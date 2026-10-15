@@ -807,6 +807,48 @@ def test_a_binding_must_name_retained_matching_observed_records():
         check([one, interrupted], review_evidence=_binding([interrupted]))
 
 
+def test_a_binding_of_pass_records_carries_their_set_digest():
+    one, two = record(1), record(2, definition=DEF1)
+    tampered = _binding([one, two])
+    tampered["validation_set_digest"] = set_digest([DEF1.digest, DEF0.digest])
+    with pytest.raises(StateError, match="validation_set_digest.*not the digest of the records"):
+        check([one, two], review_evidence=tampered)
+    # Two PASS records are the whole set: a set digest of three definitions is not theirs.
+    tampered["validation_set_digest"] = set_digest(
+        [DEF0.digest, DEF1.digest, Definition(2, ("x",)).digest]
+    )
+    with pytest.raises(StateError, match="validation_set_digest.*not the digest of the records"):
+        check([one, two], review_evidence=tampered)
+
+
+def test_an_empty_binding_carries_the_empty_sets_digest():
+    empty = _binding([])
+    assert empty["validation_set_digest"] == set_digest([])
+    check(review_evidence=empty)
+    with pytest.raises(StateError, match="validation_set_digest.*not the digest of the records"):
+        check(review_evidence=empty | {"validation_set_digest": set_digest([DEF0.digest])})
+    with pytest.raises(StateError, match="validation_set_digest.*not the digest of the records"):
+        check(review_evidence=empty | {"validation_set_digest": "0" * 64})
+
+
+@pytest.mark.parametrize("stop", [{"exit_code": 1}, {"timed_out": True}])
+def test_a_binding_of_a_set_stopped_at_a_non_pass_ends_with_it(stop):
+    """D10.6: the definitions after the first non-PASS get no record, so the
+    binding's set digest covers definitions it does not name and is not
+    recomputed on load (D5.5 compares it with the set in force, D12.2 issues
+    no certificate from it); the non-PASS must be the last record it names."""
+    one, failed = record(1), record(2, definition=DEF1, **stop)
+    stopped = _binding([one, failed])
+    stopped["validation_set_digest"] = set_digest(
+        [DEF0.digest, DEF1.digest, Definition(2, ("x",)).digest]
+    )
+    check([one, failed], review_evidence=stopped)
+    first = record(1, **stop)
+    after = record(2, definition=DEF1)
+    with pytest.raises(StateError, match=r"records\[0\].*before the last.*first non-PASS"):
+        check([first, after], review_evidence=_binding([first, after]))
+
+
 def test_a_binding_holds_at_most_one_set():
     records = [record(i) for i in range(1, 18)]
     binding = _binding(records)

@@ -1029,9 +1029,25 @@ def _check_binding(
     candidate = parse_candidate(raw["candidate"], f"{what}.candidate")
     _check_candidate(candidate, f"{what}.candidate", local, repository, run_id)
     pairs = _parse_pairs(raw["records"], f"{what}.records")
-    _hex64(raw["validation_set_digest"], f"{what}.validation_set_digest")
+    set_value = _hex64(raw["validation_set_digest"], f"{what}.validation_set_digest")
     policy_digest = _hex64(raw["policy_digest"], f"{what}.policy_digest")
-    _check_named(pairs, by_seq, candidate, policy_digest, what)
+    named = _check_named(pairs, by_seq, candidate, policy_digest, what)
+    # D10.6: the set stops at its first non-PASS, so only the last record named
+    # may be one. A binding naming PASS records only (none, for an empty set)
+    # names every definition of its set, and their digests encode to its set
+    # digest (D3.5). After a non-PASS the definitions that got no record are
+    # not in the binding, so that set digest cannot be recomputed here: D5.5
+    # compares it with the set in force, and D12.2 issues no certificate from it.
+    for i, record in enumerate(named[:-1]):
+        if record.outcome is not Outcome.PASS:
+            _fail(
+                f"{what}.records[{i}]",
+                f"names a {record.outcome.value} record before the last; "
+                "the set stops at its first non-PASS",
+            )
+    if all(record.outcome is Outcome.PASS for record in named):
+        if set_digest([r.definition_digest for r in named]) != set_value:
+            _fail(f"{what}.validation_set_digest", "is not the digest of the records' definitions")
 
 
 def certificate_digest(certificate: Mapping[str, object]) -> str:

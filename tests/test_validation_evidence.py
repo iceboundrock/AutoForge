@@ -472,6 +472,29 @@ def test_a_binding_naming_a_missing_record_fails_the_load(tmp_path):
         load_state(eng.paths.state_file)
 
 
+def test_a_binding_whose_set_digest_is_not_its_records_fails_the_load(tmp_path):
+    eng, commit = remote_engine(tmp_path, [py("pass"), py("pass")])
+    run = eng.validate_remote_candidate(commit, PROVENANCE)
+    assert run.passed
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    binding = {
+        "review_round": 1,
+        "candidate": run.candidate.to_dict(),
+        "records": [{"seq": r["seq"], "digest": r["digest"]} for r in run.records],
+        "validation_set_digest": run.validation_set_digest,
+        "policy_digest": run.policy.digest,
+    }
+    data["review_evidence"] = binding
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    assert load_state(eng.paths.state_file).review_evidence == binding
+    data["review_evidence"] = binding | {"validation_set_digest": "0" * 64}
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = eng.paths.state_file.read_bytes()
+    with pytest.raises(StateError, match="not the digest of the records' definitions"):
+        load_state(eng.paths.state_file)
+    assert eng.paths.state_file.read_bytes() == before
+
+
 # -- REMOTE surfaces -------------------------------------------------------------------
 
 

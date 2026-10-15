@@ -305,8 +305,10 @@ outside this run's directory is refused, as are a mixed candidate and a
 seq out of order. The binding and the certificate name records by
 `(seq, digest)`: each must be retained, under that digest, not
 `INTERRUPTED`, for the same candidate identity and policy, and at its
-definition's index; a certificate's records must be `PASS`, its set digest
-theirs, its comment canonical, on the reviewed PR and keyed by the
+definition's index. A binding's only non-`PASS` may be its last record
+(the set stops there, D10.6), and a binding of `PASS` records only (none
+for an empty set) carries their set digest; a certificate's records must
+be `PASS`, its set digest theirs, its comment canonical, on the reviewed PR and keyed by the
 certificate's own round, head, base and merge base, and its own digest
 must match. The counter names a retained `FAIL` or `TIMEOUT` of its
 commit. The watermark lies in `[0, highest seq]`; LOCAL has none. Anything
