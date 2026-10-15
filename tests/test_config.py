@@ -2,6 +2,7 @@
 
 import builtins
 import json
+import re
 import sys
 import tomllib
 from contextlib import contextmanager
@@ -191,7 +192,8 @@ def test_acceptance_actions_rejects_anything_else(tmp_path, value):
 def test_the_sandbox_is_disabled_by_default(tmp_path):
     cfg = default_config().sandbox
     assert (cfg.mode, cfg.validation_network, cfg.premerge_network) == ("disabled", "host", "host")
-    assert not cfg.required
+    assert not cfg.enabled and cfg.read_only_paths == []
+    assert not cfg.refuses_unenforced(local=True) and not cfg.refuses_unenforced(local=False)
 
 
 @pytest.mark.parametrize(
@@ -213,14 +215,91 @@ def test_the_sandbox_section_is_read(tmp_path, name, text):
     p = tmp_path / name
     p.write_text(text, encoding="utf-8")
     cfg = load_config_file(p).sandbox
-    assert cfg.required
+    assert cfg.mode == "required" and cfg.enabled
+    assert cfg.refuses_unenforced(local=True) and cfg.refuses_unenforced(local=False)
     assert (cfg.validation_network, cfg.premerge_network) == ("isolated", "isolated")
+
+
+def test_preferred_falls_back_in_local_only(tmp_path):
+    """ADR 0005 D12.2: REMOTE's ``preferred`` refuses exactly as ``required`` does."""
+    p = tmp_path / "cfg.yaml"
+    p.write_text("version: 1\nsandbox:\n  mode: preferred\n", encoding="utf-8")
+    cfg = load_config_file(p).sandbox
+    assert cfg.mode == "preferred" and cfg.enabled
+    assert not cfg.refuses_unenforced(local=True)
+    assert cfg.refuses_unenforced(local=False)
+
+
+def _read_only_paths(tmp_path, monkeypatch, paths, **env):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    p = tmp_path / "cfg.json"
+    body = json.dumps({"version": 1, "sandbox": {"read_only_paths": paths}})
+    p.write_text(body, encoding="utf-8")
+    return load_config_file(p).sandbox.read_only_paths
+
+
+def test_operator_read_only_paths_are_read(tmp_path, monkeypatch):
+    toolchain = tmp_path / "opt" / "toolchain"
+    toolchain.mkdir(parents=True)
+    npmrc = tmp_path / "home" / ".npmrc"
+    npmrc.parent.mkdir()
+    npmrc.write_text("registry=https://registry.example\n")
+    paths = [str(toolchain), str(npmrc), "/does/not/exist/yet"]
+    assert _read_only_paths(tmp_path, monkeypatch, paths) == paths
+
+
+@pytest.mark.parametrize(
+    ("entry", "error"),
+    [
+        ("relative/path", "is a relative path"),
+        ("/opt//toolchain", "not a normalized absolute path"),
+        ("@home", "is or contains the operator's home"),
+        ("@tmp", "is or contains the operator's home"),
+        ("/", "is or contains the operator's home"),
+        ("@home/.ssh", "~/.ssh"),
+        ("@home/.ssh/id_ed25519", "~/.ssh"),
+        ("@home/.config/gh", "the gh configuration directory"),
+        ("@home/.gitconfig", "the git configuration"),
+        ("@home/.netrc", "~/.netrc"),
+        ("/run/user", "/run"),
+        ("/proc/self", "would land in /proc"),
+        ("/dev/shm", "would land in /dev"),
+    ],
+)
+def test_an_operator_read_only_path_is_refused_at_load(tmp_path, monkeypatch, entry, error):
+    """D15.4: a forbidden source, the home or an ancestor, a kernel root (D4.3, C1, C7)."""
+    entry = entry.replace("@home", str(tmp_path / "home")).replace("@tmp", str(tmp_path))
+    with pytest.raises(ConfigurationError, match=re.escape(error)) as caught:
+        _read_only_paths(tmp_path, monkeypatch, [entry])
+    assert "sandbox.read_only_paths[0]" in str(caught.value)
+
+
+def test_an_operator_read_only_path_that_links_to_a_forbidden_source_is_refused(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    link = tmp_path / "innocent"
+    link.symlink_to(home / ".ssh")
+    with pytest.raises(ConfigurationError, match=r"~/\.ssh"):
+        _read_only_paths(tmp_path, monkeypatch, [str(link)])
+
+
+def test_operator_read_only_paths_may_not_overlap_each_other(tmp_path, monkeypatch):
+    with pytest.raises(ConfigurationError, match=r"\[1\].*overlaps /opt/a"):
+        _read_only_paths(tmp_path, monkeypatch, ["/opt/a", "/opt/a/b"])
+    with pytest.raises(ConfigurationError, match="must be a list of absolute paths"):
+        _read_only_paths(tmp_path, monkeypatch, "/opt/a")
 
 
 @pytest.mark.parametrize(
     ("body", "error"),
     [
-        ('{"mode": "preferred"}', "'sandbox.mode' must be one of disabled, required"),
+        ('{"mode": "sometimes"}', "'sandbox.mode' must be one of disabled, preferred, required"),
         ('{"mode": true}', "'sandbox.mode' must be one of"),
         ('{"validation_network": "none"}', "'sandbox.validation_network' must be one of"),
         ('{"premerge_network": null}', "'sandbox.premerge_network' must be one of"),

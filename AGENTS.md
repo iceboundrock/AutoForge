@@ -53,6 +53,17 @@ runtime state belonging to one operator.
   That is why GitHub is the source of truth, why agent claims are
   independently re-verified, and why side effects are checkpointed before
   they are performed. The controller itself is not distributed.
+- Three isolation terms, never interchangeable (ADR 0005): **logical
+  isolation** is what every launch gets in every mode (the per-issue
+  worktree, the allow-listed environment, the controller's own `gh`, git
+  and shell configuration); the **outer sandbox** is the OS-enforced
+  filesystem, process and IPC boundary `sandbox.mode` adds on Linux; a
+  launch is **enforced** only when it actually ran inside it (its record
+  says `enforced: true`). `disabled` is logical isolation only; `required`
+  refuses a host that cannot enforce before anything of the step is saved
+  or launched; `preferred` falls back to logical isolation only in LOCAL,
+  visibly, and is `required` in REMOTE. Never describe a launch that fell
+  back, or one under `disabled`, as sandboxed.
 
 ### The code under work lives on a feature branch or a worktree
 

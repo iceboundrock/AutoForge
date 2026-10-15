@@ -879,7 +879,11 @@ def test_local_doctor_checks_only_the_reachable_providers(tmp_path):
         runner=runner,
     )
     results = doc.run_local()
-    assert all(r.ok for r in results), [(r.name, r.detail) for r in results if not r.ok]
+    # The outer sandbox's rows are not about providers; under the default
+    # `disabled` mode they warn (logical isolation only), never fail.
+    others = [r for r in results if not r.name.startswith("outer sandbox: ")]
+    assert all(r.ok for r in others), [(r.name, r.detail) for r in others if not r.ok]
+    assert not any(r.label == "FAIL" for r in results), [r for r in results if not r.ok]
     assert not any(cmd[0] in ("claude", "opencode") for cmd in seen), seen
 
     # One reviewer profile keeps its real CLI: exactly that binary is checked,
@@ -899,7 +903,8 @@ def test_local_doctor_checks_only_the_reachable_providers(tmp_path):
         state_dir=str(root / ".autoforge"),
         runner=runner,
     ).run_local()
-    assert all(r.ok for r in results), [(r.name, r.detail) for r in results if not r.ok]
+    others = [r for r in results if not r.name.startswith("outer sandbox: ")]
+    assert all(r.ok for r in others), [(r.name, r.detail) for r in others if not r.ok]
     assert ["oc", "--version"] in seen
     assert not any(cmd[0] == "claude" for cmd in seen), seen
     assert "agent 'oc' available (review_round_1)" in {r.name for r in results}

@@ -111,7 +111,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
-from . import __prompt_version__
+from . import __prompt_version__, sandbox_bwrap
 from .agent_worktree import (
     Candidate,
     ObjectImportError,
@@ -152,10 +152,13 @@ from .config import (
     ACCEPTANCE_ACTIONS_AUTO,
     ACCEPTANCE_ACTIONS_OFF,
     DEFAULT_STATE_DIR,
+    SANDBOX_PREFERRED,
+    SANDBOX_REQUIRED,
     AgentLimits,
     AutoForgeConfig,
     LoopDetectionConfig,
     ProfileConfig,
+    SandboxConfig,
     validate_required_profiles,
 )
 from .config_fingerprint import (
@@ -227,6 +230,7 @@ from .errors import (
     GitTransportError,
     LockError,
     MaterializationError,
+    SandboxCapabilityError,
     SandboxLaunchRefusedError,
     SandboxTamperError,
     StateError,
@@ -409,6 +413,7 @@ from .run_contract import LocalRunContract, validate_local_run_contract
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
 from .sandbox import LaunchDescription, NetworkPosition, SandboxFacts
+from .sandbox_bwrap import Capability, ProbeResult
 from .sandbox_policy import (
     CACHE,
     LOCAL_SANDBOX_KEY,
@@ -418,8 +423,11 @@ from .sandbox_policy import (
     LaunchClass,
     LaunchFacts,
     SandboxPlan,
+    class_summary,
     describe_launch,
     launch_template,
+    operator_path_problem,
+    summary_facts,
     template_facts,
 )
 from .state import (
@@ -967,6 +975,66 @@ def _operator_home() -> str:
     return os.path.normpath(home)
 
 
+# How every surface names a launch the outer sandbox did not enforce
+# (ADR 0005 D1.2): never "sandboxed".
+LOGICAL_ISOLATION_ONLY = "logical isolation only"
+
+
+def probe_sandbox() -> ProbeResult:
+    """This host's capability, by one real minimal launch (ADR 0005 D14.1).
+
+    Module-level so that a test can stand in for the host; the engine asks
+    once per instance (:meth:`ControllerEngine.sandbox_capability`), and
+    ``doctor`` asks for itself.
+    """
+    return sandbox_bwrap.probe(home=_operator_home(), environ=os.environ)
+
+
+def sandbox_mode_summary(sandbox: SandboxConfig, local: bool) -> str:
+    """What ``sandbox.mode`` does, for the plan, ``status`` and ``doctor`` (ADR 0005 D12.4).
+
+    Configuration only: nothing is probed, so the words are the same on
+    every host, and a mode that falls back never reads as enforcement.
+    """
+    if not sandbox.enabled:
+        return (
+            f"disabled (sandbox.mode): {LOGICAL_ISOLATION_ONLY}; agents and repository-defined "
+            "commands run as the operator's UID without the outer sandbox, so they can reach "
+            "whatever the operator can by absolute path, controller state and credentials "
+            'included (a risk; docs/usage.md, "Outer sandbox")'
+        )
+    networks = f"validation network {sandbox.validation_network}"
+    if not local:
+        networks += f", pre-merge network {sandbox.premerge_network}"
+    paths = (
+        f", {len(sandbox.read_only_paths)} operator read-only path(s) (sandbox.read_only_paths)"
+        if sandbox.read_only_paths
+        else ""
+    )
+    doctor = "autoforge local doctor" if local else "autoforge doctor"
+    if sandbox.mode == SANDBOX_PREFERRED and local:
+        return (
+            "preferred (sandbox.mode): every LOCAL launch runs inside the outer sandbox when "
+            f"this host can enforce one; when it cannot, launches fall back to "
+            f"{LOGICAL_ISOLATION_ONLY}, which is said on stderr at the launch and in every "
+            "execution record and is never called sandboxed; whether this host can is "
+            f"established at the first launch of a step (`{doctor}` shows it now); "
+            f"{networks}{paths}"
+        )
+    how = (
+        "required (sandbox.mode)"
+        if sandbox.mode == SANDBOX_REQUIRED
+        else "preferred (sandbox.mode), which a REMOTE run treats as required (an unattended "
+        "fallback would be a silent downgrade)"
+    )
+    return (
+        f"{how}: every agent launch and every repository-defined command runs inside it or is "
+        "refused, never without it; a host that cannot enforce one is refused at the start of "
+        f"the step, before anything is saved, charged or launched (`{doctor}` shows whether "
+        f"this one can); {networks}{paths}"
+    )
+
+
 def _refusal_facts(exc: BaseException) -> dict[str, object]:
     """What a refused sandboxed launch recorded, for the run log; {} for none."""
     facts = getattr(exc, "facts", None)
@@ -1133,6 +1201,10 @@ class ControllerEngine:
         # real run. ``None`` (a library caller, a test, a dry run) prints
         # nothing; the log is written either way.
         self.progress_output: Callable[[str], None] | None = None
+        # The host's sandbox capability, probed at the first gate that needs
+        # it and kept for this engine's process, never across processes
+        # (ADR 0005 D12.2).
+        self._sandbox_probe: ProbeResult | None = None
         # The CLI's global flags as this process was started with them
         # (``--config``, ``--state-dir``), set by the CLI and repeated by
         # :meth:`resume_command` (#189). Paths only, never a configuration
@@ -1774,17 +1846,149 @@ class ControllerEngine:
             return str(exc)
         return ""
 
+    # -- the outer sandbox's mode and gate (ADR 0005 D12.2, D13.5, #169) -------
+    def sandbox_capability(self) -> ProbeResult:
+        """Whether this host can enforce a launch, probed once for this engine (D14.1)."""
+        if self._sandbox_probe is None:
+            self._sandbox_probe = probe_sandbox()
+        return self._sandbox_probe
+
+    def _sandbox_enforced(self) -> bool:
+        """Whether a launch now is enforced; raise when the mode refuses it (D12.2).
+
+        ``disabled``: never, and nothing is probed. Otherwise the host's
+        capability decides: enforced when it can; when it cannot,
+        ``required`` and REMOTE's ``preferred`` raise
+        :class:`SandboxCapabilityError`, and LOCAL's ``preferred`` falls back
+        to logical isolation only. The fallback is decided here, from the
+        probe, never after a launch the backend refused (D10.8): a launch
+        meant to be enforced never re-runs unenforced.
+        """
+        sandbox = self.config.sandbox
+        if not sandbox.enabled:
+            return False
+        capability = self.sandbox_capability()
+        if capability.supported:
+            return True
+        if sandbox.refuses_unenforced(self.mode is WorkflowMode.LOCAL):
+            raise self._capability_error(capability)
+        return False
+
+    def _sandbox_gate(self) -> None:
+        """The pre-launch capability gate (ADR 0005 D12.2).
+
+        Called at the start of a step that may launch an agent or a
+        repository-defined command, before anything of the step is saved,
+        charged or spawned: under ``required``, and under ``preferred`` in
+        REMOTE, a host that cannot enforce refuses the step here, and state
+        stays byte-identical. Under ``disabled`` it probes nothing. An
+        operator read-only path that overlaps what no launch may see is
+        refused here too, whatever the host (D15.4).
+        """
+        if not self.config.sandbox.enabled:
+            return
+        problem = self._operator_path_problem()
+        if problem:
+            raise ConfigurationError(
+                f"{problem}. Nothing was launched, saved or charged; remove or narrow the entry."
+            )
+        self._sandbox_enforced()
+
+    def _operator_path_problem(self) -> str:
+        """An operator read-only path that overlaps this run's denied roots; "" if none."""
+        paths = tuple(self.config.sandbox.read_only_paths)
+        if not paths:
+            return ""
+        # No workspace excluded: an operator path may overlap none of them.
+        return operator_path_problem(paths, self._denied_roots(Path("/")))
+
+    def _capability_error(self, probe: ProbeResult) -> SandboxCapabilityError:
+        local = self.mode is WorkflowMode.LOCAL
+        why = (
+            "sandbox.mode is required"
+            if self.config.sandbox.mode == SANDBOX_REQUIRED
+            else "sandbox.mode is preferred, which a REMOTE run treats as required"
+        )
+        capability = probe.capability or Capability.UNKNOWN
+        alternatives = f"set sandbox.mode: disabled to run with {LOGICAL_ISOLATION_ONLY}"
+        if local:
+            alternatives += (
+                ", or preferred to fall back to it visibly where the host cannot enforce"
+            )
+        doctor = "autoforge local doctor" if local else "autoforge doctor"
+        return SandboxCapabilityError(
+            f"{why}, and this host cannot enforce the outer sandbox: it cannot provide "
+            f"{capability.value} ({probe.reason}). Nothing was launched, saved or charged; the "
+            f"run is as it was. `{doctor}` shows the capability check; make the host capable, "
+            f'or {alternatives} (ADR 0005 D12.2; docs/usage.md, "Outer sandbox")',
+            capability.key,
+        )
+
+    def _sandbox_fallback(self) -> str:
+        """Why launches run with logical isolation only under LOCAL's ``preferred``; "" if not."""
+        probe = self._sandbox_probe
+        if (
+            self.config.sandbox.mode != SANDBOX_PREFERRED
+            or self.mode is not WorkflowMode.LOCAL
+            or probe is None
+            or probe.supported
+        ):
+            return ""
+        return probe.describe()
+
+    def _fallback_facts(self) -> dict[str, object]:
+        """The execution record's ``sandbox`` for a ``preferred`` fallback (D12.2); {} else."""
+        reason = self._sandbox_fallback()
+        if not reason:
+            return {}
+        return {
+            "enforced": False,
+            "mode": SANDBOX_PREFERRED,
+            "isolation": LOGICAL_ISOLATION_ONLY,
+            "fallback": reason,
+        }
+
+    def _fallback_notice(self, what: str) -> str:
+        """The stderr line of a ``preferred`` fallback at a launch (D12.2); "" when none."""
+        reason = self._sandbox_fallback()
+        if not reason:
+            return ""
+        return (
+            f"{what} runs with {LOGICAL_ISOLATION_ONLY}, NOT inside the outer sandbox: "
+            f"sandbox.mode is preferred, and {reason.removeprefix('unsupported: ')}"
+        )
+
+    def _say_fallback(self, what: str) -> None:
+        """A repository-defined command's fallback notice, on stderr (D12.2)."""
+        notice = self._fallback_notice(what)
+        if notice and self.progress_output is not None:
+            self.progress_output(redact(f"autoforge: {notice}"))
+
+    def _step_may_launch(self, previous: Phase, allow_merge: bool) -> bool:
+        """Whether a REMOTE step of ``previous`` may launch an agent or a command."""
+        if previous in (Phase.READY_FOR_MERGE, Phase.MERGE):
+            return self.merge_gate_open(allow_merge) and bool(
+                self.config.merge.verification_commands
+            )
+        return previous in (
+            Phase.ANALYZE_EXECUTE,
+            Phase.REVIEW,
+            Phase.FIX,
+            Phase.REPLAN_REEXECUTE,
+            Phase.UPDATE_EPIC,
+        )
+
     # -- the outer sandbox's facts (ADR 0005 D13.2, #168) ---------------------
     def _agent_sandbox(
         self, phase: Phase, cwd: str, overrides: Mapping[str, str], read_context: str
     ) -> SandboxPlan | None:
-        """The engine's facts for one agent launch; ``None`` unless ``sandbox.mode: required``.
+        """The engine's facts for one agent launch; ``None`` when it is not enforced.
 
         The sandbox directories are created here, through the controller's
         filesystem boundary, at the first enforced launch that needs them. A
         directory that cannot be prepared refuses the launch.
         """
-        if not self.config.sandbox.required:
+        if not self._sandbox_enforced():
             return None
         change = phase in WORKTREE_STATE_PHASES
         if self.mode is WorkflowMode.LOCAL:
@@ -1800,9 +2004,11 @@ class ControllerEngine:
 
         LOCAL validation shares the checkout's cache; an export command gets
         none (ADR 0005 §2.5). ``network`` is the operator's opt-in (D9.2).
-        A refusal is :class:`SandboxLaunchRefusedError`, before anything runs.
+        A refusal is :class:`SandboxLaunchRefusedError`, before anything runs;
+        ``None`` when the launch is not enforced (``disabled``, or LOCAL's
+        ``preferred`` on a host that cannot enforce).
         """
-        if not self.config.sandbox.required:
+        if not self._sandbox_enforced():
             return None
         position = NetworkPosition(network)
         if launch_class is LaunchClass.LOCAL_VALIDATION:
@@ -1816,6 +2022,7 @@ class ControllerEngine:
                 controller_config=overrides_directory(overrides),
                 denied_roots=self._denied_roots(Path(cwd)),
                 network=position,
+                operator_paths=tuple(self.config.sandbox.read_only_paths),
             )
         env = {**select_environment(self.config.execution.environment_names()), **overrides}
         return describe_launch(facts, None, env)
@@ -1846,6 +2053,7 @@ class ControllerEngine:
             read_context=os.path.realpath(read_context) if read_context else "",
             controller_config=overrides_directory(overrides),
             denied_roots=self._denied_roots(worktree),
+            operator_paths=tuple(self.config.sandbox.read_only_paths),
         )
 
     def _local_facts(
@@ -1882,6 +2090,7 @@ class ControllerEngine:
             controller_config=overrides_directory(overrides),
             denied_roots=self._denied_roots(root),
             network=network,
+            operator_paths=tuple(self.config.sandbox.read_only_paths),
         )
 
     def _denied_roots(self, workspace: Path) -> tuple[str, ...]:
@@ -2050,22 +2259,48 @@ class ControllerEngine:
             "credential, an HTTP header); one refuses the launch",
             f"HEAD and branch of {Path(self.workdir).resolve()} are read before and after the "
             "invocation; a change enters BLOCKED",
-            self._sandbox_plan_note(),
+            *self._sandbox_plan_notes(),
         ]
 
-    def _sandbox_plan_note(self) -> str:
-        """``sandbox.mode`` as a plan note: what it routes, and that nothing falls back."""
-        if not self.config.sandbox.required:
-            return (
-                "outer sandbox: disabled (sandbox.mode); agents and repository-defined "
-                "commands run as the operator, without one (ADR 0005)"
-            )
-        return (
-            "outer sandbox: required (sandbox.mode); every agent launch and every "
-            "repository-defined command runs inside it or is refused, never without it; "
-            f"validation network {self.config.sandbox.validation_network}, pre-merge network "
-            f"{self.config.sandbox.premerge_network}"
-        )
+    def _sandbox_plan_notes(self) -> list[str]:
+        """``sandbox.mode`` in the plan: the mode, its outcome, the policy by class (D12.4).
+
+        No probe: a dry run launches nothing, and its plan is the same on
+        every host. The policy is §2.5's mapping for each launch class the
+        run can make, with every controller path a role name (no git runs,
+        nothing is created) and the operator's paths as configured.
+        """
+        sandbox = self.config.sandbox
+        local = self.mode is WorkflowMode.LOCAL
+        notes = [f"outer sandbox: {sandbox_mode_summary(sandbox, local)}"]
+        if not sandbox.enabled:
+            return notes
+        validation = NetworkPosition(sandbox.validation_network)
+        paths = tuple(sandbox.read_only_paths)
+        if local:
+            classes = [
+                (LaunchClass.LOCAL_AGENT, validation, "ANALYZE_EXECUTE and FIX get the cache"),
+                (LaunchClass.LOCAL_VALIDATION, validation, ""),
+            ]
+        else:
+            classes = [
+                (
+                    LaunchClass.REMOTE_AGENT,
+                    validation,
+                    "ANALYZE_EXECUTE, FIX and REPLAN_REEXECUTE get the cache; REVIEW and "
+                    "UPDATE_EPIC get none",
+                ),
+                (
+                    LaunchClass.EXPORT_COMMAND,
+                    NetworkPosition(sandbox.premerge_network),
+                    "pre-merge verification; validation.commands use the validation network",
+                ),
+            ]
+        for launch_class, network, note in classes:
+            facts = summary_facts(launch_class, network, cache=True, operator_paths=paths)
+            shown = f"{launch_class.value}" + (f" ({note})" if note else "")
+            notes.append(f"outer sandbox policy, {shown}: {class_summary(facts)}")
+        return notes
 
     def bind_local_state_dir(self, explicit: str | Path | None = None) -> None:
         """Point :attr:`paths` at where this LOCAL run keeps its runtime state.
@@ -3156,7 +3391,7 @@ class ControllerEngine:
             "the agent and the validation commands run from the run's repository root "
             f"{contract.repository_root} (frozen; never the invocation's cwd)"
         )
-        notes.append(self._sandbox_plan_note())
+        notes.extend(self._sandbox_plan_notes())
         return StepPlan(
             phase=s.phase.value,
             profile_name=profile.name,
@@ -3431,6 +3666,17 @@ class ControllerEngine:
                 plan=plan,
                 message=f"[dry-run] would execute {previous.value} via profile {plan.profile_name}",
             )
+        # The outer sandbox's pre-launch gate (ADR 0005 D12.2), first of all
+        # for a step that may launch: a host that cannot enforce, under a
+        # mode that refuses, leaves the run byte-identical -- no recovery
+        # record, no plan snapshot, no step or attempt charged.
+        local = state.mode == WorkflowMode.LOCAL
+        if (
+            previous in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX)
+            if local
+            else self._step_may_launch(previous, allow_merge)
+        ):
+            self._sandbox_gate()
         # Under the lock, before anything else of the step, the plan included
         # (ADR 0006 D11.3): a validation marker a crash left becomes its
         # INTERRUPTED record. Planning can refuse -- a LOCAL plan snapshots
@@ -4241,6 +4487,8 @@ class ControllerEngine:
                 except SandboxLaunchRefusedError as exc:
                     refused = exc
                 else:
+                    if req.sandbox is None:
+                        self._say_fallback(f"validation command {label}")
                     try:
                         result, step_log, run_log = self._launch_validator(
                             logger,
@@ -4325,15 +4573,20 @@ class ControllerEngine:
         cfg = self.config
         local = launch_class is LaunchClass.LOCAL_VALIDATION
         template: Mapping[str, object] = NO_SANDBOX_TEMPLATE
-        if cfg.sandbox.required:
+        if cfg.sandbox.enabled:
             position = NetworkPosition(cfg.sandbox.validation_network)
+            paths = tuple(cfg.sandbox.read_only_paths)
             if local:
                 separate, linked = self._local_git_layout()
                 facts = template_facts(
-                    launch_class, position, separate_git_dir=separate, linked=linked
+                    launch_class,
+                    position,
+                    separate_git_dir=separate,
+                    linked=linked,
+                    operator_paths=paths,
                 )
             else:
-                facts = template_facts(launch_class, position)
+                facts = template_facts(launch_class, position, operator_paths=paths)
             template = launch_template(facts)
         return Policy(
             mode=cfg.sandbox.mode,
@@ -4459,6 +4712,8 @@ class ControllerEngine:
         )
         if result.sandbox is not None:
             execution.sandbox = result.sandbox.record()
+        else:
+            execution.sandbox = self._fallback_facts()
         if result.timed_out or result.exit_code != 0:
             execution.error = _with_leftovers(
                 f"timed out after {req.timeout_seconds}s"
@@ -4769,7 +5024,10 @@ class ControllerEngine:
             unsandboxed = (
                 "; under sandbox.mode disabled every validator runs unsandboxed as the "
                 "operator's UID, and its record says enforced: false"
-                if not self.config.sandbox.required
+                if not self.config.sandbox.enabled
+                else "; under sandbox.mode preferred a host that cannot enforce runs every "
+                "validator unsandboxed, and its record says enforced: false"
+                if local and self.config.sandbox.mode == SANDBOX_PREFERRED
                 else ""
             )
             notes.append(
@@ -7131,6 +7389,8 @@ class ControllerEngine:
         )
         if result.sandbox is not None:
             record.sandbox = result.sandbox.record()
+        else:
+            record.sandbox = self._fallback_facts()
         if result.timed_out or result.exit_code != 0:
             record.error = _with_leftovers(
                 f"timed out after {req.timeout_seconds}s"
@@ -7193,7 +7453,7 @@ class ControllerEngine:
             metadata={**metadata, "sandbox_mode": self.config.sandbox.mode},
         )
         record.error = f"{type(exc).__name__}: {exc}"
-        record.sandbox = _refusal_facts(exc)
+        record.sandbox = _refusal_facts(exc) or self._fallback_facts()
         self._logger().log_execution(record, "", "", "", step_log=step_log)
 
     def _revision_drift_to_review(
@@ -9978,15 +10238,19 @@ class ControllerEngine:
                     # ADR 0005: under `sandbox.mode: required` every process
                     # of the launch runs inside the outer sandbox, or is
                     # refused here or at the spawn; it never runs without it.
+                    # LOCAL's `preferred` falls back here, from the probe, and
+                    # `_launch` says so (D12.2).
                     req.sandbox = self._agent_sandbox(phase, cwd, overrides, read_context)
                     result = self._launch(provider, req, limits, step_log, phase)
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
-                record.sandbox = _refusal_facts(exc)
+                record.sandbox = _refusal_facts(exc) or self._fallback_facts()
                 self._record_invocation(logger, record, prompt, "", "", phase, step_log)
                 raise
             if result.sandbox is not None:
                 record.sandbox = result.sandbox.record()
+            else:
+                record.sandbox = self._fallback_facts()
             record.started_at = result.started_at
             record.finished_at = result.finished_at
             record.exit_code = result.exit_code
@@ -10327,6 +10591,9 @@ class ControllerEngine:
                     f"attempt {req.attempt}, "
                     f"worktree {req.cwd}, log {step_log.path}"
                 )
+                notice = self._fallback_notice("this agent") if req.sandbox is None else ""
+                if notice:
+                    reporter.line(notice)
                 req.progress = reporter.sink
                 try:
                     result = provider.execute(req)

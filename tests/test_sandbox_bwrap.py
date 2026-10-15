@@ -6,8 +6,10 @@ a mask with a carve-out, an overlay, a bounded temp, the Landlock scope and
 the session keyring) and skips the module with the probe's reason when this
 host cannot enforce a launch: no ``bwrap``, unprivileged user namespaces
 refused (Ubuntu's AppArmor restriction), a kernel before Landlock ABI 6
-(Linux 6.12), or no ``/usr/bin/python3`` to run the fake commands inside.
-Whether hosted CI provides such a host is #169's.
+(Linux 6.12), or no ``/usr/bin/python3`` to run the fake commands inside
+(:func:`tests.conftest.real_sandbox_backend`; with
+``AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1`` it fails instead). ``make
+test-sandbox`` runs every real-backend module that way.
 
 Everything inside is a small Python or shell script; every sentinel, socket
 and repository is under ``tmp_path``; the operator's home is a fake one.
@@ -48,8 +50,9 @@ from autoforge.sandbox import (
     SandboxRequest,
     compile_launch,
 )
+from tests.conftest import SYSTEM_PYTHON, real_sandbox_backend
 
-PY = "/usr/bin/python3"
+PY = SYSTEM_PYTHON
 RO = Access.READ_ONLY
 RW = Access.WRITABLE
 ENGINE = Origin.ENGINE
@@ -75,15 +78,7 @@ def read(path):
 
 @pytest.fixture(scope="session")
 def backend(tmp_path_factory: pytest.TempPathFactory) -> str:
-    if not sys.platform.startswith("linux"):
-        pytest.skip("the outer sandbox's backend is Linux-only")
-    if not os.path.exists(PY):
-        pytest.skip(f"{PY} is not installed, so no fake command can run inside")
-    home = tmp_path_factory.mktemp("probe-home")
-    result = sandbox_bwrap.probe(home=str(home), environ={})
-    if not result.supported:
-        pytest.skip(f"this host cannot enforce the outer sandbox: {result.reason}")
-    return result.version
+    return real_sandbox_backend(tmp_path_factory)
 
 
 def _base(tmp_path: Path) -> Path:
@@ -851,3 +846,19 @@ def test_the_controller_keeps_neither_the_keyring_nor_the_landlock_domain(
     finally:
         listener.close()
     assert libc.prctl(39, 0, 0, 0, 0) == no_new_privs
+
+
+def test_the_probe_finds_this_host_capable_and_leaves_nothing(
+    backend: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real probe (#169, D14.1): supported, the backend's version, and its
+    temporary directory gone, overlay work directory included."""
+    import tempfile
+
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert result.supported and result.capability is None and result.reason == ""
+    assert result.describe() == f"supported (bubblewrap {backend})"
+    assert list(scratch.iterdir()) == []

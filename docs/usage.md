@@ -449,7 +449,7 @@ redacted. What it reads depends on the command:
   first time an agent is launched for the issue and reused by every later
   phase of that issue. AutoForge never deletes it: remove it with
   `git worktree remove` once the issue is done.
-- **Sandbox directories** (`sandbox.mode: required` only):
+- **Sandbox directories** (when the outer sandbox is enforced):
   `<repo>/.git/autoforge/sandbox/<issue-number>/` holds the issue's private
   object directory (`objects/`, where an agent's commits land until the
   controller imports them), the overlay's work directory and the cache its
@@ -457,6 +457,8 @@ redacted. What it reads depends on the command:
   created at the issue's first enforced launch and never deleted: remove
   them with the worktree
   ([State and recovery: runtime artifacts](agent-guides/state-and-recovery.md#runtime-artifacts)).
+  A LOCAL run's cache is `<repo>/.git/autoforge/sandbox/local/cache`.
+  `doctor` lists them with their sizes.
 
 ### How agents are separated from your checkout
 
@@ -482,9 +484,9 @@ launch: the agent sees the system runtime, a private home and `/tmp`, its
 worktree, the repository's git metadata read-only, its read context and
 what its provider declares; your checkout, the state directory, the lock,
 other worktrees and the rest of your home are absent. It still runs as your
-UID on the host network, and a host that cannot enforce refuses the launch
-rather than running it without the sandbox
-([Configuration: outer sandbox](configuration.md#outer-sandbox)).
+UID on the host network, and a host that cannot enforce is refused before
+the step rather than running it without the sandbox
+([Outer sandbox](#outer-sandbox)).
 
 The agent holds no GitHub or git credential (#165). The controller pushes,
 opens the PR, posts the review comment, creates follow-up issues and
@@ -507,8 +509,59 @@ the same command again.
 `autoforge doctor` runs the same check. What this does not stop (a
 deliberate read of `~/.config/gh/hosts.yml` by absolute path, for one) is
 in [GitHub safety](agent-guides/github-safety.md#threat-model); ADR 0005's
-outer sandbox, `sandbox.mode: required`, closes it for every enforced launch
+outer sandbox (`sandbox.mode: required`, or `preferred` where the host can
+enforce) closes it for every enforced launch
 ([GitHub safety: outer sandbox threat model](agent-guides/github-safety.md#outer-sandbox-threat-model-adr-0005)).
+
+### Outer sandbox
+
+`sandbox.mode` (ADR 0005, #168, #169) chooses between three postures, and
+every surface names the one in force:
+
+| `sandbox.mode` | the host can enforce | the host cannot enforce |
+|---|---|---|
+| `disabled` (default) | logical isolation only | logical isolation only |
+| `required` | every launch enforced | refused before the step: nothing saved, charged or launched |
+| `preferred`, REMOTE | every launch enforced | refused, exactly as `required` |
+| `preferred`, LOCAL | every launch enforced | every launch with logical isolation only, said at each launch |
+
+*Logical isolation* is what every mode has: the per-issue worktree, the
+environment allow-list and the controller's own `gh`, git and shell
+configuration. The *outer sandbox* is the OS-enforced boundary on top. A
+launch is *enforced* only when it ran inside it; a `preferred` fallback is
+never called sandboxed.
+
+- **Before a run:** `autoforge doctor` (or `autoforge local doctor`, which
+  makes no GitHub call) shows the capability probe's result, one real
+  minimal sandboxed launch that names the first thing the host lacks
+  (`bwrap`, an unprivileged user, PID or IPC namespace, a new procfs, the
+  sandbox's bind mounts, an overlay mount, Landlock ABI 6), and what the
+  mode does with it: `disabled` is a WARN ("logical isolation only", a
+  risk); `required` or REMOTE's `preferred` on a host that cannot enforce is
+  a FAIL; LOCAL's `preferred` there is a WARN that launches will fall back.
+  It also shows the policy each launch class gets; for each provider its
+  declaration (paths and credential classes, never a value) and, when the
+  sandbox is enabled and the host can enforce, its `--version` run inside;
+  a keyring login, or a `dir-rw` login inside the provider's own
+  configuration root, with the supported alternatives (a login file, a
+  dedicated credential directory, an API key variable); hard-linked files
+  in the trees an agent writes (each still aliases an inode outside: remove
+  the REMOTE worktree or sandbox directory, or break the link); the sandbox
+  directories and their sizes; the TCP listeners on loopback and wildcard
+  addresses, which every launch can reach (an X11 port, 6000–6063, is a
+  WARN); and `sandbox.read_only_paths` a run would refuse.
+- **The dry run** shows the mode and its outcome and the compiled policy by
+  launch class. It runs no probe, so it reads the same on every host.
+- **`status`** shows the mode and what it means, without probing.
+- **At a step:** under `required`, and under REMOTE's `preferred`, a step
+  that may launch first runs the probe (once per controller process). A
+  host that cannot enforce is a configuration error, exit 2, before the
+  step saves, charges or launches anything; the state is byte-identical.
+  Under LOCAL's `preferred` each launch that falls back prints "this agent
+  runs with logical isolation only, NOT inside the outer sandbox: ..." (or
+  "validation command ...") on stderr, and its execution record says
+  `"sandbox": {"enforced": false, "mode": "preferred", "isolation":
+  "logical isolation only", "fallback": "<reason>"}`.
 
 AutoForge never commits to the default branch, never deletes a worktree it
 created, and never creates or cleans up local branches or any other
@@ -610,11 +663,22 @@ ownership or discard uncommitted user changes.
   OpenCode launches a database of their own (`OPENCODE_DB`, see
   [Configuration: agent environment](configuration.md#agent-environment))
   and run the same command again.
+- **"this host cannot enforce the outer sandbox: it cannot provide ..."**
+  (`SandboxCapabilityError`, exit 2; `sandbox.mode: required`, or
+  `preferred` in REMOTE): the pre-launch gate refused the step. Nothing was
+  launched, saved or charged. `autoforge doctor` (or `local doctor`) shows
+  the same capability row; make the host capable (install `bwrap`, allow
+  unprivileged user namespaces, a kernel with Landlock ABI 6), or set
+  `sandbox.mode: disabled` (logical isolation only) or, in LOCAL,
+  `preferred`, and run the same command again.
+- **"sandbox.read_only_paths[N] ... overlaps ..., which no launch may see":**
+  an operator read-only path names, contains or lies inside the state
+  directory, the lock, `<git common dir>/autoforge`, another worktree or (in
+  REMOTE) your checkout. Nothing was launched; narrow or remove the entry.
 - **"the sandbox cannot be established ..."** (`SandboxLaunchRefusedError`,
-  `sandbox.mode: required`): the launch did not run, and nothing ran
-  without the sandbox. The message names the cause: a host that cannot
-  enforce (not Linux, no `bwrap`, user namespaces refused, a kernel without
-  Landlock ABI 6), a sandbox directory that is a link, or a path and the
+  the sandbox enforced): the launch did not run, and nothing ran
+  without the sandbox. The message names the cause: a backend that failed
+  to set the sandbox up after the gate passed, a sandbox directory that is a link, or a path and the
   policy rule it breaks ("sandbox policy refuses <path>: <rule>"), such as
   a `CLAUDE_CONFIG_DIR`, `OPENCODE_DB` directory or `PI_CODING_AGENT_DIR`
   inside the provider's own configuration directory
@@ -731,7 +795,7 @@ To continue under this command's configuration instead, repeat it with --accept-
 
 Everything else in the configuration may change between commands without a
 refusal: the loop bounds and step budget, the merge gate, `env_allowlist`,
-`sandbox.mode`, and a profile's `command`, `extra_args` and `options`. The
+the `sandbox` section, and a profile's `command`, `extra_args` and `options`. The
 record holds none of them, and no value that could carry a secret.
 
 `--dry-run` makes the same comparison and writes nothing. It refuses as the

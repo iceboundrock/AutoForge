@@ -6,7 +6,11 @@
   is #168's (`src/autoforge/sandbox_policy.py`,
   `src/autoforge/agent_worktree.py`, each adapter's
   `sandbox_requirements`, the engine's routing and the `sandbox:` config
-  section); #169's is not yet. It is implemented by #167 (the launch
+  section), and so is #169's (the typed capability probe in
+  `sandbox_bwrap.py`, the engine's pre-launch gate and `preferred`,
+  `sandbox.read_only_paths`, `src/autoforge/doctor_sandbox.py`, the
+  per-class policy in the dry-run plan and the parity suite,
+  `tests/test_sandbox_parity.py`). It is implemented by #167 (the launch
   description, the policy compiler and the Linux `bwrap` backend in the
   executor layer), #168
   (provider declarations, engine facts, the routing of every launch, the git

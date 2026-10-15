@@ -141,7 +141,7 @@ directory if it is missing and a probe file it creates and removes there.
 | `github` | the `gh` binary and its timeout | [GitHub safety](agent-guides/github-safety.md) |
 | `validation` | REMOTE candidate validation (#172): `commands` (argv lists, empty by default), `scope` (`candidate-tree`, the only value) | [Candidate validation](#candidate-validation) below, [State and recovery](agent-guides/state-and-recovery.md#validation-evidence) |
 | `local` | Local Mode: `feature_dir`, `max_fix_rounds`, `validation_commands`, `exclude`, `max_workspace_entries`, `max_workspace_bytes` | [Local mode configuration](#local-mode-configuration) below |
-| `sandbox` | the outer sandbox (#168): `mode` (`disabled`, the default, or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`) | [Outer sandbox](#outer-sandbox) below, [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
+| `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths` | [Outer sandbox](#outer-sandbox) below, [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
 ## Profiles
 
@@ -699,9 +699,9 @@ validation:
   discarded. The commands get the allow-listed environment
   (`execution.env_allowlist`), no GitHub or git credential, the wall-clock
   limit `execution.command_timeout_seconds`, and orphan containment; under
-  `sandbox.mode: required` they run inside the outer sandbox as the
-  pre-merge export does (`sandbox.validation_network` sets their network),
-  or are refused.
+  `sandbox.mode: required` or `preferred` (which a REMOTE run treats as
+  `required`) they run inside the outer sandbox as the pre-merge export
+  does (`sandbox.validation_network` sets their network), or are refused.
 - **What it records.** Every command that runs leaves a `ValidationRecord`
   in `state.json`: the candidate, the definition, policy P, the outcome
   (`PASS` for exit 0, `FAIL` for any other exit, exit 127 included,
@@ -733,7 +733,10 @@ validation:
   of them, `execution.command_timeout_seconds` or
   `execution.env_allowlist_extra` included, makes earlier records not
   apply: the commands run again. Under `disabled` every validator runs
-  unsandboxed as your UID and its record says `enforced: false`.
+  unsandboxed as your UID and its record says `enforced: false`. Under
+  `required`, and under REMOTE's `preferred`, a record applies only when
+  its launch was enforced; LOCAL's `preferred` may fall back, and a record
+  made that way says `enforced: false`.
 
 ## Outer sandbox
 
@@ -745,48 +748,104 @@ above:
 
 ```yaml
 sandbox:
-  mode: disabled              # disabled | required
+  mode: disabled              # disabled | preferred | required
   validation_network: host    # host | isolated: LOCAL and REMOTE validation commands
   premerge_network: host      # host | isolated: merge.verification_commands
+  read_only_paths: []         # absolute paths every launch sees read-only (#169)
 ```
+
+Three terms are used throughout, and never interchangeably: **logical
+isolation** (the per-issue worktree, the controller's own `gh`, git and
+shell configuration, the environment allow-list: what every mode has),
+the **outer sandbox** (the OS-enforced boundary ADR 0005 describes), and
+**enforced**, which a launch is only when it ran inside the outer sandbox
+(its execution record says `sandbox.enforced: true`).
 
 - **`mode: disabled`** (the default) launches as before: logical isolation
   only, so an agent can still read and write by absolute path whatever your
-  UID can. The controller's git hardening (binding the issue worktree
-  through the registry, reading its `HEAD` through the git common dir, the
-  strict object import; ADR 0005 D6.3–D6.5) applies in this mode too
+  UID can. The plan, `status` and `doctor` say "logical isolation only", and
+  `doctor` reports it as a risk (a WARN row). The controller's git
+  hardening (binding the issue worktree through the registry, reading its
+  `HEAD` through the git common dir, the strict object import; ADR 0005
+  D6.3–D6.5) applies in this mode too
   ([GitHub safety](agent-guides/github-safety.md#threat-model)).
 - **`mode: required`** runs every agent launch of every provider (Pi's
   per-launch auth preflight included), every `local.validation_commands`
   and `validation.commands` entry and every `merge.verification_commands`
-  entry inside the outer
-  sandbox, or refuses it before it runs; nothing falls back to running
-  without one (D12.1). It needs Linux, `bwrap` on `PATH`, unprivileged user
-  namespaces and overlay mounts, and Landlock ABI 6 (Linux 6.12 or later).
-  There is no pre-launch capability check and no `doctor` row for it yet
-  (#169), so a host that cannot enforce refuses at the first launch, with
-  the reason. Where a refusal lands:
+  entry inside the outer sandbox, or refuses it; nothing falls back to
+  running without one (D12.1). It needs Linux, `bwrap` on `PATH`,
+  unprivileged user, PID and IPC namespaces, a new procfs, unprivileged
+  overlay mounts, and Landlock ABI 6 (Linux 6.12 or later).
+- **`mode: preferred`** (D12.2) is `required` where the host can enforce.
+  Where it cannot, a **LOCAL** launch falls back to logical isolation only,
+  visibly: the dry-run plan and `status` say that it may, the launch prints
+  "runs with logical isolation only, NOT inside the outer sandbox" on
+  stderr, and its execution record says `sandbox: {"enforced": false,
+  "mode": "preferred", "isolation": "logical isolation only", "fallback":
+  "<the probe's reason>"}`. It is never called sandboxed. A **REMOTE** run
+  treats `preferred` exactly as `required`: its launches are unattended, and
+  a fallback nobody watches would be a silent downgrade.
+
+**The pre-launch gate.** Under `required`, and under `preferred` in
+REMOTE, the first step that may launch an agent or a repository-defined
+command establishes whether this host can enforce, with one real minimal
+launch (the capability probe, D14.1), before anything of the step is
+saved, charged or spawned. A host that cannot is refused there with a
+configuration error (`SandboxCapabilityError`, exit 2) that names the
+missing capability (`bwrap` missing, the user, PID or IPC namespace, the
+new procfs, a bind mount, the overlay, Landlock) and the alternatives
+(`sandbox.mode: disabled`, or in LOCAL `preferred`); the run's state is
+byte-identical and nothing needs recovery. The answer is kept for the
+controller process, never across processes, so a host made capable is seen
+by the next `resume`. A step that launches nothing (INITIALIZING, a
+READY_FOR_MERGE without pre-merge commands) is not gated. `disabled` runs
+no probe. After the gate, a launch the backend still fails to set up is a
+spawn failure, as before (the attempt is charged; D10.8):
+
   - an agent: `SandboxLaunchRefusedError`, an `ExecutionError` handled like
     an executable that cannot be spawned. Nothing ran, the phase is
-    unchanged and `resume` launches it again; the attempt counter (and a
-    LOCAL write phase's launch charge) was already saved, as for that spawn
-    failure, until #169's gate moves the refusal before both;
+    unchanged and `resume` launches it again;
   - a LOCAL validation command: not run, so the phase is not verified and
     the run stays in it, as for a failing command;
   - a pre-merge verification command: not run, so the merge gate blocks
     (`BLOCKED`, "Nothing was merged or counted"), as for a failing command.
+
+  Under `preferred`, the fallback is decided at the gate only: a launch that
+  was meant to be enforced and failed is never re-run without the sandbox.
+
 - **`validation_network` and `premerge_network: isolated`** run that kind
   of command in a network namespace of its own: the host's loopback
   services, its abstract sockets and every download are unreachable, which
   is why it is opt-in (D9.2). Agents always share the host network. Both
-  keys are read only under `required`.
+  keys are read only when the sandbox is enabled.
+- **`read_only_paths`** (D15.4) are absolute paths every launch of every
+  class sees read-only, at the same path: a toolchain or interpreter outside
+  `/usr` (a Linuxbrew prefix, `/opt/...`), a corporate CA bundle, a registry
+  configuration such as `~/.npmrc`. One under your home appears at the same
+  place inside the private home. Each is refused at load when it is
+  relative or not normalized, is your home or one of its ancestors (`/`
+  included), is, contains or lies inside a forbidden source (`~/.ssh`,
+  `~/.gnupg`, `~/.netrc`, the `gh` and git configuration, the keyrings, the
+  password store, `/run`, `$XDG_RUNTIME_DIR`), resolves through a link to
+  one, lies under `/proc`, `/dev` or `/sys`, is neither a directory nor a
+  regular file, or overlaps another entry. One that overlaps what no launch
+  may see (the state directory, the lock, `<git common dir>/autoforge`,
+  another worktree, the operator's checkout in REMOTE) is refused before the
+  first launch, and `doctor` names it. There are no operator-declared
+  writable paths. **A token in a projected file (a registry token in
+  `~/.npmrc`) is readable by every tool in the sandbox**, agent and
+  repository command alike.
 
-Any other value, `preferred` included (#169's, ADR 0005 D12.2), is a load
-error. The dry-run plan names the mode in a note (`outer sandbox: disabled
-(sandbox.mode); ...`, or `required` with both network positions); `status`
-and `doctor` do not report it yet (#169).
+Any other `mode` value is a load error. The dry-run plan shows the mode and
+what it does, then the compiled policy for each launch class the run can
+make (REMOTE agent and export command, or LOCAL agent and LOCAL validation
+command), by role, with your `read_only_paths`; a dry run runs no probe,
+so its plan is the same on every host. `status` shows the mode and what it
+means, without probing. `doctor` and `local doctor` show the capability
+result and what the mode will do on this host
+([Usage: outer sandbox](usage.md#outer-sandbox)).
 The mode is not part of a LOCAL run's contract (D12.3), and no state
-records it, so a run started under one mode resumes under the other
+records it, so a run started under one mode resumes under another
 (D15.3).
 
 **What a sandboxed launch sees.** An empty root, then only what ADR 0005

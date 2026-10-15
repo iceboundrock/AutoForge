@@ -866,6 +866,12 @@ if args == ["--version"]:
 if args == ["--help"]:
     print(setting("help", "--size BYTES --perms OCTAL --overlay RWSRC WORKDIR DEST"))
     sys.exit(0)
+if args[0] != "--args":
+    # The probe narrowing a namespace refusal: plain flags, then the command.
+    with open(os.path.join(here, "narrow.jsonl"), "a") as fh:
+        fh.write(json.dumps(args) + "\n")
+    refused = setting("refuse", "").split()
+    sys.exit(1 if any(flag in args for flag in refused) else 0)
 assert args[0] == "--args" and args[2] == "--", args
 fd = int(args[1])
 data = b""
@@ -885,7 +891,8 @@ with open(os.path.join(here, "log.jsonl"), "a") as fh:
     fh.write("\n")
 mode = setting("mode", "run")
 if mode == "setup-fail":
-    sys.stderr.write("bwrap: Creating new namespace failed: Operation not permitted\n")
+    message = setting("stderr", "bwrap: Creating new namespace failed: Operation not permitted")
+    sys.stderr.write(message + "\n")
     sys.exit(1)
 status_fd = int(options[options.index("--json-status-fd") + 1])
 env = {}
@@ -1284,3 +1291,162 @@ def test_the_options_travel_in_a_descriptor(
         assert options[options.index(b"--json-status-fd") + 1] == str(status_fd).encode()
     finally:
         launch.close()
+
+
+# ------------------------------------------- the capability probe, typed (#169)
+
+
+@pytest.mark.parametrize(
+    ("reason", "capability"),
+    [
+        ("the outer sandbox has no backend on darwin; only Linux has one", "platform"),
+        ("bwrap was not found on the controller's PATH", "backend"),
+        ("/usr/bin/bwrap --version failed (exit 1)", "backend"),
+        (
+            "bubblewrap failed to set the sandbox up: bwrap: No permissions to create a new "
+            "namespace, likely because the kernel does not allow non-privileged user "
+            "namespaces. On e.g. debian this can be enabled with 'sysctl "
+            "kernel.unprivileged_userns_clone=1'.",
+            "user_namespace",
+        ),
+        (
+            "bubblewrap failed to set the sandbox up: bwrap: setting up uid map: EPERM",
+            "user_namespace",
+        ),
+        ("bwrap: Can't mount proc on /newroot/proc: Operation not permitted", "procfs"),
+        ("bwrap: Can't bind mount /oldroot/srv on /newroot/srv: No such file", "bind"),
+        ("bwrap: Can't find source path /gone: No such file or directory", "bind"),
+        ("bwrap: Can't mount tmpfs on /newroot/tmp: Operation not permitted", "bind"),
+        ("/usr/bin/bwrap 0.4.0 cannot mount an overlay", "overlay"),
+        ("bwrap: Can't make overlay mount on /newroot/x with options ...: EINVAL", "overlay"),
+        (
+            "the kernel's Landlock ABI is 4; the abstract-socket scope needs ABI 6 (Linux "
+            "6.12) with Landlock enabled",
+            "landlock",
+        ),
+        (
+            "the launch's process could not join a new session keyring or restrict itself to "
+            "the Landlock abstract-socket scope ([Errno 1] landlock_restrict_self)",
+            "landlock",
+        ),
+        (
+            "the launch's process could not join a new session keyring or restrict itself to "
+            "the Landlock abstract-socket scope ([Errno 1] keyctl(KEYCTL_JOIN_SESSION_KEYRING))",
+            "session_keyring",
+        ),
+        ("bwrap: Creating new namespace failed: Operation not permitted", "unknown"),
+        ("something no one has seen", "unknown"),
+    ],
+)
+def test_a_refusal_names_the_capability_the_host_lacks(reason: str, capability: str) -> None:
+    assert sandbox_bwrap.classify(reason).key == capability
+
+
+def test_an_unsupported_probe_says_what_the_host_cannot_provide() -> None:
+    result = sandbox_bwrap.ProbeResult(
+        False, "bwrap: Can't mount proc", "", sandbox_bwrap.Capability.PROCFS
+    )
+    assert result.describe() == (
+        "unsupported: this host cannot provide a new procfs (bwrap: Can't mount proc)"
+    )
+    assert sandbox_bwrap.ProbeResult(True, "", "0.12.0").describe() == (
+        "supported (bubblewrap 0.12.0)"
+    )
+
+
+@_linux_only
+def test_the_probe_passes_on_a_backend_that_runs_the_command(
+    tmp_path: Path, fake_bwrap: FakeBwrap
+) -> None:
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert result.supported and result.capability is None
+    assert result.version == "0.99.0-fake"
+    # The probe's description has a real launch's shape (D14.1).
+    (launch,) = fake_bwrap.log()
+    options = launch["options"]
+    for flag in ("--unshare-user", "--unshare-pid", "--unshare-ipc", "--proc", "--dev"):
+        assert flag in options, flag
+    assert "--ro-bind" in options and "--overlay" in options
+
+
+@_linux_only
+@pytest.mark.parametrize(
+    ("refuse", "capability"),
+    [
+        ("--unshare-user", "user_namespace"),
+        ("--unshare-pid", "pid_namespace"),
+        ("--unshare-ipc", "ipc_namespace"),
+        ("", "unknown"),
+    ],
+)
+def test_a_generic_namespace_refusal_is_narrowed_to_the_namespace(
+    tmp_path: Path, fake_bwrap: FakeBwrap, refuse: str, capability: str
+) -> None:
+    fake_bwrap.set("mode", "setup-fail")
+    fake_bwrap.set("refuse", refuse)
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert not result.supported
+    assert result.capability is not None and result.capability.key == capability
+    assert "Creating new namespace failed" in result.reason
+    tried = [
+        json.loads(line) for line in (fake_bwrap.root / "narrow.jsonl").read_text().splitlines()
+    ]
+    # One namespace more at each step, the host's root read-only, a trivial command.
+    assert [t[: t.index("--ro-bind")] for t in tried][0] == ["--unshare-user"]
+    assert all(t[t.index("--ro-bind") :][:3] == ["--ro-bind", "/", "/"] for t in tried)
+
+
+@_linux_only
+@pytest.mark.parametrize(
+    ("stderr", "capability"),
+    [
+        ("bwrap: Can't mount proc on /newroot/proc: Operation not permitted", "procfs"),
+        ("bwrap: Can't bind mount /oldroot/x on /newroot/x: Permission denied", "bind"),
+        ("bwrap: Can't make overlay mount on /newroot/y with options x: EINVAL", "overlay"),
+        (
+            "bwrap: No permissions to create a new namespace, likely because the kernel does "
+            "not allow non-privileged user namespaces.",
+            "user_namespace",
+        ),
+    ],
+)
+def test_the_probe_names_the_failing_setup_step(
+    tmp_path: Path, fake_bwrap: FakeBwrap, stderr: str, capability: str
+) -> None:
+    fake_bwrap.set("mode", "setup-fail")
+    fake_bwrap.set("stderr", stderr)
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert (result.supported, result.capability.key if result.capability else None) == (
+        False,
+        capability,
+    )
+    assert not (fake_bwrap.root / "narrow.jsonl").exists()
+
+
+@_linux_only
+def test_the_probe_names_a_missing_backend_and_one_without_overlay(
+    tmp_path: Path, fake_bwrap: FakeBwrap, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bwrap.set("help", "--size BYTES --perms OCTAL")
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert result.capability is sandbox_bwrap.Capability.OVERLAY
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert result.capability is sandbox_bwrap.Capability.BACKEND
+    assert "bwrap (bubblewrap)" in result.describe()
+
+
+@_linux_only
+def test_the_probe_writes_nothing_it_leaves_behind(
+    tmp_path: Path, fake_bwrap: FakeBwrap, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    assert sandbox_bwrap.probe(home=str(tmp_path), environ={}).supported
+    assert list(scratch.iterdir()) == []

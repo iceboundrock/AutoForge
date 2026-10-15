@@ -1,4 +1,4 @@
-.PHONY: test lint typecheck fmt fmt-check lock-check check check-matrix sync lock
+.PHONY: test test-sandbox lint typecheck fmt fmt-check lock-check check check-matrix sync lock
 
 # The interpreters the hosted CI matrix runs `pytest` on (`python-version:`
 # in .github/workflows/ci.yml). tests/test_ci_workflow.py fails when the two
@@ -24,6 +24,16 @@ lock-check:
 
 test:
 	uv run pytest
+
+# The tests that launch the real outer-sandbox backend (bubblewrap), on a host
+# that must be able to enforce it: each skips with the probe's reason
+# elsewhere, and here fails instead (AUTOFORGE_REQUIRE_SANDBOX_BACKEND). Not
+# part of `check`: whether the hosted CI runner can enforce is not something
+# this repository controls (docs/development.md, "The outer sandbox").
+SANDBOX_TESTS = tests/test_sandbox_bwrap.py tests/test_sandbox_routing.py \
+	tests/test_sandbox_parity.py
+test-sandbox:
+	AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1 uv run pytest -rs $(SANDBOX_TESTS)
 
 lint:
 	uv run ruff check src tests

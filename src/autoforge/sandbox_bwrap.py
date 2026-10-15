@@ -49,12 +49,15 @@ processes get no exit grace and no kill grace, and they are never counted
 (D10.3-D10.5, ADR 0002 §4e).
 
 :func:`probe` is the minimal launch that proves a host can enforce
-(D14.1's shape); its operator-facing use is #169's.
+(D14.1's shape) and names the :class:`Capability` a host lacks; its
+operator-facing uses, the engine's pre-launch gate and ``doctor``, are
+#169's (D13.5).
 """
 
 from __future__ import annotations
 
 import ctypes
+import enum
 import json
 import os
 import platform
@@ -526,13 +529,159 @@ def prepare(
 # ---------------------------------------------------------------- the probe
 
 
+class Capability(enum.Enum):
+    """What a host must provide for a launch to be enforced (ADR 0005 D14.1).
+
+    The probe names the first one it finds missing; the value is how the
+    gate's refusal, ``doctor`` and the documentation name it.
+    """
+
+    PLATFORM = "a Linux kernel (the only platform with a backend)"
+    BACKEND = "bwrap (bubblewrap) on the controller's PATH"
+    LANDLOCK = "the Landlock abstract-socket scope (Landlock ABI 6, Linux 6.12 or later)"
+    SESSION_KEYRING = "a new session keyring"
+    USER_NAMESPACE = "an unprivileged user namespace"
+    PID_NAMESPACE = "a PID namespace"
+    IPC_NAMESPACE = "an IPC namespace"
+    PROCFS = "a new procfs"
+    BIND = "the sandbox's bind and tmpfs mounts"
+    OVERLAY = "an unprivileged overlay mount"
+    UNKNOWN = "a setup step the probe could not name"
+
+    @property
+    def key(self) -> str:
+        """The machine-readable name: ``user_namespace``, ``procfs``, ..."""
+        return self.name.lower()
+
+
+# How a refusal's text names the capability it lacks, first match wins:
+# this module's own refusals, then ``bwrap``'s messages (bubblewrap 0.12.0's
+# strings; an older build words them the same way). A syscall name is
+# matched before the prose around it, because one message of
+# :meth:`BwrapLaunch.spawn_error` names both the keyring and Landlock.
+_CLASSIFIERS: tuple[tuple[Capability, tuple[str, ...]], ...] = (
+    (Capability.PLATFORM, ("has no backend on",)),
+    (
+        Capability.BACKEND,
+        (
+            "was not found on the controller's path",
+            "cannot be read (",
+            "--version failed",
+            "--help failed",
+        ),
+    ),
+    (Capability.SESSION_KEYRING, ("keyctl", "session keyring call")),
+    (Capability.LANDLOCK, ("landlock abi", "landlock_", "pr_set_no_new_privs")),
+    (
+        Capability.OVERLAY,
+        ("cannot mount an overlay", "overlay mount", "overlay workdir", "overlay source"),
+    ),
+    (
+        Capability.USER_NAMESPACE,
+        (
+            "non-privileged user namespaces",
+            "does not support user namespaces",
+            "setting up uid map",
+            "setting up gid map",
+            "unprivileged_userns",
+        ),
+    ),
+    (Capability.PROCFS, ("mount proc", "creating proc", "mounting proc")),
+    (
+        Capability.BIND,
+        (
+            "bind mount",
+            "find source path",
+            "open source",
+            "type of source",
+            "remount readonly",
+            "mount tmpfs",
+            "mount devpts",
+            "mount mqueue",
+            "mkdir parents",
+        ),
+    ),
+)
+# ``bwrap`` creates the user, PID and IPC namespaces in one call and words a
+# refusal of any of them the same way; :func:`_narrow_namespaces` tells them
+# apart.
+_NAMESPACE_FAILURE = "creating new namespace failed"
+
+
+def classify(reason: str) -> Capability:
+    """The capability a refusal's text says is missing; ``UNKNOWN`` when none."""
+    text = reason.lower()
+    for capability, needles in _CLASSIFIERS:
+        if any(needle in text for needle in needles):
+            return capability
+    return Capability.UNKNOWN
+
+
 @dataclass(frozen=True)
 class ProbeResult:
-    """Whether this host can enforce a launch, and if not, why."""
+    """Whether this host can enforce a launch, and if not, which capability it lacks.
+
+    ``capability`` is ``None`` exactly when ``supported``; ``reason`` is the
+    refusal, bounded and redacted as every refusal is; ``version`` the
+    backend's.
+    """
 
     supported: bool
     reason: str = ""
     version: str = ""
+    capability: Capability | None = None
+
+    def describe(self) -> str:
+        """One line for the gate's refusal and ``doctor``; no value but the reason."""
+        if self.supported:
+            return f"supported ({BACKEND} {self.version or 'version unknown'})"
+        missing = (self.capability or Capability.UNKNOWN).value
+        return f"unsupported: this host cannot provide {missing} ({self.reason})"
+
+
+def _true() -> str:
+    return "/usr/bin/true" if os.path.exists("/usr/bin/true") else "/bin/true"
+
+
+def _narrow_namespaces(executable: str) -> Capability:
+    """Which namespace a refusal ``bwrap`` words generically was about.
+
+    Each is tried on its own, in the order a launch needs them, with the
+    trivial command, the host root bound read-only and nothing else: the
+    first that ``bwrap`` refuses is named. Uncontained and outside any
+    sandbox, like ``--version``; nothing is written.
+    """
+    from . import executor  # the executor imports this module
+
+    steps = (
+        (Capability.USER_NAMESPACE, ["--unshare-user"]),
+        (Capability.PID_NAMESPACE, ["--unshare-user", "--unshare-pid"]),
+        (Capability.IPC_NAMESPACE, ["--unshare-user", "--unshare-pid", "--unshare-ipc"]),
+    )
+    for capability, flags in steps:
+        try:
+            result = executor.execute(
+                executor.ExecutionRequest(
+                    command=[executable, *flags, "--ro-bind", "/", "/", _true()],
+                    env_allowlist=(),
+                    timeout_seconds=_PROBE_TIMEOUT_SECONDS,
+                    max_output_bytes=65536,
+                )
+            )
+        except Exception:
+            return Capability.UNKNOWN
+        if result.timed_out or result.exit_code != 0:
+            return capability
+    return Capability.UNKNOWN
+
+
+def _unsupported(reason: str) -> ProbeResult:
+    capability = classify(reason)
+    if capability is Capability.UNKNOWN and _NAMESPACE_FAILURE in reason.lower():
+        executable = shutil.which(EXECUTABLE)
+        if executable is not None:
+            capability = _narrow_namespaces(executable)
+    return ProbeResult(False, reason, "", capability)
 
 
 def probe(home: str | None = None, environ: Mapping[str, str] | None = None) -> ProbeResult:
@@ -542,12 +691,15 @@ def probe(home: str | None = None, environ: Mapping[str, str] | None = None) -> 
     read-only bind, a mask with a carve-out, an overlay with a writable upper
     directory, the Landlock scope, a new session keyring and the status
     descriptor. Writes nothing outside a temporary directory it removes.
+    A refusal is typed: :attr:`ProbeResult.capability` names what the host
+    lacks, read from the refusal's text, and a namespace refusal ``bwrap``
+    words generically is narrowed by trying each namespace alone.
     """
     from . import executor  # the executor imports this module
 
     environ = os.environ if environ is None else environ
     home = home or environ.get("HOME", "")
-    true = "/usr/bin/true" if os.path.exists("/usr/bin/true") else "/bin/true"
+    true = _true()
     with tempfile.TemporaryDirectory(prefix="autoforge-sandbox-probe-") as raw:
         base = os.path.realpath(raw)
         for rel in ("ro/masked/carved", "ro/lower", "upper", "work"):
@@ -585,11 +737,13 @@ def probe(home: str | None = None, environ: Mapping[str, str] | None = None) -> 
                 )
             )
         except (SandboxPolicyError, SandboxLaunchRefusedError) as exc:
-            return ProbeResult(False, str(exc))
+            return _unsupported(str(exc))
         finally:
             _make_removable(os.path.join(base, "work"))
         if result.exit_code != 0:
-            return ProbeResult(False, f"the probe command exited {result.exit_code}")
+            return ProbeResult(
+                False, f"the probe command exited {result.exit_code}", "", Capability.UNKNOWN
+            )
         version = result.sandbox.backend_version if result.sandbox is not None else ""
         return ProbeResult(True, "", version)
 

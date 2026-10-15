@@ -18,10 +18,36 @@ make typecheck    # uv run mypy src
 make lock-check   # uv lock --check (what CI's `uv sync --locked` enforces)
 make check        # lock-check + the four CI commands, on the local interpreter
 make check-matrix # pytest on every CI Python (3.11, 3.12), opt-in
+make test-sandbox # the real-backend sandbox tests; fail (not skip) without a backend
 ```
 
 Run `make check` before declaring a change complete, and `make check-matrix`
-when a change could be interpreter-sensitive.
+when a change could be interpreter-sensitive. Run `make test-sandbox` too
+when a change touches the outer sandbox (`sandbox*.py`, the executor, a
+provider's declaration, the engine's launch routing).
+
+## The outer sandbox
+
+`tests/test_sandbox_bwrap.py`, `tests/test_sandbox_routing.py` and
+`tests/test_sandbox_parity.py` launch the real backend (`bwrap`). Each
+first runs the backend's own capability probe
+(`autoforge.sandbox_bwrap.probe`, ADR 0005 D14.1) and, on a host that
+cannot enforce, skips with the probe's typed reason: which capability is
+missing (`bwrap` itself, an unprivileged user, PID or IPC namespace, a new
+procfs, a bind mount, an overlay mount, Landlock ABI 6). `pytest` is
+configured with `-rs`, so every run, CI's included, prints each skip and
+its reason; a silent pass of zero tests cannot hide one. `make test-sandbox`
+runs those three modules with `AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1`, which
+turns each skip into a failure: the target for a host known to be capable
+(a Linux 6.12+ workstation with `bwrap` and unprivileged user namespaces).
+It is not part of `make check`, and the hosted workflow does not run it:
+whether GitHub's Ubuntu runners can enforce (their AppArmor policy on
+unprivileged user namespaces, their kernel's Landlock ABI) is not something
+this repository controls or has measured, so CI shows the skip reason
+instead of claiming coverage it may not have. The rest of the suite stands
+in for the probe (`tests/conftest.py`'s `sandbox_probe` fixture answers
+"supported" without a launch), so every mode and the pre-launch gate are
+tested on any host.
 
 ## Continuous integration
 
@@ -88,7 +114,9 @@ themselves are specified in
 
 Tests never call real Claude Code, OpenCode or GitHub write APIs. Agents are
 replaced by a `ScriptedProvider` and GitHub by an in-memory fake; the
-executor tests use real local Python subprocesses only.
+executor tests use real local Python subprocesses only, and the sandbox's
+real-backend tests real `bwrap` around fake CLIs
+([The outer sandbox](#the-outer-sandbox)).
 
 - [testing.md](agent-guides/testing.md): the coverage contract, including
   the high-priority areas every behavioural change there must test.

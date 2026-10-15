@@ -173,7 +173,14 @@ def test_all_checks_pass(tmp_path):
         "state dir writable",
     ):
         assert expected in names
-    assert all(r.ok for r in results), [r for r in results if not r.ok]
+    others = [r for r in results if not r.name.startswith("outer sandbox: ")]
+    assert all(r.ok for r in others), [r for r in others if not r.ok]
+    # The default sandbox.mode is disabled: reported as a risk, never a failure
+    # (ADR 0005 D12.4), and nothing of the sandbox rows fails doctor.
+    sandbox = {r.name: r for r in results if r.name.startswith("outer sandbox: ")}
+    mode = sandbox["outer sandbox: mode (disabled)"]
+    assert mode.label == "WARN" and "logical isolation only" in mode.detail
+    assert not any(r.label == "FAIL" for r in sandbox.values()), sandbox
     assert "owner/repo" in next(r.detail for r in results if r.name == "GitHub remote")
     assert (tmp_path / ".autoforge").is_dir()
     assert not any(p.name.startswith(".doctor-") for p in (tmp_path / ".autoforge").iterdir())
@@ -945,7 +952,8 @@ def test_a_healthy_pi_profile_passes_and_bounds_its_claim(tmp_path):
     # `ready` proves a credential exists for the provider, not that the model is usable.
     assert "provider 'openai' only" in auth.detail
     assert "cannot be checked" in auth.detail
-    assert all(r.ok for r in results.values()), [r for r in results.values() if not r.ok]
+    others = [r for n, r in results.items() if not n.startswith("outer sandbox: ")]
+    assert all(r.ok for r in others), [r for r in others if not r.ok]
 
 
 @pytest.mark.parametrize("version", ["1.0.0", "1.0.1", "1.12.0", "2.0.0", "10.0.0"])

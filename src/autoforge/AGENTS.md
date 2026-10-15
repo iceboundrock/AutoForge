@@ -13,6 +13,9 @@ a concern lives so the routing rules can be applied.
 cli.py              subcommands run / step / resume / unblock / status / doctor / local, dry-run flags
 config.py           configuration loading and validation; owns config defaults and keys
 doctor.py           read-only environment checks
+doctor_sandbox.py   doctor's outer-sandbox rows: capability and mode outcome, policy by
+                    class, provider declarations and sandboxed --version, operator paths,
+                    hard links, sandbox directories, TCP listeners; read-only (#169)
 engine.py           ControllerEngine: phase orchestration, verification calls, recovery
 transitions.py      Phase enum, LEGAL_EDGES / LOCAL_LEGAL_EDGES / UNBLOCK_TARGETS, decide_next_phase
 profiles.py         execution-profile routing (which provider/model/effort per phase/round)
@@ -39,7 +42,7 @@ sandbox.py          outer sandbox: the backend-neutral launch description, the p
                     no workflow semantics (#167)
 sandbox_bwrap.py    the Linux backend: the only place that knows a `bwrap` flag; the
                     launch's keyring and Landlock scope, setup-failure detection, the
-                    capability probe (#167)
+                    typed capability probe (#167, #169)
 sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005 §2.5):
                     LaunchFacts from the engine, ProviderRequirements from an adapter,
                     the SandboxPlan, the path-valued environment rewrite (D8.2),
@@ -155,7 +158,8 @@ sandbox.py, sandbox_bwrap.py                      -> docs/agent-guides/architect
                                                      model.md and ADR 0002 §4e
 sandbox_policy.py, providers.py
 (sandbox_requirements), engine.py (launch
-routing, sandbox directories)                     -> docs/agent-guides/architecture.md
+routing, sandbox directories, the pre-launch
+gate), doctor_sandbox.py                          -> docs/agent-guides/architecture.md
                                                      (Launch routing) + ADR 0005 and
                                                      docs/configuration.md (Outer sandbox)
 agent_worktree.py, engine.py (strict import,

@@ -413,33 +413,45 @@ github:
   timeout_seconds: 120
 
 sandbox:
-  # The outer sandbox (ADR 0005, #168): an OS-enforced filesystem, process
-  # and IPC boundary around what AutoForge launches, on top of the logical
-  # isolation of `execution.env_allowlist` (docs/configuration.md, "Outer
-  # sandbox").
-  #   disabled -- (the default) launches run as your UID with logical
-  #               isolation only;
-  #   required -- every agent launch (Pi's auth preflight included), every
-  #               `local.validation_commands` and `validation.commands` entry
-  #               and every `merge.verification_commands` entry runs inside the sandbox
-  #               or is refused before it runs; never without it. Linux only:
-  #               `bwrap` on PATH, unprivileged user namespaces, Landlock ABI 6.
-  #               No pre-launch check exists yet, so a host that cannot
-  #               enforce refuses at the first launch. Launches see the system
-  #               runtime, a private home and /tmp, their workspace and what
-  #               their provider declares; a toolchain under your home or in
-  #               /opt is not visible. A Claude subscription login cannot be
-  #               refreshed inside: use a dedicated CLAUDE_CONFIG_DIR or a
-  #               token variable; Pi needs a PI_CODING_AGENT_DIR of its own.
+  # The outer sandbox (ADR 0005, #168, #169): an OS-enforced filesystem,
+  # process and IPC boundary around what AutoForge launches, on top of the
+  # logical isolation of `execution.env_allowlist` (docs/configuration.md,
+  # "Outer sandbox"; docs/usage.md, "Outer sandbox"). `autoforge doctor` /
+  # `autoforge local doctor` show whether this host can enforce it.
+  #   disabled  -- (the default) logical isolation only: launches run as your
+  #                UID without the outer sandbox; doctor reports it as a risk.
+  #   required  -- every agent launch (Pi's auth preflight included), every
+  #                `local.validation_commands` and `validation.commands` entry
+  #                and every `merge.verification_commands` entry runs inside
+  #                the sandbox, never without it. Linux only: `bwrap` on PATH,
+  #                unprivileged user, PID and IPC namespaces, overlay mounts,
+  #                Landlock ABI 6. A host that cannot enforce is refused at the
+  #                start of the step, before anything is saved, charged or
+  #                launched (exit 2, naming what the host lacks).
+  #   preferred -- `required` where the host can enforce. Where it cannot, a
+  #                LOCAL launch runs with logical isolation only and says so
+  #                (stderr at the launch, `enforced: false` in its record); a
+  #                REMOTE run refuses exactly as under `required`.
+  # Launches see the system runtime, a private home and /tmp, their workspace
+  # and what their provider declares; a toolchain under your home or in /opt
+  # is not visible unless listed in `read_only_paths`. A Claude subscription
+  # login cannot be refreshed inside: use a dedicated CLAUDE_CONFIG_DIR or a
+  # token variable; Pi needs a PI_CODING_AGENT_DIR of its own.
   # Whatever the mode, the controller reads an issue worktree's HEAD through
   # the git common dir and imports the agent's objects strictly.
   mode: disabled
   # `isolated`: validation commands (LOCAL and REMOTE) / pre-merge verification commands
   # run in a network namespace of their own (no host loopback service, no
-  # download). Agents always share the host network. Read only under
-  # `required`.
+  # download). Agents always share the host network. Read only when the
+  # sandbox is enabled.
   validation_network: host    # host | isolated
   premerge_network: host      # host | isolated
+  # Absolute paths every launch sees read-only, at the same path (ADR 0005
+  # D15.4): a toolchain outside /usr, a CA bundle, a registry configuration.
+  # Refused at load: your home or an ancestor, ~/.ssh, ~/.gnupg, ~/.netrc,
+  # the gh and git configuration, keyrings, /run, /proc, /dev, /sys. A token
+  # in a listed file (~/.npmrc) is readable by every tool in the sandbox.
+  read_only_paths: []         # e.g. ["/opt/toolchain", "/home/me/.npmrc"]
 
 # ---------------------------------------------------------------------------
 # LOCAL mode (`autoforge local init|run|doctor`).

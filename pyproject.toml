@@ -26,7 +26,8 @@ dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10", "pyyaml>=6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# -rs: every skip prints its reason (a real-backend test names what the host lacks).
+addopts = "-q -rs"
 
 [tool.ruff]
 target-version = "py311"

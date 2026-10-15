@@ -308,8 +308,17 @@ class Policy:
 
     @property
     def requires_enforcement(self) -> bool:
-        """D8.3: a record applies under this policy only when it was enforced."""
-        return self.mode in ("required", "preferred")
+        """D8.3: a record applies under this policy only when it was enforced.
+
+        Under ``required``, and under ``preferred`` in REMOTE, which refuses
+        as ``required`` does (ADR 0005 D12.2). LOCAL's ``preferred`` falls
+        back to logical isolation on a host that cannot enforce, and its
+        records say ``enforced: false`` honestly; the in-place method is
+        LOCAL's, so it tells the two apart.
+        """
+        if self.mode == "preferred":
+            return self.method != METHOD_IN_PLACE
+        return self.mode == "required"
 
     def stored(self) -> dict:
         return {
@@ -1361,8 +1370,8 @@ def applicable(record: RecordView, candidate: Candidate, definition: str, policy
     """D8.3: an observed record for this candidate, definition and policy.
 
     Equal candidate identity (never provenance), definition digest and
-    policy digest; under ``required`` (or ``preferred``) the record must
-    also show the launch enforced. An ``INTERRUPTED`` record never applies.
+    policy digest; under ``required`` (or REMOTE's ``preferred``) the record
+    must also show the launch enforced. An ``INTERRUPTED`` record never applies.
     """
     return (
         record.is_observed

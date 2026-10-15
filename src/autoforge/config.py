@@ -36,6 +36,7 @@ than keeping as the string it looks like. See the note above ``_scalar``.
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
@@ -43,7 +44,7 @@ from pathlib import Path
 
 from . import __prompt_version__
 from .child_env import refuse_forbidden_env
-from .errors import ConfigurationError, ValidationDefinitionError
+from .errors import ConfigurationError, SandboxPolicyError, ValidationDefinitionError
 from .evidence import SCOPE, check_definitions, check_scope
 from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
 from .local_workspace import (
@@ -51,6 +52,7 @@ from .local_workspace import (
     DEFAULT_MAX_ENTRIES,
     normalize_exclude_pattern,
 )
+from .sandbox import check_declared_path
 
 CONFIG_VERSION = 1
 
@@ -642,40 +644,67 @@ class LocalConfig:
 
 
 SANDBOX_DISABLED = "disabled"
+SANDBOX_PREFERRED = "preferred"
 SANDBOX_REQUIRED = "required"
-# `preferred` and the pre-launch gate are #169's (ADR 0005 D12.2).
-SANDBOX_MODES = (SANDBOX_DISABLED, SANDBOX_REQUIRED)
+SANDBOX_MODES = (SANDBOX_DISABLED, SANDBOX_PREFERRED, SANDBOX_REQUIRED)
 SANDBOX_NETWORKS = ("host", "isolated")
-SANDBOX_KEYS = ("mode", "validation_network", "premerge_network")
+SANDBOX_KEYS = ("mode", "validation_network", "premerge_network", "read_only_paths")
 
 
 @dataclass
 class SandboxConfig:
-    """The outer sandbox (``sandbox:`` in the config file; ADR 0005 D12.1, D9.2).
+    """The outer sandbox (``sandbox:`` in the config file; ADR 0005 D12, D9.2, D15.4).
 
-    ``mode`` is ``disabled`` (the default: logical isolation only, #165) or
-    ``required``: every agent launch, LOCAL validation command and pre-merge
-    verification command runs inside the outer sandbox, or is refused; it
-    never runs without it. Not part of LOCAL's run contract (D12.3): it
-    decides how a launch is contained, not what the run is, so a run
-    resumes under another mode. The candidate read and the strict import of
-    an issue's private objects (D6.3-D6.5) apply in both modes.
+    ``mode`` is one of:
+
+    - ``disabled`` (the default): logical isolation only (#165); no launch
+      is sandboxed, and ``doctor``, the plan and ``status`` say so;
+    - ``required``: every agent launch, LOCAL validation command and
+      pre-merge verification command runs inside the outer sandbox, or is
+      refused; it never runs without it. A host that cannot enforce is
+      refused by the pre-launch gate, before anything is saved or charged;
+    - ``preferred``: in a LOCAL run, enforced when the host can, else run
+      with logical isolation only, visibly (the plan, ``status``, stderr at
+      the launch, every execution record); in a REMOTE run, exactly
+      ``required``, since nobody watches an unattended fallback (D12.2).
+
+    Not part of LOCAL's run contract (D12.3): it decides how a launch is
+    contained, not what the run is, so a run resumes under another mode.
+    The candidate read and the strict import of an issue's private objects
+    (D6.3-D6.5) apply in every mode.
 
     ``validation_network`` and ``premerge_network`` are ``host`` (the
     default) or ``isolated``: a validation command (LOCAL, or REMOTE
     ``validation.commands`` in a candidate's export), or a pre-merge
     verification command, then runs with no network at all (no loopback, no
     abstract socket, no download). Agents always share the host network.
-    Read only under ``required``.
+
+    ``read_only_paths`` are absolute host paths every sandboxed launch sees
+    read-only (D15.4): a toolchain, an interpreter or a file a build needs
+    outside ``/usr`` and ``/etc``. Refused at load when one names the
+    operator's home, an ancestor of it or a forbidden source, or two nest;
+    one overlapping a denied root of the checkout is refused before the
+    first launch. There are no operator-declared writable paths.
+
+    The networks and the paths are read only when a launch is enforced.
     """
 
     mode: str = SANDBOX_DISABLED
     validation_network: str = "host"
     premerge_network: str = "host"
+    read_only_paths: list[str] = field(default_factory=list)
 
     @property
-    def required(self) -> bool:
-        return self.mode == SANDBOX_REQUIRED
+    def enabled(self) -> bool:
+        """A sandbox is wanted: ``required`` or ``preferred``."""
+        return self.mode != SANDBOX_DISABLED
+
+    def refuses_unenforced(self, local: bool) -> bool:
+        """Whether a launch the host cannot enforce is refused rather than run.
+
+        ``required`` everywhere, ``preferred`` in REMOTE (ADR 0005 D12.2).
+        """
+        return self.mode == SANDBOX_REQUIRED or (self.mode == SANDBOX_PREFERRED and not local)
 
 
 # The keys a config file may contain at top level: the scalars read directly
@@ -1036,6 +1065,37 @@ def _optional_limit(raw: object, source: str, key: str) -> int | None:
     return value
 
 
+def _as_read_only_paths(raw: object, source: str) -> list[str]:
+    """``sandbox.read_only_paths``: absolute paths every sandboxed launch sees read-only (D15.4).
+
+    Each is checked with the rules that need no launch (C1, C3, C7, D4.3;
+    :func:`autoforge.sandbox.check_declared_path`) against the controller's
+    own home and environment, and no two may be equal or nested (C6). A
+    refusal names the key, the entry and the rule, never a file's contents.
+    """
+    key = "sandbox.read_only_paths"
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ConfigurationError(
+            f"{source}: '{key}' must be a list of absolute paths, e.g. ['/opt/toolchain']"
+        )
+    home = os.path.normpath(os.environ.get("HOME") or os.path.expanduser("~"))
+    paths: list[str] = []
+    for index, path in enumerate(raw):
+        label = f"'{key}[{index}]'"
+        try:
+            check_declared_path(path, home, os.environ, label)
+        except SandboxPolicyError as exc:
+            raise ConfigurationError(f"{source}: {exc}") from None
+        for other in paths:
+            if path == other or path.startswith(other + "/") or other.startswith(path + "/"):
+                raise ConfigurationError(
+                    f"{source}: {label} {path} overlaps {other}, another entry of '{key}' "
+                    "(C6 overlaps): declare the outer one alone"
+                )
+        paths.append(path)
+    return paths
+
+
 def _reject_unknown_keys(mapping: dict, known: tuple[str, ...], source: str, label: str) -> None:
     """Fail on any key of ``mapping`` that the loader would not read.
 
@@ -1368,6 +1428,8 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
                     f"{source}: 'sandbox.{key}' must be one of {', '.join(allowed)}, got {value!r}"
                 )
             setattr(base.sandbox, key, value)
+    if "read_only_paths" in sandbox:
+        base.sandbox.read_only_paths = _as_read_only_paths(sandbox["read_only_paths"], source)
     validation = _section(data, "validation", source, VALIDATION_KEYS)
     if "commands" in validation:
         base.validation.commands = _as_definitions(

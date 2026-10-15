@@ -15,7 +15,6 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import threading
 import uuid
 from pathlib import Path
@@ -32,9 +31,15 @@ from autoforge.sandbox import NetworkPosition
 from autoforge.sandbox_policy import LaunchClass, LaunchFacts, SandboxPlan, describe_launch
 from autoforge.transitions import Phase
 
-from .conftest import GIT_IDENT, FakeGitHub, make_local_engine
+from .conftest import (
+    GIT_IDENT,
+    SYSTEM_PYTHON,
+    FakeGitHub,
+    make_local_engine,
+    real_sandbox_backend,
+)
 
-PY = "/usr/bin/python3"
+PY = SYSTEM_PYTHON
 
 # Prepended to every probe run inside: each operation's outcome as a word.
 _PROBE = """
@@ -56,15 +61,7 @@ def read(path):
 
 @pytest.fixture(scope="module")
 def backend(tmp_path_factory: pytest.TempPathFactory) -> str:
-    if not sys.platform.startswith("linux"):
-        pytest.skip("the outer sandbox's backend is Linux-only")
-    if not os.path.exists(PY):
-        pytest.skip(f"{PY} is not installed, so no fake command can run inside")
-    home = tmp_path_factory.mktemp("probe-home")
-    result = sandbox_bwrap.probe(home=str(home), environ={})
-    if not result.supported:
-        pytest.skip(f"this host cannot enforce the outer sandbox: {result.reason}")
-    return result.version
+    return real_sandbox_backend(tmp_path_factory)
 
 
 def _git(*args: str) -> str:

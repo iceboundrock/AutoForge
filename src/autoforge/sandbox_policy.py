@@ -51,6 +51,7 @@ import dataclasses
 import enum
 import os
 import posixpath
+import re
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -179,6 +180,8 @@ class LaunchFacts:
     launch's read context, ``controller_config`` the directory #165's
     overrides point into. ``home`` is the operator's home and
     ``controller_env`` the controller's environment, for D4.3.
+    ``operator_paths`` are ``sandbox.read_only_paths``, as configured
+    (D15.4): read-only for every launch class.
     """
 
     launch_class: LaunchClass
@@ -195,6 +198,7 @@ class LaunchFacts:
     controller_config: str = ""
     denied_roots: tuple[str, ...] = ()
     network: NetworkPosition = NetworkPosition.HOST
+    operator_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -298,44 +302,9 @@ def sandbox_request(
             carve_out=False,
         )
 
-    env: list[tuple[str, str]] = []
-    keyring: list[str] = []
-    operator_roots: tuple[str, ...] = ()
     agent = kind in (LaunchClass.REMOTE_AGENT, LaunchClass.LOCAL_AGENT)
-    if needs is not None and agent:
-        operator_roots = needs.operator_config_roots
-        for path in _outermost([*needs.install_roots, *needs.config]):
-            projections.append(
-                ProjectionRequest(path, read_only, Origin.DECLARED, label=f"{path} (provider)")
-            )
-        for path in needs.home_config:
-            projections.append(
-                ProjectionRequest(
-                    path, read_only, Origin.DECLARED, target=path, label=f"{path} (provider)"
-                )
-            )
-        for path in needs.state:
-            projections.append(
-                ProjectionRequest(path, writable, Origin.DECLARED, label=f"{path} (provider)")
-            )
-        for item in needs.auth:
-            if item.mode is AuthMode.KEYRING:
-                keyring.append(item.source or item.label)
-                continue
-            if item.mode not in (AuthMode.FILE_RO, AuthMode.DIR_RW):
-                continue
-            access = writable if item.mode is AuthMode.DIR_RW else read_only
-            projections.append(
-                ProjectionRequest(
-                    item.source,
-                    access,
-                    Origin.DECLARED,
-                    target=item.target,
-                    label=f"{item.label} ({item.mode.value})",
-                )
-            )
-            if item.env_name:
-                env.append((item.env_name, item.target or item.source))
+    declared = _declared(needs if agent else None, facts.operator_paths, facts.home)
+    projections += declared.projections
     network = NetworkPosition.HOST if agent else facts.network
     return SandboxRequest(
         home=facts.home,
@@ -344,11 +313,260 @@ def sandbox_request(
         masks=tuple(masks),
         overlays=tuple(overlays),
         denied_roots=tuple(dict.fromkeys(facts.denied_roots)),
-        operator_config_roots=operator_roots,
-        keyring_items=tuple(keyring),
+        operator_config_roots=declared.operator_roots,
+        keyring_items=declared.keyring,
         network=network,
-        env=tuple(env),
+        env=declared.env,
     )
+
+
+OPERATOR_PATHS_KEY = "sandbox.read_only_paths"
+
+
+def operator_path_problem(operator_paths: tuple[str, ...], denied_roots: tuple[str, ...]) -> str:
+    """The first operator read-only path that overlaps a denied root, as a reason; "" if none.
+
+    ADR 0005 D15.4: an operator path may not name, sit inside or contain
+    what no launch may see -- the state directory, the lock, the
+    controller's directory under the git common dir, another worktree, the
+    operator's checkout in REMOTE. The loader cannot know these (they are
+    the run's), so the engine's gate and ``doctor`` ask before a launch
+    would; the compiler refuses the same overlap at the launch regardless.
+    Both sides are compared resolved, as the compiler compares them.
+    """
+    denied = [(root, os.path.realpath(root)) for root in denied_roots]
+    for index, path in enumerate(operator_paths):
+        real = os.path.realpath(path)
+        for root, resolved in denied:
+            if _inside(real, resolved) or _inside(resolved, real):
+                return (
+                    f"{OPERATOR_PATHS_KEY}[{index}] {path!r} overlaps {root!r}, which no "
+                    "launch may see (ADR 0005 D15.4: the state directory, the lock, the "
+                    "controller's directory under the git common dir, another worktree, and "
+                    "in REMOTE the operator's checkout)"
+                )
+    return ""
+
+
+@dataclass(frozen=True)
+class _Declared:
+    projections: tuple[ProjectionRequest, ...]
+    env: tuple[tuple[str, str], ...]
+    keyring: tuple[str, ...]
+    operator_roots: tuple[str, ...]
+
+
+def _declared(
+    needs: ProviderRequirements | None, operator_paths: tuple[str, ...], home: str
+) -> _Declared:
+    """The declared projections of a launch: the provider's, then the operator's.
+
+    Every one is :attr:`Origin.DECLARED`, so C6 decides its overlaps. The
+    provider's read-only install roots and configuration are kept outermost,
+    as before; an operator path outside the home that one of them already
+    shows is dropped for this launch, and a provider root inside an
+    operator path is dropped in its favour (both are read-only, so the outer
+    one shows the inner). An operator path is projected by its spelling
+    (the compiler resolves it, C1), so a launch class without a provider
+    sees exactly the configured list; one inside the home appears at that
+    spelling in the private home (C7, D15.4), as a provider's home
+    configuration does.
+    """
+    projections: list[ProjectionRequest] = []
+    env: list[tuple[str, str]] = []
+    keyring: list[str] = []
+    in_home = [p for p in operator_paths if _inside(p, home) and p != home]
+    elsewhere = [p for p in operator_paths if p not in in_home]
+    roots = _outermost([*needs.install_roots, *needs.config]) if needs is not None else []
+    if roots:
+        real = {p: os.path.realpath(p) for p in elsewhere}
+        elsewhere = [p for p in elsewhere if not any(_inside(real[p], r) for r in roots)]
+        roots = [r for r in roots if not any(_inside(r, real[p]) for p in elsewhere)]
+    for path in roots:
+        projections.append(
+            ProjectionRequest(path, Access.READ_ONLY, Origin.DECLARED, label=f"{path} (provider)")
+        )
+    for path in elsewhere:
+        projections.append(
+            ProjectionRequest(
+                path, Access.READ_ONLY, Origin.DECLARED, label=f"{path} ({OPERATOR_PATHS_KEY})"
+            )
+        )
+    for path in in_home:
+        projections.append(
+            ProjectionRequest(
+                path,
+                Access.READ_ONLY,
+                Origin.DECLARED,
+                target=path,
+                label=f"{path} ({OPERATOR_PATHS_KEY})",
+            )
+        )
+    if needs is None:
+        return _Declared(tuple(projections), (), (), ())
+    for path in needs.home_config:
+        projections.append(
+            ProjectionRequest(
+                path, Access.READ_ONLY, Origin.DECLARED, target=path, label=f"{path} (provider)"
+            )
+        )
+    for path in needs.state:
+        projections.append(
+            ProjectionRequest(path, Access.WRITABLE, Origin.DECLARED, label=f"{path} (provider)")
+        )
+    for item in needs.auth:
+        if item.mode is AuthMode.KEYRING:
+            keyring.append(item.source or item.label)
+            continue
+        if item.mode not in (AuthMode.FILE_RO, AuthMode.DIR_RW):
+            continue
+        access = Access.WRITABLE if item.mode is AuthMode.DIR_RW else Access.READ_ONLY
+        projections.append(
+            ProjectionRequest(
+                item.source,
+                access,
+                Origin.DECLARED,
+                target=item.target,
+                label=f"{item.label} ({item.mode.value})",
+            )
+        )
+        if item.env_name:
+            env.append((item.env_name, item.target or item.source))
+    return _Declared(
+        tuple(projections), tuple(env), tuple(keyring), tuple(needs.operator_config_roots)
+    )
+
+
+def provider_request(
+    needs: ProviderRequirements,
+    *,
+    home: str,
+    controller_env: Mapping[str, str],
+    workspace: str,
+    operator_paths: tuple[str, ...] = (),
+    denied_roots: tuple[str, ...] = (),
+) -> SandboxRequest:
+    """A provider's declaration alone, around a scratch ``workspace`` (ADR 0005 D14.1).
+
+    What ``doctor`` compiles to say whether a declaration is allowed, and
+    launches the provider's ``--version`` in to prove it is enough: the
+    rows every agent launch gets from its provider and the operator, the
+    workspace writable, and none of a workflow's (no repository, no cache,
+    no read context). The same rules as :func:`sandbox_request`'s.
+    """
+    declared = _declared(needs, operator_paths, home)
+    workspace_projection = ProjectionRequest(
+        workspace, Access.WRITABLE, Origin.ENGINE, label="the scratch workspace"
+    )
+    return SandboxRequest(
+        home=home,
+        controller_env=controller_env,
+        projections=(workspace_projection, *declared.projections),
+        denied_roots=tuple(dict.fromkeys(denied_roots)),
+        operator_config_roots=declared.operator_roots,
+        keyring_items=declared.keyring,
+        env=declared.env,
+    )
+
+
+# The phrases :func:`class_summary` shows for a role path (:func:`role`).
+_ROLE_RE = re.compile(r"/@([a-z-]+)")
+
+
+def _shown(path: str) -> str:
+    return _ROLE_RE.sub(lambda m: f"<{m.group(1).replace('-', ' ')}>", path)
+
+
+def summary_facts(
+    launch_class: LaunchClass,
+    network: NetworkPosition,
+    *,
+    cache: bool,
+    operator_paths: tuple[str, ...] = (),
+) -> LaunchFacts:
+    """A launch class's facts with every controller path a role name, for display.
+
+    The shape :meth:`ControllerEngine` builds for a launch of the class
+    (D13.2), before anything is created: what the dry-run plan and
+    ``doctor`` describe. ``cache`` says whether the launch gets the
+    persistent cache (§2.5).
+    """
+    facts = LaunchFacts(
+        launch_class=launch_class,
+        workspace=role("workspace"),
+        home=role("home"),
+        controller_env={},
+        controller_config=role("controller-config"),
+        denied_roots=(role("denied-roots"),),
+        network=network,
+        operator_paths=operator_paths,
+        cache=role("cache") if cache and launch_class is not LaunchClass.EXPORT_COMMAND else "",
+    )
+    if launch_class is LaunchClass.EXPORT_COMMAND:
+        return facts
+    if launch_class is LaunchClass.REMOTE_AGENT:
+        return dataclasses.replace(
+            facts,
+            git_entry=posixpath.join(role("workspace"), ".git"),
+            git_dir=role("admin-dir"),
+            common_dir=role("common-dir"),
+            private_objects=role("private-objects"),
+            overlay_work=role("overlay-work"),
+            read_context=role("read-context"),
+        )
+    entry = posixpath.join(role("workspace"), ".git")
+    return dataclasses.replace(facts, git_entry=entry, git_dir=entry, common_dir=entry)
+
+
+def class_summary(facts: LaunchFacts) -> str:
+    """What a launch of ``facts.launch_class`` gets, in words, from §2.5's mapping.
+
+    Derived from :func:`sandbox_request` over :func:`summary_facts`, so the
+    words cannot drift from what a launch is given: the writable and
+    read-only projections by label, the masks, the overlays, what the
+    compiler adds to every launch, the denied roots and the network. A
+    provider's own declaration is named, never listed: it is per provider
+    (``doctor`` lists it).
+    """
+    request = sandbox_request(facts)
+    writable = [p.label for p in request.projections if p.access is Access.WRITABLE]
+    read_only = [p.label for p in request.projections if p.access is Access.READ_ONLY]
+    parts = []
+    if writable:
+        parts.append("writable: " + ", ".join(writable))
+    if read_only:
+        parts.append("read-only: " + ", ".join(read_only))
+    if request.masks:
+        parts.append("masked: " + ", ".join(_shown(m) for m in request.masks))
+    for overlay in request.overlays:
+        parts.append(
+            f"overlay: {overlay.label or _shown(overlay.lower)}, its writes landing in "
+            f"{_shown(overlay.upper)}"
+        )
+    if facts.launch_class in (LaunchClass.REMOTE_AGENT, LaunchClass.LOCAL_AGENT):
+        parts.append(
+            "the provider's executable, install roots, configuration and model credential "
+            "as its adapter declares them"
+        )
+    parts.append(
+        "always: /usr and /etc read-only, a private home and /tmp per launch, a new /proc, "
+        "a minimal /dev, /sys read-only"
+    )
+    parts.append(
+        "absent: the state directory and run logs, the lock, <git common dir>/autoforge "
+        "but the launch's own carve-outs, every other worktree"
+        + (" and the controller checkout" if facts.launch_class is LaunchClass.REMOTE_AGENT else "")
+        + "; credentials, keyrings, /run and everything not listed"
+    )
+    parts.append(
+        "network: "
+        + (
+            "isolated (no loopback, no abstract socket, no egress)"
+            if request.network is NetworkPosition.ISOLATED
+            else "the host's (abstract sockets of the host unreachable; not sandboxed)"
+        )
+    )
+    return "; ".join(parts)
 
 
 # The version label of :func:`launch_template`'s encoding. The compiler's
@@ -368,6 +586,7 @@ def template_facts(
     *,
     separate_git_dir: bool = False,
     linked: bool = False,
+    operator_paths: tuple[str, ...] = (),
 ) -> LaunchFacts:
     """A repository-defined command's facts with every concrete path a role name.
 
@@ -379,6 +598,9 @@ def template_facts(
     root's ``.git`` is a file naming the git directory and ``linked`` that
     the checkout is a linked worktree with a common dir of its own: the
     layout decides which of them §2.5 projects, never where they are.
+    ``operator_paths`` (``sandbox.read_only_paths``, D15.4) are
+    configuration, not paths of the launch: they are in the template as
+    configured.
     """
     workspace = role("candidate-root")
     facts = LaunchFacts(
@@ -389,6 +611,7 @@ def template_facts(
         controller_config=role("controller-config"),
         denied_roots=(role("denied-roots"),),
         network=network,
+        operator_paths=operator_paths,
     )
     if launch_class is LaunchClass.EXPORT_COMMAND:
         return facts

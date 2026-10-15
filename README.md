@@ -135,8 +135,13 @@ Each line is a summary; the linked document is the precise statement.
   refuses it: an empty root with only the system runtime, the workspace,
   read-only git metadata, a private home and what the provider declares, so
   controller state, other worktrees and your credential files are out of
-  reach. It still runs as your UID, and agents keep the host network
+  reach. It still runs as your UID, and agents keep the host network. A
+  host that cannot enforce one is refused before the step, with nothing
+  saved, charged or launched; `preferred` falls back to logical isolation
+  only in LOCAL, visibly, and refuses like `required` in REMOTE; `doctor`
+  shows which this host gets
   ([ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md),
+  [Usage](docs/usage.md#outer-sandbox),
   [Configuration](docs/configuration.md#outer-sandbox)).
 - **Agents hold no GitHub credential.** The controller makes every GitHub
   write itself; agents, validation commands and pre-merge commands get no
@@ -287,7 +292,9 @@ under the default `sandbox.mode: disabled`
 every LOCAL agent and validation command runs inside ADR 0005's outer
 sandbox, where the git directory is read-only, so a commit, stash or branch
 switch fails outright; the agent still runs as your UID on the host
-network ([Local mode](docs/local-mode.md#what-the-controller-does-and-does-not-do)).
+network. `preferred` does the same where the host can enforce and, where it
+cannot, says at every launch that it runs with logical isolation only
+([Local mode](docs/local-mode.md#what-the-controller-does-and-does-not-do)).
 
 ```bash
 uv run autoforge local doctor                    # config, git, agent CLIs; never gh
@@ -332,7 +339,12 @@ repeated review with SHA binding → `READY_FOR_MERGE`; the bounded REVIEW/FIX
 loop with stagnation detection and the `REPLAN_REEXECUTE` transaction;
 journal-first recovery of an interrupted push or PR creation;
 bounded correction retry for malformed results; `doctor`; redacted
-per-invocation logs; LOCAL mode against a feature Markdown file.
+per-invocation logs; LOCAL mode against a feature Markdown file; the outer
+sandbox on Linux (`sandbox.mode`, off by default), with its capability
+probe, pre-launch gate and `doctor` rows, its boundary tested across every
+provider path on a capable host (`make test-sandbox`). Hosted CI skips the
+real-backend tests with the probe's reason where its runner cannot
+enforce.
 
 **Implemented and verified, but exercised only against the in-memory fake:**
 the controller-owned `MERGE` step behind the merge safety gate (off by
