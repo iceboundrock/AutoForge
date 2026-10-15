@@ -143,6 +143,10 @@ executor_duplex.py,
 prompts/__init__.py                               -> docs/agent-guides/architecture.md
                                                      (+ docs/adr/0003-pi-agent-provider.md and
                                                      docs/pi-policy.md for Pi)
+interaction.py, claude_sdk.py, opencode_sdk.py,
+sdk_helpers/ (all planned)                        -> docs/agent-guides/architecture.md
+                                                     + docs/adr/0007-sdk-providers-isolated-
+                                                     helpers-and-interaction-contract.md
 sandbox.py, sandbox_bwrap.py                      -> docs/agent-guides/architecture.md
                                                      (Executor) + docs/adr/0005-outer-
                                                      sandbox-and-host-resource-capability-

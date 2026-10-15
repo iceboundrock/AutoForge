@@ -53,6 +53,8 @@ AgentProvider
   -> PiProvider          (EPIC #127, ADR 0003: config, argv and doctor checks
                           in #129; execution over RPC in #131; the resource,
                           tool and credential policy in #132, docs/pi-policy.md)
+  -> ClaudeSdkProvider   (planned, ADR 0007: #151)
+  -> OpenCodeSdkProvider (planned, ADR 0007: #152)
 ```
 
 Provider adapters own:
@@ -166,6 +168,27 @@ run-level errors, read from the error lines OpenCode itself prints rather
 than from text anywhere in its trace, are all
 `WebSocket closed with code 1000` (the adapter's docstring says what that
 check cannot see).
+
+#### SDK providers and interactions (planned, ADR 0007)
+
+Nothing in this subsection is implemented yet. ADR 0007 decides how an SDK
+provider fits these boundaries:
+
+- **No SDK in the controller.** An SDK runs only inside a helper process
+  (a Python helper around `ClaudeSDKClient`, or a Node bridge over
+  `@opencode-ai/sdk`). The helper is launched like any agent, through the
+  duplex handle, the allow-listed environment, containment and the outer
+  sandbox, under the idle timeout and the ceiling.
+- **The helper owns its runtime.** The CLI or `opencode serve` the helper
+  starts is its child, in its process group, under one containment owner.
+- **Pinned pairs.** SDK and runtime versions are pinned exactly, and a
+  mismatch is a provider failure.
+- **Interactions go through a provider-neutral contract and broker** in
+  `interaction.py` (#134), handed to the adapter like `progress`. The
+  adapter maps provider asks to it, and the engine never sees an SDK type.
+  The `pause` policy, its state and recovery are #126's.
+- **A capability exists only after its gate passes.** The gate is an
+  isolated runtime probe, per ADR 0007 §3.
 
 ### Executor
 
