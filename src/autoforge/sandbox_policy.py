@@ -351,6 +351,101 @@ def sandbox_request(
     )
 
 
+# The version label of :func:`launch_template`'s encoding. The compiler's
+# fixed choices (a private home and temp, a new /proc, a minimal /dev) are
+# not in a request, so a change to one of them is a change of this label.
+TEMPLATE_VERSION = "autoforge-sandbox-template-v1"
+
+
+def role(name: str) -> str:
+    """The stand-in path of role ``name`` in a policy template (ADR 0006 D8.1)."""
+    return f"/@{name}"
+
+
+def template_facts(
+    launch_class: LaunchClass,
+    network: NetworkPosition,
+    *,
+    separate_git_dir: bool = False,
+    linked: bool = False,
+) -> LaunchFacts:
+    """A repository-defined command's facts with every concrete path a role name.
+
+    The role-level inputs the engine passes the compiler for a validator
+    (ADR 0006 D8.1), before any path is bound: the export or the repository
+    root is ``candidate-root``, and so on, and every denied root is one
+    ``denied-roots`` role, since how many worktrees are registered is not a
+    fact of the policy. For LOCAL validation, ``separate_git_dir`` says the
+    root's ``.git`` is a file naming the git directory and ``linked`` that
+    the checkout is a linked worktree with a common dir of its own: the
+    layout decides which of them §2.5 projects, never where they are.
+    """
+    workspace = role("candidate-root")
+    facts = LaunchFacts(
+        launch_class=launch_class,
+        workspace=workspace,
+        home=role("home"),
+        controller_env={},
+        controller_config=role("controller-config"),
+        denied_roots=(role("denied-roots"),),
+        network=network,
+    )
+    if launch_class is LaunchClass.EXPORT_COMMAND:
+        return facts
+    if launch_class is not LaunchClass.LOCAL_VALIDATION:
+        raise ValueError(f"no policy template for the {launch_class.value}")
+    entry = posixpath.join(workspace, ".git")
+    git_dir = role("git-dir") if separate_git_dir or linked else entry
+    return dataclasses.replace(
+        facts,
+        git_entry=entry,
+        git_dir=git_dir,
+        common_dir=role("common-dir") if linked else git_dir,
+        cache=role("cache"),
+    )
+
+
+def launch_template(facts: LaunchFacts) -> dict:
+    """The path-independent policy template of a command launch (ADR 0006 D8.1).
+
+    §2.5's request for ``facts`` (:func:`sandbox_request`, pure for a
+    command class), as canonical data: the projections and their access,
+    the masks, the overlays, the denied roots, the network position and the
+    compiler's options. Labels are prose and are left out. Given
+    :func:`template_facts`, no concrete path is in it, so two exports of one
+    candidate in two temporary directories give one template.
+    """
+    request = sandbox_request(facts)
+    return {
+        "version": TEMPLATE_VERSION,
+        "launch_class": facts.launch_class.name,
+        "projections": [
+            {
+                "source": p.source,
+                "access": p.access.value,
+                "origin": p.origin.value,
+                "target": p.target,
+                "carve_out": p.carve_out,
+            }
+            for p in request.projections
+        ],
+        "masks": list(request.masks),
+        "overlays": [
+            {"lower": o.lower, "upper": o.upper, "work": o.work, "carve_out": o.carve_out}
+            for o in request.overlays
+        ],
+        "denied_roots": list(request.denied_roots),
+        "operator_config_roots": list(request.operator_config_roots),
+        "system_runtime": request.system_runtime,
+        "home_size_bytes": request.home_size_bytes,
+        "tmp_size_bytes": request.tmp_size_bytes,
+        "network": request.network.value,
+        "sys": request.sys.value,
+        "env": [list(pair) for pair in request.env],
+        "env_unset": list(request.env_unset),
+    }
+
+
 def _outermost(paths: list[str]) -> list[str]:
     """``paths`` resolved, without those inside another one (C6 would refuse them)."""
     resolved = list(dict.fromkeys(os.path.realpath(p) for p in paths if p))

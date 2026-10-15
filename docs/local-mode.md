@@ -312,6 +312,20 @@ visible inside, under `/usr` or in the repository (a tool installed
 elsewhere under your home or in `/opt` is not), and a command the sandbox
 refuses is not run and leaves the phase unverified too.
 
+Every command that runs leaves a `ValidationRecord` in the state file
+(#172; [State and recovery](agent-guides/state-and-recovery.md#validation-evidence)):
+the workspace it ran against (fingerprint, workspace-policy digest, run
+id), the command, policy P, the outcome (`PASS`, `FAIL`, `TIMEOUT`), the
+fingerprint of the tree before it ran and after (the next command's
+before), and a bounded, redacted tail of its output. The routing and the
+messages above are unchanged: the records are evidence beside them, and
+nothing yet reuses one to skip a command (#173). A `Ctrl-C` during a
+command leaves an attempt marker; `resume` records it `INTERRUPTED` and
+runs the phase's commands again. At most 16 commands, each at most 32
+argv elements of at most 1,024 characters and 4,096 in all: a
+configuration beyond that does not load, and a run whose contract an older
+controller wrote with more enters `BLOCKED` before its next agent.
+
 ## Dry run
 
 `local run --dry-run` is side-effect-free in the usual AutoForge sense: it

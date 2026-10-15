@@ -355,9 +355,33 @@ def test_read_commit_returns_the_authenticated_parents_and_message(world):
     p2 = world.commit("two")
     merge = world.g("commit-tree", world.tree(), "-p", p1, "-p", p2, "-m", "subject", "-m", "body")
     record = world.transport().read_commit(merge)
-    assert record == CommitRecord(sha=merge, parents=(p1, p2), message="subject\n\nbody\n")
+    assert record == CommitRecord(
+        sha=merge, parents=(p1, p2), message="subject\n\nbody\n", tree=world.tree()
+    )
     root = world.transport().read_commit(p1)
     assert root.parents == ()
+
+
+def test_read_local_commit_reads_the_tree_from_the_store_and_never_fetches(world):
+    """#172: candidate validation reads its candidate's tree from the shared
+    store's authenticated bytes; a commit that is not there is None, never fetched."""
+    tree = world.tree({"app.txt": "pristine\n"})
+    sha = world.commit("candidate", tree=tree)
+    record = world.transport().read_local_commit(sha)
+    assert record is not None and record.tree == tree and record.sha == sha
+    world.publish(sha, "refs/heads/side")
+    world.drop(sha)
+    assert world.transport().read_local_commit(sha) is None
+    assert not [r for r in world.requests if "fetch" in r.command]
+
+
+def test_a_commit_whose_tree_is_malformed_fails_closed(world):
+    content = (
+        "tree " + "z" * 40 + "\nauthor t <t@e> 0 +0000\ncommitter t <t@e> 0 +0000\n\nbad\n"
+    ).encode()
+    sha = _literal_commit(world, content)
+    with pytest.raises(GitTransportError, match="malformed tree"):
+        world.transport().read_local_commit(sha)
 
 
 def test_a_missing_commit_is_fetched_once_and_then_read(world):

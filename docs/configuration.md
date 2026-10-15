@@ -139,6 +139,7 @@ directory if it is missing and a probe file it creates and removes there.
 | `review.replan` | replan policy: `enabled`, `soft_threshold` (12), `hard_threshold` (20), `stagnation_window` (3), `max_findings_per_round` (2), `max_replans_per_issue` (2) | [Workflow](agent-guides/workflow.md#loop-bounds), [Replan transaction](agent-guides/replan-transaction.md) |
 | `profiles` | provider, model, effort, command, idle timeout, maximum runtime and provider options per logical profile | [Profiles](#profiles) below |
 | `github` | the `gh` binary and its timeout | [GitHub safety](agent-guides/github-safety.md) |
+| `validation` | REMOTE candidate validation (#172): `commands` (argv lists, empty by default), `scope` (`candidate-tree`, the only value) | [Candidate validation](#candidate-validation) below, [State and recovery](agent-guides/state-and-recovery.md#validation-evidence) |
 | `local` | Local Mode: `feature_dir`, `max_fix_rounds`, `validation_commands`, `exclude`, `max_workspace_entries`, `max_workspace_bytes` | [Local mode configuration](#local-mode-configuration) below |
 | `sandbox` | the outer sandbox (#168): `mode` (`disabled`, the default, or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`) | [Outer sandbox](#outer-sandbox) below, [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
@@ -231,8 +232,9 @@ one-week backstop is the only wall-clock bound.
   run refuses to start when a profile it requires has none, `autoforge
   doctor` fails any profile the run can reach (including `update_epic`),
   and the controller never launches it.
-- **Not agents.** `merge.verification_commands`, `local.validation_commands`
-  and the controller's own `git` plumbing keep a wall-clock limit,
+- **Not agents.** `merge.verification_commands`, `local.validation_commands`,
+  `validation.commands` and the controller's own `git` plumbing keep a
+  wall-clock limit,
   `execution.command_timeout_seconds` (default 1800); `gh` calls use
   `github.timeout_seconds`.
 
@@ -672,6 +674,67 @@ zsh startup files, and a fish `SHELL` is replaced with `bash`; and the
 provider integrations above stay off. The guarantees and what they do not cover are in
 [GitHub safety](agent-guides/github-safety.md#agents-hold-no-github-credential).
 
+## Candidate validation
+
+`validation:` (#172,
+[ADR 0006](adr/0006-candidate-validation-evidence-and-review-certificates.md)) names the
+commands the controller runs against one exact REMOTE candidate, a commit
+and the tree it names:
+
+```yaml
+validation:
+  scope: candidate-tree       # the only scope there is
+  commands:                   # argv lists; nothing goes through a shell
+    - ["uv", "run", "pytest", "-q"]
+    - ["make", "lint"]
+```
+
+- **Where they run.** Each command, in order, runs in a fresh byte-exact
+  export of the candidate's tree, proved to hash back to it (the
+  pre-merge export's writer, prefix `autoforge-validate-`): no `.git`, no
+  worktree, no submodule content, no filter or line-ending conversion. The
+  commit must already be in the shared object store; nothing is fetched,
+  and a commit that is not there is refused before anything runs. The set
+  stops at the first command that does not pass, and every export is
+  discarded. The commands get the allow-listed environment
+  (`execution.env_allowlist`), no GitHub or git credential, the wall-clock
+  limit `execution.command_timeout_seconds`, and orphan containment; under
+  `sandbox.mode: required` they run inside the outer sandbox as the
+  pre-merge export does (`sandbox.validation_network` sets their network),
+  or are refused.
+- **What it records.** Every command that runs leaves a `ValidationRecord`
+  in `state.json`: the candidate, the definition, policy P, the outcome
+  (`PASS` for exit 0, `FAIL` for any other exit, exit 127 included,
+  `TIMEOUT`), the enforcement facts and a bounded, redacted, escaped tail
+  of each stream ([State and recovery](agent-guides/state-and-recovery.md#validation-evidence)).
+  A command that cannot be launched, or an export that cannot be written,
+  is retried once and is then inconclusive, with no record.
+- **Not wired yet.** No REMOTE phase runs `validation.commands` yet: the
+  phase gates that reuse a record, and stop a run on a `FAIL`, are #173's.
+  `doctor` and the dry-run plan list the definitions and the policy and
+  run none of them. `merge.verification_commands` is unchanged and
+  separate.
+- **Bounds.** At most 16 commands; each at most 32 non-blank argv elements,
+  each at most 1,024 characters and 4,096 in all. A configuration beyond
+  them is a load error naming the command's index and the bound, never
+  its argv. `local.validation_commands` has the same bounds, since its
+  commands leave the same records. `scope` other than `candidate-tree`
+  (a base- or merge-result-bound validation) is a load error.
+- **No secrets in argv.** A command's argv is stored, logged and shown
+  redacted, but its digest is over the argv as configured, and redaction
+  claims no completeness. Pass a credential through the allow-listed
+  environment, as for an agent, never on the command line.
+- **What withdraws evidence.** A record applies to a later check only for
+  the same candidate, the same definition (its argv and its position in
+  the list) and the same policy P. P is `sandbox.mode`, the outer
+  sandbox's path-independent template (under `disabled` a fixed "no
+  sandbox" one), the names in the environment allow-list, the timeout,
+  orphan containment and how the candidate is materialized. Changing any
+  of them, `execution.command_timeout_seconds` or
+  `execution.env_allowlist_extra` included, makes earlier records not
+  apply: the commands run again. Under `disabled` every validator runs
+  unsandboxed as your UID and its record says `enforced: false`.
+
 ## Outer sandbox
 
 `sandbox:` (#168,
@@ -683,7 +746,7 @@ above:
 ```yaml
 sandbox:
   mode: disabled              # disabled | required
-  validation_network: host    # host | isolated: LOCAL validation commands
+  validation_network: host    # host | isolated: LOCAL and REMOTE validation commands
   premerge_network: host      # host | isolated: merge.verification_commands
 ```
 
@@ -695,7 +758,8 @@ sandbox:
   ([GitHub safety](agent-guides/github-safety.md#threat-model)).
 - **`mode: required`** runs every agent launch of every provider (Pi's
   per-launch auth preflight included), every `local.validation_commands`
-  entry and every `merge.verification_commands` entry inside the outer
+  and `validation.commands` entry and every `merge.verification_commands`
+  entry inside the outer
   sandbox, or refuses it before it runs; nothing falls back to running
   without one (D12.1). It needs Linux, `bwrap` on `PATH`, unprivileged user
   namespaces and overlay mounts, and Landlock ABI 6 (Linux 6.12 or later).

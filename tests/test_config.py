@@ -2174,3 +2174,84 @@ def test_the_example_config_shows_loop_detection_in_kill_mode(tmp_path, no_pyyam
     example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
     assert "  loop_detection:\n    # mode: kill\n" in example.read_text(encoding="utf-8")
     assert load_config_file(example).execution.loop_detection == config.LoopDetectionConfig()
+
+
+# -- validation.commands (#172, ADR 0006 D3.1, D4.2, D10.3) ------------------------------
+def _validation_cfg(tmp_path, validation: dict):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "validation": validation}), encoding="utf-8")
+    return load_config_file(p)
+
+
+def test_validation_defaults_to_an_empty_candidate_tree_set():
+    cfg = default_config()
+    assert cfg.validation.commands == [] and cfg.validation.scope == "candidate-tree"
+
+
+def test_validation_commands_stay_argv_arrays(tmp_path):
+    cfg = _validation_cfg(tmp_path, {"commands": [["uv", "run", "pytest", "-q"], ["make", "lint"]]})
+    assert cfg.validation.commands == [["uv", "run", "pytest", "-q"], ["make", "lint"]]
+
+
+@pytest.mark.parametrize(
+    ("validation", "match"),
+    [
+        ({"commands": ["uv run pytest"]}, "validation.commands"),
+        ({"commands": [[]]}, "validation.commands"),
+        ({"commands": [["x"]] * 17}, "17 definitions, over the bound of 16"),
+        ({"commands": [["x"] * 33]}, "33 argv elements, over the bound of 32"),
+        ({"commands": [["x" * 1025]]}, "1025 characters, over the bound of 1024"),
+        ({"commands": [["x" * 1024] * 4 + ["y"]]}, "4097 characters in all"),
+        ({"scope": "merge-result"}, "validation.scope must be 'candidate-tree'"),
+        ({"surprise": True}, "surprise"),
+    ],
+)
+def test_validation_block_rejects_unusable_values(tmp_path, validation, match):
+    with pytest.raises(ConfigurationError, match=match):
+        _validation_cfg(tmp_path, validation)
+
+
+@pytest.mark.parametrize(
+    ("commands", "match"),
+    [
+        ([["x"]] * 17, "17 definitions, over the bound of 16"),
+        ([["x"] * 33], "33 argv elements"),
+        ([["x" * 1025]], "1025 characters"),
+        ([["x" * 1024] * 4 + ["y"]], "4097 characters in all"),
+    ],
+)
+def test_local_validation_commands_have_the_same_bounds(tmp_path, commands, match):
+    with pytest.raises(ConfigurationError, match=f"local.*{match}"):
+        _local_cfg(tmp_path, {"validation_commands": commands})
+
+
+def test_validation_bounds_name_the_definition_never_the_argv(tmp_path):
+    secret = "gh" + "p_" + "s3cretvalue123456"
+    with pytest.raises(ConfigurationError) as exc:
+        _validation_cfg(tmp_path, {"commands": [["deploy", secret + "x" * 1024]]})
+    assert "definition [0] element 1" in str(exc.value)
+    assert secret not in str(exc.value)
+
+
+def test_validation_commands_round_trip_through_the_yaml_subset(tmp_path, yaml_backend):
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        "version: 1\n"
+        "validation:\n"
+        "  scope: candidate-tree\n"
+        "  commands:\n"
+        '    - ["uv", "run", "pytest", "-q"]\n'
+        "    - [make, lint]\n",
+        encoding="utf-8",
+    )
+    cfg = load_config_file(p)
+    assert cfg.validation.commands == [["uv", "run", "pytest", "-q"], ["make", "lint"]]
+    assert cfg.validation.scope == "candidate-tree"
+
+
+def test_the_example_yaml_documents_an_empty_validation_set(no_pyyaml):
+    import autoforge
+
+    example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
+    cfg = load_config_file(example)
+    assert cfg.validation.commands == [] and cfg.validation.scope == "candidate-tree"

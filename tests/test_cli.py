@@ -2485,6 +2485,15 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     with open(state_file, encoding="utf-8") as handle:
         data = json.load(handle)
     del data["config_fingerprint"]
+    for key in (
+        "validation_records",
+        "validation_attempt",
+        "review_evidence",
+        "review_certificate",
+        "producer_validation_failure",
+        "validation_override_seq",
+    ):
+        del data[key]  # protocol 10's own fields (#172)
     data["protocol_version"] = "8"
     with open(state_file, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
@@ -2502,7 +2511,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     assert f"--config {cfg} is recorded as the run's" in out.err
     assert "ANALYZE_EXECUTE -> REVIEW" in out.out
     saved = load_state(state_file)
-    assert saved.protocol_version == "9"
+    assert saved.protocol_version == "10"
     assert saved.config_fingerprint["source"] == "upgraded"
     assert saved.config_fingerprint["profiles"]["analyze_execute"]["model"] == "opus"
     assert cli.main(["--state-dir", sd, "status"]) == 0

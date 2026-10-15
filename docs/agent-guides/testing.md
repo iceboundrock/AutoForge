@@ -52,6 +52,45 @@ High-priority coverage includes:
   its dry run and `doctor` before any state is written, and by an upgrade or
   an accepted change before anything is recorded or logged, while a model
   at the bound is recorded and the run loads again
+- validation evidence (#172, `tests/test_evidence.py`,
+  `tests/test_validation_evidence.py`, `tests/test_state.py`): the
+  definition, set and policy digests are stable across processes and change
+  with each input (argv, index, mode, template, allow-list, timeout,
+  `contain_orphans`, method); the policy template is the concrete request
+  with every path a role, so two exports give one `policy_digest`; every
+  record field loads at its bound and is refused one past it, and a
+  malformed SHA, digest, timestamp or enumeration, a hand-edited record, a
+  mixed candidate, another mode's, repository's or run's record, a binding
+  or certificate naming a missing, edited, `INTERRUPTED` or misplaced
+  record, a counter naming no `FAIL`, and a watermark out of range are
+  refused; exit 0 is `PASS`, any other exit (127 included) `FAIL`, a
+  timeout `TIMEOUT`, and a launch failure no record; a tail is redacted
+  before it is cut (a secret on the cut), escaped without splitting an
+  escape, and bounded with its truncation facts; eviction never removes a
+  named record; recovery appends one `INTERRUPTED` record per marker,
+  never a `PASS`, is idempotent, ignores records at or below the
+  watermark, and blocks on the third; the six fields at their bound stay
+  far inside the state file's; REMOTE validation of a real commit binds
+  its commit and tree, stops at the first non-`PASS`, gives each
+  definition a fresh export (a mutating validator leaves the next one and
+  the repository byte-identical), refuses a commit not in the store before
+  any launch, and redacts a secret-shaped argv and output in state,
+  `status` and the run log; a setup failure of the candidate (finding the
+  shared store, launched or timing out, reading its commit, the
+  object-format read or a git process the executor could not launch, an
+  `OSError` creating the directory) gets one fresh attempt and is then
+  inconclusive with nothing written, while a commit or a blob missing
+  from the store is refused without one; a sandbox refusal under
+  `required` leaves the state byte-identical and is not retried as a
+  materialization failure; an interrupt leaves the marker, `status` and
+  the dry run report it without writing, and the next step records it;
+  LOCAL validation records start and end fingerprints and a contract
+  beyond the bounds blocks before the agent; protocol-9 and older files
+  load in every phase with none of the six fields, an older file carrying
+  one, or a protocol-10 file missing one, is refused; `validation.commands`
+  and `local.validation_commands` beyond the bounds, a scope other than
+  `candidate-tree` and an unknown key are load errors; `doctor` lists the
+  set and runs nothing
 
 ### Transitions
 

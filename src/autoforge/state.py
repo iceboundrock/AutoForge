@@ -54,6 +54,7 @@ from .effects import (
     load_phase_effects,
 )
 from .errors import ConfigurationError, StateError
+from .evidence import EvidenceFields, RecordView, check_evidence
 from .loop_guard import validate_review_history
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS
@@ -271,10 +272,14 @@ _LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS | {"5"}
 # phase, and relabelled.
 _PRE_ACCEPTANCE_PROTOCOL = "7"
 # The label before a REMOTE run recorded its configuration (#219). A
-# protocol-8 file is this protocol's shape without ``config_fingerprint``:
-# it is loaded in every phase with none, which is "not checked", and
+# protocol-8 file is protocol 9's shape without ``config_fingerprint``: it
+# is loaded in every phase with none, which is "not checked", and
 # relabelled.
-_PREVIOUS_PROTOCOL = "8"
+_PRE_CONFIG_PROTOCOL = "8"
+# The label before candidate validation evidence (#172, ADR 0006 D15.1). A
+# protocol-9 file is this protocol's shape without the six Wave 2B fields:
+# it is loaded in every phase with them empty (D15.4), and relabelled.
+_PREVIOUS_PROTOCOL = "9"
 # The fields protocol 7 added (#160): the effect records, the entry
 # observation and the completion context of the current phase entry, and the
 # launch label. A legacy file never carries one; one that does is a hand edit
@@ -289,6 +294,18 @@ _ACCEPTANCE_FIELDS = ("acceptance_outcomes",)
 # The field protocol 9 added (#219): the configuration a REMOTE run was
 # recorded under (:mod:`autoforge.config_fingerprint`), ``{}`` when none is.
 _CONFIG_FIELDS = ("config_fingerprint",)
+# The fields protocol 10 added (#172, ADR 0006 D11.2): the validation
+# records, the attempt marker, the REVIEW evidence binding, the review
+# certificate, the producer failure counter and the override watermark
+# (:mod:`autoforge.evidence`). An older file never carries one.
+_VALIDATION_FIELDS = (
+    "validation_records",
+    "validation_attempt",
+    "review_evidence",
+    "review_certificate",
+    "producer_validation_failure",
+    "validation_override_seq",
+)
 # ``acceptance_outcomes`` (#211): what became of each acceptance action of
 # the current PR. Bounded: at most one action is requested per FIX result,
 # and the writer drops the oldest entries past the bound
@@ -597,6 +614,33 @@ class AutoForgeState:
     # checked; the next command records one). Kept across issues.
     config_fingerprint: dict = field(default_factory=dict)
 
+    # -- candidate validation evidence (ADR 0006, #172) -------------------
+    # Every field below is strictly parsed, bounded (D10.3), digest-checked
+    # and checked for referential integrity on load
+    # (:func:`autoforge.evidence.check_evidence`), and cleared when the run
+    # moves to the next issue. #173 and #174 decide when the binding, the
+    # certificate, the counter and the watermark are written.
+    #
+    # What the controller observed running one trusted definition against
+    # one exact candidate under one policy, oldest first, at most 64; the
+    # records the binding, the certificate or the counter name are never
+    # evicted (D11.4).
+    validation_records: list[dict] = field(default_factory=list)
+    # The marker written immediately before a validator's launch and cleared
+    # in the save that appends its record (D11.2). One left by a crash is
+    # turned into an ``INTERRUPTED`` record by the next ``step``/``resume``
+    # under the lock, never by a load.
+    validation_attempt: dict = field(default_factory=dict)
+    # The set and the records a reviewer was presented (D11.2; #173 writes it).
+    review_evidence: dict = field(default_factory=dict)
+    # The controller's review certificate (D12.1; #174 issues it).
+    review_certificate: dict = field(default_factory=dict)
+    # A REMOTE producer's validation failures of one candidate (D5.2; #173).
+    producer_validation_failure: dict = field(default_factory=dict)
+    # The operator's override watermark (D14.2; #175 writes it): None until
+    # an unblock sets it, 0 for an unblock that found no record.
+    validation_override_seq: int | None = None
+
     created_at: str = ""
     updated_at: str = ""
 
@@ -720,6 +764,14 @@ class AutoForgeState:
         #   rebinding the record exists to catch, and a load (``status``)
         #   runs on no configuration. An older file that carries the field,
         #   even empty, is refused, never merged.
+        # - 9 -> 10: candidate validation evidence (#172, ADR 0006 D15.1):
+        #   the validation records, the attempt marker, the REVIEW evidence
+        #   binding, the review certificate, the producer failure counter and
+        #   the override watermark. An older file has none of them and is
+        #   loaded in every phase with them empty (D15.4): nothing is
+        #   fabricated, and what an empty field means is the gates' to
+        #   decide. An older file that carries any of them, even empty, is
+        #   refused, never merged.
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
@@ -754,6 +806,7 @@ class AutoForgeState:
                 )
             _refuse_acceptance_state(data, str(raw_protocol))
             _refuse_config_fingerprint(data, str(raw_protocol))
+            _refuse_validation_fields(data, str(raw_protocol))
         elif raw_protocol == _PRE_ACCEPTANCE_PROTOCOL:
             # 7 -> 8 (#211): the same shape without the acceptance-action
             # state. Every protocol-7 save wrote the effect fields, exactly
@@ -762,11 +815,25 @@ class AutoForgeState:
             _require_fields(data, raw_protocol, _EFFECT_FIELDS, "effect state")
             _refuse_acceptance_state(data, raw_protocol)
             _refuse_config_fingerprint(data, raw_protocol)
-        elif raw_protocol == _PREVIOUS_PROTOCOL:
+            _refuse_validation_fields(data, raw_protocol)
+        elif raw_protocol == _PRE_CONFIG_PROTOCOL:
             # 8 -> 9 (#219): the same shape without the recorded
             # configuration, which it never wrote and which is refused.
             _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
             _refuse_config_fingerprint(data, raw_protocol)
+            _refuse_validation_fields(data, raw_protocol)
+        elif raw_protocol == _PREVIOUS_PROTOCOL:
+            # 9 -> 10 (#172): the same shape without the validation
+            # evidence, which it never wrote and which is refused.
+            _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
+            _require_fields(
+                data,
+                raw_protocol,
+                _CONFIG_FIELDS,
+                "recorded configuration",
+                "not a run with none recorded",
+            )
+            _refuse_validation_fields(data, raw_protocol)
         elif raw_protocol != __protocol_version__:
             raise StateError(
                 f"unsupported protocol_version {raw_protocol!r} "
@@ -790,6 +857,18 @@ class AutoForgeState:
                 "recorded configuration",
                 "not a run with none recorded",
             )
+            # Every protocol-10 save writes all six, so an absent one is a
+            # truncation or a hand edit: a missing ``validation_attempt``
+            # read as "no marker" would hide a crash the resume path must
+            # record, and a missing ``review_certificate`` would read as one
+            # never issued.
+            _require_fields(
+                data,
+                raw_protocol,
+                _VALIDATION_FIELDS,
+                "validation evidence",
+                "not a run with no evidence",
+            )
         # A LOCAL state written before the run contract existed has no
         # persisted definition of what it reviewed under. It is not migrated:
         # the only source a migration could fill the contract from is the
@@ -808,9 +887,11 @@ class AutoForgeState:
         kwargs["phase"] = phase
         kwargs["mode"] = mode
         kwargs["protocol_version"] = __protocol_version__
-        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__) and (
-            mode == WorkflowMode.REMOTE
-        ):
+        if raw_protocol not in (
+            _PRE_CONFIG_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ) and (mode == WorkflowMode.REMOTE):
             # Before protocol 8 only: a protocol-8 file carries its own
             # acceptance state, which the migration would overwrite.
             kwargs.update(_acceptance_migration(data))
@@ -978,8 +1059,39 @@ class AutoForgeState:
                     f"state field {name!r} must be a full lower-case commit SHA or empty, "
                     f"got {value!r:.60}"
                 )
+        state.validation_evidence()
         state.phase_effects()
         return state
+
+    # -- candidate validation evidence (ADR 0006) --------------------------
+    def validation_evidence(self) -> list[RecordView]:
+        """The six evidence fields, checked together; the records, parsed (D11.1).
+
+        Read-only (D11.3): a leftover marker is reported and validated here,
+        never converted or cleared.
+        """
+        return check_evidence(
+            EvidenceFields(
+                validation_records=self.validation_records,
+                validation_attempt=self.validation_attempt,
+                review_evidence=self.review_evidence,
+                review_certificate=self.review_certificate,
+                producer_validation_failure=self.producer_validation_failure,
+                validation_override_seq=self.validation_override_seq,
+            ),
+            local=self.mode == WorkflowMode.LOCAL,
+            repository=self.repository,
+            run_id=self.run_id,
+        )
+
+    def clear_validation_evidence(self) -> None:
+        """All six fields, empty (D11.4): the next issue starts with none."""
+        self.validation_records = []
+        self.validation_attempt = {}
+        self.review_evidence = {}
+        self.review_certificate = {}
+        self.producer_validation_failure = {}
+        self.validation_override_seq = None
 
     # -- controller-owned effects (ADR 0004) -------------------------------
     def effect_binding(self) -> Binding:
@@ -1126,6 +1238,7 @@ class AutoForgeState:
         self.verification_failures = []
         self.premerge_verified_head_sha = ""
         self.premerge_verified_commands = []
+        self.clear_validation_evidence()
         self.execution_attempt = 1
         self.escalation_count = 0
         self.superseded_prs = []
@@ -1182,6 +1295,23 @@ def _refuse_config_fingerprint(data: dict, protocol: str) -> None:
             "'config_fingerprint'; refusing to load a file that carries protocol-9 "
             "recorded configuration -- it is a hand edit or a foreign file, not an older "
             "controller's state"
+        )
+
+
+def _refuse_validation_fields(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 10 never wrote validation evidence (#172).
+
+    The label decides, not the value: an older file that carries one of the
+    six fields at all, even empty, was not written by the controller its
+    label names (ADR 0006 D15.4), and nothing it holds is merged.
+    """
+    planted = [name for name in _VALIDATION_FIELDS if name in data]
+    if planted:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            f"{', '.join(repr(n) for n in planted)}; refusing to load a file that carries "
+            "protocol-10 validation evidence -- it is a hand edit or a foreign file, not an "
+            "older controller's state"
         )
 
 

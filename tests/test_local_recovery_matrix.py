@@ -229,7 +229,7 @@ def test_a_crash_at_validation_keeps_the_phase_unverified(tmp_path):
 
     eng.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
 
-    def dying_validation(phase):
+    def dying_validation(phase, start):
         raise Crash("killed while the validation command ran")
 
     eng._run_validation_commands = dying_validation  # type: ignore[method-assign]

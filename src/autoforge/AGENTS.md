@@ -71,6 +71,8 @@ validation.py       typed GitHub URL parsing and run-argument validation
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
 materialize.py      byte-exact export of a candidate commit from the shared object store
                     and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171)
+evidence.py         candidate validation evidence: definitions, policy P, ValidationRecords,
+                    the attempt marker, their bounds and integrity checks; pure (ADR 0006, #172)
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
 state.py            persisted controller state, atomic writes, schema/protocol checks
 run_contract.py     the durable contract of a LOCAL run
@@ -134,8 +136,8 @@ verification, merge gate, dry-run, read context),
 prompts/update_epic*.md                           -> docs/agent-guides/github-safety.md
                                                      (+ docs/adr/0004-authority-boundary-and-
                                                      typed-external-effects.md for effects)
-state.py, effects.py, run_contract.py, safefs.py,
-config_fingerprint.py, locking.py, errors.py,
+state.py, effects.py, evidence.py, run_contract.py,
+safefs.py, config_fingerprint.py, locking.py, errors.py,
 engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
 providers.py, pi_rpc.py, claude_stream.py,
 progress.py, loop_detect.py, executor.py,

@@ -186,6 +186,48 @@ class MaterializationError(VerificationError):
     """
 
 
+class ValidationDefinitionError(AutoForgeError):
+    """A validation definition is beyond the bounds a record can hold (ADR 0006 D10.3).
+
+    More than 16 definitions in a set, more than 32 elements in an argv, a
+    blank element, an element over 1,024 characters or an argv over 4,096
+    in all. The configuration loader turns it into a
+    :class:`ConfigurationError`; a LOCAL run contract persisted before the
+    bounds existed that holds one enters ``BLOCKED`` before any validator is
+    launched. The message names the definition and the bound, never the argv.
+    """
+
+
+class ValidationInconclusiveError(VerificationError):
+    """Candidate validation observed no result (ADR 0006 D10.5).
+
+    A launch or setup failure the executor or the sandbox backend reported,
+    or #165's preflight refusing the launch, after the bounded in-process
+    re-check; or a materialization failure (an ``OSError`` or a git process
+    the executor could not launch among them), or failing to find the
+    shared store or read the candidate's commit there, after one fresh
+    attempt. No ``ValidationRecord`` is written. The caller enters
+    ``BLOCKED`` with the message, which names the command or the candidate
+    and the failing entry.
+    """
+
+
+class ValidationInterruptedError(AutoForgeError):
+    """A definition was interrupted more often than recovery may rerun it (ADR 0006 D10.7).
+
+    Raised when the resume path's ``INTERRUPTED`` record is the third, or
+    later, for one candidate, definition and policy (records at or below the
+    operator's override watermark not counted). The record is still written:
+    ``records`` is the list with it appended, which the caller persists in
+    the write that enters ``BLOCKED`` with the message, naming the candidate
+    and the definition.
+    """
+
+    def __init__(self, message: str, records: list | None = None) -> None:
+        super().__init__(message)
+        self.records = list(records or [])
+
+
 class GitTransportError(AutoForgeError):
     """A controller git operation could not establish what it needs (fails closed).
 

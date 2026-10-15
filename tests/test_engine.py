@@ -7965,6 +7965,12 @@ def _as_protocol_5(eng, *, attempt: int) -> None:
         "launch_label",
         "acceptance_outcomes",
         "config_fingerprint",
+        "validation_records",
+        "validation_attempt",
+        "review_evidence",
+        "review_certificate",
+        "producer_validation_failure",
+        "validation_override_seq",
     ):
         data.pop(key, None)
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
@@ -7993,7 +7999,7 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     assert "posted by an agent under the previous contract" in call.prompt
     assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_issue_url == ISSUE3 and s.protocol_version == "9"
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "10"
     assert s.effect_records == []  # adopted with no record (D13.7)
 
 
