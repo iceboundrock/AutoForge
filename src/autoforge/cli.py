@@ -5,7 +5,10 @@ Commands:
           default-branch required checks)
   run     create a run (Issue -> ...) and advance it until READY_FOR_MERGE/DONE/BLOCKED/FAILED
   step    execute exactly one phase step from persisted state
-  resume  continue a persisted run until a stop phase / max-steps
+  resume  continue a persisted run until a stop phase / max-steps; step, resume and
+          unblock refuse a REMOTE run whose recorded configuration (profile
+          routing, agent worktree root) this invocation's differs from, unless
+          --accept-config-change (#219)
   unblock the operator's explicit exit from BLOCKED: the controller re-inspects
           live GitHub state, re-enters a phase through validate_transition or
           refuses and stays BLOCKED; the reason is recorded in state and the log.
@@ -26,6 +29,7 @@ import sys
 
 from . import __version__
 from .config import AutoForgeConfig, load_config_file
+from .config_fingerprint import RecordedConfiguration
 from .doctor import CheckResult, run_doctor, run_local_doctor
 from .effects import (
     AUTHORIZATION_POLICY,
@@ -116,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--allow-merge", action="store_true")
     s.add_argument("--full-prompt", action="store_true")
+    _add_accept_config_change(s)
 
     re_ = sub.add_parser("resume", help="continue a persisted run")
     re_.add_argument("--dry-run", action="store_true")
@@ -124,6 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     re_.add_argument("--allow-merge", action="store_true")
     re_.add_argument("--full-prompt", action="store_true")
+    _add_accept_config_change(re_)
 
     ub = sub.add_parser(
         "unblock",
@@ -148,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="read GitHub and report the decision without writing state or the log",
     )
+    _add_accept_config_change(ub)
     action = ub.add_mutually_exclusive_group()
     action.add_argument(
         "--approve-action",
@@ -183,6 +190,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_local_parser(sub)
     return p
+
+
+def _add_accept_config_change(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--accept-config-change",
+        action="store_true",
+        help=(
+            "continue a REMOTE run although this invocation's profile routing or agent "
+            "worktree root differs from the configuration the run was recorded under: the "
+            "change is written to the run log and becomes the run's configuration (#219)"
+        ),
+    )
 
 
 def _add_local_parser(sub) -> None:
@@ -308,7 +327,22 @@ def _engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
     state_dir = args.state_dir or cfg.state_dir
     engine = ControllerEngine(config=cfg, state_dir=state_dir)
     engine.cli_global_flags = _global_flags(args)
+    engine.config_file = os.path.abspath(args.config) if args.config else ""
     return engine
+
+
+def _check_configuration(engine: ControllerEngine, args, *words: str, dry_run: bool) -> None:
+    """The recorded-configuration gate of ``step``, ``resume`` and ``unblock`` (#219).
+
+    Refuses (``ConfigurationDriftError``, exit 2) before any phase executes
+    when this invocation's configuration differs from the run's, unless
+    ``--accept-config-change``; prints the engine's notice on stderr.
+    """
+    notice = engine.check_run_configuration(
+        words, accept_change=bool(getattr(args, "accept_config_change", False)), dry_run=dry_run
+    )
+    if notice:
+        print(redact(f"autoforge: {notice}"), file=sys.stderr)
 
 
 def _local_engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
@@ -536,6 +570,8 @@ def cmd_run(args) -> int:
             return rc
         engine.new_run(args.epic, args.issue)
         assert engine.state is not None
+        # What later commands of the run are checked against (#219).
+        engine.record_run_configuration()
         if corrupt:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
@@ -628,7 +664,9 @@ def cmd_step(args) -> int:
         _bind_existing_run(engine)
     if args.dry_run:
         # Read-only: no lock, nothing written.
-        engine.load()
+        state = engine.load()
+        if state.phase not in TERMINAL_PHASES:
+            _check_configuration(engine, args, "step", dry_run=True)
         outcome = engine.step(dry_run=True, allow_merge=args.allow_merge)
         if outcome.plan is not None:
             print_plan(outcome.plan, full_prompt=args.full_prompt)
@@ -636,7 +674,9 @@ def cmd_step(args) -> int:
     # Load and execute under one lock: a snapshot loaded before the lock
     # could already have been replaced by another controller.
     with engine.locked():
-        engine.load()
+        state = engine.load()
+        if state.phase not in TERMINAL_PHASES:
+            _check_configuration(engine, args, "step", dry_run=False)
         _show_progress(engine)
         outcome = engine.step(dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, [outcome], args.allow_merge)
@@ -652,6 +692,7 @@ def cmd_resume(args) -> int:
         rc = _resume_holding_state(engine, state, args.allow_merge)
         if rc is not None:
             return rc
+        _check_configuration(engine, args, "resume", dry_run=True)
         outcomes = engine.run(max_steps=args.max_steps, dry_run=True, allow_merge=args.allow_merge)
         for o in outcomes:
             assert o.plan is not None
@@ -664,6 +705,7 @@ def cmd_resume(args) -> int:
         rc = _resume_holding_state(engine, state, args.allow_merge)
         if rc is not None:
             return rc
+        _check_configuration(engine, args, "resume", dry_run=False)
         _show_progress(engine)
         outcomes = engine.run(
             max_steps=args.max_steps,
@@ -687,17 +729,25 @@ def cmd_unblock(args) -> int:
         _bind_existing_run(engine)
     approve = str(getattr(args, "approve_action", "") or "")
     decline = str(getattr(args, "decline_action", "") or "")
+    # The words a configuration refusal prints for this command (#219).
+    words = ("unblock", "--reason", "<why>")
     if args.dry_run:
         # Reads GitHub; writes nothing (no state, no run log, no lock).
-        engine.load()
+        state = engine.load()
+        if state.phase == Phase.BLOCKED:
+            _check_configuration(engine, args, *words, dry_run=True)
         outcome = engine.unblock(
             args.reason, dry_run=True, approve_action=approve, decline_action=decline
         )
         print_unblock_outcome(outcome)
         return 0
-    # Load, decide and write under one lock, like `step`.
+    # Load, decide and write under one lock, like `step`. An accepted
+    # configuration change is its own recorded write, made before the
+    # decision: a refused unblock leaves it in place.
     with engine.locked():
-        engine.load()
+        state = engine.load()
+        if state.phase == Phase.BLOCKED:
+            _check_configuration(engine, args, *words, dry_run=False)
         outcome = engine.unblock(args.reason, approve_action=approve, decline_action=decline)
     print_unblock_outcome(outcome)
     if not outcome.unblocked:
@@ -1032,6 +1082,7 @@ def _render_status(
         f"Issue:      #{_num(state.current_issue_url)} {state.current_issue_url or '-'}",
         f"PR:         #{_num(state.current_pr_url)} {state.current_pr_url or '-'}",
         f"Branch:     {state.current_branch or '-'}",
+        f"Config:     {_recorded_configuration(state)}",
         "",
         f"Phase:      {state.phase.value}",
         f"Review rounds completed: {state.review_round}",
@@ -1073,6 +1124,14 @@ def _render_status(
         f"Updated:    {state.updated_at}",
     ]
     return "\n".join(lines)
+
+
+def _recorded_configuration(state: AutoForgeState) -> str:
+    """Where a REMOTE run's recorded configuration came from, and when (#219)."""
+    if not state.config_fingerprint:
+        return "not recorded (state from before #219; the next step, resume or unblock records it)"
+    recorded = RecordedConfiguration.from_dict(state.config_fingerprint)
+    return f"{recorded.origin()} ({recorded.source} {recorded.recorded_at})"
 
 
 def _render_local_status(state: AutoForgeState, txn: ReplanTransaction | None) -> str:

@@ -162,6 +162,23 @@ for each. The built-in defaults are:
 | `replan_reexecute` | `REPLAN_REEXECUTE` | OpenCode | `openai/gpt-5.6-terra` | high |
 | `update_epic` | `UPDATE_EPIC` | OpenCode | `openai/gpt-5.6-sol` | high |
 
+### Changing the configuration of a running run
+
+A REMOTE run records the configuration it was created under: for each
+profile above, the `provider`, `model`, `effort` and the effective
+`idle_timeout_seconds` and `max_runtime_seconds`, plus the resolved
+`execution.worktree_dir` (#219). `step`, `resume` and `unblock` refuse a
+configuration that differs in any of these, naming each changed key and the
+command that restores the recorded one. `--accept-config-change` makes the
+new values the run's, and the change is recorded in the run log. Every
+other key (a profile's `command`, `extra_args` and `options`, the loop
+bounds, the merge gate, the agent environment, `sandbox.mode`) may change
+between commands. A run refuses, before any state is written, a
+configuration the record could not hold: a `provider`, `model` or `effort`
+over 512 characters, or an `update_epic` limit that is not a positive
+integer (`doctor` reports it). See
+[Running the remote workflow](usage.md#the-configuration-a-run-was-recorded-under).
+
 ### Overriding a profile
 
 A profile in your file is merged over the built-in default of the same name,

@@ -135,6 +135,7 @@ def test_load_missing_required_field_raises(tmp_path):
         "completion_context": {},
         "launch_label": "",
         "acceptance_outcomes": [],
+        "config_fingerprint": {},
     }
     p.write_text(json.dumps({"phase": "REVIEW", **effects}), encoding="utf-8")
     with pytest.raises(StateError, match="run_id"):
@@ -379,15 +380,16 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
     """
     path = tmp_path / "state.json"
     base = make_state().to_dict()
-    assert base["protocol_version"] == "8"
+    assert base["protocol_version"] == "9"
     del base["acceptance_outcomes"]  # protocol 8's own field (#211)
+    del base["config_fingerprint"]  # protocol 9's own field (#219)
     for journal in ({}, {"stage": "rejected", "rejection_reason": "refused by verification"}):
         data = dict(base, protocol_version="1", replan_transaction=journal)
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "8" and loaded.replan_transaction == journal
+        assert loaded.protocol_version == "9" and loaded.replan_transaction == journal
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "8"
+        assert json.loads(path.read_text())["protocol_version"] == "9"
     in_flight = {
         "stage": "prepared",
         "transaction_id": "a" * 32,
@@ -485,11 +487,12 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
         "reviewed_merge_base_sha",
         "current_merge_base_sha",
         "acceptance_outcomes",
+        "config_fingerprint",
     ):
         del data[missing]
     path.write_text(json.dumps(data), encoding="utf-8")
     loaded = load_state(path)
-    assert loaded.protocol_version == "8" and loaded.phase == phase
+    assert loaded.protocol_version == "9" and loaded.phase == phase
     assert (loaded.reviewed_pr_url, loaded.reviewed_base_ref, loaded.current_base_ref) == (
         "",
         "",
@@ -498,7 +501,7 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
     assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
     assert loaded.reviewed_head_sha == "a" * 40  # what protocol 2 did record is kept
     save_state(loaded, path)
-    assert json.loads(path.read_text())["protocol_version"] == "8"
+    assert json.loads(path.read_text())["protocol_version"] == "9"
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
@@ -546,16 +549,21 @@ def test_protocol_3_is_relabelled_outside_the_merge_phases(tmp_path, phase):
     for journal in ({}, rejected):
         data = _clean_review_state(phase=phase, replan_transaction=journal).to_dict()
         data["protocol_version"] = "3"
-        for missing in ("reviewed_merge_base_sha", "current_merge_base_sha", "acceptance_outcomes"):
+        for missing in (
+            "reviewed_merge_base_sha",
+            "current_merge_base_sha",
+            "acceptance_outcomes",
+            "config_fingerprint",
+        ):
             del data[missing]
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "8" and loaded.phase == phase
+        assert loaded.protocol_version == "9" and loaded.phase == phase
         assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
         assert loaded.reviewed_pr_url == PR42 and loaded.reviewed_base_ref == "main"
         assert loaded.replan_transaction == journal
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "8"
+        assert json.loads(path.read_text())["protocol_version"] == "9"
 
 
 @pytest.mark.parametrize("phase", list(Phase))
@@ -634,13 +642,14 @@ def test_protocol_4_is_relabelled_in_every_phase_without_a_replan_past_the_write
         data["protocol_version"] = "4"
         data["controller_version"] = "0.4.0"
         del data["acceptance_outcomes"]  # protocol 8's own field (#211)
+        del data["config_fingerprint"]  # protocol 9's own field (#219)
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "8" and loaded.phase == phase
+        assert loaded.protocol_version == "9" and loaded.phase == phase
         assert loaded.replan_transaction == journal
         assert loaded.reviewed_merge_base_sha == "d" * 40  # the binding is kept whole
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "8"
+        assert json.loads(path.read_text())["protocol_version"] == "9"
 
 
 @pytest.mark.parametrize("phase", list(Phase))
@@ -1943,15 +1952,15 @@ def _effect_fields(source):
     return {key: getattr(source, key) for key in _EFFECT_KEYS}
 
 
-# -- round trips under protocol 8 ------------------------------------------------------
+# -- round trips under protocol 9 ------------------------------------------------------
 
 
-def test_the_controller_speaks_protocol_8():
-    """ADR 0004 D13.1: #160 is protocol 7, #211 (the acceptance comment, K9) is 8;
-    6 is reserved for #126."""
+def test_the_controller_speaks_protocol_9():
+    """ADR 0004 D13.1: #160 is protocol 7, #211 (the acceptance comment, K9) is 8,
+    #219 (the recorded configuration) is 9; 6 is reserved for #126."""
     from autoforge import __protocol_version__
 
-    assert __protocol_version__ == "8"
+    assert __protocol_version__ == "9"
 
 
 @pytest.mark.parametrize(
@@ -1963,17 +1972,17 @@ def test_the_controller_speaks_protocol_8():
         (Stage.CONFLICT, Phase.BLOCKED),
     ],
 )
-def test_effect_state_round_trips_in_every_record_stage_under_protocol_8(tmp_path, stage, phase):
+def test_effect_state_round_trips_in_every_record_stage_under_protocol_9(tmp_path, stage, phase):
     """D2.1-D2.3, D4.4, D4.6, D13.3: a record in each stage, the entry observation,
     the completion context and the launch label survive save and load unchanged,
-    in a file labelled protocol 8. A conflict is persisted with the run BLOCKED
+    in a file labelled protocol 9. A conflict is persisted with the run BLOCKED
     in the phase it stopped, which keeps the pieces bound to that phase."""
     p = tmp_path / "state.json"
     s = _update_epic_state(stage, phase=phase)
     save_state(s, p)
 
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "8"
+    assert raw["protocol_version"] == "9"
     assert raw["effect_records"][0]["stage"] == stage.value
     loaded = load_state(p)
     assert loaded == s
@@ -3128,25 +3137,25 @@ def test_a_local_run_with_empty_effect_fields_loads(tmp_path):
 
 
 def _legacy(protocol, **kw):
-    """The dict an older controller wrote: no protocol-7 or protocol-8 field at all."""
+    """The dict an older controller wrote: no protocol-7, -8 or -9 field at all."""
     d = make_state(**kw).to_dict()
     d["protocol_version"] = protocol
-    for key in (*_EFFECT_KEYS, "acceptance_outcomes"):
+    for key in (*_EFFECT_KEYS, "acceptance_outcomes", "config_fingerprint"):
         del d[key]
     return d
 
 
 @pytest.mark.parametrize("protocol", ["1", "2", "3", "4", "5"])
-def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_8_on_save(tmp_path, protocol):
+def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_9_on_save(tmp_path, protocol):
     """D13.2: protocol 5 (the label before effects) and the older legacy labels
     load with no records, no observation and no context, and the next save writes
-    protocol 8 with the four fields at their empty values."""
+    protocol 9 with the four fields at their empty values."""
     p = _write(
         tmp_path / "state.json",
         _legacy(protocol, phase=Phase.REVIEW, current_pr_url=PR42, review_round=1),
     )
     loaded = load_state(p)
-    assert loaded.protocol_version == "8"
+    assert loaded.protocol_version == "9"
     assert loaded.phase_effects().empty
     assert _effect_fields(loaded) == {
         "effect_records": [],
@@ -3156,8 +3165,8 @@ def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_8_on_save(tm
     }
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "8"
-    assert raw["acceptance_outcomes"] == []
+    assert raw["protocol_version"] == "9"
+    assert raw["acceptance_outcomes"] == [] and raw["config_fingerprint"] == {}
     assert _effect_fields(raw) == _effect_fields(loaded)
     assert load_state(p) == loaded
 
@@ -3216,7 +3225,7 @@ def test_a_legacy_local_state_gets_no_launch_label(tmp_path):
     loads with no label, so its protocol-7 save stays loadable as LOCAL."""
     d = _local_state(attempt=1).to_dict()
     d["protocol_version"] = "5"
-    for key in (*_EFFECT_KEYS, "acceptance_outcomes"):
+    for key in (*_EFFECT_KEYS, "acceptance_outcomes", "config_fingerprint"):
         del d[key]
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
@@ -3269,8 +3278,9 @@ def test_a_protocol_7_or_8_file_missing_an_effect_field_is_refused_and_left_unch
     plan at all, and the phase would complete from its context without
     publishing it."""
     d = _update_epic_state(stage).to_dict()
-    assert d["protocol_version"] == "8"
+    assert d["protocol_version"] == "9"
     d["protocol_version"] = protocol
+    del d["config_fingerprint"]  # protocol 9's own field (#219)
     if protocol == "7":
         del d["acceptance_outcomes"]
     del d[missing]
@@ -3312,12 +3322,12 @@ def test_a_legacy_file_with_effect_fields_at_their_empty_values_loads(tmp_path):
     d = _legacy("5", phase=Phase.UPDATE_EPIC, attempt=1, current_pr_url=PR42)
     d.update(effect_records=[], entry_observation={}, completion_context={}, launch_label="")
     loaded = load_state(_write(tmp_path / "state.json", d))
-    assert loaded.protocol_version == "8"
+    assert loaded.protocol_version == "9"
     assert loaded.phase_effects().empty
     assert loaded.launch_label == LABEL_AGENT_PUBLISHES
 
 
-@pytest.mark.parametrize("protocol", ["6", "9", 7, 8])
+@pytest.mark.parametrize("protocol", ["6", "10", 7, 8, 9])
 def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(tmp_path, protocol):
     """D13.1: protocol 6 is reserved for #126 and was never written by any
     released controller, so it is not a legacy label this controller migrates;
@@ -3329,7 +3339,7 @@ def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(tmp_
     before = p.read_bytes()
     with pytest.raises(StateError) as exc:
         load_state(p)
-    assert f"unsupported protocol_version {protocol!r} (controller speaks '8')" in str(exc.value)
+    assert f"unsupported protocol_version {protocol!r} (controller speaks '9')" in str(exc.value)
     assert p.read_bytes() == before
 
 
@@ -3557,6 +3567,7 @@ def _as_protocol_7(d: dict) -> dict:
     """``d`` as a protocol-7 controller wrote it: no acceptance-action field."""
     d["protocol_version"] = "7"
     del d["acceptance_outcomes"]
+    del d["config_fingerprint"]
     for r in d["completion_context"].get("resolutions", []):
         del r["acceptance_source"]
     for r in d["last_fix_resolutions"]:
@@ -3574,22 +3585,22 @@ def test_acceptance_state_round_trips_under_protocol_8(tmp_path):
     assert loaded == _after_fix(updated_at=loaded.updated_at)
 
 
-def test_a_protocol_7_file_loads_migrated_and_is_relabelled_8_on_save(tmp_path):
-    """The previous protocol loads: its FIX plan's resolutions name no
-    acceptance comment, its recorded resolutions verified none, and it has
-    no outcomes. The next save writes protocol 8 with those values."""
+def test_a_protocol_7_file_loads_migrated_and_is_relabelled_9_on_save(tmp_path):
+    """Protocol 7 loads: its FIX plan's resolutions name no acceptance
+    comment, its recorded resolutions verified none, and it has no outcomes.
+    The next save writes the current protocol with those values."""
     d = _fix_state().to_dict()
     d["last_fix_resolutions"] = [dict(FIXED_ENTRY)]
     p = _write(tmp_path / "state.json", _as_protocol_7(d))
     loaded = load_state(p)
-    assert loaded.protocol_version == "8" and loaded.acceptance_outcomes == []
+    assert loaded.protocol_version == "9" and loaded.acceptance_outcomes == []
     assert loaded.last_fix_resolutions == [FIXED_ENTRY]
     context = loaded.phase_effects().context
     assert isinstance(context, FixContext)
     assert all(r["acceptance_source"] is None for r in context.resolutions)
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "8" and raw["acceptance_outcomes"] == []
+    assert raw["protocol_version"] == "9" and raw["acceptance_outcomes"] == []
     assert load_state(p) == loaded
 
 
@@ -3617,7 +3628,7 @@ def test_an_older_file_carrying_acceptance_state_is_refused_and_left_unchanged(
     if protocol == "7":
         d = make_state(phase=Phase.REVIEW, current_pr_url=PR42).to_dict()
         d["protocol_version"] = "7"
-        del d["acceptance_outcomes"]
+        del d["acceptance_outcomes"], d["config_fingerprint"]
     else:
         d = _legacy(protocol, phase=Phase.REVIEW, current_pr_url=PR42)
     plant(d)
@@ -3758,3 +3769,124 @@ def test_acceptance_outcomes_belong_to_the_issue_they_were_recorded_for():
     state = _after_fix()
     state.reset_for_new_issue("https://github.com/owner/repo/issues/3")
     assert state.acceptance_outcomes == [] and state.last_fix_resolutions == []
+
+
+# -- the recorded configuration (#219, protocol 9) --------------------------------------
+
+
+def _recorded_config(**over) -> dict:
+    from autoforge.config import default_config
+    from autoforge.config_fingerprint import ConfigFingerprint, RecordedConfiguration
+
+    record = RecordedConfiguration(
+        fingerprint=ConfigFingerprint.from_config(default_config(), "/srv/worktrees"),
+        config_file="/home/me/autoforge.yaml",
+        source="created",
+        recorded_at="2026-10-14T00:00:00+00:00",
+    ).to_dict()
+    record.update(over)
+    return record
+
+
+def test_a_recorded_configuration_round_trips_under_protocol_9(tmp_path):
+    p = tmp_path / "state.json"
+    s = make_state(phase=Phase.REVIEW, config_fingerprint=_recorded_config())
+    save_state(s, p)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    assert raw["protocol_version"] == "9" and raw["config_fingerprint"] == _recorded_config()
+    assert load_state(p) == s
+
+
+def test_a_protocol_8_file_loads_with_no_recorded_configuration_and_is_relabelled_9(tmp_path):
+    """No recorded configuration means "not checked": the file loads in any
+    phase, its own acceptance state untouched (it is protocol 8's, not
+    migrated), and the next save writes protocol 9 with ``{}``."""
+    d = _after_fix().to_dict()
+    d["protocol_version"] = "8"
+    del d["config_fingerprint"]
+    p = _write(tmp_path / "state.json", d)
+    loaded = load_state(p)
+    assert loaded.protocol_version == "9" and loaded.config_fingerprint == {}
+    assert loaded.last_fix_resolutions[0]["acceptance_comment_url"] == ACCEPTANCE_COMMENT_URL
+    assert loaded.acceptance_outcomes == _after_fix().acceptance_outcomes
+    save_state(loaded, p)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    assert raw["protocol_version"] == "9" and raw["config_fingerprint"] == {}
+    assert load_state(p) == loaded
+
+
+@pytest.mark.parametrize("protocol", ["4", "5", "7", "8"])
+@pytest.mark.parametrize("value", [{}, _recorded_config()], ids=["empty", "recorded"])
+def test_an_older_file_carrying_a_recorded_configuration_is_refused_and_left_unchanged(
+    tmp_path, protocol, value
+):
+    """No controller before protocol 9 wrote ``config_fingerprint``: an older
+    label carrying it, even empty, is a hand edit or a foreign file."""
+    if protocol in ("4", "5"):
+        d = _legacy(protocol, phase=Phase.REVIEW, current_pr_url=PR42)
+    else:
+        d = make_state(phase=Phase.REVIEW, current_pr_url=PR42).to_dict()
+        d["protocol_version"] = protocol
+        if protocol == "7":
+            del d["acceptance_outcomes"]
+    d["config_fingerprint"] = value
+    p = _write(tmp_path / "state.json", d)
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert f"labelled protocol_version {protocol!r}, which never wrote 'config_fingerprint'" in str(
+        exc.value
+    )
+    assert p.read_bytes() == before
+
+
+def test_a_protocol_9_file_missing_its_recorded_configuration_is_refused(tmp_path):
+    """Every protocol-9 save writes the field, ``{}`` included: read as absent
+    it would switch the check off for the rest of the run."""
+    d = make_state(config_fingerprint=_recorded_config()).to_dict()
+    del d["config_fingerprint"]
+    p = _write(tmp_path / "state.json", d)
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    message = str(exc.value)
+    assert "labelled protocol_version '9'" in message
+    assert "missing required field(s) 'config_fingerprint'" in message
+    assert "not a run with none recorded" in message
+
+
+@pytest.mark.parametrize(
+    ("value", "needle"),
+    [
+        ([], "state field 'config_fingerprint' must be an object"),
+        ("x", "state field 'config_fingerprint' must be an object"),
+        ({"schema": 1}, "state field 'config_fingerprint': the recorded configuration must hold"),
+        (_recorded_config(schema=2), "state field 'config_fingerprint': schema 2 is not 1"),
+        (_recorded_config(source=""), "state field 'config_fingerprint': source must be one of"),
+        (
+            _recorded_config(worktree_root="wt"),
+            "state field 'config_fingerprint': worktree_root must be an absolute path",
+        ),
+    ],
+)
+def test_a_malformed_recorded_configuration_is_refused(tmp_path, value, needle):
+    d = make_state().to_dict()
+    d["config_fingerprint"] = value
+    p = _write(tmp_path / "state.json", d)
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert needle in str(exc.value)
+
+
+def test_a_local_run_carrying_a_recorded_configuration_is_refused(tmp_path):
+    d = _local_state().to_dict()
+    d["config_fingerprint"] = _recorded_config()
+    p = _write(tmp_path / "state.json", d)
+    with pytest.raises(StateError, match="'config_fingerprint' is set on a LOCAL run"):
+        load_state(p)
+
+
+def test_a_new_issue_keeps_the_recorded_configuration():
+    """The configuration is the run's, not the issue's."""
+    s = make_state(config_fingerprint=_recorded_config())
+    s.reset_for_new_issue("https://github.com/owner/repo/issues/3")
+    assert s.config_fingerprint == _recorded_config()

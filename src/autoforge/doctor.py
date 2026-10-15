@@ -56,6 +56,7 @@ from .child_env import (
     preflight,
 )
 from .config import AutoForgeConfig, ProfileConfig, load_config_file, validate_required_profiles
+from .config_fingerprint import fingerprint_routing
 from .errors import (
     ConfigurationError,
     ExecutionError,
@@ -189,6 +190,9 @@ class Doctor:
             required = required_profiles or REQUIRED_PROFILES
             names = required(cfg) if callable(required) else required
             validate_required_profiles(cfg, names)
+            if required_profiles is None:
+                # A REMOTE run: its routing is recorded in its state file (#219).
+                fingerprint_routing(cfg)
         except ConfigurationError as exc:
             return CheckResult("config", False, str(exc))
         self.config = cfg

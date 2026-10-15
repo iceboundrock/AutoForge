@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __prompt_version__, __protocol_version__, __version__
+from .config_fingerprint import RecordedConfiguration
 from .effects import (
     ACTION_ID_RE,
     LABEL_AGENT_PUBLISHES,
@@ -265,10 +266,15 @@ def _validate_local_pending(state: AutoForgeState) -> None:
 # reserved for #126) and is loaded under D13.2.
 _LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS | {"5"}
 # The label before the controller could publish an acceptance comment
-# (#211). A protocol-7 file is this protocol's shape without the acceptance
+# (#211). A protocol-7 file is protocol 8's shape without the acceptance
 # state: it carries the effect fields and is loaded with them, in every
 # phase, and relabelled.
-_PREVIOUS_PROTOCOL = "7"
+_PRE_ACCEPTANCE_PROTOCOL = "7"
+# The label before a REMOTE run recorded its configuration (#219). A
+# protocol-8 file is this protocol's shape without ``config_fingerprint``:
+# it is loaded in every phase with none, which is "not checked", and
+# relabelled.
+_PREVIOUS_PROTOCOL = "8"
 # The fields protocol 7 added (#160): the effect records, the entry
 # observation and the completion context of the current phase entry, and the
 # launch label. A legacy file never carries one; one that does is a hand edit
@@ -280,6 +286,9 @@ _EFFECT_FIELDS = ("effect_records", "entry_observation", "completion_context", "
 # REMOTE ``last_fix_resolutions`` entry and an optional ``action`` to an
 # ``unblock_history`` entry (:func:`_acceptance_state_in`).
 _ACCEPTANCE_FIELDS = ("acceptance_outcomes",)
+# The field protocol 9 added (#219): the configuration a REMOTE run was
+# recorded under (:mod:`autoforge.config_fingerprint`), ``{}`` when none is.
+_CONFIG_FIELDS = ("config_fingerprint",)
 # ``acceptance_outcomes`` (#211): what became of each acceptance action of
 # the current PR. Bounded: at most one action is requested per FIX result,
 # and the writer drops the oldest entries past the bound
@@ -577,6 +586,16 @@ class AutoForgeState:
     # changed -- but in the run log. Kept across issues: it is the run's audit
     # trail, not per-PR bookkeeping.
     unblock_history: list[dict] = field(default_factory=list)
+    # The configuration a REMOTE run was recorded under (#219): per-profile
+    # provider, model, effort and limits, the agent worktree root, the
+    # ``--config`` file and how it was recorded, in the closed form of
+    # :class:`autoforge.config_fingerprint.RecordedConfiguration`. Written
+    # when the run is created; ``resume``, ``step`` and ``unblock`` refuse a
+    # configuration that differs from it unless the operator accepts the
+    # change, which replaces it. ``{}`` for a LOCAL run (its run contract
+    # defines it) and for a run created before the field existed (not
+    # checked; the next command records one). Kept across issues.
+    config_fingerprint: dict = field(default_factory=dict)
 
     created_at: str = ""
     updated_at: str = ""
@@ -692,6 +711,15 @@ class AutoForgeState:
         #   and is loaded in every phase with none: ``acceptance_source``
         #   null and ``acceptance_comment_url`` "" (nothing was published).
         #   An older file that carries any of them is refused, never merged.
+        # - 8 -> 9: a REMOTE run records the configuration it was created
+        #   under (``config_fingerprint``, #219), which ``resume``, ``step``
+        #   and ``unblock`` compare their own with. An older file has none
+        #   and is loaded in every phase with none, which is "not checked"
+        #   (the next of those commands records one). It is never filled
+        #   from the configuration of the moment at load: that is the
+        #   rebinding the record exists to catch, and a load (``status``)
+        #   runs on no configuration. An older file that carries the field,
+        #   even empty, is refused, never merged.
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
@@ -725,13 +753,20 @@ class AutoForgeState:
                     "or a foreign file, not an older controller's state"
                 )
             _refuse_acceptance_state(data, str(raw_protocol))
-        elif raw_protocol == _PREVIOUS_PROTOCOL:
+            _refuse_config_fingerprint(data, str(raw_protocol))
+        elif raw_protocol == _PRE_ACCEPTANCE_PROTOCOL:
             # 7 -> 8 (#211): the same shape without the acceptance-action
             # state. Every protocol-7 save wrote the effect fields, exactly
             # as a protocol-8 one does; the acceptance state it never wrote
-            # is refused, never merged.
+            # is refused, never merged, and so is a recorded configuration.
             _require_fields(data, raw_protocol, _EFFECT_FIELDS, "effect state")
             _refuse_acceptance_state(data, raw_protocol)
+            _refuse_config_fingerprint(data, raw_protocol)
+        elif raw_protocol == _PREVIOUS_PROTOCOL:
+            # 8 -> 9 (#219): the same shape without the recorded
+            # configuration, which it never wrote and which is refused.
+            _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
+            _refuse_config_fingerprint(data, raw_protocol)
         elif raw_protocol != __protocol_version__:
             raise StateError(
                 f"unsupported protocol_version {raw_protocol!r} "
@@ -745,6 +780,16 @@ class AutoForgeState:
             # the phase complete from its context with a pending effect never
             # performed.
             _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
+            # Every protocol-9 save writes it, ``{}`` included, so an absent
+            # one is not "not recorded": read as the empty default it would
+            # switch the configuration check off for the rest of the run.
+            _require_fields(
+                data,
+                raw_protocol,
+                _CONFIG_FIELDS,
+                "recorded configuration",
+                "not a run with none recorded",
+            )
         # A LOCAL state written before the run contract existed has no
         # persisted definition of what it reviewed under. It is not migrated:
         # the only source a migration could fill the contract from is the
@@ -763,7 +808,11 @@ class AutoForgeState:
         kwargs["phase"] = phase
         kwargs["mode"] = mode
         kwargs["protocol_version"] = __protocol_version__
-        if raw_protocol != __protocol_version__ and mode == WorkflowMode.REMOTE:
+        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__) and (
+            mode == WorkflowMode.REMOTE
+        ):
+            # Before protocol 8 only: a protocol-8 file carries its own
+            # acceptance state, which the migration would overwrite.
             kwargs.update(_acceptance_migration(data))
         if legacy and mode == WorkflowMode.REMOTE:
             attempt = data.get("attempt", 0)
@@ -895,6 +944,7 @@ class AutoForgeState:
         _validate_unblock_history(state.unblock_history)
         # After the shapes it reads (last_fix_resolutions, unblock_history).
         _validate_acceptance_state(state)
+        _validate_config_fingerprint(state)
         for name in _MINIMUM_ONE_FIELDS:
             if getattr(state, name) < 1:
                 raise StateError(f"state field {name!r} must be a valid integer")
@@ -1092,8 +1142,17 @@ class AutoForgeState:
 _UNBLOCK_ENTRY_FIELDS = ("at", "reason", "block_reason", "phase", "detail")
 
 
-def _require_fields(data: dict, protocol: object, names: tuple[str, ...], what: str) -> None:
-    """Refuse a file of ``protocol`` that lacks a field every save of it writes."""
+def _require_fields(
+    data: dict,
+    protocol: object,
+    names: tuple[str, ...],
+    what: str,
+    absent: str = "not an empty plan",
+) -> None:
+    """Refuse a file of ``protocol`` that lacks a field every save of it writes.
+
+    ``absent`` is what the missing field must not be read as.
+    """
     missing = [name for name in names if name not in data]
     if not missing:
         return
@@ -1106,8 +1165,24 @@ def _require_fields(data: dict, protocol: object, names: tuple[str, ...], what: 
         f"state file {label} but is missing "
         f"required field(s) {', '.join(repr(n) for n in missing)}; refusing to "
         f"load -- every save of this protocol writes the {what}, so an absent "
-        "field is corruption, not an empty plan"
+        f"field is corruption, {absent}"
     )
+
+
+def _refuse_config_fingerprint(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 9 never recorded a configuration (#219).
+
+    The label decides, not the value: ``config_fingerprint`` is protocol 9's
+    own field, so an older file that carries it at all, even ``{}``, was not
+    written by the controller its label names.
+    """
+    if "config_fingerprint" in data:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            "'config_fingerprint'; refusing to load a file that carries protocol-9 "
+            "recorded configuration -- it is a hand edit or a foreign file, not an older "
+            "controller's state"
+        )
 
 
 def _acceptance_state_in(data: dict) -> list[str]:
@@ -1179,6 +1254,29 @@ def _acceptance_migration(data: dict) -> dict:
             ],
         }
     return out
+
+
+def _validate_config_fingerprint(state: AutoForgeState) -> None:
+    """``config_fingerprint`` (#219): ``{}`` or a whole recorded configuration.
+
+    A LOCAL run is defined by its run contract and records none. A REMOTE
+    record that does not parse is corruption, never "not recorded": read as
+    none, it would switch the check off.
+    """
+    recorded = state.config_fingerprint
+    if not isinstance(recorded, dict):
+        raise StateError("state field 'config_fingerprint' must be an object")
+    if not recorded:
+        return
+    if state.mode == WorkflowMode.LOCAL:
+        raise StateError(
+            "state field 'config_fingerprint' is set on a LOCAL run, which its run contract "
+            "defines; refusing to load"
+        )
+    try:
+        RecordedConfiguration.from_dict(recorded)
+    except StateError as exc:
+        raise StateError(f"state field 'config_fingerprint': {exc}") from None
 
 
 def _validate_acceptance_state(state: AutoForgeState) -> None:

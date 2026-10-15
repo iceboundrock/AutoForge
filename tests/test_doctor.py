@@ -6,6 +6,7 @@ import pytest
 
 from autoforge.doctor import Doctor
 from autoforge.executor import ExecutionResult, execute
+from autoforge.profiles import local_required_profiles
 from tests.conftest import is_shell_probe
 
 RULES_ENDPOINT = "repos/owner/repo/rules/branches/main"
@@ -273,6 +274,21 @@ def test_doctor_fails_a_post_merge_profile_a_run_would_refuse_to_launch(tmp_path
     assert results["config"].ok
     row = results["profile limits"]
     assert not row.ok and row.required and "max_runtime_seconds" in row.detail
+
+
+def test_doctor_fails_a_config_whose_routing_a_remote_run_could_not_record(tmp_path):
+    """A REMOTE run records its routing in its state file (#219), and `run`
+    refuses a value that record could not hold (R1-F1): so does doctor's
+    config row. A LOCAL run records none, and its doctor passes it."""
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"version": 1, "profiles": {"fix": {"model": "m" * 513}}}))
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    row = {r.name: r for r in d.run_all()}["config"]
+    assert not row.ok and row.required
+    assert row.detail.startswith("profiles.fix.model must be a string of at most 512 characters")
+    assert d.config is None
+    local = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    assert local.check_config(local_required_profiles).ok
 
 
 def test_failures_are_reported_not_raised(tmp_path):

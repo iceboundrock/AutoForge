@@ -34,6 +34,24 @@ High-priority coverage includes:
   an unblock `action`, a K9 record or an `acceptance_source` is refused,
   unchanged; each malformed outcome and recorded URL is refused; a LOCAL
   run carries none; a new issue resets the outcomes
+- recorded configuration (#219, `tests/test_config_fingerprint.py`,
+  `tests/test_state.py`, `tests/test_cli.py`): every fingerprinted profile
+  key and the worktree root is compared and named, and no other key is; a
+  REMOTE run records it at creation; `step`, `resume` and `unblock` refuse
+  a difference (a `resume` without the run's `--config`, a changed model, a
+  changed worktree root) before any launch, GitHub call or write, and the
+  command they print to restore the recorded configuration names the state
+  directory that found the run by its absolute path, also when it came from
+  the configuration's `state_dir`, and continues that run;
+  `--accept-config-change` logs the change before recording it; a dry run
+  writes nothing; a protocol-8 file loads, resumes and records one; a
+  protocol-8 or older file carrying the field, or a protocol-9 file missing
+  it, is refused; a LOCAL run carries none; a configuration the record could
+  not hold (a model or effort over 512 characters, an `update_epic` provider
+  or limit out of bounds, a path over 4096 characters) is refused by `run`,
+  its dry run and `doctor` before any state is written, and by an upgrade or
+  an accepted change before anything is recorded or logged, while a model
+  at the bound is recorded and the run loads again
 
 ### Transitions
 

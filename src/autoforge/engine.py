@@ -158,6 +158,15 @@ from .config import (
     ProfileConfig,
     validate_required_profiles,
 )
+from .config_fingerprint import (
+    SOURCE_ACCEPTED,
+    SOURCE_CREATED,
+    SOURCE_UPGRADED,
+    ConfigChange,
+    ConfigFingerprint,
+    RecordedConfiguration,
+    fingerprint_routing,
+)
 from .effect_ops import (
     AcceptanceCommentOp,
     Driven,
@@ -205,6 +214,7 @@ from .errors import (
     AutoForgeError,
     CheckoutDriftError,
     ClaimConflictError,
+    ConfigurationDriftError,
     ConfigurationError,
     ControlResultError,
     ControlResultValidationError,
@@ -1023,6 +1033,11 @@ class ControllerEngine:
         # :meth:`resume_command` (#189). Paths only, never a configuration
         # value; empty for a library caller.
         self.cli_global_flags: tuple[str, ...] = ()
+        # The absolute path of the ``--config`` file this process loaded, ""
+        # for the built-in defaults; set by the CLI and recorded with the
+        # run's configuration (#219), so a refusal can name the file that
+        # restores it. Never a configuration value.
+        self.config_file = ""
         # The working directory and the step log directory of the latest
         # launch of the phase being invoked, recorded by :meth:`_invoke_phase`
         # (#189): an agent failure that leaves the state unchanged names
@@ -1151,6 +1166,205 @@ class ControllerEngine:
             return self.local_contract().repository_root
         return str(self._ensure_agent_worktree())
 
+    # -- the REMOTE run's recorded configuration (#219) -----------------------
+    def invocation_config_fingerprint(self) -> ConfigFingerprint:
+        """What this invocation would run a REMOTE run on: profile routing, worktree root."""
+        return ConfigFingerprint.from_config(self.config, self.agent_worktree_root())
+
+    def record_run_configuration(self, source: str = SOURCE_CREATED) -> None:
+        """Record this invocation's configuration as the run's, in memory.
+
+        ``run`` calls it on the run it creates, before its first save. A
+        LOCAL run records none: its run contract defines it. A configuration
+        the record could not be read back with is refused
+        (ConfigurationError), and nothing is recorded.
+        """
+        state = self._require_state()
+        if state.is_local:
+            return
+        state.config_fingerprint = RecordedConfiguration(
+            fingerprint=self.invocation_config_fingerprint(),
+            config_file=self.config_file,
+            source=source,
+            recorded_at=utcnow_iso(),
+        ).persisted()
+
+    def check_run_configuration(
+        self, words: Sequence[str], *, accept_change: bool = False, dry_run: bool = False
+    ) -> str:
+        """Compare this invocation's configuration with the run's, before any phase executes.
+
+        ``resume``, ``step`` and ``unblock`` call it once the run is loaded;
+        ``words`` is the command, for the one a refusal prints. Returns a
+        notice for the operator, "" when there is nothing to say:
+
+        - a LOCAL run: nothing (its run contract is checked by :meth:`load`);
+        - a run with no recorded configuration (a state file written before
+          #219): not checked, and this invocation's is recorded
+          (``upgraded``), to be saved with the command's next save;
+        - the recorded configuration: nothing;
+        - another one: :class:`ConfigurationDriftError` naming each changed
+          key, with nothing written, unless ``accept_change``. Then the
+          change goes to the run log first and the new configuration is
+          recorded (``accepted``) and saved, before anything else runs.
+
+        A dry run records, logs and saves nothing; it refuses as the command
+        would, or says what it would record or accept. Outside a git checkout
+        it compares the routing only, and says so.
+
+        A configuration that could not be recorded (one its state file could
+        not be loaded again with) is refused with ConfigurationError, in a
+        dry run too, before anything is recorded or logged.
+        """
+        state = self._require_state()
+        if state.is_local:
+            return ""
+        if not state.config_fingerprint:
+            if dry_run:
+                fingerprint_routing(self.config)  # refused as the command would refuse it
+                return (
+                    f"[dry-run] run {state.run_id} has no recorded configuration (its state "
+                    "file predates #219), so it is not checked; without --dry-run this "
+                    f"command records {self._config_origin()} as the run's"
+                )
+            self.record_run_configuration(SOURCE_UPGRADED)
+            return (
+                f"run {state.run_id} had no recorded configuration (its state file predates "
+                f"#219), so it was not checked; {self._config_origin()} is recorded as the "
+                "run's with its next save, and later commands are checked against it"
+            )
+        recorded = RecordedConfiguration.from_dict(state.config_fingerprint)
+        unresolved = ""
+        try:
+            current = self.invocation_config_fingerprint()
+        except (AutoForgeError, OSError) as exc:
+            if not dry_run:
+                raise
+            # A dry run may be planned outside any repository, where the
+            # default root (one git read) cannot be resolved: the routing is
+            # still compared, and the notice says the root was not.
+            current = ConfigFingerprint.from_config(self.config, recorded.fingerprint.worktree_root)
+            unresolved = (
+                "[dry-run] the agent worktree root was not compared: the default one is "
+                f"resolved from the checkout's git directory ({exc})"
+            )
+        changes = recorded.fingerprint.changes(current)
+        if not changes:
+            return unresolved
+        if not accept_change:
+            refusal = self._config_drift_refusal(recorded, changes, words)
+            raise ConfigurationDriftError(f"{refusal}\n{unresolved}" if unresolved else refusal)
+        listed = "".join(f"\n  {change.line()}" for change in changes)
+        # Built first: a record that could not be read back is refused, in a
+        # dry run too, with nothing logged.
+        record = RecordedConfiguration(
+            fingerprint=current,
+            config_file=self.config_file,
+            source=SOURCE_ACCEPTED,
+            recorded_at=utcnow_iso(),
+        ).persisted()
+        if dry_run:
+            accepted = (
+                f"[dry-run] would accept the configuration change of run {state.run_id} and "
+                f"record it in the run log:{listed}"
+            )
+            return f"{accepted}\n{unresolved}" if unresolved else accepted
+        # Logged before the state write: a refused log write leaves the run
+        # on its recorded configuration, and an accepted change is never on
+        # disk without its record.
+        self._log_config_change(words, recorded, changes)
+        state.config_fingerprint = record
+        self.save()
+        return (
+            f"accepted the configuration change of run {state.run_id} "
+            f"(--accept-config-change); it is in the run log, and {self._config_origin()} is "
+            f"the run's configuration from now on:{listed}"
+        )
+
+    def _config_origin(self) -> str:
+        """This invocation's configuration, for a message: its file or the built-in defaults."""
+        return f"--config {self.config_file}" if self.config_file else "the built-in defaults"
+
+    def _config_drift_refusal(
+        self, recorded: RecordedConfiguration, changes: list[ConfigChange], words: Sequence[str]
+    ) -> str:
+        """Why ``words`` refuses: each changed key, and the two ways on.
+
+        The values are routing fields and paths, none of them a place a
+        secret goes (:mod:`autoforge.config_fingerprint`); the CLI redacts
+        the message whole anyway.
+        """
+        state = self._require_state()
+        listed = "".join(f"\n  {change.line()}" for change in changes)
+        if recorded.config_file and recorded.config_file == self.config_file:
+            restore = (
+                f"This command loads the same file, {recorded.config_file}: it was edited "
+                "since, or the command runs from another directory or repository than the "
+                "run's (a relative execution.worktree_dir and the default worktree location "
+                "are resolved from there). To continue under the recorded configuration, "
+                "restore that."
+            )
+        else:
+            restore = (
+                "To continue under the recorded configuration: "
+                f"{self._restore_command(recorded, words)}"
+            )
+        return (
+            f"run {state.run_id} was recorded under {recorded.origin()} ({recorded.source} "
+            f"{recorded.recorded_at}), and this command's configuration differs from it, so "
+            f"'{words[0] if words else 'this command'}' refuses before any phase executes; "
+            f"nothing was written. Changed (recorded -> this command):{listed}\n"
+            f"{restore}\n"
+            "To continue under this command's configuration instead, repeat it with "
+            "--accept-config-change: the change is written to the run log and becomes the "
+            "run's configuration."
+        )
+
+    def _restore_command(self, recorded: RecordedConfiguration, words: Sequence[str]) -> str:
+        """``words`` with the recorded ``--config`` and the ``--state-dir`` that found this run.
+
+        Both are absolute (#189 repeats flags as typed, but the configuration
+        file was typed by another invocation). The state directory is always
+        named, even when this invocation took it from its own configuration's
+        ``state_dir`` rather than from a flag: the command swaps that
+        configuration for the recorded one, whose ``state_dir`` (or the
+        default ``.autoforge``) may be another directory, with no run or
+        another run in it.
+        """
+        flags: list[str] = ["--config", recorded.config_file] if recorded.config_file else []
+        flags += ["--state-dir", os.path.abspath(self.paths.state_dir)]
+        return shlex.join(["autoforge", *flags, *words])
+
+    def _log_config_change(
+        self, words: Sequence[str], recorded: RecordedConfiguration, changes: list[ConfigChange]
+    ) -> None:
+        """One controller-only run-log record of an accepted configuration change (#219)."""
+        state = self._require_state()
+        now = utcnow_iso()
+        record = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase=f"{state.phase.value}-config-change",
+            attempt=1,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            review_round=state.review_round,
+            profile="(operator configuration change; no agent)",
+            prompt_version=state.prompt_version,
+            started_at=now,
+            finished_at=now,
+            metadata={
+                "command": words[0] if words else "",
+                "accepted": True,
+                "changes": [change.to_dict() for change in changes],
+                "recorded_config_file": recorded.config_file,
+                "recorded_source": recorded.source,
+                "recorded_at": recorded.recorded_at,
+                "config_file": self.config_file,
+            },
+        )
+        self._logger().log_execution(record)
+
     # -- REMOTE agent isolation ---------------------------------------------
     def _agent_worktree_name(self) -> str:
         """One worktree per issue: its number, or the EPIC's between issues."""
@@ -1192,14 +1406,23 @@ class ControllerEngine:
         cached = self._agent_worktrees.get(name)
         if cached is not None:
             return cached
-        configured = self.config.execution.worktree_dir
-        if configured:
-            base = Path(os.path.realpath(Path(self.workdir) / configured))
-        else:
-            base = self.workspace().git_dirs()[-1] / "autoforge" / "worktrees"
-        path = base / name
+        path = self.agent_worktree_root() / name
         self._agent_worktrees[name] = path
         return path
+
+    def agent_worktree_root(self) -> Path:
+        """The directory that holds the per-issue agent worktrees, resolved.
+
+        ``execution.worktree_dir`` resolved against the controller's working
+        directory, or ``<git common dir>/autoforge/worktrees`` (one git read
+        when the configuration sets none). It is part of the run's recorded
+        configuration (#219): the same issue under another root is another,
+        empty worktree.
+        """
+        configured = self.config.execution.worktree_dir
+        if configured:
+            return Path(os.path.realpath(Path(self.workdir) / configured))
+        return self.workspace().git_dirs()[-1] / "autoforge" / "worktrees"
 
     def _worktree_identity(self, path: Path) -> tuple[Path, Path] | None:
         """``(working-tree root, git common dir)`` of ``path``, or ``None`` outside git.
@@ -1933,13 +2156,16 @@ class ControllerEngine:
         not require those profiles to be configured. Which reviewer profiles it
         does require follows from `local.max_fix_rounds`, because local review
         rounds are routed exactly like remote ones.
+
+        A REMOTE run also refuses a configuration whose routing its recorded
+        configuration could not hold (#219): the state file would not load
+        again (:func:`autoforge.config_fingerprint.fingerprint_routing`).
         """
-        required = (
-            local_required_profiles(self.config)
-            if self.mode == WorkflowMode.LOCAL
-            else REQUIRED_PROFILES
-        )
-        validate_required_profiles(self.config, required)
+        if self.mode == WorkflowMode.LOCAL:
+            validate_required_profiles(self.config, local_required_profiles(self.config))
+            return
+        validate_required_profiles(self.config, REQUIRED_PROFILES)
+        fingerprint_routing(self.config)
 
     # -- prompt context ---------------------------------------------------
     @staticmethod
@@ -9302,8 +9528,9 @@ class ControllerEngine:
         The CLI has no configuration discovery, so a run started with
         ``--config`` or ``--state-dir`` has to be resumed with them: without
         the state directory ``resume`` finds no run, and without the
-        configuration it runs on the built-in defaults (another model, other
-        limits, another worktree). The flags are the ones this process was
+        configuration it would run on the built-in defaults (another model,
+        other limits, another worktree), which a REMOTE run refuses (#219).
+        The flags are the ones this process was
         started with (:attr:`cli_global_flags`), paths as given, quoted for a
         POSIX shell (#189).
         """
