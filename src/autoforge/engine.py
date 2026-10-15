@@ -105,7 +105,7 @@ import re
 import secrets
 import shlex
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -506,9 +506,15 @@ MAX_LOCAL_PHASE_ATTEMPTS = 3
 # Launches of one REMOTE validation definition after a launch or setup
 # failure the executor or the sandbox backend reported, or #165's preflight
 # refusing it (ADR 0006 D10.5): the bounded in-process re-check. A
-# materialization failure gets one fresh materialization of its own.
+# materialization failure, or failing to read the store's object format,
+# gets one fresh attempt of its own.
 MAX_VALIDATION_LAUNCH_ATTEMPTS = 2
 MAX_VALIDATION_MATERIALIZATIONS = 2
+# What setting a REMOTE candidate's export up can raise besides a missing
+# candidate: the materializer's own refusal, an ``OSError`` creating or
+# writing the directory, an ``ExecutionError`` launching its git plumbing.
+# Each is a materialization failure (ADR 0006 D10.5), never a record.
+_EXPORT_SETUP_FAILURES = (MaterializationError, ExecutionError, OSError)
 # Where a REMOTE candidate's export is written for validation (ADR 0006 D6.2):
 # a fresh private directory per definition launch, beside the pre-merge one.
 VALIDATION_EXPORT_PREFIX = "autoforge-validate-"
@@ -993,6 +999,15 @@ def _validation_failure(
 class _ValidatorNotLaunched(Exception):
     """A REMOTE validator's launch or setup failed, or the preflight refused it
     (ADR 0006 D10.5): no record, and the caller re-checks within its bound."""
+
+
+def _export_setup_failure(exc: Exception) -> str:
+    """Why a REMOTE candidate's export was not set up, redacted, for the message."""
+    if isinstance(exc, MaterializationError):
+        return str(exc)
+    if isinstance(exc, ExecutionError):
+        return f"a git process could not be run: {redact(str(exc))}"
+    return f"a file system operation failed: {redact(str(exc))}"
 
 
 class ControllerEngine:
@@ -4461,9 +4476,11 @@ class ControllerEngine:
         A launch or setup failure, or the preflight refusing a launch, is
         re-checked once in-process and is then
         :class:`~autoforge.errors.ValidationInconclusiveError`; a
-        materialization failure gets one fresh materialization, then the
-        same. Neither writes a record. A sandbox refusal at the gate is
-        logged and re-raised with nothing written.
+        materialization failure (an ``OSError`` or a git process that could
+        not be run among them), or failing to read the store's object
+        format, gets one fresh attempt, then the same. Neither writes a
+        record. A sandbox refusal at the gate is logged and re-raised with
+        nothing written.
         """
         state = self._require_state()
         if state.mode == WorkflowMode.LOCAL:
@@ -4472,12 +4489,7 @@ class ControllerEngine:
         policy = self._validation_policy(LaunchClass.EXPORT_COMMAND)
         runner = self._runner or execute
         repo = str(self.workdir)
-        try:
-            object_format = read_object_format(runner, repo)
-        except MaterializationError as exc:
-            raise ValidationInconclusiveError(
-                f"candidate {commit[:12]} cannot be validated: {exc}"
-            ) from exc
+        object_format = self._validation_object_format(runner, repo, commit)
         candidate = self._remote_candidate(commit, object_format, provenance)
         records: list[dict] = []
         for definition in defs:
@@ -4492,6 +4504,21 @@ class ControllerEngine:
             records=tuple(records),
             definitions=len(defs),
         )
+
+    def _validation_object_format(self, runner, repo: str, commit: str) -> str:
+        """The shared store's object format, read again once on a failure (D10.5)."""
+        failures = 0
+        while True:
+            try:
+                return read_object_format(runner, repo)
+            except _EXPORT_SETUP_FAILURES as exc:
+                failures += 1
+                if failures >= MAX_VALIDATION_MATERIALIZATIONS:
+                    raise ValidationInconclusiveError(
+                        f"candidate {commit[:12]} cannot be validated: the object format of "
+                        f"its store could not be read ({failures} attempts): "
+                        f"{_export_setup_failure(exc)}"
+                    ) from exc
 
     def _remote_candidate(
         self, commit: str, object_format: str, provenance: Provenance
@@ -4530,34 +4557,39 @@ class ControllerEngine:
         definition: Definition,
         policy: Policy,
     ) -> dict:
-        """One definition in a fresh, proved export of ``candidate``: its record (D10.5)."""
+        """One definition in a fresh, proved export of ``candidate``: its record (D10.5).
+
+        Only setting the export up is a materialization failure; what the
+        validator's own launch raises is not, so a sandbox refusal at the
+        gate passes through, and a missing candidate is never retried.
+        """
         launch_failures = 0
         materialization_failures = 0
         while True:
+            failure: Exception
             try:
-                with materialize(
-                    runner,
-                    repo,
-                    candidate.commit,
-                    candidate.object_format,
-                    prefix=VALIDATION_EXPORT_PREFIX,
-                ) as tree:
-                    if tree.tree != candidate.tree:
-                        raise MaterializationError(
+                with ExitStack() as export:
+                    try:
+                        tree = export.enter_context(
+                            materialize(
+                                runner,
+                                repo,
+                                candidate.commit,
+                                candidate.object_format,
+                                prefix=VALIDATION_EXPORT_PREFIX,
+                            )
+                        )
+                    except _EXPORT_SETUP_FAILURES as exc:
+                        failure = exc
+                    else:
+                        if tree.tree == candidate.tree:
+                            return self._run_remote_validator(
+                                candidate, definition, policy, str(tree.root)
+                            )
+                        failure = MaterializationError(
                             f"the export of {candidate.commit} holds tree {tree.tree}, not the "
                             f"candidate's tree {candidate.tree}"
                         )
-                    return self._run_remote_validator(candidate, definition, policy, str(tree.root))
-            except CandidateNotMaterializableError:
-                raise
-            except MaterializationError as exc:
-                materialization_failures += 1
-                if materialization_failures >= MAX_VALIDATION_MATERIALIZATIONS:
-                    raise ValidationInconclusiveError(
-                        f"candidate {candidate.describe()} could not be materialized for "
-                        f"validation definition [{definition.index}] after "
-                        f"{materialization_failures} attempts: {exc}"
-                    ) from exc
             except _ValidatorNotLaunched as exc:
                 launch_failures += 1
                 if launch_failures >= MAX_VALIDATION_LAUNCH_ATTEMPTS:
@@ -4565,6 +4597,14 @@ class ControllerEngine:
                         f"validation command {definition.shown!r} could not be launched for "
                         f"{candidate.describe()} ({launch_failures} attempts): {exc}"
                     ) from exc
+                continue
+            materialization_failures += 1
+            if materialization_failures >= MAX_VALIDATION_MATERIALIZATIONS:
+                raise ValidationInconclusiveError(
+                    f"candidate {candidate.describe()} could not be materialized for "
+                    f"validation definition [{definition.index}] after "
+                    f"{materialization_failures} attempts: {_export_setup_failure(failure)}"
+                ) from failure
 
     def _run_remote_validator(
         self,

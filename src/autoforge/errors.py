@@ -203,7 +203,8 @@ class ValidationInconclusiveError(VerificationError):
 
     A launch or setup failure the executor or the sandbox backend reported,
     or #165's preflight refusing the launch, after the bounded in-process
-    re-check; or a materialization failure after one fresh attempt. No
+    re-check; or a materialization failure (an ``OSError`` or a git process
+    the executor could not launch among them) after one fresh attempt. No
     ``ValidationRecord`` is written. The caller enters ``BLOCKED`` with the
     message, which names the command or the candidate and the failing entry.
     """

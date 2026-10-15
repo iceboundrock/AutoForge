@@ -11,19 +11,24 @@ now leaves a record for every command it runs. The pure value checks are in
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 from autoforge import cli
 from autoforge import engine as engine_module
+from autoforge import materialize as materialize_module
 from autoforge.config import default_config
 from autoforge.errors import (
     CandidateNotMaterializableError,
+    ExecutionError,
     SandboxLaunchRefusedError,
     StateError,
     ValidationInconclusiveError,
@@ -157,6 +162,148 @@ def test_a_validator_that_cannot_be_launched_is_inconclusive_with_no_record(tmp_
         eng.validate_remote_candidate(commit, PROVENANCE)
     state = saved(eng)
     assert state.validation_records == [] and state.validation_attempt == {}
+
+
+def unlaunchable_git(monkeypatch, word: str, failures: int | None):
+    """The controller's git process naming ``word`` cannot be launched, ``failures`` times
+    (always when None), as the executor reports it; returns the refused argvs."""
+    real = engine_module.execute
+    refused: list[list[str]] = []
+
+    def runner(req):
+        if word in req.command and (failures is None or len(refused) < failures):
+            refused.append(list(req.command))
+            raise ExecutionError(f"failed to spawn git: [Errno 24] Too many open files ({SECRET})")
+        return real(req)
+
+    monkeypatch.setattr(engine_module, "execute", runner)
+    return refused
+
+
+def unwritable_export(monkeypatch, failures: int | None):
+    """Creating the validation export's directory fails with ENOSPC, ``failures`` times
+    (always when None); returns the refused attempts."""
+    real = tempfile.mkdtemp
+    refused: list[str] = []
+
+    def mkdtemp(*args, prefix=None, **kwargs):
+        if prefix == engine_module.VALIDATION_EXPORT_PREFIX and (
+            failures is None or len(refused) < failures
+        ):
+            refused.append(prefix)
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(*args, prefix=prefix, **kwargs)
+
+    monkeypatch.setattr(materialize_module.tempfile, "mkdtemp", mkdtemp)
+    return refused
+
+
+# Each way setting the export up fails besides a missing candidate (D10.5):
+# the object-format read and the materializer's git plumbing not launched,
+# the export directory not created; what the message names.
+SETUP_FAILURES = {
+    "object-format": (
+        lambda mp, n: unlaunchable_git(mp, "--show-object-format", n),
+        "object format of its store could not be read",
+    ),
+    "listing": (
+        lambda mp, n: unlaunchable_git(mp, "ls-tree", n),
+        "could not be materialized for validation definition",
+    ),
+    "blob-stream": (
+        lambda mp, n: unlaunchable_git(mp, "--batch", n),
+        "could not be materialized for validation definition",
+    ),
+    "export-directory": (
+        unwritable_export,
+        "could not be materialized for validation definition",
+    ),
+}
+
+
+@pytest.mark.parametrize("how", sorted(SETUP_FAILURES))
+def test_a_setup_failure_is_rechecked_once_then_inconclusive_with_no_record(
+    tmp_path, monkeypatch, how
+):
+    """An ``OSError`` or a git process the executor could not launch is a
+    materialization failure: one fresh attempt, then the typed inconclusive
+    error, with nothing launched and nothing written."""
+    ran = tmp_path / "ran"
+    eng, commit = remote_engine(tmp_path, [py(f"open({str(ran)!r}, 'w')")])
+    eng.save()
+    before = eng.paths.state_file.read_bytes()
+    inject, says = SETUP_FAILURES[how]
+    tries = inject(monkeypatch, None)
+    with pytest.raises(ValidationInconclusiveError, match=f"{says}.*2 attempts") as caught:
+        eng.validate_remote_candidate(commit, PROVENANCE)
+    assert len(tries) == 2
+    assert SECRET not in str(caught.value)
+    assert not ran.exists()
+    assert eng.paths.state_file.read_bytes() == before
+    assert eng.state.validation_records == [] and eng.state.validation_attempt == {}
+
+
+@pytest.mark.parametrize("how", sorted(SETUP_FAILURES))
+def test_a_setup_failure_once_is_recovered_by_the_fresh_attempt(tmp_path, monkeypatch, how):
+    eng, commit = remote_engine(tmp_path, [py("pass")])
+    inject, _ = SETUP_FAILURES[how]
+    tries = inject(monkeypatch, 1)
+    run = eng.validate_remote_candidate(commit, PROVENANCE)
+    assert len(tries) == 1
+    assert [r["outcome"] for r in saved(eng).validation_records] == ["PASS"]
+    assert run.passed and run.records[0]["seq"] == 1
+
+
+def counted_exports(monkeypatch) -> list[str]:
+    """The commit of every export the engine starts, in order."""
+    real = engine_module.materialize
+    exports: list[str] = []
+
+    def counted(runner, repo, commit, *args, **kwargs):
+        exports.append(commit)
+        return real(runner, repo, commit, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "materialize", counted)
+    return exports
+
+
+def stdin_git(repo: str, *args: str, data: bytes) -> str:
+    """``git -C repo`` with ``args`` and ``data`` on stdin; its stdout, stripped."""
+    res = subprocess.run(["git", "-C", repo, *args], input=data, capture_output=True, check=True)
+    return res.stdout.decode().strip()
+
+
+def test_a_blob_missing_from_the_store_is_refused_without_a_fresh_export(tmp_path, monkeypatch):
+    """The materializer's own refusal of a candidate (D6.1) is not retried."""
+    ran = tmp_path / "ran"
+    eng, _ = remote_engine(tmp_path, [py(f"open({str(ran)!r}, 'w')")])
+    repo = str(eng.workdir)
+    ghost = stdin_git(repo, "hash-object", "--stdin", data=b"only hashed\n")
+    tree = stdin_git(repo, "mktree", "--missing", data=f"100644 blob {ghost}\tghost.txt\n".encode())
+    commit = git_out("-C", repo, *GIT_IDENT, "commit-tree", "-m", "ghost", tree)
+    exports = counted_exports(monkeypatch)
+    with pytest.raises(CandidateNotMaterializableError, match=f"{ghost} of ghost.txt"):
+        eng.validate_remote_candidate(commit, PROVENANCE)
+    assert exports == [commit]
+    assert not ran.exists()
+    assert eng.state.validation_records == [] and eng.state.validation_attempt == {}
+
+
+def test_a_sandbox_refusal_is_not_a_materialization_failure(tmp_path, monkeypatch):
+    """The refusal comes from the validator's launch, inside the export: it
+    passes through after one export, never a fresh one."""
+    eng, commit = remote_engine(tmp_path, [py("pass")])
+    eng.config.sandbox.mode = "required"
+    exports = counted_exports(monkeypatch)
+
+    def refuse(*_a, **_k):
+        raise SandboxLaunchRefusedError("bwrap is not installed")
+
+    monkeypatch.setattr(eng, "_command_sandbox", refuse)
+    with pytest.raises(SandboxLaunchRefusedError, match="bwrap is not installed"):
+        eng.validate_remote_candidate(commit, PROVENANCE)
+    assert exports == [commit]
+    assert eng.state.validation_records == [] and eng.state.validation_attempt == {}
 
 
 def test_a_timeout_is_a_timeout_record(tmp_path):
