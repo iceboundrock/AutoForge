@@ -272,9 +272,23 @@ it answers "supported" without a launch, counts its calls, and
 `sandbox_probe.unsupported(capability, reason)` makes it answer that the
 host lacks one. The real-backend modules call `real_sandbox_backend()`,
 which skips with the probe's typed reason, or fails under
-`AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1` (`make test-sandbox`;
-[development.md](../development.md#the-outer-sandbox)).
+`AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1` (`make test-sandbox`), and under
+`auto` (`make test-sandbox-measured`, hosted CI's `sandbox` job) fails
+exactly when `tests/sandbox_host.py` measures the host capable
+([development.md](../development.md#the-outer-sandbox)).
 
+- `tests/test_sandbox_host.py` covers that measurement against a fake
+  `bwrap` on `PATH`: an old `bwrap` without `--overlay`, with user
+  namespaces refused and a Landlock ABI below 6, is measured incapable and
+  each lack named; a capable one is measured capable; no `bwrap` is named;
+  the measurement is printed and appended to the CI job summary. It also
+  covers what each value of the variable makes of a probe that says
+  "unsupported": unset skips, `1` fails, `auto` fails on a host measured
+  capable and skips with the measurement otherwise, and any other value
+  fails. `tests/test_ci_workflow.py` pins the `sandbox` job to
+  `make test-sandbox-measured`, that target to the measurement and then
+  every real-backend module under `auto`, and the module list to the one
+  `make test-sandbox` requires.
 - `tests/test_sandbox.py` runs on any host with Python (the fake-backend
   part on any Linux). It covers:
   - the policy compiler on paths under `tmp_path`: every refusal of D4.2,

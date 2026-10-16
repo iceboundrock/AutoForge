@@ -1673,6 +1673,10 @@ def _no_operator_claude_config(monkeypatch, tmp_path_factory):
 # Set to 1 where the real backend must run (a capable development host, a
 # runner known to provide one): a real-backend module that would skip fails
 # instead, so a host that lost its capability cannot pass silently (#169).
+# Set to auto where whether it can is measured (the hosted `sandbox` CI job,
+# `make test-sandbox-measured`): it fails instead of skipping exactly when
+# tests/sandbox_host.py, independently of the backend's probe, measures the
+# host capable. Any other non-empty value is refused, never read as "skip".
 REQUIRE_SANDBOX_BACKEND = "AUTOFORGE_REQUIRE_SANDBOX_BACKEND"
 # What the real-backend tests run their fake commands with, inside.
 SYSTEM_PYTHON = "/usr/bin/python3"
@@ -1684,15 +1688,29 @@ def real_sandbox_backend(tmp_path_factory: pytest.TempPathFactory) -> str:
     For the module- or session-scoped ``backend`` fixture of every test that
     launches real ``bwrap``. The skip reason is the probe's typed result
     (``pytest -rs`` prints it), so a CI log says which capability the runner
-    lacks; with :data:`REQUIRE_SANDBOX_BACKEND` set the test fails instead.
+    lacks; with :data:`REQUIRE_SANDBOX_BACKEND` set to 1 the test fails
+    instead, and set to ``auto`` it fails when the host measures capable
+    (:mod:`tests.sandbox_host`) and skips with the measurement otherwise.
     """
     import os
 
     from autoforge import sandbox_bwrap
+    from tests import sandbox_host
 
     def unavailable(reason: str) -> None:
-        if os.environ.get(REQUIRE_SANDBOX_BACKEND) == "1":
+        require = os.environ.get(REQUIRE_SANDBOX_BACKEND, "")
+        if require == "1":
             pytest.fail(f"{REQUIRE_SANDBOX_BACKEND}=1, but {reason}")
+        if require == "auto":
+            host = sandbox_host.measure()
+            if host.capable:
+                pytest.fail(
+                    f"{REQUIRE_SANDBOX_BACKEND}=auto, and tests/sandbox_host.py measures that "
+                    f"{host.verdict()}, but {reason}"
+                )
+            pytest.skip(f"{reason}; measured: {host.verdict()}")
+        if require:
+            pytest.fail(f"{REQUIRE_SANDBOX_BACKEND}={require!r} is neither 1 nor auto; {reason}")
         pytest.skip(reason)
 
     if not sys.platform.startswith("linux"):

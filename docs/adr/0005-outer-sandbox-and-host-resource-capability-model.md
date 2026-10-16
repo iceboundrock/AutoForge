@@ -1580,7 +1580,7 @@ refuses before the spawn (D12.2).
 | Fedora 44, kernel 7.2.x, SELinux enforcing, bubblewrap 0.12.0, git 2.55.0 / 2.56.0 (planning host and this record's) | yes | supported; every §1.2 measurement |
 | rootless podman, default settings | yes (planning) | user and PID namespaces work, a new procfs is refused (`EPERM`): unsupported unless run with `--security-opt unmask=/proc/* --security-opt label=disable` |
 | an AutoForge sandbox nested in a sandbox that passed `--disable-userns` | yes | the inner `bwrap` fails (`ENOSPC`) |
-| hosted CI, `ubuntu-latest` | no | #169 measures whether unprivileged user namespaces are usable there and how `bwrap` is installed |
+| hosted CI, `ubuntu-latest` | on every CI run | the `sandbox` job installs `bwrap` from the distribution, records its version and `--overlay`, the user-namespace sysctls, an unprivileged namespace launch and the Landlock ABI in its summary (`tests/sandbox_host.py`), and requires the real-backend tests wherever the runner measures capable (docs/development.md, "The outer sandbox") |
 | Ubuntu 23.10 and later with AppArmor's `kernel.apparmor_restrict_unprivileged_userns` | no | #169 verifies and documents |
 | Debian with `kernel.unprivileged_userns_clone=0` | no | #169 verifies and documents |
 | Docker, default seccomp profile | no | #169 verifies and documents |

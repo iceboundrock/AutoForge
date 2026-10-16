@@ -19,6 +19,7 @@ make lock-check   # uv lock --check (what CI's `uv sync --locked` enforces)
 make check        # lock-check + the four CI commands, on the local interpreter
 make check-matrix # pytest on every CI Python (3.11, 3.12), opt-in
 make test-sandbox # the real-backend sandbox tests; fail (not skip) without a backend
+make test-sandbox-measured # what CI's `sandbox` job runs: measure, then require where capable
 ```
 
 Run `make check` before declaring a change complete, and `make check-matrix`
@@ -36,31 +37,74 @@ cannot enforce, skips with the probe's typed reason: which capability is
 missing (`bwrap` itself, an unprivileged user, PID or IPC namespace, a new
 procfs, a bind mount, an overlay mount, Landlock ABI 6). `pytest` is
 configured with `-rs`, so every run, CI's included, prints each skip and
-its reason; a silent pass of zero tests cannot hide one. `make test-sandbox`
-runs those three modules with `AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1`, which
-turns each skip into a failure: the target for a host known to be capable
-(a Linux 6.12+ workstation with `bwrap` and unprivileged user namespaces).
-It is not part of `make check`, and the hosted workflow does not run it:
-whether GitHub's Ubuntu runners can enforce (their AppArmor policy on
-unprivileged user namespaces, their kernel's Landlock ABI) is not something
-this repository controls or has measured, so CI shows the skip reason
-instead of claiming coverage it may not have. The rest of the suite stands
-in for the probe (`tests/conftest.py`'s `sandbox_probe` fixture answers
-"supported" without a launch), so every mode and the pre-launch gate are
-tested on any host.
+its reason; a silent pass of zero tests cannot hide one.
+`AUTOFORGE_REQUIRE_SANDBOX_BACKEND` decides what such a host does instead:
+
+- `1` (`make test-sandbox`): each skip is a failure. The target for a host
+  known to be capable (a Linux 6.12+ workstation with `bwrap` 0.11 or later
+  and unprivileged user namespaces).
+- `auto` (`make test-sandbox-measured`): `tests/sandbox_host.py` first
+  measures the host, independently of the probe, and each skip is a failure
+  exactly when that measurement says the host can enforce. A probe that
+  wrongly answers "unsupported" therefore cannot turn a capable host's
+  coverage into a skip.
+- unset: each test skips with the reason. Any other value fails.
+
+The measurement records what a host provides for the backend:
+
+- the platform, the kernel and the distribution;
+- which `bwrap` is on `PATH`, its version, and whether it has `--overlay`;
+- the user-namespace policy: `kernel.unprivileged_userns_clone`, Ubuntu's
+  AppArmor `kernel.apparmor_restrict_unprivileged_userns` and
+  `user.max_user_namespaces`, and whether an unprivileged `bwrap` gets new
+  user, PID and IPC namespaces and a new procfs;
+- the kernel's Landlock ABI.
+
+It calls the host capable when it is Linux, its `bwrap` can mount an
+overlay, the namespace launch succeeds and the Landlock ABI is at least 6.
+`uv run python -m tests.sandbox_host` prints it on its own.
+
+**Hosted CI measures its runner on every run.** The `sandbox` job of
+`.github/workflows/ci.yml` installs `bubblewrap` from the runner's
+distribution (`apt-get install bubblewrap` on `ubuntu-latest`) and runs
+`make test-sandbox-measured`. That target writes the measurement into the
+job's log and its summary, then runs the three modules under `auto`:
+
+- on a runner that measures capable, the real-backend tests run and must
+  pass;
+- on one that does not, they skip with the probe's reason, and the summary
+  records what the runner lacks, so `make test-sandbox` on a capable host
+  is what covers them.
+
+The repository records no fixed answer for "can GitHub's runner enforce?".
+That answer follows the image GitHub ships: its Ubuntu release, its kernel
+(Landlock ABI 6 needs Linux 6.12), its `bubblewrap` package (`--overlay`
+needs 0.11) and its AppArmor policy on unprivileged user namespaces. Each
+run's summary is the record for that run's runner. A green `sandbox` job
+whose summary says "cannot enforce" proves the measurement, not the
+backend.
+
+Neither sandbox target is part of `make check`, which runs on any
+development host. The rest of the suite stands in for the probe (`tests/conftest.py`'s
+`sandbox_probe` fixture answers "supported" without a launch), so every
+mode and the pre-launch gate are tested on any host.
 
 ## Continuous integration
 
 The same checks run hosted on every pull request and every push to
 `main` (`.github/workflows/ci.yml`), each after a locked install
 (`uv sync --locked`): `pytest` on Python 3.11 and 3.12, and `ruff check` /
-`ruff format --check` / `mypy` once. `make check` runs the same commands
+`ruff format --check` / `mypy` once. A third job, `sandbox`, runs the outer
+sandbox's real backend on the runner (`make test-sandbox-measured`,
+[The outer sandbox](#the-outer-sandbox)). `make check` runs the same commands
 plus the lockfile check, but only on the interpreter the local environment
 resolves (`.python-version`); `make check-matrix` runs `pytest` on each CI
 interpreter in its own isolated environment (`uv run --isolated --locked
 --python <v>`), leaving `.venv` alone. The versions live in the Makefile's
 `CI_PYTHON_VERSIONS`; `tests/test_ci_workflow.py` fails when that list, the
-workflow's matrix, or the mirrored commands drift apart.
+workflow's matrix, or the mirrored commands drift apart, or when the
+`sandbox` job stops running exactly `make test-sandbox-measured` over every
+real-backend module.
 
 The workflow uses no repository or organization secrets, but its jobs are
 not credential-free: GitHub gives every run an automatic `GITHUB_TOKEN`, and

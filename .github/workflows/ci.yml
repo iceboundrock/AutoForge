@@ -77,6 +77,35 @@ jobs:
       - run: uv run ruff format --check src tests
       - run: uv run mypy src
 
+  sandbox:
+    # The outer sandbox's real backend (bubblewrap) on the hosted runner
+    # (#169). Whether the runner can enforce it is measured on every run,
+    # never assumed: `make test-sandbox-measured` first records bwrap's
+    # version and options, the user-namespace policy, an unprivileged
+    # namespace launch and the kernel's Landlock ABI, in the log and the job
+    # summary (tests/sandbox_host.py), then runs every real-backend test
+    # module, which fail instead of skipping whenever that measurement says
+    # the runner can enforce. Where it cannot, they skip with the backend
+    # probe's typed reason, the summary records what the runner lacks, and
+    # `make test-sandbox` is the local target (docs/development.md, "The
+    # outer sandbox"). Like every job here it calls no provider and needs no
+    # credential.
+    name: sandbox (real backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned to a full version on purpose: setup-uv stopped publishing
+      # floating major tags after v7, so `@v10` does not resolve.
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.11"
+          enable-cache: true
+      # The backend as the runner's distribution packages it: which version
+      # that is, and what it can do there, is what the job measures.
+      - run: sudo apt-get update --quiet && sudo apt-get install --yes --quiet --no-install-recommends bubblewrap
+      - run: uv sync --locked --group dev
+      - run: make test-sandbox-measured
+
   ci:
     # One stable check name to mark required in branch protection, so adding
     # or renaming a matrix entry does not silently drop the requirement.
@@ -84,12 +113,12 @@ jobs:
     # a SKIPPED check run as passing, so this job must never skip its way to
     # green.
     name: ci
-    needs: [test, static]
+    needs: [test, static, sandbox]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Require every job to have succeeded
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
         run: |
-          echo "test=${{ needs.test.result }} static=${{ needs.static.result }}"
+          echo "test=${{ needs.test.result }} static=${{ needs.static.result }} sandbox=${{ needs.sandbox.result }}"
           exit 1

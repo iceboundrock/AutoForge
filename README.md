@@ -342,9 +342,10 @@ bounded correction retry for malformed results; `doctor`; redacted
 per-invocation logs; LOCAL mode against a feature Markdown file; the outer
 sandbox on Linux (`sandbox.mode`, off by default), with its capability
 probe, pre-launch gate and `doctor` rows, its boundary tested across every
-provider path on a capable host (`make test-sandbox`). Hosted CI skips the
-real-backend tests with the probe's reason where its runner cannot
-enforce.
+provider path on a capable host (`make test-sandbox`). Hosted CI measures
+its runner on every run (its `bwrap`, user-namespace policy and Landlock
+ABI, in the job summary) and requires the real-backend tests wherever the
+runner can enforce; where it cannot, they skip with the probe's reason.
 
 **Implemented and verified, but exercised only against the in-memory fake:**
 the controller-owned `MERGE` step behind the merge safety gate (off by

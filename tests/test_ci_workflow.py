@@ -10,6 +10,13 @@ they diverge, a green CI run stops meaning "the local checks pass", and the
 controller's MERGE gate — which requires every check on the PR to have
 succeeded — would be verifying something weaker than it looks.
 
+The one hosted job outside `make check` is ``sandbox`` (#169): the outer
+sandbox's real backend on the runner, which measures what the runner provides
+and requires the real-backend tests wherever it can enforce. It runs exactly
+one Makefile target, ``test-sandbox-measured``, and
+``test_the_sandbox_job_measures_the_runner_and_requires_the_backend_where_it_can``
+pins both sides.
+
 These are text guards, not a YAML parser (the project has no YAML dependency
 outside the optional `yaml` extra). They read the workflow with whole-line
 comments removed and address individual blocks, so prose in a comment cannot
@@ -45,6 +52,19 @@ MIRRORED_MAKE_TARGETS = ("test", "lint", "fmt-check", "typecheck")
 LOCKFILE_MAKE_TARGET = "lock-check"
 # The Makefile variable that mirrors the workflow's `python-version:` matrix.
 MATRIX_MAKE_VARIABLE = "CI_PYTHON_VERSIONS"
+# The hosted job that runs the outer sandbox's real backend (#169), what it
+# runs, and the local target that requires the backend outright.
+SANDBOX_JOB = "sandbox"
+SANDBOX_JOB_COMMANDS = [
+    "sudo apt-get update --quiet && sudo apt-get install --yes --quiet "
+    "--no-install-recommends bubblewrap",
+    "uv sync --locked --group dev",
+    "make test-sandbox-measured",
+]
+SANDBOX_MEASURED_TARGET = "test-sandbox-measured"
+SANDBOX_REQUIRED_TARGET = "test-sandbox"
+SANDBOX_MEASUREMENT = "uv run python -m tests.sandbox_host"
+_RUN_LINE = re.compile(r"^\s*(?:-\s*)?run:\s*(.+?)\s*$", flags=re.MULTILINE)
 
 
 def _workflow_text() -> str:
@@ -73,6 +93,10 @@ def _block(text: str, key: str, indent: int = 0) -> str:
                 body.append(nxt)
             return "\n".join(body)
     raise AssertionError(f"the CI workflow declares no {key!r} block at indent {indent}")
+
+
+def _sandbox_job(text: str) -> str:
+    return _block(_block(text, "jobs"), SANDBOX_JOB, indent=2)
 
 
 def _job_names(text: str) -> list[str]:
@@ -205,12 +229,63 @@ def test_make_check_runs_exactly_what_ci_runs():
         (*MIRRORED_MAKE_TARGETS, LOCKFILE_MAKE_TARGET)
     ), "`make check` must run the lockfile check plus the mirrored targets and nothing else"
     mirrored = {command for target in MIRRORED_MAKE_TARGETS for command in rules[target].recipe}
-    for command in re.findall(r"^\s*(?:-\s*)?run:\s*(.+?)\s*$", _code(), flags=re.MULTILINE):
+    # The sandbox job is the one hosted job outside `make check`; its commands
+    # are pinned by test_the_sandbox_job_measures_the_runner_and_requires_...
+    code = _code().replace(_sandbox_job(_code()), "")
+    for command in _RUN_LINE.findall(code):
         if command in ("|", ">"):
             continue  # a block scalar: the aggregate job's `exit 1`, not a check command
         assert command.startswith("uv sync --locked") or command in mirrored, (
             f"CI runs {command!r} but no target of `make check` does"
         )
+
+
+# A fixture that hands its module the real backend: `return real_sandbox_backend(...)`.
+_REAL_BACKEND_FIXTURE = re.compile(r"^\s+return real_sandbox_backend\(", flags=re.MULTILINE)
+
+
+def _real_backend_modules() -> list[str]:
+    """Every test module that launches the real backend: those whose fixture asks for it."""
+    return sorted(
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in (REPO_ROOT / "tests").glob("test_*.py")
+        if _REAL_BACKEND_FIXTURE.search(path.read_text(encoding="utf-8"))
+    )
+
+
+def test_the_sandbox_job_measures_the_runner_and_requires_the_backend_where_it_can():
+    """Hosted CI runs the real backend wherever the runner can enforce (#169, PR #231 R1-F1).
+
+    Whether GitHub's runner can enforce is measured on every run, never
+    assumed. The `sandbox` job installs bubblewrap and runs exactly
+    `make test-sandbox-measured`, which records the measurement first and then
+    runs every real-backend module with AUTOFORGE_REQUIRE_SANDBOX_BACKEND=auto:
+    a runner measured capable fails a test that would skip instead of passing
+    without coverage. The modules are the ones `make test-sandbox` requires
+    outright, and every module that launches the real backend is one of them.
+    """
+    code = _code()
+    assert SANDBOX_JOB in _job_names(code), "the CI workflow has no job for the real backend"
+    job = _sandbox_job(code)
+    assert "runs-on: ubuntu-latest" in job
+    assert _RUN_LINE.findall(job) == SANDBOX_JOB_COMMANDS
+
+    measured = _make_dry_run(SANDBOX_MEASURED_TARGET)
+    (required,) = _make_dry_run(SANDBOX_REQUIRED_TARGET)
+    assert len(measured) == 2 and measured[0] == SANDBOX_MEASUREMENT, (
+        f"`make {SANDBOX_MEASURED_TARGET}` must record the measurement before the tests: {measured}"
+    )
+    auto, required_words = measured[1].split(), required.split()
+    assert auto[0] == "AUTOFORGE_REQUIRE_SANDBOX_BACKEND=auto", measured[1]
+    assert required_words[0] == "AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1", required
+    assert auto[1:] == required_words[1:], (
+        f"`make {SANDBOX_MEASURED_TARGET}` and `make {SANDBOX_REQUIRED_TARGET}` run different tests"
+    )
+    assert auto[1:5] == ["uv", "run", "pytest", "-rs"], measured[1]
+    assert sorted(auto[5:]) == _real_backend_modules(), (
+        "a module that launches the real backend is not run by the sandbox targets"
+    )
+    assert SANDBOX_MEASURED_TARGET not in _make_rules()["check"].prerequisites
 
 
 def test_ci_installs_from_the_lockfile():

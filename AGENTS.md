@@ -278,7 +278,10 @@ locked install, then `pytest`, `ruff check`, `ruff format --check`,
 `mypy src`) in the local environment on one interpreter; CI runs `pytest` on
 every Python in its matrix (`.github/workflows/ci.yml`), which
 `make check-matrix` reproduces locally when a change could be
-interpreter-sensitive. See `Makefile` and `docs/development.md`. Also inspect
+interpreter-sensitive. CI's `sandbox` job also measures its runner and runs
+the outer sandbox's real-backend tests (`make test-sandbox-measured`),
+required wherever the runner can enforce; on a capable host
+`make test-sandbox` requires them outright. See `Makefile` and `docs/development.md`. Also inspect
 `git status --short` and `git diff --stat`. Do not claim tests, lint, type
 checking, GitHub operations, or agent invocations succeeded unless they were
 actually executed and verified.
