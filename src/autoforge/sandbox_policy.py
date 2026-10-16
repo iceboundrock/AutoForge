@@ -890,9 +890,10 @@ def executable_requirements(
     The executable resolved on the host; its install root; and, for a
     script, its interpreter's install root and directory, which goes first
     on ``PATH`` so that ``#!/usr/bin/env node`` finds it inside. An
-    absolute ``#!`` path is also a spelled path, as written: the kernel
-    looks it up so, and a link on its way, such as Homebrew's ``opt/``
-    into ``Cellar/``, need not lie in any root projected (#225).
+    absolute ``#!`` path, ``env``'s too, is also a spelled path, as
+    written, and its resolved program's install root is projected: the
+    kernel looks it up so, and a link on its way, such as Homebrew's
+    ``opt/`` into ``Cellar/``, need not lie in any root projected (#225).
     """
     executable = resolve_command(command, search_path)
     if not executable:
@@ -901,10 +902,13 @@ def executable_requirements(
     path_dirs: list[str] = []
     spelled: list[str] = []
     words = _shebang(executable)
+    program = resolve_command(words[0], search_path) if words and words[0].startswith("/") else ""
+    if program:
+        # What the kernel runs, as written: ``env`` is no exception (R1-F1).
+        roots.append(install_root(program, home))
+        spelled.append(words[0])
     interpreter = _interpreter(words, search_path)
     if interpreter:
         roots.append(install_root(interpreter, home))
         path_dirs.append(posixpath.dirname(interpreter))
-        if words[0].startswith("/") and posixpath.basename(words[0]) != "env":
-            spelled.append(words[0])
     return executable, tuple(dict.fromkeys(roots)), tuple(path_dirs), tuple(spelled)

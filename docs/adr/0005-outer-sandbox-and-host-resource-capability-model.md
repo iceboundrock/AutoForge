@@ -1392,13 +1392,17 @@ launch is refused before the spawn, naming the path (rule
 `D13.1 spelled path`, or C4 and D4.3 for a denied root and a forbidden
 source), when a link would lie in a mask, a denied root, a forbidden source
 or a kernel filesystem, when the path loops, or when it does not lead to
-where its resolved interpreter is shown. `#!/usr/bin/env name` is not a
-spelled path: `env` looks `name` up on `PATH`, whose first entry is the
-interpreter's directory. Tests: `tests/test_sandbox.py` (the links, each
-refusal), `tests/test_sandbox_policy.py` (the declaration and its
-description), `tests/test_doctor_sandbox.py` (the row) and
-`tests/test_sandbox_routing.py` (a fake agent behind one link and behind a
-Homebrew-shaped chain, through the real backend).
+where its resolved program is shown. In `#!/usr/bin/env name` that program
+is `env`, which the kernel looks up as written like any other: its path is
+a spelled path, and its resolved install root is projected as an
+interpreter's is (PR #232 R1-F1: an `env` reached through a link no root
+shows). `name` is not a spelled path: `env` looks it up on `PATH`, whose
+first entry is the interpreter's directory. Tests: `tests/test_sandbox.py`
+(the links, each refusal), `tests/test_sandbox_policy.py` (the declaration
+and its description), `tests/test_doctor_sandbox.py` (the row) and
+`tests/test_sandbox_routing.py` (a fake agent behind one link, behind a
+Homebrew-shaped chain and behind a link to `env`, through the real
+backend).
 
 *Rationale.* Projecting the directory that holds a link would show
 everything beside it: a Homebrew `opt/` directory links to every installed

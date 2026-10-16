@@ -390,7 +390,9 @@ Four more files, the same split by what they need from the host:
   - install roots (the package or the directory, a prefix with its `lib`,
     never the home) and a script's interpreter; an absolute `#!` through
     a link outside every root as a spelled path whose one link is
-    recreated, not its directory, which `PATH` loses too (#225);
+    recreated, not its directory, which `PATH` loses too, an `env` there
+    included, the system's or one in its own prefix, whose root is
+    projected while `env` still finds its name on `PATH` (#225);
   - each adapter's declaration: Claude Code's login, settings and shell
     file, its login and settings at their home paths when they are links
     into a dotfiles directory, its own `CLAUDE_CONFIG_DIR` writable and the
@@ -497,7 +499,9 @@ Four more files, the same split by what they need from the host:
   A fake agent whose absolute `#!` names a link outside every root, one
   link or a Homebrew-shaped `opt/` to `Cellar/` chain, runs inside with
   its interpreter seeing that spelling, and every directory on the way
-  holds only the next link (#225).
+  holds only the next link; so does one whose `#!` names a link there to
+  `env`, the system's or a copy in its own prefix, that finds the
+  interpreter on `PATH` (#225).
   It also covers `doctor`'s sandboxed `--version` run through the same
   backend, with the environment a launch gets (PR #231 R2-F2). A fake
   Claude Code needs its linked `CLAUDE_CONFIG_DIR` to lead to a directory

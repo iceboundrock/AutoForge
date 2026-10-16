@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import threading
@@ -555,6 +556,49 @@ def test_a_script_whose_absolute_shebang_names_a_link_launches(backend, layout, 
     req = _agent_request(paths, "claude", fake, output_format="text")
     report = _report(ClaudeCodeProvider().execute(req))
     assert report == {"executable": str(shebang), "listings": holds, "sibling": "ENOENT"}
+
+
+@pytest.mark.skipif(not os.access("/usr/bin/env", os.X_OK), reason="no /usr/bin/env on this host")
+@pytest.mark.parametrize("where", ["system", "own"])
+def test_a_script_whose_absolute_env_names_a_link_launches(backend, layout, monkeypatch, where):
+    """#225 R1-F1: a fake agent whose ``#!`` names, as written, a link in a
+    directory no root projects to ``env``: the system's ``/usr/bin/env``, or
+    a copy of it in its own prefix. The kernel runs that ``env`` as written,
+    so its link is recreated inside and its root shown, and ``env`` finds
+    the interpreter on ``PATH``: the script runs, and every directory on the
+    way holds only the next step (no file beside the link is visible)."""
+    paths = layout
+    base = paths["base"]
+    if where == "system":
+        target = Path("/usr/bin/env")
+    else:
+        target = base / "coreutils" / "bin" / "env"
+        target.parent.mkdir(parents=True)
+        (base / "coreutils" / "lib").mkdir()
+        shutil.copy2(os.path.realpath("/usr/bin/env"), target)
+    shebang = _linked(base / "alias" / "bin" / "env", target)
+    _sentinel(base / "alias" / "bin" / "pip")
+    _sentinel(base / "alias" / "notes.txt")
+    holds = {str(base / "alias"): ["bin"], str(base / "alias" / "bin"): ["env"]}
+    script = (
+        f"#!{shebang} {Path(PY).name}\n{_PROBE}\n"
+        "report = {'interpreter': os.path.realpath(sys.executable), 'listings': {}}\n"
+        f"for path in {sorted(holds)!r}:\n"
+        "    report['listings'][path] = sorted(os.listdir(path))\n"
+        f"report['sibling'] = attempt(lambda: read({str(shebang.parent / 'pip')!r}))\n"
+        "print(json.dumps(report))\n"
+    )
+    fake = _sentinel(paths["base"] / "tools" / "claude" / "bin" / "claude", script)
+    fake.chmod(0o755)
+    monkeypatch.setenv("HOME", str(paths["home"]))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    req = _agent_request(paths, "claude", fake, output_format="text")
+    report = _report(ClaudeCodeProvider().execute(req))
+    assert report == {
+        "interpreter": os.path.realpath(PY),
+        "listings": holds,
+        "sibling": "ENOENT",
+    }
 
 
 def test_doctor_launches_each_providers_version_as_a_launch_would(backend, tmp_path, monkeypatch):
