@@ -541,7 +541,9 @@ alone knows, as data (D13.1, D13.2):
   `<prefix>/bin/<file>` when it has a `lib` directory, as an interpreter's
   standard library needs, unless that prefix is the home, an ancestor of it
   or `~/.local`; else its directory; never all of the home) and, for a
-  script, its interpreter's root, whose directory goes first on `PATH`;
+  script, its interpreter's root, whose directory goes first on `PATH`,
+  and an absolute `#!` line as written (`spelled_paths`), whose links the
+  compiler recreates inside without projecting what holds them (#225);
   configuration files (read-only) and state directories the adapter made
   for the launch (writable); auth items (`AuthItem`:
   `env`, `file-ro`, `dir-rw` or `keyring`, D7.1); its operator

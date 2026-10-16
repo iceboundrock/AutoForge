@@ -498,6 +498,65 @@ def test_opencode_finds_a_database_through_a_linked_directory(backend, layout, m
     assert (real / "af.db").exists()
 
 
+def _alias_layout(base: Path, chain: bool) -> tuple[Path, dict[str, list[str]]]:
+    """An interpreter path that reaches the real one through links in
+    directories no root projects, with a sentinel beside every link; and,
+    for each directory on the way, what it holds inside: only the next step.
+
+    ``chain``: a Homebrew-shaped ``opt/python -> ../Cellar/python/3.14``,
+    whose ``bin/python3`` links to the system interpreter; else one
+    ``alias/bin/python3`` linking to it.
+    """
+    if not chain:
+        shebang = _linked(base / "alias" / "bin" / "python3", Path(PY))
+        _sentinel(base / "alias" / "bin" / "pip")
+        _sentinel(base / "alias" / "notes.txt")
+        return shebang, {str(base / "alias"): ["bin"], str(base / "alias" / "bin"): ["python3"]}
+    cellar = base / "brew" / "Cellar" / "python" / "3.14"
+    _linked(cellar / "bin" / "python3", Path(PY))
+    _sentinel(cellar / "bin" / "pip")
+    _sentinel(cellar / "LICENSE")
+    _linked(base / "brew" / "opt" / "python", Path("../Cellar/python/3.14"))
+    _sentinel(base / "brew" / "opt" / "openssl" / "lib" / "libssl.so")
+    _sentinel(base / "brew" / "Cellar" / "openssl" / "LICENSE")
+    shebang = base / "brew" / "opt" / "python" / "bin" / "python3"
+    holds = {
+        str(base / "brew"): ["Cellar", "opt"],
+        str(base / "brew" / "opt"): ["python"],
+        str(base / "brew" / "Cellar"): ["python"],
+        str(cellar): ["bin"],
+        str(cellar / "bin"): ["python3"],
+    }
+    return shebang, holds
+
+
+@pytest.mark.parametrize("chain", [False, True], ids=["link", "chain"])
+def test_a_script_whose_absolute_shebang_names_a_link_launches(backend, layout, monkeypatch, chain):
+    """#225: a fake agent whose ``#!`` names, as written, a link to the real
+    interpreter in a directory no root projects. The kernel looks the line
+    up as written, so each link on its way is recreated inside: the script
+    runs, its interpreter sees the spelling it was started by, and every
+    directory on the way holds only that link (nothing beside it, no file
+    of the alias's directory, is visible)."""
+    paths = layout
+    shebang, holds = _alias_layout(paths["base"], chain)
+    script = (
+        f"#!{shebang}\n{_PROBE}\n"
+        "report = {'executable': sys.executable, 'listings': {}}\n"
+        f"for path in {sorted(holds)!r}:\n"
+        "    report['listings'][path] = sorted(os.listdir(path))\n"
+        f"report['sibling'] = attempt(lambda: read({str(shebang.parent / 'pip')!r}))\n"
+        "print(json.dumps(report))\n"
+    )
+    fake = _sentinel(paths["base"] / "tools" / "claude" / "bin" / "claude", script)
+    fake.chmod(0o755)
+    monkeypatch.setenv("HOME", str(paths["home"]))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    req = _agent_request(paths, "claude", fake, output_format="text")
+    report = _report(ClaudeCodeProvider().execute(req))
+    assert report == {"executable": str(shebang), "listings": holds, "sibling": "ENOENT"}
+
+
 def test_doctor_launches_each_providers_version_as_a_launch_would(backend, tmp_path, monkeypatch):
     """The doctor's sandboxed ``--version`` gets a launch's environment (PR #231 R2-F2).
 

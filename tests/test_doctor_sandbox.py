@@ -17,7 +17,7 @@ from autoforge.config import default_config
 from autoforge.doctor import Doctor
 from autoforge.errors import ConfigurationError, SandboxPolicyError
 from autoforge.executor import ExecutionResult, execute
-from autoforge.sandbox import compile_launch
+from autoforge.sandbox import Link, compile_launch
 from autoforge.sandbox_bwrap import Capability, ProbeResult
 from autoforge.sandbox_policy import AuthItem, AuthMode, ProviderRequirements, provider_request
 from tests.conftest import git_repo, make_local_engine
@@ -261,6 +261,27 @@ def test_a_linked_claude_config_dir_is_spelled_where_it_leads_inside(tmp_path, h
     assert env["CLAUDE_CONFIG_DIR"] == str(real)
     assert req.sandbox.inside_path(str(real)) == str(real)
     assert present[req.env["CLAUDE_ENV_FILE"]]
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/sh"), reason="no /bin/sh on this host")
+def test_a_shebang_through_a_link_is_reached_as_written(tmp_path, host):
+    """#225: a CLI whose ``#!`` names a link to the shell in a directory no
+    root projects. The ``--version`` launch is compiled with that link
+    recreated, as every launch of the CLI is, and the row says so."""
+    shell = os.path.realpath("/bin/sh")
+    alias = Path(os.path.realpath(tmp_path)) / "alias" / "bin" / "sh"
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(shell)
+    (host["bin"] / "claude").write_text(f"#!{alias}\necho fake-cli 1.2.3\n")
+    repo = git_repo(tmp_path / "repo")
+    runner = Runner()
+    rows = _rows(_doctor(repo, host, runner=runner).sandbox_checks(local=True))
+    (claude,) = [r for n, r in rows.items() if n.startswith("provider claude")]
+    assert claude.ok, claude.detail
+    assert f"reached as written, through its links: {alias}" in claude.detail
+    req, _ = runner.launch_of("claude")
+    assert Link(str(alias), shell) in req.sandbox.mounts
+    assert req.sandbox.resolve_inside(str(alias)) == shell
 
 
 def test_a_keyring_login_is_refused_and_the_alternatives_named(tmp_path):

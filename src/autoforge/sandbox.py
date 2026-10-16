@@ -40,7 +40,12 @@ into a description, applying ADR 0005's rules before anything is spawned:
   ``$XDG_RUNTIME_DIR``) are refused for every projection, wherever it was
   declared;
 - **D7.2** a keyring item is refused, and so is a writable declared
-  directory on a provider's operator configuration root.
+  directory on a provider's operator configuration root;
+- **D13.1** a spelled path (a script's absolute ``#!`` interpreter, which
+  the kernel looks up as written) leads inside where it leads on the host:
+  each link on its way that nothing shows is recreated as a link, never by
+  projecting the directory that holds it, and never in a mask, a denied
+  root, a forbidden source or a kernel filesystem (#225).
 
 A refusal is a :class:`~autoforge.errors.SandboxPolicyError` naming the path
 and the rule, never a file's contents. The compiler is pure except for
@@ -276,17 +281,7 @@ class LaunchDescription:
         engine's environment rewrite (ADR 0005 D8.2): a path-valued variable
         passes only when what it names is visible.
         """
-        entries = list(self.mounts)
-        for mount in entries:
-            if isinstance(mount, Bind) and _inside(host_path, mount.source):
-                inner = _rebase(host_path, mount.source, mount.target)
-            elif isinstance(mount, Overlay) and _inside(host_path, mount.lower):
-                inner = host_path
-            else:
-                continue
-            if _innermost(entries, inner) is mount:
-                return inner
-        return None
+        return _inside_path(list(self.mounts), host_path)
 
     def resolve_inside(self, path: str) -> str | None:
         """Where the absolute ``path``, as spelled, leads inside: ``realpath`` there.
@@ -330,6 +325,20 @@ class LaunchDescription:
 
 # As many links as one lookup follows before it is a loop (the kernel's 40).
 _MAX_LINKS = 40
+
+
+def _inside_path(entries: list[Mount], host_path: str) -> str | None:
+    """:meth:`LaunchDescription.inside_path` over ``entries``."""
+    for mount in entries:
+        if isinstance(mount, Bind) and _inside(host_path, mount.source):
+            inner = _rebase(host_path, mount.source, mount.target)
+        elif isinstance(mount, Overlay) and _inside(host_path, mount.lower):
+            inner = host_path
+        else:
+            continue
+        if _innermost(entries, inner) is mount:
+            return inner
+    return None
 
 
 def _lookup(entries: list[Mount], path: str) -> tuple[bool, str | None]:
@@ -461,6 +470,10 @@ class SandboxRequest:
     a projection; ``denied_roots`` are the engine's (C4);
     ``operator_config_roots`` are where providers load operator configuration
     from (D7.2); ``keyring_items`` are declared keyring logins, all refused.
+    ``spelled_paths`` are absolute paths the launch names as written, not
+    resolved (a script's ``#!`` interpreter, which the kernel looks up so):
+    each must lead inside to where its host target is shown, the compiler
+    recreating the links on its way (D13.1).
     ``env`` and ``env_unset`` are the caller's overrides of path-valued
     names; ``HOME``, ``XDG_*`` and ``TMPDIR`` are the compiler's.
     """
@@ -473,6 +486,7 @@ class SandboxRequest:
     denied_roots: tuple[str, ...] = ()
     operator_config_roots: tuple[str, ...] = ()
     keyring_items: tuple[str, ...] = ()
+    spelled_paths: tuple[str, ...] = ()
     system_runtime: bool = True
     home_size_bytes: int | None = None
     tmp_size_bytes: int | None = None
@@ -935,6 +949,8 @@ def compile_launch(request: SandboxRequest) -> LaunchDescription:
             covered.append(proj.source)
         else:
             entries.append(entry)
+    for path in request.spelled_paths:
+        entries += _spelled_links(path, entries, rules)
     _check_links(entries)
     _check_hidden(rules, entries)
 
@@ -1129,6 +1145,110 @@ def _place_declared(proj: _Proj, entries: list[Mount], declared: list[_Proj]) ->
     if isinstance(outer, Overlay | Link):
         raise _refuse(proj.source, "C6 overlaps", f"{proj.label} overlaps {outer.target}")
     return Bind(proj.source, proj.target, proj.access, proj.is_dir)
+
+
+_SPELLED = "D13.1 spelled path"
+
+
+def _spelled_links(path: str, entries: list[Mount], rules: _Rules) -> list[Link]:
+    """The links to recreate so that ``path``, as written, leads inside where it leads on the host.
+
+    Each component is looked up as the kernel would look it up inside
+    (:meth:`LaunchDescription.resolve_inside`). One that is absent inside
+    but lies where nothing is shown (the empty root, a private mount) is
+    looked up on the host: a directory there is made on the way to a link
+    below it, and a link is recreated and followed. The directories that
+    hold the links are never projected, so nothing beside a link is visible
+    (D4.1). Refused, naming the path, when a link would lie in a mask, a
+    denied root, a forbidden source or a kernel filesystem, when the path
+    loops, and when it would not reach where its host target is shown.
+    """
+    label = f"the spelled path {path}"
+    if not path.startswith("/") or "\0" in path:
+        raise _refuse(path, "C1 resolved source", f"{label} is not an absolute path")
+    try:
+        real = os.path.realpath(path, strict=True)
+    except OSError as exc:
+        raise _refuse(
+            path, "C1 resolved source", f"{label} cannot be resolved ({exc.strerror})"
+        ) from None
+    added: list[Link] = []
+    pending = list(_parts(path))
+    current = "/"
+    followed = 0
+    while pending:
+        part = pending.pop(0)
+        if part == ".":
+            continue
+        if part == "..":
+            current = posixpath.dirname(current)
+            continue
+        candidate = posixpath.join(current, part)
+        known = [*entries, *added]
+        exists, link = _lookup(known, candidate)
+        if not exists:
+            covering = _innermost(known, candidate)
+            if covering is not None and not isinstance(covering, PrivateTmpfs):
+                raise _refuse(
+                    path, _SPELLED, f"{label} passes through {candidate}, which is not visible"
+                )
+            try:
+                mode = os.lstat(candidate).st_mode
+            except OSError as exc:
+                raise _refuse(
+                    path, _SPELLED, f"{label} passes through {candidate} ({exc.strerror})"
+                ) from None
+            if stat.S_ISDIR(mode):
+                current = candidate  # made inside on the way to a link below it
+                continue
+            if not stat.S_ISLNK(mode):
+                raise _refuse(
+                    path, _SPELLED, f"{label} passes through {candidate}, which is not visible"
+                )
+            _check_link_place(candidate, rules, label)
+            link = os.readlink(candidate)
+            added.append(Link(candidate, link))
+        elif link is None:
+            current = candidate
+            continue
+        followed += 1
+        if followed > _MAX_LINKS:
+            raise _refuse(path, _SPELLED, f"{label} passes through too many links")
+        if link.startswith("/"):
+            current = "/"
+        pending = [p for p in link.split("/") if p] + pending
+    shown = _inside_path([*entries, *added], real)
+    if shown is None or current != shown:
+        raise _refuse(
+            path,
+            _SPELLED,
+            f"{label} resolves to {real}, which "
+            + ("nothing of the launch shows" if shown is None else f"is shown at {shown}")
+            + f", and leads inside to {current}",
+        )
+    return added
+
+
+def _check_link_place(target: str, rules: _Rules, label: str) -> None:
+    """Where a link on a spelled path may be recreated: never in a denied
+    root, a forbidden source or a kernel filesystem."""
+    for root in _KERNEL_ROOTS:
+        if _inside(target, root):
+            raise _refuse(target, _SPELLED, f"{label} passes through a link in {root}")
+    for denied in rules.denied:
+        if _inside(target, denied):
+            raise _refuse(
+                target,
+                "C4 denied roots",
+                f"{label} passes through a link in the denied root {denied}",
+            )
+    for forbidden, name in rules.forbidden:
+        if _inside(target, forbidden):
+            raise _refuse(
+                target,
+                "D4.3 forbidden source",
+                f"{label} passes through a link in {name} ({forbidden})",
+            )
 
 
 def _check_hidden(rules: _Rules, entries: list[Mount]) -> None:

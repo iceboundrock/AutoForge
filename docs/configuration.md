@@ -882,6 +882,10 @@ worktrees and, from a REMOTE agent, your checkout.
   version manager) or in `/opt` is not visible to an agent's tools or to a
   repository command, and `PATH` loses those entries: only the provider
   CLI's install root and, for a script, its interpreter's are projected.
+  A provider CLI that is a script whose absolute `#!` line reaches its
+  interpreter through links (Homebrew's `opt/` into `Cellar/`) is launched
+  as written: each link on the way is recreated inside, and nothing beside
+  it is visible.
   Operator-declared read-only paths are #169's (D15.4) and not available
   yet, so under `required` a validation or pre-merge command must find
   what it runs under `/usr` or in the workspace.

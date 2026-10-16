@@ -10,7 +10,8 @@
   `sandbox_bwrap.py`, the engine's pre-launch gate and `preferred`,
   `sandbox.read_only_paths`, `src/autoforge/doctor_sandbox.py`, the
   per-class policy in the dry-run plan and the parity suite,
-  `tests/test_sandbox_parity.py`). It is implemented by #167 (the launch
+  `tests/test_sandbox_parity.py`). D13.1 is amended by #225 (a script's
+  absolute `#!` line is reached as written). It is implemented by #167 (the launch
   description, the policy compiler and the Linux `bwrap` backend in the
   executor layer), #168
   (provider declarations, engine facts, the routing of every launch, the git
@@ -1375,6 +1376,38 @@ extra writable provider state, and whether the network is needed.
 The launch names the executable by a path that exists inside the sandbox.
 Each declaration is checked against the installed CLI's own documentation
 and `--help` (AGENTS.md "Before changing code").
+
+*Amended by #225 (2026-10-16): a script's `#!` line, as written.* The
+kernel runs a script through the interpreter its `#!` line names, looked up
+as written, not through the resolved interpreter whose install root the
+declaration projects. An absolute `#!` path is therefore also a *spelled
+path* of the declaration (`ProviderRequirements.spelled_paths`). The
+compiler looks it up component by component as the kernel would inside.
+Each symbolic link on its way that nothing of the description shows is
+recreated as a link at its host path, where nothing is mounted (the empty
+root, the private home or temp), as the links on the way to the home
+(D8.1) and the system runtime's top-level links are. The directories that
+hold those links are made on the way, empty, and never projected. The
+launch is refused before the spawn, naming the path (rule
+`D13.1 spelled path`, or C4 and D4.3 for a denied root and a forbidden
+source), when a link would lie in a mask, a denied root, a forbidden source
+or a kernel filesystem, when the path loops, or when it does not lead to
+where its resolved interpreter is shown. `#!/usr/bin/env name` is not a
+spelled path: `env` looks `name` up on `PATH`, whose first entry is the
+interpreter's directory. Tests: `tests/test_sandbox.py` (the links, each
+refusal), `tests/test_sandbox_policy.py` (the declaration and its
+description), `tests/test_doctor_sandbox.py` (the row) and
+`tests/test_sandbox_routing.py` (a fake agent behind one link and behind a
+Homebrew-shaped chain, through the real backend).
+
+*Rationale.* Projecting the directory that holds a link would show
+everything beside it: a Homebrew `opt/` directory links to every installed
+package. Launching through the resolved interpreter instead would change
+what the interpreter sees as its own path (`argv[0]`, from which Python
+finds a virtual environment's `pyvenv.cfg`), and would re-implement the
+kernel's `#!` argument rules in the controller. A recreated link shows only
+its own contents, a path the operator's layout already names, and the
+lookup inside stays the kernel's.
 
 **D13.2 (#168).** **The engine supplies controller facts as data,** with no
 provider branch: the launch class, the workspace, the worktree's admin dir,

@@ -295,7 +295,12 @@ exactly when `tests/sandbox_host.py` measures the host capable
     D4.3 and D7.2 names the path and the rule, never quotes a file, and
     happens with process creation disabled; what compiles is ordered
     parents first; C4 masks a denied root that is a direct child of a
-    writable projection; C6 records a covered read-only declaration;
+    writable projection; C6 records a covered read-only declaration; a
+    spelled path (#225) gets each link on its way recreated in the empty
+    root, the private temp or the private home, relative contents and
+    all, and nothing beside it, needs none when a projection shows its
+    links, and is refused through a link in a mask, a denied root,
+    `~/.ssh` or `/proc`, or to an interpreter nothing shows;
   - the backend's options: the namespaces and `--die-with-parent` always,
     `--unshare-net` only on request, never `--disable-userns`,
     `--new-session` or `--as-pid-1`; masks remounted read-only after their
@@ -383,7 +388,9 @@ Four more files, the same split by what they need from the host:
     writable directory on an operator root, a keyring login, a declared
     path inside a denied root; an auth directory named by its variable;
   - install roots (the package or the directory, a prefix with its `lib`,
-    never the home) and a script's interpreter;
+    never the home) and a script's interpreter; an absolute `#!` through
+    a link outside every root as a spelled path whose one link is
+    recreated, not its directory, which `PATH` loses too (#225);
   - each adapter's declaration: Claude Code's login, settings and shell
     file, its login and settings at their home paths when they are links
     into a dotfiles directory, its own `CLAUDE_CONFIG_DIR` writable and the
@@ -460,7 +467,9 @@ Four more files, the same split by what they need from the host:
   `OPENCODE_CONFIG_DIR` is replaced by the launch's own directory, which
   exists while the probe runs. A `CLAUDE_CONFIG_DIR` link in the home is
   spelled as the directory it leads to. A token across the version line's
-  clip leaves no fragment in the text or JSON output (R2-F3).
+  clip leaves no fragment in the text or JSON output (R2-F3). A CLI whose
+  `#!` names a link outside every root is compiled with that link
+  recreated, and its row names the spelled path (#225).
 - `tests/test_sandbox_routing.py` runs real `bwrap` and skips its whole
   module with the probe's reason when this host cannot enforce, as
   `test_sandbox_bwrap.py` does (also off Linux and without
@@ -485,6 +494,10 @@ Four more files, the same split by what they need from the host:
   to it, a fake Claude Code reading and writing through a linked
   `CLAUDE_CONFIG_DIR` and reading linked default login and settings files,
   and a fake OpenCode creating its database through a linked directory.
+  A fake agent whose absolute `#!` names a link outside every root, one
+  link or a Homebrew-shaped `opt/` to `Cellar/` chain, runs inside with
+  its interpreter seeing that spelling, and every directory on the way
+  holds only the next link (#225).
   It also covers `doctor`'s sandboxed `--version` run through the same
   backend, with the environment a launch gets (PR #231 R2-F2). A fake
   Claude Code needs its linked `CLAUDE_CONFIG_DIR` to lead to a directory

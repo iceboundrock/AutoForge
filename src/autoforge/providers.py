@@ -578,17 +578,19 @@ class AgentProvider:
         controller's overrides and :meth:`integration_isolation`'s) and
         ``home`` the operator's home. The base declaration is the executable,
         resolved on the launch's ``PATH`` as the spawn would resolve it, its
-        install root and its interpreter's, and :attr:`path_names`; an
+        install root and its interpreter's, an absolute ``#!`` path as
+        written (a spelled path, #225), and :attr:`path_names`; an
         adapter adds its configuration, credential and state items. Names
         and paths only: no file is read but an executable's first line.
         """
-        executable, roots, path_dirs = executable_requirements(
+        executable, roots, path_dirs, spelled = executable_requirements(
             command[0], home=home, search_path=env.get("PATH")
         )
         return ProviderRequirements(
             executable=executable,
             install_roots=roots,
             path_dirs=path_dirs,
+            spelled_paths=spelled,
             path_names=self.path_names,
         )
 
