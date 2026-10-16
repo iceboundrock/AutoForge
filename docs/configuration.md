@@ -709,11 +709,16 @@ validation:
   of each stream ([State and recovery](agent-guides/state-and-recovery.md#validation-evidence)).
   A command that cannot be launched, or an export that cannot be written,
   is retried once and is then inconclusive, with no record.
-- **Not wired yet.** No REMOTE phase runs `validation.commands` yet: the
-  phase gates that reuse a record, and stop a run on a `FAIL`, are #173's.
-  `doctor` and the dry-run plan list the definitions and the policy and
-  run none of them. `merge.verification_commands` is unchanged and
-  separate.
+- **Where it gates** (#173). `ANALYZE_EXECUTE`, `FIX` and
+  `REPLAN_REEXECUTE` validate the exact commit the agent hands back before
+  anything is pushed or published, and `REVIEW` requires evidence for the
+  PR head before the reviewer launches and shows it to the reviewer
+  ([Workflow](agent-guides/workflow.md#candidate-validation-gates)). A
+  record is reused for the same commit, definition and policy, so a
+  commit is validated once; changing a command, the timeout or the sandbox
+  mode validates it again. `doctor` and the dry-run plan list the
+  definitions and the policy and run none of them.
+  `merge.verification_commands` is unchanged and separate.
 - **Bounds.** At most 16 commands; each at most 32 non-blank argv elements,
   each at most 1,024 characters and 4,096 in all. A configuration beyond
   them is a load error naming the command's index and the bound, never

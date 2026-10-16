@@ -36,6 +36,8 @@ already fetched the reviewed HEAD `{{REVIEWED_HEAD_SHA}}` and the merge base
 comment carrying this round's marker that the controller did not post stops
 the run: it is never adopted.
 
+{{VALIDATION_EVIDENCE}}
+
 ## Steps
 
 1. Read the repository's `AGENTS.md` / `CLAUDE.md` if present.
@@ -58,10 +60,11 @@ the run: it is never adopted.
    rewritten under its name meanwhile, the round is stale. Either way the
    controller will schedule another round.
 5. Inspect CI / checks (`checks.md` of the read context: the checks of the
-   PR's head commit when the controller read them). If checks are missing or
-   inconclusive and tests are cheap to run, check out the reviewed HEAD in
-   this worktree (`git checkout --detach {{REVIEWED_HEAD_SHA}}`) and run the
-   relevant test suite yourself.
+   PR's head commit when the controller read them) and the controller's own
+   validation of this commit, above. If checks are missing or inconclusive
+   and tests are cheap to run, check out the reviewed HEAD in this worktree
+   (`git checkout --detach {{REVIEWED_HEAD_SHA}}`) and run the relevant test
+   suite yourself.
 6. Review for: correctness and bugs; whether the implementation satisfies the
    issue specification and acceptance criteria; test coverage; adherence to
    repository standards (`AGENTS.md`/`CLAUDE.md`, style, structure);
@@ -272,7 +275,8 @@ longer is rejected, and you are asked for a shorter one.
   round or HEAD is rejected and you are asked again; they never retarget the
   review.
 - `"needs_fix_round"` must be `true` if and only if `findings` is non-empty.
-  The controller rejects results where the two disagree.
+  The controller rejects results where the two disagree, and refuses
+  `false` while any validation command above did not pass.
 - `"findings"` is an empty list when the PR is clean.
 - Bounds: at most {{MAX_FINDINGS_PER_REVIEW}} findings per round;
   `required_resolution` at most {{MAX_FINDING_RESOLUTION_CHARS}} characters,

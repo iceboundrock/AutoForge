@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 
 import pytest
@@ -2304,6 +2305,81 @@ def test_failed_or_inconsistent_result_is_rejected_before_any_effect(
     assert [c.phase for c in eng.provider.calls].count("REPLAN_REEXECUTE") == 1
     _assert_nothing_published(eng, gh)
     _assert_source_untouched(eng, gh)
+
+
+def _failing_validation(eng) -> None:
+    eng.config.validation.commands = [[sys.executable, "-c", "import sys; sys.exit(4)"]]
+
+
+def test_a_replacement_that_fails_validation_is_rejected_before_any_effect(tmp_state_dir):
+    """ADR 0006 D5.3 (#173): the replacement's exact commit is validated
+    before anything is planned, pushed or created. A FAIL takes the path a
+    ``tests_passed=false`` result takes, with no failure counter and no
+    relaunch."""
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    _failing_validation(eng)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    # The source PR's head, validated at the round-20 review entry, then the replacement.
+    source, replacement = s.validation_records
+    assert source["candidate"]["commit"] == eng.source
+    assert replacement["outcome"] == "FAIL"
+    assert replacement["candidate"]["provenance"]["base_revision"] == eng.merge_base
+    assert "validation of the replacement did not pass" in s.block_reason
+    assert f"validation record #{replacement['seq']}" in s.block_reason
+    assert ReplanTransaction.from_dict(s.replan_transaction).stage is ReplanStage.REJECTED
+    assert s.producer_validation_failure == {}
+    assert [c.phase for c in eng.provider.calls].count("REPLAN_REEXECUTE") == 1
+    _assert_nothing_published(eng, gh)
+    _assert_source_untouched(eng, gh)
+
+
+def test_a_replacement_the_check_already_rejected_is_not_validated(tmp_state_dir):
+    """D5.3: ``tests_passed=false`` is rejected by the result's check, so the
+    replacement is never validated: no record names it."""
+    gh = FakeGitHub()
+    failed = {"verification": {"tests_run": ["pytest"], "tests_passed": False}}
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh, payload_over=failed))
+    eng.config.validation.commands = [[sys.executable, "-c", "pass"]]
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    assert eng.step().next_phase == "BLOCKED"
+    assert "tests_passed=false" in eng.state.block_reason
+    s = load_state(eng.paths.state_file)
+    # Only the source PR's head, validated at the review entry that decided the replan.
+    (source,) = s.validation_records
+    assert source["candidate"]["commit"] == eng.source
+    _assert_nothing_published(eng, gh)
+
+
+def test_a_crash_after_a_failed_replacement_validation_replays_the_rejection(tmp_state_dir):
+    """The rejection is in the save that appends the failing record (D5.3):
+    a crash before the BLOCKED write rejects again on resume, launching
+    nothing and publishing nothing."""
+    gh = FakeGitHub()
+    eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
+    _failing_validation(eng)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    eng._reject_replan = crash
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REPLAN_REEXECUTE
+    assert ReplanTransaction.from_dict(s.replan_transaction).stage is ReplanStage.REJECTED
+    assert s.validation_records[-1]["outcome"] == "FAIL"
+
+    eng2 = _restart(eng, gh, save=False)
+    eng2.config.validation.commands = eng.config.validation.commands
+    assert eng2.step().next_phase == "BLOCKED"
+    assert "validation of the replacement did not pass" in eng2.state.block_reason
+    assert len(load_state(eng2.paths.state_file).validation_records) == 2
+    _assert_nothing_published(eng2, gh)
 
 
 # =============================================================================

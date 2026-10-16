@@ -821,7 +821,31 @@ LOCAL run is not checked this way: its
 are run by the controller against one exact commit, each in a fresh export
 of its tree, and each run leaves a record in the state file
 ([State and recovery](agent-guides/state-and-recovery.md#validation-evidence)).
-No REMOTE phase runs them yet: the phase gates are #173's. Until then:
+They gate every REMOTE candidate (#173; [Workflow](agent-guides/workflow.md#candidate-validation-gates)):
+
+- `ANALYZE_EXECUTE` and `FIX` validate the exact commit the agent hands
+  back before anything is pushed or published. A failure publishes nothing:
+  the step reports it (`... did not pass ... This is failure 1 of 3`), and
+  the next step (of the same `run` or `resume`) launches the agent again
+  with the failure in its prompt. The third failure of the phase enters `BLOCKED`, naming the
+  commit, the definition index and the record. A `REPLAN_REEXECUTE`
+  replacement that fails is rejected, as a replacement whose own tests
+  failed is.
+- `REVIEW` requires evidence for the PR head before the reviewer launches,
+  reusing the producer's records or validating a head someone else pushed,
+  and shows the reviewer the outcomes. A reviewer cannot return a clean
+  result over a failing record: it is asked to correct it, and at the
+  correction bound the step fails with nothing posted.
+- A record is reused, never run again, for the same commit, definition and
+  policy: a `PASS`, and a `FAIL` or `TIMEOUT` too. When the failure was the
+  environment's rather than the change's (a missing tool, a full disk),
+  repair it and run `autoforge unblock`: an applied unblock sets the
+  validation override watermark (`validation_override_seq`, shown in its
+  message, its run-log record, the dry-run plan and `status`) to the
+  newest record, so every failure recorded so far is historical and the
+  next gate runs the same commit again. Nothing else sets it.
+
+What you can inspect:
 
 - `autoforge doctor` lists the definitions, redacted, and the sandbox mode
   their records are made under (`candidate validation (validation.commands)`,
@@ -830,9 +854,11 @@ No REMOTE phase runs them yet: the phase gates are #173's. Until then:
   and says that under `sandbox.mode: disabled` every validator runs
   unsandboxed as your UID; it runs none of them;
 - `autoforge status` shows a `Validation evidence:` block: the policy line,
-  a pending attempt marker if a crash left one, and the records of the
-  current candidate (`#<seq> [<index>] '<argv>': <outcome> (...)`, with the
-  output tail of a `FAIL` or `TIMEOUT`). A pending marker is reported,
+  a pending attempt marker if a crash left one, the override watermark, the
+  current phase's validation failure count, the round the REVIEW binding is
+  for, and the records of the current candidate
+  (`#<seq> [<index>] '<argv>': <outcome> (...)`, with the output tail of a
+  `FAIL` or `TIMEOUT`). A pending marker is reported,
   never converted: the next `step` or `resume` records it `INTERRUPTED`
   and runs the definition again, and the third interruption of one
   definition blocks the run.

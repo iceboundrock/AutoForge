@@ -33,6 +33,12 @@ before it is sent, in this order:
 4. last, it pushes the exact commit you report to the PR branch, as a
    fast-forward checked against `{{REVIEWED_HEAD_SHA}}`.
 
+Before the first of these writes, the controller runs its configured
+validation commands (`validation.commands`, when any are configured)
+against the exact commit you report, each in a fresh export of its tree. If
+one does not pass, nothing is written and this phase is launched again,
+with the failure described in its prompt.
+
 So do not push, fetch or pull, and do not create, edit, close or comment on
 any pull request or issue, nor run any other command that changes GitHub or
 contacts the git remote. The controller already fetched the reviewed HEAD
@@ -92,6 +98,8 @@ Acceptance actions of this round the operator declined:
 {{DECLINED_ACCEPTANCE_ACTIONS}}
 
 {{WORKTREE_STATE}}
+
+{{VALIDATION_FAILURE}}
 
 ## Steps
 

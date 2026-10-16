@@ -29,6 +29,12 @@ one before it is sent:
    when an open PR without the marker already sits on `{{BRANCH}}`, it
    appends those two lines to that PR's body instead.
 
+Before the first of these writes, the controller runs its configured
+validation commands (`validation.commands`, when any are configured)
+against the exact commit you report, each in a fresh export of its tree. If
+one does not pass, nothing is written and this phase is launched again,
+with the failure described in its prompt.
+
 So do not push, fetch or pull, and do not create, edit or comment on any
 pull request or issue, nor run any other command that changes GitHub or
 contacts the git remote. The controller already fetched what you need into
@@ -37,6 +43,8 @@ issue that the controller did not journal stops the run: it is never adopted
 silently.
 
 {{WORKTREE_STATE}}
+
+{{VALIDATION_FAILURE}}
 
 ## Steps
 

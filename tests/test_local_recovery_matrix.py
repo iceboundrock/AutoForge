@@ -501,12 +501,14 @@ def test_validation_command_output_is_part_of_the_verified_tree(tmp_path):
     tree after the agent's snapshot. That is the controller's verification
     at work, not an unverified edit, so the fingerprint handed to REVIEW is
     taken after they ran -- and the reviewer must report exactly that value,
-    not the pre-validation one.
+    not the pre-validation one. A command that changed it is run once more
+    from the tree it left, and must leave that tree as it is (ADR 0006
+    D7.2): an idempotent generator converges.
     """
     root = local_repo(tmp_path)
     cfg = default_config()
     cache = root / ".build-cache"
-    cfg.local.validation_commands = [["sh", "-c", f"echo built >> {cache}"]]
+    cfg.local.validation_commands = [["sh", "-c", f"echo built > {cache}"]]
     eng = make_local_engine(root, FEATURE, cfg=cfg)
     eng.step()
     eng.provider._handler = lambda req: (touch_impl(root, "v1\n"), impl_result())[1]
@@ -522,11 +524,11 @@ def test_validation_command_output_is_part_of_the_verified_tree(tmp_path):
     eng2.provider._handler = lambda req: review_result(eng2.state.workspace_fingerprint)
     assert eng2.step().next_phase == "DONE"
 
-    # FIX binds the same way: the cache grows again during its validation.
+    # FIX binds the same way: its validation writes the cache again.
     root2 = local_repo(tmp_path / "second")
     cache2 = root2 / ".build-cache"
     cfg2 = default_config()
-    cfg2.local.validation_commands = [["sh", "-c", f"echo built >> {cache2}"]]
+    cfg2.local.validation_commands = [["sh", "-c", f"echo built > {cache2}"]]
     eng3 = make_local_engine(root2, FEATURE, cfg=cfg2)
     eng3.step()
     eng3.provider._handler = lambda req: (touch_impl(root2, "v1\n"), impl_result())[1]
@@ -537,7 +539,7 @@ def test_validation_command_output_is_part_of_the_verified_tree(tmp_path):
     assert eng3.step().next_phase == "FIX"
     eng3.provider._handler = lambda req: (touch_impl(root2, "v2\n"), fix_result(["R1-F1"]))[1]
     assert eng3.step().next_phase == "REVIEW"
-    assert cache2.read_text(encoding="utf-8") == "built\nbuilt\n"
+    assert cache2.read_text(encoding="utf-8") == "built\n"
     assert eng3.state.workspace_fingerprint == fingerprint(root2)
     eng3.provider._handler = lambda req: review_result(eng3.state.workspace_fingerprint, round=2)
     assert eng3.step().next_phase == "DONE"

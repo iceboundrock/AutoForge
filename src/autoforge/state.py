@@ -618,8 +618,8 @@ class AutoForgeState:
     # Every field below is strictly parsed, bounded (D10.3), digest-checked
     # and checked for referential integrity on load
     # (:func:`autoforge.evidence.check_evidence`), and cleared when the run
-    # moves to the next issue. #173 and #174 decide when the binding, the
-    # certificate, the counter and the watermark are written.
+    # moves to the next issue. #173 writes the binding, the counter and the
+    # watermark; #174 the certificate.
     #
     # What the controller observed running one trusted definition against
     # one exact candidate under one policy, oldest first, at most 64; the
@@ -635,10 +635,12 @@ class AutoForgeState:
     review_evidence: dict = field(default_factory=dict)
     # The controller's review certificate (D12.1; #174 issues it).
     review_certificate: dict = field(default_factory=dict)
-    # A REMOTE producer's validation failures of one candidate (D5.2; #173).
+    # A REMOTE producer's validation failures in its current phase entry
+    # (D5.2; #173): cleared by every save in another phase.
     producer_validation_failure: dict = field(default_factory=dict)
-    # The operator's override watermark (D14.2; #175 writes it): None until
-    # an unblock sets it, 0 for an unblock that found no record.
+    # The operator's override watermark (D14.2; #173 writes it): None until
+    # an explicit REMOTE unblock sets it, 0 for an unblock that found no
+    # record; automatic recovery never does.
     validation_override_seq: int | None = None
 
     created_at: str = ""
@@ -1189,6 +1191,17 @@ class AutoForgeState:
             self.drop_phase_effects()
         elif self.attempt == 0:
             self.launch_label = LABEL_NONE
+
+    def settle_validation_failure(self) -> None:
+        """ADR 0006 D5.2 at every save: a producer's failure counter is its phase's.
+
+        Counted per phase entry, so the write that changes the phase (to
+        the next phase, or to ``BLOCKED``) clears it, and the next entry of
+        the phase counts from nothing.
+        """
+        counter = self.producer_validation_failure
+        if isinstance(counter, dict) and counter and counter.get("phase") != self.phase.value:
+            self.producer_validation_failure = {}
 
     def touch(self) -> None:
         self.updated_at = utcnow_iso()

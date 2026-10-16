@@ -1034,3 +1034,189 @@ def test_the_validation_fields_stay_well_inside_the_state_file_bound():
     # Every record, the marker, both bindings and the counter, beside the
     # largest effect state, with the JSON escaping of the whole file.
     assert 6 * (total + 3 * one) + 6 * MAX_EFFECT_STATE_CHARS < MAX_STATE_FILE_BYTES
+
+
+# -- eligibility, reuse and the binding (D5.5, D7.2, D10.6; #173) ----------------------
+
+
+def _views(*records: dict):
+    return [parse_record(r) for r in records]
+
+
+def test_a_pass_is_evidence_and_stays_so_across_the_override():
+    (view,) = _views(record(1))
+    assert ev.eligible(view, remote(), DEF0, policy(), None)
+    assert ev.eligible(view, remote(), DEF0, policy(), 1)
+
+
+def test_a_failure_is_terminal_until_the_override_makes_it_historical():
+    (fail,) = _views(record(3, exit_code=1))
+    (timeout,) = _views(record(4, res=result(-9, timed_out=True)))
+    for view in (fail, timeout):
+        assert ev.eligible(view, remote(), DEF0, policy(), None)
+        assert ev.eligible(view, remote(), DEF0, policy(), view.seq - 1)
+        assert not ev.eligible(view, remote(), DEF0, policy(), view.seq)
+
+
+def test_eligibility_is_applicability_first_and_never_provenance():
+    (view,) = _views(record(1))
+    assert not ev.eligible(view, remote(commit="e" * 40), DEF0, policy(), None)
+    assert not ev.eligible(view, remote(), DEF1, policy(), None)
+    assert not ev.eligible(view, remote(), DEF0, policy(timeout_seconds=601), None)
+    assert ev.eligible(view, remote(provenance=PrHeadProvenance(PR)), DEF0, policy(), None)
+    interrupted = parse_record(interrupted_record(seq=2, marker=marker(), recovered_at=FINISHED))
+    assert not ev.eligible(interrupted, remote(), DEF0, policy(), None)
+
+
+def test_a_local_pass_is_evidence_only_for_a_tree_it_ended_on():
+    """D7.2: a passing command that moved the tree passed on a tree that is gone."""
+    stayed = record(1, candidate=local())
+    moved = observed_record(
+        seq=2,
+        candidate=local(),
+        definition=DEF0,
+        policy=policy(),
+        result=result(),
+        run_log=RUN_LOG,
+        end_fingerprint="e" * 64,
+    )
+    moved_fail = observed_record(
+        seq=3,
+        candidate=local(),
+        definition=DEF0,
+        policy=policy(),
+        result=result(1),
+        run_log=RUN_LOG,
+        end_fingerprint="e" * 64,
+    )
+    a, b, c = _views(stayed, moved, moved_fail)
+    assert ev.eligible(a, local(), DEF0, policy(), None)
+    assert not ev.eligible(b, local(), DEF0, policy(), None)
+    # A failure is final for the tree it started on, wherever it ended.
+    assert ev.eligible(c, local(), DEF0, policy(), None)
+
+
+def test_the_newest_eligible_record_is_the_one_reused():
+    records = _views(record(1, exit_code=1), record(2), record(3, candidate=remote("e" * 40)))
+    assert ev.eligible_record(records, remote(), DEF0, policy(), None).seq == 2
+    assert ev.eligible_record(records, remote(), DEF1, policy(), None) is None
+
+
+def test_evidence_is_complete_failed_or_undecided():
+    defs = (DEF0, DEF1)
+    passed = _views(record(1), record(2, definition=DEF1))
+    complete = ev.find_evidence(passed, remote(), defs, policy(), None)
+    assert complete.complete and complete.decided and complete.failed is None
+    assert [r.seq for r in complete.records] == [1, 2]
+    assert complete.validation_set_digest == validation_set_digest(defs)
+
+    # The set stops at its first non-PASS, as a run of it does.
+    failing = _views(record(1, exit_code=1), record(2, definition=DEF1))
+    failed = ev.find_evidence(failing, remote(), defs, policy(), None)
+    assert not failed.complete and failed.decided and failed.failed.seq == 1
+    assert [r.seq for r in failed.records] == [1]
+
+    # Overridden, the failure no longer decides anything: DEF0 must run.
+    undecided = ev.find_evidence(failing, remote(), defs, policy(), 1)
+    assert not undecided.decided and undecided.records == ()
+
+    partial = ev.find_evidence(passed[:1], remote(), defs, policy(), None)
+    assert not partial.decided and [r.seq for r in partial.records] == [1]
+
+    empty = ev.find_evidence(passed, remote(), (), policy(), None)
+    assert empty.complete and empty.records == ()
+
+
+def _bound(records, round_=2, defs=(DEF0, DEF1), watermark=None):
+    found = ev.find_evidence(records, remote(), defs, policy(), watermark)
+    return ev.binding(round_, found), found
+
+
+def test_a_binding_names_decided_evidence_only():
+    views = _views(record(1), record(2, definition=DEF1))
+    raw, found = _bound(views)
+    assert raw == {
+        "review_round": 2,
+        "candidate": remote().to_dict(),
+        "records": [{"seq": r.seq, "digest": r.digest} for r in found.records],
+        "validation_set_digest": validation_set_digest((DEF0, DEF1)),
+        "policy_digest": policy().digest,
+    }
+    assert ev.bound_records(raw, views) == list(found.records)
+    with pytest.raises(ValueError, match="complete or failed"):
+        _bound(views[:1])
+
+
+def test_a_binding_is_reused_only_for_its_round_candidate_set_and_policy():
+    views = _views(record(1), record(2, definition=DEF1))
+    raw, _ = _bound(views)
+    same = {
+        "review_round": 2,
+        "candidate": remote(provenance=PrHeadProvenance(PR)),
+        "validation_set_digest": validation_set_digest((DEF0, DEF1)),
+        "policy_digest": policy().digest,
+        "watermark": None,
+    }
+    assert ev.binding_reusable(raw, views, **same)
+    assert not ev.binding_reusable({}, views, **same)
+    for change in (
+        {"review_round": 3},
+        {"candidate": remote(commit="e" * 40)},
+        {"validation_set_digest": validation_set_digest((DEF0,))},
+        {"policy_digest": policy(timeout_seconds=601).digest},
+    ):
+        assert not ev.binding_reusable(raw, views, **(same | change))
+    # A PASS survives the operator's override.
+    assert ev.binding_reusable(raw, views, **(same | {"watermark": 2}))
+
+
+def test_a_binding_naming_an_overridden_failure_is_not_reused():
+    views = _views(record(1, exit_code=1))
+    raw, _ = _bound(views)
+    same = {
+        "review_round": 2,
+        "candidate": remote(),
+        "validation_set_digest": validation_set_digest((DEF0, DEF1)),
+        "policy_digest": policy().digest,
+    }
+    assert ev.binding_reusable(raw, views, watermark=None, **same)
+    assert not ev.binding_reusable(raw, views, watermark=1, **same)
+
+
+def test_a_binding_naming_a_record_not_retained_under_its_digest_is_refused():
+    views = _views(record(1), record(2, definition=DEF1))
+    raw, _ = _bound(views)
+    with pytest.raises(StateError, match="seq 2"):
+        ev.bound_records(raw, views[:1])
+    raw["records"][0]["digest"] = "0" * 64
+    with pytest.raises(StateError, match="seq 1"):
+        ev.bound_records(raw, views)
+
+
+def test_the_failure_counter_counts_one_phase_entry_up_to_the_bound():
+    first, second = _views(
+        record(1, exit_code=1), record(2, exit_code=1, candidate=remote("e" * 40))
+    )
+    counter = ev.failure_counter("ANALYZE_EXECUTE", {}, first)
+    assert counter == {
+        "phase": "ANALYZE_EXECUTE",
+        "count": 1,
+        "candidate_commit": COMMIT,
+        "last_record_seq": 1,
+    }
+    # Whichever candidate failed: the count goes on within the phase.
+    counter = ev.failure_counter("ANALYZE_EXECUTE", counter, second)
+    assert (counter["count"], counter["candidate_commit"]) == (2, "e" * 40)
+    # Another phase's counter is not this one's.
+    assert ev.failure_counter("FIX", counter, first)["count"] == 1
+    for _ in range(5):
+        counter = ev.failure_counter("ANALYZE_EXECUTE", counter, first)
+    assert counter["count"] == ev.MAX_FAILURE_COUNT
+
+
+def test_the_failure_counter_names_a_remote_failure_only():
+    (passed,) = _views(record(1))
+    (local_fail,) = _views(record(2, exit_code=1, candidate=local()))
+    for view in (passed, local_fail):
+        with pytest.raises(ValueError, match="REMOTE FAIL or TIMEOUT"):
+            ev.failure_counter("FIX", {}, view)
