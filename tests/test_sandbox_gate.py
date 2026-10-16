@@ -8,6 +8,8 @@ reaches a backend; the scripted provider records what the engine asked for.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -264,3 +266,37 @@ def test_a_setup_failure_after_the_gate_never_falls_back(tmp_path, sandbox_probe
         eng.step()
     # One launch, enforced; nothing re-ran without the sandbox.
     assert len(launched) == 1 and launched[0].sandbox is not None
+
+
+def test_a_local_operator_path_is_checked_against_the_local_launchs_denied_roots(
+    tmp_path, tmp_path_factory, sandbox_probe
+):
+    """The LOCAL checkout is every LOCAL launch's workspace, not a denied root (PR #231 R1-F2).
+
+    ``.git/config`` lies in the root's read-only git projection, which each
+    LOCAL launch already shows: the gate lets it through and the launch drops
+    it as covered (C6). What a LOCAL launch's denied roots do hold, the
+    controller's directory in the git dir or another registered worktree,
+    is still refused before anything of the step.
+    """
+    eng = _local(tmp_path, "required", validation=False)
+    root = Path(eng.local_contract().repository_root)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    other = tmp_path_factory.mktemp("other-worktree")
+    subprocess.run(
+        ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(other)], check=True
+    )
+    for denied in (root / ".git" / "autoforge", other / "src"):
+        eng.config.sandbox.read_only_paths = [str(denied)]
+        before = _snapshot(eng)
+        with pytest.raises(ConfigurationError, match=r"sandbox\.read_only_paths\[0\].*overlaps"):
+            eng.step()
+        assert _snapshot(eng) == before and eng.provider.calls == []
+
+    config = root / ".git" / "config"
+    eng.config.sandbox.read_only_paths = [str(config)]
+    eng.run(max_steps=5)
+    assert eng.state.phase == Phase.DONE
+    assert len(eng.provider.descriptions) == 2
+    for description in eng.provider.descriptions:
+        assert description.covered == (os.path.realpath(config),)

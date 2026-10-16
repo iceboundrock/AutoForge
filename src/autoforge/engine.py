@@ -1895,12 +1895,22 @@ class ControllerEngine:
         self._sandbox_enforced()
 
     def _operator_path_problem(self) -> str:
-        """An operator read-only path that overlaps this run's denied roots; "" if none."""
+        """An operator read-only path that overlaps this run's denied roots; "" if none.
+
+        The denied roots are the ones this run's launches compile with. A
+        LOCAL launch, agent or validation, works in the contract's
+        repository root, so the checkout is not one of them: a path in its
+        read-only git projection (``.git/config``) is the launch's to show.
+        A REMOTE step launches its agent in the issue worktree and its
+        export commands in a tree no worktree is, so no registered worktree
+        is excluded there, the controller's checkout included.
+        """
         paths = tuple(self.config.sandbox.read_only_paths)
         if not paths:
             return ""
-        # No workspace excluded: an operator path may overlap none of them.
-        return operator_path_problem(paths, self._denied_roots(Path("/")))
+        local = self.mode is WorkflowMode.LOCAL
+        workspace = Path(self._execution_cwd()) if local else Path("/")
+        return operator_path_problem(paths, self._denied_roots(workspace))
 
     def _capability_error(self, probe: ProbeResult) -> SandboxCapabilityError:
         local = self.mode is WorkflowMode.LOCAL
