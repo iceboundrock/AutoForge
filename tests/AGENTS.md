@@ -140,8 +140,12 @@ loop detector (unit and end to end)   test_loop_detect.py (adapters: test_provid
 executor, lock, redaction, run logs   test_executor.py, test_executor_duplex.py, test_lock.py,
                                       test_redaction.py, test_runlog.py
 outer sandbox: compiler, wiring on a  test_sandbox.py (real bwrap, skipped with the probe's
-fake bwrap; the real backend          reason where the host cannot enforce:
-                                      test_sandbox_bwrap.py)
+fake bwrap, the typed probe; the real reason where the host cannot enforce:
+backend; routing; every provider's    test_sandbox_bwrap.py, test_sandbox_routing.py,
+boundary alike; the gate and modes;   test_sandbox_parity.py; `make test-sandbox` fails
+doctor's rows                         instead), test_engine_sandbox.py,
+                                      test_sandbox_gate.py, test_doctor_sandbox.py,
+                                      test_sandbox_host.py (the host measurement)
 LOCAL mode                            test_local*.py
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
 launch environment, no credential     test_child_env.py (engine and doctor: test_engine.py,
@@ -155,4 +159,10 @@ for a new subsystem. Run `make test` (or `uv run pytest tests/<file>`) and
 `make lint`; `make check` runs the same commands as CI (including the
 lockfile check) on one local interpreter, and `make check-matrix` runs
 `pytest` on every CI Python. `test_ci_workflow.py` keeps the Makefile and
-`.github/workflows/ci.yml` matching in both directions.
+`.github/workflows/ci.yml` matching in both directions, and pins the
+`sandbox` job to `make test-sandbox-measured`. `make test-sandbox` runs the
+real-backend sandbox modules on a host that must be able to enforce;
+`make test-sandbox-measured`, which CI runs, first measures the host
+(`tests/sandbox_host.py`) and requires them exactly where it can. The autouse `sandbox_probe` fixture stands in for the outer
+sandbox's capability probe everywhere else ("supported", no launch); a test
+of the gate calls `sandbox_probe.unsupported(...)`.

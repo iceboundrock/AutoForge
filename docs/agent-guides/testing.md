@@ -263,10 +263,32 @@ High-priority coverage includes:
   is built, raised as itself; a contained invocation also releases the
   containment, its reaper thread included
 
-### Outer sandbox (#167, ADR 0005)
+### Outer sandbox (#167, #168, #169, ADR 0005)
 
-Three files, by what they need from the host:
+By what they need from the host. Every test outside the real-backend
+modules runs with `tests/conftest.py`'s autouse `sandbox_probe` fixture
+standing in for the capability probe (`autoforge.engine.probe_sandbox`):
+it answers "supported" without a launch, counts its calls, and
+`sandbox_probe.unsupported(capability, reason)` makes it answer that the
+host lacks one. The real-backend modules call `real_sandbox_backend()`,
+which skips with the probe's typed reason, or fails under
+`AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1` (`make test-sandbox`), and under
+`auto` (`make test-sandbox-measured`, hosted CI's `sandbox` job) fails
+exactly when `tests/sandbox_host.py` measures the host capable
+([development.md](../development.md#the-outer-sandbox)).
 
+- `tests/test_sandbox_host.py` covers that measurement against a fake
+  `bwrap` on `PATH`: an old `bwrap` without `--overlay`, with user
+  namespaces refused and a Landlock ABI below 6, is measured incapable and
+  each lack named; a capable one is measured capable; no `bwrap` is named;
+  the measurement is printed and appended to the CI job summary. It also
+  covers what each value of the variable makes of a probe that says
+  "unsupported": unset skips, `1` fails, `auto` fails on a host measured
+  capable and skips with the measurement otherwise, and any other value
+  fails. `tests/test_ci_workflow.py` pins the `sandbox` job to
+  `make test-sandbox-measured`, that target to the measurement and then
+  every real-backend module under `auto`, and the module list to the one
+  `make test-sandbox` requires.
 - `tests/test_sandbox.py` runs on any host with Python (the fake-backend
   part on any Linux). It covers:
   - the policy compiler on paths under `tmp_path`: every refusal of D4.2,
@@ -287,7 +309,20 @@ Three files, by what they need from the host:
     the facts are recorded; and a refusal leaves no descriptor and no held
     containment. Also refused: the platforms without a backend, a missing
     `bwrap`, a backend without overlays, a kernel without Landlock ABI 6,
-    an unknown architecture and a failing process scope.
+    an unknown architecture and a failing process scope;
+  - the typed capability probe (#169, D14.1): each refusal text (this
+    module's own and `bwrap` 0.12's) classified as the capability it
+    names; on the fake backend, a probe that passes with a real launch's
+    shape, a setup failure named by its step (procfs, bind, overlay, the
+    user namespace), a generic "Creating new namespace failed" narrowed
+    to the user, PID or IPC namespace by one launch per namespace, a
+    missing `bwrap` and one without overlays, and nothing left behind;
+  - the launch's own process scope failing in the child of a real
+    `Popen` (PR #231 R2-F4): the real scope with its kernel calls scripted
+    to refuse `keyctl`, `prctl`, `landlock_create_ruleset` or
+    `landlock_restrict_self`. Python's preexec error is generic, but the
+    refusal names the call and its errno, and the probe types it as the
+    session keyring or Landlock. `bwrap` never runs.
 - `tests/test_sandbox_bwrap.py` runs real `bwrap`. A session fixture runs
   `sandbox_bwrap.probe()` once and skips the whole module with the probe's
   reason when this host cannot enforce. Causes include: no `bwrap`,
@@ -296,7 +331,9 @@ Three files, by what they need from the host:
   run the fake commands inside. It skips rather than fails because
   capability is a property of the host (ADR 0005 D14.1): a host that
   cannot enforce refuses every sandboxed launch, which `test_sandbox.py`
-  already covers. Whether hosted CI runs it is #169's. It covers:
+  already covers. `make test-sandbox` fails instead. It covers the real
+  probe's success (supported, the version, nothing left in the temporary
+  directory) and:
   - forbidden sentinels under a fake operator home, a fake agent socket, a
     planted symlink and `..`;
   - read-only, writable, masked, carved-out, pinned and single-file binds
@@ -385,6 +422,45 @@ Four more files, the same split by what they need from the host:
   pushed; a `.git` pointed at a decoy repository,
   whose HEAD is never the candidate and whose next launch is refused
   naming the repair; a refusal on the spawn path; and the dry-run note.
+- `tests/test_sandbox_gate.py` (#169, D12.2, D12.4) drives the engine with
+  the probe's stand-in. It covers: under `required` and REMOTE's
+  `preferred`, a host that cannot enforce refusing the step with a
+  `SandboxCapabilityError` that names the capability and the
+  alternatives, the state and run-log directories byte-identical and
+  nothing launched; INITIALIZING not gated; the probe asked once per
+  engine and again by a new one; a capable host launching inside;
+  `disabled` never probing and saying "logical isolation only"; an
+  operator read-only path over the state directory refused before
+  anything; in LOCAL, the gate checking operator paths against the LOCAL
+  launch's own denied roots, so `.git/config` (in the checkout's read-only
+  git projection) runs to DONE dropped as covered while `.git/autoforge`
+  or another registered worktree is still refused; the dry run's policy by launch class with no probe; `status`
+  without a probe; LOCAL `required` refused before the launch is charged;
+  LOCAL `preferred` falling back visibly (the plan, `status`, a stderr
+  line at every agent and validation launch, every execution record's
+  `sandbox` facts) and enforced on a capable host; and a setup failure
+  after the gate never re-run without the sandbox.
+- `tests/test_doctor_sandbox.py` (#169) runs `doctor`'s sandbox rows with
+  real `git` in a temporary repository and a runner that answers every
+  sandboxed launch: the capability and mode rows for every mode, host and
+  workflow; the policy by class; each provider's declaration (paths and
+  credential classes, never a value) and its `--version` launched inside
+  by its resolved path; a `dir-rw` login in the provider's own root and a
+  keyring login refused with the alternatives (D7.3); hard links in the
+  workspace (D4.4), the walk reading a crowded directory an entry at a
+  time and no further than its bound; the sandbox directories and their sizes (D8.5);
+  loopback and wildcard TCP listeners from a fake `/proc/net`, X11 flagged
+  (D9.3); operator paths over a denied root (D15.4); and no `gh` call in
+  LOCAL. Its denied roots are the run's own (PR #231 R2-F1): for the
+  default LOCAL state, a relative `--state-dir` and a relative
+  `state_dir`, they equal the gate's. Its operator-path row fails exactly
+  where the gate refuses the step, and an `OPENCODE_DB` in the state
+  directory refuses OpenCode's row with nothing launched. A provider's
+  `--version` gets a launch's environment (R2-F2): an operator's
+  `OPENCODE_CONFIG_DIR` is replaced by the launch's own directory, which
+  exists while the probe runs. A `CLAUDE_CONFIG_DIR` link in the home is
+  spelled as the directory it leads to. A token across the version line's
+  clip leaves no fragment in the text or JSON output (R2-F3).
 - `tests/test_sandbox_routing.py` runs real `bwrap` and skips its whole
   module with the probe's reason when this host cannot enforce, as
   `test_sandbox_bwrap.py` does (also off Linux and without
@@ -409,12 +485,33 @@ Four more files, the same split by what they need from the host:
   to it, a fake Claude Code reading and writing through a linked
   `CLAUDE_CONFIG_DIR` and reading linked default login and settings files,
   and a fake OpenCode creating its database through a linked directory.
+  It also covers `doctor`'s sandboxed `--version` run through the same
+  backend, with the environment a launch gets (PR #231 R2-F2). A fake
+  Claude Code needs its linked `CLAUDE_CONFIG_DIR` to lead to a directory
+  inside. A fake OpenCode needs an empty, writable `OPENCODE_CONFIG_DIR`
+  of its own, although the operator's names their configuration root.
+  Both rows pass, and the operator's directory is left unwritten.
+- `tests/test_sandbox_parity.py` (#169, D13.5) runs real `bwrap` and skips
+  as the other two do. One probe runs in every launch path: Claude Code
+  text and `stream-json`, OpenCode, Pi's RPC child and its `auth check`
+  preflight, a provider-neutral adapter (the base class's launch and
+  declaration alone), a LOCAL validation command and an export command.
+  Every path must report the same: the operator's SSH key and `gh`
+  configuration, the state directory, a neighbouring worktree and the
+  controller's directory absent; its workspace, `/tmp` and private home
+  writable; `/usr` and `/etc` read-only; `/run/user` absent; a host
+  abstract socket refused by the Landlock scope; new user, PID and IPC
+  namespaces with the host network; no `XDG_RUNTIME_DIR` or
+  `SSH_AUTH_SOCK`; and the same recorded facts.
 
 `test_integration.py`'s full loops and `test_replan.py`'s hard-threshold
 replan run in both modes, and every launch under `required` carries a
 description. `test_config.py` pins the section (`disabled` by default,
-both formats read, `preferred` and anything else refused) and the example
-file; `test_prompts.py` pins the narrowed-view wording both common
+both formats read, `preferred` falling back in LOCAL only, any other mode
+refused, `read_only_paths` read and each forbidden source, the home or an
+ancestor, a kernel root, a link to a forbidden source and an overlap
+refused at load) and the example file; `test_evidence.py` pins which
+modes require enforced evidence; `test_prompts.py` pins the narrowed-view wording both common
 prompts carry in every mode.
 
 ### Agent isolation (REMOTE)

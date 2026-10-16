@@ -18,6 +18,8 @@ Three layers, none of which needs a working Bubblewrap:
 from __future__ import annotations
 
 import ast
+import ctypes
+import errno
 import json
 import os
 import socket
@@ -866,6 +868,12 @@ if args == ["--version"]:
 if args == ["--help"]:
     print(setting("help", "--size BYTES --perms OCTAL --overlay RWSRC WORKDIR DEST"))
     sys.exit(0)
+if args[0] != "--args":
+    # The probe narrowing a namespace refusal: plain flags, then the command.
+    with open(os.path.join(here, "narrow.jsonl"), "a") as fh:
+        fh.write(json.dumps(args) + "\n")
+    refused = setting("refuse", "").split()
+    sys.exit(1 if any(flag in args for flag in refused) else 0)
 assert args[0] == "--args" and args[2] == "--", args
 fd = int(args[1])
 data = b""
@@ -885,7 +893,8 @@ with open(os.path.join(here, "log.jsonl"), "a") as fh:
     fh.write("\n")
 mode = setting("mode", "run")
 if mode == "setup-fail":
-    sys.stderr.write("bwrap: Creating new namespace failed: Operation not permitted\n")
+    message = setting("stderr", "bwrap: Creating new namespace failed: Operation not permitted")
+    sys.stderr.write(message + "\n")
     sys.exit(1)
 status_fd = int(options[options.index("--json-status-fd") + 1])
 env = {}
@@ -921,6 +930,12 @@ class _NoScope:
         pass
 
     def apply(self) -> None:
+        pass
+
+    def failure(self) -> str:
+        return ""
+
+    def close(self) -> None:
         pass
 
 
@@ -1211,6 +1226,107 @@ def test_a_process_scope_that_fails_refuses_the_launch(
     assert isinstance(info.value.facts, SandboxFacts) and not info.value.facts.enforced
     assert fake_bwrap.log() == []
     assert not executor._CONTAINMENT_LOCK.locked()
+    # A failure the scope did not record names no step: refused, capability unknown.
+    assert sandbox_bwrap.classify(str(info.value)) is sandbox_bwrap.Capability.UNKNOWN
+
+
+def _scope_failing_at(failing: str) -> type:
+    """The real process scope, whose calls succeed but ``failing``, refused with EPERM.
+
+    Its foreign calls are replaced by Python ones after the real
+    ``__init__`` prepared their arguments, so ``apply`` runs as it does in
+    a launch, in the forked child of a real ``Popen``, and only the kernel's
+    answer is scripted (a kernel or a seccomp filter refusing the call).
+    """
+
+    class FailingAt(_REAL_SCOPE):  # type: ignore[misc, valid-type]
+        def __init__(self) -> None:
+            super().__init__()
+            names = {
+                self._join[0].value: "keyctl",
+                self._create[0].value: "landlock_create_ruleset",
+                self._restrict.value: "landlock_restrict_self",
+            }
+
+            def answer(name: str, ok: int) -> int:
+                if name == failing:
+                    ctypes.set_errno(errno.EPERM)
+                    return -1
+                return ok
+
+            def syscall(number: ctypes.c_long, *_args: object) -> int:
+                name = names[number.value]
+                ruleset = name == "landlock_create_ruleset" and name != failing
+                return answer(name, os.open(os.devnull, os.O_RDONLY) if ruleset else 0)
+
+            self._syscall = syscall
+            self._prctl = lambda *_args: answer("prctl", 0)
+
+    return FailingAt
+
+
+_SCOPE_FAILURES = [
+    ("keyctl", "session_keyring", "keyctl(KEYCTL_JOIN_SESSION_KEYRING) failed (EPERM"),
+    ("prctl", "landlock", "prctl(PR_SET_NO_NEW_PRIVS) failed (EPERM"),
+    ("landlock_create_ruleset", "landlock", "landlock_create_ruleset failed (EPERM"),
+    ("landlock_restrict_self", "landlock", "landlock_restrict_self failed (EPERM"),
+]
+
+
+@_linux_only
+@pytest.mark.parametrize(("failing", "capability", "named"), _SCOPE_FAILURES)
+def test_a_scope_step_that_fails_in_the_child_is_named_across_the_spawn(
+    tmp_path: Path,
+    fake_bwrap: FakeBwrap,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
+    capability: str,
+    named: str,
+) -> None:
+    """The step that failed survives Python's generic preexec error (PR #231 R2-F4).
+
+    Through a real ``Popen`` an exception raised between fork and exec
+    reaches the controller as "Exception occurred in preexec_fn.", errno
+    and call gone; the refusal still names the call and its errno, which
+    the child recorded, and nothing ran.
+    """
+    monkeypatch.setattr(sandbox_bwrap, "_landlock_abi", lambda _syscall: 6)
+    monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _scope_failing_at(failing))
+    with pytest.raises(SandboxLaunchRefusedError) as info:
+        execute(
+            ExecutionRequest(
+                command=["/bin/true"], sandbox=_description(tmp_path), contain_orphans=True
+            )
+        )
+    assert named in str(info.value)
+    assert "preexec_fn" not in str(info.value)
+    assert sandbox_bwrap.classify(str(info.value)).key == capability
+    facts = info.value.facts
+    assert isinstance(facts, SandboxFacts) and not facts.enforced
+    assert named in facts.setup_failure
+    # Fail-closed: bwrap never ran, so neither did the command.
+    assert fake_bwrap.log() == []
+    assert not executor._CONTAINMENT_LOCK.locked()
+
+
+@_linux_only
+@pytest.mark.parametrize(("failing", "capability", "named"), _SCOPE_FAILURES)
+def test_the_probe_tells_a_keyring_failure_from_a_landlock_one(
+    tmp_path: Path,
+    fake_bwrap: FakeBwrap,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
+    capability: str,
+    named: str,
+) -> None:
+    """The probe's launch, end to end, names which scope capability failed (PR #231 R2-F4)."""
+    monkeypatch.setattr(sandbox_bwrap, "_landlock_abi", lambda _syscall: 6)
+    monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _scope_failing_at(failing))
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert not result.supported
+    assert result.capability is not None and result.capability.key == capability
+    assert named in result.reason
+    assert fake_bwrap.log() == []
 
 
 # ------------------------------------------------------- how an end is read
@@ -1284,3 +1400,162 @@ def test_the_options_travel_in_a_descriptor(
         assert options[options.index(b"--json-status-fd") + 1] == str(status_fd).encode()
     finally:
         launch.close()
+
+
+# ------------------------------------------- the capability probe, typed (#169)
+
+
+@pytest.mark.parametrize(
+    ("reason", "capability"),
+    [
+        ("the outer sandbox has no backend on darwin; only Linux has one", "platform"),
+        ("bwrap was not found on the controller's PATH", "backend"),
+        ("/usr/bin/bwrap --version failed (exit 1)", "backend"),
+        (
+            "bubblewrap failed to set the sandbox up: bwrap: No permissions to create a new "
+            "namespace, likely because the kernel does not allow non-privileged user "
+            "namespaces. On e.g. debian this can be enabled with 'sysctl "
+            "kernel.unprivileged_userns_clone=1'.",
+            "user_namespace",
+        ),
+        (
+            "bubblewrap failed to set the sandbox up: bwrap: setting up uid map: EPERM",
+            "user_namespace",
+        ),
+        ("bwrap: Can't mount proc on /newroot/proc: Operation not permitted", "procfs"),
+        ("bwrap: Can't bind mount /oldroot/srv on /newroot/srv: No such file", "bind"),
+        ("bwrap: Can't find source path /gone: No such file or directory", "bind"),
+        ("bwrap: Can't mount tmpfs on /newroot/tmp: Operation not permitted", "bind"),
+        ("/usr/bin/bwrap 0.4.0 cannot mount an overlay", "overlay"),
+        ("bwrap: Can't make overlay mount on /newroot/x with options ...: EINVAL", "overlay"),
+        (
+            "the kernel's Landlock ABI is 4; the abstract-socket scope needs ABI 6 (Linux "
+            "6.12) with Landlock enabled",
+            "landlock",
+        ),
+        (
+            "the launch's process could not join a new session keyring or restrict itself to "
+            "the Landlock abstract-socket scope ([Errno 1] landlock_restrict_self)",
+            "landlock",
+        ),
+        (
+            "the launch's process could not join a new session keyring or restrict itself to "
+            "the Landlock abstract-socket scope ([Errno 1] keyctl(KEYCTL_JOIN_SESSION_KEYRING))",
+            "session_keyring",
+        ),
+        ("bwrap: Creating new namespace failed: Operation not permitted", "unknown"),
+        ("something no one has seen", "unknown"),
+    ],
+)
+def test_a_refusal_names_the_capability_the_host_lacks(reason: str, capability: str) -> None:
+    assert sandbox_bwrap.classify(reason).key == capability
+
+
+def test_an_unsupported_probe_says_what_the_host_cannot_provide() -> None:
+    result = sandbox_bwrap.ProbeResult(
+        False, "bwrap: Can't mount proc", "", sandbox_bwrap.Capability.PROCFS
+    )
+    assert result.describe() == (
+        "unsupported: this host cannot provide a new procfs (bwrap: Can't mount proc)"
+    )
+    assert sandbox_bwrap.ProbeResult(True, "", "0.12.0").describe() == (
+        "supported (bubblewrap 0.12.0)"
+    )
+
+
+@_linux_only
+def test_the_probe_passes_on_a_backend_that_runs_the_command(
+    tmp_path: Path, fake_bwrap: FakeBwrap
+) -> None:
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert result.supported and result.capability is None
+    assert result.version == "0.99.0-fake"
+    # The probe's description has a real launch's shape (D14.1).
+    (launch,) = fake_bwrap.log()
+    options = launch["options"]
+    for flag in ("--unshare-user", "--unshare-pid", "--unshare-ipc", "--proc", "--dev"):
+        assert flag in options, flag
+    assert "--ro-bind" in options and "--overlay" in options
+
+
+@_linux_only
+@pytest.mark.parametrize(
+    ("refuse", "capability"),
+    [
+        ("--unshare-user", "user_namespace"),
+        ("--unshare-pid", "pid_namespace"),
+        ("--unshare-ipc", "ipc_namespace"),
+        ("", "unknown"),
+    ],
+)
+def test_a_generic_namespace_refusal_is_narrowed_to_the_namespace(
+    tmp_path: Path, fake_bwrap: FakeBwrap, refuse: str, capability: str
+) -> None:
+    fake_bwrap.set("mode", "setup-fail")
+    fake_bwrap.set("refuse", refuse)
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert not result.supported
+    assert result.capability is not None and result.capability.key == capability
+    assert "Creating new namespace failed" in result.reason
+    tried = [
+        json.loads(line) for line in (fake_bwrap.root / "narrow.jsonl").read_text().splitlines()
+    ]
+    # One namespace more at each step, the host's root read-only, a trivial command.
+    assert [t[: t.index("--ro-bind")] for t in tried][0] == ["--unshare-user"]
+    assert all(t[t.index("--ro-bind") :][:3] == ["--ro-bind", "/", "/"] for t in tried)
+
+
+@_linux_only
+@pytest.mark.parametrize(
+    ("stderr", "capability"),
+    [
+        ("bwrap: Can't mount proc on /newroot/proc: Operation not permitted", "procfs"),
+        ("bwrap: Can't bind mount /oldroot/x on /newroot/x: Permission denied", "bind"),
+        ("bwrap: Can't make overlay mount on /newroot/y with options x: EINVAL", "overlay"),
+        (
+            "bwrap: No permissions to create a new namespace, likely because the kernel does "
+            "not allow non-privileged user namespaces.",
+            "user_namespace",
+        ),
+    ],
+)
+def test_the_probe_names_the_failing_setup_step(
+    tmp_path: Path, fake_bwrap: FakeBwrap, stderr: str, capability: str
+) -> None:
+    fake_bwrap.set("mode", "setup-fail")
+    fake_bwrap.set("stderr", stderr)
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert (result.supported, result.capability.key if result.capability else None) == (
+        False,
+        capability,
+    )
+    assert not (fake_bwrap.root / "narrow.jsonl").exists()
+
+
+@_linux_only
+def test_the_probe_names_a_missing_backend_and_one_without_overlay(
+    tmp_path: Path, fake_bwrap: FakeBwrap, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bwrap.set("help", "--size BYTES --perms OCTAL")
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert result.capability is sandbox_bwrap.Capability.OVERLAY
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert result.capability is sandbox_bwrap.Capability.BACKEND
+    assert "bwrap (bubblewrap)" in result.describe()
+
+
+@_linux_only
+def test_the_probe_writes_nothing_it_leaves_behind(
+    tmp_path: Path, fake_bwrap: FakeBwrap, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    assert sandbox_bwrap.probe(home=str(tmp_path), environ={}).supported
+    assert list(scratch.iterdir()) == []

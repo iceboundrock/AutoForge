@@ -506,13 +506,14 @@ The executor still owns no policy: it does not decide whether a launch is
 sandboxed, which paths it gets, or what happens when the host cannot
 enforce. That is the engine's routing (#168, below) and the configured
 mode (`disabled` and `required` are #168's; `preferred` and the pre-launch
-capability gate are #169's and do not exist yet). The facts are for the
-log, and the controller never reads them (D16.1).
+capability gate #169's, below). The facts are for the log, and the
+controller never reads them (D16.1).
 
 #### Launch routing (ADR 0005, #168)
 
-Under `sandbox.mode: required` every launch AutoForge makes outside itself
-carries a description (D3.1): every process of every agent provider
+When the outer sandbox is enforced (`sandbox.mode: required`, or
+`preferred` on a host that can enforce) every launch AutoForge makes
+outside itself carries a description (D3.1): every process of every agent provider
 (Claude Code one-shot and stream-json, OpenCode, Pi RPC and Pi's
 per-launch auth preflight), every LOCAL validation command and every
 pre-merge verification command. The controller's own `git` and `gh`
@@ -586,6 +587,46 @@ checkout in LOCAL) and for LOCAL validation; every other agent launch and
 an export command get the one in their private home. An agent always
 shares the host network; a repository command gets
 `sandbox.validation_network` or `sandbox.premerge_network` (D9.2).
+`sandbox.read_only_paths` (D15.4) is read-only in every class, declared
+after the provider's roots (C6 decides overlaps; one inside a provider root
+is dropped, a provider root inside one is dropped in its favour); one under
+the home appears at its spelling in the private home.
+
+**The mode and the gate** (#169, D12.2, D13.5). `engine.probe_sandbox()`
+runs `sandbox_bwrap.probe()`, one real minimal launch of a real launch's
+shape whose refusal is typed (`Capability`: `bwrap` missing, the user, PID
+or IPC namespace, procfs, bind, overlay, Landlock, the session keyring;
+`bwrap`'s generic namespace failure is narrowed by one launch per
+namespace). `ControllerEngine.sandbox_capability()` keeps its answer for
+the engine's process. `_sandbox_gate()` runs at the start of
+`_step_once`, before validation recovery, planning, the step budget and
+anything saved, for a step that may launch (`_step_may_launch` in REMOTE;
+ANALYZE_EXECUTE, REVIEW and FIX in LOCAL): an operator path over a denied
+root, or a host that cannot enforce under `required` or REMOTE's
+`preferred`, raises (`ConfigurationError`, `SandboxCapabilityError`) with
+the state byte-identical. `_sandbox_enforced()` is what every launch site
+asks (`_agent_sandbox`, `_command_sandbox`): `False` under `disabled`
+without a probe; `True` on a capable host; under LOCAL's `preferred` on an
+incapable one `False`, and `_fallback_facts()` / `_fallback_notice()` then
+put `{"enforced": false, "mode": "preferred", "isolation": "logical
+isolation only", "fallback": <reason>}` in the execution record and a line
+on stderr (`progress_output`). The fallback is decided from the probe
+alone: a launch the backend refuses after the gate stays a spawn failure
+and is never re-run unenforced. The dry-run plan (`_sandbox_plan_notes`)
+and `status` (`sandbox_mode_summary`) never probe; the plan shows
+`sandbox_policy.class_summary` over `summary_facts` (role paths, nothing
+created) for each class the run can make. `doctor_sandbox.py` holds
+`doctor`'s rows. Their denied roots are the run's own: `doctor` binds an
+engine as the CLI would for the run (its state directory, lock, git
+directories and registered worktrees) and asks it for
+`gate_denied_roots()`, the set the gate holds operator paths against. Each
+provider's declaration compiles with them too, so a declaration that
+projects what no launch may see is refused before its `--version` is
+launched. That `--version` gets the environment the provider's launch
+gets: the allow-listed variables with the adapter's
+`integration_isolation()` over them, held until the launch has ended, and
+the compiled description passed through `rewrite_environment`. Its output
+is redacted before its first line is picked and clipped.
 
 The environment is rewritten (D8.2, `rewrite_environment`): a path-valued
 name AutoForge knows (the CA-bundle names of `DEFAULT_ENV_ALLOWLIST`,

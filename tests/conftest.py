@@ -1670,6 +1670,104 @@ def _no_operator_claude_config(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(providers_module, "claude_config_files", lambda env: files)
 
 
+# Set to 1 where the real backend must run (a capable development host, a
+# runner known to provide one): a real-backend module that would skip fails
+# instead, so a host that lost its capability cannot pass silently (#169).
+# Set to auto where whether it can is measured (the hosted `sandbox` CI job,
+# `make test-sandbox-measured`): it fails instead of skipping exactly when
+# tests/sandbox_host.py, independently of the backend's probe, measures the
+# host capable. Any other non-empty value is refused, never read as "skip".
+REQUIRE_SANDBOX_BACKEND = "AUTOFORGE_REQUIRE_SANDBOX_BACKEND"
+# What the real-backend tests run their fake commands with, inside.
+SYSTEM_PYTHON = "/usr/bin/python3"
+
+
+def real_sandbox_backend(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """The real backend's version, after its own probe; skip, with the reason, without one.
+
+    For the module- or session-scoped ``backend`` fixture of every test that
+    launches real ``bwrap``. The skip reason is the probe's typed result
+    (``pytest -rs`` prints it), so a CI log says which capability the runner
+    lacks; with :data:`REQUIRE_SANDBOX_BACKEND` set to 1 the test fails
+    instead, and set to ``auto`` it fails when the host measures capable
+    (:mod:`tests.sandbox_host`) and skips with the measurement otherwise.
+    """
+    import os
+
+    from autoforge import sandbox_bwrap
+    from tests import sandbox_host
+
+    def unavailable(reason: str) -> None:
+        require = os.environ.get(REQUIRE_SANDBOX_BACKEND, "")
+        if require == "1":
+            pytest.fail(f"{REQUIRE_SANDBOX_BACKEND}=1, but {reason}")
+        if require == "auto":
+            host = sandbox_host.measure()
+            if host.capable:
+                pytest.fail(
+                    f"{REQUIRE_SANDBOX_BACKEND}=auto, and tests/sandbox_host.py measures that "
+                    f"{host.verdict()}, but {reason}"
+                )
+            pytest.skip(f"{reason}; measured: {host.verdict()}")
+        if require:
+            pytest.fail(f"{REQUIRE_SANDBOX_BACKEND}={require!r} is neither 1 nor auto; {reason}")
+        pytest.skip(reason)
+
+    if not sys.platform.startswith("linux"):
+        unavailable("the outer sandbox's backend is Linux-only")
+    if not Path(SYSTEM_PYTHON).exists():
+        unavailable(f"{SYSTEM_PYTHON} is not installed, so no fake command can run inside")
+    home = tmp_path_factory.mktemp("probe-home")
+    result = sandbox_bwrap.probe(home=str(home), environ={})
+    if not result.supported:
+        unavailable(f"this host cannot enforce the outer sandbox: {result.describe()}")
+    return result.version
+
+
+class SandboxProbe:
+    """What this test's capability probe answers, and how often it was asked (#169).
+
+    ``result`` is returned by every call; ``calls`` counts them.
+    """
+
+    def __init__(self) -> None:
+        from autoforge.sandbox_bwrap import ProbeResult
+
+        self.result = ProbeResult(True, "", "0.0-test")
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.result
+
+    def unsupported(self, capability=None, reason: str = "") -> None:
+        """Answer that this host lacks ``capability`` (the user namespace by default)."""
+        from autoforge.sandbox_bwrap import Capability, ProbeResult
+
+        capability = capability or Capability.USER_NAMESPACE
+        self.result = ProbeResult(
+            False, reason or f"test: no {capability.key.replace('_', ' ')}", "", capability
+        )
+
+
+@pytest.fixture(autouse=True)
+def sandbox_probe(monkeypatch) -> SandboxProbe:
+    """The outer sandbox's capability probe answers "supported" without a launch (#169).
+
+    The engine's pre-launch gate and ``doctor`` ask
+    :func:`autoforge.engine.probe_sandbox`, which launches a trivial command
+    through the real backend: a test of a mode must not depend on whether the
+    machine running it has user namespaces. A test of the gate calls
+    :meth:`SandboxProbe.unsupported`; a test of the real probe calls
+    :func:`autoforge.sandbox_bwrap.probe` itself.
+    """
+    import autoforge.engine as engine_module
+
+    probe = SandboxProbe()
+    monkeypatch.setattr(engine_module, "probe_sandbox", probe)
+    return probe
+
+
 @pytest.fixture
 def offline_fetches() -> list[list[str]]:
     """The fetches of this test's engines that have no origin, in order."""

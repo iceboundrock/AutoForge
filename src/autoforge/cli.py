@@ -39,7 +39,13 @@ from .effects import (
     Stage,
     sha256_text,
 )
-from .engine import ControllerEngine, StepOutcome, StepPlan, UnblockOutcome
+from .engine import (
+    ControllerEngine,
+    StepOutcome,
+    StepPlan,
+    UnblockOutcome,
+    sandbox_mode_summary,
+)
 from .errors import (
     AutoForgeError,
     ConfigurationError,
@@ -852,10 +858,18 @@ def cmd_status(args) -> int:
             **state.to_dict(),
             "replan_journal": _replan_journal_summary(txn),
             "acceptance_actions": _acceptance_actions(state),
+            "outer_sandbox": {
+                "mode": engine.config.sandbox.mode,
+                "summary": sandbox_mode_summary(
+                    engine.config.sandbox, state.mode == WorkflowMode.LOCAL
+                ),
+            },
         }
         print(json.dumps(redact_dict(document), indent=2, sort_keys=True))
         return 0
-    evidence = _render_validation_evidence(state, engine.config)
+    evidence = _render_outer_sandbox(state, engine.config) + _render_validation_evidence(
+        state, engine.config
+    )
     if state.mode == WorkflowMode.LOCAL:
         print(redact(_render_local_status(state, txn, evidence)))
         return 0
@@ -866,6 +880,16 @@ def cmd_status(args) -> int:
 # How many records of the current candidate ``status`` lists, newest last.
 _STATUS_RECORDS = 16
 _STATUS_TAIL_CHARS = 200
+
+
+def _render_outer_sandbox(state: AutoForgeState, config: AutoForgeConfig) -> list[str]:
+    """``sandbox.mode`` for ``status`` (ADR 0005 D12.4): configuration only, no probe.
+
+    A mode that may fall back says so; a ``disabled`` run reads "logical
+    isolation only". Whether this host can enforce is ``doctor``'s to show.
+    """
+    summary = sandbox_mode_summary(config.sandbox, state.mode == WorkflowMode.LOCAL)
+    return ["", "Outer sandbox:", f"  {summary}"]
 
 
 def _render_validation_evidence(state: AutoForgeState, config: AutoForgeConfig) -> list[str]:
@@ -887,10 +911,15 @@ def _render_validation_evidence(state: AutoForgeState, config: AutoForgeConfig) 
         count = len(config.validation.commands)
     mode = config.sandbox.mode
     policy = f"{count} definition(s) in {key}; records are made under sandbox.mode {mode}"
-    if not config.sandbox.required:
+    if not config.sandbox.enabled:
         policy += (
             ", so validators run unsandboxed as the operator's UID and their records say "
             "enforced: false"
+        )
+    elif local and mode == "preferred":
+        policy += (
+            ", so on a host that cannot enforce the outer sandbox validators run unsandboxed "
+            "as the operator's UID and their records say enforced: false"
         )
     lines = ["", "Validation evidence:", f"  Policy:  {policy}"]
     records = state.validation_evidence()

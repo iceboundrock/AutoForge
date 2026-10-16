@@ -29,6 +29,7 @@ from autoforge.evidence import (
     MAX_DEFINITIONS,
     MAX_RECORDS,
     MAX_TAIL_CHARS,
+    METHOD_IN_PLACE,
     NO_SANDBOX_TEMPLATE,
     Definition,
     EvidenceFields,
@@ -270,6 +271,16 @@ def test_the_disabled_template_is_the_fixed_no_sandbox_one():
     assert dict(NO_SANDBOX_TEMPLATE) == {"outer_sandbox": "none"}
     assert not policy().requires_enforcement
     assert policy(mode="required").requires_enforcement
+
+
+def test_preferred_requires_enforcement_except_where_it_may_fall_back():
+    """ADR 0005 D12.2: REMOTE's ``preferred`` refuses as ``required`` does, so its
+    evidence must be enforced; LOCAL's (the in-place method) may fall back, and
+    its records say ``enforced: false``."""
+    assert policy(mode="preferred").requires_enforcement
+    assert not policy(mode="preferred", method=METHOD_IN_PLACE).requires_enforcement
+    assert policy(mode="required", method=METHOD_IN_PLACE).requires_enforcement
+    assert policy(mode="preferred").digest != policy(mode="required").digest
 
 
 @pytest.mark.parametrize("launch_class", [LaunchClass.EXPORT_COMMAND, LaunchClass.LOCAL_VALIDATION])

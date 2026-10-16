@@ -49,6 +49,9 @@ fixed system paths (``/usr``, ``/etc``, ``/bin``, ``/lib``, ``/lib64``,
 ``/sbin``, ``/etc/resolv.conf``); it launches nothing and writes nothing.
 Which paths a launch class gets (ADR 0005 §2.5) is the engine's (#168).
 
+:func:`check_declared_path` applies the rules that need no launch to an
+operator-declared read-only path when the configuration is loaded (D15.4).
+
 :class:`SandboxFacts` is what an enforced or refused launch records:
 bounded, with no environment value. The controller never reads it (D16.1).
 """
@@ -619,6 +622,36 @@ def _check_forbidden(path: str, rules: _Rules, label: str) -> None:
                 "D4.3 forbidden source",
                 f"{label} is, contains or lies inside {name} ({forbidden})",
             )
+
+
+def check_declared_path(path: str, home: str, controller_env: Mapping[str, str], label: str) -> str:
+    """The checks of D4.2 and D4.3 an operator-declared path needs no launch for (D15.4).
+
+    An absolute, normalized spelling (C1); never the operator's home, one of
+    its ancestors or a forbidden source (D4.3), in the declared spelling and
+    where it resolves; never under ``/proc``, ``/dev`` or ``/sys`` (C7); and,
+    when it exists, a directory or a regular file (C3). A path that does not
+    exist yet passes here: the compiler refuses it at the launch (C1), and
+    ``doctor`` names it. Whether it overlaps a denied root is a fact of the
+    checkout, checked by the engine and at every compile (C4). Returns the
+    resolved path; a refusal is a :class:`SandboxPolicyError` naming the path
+    and the rule, never a file's contents.
+    """
+    if not path.startswith("/"):
+        raise _refuse(path, "C1 resolved source", f"{label} is a relative path")
+    if not _clean(path):
+        raise _refuse(path, "C1 resolved source", f"{label} is not a normalized absolute path")
+    rules = _Rules(posixpath.normpath(home), _resolve_loose(home))
+    rules.forbidden = _forbidden_sources(home, controller_env)
+    _check_forbidden(path, rules, label)
+    real = _resolve_loose(path)
+    _check_forbidden(real, rules, label)
+    for root in _KERNEL_ROOTS:
+        if _inside(real, root):
+            raise _refuse(path, "C7 relocations", f"{label} would land in {root}")
+    if os.path.lexists(real):
+        _kind_of(real, label)
+    return real
 
 
 def _resolve_engine(path: str, label: str) -> str:

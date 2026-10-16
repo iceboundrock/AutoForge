@@ -149,6 +149,14 @@ class Doctor:
         self.config: AutoForgeConfig | None = None
         # 'owner/repo' of the `origin` remote, set exactly when `check_remote` passes.
         self.repo: str | None = None
+        # Where the TCP listeners are read from (ADR 0005 D9.3); a test points
+        # it at its own files.
+        self.proc_net = "/proc/net"
+
+    @property
+    def runner(self) -> Runner:
+        """What every check's process runs through (a test's fake, or the executor)."""
+        return self._runner
 
     # -- helpers -----------------------------------------------------------------
     def _run(self, argv: list[str]) -> tuple[bool, str]:
@@ -274,7 +282,7 @@ class Doctor:
             return CheckResult(name, False, "(config check failed)", required=False)
         commands = cfg.validation.commands
         mode = f"records made under sandbox.mode {cfg.sandbox.mode}"
-        if not cfg.sandbox.required:
+        if not cfg.sandbox.enabled:
             mode += " (validators run unsandboxed as the operator's UID: unenforced evidence)"
         if not commands:
             return CheckResult(
@@ -576,7 +584,14 @@ class Doctor:
         results.append(self.check_validation_commands())
         if feature_spec_path:
             results.append(self.check_feature_spec(feature_spec_path))
+        results.extend(self.sandbox_checks(local=True))
         return results
+
+    def sandbox_checks(self, local: bool) -> list[CheckResult]:
+        """The outer sandbox's rows (ADR 0005 D12.4, D14.1; :mod:`autoforge.doctor_sandbox`)."""
+        from .doctor_sandbox import sandbox_checks
+
+        return sandbox_checks(self, local)
 
     def _local_agent_checks(self, cfg: AutoForgeConfig | None) -> list[CheckResult]:
         """The agent CLIs a LOCAL run can actually reach.
@@ -1060,6 +1075,7 @@ class Doctor:
         results.append(self.check_launch_credentials())
         results.append(self.check_required_checks(gh))
         results.append(self.check_state_dir())
+        results.extend(self.sandbox_checks(local=False))
         return results
 
 

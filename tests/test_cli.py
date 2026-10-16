@@ -2592,3 +2592,30 @@ def test_run_refuses_a_model_its_recorded_configuration_could_not_hold_before_an
     assert cli.main(["--config", at, "--state-dir", sd, "status"]) == 0
     assert f"Config:     --config {at} (created " in capsys.readouterr().out
     assert cli.main(["--config", at, "--state-dir", sd, "resume", "--dry-run"]) == 0
+
+
+def test_a_host_that_cannot_enforce_a_required_sandbox_refuses_step_with_exit_2(
+    tmp_path, capsys, monkeypatch, fakes, sandbox_probe
+):
+    """#169 (ADR 0005 D12.2): the pre-launch gate's refusal is a configuration
+    error at the CLI; it names the capability and the `disabled` alternative,
+    and the run's files are unchanged. `status` names the mode without a probe."""
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path / "autoforge.json", sandbox={"mode": "required"})
+    sd = str(tmp_path / ".autoforge")
+    run = ["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]
+    assert cli.main([*run, "--max-steps", "1"]) == 0  # INITIALIZING launches nothing
+    sandbox_probe.unsupported(reason="bwrap: setting up uid map: Permission denied")
+    capsys.readouterr()
+    before = _files(sd)
+    assert cli.main(["--config", cfg, "--state-dir", sd, "step"]) == 2
+    err = capsys.readouterr().err
+    assert "autoforge: error:" in err and "user namespace" in err
+    assert "uid map: Permission denied" in err
+    assert "sandbox.mode: disabled" in err and "logical isolation only" in err
+    assert _files(sd) == before
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+    assert cli.main(["--config", cfg, "--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert "Outer sandbox:\n  required (sandbox.mode)" in out
+    assert sandbox_probe.calls == 1

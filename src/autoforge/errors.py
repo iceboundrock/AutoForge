@@ -25,6 +25,22 @@ class ConfigurationDriftError(ConfigurationError):
     """
 
 
+class SandboxCapabilityError(ConfigurationError):
+    """This host cannot enforce the outer sandbox, and the mode refuses (ADR 0005 D12.2).
+
+    Raised by the engine's pre-launch gate under ``sandbox.mode: required``,
+    and under ``preferred`` in a REMOTE run, before anything is spawned,
+    before the attempt counter is saved and before a LOCAL launch is
+    charged: state is unchanged and nothing needs recovery. A configuration
+    or capability error, never a phase failure. ``capability`` names what
+    the host lacks (``autoforge.sandbox_bwrap.Capability``'s value).
+    """
+
+    def __init__(self, message: str, capability: str = "") -> None:
+        super().__init__(message)
+        self.capability = capability
+
+
 class StateError(AutoForgeError):
     """State file missing, unreadable, corrupted, or schema-invalid.
 

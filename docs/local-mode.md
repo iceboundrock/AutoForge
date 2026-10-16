@@ -52,12 +52,20 @@ under the default `sandbox.mode: disabled`
 `sandbox.mode: required` (#168,
 [ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md))
 runs every LOCAL agent and validation command inside an outer sandbox, or
-refuses it: the repository root is writable and its git directory
+refuses it: a host that cannot enforce one is refused at the start of the
+step, before anything is saved, charged or launched (#169). The
+repository root is writable and its git directory
 read-only, so a commit, stash or branch switch fails outright instead of
 being detected afterwards, and the LOCAL state, the lock, other worktrees
 and the rest of your home are absent. The agent still runs as your UID on
 the host network, so a network request is still neither prevented nor
 detected ([Configuration: outer sandbox](configuration.md#outer-sandbox)).
+`sandbox.mode: preferred` is `required` on a host that can enforce; on one
+that cannot, every LOCAL launch runs with logical isolation only, and says
+so on stderr at the launch and in its execution record (`enforced: false`,
+with the reason), never as "sandboxed" (D12.2). `autoforge local doctor`
+shows which of the two this host gets
+([Usage: outer sandbox](usage.md#outer-sandbox)).
 A LOCAL launch also masks the REMOTE default state directory
 `<root>/.autoforge`, but it cannot know a REMOTE state directory configured
 elsewhere inside the root (ADR 0005 D13.2): if you run REMOTE runs from the
@@ -95,6 +103,11 @@ uv run autoforge resume                  # they read the mode from persisted sta
 
 `autoforge local doctor` runs the local subset of `autoforge doctor` and
 omits the `gh`, `gh auth status`, `origin` and branch-rule checks entirely.
+It keeps the outer-sandbox rows (the capability probe, what `sandbox.mode`
+does on this host, the LOCAL launch classes' policy, each reachable
+provider's declaration and sandboxed `--version`, hard links and sandbox
+directories in the checkout, and loopback TCP listeners), none of which
+calls GitHub ([Usage: outer sandbox](usage.md#outer-sandbox)).
 It keeps the two launch-environment rows, which read only the local git
 configuration and `~/.netrc` and run each launch shell once as a login
 shell (no GitHub call): what an agent's environment
@@ -304,12 +317,13 @@ would refuse. They run under the same allow-listed environment as an agent
 variables the controller sets and the same preflight: a command gets no
 GitHub or git credential, and a refused preflight (a credential helper in
 the repository's git configuration, say) leaves the phase unverified like a
-failing command. Under `sandbox.mode: required` they run inside the outer
-sandbox like the agent whose tree they check, sharing the checkout's
+failing command. When the outer sandbox is enforced they run inside it
+like the agent whose tree they check, sharing the checkout's
 persistent cache at `~/.cache`, on the host network unless
 `sandbox.validation_network: isolated`. What they run must then be
-visible inside, under `/usr` or in the repository (a tool installed
-elsewhere under your home or in `/opt` is not), and a command the sandbox
+visible inside, under `/usr`, in the repository or in
+`sandbox.read_only_paths` (a tool installed elsewhere under your home or in
+`/opt` is not, until you declare it there), and a command the sandbox
 refuses is not run and leaves the phase unverified too.
 
 Every command that runs leaves a `ValidationRecord` in the state file

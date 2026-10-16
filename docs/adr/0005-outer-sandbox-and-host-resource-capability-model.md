@@ -6,7 +6,11 @@
   is #168's (`src/autoforge/sandbox_policy.py`,
   `src/autoforge/agent_worktree.py`, each adapter's
   `sandbox_requirements`, the engine's routing and the `sandbox:` config
-  section); #169's is not yet. It is implemented by #167 (the launch
+  section), and so is #169's (the typed capability probe in
+  `sandbox_bwrap.py`, the engine's pre-launch gate and `preferred`,
+  `sandbox.read_only_paths`, `src/autoforge/doctor_sandbox.py`, the
+  per-class policy in the dry-run plan and the parity suite,
+  `tests/test_sandbox_parity.py`). It is implemented by #167 (the launch
   description, the policy compiler and the Linux `bwrap` backend in the
   executor layer), #168
   (provider declarations, engine facts, the routing of every launch, the git
@@ -1576,7 +1580,7 @@ refuses before the spawn (D12.2).
 | Fedora 44, kernel 7.2.x, SELinux enforcing, bubblewrap 0.12.0, git 2.55.0 / 2.56.0 (planning host and this record's) | yes | supported; every §1.2 measurement |
 | rootless podman, default settings | yes (planning) | user and PID namespaces work, a new procfs is refused (`EPERM`): unsupported unless run with `--security-opt unmask=/proc/* --security-opt label=disable` |
 | an AutoForge sandbox nested in a sandbox that passed `--disable-userns` | yes | the inner `bwrap` fails (`ENOSPC`) |
-| hosted CI, `ubuntu-latest` | no | #169 measures whether unprivileged user namespaces are usable there and how `bwrap` is installed |
+| hosted CI, `ubuntu-latest` | on every CI run | the `sandbox` job installs `bwrap` from the distribution, records its version and `--overlay`, the user-namespace sysctls, an unprivileged namespace launch and the Landlock ABI in its summary (`tests/sandbox_host.py`), and requires the real-backend tests wherever the runner measures capable (docs/development.md, "The outer sandbox") |
 | Ubuntu 23.10 and later with AppArmor's `kernel.apparmor_restrict_unprivileged_userns` | no | #169 verifies and documents |
 | Debian with `kernel.unprivileged_userns_clone=0` | no | #169 verifies and documents |
 | Docker, default seccomp profile | no | #169 verifies and documents |
