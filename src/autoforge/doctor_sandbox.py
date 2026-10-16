@@ -62,6 +62,8 @@ ROW_PREFIX = "outer sandbox"
 # paths shown per row.
 MAX_WALK_ENTRIES = 200_000
 MAX_SHOWN = 20
+# How much of a provider's sandboxed ``--version`` line a row shows.
+VERSION_CHARS = 120
 
 # The ports an X server listening on TCP uses (D9.3): 6000 + display.
 X11_PORTS = range(6000, 6064)
@@ -304,7 +306,9 @@ def _provider_row(
             "not give the CLI what it needs",
             required=enforced,
         )
-    first = ((result.stdout or "").strip().splitlines() or [""])[0][:120]
+    # Redacted whole before a line is picked and clipped: a clip first could
+    # leave a token too short for the redactor to recognize.
+    first = (redact(result.stdout).strip().splitlines() or [""])[0][:VERSION_CHARS]
     return _row(name, True, f"{shown}; inside the sandbox: {first or '(no output)'}", False)
 
 

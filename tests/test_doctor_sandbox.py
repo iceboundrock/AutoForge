@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from autoforge import doctor_sandbox
+from autoforge import cli, doctor_sandbox
 from autoforge.config import default_config
 from autoforge.doctor import Doctor
 from autoforge.errors import SandboxPolicyError
@@ -28,16 +28,17 @@ SECRET = "sk-ant-doctor-test-value-0123456789"
 class Runner:
     """Real ``git``; a sandboxed launch recorded and answered; no ``gh`` ever."""
 
-    def __init__(self) -> None:
+    def __init__(self, stdout: str = "fake-cli 1.2.3\n") -> None:
         self.sandboxed: list = []
         self.commands: list[list[str]] = []
+        self.stdout = stdout
 
     def __call__(self, req):
         self.commands.append(list(req.command))
         assert req.command[0] != "gh", req.command
         if req.sandbox is not None:
             self.sandboxed.append(req)
-            return ExecutionResult(req.command, req.cwd, 0, "fake-cli 1.2.3\n", "", "t", "t")
+            return ExecutionResult(req.command, req.cwd, 0, self.stdout, "", "t", "t")
         return execute(req)
 
 
@@ -103,6 +104,29 @@ def test_local_doctor_shows_every_sandbox_row_and_never_calls_github(tmp_path, h
     for r in results:
         assert SECRET not in r.detail and SECRET not in r.name
     assert not any(c[0] == "gh" for c in runner.commands)
+
+
+def test_a_token_across_the_version_clip_leaves_no_fragment(tmp_path, host, capsys):
+    """The version line is redacted before it is clipped (PR #231 R2-F3).
+
+    The token starts seven characters before the clip: clipped first, the
+    ``ghp_`` prefix and three characters would be too short for the
+    redactor and would be printed as they are.
+    """
+    token = "ghp_" + "A1b2C3d4" * 4
+    prefix = "x" * (doctor_sandbox.VERSION_CHARS - 8) + " "
+    assert len(prefix) + 7 == doctor_sandbox.VERSION_CHARS
+    repo = git_repo(tmp_path / "repo")
+    runner = Runner(stdout=f"{prefix}{token} trailing\nsecond line\n")
+    results = _doctor(repo, host, runner=runner).sandbox_checks(local=True)
+    providers = [r for r in results if r.name.startswith("outer sandbox: provider ")]
+    assert providers and all(r.ok for r in providers)
+    assert all("inside the sandbox: xxx" in r.detail for r in providers)
+    for as_json in (False, True):
+        cli._report_checks(results, as_json, "doctor")
+        out = capsys.readouterr().out
+        assert "ghp_" not in out and "A1b" not in out
+        assert "second line" not in out
 
 
 def test_remote_doctor_appends_the_sandbox_rows(tmp_path, host):
