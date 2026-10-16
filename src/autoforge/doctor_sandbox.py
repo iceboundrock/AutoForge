@@ -79,7 +79,8 @@ class _Layout:
     workspaces: list[Path] = field(default_factory=list)
     # ``<git dir>/autoforge/sandbox/<key>`` (D8.4).
     sandbox_dirs: list[Path] = field(default_factory=list)
-    # What no launch may see (D13.2), for D15.4.
+    # What no launch may see (D13.2): the run's own denied roots, which the
+    # gate holds operator paths against (D15.4) and provider probes compile with.
     denied: tuple[str, ...] = ()
 
 
@@ -90,11 +91,12 @@ def sandbox_checks(doctor: Doctor, local: bool) -> list[CheckResult]:
         return []
     probe = _engine.probe_sandbox()
     layout = _layout(doctor, cfg, local)
+    denied = layout.denied if layout is not None else ()
     return [
         capability_row(probe),
         mode_row(cfg, probe, local),
         *policy_rows(cfg, local),
-        *provider_rows(doctor, cfg, local, probe),
+        *provider_rows(doctor, cfg, local, probe, denied),
         operator_paths_row(cfg, layout),
         hard_links_row(layout),
         sandbox_dirs_row(layout),
@@ -204,9 +206,17 @@ def _reachable(cfg: AutoForgeConfig, local: bool) -> list[str]:
 
 
 def provider_rows(
-    doctor: Doctor, cfg: AutoForgeConfig, local: bool, probe: ProbeResult
+    doctor: Doctor,
+    cfg: AutoForgeConfig,
+    local: bool,
+    probe: ProbeResult,
+    denied: tuple[str, ...] = (),
 ) -> list[CheckResult]:
-    """One row per distinct (provider, command) the run can reach, ``scripted`` excepted."""
+    """One row per distinct (provider, command) the run can reach, ``scripted`` excepted.
+
+    ``denied`` are the run's denied roots: a declaration that projects one
+    is refused, as every launch of it would be, before anything is launched.
+    """
     groups: dict[tuple[str, str], list[ProfileConfig]] = {}
     for name in _reachable(cfg, local):
         profile = cfg.profiles.get(name)
@@ -215,13 +225,17 @@ def provider_rows(
         command = profile.command or profile.provider
         groups.setdefault((profile.provider, command), []).append(profile)
     return [
-        _provider_row(doctor, cfg, profiles, probe)
+        _provider_row(doctor, cfg, profiles, probe, denied)
         for (_provider, _command), profiles in groups.items()
     ]
 
 
 def _provider_row(
-    doctor: Doctor, cfg: AutoForgeConfig, profiles: list[ProfileConfig], probe: ProbeResult
+    doctor: Doctor,
+    cfg: AutoForgeConfig,
+    profiles: list[ProfileConfig],
+    probe: ProbeResult,
+    denied: tuple[str, ...],
 ) -> CheckResult:
     profile = profiles[0]
     name = (
@@ -252,13 +266,14 @@ def _provider_row(
                     controller_env=os.environ,
                     workspace=workspace,
                     operator_paths=tuple(cfg.sandbox.read_only_paths),
+                    denied_roots=denied,
                 )
             )
         except SandboxPolicyError as exc:
             return _row(
                 name,
                 False,
-                f"{shown}; every launch of it is refused: {exc}. {_login_alternatives(needs)}",
+                f"{shown}; every launch of it is refused: {exc}. {_refusal_hint(needs, exc)}",
                 required=enforced,
             )
         except (AutoForgeError, OSError) as exc:
@@ -329,6 +344,18 @@ def describe_requirements(needs: ProviderRequirements) -> str:
     return "; ".join(parts)
 
 
+def _refusal_hint(needs: ProviderRequirements, exc: SandboxPolicyError) -> str:
+    """What to do about a declaration the policy refuses: the rule decides."""
+    if exc.rule.startswith("C4"):
+        return (
+            "Keep it clear of what no launch may see (ADR 0005 D13.2: the state directory and "
+            "its run logs, the lock, the controller's directory under the git common dir, "
+            "another worktree, and in REMOTE the operator's checkout), or set sandbox.mode: "
+            "disabled."
+        )
+    return _login_alternatives(needs)
+
+
 def _login_alternatives(needs: ProviderRequirements) -> str:
     """D7.3: what to use instead of a keyring or refused ``dir-rw`` login."""
     kinds = {item.mode for item in needs.auth}
@@ -373,21 +400,12 @@ def _layout(doctor: Doctor, cfg: AutoForgeConfig, local: bool) -> _Layout | None
     if lines is None or len(lines) != 3 or not all(line.startswith("/") for line in lines):
         return None
     root, git_dir, common = (Path(os.path.realpath(line)) for line in lines)
-    porcelain = _git_lines(doctor, "worktree", "list", "--porcelain") or []
-    registered = [
-        Path(os.path.realpath(line.removeprefix("worktree ")))
-        for line in porcelain
-        if line.startswith("worktree ")
-    ]
-    state = doctor.state_dir or cfg.state_dir
-    denied = [str(common / "autoforge"), str(git_dir / "autoforge")]
-    if os.path.isabs(state):
-        denied.append(state)
-    elif not local:
-        denied.append(str(root / state))
+    try:
+        denied = _run_engine(doctor, cfg, local).gate_denied_roots(root if local else None)
+    except (AutoForgeError, OSError):
+        return None
     if local:
         workspaces = [root]
-        denied += [str(p) for p in registered if p != root]
     else:
         configured = cfg.execution.worktree_dir
         holder = (
@@ -396,11 +414,29 @@ def _layout(doctor: Doctor, cfg: AutoForgeConfig, local: bool) -> _Layout | None
             else common / "autoforge" / "worktrees"
         )
         workspaces = sorted(p for p in _children(holder) if p.is_dir())
-        denied += [str(root), *(str(p) for p in registered)]
     sandbox_dirs: list[Path] = []
     for base in dict.fromkeys([common, git_dir]):
         sandbox_dirs += sorted(p for p in _children(base / SANDBOX_DIR) if p.is_dir())
-    return _Layout(workspaces, sandbox_dirs, tuple(dict.fromkeys(denied)))
+    return _Layout(workspaces, sandbox_dirs, denied)
+
+
+def _run_engine(doctor: Doctor, cfg: AutoForgeConfig, local: bool) -> _engine.ControllerEngine:
+    """An engine bound as this invocation's run would be, so its denied roots are the run's.
+
+    The state directory is the one the CLI gives a run (``--state-dir``,
+    else ``state_dir``; LOCAL's resolved as ``bind_local_state_dir`` does,
+    the default ``<git dir>/autoforge/state``), relative to the working
+    directory as there; the lock, the git directories and the registered
+    worktrees are read as a launch reads them. Nothing is created or locked.
+    """
+    eng = _engine.ControllerEngine(
+        cfg, state_dir=doctor.state_dir or cfg.state_dir, workdir=doctor.cwd, runner=doctor.runner
+    )
+    if local:
+        eng.paths = _engine.local_state_paths(
+            eng.workspace(), explicit=doctor.state_dir, configured=cfg.state_dir
+        )
+    return eng
 
 
 def _children(path: Path) -> list[Path]:

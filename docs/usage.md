@@ -544,7 +544,9 @@ never called sandboxed.
   sandbox is enabled and the host can enforce, its `--version` run inside;
   a keyring login, or a `dir-rw` login inside the provider's own
   configuration root, with the supported alternatives (a login file, a
-  dedicated credential directory, an API key variable); hard-linked files
+  dedicated credential directory, an API key variable); a declaration that
+  reaches what no launch may see (the run's state directory, the lock,
+  another worktree), refused as each of its launches would be; hard-linked files
   in the trees an agent writes (each still aliases an inode outside: remove
   the REMOTE worktree or sandbox directory, or break the link); the sandbox
   directories and their sizes; the TCP listeners on loopback and wildcard

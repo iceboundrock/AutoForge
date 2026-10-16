@@ -1895,22 +1895,30 @@ class ControllerEngine:
         self._sandbox_enforced()
 
     def _operator_path_problem(self) -> str:
-        """An operator read-only path that overlaps this run's denied roots; "" if none.
-
-        The denied roots are the ones this run's launches compile with. A
-        LOCAL launch, agent or validation, works in the contract's
-        repository root, so the checkout is not one of them: a path in its
-        read-only git projection (``.git/config``) is the launch's to show.
-        A REMOTE step launches its agent in the issue worktree and its
-        export commands in a tree no worktree is, so no registered worktree
-        is excluded there, the controller's checkout included.
-        """
+        """An operator read-only path that overlaps this run's denied roots; "" if none."""
         paths = tuple(self.config.sandbox.read_only_paths)
         if not paths:
             return ""
-        local = self.mode is WorkflowMode.LOCAL
-        workspace = Path(self._execution_cwd()) if local else Path("/")
-        return operator_path_problem(paths, self._denied_roots(workspace))
+        local_root = Path(self._execution_cwd()) if self.mode is WorkflowMode.LOCAL else None
+        return operator_path_problem(paths, self.gate_denied_roots(local_root))
+
+    def gate_denied_roots(self, local_root: Path | None) -> tuple[str, ...]:
+        """The denied roots the gate holds ``sandbox.read_only_paths`` against (D15.4).
+
+        They are the ones this run's launches compile with. ``local_root``
+        is a LOCAL run's repository root, ``None`` for a REMOTE run. A LOCAL
+        launch, agent or validation, works in that root, so the checkout is
+        not one of them: a path in its read-only git projection
+        (``.git/config``) is the launch's to show. A REMOTE step launches
+        its agent in the issue worktree and its export commands in a tree no
+        worktree is, so no registered worktree is excluded there, the
+        controller's checkout included. ``doctor`` asks the same question
+        before any run exists, so the mode is an argument here, not the
+        loaded run's.
+        """
+        if local_root is not None:
+            return self._denied_roots(local_root, local=True)
+        return self._denied_roots(Path("/"), local=False)
 
     def _capability_error(self, probe: ProbeResult) -> SandboxCapabilityError:
         local = self.mode is WorkflowMode.LOCAL
@@ -2103,11 +2111,14 @@ class ControllerEngine:
             operator_paths=tuple(self.config.sandbox.read_only_paths),
         )
 
-    def _denied_roots(self, workspace: Path) -> tuple[str, ...]:
+    def _denied_roots(self, workspace: Path, *, local: bool | None = None) -> tuple[str, ...]:
         """What no launch may see (ADR 0005 D13.2): the state directory and its run
         logs, the lock, ``<git common dir>/autoforge``, every other registered
         worktree, and for REMOTE the controller's checkout, for LOCAL the
-        default REMOTE state directory inside the root and the LOCAL state."""
+        default REMOTE state directory inside the root and the LOCAL state.
+        ``local`` is the run's mode when ``None``."""
+        if local is None:
+            local = self.mode is WorkflowMode.LOCAL
         ws = self.workspace()
         dirs = ws.git_dirs()
         roots = [
@@ -2116,7 +2127,7 @@ class ControllerEngine:
             str(self.lock_path()),
             str(dirs[-1] / "autoforge"),
         ]
-        if self.mode is WorkflowMode.LOCAL:
+        if local:
             roots += [str(dirs[0] / "autoforge"), str(workspace / DEFAULT_STATE_DIR)]
         else:
             roots.append(str(ws.root()))

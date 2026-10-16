@@ -15,12 +15,13 @@ import pytest
 from autoforge import cli, doctor_sandbox
 from autoforge.config import default_config
 from autoforge.doctor import Doctor
-from autoforge.errors import SandboxPolicyError
+from autoforge.errors import ConfigurationError, SandboxPolicyError
 from autoforge.executor import ExecutionResult, execute
 from autoforge.sandbox import compile_launch
 from autoforge.sandbox_bwrap import Capability, ProbeResult
 from autoforge.sandbox_policy import AuthItem, AuthMode, ProviderRequirements, provider_request
-from tests.conftest import git_repo
+from tests.conftest import git_repo, make_local_engine
+from tests.test_local import local_repo
 
 SECRET = "sk-ant-doctor-test-value-0123456789"
 
@@ -64,8 +65,14 @@ def host(tmp_path, monkeypatch):
     return {"home": home, "bin": bin_dir, "proc_net": proc_net}
 
 
-def _doctor(cwd: Path, host, mode: str = "required", runner: Runner | None = None) -> Doctor:
-    d = Doctor(cwd=str(cwd), runner=runner or Runner())
+def _doctor(
+    cwd: Path,
+    host,
+    mode: str = "required",
+    runner: Runner | None = None,
+    state_dir: str | None = None,
+) -> Doctor:
+    d = Doctor(cwd=str(cwd), runner=runner or Runner(), state_dir=state_dir)
     d.config = default_config()
     d.config.sandbox.mode = mode
     d.proc_net = str(host["proc_net"])
@@ -285,6 +292,78 @@ def test_operator_paths_over_a_denied_root_are_named(tmp_path, host):
     d.config.sandbox.read_only_paths = [str(tmp_path / "opt")]
     row = _rows(d.sandbox_checks(local=True))["operator read-only paths (sandbox.read_only_paths)"]
     assert row.ok and "readable by every tool in the sandbox" in row.detail
+
+
+# Where a LOCAL run keeps its state: (``--state-dir``, ``state_dir``), and the
+# path in the run's denied roots an operator path or a provider may not name.
+_LOCAL_STATE = {
+    # The default state is <git dir>/autoforge/state; <root>/.autoforge, the
+    # REMOTE default inside the root, is denied to a LOCAL launch as well.
+    "default": (None, None, ".autoforge"),
+    "relative --state-dir": ("../cli-state", None, "../cli-state"),
+    "relative state_dir": (None, "../config-state", "../config-state"),
+}
+
+
+@pytest.mark.parametrize("where", sorted(_LOCAL_STATE))
+def test_local_doctor_refuses_what_the_local_gate_refuses(tmp_path, host, monkeypatch, where):
+    """The doctor's denied roots are the LOCAL launch's own (PR #231 R2-F1).
+
+    ``<root>/.autoforge`` and a state directory named relative to the
+    working directory were missing from the doctor's copy, which showed an
+    OK row for an operator path the gate refuses before the first launch.
+    """
+    explicit, configured, denied = _LOCAL_STATE[where]
+    root = local_repo(tmp_path / "repo")
+    monkeypatch.chdir(root)
+    target = os.path.realpath(root / denied)
+    cfg = default_config()
+    cfg.sandbox.mode = "required"
+    if configured:
+        cfg.state_dir = configured
+    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg, state_dir=explicit)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    d = _doctor(root, host, state_dir=explicit)
+    d.config = cfg
+    layout = doctor_sandbox._layout(d, cfg, local=True)
+    assert layout is not None
+    assert layout.denied == eng.gate_denied_roots(Path(eng.local_contract().repository_root))
+    assert any(os.path.realpath(r) == target for r in layout.denied), layout.denied
+
+    cfg.sandbox.read_only_paths = [target]
+    row = _rows(d.sandbox_checks(local=True))["operator read-only paths (sandbox.read_only_paths)"]
+    assert row.label == "FAIL" and "overlaps" in row.detail, row.detail
+    with pytest.raises(ConfigurationError, match=r"sandbox\.read_only_paths\[0\].*overlaps"):
+        eng.step()
+    assert eng.provider.calls == []
+
+
+@pytest.mark.parametrize("where", sorted(_LOCAL_STATE))
+def test_a_provider_declaration_over_the_state_is_refused_before_its_launch(
+    tmp_path, host, monkeypatch, where
+):
+    """A provider probe compiles with the run's denied roots (PR #231 R2-F1).
+
+    OpenCode's database directory (``dir-rw``) put in the state directory
+    would show it to every launch: the row fails, and its ``--version``
+    is never launched.
+    """
+    explicit, configured, denied = _LOCAL_STATE[where]
+    repo = git_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+    state = repo / denied
+    state.mkdir(parents=True)
+    monkeypatch.setenv("OPENCODE_DB", str(state / "opencode.db"))
+    runner = Runner()
+    d = _doctor(repo, host, runner=runner, state_dir=explicit)
+    if configured:
+        d.config.state_dir = configured
+    rows = _rows(d.sandbox_checks(local=True))
+    (opencode,) = [r for n, r in rows.items() if n.startswith("provider opencode")]
+    assert opencode.label == "FAIL" and "every launch of it is refused" in opencode.detail
+    assert f"lies in the denied root {os.path.realpath(state)}" in opencode.detail
+    assert "Keep it clear of what no launch may see" in opencode.detail
+    assert [req.command[0] for req in runner.sandboxed] == [str(host["bin"] / "claude")]
 
 
 def _tcp(*entries: tuple[str, str]) -> str:

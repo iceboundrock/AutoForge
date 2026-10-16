@@ -616,7 +616,13 @@ and is never re-run unenforced. The dry-run plan (`_sandbox_plan_notes`)
 and `status` (`sandbox_mode_summary`) never probe; the plan shows
 `sandbox_policy.class_summary` over `summary_facts` (role paths, nothing
 created) for each class the run can make. `doctor_sandbox.py` holds
-`doctor`'s rows.
+`doctor`'s rows. Their denied roots are the run's own: `doctor` binds an
+engine as the CLI would for the run (its state directory, lock, git
+directories and registered worktrees) and asks it for
+`gate_denied_roots()`, the set the gate holds operator paths against. Each
+provider's declaration compiles with them too, so a declaration that
+projects what no launch may see is refused before its `--version` is
+launched.
 
 The environment is rewritten (D8.2, `rewrite_environment`): a path-valued
 name AutoForge knows (the CA-bundle names of `DEFAULT_ENV_ALLOWLIST`,
