@@ -316,7 +316,13 @@ exactly when `tests/sandbox_host.py` measures the host capable
     shape, a setup failure named by its step (procfs, bind, overlay, the
     user namespace), a generic "Creating new namespace failed" narrowed
     to the user, PID or IPC namespace by one launch per namespace, a
-    missing `bwrap` and one without overlays, and nothing left behind.
+    missing `bwrap` and one without overlays, and nothing left behind;
+  - the launch's own process scope failing in the child of a real
+    `Popen` (PR #231 R2-F4): the real scope with its kernel calls scripted
+    to refuse `keyctl`, `prctl`, `landlock_create_ruleset` or
+    `landlock_restrict_self`. Python's preexec error is generic, but the
+    refusal names the call and its errno, and the probe types it as the
+    session keyring or Landlock. `bwrap` never runs.
 - `tests/test_sandbox_bwrap.py` runs real `bwrap`. A session fixture runs
   `sandbox_bwrap.probe()` once and skips the whole module with the probe's
   reason when this host cannot enforce. Causes include: no `bwrap`,

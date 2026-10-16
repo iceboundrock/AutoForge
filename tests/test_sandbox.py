@@ -18,6 +18,8 @@ Three layers, none of which needs a working Bubblewrap:
 from __future__ import annotations
 
 import ast
+import ctypes
+import errno
 import json
 import os
 import socket
@@ -930,6 +932,12 @@ class _NoScope:
     def apply(self) -> None:
         pass
 
+    def failure(self) -> str:
+        return ""
+
+    def close(self) -> None:
+        pass
+
 
 class FakeBwrap:
     def __init__(self, root: Path) -> None:
@@ -1218,6 +1226,107 @@ def test_a_process_scope_that_fails_refuses_the_launch(
     assert isinstance(info.value.facts, SandboxFacts) and not info.value.facts.enforced
     assert fake_bwrap.log() == []
     assert not executor._CONTAINMENT_LOCK.locked()
+    # A failure the scope did not record names no step: refused, capability unknown.
+    assert sandbox_bwrap.classify(str(info.value)) is sandbox_bwrap.Capability.UNKNOWN
+
+
+def _scope_failing_at(failing: str) -> type:
+    """The real process scope, whose calls succeed but ``failing``, refused with EPERM.
+
+    Its foreign calls are replaced by Python ones after the real
+    ``__init__`` prepared their arguments, so ``apply`` runs as it does in
+    a launch, in the forked child of a real ``Popen``, and only the kernel's
+    answer is scripted (a kernel or a seccomp filter refusing the call).
+    """
+
+    class FailingAt(_REAL_SCOPE):  # type: ignore[misc, valid-type]
+        def __init__(self) -> None:
+            super().__init__()
+            names = {
+                self._join[0].value: "keyctl",
+                self._create[0].value: "landlock_create_ruleset",
+                self._restrict.value: "landlock_restrict_self",
+            }
+
+            def answer(name: str, ok: int) -> int:
+                if name == failing:
+                    ctypes.set_errno(errno.EPERM)
+                    return -1
+                return ok
+
+            def syscall(number: ctypes.c_long, *_args: object) -> int:
+                name = names[number.value]
+                ruleset = name == "landlock_create_ruleset" and name != failing
+                return answer(name, os.open(os.devnull, os.O_RDONLY) if ruleset else 0)
+
+            self._syscall = syscall
+            self._prctl = lambda *_args: answer("prctl", 0)
+
+    return FailingAt
+
+
+_SCOPE_FAILURES = [
+    ("keyctl", "session_keyring", "keyctl(KEYCTL_JOIN_SESSION_KEYRING) failed (EPERM"),
+    ("prctl", "landlock", "prctl(PR_SET_NO_NEW_PRIVS) failed (EPERM"),
+    ("landlock_create_ruleset", "landlock", "landlock_create_ruleset failed (EPERM"),
+    ("landlock_restrict_self", "landlock", "landlock_restrict_self failed (EPERM"),
+]
+
+
+@_linux_only
+@pytest.mark.parametrize(("failing", "capability", "named"), _SCOPE_FAILURES)
+def test_a_scope_step_that_fails_in_the_child_is_named_across_the_spawn(
+    tmp_path: Path,
+    fake_bwrap: FakeBwrap,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
+    capability: str,
+    named: str,
+) -> None:
+    """The step that failed survives Python's generic preexec error (PR #231 R2-F4).
+
+    Through a real ``Popen`` an exception raised between fork and exec
+    reaches the controller as "Exception occurred in preexec_fn.", errno
+    and call gone; the refusal still names the call and its errno, which
+    the child recorded, and nothing ran.
+    """
+    monkeypatch.setattr(sandbox_bwrap, "_landlock_abi", lambda _syscall: 6)
+    monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _scope_failing_at(failing))
+    with pytest.raises(SandboxLaunchRefusedError) as info:
+        execute(
+            ExecutionRequest(
+                command=["/bin/true"], sandbox=_description(tmp_path), contain_orphans=True
+            )
+        )
+    assert named in str(info.value)
+    assert "preexec_fn" not in str(info.value)
+    assert sandbox_bwrap.classify(str(info.value)).key == capability
+    facts = info.value.facts
+    assert isinstance(facts, SandboxFacts) and not facts.enforced
+    assert named in facts.setup_failure
+    # Fail-closed: bwrap never ran, so neither did the command.
+    assert fake_bwrap.log() == []
+    assert not executor._CONTAINMENT_LOCK.locked()
+
+
+@_linux_only
+@pytest.mark.parametrize(("failing", "capability", "named"), _SCOPE_FAILURES)
+def test_the_probe_tells_a_keyring_failure_from_a_landlock_one(
+    tmp_path: Path,
+    fake_bwrap: FakeBwrap,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
+    capability: str,
+    named: str,
+) -> None:
+    """The probe's launch, end to end, names which scope capability failed (PR #231 R2-F4)."""
+    monkeypatch.setattr(sandbox_bwrap, "_landlock_abi", lambda _syscall: 6)
+    monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _scope_failing_at(failing))
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert not result.supported
+    assert result.capability is not None and result.capability.key == capability
+    assert named in result.reason
+    assert fake_bwrap.log() == []
 
 
 # ------------------------------------------------------- how an end is read
