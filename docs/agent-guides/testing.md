@@ -451,7 +451,16 @@ Four more files, the same split by what they need from the host:
   time and no further than its bound; the sandbox directories and their sizes (D8.5);
   loopback and wildcard TCP listeners from a fake `/proc/net`, X11 flagged
   (D9.3); operator paths over a denied root (D15.4); and no `gh` call in
-  LOCAL.
+  LOCAL. Its denied roots are the run's own (PR #231 R2-F1): for the
+  default LOCAL state, a relative `--state-dir` and a relative
+  `state_dir`, they equal the gate's. Its operator-path row fails exactly
+  where the gate refuses the step, and an `OPENCODE_DB` in the state
+  directory refuses OpenCode's row with nothing launched. A provider's
+  `--version` gets a launch's environment (R2-F2): an operator's
+  `OPENCODE_CONFIG_DIR` is replaced by the launch's own directory, which
+  exists while the probe runs. A `CLAUDE_CONFIG_DIR` link in the home is
+  spelled as the directory it leads to. A token across the version line's
+  clip leaves no fragment in the text or JSON output (R2-F3).
 - `tests/test_sandbox_routing.py` runs real `bwrap` and skips its whole
   module with the probe's reason when this host cannot enforce, as
   `test_sandbox_bwrap.py` does (also off Linux and without
@@ -476,6 +485,12 @@ Four more files, the same split by what they need from the host:
   to it, a fake Claude Code reading and writing through a linked
   `CLAUDE_CONFIG_DIR` and reading linked default login and settings files,
   and a fake OpenCode creating its database through a linked directory.
+  It also covers `doctor`'s sandboxed `--version` run through the same
+  backend, with the environment a launch gets (PR #231 R2-F2). A fake
+  Claude Code needs its linked `CLAUDE_CONFIG_DIR` to lead to a directory
+  inside. A fake OpenCode needs an empty, writable `OPENCODE_CONFIG_DIR`
+  of its own, although the operator's names their configuration root.
+  Both rows pass, and the operator's directory is left unwritten.
 - `tests/test_sandbox_parity.py` (#169, D13.5) runs real `bwrap` and skips
   as the other two do. One probe runs in every launch path: Claude Code
   text and `stream-json`, OpenCode, Pi's RPC child and its `auth check`
