@@ -371,6 +371,8 @@ def describe_requirements(needs: ProviderRequirements) -> str:
     parts = [f"executable {needs.executable or '(not found)'}"]
     if needs.install_roots or needs.config:
         parts.append("read-only " + ", ".join([*needs.install_roots, *needs.config]))
+    if needs.spelled_paths:
+        parts.append("reached as written, through its links: " + ", ".join(needs.spelled_paths))
     if needs.home_config:
         parts.append("read-only in the private home " + ", ".join(needs.home_config))
     if needs.state:

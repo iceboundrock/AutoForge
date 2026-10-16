@@ -20,6 +20,7 @@ from autoforge.sandbox import (
     Access,
     Bind,
     LaunchDescription,
+    Link,
     Mask,
     NetworkPosition,
     Overlay,
@@ -439,6 +440,7 @@ def test_an_interpreter_installed_under_a_prefix_brings_its_library(tmp_path):
         assert root == str(prefix / "bin"), prefix
 
 
+@pytest.mark.skipif(not os.access("/usr/bin/env", os.X_OK), reason="no /usr/bin/env on this host")
 def test_a_script_brings_its_interpreter(tmp_path):
     base = Path(os.path.realpath(tmp_path))
     interp_dir = base / "runtime" / "bin"
@@ -453,13 +455,109 @@ def test_a_script_brings_its_interpreter(tmp_path):
     tool.chmod(0o755)
     search = f"{tool_dir}:{interp_dir}:/usr/bin"
     assert interpreter_of(str(tool), search) == str(interp)
-    executable, roots, path_dirs = executable_requirements(
+    executable, roots, path_dirs, spelled = executable_requirements(
         "agent", home=str(base / "home"), search_path=search
     )
     assert executable == str(tool)
-    assert roots == (str(tool_dir), str(interp_dir))
+    # The kernel runs ``env`` as written; it looks the name up on PATH,
+    # whose first entry is the name's directory.
+    env_root = install_root(os.path.realpath("/usr/bin/env"), str(base / "home"))
+    assert roots == (str(tool_dir), env_root, str(interp_dir))
     assert path_dirs == (str(interp_dir),)
-    assert executable_requirements("no-such-agent", home="/h", search_path=search) == ("", (), ())
+    assert spelled == ("/usr/bin/env",)
+    missing = executable_requirements("no-such-agent", home="/h", search_path=search)
+    assert missing == ("", (), (), ())
+
+
+def test_an_absolute_shebang_through_a_link_is_reached_as_written(tmp_path):
+    """#225: ``#!<base>/alias/bin/python3``, a link to the real interpreter
+    in a directory no root projects. The interpreter's root is projected as
+    before, and the line, as written, is a spelled path: the description
+    recreates that one link, not ``alias/bin``, which is neither a root nor
+    a ``PATH`` entry inside, and the kernel's lookup of the line inside
+    reaches the interpreter."""
+    paths = _layout(tmp_path)
+    base, home = paths["base"], str(paths["home"])
+    interp = base / "runtime" / "bin" / "python3.14"
+    interp.parent.mkdir(parents=True)
+    (base / "runtime" / "lib").mkdir()
+    interp.write_text("#!/bin/sh\n")
+    interp.chmod(0o755)
+    shebang = _linked(base / "alias" / "bin" / "python3", interp)
+    (base / "alias" / "bin" / "pip").write_text("")
+    tool = base / "tool" / "agent"
+    tool.parent.mkdir()
+    tool.write_text(f"#!{shebang}\nprint(1)\n")
+    tool.chmod(0o755)
+    search = f"{tool.parent}:{shebang.parent}:/usr/bin"
+    assert interpreter_of(str(tool), search) == str(interp)
+    assert executable_requirements("agent", home=home, search_path=search) == (
+        str(tool),
+        (str(tool.parent), str(base / "runtime")),
+        (str(interp.parent),),
+        (str(shebang),),
+    )
+    env = {"PATH": search}
+    needs = ClaudeCodeProvider().sandbox_requirements(_profile("claude"), ["agent"], env, home)
+    assert needs.spelled_paths == (str(shebang),)
+    description = describe_launch(_remote(paths), needs, env)
+    alias = [m for m in description.mounts if m.target.startswith(f"{base / 'alias'}/")]
+    assert alias == [Link(str(shebang), str(interp))]
+    assert description.resolve_inside(str(shebang)) == str(interp)
+    assert description.inside_path(str(shebang.parent / "pip")) is None
+    assert dict(description.env_set)["PATH"] == f"{interp.parent}:{tool.parent}:/usr/bin"
+
+
+@pytest.mark.parametrize("where", ["system", "own"])
+def test_an_absolute_env_through_a_link_is_reached_as_written(tmp_path, where):
+    """#225 R1-F1: ``#!<base>/alias/bin/env node``, a link in a directory no
+    root projects to the system's ``/usr/bin/env`` or to an ``env`` in its
+    own prefix. The kernel runs that ``env`` as written, so the line is a
+    spelled path and its program's root is projected, as an interpreter's
+    is; ``env`` still finds ``node`` on ``PATH``, whose first entry is the
+    directory of ``node``. Only the one link is recreated, not ``alias/bin``."""
+    paths = _layout(tmp_path)
+    base, home = paths["base"], str(paths["home"])
+    if where == "system":
+        if not os.access("/usr/bin/env", os.X_OK):
+            pytest.skip("no /usr/bin/env on this host")
+        target = Path("/usr/bin/env")
+    else:
+        target = base / "coreutils" / "bin" / "env"
+        target.parent.mkdir(parents=True)
+        (base / "coreutils" / "lib").mkdir()
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o755)
+    real_env = os.path.realpath(target)
+    shebang = _linked(base / "alias" / "bin" / "env", target)
+    (base / "alias" / "bin" / "pip").write_text("")
+    interp = base / "runtime" / "bin" / "node"
+    interp.parent.mkdir(parents=True)
+    (base / "runtime" / "lib").mkdir()
+    interp.write_text("#!/bin/sh\n")
+    interp.chmod(0o755)
+    tool = base / "tool" / "agent"
+    tool.parent.mkdir()
+    tool.write_text(f"#!{shebang} node\nconsole.log(1)\n")
+    tool.chmod(0o755)
+    search = f"{tool.parent}:{interp.parent}:/usr/bin"
+    assert interpreter_of(str(tool), search) == str(interp)
+    assert executable_requirements("agent", home=home, search_path=search) == (
+        str(tool),
+        (str(tool.parent), install_root(real_env, home), str(base / "runtime")),
+        (str(interp.parent),),
+        (str(shebang),),
+    )
+    env = {"PATH": search}
+    needs = ClaudeCodeProvider().sandbox_requirements(_profile("claude"), ["agent"], env, home)
+    assert needs.spelled_paths == (str(shebang),)
+    description = describe_launch(_remote(paths), needs, env)
+    alias = [m for m in description.mounts if m.target.startswith(f"{base / 'alias'}/")]
+    assert alias == [Link(str(shebang), str(target))]
+    assert description.resolve_inside(str(shebang)) == real_env
+    assert description.inside_path(real_env) == real_env
+    assert description.inside_path(str(shebang.parent / "pip")) is None
+    assert dict(description.env_set)["PATH"] == f"{interp.parent}:{tool.parent}:/usr/bin"
 
 
 # ------------------------------------------------------------- the declarations

@@ -152,12 +152,15 @@ class ProviderRequirements:
     writable; ``path_dirs`` are put first on ``PATH``; ``path_names`` are
     the provider's path-valued variables (D8.2). ``operator_config_roots``
     are where the CLI loads the operator's own settings, hooks and
-    extensions from (D7.2).
+    extensions from (D7.2). ``spelled_paths`` are paths the launch names as
+    written (a script's absolute ``#!`` interpreter): each leads inside
+    where it leads on the host, through the links on its way (#225).
     """
 
     executable: str = ""
     install_roots: tuple[str, ...] = ()
     path_dirs: tuple[str, ...] = ()
+    spelled_paths: tuple[str, ...] = ()
     config: tuple[str, ...] = ()
     home_config: tuple[str, ...] = ()
     state: tuple[str, ...] = ()
@@ -315,6 +318,7 @@ def sandbox_request(
         denied_roots=tuple(dict.fromkeys(facts.denied_roots)),
         operator_config_roots=declared.operator_roots,
         keyring_items=declared.keyring,
+        spelled_paths=declared.spelled,
         network=network,
         env=declared.env,
     )
@@ -354,6 +358,7 @@ class _Declared:
     env: tuple[tuple[str, str], ...]
     keyring: tuple[str, ...]
     operator_roots: tuple[str, ...]
+    spelled: tuple[str, ...] = ()
 
 
 def _declared(
@@ -433,7 +438,11 @@ def _declared(
         if item.env_name:
             env.append((item.env_name, item.target or item.source))
     return _Declared(
-        tuple(projections), tuple(env), tuple(keyring), tuple(needs.operator_config_roots)
+        tuple(projections),
+        tuple(env),
+        tuple(keyring),
+        tuple(needs.operator_config_roots),
+        tuple(needs.spelled_paths),
     )
 
 
@@ -465,6 +474,7 @@ def provider_request(
         denied_roots=tuple(dict.fromkeys(denied_roots)),
         operator_config_roots=declared.operator_roots,
         keyring_items=declared.keyring,
+        spelled_paths=declared.spelled,
         env=declared.env,
     )
 
@@ -838,21 +848,20 @@ def install_root(path: str, home: str) -> str:
     return path if parent == "/" else parent
 
 
-def interpreter_of(executable: str, search_path: str | None) -> str:
-    """The resolved interpreter an executable script names (``#!``), or "".
-
-    ``#!/usr/bin/env [-S] name`` is looked up on ``search_path``, as ``env``
-    would do inside. Only the first line is read.
-    """
+def _shebang(executable: str) -> list[str]:
+    """The words of an executable's ``#!`` line, ``[]`` without one. Only
+    the first line is read."""
     try:
         with open(executable, "rb") as handle:
             head = handle.read(_SHEBANG_BYTES)
     except OSError:
-        return ""
+        return []
     if not head.startswith(b"#!"):
-        return ""
-    line = head[2:].split(b"\n", 1)[0].decode("utf-8", "replace").strip()
-    words = line.split()
+        return []
+    return head[2:].split(b"\n", 1)[0].decode("utf-8", "replace").split()
+
+
+def _interpreter(words: list[str], search_path: str | None) -> str:
     if not words:
         return ""
     program = words[0]
@@ -864,22 +873,42 @@ def interpreter_of(executable: str, search_path: str | None) -> str:
     return resolve_command(program, search_path)
 
 
+def interpreter_of(executable: str, search_path: str | None) -> str:
+    """The resolved interpreter an executable script names (``#!``), or "".
+
+    ``#!/usr/bin/env [-S] name`` is looked up on ``search_path``, as ``env``
+    would do inside. Only the first line is read.
+    """
+    return _interpreter(_shebang(executable), search_path)
+
+
 def executable_requirements(
     command: str, *, home: str, search_path: str | None
-) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
-    """``(executable, install roots, PATH dirs)`` for the command a launch names.
+) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """``(executable, install roots, PATH dirs, spelled paths)`` for the command a launch names.
 
     The executable resolved on the host; its install root; and, for a
     script, its interpreter's install root and directory, which goes first
-    on ``PATH`` so that ``#!/usr/bin/env node`` finds it inside.
+    on ``PATH`` so that ``#!/usr/bin/env node`` finds it inside. An
+    absolute ``#!`` path, ``env``'s too, is also a spelled path, as
+    written, and its resolved program's install root is projected: the
+    kernel looks it up so, and a link on its way, such as Homebrew's
+    ``opt/`` into ``Cellar/``, need not lie in any root projected (#225).
     """
     executable = resolve_command(command, search_path)
     if not executable:
-        return "", (), ()
+        return "", (), (), ()
     roots = [install_root(executable, home)]
     path_dirs: list[str] = []
-    interpreter = interpreter_of(executable, search_path)
+    spelled: list[str] = []
+    words = _shebang(executable)
+    program = resolve_command(words[0], search_path) if words and words[0].startswith("/") else ""
+    if program:
+        # What the kernel runs, as written: ``env`` is no exception (R1-F1).
+        roots.append(install_root(program, home))
+        spelled.append(words[0])
+    interpreter = _interpreter(words, search_path)
     if interpreter:
         roots.append(install_root(interpreter, home))
         path_dirs.append(posixpath.dirname(interpreter))
-    return executable, tuple(dict.fromkeys(roots)), tuple(path_dirs)
+    return executable, tuple(dict.fromkeys(roots)), tuple(path_dirs), tuple(spelled)

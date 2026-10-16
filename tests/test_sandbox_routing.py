@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import threading
@@ -496,6 +497,120 @@ def test_opencode_finds_a_database_through_a_linked_directory(backend, layout, m
     req = _agent_request(paths, "opencode", fake)
     assert _report(OpenCodeProvider().execute(req)) == {"database": "ok"}
     assert (real / "af.db").exists()
+
+
+def _alias_layout(base: Path, shape: str) -> tuple[Path, dict[str, list[str]]]:
+    """An interpreter path that reaches the real one through links in
+    directories no root projects, with a sentinel beside every link; and,
+    for each directory on the way, what it holds inside: only the next step.
+
+    ``shape``: ``link``, one ``alias/bin/python3`` linking to the system
+    interpreter; ``dotdot``, the same link passing through ``transit/`` and
+    out of it by ``..`` on the way (PR #232 R2-F1), a sentinel in
+    ``transit``; ``chain``, a Homebrew-shaped
+    ``opt/python -> ../Cellar/python/3.14``, whose ``bin/python3`` links to
+    the system interpreter.
+    """
+    if shape in ("link", "dotdot"):
+        holds = {str(base / "alias"): ["bin"], str(base / "alias" / "bin"): ["python3"]}
+        target = Path(PY)
+        if shape == "dotdot":
+            transit = base / "transit"
+            _sentinel(transit / "notes.txt")
+            target = Path("../../transit") / os.path.relpath(PY, transit)
+            holds[str(transit)] = []
+        shebang = _linked(base / "alias" / "bin" / "python3", target)
+        _sentinel(base / "alias" / "bin" / "pip")
+        _sentinel(base / "alias" / "notes.txt")
+        return shebang, holds
+    cellar = base / "brew" / "Cellar" / "python" / "3.14"
+    _linked(cellar / "bin" / "python3", Path(PY))
+    _sentinel(cellar / "bin" / "pip")
+    _sentinel(cellar / "LICENSE")
+    _linked(base / "brew" / "opt" / "python", Path("../Cellar/python/3.14"))
+    _sentinel(base / "brew" / "opt" / "openssl" / "lib" / "libssl.so")
+    _sentinel(base / "brew" / "Cellar" / "openssl" / "LICENSE")
+    shebang = base / "brew" / "opt" / "python" / "bin" / "python3"
+    holds = {
+        str(base / "brew"): ["Cellar", "opt"],
+        str(base / "brew" / "opt"): ["python"],
+        str(base / "brew" / "Cellar"): ["python"],
+        str(cellar): ["bin"],
+        str(cellar / "bin"): ["python3"],
+    }
+    return shebang, holds
+
+
+@pytest.mark.parametrize("shape", ["link", "dotdot", "chain"])
+def test_a_script_whose_absolute_shebang_names_a_link_launches(backend, layout, monkeypatch, shape):
+    """#225: a fake agent whose ``#!`` names, as written, a link to the real
+    interpreter in a directory no root projects. The kernel looks the line
+    up as written, so each link on its way is recreated inside, and each
+    directory it leaves by ``..`` is made there, empty (PR #232 R2-F1): the
+    script runs, its interpreter sees the spelling it was started by, and
+    every directory on the way holds only the next step (nothing beside a
+    link, no file of the alias's directory or of the one left, is
+    visible)."""
+    paths = layout
+    shebang, holds = _alias_layout(paths["base"], shape)
+    script = (
+        f"#!{shebang}\n{_PROBE}\n"
+        "report = {'executable': sys.executable, 'listings': {}}\n"
+        f"for path in {sorted(holds)!r}:\n"
+        "    report['listings'][path] = sorted(os.listdir(path))\n"
+        f"report['sibling'] = attempt(lambda: read({str(shebang.parent / 'pip')!r}))\n"
+        "print(json.dumps(report))\n"
+    )
+    fake = _sentinel(paths["base"] / "tools" / "claude" / "bin" / "claude", script)
+    fake.chmod(0o755)
+    monkeypatch.setenv("HOME", str(paths["home"]))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    req = _agent_request(paths, "claude", fake, output_format="text")
+    report = _report(ClaudeCodeProvider().execute(req))
+    assert report == {"executable": str(shebang), "listings": holds, "sibling": "ENOENT"}
+
+
+@pytest.mark.skipif(not os.access("/usr/bin/env", os.X_OK), reason="no /usr/bin/env on this host")
+@pytest.mark.parametrize("where", ["system", "own"])
+def test_a_script_whose_absolute_env_names_a_link_launches(backend, layout, monkeypatch, where):
+    """#225 R1-F1: a fake agent whose ``#!`` names, as written, a link in a
+    directory no root projects to ``env``: the system's ``/usr/bin/env``, or
+    a copy of it in its own prefix. The kernel runs that ``env`` as written,
+    so its link is recreated inside and its root shown, and ``env`` finds
+    the interpreter on ``PATH``: the script runs, and every directory on the
+    way holds only the next step (no file beside the link is visible)."""
+    paths = layout
+    base = paths["base"]
+    if where == "system":
+        target = Path("/usr/bin/env")
+    else:
+        target = base / "coreutils" / "bin" / "env"
+        target.parent.mkdir(parents=True)
+        (base / "coreutils" / "lib").mkdir()
+        shutil.copy2(os.path.realpath("/usr/bin/env"), target)
+    shebang = _linked(base / "alias" / "bin" / "env", target)
+    _sentinel(base / "alias" / "bin" / "pip")
+    _sentinel(base / "alias" / "notes.txt")
+    holds = {str(base / "alias"): ["bin"], str(base / "alias" / "bin"): ["env"]}
+    script = (
+        f"#!{shebang} {Path(PY).name}\n{_PROBE}\n"
+        "report = {'interpreter': os.path.realpath(sys.executable), 'listings': {}}\n"
+        f"for path in {sorted(holds)!r}:\n"
+        "    report['listings'][path] = sorted(os.listdir(path))\n"
+        f"report['sibling'] = attempt(lambda: read({str(shebang.parent / 'pip')!r}))\n"
+        "print(json.dumps(report))\n"
+    )
+    fake = _sentinel(paths["base"] / "tools" / "claude" / "bin" / "claude", script)
+    fake.chmod(0o755)
+    monkeypatch.setenv("HOME", str(paths["home"]))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    req = _agent_request(paths, "claude", fake, output_format="text")
+    report = _report(ClaudeCodeProvider().execute(req))
+    assert report == {
+        "interpreter": os.path.realpath(PY),
+        "listings": holds,
+        "sibling": "ENOENT",
+    }
 
 
 def test_doctor_launches_each_providers_version_as_a_launch_would(backend, tmp_path, monkeypatch):

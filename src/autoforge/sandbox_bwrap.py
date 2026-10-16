@@ -77,6 +77,7 @@ from .sandbox import (
     TEARDOWN_UNCOUNTED,
     Access,
     Bind,
+    Dir,
     LaunchDescription,
     Link,
     Mask,
@@ -346,6 +347,8 @@ def _options(
         elif isinstance(mount, Overlay):
             opts += ["--overlay-src", mount.lower, "--overlay", mount.upper, mount.work]
             opts.append(mount.target)
+        elif isinstance(mount, Dir):
+            opts += ["--dir", mount.target]
         elif isinstance(mount, Link):
             opts += ["--symlink", mount.points_to, mount.target]
     for target in masks:
