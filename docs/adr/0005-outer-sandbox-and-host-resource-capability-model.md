@@ -1387,22 +1387,26 @@ Each symbolic link on its way that nothing of the description shows is
 recreated as a link at its host path, where nothing is mounted (the empty
 root, the private home or temp), as the links on the way to the home
 (D8.1) and the system runtime's top-level links are. The directories that
-hold those links are made on the way, empty, and never projected. The
+hold those links are made on the way, empty, and never projected. So is a
+directory the path leaves by `..` that nothing else makes, since the
+kernel leaves a directory only from inside it (PR #232 R2-F1:
+`../transit/../runtime/bin/sh`, with `transit` shown nowhere). The
 launch is refused before the spawn, naming the path (rule
 `D13.1 spelled path`, or C4 and D4.3 for a denied root and a forbidden
-source), when a link would lie in a mask, a denied root, a forbidden source
-or a kernel filesystem, when the path loops, or when it does not lead to
-where its resolved program is shown. In `#!/usr/bin/env name` that program
-is `env`, which the kernel looks up as written like any other: its path is
-a spelled path, and its resolved install root is projected as an
-interpreter's is (PR #232 R1-F1: an `env` reached through a link no root
-shows). `name` is not a spelled path: `env` looks it up on `PATH`, whose
+source), when a link or a directory made would lie in a mask, a denied
+root, a forbidden source or a kernel filesystem, when the path loops, or
+when it does not lead to where its resolved program is shown. In
+`#!/usr/bin/env name` that program is `env`, which the kernel looks up as
+written like any other: its path is a spelled path, and its resolved
+install root is projected as an interpreter's is (PR #232 R1-F1: an `env`
+reached through a link no root shows). `name` is not a spelled path: `env` looks it up on `PATH`, whose
 first entry is the interpreter's directory. Tests: `tests/test_sandbox.py`
-(the links, each refusal), `tests/test_sandbox_policy.py` (the declaration
-and its description), `tests/test_doctor_sandbox.py` (the row) and
-`tests/test_sandbox_routing.py` (a fake agent behind one link, behind a
-Homebrew-shaped chain and behind a link to `env`, through the real
-backend).
+(the links, the directories left by `..`, each refusal),
+`tests/test_sandbox_policy.py` (the declaration and its description),
+`tests/test_doctor_sandbox.py` (the row) and `tests/test_sandbox_routing.py`
+(a fake agent behind one link, behind one passing through a directory it
+leaves by `..`, behind a Homebrew-shaped chain and behind a link to `env`,
+through the real backend).
 
 *Rationale.* Projecting the directory that holds a link would show
 everything beside it: a Homebrew `opt/` directory links to every installed

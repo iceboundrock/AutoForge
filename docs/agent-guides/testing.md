@@ -298,9 +298,12 @@ exactly when `tests/sandbox_host.py` measures the host capable
     writable projection; C6 records a covered read-only declaration; a
     spelled path (#225) gets each link on its way recreated in the empty
     root, the private temp or the private home, relative contents and
-    all, and nothing beside it, needs none when a projection shows its
-    links, and is refused through a link in a mask, a denied root,
-    `~/.ssh` or `/proc`, or to an interpreter nothing shows;
+    all, and nothing beside it, and each directory it leaves by `..` made
+    there, empty (`--dir`), unless a link below it makes it (PR #232
+    R2-F1), needs none when a projection shows its links, and is refused
+    through a link in a mask, a denied root, `~/.ssh` or `/proc`, leaving
+    a directory in a denied root or `~/.ssh`, or to an interpreter
+    nothing shows;
   - the backend's options: the namespaces and `--die-with-parent` always,
     `--unshare-net` only on request, never `--disable-userns`,
     `--new-session` or `--as-pid-1`; masks remounted read-only after their
@@ -497,11 +500,12 @@ Four more files, the same split by what they need from the host:
   `CLAUDE_CONFIG_DIR` and reading linked default login and settings files,
   and a fake OpenCode creating its database through a linked directory.
   A fake agent whose absolute `#!` names a link outside every root, one
-  link or a Homebrew-shaped `opt/` to `Cellar/` chain, runs inside with
+  link, one passing through a directory it leaves by `..` (PR #232
+  R2-F1), or a Homebrew-shaped `opt/` to `Cellar/` chain, runs inside with
   its interpreter seeing that spelling, and every directory on the way
-  holds only the next link; so does one whose `#!` names a link there to
-  `env`, the system's or a copy in its own prefix, that finds the
-  interpreter on `PATH` (#225).
+  holds only the next link, the one left by `..` nothing; so does one
+  whose `#!` names a link there to `env`, the system's or a copy in its
+  own prefix, that finds the interpreter on `PATH` (#225).
   It also covers `doctor`'s sandboxed `--version` run through the same
   backend, with the environment a launch gets (PR #231 R2-F2). A fake
   Claude Code needs its linked `CLAUDE_CONFIG_DIR` to lead to a directory

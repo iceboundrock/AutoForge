@@ -187,6 +187,21 @@ def _spelled_through(
     return _request(b, spelled_paths=(link,), **kw), link, rule
 
 
+def _spelled_leaving(
+    b: Path, left: Path, rule: str, **kw: object
+) -> tuple[SandboxRequest, str, str]:
+    """A spelled path that is a link passing through the directory ``left``
+    and out of it by ``..`` to the interpreter, refused under ``rule``,
+    naming ``left``."""
+    interpreter = _interpreter(b)
+    _dir(left)
+    link = b / "alias" / "python3"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(f"{left}/../{os.path.relpath(interpreter, left.parent)}")
+    kw.setdefault("projections", (_runtime(b),))
+    return _request(b, spelled_paths=(str(link),), **kw), str(left), rule
+
+
 def _home_child(rel: str, file: bool = False):
     def build(b: Path) -> tuple[SandboxRequest, str, str]:
         path = b / "home" / rel
@@ -491,6 +506,12 @@ CASES = {
     "a spelled path to an interpreter nothing shows": lambda b: _spelled_through(
         b, b / "alias", "D13.1 spelled path", projections=()
     ),
+    "a spelled path leaving a directory in a denied root": lambda b: _spelled_leaving(
+        b, b / "state", "C4 denied roots", denied_roots=(str(b / "state"),)
+    ),
+    "a spelled path leaving ~/.ssh": lambda b: _spelled_leaving(
+        b, b / "home" / ".ssh", "D4.3 forbidden source"
+    ),
 }
 
 
@@ -693,6 +714,53 @@ def test_a_spelled_path_gets_each_link_on_its_way_and_nothing_beside_it(
     ]
     assert description.resolve_inside(spelled) == interpreter
     assert description.inside_path(str(keg / "bin" / "pip")) is None
+    _parents_first(description)
+
+
+@pytest.mark.parametrize("where", ["empty root", "private temp", "private home"])
+def test_a_spelled_path_gets_each_directory_it_leaves_by_dotdot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """PR #232 R2-F1: links whose contents pass through a directory nothing
+    projects and leave it by ``..`` (``../transit/../...``). The kernel
+    leaves a directory only from inside it, so each one that nothing else
+    makes is made inside, empty (``transit``; ``deep/sub``, whose parent it
+    makes too), and the host's files in it stay hidden; one that a link
+    below it makes (``via``) needs no entry of its own."""
+    b = _base(tmp_path)
+    if where == "private temp":
+        monkeypatch.setattr(sandbox, "PRIVATE_TMP", str(b))
+    elif where == "empty root":
+        monkeypatch.setattr(sandbox, "PRIVATE_TMP", "/nonexistent-autoforge-tmp")
+    top = b / "home" / "tools" if where == "private home" else b / "spelled"
+    interpreter = _interpreter(b)
+    up = os.path.relpath(interpreter, top)
+    _file(top / "transit" / "notes.txt")
+    _file(top / "deep" / "sub" / "notes.txt")
+    _dir(top / "via")
+    (top / "via" / "python3").symlink_to(interpreter)
+    contents = {
+        "python3": f"../transit/../{up}",
+        "nested": f"../deep/sub/../../{up}",
+        "back": "../via/../via/python3",
+    }
+    _dir(top / "alias")
+    for name, points_to in contents.items():
+        (top / "alias" / name).symlink_to(points_to)
+    spelled = tuple(str(top / "alias" / name) for name in contents)
+    description = compile_launch(_request(b, projections=(_runtime(b),), spelled_paths=spelled))
+    inside = [m for m in description.mounts if m.target.startswith(f"{top}/")]
+    assert inside == [
+        *(Link(str(top / "alias" / name), contents[name]) for name in sorted(contents)),
+        sandbox.Dir(str(top / "deep" / "sub")),
+        sandbox.Dir(str(top / "transit")),
+        Link(str(top / "via" / "python3"), interpreter),
+    ]
+    for path in spelled:
+        assert description.resolve_inside(path) == interpreter
+    assert description.inside_path(str(top / "transit" / "notes.txt")) is None
+    opts = _options(description)
+    assert opts[opts.index(str(top / "transit")) - 1] == "--dir"
     _parents_first(description)
 
 

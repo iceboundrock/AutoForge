@@ -499,20 +499,30 @@ def test_opencode_finds_a_database_through_a_linked_directory(backend, layout, m
     assert (real / "af.db").exists()
 
 
-def _alias_layout(base: Path, chain: bool) -> tuple[Path, dict[str, list[str]]]:
+def _alias_layout(base: Path, shape: str) -> tuple[Path, dict[str, list[str]]]:
     """An interpreter path that reaches the real one through links in
     directories no root projects, with a sentinel beside every link; and,
     for each directory on the way, what it holds inside: only the next step.
 
-    ``chain``: a Homebrew-shaped ``opt/python -> ../Cellar/python/3.14``,
-    whose ``bin/python3`` links to the system interpreter; else one
-    ``alias/bin/python3`` linking to it.
+    ``shape``: ``link``, one ``alias/bin/python3`` linking to the system
+    interpreter; ``dotdot``, the same link passing through ``transit/`` and
+    out of it by ``..`` on the way (PR #232 R2-F1), a sentinel in
+    ``transit``; ``chain``, a Homebrew-shaped
+    ``opt/python -> ../Cellar/python/3.14``, whose ``bin/python3`` links to
+    the system interpreter.
     """
-    if not chain:
-        shebang = _linked(base / "alias" / "bin" / "python3", Path(PY))
+    if shape in ("link", "dotdot"):
+        holds = {str(base / "alias"): ["bin"], str(base / "alias" / "bin"): ["python3"]}
+        target = Path(PY)
+        if shape == "dotdot":
+            transit = base / "transit"
+            _sentinel(transit / "notes.txt")
+            target = Path("../../transit") / os.path.relpath(PY, transit)
+            holds[str(transit)] = []
+        shebang = _linked(base / "alias" / "bin" / "python3", target)
         _sentinel(base / "alias" / "bin" / "pip")
         _sentinel(base / "alias" / "notes.txt")
-        return shebang, {str(base / "alias"): ["bin"], str(base / "alias" / "bin"): ["python3"]}
+        return shebang, holds
     cellar = base / "brew" / "Cellar" / "python" / "3.14"
     _linked(cellar / "bin" / "python3", Path(PY))
     _sentinel(cellar / "bin" / "pip")
@@ -531,16 +541,18 @@ def _alias_layout(base: Path, chain: bool) -> tuple[Path, dict[str, list[str]]]:
     return shebang, holds
 
 
-@pytest.mark.parametrize("chain", [False, True], ids=["link", "chain"])
-def test_a_script_whose_absolute_shebang_names_a_link_launches(backend, layout, monkeypatch, chain):
+@pytest.mark.parametrize("shape", ["link", "dotdot", "chain"])
+def test_a_script_whose_absolute_shebang_names_a_link_launches(backend, layout, monkeypatch, shape):
     """#225: a fake agent whose ``#!`` names, as written, a link to the real
     interpreter in a directory no root projects. The kernel looks the line
-    up as written, so each link on its way is recreated inside: the script
-    runs, its interpreter sees the spelling it was started by, and every
-    directory on the way holds only that link (nothing beside it, no file
-    of the alias's directory, is visible)."""
+    up as written, so each link on its way is recreated inside, and each
+    directory it leaves by ``..`` is made there, empty (PR #232 R2-F1): the
+    script runs, its interpreter sees the spelling it was started by, and
+    every directory on the way holds only the next step (nothing beside a
+    link, no file of the alias's directory or of the one left, is
+    visible)."""
     paths = layout
-    shebang, holds = _alias_layout(paths["base"], chain)
+    shebang, holds = _alias_layout(paths["base"], shape)
     script = (
         f"#!{shebang}\n{_PROBE}\n"
         "report = {'executable': sys.executable, 'listings': {}}\n"

@@ -17,7 +17,8 @@ and the declared requirements, both plain data (:class:`SandboxRequest`),
 into a description, applying ADR 0005's rules before anything is spawned:
 
 - **D4.1** the root is empty; every visible path is a projection, a mask, an
-  overlay, a link or a private mount the description names;
+  overlay, a link, an empty directory or a private mount the description
+  names;
 - **C1** every source is resolved with ``realpath`` on the host, and a
   relative or missing source is refused;
 - **C2** a controller-owned (:attr:`Origin.ENGINE`) source must resolve to
@@ -43,9 +44,10 @@ into a description, applying ADR 0005's rules before anything is spawned:
   directory on a provider's operator configuration root;
 - **D13.1** a spelled path (a script's absolute ``#!`` interpreter, which
   the kernel looks up as written) leads inside where it leads on the host:
-  each link on its way that nothing shows is recreated as a link, never by
+  each link on its way that nothing shows is recreated as a link, and each
+  directory it leaves by ``..`` that nothing makes is made empty, never by
   projecting the directory that holds it, and never in a mask, a denied
-  root, a forbidden source or a kernel filesystem (#225).
+  root, a forbidden source or a kernel filesystem (#225, PR #232 R2-F1).
 
 A refusal is a :class:`~autoforge.errors.SandboxPolicyError` naming the path
 and the rule, never a file's contents. The compiler is pure except for
@@ -189,6 +191,13 @@ class PrivateTmpfs:
 
 
 @dataclass(frozen=True)
+class Dir:
+    """An empty directory made at ``target``: nothing of the host's is in it."""
+
+    target: str
+
+
+@dataclass(frozen=True)
 class Link:
     """A symbolic link at ``target`` whose contents are ``points_to``."""
 
@@ -196,7 +205,7 @@ class Link:
     points_to: str
 
 
-Mount = Bind | Mask | Overlay | PrivateTmpfs | Link
+Mount = Bind | Mask | Overlay | PrivateTmpfs | Dir | Link
 
 
 def _clean(path: str) -> bool:
@@ -359,7 +368,7 @@ def _lookup(entries: list[Mount], path: str) -> tuple[bool, str | None]:
         except OSError:
             return False, None
         return True, None
-    return False, None  # in a mask, a private mount or the empty root
+    return False, None  # in a mask, a private mount, an empty directory or the empty root
 
 
 TEARDOWN_UNCOUNTED = "removed by namespace teardown, uncounted"
@@ -1150,18 +1159,22 @@ def _place_declared(proj: _Proj, entries: list[Mount], declared: list[_Proj]) ->
 _SPELLED = "D13.1 spelled path"
 
 
-def _spelled_links(path: str, entries: list[Mount], rules: _Rules) -> list[Link]:
-    """The links to recreate so that ``path``, as written, leads inside where it leads on the host.
+def _spelled_links(path: str, entries: list[Mount], rules: _Rules) -> list[Link | Dir]:
+    """The links and directories to recreate so that ``path``, as written,
+    leads inside where it leads on the host.
 
     Each component is looked up as the kernel would look it up inside
     (:meth:`LaunchDescription.resolve_inside`). One that is absent inside
-    but lies where nothing is shown (the empty root, a private mount) is
-    looked up on the host: a directory there is made on the way to a link
-    below it, and a link is recreated and followed. The directories that
-    hold the links are never projected, so nothing beside a link is visible
-    (D4.1). Refused, naming the path, when a link would lie in a mask, a
-    denied root, a forbidden source or a kernel filesystem, when the path
-    loops, and when it would not reach where its host target is shown.
+    but lies where nothing is shown (the empty root, a private mount, an
+    empty directory) is looked up on the host: a link is recreated and
+    followed, and a directory is made on the way to a link below it. The
+    kernel leaves a directory by ``..`` only from inside it, so one left
+    that way is made empty when nothing else makes it (PR #232 R2-F1). The
+    directories on the way are never projected, so nothing beside a link is
+    visible (D4.1). Refused, naming the path, when a link or a directory
+    made would lie in a mask, a denied root, a forbidden source or a kernel
+    filesystem, when the path loops, and when it would not reach where its
+    host target is shown.
     """
     label = f"the spelled path {path}"
     if not path.startswith("/") or "\0" in path:
@@ -1172,7 +1185,8 @@ def _spelled_links(path: str, entries: list[Mount], rules: _Rules) -> list[Link]
         raise _refuse(
             path, "C1 resolved source", f"{label} cannot be resolved ({exc.strerror})"
         ) from None
-    added: list[Link] = []
+    added: list[Link | Dir] = []
+    left: list[str] = []  # directories made on the way and left by ``..``
     pending = list(_parts(path))
     current = "/"
     followed = 0
@@ -1181,6 +1195,8 @@ def _spelled_links(path: str, entries: list[Mount], rules: _Rules) -> list[Link]
         if part == ".":
             continue
         if part == "..":
+            if current != "/" and not _lookup([*entries, *added], current)[0]:
+                left.append(current)
             current = posixpath.dirname(current)
             continue
         candidate = posixpath.join(current, part)
@@ -1188,7 +1204,7 @@ def _spelled_links(path: str, entries: list[Mount], rules: _Rules) -> list[Link]
         exists, link = _lookup(known, candidate)
         if not exists:
             covering = _innermost(known, candidate)
-            if covering is not None and not isinstance(covering, PrivateTmpfs):
+            if covering is not None and not isinstance(covering, PrivateTmpfs | Dir):
                 raise _refuse(
                     path, _SPELLED, f"{label} passes through {candidate}, which is not visible"
                 )
@@ -1199,13 +1215,13 @@ def _spelled_links(path: str, entries: list[Mount], rules: _Rules) -> list[Link]
                     path, _SPELLED, f"{label} passes through {candidate} ({exc.strerror})"
                 ) from None
             if stat.S_ISDIR(mode):
-                current = candidate  # made inside on the way to a link below it
+                current = candidate  # made inside: by a link below it, or left by ``..``
                 continue
             if not stat.S_ISLNK(mode):
                 raise _refuse(
                     path, _SPELLED, f"{label} passes through {candidate}, which is not visible"
                 )
-            _check_link_place(candidate, rules, label)
+            _check_place(candidate, rules, label, "a link")
             link = os.readlink(candidate)
             added.append(Link(candidate, link))
         elif link is None:
@@ -1217,6 +1233,11 @@ def _spelled_links(path: str, entries: list[Mount], rules: _Rules) -> list[Link]
         if link.startswith("/"):
             current = "/"
         pending = [p for p in link.split("/") if p] + pending
+    # Deepest first: a directory made makes its parents on the way.
+    for directory in sorted(set(left), key=lambda d: (-len(_parts(d)), d)):
+        if not any(_inside(entry.target, directory) for entry in [*entries, *added]):
+            _check_place(directory, rules, label, "a directory it leaves by '..'")
+            added.append(Dir(directory))
     shown = _inside_path([*entries, *added], real)
     if shown is None or current != shown:
         raise _refuse(
@@ -1229,25 +1250,25 @@ def _spelled_links(path: str, entries: list[Mount], rules: _Rules) -> list[Link]
     return added
 
 
-def _check_link_place(target: str, rules: _Rules, label: str) -> None:
-    """Where a link on a spelled path may be recreated: never in a denied
-    root, a forbidden source or a kernel filesystem."""
+def _check_place(target: str, rules: _Rules, label: str, what: str) -> None:
+    """Where a link or a directory on a spelled path may be recreated: never
+    in a denied root, a forbidden source or a kernel filesystem."""
     for root in _KERNEL_ROOTS:
         if _inside(target, root):
-            raise _refuse(target, _SPELLED, f"{label} passes through a link in {root}")
+            raise _refuse(target, _SPELLED, f"{label} passes through {what} in {root}")
     for denied in rules.denied:
         if _inside(target, denied):
             raise _refuse(
                 target,
                 "C4 denied roots",
-                f"{label} passes through a link in the denied root {denied}",
+                f"{label} passes through {what} in the denied root {denied}",
             )
     for forbidden, name in rules.forbidden:
         if _inside(target, forbidden):
             raise _refuse(
                 target,
                 "D4.3 forbidden source",
-                f"{label} passes through a link in {name} ({forbidden})",
+                f"{label} passes through {what} in {name} ({forbidden})",
             )
 
 
