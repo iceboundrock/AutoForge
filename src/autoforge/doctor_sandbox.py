@@ -36,7 +36,7 @@ from .config import SANDBOX_PREFERRED, AutoForgeConfig, ProfileConfig
 from .errors import AutoForgeError, ConfigurationError, ExecutionError, SandboxPolicyError
 from .executor import ExecutionRequest
 from .profiles import REQUIRED_PROFILES, local_required_profiles
-from .providers import PiProvider, provider_for
+from .providers import AgentProvider, PiProvider, provider_for
 from .redaction import redact
 from .sandbox import NetworkPosition, compile_launch
 from .sandbox_bwrap import ProbeResult
@@ -49,6 +49,7 @@ from .sandbox_policy import (
     class_summary,
     operator_path_problem,
     provider_request,
+    rewrite_environment,
     summary_facts,
 )
 
@@ -250,8 +251,44 @@ def _provider_row(
             if isinstance(provider, PiProvider)
             else [profile.command or profile.provider, "--version"]
         )
-        env = provider.launch_environment(cfg.execution.environment_names())
-        home = _engine._operator_home()
+    except (AutoForgeError, OSError) as exc:
+        return _row(name, False, f"its declaration cannot be read: {exc}", required=enforced)
+    try:
+        # As a launch is (``AgentProvider.execute``): the adapter's isolation
+        # over the allow-listed environment, its temporary files kept until
+        # the launch has ended.
+        with provider.integration_isolation() as isolation:
+            return _provider_probe(
+                doctor, cfg, provider, profile, version, isolation, probe, denied, name
+            )
+    except ExecutionError as exc:
+        return _row(name, False, f"its launch environment cannot be prepared: {exc}", enforced)
+
+
+def _provider_probe(
+    doctor: Doctor,
+    cfg: AutoForgeConfig,
+    provider: AgentProvider,
+    profile: ProfileConfig,
+    version: list[str],
+    isolation: dict[str, str],
+    probe: ProbeResult,
+    denied: tuple[str, ...],
+    name: str,
+) -> CheckResult:
+    """The declaration, compiled and launched with the environment a launch gets.
+
+    That environment is the allow-listed one with the adapter's isolation
+    over it (an operator's ``OPENCODE_CONFIG_DIR`` is replaced as at every
+    launch), and its path-valued names are spelled where they lead inside
+    (``rewrite_environment``, D8.2): a ``CLAUDE_CONFIG_DIR`` reached through
+    a link names the directory, which is what the CLI is given.
+    """
+    enforced = cfg.sandbox.enabled
+    allowlist = cfg.execution.environment_names()
+    env = {**provider.launch_environment(allowlist), **isolation}
+    home = _engine._operator_home()
+    try:
         needs = provider.sandbox_requirements(profile, version, env, home)
     except (AutoForgeError, OSError) as exc:
         return _row(name, False, f"its declaration cannot be read: {exc}", required=enforced)
@@ -259,7 +296,7 @@ def _provider_row(
     with tempfile.TemporaryDirectory(prefix="autoforge-doctor-") as scratch:
         workspace = os.path.realpath(scratch)
         try:
-            description = compile_launch(
+            compiled = compile_launch(
                 provider_request(
                     needs,
                     home=home,
@@ -269,6 +306,7 @@ def _provider_row(
                     denied_roots=denied,
                 )
             )
+            description = rewrite_environment(compiled, env, needs)
         except SandboxPolicyError as exc:
             return _row(
                 name,
@@ -306,7 +344,8 @@ def _provider_row(
                     command=[needs.executable, *version[1:]],
                     cwd=workspace,
                     timeout_seconds=doctor.timeout,
-                    env_allowlist=provider.launch_allowlist(cfg.execution.environment_names()),
+                    env_allowlist=provider.launch_allowlist(allowlist),
+                    env=isolation or None,
                     sandbox=description,
                 )
             )

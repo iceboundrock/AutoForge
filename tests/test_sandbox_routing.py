@@ -24,6 +24,7 @@ import pytest
 from autoforge import sandbox_bwrap
 from autoforge.agent_worktree import ObjectImportError, import_private_objects, read_candidate
 from autoforge.config import ProfileConfig, default_config
+from autoforge.doctor import Doctor
 from autoforge.errors import SandboxTamperError
 from autoforge.executor import ExecutionRequest, execute
 from autoforge.providers import AgentRequest, ClaudeCodeProvider, OpenCodeProvider, PiProvider
@@ -35,6 +36,7 @@ from .conftest import (
     GIT_IDENT,
     SYSTEM_PYTHON,
     FakeGitHub,
+    git_repo,
     make_local_engine,
     real_sandbox_backend,
 )
@@ -494,6 +496,63 @@ def test_opencode_finds_a_database_through_a_linked_directory(backend, layout, m
     req = _agent_request(paths, "opencode", fake)
     assert _report(OpenCodeProvider().execute(req)) == {"database": "ok"}
     assert (real / "af.db").exists()
+
+
+def test_doctor_launches_each_providers_version_as_a_launch_would(backend, tmp_path, monkeypatch):
+    """The doctor's sandboxed ``--version`` gets a launch's environment (PR #231 R2-F2).
+
+    A fake ``claude`` whose ``--version`` needs ``$CLAUDE_CONFIG_DIR``, a
+    link in the home, to lead to a directory inside, and a fake
+    ``opencode`` whose ``--version`` needs ``$OPENCODE_CONFIG_DIR`` to be
+    an empty directory it can write: the operator's is their configuration
+    root, which every launch replaces with one of its own. Through the real
+    backend, both rows pass, as both CLIs' launches do.
+    """
+    base = Path(os.path.realpath(tmp_path))
+    home = base / "home"
+    real = base / "claude-autoforge"
+    real.mkdir()
+    alias = _linked(home / ".claude-autoforge", real)
+    operator_config = _sentinel(home / ".config" / "opencode" / "opencode.json", "{}\n").parent
+    claude = _sentinel(
+        base / "tools" / "claude" / "bin" / "claude",
+        f"#!{PY}\nimport os, sys\n"
+        "if not os.path.isdir(os.environ.get('CLAUDE_CONFIG_DIR', '')):\n"
+        "    sys.exit(3)\n"
+        "print('fake-claude 9.9.9')\n",
+    )
+    opencode = _sentinel(
+        base / "tools" / "opencode" / "bin" / "opencode",
+        f"#!{PY}\nimport os, sys\n"
+        "config = os.environ.get('OPENCODE_CONFIG_DIR', '')\n"
+        "if not os.path.isdir(config) or os.listdir(config):\n"
+        "    sys.exit(3)\n"
+        "open(os.path.join(config, 'written'), 'w').close()\n"
+        "print('fake-opencode 9.9.9')\n",
+    )
+    for tool in (claude, opencode):
+        tool.chmod(0o755)
+    for name in list(os.environ):
+        if name.startswith(("CLAUDE_", "ANTHROPIC_", "OPENCODE_", "PI_")):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", f"{claude.parent}:{opencode.parent}:/usr/bin:/bin")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alias))
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(operator_config))
+    doctor = Doctor(cwd=str(git_repo(base / "repo")))
+    doctor.config = default_config()
+    doctor.config.sandbox.mode = "required"
+    rows = {r.name: r for r in doctor.sandbox_checks(local=True)}
+    shown = {
+        name.split("'")[1]: row for name, row in rows.items() if "outer sandbox: provider" in name
+    }
+    assert set(shown) == {"claude", "opencode"}
+    assert shown["claude"].ok, shown["claude"].detail
+    assert "inside the sandbox: fake-claude 9.9.9" in shown["claude"].detail
+    assert shown["opencode"].ok, shown["opencode"].detail
+    assert "inside the sandbox: fake-opencode 9.9.9" in shown["opencode"].detail
+    # The operator's configuration root was not the one given, nor written.
+    assert sorted(os.listdir(operator_config)) == ["opencode.json"]
 
 
 def _local_facts(paths, network=NetworkPosition.HOST) -> LaunchFacts:

@@ -33,14 +33,24 @@ class Runner:
         self.sandboxed: list = []
         self.commands: list[list[str]] = []
         self.stdout = stdout
+        # Per sandboxed launch: each path its ``env`` names, and whether it
+        # existed while the launch ran.
+        self.present: list[dict[str, bool]] = []
 
     def __call__(self, req):
         self.commands.append(list(req.command))
         assert req.command[0] != "gh", req.command
         if req.sandbox is not None:
             self.sandboxed.append(req)
+            paths = {v for v in (req.env or {}).values() if v.startswith("/")}
+            self.present.append({path: os.path.exists(path) for path in paths})
             return ExecutionResult(req.command, req.cwd, 0, self.stdout, "", "t", "t")
         return execute(req)
+
+    def launch_of(self, name: str):
+        """The sandboxed launch of the executable ``name``, and what it found present."""
+        (index,) = [i for i, req in enumerate(self.sandboxed) if req.command[0].endswith(name)]
+        return self.sandboxed[index], self.present[index]
 
 
 @pytest.fixture
@@ -199,6 +209,58 @@ def test_a_dir_rw_login_the_policy_refuses_is_named_with_the_alternatives(
     assert "every launch of it is refused" in claude.detail
     assert "dir-rw login may not be the provider's own configuration root" in claude.detail
     assert "(file-ro)" in claude.detail and "(env)" in claude.detail
+
+
+def test_an_operator_opencode_config_dir_is_replaced_as_at_every_launch(
+    tmp_path, host, monkeypatch
+):
+    """The probe runs in the launch's own isolation (PR #231 R2-F2).
+
+    Every OpenCode launch replaces the operator's ``OPENCODE_CONFIG_DIR``
+    (here their configuration root, which no launch may be given) with an
+    empty directory of its own, so the operator's refuses no launch and must
+    not refuse the probe either. That directory exists while the probe runs
+    and is removed with the launch.
+    """
+    own = host["home"] / ".config" / "opencode"
+    own.mkdir(parents=True)
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(own))
+    repo = git_repo(tmp_path / "repo")
+    runner = Runner()
+    rows = _rows(_doctor(repo, host, runner=runner).sandbox_checks(local=True))
+    (opencode,) = [r for n, r in rows.items() if n.startswith("provider opencode")]
+    assert opencode.ok and "inside the sandbox: fake-cli 1.2.3" in opencode.detail, opencode.detail
+    req, present = runner.launch_of("opencode")
+    config_dir = req.env["OPENCODE_CONFIG_DIR"]
+    assert config_dir != str(own) and present[config_dir]
+    assert req.env["OPENCODE_CONFIG_PROJECT_DISABLE"] == "1"
+    assert f"writable {config_dir}" in opencode.detail
+    assert not os.path.exists(config_dir)
+
+
+def test_a_linked_claude_config_dir_is_spelled_where_it_leads_inside(tmp_path, host, monkeypatch):
+    """The probe's environment is rewritten as a launch's is (PR #231 R2-F2, D8.2).
+
+    ``CLAUDE_CONFIG_DIR`` names a link in the home, which the private home
+    does not recreate: the probe's CLI is given the directory it leads to,
+    where it is inside, as every launch's is. Claude's isolation (the
+    launch's ``CLAUDE_ENV_FILE``) exists while the probe runs.
+    """
+    real = Path(os.path.realpath(tmp_path)) / "claude-autoforge"
+    real.mkdir()
+    alias = host["home"] / ".claude-autoforge"
+    alias.symlink_to(real)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alias))
+    repo = git_repo(tmp_path / "repo")
+    runner = Runner()
+    rows = _rows(_doctor(repo, host, runner=runner).sandbox_checks(local=True))
+    (claude,) = [r for n, r in rows.items() if n.startswith("provider claude")]
+    assert claude.ok, claude.detail
+    req, present = runner.launch_of("claude")
+    env = dict(req.sandbox.env_set)
+    assert env["CLAUDE_CONFIG_DIR"] == str(real)
+    assert req.sandbox.inside_path(str(real)) == str(real)
+    assert present[req.env["CLAUDE_ENV_FILE"]]
 
 
 def test_a_keyring_login_is_refused_and_the_alternatives_named(tmp_path):

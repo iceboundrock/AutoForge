@@ -541,7 +541,9 @@ never called sandboxed.
   a FAIL; LOCAL's `preferred` there is a WARN that launches will fall back.
   It also shows the policy each launch class gets; for each provider its
   declaration (paths and credential classes, never a value) and, when the
-  sandbox is enabled and the host can enforce, its `--version` run inside;
+  sandbox is enabled and the host can enforce, its `--version` run inside
+  with the environment its launches get (the provider's own configuration
+  isolation, and path-valued variables spelled where they lead inside);
   a keyring login, or a `dir-rw` login inside the provider's own
   configuration root, with the supported alternatives (a login file, a
   dedicated credential directory, an API key variable); a declaration that
