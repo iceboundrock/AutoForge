@@ -425,7 +425,10 @@ Four more files, the same split by what they need from the host:
   engine and again by a new one; a capable host launching inside;
   `disabled` never probing and saying "logical isolation only"; an
   operator read-only path over the state directory refused before
-  anything; the dry run's policy by launch class with no probe; `status`
+  anything; in LOCAL, the gate checking operator paths against the LOCAL
+  launch's own denied roots, so `.git/config` (in the checkout's read-only
+  git projection) runs to DONE dropped as covered while `.git/autoforge`
+  or another registered worktree is still refused; the dry run's policy by launch class with no probe; `status`
   without a probe; LOCAL `required` refused before the launch is charged;
   LOCAL `preferred` falling back visibly (the plan, `status`, a stderr
   line at every agent and validation launch, every execution record's
@@ -438,7 +441,8 @@ Four more files, the same split by what they need from the host:
   credential classes, never a value) and its `--version` launched inside
   by its resolved path; a `dir-rw` login in the provider's own root and a
   keyring login refused with the alternatives (D7.3); hard links in the
-  workspace (D4.4); the sandbox directories and their sizes (D8.5);
+  workspace (D4.4), the walk reading a crowded directory an entry at a
+  time and no further than its bound; the sandbox directories and their sizes (D8.5);
   loopback and wildcard TCP listeners from a fake `/proc/net`, X11 flagged
   (D9.3); operator paths over a denied root (D15.4); and no `gh` call in
   LOCAL.
