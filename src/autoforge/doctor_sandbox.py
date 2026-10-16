@@ -434,28 +434,34 @@ def operator_paths_row(cfg: AutoForgeConfig, layout: _Layout | None) -> CheckRes
 
 # -- hard links (D4.4), sandbox directories (D8.5) ------------------------------
 def _walk(root: Path, skip_git: bool) -> Iterator[tuple[str, os.stat_result]]:
-    """``(path, lstat)`` of every entry below ``root``, never following a link, bounded."""
+    """``(path, lstat)`` of every entry below ``root``, never following a link, bounded.
+
+    Each directory is read an entry at a time and the bound is checked per
+    entry, so no more than ``MAX_WALK_ENTRIES`` are ever read, however many
+    one directory holds. A directory that cannot be read, or stops being
+    readable part way, is skipped from there.
+    """
     seen = 0
     stack = [str(root)]
     while stack:
         current = stack.pop()
         try:
-            entries = list(os.scandir(current))
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > MAX_WALK_ENTRIES:
+                        return
+                    if skip_git and entry.name == ".git":
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    yield entry.path, info
+                    if stat.S_ISDIR(info.st_mode):
+                        stack.append(entry.path)
         except OSError:
             continue
-        for entry in entries:
-            seen += 1
-            if seen > MAX_WALK_ENTRIES:
-                return
-            if skip_git and entry.name == ".git":
-                continue
-            try:
-                info = entry.stat(follow_symlinks=False)
-            except OSError:
-                continue
-            yield entry.path, info
-            if stat.S_ISDIR(info.st_mode):
-                stack.append(entry.path)
 
 
 def hard_links_row(layout: _Layout | None) -> CheckResult:

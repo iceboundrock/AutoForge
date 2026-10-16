@@ -211,6 +211,47 @@ def test_the_sandbox_directories_and_their_sizes_are_listed(tmp_path, host):
     assert "local" in rows["hard links in writable trees"].detail
 
 
+def test_the_walk_reads_no_more_of_a_directory_than_its_bound(tmp_path, monkeypatch):
+    """One crowded directory cannot defeat the walk's bound (PR #231 review R1-F3).
+
+    Entries are read one at a time and the bound checked per entry, so the
+    walk stops reading the directory at the entry past the bound instead of
+    materializing all of it first.
+    """
+    crowded = tmp_path / "crowded"
+    crowded.mkdir()
+    for index in range(50):
+        (crowded / f"f{index}").touch()
+    scandir = os.scandir
+    read: list[str] = []
+
+    class Counting:
+        """``os.scandir`` counting the entries the walk actually reads."""
+
+        def __init__(self, path):
+            self._entries = scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._entries.close()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            entry = next(self._entries)
+            read.append(entry.name)
+            return entry
+
+    monkeypatch.setattr(doctor_sandbox, "MAX_WALK_ENTRIES", 5)
+    monkeypatch.setattr(doctor_sandbox.os, "scandir", Counting)
+    assert len(list(doctor_sandbox._walk(crowded, skip_git=False))) == 5
+    # The bound, plus the one entry that reached past it.
+    assert len(read) == 6
+
+
 def test_operator_paths_over_a_denied_root_are_named(tmp_path, host):
     repo = git_repo(tmp_path / "repo")
     d = _doctor(repo, host)
