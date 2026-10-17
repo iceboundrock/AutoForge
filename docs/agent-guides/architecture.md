@@ -673,10 +673,12 @@ the mode. Every git process is the controller's own `local_git_request`
   candidate.
 - **Strict import (D6.5).** `import_private_objects` copies the objects the
   candidate reaches that the shared store lacks out of the issue's private
-  object directory: `rev-list --objects` and `pack-objects` with the
-  directory named through `GIT_ALTERNATE_OBJECT_DIRECTORIES` (never added
-  to the shared store's alternates), then `index-pack --stdin --fix-thin
-  --strict` into the shared store. The commit is the object id `HEAD`
+  object directory: the `rev-parse` of the commit `HEAD` names,
+  `rev-list --objects` and `pack-objects`, those three processes only,
+  with the directory named through `GIT_ALTERNATE_OBJECT_DIRECTORIES` as
+  one double-quoted entry, so that a `:` in its path does not split it
+  (never added to the shared store's alternates), then `index-pack --stdin
+  --fix-thin --strict` into the shared store. The commit is the object id `HEAD`
   holds, read by the controller itself after the same `lstat`: a `HEAD`
   that is not a regular file is an `ObjectImportError` before any git
   process runs (nothing packed or imported), and an attached one imports

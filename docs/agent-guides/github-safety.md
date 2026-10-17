@@ -1361,9 +1361,11 @@ can write, so they hold under `sandbox.mode: disabled` too:
 - **The agent's objects are imported strictly.** Before every REMOTE
   launch and after every one that exited cleanly, the objects the
   candidate reaches that the shared store lacks are copied out of the
-  issue's private object directory: `rev-list --objects` and
-  `pack-objects` read it through `GIT_ALTERNATE_OBJECT_DIRECTORIES`, for
-  those two processes only, and `index-pack --stdin --fix-thin --strict`
+  issue's private object directory: the `rev-parse` that reads the commit
+  `HEAD` names, `rev-list --objects` and `pack-objects` read it through
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, for those three processes only, as
+  one double-quoted entry (a `:` in its path
+  does not split it), and `index-pack --stdin --fix-thin --strict`
   writes each object under the id it computes from its bytes. The commit
   is the object id `HEAD` holds, read by the controller after the same
   `lstat` as the candidate read: a `HEAD` that is a link is refused before
