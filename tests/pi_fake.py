@@ -116,9 +116,22 @@ def assistant(stop, **extra):
     return {"role": "assistant", "content": content, "stopReason": stop, **extra}
 
 
+def agent_end(message):
+    if not turn["agent_end_bytes"]:
+        emit({"type": "agent_end", "messages": [], "willRetry": False})
+        return
+    # As Pi 1.0.1 writes it (JSON.stringify: `type` first, no whitespace),
+    # repeating every message of the run: a user prompt of the size asked,
+    # then the answer.
+    user = {"role": "user", "content": [{"type": "text", "text": "p" * turn["agent_end_bytes"]}]}
+    record = {"type": "agent_end", "messages": [user, message], "willRetry": False}
+    out.write(json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n")
+    out.flush()
+
+
 def settle(message):
     emit({"type": "message_end", "message": message})
-    emit({"type": "agent_end", "messages": [], "willRetry": False})
+    agent_end(message)
     emit({"type": "agent_settled"})
 
 
@@ -186,7 +199,9 @@ class PiTurn:
     accepted, ``writes`` (paths relative to the cwd) are written into the
     agent's working directory and ``detach`` starts a detached sleeper for
     that many seconds. ``auth`` and ``auth_exit`` script the ``pi auth
-    check`` preflight.
+    check`` preflight. ``agent_end_bytes`` makes the run's ``agent_end``
+    repeat a user prompt of that many characters, as Pi's repeats every
+    message of the run (#144).
     """
 
     text: str = ""
@@ -198,6 +213,7 @@ class PiTurn:
     detach: int = 0
     auth: dict | None = None
     auth_exit: int = 0
+    agent_end_bytes: int = 0
 
 
 class PiFake:

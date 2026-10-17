@@ -11578,6 +11578,32 @@ def test_a_pi_failure_leaves_state_unchanged_and_resume_relaunches(
     assert load_state(eng.paths.state_file).current_pr_url == PR
 
 
+def test_a_pi_run_whose_agent_end_outgrows_the_record_bound_advances(
+    tmp_state_dir, fake_github, tmp_path_factory
+):
+    """#144: Pi's agent_end repeats every message of the run, so a long run's
+    outgrows the real stdout record bound. That record is dropped and
+    tolerated: the run is no provider failure, its result is published and
+    the phase advances, and execution.json counts the record."""
+    from autoforge.providers import PI_MAX_RECORD_BYTES
+    from tests.pi_fake import PiTurn
+
+    def agent(req):
+        return PiTurn(text=implement(req), agent_end_bytes=PI_MAX_RECORD_BYTES + 1)
+
+    eng = make_engine(tmp_state_dir, [], github=fake_github, origin=True)
+    fake = _to_pi(eng, tmp_path_factory, agent)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    assert eng.step().next_phase == "REVIEW"
+    assert len(fake.launches()) == 1
+    assert load_state(eng.paths.state_file).current_pr_url == PR
+    _, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    summary = execution["provider_summary"]
+    assert summary["oversize_records"] == 1 and summary["agent_ends"] == 1
+    assert summary["failure"] == "" and summary["stop_reason"] == "stop"
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="orphan sweep is Linux-only")
 def test_a_pi_deadline_is_a_timeout_naming_what_it_left_behind(
     tmp_state_dir, fake_github, tmp_path_factory

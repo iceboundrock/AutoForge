@@ -22,6 +22,7 @@ from autoforge.errors import ChildStdinClosedError, ExecutionError, ExecutionTim
 from autoforge.executor import ExecutionRequest, execute
 from autoforge.executor_duplex import (
     MAX_DEADLINE_SECONDS,
+    OVERSIZE_HEAD_BYTES,
     DuplexRequest,
     Eof,
     Fragment,
@@ -178,11 +179,42 @@ def test_oversize_record_is_reported_and_the_next_one_is_read():
     assert got == [
         Record(b"x" * limit),
         Record(b"y" * limit),
-        Oversize(limit),
-        Oversize(limit),
+        Oversize(limit, b"z" * limit),
+        Oversize(limit, b"w" * limit),
         Record(b"after"),
         Eof(),
     ]
+
+
+def test_oversize_keeps_the_head_of_the_dropped_record_and_nothing_more():
+    """#144: an Oversize carries the record's first OVERSIZE_HEAD_BYTES bytes,
+    whether the bound is crossed inside one read, across reads with the head
+    split between them, or by the LF of a record one byte over; the rest of
+    the record, and every record after it, is not part of the head."""
+    limit = 1000
+    record = bytes(range(32, 127)) * 20  # no LF, 1900 bytes
+    head = record[:OVERSIZE_HEAD_BYTES]
+    framer = _LineFramer(limit)
+    assert framer.feed(record + b"\nnext\n") == [Oversize(limit, head), Record(b"next")]
+    # Part of the head is held when the read that crosses the bound arrives.
+    assert framer.feed(record[:30]) == []
+    assert framer.feed(record[30:] + b"\n") == [Oversize(limit, head)]
+    # The head arrives in pieces, the bound is crossed many reads later.
+    got = []
+    for start in range(0, len(record), 7):
+        got += framer.feed(record[start : start + 7])
+        assert framer.retained <= limit + 1
+    got += framer.feed(b"\n")
+    assert got == [Oversize(limit, head)]
+    # A record exactly one byte over is only known oversize at its LF.
+    assert framer.feed(record[: limit + 1] + b"\n") == [Oversize(limit, head)]
+    assert framer.finish() == []
+
+
+def test_oversize_head_never_exceeds_the_record_bound():
+    limit = OVERSIZE_HEAD_BYTES // 4
+    got = _records_until_eof([b"a" * (4 * OVERSIZE_HEAD_BYTES) + b"\n"], max_record_bytes=limit)
+    assert got == [Oversize(limit, b"a" * limit), Eof()]
 
 
 def test_unterminated_fragment_at_eof_is_reported_not_returned_as_a_record():
@@ -274,7 +306,7 @@ def test_stdout_flood_without_newlines_is_oversize_with_bounded_memory():
     with start_duplex(
         DuplexRequest(command=[PY, "-c", script], max_runtime_seconds=30, max_record_bytes=limit)
     ) as child:
-        assert child.read_line(timeout=10) == Oversize(limit)
+        assert child.read_line(timeout=10) == Oversize(limit, b"x" * OVERSIZE_HEAD_BYTES)
         assert child.read_line(timeout=10) == Record(b"next")
         reader = child._readers[0]
         assert reader.framer.retained <= limit + 1
@@ -292,7 +324,7 @@ def test_framer_holds_at_most_the_limit_whatever_the_stream():
         got += framer.feed(b"y" * 4096)
         assert framer.retained <= limit + 1
     got += framer.feed(b"\nok\n")
-    assert got == [Oversize(limit), Record(b"ok")]
+    assert got == [Oversize(limit, b"y" * OVERSIZE_HEAD_BYTES), Record(b"ok")]
     assert framer.finish() == []
 
 
@@ -337,6 +369,25 @@ def test_record_queue_overflow_by_bytes():
     ) as child:
         assert child.finish().records_overflowed
     assert _drain(child) == [Record(b"z" * 1000)] * 5 + [Overflow()]
+
+
+def test_an_oversize_head_counts_against_the_pending_bytes():
+    """The head an Oversize holds while it waits is part of the queue's byte
+    bound, so the bound stays what memory costs (#144)."""
+    script = (
+        "import sys\nsys.stdout.buffer.write(b'q' * 900 + b'\\n' + (b'o' * 2000 + b'\\n') * 3)\n"
+    )
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", script],
+            max_runtime_seconds=30,
+            max_record_bytes=1000,
+            max_pending_bytes=900 + 2 * OVERSIZE_HEAD_BYTES,
+        )
+    ) as child:
+        assert child.finish().records_overflowed
+    oversize = Oversize(1000, b"o" * OVERSIZE_HEAD_BYTES)
+    assert _drain(child) == [Record(b"q" * 900), oversize, oversize, Overflow()]
 
 
 def test_stderr_flood_is_bounded_and_flagged():

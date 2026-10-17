@@ -1641,11 +1641,16 @@ PI_ROUND_TRIP_SECONDS = 15.0
 # closed. It follows a limit falling due and never shortens it (#193): the
 # group is killed this long after the limit, Pi's own exit included.
 PI_ABORT_SECONDS = 5.0
-# A final text past the stdout bound must still arrive whole in one
-# `get_last_assistant_text` record so that its tail can be kept, and JSON
-# escaping can double a text. Pi's `agent_end` is not bounded by this: it
-# repeats every message of the run (verified on Pi 1.0.1), so a very long run
-# can overflow the bound and fail closed as a protocol violation (#144).
+# The per-record bound is sized for one message: a final text past the
+# stdout bound must still arrive whole in one `get_last_assistant_text`
+# record so that its tail can be kept, and JSON escaping can double a text.
+# It is not Pi's worst case, which has no bound: `agent_end` repeats every
+# message of the run (207 KB for a 200 KB prompt and one `read` on Pi
+# 1.0.1, and compaction does not shrink it), and `turn_end` a turn's
+# assistant message and all its tool results. Those two are dropped past
+# the bound and tolerated from their leading bytes, since the reducer needs
+# neither's content; any other record past it is a protocol violation
+# (`PiConversation.oversize`, #144). Memory stays at the bound either way.
 PI_MAX_RECORD_BYTES = 2 * DEFAULT_MAX_OUTPUT_BYTES + 1024 * 1024
 PI_MAX_PENDING_BYTES = 2 * PI_MAX_RECORD_BYTES
 
@@ -2109,7 +2114,7 @@ class PiProvider(AgentProvider):
                         return False
                     self._send(child, conversation, replies)
                 elif isinstance(item, Oversize):
-                    conversation.framing_error(f"a stdout record exceeded {item.limit} bytes")
+                    conversation.oversize(item.head, item.limit)
                 elif isinstance(item, Fragment):
                     conversation.framing_error("stdout ended inside an unterminated record")
                 elif isinstance(item, Overflow):

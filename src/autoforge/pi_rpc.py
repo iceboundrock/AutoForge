@@ -25,7 +25,10 @@ The conversation, in order (ADR 0003 §2.1 to §2.8):
    ``error`` and ``aborted`` are provider failures, anything else is a
    protocol failure. An extension dialog is answered at once with
    ``cancelled: true`` and fails the run. Unknown event types are counted
-   and otherwise ignored.
+   and otherwise ignored. A record past the stdout bound is a protocol
+   failure, except an ``agent_end`` or ``turn_end``: both repeat messages
+   of the run and the reducer needs neither's content, so one is counted
+   from its leading bytes and its content never read (#144).
 4. ``get_last_assistant_text``, a bounded round trip. A missing, ``null``,
    non-string or blank ``text`` is "no assistant text"; a text that differs
    from the one derived from the last assistant ``message_end`` (its
@@ -111,6 +114,19 @@ _IGNORED_EVENTS = frozenset(
         "entry_appended",
     }
 )
+# Events whose record may outgrow any stdout bound because it repeats
+# messages of the run (#144): `agent_end` carries every message (the
+# system and user prompts, every assistant message with its tool-call
+# arguments, every tool result) and compaction does not shrink it;
+# `turn_end` carries a turn's assistant message and its tool results. The
+# reducer reads only `agent_end`'s `willRetry`, a summary counter, so a
+# dropped one costs nothing the outcome depends on. It is recognised by its
+# leading bytes: Pi 1.0.1 writes JSON.stringify output, `type` first and
+# no whitespace, and those bytes are Pi's own (what the model writes is
+# inside JSON strings further on). Any other leading bytes (another
+# serialisation included) leave the record a protocol failure.
+OVERSIZE_TOLERATED_EVENTS = ("agent_end", "turn_end")
+_OVERSIZE_HEADS = {f'{{"type":"{kind}",'.encode(): kind for kind in OVERSIZE_TOLERATED_EVENTS}
 # What Pi reports when a ChatGPT subscription has run out of usage.
 _USAGE_LIMIT_CODE = "subscription_sharing_usage_limit_exceeded"
 # Commands answered within the round-trip bound. ``prompt`` is not one: its
@@ -230,6 +246,7 @@ class PiConversation:
         self._dialogs_cancelled = 0
         self._notifications_ignored = 0
         self._unknown_events = 0
+        self._oversize_records = 0
 
     # -- driver interface ----------------------------------------------------
     @property
@@ -300,6 +317,25 @@ class PiConversation:
     def framing_error(self, what: str) -> None:
         self._protocol(what)
 
+    def oversize(self, head: bytes, limit: int) -> None:
+        """A stdout record past ``limit`` bytes was dropped; ``head`` is its start.
+
+        An ``agent_end`` or ``turn_end`` (:data:`OVERSIZE_TOLERATED_EVENTS`)
+        is counted, as an event of its kind and in ``oversize_records``, and
+        reported as activity; an ``agent_end``'s ``willRetry`` is not known,
+        so it is not counted. Any other record is a protocol violation.
+        """
+        kind = next((k for h, k in _OVERSIZE_HEADS.items() if head.startswith(h)), None)
+        if kind is None:
+            self._protocol(f"a stdout record exceeded {limit} bytes")
+            return
+        if self.done:
+            return  # as for any event once the outcome is fixed
+        self._oversize_records += 1
+        self._progress(kind, {})
+        if kind == "agent_end":
+            self._agent_ends += 1
+
     def stream_ended(self) -> None:
         """Pi's stdout reached EOF."""
         if self.done:
@@ -338,6 +374,7 @@ class PiConversation:
             "ui_dialogs_cancelled": self._dialogs_cancelled,
             "ui_notifications_ignored": self._notifications_ignored,
             "unknown_events": self._unknown_events,
+            "oversize_records": self._oversize_records,
             "abort_sent": self._abort_sent,
             "failure": self.failure or "",
         }

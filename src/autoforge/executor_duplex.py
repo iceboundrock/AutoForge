@@ -20,9 +20,10 @@ Guarantees:
 - stdout is split into records on LF (0x0A) **only**, one trailing CR
   stripped per record; no other byte or Unicode line separator (U+2028,
   U+2029, NUL, VT, FF, NEL) is a boundary. A record longer than
-  ``max_record_bytes`` is reported as :class:`Oversize` and dropped through
-  its LF, and an unterminated fragment at EOF is reported as
-  :class:`Fragment`, never as a record;
+  ``max_record_bytes`` is reported as :class:`Oversize` with at most its
+  first :data:`OVERSIZE_HEAD_BYTES` bytes, so that the caller can tell what
+  was dropped, and dropped through its LF; an unterminated fragment at EOF
+  is reported as :class:`Fragment`, never as a record;
 - stdout and stderr are drained continuously on reader threads, whether or
   not the caller reads, so the child never blocks on a full pipe. Complete
   records wait in a queue bounded by ``max_pending_records`` and
@@ -126,6 +127,10 @@ from .executor import (
 DEFAULT_MAX_RECORD_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_PENDING_RECORDS = 1024
 DEFAULT_MAX_PENDING_BYTES = 16 * 1024 * 1024
+# How much of a dropped record an :class:`Oversize` keeps: enough for a
+# caller to read what kind of record it was from its leading bytes (#144),
+# never its content. Never more than the record bound itself.
+OVERSIZE_HEAD_BYTES = 64
 
 
 class StdoutMode(enum.Enum):
@@ -146,9 +151,14 @@ class Record:
 
 @dataclass(frozen=True)
 class Oversize:
-    """A record exceeded ``limit`` bytes; it was dropped through its LF."""
+    """A record exceeded ``limit`` bytes; it was dropped through its LF.
+
+    ``head`` is its first ``min(OVERSIZE_HEAD_BYTES, limit)`` bytes, for
+    the caller to recognise the record by; the rest was never kept.
+    """
 
     limit: int
+    head: bytes
 
 
 @dataclass(frozen=True)
@@ -275,13 +285,15 @@ class _LineFramer:
 
     The partial record is held in one ``bytearray`` of at most ``limit + 1``
     bytes (the extra byte is room for the CR an LF ending strips). Past
-    that, the record is reported once as :class:`Oversize` the moment it
-    crosses the bound and its remaining bytes are counted out up to the
-    next LF, so a stream with no LF at all costs the bound, not its length.
+    that, the record is reported once as :class:`Oversize`, with its head,
+    the moment it crosses the bound and its remaining bytes are counted out
+    up to the next LF, so a stream with no LF at all costs the bound, not
+    its length.
     """
 
     def __init__(self, limit: int) -> None:
         self._limit = limit
+        self._head = min(OVERSIZE_HEAD_BYTES, limit)
         self._buf = bytearray()
         self._dropping = False
 
@@ -305,16 +317,21 @@ class _LineFramer:
                 self._buf.clear()
                 if record.endswith(b"\r"):
                     record = record[:-1]
-                out.append(Oversize(self._limit) if len(record) > self._limit else Record(record))
+                if len(record) > self._limit:
+                    out.append(Oversize(self._limit, record[: self._head]))
+                else:
+                    out.append(Record(record))
             start = lf + 1
 
     def _take(self, piece: bytes, out: list[Record | Oversize]) -> None:
         if self._dropping or not piece:
             return
         if len(self._buf) + len(piece) > self._limit + 1:
+            head = bytes(self._buf[: self._head])
+            head += piece[: self._head - len(head)]
             self._buf.clear()
             self._dropping = True
-            out.append(Oversize(self._limit))
+            out.append(Oversize(self._limit, head))
             return
         self._buf += piece
 
@@ -333,7 +350,7 @@ class _RecordQueue:
     A put past either bound ends the queue with :class:`Overflow` instead
     of waiting, so the reader thread keeps draining the pipe. The end item
     (:class:`Eof` or :class:`Overflow`) is returned after every queued item,
-    and then on every later get.
+    and then on every later get. An :class:`Oversize` counts its head.
     """
 
     def __init__(self, max_items: int, max_bytes: int) -> None:
@@ -356,7 +373,7 @@ class _RecordQueue:
 
     def put(self, item: Record | Oversize | Fragment) -> bool:
         """Queue ``item``; False once the queue has ended (overflow included)."""
-        size = 0 if isinstance(item, Oversize) else len(item.data)
+        size = _held_bytes(item)
         with self._cond:
             if self._end is not None:
                 return False
@@ -381,8 +398,7 @@ class _RecordQueue:
             while True:
                 if self._items:
                     item = self._items.popleft()
-                    if not isinstance(item, Oversize):
-                        self._bytes -= len(item.data)
+                    self._bytes -= _held_bytes(item)
                     return item
                 if self._end is not None:
                     return self._end
@@ -390,6 +406,11 @@ class _RecordQueue:
                 if remaining <= 0:
                     return None
                 self._cond.wait(remaining)
+
+
+def _held_bytes(item: Record | Oversize | Fragment) -> int:
+    """The bytes ``item`` holds while it waits in the queue."""
+    return len(item.head) if isinstance(item, Oversize) else len(item.data)
 
 
 class _RecordReader(_PipeDrain):
