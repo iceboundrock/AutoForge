@@ -1348,8 +1348,9 @@ can write, so they hold under `sandbox.mode: disabled` too:
 - **The candidate is addressed through the common dir.** The controller
   reads an issue worktree's `HEAD` as `worktrees/<id>/HEAD` with
   `git --git-dir=<git common dir>`, after `lstat` found a regular file
-  there (git would follow a link to a file the agent named outside the
-  store), and never through the worktree's `.git` file, the admin dir's
+  there and real directories above it up to the common dir (git would
+  follow a link to a file the agent named outside the store), and never
+  through the worktree's `.git` file, the admin dir's
   `commondir` or `gitdir`, or `git -C <worktree>`. A `.git` rewritten to
   name a decoy repository cannot move the candidate: the decoy's commit,
   reported as `head_sha`, is refused as not the worktree's `HEAD`
@@ -1367,6 +1368,10 @@ can write, so they hold under `sandbox.mode: disabled` too:
   which resolves every listed worktree's `HEAD` through a planted link
   (#223;
   `test_engine_sandbox.py::test_a_planted_link_to_a_fifo_stalls_no_controller_read`).
+  The registry directory is opened without following a link: one an agent
+  replaced with a link is refused, never listed, until the operator puts
+  it back
+  (`test_engine_sandbox.py::test_a_registry_replaced_by_a_link_is_refused_until_the_operator_repairs_it`).
 - **The agent's objects are imported strictly.** Before every REMOTE
   launch and after every one that exited cleanly, the objects the
   candidate reaches that the shared store lacks are copied out of the

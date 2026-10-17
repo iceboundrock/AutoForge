@@ -576,7 +576,8 @@ whatever it points to (a link to the operator's checkout or to another
 worktree would otherwise answer git as that tree), a directory is
 reused only when the repository's registry lists it as a worktree root
 (read from `<common>/worktrees/*/gitdir` without git, so no worktree's
-`HEAD` is read and no link followed, #223), and a
+`HEAD` is read and no link followed, the registry directory's own
+included, #223), and a
 path reached through a symbolic link above it (`.git/autoforge/worktrees`
 linked into the working tree, say) is refused before anything is created,
 so a worktree only ever appears at the literal derived path. Reuse also

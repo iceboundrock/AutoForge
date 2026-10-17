@@ -446,7 +446,10 @@ Four more files, the same split by what they need from the host:
     linked worktree, with relative pointers, a separate git dir and a bare
     repository; an entry or `gitdir` that is a link or a FIFO names no
     root and is never opened; a registry over its bound or unreadable is
-    refused;
+    refused; so is a registry that is itself a link, by the listing, the
+    binding, the candidate read and the import, none of which opens or
+    lists a path through it, each answering again once the directory is
+    put back; and a registry that is a file or a FIFO;
   - the D6.3 candidate read: the detached HEAD, an attached HEAD reported,
     a HEAD that is a link not read, pointer rewrites that do not move the
     candidate, a HEAD naming no commit read as none;
@@ -481,6 +484,8 @@ Four more files, the same split by what they need from the host:
   naming the repair; a `HEAD` link, or a reference a regular `HEAD`
   names, to a FIFO outside, which no controller read opens across the
   candidate refusal, the relaunches and the operator's repair (#223); a
+  registry the agent replaced with a link under `disabled`, refusing the
+  candidate and every relaunch until the operator puts it back (#223); a
   refusal on the spawn path; and the dry-run note.
 - `tests/test_sandbox_gate.py` (#169, D12.2, D12.4) drives the engine with
   the probe's stand-in. It covers: under `required` and REMOTE's

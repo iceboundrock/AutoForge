@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -213,6 +214,73 @@ def test_a_registry_bigger_than_the_bound_is_refused(repo, monkeypatch):
     _git("-C", str(repo["root"]), "worktree", "add", "-q", "--detach", str(repo["base"] / "o"))
     with pytest.raises(VerificationError, match="cannot list the repository's worktrees"):
         registered_worktree_roots(repo["common"])
+
+
+def test_a_registry_that_is_a_link_is_refused_without_reading_through_it(repo, monkeypatch):
+    """The registry ``<common>/worktrees`` itself a link to a directory
+    outside, which still holds the worktree's entry, as an agent without an
+    enforced sandbox can leave it: the listing and the binding refuse it on
+    ``lstat``, and the candidate read and the import name it, before any of
+    them opens or lists a path through it. Once the operator puts the
+    directory back, each answers again (#223)."""
+    head = _commit_privately(repo)
+    registry, elsewhere = repo["common"] / "worktrees", repo["base"] / "elsewhere"
+    registry.rename(elsewhere)
+    registry.symlink_to(elsewhere)
+    # The layout is sharp: a listing by path, the read before this check,
+    # finds the worktree's entry through the link.
+    assert [entry.name for entry in os.scandir(registry)] == ["2"]
+    reached: list[object] = []
+    real_open, real_scandir = os.open, os.scandir
+
+    def opening(path, *args, **kwargs):
+        reached.append(path)
+        return real_open(path, *args, **kwargs)
+
+    def listing(path="."):
+        reached.append(path)
+        return real_scandir(path)
+
+    seen: list[ExecutionRequest] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", opening)
+        patch.setattr(os, "scandir", listing)
+        with pytest.raises(VerificationError, match=re.escape(f"{registry} is a link")):
+            registered_worktree_roots(repo["common"])
+        with pytest.raises(VerificationError, match=re.escape(f"{registry} is a link")):
+            bound_admin_dir(repo["common"], repo["worktree"])
+        candidate = read_candidate(repo["common"], repo["admin"], "w", _recording(seen))
+        with pytest.raises(ObjectImportError, match=re.escape(f"{registry} is a link")):
+            import_private_objects(repo["common"], repo["admin"], repo["private"], _recording(seen))
+    # A descriptor would be the registry's: nothing listed it, by path or not.
+    through = [
+        path
+        for path in reached
+        if isinstance(path, int) or str(path).startswith((str(registry), str(elsewhere)))
+    ]
+    assert through == [] and seen == []
+    assert candidate.head == "" and f"{registry} is a link" in candidate.problem
+    assert not _shared_has(repo, head)
+    registry.unlink()
+    elsewhere.rename(registry)
+    assert registered_worktree_roots(repo["common"]) == {repo["root"], repo["worktree"]}
+    assert bound_admin_dir(repo["common"], repo["worktree"]) == repo["admin"]
+    assert import_private_objects(repo["common"], repo["admin"], repo["private"], None) == head
+    assert read_candidate(repo["common"], repo["admin"], "w", None).head == head
+
+
+@pytest.mark.parametrize("kind", ["file", "fifo"])
+def test_a_registry_that_is_not_a_directory_is_refused(repo, kind):
+    registry = repo["common"] / "worktrees"
+    shutil.rmtree(registry)
+    if kind == "file":
+        registry.write_text("not a registry\n")
+    else:
+        os.mkfifo(registry)
+    with pytest.raises(VerificationError, match=re.escape(f"{registry} is not a directory")):
+        registered_worktree_roots(repo["common"])
+    with pytest.raises(VerificationError, match=re.escape(f"{registry} is not a directory")):
+        bound_admin_dir(repo["common"], repo["worktree"])
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a directory without permission")

@@ -772,7 +772,12 @@ alone: an attached `HEAD` is reported and the reference it names is never
 opened. `rev-parse` runs only on a detached `HEAD`, which names an object
 id and no reference. Reading the `HEAD` file's content instead, as the
 strict import does (D6.5), would take a reftable worktree, whose `HEAD`
-file is a stub, for an attached one.
+file is a stub, for an attached one. Nor is `HEAD` read through a link
+above it: `<common>/worktrees` and `<common>/worktrees/<id>` are `lstat`-ed
+as well, and one that is a link or not a directory is named and refuses
+the candidate, since git would read `worktrees/<id>/HEAD` through it (an
+agent without an enforced sandbox can move the registry away and leave a
+link to a copy whose `HEAD` it controls).
 
 *Consequence for #161 (merged).* #161 already defines the candidate as the
 worktree's detached `HEAD` and pushes it to the controller-named remote
@@ -818,7 +823,14 @@ and without git. An entry git marks `prunable` (its `gitdir` names a
 `.git` that is gone, and it is not `locked`) is left out, as before. An
 entry that is a link or whose `gitdir` is not a regular file names no
 root, where git would read through it; the binding refuses such a
-worktree in any case.
+worktree in any case. The registry directory itself is no exception: the
+listing and the binding `lstat` `<common>/worktrees`, open it with
+`O_NOFOLLOW`, and reach each entry and its `gitdir` and `locked` files from
+that descriptor, never by path. A registry that is a link (an agent
+without an enforced sandbox can move the directory away and leave one) is
+refused with a `VerificationError` naming it, before the directory it
+names is opened, and so is one that is not a directory or cannot be read;
+the operator puts the directory back and resumes.
 
 **D6.5 (#168).** **The controller imports the private objects strictly, and
 never follows an agent-written alternate.**

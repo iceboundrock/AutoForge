@@ -668,9 +668,13 @@ the mode. Every git process is the controller's own `local_git_request`
   without git and without following a link (git resolves every listed
   `HEAD`, through a link the agent planted, #223); the reuse check and the
   sandbox's denied roots read it, and the engine lists no worktree itself.
+  Both read the registry through a descriptor opened `O_NOFOLLOW`
+  (`_registry_entries`): a `<common>/worktrees` that is itself a link is
+  refused, never listed.
 - **Candidate (D6.3).** `read_candidate` reads `worktrees/<id>/HEAD` with
-  `git --git-dir=<common>`, after `lstat` found a regular file there
-  (`head_problem`), never through the worktree's `.git`, the admin dir's
+  `git --git-dir=<common>`, after `lstat` found a regular file there,
+  reached from the common dir through real directories (`head_problem`),
+  never through the worktree's `.git`, the admin dir's
   `commondir` or `gitdir`, or `git -C <worktree>`; an attached `HEAD` is
   reported by `symbolic-ref --no-recurse`, which never opens the reference
   it names (#223). `_read_candidate`
