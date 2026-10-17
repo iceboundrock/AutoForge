@@ -204,7 +204,8 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        Pi provider, authority boundary and typed external effects,
                                        outer sandbox and host-resource capability model,
                                        candidate validation evidence and review certificates,
-                                       SDK providers: isolated helpers, interaction contract)
+                                       SDK providers: isolated helpers, interaction contract,
+                                       parallel EPIC scheduler: authority, run identity, claims, locks)
 docs/README.md                         human-oriented documentation index, by intent
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
@@ -243,6 +244,11 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   resolver, `interaction_policy`, `pause` and continuation), read
   `docs/adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md`
   in addition to `architecture.md`.
+- If implementing the parallel EPIC scheduler (#176: run namespaces,
+  dependency snapshots, lock domains, scheduler claims, workers, the `epic`
+  commands) or changing the repository lock, read
+  `docs/adr/0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md`
+  in addition to `state-and-recovery.md`.
 - If changing `src/autoforge/result_parser.py`, a prompt template, the
   per-phase required result fields, or how the engine consumes a parsed
   result, read `docs/agent-guides/control-result-protocol.md`.
