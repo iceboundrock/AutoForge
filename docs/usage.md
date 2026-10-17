@@ -709,7 +709,9 @@ ownership or discard uncommitted user changes.
   belong there, then `unblock` and `resume`. To look at an agent's commits
   while they are still only in that directory, read them through it
   without writing anything:
-  `GIT_ALTERNATE_OBJECT_DIRECTORIES=<repo>/.git/autoforge/sandbox/<n>/objects git -C <worktree> log`.
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES='"<repo>/.git/autoforge/sandbox/<n>/objects"' git -C <worktree> log`.
+  The inner double quotes keep git from splitting a path that contains a
+  `:`; inside them, write a `"` or a `\` of the path as `\"` or `\\`.
 - **Merge verification keeps saying "inconclusive":** checks still running,
   mergeability unknown or a transient GitHub failure; re-run
   `autoforge resume --allow-merge`. After `merge.max_verification_attempts`

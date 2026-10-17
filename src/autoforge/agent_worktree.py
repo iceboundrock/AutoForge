@@ -33,8 +33,9 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
 Every git process is the controller's own hardened local request
 (:func:`~autoforge.git_transport.local_git_request`, ADR 0004 D7.3, D7.5);
 the private directory is named through ``GIT_ALTERNATE_OBJECT_DIRECTORIES``
-for the two processes that read it, and never added to the shared store's
-alternates.
+for the processes that read it, as one double-quoted entry
+(:func:`alternate_entry`) so that a ``:`` in its path does not split it,
+and never added to the shared store's alternates.
 """
 
 from __future__ import annotations
@@ -325,6 +326,20 @@ def holds_objects(private: Path) -> bool:
         return True
 
 
+def alternate_entry(directory: Path) -> str:
+    """``directory`` as the one entry of ``GIT_ALTERNATE_OBJECT_DIRECTORIES`` (#224).
+
+    Git splits that variable on ``:`` unless an entry starts with ``"``,
+    which it then unquotes C-style. So the entry is always double-quoted,
+    with ``\\`` and ``"`` escaped; every other byte, ``:`` included, passes
+    verbatim. Unquoted, a path with a ``:`` names two directories that do
+    not exist, git reads no object through either, and the import would
+    take the agent's commit for none.
+    """
+    escaped = str(directory).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 class ObjectImportError(VerificationError):
     """The strict import did not complete; nothing was published."""
 
@@ -371,7 +386,7 @@ def import_private_objects(
             f"the strict import of the agent's commits from {private} did not start: "
             f"{problem}, and git would follow it; nothing was read or published"
         )
-    alternate = {"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(private)}
+    alternate = {"GIT_ALTERNATE_OBJECT_DIRECTORIES": alternate_entry(private)}
     git_dir = ["--git-dir", str(common)]
 
     def git(

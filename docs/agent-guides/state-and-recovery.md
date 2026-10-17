@@ -618,7 +618,10 @@ exited cleanly, so a crash between a launch and its import, or a switch
 back to `disabled`, leaves no commit unreadable. Until then the operator's
 own `git -C <worktree> log` cannot read those commits; inspect them
 read-only with
-`GIT_ALTERNATE_OBJECT_DIRECTORIES=<git common dir>/autoforge/sandbox/<n>/objects git -C <worktree> log`,
+`GIT_ALTERNATE_OBJECT_DIRECTORIES='"<git common dir>/autoforge/sandbox/<n>/objects"' git -C <worktree> log`
+(git splits the variable on `:` unless an entry is double-quoted, and
+unquotes a quoted one C-style; the controller always names the directory
+as one such entry, #224),
 and never add the directory to the shared store's `objects/info/alternates`.
 The import walks the directory first without following a link: a
 directory that is not a real one reached from the common dir through real

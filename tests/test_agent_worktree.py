@@ -16,6 +16,7 @@ import pytest
 
 from autoforge.agent_worktree import (
     ObjectImportError,
+    alternate_entry,
     bound_admin_dir,
     holds_objects,
     import_private_objects,
@@ -39,9 +40,8 @@ def _git(*args: str, env: dict[str, str] | None = None) -> str:
     return out.stdout.strip()
 
 
-@pytest.fixture
-def repo(tmp_path) -> dict[str, Path]:
-    base = Path(os.path.realpath(tmp_path))
+def _make_repo(base: Path) -> dict[str, Path]:
+    """A repository under ``base`` with an issue worktree and its private object directory."""
     root = base / "repo"
     root.mkdir()
     _git("init", "-q", "-b", "main", str(root))
@@ -62,6 +62,11 @@ def repo(tmp_path) -> dict[str, Path]:
         "admin": admin,
         "private": private,
     }
+
+
+@pytest.fixture
+def repo(tmp_path) -> dict[str, Path]:
+    return _make_repo(Path(os.path.realpath(tmp_path)))
 
 
 # ------------------------------------------------------------------ binding
@@ -159,9 +164,11 @@ def test_a_head_naming_no_commit_reads_as_none(repo):
 
 def _commit_privately(repo: dict[str, Path], name: str = "b.txt") -> str:
     """What an enforced agent does: its new objects land in the private directory."""
+    # Quoted as git unquotes it, so that a ``:`` in the path does not split it.
+    shared = str(repo["common"] / "objects").replace("\\", "\\\\").replace('"', '\\"')
     env = {
         "GIT_OBJECT_DIRECTORY": str(repo["private"]),
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repo["common"] / "objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": f'"{shared}"',
     }
     worktree = str(repo["worktree"])
     (repo["worktree"] / name).write_text(f"{name}\n")
@@ -204,6 +211,44 @@ def _recording(seen: list[ExecutionRequest]):
         return execute(request)
 
     return runner
+
+
+@pytest.mark.parametrize(
+    ("path", "entry"),
+    [
+        ("/r/objects", '"/r/objects"'),
+        ("/a:b/objects", '"/a:b/objects"'),
+        ('/a"b/objects', '"/a\\"b/objects"'),
+        ("/a\\b/objects", '"/a\\\\b/objects"'),
+    ],
+)
+def test_the_alternate_entry_is_quoted_the_way_git_unquotes_it(path, entry):
+    assert alternate_entry(Path(path)) == entry
+
+
+@pytest.mark.parametrize("name", ["a:b", 'a"b', "a\\b", 'a:"\\b'])
+def test_a_private_directory_under_a_path_git_would_split_is_imported(tmp_path, name):
+    """A checkout under a directory whose name holds a ``:`` (where git
+    splits an unquoted ``GIT_ALTERNATE_OBJECT_DIRECTORIES``), a ``"`` or a
+    ``\\`` (what the quoting escapes): the agent's commit is imported and
+    the candidate read returns it (#224). Unquoted, git read no object
+    through the alternate and the import took the commit for none."""
+    base = Path(os.path.realpath(tmp_path)) / name
+    base.mkdir()
+    repo = _make_repo(base)
+    head = _commit_privately(repo)
+    seen: list[ExecutionRequest] = []
+    imported = import_private_objects(
+        repo["common"], repo["admin"], repo["private"], _recording(seen)
+    )
+    assert imported == head and _shared_has(repo, head)
+    assert read_candidate(repo["common"], repo["admin"], str(repo["worktree"]), None).head == head
+    named = {
+        r.env["GIT_ALTERNATE_OBJECT_DIRECTORIES"]
+        for r in seen
+        if r.env and "GIT_ALTERNATE_OBJECT_DIRECTORIES" in r.env
+    }
+    assert named == {alternate_entry(repo["private"])}
 
 
 @pytest.mark.parametrize("kind", ["link", "dangling link"])
