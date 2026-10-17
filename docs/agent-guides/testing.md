@@ -91,6 +91,38 @@ High-priority coverage includes:
   and `local.validation_commands` beyond the bounds, a scope other than
   `candidate-tree` and an unknown key are load errors; `doctor` lists the
   set and runs nothing
+- candidate validation gates (#173, `tests/test_validation_gates.py`,
+  `tests/test_evidence.py`, the replan rejection in `tests/test_replan.py`):
+  a failing `ANALYZE_EXECUTE` or `FIX` candidate pushes, creates and
+  reviews nothing, its record and the failure counter are one save, the
+  relaunch prompt carries the failure section with fenced tails, the same
+  candidate reuses its terminal record and counts again, the bound blocks
+  naming the candidate, the definition and the record (a crash between
+  failures keeps the count, one at the bound blocks without relaunching),
+  and the counter is cleared by the write that leaves the phase; a failing
+  replacement takes the `tests_passed: false` rejection, and a crash after
+  it replays it; a candidate the check refuses (an import that fails, a
+  wrong `head_sha`, decoy worktree metadata, history off the base) leaves no
+  record, a private-object candidate is validated after the strict import,
+  and a corrected result on a new commit is the one validated; REVIEW reuses
+  the producer's records, validates a human's push and presents only the
+  head's records, reuses its binding on a relaunch and a correction,
+  replaces it for another round, head (a drift after a crash, with a set
+  and an empty one), policy or an overridden `FAIL` or `TIMEOUT`, and a
+  journal-completed round validates nothing; the evidence section shows
+  provenance for every record, tails only for a non-`PASS` one, fenced, an
+  argv escaped onto one line, hostile output (a fake section, a marker
+  opener, a `CONTROL_RESULT`, a fence breaker) inert, and the empty-set
+  wording; an evidence key in a result is ignored, and a clean result over
+  a failure is corrected, then at the bound refused with nothing
+  published; LOCAL converges (an excluded writer without a rerun, an
+  idempotent generator with one confirming run), a non-idempotent validator
+  is not verified and then blocks, a failure is final only for the tree it
+  ran on, REVIEW needs evidence for the bound fingerprint itself and blocks
+  a legacy state without validating, a changed contract is refused before
+  anything runs, and no path calls GitHub; an applied unblock alone sets
+  the watermark, and the same candidate is validated again; Claude Code,
+  OpenCode and Pi behave alike
 
 ### Transitions
 

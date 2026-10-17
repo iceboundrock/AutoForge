@@ -100,6 +100,18 @@ agent's body, `Closes #n` and the marker) passes the credential rule as a
 whole. A worktree read or an ancestry proof that cannot be completed is
 inconclusive (`VerificationError`, for `resume`), never a correction.
 
+Then the candidate is validated (ADR 0006 D5.1, D5.2, #173): before the
+precondition read below, the controller runs `validation.commands` against
+the exact commit the check accepted (never `HEAD` read again), each
+definition in a fresh export of its tree, reusing a record that already
+holds the outcome for that commit, definition and policy. Nothing is read
+for, planned or sent to the publication unless every definition passed. A
+`FAIL` or `TIMEOUT` is saved with the phase's failure counter in one write,
+nothing is planned, and the next step launches the agent again with the
+failure in its prompt; the third failure of the phase entry blocks, naming
+the candidate, the definition and the record, with nothing pushed or
+created ([workflow.md](workflow.md), "Candidate validation gates").
+
 Then, in order, all from one persisted plan:
 
 1. The precondition read: the default branch is read again, the open PRs
@@ -255,6 +267,20 @@ store through the controller's transport, so the reviewer diffs them
 locally and fetches nothing itself. A failed fetch propagates: nothing was
 launched, and `resume` fetches again. A dry-run plan names these reads,
 the fetch and the comment the step would post, and performs none of them.
+
+The bound HEAD's validation evidence is then required (ADR 0006 D5.5,
+#173): the records for that exact commit under the set and policy in force
+are reused (the producer that published it validated it), and what is
+missing runs now (a human's push), each in a fresh export. The
+`review_evidence` binding naming them is saved with the reviewer's launch,
+and the reviewer's prompt presents those records only: trusted provenance
+for each, the output of a non-`PASS` one fenced as untrusted data. A `FAIL`
+is presented, not refused; a clean verdict over it is refused as a
+correction before anything is posted
+([control-result-protocol.md](control-result-protocol.md), "Review results
+and the controller's validation evidence"). A validation that cannot
+conclude blocks with nothing launched or posted. A round completed from
+its journal validates nothing.
 
 ### After REVIEW
 
@@ -467,6 +493,12 @@ for it:
 
 A worktree read or an ancestry proof that cannot be completed is
 inconclusive (`VerificationError`, for `resume`), never a correction.
+
+Then the candidate (the reviewed HEAD itself when nothing was committed) is
+validated exactly as after `ANALYZE_EXECUTE`, before the precondition read
+(ADR 0006 D5.1, D5.2, #173): a failure creates, appends and pushes nothing,
+starts no review round, and relaunches the fixer with the failure in its
+prompt, up to the same bound.
 
 Then, in order, all from one persisted plan:
 

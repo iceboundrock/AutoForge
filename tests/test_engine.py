@@ -8541,14 +8541,18 @@ def test_oversized_resolution_never_reaches_state_or_a_prompt(tmp_state_dir, fak
     assert after.phase == Phase.REVIEW and after.review_round == 0
     assert after.open_findings == [] and after.review_history == []
     # The only differences on disk are the counters and the launch label
-    # (ADR 0004 D13.3) of the refused launch.
+    # (ADR 0004 D13.3) of the refused launch, and the validation binding the
+    # reviewer was launched under (ADR 0006 D5.5).
     persisted = json.loads(eng.paths.state_file.read_bytes())
     for volatile in ("updated_at",):
         persisted.pop(volatile)
+    assert persisted["review_evidence"]["review_round"] == 1
+    assert persisted["review_evidence"]["records"] == []
     expected = json.loads(before) | {
         "attempt": 1,
         "step_count": 1,
         "launch_label": "controller_publishes",
+        "review_evidence": persisted["review_evidence"],
     }
     expected.pop("updated_at")
     assert persisted == expected

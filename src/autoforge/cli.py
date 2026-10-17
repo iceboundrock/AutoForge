@@ -53,7 +53,14 @@ from .errors import (
     StateError,
     StateTransitionError,
 )
-from .evidence import LocalCandidate, Outcome, RemoteCandidate, parse_marker, record_summary
+from .evidence import (
+    MAX_FAILURE_COUNT,
+    LocalCandidate,
+    Outcome,
+    RemoteCandidate,
+    parse_marker,
+    record_summary,
+)
 from .local_workspace import init_feature_file
 from .redaction import redact, redact_argv, redact_dict
 from .replan_txn import ReplanTransaction
@@ -897,10 +904,11 @@ def _render_validation_evidence(state: AutoForgeState, config: AutoForgeConfig) 
 
     The evidence policy (the configured set's size and the mode records are
     made under, and under ``disabled`` that validators run unsandboxed), a
-    pending attempt marker, the override watermark, whether a binding or a
-    certificate is held, and the records of the current candidate: the
-    REMOTE current HEAD's or the LOCAL bound workspace's, else the newest
-    record's. Read-only: a marker is reported, never converted.
+    pending attempt marker, the override watermark, a producer's validation
+    failure counter, whether a binding or a certificate is held, and the
+    records of the current candidate: the REMOTE current HEAD's or the LOCAL
+    bound workspace's, else the newest record's. Read-only: a marker is
+    reported, never converted.
     """
     local = state.mode == WorkflowMode.LOCAL
     if local:
@@ -932,6 +940,13 @@ def _render_validation_evidence(state: AutoForgeState, config: AutoForgeConfig) 
         )
     if state.validation_override_seq is not None:
         lines.append(f"  Override watermark: seq {state.validation_override_seq}")
+    counter = state.producer_validation_failure
+    if counter:
+        lines.append(
+            f"  {counter['phase']} validation failures: {counter['count']} of "
+            f"{MAX_FAILURE_COUNT} (last: record #{counter['last_record_seq']}, commit "
+            f"{counter['candidate_commit'][:12]})"
+        )
     if state.review_evidence:
         lines.append(
             f"  REVIEW evidence: round {state.review_evidence['review_round']}, "

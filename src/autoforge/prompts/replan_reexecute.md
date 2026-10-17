@@ -586,6 +586,12 @@ transaction id, after checking that the branch does not exist yet. A branch
 or a replacement PR for this transaction that the controller did not create
 from its own journal stops the run: it is never adopted.
 
+Before it pushes anything, the controller runs its configured validation
+commands (`validation.commands`, when any are configured) against the exact
+commit you report, each in a fresh export of its tree. If one does not pass,
+the replacement is refused, as a `tests_passed: false` result is, and
+nothing is pushed or created.
+
 ---
 
 # 16. No code inheritance rule

@@ -1359,12 +1359,14 @@ def test_an_unresolved_finding_blocks_instead_of_reaching_a_clean_review(tmp_pat
     carried the run to DONE with an acknowledged, unaddressed finding in the
     tree.
     """
-    root = local_repo(tmp_path)
+    root = local_repo(tmp_path / "repo")
     cfg = default_config()
     # A validation command that appends one character per run, so the test can
     # tell "ran for ANALYZE_EXECUTE" from "ran again for FIX": an unresolved
-    # finding is terminal *before* the FIX round's validation is executed.
-    tally = root / "VALIDATION_RUNS"
+    # finding is terminal *before* the FIX round's validation is executed. The
+    # tally is outside the repository: a command that changes the files the
+    # fingerprint covers on every run never converges (ADR 0006 D7.2).
+    tally = tmp_path / "VALIDATION_RUNS"
     cfg.local.validation_commands = [
         [sys.executable, "-c", f"open({str(tally)!r}, 'a').write('x')"]
     ]

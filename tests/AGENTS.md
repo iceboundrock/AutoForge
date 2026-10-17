@@ -38,7 +38,11 @@ read it before adding tests for a listed area.
 - `REVIEW` and `FIX` fetch the bound HEAD (and `REVIEW` the merge base)
   before launching the agent. An engine without an origin records that
   fetch in the `offline_fetches` fixture and fetches nothing; with
-  `origin=True` it fetches from the origin.
+  `origin=True` it fetches from the origin. Offline, a fetched head the
+  store does not hold reads as a stand-in commit whose tree is
+  `offline_tree(sha)`, so the REVIEW entry's `review_evidence` binding
+  (#173) can name it; a test that runs `validation.commands` at REVIEW
+  needs a real commit (`origin=True`).
 - The controller publishes `FIX` itself (#163): the fixer commits on its
   worktree's detached `HEAD` and the controller creates the follow-up
   issues, appends the markers and pushes the commit. A test that reaches
@@ -131,6 +135,9 @@ REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.
                                       protocol: test_state.py)
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py
                                       (engine, REMOTE and LOCAL; load and protocol: test_state.py)
+candidate validation gates (#173)     test_validation_gates.py (producers, REVIEW entry, LOCAL
+                                      convergence, override, provider parity; REPLAN
+                                      rejection: test_replan.py)
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
 Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)

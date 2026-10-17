@@ -312,7 +312,18 @@ verified: the run stops with the phase unchanged for `resume`. `--dry-run`
 lists them and executes none of them. The fingerprint a review is bound to
 is taken *after* they ran, so a build cache or a generated file they leave
 in the tree is part of the reviewed tree rather than a drift the next phase
-would refuse. They run under the same allow-listed environment as an agent
+would refuse. They must converge (ADR 0006 D7.2, #173): a passing command
+that changed the files the fingerprint covers passed on a tree that no
+longer exists, so the whole set runs once more from the tree it left,
+skipping what already ran there and left it unchanged. The phase is
+verified only when that confirming run ends on the same tree with every
+command passing; a command that rewrites covered files on every run (a
+timestamp, an appended log) never converges and leaves the phase
+unverified, naming the remedy: exclude what it writes (`local.exclude`, in
+a new local run) or make it not write covered files. An excluded path's
+own name is part of the fingerprint, so a command that only writes inside
+an excluded directory that already exists converges without a second run.
+They run under the same allow-listed environment as an agent
 (`execution.env_allowlist`), not the operator's whole shell, with the same
 variables the controller sets and the same preflight: a command gets no
 GitHub or git credential, and a refused preflight (a credential helper in
@@ -331,9 +342,18 @@ Every command that runs leaves a `ValidationRecord` in the state file
 the workspace it ran against (fingerprint, workspace-policy digest, run
 id), the command, policy P, the outcome (`PASS`, `FAIL`, `TIMEOUT`), the
 fingerprint of the tree before it ran and after (the next command's
-before), and a bounded, redacted tail of its output. The routing and the
-messages above are unchanged: the records are evidence beside them, and
-nothing yet reuses one to skip a command (#173). A `Ctrl-C` during a
+before), and a bounded, redacted tail of its output. A record is reused
+rather than run again (#173): a `PASS` that started and ended on the tree a
+command would run on, or a `FAIL` or `TIMEOUT` on it, which is final for
+that tree, so a relaunched agent that leaves the tree as it was fails
+again without the command running. `REVIEW` runs no command: before the
+reviewer launches, the controller binds the records the write phase made
+for the bound fingerprint (`review_evidence`), and the reviewer's prompt
+presents them (the command, its outcome, its exit status and duration).
+A run whose state has no such evidence (one persisted before the records
+existed) enters `BLOCKED` before the reviewer: "no validation evidence for
+this LOCAL run; start a new local run". A clean review over a record that
+did not pass is refused, as in REMOTE. A `Ctrl-C` during a
 command leaves an attempt marker; `resume` records it `INTERRUPTED` and
 runs the phase's commands again. At most 16 commands, each at most 32
 argv elements of at most 1,024 characters and 4,096 in all: a

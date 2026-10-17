@@ -1358,7 +1358,8 @@ def appended(records: Sequence[dict], record: dict, pinned: set[int]) -> list[di
             if old.get("seq") not in pinned:
                 del out[i]
                 break
-        else:  # pragma: no cover - pinned records are at most 2 x 16 + 1
+        else:  # pragma: no cover - pinned: a binding, a certificate, the counter's
+            # record and the set being run, at most 3 x 16 + 1
             break
     return out
 
@@ -1479,9 +1480,225 @@ class ValidationRun:
     records: tuple[dict, ...]
     definitions: int
 
+    # The seqs of ``records`` this call reused rather than ran (#173).
+    reused: tuple[int, ...] = ()
+
     @property
     def passed(self) -> bool:
         """Every definition of the set ran and passed (D10.6 stops at a non-PASS)."""
         return len(self.records) == self.definitions and all(
             r["outcome"] == Outcome.PASS.value for r in self.records
         )
+
+    def evidence(self) -> Evidence:
+        return Evidence(
+            candidate=self.candidate,
+            validation_set_digest=self.validation_set_digest,
+            policy=self.policy,
+            records=tuple(parse_record(r) for r in self.records),
+            definitions=self.definitions,
+        )
+
+
+# -- eligibility, reuse and the binding (D5.5, D7.2, D8.3, D10.6; #173) ----------------
+
+
+def eligible(
+    view: RecordView,
+    candidate: Candidate,
+    definition: Definition,
+    policy: Policy,
+    watermark: int | None,
+) -> bool:
+    """Whether ``view`` stands for ``definition`` of ``candidate`` under ``policy`` now.
+
+    The one eligibility rule every gate uses. The record is applicable
+    (:func:`applicable`: the candidate key, the definition digest at its
+    index, the policy digest, enforcement where the policy requires it; an
+    ``INTERRUPTED`` record never is), and:
+
+    - a ``PASS`` is evidence, and stays so across an override; in LOCAL only
+      when the run ended where it started (D7.2): a validator that changed
+      covered bytes passed on a tree that no longer exists;
+    - a ``FAIL`` or ``TIMEOUT`` is terminal, reused rather than run again,
+      unless its seq is at or below the operator's override watermark
+      (D14.2): it is then historical and the definition runs again.
+    """
+    if not applicable(view, candidate, definition.digest, policy):
+        return False
+    if view.outcome is Outcome.PASS:
+        return view.candidate.kind != KIND_LOCAL or view.end_fingerprint == view.start_fingerprint
+    return view.seq > (watermark or 0)
+
+
+def eligible_record(
+    records: Sequence[RecordView],
+    candidate: Candidate,
+    definition: Definition,
+    policy: Policy,
+    watermark: int | None,
+) -> RecordView | None:
+    """The newest :func:`eligible` record for ``definition``, or ``None``."""
+    for view in reversed(records):
+        if eligible(view, candidate, definition, policy, watermark):
+            return view
+    return None
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """What the retained records say about one candidate, set and policy (D10.6).
+
+    ``records`` are the eligible records in set order, stopping at the
+    first non-PASS, as a run of the set would. The evidence is *complete*
+    when every definition has a ``PASS``, *failed* when it stops at a
+    ``FAIL`` or ``TIMEOUT``, and otherwise has a definition no eligible
+    record covers, which a gate runs (REMOTE) or refuses (LOCAL REVIEW).
+    """
+
+    candidate: Candidate
+    validation_set_digest: str
+    policy: Policy
+    records: tuple[RecordView, ...]
+    definitions: int
+
+    @property
+    def complete(self) -> bool:
+        return len(self.records) == self.definitions and all(
+            r.outcome is Outcome.PASS for r in self.records
+        )
+
+    @property
+    def failed(self) -> RecordView | None:
+        """The ``FAIL`` or ``TIMEOUT`` the set stops at, or ``None``."""
+        if self.records and self.records[-1].outcome is not Outcome.PASS:
+            return self.records[-1]
+        return None
+
+    @property
+    def decided(self) -> bool:
+        """Complete or failed: nothing is left to run."""
+        return self.complete or self.failed is not None
+
+
+def find_evidence(
+    records: Sequence[RecordView],
+    candidate: Candidate,
+    defs: Sequence[Definition],
+    policy: Policy,
+    watermark: int | None,
+) -> Evidence:
+    """The candidate's evidence for ``defs`` from ``records`` alone; runs nothing."""
+    found: list[RecordView] = []
+    for definition in defs:
+        view = eligible_record(records, candidate, definition, policy, watermark)
+        if view is None:
+            break
+        found.append(view)
+        if view.outcome is not Outcome.PASS:
+            break
+    return Evidence(
+        candidate=candidate,
+        validation_set_digest=validation_set_digest(defs),
+        policy=policy,
+        records=tuple(found),
+        definitions=len(defs),
+    )
+
+
+def binding(review_round: int, evidence: Evidence) -> dict:
+    """The ``review_evidence`` value naming ``evidence`` for ``review_round`` (D11.2)."""
+    if not evidence.decided:
+        raise ValueError("a binding names complete or failed evidence only")
+    return {
+        "review_round": review_round,
+        "candidate": evidence.candidate.to_dict(),
+        "records": [{"seq": r.seq, "digest": r.digest} for r in evidence.records],
+        "validation_set_digest": evidence.validation_set_digest,
+        "policy_digest": evidence.policy.digest,
+    }
+
+
+def bound_records(raw: Mapping[str, object], records: Sequence[RecordView]) -> list[RecordView]:
+    """The records a loaded binding names, in its order (:func:`check_evidence` proved them)."""
+    by_seq = {r.seq: r for r in records}
+    pairs = raw.get("records")
+    named: list[RecordView] = []
+    for pair in pairs if isinstance(pairs, list) else ():
+        view = by_seq.get(pair["seq"])
+        if view is None or view.digest != pair["digest"]:
+            raise StateError(
+                f"state field 'review_evidence' names record seq {pair['seq']}, "
+                "which is not retained under that digest"
+            )
+        named.append(view)
+    return named
+
+
+def binding_reusable(
+    raw: Mapping[str, object],
+    records: Sequence[RecordView],
+    *,
+    review_round: int,
+    candidate: Candidate,
+    validation_set_digest: str,
+    policy_digest: str,
+    watermark: int | None,
+) -> bool:
+    """D5.5, D5.7: whether a persisted binding is evidence for this launch, unchanged.
+
+    Its round is the upcoming one, its candidate is the one just bound (the
+    PR head's commit in REMOTE, the bound fingerprint's identity in LOCAL),
+    its set and policy digests are the ones in force, and no record it
+    names is a ``FAIL`` or ``TIMEOUT`` the operator's override made
+    historical.
+    """
+    if not raw:
+        return False
+    bound = parse_candidate(raw.get("candidate"), "state field 'review_evidence'.candidate")
+    if isinstance(candidate, RemoteCandidate):
+        if not isinstance(bound, RemoteCandidate) or bound.commit != candidate.commit:
+            return False
+    elif bound.identity != candidate.identity:
+        return False
+    if (
+        raw.get("review_round") != review_round
+        or raw.get("validation_set_digest") != validation_set_digest
+        or raw.get("policy_digest") != policy_digest
+    ):
+        return False
+    floor = watermark or 0
+    return not any(
+        r.outcome is not Outcome.PASS and r.seq <= floor for r in bound_records(raw, records)
+    )
+
+
+def failure_counter(phase: str, previous: Mapping[str, object], record: RecordView) -> dict:
+    """``producer_validation_failure`` after one more failure of ``phase`` (D5.2).
+
+    Counted per phase entry, whichever candidate failed: the count goes on
+    from the phase's own counter, and starts at 1 otherwise. The bound is
+    the caller's (:data:`MAX_FAILURE_COUNT`), and the count never passes it.
+    """
+    candidate = record.candidate
+    if not isinstance(candidate, RemoteCandidate) or record.outcome not in (
+        Outcome.FAIL,
+        Outcome.TIMEOUT,
+    ):
+        raise ValueError("the counter names a REMOTE FAIL or TIMEOUT record")
+    count = previous.get("count") if previous.get("phase") == phase else 0
+    return {
+        "phase": phase,
+        "count": min((count if isinstance(count, int) else 0) + 1, MAX_FAILURE_COUNT),
+        "candidate_commit": candidate.commit,
+        "last_record_seq": record.seq,
+    }
+
+
+def duration_seconds(view: RecordView) -> float | None:
+    """How long an observed record's launch ran, from its own times; ``None`` for none."""
+    if not view.is_observed:
+        return None
+    started = datetime.fromisoformat(view.raw["started_at"])
+    finished = datetime.fromisoformat(view.raw["finished_at"])
+    return max((finished - started).total_seconds(), 0.0)

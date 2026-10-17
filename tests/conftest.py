@@ -28,7 +28,7 @@ from autoforge.errors import (  # noqa: E402
     GitHubUnavailableError,
 )
 from autoforge.executor import ExecutionResult  # noqa: E402
-from autoforge.git_transport import GitRemote, GitTransport  # noqa: E402
+from autoforge.git_transport import CommitRecord, GitRemote, GitTransport  # noqa: E402
 from autoforge.github import (  # noqa: E402
     ChangedFile,
     ChangedFiles,
@@ -1547,6 +1547,19 @@ def _no_network_git_remote(monkeypatch):
             _OFFLINE_FETCHES.append(list(revisions))
             return None
 
+        def read_local_commit(self, sha: str):
+            # A revision a test without an origin "fetched" (a scripted
+            # reviewer's PR head, never read) is not in the store. Its REVIEW
+            # entry still names it as a candidate, commit and tree (ADR 0006
+            # D5.5, #173): the stand-in's tree is derived from the SHA, so it
+            # is stable per head. A commit the store holds is read as it is.
+            found = super().read_local_commit(sha)
+            if found is not None or not isinstance(self.remote, OfflineRemote):
+                return found
+            if not any(sha in fetched for fetched in _OFFLINE_FETCHES):
+                return None
+            return CommitRecord(sha=sha, parents=(), message="", tree=offline_tree(sha))
+
         def push(self, *args, **kwargs):
             if isinstance(self.remote, OfflineRemote):
                 raise AssertionError(
@@ -1772,6 +1785,14 @@ def sandbox_probe(monkeypatch) -> SandboxProbe:
 def offline_fetches() -> list[list[str]]:
     """The fetches of this test's engines that have no origin, in order."""
     return _OFFLINE_FETCHES
+
+
+def offline_tree(sha: str) -> str:
+    """The tree an offline-fetched stand-in commit names (see ``_no_network_git_remote``)."""
+    import hashlib
+
+    digest = hashlib.sha256(f"tree of {sha}".encode()).hexdigest()
+    return digest[: len(sha)]
 
 
 @pytest.fixture

@@ -13,6 +13,8 @@ review comment to post anywhere.
 - Not covered by the fingerprint you are reviewing: {{WORKSPACE_EXCLUSIONS}}
 - Base git HEAD at run creation: {{BASE_HEAD_SHA}}
 
+{{VALIDATION_EVIDENCE}}
+
 ## Steps
 
 1. Read the repository's `AGENTS.md` / `CLAUDE.md` if present.
@@ -83,7 +85,8 @@ information-only remarks. Do not hide real defects as observations either.
   It binds this review to the exact code you reviewed; the controller rejects
   any other value.
 - `"needs_fix_round"` must be `true` if and only if `findings` is non-empty.
-  The controller rejects results where the two disagree.
+  The controller rejects results where the two disagree, and refuses
+  `false` while any validation command above did not pass.
 - `"findings"` is an empty list when the implementation is clean.
 - Bounds: at most {{MAX_FINDINGS_PER_REVIEW}} findings per round;
   `required_resolution` at most {{MAX_FINDING_RESOLUTION_CHARS}} characters,

@@ -151,6 +151,77 @@ workflow:
 
 ---
 
+## Candidate validation gates
+
+ADR 0006 §2.5 (#173): the controller's own validation commands
+(`validation.commands` in REMOTE, `local.validation_commands` in LOCAL) gate
+the existing transitions; they add no phase and no edge. Every gate decides
+from one eligibility rule (`evidence.eligible`): a record is evidence for a
+definition of a candidate when it is applicable (the candidate's identity,
+the definition's digest at its index, policy P's digest, enforcement where P
+requires it) and is a `PASS` (in LOCAL, one that ended on the tree it
+started on), or a `FAIL` or `TIMEOUT` above the override watermark, which is
+terminal and reused rather than run again. `INTERRUPTED` never is. A set
+stops at its first non-`PASS`.
+
+- **REMOTE producers** (`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`). After
+  the result's check accepted the candidate, and before the first intent is
+  planned, the exact accepted commit (never `HEAD` read again) is validated,
+  each definition in a fresh export of its tree; what the records already
+  hold for it is reused. Nothing is pushed, created or reviewed unless every
+  definition passed. In `ANALYZE_EXECUTE` and `FIX` a failure is not a
+  `VerificationError`: the record and `producer_validation_failure` (phase,
+  count, candidate commit, the record's seq) are one save, the step ends
+  without a transition, and the next step relaunches the agent with a
+  "validation failed" section in its prompt (the record's trusted
+  provenance and its output tails fenced as untrusted data). The counter is
+  per phase entry: it counts whichever candidate failed, handing back the
+  same failing candidate counts again without running anything, and every
+  save in another phase clears it. The third failure (`MAX_FAILURE_COUNT`)
+  blocks, naming the candidate, the definition index and the record; a
+  crash between that save and the `BLOCKED` write blocks at the next entry
+  without relaunching. A `REPLAN_REEXECUTE` replacement that fails takes the
+  rejection path of a `tests_passed: false` result, no counter and no
+  relaunch, with the rejection in the save that appends the record
+  ([replan-transaction.md](replan-transaction.md)). A run that cannot
+  conclude (a setup failure the bound did not absorb, a refused launch)
+  blocks with nothing published.
+- **REMOTE `REVIEW` entry.** After the head is bound and fetched, and before
+  the reviewer launches, the PR head's evidence is reused from the records
+  (the normal path: the producer just validated and published that commit)
+  or run now (a human's push, a run that crossed the upgrade), and the
+  `review_evidence` binding naming it (round, candidate, records by seq and
+  digest, set and policy digests) is saved with the launch. A binding of
+  the upcoming round, the bound head, and the set and policy in force,
+  naming no overridden failure, is reused unchanged (a relaunch, a
+  correction); any other is replaced. A round completed from #162's journal
+  validates nothing. A `FAIL` here is no refusal: the reviewer sees it.
+- **What the reviewer sees** (D9.1, D9.2). The prompt's evidence section is
+  rendered from the bound records alone: per record the definition index and
+  argv, the outcome, exit status, duration, enforcement facts and
+  provenance; the output tails of a non-`PASS` record only, each fenced as
+  untrusted data; for an empty set, "no controller validation is
+  configured". A `CONTROL_RESULT` carries no evidence field, so evidence an
+  agent writes is ignored.
+- **A clean result over a failure** (D9.4). A `REVIEW` result with
+  `needs_fix_round: false` while a presented record is not `PASS` is refused
+  in the correction loop, before anything is published; at the correction
+  bound it is the usual `ControlResultValidationError` and the phase stays.
+- **LOCAL** (D7.2, D5.7). The write phases run the set in place and must
+  converge: a passing command that changed covered bytes (F0 -> F1) causes
+  one confirming run of the set from F1, reusing what already ran on F1 and
+  stayed there; anything but ending on F1 with every command passing is
+  "not verified" naming `local.exclude` as the remedy. A tree with a
+  terminal `FAIL` is not run again while it is unchanged. LOCAL `REVIEW`
+  runs nothing: it binds the evidence the write phase recorded for the
+  bound fingerprint, and a run with none (state from before the records
+  existed) blocks: "no validation evidence for this LOCAL run; start a new
+  local run".
+- **The override watermark** is the operator's: only an applied REMOTE
+  unblock sets it (**Leaving BLOCKED** below).
+
+---
+
 ## Bind reviews to PR HEAD SHA and to the PR identity
 
 A clean review is valid only for the exact change it reviewed: the commit,
@@ -615,6 +686,16 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   phase, detail, and `action` for an approval or a decline) and to the run log, `block_reason` is cleared and `attempt`
   reset. No agent runs and no step is charged: the operator reviews the
   outcome and runs `resume`, whose entry probe for that phase runs again.
+- **The validation override watermark** (ADR 0006 D14.2, #173). An applied
+  unblock is the operator's override of what candidate validation recorded
+  so far: the same write sets `validation_override_seq` to the highest
+  retained record seq (0 when there is none), and the message, the run-log
+  record (`metadata.validation_override_seq`) and the dry-run plan show it.
+  A `FAIL` or `TIMEOUT` at or below the watermark is historical: the next
+  gate validates the same candidate again instead of reusing it, and a
+  binding that names one is not reused. A `PASS` stays evidence. A refusal
+  sets nothing, and no automatic path (a `resume`, a relaunch, a bound)
+  ever writes the watermark. See **Candidate validation gates** above.
 - **Dry-run** reads GitHub, reports the phase it would re-enter or the
   refusal, and writes nothing (no state, no log, no lock).
 

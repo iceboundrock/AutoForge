@@ -706,7 +706,9 @@ def test_the_dry_run_plan_lists_the_set_and_runs_nothing(tmp_path):
     assert "candidate validation (validation.commands): 2 definition(s)" in notes
     assert "validation definition [1]: 'make lint'" in notes
     assert "mode disabled" in notes and "unsandboxed" in notes
-    assert "no REMOTE phase runs validation.commands yet" in notes
+    # #173: the plan says where the set gates.
+    assert "validation.commands gate every REMOTE candidate" in notes
+    assert "before anything is pushed or published" in notes
     assert not ran.exists()
 
 
@@ -727,11 +729,17 @@ def test_a_local_validation_leaves_records_with_start_and_end_fingerprints(tmp_p
     eng.run(max_steps=2)
     state = saved(eng)
     assert state.phase == Phase.REVIEW
-    first, second = state.validation_records
+    first, second, confirming = state.validation_records
     assert first["candidate"]["kind"] == "local" and first["outcome"] == "PASS"
     assert first["start_fingerprint"] != first["end_fingerprint"]  # the validator wrote a file
     assert second["start_fingerprint"] == first["end_fingerprint"]
     assert second["end_fingerprint"] == state.workspace_fingerprint
+    # D7.2 (#173): the first command changed covered bytes, so the set ran once
+    # more from the tree it left. The second command started and ended there,
+    # so its record is reused; the generator runs again and stays there too.
+    assert confirming["definition"]["index"] == 0 and confirming["outcome"] == "PASS"
+    assert confirming["start_fingerprint"] == confirming["end_fingerprint"]
+    assert confirming["end_fingerprint"] == state.workspace_fingerprint
     assert first["candidate"]["run_id"] == state.run_id
     assert first["candidate"]["workspace_policy_digest"] == (
         eng.local_contract().workspace_policy.digest()

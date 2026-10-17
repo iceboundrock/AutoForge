@@ -119,6 +119,34 @@ findings=[] and needs_fix_round=true
 findings=[...] and needs_fix_round=false
 ```
 
+### Review results and the controller's validation evidence
+
+ADR 0006 D9.3, D9.4 (#173). The reviewer's prompt holds the controller's
+evidence section: the validation records the round's `review_evidence`
+binding names, rendered from state ([workflow.md](workflow.md), "Candidate
+validation gates"). The `REVIEW` schema has no evidence field: a result
+cannot report, confirm or contradict a validation outcome, and an unknown
+key that claims one is ignored like any other. What the controller holds
+the reviewer to is the comparison of its verdict with what it presented:
+
+```text
+needs_fix_round == false  and  a presented record is not PASS   -> refused
+```
+
+The refusal is a correction in `_invoke_phase`, in REMOTE and LOCAL alike,
+before anything is planned or posted. Its text names each failing
+definition by its index and asks for an actionable finding that names it.
+At the correction bound it is the usual `ControlResultValidationError`:
+the phase stays `REVIEW` and nothing is published. A result with findings
+over a failure, and a clean result over all-`PASS` records or an empty set,
+are accepted as before.
+
+Producers (`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`) are not asked
+about validation either: their `tests` / `verification` fields stay the
+agent's account, and the controller validates the exact candidate the
+result names before anything is published. A failure there is not a
+correction of the result; see the workflow guide.
+
 ### Review payload bounds
 
 Review output is untrusted project data, and every accepted finding is

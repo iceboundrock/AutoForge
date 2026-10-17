@@ -282,8 +282,21 @@ six fields, in REMOTE and LOCAL state alike:
 - `review_evidence`, `review_certificate`, `producer_validation_failure`
   and `validation_override_seq`: the review binding, the review
   certificate, the producer failure counter and the operator's override
-  watermark. #173 writes them; #172 validates them on load and keeps the
-  records they name.
+  watermark. #172 validates them on load and keeps the records they name;
+  #174 issues the certificate. #173 writes the other three
+  ([workflow.md](workflow.md#candidate-validation-gates)): the `REVIEW`
+  entry saves the binding with the reviewer's launch (a relaunch for the
+  same round, head, set and policy reuses it); a REMOTE producer's failure
+  saves the counter with the failing record in one write, and every save
+  in another phase clears it, so it counts one phase entry; an applied
+  REMOTE `unblock` sets the watermark to the highest retained seq (0 for
+  none) in its own write, and nothing else sets it.
+- Recovery: a crash after a failing record's save resumes with the count
+  it saved, and one after the save that reached the bound blocks at the
+  next entry without relaunching. A crash after a `PASS`, before the plan,
+  reuses the record when the agent hands back the same commit. A record
+  is never rewritten to change what a gate decides; only the operator's
+  watermark makes a failure historical.
 
 **Bounds** (D10.3, `evidence.py`'s constants, part of the protocol): at
 most 64 records; at most 16 definitions per set and so 16 records per
@@ -316,6 +329,10 @@ else is a `StateError`: never clipped, defaulted or repaired.
 
 **Retention** (D11.4): a record past the 64th evicts the oldest one no
 binding, certificate or counter names; a named record is never evicted.
+Nor is a record of the set being run (#173): a gate that reuses some of a
+candidate's records and runs the rest pins both while it appends, so the
+binding or counter it writes next never names an evicted record (at most
+3 x 16 + 1 records are pinned, below the bound).
 
 **Read-only load** (D11.3): loading reports a pending marker
 (`status` shows it as "Pending attempt", the dry-run plan as a note) and
