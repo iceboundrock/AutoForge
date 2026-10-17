@@ -146,6 +146,36 @@ High-priority coverage includes:
   `status --json` show it, its applicability and the not-a-permission
   note; no prompt, read context or published payload carries it; Claude
   Code, OpenCode and Pi issue the same certificate
+- the merge gate's certificate check (#175, `tests/test_merge_certificate.py`,
+  with the existing merge tests in `tests/test_engine.py` certifying their
+  hand-built clean reviews): in `READY_FOR_MERGE` and in `MERGE`, an
+  applicable certificate continues to the existing merge with every live
+  gate, `merge.verification_commands` and its cache included; none held, a
+  set or policy changed since issuance (timeout, sandbox mode, allow-list,
+  the set), and each other requirement failing alone (digest, PR, base,
+  merge base, comment, round, a missing or non-`PASS` record) block in one
+  write naming it, before the comment is re-read or any command runs, with
+  nothing merged or counted; a restored configuration unblocks to
+  `READY_FOR_MERGE` and merges with no new round, an unchanged one unblocks
+  to a fresh validated `REVIEW`; HEAD drift, failing CI, a failing
+  verification command, a deleted comment and `BEHIND` still refuse with a
+  certificate held; the dry-run plan and the closed-gate `resume` banner say
+  whether it applies, from state, with no GitHub read; the invalidation
+  matrix: a push (a new commit, the same tree, a force push) certifies the
+  new head alone, a base that only advanced keeps the certificate, a
+  rewritten base or a retarget reuses the records and certifies the new
+  base, an edited or doubled comment is refused by the #94 re-read, a
+  certificate of an earlier round stays as history while a producer
+  validates a new set, a replan replacement inherits nothing, and LOCAL
+  fingerprint drift certifies nothing, with no GitHub call; the crash
+  windows: a saved gate pass reruns the whole gate in `MERGE`, a crash
+  after the merge call is counted once with or without a certificate, a
+  crash during a verification command reruns it after the certificate
+  check, a push while the `REVIEW` entry validates is a stale round that
+  certifies nothing and the next round certifies the new head, a restart
+  merges, and a legacy state in `REVIEW`,
+  `READY_FOR_MERGE`, `MERGE` or `BLOCKED` reaches a validated, certified
+  merge; Claude Code, OpenCode and Pi route the gate alike
 
 ### Transitions
 

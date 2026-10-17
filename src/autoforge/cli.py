@@ -497,7 +497,11 @@ def _finish(
     state = engine.state
     assert state is not None
     if state.phase == Phase.READY_FOR_MERGE:
-        print_ready_banner(state, gate_open=engine.merge_gate_open(allow_merge))
+        print_ready_banner(
+            state,
+            gate_open=engine.merge_gate_open(allow_merge),
+            certificate=_review_certificate_check(engine, state),
+        )
         return 0
     if state.phase in (Phase.BLOCKED, Phase.FAILED):
         # The whole line is state-derived (`run_id` is a validated path
@@ -787,8 +791,10 @@ def _resume_holding_state(
         # Holding state: nothing runs unless the merge gate is open. With the
         # gate open, engine.run() performs the controller-side pre-merge
         # verification instead (bounded re-checks of inconclusive GitHub data
-        # happen there, one attempt per resume).
-        print_ready_banner(state)
+        # happen there, one attempt per resume), the review certificate's
+        # live check included (#175); the banner says only whether it
+        # applies against state and the configuration in force.
+        print_ready_banner(state, certificate=_review_certificate_check(engine, state))
         return 0
     if state.phase in TERMINAL_PHASES:
         if state.phase == Phase.DONE:
@@ -1382,7 +1388,28 @@ def _render_local_status(
 
 
 # -- pretty printing ----------------------------------------------------------
-def print_ready_banner(state: AutoForgeState, gate_open: bool = False) -> None:
+def print_ready_banner(
+    state: AutoForgeState,
+    gate_open: bool = False,
+    certificate: tuple[bool | None, str] | None = None,
+) -> None:
+    """The READY_FOR_MERGE banner; ``certificate`` is :func:`_review_certificate_check`'s answer.
+
+    Whether the review certificate applies is read from state and the
+    configuration in force, never GitHub: the merge gate compares it with
+    the live PR itself (#175), and refuses to merge without one.
+    """
+    if not state.review_certificate:
+        held = "none held; the merge gate would refuse to merge"
+    elif certificate is None or certificate[0] is None:
+        held = certificate[1] if certificate is not None else "not checked"
+    elif certificate[0]:
+        held = (
+            f"applies (round {state.review_certificate.get('review_round')}, against state and "
+            "the configuration in force; the merge gate checks it against GitHub too)"
+        )
+    else:
+        held = f"does not apply ({certificate[1]}); the merge gate would refuse to merge"
     lines = [
         "",
         "=" * 72,
@@ -1394,6 +1421,7 @@ def print_ready_banner(state: AutoForgeState, gate_open: bool = False) -> None:
         f"  Reviewed base: {state.reviewed_base_ref or '-'}",
         f"  Reviewed merge base: {state.reviewed_merge_base_sha or '-'}",
         f"  Review:        {state.last_review_comment_url or '-'}",
+        f"  Review certificate: {held}",
     ]
     if gate_open:
         lines += [

@@ -386,6 +386,19 @@ def test_the_round_must_be_the_completed_round(held):
     )
 
 
+@pytest.mark.parametrize("result", ["stale", "needs_fix", "fixed", ""])
+def test_the_completed_round_must_still_be_clean(held, result):
+    """#175: a drift the controller observed marks the round ``stale`` and
+    leaves its binding where it was; the certificate of that round no longer
+    applies, whatever else still matches."""
+    _, cert, state = held
+    state.last_review_result = result
+    assert certificate_problem(cert, state, configured(DEF0, DEF1)) == (
+        f"the state's last review result is {result or 'unrecorded'!r}, not the clean round "
+        "it certifies"
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -535,6 +548,7 @@ def local_state(records, **over) -> AutoForgeState:
         phase=Phase.DONE,
         local_run_contract=LOCAL_CONTRACT,
         review_round=1,
+        last_review_result="clean",
         workspace_fingerprint=FINGERPRINT,
         reviewed_workspace_fingerprint=FINGERPRINT,
         validation_records=list(records),

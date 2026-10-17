@@ -389,10 +389,12 @@ def certificate_problem(
     Checked, in this order, each failing with one bounded reason: it is
     held, its kind is the run's mode, its digest verifies and it loads as
     a certificate against the state's records (D11.1); its round is the
-    state's completed round; its review binding equals the state's (REMOTE:
-    PR, HEAD, base ref and merge base, its candidate's commit is the
-    reviewed HEAD and its comment is ``last_review_comment_url``; LOCAL: the
-    reviewed workspace fingerprint, under this run's contract); the
+    state's completed round, and that round's result is still ``clean`` (an
+    observed drift marks it ``stale``, #175); its review binding equals the
+    state's (REMOTE: PR, HEAD, base ref and merge base, its candidate's
+    commit is the reviewed HEAD and its comment is
+    ``last_review_comment_url``; LOCAL: the reviewed workspace fingerprint,
+    under this run's contract); the
     configuration in force yields its set and policy digests
     (:func:`configuration_drift`); and every record it names is eligible
     evidence for its candidate under that set and policy
@@ -426,6 +428,13 @@ def certificate_problem(
         return (
             f"it is of review round {certificate['review_round']}, not of the completed round "
             f"{state.review_round}"
+        )
+    if state.last_review_result != "clean":
+        # #175: a drift the controller observed (a push, a retarget, a
+        # rewritten base) marks the round stale without moving its binding.
+        return (
+            f"the state's last review result is {state.last_review_result[:32] or 'unrecorded'!r}"
+            ", not the clean round it certifies"
         )
     problem = (
         _local_binding_problem(certificate, state)

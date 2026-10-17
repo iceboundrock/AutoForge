@@ -131,9 +131,15 @@ exact triggers are in [Workflow: loop bounds](agent-guides/workflow.md#loop-boun
 When the loop reaches `READY_FOR_MERGE` with the merge gate closed (the
 default) the CLI prints a banner with the issue, PR, review round and reviewed
 HEAD, and states that automatic merge is disabled: a human merges the PR.
-`resume` without the gate open re-prints the banner and runs nothing. With the
-gate open (`resume --allow-merge` / `step --allow-merge`) the controller
-continues through its own pre-merge verification, `MERGE` and `UPDATE_EPIC`.
+`resume` without the gate open re-prints the banner and runs nothing. The
+banner's `Review certificate:` line says whether the round's certificate
+applies, checked against the state and the configuration in force (GitHub
+is not read): `applies (round N, ...)`, `does not apply (<reason>)` or
+`none held`; in the last two cases the merge gate would refuse to merge.
+With the gate open (`resume --allow-merge` / `step --allow-merge`) the
+controller continues through its own pre-merge verification, `MERGE` and
+`UPDATE_EPIC`, and checks the certificate against the PR GitHub returns as
+part of it.
 
 The gate opens only when both `safety.allow_merge: true` is set in config and
 `--allow-merge` is passed on the CLI. Pre-merge verification fails closed:
@@ -141,7 +147,12 @@ conclusive negatives are `BLOCKED`, inconclusive GitHub data keeps the phase
 for another `resume --allow-merge` (at most
 `merge.max_verification_attempts` times, then `BLOCKED`), and a PR that
 changes `safety.protected_merge_paths` (default `.github/workflows/`) is
-never merged unattended. The full gate, including the check-definition
+never merged unattended. Every gate pass also requires the round's review
+certificate to apply to the live PR and to the configuration in force,
+before the review comment is re-read or any local command runs; a refusal
+is `BLOCKED`, never retried (see
+[Candidate validation evidence](#candidate-validation-evidence) for the
+`unblock` that follows). The full gate, including the check-definition
 comparison and the optional controller-run `merge.verification_commands`,
 is in [GitHub safety: merge safety](agent-guides/github-safety.md#merge-safety).
 
@@ -813,7 +824,12 @@ To continue under this command's configuration instead, repeat it with --accept-
 Everything else in the configuration may change between commands without a
 refusal: the loop bounds and step budget, the merge gate, `env_allowlist`,
 the `sandbox` section, and a profile's `command`, `extra_args` and `options`. The
-record holds none of them, and no value that could carry a secret.
+record holds none of them, and no value that could carry a secret. The
+validation evidence does depend on some of them: `validation.commands`,
+the allow-list, `execution.command_timeout_seconds` and the `sandbox`
+section are what candidate validation runs under, so editing one after a
+clean review is not refused here but makes the merge gate refuse
+([Candidate validation evidence](#candidate-validation-evidence)).
 
 `--dry-run` makes the same comparison and writes nothing. It refuses as the
 command would, or, with `--accept-config-change`, says what it would accept.
@@ -893,6 +909,38 @@ certificate is still issued from what was presented and the run blocks
 naming the change: restore the configuration and `unblock` (the certificate
 then applies and `READY_FOR_MERGE` is re-entered), or `unblock` under the
 new configuration, which decides a fresh `REVIEW` round validated under it.
+
+The merge gate requires the certificate too (#175): every pass, in
+`READY_FOR_MERGE` and again in `MERGE`, checks that it applies to the PR,
+HEAD, base and merge base GitHub returns and to the validation set and
+policy in force, before the review comment is re-read or any
+`merge.verification_commands` command runs. Every other check is kept, and
+`merge.verification_commands` still runs (and is cached) as before. A
+refusal is `BLOCKED` with nothing merged or counted:
+
+- **None held** ("no applicable ReviewCertificate for HEAD <sha>; unblock
+  to run a new validated REVIEW round"): a state from before certificates,
+  or one that reached the gate without the clean round that issues one.
+  `autoforge unblock` decides `REVIEW`; the new round validates the head and
+  its clean result issues the certificate the gate needs.
+- **The validation set or policy changed since the clean review**: editing
+  `validation.commands`, the timeout, the environment allow-list or the
+  sandbox mode (or, with the sandbox on, `sandbox.validation_network` or
+  `sandbox.read_only_paths`) changes the set or policy digest the
+  certificate states, and the reason names which.
+  Restore the configuration and `unblock`: the certificate applies again,
+  `READY_FOR_MERGE` is re-entered and the next `resume --allow-merge`
+  re-verifies the PR on GitHub. Or keep the new configuration and `unblock`:
+  it decides `REVIEW`, a fresh round validated under it. Nothing reruns the
+  review by itself.
+- **Any other mismatch** (a hand-edited state, a certificate for another
+  PR, base, merge base, comment or round) names what failed and is never
+  coerced; `unblock` decides `REVIEW`.
+
+A push to the PR, a retarget or a rewritten base still goes back to
+`REVIEW` before the certificate is consulted, and the new round certifies
+the new revision; a base that only advanced keeps it. A PR already merged
+on GitHub is counted once without one, as before.
 
 LOCAL runs show the same block for their `local.validation_commands`
 records ([Local mode](local-mode.md#validation-commands)).
