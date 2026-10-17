@@ -1063,6 +1063,24 @@ def certificate_digest(certificate: Mapping[str, object]) -> str:
     return _sha256({k: v for k, v in certificate.items() if k != "digest"})
 
 
+def check_certificate(
+    raw: Mapping[str, object],
+    records: Sequence[RecordView],
+    *,
+    local: bool,
+    repository: str,
+    run_id: str,
+) -> None:
+    """One certificate against the retained ``records``, exactly as a load checks it (D11.1).
+
+    The writer's check (:mod:`autoforge.certificate` never builds one a load
+    refuses) and the applicability check's first step.
+    """
+    if not isinstance(raw, dict):
+        _fail("state field 'review_certificate'", "must be an object")
+    _check_certificate(raw, {r.seq: r for r in records}, local, repository, run_id)
+
+
 def _check_certificate(
     raw: dict, by_seq: Mapping[int, RecordView], local: bool, repository: str, run_id: str
 ) -> None:

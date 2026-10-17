@@ -77,6 +77,8 @@ materialize.py      byte-exact export of a candidate commit from the shared obje
                     and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171)
 evidence.py         candidate validation evidence: definitions, policy P, ValidationRecords,
                     the attempt marker, their bounds and integrity checks; pure (ADR 0006, #172)
+certificate.py      review certificates: issuance from the review binding, applicability
+                    (certificate_problem) and the not-a-merge-permission wording; pure (ADR 0006 D12, #174)
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
 state.py            persisted controller state, atomic writes, schema/protocol checks
 run_contract.py     the durable contract of a LOCAL run
@@ -130,6 +132,7 @@ table keyed by file, for a task that starts from a module name.
 
 ```text
 transitions.py, profiles.py, loop_guard.py, replan.py,
+certificate.py,
 engine.py (phase sequencing, resume)             -> docs/agent-guides/workflow.md
 replan_txn.py, engine.py (REPLAN_REEXECUTE),
 prompts/replan_reexecute.md                       -> docs/agent-guides/replan-transaction.md (+ workflow.md)
@@ -140,8 +143,9 @@ verification, merge gate, dry-run, read context),
 prompts/update_epic*.md                           -> docs/agent-guides/github-safety.md
                                                      (+ docs/adr/0004-authority-boundary-and-
                                                      typed-external-effects.md for effects)
-state.py, effects.py, evidence.py, run_contract.py,
-safefs.py, config_fingerprint.py, locking.py, errors.py,
+state.py, effects.py, evidence.py, certificate.py,
+run_contract.py, safefs.py, config_fingerprint.py,
+locking.py, errors.py,
 engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
 providers.py, pi_rpc.py, claude_stream.py,
 progress.py, loop_detect.py, executor.py,

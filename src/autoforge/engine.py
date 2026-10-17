@@ -123,6 +123,15 @@ from .agent_worktree import (
     read_candidate,
     registered_worktree_roots,
 )
+from .certificate import (
+    CertificateIssuanceError,
+    Configured,
+    Revision,
+    certificate_problem,
+    configuration_drift,
+    local_certificate,
+    remote_certificate,
+)
 from .child_env import (
     describe_overrides,
     isolated_overrides,
@@ -238,6 +247,7 @@ from .errors import (
     SandboxTamperError,
     StateError,
     StateTransitionError,
+    ValidationDefinitionError,
     ValidationInconclusiveError,
     ValidationInterruptedError,
     VerificationError,
@@ -4581,10 +4591,33 @@ class ControllerEngine:
             )
         state.last_review_result = "clean"
         state.open_findings = []
+        # ADR 0006 D12.5: DONE only with a certificate, issued in the DONE
+        # write from the round's binding and the fingerprint the reviewer
+        # was bound to and re-checked against. GitHub is never consulted.
+        uncertified, _ = self._issue_review_certificate(
+            lambda records: local_certificate(
+                state.review_evidence,
+                records,
+                run_id=state.run_id,
+                review_round=res.round,
+                needs_fix_round=res.needs_fix_round,
+                actionable_findings=len(findings),
+                reviewed_workspace_fingerprint=bound,
+                issued_at=utcnow_iso(),
+            )
+        )
+        if uncertified:
+            return Phase.BLOCKED, (
+                f"local review round {res.round} was clean for workspace {bound[:16]}..., but "
+                f"{uncertified}, so DONE was not entered. The run stays on feature "
+                f"{state.feature_spec_path}; the work is left in the working tree exactly as it "
+                "is (nothing was committed, reverted or discarded). A LOCAL run has no unblock: "
+                "start a new local run"
+            )
         return nxt, (
-            f"local review round {res.round} clean for workspace {bound[:16]}...; "
-            f"REVIEW -> {nxt.value}. The implementation is in the working tree; committing "
-            "it is yours to do."
+            f"local review round {res.round} clean for workspace {bound[:16]}...; review "
+            f"certificate issued; REVIEW -> {nxt.value}. The implementation is in the working "
+            "tree; committing it is yours to do."
         )
 
     def _apply_local_fix(
@@ -5601,6 +5634,86 @@ class ControllerEngine:
             f"validation evidence ({detail}), so no reviewer was launched: a review is only "
             "ever bound to a workspace the controller validated"
         )
+
+    # -- the review certificate (ADR 0006 D12, #174) ---------------------------
+    def _configured_validation(self) -> Configured:
+        """The set and policy P in force: what a certificate must have been issued under.
+
+        REMOTE from ``validation.commands``, LOCAL from the run contract, each
+        under the policy its gates validate with (:meth:`_validation_policy`).
+        """
+        state = self._require_state()
+        if state.mode == WorkflowMode.LOCAL:
+            return Configured(
+                definitions(self.local_contract().validation_commands),
+                self._validation_policy(LaunchClass.LOCAL_VALIDATION),
+            )
+        return Configured(
+            definitions(self.config.validation.commands),
+            self._validation_policy(LaunchClass.EXPORT_COMMAND),
+        )
+
+    def review_certificate_problem(self, live: Revision | None = None) -> str:
+        """Why the held certificate does not apply now, or "" (ADR 0006 D12.3).
+
+        Against the state, the configuration in force and, when given, the
+        ``live`` PR revision (#175). Reads the configuration, never GitHub.
+        """
+        state = self._require_state()
+        try:
+            configured = self._configured_validation()
+        except ValidationDefinitionError as exc:
+            return f"the configured validation set is beyond its bounds ({exc})"
+        return certificate_problem(state.review_certificate, state, configured, live)
+
+    def _issue_review_certificate(
+        self, build: Callable[[list[RecordView]], dict]
+    ) -> tuple[str, bool]:
+        """The clean round's certificate, set in memory for the write that completes it (D12.2).
+
+        ``build`` issues it from the retained records
+        (:func:`~autoforge.certificate.remote_certificate` or
+        :func:`~autoforge.certificate.local_certificate`). The caller's
+        transition write saves it with the phase, so no state holds a
+        certificate for a phase that did not move, or a moved phase without
+        one. Returns ``("", False)`` when the round may complete, and
+        otherwise what blocks it and whether that is a drift:
+
+        - an input missing or inconsistent (D12.2), ``False``: no certificate
+          is written, and the one held before (another round's) stays;
+        - the binding's set or policy digest is not the configuration's
+          (D12.6), ``True``: the certificate is written all the same, issued
+          from the binding, and the same write enters ``BLOCKED`` naming the
+          change.
+        """
+        state = self._require_state()
+        try:
+            certificate = build(state.validation_evidence())
+            configured = self._configured_validation()
+        except (CertificateIssuanceError, ValidationDefinitionError) as exc:
+            return (
+                f"no review certificate was issued: {exc}. That is an invariant violation (the "
+                "REVIEW entry binds the round's validation before the reviewer launches)",
+                False,
+            )
+        drift = configuration_drift(certificate, configured)
+        if drift:
+            state.review_certificate = certificate
+            return (
+                f"its review certificate was issued, but {drift} after the reviewer was "
+                "presented its validation. The certificate states the set and policy the review "
+                "was presented under, never the ones in force (ADR 0006 D12.6)",
+                True,
+            )
+        problem = certificate_problem(certificate, state, configured)
+        if problem:
+            return (
+                "no review certificate was issued: the one built from the persisted inputs "
+                f"does not apply ({problem}). That is an invariant violation",
+                False,
+            )
+        state.review_certificate = certificate
+        return "", False
 
     def _validation_plan_notes(
         self, launch_class: LaunchClass, commands: Sequence[Sequence[str]]
@@ -6976,14 +7089,21 @@ class ControllerEngine:
                 pr=pr,
             )
         cap = next_round_cap_reason(state.review_round, self.config.workflow.max_review_rounds)
+        uncertified = ""
         if at_reviewed_revision and clean:
-            return UnblockDecision(
-                Phase.READY_FOR_MERGE,
-                f"PR {canonical} is OPEN at the clean-reviewed HEAD {reviewed[:12]} on "
-                f"{state.reviewed_base_ref!r}; READY_FOR_MERGE re-verifies it on GitHub before "
-                "any merge",
-                pr=pr,
-            )
+            # ADR 0006 D12.3: READY_FOR_MERGE is never entered to merge an
+            # open PR without an applicable certificate; with none, the
+            # decision is a fresh REVIEW round under the cap below.
+            uncertified = self.review_certificate_problem()
+            if not uncertified:
+                return UnblockDecision(
+                    Phase.READY_FOR_MERGE,
+                    f"PR {canonical} is OPEN at the clean-reviewed HEAD {reviewed[:12]} on "
+                    f"{state.reviewed_base_ref!r} and the review certificate of round "
+                    f"{state.review_round} applies; READY_FOR_MERGE re-verifies it on GitHub "
+                    "before any merge",
+                    pr=pr,
+                )
         if (
             at_reviewed_revision
             and state.last_review_result == RESULT_NEEDS_FIX
@@ -7004,9 +7124,18 @@ class ControllerEngine:
                 pr=pr,
             )
         if cap:
+            # A clean review the cap refuses to re-review says why it was
+            # not re-entered: the certificate may be the operator's to fix.
+            held = (
+                f"; its clean review of round {state.review_round} has no applicable review "
+                f"certificate ({uncertified})"
+                if uncertified
+                else ""
+            )
             return UnblockDecision(
                 None,
-                f"{cap}. Raise 'workflow.max_review_rounds' in the config, then unblock again",
+                f"{cap}{held}. Raise 'workflow.max_review_rounds' in the config, then unblock "
+                "again",
                 pr=pr,
             )
         if not review_is_this_pr or not reviewed:
@@ -7016,6 +7145,11 @@ class ControllerEngine:
                 f"its revision moved after review round {state.review_round} (HEAD "
                 f"{pr.head_sha[:12]} on {pr.base_ref!r}, reviewed {reviewed[:12]} on "
                 f"{state.reviewed_base_ref!r})"
+            )
+        elif uncertified:
+            why = (
+                f"its clean review of round {state.review_round} has no applicable review "
+                f"certificate ({uncertified})"
             )
         else:
             why = f"its last review is {state.last_review_result or 'unrecorded'!r}"
@@ -12119,8 +12253,48 @@ class ControllerEngine:
         state.open_findings = []
         self._record_review(round_, expected_head, RESULT_CLEAN, findings)
         nxt = self._next_phase(Phase.REVIEW, {"needs_fix_round": False})
+        # ADR 0006 D12.2: the certificate, issued in this transition's write
+        # from the round's binding and the comment the K4 read-back (or its
+        # journal's observation) identified; never from the configuration.
+        uncertified, drifted = self._issue_review_certificate(
+            lambda records: remote_certificate(
+                state.review_evidence,
+                records,
+                repository=state.repository,
+                run_id=state.run_id,
+                review_round=round_,
+                needs_fix_round=needs_fix_round,
+                actionable_findings=len(findings),
+                reviewed=Revision(
+                    state.reviewed_pr_url, expected_head, expected_base, expected_merge_base
+                ),
+                comment_url=comment_url,
+                marker_key={
+                    "review_round": claim.round,
+                    "reviewed_head_sha": claim.reviewed_head_sha,
+                    "reviewed_base_ref": claim.reviewed_base_ref or "",
+                    "reviewed_merge_base_sha": claim.reviewed_merge_base_sha or "",
+                },
+                issued_at=utcnow_iso(),
+            )
+        )
+        if uncertified:
+            remedy = (
+                "Restore the configuration and 'unblock': the certificate then applies and "
+                "READY_FOR_MERGE re-verifies the PR on GitHub. Or 'unblock' under the new "
+                "configuration: it decides REVIEW, a fresh round validated under it"
+                if drifted
+                else "Inspect the state ('autoforge status'), then 'unblock': with no "
+                "applicable certificate it decides REVIEW, a fresh round that validates and "
+                "reviews the PR again"
+            )
+            return Phase.BLOCKED, (
+                f"review round {round_} was clean for HEAD {expected_head[:12]}, but "
+                f"{uncertified}, so READY_FOR_MERGE was not entered. {remedy}"
+            )
         return nxt, (
-            f"review round {round_} clean for HEAD {expected_head[:12]}; REVIEW -> {nxt.value}"
+            f"review round {round_} clean for HEAD {expected_head[:12]}; review certificate "
+            f"issued; REVIEW -> {nxt.value}"
         )
 
     @staticmethod

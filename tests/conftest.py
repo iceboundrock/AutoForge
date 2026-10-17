@@ -23,12 +23,19 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from autoforge.certificate import Revision, remote_certificate  # noqa: E402
 from autoforge.config import default_config  # noqa: E402
 from autoforge.engine import ControllerEngine  # noqa: E402
 from autoforge.errors import (  # noqa: E402
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+)
+from autoforge.evidence import (  # noqa: E402
+    PrHeadProvenance,
+    RemoteCandidate,
+    binding,
+    find_evidence,
 )
 from autoforge.executor import ExecutionResult  # noqa: E402
 from autoforge.git_transport import CommitRecord, GitRemote, GitTransport  # noqa: E402
@@ -49,6 +56,7 @@ from autoforge.github import (  # noqa: E402
 )
 from autoforge.providers import ProviderRegistry, ScriptedProvider  # noqa: E402
 from autoforge.result_parser import BEGIN, END  # noqa: E402
+from autoforge.state import utcnow_iso  # noqa: E402
 from autoforge.validation import parse_issue_url  # noqa: E402
 
 EPIC = "https://github.com/owner/repo/issues/1"
@@ -1550,6 +1558,55 @@ def make_engine(
     if origin:
         eng.origin = attach_origin(eng)  # type: ignore[attr-defined]
     return eng
+
+
+def certify_review(eng: ControllerEngine, tree: str = "e" * 40) -> dict:
+    """Hold the certificate the REVIEW write of a hand-built clean review issues (#174).
+
+    A test that sets the review fields of a clean round directly, rather than
+    stepping a reviewer through REVIEW, holds no certificate; READY_FOR_MERGE
+    then refuses it, as ADR 0006 D12.3 requires. This binds the configured
+    validation set (empty by default) to the reviewed HEAD at ``tree`` and
+    issues the certificate the controller would have issued, exactly as
+    :meth:`ControllerEngine._complete_review` does, then saves the state.
+    """
+    state = eng.state
+    configured = eng._configured_validation()
+    candidate = RemoteCandidate(
+        state.repository,
+        "sha1",
+        state.reviewed_head_sha.lower(),
+        tree,
+        PrHeadProvenance(state.reviewed_pr_url),
+    )
+    records = state.validation_evidence()
+    evidence = find_evidence(records, candidate, configured.definitions, configured.policy, None)
+    state.review_evidence = binding(state.review_round, evidence)
+    state.review_certificate = remote_certificate(
+        state.review_evidence,
+        records,
+        repository=state.repository,
+        run_id=state.run_id,
+        review_round=state.review_round,
+        needs_fix_round=False,
+        actionable_findings=0,
+        reviewed=Revision(
+            state.reviewed_pr_url,
+            state.reviewed_head_sha,
+            state.reviewed_base_ref,
+            state.reviewed_merge_base_sha,
+        ),
+        comment_url=state.last_review_comment_url,
+        marker_key={
+            "review_round": state.review_round,
+            "reviewed_head_sha": state.reviewed_head_sha,
+            "reviewed_base_ref": state.reviewed_base_ref,
+            "reviewed_merge_base_sha": state.reviewed_merge_base_sha,
+        },
+        issued_at=utcnow_iso(),
+    )
+    eng._save()
+    return state.review_certificate
 
 
 class OfflineRemote(GitRemote):

@@ -28,6 +28,8 @@ import os
 import sys
 
 from . import __version__
+from .certificate import NOT_A_PERMISSION
+from .certificate import describe as describe_certificate
 from .config import AutoForgeConfig, load_config_file
 from .config_fingerprint import RecordedConfiguration
 from .doctor import CheckResult, run_doctor, run_local_doctor
@@ -856,6 +858,7 @@ def cmd_status(args) -> int:
     # Everything status shows is state-derived, and state carries text the
     # agents controlled (`block_reason`, findings, a hand-edited journal), so
     # both output modes cross the same redaction boundary as the run log.
+    certificate = _review_certificate_check(engine, state)
     if args.as_json:
         # to_dict() already carries "mode" plus the local fields, so the JSON
         # shape stays additive for remote consumers; `replan_journal` and
@@ -865,6 +868,7 @@ def cmd_status(args) -> int:
             **state.to_dict(),
             "replan_journal": _replan_journal_summary(txn),
             "acceptance_actions": _acceptance_actions(state),
+            "review_certificate_status": _review_certificate_status(state, certificate),
             "outer_sandbox": {
                 "mode": engine.config.sandbox.mode,
                 "summary": sandbox_mode_summary(
@@ -875,7 +879,7 @@ def cmd_status(args) -> int:
         print(json.dumps(redact_dict(document), indent=2, sort_keys=True))
         return 0
     evidence = _render_outer_sandbox(state, engine.config) + _render_validation_evidence(
-        state, engine.config
+        state, engine.config, certificate
     )
     if state.mode == WorkflowMode.LOCAL:
         print(redact(_render_local_status(state, txn, evidence)))
@@ -899,16 +903,69 @@ def _render_outer_sandbox(state: AutoForgeState, config: AutoForgeConfig) -> lis
     return ["", "Outer sandbox:", f"  {summary}"]
 
 
-def _render_validation_evidence(state: AutoForgeState, config: AutoForgeConfig) -> list[str]:
+def _review_certificate_check(
+    engine: ControllerEngine, state: AutoForgeState
+) -> tuple[bool | None, str] | None:
+    """Whether the held review certificate applies now (ADR 0006 D12.3), for ``status``.
+
+    ``None`` when none is held; otherwise ``(applicable, reason)``, with
+    ``applicable`` ``None`` and the reason saying why when the check could
+    not run (a LOCAL contract that no longer matches this invocation, say).
+    Reads the configuration in force, never GitHub: the live comparison is
+    the merge gate's.
+    """
+    if not state.review_certificate:
+        return None
+    try:
+        problem = engine.review_certificate_problem()
+    except AutoForgeError as exc:
+        return None, f"not checked: {exc}"
+    return not problem, problem
+
+
+def _review_certificate_status(
+    state: AutoForgeState, check: tuple[bool | None, str] | None
+) -> dict | None:
+    """The derived ``review_certificate_status`` of ``status --json`` (#174); ``None`` for none.
+
+    Beside the raw ``review_certificate``, never merged into it: the fields
+    a consumer reads (kind, candidate, round, set and policy digests,
+    ``issued_at``), its applicability against state and the configuration
+    in force with the reason when it does not apply, and the fixed note that
+    it is no merge permission.
+    """
+    certificate = state.review_certificate
+    if not certificate or check is None:
+        return None
+    applicable, problem = check
+    return {
+        "kind": certificate["kind"],
+        "candidate": certificate["candidate"],
+        "review_round": certificate["review_round"],
+        "validation_set_digest": certificate["validation_set_digest"],
+        "policy_digest": certificate["policy_digest"],
+        "issued_at": certificate["issued_at"],
+        "applicable": applicable,
+        "problem": problem,
+        "note": NOT_A_PERMISSION,
+    }
+
+
+def _render_validation_evidence(
+    state: AutoForgeState,
+    config: AutoForgeConfig,
+    certificate: tuple[bool | None, str] | None = None,
+) -> list[str]:
     """Candidate validation evidence for ``status`` (ADR 0006 D8.6; the caller redacts).
 
     The evidence policy (the configured set's size and the mode records are
     made under, and under ``disabled`` that validators run unsandboxed), a
     pending attempt marker, the override watermark, a producer's validation
-    failure counter, whether a binding or a certificate is held, and the
-    records of the current candidate: the REMOTE current HEAD's or the LOCAL
-    bound workspace's, else the newest record's. Read-only: a marker is
-    reported, never converted.
+    failure counter, whether a binding is held, the review certificate (what
+    it names, whether it applies, as ``certificate`` says, and that it is no
+    merge permission), and the records of the current candidate: the REMOTE
+    current HEAD's or the LOCAL bound workspace's, else the newest record's.
+    Read-only: a marker is reported, never converted.
     """
     local = state.mode == WorkflowMode.LOCAL
     if local:
@@ -953,10 +1010,14 @@ def _render_validation_evidence(state: AutoForgeState, config: AutoForgeConfig) 
             f"{len(state.review_evidence['records'])} record(s)"
         )
     if state.review_certificate:
-        lines.append(
-            f"  Review certificate: round {state.review_certificate['review_round']}, issued "
-            f"{state.review_certificate['issued_at']}"
-        )
+        lines.append(f"  Review certificate: {describe_certificate(state.review_certificate)}")
+        if certificate is None:
+            applies = "not checked"
+        else:
+            applicable, problem = certificate
+            applies = "yes" if applicable else problem if applicable is None else f"no: {problem}"
+        lines.append(f"    Applicable: {applies}")
+        lines.append(f"    Note: {NOT_A_PERMISSION}")
     if not records:
         lines.append("  Records: none")
         return lines
