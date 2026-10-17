@@ -10,12 +10,21 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   worktree's ``.git`` is a regular file naming that admin dir, absolute or
   relative (``worktree.useRelativePaths``). It replaces asking ``git -C
   <worktree>`` where its repository is, which follows the agent-writable
-  ``.git`` file.
+  ``.git`` file. :func:`registered_worktree_roots` is the registry's list of
+  working-tree roots, what ``git worktree list`` reports, read from the same
+  entries without git and without following a link: ``git worktree list``
+  resolves every listed worktree's ``HEAD``, through a link the agent
+  planted in its admin dir (#223). Both read the registry through a
+  descriptor opened ``O_NOFOLLOW`` (:func:`_registry_entries`): a registry
+  that is itself a link is refused, never listed.
 - **Candidate (D6.3).** :func:`read_candidate` reads the worktree's
   ``HEAD`` as ``worktrees/<id>/HEAD`` with ``--git-dir=<git common dir>``,
-  after ``lstat`` found a regular file there (:func:`head_problem`): never
+  after ``lstat`` found a regular file there, reached from the common dir
+  through real directories (:func:`head_problem`): never
   through the worktree's ``.git`` file, the admin dir's ``commondir`` or
-  ``gitdir``, or ``git -C <worktree>``.
+  ``gitdir``, or ``git -C <worktree>``. An attached ``HEAD`` is told by
+  ``symbolic-ref --no-recurse``, which never opens the reference it names
+  (#223).
 - **Strict import (D6.5).** :func:`import_private_objects` copies the
   objects reachable from that ``HEAD`` which the shared store lacks out of
   the issue's private object directory (an enforced launch's overlay upper
@@ -61,6 +70,8 @@ GIT_TIMEOUT_SECONDS = 120
 IMPORT_TIMEOUT_SECONDS = 600
 # A pointer file holds one path.
 _MAX_POINTER_BYTES = 4096
+# A registry directory: a link there fails the open instead of being followed.
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 # The registry entries and private-directory entries a walk visits before
 # it fails closed: a store bigger than this is not one issue's work.
 MAX_REGISTRY_ENTRIES = 10_000
@@ -83,15 +94,23 @@ def _ended(res: ExecutionResult) -> str:
     return "timed out" if res.timed_out else f"exited {res.exit_code}"
 
 
-def _read_pointer(path: Path) -> str | None:
-    """A pointer file's single line, or ``None`` unless it is a regular file."""
+def _read_pointer(path: Path | str, dir_fd: int | None = None) -> str | None:
+    """A pointer file's single line, or ``None`` unless it is a regular file.
+
+    Opened without following a link and without blocking, and checked again
+    on the descriptor: a file swapped for a FIFO after the ``lstat`` neither
+    blocks the read nor is read. ``dir_fd``: ``path`` is a name in that
+    directory, reached through no path at all.
+    """
     try:
-        if not stat.S_ISREG(os.lstat(path).st_mode):
+        if not stat.S_ISREG(os.lstat(path, dir_fd=dir_fd).st_mode):
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except OSError:
         return None
     with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return None
         data = handle.read(_MAX_POINTER_BYTES + 1)
     if len(data) > _MAX_POINTER_BYTES or b"\0" in data:
         return None
@@ -105,6 +124,75 @@ def _names(value: str, base: Path, expected: Path) -> bool:
     return named in (str(expected), os.path.realpath(expected))
 
 
+@dataclass(frozen=True)
+class _RegistryEntry:
+    """A registry entry ``<common>/worktrees/<id>`` with a regular ``gitdir`` file."""
+
+    admin: Path
+    gitdir: str
+    locked: bool
+
+
+def _registry_entries(
+    registry: Path, refuse: Callable[[str], VerificationError]
+) -> list[_RegistryEntry] | None:
+    """The registry's entries, read without following a link (D6.4, #223).
+
+    ``None`` when ``registry`` is absent. The registry itself is ``lstat``-ed
+    and opened ``O_NOFOLLOW``, and each entry and its files are reached from
+    that descriptor, never by path: a registry that is a link (an agent
+    without an enforced sandbox can replace it) is refused before the
+    directory it names is opened, and so is one that is not a directory,
+    cannot be read, or holds more than :data:`MAX_REGISTRY_ENTRIES`
+    entries. An entry that is not a real directory, or whose ``gitdir`` is
+    not a regular file (:func:`_read_pointer`), is left out.
+    """
+    try:
+        mode = os.lstat(registry).st_mode
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise refuse(f"{registry} cannot be checked ({exc.strerror})") from None
+    if stat.S_ISLNK(mode):
+        raise refuse(f"{registry} is a link: the controller lists no registry through one")
+    if not stat.S_ISDIR(mode):
+        raise refuse(f"{registry} is not a directory")
+    found: list[_RegistryEntry] = []
+    try:
+        # A link swapped in since the lstat fails the open.
+        fd = os.open(registry, _DIR_FLAGS)
+    except OSError as exc:
+        raise refuse(f"{registry} cannot be read ({exc.strerror})") from None
+    try:
+        with os.scandir(fd) as entries:
+            for count, entry in enumerate(entries):
+                if count >= MAX_REGISTRY_ENTRIES:
+                    raise refuse(f"{registry} holds more than {MAX_REGISTRY_ENTRIES} entries")
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    admin_fd = os.open(entry.name, _DIR_FLAGS, dir_fd=fd)
+                except OSError:
+                    continue
+                try:
+                    value = _read_pointer("gitdir", admin_fd)
+                    if value is None:
+                        continue
+                    try:
+                        os.lstat("locked", dir_fd=admin_fd)
+                        locked = True
+                    except OSError:
+                        locked = False
+                finally:
+                    os.close(admin_fd)
+                found.append(_RegistryEntry(registry / entry.name, value, locked))
+    except OSError as exc:
+        raise refuse(f"{registry} cannot be read ({exc.strerror})") from None
+    finally:
+        os.close(fd)
+    return found
+
+
 def bound_admin_dir(common: Path, worktree: Path) -> Path:
     """The admin dir ``<common>/worktrees/<id>`` the registry binds ``worktree`` to (D6.4).
 
@@ -113,7 +201,8 @@ def bound_admin_dir(common: Path, worktree: Path) -> Path:
     :class:`VerificationError` naming the inconsistency and ``git worktree
     repair``, unless exactly one registry entry's ``gitdir`` names
     ``<worktree>/.git`` and the worktree's ``.git`` is a regular file
-    naming that entry.
+    naming that entry. The registry is read without following a link
+    (:func:`_registry_entries`).
     """
     dotgit = worktree / ".git"
     registry = common / "worktrees"
@@ -126,22 +215,10 @@ def bound_admin_dir(common: Path, worktree: Path) -> Path:
             f"from the repository (or `git worktree repair {worktree}`), then 'resume'"
         )
 
-    matches: list[Path] = []
-    try:
-        with os.scandir(registry) as entries:
-            for count, entry in enumerate(entries):
-                if count >= MAX_REGISTRY_ENTRIES:
-                    raise refuse(f"{registry} holds more than {MAX_REGISTRY_ENTRIES} entries")
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                admin = registry / entry.name
-                value = _read_pointer(admin / "gitdir")
-                if value is not None and _names(value, admin, dotgit):
-                    matches.append(admin)
-    except FileNotFoundError:
-        raise refuse(f"the repository registers no worktree ({registry} is absent)") from None
-    except OSError as exc:
-        raise refuse(f"{registry} cannot be read ({exc.strerror})") from None
+    entries = _registry_entries(registry, refuse)
+    if entries is None:
+        raise refuse(f"the repository registers no worktree ({registry} is absent)")
+    matches = [e.admin for e in entries if _names(e.gitdir, e.admin, dotgit)]
     if not matches:
         raise refuse(f"no entry of {registry} has a gitdir naming {dotgit}")
     if len(matches) > 1:
@@ -154,6 +231,54 @@ def bound_admin_dir(common: Path, worktree: Path) -> Path:
     if not _names(value[len("gitdir: ") :].strip(), worktree, admin):
         raise refuse(f"{dotgit} does not name the registry entry {admin}")
     return admin
+
+
+def _less_dotgit(path: str) -> str:
+    """``path`` less a trailing ``/.git``: how git names a worktree after its ``.git``."""
+    return path[: -len("/.git")] if path.endswith("/.git") else path
+
+
+def registered_worktree_roots(common: Path) -> set[Path]:
+    """The working-tree roots the repository's registry names, resolved (D6.4, #223).
+
+    What ``git worktree list`` reports, read without git: git also resolves
+    every listed worktree's ``HEAD``, following a link an agent planted
+    there to any file on the host (a FIFO stalls it). Nothing here reads a
+    ``HEAD`` or a reference.
+
+    - The main worktree, named as git names it: the common dir, less a
+      trailing ``/.git``.
+    - Each entry ``<common>/worktrees/<id>`` that is a real directory with
+      a regular ``gitdir`` file (:func:`_read_pointer`), at the path that
+      file names less a trailing ``/.git``, absolute or relative to the
+      entry.
+    - Left out, as git marks it ``prunable``: an entry whose ``gitdir``
+      names a ``.git`` that is not there, unless the entry is ``locked``.
+      Both are ``lstat``-ed, so a link there counts as there and is not
+      followed.
+
+    An entry that is a link, or whose ``gitdir`` is not a regular file,
+    names no root, since git would read through it; the binding
+    (:func:`bound_admin_dir`) refuses such a worktree too. A registry that
+    is a link, is not a directory, cannot be listed, or holds more than
+    :data:`MAX_REGISTRY_ENTRIES` entries, is a :class:`VerificationError`
+    (:func:`_registry_entries`).
+    """
+    roots = {Path(os.path.realpath(_less_dotgit(os.path.realpath(common)) or "/"))}
+    registry = common / "worktrees"
+
+    def refuse(what: str) -> VerificationError:
+        return VerificationError(
+            f"cannot list the repository's worktrees: {what}. The controller neither reuses an "
+            "agent worktree nor launches in a sandbox it cannot check against the registry"
+        )
+
+    for entry in _registry_entries(registry, refuse) or ():  # None: no linked worktree
+        dotgit = os.path.join(entry.admin, entry.gitdir)  # an absolute value stands alone
+        if not (os.path.lexists(dotgit) or entry.locked):
+            continue  # prunable: nothing at its path is a worktree
+        roots.add(Path(os.path.realpath(os.path.join(entry.admin, _less_dotgit(entry.gitdir)))))
+    return roots
 
 
 @dataclass(frozen=True)
@@ -186,14 +311,20 @@ def _admin_git(
     return res.exit_code, res.stdout.strip()
 
 
-def head_problem(admin: Path) -> str | None:
+def head_problem(common: Path, admin: Path) -> str | None:
     """Why git may not read the admin dir's ``HEAD``, or ``None`` (D6.3).
 
     ``lstat``, no link followed: anything but a regular file is named,
     since git follows a link there (to a file the agent wrote outside the
-    store, invisible inside) and reads the commit it names. Checked before
-    ``HEAD`` is read at all, by the candidate read and by the import.
+    store, invisible inside) and reads the commit it names. So is a link or
+    another file type at the admin dir or the registry above it
+    (:func:`_root_problem`), which git would read ``worktrees/<id>/HEAD``
+    through (#223). Checked before ``HEAD`` is read at all, by the
+    candidate read and by the import.
     """
+    problem = _root_problem(common, admin)
+    if problem:
+        return problem
     head_file = admin / "HEAD"
     try:
         mode = os.lstat(head_file).st_mode
@@ -207,18 +338,26 @@ def head_problem(admin: Path) -> str | None:
 def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | None) -> Candidate:
     """The candidate: ``worktrees/<id>/HEAD`` addressed through the common dir (D6.3).
 
-    An inconclusive git read is a :class:`VerificationError`, never a guess.
+    Whether ``HEAD`` is attached is asked with ``symbolic-ref --no-recurse``,
+    which reads ``HEAD`` alone: without it git resolves the reference
+    ``HEAD`` names, and so a link the agent planted at
+    ``worktrees/<id>/refs/...`` to any file on the host (#223). An
+    inconclusive git read is a :class:`VerificationError`, never a guess.
     """
-    problem = head_problem(admin)
+    problem = head_problem(common, admin)
     if problem:
         return Candidate(False, "", problem)
     ref = f"worktrees/{admin.name}/HEAD"
     attached, _ = _admin_git(
-        common, ["symbolic-ref", "-q", ref], runner, "whether HEAD is detached", worktree
+        common,
+        ["symbolic-ref", "-q", "--no-recurse", ref],
+        runner,
+        "whether HEAD is detached",
+        worktree,
     )
     if attached == 0:
         # Never a candidate: the reference it names (one the agent may have
-        # written in its admin dir) is not resolved.
+        # written in its admin dir) is neither opened nor resolved.
         return Candidate(True, "")
     found, head = _admin_git(
         common,
@@ -232,19 +371,19 @@ def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | No
     return Candidate(False, head)
 
 
-def _root_problem(common: Path, private: Path) -> str | None:
-    """Why ``private`` is not a real directory below ``common``, or ``None``.
+def _root_problem(common: Path, directory: Path) -> str | None:
+    """Why ``directory`` is not a real directory below ``common``, or ``None``.
 
-    Every component from ``common`` down to ``private`` is ``lstat``-ed: one
-    that is a link, not a directory, or cannot be checked is named, so
+    Every component from ``common`` down to ``directory`` is ``lstat``-ed:
+    one that is a link, not a directory, or cannot be checked is named, so
     nothing is read through it.
     """
     try:
-        parts = private.relative_to(common).parts
+        parts = directory.relative_to(common).parts
     except ValueError:
         parts = ()
     if not parts or ".." in parts:
-        return f"{private} is not a directory below the git common dir {common}"
+        return f"{directory} is not a directory below the git common dir {common}"
     path = common
     for part in parts:
         path = path / part
@@ -253,7 +392,7 @@ def _root_problem(common: Path, private: Path) -> str | None:
         except OSError as exc:
             return f"{path} cannot be checked ({exc.strerror})"
         if stat.S_ISLNK(mode):
-            return f"{path} is a link: git would read the object store it names"
+            return f"{path} is a link"
         if not stat.S_ISDIR(mode):
             return f"{path} is not a directory"
     return None
@@ -380,7 +519,7 @@ def import_private_objects(
             f"tampered with: {problem}. Nothing was read from it and nothing was published; "
             "inspect it, and remove what does not belong there before unblocking the run"
         )
-    problem = head_problem(admin)
+    problem = head_problem(common, admin)
     if problem:
         raise ObjectImportError(
             f"the strict import of the agent's commits from {private} did not start: "

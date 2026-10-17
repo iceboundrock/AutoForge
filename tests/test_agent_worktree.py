@@ -1,20 +1,25 @@
 """The agent worktree's git surface (ADR 0005 D6.3-D6.5, #168).
 
-Real repositories, real git: the binding reads the registry, the candidate
-read ignores everything the agent can write, and the strict import copies
-an agent's commit out of a private object directory into the shared store.
+Real repositories, real git: the binding and the registry listing read the
+registry, the candidate read ignores everything the agent can write, and the
+strict import copies an agent's commit out of a private object directory
+into the shared store.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from autoforge import agent_worktree
 from autoforge.agent_worktree import (
+    Candidate,
     ObjectImportError,
     alternate_entry,
     bound_admin_dir,
@@ -22,11 +27,12 @@ from autoforge.agent_worktree import (
     import_private_objects,
     private_objects_problem,
     read_candidate,
+    registered_worktree_roots,
 )
 from autoforge.errors import SandboxTamperError, VerificationError
 from autoforge.executor import ExecutionRequest, execute
 
-from .conftest import GIT_IDENT
+from .conftest import GIT_IDENT, watched_fifo
 
 
 def _git(*args: str, env: dict[str, str] | None = None) -> str:
@@ -115,6 +121,179 @@ def test_an_unregistered_worktree_is_refused(repo):
         bound_admin_dir(repo["common"], stray)
 
 
+# ----------------------------------------------------------------- registry
+
+
+def _listed_roots(cwd: Path) -> set[Path]:
+    """The roots `git worktree list` registers, as the engine read them before
+    #223: each resolved, a `prunable` one left out."""
+    out = _git("-C", str(cwd), "worktree", "list", "--porcelain")
+    roots: set[Path] = set()
+    for entry in out.split("\n\n"):
+        lines = [line.strip() for line in entry.splitlines() if line.strip()]
+        if not lines or not lines[0].startswith("worktree "):
+            continue
+        if any(line == "prunable" or line.startswith("prunable ") for line in lines[1:]):
+            continue
+        roots.add(Path(os.path.realpath(lines[0][len("worktree ") :])))
+    return roots
+
+
+def test_the_registry_lists_the_roots_git_worktree_list_registers(repo):
+    """The operator's checkout, the issue worktree and another linked one; a
+    prunable entry (its tree is gone) left out, and a locked one whose tree
+    is gone kept, as git keeps it: the roots `git worktree list` reports,
+    asked from the checkout or from a linked worktree, read without git."""
+    root, base = repo["root"], repo["base"]
+    for name in ("other", "gone", "locked"):
+        _git("-C", str(root), "worktree", "add", "-q", "--detach", str(base / name), "HEAD")
+    _git("-C", str(root), "worktree", "lock", str(base / "locked"))
+    shutil.rmtree(base / "gone")
+    shutil.rmtree(base / "locked")
+    roots = registered_worktree_roots(repo["common"])
+    assert roots == {root, repo["worktree"], base / "other", base / "locked"}
+    assert roots == _listed_roots(root) == _listed_roots(base / "other")
+
+
+def test_a_repository_without_linked_worktrees_lists_its_checkout(tmp_path):
+    root = Path(os.path.realpath(tmp_path)) / "plain"
+    _git("init", "-q", "-b", "main", str(root))
+    assert not (root / ".git" / "worktrees").exists()
+    assert registered_worktree_roots(root / ".git") == {root} == _listed_roots(root)
+
+
+def test_relative_registry_pointers_list_the_worktree(repo):
+    """`worktree.useRelativePaths`: the `gitdir` names `.git` relative to the entry."""
+    worktree, admin = repo["worktree"], repo["admin"]
+    (worktree / ".git").write_text(f"gitdir: {os.path.relpath(admin, worktree)}\n")
+    (admin / "gitdir").write_text(f"{os.path.relpath(worktree / '.git', admin)}\n")
+    assert registered_worktree_roots(repo["common"]) == {repo["root"], worktree}
+
+
+@pytest.mark.parametrize("kind", ["separate git dir", "bare"])
+def test_the_main_worktree_is_named_as_git_names_it(repo, kind):
+    """The common dir less a trailing `/.git`: for a separate git dir and a
+    bare repository that is the git dir itself, as `git worktree list` says."""
+    base = repo["base"]
+    if kind == "bare":
+        common = base / "bare.git"
+        _git("clone", "-q", "--bare", str(repo["root"]), str(common))
+    else:
+        common = base / "separate"
+        _git("init", "-q", "-b", "main", f"--separate-git-dir={common}", str(base / "work"))
+        _git("-C", str(base / "work"), *GIT_IDENT, "commit", "-q", "--allow-empty", "-m", "one")
+    _git("--git-dir", str(common), "worktree", "add", "-q", "--detach", str(base / "linked"))
+    roots = registered_worktree_roots(common)
+    assert roots == {common, base / "linked"} == _listed_roots(base / "linked")
+
+
+@pytest.mark.parametrize("planted", ["entry link", "gitdir link", "gitdir fifo"])
+def test_a_registry_entry_git_would_read_through_names_no_root(repo, planted):
+    """An entry that is a link, or whose `gitdir` is a link or a FIFO, is
+    never read through (git would follow it): it names no root, and the
+    binding refuses the worktree."""
+    admin, elsewhere = repo["admin"], repo["base"] / "elsewhere"
+    if planted == "entry link":
+        admin.rename(elsewhere)
+        admin.symlink_to(elsewhere)
+    elif planted == "gitdir link":
+        (admin / "gitdir").rename(elsewhere)
+        (admin / "gitdir").symlink_to(elsewhere)
+    else:
+        (admin / "gitdir").unlink()
+    fifo = planted == "gitdir fifo"
+    with watched_fifo(admin / "gitdir") if fifo else contextlib.nullcontext([]) as opened:
+        assert registered_worktree_roots(repo["common"]) == {repo["root"]}
+        with pytest.raises(VerificationError, match="no entry"):
+            bound_admin_dir(repo["common"], repo["worktree"])
+    assert opened == []
+
+
+def test_a_registry_bigger_than_the_bound_is_refused(repo, monkeypatch):
+    monkeypatch.setattr(agent_worktree, "MAX_REGISTRY_ENTRIES", 1)
+    _git("-C", str(repo["root"]), "worktree", "add", "-q", "--detach", str(repo["base"] / "o"))
+    with pytest.raises(VerificationError, match="cannot list the repository's worktrees"):
+        registered_worktree_roots(repo["common"])
+
+
+def test_a_registry_that_is_a_link_is_refused_without_reading_through_it(repo, monkeypatch):
+    """The registry ``<common>/worktrees`` itself a link to a directory
+    outside, which still holds the worktree's entry, as an agent without an
+    enforced sandbox can leave it: the listing and the binding refuse it on
+    ``lstat``, and the candidate read and the import name it, before any of
+    them opens or lists a path through it. Once the operator puts the
+    directory back, each answers again (#223)."""
+    head = _commit_privately(repo)
+    registry, elsewhere = repo["common"] / "worktrees", repo["base"] / "elsewhere"
+    registry.rename(elsewhere)
+    registry.symlink_to(elsewhere)
+    # The layout is sharp: a listing by path, the read before this check,
+    # finds the worktree's entry through the link.
+    assert [entry.name for entry in os.scandir(registry)] == ["2"]
+    reached: list[object] = []
+    real_open, real_scandir = os.open, os.scandir
+
+    def opening(path, *args, **kwargs):
+        reached.append(path)
+        return real_open(path, *args, **kwargs)
+
+    def listing(path="."):
+        reached.append(path)
+        return real_scandir(path)
+
+    seen: list[ExecutionRequest] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", opening)
+        patch.setattr(os, "scandir", listing)
+        with pytest.raises(VerificationError, match=re.escape(f"{registry} is a link")):
+            registered_worktree_roots(repo["common"])
+        with pytest.raises(VerificationError, match=re.escape(f"{registry} is a link")):
+            bound_admin_dir(repo["common"], repo["worktree"])
+        candidate = read_candidate(repo["common"], repo["admin"], "w", _recording(seen))
+        with pytest.raises(ObjectImportError, match=re.escape(f"{registry} is a link")):
+            import_private_objects(repo["common"], repo["admin"], repo["private"], _recording(seen))
+    # A descriptor would be the registry's: nothing listed it, by path or not.
+    through = [
+        path
+        for path in reached
+        if isinstance(path, int) or str(path).startswith((str(registry), str(elsewhere)))
+    ]
+    assert through == [] and seen == []
+    assert candidate.head == "" and f"{registry} is a link" in candidate.problem
+    assert not _shared_has(repo, head)
+    registry.unlink()
+    elsewhere.rename(registry)
+    assert registered_worktree_roots(repo["common"]) == {repo["root"], repo["worktree"]}
+    assert bound_admin_dir(repo["common"], repo["worktree"]) == repo["admin"]
+    assert import_private_objects(repo["common"], repo["admin"], repo["private"], None) == head
+    assert read_candidate(repo["common"], repo["admin"], "w", None).head == head
+
+
+@pytest.mark.parametrize("kind", ["file", "fifo"])
+def test_a_registry_that_is_not_a_directory_is_refused(repo, kind):
+    registry = repo["common"] / "worktrees"
+    shutil.rmtree(registry)
+    if kind == "file":
+        registry.write_text("not a registry\n")
+    else:
+        os.mkfifo(registry)
+    with pytest.raises(VerificationError, match=re.escape(f"{registry} is not a directory")):
+        registered_worktree_roots(repo["common"])
+    with pytest.raises(VerificationError, match=re.escape(f"{registry} is not a directory")):
+        bound_admin_dir(repo["common"], repo["worktree"])
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a directory without permission")
+def test_a_registry_that_cannot_be_read_is_refused(repo):
+    registry = repo["common"] / "worktrees"
+    registry.chmod(0)
+    try:
+        with pytest.raises(VerificationError, match="cannot list the repository's worktrees"):
+            registered_worktree_roots(repo["common"])
+    finally:
+        registry.chmod(0o755)
+
+
 # ---------------------------------------------------------------- candidate
 
 
@@ -151,6 +330,76 @@ def test_pointer_rewrites_do_not_move_the_candidate(repo):
     (repo["admin"] / "gitdir").write_text(f"{decoy / '.git'}\n")
     candidate = read_candidate(repo["common"], repo["admin"], str(repo["worktree"]), None)
     assert candidate.head == head
+
+
+def test_an_attached_head_naming_a_linked_reference_opens_nothing(repo):
+    """``HEAD`` a regular file naming a reference of its own admin dir,
+    ``worktrees/<id>/refs/worktree/redirect``, which is a link to a FIFO
+    outside the store: the candidate read tells ``HEAD`` attached without
+    opening the FIFO (a reader blocks until git's timeout), and the import
+    runs no git at all (#223)."""
+    head = _commit_privately(repo)
+    refs = repo["admin"] / "refs" / "worktree"
+    refs.mkdir(parents=True)
+    outside = repo["base"] / "outside-fifo"
+    (refs / "redirect").symlink_to(outside)
+    (repo["admin"] / "HEAD").write_text("ref: worktrees/2/refs/worktree/redirect\n")
+    seen: list[ExecutionRequest] = []
+    with watched_fifo(outside) as opened:
+        imported = import_private_objects(
+            repo["common"], repo["admin"], repo["private"], _recording(seen)
+        )
+        assert seen == []
+        candidate = read_candidate(repo["common"], repo["admin"], "w", _recording(seen))
+    assert opened == []
+    assert imported == "" and not _shared_has(repo, head)
+    assert candidate == Candidate(True, "")
+    assert [r.command[-2:] for r in seen] == [["--no-recurse", "worktrees/2/HEAD"]]
+    # The layout is sharp: `symbolic-ref` without `--no-recurse`, the read
+    # before #223, opens the FIFO.
+    (refs / "redirect").unlink()
+    (refs / "redirect").symlink_to(repo["base"] / "outside-fifo-2")
+    with watched_fifo(repo["base"] / "outside-fifo-2") as opened:
+        subprocess.run(
+            ["git", "--git-dir", str(repo["common"]), "symbolic-ref", "-q", "worktrees/2/HEAD"],
+            capture_output=True,
+            timeout=60,
+        )
+    assert opened
+
+
+def test_a_head_link_to_a_fifo_is_opened_by_no_controller_read(repo):
+    """``HEAD`` a link to a FIFO outside the store: the candidate read and
+    the import refuse it on ``lstat``, and the registry listing and the
+    binding read no ``HEAD``, so none of them opens the FIFO and each still
+    answers (#223)."""
+    head = _commit_privately(repo)
+    head_file = repo["admin"] / "HEAD"
+    outside = repo["base"] / "outside-fifo"
+    head_file.unlink()
+    head_file.symlink_to(outside)
+    seen: list[ExecutionRequest] = []
+    with watched_fifo(outside) as opened:
+        candidate = read_candidate(repo["common"], repo["admin"], "w", _recording(seen))
+        with pytest.raises(ObjectImportError, match="is not a regular file"):
+            import_private_objects(repo["common"], repo["admin"], repo["private"], _recording(seen))
+        roots = registered_worktree_roots(repo["common"])
+        admin = bound_admin_dir(repo["common"], repo["worktree"])
+    assert opened == [] and seen == []
+    assert candidate.head == "" and "is not a regular file" in candidate.problem
+    assert roots == {repo["root"], repo["worktree"]} and admin == repo["admin"]
+    assert not _shared_has(repo, head)
+    # The layout is sharp: `git worktree list`, the listing before #223,
+    # opens the FIFO.
+    head_file.unlink()
+    head_file.symlink_to(repo["base"] / "outside-fifo-2")
+    with watched_fifo(repo["base"] / "outside-fifo-2") as opened:
+        subprocess.run(
+            ["git", "-C", str(repo["root"]), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            timeout=60,
+        )
+    assert opened
 
 
 def test_a_head_naming_no_commit_reads_as_none(repo):

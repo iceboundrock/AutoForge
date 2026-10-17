@@ -120,6 +120,7 @@ from .agent_worktree import (
     holds_objects,
     import_private_objects,
     read_candidate,
+    registered_worktree_roots,
 )
 from .child_env import (
     describe_overrides,
@@ -1838,40 +1839,6 @@ class ControllerEngine:
         common = Path(os.path.realpath(path / lines[1]))
         return root, common
 
-    def _registered_worktree_roots(self) -> set[Path]:
-        """The working-tree roots ``git worktree list`` registers for this repository.
-
-        Read from the controller's own checkout, so the answer comes from
-        the repository's registry (the common dir's ``worktrees/``), not
-        from whatever the candidate path leads to. Git reports the paths
-        resolved; a linked worktree whose tree is gone is listed as
-        ``prunable`` and left out, since nothing at its path is a worktree.
-        """
-        res = (self._runner or execute)(
-            local_git_request(
-                ["worktree", "list", "--porcelain"],
-                cwd=self.workdir,
-                timeout_seconds=GIT_TIMEOUT_SECONDS,
-            )
-        )
-        if res.timed_out or res.truncated or res.exit_code != 0:
-            detail = (res.stderr or res.stdout).strip().splitlines()
-            raise VerificationError(
-                "cannot list the repository's worktrees (`git worktree list` "
-                f"{'timed out' if res.timed_out else f'exited {res.exit_code}'}"
-                f"{f': {detail[-1]}' if detail else ''}); the controller will not reuse "
-                "an agent worktree it cannot confirm is registered"
-            )
-        roots: set[Path] = set()
-        for entry in res.stdout.split("\n\n"):
-            lines = [line.strip() for line in entry.splitlines() if line.strip()]
-            if not lines or not lines[0].startswith("worktree "):
-                continue
-            if any(line == "prunable" or line.startswith("prunable ") for line in lines[1:]):
-                continue
-            roots.add(Path(os.path.realpath(lines[0][len("worktree ") :])))
-        return roots
-
     def _ensure_agent_worktree(self) -> Path:
         """The issue's agent worktree, created on first use and never deleted.
 
@@ -1891,7 +1858,11 @@ class ControllerEngine:
         merely to answer git as some worktree, and the registry must bind it
         to its admin dir (:func:`~autoforge.agent_worktree.bound_admin_dir`,
         ADR 0005 D6.4): the worktree's agent-writable ``.git`` file is checked
-        against the registry, never followed. Nor is one
+        against the registry, never followed, and the list is read from the
+        registry itself
+        (:func:`~autoforge.agent_worktree.registered_worktree_roots`), never
+        by ``git worktree list``, which follows a link at any listed
+        worktree's ``HEAD`` (#223). Nor is one
         created inside the operator's working tree (the git directory,
         which git never walks as content, excepted), where it would sit in
         their ``git status`` and the agent's tree would contain the
@@ -1925,7 +1896,7 @@ class ControllerEngine:
                 what = f"reached through a symbolic link ({real})"
             elif path == ws.root():
                 what = "the checkout the controller is run from"
-            elif path not in self._registered_worktree_roots():
+            elif path not in registered_worktree_roots(common):
                 # A stale directory, a worktree of another repository and a
                 # subdirectory of some tree are all absent from the registry.
                 what = "not registered in the repository's worktree list"
@@ -2345,7 +2316,7 @@ class ControllerEngine:
             roots += [str(dirs[0] / "autoforge"), str(workspace / DEFAULT_STATE_DIR)]
         else:
             roots.append(str(ws.root()))
-        roots += sorted(str(r) for r in self._registered_worktree_roots() if r != workspace)
+        roots += sorted(str(r) for r in registered_worktree_roots(dirs[-1]) if r != workspace)
         return tuple(dict.fromkeys(roots))
 
     def _sandbox_dirs(self, anchor: Path, relbase: str, names: tuple[str, ...]) -> Path:

@@ -23,7 +23,14 @@ from pathlib import Path
 import pytest
 
 from autoforge import sandbox_bwrap
-from autoforge.agent_worktree import ObjectImportError, import_private_objects, read_candidate
+from autoforge.agent_worktree import (
+    Candidate,
+    ObjectImportError,
+    bound_admin_dir,
+    import_private_objects,
+    read_candidate,
+    registered_worktree_roots,
+)
 from autoforge.config import ProfileConfig, default_config
 from autoforge.doctor import Doctor
 from autoforge.errors import SandboxTamperError
@@ -40,6 +47,7 @@ from .conftest import (
     git_repo,
     make_local_engine,
     real_sandbox_backend,
+    watched_fifo,
 )
 
 PY = SYSTEM_PYTHON
@@ -353,6 +361,78 @@ def test_a_head_link_written_inside_is_never_followed_by_the_import(backend, lay
     )
     assert missing.returncode != 0
     assert "is not a regular file" in read_candidate(common, admin, "w", None).problem
+
+
+@pytest.mark.parametrize("planted", ["HEAD link", "linked reference"])
+def test_a_link_to_a_fifo_written_inside_is_opened_by_no_controller_read(backend, layout, planted):
+    """An agent commits, then plants a link to a path outside, invisible
+    inside, where the host has a FIFO: its writable ``HEAD`` itself, or a
+    reference of its admin dir that a regular ``HEAD`` names
+    (``ref: worktrees/7/refs/worktree/redirect``). On the host no controller
+    read opens the FIFO, where a reader would block until its git timeout:
+    the import and the candidate read refuse the candidate, naming why, the
+    registry listing and the binding still find the worktree, and nothing
+    reaches the shared store (ADR 0005 D6.3, D6.4, #223)."""
+    paths = layout
+    common, admin, worktree = paths["common"], paths["admin"], paths["worktree"]
+    outside = paths["base"] / "outside-fifo"
+    if planted == "HEAD link":
+        plant = (
+            f"os.unlink({str(admin / 'HEAD')!r})\n"
+            f"os.symlink({str(outside)!r}, {str(admin / 'HEAD')!r})\n"
+        )
+    else:
+        ref = admin / "refs" / "worktree" / "redirect"
+        plant = (
+            f"os.makedirs({str(ref.parent)!r}, exist_ok=True)\n"
+            f"os.symlink({str(outside)!r}, {str(ref)!r})\n"
+            f"with open({str(admin / 'HEAD')!r}, 'w') as fh:\n"
+            "    fh.write('ref: worktrees/7/refs/worktree/redirect\\n')\n"
+        )
+    code = (
+        "git = ['git', '-c', 'user.name=Agent', '-c', 'user.email=agent@example.invalid',"
+        " '-c', 'gc.auto=0']\n"
+        "write('inside.txt', 'made inside\\n')\n"
+        "subprocess.run(git + ['add', 'inside.txt'], check=True)\n"
+        "subprocess.run(git + ['commit', '-q', '-m', 'inside (#7)'], check=True)\n"
+        "head = subprocess.run(git + ['rev-parse', 'HEAD'], check=True,"
+        " capture_output=True, text=True).stdout.strip()\n"
+        + plant
+        + f"report = {{'head': head, 'outside': attempt(lambda: read({str(outside)!r}))}}\n"
+        "print(json.dumps(report))\n"
+    )
+    report = _probe(describe_launch(_remote_facts(paths), None, {}), worktree, code)
+    assert report["outside"] == "ENOENT"
+    seen: list[ExecutionRequest] = []
+
+    def runner(request: ExecutionRequest):
+        seen.append(request)
+        return execute(request)
+
+    private = paths["sandbox"] / "objects"
+    with watched_fifo(outside) as opened:
+        if planted == "HEAD link":
+            with pytest.raises(ObjectImportError, match="is not a regular file"):
+                import_private_objects(common, admin, private, runner)
+        else:
+            assert import_private_objects(common, admin, private, runner) == ""
+        assert seen == []  # the import read HEAD itself, no git process
+        candidate = read_candidate(common, admin, "w", runner)
+        roots = registered_worktree_roots(common)
+        bound = bound_admin_dir(common, worktree)
+    assert opened == []
+    if planted == "HEAD link":
+        assert candidate.head == "" and "is not a regular file" in candidate.problem
+        assert seen == []
+    else:
+        assert candidate == Candidate(True, "")
+        assert [r.command[-2:] for r in seen] == [["--no-recurse", "worktrees/7/HEAD"]]
+    assert roots == {paths["repo"], worktree, paths["neighbour"]} and bound == admin
+    missing = subprocess.run(
+        ["git", "--git-dir", str(common), "cat-file", "-e", f"{report['head']}^{{commit}}"],
+        capture_output=True,
+    )
+    assert missing.returncode != 0
 
 
 def _reporting_cli(paths, name: str, probes: dict[str, str]) -> Path:

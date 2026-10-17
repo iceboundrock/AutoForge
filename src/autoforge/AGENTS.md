@@ -49,7 +49,8 @@ sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005
                     executable and install-root resolution; no provider branch, no
                     workflow decision, launches nothing (#168)
 agent_worktree.py   the agent worktree's git surface in every sandbox.mode: registry
-                    binding (D6.4), candidate read through the common dir (D6.3),
+                    binding and listing (D6.4, #223), candidate read through the
+                    common dir (D6.3),
                     strict import of private objects (D6.5); git only through the
                     executor's hardened local request (#168)
 github.py           GitHubClient over `gh`, the only holder of a GitHub credential:

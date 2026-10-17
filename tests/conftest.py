@@ -7,10 +7,13 @@ agents are ``ScriptedProvider`` instances, GitHub is ``FakeGitHub``.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -1302,6 +1305,40 @@ def commit_in(cwd, message: str = "Implement the feature (#2)") -> str:
     """One (empty) commit on the agent worktree's detached HEAD; the new HEAD."""
     git_out("-C", str(cwd), *GIT_IDENT, "commit", "-q", "--allow-empty", "-m", message)
     return git_out("-C", str(cwd), "rev-parse", "HEAD")
+
+
+@contextmanager
+def watched_fifo(path: Path) -> Iterator[list[str]]:
+    """A FIFO made at ``path``; the list it yields records each opening of it to read.
+
+    A reader of a FIFO blocks until a writer comes, so a controller read
+    that follows a planted link to one would stall. A watchdog tries every
+    few milliseconds to open it for writing without blocking, which succeeds
+    only while a reader has it open: it records the opening and closes it
+    again, so the reader sees an end of file instead of hanging the test.
+    The list stays empty unless something opened ``path`` (#223).
+    """
+    os.mkfifo(path)
+    opened: list[str] = []
+    stop = threading.Event()
+
+    def watch() -> None:
+        while not stop.is_set():
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:  # ENXIO: no reader has it open
+                stop.wait(0.01)
+                continue
+            opened.append(str(path))
+            os.close(fd)
+
+    watchdog = threading.Thread(target=watch, daemon=True)
+    watchdog.start()
+    try:
+        yield opened
+    finally:
+        stop.set()
+        watchdog.join()
 
 
 def publish_pr_head(

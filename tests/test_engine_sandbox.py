@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
 
 from autoforge.config import default_config
 from autoforge.errors import (
+    ConfigurationError,
     ControlResultValidationError,
     SandboxLaunchRefusedError,
     VerificationError,
@@ -33,6 +35,7 @@ from tests.conftest import (
     implement,
     make_engine,
     scripted,
+    watched_fifo,
 )
 
 
@@ -204,6 +207,107 @@ def test_the_candidate_is_read_through_the_registry_not_the_worktrees_git_file(
     with pytest.raises(VerificationError, match="git worktree repair"):
         eng.step()
     assert len(eng.provider.calls) == 2
+
+
+@pytest.mark.parametrize("planted", ["HEAD link", "linked reference"])
+def test_a_planted_link_to_a_fifo_stalls_no_controller_read(
+    tmp_state_dir, fake_github, tmp_path, planted
+):
+    """#223, in every mode: the agent commits, then makes its ``HEAD`` a link
+    to a FIFO outside the store, or leaves a regular ``HEAD`` naming a
+    reference of its own admin dir that is such a link. No controller read
+    opens the FIFO, where a reader would block until its git timeout, and
+    every 'resume' with it: the candidate is refused, naming why; the
+    worktree is still found in the registry and bound, and the relaunch is
+    refused at once by the launch preflight, whose git no longer accepts the
+    worktree. Once the operator repairs ``HEAD`` the run goes on."""
+    admin = Path(os.path.realpath(tmp_state_dir.parent)) / ".git" / "worktrees" / "2"
+    outside = tmp_path / "outside-fifo"
+    heads: list[str] = []
+
+    def plants(req) -> str:
+        heads.append(commit_in(req.cwd))
+        if planted == "HEAD link":
+            (admin / "HEAD").unlink()
+            (admin / "HEAD").symlink_to(outside)
+        else:
+            (admin / "refs" / "worktree").mkdir(parents=True)
+            (admin / "refs" / "worktree" / "redirect").symlink_to(outside)
+            (admin / "HEAD").write_text("ref: worktrees/2/refs/worktree/redirect\n")
+        return block(analyze_payload(heads[0]))
+
+    eng = make_engine(
+        tmp_state_dir,
+        scripted(plants, lambda req: block(analyze_payload(heads[0]))),
+        github=fake_github,
+        origin=True,
+    )
+    with watched_fifo(outside) as opened:
+        assert eng.step().next_phase == "ANALYZE_EXECUTE"
+        # The candidate refusal's correction, then a 'resume': both relaunches
+        # stop at the preflight, after the registry listing and the binding.
+        for _ in range(2):
+            with pytest.raises(ConfigurationError, match="cannot read the git configuration"):
+                eng.step()
+        candidate = eng._read_candidate(eng.provider.calls[0].cwd)
+        assert len(eng.provider.calls) == 1
+        (admin / "HEAD").unlink()
+        (admin / "HEAD").write_text(heads[0] + "\n")
+        out = eng.step()
+    assert opened == []
+    if planted == "HEAD link":
+        assert candidate.head == "" and "is not a regular file" in candidate.problem
+    else:
+        assert candidate.attached and candidate.head == ""
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 2
+    assert eng.origin.head("autoforge/2") == heads[0]
+
+
+def test_a_registry_replaced_by_a_link_is_refused_until_the_operator_repairs_it(
+    tmp_state_dir, fake_github, tmp_path_factory
+):
+    """#223, ``sandbox.mode: disabled``: the agent commits, then moves the
+    repository's registry ``<common>/worktrees`` outside and leaves a link
+    to it in its place. The candidate is refused, naming the link, and the
+    relaunch is refused before it is made: the registry listing does not
+    read through the link. Once the operator puts the directory back the
+    run goes on with the agent's commit."""
+    registry = Path(os.path.realpath(tmp_state_dir.parent)) / ".git" / "worktrees"
+    elsewhere = tmp_path_factory.mktemp("elsewhere") / "worktrees"
+    heads: list[str] = []
+
+    def replaces(req) -> str:
+        heads.append(commit_in(req.cwd))
+        registry.rename(elsewhere)
+        registry.symlink_to(elsewhere)
+        return block(analyze_payload(heads[0]))
+
+    eng = make_engine(
+        tmp_state_dir,
+        scripted(replaces, lambda req: block(analyze_payload(heads[0]))),
+        github=fake_github,
+        origin=True,
+    )
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    # The candidate refusal's correction stops at the launch preflight, whose
+    # git no longer finds the repository through the link; a 'resume' stops
+    # at the registry listing, before the worktree is reused.
+    with pytest.raises(ConfigurationError, match="cannot read the git configuration"):
+        eng.step()
+    for _ in range(2):
+        with pytest.raises(VerificationError, match=re.escape(f"{registry} is a link")):
+            eng.step()
+    assert len(eng.provider.calls) == 1
+    candidate = eng._read_candidate(eng.provider.calls[0].cwd)
+    assert candidate.head == "" and f"{registry} is a link" in candidate.problem
+    assert eng.origin.head("autoforge/2") is None and fake_github.effect_writes == []
+    registry.unlink()
+    elsewhere.rename(registry)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert len(eng.provider.calls) == 2
+    assert eng.origin.head("autoforge/2") == heads[0]
 
 
 def test_a_scripted_refusal_from_the_compiler_is_a_launch_failure(tmp_state_dir, fake_github):
