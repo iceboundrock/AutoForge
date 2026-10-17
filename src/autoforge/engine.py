@@ -3450,6 +3450,7 @@ class ControllerEngine:
                     "clean review of that revision, not draft, no change to "
                     "safety.protected_merge_paths, all checks succeeded, mergeable, no "
                     "auto-merge / merge queue (fail closed)",
+                    self._certificate_plan_note(),
                     *self._premerge_plan_notes(),
                 ],
             )
@@ -3465,6 +3466,7 @@ class ControllerEngine:
                     "re-read and still this round's clean review of that revision, not "
                     "draft, no change to safety.protected_merge_paths, all checks "
                     "succeeded, mergeable, no auto-merge / merge queue",
+                    self._certificate_plan_note(),
                     *self._premerge_plan_notes(),
                     "would run the command below (bound to the reviewed HEAD via "
                     "--match-head-commit), then re-read the PR and require state MERGED",
@@ -7367,6 +7369,32 @@ class ControllerEngine:
             pr=pr,
         )
 
+    def _certificate_plan_note(self) -> str:
+        """Dry-run description of the gate's review-certificate check (ADR 0006 D13, #175).
+
+        Whether the certificate applies is read from state and the
+        configuration in force only; the gate itself also compares it with
+        the PR revision GitHub returns, which a dry run does not read.
+        """
+        state = self._require_state()
+        if not state.review_certificate:
+            now = "none is held, so the gate would enter BLOCKED (unblock decides REVIEW)"
+        else:
+            problem = self.review_certificate_problem()
+            now = (
+                f"against state and the configuration in force the certificate of round "
+                f"{state.review_certificate.get('review_round')} applies"
+                if not problem
+                else f"against state and the configuration in force it does not apply "
+                f"({problem}), so the gate would enter BLOCKED"
+            )
+        return (
+            "after the revision checks, would require the review certificate to apply to the "
+            "PR, HEAD, base and merge base GitHub returns and to the validation set and policy "
+            "in force, before the review comment is re-read or any merge.verification_commands "
+            f"runs (else BLOCKED; never a merge permission on its own); {now}"
+        )
+
     def _premerge_plan_notes(self) -> list[str]:
         """Dry-run description of the controller's own pre-merge evidence (#42)."""
         notes: list[str] = []
@@ -7416,7 +7444,8 @@ class ControllerEngine:
             plan=plan,
             message=(
                 f"merge gate open and GitHub confirms PR {verified.url} is mergeable at the "
-                f"reviewed HEAD {verified.head_sha[:12]} on {verified.base_ref!r}; "
+                f"reviewed HEAD {verified.head_sha[:12]} on {verified.base_ref!r}, where the "
+                f"review certificate of round {state.review_round} applies; "
                 f"READY_FOR_MERGE -> {nxt.value}"
             ),
         )
@@ -7735,6 +7764,12 @@ class ControllerEngine:
         - PR HEAD != reviewed HEAD, PR base != reviewed base, or the merge
           base of the two != the reviewed merge base (the base branch was
           rewritten under its name, #96) -> REVIEW (clean review is stale)
+        - no review certificate, or one that does not apply to that live
+          PR, HEAD, base and merge base, to the state's round, binding and
+          comment, or to the validation set and policy in force
+          (:meth:`_merge_certificate_problem`, ADR 0006 D13) -> BLOCKED
+          (conclusive; ``unblock`` decides REVIEW, or READY_FOR_MERGE once a
+          restored configuration makes it apply again)
         - the review comment the state names, re-read from GitHub, is not
           the clean review of this round at this revision (gone, on another
           PR, marker for another round / HEAD / base / merge base, unreadable marker,
@@ -7859,6 +7894,15 @@ class ControllerEngine:
             )
         if merge_base != reviewed_merge_base:
             return self._revision_drift_to_review(phase, plan, pr, merge_base_sha=merge_base)
+        # ADR 0006 D13 (#175): the round's review certificate must apply to
+        # the PR, HEAD, base and merge base just read and to the validation
+        # set and policy in force. It is a prerequisite and stands in for
+        # nothing below: the #94 re-read, the readiness reads and
+        # merge.verification_commands still run and still refuse on their
+        # own, and a PR with no applicable certificate never has its code run.
+        uncertified = self._merge_certificate_problem(phase, pr, merge_base)
+        if uncertified:
+            return self._block(phase, plan, uncertified)
         # The PR is at the reviewed revision; now the review itself. Every
         # other fact the gate relies on was just read from GitHub, and the
         # clean review must be too (#94): the comment the state names is
@@ -7899,6 +7943,67 @@ class ControllerEngine:
         if unverified:
             return self._block(phase, plan, f"{unverified}. Nothing was merged or counted.")
         return pr
+
+    def _merge_certificate_problem(self, phase: Phase, pr: PRInfo, merge_base: str) -> str:
+        """Why the merge gate refuses the held review certificate, or "" (ADR 0006 D13.2).
+
+        ``pr`` and ``merge_base`` are what GitHub just returned, already
+        proven to be the reviewed revision: the certificate must apply to
+        them as the ``live`` revision of
+        :func:`~autoforge.certificate.certificate_problem`, and to the state
+        and the configuration in force (:meth:`review_certificate_problem`).
+        Pure past the reads the caller made. Every refusal is conclusive (a
+        re-check would read the same state and configuration) and says which
+        way out ``unblock`` takes:
+
+        - no certificate (a state from before certificates existed, or one
+          that reached the gate without one): ``unblock`` decides REVIEW, a
+          new round validated under the configuration in force;
+        - the set or policy digest changed since issuance: named; restoring
+          the configuration makes ``unblock`` decide READY_FOR_MERGE, and the
+          new configuration decides REVIEW (no automatic re-review);
+        - anything else (round, binding, comment, a record): named, never
+          coerced; ``unblock`` decides REVIEW.
+        """
+        state = self._require_state()
+        head = pr.head_sha.lower()
+        outcome = (
+            f"The merge gate refuses before the review comment is re-read, the PR's code is "
+            f"run or anything is written; nothing was merged or counted ({phase.value} -> "
+            "BLOCKED)"
+        )
+        if not state.review_certificate:
+            return (
+                f"no applicable ReviewCertificate for HEAD {head}; unblock to run a new "
+                "validated REVIEW round. The state holds no review certificate: it predates "
+                "certificates, or reached the merge gate without the clean round that issues "
+                f"one. {outcome}. 'unblock' decides REVIEW, a fresh round that validates and "
+                f"reviews HEAD {head[:12]} under the configuration in force"
+            )
+        live = Revision(pr.url or state.current_pr_url, pr.head_sha, pr.base_ref, merge_base)
+        problem = self.review_certificate_problem(live)
+        if not problem:
+            return ""
+        try:
+            drift = configuration_drift(state.review_certificate, self._configured_validation())
+        except ValidationDefinitionError:
+            drift = ""
+        if drift and problem == drift:
+            return (
+                f"the review certificate of round {state.review_round} for HEAD {head[:12]} "
+                f"does not apply: {drift} since it was issued. A certificate states the set and "
+                "policy its review was presented under, and the merge gate merges under no "
+                f"other. {outcome}. Restore the configuration and 'unblock': the certificate "
+                "then applies and READY_FOR_MERGE re-verifies the PR on GitHub. Or 'unblock' "
+                "under the new configuration: it decides REVIEW, a fresh round validated under "
+                "it"
+            )
+        return (
+            f"no applicable ReviewCertificate for HEAD {head}: the review certificate held "
+            f"does not apply ({problem}); it is never coerced. {outcome}. Inspect the state "
+            "('autoforge status'), then 'unblock': with no applicable certificate it decides "
+            "REVIEW, a fresh round that validates and reviews the PR again"
+        )
 
     def _clean_review_problem(self, reviewed_ref: GitHubPullRequestRef) -> str:
         """Re-read the clean review's comment from GitHub; "" when it backs the state.
@@ -8330,6 +8435,9 @@ class ControllerEngine:
         5. PR is OPEN, its HEAD equals the reviewed HEAD, its base is the
            reviewed base and their merge base is the reviewed merge base
            (else -> REVIEW)
+        5a. the round's review certificate applies to that live revision and
+           to the validation set and policy in force (else BLOCKED, ADR 0006
+           D13), then the #94 re-read of the review comment
         6. GitHub says the PR is mergeable *now*: not a draft, ``mergeable``
            is MERGEABLE, ``mergeStateStatus`` is CLEAN/HAS_HOOKS, every check
            in the status rollup succeeded, no auto-merge is armed and the

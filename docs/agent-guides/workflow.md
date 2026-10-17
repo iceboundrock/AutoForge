@@ -243,15 +243,45 @@ stops at its first non-`PASS`.
   which has no unblock, starts again. `certificate.certificate_problem`
   decides applicability from the state, the configured set and policy and,
   for REMOTE, an optional live revision, with no I/O: the kind of the run's
-  mode, its digest, the load checks, the state's round, review binding,
-  comment and candidate (LOCAL, the reviewed fingerprint under this run's
-  contract), the set and policy in force, every named record still
-  eligible, and the live PR, HEAD, base and merge base. A certificate is
-  never shown to an agent or published (D1.3), and it is not a merge
+  mode, its digest, the load checks, the state's round and that its last
+  review result is still `clean` (an observed push, retarget or rewritten
+  base marks the round `stale` without moving its binding, #175), review
+  binding, comment and candidate (LOCAL, the reviewed fingerprint under
+  this run's contract), the set and policy in force, every named record
+  still eligible, and the live PR, HEAD, base and merge base. A certificate
+  is never shown to an agent or published (D1.3), and it is not a merge
   permission (D1.2): the merge gate re-reads every fact it decides on from
-  GitHub, and does not consult the certificate yet (#175). A certificate is
-  not cleared when a new round starts: one of an earlier round no longer
-  applies, which is all a gate asks.
+  GitHub, and the certificate is one more prerequisite of it (below). A
+  certificate is not cleared when a new round starts: one of an earlier
+  round no longer applies, which is all a gate asks.
+- **The merge gate** (ADR 0006 D13, #175). Each `_verify_pr_for_merge`
+  pass, the `READY_FOR_MERGE` gate pass and `MERGE` alike, checks the
+  certificate after the PR identity, MERGED reconciliation, HEAD, base and
+  merge-base checks, against the revision it just read
+  (`certificate_problem(..., live=Revision(...))`), and before the #94
+  re-read of the review comment, the readiness reads and
+  `merge.verification_commands`. A refusal is a conclusive `BLOCKED` in one
+  write, with nothing run, merged or counted: none held ("no applicable
+  ReviewCertificate for HEAD <sha>; unblock to run a new validated REVIEW
+  round"), a set or policy changed since issuance (named; restore it and
+  unblock, or unblock to `REVIEW`), or any other mismatch (named, never
+  coerced). Every other gate is kept; the certificate removes none. The
+  dry-run plan of both phases describes the check and whether the
+  certificate applies against state, and the closed-gate banner of
+  `READY_FOR_MERGE` says the same.
+- **Drift and evidence** (D14.1). Nothing marks a record or a certificate
+  stale; applicability is derived where it is used, and old ones stay as
+  history. A push to the PR (a new commit, a force push, or another commit
+  with the same tree) routes to `REVIEW` as before; the REVIEW entry
+  validates the new commit and the new round's clean result certifies it
+  alone. A retarget or a rewritten base routes to `REVIEW` too; the
+  candidate-tree records still apply and are reused, and the new round's
+  certificate names the new base and merge base. A base that only advanced
+  keeps both (`BEHIND` is the readiness check's). An edited, deleted or
+  doubled review comment is refused by the #94 re-read. A replan
+  replacement inherits nothing: the source PR's certificate never matches
+  its PR, candidate or round. A PR found already MERGED is reconciled and
+  counted once with no certificate (D12.4).
 
 ---
 
@@ -651,8 +681,9 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   reviewed HEAD and base with a
   clean review whose review certificate applies (ADR 0006 D12.3) ->
   `READY_FOR_MERGE` (the merge gate re-verifies from there); with a clean
-  review and no applicable certificate (none was issued, or the set or
-  policy changed since) -> `REVIEW` (past the cap: refuse), a fresh round
+  review and no applicable certificate (none was issued, the set or policy
+  changed since, or another requirement fails; the reason the merge gate
+  blocked with, #175) -> `REVIEW` (past the cap: refuse), a fresh round
   that validates and reviews the revision under the configuration in force,
   the clean result left as it is (it describes this revision; it is only
   uncertified);

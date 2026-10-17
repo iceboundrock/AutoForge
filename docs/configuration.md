@@ -742,7 +742,12 @@ validation:
   orphan containment and how the candidate is materialized. Changing any
   of them, `execution.command_timeout_seconds` or
   `execution.env_allowlist_extra` included, makes earlier records not
-  apply: the commands run again. Under `disabled` every validator runs
+  apply: the commands run again. Made after a clean review, the same change
+  makes that round's review certificate not apply, so the merge gate
+  refuses (`BLOCKED`, naming the policy or set digest) until the
+  configuration is restored or a new round runs under it
+  ([Running the remote workflow](usage.md#candidate-validation-evidence)).
+  Under `disabled` every validator runs
   unsandboxed as your UID and its record says `enforced: false`. Under
   `required`, and under REMOTE's `preferred`, a record applies only when
   its launch was enforced; LOCAL's `preferred` may fall back, and a record

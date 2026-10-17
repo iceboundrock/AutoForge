@@ -1503,9 +1503,11 @@ The certificate is not a merge permission (D1.2): it records what the
 controller observed of one clean review of one exact validated candidate,
 it is not a GitHub approval or a CI result, and it is never shown to an
 agent or published (D1.3). Opening the gate still takes both halves above,
-and the gate re-reads every fact it decides on from GitHub; it does not
-consult the certificate yet (#175). A merged PR not yet counted is
-reconciled without one (D12.4).
+and the gate re-reads every fact it decides on from GitHub. The certificate
+is one more prerequisite of each gate pass (D13, #175; below), never a
+reason to merge on its own, and it removes no other check. A merged PR not
+yet counted is reconciled without one (D12.4): counting a merge already
+made is not a merge decision.
 
 ### Pre-merge verification and its failure classes
 
@@ -1544,6 +1546,35 @@ the write), reading only controller state and GitHub, never an agent claim.
   change it.
 - HEAD, base or merge-base drift -> `REVIEW`; a PR found already merged in
   `READY_FOR_MERGE` -> `MERGE`, to reconcile and count it once.
+- With the PR, HEAD, base and merge base confirmed, the round's review
+  certificate must apply to them and to the validation set and policy in
+  force (ADR 0006 D13.2): its digest verifies, it names `current_pr_url`
+  and the PR GitHub returned, the HEAD, base ref and merge base just read,
+  the review comment `last_review_comment_url` names, and PASS records that
+  are still in state; and the configured `validation.commands` and policy P
+  (`sandbox.mode` and its template, the environment allow-list names,
+  `execution.command_timeout_seconds`; [Configuration](../configuration.md#candidate-validation))
+  digest to the values it states. This runs before the #94 re-read
+  of the review comment, before the readiness reads and before any
+  `merge.verification_commands` command, so a PR without an applicable
+  certificate never runs its code locally. A refusal is conclusive
+  `BLOCKED` in one write, nothing merged or counted, and is never coerced:
+  - none held (a state from before certificates, or one that reached the
+    gate without the clean round that issues one): "no applicable
+    ReviewCertificate for HEAD <sha>; unblock to run a new validated REVIEW
+    round", and `unblock` decides `REVIEW`;
+  - the set or the policy changed since issuance: the reason names the
+    digest that changed. Restore the configuration and `unblock` (it decides
+    `READY_FOR_MERGE`, and the next pass re-verifies the PR on GitHub), or
+    `unblock` under the new configuration (it decides `REVIEW`: a fresh
+    round validated under it). No round is relaunched by itself;
+  - any other mismatch names the requirement that failed, and `unblock`
+    decides `REVIEW`.
+
+  The check consults state, the configuration and the facts this pass just
+  read; it reads nothing more from GitHub and writes nothing on success.
+  `MERGE` repeats it: a saved `READY_FOR_MERGE -> MERGE` write followed by a
+  configuration edit and a restart is refused the same way.
 
 In every one of these cases nothing is merged.
 

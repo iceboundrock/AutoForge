@@ -287,9 +287,13 @@ six fields, in REMOTE and LOCAL state alike:
   [workflow.md](workflow.md#candidate-validation-gates)) in the save that
   enters `READY_FOR_MERGE` or LOCAL `DONE`, copying the candidate, the
   records and the set and policy digests from the round's binding, and a
-  clean round it cannot certify exactly blocks in that save instead. A
-  certificate is never cleared by a later round: one of an earlier round
-  no longer applies. #173 writes the other three
+  clean round it cannot certify exactly blocks in that save instead. The
+  merge gate requires it to apply to the live PR revision on every pass
+  (#175; [github-safety.md](github-safety.md#pre-merge-verification-and-its-failure-classes))
+  and writes nothing to it. A certificate is never cleared or rewritten by
+  a later round, a drift or a merge: one of an earlier round no longer
+  applies, and old records and certificates stay as history until evicted
+  or cleared. #173 writes the other three
   ([workflow.md](workflow.md#candidate-validation-gates)): the `REVIEW`
   entry saves the binding with the reviewer's launch (a relaunch for the
   same round, head, set and policy reuses it); a REMOTE producer's failure
@@ -429,6 +433,10 @@ A controller effect (ADR 0004) is resumed from its record and never re-sent blin
 A validator (#172, ADR 0006 D10.7, §2.16) has its own windows. A crash before the attempt marker is saved recorded nothing, and the caller runs the definition again. A crash with the marker saved, the validator running or already exited, leaves the marker: the next `step` or `resume`, under the lock and before anything else of the step, appends an `INTERRUPTED` record built from the marker alone and clears the marker in the same save, and the definition runs again when its phase does. An exit 0 the controller did not record is therefore never a `PASS`. The record and the marker clear are one save, so a crash between them is impossible; a marker whose record exists (only a hand edit makes one) is cleared and nothing is appended, which also makes a duplicate resume idempotent. More than two `INTERRUPTED` records for one candidate, definition and policy (those at or below the operator's override watermark not counted) enters `BLOCKED` in the save that writes the third, naming the candidate and the definition. A launch or setup failure clears the marker in the next save and writes no record.
 
 The review certificate (#174, ADR 0006 §2.16) has two windows. A crash after a clean round's comment was published and before the state was saved is #162's: the journal completes the round from the observed comment, with no relaunch and no new comment, and the certificate is issued from the comment the journal observed and from the binding the plan was saved under, empty set included, in the same save that enters `READY_FOR_MERGE`; a set or policy that changed in between makes that save `BLOCKED` instead, still holding the certificate (D12.6). A crash before that save (or before the LOCAL `DONE` save) wrote neither the certificate nor the transition, so the next step completes the round again. The certificate and its transition are one write, so a crash between them is impossible.
+
+The merge gate (#175, ADR 0006 D12.4, D13, §2.16) holds no state of its own across a crash: each `_verify_pr_for_merge` pass reads the PR again and checks the certificate against what it read. A crash after the `READY_FOR_MERGE -> MERGE` save runs the whole gate again in `MERGE`, certificate included, so a configuration edited before the restart is refused there exactly as at the gate pass. A crash while a `merge.verification_commands` command runs, or after it ran and before its result was saved, caches nothing (`premerge_verified_*` records an observed pass only): the next pass checks the certificate again and runs the command again. A crash after the merge call and before its save finds the PR MERGED at the next `MERGE` step, which reconciles and counts it once, with no second merge and no certificate issued, rewritten or required: counting a merge already made is not a merge decision. A restart with an applicable certificate and an unchanged PR merges as if nothing had happened. A push that lands while the `REVIEW` entry validates the head leaves records that stay true for the commit they ran on; the reviewer reviews that commit, the re-read after the review finds the push, and the round is stale with no certificate, so the next round validates and certifies the new head.
+
+A state saved before certificates existed (protocol 9 or older, migrated with every evidence field empty) is handled per phase. In `REVIEW` the round validates the head at its entry and certifies its own clean result. In `READY_FOR_MERGE` or `MERGE` with an OPEN PR the gate refuses with no applicable certificate (`BLOCKED`, conclusive, nothing run or merged), and `unblock`, as from any `BLOCKED` with a clean review and none held, decides `REVIEW` for a fresh validated round. A legacy PR GitHub already reports MERGED is reconciled and counted as before, with no certificate.
 
 If recovery cannot determine the safe state with sufficient confidence, enter `BLOCKED` rather than guessing.
 

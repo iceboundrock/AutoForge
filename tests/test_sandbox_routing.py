@@ -44,6 +44,7 @@ from .conftest import (
     GIT_IDENT,
     SYSTEM_PYTHON,
     FakeGitHub,
+    certify_review,
     git_repo,
     make_local_engine,
     real_sandbox_backend,
@@ -924,6 +925,7 @@ def test_a_required_premerge_command_runs_in_the_export_alone(
     eng.config.sandbox.mode = "required"
     eng.config.sandbox.premerge_network = "isolated"
     eng.config.execution.command_timeout_seconds = 60
+    certify_review(eng)  # the clean review ran under this configuration (#175)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC", out.message
     assert len(fake_github.merges) == 1 and eng.state.premerge_verified_head_sha == sha

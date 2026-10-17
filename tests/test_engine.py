@@ -68,6 +68,7 @@ from autoforge.result_parser import (
 )
 from autoforge.state import MAX_ACCEPTANCE_OUTCOMES, MAX_DECLINES_PER_ROUND, load_state
 from autoforge.transitions import Phase
+from autoforge.validation import parse_pr_url
 from tests.conftest import (
     ACCEPTANCE_RATIONALE,
     ACCEPTANCE_TEXT,
@@ -93,6 +94,7 @@ from tests.conftest import (
     acceptance,
     analyze_payload,
     block,
+    certify_review,
     ci_check,
     ci_jobs,
     comment_url,
@@ -4659,7 +4661,9 @@ def _in_merge(tmp_state_dir, gh, script=None, reviewed=SHA_A, clean=True, phase=
     The review is bound the way ``_apply_review`` binds it: round 2 at
     ``reviewed`` on ``main`` from merge base ``MERGE_BASE`` of ``PR``,
     decided by a comment on the fake that carries that round's marker
-    (``REVIEW_CID``), which the gate re-reads (#94).
+    (``REVIEW_CID``), which the gate re-reads (#94). A clean review holds
+    the certificate its REVIEW write issues (#174), which the gate requires
+    (#175); one that is not clean holds none.
     """
     eng = make_engine(tmp_state_dir, script or [], github=gh)
     eng.config.safety.allow_merge = True
@@ -4678,6 +4682,8 @@ def _in_merge(tmp_state_dir, gh, script=None, reviewed=SHA_A, clean=True, phase=
         gh.add_comment(PR, REVIEW_CID, review_comment_body(2, reviewed, not clean))
     eng.state.last_review_comment_url = comment_url(PR, REVIEW_CID)
     eng._save()
+    if clean:
+        certify_review(eng)
     return eng
 
 
@@ -4712,6 +4718,7 @@ def test_merge_when_explicitly_enabled_is_done_by_controller(tmp_state_dir, fake
     eng.state.review_round = 2
     fake_github.add_comment(PR, 100, review_comment_body(2, SHA_A, False))
     eng.state.last_review_comment_url = comment_url(PR, 100)
+    certify_review(eng)
     assert eng.step(allow_merge=True).next_phase == "MERGE"
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC", out.message
@@ -4901,13 +4908,21 @@ def test_gate_blocks_when_the_state_names_a_comment_on_another_pr(
     tmp_state_dir, fake_github, phase
 ):
     """`last_review_comment_url` on PR 43 while the review is bound to PR 42:
-    refused from state alone, before the comment is even read."""
+    refused from state alone, before the comment is even read. The review
+    certificate names the comment the round posted, so its check (#175)
+    refuses first; the #94 re-read refuses the same state on its own."""
     other = "https://github.com/owner/repo/pull/43"
     fake_github.add_pr(head_sha=SHA_A)
     eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
     fake_github.add_comment(other, 200, review_comment_body(2, SHA_A, False))
     eng.state.last_review_comment_url = comment_url(other, 200)
-    _gate_blocks_on_review_comment(eng, fake_github, "is not on the reviewed PR")
+    assert "is not on the reviewed PR" in eng._clean_review_problem(parse_pr_url(PR))
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    reason = eng.state.block_reason
+    assert f"its review comment {comment_url(PR, REVIEW_CID)} is not the last review" in reason
+    assert "nothing was merged or counted" in reason
+    assert fake_github.merges == [] and eng.state.attempt == 0
     assert not any(c[0] == "get_comment" for c in fake_github.calls)
 
 
@@ -5759,6 +5774,7 @@ def test_verification_command_timeout_blocks_the_merge(tmp_state_dir, fake_githu
     commands = [["python3", "-c", "import time; time.sleep(30)"]]
     eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
     eng.config.execution.command_timeout_seconds = 1
+    certify_review(eng)  # the clean review ran under this configuration (#175)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED" and "timed out after 1s" in eng.state.block_reason
     assert fake_github.merges == []
@@ -5788,6 +5804,7 @@ def test_verification_command_leftover_is_killed_and_its_result_kept(
     commands = [["python3", "-c", _LEAVES_A_SERVER]]
     eng, sha = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
     eng.config.execution.command_timeout_seconds = 30
+    certify_review(eng)  # the clean review ran under this configuration (#175)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
     assert eng.state.premerge_verified_head_sha == sha
@@ -5827,6 +5844,7 @@ def test_verification_command_detached_leftover_is_killed_and_journaled(
     commands = [["python3", "-c", _DETACHES_A_SERVER]]
     eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
     eng.config.execution.command_timeout_seconds = 30
+    certify_review(eng)  # the clean review ran under this configuration (#175)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC" and len(fake_github.merges) == 1
     run_dir = eng.paths.logs_dir / eng.state.run_id
@@ -5851,6 +5869,7 @@ def test_failing_verification_command_names_its_leftover_in_the_block_reason(
     commands = [["python3", "-c", _LEAVES_A_SERVER, "3"]]
     eng, sha = _in_merge_on_commit(tmp_state_dir, fake_github, commands)
     eng.config.execution.command_timeout_seconds = 30
+    certify_review(eng)  # the clean review ran under this configuration (#175)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED" and fake_github.merges == []
     reason = eng.state.block_reason
@@ -11158,6 +11177,7 @@ def test_validation_and_premerge_commands_run_under_the_allowlist(tmp_state_dir,
     """Repository-defined commands get the agent's environment, not the operator's shell."""
     eng, _ = _in_merge_on_commit(tmp_state_dir, fake_github, [["true"]])
     eng.config.execution.env_allowlist_extra = ["MY_TOOL_*"]
+    certify_review(eng)  # the clean review ran under this configuration (#175)
     seen = []
 
     def runner(req):

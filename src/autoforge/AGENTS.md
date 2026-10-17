@@ -78,7 +78,8 @@ materialize.py      byte-exact export of a candidate commit from the shared obje
 evidence.py         candidate validation evidence: definitions, policy P, ValidationRecords,
                     the attempt marker, their bounds and integrity checks; pure (ADR 0006, #172)
 certificate.py      review certificates: issuance from the review binding, applicability
-                    (certificate_problem) and the not-a-merge-permission wording; pure (ADR 0006 D12, #174)
+                    (certificate_problem, also against the live PR the merge gate reads, #175)
+                    and the not-a-merge-permission wording; pure (ADR 0006 D12, D13, #174)
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
 state.py            persisted controller state, atomic writes, schema/protocol checks
 run_contract.py     the durable contract of a LOCAL run
