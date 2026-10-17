@@ -9378,20 +9378,43 @@ def test_a_fix_launch_is_told_what_its_worktree_holds_uncommitted(tmp_state_dir)
 # a running turn: its own error line, styled whatever stderr is.
 WS_CLOSED = "> build · gpt-6-luna\n\x1b[91m\x1b[1mError: \x1b[0mWebSocket closed with code 1000\n"
 TRANSIENT = "opencode: OpenAI WebSocket closed with code 1000"
+# The two failed REVIEW runs of #226: one run-level error each, after which
+# the session opened a new turn and finished it.
+WS_POLICY = (
+    "> build · gpt-6.1-sol\n\x1b[91m\x1b[1mError: \x1b[0mWebSocket closed with code 1008\n"
+    "> build · gpt-6.1-sol\n"
+)
+SERVER_ERROR = (
+    "> build · gpt-6.1-sol\n\x1b[91m\x1b[1mError: \x1b[0mserver_error: An error occurred while "
+    "processing your request. You can retry your request, or contact us through our help "
+    "center at help.openai.com if the error persists.\n> build · gpt-6.1-sol\n"
+)
 
 
-def test_openai_websocket_disconnect_retries_and_reconciles_before_relaunch(
-    tmp_state_dir, fake_github
+@pytest.mark.parametrize(
+    ("stderr", "transient"),
+    [
+        pytest.param(WS_CLOSED, TRANSIENT, id="websocket-1000"),
+        pytest.param(
+            WS_POLICY, "opencode: OpenAI WebSocket closed with code 1008", id="websocket-1008"
+        ),
+        pytest.param(SERVER_ERROR, "opencode: OpenAI server_error", id="server-error"),
+    ],
+)
+def test_a_transient_openai_failure_is_relaunched_after_reconciling(
+    tmp_state_dir, fake_github, stderr, transient
 ):
-    """#164: a reviewer whose OpenCode run died of the socket close is
-    relaunched, each relaunch after the phase-entry reconciliation, and every
-    failed launch is logged as the failed exit it was."""
+    """#164, #226: a reviewer whose OpenCode run failed only on a listed
+    OpenAI error is relaunched, each relaunch after the phase-entry
+    reconciliation, and every failed launch is logged as the failed exit it
+    was: the well-formed result it printed is not read."""
     eng = _in_review(tmp_state_dir, fake_github, [])
+    discarded = block(review_payload(1, SHA_A, []))
     calls = _install_opencode_responses(
         eng,
         [
-            (1, "complete but rejected", WS_CLOSED),
-            (1, "complete but rejected", WS_CLOSED),
+            (1, discarded, stderr),
+            (1, discarded, stderr),
             (0, block(review_payload(1, SHA_A, [])), ""),
         ],
     )
@@ -9414,11 +9437,11 @@ def test_openai_websocket_disconnect_retries_and_reconciles_before_relaunch(
     assert len(steps) == 3
     executions = [json.loads((p / "execution.json").read_text(encoding="utf-8")) for p in steps]
     assert [e["exit_code"] for e in executions] == [1, 1, 0]
-    assert [e["error"] for e in executions[:2]] == [f"exit 1 (transient: {TRANSIENT})"] * 2
-    assert (steps[0] / "stderr.log").read_text(encoding="utf-8") == WS_CLOSED
+    assert [e["error"] for e in executions[:2]] == [f"exit 1 (transient: {transient})"] * 2
+    assert (steps[0] / "stderr.log").read_text(encoding="utf-8") == stderr
     progress = (steps[0] / "progress.log").read_text(encoding="utf-8")
-    assert f"agent exited 1 (transient: {TRANSIENT})" in progress
-    assert (steps[2] / "control-result.json").exists()
+    assert f"agent exited 1 (transient: {transient})" in progress
+    assert [(p / "control-result.json").exists() for p in steps] == [False, False, True]
 
 
 def test_openai_websocket_disconnect_is_relaunched_at_most_twice_per_step(

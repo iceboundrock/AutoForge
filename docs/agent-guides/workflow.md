@@ -388,7 +388,8 @@ has an entry, and a test holds the two tables together.
 
 A failed launch its adapter reports as a known transient failure of the
 provider (`transient_failure`, #164; today an OpenCode `openai/*` run whose
-only run-level error is `WebSocket closed with code 1000`) is relaunched
+run-level errors are all `WebSocket closed with code 1000` or `1008` or
+OpenAI's generic `server_error` message, #226) is relaunched
 inside the current REMOTE step, at most `MAX_TRANSIENT_RETRIES` (2) times.
 That budget belongs to the step: it is counted apart from the CONTROL_RESULT
 corrections and is not refilled by them, so one step launches at most

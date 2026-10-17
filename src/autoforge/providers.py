@@ -93,19 +93,33 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     heartbeat's "last activity" current; the trace itself reaches the
     operator only in ``stderr.log``.
   * a run-level error prints ``ESC[91mESC[1mError: ESC[0m<message>`` on
-    stderr (whether or not it is a terminal) and sets exit 1; a tool's error
+    stderr (whether or not it is a terminal) and sets exit 1, even when the
+    session goes on after it and finishes its turn; a tool's error
     is the same line right after the tool's ``ESC[0m✗ ESC[0m<title> failed``
     line and fails nothing (read from the 2.0.26 build). An exit 1 of an
-    ``openai/*`` model whose run-level errors are all ``WebSocket closed
-    with code 1000`` (the socket to the model closed under a running turn,
-    #164) is reported as a :attr:`AgentExecutionResult.transient_failure`;
-    the exit stays a failed exit, and whether to relaunch is the engine's
-    policy. Text anywhere else in the trace (a diff, a file, a command's
-    output) is not an error line, and a truncated ``stderr`` or a timeout
-    is never classified. Not visible to this check: an error the CLI does
-    not print (it prints one execution failure only when no step failed
-    before it) and an exit 1 without any error line (a cancelled
-    permission prompt); both are failed exits all the same.
+    ``openai/*`` model whose run-level errors are all on a short list, each
+    compared as a whole message (:data:`_OPENCODE_OPENAI_TRANSIENT_ERRORS`),
+    is reported as a :attr:`AgentExecutionResult.transient_failure`:
+    ``WebSocket closed with code 1000`` (the socket to the model closed
+    under a running turn, #164), ``WebSocket closed with code 1008`` and
+    OpenAI's generic ``server_error: An error occurred while processing your
+    request. You can retry your request, ...`` (#226). OpenAI documents no
+    close code for its Responses WebSocket (its 60-minute connection limit
+    is an error event, not a code), and 1008 is RFC 6455's generic policy
+    code; 1008 is listed because OpenCode's own retry rule (read from the
+    2.0.32 build) retries a socket closed with any code but 1009 (message
+    too big) as it retries a ``server_error``, and each of the two runs of
+    #226 reconnected after one and finished its turn. The ``server_error``
+    message is compared whole, not by its ``server_error: `` prefix: another
+    text under that code (one naming a request ID, say) is not the one that
+    says to retry, and stays a plain failed exit. A transient exit stays a
+    failed exit too (a CONTROL_RESULT it printed is not read), and whether
+    to relaunch is the engine's policy. Text anywhere else in the trace (a
+    diff, a file, a command's output) is not an error line, and a truncated
+    ``stderr`` or a timeout is never classified. Not visible to this check:
+    an error the CLI does not print (it prints one execution failure only
+    when no step failed before it) and an exit 1 without any error line (a
+    cancelled permission prompt); both are failed exits all the same.
   * bash/edit tools run without ``--auto`` under the default agent;
     ``--auto`` is opt-in via ``options.auto_approve: true``.
   * ``opencode --version`` prints ``opencode v2.0.23``; 1.x printed the
@@ -1530,8 +1544,9 @@ class OpenCodeProvider(AgentProvider):
             and req.profile.model.partition("/")[0] == "openai"
         ):
             errors = _opencode_run_errors(result.stderr)
-            if errors and all(e == _OPENCODE_OPENAI_WS_CLOSED for e in errors):
-                result.transient_failure = "opencode: OpenAI WebSocket closed with code 1000"
+            if errors and all(e in _OPENCODE_OPENAI_TRANSIENT_ERRORS for e in errors):
+                reasons = dict.fromkeys(_OPENCODE_OPENAI_TRANSIENT_ERRORS[e] for e in errors)
+                result.transient_failure = "opencode: " + ", ".join(reasons)
         return result
 
 
@@ -1540,9 +1555,21 @@ class OpenCodeProvider(AgentProvider):
 # `ESC[0m✗ ESC[0m<title> failed` line, then the tool's error in the same form.
 _OPENCODE_ERROR_LINE_RE = re.compile(r"\x1b\[91m\x1b\[1mError: \x1b\[0m(.*)")
 _OPENCODE_TOOL_FAILED_LINE_RE = re.compile(r"\x1b\[0m✗ \x1b\[0m.* failed")
-# The run-level error of a socket to OpenAI that closed normally (code 1000)
-# under a running turn (#164).
-_OPENCODE_OPENAI_WS_CLOSED = "WebSocket closed with code 1000"
+# The run-level errors that make an `openai/*` exit 1 transient, each the
+# whole message OpenCode prints, mapped to the fixed reason reported for it:
+# the socket to OpenAI closed under a running turn, normally (1000, #164) or
+# with the policy code (1008, #226), and OpenAI's generic server error, whose
+# own text says to retry (#226). A message that only starts the same way
+# (another `server_error` text, one naming a request ID) is not listed.
+_OPENCODE_OPENAI_TRANSIENT_ERRORS = {
+    "WebSocket closed with code 1000": "OpenAI WebSocket closed with code 1000",
+    "WebSocket closed with code 1008": "OpenAI WebSocket closed with code 1008",
+    (
+        "server_error: An error occurred while processing your request. You can retry "
+        "your request, or contact us through our help center at help.openai.com if the "
+        "error persists."
+    ): "OpenAI server_error",
+}
 
 
 def _opencode_run_errors(stderr: str) -> list[str]:

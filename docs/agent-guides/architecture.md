@@ -165,9 +165,12 @@ checkout check and the phase-entry reconciliation, and none while a process
 the failed launch started may still be running. Today the one
 classification is OpenCode's: an exit 1 of an `openai/*` model whose
 run-level errors, read from the error lines OpenCode itself prints rather
-than from text anywhere in its trace, are all
-`WebSocket closed with code 1000` (the adapter's docstring says what that
-check cannot see).
+than from text anywhere in its trace, are all on the adapter's list, each
+compared as a whole message: `WebSocket closed with code 1000` (#164),
+`WebSocket closed with code 1008` and OpenAI's generic
+`server_error: An error occurred while processing your request. ...`
+(#226). The adapter's docstring says why each is listed and what that
+check cannot see.
 
 #### SDK providers and interactions (planned, ADR 0007)
 

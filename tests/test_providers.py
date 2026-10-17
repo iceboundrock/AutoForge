@@ -194,6 +194,17 @@ def test_opencode_auto_flag_and_extra_args():
 # tool that precedes the tool's own error (see providers.py).
 OC_ERROR = "\x1b[91m\x1b[1mError: \x1b[0m"
 OC_WS_CLOSED = OC_ERROR + "WebSocket closed with code 1000"
+# The run-level errors of the two failed REVIEW runs of #226, as OpenCode
+# 2.0.27 printed them.
+OC_WS_POLICY = OC_ERROR + "WebSocket closed with code 1008"
+OC_SERVER_ERROR = (
+    OC_ERROR + "server_error: An error occurred while processing your request. You can retry "
+    "your request, or contact us through our help center at help.openai.com if the error "
+    "persists."
+)
+WS_CLOSED_REASON = "opencode: OpenAI WebSocket closed with code 1000"
+WS_POLICY_REASON = "opencode: OpenAI WebSocket closed with code 1008"
+SERVER_ERROR_REASON = "opencode: OpenAI server_error"
 
 
 def oc_tool_failed(title: str) -> str:
@@ -235,45 +246,81 @@ def _opencode_run(
 
 
 @pytest.mark.parametrize(
-    ("stderr", "transient"),
+    ("stderr", "reason"),
     [
         # The run of #164: the socket closed mid-turn, the session went on,
         # and the CLI exited 1 with this as its only error.
-        (f"> build · gpt-6-luna\n{OC_WS_CLOSED}\n\x1b[0m→ \x1b[0mRead src/x.py\n", True),
+        (
+            f"> build · gpt-6-luna\n{OC_WS_CLOSED}\n\x1b[0m→ \x1b[0mRead src/x.py\n",
+            WS_CLOSED_REASON,
+        ),
+        # The runs of #226: one error, then a new turn that finished the review.
+        (
+            f"> build · gpt-6.1-sol\n{OC_WS_POLICY}\n> build · gpt-6.1-sol\n"
+            "\x1b[0m$ \x1b[0muv run pytest\n",
+            WS_POLICY_REASON,
+        ),
+        (
+            f"import result:\n{OC_SERVER_ERROR}\n> build · gpt-6.1-sol\n"
+            "\x1b[0m→ \x1b[0mRead src/x.py\n",
+            SERVER_ERROR_REASON,
+        ),
+        # Every error listed: each listed error named once, in order.
+        (
+            f"{OC_WS_POLICY}\n{OC_SERVER_ERROR}\n{OC_WS_POLICY}\n{OC_WS_CLOSED}\n",
+            "opencode: OpenAI WebSocket closed with code 1008, OpenAI server_error, "
+            "OpenAI WebSocket closed with code 1000",
+        ),
         # A tool's error fails nothing; the run-level error is still the close.
         (
             f"{oc_tool_failed('Read docs/x.md')}\n{OC_ERROR}File not found: docs/x.md\n"
             f'{oc_tool_failed("")}\n{OC_ERROR}Invalid arguments for tool "shell":\n'
             f"  expected string\n{OC_WS_CLOSED}\n",
-            True,
+            WS_CLOSED_REASON,
         ),
-        (OC_ERROR + "WebSocket closed with code 1006\n", False),
+        (OC_ERROR + "WebSocket closed with code 1006\n", None),
+        (OC_ERROR + "WebSocket closed with code 1009\n", None),
+        (OC_ERROR + "WebSocket closed with code 1011\n", None),
+        # The whole message, not its `server_error: ` prefix: another text
+        # under that code, or this one with more after it, is not listed.
+        (OC_ERROR + "server_error: The server had an error while processing your request\n", None),
+        (
+            f"{OC_SERVER_ERROR} Please include the request ID req_0123456789abcdef in your "
+            "message.\n",
+            None,
+        ),
+        (OC_SERVER_ERROR.removesuffix(" if the error persists.") + "\n", None),
+        (OC_ERROR + "An error occurred while processing your request.\n", None),
         # The phrase is not OpenCode's error line unless OpenCode printed it.
-        ("Error: WebSocket closed with code 1000\n", False),
+        ("Error: WebSocket closed with code 1000\n", None),
+        (OC_SERVER_ERROR.removeprefix("\x1b[91m\x1b[1m") + "\n", None),
         (
             "+    stderr = '\\x1b[91mError: WebSocket closed with code 1000'\n"
             f"{OC_ERROR}insufficient_quota\n",
-            False,
+            None,
         ),
         # A line break OpenCode does not write does not start an error line.
-        (f"output\u2028{OC_WS_CLOSED}\n", False),
-        (f"{OC_WS_CLOSED}\r\n", True),
+        (f"output\u2028{OC_WS_CLOSED}\n", None),
+        (f"{OC_WS_CLOSED}\r\n", WS_CLOSED_REASON),
+        (f"{OC_SERVER_ERROR}\r\n", SERVER_ERROR_REASON),
         # The quoted error line inside a tool's output is not on a line of its own.
-        (f"| {OC_WS_CLOSED}\n{OC_ERROR}The usage limit has been reached\n", False),
-        # A close the session recovered from, then the error the run died of.
-        (f"{OC_WS_CLOSED}\n> build · gpt-6-luna\n{OC_ERROR}Model not found: openai/x\n", False),
-        (f"{OC_ERROR}Model not found: openai/x\n{OC_WS_CLOSED}\n", False),
+        (f"| {OC_WS_CLOSED}\n{OC_ERROR}The usage limit has been reached\n", None),
+        # An error the session recovered from, then the error the run died of.
+        (f"{OC_WS_CLOSED}\n> build · gpt-6-luna\n{OC_ERROR}Model not found: openai/x\n", None),
+        (f"{OC_ERROR}Model not found: openai/x\n{OC_WS_CLOSED}\n", None),
+        (f"{OC_SERVER_ERROR}\n> build · gpt-6.1-sol\n{OC_ERROR}insufficient_quota\n", None),
+        (f"{OC_WS_POLICY}\n{OC_ERROR}WebSocket closed with code 1006\n", None),
         # A tool that failed with the same text is a tool's error, not the run's.
-        (f"{oc_tool_failed('WebFetch https://x')}\n{OC_WS_CLOSED}\n", False),
+        (f"{oc_tool_failed('WebFetch https://x')}\n{OC_WS_CLOSED}\n", None),
+        (f"{oc_tool_failed('WebFetch https://x')}\n{OC_SERVER_ERROR}\n", None),
+        (f"{oc_tool_failed('WebFetch https://x')}\n{OC_WS_POLICY}\n", None),
         # No error line at all (a cancelled permission prompt also exits 1).
-        ("> build · gpt-6-luna\n", False),
+        ("> build · gpt-6-luna\n", None),
     ],
 )
-def test_opencode_classifies_a_run_whose_only_error_is_the_openai_socket_close(stderr, transient):
+def test_opencode_classifies_a_run_whose_errors_are_all_listed_openai_errors(stderr, reason):
     result = _opencode_run(stderr)
-    assert result.transient_failure == (
-        "opencode: OpenAI WebSocket closed with code 1000" if transient else None
-    )
+    assert result.transient_failure == reason
     # A fact next to the failed exit, never in place of it.
     assert result.exit_code == 1
     assert result.provider_failure is None
@@ -290,8 +337,9 @@ def test_opencode_classifies_a_run_whose_only_error_is_the_openai_socket_close(s
         {"stderr_truncated": True},
     ],
 )
-def test_opencode_classifies_the_socket_close_only_for_an_untruncated_openai_exit_1(run):
-    result = _opencode_run(f"{OC_WS_CLOSED}\n", **run)
+@pytest.mark.parametrize("error", [OC_WS_CLOSED, OC_WS_POLICY, OC_SERVER_ERROR])
+def test_opencode_classifies_a_listed_error_only_for_an_untruncated_openai_exit_1(error, run):
+    result = _opencode_run(f"{error}\n", **run)
     assert result.transient_failure is None
     assert result.provider_failure is None
 
