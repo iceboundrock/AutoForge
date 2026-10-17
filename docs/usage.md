@@ -587,8 +587,12 @@ ownership or discard uncommitted user changes.
   (`Not re-invoked: a process the launch started may still be running`,
   followed by which one); stop it before `resume`. The one failed
   exit relaunched automatically is a launch its adapter reports as transient
-  (today an OpenCode `openai/*` run whose only error is `WebSocket closed
-  with code 1000`): a REMOTE run relaunches it at most twice per step, after
+  (today an OpenCode `openai/*` run whose errors are all `WebSocket closed
+  with code 1000`, `WebSocket closed with code 1008` or OpenAI's generic
+  `server_error: An error occurred while processing your request. ...`,
+  even when the session recovered from it and printed a result: OpenCode
+  exits 1 once it has printed one, and a result from a failed exit is not
+  read): a REMOTE run relaunches it at most twice per step, after
   re-reading GitHub, and when it stops the error says why ("not relaunched:
   ..."). Any other non-zero exit, a timeout or a verification failure is not
   retried automatically and leaves the phase unchanged for `resume`. Inspect
