@@ -737,8 +737,11 @@ command creates a namespace yet.
   Loading is strict: an unknown schema version, an unknown or missing field
   at any level, a duplicated key, an id that is not a positive 64-bit
   integer, an owner over 39 or a name over 100 characters, a relative or
-  over-long worktree path, a file over 16 KiB or not UTF-8 JSON is a
-  `NamespaceError`; a binding whose `run_key` names another issue than its
+  over-long worktree path, a file over 16 KiB or not UTF-8 JSON, or one
+  past the JSON decoder's own integer-digit or nesting limit (its
+  `ValueError` or `RecursionError`, not a `JSONDecodeError`) is a
+  `NamespaceError`, whose message quotes at most a bounded part of the
+  file; a binding whose `run_key` names another issue than its
   directory is a `NamespaceMismatch`. It is written once, with
   `SafeRoot.create_exclusive` (fsynced temporary, then `link(2)`), so a
   crash leaves no binding or a complete one; a second write is refused and
@@ -753,8 +756,9 @@ command creates a namespace yet.
   `run.lock`, logs or worker logs is absent), *unbound* (a claim file or a
   state without a binding) or *bound*, together with the strict,
   read-only load of `state/state.json` (absent, loaded, or corrupt with a
-  redacted, bounded reason: unparseable, an unknown protocol, not a regular
-  file, reached through a link) and whether `claim.json` exists. A corrupt
+  redacted, bounded reason: unparseable or past the decoder's limits
+  (`load_state` reports both as corruption), an unknown protocol, not a
+  regular file, reached through a link) and whether `claim.json` exists. A corrupt
   state is reported for its own namespace only; a corrupt binding raises,
   for that namespace only.
 - **Enumeration** (`list_issue_namespaces`) lists the issue directories

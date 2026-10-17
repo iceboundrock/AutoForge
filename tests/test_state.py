@@ -47,7 +47,7 @@ from autoforge.state import (
 )
 from autoforge.transitions import Phase, WorkflowMode
 
-from .conftest import sample_contract
+from .conftest import DECODER_LIMIT_RECORDS, sample_contract
 
 # Protocol 10's own fields (#172): no older label wrote any of them.
 _VALIDATION_KEYS = (
@@ -133,6 +133,17 @@ def test_load_invalid_utf8_raises_state_error_and_does_not_clobber(tmp_path):
     p.write_bytes(raw)
     with pytest.raises(StateError, match="[Cc]orrupt.*UTF-8"):
         load_state(p)
+    assert p.read_bytes() == raw
+
+
+@pytest.mark.parametrize("raw", DECODER_LIMIT_RECORDS.values(), ids=DECODER_LIMIT_RECORDS.keys())
+def test_load_past_the_decoders_limits_is_corrupt_state_and_does_not_clobber(tmp_path, raw):
+    """ValueError and RecursionError from the decoder are corruption too, never an escape."""
+    p = tmp_path / "state.json"
+    p.write_bytes(raw)
+    with pytest.raises(StateError, match="[Cc]orrupt.*integer or nesting limit") as info:
+        load_state(p)
+    assert len(str(info.value)) < len(str(p)) + 200
     assert p.read_bytes() == raw
 
 

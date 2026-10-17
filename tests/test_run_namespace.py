@@ -41,7 +41,7 @@ from autoforge.runlog import ExecutionRecord
 from autoforge.safefs import SafeRoot, UnsafePathError
 from autoforge.state import AutoForgeState, load_state, save_state
 
-from .conftest import EPIC, ISSUE, git_repo, make_engine
+from .conftest import DECODER_LIMIT_RECORDS, EPIC, ISSUE, git_repo, make_engine
 
 REPOSITORY_ID = 700_001
 ISSUE_IDS = {11: 9_011, 12: 9_012, 13: 9_013, 2: 9_002}
@@ -385,6 +385,79 @@ def test_a_binding_that_is_not_one_json_document_is_refused(common, raw, message
     assert str(issue_namespace(common, 11).binding_file) in str(info.value)
 
 
+# Inside MAX_BINDING_BYTES and past the JSON decoder's own limits: a
+# 5,000-digit integer (ValueError on every supported Python, even ahead of a
+# syntax error) and nesting 3.11 refuses with RecursionError (3.12+ decode
+# it, and it then fails the schema like any other non-binding).
+BINDINGS_PAST_THE_DECODER = {
+    "huge-int": b'{"schema": "autoforge.run-binding/1", "issue_id": ' + b"1" * 5000 + b"}",
+    "huge-int-then-comma": b'{"issue_id": ' + b"1" * 5000 + b",}",
+    "nested-arrays": b"[" * 1500 + b"]" * 1500,
+    "nested-at-the-bound": b'{"schema": ' + b"[" * 8000 + b"]" * 8000 + b"}",
+}
+
+
+@pytest.mark.parametrize(
+    "raw", BINDINGS_PAST_THE_DECODER.values(), ids=BINDINGS_PAST_THE_DECODER.keys()
+)
+def test_a_binding_past_the_decoders_limits_is_a_typed_bounded_refusal(common, raw):
+    assert len(raw) <= rn.MAX_BINDING_BYTES
+    _planted(common, None, raw=raw)
+    where = str(issue_namespace(common, 11).binding_file)
+    before = _tree(common / "autoforge")
+    with pytest.raises(NamespaceError) as info:
+        load_issue_namespace(common, 11)
+    message = str(info.value)
+    assert where in message and not isinstance(info.value, NamespaceMismatch)
+    assert len(message) < len(where) + 300 and "1" * 50 not in message
+    assert _tree(common / "autoforge") == before
+
+
+@pytest.mark.parametrize("name", ["huge-int", "huge-int-then-comma"])
+def test_an_integer_past_the_decoders_limit_is_named_as_such(common, name):
+    _planted(common, None, raw=BINDINGS_PAST_THE_DECODER[name])
+    with pytest.raises(NamespaceError, match=r"integer or nesting limit \(ValueError\)"):
+        load_issue_namespace(common, 11)
+
+
+def test_nesting_past_the_decoders_limit_is_named_as_such(common, monkeypatch):
+    # The real nesting limit is below MAX_BINDING_BYTES on 3.11 only.
+    def too_deep(text: str, **kw: object) -> object:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    _planted(common, _good())
+    monkeypatch.setattr(rn.json, "loads", too_deep)
+    with pytest.raises(NamespaceError, match=r"integer or nesting limit \(RecursionError\)"):
+        load_issue_namespace(common, 11)
+
+
+def test_an_interrupt_inside_the_decoder_is_not_taken_for_a_corrupt_binding(common, monkeypatch):
+    def interrupted(text: str, **kw: object) -> object:
+        raise KeyboardInterrupt
+
+    _planted(common, _good())
+    monkeypatch.setattr(rn.json, "loads", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        load_issue_namespace(common, 11)
+
+
+def test_a_refusal_never_quotes_the_binding_whole(common):
+    many = {**_good(), **{f"x{i:02}": 1 for i in range(40)}, "y" * 5000: 1}
+    _planted(common, many)
+    with pytest.raises(NamespaceError, match=r"\['x00', .*'x04'\] and 36 more") as info:
+        load_issue_namespace(common, 11)
+    assert "x05" not in str(info.value) and "y" * 81 not in str(info.value)
+
+    _planted(common, {**_good(), "y" * 5000: 1})
+    with pytest.raises(NamespaceError, match=r"\['y{79}\]"):
+        load_issue_namespace(common, 11)
+
+    _planted(common, _with(("issue_id",), 10**4000))
+    with pytest.raises(NamespaceError, match="got 4001 digits") as info:
+        load_issue_namespace(common, 11)
+    assert "1" + "0" * 50 not in str(info.value)
+
+
 def test_a_binding_that_is_not_a_regular_file_is_refused_unfollowed(common, tmp_path):
     target = tmp_path / "elsewhere.json"
     target.write_text(json.dumps(_good()), encoding="utf-8")
@@ -564,6 +637,24 @@ def test_a_corrupt_state_reason_is_redacted_and_bounded(common, monkeypatch):
     assert found.state.status is StateStatus.CORRUPT
     assert secret not in found.state.reason
     assert len(found.state.reason) <= rn.MAX_STATE_REASON_CHARS
+
+
+@pytest.mark.parametrize("raw", DECODER_LIMIT_RECORDS.values(), ids=DECODER_LIMIT_RECORDS.keys())
+def test_a_state_past_the_decoders_limits_is_corrupt_for_its_namespace_only(common, raw):
+    for n in (11, 12):
+        _bind(common, n)
+    _save_in(issue_namespace(common, 12), _state(12))
+    corrupt = issue_namespace(common, 11)
+    corrupt.state_dir.mkdir()
+    corrupt.state_file.write_bytes(raw)
+    before = _tree(common / "autoforge")
+    eleven = load_issue_namespace(common, 11)
+    assert eleven.kind is NamespaceKind.BOUND
+    assert eleven.state.status is StateStatus.CORRUPT and eleven.state.state is None
+    assert "integer or nesting limit" in eleven.state.reason
+    assert "1" * 50 not in eleven.state.reason and "[[[[[" not in eleven.state.reason
+    assert load_issue_namespace(common, 12).state.status is StateStatus.LOADED
+    assert _tree(common / "autoforge") == before
 
 
 def test_legacy_standalone_state_is_never_read_moved_or_modified(common):

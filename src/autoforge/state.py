@@ -1777,6 +1777,16 @@ def load_state(path: str | Path, *, root: SafeRoot | None = None) -> AutoForgeSt
             f"corrupted state file {p}: invalid JSON ({exc}); "
             "refusing to overwrite — restore from backup or re-run"
         ) from exc
+    except (ValueError, RecursionError) as exc:
+        # The decoder's own limits, which are not JSONDecodeError: an integer
+        # past ``sys.get_int_max_str_digits()`` and nesting past the recursion
+        # limit or the C stack, both inside MAX_STATE_FILE_BYTES. Corrupt like
+        # unparseable JSON, reported by type only; an interrupt still propagates.
+        raise StateError(
+            f"corrupted state file {p}: exceeds the JSON decoder's integer or nesting "
+            f"limit ({type(exc).__name__}); "
+            "refusing to overwrite — restore from backup or re-run"
+        ) from exc
     return AutoForgeState.from_dict(data)
 
 

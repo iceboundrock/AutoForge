@@ -97,6 +97,11 @@ MAX_TIMESTAMP_CHARS = 32  # utcnow_iso(): 2026-01-01T00:00:00.000000+00:00
 # The reason a namespace's state could not be loaded, as reported: redacted,
 # then bounded, because it quotes the state loader's message.
 MAX_STATE_REASON_CHARS = 2000
+# A binding's refusal quotes the file only this far: at most this many
+# unknown field names (each cut to 80 characters), and an out-of-range id
+# only while its decimal rendering is this short (otherwise its length).
+MAX_QUOTED_NAMES = 5
+MAX_QUOTED_INT_CHARS = 40
 
 _BINDING_KEYS = (
     "schema",
@@ -126,7 +131,7 @@ def _exact(raw: object, keys: Iterable[str], what: str) -> dict:
     wanted = tuple(keys)
     unknown = sorted(str(k) for k in raw if k not in wanted)
     if unknown:
-        _fail(what, f"has unknown field(s) {unknown}")
+        _fail(what, f"has unknown field(s) {_quoted_names(unknown)}")
     missing = [k for k in wanted if k not in raw]
     if missing:
         _fail(what, f"is missing field(s) {missing}")
@@ -137,8 +142,16 @@ def _check_id(value: object, what: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         _fail(what, f"must be an integer, got {type(value).__name__}")
     if value < 1 or value > MAX_ID:
-        _fail(what, f"must be a positive integer of at most {MAX_ID}, got {value}")
+        digits = str(abs(value))
+        got = str(value) if len(digits) <= MAX_QUOTED_INT_CHARS else f"{len(digits)} digits"
+        _fail(what, f"must be a positive integer of at most {MAX_ID}, got {got}")
     return value
+
+
+def _quoted_names(names: list[str]) -> str:
+    shown = ", ".join(f"{name!r:.80}" for name in names[:MAX_QUOTED_NAMES])
+    more = len(names) - MAX_QUOTED_NAMES
+    return f"[{shown}]" if more <= 0 else f"[{shown}] and {more} more"
 
 
 def _check_str(value: object, what: str, max_chars: int) -> str:
@@ -502,7 +515,8 @@ class NamespaceLookup:
 def load_issue_namespace(coordination_root: str | Path, issue_number: int) -> NamespaceLookup:
     """Read issue ``issue_number``'s namespace, strictly and without writing anything.
 
-    A binding is parsed strictly: a corrupt one, or one that names another
+    A binding is parsed strictly: a corrupt one (including one past the JSON
+    decoder's integer or nesting limit), or one that names another
     issue than its directory, raises (:class:`NamespaceError`,
     :class:`~autoforge.errors.NamespaceMismatch`), and the caller reports
     that namespace as uncertain. A symbolic link or another kind of entry at
@@ -563,6 +577,15 @@ def _read_binding(issue_root: SafeRoot, namespace: IssueNamespace) -> RunBinding
         raise NamespaceError(f"{where} is not valid JSON ({exc})") from exc
     except NamespaceError as exc:  # a duplicated key or a non-JSON number
         raise NamespaceError(f"{where}: {exc}") from exc
+    except (ValueError, RecursionError) as exc:
+        # The decoder's own limits, which are not JSONDecodeError: an integer
+        # past ``sys.get_int_max_str_digits()`` and nesting past the recursion
+        # limit or the C stack, both inside MAX_BINDING_BYTES. Only the type
+        # is reported, never the input; an interrupt still propagates.
+        raise NamespaceError(
+            f"{where} exceeds the JSON decoder's integer or nesting limit "
+            f"({type(exc).__name__}); no binding comes near it"
+        ) from exc
     binding = RunBinding.from_dict(data, where=where)
     if binding.run_key.issue_number != namespace.issue_number:
         raise NamespaceMismatch(
