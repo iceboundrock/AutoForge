@@ -504,6 +504,33 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
   privileges and is outside the trust boundary (the git directory is assumed
   to be writable only by the operating user).
 
+**The parallel EPIC scheduler generalizes this invariant; it does not remove
+it** ([ADR 0008](../adr/0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md),
+D10–D12; a design record, implemented by #178–#183, so only the lock above
+exists today):
+
+- **One orchestration authority per git common dir.** This lock is L0. It
+  is held either by one standalone mutating command, exactly as above, or
+  by one scheduler invocation (`epic run`, `epic resume`, `epic archive`)
+  together with the workers it launched. Workers inherit the scheduler's
+  open file description and prove it, never acquire it, and a shared
+  descriptor is released by `close` only, never `LOCK_UN`.
+- **At most one worker per issue.** A per-issue run lock (L2,
+  `<git common dir>/autoforge/scheduler/issues/<n>/run.lock`) is the only
+  proof of a live owner. Every write to a per-issue state happens under
+  that issue's exclusive authority: L2 for a worker, L0 for a standalone
+  command.
+- **Controller writes to git's shared data in the common dir** (its object
+  store and its worktree registry) **are serialized** by a shared-Git lock
+  (L1, `<git common dir>/autoforge/git.lock`): the worktree
+  check-then-create, the controller's fetch and the strict import of an
+  issue's private objects. Reads take no lock, and AutoForge's own files
+  under `<git common dir>/autoforge` (the sandbox directories, this lock's
+  PID record) are covered by L0 or L2 instead.
+- **Order L0 → L2 → L1.** L0 and L2 are only ever taken non-blocking, and
+  the holder of L1, the one bounded blocking wait, acquires nothing while
+  holding it.
+
 ---
 
 ## Runtime artifacts
