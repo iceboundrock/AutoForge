@@ -176,6 +176,31 @@ High-priority coverage includes:
   merges, and a legacy state in `REVIEW`,
   `READY_FOR_MERGE`, `MERGE` or `BLOCKED` reaches a validated, certified
   merge; Claude Code, OpenCode and Pi route the gate alike
+- per-issue scheduler namespaces (#178, ADR 0008 D5, D17.3,
+  `tests/test_run_namespace.py`, `tests/test_cli.py`): the RunKey and the
+  layout are pure and independent of `--state-dir`, `config.state_dir` and
+  the working directory; two issues bound at once keep their states and run
+  logs in disjoint files; `binding.json` round-trips, is written once (a
+  second write, for the same or another EPIC, is refused and the first
+  kept; a crash before the link leaves none), and each unknown field or
+  schema version, missing field, out-of-bound string, non-positive or
+  non-integer id, duplicated key and non-JSON file is refused; a wrong
+  `repository_id`, issue number, `issue_id` or EPIC is a `NamespaceMismatch`
+  naming the field, while a renamed repository keeps its namespace; the
+  lookup classes (absent, a bare `run.lock` included; unbound with a claim
+  or a state; bound) and the listing create, quarantine and modify nothing;
+  a corrupt state is reported for its own namespace only; a link at
+  `autoforge`, `scheduler`, `issues`, `<n>` or `state`, a non-decimal entry,
+  a regular file and a FIFO named like an issue are reported or refused and
+  never followed or written through; the listing is bounded; the archive
+  keeps logs, binding, claim and worktree, reports nothing to archive the
+  second time, and completes after a crash between link and unlink; the
+  engine binding refuses another repository's namespace; legacy standalone
+  and LOCAL states are never touched; `run`, `step`, `resume` and
+  `local run` refuse a state dir inside the scheduler root, also through a
+  relative path, a link or `state_dir`, before the lock, while `status`
+  reads it, `unblock` acts on it, a dry run writes nothing and a sibling
+  directory is not refused
 
 ### Transitions
 

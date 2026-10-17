@@ -577,6 +577,9 @@ def cmd_run(args) -> int:
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
 
+    # A state directory inside the scheduler root is a namespace's, never a
+    # standalone run's (ADR 0008 D17.3); refused before the lock is taken.
+    engine.refuse_scheduler_state_dir("run")
     # Inspect, decide, quarantine, write the first state AND execute under
     # one continuous lock: a verdict taken before the lock could go stale
     # (another controller may have repaired, replaced or created state.json
@@ -658,6 +661,7 @@ def cmd_local_run(args) -> int:
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
 
+    engine.refuse_scheduler_state_dir("local run")
     # One continuous lock over inspect -> decide -> first save -> execute,
     # for the same reasons as `cmd_run`.
     with engine.locked():
@@ -691,6 +695,7 @@ def cmd_step(args) -> int:
         if outcome.plan is not None:
             print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
+    engine.refuse_scheduler_state_dir("step")
     # Load and execute under one lock: a snapshot loaded before the lock
     # could already have been replaced by another controller.
     with engine.locked():
@@ -718,6 +723,7 @@ def cmd_resume(args) -> int:
             assert o.plan is not None
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
+    engine.refuse_scheduler_state_dir("resume")
     # Load, decide and execute under one lock: a snapshot loaded before the
     # lock could already have been replaced by another controller.
     with engine.locked():
@@ -772,6 +778,14 @@ def cmd_unblock(args) -> int:
     print_unblock_outcome(outcome)
     if not outcome.unblocked:
         return 1
+    if engine.state_dir_in_scheduler_root():
+        # A scheduler namespace's run (ADR 0008 D17.3): a standalone
+        # 'resume' would refuse this state directory.
+        print(
+            "continue with the scheduler: 'autoforge epic resume' "
+            "(a standalone 'resume' refuses this state directory)"
+        )
+        return 0
     # With the flags this command was given, as a block reason's 'resume'
     # line does (#189): a bare 'resume' would find no run or other defaults.
     print(redact(f"continue with: {engine.resume_command()}"))

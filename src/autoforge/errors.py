@@ -49,6 +49,44 @@ class StateError(AutoForgeError):
     """
 
 
+class NamespaceError(StateError):
+    """A per-issue scheduler namespace cannot be used as asked (ADR 0008 D5, #178).
+
+    Raised by :mod:`autoforge.run_namespace` for a ``binding.json`` that is
+    not a valid ``autoforge.run-binding/1`` document (an unknown field or
+    schema version, a missing field, an out-of-bound string, an id that is
+    not a positive integer), a binding written a second time, a namespace of
+    another repository and an ``issues/`` directory beyond its listing
+    bound. Nothing is created, moved or rewritten when it is raised.
+    """
+
+
+class NamespaceMismatch(NamespaceError):
+    """A namespace's binding names another run than the caller expects (ADR 0008 D5.1, D5.2).
+
+    ``field`` says which identity differs: ``repository_id`` (the scheduler's
+    global uncertainty, D14.3), ``issue_number``, ``issue_id`` or ``epic``
+    (the namespace's ``uncertain``, D14.2). The caller decides what the
+    difference means; the binding is never rewritten to agree.
+    """
+
+    def __init__(self, message: str, field: str) -> None:
+        super().__init__(message)
+        self.field = field
+
+
+class SchedulerStateDirError(ConfigurationError):
+    """A standalone command was pointed at a state directory inside the scheduler root.
+
+    ``run``, ``step``, ``resume`` and ``local run`` refuse a ``--state-dir``
+    or ``config.state_dir`` that resolves inside
+    ``<git common dir>/autoforge/scheduler/`` (ADR 0008 D17.3, #178), before
+    the lock is taken or any state is read or written; the message names the
+    scheduler commands instead. ``status`` reads such a directory and
+    ``unblock`` acts on it.
+    """
+
+
 class StateTransitionError(AutoForgeError):
     """Illegal phase transition or step on a terminal phase."""
 

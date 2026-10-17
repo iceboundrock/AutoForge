@@ -688,6 +688,115 @@ before a launch it refuses the launch (`SandboxLaunchRefusedError`, before
 anything is saved), after one it refuses the candidate, which the agent is
 asked to correct.
 
+### Per-issue scheduler namespaces
+
+The parallel EPIC scheduler
+([ADR 0008](../adr/0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md)
+D5, D17.3) gives every issue a stable identity and a directory of its own,
+found again from the repository alone after a crash. #178 implements the
+identity, the layout and the files it owns (`src/autoforge/run_namespace.py`);
+the run lock, the claim, the scheduler and its workers are #180–#183, so no
+command creates a namespace yet.
+
+- **RunKey** is `(repository_id, issue_number)`: GitHub's numeric
+  repository id and the issue number, both positive integers, rendered
+  `<repository_id>/<issue_number>`. Titles, URLs and the owner/name pair are
+  never part of it, so a renamed repository keeps its namespaces.
+- **Layout.** A pure function of the coordination root (the git common
+  dir, the key the controller lock already uses) and the issue number,
+  independent of `--state-dir`, `config.state_dir` and the working
+  directory:
+
+  ```text
+  <git common dir>/autoforge/scheduler/issues/<n>/
+      run.lock         reserved: L2 (#180) creates it
+      binding.json     autoforge.run-binding/1 (below)
+      claim.json       reserved: the scheduler claim (#181)
+      state/           an ordinary state directory: state.json, logs/<run-id>/,
+                       read-context/<run-id>/ (the layout above, unchanged)
+      workers/         worker console logs (#182)
+  ```
+
+  The **anchor** is the git common dir: `StatePaths` for `state/` is
+  anchored there, as a LOCAL run's state is anchored at the git dir, and
+  every component from `autoforge` down is opened descriptor-relative with
+  `O_NOFOLLOW`. A symbolic link planted at `autoforge`, `scheduler`,
+  `issues`, `<n>` or `state` refuses every write, archive and engine save
+  (`UnsafePathError`) and is never followed. Two issues' namespaces share no
+  file. The issue's worktree is not in the namespace: its path is the
+  engine's existing derivation (`execution.worktree_dir/<n>` or
+  `<common>/autoforge/worktrees/<n>`,
+  `ControllerEngine.issue_worktree_path`), so a worker reuses the worktree a
+  standalone run of the issue created. The scheduler root is controller
+  private and outside every working tree.
+- **`binding.json`**, schema `autoforge.run-binding/1`: `schema`;
+  `run_key` {`repository_id`, `issue_number`}; `issue_id` (GitHub's numeric
+  issue id); `repository` {`owner`, `name`} (display only); `epic`
+  {`number`, `issue_id`} (the EPIC the namespace was first bound under);
+  `worktree_path` (absolute, diagnostic only); `created_at` (ISO 8601 UTC).
+  Loading is strict: an unknown schema version, an unknown or missing field
+  at any level, a duplicated key, an id that is not a positive 64-bit
+  integer, an owner over 39 or a name over 100 characters, a relative or
+  over-long worktree path, a file over 16 KiB or not UTF-8 JSON is a
+  `NamespaceError`; a binding whose `run_key` names another issue than its
+  directory is a `NamespaceMismatch`. It is written once, with
+  `SafeRoot.create_exclusive` (fsynced temporary, then `link(2)`), so a
+  crash leaves no binding or a complete one; a second write is refused and
+  the first binding kept. `check_binding` compares a binding with the
+  caller's expectation and raises `NamespaceMismatch` naming the first
+  identity that differs (`repository_id`, `issue_number`, `issue_id`, then
+  `epic` when the caller asks): the caller decides what that means
+  (`held:other-epic`, uncertain, global uncertainty; D14).
+- **Lookup** (`load_issue_namespace`) is read-only: it creates no
+  directory, quarantines nothing and writes nothing. It returns *absent* (no
+  binding, no claim file, no `state/state.json`; a directory holding only
+  `run.lock`, logs or worker logs is absent), *unbound* (a claim file or a
+  state without a binding) or *bound*, together with the strict,
+  read-only load of `state/state.json` (absent, loaded, or corrupt with a
+  redacted, bounded reason: unparseable, an unknown protocol, not a regular
+  file, reached through a link) and whether `claim.json` exists. A corrupt
+  state is reported for its own namespace only; a corrupt binding raises,
+  for that namespace only.
+- **Enumeration** (`list_issue_namespaces`) lists the issue directories
+  holding a binding, then those without one, in ascending issue number. It
+  refuses a directory of more than 10 000 entries while reading it, and
+  reports, never opens, an entry that is not a canonical decimal issue
+  number (`abc`, `011`, `0`) or not a directory (a symbolic link, a regular
+  file, a FIFO).
+- **Archive** (`archive_issue_state`) moves `state/state.json` aside as
+  `state.json.archived-<UTC timestamp>` through a root reached from the
+  common dir, with the same link-then-unlink primitive as `run --force`'s
+  quarantine (`state.archive_state_file`; the `corrupt-` behaviour is
+  unchanged): a crash between the two syscalls leaves both names and a
+  re-run completes the move. With no state it reports nothing to archive
+  and changes nothing; logs, worker logs, binding, claim and worktree are
+  kept. The caller holds the issue's L2 (#180); `epic archive` (#183) closes
+  the claim first (D17.4).
+- **Engine binding.** `ControllerEngine.bind_issue_namespace(namespace)`
+  points an engine's `paths` at the namespace's anchored state directory
+  before the run starts, as `bind_local_state_dir` does for LOCAL, so a
+  worker (#182) runs the unchanged engine there. A namespace of another
+  repository than the engine's is refused; an engine never given one is
+  unchanged.
+- **Standalone commands refuse the scheduler root** (D17.3). `run`,
+  `step`, `resume` and `local run` refuse (`SchedulerStateDirError`, exit
+  2) a `--state-dir` or `config.state_dir` that resolves inside
+  `<git common dir>/autoforge/scheduler/` (decided on the resolved path, so
+  a relative path or a link is judged by where it leads), before the lock
+  is taken and before any state is read or written; the error names
+  `autoforge epic resume`, `epic status` and `epic archive` instead.
+  `status` reads such a state directory; `unblock` acts on it under the
+  controller lock, as today, and then names `epic resume` rather than a
+  standalone `resume`. A dry run is not refused: it takes no lock and runs
+  no git, so it has no coordination root, and it writes nothing. LOCAL's
+  default state directory (`<git dir>/autoforge/state`) is not inside the
+  scheduler root and is unaffected.
+
+No per-issue state field, protocol number or state migration comes with
+any of this: the state inside a namespace is an ordinary `AutoForgeState`,
+and an existing standalone `.autoforge/` or LOCAL state is never read,
+moved or rewritten by a namespace function.
+
 ---
 
 ## Error handling
@@ -751,6 +860,16 @@ validation command leaves the phase unverified; a refused pre-merge
 verification command blocks the merge gate (`BLOCKED`). `SandboxTamperError`
 is a `VerificationError` for a private object directory that holds what no
 object store does (above); the step enters `BLOCKED`.
+
+The per-issue scheduler namespaces (#178, above) add three, none of them
+retried. `NamespaceError` is a `StateError`: a `binding.json` that is not a
+valid `autoforge.run-binding/1` document, a second binding write, a
+namespace of another repository or an `issues/` directory beyond its
+bound. `NamespaceMismatch` is a `NamespaceError` naming (`field`) the
+identity in which a binding differs from what its caller expects; the
+binding is never rewritten to agree. `SchedulerStateDirError` is a
+`ConfigurationError`: a standalone command pointed at a state directory in
+the scheduler root (exit 2, nothing read or written).
 
 ---
 

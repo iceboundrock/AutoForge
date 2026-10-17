@@ -67,6 +67,9 @@ from .validation import parse_comment_url, parse_issue_url, parse_pr_url
 STATE_FILENAME = "state.json"
 LOGS_DIRNAME = "logs"
 CORRUPT_SUFFIX = ".corrupt-"
+# What :func:`archive_state_file` appends to ``state.json`` when an operator
+# retires a scheduler namespace's run (``epic archive``, ADR 0008 D17.4).
+ARCHIVED_SUFFIX = ".archived-"
 # Prefix/suffix of the temporary file :func:`save_state` renames into place.
 TMP_PREFIX = ".state-"
 TMP_SUFFIX = ".tmp"
@@ -1815,20 +1818,53 @@ def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> 
     ``ControllerEngine.locked()``): a writer replacing ``path`` between the
     two syscalls would see the replacement removed.
     """
+    return _move_state_file_aside(
+        path, root=root, suffix=CORRUPT_SUFFIX, what="corrupted state file", verb="quarantined"
+    )
+
+
+def archive_state_file(path: str | Path, *, root: SafeRoot | None = None) -> Path:
+    """Move a *readable* state file aside as ``<path>.archived-<UTC timestamp>``.
+
+    The same primitive as :func:`quarantine_state_file`, with its own
+    suffix: the name is reserved by ``link(2)`` (or an exclusive copy where
+    the filesystem makes no hard links) and only then is ``path`` unlinked,
+    so a crash between the two leaves both names and a re-run moves
+    ``path`` aside again, under a new name; a state is never lost. Used by a
+    scheduler namespace's archive (ADR 0008 D17.4,
+    :func:`autoforge.run_namespace.archive_issue_state`), whose caller holds
+    the issue's exclusive authority as quarantining's holds the controller
+    lock. Raises StateError when there is nothing at ``path`` or the move
+    fails; the original entry is left untouched in that case.
+    """
+    return _move_state_file_aside(
+        path, root=root, suffix=ARCHIVED_SUFFIX, what="state file", verb="archived"
+    )
+
+
+def _move_state_file_aside(
+    path: str | Path, *, root: SafeRoot | None, suffix: str, what: str, verb: str
+) -> Path:
+    """Rename ``path`` to ``<path><suffix><UTC timestamp>`` without replacing anything.
+
+    The link-then-unlink primitive behind :func:`quarantine_state_file` (its
+    docstring is the contract) and :func:`archive_state_file`. ``what`` names
+    the file and ``verb`` the operation in every refusal.
+    """
     src = Path(path)
     fs, name, owned = _root_for(src, root)
     try:
         st = fs.lstat(name)
         if st is None:
-            raise StateError(f"cannot move corrupted state file {src} aside: it is gone")
+            raise StateError(f"cannot move {what} {src} aside: it is gone")
         if stat.S_ISDIR(st.st_mode):
             raise StateError(
-                f"cannot move corrupted state file {src} aside: it is a directory; "
+                f"cannot move {what} {src} aside: it is a directory; "
                 "move it out of the way by hand and re-run"
             )
         source_identity = (st.st_dev, st.st_ino, st.st_mode)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        base = f"{name}{CORRUPT_SUFFIX}{stamp}"
+        base = f"{name}{suffix}{stamp}"
         candidate = base
         hard_links = True
 
@@ -1853,7 +1889,7 @@ def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> 
                 candidate = f"{base}.{n}"
                 continue
             except StateError as exc:
-                raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+                raise StateError(f"cannot move {what} {src} aside: {exc}") from exc
             current = fs.lstat(name)
             current_identity = (
                 None if current is None else (current.st_dev, current.st_ino, current.st_mode)
@@ -1864,8 +1900,8 @@ def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> 
                 except StateError:  # pragma: no cover - cleanup best effort
                     pass
                 raise StateError(
-                    f"cannot move corrupted state file {src} aside: it changed while being "
-                    "quarantined; refusing to remove the replacement"
+                    f"cannot move {what} {src} aside: it changed while being "
+                    f"{verb}; refusing to remove the replacement"
                 )
             try:
                 fs.unlink(name)
@@ -1877,10 +1913,10 @@ def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> 
                     fs.unlink(candidate)
                 except StateError:  # pragma: no cover - cleanup best effort
                     pass
-                raise StateError(f"cannot move corrupted state file {src} aside: {exc}") from exc
+                raise StateError(f"cannot move {what} {src} aside: {exc}") from exc
             return src.with_name(candidate)
         raise StateError(
-            f"cannot move corrupted state file {src} aside: "
+            f"cannot move {what} {src} aside: "
             f"no free name after {_QUARANTINE_MAX_ATTEMPTS} attempts (last tried {candidate})"
         )
     finally:

@@ -242,6 +242,7 @@ from .errors import (
     GitTransportError,
     LockError,
     MaterializationError,
+    NamespaceError,
     SandboxCapabilityError,
     SandboxLaunchRefusedError,
     SandboxTamperError,
@@ -438,6 +439,7 @@ from .roadmap import (
     split_roadmap,
 )
 from .run_contract import LocalRunContract, validate_local_run_contract
+from .run_namespace import IssueNamespace, check_standalone_state_dir, inside_scheduler_root
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
 from .sandbox import LaunchDescription, NetworkPosition, SandboxFacts
@@ -1826,6 +1828,19 @@ class ControllerEngine:
             return Path(os.path.realpath(Path(self.workdir) / configured))
         return self.workspace().git_dirs()[-1] / "autoforge" / "worktrees"
 
+    def issue_worktree_path(self, issue_number: int) -> Path:
+        """The agent worktree of issue ``issue_number``, derived as :meth:`agent_worktree_path` is.
+
+        For a caller that names the issue rather than holding its run's
+        state: a scheduler binding records it for diagnostics (ADR 0008
+        D5.4), and a worker then reuses the worktree an earlier standalone
+        run of the issue created. Derives the path (one git read when no
+        ``execution.worktree_dir`` is configured) and creates nothing.
+        """
+        if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number < 1:
+            raise NamespaceError(f"issue number must be a positive integer, got {issue_number!r}")
+        return self.agent_worktree_root() / str(issue_number)
+
     def _worktree_identity(self, path: Path) -> tuple[Path, Path] | None:
         """``(working-tree root, git common dir)`` of ``path``, or ``None`` outside git.
 
@@ -2534,6 +2549,50 @@ class ControllerEngine:
     def local_state_paths(self) -> StatePaths:
         """LOCAL mode's *default* state location, ignoring any configured one."""
         return local_state_paths(self.workspace())
+
+    def bind_issue_namespace(self, namespace: IssueNamespace) -> None:
+        """Point :attr:`paths` at a scheduler namespace's state directory (ADR 0008 D5.3).
+
+        What :meth:`bind_local_state_dir` is to a LOCAL run, for a worker
+        (#182): called before the run starts, it lets the unchanged engine
+        run on ``<namespace>/state`` anchored at the coordination root, so
+        every component from ``autoforge`` down is opened ``O_NOFOLLOW`` from
+        the common dir's descriptor and never resolved from the working
+        directory, ``--state-dir`` or ``config.state_dir``. A namespace of
+        another repository than the one containing ``workdir`` is refused
+        (NamespaceError) with nothing changed. One git read, the one
+        :meth:`lock_path` makes; an engine that is never given a namespace
+        is unaffected.
+        """
+        own = Path(os.path.realpath(self.coordination_root()))
+        theirs = Path(os.path.realpath(namespace.coordination_root))
+        if own != theirs:
+            raise NamespaceError(
+                f"the namespace of issue {namespace.issue_number} lies under {theirs}, not "
+                f"under this repository's git common dir {own}; an engine runs only on its "
+                "own repository's namespaces"
+            )
+        self.paths = namespace.state_paths()
+
+    def refuse_scheduler_state_dir(self, command: str) -> None:
+        """Refuse a standalone ``command`` whose state dir lies in the scheduler root.
+
+        ADR 0008 D17.3 (:func:`autoforge.run_namespace.check_standalone_state_dir`):
+        ``run``, ``step``, ``resume`` and ``local run`` call it before they
+        take the lock; ``status`` and ``unblock`` do not. A dry run is not
+        checked: it runs no git, so it has no coordination root, and it
+        writes nothing.
+        """
+        check_standalone_state_dir(self.paths.state_dir, self.coordination_root(), command)
+
+    def state_dir_in_scheduler_root(self) -> bool:
+        """Whether this engine's state dir lies in the scheduler root (ADR 0008 D17.3).
+
+        ``unblock`` may act on such a state directory, and then names the
+        scheduler's command to continue it, since a standalone ``resume``
+        refuses it (:meth:`refuse_scheduler_state_dir`).
+        """
+        return inside_scheduler_root(self.paths.state_dir, self.coordination_root())
 
     # -- state handling --------------------------------------------------
     def new_run(self, epic_url: str, issue_url: str) -> AutoForgeState:
@@ -3776,6 +3835,15 @@ class ControllerEngine:
         if self._lock_path is None:
             self._lock_path = repository_lock_path(self.workdir)
         return self._lock_path
+
+    def coordination_root(self) -> Path:
+        """The git common dir of the repository containing ``workdir`` (ADR 0008 §1.4).
+
+        What the controller lock, the agent worktrees and the scheduler's
+        per-issue namespaces are all keyed by; derived with the lock path
+        (LockError outside a git repository) and cached with it.
+        """
+        return self.lock_path().parent.parent
 
     @contextmanager
     def locked(self) -> Iterator[ControllerEngine]:

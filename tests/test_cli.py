@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import shutil
 
 import pytest
 
@@ -1881,6 +1882,126 @@ def test_dry_run_needs_no_repository_and_spawns_no_git(tmp_path, capsys, monkeyp
     assert cli.main(["--state-dir", str(sd), "step", "--dry-run"]) == 0
     assert cli.main(["--state-dir", str(sd), "resume", "--dry-run"]) == 0
     assert fakes["provider"].calls == []
+
+
+# -- a state dir inside the scheduler root (#178, ADR 0008 D17.3) ------------------
+def _namespace_state_dir(tmp_path, n: int = 1):
+    """``<common>/autoforge/scheduler/issues/<n>/state`` of the tmp_path repository."""
+    return tmp_path / ".git" / "autoforge" / "scheduler" / "issues" / str(n) / "state"
+
+
+def _assert_refused(capsys, fakes, command: str) -> None:
+    err = capsys.readouterr().err
+    assert f"autoforge: error: '{command}' refuses state directory" in err
+    assert "inside the parallel EPIC scheduler's root" in err
+    assert "'autoforge epic resume'" in err and "'autoforge epic archive" in err
+    assert "Traceback" not in err
+    assert fakes["provider"].calls == [] and fakes["gh"].calls == []
+
+
+@pytest.mark.parametrize("command", ["run", "step", "resume"])
+def test_standalone_commands_refuse_a_state_dir_inside_the_scheduler_root(
+    tmp_path, capsys, monkeypatch, fakes, command
+):
+    """Refused before the lock is taken or anything is read or written."""
+    monkeypatch.chdir(tmp_path)
+    sd = _namespace_state_dir(tmp_path)
+    if command != "run":
+        sd.mkdir(parents=True)
+        save_state(_other_controller_state("af-namespace"), sd / "state.json")
+    before = _files(sd) if sd.exists() else None
+    argv = ["--state-dir", str(sd), command]
+    if command == "run":
+        argv += ["--epic", EPIC, "--issue", ISSUE]
+    assert cli.main(argv) == 2
+    _assert_refused(capsys, fakes, command)
+    assert not (tmp_path / ".git" / "autoforge" / "controller.lock").exists()
+    if command == "run":
+        assert not (tmp_path / ".git" / "autoforge" / "scheduler").exists()
+    else:
+        assert _files(sd) == before
+
+
+def test_the_refusal_is_decided_on_the_resolved_path(tmp_path, capsys, monkeypatch, fakes):
+    """A relative path, a symbolic link and config.state_dir all reach the namespace."""
+    monkeypatch.chdir(tmp_path)
+    scheduler = tmp_path / ".git" / "autoforge" / "scheduler"
+    scheduler.mkdir(parents=True)
+    link = tmp_path.parent / f"{tmp_path.name}-link"
+    link.symlink_to(scheduler, target_is_directory=True)
+    run = ["run", "--epic", EPIC, "--issue", ISSUE]
+    for sd in (".git/autoforge/scheduler/issues/1/state", str(link / "issues" / "1" / "state")):
+        assert cli.main(["--state-dir", sd, *run]) == 2
+        _assert_refused(capsys, fakes, "run")
+    cfg = _config(tmp_path / "autoforge.json", state_dir=".git/autoforge/scheduler/issues/7/state")
+    assert cli.main(["--config", cfg, *run]) == 2
+    _assert_refused(capsys, fakes, "run")
+    assert sorted(p.name for p in scheduler.iterdir()) == []
+
+
+def test_local_run_refuses_a_state_dir_inside_the_scheduler_root(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    monkeypatch.chdir(tmp_path)
+    feature = tmp_path / "features" / "add-filter.md"
+    feature.parent.mkdir()
+    feature.write_text("# Feature: Add a filter\n", encoding="utf-8")
+    sd = _namespace_state_dir(tmp_path)
+    assert cli.main(["--state-dir", str(sd), "local", "run", str(feature)]) == 2
+    _assert_refused(capsys, fakes, "local run")
+    assert not (tmp_path / ".git" / "autoforge" / "scheduler").exists()
+
+
+def test_status_reads_and_unblock_acts_on_a_namespace_state_dir(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """`status` reads one; `unblock` takes the lock and edits it, then names the
+    scheduler's command to continue, since a standalone `resume` refuses it."""
+    monkeypatch.chdir(tmp_path)
+    standalone = str(tmp_path / ".autoforge")
+    _block_run(tmp_path, capsys, fakes, standalone)
+    sd = _namespace_state_dir(tmp_path, 2)
+    sd.mkdir(parents=True)
+    shutil.copy2(os.path.join(standalone, "state.json"), sd / "state.json")
+    provider_calls = len(fakes["provider"].calls)
+
+    assert cli.main(["--state-dir", str(sd), "status"]) == 0
+    assert "BLOCKED" in capsys.readouterr().out
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["phase"] == "BLOCKED"
+
+    assert cli.main(["--state-dir", str(sd), "unblock", "--reason", "clarified"]) == 0
+    out = capsys.readouterr().out
+    assert "BLOCKED -> ANALYZE_EXECUTE" in out
+    assert "continue with the scheduler: 'autoforge epic resume'" in out
+    assert "continue with: autoforge" not in out
+    assert load_state(sd / "state.json").phase == Phase.ANALYZE_EXECUTE
+    assert load_state(os.path.join(standalone, "state.json")).phase == Phase.BLOCKED
+
+    assert cli.main(["--state-dir", str(sd), "resume"]) == 2
+    assert "'resume' refuses state directory" in capsys.readouterr().err
+    assert len(fakes["provider"].calls) == provider_calls
+
+
+def test_a_dry_run_is_not_refused_and_writes_nothing(tmp_path, capsys, monkeypatch, fakes):
+    """A dry run takes no lock and runs no git, so it has no coordination root
+    to compare with; it writes nothing either way."""
+    monkeypatch.chdir(tmp_path)
+    sd = _namespace_state_dir(tmp_path)
+    assert cli.main(["--state-dir", str(sd), *_run_argv(None, "--dry-run")]) == 0
+    assert "analyze_execute.md" in capsys.readouterr().out
+    assert not (tmp_path / ".git" / "autoforge").exists()
+
+
+def test_a_state_dir_beside_the_scheduler_root_is_not_refused(tmp_path, capsys, monkeypatch, fakes):
+    """Only the scheduler root: LOCAL's default `<git dir>/autoforge/state` and a
+    sibling whose name merely starts with `scheduler` are standalone state dirs."""
+    monkeypatch.chdir(tmp_path)
+    for sd in (tmp_path / ".git" / "autoforge" / "schedulers", tmp_path / ".autoforge"):
+        argv = ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE]
+        assert cli.main([*argv, "--max-steps", "1"]) == 0
+        capsys.readouterr()
+        assert load_state(sd / "state.json").step_count == 1
 
 
 # -- unblock (issue #5) -------------------------------------------------------------
