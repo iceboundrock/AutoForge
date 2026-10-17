@@ -408,6 +408,26 @@ def _bind_existing_run(engine: ControllerEngine) -> None:
         engine.paths = local
 
 
+def _bind_standalone_run(engine: ControllerEngine, args, command: str) -> None:
+    """:func:`_bind_existing_run` for a standalone ``step`` or ``resume`` (ADR 0008 D17.3).
+
+    The state directory this invocation names (``--state-dir`` or
+    ``config.state_dir``) is judged before the binding looks for a run in it
+    or in LOCAL's location: one inside the scheduler root that holds no
+    ``state.json`` would otherwise give way to a LOCAL run's, and the command
+    would continue that run instead of refusing. The directory bound is
+    judged again. Both before the lock and before any state is read; a dry
+    run is judged by neither (:meth:`ControllerEngine.refuse_scheduler_state_dir`).
+    """
+    if not args.dry_run:
+        engine.refuse_scheduler_state_dir(command)
+    if args.state_dir:
+        return
+    _bind_existing_run(engine)
+    if not args.dry_run:
+        engine.refuse_scheduler_state_dir(command)
+
+
 def _doctor_runner():
     """Command runner used by `doctor` (indirection so tests can inject a fake)."""
     return None
@@ -684,8 +704,7 @@ def cmd_local_run(args) -> int:
 
 def cmd_step(args) -> int:
     engine = _engine_for(args)
-    if not args.state_dir:
-        _bind_existing_run(engine)
+    _bind_standalone_run(engine, args, "step")
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
@@ -695,7 +714,6 @@ def cmd_step(args) -> int:
         if outcome.plan is not None:
             print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
-    engine.refuse_scheduler_state_dir("step")
     # Load and execute under one lock: a snapshot loaded before the lock
     # could already have been replaced by another controller.
     with engine.locked():
@@ -709,8 +727,7 @@ def cmd_step(args) -> int:
 
 def cmd_resume(args) -> int:
     engine = _engine_for(args)
-    if not args.state_dir:
-        _bind_existing_run(engine)
+    _bind_standalone_run(engine, args, "resume")
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
@@ -723,7 +740,6 @@ def cmd_resume(args) -> int:
             assert o.plan is not None
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
-    engine.refuse_scheduler_state_dir("resume")
     # Load, decide and execute under one lock: a snapshot loaded before the
     # lock could already have been replaced by another controller.
     with engine.locked():

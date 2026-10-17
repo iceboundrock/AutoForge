@@ -2579,9 +2579,10 @@ class ControllerEngine:
 
         ADR 0008 D17.3 (:func:`autoforge.run_namespace.check_standalone_state_dir`):
         ``run``, ``step``, ``resume`` and ``local run`` call it before they
-        take the lock; ``status`` and ``unblock`` do not. A dry run is not
-        checked: it runs no git, so it has no coordination root, and it
-        writes nothing.
+        take the lock, ``step`` and ``resume`` also before they look for
+        their run (``cli._bind_standalone_run``); ``status`` and ``unblock``
+        do not. A dry run is not checked: it runs no git, so it has no
+        coordination root, and it writes nothing.
         """
         check_standalone_state_dir(self.paths.state_dir, self.coordination_root(), command)
 

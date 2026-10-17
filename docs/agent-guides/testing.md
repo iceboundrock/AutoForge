@@ -198,7 +198,8 @@ High-priority coverage includes:
   engine binding refuses another repository's namespace; legacy standalone
   and LOCAL states are never touched; `run`, `step`, `resume` and
   `local run` refuse a state dir inside the scheduler root, also through a
-  relative path, a link or `state_dir`, before the lock, while `status`
+  relative path, a link or `state_dir`, before the lock (`step` and
+  `resume` also before a LOCAL run's state is looked for), while `status`
   reads it, `unblock` acts on it, a dry run writes nothing and a sibling
   directory is not refused
 

@@ -14,7 +14,7 @@ from autoforge.executor import ExecutionResult, execute
 from autoforge.locking import ControllerLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
-from autoforge.transitions import Phase
+from autoforge.transitions import Phase, WorkflowMode
 from tests.conftest import (
     BRANCH,
     EPIC,
@@ -36,6 +36,7 @@ from tests.conftest import (
     make_engine,
     publish_pr_head,
     review_result,
+    sample_contract,
 )
 
 
@@ -1937,6 +1938,54 @@ def test_the_refusal_is_decided_on_the_resolved_path(tmp_path, capsys, monkeypat
     assert cli.main(["--config", cfg, *run]) == 2
     _assert_refused(capsys, fakes, "run")
     assert sorted(p.name for p in scheduler.iterdir()) == []
+
+
+@pytest.mark.parametrize("command", ["step", "resume"])
+def test_a_configured_scheduler_state_dir_is_refused_before_the_run_is_looked_for(
+    tmp_path, capsys, monkeypatch, fakes, command
+):
+    """R1-F1: `config.state_dir` in the scheduler root, a LOCAL run's state in
+    LOCAL's location. Looking for the run first would find no `state.json` in
+    the namespace, bind the LOCAL one and continue it; the configured directory
+    is refused before either is read, whether it is missing, empty or holds a
+    state (no "two runs exist" either)."""
+    monkeypatch.chdir(tmp_path)
+    local = tmp_path / ".git" / "autoforge" / "state"
+    local.mkdir(parents=True)
+    save_state(
+        AutoForgeState(
+            run_id="af-local",
+            mode=WorkflowMode.LOCAL,
+            phase=Phase.REVIEW,
+            feature_spec_path="features/add-filter.md",
+            feature_spec_sha256="a" * 64,
+            local_run_contract=sample_contract(
+                repository_root=str(tmp_path), state_root=str(local)
+            ),
+            workspace_fingerprint="b" * 64,
+            base_head_sha="c" * 40,
+            base_branch="main",
+            created_at="2026-09-06T00:00:00+00:00",
+            updated_at="2026-09-06T00:00:00+00:00",
+        ),
+        local / "state.json",
+    )
+    sd = _namespace_state_dir(tmp_path)
+    cfg = _config(tmp_path / "autoforge.json", state_dir=".git/autoforge/scheduler/issues/1/state")
+    local_before = _files(local)
+
+    def holds_a_state() -> None:
+        save_state(_other_controller_state("af-namespace"), sd / "state.json")
+
+    for prepare in (lambda: None, lambda: sd.mkdir(parents=True), holds_a_state):
+        prepare()
+        namespace_before = _files(sd) if sd.exists() else None
+        assert cli.main(["--config", cfg, command]) == 2
+        _assert_refused(capsys, fakes, command)
+        assert _files(local) == local_before
+        assert (_files(sd) if sd.exists() else None) == namespace_before
+        assert not (tmp_path / ".git" / "autoforge" / "controller.lock").exists()
+    assert load_state(local / "state.json").phase == Phase.REVIEW
 
 
 def test_local_run_refuses_a_state_dir_inside_the_scheduler_root(

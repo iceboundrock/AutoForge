@@ -785,6 +785,10 @@ command creates a namespace yet.
   a relative path or a link is judged by where it leads), before the lock
   is taken and before any state is read or written; the error names
   `autoforge epic resume`, `epic status` and `epic archive` instead.
+  `step` and `resume` judge the directory they were given before they look
+  for their run in it or in LOCAL's location, so one in the scheduler root
+  that holds no `state.json` is refused rather than giving way to a LOCAL
+  run's state, and judge the directory they bind again.
   `status` reads such a state directory; `unblock` acts on it under the
   controller lock, as today, and then names `epic resume` rather than a
   standalone `resume`. A dry run is not refused: it takes no lock and runs
