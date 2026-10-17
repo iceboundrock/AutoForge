@@ -27,6 +27,7 @@ from tests.conftest import (
     PR,
     SHA_A,
     SHA_B,
+    certify_review,
     comment_url,
     implementation_pr_body,
     make_engine,
@@ -272,9 +273,11 @@ def test_unblock_open_pr_at_clean_reviewed_revision_reenters_ready_for_merge(
     fake_github.add_pr(head_sha=SHA_A)
     _review_comment(fake_github)
     eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, reason="check ci failed", **_reviewed())
+    certify_review(eng)
     out = eng.unblock(REASON)
     assert out.unblocked and out.phase == "READY_FOR_MERGE"
     assert "clean-reviewed HEAD" in out.message
+    assert "review certificate of round 2 applies" in out.message
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.READY_FOR_MERGE and s.last_review_result == "clean"
     assert s.reviewed_head_sha == SHA_A and s.open_findings == [] and s.prior_findings == []
@@ -600,6 +603,7 @@ def test_unblock_refuses_a_merge_no_review_decided_on(tmp_state_dir, fake_github
 def test_unblock_refuses_while_the_step_budget_is_exhausted(tmp_state_dir, fake_github):
     fake_github.add_pr(head_sha=SHA_A)
     eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, step_count=7, **_reviewed())
+    certify_review(eng)
     eng.config.workflow.max_total_steps = 7
     raw = eng.paths.state_file.read_text()
     out = eng.unblock(REASON)
@@ -637,6 +641,7 @@ def test_unblock_goes_through_validate_transition(tmp_state_dir, fake_github, mo
     the audit trail never claims an applied unblock into it either."""
     fake_github.add_pr(head_sha=SHA_A)
     eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **_reviewed())
+    certify_review(eng)
     seen = []
 
     def refusing(frm, to, mode=WorkflowMode.REMOTE):

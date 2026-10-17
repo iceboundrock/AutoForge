@@ -354,6 +354,11 @@ records its comment URL in its history entry and in
 `PREVIOUS_REVIEW_COMMENT_URL`, but launches no fixer, so a stale comment
 never becomes a FIX handoff.
 
+A clean round's comment is also what its review certificate is keyed by
+(#174): the certificate names the comment's URL, id and marker key (round,
+HEAD, base, merge base) as #162 read it back, or as its journal observed
+it, and no comment, prompt or read context ever carries the certificate.
+
 The reviewer is a full coding agent launched in the issue's worktree, and
 the REVIEW prompt makes the phase read-only: it posts, commits, pushes and
 edits nothing, and a defect it finds is a finding for the fixer, never its
@@ -1490,6 +1495,17 @@ and the file that set it.
 When the gate is open, the *controller* performs the merge itself:
 `gh pr merge --<merge.method> --match-head-commit <reviewed HEAD>` through
 `GitHubClient`, with no prompt and no agent invocation.
+
+`READY_FOR_MERGE` is entered for an open PR only in the write that issues
+the round's review certificate, or by an `unblock` while that certificate
+applies (ADR 0006 D12.3, #174; [workflow.md](workflow.md#candidate-validation-gates)).
+The certificate is not a merge permission (D1.2): it records what the
+controller observed of one clean review of one exact validated candidate,
+it is not a GitHub approval or a CI result, and it is never shown to an
+agent or published (D1.3). Opening the gate still takes both halves above,
+and the gate re-reads every fact it decides on from GitHub; it does not
+consult the certificate yet (#175). A merged PR not yet counted is
+reconciled without one (D12.4).
 
 ### Pre-merge verification and its failure classes
 

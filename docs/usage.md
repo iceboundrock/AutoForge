@@ -22,8 +22,9 @@ uv run autoforge run --epic https://github.com/owner/repo/issues/1 \
 
 uv run autoforge status            # human summary
 uv run autoforge status --json     # machine-readable; `replan_journal` says whether the
-                                   # raw `replan_transaction` beside it is readable, and
-                                   # `acceptance_actions` lists the acceptance actions
+                                   # raw `replan_transaction` beside it is readable,
+                                   # `acceptance_actions` lists the acceptance actions and
+                                   # `review_certificate_status` the review certificate
 uv run autoforge status --action A-0123456789abcdef   # the exact payload bytes of
                                    # an acceptance action (exit 1 for an unknown id)
 
@@ -156,7 +157,10 @@ re-enter and either re-enters it (`ANALYZE_EXECUTE`, `REVIEW`, `FIX`,
 any other step) or refuses and leaves the run `BLOCKED`, exit code 1, when
 the safe state still cannot be determined (two candidate PRs, a closed PR, a
 merge no review decided on, a replan transaction on record, an exhausted
-bound). The reason is recorded in the state file and the run log, `status`
+bound). An open PR at its clean-reviewed revision re-enters
+`READY_FOR_MERGE` only while the round's review certificate applies; with
+none, it re-enters `REVIEW` for a fresh round (refused past
+`workflow.max_review_rounds`). The reason is recorded in the state file and the run log, `status`
 shows the last one, and no agent runs until `resume`. A controller write
 that blocked as a conflict (for example the `UPDATE_EPIC` progress comment
 after its two attempts, or a marker comment the controller did not post)
@@ -870,7 +874,25 @@ What you can inspect:
   `FAIL` or `TIMEOUT`). A pending marker is reported,
   never converted: the next `step` or `resume` records it `INTERRUPTED`
   and runs the definition again, and the third interruption of one
-  definition blocks the run.
+  definition blocks the run. A run that reviewed a candidate clean adds
+  the review certificate the controller issued for that round (#174): its
+  kind, candidate, round, set and policy digests and issue time, whether
+  it applies to the state and configuration now (`yes`, or `no:` and the
+  first mismatch), and the note that it is not a merge permission. `status
+  --json` carries the same as `review_certificate_status` (`null` when
+  none is held), beside the raw `review_certificate`.
+
+A review certificate is the controller's own record of one clean review of
+one exact validated candidate (ADR 0006 D1.2): it is not a GitHub approval,
+a CI result or permission to merge, and it is never shown to an agent or
+published. `REVIEW -> READY_FOR_MERGE` (and LOCAL `REVIEW -> DONE`) is
+entered only in the write that issues it; a clean round whose certificate
+cannot be issued exactly as recorded blocks instead. If the validation set
+or policy changed after the reviewer was presented its evidence, the
+certificate is still issued from what was presented and the run blocks
+naming the change: restore the configuration and `unblock` (the certificate
+then applies and `READY_FOR_MERGE` is re-entered), or `unblock` under the
+new configuration, which decides a fresh `REVIEW` round validated under it.
 
 LOCAL runs show the same block for their `local.validation_commands`
 records ([Local mode](local-mode.md#validation-commands)).

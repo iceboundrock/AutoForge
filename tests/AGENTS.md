@@ -142,6 +142,11 @@ candidate validation evidence         test_evidence.py (pure), test_validation_e
 candidate validation gates (#173)     test_validation_gates.py (producers, REVIEW entry, LOCAL
                                       convergence, override, provider parity; REPLAN
                                       rejection: test_replan.py)
+review certificates (#174)            test_certificate.py (pure: issuance, applicability,
+                                      wording), test_review_certificate.py (engine: the
+                                      READY_FOR_MERGE and LOCAL DONE writes, the #162 journal,
+                                      drift, unblock, status, provider parity); hand-built
+                                      clean reviews hold one through conftest.certify_review
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
 Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)

@@ -123,6 +123,29 @@ High-priority coverage includes:
   anything runs, and no path calls GitHub; an applied unblock alone sets
   the watermark, and the same candidate is validated again; Claude Code,
   OpenCode and Pi behave alike
+- review certificates (#174, `tests/test_certificate.py`,
+  `tests/test_review_certificate.py`): a clean round's write issues the
+  certificate of the exact candidate, records, set and review binding, an
+  empty set included, in the save that enters `READY_FOR_MERGE` (a failed
+  save leaves neither; #162's journal completes the round and issues it
+  from the observed comment) or LOCAL `DONE` (no `gh` call; a fix round
+  certifies the new workspace only); a needs-fix round issues none; a
+  binding of another round, a non-`PASS` record, another head or PR, a
+  comment URL that does not parse, or no binding issues none and blocks; a
+  set or policy changed after presentation (timeout, sandbox mode,
+  allow-list, the set; with a set and an empty one) issues it from the
+  binding and blocks, after which `unblock` decides `REVIEW` under the new
+  configuration and `READY_FOR_MERGE` under the restored one;
+  `certificate_problem` refuses each field that stops matching (kind,
+  digest, round, PR, HEAD, base, merge base, comment, candidate, LOCAL
+  fingerprint and contract, set, policy, a record no longer eligible, the
+  live revision) and does no I/O; an edited certificate fails the load;
+  `unblock` of an open PR at its clean-reviewed revision re-enters
+  `READY_FOR_MERGE` only with an applicable certificate and otherwise
+  `REVIEW` under the cap, a merged uncounted PR needing none; `status` and
+  `status --json` show it, its applicability and the not-a-permission
+  note; no prompt, read context or published payload carries it; Claude
+  Code, OpenCode and Pi issue the same certificate
 
 ### Transitions
 

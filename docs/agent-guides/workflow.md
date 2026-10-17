@@ -64,6 +64,10 @@ REVIEW -> READY_FOR_MERGE     when needs_fix_round == false
 phase where the controller closes an open PR, so a second edge in or out would
 be a second way into that destructive step.
 
+`REVIEW -> READY_FOR_MERGE` (and LOCAL `REVIEW -> DONE`) is taken only in the
+write that issues the round's review certificate (**Candidate validation
+gates** below); a clean round that gets none blocks instead.
+
 Behind the merge safety gate (`safety.allow_merge` plus `--allow-merge`;
 without it `READY_FOR_MERGE` is a stop phase):
 
@@ -219,6 +223,35 @@ stops at its first non-`PASS`.
   local run".
 - **The override watermark** is the operator's: only an applied REMOTE
   unblock sets it (**Leaving BLOCKED** below).
+- **The review certificate** (ADR 0006 §2.12, #174; `certificate.py`). A
+  clean round's write issues a `review_certificate` in the same save that
+  enters `READY_FOR_MERGE` (REMOTE, the #162 journal completion included)
+  or `DONE` (LOCAL, with no `gh` call). Issuance is a pure function of
+  persisted inputs (D12.2): the candidate, the records, and the set and
+  policy digests are copied from the round's `review_evidence` binding, the
+  REMOTE review binding (PR, HEAD, base, merge base) and comment (URL, id,
+  marker key) from the round just recorded, and the LOCAL reviewed
+  fingerprint from the binding the round was judged on. A binding of
+  another round, a named record that is not `PASS`, a candidate that is not
+  the reviewed HEAD's commit (REMOTE) or workspace (LOCAL), or a
+  certificate that would not load issues nothing and blocks: these are
+  invariant violations, never a reason to enter `READY_FOR_MERGE` or
+  `DONE`. A set or policy that changed after the reviewer was presented its
+  evidence (D12.6) still issues the certificate from the binding, so it
+  states what the review was presented under, and blocks naming the
+  change; a REMOTE `unblock` decides from it (below), and a LOCAL run,
+  which has no unblock, starts again. `certificate.certificate_problem`
+  decides applicability from the state, the configured set and policy and,
+  for REMOTE, an optional live revision, with no I/O: the kind of the run's
+  mode, its digest, the load checks, the state's round, review binding,
+  comment and candidate (LOCAL, the reviewed fingerprint under this run's
+  contract), the set and policy in force, every named record still
+  eligible, and the live PR, HEAD, base and merge base. A certificate is
+  never shown to an agent or published (D1.3), and it is not a merge
+  permission (D1.2): the merge gate re-reads every fact it decides on from
+  GitHub, and does not consult the certificate yet (#175). A certificate is
+  not cleared when a new round starts: one of an earlier round no longer
+  applies, which is all a gate asks.
 
 ---
 
@@ -616,7 +649,13 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   launching the fixer, unless its acceptance action awaits the operator
   (below). `OPEN` at the
   reviewed HEAD and base with a
-  clean review -> `READY_FOR_MERGE` (the merge gate re-verifies from there);
+  clean review whose review certificate applies (ADR 0006 D12.3) ->
+  `READY_FOR_MERGE` (the merge gate re-verifies from there); with a clean
+  review and no applicable certificate (none was issued, or the set or
+  policy changed since) -> `REVIEW` (past the cap: refuse), a fresh round
+  that validates and reviews the revision under the configuration in force,
+  the clean result left as it is (it describes this revision; it is only
+  uncertified);
   at the reviewed HEAD and base with open findings -> `FIX` with the findings
   open, unless the next review round is past `workflow.max_review_rounds`,
   which refuses; any other revision, or no completed review -> `REVIEW`

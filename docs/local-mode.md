@@ -353,7 +353,16 @@ presents them (the command, its outcome, its exit status and duration).
 A run whose state has no such evidence (one persisted before the records
 existed) enters `BLOCKED` before the reviewer: "no validation evidence for
 this LOCAL run; start a new local run". A clean review over a record that
-did not pass is refused, as in REMOTE. A `Ctrl-C` during a
+did not pass is refused, as in REMOTE. `REVIEW → DONE` is entered only in
+the save that issues a `local` review certificate (#174, ADR 0006 D12.5),
+with no GitHub call: the controller's record that this round reviewed this
+exact workspace clean under these records, set and policy, copied from the
+binding. It is never shown to an agent, and it is no merge permission
+(LOCAL never merges). A clean round it cannot certify exactly, or one whose
+`local.validation_commands` set or policy changed after the reviewer was
+presented its evidence, enters `BLOCKED` instead and leaves the work in the
+working tree; a LOCAL run has no unblock, so start a new local run.
+`autoforge status` shows the certificate and whether it applies. A `Ctrl-C` during a
 command leaves an attempt marker; `resume` records it `INTERRUPTED` and
 runs the phase's commands again. At most 16 commands, each at most 32
 argv elements of at most 1,024 characters and 4,096 in all: a
