@@ -112,9 +112,14 @@ no credential was used.
 2. **`agent_end` repeats every message of the run.** Its `messages` field
    holds the system prompt, the user prompt, every assistant message and
    every tool result: 207 KB for a 200 KB prompt. A very long run can
-   therefore exceed the duplex record bound and fail closed as a protocol
-   violation. The bound's comment now says so, and tolerating an oversize
-   `agent_end` is #144.
+   therefore exceed the duplex record bound. Since #144 such a record is
+   not a protocol violation. The duplex handle hands the caller the first
+   bytes of every record it drops, and the reducer tolerates a record that
+   starts as Pi writes an `agent_end` (`{"type":"agent_end",`) or a
+   `turn_end`, which repeats a turn's assistant message and tool results.
+   The record is counted (`oversize_records`) and its content is never
+   read; that costs only `willRetry`, a summary counter. Any other record
+   past the bound still fails closed, and memory stays at the bound.
 3. **`entry_appended`** (documented in `docs/json.md`) is emitted after a
    `length` stop or a retried error. It is now a known, ignored event
    instead of being counted as unknown.
@@ -448,8 +453,8 @@ stderr"). Verified from docs/source; re-verified against installed Pi 1.0.1 in #
     `auto_retry_end` with `success: false`;
   - a model or thinking mismatch (§2.2, §2.3);
   - a protocol violation: an unknown response id, a `parse` error, a
-    non-JSON stdout record, an oversize record, or a missing required
-    field;
+    non-JSON stdout record, an oversize record other than an `agent_end`
+    or `turn_end` (#144, §1.1), or a missing required field;
   - Pi exiting before `agent_settled`;
   - no assistant text;
   - a cross-check mismatch;

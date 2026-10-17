@@ -1022,6 +1022,15 @@ is scripted with the same handlers `ScriptedProvider` takes. Keep covered:
   preflight, a rejected prompt, `stopReason: error`, an exit before
   `agent_settled` and a model mismatch (`ExecutionError`, stdout and stderr
   recorded)
+- an `agent_end` past the real record bound (#144) is no failure: the
+  phase advances and `execution.json` counts it. Below the engine
+  (`tests/test_pi_rpc.py`), an oversize `agent_end` or `turn_end` on the
+  fake `pi` is tolerated with the framer holding no more than the bound,
+  while an oversize answer stays a protocol violation, and so, in the
+  reducer, does every other head (another event, another serialisation,
+  a head cut short); the duplex handle's `Oversize` carries exactly the
+  record's head, across reads and never past the bound, and the head
+  counts against the pending bytes (`tests/test_executor_duplex.py`)
 - run logs: argv without the prompt and the env allow-list (Pi's names, no
   `OPENAI_*`) in `request.json`, the Pi summary in `execution.json`, only
   the final text in `stdout.log`, stderr separate, and a credential-shaped

@@ -20,6 +20,7 @@ import pytest
 from autoforge import executor, providers
 from autoforge.config import ProfileConfig
 from autoforge.errors import ExecutionError
+from autoforge.executor_duplex import OVERSIZE_HEAD_BYTES
 from autoforge.pi_rpc import PiConversation, js_trim
 from autoforge.providers import AgentRequest, PiProvider
 from autoforge.result_parser import parse_control_result
@@ -155,6 +156,7 @@ def test_happy_path_returns_the_final_text_and_the_parser_accepts_it():
         "ui_dialogs_cancelled": 0,
         "ui_notifications_ignored": 0,
         "unknown_events": 0,
+        "oversize_records": 0,
         "abort_sent": False,
         "failure": "",
     }
@@ -673,6 +675,90 @@ def test_abort_is_offered_only_for_a_running_prompt():
     assert run.c.failure.startswith("pi: the deadline was reached")
 
 
+# -- records past the stdout bound (#144) ------------------------------------------------------
+def _pi_record(record: dict) -> bytes:
+    """``record`` as Pi 1.0.1 writes it: JSON.stringify, ``type`` first, no whitespace."""
+    return json.dumps(record, separators=(",", ":")).encode()
+
+
+# What an Oversize keeps of each: the leading bytes of what Pi wrote.
+_AGENT_END_HEAD = _pi_record(
+    {"type": "agent_end", "messages": [{"role": "system", "content": "you are"}]}
+)[:OVERSIZE_HEAD_BYTES]
+_TURN_END_HEAD = _pi_record({"type": "turn_end", "message": assistant(), "toolResults": []})[
+    :OVERSIZE_HEAD_BYTES
+]
+
+
+@pytest.mark.parametrize(
+    ("head", "agent_ends"),
+    [(_AGENT_END_HEAD, 1), (_TURN_END_HEAD, 0)],
+    ids=["agent_end", "turn_end"],
+)
+def test_an_oversize_agent_end_or_turn_end_is_counted_not_fatal(head, agent_ends):
+    """Both repeat messages of the run, and the reducer needs neither's
+    content: one past the bound is counted from its leading bytes, shown as
+    activity, and the run ends in its answer. willRetry is unknown, so it is
+    not counted."""
+    from autoforge.progress import ProgressKind
+
+    events = []
+    run = Run(emit=events.append).started()
+    run.feed({"type": "message_end", "message": assistant()})
+    seen = len(events)
+    run.c.oversize(head, 1024)
+    assert not run.c.done
+    assert [e.kind for e in events[seen:]] == [ProgressKind.ACTIVITY]
+    run.feed({"type": "agent_settled"})
+    assert run.types()[-1] == "get_last_assistant_text"
+    run.respond("get_last_assistant_text", {"text": FINAL})
+    assert run.c.text == FINAL and run.c.failure is None
+    summary = run.c.summary()
+    assert summary["oversize_records"] == 1 and summary["agent_ends"] == agent_ends
+    assert summary["will_retry"] == 0 and summary["unknown_events"] == 0
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        pytest.param(
+            _pi_record({"type": "message_end", "message": assistant()})[:OVERSIZE_HEAD_BYTES],
+            id="answer",
+        ),
+        pytest.param(b'{"type":"message_update","message":{"role":"assistant"', id="update"),
+        pytest.param(b'{"type":"response","id":"id-4","command":"get_last', id="response"),
+        pytest.param(b'{"type":"extension_ui_request","id":"u","method":', id="dialog"),
+        pytest.param(b'{"type":"agent_settled","x":"', id="settled"),
+        pytest.param(b'{"type":"agent_end_v2","messages":[', id="longer-name"),
+        pytest.param(b'{"type": "agent_end", "messages": [', id="other-spacing"),
+        pytest.param(b'{"messages":[],"type":"agent_end",', id="type-not-first"),
+        pytest.param(b'{"type":"agent\\u005fend","messages":[', id="escaped-name"),
+        pytest.param(b'\xef\xbb\xbf{"type":"agent_end","messages":[', id="bom"),
+        pytest.param(b' {"type":"turn_end","message":', id="leading-space"),
+        pytest.param(b'{"type":"agent_end"', id="cut-before-the-comma"),
+        pytest.param(b"", id="empty"),
+    ],
+)
+def test_any_other_oversize_record_is_a_protocol_violation(head):
+    """Only Pi's own serialisation of an agent_end or turn_end is tolerated;
+    every other record past the bound fails closed, as before #144."""
+    run = Run().started()
+    run.c.oversize(head, 1024)
+    assert run.failure() == "pi: protocol violation: a stdout record exceeded 1024 bytes"
+    assert run.c.summary()["oversize_records"] == 0
+
+
+def test_an_oversize_record_after_the_outcome_is_fixed_changes_nothing():
+    run = Run().started()
+    run.c.deadline_reached()
+    failure = run.failure()
+    run.c.oversize(_AGENT_END_HEAD, 1024)
+    run.c.oversize(b'{"type":"message_end",', 1024)
+    assert run.failure() == failure
+    summary = run.c.summary()
+    assert summary["oversize_records"] == 0 and summary["agent_ends"] == 0
+
+
 # -- the provider over a fake `pi` ------------------------------------------------------------
 _FAKE_PI = r"""
 import json, subprocess, sys, time
@@ -965,6 +1051,76 @@ def test_provider_an_oversize_record_is_a_protocol_failure(tmp_path, monkeypatch
     )
     res, _ = _execute(tmp_path, scenario)
     assert res.provider_failure == "pi: protocol violation: a stdout record exceeded 1024 bytes"
+
+
+def _big_agent_end(size: int) -> str:
+    """An agent_end as Pi 1.0.1 writes it, repeating a user prompt of ``size``
+    characters and the final assistant message, LF-terminated."""
+    user = {"role": "user", "content": [{"type": "text", "text": "p" * size}]}
+    record = {"type": "agent_end", "messages": [user, assistant()], "willRetry": False}
+    return _pi_record(record).decode() + "\n"
+
+
+def _big_turn_end(size: int) -> str:
+    result = {"role": "toolResult", "content": [{"type": "text", "text": "r" * size}]}
+    record = {"type": "turn_end", "message": assistant(), "toolResults": [result]}
+    return _pi_record(record).decode() + "\n"
+
+
+def test_provider_an_oversize_agent_end_and_turn_end_are_tolerated(tmp_path, monkeypatch):
+    """#144: an agent_end (and a turn_end) larger than the record bound, but
+    otherwise valid, does not fail the run: the answer is accepted, both are
+    counted, no abort is sent, and the framer never held more than the bound
+    of either."""
+    from autoforge import executor_duplex
+
+    monkeypatch.setattr(providers, "PI_MAX_RECORD_BYTES", 1024)
+    monkeypatch.setattr(providers, "PI_MAX_PENDING_BYTES", 4096)
+    retained = []
+
+    class Framer(executor_duplex._LineFramer):
+        def feed(self, chunk):
+            out = super().feed(chunk)
+            retained.append(self.retained)
+            return out
+
+    monkeypatch.setattr(executor_duplex, "_LineFramer", Framer)
+    scenario = _happy()
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {"emit": {"type": "agent_start"}},
+        {"emit": {"type": "message_end", "message": assistant()}},
+        {"raw": _big_turn_end(50_000)},
+        {"raw": _big_agent_end(200_000)},
+        {"emit": {"type": "agent_settled"}},
+    ]
+    res, fake = _execute(tmp_path, scenario)
+    assert res.provider_failure is None and not res.timed_out and res.exit_code == 0
+    assert res.stdout == FINAL
+    assert parse_control_result(res.stdout, Phase.ANALYZE_EXECUTE) == ANALYZE_OK
+    assert res.provider_summary["oversize_records"] == 2
+    assert res.provider_summary["agent_ends"] == 1 and res.provider_summary["failure"] == ""
+    assert "abort" not in fake.commands()
+    assert retained and max(retained) <= 1024 + 1
+
+
+def test_provider_an_oversize_answer_is_still_a_protocol_failure(tmp_path, monkeypatch):
+    """The last assistant message_end decides the outcome, so one past the
+    bound fails closed, even beside a tolerated agent_end."""
+    monkeypatch.setattr(providers, "PI_MAX_RECORD_BYTES", 1024)
+    monkeypatch.setattr(providers, "PI_MAX_PENDING_BYTES", 4096)
+    big = _pi_record({"type": "message_end", "message": assistant("a" * 5000)}).decode()
+    scenario = _happy()
+    scenario["on"]["prompt"] = [
+        {"respond": "prompt", "data": {"disposition": "started"}},
+        {"raw": big + "\n"},
+        {"raw": _big_agent_end(5000)},
+        {"emit": {"type": "agent_settled"}},
+    ]
+    res, fake = _execute(tmp_path, scenario)
+    assert res.provider_failure == "pi: protocol violation: a stdout record exceeded 1024 bytes"
+    assert res.stdout == "" and res.provider_summary["oversize_records"] == 0
+    assert "get_last_assistant_text" not in fake.commands()
 
 
 def test_provider_a_response_to_an_unknown_id_is_a_protocol_failure(tmp_path):

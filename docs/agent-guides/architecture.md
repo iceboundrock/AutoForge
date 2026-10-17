@@ -315,8 +315,11 @@ it is held to the same contract:
   per record; U+2028/U+2029, NUL and every other byte are record content.
   Records are bytes and decoding them is the caller's. A record over
   `max_record_bytes` is reported as `Oversize` and dropped through its LF;
-  an unterminated fragment at EOF is reported as `Fragment`, never as a
-  record;
+  the `Oversize` carries the record's first `OVERSIZE_HEAD_BYTES` bytes
+  (never more than the bound), so a caller can tell what was dropped while
+  the handle stays protocol-free (Pi tolerates an oversize `agent_end` or
+  `turn_end` by it, #144). An unterminated fragment at EOF is reported as
+  `Fragment`, never as a record;
 - both pipes are drained continuously whether or not the caller reads.
   Records wait in a queue bounded by `max_pending_records` and
   `max_pending_bytes`, and exceeding it is `Overflow`, which ends the
