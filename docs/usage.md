@@ -711,7 +711,10 @@ ownership or discard uncommitted user changes.
   without writing anything:
   `GIT_ALTERNATE_OBJECT_DIRECTORIES='"<repo>/.git/autoforge/sandbox/<n>/objects"' git -C <worktree> log`.
   The inner double quotes keep git from splitting a path that contains a
-  `:`; inside them, write a `"` or a `\` of the path as `\"` or `\\`.
+  `:`; inside them, write a `"` or a `\` of the path as `\"` or `\\`. The
+  outer single quotes are the shell's, and end at a `'`: write a `'` of the
+  path as `'\''` (close the quotes, an escaped `'`, reopen them), after
+  git's escapes.
 - **Merge verification keeps saying "inconclusive":** checks still running,
   mergeability unknown or a transient GitHub failure; re-run
   `autoforge resume --allow-merge`. After `merge.max_verification_attempts`

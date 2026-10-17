@@ -620,8 +620,10 @@ own `git -C <worktree> log` cannot read those commits; inspect them
 read-only with
 `GIT_ALTERNATE_OBJECT_DIRECTORIES='"<git common dir>/autoforge/sandbox/<n>/objects"' git -C <worktree> log`
 (git splits the variable on `:` unless an entry is double-quoted, and
-unquotes a quoted one C-style; the controller always names the directory
-as one such entry, #224),
+unquotes a quoted one C-style, so a `"` or a `\` of the path is written
+`\"` or `\\`; the outer single quotes are the shell's, so a `'` is then
+written `'\''`; the controller always names the directory as one such
+entry, #224),
 and never add the directory to the shared store's `objects/info/alternates`.
 The import walks the directory first without following a link: a
 directory that is not a real one reached from the common dir through real
