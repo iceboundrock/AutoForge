@@ -10,12 +10,18 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   worktree's ``.git`` is a regular file naming that admin dir, absolute or
   relative (``worktree.useRelativePaths``). It replaces asking ``git -C
   <worktree>`` where its repository is, which follows the agent-writable
-  ``.git`` file.
+  ``.git`` file. :func:`registered_worktree_roots` is the registry's list of
+  working-tree roots, what ``git worktree list`` reports, read from the same
+  entries without git and without following a link: ``git worktree list``
+  resolves every listed worktree's ``HEAD``, through a link the agent
+  planted in its admin dir (#223).
 - **Candidate (D6.3).** :func:`read_candidate` reads the worktree's
   ``HEAD`` as ``worktrees/<id>/HEAD`` with ``--git-dir=<git common dir>``,
   after ``lstat`` found a regular file there (:func:`head_problem`): never
   through the worktree's ``.git`` file, the admin dir's ``commondir`` or
-  ``gitdir``, or ``git -C <worktree>``.
+  ``gitdir``, or ``git -C <worktree>``. An attached ``HEAD`` is told by
+  ``symbolic-ref --no-recurse``, which never opens the reference it names
+  (#223).
 - **Strict import (D6.5).** :func:`import_private_objects` copies the
   objects reachable from that ``HEAD`` which the shared store lacks out of
   the issue's private object directory (an enforced launch's overlay upper
@@ -84,14 +90,21 @@ def _ended(res: ExecutionResult) -> str:
 
 
 def _read_pointer(path: Path) -> str | None:
-    """A pointer file's single line, or ``None`` unless it is a regular file."""
+    """A pointer file's single line, or ``None`` unless it is a regular file.
+
+    Opened without following a link and without blocking, and checked again
+    on the descriptor: a file swapped for a FIFO after the ``lstat`` neither
+    blocks the read nor is read.
+    """
     try:
         if not stat.S_ISREG(os.lstat(path).st_mode):
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return None
         data = handle.read(_MAX_POINTER_BYTES + 1)
     if len(data) > _MAX_POINTER_BYTES or b"\0" in data:
         return None
@@ -156,6 +169,67 @@ def bound_admin_dir(common: Path, worktree: Path) -> Path:
     return admin
 
 
+def _less_dotgit(path: str) -> str:
+    """``path`` less a trailing ``/.git``: how git names a worktree after its ``.git``."""
+    return path[: -len("/.git")] if path.endswith("/.git") else path
+
+
+def registered_worktree_roots(common: Path) -> set[Path]:
+    """The working-tree roots the repository's registry names, resolved (D6.4, #223).
+
+    What ``git worktree list`` reports, read without git: git also resolves
+    every listed worktree's ``HEAD``, following a link an agent planted
+    there to any file on the host (a FIFO stalls it). Nothing here reads a
+    ``HEAD`` or a reference.
+
+    - The main worktree, named as git names it: the common dir, less a
+      trailing ``/.git``.
+    - Each entry ``<common>/worktrees/<id>`` that is a real directory with
+      a regular ``gitdir`` file (:func:`_read_pointer`), at the path that
+      file names less a trailing ``/.git``, absolute or relative to the
+      entry.
+    - Left out, as git marks it ``prunable``: an entry whose ``gitdir``
+      names a ``.git`` that is not there, unless the entry is ``locked``.
+      Both are ``lstat``-ed, so a link there counts as there and is not
+      followed.
+
+    An entry that is a link, or whose ``gitdir`` is not a regular file,
+    names no root, since git would read through it; the binding
+    (:func:`bound_admin_dir`) refuses such a worktree too. A registry that
+    cannot be listed, or holds more than :data:`MAX_REGISTRY_ENTRIES`
+    entries, is a :class:`VerificationError`.
+    """
+    roots = {Path(os.path.realpath(_less_dotgit(os.path.realpath(common)) or "/"))}
+    registry = common / "worktrees"
+
+    def refuse(what: str) -> VerificationError:
+        return VerificationError(
+            f"cannot list the repository's worktrees: {what}. The controller neither reuses an "
+            "agent worktree nor launches in a sandbox it cannot check against the registry"
+        )
+
+    try:
+        with os.scandir(registry) as entries:
+            for count, entry in enumerate(entries):
+                if count >= MAX_REGISTRY_ENTRIES:
+                    raise refuse(f"{registry} holds more than {MAX_REGISTRY_ENTRIES} entries")
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                admin = registry / entry.name
+                value = _read_pointer(admin / "gitdir")
+                if value is None:
+                    continue
+                dotgit = os.path.join(admin, value)  # an absolute value stands alone
+                if not (os.path.lexists(dotgit) or os.path.lexists(admin / "locked")):
+                    continue  # prunable: nothing at its path is a worktree
+                roots.add(Path(os.path.realpath(os.path.join(admin, _less_dotgit(value)))))
+    except FileNotFoundError:
+        pass  # no linked worktree
+    except OSError as exc:
+        raise refuse(f"{registry} cannot be read ({exc.strerror})") from None
+    return roots
+
+
 @dataclass(frozen=True)
 class Candidate:
     """The worktree's ``HEAD`` as the controller reads it (D6.3).
@@ -207,18 +281,26 @@ def head_problem(admin: Path) -> str | None:
 def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | None) -> Candidate:
     """The candidate: ``worktrees/<id>/HEAD`` addressed through the common dir (D6.3).
 
-    An inconclusive git read is a :class:`VerificationError`, never a guess.
+    Whether ``HEAD`` is attached is asked with ``symbolic-ref --no-recurse``,
+    which reads ``HEAD`` alone: without it git resolves the reference
+    ``HEAD`` names, and so a link the agent planted at
+    ``worktrees/<id>/refs/...`` to any file on the host (#223). An
+    inconclusive git read is a :class:`VerificationError`, never a guess.
     """
     problem = head_problem(admin)
     if problem:
         return Candidate(False, "", problem)
     ref = f"worktrees/{admin.name}/HEAD"
     attached, _ = _admin_git(
-        common, ["symbolic-ref", "-q", ref], runner, "whether HEAD is detached", worktree
+        common,
+        ["symbolic-ref", "-q", "--no-recurse", ref],
+        runner,
+        "whether HEAD is detached",
+        worktree,
     )
     if attached == 0:
         # Never a candidate: the reference it names (one the agent may have
-        # written in its admin dir) is not resolved.
+        # written in its admin dir) is neither opened nor resolved.
         return Candidate(True, "")
     found, head = _admin_git(
         common,

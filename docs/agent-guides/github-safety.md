@@ -870,9 +870,10 @@ URL, target, method, path or command in its request is refused.
   the executor.
 - **Every other controller git process** runs in the operator's repository
   through `git_transport.local_git_request` (ADR 0004 D7.3, D7.5): the
-  per-issue worktree's `git worktree add` and its identity and registry
-  reads, the workspace reader (`rev-parse`, `symbolic-ref`, `status`), the
-  lock's common-dir read and the pre-merge export. Hooks and the file-system
+  per-issue worktree's `git worktree add` and its identity read, the
+  candidate read and the strict import, the workspace reader
+  (`rev-parse`, `symbolic-ref`, `status`), the lock's common-dir read and
+  the pre-merge export. Hooks and the file-system
   monitor are off at command-line precedence, and so are replacement
   objects and the commit-graph. The child starts from
   `LOCAL_GIT_ENV_ALLOWLIST`, with no token and no `GIT_*` variable of the
@@ -1353,11 +1354,19 @@ can write, so they hold under `sandbox.mode: disabled` too:
   name a decoy repository cannot move the candidate: the decoy's commit,
   reported as `head_sha`, is refused as not the worktree's `HEAD`
   (`test_engine_sandbox.py::test_the_candidate_is_read_through_the_registry_not_the_worktrees_git_file`).
+  An attached `HEAD` is told by `symbolic-ref --no-recurse`: the
+  reference it names, which may be a link the agent planted in its admin
+  dir to any host file, is never opened (#223).
 - **The worktree is bound through the registry.** It is used only while
   exactly one registry entry's `gitdir` names `<worktree>/.git` and that
   `.git` is a regular file naming the entry; otherwise the step refuses,
   naming `git worktree repair`. Rewriting the pointers can make the check
-  refuse, never make it name another worktree.
+  refuse, never make it name another worktree. Whether it is registered at
+  all, and which other worktrees a sandbox denies, is read from the
+  registry's `gitdir` files without git, never by `git worktree list`,
+  which resolves every listed worktree's `HEAD` through a planted link
+  (#223;
+  `test_engine_sandbox.py::test_a_planted_link_to_a_fifo_stalls_no_controller_read`).
 - **The agent's objects are imported strictly.** Before every REMOTE
   launch and after every one that exited cleanly, the objects the
   candidate reaches that the shared store lacks are copied out of the

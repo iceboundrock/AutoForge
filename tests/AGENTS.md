@@ -116,6 +116,10 @@ read it before adding tests for a listed area.
   to it for a netrc entry). `tests/test_providers.py` has a fake
   `opencode` that resolves its configuration, organizations cached in a
   2.0.26-shaped database included, as 2.0.26 does.
+- `watched_fifo(path)` makes a FIFO and yields the list of times
+  something opened it to read (a watchdog releases the reader, so a read
+  that follows a planted link records itself instead of hanging the
+  test); read it after the `with` block (#223).
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.

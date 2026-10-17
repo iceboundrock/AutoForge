@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from autoforge import __prompt_version__
+from autoforge import __prompt_version__, agent_worktree
 from autoforge.child_env import POSIX_SHELLS
 from autoforge.claims import (
     REVIEW,
@@ -10848,7 +10848,9 @@ def test_worktree_creation_runs_no_repository_hook_and_holds_no_credential(
 
     run = [r.command[1 + len(LOCAL_GIT_SWITCHES) :] for r in requests if r.command[0] == "git"]
     assert ["worktree", "add", "--detach", str(expected), "HEAD"] in run
-    assert ["worktree", "list", "--porcelain"] in run
+    # The registry is read without git (#223): `git worktree list` follows a
+    # link at any listed worktree's HEAD.
+    assert not any(cmd[:2] == ["worktree", "list"] for cmd in run)
     # ADR 0005 D6.4: the reuse is bound through the registry, never by asking
     # git inside the worktree (which follows its agent-writable `.git` file).
     assert not any(cmd[:2] == ["-C", str(expected)] for cmd in run)
@@ -11065,20 +11067,15 @@ def test_an_existing_worktree_is_reused_only_when_the_repository_registers_it(
     assert Path(eng.provider.calls[0].cwd) == expected
 
 
-def test_the_worktree_registry_read_failing_refuses_reuse(tmp_state_dir, fake_github):
+def test_the_worktree_registry_read_failing_refuses_reuse(tmp_state_dir, fake_github, monkeypatch):
+    """A registry the controller cannot list (here: more entries than its
+    bound) refuses the reuse before anything is launched."""
     repo = git_repo(tmp_state_dir.parent)
     _commit(repo, "a.txt", "1", "base")
     expected = repo / ".git" / "autoforge" / "worktrees" / "2"
     _git(repo, "worktree", "add", "-q", "--detach", str(expected), "HEAD")
     eng = _analyze_with(tmp_state_dir, fake_github, lambda req: None)
-    real = eng._runner
-
-    def failing(req):
-        if req.command[1 + len(LOCAL_GIT_SWITCHES) :][:2] == ["worktree", "list"]:
-            return ExecutionResult(req.command, req.cwd, 128, "", "fatal: cannot read", "t", "t")
-        return (real or execute)(req)
-
-    eng._runner = failing
+    monkeypatch.setattr(agent_worktree, "MAX_REGISTRY_ENTRIES", 0)
     with pytest.raises(VerificationError, match="cannot list the repository's worktrees"):
         eng.step()
     assert eng.provider.calls == []

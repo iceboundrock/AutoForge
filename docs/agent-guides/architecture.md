@@ -663,11 +663,17 @@ the mode. Every git process is the controller's own `local_git_request`
   creates and one it reuses; otherwise the refusal (a `VerificationError`)
   names the inconsistency and `git worktree repair`. A worktree created
   before #168 is reused once it binds, never refused for its age (D15.2).
+  `registered_worktree_roots` is the registry's list of roots, what
+  `git worktree list` reports, read from `<common>/worktrees/*/gitdir`
+  without git and without following a link (git resolves every listed
+  `HEAD`, through a link the agent planted, #223); the reuse check and the
+  sandbox's denied roots read it, and the engine lists no worktree itself.
 - **Candidate (D6.3).** `read_candidate` reads `worktrees/<id>/HEAD` with
   `git --git-dir=<common>`, after `lstat` found a regular file there
   (`head_problem`), never through the worktree's `.git`, the admin dir's
   `commondir` or `gitdir`, or `git -C <worktree>`; an attached `HEAD` is
-  reported without resolving the reference it names. `_read_candidate`
+  reported by `symbolic-ref --no-recurse`, which never opens the reference
+  it names (#223). `_read_candidate`
   serves the `ANALYZE_EXECUTE`, `FIX` and `REPLAN_REEXECUTE` result
   checks, so a `.git` rewritten to a decoy repository cannot move the
   candidate.

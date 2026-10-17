@@ -440,6 +440,13 @@ Four more files, the same split by what they need from the host:
     pointers too; a rewritten `.git` file (refused naming
     `git worktree repair`), a `.git` directory, two entries naming the
     worktree and an unregistered worktree are refused;
+  - the registry listing (#223): the roots `git worktree list` reports for
+    the checkout, linked worktrees, a prunable entry (left out) and a
+    locked one whose tree is gone (kept), asked from the checkout or a
+    linked worktree, with relative pointers, a separate git dir and a bare
+    repository; an entry or `gitdir` that is a link or a FIFO names no
+    root and is never opened; a registry over its bound or unreadable is
+    refused;
   - the D6.3 candidate read: the detached HEAD, an attached HEAD reported,
     a HEAD that is a link not read, pointer rewrites that do not move the
     candidate, a HEAD naming no commit read as none;
@@ -448,6 +455,12 @@ Four more files, the same split by what they need from the host:
     nothing reaches the shared store; an attached `HEAD` whose
     per-worktree reference is such a link imports nothing, and neither
     the import nor the candidate read resolves it;
+  - a FIFO outside (#223), watched by `watched_fifo`, that a `HEAD` link
+    or a reference `worktrees/<id>/refs/worktree/...` a regular `HEAD`
+    names leads to: no controller read opens it (the candidate read, the
+    import, the registry listing, the binding), while the git commands
+    they replaced (`symbolic-ref` without `--no-recurse`,
+    `git worktree list`) do;
   - the D6.5 import: an empty or absent private directory imports
     nothing, an agent's commit reaches the shared store, a corrupt object
     does not, and `info/alternates`, `info/http-alternates`, a link or a
@@ -465,7 +478,10 @@ Four more files, the same split by what they need from the host:
   replaced by a link under `disabled`, entering `BLOCKED` with nothing
   pushed; a `.git` pointed at a decoy repository,
   whose HEAD is never the candidate and whose next launch is refused
-  naming the repair; a refusal on the spawn path; and the dry-run note.
+  naming the repair; a `HEAD` link, or a reference a regular `HEAD`
+  names, to a FIFO outside, which no controller read opens across the
+  candidate refusal, the relaunches and the operator's repair (#223); a
+  refusal on the spawn path; and the dry-run note.
 - `tests/test_sandbox_gate.py` (#169, D12.2, D12.4) drives the engine with
   the probe's stand-in. It covers: under `required` and REMOTE's
   `preferred`, a host that cannot enforce refusing the step with a
@@ -525,7 +541,10 @@ Four more files, the same split by what they need from the host:
   that sees only the export; an all-Pi run sandboxed in every child,
   the auth preflight included; a `HEAD` an agent replaced with a link to a
   file invisible inside, which the import refuses before git reads it,
-  leaving the commit out of the shared store; and the linked provider
+  leaving the commit out of the shared store; such a `HEAD` link, or a
+  reference a regular `HEAD` names, to a FIFO on the host that neither the
+  import, the candidate read, the registry listing nor the binding opens
+  (#223); and the linked provider
   paths found inside: Pi's auth preflight (a fake that is ready only when
   it reads `$PI_CODING_AGENT_DIR/auth.json`) with the directory or a link
   to it, a fake Claude Code reading and writing through a linked
@@ -589,8 +608,8 @@ prompts carry in every mode.
 - a path that exists but is not a worktree root of this repository, or a
   location inside the operator's working tree, is refused, not adopted
 - a dry run creates no worktree and runs no git
-- worktree creation, its identity and registry reads, and the workspace
-  reader are hardened (ADR 0004 D7.3): a planted `post-checkout` or
+- worktree creation, its identity read, and the workspace
+  reader are hardened (the registry is read without git, #223) (ADR 0004 D7.3): a planted `post-checkout` or
   `reference-transaction` hook (in `hooks/` or a configured `core.hooksPath`)
   and a configured `core.fsmonitor` do not run, a filter driver sees no
   token and no operator `GIT_*`, and an operator `GIT_DIR` redirects neither

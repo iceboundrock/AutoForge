@@ -11,7 +11,9 @@
   `sandbox.read_only_paths`, `src/autoforge/doctor_sandbox.py`, the
   per-class policy in the dry-run plan and the parity suite,
   `tests/test_sandbox_parity.py`). D13.1 is amended by #225 (a script's
-  absolute `#!` line is reached as written). It is implemented by #167 (the launch
+  absolute `#!` line is reached as written), and D6.3 and D6.4 by #223
+  (the controller's reads of the admin dir follow no link the agent
+  planted). It is implemented by #167 (the launch
   description, the policy compiler and the Linux `bwrap` backend in the
   executor layer), #168
   (provider declarations, engine facts, the routing of every launch, the git
@@ -759,6 +761,19 @@ addressed through the common dir.**
   §1.2 needs no sandbox, only a writable `.git` file, which every
   unsandboxed agent has today.
 
+*Amended by #223 (2026-10-16): no reference is resolved past `HEAD`.*
+`symbolic-ref` follows a chain of symbolic references by default, so a
+regular `HEAD` holding `ref: worktrees/<id>/refs/worktree/<name>`, where
+`<name>` is a link the agent placed in its writable admin dir, made the
+controller's git open and parse whatever host file the link names, outside
+the boundary (a FIFO there stalled the read until its timeout; measured).
+The detached check is `symbolic-ref -q --no-recurse`, which reads `HEAD`
+alone: an attached `HEAD` is reported and the reference it names is never
+opened. `rev-parse` runs only on a detached `HEAD`, which names an object
+id and no reference. Reading the `HEAD` file's content instead, as the
+strict import does (D6.5), would take a reftable worktree, whose `HEAD`
+file is a stub, for an attached one.
+
 *Consequence for #161 (merged).* #161 already defines the candidate as the
 worktree's detached `HEAD` and pushes it to the controller-named remote
 branch, so its rule stands. Two of its reads change, and #168 makes both
@@ -787,6 +802,23 @@ operator moved breaks the pointers for git too; the refusal names
 the check refuse, never make it name another worktree: under an enforced
 sandbox the other admin dirs are masked, and its own pointers are pinned
 (D6.6).
+
+*Amended by #223 (2026-10-16): the registry is listed without git.* Reuse
+first asks whether the worktree is registered at all, and the sandbox's
+denied roots (D13.2) name every other registered worktree. Both read the
+registry's list of roots, which `git worktree list --porcelain` used to
+supply; but git resolves each listed worktree's `HEAD` for that listing,
+and follows a `HEAD` that is a link (to a FIFO, it stalled the reuse and
+every `resume` until its timeout; measured). The list is now read from the
+registry itself, next to the binding (`registered_worktree_roots`): the
+main worktree as git names it (the common dir less a trailing `/.git`),
+and each `<common>/worktrees/<id>` that is a real directory with a regular
+`gitdir` file, at the path that file names, read without following a link
+and without git. An entry git marks `prunable` (its `gitdir` names a
+`.git` that is gone, and it is not `locked`) is left out, as before. An
+entry that is a link or whose `gitdir` is not a regular file names no
+root, where git would read through it; the binding refuses such a
+worktree in any case.
 
 **D6.5 (#168).** **The controller imports the private objects strictly, and
 never follows an agent-written alternate.**
