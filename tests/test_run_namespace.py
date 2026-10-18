@@ -767,6 +767,30 @@ def test_listing_reports_what_is_not_an_issue_directory(common, tmp_path):
     assert (issues / "14").read_text(encoding="utf-8") == "a regular file named like an issue"
 
 
+def test_an_out_of_range_issue_directory_is_rejected_and_hides_nothing(common):
+    """Nineteen digits pass the name check; one past MAX_ID is reported, not raised."""
+    bound = _bind(common, 11)
+    issues = common / "autoforge" / "scheduler" / "issues"
+    past = (str(rn.MAX_ID + 1), "9" * 19)
+    for name in (str(rn.MAX_ID), *past):
+        (issues / name).mkdir()
+    (issues / past[0] / "binding.json").write_text(
+        json.dumps(_binding(11).to_dict()), encoding="utf-8"
+    )
+    (issues / ("1" + "0" * 19)).mkdir()  # twenty digits: never a decimal issue number
+    before = _tree(common / "autoforge")
+
+    listing = list_issue_namespaces(common)
+    assert listing.bound == (bound,)
+    assert listing.unbound == (issue_namespace(common, rn.MAX_ID),)
+    rejected = {r.name: r.reason for r in listing.rejected}
+    for name in past:
+        assert rejected[name] == f"past the largest issue number {rn.MAX_ID}"
+    assert rejected["1" + "0" * 19] == "not a decimal issue number"
+    assert len(rejected) == 3
+    assert _tree(common / "autoforge") == before
+
+
 def test_listing_is_bounded(common, monkeypatch):
     monkeypatch.setattr(rn, "MAX_ISSUE_NAMESPACES", 3)
     for n in (1, 2, 3):

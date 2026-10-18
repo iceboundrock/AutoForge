@@ -114,7 +114,8 @@ _BINDING_KEYS = (
 )
 _NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
 # An issue directory's name: the canonical decimal rendering of a positive
-# issue number, so ``011`` can never alias ``11``.
+# issue number, so ``011`` can never alias ``11``. Nineteen digits reach
+# past MAX_ID; the listing checks the value as well.
 _ISSUE_DIR_RE = re.compile(r"[1-9][0-9]{0,18}")
 
 
@@ -662,12 +663,14 @@ def list_issue_namespaces(coordination_root: str | Path) -> NamespaceListing:
 
     More than :data:`MAX_ISSUE_NAMESPACES` entries refuses the listing
     (:class:`NamespaceError`) as soon as the directory read passes the
-    bound. An entry whose name is not a canonical decimal issue number, or
-    that is a symbolic link, a regular file or any other non-directory, is
-    reported in :attr:`NamespaceListing.rejected` and never opened. A link
-    in place of ``autoforge``, ``scheduler`` or ``issues`` itself raises
-    :class:`~autoforge.safefs.UnsafePathError`. No directory is created: a
-    repository without a scheduler tree lists nothing.
+    bound. An entry whose name is not a canonical decimal issue number (or
+    is one past :data:`MAX_ID`), or that is a symbolic link, a regular file
+    or any other non-directory, is reported in
+    :attr:`NamespaceListing.rejected` and never opened; it never hides the
+    other entries. A link in place of ``autoforge``, ``scheduler`` or
+    ``issues`` itself raises :class:`~autoforge.safefs.UnsafePathError`. No
+    directory is created: a repository without a scheduler tree lists
+    nothing.
     """
     root = _coordination_root(coordination_root)
     issues_relpath = "/".join((AUTOFORGE_DIRNAME, SCHEDULER_DIRNAME, ISSUES_DIRNAME))
@@ -693,6 +696,9 @@ def list_issue_namespaces(coordination_root: str | Path) -> NamespaceListing:
         for name, mode in entries:
             if not _ISSUE_DIR_RE.fullmatch(name):
                 rejected.append(RejectedEntry(name, "not a decimal issue number"))
+                continue
+            if int(name) > MAX_ID:
+                rejected.append(RejectedEntry(name, f"past the largest issue number {MAX_ID}"))
                 continue
             if not stat.S_ISDIR(mode):
                 kind = entry_kind(mode) or "regular file"
