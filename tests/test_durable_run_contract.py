@@ -782,13 +782,13 @@ def _calls(tree: ast.AST, names: set[str]):
 def test_production_never_reads_or_writes_state_by_pathname_outside_state_py():
     """Every state.json read/write goes through a held root capability.
 
-    ``save_state``/``load_state``/``quarantine_state_file`` accept a
-    pathname for the *message*, and a ``root=`` capability for the
+    ``save_state``/``load_state``/``quarantine_state_file``/``archive_state_file``
+    accept a pathname for the *message*, and a ``root=`` capability for the
     *access*. Outside :mod:`autoforge.state` itself, a call without ``root=``
     would be a fresh pathname resolution -- exactly the rebinding that a
     replaced state directory exploits.
     """
-    names = {"save_state", "load_state", "quarantine_state_file"}
+    names = {"save_state", "load_state", "quarantine_state_file", "archive_state_file"}
     offenders = []
     for path in sorted(SRC.rglob("*.py")):
         if path.name == "state.py":

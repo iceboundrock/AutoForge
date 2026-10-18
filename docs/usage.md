@@ -459,6 +459,13 @@ redacted. What it reads depends on the command:
 - **Repository lock:** `<repo>/.git/autoforge/controller.lock`, the same
   file for every `--state-dir`, subdirectory and linked worktree of one
   checkout. A second controller exits with `LockError`.
+- **Scheduler namespaces:** `<repo>/.git/autoforge/scheduler/` belongs to
+  the parallel EPIC scheduler (ADR 0008; its commands are still being
+  built): one directory per issue, with its own state. `run`, `step`,
+  `resume` and `local run` refuse a `--state-dir` or `state_dir` that
+  resolves inside it (exit 2, before the lock is taken); `status` reads such
+  a state directory and `unblock` acts on it. Layout:
+  [State and recovery: per-issue scheduler namespaces](agent-guides/state-and-recovery.md#per-issue-scheduler-namespaces).
 - **Agent worktrees:** `<repo>/.git/autoforge/worktrees/<issue-number>` (or
   under `execution.worktree_dir`), added detached at the checkout's HEAD the
   first time an agent is launched for the issue and reused by every later

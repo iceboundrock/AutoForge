@@ -135,6 +135,9 @@ byte-exact export and its proof       test_materialize.py (the merge gate's: tes
                                       test_engine.py)
 effect operations, git transport      test_effects.py, test_git_transport.py
 state, contract, filesystem boundary  test_state.py, test_durable_run_contract.py, test_safefs.py
+scheduler namespaces (#178)           test_run_namespace.py (RunKey, layout, binding, lookup,
+                                      listing, archive, engine binding); the standalone
+                                      state-dir refusal: test_cli.py
 REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.py; load and
                                       protocol: test_state.py)
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py

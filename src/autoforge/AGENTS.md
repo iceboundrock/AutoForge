@@ -82,6 +82,10 @@ certificate.py      review certificates: issuance from the review binding, appli
                     and the not-a-merge-permission wording; pure (ADR 0006 D12, D13, #174)
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
 state.py            persisted controller state, atomic writes, schema/protocol checks
+run_namespace.py    the parallel EPIC scheduler's per-issue run identities (RunKey) and
+                    namespaces under <common>/autoforge/scheduler/issues/<n>: layout,
+                    binding.json, read-only lookup and listing, the state archive, the
+                    standalone state-dir refusal; no lock, claim or GitHub read (#178)
 run_contract.py     the durable contract of a LOCAL run
 config_fingerprint.py  the recorded configuration of a REMOTE run (profile routing,
                     agent worktree root) that step/resume/unblock compare (#219)
@@ -148,6 +152,9 @@ state.py, effects.py, evidence.py, certificate.py,
 run_contract.py, safefs.py, config_fingerprint.py,
 locking.py, errors.py,
 engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
+run_namespace.py, engine.py (namespace binding)   -> docs/agent-guides/state-and-recovery.md
+                                                     + docs/adr/0008-parallel-epic-scheduler-
+                                                     authority-run-identity-claims-and-locks.md
 providers.py, pi_rpc.py, claude_stream.py,
 progress.py, loop_detect.py, executor.py,
 executor_duplex.py,
