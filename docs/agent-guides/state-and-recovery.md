@@ -506,30 +506,90 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
 
 **The parallel EPIC scheduler generalizes this invariant; it does not remove
 it** ([ADR 0008](../adr/0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md),
-D10–D12; a design record, implemented by #178–#183, so only the lock above
-exists today):
+D10–D12, D17.2). #180 implements the three lock domains in
+`src/autoforge/locking.py` and the ownership guards in
+`src/autoforge/ownership.py`; the scheduler that shares them with its
+workers arrives with #182, so today a standalone command holds L0 and takes
+L1, and only tests take L2:
 
-- **One orchestration authority per git common dir.** This lock is L0. It
-  is held either by one standalone mutating command, exactly as above, or
-  by one scheduler invocation (`epic run`, `epic resume`, `epic archive`)
-  together with the workers it launched. Workers inherit the scheduler's
-  open file description and prove it, never acquire it, and a shared
-  descriptor is released by `close` only, never `LOCK_UN`.
-- **At most one worker per issue.** A per-issue run lock (L2,
-  `<git common dir>/autoforge/scheduler/issues/<n>/run.lock`) is the only
-  proof of a live owner. Every write to a per-issue state happens under
-  that issue's exclusive authority: L2 for a worker, L0 for a standalone
-  command.
-- **Controller writes to git's shared data in the common dir** (its object
-  store and its worktree registry) **are serialized** by a shared-Git lock
-  (L1, `<git common dir>/autoforge/git.lock`): the worktree
-  check-then-create, the controller's fetch and the strict import of an
-  issue's private objects. Reads take no lock, and AutoForge's own files
-  under `<git common dir>/autoforge` (the sandbox directories, this lock's
-  PID record) are covered by L0 or L2 instead.
+- **L0: one orchestration authority per git common dir.** This lock is L0,
+  unchanged for a standalone command (including its `LOCK_UN`-then-close
+  release); its refusal now adds "an AutoForge scheduler or its surviving
+  workers may hold it" (exit 2). A scheduler invocation (`epic run`, `epic
+  resume`, `epic archive`) holds it together with the workers it launched.
+  It switches to a **close-only release** (`ControllerLock.share`) before its
+  first spawn, so neither its return, an exception nor SIGKILL unlocks the
+  open file description its workers inherited (`pass_fds`): `LOCK_UN` on any
+  copy would release it for every holder at once. A worker never acquires
+  L0: it adopts the inherited descriptor (`ControllerLock.adopt`) only after
+  the fresh-descriptor proof (`locking.prove_held`): the expected
+  coordination root opened afresh (`O_NOFOLLOW | O_CLOEXEC`) names the same
+  `(st_dev, st_ino)`, and `flock(LOCK_EX | LOCK_NB)` on that fresh
+  descriptor fails with `EWOULDBLOCK`. No environment variable, PID record
+  or claim authorizes adoption. An adopted lock is close-only, is made
+  non-inheritable and never writes the PID record, which keeps naming the
+  scheduler for diagnostics only.
+- **L2: at most one worker per issue.** `IssueRunLock`,
+  `<git common dir>/autoforge/scheduler/issues/<n>/run.lock`, is the only
+  proof of a live owner. Every directory on its path is opened
+  `O_NOFOLLOW`, the file `O_NOFOLLOW | O_CLOEXEC`; it must be a regular
+  file with one link, and it is created once and never written, truncated
+  or unlinked. Only the L0-holding scheduler acquires it, `LOCK_EX |
+  LOCK_NB` only: a held one is `IssueBusy`, never a wait. It is handed to
+  exactly one child, every release (scheduler or worker) is `close` only,
+  and a worker adopts it with the same proof as L0. The lock-free probe
+  `issue_run_lock_live` opens it read-only without `O_CREAT` and tries
+  `LOCK_SH | LOCK_NB`: a missing file is no owner, `EWOULDBLOCK` is a live
+  one. Every write to a per-issue state happens under that issue's exclusive
+  authority: L2 for a worker, L0 for a standalone command.
+- **L1: controller writes to git's shared data in the common dir are
+  serialized.** `SharedGitLock`, `<git common dir>/autoforge/git.lock`
+  (hardened like L2), is held around exactly the writes of ADR 0008 D12.1:
+  the agent worktree's check-then-create (`_ensure_agent_worktree`), the
+  controller's fetch (taken inside `GitTransport.fetch`, so every caller,
+  the pre-merge fetch and `read_commit`'s re-fetch included, holds it), and
+  the strict import's `index-pack` alone. Each of those git processes runs
+  with automatic maintenance off (`git_transport.NO_AUTO_MAINTENANCE`:
+  `gc.auto=0`, `maintenance.auto=false`). It is the one blocking
+  acquisition: a poll bounded by `SHARED_GIT_LOCK_WAIT_SECONDS` (the fetch's
+  600 s plus 60 s) whose expiry is the transient `GitLockTimeout`, which the
+  guarded operation reports as its own failure (the fetch's
+  `GitTransportError`, the import's failure, the worktree creation's
+  "Nothing was launched; 'resume' tries again"). Reads take no lock. The
+  sandbox directories are not under L1: they are not git data and only
+  their issue's owner creates them; the PID record is covered by L0.
 - **Order L0 → L2 → L1.** L0 and L2 are only ever taken non-blocking, and
-  the holder of L1, the one bounded blocking wait, acquires nothing while
-  holding it.
+  the holder of L1 takes nothing while holding it, so no wait-for cycle can
+  form; a standalone command takes L0 then L1 and never L2. A debug
+  assertion (`LockOrderError`, a controller bug) refuses, while this
+  process holds L1, any lock acquisition, agent launch, GitHub call or
+  state save.
+- **Filesystem.** In scheduler mode only, `check_local_lock_filesystem`
+  refuses (`NetworkFilesystemError`) a coordination root, and every
+  `run.lock` and `git.lock` descriptor, on NFS, CIFS/SMB, 9p, AFS, a
+  cluster filesystem or any FUSE filesystem (Linux `statfs` magic, macOS
+  `f_fstypename`), and one it cannot identify: the live-ownership proof
+  needs local kernel locks. Standalone commands never check.
+- **No stale-lock cleanup.** No lock has a timeout, lease or heartbeat: the
+  kernel releases each when its last descriptor closes, SIGKILL included,
+  and nothing ever removes a lock file.
+- **Ownership (D17.2).** L0 excludes a standalone command and a scheduler
+  in time; the guards exclude them in ownership. **Forward:** `run`,
+  `step`, `resume` and `unblock` refuse (exit 2, `SchedulerOwnedIssueError`
+  naming `autoforge epic archive`) an issue a scheduler namespace owns,
+  checked under L0 before anything is written: the namespace holds any
+  `state/state.json` (loaded or not) or a live owner holds its L2, and a
+  namespace that cannot be read owns its issue (fail-closed). #181 adds the
+  open-claim half. The CLI hands the standalone engine the same predicate
+  (`ControllerEngine.issue_ownership`), one more rejection fact of
+  `_verify_issue_selectable`, so a sequential run's `next_issue_url` naming
+  an owned issue takes the bounded rejection path. A worker engine gets no
+  predicate, and `unblock` of a namespace's own state directory exempts
+  that namespace. **Reverse:** `ownership.standalone_hold` reports the issue
+  the configured standalone state names as `current_issue_url` while its
+  phase is anything but `DONE` (`BLOCKED` and `FAILED` included), for
+  #182's admission to hold as `held:standalone-state`; an unreadable
+  standalone state is reported and holds nothing.
 
 ---
 
@@ -695,8 +755,9 @@ The parallel EPIC scheduler
 D5, D17.3) gives every issue a stable identity and a directory of its own,
 found again from the repository alone after a crash. #178 implements the
 identity, the layout and the files it owns (`src/autoforge/run_namespace.py`);
-the run lock, the claim, the scheduler and its workers are #180–#183, so no
-command creates a namespace yet.
+#180 the run lock and the ownership guards (Locking, above); the claim, the
+scheduler and its workers are #181–#183, so no command creates a namespace
+yet.
 
 - **RunKey** is `(repository_id, issue_number)`: GitHub's numeric
   repository id and the issue number, both positive integers, rendered
@@ -709,7 +770,7 @@ command creates a namespace yet.
 
   ```text
   <git common dir>/autoforge/scheduler/issues/<n>/
-      run.lock         reserved: L2 (#180) creates it
+      run.lock         L2 (#180): created by its first acquisition, never removed
       binding.json     autoforge.run-binding/1 (below)
       claim.json       reserved: the scheduler claim (#181)
       state/           an ordinary state directory: state.json, logs/<run-id>/,
@@ -795,7 +856,8 @@ command creates a namespace yet.
   run's state, and judge the directory they bind again.
   `status` reads such a state directory; `unblock` acts on it under the
   controller lock, as today, and then names `epic resume` rather than a
-  standalone `resume`. A dry run is not refused: it takes no lock and runs
+  standalone `resume`; the forward guard (Locking, above) exempts that
+  namespace's own issue, and refuses an issue another namespace owns. A dry run is not refused: it takes no lock and runs
   no git, so it has no coordination root, and it writes nothing. LOCAL's
   default state directory (`<git dir>/autoforge/state`) is not inside the
   scheduler root and is unaffected.

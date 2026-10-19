@@ -25,6 +25,7 @@ from autoforge.git_transport import (
     GitTransport,
 )
 from autoforge.github import WorkflowJob, WorkflowRunJobs
+from autoforge.locking import SharedGitLock
 from autoforge.premerge import (
     commit_is_local,
     describe_definition_difference,
@@ -238,6 +239,7 @@ def _transport(tmp_path: Path, local: Path, origin: Path) -> GitTransport:
         remote=GitRemote(url=f"file://{origin}"),
         gh_command=str(gh),
         in_base_history=no_walk,
+        git_lock=lambda op: SharedGitLock(local / ".git", operation=op),
     )
 
 

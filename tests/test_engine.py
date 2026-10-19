@@ -43,6 +43,7 @@ from autoforge.git_transport import (
     LOCAL_GIT_ENV_ALLOWLIST,
     LOCAL_GIT_SWITCHES,
     NETWORK_GIT_ENV_ALLOWLIST,
+    NO_AUTO_MAINTENANCE,
     GitRemote,
 )
 from autoforge.github import (
@@ -6980,6 +6981,40 @@ def test_update_epic_rejects_casing_variants_of_the_current_issue(
     _assert_not_switched(eng, fake_github, None)
 
 
+def test_update_epic_rejects_a_scheduler_owned_next_issue_without_querying_it(
+    tmp_state_dir, fake_github
+):
+    """ADR 0008 D17.2 (#180): a standalone engine's ownership predicate is one
+    more local rejection fact, so a selection a scheduler namespace owns takes
+    the bounded rejection path and GitHub is never asked about it."""
+    fake_github.add_issue(ISSUE3, "Owned by a scheduler worker")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    asked: list[int] = []
+
+    def owner(number: int) -> str:
+        asked.append(number)
+        return "its scheduler namespace holds a state (phase REVIEW)" if number == 3 else ""
+
+    eng.issue_ownership = owner
+    with pytest.raises(
+        VerificationError,
+        match=r"issues/3 is owned by the parallel EPIC scheduler: its scheduler namespace "
+        r"holds a state \(phase REVIEW\)\. .*'autoforge epic archive'.*selection 1/2",
+    ):
+        eng.step()
+    assert asked == [3]
+    _assert_not_switched(eng, fake_github, None)
+
+
+def test_update_epic_without_an_ownership_predicate_checks_none(tmp_state_dir, fake_github):
+    """A worker engine (and a library caller) is given no predicate."""
+    fake_github.add_issue(ISSUE3, "Next")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    assert eng.issue_ownership is None
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    assert load_state(eng.paths.state_file).current_issue_url == ISSUE3
+
+
 def test_update_epic_accepts_a_casing_variant_of_a_valid_next_issue(tmp_state_dir, fake_github):
     """Case-insensitivity must not over-reject: #3 spelled with another casing is still #3."""
     fake_github.add_issue(ISSUE3, "Next")
@@ -10889,7 +10924,7 @@ def test_worktree_creation_runs_no_repository_hook_and_holds_no_credential(
     assert _git(decoy, "worktree", "list", "--porcelain").count("worktree ") == 1
 
     run = [r.command[1 + len(LOCAL_GIT_SWITCHES) :] for r in requests if r.command[0] == "git"]
-    assert ["worktree", "add", "--detach", str(expected), "HEAD"] in run
+    assert [*NO_AUTO_MAINTENANCE, "worktree", "add", "--detach", str(expected), "HEAD"] in run
     # The registry is read without git (#223): `git worktree list` follows a
     # link at any listed worktree's HEAD.
     assert not any(cmd[:2] == ["worktree", "list"] for cmd in run)

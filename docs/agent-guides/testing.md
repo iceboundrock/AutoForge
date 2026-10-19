@@ -202,6 +202,40 @@ High-priority coverage includes:
   `resume` also before a LOCAL run's state is looked for), while `status`
   reads it, `unblock` acts on it, a dry run writes nothing and a sibling
   directory is not refused
+- lock domains (#180, ADR 0008 D9.2, D10–D12, D17.2,
+  `tests/test_lock_domains.py`, `tests/test_shared_git.py`,
+  `tests/test_ownership.py`, `tests/test_cli.py`): real child processes
+  talking over pipes, never a sleep for correctness. L0: the standalone
+  release still unlocks; `share` switches to close-only before a spawn; a
+  scheduler stand-in that returns, raises or is SIGKILLed leaves L0 and L2
+  with its surviving worker until the worker exits; adoption needs the
+  fresh-descriptor proof and refuses a descriptor that holds nothing, names
+  another object, is not open or is reached through a link. L2: a held lock
+  is `IssueBusy` at once, it is handed to exactly one child and released by
+  close only, the probe creates nothing and collides only with an
+  acquisition; a link, a FIFO, a directory or a hard link at `run.lock` or
+  `git.lock` (or a link above them) is refused untouched; SIGKILL releases
+  every lock with nothing to clean. L1: a waiter proceeds once the holder
+  releases, its bounded wait expires as `GitLockTimeout`, and the bound
+  covers every guarded operation; the L1 holder takes no lock, calls no
+  GitHub, saves nothing and launches nothing; 1000 randomized acquisitions
+  in order from four processes never deadlock and admit one holder at a
+  time. The scheduler's filesystem refusal (faked `statfs`: NFS, CIFS,
+  SMB2, 9p, FUSE, Ceph and macOS names refused; ext4, xfs, btrfs, tmpfs and
+  apfs accepted; a lock file on NFS below an ext4 root refused) and the
+  real `statfs`. No launch inherits a lock descriptor. With real git
+  (D12.5): concurrent worktree creation, fetches and an import beside a
+  read-only export hold L1 in disjoint sections and leave `git fsck --full`
+  clean; agents' concurrent commits and sandbox directories take no L1;
+  the installed git repacks after a fetch unless automatic maintenance is
+  off; every git write in the source is a guarded section. The ownership
+  guards: `run` (also `--force`, before the quarantine), `step`, `resume`
+  and `unblock` refuse an issue whose namespace holds a state (a corrupt
+  one included), whose run lock is live or whose namespace cannot be read,
+  writing nothing; `unblock` of a namespace's own state dir is exempt; a
+  `next_issue_url` the predicate refuses takes the bounded rejection path;
+  the reverse read holds every phase but `DONE` and reports an unreadable
+  state
 
 ### Transitions
 

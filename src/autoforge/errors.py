@@ -95,6 +95,62 @@ class LockError(AutoForgeError):
     """Another controller instance holds the repository lock."""
 
 
+class IssueBusy(LockError):
+    """An issue's run lock (L2) is held by another process (ADR 0008 D11.1, #180).
+
+    L2 is only ever taken non-blocking, so a held one is this refusal at
+    once, never a wait.
+    """
+
+
+class LockProofError(LockError):
+    """An inherited lock descriptor was not proven to hold its lock (ADR 0008 D9.2, #180).
+
+    The descriptor names another object than the expected one, or nothing
+    holds the expected object's lock; nothing was acquired or released.
+    """
+
+
+class NetworkFilesystemError(LockError):
+    """A scheduler lock lies on a filesystem whose ``flock`` is not a local kernel lock.
+
+    NFS, CIFS/SMB, 9p, AFS, cluster filesystems and every FUSE filesystem
+    (ADR 0008 D11.4, #180): the live-ownership proof depends on local locks,
+    so scheduler mode refuses them. Standalone commands never check.
+    """
+
+
+class SchedulerOwnedIssueError(ConfigurationError):
+    """A standalone command was asked to act on an issue a scheduler namespace owns.
+
+    ADR 0008 D17.2's forward guard (#180): the namespace holds a state, a
+    live worker holds its run lock, or the namespace cannot be read
+    (fail-closed), so only the scheduler continues it until ``autoforge epic
+    archive`` releases it. Nothing was read past the guard and nothing was
+    written.
+    """
+
+
+class GitLockTimeout(AutoForgeError):
+    """The shared-Git lock (L1) was not obtained within its bounded wait (ADR 0008 D11.3).
+
+    Transient. Each operation L1 guards turns it into its own failure (a
+    fetch's :class:`GitTransportError`, an import's failure, a worktree
+    creation's :class:`VerificationError`) and is handled exactly as that
+    operation failing; it is never a :class:`LockError` exit and never
+    retried in place.
+    """
+
+
+class LockOrderError(AutoForgeError):
+    """A lock was taken out of the order L0 -> L2 -> L1, or work was done under L1.
+
+    ADR 0008 D11.2's debug assertion (#180): the holder of the shared-Git
+    lock acquires no lock, invokes no agent, calls no GitHub and saves no
+    state. Always a controller bug; never retried.
+    """
+
+
 class ExecutionError(AutoForgeError):
     """Agent/CLI subprocess failed (non-zero exit, spawn failure, ...)."""
 

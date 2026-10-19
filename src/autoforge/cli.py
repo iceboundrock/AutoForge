@@ -64,8 +64,10 @@ from .evidence import (
     record_summary,
 )
 from .local_workspace import init_feature_file
+from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
 from .redaction import redact, redact_argv, redact_dict
 from .replan_txn import ReplanTransaction
+from .run_namespace import namespace_issue_of_state_dir
 from .state import AutoForgeState
 from .transitions import TERMINAL_PHASES, Phase, WorkflowMode
 
@@ -408,6 +410,29 @@ def _bind_existing_run(engine: ControllerEngine) -> None:
         engine.paths = local
 
 
+def _guard_scheduler_ownership(
+    engine: ControllerEngine, state: AutoForgeState, command: str
+) -> None:
+    """ADR 0008 D17.2's forward guard, under L0 and before anything is written.
+
+    Refuses (``SchedulerOwnedIssueError``, exit 2) when a scheduler
+    namespace owns the issue ``command`` would act on, the run's
+    ``current_issue_url``, then hands the engine the same predicate, which
+    ``_verify_issue_selectable`` applies to every issue it is asked about
+    (``next_issue_url`` included). ``unblock`` of a namespace's own state
+    directory exempts that namespace. LOCAL runs name no issue and are not
+    checked.
+    """
+    if state.mode is WorkflowMode.LOCAL:
+        return
+    root = engine.coordination_root()
+    exempt = (
+        namespace_issue_of_state_dir(engine.paths.state_dir, root) if command == "unblock" else None
+    )
+    refuse_scheduler_owned_issue(root, state.current_issue_url, command, exempt_issue=exempt)
+    engine.issue_ownership = standalone_ownership_predicate(root, exempt_issue=exempt)
+
+
 def _bind_standalone_run(engine: ControllerEngine, args, command: str) -> None:
     """:func:`_bind_existing_run` for a standalone ``step`` or ``resume`` (ADR 0008 D17.3).
 
@@ -613,6 +638,9 @@ def cmd_run(args) -> int:
             return rc
         engine.new_run(args.epic, args.issue)
         assert engine.state is not None
+        # A scheduler-owned issue is refused before anything is written
+        # (ADR 0008 D17.2): no quarantine, no state, no run log.
+        _guard_scheduler_ownership(engine, engine.state, "run")
         # What later commands of the run are checked against (#219).
         engine.record_run_configuration()
         if corrupt:
@@ -718,6 +746,7 @@ def cmd_step(args) -> int:
     # could already have been replaced by another controller.
     with engine.locked():
         state = engine.load()
+        _guard_scheduler_ownership(engine, state, "step")
         if state.phase not in TERMINAL_PHASES:
             _check_configuration(engine, args, "step", dry_run=False)
         _show_progress(engine)
@@ -744,6 +773,7 @@ def cmd_resume(args) -> int:
     # lock could already have been replaced by another controller.
     with engine.locked():
         state = engine.load()
+        _guard_scheduler_ownership(engine, state, "resume")
         rc = _resume_holding_state(engine, state, args.allow_merge)
         if rc is not None:
             return rc
@@ -788,6 +818,7 @@ def cmd_unblock(args) -> int:
     # decision: a refused unblock leaves it in place.
     with engine.locked():
         state = engine.load()
+        _guard_scheduler_ownership(engine, state, "unblock")
         if state.phase == Phase.BLOCKED:
             _check_configuration(engine, args, *words, dry_run=False)
         outcome = engine.unblock(args.reason, approve_action=approve, decline_action=decline)

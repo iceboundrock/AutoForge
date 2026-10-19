@@ -1097,6 +1097,13 @@ with the rationale recorded here, before #180 merges.
 | L1 writes run with automatic maintenance off | `test_l1_writes_disable_automatic_maintenance` |
 | Every call site of a common-dir write holds L1 | `test_every_common_dir_write_holds_l1` |
 
+Every claim above is backed by its test (`tests/test_shared_git.py`, and
+`tests/test_lock_domains.py` for the descriptors), so #180 removed none. On
+git 2.56, a fetch into a store past `gc.autoPackLimit` repacks it unless
+automatic maintenance is off (either option alone already stops it; both
+are given), while `worktree add` and `index-pack` start no maintenance
+either way and carry the options all the same.
+
 ### 2.13 Stale-worker fencing before controller effects (decision 13)
 
 **D13.1 (documentation only).** **Invariant:** a worker whose scheduler
@@ -1393,11 +1400,15 @@ complete, or write to GitHub.
 configuration gate and #211's acceptance actions. No existing state is
 migrated. **Exclusion in time** is L0 (D10).
 
-**D17.2 (#181).** **Exclusion in ownership.**
+**D17.2 (#180, #181).** **Exclusion in ownership.**
 
 - **Forward guard: a standalone run against a scheduler-owned issue.**
   - A namespace that has an open claim or any `state/state.json` owns its
-    issue until `epic archive` releases it.
+    issue until `epic archive` releases it. So does one whose run lock a
+    live owner holds (the D8.3 probe), and one that cannot be read
+    (fail-closed). #180 implements the state and run-lock halves and the
+    reverse guard's read (`ownership.py`); #181 adds the open-claim half
+    with the claim schema.
   - A standalone controller refuses to bind or continue an issue that a
     namespace owns, whatever that state's phase. A scheduler-`BLOCKED` or
     `READY_FOR_MERGE` issue therefore never gets a second, standalone
@@ -1575,8 +1586,8 @@ certificates (#170–#175) are consumed, not changed.
 |---|---|---|
 | #178 | run identities and namespaces | D2.2 step 5 (the binding), D5.1–D5.5, D17.3 |
 | #179 | dependency snapshots and the ready set | D2.2 steps 1 and 4, D2.5, D3.1–D3.6, D4.1, D4.2, D4.4 |
-| #180 | lock domains | D2.2 step 2, D8.3 (the probe), D8.4, D9.2 step 1 (`ControllerLock.adopt`), D10.2–D10.4, D11.1, D11.3, D11.4, D12.1, D12.3, D12.5 |
-| #181 | scheduler claims and restart reconciliation | D2.2 steps 3 and 5 (the claim), D6.1–D6.3, D7.1–D7.3, D8.2, D14.1–D14.5, D15.1, D17.2; the claim closure of D17.4 |
+| #180 | lock domains | D2.2 step 2, D8.3 (the probe), D8.4, D9.2 step 1 (`ControllerLock.adopt`), D10.2–D10.4, D11.1, D11.3, D11.4, D12.1, D12.3, D12.5; D17.2's state and run-lock halves of the forward guard and the reverse guard's read |
+| #181 | scheduler claims and restart reconciliation | D2.2 steps 3 and 5 (the claim), D6.1–D6.3, D7.1–D7.3, D8.2, D14.1–D14.5, D15.1, D17.2 (the open-claim half); the claim closure of D17.4 |
 | #182 | the bounded worker supervisor | D2.2 (the orchestration) and its step 6, D2.3, D4.3, D9.1–D9.7, D13.3, D15.3, D16.1, D16.3, D16.4, D18.3, D18.4 |
 | #183 | `epic` commands and end-to-end recovery tests | D8.3 (its use in `epic status`), D9.8, D14.4 (the commands), D14.5 (end to end), the `epic stop` command of D16.4, D17.4 |
 | documentation only | | D1.1, D1.2, D2.1, D2.4, D7.4, D8.1, D8.5, D10.1, D10.5, D10.6, D11.2, D12.2, D12.4, D13.1, D13.2, D13.4, D15.2, D16.2, D16.5, D17.1, D17.5 |

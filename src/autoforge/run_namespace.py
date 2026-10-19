@@ -35,7 +35,9 @@ own, found again from the repository alone after a crash:
 * :func:`archive_issue_state` moves ``state/state.json`` aside with the
   link-then-unlink primitive of ``run --force``'s quarantine.
 * :func:`check_standalone_state_dir` is the standalone commands' refusal of
-  a state directory inside the scheduler root (D17.3).
+  a state directory inside the scheduler root (D17.3), and
+  :func:`namespace_issue_of_state_dir` names the namespace whose own state
+  directory ``unblock`` acts on (the forward guard exempts it, D17.2).
 
 Nothing here takes a lock, creates a claim or reads GitHub: the caller
 supplies the ids (#179), holds the issue's L2 for a write (#180), and decides
@@ -762,6 +764,26 @@ def inside_scheduler_root(path: str | Path, coordination_root: str | Path) -> bo
     resolved = Path(os.path.realpath(path))
     root = Path(os.path.realpath(scheduler_root(coordination_root)))
     return resolved == root or root in resolved.parents
+
+
+def namespace_issue_of_state_dir(
+    state_dir: str | Path, coordination_root: str | Path
+) -> int | None:
+    """The issue whose namespace ``state_dir`` is the state directory of, else ``None``.
+
+    Decided on resolved paths, like :func:`inside_scheduler_root`: only
+    ``<scheduler root>/issues/<n>/state`` itself, with ``<n>`` a canonical
+    decimal issue number, names a namespace. ``unblock`` acting on that
+    directory exempts issue ``<n>`` from the forward guard (ADR 0008 D17.2).
+    """
+    resolved = Path(os.path.realpath(state_dir))
+    issues = Path(os.path.realpath(scheduler_root(coordination_root))) / ISSUES_DIRNAME
+    if resolved.name != STATE_DIRNAME or resolved.parent.parent != issues:
+        return None
+    name = resolved.parent.name
+    if not _ISSUE_DIR_RE.fullmatch(name) or int(name) > MAX_ID:
+        return None
+    return int(name)
 
 
 def check_standalone_state_dir(

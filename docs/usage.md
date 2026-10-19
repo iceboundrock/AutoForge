@@ -458,13 +458,22 @@ redacted. What it reads depends on the command:
   error that says so; point `--state-dir` at another filesystem.
 - **Repository lock:** `<repo>/.git/autoforge/controller.lock`, the same
   file for every `--state-dir`, subdirectory and linked worktree of one
-  checkout. A second controller exits with `LockError`.
+  checkout. A second controller exits with `LockError`, whose message adds
+  that an AutoForge scheduler or its surviving workers may hold it.
+  `<repo>/.git/autoforge/git.lock` is held for a moment around each
+  controller write to the shared git data (a fetch, the agent worktree's
+  creation, the import of an agent's objects); a controller that waited too
+  long for it reports that operation as failed, and `resume` tries again.
 - **Scheduler namespaces:** `<repo>/.git/autoforge/scheduler/` belongs to
   the parallel EPIC scheduler (ADR 0008; its commands are still being
   built): one directory per issue, with its own state. `run`, `step`,
   `resume` and `local run` refuse a `--state-dir` or `state_dir` that
   resolves inside it (exit 2, before the lock is taken); `status` reads such
-  a state directory and `unblock` acts on it. Layout:
+  a state directory and `unblock` acts on it. An issue whose namespace
+  holds a state, or whose run lock a live worker holds, belongs to the
+  scheduler: `run`, `step`, `resume` and `unblock` refuse to act on it
+  (exit 2, nothing written) until `autoforge epic archive` releases it, and
+  a sequential run never selects it as its next issue. Layout:
   [State and recovery: per-issue scheduler namespaces](agent-guides/state-and-recovery.md#per-issue-scheduler-namespaces).
 - **Agent worktrees:** `<repo>/.git/autoforge/worktrees/<issue-number>` (or
   under `execution.worktree_dir`), added detached at the checkout's HEAD the
@@ -749,8 +758,10 @@ ownership or discard uncommitted user changes.
   exit 2 and never overwrite it. `run --force` moves it aside as
   `state.json.corrupt-<timestamp>` (never deletes it) and starts a new run;
   see [State and recovery](agent-guides/state-and-recovery.md#persistent-state).
-- **`LockError`:** another controller holds the repository lock, or the lock
-  entry under `.git/autoforge/` is not a regular file with a single name; see
+- **`LockError`:** another controller holds the repository lock (a
+  standalone command, or a parallel EPIC scheduler or one of its surviving
+  workers), or a lock entry under `.git/autoforge/` is not a regular file
+  with a single name; see
   [State and recovery: locking](agent-guides/state-and-recovery.md#locking).
 - **A replan was interrupted:** the phase is still `REPLAN_REEXECUTE`.
   `autoforge status` prints the transaction id, stage and both PRs, and

@@ -4,6 +4,9 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -11,8 +14,9 @@ from autoforge import cli
 from autoforge.engine import ControllerEngine
 from autoforge.errors import GitHubError, LockError
 from autoforge.executor import ExecutionResult, execute
-from autoforge.locking import ControllerLock, repository_lock_path
+from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
+from autoforge.run_namespace import issue_namespace
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
 from autoforge.transitions import Phase, WorkflowMode
 from tests.conftest import (
@@ -2051,6 +2055,193 @@ def test_a_state_dir_beside_the_scheduler_root_is_not_refused(tmp_path, capsys, 
         assert cli.main([*argv, "--max-steps", "1"]) == 0
         capsys.readouterr()
         assert load_state(sd / "state.json").step_count == 1
+
+
+# -- the forward guard: an issue a scheduler namespace owns (#180, ADR 0008 D17.2) -----
+# Holds L0 the way a scheduler does (shared, close-only) until its stdin ends.
+_HOLD_L0 = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from autoforge.locking import ControllerLock
+
+with ControllerLock(Path(sys.argv[2]) / "autoforge" / "controller.lock") as lock:
+    lock.share()
+    print("held", flush=True)
+    sys.stdin.read()
+"""
+
+
+def _own_issue_by_state(tmp_path, n: int = 2) -> Path:
+    """Scheduler namespace ``n`` holds a state for issue ``n`` (ISSUE is #2)."""
+    sd = _namespace_state_dir(tmp_path, n)
+    sd.mkdir(parents=True)
+    save_state(_other_controller_state(f"af-namespace-{n}"), sd / "state.json")
+    return sd
+
+
+def _assert_owned(capsys, fakes, command: str, reason: str, provider_calls: int = 0) -> None:
+    err = capsys.readouterr().err
+    assert f"autoforge: error: '{command}' refuses issue {ISSUE}: " in err
+    assert reason in err
+    assert "'autoforge epic archive <epic> 2' releases it" in err
+    assert "Nothing was written." in err and "Traceback" not in err
+    assert len(fakes["provider"].calls) == provider_calls
+
+
+@pytest.mark.parametrize(
+    "owned_by", ["state", "corrupt state", "live run lock", "unreadable namespace"]
+)
+def test_run_refuses_an_issue_a_scheduler_namespace_owns(
+    tmp_path, capsys, monkeypatch, fakes, owned_by
+):
+    """Under L0, before a state, a quarantine or a run log is written; fail-closed."""
+    monkeypatch.chdir(tmp_path)
+    common = Path(os.path.realpath(tmp_path / ".git"))
+    namespace = issue_namespace(common, 2)
+    lock = None
+    if owned_by == "state":
+        _own_issue_by_state(tmp_path)
+        reason = "holds a state (phase ANALYZE_EXECUTE)"
+    elif owned_by == "corrupt state":
+        namespace.state_dir.mkdir(parents=True)
+        namespace.state_file.write_text("{ not json")
+        reason = "holds a state that cannot be read"
+    elif owned_by == "live run lock":
+        lock = IssueRunLock(namespace).acquire()
+        reason = "a live scheduler worker holds its run lock"
+    else:
+        namespace.directory.mkdir(parents=True)
+        namespace.binding_file.write_text("{ not json")
+        reason = "cannot be read"
+    before = _files(namespace.directory)
+    sd = tmp_path / ".autoforge"
+    try:
+        assert cli.main(_run_argv(sd)) == 2
+    finally:
+        if lock is not None:
+            lock.release()
+    _assert_owned(capsys, fakes, "run", reason)
+    assert fakes["gh"].calls == []
+    assert not (sd / "state.json").exists() and not (sd / "logs").exists()
+    assert _files(namespace.directory) == before
+    ControllerLock(repository_lock_path(tmp_path)).acquire().release()  # released
+
+
+def test_run_force_refuses_an_owned_issue_before_quarantining(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    _own_issue_by_state(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    (sd / "state.json").write_text("{ corrupt")
+    before = _files(sd)
+    assert cli.main([*_run_argv(sd), "--force"]) == 2
+    _assert_owned(capsys, fakes, "run", "holds a state")
+    assert _files(sd) == before
+
+
+@pytest.mark.parametrize("command", ["step", "resume", "unblock"])
+def test_continuing_a_standalone_run_on_an_owned_issue_is_refused(
+    tmp_path, capsys, monkeypatch, fakes, command
+):
+    """The standalone state names an issue a namespace has owned since."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    blocked = command == "unblock"
+    state = _other_controller_state(
+        "af-standalone",
+        Phase.BLOCKED if blocked else Phase.ANALYZE_EXECUTE,
+        block_reason="spec unclear" if blocked else "",
+    )
+    save_state(state, sd / "state.json")
+    _own_issue_by_state(tmp_path)
+    before = _files(sd)
+    argv = ["--state-dir", str(sd), command, *(["--reason", "clarified"] if blocked else [])]
+    assert cli.main(argv) == 2
+    _assert_owned(capsys, fakes, command, "holds a state")
+    assert fakes["gh"].calls == []
+    assert _files(sd) == before
+
+
+def test_unblock_of_a_namespace_state_dir_is_exempt_for_its_own_issue_only(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    monkeypatch.chdir(tmp_path)
+    standalone = str(tmp_path / ".autoforge")
+    _block_run(tmp_path, capsys, fakes, standalone)
+    calls = len(fakes["provider"].calls)
+    own = _namespace_state_dir(tmp_path, 2)
+    other = _namespace_state_dir(tmp_path, 3)
+    for sd in (own, other):
+        sd.mkdir(parents=True)
+        shutil.copy2(os.path.join(standalone, "state.json"), sd / "state.json")
+    unblock = ["unblock", "--reason", "clarified"]
+
+    # Namespace 2 owns issue 2: neither the standalone state nor namespace 3's
+    # copy may unblock it.
+    for sd in (standalone, str(other)):
+        assert cli.main(["--state-dir", sd, *unblock]) == 2
+        _assert_owned(capsys, fakes, "unblock", "holds a state (phase BLOCKED)", calls)
+        assert load_state(os.path.join(sd, "state.json")).phase == Phase.BLOCKED
+
+    # Its own state directory: exempt.
+    assert cli.main(["--state-dir", str(own), *unblock]) == 0
+    assert "BLOCKED -> ANALYZE_EXECUTE" in capsys.readouterr().out
+    assert load_state(own / "state.json").phase == Phase.ANALYZE_EXECUTE
+
+
+def test_the_cli_hands_a_standalone_engine_the_ownership_predicate(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """What `_verify_issue_selectable` applies to a sequential run's next issue."""
+    monkeypatch.chdir(tmp_path)
+    _own_issue_by_state(tmp_path, 3)
+    guarded = []
+    real = cli._guard_scheduler_ownership
+
+    def spy(engine, state, command):
+        real(engine, state, command)
+        guarded.append(engine)
+
+    monkeypatch.setattr(cli, "_guard_scheduler_ownership", spy)
+    fakes["handler"] = implement
+    assert cli.main(_run_argv(tmp_path / ".autoforge")) == 0
+    (engine,) = guarded
+    assert engine.issue_ownership is not None
+    assert engine.issue_ownership(2) == ""
+    assert "holds a state" in engine.issue_ownership(3)
+
+
+@pytest.mark.parametrize("command", ["run", "unblock"])
+def test_a_scheduler_holding_the_controller_lock_excludes_a_standalone_command(
+    tmp_path, capsys, monkeypatch, fakes, command
+):
+    """L0 excludes them in time: a scheduler (or its surviving workers) holds it."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    if command == "unblock":
+        _block_run(tmp_path, capsys, fakes, sd)
+    before = _files(sd) if os.path.exists(sd) else None
+    calls = len(fakes["provider"].calls)
+    src = Path(__file__).resolve().parents[1] / "src"
+    common = os.path.realpath(tmp_path / ".git")
+    scheduler = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_L0, str(src), common],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert scheduler.stdout is not None and scheduler.stdout.readline() == "held\n"
+        argv = _run_argv(sd) if command == "run" else ["--state-dir", sd, "unblock"]
+        assert cli.main(argv + (["--reason", "clarified"] if command == "unblock" else [])) == 2
+    finally:
+        scheduler.communicate("", timeout=60)
+    err = capsys.readouterr().err
+    assert "an AutoForge scheduler or its surviving workers may hold it" in err
+    assert len(fakes["provider"].calls) == calls
+    assert (_files(sd) if os.path.exists(sd) else None) == before
 
 
 # -- unblock (issue #5) -------------------------------------------------------------

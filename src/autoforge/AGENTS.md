@@ -91,7 +91,12 @@ config_fingerprint.py  the recorded configuration of a REMOTE run (profile routi
                     agent worktree root) that step/resume/unblock compare (#219)
 local_workspace.py  LOCAL mode working-tree verification
 safefs.py           filesystem capability boundary for every controller write
-locking.py          repository lock keyed by the git common dir
+locking.py          the lock domains of ADR 0008 (#180): L0 (ControllerLock, keyed by the git
+                    common dir; shared and adopted close-only), L2 (IssueRunLock and its
+                    lock-free probe), L1 (SharedGitLock around each common-dir git write),
+                    the order assertion and the scheduler's filesystem refusal
+ownership.py        who may act on an issue (ADR 0008 D17.2, #180): the forward guard's
+                    ownership predicate and the reverse guard's standalone-state read
 redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
@@ -152,7 +157,8 @@ state.py, effects.py, evidence.py, certificate.py,
 run_contract.py, safefs.py, config_fingerprint.py,
 locking.py, errors.py,
 engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
-run_namespace.py, engine.py (namespace binding)   -> docs/agent-guides/state-and-recovery.md
+run_namespace.py, ownership.py, locking.py (lock
+domains), engine.py (namespace binding)           -> docs/agent-guides/state-and-recovery.md
                                                      + docs/adr/0008-parallel-epic-scheduler-
                                                      authority-run-identity-claims-and-locks.md
 providers.py, pi_rpc.py, claude_stream.py,
