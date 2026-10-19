@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -552,6 +553,62 @@ def test_supersede_compares_with_the_open_claim(common):
     assert before != ns.claim_file.read_bytes()  # only the close was written
 
 
+@pytest.mark.parametrize(
+    ("case", "found"),
+    [
+        ("blocked", "settled(terminal)"),
+        ("ready for merge", "settled(ready_for_merge)"),
+        ("handoff", "settled(handoff)"),
+        ("corrupt state", "uncertain(state-corrupt)"),
+        ("missing state", "uncertain(state-missing)"),
+        ("state of another epic", "uncertain(state-mismatch)"),
+    ],
+)
+def test_supersede_refuses_a_settled_or_uncertain_claim_and_leaves_the_file(common, case, found):
+    """D7.2: replacing an open claim requires the classification resumable, under L2."""
+    ns = _bind(common, 7)
+    if case == "missing state":
+        _save(ns, Phase.REVIEW)  # admitted with a state: present=true
+    claim = _spawned(ns, _open(ns))
+    if case == "blocked":
+        _save(ns, Phase.BLOCKED)
+    elif case == "ready for merge":
+        _save(ns, Phase.READY_FOR_MERGE)
+    elif case == "handoff":
+        _save(ns, Phase.MERGE)
+    elif case == "corrupt state":
+        ns.state_dir.mkdir()
+        ns.state_file.write_text("{ not json")
+    elif case == "missing state":
+        ns.state_file.unlink()
+    else:
+        _save(ns, Phase.REVIEW, epic_number=OTHER_EPIC.number)
+    assert str(_classify(ns, _expected(7))) == found
+    before = _tree(common)
+    with pytest.raises(SchedulerStateError, match=re.escape(f"is {found}")) as refused:
+        _open(ns, supersedes=claim, kind=ClaimKind.RESUME, state_ref=StateRef.absent())
+    assert not isinstance(refused.value, ClaimConflict)
+    assert "refusing to supersede generation 1" in str(refused.value)
+    assert _without(_tree(common), "run.lock") == _without(before, "run.lock")
+    assert _claims(ns).current == claim and _claims(ns).history == ()
+
+
+def test_supersede_replaces_a_resumable_in_progress_claim(common):
+    ns = _bind(common, 7)
+    claim = _spawned(ns, _open(ns))
+    _save(ns, Phase.FIX)
+    assert str(_classify(ns, _expected(7))) == "resumable(in-progress)"
+    resumed = _open(ns, supersedes=claim, kind=ClaimKind.RESUME)
+    claim_file = _claims(ns)
+    assert claim_file.current == resumed and resumed.generation == 2
+    assert resumed.state_ref.present and resumed.state_ref.settlement is Settlement.IN_PROGRESS
+    (superseded,) = claim_file.history
+    assert (superseded.claim, superseded.classification) == (
+        claim,
+        ClaimClassification.SUPERSEDED,
+    )
+
+
 def test_only_open_claim_closes_a_claim_as_superseded(common):
     ns = _bind(common, 7)
     claim = _open(ns)
@@ -1018,6 +1075,30 @@ def test_a_namespace_bound_to_another_epic_is_held_and_left_alone(common):
     assert _claims(ns).current == claim
     # Its own EPIC's reconciliation settles it.
     assert _item(_reconcile(common, OTHER_EPIC), 7).fact is LocalFact.HELD_SETTLED_NAMESPACE
+
+
+@pytest.mark.parametrize(
+    "bound",
+    [OTHER_EPIC, EpicRef(number=EPIC.number, issue_id=8_999)],
+    ids=["another epic", "this epic number with another id"],
+)
+def test_a_binding_of_another_repository_is_global_uncertainty_whatever_its_epic(common, bound):
+    """D14.3: the repository is checked before the binding's EPIC is."""
+    ns = _bind(common, 7, epic=bound, repository_id=REPO_ID + 1)
+    claim = _open(ns)
+    _bind(common, 8)
+    before = _tree(common)
+    report = _reconcile(common)
+    item = _item(report, 7)
+    assert item.fact is LocalFact.HELD_UNCERTAIN and item.closed is None
+    assert item.classification is not None
+    assert str(item.classification) == "uncertain(repository-mismatch)"
+    assert item.classification.open_claim == claim
+    assert f"repository_id {REPO_ID + 1}" in item.detail
+    assert not report.admissible and report.global_problems == (item.detail,)
+    assert str(_item(report, 8).classification) == "fresh"
+    assert _without(_tree(common), "run.lock") == _without(before, "run.lock")
+    assert _claims(ns).current == claim
 
 
 def test_the_callers_own_children_are_owned_without_taking_their_lock(common):

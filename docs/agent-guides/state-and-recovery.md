@@ -916,12 +916,16 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   scheduler just spawned, without L2 (the worker holds it), once. Each write
   compares `(claim_id, generation)` on disk with the caller's record first:
   a mismatch, or a slot already taken, is `ClaimConflict` and the file is
-  left as it is, so a stale claimant cannot finalize a newer generation. A
-  claim is written only over this namespace's own file: no binding, a claim
-  file that does not load, or one naming another run or EPIC than the
-  binding is refused. Writes are atomic (fsynced temporary, `replace`,
-  directory fsync) through `safefs` from the coordination root, so a claim
-  is durable before `open_claim` returns, before any worker exists.
+  left as it is, so a stale claimant cannot finalize a newer generation.
+  `open_claim(..., supersedes=)` and `close_unready` also classify the
+  namespace under the held L2 and refuse (`SchedulerStateError`, nothing
+  written) unless it is `resumable`: a settled or uncertain claim is never
+  replaced (D7.2). A claim is written only over this namespace's own file:
+  no binding, a claim file that does not load, or one naming another run or
+  EPIC than the binding is refused. Writes are atomic (fsynced temporary,
+  `replace`, directory fsync) through `safefs` from the coordination root,
+  so a claim is durable before `open_claim` returns, before any worker
+  exists.
 - **`scheduler.json`**, schema `autoforge.scheduler/1` (D6), at
   `<git common dir>/autoforge/scheduler/epics/<n>/scheduler.json`:
   `repository` {`owner`, `name`, `repository_id`}, `epic`, `invocation`
@@ -952,13 +956,14 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   admission, in ascending issue number. The caller's own children are
   `owned`; otherwise L2 is taken non-blocking and a held one is `owned`
   (`observed_live`) for this pass and never reclassified. Holding L2: a
-  namespace bound under another EPIC is `held:other-epic` and left alone; an
-  uncertain one keeps its claim open and is `held:uncertain` with its
-  reason; a settled one has its open claim closed `settled` and is
-  `held:settled-namespace`, never relaunched; resumable and fresh ones
-  contribute no local fact and resumable claims stay open, for admission's
-  supersession or `close_unready` (a snapshot no longer shows the issue
-  ready). A run lock that cannot be used is `uncertain(run-lock-unusable)`;
+  binding of another repository is global uncertainty whatever EPIC it
+  names (D14.3); a namespace of this repository bound under another EPIC
+  is `held:other-epic` and left alone; an uncertain one keeps its claim
+  open and is `held:uncertain` with its reason; a settled one has its open
+  claim closed `settled` and is `held:settled-namespace`, never relaunched;
+  resumable and fresh ones contribute no local fact and resumable claims
+  stay open, for admission's supersession or `close_unready` (a snapshot no
+  longer shows the issue ready). A run lock that cannot be used is `uncertain(run-lock-unusable)`;
   a binding of another repository, a run lock on a network filesystem, or a
   namespace listing that cannot be read is global uncertainty (the report
   is not `admissible`). It never spawns, writes a per-issue state or

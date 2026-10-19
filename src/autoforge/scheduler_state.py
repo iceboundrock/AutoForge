@@ -884,6 +884,25 @@ def _matching_current(namespace: IssueNamespace, claim_file: ClaimFile, claim: C
     return current
 
 
+def _require_resumable(namespace: IssueNamespace, refusal: str) -> Classification:
+    """The namespace's class, read under the caller's L2; refused unless ``resumable`` (D7.2).
+
+    Only a ``resumable`` claim is replaced (:func:`open_claim`) or closed
+    unready (:func:`close_unready`): a settled or uncertain one is refused
+    (:class:`~autoforge.errors.SchedulerStateError`) and the file is left as
+    it is.
+    """
+    read = read_namespace(namespace)
+    if read.absent:
+        raise ClaimConflict(f"{namespace.claim_file} does not exist; there is no open claim")
+    classification = classify(read.lookup, read.claim, expected=None)
+    if classification.kind is not ClassificationKind.RESUMABLE:
+        raise SchedulerStateError(
+            f"{refusal}; the namespace of issue {namespace.issue_number} is {classification}"
+        )
+    return classification
+
+
 def _close(
     namespace: IssueNamespace,
     claim_file: ClaimFile,
@@ -931,11 +950,14 @@ def open_claim(
 
     With ``supersedes=None`` it refuses (:class:`~autoforge.errors.ClaimConflict`)
     while ``current`` is set: at most one claim is open per issue. With
-    ``supersedes`` set to the open claim (a ``resumable`` one, D14.2), it
-    compares it with ``current`` and, in the same atomic write, closes it as
-    ``superseded`` and installs the new claim: the only way a claim is ever
-    closed so. The generation is ``next_generation``, which is then
-    incremented. The file is written and fsynced before this returns.
+    ``supersedes`` set to the open claim, it compares it with ``current``,
+    classifies the namespace under the held L2 and refuses
+    (:class:`~autoforge.errors.SchedulerStateError`, nothing written) unless
+    it is ``resumable`` (D7.2, D14.2): a settled or uncertain claim is never
+    replaced. Then, in the same atomic write, it closes it as ``superseded``
+    and installs the new claim: the only way a claim is ever closed so. The
+    generation is ``next_generation``, which is then incremented. The file
+    is written and fsynced before this returns.
     """
     _require_lock(namespace, lock, "open a claim")
     _check_type(kind, ClaimKind, "claim kind")
@@ -949,6 +971,11 @@ def open_claim(
             )
     else:
         current = _matching_current(namespace, claim_file, supersedes)
+        _require_resumable(
+            namespace,
+            f"refusing to supersede generation {current.generation}: only a resumable claim "
+            "is replaced",
+        )
     now = utcnow_iso()
     claim = Claim(
         claim_id=secrets.token_hex(16),
@@ -1062,15 +1089,7 @@ def close_unready(
     (:class:`~autoforge.errors.SchedulerStateError`) and left open.
     """
     _require_lock(namespace, lock, "close an unready claim")
-    read = read_namespace(namespace)
-    if read.absent:
-        raise ClaimConflict(f"{namespace.claim_file} does not exist; there is no claim to close")
-    classification = classify(read.lookup, read.claim, expected=None)
-    if classification.kind is not ClassificationKind.RESUMABLE:
-        raise SchedulerStateError(
-            f"close_unready closes only a resumable claim; the namespace of issue "
-            f"{namespace.issue_number} is {classification}"
-        )
+    classification = _require_resumable(namespace, "close_unready closes only a resumable claim")
     on_disk = classification.open_claim
     if on_disk is None or on_disk.identity != claim.identity:
         raise ClaimConflict(
@@ -1498,8 +1517,8 @@ class IssueReconciliation:
     ``fact`` is ``None`` for ``fresh`` and ``resumable``, which are
     evaluated like an issue without a namespace. ``classification`` is
     ``None`` where none ran: the caller's own child, a live owner, another
-    EPIC's namespace, or a run lock that cannot be taken. ``closed`` is the
-    claim reconciliation closed as ``settled``.
+    EPIC's namespace of this repository, or a run lock that cannot be taken.
+    ``closed`` is the claim reconciliation closed as ``settled``.
     """
 
     issue_number: int
@@ -1547,14 +1566,16 @@ def reconcile_epic(
     The caller holds L0. For each namespace, in ascending issue number: the
     caller's own unreaped children are skipped as ``owned``; L2 is taken
     non-blocking, and a held one is ``owned`` (``observed_live``) for this
-    pass; holding it, the namespace is read and classified. A namespace bound
-    to another EPIC is ``held:other-epic`` and left alone. An open claim of a
-    ``settled`` namespace is closed ``settled`` and the issue is
-    ``held:settled-namespace``; ``resumable`` and ``uncertain`` claims are
-    kept open (an admission's supersession, :func:`close_unready` or ``epic
-    archive`` closes them later); ``uncertain`` is ``held:uncertain``; L2 is
-    released by ``close``. It never spawns, never writes or quarantines a
-    per-issue state and never contacts GitHub.
+    pass; holding it, the namespace is read and classified. A namespace of
+    this repository bound to another EPIC is ``held:other-epic`` and left
+    alone; a binding of another repository is global uncertainty (D14.3),
+    whatever EPIC it names. An open claim of a ``settled`` namespace is
+    closed ``settled`` and the issue is ``held:settled-namespace``;
+    ``resumable`` and ``uncertain`` claims are kept open (an admission's
+    supersession, :func:`close_unready` or ``epic archive`` closes them
+    later); ``uncertain`` is ``held:uncertain``; L2 is released by
+    ``close``. It never spawns, never writes or quarantines a per-issue
+    state and never contacts GitHub.
     """
     _check_type(epic, EpicRef, "reconciled epic")
     _check_type(expected, ExpectedIdentity, "reconciliation's expected identity")
@@ -1621,8 +1642,12 @@ def _reconcile_held(
     if read.absent:
         return None
     lookup = read.lookup
-    if isinstance(lookup, NamespaceLookup) and lookup.binding is not None:
-        bound = lookup.binding.epic
+    binding = lookup.binding if isinstance(lookup, NamespaceLookup) else None
+    # A binding of another repository is global uncertainty whatever EPIC it
+    # names (D14.3), so only this repository's bindings are compared by EPIC:
+    # classify reports the other repository's, and it is added to ``problems``.
+    if binding is not None and binding.run_key.repository_id == expected.repository_id:
+        bound = binding.epic
         if bound.number != epic.number:
             return IssueReconciliation(
                 number,

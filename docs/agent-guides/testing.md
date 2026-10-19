@@ -254,10 +254,12 @@ High-priority coverage includes:
   linked file is refused untouched, as is a `claims` field in
   `scheduler.json`; only a corrupt `scheduler.json` is quarantined. A claim
   is fsynced before `open_claim` returns, one is open per issue,
-  generations are monotonic, a supersede is exactly one write and compares
-  with the open claim, the closing rule is decided on the claim on disk,
-  `detail` is redacted and bounded, `record_worker` records once, and a
-  writer of generation 3 cannot close, record or finalize generation 4.
+  generations are monotonic, a supersede is exactly one write, compares
+  with the open claim and replaces only a `resumable` one (a settled or
+  uncertain claim is refused, the file untouched), the closing rule is
+  decided on the claim on disk, `detail` is redacted and bounded,
+  `record_worker` records once, and a writer of generation 3 cannot close,
+  record or finalize generation 4.
   Every claim write needs the issue's held L2 and is refused under L1, and
   only over its own namespace's claim file. Every row of #181's crash-window
   table, with real child processes holding L2 (and L0) through `pass_fds`:
@@ -272,9 +274,10 @@ High-priority coverage includes:
   windows. Each uncertain trigger keeps its claim open and holds the issue
   with its reason; another EPIC's namespace is `held:other-epic` and left
   alone; reconciliation skips its own children, never spawns or writes a
-  state, and reports a repository mismatch, a network-filesystem run lock
-  and an unlistable root as global; finalization's matrix (exit status
-  never decides); `archive_claim` closes, moves aside and is idempotent;
+  state, and reports a repository mismatch (whatever EPIC the binding
+  names), a network-filesystem run lock and an unlistable root as global;
+  finalization's matrix (exit status never decides); `archive_claim`
+  closes, moves aside and is idempotent;
   `open_claims_for_epic` fails closed. Every phase has exactly one
   settlement and a durable pause comes first; an open claim without a
   state owns its issue for `run`, a claim file of closed claims owns
