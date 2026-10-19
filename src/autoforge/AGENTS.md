@@ -96,7 +96,13 @@ locking.py          the lock domains of ADR 0008 (#180): L0 (ControllerLock, key
                     lock-free probe), L1 (SharedGitLock around each common-dir git write),
                     the order assertion and the scheduler's filesystem refusal
 ownership.py        who may act on an issue (ADR 0008 D17.2, #180): the forward guard's
-                    ownership predicate and the reverse guard's standalone-state read
+                    ownership predicate (an open scheduler claim included, #181) and the
+                    reverse guard's standalone-state read
+scheduler_state.py  the scheduler's durable bookkeeping (ADR 0008 D6, D7, D14, #181):
+                    claim.json (claims, generations, the closing rule, compare-and-write
+                    under L2), scheduler.json, the pure restart classification,
+                    reconciliation, worker finalization and open-claim queries; recovery
+                    data, never liveness; no spawn, no GitHub, no per-issue state write
 redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
@@ -158,7 +164,8 @@ run_contract.py, safefs.py, config_fingerprint.py,
 locking.py, errors.py,
 engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
 run_namespace.py, ownership.py, locking.py (lock
-domains), engine.py (namespace binding)           -> docs/agent-guides/state-and-recovery.md
+domains), scheduler_state.py,
+engine.py (namespace binding)                     -> docs/agent-guides/state-and-recovery.md
                                                      + docs/adr/0008-parallel-epic-scheduler-
                                                      authority-run-identity-claims-and-locks.md
 providers.py, pi_rpc.py, claude_stream.py,

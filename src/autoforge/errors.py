@@ -75,6 +75,31 @@ class NamespaceMismatch(NamespaceError):
         self.field = field
 
 
+class SchedulerStateError(StateError):
+    """A scheduler file cannot be used as asked (ADR 0008 D6, D7, #181).
+
+    Raised by :mod:`autoforge.scheduler_state` for a ``claim.json`` or a
+    ``scheduler.json`` that is not a valid document of its schema (an unknown
+    field or version, a missing field, an out-of-bound string or list, a
+    broken generation order), for a claim operation its closing rule refuses,
+    and for an operation called without the issue's run lock (L2). Nothing is
+    written when it is raised. A corrupt ``scheduler.json`` is the
+    scheduler's global uncertainty, a corrupt ``claim.json`` its issue's
+    ``uncertain``.
+    """
+
+
+class ClaimConflict(SchedulerStateError):
+    """``claim.json`` on disk is not what its writer expected (ADR 0008 D7.2, #181).
+
+    The ``(claim_id, generation)`` the caller holds is not the open claim on
+    disk, or the slot it means to fill is taken: a stale claimant, which can
+    never overwrite or finalize a newer generation. Classifies as
+    ``uncertain``; the file is left as it is, never overwritten to agree.
+    Distinct from :class:`ClaimConflictError`, which is about GitHub claims.
+    """
+
+
 class SchedulerStateDirError(ConfigurationError):
     """A standalone command was pointed at a state directory inside the scheduler root.
 

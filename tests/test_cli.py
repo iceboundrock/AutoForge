@@ -16,7 +16,8 @@ from autoforge.errors import GitHubError, LockError
 from autoforge.executor import ExecutionResult, execute
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
-from autoforge.run_namespace import issue_namespace
+from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
+from autoforge.scheduler_state import Admission, ClaimKind, StateRef, open_claim
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
 from autoforge.transitions import Phase, WorkflowMode
 from tests.conftest import (
@@ -2089,8 +2090,33 @@ def _assert_owned(capsys, fakes, command: str, reason: str, provider_calls: int 
     assert len(fakes["provider"].calls) == provider_calls
 
 
+def _own_issue_by_open_claim(namespace) -> None:
+    """Namespace #2 holds an open claim (#181) and no state: admitted, not yet started."""
+    write_binding(
+        namespace,
+        RunBinding(
+            run_key=RunKey(700_001, 2),
+            issue_id=9_002,
+            repository_owner="owner",
+            repository_name="repo",
+            epic=EpicRef(number=1, issue_id=8_001),
+            worktree_path="/work/autoforge/worktrees/2",
+            created_at="2026-10-18T00:00:00+00:00",
+        ),
+    )
+    with IssueRunLock(namespace) as lock:
+        open_claim(
+            namespace,
+            lock,
+            kind=ClaimKind.START,
+            invocation_id="0" * 32,
+            admission=Admission("a" * 64, "b" * 64, "2026-10-18T00:00:00+00:00"),
+            state_ref=StateRef.absent(),
+        )
+
+
 @pytest.mark.parametrize(
-    "owned_by", ["state", "corrupt state", "live run lock", "unreadable namespace"]
+    "owned_by", ["state", "corrupt state", "open claim", "live run lock", "unreadable namespace"]
 )
 def test_run_refuses_an_issue_a_scheduler_namespace_owns(
     tmp_path, capsys, monkeypatch, fakes, owned_by
@@ -2107,6 +2133,9 @@ def test_run_refuses_an_issue_a_scheduler_namespace_owns(
         namespace.state_dir.mkdir(parents=True)
         namespace.state_file.write_text("{ not json")
         reason = "holds a state that cannot be read"
+    elif owned_by == "open claim":
+        _own_issue_by_open_claim(namespace)
+        reason = "holds an open scheduler claim (generation 1, a start admission)"
     elif owned_by == "live run lock":
         lock = IssueRunLock(namespace).acquire()
         reason = "a live scheduler worker holds its run lock"

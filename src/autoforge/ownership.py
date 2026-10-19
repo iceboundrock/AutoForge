@@ -7,11 +7,13 @@ continue it.
 * **Forward guard.** A standalone controller refuses an issue a scheduler
   namespace owns. :func:`scheduler_ownership` is the predicate: a namespace
   owns its issue when it holds any ``state/state.json``, read with #178's
-  lookup (:func:`~autoforge.run_namespace.load_issue_namespace`), or when a
-  live owner holds its run lock (L2, the lock-free probe
-  :func:`~autoforge.locking.issue_run_lock_live`). #181 adds the open-claim
-  half once the claim schema exists. It fails closed: a namespace that
-  cannot be read, or a run lock that cannot be probed, owns its issue. The
+  lookup (:func:`~autoforge.run_namespace.load_issue_namespace`), when its
+  ``claim.json`` holds an open scheduler claim (#181,
+  :func:`~autoforge.scheduler_state.load_claim_file`), or when a live owner
+  holds its run lock (L2, the lock-free probe
+  :func:`~autoforge.locking.issue_run_lock_live`). It fails closed: a
+  namespace or a claim file that cannot be read (an unknown claim schema
+  included), or a run lock that cannot be probed, owns its issue. The
   CLI applies it under L0 to the issue ``run``, ``step``, ``resume`` and
   ``unblock`` would act on (:func:`refuse_scheduler_owned_issue`), and hands
   a standalone engine the same predicate
@@ -43,6 +45,7 @@ from .locking import issue_run_lock_live
 from .redaction import redact
 from .run_namespace import StateStatus, issue_namespace, load_issue_namespace
 from .safefs import SafeRoot
+from .scheduler_state import load_claim_file
 from .state import STATE_FILENAME, load_state
 from .transitions import Phase, WorkflowMode
 from .validation import parse_issue_url
@@ -62,10 +65,13 @@ def _bounded(text: str) -> str:
 def scheduler_ownership(coordination_root: str | Path, issue_number: int) -> str:
     """Why a scheduler namespace owns issue ``issue_number``; "" when none does.
 
-    The state half of ADR 0008 D17.2's ownership predicate (#180): the
-    namespace holds a state (loaded or not), or a live owner holds its run
-    lock. Fail-closed: a namespace whose binding or directories cannot be
-    read, or whose run lock cannot be probed, owns its issue. Read-only.
+    ADR 0008 D17.2's ownership predicate: the namespace holds a state
+    (loaded or not, #180), its claim file holds an open claim (#181), or a
+    live owner holds its run lock (#180). Fail-closed: a namespace whose
+    binding or directories cannot be read, a claim file that cannot be read
+    or is of an unknown schema, or a run lock that cannot be probed, owns
+    its issue. A claim file holding only closed claims owns nothing: the
+    namespace's next run starts fresh. Read-only.
     """
     try:
         namespace = issue_namespace(coordination_root, issue_number)
@@ -90,6 +96,20 @@ def scheduler_ownership(coordination_root: str | Path, issue_number: int) -> str
             f"its scheduler namespace {where} holds a state that cannot be read "
             f"({lookup.state.reason})"
         )
+    if lookup.claim_present:
+        try:
+            claim_file = load_claim_file(namespace)
+        except (StateError, OSError) as exc:
+            return (
+                f"its scheduler claim {namespace.claim_file} cannot be read "
+                f"({_bounded(str(exc))}), so it may hold an open claim"
+            )
+        if claim_file is not None and claim_file.current is not None:
+            current = claim_file.current
+            return (
+                f"its scheduler namespace {where} holds an open scheduler claim (generation "
+                f"{current.generation}, a {current.kind.value} admission)"
+            )
     try:
         live = issue_run_lock_live(namespace)
     except (LockError, OSError) as exc:

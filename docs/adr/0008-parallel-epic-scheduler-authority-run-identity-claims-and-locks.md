@@ -683,6 +683,19 @@ provider output or transcript.
   held, and nothing is launched for it.
 - **No TTL.** Timestamps and PIDs are diagnostics.
 
+**Amended by #181.** `abandoned` versus `interrupted` is decided by the
+claim alone: `abandoned` when no worker is recorded on it, `interrupted`
+when one is. A worker this scheduler reaped before `record_worker` wrote
+its diagnostics (a crash, or a failed write, in between) is therefore
+closed `abandoned`, not `interrupted` as "this scheduler reaped none" above
+and D14.2's "after this scheduler reaped the issue's worker" suggested. The
+reason: the writers and the loader can enforce the rule from the file
+alone, and no in-memory fact can contradict the history written to disk.
+Nothing decides on the difference. Both classes leave the issue
+`resumable` or `fresh` by its state, and the exit status is still
+recorded. #182 records the diagnostics right after the spawn, so the
+window is that short.
+
 **D7.3 (#181).** The worker diagnostics are the PID, the process start
 time as the kernel reports it (`/proc/<pid>/stat` field 22 on Linux, the
 process's start time on macOS), the spawn time and the worker log's path.

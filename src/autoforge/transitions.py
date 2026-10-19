@@ -66,9 +66,15 @@ ever names BLOCKED and FAILED itself, which are not edges of this topology.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from .errors import StateTransitionError
+
+if TYPE_CHECKING:
+    # Typing only: the state module imports this one for Phase.
+    from .state import AutoForgeState
 
 
 class WorkflowMode(Enum):
@@ -153,6 +159,67 @@ LEGAL_EDGES: dict[Phase, frozenset[Phase]] = {
 # engine, the docs and the tests refer to one decision rather than to a
 # literal set repeated in each. REPLAN_REEXECUTE is never a target.
 UNBLOCK_TARGETS: frozenset[Phase] = LEGAL_EDGES[Phase.BLOCKED]
+
+
+class Settlement(Enum):
+    """Whether a per-issue state needs more automatic work (ADR 0008 D15.1, #181).
+
+    The parallel EPIC scheduler's only view of the engine: it never branches
+    on a phase, only on this. Every value but ``IN_PROGRESS`` is settled: the
+    scheduler launches nothing more for the issue.
+    """
+
+    #: #126's durable pause holds: the run waits for a human's answer.
+    AWAITING_INPUT = "awaiting_input"
+    #: ``DONE``, ``BLOCKED`` or ``FAILED``.
+    TERMINAL = "terminal"
+    #: The stop phase reached with the merge gate closed; satisfies no dependency.
+    READY_FOR_MERGE = "ready_for_merge"
+    #: ``MERGE`` or ``UPDATE_EPIC``, which a scheduler worker never executes.
+    HANDOFF = "handoff"
+    #: Any other phase: an ordinary resume continues it.
+    IN_PROGRESS = "in_progress"
+
+
+# Total over Phase: ``test_transitions`` fails when a phase is added without one.
+PHASE_SETTLEMENT: dict[Phase, Settlement] = {
+    Phase.INITIALIZING: Settlement.IN_PROGRESS,
+    Phase.ANALYZE_EXECUTE: Settlement.IN_PROGRESS,
+    Phase.REVIEW: Settlement.IN_PROGRESS,
+    Phase.FIX: Settlement.IN_PROGRESS,
+    Phase.REPLAN_REEXECUTE: Settlement.IN_PROGRESS,
+    Phase.READY_FOR_MERGE: Settlement.READY_FOR_MERGE,
+    Phase.MERGE: Settlement.HANDOFF,
+    Phase.UPDATE_EPIC: Settlement.HANDOFF,
+    Phase.DONE: Settlement.TERMINAL,
+    Phase.BLOCKED: Settlement.TERMINAL,
+    Phase.FAILED: Settlement.TERMINAL,
+}
+
+
+def durable_pause(state: AutoForgeState) -> bool:
+    """#126's durable pause predicate: whether ``state`` waits for a human's answer.
+
+    The hook :func:`issue_settlement` checks before the phase. #126 has not
+    landed, so no state can hold a pause and this is ``False``; #126 wires
+    its predicate here (ADR 0008 D15.1, ADR 0007).
+    """
+    return False
+
+
+def issue_settlement(
+    state: AutoForgeState, *, paused: Callable[[AutoForgeState], bool] = durable_pause
+) -> Settlement:
+    """The settlement of a strictly loaded per-issue state (ADR 0008 D15.1); pure.
+
+    It takes the whole state, not its phase, because #126's pause is
+    invocation state: ``paused`` (the durable pause predicate) is checked
+    first and gives ``AWAITING_INPUT`` whatever the phase; then the phase is
+    mapped by :data:`PHASE_SETTLEMENT`.
+    """
+    if paused(state):
+        return Settlement.AWAITING_INPUT
+    return PHASE_SETTLEMENT[state.phase]
 
 
 # LOCAL topology: no PR, no merge, no replan, no EPIC. A clean review is the

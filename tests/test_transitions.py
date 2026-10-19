@@ -3,15 +3,19 @@
 import pytest
 
 from autoforge.errors import ControlResultValidationError, StateTransitionError
+from autoforge.state import AutoForgeState
 from autoforge.transitions import (
     LEGAL_EDGES,
     LOCAL_LEGAL_EDGES,
+    PHASE_SETTLEMENT,
     TERMINAL_PHASES,
     UNBLOCK_TARGETS,
     Phase,
+    Settlement,
     WorkflowMode,
     decide_next_phase,
     is_legal,
+    issue_settlement,
     validate_transition,
 )
 
@@ -291,3 +295,47 @@ def test_decisions_cover_every_non_operator_edge_of_the_mode(mode):
     reserved = {(Phase.MERGE, Phase.ANALYZE_EXECUTE), (Phase.MERGE, Phase.DONE)}
     declared = {(frm, to) for frm, tos in edges.items() for to in tos if frm is not Phase.BLOCKED}
     assert {(frm, expected) for frm, _, expected in table} == declared - reserved
+
+
+# -- issue_settlement (ADR 0008 D15.1; #181) ---------------------------------------------
+
+# Written out independently of PHASE_SETTLEMENT: a new phase needs a decision here.
+EXPECTED_SETTLEMENT = {
+    Phase.INITIALIZING: Settlement.IN_PROGRESS,
+    Phase.ANALYZE_EXECUTE: Settlement.IN_PROGRESS,
+    Phase.REVIEW: Settlement.IN_PROGRESS,
+    Phase.FIX: Settlement.IN_PROGRESS,
+    Phase.REPLAN_REEXECUTE: Settlement.IN_PROGRESS,
+    Phase.READY_FOR_MERGE: Settlement.READY_FOR_MERGE,
+    Phase.MERGE: Settlement.HANDOFF,
+    Phase.UPDATE_EPIC: Settlement.HANDOFF,
+    Phase.DONE: Settlement.TERMINAL,
+    Phase.BLOCKED: Settlement.TERMINAL,
+    Phase.FAILED: Settlement.TERMINAL,
+}
+
+
+def _settlement_state(phase: Phase) -> AutoForgeState:
+    return AutoForgeState(
+        run_id="af-issue-7",
+        repository="owner/repo",
+        epic_url="https://github.com/owner/repo/issues/1",
+        current_issue_url="https://github.com/owner/repo/issues/7",
+        phase=phase,
+    )
+
+
+def test_every_phase_has_exactly_one_settlement():
+    assert set(PHASE_SETTLEMENT) == set(Phase)
+    assert PHASE_SETTLEMENT == EXPECTED_SETTLEMENT
+    assert set(EXPECTED_SETTLEMENT.values()) == set(Settlement) - {Settlement.AWAITING_INPUT}
+    for phase in Phase:
+        assert issue_settlement(_settlement_state(phase)) is EXPECTED_SETTLEMENT[phase]
+
+
+@pytest.mark.parametrize("phase", list(Phase))
+def test_a_durable_pause_is_checked_before_the_phase(phase):
+    """Until #126 lands nothing is paused; a paused state awaits input whatever its phase."""
+    state = _settlement_state(phase)
+    assert issue_settlement(state, paused=lambda s: s is state) is Settlement.AWAITING_INPUT
+    assert issue_settlement(state, paused=lambda s: False) is EXPECTED_SETTLEMENT[phase]
