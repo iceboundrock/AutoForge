@@ -1036,6 +1036,58 @@ a stated reason it has none. The coverage that must keep working:
   provider failure publishes nothing and the relaunch is published; Pi
   reaches the same outcome as the scripted provider; a dry run over a
   saved plan sends nothing and launches no agent
+- the EPIC dependency graph (#179, ADR 0008 D3, D4, D2.2 step 4,
+  `tests/test_epic_graph.py`, `tests/test_github.py`,
+  `tests/test_validation.py`). Every test is offline: a fake `gh` serves
+  synthetic graphs and the fixtures under `tests/fixtures/github_graph`
+  to the real client, and refuses anything but a plain GET. The fixtures
+  are GitHub's answers for EPIC #176, captured live. The cases:
+  - the typed reads decode the fixtures' fields and refuse each malformed
+    row, an answer for another issue, a pull request, a short page before
+    the last and a non-paginated answer, and keep the transient retry of
+    reads; an issue without a parent, which GitHub answers without a
+    `parent_issue_url` field, reads as parentless;
+  - the recorded graph builds and evaluates (#179 ready, #182 and #183
+    blocked, the four closed children closed), its answers hold both
+    pinned behaviours, and the recorded child is `unchanged` on re-read;
+  - independent children, a chain and a diamond are released in the
+    specified order;
+  - cross-EPIC and cross-repository blockers count by live state, and an
+    unreadable one blocks;
+  - only `completed` satisfies: `not_planned`, `duplicate`, no reason and
+    an unknown reason are `closed-unsatisfied` with the reason shown, and
+    a reopened blocker blocks again;
+  - cycles of length 1, 2 and 3 refuse with the canonical cycle under
+    shuffled API order, and a cycle through a closed child does not
+    refuse;
+  - a duplicated child or edge is de-duplicated by id, and a duplicate that
+    contradicts itself refuses;
+  - a removed child disappears, a completed child is `closed`, and a
+    nested parent and a foreign child are unsupported (never traversed);
+  - verdict precedence holds with every `LocalFact`;
+  - a 30-child random DAG shuffled 200 times (API and insertion order)
+    gives an identical verdict tuple, snapshot digest and node digests,
+    and the fan-out key matches an independent count;
+  - each completeness failure refuses: a short or over-long child or
+    blocker listing, each bound (before the listing is read when the
+    summary already exceeds it), a repository-id mismatch, a closed EPIC,
+    a failed read (transient or not, with its cause) and an inconsistent
+    parent; children without blockers and closed children are not
+    queried;
+  - the fixtures with closed children or closed blockers removed from the
+    counts are refused;
+  - the digests change for every eligibility fact and for no excluded
+    field (hostile titles, bodies, labels, timestamps, `observed_at`),
+    whatever the input order, and #181's `Admission` accepts them;
+  - the re-read is `stale` for a blocker added, reopened or removed, the
+    child closed, re-parented, given sub-issues, given another id or
+    reopened, and an incomplete or over-bound blocker listing; it is
+    `unchanged` otherwise, raises on a failed read and never changes the
+    snapshot;
+  - human changes between snapshots show in the next one;
+  - diagnostics never quote a title or a body and are bounded;
+  - an AST scan finds no GitHub write, no client method beyond the four
+    reads and no process, file or lock module in `epic_graph.py`.
 
 ### Recovery
 

@@ -9,6 +9,14 @@ Accepted shapes (HTTPS, ``github.com`` host only)::
     https://github.com/<owner>/<repo>/pull/<number>
     https://github.com/<owner>/<repo>/pull/<number>#issuecomment-<id>
     https://github.com/<owner>/<repo>/issues/<number>#issuecomment-<id>
+
+The REST API names an issue's parent and repository by API URL instead
+(``parent_issue_url``, ``repository_url``); :func:`parse_api_issue_url` and
+:func:`parse_api_repository_url` read those two shapes, host
+``api.github.com`` only::
+
+    https://api.github.com/repos/<owner>/<repo>/issues/<number>
+    https://api.github.com/repos/<owner>/<repo>
 """
 
 from __future__ import annotations
@@ -25,6 +33,10 @@ _PATH_RE = re.compile(
     rf"^/(?P<owner>{_NAME})/(?P<repo>{_NAME})/(?P<kind>issues|pull)/(?P<number>[0-9]+)/?$"
 )
 _COMMENT_FRAGMENT_RE = re.compile(r"^issuecomment-(?P<id>[0-9]+)$")
+_API_REPOSITORY_RE = re.compile(rf"^/repos/(?P<owner>{_NAME})/(?P<repo>{_NAME})/?$")
+_API_ISSUE_RE = re.compile(
+    rf"^/repos/(?P<owner>{_NAME})/(?P<repo>{_NAME})/issues/(?P<number>[0-9]+)/?$"
+)
 
 _EXPECTED = "expected https://github.com/<owner>/<repo>/(issues|pull)/<n>"
 
@@ -239,6 +251,45 @@ def parse_comment_url(url: str) -> GitHubCommentRef:
         raise ConfigurationError(f"GitHub comment URL must end with '#issuecomment-<id>': {url!r}")
     parent = parse_github_url(url.split("#", 1)[0])
     return GitHubCommentRef(parent=parent, comment_id=_number(fm.group("id"), "comment id", url))
+
+
+def _split_api(url: str):
+    """``url`` as an ``https://api.github.com`` URL with no query or fragment."""
+    if not isinstance(url, str) or not url.strip():
+        raise ConfigurationError(f"not a valid GitHub API URL: {url!r}")
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError as exc:
+        raise ConfigurationError(f"not a valid GitHub API URL: {url!r} ({exc})") from None
+    if parts.scheme != "https" or parts.netloc.lower() != "api.github.com":
+        raise ConfigurationError(f"GitHub API URL must be https://api.github.com/...: {url!r}")
+    if parts.query or parts.fragment:
+        raise ConfigurationError(f"GitHub API URL must not carry a query or fragment: {url!r}")
+    return parts
+
+
+def parse_api_issue_url(url: str) -> GitHubIssueRef:
+    """The issue an API URL (``.../repos/<owner>/<repo>/issues/<n>``) names.
+
+    The REST spelling of an issue reference, such as ``parent_issue_url``;
+    the result is the same typed reference :func:`parse_issue_url` returns
+    for the issue's HTML URL, so the two compare with ``same_target``.
+    """
+    m = _API_ISSUE_RE.match(_split_api(url).path)
+    if not m:
+        raise ConfigurationError(f"malformed GitHub API issue URL: {url!r}")
+    number = _number(m.group("number"), "issue number", url)
+    if number < 1:
+        raise ConfigurationError(f"GitHub issue number must be >= 1: {url!r}")
+    return GitHubIssueRef(owner=m.group("owner"), repo=m.group("repo"), number=number)
+
+
+def parse_api_repository_url(url: str) -> str:
+    """``owner/repo`` of an API repository URL (``.../repos/<owner>/<repo>``)."""
+    m = _API_REPOSITORY_RE.match(_split_api(url).path)
+    if not m:
+        raise ConfigurationError(f"malformed GitHub API repository URL: {url!r}")
+    return f"{m.group('owner')}/{m.group('repo')}"
 
 
 def validate_epic_and_issue(epic_url: str, issue_url: str) -> tuple[GitHubIssueRef, GitHubIssueRef]:
