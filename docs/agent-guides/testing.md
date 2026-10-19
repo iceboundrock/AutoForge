@@ -1040,11 +1040,16 @@ a stated reason it has none. The coverage that must keep working:
   `tests/test_epic_graph.py`, `tests/test_github.py`,
   `tests/test_validation.py`). Every test is offline: a fake `gh` serves
   synthetic graphs and the fixtures under `tests/fixtures/github_graph`
-  to the real client, and refuses anything but a plain GET. The cases:
+  to the real client, and refuses anything but a plain GET. The fixtures
+  are GitHub's answers for EPIC #176, captured live. The cases:
   - the typed reads decode the fixtures' fields and refuse each malformed
     row, an answer for another issue, a pull request, a short page before
     the last and a non-paginated answer, and keep the transient retry of
-    reads;
+    reads; an issue without a parent, which GitHub answers without a
+    `parent_issue_url` field, reads as parentless;
+  - the recorded graph builds and evaluates (#179 ready, #182 and #183
+    blocked, the four closed children closed), its answers hold both
+    pinned behaviours, and the recorded child is `unchanged` on re-read;
   - independent children, a chain and a diamond are released in the
     specified order;
   - cross-EPIC and cross-repository blockers count by live state, and an

@@ -1162,12 +1162,19 @@ def _rest_issue_ref(data: dict, what: str) -> GitHubIssueRef:
 
 
 def _decode_issue_node(row: object, what: str) -> IssueNode:
-    """One REST issue object as an :class:`IssueNode`, strictly."""
+    """One REST issue object as an :class:`IssueNode`, strictly.
+
+    GitHub leaves ``parent_issue_url`` out of an issue that has no parent
+    (observed live for #179, ``tests/fixtures/github_graph/README.md``), so
+    an absent field reads as no parent, like a null one. That is never the
+    more permissive outcome: a ``/sub_issues`` row without a parent is
+    refused by the snapshot, and a re-read child without one is stale. An
+    answer from an API without native sub-issues still fails here, on the
+    two summaries it lacks.
+    """
     data = _row_object(row, what)
     ref = _rest_issue_ref(data, what)
     what = f"{what}: {ref.canonical}"
-    if "parent_issue_url" not in data:
-        raise GitHubError(f"{what}: the row carries no parent_issue_url")
     parent_url = data.get("parent_issue_url")
     parent: GitHubIssueRef | None = None
     if parent_url is not None:

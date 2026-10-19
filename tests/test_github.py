@@ -2745,6 +2745,9 @@ def test_fake_write_bounds_refuse_before_any_attempt_and_history_must_be_set():
 _GRAPH_FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "github_graph")
 _GRAPH_REPO = "octo-org/octo-repo"
 _GRAPH_EPIC = f"https://github.com/{_GRAPH_REPO}/issues/158"
+# The recorded fixtures: GitHub's answers for EPIC #176 of this repository, captured live.
+_RECORDED_REPO = "iceboundrock/AutoForge"
+_RECORDED_EPIC = f"https://github.com/{_RECORDED_REPO}/issues/176"
 
 
 def _graph_fixture(name):
@@ -2784,8 +2787,8 @@ def test_get_repository_id_reads_the_numeric_id():
         calls.append(req.command)
         return _res(_graph_fixture("repository.json"))
 
-    assert _client(handler).get_repository_id(_GRAPH_REPO) == 1296269
-    assert calls == [["gh", "api", f"repos/{_GRAPH_REPO}"]]
+    assert _client(handler).get_repository_id(_RECORDED_REPO) == 1358733090
+    assert calls == [["gh", "api", f"repos/{_RECORDED_REPO}"]]
 
 
 @pytest.mark.parametrize("value", [None, "1296269", True, 0, -3, 1.5])
@@ -2804,27 +2807,29 @@ def test_get_issue_node_reads_the_eligibility_facts_of_the_recorded_epic():
 
     def handler(req):
         calls.append(req.command)
-        return _res(_graph_fixture("epic_issue.json"))
+        return _res(_graph_fixture("issue_176.json"))
 
-    node = _client(handler).get_issue_node(_GRAPH_EPIC)
-    assert calls == [["gh", "api", f"repos/{_GRAPH_REPO}/issues/158"]]
-    assert node.id == 3001158 and node.number == 158 and node.url == _GRAPH_EPIC
-    assert node.repository == _GRAPH_REPO and node.is_open and node.state_reason is None
-    assert node.parent is None
-    # The listing pinned below holds three children, one closed: total counts it.
-    assert node.sub_issues_total == 3
-    assert node.blocked_by_total == 0 and node.blocked_by_open == 0
+    node = _client(handler).get_issue_node(_RECORDED_EPIC)
+    assert calls == [["gh", "api", f"repos/{_RECORDED_REPO}/issues/176"]]
+    assert node.id == 5706833143 and node.number == 176 and node.url == _RECORDED_EPIC
+    assert node.repository == _RECORDED_REPO and node.is_open and node.state_reason is None
+    # GitHub leaves parent_issue_url out of an issue without a parent.
+    assert "parent_issue_url" not in _graph_fixture("issue_176.json") and node.parent is None
+    # The listing pinned below holds seven children, four closed: total counts them.
+    assert node.sub_issues_total == 7
+    # The EPIC's one blocker (#158) is closed: counted in the total, not as open.
+    assert node.blocked_by_total == 1 and node.blocked_by_open == 0
     # Nothing beyond the eligibility facts is kept.
     assert not hasattr(node, "title") and not hasattr(node, "body")
 
 
 def test_get_issue_node_reads_a_child_with_its_parent_and_dependency_totals():
-    node = _client(lambda req: _res(_graph_fixture("issue_180.json"))).get_issue_node(
-        f"https://github.com/{_GRAPH_REPO}/issues/180"
+    node = _client(lambda req: _res(_graph_fixture("issue_182.json"))).get_issue_node(
+        f"https://github.com/{_RECORDED_REPO}/issues/182"
     )
-    assert node.parent is not None and node.parent.canonical == _GRAPH_EPIC
-    # total_blocked_by counts the closed blocker; blocked_by only the open one.
-    assert node.blocked_by_total == 2 and node.blocked_by_open == 1
+    assert node.parent is not None and node.parent.canonical == _RECORDED_EPIC
+    # total_blocked_by counts the two closed blockers; blocked_by only the open one.
+    assert node.blocked_by_total == 3 and node.blocked_by_open == 1
 
 
 def test_get_issue_node_refuses_an_answer_for_another_issue():
@@ -2877,10 +2882,17 @@ def test_get_issue_node_refuses_a_malformed_row(over, match):
         _client(lambda req: _res(row)).get_issue_node(f"https://github.com/{_GRAPH_REPO}/issues/12")
 
 
-def test_get_issue_node_refuses_a_row_without_the_parent_field():
+def test_get_issue_node_reads_a_row_without_the_parent_field_as_parentless():
+    # What GitHub answers for an issue without a parent (the recorded EPIC).
     row = _graph_row(12)
     del row["parent_issue_url"]
-    with pytest.raises(GitHubError, match="carries no parent_issue_url"):
+    node = _client(lambda req: _res(row)).get_issue_node(
+        f"https://github.com/{_GRAPH_REPO}/issues/12"
+    )
+    assert node.parent is None
+    # The summaries still have to be there: an API without native sub-issues is refused.
+    del row["sub_issues_summary"]
+    with pytest.raises(GitHubError, match="sub_issues_summary is not an object"):
         _client(lambda req: _res(row)).get_issue_node(f"https://github.com/{_GRAPH_REPO}/issues/12")
 
 
@@ -2889,24 +2901,28 @@ def test_list_sub_issues_reads_every_page_and_includes_closed_children():
 
     def handler(req):
         calls.append(req.command)
-        return _paged(_graph_fixture("epic_sub_issues.json"))
+        return _paged(_graph_fixture("issue_176_sub_issues.json"))
 
-    children = _client(handler).list_sub_issues(_GRAPH_EPIC)
+    children = _client(handler).list_sub_issues(_RECORDED_EPIC)
     assert calls == [
         [
             "gh",
             "api",
             "--paginate",
             "--slurp",
-            f"repos/{_GRAPH_REPO}/issues/158/sub_issues?per_page=100",
+            f"repos/{_RECORDED_REPO}/issues/176/sub_issues?per_page=100",
         ]
     ]
     assert [(c.number, c.state, c.state_reason) for c in children] == [
+        (177, "closed", "completed"),
         (178, "closed", "completed"),
         (179, "open", None),
-        (180, "open", None),
+        (180, "closed", "completed"),
+        (181, "closed", "completed"),
+        (182, "open", None),
+        (183, "open", None),
     ]
-    assert all(c.parent is not None and c.parent.canonical == _GRAPH_EPIC for c in children)
+    assert all(c.parent is not None and c.parent.canonical == _RECORDED_EPIC for c in children)
 
 
 def test_list_blocked_by_reads_every_page_and_includes_closed_blockers():
@@ -2914,23 +2930,25 @@ def test_list_blocked_by_reads_every_page_and_includes_closed_blockers():
 
     def handler(req):
         calls.append(req.command)
-        return _paged(_graph_fixture("issue_180_blocked_by.json"))
+        return _paged(_graph_fixture("issue_182_blocked_by.json"))
 
-    blockers = _client(handler).list_blocked_by(f"https://github.com/{_GRAPH_REPO}/issues/180")
+    blockers = _client(handler).list_blocked_by(f"https://github.com/{_RECORDED_REPO}/issues/182")
     assert calls == [
         [
             "gh",
             "api",
             "--paginate",
             "--slurp",
-            f"repos/{_GRAPH_REPO}/issues/180/dependencies/blocked_by?per_page=100",
+            f"repos/{_RECORDED_REPO}/issues/182/dependencies/blocked_by?per_page=100",
         ]
     ]
+    # #158 has no parent: its row carries no parent_issue_url, which a blocker never needs.
     assert [(b.number, b.state, b.state_reason, b.readable) for b in blockers] == [
         (179, "open", None, True),
-        (178, "closed", "completed", True),
+        (158, "closed", "completed", True),
+        (181, "closed", "completed", True),
     ]
-    assert all(b.repository == _GRAPH_REPO for b in blockers)
+    assert all(b.repository == _RECORDED_REPO for b in blockers)
 
 
 def test_list_blocked_by_reads_a_blocker_in_another_repository():

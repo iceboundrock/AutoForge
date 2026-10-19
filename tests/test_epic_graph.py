@@ -151,7 +151,7 @@ class Hub:
         children = [i for i in self.issues.values() if i.parent == key]
         blockers = [self.issues[k] for k in issue.blockers]
         api = f"https://api.github.com/repos/{issue.repo}"
-        return {
+        row = {
             "url": f"{api}/issues/{issue.number}",
             "repository_url": api,
             "html_url": f"https://github.com/{issue.repo}/issues/{issue.number}",
@@ -166,11 +166,6 @@ class Hub:
             "state_reason": issue.reason,
             "created_at": issue.created_at,
             "updated_at": issue.created_at,
-            "parent_issue_url": (
-                None
-                if issue.parent is None
-                else f"https://api.github.com/repos/{issue.parent[0]}/issues/{issue.parent[1]}"
-            ),
             "sub_issues_summary": {
                 "total": len(children) + issue.extra_sub_issues,
                 "completed": sum(1 for c in children if c.state == "closed"),
@@ -183,6 +178,13 @@ class Hub:
                 "total_blocking": 0,
             },
         }
+        # GitHub leaves the field out of an issue without a parent (the recorded fixtures).
+        if issue.parent is not None:
+            parent_repo, parent_number = issue.parent
+            row["parent_issue_url"] = (
+                f"https://api.github.com/repos/{parent_repo}/issues/{parent_number}"
+            )
+        return row
 
     def _listing(self, rows: list) -> list[list]:
         if self.rng is not None:
@@ -1180,10 +1182,11 @@ def test_diagnostics_never_quote_a_title_or_body_and_are_bounded():
 
 
 # -- the recorded fixtures (tests/fixtures/github_graph) ----------------------------------------
+# GitHub's answers for EPIC #176 of iceboundrock/AutoForge, captured live (see the README there).
 
-FIXTURE_REPO = "octo-org/octo-repo"
-FIXTURE_EPIC = f"https://github.com/{FIXTURE_REPO}/issues/158"
-FIXTURE_REPO_ID = 1296269
+FIXTURE_REPO = "iceboundrock/AutoForge"
+FIXTURE_EPIC = f"https://github.com/{FIXTURE_REPO}/issues/176"
+FIXTURE_REPO_ID = 1358733090
 
 
 class FixtureHub:
@@ -1195,11 +1198,14 @@ class FixtureHub:
         base = f"repos/{FIXTURE_REPO}"
         self.answers = {
             base: "repository.json",
-            f"{base}/issues/158": "epic_issue.json",
-            f"{base}/issues/158/sub_issues?per_page=100": "epic_sub_issues.json",
-            f"{base}/issues/180": "issue_180.json",
-            f"{base}/issues/180/dependencies/blocked_by?per_page=100": "issue_180_blocked_by.json",
+            f"{base}/issues/176": "issue_176.json",
+            f"{base}/issues/176/sub_issues?per_page=100": "issue_176_sub_issues.json",
+            f"{base}/issues/182": "issue_182.json",
         }
+        for child in (179, 182, 183):
+            self.answers[f"{base}/issues/{child}/dependencies/blocked_by?per_page=100"] = (
+                f"issue_{child}_blocked_by.json"
+            )
 
     def __call__(self, req) -> ExecutionResult:
         endpoint = _assert_read_only(req.command)
@@ -1214,39 +1220,114 @@ class FixtureHub:
         return GitHubClient(runner=self, transient_retries=0, retry_delay_seconds=0)
 
 
+def _fixture(name: str) -> object:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
 def _fixture_snapshot(hub: FixtureHub) -> EpicSnapshot:
     return build_epic_snapshot(
         hub.client(), FIXTURE_EPIC, repository_id=FIXTURE_REPO_ID, observed_at=T0
     )
 
 
+def test_the_recorded_answers_hold_both_pinned_behaviours():
+    # The sub-issue listing includes closed children: all seven rows, four
+    # of them closed, against the EPIC's total of seven.
+    epic = _fixture("issue_176.json")
+    listing = _fixture("issue_176_sub_issues.json")
+    assert epic["sub_issues_summary"]["total"] == len(listing) == 7
+    closed = [row["number"] for row in listing if row["state"] == "closed"]
+    assert closed == [177, 178, 180, 181] and epic["sub_issues_summary"]["completed"] == 4
+    # total_blocked_by counts closed blockers; blocked_by only open ones.
+    # #179 reports none open and two in all, and lists two closed blockers.
+    summaries = {row["number"]: row["issue_dependencies_summary"] for row in listing}
+    assert (summaries[179]["blocked_by"], summaries[179]["total_blocked_by"]) == (0, 2)
+    assert [(b["number"], b["state"]) for b in _fixture("issue_179_blocked_by.json")] == [
+        (177, "closed"),
+        (158, "closed"),
+    ]
+    for child in (179, 182, 183):
+        blockers = _fixture(f"issue_{child}_blocked_by.json")
+        open_blockers = [b for b in blockers if b["state"] == "open"]
+        assert len(blockers) == summaries[child]["total_blocked_by"]
+        assert len(open_blockers) == summaries[child]["blocked_by"]
+    # An issue without a parent carries no parent_issue_url field at all.
+    assert "parent_issue_url" not in epic
+    assert "parent_issue_url" not in _fixture("issue_179_blocked_by.json")[1]  # #158
+
+
 def test_the_recorded_graph_builds_and_evaluates():
     hub = FixtureHub()
     snapshot = _fixture_snapshot(hub)
-    # The listing includes the closed child, and the EPIC's total counts it.
+    assert snapshot.repository == FIXTURE_REPO and snapshot.epic.parent is None
+    # The listing includes the closed children, and the EPIC's total counts them.
     assert [(c.number, c.state) for c in snapshot.children] == [
+        (177, "closed"),
         (178, "closed"),
         (179, "open"),
-        (180, "open"),
+        (180, "closed"),
+        (181, "closed"),
+        (182, "open"),
+        (183, "open"),
     ]
-    # total_blocked_by counts the closed blocker: #180 lists both.
-    assert [(e.blocker.number, e.blocker.state) for e in snapshot.edges] == [
-        (178, "closed"),
-        (179, "open"),
-    ]
-    assert reasons(snapshot) == {178: "closed", 179: "ready", 180: "blocked"}
-    # The closed-as-completed blocker is satisfied; only the open one blocks.
-    assert verdict(snapshot, 180).explain() == "#180: blocked by #179 (open)"
-    # Only the open child that reports blockers was queried.
+    # total_blocked_by counts the closed blockers: every listing is read whole.
+    edges: dict[int, list[tuple[int | None, str | None]]] = {}
+    for edge in snapshot.edges:
+        child = next(c.number for c in snapshot.children if c.id == edge.child_id)
+        edges.setdefault(child, []).append((edge.blocker.number, edge.blocker.state))
+    assert edges == {
+        179: [(158, "closed"), (177, "closed")],
+        182: [(158, "closed"), (179, "open"), (181, "closed")],
+        183: [(158, "closed"), (179, "open"), (181, "closed"), (182, "open")],
+    }
+    assert reasons(snapshot) == {
+        177: "closed",
+        178: "closed",
+        179: "ready",
+        180: "closed",
+        181: "closed",
+        182: "blocked",
+        183: "blocked",
+    }
+    # The closed-as-completed blockers (#158 outside the EPIC among them) are
+    # satisfied; only the open ones block.
+    assert verdict(snapshot, 182).explain() == "#182: blocked by #179 (open)"
+    assert verdict(snapshot, 183).explain() == "#183: blocked by #179 (open), #182 (open)"
+    assert ready(snapshot) == [179] and verdict(snapshot, 179).dependents == 2
+    # Only the open children that report blockers were queried, #179 with
+    # none open among them.
     assert [c for c in hub.calls if "blocked_by" in c] == [
-        f"repos/{FIXTURE_REPO}/issues/180/dependencies/blocked_by?per_page=100"
+        f"repos/{FIXTURE_REPO}/issues/{child}/dependencies/blocked_by?per_page=100"
+        for child in (179, 182, 183)
     ]
-    assert reread_node(hub.client(), snapshot, 180).unchanged
+    assert reread_node(hub.client(), snapshot, 182).unchanged
+
+
+def test_a_recorded_child_that_lost_its_parent_field_is_stale():
+    def rewrite(name, payload):
+        if name == "issue_182.json":
+            del payload["parent_issue_url"]
+        return payload
+
+    snapshot = _fixture_snapshot(FixtureHub())
+    result = reread_node(FixtureHub(rewrite).client(), snapshot, 182)
+    assert result.status is RereadStatus.STALE
+    assert result.differences == ("no parent, no longer the EPIC #176",)
+
+
+def test_a_recorded_sub_issue_row_without_its_parent_field_is_refused():
+    def rewrite(name, payload):
+        if name == "issue_176_sub_issues.json":
+            del payload[2]["parent_issue_url"]  # #179
+        return payload
+
+    error = _fixture_refused(FixtureHub(rewrite))
+    assert error.reason == "inconsistent" and "#179, whose parent is none" in str(error)
 
 
 def test_a_listing_without_closed_children_would_be_refused():
     def rewrite(name, payload):
-        if name == "epic_sub_issues.json":
+        if name == "issue_176_sub_issues.json":
             return [row for row in payload if row["state"] == "open"]
         return payload
 
@@ -1256,14 +1337,14 @@ def test_a_listing_without_closed_children_would_be_refused():
 
 def test_a_total_without_closed_blockers_would_be_refused():
     def rewrite(name, payload):
-        if name == "epic_sub_issues.json":
+        if name == "issue_176_sub_issues.json":
             for row in payload:
                 summary = row["issue_dependencies_summary"]
                 summary["total_blocked_by"] = summary["blocked_by"]
         return payload
 
     error = _fixture_refused(FixtureHub(rewrite))
-    assert error.reason == "blockers-count" and "#180 reports 1" in str(error)
+    assert error.reason == "blockers-count" and "#182 reports 1" in str(error)
 
 
 def _fixture_refused(hub: FixtureHub) -> SnapshotRefused:

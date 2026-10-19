@@ -1812,7 +1812,10 @@ selection (`_verify_issue_selectable`) is unchanged and does not read it.
   missing between page reads. Rows decode strictly into `IssueNode` /
   `BlockerNode`: id, number, HTML URL (a `/pull/` URL is refused), the
   repository (`repository_url` must agree with it), state, `state_reason`,
-  `parent_issue_url` and the two summaries. No raw dictionary leaves
+  `parent_issue_url` and the two summaries. GitHub omits `parent_issue_url`
+  for an issue without a parent (observed live), so an absent field reads
+  as no parent. A sub-issue row without one is still refused, and a
+  re-read child without one is stale. No raw dictionary leaves
   `github.py`. Only direct sub-issues are listed. Nested EPICs are never
   traversed, `blocking` is never read, and prose (`Depends on #n`,
   checklists, the roadmap) is never authority.
@@ -1838,11 +1841,15 @@ selection (`_verify_issue_selectable`) is unchanged and does not read it.
 - **The pinned fields.** Two counts carry the completeness check:
   `sub_issues_summary.total` counts closed children, and
   `issue_dependencies_summary.total_blocked_by` counts closed blockers
-  (`blocked_by` counts only open ones). The fixtures under
-  `tests/fixtures/github_graph` hold both conditions. They are shaped from
-  the REST reference, not captured live (their README says so). If GitHub
-  counted otherwise, the listing's length would differ from the count and
-  every affected snapshot would be refused, never accepted incomplete.
+  (`blocked_by` counts only open ones). The REST reference settles
+  neither. Both were confirmed live on 2026-10-19 against EPIC #176 of this
+  repository. Its listing holds all seven children, four of them closed.
+  #179 reports no open blocker and two in all, and lists both closed
+  blockers. The captured answers are the fixtures under
+  `tests/fixtures/github_graph`, and their README records how they were
+  captured. If GitHub counted otherwise, a listing holding a closed child
+  or blocker would be longer than its count, and the snapshot would be
+  refused, never accepted incomplete.
 - **Satisfaction is completed-only.** A blocker is satisfied only when it
   is closed with `state_reason` `completed`. Closed as `not_planned`, as a
   duplicate, with no reason or with an unknown reason, it is
