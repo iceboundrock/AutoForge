@@ -45,6 +45,7 @@ from .errors import (
     GitHubUnavailableError,
 )
 from .executor import ExecutionRequest, ExecutionResult, execute
+from .locking import assert_shared_git_lock_free
 from .redaction import redact
 from .validation import (
     GitHubCommentRef,
@@ -1034,6 +1035,9 @@ class GitHubClient:
 
     # -- low level ------------------------------------------------------
     def _invoke(self, args: list[str], stdin: bytes | None = None) -> ExecutionResult:
+        # No GitHub call while this process holds the shared-Git lock (ADR
+        # 0008 D11.2): its holder must never wait on anything remote.
+        assert_shared_git_lock_free("call GitHub")
         return self._runner(
             ExecutionRequest(
                 command=[self.gh_command, *args],

@@ -98,6 +98,7 @@ from autoforge.errors import (
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.git_transport import GitRemote, GitTransport
 from autoforge.github import GitHubClient
+from autoforge.locking import SharedGitLock
 from autoforge.replan_txn import ReplanAttestation, render_marker
 from autoforge.result_parser import (
     MAX_FINDINGS_PER_REVIEW,
@@ -2650,6 +2651,7 @@ class Remote:
             in_base_history=self.in_base_history,
             gh_command=str(self.gh),
             runner=runner or self.runner,
+            git_lock=lambda op: SharedGitLock(self.shared / ".git", operation=op),
         )
 
     def pushes(self) -> int:

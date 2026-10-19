@@ -37,7 +37,10 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   reached from the common dir through real directories, an alternates
   file, or an entry that is neither a directory, a regular file nor an
   overlay whiteout, is tampering
-  (:class:`~autoforge.errors.SandboxTamperError`).
+  (:class:`~autoforge.errors.SandboxTamperError`). Its ``index-pack`` is
+  the one step that writes the shared store, so it alone runs under the
+  shared-Git lock (L1, ADR 0008 D12.1) and with automatic maintenance off
+  (D12.3).
 
 Every git process is the controller's own hardened local request
 (:func:`~autoforge.git_transport.local_git_request`, ADR 0004 D7.3, D7.5);
@@ -55,12 +58,14 @@ import shutil
 import stat
 import tempfile
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import SandboxTamperError, VerificationError
+from .errors import GitLockTimeout, LockError, SandboxTamperError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult, execute
-from .git_transport import local_git_request
+from .git_transport import NO_AUTO_MAINTENANCE, local_git_request
+from .locking import SharedGitLock
 from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -490,6 +495,7 @@ def import_private_objects(
     runner: Runner | None,
     *,
     exclude: tuple[str, ...] = (),
+    git_lock: Callable[[str], AbstractContextManager[object]] | None = None,
 ) -> str:
     """Import the objects ``HEAD`` reaches that the shared store lacks (D6.5).
 
@@ -509,6 +515,14 @@ def import_private_objects(
     Idempotent; a failure is :class:`ObjectImportError` and is not retried
     here. ``exclude`` are commits the shared store holds (the phase's
     recorded base), so the walk stops there.
+
+    Only ``index-pack`` writes the shared store: it runs under the
+    shared-Git lock (L1, ADR 0008 D12.1) that ``git_lock(operation)``
+    returns, by default :class:`~autoforge.locking.SharedGitLock` on
+    ``common``, and with automatic maintenance off (D12.3). The walk,
+    ``rev-list`` and ``pack-objects`` read the store and write only a
+    private scratch directory. A lock not obtained within its bound is this
+    import failing (:class:`ObjectImportError`, D11.3).
     """
     if not holds_objects(private):
         return ""
@@ -603,11 +617,19 @@ def import_private_objects(
             )
         with open(os.path.join(scratch, packs[0]), "rb") as handle:
             data = handle.read()
-        git(
-            ["index-pack", "--stdin", "--fix-thin", "--strict"],
-            "indexing the pack strictly into the shared store",
-            stdin=data,
-        )
+        lock = git_lock or (lambda operation: SharedGitLock(common, operation=operation))
+        try:
+            with lock("import the agent's objects into the shared store"):
+                git(
+                    [*NO_AUTO_MAINTENANCE, "index-pack", "--stdin", "--fix-thin", "--strict"],
+                    "indexing the pack strictly into the shared store",
+                    stdin=data,
+                )
+        except (GitLockTimeout, LockError) as exc:
+            raise ObjectImportError(
+                f"the strict import of the agent's commits from {private} failed: {exc}; "
+                "nothing was published"
+            ) from exc
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     if head not in _present(git, [head]):

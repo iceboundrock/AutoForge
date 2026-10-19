@@ -138,6 +138,11 @@ state, contract, filesystem boundary  test_state.py, test_durable_run_contract.p
 scheduler namespaces (#178)           test_run_namespace.py (RunKey, layout, binding, lookup,
                                       listing, archive, engine binding); the standalone
                                       state-dir refusal: test_cli.py
+lock domains (#180)                   test_lock_domains.py (L0 sharing and adoption, L2, L1,
+                                      the order, the filesystem refusal, descriptor hygiene;
+                                      real processes), test_shared_git.py (ADR 0008 D12.5,
+                                      real git); ownership guards: test_ownership.py,
+                                      test_cli.py, test_engine.py (next_issue_url)
 REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.py; load and
                                       protocol: test_state.py)
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py

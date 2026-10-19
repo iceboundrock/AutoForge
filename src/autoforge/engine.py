@@ -106,7 +106,7 @@ import re
 import secrets
 import shlex
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -239,8 +239,10 @@ from .errors import (
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    GitLockTimeout,
     GitTransportError,
     LockError,
+    LockOrderError,
     MaterializationError,
     NamespaceError,
     SandboxCapabilityError,
@@ -300,6 +302,7 @@ from .executor import (
     select_environment,
 )
 from .git_transport import (
+    NO_AUTO_MAINTENANCE,
     CommitRecord,
     GitRemote,
     GitTransport,
@@ -325,7 +328,12 @@ from .local_workspace import (
     uncommitted_paths,
     verify_feature_spec_unchanged,
 )
-from .locking import ControllerLock, repository_lock_path
+from .locking import (
+    ControllerLock,
+    SharedGitLock,
+    assert_shared_git_lock_free,
+    repository_lock_path,
+)
 from .loop_detect import LIMIT_LOOP
 from .loop_guard import (
     RESULT_CLEAN,
@@ -1448,6 +1456,18 @@ class ControllerEngine:
         # both, and a relaunch refused because a checkout moved names the log.
         self._launch_cwd = ""
         self._launch_log: Path | None = None
+        # ADR 0008 D17.2's forward guard (#180), set by the CLI for a
+        # standalone command under L0: given an issue number, why a scheduler
+        # namespace owns it ("" when none does). One more rejection fact of
+        # :meth:`_verify_issue_selectable`, which covers a sequential run's
+        # ``next_issue_url``. ``None`` (a worker, a library caller, a dry
+        # run) checks nothing; the engine never reads scheduler files itself.
+        self.issue_ownership: Callable[[int], str] | None = None
+        # Scheduler mode's filesystem refusal (ADR 0008 D11.4), a generic
+        # input a worker sets (#182): the shared-Git lock's root and
+        # descriptor must be on a filesystem whose flock is a local kernel
+        # lock. A standalone engine never checks.
+        self.require_local_lock_filesystem = False
 
     # -- the state directory as a held capability --------------------------
     @property
@@ -1898,7 +1918,27 @@ class ControllerEngine:
         Only :meth:`_invoke_phase` reaches this, so a dry run
         never creates one; the operator removes worktrees
         (``git worktree remove``), the controller does not.
+
+        The whole check-then-create runs under the shared-Git lock (L1,
+        ADR 0008 D12.1), so the administrative writes ``git worktree add``
+        makes in the common dir never interleave with another controller
+        process's, and ``git worktree add`` runs with automatic maintenance
+        off (D12.3). A lock that is not obtained within its bound (or a
+        lock entry that is not the controller's file) fails like the
+        creation itself: a :class:`VerificationError` before anything of
+        the launch is charged or saved, and ``resume`` tries again.
         """
+        try:
+            with self._shared_git_lock("check or create the agent worktree"):
+                return self._ensure_agent_worktree_unlocked()
+        except (GitLockTimeout, LockError) as exc:
+            raise VerificationError(
+                f"cannot check or create the agent worktree: {exc}. Nothing was launched; "
+                "'resume' tries again"
+            ) from exc
+
+    def _ensure_agent_worktree_unlocked(self) -> Path:
+        """:meth:`_ensure_agent_worktree`'s section; the caller holds L1."""
         path = self.agent_worktree_path()
         ws = self.workspace()
         common = ws.git_dirs()[-1]
@@ -1971,7 +2011,7 @@ class ControllerEngine:
         # object's tree instead of HEAD's.
         res = (self._runner or execute)(
             local_git_request(
-                ["worktree", "add", "--detach", str(path), "HEAD"],
+                [*NO_AUTO_MAINTENANCE, "worktree", "add", "--detach", str(path), "HEAD"],
                 cwd=self.workdir,
                 timeout_seconds=GIT_TIMEOUT_SECONDS,
             )
@@ -2020,6 +2060,23 @@ class ControllerEngine:
             private,
             self._runner,
             exclude=tuple(sha for sha in exclude if sha),
+            git_lock=self._shared_git_lock,
+        )
+
+    def _shared_git_lock(self, operation: str) -> SharedGitLock:
+        """The shared-Git lock (L1) for one controller write to the common dir.
+
+        ADR 0008 D11.1, D12.1: around the agent worktree's check-then-create,
+        the controller's fetch (:meth:`_git_transport`), the strict import's
+        ``index-pack`` and the REMOTE sandbox directories' creation
+        (:meth:`_sandbox_dirs`), never across an agent invocation, a GitHub
+        call, a state save or another acquisition. Keyed by
+        :meth:`coordination_root`, like L0 and the scheduler namespaces.
+        """
+        return SharedGitLock(
+            self.coordination_root(),
+            operation=operation,
+            require_local_filesystem=self.require_local_lock_filesystem,
         )
 
     def _import_exclusions(self) -> tuple[str, ...]:
@@ -2267,6 +2324,7 @@ class ControllerEngine:
             common,
             f"{SANDBOX_DIR}/{self._agent_worktree_name()}",
             (PRIVATE_OBJECTS, OVERLAY_WORK, *((CACHE,) if cache else ())),
+            git_lock=self._shared_git_lock,
         )
         return LaunchFacts(
             launch_class=LaunchClass.REMOTE_AGENT,
@@ -2345,13 +2403,34 @@ class ControllerEngine:
         roots += sorted(str(r) for r in registered_worktree_roots(dirs[-1]) if r != workspace)
         return tuple(dict.fromkeys(roots))
 
-    def _sandbox_dirs(self, anchor: Path, relbase: str, names: tuple[str, ...]) -> Path:
+    def _sandbox_dirs(
+        self,
+        anchor: Path,
+        relbase: str,
+        names: tuple[str, ...],
+        *,
+        git_lock: Callable[[str], SharedGitLock] | None = None,
+    ) -> Path:
         """Create ``<anchor>/<relbase>/<name>`` for each name, refusing a link anywhere
-        below ``anchor`` (ADR 0005 D8.4); AutoForge never deletes them."""
+        below ``anchor`` (ADR 0005 D8.4); AutoForge never deletes them.
+
+        REMOTE passes ``git_lock`` (:meth:`_shared_git_lock`): there ``anchor``
+        is the common dir, whose ``autoforge/sandbox`` parent every issue's
+        engine writes, so the whole creation, that shared parent included, holds
+        L1 (ADR 0008 D12.1), and the launch after it does not. A lock not
+        obtained within its bound (or a lock entry that is not the controller's
+        file) refuses the launch like a directory that cannot be prepared, and
+        ``resume`` tries again. LOCAL's own git directory takes none.
+        """
         try:
-            with SafeRoot.open(anchor) as root:
+            with (
+                git_lock("prepare the issue's sandbox directories") if git_lock else nullcontext(),
+                SafeRoot.open(anchor) as root,
+            ):
                 for name in names:
                     root.ensure_dir(f"{relbase}/{name}")
+        except LockOrderError:
+            raise  # a controller bug (D11.2), never a launch refusal to retry
         except (AutoForgeError, OSError) as exc:
             raise SandboxLaunchRefusedError(
                 f"the sandbox cannot be established: its directory {anchor / relbase} cannot "
@@ -2740,6 +2819,7 @@ class ControllerEngine:
     def save(self) -> None:
         """Persist the current state through the held state root."""
         assert self.state is not None
+        assert_shared_git_lock_free("save the state")
         self.state.settle_phase_effects()
         self.state.settle_validation_failure()
         save_state(self.state, self.paths.state_file, root=self.state_root())
@@ -5877,7 +5957,10 @@ class ControllerEngine:
         issue just finished), exist on GitHub and be OPEN. Any of those failing
         raises :class:`VerificationError` — a problem with the *selection*. No
         GitHub read is made for a URL that already fails the local checks (a
-        foreign repository is never queried).
+        foreign repository is never queried). A standalone engine's
+        :attr:`issue_ownership` predicate is one of those local checks (ADR
+        0008 D17.2): an issue a scheduler namespace owns is refused, so an
+        UPDATE_EPIC selection of one goes through the bounded rejection path.
 
         Identity (EPIC / current issue) is compared with
         :meth:`GitHubRef.same_target`, never by URL string: owner and repository
@@ -5905,6 +5988,13 @@ class ControllerEngine:
             raise VerificationError(f"{what} {ref.canonical} is the EPIC itself")
         if switching and ref.same_target(parse_issue_url(state.current_issue_url)):
             raise VerificationError(f"{what} {ref.canonical} is the issue that was just finished")
+        if self.issue_ownership is not None:
+            owner = self.issue_ownership(ref.number)
+            if owner:
+                raise VerificationError(
+                    f"{what} {ref.canonical} is owned by the parallel EPIC scheduler: {owner}. "
+                    "A standalone run never acts on it; 'autoforge epic archive' releases it"
+                )
         try:
             issue = self.github.get_issue(ref.canonical)
         except GitHubNotFoundError as exc:
@@ -8245,6 +8335,7 @@ class ControllerEngine:
             remote=remote,
             gh_command=self.config.github.command,
             in_base_history=lambda base, sha: github.commit_in_history(repository, base, sha),
+            git_lock=self._shared_git_lock,
             runner=self._runner,
         )
 
@@ -11018,6 +11109,7 @@ class ControllerEngine:
         their text (:meth:`_state_unchanged_text`) from the working directory
         and the step log directory recorded here (#189).
         """
+        assert_shared_git_lock_free(f"launch the {phase.value} agent")
         state = self._require_state()
         profile = profile_for_phase(self.config, phase, state.review_round)
         provider = self.providers.get(profile)

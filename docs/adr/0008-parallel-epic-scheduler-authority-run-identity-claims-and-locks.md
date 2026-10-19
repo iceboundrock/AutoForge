@@ -973,7 +973,7 @@ claim match is a consistency check, not authority.
 |---|---|---|---|
 | Orchestration | L0: `flock` on the common-dir descriptor | standalone mutating commands; the scheduler (workers inherit it) | `LOCK_EX \| LOCK_NB`, held for the command or scheduler lifetime. Close-only release once shared (D10.3). |
 | Per-issue run | L2: `scheduler/issues/<n>/run.lock` | only the L0-holding scheduler, which hands it to exactly one worker | `LOCK_EX \| LOCK_NB`. Hardened open like `controller.lock` (`O_NOFOLLOW`, `O_CLOEXEC`, regular file, one link, never unlinked). The scheduler closes its copy right after the spawn, by `close` only. |
-| Shared Git | L1: `<common dir>/autoforge/git.lock` | any controller process (standalone or worker) around a controller write to git's shared data in the common dir (D12) | `LOCK_EX` with a bounded blocking wait (D11.3). Held for one critical section of D12.1 (one git write, or the worktree check-then-create), never across an agent invocation, a GitHub call, a state save or another acquisition. |
+| Shared Git | L1: `<common dir>/autoforge/git.lock` | any controller process (standalone or worker) around a controller write to git's shared data in the common dir (D12) | `LOCK_EX` with a bounded blocking wait (D11.3). Held for one critical section of D12.1 (one git write, the worktree check-then-create, or the REMOTE sandbox directories' creation), never across an agent invocation, a GitHub call, a state save or another acquisition. |
 | External effect | none new | — | Controller effects are per issue and are serialized by that issue's L2 (worker) or L0 (standalone); D13 shows why their targets are per issue. Independent issues' effects are not serialized against each other. No `SchedulerEffect`. |
 | Parent EPIC | deferred to Wave 2 | — | Wave 1 workers never write the EPIC (no `UPDATE_EPIC`, roadmap splice or progress comment) and never merge. |
 | Scheduler files | none | single writer: the L0 holder. One exception: `stop-request` (D16.4). | Lock-free readers, through atomic replace. `stop-request` is published by `link(2)` and never replaced. |
@@ -1033,7 +1033,7 @@ type.
 | Worktree existence and registration check plus `git worktree add --detach` | `engine.py` `_ensure_agent_worktree` (:1853, :1959) | `worktrees/<id>/`, the worktree | yes, the whole check-then-create section. Defensive: L0 serializes it today, and in scheduler mode one issue's L2 already excludes a second creation of the same path; L1 serializes the shared administrative writes of `git worktree add` for different issues. |
 | Controller fetch | `git_transport.py` `GitTransport.fetch` (:526), for every caller: `engine.py` :6089, :9224, :9428, :10052; `premerge.py` :152; `read_commit`'s re-fetch (`git_transport.py` :673) | objects (loose or one pack) in `objects/`; no ref, no `FETCH_HEAD` | yes, taken inside `GitTransport.fetch` itself, so no caller can miss it. Only standalone runs reach the pre-merge fetch: workers never open the merge gate. |
 | Strict import of the private objects | `agent_worktree.py` `import_private_objects` (:486), from `engine.py` :2021 and :2032 | one pack in `objects/pack/` | yes, around `index-pack` alone. The walk, `rev-list` and `pack-objects` read the store and write only into a private scratch directory. |
-| Sandbox directories | `engine.py` `_sandbox_dirs` (:2333) | `autoforge/sandbox/<key>/{objects,overlay-work,cache}` | no. They are not git data, and the key is the issue's, so only that issue's owner (L2 or L0) creates them. The shared parent `autoforge/sandbox` may be created by two workers at once, which `SafeRoot.ensure_dir` already tolerates: an existing directory counts as created once it is opened `O_DIRECTORY \| O_NOFOLLOW` (`safefs.py` `ensure_dir` :798, through `_walk` :752–789). |
+| Sandbox directories | `engine.py` `_sandbox_dirs` (:2333), from `_remote_facts` | `autoforge/sandbox/<key>/{objects,overlay-work,cache}` | yes, in REMOTE, around the whole creation, the shared parent `autoforge/sandbox` included, and not the launch after it. They are not git data, and the key is the issue's, so only that issue's owner (L2 or L0) creates `<key>`; but every issue's engine writes the shared parent, and #180's acceptance criteria put every controller write to the common dir under L1 (#168's inventory note on #180). A lock not obtained in time refuses the launch as a sandbox directory that cannot be prepared. LOCAL's `<git dir>/autoforge/sandbox/local` is unchanged. |
 | Controller push (K1) | `git_transport.py` `GitTransport.push` (:751) | nothing: a private `GIT_DIR`, no local ref | no. A commit it must re-fetch goes through `GitTransport.fetch`, which takes L1. |
 | Lock directory and PID record | `locking.py` | `autoforge/`, `controller.lock` | no: written under L0, by its acquirer only (D10.2) |
 | Worktree removal or prune | none: AutoForge never removes a worktree | — | not applicable |
@@ -1092,10 +1092,20 @@ with the rationale recorded here, before #180 merges.
 | Two controller fetches into one common dir, from two workers, leave a sound store and no ref | `test_l1_concurrent_controller_fetches_into_one_common_dir` |
 | An import concurrent with a read-only byte-exact export of another commit neither fails the export's proof nor corrupts the store | `test_l1_import_concurrent_with_read_only_export` |
 | Agents committing on distinct detached worktrees at once (the `disabled` residual) lose no commit, and any failure is a transient git error | `test_concurrent_agent_commits_on_distinct_worktrees` |
-| Two `_sandbox_dirs` calls for different keys at once both succeed | `test_concurrent_sandbox_dirs_for_different_keys` |
+| Two `_sandbox_dirs` calls for different keys at once both succeed, each holding L1 alone | `test_l1_concurrent_sandbox_dirs_for_different_keys` |
 | No launch inherits L0, L1 or L2 | `test_no_launch_inherits_a_lock_descriptor` |
 | L1 writes run with automatic maintenance off | `test_l1_writes_disable_automatic_maintenance` |
-| Every call site of a common-dir write holds L1 | `test_every_common_dir_write_holds_l1` |
+| Every call site of a common-dir write holds L1 | `test_every_common_dir_write_holds_l1`, `test_remote_sandbox_dirs_are_created_under_l1_and_the_agent_runs_without_it` |
+
+Every claim above is backed by its test (`tests/test_shared_git.py`, and
+`tests/test_lock_domains.py` for the descriptors), so #180 removed none. On
+git 2.56, a fetch into a store past `gc.autoPackLimit` repacks it unless
+automatic maintenance is off (either option alone already stops it; both
+are given), while `worktree add` and `index-pack` start no maintenance
+either way and carry the options all the same. #180 also moved the REMOTE
+sandbox directories' creation under L1, where D12.1 first said "no": #168's
+inventory note on #180 names it a controller write to the common dir, and
+#180 puts every such write under L1. Its two tests above back the change.
 
 ### 2.13 Stale-worker fencing before controller effects (decision 13)
 
@@ -1393,11 +1403,15 @@ complete, or write to GitHub.
 configuration gate and #211's acceptance actions. No existing state is
 migrated. **Exclusion in time** is L0 (D10).
 
-**D17.2 (#181).** **Exclusion in ownership.**
+**D17.2 (#180, #181).** **Exclusion in ownership.**
 
 - **Forward guard: a standalone run against a scheduler-owned issue.**
   - A namespace that has an open claim or any `state/state.json` owns its
-    issue until `epic archive` releases it.
+    issue until `epic archive` releases it. So does one whose run lock a
+    live owner holds (the D8.3 probe), and one that cannot be read
+    (fail-closed). #180 implements the state and run-lock halves and the
+    reverse guard's read (`ownership.py`); #181 adds the open-claim half
+    with the claim schema.
   - A standalone controller refuses to bind or continue an issue that a
     namespace owns, whatever that state's phase. A scheduler-`BLOCKED` or
     `READY_FOR_MERGE` issue therefore never gets a second, standalone
@@ -1575,8 +1589,8 @@ certificates (#170–#175) are consumed, not changed.
 |---|---|---|
 | #178 | run identities and namespaces | D2.2 step 5 (the binding), D5.1–D5.5, D17.3 |
 | #179 | dependency snapshots and the ready set | D2.2 steps 1 and 4, D2.5, D3.1–D3.6, D4.1, D4.2, D4.4 |
-| #180 | lock domains | D2.2 step 2, D8.3 (the probe), D8.4, D9.2 step 1 (`ControllerLock.adopt`), D10.2–D10.4, D11.1, D11.3, D11.4, D12.1, D12.3, D12.5 |
-| #181 | scheduler claims and restart reconciliation | D2.2 steps 3 and 5 (the claim), D6.1–D6.3, D7.1–D7.3, D8.2, D14.1–D14.5, D15.1, D17.2; the claim closure of D17.4 |
+| #180 | lock domains | D2.2 step 2, D8.3 (the probe), D8.4, D9.2 step 1 (`ControllerLock.adopt`), D10.2–D10.4, D11.1, D11.3, D11.4, D12.1, D12.3, D12.5; D17.2's state and run-lock halves of the forward guard and the reverse guard's read |
+| #181 | scheduler claims and restart reconciliation | D2.2 steps 3 and 5 (the claim), D6.1–D6.3, D7.1–D7.3, D8.2, D14.1–D14.5, D15.1, D17.2 (the open-claim half); the claim closure of D17.4 |
 | #182 | the bounded worker supervisor | D2.2 (the orchestration) and its step 6, D2.3, D4.3, D9.1–D9.7, D13.3, D15.3, D16.1, D16.3, D16.4, D18.3, D18.4 |
 | #183 | `epic` commands and end-to-end recovery tests | D8.3 (its use in `epic status`), D9.8, D14.4 (the commands), D14.5 (end to end), the `epic stop` command of D16.4, D17.4 |
 | documentation only | | D1.1, D1.2, D2.1, D2.4, D7.4, D8.1, D8.5, D10.1, D10.5, D10.6, D11.2, D12.2, D12.4, D13.1, D13.2, D13.4, D15.2, D16.2, D16.5, D17.1, D17.5 |
@@ -1605,8 +1619,9 @@ certificates (#170–#175) are consumed, not changed.
 - **There are five controller writes to the common dir, not two** (§1.1).
   #161's verified default-branch fetch and #168's strict import have
   landed, along with the `REVIEW`, `FIX` and `REPLAN_REEXECUTE` fetches.
-  The three that write git's data take L1 (D12.1); the sandbox directories
-  and the lock's own files are inventoried and take none.
+  The three that write git's data and the REMOTE sandbox directories'
+  creation take L1 (D12.1); the lock's own files are inventoried and take
+  none.
 - **The controller's push updates no local ref.** #177's row "controller
   push transport (local remote-tracking ref update)" does not exist: the
   push writes nothing to the common dir, and its re-fetch is a fetch

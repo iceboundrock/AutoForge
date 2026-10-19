@@ -52,7 +52,11 @@ steering it.
   a non-fast-forward. No ``--force``, no ``+``, no delete.
 
 Fetches write objects only (D6.4): no ref is created or moved anywhere, the
-private directory included, so AutoForge owns no ref lifecycle.
+private directory included, so AutoForge owns no ref lifecycle. A fetch is a
+controller write to the shared object store, so it runs under the shared-Git
+lock (L1, ADR 0008 D12.1), taken inside :meth:`GitTransport.fetch` itself
+from the factory every transport is built with, so that no caller can miss
+it; a push writes nothing to the shared store and takes none.
 
 Every process runs through the executor (``runner``); this module has no
 workflow semantics beyond the rules above, and it never talks to the GitHub
@@ -70,12 +74,12 @@ import shutil
 import tempfile
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from .errors import ExecutionError, GitTransportError
+from .errors import ExecutionError, GitLockTimeout, GitTransportError, LockError
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .redaction import redact
 
@@ -107,6 +111,17 @@ LOCAL_GIT_SWITCHES: tuple[str, ...] = (
     "-c",
     "core.fsmonitor=false",
 )
+
+# Automatic maintenance off for one controller write to the shared store
+# (ADR 0008 D12.3): neither ``git gc --auto`` nor ``git maintenance run
+# --auto`` may start there from a controller write. Verified against git
+# 2.56 (tests/test_lock_domains.py): a fetch into a store past
+# ``gc.autoPackLimit`` repacks it without these options and leaves it alone
+# with them; ``worktree add`` and ``index-pack`` start no maintenance either
+# way and carry them so that a later git cannot change that. Every fetch
+# (with ``--no-auto-gc`` as well), the agent worktree's ``worktree add`` and
+# the strict import's ``index-pack`` carry both.
+NO_AUTO_MAINTENANCE: tuple[str, ...] = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
 
 # The environment a controller git process that holds no credential starts
 # from (D7.3): ``PATH`` to find git, the locale, ``TMPDIR`` for git's
@@ -408,6 +423,10 @@ class GitTransport:
     commit GitHub does not hold); any exception it raises fails the walk
     closed. ``object_format`` is used only when an operation names no SHA
     (a fetch of refs alone); otherwise the SHAs' own format is used.
+    ``git_lock(operation)`` returns the shared-Git lock (L1) of the store's
+    common dir, a context manager :meth:`fetch` holds around its git
+    process (ADR 0008 D12.1); it is required, so no transport fetches
+    without it.
     """
 
     def __init__(
@@ -417,6 +436,7 @@ class GitTransport:
         remote: GitRemote,
         gh_command: str = "gh",
         in_base_history: Callable[[str, str], bool],
+        git_lock: Callable[[str], AbstractContextManager[object]],
         runner: Runner | None = None,
         max_range_commits: int = MAX_RANGE_COMMITS,
         object_format: str = "sha1",
@@ -429,6 +449,7 @@ class GitTransport:
         self._remote = remote
         self._gh_command = gh_command
         self._in_base_history = in_base_history
+        self._git_lock = git_lock
         self._runner: Runner = runner or execute
         self._max_range_commits = max_range_commits
         self._default_format = object_format
@@ -481,7 +502,7 @@ class GitTransport:
         """One git process in ``git_dir``; a network one when ``gh_path`` is given."""
         # No promisor remote can be configured in the private directory, so a
         # missing object is never fetched lazily behind this module's back.
-        switches = [*LOCAL_GIT_SWITCHES, "-c", "gc.auto=0", "-c", "maintenance.auto=false"]
+        switches = [*LOCAL_GIT_SWITCHES, *NO_AUTO_MAINTENANCE]
         switches += ["-c", "protocol.allow=never"]
         if gh_path is not None:
             switches += ["-c", f"protocol.{self._remote.scheme}.allow=always"]
@@ -530,6 +551,11 @@ class GitTransport:
         ``refs/heads/main``). No destination is given, tags are not followed,
         ``FETCH_HEAD`` is not written and submodules are not touched, so no
         ref is created or moved, the private directory's included (D6.4).
+        The git process runs under the shared-Git lock (L1, ADR 0008 D12.1);
+        a lock not obtained within its bound
+        (:class:`~autoforge.errors.GitLockTimeout`), or a lock entry that is
+        not the controller's file, is this fetch failing
+        (:class:`GitTransportError`), never retried here (D11.3).
         """
         if isinstance(revisions, str):
             raise GitTransportError("fetch takes a sequence of revisions, not one string")
@@ -559,7 +585,13 @@ class GitTransport:
                 ],
                 gh_path=gh_path,
             )
-            result = self._run(request, f"fetching {shown} from {self._remote.url} failed")
+            try:
+                with self._git_lock(f"fetch {shown}"):
+                    result = self._run(request, f"fetching {shown} from {self._remote.url} failed")
+            except (GitLockTimeout, LockError) as exc:
+                raise GitTransportError(
+                    f"fetching {shown} from {self._remote.url} failed: {exc}"
+                ) from exc
         if result.timed_out:
             raise GitTransportError(
                 f"fetching {shown} from {self._remote.url} timed out after "

@@ -39,6 +39,7 @@ from autoforge.git_transport import (
     RangeProof,
     published_range_problem,
 )
+from autoforge.locking import SharedGitLock
 
 IDENT = ("-c", "user.name=t", "-c", "user.email=t@example.com")
 CREDENTIAL = "fake-credential-0123456789"
@@ -145,6 +146,7 @@ class World:
     def transport(self, **kwargs) -> GitTransport:
         kwargs.setdefault("gh_command", str(self.gh))
         kwargs.setdefault("runner", self.runner)
+        kwargs.setdefault("git_lock", lambda op: SharedGitLock(self.objects.parent, operation=op))
         return GitTransport(
             object_directory=self.objects,
             remote=GitRemote(url=self.url),
