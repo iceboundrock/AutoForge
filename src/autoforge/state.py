@@ -1793,7 +1793,9 @@ def load_state(path: str | Path, *, root: SafeRoot | None = None) -> AutoForgeSt
 _QUARANTINE_MAX_ATTEMPTS = 1000
 
 
-def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> Path:
+def quarantine_state_file(
+    path: str | Path, *, root: SafeRoot | None = None, what: str = "corrupted state file"
+) -> Path:
     """Move an unreadable state file aside instead of deleting it.
 
     Renames ``<path>`` to ``<path>.corrupt-<UTC timestamp>`` (a numeric
@@ -1827,13 +1829,19 @@ def quarantine_state_file(path: str | Path, *, root: SafeRoot | None = None) -> 
     must hold the controller lock (the CLI does, via
     ``ControllerEngine.locked()``): a writer replacing ``path`` between the
     two syscalls would see the replacement removed.
+
+    ``what`` names the file in every refusal: the scheduler quarantines its
+    own ``scheduler.json`` with this primitive (``epic run --force``, ADR
+    0008 D6.3, :func:`autoforge.scheduler_state.quarantine_scheduler_state`).
     """
     return _move_state_file_aside(
-        path, root=root, suffix=CORRUPT_SUFFIX, what="corrupted state file", verb="quarantined"
+        path, root=root, suffix=CORRUPT_SUFFIX, what=what, verb="quarantined"
     )
 
 
-def archive_state_file(path: str | Path, *, root: SafeRoot | None = None) -> Path:
+def archive_state_file(
+    path: str | Path, *, root: SafeRoot | None = None, what: str = "state file"
+) -> Path:
     """Move a *readable* state file aside as ``<path>.archived-<UTC timestamp>``.
 
     The same primitive as :func:`quarantine_state_file`, with its own
@@ -1845,10 +1853,12 @@ def archive_state_file(path: str | Path, *, root: SafeRoot | None = None) -> Pat
     :func:`autoforge.run_namespace.archive_issue_state`), whose caller holds
     the issue's exclusive authority as quarantining's holds the controller
     lock. Raises StateError when there is nothing at ``path`` or the move
-    fails; the original entry is left untouched in that case.
+    fails; the original entry is left untouched in that case. ``what`` names
+    the file in every refusal: ``epic archive`` moves a corrupt ``claim.json``
+    aside with this primitive (:func:`autoforge.scheduler_state.archive_claim`).
     """
     return _move_state_file_aside(
-        path, root=root, suffix=ARCHIVED_SUFFIX, what="state file", verb="archived"
+        path, root=root, suffix=ARCHIVED_SUFFIX, what=what, verb="archived"
     )
 
 

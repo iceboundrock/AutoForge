@@ -15,7 +15,7 @@ own, found again from the repository alone after a crash:
       <git common dir>/autoforge/scheduler/issues/<n>/
         run.lock          L2, reserved: #180 creates it, nothing here does
         binding.json      autoforge.run-binding/1 (this module)
-        claim.json        reserved: #181 writes and parses it
+        claim.json        autoforge.scheduler-claim/1: scheduler_state.py (#181), never here
         state/            an ordinary state directory (state.json, logs/, read-context/)
         workers/          worker console logs (#182)
 

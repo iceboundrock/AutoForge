@@ -143,6 +143,11 @@ lock domains (#180)                   test_lock_domains.py (L0 sharing and adopt
                                       real processes), test_shared_git.py (ADR 0008 D12.5,
                                       real git); ownership guards: test_ownership.py,
                                       test_cli.py, test_engine.py (next_issue_url)
+scheduler claims, scheduler.json and  test_scheduler_state.py (strict files, the closing rule,
+restart reconciliation (#181)         compare-and-write, classification, every crash window
+                                      with real L0/L2 holders, finalization, archive);
+                                      issue_settlement: test_transitions.py; the open-claim
+                                      guard: test_ownership.py, test_cli.py
 REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.py; load and
                                       protocol: test_state.py)
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py

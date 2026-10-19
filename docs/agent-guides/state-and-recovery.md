@@ -581,9 +581,11 @@ L1, and only tests take L2:
   `step`, `resume` and `unblock` refuse (exit 2, `SchedulerOwnedIssueError`
   naming `autoforge epic archive`) an issue a scheduler namespace owns,
   checked under L0 before anything is written: the namespace holds any
-  `state/state.json` (loaded or not) or a live owner holds its L2, and a
-  namespace that cannot be read owns its issue (fail-closed). #181 adds the
-  open-claim half. The CLI hands the standalone engine the same predicate
+  `state/state.json` (loaded or not), its `claim.json` holds an open claim
+  (#181), or a live owner holds its L2; a namespace or a claim file that
+  cannot be read (an unknown claim schema included) owns its issue
+  (fail-closed), and a claim file of closed claims only owns nothing. The
+  CLI hands the standalone engine the same predicate
   (`ControllerEngine.issue_ownership`), one more rejection fact of
   `_verify_issue_selectable`, so a sequential run's `next_issue_url` naming
   an owned issue takes the bounded rejection path. A worker engine gets no
@@ -758,9 +760,10 @@ The parallel EPIC scheduler
 D5, D17.3) gives every issue a stable identity and a directory of its own,
 found again from the repository alone after a crash. #178 implements the
 identity, the layout and the files it owns (`src/autoforge/run_namespace.py`);
-#180 the run lock and the ownership guards (Locking, above); the claim, the
-scheduler and its workers are #181–#183, so no command creates a namespace
-yet.
+#180 the run lock and the ownership guards (Locking, above); #181 the claim
+file, the per-EPIC scheduler state and restart reconciliation
+(`src/autoforge/scheduler_state.py`, below); the scheduler and its workers
+are #182–#183, so no command creates a namespace yet.
 
 - **RunKey** is `(repository_id, issue_number)`: GitHub's numeric
   repository id and the issue number, both positive integers, rendered
@@ -775,7 +778,7 @@ yet.
   <git common dir>/autoforge/scheduler/issues/<n>/
       run.lock         L2 (#180): created by its first acquisition, never removed
       binding.json     autoforge.run-binding/1 (below)
-      claim.json       reserved: the scheduler claim (#181)
+      claim.json       autoforge.scheduler-claim/1: the scheduler claim (#181, below)
       state/           an ordinary state directory: state.json, logs/<run-id>/,
                        read-context/<run-id>/ (the layout above, unchanged)
       workers/         worker console logs (#182)
@@ -839,7 +842,7 @@ yet.
   re-run completes the move. With no state it reports nothing to archive
   and changes nothing; logs, worker logs, binding, claim and worktree are
   kept. The caller holds the issue's L2 (#180); `epic archive` (#183) closes
-  the claim first (D17.4).
+  the claim first (D17.4, `archive_claim`, below).
 - **Engine binding.** `ControllerEngine.bind_issue_namespace(namespace)`
   points an engine's `paths` at the namespace's anchored state directory
   before the run starts, as `bind_local_state_dir` does for LOCAL, so a
@@ -869,6 +872,109 @@ No per-issue state field, protocol number or state migration comes with
 any of this: the state inside a namespace is an ordinary `AutoForgeState`,
 and an existing standalone `.autoforge/` or LOCAL state is never read,
 moved or rewritten by a namespace function.
+
+### Scheduler claims, scheduler state and restart reconciliation
+
+#181 implements ADR 0008 D6, D7 and D14 in `src/autoforge/scheduler_state.py`;
+#182's scheduler is its caller. **A claim is recovery data, not liveness:**
+an issue has a live owner exactly when a process holds its L2. A claim
+records which generation of which invocation was admitted, so a restarted
+scheduler can tell an interrupted assignment from a settled one. Nothing in
+the module spawns a process, reads or writes GitHub, writes or quarantines a
+per-issue state or parses `CONTROL_RESULT`; timestamps and PIDs are
+diagnostics, and every `detail` is redacted and bounded (500 characters).
+
+- **`claim.json`**, schema `autoforge.scheduler-claim/1` (D7.1): `run_key`,
+  `issue_id` and `epic` (copied from the binding), `next_generation`,
+  `current` (the one open claim, or `null`), `history` (at most 16 closed
+  claims, oldest dropped) and `updated_at`. A claim holds `claim_id` (32
+  random hex), `generation`, `invocation_id`, `kind` (`start`, `resume`),
+  `admission` {`snapshot_digest`, `node_digest`, `observed_at`},
+  `state_ref` {`present`, `run_id`, `settlement`} at admission,
+  `created_at` and `worker` (`null` or {`pid`, `process_start_time`,
+  `spawned_at`, `log`}, diagnostics only). A closed claim adds `closed`
+  {`at`, `classification`, `settlement`, `exit_status`, `detail`}. Loading
+  is strict: an unknown schema (refused as a version before any field), an
+  unknown or missing field at any level, a duplicated key, `NaN`, a value
+  out of its bound, a file over 1 MiB, not UTF-8 JSON or reached through a
+  link, generations out of order, a `current` that is not the last
+  generation allocated, a claim id used twice or a history the closing rule
+  forbids is a `SchedulerStateError`. Generations are monotonic within the
+  file.
+- **One closing rule** (D7.2). `superseded` only in the write that installs
+  the replacing claim (`open_claim(..., supersedes=)`); a claim closed
+  without a replacement is `abandoned` when no worker was recorded on it
+  and `interrupted` when one was; `settled` needs a settlement other than
+  `in_progress`; `archived` is `epic archive`'s. The rule is decided on the
+  claim as it is on disk, so a caller's stale copy cannot pick the other
+  class.
+- **Writers.** `open_claim`, `close_claim`, `close_unready`,
+  `finalize_worker` and `archive_claim` take the issue's held
+  `IssueRunLock` as an argument (refused, `SchedulerStateError`, without
+  it), and every write is refused while this process holds L1
+  (`LockOrderError`). `record_worker` writes the diagnostics of a claim the
+  scheduler just spawned, without L2 (the worker holds it), once. Each write
+  compares `(claim_id, generation)` on disk with the caller's record first:
+  a mismatch, or a slot already taken, is `ClaimConflict` and the file is
+  left as it is, so a stale claimant cannot finalize a newer generation. A
+  claim is written only over this namespace's own file: no binding, a claim
+  file that does not load, or one naming another run or EPIC than the
+  binding is refused. Writes are atomic (fsynced temporary, `replace`,
+  directory fsync) through `safefs` from the coordination root, so a claim
+  is durable before `open_claim` returns, before any worker exists.
+- **`scheduler.json`**, schema `autoforge.scheduler/1` (D6), at
+  `<git common dir>/autoforge/scheduler/epics/<n>/scheduler.json`:
+  `repository` {`owner`, `name`, `repository_id`}, `epic`, `invocation`
+  {`invocation_id`, `started_at`, `ended_at`, `end_reason`},
+  `config` {`max_parallel` 1–4, `poll_interval_seconds` 15–3600,
+  `stop_grace_seconds` 10–600, `config_digest`}, `admission` {`status`
+  `open` / `closed` / `degraded`, `reason`, paired as D6 says},
+  `last_snapshot` (digest, time, bounded counts) and timestamps. It holds
+  run-level facts only, never a claim (a `claims` field is refused), so the
+  two files cannot disagree. Loading is as strict as a claim file's; a
+  corrupt one is global uncertainty, moved aside only on request
+  (`quarantine_scheduler_state`, for #182's `epic run --force`:
+  `scheduler.json.corrupt-<UTC timestamp>`), and a readable one never is.
+- **Restart classification** (D14.2, `classify`) is pure: given #178's
+  strict lookup and the claim file, read under L2, a namespace is, checked
+  in this order, `uncertain(reason)` (the binding cannot be read or does not
+  match the repository and issue ids the caller expects; a claim file or a
+  state without a binding; a corrupt state, an unknown protocol included; a
+  corrupt claim file or one of an unknown schema; a claim file or a state
+  naming another run or EPIC than the binding; an open claim admitted with a
+  state, `state_ref.present`, whose state is absent), `settled(settlement)`,
+  `resumable(in-progress | not-started)` or `fresh`. The `present` rule
+  applies only to an open claim. The scheduler sees a state only through
+  `transitions.issue_settlement` (D15.1): `awaiting_input` (a durable pause,
+  #126's, checked before the phase), then `terminal`, `ready_for_merge`,
+  `handoff` or `in_progress` from the total `PHASE_SETTLEMENT` table.
+- **Reconciliation** (`reconcile_epic`, D14.1) runs under L0 before any
+  admission, in ascending issue number. The caller's own children are
+  `owned`; otherwise L2 is taken non-blocking and a held one is `owned`
+  (`observed_live`) for this pass and never reclassified. Holding L2: a
+  namespace bound under another EPIC is `held:other-epic` and left alone; an
+  uncertain one keeps its claim open and is `held:uncertain` with its
+  reason; a settled one has its open claim closed `settled` and is
+  `held:settled-namespace`, never relaunched; resumable and fresh ones
+  contribute no local fact and resumable claims stay open, for admission's
+  supersession or `close_unready` (a snapshot no longer shows the issue
+  ready). A run lock that cannot be used is `uncertain(run-lock-unusable)`;
+  a binding of another repository, a run lock on a network filesystem, or a
+  namespace listing that cannot be read is global uncertainty (the report
+  is not `admissible`). It never spawns, writes a per-issue state or
+  contacts GitHub.
+- **Finalization** (`finalize_worker`): after a worker exits and the
+  scheduler re-acquires L2, the claim is closed by the state the worker
+  left: `settled`, or `interrupted` / `abandoned` by the closing rule for an
+  in-progress or never-saved state; anything uncertain, or an open claim on
+  disk that is not the reaped worker's, leaves it open. The exit status is
+  recorded and never decides.
+- **Queries.** `open_claims_for_epic` (D14.4, behind `epic run`'s refusal)
+  lists an EPIC's open claims and every claim file that cannot be read
+  (fail-closed), lock-free and read-only. `archive_claim` (D17.4) closes an
+  open claim `archived` whatever the state holds, moves a claim file the
+  writers refuse aside (`claim.json.archived-<UTC timestamp>`, link then
+  unlink), and otherwise changes nothing.
 
 ---
 
@@ -943,6 +1049,15 @@ identity in which a binding differs from what its caller expects; the
 binding is never rewritten to agree. `SchedulerStateDirError` is a
 `ConfigurationError`: a standalone command pointed at a state directory in
 the scheduler root (exit 2, nothing read or written).
+
+The scheduler files (#181, above) add two, neither retried and neither
+overwriting anything. `SchedulerStateError` is a `StateError`: a
+`claim.json` or `scheduler.json` that is not a valid document of its
+schema, a close the closing rule refuses, or a claim operation called
+without the issue's held L2. `ClaimConflict` is a `SchedulerStateError`:
+the claim on disk is not the caller's (`claim_id`, `generation`), or the
+slot is taken; classification treats it as uncertain. It is unrelated to
+`ClaimConflictError`, which is about GitHub claims.
 
 ---
 

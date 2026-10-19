@@ -244,6 +244,41 @@ High-priority coverage includes:
   `next_issue_url` the predicate refuses takes the bounded rejection path;
   the reverse read holds every phase but `DONE` and reports an unreadable
   state
+- scheduler claims, scheduler state and restart reconciliation (#181, ADR
+  0008 D6, D7, D14, D15.1, D17.2, `tests/test_scheduler_state.py`,
+  `tests/test_transitions.py`, `tests/test_ownership.py`,
+  `tests/test_cli.py`): `claim.json` and `scheduler.json` round-trip, and
+  each unknown field (at every level), unknown schema, out-of-bound or
+  mistyped value, history over 16, broken generation order, history the
+  closing rule forbids, duplicated key, `NaN`, non-UTF-8, oversized or
+  linked file is refused untouched, as is a `claims` field in
+  `scheduler.json`; only a corrupt `scheduler.json` is quarantined. A claim
+  is fsynced before `open_claim` returns, one is open per issue,
+  generations are monotonic, a supersede is exactly one write and compares
+  with the open claim, the closing rule is decided on the claim on disk,
+  `detail` is redacted and bounded, `record_worker` records once, and a
+  writer of generation 3 cannot close, record or finalize generation 4.
+  Every claim write needs the issue's held L2 and is refused under L1, and
+  only over its own namespace's claim file. Every row of #181's crash-window
+  table, with real child processes holding L2 (and L0) through `pass_fds`:
+  nothing before the claim, a binding alone `fresh`, a claim before the
+  spawn `resumable` and kept open (superseded on re-admission or closed
+  `abandoned` by `close_unready`), a live worker `owned` and never
+  reclassified while it holds L2 (then classified by its state), a crashed
+  scheduler's L0 and two L2s with its worker (a new L0 refused; then each
+  issue by its state), a settled worker not finalized (`BLOCKED`, `DONE`,
+  `FAILED`, `READY_FOR_MERGE`, `MERGE`, `UPDATE_EPIC`) closed `settled` and
+  never relaunched, a killed worker `resumable`, and both `epic archive`
+  windows. Each uncertain trigger keeps its claim open and holds the issue
+  with its reason; another EPIC's namespace is `held:other-epic` and left
+  alone; reconciliation skips its own children, never spawns or writes a
+  state, and reports a repository mismatch, a network-filesystem run lock
+  and an unlistable root as global; finalization's matrix (exit status
+  never decides); `archive_claim` closes, moves aside and is idempotent;
+  `open_claims_for_epic` fails closed. Every phase has exactly one
+  settlement and a durable pause comes first; an open claim without a
+  state owns its issue for `run`, a claim file of closed claims owns
+  nothing, and an unreadable one owns its issue
 
 ### Transitions
 

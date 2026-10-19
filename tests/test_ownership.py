@@ -1,7 +1,8 @@
 """Who may act on an issue: the forward and reverse guards of ADR 0008 D17.2 (#180).
 
 The forward guard's predicate (a scheduler namespace owns its issue when it
-holds a state or a live worker holds its run lock; fail-closed) and the
+holds a state, its claim file holds an open claim (#181) or a live worker
+holds its run lock; fail-closed) and the
 reverse helper (the issue a standalone state holds). Both only read. The
 CLI's use of the forward guard is tested in ``test_cli.py``, the engine's in
 ``test_engine.py``.
@@ -25,6 +26,14 @@ from autoforge.ownership import (
     standalone_ownership_predicate,
 )
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
+from autoforge.scheduler_state import (
+    Admission,
+    ClaimClassification,
+    ClaimKind,
+    StateRef,
+    close_claim,
+    open_claim,
+)
 from autoforge.state import AutoForgeState, save_state
 from autoforge.transitions import Phase, WorkflowMode
 
@@ -100,22 +109,75 @@ def test_a_namespace_holding_a_state_that_cannot_be_read_owns_its_issue(common):
     assert _tree(common) == before, "never quarantined"
 
 
-def test_a_bound_namespace_without_a_state_or_a_live_owner_does_not_own(common):
-    """The claim half of the predicate is #181's; a binding alone is no ownership."""
-    ns = issue_namespace(common, 7)
+def _bind(common: Path, n: int = 7):
+    ns = issue_namespace(common, n)
     write_binding(
         ns,
         RunBinding(
-            run_key=RunKey(700_001, 7),
-            issue_id=9_007,
+            run_key=RunKey(700_001, n),
+            issue_id=9_000 + n,
             repository_owner="owner",
             repository_name="repo",
             epic=EpicRef(number=1, issue_id=8_001),
-            worktree_path="/work/autoforge/worktrees/7",
+            worktree_path=f"/work/autoforge/worktrees/{n}",
             created_at="2026-10-18T00:00:00+00:00",
         ),
     )
+    return ns
+
+
+def _open_claim(ns):
+    with IssueRunLock(ns) as lock:
+        return open_claim(
+            ns,
+            lock,
+            kind=ClaimKind.START,
+            invocation_id="0" * 32,
+            admission=Admission("a" * 64, "b" * 64, "2026-10-18T00:00:00+00:00"),
+            state_ref=StateRef.absent(),
+        )
+
+
+def test_a_bound_namespace_without_a_state_a_claim_or_a_live_owner_does_not_own(common):
+    """A binding alone is no ownership."""
+    _bind(common)
     assert scheduler_ownership(common, 7) == ""
+
+
+def test_an_open_claim_without_a_state_owns_its_issue(common):
+    """The open-claim half (#181): admitted, its worker not yet started, or never recorded."""
+    ns = _bind(common)
+    _open_claim(ns)
+    before = _tree(common)
+    reason = scheduler_ownership(common, 7)
+    assert "holds an open scheduler claim (generation 1, a start admission)" in reason
+    assert _tree(common) == before, "read-only"
+
+
+def test_a_claim_file_of_closed_claims_only_owns_nothing(common):
+    ns = _bind(common)
+    claim = _open_claim(ns)
+    with IssueRunLock(ns) as lock:
+        close_claim(ns, lock, claim, ClaimClassification.ABANDONED)
+    assert scheduler_ownership(common, 7) == ""
+
+
+@pytest.mark.parametrize("damage", ["garbage", "unknown schema", "symlink"])
+def test_an_unreadable_claim_file_owns_its_issue(common, tmp_path, damage):
+    """Fail-closed: a claim file the scheduler cannot read may hold an open claim."""
+    ns = _bind(common)
+    if damage == "garbage":
+        ns.claim_file.write_text("{ not json")
+    elif damage == "unknown schema":
+        ns.claim_file.write_text('{"schema": "autoforge.scheduler-claim/2", "current": null}')
+    else:
+        (tmp_path / "elsewhere").write_text("{}")
+        ns.claim_file.symlink_to(tmp_path / "elsewhere")
+    before = _tree(common)
+    reason = scheduler_ownership(common, 7)
+    assert f"its scheduler claim {ns.claim_file} cannot be read" in reason
+    assert reason.endswith("so it may hold an open claim")
+    assert _tree(common) == before, "never moved aside"
 
 
 def test_a_live_run_lock_owns_its_issue(common):
