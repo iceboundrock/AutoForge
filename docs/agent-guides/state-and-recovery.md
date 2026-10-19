@@ -918,11 +918,12 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   a mismatch, or a slot already taken, is `ClaimConflict` and the file is
   left as it is, so a stale claimant cannot finalize a newer generation.
   `open_claim(..., supersedes=)` and `close_unready` also classify the
-  namespace under the held L2 and refuse (`SchedulerStateError`, nothing
-  written) unless it is `resumable`: a settled or uncertain claim is never
-  replaced (D7.2). A claim is written only over this namespace's own file:
-  no binding, a claim file that does not load, or one naming another run or
-  EPIC than the binding is refused. Writes are atomic (fsynced temporary,
+  namespace under the held L2, with the caller's `expected` identity when
+  it passes one, and refuse (`SchedulerStateError`, nothing written) unless
+  it is `resumable`: a settled or uncertain claim is never replaced (D7.2).
+  A claim is written only over this namespace's own file: no binding, a
+  claim file that does not load, or one naming another run or EPIC than the
+  binding is refused. Writes are atomic (fsynced temporary,
   `replace`, directory fsync) through `safefs` from the coordination root,
   so a claim is durable before `open_claim` returns, before any worker
   exists.
@@ -948,8 +949,17 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   naming another run or EPIC than the binding; an open claim admitted with a
   state, `state_ref.present`, whose state is absent), `settled(settlement)`,
   `resumable(in-progress | not-started)` or `fresh`. The `present` rule
-  applies only to an open claim. The scheduler sees a state only through
-  `transitions.issue_settlement` (D15.1): `awaiting_input` (a durable pause,
+  applies only to an open claim. A state is the binding's only when its
+  `repository` and the repository of its issue and EPIC URLs are one
+  repository, and that repository is named as the binding recorded it at
+  first admission or as the caller resolved it with the live
+  `repository_id` (`ExpectedIdentity.repository`), compared without case:
+  an issue number names an issue of any repository, so foreign/project's
+  issue 7 under EPIC 1 is `uncertain(state-mismatch)` in owner/repo's
+  namespace 7, and a rename is tolerated through the two names. A state
+  naming a name the repository had only in between is uncertain too. The
+  scheduler sees a state only through `transitions.issue_settlement`
+  (D15.1): `awaiting_input` (a durable pause,
   #126's, checked before the phase), then `terminal`, `ready_for_merge`,
   `handoff` or `in_progress` from the total `PHASE_SETTLEMENT` table.
 - **Reconciliation** (`reconcile_epic`, D14.1) runs under L0 before any
@@ -970,7 +980,8 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   contacts GitHub.
 - **Finalization** (`finalize_worker`): after a worker exits and the
   scheduler re-acquires L2, the claim is closed by the state the worker
-  left: `settled`, or `interrupted` / `abandoned` by the closing rule for an
+  left, classified with the caller's `expected` identity when it passes
+  one: `settled`, or `interrupted` / `abandoned` by the closing rule for an
   in-progress or never-saved state; anything uncertain, or an open claim on
   disk that is not the reaped worker's, leaves it open. The exit status is
   recorded and never decides.

@@ -89,6 +89,8 @@ from autoforge.transitions import Phase, Settlement
 
 TS = "2026-10-18T00:00:00+00:00"
 REPO_ID = 700_001
+REPOSITORY = "owner/repo"  # the binding's recorded owner/name
+FOREIGN = "foreign/project"
 EPIC = EpicRef(number=1, issue_id=8_001)
 OTHER_EPIC = EpicRef(number=5, issue_id=8_005)
 ADMISSION = Admission("a" * 64, "b" * 64, TS)
@@ -110,8 +112,8 @@ def _issue_id(n: int) -> int:
     return 9_000 + n
 
 
-def _url(n: int) -> str:
-    return f"https://github.com/owner/repo/issues/{n}"
+def _url(n: int, repository: str = REPOSITORY) -> str:
+    return f"https://github.com/{repository}/issues/{n}"
 
 
 @pytest.fixture
@@ -139,16 +141,25 @@ def _bind(common: Path, n: int, epic: EpicRef = EPIC, repository_id: int = REPO_
     return ns
 
 
-def _expected(*issues: int) -> ExpectedIdentity:
-    return ExpectedIdentity(REPO_ID, {n: _issue_id(n) for n in issues})
+def _expected(*issues: int, repository: str | None = None) -> ExpectedIdentity:
+    return ExpectedIdentity(REPO_ID, {n: _issue_id(n) for n in issues}, repository)
 
 
-def _state(n: int, phase: Phase, *, epic_number: int = EPIC.number) -> AutoForgeState:
+def _state(
+    n: int,
+    phase: Phase,
+    *,
+    epic_number: int = EPIC.number,
+    repository: str = REPOSITORY,
+    issue_repository: str | None = None,
+    epic_repository: str | None = None,
+) -> AutoForgeState:
+    """A REMOTE state of issue ``n``; its issue and EPIC URLs are in ``repository`` by default."""
     return AutoForgeState(
         run_id=f"af-issue-{n}",
-        repository="owner/repo",
-        epic_url=_url(epic_number),
-        current_issue_url=_url(n),
+        repository=repository,
+        epic_url=_url(epic_number, epic_repository or repository),
+        current_issue_url=_url(n, issue_repository or repository),
         phase=phase,
         created_at=TS,
         updated_at=TS,
@@ -170,6 +181,7 @@ def _open(
     supersedes: Claim | None = None,
     kind: ClaimKind = ClaimKind.START,
     state_ref: StateRef | None = None,
+    expected: ExpectedIdentity | None = None,
 ) -> Claim:
     with IssueRunLock(ns) as lock:
         return open_claim(
@@ -180,6 +192,7 @@ def _open(
             admission=ADMISSION,
             state_ref=_state_ref(ns) if state_ref is None else state_ref,
             supersedes=supersedes,
+            expected=expected,
         )
 
 
@@ -565,6 +578,7 @@ def test_supersede_compares_with_the_open_claim(common):
         ("corrupt state", "uncertain(state-corrupt)"),
         ("missing state", "uncertain(state-missing)"),
         ("state of another epic", "uncertain(state-mismatch)"),
+        ("state of another repository", "uncertain(state-mismatch)"),
     ],
 )
 def test_supersede_refuses_a_settled_or_uncertain_claim_and_leaves_the_file(common, case, found):
@@ -584,6 +598,8 @@ def test_supersede_refuses_a_settled_or_uncertain_claim_and_leaves_the_file(comm
         ns.state_file.write_text("{ not json")
     elif case == "missing state":
         ns.state_file.unlink()
+    elif case == "state of another repository":
+        _save(ns, Phase.REVIEW, repository=FOREIGN)  # issue 7 and EPIC 1, of foreign/project
     else:
         _save(ns, Phase.REVIEW, epic_number=OTHER_EPIC.number)
     assert str(_classify(ns, _expected(7))) == found
@@ -994,6 +1010,9 @@ def _uncertain_case(common: Path, case: str, tmp_path: Path) -> tuple[IssueNames
     if case == "state of another epic":
         _save(ns, Phase.REVIEW, epic_number=5)
         return ns, "state-mismatch"
+    if case == "state of another repository":
+        _save(ns, Phase.READY_FOR_MERGE, repository=FOREIGN)  # issue 7 and EPIC 1 there
+        return ns, "state-mismatch"
     raw = _raw(ns)
     if case == "corrupt claim":
         ns.claim_file.write_text("{ not json")
@@ -1025,6 +1044,7 @@ UNCERTAIN_CASES = [
     "state of unknown protocol",
     "state of another issue",
     "state of another epic",
+    "state of another repository",
     "corrupt claim",
     "null claim",
     "unknown claim schema",
@@ -1055,6 +1075,133 @@ def test_a_state_absent_while_no_claim_is_open_is_never_uncertain(common):
     _close(ns, claim, ClaimClassification.ABANDONED)
     ns.state_file.unlink()
     assert str(_classify(ns, _expected(7))) == "fresh"
+
+
+# Which part of a state names foreign/project; the numbers are always issue 7 and EPIC 1.
+FOREIGN_STATES = {
+    "all of it": {"repository": FOREIGN},
+    "its repository": {
+        "repository": FOREIGN,
+        "issue_repository": REPOSITORY,
+        "epic_repository": REPOSITORY,
+    },
+    "its issue": {"issue_repository": FOREIGN},
+    "its epic": {"epic_repository": FOREIGN},
+}
+
+
+@pytest.mark.parametrize("foreign", list(FOREIGN_STATES))
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.BLOCKED, Phase.FIX])
+def test_a_state_of_another_repository_with_matching_numbers_is_uncertain_and_keeps_its_claim(
+    common, foreign, phase
+):
+    """An issue number names an issue of any repository: the state's repository is compared too.
+
+    Settled or in progress, a state naming foreign/project's issue 7 and
+    EPIC 1 is not owner/repo's: reconciliation and finalization keep its
+    claim open, and it is neither superseded nor closed unready.
+    """
+    ns = _bind(common, 7)
+    claim = _spawned(ns, _open(ns))
+    _save(ns, phase, **FOREIGN_STATES[foreign])
+    before = _tree(ns.directory)
+    for expected in (None, _expected(7), _expected(7, repository=REPOSITORY)):
+        found = _classify(ns, expected)
+        assert str(found) == "uncertain(state-mismatch)" and found.open_claim == claim
+        assert FOREIGN in found.detail
+    for expected in (_expected(*range(1, 20)), _expected(*range(1, 20), repository=REPOSITORY)):
+        report = _reconcile(common, expected=expected)
+        item = _item(report, 7)
+        assert item.fact is LocalFact.HELD_UNCERTAIN and item.closed is None
+        assert str(item.classification) == "uncertain(state-mismatch)"
+        assert report.admissible, "a state is the issue's uncertainty, not the scheduler's"
+    with IssueRunLock(ns) as lock:
+        outcome = finalize_worker(ns, lock, claim, 0, expected=_expected(7, repository=REPOSITORY))
+        assert outcome.closed is None
+        assert str(outcome.classification) == "uncertain(state-mismatch)"
+        assert finalize_worker(ns, lock, claim, 0).closed is None
+        with pytest.raises(SchedulerStateError, match=re.escape("is uncertain(state-mismatch)")):
+            close_unready(ns, lock, claim)
+    with pytest.raises(SchedulerStateError, match=re.escape("is uncertain(state-mismatch)")):
+        _open(ns, supersedes=claim, kind=ClaimKind.RESUME, state_ref=StateRef.absent())
+    assert _without(_tree(ns.directory), "run.lock") == _without(before, "run.lock")
+    assert _claims(ns).current == claim and _claims(ns).history == ()
+
+
+@pytest.mark.parametrize(
+    ("phase", "found"),
+    [(Phase.READY_FOR_MERGE, "settled(ready_for_merge)"), (Phase.FIX, "resumable(in-progress)")],
+)
+def test_a_renamed_repository_keeps_its_states(common, phase, found):
+    """D5.1: a rename is tolerated: the binding's recorded name or the caller's live one."""
+    ns = _bind(common, 7)  # recorded as owner/repo
+    renamed = _expected(7, repository="new-owner/renamed")
+    # Written before the rename, a state names the recorded name (GitHub folds case).
+    _save(ns, phase, repository="Owner/Repo")
+    for expected in (None, _expected(7), renamed):
+        assert str(_classify(ns, expected)) == found
+    # Written after it, a state names the live name, which only the caller knows.
+    _save(ns, phase, repository="new-owner/renamed")
+    assert str(_classify(ns, renamed)) == found
+    assert str(_classify(ns, _expected(7, repository="NEW-OWNER/Renamed"))) == found
+    assert str(_classify(ns)) == "uncertain(state-mismatch)"
+    assert str(_classify(ns, _expected(7))) == "uncertain(state-mismatch)"
+    # A state naming two names of the repository at once is not one the engine writes.
+    _save(ns, phase, repository="new-owner/renamed", epic_repository=REPOSITORY)
+    assert str(_classify(ns, renamed)) == "uncertain(state-mismatch)"
+
+
+def test_after_a_rename_the_claim_operations_recognise_the_live_name(common):
+    renamed = "new-owner/renamed"
+    settled = _bind(common, 7)
+    settled_claim = _spawned(settled, _open(settled))
+    _save(settled, Phase.READY_FOR_MERGE, repository=renamed)
+    resumable = _bind(common, 8)
+    resumable_claim = _spawned(resumable, _open(resumable))
+    _save(resumable, Phase.FIX, repository=renamed)
+
+    report = _reconcile(common, expected=_expected(*range(1, 20), repository=renamed))
+    seven = _item(report, 7)
+    assert seven.fact is LocalFact.HELD_SETTLED_NAMESPACE
+    assert seven.closed is not None and seven.closed.claim == settled_claim
+    assert str(_item(report, 8).classification) == "resumable(in-progress)"
+    assert _claims(resumable).current == resumable_claim
+
+    # Without the live name the state is not recognised, and nothing is replaced.
+    with pytest.raises(SchedulerStateError, match=re.escape("is uncertain(state-mismatch)")):
+        _open(resumable, supersedes=resumable_claim, kind=ClaimKind.RESUME)
+    resumed = _open(
+        resumable,
+        supersedes=resumable_claim,
+        kind=ClaimKind.RESUME,
+        expected=_expected(8, repository=renamed),
+    )
+    assert _claims(resumable).current == resumed
+    with IssueRunLock(resumable) as lock:
+        with pytest.raises(SchedulerStateError, match=re.escape("is uncertain(state-mismatch)")):
+            close_unready(resumable, lock, resumed)
+        closed = close_unready(resumable, lock, resumed, expected=_expected(8, repository=renamed))
+    assert closed.classification is ClaimClassification.ABANDONED
+
+    reaped = _bind(common, 9)
+    reaped_claim = _spawned(reaped, _open(reaped))
+    _save(reaped, Phase.BLOCKED, repository=renamed)
+    with IssueRunLock(reaped) as lock:
+        assert finalize_worker(reaped, lock, reaped_claim, 0).closed is None
+        outcome = finalize_worker(
+            reaped, lock, reaped_claim, 0, expected=_expected(9, repository=renamed)
+        )
+    assert outcome.closed is not None
+    assert outcome.closed.classification is ClaimClassification.SETTLED
+
+
+@pytest.mark.parametrize(
+    "repository",
+    ["", "owner", "owner/", "/repo", "owner/repo/extra", "own er/repo", "o" * 40 + "/repo", 7],
+)
+def test_the_expected_repository_is_an_owner_name_pair(repository):
+    with pytest.raises(SchedulerStateError, match="expected repository"):
+        ExpectedIdentity(REPO_ID, {}, repository)  # type: ignore[arg-type]
 
 
 def test_classification_is_pure_and_total_over_its_inputs(common):
@@ -1229,6 +1376,7 @@ def test_a_reaped_worker_that_did_not_settle_is_interrupted_or_abandoned(common,
         ("missing state", "state-missing"),
         ("corrupt state", "state-corrupt"),
         ("state of another issue", "state-mismatch"),
+        ("state of another repository", "state-mismatch"),
         ("corrupt claim", "claim-corrupt"),
     ],
 )

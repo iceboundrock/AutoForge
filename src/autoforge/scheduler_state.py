@@ -890,18 +890,21 @@ def _matching_current(namespace: IssueNamespace, claim_file: ClaimFile, claim: C
     return current
 
 
-def _require_resumable(namespace: IssueNamespace, refusal: str) -> Classification:
+def _require_resumable(
+    namespace: IssueNamespace, refusal: str, expected: ExpectedIdentity | None
+) -> Classification:
     """The namespace's class, read under the caller's L2; refused unless ``resumable`` (D7.2).
 
     Only a ``resumable`` claim is replaced (:func:`open_claim`) or closed
     unready (:func:`close_unready`): a settled or uncertain one is refused
     (:class:`~autoforge.errors.SchedulerStateError`) and the file is left as
-    it is.
+    it is. ``expected`` is :func:`classify`'s.
     """
+    _check_optional_expected(expected)
     read = read_namespace(namespace)
     if read.absent:
         raise ClaimConflict(f"{namespace.claim_file} does not exist; there is no open claim")
-    classification = classify(read.lookup, read.claim, expected=None)
+    classification = classify(read.lookup, read.claim, expected=expected)
     if classification.kind is not ClassificationKind.RESUMABLE:
         raise SchedulerStateError(
             f"{refusal}; the namespace of issue {namespace.issue_number} is {classification}"
@@ -951,6 +954,7 @@ def open_claim(
     admission: Admission,
     state_ref: StateRef,
     supersedes: Claim | None = None,
+    expected: ExpectedIdentity | None = None,
 ) -> Claim:
     """Write a new open claim, durably, before the worker exists; return it (D2.2 step 5).
 
@@ -961,9 +965,12 @@ def open_claim(
     (:class:`~autoforge.errors.SchedulerStateError`, nothing written) unless
     it is ``resumable`` (D7.2, D14.2): a settled or uncertain claim is never
     replaced. Then, in the same atomic write, it closes it as ``superseded``
-    and installs the new claim: the only way a claim is ever closed so. The
-    generation is ``next_generation``, which is then incremented. The file
-    is written and fsynced before this returns.
+    and installs the new claim: the only way a claim is ever closed so.
+    ``expected`` is the classification's (:func:`classify`): the admission's
+    repository and issue ids, and the live ``owner/name`` that lets a state
+    written after a repository rename be recognised. The generation is
+    ``next_generation``, which is then incremented. The file is written and
+    fsynced before this returns.
     """
     _require_lock(namespace, lock, "open a claim")
     _check_type(kind, ClaimKind, "claim kind")
@@ -981,6 +988,7 @@ def open_claim(
             namespace,
             f"refusing to supersede generation {current.generation}: only a resumable claim "
             "is replaced",
+            expected,
         )
     now = utcnow_iso()
     claim = Claim(
@@ -1082,7 +1090,12 @@ def close_claim(
 
 
 def close_unready(
-    namespace: IssueNamespace, lock: IssueRunLock, claim: Claim, *, detail: str = ""
+    namespace: IssueNamespace,
+    lock: IssueRunLock,
+    claim: Claim,
+    *,
+    detail: str = "",
+    expected: ExpectedIdentity | None = None,
 ) -> ClosedClaim:
     """Close an open ``resumable`` claim whose issue a snapshot no longer shows as ready.
 
@@ -1090,12 +1103,15 @@ def close_unready(
     or no longer lists it, so the earlier invocation's claim cannot be
     superseded by an admission and must not keep ``epic run`` refused. It
     is closed ``abandoned`` when no worker was recorded and ``interrupted``
-    when one was. The namespace is classified again first: a claim that is
-    not ``resumable`` (settled, uncertain) is refused
+    when one was. The namespace is classified again first, with
+    ``expected`` (:func:`classify`): a claim that is not ``resumable``
+    (settled, uncertain) is refused
     (:class:`~autoforge.errors.SchedulerStateError`) and left open.
     """
     _require_lock(namespace, lock, "close an unready claim")
-    classification = _require_resumable(namespace, "close_unready closes only a resumable claim")
+    classification = _require_resumable(
+        namespace, "close_unready closes only a resumable claim", expected
+    )
     on_disk = classification.open_claim
     if on_disk is None or on_disk.identity != claim.identity:
         raise ClaimConflict(
@@ -1204,7 +1220,8 @@ class UncertainReason(Enum):
     CLAIM_MISMATCH = "claim-mismatch"
     #: The claim file names another EPIC than the binding.
     CLAIM_EPIC_MISMATCH = "claim-epic-mismatch"
-    #: The state names another issue or EPIC than the binding, or is not a REMOTE run.
+    #: The state names another repository, issue or EPIC than the binding, or is not a
+    #: REMOTE run.
     STATE_MISMATCH = "state-mismatch"
     #: An open claim's ``state_ref.present`` is true, and the state is absent.
     STATE_MISSING = "state-missing"
@@ -1359,11 +1376,15 @@ class ExpectedIdentity:
     ``repository_id`` is the live repository's; ``issue_ids`` maps an issue
     number to its GitHub issue id, as the caller's snapshot lists them. An
     issue the mapping does not name (one the snapshot no longer lists) has
-    its id unchecked.
+    its id unchecked. ``repository`` is the ``owner/name`` the caller
+    resolved together with ``repository_id``, or ``None`` when it has none:
+    a state naming it is of the namespace's repository, also after a
+    rename made the binding's recorded name an old one (D5.1).
     """
 
     repository_id: int
     issue_ids: Mapping[int, int] = field(default_factory=dict)
+    repository: str | None = None
 
     def __post_init__(self) -> None:
         _check_id(self.repository_id, "expected repository_id")
@@ -1372,6 +1393,17 @@ class ExpectedIdentity:
             _check_id(number, "expected issue number")
             _check_id(issue_id, f"expected issue id of #{number}")
         object.__setattr__(self, "issue_ids", issue_ids)
+        if self.repository is not None:
+            text = _check_str(
+                self.repository,
+                "expected repository",
+                MAX_OWNER_CHARS + 1 + MAX_REPOSITORY_NAME_CHARS,
+            )
+            owner, slash, name = text.partition("/")
+            if not slash:
+                _fail("expected repository", f"is not an owner/name pair: {text!r}")
+            _check_name(owner, "expected repository owner", MAX_OWNER_CHARS)
+            _check_name(name, "expected repository name", MAX_REPOSITORY_NAME_CHARS)
 
     def binding_problem(self, binding: RunBinding) -> tuple[UncertainReason, str] | None:
         number = binding.run_key.issue_number
@@ -1391,20 +1423,59 @@ class ExpectedIdentity:
         return None
 
 
-def _state_identity_problem(state: AutoForgeState, binding: RunBinding) -> str:
+def _check_optional_expected(expected: ExpectedIdentity | None) -> None:
+    if expected is not None:
+        _check_type(expected, ExpectedIdentity, "expected identity")
+
+
+def _repository_names(binding: RunBinding, expected: ExpectedIdentity | None) -> tuple[str, ...]:
+    """The ``owner/name`` pairs a state of this namespace may name (D5.1).
+
+    The binding's, recorded with its ``repository_id`` at first admission,
+    and the caller's, resolved with the live ``repository_id``: a rename
+    since the binding is tolerated, and no other name is this repository's.
+    A name the repository had only in between is not known here, so a state
+    naming it is ``uncertain``.
+    """
+    names = [binding.repository]
+    if expected is not None and expected.repository is not None:
+        if expected.repository.lower() != binding.repository.lower():
+            names.append(expected.repository)
+    return tuple(names)
+
+
+def _state_identity_problem(
+    state: AutoForgeState, binding: RunBinding, expected: ExpectedIdentity | None
+) -> str:
+    """Why ``state`` is not the run ``binding`` names, or ``""``.
+
+    A state is this namespace's only when its repository is one of
+    :func:`_repository_names` (compared case-insensitively, as GitHub does),
+    its issue and EPIC are in that repository, and their numbers are the
+    binding's: a number alone names an issue of any repository.
+    """
     if state.mode is not WorkflowMode.REMOTE:
         return f"the state is a {state.mode.value} run, which never lives in a namespace"
+    names = _repository_names(binding, expected)
+    if not any(state.repository.lower() == name.lower() for name in names):
+        known = " or ".join(repr(name) for name in names)
+        return f"the state's repository is {state.repository!r:.200}, the namespace's {known}"
     number = binding.run_key.issue_number
-    for what, url, expected in (
+    for what, url, want in (
         ("issue", state.current_issue_url, number),
         ("EPIC", state.epic_url, binding.epic.number),
     ):
         try:
-            got = parse_issue_url(url).number
+            ref = parse_issue_url(url)
         except ConfigurationError:
             return f"the state names no {what} the binding can be compared with ({url!r:.200})"
-        if got != expected:
-            return f"the state's {what} is #{got}, the binding's #{expected}"
+        if not ref.same_repository(state.repository):
+            return (
+                f"the state's {what} {ref.canonical!r:.300} is not in its repository "
+                f"{state.repository!r}"
+            )
+        if ref.number != want:
+            return f"the state's {what} is #{ref.number}, the binding's #{want}"
     return ""
 
 
@@ -1422,7 +1493,9 @@ def classify(
       read or does not match ``expected`` (``expected=None`` compares the
       namespace with its own binding only); a claim file or a state without
       a binding; a corrupt state or claim file; a claim file or a state
-      naming another run or EPIC than the binding; an open claim whose
+      naming another run or EPIC than the binding, a state of another
+      repository included (one named neither as the binding recorded it nor
+      as ``expected.repository`` names it); an open claim whose
       ``state_ref.present`` is true while the state is absent;
     * ``settled(settlement)``: the state's settlement is not ``in_progress``;
     * ``resumable(reason)``: the state is ``in_progress``, whether or not a
@@ -1469,7 +1542,7 @@ def classify(
             return _uncertain(problem[0], problem[1], open_claim)
     state = lookup.state.state
     if state is not None:
-        state_problem = _state_identity_problem(state, binding)
+        state_problem = _state_identity_problem(state, binding, expected)
         if state_problem:
             return _uncertain(UncertainReason.STATE_MISMATCH, state_problem, open_claim)
         settlement = issue_settlement(state)
@@ -1715,7 +1788,12 @@ class Finalization:
 
 
 def finalize_worker(
-    namespace: IssueNamespace, lock: IssueRunLock, claim: Claim, exit_status: int | None
+    namespace: IssueNamespace,
+    lock: IssueRunLock,
+    claim: Claim,
+    exit_status: int | None,
+    *,
+    expected: ExpectedIdentity | None = None,
 ) -> Finalization:
     """Close a reaped worker's claim by the state it left (ADR 0008 D7.2, D14.1).
 
@@ -1726,9 +1804,11 @@ def finalize_worker(
     was recorded and ``abandoned`` when none was. Anything else (a corrupt
     state, a state missing while ``present`` is true, a mismatch, an open
     claim on disk that is not ``claim``) leaves it open as ``uncertain``.
-    ``exit_status`` is recorded as a diagnostic and never decides.
+    ``expected`` is :func:`classify`'s. ``exit_status`` is recorded as a
+    diagnostic and never decides.
     """
     _require_lock(namespace, lock, "finalize a worker's claim")
+    _check_optional_expected(expected)
     if exit_status is not None:
         _check_int(exit_status, "worker exit status", -MAX_EXIT_STATUS, MAX_EXIT_STATUS)
     read = read_namespace(namespace)
@@ -1736,7 +1816,7 @@ def finalize_worker(
         return Finalization(
             _uncertain(UncertainReason.CLAIM_CONFLICT, f"{namespace.claim_file} does not exist")
         )
-    classification = classify(read.lookup, read.claim, expected=None)
+    classification = classify(read.lookup, read.claim, expected=expected)
     if classification.kind is ClassificationKind.UNCERTAIN:
         return Finalization(classification)
     on_disk = classification.open_claim
