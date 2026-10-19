@@ -957,7 +957,12 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   an issue number names an issue of any repository, so foreign/project's
   issue 7 under EPIC 1 is `uncertain(state-mismatch)` in owner/repo's
   namespace 7, and a rename is tolerated through the two names. A state
-  naming a name the repository had only in between is uncertain too. The
+  naming a name the repository had only in between is uncertain too, and
+  so is one whose issue or EPIC URL does not parse (`https://[`, a number
+  of thousands of digits): `validation`'s parsers refuse every malformed
+  URL as a `ConfigurationError`, never a `ValueError` of `urllib` or
+  `int()`, so a damaged namespace is `uncertain(state-mismatch)` and never
+  aborts reconciliation of the others. The
   scheduler sees a state only through `transitions.issue_settlement`
   (D15.1): `awaiting_input` (a durable pause,
   #126's, checked before the phase), then `terminal`, `ready_for_merge`,

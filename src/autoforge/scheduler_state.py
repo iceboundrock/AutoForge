@@ -1452,7 +1452,9 @@ def _state_identity_problem(
     A state is this namespace's only when its repository is one of
     :func:`_repository_names` (compared case-insensitively, as GitHub does),
     its issue and EPIC are in that repository, and their numbers are the
-    binding's: a number alone names an issue of any repository.
+    binding's: a number alone names an issue of any repository. A URL the
+    parser refuses (anything malformed, as :class:`ConfigurationError`)
+    names no issue to compare, which is a mismatch too.
     """
     if state.mode is not WorkflowMode.REMOTE:
         return f"the state is a {state.mode.value} run, which never lives in a namespace"

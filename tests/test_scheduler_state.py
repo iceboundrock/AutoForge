@@ -171,6 +171,13 @@ def _save(ns: IssueNamespace, phase: Phase, **kw) -> None:
         save_state(_state(ns.issue_number, phase, **kw), ns.state_file, root=root)
 
 
+def _save_replaced(ns: IssueNamespace, phase: Phase, **fields) -> None:
+    """Save issue ``ns``'s state of ``phase`` with ``fields`` replaced, unchecked."""
+    state = replace(_state(ns.issue_number, phase), **fields)
+    with ns.state_paths().open_root(create=True) as root:
+        save_state(state, ns.state_file, root=root)
+
+
 def _state_ref(ns: IssueNamespace) -> StateRef:
     return StateRef.from_lookup(read_namespace(ns).lookup)  # type: ignore[arg-type]
 
@@ -1013,6 +1020,10 @@ def _uncertain_case(common: Path, case: str, tmp_path: Path) -> tuple[IssueNames
     if case == "state of another repository":
         _save(ns, Phase.READY_FOR_MERGE, repository=FOREIGN)  # issue 7 and EPIC 1 there
         return ns, "state-mismatch"
+    if case == "state of an unparseable reviewed pr url":
+        # The loader checks it; urllib raises ValueError on it.
+        _save_replaced(ns, Phase.READY_FOR_MERGE, reviewed_pr_url="https://[")
+        return ns, "state-corrupt"
     raw = _raw(ns)
     if case == "corrupt claim":
         ns.claim_file.write_text("{ not json")
@@ -1045,6 +1056,7 @@ UNCERTAIN_CASES = [
     "state of another issue",
     "state of another epic",
     "state of another repository",
+    "state of an unparseable reviewed pr url",
     "corrupt claim",
     "null claim",
     "unknown claim schema",
@@ -1120,6 +1132,66 @@ def test_a_state_of_another_repository_with_matching_numbers_is_uncertain_and_ke
         assert outcome.closed is None
         assert str(outcome.classification) == "uncertain(state-mismatch)"
         assert finalize_worker(ns, lock, claim, 0).closed is None
+        with pytest.raises(SchedulerStateError, match=re.escape("is uncertain(state-mismatch)")):
+            close_unready(ns, lock, claim)
+    with pytest.raises(SchedulerStateError, match=re.escape("is uncertain(state-mismatch)")):
+        _open(ns, supersedes=claim, kind=ClaimKind.RESUME, state_ref=StateRef.absent())
+    assert _without(_tree(ns.directory), "run.lock") == _without(before, "run.lock")
+    assert _claims(ns).current == claim and _claims(ns).history == ()
+
+
+# URLs a strict state load accepts and the URL parser refuses; urllib raises ValueError
+# on the first and int() on the second, which must never escape as an exception.
+UNPARSEABLE_URLS = {
+    "unbalanced bracket": "https://[",
+    "too many digits": f"https://github.com/{REPOSITORY}/issues/{'1' * 5000}",
+}
+
+
+@pytest.mark.parametrize("url", list(UNPARSEABLE_URLS))
+@pytest.mark.parametrize(("field", "names"), [("current_issue_url", "issue"), ("epic_url", "EPIC")])
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.FIX])
+def test_a_state_url_that_does_not_parse_is_a_state_mismatch_and_keeps_its_claim(
+    common, url, field, names, phase
+):
+    """A state naming no issue or EPIC that parses names none the binding can be compared with.
+
+    It is ``uncertain(state-mismatch)``, never an exception: reconciliation
+    holds the issue and goes on to the namespaces after it, finalization
+    leaves the claim open, and it is neither superseded nor closed unready.
+    """
+    ns = _bind(common, 7)
+    claim = _spawned(ns, _open(ns))
+    _save_replaced(ns, phase, **{field: UNPARSEABLE_URLS[url]})
+    resumable = _bind(common, 8)
+    resumable_claim = _spawned(resumable, _open(resumable))
+    _save(resumable, Phase.REVIEW)
+    settled = _bind(common, 9)
+    settled_claim = _spawned(settled, _open(settled))
+    _save(settled, Phase.BLOCKED)
+    before = _tree(ns.directory)
+    for expected in (None, _expected(7), _expected(7, repository=REPOSITORY)):
+        found = _classify(ns, expected)
+        assert str(found) == "uncertain(state-mismatch)" and found.open_claim == claim
+        assert f"the state names no {names} the binding can be compared with" in found.detail
+        assert len(found.detail) <= ss.MAX_REASON_CHARS
+    report = _reconcile(common)
+    assert report.admissible, "a state is the issue's uncertainty, not the scheduler's"
+    item = _item(report, 7)
+    assert item.fact is LocalFact.HELD_UNCERTAIN and item.closed is None
+    assert str(item.classification) == "uncertain(state-mismatch)"
+    eight = _item(report, 8)
+    assert eight.fact is None and str(eight.classification) == "resumable(in-progress)"
+    nine = _item(report, 9)
+    assert nine.fact is LocalFact.HELD_SETTLED_NAMESPACE
+    assert nine.closed is not None and nine.closed.claim == settled_claim
+    assert _claims(resumable).current == resumable_claim and _claims(settled).current is None
+    with IssueRunLock(ns) as lock:
+        for expected in (None, _expected(7, repository=REPOSITORY)):
+            outcome = finalize_worker(ns, lock, claim, 0, expected=expected)
+            assert outcome.closed is None
+            assert str(outcome.classification) == "uncertain(state-mismatch)"
+            assert outcome.classification.open_claim == claim
         with pytest.raises(SchedulerStateError, match=re.escape("is uncertain(state-mismatch)")):
             close_unready(ns, lock, claim)
     with pytest.raises(SchedulerStateError, match=re.escape("is uncertain(state-mismatch)")):
@@ -1377,6 +1449,7 @@ def test_a_reaped_worker_that_did_not_settle_is_interrupted_or_abandoned(common,
         ("corrupt state", "state-corrupt"),
         ("state of another issue", "state-mismatch"),
         ("state of another repository", "state-mismatch"),
+        ("state of an unparseable reviewed pr url", "state-corrupt"),
         ("corrupt claim", "claim-corrupt"),
     ],
 )

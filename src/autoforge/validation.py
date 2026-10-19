@@ -166,7 +166,10 @@ def same_pr_url(observed: str, expected: str) -> bool:
 def _split(url: str):
     if not isinstance(url, str) or not url.strip():
         raise ConfigurationError(f"not a valid HTTPS GitHub URL: {url!r} ({_EXPECTED})")
-    parts = urlsplit(url.strip())
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError as exc:  # an unbalanced or invalid bracketed host, an NFKC netloc
+        raise ConfigurationError(f"not a valid HTTPS GitHub URL: {url!r} ({exc})") from None
     if parts.scheme != "https":
         raise ConfigurationError(
             f"GitHub URL must use https, got {parts.scheme or 'no'} scheme: {url!r}"
@@ -176,6 +179,16 @@ def _split(url: str):
     if parts.query:
         raise ConfigurationError(f"GitHub URL must not carry a query string: {url!r}")
     return parts
+
+
+def _number(digits: str, what: str, url: str) -> int:
+    """``digits`` (ASCII, matched by a pattern) as an int; too many of them are malformed."""
+    try:
+        return int(digits)
+    except ValueError:  # over the interpreter's integer string conversion limit
+        raise ConfigurationError(
+            f"GitHub {what} has {len(digits)} digits, too many for a number: {url!r}"
+        ) from None
 
 
 def parse_github_url(url: str, expect: str | None = None) -> GitHubIssueRef | GitHubPullRequestRef:
@@ -190,7 +203,7 @@ def parse_github_url(url: str, expect: str | None = None) -> GitHubIssueRef | Gi
     m = _PATH_RE.match(parts.path)
     if not m:
         raise ConfigurationError(f"malformed GitHub URL: {url!r} ({_EXPECTED})")
-    number = int(m.group("number"))
+    number = _number(m.group("number"), "issue/PR number", url)
     if number < 1:
         raise ConfigurationError(f"GitHub issue/PR number must be >= 1: {url!r}")
     ref: GitHubIssueRef | GitHubPullRequestRef
@@ -225,7 +238,7 @@ def parse_comment_url(url: str) -> GitHubCommentRef:
     if not fm:
         raise ConfigurationError(f"GitHub comment URL must end with '#issuecomment-<id>': {url!r}")
     parent = parse_github_url(url.split("#", 1)[0])
-    return GitHubCommentRef(parent=parent, comment_id=int(fm.group("id")))
+    return GitHubCommentRef(parent=parent, comment_id=_number(fm.group("id"), "comment id", url))
 
 
 def validate_epic_and_issue(epic_url: str, issue_url: str) -> tuple[GitHubIssueRef, GitHubIssueRef]:

@@ -11,6 +11,7 @@ from autoforge.validation import (
     parse_issue_url,
     parse_pr_url,
     parse_remote_repository,
+    same_issue_url,
 )
 
 
@@ -71,6 +72,35 @@ def test_issue_and_pr_refs():
 def test_malformed_urls_rejected(url):
     with pytest.raises(ConfigurationError):
         parse_github_url(url)
+
+
+# urllib and int() raise ValueError on these; the parsers' callers catch ConfigurationError.
+TOO_MANY_DIGITS = "1" * 5000
+REFUSED_BY_THE_STANDARD_LIBRARY = {
+    "unbalanced open bracket": "https://[",
+    "unbalanced close bracket": "https://]",
+    "bracket after the host": "https://github.com]/o/r/issues/1",
+    "unclosed IPv6 host": "https://[::1/o/r/issues/1",
+    "bracketed name": "https://[github.com]/o/r/issues/1",
+    "too many digits": f"https://github.com/o/r/issues/{TOO_MANY_DIGITS}",
+}
+
+
+@pytest.mark.parametrize("case", list(REFUSED_BY_THE_STANDARD_LIBRARY))
+def test_urls_the_standard_library_refuses_are_malformed_never_a_value_error(case):
+    url = REFUSED_BY_THE_STANDARD_LIBRARY[case]
+    for parse in (parse_github_url, parse_issue_url, parse_comment_url):
+        with pytest.raises(ConfigurationError):
+            parse(url)
+    with pytest.raises(ConfigurationError):
+        parse_comment_url(url + "#issuecomment-1")
+    assert not same_issue_url(url, url)
+    assert not same_issue_url("https://github.com/o/r/issues/1", url)
+
+
+def test_a_comment_id_of_too_many_digits_is_malformed():
+    with pytest.raises(ConfigurationError, match="comment id has 5000 digits"):
+        parse_comment_url(f"https://github.com/o/r/pull/1#issuecomment-{TOO_MANY_DIGITS}")
 
 
 def test_wrong_kind_rejected():
