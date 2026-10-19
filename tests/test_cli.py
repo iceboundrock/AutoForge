@@ -3009,3 +3009,21 @@ def test_a_host_that_cannot_enforce_a_required_sandbox_refuses_step_with_exit_2(
     out = capsys.readouterr().out
     assert "Outer sandbox:\n  required (sandbox.mode)" in out
     assert sandbox_probe.calls == 1
+
+
+def test_the_scheduler_worker_entry_point_is_hidden_and_routed(monkeypatch, capsys):
+    """``epic _worker`` (#182) is the scheduler's, not an operator's: no parser, no help."""
+    import autoforge.worker as worker_module
+
+    seen: list[list[str]] = []
+
+    def run_worker(argv):
+        seen.append(list(argv))
+        return 7
+
+    monkeypatch.setattr(worker_module, "run_worker", run_worker)
+    assert cli.main(["epic", "_worker", "--issue", "2"]) == 7
+    assert seen == [["--issue", "2"]]
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    assert "_worker" not in capsys.readouterr().out

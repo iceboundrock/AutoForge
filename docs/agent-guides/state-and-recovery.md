@@ -508,9 +508,10 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
 it** ([ADR 0008](../adr/0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md),
 D10–D12, D17.2). #180 implements the three lock domains in
 `src/autoforge/locking.py` and the ownership guards in
-`src/autoforge/ownership.py`; the scheduler that shares them with its
-workers arrives with #182, so today a standalone command holds L0 and takes
-L1, and only tests take L2:
+`src/autoforge/ownership.py`; #182's scheduler (`src/autoforge/scheduler.py`)
+shares L0 with its workers and hands each one its issue's L2 (Scheduler
+workers and supervision, below), and the `epic` commands that start it are
+#183's, so today a standalone command holds L0 and takes L1:
 
 - **L0: one orchestration authority per git common dir.** This lock is L0,
   unchanged for a standalone command (including its `LOCK_UN`-then-close
@@ -592,8 +593,8 @@ L1, and only tests take L2:
   predicate, and `unblock` of a namespace's own state directory exempts
   that namespace. **Reverse:** `ownership.standalone_hold` reports the issue
   the configured standalone state names as `current_issue_url` while its
-  phase is anything but `DONE` (`BLOCKED` and `FAILED` included), for
-  #182's admission to hold as `held:standalone-state`; an unreadable
+  phase is anything but `DONE` (`BLOCKED` and `FAILED` included), which
+  the scheduler holds as `held:standalone-state` (#182); an unreadable
   standalone state is reported and holds nothing.
 
 ---
@@ -762,8 +763,10 @@ found again from the repository alone after a crash. #178 implements the
 identity, the layout and the files it owns (`src/autoforge/run_namespace.py`);
 #180 the run lock and the ownership guards (Locking, above); #181 the claim
 file, the per-EPIC scheduler state and restart reconciliation
-(`src/autoforge/scheduler_state.py`, below); the scheduler and its workers
-are #182–#183, so no command creates a namespace yet.
+(`src/autoforge/scheduler_state.py`, below); #182 the scheduler and its
+workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
+the `epic` commands that start them are #183's, so no CLI command creates a
+namespace yet.
 
 - **RunKey** is `(repository_id, issue_number)`: GitHub's numeric
   repository id and the issue number, both positive integers, rendered
@@ -781,7 +784,7 @@ are #182–#183, so no command creates a namespace yet.
       claim.json       autoforge.scheduler-claim/1: the scheduler claim (#181, below)
       state/           an ordinary state directory: state.json, logs/<run-id>/,
                        read-context/<run-id>/ (the layout above, unchanged)
-      workers/         worker console logs (#182)
+      workers/         <generation>.log: one worker's stdout and stderr (#182)
   ```
 
   The **anchor** is the git common dir: `StatePaths` for `state/` is
@@ -938,7 +941,7 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   run-level facts only, never a claim (a `claims` field is refused), so the
   two files cannot disagree. Loading is as strict as a claim file's; a
   corrupt one is global uncertainty, moved aside only on request
-  (`quarantine_scheduler_state`, for #182's `epic run --force`:
+  (`quarantine_scheduler_state`, for #183's `epic run --force`:
   `scheduler.json.corrupt-<UTC timestamp>`), and a readable one never is.
 - **Restart classification** (D14.2, `classify`) is pure: given #178's
   strict lookup and the claim file, read under L2, a namespace is, checked
@@ -998,6 +1001,85 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   open claim `archived` whatever the state holds, moves a claim file the
   writers refuse aside (`claim.json.archived-<UTC timestamp>`, link then
   unlink), and otherwise changes nothing.
+
+### Scheduler workers and supervision
+
+#182 (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`,
+`src/autoforge/executor_supervised.py`, `src/autoforge/scheduler_stop.py`;
+ADR 0008 D2, D9, D13, D16) is the caller of the claims and locks above.
+Every crash leaves state the next start classifies; nothing here is
+liveness except L2.
+
+- **One admission** (D2.2), holding L0: L2 non-blocking (held: the issue
+  is `owned` for this snapshot and skipped); under it the strict namespace
+  read and `classify` (only none, `fresh` and `resumable` go on; a settled
+  namespace's open claim is closed `settled`); #179's re-read of the issue
+  and its blockers (`stale` writes nothing and forces a new snapshot); the
+  binding on first admission; `open_claim` (superseding an earlier
+  invocation's open `resumable` claim); the worker log
+  `workers/<generation>.log` opened append-only and bounded; the spawn,
+  with L0 and L2 passed by inheritance (`pass_fds`) and every other
+  descriptor closed; `record_worker` (pid, kernel start time, log path:
+  diagnostics, never authority); the scheduler's L2 copy closed (`close`
+  only), so the worker is its only holder.
+- **A spawn that fails** (D2.3): a log that cannot be opened closes the
+  claim `abandoned` at once (no process exists). A spawn that raised
+  closes the scheduler's L2 copy and probes L2 afresh: free, the claim is
+  closed `abandoned` and the issue held `held:spawn-failed` for the
+  invocation; held, a child exists after all, so the claim stays open and
+  the issue `owned`. A `record_worker` that fails leaves the claim open with
+  no worker recorded; it is finalized after the reap like any other.
+- **The worker's startup** (D9.2), each step before the next and every
+  refusal an exit 2 before any state is read or written: adopt L0 and L2
+  through the fresh-descriptor proof (a wrong descriptor, or one of the
+  right object that does not hold its lock, is refused) and make them
+  non-inheritable, so no agent launch inherits either; load the binding and
+  the claim file strictly and require the open claim to be argv's
+  `(claim_id, generation, invocation_id)` and both files to name argv's
+  issue and EPIC; require `scheduler.json` to name argv's invocation and
+  the configuration the worker loaded to have its `config_digest` (an edit
+  since the scheduler started is refused); then bind the engine to the
+  namespace (`bind_issue_namespace`) and run it under the adopted L0
+  (`ControllerEngine.locked(held=...)`, which neither takes nor releases a
+  lock). A `start` claim over a state, or a `resume` claim admitted with a
+  state the namespace no longer holds, is refused with exit 2 too, once the
+  engine looked for its state and before anything is written.
+- **The worker's run** (D9.3): the engine with the merge gate closed and
+  `MERGE` / `UPDATE_EPIC` as extra stop phases (Workflow, "Scheduler
+  execution policy"); before every step L2 is proven again and the stop
+  request read. Its continuation command is `autoforge epic resume <n>`
+  (`ControllerEngine.continue_command`), never a standalone `resume`,
+  which refuses the scheduler root. SIGTERM is turned into
+  `KeyboardInterrupt` so the executor's existing teardown of a running
+  agent runs; SIGINT already is. Either ends the worker with exit 130 and
+  the state as the last step saved it.
+- **Reap and finalization.** The scheduler polls its unreaped children
+  each tick; one that exited is finalized under a re-acquired L2
+  (`finalize_worker`; a probe that holds L2 at that instant only defers it
+  to the next tick). Its issue is then held for the rest of the invocation
+  by what finalization classified it as. The exit status is recorded and
+  never decides.
+- **Stop request** (`epics/<n>/stop-request`, D16.4), schema
+  `autoforge.scheduler-stop/1`: `{schema, invocation_id, mode
+  (drain | now), requested_at}`. `request_stop` (#183's `epic stop`) is its
+  one writer and needs no lock: it refuses when no `scheduler.json` exists
+  (creating nothing), writes a fsynced temporary
+  `.stop-request.<random>.tmp` and publishes it by `link(2)`, which never
+  replaces: a second request writes nothing and reports the existing mode.
+  It then re-reads `scheduler.json` and reports "scheduler changed; stop not
+  delivered" when another invocation started meanwhile, and that an ended
+  invocation's workers may still run, which `now` cannot signal. A writer
+  killed before its link leaves only a temporary, which is no request.
+  Every reader is strict, and a request that does not parse (a link at the
+  name included) is a drain for every invocation. Only the L0 holder
+  removes one: a request bound to another invocation on any tick, and an
+  unparsable request or a leftover temporary at its start.
+- **Exit with a live worker.** A second interrupt, the grace expiring or
+  an exception ends the scheduler while a worker may still run. Its L0 was
+  close-only from before the first spawn, so the worker keeps L0 and its
+  L2 until it exits: no standalone `run`, `step`, `resume` or `unblock`
+  runs before that (`LockError`), and the claim it leaves is classified at
+  the next start.
 
 ---
 

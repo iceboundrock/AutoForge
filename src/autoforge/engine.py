@@ -105,7 +105,7 @@ import os
 import re
 import secrets
 import shlex
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -1468,6 +1468,11 @@ class ControllerEngine:
         # descriptor must be on a filesystem whose flock is a local kernel
         # lock. A standalone engine never checks.
         self.require_local_lock_filesystem = False
+        # The command that continues this run when it is not ``resume`` with
+        # :attr:`cli_global_flags` (#182): a worker's namespace is continued
+        # by the scheduler, which a standalone ``resume`` refuses. Words
+        # after ``autoforge``, paths only; empty for every other caller.
+        self.continue_command: tuple[str, ...] = ()
 
     # -- the state directory as a held capability --------------------------
     @property
@@ -1753,10 +1758,12 @@ class ControllerEngine:
         ``state_dir`` rather than from a flag: the command swaps that
         configuration for the recorded one, whose ``state_dir`` (or the
         default ``.autoforge``) may be another directory, with no run or
-        another run in it.
+        another run in it. A run with a :attr:`continue_command` names no
+        state directory: its command finds the run by itself.
         """
         flags: list[str] = ["--config", recorded.config_file] if recorded.config_file else []
-        flags += ["--state-dir", os.path.abspath(self.paths.state_dir)]
+        if not self.continue_command:
+            flags += ["--state-dir", os.path.abspath(self.paths.state_dir)]
         return shlex.join(["autoforge", *flags, *words])
 
     def _log_config_change(
@@ -3927,7 +3934,7 @@ class ControllerEngine:
         return self.lock_path().parent.parent
 
     @contextmanager
-    def locked(self) -> Iterator[ControllerEngine]:
+    def locked(self, held: ControllerLock | None = None) -> Iterator[ControllerEngine]:
         """Hold the controller lock for a whole command lifecycle.
 
         A CLI command loads (or creates and saves) state and executes it
@@ -3937,11 +3944,29 @@ class ControllerEngine:
         acquiring a second one (flock(2) is not reentrant across file
         descriptors; a nested acquisition would fail with LockError).
         The lock is released when the block exits, also on error.
+
+        ``held`` is a lock this process already holds (a worker's adopted L0,
+        #182): the block runs under it, and leaves it held on exit, since its
+        owner releases it. One of another repository than ``workdir``'s, or
+        one not held, is refused (LockError) before the block runs.
         """
         if self._lock is not None:
             raise LockError(
                 f"controller lock {self._lock.lock_path} is already held by this engine"
             )
+        if held is not None:
+            own = os.path.realpath(self.coordination_root())
+            if not held.held or os.path.realpath(held.coordination_root) != own:
+                raise LockError(
+                    f"the controller lock {held.lock_path} is not a held lock of this "
+                    f"repository's git common dir {own}"
+                )
+            self._lock = held
+            try:
+                yield self
+            finally:
+                self._lock = None
+            return
         lock = ControllerLock(self.lock_path()).acquire()
         self._lock = lock
         try:
@@ -3981,6 +4006,8 @@ class ControllerEngine:
         dry_run: bool = False,
         allow_merge: bool = False,
         on_outcome: Callable[[StepOutcome], None] | None = None,
+        extra_stop_phases: Iterable[Phase] = (),
+        should_continue: Callable[[], bool] | None = None,
     ) -> list[StepOutcome]:
         """Loop ``step()`` until a stop phase or ``max_steps``.
 
@@ -3994,6 +4021,14 @@ class ControllerEngine:
         step finished, before the next one starts (the CLI prints it, #192);
         the list returned is the same outcomes. It is not called for a dry
         run, whose plans are returned at once.
+
+        Two execution-policy inputs, generic and unaware of who passes them
+        (a scheduler's worker passes both, #182). ``extra_stop_phases`` are
+        stop phases besides the mode's, and ``should_continue`` a predicate
+        that ends the loop when it returns false; both are checked before
+        every step, the first included, so a run whose state already is in
+        one of the phases executes nothing. A dry run plans as before: it
+        executes nothing either way. The defaults are the loop above.
         """
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
@@ -4002,6 +4037,7 @@ class ControllerEngine:
             stop_phases = stop_phases_for(WorkflowMode.LOCAL)
         else:
             stop_phases = TERMINAL_PHASES if self.merge_gate_open(allow_merge) else STOP_PHASES
+        stop_phases = frozenset(stop_phases) | frozenset(extra_stop_phases)
         if dry_run:
             outcomes = [self._step_once(dry_run=True, allow_merge=allow_merge)]
             assert self.state is not None
@@ -4018,6 +4054,8 @@ class ControllerEngine:
             for _ in range(max_steps):
                 assert self.state is not None
                 if self.state.phase in stop_phases:
+                    break
+                if should_continue is not None and not should_continue():
                     break
                 outcome = self._step_once(dry_run=False, allow_merge=allow_merge)
                 all_outcomes.append(outcome)
@@ -11481,8 +11519,12 @@ class ControllerEngine:
         other limits, another worktree), which a REMOTE run refuses (#219).
         The flags are the ones this process was
         started with (:attr:`cli_global_flags`), paths as given, quoted for a
-        POSIX shell (#189).
+        POSIX shell (#189). A run whose continuation is another command (a
+        scheduler namespace's, which a standalone ``resume`` refuses) names
+        :attr:`continue_command` instead.
         """
+        if self.continue_command:
+            return shlex.join(["autoforge", *self.continue_command])
         return self.cli_command("resume")
 
     def cli_command(self, *words: str) -> str:

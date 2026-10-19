@@ -77,7 +77,7 @@ install the extra.
 
 An unknown key, whether at the top level, in any section (`execution`,
 `safety`, `github`, `merge`, `review`, `review.replan`, `workflow`, `local`,
-`sandbox`) or in a profile mapping, is a configuration error naming the section, the
+`sandbox`, `scheduler`) or in a profile mapping, is a configuration error naming the section, the
 offending key and the keys that section knows, e.g.
 `unknown key(s) under 'workflow': max_review_round (known: max_review_rounds, ...)`.
 A typo cannot be a silent no-op that leaves the built-in default in force:
@@ -141,6 +141,7 @@ directory if it is missing and a probe file it creates and removes there.
 | `github` | the `gh` binary and its timeout | [GitHub safety](agent-guides/github-safety.md) |
 | `validation` | REMOTE candidate validation (#172): `commands` (argv lists, empty by default), `scope` (`candidate-tree`, the only value) | [Candidate validation](#candidate-validation) below, [State and recovery](agent-guides/state-and-recovery.md#validation-evidence) |
 | `local` | Local Mode: `feature_dir`, `max_fix_rounds`, `validation_commands`, `exclude`, `max_workspace_entries`, `max_workspace_bytes` | [Local mode configuration](#local-mode-configuration) below |
+| `scheduler` | the parallel EPIC scheduler (#182): `max_parallel` (1-4, default 2), `poll_interval_seconds` (15-3600, default 60), `stop_grace_seconds` (10-600, default 30) | [Parallel EPIC scheduler](#parallel-epic-scheduler) below, [Workflow](agent-guides/workflow.md#scheduler-execution-policy) |
 | `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths` | [Outer sandbox](#outer-sandbox) below, [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
 ## Profiles
@@ -966,6 +967,34 @@ one.
 
 A writable credential directory is shared by every launch that projects
 it, across issues and roles, so dedicate it to AutoForge's launches.
+
+## Parallel EPIC scheduler
+
+```yaml
+scheduler:
+  max_parallel: 2            # live issue workers at once, 1-4
+  poll_interval_seconds: 60  # least time between two EPIC snapshots, 15-3600
+  stop_grace_seconds: 30     # how long a stop or a first Ctrl-C waits, 10-600
+```
+
+The parallel EPIC scheduler (ADR 0008, #182) runs up to `max_parallel`
+issues of one EPIC at once, each in a worker process that runs the
+single-issue workflow on the issue's own namespace. Every value is bounded
+and a value outside its bounds (0, 5 or a negative `max_parallel`, say) is a
+configuration error: there is no unbounded mode. `poll_interval_seconds` is
+the least time between two snapshots of the EPIC's native graph while new
+issues may still be admitted. `stop_grace_seconds` is how long a stop, or
+a first Ctrl-C, waits for the interrupted workers to return; a second
+Ctrl-C does not wait. The section is ignored by `run`, `step`, `resume` and
+`local`.
+
+A scheduler's workers read the same configuration file again, and each
+refuses to start when its effective configuration is not the one the
+scheduler started with (`scheduler.json`'s `config_digest`): stop the
+scheduler before editing the file. Workers stop at `READY_FOR_MERGE`
+whatever `safety.allow_merge` says; with `allow_merge: true` the scheduler
+says so once at startup and leaves the file as it is
+([Workflow](agent-guides/workflow.md#scheduler-execution-policy)).
 
 ## Local mode configuration
 

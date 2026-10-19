@@ -29,7 +29,8 @@ own, found again from the repository alone after a crash:
   strict, written once with create-exclusive semantics and never rewritten;
   :func:`check_binding` turns a difference from the caller's expectation
   into a typed :class:`~autoforge.errors.NamespaceMismatch`.
-* :func:`load_issue_namespace` and :func:`list_issue_namespaces` only read:
+* :func:`load_issue_namespace`, :func:`load_binding` (the binding alone, a
+  worker's first read) and :func:`list_issue_namespaces` only read:
   they never create a directory, quarantine or write. A corrupt state is
   reported for its own namespace and no other.
 * :func:`archive_issue_state` moves ``state/state.json`` aside with the
@@ -549,6 +550,23 @@ def load_issue_namespace(coordination_root: str | Path, issue_number: int) -> Na
     else:
         kind = NamespaceKind.ABSENT
     return NamespaceLookup(namespace, kind, binding, state, claim_present)
+
+
+def load_binding(namespace: IssueNamespace) -> RunBinding | None:
+    """The namespace's ``binding.json`` alone, strictly; ``None`` when there is none.
+
+    What a worker checks before it reads anything else of its namespace
+    (#182): :func:`load_issue_namespace`'s strict binding read, without the
+    state. Read-only; a corrupt binding, one of another issue and a link at
+    any directory of the path raise as they do there.
+    """
+    with _open_anchor(namespace.coordination_root) as anchor:
+        try:
+            issue_root = anchor.subroot("/".join(namespace.relative))
+        except FileNotFoundError:
+            return None
+    with issue_root:
+        return _read_binding(issue_root, namespace)
 
 
 def _read_binding(issue_root: SafeRoot, namespace: IssueNamespace) -> RunBinding | None:

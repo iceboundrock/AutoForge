@@ -63,6 +63,7 @@ from enum import Enum
 from pathlib import Path
 from typing import NoReturn, TypeVar
 
+from .config import MAX_PARALLEL_BOUNDS, POLL_INTERVAL_BOUNDS, STOP_GRACE_BOUNDS
 from .epic_graph import LocalFact
 from .errors import (
     ClaimConflict,
@@ -130,10 +131,9 @@ MAX_QUOTED_NAMES = 5
 # A pid fits a 32-bit signed integer on every platform the scheduler runs on.
 MAX_PID = 2**31 - 1
 
-# ADR 0008 D18.3, D18.4: the bounds a scheduler's configuration is held to.
-MAX_PARALLEL_BOUNDS = (1, 4)
-POLL_INTERVAL_BOUNDS = (15, 3600)
-STOP_GRACE_BOUNDS = (10, 600)
+# ADR 0008 D18.3, D18.4: the bounds a scheduler's configuration is held to are
+# config.py's (MAX_PARALLEL_BOUNDS, POLL_INTERVAL_BOUNDS, STOP_GRACE_BOUNDS), the
+# ones the ``scheduler.*`` keys are validated against.
 
 _HEX32 = re.compile(r"[0-9a-f]{32}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")

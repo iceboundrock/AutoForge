@@ -155,6 +155,66 @@ workflow:
 
 ---
 
+## Scheduler execution policy
+
+ADR 0008 D2, D9 and D16 (#182; `src/autoforge/scheduler.py`,
+`src/autoforge/worker.py`). The parallel EPIC scheduler runs one EPIC's
+ready children through this same state machine, one issue per worker
+process. It changes where a run stops and who starts it, never a
+transition:
+
+- **Bounded parallelism.** At most `scheduler.max_parallel` workers (1-4,
+  default 2; there is no unbounded mode) are live at once. Ready issues are
+  admitted in #179's ready order (how many open children an issue unblocks,
+  then issue number) up to the free slots, one admission transaction at a
+  time under L0. A snapshot of the EPIC is taken at most once per
+  `scheduler.poll_interval_seconds` (default 60) while admission is open, at
+  once after an admission whose re-read found the issue changed (no claim
+  is written for it), at most three times in a row before it waits for the
+  interval again.
+- **The settlement boundary.** A worker runs the engine with the merge gate
+  closed (`allow_merge=False`, whatever `safety.allow_merge` says) and with
+  `MERGE` and `UPDATE_EPIC` as extra stop phases, so it stops at
+  `READY_FOR_MERGE`, `BLOCKED`, `FAILED` or `DONE` and never merges, never
+  updates the EPIC, never reads a `next_issue_url` and never calls
+  `reset_for_new_issue`. A state that `unblock` moved into `MERGE` or
+  `UPDATE_EPIC` makes its worker exit without a step. With
+  `safety.allow_merge: true` the scheduler prints, once at startup,
+  "safety.allow_merge is enabled in configuration, but scheduler workers
+  stop at READY_FOR_MERGE and never merge in this version; configuration is
+  not changed." and changes nothing. A run also stops at the worker's step
+  limit (50, as a standalone `run`), its claim then classified `resumable`.
+- **The same run as a standalone one.** A fresh issue starts exactly as
+  `autoforge run` starts it (INITIALIZING); a namespace holding a state
+  passes #219's recorded-configuration gate first, as `resume` does, and a
+  changed configuration is refused unless the scheduler forwards
+  `--accept-config-change`. Every validation and certificate gate of #158
+  applies unchanged: a failing candidate takes the same next phase in a
+  worker as in a standalone run.
+- **One run per issue per invocation.** A worker that exits leaves its
+  issue held for the rest of the invocation (`held:settled-namespace`,
+  `held:resumable` or `held:uncertain`), whatever it returned: no issue is
+  relaunched by the invocation that ran it. A `BLOCKED` or `READY_FOR_MERGE`
+  issue is settled; a child it blocks stays blocked until the blocker is
+  closed as completed on GitHub and a later snapshot sees it.
+- **The step boundary.** Before every step a worker proves again that it
+  holds its issue's L2 and reads the stop request; a failed proof, a
+  request for this invocation or one that does not parse ends the run
+  there, the state as the last step saved it.
+- **Stop.** A `drain` request closes admission and lets every worker
+  return at its next step boundary; the scheduler then exits `drained`. The
+  first SIGINT, SIGTERM or SIGHUP, or a `now` request, closes admission and
+  sends SIGINT to every live worker, whose engine runs the executor's
+  existing teardown of a running agent and exits 130 with its state in
+  progress; the scheduler waits up to `scheduler.stop_grace_seconds`
+  (default 30) and finalizes each worker that returns. A second signal, or
+  the grace expiring, forwards a second SIGINT and exits at once; a worker
+  still running keeps L0 and its L2 until it exits, and its claim is
+  classified at the next start. Nothing sends SIGKILL, and no stop writes
+  GitHub.
+
+---
+
 ## Candidate validation gates
 
 ADR 0006 §2.5 (#173): the controller's own validation commands

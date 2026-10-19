@@ -261,3 +261,79 @@ def test_locking_outside_a_git_repository_is_a_lock_error(tmp_path):
         eng.step()
     assert eng.provider.calls == []
     assert not (plain / ".autoforge").exists()
+
+
+# -- the scheduler worker's hooks (#182) ----------------------------------------------------
+
+
+def test_locked_under_a_held_lock_runs_under_it_and_leaves_it_held(tmp_state_dir, monkeypatch):
+    """A worker's adopted L0: the block runs under it, takes no lock, releases nothing."""
+    eng = make_engine(tmp_state_dir, ["never"])
+    held = ControllerLock(eng.lock_path()).acquire()
+    try:
+        acquired = _count_acquisitions(monkeypatch)
+        with eng.locked(held=held):
+            assert eng.lock_held
+            eng._save()
+            assert eng.run(max_steps=1)  # the run reuses it
+        assert not eng.lock_held and held.held, "the owner releases it, not the block"
+        assert acquired == [] and not _can_lock(eng.lock_path())
+    finally:
+        held.release()
+    assert _can_lock(eng.lock_path())
+
+
+def test_locked_refuses_a_lock_that_is_not_held_or_not_this_repositorys(tmp_state_dir, tmp_path):
+    eng = make_engine(tmp_state_dir, ["never"])
+    unheld = ControllerLock(eng.lock_path())
+    with pytest.raises(LockError, match="not a held lock"):
+        with eng.locked(held=unheld):
+            raise AssertionError("the block ran")
+    other = git_repo(tmp_path / "elsewhere")
+    with ControllerLock(repository_lock_path(other)) as foreign:
+        with pytest.raises(LockError, match="not a held lock"):
+            with eng.locked(held=foreign):
+                raise AssertionError("the block ran")
+    assert not eng.lock_held
+
+
+def test_run_asks_should_continue_before_every_step(tmp_state_dir):
+    gh = _github()
+    eng = make_engine(tmp_state_dir, implement, github=gh, origin=True)
+    asked: list[str] = []
+
+    def refuse() -> bool:
+        asked.append(eng.state.phase.value)
+        return False
+
+    assert eng.run(should_continue=refuse) == []  # checked before the first step too
+    assert asked == ["INITIALIZING"] and eng.provider.calls == []
+    answers = iter([True, False])
+    outcomes = eng.run(should_continue=lambda: next(answers))
+    assert [o.next_phase for o in outcomes] == ["ANALYZE_EXECUTE"]
+    assert eng.state.phase is Phase.ANALYZE_EXECUTE and eng.provider.calls == []
+
+
+def test_run_stops_before_an_extra_stop_phase(tmp_state_dir):
+    gh = _github()
+    eng = make_engine(tmp_state_dir, implement, github=gh, origin=True)
+    asked: list[str] = []
+
+    def ask() -> bool:
+        asked.append(eng.state.phase.value)
+        return True
+
+    outcomes = eng.run(extra_stop_phases={Phase.REVIEW}, should_continue=ask)
+    assert [o.next_phase for o in outcomes] == ["ANALYZE_EXECUTE", "REVIEW"]
+    assert eng.state.phase is Phase.REVIEW and len(eng.provider.calls) == 1
+    # A stop phase ends the loop before the predicate is asked again.
+    assert asked == ["INITIALIZING", "ANALYZE_EXECUTE"]
+    assert eng.run(extra_stop_phases={Phase.REVIEW}) == []
+
+
+def test_a_continue_command_replaces_the_resume_command_and_names_no_state_dir(tmp_state_dir):
+    eng = make_engine(tmp_state_dir, ["never"])
+    eng.cli_global_flags = ("--state-dir", str(tmp_state_dir))
+    assert eng.resume_command() == f"autoforge --state-dir {tmp_state_dir} resume"
+    eng.continue_command = ("--config", "/etc/af.yaml", "epic", "resume", "1")
+    assert eng.resume_command() == "autoforge --config /etc/af.yaml epic resume 1"

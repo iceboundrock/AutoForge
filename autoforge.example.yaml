@@ -412,6 +412,18 @@ github:
   command: gh
   timeout_seconds: 120
 
+scheduler:
+  # The parallel EPIC scheduler (ADR 0008, #182): one foreground process runs
+  # up to `max_parallel` issues of one EPIC at once, each in a worker process
+  # of its own that runs the single-issue workflow on that issue's namespace
+  # and stops at its settlement boundary (READY_FOR_MERGE, BLOCKED, FAILED).
+  # Workers never merge and never update the EPIC, whatever
+  # `safety.allow_merge` says. Every value is bounded; there is no unbounded
+  # mode. Ignored by `run`, `step`, `resume` and `local`.
+  max_parallel: 2           # live workers at once, 1-4
+  poll_interval_seconds: 60 # least time between two EPIC snapshots, 15-3600
+  stop_grace_seconds: 30    # a stop or first Ctrl-C waits this long, 10-600
+
 sandbox:
   # The outer sandbox (ADR 0005, #168, #169): an OS-enforced filesystem,
   # process and IPC boundary around what AutoForge launches, on top of the

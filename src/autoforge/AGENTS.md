@@ -10,7 +10,8 @@ Read the module docstring before changing a module; this map only says where
 a concern lives so the routing rules can be applied.
 
 ```text
-cli.py              subcommands run / step / resume / unblock / status / doctor / local, dry-run flags
+cli.py              subcommands run / step / resume / unblock / status / doctor / local, dry-run flags;
+                    the hidden `epic _worker` entry point of a scheduler's worker (#182)
 config.py           configuration loading and validation; owns config defaults and keys
 doctor.py           read-only environment checks
 doctor_sandbox.py   doctor's outer-sandbox rows: capability and mode outcome, policy by
@@ -109,6 +110,22 @@ epic_graph.py       the parallel EPIC scheduler's view of GitHub's native graph 
                     satisfaction, the pure evaluate (verdicts, LocalFact, ready order), the
                     snapshot and node digests, the admission re-read; four client reads,
                     no GitHub write, no lock, no file
+scheduler.py        the parallel EPIC scheduler (ADR 0008 D2, D9, D16, #182): holds L0 for its
+                    life, admits ready issues one transaction at a time under L2 (re-read,
+                    binding, claim, spawn), reaps and finalizes workers, drain, stop and
+                    Ctrl-C; #179's four reads only, no GitHub write, no provider name, no
+                    effect record, no CONTROL_RESULT, never SIGKILL
+worker.py           a scheduler's issue worker, `epic _worker` (#182): adopts the inherited
+                    L0 and L2 by proof, checks the claim, invocation and config digest, then
+                    runs the unchanged engine on the issue's namespace with the merge gate
+                    closed and MERGE / UPDATE_EPIC as stop phases, proving L2 and reading
+                    the stop request at each step boundary
+executor_supervised.py  one supervised child: spawned in a session of its own with only the
+                    passed descriptors and a log as stdout and stderr, signalled (never
+                    SIGKILL, never once reaped), polled; executor layer, no workflow (#182)
+scheduler_stop.py   `epics/<n>/stop-request` (ADR 0008 D16.4, #182): published by link(2),
+                    never replaced, read strictly (one that does not parse is a drain),
+                    removed only by the L0 holder
 redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
@@ -134,7 +151,12 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
   pushes or publishes) is read only through `agent_worktree.py`, never
   through the worktree's agent-writable `.git` file;
   no raw `gh --json` dictionaries crossing out of `github.py`; no large
-  prompt text in Python string literals.
+  prompt text in Python string literals. The scheduler modules
+  (`scheduler.py`, `worker.py`, `executor_supervised.py`,
+  `scheduler_stop.py`) name no provider, call no GitHub write, construct no
+  effect record and parse no `CONTROL_RESULT`: everything an issue does is
+  the engine's, in its worker (#182; structural tests in
+  `tests/test_scheduler.py`).
 - The outcome of a GitHub write is read back from GitHub, never inferred
   from an exit status or an agent claim, and a destructive write is
   checkpointed in persisted state before it is performed. Persisted state is
