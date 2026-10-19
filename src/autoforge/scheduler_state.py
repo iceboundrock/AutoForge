@@ -738,12 +738,14 @@ def _no_constant(name: str) -> NoReturn:
 
 
 def _read_document(root: SafeRoot, name: str, *, limit: int, where: str) -> object | None:
-    """The JSON document at ``name`` under ``root``; ``None`` when there is none.
+    """The JSON document at ``name`` under ``root``; ``None`` only when there is no file.
 
     Strict like the binding's read: a link or another non-regular entry is
     refused without being followed, a file over ``limit`` unread, and a
     duplicated key, a non-JSON number and the decoder's own limits are
-    refusals (:class:`SchedulerStateError`).
+    refusals (:class:`SchedulerStateError`). So is a file holding JSON
+    ``null``: it is a corrupt file, kept until explicit recovery, never one
+    that is not there.
     """
     st = root.lstat(name)
     if st is None:
@@ -760,7 +762,7 @@ def _read_document(root: SafeRoot, name: str, *, limit: int, where: str) -> obje
     if raw is None:
         return None  # removed between the lstat and the open
     try:
-        return json.loads(
+        document = json.loads(
             raw.decode("utf-8"), object_pairs_hook=_unique_keys, parse_constant=_no_constant
         )
     except UnicodeDecodeError as exc:
@@ -774,6 +776,9 @@ def _read_document(root: SafeRoot, name: str, *, limit: int, where: str) -> obje
             f"{where} exceeds the JSON decoder's integer or nesting limit "
             f"({type(exc).__name__}); no scheduler file comes near it"
         ) from exc
+    if document is None:
+        raise SchedulerStateError(f"{where} holds JSON null, not a JSON object")
+    return document
 
 
 def _payload(document: dict, *, limit: int, where: str) -> bytes:
@@ -786,11 +791,12 @@ def _payload(document: dict, *, limit: int, where: str) -> bytes:
 def load_claim_file(namespace: IssueNamespace) -> ClaimFile | None:
     """The namespace's ``claim.json``, strictly; ``None`` when there is none. Read-only.
 
-    A corrupt file, one of an unknown schema or one that breaks a bound or
-    the closing rule raises :class:`SchedulerStateError`; a link at any
-    directory of the path raises :class:`~autoforge.safefs.UnsafePathError`.
-    Whether the file names this namespace's run is the caller's check
-    (:func:`classify`), as the binding's is.
+    A corrupt file (one holding JSON ``null`` included), one of an unknown
+    schema or one that breaks a bound or the closing rule raises
+    :class:`SchedulerStateError`; a link at any directory of the path raises
+    :class:`~autoforge.safefs.UnsafePathError`. Whether the file names this
+    namespace's run is the caller's check (:func:`classify`), as the
+    binding's is.
     """
     with _open_anchor(namespace.coordination_root) as anchor:
         try:
@@ -2118,9 +2124,10 @@ def scheduler_state_path(coordination_root: str | Path, epic_number: int) -> Pat
 def load_scheduler_state(coordination_root: str | Path, epic_number: int) -> SchedulerState | None:
     """EPIC ``epic_number``'s ``scheduler.json``, strictly; ``None`` when there is none.
 
-    A corrupt file, or one of an unknown version, raises
-    :class:`~autoforge.errors.SchedulerStateError`: the scheduler's global
-    uncertainty (D6.3), recovered only by ``epic run --force``. Read-only.
+    A corrupt file (one holding JSON ``null`` included), or one of an
+    unknown version, raises :class:`~autoforge.errors.SchedulerStateError`:
+    the scheduler's global uncertainty (D6.3), recovered only by
+    ``epic run --force``. Read-only.
     """
     relative = _epic_relative(epic_number)
     where = str(scheduler_state_path(coordination_root, epic_number))

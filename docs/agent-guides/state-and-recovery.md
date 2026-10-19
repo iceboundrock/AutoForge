@@ -897,10 +897,10 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   is strict: an unknown schema (refused as a version before any field), an
   unknown or missing field at any level, a duplicated key, `NaN`, a value
   out of its bound, a file over 1 MiB, not UTF-8 JSON or reached through a
-  link, generations out of order, a `current` that is not the last
-  generation allocated, a claim id used twice or a history the closing rule
-  forbids is a `SchedulerStateError`. Generations are monotonic within the
-  file.
+  link, a file holding JSON `null` (corrupt, never read as no file),
+  generations out of order, a `current` that is not the last generation
+  allocated, a claim id used twice or a history the closing rule forbids is
+  a `SchedulerStateError`. Generations are monotonic within the file.
 - **One closing rule** (D7.2). `superseded` only in the write that installs
   the replacing claim (`open_claim(..., supersedes=)`); a claim closed
   without a replacement is `abandoned` when no worker was recorded on it

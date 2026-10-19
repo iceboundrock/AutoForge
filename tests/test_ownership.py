@@ -162,12 +162,14 @@ def test_a_claim_file_of_closed_claims_only_owns_nothing(common):
     assert scheduler_ownership(common, 7) == ""
 
 
-@pytest.mark.parametrize("damage", ["garbage", "unknown schema", "symlink"])
+@pytest.mark.parametrize("damage", ["garbage", "null", "unknown schema", "symlink"])
 def test_an_unreadable_claim_file_owns_its_issue(common, tmp_path, damage):
     """Fail-closed: a claim file the scheduler cannot read may hold an open claim."""
     ns = _bind(common)
     if damage == "garbage":
         ns.claim_file.write_text("{ not json")
+    elif damage == "null":
+        ns.claim_file.write_text("null")
     elif damage == "unknown schema":
         ns.claim_file.write_text('{"schema": "autoforge.scheduler-claim/2", "current": null}')
     else:

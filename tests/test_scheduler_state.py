@@ -445,7 +445,8 @@ def test_the_loader_refuses_a_history_the_closing_rule_forbids(
 
 
 @pytest.mark.parametrize(
-    "damage", ["garbage", "duplicate key", "nan", "not utf-8", "array", "symlink", "too large"]
+    "damage",
+    ["garbage", "duplicate key", "nan", "not utf-8", "array", "null", "symlink", "too large"],
 )
 def test_a_claim_file_that_does_not_parse_is_refused_and_left_alone(common, tmp_path, damage):
     ns = _bind(common, 7)
@@ -461,6 +462,8 @@ def test_a_claim_file_that_does_not_parse_is_refused_and_left_alone(common, tmp_
         ns.claim_file.write_bytes(b'{"schema": "\xff"}')
     elif damage == "array":
         ns.claim_file.write_text("[]")
+    elif damage == "null":
+        ns.claim_file.write_text("null")
     elif damage == "symlink":
         ns.claim_file.symlink_to(elsewhere)
     else:
@@ -742,7 +745,9 @@ def test_claim_and_scheduler_writes_are_refused_while_holding_l1(common):
     assert load_claim_file(ns) is None and load_scheduler_state(common, 1) is None
 
 
-@pytest.mark.parametrize("problem", ["no binding", "corrupt claim", "other run", "other epic"])
+@pytest.mark.parametrize(
+    "problem", ["no binding", "corrupt claim", "null claim", "other run", "other epic"]
+)
 def test_a_claim_is_written_only_over_this_namespaces_own_file(common, problem):
     ns = issue_namespace(common, 7)
     if problem == "no binding":
@@ -753,6 +758,9 @@ def test_a_claim_is_written_only_over_this_namespaces_own_file(common, problem):
         if problem == "corrupt claim":
             ns.claim_file.write_text("{ not json")
             message = "not valid JSON"
+        elif problem == "null claim":
+            ns.claim_file.write_text("null")
+            message = "holds JSON null"
         elif problem == "other run":
             other = _bind(common, 8)
             _open(other)
@@ -990,6 +998,9 @@ def _uncertain_case(common: Path, case: str, tmp_path: Path) -> tuple[IssueNames
     if case == "corrupt claim":
         ns.claim_file.write_text("{ not json")
         return ns, "claim-corrupt"
+    if case == "null claim":
+        ns.claim_file.write_text("null")
+        return ns, "claim-corrupt"
     if case == "unknown claim schema":
         raw["schema"] = "autoforge.scheduler-claim/2"
         reason = "claim-corrupt"
@@ -1015,6 +1026,7 @@ UNCERTAIN_CASES = [
     "state of another issue",
     "state of another epic",
     "corrupt claim",
+    "null claim",
     "unknown claim schema",
     "claim of another issue id",
     "claim of another epic",
@@ -1271,13 +1283,15 @@ def test_archive_crashed_before_the_state_was_moved_classifies_by_the_state(comm
     assert item.fact is LocalFact.HELD_SETTLED_NAMESPACE and item.closed is None
 
 
-@pytest.mark.parametrize("damage", ["garbage", "unknown schema", "other run", "symlink"])
+@pytest.mark.parametrize("damage", ["garbage", "null", "unknown schema", "other run", "symlink"])
 def test_archive_moves_a_claim_file_the_writers_refuse_aside(common, tmp_path, damage):
     ns = _bind(common, 7)
     target = tmp_path / "target"
     target.write_text("not mine")
     if damage == "garbage":
         ns.claim_file.write_text("{ not json")
+    elif damage == "null":
+        ns.claim_file.write_text("null")
     elif damage == "unknown schema":
         _open(ns)
         raw = _raw(ns)
@@ -1317,15 +1331,17 @@ def test_archive_of_a_namespace_without_a_claim_changes_nothing(common):
 def test_open_claims_for_epic_lists_this_epics_open_claims_and_unreadable_ones(common):
     seven, eight, nine = (_bind(common, n) for n in (7, 8, 9))
     ten = _bind(common, 10, OTHER_EPIC)
+    eleven = _bind(common, 11)
     open_seven = _open(seven)
     _close(eight, _open(eight), ClaimClassification.ABANDONED)
     nine.claim_file.write_text("{ not json")
     _open(ten)
+    eleven.claim_file.write_text("null")
     before = _tree(common)
     found = open_claims_for_epic(common, EPIC)
-    assert [(c.issue_number, c.claim) for c in found] == [(7, open_seven), (9, None)]
-    assert found[1].problem
-    assert [c.issue_number for c in open_claims_for_epic(common, OTHER_EPIC)] == [9, 10]
+    assert [(c.issue_number, c.claim) for c in found] == [(7, open_seven), (9, None), (11, None)]
+    assert found[1].problem and "holds JSON null" in found[2].problem
+    assert [c.issue_number for c in open_claims_for_epic(common, OTHER_EPIC)] == [9, 10, 11]
     assert _tree(common) == before
 
 
@@ -1422,18 +1438,21 @@ def test_scheduler_state_is_strict(common, path, value, message):
         load_scheduler_state(common, 1)
 
 
-def test_a_corrupt_scheduler_state_is_quarantined_only_on_request(common):
+@pytest.mark.parametrize(
+    ("content", "message"), [("{ corrupt", "not valid JSON"), ("null", "holds JSON null")]
+)
+def test_a_corrupt_scheduler_state_is_quarantined_only_on_request(common, content, message):
     assert quarantine_scheduler_state(common, 1) is None
     write_scheduler_state(common, _scheduler())
     with pytest.raises(SchedulerStateError, match="only a corrupt one is quarantined"):
         quarantine_scheduler_state(common, 1)
     file = scheduler_state_path(common, 1)
-    file.write_text("{ corrupt")
-    with pytest.raises(SchedulerStateError, match="not valid JSON"):
+    file.write_text(content)
+    with pytest.raises(SchedulerStateError, match=message):
         load_scheduler_state(common, 1)  # global uncertainty, until --force
     moved = quarantine_scheduler_state(common, 1)
     assert moved is not None and moved.name.startswith("scheduler.json.corrupt-")
-    assert moved.read_text() == "{ corrupt" and not file.exists()
+    assert moved.read_text() == content and not file.exists()
     write_scheduler_state(common, _scheduler())
     assert load_scheduler_state(common, 1) is not None
 
