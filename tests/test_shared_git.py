@@ -1,8 +1,9 @@
 """Shared-Git critical sections (ADR 0008 D12; #180), with real git.
 
 Every controller write to git's shared data in the common dir holds the
-shared-Git lock (L1) and runs with automatic maintenance off; read-only
-operations, the agents' own commits and the sandbox directories take no L1.
+shared-Git lock (L1) and runs with automatic maintenance off, and so does the
+REMOTE creation of the sandbox directories there; read-only operations and
+the agents' own commits take no L1.
 Each claim of D12.5's table is one test here, run with concurrent real
 processes in temporary repositories, and each ends with ``git fsck --full``
 clean.
@@ -23,11 +24,13 @@ import textwrap
 from pathlib import Path
 
 from autoforge import locking
+from autoforge.config import default_config
 from autoforge.engine import ControllerEngine
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.git_transport import NO_AUTO_MAINTENANCE
 from autoforge.locking import SharedGitLock
 from autoforge.premerge import export_commit_tree
+from autoforge.safefs import SafeRoot
 from tests.conftest import GIT_IDENT, ISSUE, FakeGitHub, git_repo, implement, make_engine
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -151,7 +154,11 @@ SANDBOX_DIRS = PRELUDE + textwrap.dedent(
     barrier()
     for anchor in anchors:
         made = ControllerEngine._sandbox_dirs(
-            None, anchor, f"autoforge/sandbox/{key}", ("objects", "overlay-work", "cache")
+            None,
+            anchor,
+            f"autoforge/sandbox/{key}",
+            ("objects", "overlay-work", "cache"),
+            git_lock=lambda operation: Timed(anchor, operation=operation),
         )
         print("made", made, flush=True)
     """
@@ -410,10 +417,11 @@ def test_concurrent_agent_commits_on_distinct_worktrees(tmp_path):
     _fsck(common)
 
 
-def test_concurrent_sandbox_dirs_for_different_keys(tmp_path):
+def test_l1_concurrent_sandbox_dirs_for_different_keys(tmp_path):
     """Eight issues prepare their sandbox directories at once in each of five
-    fresh common dirs, racing on the shared `autoforge/sandbox` parent: every
-    call succeeds, without L1."""
+    fresh common dirs, racing on the shared `autoforge/sandbox` parent: in each
+    common dir every creation, that parent's included, holds L1 alone, and
+    every call succeeds."""
     anchors = []
     for n in range(5):
         anchor = tmp_path / f"common-{n}"
@@ -421,8 +429,17 @@ def test_concurrent_sandbox_dirs_for_different_keys(tmp_path):
         anchors.append(str(anchor))
     keys = [str(key) for key in range(2, 10)]
     outputs = _run_together([[SANDBOX_DIRS, os.pathsep.join(anchors), key] for key in keys])
-    assert all(len(lines) == len(anchors) for lines in outputs)
+    sections: dict[str, list[tuple[float, float]]] = {anchor: [] for anchor in anchors}
+    for lines in outputs:
+        # Each call reports its section as it releases L1, then what it made.
+        assert len(lines) == 2 * len(anchors)
+        for section, made in zip(lines[::2], lines[1::2], strict=True):
+            assert section.startswith("section ") and made.startswith("made ")
+            _, start, end = section.split()
+            sections[str(Path(made.split(" ", 1)[1]).parents[2])].append((float(start), float(end)))
     for anchor in anchors:
+        _assert_disjoint(sorted(sections[anchor]), expected=len(keys))
+        assert (Path(anchor) / "autoforge" / "git.lock").is_file()
         sandbox = Path(anchor) / "autoforge" / "sandbox"
         assert sorted(p.name for p in sandbox.iterdir()) == sorted(keys)
         for key in keys:
@@ -431,8 +448,6 @@ def test_concurrent_sandbox_dirs_for_different_keys(tmp_path):
                 "objects",
                 "overlay-work",
             ]
-    assert _sections(outputs) == []
-    assert not any((Path(anchor) / "autoforge" / "git.lock").exists() for anchor in anchors)
 
 
 def test_l1_writes_disable_automatic_maintenance(tmp_path):
@@ -549,6 +564,45 @@ def test_every_common_dir_write_holds_l1(tmp_state_dir):
     assert locking._shared_git_holder == ""
 
 
+def test_remote_sandbox_dirs_are_created_under_l1_and_the_agent_runs_without_it(
+    tmp_state_dir, monkeypatch
+):
+    """An enforced REMOTE launch creates its sandbox directories in the common
+    dir, the shared `autoforge/sandbox` parent first, under L1 (D12.1), and
+    the agent it launches next holds none."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE, "Feature")
+    held_by_agent: list[str] = []
+
+    def agent(req):
+        held_by_agent.append(locking._shared_git_holder)
+        return implement(req)
+
+    created: list[tuple[str, str]] = []
+    real_ensure_dir = SafeRoot.ensure_dir
+
+    def ensure_dir(root: SafeRoot, relpath: str) -> None:
+        created.append((relpath, locking._shared_git_holder))
+        real_ensure_dir(root, relpath)
+
+    monkeypatch.setattr(SafeRoot, "ensure_dir", ensure_dir)
+    cfg = default_config()
+    cfg.sandbox.mode = "required"
+    eng = make_engine(tmp_state_dir, agent, github=gh, cfg=cfg, origin=True)
+    eng.step()  # INITIALIZING
+    sandbox = Path(os.path.realpath(eng.coordination_root())) / "autoforge" / "sandbox"
+    assert not sandbox.exists()
+    assert eng.step().next_phase == "REVIEW"
+    made = [(relpath, holder) for relpath, holder in created if relpath.startswith("autoforge/")]
+    assert [relpath for relpath, _ in made] == [
+        f"autoforge/sandbox/2/{name}" for name in ("objects", "overlay-work", "cache")
+    ]
+    assert {holder for _, holder in made} == {"prepare the issue's sandbox directories"}
+    assert sorted(p.name for p in (sandbox / "2").iterdir()) == ["cache", "objects", "overlay-work"]
+    assert held_by_agent == [""]
+    assert locking._shared_git_holder == ""
+
+
 def _has(command: list[str], words: list[str]) -> bool:
     return any(command[i : i + len(words)] == words for i in range(len(command)))
 
@@ -633,8 +687,10 @@ def test_every_common_dir_write_in_the_source_is_a_guarded_section():
 
 
 def test_sandbox_dirs_is_a_plain_function_of_its_arguments(tmp_path):
-    """The sandbox test above calls it without an engine: it reads no engine state."""
+    """The sandbox test above calls it without an engine: it reads no engine state.
+    Without a lock factory (LOCAL's own git directory) it takes no L1."""
     no_engine: ControllerEngine = None  # type: ignore[assignment]
     made = ControllerEngine._sandbox_dirs(no_engine, tmp_path, "autoforge/sandbox/7", ("objects",))
     assert made == tmp_path / "autoforge" / "sandbox" / "7"
     assert (made / "objects").is_dir()
+    assert not (tmp_path / "autoforge" / "git.lock").exists()

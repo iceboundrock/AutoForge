@@ -9,6 +9,7 @@ same routes in ``test_sandbox_routing.py``.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from autoforge import locking
 from autoforge.config import default_config
 from autoforge.errors import (
     ConfigurationError,
@@ -23,6 +25,7 @@ from autoforge.errors import (
     SandboxLaunchRefusedError,
     VerificationError,
 )
+from autoforge.locking import SharedGitLock, shared_git_lock_path
 from autoforge.sandbox import Access, Bind, Mask, Overlay
 from autoforge.state import load_state
 from autoforge.transitions import Phase
@@ -136,6 +139,52 @@ def test_a_refused_launch_is_recorded_and_nothing_runs(tmp_state_dir, fake_githu
     assert record["metadata"]["sandbox_mode"] == "required"
     assert "SandboxLaunchRefusedError" in record["execution"]["error"]
     assert not (tmp_state_dir.parent / "elsewhere").exists()
+
+
+def test_a_shared_git_lock_not_obtained_refuses_the_launch_and_a_retry_proceeds(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """The REMOTE sandbox directories are created under L1 (ADR 0008 D12.1):
+    while another controller process holds it past the bound, the launch is
+    refused as a sandbox that cannot be prepared, nothing runs or is created,
+    and the next step, once L1 is free, launches."""
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=_required(), origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    root = eng.coordination_root()
+    sandbox = Path(os.path.realpath(root)) / "autoforge" / "sandbox"
+    real = eng._shared_git_lock
+    other: list[int] = []
+
+    def busy(operation: str) -> SharedGitLock:
+        if operation != "prepare the issue's sandbox directories":
+            return real(operation)
+        # Another controller's descriptor of the same lock file holds L1.
+        fd = os.open(shared_git_lock_path(root), os.O_RDWR | os.O_CLOEXEC)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        other.append(fd)
+        return SharedGitLock(root, operation=operation, wait_seconds=0)
+
+    monkeypatch.setattr(eng, "_shared_git_lock", busy)
+    try:
+        with pytest.raises(
+            SandboxLaunchRefusedError,
+            match=r"GitLockTimeout: waited 0s for the shared-Git lock \(L1\) .* to prepare "
+            "the issue's sandbox directories",
+        ):
+            eng.step()
+    finally:
+        for fd in other:
+            os.close(fd)
+    assert len(other) == 1
+    assert eng.provider.calls == [] and not sandbox.exists()
+    assert locking._shared_git_holder == ""
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+    (record,) = _executions(eng, "ANALYZE_EXECUTE")
+    assert "SandboxLaunchRefusedError" in record["execution"]["error"]
+    monkeypatch.setattr(eng, "_shared_git_lock", real)
+    assert eng.step().next_phase == "REVIEW"
+    assert len(eng.provider.calls) == 1
+    assert sorted(p.name for p in (sandbox / "2").iterdir()) == ["cache", "objects", "overlay-work"]
 
 
 def test_an_alternates_file_in_the_private_store_blocks_the_run(tmp_state_dir, fake_github):

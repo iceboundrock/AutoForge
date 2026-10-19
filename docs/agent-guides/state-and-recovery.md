@@ -547,17 +547,20 @@ L1, and only tests take L2:
   (hardened like L2), is held around exactly the writes of ADR 0008 D12.1:
   the agent worktree's check-then-create (`_ensure_agent_worktree`), the
   controller's fetch (taken inside `GitTransport.fetch`, so every caller,
-  the pre-merge fetch and `read_commit`'s re-fetch included, holds it), and
-  the strict import's `index-pack` alone. Each of those git processes runs
-  with automatic maintenance off (`git_transport.NO_AUTO_MAINTENANCE`:
-  `gc.auto=0`, `maintenance.auto=false`). It is the one blocking
-  acquisition: a poll bounded by `SHARED_GIT_LOCK_WAIT_SECONDS` (the fetch's
-  600 s plus 60 s) whose expiry is the transient `GitLockTimeout`, which the
-  guarded operation reports as its own failure (the fetch's
-  `GitTransportError`, the import's failure, the worktree creation's
-  "Nothing was launched; 'resume' tries again"). Reads take no lock. The
-  sandbox directories are not under L1: they are not git data and only
-  their issue's owner creates them; the PID record is covered by L0.
+  the pre-merge fetch and `read_commit`'s re-fetch included, holds it), the
+  strict import's `index-pack` alone, and the REMOTE creation of the
+  issue's sandbox directories (`_sandbox_dirs`), the shared
+  `autoforge/sandbox` parent included, but not the launch after it. Each of
+  those git processes runs with automatic maintenance off
+  (`git_transport.NO_AUTO_MAINTENANCE`: `gc.auto=0`,
+  `maintenance.auto=false`). It is the one blocking acquisition: a poll
+  bounded by `SHARED_GIT_LOCK_WAIT_SECONDS` (the fetch's 600 s plus 60 s)
+  whose expiry is the transient `GitLockTimeout`, which the guarded
+  operation reports as its own failure (the fetch's `GitTransportError`, the
+  import's failure, the worktree creation's "Nothing was launched; 'resume'
+  tries again", the sandbox directories' `SandboxLaunchRefusedError`). Reads
+  take no lock. LOCAL's sandbox cache in its own git directory takes no L1;
+  the PID record is covered by L0.
 - **Order L0 → L2 → L1.** L0 and L2 are only ever taken non-blocking, and
   the holder of L1 takes nothing while holding it, so no wait-for cycle can
   form; a standalone command takes L0 then L1 and never L2. A debug

@@ -106,7 +106,7 @@ import re
 import secrets
 import shlex
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -242,6 +242,7 @@ from .errors import (
     GitLockTimeout,
     GitTransportError,
     LockError,
+    LockOrderError,
     MaterializationError,
     NamespaceError,
     SandboxCapabilityError,
@@ -2066,8 +2067,9 @@ class ControllerEngine:
         """The shared-Git lock (L1) for one controller write to the common dir.
 
         ADR 0008 D11.1, D12.1: around the agent worktree's check-then-create,
-        the controller's fetch (:meth:`_git_transport`) and the strict
-        import's ``index-pack``, never across an agent invocation, a GitHub
+        the controller's fetch (:meth:`_git_transport`), the strict import's
+        ``index-pack`` and the REMOTE sandbox directories' creation
+        (:meth:`_sandbox_dirs`), never across an agent invocation, a GitHub
         call, a state save or another acquisition. Keyed by
         :meth:`coordination_root`, like L0 and the scheduler namespaces.
         """
@@ -2322,6 +2324,7 @@ class ControllerEngine:
             common,
             f"{SANDBOX_DIR}/{self._agent_worktree_name()}",
             (PRIVATE_OBJECTS, OVERLAY_WORK, *((CACHE,) if cache else ())),
+            git_lock=self._shared_git_lock,
         )
         return LaunchFacts(
             launch_class=LaunchClass.REMOTE_AGENT,
@@ -2400,13 +2403,34 @@ class ControllerEngine:
         roots += sorted(str(r) for r in registered_worktree_roots(dirs[-1]) if r != workspace)
         return tuple(dict.fromkeys(roots))
 
-    def _sandbox_dirs(self, anchor: Path, relbase: str, names: tuple[str, ...]) -> Path:
+    def _sandbox_dirs(
+        self,
+        anchor: Path,
+        relbase: str,
+        names: tuple[str, ...],
+        *,
+        git_lock: Callable[[str], SharedGitLock] | None = None,
+    ) -> Path:
         """Create ``<anchor>/<relbase>/<name>`` for each name, refusing a link anywhere
-        below ``anchor`` (ADR 0005 D8.4); AutoForge never deletes them."""
+        below ``anchor`` (ADR 0005 D8.4); AutoForge never deletes them.
+
+        REMOTE passes ``git_lock`` (:meth:`_shared_git_lock`): there ``anchor``
+        is the common dir, whose ``autoforge/sandbox`` parent every issue's
+        engine writes, so the whole creation, that shared parent included, holds
+        L1 (ADR 0008 D12.1), and the launch after it does not. A lock not
+        obtained within its bound (or a lock entry that is not the controller's
+        file) refuses the launch like a directory that cannot be prepared, and
+        ``resume`` tries again. LOCAL's own git directory takes none.
+        """
         try:
-            with SafeRoot.open(anchor) as root:
+            with (
+                git_lock("prepare the issue's sandbox directories") if git_lock else nullcontext(),
+                SafeRoot.open(anchor) as root,
+            ):
                 for name in names:
                     root.ensure_dir(f"{relbase}/{name}")
+        except LockOrderError:
+            raise  # a controller bug (D11.2), never a launch refusal to retry
         except (AutoForgeError, OSError) as exc:
             raise SandboxLaunchRefusedError(
                 f"the sandbox cannot be established: its directory {anchor / relbase} cannot "

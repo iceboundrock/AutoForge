@@ -142,9 +142,10 @@ GIT_LOCK_FILENAME = "git.lock"  # L1, beside controller.lock (ADR 0008 D5.3)
 # D11.3: the longest timeout of any operation L1 guards, plus 60 s, so a
 # waiter queued behind one operation that stays within its own bound never
 # times out. The network fetch is the longest: the strict import's
-# `index-pack` (agent_worktree.IMPORT_TIMEOUT_SECONDS) is as long, and the
+# `index-pack` (agent_worktree.IMPORT_TIMEOUT_SECONDS) is as long, the
 # worktree check-then-create is a few local git reads and one `worktree
-# add` of 120 s each (tests/test_lock_domains.py keeps the three in step).
+# add` of 120 s each (tests/test_lock_domains.py keeps the three in step),
+# and the sandbox directories' creation is a few `mkdir`s.
 SHARED_GIT_LOCK_WAIT_SECONDS = NETWORK_TIMEOUT_SECONDS + 60
 # How often a waiter retries its non-blocking attempt.
 SHARED_GIT_LOCK_POLL_SECONDS = 0.05
@@ -803,10 +804,11 @@ class SharedGitLock:
     """The shared-Git lock (L1), scoped to one controller write to the common dir.
 
     A context manager around exactly one critical section of ADR 0008 D12.1:
-    the agent worktree's check-then-create, the controller's fetch, or the
-    strict import's ``index-pack``. Taken ``LOCK_EX`` by a poll of
-    non-blocking attempts until :data:`SHARED_GIT_LOCK_WAIT_SECONDS` have
-    passed, then :class:`~autoforge.errors.GitLockTimeout` (transient; the
+    the agent worktree's check-then-create, the controller's fetch, the
+    strict import's ``index-pack``, or the REMOTE sandbox directories'
+    creation. Taken ``LOCK_EX`` by a poll of non-blocking attempts until
+    :data:`SHARED_GIT_LOCK_WAIT_SECONDS` have passed, then
+    :class:`~autoforge.errors.GitLockTimeout` (transient; the
     guarded operation reports it as its own failure). Released by ``close``:
     the descriptor is ``O_CLOEXEC`` and never shared. Standalone commands and
     workers both take it; with ``require_local_filesystem`` (scheduler mode)

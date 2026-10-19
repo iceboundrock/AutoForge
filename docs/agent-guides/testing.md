@@ -226,7 +226,11 @@ High-priority coverage includes:
   real `statfs`. No launch inherits a lock descriptor. With real git
   (D12.5): concurrent worktree creation, fetches and an import beside a
   read-only export hold L1 in disjoint sections and leave `git fsck --full`
-  clean; agents' concurrent commits and sandbox directories take no L1;
+  clean; concurrent sandbox directories for different issues also hold L1
+  in disjoint sections; an enforced REMOTE launch creates its sandbox
+  directories under L1 and launches its agent without it, and one that
+  cannot get L1 in time is refused and proceeds on the next step; agents'
+  concurrent commits take no L1;
   the installed git repacks after a fetch unless automatic maintenance is
   off; every git write in the source is a guarded section. The ownership
   guards: `run` (also `--force`, before the quarantine), `step`, `resume`
