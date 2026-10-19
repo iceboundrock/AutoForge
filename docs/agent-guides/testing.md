@@ -220,14 +220,18 @@ High-priority coverage includes:
   covers every guarded operation; the L1 holder takes no lock, calls no
   GitHub, saves nothing and launches nothing; 1000 randomized acquisitions
   in order from four processes never deadlock and admit one holder at a
-  time. The scheduler's filesystem refusal (faked `statfs`: NFS, CIFS,
-  SMB2, 9p, FUSE, Ceph and macOS names refused; ext4, xfs, btrfs, tmpfs and
-  apfs accepted; a lock file on NFS below an ext4 root refused) and the
-  real `statfs`. No launch inherits a lock descriptor. With real git
+  time. Two workers sharing L0, each with its own issue's L2, are inside
+  their executor-launched fake providers at once (each says so on a FIFO,
+  and neither is released before both did): meanwhile no process holds L1,
+  another write takes it without waiting, and a third acquisition of issue
+  1's L2 is `IssueBusy`. The scheduler's filesystem refusal (faked `statfs`:
+  NFS, CIFS, SMB2, 9p, FUSE, Ceph and macOS names refused; ext4, xfs, btrfs,
+  tmpfs and apfs accepted; a lock file on NFS below an ext4 root refused)
+  and the real `statfs`. No launch inherits a lock descriptor. With real git
   (D12.5): concurrent worktree creation, fetches and an import beside a
   read-only export hold L1 in disjoint sections and leave `git fsck --full`
-  clean; concurrent sandbox directories for different issues also hold L1
-  in disjoint sections; an enforced REMOTE launch creates its sandbox
+  clean; concurrent sandbox directories for different issues also hold L1 in
+  disjoint sections; an enforced REMOTE launch creates its sandbox
   directories under L1 and launches its agent without it, and one that
   cannot get L1 in time is refused and proceeds on the next step; agents'
   concurrent commits take no L1;

@@ -3,13 +3,16 @@
 L0 (:class:`ControllerLock`) shared by a scheduler with its workers and
 adopted after a proof, L2 (:class:`IssueRunLock`) handed to exactly one
 worker and probed lock-free, L1 (:class:`SharedGitLock`) around one write to
-the common dir, the order L0 -> L2 -> L1, the filesystem refusal and the
+the common dir, the order L0 -> L2 -> L1, two workers inside their provider
+invocations at once with no L1 held, the filesystem refusal and the
 descriptor hygiene of every launch.
 
 A multi-process test runs real child processes that talk over pipes. None
 sleeps for correctness: a child answers once its step is done, a reaped
-child has closed every descriptor, and "released" after an orphaned child
-exits is waited for with a blocking ``flock`` bounded by an alarm.
+child has closed every descriptor, a fake provider says on a FIFO that it
+entered and waits on another for its release, and "released" after an
+orphaned child exits is waited for with a blocking ``flock`` bounded by an
+alarm.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import subprocess
 import sys
 import textwrap
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import IO
 
@@ -150,6 +154,54 @@ LIST_FDS = textwrap.dedent(
     """
 )
 
+# A worker stand-in: adopts the L0 and the one issue's L2 its scheduler
+# handed it, takes and releases L1 for its launch's preparation (as the
+# worktree check-then-create and the strict import do), then launches its
+# fake provider through the executor, as every agent is launched. Once the
+# provider has returned it proves both locks again and prints the
+# provider's exit code and output.
+WORKER = textwrap.dedent(
+    """
+    import sys
+    sys.path.insert(0, sys.argv[1])
+    from autoforge import locking
+    from autoforge.executor import ExecutionRequest, execute
+    from autoforge.run_namespace import issue_namespace
+
+    root, issue, l0_fd, l2_fd, provider, entered, release = sys.argv[2:9]
+    l0 = locking.ControllerLock.adopt(int(l0_fd), expected_root=root)
+    l2 = locking.IssueRunLock.adopt(int(l2_fd), issue_namespace(root, int(issue)))
+    with locking.SharedGitLock(root, operation=f"prepare issue {issue}'s launch"):
+        pass
+    locking.assert_shared_git_lock_free(f"launch issue {issue}'s agent")
+    result = execute(
+        ExecutionRequest(
+            command=[sys.executable, "-c", provider, issue, entered, release],
+            timeout_seconds=120,
+            contain_orphans=True,
+        )
+    )
+    l0.prove_held()
+    l2.prove_held()
+    print(result.exit_code, result.stdout.strip(), flush=True)
+    """
+)
+
+# A fake provider: says on one FIFO that it entered, then waits on another
+# for its release, so the test decides when the invocation ends. The alarm
+# ends it should the test never answer.
+PROVIDER = textwrap.dedent(
+    """
+    import signal, sys
+    signal.alarm(120)
+    issue, entered, release = sys.argv[1:4]
+    with open(entered, "w") as told:
+        told.write(f"provider {issue} entered\\n")
+    with open(release) as word:
+        print(f"provider {issue} released by {word.read().strip()}")
+    """
+)
+
 
 class Channel:
     """One request line to a child, its one answer line back."""
@@ -244,20 +296,29 @@ def _held(path: Path) -> bool:
     return False
 
 
-def _wait_released(path: Path, seconds: int = 60) -> None:
-    """Block until nothing holds ``path``'s lock: a blocking flock, bounded by an alarm."""
+@contextmanager
+def _within(seconds: int, failure: str) -> Iterator[None]:
+    """Bound the blocking calls inside by an alarm: ``AssertionError(failure)`` once it fires."""
 
     def expired(signum, frame):
-        raise AssertionError(f"{path} was still locked after {seconds}s")
+        raise AssertionError(failure)
 
     previous = signal.signal(signal.SIGALRM, expired)
     signal.alarm(seconds)
-    fd = _open_fresh(path)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
+
+
+def _wait_released(path: Path, seconds: int = 60) -> None:
+    """Block until nothing holds ``path``'s lock: a blocking flock, bounded by an alarm."""
+    fd = _open_fresh(path)
+    try:
+        with _within(seconds, f"{path} was still locked after {seconds}s"):
+            fcntl.flock(fd, fcntl.LOCK_EX)
+    finally:
         os.close(fd)
 
 
@@ -841,6 +902,80 @@ def test_a_thousand_randomized_acquisitions_in_order_never_deadlock(root):
     taken = sum(int(out) for out, _ in results)
     assert taken >= 1000, "every round takes L1"
     assert sorted(p.name for p in root.iterdir()) == ["autoforge"], "every marker removed"
+
+
+# -- two workers on distinct issues at once (D11.2) ----------------------------------
+
+
+def test_two_workers_are_inside_their_provider_invocations_at_once_without_l1(root, tmp_path):
+    """#180's issue-local overlap: two workers on distinct issues run their
+    providers at the same time, and neither holds L1 while they run.
+
+    The test is their scheduler: it takes L0 and switches it to close-only,
+    takes issue 1's and issue 2's L2 and hands each, with L0, to one worker,
+    and closes its own copies. Each worker adopts both, takes and releases L1
+    for its launch's preparation and launches its fake provider through the
+    executor. Neither provider is released before both have said they
+    entered: in that window no process holds L1, so another controller write
+    takes it without waiting, while the workers hold L0 and their own L2.
+    """
+    issues = (1, 2)
+    namespaces = {n: issue_namespace(root, n) for n in issues}
+    fifos: dict[tuple[int, str], Path] = {}
+    for n in issues:
+        for end in ("entered", "release"):
+            fifos[n, end] = tmp_path / f"provider-{n}-{end}"
+            os.mkfifo(fifos[n, end])
+    workers: dict[int, subprocess.Popen[str]] = {}
+    scheduler = ControllerLock(_l0(root)).acquire()
+    try:
+        l0_fd = scheduler.share()
+        for n in issues:
+            with IssueRunLock(namespaces[n]) as l2:
+                l2_fd = l2.handoff()
+                workers[n] = subprocess.Popen(
+                    [sys.executable, "-c", WORKER, str(SRC), str(root), str(n)]
+                    + [str(l0_fd), str(l2_fd), PROVIDER]
+                    + [str(fifos[n, "entered"]), str(fifos[n, "release"])],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    pass_fds=(l0_fd, l2_fd),
+                )
+    finally:
+        scheduler.release()  # close only: the workers' copies keep L0
+    try:
+        with _within(60, "the two providers did not both enter within 60s"):
+            entered = {n: fifos[n, "entered"].read_text() for n in issues}
+        assert entered == {n: f"provider {n} entered\n" for n in issues}
+        # Both invocations are running: neither provider returns before the
+        # test opens its release FIFO.
+        assert not _held(shared_git_lock_path(root)), "no process holds L1 while both run"
+        with SharedGitLock(root, operation="another issue's fetch", wait_seconds=0) as l1:
+            assert l1.held
+        assert _held(root), "the workers hold L0 after their scheduler let go"
+        assert all(issue_run_lock_live(namespaces[n]) for n in issues)
+        with pytest.raises(IssueBusy):
+            IssueRunLock(namespaces[1]).acquire()
+        for n in issues:
+            with _within(60, f"provider {n} was not waiting for its release"):
+                fifos[n, "release"].write_text("the test\n")
+        results = {n: worker.communicate(timeout=120) for n, worker in workers.items()}
+    finally:
+        for worker in workers.values():
+            if worker.poll() is None:
+                # Ctrl-C, not SIGKILL: the executor kills its provider's group first.
+                worker.send_signal(signal.SIGINT)
+                try:
+                    worker.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+                    worker.wait(timeout=60)
+    for n, (out, err) in results.items():
+        assert workers[n].returncode == 0, err
+        assert out == f"0 provider {n} released by the test\n"
+    assert not _held(root)
+    assert not any(issue_run_lock_live(namespaces[n]) for n in issues)
 
 
 # -- the filesystem of a scheduler lock (D11.4) --------------------------------------
