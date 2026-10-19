@@ -52,6 +52,8 @@ from .validation import (
     GitHubIssueRef,
     GitHubPullRequestRef,
     GitHubRef,
+    parse_api_issue_url,
+    parse_api_repository_url,
     parse_comment_url,
     parse_github_url,
     parse_issue_url,
@@ -1016,6 +1018,214 @@ def _ruleset_from_data(data: dict) -> RulesetInfo:
     )
 
 
+# -- the native EPIC dependency graph (ADR 0008 D3, #179) ----------------------------
+#
+# Read-only: the parallel EPIC scheduler's snapshot reads an EPIC's direct
+# native sub-issues and each child's native ``blocked_by`` list, nothing
+# else (``blocking`` is never read, prose never parsed). Every row is
+# decoded strictly into the eligibility facts of D3.5; a row that is not
+# the object asked for is a conclusive GitHubError, never a node with a
+# manufactured identity.
+
+# GitHub's documented limits on the native graph: "You can add up to 100
+# sub-issues per parent issue" (docs, "Adding sub-issues"), and "You can
+# link up to 50 issues for each relationship type" (changelog 2025-08-21,
+# "Dependencies on issues"). The snapshot refuses a graph past either
+# (D3.4) instead of reading it partially.
+MAX_SUB_ISSUES = 100
+MAX_BLOCKED_BY = 50
+# Both listings are read with the REST maximum page size, every page.
+_GRAPH_PAGE_SIZE = 100
+ISSUE_STATES = ("open", "closed")
+# A ``state_reason`` is GitHub's word (``completed``, ``not_planned``,
+# ``duplicate``, ``reopened``, or one it adds later). An unknown word is kept
+# and shown; anything that is not a short word is a malformed answer.
+_STATE_REASON_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+# The fields that name a blocker beyond its ``id``. A row carrying none of
+# them names a blocker the token may not read (see :func:`_decode_blocker`).
+_BLOCKER_IDENTITY_FIELDS = ("html_url", "number", "state", "repository_url")
+
+
+@dataclass(frozen=True)
+class IssueNode:
+    """One issue as the dependency graph reads it: its eligibility facts (ADR 0008 D3.5).
+
+    Decoded from a REST issue object (``GET .../issues/<n>`` or a
+    ``/sub_issues`` row). ``id`` is GitHub's numeric issue id; ``url`` the
+    issue's canonical HTML URL and ``repository`` the ``owner/repo`` it
+    names; ``state`` is ``open`` or ``closed``; ``state_reason`` is GitHub's
+    word or None; ``parent`` is the issue ``parent_issue_url`` names (None
+    when it has none); ``sub_issues_total`` is ``sub_issues_summary.total``;
+    ``blocked_by_total`` and ``blocked_by_open`` are
+    ``issue_dependencies_summary.total_blocked_by`` and ``.blocked_by``.
+    Titles, bodies, labels, assignees, milestones and timestamps are never
+    read into a node.
+    """
+
+    id: int
+    number: int
+    url: str
+    repository: str
+    state: str
+    state_reason: str | None
+    parent: GitHubIssueRef | None
+    sub_issues_total: int
+    blocked_by_total: int
+    blocked_by_open: int
+
+    @property
+    def ref(self) -> GitHubIssueRef:
+        return parse_issue_url(self.url)
+
+    @property
+    def is_open(self) -> bool:
+        return self.state == "open"
+
+
+@dataclass(frozen=True)
+class BlockerNode:
+    """One row of an issue's native ``blocked_by`` listing (ADR 0008 D3.2, D3.6).
+
+    A readable blocker carries its ``number``, ``url``, ``repository``,
+    ``state`` and ``state_reason``, wherever it lives. ``readable`` False is
+    a blocker GitHub names by its ``id`` alone, with none of the fields that
+    would identify it: the token may not read it. Its other fields are None
+    rather than a made-up identity, and it blocks its child (fail closed).
+    """
+
+    id: int
+    readable: bool
+    number: int | None = None
+    url: str | None = None
+    repository: str | None = None
+    state: str | None = None
+    state_reason: str | None = None
+
+
+def _positive_id(data: dict, key: str, what: str) -> int:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise GitHubError(f"{what}: field {key!r} is not a positive integer: {value!r:.40}")
+    return value
+
+
+def _rest_state(data: dict, what: str) -> str:
+    state = data.get("state")
+    if not isinstance(state, str) or state.lower() not in ISSUE_STATES:
+        raise GitHubError(f"{what}: state {state!r:.40} is neither open nor closed")
+    return state.lower()
+
+
+def _rest_state_reason(data: dict, what: str) -> str | None:
+    reason = data.get("state_reason")
+    if reason is None:
+        return None
+    if not isinstance(reason, str) or not _STATE_REASON_RE.fullmatch(reason):
+        raise GitHubError(f"{what}: state_reason {reason!r:.80} is not a reason word")
+    return reason.lower()
+
+
+def _summary_count(data: dict, summary: str, key: str, what: str) -> int:
+    block = data.get(summary)
+    if not isinstance(block, dict):
+        raise GitHubError(f"{what}: {summary} is not an object")
+    value = block.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise GitHubError(f"{what}: {summary}.{key} is not a count: {value!r:.40}")
+    return value
+
+
+def _rest_issue_ref(data: dict, what: str) -> GitHubIssueRef:
+    """The issue a REST row is: its ``html_url``, which ``number`` and ``repository_url`` match.
+
+    A pull request is an issue to the REST API, but its ``html_url`` is a
+    ``/pull/`` URL, so it is refused here: no graph edge names one.
+    """
+    url = data.get("html_url")
+    try:
+        ref = parse_issue_url(url if isinstance(url, str) else "")
+    except ConfigurationError as exc:
+        raise GitHubError(f"{what}: html_url {url!r:.200} is not a GitHub issue URL") from exc
+    _number_field(data, "number", what, ref.number)
+    api_repository = data.get("repository_url")
+    try:
+        repository = parse_api_repository_url(
+            api_repository if isinstance(api_repository, str) else ""
+        )
+    except ConfigurationError as exc:
+        raise GitHubError(
+            f"{what}: repository_url {api_repository!r:.200} is not a GitHub repository"
+        ) from exc
+    if not ref.same_repository(repository):
+        raise GitHubError(f"{what}: repository_url names {repository}, html_url {ref.repository}")
+    return ref
+
+
+def _decode_issue_node(row: object, what: str) -> IssueNode:
+    """One REST issue object as an :class:`IssueNode`, strictly."""
+    data = _row_object(row, what)
+    ref = _rest_issue_ref(data, what)
+    what = f"{what}: {ref.canonical}"
+    if "parent_issue_url" not in data:
+        raise GitHubError(f"{what}: the row carries no parent_issue_url")
+    parent_url = data.get("parent_issue_url")
+    parent: GitHubIssueRef | None = None
+    if parent_url is not None:
+        try:
+            parent = parse_api_issue_url(parent_url if isinstance(parent_url, str) else "")
+        except ConfigurationError as exc:
+            raise GitHubError(
+                f"{what}: parent_issue_url {parent_url!r:.200} is not a GitHub issue"
+            ) from exc
+    blocked_total = _summary_count(data, "issue_dependencies_summary", "total_blocked_by", what)
+    blocked_open = _summary_count(data, "issue_dependencies_summary", "blocked_by", what)
+    if blocked_open > blocked_total:
+        raise GitHubError(
+            f"{what}: {blocked_open} open blockers but {blocked_total} blockers in total"
+        )
+    return IssueNode(
+        id=_positive_id(data, "id", what),
+        number=ref.number,
+        url=ref.canonical,
+        repository=ref.repository,
+        state=_rest_state(data, what),
+        state_reason=_rest_state_reason(data, what),
+        parent=parent,
+        sub_issues_total=_summary_count(data, "sub_issues_summary", "total", what),
+        blocked_by_total=blocked_total,
+        blocked_by_open=blocked_open,
+    )
+
+
+def _decode_blocker(row: object, what: str) -> BlockerNode:
+    """One ``blocked_by`` row as a :class:`BlockerNode`, strictly.
+
+    GitHub documents no shape for a blocker the token may not read. A row
+    that carries a positive ``id`` and none of the fields naming the issue
+    (``html_url``, ``number``, ``state``, ``repository_url``) is read as such
+    a blocker: ``readable`` False, which blocks its child. A row with some
+    of them and not the others is malformed, as is every other defect. A
+    blocker GitHub leaves out of the listing altogether makes the listing
+    shorter than the child's ``total_blocked_by``, which refuses the whole
+    snapshot instead (ADR 0008 D3.3), the stricter of the two outcomes.
+    """
+    data = _row_object(row, what)
+    issue_id = _positive_id(data, "id", what)
+    if all(data.get(key) is None for key in _BLOCKER_IDENTITY_FIELDS):
+        return BlockerNode(id=issue_id, readable=False)
+    ref = _rest_issue_ref(data, what)
+    what = f"{what}: {ref.canonical}"
+    return BlockerNode(
+        id=issue_id,
+        readable=True,
+        number=ref.number,
+        url=ref.canonical,
+        repository=ref.repository,
+        state=_rest_state(data, what),
+        state_reason=_rest_state_reason(data, what),
+    )
+
+
 class GitHubClient:
     """Thin typed wrapper around `gh`. Inject ``runner`` for tests."""
 
@@ -1196,6 +1406,25 @@ class GitHubClient:
             raise GitHubError(
                 f"`gh api {endpoint}` returned a non-paginated JSON payload: {data!r:.200}"
             )
+        return [item for page in data for item in page]
+
+    def _api_full_pages(self, endpoint: str, page_size: int, what: str) -> list:
+        """:meth:`_api_pages`, and every page before the last holds ``page_size`` rows.
+
+        ``endpoint`` asks for ``per_page=page_size``. A page short of it
+        before the last means rows went missing between page reads, or were
+        held back from a page: the listing is not known to be complete, so
+        it is a conclusive GitHubError, never a shorter answer.
+        """
+        data = self._json(["api", "--paginate", "--slurp", endpoint])
+        if not isinstance(data, list) or not all(isinstance(page, list) for page in data):
+            raise GitHubError(f"{what}: `gh api` returned a non-paginated JSON payload")
+        for index, page in enumerate(data[:-1]):
+            if len(page) != page_size:
+                raise GitHubError(
+                    f"{what}: page {index + 1} of {len(data)} holds {len(page)} rows, "
+                    f"not {page_size}; the listing may be incomplete"
+                )
         return [item for page in data for item in page]
 
     # -- environment / doctor --------------------------------------------
@@ -1387,6 +1616,59 @@ class GitHubClient:
             return True
         except GitHubError:
             return False
+
+    # -- the native EPIC dependency graph (read-only; ADR 0008 D3, #179) ---------
+    def get_repository_id(self, repo: str) -> int:
+        """GitHub's numeric id of ``repo`` (``owner/name``), the RunKey's repository part."""
+        path = _repository_path(repo)
+        data = self._api_json(["api", f"repos/{path}"])
+        return _positive_id(data, "id", f"repository {path}")
+
+    def get_issue_node(self, url: str) -> IssueNode:
+        """The eligibility facts of one issue (``GET .../issues/<n>``).
+
+        The answer must be the issue asked for: one GitHub answers for
+        another (a transferred issue's redirect, a pull request's number)
+        is a conclusive GitHubError.
+        """
+        ref = parse_issue_url(url)
+        path = f"repos/{_repository_path(ref.repository)}/issues/{ref.number}"
+        node = _decode_issue_node(self._api_json(["api", path]), f"issue {ref.canonical}")
+        if not node.ref.same_target(ref):
+            raise GitHubError(f"issue {ref.canonical}: GitHub answered with {node.url}")
+        return node
+
+    def list_sub_issues(self, url: str) -> tuple[IssueNode, ...]:
+        """Every direct native sub-issue of an issue, every page read, in API order.
+
+        Not recursive (ADR 0008 D3.1). The caller checks the length against
+        the parent's ``sub_issues_summary.total`` and de-duplicates by ``id``.
+        """
+        ref = parse_issue_url(url)
+        what = f"sub-issues of {ref.canonical}"
+        endpoint = (
+            f"repos/{_repository_path(ref.repository)}/issues/{ref.number}/sub_issues"
+            f"?per_page={_GRAPH_PAGE_SIZE}"
+        )
+        rows = self._api_full_pages(endpoint, _GRAPH_PAGE_SIZE, what)
+        return tuple(_decode_issue_node(row, what) for row in rows)
+
+    def list_blocked_by(self, url: str) -> tuple[BlockerNode, ...]:
+        """Every native ``blocked_by`` dependency of an issue, every page read, in API order.
+
+        ``blocking`` is never read (ADR 0008 D3.2). A blocker may live in
+        any repository; one the token may not read is a ``readable`` False
+        node (:func:`_decode_blocker`). The caller checks the length against
+        the issue's ``total_blocked_by`` and de-duplicates by ``id``.
+        """
+        ref = parse_issue_url(url)
+        what = f"blockers of {ref.canonical}"
+        endpoint = (
+            f"repos/{_repository_path(ref.repository)}/issues/{ref.number}"
+            f"/dependencies/blocked_by?per_page={_GRAPH_PAGE_SIZE}"
+        )
+        rows = self._api_full_pages(endpoint, _GRAPH_PAGE_SIZE, what)
+        return tuple(_decode_blocker(row, what) for row in rows)
 
     # -- pull requests ------------------------------------------------------
     @staticmethod

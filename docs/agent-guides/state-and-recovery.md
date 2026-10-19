@@ -982,7 +982,9 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   a binding of another repository, a run lock on a network filesystem, or a
   namespace listing that cannot be read is global uncertainty (the report
   is not `admissible`). It never spawns, writes a per-issue state or
-  contacts GitHub.
+  contacts GitHub. Its facts are `epic_graph.LocalFact` values, the
+  vocabulary `evaluate` consumes (D4.1, #179; see `github-safety.md`,
+  "EPIC dependency graph").
 - **Finalization** (`finalize_worker`): after a worker exits and the
   scheduler re-acquires L2, the claim is closed by the state the worker
   left, classified with the caller's `expected` identity when it passes

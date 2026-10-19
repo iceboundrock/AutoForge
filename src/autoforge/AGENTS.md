@@ -103,6 +103,12 @@ scheduler_state.py  the scheduler's durable bookkeeping (ADR 0008 D6, D7, D14, #
                     under L2), scheduler.json, the pure restart classification,
                     reconciliation, worker finalization and open-claim queries; recovery
                     data, never liveness; no spawn, no GitHub, no per-issue state write
+epic_graph.py       the parallel EPIC scheduler's view of GitHub's native graph (ADR 0008 D3,
+                    D4, #179): the complete-or-refused EpicSnapshot of an EPIC's direct
+                    sub-issues and their blocked_by lists, cycles, completed-only blocker
+                    satisfaction, the pure evaluate (verdicts, LocalFact, ready order), the
+                    snapshot and node digests, the admission re-read; four client reads,
+                    no GitHub write, no lock, no file
 redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
@@ -168,6 +174,10 @@ domains), scheduler_state.py,
 engine.py (namespace binding)                     -> docs/agent-guides/state-and-recovery.md
                                                      + docs/adr/0008-parallel-epic-scheduler-
                                                      authority-run-identity-claims-and-locks.md
+epic_graph.py, github.py (graph reads)           -> docs/agent-guides/github-safety.md
+                                                     ("EPIC dependency graph") + docs/adr/0008-
+                                                     parallel-epic-scheduler-authority-run-
+                                                     identity-claims-and-locks.md
 providers.py, pi_rpc.py, claude_stream.py,
 progress.py, loop_detect.py, executor.py,
 executor_duplex.py,

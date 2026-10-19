@@ -5,7 +5,8 @@ Read this before changing any GitHub read or write (`src/autoforge/github.py`,
 (`src/autoforge/validation.py`, the post-phase checks in
 `src/autoforge/engine.py`), PR discovery, the merge gate and pre-merge evidence
 (`src/autoforge/premerge.py`, `safety.*` and `merge.*` configuration), EPIC
-maintenance, or the dry-run mode.
+maintenance, the EPIC dependency graph the parallel scheduler reads
+(`src/autoforge/epic_graph.py`), or the dry-run mode.
 
 ---
 
@@ -1790,6 +1791,106 @@ controller is the only party that writes the body (`autoforge.roadmap`,
 
 Do not rewrite the whole EPIC body, and never edit the EPIC body from a
 prompt.
+
+---
+
+## EPIC dependency graph
+
+The parallel EPIC scheduler (ADR 0008 D3, D4) decides which children of an
+EPIC are admissible from GitHub's native graph alone
+(`src/autoforge/epic_graph.py`, #179). Nothing calls it yet: #182's
+supervisor will, holding L0, before each claim. Sequential `UPDATE_EPIC`
+selection (`_verify_issue_selectable`) is unchanged and does not read it.
+
+- **The reads.** Four typed, read-only `GitHubClient` methods, each a plain
+  `gh api` GET with the transient retry of every read:
+  `get_repository_id` (`GET /repos/{o}/{r}`), `get_issue_node`
+  (`GET .../issues/{n}`), `list_sub_issues` (`.../sub_issues`) and
+  `list_blocked_by` (`.../dependencies/blocked_by`). Each listing uses
+  `per_page=100` and reads every page (`--paginate --slurp`). A page short
+  of 100 rows before the last page is a GitHubError, because rows went
+  missing between page reads. Rows decode strictly into `IssueNode` /
+  `BlockerNode`: id, number, HTML URL (a `/pull/` URL is refused), the
+  repository (`repository_url` must agree with it), state, `state_reason`,
+  `parent_issue_url` and the two summaries. No raw dictionary leaves
+  `github.py`. Only direct sub-issues are listed. Nested EPICs are never
+  traversed, `blocking` is never read, and prose (`Depends on #n`,
+  checklists, the roadmap) is never authority.
+- **Complete or refused.** `build_epic_snapshot` returns an immutable
+  `EpicSnapshot` or raises `SnapshotRefused` with a reason. It never
+  returns a partial graph. It refuses when:
+  - a read fails (`read-failed`, `transient` when it may succeed later);
+  - the EPIC URL's repository no longer has the verified `repository_id`;
+  - the EPIC is not open;
+  - the distinct child listing differs from `sub_issues_summary.total`;
+  - a queried blocker listing differs from `total_blocked_by`;
+  - a bound is exceeded: 100 sub-issues per parent (GitHub docs, "Adding
+    sub-issues") or 50 blockers per issue (GitHub changelog 2025-08-21,
+    "Dependencies on issues");
+  - the answer contradicts itself (one id with two sets of facts, two ids
+    for one issue, a listed child whose parent is not the EPIC);
+  - the open children contain a cycle, a self-edge included. The message
+    names one cycle canonically, starting at its lowest number. No agent
+    is ever asked to resolve it.
+
+  Entries are de-duplicated by issue `id`. A closed child's blockers are
+  not read, and neither are those of a child whose summary reports none.
+- **The pinned fields.** Two counts carry the completeness check:
+  `sub_issues_summary.total` counts closed children, and
+  `issue_dependencies_summary.total_blocked_by` counts closed blockers
+  (`blocked_by` counts only open ones). The fixtures under
+  `tests/fixtures/github_graph` hold both conditions. They are shaped from
+  the REST reference, not captured live (their README says so). If GitHub
+  counted otherwise, the listing's length would differ from the count and
+  every affected snapshot would be refused, never accepted incomplete.
+- **Satisfaction is completed-only.** A blocker is satisfied only when it
+  is closed with `state_reason` `completed`. Closed as `not_planned`, as a
+  duplicate, with no reason or with an unknown reason, it is
+  `closed-unsatisfied` and the verdict shows the reason. An open or
+  reopened blocker blocks. This is stricter than GitHub's display on
+  purpose: the operator removes the native edge when that is intended.
+  A blocker in another EPIC or another repository counts by its live state.
+  A blocker the token may not read blocks its child (`unreadable`).
+  GitHub documents no shape for one: a row naming only an `id` is read as
+  unreadable. A blocker left out of the listing makes it shorter than
+  `total_blocked_by`, and that refuses the snapshot.
+- **Shapes.** A child with sub-issues of its own is
+  `unsupported:nested-parent`. A child in another repository is
+  `unsupported:foreign-repository`. A closed child is `closed` and never
+  ready.
+- **The ready set.** `evaluate(snapshot, local_facts)` is pure. Verdict
+  precedence is `closed` > `unsupported` > `blocked` > `owned` >
+  `held:<reason>` > `ready`. `local_facts` is `epic_graph.LocalFact`, the
+  type #181's reconciliation returns. Order is descending count of open
+  children that transitively depend on the child, then ascending issue
+  number. Both keys come from the snapshot alone, never from API order,
+  dictionary or set iteration, or time.
+- **Eligibility facts and digests.** Only ids, numbers, states,
+  `state_reason`, repository, parent and sub-issue count reach a verdict,
+  the order or a digest. Titles, bodies, labels, assignees, milestones
+  and timestamps are never read into a node, so a hostile title cannot
+  change scheduling. The snapshot digest and the node digests are SHA-256
+  over canonical JSON of exactly the facts of ADR 0008 D4.4. #181 records
+  them in a claim's `admission`. Diagnostics name issue numbers, states
+  and reasons, never a title or a body. They are redacted and bounded.
+- **The admission re-read.** `reread_node(client, snapshot, issue)`
+  re-reads one child and its complete blocker list and compares them with
+  the snapshot's node digest. The result is `unchanged`, or `stale` with
+  each difference:
+  - the child is not open;
+  - its id differs;
+  - its parent is no longer the EPIC;
+  - it now has sub-issues;
+  - a blocker was added, removed or changed state;
+  - the blocker listing is incomplete.
+
+  A read that fails raises its GitHubError, so it is never `unchanged`. The
+  snapshot is never changed.
+- **No GitHub write.** The scheduler writes nothing to GitHub: no label,
+  comment, edge or EPIC body. `epic_graph` is typed against a
+  `GraphReader` protocol of the four reads. A structural test
+  (`tests/test_epic_graph.py`) asserts that the module reaches no other
+  client method, no write method, and no process, file or lock module.
 
 ---
 

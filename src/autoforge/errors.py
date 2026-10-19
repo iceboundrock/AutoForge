@@ -258,6 +258,53 @@ class GitHubNotFoundError(GitHubError):
     """
 
 
+class SnapshotRefused(AutoForgeError):
+    """An EPIC's dependency graph cannot be taken as a complete snapshot (ADR 0008 D3, #179).
+
+    Raised by :func:`autoforge.epic_graph.build_epic_snapshot` instead of
+    returning a partial snapshot: a read that failed, a listing whose length
+    differs from its summary count, a bound exceeded, an EPIC that is not
+    open or not in the verified repository, an inconsistent answer, or a
+    cycle among open children. ``reason`` is one of :data:`SNAPSHOT_REFUSALS`;
+    ``cycle`` is the canonical cycle (issue numbers, starting at the lowest)
+    when ``reason`` is ``cycle``; ``transient`` is whether the refusal came
+    from a GitHub read that may well succeed later. Nothing is admitted
+    from a refused snapshot, and the next pass takes a new one. The message
+    names issue numbers, states and reasons, never a title or a body.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        reason: str,
+        *,
+        cycle: tuple[int, ...] = (),
+        transient: bool = False,
+    ) -> None:
+        if reason not in SNAPSHOT_REFUSALS:
+            raise ValueError(f"unknown snapshot refusal reason {reason!r}")
+        super().__init__(message)
+        self.reason = reason
+        self.cycle = tuple(cycle)
+        self.transient = transient
+
+
+# The closed set of :class:`SnapshotRefused` reasons.
+SNAPSHOT_REFUSALS = frozenset(
+    {
+        "read-failed",
+        "repository-mismatch",
+        "epic-not-open",
+        "children-bound",
+        "children-count",
+        "blockers-bound",
+        "blockers-count",
+        "inconsistent",
+        "cycle",
+    }
+)
+
+
 class ClaimConflictError(AutoForgeError):
     """A durable-claim read is inconclusive or ambiguous (``autoforge.claims``).
 

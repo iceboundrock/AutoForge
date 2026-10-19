@@ -1,0 +1,23 @@
+{
+  "id": 1296269,
+  "node_id": "MDEwOlJlcG9zaXRvcnkxMjk2MjY5",
+  "name": "octo-repo",
+  "full_name": "octo-org/octo-repo",
+  "private": false,
+  "owner": {
+    "login": "octo-org",
+    "id": 9919,
+    "node_id": "U_kgDO9919",
+    "avatar_url": "https://avatars.githubusercontent.com/u/9919?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/octo-org",
+    "html_url": "https://github.com/octo-org",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "html_url": "https://github.com/octo-org/octo-repo",
+  "url": "https://api.github.com/repos/octo-org/octo-repo",
+  "default_branch": "main",
+  "visibility": "public"
+}

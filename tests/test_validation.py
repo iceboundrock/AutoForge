@@ -6,6 +6,8 @@ from autoforge.errors import ConfigurationError
 from autoforge.validation import (
     GitHubIssueRef,
     GitHubPullRequestRef,
+    parse_api_issue_url,
+    parse_api_repository_url,
     parse_comment_url,
     parse_github_url,
     parse_issue_url,
@@ -151,3 +153,52 @@ def test_remote_parsing():
     assert parse_remote_repository("ssh://git@github.com/o/r") == "o/r"
     with pytest.raises(ConfigurationError):
         parse_remote_repository("https://example.com/o/r.git")
+
+
+# -- REST API URLs (parent_issue_url, repository_url; #179) ---------------------------------
+def test_parse_api_issue_url_names_the_same_issue_as_its_html_url():
+    ref = parse_api_issue_url("https://api.github.com/repos/Octo-Org/octo-repo/issues/158")
+    assert ref.repository == "Octo-Org/octo-repo" and ref.number == 158
+    assert ref.same_target(parse_issue_url("https://github.com/octo-org/octo-repo/issues/158"))
+    assert ref.canonical == "https://github.com/Octo-Org/octo-repo/issues/158"
+
+
+def test_parse_api_repository_url():
+    assert parse_api_repository_url("https://api.github.com/repos/o/r") == "o/r"
+    assert parse_api_repository_url("https://API.github.com/repos/o/r/") == "o/r"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        None,
+        "http://api.github.com/repos/o/r/issues/1",  # not https
+        "https://github.com/o/r/issues/1",  # the HTML URL, not the API one
+        "https://api.github.com.evil/repos/o/r/issues/1",
+        "https://api.github.com/repos/o/r/pulls/1",
+        "https://api.github.com/repos/o/r/issues/0",
+        "https://api.github.com/repos/o/r/issues/1/comments",
+        "https://api.github.com/repos/o/r/issues/1?x=1",
+        "https://api.github.com/repos/o/r/issues/1#frag",
+        "https://api.github.com/repos/o/../issues/1/x",
+        "https://api.github.com/repos/o/r/issues/" + "9" * 5000,
+    ],
+)
+def test_parse_api_issue_url_refuses_other_shapes(url):
+    with pytest.raises(ConfigurationError):
+        parse_api_issue_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.github.com/repos/o",
+        "https://api.github.com/repos/o/r/issues",
+        "https://github.com/o/r",
+        "https://api.github.com/users/o/r",
+    ],
+)
+def test_parse_api_repository_url_refuses_other_shapes(url):
+    with pytest.raises(ConfigurationError):
+        parse_api_repository_url(url)

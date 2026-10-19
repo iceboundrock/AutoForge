@@ -63,6 +63,7 @@ from enum import Enum
 from pathlib import Path
 from typing import NoReturn, TypeVar
 
+from .epic_graph import LocalFact
 from .errors import (
     ClaimConflict,
     ConfigurationError,
@@ -1580,15 +1581,6 @@ def classify(
 
 
 # -- reconciliation (ADR 0008 D14.1, D14.2) ---------------------------------------------
-
-
-class LocalFact(Enum):
-    """The per-issue local facts #179's ``evaluate`` consumes (D4.1)."""
-
-    OWNED = "owned"
-    HELD_UNCERTAIN = "held:uncertain"
-    HELD_SETTLED_NAMESPACE = "held:settled-namespace"
-    HELD_OTHER_EPIC = "held:other-epic"
 
 
 @dataclass(frozen=True)
