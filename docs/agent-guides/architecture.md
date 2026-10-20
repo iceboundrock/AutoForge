@@ -56,8 +56,10 @@ AgentProvider
   -> PiProvider          (EPIC #127, ADR 0003: config, argv and doctor checks
                           in #129; execution over RPC in #131; the resource,
                           tool and credential policy in #132, docs/pi-policy.md)
-  -> ClaudeSdkProvider   (planned, ADR 0007: #151)
-  -> OpenCodeSdkProvider (planned, ADR 0007: #152)
+  -> ClaudeSdkProvider   (ADR 0007: policy, validation and declaration in
+                          #149, docs/sdk-policy.md; launch planned, #151)
+  -> OpenCodeSdkProvider (ADR 0007: policy, validation and declaration in
+                          #149, docs/sdk-policy.md; launch planned, #152)
 ```
 
 Provider adapters own:
@@ -175,10 +177,21 @@ compared as a whole message: `WebSocket closed with code 1000` (#164),
 (#226). The adapter's docstring says why each is listed and what that
 check cannot see.
 
-#### SDK providers and interactions (planned, ADR 0007)
+#### SDK providers and interactions (partly implemented, ADR 0007)
 
-Nothing in this subsection is implemented yet. ADR 0007 decides how an SDK
-provider fits these boundaries:
+#149's policy is implemented: `sdk_policy.py` and the two adapters'
+static surface. The adapters have names, option keys, validation, the launch
+allow-list and the sandbox declaration, and every launch is still refused
+before it starts. The rest of this subsection is planned. ADR 0007
+decides how an SDK provider fits these boundaries:
+
+- **The policy is data in the provider layer.** `sdk_policy.py` decides
+  what a launch may load, which tools it gets and which may ask, its
+  configuration and session roots, its credential and the variables it
+  inherits ([SDK policy](../sdk-policy.md)). It is pure: no process, file,
+  network or SDK import. A helper receives the policy as flat fields in its
+  `start` record and passes nothing else, and an adapter never forwards
+  `extra_args` or a free-text option.
 
 - **No SDK in the controller.** An SDK runs only inside a helper process
   (a Python helper around `ClaudeSDKClient`, or a Node bridge over

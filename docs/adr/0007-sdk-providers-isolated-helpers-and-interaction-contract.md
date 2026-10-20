@@ -1,7 +1,10 @@
 # ADR 0007. SDK providers: isolated helpers, interaction capabilities, compatibility pins and the #126 / #134 contract
 
-- **Status:** accepted for implementation. This is a design record; nothing
-  in it is implemented. It is implemented by #134 (the provider-neutral
+- **Status:** accepted for implementation. #149's part (D2.7, D10.1, D10.2
+  and the configuration rows of D6.3) is implemented, with two dated
+  amendments (D6.3 and D10.2 below); its record is
+  [docs/sdk-policy.md](../sdk-policy.md). The rest is not implemented yet.
+  It is implemented by #134 (the provider-neutral
   interaction contract and its broker), #126 (the one state bump, `pause`
   and continuation in the engine, the operator commands, crash recovery
   including OpenCode's), #149 (SDK policy and configuration), #151 (the
@@ -434,7 +437,9 @@ launch or in `doctor`.**
   wrote, so the server's data directory is one too.
 - #149 chooses these directories and what the provider may load from them.
   This record requires only that a continuation runs on the same directory
-  as its paused launch (D8.4).
+  as its paused launch (D8.4). #149's choice: per issue, under the issue's
+  sandbox directory, `<sandbox dir>/sdk/<provider>/`
+  (docs/sdk-policy.md §6).
 
 ### 2.3 OpenCode ownership (item 3)
 
@@ -899,6 +904,18 @@ Once implemented, `src/autoforge/AGENTS.md`'s boundary rule names the two
 new protocol modules beside `pi_rpc.py` and `claude_stream.py`. The helper
 programs are separate executables, not modules of the provider layer.
 
+*Amendment (2026-10-20, #149).* The configuration row is split between two
+modules:
+
+- **`src/autoforge/config.py`** holds the provider names
+  (`KNOWN_PROVIDERS`) and the check that a live wait ends before the
+  profile's limits (`agent_limits`).
+- **`src/autoforge/sdk_policy.py`** (provider layer) holds the option keys,
+  `interaction_policy` and its limits. Config validation reaches them
+  through the adapters' `validate_profile`, as it reaches every provider's
+  option keys (#129). That module holds the rest of #149's policy too:
+  [docs/sdk-policy.md](../sdk-policy.md).
+
 *Rejected.*
 
 - **The SDK as an optional extra of `autoforge`, run with the controller's
@@ -1314,6 +1331,23 @@ method only, never a reused subscription login.**
 - The `claude` CLI provider's login is unchanged.
 - OpenCode SDK credentials stay OpenCode's own: an authentication store in
   the isolated data directory, or environment names that #149 declares.
+
+*Amendment (2026-10-20, #149).* #149 narrows the methods it lists.
+
+- **`claude-sdk`.** The only credential is `ANTHROPIC_API_KEY`. The cloud
+  routes (Bedrock, Claude Platform on AWS, Vertex AI, Foundry) are
+  unsupported in this release. Each reads a credential chain of its own
+  (profile files, application-default credentials, a cloud CLI's login)
+  that would need its own sandbox projection and probe. Adding one is a
+  later change with that evidence. `CLAUDE_CODE_OAUTH_TOKEN` and
+  `ANTHROPIC_AUTH_TOKEN` are refused by name.
+- **`opencode-sdk`.** The credential is one environment variable that the
+  profile names (`options.credential_env`). An authentication store in
+  the data directory is unsupported in this release: the directory starts
+  empty, and no store is copied into it.
+
+The rest of D10.2 stands. docs/sdk-policy.md §5 and §9 record the
+decision and its evidence.
 
 **D10.3 (#151, #152).** **Only the final accepted result text reaches the
 parser.**

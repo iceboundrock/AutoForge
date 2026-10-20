@@ -179,6 +179,14 @@ file's functions and aliases, from loading. An integration or a setting
 neither can keep off refuses the launch before it starts
 (:meth:`AgentProvider.integration_preflight`).
 
+The SDK providers ``claude-sdk`` and ``opencode-sdk`` (ADR 0007) have their
+static surface here: names, option keys and validation, the launch
+allow-list and the sandbox declaration. Their policy (tools, permissions,
+setting sources, configuration and session roots, authentication, the
+environment) is :mod:`autoforge.sdk_policy`'s (#149, docs/sdk-policy.md);
+their helpers and transports are #151's and #152's, and until those land
+every launch of one is refused before anything starts.
+
 Every adapter runs a :class:`~autoforge.loop_detect.LoopMonitor` under
 :attr:`AgentRequest.loop_detection` (#194): Claude's stream and Pi's events
 report each completed tool call as an action, and a one-shot CLI's output
@@ -246,6 +254,22 @@ from .sandbox_policy import (
     ProviderRequirements,
     SandboxPlan,
     executable_requirements,
+)
+from .sdk_policy import (
+    CLAUDE_SDK,
+    CLAUDE_SDK_CREDENTIAL,
+    CLAUDE_SDK_OPTION_KEYS,
+    CLAUDE_SDK_PASSTHROUGH,
+    OPENCODE_SDK,
+    OPENCODE_SDK_OPTION_KEYS,
+    ClaudeSdkPolicy,
+    InteractionSettings,
+    OpenCodeSdkPolicy,
+    claude_sdk_policy,
+    interaction_settings,
+    opencode_model_problem,
+    opencode_sdk_policy,
+    sdk_launch_allowlist,
 )
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -565,6 +589,12 @@ class AgentProvider:
         limit, see ``AutoForgeConfig.agent_limits``).
         """
         return True
+
+    def interaction_settings(self, profile: ProfileConfig) -> InteractionSettings | None:
+        """``profile``'s interaction policy and limits (ADR 0007 D7.1, D7.3), or
+        ``None`` for a provider through which nothing can ask. Validated:
+        :class:`ConfigurationError` for a value the policy refuses."""
+        return None
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         """Raise ConfigurationError for values this CLI cannot accept.
@@ -2305,6 +2335,240 @@ def _pi_model_problem(model: str) -> str:
     return ""
 
 
+# -- SDK providers (ADR 0007; policy: sdk_policy.py, #149) --------------------
+_SDK_MODEL_RE = re.compile(r"[A-Za-z0-9][^\s#]{0,127}")
+_OPENCODE_SDK_EFFORT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+
+
+class _SdkProvider(AgentProvider):
+    """What the two SDK adapters share: a fixed policy, no pass-through, and
+    no launch until their helper lands.
+
+    ``command`` names the helper's interpreter (Python for ``claude-sdk``,
+    Node for ``opencode-sdk``; ADR 0007 D2.3, D2.5) and is required: no
+    default could name the operator's separate runtime environment.
+    ``extra_args`` are refused: every option the helper gets is a field of
+    the policy (:mod:`autoforge.sdk_policy`), and the SDKs' ``extra_args``
+    and ``settings`` are the pass-through #149 closes. The launch allow-list
+    holds exact names only, without any other provider's variables or a
+    credential-shaped name (:func:`autoforge.sdk_policy.sdk_launch_allowlist`).
+    """
+
+    # The issue whose helper launches this provider, the helper's
+    # interpreter as ``command`` names it, and the decision that says so.
+    transport_issue = ""
+    interpreter = ""
+    runtime_decision = ""
+    # Foreign names the operator may still forward by listing them exactly.
+    passthrough: tuple[str, ...] = ()
+
+    def validate_profile(self, profile: ProfileConfig) -> None:
+        super().validate_profile(profile)
+        where = f"profile {profile.name!r}"
+        if not profile.command or any(ch.isspace() for ch in profile.command):
+            raise ConfigurationError(
+                f"{where}: {self.name} needs 'command', the {self.interpreter} of the "
+                "separately installed runtime environment its helper runs in (ADR 0007 "
+                f"{self.runtime_decision}), with no whitespace; got {profile.command!r}"
+            )
+        if profile.extra_args:
+            # Never the arguments themselves: one may carry a settings
+            # document or a key.
+            raise ConfigurationError(
+                f"{where}: {self.name} takes no extra_args ({len(profile.extra_args)} given): "
+                "every SDK option, flag and setting is fixed by AutoForge's unattended policy "
+                "(docs/sdk-policy.md), and a pass-through could load settings, hooks, MCP "
+                "servers or plugins, or widen the tools"
+            )
+        self.policy(profile)
+
+    # -- to override ---------------------------------------------------------
+    def policy(self, profile: ProfileConfig) -> ClaudeSdkPolicy | OpenCodeSdkPolicy:
+        """``profile``'s policy, or :class:`ConfigurationError`."""
+        raise NotImplementedError
+
+    def interaction_settings(self, profile: ProfileConfig) -> InteractionSettings | None:
+        return interaction_settings(profile.options, f"profile {profile.name!r}")
+
+    def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
+        """The variables this provider adds to the allow-list: its credential."""
+        return self.environment_names
+
+    # -- shared --------------------------------------------------------------
+    def _refuse_launch(self) -> ConfigurationError:
+        return ConfigurationError(
+            f"provider {self.name} cannot launch in this release: its policy is in place "
+            f"(docs/sdk-policy.md), but its helper and transport are #{self.transport_issue}'s "
+            "and have not landed. Route this profile to another provider"
+        )
+
+    def build_command_for(self, profile: ProfileConfig, prompt: str) -> list[str]:
+        raise self._refuse_launch()
+
+    def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
+        """Refused: nothing can launch yet, so the engine stops here, before
+        a launch is charged."""
+        raise self._refuse_launch()
+
+    def execute(self, req: AgentRequest) -> AgentExecutionResult:
+        raise self._refuse_launch()
+
+    def launch_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
+        """``base`` with every other provider's variables and every
+        credential-shaped name removed and ``*`` prefixes expanded, plus this
+        provider's own names (:func:`autoforge.sdk_policy.sdk_launch_allowlist`)."""
+        return self._allowlist(base, None)
+
+    def environment_allowlist(self, req: AgentRequest) -> tuple[str, ...] | None:
+        if req.env_allowlist is None:
+            return None
+        return self._allowlist(req.env_allowlist, req.profile)
+
+    def _allowlist(self, base: tuple[str, ...], profile: ProfileConfig | None) -> tuple[str, ...]:
+        return sdk_launch_allowlist(
+            base,
+            self.own_names(profile),
+            os.environ.keys(),
+            passthrough=self.passthrough,
+        )
+
+
+class ClaudeSdkProvider(_SdkProvider):
+    """``claude-sdk``: the Claude Agent SDK in a helper process (ADR 0007; #151).
+
+    Authenticates with ``ANTHROPIC_API_KEY`` alone, never a claude.ai login
+    (D10.2); a Bedrock, Vertex AI or Foundry route is not supported in this
+    release (docs/sdk-policy.md §5).
+    """
+
+    name = CLAUDE_SDK
+    environment_names = (CLAUDE_SDK_CREDENTIAL,)
+    option_keys = CLAUDE_SDK_OPTION_KEYS
+    path_names = ("CLAUDE_CONFIG_DIR",)
+    passthrough = CLAUDE_SDK_PASSTHROUGH
+    transport_issue = "151"
+    interpreter = "Python interpreter"
+    runtime_decision = "D2.3"
+
+    def validate_profile(self, profile: ProfileConfig) -> None:
+        super().validate_profile(profile)
+        where = f"profile {profile.name!r}"
+        if profile.effort and profile.effort not in CLAUDE_EFFORTS:
+            raise ConfigurationError(
+                f"{where}: {self.name} effort must be one of {', '.join(CLAUDE_EFFORTS)}, "
+                f"got {profile.effort!r}"
+            )
+        if not _SDK_MODEL_RE.fullmatch(profile.model):
+            raise ConfigurationError(
+                f"{where}: {self.name} model must be a Claude model alias or id, with no "
+                f"whitespace and no '#', got {profile.model!r}"
+            )
+
+    def policy(self, profile: ProfileConfig) -> ClaudeSdkPolicy:
+        return claude_sdk_policy(profile.name, profile.options)
+
+    def sandbox_requirements(
+        self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
+    ) -> ProviderRequirements:
+        """``claude-sdk``'s declaration (ADR 0005 D7.1, D13.1; ADR 0007 D10.2).
+
+        ``ANTHROPIC_API_KEY`` is an ``env`` item; there is no login file and
+        no keyring item, ever. The policy's ``CLAUDE_CONFIG_DIR``
+        (:class:`autoforge.sdk_policy.ClaudeSdkRoots`) writable at its own
+        path (``dir-rw``), refused when it is or lies in ``~/.claude``
+        (D7.2). ``~/.claude`` and ``~/.claude.json`` are the operator
+        configuration roots.
+        """
+        needs = super().sandbox_requirements(profile, command, env, home)
+        auth = (
+            [AuthItem(AuthMode.ENV, CLAUDE_SDK_CREDENTIAL)]
+            if env.get(CLAUDE_SDK_CREDENTIAL)
+            else []
+        )
+        config_dir = env.get("CLAUDE_CONFIG_DIR", "")
+        if config_dir.startswith("/"):
+            auth.append(
+                AuthItem(
+                    AuthMode.DIR_RW,
+                    "the claude-sdk configuration and session root ($CLAUDE_CONFIG_DIR)",
+                    config_dir,
+                    env_name="CLAUDE_CONFIG_DIR",
+                )
+            )
+        return dataclasses.replace(
+            needs,
+            auth=tuple(auth),
+            operator_config_roots=(
+                os.path.join(home, ".claude"),
+                os.path.join(home, ".claude.json"),
+            ),
+        )
+
+
+class OpenCodeSdkProvider(_SdkProvider):
+    """``opencode-sdk``: the OpenCode SDK in a Node bridge (ADR 0007; #152).
+
+    Its model credential is the one variable the profile names in
+    ``options.credential_env``; no stored sign-in is read (D10.2).
+    """
+
+    name = OPENCODE_SDK
+    environment_names = ()
+    option_keys = OPENCODE_SDK_OPTION_KEYS
+    path_names = ("OPENCODE_CONFIG_DIR",)
+    transport_issue = "152"
+    interpreter = "Node executable"
+    runtime_decision = "D2.5"
+
+    def validate_profile(self, profile: ProfileConfig) -> None:
+        super().validate_profile(profile)
+        where = f"profile {profile.name!r}"
+        problem = opencode_model_problem(profile.model)
+        if problem:
+            raise ConfigurationError(
+                f"{where}: {self.name} model must be an OpenCode model id: {problem}, "
+                f"got {profile.model!r}"
+            )
+        if profile.effort and not _OPENCODE_SDK_EFFORT_RE.fullmatch(profile.effort):
+            raise ConfigurationError(
+                f"{where}: {self.name} effort must be a reasoning variant name (lower-case "
+                f"letters, digits, '_' and '-'), got {profile.effort!r}"
+            )
+
+    def policy(self, profile: ProfileConfig) -> OpenCodeSdkPolicy:
+        return opencode_sdk_policy(profile.name, profile.options)
+
+    def own_names(self, profile: ProfileConfig | None) -> tuple[str, ...]:
+        if profile is None:
+            return ()
+        return (self.policy(profile).credential_env,)
+
+    def sandbox_requirements(
+        self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
+    ) -> ProviderRequirements:
+        """``opencode-sdk``'s declaration (ADR 0005 D7.1, D13.1; ADR 0007 D10.2).
+
+        The profile's ``credential_env`` is an ``env`` item, the only
+        credential; no OpenCode store is projected. The policy's roots
+        (:class:`autoforge.sdk_policy.OpenCodeSdkRoots`) are #152's to
+        project. The operator's OpenCode configuration, data and cache
+        directories are the operator configuration roots.
+        """
+        needs = super().sandbox_requirements(profile, command, env, home)
+        credential = self.policy(profile).credential_env
+        auth = (AuthItem(AuthMode.ENV, credential),) if env.get(credential) else ()
+        return dataclasses.replace(
+            needs,
+            auth=auth,
+            operator_config_roots=(
+                os.path.join(home, ".config", "opencode"),
+                os.path.join(home, ".local", "share", "opencode"),
+                os.path.join(home, ".cache", "opencode"),
+                os.path.join(home, ".opencode"),
+            ),
+        )
+
+
 ScriptHandler = Callable[[AgentRequest], str]
 
 
@@ -2365,6 +2629,8 @@ _REGISTRY: dict[str, type[AgentProvider]] = {
     "opencode": OpenCodeProvider,
     "pi": PiProvider,
     "scripted": ScriptedProvider,
+    CLAUDE_SDK: ClaudeSdkProvider,
+    OPENCODE_SDK: OpenCodeSdkProvider,
 }
 
 

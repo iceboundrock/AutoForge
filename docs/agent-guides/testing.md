@@ -1293,3 +1293,44 @@ is scripted with the same handlers `ScriptedProvider` takes. Keep covered:
   the final text in `stdout.log`, stderr separate, and a credential-shaped
   string redacted in every file
 - dry-run with Pi profiles prints the Pi argv and starts nothing
+
+### SDK policy (#149, docs/sdk-policy.md)
+
+The SDK providers cannot launch yet, so their policy is held at its own
+boundary (`tests/test_sdk_policy.py`). Keep covered:
+
+- every option outside its closed set is a `ConfigurationError` naming the
+  key and never quoting an `extra_args` value. That includes the SDKs' own
+  names (`permission_mode`, `setting_sources`, `settings`, `mcp_servers`,
+  `plugins`, `extra_args`), `pause`, an `ask_tools` without `prompt`, and
+  a `credential_env` that is not a `*_API_KEY` name;
+- the inventories per profile, and the PreToolUse disposition. Every
+  unlisted tool, every `mcp__*` name and every unknown built-in is `deny`;
+- the start fields close every escape hatch: no setting source, strict MCP
+  with no server, no plugin, no `extra_args`, the fixed settings document,
+  permission mode `default`, and no session approval. The digest moves
+  with the policy and never with a root;
+- the `system/init` check names each departure without quoting a value;
+- authentication: `claude-sdk` without `ANTHROPIC_API_KEY`, or with a
+  login token or a cloud route, is refused by name only;
+- the launch allow-list. A real subprocess started with synthetic secrets
+  for other providers in the controller's environment receives none of
+  them, gets its own credential, and leaves `os.environ` unchanged. A `*`
+  prefix is expanded and never carries a foreign name, and #165's
+  refusals still apply;
+- the roots: writing every root leaves a LOCAL fingerprint unchanged, and
+  REMOTE roots lie outside the worktree;
+- interaction data: an oversized, escape-carrying or credential-shaped
+  input, option, answer or modified input is refused, never clipped. Two
+  options shown alike are refused, and a permission ask shows only
+  allow-listed keys;
+- every launch path refuses (`integration_preflight`, `build_command_for`,
+  `execute`), and `doctor` fails the "can launch" row;
+- the interaction wait is below both agent limits under `prompt`.
+
+The opt-in probes (`AUTOFORGE_CLAUDE_SDK_PROBE_CLI`,
+`AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`) run an installed runtime under the
+policy against sentinel hooks, MCP servers, skills, agents and instruction
+files, and assert that none loads. A control run without the policy
+asserts that the probe can see them load. Re-run both whenever a pin, a
+policy field or a runtime changes.

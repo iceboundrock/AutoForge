@@ -42,7 +42,8 @@ _PATTERNS: tuple[_Pattern, ...] = (
         "env-assignment",
         re.compile(
             r"(?i)\b(GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|"
-            r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY)"
+            r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY|"
+            r"ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENCODE_SERVER_PASSWORD)"
             r"(\s*[:=]\s*)([\"']?)([^\s\"';]+)([\"']?)"
         ),
         r"\1\2\3***REDACTED***\5",

@@ -108,10 +108,12 @@ from .providers import (
     PiProvider,
     parse_opencode_version,
     parse_pi_version,
+    provider_for,
 )
 from .redaction import redact, redact_argv
 from .run_namespace import AUTOFORGE_DIRNAME, SCHEDULER_DIRNAME
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
+from .sdk_policy import SDK_PROVIDERS
 from .validation import parse_issue_url, parse_remote_repository
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -714,6 +716,9 @@ class Doctor:
             elif provider == "opencode":
                 results.append(self.check_opencode_version(label, command))
                 results.append(self.check_opencode_isolation(cfg, command, profiles))
+            elif provider in SDK_PROVIDERS:
+                results.append(self._version_check(label, [command, "--version"]))
+                results.append(self.check_sdk_launch(provider, profiles))
             else:
                 results.append(self._version_check(label, [command, "--version"]))
                 if provider == "claude":
@@ -723,6 +728,17 @@ class Doctor:
         if pi_profiles:
             results.append(self.check_pi_outside_instructions(pi_profiles))
         return results
+
+    def check_sdk_launch(self, provider: str, profiles: list[ProfileConfig]) -> CheckResult:
+        """FAIL for an SDK provider's profiles: their policy validates (#149),
+        but the helper that would launch them has not landed (#151, #152), so
+        every launch is refused before it starts."""
+        name = f"provider {provider} can launch ({', '.join(p.name for p in profiles)})"
+        try:
+            provider_for(profiles[0]).integration_preflight(None)
+        except ConfigurationError as exc:
+            return CheckResult(name, False, redact(str(exc)))
+        return CheckResult(name, True, "its helper is available")
 
     def check_pi_outside_instructions(self, profiles: list[ProfileConfig]) -> CheckResult:
         """WARN when Pi would load instruction files from outside the checkout.

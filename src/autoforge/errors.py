@@ -204,6 +204,19 @@ class ExecutionTimeoutError(ExecutionError):
     """Subprocess exceeded its timeout and was terminated."""
 
 
+class InteractionDataError(ExecutionError):
+    """A provider's interaction data is refused, never clipped or rewritten (#149).
+
+    Raised by :mod:`autoforge.sdk_policy` for a value that decides what a
+    tool may do or what the agent is told (a tool input, a question's
+    option, an answer, a modified input) when it is past its bound, carries
+    a control character or an escape sequence, or would be changed by
+    redaction: approving a clipped or redacted rendering would approve
+    different work. The message names the field and the rule, never the
+    value.
+    """
+
+
 class ChildStdinClosedError(ExecutionError):
     """A duplex child closed its stdin while a record was being written (EPIPE)."""
 

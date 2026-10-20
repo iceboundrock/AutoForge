@@ -66,7 +66,7 @@ DEFAULT_IDLE_TIMEOUT_SECONDS = 900
 # runs itself (pre-merge verification, LOCAL validation).
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 1800
 
-KNOWN_PROVIDERS = ("claude", "opencode", "pi", "scripted")
+KNOWN_PROVIDERS = ("claude", "opencode", "pi", "scripted", "claude-sdk", "opencode-sdk")
 
 
 # Where a REMOTE run keeps its state, relative to the invocation directory.
@@ -82,13 +82,15 @@ class ProfileConfig:
 
     ``options`` carries provider-specific knobs the adapter understands
     (e.g. ``permission_mode`` for Claude Code, ``auto_approve`` for
-    OpenCode, ``require_oauth`` for Pi); each real adapter names the keys it
-    accepts and rejects any other. ``extra_args`` are appended verbatim
-    before the prompt (Pi accepts none).
+    OpenCode, ``require_oauth`` for Pi, ``interaction_policy`` and its limits
+    for the SDK providers); each real adapter names the keys it accepts and
+    rejects any other. ``extra_args`` are appended verbatim before the prompt
+    (Pi and the SDK providers accept none: docs/sdk-policy.md).
     """
 
     name: str
-    provider: str  # "claude" | "opencode" | "pi" | "scripted"
+    # "claude" | "opencode" | "pi" | "scripted" | "claude-sdk" | "opencode-sdk"
+    provider: str
     model: str = ""
     effort: str = "high"
     command: str = ""
@@ -812,7 +814,9 @@ class AutoForgeConfig:
         CLI that writes nothing until it exits (Claude with ``output_format:
         text``) would look frozen for its whole run, so it cannot run under
         an idle limit: it runs under its wall-clock ceiling alone, and a
-        ceiling is then required, never an unbounded run.
+        ceiling is then required, never an unbounded run. A profile whose
+        ``interaction_policy`` is ``prompt`` needs a ``max_wait_seconds``
+        below both limits (ADR 0007 D7.3).
         """
         from .providers import provider_for  # local import: providers depends on config
 
@@ -830,7 +834,20 @@ class AutoForgeConfig:
             if profile.max_runtime_seconds is not None
             else self.execution.default_max_runtime_seconds
         )
-        if provider_for(profile).reports_activity(profile):
+        provider = provider_for(profile)
+        settings = provider.interaction_settings(profile)
+        if settings is not None and settings.live:
+            # A live ask waits for a person: the wait must end before either
+            # limit would end the invocation under it (ADR 0007 D7.3).
+            wait = settings.max_wait_seconds
+            for key, limit in (("idle timeout", idle), ("max_runtime_seconds", ceiling)):
+                if limit is not None and wait >= limit:
+                    raise ConfigurationError(
+                        f"profile {profile.name!r}: option max_wait_seconds ({wait}) must be "
+                        f"below its {key} ({limit}s): a wait for an answer that outlasts the "
+                        "limit would end the invocation under the person answering"
+                    )
+        if provider.reports_activity(profile):
             return AgentLimits(idle_timeout_seconds=idle, max_runtime_seconds=ceiling)
         if ceiling is None:
             raise ConfigurationError(
