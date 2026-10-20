@@ -28,8 +28,10 @@ wires them. This module holds the rest, so the CLI only parses and prints:
   first refuses an EPIC of another repository than this checkout's
   ``origin``, before anything is read or written here. ``epic stop`` and
   ``epic archive`` also refuse a ``scheduler.json`` or a binding recorded
-  for another repository, by its numeric id, so a rename is no refusal
-  (:func:`check_recorded_repository`).
+  for another repository, by its numeric id read from GitHub, so a rename
+  is no refusal and a name taken by another repository is one
+  (:func:`check_recorded_repository`); ``epic status`` reports either as a
+  problem.
 
 Nothing here names a provider, writes GitHub, records an effect or parses an
 agent's result.
@@ -247,23 +249,26 @@ def check_recorded_repository(
 
     ``recorded`` is the file's ``owner/name``, display only: a rename leaves
     the old name in ``scheduler.json`` until the next scheduler start, and
-    in a binding for good. A recorded name that is the EPIC's
-    (case-insensitively) needs no read. One that is not is either the same
-    repository renamed or another one, and only the numeric repository id
-    tells them apart: ``repository_id`` reads it from GitHub for the EPIC's
-    repository, and the recorded id must be it. Another id, or no answer,
-    raises :class:`~autoforge.errors.SchedulerStateError`; the caller then
-    writes nothing.
+    in a binding for good, while a repository transferred or deleted leaves
+    its name free for another one. So a name proves nothing either way, and
+    only the numeric repository id tells the same repository from another:
+    ``repository_id`` reads it from GitHub for the EPIC's repository, every
+    time, and the recorded id must be it. Another id, or no answer, raises
+    :class:`~autoforge.errors.SchedulerStateError`; the caller then writes
+    nothing.
     """
     if recorded.lower() == epic.repository.lower():
-        return
+        shown = recorded
+        what = "another repository that took the name since"
+    else:
+        shown = f"{recorded}, not {epic.repository},"
+        what = "a rename from another repository"
     try:
         live = repository_id(epic.repository)
     except (GitHubError, ConfigurationError, ExecutionError) as exc:
         raise SchedulerStateError(
-            f"{subject} {recorded}, not {epic.repository}, and the repository id that tells a "
-            f"rename from another repository cannot be read from GitHub "
-            f"({_bounded(str(exc), 500)}): {refused}"
+            f"{subject} {shown} and the repository id that tells {what} cannot be read from "
+            f"GitHub ({_bounded(str(exc), 500)}): {refused}"
         ) from exc
     if live != recorded_id:
         raise SchedulerStateError(
@@ -717,9 +722,10 @@ class StatusReport:
         """0, or 1 when GitHub, ``scheduler.json`` or the namespaces could not all be read.
 
         An ``uncertain`` namespace (one that cannot be read, classified or
-        probed), a child's or an orphaned one, a binding of another
-        repository, and an entry under ``issues/`` that is not a namespace
-        (:attr:`rejected`) are among :attr:`problems`.
+        probed), a child's or an orphaned one, a binding or a
+        ``scheduler.json`` of another repository, and an entry under
+        ``issues/`` that is not a namespace (:attr:`rejected`) are among
+        :attr:`problems`.
         """
         return 1 if (self.snapshot is None or self.scheduler_problem or self.problems) else 0
 
@@ -932,9 +938,11 @@ def collect_status(
 ) -> StatusReport:
     """``epic status``: every child's category, lock-free and read-only (#183).
 
-    GitHub is read for the snapshot only; when it cannot be, the local
-    namespaces are still shown, identified by ``scheduler.json``. Nothing is
-    created, locked, written or signalled.
+    GitHub is read for the identities and the snapshot only; when it cannot
+    be, the local namespaces are still shown, identified by
+    ``scheduler.json``, and when it can, a ``scheduler.json`` of another
+    repository id is a problem. Nothing is created, locked, written or
+    signalled.
     """
     epic = parse_issue_url(epic_url)
     repository = epic.repository
@@ -957,6 +965,8 @@ def collect_status(
     )
     hold, hold_problem = _standalone(standalone_state_dir, repository)
     problems: list[str] = [hold_problem] if hold_problem else []
+    if not github_problem:
+        problems.extend(_foreign_scheduler(scheduler, identity, repository))
     try:
         listing = list_issue_namespaces(root)
         listed = sorted((*listing.bound, *listing.unbound), key=lambda ns: ns.issue_number)
@@ -1024,6 +1034,28 @@ def collect_status(
         other_namespaces=tuple(others),
         rejected=tuple(rejected),
         problems=tuple(problems),
+    )
+
+
+def _foreign_scheduler(
+    scheduler: SchedulerState | None, identity: Identity | None, repository: str
+) -> tuple[str, ...]:
+    """``scheduler.json`` of another repository than GitHub's: global uncertainty (D14.3).
+
+    Compared by the numeric id GitHub gave (D5.1): a rename keeps it, while
+    ``origin`` pointed at another repository, or a name another repository
+    took, does not, whatever the recorded name.
+    """
+    if scheduler is None or identity is None:
+        return ()
+    if scheduler.repository_id == identity.repository_id:
+        return ()
+    recorded = f"{scheduler.repository_owner}/{scheduler.repository_name}"
+    return (
+        f"scheduler.json of EPIC #{scheduler.epic.number} here was written for {recorded} "
+        f"(repository id {scheduler.repository_id}), and {repository} is repository id "
+        f"{identity.repository_id} (global uncertainty: no scheduler admits anything until it "
+        "is resolved)",
     )
 
 
@@ -1285,9 +1317,9 @@ def stop_scheduler(
     names; 1 when nothing was delivered (a request was already there, or
     the scheduler changed after the write). No ``scheduler.json`` (or one
     that does not load), or one of another repository than the EPIC's
-    (:func:`check_recorded_repository`; ``repository_id`` is read only when
-    its recorded name is not the EPIC's), raises
-    :class:`~autoforge.errors.SchedulerStateError`, with nothing created.
+    (:func:`check_recorded_repository`, which reads ``repository_id``),
+    raises :class:`~autoforge.errors.SchedulerStateError`, with nothing
+    created.
 
     The workers holding their run locks are always listed. An invocation
     that is not ended either still runs or died without finalizing (a
@@ -1400,9 +1432,9 @@ def archive_issue(
 
     The caller holds L0. A namespace that does not exist is left alone:
     nothing is created. One bound under another repository (by its numeric
-    id, :func:`check_recorded_repository`: the binding keeps the name of its
-    first admission, so after a rename ``repository_id`` is read once) or
-    under another EPIC is refused. L2 is taken non-blocking, so a live owner
+    id, :func:`check_recorded_repository`, which reads ``repository_id``
+    whatever name the binding keeps from its first admission) or under
+    another EPIC is refused. L2 is taken non-blocking, so a live owner
     refuses the archive (:class:`~autoforge.errors.IssueBusy`). Each step is
     idempotent: a re-run after a crash completes the archive, and one with
     nothing left says so. No other GitHub read; ``scheduler.json`` is not

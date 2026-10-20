@@ -309,6 +309,7 @@ def test_an_epic_command_needs_a_github_origin_and_compares_it_case_insensitivel
     # GitHub's names are case-insensitive: another spelling is the same repository.
     git_out("-C", str(b.repo), "remote", "set-url", "origin", "git@github.com:Owner/Repo.git")
     assert e.run()[0] == 0
+    b.graph.repository_ids["OWNER/repo"] = REPO_ID  # GitHub resolves either spelling
     code, out, _ = e.cli("epic", "stop", "https://github.com/OWNER/repo/issues/1")
     assert code == 0 and "which has ended" in out
 
@@ -391,6 +392,56 @@ def test_stop_and_archive_go_on_after_a_rename_and_never_rewrite_the_binding(epi
     # The binding keeps its first admission's name, and scheduler.json is left alone.
     assert b.ns(2).binding_file.read_bytes() == binding
     assert scheduler_state_path(b.root, 1).read_bytes() == scheduler_json
+
+
+def test_stop_and_archive_refuse_another_repository_that_took_the_name(epic):
+    """``owner/repo`` transferred or deleted, and its name taken by another repository.
+
+    ``origin`` and every recorded name are unchanged: only the numeric id
+    GitHub now gives the name shows that the files are another
+    repository's (ADR 0008 D5.1). Stop and archive refuse, and the stop
+    request, the claim, the state and ``scheduler.json`` are left untouched.
+    """
+    e = epic()
+    b = e.b
+    _crashed_scheduler_leaving_an_open_claim(b)
+    ns = b.ns(2)
+    files = (scheduler_state_path(b.root, 1), ns.binding_file, ns.claim_file, ns.state_file)
+    before = {path: path.read_bytes() for path in files}
+    claim = b.claims(2).current
+    b.graph.repository_ids[R] = REPO_ID + 1  # what GitHub's owner/repo is now
+    calls: list[str] = []
+    b.graph.on_call = calls.append
+    code, _, err = e.cli("epic", "stop", EPIC, "--now")
+    assert code == 2
+    assert (
+        f"scheduler.json of EPIC #1 here was written for {R} (repository id {REPO_ID}), and "
+        f"{R} is repository id {REPO_ID + 1}: no stop request was written"
+    ) in err
+    code, _, err = e.cli("epic", "archive", EPIC, "2")
+    assert code == 2
+    assert (
+        f"issue #2's namespace is bound under {R} (repository id {REPO_ID}), and {R} is "
+        f"repository id {REPO_ID + 1}: nothing was archived"
+    ) in err
+    # GitHub cannot say which repository the name is now: refused alike.
+    b.graph.fail[f"repos/{R}"] = (1, "gh: Service Unavailable (HTTP 503)")
+    code, _, err = e.cli("epic", "stop", EPIC)
+    assert code == 2
+    assert (
+        f"scheduler.json of EPIC #1 here was written for {R} and the repository id that tells "
+        "another repository that took the name since cannot be read from GitHub"
+    ) in err
+    code, _, err = e.cli("epic", "archive", EPIC, "2")
+    assert code == 2
+    assert (
+        f"issue #2's namespace is bound under {R} and the repository id that tells another "
+        "repository that took the name since cannot be read from GitHub"
+    ) in err
+    assert calls == [f"repos/{R}"] * 4  # each command's one GitHub read: the repository id
+    assert not stop_request_path(b.root, 1).exists()
+    assert {path: path.read_bytes() for path in files} == before
+    assert b.claims(2).current == claim
 
 
 # -- epic status -------------------------------------------------------------------------
@@ -712,6 +763,46 @@ def test_global_uncertainty_and_a_held_lock_exit_non_zero(epic):
     assert code == 1 and "global uncertainty" in e.said and b.admitted() == []
     code, doc = e.status()
     assert code == 1 and any("issue #5" in p for p in doc["problems"])
+
+
+def test_status_reports_a_scheduler_json_of_another_repository_id(epic):
+    """``origin`` re-pointed at another repository with an EPIC of the same number (D14.3).
+
+    No namespace is there to show it: only ``scheduler.json``'s repository
+    id differs from the one GitHub gives, which the scheduler refuses as
+    global uncertainty, and status reports as a problem. A rename keeps the
+    id, and is none.
+    """
+    e = epic()
+    b = e.b
+    _other_repository_with_an_epic(b)
+    assert e.run()[0] == 0  # scheduler.json of owner/repo's EPIC #1, and no namespace
+    git_out("-C", str(b.repo), "remote", "set-url", "origin", f"https://github.com/{OTHER}.git")
+    code, out, _ = e.cli("epic", "status", OTHER_EPIC, "--json")
+    doc = json.loads(out)
+    foreign = (
+        f"scheduler.json of EPIC #1 here was written for {R} (repository id {REPO_ID}), and "
+        f"{OTHER} is repository id 5151 (global uncertainty: no scheduler admits anything "
+        "until it is resolved)"
+    )
+    assert code == 1 and doc["problems"] == [foreign]
+    assert doc["scheduler"]["state"] == "readable" and doc["snapshot"]["taken"]
+    assert [(row["number"], row["category"]) for row in doc["children"]] == [(2, "ready")]
+    assert doc["other_namespaces"] == []
+    code, out, _ = e.cli("epic", "status", OTHER_EPIC)
+    assert code == 1 and f"problem: {foreign}" in out
+    b.lines.clear()
+    assert e.cli("epic", "resume", OTHER_EPIC)[0] == 1
+    assert f"scheduler.json names repository id {REPO_ID}" in e.said and b.admitted() == []
+    # Renamed, with the same id, and ``origin`` updated: no problem.
+    b.graph.repository_ids[RENAMED] = REPO_ID
+    b.graph.add(1, repo=RENAMED, parent=None, id=b.graph.issue(1, R).id)
+    git_out("-C", str(b.repo), "remote", "set-url", "origin", f"https://github.com/{RENAMED}.git")
+    assert load_scheduler_state(b.root, 1).repository_name == "repo"
+    code, out, _ = e.cli("epic", "status", RENAMED_EPIC, "--json")
+    doc = json.loads(out)
+    assert code == 0 and doc["problems"] == [], doc["problems"]
+    assert doc["scheduler"]["state"] == "readable"
 
 
 # -- epic run --dry-run and --force -------------------------------------------------------

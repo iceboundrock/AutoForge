@@ -1225,8 +1225,8 @@ def cmd_epic_status(args) -> int:
 def _epic_repository_id(args) -> Callable[[str], int]:
     """GitHub's numeric id of a repository, as ``epic stop`` and ``epic archive`` read it.
 
-    Called only for a recorded ``owner/name`` that is not the EPIC's (a
-    rename, or another repository), so the configuration is loaded then.
+    Called once a ``scheduler.json`` or a binding is found to compare with,
+    so the configuration is loaded then.
     """
 
     def read(repository: str) -> int:
@@ -1236,7 +1236,7 @@ def _epic_repository_id(args) -> Callable[[str], int]:
 
 
 def cmd_epic_stop(args) -> int:
-    """``epic stop``: lock-free; the configuration and GitHub are read only after a rename."""
+    """``epic stop``: lock-free; GitHub is read for the repository id ``scheduler.json`` records."""
     epic = parse_issue_url(args.epic)
     mode = StopMode.NOW if args.now else StopMode.DRAIN
     outcome = stop_scheduler(
@@ -1248,7 +1248,7 @@ def cmd_epic_stop(args) -> int:
 
 
 def cmd_epic_archive(args) -> int:
-    """``epic archive``: under L0 (a held one is exit 2); GitHub is read only after a rename."""
+    """``epic archive``: under L0 (a held one is exit 2); GitHub is read for the binding's id."""
     epic = parse_issue_url(args.epic)
     lock_path = repository_lock_path(os.getcwd())
     with ControllerLock(lock_path):

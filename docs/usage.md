@@ -402,13 +402,16 @@ recorded snapshot, a pending stop request, and namespaces of the EPIC the
 snapshot no longer lists. An invocation recorded as not ended while no
 worker runs says so: "not ended: if no `autoforge epic` process is running,
 it ended without finalizing (crash or kill); run `epic resume`". Exit 0,
-or 1 when the snapshot or `scheduler.json` cannot be read, a namespace (a
-child's, or one the snapshot no longer lists) is `uncertain` (its binding,
-claim or state cannot be read or classified, or its run lock cannot be
-probed) or bound under another repository, or an entry of the scheduler's
-`issues/` directory is not a namespace (a stray file, a link, a name that
-is no issue number: never read as one, so move it out by hand). Each of
-these is one of the listed problems.
+or 1 when the snapshot or `scheduler.json` cannot be read, `scheduler.json`
+was written for another repository id than GitHub gives the EPIC's
+repository (global uncertainty: `origin` re-pointed, or the name taken by
+another repository; a rename keeps the id), a namespace (a child's, or one
+the snapshot no longer lists) is `uncertain` (its binding, claim or state
+cannot be read or classified, or its run lock cannot be probed) or bound
+under another repository, or an entry of the scheduler's `issues/`
+directory is not a namespace (a stray file, a link, a name that is no
+issue number: never read as one, so move it out by hand). Each of these is
+one of the listed problems.
 
 `epic status --json` prints one document, schema `autoforge.epic-status/1`,
 redacted. Its keys are fixed; a field without a value is `null`:
@@ -470,11 +473,12 @@ process of the EPIC is running, they survived it, a request reaches each
 only at its next step boundary, and `--now` cannot signal them.
 
 `scheduler.json` and each binding record the repository's numeric id and
-its `owner/name` at the time; the name is for display only. When it is
-not the EPIC's (the repository was renamed, and `origin` updated),
-`epic stop` and `epic archive` read the repository's id from GitHub: the
-same id is the same repository, and the command goes on; another id, or
-no answer, refuses (exit 2, nothing written).
+its `owner/name` at the time; the name is for display only. A renamed
+repository keeps its id under a new name, and a transferred or deleted
+one leaves its name free for another repository, so `epic stop` and
+`epic archive` read the repository's id from GitHub every time, whatever
+name the file records: the same id is the same repository, and the command
+goes on; another id, or no answer, refuses (exit 2, nothing written).
 
 ### `epic archive`
 
@@ -490,9 +494,8 @@ rounds, fix attempts, the replan count) and its validation records then
 live only in the archived state: the next admission starts the issue fresh
 and adopts its marked PR. Re-running it completes an interrupted archive;
 on an issue with nothing left it says "nothing left to archive". It reads
-nothing from GitHub, except the repository's id when the binding names the
-repository by an earlier name (see `epic stop` above), and does not touch
-`scheduler.json`.
+nothing from GitHub but the repository's id, which the binding's must be
+(see `epic stop` above), and does not touch `scheduler.json`.
 
 ### Recovery and exit codes
 

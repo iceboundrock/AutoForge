@@ -1128,7 +1128,9 @@ code, is [Running an EPIC in parallel](../usage.md#running-an-epic-in-parallel).
   diagnostics; nothing is signalled. An unended invocation with no live
   worker is reported as one that may have ended without finalizing. An
   `uncertain` namespace (one that cannot be read, classified or probed), a
-  child's or an orphaned one, is one of the report's problems and exits 1.
+  child's or an orphaned one, is one of the report's problems and exits 1,
+  as is a `scheduler.json` whose repository id is not the one GitHub gives
+  (D14.3's global uncertainty, which no namespace need show).
   The `--json` document is `autoforge.epic-status/1`, redacted, its keys
   fixed.
 - **`epic run --dry-run`** takes no lock and creates no namespace, claim,
@@ -1149,11 +1151,12 @@ code, is [Running an EPIC in parallel](../usage.md#running-an-epic-in-parallel).
   A re-run after a crash completes the archive, and one with nothing left
   says so.
 - **A recorded repository** (`scheduler.json` for `epic stop`, the binding
-  for `epic archive`) is compared by its numeric id (D5.1): a recorded
-  `owner/name` that is the EPIC's needs no GitHub read; another one (a
-  rename, which a binding keeps for good) has the EPIC's repository id
-  read from GitHub, and only the same id goes on
-  (`check_recorded_repository`).
+  for `epic archive`) is compared by its numeric id (D5.1), never by its
+  `owner/name`: a rename (which a binding keeps for good) changes the name
+  and keeps the id, and a repository transferred or deleted leaves its
+  name to another one. So the EPIC's repository id is read from GitHub
+  every time, and only the recorded id goes on; another id, or no answer,
+  refuses with nothing written (`check_recorded_repository`).
 - **The crash windows** (D14.5) are tested end to end by SIGKILL of real
   scheduler, worker and archive processes (`tests/test_epic_recovery.py`);
   the validator-marker row is the engine's own crash recovery.
