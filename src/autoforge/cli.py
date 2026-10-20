@@ -18,6 +18,12 @@ Commands:
           prints an acceptance action's exact payload)
   local   LOCAL mode: feature Markdown -> implement -> review -> fix -> DONE,
           with no GitHub involved at any point (init / run / doctor)
+  epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
+          --dry-run and --force), resume, status (lock-free, --json), stop
+          (lock-free, --now) and archive; every 'epic' command refuses
+          --state-dir, since each issue's state lives in its scheduler namespace,
+          and an EPIC of another repository than the checkout's 'origin'.
+          'epic _worker' is the scheduler's hidden worker entry point
 """
 
 from __future__ import annotations
@@ -26,11 +32,12 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 
 from . import __version__
 from .certificate import NOT_A_PERMISSION
 from .certificate import describe as describe_certificate
-from .config import AutoForgeConfig, load_config_file
+from .config import MAX_PARALLEL_BOUNDS, AutoForgeConfig, load_config_file
 from .config_fingerprint import RecordedConfiguration
 from .doctor import CheckResult, run_doctor, run_local_doctor
 from .effects import (
@@ -48,6 +55,20 @@ from .engine import (
     UnblockOutcome,
     sandbox_mode_summary,
 )
+from .epic_commands import (
+    DRAIN_HELP,
+    EXIT_OPEN_CLAIMS,
+    archive_issue,
+    checkout_epic,
+    claims_left_open,
+    collect_status,
+    coordination_root_of,
+    dry_run_plan,
+    epic_run_guard,
+    left_open_lines,
+    stop_scheduler,
+)
+from .epic_graph import GraphReader
 from .errors import (
     AutoForgeError,
     ConfigurationError,
@@ -63,13 +84,18 @@ from .evidence import (
     parse_marker,
     record_summary,
 )
+from .github import GitHubClient
 from .local_workspace import init_feature_file
+from .locking import ControllerLock, repository_lock_path
 from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
 from .redaction import redact, redact_argv, redact_dict
 from .replan_txn import ReplanTransaction
 from .run_namespace import namespace_issue_of_state_dir
+from .scheduler import EpicScheduler, SchedulerInputs
+from .scheduler_stop import StopMode
 from .state import AutoForgeState
 from .transitions import TERMINAL_PHASES, Phase, WorkflowMode
+from .validation import parse_issue_url
 
 
 def _positive_int(text: str) -> int:
@@ -84,6 +110,20 @@ def _positive_int(text: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
+
+
+def _max_parallel(text: str) -> int:
+    """argparse type for ``--max-parallel``: within ``scheduler.max_parallel``'s bounds."""
+    low, high = MAX_PARALLEL_BOUNDS
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if not low <= value <= high:
+        raise argparse.ArgumentTypeError(
+            f"must be between {low} and {high}, got {value} (there is no unbounded mode)"
+        )
     return value
 
 
@@ -107,6 +147,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("doctor", help="check git/gh/claude/opencode/repo/config (read-only)")
     d.add_argument("--json", action="store_true", dest="as_json")
+    d.add_argument(
+        "--epic",
+        default=None,
+        metavar="EPIC_URL",
+        help=(
+            "also run the parallel EPIC scheduler's checks: the coordination root's "
+            "filesystem and the scheduler root's permissions, and whether gh can read this "
+            "EPIC's sub-issues and dependencies (read-only; nothing is created)"
+        ),
+    )
 
     r = sub.add_parser("run", help="create a run and advance it")
     r.add_argument("--epic", required=True, help="EPIC issue URL")
@@ -207,6 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     _add_local_parser(sub)
+    _add_epic_parser(sub)
     return p
 
 
@@ -285,6 +336,135 @@ def _add_local_parser(sub) -> None:
     ld.add_argument("--feature", default=None, help="also validate this feature Markdown path")
 
 
+def _add_epic_parser(sub) -> None:
+    """`autoforge epic ...`: the parallel EPIC scheduler (ADR 0008, #183).
+
+    ``epic _worker`` is matched in :func:`main` before this parser, so it is
+    neither a choice here nor in ``--help``.
+    """
+    ep = sub.add_parser(
+        "epic",
+        help="parallel EPIC scheduler: run, resume, status, stop, archive (REMOTE only)",
+        description=(
+            "Run up to --max-parallel issues of one EPIC at once, each in its own scheduler "
+            "namespace and worktree, admitted in dependency order from GitHub's native "
+            "sub-issues and blocked-by links. Every worker stops at its settlement boundary "
+            "(READY_FOR_MERGE, BLOCKED, DONE, FAILED); nothing is merged. REMOTE only; "
+            "--state-dir is refused, and so is an EPIC of another repository than this "
+            "checkout's 'origin' remote, before anything is read or written."
+        ),
+    )
+    esub = ep.add_subparsers(dest="epic_command", required=True)
+
+    er = esub.add_parser(
+        "run",
+        help="start a scheduler for an EPIC (refused while a claim of it is open)",
+        description=(
+            "Start a scheduler invocation: it holds the controller lock for its whole life, "
+            "admits ready issues up to --max-parallel and exits when no worker runs and "
+            "nothing is admissible. Refused while any claim of this EPIC is open: an earlier "
+            "scheduler ended without closing it, and 'epic resume' classifies it."
+        ),
+    )
+    er.add_argument("epic", metavar="EPIC_URL", help="the EPIC issue URL")
+    _add_max_parallel(er)
+    er.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "print the snapshot, the ordered verdicts and the admission plan; no lock, "
+            "namespace, claim, worktree or worker"
+        ),
+    )
+    er.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "move an unreadable scheduler.json aside (scheduler.json.corrupt-<timestamp>); "
+            "it does nothing else: it never closes a claim or moves a state"
+        ),
+    )
+
+    eres = esub.add_parser(
+        "resume",
+        help="classify an EPIC's namespaces and claims, then continue like 'epic run'",
+        description=(
+            "Reconcile every namespace of the EPIC first (a settled one's open claim is "
+            "closed, a resumable one is admitted as a resume, an uncertain one is held), "
+            "then admit like 'epic run'. Refused (exit 2) while a worker of an earlier "
+            "invocation still runs: it keeps the controller lock until it exits."
+        ),
+    )
+    eres.add_argument("epic", metavar="EPIC_URL", help="the EPIC issue URL")
+    _add_max_parallel(eres)
+    _add_accept_config_change(eres)
+
+    est = esub.add_parser(
+        "status",
+        help="every child's category and next step (lock-free, read-only)",
+        description=(
+            "Take no lock and change nothing: the snapshot from GitHub, and each child's "
+            "namespace, claim and run lock read lock-free. Each child gets exactly one "
+            "category; a claim's worker PID is shown as a diagnostic and never signalled."
+        ),
+    )
+    est.add_argument("epic", metavar="EPIC_URL", help="the EPIC issue URL")
+    est.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="print one autoforge.epic-status/1 document (docs/usage.md)",
+    )
+
+    esp = esub.add_parser(
+        "stop",
+        help="ask the EPIC's scheduler to stop (lock-free; default: drain)",
+        description=(
+            "Publish a stop request for the invocation scheduler.json names. A drain "
+            "closes admission and lets every worker return at its next step boundary; "
+            f"--now behaves like Ctrl-C in the scheduler's terminal. Note: {DRAIN_HELP}. "
+            "With no live scheduler, surviving workers drain at their next step boundary, "
+            "and --now cannot signal them. Refused when no scheduler.json exists; nothing "
+            "is ever removed."
+        ),
+    )
+    esp.add_argument("epic", metavar="EPIC_URL", help="the EPIC issue URL")
+    esp.add_argument(
+        "--now",
+        action="store_true",
+        help="interrupt the workers, as Ctrl-C in the scheduler's terminal does",
+    )
+
+    ea = esub.add_parser(
+        "archive",
+        help="release one settled or uncertain issue for a fresh run (never automatic)",
+        description=(
+            "Under the controller lock and the issue's run lock: close an open claim as "
+            "archived (an unusable claim file is moved aside), then move state/state.json "
+            "aside as state.json.archived-<timestamp>. The logs, the worktree, the binding "
+            "and the claim history are kept; the run's loop-bound evidence then lives only "
+            "in the archived state. Refused while the issue has a live owner. Re-running it "
+            "completes an interrupted archive."
+        ),
+    )
+    ea.add_argument("epic", metavar="EPIC_URL", help="the EPIC issue URL")
+    ea.add_argument("issue", type=_positive_int, metavar="ISSUE", help="the issue number")
+
+
+def _add_max_parallel(parser: argparse.ArgumentParser) -> None:
+    low, high = MAX_PARALLEL_BOUNDS
+    parser.add_argument(
+        "--max-parallel",
+        type=_max_parallel,
+        default=None,
+        metavar="N",
+        help=(
+            f"workers at once, {low} to {high} (default: scheduler.max_parallel in the "
+            "configuration)"
+        ),
+    )
+
+
 def _load_cfg(args) -> AutoForgeConfig:
     return load_config_file(args.config)
 
@@ -312,6 +492,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_unblock(args)
         if args.command == "status":
             return cmd_status(args)
+        if args.command == "epic":
+            return cmd_epic(args)
         if args.command == "local":
             if args.local_command == "init":
                 return cmd_local_init(args)
@@ -466,7 +648,12 @@ def _doctor_runner():
 
 
 def cmd_doctor(args) -> int:
-    results = run_doctor(config_path=args.config, state_dir=args.state_dir, runner=_doctor_runner())
+    results = run_doctor(
+        config_path=args.config,
+        state_dir=args.state_dir,
+        runner=_doctor_runner(),
+        epic_url=args.epic,
+    )
     return _report_checks(results, args.as_json, "AutoForge doctor (read-only checks)")
 
 
@@ -917,6 +1104,160 @@ def _replan_journal_summary(txn: ReplanTransaction | None) -> dict | None:
         "stage": txn.stage.value,
         "defects": list(txn.journal_defects),
     }
+
+
+# -- epic commands (ADR 0008, #183) ----------------------------------------------
+
+
+def _epic_graph(cfg: AutoForgeConfig) -> GraphReader:
+    """The GitHub reads the ``epic`` commands make (indirection so tests can inject a fake)."""
+    return GitHubClient(gh_command=cfg.github.command, timeout_seconds=cfg.github.timeout_seconds)
+
+
+def _epic_scheduler_options() -> dict:
+    """Extra :class:`SchedulerInputs` for ``epic run``/``resume`` (a test's injection point)."""
+    return {}
+
+
+def _epic_flags(args) -> tuple[str, ...]:
+    """What every command an ``epic`` command prints repeats: ``--config``, as typed."""
+    return ("--config", args.config) if args.config else ()
+
+
+def _say(text: str) -> None:
+    print(redact(f"autoforge epic: {text}"), file=sys.stderr, flush=True)
+
+
+def cmd_epic(args) -> int:
+    if args.state_dir:
+        raise ConfigurationError(
+            "'epic' commands refuse --state-dir: each issue's state lives in its own "
+            "scheduler namespace, which 'autoforge epic status <epic>' names"
+        )
+    # Before anything is read or written here: an EPIC of another repository
+    # than this checkout's would bind its issues in this checkout's namespaces,
+    # or stop or archive this checkout's EPIC of the same number.
+    checkout_epic(os.getcwd(), args.epic)
+    if args.epic_command == "run":
+        return cmd_epic_run(args, resume=False)
+    if args.epic_command == "resume":
+        return cmd_epic_run(args, resume=True)
+    if args.epic_command == "status":
+        return cmd_epic_status(args)
+    if args.epic_command == "stop":
+        return cmd_epic_stop(args)
+    if args.epic_command == "archive":
+        return cmd_epic_archive(args)
+    raise ConfigurationError(f"unknown epic command {args.epic_command}")
+
+
+def cmd_epic_run(args, *, resume: bool) -> int:
+    """``epic run`` and ``epic resume``: one scheduler invocation (#182) and its exit status.
+
+    The scheduler makes no run/resume split; ``epic run``'s refusal of open
+    claims and its ``--force`` run inside it, holding L0, before anything is
+    written. A run that ends with nothing admissible while claims of the
+    EPIC are still open exits :data:`~autoforge.epic_commands.EXIT_OPEN_CLAIMS`.
+    """
+    cfg = _load_cfg(args)
+    flags = _epic_flags(args)
+    epic_url = parse_issue_url(args.epic).canonical
+    graph = _epic_graph(cfg)
+    repository = os.getcwd()
+    standalone = os.path.abspath(cfg.state_dir)
+    if not resume and args.dry_run:
+        plan = dry_run_plan(
+            graph,
+            repository_root=repository,
+            epic_url=epic_url,
+            max_parallel=args.max_parallel or cfg.scheduler.max_parallel,
+            standalone_state_dir=standalone,
+            force=args.force,
+            flags=flags,
+        )
+        for line in plan.lines:
+            print(line)
+        return plan.exit_code
+    inputs = SchedulerInputs(
+        repository=repository,
+        epic_url=epic_url,
+        config=cfg,
+        graph=graph,
+        config_path=os.path.abspath(args.config) if args.config else "",
+        max_parallel=args.max_parallel,
+        accept_config_change=resume and args.accept_config_change,
+        standalone_state_dir=standalone,
+        **_epic_scheduler_options(),
+    )
+    scheduler = EpicScheduler(inputs)
+    if not resume:
+        inputs.before_start = epic_run_guard(
+            force=args.force, flags=flags, epic_url=epic_url, say=scheduler.say
+        )
+    code = scheduler.run()
+    if code != 0:
+        return code
+    left = claims_left_open(scheduler.coordination_root, scheduler.epic_ref)
+    if not left:
+        return code
+    for line in left_open_lines(left, flags, epic_url):
+        scheduler.say(line)
+    return EXIT_OPEN_CLAIMS
+
+
+def cmd_epic_status(args) -> int:
+    cfg = _load_cfg(args)
+    report = collect_status(
+        _epic_graph(cfg),
+        repository_root=os.getcwd(),
+        epic_url=args.epic,
+        standalone_state_dir=os.path.abspath(cfg.state_dir),
+        flags=_epic_flags(args),
+    )
+    if args.as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        for line in report.lines():
+            print(line)
+    return report.exit_code
+
+
+def _epic_repository_id(args) -> Callable[[str], int]:
+    """GitHub's numeric id of a repository, as ``epic stop`` and ``epic archive`` read it.
+
+    Called once a ``scheduler.json`` or a binding is found to compare with,
+    so the configuration is loaded then.
+    """
+
+    def read(repository: str) -> int:
+        return _epic_graph(_load_cfg(args)).get_repository_id(repository)
+
+    return read
+
+
+def cmd_epic_stop(args) -> int:
+    """``epic stop``: lock-free; GitHub is read for the repository id ``scheduler.json`` records."""
+    epic = parse_issue_url(args.epic)
+    mode = StopMode.NOW if args.now else StopMode.DRAIN
+    outcome = stop_scheduler(
+        coordination_root_of(os.getcwd()), epic, mode, _epic_repository_id(args)
+    )
+    for line in outcome.lines:
+        print(line)
+    return outcome.exit_code
+
+
+def cmd_epic_archive(args) -> int:
+    """``epic archive``: under L0 (a held one is exit 2); GitHub is read for the binding's id."""
+    epic = parse_issue_url(args.epic)
+    lock_path = repository_lock_path(os.getcwd())
+    with ControllerLock(lock_path):
+        report = archive_issue(
+            lock_path.parent.parent, epic.canonical, args.issue, _epic_repository_id(args)
+        )
+    for line in report.lines():
+        print(line)
+    return 0
 
 
 def cmd_status(args) -> int:

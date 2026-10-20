@@ -100,6 +100,16 @@ class ClaimConflict(SchedulerStateError):
     """
 
 
+class OpenSchedulerClaimsError(SchedulerStateError):
+    """``epic run`` found claims of its EPIC still open (ADR 0008 D14.4, #183).
+
+    An earlier invocation ended without closing them (a crash, a kill, a
+    second Ctrl-C, or an issue it held uncertain), so ``epic resume``, which
+    reconciles them first, is the command to run. Raised holding L0, before
+    ``scheduler.json`` is written: nothing of the invocation was written.
+    """
+
+
 class SchedulerStateDirError(ConfigurationError):
     """A standalone command was pointed at a state directory inside the scheduler root.
 

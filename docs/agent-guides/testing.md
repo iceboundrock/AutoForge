@@ -1160,6 +1160,52 @@ INITIALIZING
 
 without external writes.
 
+Maintain, too, the scheduler's end-to-end loop (#183, ADR 0008;
+`tests/test_epic_commands.py`, `tests/test_epic_recovery.py`): offline and
+deterministic, `autoforge epic` run through `cli.main` as an operator runs
+it, the EPIC's graph served by the fake `gh` behind the real read-only
+client, every worker a real subprocess running the production worker on
+the in-memory GitHub and scripted agents. It must keep covering:
+
+- every row of D14.5's crash-window table, by SIGKILL of a real scheduler,
+  worker or `epic archive` process at the window (a fault-injection hook
+  in `tests/epic_cli.py` or `tests/scheduler_worker.py`, never timing),
+  recovered by `epic resume` (or a re-run `epic archive`) with no second
+  worker for an issue and no second PR; the validator-marker row is the
+  engine's own crash tests (ADR 0006 D10.7);
+- `epic run` refusing an open claim and pointing to `epic resume`, also
+  with `--force`, which moves only a corrupt `scheduler.json` aside; exit 3
+  for claims left open, 1 for global uncertainty, 2 for a held lock;
+- every `epic status` category with its next command, the strict
+  `autoforge.epic-status/1` keys, a hung worker's diagnostics, a spawn
+  failure held, the not-ended hint, an entry of `issues/` that is not a
+  namespace, a corrupt namespace and a run lock that cannot be probed (a
+  child's and an orphaned one) and a `scheduler.json` of another
+  repository id than GitHub's, with no namespace showing it, as problems
+  (exit 1), a rename keeping the id as none, and that it takes no lock,
+  signals nothing and writes nothing; `epic run --dry-run` creating
+  nothing;
+- every `epic` command refusing an EPIC of another repository than the
+  checkout's `origin` (and a checkout without one) with nothing written
+  locally and nothing read from GitHub; `epic stop` refusing a
+  `scheduler.json` of another repository and `epic archive` a namespace
+  bound under one, by repository id, also when another repository took the
+  recorded name (stop request, claim, state and `scheduler.json`
+  untouched), and both going on after a rename with the binding never
+  rewritten;
+- every `epic stop` outcome, a drain and a `--now` of a running scheduler,
+  and a stop after a SIGKILLed scheduler listing its surviving worker with
+  the survivors' caveat;
+  `epic archive` closing then moving aside, idempotent, refused while the
+  issue has a live owner or another EPIC, an unusable claim file moved
+  aside;
+- GitHub changing between ticks: a blocker closed and another reopened, a
+  child completed or given a dependency between snapshot and claim, a
+  child removed or re-parented, the EPIC closed, a human push to an active
+  PR;
+- standalone guards both ways, LOCAL unaffected, and no worker merging or
+  writing the EPIC with the merge gate open.
+
 ### Live progress (#192)
 
 Progress is observability, never part of an outcome. Keep covered:

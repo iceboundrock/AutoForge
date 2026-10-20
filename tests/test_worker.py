@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import sys
 from collections.abc import Callable
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from autoforge import worker
 from autoforge.config import config_digest, load_config_file
 from autoforge.engine import ControllerEngine
 from autoforge.errors import LockProofError
@@ -273,6 +275,14 @@ def test_a_fresh_issue_runs_to_ready_for_merge_and_stops_there_even_with_merge_a
         raise AssertionError("a worker selected a next issue")
 
     monkeypatch.setattr(AutoForgeState, "reset_for_new_issue", no_chaining)
+    engines: list[ControllerEngine] = []
+    build = worker._engine
+
+    def kept(*args, **kwargs):
+        engines.append(build(*args, **kwargs))
+        return engines[-1]
+
+    monkeypatch.setattr(worker, "_engine", kept)
     assert w.run(w.admit()) == 0
     state = w.state()
     assert state.phase is Phase.READY_FOR_MERGE
@@ -286,7 +296,12 @@ def test_a_fresh_issue_runs_to_ready_for_merge_and_stops_there_even_with_merge_a
     assert "stopped in phase READY_FOR_MERGE" in captured.err
     assert "READY_FOR_MERGE" in captured.out  # the CLI's own step rendering
     # The run names the scheduler's command to continue it, not a standalone one.
-    assert "--state-dir" not in captured.out.split("autoforge epic resume")[-1].splitlines()[0]
+    # It names no state directory, and the EPIC by its URL, as 'epic resume'
+    # takes it (#183).
+    (engine,) = engines
+    assert engine.resume_command() == shlex.join(
+        ["autoforge", "--config", w.config_path, "epic", "resume", EPIC]
+    )
 
 
 @pytest.mark.parametrize("phase", [Phase.MERGE, Phase.UPDATE_EPIC])

@@ -63,6 +63,9 @@ existing non-terminal run (an unreadable state file is moved aside rather
 than deleted; see [Troubleshooting](#troubleshooting-and-recovery)).
 `--full-prompt` prints the whole rendered prompt in a dry run.
 
+To run several issues of an EPIC at once, see
+[Running an EPIC in parallel](#running-an-epic-in-parallel).
+
 URLs must be HTTPS GitHub issue URLs, and EPIC + issue must be in the same
 repository as the current working directory (cross-repo runs are rejected).
 `run`, `step` and `resume` must be run inside a git checkout of that
@@ -277,6 +280,246 @@ GitHub, and the next review still judges whether it resolves the finding.
 `DONE` is reached when `UPDATE_EPIC` reports no next issue. `DONE` and
 `FAILED` have no outgoing edges; `autoforge run` starts a new run.
 
+## Running an EPIC in parallel
+
+`autoforge epic` runs up to `scheduler.max_parallel` issues of one EPIC at
+once (1-4, default 2; `--max-parallel N` overrides it for one invocation),
+each in a worker process that runs the single-issue workflow above on the
+issue's own scheduler namespace and worktree (ADR 0008). The scheduler
+decides which issue runs and when; each worker stops at its settlement
+boundary (`READY_FOR_MERGE`, `BLOCKED`, `DONE`, `FAILED`) and never goes on
+to `MERGE` or `UPDATE_EPIC`, whatever `safety.allow_merge` says, so a human
+merges every PR. It is REMOTE only, and every `epic` command refuses
+`--state-dir`: a namespace is found from the EPIC, never from a directory.
+Every `epic` command also refuses an EPIC of another repository than the
+one the checkout's `origin` remote names (exit 2), before it reads or
+writes anything: the scheduler's files are this checkout's and are found
+by EPIC and issue number, so another repository's EPIC would bind its
+issues here, or stop or archive this checkout's EPIC of the same number.
+
+```bash
+# the scheduler's own checks too: the coordination root's filesystem, the
+# scheduler root's permissions, and that gh can read the EPIC's graph
+uv run autoforge doctor --epic https://github.com/owner/repo/issues/1
+
+# the snapshot, every child's verdict and the admission plan; no lock, no
+# namespace, no claim, no worktree, no worker
+uv run autoforge epic run https://github.com/owner/repo/issues/1 --dry-run
+
+# start a scheduler; it exits when no worker runs and nothing is admissible
+uv run autoforge epic run https://github.com/owner/repo/issues/1 --max-parallel 3
+
+# from another terminal, any time: lock-free and read-only
+uv run autoforge epic status https://github.com/owner/repo/issues/1
+uv run autoforge epic status https://github.com/owner/repo/issues/1 --json
+
+# ask the scheduler to stop: a drain, or --now (Ctrl-C in its terminal)
+uv run autoforge epic stop https://github.com/owner/repo/issues/1
+uv run autoforge epic stop https://github.com/owner/repo/issues/1 --now
+
+# after a crash, a kill, a reboot or a stop: classify, then continue
+uv run autoforge epic resume https://github.com/owner/repo/issues/1
+
+# release one settled or uncertain issue for a fresh run (never automatic)
+uv run autoforge epic archive https://github.com/owner/repo/issues/1 7
+```
+
+### The lifecycle
+
+- **Order.** The EPIC's children are its native GitHub sub-issues, and an
+  issue's dependencies are its native "blocked by" links. A child is ready
+  when it is open, supported, and every blocker is closed as completed; the
+  scheduler admits ready children while a slot is free, those that block the
+  most other children first, then the lowest number, and takes a new
+  snapshot at most every `scheduler.poll_interval_seconds` while it may
+  still admit. A blocker closed as not planned, as a duplicate or with no
+  reason never unblocks anything. A child whose PR reaches `READY_FOR_MERGE`
+  unblocks its dependents only once a human merged it and the issue is
+  closed as completed.
+- **One owner per issue.** The scheduler holds the repository lock for its
+  whole life, so `run`, `step`, `resume` and a second `epic run` are refused
+  while it runs (exit 2). Before a worker starts, the scheduler writes the issue's
+  binding and opens a claim for it; the worker holds the issue's run lock
+  while it runs. A claim stays open until the scheduler has seen the worker
+  settle and closes it.
+- **`epic run` vs `epic resume`.** `epic run` starts from what GitHub says
+  and refuses (exit 2, nothing written) while any claim of the EPIC is
+  open, naming each one: an earlier scheduler ended without closing it, and
+  only `epic resume` decides what it means. `epic resume` first reconciles
+  every namespace of the EPIC (a settled worker's claim is closed, a run
+  that stopped mid-workflow is admitted again as a resume, anything it
+  cannot classify is held as uncertain), then admits like `epic run`. While
+  a worker of an earlier invocation still runs, it keeps the repository
+  lock and `epic resume` exits 2: wait for it, or `epic stop` it.
+- **`--force`** (on `epic run` only) moves an unreadable `scheduler.json`
+  aside as `scheduler.json.corrupt-<timestamp>` and does nothing else: it
+  never closes a claim, moves a state or skips the open-claim refusal.
+- **Configuration.** Each worker re-reads the configuration file and
+  refuses to start when it no longer matches the one the scheduler
+  recorded: stop the scheduler before editing it. A resumed issue's run
+  also refuses another profile routing or agent worktree root than the one
+  it was recorded under. `epic run` and `epic resume` both admit a run that
+  stopped mid-workflow (its claim closed) as a resume, but only
+  `epic resume` takes `--accept-config-change`, which it passes to every
+  resumed worker, as on `resume`
+  ([Configuration](configuration.md#parallel-epic-scheduler)): a run that
+  `epic run` resumes refuses such a change, and its issue is held for the
+  rest of that invocation.
+- **`--max-parallel N`** overrides `scheduler.max_parallel` for one
+  invocation, within the same bounds (1-4): there is no unbounded mode.
+- **Standalone commands.** The issue of the configuration's own standalone
+  state (`.autoforge/state.json`, or `state_dir`) is held until that run is
+  `DONE`; finish it with `run`/`resume`. A standalone `run`, `step`,
+  `resume` or `unblock` refuses an issue a scheduler namespace owns
+  (exit 2) until `epic archive` releases it. LOCAL runs are unaffected.
+
+### `epic status`: one category per child
+
+`epic status` takes no lock, writes nothing and never probes the
+repository lock: it reads the snapshot from GitHub and each namespace's
+claim, state and run lock, so it answers while a scheduler runs. Each child
+gets exactly one category, decided only from the snapshot, the claims, the
+state and the run-lock probe, with the next command where there is one:
+
+| Category | What it means | What to do |
+|---|---|---|
+| `blocked-by-dependency` | an open blocker, or one closed other than as completed; the blockers are listed | nothing: it becomes ready when they are done |
+| `ready` | open, supported, every blocker completed; no namespace state | nothing: the next admission takes it |
+| `claimed` | an open claim and no live run lock: its scheduler ended without closing it | `epic resume` |
+| `running` | a live process holds its run lock | wait; the claim's worker PID and process start time are shown as diagnostics and never signalled (a PID may be reused) |
+| `ready-for-merge` | its PR is at `READY_FOR_MERGE` | merge it; dependents become ready once the issue is closed as completed |
+| `blocked` | the run is `BLOCKED`; the reason is shown | fix the cause, then the printed `autoforge --state-dir <namespace>/state unblock --reason "<why>"` (while no scheduler runs: it takes the repository lock), then `epic resume` |
+| `resumable` | a run stopped mid-workflow (a crash, a stop, a killed worker) | `epic resume` |
+| `uncertain` | a claim, a state or a run lock that cannot be read or does not agree | repair the files by hand, or `epic archive` the issue, then `epic resume` |
+| `settled` | `DONE`, `FAILED`, a hand-off or a pause; the scheduler launches nothing more for it | nothing if the issue is closed; otherwise `epic archive` for a fresh run |
+| `held` | `standalone-state` (the standalone run's issue), `other-epic` (bound under another EPIC) or `spawn-failed` (its worker could not be started; held for the rest of that invocation) | finish the standalone run; use that EPIC's scheduler; the next `epic run`/`epic resume` tries again |
+| `unsupported` | in another repository, or a parent of sub-issues itself | nothing: the scheduler never admits it |
+| `closed` | closed on GitHub (and no settled state) | nothing |
+
+It also shows the last scheduler invocation (started, ended and why),
+admission (open, closed or degraded, and why), `max_parallel`, the last
+recorded snapshot, a pending stop request, and namespaces of the EPIC the
+snapshot no longer lists. An invocation recorded as not ended while no
+worker runs says so: "not ended: if no `autoforge epic` process is running,
+it ended without finalizing (crash or kill); run `epic resume`". Exit 0,
+or 1 when the snapshot or `scheduler.json` cannot be read, `scheduler.json`
+was written for another repository id than GitHub gives the EPIC's
+repository (global uncertainty: `origin` re-pointed, or the name taken by
+another repository; a rename keeps the id), a namespace (a child's, or one
+the snapshot no longer lists) is `uncertain` (its binding, claim or state
+cannot be read or classified, or its run lock cannot be probed) or bound
+under another repository, or an entry of the scheduler's `issues/`
+directory is not a namespace (a stray file, a link, a name that is no
+issue number: never read as one, so move it out by hand). Each of these is
+one of the listed problems.
+
+`epic status --json` prints one document, schema `autoforge.epic-status/1`,
+redacted. Its keys are fixed; a field without a value is `null`:
+
+```text
+schema            "autoforge.epic-status/1"
+repository        "owner/repo"
+epic              {number, url, issue_id}
+scheduler         {state: absent | readable | unreadable, problem,
+                   invocation {invocation_id, started_at, ended_at, end_reason, ended, hint},
+                   admission {status, reason}, max_parallel,
+                   last_snapshot {digest, observed_at, counts}}
+stop_request      {present, mode: drain | now, invocation_id, requested_at, applies, problem}
+snapshot          {taken, digest, observed_at, problem}
+problems          [text]
+children          [row], in admission order
+other_namespaces  [row], namespaces of the EPIC the snapshot does not list
+rejected          [{name, reason}], entries under issues/ that are not namespaces
+                  (each is also one of problems)
+row               {number, category, hold_reason, detail, verdict, blockers, phase,
+                   settlement, classification, pr_url, state_dir, live, orphaned,
+                   claim {claim_id, generation, kind, invocation_id, created_at,
+                          worker {pid, process_start_time, spawned_at, log}},
+                   next: [command]}
+```
+
+`category` takes the values of the table above (`null` only for a
+namespace outside the snapshot that holds nothing) and `hold_reason` is set
+for `held` only; `next` holds the commands in the order to run them. A new key or value is a
+new schema version.
+
+### `epic stop`
+
+`epic stop` takes no lock: it publishes a stop request for the invocation
+`scheduler.json` names and says what happened. The default is a drain:
+admission closes at the scheduler's next tick and each worker returns at
+its next step boundary. `--now` behaves like Ctrl-C in the scheduler's
+terminal: the workers are interrupted and the scheduler waits
+`scheduler.stop_grace_seconds` for them. A drain cannot be escalated by
+another `epic stop`: press Ctrl-C in the scheduler's terminal. The outcomes
+are distinct:
+
+- delivered to the running scheduler (exit 0);
+- delivered, but the invocation `scheduler.json` names has ended (exit 0):
+  it lists the workers that still hold their run lock, which drain at their
+  next step boundary (`--now` cannot signal them; nothing is ever signalled
+  by a recorded PID), and the next scheduler removes the stale request;
+- a request is already there, a drain blocking a `--now` among them, or the
+  scheduler changed under the write (exit 1);
+- no `scheduler.json` for the EPIC, or one of another repository: nothing
+  to stop (exit 2, nothing created).
+
+Every outcome that writes or finds a request lists the workers of the EPIC
+that hold their run lock. A scheduler that crashed or was killed with
+SIGKILL never records its end, so `epic stop` cannot tell its invocation
+from a running one without trusting a PID: for an invocation that is not
+ended, the listed workers come with the caveat that, if no `autoforge epic`
+process of the EPIC is running, they survived it, a request reaches each
+only at its next step boundary, and `--now` cannot signal them.
+
+`scheduler.json` and each binding record the repository's numeric id and
+its `owner/name` at the time; the name is for display only. A renamed
+repository keeps its id under a new name, and a transferred or deleted
+one leaves its name free for another repository, so `epic stop` and
+`epic archive` read the repository's id from GitHub every time, whatever
+name the file records: the same id is the same repository, and the command
+goes on; another id, or no answer, refuses (exit 2, nothing written).
+
+### `epic archive`
+
+`epic archive <EPIC_URL> <ISSUE>` releases one issue for a fresh run: a
+`settled` issue that is still open, or an `uncertain` one. It is never
+done automatically. Under the repository lock and the issue's run lock
+(refused while either is held), it closes the issue's open claim as
+archived (an unusable claim file is moved aside), then moves
+`state/state.json` aside as `state.json.archived-<timestamp>`, in that
+order. It keeps the run logs, the worker logs, the worktree, the binding
+and the claim history, and says so; the run's loop-bound evidence (review
+rounds, fix attempts, the replan count) and its validation records then
+live only in the archived state: the next admission starts the issue fresh
+and adopts its marked PR. Re-running it completes an interrupted archive;
+on an issue with nothing left it says "nothing left to archive". It reads
+nothing from GitHub but the repository's id, which the binding's must be
+(see `epic stop` above), and does not touch `scheduler.json`.
+
+### Recovery and exit codes
+
+Ctrl-C, a killed scheduler, a killed worker and a reboot all end the same
+way: run `epic status`, then `epic resume`. Each crash window between the
+scheduler's writes (ADR 0008 D14.5) is recovered by it, and no issue gets a
+second worker or a second PR: a PR an interrupted run opened is adopted
+([State and recovery](agent-guides/state-and-recovery.md#per-issue-scheduler-namespaces)).
+`epic resume` never signals a process: a worker that survived its
+scheduler keeps the repository lock until it exits, so wait for it (or
+`epic stop` it) first.
+
+| Exit | `epic run` / `epic resume` |
+|---|---|
+| 0 | nothing more is admissible and no claim is left open, or a drain finished |
+| 1 | global uncertainty: admission degraded (the snapshot, `scheduler.json` or a namespace could not be trusted); see `epic status` |
+| 2 | refused before anything ran: the repository lock is held (a scheduler, a standalone command or a surviving worker), open claims (`epic run`), `--state-dir`, an EPIC of another repository than the checkout's `origin` |
+| 3 | it ended with claims of the EPIC still open (each is listed with its next command): `epic status`, then `epic resume` or `epic archive` |
+| 130 | interrupted: Ctrl-C, a signal, or `epic stop --now` |
+
+The codes are diagnostics for a human or a wrapper script, not a protocol
+an automation should branch on: `epic status --json` is the machine-readable
+answer.
+
 ## Watching an agent run
 
 While an agent runs, `run`, `step` and `resume` (and `local run`) print live
@@ -465,8 +708,9 @@ redacted. What it reads depends on the command:
   creation, the import of an agent's objects); a controller that waited too
   long for it reports that operation as failed, and `resume` tries again.
 - **Scheduler namespaces:** `<repo>/.git/autoforge/scheduler/` belongs to
-  the parallel EPIC scheduler (ADR 0008; its commands are still being
-  built): one directory per issue, with its own state. `run`, `step`,
+  the parallel EPIC scheduler (ADR 0008;
+  [Running an EPIC in parallel](#running-an-epic-in-parallel)): one directory
+  per issue, with its own state. `run`, `step`,
   `resume` and `local run` refuse a `--state-dir` or `state_dir` that
   resolves inside it (exit 2, before the lock is taken); `status` reads such
   a state directory and `unblock` acts on it. An issue whose namespace

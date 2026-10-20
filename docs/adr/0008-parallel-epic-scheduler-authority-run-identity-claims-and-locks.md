@@ -610,6 +610,17 @@ cases:
 - `last_snapshot` (digest, `observed_at`, counts), diagnostic only;
 - `created_at`, `updated_at`.
 
+**Amended by #183.** `epic archive` writes no `scheduler.json` and starts
+no invocation: only `epic run` and `epic resume` processes get an
+`invocation_id`. Archive acts on one issue's claim and state under L0 and
+that issue's L2 (D17.4), and has none of the facts the file records (no
+admission, no snapshot, no configuration digest to compare). Writing it
+would also replace the record of the last scheduler invocation, so a
+scheduler that crashed without finalizing would no longer show in
+`epic status` as not ended, which is the hint that sends the operator to
+`epic resume`. Nothing reads an invocation id from an archive: the
+claim it closes keeps the invocation that opened it.
+
 **D6.2 (#181).** **It lists no claims.** Claims live only in each issue's
 `claim.json`, so the two files have no consistency relationship to maintain
 and nothing to disagree about.

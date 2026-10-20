@@ -1498,3 +1498,169 @@ def test_candidate_validation_is_listed_redacted_and_never_run(tmp_path):
     assert check.detail.startswith("2 definition(s): false; make check TOKEN=")
     assert secret not in check.detail
     assert not any(argv[:1] in (["false"], ["make"]) for argv in calls)
+
+
+# -- the parallel EPIC scheduler's rows (ADR 0008, #183) --------------------------
+SCHEDULER_ROWS = (
+    "scheduler settings",
+    "scheduler coordination root",
+    "EPIC sub-issues and dependencies readable",
+)
+DOCTOR_EPIC = "https://github.com/owner/repo/issues/1"
+
+
+def _scheduler_doctor(tmp_path, graph, **kwargs):
+    """A doctor on a real checkout: git's common dir is read for real, the
+    EPIC's graph from ``graph``, everything else from the healthy fake."""
+    from tests.conftest import git_repo
+
+    repo = git_repo(tmp_path / "repo")
+    base = _runner_factory()
+
+    def runner(req):
+        argv = req.command
+        if argv[0] == "git" and "--git-common-dir" in argv:
+            return execute(req)
+        if argv[:2] == ["gh", "api"] and (
+            argv[-1] == "repos/owner/repo" or argv[-1].startswith("repos/owner/repo/issues/")
+        ):
+            return graph(req)
+        return base(req)
+
+    return repo, Doctor(cwd=str(repo), runner=runner, epic_url=DOCTOR_EPIC, **kwargs)
+
+
+def _epic_graph():
+    from tests.test_scheduler import Graph
+
+    graph = Graph()
+    graph.child(2)
+    graph.child(3, 2)
+    return graph
+
+
+def test_every_doctor_shows_the_scheduler_settings_and_only_epic_adds_the_rest(tmp_path):
+    results = {r.name: r for r in Doctor(cwd=str(tmp_path), runner=_runner_factory()).run_all()}
+    settings = results["scheduler settings"]
+    assert settings.ok
+    assert settings.detail == (
+        "max_parallel 2 (1-4), poll_interval_seconds 60 (15-3600), stop_grace_seconds 30 (10-600)"
+    )
+    assert SCHEDULER_ROWS[1] not in results and SCHEDULER_ROWS[2] not in results
+
+
+def test_the_scheduler_settings_row_shows_the_configured_values(tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"version": 1, "scheduler": {"max_parallel": 4}}))
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    assert d.check_config().ok
+    assert "max_parallel 4 (1-4)" in d.check_scheduler_settings().detail
+    # A value out of bounds fails the configuration itself; the row is skipped.
+    cfg.write_text(json.dumps({"version": 1, "scheduler": {"max_parallel": 5}}))
+    d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
+    results = {r.name: r for r in d.run_all()}
+    assert not results["config"].ok
+    assert results["scheduler settings"].detail == "(config check failed)"
+
+
+def test_doctor_epic_checks_the_root_and_the_graph_and_creates_nothing(tmp_path):
+    graph = _epic_graph()
+    repo, d = _scheduler_doctor(tmp_path, graph)
+    results = {r.name: r for r in d.run_all()}
+    for name in SCHEDULER_ROWS:
+        assert results[name].ok, results[name]
+    root = results["scheduler coordination root"].detail
+    assert root.startswith(f"{(repo / '.git').resolve()}: local flock; the scheduler root ")
+    assert root.endswith("is absent (the first 'epic run' makes it)")
+    assert results["EPIC sub-issues and dependencies readable"].detail.startswith(
+        "EPIC #1: 2 sub-issues and 1 blocked-by links read; 1 ready by the graph alone"
+    )
+    assert not (repo / ".git" / "autoforge").exists(), "doctor --epic creates nothing"
+    assert all("/dependencies/" in c or c.startswith("repos/owner/repo") for c in graph.calls)
+
+
+def test_an_existing_scheduler_root_is_accepted_when_it_is_this_users(tmp_path):
+    repo, d = _scheduler_doctor(tmp_path, _epic_graph())
+    (repo / ".git" / "autoforge" / "scheduler").mkdir(parents=True, mode=0o700)
+    result = d.check_scheduler_root()
+    assert result.ok and result.detail.endswith("scheduler exists")
+
+
+def test_a_world_writable_scheduler_root_fails(tmp_path):
+    repo, d = _scheduler_doctor(tmp_path, _epic_graph())
+    scheduler = repo / ".git" / "autoforge" / "scheduler"
+    scheduler.mkdir(parents=True)
+    scheduler.chmod(0o777)
+    result = d.check_scheduler_root()
+    assert not result.ok and result.detail == f"{scheduler.resolve()} is world-writable"
+
+
+def test_a_linked_scheduler_root_fails_and_is_not_followed(tmp_path):
+    repo, d = _scheduler_doctor(tmp_path, _epic_graph())
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (repo / ".git" / "autoforge").symlink_to(elsewhere)
+    result = d.check_scheduler_root()
+    assert not result.ok
+    assert result.detail.endswith("autoforge is not a directory (a link or another entry)")
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_coordination_root_on_a_network_filesystem_fails(tmp_path, monkeypatch):
+    from autoforge import locking
+
+    monkeypatch.setattr(
+        locking, "filesystem_type", lambda target: locking.FilesystemType(magic=0x6969)
+    )
+    _, d = _scheduler_doctor(tmp_path, _epic_graph())
+    result = d.check_scheduler_root()
+    assert not result.ok and "is on a nfs filesystem" in result.detail
+
+
+def test_a_graph_the_scheduler_would_refuse_fails_the_row(tmp_path):
+    graph = _epic_graph()
+    graph.blocked(2, 3)  # #2 -> #3 -> #2
+    _, d = _scheduler_doctor(tmp_path, graph)
+    result = d.check_epic_graph("gh")
+    assert not result.ok and "#2 -> #3 -> #2" in result.detail
+
+
+def test_a_transient_graph_read_is_skipped_not_failed(tmp_path, monkeypatch):
+    import autoforge.github as github
+
+    monkeypatch.setattr(github.time, "sleep", lambda seconds: None)
+    graph = _epic_graph()
+    graph.fail["/sub_issues"] = (1, "HTTP 502: Bad Gateway")
+    _, d = _scheduler_doctor(tmp_path, graph)
+    result = d.check_epic_graph("gh")
+    assert result.label == "SKIP" and "transient" in result.detail
+
+
+def test_an_epic_of_another_repository_than_origin_fails(tmp_path):
+    graph = _epic_graph()
+    _, d = _scheduler_doctor(tmp_path, graph)
+    d.repo = "owner/other"  # what the 'GitHub remote' row found
+    result = d.check_epic_graph("gh")
+    assert not result.ok
+    assert result.detail == "the EPIC is in owner/repo, and this checkout's origin is owner/other"
+    assert graph.calls == []
+
+
+def test_doctor_epic_takes_an_issue_url_only(tmp_path):
+    _, d = _scheduler_doctor(tmp_path, _epic_graph())
+    d.epic_url = "owner/repo#1"
+    assert not d.check_epic_graph("gh").ok
+
+
+def test_the_cli_passes_the_epic_to_doctor(monkeypatch):
+    from autoforge import cli
+
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli, "run_doctor", fake)
+    assert cli.main(["doctor", "--epic", DOCTOR_EPIC]) == 0
+    assert seen["epic_url"] == DOCTOR_EPIC

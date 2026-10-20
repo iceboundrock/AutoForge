@@ -16,7 +16,7 @@ issue's PR, so one FakeGitHub per worker is faithful (#182's harness).
 A step is ``{"do": ...}``:
 
 - ``implement``: one commit in the agent's worktree, reported as success;
-- ``review``: a clean round-1 review of the PR head;
+- ``review``: a clean review of the PR head, of round ``round`` (1 by default);
 - ``blocked``: the agent reports the issue blocked;
 - ``garbage``: no ``CONTROL_RESULT`` at all (a failing provider);
 - ``hold``: write ``started``, then wait for ``gate``; with ``stubborn`` the
@@ -27,12 +27,23 @@ A step is ``{"do": ...}``:
 ``started`` and waits for ``gate`` to exist. Synchronization is by files.
 With ``"real_claude": true`` no provider is replaced for ``claude``: its
 profiles run the real adapter on the command the configuration names.
+
+``"world": PATH`` (#183) makes the issue's GitHub outlive its worker: the
+FakeGitHub is unpickled from ``PATH`` when it exists and pickled back after
+every call the engine makes, so the next worker of the issue (a resume, a
+re-admission after ``epic archive``) sees the PRs and comments the last one
+left, and a test counts them. ``"gh_crash": {"method": ..., "marker": ...}``
+kills the worker with SIGKILL right after that call's effect lands and is
+saved, once (``marker`` records it): a worker killed between a GitHub write
+and the state that records it (ADR 0008 D14.5).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import pickle
+import signal
 import sys
 import time
 from pathlib import Path
@@ -63,6 +74,41 @@ def _wait_for(path: str | None, *, stubborn: bool = False, noted: str | None = N
                 raise
             interrupted = True
             _touch(noted)
+
+
+class _World:
+    """The issue's FakeGitHub, saved to ``path`` after every call the engine makes."""
+
+    def __init__(self, inner: object, path: str, crash: dict | None) -> None:
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_path", path)
+        object.__setattr__(self, "_crash", crash or {})
+
+    def save(self) -> None:
+        tmp = f"{self._path}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(self._inner, f)
+        os.replace(tmp, self._path)
+
+    def __getattr__(self, name: str):
+        value = getattr(self._inner, name)
+        if name.startswith("_") or not callable(value):
+            return value
+
+        def call(*args, **kwargs):
+            try:
+                return value(*args, **kwargs)
+            finally:
+                self.save()
+                crash = self._crash
+                if crash.get("method") == name and not os.path.exists(crash["marker"]):
+                    _touch(crash["marker"])
+                    os.kill(os.getpid(), signal.SIGKILL)
+
+        return call
+
+    def __setattr__(self, name: str, value: object) -> None:
+        setattr(self._inner, name, value)
 
 
 def main(argv: list[str]) -> int:
@@ -104,10 +150,16 @@ def main(argv: list[str]) -> int:
 
     repository = fixture["repository"]
     url = f"https://github.com/{repository}/issues/{issue}"
-    gh = FakeGitHub(repository)
-    gh.add_issue(url, fixture.get("title", f"Issue {issue}"))
+    world = fixture.get("world")
+    if world and os.path.exists(world):
+        with open(world, "rb") as f:
+            gh = pickle.load(f)
+    else:
+        gh = FakeGitHub(repository)
+        gh.add_issue(url, fixture.get("title", f"Issue {issue}"))
     origin = Origin(Path(fixture["origin"]["bare"]), Path(fixture["origin"]["gh"]))
     gh.attach_origin(origin)
+    client = _World(gh, world, fixture.get("gh_crash")) if world else gh
     real_init = ControllerEngine.__init__
 
     def init(self, *args, **kwargs):
@@ -130,7 +182,7 @@ def main(argv: list[str]) -> int:
             return block(analyze_payload(head, issue_url=url))
         if kind == "review":
             (pr,) = gh.prs.values()
-            return block(review_result(1, pr.head_sha))
+            return block(review_result(step.get("round", 1), pr.head_sha))
         if kind == "blocked":
             return block(
                 {"phase": req.phase, "status": "blocked", "issue_url": url, "message": "stuck"}
@@ -146,7 +198,7 @@ def main(argv: list[str]) -> int:
         overrides["claude"] = provider
     return run_worker(
         worker_args,
-        github_factory=lambda cfg: gh,
+        github_factory=lambda cfg: client,
         provider_factory=lambda cfg: ProviderRegistry(overrides=overrides),
     )
 

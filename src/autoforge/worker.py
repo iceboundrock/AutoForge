@@ -437,7 +437,7 @@ def _engine(
     engine.bind_issue_namespace(started.namespace)
     config_flags: tuple[str, ...] = ("--config", args.config) if args.config else ()
     engine.cli_global_flags = (*config_flags, "--state-dir", str(started.namespace.state_dir))
-    engine.continue_command = (*config_flags, "epic", "resume", str(args.epic))
+    engine.continue_command = (*config_flags, "epic", "resume", started.epic_url)
     engine.config_file = args.config
     engine.require_local_lock_filesystem = True
     engine.progress_output = _progress_line
@@ -499,7 +499,7 @@ def _run(
                 _refuse(f"the namespace's state is not issue #{args.issue} of EPIC #{args.epic}")
             if state.phase not in WORKER_STOP_PHASES:
                 notice = engine.check_run_configuration(
-                    ("epic", "resume", str(args.epic)),
+                    ("epic", "resume", started.epic_url),
                     accept_change=args.accept_config_change,
                 )
                 if notice:

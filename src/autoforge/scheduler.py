@@ -13,14 +13,16 @@ effect and never parses an agent's result.
 (:meth:`~autoforge.locking.ControllerLock.share`), so neither a normal exit
 nor an exit by exception releases it while a worker that inherited it
 lives; refuse a coordination root whose ``flock`` is not local; read the
-repository id and the EPIC; refuse a corrupt ``scheduler.json`` or one of
-another repository (global uncertainty, D14.3) without writing it; write
-``scheduler.json`` for a new invocation; remove stale stop requests; print
-the ``allow_merge`` notice when the configuration enables merging (the
-configuration is not changed); install the SIGINT, SIGTERM and SIGHUP
-handlers, which only set a flag; run #181's reconciliation, whose global
-problems admit nothing; apply the reverse guard (the configured standalone
-state's issue is ``held:standalone-state`` in any phase but ``DONE``).
+repository id and the EPIC; call the caller's ``before_start`` (``epic
+run``'s ``--force`` and its refusal of open claims, #183); refuse a corrupt
+``scheduler.json`` or one of another repository (global uncertainty, D14.3)
+without writing it; write ``scheduler.json`` for a new invocation; remove
+stale stop requests; print the ``allow_merge`` notice when the
+configuration enables merging (the configuration is not changed); install
+the SIGINT, SIGTERM and SIGHUP handlers, which only set a flag; run #181's
+reconciliation, whose global problems admit nothing; apply the reverse
+guard (the configured standalone state's issue is ``held:standalone-state``
+in any phase but ``DONE``).
 
 **Each tick** (D9.7): reap exited workers and finalize their claims under a
 re-acquired L2 (#181's ``finalize_worker``); handle signals and the stop
@@ -170,6 +172,13 @@ ALLOW_MERGE_NOTICE = (
     "READY_FOR_MERGE and never merge in this version; configuration is not changed."
 )
 
+# How the claim of a worker that never started is closed (D2.3): the
+# ``detail`` of its ``abandoned`` claim starts with one of these, so ``epic
+# status`` (#183) shows the issue held for the rest of the invocation.
+WORKER_LOG_UNOPENED = "the worker log cannot be opened"
+WORKER_NOT_STARTED = "the worker could not be started"
+SPAWN_FAILURE_DETAILS = (WORKER_LOG_UNOPENED, WORKER_NOT_STARTED)
+
 EXIT_CODES = {
     EndReason.NOTHING_ADMISSIBLE: 0,
     EndReason.DRAINED: 0,
@@ -196,8 +205,13 @@ class SchedulerInputs:
     ``standalone_state_dir`` is the configured standalone state directory
     the reverse guard reads (``config.state_dir``, resolved against the
     current directory, by default). ``env`` is the workers' environment
-    (this process's by default). ``worker_command``, ``spawn``, ``output``,
-    ``on_tick``, ``clock`` and ``sleep`` are injection points.
+    (this process's by default). ``before_start`` is called holding L0, once
+    the repository and the EPIC are read and before ``scheduler.json`` is
+    read or anything is written, with the coordination root and the EPIC:
+    ``epic run``'s ``--force`` and its refusal of open claims (#183); what it
+    raises ends the invocation with nothing written. ``worker_command``,
+    ``spawn``, ``output``, ``on_tick``, ``clock`` and ``sleep`` are
+    injection points.
     """
 
     repository: str
@@ -209,6 +223,7 @@ class SchedulerInputs:
     accept_config_change: bool = False
     standalone_state_dir: str | None = None
     env: Mapping[str, str] | None = None
+    before_start: Callable[[Path, EpicRef], None] | None = None
     worker_command: Sequence[str] = DEFAULT_WORKER_COMMAND
     spawn: Spawn = spawn_supervised
     output: Callable[[str], None] | None = None
@@ -425,6 +440,8 @@ class EpicScheduler:
             self.say(f"cannot read the repository or the EPIC on GitHub: {exc}")
             return False
         self.epic_ref = EpicRef(self.epic.number, epic_node.id)
+        if self.inputs.before_start is not None:
+            self.inputs.before_start(self.coordination_root, self.epic_ref)
         try:
             existing = load_scheduler_state(self.coordination_root, self.epic.number)
         except StateError as exc:
@@ -1047,7 +1064,7 @@ class EpicScheduler:
                 )
         except (StateError, OSError) as exc:
             # No process exists, and this scheduler holds L2: the claim is closed now.
-            self._abandon(namespace, lock, claim, f"the worker log cannot be opened ({exc})")
+            self._abandon(namespace, lock, claim, f"{WORKER_LOG_UNOPENED} ({exc})")
             return
         try:
             try:
@@ -1116,7 +1133,7 @@ class EpicScheduler:
             self.say(f"issue #{number}: the worker start failed ({exc}); {probe_exc}")
             return
         try:
-            self._abandon(namespace, probe, claim, f"the worker could not be started ({exc})")
+            self._abandon(namespace, probe, claim, f"{WORKER_NOT_STARTED} ({exc})")
         finally:
             probe.release()
 

@@ -11,9 +11,11 @@ a concern lives so the routing rules can be applied.
 
 ```text
 cli.py              subcommands run / step / resume / unblock / status / doctor / local, dry-run flags;
-                    the hidden `epic _worker` entry point of a scheduler's worker (#182)
+                    the `epic` group (run / resume / status / stop / archive, #183) and the
+                    hidden `epic _worker` entry point of a scheduler's worker (#182)
 config.py           configuration loading and validation; owns config defaults and keys
-doctor.py           read-only environment checks
+doctor.py           read-only environment checks; the scheduler rows (settings, and with
+                    `--epic` the coordination root and the EPIC's graph, #183)
 doctor_sandbox.py   doctor's outer-sandbox rows: capability and mode outcome, policy by
                     class, provider declarations and sandboxed --version, operator paths,
                     hard links, sandbox directories, TCP listeners; read-only (#169)
@@ -126,6 +128,11 @@ executor_supervised.py  one supervised child: spawned in a session of its own wi
 scheduler_stop.py   `epics/<n>/stop-request` (ADR 0008 D16.4, #182): published by link(2),
                     never replaced, read strictly (one that does not parse is a drain),
                     removed only by the L0 holder
+epic_commands.py    the `epic` commands' logic (ADR 0008 D9.8, D14.4, D16.4, D17.4, #183):
+                    the lock-free `epic status` (one category per child, the
+                    autoforge.epic-status/1 document), the dry-run plan, `epic run`'s
+                    open-claim refusal and --force, `epic stop`'s outcomes and `epic
+                    archive` under L0 and L2; graph reads only, no signal, no GitHub write
 redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
@@ -153,10 +160,10 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
   no raw `gh --json` dictionaries crossing out of `github.py`; no large
   prompt text in Python string literals. The scheduler modules
   (`scheduler.py`, `worker.py`, `executor_supervised.py`,
-  `scheduler_stop.py`) name no provider, call no GitHub write, construct no
-  effect record and parse no `CONTROL_RESULT`: everything an issue does is
-  the engine's, in its worker (#182; structural tests in
-  `tests/test_scheduler.py`).
+  `scheduler_stop.py`, `epic_commands.py`) name no provider, call no GitHub
+  write, construct no effect record and parse no `CONTROL_RESULT`:
+  everything an issue does is the engine's, in its worker (#182, #183;
+  structural tests in `tests/test_scheduler.py`).
 - The outcome of a GitHub write is read back from GitHub, never inferred
   from an exit status or an agent claim, and a destructive write is
   checkpointed in persisted state before it is performed. Persisted state is
