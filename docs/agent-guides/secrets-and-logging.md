@@ -25,6 +25,9 @@ GITHUB_TOKEN
 GH_TOKEN
 OPENAI_API_KEY
 ANTHROPIC_API_KEY
+ANTHROPIC_AUTH_TOKEN
+CLAUDE_CODE_OAUTH_TOKEN
+OPENCODE_SERVER_PASSWORD
 Authorization: Bearer ... / Token ... / Basic ...
 ```
 
@@ -63,6 +66,43 @@ What #165 adds reports names, never values:
   controller wrote for an agent: every text in it went through `redact`
   before its bounds were applied, and an unreadable item names only the
   error's type, never the `gh` output.
+
+## SDK providers (#149)
+
+The SDK providers' policy ([SDK policy](../sdk-policy.md)) adds rules of
+its own, all enforced in `src/autoforge/sdk_policy.py`:
+
+- **No other provider's credential reaches an SDK launch.** Its allow-list
+  is expanded to exact names against the *names* in the controller's
+  environment, and every other provider's variables and every
+  credential-shaped name (`*_API_KEY`, `*_TOKEN`, `*_SECRET`,
+  `*_PASSWORD` and the like) are removed. Only then is the provider's own
+  credential added: `ANTHROPIC_API_KEY`, or the variable an `opencode-sdk`
+  profile names in `options.credential_env`. The controller's own
+  environment is never changed.
+- **No login is reused.** `claude-sdk` has no login-file or keyring item,
+  and refuses `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN` by name.
+  `opencode-sdk` reads no stored sign-in.
+- **The OpenCode server password** is generated per launch and given to
+  the server's environment alone. It never appears in an argv, a record, a
+  log or state, and its name is in the redaction list above.
+- **Names, never values.** Every policy message names a variable, a field
+  or a tool and never quotes a value: config validation, the
+  authentication checks, the `system/init` check and the
+  interaction-data refusals.
+- **Interaction data is bounded before it is shown or persisted.**
+  - A value a reply depends on (a tool input, an option, an answer, a
+    modified input) is *refused* rather than redacted or clipped when it
+    carries a credential shape, a control or escape character, or exceeds
+    its bound. A redacted or clipped value would no longer be the one
+    approved.
+  - What an operator is shown goes through `progress.clean`, which strips
+    escape sequences and control characters, redacts, and clips, in that
+    order. It shows only allow-listed input keys, never a file's content
+    or a diff.
+- **The session roots** (`<sandbox dir>/sdk/<provider>/`) hold the
+  provider's transcripts. They are controller state, never a working tree
+  and never published. AutoForge copies no credential into them.
 
 ## The outer sandbox and credentials (ADR 0005 D7.4)
 

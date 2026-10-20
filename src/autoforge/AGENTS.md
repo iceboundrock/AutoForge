@@ -30,6 +30,9 @@ pi_rpc.py           Pi RPC wire protocol: JSONL codec, request ids, event reduce
                     outcome classification; provider layer, no flags and no processes (#131)
 claude_stream.py    Claude stream-json reducer: result text, failure, summary, progress
                     events; provider layer, no flags and no processes (#192)
+sdk_policy.py       SDK providers' unattended policy: tools, permissions, setting sources,
+                    roots, credentials, environment, interaction-data bounds; provider
+                    layer, pure: no process, file, SDK import or os.environ change (#149)
 progress.py         provider-neutral ProgressEvent, cleaning, and the line renderer the
                     engine reports a launch through (#192)
 loop_detect.py      provider-neutral loop detector: action fingerprints, line keys,
@@ -217,6 +220,10 @@ interaction.py, claude_sdk.py, opencode_sdk.py,
 sdk_helpers/ (all planned)                        -> docs/agent-guides/architecture.md
                                                      + docs/adr/0007-sdk-providers-isolated-
                                                      helpers-and-interaction-contract.md
+sdk_policy.py, providers.py (ClaudeSdkProvider,
+OpenCodeSdkProvider)                              -> docs/sdk-policy.md + docs/adr/0007-sdk-
+                                                     providers-isolated-helpers-and-
+                                                     interaction-contract.md
 sandbox.py, sandbox_bwrap.py                      -> docs/agent-guides/architecture.md
                                                      (Executor) + docs/adr/0005-outer-
                                                      sandbox-and-host-resource-capability-

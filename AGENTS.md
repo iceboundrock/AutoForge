@@ -210,6 +210,8 @@ docs/README.md                         human-oriented documentation index, by in
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
 docs/pi-policy.md                      Pi: what an unattended run may load, tools, credentials
+docs/sdk-policy.md                     SDK providers: what a launch may load, tools, permissions,
+                                       roots, credentials, environment, interaction-data bounds
 docs/configuration.md                  config files, formats, strict key validation, profiles
 docs/development.md                    make targets, CI, what a green `ci` does and does not prove
 README.md                              operator-facing landing page: overview, key properties,
@@ -243,7 +245,10 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   lets an agent run ask a human (the interaction contract, its broker or
   resolver, `interaction_policy`, `pause` and continuation), read
   `docs/adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md`
-  in addition to `architecture.md`.
+  in addition to `architecture.md`. If changing what an SDK provider may
+  load, its tools or permissions, its roots, its credentials or the
+  variables it inherits (`src/autoforge/sdk_policy.py`), read
+  `docs/sdk-policy.md` too.
 - If implementing the parallel EPIC scheduler (#176: run namespaces,
   dependency snapshots, lock domains, scheduler claims, workers, the `epic`
   commands) or changing the repository lock, read

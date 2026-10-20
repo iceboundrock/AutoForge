@@ -12,7 +12,12 @@ read it before adding tests for a listed area.
   APIs. Agents are replaced by scripted providers (Pi by the fake `pi` of
   `tests/pi_fake.py`, Claude's stream by the fake `claude` of
   `tests/claude_fake.py`) and GitHub by an in-memory fake; the executor tests
-  use real local Python subprocesses only.
+  use real local Python subprocesses only. The one exception is an opt-in
+  probe, skipped unless its variable names an installed runtime
+  (`AUTOFORGE_PI_E2E_BIN`, `AUTOFORGE_CLAUDE_SDK_PROBE_CLI`,
+  `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`). Such a probe uses a temporary home
+  and synthetic credentials, and calls no model: the Claude probe answers
+  from a loopback stand-in.
 - Never merge a real PR, push to a real remote, or touch a checkout outside
   `tmp_path`.
 - Never weaken an assertion, a safety gate, or a verification step to make an
@@ -209,6 +214,9 @@ merge gate certificate check (#175)   test_merge_certificate.py (each requiremen
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
 Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)
+SDK policy (#149): options, tools,    test_sdk_policy.py (opt-in probes of an installed Claude
+roots, credentials, environment,      Code CLI or OpenCode runtime against sentinel
+interaction data, the adapters        configuration, each with a control run)
 live progress, its redaction          test_progress.py
 loop detector (unit and end to end)   test_loop_detect.py (adapters: test_providers.py,
                                       test_pi_rpc.py, test_claude_stream.py)

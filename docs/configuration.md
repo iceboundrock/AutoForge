@@ -528,6 +528,51 @@ the operator's own checkout. Pi has no approval layer: run unattended Pi
 phases in a container, a VM or under a dedicated user
 ([Pi policy](pi-policy.md) §7).
 
+### SDK profiles (`claude-sdk`, `opencode-sdk`)
+
+`provider: claude-sdk` and `provider: opencode-sdk` are the SDK providers
+of [ADR 0007](adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md).
+**They cannot launch in this release.** Their policy and configuration
+(#149) are in place, but their helpers are #151's and #152's. A profile
+that uses one validates, `doctor` fails its "can launch" row, and a phase
+that reaches it is refused before anything starts. Route phases to another
+provider until those land. [SDK policy](sdk-policy.md) gives every decision
+below with its evidence.
+
+- `command` is required. It is the interpreter of the separately installed
+  runtime environment: Python for `claude-sdk`, Node for `opencode-sdk`.
+- `extra_args` must be empty. Every SDK option, flag and setting is fixed
+  by the policy: no settings source, no MCP server, no plugin, and only the
+  helper's own hook.
+- `claude-sdk`:
+  - `model` is a Claude alias or id, and `effort` is one of `low`,
+    `medium`, `high`, `xhigh` or `max`.
+  - It authenticates with `ANTHROPIC_API_KEY` only, never a claude.ai
+    login or `CLAUDE_CODE_OAUTH_TOKEN`. The cloud routes are not supported.
+- `opencode-sdk`:
+  - `model` is `<provider>/<model>` with no `#`.
+  - `options.server_command` names the OpenCode runtime binary.
+  - `options.credential_env` names the one variable that holds the model
+    key, for example `OPENAI_API_KEY`. A stored `opencode auth login` is
+    not used.
+- `options.tools` narrows the tool inventory. The defaults match Pi's
+  split: the write profiles get edit tools, the others do not.
+  `options.ask_tools` (`claude-sdk` only) lists tools whose calls ask a
+  person, and needs `prompt`.
+- `options.interaction_policy`:
+  - `fail` (default): any ask fails the invocation.
+  - `prompt`: ask the operator live.
+  - `pause`: refused until #126 lands.
+
+  `options.max_wait_seconds` (default 120) must be below the profile's idle
+  timeout and its `max_runtime_seconds` under `prompt`.
+  `options.max_interactions` defaults to 8.
+
+An SDK launch inherits exact names only. The allow-list's `*` prefixes are
+expanded, and every other provider's variables and every credential-shaped
+name are removed before the provider's own credential is added. A key
+forwarded for another provider therefore never reaches it.
+
 ## Agent environment
 
 Agents, LOCAL `local.validation_commands` and `merge.verification_commands`

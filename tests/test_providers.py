@@ -2244,6 +2244,10 @@ def test_every_real_provider_declares_only_valid_environment_patterns():
         ("pi", "openai/gpt-5.6-terra", "require_oath"),
         ("pi", "openai/gpt-5.6-terra", "tool"),
         ("pi", "openai/gpt-5.6-terra", "extensions"),  # #132: no knob re-enables them
+        ("claude-sdk", "fable", "permission_mode"),  # #149: the mode is the policy's
+        ("claude-sdk", "fable", "setting_sources"),
+        ("opencode-sdk", "openai/gpt-5.6-luna", "auto_approve"),
+        ("opencode-sdk", "openai/gpt-5.6-luna", "ask_tools"),  # advisory until G-O11
     ],
 )
 def test_an_unknown_option_key_is_rejected_with_the_profile_and_accepted_set(provider, model, key):
