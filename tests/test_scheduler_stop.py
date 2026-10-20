@@ -193,12 +193,32 @@ def test_a_writer_killed_before_its_link_leaves_no_request(common):
             {"schema": STOP_SCHEMA, "invocation_id": INVOCATION, "mode": "soon", "requested_at": TS}
         ),
         json.dumps(
+            {"schema": STOP_SCHEMA, "invocation_id": INVOCATION, "mode": [], "requested_at": TS}
+        ),
+        json.dumps(
+            {"schema": STOP_SCHEMA, "invocation_id": INVOCATION, "mode": {}, "requested_at": TS}
+        ),
+        json.dumps(
+            {"schema": STOP_SCHEMA, "invocation_id": INVOCATION, "mode": 1, "requested_at": TS}
+        ),
+        json.dumps(
             {"schema": STOP_SCHEMA, "invocation_id": "x", "mode": "now", "requested_at": TS}
         ),
         '{"schema": "autoforge.scheduler-stop/1", "schema": "again"}',
         "null",
     ],
-    ids=["bad-json", "other-schema", "extra-field", "bad-mode", "bad-id", "duplicate", "null"],
+    ids=[
+        "bad-json",
+        "other-schema",
+        "extra-field",
+        "bad-mode",
+        "array-mode",
+        "object-mode",
+        "number-mode",
+        "bad-id",
+        "duplicate",
+        "null",
+    ],
 )
 def test_a_request_that_does_not_parse_is_a_drain_for_everyone(common, content):
     _scheduler(common)
@@ -210,6 +230,23 @@ def test_a_request_that_does_not_parse_is_a_drain_for_everyone(common, content):
     assert not read.bound_elsewhere(INVOCATION)
     delivery = request_stop(common, 1, StopMode.NOW)  # never replaced, even then
     assert not delivery.written and "does not parse" in delivery.message
+
+
+@pytest.mark.parametrize("mode", [[], {}, ["now"], {"drain": 1}], ids=repr)
+def test_an_unhashable_mode_is_refused_by_the_strict_decoder_never_raised(common, mode):
+    # PR #248 R1-F1: set membership of a JSON array or object raised TypeError.
+    raw = {"schema": STOP_SCHEMA, "invocation_id": INVOCATION, "mode": mode, "requested_at": TS}
+    with pytest.raises(SchedulerStateError, match="mode is not drain or now"):
+        scheduler_stop.StopRequest.from_dict(raw)
+    _scheduler(common)
+    _write_request(common, json.dumps(raw))
+    read = read_stop_request(common, 1)
+    assert read.present and read.request is None and "mode is not drain or now" in read.problem
+    assert read.mode is StopMode.DRAIN and read.applies_to(INVOCATION)
+    # Kept on a tick, removed at the L0 holder's next start like any request that does not parse.
+    assert remove_stale_stop_requests(common, 1, INVOCATION, at_start=False) == ()
+    assert remove_stale_stop_requests(common, 1, INVOCATION, at_start=True) == ("stop-request",)
+    assert _entries(common) == ["scheduler.json"]
 
 
 def test_a_link_at_the_request_is_a_drain_and_is_never_followed(common, tmp_path):

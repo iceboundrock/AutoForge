@@ -66,6 +66,7 @@ from autoforge.scheduler_state import (
     read_namespace,
 )
 from autoforge.scheduler_stop import (
+    STOP_SCHEMA,
     StopMode,
     StopRequest,
     request_stop,
@@ -611,6 +612,58 @@ def test_a_now_request_interrupts_like_ctrl_c(bench, no_sigkill):
     assert sched.end_reason is EndReason.STOPPED
     assert settled(b, 2) is ClaimClassification.INTERRUPTED
     assert [sig for _, sig in no_sigkill] == [signal.SIGINT]
+
+
+def _request_with_mode(invocation: str, mode: object) -> str:
+    return json.dumps(
+        {
+            "schema": STOP_SCHEMA,
+            "invocation_id": invocation,
+            "mode": mode,
+            "requested_at": "2026-10-19T00:00:00+00:00",
+        }
+    )
+
+
+@pytest.mark.parametrize("mode", [[], {}], ids=["array", "object"])
+def test_an_unhashable_mode_drains_the_scheduler_and_its_worker(bench, no_sigkill, mode):
+    # PR #248 R1-F1: the scheduler's tick and the worker's step boundary read it,
+    # and each takes it as a drain instead of raising.
+    b = bench()
+    b.issue(2, ({**IMPLEMENT, "started": b.marker("s2"), "gate": b.marker("g2")}, REVIEW))
+    b.issue(3)
+    path = stop_request_path(b.root, 1)
+
+    def tick(s: EpicScheduler) -> None:
+        if b.has("s2") and not b.has("g2"):
+            path.write_text(_request_with_mode(s.invocation_id, mode))
+            b.open_gate("g2")
+
+    sched = b.scheduler(max_parallel=1, on_tick=tick)
+    assert sched.run() == 0
+    assert sched.end_reason is EndReason.DRAINED
+    assert sched.admission.reason is AdmissionReason.STOP_REQUESTED
+    assert "does not parse is a drain" in "\n".join(b.lines)
+    assert b.state(2).phase is Phase.REVIEW  # the worker returned at its step boundary
+    assert settled(b, 2) is ClaimClassification.INTERRUPTED
+    logs = "".join(log.read_text() for log in b.ns(2).workers_dir.iterdir())
+    assert "does not parse is a drain" in logs and "the scheduler is draining" in logs
+    assert b.claims(3) is None and b.admitted() == [2]
+    assert path.exists() and no_sigkill == []  # kept on a tick: only a start removes it
+
+
+@pytest.mark.parametrize("mode", [[], {}], ids=["array", "object"])
+def test_an_unhashable_mode_left_from_before_is_removed_at_start(bench, mode):
+    b = bench()
+    b.issue(2)
+    path = stop_request_path(b.root, 1)
+    path.parent.mkdir(parents=True)
+    path.write_text(_request_with_mode("f" * 32, mode))
+    sched = b.scheduler()
+    assert sched.run() == 0
+    assert "removed the stale stop-request" in "\n".join(b.lines)
+    assert not path.exists()
+    assert b.state(2).phase is Phase.READY_FOR_MERGE  # and not obeyed
 
 
 def test_the_grace_expiring_forwards_a_second_sigint_and_exits(bench, no_sigkill):

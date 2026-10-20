@@ -119,7 +119,8 @@ class StopRequest:
             missing = [key for key in _KEYS if key not in raw]
             _fail(f"has the fields {unknown} it may not have and lacks {missing}")
         mode = raw["mode"]
-        if mode not in {m.value for m in StopMode}:
+        # A string first: ``[]`` or ``{}`` is unhashable, and set membership would raise.
+        if not isinstance(mode, str) or mode not in {m.value for m in StopMode}:
             _fail(f"mode is not drain or now: {mode!r:.80}")
         return cls(raw["invocation_id"], StopMode(mode), raw["requested_at"])
 
@@ -215,7 +216,7 @@ def _read_at(root: SafeRoot, where: str) -> StopRead:
             raw.decode("utf-8"), object_pairs_hook=_unique, parse_constant=_no_constant
         )
         return StopRead(True, StopRequest.from_dict(document))
-    except (SchedulerStateError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+    except (SchedulerStateError, UnicodeDecodeError, ValueError, TypeError, RecursionError) as exc:
         return StopRead(True, problem=_bounded(f"{where} does not parse ({exc})"))
 
 

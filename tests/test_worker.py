@@ -41,7 +41,13 @@ from autoforge.scheduler_state import (
     read_namespace,
     write_scheduler_state,
 )
-from autoforge.scheduler_stop import StopMode, StopRequest, request_stop, stop_request_path
+from autoforge.scheduler_stop import (
+    STOP_SCHEMA,
+    StopMode,
+    StopRequest,
+    request_stop,
+    stop_request_path,
+)
 from autoforge.state import AutoForgeState, load_state, save_state
 from autoforge.transitions import Phase
 from autoforge.worker import WorkerArguments, parse_worker_arguments, run_worker
@@ -490,9 +496,20 @@ def test_a_drain_returns_at_the_next_step_boundary(world, capsys):
     assert "the scheduler is draining" in capsys.readouterr().err
 
 
-def test_a_request_that_does_not_parse_drains_and_never_crashes(world, capsys):
+def _with_mode(mode: object) -> str:
+    return json.dumps(
+        {"schema": STOP_SCHEMA, "invocation_id": INVOCATION, "mode": mode, "requested_at": TS}
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{broken", _with_mode([]), _with_mode({})],
+    ids=["bad-json", "array-mode", "object-mode"],  # unhashable modes: PR #248 R1-F1
+)
+def test_a_request_that_does_not_parse_drains_and_never_crashes(world, capsys, content):
     w = world()
-    _requesting(w, lambda: stop_request_path(w.root, 1).write_text("{broken"))
+    _requesting(w, lambda: stop_request_path(w.root, 1).write_text(content))
     assert w.run(w.admit()) == 0
     assert phases(w.provider) == ["ANALYZE_EXECUTE"] and w.state().phase is Phase.REVIEW
     err = capsys.readouterr().err
