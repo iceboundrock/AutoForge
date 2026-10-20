@@ -1178,8 +1178,14 @@ the in-memory GitHub and scripted agents. It must keep covering:
   for claims left open, 1 for global uncertainty, 2 for a held lock;
 - every `epic status` category with its next command, the strict
   `autoforge.epic-status/1` keys, a hung worker's diagnostics, a spawn
-  failure held, the not-ended hint, and that it takes no lock, signals
+  failure held, the not-ended hint, an entry of `issues/` that is not a
+  namespace as a problem (exit 1), and that it takes no lock, signals
   nothing and writes nothing; `epic run --dry-run` creating nothing;
+- every `epic` command refusing an EPIC of another repository than the
+  checkout's `origin` (and a checkout without one) with nothing written
+  locally and nothing read from GitHub; `epic stop` refusing a
+  `scheduler.json` of another repository and `epic archive` a namespace
+  bound under one;
 - every `epic stop` outcome, a drain and a `--now` of a running scheduler;
   `epic archive` closing then moving aside, idempotent, refused while the
   issue has a live owner or another EPIC, an unusable claim file moved

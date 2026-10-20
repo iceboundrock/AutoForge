@@ -21,7 +21,8 @@ Commands:
   epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
           --dry-run and --force), resume, status (lock-free, --json), stop
           (lock-free, --now) and archive; every 'epic' command refuses
-          --state-dir, since each issue's state lives in its scheduler namespace.
+          --state-dir, since each issue's state lives in its scheduler namespace,
+          and an EPIC of another repository than the checkout's 'origin'.
           'epic _worker' is the scheduler's hidden worker entry point
 """
 
@@ -57,6 +58,7 @@ from .epic_commands import (
     DRAIN_HELP,
     EXIT_OPEN_CLAIMS,
     archive_issue,
+    checkout_epic,
     claims_left_open,
     collect_status,
     coordination_root_of,
@@ -347,7 +349,8 @@ def _add_epic_parser(sub) -> None:
             "namespace and worktree, admitted in dependency order from GitHub's native "
             "sub-issues and blocked-by links. Every worker stops at its settlement boundary "
             "(READY_FOR_MERGE, BLOCKED, DONE, FAILED); nothing is merged. REMOTE only; "
-            "--state-dir is refused."
+            "--state-dir is refused, and so is an EPIC of another repository than this "
+            "checkout's 'origin' remote, before anything is read or written."
         ),
     )
     esub = ep.add_subparsers(dest="epic_command", required=True)
@@ -380,7 +383,6 @@ def _add_epic_parser(sub) -> None:
             "it does nothing else: it never closes a claim or moves a state"
         ),
     )
-    _add_accept_config_change(er)
 
     eres = esub.add_parser(
         "resume",
@@ -1131,6 +1133,10 @@ def cmd_epic(args) -> int:
             "'epic' commands refuse --state-dir: each issue's state lives in its own "
             "scheduler namespace, which 'autoforge epic status <epic>' names"
         )
+    # Before anything is read or written here: an EPIC of another repository
+    # than this checkout's would bind its issues in this checkout's namespaces,
+    # or stop or archive this checkout's EPIC of the same number.
+    checkout_epic(os.getcwd(), args.epic)
     if args.epic_command == "run":
         return cmd_epic_run(args, resume=False)
     if args.epic_command == "resume":
@@ -1178,7 +1184,7 @@ def cmd_epic_run(args, *, resume: bool) -> int:
         graph=graph,
         config_path=os.path.abspath(args.config) if args.config else "",
         max_parallel=args.max_parallel,
-        accept_config_change=args.accept_config_change,
+        accept_config_change=resume and args.accept_config_change,
         standalone_state_dir=standalone,
         **_epic_scheduler_options(),
     )
@@ -1219,7 +1225,7 @@ def cmd_epic_stop(args) -> int:
     """``epic stop``: lock-free; no configuration and no GitHub read are needed."""
     epic = parse_issue_url(args.epic)
     mode = StopMode.NOW if args.now else StopMode.DRAIN
-    outcome = stop_scheduler(coordination_root_of(os.getcwd()), epic.number, mode)
+    outcome = stop_scheduler(coordination_root_of(os.getcwd()), epic, mode)
     for line in outcome.lines:
         print(line)
     return outcome.exit_code

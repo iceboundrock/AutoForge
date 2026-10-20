@@ -216,6 +216,10 @@ def test_the_epic_commands_and_their_flags(capsys):
     assert "between 1 and 4" in capsys.readouterr().err
     args = parser.parse_args(["epic", "resume", EPIC, "--max-parallel", "4"])
     assert args.max_parallel == 4 and not args.accept_config_change
+    args = parser.parse_args(["epic", "resume", EPIC, "--accept-config-change"])
+    assert args.accept_config_change
+    with pytest.raises(SystemExit):  # epic resume's only (D9.4): epic run resumes no run
+        parser.parse_args(["epic", "run", EPIC, "--accept-config-change"])
     with pytest.raises(SystemExit):  # there is no --allow-merge
         parser.parse_args(["epic", "run", EPIC, "--allow-merge"])
     with pytest.raises(SystemExit):
@@ -237,6 +241,95 @@ def test_every_epic_command_refuses_state_dir(tmp_path, capsys, words):
     assert cli.main(["--state-dir", str(tmp_path / "sd"), "epic", *words]) == 2
     assert "refuse --state-dir" in capsys.readouterr().err
     assert not (tmp_path / "sd").exists()
+
+
+OTHER = "other/repo"
+OTHER_EPIC = f"https://github.com/{OTHER}/issues/1"  # this checkout's EPIC's number
+
+
+def _tree(root: Path) -> dict[str, tuple[bytes, int] | None]:
+    """Every entry of the scheduler's tree with its bytes and mtime: a refusal changes none."""
+    base = root / "autoforge"
+    found: dict[str, tuple[bytes, int] | None] = {}
+    for path in sorted(base.rglob("*")):
+        name = str(path.relative_to(base))
+        found[name] = (path.read_bytes(), path.stat().st_mtime_ns) if path.is_file() else None
+    return found
+
+
+def _other_repository_with_an_epic(b: Bench) -> None:
+    """EPIC #1 of ``other/repo`` with a ready child #2: one the CLI would otherwise run."""
+    b.graph.repository_ids[OTHER] = 5151
+    b.graph.add(1, repo=OTHER, parent=None)
+    b.graph.add(2, repo=OTHER, parent=(OTHER, 1))
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["run", OTHER_EPIC],
+        ["run", OTHER_EPIC, "--dry-run"],
+        ["resume", OTHER_EPIC],
+        ["status", OTHER_EPIC, "--json"],
+        ["stop", OTHER_EPIC],
+        ["stop", OTHER_EPIC, "--now"],
+        ["archive", OTHER_EPIC, "2"],
+    ],
+)
+def test_every_epic_command_refuses_an_epic_of_another_repository(epic, words):
+    e = epic()
+    b = e.b
+    _other_repository_with_an_epic(b)
+    assert e.run()[0] == 0  # this checkout's scheduler.json for its own EPIC #1
+    b.graph.child(2)
+    _admitted_but_never_spawned(b, 2, b.graph.issue(2, R).id)
+    before = _tree(b.root)
+    calls: list[str] = []
+    b.graph.on_call = calls.append
+    code, out, err = e.cli("epic", *words)
+    assert code == 2 and out == ""
+    assert f"{OTHER_EPIC} is an EPIC of {OTHER}, and this checkout's 'origin' is {R}" in err
+    # Nothing written here (no lock, binding, claim, scheduler.json or stop
+    # request; this checkout's own EPIC #1 untouched), and nothing read from GitHub.
+    assert _tree(b.root) == before and calls == []
+    assert b.claims(2).current is not None and b.admitted() == []
+
+
+def test_an_epic_command_needs_a_github_origin_and_compares_it_case_insensitively(epic):
+    e = epic()
+    b = e.b
+    git_out("-C", str(b.repo), "remote", "remove", "origin")
+    code, _, err = e.cli("epic", "run", EPIC, "--dry-run")
+    assert code == 2 and "its 'origin' remote cannot be read" in err
+    git_out("-C", str(b.repo), "remote", "add", "origin", "https://gitlab.com/owner/repo.git")
+    code, _, err = e.cli("epic", "status", EPIC)
+    assert code == 2 and "its 'origin' remote does not name one" in err
+    assert not (b.root / "autoforge").exists()
+    # GitHub's names are case-insensitive: another spelling is the same repository.
+    git_out("-C", str(b.repo), "remote", "set-url", "origin", "git@github.com:Owner/Repo.git")
+    assert e.run()[0] == 0
+    code, out, _ = e.cli("epic", "stop", "https://github.com/OWNER/repo/issues/1")
+    assert code == 0 and "which has ended" in out
+
+
+def test_stop_and_archive_refuse_files_of_another_repository(epic):
+    """The origin re-pointed after a scheduler ran: its files still name the repository."""
+    e = epic()
+    b = e.b
+    _other_repository_with_an_epic(b)
+    assert e.run()[0] == 0
+    b.graph.child(2)
+    _admitted_but_never_spawned(b, 2, b.graph.issue(2, R).id)
+    git_out("-C", str(b.repo), "remote", "set-url", "origin", f"https://github.com/{OTHER}.git")
+    scheduler_json = scheduler_state_path(b.root, 1).read_bytes()
+    claims = b.ns(2).claim_file.read_bytes()
+    code, _, err = e.cli("epic", "stop", OTHER_EPIC, "--now")
+    assert code == 2 and f"scheduler.json of EPIC #1 here is {R}'s, not {OTHER}'s" in err
+    assert not stop_request_path(b.root, 1).exists()
+    code, _, err = e.cli("epic", "archive", OTHER_EPIC, "2")
+    assert code == 2 and f"bound under {R}, not {OTHER}: nothing was archived" in err
+    assert b.ns(2).claim_file.read_bytes() == claims and b.claims(2).current is not None
+    assert scheduler_state_path(b.root, 1).read_bytes() == scheduler_json
 
 
 # -- epic status -------------------------------------------------------------------------
@@ -360,6 +453,28 @@ def test_status_gives_every_child_exactly_one_category(epic, tmp_path):
     # Lock-free and read-only: nothing changed.
     assert scheduler_state_path(b.root, 1).read_bytes() == scheduler_json
     assert not b.ns(11).directory.exists() and not b.ns(14).directory.exists()
+
+
+def test_an_entry_of_issues_that_is_not_a_namespace_is_a_status_problem(epic):
+    e = epic()
+    b = e.b
+    b.issue(2)
+    issues = b.ns(2).directory.parent
+    issues.mkdir(parents=True)
+    (issues / "notes.txt").write_text("stray", encoding="utf-8")
+    (issues / "7").write_text("not a directory", encoding="utf-8")
+    code, doc = e.status()
+    assert code == 1
+    assert [entry["name"] for entry in doc["rejected"]] == ["7", "notes.txt"]
+    rejected = [p for p in doc["problems"] if "is not a namespace" in p]
+    assert len(rejected) == 2 and len(doc["problems"]) == 2
+    assert rejected[1].startswith(
+        "issues/notes.txt is not a namespace (not a decimal issue number) and is never read"
+    )
+    assert doc["children"][0]["category"] == "ready"  # every child is still shown
+    code, out, _ = e.cli("epic", "status", EPIC)
+    assert code == 1 and "problem: issues/7 is not a namespace (" in out
+    assert out.count("issues/notes.txt") == 1
 
 
 def test_status_while_a_scheduler_runs_shows_the_hung_worker_and_a_spawn_failure(epic, signals):

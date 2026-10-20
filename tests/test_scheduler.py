@@ -136,6 +136,12 @@ class Bench:
     def __init__(self, tmp_path: Path, config: dict | None = None) -> None:
         self.tmp = tmp_path
         self.repo = git_repo(tmp_path / "repo")
+        # The checkout's repository, as every 'epic' command reads it (#183); the
+        # controller's git transport talks to the bare origin below, never to it.
+        subprocess.run(
+            ["git", "-C", str(self.repo), "remote", "add", "origin", f"https://github.com/{R}.git"],
+            check=True,
+        )
         (tmp_path / "origin").mkdir()
         self.origin = Origin.seeded(tmp_path / "origin", self.repo)
         self.fixtures = tmp_path / "fixtures"

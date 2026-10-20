@@ -291,6 +291,11 @@ boundary (`READY_FOR_MERGE`, `BLOCKED`, `DONE`, `FAILED`) and never goes on
 to `MERGE` or `UPDATE_EPIC`, whatever `safety.allow_merge` says, so a human
 merges every PR. It is REMOTE only, and every `epic` command refuses
 `--state-dir`: a namespace is found from the EPIC, never from a directory.
+Every `epic` command also refuses an EPIC of another repository than the
+one the checkout's `origin` remote names (exit 2), before it reads or
+writes anything: the scheduler's files are this checkout's and are found
+by EPIC and issue number, so another repository's EPIC would bind its
+issues here, or stop or archive this checkout's EPIC of the same number.
 
 ```bash
 # the scheduler's own checks too: the coordination root's filesystem, the
@@ -353,9 +358,9 @@ uv run autoforge epic archive https://github.com/owner/repo/issues/1 7
   refuses to start when it no longer matches the one the scheduler
   recorded: stop the scheduler before editing it. A resumed issue's run
   also refuses another profile routing or agent worktree root than the one
-  it was recorded under; `--accept-config-change` (on `epic run` and
-  `epic resume`) is passed to every resumed worker, as on `resume`
-  ([Configuration](configuration.md#parallel-epic-scheduler)).
+  it was recorded under; `--accept-config-change` (on `epic resume` only:
+  `epic run` resumes no run) is passed to every resumed worker, as on
+  `resume` ([Configuration](configuration.md#parallel-epic-scheduler)).
 - **`--max-parallel N`** overrides `scheduler.max_parallel` for one
   invocation, within the same bounds (1-4): there is no unbounded mode.
 - **Standalone commands.** The issue of the configuration's own standalone
@@ -393,8 +398,10 @@ recorded snapshot, a pending stop request, and namespaces of the EPIC the
 snapshot no longer lists. An invocation recorded as not ended while no
 worker runs says so: "not ended: if no `autoforge epic` process is running,
 it ended without finalizing (crash or kill); run `epic resume`". Exit 0,
-or 1 when the snapshot or `scheduler.json` cannot be read or a namespace
-is a problem.
+or 1 when the snapshot or `scheduler.json` cannot be read, a namespace
+is a problem, or an entry of the scheduler's `issues/` directory is not a
+namespace (a stray file, a link, a name that is no issue number: never
+read as one, so move it out by hand).
 
 `epic status --json` prints one document, schema `autoforge.epic-status/1`,
 redacted. Its keys are fixed; a field without a value is `null`:
@@ -413,6 +420,7 @@ problems          [text]
 children          [row], in admission order
 other_namespaces  [row], namespaces of the EPIC the snapshot does not list
 rejected          [{name, reason}], entries under issues/ that are not namespaces
+                  (each is also one of problems)
 row               {number, category, hold_reason, detail, verdict, blockers, phase,
                    settlement, classification, pr_url, state_dir, live, orphaned,
                    claim {claim_id, generation, kind, invocation_id, created_at,
@@ -443,8 +451,8 @@ are distinct:
   by a recorded PID), and the next scheduler removes the stale request;
 - a request is already there, a drain blocking a `--now` among them, or the
   scheduler changed under the write (exit 1);
-- no `scheduler.json` for the EPIC: nothing to stop (exit 2, nothing
-  created).
+- no `scheduler.json` for the EPIC, or one of another repository: nothing
+  to stop (exit 2, nothing created).
 
 ### `epic archive`
 
@@ -477,7 +485,7 @@ scheduler keeps the repository lock until it exits, so wait for it (or
 |---|---|
 | 0 | nothing more is admissible and no claim is left open, or a drain finished |
 | 1 | global uncertainty: admission degraded (the snapshot, `scheduler.json` or a namespace could not be trusted); see `epic status` |
-| 2 | refused before anything ran: the repository lock is held (a scheduler, a standalone command or a surviving worker), open claims (`epic run`), `--state-dir` |
+| 2 | refused before anything ran: the repository lock is held (a scheduler, a standalone command or a surviving worker), open claims (`epic run`), `--state-dir`, an EPIC of another repository than the checkout's `origin` |
 | 3 | it ended with claims of the EPIC still open (each is listed with its next command): `epic status`, then `epic resume` or `epic archive` |
 | 130 | interrupted: Ctrl-C, a signal, or `epic stop --now` |
 

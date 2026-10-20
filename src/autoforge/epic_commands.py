@@ -24,6 +24,9 @@ wires them. This module holds the rest, so the CLI only parses and prints:
 * **``epic run``'s refusal and ``--force``** (:func:`epic_run_guard`), run by
   the scheduler holding L0 before it writes anything, and the end-of-run
   check that no claim was left open (:func:`claims_left_open`).
+* **The checkout's EPIC** (:func:`checkout_epic`): every ``epic`` command
+  first refuses an EPIC of another repository than this checkout's
+  ``origin``, before anything is read or written here.
 
 Nothing here names a provider, writes GitHub, records an effect or parses an
 agent's result.
@@ -50,6 +53,7 @@ from .epic_graph import (
 )
 from .errors import (
     ConfigurationError,
+    ExecutionError,
     GitHubError,
     IssueBusy,
     LockError,
@@ -59,6 +63,8 @@ from .errors import (
     SnapshotRefused,
     StateError,
 )
+from .executor import ExecutionRequest, ExecutionResult, execute
+from .git_transport import local_git_request
 from .locking import IssueRunLock, issue_run_lock_live, repository_lock_path
 from .ownership import StandaloneHold, standalone_hold
 from .redaction import redact, redact_dict
@@ -97,7 +103,7 @@ from .scheduler_state import (
 from .scheduler_stop import StopMode, StopRead, read_stop_request, request_stop
 from .state import AutoForgeState
 from .transitions import Phase, Settlement
-from .validation import GitHubIssueRef, parse_issue_url
+from .validation import GitHubIssueRef, parse_issue_url, parse_remote_repository
 
 STATUS_SCHEMA = "autoforge.epic-status/1"
 # ``epic run`` and ``epic resume`` end with claims of the EPIC still open: an
@@ -115,6 +121,8 @@ DRAIN_HELP = (
     "a drain cannot be escalated by another 'epic stop': press Ctrl-C in the scheduler's "
     "terminal to interrupt its workers"
 )
+
+Runner = Callable[[ExecutionRequest], ExecutionResult]
 
 
 class Category(Enum):
@@ -168,6 +176,59 @@ def _bounded(text: str, limit: int) -> str:
 def coordination_root_of(repository: str | Path) -> Path:
     """The git common dir L0 is keyed by: the scheduler's coordination root (D5.3)."""
     return repository_lock_path(repository).parent.parent
+
+
+def checkout_repository(workdir: str | Path, runner: Runner = execute) -> str:
+    """``owner/repo`` of the checkout containing ``workdir``: its ``origin`` remote.
+
+    Read locally with the controller's hardened git, as ``doctor`` reads it,
+    so ``epic stop`` and ``epic archive`` check it too without a GitHub
+    read. No ``origin``, or one that is not a github.com repository, raises
+    :class:`~autoforge.errors.ConfigurationError`: there is then nothing to
+    bind an EPIC to.
+    """
+    try:
+        res = runner(local_git_request(["remote", "get-url", "origin"], cwd=str(workdir)))
+    except ExecutionError as exc:
+        raise ConfigurationError(
+            f"cannot read this checkout's 'origin' remote: git could not be run ({exc})"
+        ) from exc
+    if res.timed_out or res.truncated or res.exit_code != 0:
+        detail = (res.stderr or res.stdout).strip().splitlines()
+        shown = detail[0] if detail else f"git remote get-url exited {res.exit_code}"
+        raise ConfigurationError(
+            "an 'epic' command runs on an EPIC of this checkout's own repository, and its "
+            f"'origin' remote cannot be read ({_bounded(shown, 500)})"
+        )
+    try:
+        return parse_remote_repository(res.stdout)
+    except ConfigurationError as exc:
+        raise ConfigurationError(
+            "an 'epic' command runs on an EPIC of this checkout's own repository, and its "
+            f"'origin' remote does not name one: {_bounded(str(exc), 500)}"
+        ) from exc
+
+
+def checkout_epic(workdir: str | Path, epic_url: str, runner: Runner = execute) -> GitHubIssueRef:
+    """The EPIC, refused unless it belongs to this checkout's repository (#183).
+
+    Every ``epic`` command calls it first, before it takes a lock or reads
+    the coordination root or GitHub. That root is this checkout's, and
+    ``scheduler.json``, the stop request and every namespace are found by
+    EPIC and issue number: another repository's EPIC would otherwise write
+    its bindings and claims here (global uncertainty for every later
+    scheduler), or stop or archive this checkout's EPIC of the same number.
+    The names are compared case-insensitively, as GitHub does.
+    """
+    epic = parse_issue_url(epic_url)
+    home = checkout_repository(workdir, runner)
+    if home.lower() != epic.repository.lower():
+        raise ConfigurationError(
+            f"{epic.canonical} is an EPIC of {epic.repository}, and this checkout's 'origin' "
+            f"is {home}: an 'epic' command runs only on an EPIC of the checkout's own "
+            "repository; nothing was written"
+        )
+    return epic
 
 
 # -- one child's category (pure) --------------------------------------------------------
@@ -605,7 +666,11 @@ class StatusReport:
 
     @property
     def exit_code(self) -> int:
-        """0, or 1 when GitHub, ``scheduler.json`` or the namespaces could not all be read."""
+        """0, or 1 when GitHub, ``scheduler.json`` or the namespaces could not all be read.
+
+        A namespace that is a problem, and an entry under ``issues/`` that is
+        not a namespace (:attr:`rejected`), are among :attr:`problems`.
+        """
         return 1 if (self.snapshot is None or self.scheduler_problem or self.problems) else 0
 
     def to_dict(self) -> dict:
@@ -737,8 +802,6 @@ class StatusReport:
                 else "namespaces of this EPIC:"
             )
             out.extend(_row_lines(row) for row in self.other_namespaces)
-        for entry in self.rejected:
-            out.append(f"not a namespace: issues/{entry.name} ({entry.reason})")
         return [redact(line) for line in out]
 
 
@@ -851,6 +914,13 @@ def collect_status(
     except (StateError, OSError) as exc:
         problems.append(f"the scheduler's namespaces cannot be listed: {_bounded(str(exc), 500)}")
         listed, rejected = [], ()
+    # An entry no reader follows: what it holds is never shown or classified,
+    # so it is a problem (exit 1), as an unreadable namespace is.
+    problems.extend(
+        f"issues/{entry.name} is not a namespace ({entry.reason}) and is never read as one: "
+        "move it out of the scheduler's issues/ directory by hand"
+        for entry in rejected
+    )
 
     def facts_of(number: int, verdict: ChildVerdict | None) -> IssueFacts:
         standalone = hold if hold is not None and hold.issue_number == number else None
@@ -1148,15 +1218,25 @@ def live_namespaces(root: Path, epic_number: int) -> tuple[int, ...]:
     return tuple(live)
 
 
-def stop_scheduler(root: Path, epic_number: int, mode: StopMode) -> StopOutcome:
+def stop_scheduler(root: Path, epic: GitHubIssueRef, mode: StopMode) -> StopOutcome:
     """``epic stop``: publish a stop request (#182's ``request_stop``) and say what happened.
 
     Exit 0 when a request was delivered to the invocation ``scheduler.json``
     names; 1 when nothing was delivered (a request was already there, or
     the scheduler changed after the write). No ``scheduler.json`` (or one
-    that does not load) raises :class:`~autoforge.errors.SchedulerStateError`,
-    with nothing created. Nothing is ever removed or signalled.
+    that does not load), or one of another repository than the EPIC's,
+    raises :class:`~autoforge.errors.SchedulerStateError`, with nothing
+    created. Nothing is ever removed or signalled.
     """
+    epic_number = epic.number
+    state = load_scheduler_state(root, epic_number)  # absent: request_stop refuses
+    if state is not None:
+        named = f"{state.repository_owner}/{state.repository_name}"
+        if named.lower() != epic.repository.lower():
+            raise SchedulerStateError(
+                f"scheduler.json of EPIC #{epic_number} here is {named}'s, not "
+                f"{epic.repository}'s: no stop request was written"
+            )
     delivery = request_stop(root, epic_number, mode)
     out = [delivery.message]
     code = 0 if delivery.written and not delivery.scheduler_changed else 1
@@ -1239,9 +1319,9 @@ def archive_issue(root: Path, epic_url: str, issue: int) -> ArchiveReport:
     """``epic archive``: close the claim, then move the state aside (D17.4).
 
     The caller holds L0. A namespace that does not exist is left alone:
-    nothing is created. One bound under another EPIC is refused. L2 is
-    taken non-blocking, so a live owner refuses the archive
-    (:class:`~autoforge.errors.IssueBusy`). Each step is idempotent: a re-run
+    nothing is created. One bound under another repository or another EPIC
+    is refused. L2 is taken non-blocking, so a live owner refuses the
+    archive (:class:`~autoforge.errors.IssueBusy`). Each step is idempotent: a re-run
     after a crash completes the archive, and one with nothing left says so.
     No GitHub read; ``scheduler.json`` is not written.
     """
@@ -1258,6 +1338,11 @@ def archive_issue(root: Path, epic_url: str, issue: int) -> ArchiveReport:
             if lookup.state.status is StateStatus.ABSENT:
                 return ArchiveReport(namespace)
         binding = lookup.binding
+    if binding is not None and binding.repository.lower() != epic.repository.lower():
+        raise SchedulerStateError(
+            f"issue #{issue}'s namespace is bound under {binding.repository}, not "
+            f"{epic.repository}: nothing was archived"
+        )
     if binding is not None and binding.epic.number != epic.number:
         other = f"https://github.com/{binding.repository}/issues/{binding.epic.number}"
         raise SchedulerStateError(
