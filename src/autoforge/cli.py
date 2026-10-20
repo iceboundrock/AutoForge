@@ -736,18 +736,71 @@ _MAX_TERMINAL_LINE_BYTES = 4 * MAX_ANSWER_CHARS + 64
 # An option number as typed: ASCII digits, and few of them (a question has
 # at most sdk_policy.MAX_OPTIONS options), so int() takes every one.
 _OPTION_NUMBER = re.compile(r"[0-9]{1,3}")
+# What the resolver may have written to a terminal that has not taken it yet
+# (its output suspended, or not read): past this it reads no more keys until
+# the terminal takes some or the deadline comes, so what waits stays bounded.
+_MAX_UNSHOWN_BYTES = 64 * 1024
 
 
 class _Unusable(Exception):
     """A line the terminal resolver cannot use: the message names the rule."""
 
 
+class _TerminalWriter:
+    """Writes to the terminal of ``fd`` that never block (#134).
+
+    A terminal's output can be suspended (its stop key under IXON, another
+    program's ``tcflow``) or left unread, and a blocking write then waits
+    until it resumes: past any deadline, and the resolver with it. So the
+    resolver writes to a terminal through a descriptor of its own on its
+    device, opened non-blocking: an open file description of its own, so
+    stdin, stderr and the shell's descriptors stay as they are. What the
+    terminal does not take at once waits here, and is written as it takes
+    it while the resolver waits for a key, never past the deadline
+    (:meth:`_Terminal.line`); what it has not taken when the resolver is
+    done is dropped (:meth:`close`).
+    """
+
+    def __init__(self, fd: int) -> None:
+        self.fd = os.open(os.ttyname(fd), os.O_WRONLY | os.O_NOCTTY | os.O_CLOEXEC | os.O_NONBLOCK)
+        self.device = os.fstat(self.fd).st_rdev
+        self._unshown = bytearray()
+
+    @property
+    def unshown(self) -> int:
+        """How many bytes the terminal has not taken yet."""
+        return len(self._unshown)
+
+    def write(self, data: bytes) -> None:
+        self._unshown += data
+        self.flush()
+
+    def flush(self) -> None:
+        """Write what the terminal takes now."""
+        while self._unshown:
+            try:
+                written = os.write(self.fd, self._unshown)
+            except BlockingIOError:
+                return
+            if not written:
+                return
+            del self._unshown[:written]
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        except OSError:  # the terminal hung up: there is no one to show it to
+            pass
+        finally:
+            os.close(self.fd)
+
+
 class _LineEditing:
-    """A terminal whose line editing the resolver took over: its keys, where
-    the resolver echoes what is typed, and the settings it reads under
+    """A terminal whose line editing the resolver took over: its keys, the
+    writer it echoes what is typed through, and the settings it reads under
     (:func:`_line_editing`)."""
 
-    def __init__(self, fd: int, saved: list, echo_fd: int) -> None:
+    def __init__(self, fd: int, saved: list, writer: _TerminalWriter) -> None:
         import termios
 
         cc = saved[6]
@@ -765,29 +818,34 @@ class _LineEditing:
         self.word_erase = key(termios.VWERASE)
         self.kill = key(termios.VKILL)
         self.eof = key(termios.VEOF)
+        # Under IXON the stop and start keys are never input either.
+        flow = (key(termios.VSTOP), key(termios.VSTART)) if saved[0] & termios.IXON else ()
+        self.flow = frozenset(k for k in flow if k is not None)
         self._fd = fd
-        self._echo_fd = echo_fd
-        # Canonical mode and echo off, and a read returns once a key is typed.
+        self.writer = writer
+        # Canonical mode, echo and output flow control off, and a read
+        # returns once a key is typed.
         self.raw = list(saved)
+        self.raw[0] = saved[0] & ~termios.IXON
         self.raw[3] = saved[3] & ~(termios.ICANON | termios.ECHO)
         self.raw[6] = list(cc)
         self.raw[6][termios.VMIN], self.raw[6][termios.VTIME] = 1, 0
 
     def echo(self, data: bytes) -> None:
-        while data:
-            data = data[os.write(self._echo_fd, data) :]
+        self.writer.write(data)
 
     def retake(self) -> bool:
         """Whether the terminal's own line editing came back on while the
         resolver waited (a stop and continue under a shell that resets the
         terminal, another program's ``stty``): what was just read went
-        through it and may have been cut. It is turned off again."""
+        through it and may have been cut. It is turned off again, and so is
+        output flow control when that came back on."""
         import termios
 
-        mode = termios.tcgetattr(self._fd)[3]
-        if mode & (termios.ICANON | termios.ECHO):
+        attrs = termios.tcgetattr(self._fd)
+        if attrs[3] & (termios.ICANON | termios.ECHO) or attrs[0] & termios.IXON:
             termios.tcsetattr(self._fd, termios.TCSANOW, self.raw)
-        return bool(mode & termios.ICANON)
+        return bool(attrs[3] & termios.ICANON)
 
 
 @contextmanager
@@ -801,15 +859,22 @@ def _line_editing(fd: int) -> Iterator[_LineEditing | None]:
     without a word, under any bound a reader could hold the line to, and an
     answer or guidance would reach the agent cut short. So canonical mode
     and echo are off while the resolver reads, and it edits the line itself
-    (:class:`_TerminalInput`): it echoes what it keeps, on the terminal and
+    (:class:`_Terminal`): it echoes what it keeps, on the terminal and
     never on stderr, and takes the terminal's own erase, word-erase, kill
     and end-of-file keys. A line read while canonical mode came back on is
-    refused (:meth:`_LineEditing.retake`). Everything else stays the
-    terminal's: Ctrl-C still raises ``KeyboardInterrupt`` (ISIG is
-    untouched), and the settings are restored however the reading ends.
+    refused (:meth:`_LineEditing.retake`).
+
+    Output flow control (IXON) is off too: under it the stop key suspends
+    the terminal's output until the start key, and the echo would wait for
+    it past the deadline. The two keys are still never input, and suspend
+    nothing; output a stop key suspended before the resolver asked comes
+    back where turning IXON off restarts it (Linux). Whatever else holds the
+    output, the resolver writes to the terminal only as it takes it
+    (:class:`_TerminalWriter`). Everything else stays the terminal's: Ctrl-C
+    still raises ``KeyboardInterrupt`` (ISIG is untouched), and the settings
+    are restored however the reading ends.
     """
     try:
-        import fcntl
         import termios
     except ImportError:  # pragma: no cover - a platform without termios
         yield None
@@ -821,19 +886,41 @@ def _line_editing(fd: int) -> Iterator[_LineEditing | None]:
     if saved is None:
         yield None
         return
-    echo_fd = fd
-    if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY:
-        echo_fd = os.open(os.ttyname(fd), os.O_WRONLY | os.O_NOCTTY | os.O_CLOEXEC)
+    # Its own descriptor, opened to write, also echoes a terminal read
+    # through a read-only one.
+    writer = _TerminalWriter(fd)
     try:
-        editing = _LineEditing(fd, saved, echo_fd)
+        editing = _LineEditing(fd, saved, writer)
         termios.tcsetattr(fd, termios.TCSANOW, editing.raw)
         try:
             yield editing
         finally:
             termios.tcsetattr(fd, termios.TCSANOW, saved)
     finally:
-        if echo_fd != fd:
-            os.close(echo_fd)
+        writer.close()
+
+
+@contextmanager
+def _shown_on(output: TextIO, editing: _LineEditing | None) -> Iterator[_TerminalWriter | None]:
+    """The writer the resolver shows its text on ``output`` through when that
+    is a terminal: the echo's when it is the terminal the resolver reads,
+    so that the two keep their order. ``None`` for an output that is not a
+    terminal, printed to as before."""
+    try:
+        fd = output.fileno()
+    except (AttributeError, OSError, ValueError):  # a StringIO has none
+        fd = None
+    if fd is None or not os.isatty(fd):
+        yield None
+        return
+    if editing is not None and os.fstat(fd).st_rdev == editing.writer.device:
+        yield editing.writer
+        return
+    writer = _TerminalWriter(fd)
+    try:
+        yield writer
+    finally:
+        writer.close()
 
 
 def _utf8_length(lead: int) -> int:
@@ -867,8 +954,10 @@ def _echoed(typed: bytes) -> tuple[bytes, int]:
     return typed, 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
-class _TerminalInput:
-    """Lines read from ``fd`` until ``deadline``: a string, or :class:`Unavailable`.
+class _Terminal:
+    """The operator's terminal while the resolver asks: lines read from
+    ``fd`` until ``deadline`` (a string, or :class:`Unavailable`), and the
+    resolver's text shown on ``output`` (:meth:`show`).
 
     At a terminal (``editing``) each key is taken as it is typed and the
     line is edited here (:func:`_line_editing`); any other descriptor
@@ -876,6 +965,13 @@ class _TerminalInput:
     refused whole when it ends: at a terminal what is typed past the bound
     is neither kept nor echoed (the bell rings once), and the kill key
     starts the line again.
+
+    What the resolver writes to a terminal, its echo and, when ``output``
+    is a terminal (``shown``), its text, goes through a
+    :class:`_TerminalWriter`: what the terminal has not taken is written
+    while a line is awaited, and a terminal whose output is suspended never
+    holds the resolver past the deadline. While more than
+    :data:`_MAX_UNSHOWN_BYTES` wait, no key is read.
     """
 
     def __init__(
@@ -884,11 +980,19 @@ class _TerminalInput:
         clock: Callable[[], float],
         deadline: float,
         editing: _LineEditing | None = None,
+        output: TextIO | None = None,
+        shown: _TerminalWriter | None = None,
     ) -> None:
         self._fd = fd
         self._clock = clock
         self._deadline = deadline
         self._editing = editing
+        self._output = output
+        self._shown = shown
+        self._writers: list[_TerminalWriter] = []
+        for writer in (editing.writer if editing is not None else None, shown):
+            if writer is not None and writer not in self._writers:
+                self._writers.append(writer)
         self._pending = b""
         self._overlong = False
         # The line being typed at a terminal: each character's bytes and
@@ -897,13 +1001,27 @@ class _TerminalInput:
         self._size = 0
         self._partial = b""
 
+    def show(self, text: str, end: str = "\n") -> None:
+        if self._shown is None:
+            print(text, end=end, file=self._output or sys.stderr, flush=True)
+            return
+        encoding = getattr(self._output, "encoding", None) or "utf-8"
+        self._shown.write((text + end).encode(encoding, "backslashreplace"))
+
     def line(self) -> str | Unavailable:
         while (raw := self._take()) is None:
             remaining = self._deadline - self._clock()
             if remaining <= 0:
                 return Unavailable(UnavailableReason.EXPIRED)
-            ready, _, _ = select.select([self._fd], [], [], remaining)
-            if not ready:
+            unshown = [writer for writer in self._writers if writer.unshown]
+            reading = [self._fd] if sum(w.unshown for w in unshown) < _MAX_UNSHOWN_BYTES else []
+            readable, writable, _ = select.select(reading, [w.fd for w in unshown], [], remaining)
+            for writer in unshown:
+                if writer.fd in writable:
+                    writer.flush()
+            if not readable:
+                if writable:
+                    continue
                 return Unavailable(UnavailableReason.EXPIRED)
             chunk = os.read(self._fd, 4096)
             if not chunk:
@@ -943,6 +1061,8 @@ class _TerminalInput:
     def _edit(self, keys: _LineEditing) -> bytes | Unavailable | None:
         pending, self._pending = self._pending, b""
         for at, byte in enumerate(pending):
+            if byte in keys.flow:  # the stop and start keys, taken as under IXON
+                continue
             if self._partial and 0x80 <= byte <= 0xBF:
                 self._partial += bytes((byte,))
                 if len(self._partial) == _utf8_length(self._partial[0]):
@@ -1026,6 +1146,10 @@ class TerminalResolver:
     an answer reaches the agent whole or is refused. Each line is read
     until the deadline the broker gives: its expiry is ``expired``, the end
     of the input ``end_of_input``, and the broker decides what either means.
+    No write holds it past that deadline: the stop key suspends nothing
+    while it reads, and it writes to a terminal only as the terminal takes
+    it (:class:`_TerminalWriter`), so a terminal whose output is suspended
+    or unread neither holds a decision back nor keeps the wait open.
     Ctrl-C raises ``KeyboardInterrupt`` as anywhere else: the step is
     interrupted and nothing is decided (D7.7). An input it cannot use is
     explained, by rule and never by value, and asked again within the same
@@ -1056,22 +1180,24 @@ class TerminalResolver:
         if fd is None or not self._is_terminal(fd):
             return Unavailable(UnavailableReason.NO_TERMINAL)
         _discard_typeahead(fd)
-        with _line_editing(fd) as editing:
-            return self._resolve(request, _TerminalInput(fd, self._clock, deadline, editing))
+        output = self._output or sys.stderr
+        with _line_editing(fd) as editing, _shown_on(output, editing) as shown:
+            terminal = _Terminal(fd, self._clock, deadline, editing, output, shown)
+            return self._resolve(request, terminal)
 
     # -- internals -------------------------------------------------------------
     def _resolve(
-        self, request: InteractionRequest, terminal: _TerminalInput
+        self, request: InteractionRequest, terminal: _Terminal
     ) -> InteractionDecision | Unavailable:
         source = f", subagent {request.agent}" if request.agent is not None else ""
         if request.kind is RequestKind.PERMISSION:
-            self._say(
+            terminal.show(
                 f"autoforge: the agent asks permission to use {request.tool_name} "
                 f"(request {request.request_id}{source}); answer within "
                 f"{terminal.seconds_left()}s, Ctrl-C stops the step"
             )
             return self._permission(request, terminal)
-        self._say(
+        terminal.show(
             f"autoforge: the agent asks {len(request.questions)} question(s) "
             f"(request {request.request_id}{source}); answer within "
             f"{terminal.seconds_left()}s, Ctrl-C stops the step"
@@ -1092,20 +1218,17 @@ class TerminalResolver:
         except (OSError, ValueError):
             return None
 
-    def _say(self, text: str) -> None:
-        print(text, file=self._output or sys.stderr, flush=True)
-
-    def _ask(self, terminal: _TerminalInput, prompt: str) -> str | Unavailable:
+    def _ask(self, terminal: _Terminal, prompt: str) -> str | Unavailable:
         """One usable line for ``prompt``, or :class:`Unavailable`."""
         while True:
-            print(prompt, end="", file=self._output or sys.stderr, flush=True)
+            terminal.show(prompt, end="")
             try:
                 line = terminal.line()
             except _Unusable as exc:
-                self._say(f"  not used: {exc}; try again")
+                terminal.show(f"  not used: {exc}; try again")
                 continue
             if isinstance(line, Unavailable):
-                self._say("")
+                terminal.show("")
                 return line
             if line.strip():
                 return line.strip()
@@ -1115,18 +1238,18 @@ class TerminalResolver:
         request: InteractionRequest,
         question: Question,
         n: int,
-        terminal: _TerminalInput,
+        terminal: _Terminal,
     ) -> QuestionResponse | Cancel | Unavailable:
         own = question.custom and DecisionKind.CUSTOM_ANSWER in request.offers
         cancel = DecisionKind.CANCEL in request.offers
         title = f"  ({n}/{len(request.questions)})"
-        self._say(f"{title} {question.header}" if question.header else title)
-        self._say(f"  {question.text}")
+        terminal.show(f"{title} {question.header}" if question.header else title)
+        terminal.show(f"  {question.text}")
         for number, option in enumerate(question.options, 1):
             described = f" - {option.description}" if option.description else ""
-            self._say(f"    {number}. {option.shown}{described}")
+            terminal.show(f"    {number}. {option.shown}{described}")
         if own:
-            self._say("    0. something else, in your own words")
+            terminal.show("    0. something else, in your own words")
         several = "numbers separated by commas" if question.multiple else "a number"
         prompt = f"  choose {several}{', or c to cancel' if cancel else ''}: "
         while True:
@@ -1137,7 +1260,7 @@ class TerminalResolver:
                 return Cancel()
             picked = self._picks(line, question, own)
             if isinstance(picked, str):
-                self._say(f"  not used: {picked}; try again")
+                terminal.show(f"  not used: {picked}; try again")
                 continue
             custom: str | None = None
             if 0 in picked:
@@ -1149,7 +1272,7 @@ class TerminalResolver:
             try:
                 return QuestionResponse(choices=labels, custom_text=custom)
             except InteractionDataError as exc:
-                self._say(f"  not used: {exc}; try again")
+                terminal.show(f"  not used: {exc}; try again")
 
     @staticmethod
     def _picks(line: str, question: Question, own: bool) -> list[int] | str:
@@ -1168,12 +1291,12 @@ class TerminalResolver:
         return picked
 
     def _permission(
-        self, request: InteractionRequest, terminal: _TerminalInput
+        self, request: InteractionRequest, terminal: _Terminal
     ) -> Allow | Deny | Cancel | Unavailable:
         offers = request.offers
         if request.summary:
-            self._say(f"  {request.summary}")
-        self._say(f"  input sha256 {request.input_sha256}")
+            terminal.show(f"  {request.summary}")
+        terminal.show(f"  input sha256 {request.input_sha256}")
         choices: dict[str, str] = {}
         if DecisionKind.ALLOW_ONCE in offers:
             choices["y"] = "allow this call once"
@@ -1188,7 +1311,7 @@ class TerminalResolver:
         if DecisionKind.CANCEL in offers:
             choices["c"] = "cancel: decline to decide"
         for key, text in choices.items():
-            self._say(f"    {key}  {text}")
+            terminal.show(f"    {key}  {text}")
         while True:
             line = self._ask(terminal, f"  choose {'/'.join(choices)}: ")
             if isinstance(line, Unavailable):
@@ -1196,7 +1319,7 @@ class TerminalResolver:
             key, _, rest = line.partition(" ")
             key, rest = key.lower(), rest.strip()
             if key not in choices or (rest and key != "n"):
-                self._say(f"  not used: expected one of {', '.join(choices)}; try again")
+                terminal.show(f"  not used: expected one of {', '.join(choices)}; try again")
                 continue
             if key == "y":
                 return Allow(AllowScope.ONCE)
@@ -1205,15 +1328,15 @@ class TerminalResolver:
             if key == "c":
                 return Cancel()
             if not rest and DecisionKind.DENY not in offers:
-                self._say("  not used: say what the agent should do instead (n <text>)")
+                terminal.show("  not used: say what the agent should do instead (n <text>)")
                 continue
             if rest and DecisionKind.DENY_GUIDANCE not in offers:
-                self._say("  not used: this provider takes no guidance with a denial (n)")
+                terminal.show("  not used: this provider takes no guidance with a denial (n)")
                 continue
             try:
                 return Deny(rest or None)
             except InteractionDataError as exc:
-                self._say(f"  not used: {exc}; try again")
+                terminal.show(f"  not used: {exc}; try again")
 
 
 def _attach_terminal(engine: ControllerEngine) -> None:

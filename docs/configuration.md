@@ -575,7 +575,9 @@ below with its evidence.
   A failed ask ends the step with the phase unchanged. It is never
   corrected or relaunched as transient, because the agent would ask
   again. Change the policy, the tools or the task, then `resume`.
-  Ctrl-C at the prompt stops the step; it is not an answer.
+  Ctrl-C at the prompt stops the step; it is not an answer. Ctrl-S and
+  Ctrl-Q suspend nothing while it asks, and a terminal whose output is
+  suspended or not read never holds the wait past its limit.
 
 An SDK launch inherits exact names only. The allow-list's `*` prefixes are
 expanded, and every other provider's variables and every credential-shaped

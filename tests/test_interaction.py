@@ -1280,13 +1280,16 @@ def test_typed_text_past_a_bound_is_refused_whole_and_asked_again():
         ("n x\x04y\n", Deny("xy"), b"n xy"),
         ("\x04", Unavailable(UnavailableReason.END_OF_INPUT), b""),
         ("n a\x1bb\nc\n", Cancel(), b"n a^[b"),
+        ("n a\x11b\x13c\n", Deny("abc"), b"n abc"),
     ],
-    ids=["erase-wide", "backspace", "word-erase", "kill", "eof-within", "eof", "control"],
+    ids=["erase-wide", "backspace", "word-erase", "kill", "eof-within", "eof", "control", "flow"],
 )
 def test_the_terminal_resolver_edits_the_line_with_the_terminals_keys(typed, decision, echoed):
     """The terminal's erase (and backspace), word-erase, kill and end-of-file
     keys work as they do in canonical mode; a wide character is erased in
-    its two columns, and a control character is shown as ^X and refused."""
+    its two columns, and a control character is shown as ^X and refused.
+    The stop and start keys are never part of a line, as under IXON, and
+    the stop key suspends nothing: all of the line is echoed."""
     b, _ = broker()
     request = permission(b)
     session = _at_terminal(lambda r: r.resolve(request, FAR_REAL()), typed.encode())
@@ -1322,6 +1325,86 @@ def test_a_line_read_while_the_terminals_own_editing_came_back_on_is_refused():
     assert session.printed.count("line editing came back on") == 1
     assert len(session.modes) == 2 and not session.modes[1] & termios.ICANON
     assert session.restored
+
+
+def test_output_flow_control_that_came_back_on_is_taken_back_and_suspends_nothing():
+    """Another program's ``stty ixon`` while the resolver waits lets the stop
+    key suspend the terminal's output again (R3-F1): the resolver turns flow
+    control off at the next key it reads, which restarts the output, so what
+    it echoes is shown and the line, not cut, is taken."""
+
+    def at_prompt(slave: int, n: int) -> None:
+        if n == 1:
+            mode = termios.tcgetattr(slave)
+            mode[0] |= termios.IXON
+            termios.tcsetattr(slave, termios.TCSANOW, mode)
+
+    session = _at_terminal(_deliver(permission), b"\x13n tests only\n", at_prompt=at_prompt)
+    assert session.result == Deliver(Deny("tests only"))
+    assert b"n tests only" in session.shown and "came back on" not in session.printed
+    assert session.restored
+
+
+def test_the_resolver_reads_no_more_keys_while_the_terminal_does_not_take_its_output():
+    """What a terminal whose output is suspended has not taken stays bounded
+    (R3-F1): past _MAX_UNSHOWN_BYTES of echo the resolver reads no more keys,
+    so the answer typed after them is not taken and the wait ends at its
+    deadline. Each line below echoes 8000 bytes and its kill erases them in
+    24000 more."""
+
+    def at_prompt(slave: int, n: int) -> None:
+        termios.tcflow(slave, termios.TCOOFF)
+
+    b, _ = broker()
+    request = permission(b)
+    started = time.monotonic()
+    session = _at_terminal(
+        lambda r: r.resolve(request, started + 1.0),
+        (b"x" * 8000 + b"\x15") * 4 + b"y\n",
+        at_prompt=at_prompt,
+    )
+    assert session.result == Unavailable(UnavailableReason.EXPIRED)
+    assert time.monotonic() - started < 10 and session.restored
+
+
+def test_text_shown_on_another_suspended_terminal_never_holds_the_resolver():
+    """An output that is a terminal other than the one the resolver reads is
+    written to as it takes it as well (R3-F1): with its output suspended for
+    the whole wait, the resolver still asks again on an unusable line and
+    ends at its deadline."""
+    master, slave = pty.openpty()
+    out_master, out_slave = pty.openpty()
+    termios.tcflow(out_slave, termios.TCOOFF)
+    output = open(out_slave, "w", encoding="utf-8", closefd=False)
+    outcome: list = []
+
+    def type_once_taken_over() -> None:
+        give_up = time.monotonic() + 30
+        while termios.tcgetattr(slave)[3] & termios.ICANON and time.monotonic() < give_up:
+            time.sleep(0.01)
+        os.write(master, b"maybe\ny")
+
+    b, _ = broker()
+    request = permission(b)
+    typist = threading.Thread(target=type_once_taken_over, daemon=True)
+    resolver = TerminalResolver(input_fd=slave, output=output)
+    asker = threading.Thread(
+        target=lambda: outcome.append(resolver.resolve(request, time.monotonic() + 1.0)),
+        daemon=True,
+    )
+    try:
+        started = time.monotonic()
+        typist.start()
+        asker.start()
+        asker.join(15)
+        assert not asker.is_alive() and time.monotonic() - started < 10
+        assert outcome == [Unavailable(UnavailableReason.EXPIRED)]
+        typist.join(10)
+    finally:
+        termios.tcflow(out_slave, termios.TCOON)
+        output.close()
+        for fd in (master, slave, out_master, out_slave):
+            os.close(fd)
 
 
 def test_the_resolver_echoes_on_the_terminal_through_a_read_only_descriptor():
@@ -1411,6 +1494,90 @@ def test_ctrl_c_at_a_real_controlling_terminal_still_interrupts_and_settings_com
         os.close(master)
         os.close(slave)
     assert out == b"interrupted True\n", err
+
+
+_SUSPENDED_CHILD = """
+import json, sys, termios, time
+sys.path.insert(0, sys.argv[1])
+from autoforge.cli import TerminalResolver
+from autoforge.interaction import Capabilities, InteractionBroker, Unattended
+from autoforge.sdk_policy import InteractionSettings, input_digest
+
+broker = InteractionBroker(
+    InteractionSettings(policy="prompt"), Capabilities(live_permissions=True), Unattended()
+)
+request = broker.permission("toolu_01", "Bash", "command: make test", input_digest({}, "input"))
+before = termios.tcgetattr(0)
+started = time.monotonic()
+result = TerminalResolver().resolve(request, started + float(sys.argv[2]))
+print(json.dumps({"result": repr(result), "seconds": time.monotonic() - started,
+                  "restored": termios.tcgetattr(0) == before}), flush=True)
+"""
+
+
+@pytest.mark.parametrize(
+    "suspend, typed, wait, expected",
+    [
+        ("stop key", b"\x13y\r", 20.0, Allow(AllowScope.ONCE)),
+        ("stop key", b"\x13y", 1.0, Unavailable(UnavailableReason.EXPIRED)),
+        ("stop key before", b"y\r", 20.0, Allow(AllowScope.ONCE)),
+        ("tcflow", b"y\r", 20.0, Allow(AllowScope.ONCE)),
+        ("tcflow", b"maybe\ry", 1.0, Unavailable(UnavailableReason.EXPIRED)),
+    ],
+    ids=["stop-key-answer", "stop-key-expiry", "stopped-before", "tcflow-answer", "tcflow-expiry"],
+)
+def test_suspended_output_never_holds_the_resolver_past_its_deadline(
+    suspend, typed, wait, expected
+):
+    """R3-F1: a terminal whose output is suspended does not take a write, and
+    a blocking write waits until it resumes: the stop key (Ctrl-S under
+    IXON, a pseudo-terminal's default) typed after the prompt held the
+    resolver's echo, and so the resolver, past its deadline until Ctrl-Q.
+
+    At a real pseudo-terminal that is the resolver's stdin and its stderr,
+    as in the CLI: while the resolver reads, the stop and start keys are
+    taken as under IXON but suspend nothing, and output a stop key
+    suspended before it asked comes back. Output another program suspends
+    (``tcflow``) holds neither the echo nor the resolver's messages: an
+    answer is delivered at once, and without one the resolver ends at its
+    deadline. The terminal's settings come back either way."""
+    master, slave = pty.openpty()
+    src = Path(interaction_module.__file__).resolve().parents[1]
+    if suspend == "stop key before":
+        os.write(master, b"\x13")
+    child = subprocess.Popen(
+        [sys.executable, "-c", _SUSPENDED_CHILD, str(src), str(wait)],
+        stdin=slave,
+        stdout=subprocess.PIPE,
+        stderr=slave,
+        start_new_session=True,
+    )
+    shown = b""
+    try:
+        while not shown.endswith(b"choose y/s/n/c: "):
+            ready, _, _ = select.select([master], [], [], 30)
+            data = os.read(master, 4096) if ready else b""
+            assert data, shown
+            shown += data
+        if suspend == "tcflow":
+            termios.tcflow(slave, termios.TCOOFF)
+        os.write(master, typed)
+        out, _ = child.communicate(timeout=wait + 15)
+        termios.tcflow(slave, termios.TCOON)
+        while select.select([master], [], [], 0.2)[0]:
+            shown += os.read(master, 4096)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        os.close(master)
+        os.close(slave)
+    report = json.loads(out)
+    assert report["result"] == repr(expected)
+    assert report["seconds"] < (wait if isinstance(expected, Allow) else wait + 2)
+    assert report["restored"]
+    if suspend != "tcflow":
+        assert b"choose y/s/n/c: y" in shown and b"^S" not in shown
 
 
 def test_a_superscript_digit_then_a_valid_pick_at_a_real_terminal_is_delivered():

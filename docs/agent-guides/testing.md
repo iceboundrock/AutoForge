@@ -1378,6 +1378,16 @@ their own boundaries (`tests/test_interaction.py`). Keep covered:
   word-erase, kill and end-of-file keys work, the echo goes to the
   terminal and never to stderr, and the settings come back on an answer,
   an expiry, an exception and a real Ctrl-C at the controlling terminal;
+- no terminal write holds the resolver past its deadline: output flow
+  control is off while it reads, so the stop and start keys are never part
+  of a line and suspend nothing (also when IXON comes back on mid-wait),
+  and output a stop key suspended before it asked comes back. Output
+  another program suspends (`tcflow`), on the terminal it reads or another
+  one it writes to, holds neither the echo nor its messages: an answer is
+  delivered at once, without one the wait ends at its deadline, and past
+  `_MAX_UNSHOWN_BYTES` not taken it reads no more keys. The stop-key and
+  `tcflow` cases run in a child process whose stdin and stderr are one
+  real pseudo-terminal, as in the CLI;
 - the engine: `InteractionRequiredError` with the phase unchanged, one
   launch despite corrections and a transient report, a resolver asked
   under the repository lock, a broker per launch, a claimed pause with
