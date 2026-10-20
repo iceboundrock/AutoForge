@@ -34,8 +34,9 @@ mints each provider ask through it (:meth:`InteractionBroker.question`,
 policy (D7.1), the per-wait and aggregate limits (D7.3), the degradation of
 a live wait (D7.4), the capability check (a decision the provider cannot
 carry is never offered, and never delivered) and a bounded, redacted record
-of each request for the run log. It never sees a provider record, and the
-adapter never sees the policy.
+of the requests for the run log: one entry per request up to the aggregate
+limit and the first one past it, and a count of all. It never sees a
+provider record, and the adapter never sees the policy.
 
 What this module is not (D5.4): a transport. It carries decisions, never
 bytes, starts no process, reads no file and names no provider, SDK or wire
@@ -61,11 +62,13 @@ broker never answers :class:`Pause`, and config validation refuses
 from __future__ import annotations
 
 import enum
+import json
 import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Protocol
 
 from .errors import InteractionDataError
@@ -80,6 +83,7 @@ from .sdk_policy import (
     MAX_SHOWN_CHARS,
     MAX_TOOL_NAME_CHARS,
     InteractionSettings,
+    canonical_json,
     exact_input,
     exact_text,
     question_options,
@@ -363,11 +367,37 @@ class AllowScope(enum.StrEnum):
     SESSION = "session"
 
 
+def _frozen(value: object) -> object:
+    """A parsed JSON ``value`` with every object read-only and every array a tuple."""
+    if isinstance(value, dict):
+        return MappingProxyType({key: _frozen(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_frozen(item) for item in value)
+    return value
+
+
+def _thawed(value: object) -> object:
+    """``value`` with every mapping a new dict and every sequence but a string
+    a new list, sharing no container with it."""
+    if isinstance(value, Mapping):
+        return {key: _thawed(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thawed(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class Allow:
     """Approve the tool call, ``once`` or for the ``session``; with
     ``updated_input``, the call runs on that input instead, sent back
-    exactly as validated (:func:`autoforge.sdk_policy.exact_input`)."""
+    exactly as validated (:func:`autoforge.sdk_policy.exact_input`).
+
+    ``updated_input`` is kept as a read-only snapshot of the whole input,
+    nested values included, taken through its canonical JSON when the
+    decision is built: the snapshot is what is validated, and an adapter
+    sends :meth:`input_to_send`, a copy of it. Changing the caller's object
+    afterwards changes nothing the decision carries.
+    """
 
     scope: AllowScope = AllowScope.ONCE
     updated_input: Mapping[str, object] | None = None
@@ -380,7 +410,18 @@ class Allow:
         if self.updated_input is not None:
             if not isinstance(self.updated_input, Mapping):
                 raise InteractionDataError("a modified input is not an object")
-            exact_input(dict(self.updated_input), "a modified input")
+            snapshot = json.loads(canonical_json(_thawed(self.updated_input)))
+            exact_input(snapshot, "a modified input")
+            object.__setattr__(self, "updated_input", _frozen(snapshot))
+
+    def input_to_send(self) -> dict[str, object] | None:
+        """The modified input as a new plain JSON object, equal to the snapshot
+        validated, or ``None``: what an adapter sends, and all it sends."""
+        if self.updated_input is None:
+            return None
+        snapshot = _thawed(self.updated_input)
+        assert isinstance(snapshot, dict)
+        return snapshot
 
 
 @dataclass(frozen=True)
@@ -789,13 +830,17 @@ class InteractionBroker:
         # The requests minted and not yet handled, by id: a request is
         # handled once, and only as it was minted.
         self._open: dict[str, InteractionRequest] = {}
+        self._handled = 0
+        # What the run log keeps: the requests up to the aggregate limit and
+        # the first one past it. A provider that keeps asking after that is
+        # failed all the same and only counted, so the record stays bounded.
         self._entries: list[_Entry] = []
         self._ended: Pause | Fail | None = None
 
     @property
     def handled(self) -> int:
         """How many requests :meth:`handle` took, answered or not."""
-        return len(self._entries)
+        return self._handled
 
     @property
     def ended(self) -> Pause | Fail | None:
@@ -880,8 +925,10 @@ class InteractionBroker:
         """The directive for ``request``. ``invocation_due`` is when the
         invocation's limit falls due (``DuplexChild.limit_due()``)."""
         with self._lock:
+            self._handled += 1
             entry = _Entry(request if isinstance(request, InteractionRequest) else None)
-            self._entries.append(entry)
+            if len(self._entries) <= self._max_interactions:
+                self._entries.append(entry)
             directive = self._decide(request, invocation_due, entry)
             if isinstance(directive, Deliver):
                 entry.directive = "deliver"
@@ -913,7 +960,7 @@ class InteractionBroker:
             )
         if self._ended is not None:
             return Fail(f"{asked} after an earlier request ended this invocation's interactions")
-        if len(self._entries) > self._max_interactions:
+        if self._handled > self._max_interactions:
             return Fail(
                 f"interaction limit reached: {asked} past the {self._max_interactions} an "
                 "invocation may make (max_interactions)"
@@ -965,15 +1012,16 @@ class InteractionBroker:
 
     def record(self) -> dict[str, object]:
         """A bounded, redacted account of the launch's requests for the run
-        log: the policy, its limits and, per request, its id, kind, what was
-        asked, the offers, the directive, the kinds of decision delivered,
-        a fail reason and how long the wait took. Never an answer's text,
-        guidance or a modified input."""
+        log: the policy, its limits, how many requests were handled and, per
+        request up to ``max_interactions`` and the first one past it, its
+        id, kind, what was asked, the offers, the directive, the kinds of
+        decision delivered, a fail reason and how long the wait took. Never
+        an answer's text, guidance or a modified input."""
         with self._lock:
             return {
                 "policy": str(self._policy),
                 "max_wait_seconds": self._max_wait,
                 "max_interactions": self._max_interactions,
-                "handled": len(self._entries),
+                "handled": self._handled,
                 "requests": [entry.record() for entry in self._entries],
             }

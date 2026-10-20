@@ -1356,7 +1356,12 @@ their own boundaries (`tests/test_interaction.py`). Keep covered:
   An expiry the invocation's limit caused is never a pause, a pause needs
   both `pause_available` and the kind's capability, a request is handled
   once and only as it was minted, and Ctrl-C propagates;
-- the run-log record keeps no answer text, guidance or modified input;
+- the run-log record keeps no answer text, guidance or modified input, and
+  no more than `max_interactions` entries and the first one past them, however
+  often a provider asks after its interactions ended;
+- a modified input is a read-only snapshot of what was validated: changing
+  the caller's object, or what was sent, afterwards never changes what an
+  adapter sends;
 - one Claude-shaped and one OpenCode-shaped question payload become equal
   requests with one rendering, and the answer maps back to each shape;
 - `interaction.py` imports only the standard library, the errors and the

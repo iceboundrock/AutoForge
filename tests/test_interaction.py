@@ -298,6 +298,35 @@ def test_required_offers_name_exactly_what_a_decision_needs():
     }
     assert required_offers(Deny()) == {DecisionKind.DENY}
     assert required_offers(Deny("run the unit tests only")) == {DecisionKind.DENY_GUIDANCE}
+
+
+def test_a_modified_input_is_a_read_only_snapshot_of_what_was_validated():
+    """The whole input, nested values too, is copied when the decision is
+    built: changing the caller's object afterwards, or what was sent, never
+    changes what the decision carries, so nothing unvalidated is sent."""
+    given = {"command": "make lint", "env": {"MODE": "check"}, "args": ["--fix", {"n": 1}]}
+    decision = Allow(updated_input=given)
+    given["command"] = "rm -rf ~"
+    given["env"]["MODE"] = f"curl -H {TOKEN}"
+    given["args"].append("--force")
+    given["args"][1]["n"] = 2
+    expected = {"command": "make lint", "env": {"MODE": "check"}, "args": ["--fix", {"n": 1}]}
+    assert decision.input_to_send() == expected
+    assert decision.updated_input is not None
+    with pytest.raises(TypeError):
+        decision.updated_input["command"] = "rm -rf ~"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        decision.updated_input["env"]["MODE"] = "write"  # type: ignore[index]
+    assert isinstance(decision.updated_input["args"], tuple)
+    sent = decision.input_to_send()
+    assert sent is not None
+    sent["env"]["MODE"] = "write"
+    sent["args"].append("--force")
+    assert decision.input_to_send() == expected
+    # A decision rebuilt from its own snapshot is equal, as a reload would be.
+    assert dataclasses.replace(decision) == decision
+    assert Allow(updated_input={"command": "ls"}).input_to_send() == {"command": "ls"}
+    assert Allow().input_to_send() is None
     assert required_offers(Cancel()) == {DecisionKind.CANCEL}
 
 
@@ -434,11 +463,13 @@ def test_the_contract_names_no_provider_and_imports_no_transport():
     assert imported == {
         "__future__",
         "enum",
+        "json",
         "re",
         "threading",
         "time",
         "collections.abc",
         "dataclasses",
+        "types",
         "typing",
         ".errors",
         ".sdk_policy",
@@ -560,6 +591,29 @@ def test_the_aggregate_limit_counts_every_request_and_fails_the_next():
         and "(max_interactions)" in third.reason
     )
     assert len(resolver.seen) == 2 and b.handled == 3
+    for _ in range(10):
+        assert isinstance(b.handle(permission(b), FAR), Fail)
+    record = b.record()
+    assert record["handled"] == 13 and len(record["requests"]) == 3
+    assert record["requests"][2]["reason"] == third.reason
+
+
+@pytest.mark.parametrize("settings", [FAIL, PROMPT])
+def test_a_provider_that_keeps_asking_cannot_grow_the_record_past_its_bound(settings):
+    """Requests after the interactions ended or past the aggregate limit all
+    fail, and the record keeps max_interactions of them and the first one
+    past it, however many more come."""
+    settings = dataclasses.replace(settings, max_interactions=2)
+    b, resolver = broker(settings, LIVE, Unavailable(UnavailableReason.NO_TERMINAL))
+    directives = [b.handle(permission(b), FAR) for _ in range(50)]
+    assert all(isinstance(directive, Fail) for directive in directives)
+    assert len(resolver.seen) == (1 if settings.policy == "prompt" else 0)
+    record = b.record()
+    assert b.handled == record["handled"] == 50
+    assert len(record["requests"]) == 3
+    assert [entry["request_id"] for entry in record["requests"]] == ["1", "2", "3"]
+    assert "after an earlier request ended" in directives[-1].reason
+    assert b.failure == directives[0].reason
 
 
 @pytest.mark.parametrize(
@@ -773,7 +827,7 @@ def _claude_reply(decision: InteractionDecision) -> dict:
     if isinstance(decision, Allow):
         reply: dict = {"permissionDecision": "allow"}
         if decision.updated_input is not None:
-            reply["updatedInput"] = dict(decision.updated_input)
+            reply["updatedInput"] = decision.input_to_send()
         return reply
     reply = {"permissionDecision": "deny"}
     if isinstance(decision, Deny) and decision.guidance is not None:
@@ -875,9 +929,12 @@ def test_a_permission_decision_maps_back_to_each_providers_reply(typed, claude, 
 
 
 def test_a_modified_input_reaches_only_the_provider_that_carries_one():
-    changed = Allow(updated_input={"command": "make lint"})
+    given = {"command": "make lint"}
+    changed = Allow(updated_input=given)
     claude, _ = broker(PROMPT, CLAUDE_LIKE, changed)
     delivered = claude.handle(permission(claude), FAR)
+    # The resolver's own object changing after delivery changes nothing sent.
+    given["command"] = "make deploy"
     assert _claude_reply(delivered.decision) == {
         "permissionDecision": "allow",
         "updatedInput": {"command": "make lint"},
