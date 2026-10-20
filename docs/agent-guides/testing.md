@@ -1388,6 +1388,15 @@ their own boundaries (`tests/test_interaction.py`). Keep covered:
   `_MAX_UNSHOWN_BYTES` not taken it reads no more keys. The stop-key and
   `tcflow` cases run in a child process whose stdin and stderr are one
   real pseudo-terminal, as in the CLI;
+- no write to a redirected stderr holds the resolver past its deadline:
+  an output that is not a terminal is never written to, and the request
+  is shown on the terminal it reads instead (also with no stderr at all,
+  never on stdout; nothing is asked when there is no terminal to show it
+  on). In a child process whose stdin is a
+  real pseudo-terminal and whose stderr is a full pipe no one reads, an
+  answer is delivered at once, a line it cannot use is explained on the
+  terminal, without an answer the wait ends at its deadline, nothing
+  reaches the pipe, and the terminal's settings come back;
 - the engine: `InteractionRequiredError` with the phase unchanged, one
   launch despite corrections and a transient report, a resolver asked
   under the repository lock, a broker per launch, a claimed pause with

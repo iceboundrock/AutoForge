@@ -29,6 +29,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
@@ -900,22 +901,64 @@ def _line_editing(fd: int) -> Iterator[_LineEditing | None]:
         writer.close()
 
 
-@contextmanager
-def _shown_on(output: TextIO, editing: _LineEditing | None) -> Iterator[_TerminalWriter | None]:
-    """The writer the resolver shows its text on ``output`` through when that
-    is a terminal: the echo's when it is the terminal the resolver reads,
-    so that the two keep their order. ``None`` for an output that is not a
-    terminal, printed to as before."""
+def _in_memory(output: TextIO | None) -> bool:
+    """Whether ``output`` is a stream without a descriptor (a StringIO),
+    whose writes never wait. ``None`` is no stream at all: Python's stderr
+    when its descriptor was closed at startup; a closed stream is none
+    either."""
+    if output is None:
+        return False
+    try:
+        output.fileno()
+    except (AttributeError, io.UnsupportedOperation):
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _terminal_fd(output: TextIO | None) -> int | None:
+    """The descriptor ``output`` writes to when that is a terminal."""
+    if output is None:
+        return None
     try:
         fd = output.fileno()
-    except (AttributeError, OSError, ValueError):  # a StringIO has none
-        fd = None
-    if fd is None or not os.isatty(fd):
+    except (AttributeError, OSError, ValueError):
+        return None
+    return fd if os.isatty(fd) else None
+
+
+def _can_show(output: TextIO | None, editing: _LineEditing | None) -> bool:
+    """Whether the resolver has somewhere to show its text that no write
+    holds past the deadline (:func:`_shown_on`)."""
+    return editing is not None or _in_memory(output) or _terminal_fd(output) is not None
+
+
+@contextmanager
+def _shown_on(
+    output: TextIO | None, editing: _LineEditing | None
+) -> Iterator[_TerminalWriter | None]:
+    """The writer the resolver shows its text through, so that no write holds
+    it past the deadline (R4-F1).
+
+    An ``output`` that is a terminal is written to as it takes it: through
+    the echo's writer when it is the terminal the resolver reads, so that
+    the two keep their order. Any other output (stderr redirected to a
+    pipe, a file or a socket: ``2>log``, ``2>&1 | tee log``; or closed) is
+    never written to, since a pipe no one reads holds a blocking write
+    until it is read: the text is shown on the terminal the resolver reads
+    instead, where the answer is typed, as ``getpass`` does. ``None`` for
+    an in-memory stream, printed to as before. Entered only when
+    :func:`_can_show`: with no terminal to show the text on instead, the
+    resolver asks nothing."""
+    if _in_memory(output):
         yield None
         return
-    if editing is not None and os.fstat(fd).st_rdev == editing.writer.device:
+    fd = _terminal_fd(output)
+    if editing is not None and (fd is None or os.fstat(fd).st_rdev == editing.writer.device):
         yield editing.writer
         return
+    assert fd is not None  # _can_show
     writer = _TerminalWriter(fd)
     try:
         yield writer
@@ -966,11 +1009,11 @@ class _Terminal:
     is neither kept nor echoed (the bell rings once), and the kill key
     starts the line again.
 
-    What the resolver writes to a terminal, its echo and, when ``output``
-    is a terminal (``shown``), its text, goes through a
-    :class:`_TerminalWriter`: what the terminal has not taken is written
-    while a line is awaited, and a terminal whose output is suspended never
-    holds the resolver past the deadline. While more than
+    What the resolver writes to a terminal, its echo and, unless ``output``
+    is an in-memory stream (``shown``, :func:`_shown_on`), its text, goes
+    through a :class:`_TerminalWriter`: what the terminal has not taken is
+    written while a line is awaited, and a terminal whose output is
+    suspended never holds the resolver past the deadline. While more than
     :data:`_MAX_UNSHOWN_BYTES` wait, no key is read.
     """
 
@@ -1002,8 +1045,8 @@ class _Terminal:
         self._partial = b""
 
     def show(self, text: str, end: str = "\n") -> None:
-        if self._shown is None:
-            print(text, end=end, file=self._output or sys.stderr, flush=True)
+        if self._shown is None:  # an in-memory stream (_shown_on)
+            print(text, end=end, file=self._output, flush=True)
             return
         encoding = getattr(self._output, "encoding", None) or "utf-8"
         self._shown.write((text + end).encode(encoding, "backslashreplace"))
@@ -1138,18 +1181,22 @@ class TerminalResolver:
     """Asks the operator at this terminal (ADR 0007 D5.1, D7.4, D7.7; #134).
 
     The engine's resolver for a real ``run``, ``local run``, ``step`` and
-    ``resume``. It reads stdin and writes to stderr, where the live progress
-    is; stdout stays the step outcomes'. Before it asks it checks that stdin
-    is a terminal (D7.4) and drops anything typed ahead. While it asks it
-    edits the line itself, since the terminal's own line editing would drop
-    what is typed past its buffer without a word (:func:`_line_editing`):
-    an answer reaches the agent whole or is refused. Each line is read
-    until the deadline the broker gives: its expiry is ``expired``, the end
-    of the input ``end_of_input``, and the broker decides what either means.
+    ``resume``. It reads stdin and shows the request on stderr, where the
+    live progress is, when stderr is a terminal; stdout stays the step
+    outcomes'. A redirected stderr (a pipe, a file) or none at all is never
+    written to: the request is shown on the terminal it reads instead
+    (:func:`_shown_on`). Before it asks it checks that stdin is a terminal
+    (D7.4) and drops anything typed ahead. While it asks it edits the line
+    itself, since the terminal's own line editing would drop what is typed
+    past its buffer without a word (:func:`_line_editing`): an answer
+    reaches the agent whole or is refused. Each line is read until the
+    deadline the broker gives: its expiry is ``expired``, the end of the
+    input ``end_of_input``, and the broker decides what either means.
     No write holds it past that deadline: the stop key suspends nothing
-    while it reads, and it writes to a terminal only as the terminal takes
-    it (:class:`_TerminalWriter`), so a terminal whose output is suspended
-    or unread neither holds a decision back nor keeps the wait open.
+    while it reads, it writes to a terminal only as the terminal takes it
+    (:class:`_TerminalWriter`), so a terminal whose output is suspended or
+    unread neither holds a decision back nor keeps the wait open, and it
+    writes to no pipe, which a reader that stopped reading would hold.
     Ctrl-C raises ``KeyboardInterrupt`` as anywhere else: the step is
     interrupted and nothing is decided (D7.7). An input it cannot use is
     explained, by rule and never by value, and asked again within the same
@@ -1181,9 +1228,12 @@ class TerminalResolver:
             return Unavailable(UnavailableReason.NO_TERMINAL)
         _discard_typeahead(fd)
         output = self._output or sys.stderr
-        with _line_editing(fd) as editing, _shown_on(output, editing) as shown:
-            terminal = _Terminal(fd, self._clock, deadline, editing, output, shown)
-            return self._resolve(request, terminal)
+        with _line_editing(fd) as editing:
+            if not _can_show(output, editing):
+                return Unavailable(UnavailableReason.NO_TERMINAL)
+            with _shown_on(output, editing) as shown:
+                terminal = _Terminal(fd, self._clock, deadline, editing, output, shown)
+                return self._resolve(request, terminal)
 
     # -- internals -------------------------------------------------------------
     def _resolve(

@@ -577,7 +577,10 @@ below with its evidence.
   again. Change the policy, the tools or the task, then `resume`.
   Ctrl-C at the prompt stops the step; it is not an answer. Ctrl-S and
   Ctrl-Q suspend nothing while it asks, and a terminal whose output is
-  suspended or not read never holds the wait past its limit.
+  suspended or not read never holds the wait past its limit. With stderr
+  redirected (`2>run.log`, `2>&1 | tee run.log`) the question is shown on
+  the terminal the answer is typed at, never in the redirected output, so
+  a pipe that is not read never holds the wait either.
 
 An SDK launch inherits exact names only. The allow-list's `*` prefixes are
 expanded, and every other provider's variables and every credential-shaped

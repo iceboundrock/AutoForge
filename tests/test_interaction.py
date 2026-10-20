@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import fcntl
 import io
 import json
 import os
@@ -1002,6 +1003,28 @@ def test_the_terminal_resolver_asks_nothing_without_a_terminal():
         assert out.getvalue() == "" and os.read(fd, 10) == b"y\n"
 
 
+def test_the_terminal_resolver_never_writes_to_an_output_that_is_not_a_terminal():
+    """R4-F1: a pipe no one reads holds a blocking write until it is read, so
+    an output that is not a terminal is never written to; the request is
+    shown on the terminal the resolver reads instead. With no terminal to
+    show it on (stdin taken for a terminal it is not), nothing is asked."""
+    b, _ = broker()
+    r, w = os.pipe()
+    try:
+        with _pipe(b"y\n") as (fd, _), open(w, "w", closefd=False) as output:
+            resolver = TerminalResolver(input_fd=fd, output=output, is_terminal=_tty)
+            assert resolver.resolve(permission(b), FAR_REAL()) == Unavailable(
+                UnavailableReason.NO_TERMINAL
+            )
+        os.close(w)
+        w = -1
+        assert _drained(r) == b""
+    finally:
+        os.close(r)
+        if w != -1:
+            os.close(w)
+
+
 @pytest.mark.parametrize(
     "typed, decision",
     [
@@ -1407,6 +1430,46 @@ def test_text_shown_on_another_suspended_terminal_never_holds_the_resolver():
             os.close(fd)
 
 
+@pytest.mark.parametrize("stderr", ["none", "closed"])
+def test_without_a_stderr_the_request_is_shown_on_the_terminal_and_never_on_stdout(
+    monkeypatch, tmp_path, stderr
+):
+    """R4-F1: Python's stderr is ``None`` when its descriptor was closed at
+    startup (``2>&-``), and ``print(file=None)`` writes to stdout, which a
+    script may read through a pipe; a closed stream takes no write at all.
+    The request is shown on the terminal the resolver reads instead."""
+    master, slave = pty.openpty()
+    closed = None
+    if stderr == "closed":
+        closed = open(tmp_path / "stderr", "w", encoding="utf-8")
+        closed.close()
+    shown = bytearray()
+
+    def answer_once_asked() -> None:
+        give_up = time.monotonic() + 30
+        while b"choose y/s/n/c: " not in shown and time.monotonic() < give_up:
+            if select.select([master], [], [], 0.05)[0]:
+                shown.extend(os.read(master, 4096))
+        os.write(master, b"y\r")
+
+    b, _ = broker()
+    request = permission(b)
+    typist = threading.Thread(target=answer_once_asked, daemon=True)
+    stdout = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", closed)
+    try:
+        typist.start()
+        result = TerminalResolver(input_fd=slave).resolve(request, FAR_REAL())
+        typist.join(10)
+    finally:
+        os.close(slave)
+        os.close(master)
+    assert result == Allow(AllowScope.ONCE)
+    assert b"asks permission to use Bash" in shown
+    assert stdout.getvalue() == ""
+
+
 def test_the_resolver_echoes_on_the_terminal_through_a_read_only_descriptor():
     """A terminal read through a read-only descriptor is still echoed on,
     through its device opened to write."""
@@ -1467,7 +1530,8 @@ except KeyboardInterrupt:
 def test_ctrl_c_at_a_real_controlling_terminal_still_interrupts_and_settings_come_back():
     """D7.7 with the resolver's own line editing: ISIG stays on, so Ctrl-C at
     the controlling terminal still raises KeyboardInterrupt (the broker
-    decides nothing), and the terminal's settings are restored."""
+    decides nothing), and the terminal's settings are restored. The child's
+    stderr is a pipe, so the request is shown on the terminal (R4-F1)."""
     master, slave = pty.openpty()
     src = Path(interaction_module.__file__).resolve().parents[1]
     child = subprocess.Popen(
@@ -1478,13 +1542,12 @@ def test_ctrl_c_at_a_real_controlling_terminal_still_interrupts_and_settings_com
         start_new_session=True,
     )
     try:
-        assert child.stderr is not None
-        printed = b""
-        while b"choose" not in printed:
-            ready, _, _ = select.select([child.stderr], [], [], 30)
-            data = os.read(child.stderr.fileno(), 4096) if ready else b""
-            assert data, printed
-            printed += data
+        shown = b""
+        while b"choose" not in shown:
+            ready, _, _ = select.select([master], [], [], 30)
+            data = os.read(master, 4096) if ready else b""
+            assert data, shown
+            shown += data
         os.write(master, b"n half an answ\x03")
         out, err = child.communicate(timeout=30)
     finally:
@@ -1494,9 +1557,10 @@ def test_ctrl_c_at_a_real_controlling_terminal_still_interrupts_and_settings_com
         os.close(master)
         os.close(slave)
     assert out == b"interrupted True\n", err
+    assert b"choose" not in err
 
 
-_SUSPENDED_CHILD = """
+_DEADLINE_CHILD = """
 import json, sys, termios, time
 sys.path.insert(0, sys.argv[1])
 from autoforge.cli import TerminalResolver
@@ -1546,7 +1610,7 @@ def test_suspended_output_never_holds_the_resolver_past_its_deadline(
     if suspend == "stop key before":
         os.write(master, b"\x13")
     child = subprocess.Popen(
-        [sys.executable, "-c", _SUSPENDED_CHILD, str(src), str(wait)],
+        [sys.executable, "-c", _DEADLINE_CHILD, str(src), str(wait)],
         stdin=slave,
         stdout=subprocess.PIPE,
         stderr=slave,
@@ -1578,6 +1642,95 @@ def test_suspended_output_never_holds_the_resolver_past_its_deadline(
     assert report["restored"]
     if suspend != "tcflow":
         assert b"choose y/s/n/c: y" in shown and b"^S" not in shown
+
+
+def _full_pipe() -> tuple[int, int, int]:
+    """A pipe whose buffer is full and whose write end blocks again, so that a
+    write to it waits until the pipe is read: its read and write ends and
+    the bytes that fill it."""
+    r, w = os.pipe()
+    flags = fcntl.fcntl(w, fcntl.F_GETFL)
+    fcntl.fcntl(w, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    filled = 0
+    for size in (65536, 1):
+        try:
+            while True:
+                filled += os.write(w, b"x" * size)
+        except BlockingIOError:
+            pass
+    fcntl.fcntl(w, fcntl.F_SETFL, flags)
+    return r, w, filled
+
+
+def _drained(fd: int) -> bytes:
+    """Everything left in the pipe ``fd`` once its write ends are closed."""
+    data = b""
+    while chunk := os.read(fd, 65536):
+        data += chunk
+    return data
+
+
+@pytest.mark.parametrize(
+    "typed, wait, expected",
+    [
+        (b"y\r", 20.0, Allow(AllowScope.ONCE)),
+        (b"maybe\r", 1.0, Unavailable(UnavailableReason.EXPIRED)),
+        (b"", 0.2, Unavailable(UnavailableReason.EXPIRED)),
+    ],
+    ids=["answer", "unusable-then-expiry", "expiry"],
+)
+def test_a_full_redirected_stderr_never_holds_the_resolver_past_its_deadline(typed, wait, expected):
+    """R4-F1: a write to a pipe that is full blocks until the pipe is read.
+    With stdin a real pseudo-terminal and stderr redirected to a full pipe
+    no one reads (``2>&1 | tee``, its reader stopped), the resolver printed
+    its request there and stayed past a 0.2-second deadline until the pipe
+    was drained.
+
+    A redirected stderr is never written to: the request is shown on the
+    terminal the resolver reads, where the answer is typed. An answer is
+    delivered at once, a line it cannot use is explained there, without an
+    answer the wait ends at its deadline, nothing reaches the pipe, and the
+    terminal's settings come back."""
+    master, slave = pty.openpty()
+    src = Path(interaction_module.__file__).resolve().parents[1]
+    r, w, filled = _full_pipe()
+    try:
+        child = subprocess.Popen(
+            [sys.executable, "-c", _DEADLINE_CHILD, str(src), str(wait)],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=w,
+            start_new_session=True,
+        )
+    finally:
+        os.close(w)
+    shown = b""
+    try:
+        while not shown.endswith(b"choose y/s/n/c: "):
+            ready, _, _ = select.select([master], [], [], 30)
+            data = os.read(master, 4096) if ready else b""
+            assert data, shown
+            shown += data
+        os.write(master, typed)
+        out, _ = child.communicate(timeout=wait + 15)
+        while select.select([master], [], [], 0.2)[0]:
+            shown += os.read(master, 4096)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        os.close(master)
+        os.close(slave)
+        redirected = _drained(r)
+        os.close(r)
+    report = json.loads(out)
+    assert report["result"] == repr(expected)
+    assert report["seconds"] < (wait if isinstance(expected, Allow) else wait + 2)
+    assert report["restored"]
+    assert redirected == b"x" * filled
+    assert b"asks permission to use Bash" in shown
+    if typed == b"maybe\r":
+        assert b"not used: expected one of y, s, n, c" in shown
 
 
 def test_a_superscript_digit_then_a_valid_pick_at_a_real_terminal_is_delivered():
