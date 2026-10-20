@@ -85,7 +85,13 @@ REPO_ID = 4242
 EPIC = f"https://github.com/{R}/issues/1"
 BOOTSTRAP = Path(__file__).with_name("scheduler_worker.py")
 SRC = Path(__file__).resolve().parents[1] / "src" / "autoforge"
-SCHEDULER_MODULES = ("scheduler.py", "worker.py", "executor_supervised.py", "scheduler_stop.py")
+SCHEDULER_MODULES = (
+    "scheduler.py",
+    "worker.py",
+    "executor_supervised.py",
+    "scheduler_stop.py",
+    "epic_commands.py",
+)
 DEADLINE = 120.0
 
 

@@ -94,7 +94,16 @@ read it before adding tests for a listed area.
   steps (`implement`, `review`, `blocked`, `garbage`, `hold`; a step's
   `started` and `gate` files are the synchronization). In-process patches
   of a test never reach a worker: what a worker must see goes in its
-  fixture or the configuration file.
+  fixture or the configuration file. A fixture's `world` file keeps its
+  FakeGitHub across worker processes (saved after every call, so a killed
+  worker leaves what GitHub would hold), and its `gh_crash` kills the worker
+  right after one GitHub call (#183).
+- `tests/epic_cli.py` runs `autoforge.cli.main` in a process of its own for
+  `tests/test_epic_recovery.py` (#183): the graph is the test's pickled
+  `Graph`, the workers are `tests/scheduler_worker.py`, and each `crashes`
+  entry SIGKILLs that process once, before or after a named call
+  (`module:attribute`, or `spawn`), so a scheduler or `epic archive` dies at
+  an exact ADR 0008 D14.5 window while its workers live on.
 - `tests/pi_fake.py` holds the engine-level Pi harness: `PiFake` (a fake
   `pi` executable outside the repository that logs every start, argv, cwd,
   environment name and RPC record) and `ScriptedPi` (the real
@@ -175,6 +184,12 @@ workers (#182)                        BLOCKED, failing and READY_FOR_MERGE worke
                                       test_executor_supervised.py, test_scheduler_stop.py; the
                                       engine's hooks: test_engine_locking.py; scheduler keys:
                                       test_config.py
+`epic` commands and end-to-end        test_epic_commands.py (run, resume, status categories and
+recovery (#183)                       JSON keys, stop, archive, dry run, --force, exit codes, GitHub
+                                      changes between ticks, standalone guards, LOCAL, no merge;
+                                      the scheduler in process), test_epic_recovery.py (every
+                                      D14.5 crash window by SIGKILL of a real scheduler, worker or
+                                      archive; tests/epic_cli.py); doctor --epic: test_doctor.py
 REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.py; load and
                                       protocol: test_state.py)
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py

@@ -32,6 +32,15 @@ wget's configuration and zsh's startup files need no check: a launch's
 curl, wget and zsh read the controller's empty ones instead. The
 ``origin`` URL is shown redacted.
 
+Every run shows the parallel EPIC scheduler's settings (``scheduler.*``,
+bounded by the configuration loader). ``doctor --epic <url>`` adds the
+scheduler's own checks (ADR 0008, #183): the coordination root (the git
+common dir) is on a filesystem whose ``flock`` is a local kernel lock
+(:func:`autoforge.locking.check_local_lock_filesystem`); the scheduler root
+is absent or a real directory owned by this user and not world-writable
+(``lstat`` only); and ``gh`` can read the EPIC's sub-issues and
+dependencies (#179's snapshot, its four reads). They create nothing.
+
 ``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
 status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
 credentials must pass it, so the checks it omits are omitted entirely rather
@@ -43,6 +52,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,14 +65,25 @@ from .child_env import (
     isolated_overrides,
     preflight,
 )
-from .config import AutoForgeConfig, ProfileConfig, load_config_file, validate_required_profiles
+from .config import (
+    MAX_PARALLEL_BOUNDS,
+    POLL_INTERVAL_BOUNDS,
+    STOP_GRACE_BOUNDS,
+    AutoForgeConfig,
+    ProfileConfig,
+    load_config_file,
+    validate_required_profiles,
+)
 from .config_fingerprint import fingerprint_routing
+from .epic_graph import build_epic_snapshot, evaluate, ready_set
 from .errors import (
     ConfigurationError,
     ExecutionError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    LockError,
+    SnapshotRefused,
     StateError,
 )
 from .executor import ExecutionRequest, ExecutionResult, execute
@@ -73,6 +94,7 @@ from .github import (
     parse_gh_version,
 )
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
+from .locking import check_local_lock_filesystem, repository_lock_path
 from .profiles import REQUIRED_PROFILES, local_required_profiles
 from .providers import (
     CLAUDE_ISOLATION_FLAGS,
@@ -88,8 +110,9 @@ from .providers import (
     parse_pi_version,
 )
 from .redaction import redact, redact_argv
+from .run_namespace import AUTOFORGE_DIRNAME, SCHEDULER_DIRNAME
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
-from .validation import parse_remote_repository
+from .validation import parse_issue_url, parse_remote_repository
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 # A fixed list of required profile names, or a function of the loaded config.
@@ -140,8 +163,11 @@ class Doctor:
         cwd: str | None = None,
         runner: Runner | None = None,
         timeout_seconds: int = 30,
+        epic_url: str | None = None,
     ) -> None:
         self.config_path = config_path
+        # ``doctor --epic``: the EPIC whose graph the scheduler rows read.
+        self.epic_url = epic_url
         self.state_dir = state_dir
         self.cwd = cwd or os.getcwd()
         self._runner: Runner = runner or execute
@@ -1056,6 +1082,107 @@ class Doctor:
             self.check_loop_detection(cfg),
         ]
 
+    # -- the parallel EPIC scheduler (ADR 0008, #183) -------------------------------
+    def check_scheduler_settings(self) -> CheckResult:
+        """``scheduler.*`` as a scheduler would run with them; the loader enforces the bounds."""
+        name = "scheduler settings"
+        cfg = self.config
+        if cfg is None:
+            return CheckResult.skip(name, "(config check failed)")
+        settings = cfg.scheduler
+        values = (
+            ("max_parallel", settings.max_parallel, MAX_PARALLEL_BOUNDS),
+            ("poll_interval_seconds", settings.poll_interval_seconds, POLL_INTERVAL_BOUNDS),
+            ("stop_grace_seconds", settings.stop_grace_seconds, STOP_GRACE_BOUNDS),
+        )
+        outside = [
+            f"{key} {value}" for key, value, (low, high) in values if not low <= value <= high
+        ]
+        detail = ", ".join(f"{key} {value} ({low}-{high})" for key, value, (low, high) in values)
+        if outside:
+            return CheckResult(name, False, f"out of bounds: {', '.join(outside)}; {detail}")
+        return CheckResult(name, True, detail)
+
+    def check_scheduler_root(self) -> CheckResult:
+        """The coordination root's filesystem and the scheduler root's entry; read-only."""
+        name = "scheduler coordination root"
+        try:
+            root = repository_lock_path(self.cwd, runner=self._runner).parent.parent
+            check_local_lock_filesystem(root, what=f"the coordination root {root}")
+        except LockError as exc:
+            return CheckResult(name, False, str(exc))
+        problems = []
+        path = Path(root)
+        for component in (AUTOFORGE_DIRNAME, SCHEDULER_DIRNAME):
+            path = path / component
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                problems.append(f"{path} cannot be read ({exc})")
+                break
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                problems.append(f"{path} is not a directory (a link or another entry)")
+                break
+            if st.st_uid != os.getuid():
+                problems.append(f"{path} is owned by uid {st.st_uid}, not this user")
+            if st.st_mode & stat.S_IWOTH:
+                problems.append(f"{path} is world-writable")
+        if problems:
+            return CheckResult(name, False, "; ".join(problems))
+        scheduler = Path(root) / AUTOFORGE_DIRNAME / SCHEDULER_DIRNAME
+        found = (
+            "exists" if os.path.lexists(scheduler) else "is absent (the first 'epic run' makes it)"
+        )
+        return CheckResult(
+            name, True, f"{root}: local flock; the scheduler root {scheduler} {found}"
+        )
+
+    def check_epic_graph(self, gh: str) -> CheckResult:
+        """Whether ``gh`` reads the EPIC's graph: #179's snapshot, read-only."""
+        name = "EPIC sub-issues and dependencies readable"
+        if self.epic_url is None:
+            return CheckResult.skip(name, "(no --epic)")
+        try:
+            epic = parse_issue_url(self.epic_url)
+        except ConfigurationError as exc:
+            return CheckResult(name, False, str(exc))
+        if self.repo is not None and self.repo.lower() != epic.repository.lower():
+            return CheckResult(
+                name,
+                False,
+                f"the EPIC is in {epic.repository}, and this checkout's origin is {self.repo}",
+            )
+        client = GitHubClient(gh_command=gh, timeout_seconds=self.timeout, runner=self._runner)
+        try:
+            repository_id = client.get_repository_id(epic.repository)
+            snapshot = build_epic_snapshot(client, epic.canonical, repository_id=repository_id)
+        except GitHubUnavailableError as exc:
+            return CheckResult.skip(name, f"GitHub could not be read (transient): {exc}")
+        except SnapshotRefused as exc:
+            if exc.transient:
+                return CheckResult.skip(name, f"GitHub could not be read (transient): {exc}")
+            return CheckResult(name, False, str(exc))
+        except GitHubError as exc:
+            return CheckResult(name, False, str(exc))
+        ready = ready_set(evaluate(snapshot))
+        return CheckResult(
+            name,
+            True,
+            f"EPIC #{epic.number}: {len(snapshot.children)} sub-issues and "
+            f"{len(snapshot.edges)} blocked-by links read; {len(ready)} ready by the graph "
+            f"alone (snapshot {snapshot.digest[:12]})",
+        )
+
+    def scheduler_checks(self, gh: str) -> list[CheckResult]:
+        """The scheduler rows: its settings always, the rest for ``doctor --epic``."""
+        results = [self.check_scheduler_settings()]
+        if self.epic_url is not None:
+            results.append(self.check_scheduler_root())
+            results.append(self.check_epic_graph(gh))
+        return results
+
     def run_all(self) -> list[CheckResult]:
         results = [
             self.check_config(),
@@ -1075,6 +1202,7 @@ class Doctor:
         results.append(self.check_launch_credentials())
         results.append(self.check_required_checks(gh))
         results.append(self.check_state_dir())
+        results.extend(self.scheduler_checks(gh))
         results.extend(self.sandbox_checks(local=False))
         return results
 
@@ -1094,8 +1222,11 @@ def run_doctor(
     state_dir: str | None = None,
     cwd: str | None = None,
     runner: Runner | None = None,
+    epic_url: str | None = None,
 ) -> list[CheckResult]:
-    return Doctor(config_path=config_path, state_dir=state_dir, cwd=cwd, runner=runner).run_all()
+    return Doctor(
+        config_path=config_path, state_dir=state_dir, cwd=cwd, runner=runner, epic_url=epic_url
+    ).run_all()
 
 
 def run_local_doctor(

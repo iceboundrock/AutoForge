@@ -1160,6 +1160,37 @@ INITIALIZING
 
 without external writes.
 
+Maintain, too, the scheduler's end-to-end loop (#183, ADR 0008;
+`tests/test_epic_commands.py`, `tests/test_epic_recovery.py`): offline and
+deterministic, `autoforge epic` run through `cli.main` as an operator runs
+it, the EPIC's graph served by the fake `gh` behind the real read-only
+client, every worker a real subprocess running the production worker on
+the in-memory GitHub and scripted agents. It must keep covering:
+
+- every row of D14.5's crash-window table, by SIGKILL of a real scheduler,
+  worker or `epic archive` process at the window (a fault-injection hook
+  in `tests/epic_cli.py` or `tests/scheduler_worker.py`, never timing),
+  recovered by `epic resume` (or a re-run `epic archive`) with no second
+  worker for an issue and no second PR; the validator-marker row is the
+  engine's own crash tests (ADR 0006 D10.7);
+- `epic run` refusing an open claim and pointing to `epic resume`, also
+  with `--force`, which moves only a corrupt `scheduler.json` aside; exit 3
+  for claims left open, 1 for global uncertainty, 2 for a held lock;
+- every `epic status` category with its next command, the strict
+  `autoforge.epic-status/1` keys, a hung worker's diagnostics, a spawn
+  failure held, the not-ended hint, and that it takes no lock, signals
+  nothing and writes nothing; `epic run --dry-run` creating nothing;
+- every `epic stop` outcome, a drain and a `--now` of a running scheduler;
+  `epic archive` closing then moving aside, idempotent, refused while the
+  issue has a live owner or another EPIC, an unusable claim file moved
+  aside;
+- GitHub changing between ticks: a blocker closed and another reopened, a
+  child completed or given a dependency between snapshot and claim, a
+  child removed or re-parented, the EPIC closed, a human push to an active
+  PR;
+- standalone guards both ways, LOCAL unaffected, and no worker merging or
+  writing the EPIC with the merge gate open.
+
 ### Live progress (#192)
 
 Progress is observability, never part of an outcome. Keep covered:

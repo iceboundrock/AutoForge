@@ -1709,6 +1709,76 @@ def reconcile_epic(
     return ReconcileReport(epic, tuple(issues), tuple(problems), listing.rejected)
 
 
+@dataclass(frozen=True)
+class EpicClassification:
+    """One namespace classified for one EPIC's reconciliation (D14.2 step 4); nothing closed.
+
+    ``fact`` is what :func:`~autoforge.epic_graph.evaluate` is given: ``None``
+    for ``fresh`` and ``resumable``, ``held:settled-namespace``,
+    ``held:uncertain``, and ``held:other-epic`` for a namespace of this
+    repository bound to another EPIC, which has no ``classification``.
+    """
+
+    fact: LocalFact | None
+    classification: Classification | None
+    detail: str
+
+    @property
+    def repository_mismatch(self) -> bool:
+        """A binding of another repository: D14.3's global uncertainty."""
+        found = self.classification
+        return found is not None and found.uncertain is UncertainReason.REPOSITORY_MISMATCH
+
+
+def classify_for_epic(
+    read: NamespaceRead, epic: EpicRef, *, expected: ExpectedIdentity
+) -> EpicClassification | None:
+    """Classify one namespace read for ``epic`` (D14.2 step 4); pure, ``None`` when absent.
+
+    A namespace of this repository bound to another EPIC is
+    ``held:other-epic`` and is not classified; one bound to this EPIC's
+    number with another issue id is ``uncertain``; a binding of another
+    repository is classified (``uncertain``, a repository mismatch) whatever
+    EPIC it names. Otherwise :func:`classify` decides. Reconciliation runs it
+    under L2 and then closes a settled namespace's open claim; ``epic
+    status`` and ``epic run --dry-run`` (#183) run it on a lock-free read and
+    close nothing.
+    """
+    _check_type(epic, EpicRef, "classified epic")
+    _check_type(expected, ExpectedIdentity, "classification's expected identity")
+    if read.absent:
+        return None
+    lookup = read.lookup
+    binding = lookup.binding if isinstance(lookup, NamespaceLookup) else None
+    # A binding of another repository is global uncertainty whatever EPIC it
+    # names (D14.3), so only this repository's bindings are compared by EPIC:
+    # classify reports the other repository's.
+    if binding is not None and binding.run_key.repository_id == expected.repository_id:
+        bound = binding.epic
+        if bound.number != epic.number:
+            return EpicClassification(
+                LocalFact.HELD_OTHER_EPIC,
+                None,
+                f"bound under EPIC #{bound.number}, not #{epic.number}",
+            )
+        if bound != epic:
+            mismatch = _uncertain(
+                UncertainReason.BINDING_MISMATCH,
+                f"bound under EPIC #{bound.number} with issue id {bound.issue_id}, not "
+                f"{epic.issue_id}",
+                read.claim.open_claim,
+            )
+            return EpicClassification(LocalFact.HELD_UNCERTAIN, mismatch, mismatch.detail)
+    classification = classify(lookup, read.claim, expected=expected)
+    if classification.kind is ClassificationKind.UNCERTAIN:
+        fact: LocalFact | None = LocalFact.HELD_UNCERTAIN
+    elif classification.kind is ClassificationKind.SETTLED:
+        fact = LocalFact.HELD_SETTLED_NAMESPACE
+    else:
+        fact = None
+    return EpicClassification(fact, classification, classification.detail)
+
+
 def _reconcile_held(
     namespace: IssueNamespace,
     lock: IssueRunLock,
@@ -1717,66 +1787,39 @@ def _reconcile_held(
     problems: list[str],
 ) -> IssueReconciliation | None:
     number = namespace.issue_number
-    read = read_namespace(namespace)
-    if read.absent:
+    found = classify_for_epic(read_namespace(namespace), epic, expected=expected)
+    if found is None:
         return None
-    lookup = read.lookup
-    binding = lookup.binding if isinstance(lookup, NamespaceLookup) else None
-    # A binding of another repository is global uncertainty whatever EPIC it
-    # names (D14.3), so only this repository's bindings are compared by EPIC:
-    # classify reports the other repository's, and it is added to ``problems``.
-    if binding is not None and binding.run_key.repository_id == expected.repository_id:
-        bound = binding.epic
-        if bound.number != epic.number:
+    classification = found.classification
+    if classification is None:
+        return IssueReconciliation(number, found.fact, detail=found.detail)
+    if found.repository_mismatch:
+        problems.append(classification.detail)
+    if classification.kind is not ClassificationKind.SETTLED:
+        return IssueReconciliation(number, found.fact, classification, detail=found.detail)
+    closed = None
+    if classification.open_claim is not None:
+        try:
+            closed = close_claim(
+                namespace,
+                lock,
+                classification.open_claim,
+                ClaimClassification.SETTLED,
+                settlement=classification.settlement,
+                detail=f"closed at restart reconciliation: {classification.detail}",
+            )
+        except StateError as exc:
+            failed = _uncertain(UncertainReason.CLAIM_CONFLICT, str(exc), classification.open_claim)
             return IssueReconciliation(
-                number,
-                LocalFact.HELD_OTHER_EPIC,
-                detail=f"bound under EPIC #{bound.number}, not #{epic.number}",
+                number, LocalFact.HELD_UNCERTAIN, failed, detail=failed.detail
             )
-        if bound != epic:
-            classification = _uncertain(
-                UncertainReason.BINDING_MISMATCH,
-                f"bound under EPIC #{bound.number} with issue id {bound.issue_id}, not "
-                f"{epic.issue_id}",
-                read.claim.open_claim,
-            )
-            return IssueReconciliation(
-                number, LocalFact.HELD_UNCERTAIN, classification, detail=classification.detail
-            )
-    classification = classify(lookup, read.claim, expected=expected)
-    if classification.kind is ClassificationKind.UNCERTAIN:
-        if classification.uncertain is UncertainReason.REPOSITORY_MISMATCH:
-            problems.append(classification.detail)
-        return IssueReconciliation(
-            number, LocalFact.HELD_UNCERTAIN, classification, detail=classification.detail
-        )
-    if classification.kind is ClassificationKind.SETTLED:
-        closed = None
-        if classification.open_claim is not None:
-            try:
-                closed = close_claim(
-                    namespace,
-                    lock,
-                    classification.open_claim,
-                    ClaimClassification.SETTLED,
-                    settlement=classification.settlement,
-                    detail=f"closed at restart reconciliation: {classification.detail}",
-                )
-            except StateError as exc:
-                failed = _uncertain(
-                    UncertainReason.CLAIM_CONFLICT, str(exc), classification.open_claim
-                )
-                return IssueReconciliation(
-                    number, LocalFact.HELD_UNCERTAIN, failed, detail=failed.detail
-                )
-        return IssueReconciliation(
-            number,
-            LocalFact.HELD_SETTLED_NAMESPACE,
-            classification,
-            closed=closed,
-            detail=classification.detail,
-        )
-    return IssueReconciliation(number, None, classification, detail=classification.detail)
+    return IssueReconciliation(
+        number,
+        LocalFact.HELD_SETTLED_NAMESPACE,
+        classification,
+        closed=closed,
+        detail=classification.detail,
+    )
 
 
 @dataclass(frozen=True)

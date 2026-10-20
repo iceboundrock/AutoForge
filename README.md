@@ -253,6 +253,17 @@ waits for you to approve or decline that exact comment
 where a run stops, and how to recover are in
 [Running the remote workflow](docs/usage.md).
 
+To work through an EPIC's issues several at a time,
+`uv run autoforge epic run https://github.com/owner/repo/issues/1` runs up to
+`scheduler.max_parallel` (1-4) of them at once, admitted in dependency order
+from GitHub's native sub-issues and "blocked by" links, each in its own
+worker, namespace and worktree. Every worker stops at its settlement
+boundary (`READY_FOR_MERGE`, `BLOCKED`, `DONE`, `FAILED`), so nothing is
+merged without a human. `epic status` shows each child's category and next
+step without taking a lock, `epic stop` drains it, and `epic resume`
+recovers after a crash, a kill or a reboot
+([Running an EPIC in parallel](docs/usage.md#running-an-epic-in-parallel)).
+
 ## Local mode (no GitHub)
 
 Sometimes there is no GitHub to orchestrate: a coding interview, a scratch
@@ -353,6 +364,13 @@ default), including its pre-merge verification, and `UPDATE_EPIC`. Every
 claim these phases depend on is re-read from GitHub before state advances,
 but no automated test has ever merged a real PR or edited a real EPIC, so
 treat an opened gate as unproven against real services.
+
+**Implemented and verified offline, new:** the parallel EPIC scheduler
+(`autoforge epic run|resume|status|stop|archive`, ADR 0008). Its crash
+windows are tested by killing real scheduler and worker processes at each
+one, but against the in-memory GitHub and scripted agents only, and it has
+not yet driven a real EPIC: run it on an EPIC you watch, with `epic status`
+open.
 
 **Explicitly not yet:** unattended production operation; the controller
 feeding CI results into the review prompt (the reviewer is asked to inspect

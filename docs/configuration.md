@@ -141,7 +141,7 @@ directory if it is missing and a probe file it creates and removes there.
 | `github` | the `gh` binary and its timeout | [GitHub safety](agent-guides/github-safety.md) |
 | `validation` | REMOTE candidate validation (#172): `commands` (argv lists, empty by default), `scope` (`candidate-tree`, the only value) | [Candidate validation](#candidate-validation) below, [State and recovery](agent-guides/state-and-recovery.md#validation-evidence) |
 | `local` | Local Mode: `feature_dir`, `max_fix_rounds`, `validation_commands`, `exclude`, `max_workspace_entries`, `max_workspace_bytes` | [Local mode configuration](#local-mode-configuration) below |
-| `scheduler` | the parallel EPIC scheduler (#182): `max_parallel` (1-4, default 2), `poll_interval_seconds` (15-3600, default 60), `stop_grace_seconds` (10-600, default 30) | [Parallel EPIC scheduler](#parallel-epic-scheduler) below, [Workflow](agent-guides/workflow.md#scheduler-execution-policy) |
+| `scheduler` | the parallel EPIC scheduler (#182, `autoforge epic`): `max_parallel` (1-4, default 2; `epic run --max-parallel` overrides it), `poll_interval_seconds` (15-3600, default 60), `stop_grace_seconds` (10-600, default 30) | [Parallel EPIC scheduler](#parallel-epic-scheduler) below, [Workflow](agent-guides/workflow.md#scheduler-execution-policy) |
 | `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths` | [Outer sandbox](#outer-sandbox) below, [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
 ## Profiles
@@ -987,6 +987,13 @@ issues may still be admitted. `stop_grace_seconds` is how long a stop, or
 a first Ctrl-C, waits for the interrupted workers to return; a second
 Ctrl-C does not wait. The section is ignored by `run`, `step`, `resume` and
 `local`.
+
+`autoforge epic run --max-parallel N` (and `epic resume --max-parallel N`)
+overrides `max_parallel` for that one invocation, within the same bounds 1-4;
+`doctor` shows the three values and `doctor --epic <url>` adds the
+scheduler's own checks. The commands, `epic status`'s categories, `epic stop`
+and recovery are in
+[Running an EPIC in parallel](usage.md#running-an-epic-in-parallel).
 
 A scheduler's workers read the same configuration file again, and each
 refuses to start when its effective configuration is not the one the

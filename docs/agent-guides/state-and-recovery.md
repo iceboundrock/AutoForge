@@ -510,8 +510,9 @@ D10–D12, D17.2). #180 implements the three lock domains in
 `src/autoforge/locking.py` and the ownership guards in
 `src/autoforge/ownership.py`; #182's scheduler (`src/autoforge/scheduler.py`)
 shares L0 with its workers and hands each one its issue's L2 (Scheduler
-workers and supervision, below), and the `epic` commands that start it are
-#183's, so today a standalone command holds L0 and takes L1:
+workers and supervision, below), and #183's `epic run` and `epic resume`
+start it (The `epic` commands, below); a standalone command holds L0 and
+takes L1:
 
 - **L0: one orchestration authority per git common dir.** This lock is L0,
   unchanged for a standalone command (including its `LOCK_UN`-then-close
@@ -765,8 +766,8 @@ identity, the layout and the files it owns (`src/autoforge/run_namespace.py`);
 file, the per-EPIC scheduler state and restart reconciliation
 (`src/autoforge/scheduler_state.py`, below); #182 the scheduler and its
 workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
-the `epic` commands that start them are #183's, so no CLI command creates a
-namespace yet.
+#183 the `epic` commands that start them and act on them
+(`src/autoforge/epic_commands.py`, below).
 
 - **RunKey** is `(repository_id, issue_number)`: GitHub's numeric
   repository id and the issue number, both positive integers, rendered
@@ -1063,8 +1064,9 @@ liveness except L2.
 - **The worker's run** (D9.3): the engine with the merge gate closed and
   `MERGE` / `UPDATE_EPIC` as extra stop phases (Workflow, "Scheduler
   execution policy"); before every step L2 is proven again and the stop
-  request read. Its continuation command is `autoforge epic resume <n>`
-  (`ControllerEngine.continue_command`), never a standalone `resume`,
+  request read. Its continuation command is `autoforge [--config <path>]
+  epic resume <EPIC URL>` (`ControllerEngine.continue_command`, #183),
+  never a standalone `resume`,
   which refuses the scheduler root. SIGTERM is turned into
   `KeyboardInterrupt` so the executor's existing teardown of a running
   agent runs; SIGINT already is. Either ends the worker with exit 130 and
@@ -1096,6 +1098,55 @@ liveness except L2.
   L2 until it exits: no standalone `run`, `step`, `resume` or `unblock`
   runs before that (`LockError`), and the claim it leaves is classified at
   the next start.
+
+### The `epic` commands
+
+#183 (`src/autoforge/epic_commands.py`, the `epic` group of
+`src/autoforge/cli.py`; ADR 0008 D8.3, D9.8, D14.4, D16.4, D17.4) is the
+operator's surface over the files above. Every `epic` command is REMOTE
+only and refuses `--state-dir` (`ConfigurationError`, exit 2): a namespace
+is found from the EPIC. The operator's view, with every category and exit
+code, is [Running an EPIC in parallel](../usage.md#running-an-epic-in-parallel).
+
+- **`epic run` and `epic resume`** are one scheduler invocation each, the
+  same loop. `epic run`'s guard (`epic_run_guard`, through
+  `SchedulerInputs.before_start`) runs holding L0, once the repository and
+  the EPIC are read and before `scheduler.json` is read or anything is
+  written: `--force` quarantines an unreadable `scheduler.json` and nothing
+  else, then any open claim bound to the EPIC (`open_claims_for_epic`)
+  refuses the invocation (`OpenSchedulerClaimsError`, exit 2, nothing
+  written), naming each claim and `epic resume`. `epic resume` has no
+  guard: its start reconciliation classifies every namespace (Scheduler
+  claims, above). An invocation that ended 0 with a claim of the EPIC
+  still open exits 3 (`EXIT_OPEN_CLAIMS`) and names each one.
+- **`epic status`** takes no lock and writes nothing: it never takes L0
+  and never probes it, and it reads `scheduler.json`, the stop request and
+  each namespace lock-free (`read_namespace`, `classify_for_epic`, the
+  D8.3 run-lock probe). Each child gets one category, decided only from the
+  snapshot, the claims, the state and the probe (`categorize`, pure, first
+  match wins). A claim's worker PID and process start time are shown as
+  diagnostics; nothing is signalled. An unended invocation with no live
+  worker is reported as one that may have ended without finalizing. The
+  `--json` document is `autoforge.epic-status/1`, redacted, its keys
+  fixed.
+- **`epic run --dry-run`** takes no lock and creates no namespace, claim,
+  worktree, worker or `scheduler.json`: the snapshot, the ordered
+  verdicts with the lock-free local facts, and which ready issues the
+  first tick would admit.
+- **`epic stop`** is `request_stop` (Stop request, above) and reports its
+  outcome: delivered (exit 0), delivered to an ended invocation (exit 0,
+  with the workers that still hold their L2), nothing written or the
+  scheduler changed (exit 1), no `scheduler.json` (exit 2). It signals
+  nothing.
+- **`epic archive`** holds L0, then the issue's L2 (a live owner refuses
+  it), and calls `archive_claim` then `archive_issue_state` (Per-issue
+  scheduler namespaces, above); a namespace bound under another EPIC is
+  refused. It reads nothing from GitHub and writes no `scheduler.json`
+  (ADR 0008 D6.1, amended by #183). A re-run after a crash completes the
+  archive, and one with nothing left says so.
+- **The crash windows** (D14.5) are tested end to end by SIGKILL of real
+  scheduler, worker and archive processes (`tests/test_epic_recovery.py`);
+  the validator-marker row is the engine's own crash recovery.
 
 ---
 
