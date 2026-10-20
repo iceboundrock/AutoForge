@@ -1632,6 +1632,7 @@ def reconcile_epic(
     epic: EpicRef,
     *,
     own_children: Collection[int] = (),
+    only: Collection[int] | None = None,
     expected: ExpectedIdentity,
 ) -> ReconcileReport:
     """Restart reconciliation of the namespaces under ``root`` for ``epic`` (D14.1, D14.2).
@@ -1648,7 +1649,9 @@ def reconcile_epic(
     supersession, :func:`close_unready` or ``epic archive`` closes them
     later); ``uncertain`` is ``held:uncertain``; L2 is released by
     ``close``. It never spawns, never writes or quarantines a per-issue
-    state and never contacts GitHub.
+    state and never contacts GitHub. ``only``, when given, limits the pass
+    to those issues' namespaces: the scheduler's re-check of the namespaces
+    it found live (D14.2 step 2).
     """
     _check_type(epic, EpicRef, "reconciled epic")
     _check_type(expected, ExpectedIdentity, "reconciliation's expected identity")
@@ -1659,10 +1662,13 @@ def reconcile_epic(
             epic, (), (f"the scheduler's namespaces cannot be listed ({_bounded(str(exc))})",)
         )
     own = frozenset(own_children)
+    wanted = None if only is None else frozenset(only)
     problems: list[str] = []
     issues: list[IssueReconciliation] = []
     for namespace in sorted((*listing.bound, *listing.unbound), key=lambda ns: ns.issue_number):
         number = namespace.issue_number
+        if wanted is not None and number not in wanted:
+            continue
         if number in own:
             issues.append(
                 IssueReconciliation(

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import errno
+import fcntl
 import json
 import os
 import re
@@ -858,6 +859,40 @@ def _crashed_scheduler_leaving_an_open_claim(b: Bench) -> None:
     os.unlink(b.marker("s2"))
 
 
+def _admitted_but_never_spawned(
+    b: Bench, n: int, issue_id: int, repository_id: int = REPO_ID
+) -> None:
+    """An admission that died before its spawn: a binding and an open claim, no state."""
+    ns = b.ns(n)
+    write_binding(
+        ns,
+        RunBinding(
+            run_key=RunKey(repository_id, n),
+            issue_id=issue_id,
+            repository_owner="owner",
+            repository_name="repo",
+            epic=EpicRef(1, b.graph.issue(1, R).id),
+            worktree_path=str(b.tmp / f"wt{n}"),
+        ),
+    )
+    with IssueRunLock(ns) as lock:
+        open_claim(
+            ns,
+            lock,
+            kind=ClaimKind.START,
+            invocation_id="e" * 32,
+            admission=Admission("a" * 64, "b" * 64, "2026-10-19T00:00:00+00:00"),
+            state_ref=StateRef.absent(),
+        )
+
+
+def _status_probe(b: Bench, n: int) -> int:
+    """``run.lock`` held shared, as ``epic status``'s probe holds it for an instant (D8.3)."""
+    fd = os.open(b.ns(n).run_lock_file, os.O_RDONLY | os.O_CLOEXEC)
+    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    return fd
+
+
 def test_a_ready_resumable_claim_is_superseded_and_the_run_resumes(bench):
     b = bench()
     _crashed_scheduler_leaving_an_open_claim(b)
@@ -884,33 +919,92 @@ def test_a_resumable_claim_whose_issue_is_now_blocked_is_closed_unready(bench):
     b.graph.blocked(2, 8)
     # Without one: an admission that died before its spawn, abandoned.
     b.graph.child(5, 8)
-    ns5 = b.ns(5)
-    write_binding(
-        ns5,
-        RunBinding(
-            run_key=RunKey(REPO_ID, 5),
-            issue_id=b.graph.issue(5, R).id,
-            repository_owner="owner",
-            repository_name="repo",
-            epic=EpicRef(1, b.graph.issue(1, R).id),
-            worktree_path=str(b.tmp / "wt5"),
-        ),
-    )
-    with IssueRunLock(ns5) as lock:
-        open_claim(
-            ns5,
-            lock,
-            kind=ClaimKind.START,
-            invocation_id="e" * 32,
-            admission=Admission("a" * 64, "b" * 64, "2026-10-19T00:00:00+00:00"),
-            state_ref=StateRef.absent(),
-        )
+    _admitted_but_never_spawned(b, 5, b.graph.issue(5, R).id)
     sched = b.scheduler()
     sched._held[8] = LocalFact.HELD_SETTLED_NAMESPACE  # the blocker never runs here
     assert sched.run() == 0
     assert settled(b, 2) is ClaimClassification.INTERRUPTED
     assert settled(b, 5) is ClaimClassification.ABANDONED
     assert b.admitted() == []
+
+
+def test_a_claim_a_status_probe_hid_at_startup_is_closed_unready_by_the_same_invocation(
+    bench, monkeypatch
+):
+    """R2-F1: a run lock probed during startup reconciliation is reconciled at the snapshot."""
+    b = bench()
+    _crashed_scheduler_leaving_an_open_claim(b)
+    b.graph.close_issue(2)  # its claim recorded a worker: interrupted
+    _admitted_but_never_spawned(b, 5, 9005)  # no longer a child at all: orphaned, abandoned
+    probes = [_status_probe(b, n) for n in (2, 5)]
+    real = scheduler.reconcile_epic
+    passes: list[tuple[object, list[tuple[int, bool]]]] = []
+
+    def reconcile(*args, **kwargs):
+        report = real(*args, **kwargs)
+        passes.append(
+            (kwargs.get("only"), [(i.issue_number, i.observed_live) for i in report.issues])
+        )
+        while probes:  # the probe ends after startup reconciliation, before the first snapshot
+            os.close(probes.pop())
+        return report
+
+    monkeypatch.setattr(scheduler, "reconcile_epic", reconcile)
+    sched = b.scheduler()
+    assert sched.run() == 0
+    assert settled(b, 2) is ClaimClassification.INTERRUPTED
+    assert settled(b, 5) is ClaimClassification.ABANDONED
+    assert sched.local_facts()[5] is LocalFact.HELD_ORPHANED
+    assert passes == [(None, [(2, True), (5, True)]), ({2, 5}, [(2, False), (5, False)])]
+    assert b.admitted() == []
+    assert not any("stays held" in line for line in b.lines)
+
+
+def test_a_run_lock_held_at_every_re_check_stays_owned_and_its_claim_open(bench):
+    b = bench()
+    b.graph.child(5)
+    b.graph.close_issue(5)
+    _admitted_but_never_spawned(b, 5, b.graph.issue(5, R).id)
+    probe = _status_probe(b, 5)
+    try:
+        sched = b.scheduler()
+        assert sched.run() == 0
+    finally:
+        os.close(probe)
+    claims = b.claims(5)
+    assert claims is not None and claims.current is not None, "never closed while held"
+    assert sched.local_facts() == {5: LocalFact.OWNED}
+    assert any(
+        "issue #5: its run lock stays held by a process this scheduler did not start" in line
+        for line in b.lines
+    )
+
+
+def test_a_binding_of_another_repository_found_at_the_re_check_admits_nothing(bench, monkeypatch):
+    """Global uncertainty (D14.3) a status probe hid at startup closes admission when found."""
+    b = bench()
+    b.issue(3)
+    b.graph.child(7)
+    _admitted_but_never_spawned(b, 7, b.graph.issue(7, R).id, repository_id=REPO_ID + 1)
+    probes = [_status_probe(b, 7)]
+    real = scheduler.reconcile_epic
+
+    def reconcile(*args, **kwargs):
+        report = real(*args, **kwargs)
+        while probes:
+            os.close(probes.pop())
+        return report
+
+    monkeypatch.setattr(scheduler, "reconcile_epic", reconcile)
+    sched = b.scheduler()
+    assert sched.run() == 1
+    assert b.admitted() == []
+    assert b.claims(3) is None
+    assert b.claims(7).current is not None
+    state = load_scheduler_state(b.root, 1)
+    assert state.admission.reason is AdmissionReason.EPIC_NOT_ADMISSIBLE
+    assert state.invocation.end_reason is EndReason.DEGRADED
+    assert any("global uncertainty, nothing is admitted" in line for line in b.lines)
 
 
 # -- structure: no second effect system, no provider branch ----------------------------------

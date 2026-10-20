@@ -985,9 +985,10 @@ diagnostics, and every `detail` is redacted and bounded (500 characters).
   a binding of another repository, a run lock on a network filesystem, or a
   namespace listing that cannot be read is global uncertainty (the report
   is not `admissible`). It never spawns, writes a per-issue state or
-  contacts GitHub. Its facts are `epic_graph.LocalFact` values, the
-  vocabulary `evaluate` consumes (D4.1, #179; see `github-safety.md`,
-  "EPIC dependency graph").
+  contacts GitHub. `only=` limits a pass to the named namespaces (the
+  scheduler's re-check of those it saw live). Its facts are
+  `epic_graph.LocalFact` values, the vocabulary `evaluate` consumes (D4.1,
+  #179; see `github-safety.md`, "EPIC dependency graph").
 - **Finalization** (`finalize_worker`): after a worker exits and the
   scheduler re-acquires L2, the claim is closed by the state the worker
   left, classified with the caller's `expected` identity when it passes
@@ -1023,6 +1024,17 @@ liveness except L2.
   descriptor closed; `record_worker` (pid, kernel start time, log path:
   diagnostics, never authority); the scheduler's L2 copy closed (`close`
   only), so the worker is its only holder.
+- **Each snapshot** (D14.2): a namespace whose L2 was held at startup
+  reconciliation or at an admission (a status probe, a process outside
+  AutoForge) is `owned` until the next snapshot, which reconciles it again
+  under L2 (`reconcile_epic(..., only=)`) before its verdicts are used. One
+  still held stays `owned`, and is reported when it is still held at the
+  scheduler's last re-check; one free now is classified as at startup, and
+  an open `resumable` claim found only now is closed by `close_unready`
+  like an earlier one when the snapshot does not show the issue ready
+  (`closed`, `blocked`, `unsupported`, or no longer listed:
+  `held:orphaned`). A binding of another repository found then is global
+  uncertainty: admission degrades and nothing more is admitted.
 - **A spawn that fails** (D2.3): a log that cannot be opened closes the
   claim `abandoned` at once (no process exists). A spawn that raised
   closes the scheduler's L2 copy and probes L2 afresh: free, the claim is

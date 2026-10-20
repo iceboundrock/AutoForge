@@ -26,9 +26,12 @@ state's issue is ``held:standalone-state`` in any phase but ``DONE``).
 re-acquired L2 (#181's ``finalize_worker``); handle signals and the stop
 request; then, while admission is open and slots are free, take a snapshot
 (at most once per ``poll_interval_seconds``, or at once after a stale
-re-read), close each earlier invocation's ``resumable`` claim whose issue is
-no longer ready (``close_unready``), and admit ready issues in order up to
-the free slots. It exits once no worker is live and nothing is admissible.
+re-read), reconcile again under L2 each namespace whose run lock was seen
+held (D14.2 step 2; one still held stays ``owned``), close each earlier
+invocation's ``resumable`` claim whose issue is no longer ready
+(``close_unready``), those the re-check found included, and admit ready
+issues in order up to the free slots. It exits once no worker is live and
+nothing is admissible.
 
 **Admission** (D2.2), holding L0: L2 non-blocking; under it, the strict
 read and classification of the namespace (only none, ``fresh`` and
@@ -125,6 +128,7 @@ from .scheduler_state import (
     EndReason,
     ExpectedIdentity,
     Invocation,
+    ReconcileReport,
     SchedulerConfig,
     SchedulerState,
     SnapshotSummary,
@@ -287,8 +291,8 @@ class EpicScheduler:
         self._unfinalized: dict[int, _Worker] = {}
         # Facts held for the rest of the invocation (D4.1, D9.6).
         self._held: dict[int, LocalFact] = {}
-        # Live owners this scheduler did not start (``observed_live``), re-checked
-        # at every snapshot (D14.2 step 2).
+        # Live owners this scheduler did not start (``observed_live``), reconciled
+        # again under L2 at every snapshot (D14.2 step 2).
         self._observed_live: set[int] = set()
         self._observed_rechecked = False
         # Earlier invocations' open resumable claims (D14.2): superseded by an
@@ -466,32 +470,50 @@ class EpicScheduler:
         self._install_handlers()
         expected = ExpectedIdentity(self.repository_id, repository=self.repository)
         report = reconcile_epic(self.coordination_root, self.epic_ref, expected=expected)
+        if not self._take_reconciliation(report):
+            self.end_reason = EndReason.DEGRADED
+            self._finish()
+            return False
+        self._apply_reverse_guard()
+        return True
+
+    def _take_reconciliation(self, report: ReconcileReport, *, again: bool = False) -> bool:
+        """Record what reconciliation found (D14.2); ``False`` on global uncertainty.
+
+        A live owner is ``observed_live``; a fact is held for the invocation;
+        an open ``resumable`` claim waits for an admission's supersession or
+        ``close_unready``. Global uncertainty (D14.3) degrades admission.
+        ``again`` is the re-check of namespaces seen live before: one still
+        held is not reported a second time.
+        """
         for problem in report.global_problems:
             self.say(f"global uncertainty, nothing is admitted: {problem}")
         for item in report.issues:
+            number = item.issue_number
             if item.observed_live:
-                self._observed_live.add(item.issue_number)
-                self.say(f"issue #{item.issue_number}: its run lock is held ({item.detail})")
-            elif item.fact is not None:
-                self._held[item.issue_number] = item.fact
-                if item.fact is LocalFact.HELD_UNCERTAIN:
-                    self.say(f"issue #{item.issue_number} is uncertain: {item.detail}")
+                self._observed_live.add(number)
+                if not again:
+                    self.say(f"issue #{number}: its run lock is held ({item.detail})")
+                continue
+            if item.fact is LocalFact.HELD_UNCERTAIN:
+                self.say(f"issue #{number} is uncertain: {item.detail}")
+            elif again:
+                self.say(f"issue #{number}: its run lock is free now ({item.detail})")
+            if item.fact is not None:
+                self._held[number] = item.fact
             classification = item.classification
             if (
                 classification is not None
                 and classification.kind is ClassificationKind.RESUMABLE
                 and classification.open_claim is not None
             ):
-                self._resumable_open[item.issue_number] = classification.open_claim
-        if not report.admissible:
-            self.admission = AdmissionState(
-                AdmissionStatus.DEGRADED, AdmissionReason.EPIC_NOT_ADMISSIBLE
-            )
-            self.end_reason = EndReason.DEGRADED
-            self._finish()
-            return False
-        self._apply_reverse_guard()
-        return True
+                self._resumable_open[number] = classification.open_claim
+        if report.admissible:
+            return True
+        self.admission = AdmissionState(
+            AdmissionStatus.DEGRADED, AdmissionReason.EPIC_NOT_ADMISSIBLE
+        )
+        return False
 
     def _apply_reverse_guard(self) -> None:
         """D17.2: the configured standalone state's issue is not admitted."""
@@ -742,7 +764,8 @@ class EpicScheduler:
             },
             repository=self.repository,
         )
-        self._observed_live.clear()
+        if not self._recheck_observed_live(expected):
+            return None
         taken = _Snapshot(snapshot, self.inputs.clock(), expected)
         self._snapshot = taken
         self._force_snapshot = False
@@ -750,6 +773,29 @@ class EpicScheduler:
         taken.verdicts = evaluate(snapshot, self.local_facts())
         self._write_state(last_snapshot=self._summary(taken))
         return taken
+
+    def _recheck_observed_live(self, expected: ExpectedIdentity) -> bool:
+        """D14.2 step 2: reconcile again each namespace whose run lock was seen held.
+
+        Before the snapshot's verdicts are used: a namespace whose L2 is free
+        now is classified under it as at startup, so an open ``resumable``
+        claim found only now reaches ``close_unready`` with this snapshot;
+        one still held stays ``observed_live``. Global uncertainty found now
+        closes admission as at startup; ``False`` then.
+        """
+        own = {*self._live, *self._unfinalized}
+        numbers = {number for number in self._observed_live if number not in own}
+        self._observed_live.clear()
+        if not numbers:
+            return True
+        assert self.epic_ref is not None
+        report = reconcile_epic(
+            self.coordination_root, self.epic_ref, only=numbers, expected=expected
+        )
+        if self._take_reconciliation(report, again=True):
+            return True
+        self._write_state()
+        return False
 
     def _summary(self, taken: _Snapshot) -> SnapshotSummary:
         counts = dict.fromkeys(("ready", "blocked", "closed", "unsupported", "owned", "held"), 0)
