@@ -849,7 +849,9 @@ DISPLAY_KEYS: dict[str, tuple[str, ...]] = {
 def canonical_json(value: object) -> bytes:
     """``value`` as canonical JSON: sorted keys, no spaces, UTF-8, no NaN.
 
-    A value JSON cannot represent raises :class:`InteractionDataError`.
+    A value JSON cannot represent, or a string UTF-8 cannot encode (a lone
+    surrogate, legal in a JSON string's escapes), raises
+    :class:`InteractionDataError`.
     """
     try:
         text = json.dumps(
@@ -857,7 +859,10 @@ def canonical_json(value: object) -> bytes:
         )
     except (TypeError, ValueError) as exc:
         raise InteractionDataError(f"a value is not JSON ({type(exc).__name__})") from exc
-    return text.encode("utf-8")
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise InteractionDataError("a value carries a lone surrogate, not UTF-8") from exc
 
 
 def input_digest(value: object, what: str, limit: int = MAX_INPUT_BYTES) -> str:
@@ -907,12 +912,14 @@ def exact_text(value: object, what: str, limit: int) -> str:
 def exact_input(value: object, what: str, limit: int = MAX_INPUT_BYTES) -> object:
     """A modified tool input the controller may send back, unchanged, or
     :class:`InteractionDataError`: JSON within ``limit`` bytes, and every
-    string in it safe for :func:`exact_text` (redaction would change none)."""
+    string in it, key or value, safe for :func:`exact_text` (redaction would
+    change none, and a carriage return is refused like any other control
+    character: it redraws the line it is shown on)."""
     input_digest(value, what, limit)
     if redact_obj(value) != value:
         raise InteractionDataError(f"{what} carries a credential-shaped value")
     for text in _strings(value):
-        if _unsafe_character(text.replace("\r", "")):
+        if _unsafe_character(text):
             raise InteractionDataError(f"{what} carries a control or escape character")
     return value
 

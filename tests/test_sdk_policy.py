@@ -579,6 +579,18 @@ def test_canonical_json_is_stable_and_refuses_what_json_cannot_hold():
         canonical_json({"x": object()})
 
 
+def test_a_lone_surrogate_follows_the_refusal_path_not_a_unicode_error():
+    # Legal as a JSON escape, so a provider's ask can carry one; UTF-8 cannot.
+    ask = json.loads('{"command": "echo \\ud800"}')
+    assert ask == {"command": "echo \ud800"}
+    with pytest.raises(InteractionDataError, match="lone surrogate"):
+        canonical_json(ask)
+    with pytest.raises(InteractionDataError, match="lone surrogate"):
+        input_digest(ask, "tool input")
+    with pytest.raises(InteractionDataError, match="lone surrogate"):
+        exact_input(ask, "modified input")
+
+
 def test_input_digest_binds_the_whole_input_and_refuses_an_oversized_one():
     a = input_digest({"command": "ls"}, "tool input")
     assert a == input_digest({"command": "ls"}, "tool input")
@@ -593,6 +605,8 @@ def test_input_digest_binds_the_whole_input_and_refuses_an_oversized_one():
         ("Yes\x1b[2J", "control or escape"),
         ("Yes‮", "control or escape"),
         ("Yes\x00", "control or escape"),
+        ("Yes\rNo", "control or escape"),
+        ("Yes\ud800", "control or escape"),
         ("x" * 201, "longer than"),
         ("use GITHUB_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "credential-shaped"),
         (3, "not a string"),
@@ -615,6 +629,21 @@ def test_exact_input_refuses_a_modified_input_redaction_would_change():
         exact_input({"command": "OPENAI_API_KEY=sk-aaaaaaaaaaaaaaaaaaaa run"}, "modified input")
     with pytest.raises(InteractionDataError, match="control or escape"):
         exact_input({"command": "echo \x1b]0;x\x07"}, "modified input")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # Shown, the text after the carriage return redraws what came before it.
+        {"command": "rm -rf ~/work\recho tidy"},
+        {"content": "line one\r\nline two"},
+        {"cmd\r": "ls"},
+        {"edits": [{"new_string": "x\r"}]},
+    ],
+)
+def test_exact_input_refuses_a_carriage_return_bare_or_in_crlf(value):
+    with pytest.raises(InteractionDataError, match="control or escape"):
+        exact_input(value, "modified input")
 
 
 def test_question_options_keep_the_raw_identity_apart_from_what_is_shown():

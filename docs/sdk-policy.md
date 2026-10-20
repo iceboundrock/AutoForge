@@ -371,11 +371,13 @@ field and the rule, never the value.
 
   Approving a clipped rendering would approve different work, so any of
   these is refused when it is past its bound, carries a control, format or
-  separator character (an escape sequence starts with one), or would be
-  changed by redaction.
+  separator character other than a newline or a tab (an escape sequence
+  starts with one, and a carriage return, bare or in a CRLF pair, redraws
+  the line it is shown on), or would be changed by redaction.
 - **Bound by digest.** A decision is bound to the SHA-256 of the input's
-  canonical JSON (sorted keys, no spaces, UTF-8, no NaN; D9.3). A modified
-  input is sent back exactly as validated.
+  canonical JSON (sorted keys, no spaces, UTF-8, no NaN; D9.3). A value
+  that has none, such as a lone surrogate (legal as a JSON escape, not in
+  UTF-8), is refused. A modified input is sent back exactly as validated.
 - **Shown apart from the identity.** An option keeps its raw label (the
   identity a reply carries) apart from what is shown (`question_options`).
   Two labels shown alike are refused, because a person could not tell them
