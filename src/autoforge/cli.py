@@ -31,10 +31,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import select
 import sys
 import time
-from collections.abc import Callable
+import unicodedata
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import TextIO
 
 from . import __version__
@@ -730,24 +733,172 @@ def _progress_line(line: str) -> None:
 # MAX_ANSWER_CHARS characters of up to four UTF-8 bytes each, and a little
 # more. A longer line is read to its end and refused, never kept.
 _MAX_TERMINAL_LINE_BYTES = 4 * MAX_ANSWER_CHARS + 64
+# An option number as typed: ASCII digits, and few of them (a question has
+# at most sdk_policy.MAX_OPTIONS options), so int() takes every one.
+_OPTION_NUMBER = re.compile(r"[0-9]{1,3}")
 
 
 class _Unusable(Exception):
     """A line the terminal resolver cannot use: the message names the rule."""
 
 
-class _TerminalInput:
-    """Lines read from ``fd`` until ``deadline``: a string, or :class:`Unavailable`."""
+class _LineEditing:
+    """A terminal whose line editing the resolver took over: its keys, where
+    the resolver echoes what is typed, and the settings it reads under
+    (:func:`_line_editing`)."""
 
-    def __init__(self, fd: int, clock: Callable[[], float], deadline: float) -> None:
+    def __init__(self, fd: int, saved: list, echo_fd: int) -> None:
+        import termios
+
+        cc = saved[6]
+
+        def key(index: int) -> int | None:
+            value = cc[index]
+            code = value[0] if isinstance(value, bytes) else value
+            # 0 is Linux's _POSIX_VDISABLE, 0xff macOS's; a key past ASCII
+            # would cut into a UTF-8 character.
+            return code if 0 < code < 0x80 else None
+
+        # Backspace and delete erase whatever the terminal's erase key is:
+        # a control character is never part of a usable answer.
+        self.erase = frozenset(k for k in (key(termios.VERASE), 0x08, 0x7F) if k is not None)
+        self.word_erase = key(termios.VWERASE)
+        self.kill = key(termios.VKILL)
+        self.eof = key(termios.VEOF)
+        self._fd = fd
+        self._echo_fd = echo_fd
+        # Canonical mode and echo off, and a read returns once a key is typed.
+        self.raw = list(saved)
+        self.raw[3] = saved[3] & ~(termios.ICANON | termios.ECHO)
+        self.raw[6] = list(cc)
+        self.raw[6][termios.VMIN], self.raw[6][termios.VTIME] = 1, 0
+
+    def echo(self, data: bytes) -> None:
+        while data:
+            data = data[os.write(self._echo_fd, data) :]
+
+    def retake(self) -> bool:
+        """Whether the terminal's own line editing came back on while the
+        resolver waited (a stop and continue under a shell that resets the
+        terminal, another program's ``stty``): what was just read went
+        through it and may have been cut. It is turned off again."""
+        import termios
+
+        mode = termios.tcgetattr(self._fd)[3]
+        if mode & (termios.ICANON | termios.ECHO):
+            termios.tcsetattr(self._fd, termios.TCSANOW, self.raw)
+        return bool(mode & termios.ICANON)
+
+
+@contextmanager
+def _line_editing(fd: int) -> Iterator[_LineEditing | None]:
+    """Take over the line editing of the terminal ``fd`` while the resolver
+    asks (#134); ``None`` for a descriptor that is not a terminal, whose
+    lines arrive whole.
+
+    In canonical mode a terminal edits a line before a reader gets it, and
+    Linux keeps at most 4095 bytes of it: what is typed past that is dropped
+    without a word, under any bound a reader could hold the line to, and an
+    answer or guidance would reach the agent cut short. So canonical mode
+    and echo are off while the resolver reads, and it edits the line itself
+    (:class:`_TerminalInput`): it echoes what it keeps, on the terminal and
+    never on stderr, and takes the terminal's own erase, word-erase, kill
+    and end-of-file keys. A line read while canonical mode came back on is
+    refused (:meth:`_LineEditing.retake`). Everything else stays the
+    terminal's: Ctrl-C still raises ``KeyboardInterrupt`` (ISIG is
+    untouched), and the settings are restored however the reading ends.
+    """
+    try:
+        import fcntl
+        import termios
+    except ImportError:  # pragma: no cover - a platform without termios
+        yield None
+        return
+    try:
+        saved = termios.tcgetattr(fd)
+    except (OSError, termios.error):
+        saved = None
+    if saved is None:
+        yield None
+        return
+    echo_fd = fd
+    if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY:
+        echo_fd = os.open(os.ttyname(fd), os.O_WRONLY | os.O_NOCTTY | os.O_CLOEXEC)
+    try:
+        editing = _LineEditing(fd, saved, echo_fd)
+        termios.tcsetattr(fd, termios.TCSANOW, editing.raw)
+        try:
+            yield editing
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, saved)
+    finally:
+        if echo_fd != fd:
+            os.close(echo_fd)
+
+
+def _utf8_length(lead: int) -> int:
+    """How many bytes the UTF-8 character starting with ``lead`` has; 1 for
+    a byte no character starts with (kept alone, so its line is refused)."""
+    if 0xC2 <= lead <= 0xDF:
+        return 2
+    if 0xE0 <= lead <= 0xEF:
+        return 3
+    if 0xF0 <= lead <= 0xF4:
+        return 4
+    return 1
+
+
+def _echoed(typed: bytes) -> tuple[bytes, int]:
+    """What the terminal is shown of one typed character, and its columns: a
+    control character as ^X, one that is not UTF-8 or would act on the
+    terminal as U+FFFD, a combining mark in no column of its own and a wide
+    character in two."""
+    try:
+        ch = typed.decode("utf-8")
+    except UnicodeDecodeError:
+        return "\ufffd".encode(), 1
+    if ord(ch) < 0x20:
+        return b"^" + bytes((ord(ch) + 0x40,)), 2
+    category = unicodedata.category(ch)
+    if category in ("Cc", "Cf", "Zl", "Zp"):
+        return "\ufffd".encode(), 1
+    if category in ("Mn", "Me"):
+        return typed, 0
+    return typed, 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+class _TerminalInput:
+    """Lines read from ``fd`` until ``deadline``: a string, or :class:`Unavailable`.
+
+    At a terminal (``editing``) each key is taken as it is typed and the
+    line is edited here (:func:`_line_editing`); any other descriptor
+    delivers whole lines. A line past :data:`_MAX_TERMINAL_LINE_BYTES` is
+    refused whole when it ends: at a terminal what is typed past the bound
+    is neither kept nor echoed (the bell rings once), and the kill key
+    starts the line again.
+    """
+
+    def __init__(
+        self,
+        fd: int,
+        clock: Callable[[], float],
+        deadline: float,
+        editing: _LineEditing | None = None,
+    ) -> None:
         self._fd = fd
         self._clock = clock
         self._deadline = deadline
+        self._editing = editing
         self._pending = b""
         self._overlong = False
+        # The line being typed at a terminal: each character's bytes and
+        # columns, and the first bytes of one not yet whole.
+        self._typed: list[tuple[bytes, int]] = []
+        self._size = 0
+        self._partial = b""
 
     def line(self) -> str | Unavailable:
-        while b"\n" not in self._pending:
+        while (raw := self._take()) is None:
             remaining = self._deadline - self._clock()
             if remaining <= 0:
                 return Unavailable(UnavailableReason.EXPIRED)
@@ -757,12 +908,15 @@ class _TerminalInput:
             chunk = os.read(self._fd, 4096)
             if not chunk:
                 return Unavailable(UnavailableReason.END_OF_INPUT)
+            if self._editing is not None and self._editing.retake():
+                self._pending, self._partial, self._overlong = b"", b"", False
+                self._typed, self._size = [], 0
+                raise _Unusable("the terminal's line editing came back on while the line was typed")
             self._pending += chunk
-            if b"\n" not in self._pending and len(self._pending) > _MAX_TERMINAL_LINE_BYTES:
-                self._pending, self._overlong = b"", True
-        raw, _, self._pending = self._pending.partition(b"\n")
-        if self._overlong or len(raw) > _MAX_TERMINAL_LINE_BYTES:
-            self._overlong = False
+        if isinstance(raw, Unavailable):
+            return raw
+        overlong, self._overlong = self._overlong, False
+        if overlong:
             raise _Unusable("the line is too long")
         try:
             return raw.decode("utf-8").rstrip("\r")
@@ -771,6 +925,79 @@ class _TerminalInput:
 
     def seconds_left(self) -> int:
         return max(0, int(self._deadline - self._clock()))
+
+    def _take(self) -> bytes | Unavailable | None:
+        """The next line of what was read, or ``None`` until one has ended."""
+        if self._editing is not None:
+            return self._edit(self._editing)
+        raw, newline, rest = self._pending.partition(b"\n")
+        if not newline:
+            if len(self._pending) > _MAX_TERMINAL_LINE_BYTES:
+                self._pending, self._overlong = b"", True
+            return None
+        self._pending = rest
+        if len(raw) > _MAX_TERMINAL_LINE_BYTES:
+            self._overlong = True
+        return raw
+
+    def _edit(self, keys: _LineEditing) -> bytes | Unavailable | None:
+        pending, self._pending = self._pending, b""
+        for at, byte in enumerate(pending):
+            if self._partial and 0x80 <= byte <= 0xBF:
+                self._partial += bytes((byte,))
+                if len(self._partial) == _utf8_length(self._partial[0]):
+                    self._keep(self._partial, keys)
+                    self._partial = b""
+                continue
+            if self._partial:  # a character cut short: kept, so the line is refused
+                self._keep(self._partial, keys)
+                self._partial = b""
+            if byte >= 0x80:
+                if _utf8_length(byte) == 1:
+                    self._keep(bytes((byte,)), keys)
+                else:
+                    self._partial = bytes((byte,))
+            elif byte in b"\r\n":
+                keys.echo(b"\n")
+                self._pending = pending[at + 1 :]
+                line = b"".join(typed for typed, _ in self._typed)
+                self._typed, self._size = [], 0
+                return line
+            elif byte in keys.erase:
+                self._erase(1, keys)
+            elif byte == keys.word_erase:
+                while self._typed and self._typed[-1][0].decode("utf-8", "replace").isspace():
+                    self._erase(1, keys)
+                while self._typed and not self._typed[-1][0].decode("utf-8", "replace").isspace():
+                    self._erase(1, keys)
+            elif byte == keys.kill:
+                self._erase(len(self._typed), keys)
+                self._overlong = False
+            elif byte == keys.eof:
+                # As in canonical mode: the end of input on an empty line,
+                # and nothing within one.
+                if not self._typed and not self._overlong:
+                    return Unavailable(UnavailableReason.END_OF_INPUT)
+            else:
+                self._keep(bytes((byte,)), keys)
+        return None
+
+    def _keep(self, typed: bytes, keys: _LineEditing) -> None:
+        if self._overlong or self._size + len(typed) > _MAX_TERMINAL_LINE_BYTES:
+            if not self._overlong:
+                keys.echo(b"\a")
+            self._overlong = True
+            return
+        shown, columns = _echoed(typed)
+        keys.echo(shown)
+        self._typed.append((typed, columns))
+        self._size += len(typed)
+
+    def _erase(self, count: int, keys: _LineEditing) -> None:
+        for _ in range(min(count, len(self._typed))):
+            typed, columns = self._typed.pop()
+            self._size -= len(typed)
+            keys.echo(b"\b" * columns + b" " * columns + b"\b" * columns)
 
 
 def _discard_typeahead(fd: int) -> None:
@@ -793,7 +1020,10 @@ class TerminalResolver:
     The engine's resolver for a real ``run``, ``local run``, ``step`` and
     ``resume``. It reads stdin and writes to stderr, where the live progress
     is; stdout stays the step outcomes'. Before it asks it checks that stdin
-    is a terminal (D7.4) and drops anything typed ahead. Each line is read
+    is a terminal (D7.4) and drops anything typed ahead. While it asks it
+    edits the line itself, since the terminal's own line editing would drop
+    what is typed past its buffer without a word (:func:`_line_editing`):
+    an answer reaches the agent whole or is refused. Each line is read
     until the deadline the broker gives: its expiry is ``expired``, the end
     of the input ``end_of_input``, and the broker decides what either means.
     Ctrl-C raises ``KeyboardInterrupt`` as anywhere else: the step is
@@ -826,7 +1056,13 @@ class TerminalResolver:
         if fd is None or not self._is_terminal(fd):
             return Unavailable(UnavailableReason.NO_TERMINAL)
         _discard_typeahead(fd)
-        terminal = _TerminalInput(fd, self._clock, deadline)
+        with _line_editing(fd) as editing:
+            return self._resolve(request, _TerminalInput(fd, self._clock, deadline, editing))
+
+    # -- internals -------------------------------------------------------------
+    def _resolve(
+        self, request: InteractionRequest, terminal: _TerminalInput
+    ) -> InteractionDecision | Unavailable:
         source = f", subagent {request.agent}" if request.agent is not None else ""
         if request.kind is RequestKind.PERMISSION:
             self._say(
@@ -848,7 +1084,6 @@ class TerminalResolver:
             responses.append(response)
         return Answer(tuple(responses))
 
-    # -- internals -------------------------------------------------------------
     def _stdin(self) -> int | None:
         if self._input_fd is not None:
             return self._input_fd
@@ -920,7 +1155,7 @@ class TerminalResolver:
     def _picks(line: str, question: Question, own: bool) -> list[int] | str:
         """The option numbers ``line`` picks, or why it picks none."""
         words = [word.strip() for word in line.split(",")]
-        if not all(word.isdigit() for word in words):
+        if not all(_OPTION_NUMBER.fullmatch(word) for word in words):
             return "expected option numbers"
         picked = [int(word) for word in words]
         lowest = 0 if own else 1

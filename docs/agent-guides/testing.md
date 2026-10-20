@@ -1367,8 +1367,17 @@ their own boundaries (`tests/test_interaction.py`). Keep covered:
 - `interaction.py` imports only the standard library, the errors and the
   interaction-data bounds, and names no provider or SDK;
 - the terminal resolver, through a pipe, and a real pseudo-terminal for
-  type-ahead: only offered choices are shown, bad input is asked again,
-  and text it could not send back exactly is refused;
+  type-ahead: only offered choices are shown, bad input (an option number
+  that is not a few ASCII digits included) is asked again, and text it
+  could not send back exactly is refused;
+- the terminal resolver's own line editing at a real pseudo-terminal:
+  canonical mode and echo are off while it reads (Linux keeps 4095 bytes
+  of a canonical line and drops the rest silently), so an answer or
+  guidance of up to `MAX_ANSWER_CHARS` characters of any width arrives
+  whole, a line past a bound is refused whole, the terminal's erase,
+  word-erase, kill and end-of-file keys work, the echo goes to the
+  terminal and never to stderr, and the settings come back on an answer,
+  an expiry, an exception and a real Ctrl-C at the controlling terminal;
 - the engine: `InteractionRequiredError` with the phase unchanged, one
   launch despite corrections and a transient report, a resolver asked
   under the repository lock, a broker per launch, a claimed pause with

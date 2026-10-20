@@ -18,6 +18,11 @@ import json
 import os
 import pty
 import re
+import select
+import subprocess
+import sys
+import termios
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -65,6 +70,7 @@ from autoforge.interaction import (
 from autoforge.locking import ControllerLock
 from autoforge.providers import AgentExecutionResult, ScriptedProvider
 from autoforge.sdk_policy import (
+    MAX_ANSWER_CHARS,
     MAX_OPTIONS,
     MAX_QUESTION_CHARS,
     MAX_QUESTIONS,
@@ -1100,6 +1106,321 @@ def test_the_terminal_resolver_drops_what_was_typed_before_it_asked():
     finally:
         os.close(master)
         os.close(slave)
+
+
+@pytest.mark.parametrize(
+    "typed, rule",
+    [
+        ("²", "expected option numbers"),
+        ("١", "expected option numbers"),
+        ("1²", "expected option numbers"),
+        ("9" * 5000, "expected option numbers"),
+        ("+1", "expected option numbers"),
+        ("-1", "expected option numbers"),
+        ("1 2", "expected option numbers"),
+        ("100", "choose from 1 to 2"),
+    ],
+    ids=["superscript", "arabic-indic", "mixed", "past-int-limit", "plus", "minus", "two", "big"],
+)
+def test_a_number_that_picks_no_option_is_asked_again_and_the_next_pick_taken(typed, rule):
+    """R2-F2: ``str.isdigit()`` takes a superscript two, which ``int()``
+    refuses, an Arabic-Indic digit, which ``int()`` takes, and a digit string
+    ``int()`` refuses past its limit. An option number is a few ASCII digits;
+    anything else is unusable input, asked again within the deadline, never
+    an error that ends the invocation."""
+    b, _ = broker()
+    result, shown = _resolve(b.question("q1", [question()]), typed.encode() + b"\n2\n")
+    assert result == Answer((QuestionResponse(("B",)),))
+    assert rule in shown
+
+
+# -- the terminal resolver at a real pseudo-terminal (its own line editing) ---------
+class _Typist(io.StringIO):
+    """The resolver's output at a real pseudo-terminal. Its n-th prompt has
+    the n-th of ``typed`` typed at the master end, from a thread of its own,
+    so the input reaches the terminal once the resolver has taken over its
+    line editing, and while it reads; ``at_prompt(n)`` runs first.
+    ``modes`` keeps the terminal's local modes at each prompt."""
+
+    def __init__(self, master: int, slave: int, typed: tuple[bytes, ...], at_prompt) -> None:
+        super().__init__()
+        self._master, self._slave, self._typed = master, slave, list(typed)
+        self._at_prompt = at_prompt
+        self.modes: list[int] = []
+
+    def write(self, text: str) -> int:
+        if text.endswith(": "):
+            self.modes.append(termios.tcgetattr(self._slave)[3])
+            if self._at_prompt is not None:
+                self._at_prompt(len(self.modes))
+            if self._typed:
+                data = self._typed.pop(0)
+                threading.Thread(target=self._type, args=(data,), daemon=True).start()
+        return super().write(text)
+
+    def _type(self, data: bytes) -> None:
+        try:
+            while data:
+                data = data[os.write(self._master, data) :]
+        except OSError:  # the terminal closed before all of it was typed
+            pass
+
+
+@dataclasses.dataclass
+class _Session:
+    result: object
+    printed: str  # what the resolver wrote to its output
+    shown: bytes  # what the terminal showed
+    modes: list[int]  # the terminal's local modes at each prompt
+    restored: bool  # the terminal's settings afterwards are those before
+
+
+def _at_terminal(resolve, *typed: bytes, read_only: bool = False, at_prompt=None) -> _Session:
+    """``resolve(resolver)`` with a terminal resolver reading a real
+    pseudo-terminal (through a read-only descriptor of its device, with
+    ``read_only``) at which each of ``typed`` is typed at a prompt;
+    ``at_prompt(slave, n)`` runs at the n-th prompt."""
+    master, slave = pty.openpty()
+    shown = bytearray()
+
+    def drain() -> None:
+        while True:
+            try:
+                data = os.read(master, 65536)
+            except OSError:  # every descriptor of the slave end closed
+                return
+            if not data:
+                return
+            shown.extend(data)
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    fd = os.open(os.ttyname(slave), os.O_RDONLY | os.O_NOCTTY) if read_only else slave
+    before = termios.tcgetattr(slave)
+    output = _Typist(master, slave, typed, at_prompt and (lambda n: at_prompt(slave, n)))
+    try:
+        result = resolve(TerminalResolver(input_fd=fd, output=output))
+        restored = termios.tcgetattr(slave) == before
+    finally:
+        if fd != slave:
+            os.close(fd)
+        os.close(slave)
+        reader.join(10)
+        os.close(master)
+    return _Session(result, output.getvalue(), bytes(shown), output.modes, restored)
+
+
+def _deliver(ask):
+    """A ``resolve`` for :func:`_at_terminal`: ``ask(broker)``'s request,
+    handled by a ``prompt`` broker asking the terminal resolver."""
+
+    def resolve(resolver):
+        b = InteractionBroker(PROMPT, LIVE, resolver)
+        return b.handle(ask(b), FAR_REAL())
+
+    return resolve
+
+
+def test_long_multibyte_guidance_from_a_real_terminal_reaches_the_provider_whole():
+    """R2-F1: in canonical mode Linux keeps 4095 bytes of a line and drops the
+    rest without a word, so 1500 three-byte characters, within
+    MAX_ANSWER_CHARS, reached the broker as 1365. The resolver turns
+    canonical mode and echo off while it reads, keeps Ctrl-C's signal, and
+    delivers the guidance whole; it echoes on the terminal, never on its
+    output, and the terminal's settings come back."""
+    long = "数" * 1500
+    session = _at_terminal(_deliver(permission), b"n " + long.encode() + b"\n")
+    assert session.result == Deliver(Deny(long))
+    assert long.encode() in session.shown and long not in session.printed
+    assert session.modes and all(
+        not mode & (termios.ICANON | termios.ECHO) and mode & termios.ISIG for mode in session.modes
+    )
+    assert session.restored
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["数据" * (MAX_ANSWER_CHARS // 2), "\U0001f600" * MAX_ANSWER_CHARS],
+    ids=["three-byte", "four-byte"],
+)
+def test_an_answer_of_the_full_length_in_any_script_is_kept_whole(text):
+    """Every answer MAX_ANSWER_CHARS allows fits the resolver's line, up to
+    four UTF-8 bytes a character: nearly twice what a canonical line holds."""
+    custom = lambda b: b.question("q1", [question("Postgres", "SQLite", custom=True)])  # noqa: E731
+    session = _at_terminal(_deliver(custom), b"0\n" + text.encode() + b"\n")
+    assert session.result == Deliver(Answer((QuestionResponse(custom_text=text),)))
+    assert session.restored
+
+
+def test_typed_text_past_a_bound_is_refused_whole_and_asked_again():
+    """Past MAX_ANSWER_CHARS the guidance is refused by rule; past the line's
+    bytes nothing more is kept or echoed, the bell rings once and the line
+    is refused when it ends; the kill key starts a line again. Nothing is
+    ever delivered in part."""
+    typed = (
+        b"n " + ("数" * (MAX_ANSWER_CHARS + 1)).encode() + b"\n"
+        b"n " + ("数" * 3000).encode() + b"\n"
+        b"n " + b"x" * 9000 + b"\x15n run the unit tests only\n"
+    )
+    session = _at_terminal(_deliver(permission), typed)
+    assert session.result == Deliver(Deny("run the unit tests only"))
+    assert f"guidance is longer than {MAX_ANSWER_CHARS} characters" in session.printed
+    assert session.printed.count("the line is too long") == 1
+    assert session.shown.count(b"\a") == 2
+    assert session.restored
+
+
+@pytest.mark.parametrize(
+    "typed, decision, echoed",
+    [
+        ("n 数据库\x7f\n", Deny("数据"), "库\b\b  \b\b".encode()),
+        ("n ab\x08c\n", Deny("ac"), b"b\b \bc"),
+        ("n run the linter\x17tests\n", Deny("run the tests"), b"linter" + b"\b \b" * 6),
+        ("y\x15n stop\n", Deny("stop"), b"y\b \bn stop"),
+        ("n x\x04y\n", Deny("xy"), b"n xy"),
+        ("\x04", Unavailable(UnavailableReason.END_OF_INPUT), b""),
+        ("n a\x1bb\nc\n", Cancel(), b"n a^[b"),
+    ],
+    ids=["erase-wide", "backspace", "word-erase", "kill", "eof-within", "eof", "control"],
+)
+def test_the_terminal_resolver_edits_the_line_with_the_terminals_keys(typed, decision, echoed):
+    """The terminal's erase (and backspace), word-erase, kill and end-of-file
+    keys work as they do in canonical mode; a wide character is erased in
+    its two columns, and a control character is shown as ^X and refused."""
+    b, _ = broker()
+    request = permission(b)
+    session = _at_terminal(lambda r: r.resolve(request, FAR_REAL()), typed.encode())
+    assert session.result == decision
+    assert echoed in session.shown
+    assert session.restored
+    if isinstance(decision, Cancel):
+        assert "control or escape character" in session.printed
+
+
+def test_a_line_read_while_the_terminals_own_editing_came_back_on_is_refused():
+    """A stop and continue under a shell that resets the terminal, or another
+    program's ``stty``, can turn canonical mode back on while the resolver
+    waits: a line read through it may have been cut, so it is refused, the
+    resolver's own editing taken back, and the next line is taken whole."""
+    canonical: list[list] = []
+
+    def at_prompt(slave: int, n: int) -> None:
+        if n == 1:
+            mode = termios.tcgetattr(slave)
+            mode[3] |= termios.ICANON | termios.ECHO
+            termios.tcsetattr(slave, termios.TCSANOW, mode)
+            canonical.append(mode)
+
+    long = "数" * 1500
+    session = _at_terminal(
+        _deliver(permission),
+        b"n " + long.encode() + b"\n",
+        b"n " + long.encode() + b"\n",
+        at_prompt=at_prompt,
+    )
+    assert canonical and session.result == Deliver(Deny(long))
+    assert session.printed.count("line editing came back on") == 1
+    assert len(session.modes) == 2 and not session.modes[1] & termios.ICANON
+    assert session.restored
+
+
+def test_the_resolver_echoes_on_the_terminal_through_a_read_only_descriptor():
+    """A terminal read through a read-only descriptor is still echoed on,
+    through its device opened to write."""
+    session = _at_terminal(_deliver(permission), b"n tests only\n", read_only=True)
+    assert session.result == Deliver(Deny("tests only"))
+    assert b"n tests only" in session.shown and "tests only" not in session.printed
+    assert session.restored
+
+
+def test_the_terminal_settings_come_back_when_the_resolver_is_interrupted_or_expires():
+    master, slave = pty.openpty()
+    try:
+        before = termios.tcgetattr(slave)
+
+        class Interrupting(io.StringIO):
+            def write(self, text):
+                if text.endswith(": "):
+                    raise KeyboardInterrupt
+                return super().write(text)
+
+        b, _ = broker()
+        with pytest.raises(KeyboardInterrupt):
+            TerminalResolver(input_fd=slave, output=Interrupting()).resolve(
+                permission(b), FAR_REAL()
+            )
+        assert termios.tcgetattr(slave) == before
+        result = TerminalResolver(input_fd=slave, output=io.StringIO()).resolve(
+            permission(b), time.monotonic() + 0.2
+        )
+        assert result == Unavailable(UnavailableReason.EXPIRED)
+        assert termios.tcgetattr(slave) == before
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+_CTRL_C_CHILD = """
+import fcntl, signal, sys, termios, time
+sys.path.insert(0, sys.argv[1])
+from autoforge.cli import TerminalResolver
+from autoforge.interaction import Capabilities, InteractionBroker
+from autoforge.sdk_policy import InteractionSettings, input_digest
+
+signal.signal(signal.SIGINT, signal.default_int_handler)
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+before = termios.tcgetattr(0)
+broker = InteractionBroker(
+    InteractionSettings(policy="prompt"), Capabilities(live_permissions=True), TerminalResolver()
+)
+request = broker.permission("toolu_01", "Bash", "command: make test", input_digest({}, "input"))
+try:
+    broker.handle(request, time.monotonic() + 60)
+except KeyboardInterrupt:
+    print("interrupted", termios.tcgetattr(0) == before, flush=True)
+"""
+
+
+def test_ctrl_c_at_a_real_controlling_terminal_still_interrupts_and_settings_come_back():
+    """D7.7 with the resolver's own line editing: ISIG stays on, so Ctrl-C at
+    the controlling terminal still raises KeyboardInterrupt (the broker
+    decides nothing), and the terminal's settings are restored."""
+    master, slave = pty.openpty()
+    src = Path(interaction_module.__file__).resolve().parents[1]
+    child = subprocess.Popen(
+        [sys.executable, "-c", _CTRL_C_CHILD, str(src)],
+        stdin=slave,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        assert child.stderr is not None
+        printed = b""
+        while b"choose" not in printed:
+            ready, _, _ = select.select([child.stderr], [], [], 30)
+            data = os.read(child.stderr.fileno(), 4096) if ready else b""
+            assert data, printed
+            printed += data
+        os.write(master, b"n half an answ\x03")
+        out, err = child.communicate(timeout=30)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        os.close(master)
+        os.close(slave)
+    assert out == b"interrupted True\n", err
+
+
+def test_a_superscript_digit_then_a_valid_pick_at_a_real_terminal_is_delivered():
+    """R2-F2's reproduction: ``²`` and then a valid pick, typed at a real
+    terminal, deliver the pick instead of failing the invocation."""
+    one = lambda b: b.question("q1", [question()])  # noqa: E731
+    session = _at_terminal(_deliver(one), "²\n1\n".encode())
+    assert session.result == Deliver(Answer((QuestionResponse(("A",)),)))
+    assert "expected option numbers" in session.printed
+    assert session.restored
 
 
 def test_attach_terminal_gives_a_real_run_the_terminal_resolver(tmp_state_dir):
