@@ -31,8 +31,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
 import sys
+import time
 from collections.abc import Callable
+from typing import TextIO
 
 from . import __version__
 from .certificate import NOT_A_PERMISSION
@@ -72,6 +75,7 @@ from .epic_graph import GraphReader
 from .errors import (
     AutoForgeError,
     ConfigurationError,
+    InteractionDataError,
     LockError,
     StateError,
     StateTransitionError,
@@ -85,6 +89,21 @@ from .evidence import (
     record_summary,
 )
 from .github import GitHubClient
+from .interaction import (
+    Allow,
+    AllowScope,
+    Answer,
+    Cancel,
+    DecisionKind,
+    Deny,
+    InteractionDecision,
+    InteractionRequest,
+    Question,
+    QuestionResponse,
+    RequestKind,
+    Unavailable,
+    UnavailableReason,
+)
 from .local_workspace import init_feature_file
 from .locking import ControllerLock, repository_lock_path
 from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
@@ -93,6 +112,7 @@ from .replan_txn import ReplanTransaction
 from .run_namespace import namespace_issue_of_state_dir
 from .scheduler import EpicScheduler, SchedulerInputs
 from .scheduler_stop import StopMode
+from .sdk_policy import MAX_ANSWER_CHARS
 from .state import AutoForgeState
 from .transitions import TERMINAL_PHASES, Phase, WorkflowMode
 from .validation import parse_issue_url
@@ -706,14 +726,273 @@ def _progress_line(line: str) -> None:
     print(line, file=sys.stderr, flush=True)
 
 
-def _show_progress(engine: ControllerEngine) -> None:
-    """Stream a real run's agent progress to stderr (#192).
+# What one line typed at the terminal resolver may hold: an answer of
+# MAX_ANSWER_CHARS characters of up to four UTF-8 bytes each, and a little
+# more. A longer line is read to its end and refused, never kept.
+_MAX_TERMINAL_LINE_BYTES = 4 * MAX_ANSWER_CHARS + 64
+
+
+class _Unusable(Exception):
+    """A line the terminal resolver cannot use: the message names the rule."""
+
+
+class _TerminalInput:
+    """Lines read from ``fd`` until ``deadline``: a string, or :class:`Unavailable`."""
+
+    def __init__(self, fd: int, clock: Callable[[], float], deadline: float) -> None:
+        self._fd = fd
+        self._clock = clock
+        self._deadline = deadline
+        self._pending = b""
+        self._overlong = False
+
+    def line(self) -> str | Unavailable:
+        while b"\n" not in self._pending:
+            remaining = self._deadline - self._clock()
+            if remaining <= 0:
+                return Unavailable(UnavailableReason.EXPIRED)
+            ready, _, _ = select.select([self._fd], [], [], remaining)
+            if not ready:
+                return Unavailable(UnavailableReason.EXPIRED)
+            chunk = os.read(self._fd, 4096)
+            if not chunk:
+                return Unavailable(UnavailableReason.END_OF_INPUT)
+            self._pending += chunk
+            if b"\n" not in self._pending and len(self._pending) > _MAX_TERMINAL_LINE_BYTES:
+                self._pending, self._overlong = b"", True
+        raw, _, self._pending = self._pending.partition(b"\n")
+        if self._overlong or len(raw) > _MAX_TERMINAL_LINE_BYTES:
+            self._overlong = False
+            raise _Unusable("the line is too long")
+        try:
+            return raw.decode("utf-8").rstrip("\r")
+        except UnicodeDecodeError:
+            raise _Unusable("the line is not UTF-8") from None
+
+    def seconds_left(self) -> int:
+        return max(0, int(self._deadline - self._clock()))
+
+
+def _discard_typeahead(fd: int) -> None:
+    """Drop what was typed before the request was shown, so a key pressed
+    earlier never answers it. Nothing to drop on a descriptor that is not a
+    terminal."""
+    try:
+        import termios
+    except ImportError:  # pragma: no cover - a platform without termios
+        return
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (OSError, termios.error):
+        pass
+
+
+class TerminalResolver:
+    """Asks the operator at this terminal (ADR 0007 D5.1, D7.4, D7.7; #134).
+
+    The engine's resolver for a real ``run``, ``local run``, ``step`` and
+    ``resume``. It reads stdin and writes to stderr, where the live progress
+    is; stdout stays the step outcomes'. Before it asks it checks that stdin
+    is a terminal (D7.4) and drops anything typed ahead. Each line is read
+    until the deadline the broker gives: its expiry is ``expired``, the end
+    of the input ``end_of_input``, and the broker decides what either means.
+    Ctrl-C raises ``KeyboardInterrupt`` as anywhere else: the step is
+    interrupted and nothing is decided (D7.7). An input it cannot use is
+    explained, by rule and never by value, and asked again within the same
+    deadline. Only what the request offers is offered; a modified input
+    never is, here.
+
+    Everything shown is the request's own rendering, already bounded,
+    cleaned and redacted (:mod:`autoforge.interaction`).
+    """
+
+    def __init__(
+        self,
+        *,
+        input_fd: int | None = None,
+        output: TextIO | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        is_terminal: Callable[[int], bool] = os.isatty,
+    ) -> None:
+        self._input_fd = input_fd
+        self._output = output
+        self._clock = clock
+        self._is_terminal = is_terminal
+
+    def resolve(
+        self, request: InteractionRequest, deadline: float
+    ) -> InteractionDecision | Unavailable:
+        fd = self._stdin()
+        if fd is None or not self._is_terminal(fd):
+            return Unavailable(UnavailableReason.NO_TERMINAL)
+        _discard_typeahead(fd)
+        terminal = _TerminalInput(fd, self._clock, deadline)
+        source = f", subagent {request.agent}" if request.agent is not None else ""
+        if request.kind is RequestKind.PERMISSION:
+            self._say(
+                f"autoforge: the agent asks permission to use {request.tool_name} "
+                f"(request {request.request_id}{source}); answer within "
+                f"{terminal.seconds_left()}s, Ctrl-C stops the step"
+            )
+            return self._permission(request, terminal)
+        self._say(
+            f"autoforge: the agent asks {len(request.questions)} question(s) "
+            f"(request {request.request_id}{source}); answer within "
+            f"{terminal.seconds_left()}s, Ctrl-C stops the step"
+        )
+        responses: list[QuestionResponse] = []
+        for n, question in enumerate(request.questions, 1):
+            response = self._question(request, question, n, terminal)
+            if not isinstance(response, QuestionResponse):
+                return response
+            responses.append(response)
+        return Answer(tuple(responses))
+
+    # -- internals -------------------------------------------------------------
+    def _stdin(self) -> int | None:
+        if self._input_fd is not None:
+            return self._input_fd
+        try:
+            return sys.stdin.fileno() if sys.stdin is not None else None
+        except (OSError, ValueError):
+            return None
+
+    def _say(self, text: str) -> None:
+        print(text, file=self._output or sys.stderr, flush=True)
+
+    def _ask(self, terminal: _TerminalInput, prompt: str) -> str | Unavailable:
+        """One usable line for ``prompt``, or :class:`Unavailable`."""
+        while True:
+            print(prompt, end="", file=self._output or sys.stderr, flush=True)
+            try:
+                line = terminal.line()
+            except _Unusable as exc:
+                self._say(f"  not used: {exc}; try again")
+                continue
+            if isinstance(line, Unavailable):
+                self._say("")
+                return line
+            if line.strip():
+                return line.strip()
+
+    def _question(
+        self,
+        request: InteractionRequest,
+        question: Question,
+        n: int,
+        terminal: _TerminalInput,
+    ) -> QuestionResponse | Cancel | Unavailable:
+        own = question.custom and DecisionKind.CUSTOM_ANSWER in request.offers
+        cancel = DecisionKind.CANCEL in request.offers
+        title = f"  ({n}/{len(request.questions)})"
+        self._say(f"{title} {question.header}" if question.header else title)
+        self._say(f"  {question.text}")
+        for number, option in enumerate(question.options, 1):
+            described = f" - {option.description}" if option.description else ""
+            self._say(f"    {number}. {option.shown}{described}")
+        if own:
+            self._say("    0. something else, in your own words")
+        several = "numbers separated by commas" if question.multiple else "a number"
+        prompt = f"  choose {several}{', or c to cancel' if cancel else ''}: "
+        while True:
+            line = self._ask(terminal, prompt)
+            if isinstance(line, Unavailable):
+                return line
+            if line.lower() == "c" and cancel:
+                return Cancel()
+            picked = self._picks(line, question, own)
+            if isinstance(picked, str):
+                self._say(f"  not used: {picked}; try again")
+                continue
+            custom: str | None = None
+            if 0 in picked:
+                text = self._ask(terminal, "  your answer: ")
+                if isinstance(text, Unavailable):
+                    return text
+                custom = text
+            labels = tuple(question.options[number - 1].label for number in picked if number)
+            try:
+                return QuestionResponse(choices=labels, custom_text=custom)
+            except InteractionDataError as exc:
+                self._say(f"  not used: {exc}; try again")
+
+    @staticmethod
+    def _picks(line: str, question: Question, own: bool) -> list[int] | str:
+        """The option numbers ``line`` picks, or why it picks none."""
+        words = [word.strip() for word in line.split(",")]
+        if not all(word.isdigit() for word in words):
+            return "expected option numbers"
+        picked = [int(word) for word in words]
+        lowest = 0 if own else 1
+        if any(not lowest <= number <= len(question.options) for number in picked):
+            return f"choose from {lowest} to {len(question.options)}"
+        if len(set(picked)) != len(picked):
+            return "an option is chosen twice"
+        if len(picked) > 1 and not question.multiple:
+            return "this question takes one answer"
+        return picked
+
+    def _permission(
+        self, request: InteractionRequest, terminal: _TerminalInput
+    ) -> Allow | Deny | Cancel | Unavailable:
+        offers = request.offers
+        if request.summary:
+            self._say(f"  {request.summary}")
+        self._say(f"  input sha256 {request.input_sha256}")
+        choices: dict[str, str] = {}
+        if DecisionKind.ALLOW_ONCE in offers:
+            choices["y"] = "allow this call once"
+        if DecisionKind.ALLOW_SESSION in offers:
+            choices["s"] = "allow it for the rest of this session"
+        if DecisionKind.DENY in offers or DecisionKind.DENY_GUIDANCE in offers:
+            choices["n"] = (
+                "deny it (n <text>: and tell the agent what to do instead)"
+                if DecisionKind.DENY_GUIDANCE in offers
+                else "deny it"
+            )
+        if DecisionKind.CANCEL in offers:
+            choices["c"] = "cancel: decline to decide"
+        for key, text in choices.items():
+            self._say(f"    {key}  {text}")
+        while True:
+            line = self._ask(terminal, f"  choose {'/'.join(choices)}: ")
+            if isinstance(line, Unavailable):
+                return line
+            key, _, rest = line.partition(" ")
+            key, rest = key.lower(), rest.strip()
+            if key not in choices or (rest and key != "n"):
+                self._say(f"  not used: expected one of {', '.join(choices)}; try again")
+                continue
+            if key == "y":
+                return Allow(AllowScope.ONCE)
+            if key == "s":
+                return Allow(AllowScope.SESSION)
+            if key == "c":
+                return Cancel()
+            if not rest and DecisionKind.DENY not in offers:
+                self._say("  not used: say what the agent should do instead (n <text>)")
+                continue
+            if rest and DecisionKind.DENY_GUIDANCE not in offers:
+                self._say("  not used: this provider takes no guidance with a denial (n)")
+                continue
+            try:
+                return Deny(rest or None)
+            except InteractionDataError as exc:
+                self._say(f"  not used: {exc}; try again")
+
+
+def _attach_terminal(engine: ControllerEngine) -> None:
+    """Stream a real run's agent progress to stderr (#192), and ask the
+    operator at this terminal when an agent asks for a decision (ADR 0007
+    D5.1, #134; only a profile whose ``interaction_policy`` is ``prompt``
+    ever reaches it).
 
     Only the non-dry paths call this: a dry run launches nothing. stdout is
-    left to the step outcomes, so nothing about progress reaches output a
-    script reads.
+    left to the step outcomes, so nothing about progress or a question
+    reaches output a script reads.
     """
     engine.progress_output = _progress_line
+    engine.interaction_resolver = TerminalResolver()
 
 
 def _print_outcome_now(o: StepOutcome) -> None:
@@ -841,7 +1120,7 @@ def cmd_run(args) -> int:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         engine.save()
-        _show_progress(engine)
+        _attach_terminal(engine)
         outcomes = engine.run(
             max_steps=args.max_steps,
             dry_run=False,
@@ -917,7 +1196,7 @@ def cmd_local_run(args) -> int:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         engine.save()
-        _show_progress(engine)
+        _attach_terminal(engine)
         outcomes = engine.run(
             max_steps=args.max_steps, dry_run=False, on_outcome=_print_outcome_now
         )
@@ -943,7 +1222,7 @@ def cmd_step(args) -> int:
         _guard_scheduler_ownership(engine, state, "step")
         if state.phase not in TERMINAL_PHASES:
             _check_configuration(engine, args, "step", dry_run=False)
-        _show_progress(engine)
+        _attach_terminal(engine)
         outcome = engine.step(dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, [outcome], args.allow_merge)
 
@@ -972,7 +1251,7 @@ def cmd_resume(args) -> int:
         if rc is not None:
             return rc
         _check_configuration(engine, args, "resume", dry_run=False)
-        _show_progress(engine)
+        _attach_terminal(engine)
         outcomes = engine.run(
             max_steps=args.max_steps,
             dry_run=False,

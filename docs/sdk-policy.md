@@ -388,6 +388,13 @@ field and the rule, never the value.
   or a web page. Every other key is counted, not shown. Every shown value
   goes through `progress.clean`, which strips escape sequences and control
   characters, redacts, then clips.
+- **Held where it is built.** The contract types of
+  `src/autoforge/interaction.py` (#134) apply these rules on construction.
+  A question's text is refused past its bound too, so an operator never
+  decides on part of a question. An identity (a request id, a subagent
+  name, a session id) is exact text on one line. The run log keeps the
+  kinds of each decision, never an answer's text, guidance or a modified
+  input.
 
 ## 11. Redaction and logs
 

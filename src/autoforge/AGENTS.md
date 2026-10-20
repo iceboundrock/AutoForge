@@ -33,6 +33,10 @@ claude_stream.py    Claude stream-json reducer: result text, failure, summary, p
 sdk_policy.py       SDK providers' unattended policy: tools, permissions, setting sources,
                     roots, credentials, environment, interaction-data bounds; provider
                     layer, pure: no process, file, SDK import or os.environ change (#149)
+interaction.py      provider-neutral interaction contract (requests, decisions,
+                    capabilities, lifecycle, session identity) and the per-launch
+                    broker (policy, limits, degradation, capability check, run-log
+                    record); no transport, no provider name, persists nothing (#134)
 progress.py         provider-neutral ProgressEvent, cleaning, and the line renderer the
                     engine reports a launch through (#192)
 loop_detect.py      provider-neutral loop detector: action fingerprints, line keys,
@@ -216,8 +220,9 @@ executor_duplex.py,
 prompts/__init__.py                               -> docs/agent-guides/architecture.md
                                                      (+ docs/adr/0003-pi-agent-provider.md and
                                                      docs/pi-policy.md for Pi)
-interaction.py, claude_sdk.py, opencode_sdk.py,
-sdk_helpers/ (all planned)                        -> docs/agent-guides/architecture.md
+interaction.py, cli.py (TerminalResolver),
+claude_sdk.py, opencode_sdk.py,
+sdk_helpers/ (the last three planned)             -> docs/agent-guides/architecture.md
                                                      + docs/adr/0007-sdk-providers-isolated-
                                                      helpers-and-interaction-contract.md
 sdk_policy.py, providers.py (ClaudeSdkProvider,

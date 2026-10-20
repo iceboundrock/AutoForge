@@ -243,6 +243,7 @@ from .executor_duplex import (
     Timeout,
     start_duplex,
 )
+from .interaction import NO_CAPABILITIES, Capabilities, InteractionBroker, InteractionOutcome
 from .loop_detect import LIMIT_LOOP, LoopMonitor, LoopReport
 from .pi_rpc import PiConversation, encodable
 from .progress import ProgressEvent, ProgressKind, ProgressSink, guarded
@@ -317,6 +318,13 @@ class AgentRequest:
     # (:meth:`AgentProvider.sandbox_requirements`). ``None`` launches as
     # before the sandbox existed (``sandbox.mode: disabled``).
     sandbox: SandboxPlan | None = None
+    # Where the adapter takes the agent's requests for a decision (ADR 0007
+    # D5.2, #134): the launch's broker, created by the engine for a provider
+    # whose ``interaction_settings`` names a policy, as it hands over
+    # ``progress``. The adapter mints each provider ask through it and does
+    # what the directive says; it never sees the policy. ``None`` (every
+    # provider through which nothing can ask) keeps today's behaviour.
+    interaction: InteractionBroker | None = None
 
     def __post_init__(self) -> None:
         self.loop_detection = self.loop_detection.for_invocation(self.profile.provider, self.phase)
@@ -377,6 +385,13 @@ class AgentExecutionResult:
     # What the outer sandbox recorded for a sandboxed launch (ADR 0005
     # D10.4), for the run log; ``None`` without one. Never read for a decision.
     sandbox: SandboxFacts | None = None
+    # How an invocation through which the agent could ask ended (ADR 0007
+    # D10.5, #134): ``completed``, ``failed`` (the adapter also reports
+    # ``provider_failure``, and the engine raises InteractionRequiredError,
+    # never correcting or relaunching), ``interrupted``, or ``paused`` with
+    # the pending request (#126 persists it). ``None`` for a launch without
+    # a broker: every existing provider, unchanged.
+    interaction: InteractionOutcome | None = None
 
     @property
     def stdout_tail(self) -> str:
@@ -595,6 +610,17 @@ class AgentProvider:
         ``None`` for a provider through which nothing can ask. Validated:
         :class:`ConfigurationError` for a value the policy refuses."""
         return None
+
+    def interaction_capabilities(self, profile: ProfileConfig) -> Capabilities:
+        """What this provider can carry of a decision for ``profile`` (ADR 0007
+        D5.1, D5.3), for the launch's broker.
+
+        A capability is declared true only once every ADR 0007 §3 gate of its
+        row passed on the provider's pinned pair. None has yet, so every
+        adapter declares :data:`~autoforge.interaction.NO_CAPABILITIES`: an
+        ask fails the invocation under every policy.
+        """
+        return NO_CAPABILITIES
 
     def validate_profile(self, profile: ProfileConfig) -> None:
         """Raise ConfigurationError for values this CLI cannot accept.

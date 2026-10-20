@@ -303,6 +303,13 @@ class ExecutionRecord:
     # and a bounded reason, never an environment value. Written to
     # ``execution.json`` only when the launch had a sandbox.
     sandbox: dict[str, object] = field(default_factory=dict)
+    # What the launch's interaction broker recorded (``InteractionBroker.record``
+    # plus the ``lifecycle``, ADR 0007 D5.2, #134): the policy, its limits
+    # and, per request, its id, kind, what was asked, the offers, the
+    # directive and the kinds of decision delivered; never an answer's text,
+    # guidance or a tool input. Written to ``execution.json`` only when the
+    # launch had a broker.
+    interaction: dict[str, object] = field(default_factory=dict)
 
 
 class RunLogger:
@@ -641,6 +648,9 @@ class RunLogger:
         record.provider_summary = redact_dict(record.provider_summary)
         # Paths and a backend's message; redacted for the same reason.
         record.sandbox = redact_dict(record.sandbox)
+        # Built from bounded, redacted request fields; redacted again
+        # because it is written twice, like the summary.
+        record.interaction = redact_dict(record.interaction)
         if record.loop is not None:
             # Built from cleaned tool names and counts; redacted again
             # because it is written twice, like the summary.
@@ -708,6 +718,8 @@ class RunLogger:
             execution["provider_summary"] = record.provider_summary
         if record.sandbox:
             execution["sandbox"] = record.sandbox
+        if record.interaction:
+            execution["interaction"] = record.interaction
         if record.loop_detection:
             execution["ended_by"] = record.ended_by
             execution["loop_detection"] = record.loop_detection

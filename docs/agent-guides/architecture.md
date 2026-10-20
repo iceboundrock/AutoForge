@@ -182,8 +182,9 @@ check cannot see.
 #149's policy is implemented: `sdk_policy.py` and the two adapters'
 static surface. The adapters have names, option keys, validation, the launch
 allow-list and the sandbox declaration, and every launch is still refused
-before it starts. The rest of this subsection is planned. ADR 0007
-decides how an SDK provider fits these boundaries:
+before it starts. #134's interaction contract and broker are implemented
+(`interaction.py`, below); the helpers, the adapters' mapping and `pause`
+are planned. ADR 0007 decides how an SDK provider fits these boundaries:
 
 - **The policy is data in the provider layer.** `sdk_policy.py` decides
   what a launch may load, which tools it gets and which may ask, its
@@ -203,9 +204,29 @@ decides how an SDK provider fits these boundaries:
 - **Pinned pairs.** SDK and runtime versions are pinned exactly, and a
   mismatch is a provider failure.
 - **Interactions go through a provider-neutral contract and broker** in
-  `interaction.py` (#134), handed to the adapter like `progress`. The
-  adapter maps provider asks to it, and the engine never sees an SDK type.
-  The `pause` policy, its state and recovery are #126's.
+  `interaction.py` (#134, implemented). The engine creates one
+  `InteractionBroker` per launch of a profile whose provider has
+  interaction settings, and hands it to the adapter as
+  `AgentRequest.interaction`, like `progress`. The adapter mints each
+  provider ask through it (`question()` or `permission()`, bounded and
+  redacted on construction, with the decisions its `Capabilities` can
+  carry as `offers`) and calls `handle()`, which returns `Deliver`,
+  `Pause` or `Fail`. It reports the outcome as
+  `AgentExecutionResult.interaction` (completed, failed, interrupted or
+  paused). The broker owns the policy, the per-wait and aggregate limits,
+  the degradation of a live wait and the capability check; the adapter
+  never sees the policy, and the engine never sees an SDK type. Who
+  decides is the engine's `interaction_resolver`: the terminal resolver
+  of `cli.py` for `run`, `step`, `resume` and `local run`, and
+  `Unattended` (no one to ask) for a library caller or a scheduler's
+  worker. The resolver runs inside the launch, so under the repository
+  lock the command holds (D7.2). A failed or paused interaction ends the
+  step with `InteractionRequiredError` and the phase unchanged; it is
+  never corrected or relaunched as transient (D7.6), and nothing is
+  persisted. Until #126 lands the broker never pauses: the `pause`
+  policy, its pending record, the operator commands and recovery are
+  #126's. Every adapter declares no capability (D5.3), so every ask
+  fails today, whatever the policy.
 - **A capability exists only after its gate passes.** The gate is an
   isolated runtime probe, per ADR 0007 §3.
 

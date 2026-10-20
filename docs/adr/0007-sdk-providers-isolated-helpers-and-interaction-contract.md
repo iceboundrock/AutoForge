@@ -3,7 +3,13 @@
 - **Status:** accepted for implementation. #149's part (D2.7, D10.1, D10.2
   and the configuration rows of D6.3) is implemented, with two dated
   amendments (D6.3 and D10.2 below); its record is
-  [docs/sdk-policy.md](../sdk-policy.md). The rest is not implemented yet.
+  [docs/sdk-policy.md](../sdk-policy.md). #134's first part is
+  implemented: the contract and broker (D5.1, D5.2, D5.4,
+  `src/autoforge/interaction.py`), the `prompt` and `fail` policies with
+  their limits, the lock rule (D7.1 to D7.4, D7.6, D7.7, with the broker
+  never pausing until #126), the terminal resolver and the two type
+  extensions (D10.5). Every adapter still declares no capability (D5.3).
+  The rest is not implemented yet.
   It is implemented by #134 (the provider-neutral
   interaction contract and its broker), #126 (the one state bump, `pause`
   and continuation in the engine, the operator commands, crash recovery

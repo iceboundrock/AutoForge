@@ -1334,3 +1334,38 @@ policy against sentinel hooks, MCP servers, skills, agents and instruction
 files, and assert that none loads. A control run without the policy
 asserts that the probe can see them load. Re-run both whenever a pin, a
 policy field or a runtime changes.
+
+### Interaction contract and broker (#134, ADR 0007)
+
+No adapter can ask yet (every one declares no capability), so the contract,
+the broker, the terminal resolver and the engine's handling are held at
+their own boundaries (`tests/test_interaction.py`). Keep covered:
+
+- the contract refuses what it cannot render or bind (an oversized
+  question, an escape-carrying or credential-shaped label, identity or
+  answer, two options or questions shown alike, offers a request cannot
+  take), naming the rule and never the value. Shown fields are cleaned,
+  redacted and clipped;
+- `decision_problem`: a decision outside the request's offers or its
+  options, two picks for a single choice, or custom text where none is
+  allowed is never delivered;
+- the broker's table: `fail` never asks. `prompt` asks until the earlier of
+  the wait limit and the invocation's limit, delivers only an offered and
+  fitting decision, and fails on no terminal, end of input, expiry, a late
+  decision, a resolver error, no live capability or the aggregate limit.
+  An expiry the invocation's limit caused is never a pause, a pause needs
+  both `pause_available` and the kind's capability, a request is handled
+  once and only as it was minted, and Ctrl-C propagates;
+- the run-log record keeps no answer text, guidance or modified input;
+- one Claude-shaped and one OpenCode-shaped question payload become equal
+  requests with one rendering, and the answer maps back to each shape;
+- `interaction.py` imports only the standard library, the errors and the
+  interaction-data bounds, and names no provider or SDK;
+- the terminal resolver, through a pipe, and a real pseudo-terminal for
+  type-ahead: only offered choices are shown, bad input is asked again,
+  and text it could not send back exactly is refused;
+- the engine: `InteractionRequiredError` with the phase unchanged, one
+  launch despite corrections and a transient report, a resolver asked
+  under the repository lock, a broker per launch, a claimed pause with
+  nothing persisted, a LOCAL launch charge kept, and a dry run that asks
+  no one.
