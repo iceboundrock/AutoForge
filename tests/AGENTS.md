@@ -85,6 +85,16 @@ read it before adding tests for a listed area.
   `~/.bashrc` or `~/.zshrc` (or a login shell without one),
   `CLAUDE_ENV_FILE` and `CLAUDE_CODE_SHELL_PREFIX`, with the real bash and
   zsh.
+- `tests/scheduler_worker.py` is the worker process of the scheduler tests
+  (#182): `python -P tests/scheduler_worker.py FIXTURES epic _worker ...`,
+  the `worker_command` a test gives the scheduler, runs the production
+  `run_worker` after doing in its own process what the autouse fixtures do
+  in the test's, with a FakeGitHub seeded from `FIXTURES/<issue>.json` over
+  the test's bare origin and a `ScriptedProvider` playing that fixture's
+  steps (`implement`, `review`, `blocked`, `garbage`, `hold`; a step's
+  `started` and `gate` files are the synchronization). In-process patches
+  of a test never reach a worker: what a worker must see goes in its
+  fixture or the configuration file.
 - `tests/pi_fake.py` holds the engine-level Pi harness: `PiFake` (a fake
   `pi` executable outside the repository that logs every start, argv, cwd,
   environment name and RPC record) and `ScriptedPi` (the real
@@ -152,6 +162,19 @@ EPIC dependency graph (#179)          test_epic_graph.py (snapshots, refusals, c
                                       order, digests, the re-read, no write; a fake `gh` serving
                                       graphs to the real client, and tests/fixtures/github_graph);
                                       the typed reads: test_github.py; API URLs: test_validation.py
+parallel EPIC scheduler and its       test_scheduler.py (bounded admission in ready order, slow,
+workers (#182)                        BLOCKED, failing and READY_FOR_MERGE workers, drain, Ctrl-C,
+                                      the grace, SIGHUP, exits with a live worker, the graph race,
+                                      spawn failures, resume, a run lock a status probe held at
+                                      startup or at a close_unready reconciled and retried at the
+                                      next snapshot, once per issue, isolation, no write /
+                                      effect / provider name; real worker subprocesses through
+                                      tests/scheduler_worker.py), test_worker.py (in process:
+                                      startup refusals, the step boundary, signals, the recorded
+                                      configuration, provider and #158 gate parity),
+                                      test_executor_supervised.py, test_scheduler_stop.py; the
+                                      engine's hooks: test_engine_locking.py; scheduler keys:
+                                      test_config.py
 REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.py; load and
                                       protocol: test_state.py)
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py

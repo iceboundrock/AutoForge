@@ -176,6 +176,16 @@ class LockOrderError(AutoForgeError):
     """
 
 
+class WorkerStartupError(AutoForgeError):
+    """A scheduler worker refused to start (ADR 0008 D9.2, #182).
+
+    Its argv does not parse, an inherited descriptor was not proven to hold
+    its lock, or the namespace's binding, its open claim, ``scheduler.json``
+    or the configuration digest does not match what the worker was started
+    for. The worker exits 2 before it reads or writes any state.
+    """
+
+
 class ExecutionError(AutoForgeError):
     """Agent/CLI subprocess failed (non-zero exit, spawn failure, ...)."""
 

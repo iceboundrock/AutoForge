@@ -1798,8 +1798,13 @@ prompt.
 
 The parallel EPIC scheduler (ADR 0008 D3, D4) decides which children of an
 EPIC are admissible from GitHub's native graph alone
-(`src/autoforge/epic_graph.py`, #179). Nothing calls it yet: #182's
-supervisor will, holding L0, before each claim. Sequential `UPDATE_EPIC`
+(`src/autoforge/epic_graph.py`, #179). Its caller is the scheduler
+(`src/autoforge/scheduler.py`, #182), holding L0: a snapshot at most once
+per poll interval while admission is open, and the re-read before each
+claim. These four reads are all the GitHub the scheduler itself uses: every
+write of an issue (its branch, PR and comments) is that issue's worker
+engine's, under the same effect records and gates as a standalone run, and
+no worker writes another issue's objects. Sequential `UPDATE_EPIC`
 selection (`_verify_issue_selectable`) is unchanged and does not read it.
 
 - **The reads.** Four typed, read-only `GitHubClient` methods, each a plain

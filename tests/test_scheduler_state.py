@@ -1340,6 +1340,22 @@ def test_the_callers_own_children_are_owned_without_taking_their_lock(common):
     assert item.fact is LocalFact.OWNED and item.own_child and not item.observed_live
 
 
+def test_only_limits_the_pass_to_the_named_namespaces(common):
+    """The scheduler's re-check of the namespaces it saw live (D14.2 step 2)."""
+    for n in (7, 8, 9):
+        _bind(common, n)
+    claim = _open(issue_namespace(common, 8))
+    report = _reconcile(common, only={8, 9, 12})
+    assert [item.issue_number for item in report.issues] == [8, 9]
+    item = _item(report, 8)
+    assert str(item.classification) == "resumable(not-started)" and item.fact is None
+    assert item.classification is not None and item.classification.open_claim == claim
+    assert str(_item(report, 9).classification) == "fresh"
+    assert not issue_namespace(common, 7).run_lock_file.exists(), "its L2 is never taken"
+    assert not issue_namespace(common, 12).directory.exists(), "nothing is created"
+    assert report.admissible
+
+
 def test_reconciliation_never_spawns_never_writes_state_and_never_reaches_github(
     common, monkeypatch
 ):

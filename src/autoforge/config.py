@@ -36,10 +36,12 @@ than keeping as the string it looks like. See the note above ``_scalar``.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import json
 import os
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from . import __prompt_version__
@@ -465,6 +467,33 @@ class MergeConfig:
     verification_commands: list[list[str]] = field(default_factory=list)
 
 
+# The parallel EPIC scheduler's bounds (ADR 0008 D18.3, D18.4): no unbounded
+# mode and no CPU-count default. ``scheduler.json`` (``SchedulerConfig``)
+# enforces the same constants.
+MAX_PARALLEL_BOUNDS = (1, 4)
+POLL_INTERVAL_BOUNDS = (15, 3600)
+STOP_GRACE_BOUNDS = (10, 600)
+
+SCHEDULER_KEYS = ("max_parallel", "poll_interval_seconds", "stop_grace_seconds")
+
+
+@dataclass
+class EpicSchedulerConfig:
+    """How ``autoforge epic`` runs one EPIC's issues in parallel (ADR 0008 D18; #182).
+
+    ``max_parallel`` is the number of issue workers live at once (1-4).
+    ``poll_interval_seconds`` is the least time between two EPIC snapshots
+    while admission is open. ``stop_grace_seconds`` is how long a stop or a
+    first Ctrl-C waits for the workers to return after it interrupted them:
+    above the executor's agent teardown plus a state save. Workers never
+    merge, whatever ``safety.allow_merge`` says.
+    """
+
+    max_parallel: int = 2
+    poll_interval_seconds: int = 60
+    stop_grace_seconds: int = 30
+
+
 VALIDATION_KEYS = ("commands", "scope")
 
 
@@ -723,6 +752,7 @@ TOP_LEVEL_KEYS = (
     "local",
     "sandbox",
     "validation",
+    "scheduler",
     "profiles",
 )
 
@@ -766,6 +796,7 @@ class AutoForgeConfig:
     local: LocalConfig = field(default_factory=LocalConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    scheduler: EpicSchedulerConfig = field(default_factory=EpicSchedulerConfig)
     profiles: dict[str, ProfileConfig] = field(default_factory=dict)
 
     def profile(self, name: str) -> ProfileConfig:
@@ -914,8 +945,6 @@ def load_config_file(path: str | Path | None) -> AutoForgeConfig:
 
             data = tomllib.loads(p.read_text(encoding="utf-8"))
         elif suffix == ".json":
-            import json
-
             data = json.loads(
                 p.read_text(encoding="utf-8"), object_pairs_hook=_pairs_without_duplicates
             )
@@ -932,6 +961,19 @@ def load_config_file(path: str | Path | None) -> AutoForgeConfig:
     if not isinstance(data, dict):
         raise ConfigurationError(f"config {p} must contain a mapping at top level")
     return _merge_config(cfg, data, source=str(p))
+
+
+def config_digest(cfg: AutoForgeConfig) -> str:
+    """The SHA-256 of the effective configuration, as canonical JSON (ADR 0008 D9.2 step 4).
+
+    A scheduler records it in ``scheduler.json`` and each worker requires
+    the configuration it loaded to have the same one, so a file edited
+    between the scheduler's start and a worker's is refused, never run.
+    It covers every field of the effective configuration, the defaults a
+    file left in force included; it is a comparison, never shown.
+    """
+    document = json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(document.encode("utf-8")).hexdigest()
 
 
 # Every parser backend must hand `_merge_config` the document as written: a
@@ -1321,6 +1363,20 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         base.merge.verification_commands = _as_argv_list(
             merge["verification_commands"], source, "merge.verification_commands"
         )
+    scheduler = _section(data, "scheduler", source, SCHEDULER_KEYS)
+    for key, (low, high) in (
+        ("max_parallel", MAX_PARALLEL_BOUNDS),
+        ("poll_interval_seconds", POLL_INTERVAL_BOUNDS),
+        ("stop_grace_seconds", STOP_GRACE_BOUNDS),
+    ):
+        if key in scheduler:
+            value = _as_int(scheduler[key], source, f"scheduler.{key}")
+            if not low <= value <= high:
+                raise ConfigurationError(
+                    f"{source}: 'scheduler.{key}' must be between {low} and {high}, got "
+                    f"{value} (there is no unbounded mode)"
+                )
+            setattr(base.scheduler, key, value)
     review = _section(data, "review", source, REVIEW_KEYS)
     replan = _section(review, "replan", source, REPLAN_KEYS, label="review.replan")
     rp = base.review.replan

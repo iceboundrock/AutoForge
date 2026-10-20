@@ -37,8 +37,11 @@ The engine must not contain Claude Code or OpenCode CLI-specific flag logic.
 phase (`READY_FOR_MERGE`, `DONE`, `BLOCKED`, `FAILED`). With the merge gate
 open (`safety.allow_merge: true` **and** `--allow-merge`) `READY_FOR_MERGE`
 is no longer a stop phase: the loop continues through the controller-side
-verification, `MERGE` and `UPDATE_EPIC`. Which module owns which concern is
-listed in the module map in `src/autoforge/AGENTS.md`.
+verification, `MERGE` and `UPDATE_EPIC`. A caller may add stop phases
+(`extra_stop_phases`) and a `should_continue` predicate the loop asks
+before every step, the first one included; both are a scheduler worker's
+(#182, below), and the defaults are the loop above. Which module owns which
+concern is listed in the module map in `src/autoforge/AGENTS.md`.
 
 ### Provider adapters
 
@@ -737,6 +740,53 @@ narrowed view means (prompt version `v10`): `common.md` that the
 operator's checkout, other worktrees, the controller's state and the home's
 files may be absent and the shared git metadata read-only, and
 `local_common.md` that the git directory may be read-only.
+
+### Parallel EPIC scheduler, workers and supervision (ADR 0008, #182)
+
+The scheduler decides eligibility, capacity and ownership; each issue's
+work is the unchanged engine's, in a worker process of its own. Four
+modules, each with one concern:
+
+- **`scheduler.py`** is the supervisor. One foreground process per EPIC
+  holds L0 for its whole life (close-only from before its first spawn),
+  reads GitHub through #179's four graph reads and nothing else, and admits
+  ready issues one transaction at a time: L2 non-blocking, the strict
+  namespace classification, the admission re-read (a changed issue writes no
+  claim and makes the next tick re-snapshot), the binding, the claim, then
+  the spawn. It reaps exited workers and finalizes their claims under a
+  re-acquired L2 (#181's `finalize_worker`), and handles the stop request,
+  SIGINT, SIGTERM and SIGHUP. It never invokes an agent, never writes
+  GitHub, never records an effect and never parses a `CONTROL_RESULT`; it
+  names no provider and imports none.
+- **`worker.py`** is the process the scheduler starts for one admitted
+  issue: `sys.executable -P -m autoforge.cli epic _worker ...` (a hidden
+  entry point, not an operator command). It adopts the inherited L0 and L2
+  descriptors only after the fresh-descriptor proof, checks that the open
+  claim, `scheduler.json`'s invocation and the digest of the configuration
+  it loaded are the ones it was started for (each refusal exits 2 before
+  any state is read or written), binds a `ControllerEngine` to the issue's
+  namespace (`bind_issue_namespace`) and runs it under the adopted L0
+  (`locked(held=...)`). The engine is unchanged: a worker is a policy
+  around `run()`, never a fork of the workflow.
+- **`executor_supervised.py`** is the supervision handle, executor layer
+  with no workflow semantics: it starts the worker in a session of its own
+  (so the terminal's signals reach only the scheduler), with every
+  descriptor closed but the standard streams and the two passed locks,
+  stdin on `/dev/null` and stdout and stderr on the worker log, and it
+  signals a child only while it is unreaped (so a reused pid is never hit),
+  never with SIGKILL. Unlike `executor.py` it contains nothing: the worker
+  runs its own contained agent launches.
+- **`scheduler_stop.py`** owns `epics/<n>/stop-request`, the one file a
+  process without L0 writes: published by `link(2)` from a fsynced
+  temporary, never replaced, read strictly by the scheduler and every
+  worker, removed only by the L0 holder.
+
+What crosses between them is deliberately small: the worker's argv (the
+checkout, the configuration file's path, the EPIC and issue numbers, the
+claim id, generation and invocation, the two descriptor numbers), the
+inherited L0 and L2, and the files under the namespace. No environment
+variable carries authority, and the scheduler learns what a worker did only
+from the state it left, never from its exit status or its log.
 
 ### GitHub client
 

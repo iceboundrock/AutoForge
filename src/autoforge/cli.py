@@ -290,8 +290,15 @@ def _load_cfg(args) -> AutoForgeConfig:
 
 
 def main(argv: list[str] | None = None) -> int:
+    words = sys.argv[1:] if argv is None else list(argv)
+    if words[:2] == ["epic", "_worker"]:
+        # The scheduler's hidden worker entry point (ADR 0008 D9.1, #182): not
+        # a command an operator types, so it is not in the parser or --help.
+        from .worker import run_worker
+
+        return run_worker(words[2:])
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(words)
     try:
         if args.command == "doctor":
             return cmd_doctor(args)

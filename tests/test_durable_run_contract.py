@@ -837,10 +837,13 @@ def test_no_module_reinterprets_a_loaded_run_through_the_current_configuration()
 
     The configuration is loaded exactly once per process, by the CLI, before
     any state is read; no production module calls ``load_config`` after
-    loading state. (A test of shape rather than of one scenario.)
+    loading state. (A test of shape rather than of one scenario.) A
+    scheduler worker is a process of its own (``epic _worker``, #182): its
+    entry point loads the configuration before it reads any state, and the
+    worker tests pin that order.
     """
     for path in sorted(SRC.rglob("*.py")):
-        if path.name in ("cli.py", "doctor.py", "config.py"):  # entry points
+        if path.name in ("cli.py", "doctor.py", "config.py", "worker.py"):  # entry points
             continue
         text = path.read_text(encoding="utf-8")
         assert "load_config" not in text, f"{path.name} loads configuration"

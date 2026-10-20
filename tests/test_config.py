@@ -408,6 +408,7 @@ SECTION_SCHEMAS = [
     ("review.replan", ("review", "replan"), ("enabled", "false"), config.REPLAN_KEYS),
     ("workflow", ("workflow",), ("max_review_rounds", "3"), config.WORKFLOW_KEYS),
     ("local", ("local",), ("max_fix_rounds", "0"), config.LOCAL_KEYS),
+    ("scheduler", ("scheduler",), ("max_parallel", "2"), config.SCHEDULER_KEYS),
     ("profiles.fix", ("profiles", "fix"), ("effort", '"high"'), config.PROFILE_KEYS),
 ]
 
@@ -692,6 +693,7 @@ def test_removed_execution_allow_merge_keeps_its_own_message(tmp_path):
         (config.REPLAN_KEYS, config.ReplanConfig),
         (config.WORKFLOW_KEYS, config.WorkflowConfig),
         (config.LOCAL_KEYS, config.LocalConfig),
+        (config.SCHEDULER_KEYS, config.EpicSchedulerConfig),
         (config.PROFILE_KEYS, config.ProfileConfig),
         (config.TOP_LEVEL_KEYS, config.AutoForgeConfig),
     ],
@@ -2334,3 +2336,95 @@ def test_the_example_yaml_documents_an_empty_validation_set(no_pyyaml):
     example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
     cfg = load_config_file(example)
     assert cfg.validation.commands == [] and cfg.validation.scope == "candidate-tree"
+
+
+# -- scheduler (ADR 0008 D18; #182) ------------------------------------------------------
+
+
+def _scheduler_cfg(tmp_path, scheduler: object):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "scheduler": scheduler}), encoding="utf-8")
+    return load_config_file(p)
+
+
+def test_scheduler_defaults():
+    cfg = default_config()
+    assert (
+        cfg.scheduler.max_parallel,
+        cfg.scheduler.poll_interval_seconds,
+        cfg.scheduler.stop_grace_seconds,
+    ) == (2, 60, 30)
+
+
+def test_scheduler_keys_load_within_their_bounds(tmp_path):
+    cfg = _scheduler_cfg(
+        tmp_path, {"max_parallel": 4, "poll_interval_seconds": 15, "stop_grace_seconds": 600}
+    )
+    assert (
+        cfg.scheduler.max_parallel,
+        cfg.scheduler.poll_interval_seconds,
+        cfg.scheduler.stop_grace_seconds,
+    ) == (4, 15, 600)
+    cfg = _scheduler_cfg(tmp_path, {"max_parallel": 1})
+    assert cfg.scheduler.max_parallel == 1 and cfg.scheduler.stop_grace_seconds == 30
+
+
+@pytest.mark.parametrize(
+    "scheduler, match",
+    [
+        ({"max_parallel": 0}, "'scheduler.max_parallel' must be between 1 and 4, got 0"),
+        ({"max_parallel": 5}, "'scheduler.max_parallel' must be between 1 and 4, got 5"),
+        ({"max_parallel": -1}, "'scheduler.max_parallel' must be between 1 and 4, got -1"),
+        ({"max_parallel": "2"}, "scheduler.max_parallel"),
+        ({"max_parallel": True}, "scheduler.max_parallel"),
+        ({"poll_interval_seconds": 14}, "between 15 and 3600"),
+        ({"poll_interval_seconds": 3601}, "between 15 and 3600"),
+        ({"stop_grace_seconds": 9}, "between 10 and 600"),
+        ({"stop_grace_seconds": 601}, "between 10 and 600"),
+        ({"max_paralel": 2}, "max_paralel"),
+        ([], "'scheduler' must be a mapping"),
+    ],
+)
+def test_scheduler_values_out_of_bounds_are_refused(tmp_path, scheduler, match):
+    """There is no unbounded mode: 0, 5 and a negative value are refused (#182)."""
+    with pytest.raises(ConfigurationError, match=re.escape(match) if "'" in match else match):
+        _scheduler_cfg(tmp_path, scheduler)
+
+
+def test_the_scheduler_bounds_are_the_scheduler_states():
+    from autoforge import scheduler_state
+
+    assert scheduler_state.MAX_PARALLEL_BOUNDS == config.MAX_PARALLEL_BOUNDS == (1, 4)
+    assert scheduler_state.POLL_INTERVAL_BOUNDS == config.POLL_INTERVAL_BOUNDS == (15, 3600)
+    assert scheduler_state.STOP_GRACE_BOUNDS == config.STOP_GRACE_BOUNDS == (10, 600)
+
+
+def test_the_config_digest_is_stable_and_covers_every_field(tmp_path):
+    a, b = default_config(), default_config()
+    assert config.config_digest(a) == config.config_digest(b)
+    assert re.fullmatch(r"[0-9a-f]{64}", config.config_digest(a))
+    b.github.timeout_seconds += 1
+    assert config.config_digest(a) != config.config_digest(b)
+    c = default_config()
+    c.profiles["fix"].model = "another"
+    assert config.config_digest(a) != config.config_digest(c)
+    # The same file loads to the same digest; an edit changes it.
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "scheduler": {"max_parallel": 3}}), encoding="utf-8")
+    first = config.config_digest(load_config_file(p))
+    assert config.config_digest(load_config_file(p)) == first
+    p.write_text(json.dumps({"version": 1, "scheduler": {"max_parallel": 4}}), encoding="utf-8")
+    assert config.config_digest(load_config_file(p)) != first
+
+
+def test_the_example_yaml_documents_the_scheduler_defaults(no_pyyaml):
+    import autoforge
+
+    example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
+    cfg = load_config_file(example)
+    assert (
+        cfg.scheduler.max_parallel,
+        cfg.scheduler.poll_interval_seconds,
+        cfg.scheduler.stop_grace_seconds,
+    ) == (2, 60, 30)
+    assert "\nscheduler:\n" in example.read_text(encoding="utf-8")
