@@ -155,7 +155,8 @@ DEFAULT_WORKER_COMMAND: tuple[str, ...] = (sys.executable, "-P", "-m", "autoforg
 # The loop's tick: how soon an exited worker is reaped and a signal handled.
 TICK_SECONDS = 0.1
 # Stale admission re-reads in a row that each take a new snapshot at once;
-# after that the next snapshot waits for the poll interval.
+# after that the next snapshot, and with it the next re-read, waits for the
+# poll interval.
 MAX_STALE_RESNAPSHOTS = 3
 
 ALLOW_MERGE_NOTICE = (
@@ -234,6 +235,9 @@ class _Snapshot:
     taken_at: float
     expected: ExpectedIdentity
     verdicts: tuple[ChildVerdict, ...] = field(default_factory=tuple)
+    # An admission re-read found it stale after the re-snapshot budget was
+    # spent: nothing more is admitted from it, and so nothing re-read.
+    stale: bool = False
 
 
 def _default_output(line: str) -> None:
@@ -816,15 +820,21 @@ class EpicScheduler:
             taken = self._take_snapshot()
             if taken is None:
                 return
+        elif taken.stale:
+            return
         for verdict in ready_set(evaluate(taken.snapshot, self.local_facts())):
             if self._free_slots() <= 0 or self.admission.status is not AdmissionStatus.OPEN:
                 return
             outcome = self._admit(taken, verdict)
             if outcome is _Admit.STALE:
                 # No claim; the next tick takes a new snapshot (D2.2 step 4). A
-                # graph that keeps changing waits for the poll interval instead.
+                # graph that keeps changing waits for the poll interval instead,
+                # and its stale snapshot is not re-read every tick meanwhile.
                 self._stale_streak += 1
-                self._force_snapshot = self._stale_streak <= MAX_STALE_RESNAPSHOTS
+                if self._stale_streak <= MAX_STALE_RESNAPSHOTS:
+                    self._force_snapshot = True
+                else:
+                    taken.stale = True
                 return
             if outcome is _Admit.ADMITTED:
                 self._stale_streak = 0

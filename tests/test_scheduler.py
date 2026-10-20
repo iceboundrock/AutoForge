@@ -29,7 +29,7 @@ import pytest
 
 from autoforge import cli, scheduler
 from autoforge.config import load_config_file
-from autoforge.epic_graph import GRAPH_READS, LocalFact
+from autoforge.epic_graph import GRAPH_READS, LocalFact, NodeReread, RereadStatus
 from autoforge.errors import ConfigurationError, ExecutionError, LockError, StateError
 from autoforge.locking import (
     ControllerLock,
@@ -727,6 +727,48 @@ def test_a_dependency_added_between_snapshot_and_claim_writes_no_claim(bench):
     assert len(snapshots) == 2  # and a new snapshot was taken at once, which blocks it
     assert sched.local_facts().get(2) is None
     assert b.admitted() == []
+
+
+def test_a_graph_that_stays_stale_is_re_read_once_per_poll_interval(bench, monkeypatch):
+    # PR #248 R1-F2: three immediate re-snapshots, then one snapshot and one
+    # re-read per poll interval; the stale snapshot is never re-read per tick.
+    b = bench()
+    b.issue(2)
+    now = [0.0]
+    snapshots: list[float] = []
+    issue_reads: list[float] = []
+    rereads: list[float] = []
+    real = scheduler.reread_node
+
+    def always_stale(client, snapshot, issue):
+        found = real(client, snapshot, issue)
+        rereads.append(now[0])
+        return NodeReread(found.number, RereadStatus.STALE, found.node_digest, ("injected",))
+
+    def on_call(endpoint: str) -> None:
+        if endpoint == f"repos/{R}/issues/2":
+            issue_reads.append(now[0])
+        if endpoint.startswith(f"repos/{R}/issues/1/sub_issues"):
+            snapshots.append(now[0])
+
+    def tick(s: EpicScheduler) -> None:
+        now[0] += 1.0
+        if now[0] == 150.0:
+            assert request_stop(b.root, 1, StopMode.DRAIN).written
+
+    monkeypatch.setattr(scheduler, "reread_node", always_stale)
+    b.graph.on_call = on_call
+    sched = b.scheduler(on_tick=tick, clock=lambda: now[0], sleep=lambda seconds: None)
+    interval = sched.poll_interval
+    assert interval == 60 and scheduler.MAX_STALE_RESNAPSHOTS == 3
+    assert sched.run() == 0
+    assert sched.end_reason is EndReason.DRAINED
+    expected = [0.0, 1.0, 2.0, 3.0, 3.0 + interval, 3.0 + 2 * interval]
+    assert rereads == expected
+    assert issue_reads == expected  # GitHub itself: one GET of the issue per re-read
+    assert snapshots == expected
+    assert "\n".join(b.lines).count("changed since the snapshot") == len(expected)
+    assert b.claims(2) is None and b.admitted() == []
 
 
 def _failing_spawn(*args, **kwargs):

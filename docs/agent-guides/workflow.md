@@ -171,7 +171,9 @@ transition:
   `scheduler.poll_interval_seconds` (default 60) while admission is open, at
   once after an admission whose re-read found the issue changed (no claim
   is written for it), at most three times in a row before it waits for the
-  interval again.
+  interval again. While it waits, the stale snapshot admits nothing, so
+  nothing is re-read either: a graph that keeps changing costs one snapshot
+  and one re-read per interval, not one per tick.
 - **The settlement boundary.** A worker runs the engine with the merge gate
   closed (`allow_merge=False`, whatever `safety.allow_merge` says) and with
   `MERGE` and `UPDATE_EPIC` as extra stop phases, so it stops at

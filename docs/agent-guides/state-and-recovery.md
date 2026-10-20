@@ -1014,9 +1014,10 @@ liveness except L2.
   is `owned` for this snapshot and skipped); under it the strict namespace
   read and `classify` (only none, `fresh` and `resumable` go on; a settled
   namespace's open claim is closed `settled`); #179's re-read of the issue
-  and its blockers (`stale` writes nothing and forces a new snapshot); the
-  binding on first admission; `open_claim` (superseding an earlier
-  invocation's open `resumable` claim); the worker log
+  and its blockers (`stale` writes nothing and forces a new snapshot, three
+  times in a row at most: after that the next snapshot and the next re-read
+  wait for the poll interval); the binding on first admission; `open_claim`
+  (superseding an earlier invocation's open `resumable` claim); the worker log
   `workers/<generation>.log` opened append-only and bounded; the spawn,
   with L0 and L2 passed by inheritance (`pass_fds`) and every other
   descriptor closed; `record_worker` (pid, kernel start time, log path:
