@@ -29,9 +29,11 @@ request; then, while admission is open and slots are free, take a snapshot
 re-read), reconcile again under L2 each namespace whose run lock was seen
 held (D14.2 step 2; one still held stays ``owned``), close each earlier
 invocation's ``resumable`` claim whose issue is no longer ready
-(``close_unready``), those the re-check found included, and admit ready
-issues in order up to the free slots. It exits once no worker is live and
-nothing is admissible.
+(``close_unready``), those the re-check found included (one whose run lock
+is held then is seen held too, and the next snapshot tries again), and
+admit ready issues in order up to the free slots. It exits once no worker
+is live and nothing is admissible: each issue seen held gets one more
+snapshot first, and one still held then is reported.
 
 **Admission** (D2.2), holding L0: L2 non-blocking; under it, the strict
 read and classification of the namespace (only none, ``fresh`` and
@@ -292,9 +294,10 @@ class EpicScheduler:
         # Facts held for the rest of the invocation (D4.1, D9.6).
         self._held: dict[int, LocalFact] = {}
         # Live owners this scheduler did not start (``observed_live``), reconciled
-        # again under L2 at every snapshot (D14.2 step 2).
+        # again under L2 at every snapshot (D14.2 step 2), and those already
+        # given their one more snapshot before the scheduler ends.
         self._observed_live: set[int] = set()
-        self._observed_rechecked = False
+        self._observed_rechecked: set[int] = set()
         # Earlier invocations' open resumable claims (D14.2): superseded by an
         # admission or closed by close_unready.
         self._resumable_open: dict[int, Claim] = {}
@@ -560,16 +563,24 @@ class EpicScheduler:
             return True
         if ready_set(evaluate(self._snapshot.snapshot, self.local_facts())):
             return True
-        if self._observed_live and not self._observed_rechecked:
+        unchecked = self._observed_live - self._observed_rechecked
+        if unchecked:
             # A run lock seen held once may have been a status probe: one more
-            # snapshot re-checks it before the scheduler ends (D14.2 step 2).
-            self._observed_rechecked = True
+            # snapshot re-checks it before the scheduler ends (D14.2 step 2), and
+            # tries again a close_unready it refused. Once per issue: one held
+            # at every re-check is reported, never waited for.
+            self._observed_rechecked |= unchecked
             self._force_snapshot = True
             return True
         for number in sorted(self._observed_live):
+            left = (
+                "; the earlier invocation's claim stays open for the next start"
+                if number in self._resumable_open
+                else ""
+            )
             self.say(
                 f"issue #{number}: its run lock stays held by a process this scheduler did "
-                "not start; it was not admitted"
+                f"not start; it was not admitted{left}"
             )
         return False
 
@@ -829,7 +840,11 @@ class EpicScheduler:
             try:
                 lock.acquire()
             except IssueBusy:
-                continue  # live now: the next snapshot looks again
+                # Live now, a status probe perhaps: observed live, so the next
+                # snapshot, one more before the scheduler ends included,
+                # reconciles it under L2 and tries again (D14.2 step 2).
+                self._observed_live.add(number)
+                continue
             except (LockError, StateError, OSError) as exc:
                 self.say(f"issue #{number}: the run lock cannot be taken ({exc})")
                 continue

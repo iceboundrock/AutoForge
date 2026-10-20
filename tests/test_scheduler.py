@@ -980,6 +980,119 @@ def test_a_run_lock_held_at_every_re_check_stays_owned_and_its_claim_open(bench)
     )
 
 
+def test_a_claim_a_status_probe_hid_at_close_unready_is_closed_by_the_next_snapshot(
+    bench, monkeypatch
+):
+    """R3-F1: a run lock probed only during the first close_unready is tried again."""
+    b = bench()
+    b.graph.child(5)
+    b.graph.close_issue(5)
+    _admitted_but_never_spawned(b, 5, b.graph.issue(5, R).id)
+    real = EpicScheduler._close_unready
+    probed: list[bool] = []
+    open_after_probe: list[bool] = []
+
+    def close_unready(self, taken):
+        probe = None if probed else _status_probe(b, 5)
+        probed.append(probe is not None)
+        try:
+            real(self, taken)
+        finally:
+            if probe is not None:
+                os.close(probe)  # the probe ends right after the first attempt
+                open_after_probe.append(b.claims(5).current is not None)
+
+    monkeypatch.setattr(EpicScheduler, "_close_unready", close_unready)
+    sched = b.scheduler()
+    assert sched.run() == 0
+    assert probed == [True, False]
+    assert open_after_probe == [True], "refused while the probe held it"
+    assert settled(b, 5) is ClaimClassification.ABANDONED
+    assert sched.local_facts() == {}
+    assert b.admitted() == []
+    assert not any("stays held" in line for line in b.lines)
+
+
+def test_a_run_lock_held_from_close_unready_on_is_re_checked_once_then_reported(bench, monkeypatch):
+    """R3-F1: a holder that stays costs one more snapshot, never a wait; the next start closes."""
+    b = bench()
+    b.graph.child(5)
+    b.graph.close_issue(5)
+    _admitted_but_never_spawned(b, 5, b.graph.issue(5, R).id)
+    real = EpicScheduler._close_unready
+    probes: list[int] = []
+    calls: list[int] = []
+
+    def close_unready(self, taken):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            probes.append(_status_probe(b, 5))  # held from the first attempt on
+        real(self, taken)
+
+    monkeypatch.setattr(EpicScheduler, "_close_unready", close_unready)
+    sched = b.scheduler()
+    try:
+        assert sched.run() == 0
+        assert calls == [0, 1]
+        claims = b.claims(5)
+        assert claims is not None and claims.current is not None, "never closed while held"
+        assert sched.local_facts() == {5: LocalFact.OWNED}
+        assert any(
+            "issue #5: its run lock stays held by a process this scheduler did not start; "
+            "it was not admitted; the earlier invocation's claim stays open for the next start"
+            in line
+            for line in b.lines
+        )
+    finally:
+        while probes:
+            os.close(probes.pop())
+    assert b.scheduler().run() == 0
+    assert settled(b, 5) is ClaimClassification.ABANDONED
+
+
+def test_a_close_unready_refused_after_another_issue_s_re_check_is_re_checked_too(
+    bench, monkeypatch
+):
+    """R3-F1: each issue seen held gets its own re-check, even after another's was spent."""
+    b = bench()
+    b.graph.child(7)
+    _admitted_but_never_spawned(b, 7, b.graph.issue(7, R).id)
+    b.graph.child(5)
+    _admitted_but_never_spawned(b, 5, b.graph.issue(5, R).id)
+    held = _status_probe(b, 7)  # held throughout: #7's re-check is spent at the first end
+    real = EpicScheduler._close_unready
+    calls: list[int] = []
+
+    def close_unready(self, taken):
+        calls.append(len(calls))
+        probe = _status_probe(b, 5) if len(calls) == 2 else None
+        try:
+            real(self, taken)
+        finally:
+            if probe is not None:
+                os.close(probe)
+
+    def tick(s: EpicScheduler) -> None:
+        if len(calls) == 1 and b.graph.issue(5, R).state == "open":
+            b.graph.close_issue(5)  # not ready from the re-check snapshot on
+
+    monkeypatch.setattr(EpicScheduler, "_close_unready", close_unready)
+    sched = b.scheduler(on_tick=tick)
+    # Ready on GitHub but held here (as the reverse guard holds it): not admitted.
+    sched._held[5] = LocalFact.HELD_STANDALONE_STATE
+    try:
+        assert sched.run() == 0
+    finally:
+        os.close(held)
+    assert len(calls) == 3
+    assert settled(b, 5) is ClaimClassification.ABANDONED
+    assert b.claims(7).current is not None
+    assert sched.local_facts() == {5: LocalFact.HELD_STANDALONE_STATE, 7: LocalFact.OWNED}
+    assert any("issue #7: its run lock stays held" in line for line in b.lines)
+    assert not any("issue #5: its run lock stays held" in line for line in b.lines)
+    assert b.admitted() == []
+
+
 def test_a_binding_of_another_repository_found_at_the_re_check_admits_nothing(bench, monkeypatch):
     """Global uncertainty (D14.3) a status probe hid at startup closes admission when found."""
     b = bench()

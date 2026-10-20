@@ -166,7 +166,8 @@ parallel EPIC scheduler and its       test_scheduler.py (bounded admission in re
 workers (#182)                        BLOCKED, failing and READY_FOR_MERGE workers, drain, Ctrl-C,
                                       the grace, SIGHUP, exits with a live worker, the graph race,
                                       spawn failures, resume, a run lock a status probe held at
-                                      startup reconciled at the snapshot, isolation, no write /
+                                      startup or at a close_unready reconciled and retried at the
+                                      next snapshot, once per issue, isolation, no write /
                                       effect / provider name; real worker subprocesses through
                                       tests/scheduler_worker.py), test_worker.py (in process:
                                       startup refusals, the step boundary, signals, the recorded

@@ -1025,16 +1025,19 @@ liveness except L2.
   diagnostics, never authority); the scheduler's L2 copy closed (`close`
   only), so the worker is its only holder.
 - **Each snapshot** (D14.2): a namespace whose L2 was held at startup
-  reconciliation or at an admission (a status probe, a process outside
-  AutoForge) is `owned` until the next snapshot, which reconciles it again
-  under L2 (`reconcile_epic(..., only=)`) before its verdicts are used. One
-  still held stays `owned`, and is reported when it is still held at the
-  scheduler's last re-check; one free now is classified as at startup, and
-  an open `resumable` claim found only now is closed by `close_unready`
+  reconciliation, at an admission or at a `close_unready` (a status probe,
+  a process outside AutoForge) is `owned` until the next snapshot, which
+  reconciles it again under L2 (`reconcile_epic(..., only=)`) before its
+  verdicts are used. One still held stays `owned`; one free now is
+  classified as at startup, and an open `resumable` claim found only now,
+  or one whose closing the held lock refused, is closed by `close_unready`
   like an earlier one when the snapshot does not show the issue ready
   (`closed`, `blocked`, `unsupported`, or no longer listed:
-  `held:orphaned`). A binding of another repository found then is global
-  uncertainty: admission degrades and nothing more is admitted.
+  `held:orphaned`). Before the scheduler ends with nothing admissible,
+  each issue seen held gets one more snapshot, once per invocation, and
+  one still held then is reported (its open claim left for the next
+  start), never waited for. A binding of another repository found then is
+  global uncertainty: admission degrades and nothing more is admitted.
 - **A spawn that fails** (D2.3): a log that cannot be opened closes the
   claim `abandoned` at once (no process exists). A spawn that raised
   closes the scheduler's L2 copy and probes L2 afresh: free, the claim is
