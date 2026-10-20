@@ -225,6 +225,41 @@ def test_a_scheduler_killed_while_its_worker_lives_refuses_resume_until_the_work
     assert _status(p)["scheduler"]["invocation"]["ended"]
 
 
+def test_a_stop_after_the_scheduler_was_killed_names_its_surviving_worker(proc):
+    """SIGKILL leaves the invocation not ended: ``epic stop`` cannot call the scheduler dead."""
+    p = proc()
+    b = p.b
+    gated = {**IMPLEMENT, "started": b.marker("s2"), "gate": b.marker("g2")}
+    b.issue(2, (gated, REVIEW), world=str(world(b, 2)))
+    crash = p.crash("autoforge.scheduler:EpicScheduler._reap", if_exists=b.marker("s2"))
+    done = p("epic", "run", EPIC, crashes=(crash,))
+    assert done.returncode == -signal.SIGKILL, done.stderr
+    deadline = time.monotonic() + DEADLINE
+    while not b.has("s2"):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    assert not _status(p)["scheduler"]["invocation"]["ended"]
+    stopped = p("epic", "stop", EPIC, "--now")
+    assert stopped.returncode == 0, stopped.stderr
+    out = " ".join(stopped.stdout.split())
+    assert "now stop requested for scheduler invocation" in out and "which has ended" not in out
+    assert (
+        "workers holding their run locks: #2. If no 'autoforge epic' process of this EPIC is "
+        "running, its invocation ended without finalizing (a crash or a kill) and these workers "
+        "survived it: a stop request reaches each only at its next step boundary, '--now' "
+        "cannot signal them, and no process is ever signalled by a recorded PID"
+    ) in out
+    # Nothing signalled the survivor: it drains at its next step boundary.
+    b.open_gate("g2")
+    p.wait_free(2)
+    assert b.state(2).phase is Phase.REVIEW and len(prs(b, 2)) == 1
+    assert load_claim_file(b.ns(2)).current is not None
+    b.issue(2, (REVIEW,), world=str(world(b, 2)))
+    resumed = p("epic", "resume", EPIC)
+    assert resumed.returncode == 0, resumed.stderr
+    assert b.state(2).phase is Phase.READY_FOR_MERGE and len(prs(b, 2)) == 1
+
+
 # -- a worker killed (D14.5 rows 8 and 9) ---------------------------------------------------
 
 

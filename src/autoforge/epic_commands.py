@@ -26,7 +26,10 @@ wires them. This module holds the rest, so the CLI only parses and prints:
   check that no claim was left open (:func:`claims_left_open`).
 * **The checkout's EPIC** (:func:`checkout_epic`): every ``epic`` command
   first refuses an EPIC of another repository than this checkout's
-  ``origin``, before anything is read or written here.
+  ``origin``, before anything is read or written here. ``epic stop`` and
+  ``epic archive`` also refuse a ``scheduler.json`` or a binding recorded
+  for another repository, by its numeric id, so a rename is no refusal
+  (:func:`check_recorded_repository`).
 
 Nothing here names a provider, writes GitHub, records an effect or parses an
 agent's result.
@@ -231,6 +234,44 @@ def checkout_epic(workdir: str | Path, epic_url: str, runner: Runner = execute) 
     return epic
 
 
+def check_recorded_repository(
+    subject: str,
+    recorded: str,
+    recorded_id: int,
+    epic: GitHubIssueRef,
+    repository_id: Callable[[str], int],
+    *,
+    refused: str,
+) -> None:
+    """Refuse a file recorded for another repository than the EPIC's (D5.1).
+
+    ``recorded`` is the file's ``owner/name``, display only: a rename leaves
+    the old name in ``scheduler.json`` until the next scheduler start, and
+    in a binding for good. A recorded name that is the EPIC's
+    (case-insensitively) needs no read. One that is not is either the same
+    repository renamed or another one, and only the numeric repository id
+    tells them apart: ``repository_id`` reads it from GitHub for the EPIC's
+    repository, and the recorded id must be it. Another id, or no answer,
+    raises :class:`~autoforge.errors.SchedulerStateError`; the caller then
+    writes nothing.
+    """
+    if recorded.lower() == epic.repository.lower():
+        return
+    try:
+        live = repository_id(epic.repository)
+    except (GitHubError, ConfigurationError, ExecutionError) as exc:
+        raise SchedulerStateError(
+            f"{subject} {recorded}, not {epic.repository}, and the repository id that tells a "
+            f"rename from another repository cannot be read from GitHub "
+            f"({_bounded(str(exc), 500)}): {refused}"
+        ) from exc
+    if live != recorded_id:
+        raise SchedulerStateError(
+            f"{subject} {recorded} (repository id {recorded_id}), and {epic.repository} is "
+            f"repository id {live}: {refused}"
+        )
+
+
 # -- one child's category (pure) --------------------------------------------------------
 
 
@@ -289,7 +330,9 @@ class IssueStatus:
 
     ``category`` is ``None`` only for a namespace outside the snapshot that
     holds nothing (no claim, no state, no live owner). ``next`` are the
-    commands to run, in order.
+    commands to run, in order. ``problem`` is set for an ``uncertain`` row
+    only (a namespace that cannot be read, classified or probed): it is one
+    of the report's problems, never a key of the row's document.
     """
 
     number: int
@@ -307,6 +350,7 @@ class IssueStatus:
     orphaned: bool = False
     claim: Claim | None = None
     next: tuple[str, ...] = ()
+    problem: str = ""
 
     def to_dict(self) -> dict:
         claim = self.claim
@@ -389,6 +433,7 @@ def categorize(
         hold_reason: HoldReason | None = None,
         blockers: tuple[str, ...] = (),
         steps: tuple[str, ...] = (),
+        problem: str = "",
     ) -> IssueStatus:
         return IssueStatus(
             number=facts.number,
@@ -410,6 +455,7 @@ def categorize(
             orphaned=orphaned,
             claim=claim,
             next=steps,
+            problem=_bounded(problem, MAX_DETAIL_CHARS),
         )
 
     if facts.probe_problem:
@@ -418,6 +464,7 @@ def categorize(
             f"its run lock cannot be probed ({facts.probe_problem}); repair the namespace by "
             "hand or archive it",
             steps=(archive, resume),
+            problem=f"its run lock cannot be probed ({facts.probe_problem})",
         )
     if facts.live:
         if claim is not None:
@@ -429,7 +476,7 @@ def categorize(
             )
         return row(Category.RUNNING, detail)
     if facts.unidentified:
-        return row(Category.UNCERTAIN, facts.unidentified)
+        return row(Category.UNCERTAIN, facts.unidentified, problem=facts.unidentified)
     if classification is not None and classification.kind is ClassificationKind.UNCERTAIN:
         return row(
             Category.UNCERTAIN,
@@ -437,6 +484,7 @@ def categorize(
             "and the state aside (keeping the logs, the worktree and the binding), or repair "
             "the files by hand",
             steps=(archive, resume),
+            problem=f"{classification}: {classification.detail}",
         )
     if found is not None and found.fact is LocalFact.HELD_OTHER_EPIC:
         return row(
@@ -668,8 +716,10 @@ class StatusReport:
     def exit_code(self) -> int:
         """0, or 1 when GitHub, ``scheduler.json`` or the namespaces could not all be read.
 
-        A namespace that is a problem, and an entry under ``issues/`` that is
-        not a namespace (:attr:`rejected`), are among :attr:`problems`.
+        An ``uncertain`` namespace (one that cannot be read, classified or
+        probed), a child's or an orphaned one, a binding of another
+        repository, and an entry under ``issues/`` that is not a namespace
+        (:attr:`rejected`) are among :attr:`problems`.
         """
         return 1 if (self.snapshot is None or self.scheduler_problem or self.problems) else 0
 
@@ -943,21 +993,21 @@ def collect_status(
             if verdict.shape is not Shape.FOREIGN_REPOSITORY:
                 shown.add(verdict.number)
             children.append(categorize(facts, epic_url=epic.canonical, flags=flags))
-            _note_repository_mismatch(facts, problems)
+            _note_problem(facts, children[-1], problems)
     others: list[IssueStatus] = []
     for namespace in listed:
         number = namespace.issue_number
         if number in shown:
             continue
         facts = facts_of(number, None)
-        if facts.read is None and not facts.live:
-            continue  # nothing there but a run lock or logs
+        if facts.read is None and not facts.live and not facts.probe_problem:
+            continue  # nothing there but a free run lock or logs
         if _bound_elsewhere(facts.lookup, identity, epic.number):
             continue
-        _note_repository_mismatch(facts, problems)
         others.append(
             categorize(facts, epic_url=epic.canonical, flags=flags, orphaned=snapshot is not None)
         )
+        _note_problem(facts, others[-1], problems)
     return StatusReport(
         repository=repository,
         epic_url=epic.canonical,
@@ -977,13 +1027,21 @@ def collect_status(
     )
 
 
-def _note_repository_mismatch(facts: IssueFacts, problems: list[str]) -> None:
+def _note_problem(facts: IssueFacts, row: IssueStatus, problems: list[str]) -> None:
+    """An issue status cannot vouch for is a problem (exit 1), named once.
+
+    A binding of another repository is global uncertainty; otherwise an
+    ``uncertain`` row's reason: a namespace that cannot be read, classified
+    or probed.
+    """
     found = facts.found
     if found is not None and found.repository_mismatch and found.classification is not None:
         problems.append(
             f"issue #{facts.number}: {found.classification.detail} (global uncertainty: no "
             "scheduler admits anything until it is resolved)"
         )
+    elif row.problem:
+        problems.append(f"issue #{facts.number}: {row.problem}")
 
 
 # -- epic run --dry-run (D9.8) ----------------------------------------------------------
@@ -1218,25 +1276,36 @@ def live_namespaces(root: Path, epic_number: int) -> tuple[int, ...]:
     return tuple(live)
 
 
-def stop_scheduler(root: Path, epic: GitHubIssueRef, mode: StopMode) -> StopOutcome:
+def stop_scheduler(
+    root: Path, epic: GitHubIssueRef, mode: StopMode, repository_id: Callable[[str], int]
+) -> StopOutcome:
     """``epic stop``: publish a stop request (#182's ``request_stop``) and say what happened.
 
     Exit 0 when a request was delivered to the invocation ``scheduler.json``
     names; 1 when nothing was delivered (a request was already there, or
     the scheduler changed after the write). No ``scheduler.json`` (or one
-    that does not load), or one of another repository than the EPIC's,
-    raises :class:`~autoforge.errors.SchedulerStateError`, with nothing
-    created. Nothing is ever removed or signalled.
+    that does not load), or one of another repository than the EPIC's
+    (:func:`check_recorded_repository`; ``repository_id`` is read only when
+    its recorded name is not the EPIC's), raises
+    :class:`~autoforge.errors.SchedulerStateError`, with nothing created.
+
+    The workers holding their run locks are always listed. An invocation
+    that is not ended either still runs or died without finalizing (a
+    SIGKILL leaves it so), and nothing here can tell which without trusting
+    a PID: its workers get the survivors' caveat conditionally. Nothing is
+    ever removed or signalled.
     """
     epic_number = epic.number
     state = load_scheduler_state(root, epic_number)  # absent: request_stop refuses
     if state is not None:
-        named = f"{state.repository_owner}/{state.repository_name}"
-        if named.lower() != epic.repository.lower():
-            raise SchedulerStateError(
-                f"scheduler.json of EPIC #{epic_number} here is {named}'s, not "
-                f"{epic.repository}'s: no stop request was written"
-            )
+        check_recorded_repository(
+            f"scheduler.json of EPIC #{epic_number} here was written for",
+            f"{state.repository_owner}/{state.repository_name}",
+            state.repository_id,
+            epic,
+            repository_id,
+            refused="no stop request was written",
+        )
     delivery = request_stop(root, epic_number, mode)
     out = [delivery.message]
     code = 0 if delivery.written and not delivery.scheduler_changed else 1
@@ -1249,16 +1318,25 @@ def stop_scheduler(root: Path, epic: GitHubIssueRef, mode: StopMode) -> StopOutc
             "admission is closed at the scheduler's next tick and each worker returns at its "
             f"next step boundary; {DRAIN_HELP}"
         )
-    if delivery.scheduler_ended or delivery.scheduler_changed:
-        live = live_namespaces(root, epic_number)
-        if live:
-            listed = ", ".join(f"#{n}" for n in live)
-            out.append(
-                f"workers still running (their run locks are held): {listed}; they drain at "
-                "their next step boundary, and no process is ever signalled by a recorded PID"
-            )
-        else:
-            out.append("no worker of this EPIC holds a run lock")
+    live = live_namespaces(root, epic_number)
+    listed = ", ".join(f"#{n}" for n in live)
+    if not live:
+        out.append("no worker of this EPIC holds a run lock")
+    elif delivery.scheduler_ended:
+        out.append(
+            f"workers still running (their run locks are held): {listed}; they drain at "
+            "their next step boundary, and no process is ever signalled by a recorded PID"
+        )
+    elif delivery.scheduler_changed:
+        out.append(f"workers holding their run locks: {listed}")
+    else:
+        out.append(
+            f"workers holding their run locks: {listed}. If no 'autoforge epic' process of this "
+            "EPIC is running, its invocation ended without finalizing (a crash or a kill) and "
+            "these workers survived it: a stop request reaches each only at its next step "
+            "boundary, '--now' cannot signal them, and no process is ever signalled by a "
+            "recorded PID"
+        )
     return StopOutcome(tuple(redact(line) for line in out), code)
 
 
@@ -1315,15 +1393,20 @@ class ArchiveReport:
         return [redact(line) for line in out]
 
 
-def archive_issue(root: Path, epic_url: str, issue: int) -> ArchiveReport:
+def archive_issue(
+    root: Path, epic_url: str, issue: int, repository_id: Callable[[str], int]
+) -> ArchiveReport:
     """``epic archive``: close the claim, then move the state aside (D17.4).
 
     The caller holds L0. A namespace that does not exist is left alone:
-    nothing is created. One bound under another repository or another EPIC
-    is refused. L2 is taken non-blocking, so a live owner refuses the
-    archive (:class:`~autoforge.errors.IssueBusy`). Each step is idempotent: a re-run
-    after a crash completes the archive, and one with nothing left says so.
-    No GitHub read; ``scheduler.json`` is not written.
+    nothing is created. One bound under another repository (by its numeric
+    id, :func:`check_recorded_repository`: the binding keeps the name of its
+    first admission, so after a rename ``repository_id`` is read once) or
+    under another EPIC is refused. L2 is taken non-blocking, so a live owner
+    refuses the archive (:class:`~autoforge.errors.IssueBusy`). Each step is
+    idempotent: a re-run after a crash completes the archive, and one with
+    nothing left says so. No other GitHub read; ``scheduler.json`` is not
+    written.
     """
     epic = parse_issue_url(epic_url)
     namespace = issue_namespace(root, issue)
@@ -1338,13 +1421,18 @@ def archive_issue(root: Path, epic_url: str, issue: int) -> ArchiveReport:
             if lookup.state.status is StateStatus.ABSENT:
                 return ArchiveReport(namespace)
         binding = lookup.binding
-    if binding is not None and binding.repository.lower() != epic.repository.lower():
-        raise SchedulerStateError(
-            f"issue #{issue}'s namespace is bound under {binding.repository}, not "
-            f"{epic.repository}: nothing was archived"
+    if binding is not None:
+        check_recorded_repository(
+            f"issue #{issue}'s namespace is bound under",
+            binding.repository,
+            binding.run_key.repository_id,
+            epic,
+            repository_id,
+            refused="nothing was archived",
         )
     if binding is not None and binding.epic.number != epic.number:
-        other = f"https://github.com/{binding.repository}/issues/{binding.epic.number}"
+        # The same repository (checked above), under its current name.
+        other = f"https://github.com/{epic.repository}/issues/{binding.epic.number}"
         raise SchedulerStateError(
             f"issue #{issue}'s namespace is bound under EPIC #{binding.epic.number}, not "
             f"#{epic.number}: 'autoforge epic archive {other} {issue}' archives it"

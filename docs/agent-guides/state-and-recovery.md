@@ -1126,8 +1126,10 @@ code, is [Running an EPIC in parallel](../usage.md#running-an-epic-in-parallel).
   snapshot, the claims, the state and the probe (`categorize`, pure, first
   match wins). A claim's worker PID and process start time are shown as
   diagnostics; nothing is signalled. An unended invocation with no live
-  worker is reported as one that may have ended without finalizing. The
-  `--json` document is `autoforge.epic-status/1`, redacted, its keys
+  worker is reported as one that may have ended without finalizing. An
+  `uncertain` namespace (one that cannot be read, classified or probed), a
+  child's or an orphaned one, is one of the report's problems and exits 1.
+  The `--json` document is `autoforge.epic-status/1`, redacted, its keys
   fixed.
 - **`epic run --dry-run`** takes no lock and creates no namespace, claim,
   worktree, worker or `scheduler.json`: the snapshot, the ordered
@@ -1136,14 +1138,22 @@ code, is [Running an EPIC in parallel](../usage.md#running-an-epic-in-parallel).
 - **`epic stop`** is `request_stop` (Stop request, above) and reports its
   outcome: delivered (exit 0), delivered to an ended invocation (exit 0,
   with the workers that still hold their L2), nothing written or the
-  scheduler changed (exit 1), no `scheduler.json` (exit 2). It signals
-  nothing.
+  scheduler changed (exit 1), no `scheduler.json` (exit 2). It lists the
+  workers holding their L2 for an invocation that is not ended too: a
+  SIGKILLed scheduler never records its end, so they get the survivors'
+  caveat conditionally, never from a PID. It signals nothing.
 - **`epic archive`** holds L0, then the issue's L2 (a live owner refuses
   it), and calls `archive_claim` then `archive_issue_state` (Per-issue
   scheduler namespaces, above); a namespace bound under another EPIC is
-  refused. It reads nothing from GitHub and writes no `scheduler.json`
-  (ADR 0008 D6.1, amended by #183). A re-run after a crash completes the
-  archive, and one with nothing left says so.
+  refused. It writes no `scheduler.json` (ADR 0008 D6.1, amended by #183).
+  A re-run after a crash completes the archive, and one with nothing left
+  says so.
+- **A recorded repository** (`scheduler.json` for `epic stop`, the binding
+  for `epic archive`) is compared by its numeric id (D5.1): a recorded
+  `owner/name` that is the EPIC's needs no GitHub read; another one (a
+  rename, which a binding keeps for good) has the EPIC's repository id
+  read from GitHub, and only the same id goes on
+  (`check_recorded_repository`).
 - **The crash windows** (D14.5) are tested end to end by SIGKILL of real
   scheduler, worker and archive processes (`tests/test_epic_recovery.py`);
   the validator-marker row is the engine's own crash recovery.

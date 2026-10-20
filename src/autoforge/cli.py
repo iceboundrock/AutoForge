@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 
 from . import __version__
 from .certificate import NOT_A_PERMISSION
@@ -1221,22 +1222,39 @@ def cmd_epic_status(args) -> int:
     return report.exit_code
 
 
+def _epic_repository_id(args) -> Callable[[str], int]:
+    """GitHub's numeric id of a repository, as ``epic stop`` and ``epic archive`` read it.
+
+    Called only for a recorded ``owner/name`` that is not the EPIC's (a
+    rename, or another repository), so the configuration is loaded then.
+    """
+
+    def read(repository: str) -> int:
+        return _epic_graph(_load_cfg(args)).get_repository_id(repository)
+
+    return read
+
+
 def cmd_epic_stop(args) -> int:
-    """``epic stop``: lock-free; no configuration and no GitHub read are needed."""
+    """``epic stop``: lock-free; the configuration and GitHub are read only after a rename."""
     epic = parse_issue_url(args.epic)
     mode = StopMode.NOW if args.now else StopMode.DRAIN
-    outcome = stop_scheduler(coordination_root_of(os.getcwd()), epic, mode)
+    outcome = stop_scheduler(
+        coordination_root_of(os.getcwd()), epic, mode, _epic_repository_id(args)
+    )
     for line in outcome.lines:
         print(line)
     return outcome.exit_code
 
 
 def cmd_epic_archive(args) -> int:
-    """``epic archive``: under L0 (a held one is exit 2); no GitHub read."""
+    """``epic archive``: under L0 (a held one is exit 2); GitHub is read only after a rename."""
     epic = parse_issue_url(args.epic)
     lock_path = repository_lock_path(os.getcwd())
     with ControllerLock(lock_path):
-        report = archive_issue(lock_path.parent.parent, epic.canonical, args.issue)
+        report = archive_issue(
+            lock_path.parent.parent, epic.canonical, args.issue, _epic_repository_id(args)
+        )
     for line in report.lines():
         print(line)
     return 0

@@ -218,7 +218,8 @@ def test_the_epic_commands_and_their_flags(capsys):
     assert args.max_parallel == 4 and not args.accept_config_change
     args = parser.parse_args(["epic", "resume", EPIC, "--accept-config-change"])
     assert args.accept_config_change
-    with pytest.raises(SystemExit):  # epic resume's only (D9.4): epic run resumes no run
+    # epic resume's only (D9.4), though epic run admits a resumable issue as a resume too (D14.4)
+    with pytest.raises(SystemExit):
         parser.parse_args(["epic", "run", EPIC, "--accept-config-change"])
     with pytest.raises(SystemExit):  # there is no --allow-merge
         parser.parse_args(["epic", "run", EPIC, "--allow-merge"])
@@ -323,12 +324,72 @@ def test_stop_and_archive_refuse_files_of_another_repository(epic):
     git_out("-C", str(b.repo), "remote", "set-url", "origin", f"https://github.com/{OTHER}.git")
     scheduler_json = scheduler_state_path(b.root, 1).read_bytes()
     claims = b.ns(2).claim_file.read_bytes()
+    # Compared by repository id (ADR 0008 D5.1): another id refuses.
     code, _, err = e.cli("epic", "stop", OTHER_EPIC, "--now")
-    assert code == 2 and f"scheduler.json of EPIC #1 here is {R}'s, not {OTHER}'s" in err
+    assert code == 2
+    assert (
+        f"scheduler.json of EPIC #1 here was written for {R} (repository id {REPO_ID}), and "
+        f"{OTHER} is repository id 5151: no stop request was written"
+    ) in err
     assert not stop_request_path(b.root, 1).exists()
     code, _, err = e.cli("epic", "archive", OTHER_EPIC, "2")
-    assert code == 2 and f"bound under {R}, not {OTHER}: nothing was archived" in err
+    assert code == 2
+    assert (
+        f"issue #2's namespace is bound under {R} (repository id {REPO_ID}), and {OTHER} is "
+        "repository id 5151: nothing was archived"
+    ) in err
     assert b.ns(2).claim_file.read_bytes() == claims and b.claims(2).current is not None
+    assert scheduler_state_path(b.root, 1).read_bytes() == scheduler_json
+
+
+RENAMED = "owner/renamed"
+RENAMED_EPIC = f"https://github.com/{RENAMED}/issues/1"
+
+
+def test_stop_and_archive_go_on_after_a_rename_and_never_rewrite_the_binding(epic):
+    """The repository renamed and ``origin`` updated: the recorded names are the old ones.
+
+    The name is display only (ADR 0008 D5.1): the repository id GitHub gives
+    the new name is the recorded one, so stop and archive go on, while no
+    answer still refuses with nothing written.
+    """
+    e = epic()
+    b = e.b
+    b.issue(2, (IMPLEMENT, {"do": "blocked"}))
+    assert e.run()[0] == 0 and b.state(2).phase is Phase.BLOCKED
+    b.graph.repository_ids[RENAMED] = REPO_ID  # GitHub's answer for the new name
+    git_out("-C", str(b.repo), "remote", "set-url", "origin", f"https://github.com/{RENAMED}.git")
+    scheduler_json = scheduler_state_path(b.root, 1).read_bytes()
+    binding = b.ns(2).binding_file.read_bytes()
+    assert load_scheduler_state(b.root, 1).repository_name == "repo"
+    calls: list[str] = []
+    b.graph.on_call = calls.append
+    # GitHub cannot say whether it is a rename: refused, nothing written.
+    b.graph.fail[f"repos/{RENAMED}"] = (1, "gh: Service Unavailable (HTTP 503)")
+    code, _, err = e.cli("epic", "stop", RENAMED_EPIC)
+    assert code == 2
+    assert (
+        f"scheduler.json of EPIC #1 here was written for {R}, not {RENAMED}, and the "
+        "repository id that tells a rename from another repository cannot be read from GitHub"
+    ) in err
+    code, _, err = e.cli("epic", "archive", RENAMED_EPIC, "2")
+    assert code == 2 and f"issue #2's namespace is bound under {R}, not {RENAMED}" in err
+    assert not stop_request_path(b.root, 1).exists() and b.state(2).phase is Phase.BLOCKED
+    del b.graph.fail[f"repos/{RENAMED}"]
+    calls.clear()
+    # The same repository id: the stop is delivered, then the issue archived.
+    code, out, err = e.cli("epic", "stop", RENAMED_EPIC, "--now")
+    assert code == 0, err
+    assert "which has ended" in out and stop_request_path(b.root, 1).exists()
+    assert calls == [f"repos/{RENAMED}"]  # the one GitHub read: the repository id
+    code, out, err = e.cli("epic", "archive", RENAMED_EPIC, "2")
+    assert code == 0, err
+    assert "the state was moved aside" in out and not b.ns(2).state_file.exists()
+    code, out, err = e.cli("epic", "archive", RENAMED_EPIC, "2")
+    assert code == 0 and "nothing left to archive" in out, err
+    assert calls == [f"repos/{RENAMED}"] * 3
+    # The binding keeps its first admission's name, and scheduler.json is left alone.
+    assert b.ns(2).binding_file.read_bytes() == binding
     assert scheduler_state_path(b.root, 1).read_bytes() == scheduler_json
 
 
@@ -394,10 +455,10 @@ def test_status_gives_every_child_exactly_one_category(epic, tmp_path):
     lock = IssueRunLock(b.ns(12)).acquire()
     try:
         code, doc = e.status()
-        text = e.cli("epic", "status", EPIC)[1]
+        text_code, text, _ = e.cli("epic", "status", EPIC)
     finally:
         lock.release()
-    assert code == 0
+    assert code == 1 and text_code == 1  # #9's state cannot be read
     rows = {row["number"]: row for row in doc["children"]}
     assert {n: row["category"] for n, row in rows.items()} == {
         2: "ready-for-merge",
@@ -414,7 +475,9 @@ def test_status_gives_every_child_exactly_one_category(epic, tmp_path):
         13: "settled",
         14: "held",
     }
-    assert doc["other_namespaces"] == [] and doc["problems"] == []
+    assert doc["other_namespaces"] == []
+    (problem,) = doc["problems"]
+    assert problem.startswith("issue #9: uncertain(state-corrupt): ")
     assert rows[10]["hold_reason"] == "other-epic" and rows[14]["hold_reason"] == "standalone-state"
     assert all(rows[n]["hold_reason"] is None for n in rows if n not in (10, 14))
     resume = e.command("epic", "resume", EPIC)
@@ -449,6 +512,7 @@ def test_status_gives_every_child_exactly_one_category(epic, tmp_path):
     assert doc["stop_request"]["present"] is False and doc["snapshot"]["taken"]
     assert doc["epic"] == {"number": 1, "url": EPIC, "issue_id": b.graph.issue(1, R).id}
     assert "#3 blocked: BLOCKED: " in text and "#12 running: a live process" in text
+    assert "problem: issue #9: uncertain(state-corrupt): " in text
     assert "#10 held:other-epic" in text and f"next: {unblock}" in text
     # Lock-free and read-only: nothing changed.
     assert scheduler_state_path(b.root, 1).read_bytes() == scheduler_json
@@ -475,6 +539,57 @@ def test_an_entry_of_issues_that_is_not_a_namespace_is_a_status_problem(epic):
     code, out, _ = e.cli("epic", "status", EPIC)
     assert code == 1 and "problem: issues/7 is not a namespace (" in out
     assert out.count("issues/notes.txt") == 1
+
+
+def _broken_run_lock(b: Bench, n: int) -> None:
+    """A ``run.lock`` that is a directory: the D8.3 probe cannot tell whether an owner lives."""
+    b.ns(n).directory.mkdir(parents=True)
+    (b.ns(n).directory / "run.lock").mkdir()
+
+
+def test_an_uncertain_namespace_child_or_orphaned_is_a_status_problem(epic):
+    e = epic()
+    b = e.b
+    b.issue(2)
+    b.graph.child(3)
+    _broken_run_lock(b, 3)  # a child whose run lock cannot be probed
+    b.graph.child(4)
+    _bind(b, 4, issue_id=b.graph.issue(4, R).id)
+    b.ns(4).state_dir.mkdir()
+    b.ns(4).state_file.write_text("{ not json")  # a child whose state cannot be read
+    _bind(b, 7)  # orphaned: bound under EPIC #1, which no longer lists it
+    b.ns(7).state_dir.mkdir()
+    b.ns(7).state_file.write_text("{ not json")
+    _broken_run_lock(b, 8)  # orphaned, nothing but a run lock that cannot be probed
+    code, doc = e.status()
+    assert code == 1
+    rows = {row["number"]: row for row in (*doc["children"], *doc["other_namespaces"])}
+    assert {n: row["category"] for n, row in rows.items()} == {
+        2: "ready",
+        3: "uncertain",
+        4: "uncertain",
+        7: "uncertain",
+        8: "uncertain",
+    }
+    assert [row["number"] for row in doc["other_namespaces"]] == [7, 8]
+    assert all(rows[n]["orphaned"] for n in (7, 8))
+    problems = doc["problems"]
+    assert len(problems) == 4
+    assert problems[0].startswith("issue #3: its run lock cannot be probed (cannot use ")
+    assert problems[1].startswith("issue #4: uncertain(state-corrupt): ")
+    assert problems[2].startswith("issue #7: uncertain(state-corrupt): ")
+    assert problems[3].startswith("issue #8: its run lock cannot be probed (cannot use ")
+    code, out, _ = e.cli("epic", "status", EPIC)
+    assert code == 1 and out.count("problem: issue #") == 4
+    # Repaired by hand: nothing is uncertain any more, and status exits 0.
+    for n in (3, 8):
+        (b.ns(n).directory / "run.lock").rmdir()
+    for n in (4, 7):
+        b.ns(n).state_file.unlink()
+    archive, resume = e.command("epic", "archive", EPIC, "3"), e.command("epic", "resume", EPIC)
+    assert rows[3]["next"] == [archive, resume]
+    code, doc = e.status()
+    assert code == 0 and doc["problems"] == [], doc["problems"]
 
 
 def test_status_while_a_scheduler_runs_shows_the_hung_worker_and_a_spawn_failure(epic, signals):
@@ -875,6 +990,11 @@ def test_a_drain_and_a_now_stop_of_a_running_scheduler(epic, signals):
     code, _, _ = e.run("--max-parallel", "1")
     assert code == 0 and b.schedulers[-1].end_reason is EndReason.DRAINED
     assert stops[0][0] == 0 and DRAIN_HELP in stops[0][1]
+    # The invocation is not ended: whether it still runs is never decided from a PID.
+    assert (
+        "workers holding their run locks: #2. If no 'autoforge epic' process of this EPIC is "
+        "running, its invocation ended without finalizing"
+    ) in stops[0][1]
     assert b.state(2).phase is Phase.REVIEW and b.admitted() == [2]  # #3 never admitted
     assert signals == []
     # --now: the scheduler behaves as on Ctrl-C (#2, resumed, is admitted first).

@@ -358,9 +358,13 @@ uv run autoforge epic archive https://github.com/owner/repo/issues/1 7
   refuses to start when it no longer matches the one the scheduler
   recorded: stop the scheduler before editing it. A resumed issue's run
   also refuses another profile routing or agent worktree root than the one
-  it was recorded under; `--accept-config-change` (on `epic resume` only:
-  `epic run` resumes no run) is passed to every resumed worker, as on
-  `resume` ([Configuration](configuration.md#parallel-epic-scheduler)).
+  it was recorded under. `epic run` and `epic resume` both admit a run that
+  stopped mid-workflow (its claim closed) as a resume, but only
+  `epic resume` takes `--accept-config-change`, which it passes to every
+  resumed worker, as on `resume`
+  ([Configuration](configuration.md#parallel-epic-scheduler)): a run that
+  `epic run` resumes refuses such a change, and its issue is held for the
+  rest of that invocation.
 - **`--max-parallel N`** overrides `scheduler.max_parallel` for one
   invocation, within the same bounds (1-4): there is no unbounded mode.
 - **Standalone commands.** The issue of the configuration's own standalone
@@ -398,10 +402,13 @@ recorded snapshot, a pending stop request, and namespaces of the EPIC the
 snapshot no longer lists. An invocation recorded as not ended while no
 worker runs says so: "not ended: if no `autoforge epic` process is running,
 it ended without finalizing (crash or kill); run `epic resume`". Exit 0,
-or 1 when the snapshot or `scheduler.json` cannot be read, a namespace
-is a problem, or an entry of the scheduler's `issues/` directory is not a
-namespace (a stray file, a link, a name that is no issue number: never
-read as one, so move it out by hand).
+or 1 when the snapshot or `scheduler.json` cannot be read, a namespace (a
+child's, or one the snapshot no longer lists) is `uncertain` (its binding,
+claim or state cannot be read or classified, or its run lock cannot be
+probed) or bound under another repository, or an entry of the scheduler's
+`issues/` directory is not a namespace (a stray file, a link, a name that
+is no issue number: never read as one, so move it out by hand). Each of
+these is one of the listed problems.
 
 `epic status --json` prints one document, schema `autoforge.epic-status/1`,
 redacted. Its keys are fixed; a field without a value is `null`:
@@ -454,6 +461,21 @@ are distinct:
 - no `scheduler.json` for the EPIC, or one of another repository: nothing
   to stop (exit 2, nothing created).
 
+Every outcome that writes or finds a request lists the workers of the EPIC
+that hold their run lock. A scheduler that crashed or was killed with
+SIGKILL never records its end, so `epic stop` cannot tell its invocation
+from a running one without trusting a PID: for an invocation that is not
+ended, the listed workers come with the caveat that, if no `autoforge epic`
+process of the EPIC is running, they survived it, a request reaches each
+only at its next step boundary, and `--now` cannot signal them.
+
+`scheduler.json` and each binding record the repository's numeric id and
+its `owner/name` at the time; the name is for display only. When it is
+not the EPIC's (the repository was renamed, and `origin` updated),
+`epic stop` and `epic archive` read the repository's id from GitHub: the
+same id is the same repository, and the command goes on; another id, or
+no answer, refuses (exit 2, nothing written).
+
 ### `epic archive`
 
 `epic archive <EPIC_URL> <ISSUE>` releases one issue for a fresh run: a
@@ -468,7 +490,9 @@ rounds, fix attempts, the replan count) and its validation records then
 live only in the archived state: the next admission starts the issue fresh
 and adopts its marked PR. Re-running it completes an interrupted archive;
 on an issue with nothing left it says "nothing left to archive". It reads
-nothing from GitHub and does not touch `scheduler.json`.
+nothing from GitHub, except the repository's id when the binding names the
+repository by an earlier name (see `epic stop` above), and does not touch
+`scheduler.json`.
 
 ### Recovery and exit codes
 
