@@ -23,6 +23,8 @@ from autoforge.transitions import Phase, WorkflowMode
 from tests.conftest import (
     BRANCH,
     EPIC,
+    FOLLOW_UP_TEXT,
+    FOLLOW_UP_TITLE,
     ISSUE,
     PR,
     SHA_A,
@@ -2627,8 +2629,14 @@ T158 = "https://github.com/owner/repo/issues/158"
 NOTES = {16: "Coordination note for #16.", 158: "Coordination note for #158."}
 
 
-def _blocked_on_operator(tmp_path, monkeypatch, fakes) -> tuple[str, dict[str, str]]:
-    """A run whose FIX plan awaits two operator actions: (state dir, {target: action id})."""
+def _blocked_on_operator(
+    tmp_path, monkeypatch, fakes, *, commit: bool = True, also: tuple[dict, ...] = ()
+) -> tuple[str, dict[str, str]]:
+    """A run whose FIX plan awaits two operator actions: (state dir, {target: action id}).
+
+    The fixer commits a candidate unless ``commit`` is False; ``also`` are
+    further resolutions, each for a finding of its own.
+    """
     from autoforge.effects import EffectRecord
 
     monkeypatch.chdir(tmp_path)
@@ -2649,7 +2657,7 @@ def _blocked_on_operator(tmp_path, monkeypatch, fakes) -> tuple[str, dict[str, s
             ]
         },
     }
-    eng = make_engine(sd, fixer(resolution), github=gh)
+    eng = make_engine(sd, fixer(resolution, *also, commit=commit), github=gh)
     eng.origin = fakes["origin"]
     head = publish_pr_head(eng)
     gh.add_pr(head_sha=head)
@@ -2660,12 +2668,13 @@ def _blocked_on_operator(tmp_path, monkeypatch, fakes) -> tuple[str, dict[str, s
     eng.state.last_review_comment_url = comment_url(PR, 100)
     eng.state.open_findings = [
         {
-            "id": "R1-F1",
+            "id": f"R1-F{n}",
             "classification": "bug",
             "title": "notes missing",
             "location": "docs/adr.md:1",
             "required_resolution": "publish the coordination notes",
         }
+        for n in range(1, 2 + len(also))
     ]
     assert eng.step().next_phase == "BLOCKED"
     records = [EffectRecord.from_dict(r) for r in load_state(sd / "state.json").effect_records]
@@ -2692,6 +2701,59 @@ def test_status_shows_the_operator_actions_and_their_commands(tmp_path, capsys, 
         (ids[T158], "pending", "operator", T158),
     ]
     assert entries[0]["allowed_by"] == ["issue_body"] and entries[0]["binding"] is None
+
+
+@pytest.mark.parametrize("commit", [True, False])
+def test_status_names_the_candidate_held_behind_operator_actions(
+    tmp_path, capsys, monkeypatch, fakes, commit
+):
+    """PR #254 R2-F2: the push follows the operator actions in the plan;
+    ``status`` names the committed candidate and the worktree that holds
+    it, and says nothing was committed only when nothing was."""
+    from autoforge.effects import EffectKind, EffectRecord
+
+    sd, _ = _blocked_on_operator(tmp_path, monkeypatch, fakes, commit=commit)
+    records = [
+        EffectRecord.from_dict(r) for r in load_state(Path(sd) / "state.json").effect_records
+    ]
+    push = next((r for r in records if r.kind is EffectKind.PUSH), None)
+    assert (push is not None) is commit
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    if commit:
+        assert push is not None
+        assert (
+            f"held back: push of {str(push.payload['sha'])[:12]}, after every operator action "
+            "is verified"
+        ) in out
+        assert "holds the unpushed candidate; do not reset it" in out
+        assert "nothing was committed" not in out
+    else:
+        assert "held back: nothing was committed, so nothing is pushed" in out
+        assert "unpushed candidate" not in out
+
+
+def test_status_names_follow_up_writes_held_behind_operator_actions(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    from autoforge.effects import EffectKind, EffectRecord
+
+    follow_up = {
+        "finding_id": "R1-F2",
+        "resolution": "follow_up_created",
+        "follow_up_issue": {"title": FOLLOW_UP_TITLE, "body": FOLLOW_UP_TEXT},
+    }
+    sd, _ = _blocked_on_operator(tmp_path, monkeypatch, fakes, also=(follow_up,))
+    kinds = [
+        EffectRecord.from_dict(r).kind for r in load_state(Path(sd) / "state.json").effect_records
+    ]
+    assert kinds[2:] == [EffectKind.FOLLOW_UP_ISSUE, EffectKind.PUSH]
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert "held back: push of" in out
+    assert "1 follow-up write(s) are held back as well" in out
 
 
 def test_status_action_prints_an_operator_payload_and_a_bound_state(

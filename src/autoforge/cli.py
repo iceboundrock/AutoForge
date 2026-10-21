@@ -2511,7 +2511,10 @@ def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) ->
             ]
     pending = [r for r in records if r.stage is not Stage.OBSERVED]
     if pending:
-        push = next((r for r in records if r.kind is EffectKind.PUSH), None)
+        # The rest of the plan follows the K10 prefix: the push and the
+        # follow-up writes are found in the whole saved plan (PR #254 R2-F2).
+        plan = state.phase_effects().records
+        push = next((r for r in plan if r.kind is EffectKind.PUSH), None)
         if push is not None and push.stage is not Stage.OBSERVED:
             lines += [
                 f"  held back: push of {str(push.payload['sha'])[:12]}, after every operator "
@@ -2521,6 +2524,11 @@ def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) ->
             ]
         else:
             lines.append("  held back: nothing was committed, so nothing is pushed")
+        others = sum(
+            1 for r in plan if r.kind in (EffectKind.FOLLOW_UP_ISSUE, EffectKind.FOLLOW_UP_APPEND)
+        )
+        if others:
+            lines.append(f"             {others} follow-up write(s) are held back as well")
         first = pending[0]
         action = first.action_id
         kept = [r.action_id for r in records if r.stage is Stage.OBSERVED]
