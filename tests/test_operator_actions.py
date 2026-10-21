@@ -601,6 +601,182 @@ def test_an_earlier_rounds_payload_may_be_bound(tmp_state_dir):
     assert eng.step().next_phase == "REVIEW"
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_a_binding_reads_every_pending_target_first(tmp_state_dir, dry_run):
+    """PR #254 R2-F3: binding #16 reads #158's target as well. A conclusive
+    failure to read it refuses, naming #158's action and target, with the
+    state byte-identical, also as a dry run; a transient one propagates."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    assert eng.step().next_phase == "BLOCKED"
+    x16, x158 = _k10(eng, T16).action_id, _k10(eng, T158).action_id
+    c = _post(gh, T16, 5016, "Notes.")
+    gh.get_issue_errors[T158] = GitHubError("HTTP 403: Resource not accessible")
+    raw = eng.paths.state_file.read_text()
+    calls = len(gh.calls)
+    out = eng.unblock(REASON, bind_evidence=[(x16, c.url)], dry_run=dry_run)
+    assert not out.unblocked, out.message
+    assert f"({x158}) cannot be checked, because {T158} cannot be read" in out.message
+    assert "HTTP 403" in out.message
+    assert ("get_issue", T158) in gh.calls[calls:]
+    assert eng.paths.state_file.read_text() == raw
+    gh.get_issue_errors[T158] = GitHubUnavailableError("connection reset")
+    with pytest.raises(GitHubUnavailableError):
+        eng.unblock(REASON, bind_evidence=[(x16, c.url)], dry_run=dry_run)
+    assert eng.paths.state_file.read_text() == raw
+
+
+def test_a_binding_beside_a_target_that_is_gone_binds(tmp_state_dir):
+    """An unnamed pending target that is not found holds its own action and
+    refuses no binding of another (it can be declined)."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    assert eng.step().next_phase == "BLOCKED"
+    x16 = _k10(eng, T16).action_id
+    c = _post(gh, T16, 5016, "Notes.")
+    del gh.issues[T158]
+    out = eng.unblock(REASON, bind_evidence=[(x16, c.url)])
+    assert out.unblocked, out.message
+    assert _k10(eng, T16).binding is not None
+
+
+TWO_ON_16 = [operator("R1-F1", (16, NOTE16)), operator("R1-F2", (16, NOTE158))]
+
+
+def _bind_directly(eng, record: EffectRecord, comment) -> None:
+    """Save ``record`` bound to ``comment`` as no ``unblock`` accepts it now, so
+    that verification's own rule is what a test exercises."""
+    bound = record.binding_to(comment.url, comment.id, sha256_text(comment.body))
+    eng.state.effect_records[record.position] = bound.to_dict()
+    eng._save()
+
+
+def test_another_actions_exact_payload_is_never_bound(tmp_state_dir):
+    """PR #254 R2-F1: two findings each ask for a note on #16. The first
+    action's exact payload is on #16 while both are pending; binding the
+    second to it is refused byte-identical, naming the first, and the first
+    is then verified from it alone."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(*TWO_ON_16), findings=2)
+    assert eng.step().next_phase == "BLOCKED"
+    first, second = _records(eng)[:2]
+    c = _post(gh, T16, 5016, first.body)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, bind_evidence=[(second.action_id, c.url)])
+    assert not out.unblocked, out.message
+    assert f"it carries the marker of {first.action_id}, another operator action" in out.message
+    assert eng.paths.state_file.read_text() == raw
+    assert eng.unblock(REASON).unblocked
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    first, second = _records(eng)[:2]
+    assert first.stage is Stage.OBSERVED and first.observed["evidence"] == "exact"
+    assert second.stage is Stage.INTENDED and second.binding is None
+
+
+def test_a_comment_carrying_another_actions_marker_never_verifies_a_binding(tmp_state_dir):
+    """PR #254 R2-F1, at verification: a saved binding to the comment that is
+    a later action's exact evidence holds, whatever the plan order, and the
+    comment is recorded for that action only."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(*TWO_ON_16), findings=2)
+    assert eng.step().next_phase == "BLOCKED"
+    first, second = _records(eng)[:2]
+    c = _post(gh, T16, 5016, second.body)
+    _bind_directly(eng, first, c)
+    assert eng.unblock(REASON).unblocked
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    first, second = _records(eng)[:2]
+    assert first.stage is Stage.INTENDED
+    assert second.stage is Stage.OBSERVED and second.observed["comment_id"] == c.id
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"the bound comment {c.url} is the evidence of {second.action_id}" in reason
+
+
+@pytest.mark.parametrize("route", ["prefix", "drift"])
+def test_two_bindings_to_one_comment_verify_one_action(tmp_state_dir, route):
+    """PR #254 R2-F1: should two actions be bound to one comment, the prefix
+    pass and drift's read-only reconcile each verify the first only."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(*TWO_ON_16), findings=2)
+    assert eng.step().next_phase == "BLOCKED"
+    first, second = _records(eng)[:2]
+    c = _post(gh, T16, 5016, "Notes for both findings.")
+    _bind_directly(eng, first, c)
+    _bind_directly(eng, _records(eng)[1], c)
+    if route == "drift":
+        gh.set_head(publish_pr_head(eng, parent=eng.state.reviewed_head_sha, message="Push (#2)"))
+    assert eng.unblock(REASON).unblocked
+    out = eng.step()
+    s = load_state(eng.paths.state_file)
+    if route == "drift":
+        assert out.next_phase == "REVIEW", out.message
+        assert [
+            (o["action_id"], o["outcome"], o["comment_url"]) for o in s.operator_comment_outcomes
+        ] == [(first.action_id, "verified", c.url), (second.action_id, "stale", "")]
+        return
+    assert out.next_phase == "BLOCKED", out.message
+    first, second = _records(eng)[:2]
+    assert first.stage is Stage.OBSERVED and first.observed["evidence"] == "bound"
+    assert second.stage is Stage.INTENDED
+    assert f"the bound comment {c.url} is the evidence of {first.action_id}" in s.block_reason
+
+
+def test_an_exact_payload_on_a_comment_another_action_consumed_is_a_conflict(tmp_state_dir):
+    """PR #254 R2-F1: the first action was verified on a bound comment, which
+    was then edited into the second action's exact payload. The second is
+    not verified from it: the unblock is refused, naming the first."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(*TWO_ON_16), findings=2)
+    assert eng.step().next_phase == "BLOCKED"
+    first, second = _records(eng)[:2]
+    c = _post(gh, T16, 5016, "Notes for the first finding.")
+    assert eng.unblock(REASON, bind_evidence=[(first.action_id, c.url)]).unblocked
+    assert eng.step().next_phase == "BLOCKED"
+    assert _records(eng)[0].stage is Stage.OBSERVED
+    gh.comments[T16] = [replace(c, body=second.body)]
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON)
+    assert not out.unblocked, out.message
+    assert f"is already the evidence of {first.action_id}" in out.message
+    assert eng.paths.state_file.read_text() == raw
+
+
+def test_a_comment_verified_earlier_in_the_round_is_never_bound_again(tmp_state_dir):
+    """PR #254 R2-F1: #16's comment was verified for R1-F1 before a decline
+    dropped the plan; the relaunched fixer's action for R1-F2 on #16 is
+    neither bound to it nor verified from it."""
+    gh = FakeGitHub()
+    eng = _operating(
+        tmp_state_dir,
+        gh,
+        scripted(
+            fixer(BOTH, dict(NO_CHANGE, finding_id="R1-F2")),
+            fixer(NO_CHANGE, operator("R1-F2", (16, NOTE158)), commit=False),
+        ),
+        findings=2,
+    )
+    assert eng.step().next_phase == "BLOCKED"
+    x16, x158 = _k10(eng, T16).action_id, _k10(eng, T158).action_id
+    c16 = _post(gh, T16, 9016, payload(T16, NOTE16))
+    assert eng.unblock(REASON).unblocked
+    assert eng.step().next_phase == "BLOCKED"
+    assert eng.unblock("not on #158", decline_action=[x158]).unblocked
+    assert eng.step().next_phase == "BLOCKED"
+    again = _k10(eng, T16)
+    assert again.action_id != x16
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, bind_evidence=[(again.action_id, c16.url)])
+    assert not out.unblocked and f"already bound to or observed for {x16}" in out.message
+    assert eng.paths.state_file.read_text() == raw
+    _bind_directly(eng, again, c16)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON)
+    assert not out.unblocked and f"is the evidence of {x16}" in out.message, out.message
+    assert eng.paths.state_file.read_text() == raw
+
+
 def test_approving_an_operator_action_is_refused(tmp_state_dir):
     gh = FakeGitHub()
     eng = _operating(tmp_state_dir, gh, fixer(BOTH))

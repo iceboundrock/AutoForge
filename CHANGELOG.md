@@ -16,8 +16,8 @@ so.
   prints the exact bytes, and the operator posts each, binds an existing
   comment (`unblock --bind-evidence X-… <comment URL>`) or withdraws them
   (`unblock --decline-action X-…`, now repeatable). `FIX` verifies every
-  comment on GitHub before it publishes the rest of the plan, and the next
-  review reads the verified comments
+  comment on GitHub before it publishes the rest of the plan, one comment
+  for one action only, and the next review reads the verified comments
   ([BLOCKED on operator actions](docs/usage.md#blocked-on-operator-actions)).
 - `safety.acceptance_actions: off` refuses that resolution too; `approve`
   (the default) and `auto` offer it. Acceptance and operator declines share

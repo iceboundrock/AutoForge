@@ -332,7 +332,10 @@ remove it), and the next commands. For each action, either:
   `resume`. The comment must be an issue comment of the run's repository on
   the action's target, in the target's complete comment listing, carry no
   controller marker (an earlier round's payload of this run for the same
-  target may be bound), and be bound to no other action of the plan. The
+  target may be bound, another action's payload of this plan may not), and
+  be bound to, verified for or carry the payload of no other action of the
+  round: one comment verifies one action. Every pending action's target is
+  read first, and one that cannot be read refuses the binding. The
   binding records the comment's digest: the evidence is `bound`. If that
   comment is edited or deleted before `FIX` verifies it, `FIX` blocks again
   naming both digests: bind it again or post the payload.

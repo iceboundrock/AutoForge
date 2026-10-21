@@ -1715,6 +1715,20 @@ def load_records(raw: object, binding: Binding) -> tuple[EffectRecord, ...]:
     keys = [scan(OPERATOR_COMMENT, records[i].marker).claims[0].key for i in operator]
     if len(set(keys)) != len(keys):
         _fail("effect_records", "plans two operator comments with one identity")
+    # One comment verifies one action (PR #254 R2-F1): verification never
+    # observes a comment another record of the plan was observed on.
+    consumed: dict[int, int] = {}
+    for i in operator:
+        if records[i].stage is not Stage.OBSERVED:
+            continue
+        cid = int((records[i].observed or {})["comment_id"])
+        if cid in consumed:
+            _fail(
+                "effect_records",
+                f"verifies the operator comments at positions {consumed[cid]} and {i} with one "
+                "comment",
+            )
+        consumed[cid] = i
     return records
 
 
@@ -2955,6 +2969,7 @@ def decide_operator_comment(
     listing: Sequence[Listed],
     defects: Sequence[str] = (),
     target_problem: str = "",
+    taken: Mapping[int, str] | None = None,
 ) -> Decision:
     """K10 (#243): verify an operator-performed comment; never ``ISSUE``.
 
@@ -2962,14 +2977,20 @@ def decide_operator_comment(
     ``misplaced`` those carrying the key of another record of this plan
     whose target is another issue, ``listing`` the target's complete
     listing (for a binding) and ``defects`` the unreadable
-    ``ai-operator-comment`` markers in it. Conflict rows are evaluated
-    first, so an exact or bound match never hides a conflict: a misplaced
-    payload, two comments with this key, or one with other bytes. Then the
-    exact payload (``exact``), then the bound comment with its digest
-    unchanged (``bound``). Everything else is a hold, which sends nothing:
-    where :func:`decide_create` would issue, this waits for the operator.
-    ``target_problem`` (transferred, deleted, unreadable) holds as well.
+    ``ai-operator-comment`` markers in it. ``taken`` maps the id of each
+    comment another action already consumes (observed for it, carrying its
+    marker, or verified for it earlier in the round) to that action's id:
+    one comment verifies one action (PR #254 R2-F1). Conflict rows are
+    evaluated first, so an exact or bound match never hides a conflict: a
+    misplaced payload, two comments with this key, one with other bytes, or
+    the exact payload on a comment another action consumes. Then the exact
+    payload (``exact``), then the bound comment with its digest unchanged
+    (``bound``) unless another action consumes it. Everything else is a
+    hold, which sends nothing: where :func:`decide_create` would issue, this
+    waits for the operator. ``target_problem`` (transferred, deleted,
+    unreadable) holds as well.
     """
+    taken = taken or {}
     terminal = _terminal(record)
     if terminal is not None:
         return terminal
@@ -3020,6 +3041,17 @@ def decide_operator_comment(
                     "'unblock'"
                 ),
             )
+        other = taken.get(comment.comment_id)
+        if other:
+            return Decision(
+                Action.CONFLICT,
+                reason=(
+                    f"{action}: {comment.url} carries its exact payload but is already the "
+                    f"evidence of {other}, and one comment verifies one action; post the "
+                    "payload as a comment of its own and remove this action's marker from "
+                    f"{comment.url}, then 'unblock'"
+                ),
+            )
         return Decision(
             Action.OBSERVE,
             observed={
@@ -3031,6 +3063,16 @@ def decide_operator_comment(
         )
     binding = record.binding
     if binding is not None:
+        other = taken.get(binding["comment_id"])
+        if other:
+            return Decision(
+                Action.HOLD,
+                reason=(
+                    f"{action}: the bound comment {binding['comment_url']} is the evidence of "
+                    f"{other}, and one comment verifies one action; bind another comment or "
+                    "post the payload"
+                ),
+            )
         bound = [c for c in listing if c.comment_id == binding["comment_id"]]
         if bound and sha256_text(bound[0].body) == binding["body_sha256"]:
             return Decision(

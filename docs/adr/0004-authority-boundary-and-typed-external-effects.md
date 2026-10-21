@@ -1603,17 +1603,35 @@ rules checked by fresh reads:
    and the target's complete listing holds the same comment id; the digest
    is taken from the listing's body;
 3. that body carries no controller marker, except an `ai-operator-comment`
-   marker of this run's issue and PR for the same target with another key
-   (an earlier round's payload). A comment with the record's own key is
-   exact evidence or a conflict, never bindable;
-4. no other record of the plan is bound to it or observed on it;
+   marker of this run's issue and PR for the same target with a key that
+   is no record's of the plan (an earlier round's payload). A comment with
+   the record's own key is exact evidence or a conflict, never bindable;
+   one with the key of another record of the plan is that record's exact
+   evidence or conflict, observed or not yet, and never bindable either
+   (PR #254 R2-F1);
+4. no other record of the plan is bound to it or observed on it, and no
+   action of the round was verified on it before a decline dropped its plan;
 5. the record is `intended`, not in conflict, and the PR is still at the
    reviewed HEAD, base and merge base (drift refuses it as stale).
+
+Every pending action's target is read first, named in the command or not:
+a target that cannot be read conclusively refuses the binding, naming the
+action and the target, and a transient failure propagates; a target that
+is not found or answers as another object refuses only a pair that names
+its action (PR #254 R2-F3).
 
 The record's `binding` stores the canonical comment URL, its id and the
 SHA-256 of its body, in the unblock's save; binding the same comment with
 the same digest again is no progress, and refused. `resume` verifies it in
 the prefix pass, and the evidence is `bound`.
+
+One comment verifies one action, at verification as at binding: the prefix
+pass, a plain unblock's read-only reconcile and drift's never record a
+comment for an action when another action of the plan is observed on it,
+when it carries another record's marker, or when it was verified for
+another action of the round. Such a binding holds, naming the other action,
+and such an exact payload is a conflict naming it. A plan in which two
+records are observed on one comment fails to load.
 
 The two evidence classes prove different things, and every consumer
 (`status`, `last_fix_resolutions[].operator_evidence`,

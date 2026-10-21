@@ -8215,12 +8215,29 @@ class ControllerEngine:
                 "verified or stale, and routes the drift to REVIEW, sending nothing",
                 pr=pr,
             )
-        op = OperatorCommentOp(self.github, plan=records)
+        op = self._operator_op(records)
         if request is None:
             return self._operator_progress(op, pending, pr, canonical)
         if request.verb == "bind":
             return self._operator_bind(op, request, plan, pr, canonical)
         return self._operator_decline(request, plan, pr, canonical)
+
+    def _operator_op(self, records: Sequence[EffectRecord]) -> OperatorCommentOp:
+        """K10's read-only operation over the plan ``records`` (#243).
+
+        The comments verified for this round's actions of a dropped plan are
+        reserved: one comment verifies one action (PR #254 R2-F1).
+        """
+        return OperatorCommentOp(self.github, plan=records, reserved=self._operator_reserved())
+
+    def _operator_reserved(self) -> dict[int, str]:
+        """``{comment id: action id}`` of this round's ``verified`` operator outcomes (#243)."""
+        state = self._require_state()
+        return {
+            parse_comment_url(o["comment_url"]).comment_id: o["action_id"]
+            for o in state.operator_comment_outcomes
+            if o["outcome"] == "verified" and o["round"] == state.review_round
+        }
 
     def _operator_progress(
         self,
@@ -8340,15 +8357,40 @@ class ControllerEngine:
            complete listing holds its id (the digest is the listing's body);
         3. that body carries no controller marker but an
            ``ai-operator-comment`` of this run's issue and PR for the same
-           target with another key (an earlier round's payload);
-        4. no other record of the plan is bound to or observed on it;
+           target with another key that is no other record's of the plan
+           (an earlier round's payload);
+        4. no other record of the plan is bound to or observed on it, and
+           no action of the round was verified on it (PR #254 R2-F1);
         5. the record is pending (``intended``); the PR binding was read.
 
-        Re-binding the same comment with the same digest is no progress.
+        Every pending action's target is read first, named in the command or
+        not (PR #254 R2-F3): a target that cannot be read conclusively
+        refuses, naming the action and the target. Re-binding the same
+        comment with the same digest is no progress.
         """
         state = self._require_state()
         by_id = {r.action_id: r for r in plan}
-        taken: dict[int, str] = {}
+        problems: dict[str, str] = {}
+        for record in plan:
+            if record.stage is Stage.OBSERVED:
+                continue
+            target_url = record.target["issue_url"]
+            try:
+                problems[record.action_id] = op.target_disqualification(
+                    target_url, state.current_issue_url
+                )
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return UnblockDecision(
+                    None,
+                    f"unblock {request.flag} is refused: {record.describe()} "
+                    f"({record.action_id}) cannot be checked, because {target_url} cannot be "
+                    f"read ({exc}), so nothing was bound and nothing is saved. Fix the cause, "
+                    "then unblock again",
+                    pr=pr,
+                )
+        taken = self._operator_reserved()
         for record in plan:
             if record.action_id in request.action_ids:
                 continue
@@ -8356,6 +8398,7 @@ class ControllerEngine:
                 taken[int((record.observed or {}).get("comment_id", 0))] = record.action_id
             elif record.binding is not None:
                 taken[int(record.binding["comment_id"])] = record.action_id
+        keys = {scan(OPERATOR_COMMENT, r.marker).claims[0].key: r.action_id for r in plan}
         run_issue = parse_issue_url(state.current_issue_url)
         run_pr = parse_pr_url(state.current_pr_url)
         bound: list[EffectRecord] = []
@@ -8385,7 +8428,7 @@ class ControllerEngine:
                     refused + (f"the comment is not in the run's repository {state.repository}"),
                     pr=pr,
                 )
-            problem = op.target_problem(target.canonical, state.current_issue_url)
+            problem = problems[action_id]
             if problem:
                 return UnblockDecision(None, refused + (problem), pr=pr)
             try:
@@ -8433,14 +8476,20 @@ class ControllerEngine:
                     pr=pr,
                 )
             body = listed[0].body
-            marker = self._operator_bind_marker_problem(body, record, run_issue, run_pr, target)
+            marker = self._operator_bind_marker_problem(
+                body, record, run_issue, run_pr, target, keys
+            )
             if marker:
                 return UnblockDecision(None, refused + (marker), pr=pr)
             other = taken.get(ref.comment_id)
             if other:
                 return UnblockDecision(
                     None,
-                    refused + (f"the comment is already bound to or observed for {other}"),
+                    refused
+                    + (
+                        f"the comment is already bound to or observed for {other}, and one "
+                        "comment verifies one action"
+                    ),
                     pr=pr,
                 )
             digest = sha256_text(body)
@@ -8481,8 +8530,14 @@ class ControllerEngine:
         run_issue: GitHubIssueRef,
         run_pr: GitHubPullRequestRef,
         target: GitHubIssueRef,
+        keys: Mapping[Hashable, str],
     ) -> str:
-        """Binding rule 3: why ``body`` carries a marker it may not, or "" (#243)."""
+        """Binding rule 3: why ``body`` carries a marker it may not, or "" (#243).
+
+        ``keys`` maps the marker key of each record of the plan to its action
+        id: a comment carrying another one is that action's exact evidence
+        (or its conflict), never this one's (PR #254 R2-F1).
+        """
         opened = len(AGENT_MARKER_OPEN_RE.findall(body))
         if not opened:
             return ""
@@ -8498,6 +8553,14 @@ class ControllerEngine:
                 return (
                     "it carries this action's own marker, which is exact evidence or a conflict "
                     "and never bound; run a plain unblock to adopt it, or repair it"
+                )
+            other = keys.get(claim.key)
+            if other:
+                return (
+                    f"it carries the marker of {other}, another operator action of this plan, "
+                    "and is that action's exact evidence or its conflict, never this one's: one "
+                    "comment verifies one action. Run a plain unblock to adopt it for "
+                    f"{other}, and bind or post another comment for {record.action_id}"
                 )
             if not (
                 claim.issue.same_target(run_issue)
@@ -14664,7 +14727,6 @@ class ControllerEngine:
         reason naming each action, and nothing after the prefix is sent. An
         unavailable GitHub propagates with what was saved so far.
         """
-        op = OperatorCommentOp(self.github, plan=records)
         open_: list[tuple[EffectRecord, str]] = []
         for index, record in enumerate(records):
             if record.kind is not EffectKind.OPERATOR_COMMENT:
@@ -14675,7 +14737,10 @@ class ControllerEngine:
                 open_.append((record, record.reason))
                 continue
             try:
-                driven = verify(record, op, self._persist_effect)
+                # Over the records as observed so far in this pass: a comment
+                # an earlier record just consumed is not this one's evidence
+                # (PR #254 R2-F1).
+                driven = verify(record, self._operator_op(records), self._persist_effect)
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
@@ -14822,21 +14887,23 @@ class ControllerEngine:
         ``{position: observed}`` for each one the operator completed (the
         exact payload, or the bound comment unchanged). Nothing is saved;
         an unavailable GitHub propagates, any other failure leaves the
-        action unobserved (stale).
+        action unobserved (stale). Each read sees the ones found before it,
+        so one comment is never found for two actions (PR #254 R2-F1).
         """
-        op = OperatorCommentOp(self.github, plan=records)
+        current = list(records)
         found: dict[int, dict] = {}
-        for record in records:
+        for index, record in enumerate(records):
             if record.kind is not EffectKind.OPERATOR_COMMENT or record.stage is Stage.OBSERVED:
                 continue
             try:
-                decision = op.reconcile(record.reopened())
+                decision = self._operator_op(current).reconcile(record.reopened())
             except GitHubUnavailableError:
                 raise
             except GitHubError:
                 continue
             if decision.action is Action.OBSERVE and decision.observed:
                 found[record.position] = dict(decision.observed)
+                current[index] = record.reopened().observing(decision.observed)
         return found
 
     def _record_operator_outcomes(

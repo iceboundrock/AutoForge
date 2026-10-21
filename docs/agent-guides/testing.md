@@ -1049,8 +1049,11 @@ a stated reason it has none. The coverage that must keep working:
   propagates; `off` offers nothing; the allowed set is the entry's even
   when the issue body changes; bound evidence is verified as
   operator-bound, an edited bound comment holds, the binding rules refuse
-  and one comment is never evidence for two actions, while an earlier
-  round's payload may be bound; `--approve-action X-…` is refused; a
+  and one comment is never evidence for two actions (another action's
+  exact payload is never bound, and the prefix pass, a plain unblock and
+  drift never verify one comment twice, PR #254 R2-F1), while an earlier
+  round's payload may be bound; a binding reads every pending target and
+  refuses on one it cannot read, named or not, also as a dry run (R2-F3); `--approve-action X-…` is refused; a
   decline keeps a verified comment, withdraws the other pending actions,
   is refused while anything of the plan is on GitHub, and shares the
   round's bound with K9; drift records each action `verified` or `stale`;

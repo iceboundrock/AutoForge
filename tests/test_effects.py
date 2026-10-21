@@ -3850,6 +3850,18 @@ def test_a_plan_led_by_operator_comments_loads_with_its_context_and_entry():
             "plans two operator comments with one identity",
             id="one-identity-twice",
         ),
+        pytest.param(
+            lambda: [
+                operator_record().observing(exact_evidence(operator_record())),
+                operator_record(
+                    finding_id="R1-F2", position=1, binding=evidence_binding(300)
+                ).observing(
+                    {**K10_BOUND_EVIDENCE, "comment_id": 300, "url": comment_url(ISSUE3, 300)}
+                ),
+            ],
+            "verifies the operator comments at positions 0 and 1 with one comment",
+            id="one-comment-twice",
+        ),
     ],
 )
 def test_a_plan_whose_operator_comments_are_not_its_unique_leading_prefix_fails_loudly(
@@ -4390,6 +4402,7 @@ def decide_k10(
     listing: Any = None,
     defects: Any = (),
     target_problem: str = "",
+    taken: Any = None,
 ) -> Decision:
     """``decide_operator_comment``; the listing defaults to every comment named."""
     return decide_operator_comment(
@@ -4399,6 +4412,7 @@ def decide_k10(
         listing=[*own, *misplaced] if listing is None else list(listing),
         defects=list(defects),
         target_problem=target_problem,
+        taken=taken,
     )
 
 
@@ -4505,6 +4519,67 @@ def test_a_bound_comment_that_changed_or_is_gone_is_held_naming_both_digests(now
         f"the bound comment {url} changed since it was bound "
         f"(bound sha256 {sha256_text(EVIDENCE_TEXT)}, now {seen})"
     ) in decision.reason
+
+
+def test_a_comment_another_action_consumes_is_never_this_ones_evidence():
+    """PR #254 R2-F1: one comment verifies one action. The exact payload on a
+    comment another action consumes is a conflict naming it; a bound comment
+    another action consumes is a hold naming it, even with its digest
+    unchanged."""
+    record = operator_record()
+    exact = k10_listed(300, record.body)
+    decision = decide_k10(record, own=[exact], taken={300: "X-0123456789abcdef"})
+    assert decision.action is Action.CONFLICT and decision.observed is None
+    assert (
+        f"{exact.url} carries its exact payload but is already the evidence of X-0123456789abcdef"
+    ) in decision.reason
+    evidence = k10_listed(400, EVIDENCE_TEXT)
+    bound = record.binding_to(evidence.url, 400, sha256_text(EVIDENCE_TEXT))
+    decision = decide_k10(bound, listing=[evidence], taken={400: "X-0123456789abcdef"})
+    assert decision.action is Action.HOLD and decision.observed is None
+    assert (
+        f"the bound comment {evidence.url} is the evidence of X-0123456789abcdef"
+    ) in decision.reason
+    # Another comment taken changes nothing.
+    assert decide_k10(bound, listing=[evidence], taken={401: "X-0123456789abcdef"}) == Decision(
+        Action.OBSERVE, observed=K10_BOUND_EVIDENCE
+    )
+
+
+def test_the_operation_never_verifies_one_comment_for_two_actions():
+    """PR #254 R2-F1, over FakeGitHub: a sibling's exact payload on this
+    target, a comment a sibling is observed on, and a comment ``reserved``
+    for an action verified earlier in the round are each another action's
+    evidence, never this record's binding or exact payload."""
+    fake, _ = operator_world()
+    record = operator_record()
+    sibling = operator_record(finding_id="R1-F2", position=1)
+    fake.add_comment(ISSUE3, 300, sibling.body)
+    fake.add_comment(ISSUE3, 400, EVIDENCE_TEXT)
+    claimed = record.binding_to(comment_url(ISSUE3, 300), 300, sha256_text(sibling.body))
+    held = OperatorCommentOp(fake, plan=(claimed, sibling)).reconcile(claimed)
+    assert held.action is Action.HOLD and f"is the evidence of {sibling.action_id}" in held.reason
+    bound = record.binding_to(comment_url(ISSUE3, 400), 400, sha256_text(EVIDENCE_TEXT))
+    observed = sibling.binding_to(
+        comment_url(ISSUE3, 400), 400, sha256_text(EVIDENCE_TEXT)
+    ).observing(K10_BOUND_EVIDENCE)
+    plan = (bound, observed)
+    held = OperatorCommentOp(fake, plan=plan).reconcile(bound)
+    assert held.action is Action.HOLD and f"is the evidence of {sibling.action_id}" in held.reason
+    held = OperatorCommentOp(fake, plan=(bound,), reserved={400: "X-0123456789abcdef"}).reconcile(
+        bound
+    )
+    assert held.action is Action.HOLD and "is the evidence of X-0123456789abcdef" in held.reason
+    assert OperatorCommentOp(fake, plan=(bound,)).reconcile(bound).action is Action.OBSERVE
+    # The exact payload on a comment a sibling is observed on is a conflict.
+    fake.add_comment(ISSUE3, 500, record.body)
+    url = comment_url(ISSUE3, 500)
+    elsewhere = sibling.binding_to(url, 500, sha256_text(record.body))
+    plan = (record, elsewhere.observing(exact_evidence(record, 500) | {"evidence": "bound"}))
+    conflict = OperatorCommentOp(fake, plan=plan).reconcile(record)
+    assert conflict.action is Action.CONFLICT
+    assert f"is already the evidence of {sibling.action_id}" in conflict.reason
+    assert fake.effect_writes == []
 
 
 def test_nothing_on_the_target_is_a_hold_awaiting_the_operator():

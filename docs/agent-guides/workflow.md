@@ -827,10 +827,13 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
     conflict), the comment is an issue comment of the run's repository
     that GitHub places on the action's target and its complete listing
     holds, it carries no controller marker but, at most, an earlier
-    round's operator marker for the same target, and no other action is
-    bound to or observed on it; the history entry's `action` is
+    round's operator marker for the same target (never another action of
+    the plan's), and no other action is bound to, observed on or, earlier
+    in the round, verified on it; the history entry's `action` is
     `bound X-… <URL>`, and `resume` verifies the comment against the bound
-    digest.
+    digest. Every pending action's target is read first, named or not: one
+    that cannot be read conclusively refuses, naming the action and the
+    target. One comment verifies one action at verification too.
   - **`--decline-action X-…`** (repeatable) -> `FIX` afresh: the plan is
     dropped, the named actions are recorded `declined`, the plan's other
     pending ones `withdrawn` and the verified ones `verified`, and the

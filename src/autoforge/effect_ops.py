@@ -48,7 +48,7 @@ records.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -969,11 +969,23 @@ class OperatorCommentOp:
     another K10 of the plan, meant for another issue, found on this target
     is a misplaced payload and a conflict. The target is read too: it must
     still be an issue of the run's repository (open or closed).
+
+    One comment verifies one action (PR #254 R2-F1): a comment another
+    record of the plan is observed on, one carrying the marker of another
+    record of the plan (its exact evidence, observed or not yet), and one
+    ``reserved`` names (``{comment id: action id}``, the comments verified
+    for other actions earlier in the round) is never this record's evidence.
     """
 
-    def __init__(self, github: GitHubClient, plan: Sequence[EffectRecord] = ()) -> None:
+    def __init__(
+        self,
+        github: GitHubClient,
+        plan: Sequence[EffectRecord] = (),
+        reserved: Mapping[int, str] | None = None,
+    ) -> None:
         self.github = github
         self.plan = tuple(plan)
+        self.reserved = dict(reserved or {})
 
     def reconcile(self, record: EffectRecord) -> Decision:
         if record.stage in (Stage.OBSERVED, Stage.CONFLICT):
@@ -1000,13 +1012,17 @@ class OperatorCommentOp:
         listing = [Listed(url=c.url, comment_id=c.id, body=c.body) for c in comments]
         collection = collect(OPERATOR_COMMENT, comments, "comment")
         key = scan(OPERATOR_COMMENT, record.marker).claims[0].key
+        siblings = [
+            r
+            for r in self.plan
+            if r.kind is EffectKind.OPERATOR_COMMENT and r.position != record.position
+        ]
         others = {
             scan(OPERATOR_COMMENT, r.marker).claims[0].key
-            for r in self.plan
-            if r.kind is EffectKind.OPERATOR_COMMENT
-            and r.position != record.position
-            and not same_issue_url(r.target["issue_url"], target_url)
+            for r in siblings
+            if not same_issue_url(r.target["issue_url"], target_url)
         }
+        claimants = {scan(OPERATOR_COMMENT, r.marker).claims[0].key: r.action_id for r in siblings}
         own = [
             Listed(url=h.obj.url, comment_id=h.obj.id, body=h.obj.body)
             for h in collection.holders
@@ -1017,12 +1033,20 @@ class OperatorCommentOp:
             for h in collection.holders
             if h.claim.key in others
         ]
+        taken = dict(self.reserved)
+        for r in siblings:
+            if r.stage is Stage.OBSERVED:
+                taken[int((r.observed or {})["comment_id"])] = r.action_id
+        for h in collection.holders:
+            if h.claim.key in claimants:
+                taken.setdefault(h.obj.id, claimants[h.claim.key])
         return decide_operator_comment(
             record,
             own=own,
             misplaced=misplaced,
             listing=listing,
             defects=collection.defects,
+            taken={cid: a for cid, a in taken.items() if a != record.action_id},
         )
 
     def target_problem(self, target_url: str, issue_url: str) -> str:
