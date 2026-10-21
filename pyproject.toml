@@ -27,7 +27,12 @@ dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10", "pyyaml>=6"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # -rs: every skip prints its reason (a real-backend test names what the host lacks).
-addopts = "-q -rs"
+# -m "not live": a `live` test is deselected unless the command line selects it
+# with `-m live` (a later -m wins); it then still skips without its variable.
+addopts = "-q -rs -m 'not live'"
+markers = [
+    "live: calls a real agent and a real model; opt-in, never in `make check` or CI (docs/development.md)",
+]
 
 [tool.ruff]
 target-version = "py311"

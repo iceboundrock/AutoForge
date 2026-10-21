@@ -11,12 +11,16 @@ A Pi profile adds a version floor and a read-only credential probe, run
 under the same environment allow-list as the agent launch (never the
 operator's whole environment) and reported without Pi's raw output, and a
 warning naming the instruction files Pi would load from outside the
-checkout (docs/pi-policy.md §4-5); those are found by path, never read. A
-Claude Code command must list the flags every launch keeps the operator's
-and the repository's integrations off with in its ``--help`` (#165) and
-fails while its settings or global configuration set a variable over a
-launch's isolation, and an OpenCode profile fails while OpenCode would load
-an organization's configuration; a launch refuses either (#165,
+checkout (docs/pi-policy.md §4-5); those are found by path, never read.
+It also warns where the controller cannot contain Pi's detached tool
+processes (it cannot make itself a child subreaper: not Linux, or a
+security policy denies it), where unattended Pi use is not supported
+(docs/pi.md, #135). A Claude Code command must list the flags every
+launch keeps the operator's and the repository's integrations off with in
+its ``--help`` (#165) and fails while its settings or global
+configuration set a variable over a launch's isolation, and an OpenCode
+profile fails while OpenCode would load an organization's configuration;
+a launch refuses either (#165,
 :meth:`autoforge.providers.ClaudeCodeProvider.integration_preflight`,
 :meth:`autoforge.providers.OpenCodeProvider.integration_preflight`).
 
@@ -86,7 +90,12 @@ from .errors import (
     SnapshotRefused,
     StateError,
 )
-from .executor import ExecutionRequest, ExecutionResult, execute
+from .executor import (
+    ExecutionRequest,
+    ExecutionResult,
+    execute,
+    orphan_containment_available,
+)
 from .github import (
     GH_MIN_VERSION,
     GitHubClient,
@@ -727,6 +736,7 @@ class Doctor:
         pi_profiles = [p for (_, provider), ps in groups.items() if provider == "pi" for p in ps]
         if pi_profiles:
             results.append(self.check_pi_outside_instructions(pi_profiles))
+            results.append(self.check_pi_orphan_containment(pi_profiles))
         return results
 
     def check_sdk_launch(self, provider: str, profiles: list[ProfileConfig]) -> CheckResult:
@@ -768,6 +778,37 @@ class Doctor:
             f"every Pi run will also follow {', '.join(str(p) for p in found)}; remove "
             "or move them, or set options.context_files: false for context files "
             "(docs/pi-policy.md)",
+            required=False,
+        )
+
+    def check_pi_orphan_containment(self, profiles: list[ProfileConfig]) -> CheckResult:
+        """WARN where Pi's detached tool processes cannot be contained.
+
+        Pi's `bash` tool starts every command detached, so what a command
+        backgrounds outlives Pi; only a child subreaper (Linux) lets the
+        executor find and kill it (ADR 0002 §4b). The row passes only where
+        the controller can make itself one, as each contained launch does,
+        not merely read the setting. Without one, unattended Pi use is not
+        supported (docs/pi.md#unattended-use, #135). Never a FAIL: an
+        attended run that reads each result's leftovers sentence is still
+        possible.
+        """
+        name = f"pi's detached tool processes are contained ({', '.join(p.name for p in profiles)})"
+        if orphan_containment_available():
+            return CheckResult(
+                name,
+                True,
+                "a process a Pi tool command leaves running is killed when the launch ends "
+                "(Linux child subreaper, ADR 0002 §4b)",
+                required=False,
+            )
+        return CheckResult(
+            name,
+            False,
+            "the controller cannot make itself a child subreaper here (not Linux, or a "
+            "security policy denies it): a process a Pi tool command leaves "
+            "running can outlive the launch, and each result says so (orphans_unchecked); "
+            "do not run Pi unattended here (docs/pi.md#unattended-use)",
             required=False,
         )
 

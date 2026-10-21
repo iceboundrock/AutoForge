@@ -6,8 +6,11 @@
 - **Where:** `src/autoforge/providers.py` (`PiProvider`: the argv,
   `tools` / `context_files` options, environment names, API-key guard,
   per-launch auth preflight), `src/autoforge/doctor.py` (the outside-instruction
-  warning), `src/autoforge/redaction.py` (OAuth fields), `src/autoforge/executor.py`
-  and `executor_duplex.py` (orphan containment).
+  warning, and #135's containment row), `src/autoforge/redaction.py` (OAuth
+  fields), `src/autoforge/executor.py` and `executor_duplex.py` (orphan
+  containment).
+- **Operator guide:** [Pi: running phases on DeepSeek or a ChatGPT subscription](pi.md)
+  (#135) is the how-to; this page is the policy and its evidence.
 - **Evidence base.** Each item below names its evidence and how it was
   checked. "Verified on installed Pi 1.0.1" means it was observed by running
   `@earendil-works/pi-coding-agent` 1.0.1 from npm, with a temporary
@@ -92,8 +95,13 @@ It does **not** block model calls or the request-path OAuth token refresh.
 - a model call and a `bash` tool call through the full adapter, under
   `--offline`, against a local OpenAI-compatible stand-in, succeeded.
 
-A real ChatGPT sign-in and its token refresh were not exercised (#135's
-smoke run).
+A real ChatGPT sign-in and its token refresh were not exercised here.
+#135's opt-in live smoke test (`tests/test_live_pi.py`,
+[Pi operator guide](pi.md#prove-it-on-your-machine-the-live-smoke-test))
+runs one REVIEW under this argv through a real credential: a DeepSeek API
+key (the acceptance run) or, optionally, a real sign-in. Its evidence is
+posted on #135 when a maintainer runs it; a DeepSeek run is no evidence
+for the sign-in.
 
 ## 4. Context files: on by default, `context_files: false` to turn off
 
@@ -313,9 +321,18 @@ and left no process behind.
 
 **Gate for #135.** On a platform without a child subreaper (anything but
 Linux), every agent result carries `orphans_unchecked`, and its leftovers
-sentence says a process may still be running. #135 must gate unattended
-Pi use on such platforms. The prompt rule in `common.md` /
-`local_common.md` is the only mitigation there.
+sentence says a process may still be running. The prompt rule in
+`common.md` / `local_common.md` is the only mitigation there. #135 gates
+unattended Pi use on it: the [Pi operator guide](pi.md#unattended-use)
+states that Pi is attended only on such a platform, and `doctor` adds a
+row for the Pi profiles, `pi's detached tool processes are contained`,
+which passes where the controller can make itself a child subreaper
+and warns elsewhere. `executor.orphan_containment_available` sets the
+attribute and restores it, as each contained launch sets it, so a
+security policy that permits reading it but denies setting it is a
+warning too. It is a warning, never a failure: an attended run that
+reads each result's leftovers sentence stays possible, and no default
+changes.
 
 ## Residual risks and follow-ups
 
@@ -353,8 +370,20 @@ Pi use on such platforms. The prompt rule in `common.md` /
     then that nothing loads under the adapter's.
 - `tests/test_providers.py`, `tests/test_engine.py`: the argv, option keys
   and the preflight runner pinned.
-- `tests/test_doctor.py`: the outside-instruction WARN row, and the auth
-  row's API-key refusal.
+- `tests/test_doctor.py`: the outside-instruction WARN row, the auth
+  row's API-key refusal, and the containment row (#135: OK with a child
+  subreaper, WARN without one, and WARN where the setting can be read
+  but not set); `tests/test_executor.py` pins the probe behind it.
+- **opt-in, real Pi and a real credential (#135):** `tests/test_live_pi.py`,
+  marked `live` and deselected by default, runs under `-m live` with
+  `AUTOFORGE_LIVE_PI=1` and a route, `AUTOFORGE_LIVE_PI_AUTH=api_key`
+  (DeepSeek, `require_oauth: false`) or `oauth` (the ChatGPT sign-in): one
+  LOCAL REVIEW through the operator's Pi, then a credential scan of
+  everything AutoForge wrote and the side-effect checks
+  ([Pi operator guide](pi.md#prove-it-on-your-machine-the-live-smoke-test)).
+  `tests/test_live_pi_support.py` checks offline that it is deselected by
+  default, its settings, its scan and its other checks, and rehearses its
+  whole flow on both routes against the fake `pi`.
 - `tests/test_redaction.py`: the OAuth fields and the prose cases.
 - `tests/test_executor.py`, `tests/test_executor_duplex.py`: orphan
   containment (ADR 0002 §5).

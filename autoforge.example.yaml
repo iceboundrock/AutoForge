@@ -358,13 +358,19 @@ profiles:
 
   # Pi (`provider: pi`, ADR 0003) instead: replace the block above with this
   # one. Prerequisite, an operator step AutoForge never performs for you:
-  # run `pi`, then `/login openai` (ChatGPT sign-in). `autoforge doctor`
-  # checks the Pi version and, read-only, that Pi holds a credential for the
-  # provider (not that this model is usable with it).
+  # install Pi 1.0.0+, run `pi`, then `/login openai` (ChatGPT sign-in).
+  # For DeepSeek instead, give Pi its API key yourself and set
+  # `model: deepseek/deepseek-flash`, `effort: low` and
+  # `require_oauth: false` (docs/pi.md#deepseek-on-an-api-key).
+  # `autoforge doctor` checks the Pi version and, read-only, that Pi holds a
+  # credential for the provider (not that this model is usable with it; that
+  # depends on your plan). The operator guide, with the opt-in live smoke
+  # test that proves the setup, is docs/pi.md.
   # A Pi profile takes no extra_args: AutoForge loads no Pi extension,
   # package, MCP server, skill or prompt template and ignores project trust
   # (docs/pi-policy.md). Pi has no approval layer; run it in a container, a
-  # VM or under a dedicated user.
+  # VM or under a dedicated user, and unattended only on Linux, where what
+  # its tools leave running is killed at the end of each launch.
   # pi-example-start
   # review_round_2_5:
   #   provider: pi

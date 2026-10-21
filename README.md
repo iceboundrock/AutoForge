@@ -184,8 +184,9 @@ Each line is a summary; the linked document is the precise statement.
 - `opencode` (OpenCode CLI) 2.0.0 or newer for the `review_*`,
   `replan_reexecute` and `update_epic` profiles; 1.x is refused by `doctor`
   (see [OpenCode profiles](docs/configuration.md#opencode-profiles))
-- `pi` 1.0.0 or newer, only if a profile you route to uses `provider: pi`
-  (see [Pi profiles](docs/configuration.md#pi-profiles)). `doctor` checks
+- `pi` 1.0.0 or newer, only if a profile you route to uses `provider: pi`,
+  holding a DeepSeek API key or signed in with your ChatGPT subscription
+  (see the [Pi operator guide](docs/pi.md)). `doctor` checks
   only the agent CLIs your configured profiles actually reach
 - a state directory (`.autoforge/` by default; `--state-dir` or
   `state_dir` in config) on a filesystem with hard links: run logs and
@@ -331,6 +332,7 @@ most common entry points:
 |---|---|
 | run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/usage.md#troubleshooting-and-recovery) |
 | work without GitHub | [Local mode](docs/local-mode.md) |
+| run phases through Pi on a DeepSeek API key or a ChatGPT subscription | [Pi operator guide](docs/pi.md) |
 | configure profiles, bounds and the merge gate | [Configuration](docs/configuration.md), [`autoforge.example.yaml`](autoforge.example.yaml) |
 | understand the phases and legal transitions | [Workflow](docs/agent-guides/workflow.md) |
 | know what is verified on GitHub, and what gates a merge | [GitHub safety](docs/agent-guides/github-safety.md) |

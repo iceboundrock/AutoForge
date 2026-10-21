@@ -2149,6 +2149,54 @@ def test_example_yaml_with_the_pi_block_enabled_loads_and_validates(tmp_path, ya
     validate_required_profiles(cfg, REQUIRED_PROFILES)
 
 
+def test_the_pi_guides_example_profile_loads_and_validates(tmp_path, yaml_backend):
+    """The profile docs/pi.md tells an operator to copy (#135) is a working
+    config on both YAML backends, with the sign-in required and both limits."""
+    cfg = load_config_file(_pi_guide_block(tmp_path, "pi-guide-example"))
+    for name in ("review_round_1", "review_round_2_5"):
+        p = cfg.profile(name)
+        assert (p.provider, p.model, p.effort, p.command) == (
+            "pi",
+            "openai/gpt-5.6-terra",
+            "high",
+            "pi",
+        )
+        assert p.options == {"require_oauth": "true"}
+        assert cfg.agent_limits(p) == config.AgentLimits(900, 3600)
+    validate_required_profiles(cfg, REQUIRED_PROFILES)
+
+
+def test_the_pi_guides_deepseek_profile_loads_and_validates(tmp_path, yaml_backend):
+    """The DeepSeek profile of docs/pi.md (#135's amendment): an exact
+    `deepseek/<id>`, a thinking level the model takes, and an API key
+    (`require_oauth: false`)."""
+    cfg = load_config_file(_pi_guide_block(tmp_path, "pi-guide-deepseek-example"))
+    p = cfg.profile("review_round_1")
+    assert (p.provider, p.model, p.effort, p.command) == (
+        "pi",
+        "deepseek/deepseek-flash",
+        "low",
+        "pi",
+    )
+    assert p.options == {"require_oauth": "false"}
+    assert cfg.agent_limits(p) == config.AgentLimits(900, 3600)
+    validate_required_profiles(cfg, REQUIRED_PROFILES)
+
+
+def _pi_guide_block(tmp_path, marker: str) -> Path:
+    """The YAML block docs/pi.md holds between ``<!-- marker -->`` and its
+    closing comment, written to a config file."""
+    import autoforge
+
+    guide = Path(autoforge.__file__).parents[2] / "docs" / "pi.md"
+    text = guide.read_text(encoding="utf-8")
+    block = text.split(f"<!-- {marker} -->\n", 1)[1].split(f"<!-- /{marker} -->")[0]
+    assert block.startswith("```yaml\n") and block.endswith("```\n")
+    target = tmp_path / "autoforge.yaml"
+    target.write_text(block.removeprefix("```yaml\n").removesuffix("```\n"), encoding="utf-8")
+    return target
+
+
 # -- execution.loop_detection (#194) ---------------------------------------------
 def test_loop_detection_defaults_to_kill_with_the_calibrated_thresholds():
     """#199: ``kill`` by default, the thresholds #194 proposed kept after real

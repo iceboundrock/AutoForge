@@ -1285,6 +1285,81 @@ def _subreaper() -> int:
     return value.value
 
 
+def test_orphan_containment_is_available_exactly_where_a_subreaper_is(monkeypatch):
+    """What doctor's Pi row reads (#135): Linux can contain, and asking
+    leaves the subreaper setting as it was; a platform without prctl cannot."""
+    linux = sys.platform.startswith("linux")
+    assert executor.orphan_containment_available() is linux
+    if linux:
+        assert _subreaper() == 0
+    monkeypatch.setattr(executor, "_prctl", lambda: None)
+    assert executor.orphan_containment_available() is False
+
+
+def _fake_prctl(*, get_ok=True, set_ok=True, current=0):
+    """A ``prctl`` that records its subreaper calls: ``"get"`` or ``("set", value)``.
+
+    A read reports ``current``; a refused call returns -1, as a denying
+    security policy (a seccomp filter, an LSM) makes the real one do.
+    """
+    calls: list[object] = []
+
+    def prctl(option, arg, *_):
+        if option == executor._PR_GET_CHILD_SUBREAPER:
+            calls.append("get")
+            arg._obj.value = current
+            return 0 if get_ok else -1
+        assert option == executor._PR_SET_CHILD_SUBREAPER
+        calls.append(("set", arg))
+        return 0 if set_ok else -1
+
+    return prctl, calls
+
+
+def test_containment_is_unavailable_where_the_subreaper_can_be_read_but_not_set(monkeypatch):
+    """R1-F1 (#135): a host that permits reading the setting but denies
+    setting it cannot contain, since every contained launch sets it; doctor
+    must not report containment there, and the executor indeed falls back."""
+    prctl, calls = _fake_prctl(set_ok=False)
+    monkeypatch.setattr(executor, "_prctl", lambda: prctl)
+    assert executor.orphan_containment_available() is False
+    assert calls == ["get", ("set", 1)]
+    if sys.platform.startswith("linux"):
+        assert executor._Containment.begin() is None
+    assert executor._CONTAINMENT_LOCK.acquire(blocking=False)
+    executor._CONTAINMENT_LOCK.release()
+
+
+def test_containment_is_unavailable_where_the_subreaper_cannot_be_read(monkeypatch):
+    prctl, calls = _fake_prctl(get_ok=False)
+    monkeypatch.setattr(executor, "_prctl", lambda: prctl)
+    assert executor.orphan_containment_available() is False
+    assert calls == ["get"]
+
+
+@pytest.mark.parametrize("previous", [0, 1])
+def test_the_containment_probe_restores_the_setting_it_found(monkeypatch, previous):
+    prctl, calls = _fake_prctl(current=previous)
+    monkeypatch.setattr(executor, "_prctl", lambda: prctl)
+    assert executor.orphan_containment_available() is True
+    assert calls == ["get", ("set", 1), ("set", previous)]
+
+
+@pytest.mark.parametrize("current", [0, 1])
+def test_the_probe_never_sets_what_a_running_contained_invocation_owns(monkeypatch, current):
+    """While a contained invocation of this process holds the setting, the
+    probe only reads it: setting and restoring it then could switch that
+    invocation's containment off."""
+    prctl, calls = _fake_prctl(current=current)
+    monkeypatch.setattr(executor, "_prctl", lambda: prctl)
+    assert executor._CONTAINMENT_LOCK.acquire(blocking=False)
+    try:
+        assert executor.orphan_containment_available() is bool(current)
+    finally:
+        executor._CONTAINMENT_LOCK.release()
+    assert calls == ["get"]
+
+
 def test_detached_orphan_outlives_an_uncontained_invocation_unreported(monkeypatch):
     """The gap the amendment closes: a detached process that holds none of
     the pipes is invisible to the group check and the pipe EOF, so without

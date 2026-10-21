@@ -4,9 +4,12 @@ import json
 
 import pytest
 
+import autoforge.doctor as doctor_module
+import autoforge.executor as executor_module
 from autoforge.doctor import Doctor
 from autoforge.executor import ExecutionResult, execute
 from autoforge.profiles import local_required_profiles
+from autoforge.redaction import redact
 from tests.conftest import is_shell_probe
 
 RULES_ENDPOINT = "repos/owner/repo/rules/branches/main"
@@ -775,6 +778,7 @@ def test_state_dir_on_a_filesystem_without_hard_links_names_the_requirement(tmp_
 # -- agent rows derived from the reachable profiles; Pi checks (#129) ---------------
 PI_LABEL = "agent 'pi' available (review_round_2_5)"
 PI_AUTH = "agent 'pi' auth ready (review_round_2_5)"
+PI_CONTAINED = "pi's detached tool processes are contained (review_round_2_5)"
 OAUTH_READY = '{"status":"ready","provider":"openai","authType":"oauth"}'
 # A planted "secret" Pi might print on stderr; no row may ever quote it.
 PLANTED = "sk-planted-SECRET-0123456789abcdef"
@@ -952,7 +956,8 @@ def test_a_healthy_pi_profile_passes_and_bounds_its_claim(tmp_path):
     # `ready` proves a credential exists for the provider, not that the model is usable.
     assert "provider 'openai' only" in auth.detail
     assert "cannot be checked" in auth.detail
-    others = [r for n, r in results.items() if not n.startswith("outer sandbox: ")]
+    # The sandbox rows and the containment row depend on the host's platform.
+    others = [r for n, r in results.items() if not n.startswith(("outer sandbox: ", PI_CONTAINED))]
     assert all(r.ok for r in others), [r for r in others if not r.ok]
 
 
@@ -1134,6 +1139,17 @@ def test_require_oauth_decides_whether_an_api_key_is_acceptable(
         assert "require_oauth: false" in row.detail
 
 
+def test_a_ready_api_key_row_survives_the_redaction_doctor_prints_it_through(tmp_path):
+    """#135: the DeepSeek route's OK row, as `autoforge doctor` prints it
+    (redacted), still reads `authenticated`, not a redaction marker."""
+    profile = _pi_profile(model="deepseek/deepseek-flash", options={"require_oauth": "false"})
+    auth = (0, '{"status":"ready","provider":"deepseek","authType":"api_key"}')
+    row = _pi_doctor(tmp_path, profile=profile, auth=auth)[PI_AUTH]
+    assert row.ok, row.detail
+    assert redact(row.detail) == row.detail
+    assert "authType api_key; authenticated for provider 'deepseek' only" in row.detail
+
+
 def test_pi_profiles_sharing_a_model_share_one_probe(tmp_path):
     pi = _pi_profile()
     config = _write_config(tmp_path, {"review_round_2_5": pi, "review_round_6_plus": pi})
@@ -1265,7 +1281,43 @@ def test_the_default_agent_dir_is_used_when_the_launch_does_not_pass_one(tmp_pat
 def test_no_outside_instructions_row_without_a_pi_profile(tmp_path):
     config = _write_config(tmp_path, {"analyze_execute": {"provider": "opencode"}})
     d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory())
-    assert not any("instructions" in r.name for r in d.run_all())
+    names = [r.name for r in d.run_all()]
+    assert not any("instructions" in n or n.startswith("pi's detached") for n in names)
+
+
+# -- unattended Pi use needs orphan containment (#135, ADR 0002 §4b) ----------------
+def test_pi_tool_processes_are_contained_where_a_subreaper_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor_module, "orphan_containment_available", lambda: True)
+    row = _pi_doctor(tmp_path)[PI_CONTAINED]
+    assert row.ok and not row.required
+    assert "killed when the launch ends" in row.detail
+
+
+def test_without_a_subreaper_unattended_pi_use_is_warned_against(tmp_path, monkeypatch):
+    """A WARN, never a FAIL: attended use stays possible, and doctor passes."""
+    monkeypatch.setattr(doctor_module, "orphan_containment_available", lambda: False)
+    results = _pi_doctor(tmp_path)
+    row = results[PI_CONTAINED]
+    assert row.label == "WARN" and not row.required
+    assert "do not run Pi unattended here (docs/pi.md#unattended-use)" in row.detail
+    assert results[PI_LABEL].ok and results[PI_AUTH].ok
+
+
+def test_a_subreaper_that_can_be_read_but_not_set_is_no_containment(tmp_path, monkeypatch):
+    """R1-F1: a security policy that permits reading the subreaper setting
+    but denies setting it leaves every launch uncontained, so doctor warns."""
+    calls = []
+
+    def prctl(option, arg, *_):
+        calls.append(option)
+        return 0 if option == executor_module._PR_GET_CHILD_SUBREAPER else -1
+
+    monkeypatch.setattr(executor_module, "_prctl", lambda: prctl)
+    row = _pi_doctor(tmp_path)[PI_CONTAINED]
+    assert row.label == "WARN" and not row.required
+    assert "cannot make itself a child subreaper" in row.detail
+    assert "a security policy denies it" in row.detail
+    assert executor_module._PR_SET_CHILD_SUBREAPER in calls
 
 
 def test_a_forwarded_api_key_fails_an_oauth_profile_without_probing(tmp_path, monkeypatch):

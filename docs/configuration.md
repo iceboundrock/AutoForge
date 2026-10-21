@@ -467,10 +467,14 @@ opencode run --standalone -m <provider/model>[#<effort>] --format default
 ### Pi profiles
 
 `provider: pi` runs [Pi](adr/0003-pi-agent-provider.md) (`pi` 1.0.0 or
-newer). The profile's fields map as follows:
+newer). The [Pi operator guide](pi.md) walks through installing Pi,
+giving it a DeepSeek API key or signing in with ChatGPT, a profile to copy
+for each, `doctor`'s Pi rows and their remedies, and the opt-in live smoke
+test. The profile's fields map as follows:
 
 - `model` is `<pi-provider>/<model-id>`, for example
-  `openai/gpt-5.6-terra` or `openai-codex/gpt-5.6`: exactly one `/`, a
+  `deepseek/deepseek-flash`, `openai/gpt-5.6-terra` or
+  `openai-codex/gpt-5.6`: exactly one `/`, a
   lowercase provider name, and no `:<thinking>` suffix (the thinking level
   comes from `effort`).
 - `effort` is required and is one of `off`, `minimal`, `low`, `medium`,
@@ -501,7 +505,10 @@ newer). The profile's fields map as follows:
   `doctor` fails, and a launch is refused before anything starts, when
   `OPENAI_API_KEY` would reach Pi through the allow-list. Every launch first
   runs `pi auth check` (below), and Pi is started only when it reports a
-  ready OAuth sign-in for the model's provider.
+  ready OAuth sign-in for the model's provider. An API-key provider
+  (DeepSeek) needs `false`; its key belongs in Pi's credential store, or
+  is forwarded with `execution.env_allowlist_extra`, a list every agent
+  launch gets ([Pi operator guide](pi.md#deepseek-on-an-api-key)).
 
 `autoforge doctor` checks the Pi version and runs
 `pi auth check --model M --json --no-refresh` under the same environment
@@ -526,7 +533,11 @@ profile sets `context_files: false`, a context file there or in a directory
 above the checkout. With the default `execution.worktree_dir` that includes
 the operator's own checkout. Pi has no approval layer: run unattended Pi
 phases in a container, a VM or under a dedicated user
-([Pi policy](pi-policy.md) §7).
+([Pi policy](pi-policy.md) §7). `doctor` also warns where the controller
+cannot make itself a child subreaper (anything but Linux, or a Linux host
+whose security policy denies it): what a Pi tool command leaves running
+can then outlive the launch, so Pi is attended only there
+([Pi operator guide: unattended use](pi.md#unattended-use)).
 
 ### SDK profiles (`claude-sdk`, `opencode-sdk`)
 
