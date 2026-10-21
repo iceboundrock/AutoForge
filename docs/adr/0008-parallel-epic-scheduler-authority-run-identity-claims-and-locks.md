@@ -86,8 +86,8 @@ facts of #177's body that changed in between.
   (`cli.py` `--state-dir` :100, `config.state_dir`). LOCAL's is
   `<git dir>/autoforge/state`.
 - The state schema is `AutoForgeState` (`state.py` :390) at
-  `__protocol_version__` "10": #160 took 7, #211 8, #219 9 and #172 10, and
-  #23 reserves 6 for #126.
+  `__protocol_version__` "11": #160 took 7, #211 8, #219 9, #172 10 and
+  #243 11, and #23 reserves 6 for #126.
 - Worktrees are one per issue (`_agent_worktree_name`, `engine.py` :1771):
   `<common dir>/autoforge/worktrees/<n>`, or `<execution.worktree_dir>/<n>`.
   Between issues, `UPDATE_EPIC` uses `epic-<n>`. The worktree root is part
@@ -1654,8 +1654,9 @@ certificates (#170–#175) are consumed, not changed.
   `reset_for_new_issue` :1226, `StatePaths` :1584 and
   `quarantine_state_file` :1783; `_CONTAINMENT_LOCK` is at `executor.py`
   :917 (refused at :1025); `edit_issue_body` at `github.py` :1325.
-- **The state protocol is 10, not 5.** The scheduler's schemas stay outside
-  `AutoForgeState` (D18.2).
+- **The state protocol is 11, not 5** (10 when this record was accepted;
+  #243 took 11). The scheduler's schemas stay outside `AutoForgeState`
+  (D18.2).
 - **Agents no longer push or fetch.** Every REMOTE GitHub write is the
   controller's: an effect K1–K9, or one of ADR 0004 D5.4's writes (the
   merge, disabling auto-merge, the replan close, receipt and reopen, the

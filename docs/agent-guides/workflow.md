@@ -814,11 +814,14 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   stale. Otherwise:
   - **no flag** -> `FIX` only on progress, from a read-only reconcile: an
     action now verifiable (its exact payload, or its bound comment
-    unchanged) or a recorded conflict that no longer reproduces; `FIX`
-    saves each verified action and completes the plan without launching
-    the fixer. Without progress the unblock refuses, naming each action: a
-    reason, a checkbox or a comment that is not the payload is never
-    evidence.
+    unchanged) or a recorded conflict that no longer reproduces on a
+    target whose listing was read; `FIX` saves each verified action and
+    completes the plan without launching the fixer. Without progress the
+    unblock refuses, naming each action: a reason, a checkbox or a comment
+    that is not the payload is never evidence. A target that is not found
+    or answers as another object holds its action (a conflict there is not
+    re-checked); any other conclusive failure to read a target or its
+    comments refuses, naming both, as it does for `--bind-evidence`.
   - **`--bind-evidence X-… <comment URL>`** (repeatable) -> `FIX` when
     every pair meets ADR 0004 D5.9's rules: the record is pending (not in
     conflict), the comment is an issue comment of the run's repository

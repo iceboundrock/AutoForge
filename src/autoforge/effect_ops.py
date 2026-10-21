@@ -984,6 +984,18 @@ class OperatorCommentOp:
             return decide_operator_comment(
                 record, own=(), misplaced=(), listing=(), target_problem=problem
             )
+        return self.reconcile_listing(record)
+
+    def reconcile_listing(self, record: EffectRecord) -> Decision:
+        """:meth:`reconcile` from the target's complete listing alone (#243).
+
+        For a caller that has read the target itself
+        (:meth:`target_disqualification`). Any failure to read the listing
+        propagates.
+        """
+        if record.stage in (Stage.OBSERVED, Stage.CONFLICT):
+            return decide_operator_comment(record, own=(), misplaced=(), listing=())
+        target_url = record.target["issue_url"]
         comments = self.github.get_issue_comments(target_url)
         listing = [Listed(url=c.url, comment_id=c.id, body=c.body) for c in comments]
         collection = collect(OPERATOR_COMMENT, comments, "comment")
@@ -1019,16 +1031,27 @@ class OperatorCommentOp:
         A transient failure propagates; every conclusive one is a reason.
         """
         try:
-            issue = self.github.get_issue(target_url)
+            return self.target_disqualification(target_url, issue_url)
         except GitHubUnavailableError:
             raise
+        except GitHubError as exc:
+            return f"issue {target_url} cannot be read ({redact(str(exc))})"
+
+    def target_disqualification(self, target_url: str, issue_url: str) -> str:
+        """:meth:`target_problem` from an answer GitHub gave, or "" (#243).
+
+        Not found, another object or another repository is a reason. Any
+        other conclusive failure propagates, like a transient one: an
+        ``unblock`` refuses on a target it cannot read rather than holding
+        it (PR #254 R1-F1).
+        """
+        try:
+            issue = self.github.get_issue(target_url)
         except GitHubNotFoundError:
             return f"issue {target_url} is not found (deleted, or not readable with this token)"
         except GitHubWrongTargetError as exc:
             what = "a pull request" if exc.is_pull_request else "another object"
             return f"issue {target_url} answers as {what} ({exc.answered_url})"
-        except GitHubError as exc:
-            return f"issue {target_url} cannot be read ({redact(str(exc))})"
         repository = parse_issue_url(issue_url).repository
         if not _same_repository(issue.repository or repository, repository):
             return f"issue {target_url} is no longer in the run's repository {repository}"

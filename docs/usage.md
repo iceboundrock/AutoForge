@@ -342,7 +342,10 @@ action before anything else; it then publishes the rest of the plan. While
 one is still missing it blocks again, naming what is verified so far. A
 plain `unblock` is refused, with nothing written, unless something changed
 since the block: a pending action is now on GitHub, or a recorded conflict
-no longer reproduces (a new conflict is not progress). A conflict blocks
+no longer reproduces (a new conflict is not progress). A target that cannot
+be read (a permission lost, say) refuses the unblock, naming it; one that is
+not found or answers as a pull request holds its action, and a conflict
+recorded on it is not re-checked until it can be read. A conflict blocks
 with the comments named; repair it, then `unblock`:
 
 - the payload posted twice: delete one;

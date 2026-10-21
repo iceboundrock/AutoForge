@@ -8187,7 +8187,8 @@ class ControllerEngine:
                     f"unblock {request.flag} names {', '.join(unknown)}, which is no operator "
                     f"action of the saved FIX plan awaiting the operator (awaiting: {names}); "
                     "the id is recomputed from the saved record, so an id of an older plan or "
-                    "other bytes never matches. Run 'autoforge status' for the current ones",
+                    f"other bytes never matches. Run {self.cli_command('status')} for the "
+                    "current ones",
                     pr=pr,
                 )
             if not pending:
@@ -8231,15 +8232,42 @@ class ControllerEngine:
         """A plain unblock: FIX only when a read-only reconcile shows progress (#243).
 
         Progress is a pending action now observable, or a recorded conflict
-        that no longer reproduces. Without progress the unblock is refused
-        and saves nothing, naming each pending action: an unblock reason, a
-        checkbox or a comment that is not the payload is never evidence.
+        that no longer reproduces on a target whose listing was read.
+        Without progress the unblock is refused and saves nothing, naming
+        each pending action: an unblock reason, a checkbox or a comment that
+        is not the payload is never evidence. A target that is not found or
+        answers as another object holds its action. Any other conclusive
+        failure to read a target or its comments refuses, naming both
+        (PR #254 R1-F1).
         """
         progress: list[str] = []
         waiting: list[str] = []
         for record in pending:
-            reopened = record.reopened()
-            found = op.reconcile(reopened)
+            target = record.target["issue_url"]
+            action = f"{record.describe()} ({record.action_id})"
+            try:
+                problem = op.target_disqualification(target, record.owner.issue_url)
+                found = None if problem else op.reconcile_listing(record.reopened())
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return UnblockDecision(
+                    None,
+                    f"{action} cannot be checked: {target} or its comments cannot be read "
+                    f"({exc}), so nothing was verified and nothing is saved. Fix the cause, "
+                    "then unblock again",
+                    pr=pr,
+                )
+            if found is None:
+                # Nothing on the target was read, so a recorded conflict is
+                # not re-checked, and never progress.
+                checked = (
+                    "its recorded conflict is not re-checked"
+                    if record.stage is Stage.CONFLICT
+                    else "nothing was verified"
+                )
+                waiting.append(f"{action}: {problem}; {checked}")
+                continue
             if found.action is Action.OBSERVE:
                 observed = found.observed or {}
                 progress.append(
@@ -8258,13 +8286,17 @@ class ControllerEngine:
                 f"the persisted plan without launching the fixer{changed}",
                 pr=pr,
             )
+        why = "<why>"
+        printed = ", ".join(self.cli_command("status", "--action", r.action_id) for r in pending)
+        bind = self.cli_command("unblock", "--bind-evidence", "X-...")
+        decline = self.cli_command("unblock", "--decline-action", "X-...")
         return UnblockDecision(
             None,
             "no operator action made progress, and an unblock reason, a checkbox or a "
             f"comment that is not the payload is never evidence: {'; '.join(waiting)}. Post "
-            "each payload exactly ('autoforge status --action X-...'), bind an existing "
-            "comment with '--bind-evidence', or decline with '--decline-action'"
-            f"{changed}",
+            f"each payload exactly (print it with {printed}), bind an existing comment with "
+            f"{bind} <comment URL> --reason {why!r}, or decline with {decline} --reason "
+            f"{why!r}{changed}",
             pr=pr,
         )
 
@@ -8382,11 +8414,17 @@ class ControllerEngine:
                     ),
                     pr=pr,
                 )
-            listed = [
-                c
-                for c in self.github.get_issue_comments(target.canonical)
-                if c.id == ref.comment_id
-            ]
+            try:
+                comments = self.github.get_issue_comments(target.canonical)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return UnblockDecision(
+                    None,
+                    refused + (f"the comments of {target.canonical} cannot be read ({exc})"),
+                    pr=pr,
+                )
+            listed = [c for c in comments if c.id == ref.comment_id]
             if len(listed) != 1:
                 return UnblockDecision(
                     None,

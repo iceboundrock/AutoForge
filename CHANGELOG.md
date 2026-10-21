@@ -24,7 +24,8 @@ so.
   the bound of 16 per review round.
 - A plain `unblock` of a run waiting on operator actions is refused, with
   nothing written, until one of them is on GitHub or a recorded conflict is
-  repaired. `run` refuses to replace a `BLOCKED` or `FAILED` run that holds
+  repaired; a target or comment listing it cannot read refuses it as well,
+  naming the target. `run` refuses to replace a `BLOCKED` or `FAILED` run that holds
   operator actions without `--force`.
 - The state file is protocol 11 (prompt version 12): an older AutoForge
   refuses it, and this one refuses a file labelled older that carries

@@ -280,6 +280,92 @@ def test_a_payload_posted_twice_or_on_the_wrong_issue_is_a_conflict(tmp_state_di
     assert record.stage is Stage.CONFLICT and "misplaced payload" in record.reason
 
 
+def _conflicted(tmp_state_dir, gh: FakeGitHub):
+    """A run blocked on #16's payload posted with other line endings (a conflict)."""
+    eng = _operating(tmp_state_dir, gh, fixer(operator("R1-F1", (16, NOTE16 + "\nmore"))))
+    _post(gh, T16, 9016, payload(T16, NOTE16 + "\nmore").replace("\n", "\r\n"))
+    assert eng.step().next_phase == "BLOCKED"
+    assert _k10(eng, T16).stage is Stage.CONFLICT
+    return eng
+
+
+@pytest.mark.parametrize("case", ["listing", "target", "conflicted listing", "conflicted target"])
+def test_an_unreadable_target_refuses_a_plain_unblock_byte_identical(tmp_state_dir, case):
+    """PR #254 R1-F1: a conclusive failure to read a target or its comments
+    refuses the unblock naming both, even beside another action's progress;
+    a conflict on a target that was not read is never progress."""
+    gh = FakeGitHub()
+    if case.startswith("conflicted"):
+        eng, target = _conflicted(tmp_state_dir, gh), T16
+        gh.comments[T16] = [replace(gh.comments[T16][0], body=_k10(eng, T16).body)]  # repaired
+    else:
+        eng, target = _operating(tmp_state_dir, gh, fixer(BOTH)), T158
+        assert eng.step().next_phase == "BLOCKED"
+        _post(gh, T16, 9016, payload(T16, NOTE16))  # #16 made progress
+    if case.endswith("listing"):
+        gh.comments_error = GitHubError("HTTP 403: Resource not accessible")
+        target = T16  # every listing fails, #16's (the first read) included
+    else:
+        gh.get_issue_errors[target] = GitHubError("HTTP 403: Resource not accessible")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON)
+    assert not out.unblocked, out.message
+    assert _k10(eng, target).action_id in out.message
+    assert f"{target} or its comments cannot be read" in out.message and "HTTP 403" in out.message
+    assert eng.paths.state_file.read_text() == raw
+
+
+def test_a_conflict_on_a_target_that_is_gone_is_not_progress(tmp_state_dir):
+    gh = FakeGitHub()
+    eng = _conflicted(tmp_state_dir, gh)
+    del gh.issues[T16]
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON)
+    assert not out.unblocked and "no operator action made progress" in out.message
+    assert "is not found" in out.message and "recorded conflict is not re-checked" in out.message
+    assert eng.paths.state_file.read_text() == raw
+
+
+@pytest.mark.parametrize("where", ["listing", "target"])
+def test_a_transient_read_during_a_plain_unblock_propagates(tmp_state_dir, where):
+    gh = FakeGitHub()
+    eng = _conflicted(tmp_state_dir, gh)
+    if where == "listing":
+        gh.comments_error = GitHubUnavailableError("connection reset")
+    else:
+        gh.get_issue_errors[T16] = GitHubUnavailableError("connection reset")
+    raw = eng.paths.state_file.read_text()
+    with pytest.raises(GitHubUnavailableError):
+        eng.unblock(REASON)
+    assert eng.paths.state_file.read_text() == raw
+
+
+def test_unblock_refusals_name_the_runs_own_commands(tmp_state_dir):
+    """PR #254 R1-F2: a scheduler namespace's run (or one started with
+    ``--config`` / ``--state-dir``) is told commands it can run as typed."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    assert eng.step().next_phase == "BLOCKED"
+    eng.cli_global_flags = ("--config", "af.yaml", "--state-dir", "ns dir")
+    eng.continue_command = ("--config", "af.yaml", "epic", "resume", EPIC)
+    flags = "autoforge --config af.yaml --state-dir 'ns dir'"
+    x16, x158 = _k10(eng, T16).action_id, _k10(eng, T158).action_id
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, decline_action=["X-" + "0" * 16])
+    assert not out.unblocked and f"Run {flags} status for the current ones" in out.message
+    out = eng.unblock(REASON)
+    assert not out.unblocked and "no operator action made progress" in out.message
+    for command in (
+        f"{flags} status --action {x16}",
+        f"{flags} status --action {x158}",
+        f"{flags} unblock --bind-evidence X-...",
+        f"{flags} unblock --decline-action X-...",
+    ):
+        assert command in out.message, out.message
+    assert "'autoforge status" not in out.message and "'autoforge " not in out.message
+    assert eng.paths.state_file.read_text() == raw
+
+
 # -- the result check ------------------------------------------------------------------
 
 
@@ -459,6 +545,27 @@ def test_a_binding_outside_the_rules_is_refused_byte_identical(tmp_state_dir, ca
     raw = eng.paths.state_file.read_text()
     out = eng.unblock(REASON, bind_evidence=pairs)
     assert not out.unblocked and expect in out.message, out.message
+    assert eng.paths.state_file.read_text() == raw
+
+
+def test_a_binding_whose_listing_cannot_be_read_is_refused_byte_identical(tmp_state_dir):
+    """PR #254 R1-F1: a conclusive listing failure refuses, naming the action
+    and the target; a transient one propagates. Either way nothing is saved."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    assert eng.step().next_phase == "BLOCKED"
+    x16 = _k10(eng, T16).action_id
+    c = _post(gh, T16, 5016, "Notes.")
+    gh.comments_error = GitHubError("HTTP 403: Resource not accessible")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, bind_evidence=[(x16, c.url)])
+    assert not out.unblocked, out.message
+    assert f"{x16} cannot be bound to {c.url}" in out.message
+    assert f"the comments of {T16} cannot be read" in out.message
+    assert eng.paths.state_file.read_text() == raw
+    gh.comments_error = GitHubUnavailableError("connection reset")
+    with pytest.raises(GitHubUnavailableError):
+        eng.unblock(REASON, bind_evidence=[(x16, c.url)])
     assert eng.paths.state_file.read_text() == raw
 
 
