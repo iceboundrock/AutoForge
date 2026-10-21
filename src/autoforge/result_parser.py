@@ -69,12 +69,14 @@ only what it asks for.
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
+from urllib.parse import unquote
 
 from .errors import ConfigurationError, ControlResultError, ControlResultValidationError
 from .prompts import CONTROL_CHAR_RE, CONTROL_CHARS
@@ -105,7 +107,13 @@ _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 ALLOWED_STATUSES = ("success", "failure", "blocked")
 FINDING_CLASSIFICATIONS = ("blocked", "non-blocked", "nit")
-FIX_RESOLUTIONS = ("fixed", "follow_up_created", "no_change_with_rationale", "acceptance_action")
+FIX_RESOLUTIONS = (
+    "fixed",
+    "follow_up_created",
+    "no_change_with_rationale",
+    "acceptance_action",
+    "operator_acceptance",
+)
 # LOCAL mode has no GitHub, so a finding cannot be deferred to a follow-up
 # Issue. "unresolved" is the honest local disposition: the fixer could not
 # resolve it and says why. The controller treats it as a remaining finding.
@@ -224,6 +232,33 @@ ACCEPTANCE_ACTION_KEYS = ("kind", "body")
 ACCEPTANCE_TARGET_KEYS = ("url", "issue", "repository", "target", "method", "path", "command")
 MAX_ACCEPTANCE_BODY_CHARS = 60000
 MAX_ACCEPTANCE_ACTIONS_PER_FIX = 1
+# An ``operator_acceptance`` resolution (#243): 1 to
+# ``MAX_OPERATOR_ACTIONS_PER_FIX`` comments on *other* issues of the run's
+# repository that the operator posts and the controller only verifies (K10).
+# Each action is a closed schema: a kind, a target issue *number* the
+# controller checks against the allowed set it read at FIX entry, and the
+# text. Nothing names a URL, repository or command: those keys are refused
+# by name. The operator often pipes the text unedited under their own
+# identity, so beyond the published-text rules it carries no image, no raw
+# HTML and no link other than one into the run's repository
+# (:func:`operator_comment_link_problem`). Rejected, never clipped.
+OPERATOR_ACTION_KINDS = ("related_issue_comment",)
+OPERATOR_ACTION_KEYS = ("kind", "issue", "body")
+OPERATOR_ACCEPTANCE_KEYS = ("actions",)
+OPERATOR_TARGET_KEYS = (
+    "url",
+    "repository",
+    "owner",
+    "repo",
+    "target",
+    "method",
+    "path",
+    "command",
+)
+MAX_OPERATOR_COMMENT_CHARS = 16000
+MAX_OPERATOR_ACTIONS_PER_FIX = 4
+# The largest issue number ``engine._ISSUE_REFERENCE_RE`` reads (nine digits).
+MAX_OPERATOR_ISSUE_NUMBER = 999_999_999
 # Bounds on the ``tests`` list: names of what the agent ran, recorded with
 # the result and never published.
 MAX_TESTS_REPORTED = 50
@@ -1257,6 +1292,230 @@ def _acceptance_body(raw: object, fid: str) -> str:
     return validate_acceptance_body(raw.get("body"), f"acceptance_action of {fid}")
 
 
+# A link or bare URL in operator text (#243): a scheme separator, an
+# extended ``www.`` autolink, a Markdown inline link destination or a link
+# reference definition. Matched anywhere, code included, like
+# :data:`_PROGRESS_URL_RE`: the operator copies the text whole. A
+# definition is read wherever ``]:`` occurs, not only at a line start:
+# CommonMark honours one inside a block quote or list item, with an escaped
+# bracket or a line break in its label, and with its destination on the next
+# line. A ``]:`` that starts no definition is refused too unless what follows
+# links into the repository; rephrasing it costs the fixer one correction.
+_OPERATOR_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*+://[^\s<>\"'`)\]]*+")
+_OPERATOR_WWW_RE = re.compile(r"(?<![A-Za-z0-9.])www\.", re.IGNORECASE)
+_OPERATOR_LINK_DEST_RE = re.compile(r"\]\(\s*+<?([^\s)>]*+)")
+_OPERATOR_LINK_DEF_RE = re.compile(r"\]:[ \t]*+(?:\r?\n[ \t]*+)?(<?)([^\s>]*+)")
+_OPERATOR_IMAGE_RE = re.compile(r"!\[")
+# An e-mail address GitHub autolinks as a ``mailto:`` link.
+_OPERATOR_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]@[A-Za-z0-9-]++\.[A-Za-z]")
+
+
+def _repository_url_prefix(repository: str) -> re.Pattern[str]:
+    """The one link form operator text may carry: ``https://github.com/<owner>/<repo>``.
+
+    Owner and repository compare case-insensitively, as GitHub does; the
+    prefix must end the URL or be followed by ``/``, ``?`` or ``#``, so a
+    longer name (``repo-evil``) or another host never matches.
+    """
+    return re.compile(rf"https://github\.com/{re.escape(repository)}(?:[/?#]|\Z)", re.IGNORECASE)
+
+
+def operator_comment_link_problem(subject: str, text: str, repository: str) -> str | None:
+    """Why operator text ``subject`` links outside ``repository``, or ``None`` (#243).
+
+    Every link or bare URL must be ``https://github.com/<repository>/...``;
+    a relative link, another scheme, another host or repository, a ``www.``
+    or e-mail autolink and a path that climbs out with ``..`` or a backslash
+    are refused, as written and once entity and percent escapes are decoded
+    (CommonMark decodes an entity in a destination, and a browser resolves
+    ``%2e%2e`` as ``..``). Names the subject, the index and the rule, never
+    the text.
+    """
+    allowed = _repository_url_prefix(repository)
+
+    def bad(url: str) -> bool:
+        return any(
+            allowed.match(form) is None
+            or "\\" in form
+            or re.search(r"/\.{1,2}(?:[/?#]|\Z)", form) is not None
+            for form in (url, unquote(html.unescape(url)))
+        )
+
+    found: list[int] = []
+    for m in _OPERATOR_URL_RE.finditer(text):
+        if bad(m.group(0)):
+            found.append(m.start())
+    found.extend(m.start() for m in _OPERATOR_WWW_RE.finditer(text))
+    found.extend(m.start() for m in _OPERATOR_EMAIL_RE.finditer(text))
+    for m in _OPERATOR_LINK_DEST_RE.finditer(text):
+        if bad(m.group(1)):
+            found.append(m.start(1))
+    for m in _OPERATOR_LINK_DEF_RE.finditer(text):
+        if (m.group(1) or m.group(2)) and bad(m.group(2)):
+            found.append(m.start(2))
+    if not found:
+        return None
+    return (
+        f"{subject!r} contains a link or URL at index {min(found)} that is not "
+        f"'https://github.com/{repository}/...'; the operator posts this text under their own "
+        "identity, so it links only into the run's repository (no relative link, other host, "
+        "other repository, 'www.' form or e-mail address). Remove it and re-emit the "
+        "CONTROL_RESULT."
+    )
+
+
+def operator_markup_problem(subject: str, text: str) -> str | None:
+    """Why operator text ``subject`` carries an image or raw HTML, or ``None`` (#243).
+
+    Both are judged outside code spans and fenced blocks, where GitHub
+    renders them. Names the subject and an index, never the text.
+    """
+    ranges = _code_ranges(text)
+    image = next(_outside(ranges, (m.start() for m in _OPERATOR_IMAGE_RE.finditer(text))), None)
+    if image is not None:
+        return (
+            f"{subject!r} contains a Markdown image at index {image} outside code; the operator "
+            "posts this text under their own identity, so it embeds no image. Remove it and "
+            "re-emit the CONTROL_RESULT."
+        )
+    html = next(_outside(ranges, (m.start() for m in _RAW_HTML_RE.finditer(text))), None)
+    if html is not None:
+        return (
+            f"{subject!r} contains raw HTML (a tag, comment or autolink) at index {html} outside "
+            "code; the operator posts this text under their own identity, so it carries no raw "
+            "HTML. Remove it (or put it in a code span) and re-emit the CONTROL_RESULT."
+        )
+    return None
+
+
+def validate_operator_comment_body(
+    text: object, subject: str = "operator_acceptance", repository: str = ""
+) -> str:
+    """``text`` as the agent's part of an operator comment (K10, #243), or a rejection.
+
+    Non-blank, at most :data:`MAX_OPERATOR_COMMENT_CHARS`, multi-line text
+    with no other control character, publishable
+    (:func:`published_text_problem`), and with no image or raw HTML
+    (:func:`operator_markup_problem`). With ``repository``
+    (``owner/name``) the link rule applies too
+    (:func:`operator_comment_link_problem`): the parser does not know the
+    run's repository, so the controller applies it when it checks the
+    result and when it reloads a persisted record.
+    """
+    body = _fix_text(text, subject, "body", MAX_OPERATOR_COMMENT_CHARS, one_line=False)
+    problem = operator_markup_problem(f"{subject} body", body)
+    if problem is None and repository:
+        problem = operator_comment_link_problem(f"{subject} body", body, repository)
+    if problem is not None:
+        raise ControlResultValidationError(f"FIX: field {problem}")
+    return body
+
+
+@dataclass(frozen=True)
+class OperatorAction:
+    """One ``related_issue_comment`` an ``operator_acceptance`` resolution requests (#243).
+
+    ``issue`` is a number of the run's repository the controller checks
+    against the allowed set it read at FIX entry; ``body`` is the agent's
+    text the controller renders between its header and marker.
+    """
+
+    issue: int
+    body: str
+
+
+def _operator_issue_number(value: object, fid: str, index: int) -> int:
+    """The target issue number of ``fid``'s action ``index``, or a rejection."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        shown = "a string" if isinstance(value, str) else type(value).__name__
+        raise ControlResultValidationError(
+            f"FIX: {fid} operator_acceptance actions[{index}] field 'issue' is {shown}; it is "
+            "a JSON integer, the issue number alone (never a URL, '#n' or 'owner/repo#n'). Fix "
+            "it and re-emit the CONTROL_RESULT."
+        )
+    if not 1 <= value <= MAX_OPERATOR_ISSUE_NUMBER:
+        raise ControlResultValidationError(
+            f"FIX: {fid} operator_acceptance actions[{index}] field 'issue' must be between 1 "
+            f"and {MAX_OPERATOR_ISSUE_NUMBER}"
+        )
+    return value
+
+
+def _operator_actions(raw: object, fid: str) -> tuple[OperatorAction, ...]:
+    """The actions of ``fid``'s ``operator_acceptance`` object, or a rejection.
+
+    A closed schema at both levels: the object carries ``actions`` only, and
+    each action exactly ``kind``, ``issue`` and ``body``. A key that would
+    name a target is refused by name, any other unknown key as unknown;
+    nothing is ignored, because an ignored ``url`` would read as a target
+    the controller honoured.
+    """
+    ph = "FIX"
+    if not isinstance(raw, dict):
+        raise ControlResultValidationError(
+            f"{ph}: {fid} field 'operator_acceptance' must be an object with 'actions'"
+        )
+
+    def refuse_keys(obj: dict, allowed: tuple[str, ...], what: str) -> None:
+        targets = sorted(str(k) for k in obj if k in OPERATOR_TARGET_KEYS)
+        if targets:
+            raise ControlResultValidationError(
+                f"{ph}: {fid} {what} carries {', '.join(repr(k) for k in targets)}; an operator "
+                "action names no URL, repository, owner, target, method, path or command: it "
+                "names an issue number of the run's repository. Remove the field and re-emit "
+                "the CONTROL_RESULT."
+            )
+        unknown = sorted(str(k) for k in obj if k not in allowed)
+        if unknown:
+            raise ControlResultValidationError(
+                f"{ph}: {fid} {what} has unknown field(s) "
+                f"{', '.join(repr(k[:MAX_FINDING_ID_CHARS]) for k in unknown)}; it carries "
+                f"exactly {', '.join(repr(k) for k in allowed)}"
+            )
+
+    refuse_keys(raw, OPERATOR_ACCEPTANCE_KEYS, "operator_acceptance")
+    actions = raw.get("actions")
+    if not isinstance(actions, list) or not actions:
+        raise ControlResultValidationError(
+            f"{ph}: {fid} operator_acceptance must carry a non-empty 'actions' array"
+        )
+    if len(actions) > MAX_OPERATOR_ACTIONS_PER_FIX:
+        raise ControlResultValidationError(
+            f"{ph}: {fid} operator_acceptance carries {len(actions)} actions; the controller "
+            f"accepts at most {MAX_OPERATOR_ACTIONS_PER_FIX} per FIX result. Re-emit the "
+            "CONTROL_RESULT with fewer."
+        )
+    out: list[OperatorAction] = []
+    for index, action in enumerate(actions):
+        what = f"operator_acceptance actions[{index}]"
+        if not isinstance(action, dict):
+            raise ControlResultValidationError(
+                f"{ph}: {fid} {what} must be an object with kind, issue and body"
+            )
+        refuse_keys(action, OPERATOR_ACTION_KEYS, what)
+        kind = action.get("kind")
+        if kind not in OPERATOR_ACTION_KINDS:
+            shown = (
+                repr(kind[:MAX_FINDING_ID_CHARS]) if isinstance(kind, str) else type(kind).__name__
+            )
+            raise ControlResultValidationError(
+                f"{ph}: {fid} {what} kind {shown} is not supported; the one supported kind is "
+                f"{OPERATOR_ACTION_KINDS[0]!r} (a comment the operator posts on another issue "
+                "of the run's repository)"
+            )
+        issue = _operator_issue_number(action.get("issue"), fid, index)
+        if any(a.issue == issue for a in out):
+            raise ControlResultValidationError(
+                f"{ph}: {fid} operator_acceptance names issue #{issue} twice; one finding "
+                "requests at most one comment per issue"
+            )
+        body = validate_operator_comment_body(
+            action.get("body"), f"operator_acceptance of {fid} for #{issue}"
+        )
+        out.append(OperatorAction(issue=issue, body=body))
+    return tuple(out)
+
+
 @dataclass
 class FindingResolution:
     """One open finding's resolution, as a REMOTE fixer reports it (#163).
@@ -1268,7 +1527,10 @@ class FindingResolution:
     both. An ``acceptance_action`` resolution carries the body of the
     comment the controller publishes on the run's issue
     (``acceptance_body``; the payload's ``acceptance_action`` object, #211)
-    and the rationale a ``no_change_with_rationale`` needs. ``commit_sha``
+    and the rationale a ``no_change_with_rationale`` needs. An
+    ``operator_acceptance`` resolution carries the comments the operator
+    posts on other issues (``operator_actions``; the payload's
+    ``operator_acceptance`` object, #243) and a rationale too. ``commit_sha``
     is allowed on ``fixed`` only. ``to_dict`` keeps the persisted shape of
     ``state.last_fix_resolutions``.
     """
@@ -1281,6 +1543,7 @@ class FindingResolution:
     follow_up_title: str = ""
     follow_up_body: str = ""
     acceptance_body: str = ""
+    operator_actions: tuple[OperatorAction, ...] = ()
 
     @property
     def new_follow_up(self) -> bool:
@@ -1291,6 +1554,11 @@ class FindingResolution:
     def acceptance_action(self) -> bool:
         """An acceptance comment the controller publishes for this finding (#211)."""
         return self.resolution == "acceptance_action"
+
+    @property
+    def operator_acceptance(self) -> bool:
+        """Comments the operator posts on other issues for this finding (#243)."""
+        return self.resolution == "operator_acceptance"
 
     @classmethod
     def from_payload(cls, raw: object, index: int) -> FindingResolution:
@@ -1318,7 +1586,8 @@ class FindingResolution:
         new_issue = raw.get("follow_up_issue")
         commit_sha = _opt_sha(raw, "commit_sha", ph)
         action = raw.get("acceptance_action")
-        if res in ("no_change_with_rationale", "acceptance_action"):
+        operator = raw.get("operator_acceptance")
+        if res in ("no_change_with_rationale", "acceptance_action", "operator_acceptance"):
             if len(rationale) < MIN_RATIONALE_CHARS:
                 raise ControlResultValidationError(
                     f"{ph}: {fid} uses {res} but the rationale is missing "
@@ -1327,6 +1596,10 @@ class FindingResolution:
         if res != "acceptance_action" and action is not None:
             raise ControlResultValidationError(
                 f"{ph}: {fid} carries an acceptance_action but resolution is {res!r}"
+            )
+        if res != "operator_acceptance" and operator is not None:
+            raise ControlResultValidationError(
+                f"{ph}: {fid} carries an operator_acceptance but resolution is {res!r}"
             )
         if res != "follow_up_created":
             if follow_up or new_issue is not None:
@@ -1361,6 +1634,14 @@ class FindingResolution:
                     "object with kind and body"
                 )
             acceptance = _acceptance_body(action, fid)
+        operator_actions: tuple[OperatorAction, ...] = ()
+        if res == "operator_acceptance":
+            if operator is None:
+                raise ControlResultValidationError(
+                    f"{ph}: {fid} uses operator_acceptance and must carry an "
+                    "'operator_acceptance' object with 'actions'"
+                )
+            operator_actions = _operator_actions(operator, fid)
         return cls(
             finding_id=fid,
             resolution=res,
@@ -1370,6 +1651,7 @@ class FindingResolution:
             follow_up_title=title,
             follow_up_body=body,
             acceptance_body=acceptance,
+            operator_actions=operator_actions,
         )
 
     def to_dict(self) -> dict:
@@ -1415,6 +1697,21 @@ class FixResult:
                 f"({', '.join(actions)}); the controller accepts at most "
                 f"{MAX_ACCEPTANCE_ACTIONS_PER_FIX} per FIX result. Resolve the others another "
                 "way and re-emit the CONTROL_RESULT."
+            )
+        operators = [r for r in resolutions if r.operator_acceptance]
+        if actions and operators:
+            raise ControlResultValidationError(
+                f"{ph}: the result mixes acceptance_action ({', '.join(actions)}) and "
+                f"operator_acceptance ({', '.join(r.finding_id for r in operators)}); one FIX "
+                "result carries one or the other, never both. Resolve one of them another way "
+                "and re-emit the CONTROL_RESULT."
+            )
+        requested = sum(len(r.operator_actions) for r in operators)
+        if requested > MAX_OPERATOR_ACTIONS_PER_FIX:
+            raise ControlResultValidationError(
+                f"{ph}: the operator_acceptance resolutions request {requested} actions; the "
+                f"controller accepts at most {MAX_OPERATOR_ACTIONS_PER_FIX} per FIX result. "
+                "Re-emit the CONTROL_RESULT with fewer."
             )
         tests = _opt_str_list(p, "tests", ph)
         if len(tests) > MAX_TESTS_REPORTED:
@@ -1798,6 +2095,9 @@ class LocalFindingResolution:
                     else " — LOCAL runs perform no external writes; resolve as `unresolved` "
                     "with a rationale instead"
                     if res == "acceptance_action"
+                    else " — LOCAL runs have no GitHub and no operator actions; resolve as "
+                    "`unresolved` with a rationale instead"
+                    if res == "operator_acceptance"
                     else ""
                 )
             )

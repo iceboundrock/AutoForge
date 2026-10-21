@@ -1,6 +1,7 @@
 """CONTROL_RESULT parser boundary cases (§13)."""
 
 import json
+import re
 import time
 
 import pytest
@@ -27,6 +28,9 @@ from autoforge.result_parser import (
     MAX_FIX_RATIONALE_CHARS,
     MAX_FOLLOW_UP_BODY_CHARS,
     MAX_FOLLOW_UP_TITLE_CHARS,
+    MAX_OPERATOR_ACTIONS_PER_FIX,
+    MAX_OPERATOR_COMMENT_CHARS,
+    MAX_OPERATOR_ISSUE_NUMBER,
     MAX_PROGRESS_CHARS,
     MAX_RESOLUTIONS_PER_FIX,
     MAX_REVIEW_SECTION_CHARS,
@@ -35,24 +39,29 @@ from autoforge.result_parser import (
     MAX_TESTS_REPORTED,
     MAX_URL_CHARS,
     MIN_RATIONALE_CHARS,
+    OPERATOR_TARGET_KEYS,
     REVIEW_PROSE_SECTIONS,
     AnalyzeExecuteResult,
     Finding,
     FixResult,
     LocalFixResult,
     LocalReviewResult,
+    OperatorAction,
     ReplanReexecuteResult,
     ReviewResult,
     UpdateEpicRequest,
     UpdateEpicResult,
     _mention_problem,
     commit_message_problem,
+    operator_comment_link_problem,
+    operator_markup_problem,
     parse_control_result,
     published_markdown_problem,
     published_payload_problem,
     published_text_problem,
     validate_for_phase,
     validate_next_issue_url,
+    validate_operator_comment_body,
     validate_pr_body,
     validate_pr_title,
     validate_progress_text,
@@ -625,6 +634,546 @@ def test_local_fix_refuses_an_acceptance_action():
     )
     with pytest.raises(ControlResultValidationError, match="LOCAL runs perform no external"):
         parse_control_result(text, Phase.FIX, mode)
+
+
+# -- operator_acceptance (#243): comments the operator posts on other issues ----------------
+OPERATOR_RATIONALE = "The finding asks for a note on the issues this change affects, not code."
+OPERATOR_NOTE = "This change alters the retry budget.\n\nThe new default is `3`, see the PR."
+
+
+def _op(issue: object = 16, body: object = OPERATOR_NOTE, **extra) -> dict:
+    """One ``related_issue_comment`` action of an ``operator_acceptance`` object."""
+    return {"kind": "related_issue_comment", "issue": issue, "body": body, **extra}
+
+
+def _operator(
+    operator: object, rationale: str = OPERATOR_RATIONALE, fid: str = "R1-F1", **extra
+) -> dict:
+    """A FIX payload whose one resolution is ``operator_acceptance`` carrying ``operator``."""
+    return dict(
+        _FIX_TOP,
+        resolutions=[
+            {
+                "finding_id": fid,
+                "resolution": "operator_acceptance",
+                "rationale": rationale,
+                "operator_acceptance": operator,
+                **extra,
+            }
+        ],
+    )
+
+
+def test_operator_acceptance_bounds_are_the_documented_ones():
+    """1 to 4 comments per FIX result, each at most 16000 characters (#243)."""
+    assert MAX_OPERATOR_ACTIONS_PER_FIX == 4
+    assert MAX_OPERATOR_COMMENT_CHARS == 16000
+    assert OPERATOR_TARGET_KEYS == (
+        "url",
+        "repository",
+        "owner",
+        "repo",
+        "target",
+        "method",
+        "path",
+        "command",
+    )
+
+
+@pytest.mark.parametrize("count", [1, MAX_OPERATOR_ACTIONS_PER_FIX])
+def test_fix_operator_acceptance_carries_numbered_comments_on_other_issues(count):
+    """#243: each action is the closed kind, an issue *number* and the agent's
+    text; the parsed resolution keeps them in order with the rationale, and
+    its persisted dict is the other resolutions' shape."""
+    actions = [_op(16 + n, f"{OPERATOR_NOTE}\n\nNote {n}.") for n in range(count)]
+    [r] = FixResult.from_payload(_operator({"actions": actions})).resolutions
+    assert r.operator_acceptance and not r.acceptance_action and not r.new_follow_up
+    assert r.operator_actions == tuple(
+        OperatorAction(issue=16 + n, body=f"{OPERATOR_NOTE}\n\nNote {n}.") for n in range(count)
+    )
+    assert all(isinstance(a.issue, int) for a in r.operator_actions)
+    assert r.rationale == OPERATOR_RATIONALE and r.acceptance_body == ""
+    assert r.to_dict() == {
+        "finding_id": "R1-F1",
+        "resolution": "operator_acceptance",
+        "rationale": OPERATOR_RATIONALE,
+        "follow_up_issue_url": "",
+        "commit_sha": "",
+    }
+
+
+def test_fix_operator_acceptance_issue_and_body_bounds_are_inclusive():
+    """Issue 1 and the largest number the controller reads are targets; a body
+    of exactly the bound is kept, stripped like every published text."""
+    exact = "b" * MAX_OPERATOR_COMMENT_CHARS
+    payload = _operator(
+        {"actions": [_op(1, f"\n  {exact}  \n"), _op(MAX_OPERATOR_ISSUE_NUMBER, "edge")]}
+    )
+    [r] = FixResult.from_payload(payload).resolutions
+    assert r.operator_actions == (
+        OperatorAction(issue=1, body=exact),
+        OperatorAction(issue=MAX_OPERATOR_ISSUE_NUMBER, body="edge"),
+    )
+
+
+def test_other_resolutions_carry_no_operator_actions():
+    [r] = _remote_fix_result().resolutions
+    assert not r.operator_acceptance and r.operator_actions == ()
+
+
+@pytest.mark.parametrize("key", OPERATOR_TARGET_KEYS)
+@pytest.mark.parametrize("where", ["action", "object"])
+def test_fix_operator_acceptance_refuses_any_target_by_name(key, where):
+    """No URL, repository, owner, target, method, path or command: an action
+    names an issue number the controller checks against the run's
+    repository, so a target-like key is refused by name, never ignored."""
+    if where == "action":
+        operator = {"actions": [_op(**{key: "https://github.com/o/x/issues/16"})]}
+    else:
+        operator = {"actions": [_op()], key: "https://github.com/o/x/issues/16"}
+    msg = _refusal(lambda: FixResult.from_payload(_operator(operator)))
+    what = "operator_acceptance actions[0]" if where == "action" else "operator_acceptance"
+    assert f"R1-F1 {what} carries '{key}'; an operator action names no URL" in msg
+    assert "names an issue number of the run's repository" in msg
+    assert "o/x" not in msg  # the value is never quoted
+
+
+def test_fix_operator_acceptance_names_every_target_key_it_refuses():
+    action = _op(url="u", command="c", owner="o")
+    msg = _refusal(lambda: FixResult.from_payload(_operator({"actions": [action]})))
+    assert "carries 'command', 'owner', 'url';" in msg
+
+
+@pytest.mark.parametrize(
+    ("issue", "match"),
+    [
+        pytest.param("16", "field 'issue' is a string; it is a JSON integer", id="string"),
+        pytest.param("#16", "field 'issue' is a string; it is a JSON integer", id="hash"),
+        pytest.param(
+            "https://github.com/o/r/issues/16",
+            r"is a string; it is a JSON integer, the issue number alone \(never a URL",
+            id="url",
+        ),
+        pytest.param("o/r#16", "field 'issue' is a string", id="owner-repo"),
+        pytest.param(True, "field 'issue' is bool", id="bool"),
+        pytest.param(16.0, "field 'issue' is float", id="float"),
+        pytest.param(None, "field 'issue' is NoneType", id="null"),
+        pytest.param([16], "field 'issue' is list", id="list"),
+        pytest.param(0, f"must be between 1 and {MAX_OPERATOR_ISSUE_NUMBER}", id="zero"),
+        pytest.param(-16, f"must be between 1 and {MAX_OPERATOR_ISSUE_NUMBER}", id="negative"),
+        pytest.param(
+            MAX_OPERATOR_ISSUE_NUMBER + 1,
+            f"must be between 1 and {MAX_OPERATOR_ISSUE_NUMBER}",
+            id="too-large",
+        ),
+    ],
+)
+def test_fix_operator_acceptance_issue_is_a_number_of_the_runs_repository(issue, match):
+    """The target is the issue number alone, a JSON integer the controller
+    resolves in the run's repository: never a string, '#n', a URL or a bool,
+    and within the range the controller's issue references read."""
+    msg = _refusal(lambda: FixResult.from_payload(_operator({"actions": [_op(issue)]})))
+    assert "R1-F1 operator_acceptance actions[0] field 'issue'" in msg
+    assert re.search(match, msg), msg
+    assert "github.com/o/r" not in msg
+
+
+def test_fix_operator_acceptance_issue_is_required():
+    action = {"kind": "related_issue_comment", "body": OPERATOR_NOTE}
+    msg = _refusal(lambda: FixResult.from_payload(_operator({"actions": [action]})))
+    assert "field 'issue' is NoneType" in msg
+
+
+@pytest.mark.parametrize(
+    ("operator", "match"),
+    [
+        pytest.param("post comments", "must be an object with 'actions'", id="not-an-object"),
+        pytest.param([_op()], "must be an object with 'actions'", id="a-bare-list"),
+        pytest.param({}, "must carry a non-empty 'actions' array", id="no-actions"),
+        pytest.param({"actions": []}, "must carry a non-empty 'actions' array", id="empty"),
+        pytest.param({"actions": _op()}, "non-empty 'actions' array", id="actions-not-a-list"),
+        pytest.param(
+            {"actions": [_op(16 + n) for n in range(MAX_OPERATOR_ACTIONS_PER_FIX + 1)]},
+            f"carries {MAX_OPERATOR_ACTIONS_PER_FIX + 1} actions; the controller accepts at "
+            f"most {MAX_OPERATOR_ACTIONS_PER_FIX} per FIX result",
+            id="too-many",
+        ),
+        pytest.param(
+            {"actions": [_op()], "note": "x"},
+            "operator_acceptance has unknown field(s) 'note'; it carries exactly 'actions'",
+            id="unknown-object-key",
+        ),
+        pytest.param(
+            {"actions": [_op(extra=1)]},
+            "actions[0] has unknown field(s) 'extra'; it carries exactly 'kind', 'issue', 'body'",
+            id="unknown-action-key",
+        ),
+        pytest.param(
+            {"actions": ["comment on #16"]},
+            "actions[0] must be an object with kind, issue and body",
+            id="action-not-an-object",
+        ),
+        pytest.param(
+            {"actions": [dict(_op(), kind="issue_comment")]},
+            "kind 'issue_comment' is not supported; the one supported kind is "
+            "'related_issue_comment'",
+            id="unknown-kind",
+        ),
+        pytest.param(
+            {"actions": [{"issue": 16, "body": OPERATOR_NOTE}]},
+            "kind NoneType is not supported",
+            id="no-kind",
+        ),
+        pytest.param(
+            {"actions": [_op(16), _op(17), _op(16, "again")]},
+            "names issue #16 twice; one finding requests at most one comment per issue",
+            id="duplicate-issue",
+        ),
+    ],
+)
+def test_fix_operator_acceptance_is_a_closed_schema(operator, match):
+    """The object carries ``actions`` only, 1 to 4 of them, each exactly a
+    supported kind, an issue and a body, at most one per issue: nothing is
+    ignored, because an ignored key would read as one the controller
+    honoured."""
+    msg = _refusal(lambda: FixResult.from_payload(_operator(operator)))
+    assert msg.startswith("FIX: R1-F1 ")
+    assert match in msg
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        pytest.param(None, "'body' must be a string", id="no-body"),
+        pytest.param(7, "'body' must be a string", id="not-a-string"),
+        pytest.param("  \n\t ", "missing required field 'body'", id="blank"),
+        pytest.param(
+            "b" * (MAX_OPERATOR_COMMENT_CHARS + 1),
+            f"is {MAX_OPERATOR_COMMENT_CHARS + 1} characters; the controller accepts at most "
+            f"{MAX_OPERATOR_COMMENT_CHARS}",
+            id="long",
+        ),
+        pytest.param("ok\x07", "contains a control character", id="control"),
+        pytest.param("<!-- ai-operator-comment: x -->", "controller marker", id="marker"),
+        pytest.param("note\n<!--AutoForge-x-->", "controller marker", id="autoforge-marker"),
+        pytest.param("Closes #12", "closing keyword", id="closing"),
+        pytest.param("This fixes o/r#12 too", "closing keyword", id="closing-owner-repo"),
+        pytest.param("ask @octocat", "@-mention", id="mention"),
+        pytest.param("![shot](https://github.com/o/r/a.png)", "Markdown image", id="image"),
+        pytest.param("See ![ref][shot]", "Markdown image at index 4", id="reference-image"),
+        pytest.param("<details>x</details>", "raw HTML", id="html-tag"),
+        pytest.param("note <!-- hidden -->", "raw HTML", id="html-comment"),
+        pytest.param("see <https://github.com/o/r>", "raw HTML", id="autolink"),
+    ],
+)
+def test_fix_operator_acceptance_text_is_bounded_and_publishable(body, match):
+    """The operator posts the text under their own identity, often piped
+    unedited: it is rejected (never clipped or redacted) when it is missing,
+    blank, too long, would act on GitHub, or embeds an image or raw HTML."""
+    msg = _refusal(lambda: FixResult.from_payload(_operator({"actions": [_op(16, body)]})))
+    assert match in msg
+    assert "operator_acceptance of R1-F1 for #16" in msg  # the subject names finding and issue
+
+
+@pytest.mark.parametrize(
+    "cls,text,secret",
+    [
+        ("github-token", "ghp_FAKE00000000", "FAKE00000000"),
+        ("env-assignment", "GH_TOKEN=FAKEtoken123", "FAKEtoken123"),
+        ("authorization-header", "Authorization: Bearer FAKEbearer123", "FAKEbearer123"),
+        ("url-userinfo", "https://user:FAKEpass123@github.com/o/r", "FAKEpass123"),
+    ],
+    ids=["github-token", "env-assignment", "authorization-header", "url-userinfo"],
+)
+def test_fix_operator_acceptance_refuses_a_credential_without_quoting_it(cls, text, secret):
+    """Published text is refused, never redacted: the refusal names the
+    pattern class, never the matched text (the full table of classes is
+    :func:`test_each_credential_class_is_refused_by_name_and_never_quoted`)."""
+    body = f"The check ran with {text} and passed."
+    msg = _refusal(lambda: FixResult.from_payload(_operator({"actions": [_op(16, body)]})))
+    assert "credential-shaped" in msg and cls in msg and "never redacted" in msg
+    assert secret not in msg
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Use `![badge](x.png)` in the README.",
+        "The tag is `<details>`.",
+        "```\n<details>\n![shot](x.png)\n</details>\n```",
+        "~~~html\n<br>\n~~~",
+        "Compare a < b and a <3 b.",
+    ],
+    ids=["image-in-span", "html-in-span", "fenced", "tilde-fenced", "not-html"],
+)
+def test_fix_operator_acceptance_allows_an_image_or_html_inside_code(body):
+    """GitHub renders neither an image nor raw HTML inside a code span or a
+    fenced block, so there they are text and the body is kept as given."""
+    [r] = FixResult.from_payload(_operator({"actions": [_op(16, body)]})).resolutions
+    assert r.operator_actions == (OperatorAction(issue=16, body=body),)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Mixed: `<details>` then ![shot](x.png)",
+        "```\nfenced\n```\n<details>x</details>",
+    ],
+    ids=["image-after-span", "html-after-fence"],
+)
+def test_fix_operator_acceptance_judges_markup_outside_code_only(body):
+    msg = _refusal(lambda: FixResult.from_payload(_operator({"actions": [_op(16, body)]})))
+    assert "outside code" in msg
+
+
+def test_fix_operator_acceptance_needs_a_rationale_and_nothing_else():
+    """Like a no-change resolution it explains itself; it never names a
+    commit, a follow-up or an acceptance comment, and no other resolution
+    carries the object."""
+    operator = {"actions": [_op()]}
+    with pytest.raises(ControlResultValidationError, match="R1-F1 uses operator_acceptance but"):
+        FixResult.from_payload(_operator(operator, rationale="short"))
+    with pytest.raises(ControlResultValidationError, match="rationale is missing"):
+        FixResult.from_payload(_operator(operator, rationale=""))
+    with pytest.raises(
+        ControlResultValidationError, match="must carry an 'operator_acceptance' object"
+    ):
+        FixResult.from_payload(_operator(None))
+    with pytest.raises(ControlResultValidationError, match="only a fixed finding"):
+        FixResult.from_payload(_operator(operator, commit_sha=SHA_B))
+    with pytest.raises(ControlResultValidationError, match="carries a follow-up issue"):
+        FixResult.from_payload(_operator(operator, follow_up_issue_url=ISSUE))
+    with pytest.raises(ControlResultValidationError, match="carries a follow-up issue"):
+        FixResult.from_payload(_operator(operator, follow_up_issue=NEW_FOLLOW_UP))
+    action = {"kind": "issue_comment", "body": "evidence"}
+    with pytest.raises(
+        ControlResultValidationError,
+        match="carries an acceptance_action but resolution is 'operator_acceptance'",
+    ):
+        FixResult.from_payload(_operator(operator, acceptance_action=action))
+
+
+@pytest.mark.parametrize(
+    ("resolution", "extra"),
+    [
+        ("fixed", {}),
+        ("no_change_with_rationale", {"rationale": OPERATOR_RATIONALE}),
+        (
+            "acceptance_action",
+            {
+                "rationale": OPERATOR_RATIONALE,
+                "acceptance_action": {"kind": "issue_comment", "body": "evidence"},
+            },
+        ),
+        ("follow_up_created", {"follow_up_issue_url": ISSUE}),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_only_an_operator_acceptance_resolution_carries_the_object(resolution, extra):
+    payload = dict(
+        _FIX_TOP,
+        resolutions=[
+            {
+                "finding_id": "R1-F1",
+                "resolution": resolution,
+                "operator_acceptance": {"actions": [_op()]},
+                **extra,
+            }
+        ],
+    )
+    with pytest.raises(
+        ControlResultValidationError,
+        match=f"R1-F1 carries an operator_acceptance but resolution is '{resolution}'",
+    ):
+        FixResult.from_payload(payload)
+
+
+def _two_operator_findings(first: int, second: int) -> dict:
+    payload = _operator({"actions": [_op(16 + n) for n in range(first)]})
+    other = _operator({"actions": [_op(16 + n) for n in range(second)]}, fid="R1-F2")
+    payload["resolutions"] += other["resolutions"]
+    return payload
+
+
+def test_fix_result_requests_at_most_four_operator_actions_in_total():
+    """The bound is per FIX result, not per finding: two findings sharing four
+    actions pass, five across them are refused whole."""
+    res = FixResult.from_payload(_two_operator_findings(2, 2))
+    assert [len(r.operator_actions) for r in res.resolutions] == [2, 2]
+    msg = _refusal(lambda: FixResult.from_payload(_two_operator_findings(3, 2)))
+    assert (
+        f"FIX: the operator_acceptance resolutions request 5 actions; the controller accepts "
+        f"at most {MAX_OPERATOR_ACTIONS_PER_FIX} per FIX result"
+    ) in msg
+
+
+def test_two_findings_may_each_request_a_comment_on_the_same_issue():
+    """One comment per issue is a per-finding rule: each finding's comment
+    carries its own marker, so two findings may both name #16."""
+    res = FixResult.from_payload(_two_operator_findings(1, 1))
+    assert [a.issue for r in res.resolutions for a in r.operator_actions] == [16, 16]
+
+
+def test_fix_result_never_mixes_acceptance_action_and_operator_acceptance():
+    """One FIX result asks for the controller's acceptance comment or for the
+    operator's comments, never both."""
+    payload = _acceptance({"kind": "issue_comment", "body": "evidence"})
+    payload["resolutions"] += _operator({"actions": [_op()]}, fid="R1-F2")["resolutions"]
+    msg = _refusal(lambda: FixResult.from_payload(payload))
+    assert (
+        "FIX: the result mixes acceptance_action (R1-F1) and operator_acceptance (R1-F2); one "
+        "FIX result carries one or the other, never both"
+    ) in msg
+
+
+def test_local_fix_refuses_an_operator_acceptance():
+    """LOCAL runs have no GitHub, so no operator action is offered either."""
+    text, mode = _fix_with(_operator({"actions": [_op()]})["resolutions"], "LOCAL")
+    msg = _refusal(lambda: parse_control_result(text, Phase.FIX, mode))
+    assert "LOCAL runs have no GitHub and no operator actions" in msg
+    assert "resolve as `unresolved` with a rationale instead" in msg
+
+
+def test_remote_parse_control_result_accepts_an_operator_acceptance():
+    text, mode = _fix_with(_operator({"actions": [_op()]})["resolutions"], "REMOTE")
+    payload = parse_control_result(text, Phase.FIX, mode)
+    assert payload["resolutions"][0]["resolution"] == "operator_acceptance"
+
+
+# -- the operator text's link rule: links only into the run's repository (#243) --------
+@pytest.mark.parametrize(
+    "text",
+    [
+        "See https://github.com/o/r/issues/3.",
+        "See https://github.com/O/R/pull/4#discussion_r1",
+        "See https://github.com/o/r",
+        "See https://github.com/o/r?tab=readme",
+        "See https://github.com/o/r#readme",
+        "See [the issue](https://github.com/o/r/issues/3).",
+        "See [the issue]( https://github.com/o/r/issues/3 ).",
+        "[ref]: https://github.com/o/r/issues/3\n\nSee [ref].",
+        "See `https://github.com/o/r/blob/main/README.md`",
+        "See #12 and o/r#3 and o/x#4.",
+        "Plain text without any link.",
+    ],
+)
+def test_operator_text_may_link_into_the_runs_repository(text):
+    """Every link or bare URL is ``https://github.com/<repository>/...``;
+    owner and repository compare case-insensitively, as GitHub does. An
+    issue reference is not a link."""
+    assert operator_comment_link_problem("operator note", text, "o/r") is None
+    assert validate_operator_comment_body(text, "operator note", repository="o/r") == text
+
+
+@pytest.mark.parametrize(
+    ("text", "index"),
+    [
+        pytest.param("See https://evil.example/x.", 4, id="other-host"),
+        pytest.param("See https://github.com.evil.example/o/r", 4, id="host-prefix"),
+        pytest.param("See https://gitlab.com/o/evil/issues/3", 4, id="gitlab"),
+        pytest.param("See https://github.com/o/r-evil/issues/3", 4, id="longer-repository"),
+        pytest.param("See https://github.com/o/r.evil", 4, id="repository-suffix"),
+        pytest.param("See https://github.com/evil/r/issues/3", 4, id="other-owner"),
+        pytest.param("See http://github.com/o/r/evil", 4, id="http"),
+        pytest.param("See ftp://github.com/o/r/evil", 4, id="other-scheme"),
+        pytest.param("See [it](/evil/r/issues/3).", 9, id="root-relative"),
+        pytest.param("See [it](evil/issues/3).", 9, id="relative"),
+        pytest.param("See [it](#evil).", 9, id="fragment"),
+        pytest.param("See [it](//evil.example).", 9, id="protocol-relative"),
+        pytest.param("See [it](<https://evil.example>).", 10, id="angle-destination"),
+        pytest.param("See www.evil.example", 4, id="www"),
+        pytest.param("Mail evil@example.com", 8, id="e-mail"),
+        pytest.param("See https://github.com/o/r/../evil/issues/3", 4, id="dot-dot"),
+        pytest.param("See https://github.com/o/r/issues/evil/..", 4, id="trailing-dot-dot"),
+        pytest.param("See https://github.com/o/r/./evil", 4, id="dot"),
+        pytest.param("See https://github.com/o/r\\evil", 4, id="backslash"),
+        pytest.param("[ref]: https://evil.example\n\nSee [ref].", 7, id="definition"),
+        pytest.param("[ref]: /evil/r\n\nSee [ref].", 7, id="relative-definition"),
+        pytest.param("`https://evil.example`", 1, id="in-code"),
+        pytest.param("ok https://github.com/o/r and https://evil.example", 30, id="second"),
+    ],
+)
+def test_operator_text_links_nowhere_but_the_runs_repository(text, index):
+    """No relative link, other scheme, host or repository, ``www.`` or e-mail
+    autolink, and no path that climbs out with ``..`` or a backslash; code
+    is no exemption, since the operator copies the text whole. The refusal
+    names the subject, the first index and the rule, never the text."""
+    msg = operator_comment_link_problem("operator note", text, "o/r")
+    assert msg is not None
+    assert msg.startswith("'operator note' contains a link or URL at index ")
+    assert f"at index {index} that is not 'https://github.com/o/r/...'" in msg
+    assert "evil" not in msg
+    # The body validator refuses it too (an angle destination is raw HTML first).
+    raised = _refusal(lambda: validate_operator_comment_body(text, "note", repository="o/r"))
+    assert raised.startswith("FIX: field 'note body' contains ")
+    assert "evil" not in raised
+
+
+def test_validate_operator_comment_body_applies_the_link_rule_only_with_a_repository():
+    """The parser does not know the run's repository, so a FIX result with a
+    foreign link parses; the controller applies the rule when it checks the
+    result and when it reloads a persisted record."""
+    text = "Background: https://evil.example/post"
+    assert validate_operator_comment_body(text) == text
+    assert validate_operator_comment_body(text, "note", repository="") == text
+    with pytest.raises(ControlResultValidationError, match="not 'https://github.com/o/r/...'"):
+        validate_operator_comment_body(text, "note", repository="o/r")
+    [r] = FixResult.from_payload(_operator({"actions": [_op(16, text)]})).resolutions
+    assert r.operator_actions[0].body == text
+
+
+def test_validate_operator_comment_body_applies_every_other_rule_without_a_repository():
+    """Bounds, the published-text rules and the markup rule never depend on
+    the repository: a persisted record is re-validated under the same rules."""
+    for bad, match in [
+        ("", "missing required field 'body'"),
+        ("x" * (MAX_OPERATOR_COMMENT_CHARS + 1), f"at most {MAX_OPERATOR_COMMENT_CHARS}"),
+        ("Closes #3", "closing keyword"),
+        ("![x](y)", "Markdown image"),
+        ("<b>x</b>", "raw HTML"),
+    ]:
+        for repository in ("", "o/r"):
+            with pytest.raises(ControlResultValidationError, match=match):
+                validate_operator_comment_body(bad, "note", repository=repository)
+    stripped = validate_operator_comment_body("  kept\n", "note", repository="o/r")
+    assert stripped == "kept"
+
+
+def test_operator_markup_problem_names_an_index_never_the_text():
+    msg = operator_markup_problem("note", "Look: ![secret-shot](x.png)")
+    assert msg is not None and "Markdown image at index 6 outside code" in msg
+    assert "secret-shot" not in msg
+    msg = operator_markup_problem("note", "Look: <img src=secret.png>")
+    assert msg is not None and "raw HTML (a tag, comment or autolink) at index 6" in msg
+    assert "secret" not in msg
+    assert operator_markup_problem("note", "Look: `<img>` and `![x](y)`") is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "> [ref]: //evil.example/x\n\nSee [the note][ref].",
+        "- [ref]: /evil/repo\n\nSee [the note][ref].",
+        "[a\\]b]: //evil.example\n\nSee [the note][a\\]b].",
+        "[a\nb]: //evil.example\n\nSee [the note][a b].",
+    ],
+    ids=["block-quote", "list-item", "escaped-label", "multi-line-label"],
+)
+def test_operator_text_refuses_a_link_definition_in_any_container(text):
+    assert operator_comment_link_problem("operator note", text, "o/r") is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "See https://github.com/o/r/%2e%2e/%2e%2e/evil/repo",
+        "See https://github.com/o/r/.%2E/.%2E/evil/repo",
+        "See [it](https://github.com/o/r/&#46;&#46;/&#46;&#46;/evil/repo).",
+    ],
+    ids=["percent", "mixed-percent", "entity"],
+)
+def test_operator_text_refuses_an_encoded_dot_segment(text):
+    assert operator_comment_link_problem("operator note", text, "o/r") is not None
 
 
 def test_fix_result_reports_its_tests_within_bounds():

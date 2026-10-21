@@ -5,6 +5,31 @@ so.
 
 ## Unreleased
 
+### Operator actions on related issues (#243)
+
+- A `FIX` agent may resolve a finding as `operator_acceptance`: one to four
+  comments (four at most per result) on *other* issues of the run's
+  repository, those the run's issue body references or the EPIC, as `FIX`
+  read them when it started. The controller never posts them: the run
+  blocks before anything else of the plan is sent, `status` lists each
+  `X-…` action with its target and payload hash, `status --action X-…`
+  prints the exact bytes, and the operator posts each, binds an existing
+  comment (`unblock --bind-evidence X-… <comment URL>`) or withdraws them
+  (`unblock --decline-action X-…`, now repeatable). `FIX` verifies every
+  comment on GitHub before it publishes the rest of the plan, and the next
+  review reads the verified comments
+  ([BLOCKED on operator actions](docs/usage.md#blocked-on-operator-actions)).
+- `safety.acceptance_actions: off` refuses that resolution too; `approve`
+  (the default) and `auto` offer it. Acceptance and operator declines share
+  the bound of 16 per review round.
+- A plain `unblock` of a run waiting on operator actions is refused, with
+  nothing written, until one of them is on GitHub or a recorded conflict is
+  repaired. `run` refuses to replace a `BLOCKED` or `FAILED` run that holds
+  operator actions without `--force`.
+- The state file is protocol 11 (prompt version 12): an older AutoForge
+  refuses it, and this one refuses a file labelled older that carries
+  operator state.
+
 ### Pi: DeepSeek and the ChatGPT subscription (EPIC #127)
 
 - `provider: pi` runs any phase through [Pi](docs/pi.md) 1.0.0 or newer, an

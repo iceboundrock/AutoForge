@@ -2621,6 +2621,174 @@ def test_unblock_takes_one_acceptance_flag(tmp_path, capsys, monkeypatch, fakes)
     assert "not allowed with argument" in capsys.readouterr().err
 
 
+# -- operator actions (#243) ------------------------------------------------------------
+T16 = "https://github.com/owner/repo/issues/16"
+T158 = "https://github.com/owner/repo/issues/158"
+NOTES = {16: "Coordination note for #16.", 158: "Coordination note for #158."}
+
+
+def _blocked_on_operator(tmp_path, monkeypatch, fakes) -> tuple[str, dict[str, str]]:
+    """A run whose FIX plan awaits two operator actions: (state dir, {target: action id})."""
+    from autoforge.effects import EffectRecord
+
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    gh = fakes["gh"]
+    gh.add_issue(ISSUE, "Ship the feature", body="Notes on #16 and #158 are required.")
+    gh.add_issue(T16, "Scheduler", state="CLOSED")
+    gh.add_issue(T158, "Worker")
+    resolution = {
+        "finding_id": "R1-F1",
+        "resolution": "operator_acceptance",
+        "rationale": "The issue requires coordination notes on #16 and #158 posted by the "
+        "operator.",
+        "operator_acceptance": {
+            "actions": [
+                {"kind": "related_issue_comment", "issue": n, "body": text}
+                for n, text in NOTES.items()
+            ]
+        },
+    }
+    eng = make_engine(sd, fixer(resolution), github=gh)
+    eng.origin = fakes["origin"]
+    head = publish_pr_head(eng)
+    gh.add_pr(head_sha=head)
+    eng.state.phase = Phase.FIX
+    eng.state.current_pr_url = PR
+    eng.state.current_head_sha = eng.state.reviewed_head_sha = head
+    eng.state.review_round = 1
+    eng.state.last_review_comment_url = comment_url(PR, 100)
+    eng.state.open_findings = [
+        {
+            "id": "R1-F1",
+            "classification": "bug",
+            "title": "notes missing",
+            "location": "docs/adr.md:1",
+            "required_resolution": "publish the coordination notes",
+        }
+    ]
+    assert eng.step().next_phase == "BLOCKED"
+    records = [EffectRecord.from_dict(r) for r in load_state(sd / "state.json").effect_records]
+    eng.close()
+    return str(sd), {r.target["issue_url"]: r.action_id for r in records[:2]}
+
+
+def test_status_shows_the_operator_actions_and_their_commands(tmp_path, capsys, monkeypatch, fakes):
+    sd, ids = _blocked_on_operator(tmp_path, monkeypatch, fakes)
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert "Operator actions (FIX, review round 1, finding R1-F1 notes missing)" in out
+    for target, action in ids.items():
+        assert f"{action}  comment on {target}  pending (not yet verified)" in out
+    assert "allowed:   referenced by the run's issue body" in out
+    assert f"status --action {ids[T16]} | gh issue comment {T16} --body-file -" in out
+    assert f"--bind-evidence {ids[T16]} <comment URL>" in out
+    assert f"--decline-action {ids[T16]} --decline-action {ids[T158]}" in out
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    entries = json.loads(capsys.readouterr().out)["operator_actions"]
+    assert [(e["action_id"], e["state"], e["performer"], e["target"]) for e in entries] == [
+        (ids[T16], "pending", "operator", T16),
+        (ids[T158], "pending", "operator", T158),
+    ]
+    assert entries[0]["allowed_by"] == ["issue_body"] and entries[0]["binding"] is None
+
+
+def test_status_action_prints_an_operator_payload_and_a_bound_state(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    sd, ids = _blocked_on_operator(tmp_path, monkeypatch, fakes)
+    gh = fakes["gh"]
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status", "--action", ids[T158]]) == 0
+    body = capsys.readouterr().out
+    assert NOTES[158] in body and "ai-operator-comment" in body
+    comment = gh.add_comment(T16, 5016, "Existing notes.")
+    argv = ["--state-dir", sd, "unblock", "--bind-evidence", ids[T16], comment.url]
+    assert cli.main([*argv, "--reason", "bound the existing note"]) == 0
+    out = capsys.readouterr().out
+    assert f"bound {ids[T16]} {comment.url}" in out
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    [first, _] = json.loads(capsys.readouterr().out)["operator_actions"]
+    assert first["state"] == "evidence_bound" and first["binding"]["comment_id"] == 5016
+
+
+def test_unblock_declines_several_operator_actions_at_once(tmp_path, capsys, monkeypatch, fakes):
+    sd, ids = _blocked_on_operator(tmp_path, monkeypatch, fakes)
+    capsys.readouterr()
+    argv = ["--state-dir", sd, "unblock", "--decline-action", ids[T16]]
+    rc = cli.main([*argv, "--decline-action", ids[T158], "--reason", "not needed"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert f"declined {ids[T16]}, {ids[T158]}" in out
+    state = load_state(Path(sd) / "state.json")
+    assert [o["outcome"] for o in state.operator_comment_outcomes] == ["declined", "declined"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "code", "stream", "needle"),
+    [
+        (["--approve-action", "X-" + "0" * 16], 2, "err", "operator-performed: nothing to approve"),
+        (["--decline-action", "X-" + "0" * 16], 1, "out", "no operator action of the saved"),
+        (
+            ["--decline-action", "A-" + "0" * 16, "--decline-action", "X-" + "0" * 16],
+            2,
+            "err",
+            "may repeat for operator action ids only",
+        ),
+        (["--bind-evidence", "X-123", T16 + "#issuecomment-1"], 2, "err", "X-<16 hex digits>"),
+    ],
+)
+def test_unblock_operator_flags_exit_codes(
+    tmp_path, capsys, monkeypatch, fakes, argv, code, stream, needle
+):
+    sd, _ = _blocked_on_operator(tmp_path, monkeypatch, fakes)
+    raw = (tmp_path / ".autoforge" / "state.json").read_text()
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "unblock", *argv, "--reason", "x"]) == code
+    assert needle in getattr(capsys.readouterr(), stream)
+    assert (tmp_path / ".autoforge" / "state.json").read_text() == raw
+
+
+def test_status_of_a_namespace_names_the_scheduler_to_continue(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """A scheduler namespace's run is continued by 'epic resume', which its
+    status names in the operator and acceptance hints: a standalone 'resume'
+    refuses that state directory (ADR 0008 D17.3)."""
+    standalone, ids = _blocked_on_operator(tmp_path, monkeypatch, fakes)
+    sd = _namespace_state_dir(tmp_path, 2)
+    sd.mkdir(parents=True)
+    shutil.copy2(os.path.join(standalone, "state.json"), sd / "state.json")
+    capsys.readouterr()
+    assert cli.main(["--state-dir", str(sd), "status"]) == 0
+    out = capsys.readouterr().out
+    assert f"&& autoforge epic resume {EPIC}" in out
+    assert f"--state-dir {sd} unblock --decline-action {ids[T16]}" in out
+    assert f"--state-dir {sd} resume" not in out
+
+
+@pytest.mark.parametrize("phase", ["BLOCKED", "FAILED"])
+def test_run_refuses_to_replace_a_run_holding_operator_actions(
+    tmp_path, capsys, monkeypatch, fakes, phase
+):
+    """BLOCKED and FAILED keep the FIX plan; a fresh `run` over one holding
+    operator actions is refused without --force, naming each action."""
+    sd, ids = _blocked_on_operator(tmp_path, monkeypatch, fakes)
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = phase
+    state_file.write_text(json.dumps(data))
+    raw = state_file.read_text()
+    capsys.readouterr()
+    run_argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(run_argv) == 2
+    err = capsys.readouterr().err
+    assert "holds operator actions" in err and f"{ids[T16]} on {T16}" in err
+    assert "comments stay on GitHub" in err
+    assert state_file.read_text() == raw
+
+
 # -- the recorded configuration (#219) ------------------------------------------------
 def _config(path, **sections) -> str:
     """Write a JSON config file at ``path``; its absolute path, as the run records it."""
@@ -2884,6 +3052,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
         "validation_override_seq",
     ):
         del data[key]  # protocol 10's own fields (#172)
+    del data["operator_comment_outcomes"]  # protocol 11's own field (#243)
     data["protocol_version"] = "8"
     with open(state_file, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
@@ -2901,7 +3070,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     assert f"--config {cfg} is recorded as the run's" in out.err
     assert "ANALYZE_EXECUTE -> REVIEW" in out.out
     saved = load_state(state_file)
-    assert saved.protocol_version == "10"
+    assert saved.protocol_version == "11"
     assert saved.config_fingerprint["source"] == "upgraded"
     assert saved.config_fingerprint["profiles"]["analyze_execute"]["model"] == "opus"
     assert cli.main(["--state-dir", sd, "status"]) == 0

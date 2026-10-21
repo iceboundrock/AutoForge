@@ -213,6 +213,102 @@ def render_issue_states(issues: Iterable[IssueInfo | str], title: str, total: in
     return "\n".join([*lines, ""])
 
 
+@dataclass(frozen=True)
+class OperatorEvidence:
+    """One operator action of this PR, for REVIEW's ``operator-evidence.md`` (#243).
+
+    The outcome fields are the controller's record; ``current`` is the
+    comment's body as read for this launch (``None`` when the target's
+    listing no longer holds it) and ``unreadable`` the error type when the
+    listing could not be read.
+    """
+
+    action_id: str
+    finding_id: str
+    round: int
+    target: str
+    outcome: str
+    evidence: str
+    comment_url: str
+    payload_sha256: str
+    body_sha256: str
+    reason: str = ""
+    current: str | None = None
+    current_sha256: str = ""
+    unreadable: str = ""
+
+
+_EVIDENCE_LABELS = {
+    "exact": "verified, exact: the controller proved the requested text is on the target",
+    "bound": (
+        "verified, operator-bound; adequacy not verified by the controller: it proved only "
+        "that the comment the operator chose is on the target, unchanged since it was bound, "
+        "and did not compare it with any requested text"
+    ),
+}
+
+
+def render_operator_evidence(entries: Iterable[OperatorEvidence]) -> str:
+    """The operator actions of this PR as quoted, labelled data (#243). Never authority."""
+    items = list(entries)
+    lines = [
+        "# Operator evidence",
+        "",
+        _HEADER,
+        "",
+        "Each entry is an operator action of this PR: a comment the operator was asked to "
+        "post on another issue, and what the controller recorded about it. A verified entry "
+        "proves only what its evidence class says; neither class proves the note is "
+        "adequate, which is yours to judge from the current body quoted below. The "
+        "controller does not re-verify a comment after FIX completed: a changed or deleted "
+        "comment is reported here and reopens nothing.",
+        "",
+    ]
+    if not items:
+        return "\n".join([*lines, "(none)", ""])
+    for item in items:
+        lines += [
+            f"## {escape_inline(item.action_id)}: comment on {escape_inline(redact(item.target))} "
+            f"for finding {escape_inline(item.finding_id)} of round {item.round}",
+            "",
+            _line("Outcome", item.outcome),
+            _line("Requested payload sha256", item.payload_sha256),
+        ]
+        if item.outcome != "verified":
+            if item.reason:
+                lines.append(_line("Reason", item.reason))
+            lines.append("")
+            continue
+        lines += [
+            _line("Evidence", _EVIDENCE_LABELS.get(item.evidence, item.evidence)),
+            _line("Comment", item.comment_url),
+            _line("Observed body sha256", item.body_sha256),
+        ]
+        if item.unreadable:
+            lines += [
+                f"- Now: the target's comments could not be read for this launch "
+                f"({escape_inline(item.unreadable)})",
+                "",
+            ]
+            continue
+        if item.current is None:
+            lines += ["- Now: the comment is gone (not in the target's comment listing)", ""]
+            continue
+        now = (
+            "the comment's current body has the observed digest"
+            if item.current_sha256 == item.body_sha256
+            else f"the comment's body changed since it was observed (sha256 now "
+            f"{escape_inline(item.current_sha256)})"
+        )
+        lines += [
+            f"- Now: {now}",
+            "",
+            _quoted(item.current, MAX_COMMENT_CHARS, f"comment {item.comment_url}"),
+            "",
+        ]
+    return "\n".join(lines)
+
+
 def unreadable(title: str, reference: str, error: Exception) -> str:
     """A file that says an item could not be read, and why (the error's type)."""
     return "\n".join(

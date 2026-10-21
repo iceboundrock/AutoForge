@@ -834,7 +834,16 @@ def test_common_prompt_names_the_read_context_and_says_no_credential():
     ("template", "files"),
     [
         ("analyze_execute.md", ["issue.md"]),
-        ("review.md", ["issue.md", "pull-request.md", "checks.md", "follow-up-issues.md"]),
+        (
+            "review.md",
+            [
+                "issue.md",
+                "pull-request.md",
+                "checks.md",
+                "follow-up-issues.md",
+                "operator-evidence.md",
+            ],
+        ),
         ("fix.md", ["review-comment.md", "issue.md", "follow-up-issues.md"]),
         ("update_epic.md", ["epic.md", "epic-issues.md"]),
         ("update_epic_rerequest.md", ["epic.md", "epic-issues.md"]),

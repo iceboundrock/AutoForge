@@ -547,8 +547,10 @@ def categorize(
             f"BLOCKED: {reason}. 'unblock' on the namespace, while no scheduler runs (it "
             "takes the controller lock), re-inspects GitHub and re-enters a phase (an "
             f"acceptance action a FIX plan awaits is listed by '{status}' and decided with "
-            "'unblock --approve-action' or '--decline-action'); 'epic resume' then "
-            "continues it",
+            "'unblock --approve-action' or '--decline-action'; an operator action, listed "
+            "there too, is posted by the operator ('status --action X-...') or bound with "
+            "'unblock --bind-evidence X-... <comment URL>', or declined with "
+            "'--decline-action X-...'); 'epic resume' then continues it",
             steps=(unblock, resume),
         )
     if verdict is not None and verdict.kind is VerdictKind.BLOCKED:

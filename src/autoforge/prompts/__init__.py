@@ -40,6 +40,9 @@ TEMPLATE_FILES = (
     # The FIX prompt's acceptance_action resolution (#211), rendered into
     # fix.md's {{ACCEPTANCE_ACTIONS}} when safety.acceptance_actions offers it.
     "acceptance_actions.md",
+    # The FIX prompt's operator_acceptance resolution (#243), rendered into
+    # fix.md's {{OPERATOR_ACTIONS}} when the entry recorded allowed targets.
+    "operator_acceptance.md",
     # The controller's REVIEW evidence section (ADR 0006 D9.1), rendered into
     # review.md's and local_review.md's {{VALIDATION_EVIDENCE}}, and a REMOTE
     # producer's validation failure (D5.4), rendered into analyze_execute.md's

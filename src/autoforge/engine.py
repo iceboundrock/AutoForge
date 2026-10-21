@@ -152,6 +152,7 @@ from .claims import (
     ACCEPTANCE,
     FOLLOW_UP,
     IMPLEMENTATION,
+    OPERATOR_COMMENT,
     PROGRESS,
     REVIEW,
     Claimants,
@@ -165,6 +166,7 @@ from .claims import (
     render_acceptance_marker,
     render_follow_up_marker,
     render_implementation_marker,
+    render_operator_comment_marker,
     render_progress_marker,
     render_review_marker,
     scan,
@@ -194,19 +196,24 @@ from .config_fingerprint import (
 from .effect_ops import (
     AcceptanceCommentOp,
     Driven,
+    OperatorCommentOp,
     ProgressCommentOp,
     ReviewCommentOp,
     append_problem,
     drive,
     operation_for,
+    verify,
 )
 from .effects import (
     ACTION_ID_RE,
+    ALLOWED_BY_EPIC,
+    ALLOWED_BY_ISSUE_BODY,
     AUTHORIZATION_OPERATOR,
     AUTHORIZATION_POLICY,
     FOLLOW_UP_SOURCE_ENTRY,
     MAX_BODY_CHARS,
     MAX_EFFECT_STATE_CHARS,
+    OPERATOR_ACTION_ID_RE,
     Action,
     AnalyzeContext,
     EffectKind,
@@ -214,6 +221,7 @@ from .effects import (
     EffectRecord,
     EntryObservation,
     FixContext,
+    OperatorTargets,
     ReplanContext,
     ReviewContext,
     Stage,
@@ -227,6 +235,8 @@ from .effects import (
     implementation_closing_block,
     is_legacy_reentry,
     launch_label_for,
+    operator_comment_body,
+    operator_comment_problem,
     plan_size_problem,
     progress_comment_body,
     replacement_pr_body,
@@ -248,6 +258,7 @@ from .errors import (
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    GitHubWrongTargetError,
     GitLockTimeout,
     GitTransportError,
     InteractionRequiredError,
@@ -380,12 +391,14 @@ from .prompts import (
 from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
 from .read_context import (
     MAX_LISTED_ISSUES,
+    OperatorEvidence,
     ReadContext,
     render_checks,
     render_comment,
     render_issue,
     render_issue_list,
     render_issue_states,
+    render_operator_evidence,
     render_pr,
     unreadable,
 )
@@ -416,6 +429,7 @@ from .replan_txn import (
     verify_target_pr,
 )
 from .result_parser import (
+    AGENT_MARKER_OPEN_RE,
     MAX_ACCEPTANCE_BODY_CHARS,
     MAX_CONTROL_RESULT_CHARS,
     MAX_FINDING_ID_CHARS,
@@ -426,6 +440,8 @@ from .result_parser import (
     MAX_FIX_RATIONALE_CHARS,
     MAX_FOLLOW_UP_BODY_CHARS,
     MAX_FOLLOW_UP_TITLE_CHARS,
+    MAX_OPERATOR_ACTIONS_PER_FIX,
+    MAX_OPERATOR_COMMENT_CHARS,
     MAX_PR_BODY_CHARS,
     MAX_PR_TITLE_CHARS,
     MAX_PROGRESS_CHARS,
@@ -440,12 +456,14 @@ from .result_parser import (
     LocalAnalyzeExecuteResult,
     LocalFixResult,
     LocalReviewResult,
+    OperatorAction,
     ReplanReexecuteResult,
     ReviewResult,
     UpdateEpicRequest,
     UpdateEpicResult,
     commit_message_problem,
     markdown_code_span,
+    operator_comment_link_problem,
     parse_control_result,
     published_payload_problem,
 )
@@ -537,6 +555,8 @@ FIX_BOUND_VARIABLES: dict[str, str | int | None] = {
     "MAX_FOLLOW_UP_TITLE_CHARS": MAX_FOLLOW_UP_TITLE_CHARS,
     "MAX_FOLLOW_UP_BODY_CHARS": MAX_FOLLOW_UP_BODY_CHARS,
     "MAX_ACCEPTANCE_BODY_CHARS": MAX_ACCEPTANCE_BODY_CHARS,
+    "MAX_OPERATOR_ACTIONS_PER_FIX": MAX_OPERATOR_ACTIONS_PER_FIX,
+    "MAX_OPERATOR_COMMENT_CHARS": MAX_OPERATOR_COMMENT_CHARS,
 }
 # The FIX prompt's description of the ``acceptance_action`` resolution
 # (#211), rendered into ``{{ACCEPTANCE_ACTIONS}}`` when
@@ -548,6 +568,15 @@ ACCEPTANCE_ACTIONS_UNAVAILABLE = (
     "(`safety.acceptance_actions: off`): the controller refuses it. When a finding "
     "can only be resolved by publishing text on the issue, report "
     '`"status": "blocked"` with a `"message"` saying so.'
+)
+# The FIX prompt's description of the ``operator_acceptance`` resolution
+# (#243), rendered into ``{{OPERATOR_ACTIONS}}`` when the FIX entry recorded
+# allowed targets; otherwise one sentence says why it is unavailable.
+OPERATOR_ACTIONS_TEMPLATE = "operator_acceptance.md"
+OPERATOR_ACTIONS_UNAVAILABLE = (
+    "The `operator_acceptance` resolution is not available in this FIX entry ({why}): the "
+    "controller refuses it. When a finding can only be resolved by text on another issue, "
+    'report `"status": "blocked"` with a `"message"` saying so.'
 )
 
 # How many times one LOCAL phase entry may launch a write-capable agent
@@ -1056,6 +1085,12 @@ class UnblockDecision:
     action: str = ""
     approve: EffectRecord | None = None
     decline: EffectRecord | None = None
+    # Operator actions this unblock decides on (K10, #243): ``bind`` the
+    # records with the operator's evidence binding recorded, and
+    # ``operator_decline`` the records the operator declined; the rest of
+    # the plan's pending K10 records are withdrawn with them.
+    bind: tuple[EffectRecord, ...] = ()
+    operator_decline: tuple[EffectRecord, ...] = ()
 
     @property
     def refused(self) -> bool:
@@ -1072,6 +1107,27 @@ class AcceptanceRequest:
     @property
     def flag(self) -> str:
         return f"--{self.verb}-action {self.action_id}"
+
+
+@dataclass(frozen=True)
+class OperatorRequest:
+    """``unblock --bind-evidence`` or ``--decline-action`` of operator actions (K10, #243).
+
+    ``verb`` is ``bind`` (``action_ids[i]`` bound to ``urls[i]``) or
+    ``decline`` (``urls`` empty).
+    """
+
+    verb: str  # "bind" | "decline"
+    action_ids: tuple[str, ...]
+    urls: tuple[str, ...] = ()
+
+    @property
+    def flag(self) -> str:
+        if self.verb == "bind":
+            return " ".join(
+                f"--bind-evidence {a} {u}" for a, u in zip(self.action_ids, self.urls, strict=True)
+            )
+        return " ".join(f"--decline-action {a}" for a in self.action_ids)
 
 
 @dataclass(frozen=True)
@@ -1444,6 +1500,10 @@ class ControllerEngine:
         # entry observation and the completion context are what persist.
         self._existing_follow_ups: dict[str, str] = {}
         self._fix_candidate = ""
+        # Why the FIX result its check accepted blocks instead of being
+        # planned: an operator action's target read failed conclusively
+        # (#243). Set by :meth:`_check_fix_result`, read by :meth:`_apply_fix`.
+        self._fix_block = ""
         # The progress comment an UPDATE_EPIC entry adopted without a record:
         # posted by an agent under the previous contract (ADR 0004 D13.7), or
         # recorded as pre-existing by the entry observation of that adoption.
@@ -3024,7 +3084,13 @@ class ControllerEngine:
             "The controller verified these against the commits it pushed, the follow-up "
             "issues it read back and, for an `acceptance_action` resolution, the acceptance "
             "comment it read back on the issue (`acceptance_comment_url`, #211); each rationale "
-            "is the fixer's text, and so is an acceptance comment's text after its header:\n"
+            "is the fixer's text, and so is an acceptance comment's text after its header. "
+            "`operator_evidence` lists the operator comments on other issues the controller "
+            "verified for the finding (#243): `exact` evidence proves the text the fixer "
+            "requested is on the target; `bound` evidence proves only that the comment the "
+            "operator chose is there, unchanged since it was bound, and was never compared "
+            "with any requested text. Neither proves the note is adequate; "
+            "`operator-evidence.md` in the read context quotes each comment's current body:\n"
             + fenced_untrusted_block(
                 json.dumps(s.last_fix_resolutions, indent=2, ensure_ascii=False), "json"
             )
@@ -3056,6 +3122,127 @@ class ControllerEngine:
                 "ACCEPTANCE_AUTHORIZATION": authorization,
                 **FIX_BOUND_VARIABLES,
             },
+        )
+
+    def _format_operator_actions(self) -> str:
+        """``{{OPERATOR_ACTIONS}}``: the ``operator_acceptance`` resolution (#243).
+
+        Offered only when the FIX entry recorded allowed targets: never
+        under ``safety.acceptance_actions: off``, nor when the run's issue
+        could not be read at entry or references no other issue. The list is
+        the entry's persisted set, the one the result is checked against.
+        """
+        if self.config.safety.acceptance_actions == ACCEPTANCE_ACTIONS_OFF:
+            return OPERATOR_ACTIONS_UNAVAILABLE.format(why="`safety.acceptance_actions: off`")
+        s = self._require_state()
+        observation = s.phase_effects().observation if s.phase == Phase.FIX else None
+        targets = observation.operator_targets if observation is not None else None
+        if targets is None:
+            return OPERATOR_ACTIONS_UNAVAILABLE.format(
+                why="the controller could not read the run's issue when FIX was entered"
+            )
+        if not targets.numbers:
+            return OPERATOR_ACTIONS_UNAVAILABLE.format(
+                why="the run's issue body references no other issue and the run has no EPIC"
+            )
+        reasons = {
+            ALLOWED_BY_ISSUE_BODY: "referenced by the run's issue body",
+            ALLOWED_BY_EPIC: "the run's EPIC",
+        }
+        listed = "\n".join(
+            f"- #{n} ({'; '.join(reasons[b] for b in targets.allowed_by[n])})"
+            for n in targets.numbers
+        )
+        return render(
+            load_template(OPERATOR_ACTIONS_TEMPLATE),
+            {
+                "OPERATOR_TARGETS": listed,
+                "REPOSITORY": escape_inline(s.repository),
+                **FIX_BOUND_VARIABLES,
+            },
+        )
+
+    def _round_operator_outcomes(self, outcome: str) -> list[dict]:
+        """The ``operator_comment_outcomes`` of the round being fixed with ``outcome`` (#243)."""
+        s = self._require_state()
+        return [
+            o
+            for o in s.operator_comment_outcomes
+            if o["outcome"] == outcome and o["round"] == s.review_round
+        ]
+
+    def _format_declined_operator_actions(self) -> str:
+        """``{{DECLINED_OPERATOR_ACTIONS}}``: this round's K10 declines, quoted as data (#243)."""
+        declined = self._round_operator_outcomes("declined")
+        withdrawn = self._round_operator_outcomes("withdrawn")
+        if not declined and not withdrawn:
+            return "(none)"
+        shared = self._require_state().round_declines()
+        ask = (
+            f"and the round holds {shared} declines (acceptance and operator actions "
+            "together), the most it records for one round, so it refuses any further "
+            "`operator_acceptance` or `acceptance_action` in this round: resolve each finding "
+            "another way"
+            if shared >= MAX_DECLINES_PER_ROUND
+            else "resolve the finding another way, or change the text only where the "
+            "operator's reason asks for it. A `withdrawn` action was dropped with a decline "
+            "and may be requested again"
+        )
+        return (
+            "The operator declined (or withdrew with a decline) these operator actions of this "
+            "round. The controller refuses a declined one again unchanged (the same text for "
+            f"the same finding and issue has the same action id); {ask}:\n"
+            + fenced_untrusted_block(
+                json.dumps(
+                    [
+                        {
+                            "action_id": o["action_id"],
+                            "finding_id": o["finding_id"],
+                            "target": o["target"],
+                            "outcome": o["outcome"],
+                            "reason": o["reason"],
+                        }
+                        for o in [*declined, *withdrawn]
+                    ],
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                "json",
+            )
+        )
+
+    def _format_verified_operator_evidence(self) -> str:
+        """``{{VERIFIED_OPERATOR_EVIDENCE}}``: this PR's verified operator comments (#243)."""
+        s = self._require_state()
+        verified = [o for o in s.operator_comment_outcomes if o["outcome"] == "verified"]
+        if not verified:
+            return "(none)"
+        return (
+            "The controller verified these operator comments for this PR (`exact`: the "
+            "requested text is on the target; `bound`: the comment the operator chose is "
+            "there, never compared with any requested text). One verified in this round for a "
+            "finding and an issue is never requested again:\n"
+            + fenced_untrusted_block(
+                json.dumps(
+                    [
+                        {
+                            key: o[key]
+                            for key in (
+                                "action_id",
+                                "round",
+                                "finding_id",
+                                "target",
+                                "evidence",
+                                "comment_url",
+                            )
+                        }
+                        for o in verified
+                    ],
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                "json",
+            )
         )
 
     def _declined_acceptance_outcomes(self) -> list[dict]:
@@ -3241,6 +3428,9 @@ class ControllerEngine:
             "PREVIOUS_FIX_RESOLUTIONS": self._format_previous_fix_resolutions(),
             "ACCEPTANCE_ACTIONS": self._format_acceptance_actions(),
             "DECLINED_ACCEPTANCE_ACTIONS": self._format_declined_acceptance_actions(),
+            "OPERATOR_ACTIONS": self._format_operator_actions(),
+            "DECLINED_OPERATOR_ACTIONS": self._format_declined_operator_actions(),
+            "VERIFIED_OPERATOR_EVIDENCE": self._format_verified_operator_evidence(),
             "MERGED_SINCE_EPIC_UPDATE": s.merged_since_epic_update,
             "EPIC_UPDATE_EVERY": self.config.workflow.epic_update_every,
             "MERGED_PRS_SINCE_EPIC_UPDATE": self._format_merged_since_epic_update(s),
@@ -3388,6 +3578,12 @@ class ControllerEngine:
                 "the follow-up issues already open for this PR",
                 self._read_issue_list(urls, "Follow-up issues"),
             )
+        if phase == Phase.REVIEW:
+            context.add(
+                "operator-evidence.md",
+                "the operator actions of this PR and each verified comment's current body",
+                self._read_operator_evidence(),
+            )
         if phase in (Phase.UPDATE_EPIC, Phase.REPLAN_REEXECUTE) and s.epic_url:
             epic_text, epic_body = self._read_epic_file(s.epic_url)
             context.add("epic.md", "the EPIC and its body", epic_text)
@@ -3398,6 +3594,53 @@ class ControllerEngine:
                     self._read_epic_issues(epic_body),
                 )
         return context
+
+    def _read_operator_evidence(self) -> str:
+        """``operator-evidence.md`` (#243): this PR's operator actions, as quoted data.
+
+        One entry per ``operator_comment_outcomes`` entry; a verified one
+        with the comment's current body, read fresh from its target's
+        complete listing (each target read once), and whether its digest
+        still equals the observed one. A comment that changed or is gone is
+        reported, never acted on.
+        """
+        s = self._require_state()
+        listings: dict[str, list[CommentInfo] | str] = {}
+        entries: list[OperatorEvidence] = []
+        for o in s.operator_comment_outcomes:
+            current: str | None = None
+            failed = ""
+            if o["outcome"] == "verified":
+                target = o["target"]
+                if target not in listings:
+                    try:
+                        listings[target] = list(self.github.get_issue_comments(target))
+                    except GitHubError as exc:
+                        listings[target] = type(exc).__name__
+                listing = listings[target]
+                if isinstance(listing, str):
+                    failed = listing
+                else:
+                    wanted = parse_comment_url(o["comment_url"]).comment_id
+                    current = next((c.body for c in listing if c.id == wanted), None)
+            entries.append(
+                OperatorEvidence(
+                    action_id=o["action_id"],
+                    finding_id=o["finding_id"],
+                    round=o["round"],
+                    target=o["target"],
+                    outcome=o["outcome"],
+                    evidence=o["evidence"],
+                    comment_url=o["comment_url"],
+                    payload_sha256=o["payload_sha256"],
+                    body_sha256=o["body_sha256"],
+                    reason=o["reason"],
+                    current=current,
+                    current_sha256=sha256_text(current) if current is not None else "",
+                    unreadable=failed,
+                )
+            )
+        return render_operator_evidence(entries)
 
     def _read_issue_file(self, url: str, *, comments: bool, title: str) -> str:
         try:
@@ -3437,13 +3680,11 @@ class ControllerEngine:
                 entries.append(url)
         return render_issue_list(entries, title, len(urls))
 
-    def _read_epic_issues(self, body: str) -> str:
-        """The issues an EPIC body references (`#n` or an issue URL of this
-        repository), in order of first mention, with state and title."""
-        s = self._require_state()
-        repository = s.repository.lower()
+    def _issue_references(self, body: str) -> list[int]:
+        """The issue numbers ``body`` references (`#n` or an issue URL of this
+        repository), in order of first mention, each once."""
+        repository = self._require_state().repository.lower()
         numbers: list[int] = []
-        epic_number = parse_issue_url(s.epic_url).number
         for match in _ISSUE_REFERENCE_RE.finditer(body):
             if match.group(1):
                 number = int(match.group(1))
@@ -3451,8 +3692,16 @@ class ControllerEngine:
                 number = int(match.group(3))
             else:
                 continue
-            if number != epic_number and number not in numbers:
+            if number not in numbers:
                 numbers.append(number)
+        return numbers
+
+    def _read_epic_issues(self, body: str) -> str:
+        """The issues an EPIC body references (`#n` or an issue URL of this
+        repository), in order of first mention, with state and title."""
+        s = self._require_state()
+        epic_number = parse_issue_url(s.epic_url).number
+        numbers = [n for n in self._issue_references(body) if n != epic_number]
         entries: list[IssueInfo | str] = []
         for number in numbers[:MAX_LISTED_ISSUES]:
             url = f"https://github.com/{s.repository}/issues/{number}"
@@ -6630,7 +6879,10 @@ class ControllerEngine:
         is ``off``, when the comment the controller would render from it
         fails the published-content policy as a whole, and when its action
         id is one the operator declined for this round, or the round holds
-        the most declines the controller records (#211).
+        the most declines the controller records (#211). An
+        ``operator_acceptance`` is checked by
+        :meth:`_check_operator_acceptance` (#243), whose target reads are the
+        only GitHub reads of this check.
         The candidate is the worktree's ``HEAD`` as the controller reads it
         (ADR 0005 D6.3, D6.5; :meth:`_read_candidate`):
         detached, equal to ``head_sha``, and either the reviewed HEAD itself
@@ -6641,6 +6893,7 @@ class ControllerEngine:
         (:class:`VerificationError`), never a correction.
         """
         state = self._require_state()
+        self._fix_block = ""
         res = FixResult.from_payload(payload)
         reviewed = state.reviewed_head_sha.lower()
         issue = parse_issue_url(state.current_issue_url)
@@ -6692,6 +6945,9 @@ class ControllerEngine:
             if r.acceptance_action:
                 new_chars += self._check_acceptance_action(r)
                 continue
+            if r.operator_acceptance:
+                new_chars += self._check_operator_acceptance(r)
+                continue
             if r.resolution != "follow_up_created":
                 continue
             if r.new_follow_up:
@@ -6712,9 +6968,9 @@ class ControllerEngine:
                 )
         if new_chars + FixContext.STORED_BOUND > MAX_EFFECT_STATE_CHARS:
             raise ControlResultValidationError(
-                f"FIX: the new follow-up issues and the acceptance comment hold {new_chars} "
-                "characters together, more than the controller journals for one FIX round; "
-                "shorten their bodies and re-emit the CONTROL_RESULT"
+                f"FIX: the new follow-up issues and the acceptance or operator comments hold "
+                f"{new_chars} characters together, more than the controller journals for one "
+                "FIX round; shorten their bodies and re-emit the CONTROL_RESULT"
             )
         candidate = self._read_candidate(cwd)
         if candidate.attached:
@@ -6798,13 +7054,14 @@ class ControllerEngine:
                 "'blocked' with a message"
             )
         declined = self._declined_acceptance_outcomes()
-        if len(declined) >= MAX_DECLINES_PER_ROUND:
+        shared = self._require_state().round_declines()
+        if shared >= MAX_DECLINES_PER_ROUND:
             raise ControlResultValidationError(
                 f"FIX: {fid} is resolved as acceptance_action, but the operator declined "
-                f"{len(declined)} acceptance actions of review round "
-                f"{self._require_state().review_round}, the most the controller records for "
-                "one round, so it requests no further one in this round; resolve the finding "
-                "another way, or report status 'blocked' with a message"
+                f"{shared} actions of review round {self._require_state().review_round} "
+                "(acceptance and operator actions together), the most the controller "
+                "records for one round, so it requests no further one in this round; resolve "
+                "the finding another way, or report status 'blocked' with a message"
             )
         record = self._acceptance_plan(0, self._fix_owner(), fid, r.acceptance_body)
         if isinstance(record, str):
@@ -6819,6 +7076,176 @@ class ControllerEngine:
                     "reason (listed in the prompt) asks for it, and re-emit the CONTROL_RESULT"
                 )
         return len(record.body)
+
+    def _check_operator_acceptance(self, r: FindingResolution) -> int:
+        """The controller's half of an ``operator_acceptance`` (#243): its rendered size.
+
+        Refused (a correction) while ``safety.acceptance_actions`` is
+        ``off``; when the FIX entry recorded no allowed targets; once the
+        round holds the most declines the controller records (K9's and
+        K10's together); for a target outside the entry's allowed set, one
+        whose (finding, target) is already verified this round, text whose
+        links leave the run's repository, a rendered comment that fails the
+        published-content policy as a whole, an action id the operator
+        declined for this round, and a target GitHub answers as missing or
+        as a pull request. Any other conclusive failure reading a target
+        (transferred, permission, another repository) blocks the result
+        instead (:attr:`_fix_block`); a transient one propagates.
+        """
+        state = self._require_state()
+        fid = r.finding_id
+        if self.config.safety.acceptance_actions == ACCEPTANCE_ACTIONS_OFF:
+            raise ControlResultValidationError(
+                f"FIX: {fid} is resolved as operator_acceptance, which this run does not offer "
+                "(safety.acceptance_actions: off); resolve it another way, or report status "
+                "'blocked' with a message"
+            )
+        observation = state.phase_effects().observation
+        targets = observation.operator_targets if observation is not None else None
+        if targets is None or not targets.numbers:
+            raise ControlResultValidationError(
+                f"FIX: {fid} is resolved as operator_acceptance, but this FIX entry allows no "
+                "target issue (the prompt says why); resolve it another way, or report status "
+                "'blocked' with a message"
+            )
+        declined = state.round_declines()
+        if declined >= MAX_DECLINES_PER_ROUND:
+            raise ControlResultValidationError(
+                f"FIX: {fid} is resolved as operator_acceptance, but the operator declined "
+                f"{declined} actions of review round {state.review_round} (acceptance and "
+                "operator actions together), the most the controller records for one round, "
+                "so it requests no further one in this round; resolve the finding another "
+                "way, or report status 'blocked' with a message"
+            )
+        allowed = ", ".join(f"#{n}" for n in targets.numbers)
+        chars = 0
+        for i, action in enumerate(r.operator_actions):
+            where = f"operator_acceptance action {i} of {fid}"
+            if action.issue not in targets.numbers:
+                raise ControlResultValidationError(
+                    f"FIX: {where} targets #{action.issue}, which is not an allowed target: an "
+                    "operator action targets only an issue the run's issue body references, or "
+                    f"the EPIC, as the FIX entry read them (allowed: {allowed})"
+                )
+            target_url = f"https://github.com/{state.repository}/issues/{action.issue}"
+            for outcome in state.operator_comment_outcomes:
+                if (
+                    outcome["outcome"] == "verified"
+                    and outcome["round"] == state.review_round
+                    and outcome["finding_id"] == fid
+                    and same_issue_url(outcome["target"], target_url)
+                ):
+                    raise ControlResultValidationError(
+                        f"FIX: {where} asks again for a comment on #{action.issue}, which the "
+                        f"operator already provided for {fid} in this round "
+                        f"({outcome['comment_url']}, {outcome['action_id']}); verified work is "
+                        "never requested again. Drop the action and re-emit the CONTROL_RESULT"
+                    )
+            problem = operator_comment_link_problem(f"{where} body", action.body, state.repository)
+            if problem:
+                raise ControlResultValidationError(f"FIX: {problem}")
+            record = self._operator_plan(0, self._fix_owner(), fid, action, targets)
+            if isinstance(record, str):
+                raise ControlResultValidationError(f"FIX: {record}")
+            for outcome in state.operator_comment_outcomes:
+                if outcome["outcome"] == "declined" and outcome["action_id"] == record.action_id:
+                    raise ControlResultValidationError(
+                        f"FIX: {where} is action {record.action_id}, which the operator "
+                        f"declined for review round {outcome['round']}; the controller does not "
+                        "request it again unchanged. Resolve the finding another way, or change "
+                        "the text where the operator's reason (listed in the prompt) asks for "
+                        "it, and re-emit the CONTROL_RESULT"
+                    )
+            problem = self._operator_target_read(target_url)
+            if problem is not None:
+                raise ControlResultValidationError(f"FIX: {where}: {problem}")
+            chars += len(record.body)
+        return chars
+
+    def _operator_target_read(self, target_url: str) -> str | None:
+        """Read an operator action's target at result check (#243).
+
+        A correction's text when GitHub answers it as missing or as a pull
+        request, ``None`` otherwise. Any other conclusive failure is kept as
+        the result's block (:attr:`_fix_block`, the first one wins); a
+        transient one propagates.
+        """
+        state = self._require_state()
+        try:
+            issue = self.github.get_issue(target_url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubNotFoundError:
+            return f"{target_url} is not found; an operator action targets an existing issue"
+        except GitHubWrongTargetError as exc:
+            if exc.is_pull_request:
+                return (
+                    f"{target_url} is a pull request ({exc.answered_url}); an operator action "
+                    "targets an issue, never a pull request"
+                )
+            self._fix_block = self._fix_block or (
+                f"the operator action target {target_url} answers as {exc.answered_url} "
+                "(transferred, or another object)"
+            )
+            return None
+        except GitHubError as exc:
+            self._fix_block = self._fix_block or (
+                f"the operator action target {target_url} cannot be read: {exc}"
+            )
+            return None
+        if issue.url and not parse_issue_url(issue.url).same_repository(state.repository):
+            self._fix_block = self._fix_block or (
+                f"the operator action target {target_url} is {issue.url}, not an issue of "
+                f"{state.repository}"
+            )
+        return None
+
+    def _operator_plan(
+        self,
+        position: int,
+        owner: EffectOwner,
+        finding_id: str,
+        action: OperatorAction,
+        targets: OperatorTargets,
+    ) -> EffectRecord | str:
+        """The K10 record asking the operator to post ``action``, or why it cannot be (#243).
+
+        The target is the action's issue number in the run's repository,
+        allowed by the FIX entry's set (``targets``), whose reasons and
+        issue-body digest the record keeps. The payload is rendered once,
+        here, and persisted: the operator posts exactly these bytes.
+        """
+        state = self._require_state()
+        issue_url = parse_issue_url(state.current_issue_url).canonical
+        pr_url = parse_pr_url(owner.pr_url).canonical
+        target_url = parse_issue_url(
+            f"https://github.com/{state.repository}/issues/{action.issue}"
+        ).canonical
+        body = operator_comment_body(
+            action.body, issue_url, pr_url, state.review_round, finding_id, target_url
+        )
+        problem = operator_comment_problem(body, finding_id, target_url)
+        if problem:
+            return problem
+        identity = {
+            "issue_url": target_url,
+            "marker": render_operator_comment_marker(
+                issue_url, pr_url, state.review_round, finding_id, target_url
+            ),
+        }
+        return EffectRecord.plan(
+            position,
+            EffectKind.OPERATOR_COMMENT,
+            owner,
+            identity=identity,
+            target={"issue_url": target_url},
+            precondition={
+                "allowed_by": list(targets.allowed_by[action.issue]),
+                "issue_body_sha256": targets.issue_body_sha256,
+                "binding": None,
+            },
+            payload={"body": body},
+        )
 
     def _fix_owner(self) -> EffectOwner:
         """The owner of every record of this FIX entry's plan (ADR 0004 D2.2)."""
@@ -6879,7 +7306,8 @@ class ControllerEngine:
         *,
         dry_run: bool = False,
         approve_action: str = "",
-        decline_action: str = "",
+        decline_action: str | Sequence[str] = "",
+        bind_evidence: Sequence[tuple[str, str]] = (),
     ) -> UnblockOutcome:
         """The operator's explicit exit from BLOCKED.
 
@@ -6911,6 +7339,12 @@ class ControllerEngine:
         refused, with nothing written, unless the run is BLOCKED on that
         action, the PR is open at the reviewed HEAD, base and merge base,
         and the issue's comments allow it (:meth:`_acceptance_unblock`).
+
+        Operator actions (K10, #243) are never approved: ``bind_evidence``
+        pairs (``X-...`` id, comment URL) bind existing comments as their
+        evidence, and ``decline_action`` may name one or more ``X-...`` ids
+        to decline (withdrawing the plan's other pending ones). Both are
+        decided by :meth:`_operator_unblock` from fresh reads.
         """
         reason = reason.strip()
         if not reason:
@@ -6920,16 +7354,45 @@ class ControllerEngine:
                 f"unblock --reason must be at most {MAX_UNBLOCK_REASON_CHARS} characters "
                 f"({len(reason)} given)"
             )
-        if approve_action and decline_action:
-            raise ConfigurationError("unblock takes --approve-action or --decline-action, not both")
-        request = None
-        if approve_action or decline_action:
+        declines = [decline_action] if isinstance(decline_action, str) else list(decline_action)
+        declines = [d.strip() for d in declines if d.strip()]
+        if sum(bool(x) for x in (approve_action, declines, bind_evidence)) > 1:
+            raise ConfigurationError(
+                "unblock takes one of --approve-action, --decline-action and --bind-evidence"
+            )
+        request: AcceptanceRequest | OperatorRequest | None = None
+        if approve_action.strip().startswith("X-"):
+            raise ConfigurationError(
+                f"unblock --approve-action {approve_action.strip()} is refused: "
+                "operator-performed: nothing to approve; post it or bind evidence "
+                "(--bind-evidence)"
+            )
+        if bind_evidence:
+            ids = tuple(a.strip() for a, _ in bind_evidence)
+            for action_id in ids:
+                if not OPERATOR_ACTION_ID_RE.match(action_id):
+                    raise ConfigurationError(
+                        "unblock --bind-evidence takes an operator action id of the form "
+                        "X-<16 hex digits>, as 'autoforge status' prints it, and a comment URL"
+                    )
+            request = OperatorRequest("bind", ids, tuple(u.strip() for _, u in bind_evidence))
+        elif len(declines) > 1 or (declines and declines[0].startswith("X-")):
+            for action_id in declines:
+                if not OPERATOR_ACTION_ID_RE.match(action_id):
+                    raise ConfigurationError(
+                        "unblock --decline-action may repeat for operator action ids only (of "
+                        "the form X-<16 hex digits>); an acceptance action (A-...) is declined "
+                        "alone"
+                    )
+            request = OperatorRequest("decline", tuple(declines))
+        elif approve_action or declines:
             verb = "approve" if approve_action else "decline"
-            action_id = (approve_action or decline_action).strip()
+            action_id = (approve_action or declines[0]).strip()
             if not ACTION_ID_RE.match(action_id):
                 raise ConfigurationError(
-                    f"unblock --{verb}-action takes an action id of the form A-<16 hex digits>, "
-                    "as 'autoforge status' prints it"
+                    f"unblock --{verb}-action takes an action id of the form A-<16 hex digits> "
+                    "(or, to decline an operator action, X-<16 hex digits>), as 'autoforge "
+                    "status' prints it"
                 )
             request = AcceptanceRequest(verb, action_id)
         if dry_run:
@@ -6938,7 +7401,11 @@ class ControllerEngine:
             return self._unblock_once(reason, dry_run=False, request=request)
 
     def _unblock_once(
-        self, reason: str, *, dry_run: bool, request: AcceptanceRequest | None = None
+        self,
+        reason: str,
+        *,
+        dry_run: bool,
+        request: AcceptanceRequest | OperatorRequest | None = None,
     ) -> UnblockOutcome:
         state = self._require_state()
         if state.mode == WorkflowMode.LOCAL:
@@ -7062,6 +7529,36 @@ class ControllerEngine:
                 }
             )
             state.bound_acceptance_outcomes()
+        for bound in decision.bind:
+            # #243: the operator's evidence binding, saved with the unblock;
+            # 'resume' verifies the bound comment in the prefix pass.
+            state.effect_records[bound.position] = bound.to_dict()
+        if decision.operator_decline:
+            # #243: nothing the controller sends precedes the K10 prefix, so
+            # dropping the plan discards no controller write. Observed
+            # comments survive as verified outcomes, the named actions are
+            # declined and the other pending ones withdrawn.
+            records = state.phase_effects().records
+            named = {r.position for r in decision.operator_decline}
+            state.drop_phase_effects()
+            for record in records:
+                if record.kind is not EffectKind.OPERATOR_COMMENT:
+                    continue
+                if record.stage is Stage.OBSERVED:
+                    self._append_operator_outcome(record, "verified", "", entry["at"])
+                elif record.position in named:
+                    self._append_operator_outcome(
+                        record, "declined", bounded_reason(reason), entry["at"]
+                    )
+                else:
+                    self._append_operator_outcome(
+                        record,
+                        "withdrawn",
+                        f"withdrawn with the decline of "
+                        f"{', '.join(r.action_id for r in decision.operator_decline)}",
+                        entry["at"],
+                    )
+            state.bound_operator_comment_outcomes()
         effects = state.phase_effects()
         if effects.phase == target:
             # D2.4: the records belong to the phase entry the block
@@ -7130,7 +7627,9 @@ class ControllerEngine:
             record.error = f"unblock refused: {decision.detail}"
         self._logger().log_execution(record)
 
-    def _unblock_decision(self, request: AcceptanceRequest | None = None) -> UnblockDecision:
+    def _unblock_decision(
+        self, request: AcceptanceRequest | OperatorRequest | None = None
+    ) -> UnblockDecision:
         """Re-run the recovery inspection against live GitHub and choose the phase.
 
         Refuses (``target=None``) whenever the safe phase is not knowable
@@ -7145,14 +7644,21 @@ class ControllerEngine:
         decision = self._unblock_decision_for(request)
         if request is None or decision.refused or decision.action:
             return decision
+        what = (
+            "operator actions await the operator"
+            if isinstance(request, OperatorRequest)
+            else "acceptance action awaits the operator"
+        )
         return UnblockDecision(
             None,
-            f"unblock {request.flag} applies only to a saved FIX plan whose acceptance action "
-            f"awaits the operator, and this run has none; without the flag: {decision.detail}",
+            f"unblock {request.flag} applies only to a saved FIX plan whose {what}, and this "
+            f"run has none; without the flag: {decision.detail}",
             pr=decision.pr,
         )
 
-    def _unblock_decision_for(self, request: AcceptanceRequest | None) -> UnblockDecision:
+    def _unblock_decision_for(
+        self, request: AcceptanceRequest | OperatorRequest | None
+    ) -> UnblockDecision:
         state = self._require_state()
         if state.replan_transaction:
             stage = state.replan_transaction.get("stage", "(unknown)")
@@ -7219,7 +7725,9 @@ class ControllerEngine:
             )
         return UnblockDecision(Phase.ANALYZE_EXECUTE, detail)
 
-    def _unblock_with_pr(self, request: AcceptanceRequest | None = None) -> UnblockDecision:
+    def _unblock_with_pr(
+        self, request: AcceptanceRequest | OperatorRequest | None = None
+    ) -> UnblockDecision:
         """A PR is bound: decide from its live state and the review bound to it."""
         state = self._require_state()
         url = state.current_pr_url
@@ -7330,10 +7838,31 @@ class ControllerEngine:
             # re-entry completes them from the journal, and a PR head at the
             # planned candidate is the controller's own push. No fixer is
             # launched for it again. An acceptance action that awaits the
-            # operator decides first (#211).
+            # operator decides first (#211), and so do operator actions not
+            # yet verified (#243); once every one is observed, the plan's
+            # ordinary row below decides.
+            unverified = [
+                r
+                for r in effects.records
+                if r.kind is EffectKind.OPERATOR_COMMENT and r.stage is not Stage.OBSERVED
+            ]
+            if isinstance(request, OperatorRequest) or (unverified and request is None):
+                operator = self._operator_unblock(
+                    request if isinstance(request, OperatorRequest) else None,
+                    effects.records,
+                    pr,
+                    canonical,
+                )
+                if operator is not None:
+                    return operator
             waiting = self._awaiting_acceptance(effects.records)
-            if request is not None or waiting is not None:
-                acceptance = self._acceptance_unblock(request, waiting, pr, canonical)
+            if isinstance(request, AcceptanceRequest) or (request is None and waiting is not None):
+                acceptance = self._acceptance_unblock(
+                    request if isinstance(request, AcceptanceRequest) else None,
+                    waiting,
+                    pr,
+                    canonical,
+                )
                 if acceptance is not None:
                     return acceptance
             records = ", ".join(r.describe() for r in effects.records) or "nothing to send"
@@ -7567,7 +8096,7 @@ class ControllerEngine:
                     "flag to adopt an exact one",
                     pr=pr,
                 )
-            declined = len(self._declined_acceptance_outcomes())
+            declined = self._require_state().round_declines()
             if declined >= MAX_DECLINES_PER_ROUND:
                 # Unreachable from the controller's own state (FIX plans no
                 # action at the bound), refused rather than recorded: the
@@ -7576,7 +8105,8 @@ class ControllerEngine:
                     None,
                     f"action {action} cannot be declined: review round "
                     f"{self._require_state().review_round} already records {declined} declined "
-                    "acceptance actions, the most the controller keeps for one round. Approve "
+                    "actions (acceptance and operator actions together), the most the "
+                    "controller keeps for one round. Approve "
                     "it, or post exactly its payload on the issue yourself and unblock",
                     pr=pr,
                 )
@@ -7621,6 +8151,471 @@ class ControllerEngine:
             f"'--approve-action {action}', post exactly its payload on the issue yourself, or "
             f"decline it with '--decline-action {action}'",
             pr=pr,
+        )
+
+    def _operator_unblock(
+        self,
+        request: OperatorRequest | None,
+        records: Sequence[EffectRecord],
+        pr: PRInfo,
+        canonical: str,
+    ) -> UnblockDecision:
+        """The unblock of a saved FIX plan whose operator actions are not all verified (#243).
+
+        Every decision re-reads the PR binding first. A drift sends a plain
+        unblock to FIX (whose re-entry reconciles each pending action
+        read-only and routes the drift to REVIEW) and refuses a bind or a
+        decline as stale. Otherwise a plain unblock re-enters FIX only on
+        progress (:meth:`_operator_progress`), ``--bind-evidence`` only when
+        every pair meets the binding rules (:meth:`_operator_bind`) and
+        ``--decline-action`` only when nothing of the plan is on GitHub
+        unsaved (:meth:`_operator_decline`).
+        """
+        plan = [r for r in records if r.kind is EffectKind.OPERATOR_COMMENT]
+        pending = [r for r in plan if r.stage is not Stage.OBSERVED]
+        if request is not None:
+            known = {r.action_id: r for r in pending}
+            names = ", ".join(r.action_id for r in pending) or "none"
+            if len(set(request.action_ids)) != len(request.action_ids):
+                return UnblockDecision(
+                    None, f"unblock {request.flag} names an operator action twice", pr=pr
+                )
+            unknown = [a for a in request.action_ids if a not in known]
+            if unknown:
+                return UnblockDecision(
+                    None,
+                    f"unblock {request.flag} names {', '.join(unknown)}, which is no operator "
+                    f"action of the saved FIX plan awaiting the operator (awaiting: {names}); "
+                    "the id is recomputed from the saved record, so an id of an older plan or "
+                    "other bytes never matches. Run 'autoforge status' for the current ones",
+                    pr=pr,
+                )
+            if not pending:
+                return UnblockDecision(
+                    None, f"unblock {request.flag}: no operator action awaits the operator", pr=pr
+                )
+        drift, unreadable = self._acceptance_drift(pr)
+        if unreadable:
+            return UnblockDecision(None, unreadable, pr=pr)
+        if drift:
+            if request is not None:
+                return UnblockDecision(
+                    None,
+                    f"unblock {request.flag} is refused as stale: {drift}, so the findings the "
+                    f"operator actions were requested for no longer describe PR {canonical}. "
+                    "Unblock without the flag: FIX re-reads the PR, records each pending "
+                    "operator action verified or stale, and routes the drift to REVIEW",
+                    pr=pr,
+                )
+            return UnblockDecision(
+                Phase.FIX,
+                f"PR {canonical} moved since review round {self._require_state().review_round} "
+                f"({drift}); FIX reconciles each pending operator action read-only, records it "
+                "verified or stale, and routes the drift to REVIEW, sending nothing",
+                pr=pr,
+            )
+        op = OperatorCommentOp(self.github, plan=records)
+        if request is None:
+            return self._operator_progress(op, pending, pr, canonical)
+        if request.verb == "bind":
+            return self._operator_bind(op, request, plan, pr, canonical)
+        return self._operator_decline(request, plan, pr, canonical)
+
+    def _operator_progress(
+        self,
+        op: OperatorCommentOp,
+        pending: Sequence[EffectRecord],
+        pr: PRInfo,
+        canonical: str,
+    ) -> UnblockDecision:
+        """A plain unblock: FIX only when a read-only reconcile shows progress (#243).
+
+        Progress is a pending action now observable, or a recorded conflict
+        that no longer reproduces. Without progress the unblock is refused
+        and saves nothing, naming each pending action: an unblock reason, a
+        checkbox or a comment that is not the payload is never evidence.
+        """
+        progress: list[str] = []
+        waiting: list[str] = []
+        for record in pending:
+            reopened = record.reopened()
+            found = op.reconcile(reopened)
+            if found.action is Action.OBSERVE:
+                observed = found.observed or {}
+                progress.append(
+                    f"{record.action_id} is on {observed.get('url')} ({observed.get('evidence')})"
+                )
+            elif record.stage is Stage.CONFLICT and found.action is not Action.CONFLICT:
+                progress.append(f"{record.action_id}'s conflict no longer reproduces")
+            else:
+                waiting.append(found.reason or record.reason)
+        changed = self._operator_issue_body_note()
+        if progress:
+            return UnblockDecision(
+                Phase.FIX,
+                f"PR {canonical} is OPEN at the reviewed HEAD, base and merge base and "
+                f"{'; '.join(progress)}; FIX saves each verified operator action and completes "
+                f"the persisted plan without launching the fixer{changed}",
+                pr=pr,
+            )
+        return UnblockDecision(
+            None,
+            "no operator action made progress, and an unblock reason, a checkbox or a "
+            f"comment that is not the payload is never evidence: {'; '.join(waiting)}. Post "
+            "each payload exactly ('autoforge status --action X-...'), bind an existing "
+            "comment with '--bind-evidence', or decline with '--decline-action'"
+            f"{changed}",
+            pr=pr,
+        )
+
+    def _operator_issue_body_note(self) -> str:
+        """A note when the run's issue body changed since FIX's entry read it (#243), or "".
+
+        The actions stay bound to the entry's allowed set; the note only
+        tells the operator. A conclusive read failure leaves no note.
+        """
+        state = self._require_state()
+        observation = state.phase_effects().observation
+        targets = observation.operator_targets if observation is not None else None
+        if targets is None:
+            return ""
+        try:
+            issue = self.github.get_issue(state.current_issue_url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError:
+            return ""
+        if sha256_text(issue.body or "") == targets.issue_body_sha256:
+            return ""
+        return (
+            f" (the body of {state.current_issue_url} changed since FIX read it; the operator "
+            "actions stay bound to the targets it referenced then, and REVIEW judges against "
+            "the current issue)"
+        )
+
+    def _operator_bind(
+        self,
+        op: OperatorCommentOp,
+        request: OperatorRequest,
+        plan: Sequence[EffectRecord],
+        pr: PRInfo,
+        canonical: str,
+    ) -> UnblockDecision:
+        """``--bind-evidence``: each pair meets the five binding rules (#243, 8.2).
+
+        1. the URL is an issue-comment URL of the run's repository;
+        2. GitHub places the comment on the record's target and the target's
+           complete listing holds its id (the digest is the listing's body);
+        3. that body carries no controller marker but an
+           ``ai-operator-comment`` of this run's issue and PR for the same
+           target with another key (an earlier round's payload);
+        4. no other record of the plan is bound to or observed on it;
+        5. the record is pending (``intended``); the PR binding was read.
+
+        Re-binding the same comment with the same digest is no progress.
+        """
+        state = self._require_state()
+        by_id = {r.action_id: r for r in plan}
+        taken: dict[int, str] = {}
+        for record in plan:
+            if record.action_id in request.action_ids:
+                continue
+            if record.stage is Stage.OBSERVED:
+                taken[int((record.observed or {}).get("comment_id", 0))] = record.action_id
+            elif record.binding is not None:
+                taken[int(record.binding["comment_id"])] = record.action_id
+        run_issue = parse_issue_url(state.current_issue_url)
+        run_pr = parse_pr_url(state.current_pr_url)
+        bound: list[EffectRecord] = []
+        texts: list[str] = []
+        for action_id, url in zip(request.action_ids, request.urls, strict=True):
+            record = by_id[action_id]
+            target = parse_issue_url(record.target["issue_url"])
+            refused = f"{action_id} cannot be bound to {url}: "
+
+            if record.stage is not Stage.INTENDED:
+                return UnblockDecision(
+                    None,
+                    refused
+                    + (
+                        "it is in conflict, which is repaired, never bound over; repair it and run "
+                        "a plain unblock"
+                    ),
+                    pr=pr,
+                )
+            try:
+                ref = parse_comment_url(url)
+            except ConfigurationError as exc:
+                return UnblockDecision(None, refused + (f"not an issue-comment URL ({exc})"), pr=pr)
+            if not ref.parent.same_repository(state.repository):
+                return UnblockDecision(
+                    None,
+                    refused + (f"the comment is not in the run's repository {state.repository}"),
+                    pr=pr,
+                )
+            problem = op.target_problem(target.canonical, state.current_issue_url)
+            if problem:
+                return UnblockDecision(None, refused + (problem), pr=pr)
+            try:
+                comment = self.github.get_comment(ref.canonical)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return UnblockDecision(
+                    None, refused + (f"the comment cannot be read ({exc})"), pr=pr
+                )
+            try:
+                parent = parse_issue_url(comment.parent_url)
+            except ConfigurationError:
+                return UnblockDecision(
+                    None,
+                    refused + (f"GitHub places it on {comment.parent_url or 'nothing'}, no issue"),
+                    pr=pr,
+                )
+            if not parent.same_target(target):
+                return UnblockDecision(
+                    None,
+                    refused
+                    + (
+                        f"GitHub places it on {parent.canonical}, not on the action's target "
+                        f"{target.canonical}"
+                    ),
+                    pr=pr,
+                )
+            listed = [
+                c
+                for c in self.github.get_issue_comments(target.canonical)
+                if c.id == ref.comment_id
+            ]
+            if len(listed) != 1:
+                return UnblockDecision(
+                    None,
+                    refused
+                    + (f"the complete comment listing of {target.canonical} does not hold it"),
+                    pr=pr,
+                )
+            body = listed[0].body
+            marker = self._operator_bind_marker_problem(body, record, run_issue, run_pr, target)
+            if marker:
+                return UnblockDecision(None, refused + (marker), pr=pr)
+            other = taken.get(ref.comment_id)
+            if other:
+                return UnblockDecision(
+                    None,
+                    refused + (f"the comment is already bound to or observed for {other}"),
+                    pr=pr,
+                )
+            digest = sha256_text(body)
+            current = record.binding
+            if (
+                current is not None
+                and current["comment_id"] == ref.comment_id
+                and current["body_sha256"] == digest
+            ):
+                return UnblockDecision(
+                    None,
+                    refused
+                    + (
+                        "it is bound to that comment already, unchanged, so binding it again is no "
+                        "progress; run a plain unblock if the comment is in place"
+                    ),
+                    pr=pr,
+                )
+            taken[ref.comment_id] = action_id
+            comment_url = listed[0].url or ref.canonical
+            bound.append(record.binding_to(comment_url, ref.comment_id, digest))
+            texts.append(f"bound {action_id} {comment_url}")
+        return UnblockDecision(
+            Phase.FIX,
+            f"PR {canonical} is OPEN at the reviewed HEAD, base and merge base and "
+            f"{'; '.join(texts)} (digest-pinned; the controller does not judge adequacy); FIX "
+            "verifies each bound comment and completes the persisted plan without launching "
+            "the fixer",
+            pr=pr,
+            action="; ".join(texts),
+            bind=tuple(bound),
+        )
+
+    @staticmethod
+    def _operator_bind_marker_problem(
+        body: str,
+        record: EffectRecord,
+        run_issue: GitHubIssueRef,
+        run_pr: GitHubPullRequestRef,
+        target: GitHubIssueRef,
+    ) -> str:
+        """Binding rule 3: why ``body`` carries a marker it may not, or "" (#243)."""
+        opened = len(AGENT_MARKER_OPEN_RE.findall(body))
+        if not opened:
+            return ""
+        found = scan(OPERATOR_COMMENT, body)
+        if found.defects or len(found.claims) != opened:
+            return (
+                "its body carries a controller marker, and only an earlier operator action's "
+                "marker for the same target may be bound"
+            )
+        own = scan(OPERATOR_COMMENT, record.marker).claims[0].key
+        for claim in found.claims:
+            if claim.key == own:
+                return (
+                    "it carries this action's own marker, which is exact evidence or a conflict "
+                    "and never bound; run a plain unblock to adopt it, or repair it"
+                )
+            if not (
+                claim.issue.same_target(run_issue)
+                and claim.pr.same_target(run_pr)
+                and claim.target.same_target(target)
+            ):
+                return (
+                    "its body carries the marker of an operator action of another issue, PR or "
+                    "target"
+                )
+        return ""
+
+    def _operator_decline(
+        self,
+        request: OperatorRequest,
+        plan: Sequence[EffectRecord],
+        pr: PRInfo,
+        canonical: str,
+    ) -> UnblockDecision:
+        """``--decline-action X-...``: only when nothing of the plan is on GitHub unsaved (#243).
+
+        No record may be in conflict (a conflict is repaired, never
+        declined), and across every target's complete listing no key of a
+        record not yet observed, no misplaced marker of the plan and no
+        bound comment now observable may appear: dropping the plan would
+        otherwise leave a key on GitHub to conflict with a later request,
+        or discard evidence. A target that is not found holds no marker;
+        any other read failure refuses. The declines count against the
+        round's shared bound.
+        """
+        state = self._require_state()
+        conflicts = [r.action_id for r in plan if r.stage is Stage.CONFLICT]
+        if conflicts:
+            return UnblockDecision(
+                None,
+                f"unblock {request.flag} is refused: {', '.join(conflicts)} is in conflict, "
+                "which is repaired, never declined; repair it and run a plain unblock and "
+                "'resume' first",
+                pr=pr,
+            )
+        keys = {scan(OPERATOR_COMMENT, r.marker).claims[0].key: r for r in plan}
+        for target in dict.fromkeys(r.target["issue_url"] for r in plan):
+            try:
+                comments = list(self.github.get_issue_comments(target))
+            except GitHubUnavailableError:
+                raise
+            except GitHubNotFoundError:
+                comments = []
+            except GitHubError as exc:
+                return UnblockDecision(
+                    None,
+                    f"unblock {request.flag} is refused: the comments of {target} cannot be "
+                    f"read ({exc}), so the controller cannot tell that nothing of the plan is "
+                    "there",
+                    pr=pr,
+                )
+            collection = collect(OPERATOR_COMMENT, comments, "comment")
+            if collection.defects:
+                return UnblockDecision(
+                    None,
+                    f"unblock {request.flag} is refused: {'; '.join(collection.defects)}; "
+                    "repair it first",
+                    pr=pr,
+                )
+            for holder in collection.holders:
+                owner = keys.get(holder.claim.key)
+                if owner is None:
+                    continue
+                if not same_issue_url(owner.target["issue_url"], target):
+                    return UnblockDecision(
+                        None,
+                        f"unblock {request.flag} is refused: {holder.obj.url} carries the "
+                        f"marker of {owner.action_id}, which is meant for "
+                        f"{owner.target['issue_url']} (a misplaced payload); delete it, then "
+                        "decline",
+                        pr=pr,
+                    )
+                if owner.stage is not Stage.OBSERVED:
+                    return UnblockDecision(
+                        None,
+                        f"unblock {request.flag} is refused: {owner.action_id} is there "
+                        f"({holder.obj.url}). Run a plain unblock and 'resume' first so the "
+                        "comment is saved, or delete it",
+                        pr=pr,
+                    )
+            ids = {c.id: c for c in comments}
+            for record in plan:
+                binding = record.binding
+                if (
+                    record.stage is Stage.INTENDED
+                    and same_issue_url(record.target["issue_url"], target)
+                    and binding is not None
+                    and binding["comment_id"] in ids
+                    and sha256_text(ids[binding["comment_id"]].body) == binding["body_sha256"]
+                ):
+                    return UnblockDecision(
+                        None,
+                        f"unblock {request.flag} is refused: {record.action_id}'s bound comment "
+                        f"{binding['comment_url']} is in place; run a plain unblock and "
+                        "'resume' first so it is saved",
+                        pr=pr,
+                    )
+        declined = state.round_declines()
+        if declined + len(request.action_ids) > MAX_DECLINES_PER_ROUND:
+            return UnblockDecision(
+                None,
+                f"unblock {request.flag} is refused: review round {state.review_round} already "
+                f"records {declined} declined actions (acceptance and operator actions "
+                f"together), and {len(request.action_ids)} more would pass "
+                f"{MAX_DECLINES_PER_ROUND}, the most the controller keeps for one round. Post "
+                "the payloads or bind evidence instead",
+                pr=pr,
+            )
+        named = [r for r in plan if r.action_id in request.action_ids]
+        withdrawn = [
+            r.action_id
+            for r in plan
+            if r.stage is not Stage.OBSERVED and r.action_id not in request.action_ids
+        ]
+        kept = [r.action_id for r in plan if r.stage is Stage.OBSERVED]
+        action = f"declined {', '.join(request.action_ids)}"
+        if withdrawn:
+            action += f" (withdrawn: {', '.join(withdrawn)})"
+        verified = f"; {', '.join(kept)} stay verified" if kept else ""
+        return UnblockDecision(
+            Phase.FIX,
+            f"PR {canonical} is OPEN at the reviewed HEAD, base and merge base and "
+            f"{action}{verified}; nothing of the FIX plan was sent, so it is dropped and FIX "
+            "launches the fixer afresh with the decline in its prompt (the worktree and its "
+            "commits are kept)",
+            pr=pr,
+            action=action,
+            operator_decline=tuple(named),
+        )
+
+    def _append_operator_outcome(
+        self, record: EffectRecord, outcome: str, reason: str, at: str
+    ) -> None:
+        """One ``operator_comment_outcomes`` entry for a K10 record (#243)."""
+        state = self._require_state()
+        claim = scan(OPERATOR_COMMENT, record.marker).claims[0]
+        observed = record.observed or {} if outcome == "verified" else {}
+        state.operator_comment_outcomes.append(
+            {
+                "action_id": record.action_id,
+                "round": claim.round,
+                "finding_id": claim.finding_id,
+                "target": record.target["issue_url"],
+                "outcome": outcome,
+                "evidence": str(observed.get("evidence", "")),
+                "comment_url": str(observed.get("url", "")),
+                "body_sha256": str(observed.get("body_sha256", "")),
+                "payload_sha256": sha256_text(record.body),
+                "at": at,
+                "reason": bounded_reason(reason) if reason else "",
+            }
         )
 
     def _certificate_plan_note(self) -> str:
@@ -9225,8 +10220,23 @@ class ControllerEngine:
             f"{record.attempts} attempt(s)) against GitHub before anything else, and send it "
             "only if GitHub does not already hold it and its attempt bound is left"
             for record in effects.records
+            if not record.operator_performed
         ]
         for record in effects.records:
+            if record.kind is EffectKind.OPERATOR_COMMENT:
+                # #243: never sent by the controller; verified in the prefix
+                # pass, before anything else of the plan.
+                evidence = (
+                    "its bound comment unchanged"
+                    if record.binding is not None
+                    else "exactly one comment carrying its marker with exactly its payload"
+                )
+                notes.append(
+                    f"operator action {record.action_id} on {record.target['issue_url']} "
+                    f"({record.stage.value}): would read that issue's complete comment listing "
+                    f"and verify {evidence}, never posting it; while any operator action is "
+                    "not verified, would block before anything else is sent"
+                )
             if record.kind is EffectKind.ACCEPTANCE_COMMENT and record.pending:
                 if record.authorized:
                     by = (
@@ -9689,7 +10699,9 @@ class ControllerEngine:
             ) from exc
         if honored is None:
             # D4.4: persisted before the launch, so that a follow-up issue a
-            # later entry finds is explained by this read or not at all.
+            # later entry finds is explained by this read or not at all. The
+            # operator actions' allowed targets are read once here too
+            # (#243): a relaunch of this entry offers the same set.
             state.entry_observation = EntryObservation(
                 Phase.FIX,
                 state.current_issue_url,
@@ -9697,12 +10709,51 @@ class ControllerEngine:
                 {ref: reviewed},
                 reviewed,
                 observed,
+                operator_targets=self._operator_targets_at_entry(),
             ).to_dict()
         self._existing_follow_ups = own
         self._existing_pr_follow_ups = deferred
         state.current_head_sha = pr.head_sha
         self._save()
         return None
+
+    def _operator_targets_at_entry(self) -> OperatorTargets | None:
+        """The issues this FIX entry allows operator comments on, or ``None`` (#243).
+
+        The issues the run's issue body references (`#n` or an issue URL of
+        the repository, at most :data:`MAX_LISTED_ISSUES`), plus the EPIC,
+        minus the run's own issue and its PR. ``None`` (no operator action
+        offered) under ``safety.acceptance_actions: off``, or when the run's
+        issue cannot be read conclusively; a transient failure propagates
+        (nothing was launched yet).
+        """
+        if self.config.safety.acceptance_actions == ACCEPTANCE_ACTIONS_OFF:
+            return None
+        state = self._require_state()
+        try:
+            issue = self.github.get_issue(state.current_issue_url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError:
+            return None
+        body = issue.body or ""
+        own = parse_issue_url(state.current_issue_url).number
+        excluded = {own}
+        if state.current_pr_url:
+            excluded.add(parse_pr_url(state.current_pr_url).number)
+        allowed: dict[int, list[str]] = {}
+        referenced = [n for n in self._issue_references(body) if n not in excluded]
+        for number in referenced[:MAX_LISTED_ISSUES]:
+            allowed[number] = [ALLOWED_BY_ISSUE_BODY]
+        if state.epic_url:
+            epic = parse_issue_url(state.epic_url)
+            if epic.same_repository(state.repository) and epic.number not in excluded:
+                allowed.setdefault(epic.number, []).append(ALLOWED_BY_EPIC)
+        return OperatorTargets(
+            tuple(allowed),
+            {n: tuple(v) for n, v in allowed.items()},
+            sha256_text(body),
+        )
 
     def _fix_branch_problem(self, pr: PRInfo) -> str:
         """Why the controller cannot push a fix to ``pr``'s branch, or "" when it can."""
@@ -11143,6 +12194,7 @@ class ControllerEngine:
         state.prior_findings = []
         state.last_fix_resolutions = []
         state.acceptance_outcomes = []
+        state.operator_comment_outcomes = []
         state.last_review_comment_url = ""
         state.last_review_result = ""
         state.last_review_needs_fix = None
@@ -12187,6 +13239,7 @@ class ControllerEngine:
         state.prior_findings = []
         state.review_history = []
         state.acceptance_outcomes = []
+        state.operator_comment_outcomes = []
         state.last_review_result = ""
         state.reviewed_pr_url = ""
         state.reviewed_head_sha = ""
@@ -12779,7 +13832,9 @@ class ControllerEngine:
         :meth:`_complete_fix` does the rest from what was saved, as a later
         entry would. An acceptance comment (K9, #211) is planned first, so
         nothing of the plan is sent before the one write that may wait for
-        the operator's approval.
+        the operator's approval; so are operator comments (K10, #243, in
+        result order; a result never holds both), which the operator posts
+        and the controller only verifies.
         """
         state = self._require_state()
         reviewed = state.reviewed_head_sha.lower()
@@ -12789,6 +13844,15 @@ class ControllerEngine:
         observation = state.phase_effects().observation
         if observation is None or observation.phase != Phase.FIX:
             raise StateError("a FIX result was applied without the observation of its entry")
+        if self._fix_block:
+            # #243 (7.2): an operator action's target could not be read
+            # conclusively at the check; nothing of the result is saved.
+            block, self._fix_block, self._fix_candidate = self._fix_block, "", ""
+            return Phase.BLOCKED, (
+                f"{block}. This is not a transient GitHub failure; nothing was created, "
+                "appended or pushed and no operator action was planned. Fix the cause, then "
+                "'unblock' to launch the fixer afresh"
+            )
         # ADR 0006 D5.1: the exact candidate, the reviewed HEAD itself when
         # nothing was committed, is validated before anything is planned.
         problem = self._gate_producer(Phase.FIX, candidate, reviewed)
@@ -12883,6 +13947,23 @@ class ControllerEngine:
             )
         owner = self._fix_owner()
         records: list[EffectRecord] = []
+        operator: dict[str, list[int]] = {}
+        targets = observation.operator_targets
+        for r in res.resolutions:
+            # #243: the operator actions first, in result order (the K10
+            # prefix): nothing of the plan is sent before each is verified.
+            if not r.operator_acceptance:
+                continue
+            if targets is None:
+                raise StateError("a FIX operator action was accepted without allowed targets")
+            for action in r.operator_actions:
+                planned = self._operator_plan(len(records), owner, r.finding_id, action, targets)
+                if isinstance(planned, str):
+                    raise StateError(
+                        f"a FIX operator comment its check accepted is refused: {planned}"
+                    )
+                operator.setdefault(r.finding_id, []).append(len(records))
+                records.append(planned)
         acceptance: dict[str, int] = {}
         for r in res.resolutions:
             if not r.acceptance_action:
@@ -12963,6 +14044,7 @@ class ControllerEngine:
                     "commit_sha": r.commit_sha,
                     "follow_up_source": sources.get(r.finding_id),
                     "acceptance_source": acceptance.get(r.finding_id),
+                    "operator_sources": operator.get(r.finding_id),
                 }
                 for r in res.resolutions
             ),
@@ -13015,7 +14097,11 @@ class ControllerEngine:
         state.last_fix_resolutions = []
         # An acceptance comment the plan held (#211) is stale: it was
         # requested for findings that no longer describe the PR.
-        self._record_acceptance_outcomes(state.phase_effects().records, "stale", what)
+        records = state.phase_effects().records
+        self._record_acceptance_outcomes(records, "stale", what)
+        # An operator action (#243) is reconciled read-only first: one the
+        # operator completed is verified, any other stale.
+        self._record_operator_outcomes(records, self._operator_drift_reads(records), what)
         state.drop_phase_effects()
         nxt, _, carried = self._stale_revision(Phase.FIX, pr)
         return nxt, f"{what}; FIX -> {nxt.value} of the actual revision, no fix recorded{carried}"
@@ -13391,6 +14477,9 @@ class ControllerEngine:
         problem = self._fix_disposition_problem(context, records, observation)
         if problem:
             return self._fix_disposition_block(problem, "nothing more was sent")
+        outcome = self._operator_prefix(records)
+        if outcome is not None:
+            return outcome
         # True while the last PR read and issue listing postdate every
         # follow-up write: the push is never issued over a PR or a deferral
         # not read back as planned (PR #205 R2-F2, R2-F3, R3-F2).
@@ -13490,10 +14579,12 @@ class ControllerEngine:
                     if r["acceptance_source"] is None
                     else str((records[r["acceptance_source"]].observed or {})["url"])
                 ),
+                "operator_evidence": self._operator_evidence(r["finding_id"], records),
             }
             for r in context.resolutions
         ]
         self._record_acceptance_outcomes(records, "verified", "")
+        self._record_operator_outcomes(records, {}, "")
         state.current_head_sha = latest.head_sha
         state.last_review_result = "fixed"
         # The plan is complete, and the save that leaves FIX drops it; the
@@ -13506,6 +14597,11 @@ class ControllerEngine:
             f", acceptance comment {(r.observed or {}).get('url')} verified ({r.action_id})"
             for r in records
             if r.kind is EffectKind.ACCEPTANCE_COMMENT
+        ) + "".join(
+            f", operator comment {(r.observed or {}).get('url')} verified "
+            f"({(r.observed or {}).get('evidence')}, {r.action_id})"
+            for r in records
+            if r.kind is EffectKind.OPERATOR_COMMENT
         )
         nxt = self._next_phase(Phase.FIX, {})
         moved = (
@@ -13518,6 +14614,224 @@ class ControllerEngine:
             f"{created} follow-up issue(s) created, {appended} marker append(s){accepted}, "
             f"{moved}; FIX -> {nxt.value} (round {state.review_round + 1})"
         )
+
+    def _operator_prefix(self, records: list[EffectRecord]) -> tuple[Phase, str] | None:
+        """The prefix pass (#243): verify every operator action before anything is sent.
+
+        The plan's leading K10 records are each reconciled, never issued; the
+        pass does not stop at the first hold or conflict, and each
+        observation or conflict is saved as it is made (:func:`verify`), so
+        a partial completion is durable. ``records`` is updated in place.
+        When any is not observed, FIX blocks with one controller-rendered
+        reason naming each action, and nothing after the prefix is sent. An
+        unavailable GitHub propagates with what was saved so far.
+        """
+        op = OperatorCommentOp(self.github, plan=records)
+        open_: list[tuple[EffectRecord, str]] = []
+        for index, record in enumerate(records):
+            if record.kind is not EffectKind.OPERATOR_COMMENT:
+                break
+            if record.stage is Stage.OBSERVED:
+                continue
+            if record.stage is Stage.CONFLICT:
+                open_.append((record, record.reason))
+                continue
+            try:
+                driven = verify(record, op, self._persist_effect)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                open_.append(
+                    (
+                        record,
+                        f"{record.describe()} ({record.action_id}): the comments of "
+                        f"{record.target['issue_url']} cannot be read ({exc}); nothing was "
+                        "verified",
+                    )
+                )
+                continue
+            records[index] = driven.record
+            if driven.held:
+                open_.append((driven.record, driven.held))
+            elif driven.record.stage is Stage.CONFLICT:
+                open_.append((driven.record, driven.record.reason))
+        if not open_:
+            return None
+        return Phase.BLOCKED, self._operator_hold_reason(open_, records)
+
+    def _operator_hold_reason(
+        self, open_: Sequence[tuple[EffectRecord, str]], records: Sequence[EffectRecord]
+    ) -> str:
+        """The aggregate BLOCKED reason of a prefix pass, rendered by the controller (#243).
+
+        Names each operator action not verified (id, target, finding,
+        state and why), the ones verified so far, what is held back, and the
+        commands: print and post a payload, bind an existing comment,
+        unblock and resume, or decline. Agent text appears only as the
+        finding's title, which the review result bounded to one line.
+        """
+        state = self._require_state()
+        why = "<why>"
+        lines: list[str] = []
+        for record, reason in open_:
+            claim = scan(OPERATOR_COMMENT, record.marker).claims[0]
+            title = next(
+                (
+                    str(f.get("title", ""))
+                    for f in state.open_findings
+                    if f.get("id") == claim.finding_id
+                ),
+                "",
+            )
+            what = "verification failed" if record.stage is Stage.CONFLICT else "pending"
+            if record.stage is not Stage.CONFLICT and record.binding is not None:
+                what = "evidence bound, not verified"
+            lines.append(
+                f"{record.action_id} (comment on {record.target['issue_url']} for "
+                f"{claim.finding_id} {title!r}; {len(record.body)} characters, sha256 "
+                f"{sha256_text(record.body)}): {what}: {reason}; print it with "
+                f"{self.cli_command('status', '--action', record.action_id)}, or bind an "
+                "existing comment with "
+                f"{self.cli_command('unblock', '--bind-evidence', record.action_id)} "
+                f"<comment URL> --reason {why!r}"
+            )
+        done = [
+            f"{r.action_id} ({(r.observed or {}).get('url')}, {(r.observed or {}).get('evidence')})"
+            for r in records
+            if r.kind is EffectKind.OPERATOR_COMMENT and r.stage is Stage.OBSERVED
+        ]
+        push = records[-1] if records and records[-1].kind is EffectKind.PUSH else None
+        held = (
+            f"the push of {str(push.payload['sha'])[:12]} is held back, and that unpushed "
+            f"candidate lives only in the agent worktree {self.agent_worktree_description()}: "
+            "do not reset or remove it"
+            if push is not None
+            else "the fixer committed nothing, so nothing is pushed"
+        )
+        others = sum(
+            1
+            for r in records
+            if r.kind in (EffectKind.FOLLOW_UP_ISSUE, EffectKind.FOLLOW_UP_APPEND)
+        )
+        if others:
+            held += f"; {others} follow-up write(s) are held back as well"
+        pending = [r.action_id for r, _ in open_]
+        plain = f"{self.cli_command('unblock', '--reason')} {why!r}"
+        decline = (
+            f"{self.cli_command('unblock', *[a for p in pending for a in ('--decline-action', p)])}"
+            f" --reason {why!r}"
+        )
+        verified = f" Verified so far: {', '.join(done)}." if done else ""
+        return bound_block_reason(
+            f"FIX of review round {state.review_round} awaits {len(open_)} operator action(s) "
+            f"on other issues of {state.repository}, which the operator posts and the "
+            f"controller only verifies; {held}. {' | '.join(lines)}.{verified} After posting "
+            "exactly a payload, or binding a comment, run "
+            f"{plain} && {self.resume_command()}: the unblock reads every pending target and "
+            "re-enters FIX only on progress; a reason, a checkbox or an unbound comment is "
+            f"never evidence. To withdraw them instead: {decline}"
+        )
+
+    def _operator_evidence(self, finding_id: str, records: Sequence[EffectRecord]) -> list[dict]:
+        """``operator_evidence`` of one finding's resolution at completion (#243).
+
+        The plan's observed operator comments for the finding, then this
+        round's ``verified`` outcomes for it (kept from a declined plan), each
+        once.
+        """
+        state = self._require_state()
+        evidence: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for record in records:
+            if record.kind is not EffectKind.OPERATOR_COMMENT:
+                continue
+            if scan(OPERATOR_COMMENT, record.marker).claims[0].finding_id != finding_id:
+                continue
+            observed = record.observed or {}
+            seen.add((record.action_id, str(observed.get("url", ""))))
+            evidence.append(
+                {
+                    "action_id": record.action_id,
+                    "target": record.target["issue_url"],
+                    "comment_url": str(observed.get("url", "")),
+                    "evidence": str(observed.get("evidence", "")),
+                    "body_sha256": str(observed.get("body_sha256", "")),
+                    "payload_sha256": sha256_text(record.body),
+                }
+            )
+        for outcome in state.operator_comment_outcomes:
+            if (
+                outcome["outcome"] != "verified"
+                or outcome["round"] != state.review_round
+                or outcome["finding_id"] != finding_id
+                or (outcome["action_id"], outcome["comment_url"]) in seen
+            ):
+                continue
+            seen.add((outcome["action_id"], outcome["comment_url"]))
+            evidence.append(
+                {key: outcome[key] for key in ("action_id", "target", "comment_url")}
+                | {
+                    "evidence": outcome["evidence"],
+                    "body_sha256": outcome["body_sha256"],
+                    "payload_sha256": outcome["payload_sha256"],
+                }
+            )
+        return evidence
+
+    def _operator_drift_reads(self, records: Sequence[EffectRecord]) -> dict[int, dict]:
+        """A read-only reconcile of each pending operator action when FIX drifts (#243).
+
+        ``{position: observed}`` for each one the operator completed (the
+        exact payload, or the bound comment unchanged). Nothing is saved;
+        an unavailable GitHub propagates, any other failure leaves the
+        action unobserved (stale).
+        """
+        op = OperatorCommentOp(self.github, plan=records)
+        found: dict[int, dict] = {}
+        for record in records:
+            if record.kind is not EffectKind.OPERATOR_COMMENT or record.stage is Stage.OBSERVED:
+                continue
+            try:
+                decision = op.reconcile(record.reopened())
+            except GitHubUnavailableError:
+                raise
+            except GitHubError:
+                continue
+            if decision.action is Action.OBSERVE and decision.observed:
+                found[record.position] = dict(decision.observed)
+        return found
+
+    def _record_operator_outcomes(
+        self, records: Sequence[EffectRecord], now_observed: Mapping[int, dict], reason: str
+    ) -> None:
+        """Append the outcome of each K10 record of the FIX plan (#243).
+
+        An observed record, or one ``now_observed`` holds (a read-only
+        reconcile at drift), is ``verified``; any other is ``stale`` with
+        ``reason``. Bounded, never dropping an entry of this round.
+        """
+        state = self._require_state()
+        at = utcnow_iso()
+        for record in records:
+            if record.kind is not EffectKind.OPERATOR_COMMENT:
+                continue
+            if record.stage is Stage.OBSERVED:
+                self._append_operator_outcome(record, "verified", "", at)
+            elif record.position in now_observed:
+                self._append_operator_outcome(
+                    replace(
+                        record,
+                        stage=Stage.OBSERVED,
+                        reason="",
+                        observed=dict(now_observed[record.position]),
+                    ),
+                    "verified",
+                    "",
+                    at,
+                )
+            else:
+                self._append_operator_outcome(record, "stale", reason, at)
+        state.bound_operator_comment_outcomes()
 
     def _record_acceptance_outcomes(
         self, records: Sequence[EffectRecord], outcome: str, reason: str

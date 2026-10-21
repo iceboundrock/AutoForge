@@ -535,6 +535,9 @@ def test_status_gives_every_child_exactly_one_category(epic, tmp_path):
     # BLOCKED: its reason, the exact unblock on the namespace, then epic resume.
     blocked = rows[3]
     assert "BLOCKED: " in blocked["detail"] and blocked["phase"] == "BLOCKED"
+    # #243: the operator-action decisions are named too; a worker never takes them.
+    for words in ("status --action X-...", "unblock --bind-evidence X-...", "--decline-action X-"):
+        assert words in blocked["detail"]
     unblock = e.command("--state-dir", str(b.ns(3).state_dir), "unblock", "--reason", "<why>")
     assert blocked["next"] == [unblock, resume]
     assert rows[2]["pr_url"] and rows[2]["next"] == []

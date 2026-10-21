@@ -37,6 +37,7 @@ from autoforge.claims import (
     render_acceptance_marker,
     render_follow_up_marker,
     render_implementation_marker,
+    render_operator_comment_marker,
     render_progress_marker,
 )
 from autoforge.effect_ops import (
@@ -46,6 +47,8 @@ from autoforge.effect_ops import (
     FollowUpAppendOp,
     FollowUpIssueOp,
     ImplementationPrOp,
+    OperatorCommentOp,
+    OperatorPerformedError,
     ProgressCommentOp,
     PushOp,
     ReplacementPrOp,
@@ -53,34 +56,45 @@ from autoforge.effect_ops import (
     drive,
     operation_for,
     raise_conflict,
+    verify,
 )
 from autoforge.effects import (
+    ACTION_ID_RE,
     APPEND_SEPARATOR,
     MAX_BODY_CHARS,
     MAX_CONFLICT_REASON_CHARS,
     MAX_EFFECT_ATTEMPTS,
     MAX_EFFECT_STATE_CHARS,
     MAX_EFFECTS_PER_PLAN,
+    MAX_OPERATOR_TARGETS,
     MAX_TITLE_CHARS,
+    OPERATOR_ACTION_ID_RE,
     Action,
     AnalyzeContext,
     Binding,
+    Decision,
     EffectKind,
     EffectOwner,
     EffectRecord,
     EntryObservation,
     FixContext,
     Found,
+    Listed,
+    OperatorTargets,
     ReplanContext,
     Stage,
     acceptance_action_id,
     acceptance_comment_body,
     compose_append,
     decide_acceptance,
+    decide_operator_comment,
     follow_up_issue_body,
     implementation_closing_block,
     load_phase_effects,
     load_records,
+    normalized_comment_text,
+    operator_action_id,
+    operator_comment_body,
     payload_chars,
     plan_size_problem,
     progress_comment_body,
@@ -92,6 +106,7 @@ from autoforge.errors import (
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    GitHubWrongTargetError,
     GitTransportError,
     StateError,
 )
@@ -103,6 +118,8 @@ from autoforge.replan_txn import ReplanAttestation, render_marker
 from autoforge.result_parser import (
     MAX_FINDINGS_PER_REVIEW,
     MAX_FOLLOW_UP_BODY_CHARS,
+    MAX_OPERATOR_ACTIONS_PER_FIX,
+    MAX_OPERATOR_COMMENT_CHARS,
     MAX_PR_BODY_CHARS,
 )
 from autoforge.transitions import Phase
@@ -3165,6 +3182,7 @@ def _acceptance_context(source: int | None = 0, fid: str = "R1-F1") -> dict:
                 "commit_sha": "",
                 "follow_up_source": None,
                 "acceptance_source": source,
+                "operator_sources": None,
             }
         ],
     }
@@ -3212,3 +3230,1696 @@ def test_the_largest_plan_with_an_acceptance_comment_loads():
     ]
     records.append(push_record(position=MAX_EFFECTS_PER_PLAN - 1))
     assert len(load_records([r.to_dict() for r in records], FIX_BINDING)) == MAX_EFFECTS_PER_PLAN
+
+
+# -- K10: the operator comment (#243) ------------------------------------------------------
+#
+# The operator posts a comment on another issue of the run's repository and the
+# controller only verifies it: a K10 record is never attempted, driven or
+# issued, it leads its plan, and its verification reads the target's complete
+# comment listing (spec section 7.4).
+
+ISSUE42 = "https://github.com/owner/repo/issues/42"  # the run's PR number, as an issue URL
+OTHER_REPO_ISSUE3 = "https://github.com/other/repo/issues/3"
+OPERATOR_TEXT = "Confirmed on the reviewed HEAD: the schema migration #2 depends on is applied."
+OPERATOR_ISSUE_BODY = "Depends on #3 and #4."
+OPERATOR_BODY_SHA = sha256_text(OPERATOR_ISSUE_BODY)
+OTHER_DIGEST = "d" * 64
+EVIDENCE_TEXT = "Checked the migration by hand on staging; it is applied."
+K10_COMPLETION = "operator_comment_exact_or_bound_in_complete_listing"
+FIVE_TARGETS = (ISSUE3, ISSUE4, EPIC, ISSUE43, ISSUE44)
+
+
+def operator_dict(
+    *,
+    target: str = ISSUE3,
+    finding_id: str = "R1-F1",
+    round_: int = 1,
+    text: str = OPERATOR_TEXT,
+    position: int = 0,
+    by: EffectOwner = FIX_OWNER,
+    allowed_by: tuple[str, ...] = ("issue_body",),
+    issue_body_sha256: str = OPERATOR_BODY_SHA,
+    binding: dict | None = None,
+    marker: str | None = None,
+) -> dict:
+    """A K10 record as persisted, built without validation so a test can make it inconsistent.
+
+    Everything is rendered as the FIX planner renders it (``_operator_plan``):
+    the marker for (owner issue, owner PR, round, finding, target) and the
+    payload from the agent's ``text``; ``marker`` replaces the identity's marker.
+    """
+    rendered = render_operator_comment_marker(by.issue_url, by.pr_url, round_, finding_id, target)
+    return EffectRecord(
+        position=position,
+        kind=EffectKind.OPERATOR_COMMENT,
+        owner=by,
+        identity={"issue_url": target, "marker": rendered if marker is None else marker},
+        target={"issue_url": target},
+        precondition={
+            "allowed_by": list(allowed_by),
+            "issue_body_sha256": issue_body_sha256,
+            "binding": binding,
+        },
+        payload={
+            "body": operator_comment_body(text, by.issue_url, by.pr_url, round_, finding_id, target)
+        },
+        completion=K10_COMPLETION,
+    ).to_dict()
+
+
+def operator_record(**kwargs: Any) -> EffectRecord:
+    """K10 (#243): a valid record, loaded as recovery loads it."""
+    return EffectRecord.from_dict(operator_dict(**kwargs))
+
+
+def exact_evidence(record: EffectRecord, cid: int = 300) -> dict:
+    """What an exact K10 observation of ``record``'s payload as comment ``cid`` holds."""
+    return {
+        "url": comment_url(record.target["issue_url"], cid),
+        "comment_id": cid,
+        "evidence": "exact",
+        "body_sha256": sha256_text(record.body),
+    }
+
+
+def evidence_binding(cid: int = 400, body: str = EVIDENCE_TEXT, target: str = ISSUE3) -> dict:
+    """The operator's binding of comment ``cid`` with ``body`` on ``target``."""
+    return {
+        "comment_url": comment_url(target, cid),
+        "comment_id": cid,
+        "body_sha256": sha256_text(body),
+    }
+
+
+K10_BINDING = evidence_binding()
+K10_EXACT = exact_evidence(EffectRecord.from_dict(operator_dict()))
+K10_BOUND_EVIDENCE = {
+    "url": K10_BINDING["comment_url"],
+    "comment_id": K10_BINDING["comment_id"],
+    "evidence": "bound",
+    "body_sha256": K10_BINDING["body_sha256"],
+}
+
+
+def operator_targets(
+    numbers: Any = (3, 4, 1),
+    *,
+    allowed: dict[int, list[str]] | None = None,
+    digest: str = OPERATOR_BODY_SHA,
+) -> dict:
+    """A FIX entry's allowed set as persisted: #3 and #4 from the issue body, the EPIC (#1)."""
+    numbers = list(numbers)
+    if allowed is None:
+        allowed = {n: ["epic"] if n == 1 else ["issue_body"] for n in numbers}
+    return {
+        "numbers": numbers,
+        "allowed_by": {str(n): list(v) for n, v in allowed.items()},
+        "issue_body_sha256": digest,
+    }
+
+
+def operator_observation(targets: dict | None = None, *, phase: str = "FIX") -> dict:
+    """A FIX entry observation recording ``targets`` (the default set) as its allowed set."""
+    data: dict[str, Any] = {
+        "phase": phase,
+        "issue_url": ISSUE,
+        "pr_url": PR,
+        "refs": {},
+        "base_sha": None,
+        "objects": {},
+    }
+    data["operator_targets"] = operator_targets() if targets is None else targets
+    return data
+
+
+def fix_resolution(
+    fid: str,
+    resolution: str,
+    *,
+    follow_up: int | str | None = None,
+    operator: Any = None,
+) -> dict:
+    return {
+        "finding_id": fid,
+        "resolution": resolution,
+        "rationale": f"Why {fid} is resolved this way.",
+        "commit_sha": "",
+        "follow_up_source": follow_up,
+        "acceptance_source": None,
+        "operator_sources": operator,
+    }
+
+
+def k10_resolution(fid: str = "R1-F1", sources: Any = (0, 1), kind: str = "operator_acceptance"):
+    """The resolution of ``fid`` naming its K10 records (``sources``) by plan position."""
+    return fix_resolution(fid, kind, operator=None if sources is None else list(sources))
+
+
+# The plan the K10 load cases start from: two operator comments for R1-F1 (on
+# #3, allowed by the issue body, and on the EPIC), then the push.
+K10_PLAN = [
+    operator_record(),
+    operator_record(target=EPIC, position=1, allowed_by=("epic",)),
+    push_record(position=2),
+]
+
+
+def _k10_case(**change: Any) -> tuple[list[dict], dict, dict, Binding]:
+    """``load_phase_effects``'s arguments for :data:`K10_PLAN`, with ``change`` applied."""
+    case: dict[str, Any] = {
+        "records": K10_PLAN,
+        "observation": operator_observation(),
+        "resolutions": [k10_resolution()],
+        "open_ids": ("R1-F1",),
+        **change,
+    }
+    return (
+        [r.to_dict() for r in case["records"]],
+        case["observation"],
+        {**FIX_CONTEXT, "resolutions": case["resolutions"]},
+        replace(FIX_BINDING, open_finding_ids=case["open_ids"]),
+    )
+
+
+# -- K10: the record ----------------------------------------------------------------------
+
+
+def test_an_operator_comment_round_trips_in_every_stage_it_can_hold():
+    """Intended, bound, observed (exact or bound evidence) and conflict are
+    inverse through JSON; ``plan`` validates as a load does; only K10 is
+    operator-performed. A reopened conflict is intended again, never attempted."""
+    record = operator_record()
+    planned = EffectRecord.plan(
+        0,
+        EffectKind.OPERATOR_COMMENT,
+        FIX_OWNER,
+        identity=record.identity,
+        target=record.target,
+        precondition=record.precondition,
+        payload=record.payload,
+    )
+    assert planned == record
+    assert (record.stage, record.attempts, record.completion) == (Stage.INTENDED, 0, K10_COMPLETION)
+    assert record.operator_performed and record.binding is None
+    assert record.describe() == f"operator_comment effect 0 on {ISSUE3}"
+    assert not any(build().operator_performed for build, _ in OBSERVED)
+    bound = record.binding_to(K10_BINDING["comment_url"], 400, K10_BINDING["body_sha256"])
+    stages = [
+        record,
+        bound,
+        record.observing(exact_evidence(record)),
+        bound.observing(exact_evidence(bound)),
+        bound.observing(K10_BOUND_EVIDENCE),
+        record.conflicting("a human edited it"),
+        bound.conflicting("a human edited it"),
+    ]
+    for each in stages:
+        raw = json.loads(json.dumps(each.to_dict()))
+        assert EffectRecord.from_dict(raw) == each
+        assert EffectRecord.from_dict(raw).to_dict() == raw
+    assert record.conflicting("x").reopened() == record
+    assert bound.conflicting("x").reopened() == bound
+
+
+def test_the_link_rule_allows_links_into_the_runs_repository_only():
+    """The agent's text is published under the operator's identity: a link
+    into the run's repository loads, any other link is refused on load."""
+    inside = "Details: https://github.com/owner/repo/issues/3#issuecomment-1 and #4."
+    assert operator_record(text=inside).body.count(inside) == 1
+    with pytest.raises(StateError, match="has an invalid operator text: .*link or URL"):
+        operator_record(text="Details: https://github.com/owner/repo-evil/issues/3")
+
+
+def _k10(**kwargs: Any) -> Callable[[], dict]:
+    return lambda: operator_dict(**kwargs)
+
+
+def as_built(raw: dict) -> None:
+    """No mutation: the builder already made the record inconsistent."""
+
+
+def _strip_header(raw: dict) -> None:
+    raw["payload"]["body"] = raw["payload"]["body"].split(APPEND_SEPARATOR, 1)[1]
+
+
+def _without(data: dict, key: str) -> dict:
+    return {k: v for k, v in data.items() if k != key}
+
+
+ALLOWED_BY_RULE = "must be a non-empty list of \\('issue_body', 'epic'\\)"
+OPERATOR_CORRUPTIONS = [
+    # Never attempted: the controller never issues K10 (D4.1 has nothing to count).
+    _p(
+        "k10-attempted",
+        operator_dict,
+        both(at("stage", "attempted"), at("attempts", 1)),
+        "is an operator-performed operator_comment that records an attempt",
+    ),
+    _p(
+        "k10-conflict-charged",
+        operator_dict,
+        both(at("stage", "conflict"), at("reason", "x"), at("attempts", 1)),
+        "records an attempt; the controller never issues it",
+    ),
+    _p(
+        "k10-observed-charged",
+        operator_dict,
+        both(observed_as(K10_EXACT), at("attempts", 1)),
+        "records an attempt; the controller never issues it",
+    ),
+    _p("k10-intended-charged", operator_dict, at("attempts", 1), "intended but records an issued"),
+    # The precondition: why the target is allowed, from which issue body, and the binding.
+    _p("k10-allowed-empty", operator_dict, at("precondition.allowed_by", []), ALLOWED_BY_RULE),
+    _p(
+        "k10-allowed-out-of-order",
+        operator_dict,
+        at("precondition.allowed_by", ["epic", "issue_body"]),
+        ALLOWED_BY_RULE,
+    ),
+    _p(
+        "k10-allowed-repeated",
+        operator_dict,
+        at("precondition.allowed_by", ["issue_body", "issue_body"]),
+        ALLOWED_BY_RULE,
+    ),
+    _p("k10-allowed-unknown", operator_dict, at("precondition.allowed_by", ["x"]), ALLOWED_BY_RULE),
+    _p("k10-allowed-text", operator_dict, at("precondition.allowed_by", "epic"), ALLOWED_BY_RULE),
+    _p(
+        "k10-issue-body-digest",
+        operator_dict,
+        at("precondition.issue_body_sha256", "A" * 64),
+        "issue_body_sha256 must be a 64-character lowercase SHA-256 hex digest",
+    ),
+    _p(
+        "k10-no-binding-key",
+        operator_dict,
+        without("precondition.binding"),
+        r"is missing key\(s\) \['binding'\]",
+    ),
+    _p(
+        "k10-absent-key",
+        operator_dict,
+        at("precondition.absent", True),
+        r"has unknown key\(s\) \['absent'\]",
+    ),
+    _p(
+        "k10-binding-not-an-object",
+        operator_dict,
+        at("precondition.binding", "comment 400"),
+        "binding must be an object",
+    ),
+    _p(
+        "k10-binding-missing-key",
+        operator_dict,
+        at("precondition.binding", _without(K10_BINDING, "body_sha256")),
+        r"binding is missing key\(s\) \['body_sha256'\]",
+    ),
+    _p(
+        "k10-binding-extra-key",
+        operator_dict,
+        at("precondition.binding", {**K10_BINDING, "author": "someone"}),
+        r"binding has unknown key\(s\) \['author'\]",
+    ),
+    _p(
+        "k10-binding-not-a-comment-url",
+        operator_dict,
+        at("precondition.binding", {**K10_BINDING, "comment_url": ISSUE3}),
+        "binding.comment_url is not a GitHub URL of the expected kind",
+    ),
+    _p(
+        "k10-binding-on-another-issue",
+        operator_dict,
+        at("precondition.binding", evidence_binding(target=ISSUE4)),
+        "binding names a comment on another issue than its target",
+    ),
+    _p(
+        "k10-binding-in-another-repository",
+        operator_dict,
+        at("precondition.binding", evidence_binding(target=OTHER_REPO_ISSUE3)),
+        "binding names a comment on another issue than its target",
+    ),
+    _p(
+        "k10-binding-id-text",
+        operator_dict,
+        at("precondition.binding", {**K10_BINDING, "comment_id": "400"}),
+        "binding.comment_id must be an integer",
+    ),
+    _p(
+        "k10-binding-id-bool",
+        operator_dict,
+        at("precondition.binding", {**K10_BINDING, "comment_id": True}),
+        "binding.comment_id must be an integer",
+    ),
+    _p(
+        "k10-binding-id-zero",
+        operator_dict,
+        at("precondition.binding", {**K10_BINDING, "comment_id": 0}),
+        "binding.comment_id must be >= 1",
+    ),
+    _p(
+        "k10-binding-id-not-the-urls",
+        operator_dict,
+        at("precondition.binding", {**K10_BINDING, "comment_id": 401}),
+        "binding names another comment id than its URL's",
+    ),
+    _p(
+        "k10-binding-digest",
+        operator_dict,
+        at("precondition.binding", {**K10_BINDING, "body_sha256": "x" * 64}),
+        "binding.body_sha256 must be a 64-character lowercase SHA-256 hex digest",
+    ),
+    # The target: another issue of the owner's repository, never its own issue or PR.
+    _p("k10-own-issue", _k10(target=ISSUE), as_built, "targets its owner's own issue"),
+    _p(
+        "k10-another-repository",
+        _k10(target=OTHER_REPO_ISSUE3),
+        as_built,
+        "targets an issue outside its owner's repository",
+    ),
+    _p("k10-own-pr-number", _k10(target=ISSUE42), as_built, "targets its owner's PR"),
+    _p(
+        "k10-target-a-pr-url",
+        operator_dict,
+        both(at("identity.issue_url", PR43), at("target.issue_url", PR43)),
+        "issue_url is not a GitHub URL of the expected kind",
+    ),
+    _p(
+        "k10-identity-not-target",
+        operator_dict,
+        at("target.issue_url", ISSUE4),
+        "has a issue that differs between its identity and its target",
+    ),
+    _p("k10-owner-without-pr", operator_dict, at("owner.pr_url", ""), "has an owner without a PR"),
+    _p(
+        "k10-review-owner",
+        _k10(by=owner(Phase.REVIEW, pr_url=PR)),
+        as_built,
+        "is a operator_comment effect, which REVIEW never plans",
+    ),
+    # The marker: the owner's issue and PR, and this record's target.
+    _p(
+        "k10-marker-for-another-target",
+        _k10(marker=render_operator_comment_marker(ISSUE, PR, 1, "R1-F1", ISSUE4)),
+        as_built,
+        "carries a marker whose target is not its target",
+    ),
+    _p(
+        "k10-marker-for-another-issue",
+        _k10(marker=render_operator_comment_marker(ISSUE4, PR, 1, "R1-F1", ISSUE3)),
+        as_built,
+        "carries a marker for another issue than its owner's",
+    ),
+    _p(
+        "k10-marker-for-another-pr",
+        _k10(marker=render_operator_comment_marker(ISSUE, PR43, 1, "R1-F1", ISSUE3)),
+        as_built,
+        "carries a marker for another PR than its owner's",
+    ),
+    _p(
+        "k10-marker-of-another-kind",
+        operator_dict,
+        at("identity.marker", ACCEPTANCE_MARKER),
+        "must be exactly one well-formed ai-operator-comment marker",
+    ),
+    # The payload: exactly the controller's rendering of a text the parser accepts.
+    _p(
+        "k10-body-without-header",
+        operator_dict,
+        _strip_header,
+        "has a payload body that is not the controller's header, its text and its marker",
+    ),
+    _p(
+        "k10-body-of-another-finding",
+        operator_dict,
+        at("payload.body", operator_comment_body(OPERATOR_TEXT, ISSUE, PR, 1, "R1-F2", ISSUE3)),
+        "has a payload body that is not the controller's header, its text and its marker",
+    ),
+    _p(
+        "k10-text-not-stripped",
+        _k10(text=f" {OPERATOR_TEXT}"),
+        as_built,
+        "has an operator text that is not in the parser's stored form",
+    ),
+    _p("k10-text-blank", _k10(text=""), as_built, "has an invalid operator text"),
+    _p(
+        "k10-link-to-another-host",
+        _k10(text="The report: https://example.com/report"),
+        as_built,
+        "has an invalid operator text: .*link or URL",
+    ),
+    _p(
+        "k10-link-to-another-repository",
+        _k10(text="See https://github.com/other/repo/issues/1 for the check."),
+        as_built,
+        "has an invalid operator text: .*link or URL",
+    ),
+    _p(
+        "k10-www-autolink",
+        _k10(text="See www.example.com for the check."),
+        as_built,
+        "has an invalid operator text: .*link or URL",
+    ),
+    _p(
+        "k10-image",
+        _k10(text="![chart](https://github.com/owner/repo/chart.png)"),
+        as_built,
+        "has an invalid operator text: .*Markdown image",
+    ),
+    _p(
+        "k10-raw-html",
+        _k10(text="It is <b>applied</b>."),
+        as_built,
+        "has an invalid operator text: .*raw HTML",
+    ),
+    _p("k10-credential", _k10(text=CREDENTIAL_TEXT), as_built, "is not redaction-invariant"),
+    # The observation: a comment on the target, and evidence it can stand for.
+    _p(
+        "k10-observed-id-not-the-urls",
+        operator_dict,
+        observed_as({**K10_EXACT, "comment_id": 301}),
+        "observed names another comment id than its URL's",
+    ),
+    _p(
+        "k10-observed-on-another-issue",
+        operator_dict,
+        observed_as({**K10_EXACT, "url": comment_url(ISSUE4, 300)}),
+        "is observed on another issue than its target",
+    ),
+    _p(
+        "k10-observed-on-the-pr",
+        operator_dict,
+        observed_as({**K10_EXACT, "url": comment_url(PR, 300)}),
+        "is observed on another issue than its target",
+    ),
+    _p(
+        "k10-exact-of-other-bytes",
+        operator_dict,
+        observed_as({**K10_EXACT, "body_sha256": OTHER_DIGEST}),
+        "is exact evidence whose digest is not the payload's",
+    ),
+    _p(
+        "k10-bound-without-binding",
+        operator_dict,
+        observed_as(K10_BOUND_EVIDENCE),
+        "is bound evidence that is not the recorded binding",
+    ),
+    _p(
+        "k10-bound-to-another-comment",
+        _k10(binding=K10_BINDING),
+        observed_as({**K10_BOUND_EVIDENCE, "url": comment_url(ISSUE3, 401), "comment_id": 401}),
+        "is bound evidence that is not the recorded binding",
+    ),
+    _p(
+        "k10-bound-with-another-digest",
+        _k10(binding=K10_BINDING),
+        observed_as({**K10_BOUND_EVIDENCE, "body_sha256": OTHER_DIGEST}),
+        "is bound evidence that is not the recorded binding",
+    ),
+    _p(
+        "k10-evidence-unknown",
+        operator_dict,
+        observed_as({**K10_EXACT, "evidence": "approved"}),
+        "observed.evidence must be one of",
+    ),
+    _p(
+        "k10-observed-missing-key",
+        operator_dict,
+        observed_as(_without(K10_EXACT, "comment_id")),
+        r"observed is missing key\(s\) \['comment_id'\]",
+    ),
+    _p(
+        "k10-completion",
+        operator_dict,
+        at("completion", "acceptance_comment_exactly_one_body_equals_payload"),
+        "completion must be 'operator_comment_exact_or_bound_in_complete_listing'",
+    ),
+]
+
+
+@pytest.mark.parametrize(("base", "mutate", "match"), OPERATOR_CORRUPTIONS)
+def test_a_corrupt_operator_comment_fails_loudly(base, mutate, match):
+    """Every K10 the controller could not have planned is a StateError naming the
+    rule: an attempt, a target that is the run's own issue or PR or outside its
+    repository, a marker or payload that is not the rendering, a binding or an
+    observation that is not evidence for this target."""
+    raw = base()
+    mutate(raw)
+    with pytest.raises(StateError, match=match) as info:
+        EffectRecord.from_dict(raw)
+    assert SECRET not in str(info.value)
+
+
+# -- K10: the plan, its context and its entry ---------------------------------------------
+
+
+def test_a_plan_led_by_operator_comments_loads_with_its_context_and_entry():
+    """K10 records lead the plan; follow-ups (K5, K6) and the push follow. The
+    context names the K10s from the finding they resolve, and the entry
+    observation allowed each target for the reasons the record keeps."""
+    records = [
+        operator_record(),
+        operator_record(target=EPIC, position=1, allowed_by=("epic",)),
+        follow_up_record(finding_id="R1-F2", position=2),
+        replace(append_record(finding_ids=("R1-F3",), target=ISSUE4), position=3),
+        push_record(position=4),
+    ]
+    context = {
+        **FIX_CONTEXT,
+        "resolutions": [
+            k10_resolution(),
+            fix_resolution("R1-F2", "follow_up_created", follow_up=2),
+            fix_resolution("R1-F3", "follow_up_created", follow_up=3),
+        ],
+    }
+    binding = replace(FIX_BINDING, open_finding_ids=("R1-F1", "R1-F2", "R1-F3"))
+    loaded = load_phase_effects(
+        [r.to_dict() for r in records], operator_observation(), context, binding
+    )
+    assert loaded.records == tuple(records)
+    assert [r.kind for r in loaded.records] == [
+        EffectKind.OPERATOR_COMMENT,
+        EffectKind.OPERATOR_COMMENT,
+        EffectKind.FOLLOW_UP_ISSUE,
+        EffectKind.FOLLOW_UP_APPEND,
+        EffectKind.PUSH,
+    ]
+    assert loaded.observation is not None and loaded.observation.operator_targets is not None
+    assert loaded.observation.operator_targets.numbers == (3, 4, 1)
+    assert isinstance(loaded.context, FixContext)
+    assert loaded.context.resolutions[0]["operator_sources"] == [0, 1]
+    assert not loaded.published
+    # The default case of the load table below loads as well.
+    assert len(load_phase_effects(*_k10_case()).records) == len(K10_PLAN)
+
+
+@pytest.mark.parametrize(
+    ("records", "match"),
+    [
+        pytest.param(
+            lambda: [push_record(), operator_record(position=1)],
+            "plans an operator comment after another effect",
+            id="after-the-push",
+        ),
+        pytest.param(
+            lambda: [
+                operator_record(),
+                follow_up_record(finding_id="R1-F2", position=1),
+                operator_record(target=ISSUE4, position=2),
+            ],
+            "plans an operator comment after another effect",
+            id="not-a-prefix",
+        ),
+        pytest.param(
+            lambda: [acceptance_record(), operator_record(position=1)],
+            "plans an acceptance comment and operator comments together",
+            id="with-an-acceptance-comment",
+        ),
+        pytest.param(
+            lambda: [operator_record(), acceptance_record(position=1)],
+            "plans an acceptance comment after another effect",
+            id="before-an-acceptance-comment",
+        ),
+        pytest.param(
+            lambda: [operator_record(target=t, position=i) for i, t in enumerate(FIVE_TARGETS)],
+            f"plans 5 operator comments, over {MAX_OPERATOR_ACTIONS_PER_FIX}",
+            id="five",
+        ),
+        pytest.param(
+            lambda: [operator_record(), operator_record(position=1)],
+            "plans two operator comments with one identity",
+            id="one-identity-twice",
+        ),
+    ],
+)
+def test_a_plan_whose_operator_comments_are_not_its_unique_leading_prefix_fails_loudly(
+    records, match
+):
+    """Nothing the controller sends precedes an action the operator may still
+    decline; K9 and K10 never share a plan; at most four K10s, each once."""
+    with pytest.raises(StateError, match=match):
+        load_records([r.to_dict() for r in records()], FIX_BINDING)
+
+
+def test_two_operator_comments_for_one_issue_in_another_case_are_one_identity():
+    """GitHub names owners and repositories case-insensitively, and the
+    marker's key folds case: #3 of Owner/Repo is #3 of owner/repo. A plan
+    holding both is one identity twice, and never a verifiable plan."""
+    upper = "https://github.com/Owner/Repo/issues/3"
+    twin = operator_record(target=upper, position=1)
+    records = [operator_record(), twin, push_record(position=2)]
+    with pytest.raises(StateError, match="plans two operator comments with one identity"):
+        load_phase_effects(*_k10_case(records=records))
+
+
+OPERATOR_PLAN_MISFITS = [
+    pytest.param(
+        {"resolutions": [k10_resolution(sources=[0])]},
+        r"effect_records\[1\] is an operator comment no resolution of the context names",
+        id="unnamed",
+    ),
+    pytest.param(
+        {"resolutions": [k10_resolution("R1-F2")], "open_ids": ("R1-F2",)},
+        "resolution for R1-F2 names operator effect 0, which is another finding's or round's",
+        id="named-by-another-finding",
+    ),
+    pytest.param(
+        {
+            "resolutions": [k10_resolution(), k10_resolution("R1-F2", [1])],
+            "open_ids": ("R1-F1", "R1-F2"),
+        },
+        "resolution for R1-F2 names operator effect 1, which is another finding's or round's",
+        id="shared-with-another-finding",
+    ),
+    pytest.param(
+        {
+            "records": [operator_record(round_=2, finding_id="R2-F1")],
+            "resolutions": [k10_resolution("R2-F1", [0])],
+            "open_ids": ("R2-F1",),
+        },
+        "names operator effect 0, which is another finding's or round's",
+        id="another-rounds",
+    ),
+    pytest.param(
+        {"resolutions": [k10_resolution(sources=[0, 1, 2])]},
+        "names effect 2, which is not an operator comment",
+        id="names-the-push",
+    ),
+    pytest.param(
+        {"resolutions": [k10_resolution(sources=[0, 1, 7])]},
+        "names plan position 7, which the plan does not hold",
+        id="names-no-record",
+    ),
+    pytest.param(
+        {"observation": {**operator_observation(), "operator_targets": None}},
+        "operator_targets must be an object",
+        id="null-allowed-set",
+    ),
+    pytest.param(
+        {"observation": _without(operator_observation(), "operator_targets")},
+        "is an operator comment, but the FIX entry recorded no allowed targets",
+        id="no-allowed-set",
+    ),
+    pytest.param(
+        {"observation": {}},
+        "is an operator comment, but the FIX entry recorded no allowed targets",
+        id="no-entry-observation",
+    ),
+    pytest.param(
+        {"observation": operator_observation(operator_targets((4, 1)))},
+        r"effect_records\[0\] targets issue #3, which the FIX entry did not allow",
+        id="target-not-allowed",
+    ),
+    pytest.param(
+        {
+            "observation": operator_observation(
+                operator_targets(
+                    allowed={3: ["issue_body"], 4: ["issue_body"], 1: ["issue_body", "epic"]}
+                )
+            )
+        },
+        r"effect_records\[1\] records another allowed set than the FIX entry's",
+        id="allowed-for-other-reasons",
+    ),
+    pytest.param(
+        {"observation": operator_observation(operator_targets(digest=OTHER_DIGEST))},
+        r"effect_records\[0\] records another allowed set than the FIX entry's",
+        id="read-from-another-issue-body",
+    ),
+    pytest.param(
+        {"observation": operator_observation(operator_targets((3, 2, 1)))},
+        "operator_targets allows the run's own issue or PR",
+        id="entry-allows-the-own-issue",
+    ),
+    pytest.param(
+        {"observation": operator_observation(operator_targets((3, 42, 1)))},
+        "operator_targets allows the run's own issue or PR",
+        id="entry-allows-the-own-pr",
+    ),
+    pytest.param(
+        {"resolutions": [k10_resolution(kind="no_change_with_rationale")]},
+        "operator_sources is set exactly when the finding is resolved by operator actions",
+        id="sources-on-another-resolution",
+    ),
+    pytest.param(
+        {"resolutions": [k10_resolution(sources=None)]},
+        "operator_sources is set exactly when the finding is resolved by operator actions",
+        id="operator-acceptance-without-sources",
+    ),
+    pytest.param(
+        {"resolutions": [k10_resolution(sources=[0, 0])]},
+        "operator_sources repeats a plan position",
+        id="repeated-source",
+    ),
+    pytest.param(
+        {"resolutions": [k10_resolution(sources=[])]},
+        f"must be a list of 1 to {MAX_OPERATOR_ACTIONS_PER_FIX} plan positions",
+        id="no-source",
+    ),
+    pytest.param(
+        {"resolutions": [k10_resolution(sources=[0, 1, 2, 3, 4])]},
+        f"must be a list of 1 to {MAX_OPERATOR_ACTIONS_PER_FIX} plan positions",
+        id="five-sources",
+    ),
+    pytest.param(
+        {"resolutions": [fix_resolution("R1-F1", "operator_acceptance", operator="0")]},
+        f"must be a list of 1 to {MAX_OPERATOR_ACTIONS_PER_FIX} plan positions",
+        id="sources-not-a-list",
+    ),
+    pytest.param(
+        {"resolutions": [k10_resolution(sources=[0, MAX_EFFECTS_PER_PLAN])]},
+        rf"operator_sources\[1\] must be in \[0, {MAX_EFFECTS_PER_PLAN - 1}\]",
+        id="source-past-the-plan-bound",
+    ),
+]
+
+
+@pytest.mark.parametrize(("change", "match"), OPERATOR_PLAN_MISFITS)
+def test_an_operator_plan_its_context_or_entry_does_not_explain_fails_loudly(change, match):
+    """Each K10 is named by exactly the resolution of its own finding and round,
+    and its target is in the set the FIX entry allowed, for the recorded
+    reasons and from the recorded issue body; that set never holds the run's
+    own issue or PR."""
+    with pytest.raises(StateError, match=match):
+        load_phase_effects(*_k10_case(**change))
+
+
+def test_only_a_fix_entry_records_operator_targets():
+    """The allowed set is FIX's alone, stored only when set, and round-trips."""
+    observation = EntryObservation.from_dict(operator_observation(), FIX_BINDING)
+    assert observation.operator_targets == OperatorTargets.from_dict(operator_targets(), "t")
+    assert observation.to_dict() == operator_observation()
+    plain = _without(operator_observation(), "operator_targets")
+    loaded = EntryObservation.from_dict(plain, FIX_BINDING)
+    assert loaded.operator_targets is None and loaded.to_dict() == plain
+    review = replace(FIX_BINDING, phase=Phase.REVIEW)
+    with pytest.raises(StateError, match="operator_targets is recorded by a FIX entry only"):
+        EntryObservation.from_dict(operator_observation(phase="REVIEW"), review)
+
+
+def test_the_largest_plan_with_operator_comments_fits_both_bounds():
+    """D2.4 (#243): four operator comments for one finding (at the largest text
+    the parser accepts), one follow-up for each of the other 49 findings and
+    the push are the record bound, and the plan loads with its context and
+    entry within the total size bound. One record more is refused."""
+    assert MAX_EFFECTS_PER_PLAN == 54
+    assert MAX_EFFECTS_PER_PLAN == (MAX_FINDINGS_PER_REVIEW - 1) + MAX_OPERATOR_ACTIONS_PER_FIX + 1
+    text = "x" * MAX_OPERATOR_COMMENT_CHARS
+    targets = (ISSUE3, ISSUE4, EPIC, ISSUE43)
+    records = [
+        operator_record(
+            target=t,
+            position=i,
+            text=text,
+            allowed_by=("epic",) if t == EPIC else ("issue_body",),
+        )
+        for i, t in enumerate(targets)
+    ]
+    start = len(records)
+    others = [f"R1-F{n}" for n in range(2, MAX_FINDINGS_PER_REVIEW + 1)]
+    records += [
+        follow_up_record(finding_id=fid, position=start + i) for i, fid in enumerate(others)
+    ]
+    records.append(push_record(position=len(records)))
+    assert len(records) == MAX_EFFECTS_PER_PLAN
+    context = {
+        **FIX_CONTEXT,
+        "resolutions": [
+            k10_resolution(sources=range(len(targets))),
+            *(
+                fix_resolution(fid, "follow_up_created", follow_up=start + i)
+                for i, fid in enumerate(others)
+            ),
+        ],
+    }
+    raw = [r.to_dict() for r in records]
+    loaded = load_phase_effects(
+        raw,
+        operator_observation(operator_targets((3, 4, 43, 1))),
+        context,
+        replace(FIX_BINDING, open_finding_ids=("R1-F1", *others)),
+    )
+    assert loaded.records == tuple(records)
+    assert plan_size_problem(loaded.records, loaded.context) == ""
+    with pytest.raises(
+        StateError, match=f"holds {MAX_EFFECTS_PER_PLAN + 1} records, over {MAX_EFFECTS_PER_PLAN}"
+    ):
+        load_records([*raw, raw[-1]], FIX_BINDING)
+    with pytest.raises(StateError, match=rf"position must be in \[0, {MAX_EFFECTS_PER_PLAN - 1}\]"):
+        push_record(position=MAX_EFFECTS_PER_PLAN)
+
+
+# -- K10: the allowed set read at FIX entry -----------------------------------------------
+
+
+def test_operator_targets_round_trip_through_json():
+    """Numbers in order of first mention, each with why it is allowed, and the
+    digest of the issue body they were read from; at most MAX_OPERATOR_TARGETS."""
+    loaded = OperatorTargets.from_dict(operator_targets(), "t")
+    assert loaded == OperatorTargets(
+        (3, 4, 1), {3: ("issue_body",), 4: ("issue_body",), 1: ("epic",)}, OPERATOR_BODY_SHA
+    )
+    for raw in (
+        operator_targets(),
+        operator_targets((5,), allowed={5: ["issue_body", "epic"]}),
+        operator_targets(()),
+        operator_targets(range(3, 3 + MAX_OPERATOR_TARGETS)),
+    ):
+        again = OperatorTargets.from_dict(json.loads(json.dumps(raw)), "t")
+        assert again.to_dict() == raw
+
+
+OPERATOR_TARGET_CORRUPTIONS = [
+    pytest.param("3, 4", "must be an object", id="not-an-object"),
+    pytest.param(
+        _without(operator_targets(), "issue_body_sha256"),
+        r"is missing key\(s\) \['issue_body_sha256'\]",
+        id="missing-key",
+    ),
+    pytest.param(
+        {**operator_targets(), "epic": 1}, r"has unknown key\(s\) \['epic'\]", id="unknown-key"
+    ),
+    pytest.param(operator_targets((3, 3, 1)), "numbers repeats a number", id="repeated-number"),
+    pytest.param(
+        {**operator_targets(), "numbers": "3"},
+        f"numbers must be a list of at most {MAX_OPERATOR_TARGETS} numbers",
+        id="numbers-not-a-list",
+    ),
+    pytest.param(
+        operator_targets(range(3, 4 + MAX_OPERATOR_TARGETS)),
+        f"numbers must be a list of at most {MAX_OPERATOR_TARGETS} numbers",
+        id="too-many-numbers",
+    ),
+    pytest.param(
+        {**operator_targets(), "numbers": [3, 4, 0]},
+        r"numbers\[2\] must be >= 1, got 0",
+        id="number-zero",
+    ),
+    pytest.param(
+        {**operator_targets(), "numbers": [3, 4, True]},
+        r"numbers\[2\] must be an integer",
+        id="number-bool",
+    ),
+    pytest.param(
+        {**operator_targets(), "numbers": [3, 4, "1"]},
+        r"numbers\[2\] must be an integer",
+        id="number-text",
+    ),
+    pytest.param(
+        operator_targets((3, 4, 1), allowed={3: ["issue_body"], 4: ["issue_body"]}),
+        "allowed_by must name exactly the numbers, each by its decimal text",
+        id="allowed-by-misses-a-number",
+    ),
+    pytest.param(
+        operator_targets(
+            (3, 4, 1), allowed={3: ["issue_body"], 4: ["issue_body"], 1: ["epic"], 5: ["epic"]}
+        ),
+        "allowed_by must name exactly the numbers, each by its decimal text",
+        id="allowed-by-names-another-number",
+    ),
+    pytest.param(
+        {
+            **operator_targets(),
+            "allowed_by": {"3": ["issue_body"], "4": ["issue_body"], "01": ["epic"]},
+        },
+        "allowed_by must name exactly the numbers, each by its decimal text",
+        id="allowed-by-key-not-decimal",
+    ),
+    pytest.param(
+        {**operator_targets(), "allowed_by": [["issue_body"], ["issue_body"], ["epic"]]},
+        "allowed_by must name exactly the numbers, each by its decimal text",
+        id="allowed-by-not-an-object",
+    ),
+    pytest.param(
+        operator_targets((3, 4, 1), allowed={3: ["issue_body"], 4: [], 1: ["epic"]}),
+        r"allowed_by\[4\] must be a non-empty list",
+        id="no-reason",
+    ),
+    pytest.param(
+        operator_targets((3,), allowed={3: ["epic", "issue_body"]}),
+        r"allowed_by\[3\] must be a non-empty list of \('issue_body', 'epic'\), in that order",
+        id="reasons-out-of-order",
+    ),
+    pytest.param(
+        operator_targets((3,), allowed={3: ["issue_body", "issue_body"]}),
+        r"allowed_by\[3\] must be a non-empty list",
+        id="repeated-reason",
+    ),
+    pytest.param(
+        operator_targets((3,), allowed={3: ["policy"]}),
+        r"allowed_by\[3\] must be a non-empty list",
+        id="unknown-reason",
+    ),
+    pytest.param(
+        operator_targets((3, 4, 1), allowed={3: ["epic"], 4: ["issue_body"], 1: ["epic"]}),
+        "allowed_by names more than one EPIC",
+        id="two-epics",
+    ),
+    pytest.param(
+        operator_targets(digest="A" * 64),
+        "issue_body_sha256 must be a 64-character lowercase SHA-256 hex digest",
+        id="digest",
+    ),
+]
+
+
+@pytest.mark.parametrize(("raw", "match"), OPERATOR_TARGET_CORRUPTIONS)
+def test_corrupt_operator_targets_fail_loudly(raw, match):
+    with pytest.raises(StateError, match=match):
+        OperatorTargets.from_dict(raw, "entry_observation.operator_targets")
+
+
+# -- K10: the action id and the binding -----------------------------------------------------
+
+
+def test_the_operator_action_id_is_deterministic_and_never_an_approvable_id():
+    """``X-`` and 16 hex digits over the owner, identity, target and payload:
+    the same record is the same id in any process, other bytes, another
+    target, finding, round or run are another id, and the ``A-`` form that
+    ``unblock --approve-action`` accepts never matches it."""
+    record = operator_record()
+    again = EffectRecord.from_dict(json.loads(json.dumps(record.to_dict())))
+    parts = (record.identity, record.target, record.payload)
+    x_id = record.action_id
+    assert x_id == again.action_id == operator_action_id(FIX_OWNER, *parts)
+    assert x_id.startswith("X-") and len(x_id) == 18
+    assert OPERATOR_ACTION_ID_RE.match(x_id) and int(x_id[2:], 16) >= 0
+    a_id = acceptance_action_id(FIX_OWNER, *parts)
+    assert a_id != x_id
+    assert ACTION_ID_RE.match(a_id) and not ACTION_ID_RE.match(x_id)
+    assert not OPERATOR_ACTION_ID_RE.match(a_id)
+    others = [
+        operator_record(text=f"{OPERATOR_TEXT} Again."),
+        operator_record(target=ISSUE4),
+        operator_record(finding_id="R1-F2"),
+        operator_record(round_=2, finding_id="R2-F1"),
+        operator_record(by=owner(Phase.FIX, pr_url=PR, run_id="run-2")),
+    ]
+    ids = {x_id, *(o.action_id for o in others)}
+    assert len(ids) == 1 + len(others)
+    assert all(OPERATOR_ACTION_ID_RE.match(i) for i in ids)
+    # The binding is a precondition: binding evidence never changes the id.
+    bound = record.binding_to(K10_BINDING["comment_url"], 400, K10_BINDING["body_sha256"])
+    assert bound.action_id == x_id
+
+
+def test_a_binding_is_recorded_on_an_intended_operator_comment_only():
+    """``binding_to`` pins one comment of the target by URL, id and digest,
+    validated as a load; a settled K10 or another kind is never bound."""
+    record = operator_record()
+    url, digest = K10_BINDING["comment_url"], K10_BINDING["body_sha256"]
+    bound = record.binding_to(url, 400, digest)
+    assert bound.binding == {"comment_url": url, "comment_id": 400, "body_sha256": digest}
+    assert bound.precondition == {**record.precondition, "binding": bound.binding}
+    assert (bound.stage, bound.attempts, bound.payload) == (Stage.INTENDED, 0, record.payload)
+    assert record.binding is None
+    copy = bound.binding
+    assert copy is not None
+    copy["comment_id"] = 1
+    assert bound.binding["comment_id"] == 400  # the property hands out a copy
+    rebound = bound.binding_to(comment_url(ISSUE3, 401), 401, OTHER_DIGEST)
+    assert rebound.binding == {
+        "comment_url": comment_url(ISSUE3, 401),
+        "comment_id": 401,
+        "body_sha256": OTHER_DIGEST,
+    }
+    for settled in (
+        record.observing(exact_evidence(record)),
+        record.conflicting("a human edited it"),
+        acceptance_record(),
+        push_record(),
+    ):
+        with pytest.raises(StateError, match="cannot be bound to evidence"):
+            settled.binding_to(url, 400, digest)
+    with pytest.raises(StateError, match="names a comment on another issue than its target"):
+        record.binding_to(comment_url(ISSUE4, 400), 400, digest)
+    with pytest.raises(StateError, match="names another comment id than its URL's"):
+        record.binding_to(url, 401, digest)
+    with pytest.raises(StateError, match="must be a 64-character lowercase SHA-256 hex digest"):
+        record.binding_to(url, 400, "not a digest")
+
+
+# -- K10: never attempted, driven or issued; verified -------------------------------------
+
+
+@dataclass
+class Decides:
+    """An operation whose reconciliation returns ``decision``; it never writes."""
+
+    decision: Decision
+    reconciled: int = 0
+
+    def reconcile(self, record: EffectRecord) -> Decision:
+        self.reconciled += 1
+        return self.decision
+
+    def issue(self, record: EffectRecord) -> None:
+        raise AssertionError("an operation's write was reached")
+
+
+def test_an_operator_comment_is_never_attempted_driven_or_issued():
+    """The controller never issues K10, under any path: ``attempting`` refuses
+    it, ``drive`` refuses it before any read, save or write, and the
+    operation's ``issue`` raises. Nor is it approved or rebased."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE3, "A related issue")
+    record = operator_record()
+    for each in (record, record.binding_to(K10_BINDING["comment_url"], 400, OTHER_DIGEST)):
+        with pytest.raises(StateError, match="is operator-performed; the controller never issues"):
+            each.attempting()
+    assert issubclass(OperatorPerformedError, StateError)
+    saves = saves_for(fake)
+    stub = Decides(Decision(Action.ISSUE))
+    with pytest.raises(OperatorPerformedError, match="verified, never driven") as info:
+        drive(record, stub, saves)
+    assert record.action_id in str(info.value)
+    assert stub.reconciled == 0 and saves.log == []
+    op = operation_for(record, fake)
+    assert isinstance(op, OperatorCommentOp)
+    with pytest.raises(OperatorPerformedError, match="verified, never driven"):
+        drive(record, op, saves)
+    with pytest.raises(OperatorPerformedError, match=f"{record.action_id}.*never posts it"):
+        op.issue(record)
+    assert saves.log == [] and fake.effect_writes == [] and fake.comments.get(ISSUE3) is None
+    assert ("get_issue", ISSUE3) not in fake.calls
+    with pytest.raises(StateError, match="cannot be approved"):
+        record.approving()
+    with pytest.raises(StateError, match="cannot be rebased"):
+        record.rebasing("A human's body.")
+
+
+def test_verify_saves_an_observation_once_and_never_a_hold():
+    """A hold changes nothing and saves nothing; the observation is saved as
+    made, once; an observed record is never read or saved again."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE3, "A related issue")
+    record = operator_record()
+    op = OperatorCommentOp(fake, plan=[record])
+    saves = saves_for(fake)
+    held = verify(record, op, saves)
+    assert held.record == record and not held.issued and saves.log == []
+    assert f"({record.action_id}): awaiting the operator" in held.held
+    url = fake.add_comment(ISSUE3, 300, record.body).url
+    observed = verify(record, op, saves)
+    assert observed.record.stage is Stage.OBSERVED and not observed.issued and not observed.held
+    assert observed.record.observed == {
+        "url": url,
+        "comment_id": 300,
+        "evidence": "exact",
+        "body_sha256": sha256_text(record.body),
+    }
+    assert saves.stages == [(Stage.OBSERVED, 0, 0)]
+    calls = len(fake.calls)
+    again = verify(observed.record, op, saves)
+    assert again.record == observed.record and len(saves.log) == 1
+    assert fake.calls[calls:] == [] and fake.effect_writes == []
+
+
+def test_verify_saves_a_conflict_once():
+    """A conflict is saved as made, once; verifying the conflict again saves
+    nothing. ``unblock`` reopens it as intended, never attempted."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE3, "A related issue")
+    record = operator_record()
+    edited = fake.add_comment(ISSUE3, 301, record.body.replace(OPERATOR_TEXT, "Edited.")).url
+    op = OperatorCommentOp(fake, plan=[record])
+    saves = saves_for(fake)
+    first = verify(record, op, saves)
+    assert first.record.stage is Stage.CONFLICT and not first.issued
+    assert edited in first.record.reason and record.action_id in first.record.reason
+    assert saves.stages == [(Stage.CONFLICT, 0, 0)]
+    second = verify(first.record, op, saves)
+    assert second.record == first.record and len(saves.log) == 1
+    reopened = first.record.reopened()
+    assert (reopened.stage, reopened.attempts, reopened.reason) == (Stage.INTENDED, 0, "")
+    assert fake.effect_writes == []
+
+
+@pytest.mark.parametrize("action", [Action.ISSUE, Action.REBASE])
+def test_verify_refuses_a_decision_to_write(action):
+    """No K10 decision ever issues; one that did would be a controller bug,
+    refused before anything is saved or sent."""
+    stub = Decides(Decision(action, rebase_body="x"))
+    log: list[EffectRecord] = []
+    with pytest.raises(OperatorPerformedError, match=f"a verification decided to {action.value}"):
+        verify(operator_record(), stub, log.append)
+    assert log == [] and stub.reconciled == 1
+
+
+def test_verify_is_for_an_operator_performed_record_only():
+    stub = Decides(Decision(Action.OBSERVE, observed={"url": comment_url(ISSUE, 300)}))
+    log: list[EffectRecord] = []
+    for record in (acceptance_record(), push_record()):
+        with pytest.raises(OperatorPerformedError, match="is not operator-performed"):
+            verify(record, stub, log.append)
+    assert log == [] and stub.reconciled == 0
+
+
+# -- K10: the verification table (spec section 7.4) ---------------------------------------
+
+
+def k10_listed(cid: int, body: str, target: str = ISSUE3) -> Listed:
+    return Listed(url=comment_url(target, cid), comment_id=cid, body=body)
+
+
+def decide_k10(
+    record: EffectRecord,
+    *,
+    own: Any = (),
+    misplaced: Any = (),
+    listing: Any = None,
+    defects: Any = (),
+    target_problem: str = "",
+) -> Decision:
+    """``decide_operator_comment``; the listing defaults to every comment named."""
+    return decide_operator_comment(
+        record,
+        own=list(own),
+        misplaced=list(misplaced),
+        listing=[*own, *misplaced] if listing is None else list(listing),
+        defects=list(defects),
+        target_problem=target_problem,
+    )
+
+
+CHATTER = k10_listed(299, "A comment carrying no marker.")
+
+
+def test_exactly_one_comment_with_the_exact_payload_is_exact_evidence():
+    record = operator_record()
+    exact = k10_listed(300, record.body)
+    decision = decide_k10(record, own=[exact], listing=[CHATTER, exact])
+    assert decision == Decision(Action.OBSERVE, observed=exact_evidence(record))
+    assert record.observing(decision.observed or {}).observed == exact_evidence(record)
+
+
+@pytest.mark.parametrize(
+    ("edit", "only_whitespace"),
+    [
+        pytest.param(lambda b: b.replace(OPERATOR_TEXT, "Edited by hand."), False, id="text"),
+        pytest.param(lambda b: b.replace("is applied", "is applied!"), False, id="punctuation"),
+        pytest.param(lambda b: b.replace("\n", "\r\n"), True, id="crlf"),
+        pytest.param(lambda b: b.replace("\n", "\r"), True, id="cr"),
+        pytest.param(lambda b: b.replace("\n", "  \n"), True, id="trailing-spaces"),
+        pytest.param(lambda b: f"{b}\n", True, id="trailing-newline"),
+    ],
+)
+def test_one_comment_with_the_key_and_other_bytes_is_a_conflict(edit, only_whitespace):
+    """Byte equality is the comparison of record; the reason says when the
+    bytes differ only in line endings or trailing whitespace."""
+    record = operator_record()
+    body = edit(record.body)
+    assert body != record.body
+    assert (normalized_comment_text(body) == normalized_comment_text(record.body)) is (
+        only_whitespace
+    )
+    edited = k10_listed(301, body)
+    decision = decide_k10(record, own=[edited], listing=[CHATTER, edited])
+    assert decision.action is Action.CONFLICT and decision.observed is None
+    assert f"({record.action_id}): {edited.url} carries its marker but" in decision.reason
+    whitespace = "only in line endings or trailing whitespace"
+    assert (whitespace in decision.reason) is only_whitespace
+    assert ("its body is not the prepared payload" in decision.reason) is not only_whitespace
+
+
+def test_two_comments_with_the_key_are_a_conflict_naming_both():
+    record = operator_record()
+    first, second = k10_listed(300, record.body), k10_listed(301, record.body)
+    decision = decide_k10(record, own=[first, second])
+    assert decision.action is Action.CONFLICT
+    assert f"2 comments carry its marker ({first.url}, {second.url})" in decision.reason
+
+
+def test_a_misplaced_payload_of_another_action_of_the_plan_is_a_conflict_naming_each():
+    record = operator_record()
+    sibling = operator_record(target=ISSUE4, position=1)
+    misplaced = [k10_listed(302, sibling.body), k10_listed(303, sibling.body)]
+    decision = decide_k10(record, misplaced=misplaced)
+    assert decision.action is Action.CONFLICT
+    assert (
+        f"{misplaced[0].url}, {misplaced[1].url} on this issue carries the marker of another "
+        "operator action of this plan"
+    ) in decision.reason
+    assert "a misplaced payload" in decision.reason
+
+
+def test_defective_operator_markers_in_the_listing_are_a_conflict_naming_them():
+    record = operator_record()
+    defects = [
+        f"comment {comment_url(ISSUE3, 303)}: ai-operator-comment marker payload is not valid JSON",
+        f"comment {comment_url(ISSUE3, 304)}: carries 2 ai-operator-comment markers",
+    ]
+    decision = decide_k10(record, defects=defects)
+    assert decision.action is Action.CONFLICT
+    assert "the target's comments cannot be read unambiguously" in decision.reason
+    assert all(d in decision.reason for d in defects)
+
+
+def test_the_bound_comment_with_its_digest_unchanged_is_bound_evidence():
+    record = operator_record()
+    evidence = k10_listed(400, EVIDENCE_TEXT)
+    bound = record.binding_to(evidence.url, 400, sha256_text(EVIDENCE_TEXT))
+    decision = decide_k10(bound, listing=[CHATTER, evidence])
+    assert decision == Decision(Action.OBSERVE, observed=K10_BOUND_EVIDENCE)
+    assert bound.observing(decision.observed or {}).observed == K10_BOUND_EVIDENCE
+    # The exact payload is exact evidence, whether or not a binding is recorded.
+    exact = k10_listed(300, record.body)
+    decision = decide_k10(bound, own=[exact], listing=[evidence, exact])
+    assert decision == Decision(Action.OBSERVE, observed=exact_evidence(record))
+
+
+@pytest.mark.parametrize("now", ["edited", "deleted"])
+def test_a_bound_comment_that_changed_or_is_gone_is_held_naming_both_digests(now):
+    record = operator_record()
+    url = comment_url(ISSUE3, 400)
+    bound = record.binding_to(url, 400, sha256_text(EVIDENCE_TEXT))
+    listing = [CHATTER]
+    if now == "edited":
+        listing.append(k10_listed(400, f"{EVIDENCE_TEXT} Edited."))
+    decision = decide_k10(bound, listing=listing)
+    assert decision.action is Action.HOLD and decision.observed is None
+    seen = (
+        sha256_text(f"{EVIDENCE_TEXT} Edited.") if now == "edited" else "none: the comment is gone"
+    )
+    assert (
+        f"the bound comment {url} changed since it was bound "
+        f"(bound sha256 {sha256_text(EVIDENCE_TEXT)}, now {seen})"
+    ) in decision.reason
+
+
+def test_nothing_on_the_target_is_a_hold_awaiting_the_operator():
+    record = operator_record()
+    decision = decide_k10(record, listing=[CHATTER])
+    assert decision == Decision(
+        Action.HOLD,
+        reason=(
+            f"operator_comment effect 0 on {ISSUE3} ({record.action_id}): awaiting the "
+            "operator; no comment on the target carries it yet"
+        ),
+    )
+
+
+def test_a_target_that_no_longer_qualifies_is_a_hold_naming_it():
+    """A transferred, deleted or unreadable target holds: not even the exact
+    payload on it is adopted, and nothing was verified."""
+    record = operator_record()
+    problem = f"issue {ISSUE3} is not found (deleted, or not readable with this token)"
+    for own in ([], [k10_listed(300, record.body)]):
+        decision = decide_k10(record, own=own, target_problem=problem)
+        assert decision.action is Action.HOLD and decision.observed is None
+        assert f"({record.action_id}): {problem}; nothing was verified" in decision.reason
+
+
+def test_a_settled_operator_comment_is_never_decided_again():
+    record = operator_record()
+    observed = record.observing(exact_evidence(record))
+    assert decide_k10(observed) == Decision(Action.DONE, observed=exact_evidence(record))
+    conflict = record.conflicting("a human edited it")
+    exact = k10_listed(300, record.body)
+    settled = Decision(Action.CONFLICT, reason="a human edited it")
+    assert decide_k10(conflict, own=[exact]) == settled
+
+
+def _conflict_over_a_match(match: str, conflict: str) -> tuple[EffectRecord, list[Listed], dict]:
+    """A listing holding an exact or bound match (``own`` of the match alone),
+    and the decision's arguments once one conflict row is added to it."""
+    record = operator_record()
+    evidence = k10_listed(400, EVIDENCE_TEXT)
+    if match == "bound":
+        record = record.binding_to(evidence.url, 400, sha256_text(EVIDENCE_TEXT))
+        own: list[Listed] = []
+        listing = [evidence]
+    else:
+        own = [k10_listed(300, record.body)]
+        listing = list(own)
+    matched = list(own)
+    misplaced: list[Listed] = []
+    defects: list[str] = []
+    if conflict == "misplaced":
+        misplaced = [k10_listed(302, operator_record(target=ISSUE4, position=1).body)]
+    elif conflict == "two-with-the-key":
+        own += [k10_listed(301, record.body), k10_listed(305, record.body)][: 2 - len(own)]
+    elif conflict == "other-bytes":
+        own = [k10_listed(301, record.body.replace(OPERATOR_TEXT, "Edited."))]
+    else:
+        defects = [f"comment {comment_url(ISSUE3, 303)}: ai-operator-comment marker is broken"]
+    kwargs = {
+        "own": own,
+        "misplaced": misplaced,
+        "listing": [*listing, *(c for c in own if c not in listing), *misplaced],
+        "defects": defects,
+    }
+    return record, matched, kwargs
+
+
+@pytest.mark.parametrize(
+    ("match", "conflict"),
+    [
+        ("exact", "misplaced"),
+        ("exact", "two-with-the-key"),
+        ("exact", "defective-marker"),
+        ("bound", "misplaced"),
+        ("bound", "two-with-the-key"),
+        ("bound", "other-bytes"),
+        ("bound", "defective-marker"),
+    ],
+)
+def test_a_conflict_row_wins_over_an_exact_or_bound_match(match, conflict):
+    """Conflict rows are evaluated first: an exact or bound match never hides
+    a misplaced payload, a second comment with the key, other bytes under the
+    key or a defective marker."""
+    record, matched, kwargs = _conflict_over_a_match(match, conflict)
+    without_conflict = decide_k10(record, own=matched, listing=kwargs["listing"])
+    assert without_conflict.action is Action.OBSERVE
+    assert without_conflict.observed is not None
+    assert without_conflict.observed["evidence"] == match
+    decision = decide_k10(record, **kwargs)
+    assert decision.action is Action.CONFLICT and decision.observed is None
+
+
+# -- K10: the operation, end to end against FakeGitHub ------------------------------------
+
+
+def operator_world(*targets: str) -> tuple[FakeGitHub, tuple[EffectRecord, ...]]:
+    """A FakeGitHub holding each target issue, and a plan of one K10 per target."""
+    targets = targets or (ISSUE3, ISSUE4)
+    fake = FakeGitHub()
+    for target in targets:
+        if target not in fake.issues:
+            fake.add_issue(target, "A related issue")
+    plan = tuple(operator_record(target=t, position=i) for i, t in enumerate(targets))
+    return fake, plan
+
+
+@pytest.mark.parametrize(
+    ("post", "action", "says"),
+    [
+        pytest.param(lambda r, s: [], Action.HOLD, "awaiting the operator", id="nothing"),
+        pytest.param(
+            lambda r, s: [(301, r.body.replace(OPERATOR_TEXT, "Edited by hand."))],
+            Action.CONFLICT,
+            f"{comment_url(ISSUE3, 301)} carries its marker but its body is not the prepared",
+            id="other-bytes",
+        ),
+        pytest.param(
+            lambda r, s: [(301, r.body.replace("\n", "\r\n"))],
+            Action.CONFLICT,
+            f"{comment_url(ISSUE3, 301)} carries its marker but its bytes differ from the "
+            "prepared payload only in line endings or trailing whitespace",
+            id="line-endings",
+        ),
+        pytest.param(
+            lambda r, s: [(300, r.body), (301, r.body)],
+            Action.CONFLICT,
+            f"2 comments carry its marker ({comment_url(ISSUE3, 300)}, {comment_url(ISSUE3, 301)})",
+            id="two-copies",
+        ),
+        pytest.param(
+            lambda r, s: [(300, r.body), (302, s.body)],
+            Action.CONFLICT,
+            f"{comment_url(ISSUE3, 302)} on this issue carries the marker of another operator "
+            "action of this plan",
+            id="misplaced-sibling",
+        ),
+        pytest.param(
+            lambda r, s: [(300, r.body), (303, "Mine.\n\n<!-- ai-operator-comment: {oops} -->")],
+            Action.CONFLICT,
+            f"comment {comment_url(ISSUE3, 303)}: ai-operator-comment marker payload is not "
+            "valid JSON",
+            id="defective-marker",
+        ),
+        pytest.param(
+            lambda r, s: [(300, f"{r.body}{APPEND_SEPARATOR}{s.marker}")],
+            Action.CONFLICT,
+            f"comment {comment_url(ISSUE3, 300)}: carries 2 ai-operator-comment markers",
+            id="two-markers-in-one-comment",
+        ),
+    ],
+)
+def test_the_operation_decides_on_the_targets_complete_listing(post, action, says):
+    """End to end over FakeGitHub: the operation reads the target and its
+    complete comment listing, and decides by the table; it never writes."""
+    fake, plan = operator_world()
+    record, sibling = plan
+    fake.add_comment(ISSUE3, 299, CHATTER.body)
+    for cid, body in post(record, sibling):
+        fake.add_comment(ISSUE3, cid, body)
+    decision = OperatorCommentOp(fake, plan=plan).reconcile(record)
+    assert decision.action is action and says in decision.reason
+    assert record.action_id in decision.reason
+    assert ("get_issue", ISSUE3) in fake.calls and ("get_issue_comments", ISSUE3) in fake.calls
+    assert fake.effect_writes == []
+
+
+@pytest.mark.parametrize("state", ["OPEN", "CLOSED"])
+def test_the_exact_payload_on_the_target_is_verified_whoever_posted_it(state):
+    """The target may be open or closed; the sibling's payload on its own
+    target is no concern of this record."""
+    fake, plan = operator_world()
+    record, sibling = plan
+    fake.issues[ISSUE3] = replace(fake.issues[ISSUE3], state=state)
+    fake.add_comment(ISSUE3, 299, CHATTER.body)
+    url = fake.add_comment(ISSUE3, 300, record.body).url
+    fake.add_comment(ISSUE4, 310, sibling.body)
+    saves = saves_for(fake)
+    driven = verify(record, OperatorCommentOp(fake, plan=plan), saves)
+    assert driven.record.observed == {**exact_evidence(record), "url": url}
+    assert saves.stages == [(Stage.OBSERVED, 0, 0)]
+    assert not driven.issued and not driven.held and fake.effect_writes == []
+
+
+@pytest.mark.parametrize("now", ["unchanged", "edited", "deleted"])
+def test_a_bound_comment_is_verified_by_its_digest_end_to_end(now):
+    fake, plan = operator_world()
+    url = comment_url(ISSUE3, 400)
+    record = plan[0].binding_to(url, 400, sha256_text(EVIDENCE_TEXT))
+    if now != "deleted":
+        text = EVIDENCE_TEXT if now == "unchanged" else f"{EVIDENCE_TEXT} Edited."
+        fake.add_comment(ISSUE3, 400, text)
+    saves = saves_for(fake)
+    driven = verify(record, OperatorCommentOp(fake, plan=plan), saves)
+    if now == "unchanged":
+        assert driven.record.observed == K10_BOUND_EVIDENCE
+        assert saves.stages == [(Stage.OBSERVED, 0, 0)]
+        return
+    assert driven.record == record and saves.log == []
+    assert f"the bound comment {url} changed since it was bound" in driven.held
+    assert f"bound sha256 {sha256_text(EVIDENCE_TEXT)}" in driven.held
+
+
+def test_a_misplaced_payload_blocks_the_issue_it_landed_on_not_its_own_action():
+    """The sibling's payload posted on #3 is a conflict for #3's action; the
+    sibling, whose own target #4 holds nothing, still awaits the operator."""
+    fake, plan = operator_world()
+    record, sibling = plan
+    fake.add_comment(ISSUE3, 300, record.body)
+    misplaced = fake.add_comment(ISSUE3, 302, sibling.body).url
+    op = OperatorCommentOp(fake, plan=plan)
+    saves = saves_for(fake)
+    first = verify(record, op, saves)
+    assert first.record.stage is Stage.CONFLICT and misplaced in first.record.reason
+    second = verify(sibling, op, saves)
+    assert second.record == sibling and "awaiting the operator" in second.held
+    assert saves.stages == [(Stage.CONFLICT, 0, 0)]
+
+
+def test_markers_of_earlier_rounds_other_plans_and_siblings_never_block_an_action():
+    """Only this record's key and the keys of this plan's actions meant for
+    other issues count on a target: an earlier round's action, another PR's
+    or run issue's, one for an issue outside the plan, and a sibling meant for
+    this same target are other keys, and never conflict."""
+    fake, _ = operator_world()
+    record = operator_record(round_=2, finding_id="R2-F1")
+    sibling_here = operator_record(round_=2, finding_id="R2-F2", position=1)
+    plan = (record, sibling_here)
+    unrelated = [
+        operator_record(round_=1, finding_id="R1-F1").body,
+        operator_comment_body(OPERATOR_TEXT, ISSUE, PR43, 2, "R2-F1", ISSUE3),
+        operator_comment_body(OPERATOR_TEXT, ISSUE4, PR, 2, "R2-F1", ISSUE3),
+        operator_comment_body(OPERATOR_TEXT, ISSUE, PR, 2, "R2-F1", ISSUE44),
+        sibling_here.body,
+    ]
+    for i, body in enumerate(unrelated):
+        fake.add_comment(ISSUE3, 290 + i, body)
+    op = OperatorCommentOp(fake, plan=plan)
+    held = op.reconcile(record)
+    assert held.action is Action.HOLD and "awaiting the operator" in held.reason
+    url = fake.add_comment(ISSUE3, 300, record.body).url
+    observed = op.reconcile(record)
+    assert observed == Decision(Action.OBSERVE, observed={**exact_evidence(record), "url": url})
+    sibling_seen = op.reconcile(sibling_here)
+    assert sibling_seen.action is Action.OBSERVE and sibling_seen.observed is not None
+    assert sibling_seen.observed["url"] == comment_url(ISSUE3, 294)
+
+
+def _deleted(fake: FakeGitHub) -> None:
+    del fake.issues[ISSUE3]
+
+
+def _answers_as_a_pr(fake: FakeGitHub) -> None:
+    fake.get_issue_errors[ISSUE3] = GitHubWrongTargetError(
+        f"issue {ISSUE3}: `gh` answered with pull request https://github.com/owner/repo/pull/3",
+        "https://github.com/owner/repo/pull/3",
+    )
+
+
+def _answers_as_another_issue(fake: FakeGitHub) -> None:
+    fake.get_issue_errors[ISSUE3] = GitHubWrongTargetError(
+        f"issue {ISSUE3}: `gh` answered with https://github.com/other/repo/issues/9",
+        "https://github.com/other/repo/issues/9",
+    )
+
+
+def _moved(fake: FakeGitHub) -> None:
+    fake.issues[ISSUE3] = replace(fake.issues[ISSUE3], repository="other/repo")
+
+
+def _forbidden(fake: FakeGitHub) -> None:
+    fake.get_issue_errors[ISSUE3] = GitHubError(
+        f"HTTP 403: Resource not accessible ({CREDENTIAL_TEXT})"
+    )
+
+
+@pytest.mark.parametrize(
+    ("break_target", "says"),
+    [
+        pytest.param(
+            _deleted,
+            f"issue {ISSUE3} is not found (deleted, or not readable with this token)",
+            id="deleted",
+        ),
+        pytest.param(
+            _answers_as_a_pr,
+            f"issue {ISSUE3} answers as a pull request (https://github.com/owner/repo/pull/3)",
+            id="a-pull-request",
+        ),
+        pytest.param(
+            _answers_as_another_issue,
+            f"issue {ISSUE3} answers as another object (https://github.com/other/repo/issues/9)",
+            id="transferred",
+        ),
+        pytest.param(
+            _moved,
+            f"issue {ISSUE3} is no longer in the run's repository owner/repo",
+            id="another-repository",
+        ),
+        pytest.param(
+            _forbidden, f"issue {ISSUE3} cannot be read (HTTP 403", id="conclusively-unreadable"
+        ),
+    ],
+)
+def test_a_target_that_no_longer_qualifies_is_held_without_reading_its_listing(break_target, says):
+    """Every conclusive target problem is a hold naming it: nothing is saved,
+    the listing is not read, and even the exact payload is not adopted."""
+    fake, plan = operator_world()
+    record = plan[0]
+    fake.add_comment(ISSUE3, 300, record.body)
+    break_target(fake)
+    saves = saves_for(fake)
+    driven = verify(record, OperatorCommentOp(fake, plan=plan), saves)
+    assert driven.record == record and saves.log == [] and not driven.issued
+    assert says in driven.held and "nothing was verified" in driven.held
+    assert SECRET not in driven.held
+    assert ("get_issue_comments", ISSUE3) not in fake.calls
+
+
+def _issue_unavailable(fake: FakeGitHub) -> None:
+    fake.get_issue_errors[ISSUE3] = GitHubUnavailableError("timed out")
+
+
+def _listing_unavailable(fake: FakeGitHub) -> None:
+    fake.comments_error = GitHubUnavailableError("connection reset")
+
+
+def _listing_refused(fake: FakeGitHub) -> None:
+    fake.comments_error = GitHubError("the listing cannot be completed")
+
+
+@pytest.mark.parametrize(
+    ("fail", "error"),
+    [
+        pytest.param(_issue_unavailable, GitHubUnavailableError, id="target-unavailable"),
+        pytest.param(_listing_unavailable, GitHubUnavailableError, id="listing-unavailable"),
+        pytest.param(_listing_refused, GitHubError, id="listing-conclusively-unreadable"),
+    ],
+)
+def test_a_target_or_listing_that_cannot_be_read_now_raises_with_nothing_saved(fail, error):
+    """A transient failure propagates for the caller to retry; a listing that
+    cannot be read to its end is never read as "nothing posted yet"."""
+    fake, plan = operator_world()
+    record = plan[0]
+    fake.add_comment(ISSUE3, 300, record.body)
+    fail(fake)
+    saves = saves_for(fake)
+    with pytest.raises(error):
+        verify(record, OperatorCommentOp(fake, plan=plan), saves)
+    assert saves.log == [] and fake.effect_writes == []
+
+
+# -- K10: the operation behind the real client ---------------------------------------------
+
+
+class IssueConversation(CommentConversation):
+    """An issue's conversation that also answers ``gh issue view`` for it.
+
+    ``answers`` is the URL GitHub answers the view with: the issue itself,
+    or a pull request or transferred issue in its place.
+    """
+
+    def __init__(self, parent_url: str, bodies: list[str], *, answers: str = "") -> None:
+        super().__init__(parent_url, bodies)
+        self.answers = answers or parent_url
+        self.views = 0
+
+    def __call__(self, req: ExecutionRequest) -> ExecutionResult:
+        if req.command[1:3] == ["issue", "view"]:
+            self.views += 1
+            number = int(self.answers.rsplit("/", 1)[1])
+            row = {"url": self.answers, "number": number, "title": "t", "state": "OPEN", "body": ""}
+            return self._reply(json.dumps(row))
+        return super().__call__(req)
+
+
+def test_an_operator_comment_past_the_first_hundred_is_verified_through_the_real_client():
+    """The verification walks every page of the target's conversation: the
+    exact payload as the 151st comment is observed, and nothing is posted."""
+    record = operator_record()
+    conversation = IssueConversation(ISSUE3, FILLER)
+    landed = conversation.add(record.body)
+    conversation.add("A later comment.")
+    github = GitHubClient(runner=conversation, retry_delay_seconds=0)
+    saves: list[EffectRecord] = []
+    driven = verify(record, OperatorCommentOp(github, plan=[record]), count_saves(saves))
+    assert driven.record.observed == {**exact_evidence(record, 5150), "url": landed}
+    assert [r.stage for r in saves] == [Stage.OBSERVED]
+    assert (conversation.views, conversation.pages_read, conversation.creates) == (1, 2, 0)
+
+
+@pytest.mark.parametrize(
+    ("answered", "says"),
+    [
+        pytest.param(
+            "https://github.com/owner/repo/pull/3",
+            "answers as a pull request (https://github.com/owner/repo/pull/3)",
+            id="a-pull-request",
+        ),
+        pytest.param(
+            "https://github.com/other/repo/issues/9",
+            "answers as another object (https://github.com/other/repo/issues/9)",
+            id="transferred",
+        ),
+    ],
+)
+def test_a_target_github_answers_with_another_object_is_held_through_the_real_client(
+    answered, says
+):
+    """``gh issue view`` of the target answering with a pull request or a
+    transferred issue is GitHubWrongTargetError, a hold naming the answer."""
+    record = operator_record()
+    conversation = IssueConversation(ISSUE3, [record.body], answers=answered)
+    github = GitHubClient(runner=conversation, retry_delay_seconds=0)
+    saves: list[EffectRecord] = []
+    driven = verify(record, OperatorCommentOp(github, plan=[record]), count_saves(saves))
+    assert driven.record == record and saves == []
+    assert f"issue {ISSUE3} {says}" in driven.held
+    assert (conversation.views, conversation.pages_read) == (1, 0)

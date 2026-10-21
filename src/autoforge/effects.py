@@ -56,17 +56,20 @@ from .claims import (
     ACCEPTANCE,
     FOLLOW_UP,
     IMPLEMENTATION,
+    OPERATOR_COMMENT,
     PROGRESS,
     REVIEW,
     MarkerKind,
     render_acceptance_marker,
     render_follow_up_marker,
     render_implementation_marker,
+    render_operator_comment_marker,
     render_progress_marker,
     render_review_marker,
     scan,
 )
 from .errors import ConfigurationError, ControlResultValidationError, StateError
+from .read_context import MAX_LISTED_ISSUES
 from .redaction import MAX_GROWTH_FACTOR, redact
 from .replan_txn import MARKER_RE as REPLAN_MARKER_RE
 from .replan_txn import TRANSACTION_ID_RE, scan_replan_markers
@@ -77,6 +80,7 @@ from .result_parser import (
     MAX_FINDING_ID_CHARS,
     MAX_FINDINGS_PER_REVIEW,
     MAX_FIX_RATIONALE_CHARS,
+    MAX_OPERATOR_ACTIONS_PER_FIX,
     MAX_RESOLUTIONS_PER_FIX,
     MAX_ROADMAP_SECTION_CHARS,
     MAX_URL_CHARS,
@@ -85,11 +89,13 @@ from .result_parser import (
     ReviewResult,
     check_published_finding,
     markdown_code_span,
+    operator_markup_problem,
     published_markdown_problem,
     published_payload_problem,
     validate_acceptance_body,
     validate_follow_up_body,
     validate_follow_up_title,
+    validate_operator_comment_body,
     validate_pr_body,
     validate_pr_title,
     validate_progress_text,
@@ -111,9 +117,11 @@ MAX_EFFECT_ATTEMPTS = 2
 MAX_BODY_CHARS = 65536
 MAX_TITLE_CHARS = 256
 
-# D2.4: the largest plan is FIX, one push plus one follow-up effect per open
-# finding.
-MAX_EFFECTS_PER_PLAN = 1 + MAX_FINDINGS_PER_REVIEW
+# D2.4: the largest plan is FIX: one push, one follow-up effect per deferred
+# finding, and (#243) up to ``MAX_OPERATOR_ACTIONS_PER_FIX`` operator comments
+# for one more finding, so 49 K5/K6, 4 K10 and one K1 (54). A K9 plan (one
+# acceptance comment for one finding) is smaller.
+MAX_EFFECTS_PER_PLAN = (MAX_FINDINGS_PER_REVIEW - 1) + MAX_OPERATOR_ACTIONS_PER_FIX + 1
 
 # D2.4's total bound, over every payload string of the plan and the
 # completion context counted at its stored bound. ``json.dumps`` writes the
@@ -329,6 +337,69 @@ def acceptance_comment_problem(body: str, finding_id: str) -> str | None:
     )
 
 
+def operator_comment_header(
+    issue_url: str, pr_url: str, round_: int, finding_id: str, target_url: str
+) -> str:
+    """The controller's line that opens an operator comment (K10, #243).
+
+    It names the run's issue, the PR, the review round, the finding and the
+    issue the comment is for, and says whose the text below it is: the FIX
+    agent's, prepared for the operator to post, and verified (never posted)
+    by the controller.
+    """
+    return (
+        f"**AutoForge operator action** for finding `{finding_id}` of review round {round_} "
+        f"of {parse_pr_url(pr_url).canonical} ({parse_issue_url(issue_url).canonical}), on "
+        f"{parse_issue_url(target_url).canonical}. The text below was prepared by the FIX "
+        "agent for the operator to post; the controller only verifies it."
+    )
+
+
+def operator_comment_body(
+    text: str, issue_url: str, pr_url: str, round_: int, finding_id: str, target_url: str
+) -> str:
+    """K10's payload: the controller's header, the agent's text, then the action's marker."""
+    return (
+        f"{operator_comment_header(issue_url, pr_url, round_, finding_id, target_url)}"
+        f"{APPEND_SEPARATOR}{text}{APPEND_SEPARATOR}"
+        f"{render_operator_comment_marker(issue_url, pr_url, round_, finding_id, target_url)}"
+    )
+
+
+def operator_comment_problem(body: str, finding_id: str, target_url: str) -> str | None:
+    """Why the rendered operator comment may not be offered for posting, or ``None`` (#243).
+
+    The comment as a whole (ADR 0004 D8.2, D8.3, D8.6): the credential rule
+    on the whole payload, the mention, image and raw-HTML rules on
+    everything before the marker, and GitHub's comment limit. Names the
+    payload, never the text.
+    """
+    subject = f"operator comment of {finding_id} for {target_url}"
+    if len(body) > MAX_BODY_CHARS:
+        return (
+            f"the rendered {subject!r} is {len(body)} characters, over GitHub's comment limit "
+            f"of {MAX_BODY_CHARS}; shorten the operator_acceptance body and re-emit the "
+            "CONTROL_RESULT"
+        )
+    marker_at = body.rfind(APPEND_SEPARATOR)
+    markdown = body[:marker_at] if marker_at >= 0 else body
+    return (
+        published_payload_problem(subject, body)
+        or published_markdown_problem(subject, markdown)
+        or operator_markup_problem(f"rendered {subject}", markdown)
+    )
+
+
+def normalized_comment_text(text: str) -> str:
+    """``text`` with CRLF/CR line endings as LF and trailing whitespace dropped per line.
+
+    Never a comparison of record (K10 compares exact bytes): it only lets a
+    conflict reason say that two bodies differ in nothing else (#243).
+    """
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return "\n".join(line.rstrip() for line in lines).rstrip()
+
+
 # -- closed sets -------------------------------------------------------------------
 
 
@@ -344,6 +415,7 @@ class EffectKind(StrEnum):
     REPLACEMENT_PR = "replacement_pr"  # K7
     PROGRESS_COMMENT = "progress_comment"  # K8
     ACCEPTANCE_COMMENT = "acceptance_comment"  # K9 (#211)
+    OPERATOR_COMMENT = "operator_comment"  # K10 (#243): operator-performed, never issued
 
 
 class Stage(StrEnum):
@@ -375,6 +447,7 @@ KIND_PHASES: Mapping[EffectKind, frozenset[Phase]] = {
     EffectKind.REPLACEMENT_PR: frozenset({Phase.REPLAN_REEXECUTE}),
     EffectKind.PROGRESS_COMMENT: frozenset({Phase.UPDATE_EPIC}),
     EffectKind.ACCEPTANCE_COMMENT: frozenset({Phase.FIX}),
+    EffectKind.OPERATOR_COMMENT: frozenset({Phase.FIX}),
 }
 
 # D13.3: the contract a launch ran under, recorded in every pre-launch save of
@@ -611,6 +684,46 @@ def _approved_action_id(value: object, what: str) -> None:
         _fail(what, "must be empty or an action id of the form A-<16 hex>")
 
 
+# K10 (#243): the action id prefix, distinct from K9's, so no K10 id ever
+# matches ``--approve-action``; why a target was allowed; and the evidence
+# class an observation records.
+OPERATOR_ACTION_ID_RE = re.compile(r"^X-[0-9a-f]{16}\Z")
+ALLOWED_BY_ISSUE_BODY = "issue_body"
+ALLOWED_BY_EPIC = "epic"
+ALLOWED_BY = (ALLOWED_BY_ISSUE_BODY, ALLOWED_BY_EPIC)
+EVIDENCE_EXACT = "exact"
+EVIDENCE_BOUND = "bound"
+EVIDENCE_CLASSES = (EVIDENCE_EXACT, EVIDENCE_BOUND)
+_BINDING_KEYS = ("comment_url", "comment_id", "body_sha256")
+
+
+def _allowed_by(value: object, what: str) -> None:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(v not in ALLOWED_BY for v in value)
+        or value != sorted(set(value), key=ALLOWED_BY.index)
+    ):
+        _fail(what, f"must be a non-empty list of {ALLOWED_BY}, in that order, without repeats")
+
+
+def _evidence(value: object, what: str) -> None:
+    if value not in EVIDENCE_CLASSES:
+        _fail(what, f"must be one of {EVIDENCE_CLASSES}")
+
+
+def _binding(value: object, what: str) -> None:
+    """K10's operator binding: ``null``, or the comment the operator bound (#243)."""
+    if value is None:
+        return
+    data = _exact(value, _BINDING_KEYS, what)
+    _comment_url(data["comment_url"], f"{what}.comment_url")
+    _number(data["comment_id"], f"{what}.comment_id")
+    _digest(data["body_sha256"], f"{what}.body_sha256")
+    if parse_comment_url(data["comment_url"]).comment_id != data["comment_id"]:
+        _fail(what, "names another comment id than its URL's")
+
+
 def _watermark(value: object, what: str) -> None:
     _int(value, what)
 
@@ -634,6 +747,11 @@ class _KindSpec:
     payload: Mapping[str, Checker]
     observed: Mapping[str, Checker]
     completion: str
+    # K10 (#243): the operator performs the write and the controller only
+    # verifies it. Such a record is never attempted: ``attempting`` and
+    # ``drive`` refuse it, and the load cross-check refuses one that claims
+    # an attempt.
+    operator_performed: bool = False
 
 
 _BODY = _published_text(MAX_BODY_CHARS)
@@ -722,6 +840,24 @@ KIND_SPECS: Mapping[EffectKind, _KindSpec] = {
         payload={"body": _BODY},
         observed={"url": _comment_url},
         completion="acceptance_comment_exactly_one_body_equals_payload",
+    ),
+    EffectKind.OPERATOR_COMMENT: _KindSpec(
+        identity={"issue_url": _issue_url, "marker": _marker_of(OPERATOR_COMMENT)},
+        target={"issue_url": _issue_url},
+        precondition={
+            "allowed_by": _allowed_by,
+            "issue_body_sha256": _digest,
+            "binding": _binding,
+        },
+        payload={"body": _BODY},
+        observed={
+            "url": _comment_url,
+            "comment_id": _number,
+            "evidence": _evidence,
+            "body_sha256": _digest,
+        },
+        completion="operator_comment_exact_or_bound_in_complete_listing",
+        operator_performed=True,
     ),
 }
 
@@ -984,6 +1120,13 @@ class EffectRecord:
             raise StateError(f"effect record {self.position} is {self.stage.value}; not issued")
         if not self.bound_left:
             raise StateError(f"effect record {self.position} has used its {MAX_EFFECT_ATTEMPTS}")
+        if self.operator_performed:
+            # K10 (#243): the operator performs it; the controller never
+            # issues it, under any policy or approval.
+            raise StateError(
+                f"effect record {self.position} ({self.kind.value} {self.action_id}) is "
+                "operator-performed; the controller never issues it"
+            )
         if self.kind == EffectKind.ACCEPTANCE_COMMENT and not self.authorized:
             # The one write K9 makes needs its approval first (#211); the
             # cross-check refuses the attempted record on load as well.
@@ -1035,11 +1178,32 @@ class EffectRecord:
         return str(self.identity.get("marker", ""))
 
     @property
+    def operator_performed(self) -> bool:
+        """K10 (#243): the operator performs the write; the controller only verifies it."""
+        return KIND_SPECS[self.kind].operator_performed
+
+    @property
     def action_id(self) -> str:
-        """K9's action id (#211), recomputed from the record; "" for every other kind."""
-        if self.kind != EffectKind.ACCEPTANCE_COMMENT:
-            return ""
-        return acceptance_action_id(self.owner, self.identity, self.target, self.payload)
+        """K9's ``A-`` or K10's ``X-`` action id, recomputed; "" for every other kind."""
+        if self.kind == EffectKind.ACCEPTANCE_COMMENT:
+            return acceptance_action_id(self.owner, self.identity, self.target, self.payload)
+        if self.kind == EffectKind.OPERATOR_COMMENT:
+            return operator_action_id(self.owner, self.identity, self.target, self.payload)
+        return ""
+
+    @property
+    def binding(self) -> dict | None:
+        """K10: the comment the operator bound as evidence, or ``None`` (#243)."""
+        value = self.precondition.get("binding")
+        return dict(value) if isinstance(value, dict) else None
+
+    def binding_to(self, comment_url: str, comment_id: int, body_sha256: str) -> EffectRecord:
+        """K10 bound by the operator to one existing comment, digest-pinned (#243)."""
+        if self.kind != EffectKind.OPERATOR_COMMENT or self.stage != Stage.INTENDED:
+            raise StateError(f"effect record {self.position} cannot be bound to evidence")
+        binding = {"comment_url": comment_url, "comment_id": comment_id, "body_sha256": body_sha256}
+        record = replace(self, precondition={**self.precondition, "binding": binding})
+        return EffectRecord.from_dict(record.to_dict())
 
     @property
     def authorized(self) -> bool:
@@ -1340,6 +1504,20 @@ def acceptance_action_id(owner: EffectOwner, identity: dict, target: dict, paylo
     approval stores the id it approved, and a record whose stored approval
     is not its recomputed id fails to load.
     """
+    return "A-" + _action_digest(owner, identity, target, payload)
+
+
+def operator_action_id(owner: EffectOwner, identity: dict, target: dict, payload: dict) -> str:
+    """The id of one operator action (K10, #243): ``X-`` and 16 hex digits.
+
+    Computed as :func:`acceptance_action_id` is, over the same four parts
+    (the binding is a precondition and never changes the id), and never
+    stored as authority. Its prefix never matches ``--approve-action``.
+    """
+    return "X-" + _action_digest(owner, identity, target, payload)
+
+
+def _action_digest(owner: EffectOwner, identity: dict, target: dict, payload: dict) -> str:
     canonical = json.dumps(
         {
             "owner": owner.to_dict(),
@@ -1351,7 +1529,7 @@ def acceptance_action_id(owner: EffectOwner, identity: dict, target: dict, paylo
         separators=(",", ":"),
         ensure_ascii=True,
     )
-    return "A-" + hashlib.sha256(canonical.encode("ascii")).hexdigest()[:16]
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()[:16]
 
 
 def _cross_acceptance_comment(record: EffectRecord, what: str) -> None:
@@ -1404,6 +1582,79 @@ def _cross_acceptance_comment(record: EffectRecord, what: str) -> None:
         _fail(what, "is observed on another issue than its target")
 
 
+def _cross_operator_comment(record: EffectRecord, what: str) -> None:
+    """K10 (#243): never attempted, a target of the owner's repository, the rendered payload."""
+    if record.stage == Stage.ATTEMPTED or record.attempts != 0:
+        _fail(
+            what,
+            "is an operator-performed operator_comment that records an attempt; the "
+            "controller never issues it",
+        )
+    _same(record, what, (record.identity["issue_url"], record.target["issue_url"], "issue"))
+    target_url = record.target["issue_url"]
+    owner_issue = parse_issue_url(record.owner.issue_url)
+    if _same_url(target_url, record.owner.issue_url, parse_issue_url):
+        _fail(what, "targets its owner's own issue; an operator comment is for another issue")
+    if not parse_issue_url(target_url).same_repository(owner_issue.repository):
+        _fail(what, "targets an issue outside its owner's repository")
+    if not record.owner.pr_url:
+        _fail(what, "has an owner without a PR; an operator comment belongs to a PR's FIX")
+    if parse_issue_url(target_url).number == parse_pr_url(record.owner.pr_url).number:
+        # Issues and PRs share one number space in a repository.
+        _fail(what, "targets its owner's PR; an operator comment is for another issue")
+    _check_owner_issue_marker(record, OPERATOR_COMMENT, what)
+    claim = _marker_claim(OPERATOR_COMMENT, record.identity["marker"])
+    if claim.target.canonical != target_url:
+        _fail(what, "carries a marker whose target is not its target")
+    # The payload is the controller's header, the text the parser accepted
+    # and the marker (``operator_comment_body``); the text gets the parser's
+    # rules again, link rule included, because it is offered to the operator
+    # with no agent result in between.
+    head = (
+        operator_comment_header(
+            record.owner.issue_url, record.owner.pr_url, claim.round, claim.finding_id, target_url
+        )
+        + APPEND_SEPARATOR
+    )
+    tail = APPEND_SEPARATOR + record.identity["marker"]
+    body = record.body
+    if not body.startswith(head) or not body.endswith(tail) or len(body) < len(head) + len(tail):
+        _fail(
+            what,
+            "has a payload body that is not the controller's header, its text and its marker",
+        )
+    text = body[len(head) : len(body) - len(tail)]
+    if text != text.strip():
+        _fail(what, "has an operator text that is not in the parser's stored form")
+    try:
+        validate_operator_comment_body(text, repository=owner_issue.repository)
+    except ControlResultValidationError as exc:
+        _fail(what, f"has an invalid operator text: {exc}")
+    if body != operator_comment_body(
+        text, record.owner.issue_url, record.owner.pr_url, claim.round, claim.finding_id, target_url
+    ):
+        _fail(what, "has a payload body that is not the controller's rendering of its text")
+    target_ref = parse_issue_url(target_url)
+    binding = record.binding
+    if binding is not None and not parse_comment_url(binding["comment_url"]).on(target_ref):
+        _fail(f"{what}.precondition.binding", "names a comment on another issue than its target")
+    observed = record.observed
+    if observed is not None:
+        ref = parse_comment_url(observed["url"])
+        if not ref.on(target_ref):
+            _fail(what, "is observed on another issue than its target")
+        if ref.comment_id != observed["comment_id"]:
+            _fail(f"{what}.observed", "names another comment id than its URL's")
+        if observed["evidence"] == EVIDENCE_EXACT:
+            if observed["body_sha256"] != sha256_text(record.body):
+                _fail(f"{what}.observed", "is exact evidence whose digest is not the payload's")
+        elif binding is None or (
+            binding["comment_id"] != observed["comment_id"]
+            or binding["body_sha256"] != observed["body_sha256"]
+        ):
+            _fail(f"{what}.observed", "is bound evidence that is not the recorded binding")
+
+
 _CROSS_CHECKS: Mapping[EffectKind, Callable[[EffectRecord, str], None]] = {
     EffectKind.PUSH: _cross_push,
     EffectKind.IMPLEMENTATION_PR: _cross_implementation_pr,
@@ -1414,6 +1665,7 @@ _CROSS_CHECKS: Mapping[EffectKind, Callable[[EffectRecord, str], None]] = {
     EffectKind.REPLACEMENT_PR: _cross_replacement_pr,
     EffectKind.PROGRESS_COMMENT: _cross_progress_comment,
     EffectKind.ACCEPTANCE_COMMENT: _cross_acceptance_comment,
+    EffectKind.OPERATOR_COMMENT: _cross_operator_comment,
 }
 
 
@@ -1446,10 +1698,80 @@ def load_records(raw: object, binding: Binding) -> tuple[EffectRecord, ...]:
         # K9 first (#211): nothing else of the plan is sent before the one
         # write that may wait for an operator.
         _fail("effect_records", "plans an acceptance comment after another effect")
+    operator = [r.position for r in records if r.kind == EffectKind.OPERATOR_COMMENT]
+    if operator and acceptance:
+        _fail("effect_records", "plans an acceptance comment and operator comments together")
+    if len(operator) > MAX_OPERATOR_ACTIONS_PER_FIX:
+        _fail(
+            "effect_records",
+            f"plans {len(operator)} operator comments, over {MAX_OPERATOR_ACTIONS_PER_FIX}",
+        )
+    if operator != list(range(len(operator))):
+        # K10 is the plan's prefix (#243): nothing the controller sends
+        # precedes an action the operator may still decline.
+        _fail("effect_records", "plans an operator comment after another effect")
+    # By claim key, not marker text: GitHub names owners and repositories
+    # case-insensitively, and the key folds that case.
+    keys = [scan(OPERATOR_COMMENT, records[i].marker).claims[0].key for i in operator]
+    if len(set(keys)) != len(keys):
+        _fail("effect_records", "plans two operator comments with one identity")
     return records
 
 
 # -- the entry observation (D4.4) -----------------------------------------------------
+
+# K10's allowed targets (#243): the issues the run's issue body references
+# (at most ``MAX_LISTED_ISSUES``, as the EPIC reads them) and the run's EPIC.
+MAX_OPERATOR_TARGETS = MAX_LISTED_ISSUES + 1
+_OPERATOR_TARGET_KEYS = ("numbers", "allowed_by", "issue_body_sha256")
+
+
+@dataclass(frozen=True)
+class OperatorTargets:
+    """The issues a FIX entry allows operator comments on, read once at entry (#243).
+
+    ``numbers`` are issue numbers of the run's repository in order of first
+    mention in the run's issue body, then the EPIC; ``allowed_by`` names why
+    each is allowed (``issue_body`` and/or ``epic``); ``issue_body_sha256``
+    is the digest of the body they were read from. The prompt's target list
+    is rendered from this, and the result is validated against it, so an
+    issue-body edit during the fixer run cannot make the two disagree.
+    """
+
+    numbers: tuple[int, ...]
+    allowed_by: Mapping[int, tuple[str, ...]]
+    issue_body_sha256: str
+
+    @classmethod
+    def from_dict(cls, raw: object, what: str) -> OperatorTargets:
+        data = _exact(raw, _OPERATOR_TARGET_KEYS, what)
+        numbers = data["numbers"]
+        if not isinstance(numbers, list) or len(numbers) > MAX_OPERATOR_TARGETS:
+            _fail(f"{what}.numbers", f"must be a list of at most {MAX_OPERATOR_TARGETS} numbers")
+        for i, n in enumerate(numbers):
+            _number(n, f"{what}.numbers[{i}]")
+        if len(set(numbers)) != len(numbers):
+            _fail(f"{what}.numbers", "repeats a number")
+        allowed = data["allowed_by"]
+        if not isinstance(allowed, dict) or sorted(allowed) != sorted(str(n) for n in numbers):
+            _fail(f"{what}.allowed_by", "must name exactly the numbers, each by its decimal text")
+        for key, value in allowed.items():
+            _allowed_by(value, f"{what}.allowed_by[{key}]")
+        if sum(1 for v in allowed.values() if ALLOWED_BY_EPIC in v) > 1:
+            _fail(f"{what}.allowed_by", "names more than one EPIC")
+        _digest(data["issue_body_sha256"], f"{what}.issue_body_sha256")
+        return cls(
+            tuple(numbers),
+            {n: tuple(allowed[str(n)]) for n in numbers},
+            data["issue_body_sha256"],
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "numbers": list(self.numbers),
+            "allowed_by": {str(n): list(self.allowed_by[n]) for n in self.numbers},
+            "issue_body_sha256": self.issue_body_sha256,
+        }
 
 
 @dataclass(frozen=True)
@@ -1466,6 +1788,10 @@ class EntryObservation:
     PR": a phase that needs the answer fails where it uses it. ``prs`` is
     stored only when it is not empty, so an observation that read no PR
     (every phase but ``ANALYZE_EXECUTE``) is stored as before it existed.
+    ``operator_targets`` (FIX only, #243) is the allowed set of K10 targets
+    read at entry, or ``None`` when the run offers no operator action
+    (``safety.acceptance_actions: off``, or an entry observed under protocol
+    10); it is stored only when set.
     """
 
     phase: Phase
@@ -1475,9 +1801,10 @@ class EntryObservation:
     base_sha: str | None
     objects: Mapping[str, str | None]
     prs: Mapping[str, str | None] = field(default_factory=dict)
+    operator_targets: OperatorTargets | None = None
 
     _KEYS = ("phase", "issue_url", "pr_url", "refs", "base_sha", "objects")
-    _OPTIONAL_KEYS = ("prs",)
+    _OPTIONAL_KEYS = ("prs", "operator_targets")
 
     @classmethod
     def from_dict(cls, raw: object, binding: Binding) -> EntryObservation:
@@ -1521,6 +1848,18 @@ class EntryObservation:
                 _fail(f"{what}.prs", f"records a PR on {ref}, a ref the observation did not read")
             if url is not None:
                 _pr_url(url, f"{what}.prs[{ref}]")
+        targets = None
+        if "operator_targets" in data:
+            if phase != Phase.FIX:
+                _fail(f"{what}.operator_targets", "is recorded by a FIX entry only")
+            targets = OperatorTargets.from_dict(
+                data["operator_targets"], f"{what}.operator_targets"
+            )
+            issue = parse_issue_url(data["issue_url"])
+            if issue.number in targets.numbers or (
+                pr_url and parse_pr_url(pr_url).number in targets.numbers
+            ):
+                _fail(f"{what}.operator_targets", "allows the run's own issue or PR")
         return cls(
             phase,
             data["issue_url"],
@@ -1529,6 +1868,7 @@ class EntryObservation:
             data["base_sha"],
             dict(objects),
             dict(prs),
+            targets,
         )
 
     def to_dict(self) -> dict:
@@ -1542,6 +1882,8 @@ class EntryObservation:
         }
         if self.prs:
             data["prs"] = dict(self.prs)
+        if self.operator_targets is not None:
+            data["operator_targets"] = self.operator_targets.to_dict()
         return data
 
 
@@ -1816,9 +2158,11 @@ class FixContext:
     """``FIX``: one resolution per open finding, rationales in their redacted form.
 
     ``follow_up_source`` names where a deferred finding's follow-up comes
-    from (D4.6) and ``acceptance_source`` the plan position of the K9 record
-    that publishes an ``acceptance_action`` finding's comment (#211); each
-    is set exactly on the resolutions of its kind.
+    from (D4.6), ``acceptance_source`` the plan position of the K9 record
+    that publishes an ``acceptance_action`` finding's comment (#211), and
+    ``operator_sources`` the plan positions of the K10 records of an
+    ``operator_acceptance`` finding (#243); each is set exactly on the
+    resolutions of its kind.
     """
 
     issue_url: str
@@ -1834,9 +2178,17 @@ class FixContext:
         "commit_sha",
         "follow_up_source",
         "acceptance_source",
+        "operator_sources",
     )
     _RESOLUTION_BOUND = (
-        MAX_STORED_RATIONALE_CHARS + MAX_FINDING_ID_CHARS + 40 + 32 + 16 + 16 + (6 * _KEY_OVERHEAD)
+        MAX_STORED_RATIONALE_CHARS
+        + MAX_FINDING_ID_CHARS
+        + 40
+        + 32
+        + 16
+        + 16
+        + (MAX_OPERATOR_ACTIONS_PER_FIX * 16)
+        + (7 * _KEY_OVERHEAD)
     )
     STORED_BOUND = (
         2 * MAX_URL_CHARS + MAX_RESOLUTIONS_PER_FIX * _RESOLUTION_BOUND + (5 * _KEY_OVERHEAD)
@@ -1879,6 +2231,7 @@ class FixContext:
             _fail(f"{what}.resolutions", "must resolve exactly the open findings")
         cls._check_sources(resolutions, data["pr_url"], records, observation, what)
         cls._check_acceptance(resolutions, data["issue_url"], data["pr_url"], round_, records, what)
+        cls._check_operator(resolutions, round_, records, observation, what)
         return cls(data["issue_url"], data["pr_url"], round_, tuple(resolutions))
 
     @classmethod
@@ -1909,7 +2262,79 @@ class FixContext:
                 f"{what}.acceptance_source",
                 "is set exactly when the finding is resolved by an acceptance action",
             )
+        operator = data["operator_sources"]
+        if operator is not None:
+            if (
+                not isinstance(operator, list)
+                or not 1 <= len(operator) <= MAX_OPERATOR_ACTIONS_PER_FIX
+            ):
+                _fail(
+                    f"{what}.operator_sources",
+                    f"must be a list of 1 to {MAX_OPERATOR_ACTIONS_PER_FIX} plan positions",
+                )
+            for i, position in enumerate(operator):
+                _int(position, f"{what}.operator_sources[{i}]", 0, MAX_EFFECTS_PER_PLAN - 1)
+            if len(set(operator)) != len(operator):
+                _fail(f"{what}.operator_sources", "repeats a plan position")
+        if (resolution == "operator_acceptance") != (operator is not None):
+            _fail(
+                f"{what}.operator_sources",
+                "is set exactly when the finding is resolved by operator actions",
+            )
         return dict(data)
+
+    @staticmethod
+    def _check_operator(
+        resolutions: Sequence[dict],
+        round_: int,
+        records: Sequence[EffectRecord],
+        observation: EntryObservation | None,
+        what: str,
+    ) -> None:
+        """#243: each ``operator_acceptance`` names its K10 records, each K10 one finding.
+
+        Every K10 is of this round and an open finding, and its target is
+        in the allowed set the FIX entry recorded, for the reasons and from
+        the issue body digest recorded there.
+        """
+        named: set[int] = set()
+        for resolution in resolutions:
+            sources = resolution["operator_sources"]
+            if sources is None:
+                continue
+            fid = resolution["finding_id"]
+            label = f"{what} resolution for {fid}"
+            for source in sources:
+                if source >= len(records):
+                    _fail(label, f"names plan position {source}, which the plan does not hold")
+                record = records[source]
+                if record.kind != EffectKind.OPERATOR_COMMENT:
+                    _fail(label, f"names effect {source}, which is not an operator comment")
+                claim = _marker_claim(OPERATOR_COMMENT, record.marker)
+                if claim.finding_id != fid or claim.round != round_:
+                    _fail(
+                        label,
+                        f"names operator effect {source}, which is another finding's or round's",
+                    )
+                named.add(source)
+        targets = observation.operator_targets if observation is not None else None
+        for record in records:
+            if record.kind != EffectKind.OPERATOR_COMMENT:
+                continue
+            where = f"effect_records[{record.position}]"
+            if record.position not in named:
+                _fail(where, "is an operator comment no resolution of the context names")
+            if targets is None:
+                _fail(
+                    where, "is an operator comment, but the FIX entry recorded no allowed targets"
+                )
+            number = parse_issue_url(record.target["issue_url"]).number
+            if number not in targets.numbers:
+                _fail(where, f"targets issue #{number}, which the FIX entry did not allow")
+            if list(targets.allowed_by[number]) != record.precondition["allowed_by"] or (
+                targets.issue_body_sha256 != record.precondition["issue_body_sha256"]
+            ):
+                _fail(where, "records another allowed set than the FIX entry's")
 
     @staticmethod
     def _check_acceptance(
@@ -2511,6 +2936,125 @@ def decide_acceptance(
         )
         return Decision(Action.HOLD, reason=f"{record.describe()}: {issue_problem}; {sent}")
     return decision
+
+
+@dataclass(frozen=True)
+class Listed:
+    """One comment of a K10 target's complete listing, as the decision needs it (#243)."""
+
+    url: str
+    comment_id: int
+    body: str
+
+
+def decide_operator_comment(
+    record: EffectRecord,
+    *,
+    own: Sequence[Listed],
+    misplaced: Sequence[Listed],
+    listing: Sequence[Listed],
+    defects: Sequence[str] = (),
+    target_problem: str = "",
+) -> Decision:
+    """K10 (#243): verify an operator-performed comment; never ``ISSUE``.
+
+    ``own`` are the target's comments carrying this record's marker key,
+    ``misplaced`` those carrying the key of another record of this plan
+    whose target is another issue, ``listing`` the target's complete
+    listing (for a binding) and ``defects`` the unreadable
+    ``ai-operator-comment`` markers in it. Conflict rows are evaluated
+    first, so an exact or bound match never hides a conflict: a misplaced
+    payload, two comments with this key, or one with other bytes. Then the
+    exact payload (``exact``), then the bound comment with its digest
+    unchanged (``bound``). Everything else is a hold, which sends nothing:
+    where :func:`decide_create` would issue, this waits for the operator.
+    ``target_problem`` (transferred, deleted, unreadable) holds as well.
+    """
+    terminal = _terminal(record)
+    if terminal is not None:
+        return terminal
+    action = f"{record.describe()} ({record.action_id})"
+    if target_problem:
+        return Decision(Action.HOLD, reason=f"{action}: {target_problem}; nothing was verified")
+    if defects:
+        return Decision(
+            Action.CONFLICT,
+            reason=(
+                f"{action}: the target's comments cannot be read unambiguously "
+                f"({'; '.join(defects)}); edit or delete the named comment, then 'unblock'"
+            ),
+        )
+    if misplaced:
+        urls = ", ".join(c.url for c in misplaced)
+        return Decision(
+            Action.CONFLICT,
+            reason=(
+                f"{action}: {urls} on this issue carries the marker of another operator action "
+                "of this plan, which is meant for another issue (a misplaced payload); delete "
+                "it here and post it on its own issue, then 'unblock'"
+            ),
+        )
+    if len(own) > 1:
+        urls = ", ".join(c.url for c in own)
+        return Decision(
+            Action.CONFLICT,
+            reason=(
+                f"{action}: {len(own)} comments carry its marker ({urls}); delete all but one, "
+                "then 'unblock'"
+            ),
+        )
+    if own:
+        comment = own[0]
+        if comment.body != record.body:
+            cause = (
+                "its bytes differ from the prepared payload only in line endings or trailing "
+                "whitespace (an editor or the web UI changes them)"
+                if normalized_comment_text(comment.body) == normalized_comment_text(record.body)
+                else "its body is not the prepared payload"
+            )
+            return Decision(
+                Action.CONFLICT,
+                reason=(
+                    f"{action}: {comment.url} carries its marker but {cause}; edit it to the "
+                    "exact bytes, or delete it and post the payload through the pipe, then "
+                    "'unblock'"
+                ),
+            )
+        return Decision(
+            Action.OBSERVE,
+            observed={
+                "url": comment.url,
+                "comment_id": comment.comment_id,
+                "evidence": EVIDENCE_EXACT,
+                "body_sha256": sha256_text(comment.body),
+            },
+        )
+    binding = record.binding
+    if binding is not None:
+        bound = [c for c in listing if c.comment_id == binding["comment_id"]]
+        if bound and sha256_text(bound[0].body) == binding["body_sha256"]:
+            return Decision(
+                Action.OBSERVE,
+                observed={
+                    "url": bound[0].url,
+                    "comment_id": bound[0].comment_id,
+                    "evidence": EVIDENCE_BOUND,
+                    "body_sha256": binding["body_sha256"],
+                },
+            )
+        now = sha256_text(bound[0].body) if bound else "none: the comment is gone"
+        return Decision(
+            Action.HOLD,
+            reason=(
+                f"{action}: the bound comment {binding['comment_url']} changed since it was "
+                f"bound (bound sha256 {binding['body_sha256']}, now {now}); bind it again or "
+                "post the payload"
+            ),
+        )
+    return Decision(
+        Action.HOLD,
+        reason=f"{action}: awaiting the operator; no comment on the target carries it yet",
+    )
 
 
 def decide_append(

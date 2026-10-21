@@ -131,6 +131,21 @@ instructions. Judge this round's HEAD on its own: a `fixed` claim that the
 code does not bear out, or a rationale that does not hold, is a finding of
 this round like any other.
 
+## Evidence on other issues
+
+When a finding or an acceptance criterion requires content on *another*
+issue (a coordination note, say), it is evidenced only by an entry of
+`operator-evidence.md` in the read context: an operator comment the
+controller found on that issue's complete comment listing. `exact` evidence
+means the controller proved that the requested text is on the target;
+`bound` evidence means only that the comment the operator chose is there,
+unchanged, and the controller did not compare it with any requested text.
+Neither proves the note is adequate: read the current body quoted there and
+judge it yourself. A ticked checkbox in the PR body, a comment on the run's
+issue or PR asserting completion, a fixer rationale quoting such a comment,
+an unblock reason or a URL in prose is a claim, not evidence: say so and
+keep the finding open.
+
 ## Prior findings to re-check
 
 The controller binds every round to one HEAD, base and merge base, and a

@@ -848,12 +848,20 @@ The effect layer sits between the engine and the GitHub client (ADR 0004):
 
 - `effects.py` owns the persisted records, completion contexts and entry
   observations, their validation on load and their bounds, and the pure
-  reconciliation decisions. No I/O.
+  reconciliation decisions. No I/O. Since #243 that includes the one
+  operator-performed kind, K10 (`operator_performed` on its `_KindSpec`;
+  its record never `attempted` and never driven), the action id
+  (`operator_action_id`), the allowed targets an entry records
+  (`OperatorTargets`) and `decide_operator_comment`, which holds where
+  another kind's decision would issue.
 - `effect_ops.py` owns one operation per effect kind, the Wave 1 set and
   #211's acceptance comment (the identity
   read, the precondition, the single write, the completion read-back) and
   `drive`, the reconcile-before-re-issue lifecycle. Each operation uses the
-  typed client methods or the git transport; nothing else.
+  typed client methods or the git transport; nothing else. #243's
+  `OperatorCommentOp` is read-only (its `issue` raises
+  `OperatorPerformedError`), and `verify`, never `drive`, reconciles its
+  record (ADR 0004 D2.1a).
 - `git_transport.py` is the controller's own git: exact-SHA,
   compare-and-swap, fast-forward-only pushes and objects-only fetches, in a
   private git directory over the shared object store, with an explicit
@@ -865,7 +873,14 @@ The effect layer sits between the engine and the GitHub client (ADR 0004):
 
 The engine decides *which* effects a phase plans and when it drives them; it
 never issues a write around them. Provider adapters and the executor know
-nothing about effects.
+nothing about effects. For operator actions (#243) the engine reads the
+allowed targets at `FIX` entry, checks the `operator_acceptance` result,
+runs the prefix pass of `_complete_fix`, decides `unblock` (progress,
+`--bind-evidence`, `--decline-action`) and records the outcomes; `cli.py`
+shows them in `status` (`--json` `operator_actions`, `--action X-…` for the
+payload bytes); the marker is `claims.OPERATOR_COMMENT`; REVIEW's
+`operator-evidence.md` is `read_context.render_operator_evidence`; and
+the FIX prompt's offer is `prompts/operator_acceptance.md`.
 
 ### Prompt system
 

@@ -12,6 +12,13 @@
   own issue), its authorization precondition (D5.6), the decline of an
   unsent acceptance action (D5.7), its D1.2 row and its own protocol bump
   (D13.9).
+- **Amended by #243:** effect kind K10 (a comment on another issue of the
+  run's repository, which the operator posts and the controller only
+  verifies): the first operator-performed kind (D2.1a), its targets (D5.8),
+  operator-bound evidence (D5.9), its D1.2 row and its own protocol bump
+  (D13.10); and amendments to D1.1, D2.4, D4.7, D5.1, D5.7, D8.3 and §4.
+  [BLOCKED on operator actions](../usage.md#blocked-on-operator-actions)
+  is the operator's guide.
 - **Decides:** #159, for EPIC #158 (Wave 1).
 - **Where:** placement is decided in §2.12. Existing code this record
   builds on: `src/autoforge/github.py`, `claims.py`, `result_parser.py`,
@@ -182,6 +189,15 @@ the operator's checkout and every other worktree share (`git help worktree`,
   A controller-only operation is performed by the controller as a typed
   effect (§2.5) or by one of its existing mechanisms (D5.4), or by nobody.
 
+**Amended (#243).** A controller-only operation may also be fulfilled by
+the operator, through the operator's own channel, when an
+operator-performed kind (D2.1a) records it and the controller verifies it.
+K10 is the one such kind: a comment on another issue of the run's
+repository (D5.8). Nothing is granted by it. The operator already owns the
+repository; no agent gains a capability, credential or permission; and the
+controller gains no write, because K10 adds reads only. An operation that
+no kind records stays the controller's, or nobody's.
+
 **No phase needs a shared ref.** The controller adds the worktree detached
 and fetches objects only (D6.4), and K1 pushes the candidate SHA to an
 explicit remote ref. An agent therefore commits on the worktree's detached
@@ -232,6 +248,7 @@ prompts make no GitHub call and are out of scope.
 | replacement branch publication and `gh pr create` | `replan_reexecute.md` §15, §20 :679, :699, :730 | controller-only | effects K1 and K7 | #164 |
 | `gh issue comment` (progress) | `update_epic.md` :22 | controller-only | effect K8 | #160 |
 | comment on the run's own issue as acceptance evidence (a finding or acceptance criterion asks for text posted on the issue) | no prompt before #211; `fix.md` "Acceptance actions" (the `acceptance_action` resolution) | controller-only | effect K9, authorized per D5.6 | #211 |
+| comment on another issue of the run's repository as acceptance evidence (a finding or acceptance criterion asks for a note on an issue the run's issue references, or on the EPIC) | no prompt before #243; `fix.md` "Operator actions" (the `operator_acceptance` resolution) | controller-only | operator-performed: effect K10, which the operator posts and the controller verifies and never issues (D2.1a) | #243 |
 | edit the progress comment in place | `update_epic.md` :35–37 | controller-only | removed (D5.2) | #160 |
 | `gh issue edit` on the EPIC | `update_epic.md` :62 (forbidden to agents) | controller-only | unchanged: the controller's roadmap splice | — |
 | source PR close, receipt, compensating reopen | `github.py` :1602, :1619, :1630 | controller-only | unchanged mechanism (D5.4) | — |
@@ -303,6 +320,67 @@ remote object. It is defined by six things:
   candidate SHA;
 - **a completion criterion:** a specific read-back, defined per kind in §2.5.
 
+**D2.1a (#243).** **Operator-performed kinds.** A kind may be
+*operator-performed*: the write is the operator's, made through the
+operator's own channel, and the controller only verifies it. Such a kind
+has the six things of D2.1, and its records share one per-phase journal
+with the controller-performed ones: the same owner, identity, plan
+position, load validation, reconciliation before anything else, and hold.
+Two things differ:
+
+- **The precondition never licenses a write.** Where a create would be
+  issued, the record is *held* (nothing is sent, the record is unchanged,
+  and the phase blocks with a controller-rendered reason) until the
+  operator's object is there.
+- **Its stages are `intended → observed | conflict`.** `attempted` is
+  invalid for it, and its attempt count stays 0.
+
+K10 is the only operator-performed kind. "Never issued" is enforced at six
+layers, each tested:
+
+1. the kind's spec (`effects.py`) marks it operator-performed, and no
+   other kind;
+2. its operation (`effect_ops.py`) has no write: its `issue` raises a
+   typed error naming the record, and the operation table and the module
+   docstring list it as read-only;
+3. its pure decision holds where a create's decision would issue;
+4. the record's transition to `attempted` and `drive` refuse an
+   operator-performed record before anything is read, persisted or sent;
+   `verify`, which persists only an observation or a conflict, is its one
+   path;
+5. the load cross-check refuses a record of the kind that is `attempted`
+   or records an attempt;
+6. its action id has the prefix `X-`, which `unblock --approve-action`
+   refuses.
+
+No policy, approval or configuration value makes the controller issue it,
+`safety.acceptance_actions: auto` included. Audit uses the existing
+channels: the records, the outcome history (`operator_comment_outcomes`),
+`unblock_history[].action` and the run log.
+
+*Rationale.* Some acceptance evidence is a write no kind may make: a
+coordination note on another issue, say. Before this, a fixer that needed
+one could only return `blocked` with prose; nothing recorded what was asked,
+and the run was unstuck by assertions the controller never verified (PR
+#242's run). A record the operator fulfils and the controller verifies
+keeps the request durable and the evidence a read-back, without widening
+any write surface.
+
+*Rejected.*
+
+- **Controller-performed K10 after an approval, or under `auto`.** It
+  widens the controller's write surface to other issues, from agent text,
+  and breaks ADR 0008 D13.2's argument that every worker write targets an
+  object derived from its own issue. It needs its own decision here and a
+  D13.2 row.
+- **Broadening K9 to more targets.** Under `auto` it becomes an unattended
+  write channel to other issues.
+- **A generic "operator task" kind, or a separate obligation journal.**
+  The first is §2.5's command language and a task queue; the second
+  duplicates the effect journal's order, reconciliation, hold and recovery.
+- **A scoped token or `gh` allowlist for the fixer.** It contradicts D1.1,
+  D1.3 and #165.
+
 **D2.2 (#160).** An effect record persists the six fields above, plus:
 
 - the attempt count;
@@ -351,6 +429,14 @@ follows:
   context together, that keeps the state file far below
   `MAX_STATE_FILE_BYTES`. It counts each context value at its stored bound
   (D4.6).
+
+**Amended (#243).** The largest `FIX` plan now holds operator comments:
+at most `MAX_OPERATOR_ACTIONS_PER_FIX` (4) K10 records, which resolve one
+finding that is then not deferred. That plan is 49 K5 or K6 records, 4 K10
+and one K1, so `MAX_EFFECTS_PER_PLAN` is 54 (51 before). The total bound
+holds it with every K10 payload at its largest rendering, and both bounds
+are tested on that plan. A K9 plan (one comment for one finding) is
+smaller.
 
 Only bounded values are persisted, and each is either redacted or
 redaction-invariant. Every payload is redaction-invariant (D8.3), a body
@@ -692,6 +778,19 @@ recovery, and these rules keep the two apart:
   `REPLAN_REEXECUTE` complete from their context or block. None asks the
   agent again after its effects are observed.
 
+**Amended (#243).** A `FIX` plan may hold up to four operator-performed
+records (K10), its prefix, observed one at a time and each saved as it is
+observed, so a plan can be partly observed while it waits. An observed K10
+is still terminal: it is never reconciled into a write, and never verified
+again. It does not, however, always outlive its plan as a record. When the
+operator declines the remaining actions (D5.7's amendment), the plan is
+dropped and each observed K10 survives as a `verified` entry of the
+outcome history, which the relaunched fixer and the next `REVIEW` receive.
+That relaunch is not a re-request: no input is voided, the fixer is
+launched afresh (D5.7), and no controller write of the plan was sent,
+because every one of them follows the prefix. An observed K10 is the
+operator's write, not the controller's.
+
 **The crash windows,** common to every kind. §2.5 gives each kind's
 concrete reads.
 
@@ -782,6 +881,14 @@ under that rule: one kind, one target class (the run's own issue), its own
 protocol bump (D13.9). It is not a generic write kind: the agent requests
 only bounded text, and the kind, target, identity and marker are the
 controller's. Its write also needs an authorization (D5.6).
+
+**Amended (#243).** A tenth kind, K10 (the operator comment on another
+issue), is added under the same rule, with its own protocol bump (D13.10).
+It is the first operator-performed kind (D2.1a): journaled like the
+others, and never issued by the controller. It is not a generic write kind
+either: the agent requests only a target issue *number*, checked against a
+set the controller read itself (D5.8), and bounded text; the kind, the
+target URL, the identity and the marker are the controller's.
 
 #### K1. Push an exact candidate (the Git publication layer, §2.6)
 
@@ -1066,6 +1173,99 @@ controller's. Its write also needs an authorization (D5.6).
   observed comment is never posted again, and the next `REVIEW` receives its
   URL as data and still judges the round.
 
+#### K10. Verify the operator's comment on another issue (#243)
+
+- **Performer:** the operator (D2.1a). The controller never issues it,
+  under any policy or approval.
+- **Consumer:** #243 (`FIX`). A REMOTE fixer may resolve a finding as
+  `operator_acceptance`, with `{"actions": [...]}` holding 1 to 4
+  `{"kind": "related_issue_comment", "issue": <number>, "body":
+  "<Markdown>"}` actions, at most `MAX_OPERATOR_ACTIONS_PER_FIX` (4) per
+  result and one per (finding, target). `issue` is a JSON integer, never a
+  string, URL, `#n` or `owner/repo#n`; a `url`, `repository`, `owner`,
+  `repo`, `target`, `method`, `path` or `command` key is refused by name,
+  any other key as unknown (D8.1). The resolution needs a rationale and
+  carries no commit, follow-up or `acceptance_action`. It is refused in
+  LOCAL, under `safety.acceptance_actions: off`, and in a result that also
+  carries an `acceptance_action`: mixing would let a K9 write land before a
+  K10 the operator then declines.
+- **Identity:** the `ai-operator-comment` marker for (the run's issue, the
+  PR, the review round, the finding id, the target issue), on the target.
+  One marker per comment. The issue the comment is *on* is not part of the
+  key, so a payload posted on the wrong issue still carries its key and is
+  found there (below). Two rounds, two PRs, two targets of one finding, or
+  two scheduler workers never share a key.
+- **Target:** the comments of one issue of the allowed set the `FIX` entry
+  recorded (D5.8), open or closed, never the owner's issue or its PR. The
+  load cross-check requires the canonical URL of an issue of the run's
+  repository, equal to the marker's `target`.
+- **Precondition:** `{"allowed_by", "issue_body_sha256", "binding"}`:
+  why the target is allowed (`issue_body`, `epic`, or both) and the digest
+  of the issue body the set was read from, both as the entry observation
+  records them, and the operator's binding (D5.9), `null` until one is
+  made. No absence is required, because nothing is ever issued.
+- **Payload:** the controller's header line (naming the run's issue, the
+  PR, the round, the finding and the target, and saying the text below
+  was prepared by the FIX agent for the operator to post and is only
+  verified by the controller), a blank line, the agent's validated text, a
+  blank line and the marker. Rendered once and persisted (D8.4); the text
+  passes D8.2, D8.3 and its amendment's operator rules, link rule included,
+  at validation and again when the record loads.
+- **Completion read-back:** a read of the target (still an issue of the
+  run's repository; closed is fine) and its complete comment listing. The
+  conflict rows are evaluated first, so an exact or bound match never
+  hides a conflict:
+
+  | The target's listing holds | Decision |
+  |---|---|
+  | a comment with this record's key and other bytes; two with the key; a marker of another K10 of this plan whose target is another issue (a misplaced payload); an unreadable `ai-operator-comment` marker | `conflict`, naming every comment; the reason says when the bytes differ only in line endings or trailing whitespace |
+  | exactly one comment with the key, byte-equal to the payload | `observed`, evidence `exact` |
+  | (a binding) the bound comment, the SHA-256 of its listed body equal to the bound one | `observed`, evidence `bound` |
+  | (a binding) the bound comment gone or changed | held, naming both digests |
+  | nothing of the above | held: awaiting the operator |
+
+  A target that is not found, answers as a pull request or as another
+  object (transferred), or cannot be read for a conclusive reason holds
+  the record, naming it. The observed result is `{"url", "comment_id",
+  "evidence", "body_sha256"}`. Whoever posted the comment is irrelevant
+  (D9.3). Markers of earlier rounds or of dropped plans carry no key of
+  this plan, so they never block it.
+- **Action id:** `X-` and the first 16 hex digits of the SHA-256 of the
+  canonical encoding of the owner, identity, target and payload, computed
+  as D5.6's `A-` id. The binding is a precondition and never changes it.
+  It is recomputed wherever it is shown or used, never stored as authority,
+  and `--approve-action` refuses it: there is nothing to approve.
+- **Plan order:** the K10 records are the plan's prefix, in result order,
+  then K5, K6 and the K1 push. At most four per plan, one identity each,
+  never beside a K9. The **prefix pass** reconciles every K10 before
+  anything else of the plan, read-only: it does not stop at the first hold
+  or conflict, it saves each observation or conflict as it is made, and
+  while any K10 is not observed it blocks with one controller-rendered
+  reason naming each action, its state and its next commands, and sends
+  nothing after the prefix. Nothing the controller sends therefore
+  precedes an action the operator may still decline (D5.7), and the push
+  stays the commit point. A K9 plan is driven as before.
+- **Windows:**
+  - W1: the generic one. After the plan save, `resume` runs the prefix pass
+    and blocks with the same ids, with no launch.
+  - W2: a read-only reconciliation; the hold replaces the issue. Each
+    observation is its own atomic save, so after a crash between two of
+    them the next pass re-reads only the records still pending.
+  - W3 and W4 do not exist: the record is never `attempted`.
+  - W5: a `conflict` is never repaired by the controller, never duplicated
+    and never declined (D5.7); once the operator edits or deletes the named
+    comment, `unblock` reopens it to `intended` (its attempt count is 0).
+  - Drift while waiting (a push to the PR, a retarget or a base rewritten
+    under its name): the `FIX → REVIEW` route reconciles each pending K10
+    read-only first and records it `verified` if the operator completed it,
+    otherwise `stale`.
+
+  The observed comment is never re-verified after `FIX` completes, the
+  merge gate included; the next `REVIEW` receives it as data
+  (`operator-evidence.md`, with its current body) and still judges the
+  round. A payload posted on an issue no record targets is not read, so it
+  is not detected.
+
 **D5.2 (#160).** **Correcting a controller-authored object in place is not a
 kind.** Every payload is rendered from persisted bytes (D8.4), so the
 controller has nothing to correct. A remote object that differs from its
@@ -1296,6 +1496,152 @@ a `conflict` is repaired, never declined.
 - **Treating the operator's reason as evidence.** A plain `unblock` with an
   action waiting re-enters `FIX` only when the exact payload is on the
   issue; otherwise it is refused and the state is left byte-identical.
+
+**Amended (#243).** `unblock --decline-action` also declines operator
+actions (K10), and may repeat for them (`X-` ids only; an `A-` id is
+declined alone). A K10 plan may be partly observed, so the rule is
+extended:
+
+- **When.** The PR is at the reviewed HEAD, base and merge base; each
+  named record is pending; no record of the plan is in `conflict` (a
+  conflict is repaired, never declined, and dropping the plan would discard
+  it silently); and across every target's complete listing no key of a
+  record not yet observed, no misplaced marker of the plan and no bound
+  comment now verifiable appears. A target that is not found holds no
+  marker; any other read failure refuses. The rationale's "a decline is
+  refused once the marker is on the issue" thus applies to the records not
+  yet observed only: an observed K10 is no reason to refuse. A key left on
+  GitHub for a record the decline drops would wait to conflict with a
+  later request; the refusal says to run a plain `unblock` and `resume`
+  first, so the comment is saved, or to remove it.
+- **What, in one save.** The plan and its context are dropped; each
+  observed K10 becomes a `verified` outcome (D4.7's amendment), each named
+  one `declined` with the operator's reason, and each other pending one
+  `withdrawn`, which may be requested again. `FIX` is entered afresh, and
+  at `resume` the fixer is relaunched with the round's declined actions and
+  this PR's verified operator evidence in its prompt. D4.6 is untouched:
+  K5, K6 and K1 follow the prefix and were never sent.
+- **Re-requests.** The same text for the same (finding, target) is the
+  same id, so a declined one requested again is a correction. A (finding,
+  target) with a `verified` outcome in the round is never requested again;
+  the outcome is carried into the `operator_evidence` of whatever
+  resolution the finding gets.
+- **One bound.** `MAX_DECLINES_PER_ROUND` (16) counts the round's
+  `declined` entries of the acceptance and the operator outcome histories
+  together; a withdrawal is not counted. A decline that would pass it is
+  refused, and a result requesting an acceptance or operator action of a
+  round at the bound is a correction. The operator outcome history is
+  bounded at 80, at least `(MAX_DECLINES_PER_ROUND + 1) ×
+  MAX_OPERATOR_ACTIONS_PER_FIX` (68), so one round always fits, and its
+  pruning never drops an entry of the round being fixed.
+
+A plain `unblock` with a K10 not yet observed re-enters `FIX` only on
+progress (a pending record now observable, or a recorded conflict that no
+longer reproduces; a new conflict is not progress) or on drift. Otherwise
+it is refused, naming each pending action, and the state is left
+byte-identical: a reason, a URL in prose, a checkbox or an unbound comment
+is never evidence. With every K10 observed, the existing "OPEN with a
+persisted `FIX` plan" row decides.
+
+**D5.8 (#243).** **K10's targets: an allowed set read at entry.** The
+`FIX` entry reads the run's issue once, through the controller's client,
+and records the issues an operator comment may target, never from the
+result:
+
+- the issue numbers its **body** references (`#n`, or an issue URL of the
+  run's repository; another repository's URL is ignored), in order of
+  first mention, without the run's issue and PR, at most
+  `MAX_LISTED_ISSUES` (60);
+- plus the run's EPIC, when it is an issue of the run's repository;
+- never the run's own issue (that is K9) or its PR.
+
+The set is persisted in the entry observation as `operator_targets`
+(`{"numbers", "allowed_by", "issue_body_sha256"}`) in the save that charges
+the launch (D4.4), so a relaunch of the entry offers the same set. It is
+absent under `safety.acceptance_actions: off`, in LOCAL, for an entry
+observed under protocol 10, and when the run's issue cannot be read
+conclusively (a transient read failure propagates before the launch); no
+target is then offered. The prompt's target list is rendered from the
+persisted set and the result is checked against it, so an issue-body edit
+during the fixer run cannot make the two disagree. At result check, before
+the plan save, each requested target is read:
+
+| Outcome | Result |
+|---|---|
+| not in the set; a (finding, target) already verified in the round; answers as a pull request; not found | correction, naming the number and the rule |
+| an issue of the run's repository, open or closed | accepted |
+| a transient failure | propagates; nothing is saved |
+| any other conclusive failure (transferred, permission, another repository) | `BLOCKED`, naming it; nothing of the result is saved |
+
+Each record keeps `allowed_by` and the body digest, and the completion
+context loads only when they equal the entry's set. A later edit of the
+run's issue body changes nothing for the plan; `unblock` says the body
+changed, and `REVIEW` judges against the current issue.
+
+*Rationale.* The issue body is the run's specification and the EPIC its
+parent: the places an acceptance criterion can name another issue.
+Comments, the PR body and finding text are writable by agents, reviewers
+and anyone who can comment, so they never widen the set. A number checked
+against a controller-read set leaves the agent nothing to inject.
+
+*Rejected.*
+
+- **Any issue of the repository.** Agent text would choose where the
+  operator posts.
+- **A URL in the request, or agent-proposed evidence URLs.** Another
+  target-injection surface; the fixer cannot read target threads anyway.
+- **Re-reading the set at result check.** A body edited during the fixer
+  run would make the prompt's list and the check disagree.
+
+**D5.9 (#243).** **Operator-bound evidence and its limits.** `unblock
+--bind-evidence X-… <comment URL>` (repeatable, one pair per pending
+action) binds an existing comment as a pending K10's evidence, under five
+rules checked by fresh reads:
+
+1. the URL parses as an issue-comment URL of the run's repository;
+2. GitHub places the comment on the record's target, compared canonically,
+   and the target's complete listing holds the same comment id; the digest
+   is taken from the listing's body;
+3. that body carries no controller marker, except an `ai-operator-comment`
+   marker of this run's issue and PR for the same target with another key
+   (an earlier round's payload). A comment with the record's own key is
+   exact evidence or a conflict, never bindable;
+4. no other record of the plan is bound to it or observed on it;
+5. the record is `intended`, not in conflict, and the PR is still at the
+   reviewed HEAD, base and merge base (drift refuses it as stale).
+
+The record's `binding` stores the canonical comment URL, its id and the
+SHA-256 of its body, in the unblock's save; binding the same comment with
+the same digest again is no progress, and refused. `resume` verifies it in
+the prefix pass, and the evidence is `bound`.
+
+The two evidence classes prove different things, and every consumer
+(`status`, `last_fix_resolutions[].operator_evidence`,
+`operator-evidence.md`) says which:
+
+- **exact:** the requested bytes are on the target, in the one comment
+  carrying the action's marker;
+- **bound:** only that the comment the operator chose is on the target,
+  unchanged since it was bound. The controller never compares it with the
+  requested text, and labels it "operator-bound; adequacy not verified by
+  the controller".
+
+Neither proves the note is adequate: `REVIEW` judges that, from the
+comment's current body. A bound comment edited or deleted before it is
+observed holds the record, naming both digests; after it is observed, a
+change is reported to the next `REVIEW` as data and reopens nothing.
+
+*Rejected.*
+
+- **Controller heuristics for "equivalent" comments.** That is semantic
+  guessing; a binding is explicit and digest-pinned.
+- **Normalizing line endings or whitespace before comparing.** It adds a
+  second equality beside K9's exact bytes. Exact evidence stays exact; a
+  conflict reason names a whitespace-only difference so the operator can
+  repair it.
+- **Treating an unblock reason, a URL in prose, a PR checkbox or a comment
+  on the run's issue as evidence.** That is how PR #242's run was unstuck
+  without anything being verified.
 
 ### 2.6 The Git publication layer (item 6)
 
@@ -1632,6 +1978,29 @@ covers only the `ai-` prefix.
   by a line start, whitespace or punctuation, and followed by a name
   character) outside a code span or fenced block is refused. The correction
   asks the agent to put such tokens in code spans.
+
+**Amended (#243).** Operator text (K10's body) is posted by the operator
+under their own identity, often piped unedited, so it passes the policy
+above and three rules more, at validation and again whenever the record
+loads:
+
+- **At most `MAX_OPERATOR_COMMENT_CHARS` (16,000) characters.**
+- **No Markdown image and no raw HTML** (a tag, a comment or an autolink)
+  outside a code span or fenced block.
+- **The link rule.** Every link or bare URL is
+  `https://github.com/<owner>/<repo>/…` of the run's repository (owner and
+  name compared case-insensitively, the prefix ending the URL or followed
+  by `/`, `?` or `#`). A relative link, another scheme, host or repository,
+  a `www.` or e-mail autolink, and a path that climbs out with `..` or a
+  backslash are refused. The rule is judged anywhere in the text, code
+  included, because the operator copies it whole; each URL is judged as
+  written and again after entity and percent decoding; and a link
+  reference definition is recognised wherever `]:` occurs.
+
+The rendered comment is then judged whole: the credential rule on the
+payload, the mention, image and raw-HTML rules on what precedes the
+marker, and GitHub's comment limit. A refusal is a correction that names
+the field, an index and the rule, never the text.
 
 **D8.4 (#160).** **A phase persists the rendered payload.** It does not
 re-render on recovery. The exact bytes to publish are stored in the effect
@@ -2123,6 +2492,37 @@ label and never by shape:
   foreign file;
 - LOCAL state carrying any of them is refused as corrupt.
 
+**D13.10 (#243).** **K10 is its own protocol bump.** Under D13.1's rule
+it is made alone: protocol 10 → 11, and the prompt version `v11` → `v12`.
+It is never 6 (reserved for #126) and is not combined with #126's bump or
+any other; whichever of the two lands second rebases its migration rule
+onto the other. The number is announced and confirmed on #23 before the
+change merges, and the label moves with that decision. D13.1 and D13.9
+also name #158, the EPIC this record decides for, as the place to announce
+a bump; #158 is closed and #243 belongs to no EPIC, so #23 is the place of
+record, and an EPIC-side mirror is the owner's choice. The migration rule
+follows D13.2, by label and never by shape:
+
+- a protocol-10 file loads in every phase and is relabelled on its next
+  save, with `operator_comment_outcomes: []`, no `operator_targets` in the
+  entry observation, `operator_sources: null` on each `FIX` context
+  resolution and `operator_evidence: []` on each REMOTE
+  `last_fix_resolutions` entry, because no earlier controller recorded an
+  operator action. A `FIX` entry observed under protocol 10 therefore
+  offers none, and a result requesting one is a correction;
+- a protocol-10 (or older) file carrying any of them, or a K10 record, is
+  refused, unchanged, as a hand edit or a foreign file;
+- every protocol-11 save writes `operator_comment_outcomes`, `[]`
+  included, so a protocol-11 file missing it is refused: read as empty, it
+  would forget a declined action of the round and let the same request
+  through again;
+- LOCAL state carrying any of them is refused as corrupt.
+
+The bump defines the full `binding` schema and the `bound` evidence value
+(D5.9), so operator-bound evidence needs no field and no bump of its own.
+`acceptance_outcomes` and every K9 field are untouched: a separate history
+avoids migrating K9 entries, which carry no target.
+
 ## 3. What does not change
 
 - **`CONTROL_RESULT` stays untrusted, and read-back stays authoritative.** The
@@ -2180,6 +2580,16 @@ label and never by shape:
     validated `CONTROL_RESULT` planned it, with no provider session
     involved. It shares no field, verb, exit code or protocol number with
     #126, and nothing is ever delivered back to an agent.
+  - **Amended (#243).** An operator action (K10) is an effect record too,
+    not an interaction record. It starts only after a validated
+    `CONTROL_RESULT`, has no provider session, and is never delivered to
+    an agent while it waits; a declined or verified one reaches a later
+    agent only as data in a fresh launch's prompt or read context. It
+    shares no name, verb, exit code, key or protocol number with #126:
+    `--bind-evidence` and `--decline-action` are `unblock` flags, while
+    `pending`, `answer`, `approve`, `reject` and exit 3 stay #126's. A
+    waiting K10 parks the run in `BLOCKED`; there is no new phase or
+    status.
 - **#147–#149 (SDK).** SDK adapters inherit the boundary with no engine
   branch. #149 owns SDK tool and permission policy, and may map D1.2 into
   deny rules as defence in depth.
@@ -2193,6 +2603,13 @@ label and never by shape:
   directory, which lives under the common dir. The controller's own runtime
   directories, the per-operation git contexts and the read-context
   directories are never projected writable to agents.
+- **ADR 0008 (parallel EPIC scheduler), added by #243.** K10 is not a
+  controller write, so ADR 0008 D13.2's table of the writes a worker can
+  make needs no row. A worker verifies operator actions only in the
+  engine's prefix pass, as a standalone `FIX` does; it never binds or
+  declines, and the scheduler never interprets, performs or verifies an
+  action. `BLOCKED` settles the issue (ADR 0008 D15.1), and ADR 0008 D9.4,
+  as amended, names the commands `epic status` points the operator to.
 
 ## 5. Decision ownership
 
@@ -2208,6 +2625,7 @@ mechanisms are unchanged and has no child.
 | #164 | D9.8, D12.7, D13.8; the K1 and K7 wiring; the D1.2 rows it owns |
 | #165 | D1.1, D1.2 (the guide entry and the rows it owns), D1.3, D10.1, D10.2, D11.1, D12.6 |
 | #211 | the D5.1 amendment, K9, D5.6, D5.7, D13.9; the K9 wiring; its D1.2 row |
+| #243 | the D1.1, D2.4, D4.7, D5.1, D5.7, D8.3 and §4 amendments, D2.1a, K10, D5.8, D5.9, D13.10; the K10 wiring; its D1.2 row |
 
 ## 6. Tests the implementing children must add
 
@@ -2399,6 +2817,44 @@ In addition:
     the action `stale`; a declined id is a correction;
   - a protocol-7 file migrates under D13.9, and one carrying the new fields
     is refused.
+- **K10 (#243):**
+  - each of D2.1a's six layers; under `approve` and `auto` alike no K10
+    write is ever made; an `attempted` K10, or one recording an attempt,
+    fails to load;
+  - the action id is deterministic, changes with the owner, the target,
+    the marker and the payload but not with the binding, and is never an
+    approvable id;
+  - every row of K10's read-back, a conflict row winning over an exact or
+    bound match, a misplaced payload blocking the issue it landed on, a
+    whitespace-only difference named, and earlier rounds', other plans' and
+    siblings' markers never blocking an action;
+  - the prefix pass reconciles every K10 past a hold or a conflict, saves
+    each observation, and sends nothing after the prefix; a partly
+    observed plan blocks, and completes later from the journal with one
+    fixer launch in all;
+  - the allowed set persisted at entry and used for both the prompt and
+    the check, an issue body edited mid-run included; D5.8's table; a
+    corrupt or unexplained `operator_targets`, K10 or context fails to
+    load;
+  - the five binding rules; a bound comment edited before it is observed
+    holds; one comment is never evidence for two actions;
+  - a plain unblock without progress, a decline refused while anything of
+    the plan is on GitHub unsaved or in conflict, and every other refusal
+    leave the state byte-identical, also as dry runs; a decline after
+    partial completion keeps the verified comment and withdraws the
+    others; the decline bound is shared with K9; `--approve-action X-…` is
+    refused; drift records each action `verified` or `stale`;
+  - the 54-record plan fits both bounds of D2.4;
+  - a protocol-10 file migrates under D13.10, and one carrying the new
+    state is refused;
+  - end to end (PR #242's reproduction): two notes on closed related
+    issues block with nothing posted, a ticked checkbox, a "done" comment
+    and a reason with URLs fulfil nothing, each exact payload is verified
+    as posted, a partial completion survives a restart, and REVIEW reads
+    both as evidence, with one fixer launch, no push and no merge; a
+    process killed after either observation save or before the completion
+    save completes from the journal with one marked comment per target;
+    and the bound and withdrawn variants.
 
 ### 6.2 The EPIC #158 test-matrix ownership
 

@@ -250,7 +250,11 @@ A run in `BLOCKED` stays there until you fix the cause and run
 re-enters the one phase that inspection supports or refuses. When a fixer
 asked the controller to post an acceptance comment on the issue, the run
 waits for you to approve or decline that exact comment
-(`unblock --approve-action` / `--decline-action`). Every command,
+(`unblock --approve-action` / `--decline-action`). When it asked for a
+comment on another issue (one the run's issue references, or the EPIC),
+you post it yourself, bind an existing comment or withdraw it
+(`unblock --bind-evidence` / `--decline-action`); the controller never posts
+there, and verifies the comment on GitHub. Every command,
 where a run stops, and how to recover are in
 [Running the remote workflow](docs/usage.md).
 
