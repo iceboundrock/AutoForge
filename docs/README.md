@@ -13,6 +13,7 @@ description of how AutoForge behaves.
 | [Getting started](../README.md#quick-start) | prerequisites, installation, `doctor`, a dry run, a first run, `resume` |
 | [Running the remote workflow](usage.md) | every command, where a run stops (`READY_FOR_MERGE`, `BLOCKED`), opt-in merge, `unblock`, how agents are separated from your checkout (not sandboxed unless `sandbox.mode: required`), troubleshooting and recovery |
 | [Local mode](local-mode.md) | the GitHub-free workflow over a feature Markdown file: the workspace fingerprint, dirty trees, the review/fix bound, validation commands, dry run and resume |
+| [Pi operator guide](pi.md) | running phases through Pi on a ChatGPT subscription with no API key: installing Pi and signing in yourself, a profile to copy, model and thinking level, `doctor`'s Pi rows and their remedies, security, LOCAL mode, limitations, unattended use, and the opt-in live smoke test |
 | [Configuration](configuration.md) | creating and passing a config file, formats, strict key validation, profiles, the `local:` block, the outer sandbox (`sandbox:`) and the provider credentials it shows; [`autoforge.example.yaml`](../autoforge.example.yaml) is the exhaustive key reference |
 
 ## Understanding AutoForge

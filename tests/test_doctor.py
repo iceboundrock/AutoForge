@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import autoforge.doctor as doctor_module
 from autoforge.doctor import Doctor
 from autoforge.executor import ExecutionResult, execute
 from autoforge.profiles import local_required_profiles
@@ -775,6 +776,7 @@ def test_state_dir_on_a_filesystem_without_hard_links_names_the_requirement(tmp_
 # -- agent rows derived from the reachable profiles; Pi checks (#129) ---------------
 PI_LABEL = "agent 'pi' available (review_round_2_5)"
 PI_AUTH = "agent 'pi' auth ready (review_round_2_5)"
+PI_CONTAINED = "pi's detached tool processes are contained (review_round_2_5)"
 OAUTH_READY = '{"status":"ready","provider":"openai","authType":"oauth"}'
 # A planted "secret" Pi might print on stderr; no row may ever quote it.
 PLANTED = "sk-planted-SECRET-0123456789abcdef"
@@ -952,7 +954,8 @@ def test_a_healthy_pi_profile_passes_and_bounds_its_claim(tmp_path):
     # `ready` proves a credential exists for the provider, not that the model is usable.
     assert "provider 'openai' only" in auth.detail
     assert "cannot be checked" in auth.detail
-    others = [r for n, r in results.items() if not n.startswith("outer sandbox: ")]
+    # The sandbox rows and the containment row depend on the host's platform.
+    others = [r for n, r in results.items() if not n.startswith(("outer sandbox: ", PI_CONTAINED))]
     assert all(r.ok for r in others), [r for r in others if not r.ok]
 
 
@@ -1265,7 +1268,26 @@ def test_the_default_agent_dir_is_used_when_the_launch_does_not_pass_one(tmp_pat
 def test_no_outside_instructions_row_without_a_pi_profile(tmp_path):
     config = _write_config(tmp_path, {"analyze_execute": {"provider": "opencode"}})
     d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory())
-    assert not any("instructions" in r.name for r in d.run_all())
+    names = [r.name for r in d.run_all()]
+    assert not any("instructions" in n or n.startswith("pi's detached") for n in names)
+
+
+# -- unattended Pi use needs orphan containment (#135, ADR 0002 §4b) ----------------
+def test_pi_tool_processes_are_contained_where_a_subreaper_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor_module, "orphan_containment_available", lambda: True)
+    row = _pi_doctor(tmp_path)[PI_CONTAINED]
+    assert row.ok and not row.required
+    assert "killed when the launch ends" in row.detail
+
+
+def test_without_a_subreaper_unattended_pi_use_is_warned_against(tmp_path, monkeypatch):
+    """A WARN, never a FAIL: attended use stays possible, and doctor passes."""
+    monkeypatch.setattr(doctor_module, "orphan_containment_available", lambda: False)
+    results = _pi_doctor(tmp_path)
+    row = results[PI_CONTAINED]
+    assert row.label == "WARN" and not row.required
+    assert "do not run Pi unattended here (docs/pi.md#unattended-use)" in row.detail
+    assert results[PI_LABEL].ok and results[PI_AUTH].ok
 
 
 def test_a_forwarded_api_key_fails_an_oauth_profile_without_probing(tmp_path, monkeypatch):

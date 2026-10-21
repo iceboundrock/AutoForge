@@ -13,6 +13,8 @@ contract.
 Every behavioral change should include or update automated tests.
 
 Do not call real Claude Code/OpenCode/Pi/GitHub write APIs from unit tests.
+The one test that calls a real agent and model, the live Pi smoke test
+(#135), is opt-in and deselected by default (below).
 
 Use mocks, fakes, fixtures, and scripted providers.
 
@@ -1293,6 +1295,32 @@ is scripted with the same handlers `ScriptedProvider` takes. Keep covered:
   the final text in `stdout.log`, stderr separate, and a credential-shaped
   string redacted in every file
 - dry-run with Pi profiles prints the Pi argv and starts nothing
+
+### The live Pi smoke test (#135)
+
+`tests/test_live_pi.py` runs one LOCAL REVIEW through the operator's real
+Pi and ChatGPT sign-in. It is marked `live`: `pyproject.toml`'s
+`-m 'not live'` deselects it from every default run, and selected with
+`-m live` it skips unless `AUTOFORGE_LIVE_PI=1`. Its flow and checks live
+in `tests/live_pi.py`; `tests/test_live_pi_support.py` keeps covered,
+offline:
+
+- the deselection: a default pytest process deselects it and runs nothing,
+  and `-m live` without the variable skips with its reason
+- the credential scan finds each pattern (JWT, `Bearer`, `refresh_token`,
+  `"refresh"`, `"access"`, `chatgpt-account-id`, `chatgpt_account_id`,
+  `sk-` keys) in synthetic data, also escaped inside a JSON string, and
+  reports the file and the pattern name, never the match; prose and
+  symbolic links are not hits
+- a Pi failure is reported by its category as the provider's refusal or
+  AutoForge's failure, never with its text
+- the session-directory, tree and process checks
+- the whole flow against the fake `pi`, through the real
+  `autoforge local doctor` in a process of its own and the real engine and
+  `PiProvider`: it passes; a usage limit is named by its category while
+  the later checks still run; a reviewer that writes and a new session
+  entry each fail; an `OPENAI_API_KEY` fails step 2, is not unset and
+  starts no Pi; a missing `pi` fails the preconditions
 
 ### SDK policy (#149, docs/sdk-policy.md)
 

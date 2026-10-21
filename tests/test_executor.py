@@ -1285,6 +1285,17 @@ def _subreaper() -> int:
     return value.value
 
 
+def test_orphan_containment_is_available_exactly_where_a_subreaper_is(monkeypatch):
+    """What doctor's Pi row reads (#135): Linux can contain, and asking
+    leaves the subreaper setting as it was; a platform without prctl cannot."""
+    linux = sys.platform.startswith("linux")
+    assert executor.orphan_containment_available() is linux
+    if linux:
+        assert _subreaper() == 0
+    monkeypatch.setattr(executor, "_prctl", lambda: None)
+    assert executor.orphan_containment_available() is False
+
+
 def test_detached_orphan_outlives_an_uncontained_invocation_unreported(monkeypatch):
     """The gap the amendment closes: a detached process that holds none of
     the pipes is invisible to the group check and the pipe EOF, so without

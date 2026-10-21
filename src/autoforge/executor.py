@@ -927,6 +927,21 @@ def _prctl() -> Callable[..., int] | None:
         return None
 
 
+def orphan_containment_available() -> bool:
+    """Whether a contained invocation can catch its orphans here (ADR 0002 §4b).
+
+    True where the controller can be a child subreaper, which is read, not
+    set. Elsewhere a contained request runs uncontained and its result
+    carries ``orphans_unchecked``: a process that left the child's group may
+    outlive the invocation.
+    """
+    prctl = _prctl()
+    if prctl is None:
+        return False
+    current = ctypes.c_int(0)
+    return prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(current), 0, 0, 0) == 0
+
+
 def _children() -> dict[tuple[int, int], bool]:
     """This process's children as ``(pid, start time) -> is a zombie``.
 

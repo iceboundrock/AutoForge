@@ -467,7 +467,10 @@ opencode run --standalone -m <provider/model>[#<effort>] --format default
 ### Pi profiles
 
 `provider: pi` runs [Pi](adr/0003-pi-agent-provider.md) (`pi` 1.0.0 or
-newer). The profile's fields map as follows:
+newer). The [Pi operator guide](pi.md) walks through installing Pi,
+signing in with ChatGPT, a profile to copy, `doctor`'s Pi rows and their
+remedies, and the opt-in live smoke test. The profile's fields map as
+follows:
 
 - `model` is `<pi-provider>/<model-id>`, for example
   `openai/gpt-5.6-terra` or `openai-codex/gpt-5.6`: exactly one `/`, a
@@ -526,7 +529,10 @@ profile sets `context_files: false`, a context file there or in a directory
 above the checkout. With the default `execution.worktree_dir` that includes
 the operator's own checkout. Pi has no approval layer: run unattended Pi
 phases in a container, a VM or under a dedicated user
-([Pi policy](pi-policy.md) §7).
+([Pi policy](pi-policy.md) §7). `doctor` also warns where the platform
+has no child subreaper (anything but Linux): what a Pi tool command leaves
+running can then outlive the launch, so Pi is attended only there
+([Pi operator guide: unattended use](pi.md#unattended-use)).
 
 ### SDK profiles (`claude-sdk`, `opencode-sdk`)
 

@@ -27,6 +27,33 @@ when a change could be interpreter-sensitive. Run `make test-sandbox` too
 when a change touches the outer sandbox (`sandbox*.py`, the executor, a
 provider's declaration, the engine's launch routing).
 
+## The live Pi smoke test
+
+`tests/test_live_pi.py` (#135) is the one test that calls a real agent and
+a real model: one LOCAL REVIEW through the operator's own Pi and ChatGPT
+sign-in. It is opt-in twice over, so `make check` and CI never run it and
+stay offline:
+
+- `pyproject.toml` registers a `live` marker and adds `-m 'not live'` to
+  pytest's default options, so a default run deselects it (it is collected
+  and deselected, never run). Passing `-m live` selects it, since a later
+  `-m` wins.
+- Selected, it skips with its reason unless `AUTOFORGE_LIVE_PI=1`. Any
+  other non-empty value fails rather than being read as "no".
+
+```bash
+AUTOFORGE_LIVE_PI=1 uv run pytest -m live tests/test_live_pi.py
+```
+
+The prerequisites (Pi installed and signed in by you, `OPENAI_API_KEY`
+unset), its seven steps, its cost (one small REVIEW of subscription quota)
+and what it never does are in the
+[Pi operator guide](pi.md#prove-it-on-your-machine-the-live-smoke-test).
+Its report carries no account detail; post it on #135 as the evidence of a
+run. `tests/test_live_pi_support.py` runs in `make check`: it checks the
+deselection in a pytest process of its own, the credential scan and the
+other checks, and rehearses the whole flow against the fake `pi`.
+
 ## The outer sandbox
 
 `tests/test_sandbox_bwrap.py`, `tests/test_sandbox_routing.py` and
@@ -160,7 +187,10 @@ Tests never call real Claude Code, OpenCode or GitHub write APIs. Agents are
 replaced by a `ScriptedProvider` and GitHub by an in-memory fake; the
 executor tests use real local Python subprocesses only, and the sandbox's
 real-backend tests real `bwrap` around fake CLIs
-([The outer sandbox](#the-outer-sandbox)).
+([The outer sandbox](#the-outer-sandbox)). The one exception, a real Pi and
+a real model call, is the opt-in live smoke test
+([The live Pi smoke test](#the-live-pi-smoke-test)), which no default run
+selects.
 
 - [testing.md](agent-guides/testing.md): the coverage contract, including
   the high-priority areas every behavioural change there must test.

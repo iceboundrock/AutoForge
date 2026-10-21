@@ -12,12 +12,18 @@ read it before adding tests for a listed area.
   APIs. Agents are replaced by scripted providers (Pi by the fake `pi` of
   `tests/pi_fake.py`, Claude's stream by the fake `claude` of
   `tests/claude_fake.py`) and GitHub by an in-memory fake; the executor tests
-  use real local Python subprocesses only. The one exception is an opt-in
+  use real local Python subprocesses only. One exception is an opt-in
   probe, skipped unless its variable names an installed runtime
   (`AUTOFORGE_PI_E2E_BIN`, `AUTOFORGE_CLAUDE_SDK_PROBE_CLI`,
   `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`). Such a probe uses a temporary home
   and synthetic credentials, and calls no model: the Claude probe answers
-  from a loopback stand-in.
+  from a loopback stand-in. The other is the live Pi smoke test
+  (`tests/test_live_pi.py`, #135), the only test that makes a model call:
+  marked `live`, deselected by default (`pyproject.toml` adds
+  `-m 'not live'`), and skipped unless `AUTOFORGE_LIVE_PI=1`. It uses the
+  operator's own Pi sign-in, which it never reads, and writes nothing to
+  GitHub. A new live test takes the marker and its own variable, and
+  never runs in `make check` or CI.
 - Never merge a real PR, push to a real remote, or touch a checkout outside
   `tmp_path`.
 - Never weaken an assertion, a safety gate, or a verification step to make an
@@ -213,6 +219,10 @@ merge gate certificate check (#175)   test_merge_certificate.py (each requiremen
                                       parity); the existing merge gate: test_engine.py
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
+live Pi smoke test (#135)             test_live_pi.py (opt-in: -m live, AUTOFORGE_LIVE_PI=1; its
+                                      flow and checks in tests/live_pi.py), test_live_pi_support.py
+                                      (offline: deselection, the credential scan, the checks, the
+                                      flow rehearsed on the fake pi)
 Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)
 SDK policy (#149): options, tools,    test_sdk_policy.py (opt-in probes of an installed Claude
 roots, credentials, environment,      Code CLI or OpenCode runtime against sentinel
