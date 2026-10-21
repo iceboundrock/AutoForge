@@ -2288,8 +2288,9 @@ class PiProvider(AgentProvider):
                     f"{fields}: this profile requires Pi's ChatGPT sign-in; Pi resolved an "
                     "API key (set options.require_oauth: false to run on an API key)"
                 )
+            # `;`, not `:`: the redactor reads `api_key: <word>` as a key's value.
             return True, (
-                f"{fields}: authenticated for provider {configured!r} only; whether this "
+                f"{fields}; authenticated for provider {configured!r} only; whether this "
                 f"credential may use {profile.model!r} cannot be checked read-only (doctor "
                 "neither refreshes nor uses it), the first real run is the proof"
             )

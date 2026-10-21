@@ -1,30 +1,38 @@
 """The live Pi smoke test (#135): its flow, its checks and its report.
 
 ``tests/test_live_pi.py`` runs :func:`run_smoke` against the real ``pi`` and
-a ChatGPT sign-in the operator made beforehand; ``tests/test_live_pi_support.py``
+a credential the operator gave Pi beforehand; ``tests/test_live_pi_support.py``
 runs the same flow against the fake ``pi`` of ``tests/pi_fake.py``, offline,
-and tests each check on its own. One run is seven steps
-(docs/development.md, "The live Pi smoke test"):
+and tests each check on its own. A run takes one of two auth routes, named
+explicitly (``AUTOFORGE_LIVE_PI_AUTH``): ``api_key``, a provider API key with
+``require_oauth: false`` (DeepSeek first, the acceptance run of #135's
+amendment of 2026-10-20), or ``oauth``, the ChatGPT sign-in with
+``require_oauth: true`` (an optional regression run). One run is seven
+steps (docs/development.md, "The live Pi smoke test"):
 
 1. preconditions, checked and never performed: ``pi`` is installed, at
-   least :data:`~autoforge.providers.PI_MIN_VERSION`, and signed in;
-2. ``OPENAI_API_KEY`` is absent from this process's environment;
+   least :data:`~autoforge.providers.PI_MIN_VERSION`, and Pi's read-only
+   auth check resolves the model to a credential of the route's type;
+2. no provider API key (:data:`PROVIDER_KEY_NAMES`) is in this process's
+   environment, unless the operator forwards one on purpose
+   (``AUTOFORGE_LIVE_PI_FORWARD_KEY``, the ``api_key`` route only);
 3. ``autoforge local doctor`` (the real CLI, in a process of its own) passes
-   its Pi rows: Pi available, auth ready with ``authType oauth``;
+   its Pi rows: Pi available, auth ready with the route's ``authType``;
 4. one LOCAL REVIEW on Pi returns a valid ``CONTROL_RESULT``: a scripted
    stand-in implements a one-line feature, so the review is the only model
    call (``execution.max_correction_attempts: 0``);
 5. nothing AutoForge wrote holds a credential-shaped string;
 6. the review left no side effect AutoForge promised against: the tree is
    unchanged, Pi's session directory gained no entry, no process is left;
-7. the report: what ran and each step's outcome.
+7. the report: what ran (the AutoForge commit, the route) and each step's
+   outcome.
 
 What this never does: start ``/login`` or Pi interactively, read a file in
 Pi's agent directory (``auth.json`` included; the session check lists names
-only), pass ``--credentials`` or a ``print-*`` subcommand, or print a token,
-an account id, an email or a plan name. A model's or Pi's own error text is
-not printed either, since it may name the plan: a failure is reported by its
-category (#131's failure reasons), never by its detail.
+only), pass ``--credentials`` or a ``print-*`` subcommand, or print a key, a
+token, an account id, an email or a plan name. A model's or Pi's own error
+text is not printed either, since it may name the plan: a failure is
+reported by its category (#131's failure reasons), never by its detail.
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import autoforge
 from autoforge.config import ProfileConfig, load_config_file
 from autoforge.engine import ControllerEngine
 from autoforge.providers import (
@@ -53,6 +62,7 @@ from autoforge.providers import (
     PiProvider,
     ProviderRegistry,
     ScriptedProvider,
+    parse_pi_auth_check,
     parse_pi_version,
 )
 from autoforge.redaction import redact
@@ -61,12 +71,25 @@ from autoforge.transitions import Phase
 # `AUTOFORGE_LIVE_PI=1` (and `-m live`) runs the smoke test; any other
 # non-empty value is refused rather than read as "no".
 LIVE_VARIABLE = "AUTOFORGE_LIVE_PI"
+# The auth route, `api_key` or `oauth`, and the `authType` Pi's auth check
+# must report for it. Never defaulted, so a report always says which route
+# it proves: a run on an API key is no evidence for the ChatGPT sign-in.
+AUTH_VARIABLE = "AUTOFORGE_LIVE_PI_AUTH"
+AUTH_ROUTES = ("api_key", "oauth")
 # The model and thinking level of the review: an account may not have the
-# default model, and a non-reasoning model needs `off`.
+# default model, and a non-reasoning model needs `off`. DeepSeek's
+# `deepseek-flash` takes `low`, `high` and `max` without a clamp.
 MODEL_VARIABLE = "AUTOFORGE_LIVE_PI_MODEL"
 EFFORT_VARIABLE = "AUTOFORGE_LIVE_PI_EFFORT"
-DEFAULT_MODEL = "openai/gpt-5.6-terra"
+DEFAULT_MODELS = {"api_key": "deepseek/deepseek-flash", "oauth": "openai/gpt-5.6-terra"}
 DEFAULT_EFFORT = "low"
+# The provider API keys step 2 requires absent from this process, so that
+# the credential reaches Pi only through Pi's own store.
+PROVIDER_KEY_NAMES = ("OPENAI_API_KEY", "DEEPSEEK_API_KEY")
+# A key the operator forwards on purpose (the `api_key` route only): its
+# name goes to `execution.env_allowlist_extra`, which every launch gets.
+FORWARD_VARIABLE = "AUTOFORGE_LIVE_PI_FORWARD_KEY"
+_KEY_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*_API_KEY")
 # The review's limits: it reads two small files.
 IDLE_TIMEOUT_SECONDS = 300
 MAX_RUNTIME_SECONDS = 900
@@ -74,9 +97,9 @@ MAX_RUNTIME_SECONDS = 900
 PROBE_TIMEOUT_SECONDS = 120
 
 STEPS = (
-    "1. preconditions: pi installed, recent enough, signed in",
-    "2. no OPENAI_API_KEY in AutoForge's environment",
-    "3. doctor: pi available, pi auth ready with authType oauth",
+    "1. preconditions: pi installed, recent enough, a credential of the route's type",
+    "2. no provider API key in AutoForge's environment, unless forwarded on purpose",
+    "3. doctor: pi available, pi auth ready with the route's authType",
     "4. one REVIEW on Pi returns a valid CONTROL_RESULT",
     "5. nothing AutoForge wrote holds a credential-shaped string",
     "6. no Pi side effect: tree unchanged, no session file, no process left",
@@ -130,15 +153,22 @@ CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def credential_hits(text: str) -> list[str]:
-    """The names of the patterns ``text`` matches, in pattern order; never a match."""
-    return [name for name, pattern in CREDENTIAL_PATTERNS if pattern.search(text)]
+def credential_hits(text: str, values: Mapping[str, str] | None = None) -> list[str]:
+    """The names of the patterns ``text`` matches, in pattern order, then
+    ``the value of NAME`` for each of ``values`` (name to value: a key
+    forwarded on purpose, whatever its shape) it holds; never a match."""
+    hits = [name for name, pattern in CREDENTIAL_PATTERNS if pattern.search(text)]
+    hits += [f"the value of {name}" for name, value in (values or {}).items() if value in text]
+    return hits
 
 
-def scan_for_credentials(root: Path) -> list[tuple[str, str]]:
+def scan_for_credentials(
+    root: Path, values: Mapping[str, str] | None = None
+) -> list[tuple[str, str]]:
     """``(path relative to root, pattern name)`` for each credential-shaped
-    string in a file under ``root``. Symbolic links are not followed; the
-    matched text is never returned."""
+    string in a file under ``root``, and each of ``values`` it holds
+    (:func:`credential_hits`). Symbolic links are not followed; the matched
+    text is never returned."""
     hits: list[tuple[str, str]] = []
     for directory, dirs, files in os.walk(root):
         dirs.sort()
@@ -148,7 +178,7 @@ def scan_for_credentials(root: Path) -> list[tuple[str, str]]:
                 continue
             text = path.read_bytes().decode("utf-8", errors="replace")
             relative = str(path.relative_to(root))
-            hits.extend((relative, hit) for hit in credential_hits(text))
+            hits.extend((relative, hit) for hit in credential_hits(text, values))
     return hits
 
 
@@ -324,18 +354,68 @@ class SmokeReport:
 # -- the flow ----------------------------------------------------------------------
 @dataclass(frozen=True)
 class SmokeSettings:
-    """What the run uses: ``command`` is the profile's (``pi`` on ``PATH``)."""
+    """What the run uses: ``command`` is the profile's (``pi`` on ``PATH``),
+    ``auth`` the route (:data:`AUTH_ROUTES`), ``forward_key`` the name of a
+    key forwarded on purpose, or ''."""
 
     command: str = "pi"
-    model: str = DEFAULT_MODEL
+    auth: str = "api_key"
+    model: str = DEFAULT_MODELS["api_key"]
     effort: str = DEFAULT_EFFORT
+    forward_key: str = ""
+
+    @property
+    def require_oauth(self) -> bool:
+        return self.auth == "oauth"
 
 
-def settings_from_environment() -> SmokeSettings:
+def settings_from_environment(env: Mapping[str, str] = os.environ) -> SmokeSettings:
+    """The settings the operator chose; :class:`ValueError` names a wrong one."""
+    auth = env.get(AUTH_VARIABLE, "")
+    if auth not in AUTH_ROUTES:
+        raise ValueError(
+            f"set {AUTH_VARIABLE} to api_key (a provider API key, require_oauth: false; "
+            f"default model {DEFAULT_MODELS['api_key']}) or oauth (the ChatGPT sign-in, "
+            f"require_oauth: true; default model {DEFAULT_MODELS['oauth']}), got {auth!r}"
+        )
+    forward = env.get(FORWARD_VARIABLE, "")
+    if forward and auth != "api_key":
+        raise ValueError(f"{FORWARD_VARIABLE} forwards an API key: the oauth route takes none")
+    if forward and not _KEY_NAME_RE.fullmatch(forward):
+        raise ValueError(f"{FORWARD_VARIABLE} must name a provider key (NAME_API_KEY)")
     return SmokeSettings(
-        model=os.environ.get(MODEL_VARIABLE) or DEFAULT_MODEL,
-        effort=os.environ.get(EFFORT_VARIABLE) or DEFAULT_EFFORT,
+        auth=auth,
+        model=env.get(MODEL_VARIABLE) or DEFAULT_MODELS[auth],
+        effort=env.get(EFFORT_VARIABLE) or DEFAULT_EFFORT,
+        forward_key=forward,
     )
+
+
+def forwarded_values(settings: SmokeSettings) -> dict[str, str]:
+    """The forwarded key's value by name, for step 5's scan; never shown."""
+    value = os.environ.get(settings.forward_key, "") if settings.forward_key else ""
+    return {settings.forward_key: value} if value else {}
+
+
+def autoforge_commit() -> str:
+    """The AutoForge commit under test, from the checkout ``autoforge`` is
+    imported from, and whether its tracked files differ from it."""
+    package = Path(autoforge.__file__).resolve().parent
+
+    def git(*argv: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(package), *argv],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+
+    found = git("rev-parse", "--show-toplevel", "HEAD")
+    lines = found.stdout.split()
+    if found.returncode != 0 or len(lines) != 2 or Path(lines[0]) / "src" / "autoforge" != package:
+        return "unknown (autoforge is not imported from a git checkout)"
+    dirty = git("status", "--porcelain", "--untracked-files=no").stdout.strip()
+    return lines[1] + (" with uncommitted changes" if dirty else "")
 
 
 class RecordingPi(PiProvider):
@@ -365,8 +445,9 @@ def write_repository(root: Path) -> Path:
 
 def write_config(path: Path, settings: SmokeSettings) -> Path:
     """The run's configuration: the implementer and fixer scripted, every
-    reviewer a LOCAL run can reach on Pi with ``require_oauth``, and no
-    correction relaunch, so the review is one model call."""
+    reviewer a LOCAL run can reach on Pi with the route's ``require_oauth``,
+    a forwarded key in ``execution.env_allowlist_extra``, and no correction
+    relaunch, so the review is one model call."""
     reviewer = {
         "provider": "pi",
         "model": settings.model,
@@ -374,11 +455,14 @@ def write_config(path: Path, settings: SmokeSettings) -> Path:
         "command": settings.command,
         "idle_timeout_seconds": IDLE_TIMEOUT_SECONDS,
         "max_runtime_seconds": MAX_RUNTIME_SECONDS,
-        "options": {"require_oauth": True},
+        "options": {"require_oauth": settings.require_oauth},
     }
+    execution: dict[str, object] = {"max_correction_attempts": 0}
+    if settings.forward_key:
+        execution["env_allowlist_extra"] = [settings.forward_key]
     data = {
         "version": 1,
-        "execution": {"max_correction_attempts": 0},
+        "execution": execution,
         "local": {"exclude": ["**/__pycache__"]},
         "profiles": {
             "analyze_execute": {"provider": "scripted"},
@@ -416,13 +500,17 @@ def _pi_profile(settings: SmokeSettings) -> ProfileConfig:
         model=settings.model,
         effort=settings.effort,
         command=settings.command,
-        options={"require_oauth": "true"},
+        options={"require_oauth": "true" if settings.require_oauth else "false"},
     )
 
 
 def check_preconditions(settings: SmokeSettings, cwd: Path, report: SmokeReport) -> None:
-    """Step 1: ``pi`` on PATH, its version, a ChatGPT sign-in (Pi's read-only
-    ``auth check --no-refresh``). Pi's output is never shown."""
+    """Step 1: ``pi`` on PATH, its version, and Pi's read-only ``auth check
+    --no-refresh`` resolving the model to a credential of the route's
+    ``authType``; Pi 1.3.0 answers an id it does not resolve ``invalid``
+    (an older Pi may not, and step 4's launch checks the model again).
+    Run without a provider key step 2 would refuse, so it sees what the
+    launch would. Pi's output is never shown."""
     path = shutil.which(settings.command)
     if path is None:
         raise StepFailed(f"`{settings.command}` is not on PATH: install Pi yourself (docs/pi.md)")
@@ -439,23 +527,56 @@ def check_preconditions(settings: SmokeSettings, cwd: Path, report: SmokeReport)
     require(found >= PI_MIN_VERSION, f"pi {release}: pi >= {minimum} is required")
     profile = _pi_profile(settings)
     provider = PiProvider()
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in PROVIDER_KEY_NAMES or name == settings.forward_key
+    }
     auth = subprocess.run(
         [path, *provider.auth_check_command(profile)[1:]],
         cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         timeout=PROBE_TIMEOUT_SECONDS,
     )
     ok, detail = provider.auth_verdict(profile, auth.returncode, auth.stdout)
-    require(ok, f"not signed in for {settings.model}: {detail}")
-
-
-def check_no_api_key() -> None:
-    """Step 2: proven in the shell as it is, so never unset here."""
+    require(ok, f"no usable credential for {settings.model}: {detail}")
+    check = parse_pi_auth_check(auth.stdout, auth.returncode)
+    report.facts["auth"] = f"Pi resolved authType {check.auth_type} for provider {check.provider!r}"
     require(
-        "OPENAI_API_KEY" not in os.environ,
-        "OPENAI_API_KEY is set: unset it for this test (it proves the subscription path, "
-        "so it does not unset it for you)",
+        check.auth_type == settings.auth,
+        f"Pi resolved authType {check.auth_type} for {settings.model}, "
+        f"not the {settings.auth} route's",
+    )
+
+
+def check_no_api_key(settings: SmokeSettings, report: SmokeReport) -> None:
+    """Step 2: proven in the shell as it is, so never unset here. Only a key
+    forwarded on purpose may be set, and it then must be; its name is
+    reported, never its value."""
+    present = [n for n in PROVIDER_KEY_NAMES if os.environ.get(n) and n != settings.forward_key]
+    why = (
+        "it proves the subscription path"
+        if settings.require_oauth
+        else f"the key reaches Pi through Pi's own store, or forward one on purpose with "
+        f"{FORWARD_VARIABLE}"
+    )
+    require(
+        not present,
+        f"{', '.join(present)} is set: unset it for this test, which does not unset it "
+        f"for you ({why})",
+    )
+    if not settings.forward_key:
+        report.facts["credential"] = "Pi's own credential store (no provider key forwarded)"
+        return
+    require(
+        os.environ.get(settings.forward_key),
+        f"{FORWARD_VARIABLE} names {settings.forward_key}, which is not set",
+    )
+    report.facts["credential"] = (
+        f"{settings.forward_key} forwarded on purpose by execution.env_allowlist_extra "
+        "(its value is not shown; Pi prefers a stored credential when it holds one)"
     )
 
 
@@ -496,8 +617,8 @@ def run_doctor(config: Path, repo: Path, settings: SmokeSettings, report: SmokeR
     rows = [c for c in pi_rows if c["name"].startswith(auth)]
     require(rows and all(c["ok"] for c in rows), "doctor's 'auth ready' row did not pass")
     require(
-        all("authType oauth" in c["detail"] for c in rows),
-        "doctor's 'auth ready' row does not name authType oauth",
+        all(f"authType {settings.auth}" in c["detail"] for c in rows),
+        f"doctor's 'auth ready' row does not name authType {settings.auth}",
     )
     return proc.stdout
 
@@ -513,6 +634,10 @@ def run_smoke(
     from tests.conftest import ExplodingGitHub
 
     report.facts["date (UTC)"] = datetime.datetime.now(datetime.UTC).date().isoformat()
+    report.facts["AutoForge commit"] = autoforge_commit()
+    report.facts["auth route"] = (
+        f"{settings.auth} (require_oauth: {str(settings.require_oauth).lower()})"
+    )
     report.facts["model"] = settings.model
     report.facts["thinking"] = settings.effort
     sessions = pi_session_dir()
@@ -524,7 +649,7 @@ def run_smoke(
     with report.step(STEPS[0]):
         check_preconditions(settings, workdir, report)
     with report.step(STEPS[1]):
-        check_no_api_key()
+        check_no_api_key(settings, report)
     with report.step(STEPS[2]):
         doctor_output = run_doctor(config, repo, settings, report)
     if not all(report.passed(name) for name in STEPS[:3]):
@@ -575,8 +700,9 @@ def run_smoke(
         )
 
     with report.step(STEPS[4]):
-        hits = scan_for_credentials(repo / ".git" / "autoforge")
-        hits += [("<doctor output>", name) for name in credential_hits(doctor_output)]
+        values = forwarded_values(settings)
+        hits = scan_for_credentials(repo / ".git" / "autoforge", values)
+        hits += [("<doctor output>", name) for name in credential_hits(doctor_output, values)]
         require(not hits, "; ".join(f"{path}: {name}" for path, name in hits))
 
     with report.step(STEPS[5]):

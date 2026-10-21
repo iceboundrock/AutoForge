@@ -359,6 +359,9 @@ profiles:
   # Pi (`provider: pi`, ADR 0003) instead: replace the block above with this
   # one. Prerequisite, an operator step AutoForge never performs for you:
   # install Pi 1.0.0+, run `pi`, then `/login openai` (ChatGPT sign-in).
+  # For DeepSeek instead, give Pi its API key yourself and set
+  # `model: deepseek/deepseek-flash`, `effort: low` and
+  # `require_oauth: false` (docs/pi.md#deepseek-on-an-api-key).
   # `autoforge doctor` checks the Pi version and, read-only, that Pi holds a
   # credential for the provider (not that this model is usable with it; that
   # depends on your plan). The operator guide, with the opt-in live smoke

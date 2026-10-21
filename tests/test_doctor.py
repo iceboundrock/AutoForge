@@ -9,6 +9,7 @@ import autoforge.executor as executor_module
 from autoforge.doctor import Doctor
 from autoforge.executor import ExecutionResult, execute
 from autoforge.profiles import local_required_profiles
+from autoforge.redaction import redact
 from tests.conftest import is_shell_probe
 
 RULES_ENDPOINT = "repos/owner/repo/rules/branches/main"
@@ -1136,6 +1137,17 @@ def test_require_oauth_decides_whether_an_api_key_is_acceptable(
     assert row.ok is ok, row.detail
     if not ok:
         assert "require_oauth: false" in row.detail
+
+
+def test_a_ready_api_key_row_survives_the_redaction_doctor_prints_it_through(tmp_path):
+    """#135: the DeepSeek route's OK row, as `autoforge doctor` prints it
+    (redacted), still reads `authenticated`, not a redaction marker."""
+    profile = _pi_profile(model="deepseek/deepseek-flash", options={"require_oauth": "false"})
+    auth = (0, '{"status":"ready","provider":"deepseek","authType":"api_key"}')
+    row = _pi_doctor(tmp_path, profile=profile, auth=auth)[PI_AUTH]
+    assert row.ok, row.detail
+    assert redact(row.detail) == row.detail
+    assert "authType api_key; authenticated for provider 'deepseek' only" in row.detail
 
 
 def test_pi_profiles_sharing_a_model_share_one_probe(tmp_path):

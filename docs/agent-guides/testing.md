@@ -1299,7 +1299,9 @@ is scripted with the same handlers `ScriptedProvider` takes. Keep covered:
 ### The live Pi smoke test (#135)
 
 `tests/test_live_pi.py` runs one LOCAL REVIEW through the operator's real
-Pi and ChatGPT sign-in. It is marked `live`: `pyproject.toml`'s
+Pi and credential, on the auth route `AUTOFORGE_LIVE_PI_AUTH` names:
+`api_key` (DeepSeek first, `require_oauth: false`) or `oauth` (the ChatGPT
+sign-in, optional). It is marked `live`: `pyproject.toml`'s
 `-m 'not live'` deselects it from every default run, and selected with
 `-m live` it skips unless `AUTOFORGE_LIVE_PI=1`. Its flow and checks live
 in `tests/live_pi.py`; `tests/test_live_pi_support.py` keeps covered,
@@ -1307,20 +1309,35 @@ offline:
 
 - the deselection: a default pytest process deselects it and runs nothing,
   and `-m live` without the variable skips with its reason
+- the settings: the route is never defaulted, each route has its default
+  model, and only the `api_key` route forwards a key, named like one
 - the credential scan finds each pattern (JWT, `Bearer`, `refresh_token`,
   `"refresh"`, `"access"`, `chatgpt-account-id`, `chatgpt_account_id`,
-  `sk-` keys) in synthetic data, also escaped inside a JSON string, and
-  reports the file and the pattern name, never the match; prose and
-  symbolic links are not hits
+  `sk-` keys, a DeepSeek-shaped key among them, which redaction masks) in
+  synthetic data, also escaped inside a JSON string, and a forwarded key's
+  value whatever its shape, and reports the file and the pattern name,
+  never the match; prose and symbolic links are not hits
 - a Pi failure is reported by its category as the provider's refusal or
   AutoForge's failure, never with its text
 - the session-directory, tree and process checks
 - the whole flow against the fake `pi`, through the real
   `autoforge local doctor` in a process of its own and the real engine and
-  `PiProvider`: it passes; a usage limit is named by its category while
-  the later checks still run; a reviewer that writes and a new session
-  entry each fail; an `OPENAI_API_KEY` fails step 2, is not unset and
-  starts no Pi; a missing `pi` fails the preconditions
+  `PiProvider`: it passes on the `api_key` route (no key in any launch,
+  two read-only auth checks, the report naming the commit, the route and
+  the `authType`, nothing in it redacted) and on the `oauth` route; a key
+  forwarded on purpose reaches the launch, is named and never shown, and
+  its value is found where AutoForge wrote it; on the `api_key` route an
+  auth check that is not ready, names another provider, is unreadable, or
+  is `invalid` for a model Pi does not resolve fails step 1 and doctor and
+  starts no review; a credential of the other route's type fails either
+  route; a review answer without a valid `CONTROL_RESULT` fails step 4 as
+  AutoForge's; a usage limit or a model error is named by its category
+  while the later checks still run; a reviewer that writes and a new
+  session entry each fail; an `OPENAI_API_KEY` or `DEEPSEEK_API_KEY` fails
+  step 2 on either route, is not unset and starts no Pi; a forward of an
+  unset key fails step 2; a missing `pi` fails the preconditions
+- `tests/test_doctor.py`: the `api_key` route's OK auth row reads the same
+  after the redaction `autoforge doctor` prints it through
 
 ### SDK policy (#149, docs/sdk-policy.md)
 

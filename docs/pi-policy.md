@@ -9,7 +9,7 @@
   warning, and #135's containment row), `src/autoforge/redaction.py` (OAuth
   fields), `src/autoforge/executor.py` and `executor_duplex.py` (orphan
   containment).
-- **Operator guide:** [Pi: running phases on a ChatGPT subscription](pi.md)
+- **Operator guide:** [Pi: running phases on DeepSeek or a ChatGPT subscription](pi.md)
   (#135) is the how-to; this page is the policy and its evidence.
 - **Evidence base.** Each item below names its evidence and how it was
   checked. "Verified on installed Pi 1.0.1" means it was observed by running
@@ -98,8 +98,10 @@ It does **not** block model calls or the request-path OAuth token refresh.
 A real ChatGPT sign-in and its token refresh were not exercised here.
 #135's opt-in live smoke test (`tests/test_live_pi.py`,
 [Pi operator guide](pi.md#prove-it-on-your-machine-the-live-smoke-test))
-runs one REVIEW through a real sign-in under this argv; its evidence is
-posted on #135 when a maintainer runs it.
+runs one REVIEW under this argv through a real credential: a DeepSeek API
+key (the acceptance run) or, optionally, a real sign-in. Its evidence is
+posted on #135 when a maintainer runs it; a DeepSeek run is no evidence
+for the sign-in.
 
 ## 4. Context files: on by default, `context_files: false` to turn off
 
@@ -372,14 +374,16 @@ changes.
   row's API-key refusal, and the containment row (#135: OK with a child
   subreaper, WARN without one, and WARN where the setting can be read
   but not set); `tests/test_executor.py` pins the probe behind it.
-- **opt-in, real Pi and a real sign-in (#135):** `tests/test_live_pi.py`,
+- **opt-in, real Pi and a real credential (#135):** `tests/test_live_pi.py`,
   marked `live` and deselected by default, runs under `-m live` with
-  `AUTOFORGE_LIVE_PI=1`: one LOCAL REVIEW through the operator's Pi and
-  ChatGPT sign-in, then a credential scan of everything AutoForge wrote and
-  the side-effect checks ([Pi operator guide](pi.md#prove-it-on-your-machine-the-live-smoke-test)).
+  `AUTOFORGE_LIVE_PI=1` and a route, `AUTOFORGE_LIVE_PI_AUTH=api_key`
+  (DeepSeek, `require_oauth: false`) or `oauth` (the ChatGPT sign-in): one
+  LOCAL REVIEW through the operator's Pi, then a credential scan of
+  everything AutoForge wrote and the side-effect checks
+  ([Pi operator guide](pi.md#prove-it-on-your-machine-the-live-smoke-test)).
   `tests/test_live_pi_support.py` checks offline that it is deselected by
-  default, its scan and its other checks, and rehearses its whole flow
-  against the fake `pi`.
+  default, its settings, its scan and its other checks, and rehearses its
+  whole flow on both routes against the fake `pi`.
 - `tests/test_redaction.py`: the OAuth fields and the prose cases.
 - `tests/test_executor.py`, `tests/test_executor_duplex.py`: orphan
   containment (ADR 0002 §5).

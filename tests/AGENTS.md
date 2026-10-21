@@ -21,9 +21,10 @@ read it before adding tests for a listed area.
   (`tests/test_live_pi.py`, #135), the only test that makes a model call:
   marked `live`, deselected by default (`pyproject.toml` adds
   `-m 'not live'`), and skipped unless `AUTOFORGE_LIVE_PI=1`. It uses the
-  operator's own Pi sign-in, which it never reads, and writes nothing to
-  GitHub. A new live test takes the marker and its own variable, and
-  never runs in `make check` or CI.
+  credential the operator gave Pi (a DeepSeek API key, or the ChatGPT
+  sign-in: `AUTOFORGE_LIVE_PI_AUTH` names the route), which it never
+  reads, and writes nothing to GitHub. A new live test takes the marker
+  and its own variable, and never runs in `make check` or CI.
 - Never merge a real PR, push to a real remote, or touch a checkout outside
   `tmp_path`.
 - Never weaken an assertion, a safety gate, or a verification step to make an

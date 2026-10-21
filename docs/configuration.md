@@ -468,12 +468,13 @@ opencode run --standalone -m <provider/model>[#<effort>] --format default
 
 `provider: pi` runs [Pi](adr/0003-pi-agent-provider.md) (`pi` 1.0.0 or
 newer). The [Pi operator guide](pi.md) walks through installing Pi,
-signing in with ChatGPT, a profile to copy, `doctor`'s Pi rows and their
-remedies, and the opt-in live smoke test. The profile's fields map as
-follows:
+giving it a DeepSeek API key or signing in with ChatGPT, a profile to copy
+for each, `doctor`'s Pi rows and their remedies, and the opt-in live smoke
+test. The profile's fields map as follows:
 
 - `model` is `<pi-provider>/<model-id>`, for example
-  `openai/gpt-5.6-terra` or `openai-codex/gpt-5.6`: exactly one `/`, a
+  `deepseek/deepseek-flash`, `openai/gpt-5.6-terra` or
+  `openai-codex/gpt-5.6`: exactly one `/`, a
   lowercase provider name, and no `:<thinking>` suffix (the thinking level
   comes from `effort`).
 - `effort` is required and is one of `off`, `minimal`, `low`, `medium`,
@@ -504,7 +505,10 @@ follows:
   `doctor` fails, and a launch is refused before anything starts, when
   `OPENAI_API_KEY` would reach Pi through the allow-list. Every launch first
   runs `pi auth check` (below), and Pi is started only when it reports a
-  ready OAuth sign-in for the model's provider.
+  ready OAuth sign-in for the model's provider. An API-key provider
+  (DeepSeek) needs `false`; its key belongs in Pi's credential store, or
+  is forwarded with `execution.env_allowlist_extra`, a list every agent
+  launch gets ([Pi operator guide](pi.md#deepseek-on-an-api-key)).
 
 `autoforge doctor` checks the Pi version and runs
 `pi auth check --model M --json --no-refresh` under the same environment

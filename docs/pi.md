@@ -1,12 +1,15 @@
-# Pi: running phases on a ChatGPT subscription
+# Pi: running phases on DeepSeek or a ChatGPT subscription
 
 This page is the operator's guide to `provider: pi`: how to run any
-AutoForge phase through [Pi](https://pi.dev/docs/latest) with the ChatGPT
-subscription you signed in to Pi with, and **no OpenAI Platform API key
-anywhere in AutoForge's environment**. It covers installing and signing in,
-a profile to copy, the choices that profile makes, `doctor`'s Pi rows and
-what each failure means, the security model, LOCAL mode, the limitations,
-and the opt-in smoke test that proves the setup on your machine.
+AutoForge phase through [Pi](https://pi.dev/docs/latest), an optional
+multi-model provider. Its first target is the **DeepSeek API**, on an API
+key you give Pi yourself ([DeepSeek on an API key](#deepseek-on-an-api-key)).
+The **ChatGPT subscription** you signed in to Pi with stays supported, with
+**no OpenAI Platform API key anywhere in AutoForge's environment**. The page
+covers installing Pi, giving it a credential, a profile to copy for each
+route, the choices a profile makes, `doctor`'s Pi rows and what each
+failure means, the security model, LOCAL mode, the limitations, and the
+opt-in smoke test that proves the setup on your machine.
 
 The decisions behind it, with their evidence, are in
 [ADR 0003](adr/0003-pi-agent-provider.md) (the RPC adapter) and the
@@ -30,9 +33,82 @@ AutoForge never installs, updates or configures Pi, and every launch passes
 ([Pi policy](pi-policy.md) §3). Pi runs on POSIX systems only, like
 AutoForge's executor.
 
+## DeepSeek on an API key
+
+A DeepSeek profile authenticates with an API key, so it sets
+`require_oauth: false`:
+
+<!-- pi-guide-deepseek-example -->
+```yaml
+profiles:
+  review_round_1:
+    provider: pi
+    model: deepseek/deepseek-flash   # exact id, as Pi's model list shows it
+    effort: low                      # deepseek-flash: low, high or max (no clamp)
+    command: pi
+    idle_timeout_seconds: 900
+    max_runtime_seconds: 3600
+    options:
+      require_oauth: false           # an API key, not the ChatGPT sign-in
+```
+<!-- /pi-guide-deepseek-example -->
+
+`tests/test_config.py` loads and validates this block too. Use the id
+Pi's own model list shows: `deepseek/deepseek-flash` is the id in Pi
+1.3.0's DeepSeek catalog, where the retired `deepseek/deepseek-v4-flash`
+alias no longer resolves (Pi's auth check answers it `status invalid`,
+reason `invalid_state`). The effort must be one the model supports:
+`deepseek-flash` takes `low`, `high` and `max`, and AutoForge fails a
+level Pi would clamp ([Provider and model](#provider-model-and-thinking-level)).
+
+**Where the key lives.** Either place works; the first is preferred:
+
+- **In Pi's own credential store.** Give the key to Pi itself, as
+  [Pi's docs](https://pi.dev/docs/latest) describe for an API-key
+  provider. Pi keeps it in `auth.json` in its agent directory, which
+  AutoForge never reads, copies or prints, and uses a stored credential
+  before an environment variable. No variable is forwarded, so the key
+  reaches no other agent.
+- **As `DEEPSEEK_API_KEY`, forwarded on purpose.** No provider key reaches
+  Pi by default. Listing the name in `execution.env_allowlist_extra`
+  forwards it from the shell that runs `autoforge`:
+
+  ```yaml
+  execution:
+    env_allowlist_extra: [DEEPSEEK_API_KEY]
+  ```
+
+  That list is **global**: it reaches every agent launch, of every
+  profile and every provider (Claude Code and OpenCode too), and through
+  Pi's `bash` tool every command Pi runs. It is **not a per-profile
+  credential boundary**, which is why the store is preferred.
+
+**Under the outer sandbox.** With `sandbox.mode: required`, or `preferred`
+in REMOTE mode (where it is `required`), the sandbox hides your home and
+refuses an agent directory that is, contains or lies inside `~/.pi/agent`
+([Pi policy](pi-policy.md) §8). A sandboxed Pi launch therefore needs a
+**dedicated `PI_CODING_AGENT_DIR` holding its own credential**: export
+`PI_CODING_AGENT_DIR=/absolute/path` in the shell that runs `autoforge`,
+and give Pi the key once with that variable set. Run `doctor` with it set
+as well: its auth row runs outside the sandbox, so without the variable it
+checks `~/.pi/agent` and can report `ready` for a credential a sandboxed
+launch cannot see. A forwarded `DEEPSEEK_API_KEY` is an ordinary
+allow-listed variable and passes into the sandbox too. Neither sandboxed
+route has been run against the real DeepSeek API yet.
+
+**What is checked, and when.** `doctor`'s auth row passes on
+`status ready` with `authType api_key` for provider `deepseek`. With
+`require_oauth: false` a launch runs no auth check of its own (that check
+enforces the ChatGPT sign-in), so a key that is missing or no longer valid
+fails the phase with Pi's provider failure
+(`pi: prompt rejected before acceptance`, or
+`pi: model error after acceptance`). DeepSeek bills
+the account the key belongs to, and AutoForge cannot check its balance or
+the model's availability before a run: the first real run is the proof.
+
 ## Sign in yourself
 
-The sign-in is yours, made once, in Pi:
+For the ChatGPT subscription, the sign-in is yours, made once, in Pi:
 
 ```text
 pi                      # start Pi interactively, in any directory
@@ -64,8 +140,10 @@ once with it set ([Pi policy](pi-policy.md) §8).
 
 ## A profile to copy
 
-Route any profile to Pi. This one puts the first reviewers on it; the same
-shape works for `analyze_execute`, `fix` and every other profile:
+Route any profile to Pi. This one puts the first reviewers on it with the
+ChatGPT sign-in (the DeepSeek one is under
+[DeepSeek on an API key](#deepseek-on-an-api-key)); the same shape works
+for `analyze_execute`, `fix` and every other profile:
 
 <!-- pi-guide-example -->
 ```yaml
@@ -103,10 +181,12 @@ carries the same profile, commented, for `review_round_2_5`.
 ## Provider, model and thinking level
 
 - **`<pi-provider>/<model-id>`.** `model` names Pi's provider and the
-  model's id, with exactly one `/`: `openai/<id>` uses the ChatGPT sign-in,
-  `openai-codex/<id>` the legacy one. Other Pi providers are allowed, but
-  they are outside this guide and need `require_oauth: false` when they
-  authenticate with an API key.
+  model's id, with exactly one `/`: `deepseek/<id>` uses a DeepSeek API
+  key ([DeepSeek on an API key](#deepseek-on-an-api-key)), `openai/<id>`
+  the ChatGPT sign-in, `openai-codex/<id>` the legacy one. Other Pi
+  providers are allowed, but they are outside this guide and, like
+  DeepSeek, need `require_oauth: false` when they authenticate with an API
+  key.
 - **Use exact ids.** Pi resolves `--model` by exact id, then by a fuzzy
   match, and can even fall back to a placeholder for an id it does not
   know. Before sending the prompt AutoForge reads back what Pi resolved and
@@ -124,9 +204,10 @@ carries the same profile, commented, for `review_round_2_5`.
   `pi: thinking mismatch: configured high, Pi resolved medium`. Set a level
   the model supports.
 - **Model availability is your account's.** `openai/gpt-5.6-terra` is an
-  example from Pi's catalog for the `openai` provider, not a promise: which
-  models a subscription may use depends on the plan and can change at any
-  time.
+  example from Pi's catalog for the `openai` provider, and
+  `deepseek/deepseek-flash` one for `deepseek`, not a promise: which models
+  a subscription or an API account may use depends on the plan and can
+  change at any time.
 
 ## Subscription or API key
 
@@ -134,16 +215,17 @@ carries the same profile, commented, for `review_round_2_5`.
   uses the sign-in even when `OPENAI_API_KEY` is exported in its
   environment; the key is consulted only when nothing is stored.
 - **AutoForge does not hand Pi a provider key.** No `OPENAI_*`,
-  `ANTHROPIC_*`, `GEMINI_*` or `GOOGLE_*` variable reaches Pi unless you
-  list it in `execution.env_allowlist_extra`
-  ([Pi policy](pi-policy.md) §8).
+  `DEEPSEEK_*`, `ANTHROPIC_*`, `GEMINI_*` or `GOOGLE_*` variable reaches Pi
+  unless you list it in `execution.env_allowlist_extra`, a list every
+  agent launch gets ([Pi policy](pi-policy.md) §8).
 - **`require_oauth: true`** (the default) makes it a rule. `doctor`'s auth
   row fails, and every launch is refused before anything starts, when
   `OPENAI_API_KEY` would reach Pi. Every launch first runs Pi's auth check
   and starts Pi only on a `ready` result with `authType oauth` for the
   model's provider. To run on an API key instead, set
-  `require_oauth: false` and forward the key with
-  `execution.env_allowlist_extra`.
+  `require_oauth: false` and keep the key in Pi's credential store, or
+  forward it with `execution.env_allowlist_extra`
+  ([DeepSeek on an API key](#deepseek-on-an-api-key)).
 - **They are different products.** The ChatGPT subscription and the OpenAI
   API are separate products with their own terms, usage limits and model
   availability. Subscription usage limits apply to AutoForge's runs as to
@@ -164,13 +246,13 @@ agent launch gets, never your whole shell, and none prints Pi's output.
 |---|---|---|
 | `agent 'pi' available (...)` | FAIL: not found, exited, or the version is unreadable | Pi is not installed under the profile's `command`, or does not answer `--version` as 1.x does. Install it ([Install](#install-pi-yourself)), or point `command` at it. |
 | | FAIL: `pi >= 1.0.0 is required` | Upgrade Pi. |
-| `agent 'pi' auth ready (...)` | OK: `status ready`, `authType oauth` | Signed in. The detail adds that the sign-in is proven for the provider only, and that whether it may use this model "cannot be checked read-only": model access is unproven until a run ([Subscription or API key](#subscription-or-api-key)). |
+| `agent 'pi' auth ready (...)` | OK: `status ready`, `authType oauth`, or `authType api_key` with `require_oauth: false` | Pi holds a credential: the sign-in, or an API key ([DeepSeek on an API key](#deepseek-on-an-api-key)). The detail adds that the credential is proven for the provider only, and that whether it may use this model "cannot be checked read-only": model access is unproven until a run ([Subscription or API key](#subscription-or-api-key)). |
 | | FAIL: `OPENAI_API_KEY is set and would reach Pi through the environment allow-list` | The key is forwarded by `execution.env_allowlist_extra` while the profile has `require_oauth`. Remove it there, or set `require_oauth: false`. Pi was not asked. |
 | | FAIL: `status ready`, `authType api_key` | Pi has an API key, not a sign-in, for the provider. Sign in ([Sign in](#sign-in-yourself)), or set `require_oauth: false`. |
-| | FAIL: `reason credentials_not_configured` | Pi has no credential for the provider. Sign in ([Sign in](#sign-in-yourself)), in the agent directory the launch uses (`PI_CODING_AGENT_DIR`, or `~/.pi/agent`). |
+| | FAIL: `reason credentials_not_configured` | Pi has no credential for the provider. Sign in ([Sign in](#sign-in-yourself)), or for an API-key provider give Pi the key or forward it ([DeepSeek on an API key](#deepseek-on-an-api-key)), in the agent directory the launch uses (`PI_CODING_AGENT_DIR`, or `~/.pi/agent`). |
 | | FAIL: `reason provider_not_found` | The provider prefix of `model` is not one of Pi's providers. Fix `model` ([Provider and model](#provider-model-and-thinking-level)). |
 | | FAIL: `reason credential_not_available` | Pi holds a sign-in it cannot use as stored. Run the check yourself (`pi auth check --model <model> --json --no-refresh`) and sign in again if it persists. What this read-only check reports for a sign-in whose access token has expired is not verified yet ([#129](https://github.com/iceboundrock/AutoForge/issues/129)); the [live smoke test](#prove-it-on-your-machine-the-live-smoke-test)'s report records what doctor printed. |
-| | FAIL: `reason invalid_state` | Pi finds its model or credential configuration invalid. Run the same check yourself to see Pi's own message. |
+| | FAIL: `reason invalid_state` | Pi finds its model or credential configuration invalid; Pi 1.3.0 answers so for a model id it does not resolve (a retired alias). Run the same check yourself to see Pi's own message, and copy the id from Pi's model list. |
 | | FAIL: `Pi resolved model ... to provider ..., not the configured ...` | Pi maps the model to another provider. Use the exact id ([Provider and model](#provider-model-and-thinking-level)). |
 | | FAIL: `exited N without a result AutoForge can read` | The output did not have Pi 1.x's shape: a wrapper printing extra lines, or a Pi whose contract changed. AutoForge fails closed. |
 | `pi loads no instructions from outside the checkout (...)` | WARN, naming the files | `SYSTEM.md` / `APPEND_SYSTEM.md` in Pi's agent directory (always loaded), or context files above the checkout. Remove or move them, or set `context_files: false` for the context files ([Pi policy](pi-policy.md) §4-5). |
@@ -202,7 +284,8 @@ The [Pi policy](pi-policy.md) is authoritative. In short:
   set `sandbox.mode: required` on Linux
   ([Configuration: outer sandbox](configuration.md#outer-sandbox)). A tool
   command can read `auth.json` in Pi's agent directory, which Pi needs for
-  its own sign-in; it gets no GitHub or git credential.
+  its own credential, and the value of any key you forward; it gets no
+  GitHub or git credential.
 - **Detached tool processes.** Pi's `bash` tool starts every command
   detached, so whatever a command backgrounds outlives Pi itself. The
   decision ([ADR 0002](adr/0002-executor-nothing-outlives-the-invocation.md)
@@ -278,48 +361,81 @@ ADR 0002 §4b and the [Pi policy](pi-policy.md) §10 record:
 ## Prove it on your machine: the live smoke test
 
 `tests/test_live_pi.py` is an opt-in test that runs one real phase through
-your Pi and your sign-in. It never runs in `make check` or CI: the `live`
+your Pi and your credential. It never runs in `make check` or CI: the `live`
 marker deselects it unless you pass `-m live`, and it then skips unless
-`AUTOFORGE_LIVE_PI=1`.
+`AUTOFORGE_LIVE_PI=1`. You name the auth route, which has no default, so a
+report always says which route it proves:
+
+- `AUTOFORGE_LIVE_PI_AUTH=api_key`: an API key, with
+  `require_oauth: false`; the model defaults to `deepseek/deepseek-flash`.
+  This is the route #135's acceptance run uses.
+- `AUTOFORGE_LIVE_PI_AUTH=oauth`: the ChatGPT sign-in, with
+  `require_oauth: true`; the model defaults to `openai/gpt-5.6-terra`. An
+  optional regression run. A run on an API key is no evidence for this
+  route, and until a report from this route is posted, the ChatGPT route
+  is untested against a real subscription.
 
 ```bash
-pi                       # once: /login openai, then quit
-unset OPENAI_API_KEY     # the test fails, and does not unset it for you
-AUTOFORGE_LIVE_PI=1 uv run pytest -m live tests/test_live_pi.py
+unset OPENAI_API_KEY DEEPSEEK_API_KEY  # the test fails, and does not unset them for you
+
+# DeepSeek, its key in Pi's own credential store
+AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live tests/test_live_pi.py
+
+# the ChatGPT sign-in (once before: `pi`, then /login openai)
+AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=oauth uv run pytest -m live tests/test_live_pi.py
 ```
 
-It costs one small REVIEW of subscription quota (a few-line diff, at
-thinking level `low`). `AUTOFORGE_LIVE_PI_MODEL` (default
-`openai/gpt-5.6-terra`) and `AUTOFORGE_LIVE_PI_EFFORT` (default `low`)
-choose the model. In a temporary directory it:
+To forward the key instead of keeping it in Pi's store, export it and add
+`AUTOFORGE_LIVE_PI_FORWARD_KEY=DEEPSEEK_API_KEY` (the `api_key` route
+only): the test's configuration then lists that name in
+`execution.env_allowlist_extra`, and the report names the route, never the
+value.
+
+It costs one small REVIEW of the account's quota (a few-line diff, at
+thinking level `low`). `AUTOFORGE_LIVE_PI_MODEL` and
+`AUTOFORGE_LIVE_PI_EFFORT` (default `low`) choose another model. In a
+temporary directory it:
 
 1. checks, and never performs, the preconditions: `pi` on `PATH`, at least
-   1.0.0, signed in for the model's provider;
-2. checks that `OPENAI_API_KEY` is absent from its environment;
+   1.0.0, and Pi's read-only `pi auth check --model M --json --no-refresh`
+   reporting `ready` for the model's provider with the route's `authType`
+   (`api_key` or `oauth`); Pi 1.3.0 answers a model id it does not
+   resolve with `status invalid`, which fails here;
+2. checks that no provider key (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) is in
+   its environment, so the credential reaches Pi through Pi's own store,
+   except a key forwarded on purpose, which must then be set;
 3. runs `autoforge local doctor` with a configuration whose reviewers are
-   Pi with `require_oauth: true`, and checks the "available" and
-   "auth ready" rows, with `authType oauth`;
+   Pi with the route's `require_oauth`, and checks the "available" and
+   "auth ready" rows, with the route's `authType`;
 4. drives a LOCAL run on a throwaway repository: a scripted stand-in
-   implements a one-line feature, then **one REVIEW runs on Pi** (no
-   correction relaunch) and must return a valid `CONTROL_RESULT`;
-5. scans everything AutoForge wrote (state, journal, run logs, doctor's
-   output) for JWTs, `Bearer`, `refresh_token`, `"refresh"`, `"access"`,
-   `chatgpt-account-id` / `chatgpt_account_id` and `sk-` keys, naming only
-   the file and the pattern;
+   implements a one-line feature, then **one REVIEW runs on Pi** through
+   AutoForge's own Pi adapter (no correction relaunch) and must return a
+   valid `CONTROL_RESULT`; the launch fails with `pi: model unavailable`
+   if the model is not among Pi's available ones;
+5. scans everything AutoForge wrote (state, journal, run logs and each
+   step's execution records, doctor's output) for JWTs, `Bearer`,
+   `refresh_token`, `"refresh"`, `"access"`, `chatgpt-account-id` /
+   `chatgpt_account_id` and `sk-` keys (DeepSeek's keys have that shape),
+   and for the forwarded key's own value, naming only the file and the
+   pattern;
 6. checks that the review left the tree unchanged, created no entry in
    Pi's session directory (`<agent dir>/sessions`, compared by name) and
    left no process running in or naming its directory;
-7. prints a report: the date, Pi's version, the model and thinking level
-   (as configured and as Pi resolved them), the review's duration and
-   outcome, doctor's Pi rows, and each step's PASS or FAIL.
+7. prints a report: the date, the AutoForge commit under test (and whether
+   its tracked files differ from it), the auth route, the `authType` Pi
+   resolved and where the credential lives, Pi's version, the model and
+   thinking level (as configured and as Pi resolved them), the review's
+   duration and outcome, doctor's Pi rows, and each step's PASS or FAIL.
 
 A failed review says who refused it: `provider refused (<reason>)` (the
-sign-in, a usage limit, the model's availability) or
-`AutoForge failure (<reason>)`, with Pi's failure categories and never
-their text. The test never starts `/login` or Pi interactively, never
-opens a file in Pi's agent directory, never passes `--credentials`, and
-prints no token, account id, email or plan name: its report is the
-evidence to post on the issue.
+credential, a usage limit or the account's balance, the model's
+availability) or `AutoForge failure (<reason>)`, with Pi's failure
+categories and never their text. The test never starts `/login` or Pi
+interactively, never opens a file in Pi's agent directory, never passes
+`--credentials` or a `print-*` subcommand, and prints no key, token,
+account id, email or plan name: its report is the evidence to post on the
+issue. Run it on the commit under review, so that the report's commit is
+the one reviewed.
 
 **More evidence, by hand.** To see the write phases too, route
 `analyze_execute` and `fix` to Pi as well and run `autoforge local init` /
