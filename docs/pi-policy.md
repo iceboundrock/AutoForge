@@ -324,9 +324,11 @@ sentence says a process may still be running. The prompt rule in
 unattended Pi use on it: the [Pi operator guide](pi.md#unattended-use)
 states that Pi is attended only on such a platform, and `doctor` adds a
 row for the Pi profiles, `pi's detached tool processes are contained`,
-which passes where the controller can be a child subreaper
-(`executor.orphan_containment_available`, read without being set) and
-warns elsewhere. It is a warning, never a failure: an attended run that
+which passes where the controller can make itself a child subreaper
+and warns elsewhere. `executor.orphan_containment_available` sets the
+attribute and restores it, as each contained launch sets it, so a
+security policy that permits reading it but denies setting it is a
+warning too. It is a warning, never a failure: an attended run that
 reads each result's leftovers sentence stays possible, and no default
 changes.
 
@@ -368,7 +370,8 @@ changes.
   and the preflight runner pinned.
 - `tests/test_doctor.py`: the outside-instruction WARN row, the auth
   row's API-key refusal, and the containment row (#135: OK with a child
-  subreaper, WARN without one).
+  subreaper, WARN without one, and WARN where the setting can be read
+  but not set); `tests/test_executor.py` pins the probe behind it.
 - **opt-in, real Pi and a real sign-in (#135):** `tests/test_live_pi.py`,
   marked `live` and deselected by default, runs under `-m live` with
   `AUTOFORGE_LIVE_PI=1`: one LOCAL REVIEW through the operator's Pi and

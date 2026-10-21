@@ -529,9 +529,10 @@ profile sets `context_files: false`, a context file there or in a directory
 above the checkout. With the default `execution.worktree_dir` that includes
 the operator's own checkout. Pi has no approval layer: run unattended Pi
 phases in a container, a VM or under a dedicated user
-([Pi policy](pi-policy.md) §7). `doctor` also warns where the platform
-has no child subreaper (anything but Linux): what a Pi tool command leaves
-running can then outlive the launch, so Pi is attended only there
+([Pi policy](pi-policy.md) §7). `doctor` also warns where the controller
+cannot make itself a child subreaper (anything but Linux, or a Linux host
+whose security policy denies it): what a Pi tool command leaves running
+can then outlive the launch, so Pi is attended only there
 ([Pi operator guide: unattended use](pi.md#unattended-use)).
 
 ### SDK profiles (`claude-sdk`, `opencode-sdk`)

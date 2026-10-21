@@ -174,7 +174,7 @@ agent launch gets, never your whole shell, and none prints Pi's output.
 | | FAIL: `Pi resolved model ... to provider ..., not the configured ...` | Pi maps the model to another provider. Use the exact id ([Provider and model](#provider-model-and-thinking-level)). |
 | | FAIL: `exited N without a result AutoForge can read` | The output did not have Pi 1.x's shape: a wrapper printing extra lines, or a Pi whose contract changed. AutoForge fails closed. |
 | `pi loads no instructions from outside the checkout (...)` | WARN, naming the files | `SYSTEM.md` / `APPEND_SYSTEM.md` in Pi's agent directory (always loaded), or context files above the checkout. Remove or move them, or set `context_files: false` for the context files ([Pi policy](pi-policy.md) §4-5). |
-| `pi's detached tool processes are contained (...)` | OK on Linux, WARN elsewhere | Whether a process a Pi tool command leaves running is killed when the launch ends. The WARN means: do not run Pi unattended on this platform ([Unattended use](#unattended-use)). |
+| `pi's detached tool processes are contained (...)` | OK on Linux, WARN elsewhere | Whether a process a Pi tool command leaves running is killed when the launch ends: OK only where the controller can make itself a child subreaper, as each launch does. It warns on a Linux host whose security policy (a seccomp filter, say) denies that too. The WARN means: do not run Pi unattended here ([Unattended use](#unattended-use)). |
 
 The same auth check runs before every launch. When it refuses, the phase
 fails with `pi: the auth preflight refused the launch: ...` and the same
@@ -268,11 +268,12 @@ ADR 0002 §4b and the [Pi policy](pi-policy.md) §10 record:
   unattended Pi run is supported under the conditions every unattended run
   needs: a container, a VM, a dedicated user or `sandbox.mode: required`,
   and a repository you trust.
-- **On every other platform** (no child subreaper), Pi is **attended
-  only**. A process a Pi tool command backgrounds can outlive the launch;
-  every result says so (`orphans_unchecked`), and `doctor` warns. The
-  prompt rule asking agents not to leave processes running is then the
-  only mitigation.
+- **On every other platform**, and on a Linux host whose security policy
+  denies the controller the child subreaper (no child subreaper either
+  way), Pi is **attended only**. A process a Pi tool command backgrounds
+  can outlive the launch; every result says so (`orphans_unchecked`),
+  and `doctor` warns. The prompt rule asking agents not to leave
+  processes running is then the only mitigation.
 
 ## Prove it on your machine: the live smoke test
 

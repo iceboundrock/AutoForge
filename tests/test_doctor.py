@@ -5,6 +5,7 @@ import json
 import pytest
 
 import autoforge.doctor as doctor_module
+import autoforge.executor as executor_module
 from autoforge.doctor import Doctor
 from autoforge.executor import ExecutionResult, execute
 from autoforge.profiles import local_required_profiles
@@ -1288,6 +1289,23 @@ def test_without_a_subreaper_unattended_pi_use_is_warned_against(tmp_path, monke
     assert row.label == "WARN" and not row.required
     assert "do not run Pi unattended here (docs/pi.md#unattended-use)" in row.detail
     assert results[PI_LABEL].ok and results[PI_AUTH].ok
+
+
+def test_a_subreaper_that_can_be_read_but_not_set_is_no_containment(tmp_path, monkeypatch):
+    """R1-F1: a security policy that permits reading the subreaper setting
+    but denies setting it leaves every launch uncontained, so doctor warns."""
+    calls = []
+
+    def prctl(option, arg, *_):
+        calls.append(option)
+        return 0 if option == executor_module._PR_GET_CHILD_SUBREAPER else -1
+
+    monkeypatch.setattr(executor_module, "_prctl", lambda: prctl)
+    row = _pi_doctor(tmp_path)[PI_CONTAINED]
+    assert row.label == "WARN" and not row.required
+    assert "cannot make itself a child subreaper" in row.detail
+    assert "a security policy denies it" in row.detail
+    assert executor_module._PR_SET_CHILD_SUBREAPER in calls
 
 
 def test_a_forwarded_api_key_fails_an_oauth_profile_without_probing(tmp_path, monkeypatch):

@@ -930,16 +930,34 @@ def _prctl() -> Callable[..., int] | None:
 def orphan_containment_available() -> bool:
     """Whether a contained invocation can catch its orphans here (ADR 0002 §4b).
 
-    True where the controller can be a child subreaper, which is read, not
-    set. Elsewhere a contained request runs uncontained and its result
-    carries ``orphans_unchecked``: a process that left the child's group may
-    outlive the invocation.
+    True where the controller can make itself a child subreaper, as
+    :meth:`_Containment.begin` does: the setting is read, set and restored,
+    so a host whose security policy permits reading it but denies setting it
+    (a seccomp filter, say) is not taken for one that can contain. Elsewhere
+    a contained request runs uncontained and its result carries
+    ``orphans_unchecked``: a process that left the child's group may outlive
+    the invocation.
     """
     prctl = _prctl()
     if prctl is None:
         return False
     current = ctypes.c_int(0)
-    return prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(current), 0, 0, 0) == 0
+    if not _CONTAINMENT_LOCK.acquire(blocking=False):
+        # A contained invocation of this process owns the setting, which is
+        # only read here: it is set when that invocation could set it.
+        return (
+            prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(current), 0, 0, 0) == 0
+            and current.value == 1
+        )
+    try:
+        if prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(current), 0, 0, 0) != 0:
+            return False
+        if prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            return False
+        prctl(_PR_SET_CHILD_SUBREAPER, current.value, 0, 0, 0)
+        return True
+    finally:
+        _CONTAINMENT_LOCK.release()
 
 
 def _children() -> dict[tuple[int, int], bool]:

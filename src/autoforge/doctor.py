@@ -12,8 +12,9 @@ under the same environment allow-list as the agent launch (never the
 operator's whole environment) and reported without Pi's raw output, and a
 warning naming the instruction files Pi would load from outside the
 checkout (docs/pi-policy.md §4-5); those are found by path, never read.
-It also warns where the platform cannot contain Pi's detached tool
-processes (no child subreaper), where unattended Pi use is not supported
+It also warns where the controller cannot contain Pi's detached tool
+processes (it cannot make itself a child subreaper: not Linux, or a
+security policy denies it), where unattended Pi use is not supported
 (docs/pi.md, #135). A Claude Code command must list the flags every
 launch keeps the operator's and the repository's integrations off with in
 its ``--help`` (#165) and fails while its settings or global
@@ -785,10 +786,12 @@ class Doctor:
 
         Pi's `bash` tool starts every command detached, so what a command
         backgrounds outlives Pi; only a child subreaper (Linux) lets the
-        executor find and kill it (ADR 0002 §4b). Without one, unattended
-        Pi use is not supported (docs/pi.md#unattended-use, #135). Never a
-        FAIL: an attended run that reads each result's leftovers sentence
-        is still possible.
+        executor find and kill it (ADR 0002 §4b). The row passes only where
+        the controller can make itself one, as each contained launch does,
+        not merely read the setting. Without one, unattended Pi use is not
+        supported (docs/pi.md#unattended-use, #135). Never a FAIL: an
+        attended run that reads each result's leftovers sentence is still
+        possible.
         """
         name = f"pi's detached tool processes are contained ({', '.join(p.name for p in profiles)})"
         if orphan_containment_available():
@@ -802,7 +805,8 @@ class Doctor:
         return CheckResult(
             name,
             False,
-            "this platform has no child subreaper: a process a Pi tool command leaves "
+            "the controller cannot make itself a child subreaper here (not Linux, or a "
+            "security policy denies it): a process a Pi tool command leaves "
             "running can outlive the launch, and each result says so (orphans_unchecked); "
             "do not run Pi unattended here (docs/pi.md#unattended-use)",
             required=False,

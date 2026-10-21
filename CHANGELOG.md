@@ -19,9 +19,11 @@ so.
   subscription versus API key, each `doctor` Pi row with its remedy,
   security, LOCAL mode, limitations and unattended use.
 - `doctor` gains a row for Pi profiles, `pi's detached tool processes are
-  contained`: OK on Linux, a warning elsewhere, where a process a Pi tool
-  command backgrounds can outlive the launch and Pi is attended only
-  (#135). A warning, never a failure.
+  contained`: OK where the controller can make itself a child subreaper
+  (Linux), a warning elsewhere, including a Linux host whose security
+  policy denies it. There a process a Pi tool command backgrounds can
+  outlive the launch and Pi is attended only (#135). A warning, never a
+  failure.
 - An opt-in live smoke test, `tests/test_live_pi.py` (#135): one LOCAL
   REVIEW through your own Pi and sign-in, then a credential scan of
   everything AutoForge wrote and checks for left-behind sessions and
