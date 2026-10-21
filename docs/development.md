@@ -61,6 +61,35 @@ deselection in a pytest process of its own, the route settings, the
 credential scan and the other checks, and rehearses the whole flow on both
 routes against the fake `pi`.
 
+## The operator-comment byte-fidelity capture
+
+Exact evidence for an operator action (K10, #243) rests on a premise no
+offline test establishes: a payload posted through the documented pipe,
+`autoforge status --action X-… | gh issue comment <target> --body-file -`,
+comes back from `GitHubClient.get_issue_comments` byte for byte. A
+maintainer settles it once, by hand, on a scratch issue they own, from the
+repository root, with a UTF-8 locale and their own `gh` login. The tool
+never writes to GitHub; you post, as an operator would:
+
+```bash
+S=https://github.com/<owner>/<repo>/issues/<scratch>
+uv run python -m tests.operator_comment_fidelity render --via pipe --issue "$S" \
+  | gh issue comment "$S" --body-file -
+uv run python -m tests.operator_comment_fidelity render --via web --issue "$S" > web.md
+# open web.md, copy all of it, paste it into the comment box of $S on github.com, submit
+uv run python -m tests.operator_comment_fidelity capture --issue "$S"
+```
+
+`capture` writes `tests/fixtures/operator_comment_fidelity/capture.json`:
+the raw GraphQL node of each comment, `gh --version`, the commit and the
+time. Commit it as captured, never edited.
+`tests/test_operator_comment_fidelity.py` replays it and pins the
+controller's decision: the pipe's comment must be exact evidence, and a web
+paste is exact only byte for byte, otherwise a conflict naming a
+whitespace-only difference. Those tests fail until the fixture is
+committed. If the pipe does not round-trip, they keep failing on the
+committed capture: #243's M2 stops, and ADR 0004 revisits exact evidence.
+
 ## The outer sandbox
 
 `tests/test_sandbox_bwrap.py`, `tests/test_sandbox_routing.py` and

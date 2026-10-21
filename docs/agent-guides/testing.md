@@ -1053,13 +1053,19 @@ a stated reason it has none. The coverage that must keep working:
   exact payload is never bound, and the prefix pass, a plain unblock and
   drift never verify one comment twice, PR #254 R2-F1), while an earlier
   round's payload may be bound; a binding reads every pending target and
-  refuses on one it cannot read, named or not, also as a dry run (R2-F3); `--approve-action X-…` is refused; a
-  decline keeps a verified comment, withdraws the other pending actions,
-  is refused while anything of the plan is on GitHub, and shares the
-  round's bound with K9; drift records each action `verified` or `stale`;
-  every K10 read-back row and each of D2.1a's six layers in
-  `tests/test_effects.py`, a comment past the first hundred and a target
-  GitHub answers with another object through the real client included
+  refuses on one it cannot read, named or not, also as a dry run (R2-F3);
+  `--approve-action X-…` is refused; a decline keeps a verified comment,
+  withdraws the other pending actions, is refused while anything of the
+  plan is on GitHub, and shares the round's bound with K9; drift records
+  each action `verified` or `stale`; `status` names a committed candidate
+  held behind the actions, and says nothing was committed only when
+  nothing was (R2-F2); every K10 read-back row and each of D2.1a's six
+  layers in `tests/test_effects.py`, a comment past the first hundred and
+  a target GitHub answers with another object through the real client
+  included; the maintainer-captured byte-fidelity fixture replayed through
+  the real client in `tests/test_operator_comment_fidelity.py` (the pipe's
+  comment is exact evidence, a web paste only byte for byte; failing until
+  the capture is committed, see `docs/development.md`)
 - `REPLAN_REEXECUTE`'s publication (#164, `tests/test_replan.py`, "The
   controller publishes the replacement"): the replan agent commits on the
   base its prompt names and publishes nothing, and the controller pushes
