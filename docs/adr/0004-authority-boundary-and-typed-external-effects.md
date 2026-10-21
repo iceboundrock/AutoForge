@@ -1656,7 +1656,11 @@ change is reported to the next `REVIEW` as data and reopens nothing.
 - **Normalizing line endings or whitespace before comparing.** It adds a
   second equality beside K9's exact bytes. Exact evidence stays exact; a
   conflict reason names a whitespace-only difference so the operator can
-  repair it.
+  repair it. #243's M2 prerequisite, the byte-fidelity capture
+  (`tests/fixtures/operator_comment_fidelity/capture.json`, replayed by
+  `tests/test_operator_comment_fidelity.py`), supports this: a payload
+  posted through the documented pipe came back from the complete listing
+  byte for byte, and a web paste did not.
 - **Treating an unblock reason, a URL in prose, a PR checkbox or a comment
   on the run's issue as evidence.** That is how PR #242's run was unstuck
   without anything being verified.

@@ -152,8 +152,9 @@ read it before adding tests for a listed area.
   byte-fidelity fixture of an operator comment (#243;
   `docs/development.md`). It renders payloads and reads a scratch issue,
   and never writes to GitHub. `tests/test_operator_comment_fidelity.py`
-  replays the captured fixture offline and tests the tool against a fake
-  runner; never write or edit the fixture by hand.
+  replays the committed fixture (the maintainer's capture on scratch issue
+  #264) offline and tests the tool against a fake runner; never write or
+  edit the fixture by hand.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the

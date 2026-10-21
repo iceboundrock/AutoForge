@@ -1063,9 +1063,10 @@ a stated reason it has none. The coverage that must keep working:
   layers in `tests/test_effects.py`, a comment past the first hundred and
   a target GitHub answers with another object through the real client
   included; the maintainer-captured byte-fidelity fixture replayed through
-  the real client in `tests/test_operator_comment_fidelity.py` (the pipe's
-  comment is exact evidence, a web paste only byte for byte; failing until
-  the capture is committed, see `docs/development.md`)
+  the real client in `tests/test_operator_comment_fidelity.py` (the
+  captured pipe comment is the payload byte for byte and exact evidence;
+  the captured web paste lost a hard break's trailing spaces and gained
+  trailing bytes, and is a conflict; see `docs/development.md`)
 - `REPLAN_REEXECUTE`'s publication (#164, `tests/test_replan.py`, "The
   controller publishes the replacement"): the replan agent commits on the
   base its prompt names and publishes nothing, and the controller pushes

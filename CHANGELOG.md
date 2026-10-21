@@ -19,6 +19,9 @@ so.
   comment on GitHub before it publishes the rest of the plan, one comment
   for one action only, and the next review reads the verified comments
   ([BLOCKED on operator actions](docs/usage.md#blocked-on-operator-actions)).
+  Post through the pipe `status` prints: a capture on a scratch issue
+  confirmed that it comes back byte for byte, while a paste into the web
+  UI did not and is a conflict to repair.
 - `safety.acceptance_actions: off` refuses that resolution too; `approve`
   (the default) and `auto` offer it. Acceptance and operator declines share
   the bound of 16 per review round.

@@ -85,10 +85,20 @@ the raw GraphQL node of each comment, `gh --version`, the commit and the
 time. Commit it as captured, never edited.
 `tests/test_operator_comment_fidelity.py` replays it and pins the
 controller's decision: the pipe's comment must be exact evidence, and a web
-paste is exact only byte for byte, otherwise a conflict naming a
-whitespace-only difference. Those tests fail until the fixture is
-committed. If the pipe does not round-trip, they keep failing on the
-committed capture: #243's M2 stops, and ADR 0004 revisits exact evidence.
+paste that is not the payload byte for byte is a conflict. If the pipe does
+not round-trip, those tests fail on the committed capture: #243's M2 stops,
+and ADR 0004 revisits exact evidence.
+
+The committed fixture was captured on 2026-10-21 on scratch issue #264,
+with gh 2.102.1 at commit `6de4227`. The pipe's comment came back byte for
+byte, so exact evidence stands. The web paste did not: it lost the two
+trailing spaces of the hard-break line and gained `%` and two line feeds
+after the marker (apparently the shell's end-of-line mark, copied with the
+text from a terminal), and the controller decides a conflict on it. Capture
+again, and commit the new fixture as captured, when the payload's header,
+marker or text rules change: the replay's first test fails then. A new
+capture's web paste may differ in other ways; its test pins this capture's
+bytes, so update it to what the new one shows, never the fixture.
 
 ## The outer sandbox
 

@@ -1,0 +1,39 @@
+{
+  "captured_at": "2026-10-21T22:39:51Z",
+  "gh_version": "gh version 2.102.1 (2026-10-20)",
+  "autoforge_commit": "6de4227ba57563e55e0b0d20d469bb0f010f3885",
+  "scratch_issue": "https://github.com/iceboundrock/AutoForge/issues/264",
+  "run_issue": "https://github.com/iceboundrock/AutoForge/issues/243",
+  "pr": "https://github.com/iceboundrock/AutoForge/pull/254",
+  "round": 2,
+  "posts": {
+    "pipe": {
+      "finding_id": "R2-F4",
+      "route": "the documented pipe: status --action's bytes into gh issue comment --body-file -",
+      "payload": "**AutoForge operator action** for finding `R2-F4` of review round 2 of https://github.com/iceboundrock/AutoForge/pull/254 (https://github.com/iceboundrock/AutoForge/issues/243), on https://github.com/iceboundrock/AutoForge/issues/264. The text below was prepared by the FIX agent for the operator to post; the controller only verifies it.\n\nCoordination note for the byte-fidelity capture of #243 (sections 12 and 14).\n\n- A list item with a `code span` and a link to https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md.\n- Non-ASCII text: caf\u00e9, na\u00efve, \u4e2d\u6587, \u2014 and \u2713.\n\nA line ending in two spaces, a Markdown hard break:  \nand the line after it.\n\n    an indented code line\n\nThe last line.\n\n<!-- ai-operator-comment: {\"finding_id\": \"R2-F4\", \"issue\": \"https://github.com/iceboundrock/AutoForge/issues/243\", \"pr\": \"https://github.com/iceboundrock/AutoForge/pull/254\", \"round\": 2, \"target\": \"https://github.com/iceboundrock/AutoForge/issues/264\"} -->",
+      "payload_sha256": "947bab98c47acacb786716a29e4a67364dde31fc112b034edb7719e9260d9711",
+      "node": {
+        "url": "https://github.com/iceboundrock/AutoForge/issues/264#issuecomment-6328113049",
+        "body": "**AutoForge operator action** for finding `R2-F4` of review round 2 of https://github.com/iceboundrock/AutoForge/pull/254 (https://github.com/iceboundrock/AutoForge/issues/243), on https://github.com/iceboundrock/AutoForge/issues/264. The text below was prepared by the FIX agent for the operator to post; the controller only verifies it.\n\nCoordination note for the byte-fidelity capture of #243 (sections 12 and 14).\n\n- A list item with a `code span` and a link to https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md.\n- Non-ASCII text: caf\u00e9, na\u00efve, \u4e2d\u6587, \u2014 and \u2713.\n\nA line ending in two spaces, a Markdown hard break:  \nand the line after it.\n\n    an indented code line\n\nThe last line.\n\n<!-- ai-operator-comment: {\"finding_id\": \"R2-F4\", \"issue\": \"https://github.com/iceboundrock/AutoForge/issues/243\", \"pr\": \"https://github.com/iceboundrock/AutoForge/pull/254\", \"round\": 2, \"target\": \"https://github.com/iceboundrock/AutoForge/issues/264\"} -->",
+        "createdAt": "2026-10-21T22:38:26Z",
+        "author": {
+          "login": "iceboundrock"
+        }
+      }
+    },
+    "web": {
+      "finding_id": "R2-F5",
+      "route": "a paste of the same bytes into github.com's comment box",
+      "payload": "**AutoForge operator action** for finding `R2-F5` of review round 2 of https://github.com/iceboundrock/AutoForge/pull/254 (https://github.com/iceboundrock/AutoForge/issues/243), on https://github.com/iceboundrock/AutoForge/issues/264. The text below was prepared by the FIX agent for the operator to post; the controller only verifies it.\n\nCoordination note for the byte-fidelity capture of #243 (sections 12 and 14).\n\n- A list item with a `code span` and a link to https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md.\n- Non-ASCII text: caf\u00e9, na\u00efve, \u4e2d\u6587, \u2014 and \u2713.\n\nA line ending in two spaces, a Markdown hard break:  \nand the line after it.\n\n    an indented code line\n\nThe last line.\n\n<!-- ai-operator-comment: {\"finding_id\": \"R2-F5\", \"issue\": \"https://github.com/iceboundrock/AutoForge/issues/243\", \"pr\": \"https://github.com/iceboundrock/AutoForge/pull/254\", \"round\": 2, \"target\": \"https://github.com/iceboundrock/AutoForge/issues/264\"} -->",
+      "payload_sha256": "b548a0f8433756011b29afaa31e70dcc03c40067bcbb41df23a543d422c383ed",
+      "node": {
+        "url": "https://github.com/iceboundrock/AutoForge/issues/264#issuecomment-6328125383",
+        "body": "**AutoForge operator action** for finding `R2-F5` of review round 2 of https://github.com/iceboundrock/AutoForge/pull/254 (https://github.com/iceboundrock/AutoForge/issues/243), on https://github.com/iceboundrock/AutoForge/issues/264. The text below was prepared by the FIX agent for the operator to post; the controller only verifies it.\n\nCoordination note for the byte-fidelity capture of #243 (sections 12 and 14).\n\n- A list item with a `code span` and a link to https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md.\n- Non-ASCII text: caf\u00e9, na\u00efve, \u4e2d\u6587, \u2014 and \u2713.\n\nA line ending in two spaces, a Markdown hard break:\nand the line after it.\n\n    an indented code line\n\nThe last line.\n\n<!-- ai-operator-comment: {\"finding_id\": \"R2-F5\", \"issue\": \"https://github.com/iceboundrock/AutoForge/issues/243\", \"pr\": \"https://github.com/iceboundrock/AutoForge/pull/254\", \"round\": 2, \"target\": \"https://github.com/iceboundrock/AutoForge/issues/264\"} -->%\n\n",
+        "createdAt": "2026-10-21T22:39:13Z",
+        "author": {
+          "login": "iceboundrock"
+        }
+      }
+    }
+  }
+}

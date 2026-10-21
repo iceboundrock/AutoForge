@@ -353,8 +353,11 @@ with the comments named; repair it, then `unblock`:
 
 - the payload posted twice: delete one;
 - the marker with other bytes (typically a paste in the web UI, which
-  changes line endings or whitespace): edit the comment back to the exact
-  bytes, or delete it and post again through the pipe above;
+  changes line endings or whitespace; text copied from a terminal can also
+  lose trailing spaces and pick up the shell's end-of-line mark, as the
+  web paste of the byte-fidelity capture in `docs/development.md` did):
+  edit the comment back to the exact bytes, or delete it and post again
+  through the pipe above;
 - one action's payload posted on another action's target: delete it there
   and post it on its own target.
 

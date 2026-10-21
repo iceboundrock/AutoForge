@@ -10,13 +10,18 @@ into the web UI. These tests replay the nodes through
 the controller decides on each.
 
 The pipe's comment must be the payload byte for byte: exact evidence rests
-on it. Should the capture show otherwise, the fixture is still committed as
+on it. Should a capture show otherwise, the fixture is still committed as
 captured, this test fails, and #243's M2 stops so that ADR 0004 revisits
-exact evidence; the fixture is never written or edited by hand. Until a
-maintainer has captured it, the fixture tests fail: it is #243's M2
-prerequisite (PR #254 R2-F4), and nothing here stands in for it. The last
-test runs the capture tool itself offline, so that the one live run yields
-a fixture these tests read.
+exact evidence; the fixture is never written or edited by hand. It is
+#243's M2 prerequisite (PR #254 R2-F4), and nothing here stands in for it.
+
+The committed capture (scratch issue #264, 2026-10-21, gh 2.102.1) shows
+the pipe's comment byte-equal to the payload, so it is exact evidence. The
+web paste is not: it came back without the two trailing spaces of the
+hard-break line and with ``%`` and two line feeds after the marker
+(apparently the shell's end-of-line mark, copied with the text from a
+terminal), so it is a conflict. The last test runs the capture tool itself
+offline, so that a live run yields a fixture these tests read.
 """
 
 from __future__ import annotations
@@ -134,31 +139,39 @@ def test_the_documented_pipe_round_trips_the_payload_byte_for_byte():
     exact evidence (#243 section 14)."""
     capture = _capture()
     body, decision = _decide(capture, "pipe")
-    payload = capture["posts"]["pipe"]["payload"]
+    post = capture["posts"]["pipe"]
+    payload = post["payload"]
+    assert body == post["node"]["body"]  # the client hands the listed body on unchanged
     assert body == payload, (
         f"the pipe's comment is not the payload (sha256 {sha256_text(body)}, payload "
         f"{sha256_text(payload)})"
     )
     assert decision.action is Action.OBSERVE and decision.observed is not None
     assert decision.observed["evidence"] == "exact"
-    assert decision.observed["body_sha256"] == sha256_text(payload)
+    assert decision.observed["url"] == post["node"]["url"]
+    assert decision.observed["body_sha256"] == sha256_text(payload) == post["payload_sha256"]
 
 
-def test_a_web_ui_paste_is_exact_evidence_only_byte_for_byte():
-    """The web UI may change line endings or trailing whitespace: such a
-    comment is a conflict naming that cause, never exact evidence, and only
-    the very bytes are."""
+def test_the_captured_web_ui_paste_is_not_the_payload_and_is_a_conflict():
+    """The web route of the capture: the paste lost the two trailing spaces
+    of the payload's hard break and gained ``%`` and two line feeds after
+    the marker. Its own key with other bytes is a conflict, never exact
+    evidence; as the difference is more than whitespace, the reason does
+    not call it whitespace-only."""
     capture = _capture()
     body, decision = _decide(capture, "web")
-    payload = capture["posts"]["web"]["payload"]
-    if body == payload:
-        assert decision.action is Action.OBSERVE and decision.observed is not None
-        assert decision.observed["evidence"] == "exact"
-        return
+    post = capture["posts"]["web"]
+    payload = post["payload"]
+    hard_break = "A line ending in two spaces, a Markdown hard break:"
+    assert f"{hard_break}  \n" in payload
+    assert body == post["node"]["body"]  # the client hands the listed body on unchanged
+    assert body == payload.replace(f"{hard_break}  \n", f"{hard_break}\n") + "%\n\n"
+    assert normalized_comment_text(body) != normalized_comment_text(payload)
     assert decision.action is Action.CONFLICT and decision.observed is None
-    whitespace = "only in line endings or trailing whitespace"
-    only = normalized_comment_text(body) == normalized_comment_text(payload)
-    assert (whitespace in decision.reason) is only, decision.reason
+    assert f"{post['node']['url']} carries its marker but its body is not the prepared payload" in (
+        decision.reason
+    )
+    assert "only in line endings or trailing whitespace" not in decision.reason
 
 
 def test_the_capture_tool_writes_a_fixture_these_tests_read(tmp_path, monkeypatch):
