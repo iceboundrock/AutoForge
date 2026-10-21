@@ -96,6 +96,15 @@ Safety rules:
   phase-entry reconciliation, and never while a process the failed launch
   started may still be running. A malformed CONTROL_RESULT keeps its
   separate bounded correction path.
+- An agent's request for a human decision goes through the launch's
+  interaction broker (``interaction.py``, ADR 0007 D5.2, #134), created for
+  a provider whose profile names an ``interaction_policy`` and asking
+  :attr:`ControllerEngine.interaction_resolver` (the CLI's terminal, or no
+  one). An invocation whose interactions failed raises
+  ``InteractionRequiredError`` with the phase unchanged, and is neither
+  corrected nor relaunched as transient: a relaunch would ask again (D7.6).
+  The resolver runs inside the launch, so under the repository lock the
+  command holds (D7.2).
 """
 
 from __future__ import annotations
@@ -241,6 +250,7 @@ from .errors import (
     GitHubUnavailableError,
     GitLockTimeout,
     GitTransportError,
+    InteractionRequiredError,
     LockError,
     LockOrderError,
     MaterializationError,
@@ -318,6 +328,7 @@ from .github import (
     WorkflowRunJobs,
     build_merge_argv,
 )
+from .interaction import InteractionBroker, Lifecycle, Resolver, Unattended
 from .local_workspace import (
     GIT_TIMEOUT_SECONDS,
     FeatureSpec,
@@ -720,6 +731,46 @@ def _loop_killed(result: AgentExecutionResult) -> str:
     if result.timeout_limit != LIMIT_LOOP:
         return ""
     return result.loop.describe() if result.loop is not None else "it repeated itself"
+
+
+def _interaction_end(
+    result: AgentExecutionResult, broker: InteractionBroker | None
+) -> Lifecycle | None:
+    """How the agent's requests for a decision ended its launch (ADR 0007 D5.1,
+    D7.6, D7.7), or ``None`` when they did not end it.
+
+    The broker's own account and the adapter's ``interaction`` are both read,
+    and the stronger wins: a failure (either says so) over a pause over an
+    interrupted turn. A completed launch, or one without a broker and
+    without an outcome, ends no other way than by its exit.
+    """
+    claimed = result.interaction.lifecycle if result.interaction is not None else None
+    ended = broker.outcome().lifecycle if broker is not None else None
+    for lifecycle in (Lifecycle.FAILED, Lifecycle.PAUSED, Lifecycle.INTERRUPTED):
+        if lifecycle in (claimed, ended):
+            return lifecycle
+    return None
+
+
+def _interaction_text(
+    lifecycle: Lifecycle, result: AgentExecutionResult, broker: InteractionBroker | None
+) -> str:
+    """How a launch :func:`_interaction_end` ended, as a predicate for its error."""
+    if lifecycle is Lifecycle.FAILED:
+        # The broker's own reason first: the controller wrote and bounded it.
+        reason = (
+            (broker.failure if broker is not None else None)
+            or result.provider_failure
+            or "the agent asked for a decision it did not get"
+        )
+        return f"failed: {reason}. Not relaunched: it would ask again (ADR 0007 D7.6)"
+    if lifecycle is Lifecycle.PAUSED:
+        return (
+            "paused for a decision, but no pending-interaction record exists to pause into "
+            "(#126): nothing is pending and nothing was answered"
+        )
+    detail = f": {result.provider_failure}" if result.provider_failure else ""
+    return f"was interrupted before its turn ended{detail}"
 
 
 def render_worktree_state(entries: Sequence[StatusEntry], head_sha: str, branch: str) -> str:
@@ -1436,6 +1487,12 @@ class ControllerEngine:
         # real run. ``None`` (a library caller, a test, a dry run) prints
         # nothing; the log is written either way.
         self.progress_output: Callable[[str], None] | None = None
+        # Who answers an agent's request for a decision under
+        # ``interaction_policy: prompt`` (ADR 0007 D5.1, #134): the CLI sets
+        # its terminal resolver for a real run. ``None`` (a library caller, a
+        # test, a scheduler's worker) is :class:`autoforge.interaction.Unattended`:
+        # no one to ask, so every such request fails the invocation.
+        self.interaction_resolver: Resolver | None = None
         # The host's sandbox capability, probed at the first gate that needs
         # it and kept for this engine's process, never across processes
         # (ADR 0005 D12.2).
@@ -11153,6 +11210,9 @@ class ControllerEngine:
         provider = self.providers.get(profile)
         provider.validate_profile(profile)
         limits = self.config.agent_limits(profile)
+        # The policy the agent's requests for a decision are held to (ADR 0007
+        # D7.1); ``None`` for a provider through which nothing can ask.
+        interaction_settings = provider.interaction_settings(profile)
         max_corrections = max(0, self.config.execution.max_correction_attempts)
         # Read once per invocation, before the loop: the agent and the record
         # of it are launched from the same directory, and for a LOCAL run
@@ -11262,6 +11322,19 @@ class ControllerEngine:
             # and the launch: nothing was launched.
             step_log = self._begin_step(logger, phase)
             self._launch_log = step_log.path
+            # One broker per launch (ADR 0007 D5.2): a correction or a
+            # transient relaunch is a new logical invocation, counted afresh.
+            # No pending record exists to pause into until #126 lands.
+            broker = (
+                InteractionBroker(
+                    interaction_settings,
+                    provider.interaction_capabilities(profile),
+                    self.interaction_resolver or Unattended(),
+                    pause_available=False,
+                )
+                if interaction_settings is not None
+                else None
+            )
             req = AgentRequest(
                 phase=phase.value,
                 prompt=prompt,
@@ -11273,6 +11346,7 @@ class ControllerEngine:
                 correction=correction_error is not None,
                 env_allowlist=env_allowlist,
                 loop_detection=self.config.execution.loop_detection,
+                interaction=broker,
             )
             record = ExecutionRecord(
                 run_id=state.run_id,
@@ -11318,8 +11392,16 @@ class ControllerEngine:
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
                 record.sandbox = _refusal_facts(exc) or self._fallback_facts()
+                if broker is not None:
+                    record.interaction = broker.record()
                 self._record_invocation(logger, record, prompt, "", "", phase, step_log)
                 raise
+            ended_interaction = _interaction_end(result, broker)
+            if broker is not None:
+                record.interaction = {
+                    **broker.record(),
+                    "lifecycle": str(ended_interaction or Lifecycle.COMPLETED),
+                }
             if result.sandbox is not None:
                 record.sandbox = result.sandbox.record()
             else:
@@ -11364,6 +11446,24 @@ class ControllerEngine:
                 raise ExecutionTimeoutError(
                     _with_leftovers(f"agent '{profile.name}' {killed}", result.leftovers)
                     + (f". The limit is set by {key}" if key else "")
+                )
+            if ended_interaction is not None:
+                # ADR 0007 D7.6, D7.7: the agent's request for a decision ended
+                # the launch. Never corrected and never relaunched as
+                # transient, whatever the adapter also reported: a relaunch
+                # would ask again. The phase is unchanged; what was saved
+                # before the launch stands.
+                ended = _interaction_text(ended_interaction, result, broker)
+                record.error = _with_leftovers(ended, result.leftovers)
+                self._record_invocation(logger, record, prompt, stdout, stderr, phase, step_log)
+                error = (
+                    ExecutionError
+                    if ended_interaction is Lifecycle.INTERRUPTED
+                    else InteractionRequiredError
+                )
+                raise error(
+                    _with_leftovers(f"agent '{profile.name}' {ended}", result.leftovers)
+                    + f". stderr tail: {stderr[-2000:]}"
                 )
             if result.provider_failure or result.exit_code != 0:
                 # A run that failed inside the provider's protocol, whatever

@@ -1334,3 +1334,71 @@ policy against sentinel hooks, MCP servers, skills, agents and instruction
 files, and assert that none loads. A control run without the policy
 asserts that the probe can see them load. Re-run both whenever a pin, a
 policy field or a runtime changes.
+
+### Interaction contract and broker (#134, ADR 0007)
+
+No adapter can ask yet (every one declares no capability), so the contract,
+the broker, the terminal resolver and the engine's handling are held at
+their own boundaries (`tests/test_interaction.py`). Keep covered:
+
+- the contract refuses what it cannot render or bind (an oversized
+  question, an escape-carrying or credential-shaped label, identity or
+  answer, two options or questions shown alike, offers a request cannot
+  take), naming the rule and never the value. Shown fields are cleaned,
+  redacted and clipped;
+- `decision_problem`: a decision outside the request's offers or its
+  options, two picks for a single choice, or custom text where none is
+  allowed is never delivered;
+- the broker's table: `fail` never asks. `prompt` asks until the earlier of
+  the wait limit and the invocation's limit, delivers only an offered and
+  fitting decision, and fails on no terminal, end of input, expiry, a late
+  decision, a resolver error, no live capability or the aggregate limit.
+  An expiry the invocation's limit caused is never a pause, a pause needs
+  both `pause_available` and the kind's capability, a request is handled
+  once and only as it was minted, and Ctrl-C propagates;
+- the run-log record keeps no answer text, guidance or modified input, and
+  no more than `max_interactions` entries and the first one past them, however
+  often a provider asks after its interactions ended;
+- a modified input is a read-only snapshot of what was validated: changing
+  the caller's object, or what was sent, afterwards never changes what an
+  adapter sends;
+- one Claude-shaped and one OpenCode-shaped question payload become equal
+  requests with one rendering, and the answer maps back to each shape;
+- `interaction.py` imports only the standard library, the errors and the
+  interaction-data bounds, and names no provider or SDK;
+- the terminal resolver, through a pipe, and a real pseudo-terminal for
+  type-ahead: only offered choices are shown, bad input (an option number
+  that is not a few ASCII digits included) is asked again, and text it
+  could not send back exactly is refused;
+- the terminal resolver's own line editing at a real pseudo-terminal:
+  canonical mode and echo are off while it reads (Linux keeps 4095 bytes
+  of a canonical line and drops the rest silently), so an answer or
+  guidance of up to `MAX_ANSWER_CHARS` characters of any width arrives
+  whole, a line past a bound is refused whole, the terminal's erase,
+  word-erase, kill and end-of-file keys work, the echo goes to the
+  terminal and never to stderr, and the settings come back on an answer,
+  an expiry, an exception and a real Ctrl-C at the controlling terminal;
+- no terminal write holds the resolver past its deadline: output flow
+  control is off while it reads, so the stop and start keys are never part
+  of a line and suspend nothing (also when IXON comes back on mid-wait),
+  and output a stop key suspended before it asked comes back. Output
+  another program suspends (`tcflow`), on the terminal it reads or another
+  one it writes to, holds neither the echo nor its messages: an answer is
+  delivered at once, without one the wait ends at its deadline, and past
+  `_MAX_UNSHOWN_BYTES` not taken it reads no more keys. The stop-key and
+  `tcflow` cases run in a child process whose stdin and stderr are one
+  real pseudo-terminal, as in the CLI;
+- no write to a redirected stderr holds the resolver past its deadline:
+  an output that is not a terminal is never written to, and the request
+  is shown on the terminal it reads instead (also with no stderr at all,
+  never on stdout; nothing is asked when there is no terminal to show it
+  on). In a child process whose stdin is a
+  real pseudo-terminal and whose stderr is a full pipe no one reads, an
+  answer is delivered at once, a line it cannot use is explained on the
+  terminal, without an answer the wait ends at its deadline, nothing
+  reaches the pipe, and the terminal's settings come back;
+- the engine: `InteractionRequiredError` with the phase unchanged, one
+  launch despite corrections and a transient report, a resolver asked
+  under the repository lock, a broker per launch, a claimed pause with
+  nothing persisted, a LOCAL launch charge kept, and a dry run that asks
+  no one.

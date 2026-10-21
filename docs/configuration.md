@@ -561,12 +561,26 @@ below with its evidence.
   person, and needs `prompt`.
 - `options.interaction_policy`:
   - `fail` (default): any ask fails the invocation.
-  - `prompt`: ask the operator live.
+  - `prompt`: ask the operator live, at the terminal of `run`, `step`,
+    `resume` or `local run`. With no terminal on stdin, when the input
+    ends or the wait expires, the ask fails the invocation, and so does a
+    decision the provider cannot carry: it is never offered.
   - `pause`: refused until #126 lands.
 
   `options.max_wait_seconds` (default 120) must be below the profile's idle
-  timeout and its `max_runtime_seconds` under `prompt`.
-  `options.max_interactions` defaults to 8.
+  timeout and its `max_runtime_seconds` under `prompt`. A wait also ends
+  when the invocation's own limit falls due. `options.max_interactions`
+  (default 8) bounds the asks of one invocation, answered or not.
+
+  A failed ask ends the step with the phase unchanged. It is never
+  corrected or relaunched as transient, because the agent would ask
+  again. Change the policy, the tools or the task, then `resume`.
+  Ctrl-C at the prompt stops the step; it is not an answer. Ctrl-S and
+  Ctrl-Q suspend nothing while it asks, and a terminal whose output is
+  suspended or not read never holds the wait past its limit. With stderr
+  redirected (`2>run.log`, `2>&1 | tee run.log`) the question is shown on
+  the terminal the answer is typed at, never in the redirected output, so
+  a pipe that is not read never holds the wait either.
 
 An SDK launch inherits exact names only. The allow-list's `*` prefixes are
 expanded, and every other provider's variables and every credential-shaped

@@ -217,6 +217,20 @@ class InteractionDataError(ExecutionError):
     """
 
 
+class InteractionRequiredError(ExecutionError):
+    """The agent asked for a decision it did not get (ADR 0007 D7.6, D10.5; #134).
+
+    Raised by the engine for an invocation whose
+    ``AgentExecutionResult.interaction`` ended ``failed``: its policy is
+    ``fail``, or a live wait could not be answered and no pause is
+    available. Raised too for a ``paused`` one while no pending-interaction
+    record exists to pause into (#126): nothing is pending. Never corrected
+    and never relaunched as transient, since a relaunch would ask again; the
+    phase is unchanged, and what was saved before the launch (the attempt
+    counter, a LOCAL launch charge) stands.
+    """
+
+
 class ChildStdinClosedError(ExecutionError):
     """A duplex child closed its stdin while a record was being written (EPIPE)."""
 

@@ -32,8 +32,9 @@ that, before every step, proves L2 is still held and reads the stop request
 that boundary). A fresh issue starts exactly as ``autoforge run`` starts
 it (INITIALIZING, with no ownership predicate); a namespace holding a state
 passes #219's recorded-configuration gate first, as ``resume`` does
-(D9.4). stdin is ``/dev/null``. #126's interaction policy has not landed,
-so there is no ``prompt`` policy to refuse yet.
+(D9.4). stdin is ``/dev/null``, and the worker sets no interaction resolver,
+so an agent's request for a decision has no one to ask and fails the
+invocation under every ``interaction_policy`` (ADR 0007 D7.4, #134).
 
 **Signals.** The worker installs two handlers, so the executor's existing
 teardown of a running agent runs: SIGTERM raises ``KeyboardInterrupt``, and

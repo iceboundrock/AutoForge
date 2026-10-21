@@ -29,10 +29,17 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
+import re
+import select
 import sys
-from collections.abc import Callable
+import time
+import unicodedata
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from typing import TextIO
 
 from . import __version__
 from .certificate import NOT_A_PERMISSION
@@ -72,6 +79,7 @@ from .epic_graph import GraphReader
 from .errors import (
     AutoForgeError,
     ConfigurationError,
+    InteractionDataError,
     LockError,
     StateError,
     StateTransitionError,
@@ -85,6 +93,21 @@ from .evidence import (
     record_summary,
 )
 from .github import GitHubClient
+from .interaction import (
+    Allow,
+    AllowScope,
+    Answer,
+    Cancel,
+    DecisionKind,
+    Deny,
+    InteractionDecision,
+    InteractionRequest,
+    Question,
+    QuestionResponse,
+    RequestKind,
+    Unavailable,
+    UnavailableReason,
+)
 from .local_workspace import init_feature_file
 from .locking import ControllerLock, repository_lock_path
 from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
@@ -93,6 +116,7 @@ from .replan_txn import ReplanTransaction
 from .run_namespace import namespace_issue_of_state_dir
 from .scheduler import EpicScheduler, SchedulerInputs
 from .scheduler_stop import StopMode
+from .sdk_policy import MAX_ANSWER_CHARS
 from .state import AutoForgeState
 from .transitions import TERMINAL_PHASES, Phase, WorkflowMode
 from .validation import parse_issue_url
@@ -706,14 +730,677 @@ def _progress_line(line: str) -> None:
     print(line, file=sys.stderr, flush=True)
 
 
-def _show_progress(engine: ControllerEngine) -> None:
-    """Stream a real run's agent progress to stderr (#192).
+# What one line typed at the terminal resolver may hold: an answer of
+# MAX_ANSWER_CHARS characters of up to four UTF-8 bytes each, and a little
+# more. A longer line is read to its end and refused, never kept.
+_MAX_TERMINAL_LINE_BYTES = 4 * MAX_ANSWER_CHARS + 64
+# An option number as typed: ASCII digits, and few of them (a question has
+# at most sdk_policy.MAX_OPTIONS options), so int() takes every one.
+_OPTION_NUMBER = re.compile(r"[0-9]{1,3}")
+# What the resolver may have written to a terminal that has not taken it yet
+# (its output suspended, or not read): past this it reads no more keys until
+# the terminal takes some or the deadline comes, so what waits stays bounded.
+_MAX_UNSHOWN_BYTES = 64 * 1024
+
+
+class _Unusable(Exception):
+    """A line the terminal resolver cannot use: the message names the rule."""
+
+
+class _TerminalWriter:
+    """Writes to the terminal of ``fd`` that never block (#134).
+
+    A terminal's output can be suspended (its stop key under IXON, another
+    program's ``tcflow``) or left unread, and a blocking write then waits
+    until it resumes: past any deadline, and the resolver with it. So the
+    resolver writes to a terminal through a descriptor of its own on its
+    device, opened non-blocking: an open file description of its own, so
+    stdin, stderr and the shell's descriptors stay as they are. What the
+    terminal does not take at once waits here, and is written as it takes
+    it while the resolver waits for a key, never past the deadline
+    (:meth:`_Terminal.line`); what it has not taken when the resolver is
+    done is dropped (:meth:`close`).
+    """
+
+    def __init__(self, fd: int) -> None:
+        self.fd = os.open(os.ttyname(fd), os.O_WRONLY | os.O_NOCTTY | os.O_CLOEXEC | os.O_NONBLOCK)
+        self.device = os.fstat(self.fd).st_rdev
+        self._unshown = bytearray()
+
+    @property
+    def unshown(self) -> int:
+        """How many bytes the terminal has not taken yet."""
+        return len(self._unshown)
+
+    def write(self, data: bytes) -> None:
+        self._unshown += data
+        self.flush()
+
+    def flush(self) -> None:
+        """Write what the terminal takes now."""
+        while self._unshown:
+            try:
+                written = os.write(self.fd, self._unshown)
+            except BlockingIOError:
+                return
+            if not written:
+                return
+            del self._unshown[:written]
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        except OSError:  # the terminal hung up: there is no one to show it to
+            pass
+        finally:
+            os.close(self.fd)
+
+
+class _LineEditing:
+    """A terminal whose line editing the resolver took over: its keys, the
+    writer it echoes what is typed through, and the settings it reads under
+    (:func:`_line_editing`)."""
+
+    def __init__(self, fd: int, saved: list, writer: _TerminalWriter) -> None:
+        import termios
+
+        cc = saved[6]
+
+        def key(index: int) -> int | None:
+            value = cc[index]
+            code = value[0] if isinstance(value, bytes) else value
+            # 0 is Linux's _POSIX_VDISABLE, 0xff macOS's; a key past ASCII
+            # would cut into a UTF-8 character.
+            return code if 0 < code < 0x80 else None
+
+        # Backspace and delete erase whatever the terminal's erase key is:
+        # a control character is never part of a usable answer.
+        self.erase = frozenset(k for k in (key(termios.VERASE), 0x08, 0x7F) if k is not None)
+        self.word_erase = key(termios.VWERASE)
+        self.kill = key(termios.VKILL)
+        self.eof = key(termios.VEOF)
+        # Under IXON the stop and start keys are never input either.
+        flow = (key(termios.VSTOP), key(termios.VSTART)) if saved[0] & termios.IXON else ()
+        self.flow = frozenset(k for k in flow if k is not None)
+        self._fd = fd
+        self.writer = writer
+        # Canonical mode, echo and output flow control off, and a read
+        # returns once a key is typed.
+        self.raw = list(saved)
+        self.raw[0] = saved[0] & ~termios.IXON
+        self.raw[3] = saved[3] & ~(termios.ICANON | termios.ECHO)
+        self.raw[6] = list(cc)
+        self.raw[6][termios.VMIN], self.raw[6][termios.VTIME] = 1, 0
+
+    def echo(self, data: bytes) -> None:
+        self.writer.write(data)
+
+    def retake(self) -> bool:
+        """Whether the terminal's own line editing came back on while the
+        resolver waited (a stop and continue under a shell that resets the
+        terminal, another program's ``stty``): what was just read went
+        through it and may have been cut. It is turned off again, and so is
+        output flow control when that came back on."""
+        import termios
+
+        attrs = termios.tcgetattr(self._fd)
+        if attrs[3] & (termios.ICANON | termios.ECHO) or attrs[0] & termios.IXON:
+            termios.tcsetattr(self._fd, termios.TCSANOW, self.raw)
+        return bool(attrs[3] & termios.ICANON)
+
+
+@contextmanager
+def _line_editing(fd: int) -> Iterator[_LineEditing | None]:
+    """Take over the line editing of the terminal ``fd`` while the resolver
+    asks (#134); ``None`` for a descriptor that is not a terminal, whose
+    lines arrive whole.
+
+    In canonical mode a terminal edits a line before a reader gets it, and
+    Linux keeps at most 4095 bytes of it: what is typed past that is dropped
+    without a word, under any bound a reader could hold the line to, and an
+    answer or guidance would reach the agent cut short. So canonical mode
+    and echo are off while the resolver reads, and it edits the line itself
+    (:class:`_Terminal`): it echoes what it keeps, on the terminal and
+    never on stderr, and takes the terminal's own erase, word-erase, kill
+    and end-of-file keys. A line read while canonical mode came back on is
+    refused (:meth:`_LineEditing.retake`).
+
+    Output flow control (IXON) is off too: under it the stop key suspends
+    the terminal's output until the start key, and the echo would wait for
+    it past the deadline. The two keys are still never input, and suspend
+    nothing; output a stop key suspended before the resolver asked comes
+    back where turning IXON off restarts it (Linux). Whatever else holds the
+    output, the resolver writes to the terminal only as it takes it
+    (:class:`_TerminalWriter`). Everything else stays the terminal's: Ctrl-C
+    still raises ``KeyboardInterrupt`` (ISIG is untouched), and the settings
+    are restored however the reading ends.
+    """
+    try:
+        import termios
+    except ImportError:  # pragma: no cover - a platform without termios
+        yield None
+        return
+    try:
+        saved = termios.tcgetattr(fd)
+    except (OSError, termios.error):
+        saved = None
+    if saved is None:
+        yield None
+        return
+    # Its own descriptor, opened to write, also echoes a terminal read
+    # through a read-only one.
+    writer = _TerminalWriter(fd)
+    try:
+        editing = _LineEditing(fd, saved, writer)
+        termios.tcsetattr(fd, termios.TCSANOW, editing.raw)
+        try:
+            yield editing
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, saved)
+    finally:
+        writer.close()
+
+
+def _in_memory(output: TextIO | None) -> bool:
+    """Whether ``output`` is a stream without a descriptor (a StringIO),
+    whose writes never wait. ``None`` is no stream at all: Python's stderr
+    when its descriptor was closed at startup; a closed stream is none
+    either."""
+    if output is None:
+        return False
+    try:
+        output.fileno()
+    except (AttributeError, io.UnsupportedOperation):
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _terminal_fd(output: TextIO | None) -> int | None:
+    """The descriptor ``output`` writes to when that is a terminal."""
+    if output is None:
+        return None
+    try:
+        fd = output.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
+    return fd if os.isatty(fd) else None
+
+
+def _can_show(output: TextIO | None, editing: _LineEditing | None) -> bool:
+    """Whether the resolver has somewhere to show its text that no write
+    holds past the deadline (:func:`_shown_on`)."""
+    return editing is not None or _in_memory(output) or _terminal_fd(output) is not None
+
+
+@contextmanager
+def _shown_on(
+    output: TextIO | None, editing: _LineEditing | None
+) -> Iterator[_TerminalWriter | None]:
+    """The writer the resolver shows its text through, so that no write holds
+    it past the deadline (R4-F1).
+
+    An ``output`` that is a terminal is written to as it takes it: through
+    the echo's writer when it is the terminal the resolver reads, so that
+    the two keep their order. Any other output (stderr redirected to a
+    pipe, a file or a socket: ``2>log``, ``2>&1 | tee log``; or closed) is
+    never written to, since a pipe no one reads holds a blocking write
+    until it is read: the text is shown on the terminal the resolver reads
+    instead, where the answer is typed, as ``getpass`` does. ``None`` for
+    an in-memory stream, printed to as before. Entered only when
+    :func:`_can_show`: with no terminal to show the text on instead, the
+    resolver asks nothing."""
+    if _in_memory(output):
+        yield None
+        return
+    fd = _terminal_fd(output)
+    if editing is not None and (fd is None or os.fstat(fd).st_rdev == editing.writer.device):
+        yield editing.writer
+        return
+    assert fd is not None  # _can_show
+    writer = _TerminalWriter(fd)
+    try:
+        yield writer
+    finally:
+        writer.close()
+
+
+def _utf8_length(lead: int) -> int:
+    """How many bytes the UTF-8 character starting with ``lead`` has; 1 for
+    a byte no character starts with (kept alone, so its line is refused)."""
+    if 0xC2 <= lead <= 0xDF:
+        return 2
+    if 0xE0 <= lead <= 0xEF:
+        return 3
+    if 0xF0 <= lead <= 0xF4:
+        return 4
+    return 1
+
+
+def _echoed(typed: bytes) -> tuple[bytes, int]:
+    """What the terminal is shown of one typed character, and its columns: a
+    control character as ^X, one that is not UTF-8 or would act on the
+    terminal as U+FFFD, a combining mark in no column of its own and a wide
+    character in two."""
+    try:
+        ch = typed.decode("utf-8")
+    except UnicodeDecodeError:
+        return "\ufffd".encode(), 1
+    if ord(ch) < 0x20:
+        return b"^" + bytes((ord(ch) + 0x40,)), 2
+    category = unicodedata.category(ch)
+    if category in ("Cc", "Cf", "Zl", "Zp"):
+        return "\ufffd".encode(), 1
+    if category in ("Mn", "Me"):
+        return typed, 0
+    return typed, 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+class _Terminal:
+    """The operator's terminal while the resolver asks: lines read from
+    ``fd`` until ``deadline`` (a string, or :class:`Unavailable`), and the
+    resolver's text shown on ``output`` (:meth:`show`).
+
+    At a terminal (``editing``) each key is taken as it is typed and the
+    line is edited here (:func:`_line_editing`); any other descriptor
+    delivers whole lines. A line past :data:`_MAX_TERMINAL_LINE_BYTES` is
+    refused whole when it ends: at a terminal what is typed past the bound
+    is neither kept nor echoed (the bell rings once), and the kill key
+    starts the line again.
+
+    What the resolver writes to a terminal, its echo and, unless ``output``
+    is an in-memory stream (``shown``, :func:`_shown_on`), its text, goes
+    through a :class:`_TerminalWriter`: what the terminal has not taken is
+    written while a line is awaited, and a terminal whose output is
+    suspended never holds the resolver past the deadline. While more than
+    :data:`_MAX_UNSHOWN_BYTES` wait, no key is read.
+    """
+
+    def __init__(
+        self,
+        fd: int,
+        clock: Callable[[], float],
+        deadline: float,
+        editing: _LineEditing | None = None,
+        output: TextIO | None = None,
+        shown: _TerminalWriter | None = None,
+    ) -> None:
+        self._fd = fd
+        self._clock = clock
+        self._deadline = deadline
+        self._editing = editing
+        self._output = output
+        self._shown = shown
+        self._writers: list[_TerminalWriter] = []
+        for writer in (editing.writer if editing is not None else None, shown):
+            if writer is not None and writer not in self._writers:
+                self._writers.append(writer)
+        self._pending = b""
+        self._overlong = False
+        # The line being typed at a terminal: each character's bytes and
+        # columns, and the first bytes of one not yet whole.
+        self._typed: list[tuple[bytes, int]] = []
+        self._size = 0
+        self._partial = b""
+
+    def show(self, text: str, end: str = "\n") -> None:
+        if self._shown is None:  # an in-memory stream (_shown_on)
+            print(text, end=end, file=self._output, flush=True)
+            return
+        encoding = getattr(self._output, "encoding", None) or "utf-8"
+        self._shown.write((text + end).encode(encoding, "backslashreplace"))
+
+    def line(self) -> str | Unavailable:
+        while (raw := self._take()) is None:
+            remaining = self._deadline - self._clock()
+            if remaining <= 0:
+                return Unavailable(UnavailableReason.EXPIRED)
+            unshown = [writer for writer in self._writers if writer.unshown]
+            reading = [self._fd] if sum(w.unshown for w in unshown) < _MAX_UNSHOWN_BYTES else []
+            readable, writable, _ = select.select(reading, [w.fd for w in unshown], [], remaining)
+            for writer in unshown:
+                if writer.fd in writable:
+                    writer.flush()
+            if not readable:
+                if writable:
+                    continue
+                return Unavailable(UnavailableReason.EXPIRED)
+            chunk = os.read(self._fd, 4096)
+            if not chunk:
+                return Unavailable(UnavailableReason.END_OF_INPUT)
+            if self._editing is not None and self._editing.retake():
+                self._pending, self._partial, self._overlong = b"", b"", False
+                self._typed, self._size = [], 0
+                raise _Unusable("the terminal's line editing came back on while the line was typed")
+            self._pending += chunk
+        if isinstance(raw, Unavailable):
+            return raw
+        overlong, self._overlong = self._overlong, False
+        if overlong:
+            raise _Unusable("the line is too long")
+        try:
+            return raw.decode("utf-8").rstrip("\r")
+        except UnicodeDecodeError:
+            raise _Unusable("the line is not UTF-8") from None
+
+    def seconds_left(self) -> int:
+        return max(0, int(self._deadline - self._clock()))
+
+    def _take(self) -> bytes | Unavailable | None:
+        """The next line of what was read, or ``None`` until one has ended."""
+        if self._editing is not None:
+            return self._edit(self._editing)
+        raw, newline, rest = self._pending.partition(b"\n")
+        if not newline:
+            if len(self._pending) > _MAX_TERMINAL_LINE_BYTES:
+                self._pending, self._overlong = b"", True
+            return None
+        self._pending = rest
+        if len(raw) > _MAX_TERMINAL_LINE_BYTES:
+            self._overlong = True
+        return raw
+
+    def _edit(self, keys: _LineEditing) -> bytes | Unavailable | None:
+        pending, self._pending = self._pending, b""
+        for at, byte in enumerate(pending):
+            if byte in keys.flow:  # the stop and start keys, taken as under IXON
+                continue
+            if self._partial and 0x80 <= byte <= 0xBF:
+                self._partial += bytes((byte,))
+                if len(self._partial) == _utf8_length(self._partial[0]):
+                    self._keep(self._partial, keys)
+                    self._partial = b""
+                continue
+            if self._partial:  # a character cut short: kept, so the line is refused
+                self._keep(self._partial, keys)
+                self._partial = b""
+            if byte >= 0x80:
+                if _utf8_length(byte) == 1:
+                    self._keep(bytes((byte,)), keys)
+                else:
+                    self._partial = bytes((byte,))
+            elif byte in b"\r\n":
+                keys.echo(b"\n")
+                self._pending = pending[at + 1 :]
+                line = b"".join(typed for typed, _ in self._typed)
+                self._typed, self._size = [], 0
+                return line
+            elif byte in keys.erase:
+                self._erase(1, keys)
+            elif byte == keys.word_erase:
+                while self._typed and self._typed[-1][0].decode("utf-8", "replace").isspace():
+                    self._erase(1, keys)
+                while self._typed and not self._typed[-1][0].decode("utf-8", "replace").isspace():
+                    self._erase(1, keys)
+            elif byte == keys.kill:
+                self._erase(len(self._typed), keys)
+                self._overlong = False
+            elif byte == keys.eof:
+                # As in canonical mode: the end of input on an empty line,
+                # and nothing within one.
+                if not self._typed and not self._overlong:
+                    return Unavailable(UnavailableReason.END_OF_INPUT)
+            else:
+                self._keep(bytes((byte,)), keys)
+        return None
+
+    def _keep(self, typed: bytes, keys: _LineEditing) -> None:
+        if self._overlong or self._size + len(typed) > _MAX_TERMINAL_LINE_BYTES:
+            if not self._overlong:
+                keys.echo(b"\a")
+            self._overlong = True
+            return
+        shown, columns = _echoed(typed)
+        keys.echo(shown)
+        self._typed.append((typed, columns))
+        self._size += len(typed)
+
+    def _erase(self, count: int, keys: _LineEditing) -> None:
+        for _ in range(min(count, len(self._typed))):
+            typed, columns = self._typed.pop()
+            self._size -= len(typed)
+            keys.echo(b"\b" * columns + b" " * columns + b"\b" * columns)
+
+
+def _discard_typeahead(fd: int) -> None:
+    """Drop what was typed before the request was shown, so a key pressed
+    earlier never answers it. Nothing to drop on a descriptor that is not a
+    terminal."""
+    try:
+        import termios
+    except ImportError:  # pragma: no cover - a platform without termios
+        return
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (OSError, termios.error):
+        pass
+
+
+class TerminalResolver:
+    """Asks the operator at this terminal (ADR 0007 D5.1, D7.4, D7.7; #134).
+
+    The engine's resolver for a real ``run``, ``local run``, ``step`` and
+    ``resume``. It reads stdin and shows the request on stderr, where the
+    live progress is, when stderr is a terminal; stdout stays the step
+    outcomes'. A redirected stderr (a pipe, a file) or none at all is never
+    written to: the request is shown on the terminal it reads instead
+    (:func:`_shown_on`). Before it asks it checks that stdin is a terminal
+    (D7.4) and drops anything typed ahead. While it asks it edits the line
+    itself, since the terminal's own line editing would drop what is typed
+    past its buffer without a word (:func:`_line_editing`): an answer
+    reaches the agent whole or is refused. Each line is read until the
+    deadline the broker gives: its expiry is ``expired``, the end of the
+    input ``end_of_input``, and the broker decides what either means.
+    No write holds it past that deadline: the stop key suspends nothing
+    while it reads, it writes to a terminal only as the terminal takes it
+    (:class:`_TerminalWriter`), so a terminal whose output is suspended or
+    unread neither holds a decision back nor keeps the wait open, and it
+    writes to no pipe, which a reader that stopped reading would hold.
+    Ctrl-C raises ``KeyboardInterrupt`` as anywhere else: the step is
+    interrupted and nothing is decided (D7.7). An input it cannot use is
+    explained, by rule and never by value, and asked again within the same
+    deadline. Only what the request offers is offered; a modified input
+    never is, here.
+
+    Everything shown is the request's own rendering, already bounded,
+    cleaned and redacted (:mod:`autoforge.interaction`).
+    """
+
+    def __init__(
+        self,
+        *,
+        input_fd: int | None = None,
+        output: TextIO | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        is_terminal: Callable[[int], bool] = os.isatty,
+    ) -> None:
+        self._input_fd = input_fd
+        self._output = output
+        self._clock = clock
+        self._is_terminal = is_terminal
+
+    def resolve(
+        self, request: InteractionRequest, deadline: float
+    ) -> InteractionDecision | Unavailable:
+        fd = self._stdin()
+        if fd is None or not self._is_terminal(fd):
+            return Unavailable(UnavailableReason.NO_TERMINAL)
+        _discard_typeahead(fd)
+        output = self._output or sys.stderr
+        with _line_editing(fd) as editing:
+            if not _can_show(output, editing):
+                return Unavailable(UnavailableReason.NO_TERMINAL)
+            with _shown_on(output, editing) as shown:
+                terminal = _Terminal(fd, self._clock, deadline, editing, output, shown)
+                return self._resolve(request, terminal)
+
+    # -- internals -------------------------------------------------------------
+    def _resolve(
+        self, request: InteractionRequest, terminal: _Terminal
+    ) -> InteractionDecision | Unavailable:
+        source = f", subagent {request.agent}" if request.agent is not None else ""
+        if request.kind is RequestKind.PERMISSION:
+            terminal.show(
+                f"autoforge: the agent asks permission to use {request.tool_name} "
+                f"(request {request.request_id}{source}); answer within "
+                f"{terminal.seconds_left()}s, Ctrl-C stops the step"
+            )
+            return self._permission(request, terminal)
+        terminal.show(
+            f"autoforge: the agent asks {len(request.questions)} question(s) "
+            f"(request {request.request_id}{source}); answer within "
+            f"{terminal.seconds_left()}s, Ctrl-C stops the step"
+        )
+        responses: list[QuestionResponse] = []
+        for n, question in enumerate(request.questions, 1):
+            response = self._question(request, question, n, terminal)
+            if not isinstance(response, QuestionResponse):
+                return response
+            responses.append(response)
+        return Answer(tuple(responses))
+
+    def _stdin(self) -> int | None:
+        if self._input_fd is not None:
+            return self._input_fd
+        try:
+            return sys.stdin.fileno() if sys.stdin is not None else None
+        except (OSError, ValueError):
+            return None
+
+    def _ask(self, terminal: _Terminal, prompt: str) -> str | Unavailable:
+        """One usable line for ``prompt``, or :class:`Unavailable`."""
+        while True:
+            terminal.show(prompt, end="")
+            try:
+                line = terminal.line()
+            except _Unusable as exc:
+                terminal.show(f"  not used: {exc}; try again")
+                continue
+            if isinstance(line, Unavailable):
+                terminal.show("")
+                return line
+            if line.strip():
+                return line.strip()
+
+    def _question(
+        self,
+        request: InteractionRequest,
+        question: Question,
+        n: int,
+        terminal: _Terminal,
+    ) -> QuestionResponse | Cancel | Unavailable:
+        own = question.custom and DecisionKind.CUSTOM_ANSWER in request.offers
+        cancel = DecisionKind.CANCEL in request.offers
+        title = f"  ({n}/{len(request.questions)})"
+        terminal.show(f"{title} {question.header}" if question.header else title)
+        terminal.show(f"  {question.text}")
+        for number, option in enumerate(question.options, 1):
+            described = f" - {option.description}" if option.description else ""
+            terminal.show(f"    {number}. {option.shown}{described}")
+        if own:
+            terminal.show("    0. something else, in your own words")
+        several = "numbers separated by commas" if question.multiple else "a number"
+        prompt = f"  choose {several}{', or c to cancel' if cancel else ''}: "
+        while True:
+            line = self._ask(terminal, prompt)
+            if isinstance(line, Unavailable):
+                return line
+            if line.lower() == "c" and cancel:
+                return Cancel()
+            picked = self._picks(line, question, own)
+            if isinstance(picked, str):
+                terminal.show(f"  not used: {picked}; try again")
+                continue
+            custom: str | None = None
+            if 0 in picked:
+                text = self._ask(terminal, "  your answer: ")
+                if isinstance(text, Unavailable):
+                    return text
+                custom = text
+            labels = tuple(question.options[number - 1].label for number in picked if number)
+            try:
+                return QuestionResponse(choices=labels, custom_text=custom)
+            except InteractionDataError as exc:
+                terminal.show(f"  not used: {exc}; try again")
+
+    @staticmethod
+    def _picks(line: str, question: Question, own: bool) -> list[int] | str:
+        """The option numbers ``line`` picks, or why it picks none."""
+        words = [word.strip() for word in line.split(",")]
+        if not all(_OPTION_NUMBER.fullmatch(word) for word in words):
+            return "expected option numbers"
+        picked = [int(word) for word in words]
+        lowest = 0 if own else 1
+        if any(not lowest <= number <= len(question.options) for number in picked):
+            return f"choose from {lowest} to {len(question.options)}"
+        if len(set(picked)) != len(picked):
+            return "an option is chosen twice"
+        if len(picked) > 1 and not question.multiple:
+            return "this question takes one answer"
+        return picked
+
+    def _permission(
+        self, request: InteractionRequest, terminal: _Terminal
+    ) -> Allow | Deny | Cancel | Unavailable:
+        offers = request.offers
+        if request.summary:
+            terminal.show(f"  {request.summary}")
+        terminal.show(f"  input sha256 {request.input_sha256}")
+        choices: dict[str, str] = {}
+        if DecisionKind.ALLOW_ONCE in offers:
+            choices["y"] = "allow this call once"
+        if DecisionKind.ALLOW_SESSION in offers:
+            choices["s"] = "allow it for the rest of this session"
+        if DecisionKind.DENY in offers or DecisionKind.DENY_GUIDANCE in offers:
+            choices["n"] = (
+                "deny it (n <text>: and tell the agent what to do instead)"
+                if DecisionKind.DENY_GUIDANCE in offers
+                else "deny it"
+            )
+        if DecisionKind.CANCEL in offers:
+            choices["c"] = "cancel: decline to decide"
+        for key, text in choices.items():
+            terminal.show(f"    {key}  {text}")
+        while True:
+            line = self._ask(terminal, f"  choose {'/'.join(choices)}: ")
+            if isinstance(line, Unavailable):
+                return line
+            key, _, rest = line.partition(" ")
+            key, rest = key.lower(), rest.strip()
+            if key not in choices or (rest and key != "n"):
+                terminal.show(f"  not used: expected one of {', '.join(choices)}; try again")
+                continue
+            if key == "y":
+                return Allow(AllowScope.ONCE)
+            if key == "s":
+                return Allow(AllowScope.SESSION)
+            if key == "c":
+                return Cancel()
+            if not rest and DecisionKind.DENY not in offers:
+                terminal.show("  not used: say what the agent should do instead (n <text>)")
+                continue
+            if rest and DecisionKind.DENY_GUIDANCE not in offers:
+                terminal.show("  not used: this provider takes no guidance with a denial (n)")
+                continue
+            try:
+                return Deny(rest or None)
+            except InteractionDataError as exc:
+                terminal.show(f"  not used: {exc}; try again")
+
+
+def _attach_terminal(engine: ControllerEngine) -> None:
+    """Stream a real run's agent progress to stderr (#192), and ask the
+    operator at this terminal when an agent asks for a decision (ADR 0007
+    D5.1, #134; only a profile whose ``interaction_policy`` is ``prompt``
+    ever reaches it).
 
     Only the non-dry paths call this: a dry run launches nothing. stdout is
-    left to the step outcomes, so nothing about progress reaches output a
-    script reads.
+    left to the step outcomes, so nothing about progress or a question
+    reaches output a script reads.
     """
     engine.progress_output = _progress_line
+    engine.interaction_resolver = TerminalResolver()
 
 
 def _print_outcome_now(o: StepOutcome) -> None:
@@ -841,7 +1528,7 @@ def cmd_run(args) -> int:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         engine.save()
-        _show_progress(engine)
+        _attach_terminal(engine)
         outcomes = engine.run(
             max_steps=args.max_steps,
             dry_run=False,
@@ -917,7 +1604,7 @@ def cmd_local_run(args) -> int:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         engine.save()
-        _show_progress(engine)
+        _attach_terminal(engine)
         outcomes = engine.run(
             max_steps=args.max_steps, dry_run=False, on_outcome=_print_outcome_now
         )
@@ -943,7 +1630,7 @@ def cmd_step(args) -> int:
         _guard_scheduler_ownership(engine, state, "step")
         if state.phase not in TERMINAL_PHASES:
             _check_configuration(engine, args, "step", dry_run=False)
-        _show_progress(engine)
+        _attach_terminal(engine)
         outcome = engine.step(dry_run=False, allow_merge=args.allow_merge)
     return _finish(engine, [outcome], args.allow_merge)
 
@@ -972,7 +1659,7 @@ def cmd_resume(args) -> int:
         if rc is not None:
             return rc
         _check_configuration(engine, args, "resume", dry_run=False)
-        _show_progress(engine)
+        _attach_terminal(engine)
         outcomes = engine.run(
             max_steps=args.max_steps,
             dry_run=False,

@@ -90,7 +90,12 @@ its own, all enforced in `src/autoforge/sdk_policy.py`:
   or a tool and never quotes a value: config validation, the
   authentication checks, the `system/init` check and the
   interaction-data refusals.
-- **Interaction data is bounded before it is shown or persisted.**
+- **Interaction data is bounded before it is shown or persisted.** The
+  run log's `interaction` record (`execution.json`, #134) names each
+  request, its offers, the directive and the kinds of decision delivered.
+  It never carries an answer's text, guidance or a modified input. It
+  keeps an entry for at most `max_interactions` requests and the first one
+  past them; a provider that keeps asking is failed and only counted.
   - A value a reply depends on (a tool input, an option, an answer, a
     modified input) is *refused* rather than redacted or clipped when it
     carries a credential shape, a control or escape character, or exceeds

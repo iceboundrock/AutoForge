@@ -377,7 +377,12 @@ field and the rule, never the value.
 - **Bound by digest.** A decision is bound to the SHA-256 of the input's
   canonical JSON (sorted keys, no spaces, UTF-8, no NaN; D9.3). A value
   that has none, such as a lone surrogate (legal as a JSON escape, not in
-  UTF-8), is refused. A modified input is sent back exactly as validated.
+  UTF-8), is refused. A modified input is sent back exactly as validated:
+  the decision keeps a read-only snapshot of the whole input, nested
+  values included, taken through its canonical JSON when it is built. That
+  snapshot is what is validated and what an adapter sends
+  (`Allow.input_to_send()`), so changing the caller's object afterwards
+  changes nothing.
 - **Shown apart from the identity.** An option keeps its raw label (the
   identity a reply carries) apart from what is shown (`question_options`).
   Two labels shown alike are refused, because a person could not tell them
@@ -388,6 +393,13 @@ field and the rule, never the value.
   or a web page. Every other key is counted, not shown. Every shown value
   goes through `progress.clean`, which strips escape sequences and control
   characters, redacts, then clips.
+- **Held where it is built.** The contract types of
+  `src/autoforge/interaction.py` (#134) apply these rules on construction.
+  A question's text is refused past its bound too, so an operator never
+  decides on part of a question. An identity (a request id, a subagent
+  name, a session id) is exact text on one line. The run log keeps the
+  kinds of each decision, never an answer's text, guidance or a modified
+  input.
 
 ## 11. Redaction and logs
 
