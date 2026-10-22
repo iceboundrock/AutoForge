@@ -22,8 +22,14 @@ so.
   allow-listed: the names `gh` and git read a credential from are refused,
   but a token under a name of your own is not recognised and reaches every
   launch if you list it. `autoforge.yaml` and `.autoforge/` are git-ignored
-  only in AutoForge's own repository; add them to the `.gitignore` or
-  `.git/info/exclude` of the repository you run it on.
+  only in AutoForge's own repository; add them, and `autoforge.local.*`,
+  to the `.gitignore` or `.git/info/exclude` of the repository you run it
+  on. Process containment is described with the escapes ADR 0002
+  records (a self-made subreaper's orphans, anything handed to
+  `systemd-run`, `at`, a container runtime or an SSH host), and the
+  documentation index and configuration reference no longer call #169's
+  `preferred`, pre-launch gate, `sandbox.read_only_paths` and `doctor`
+  rows unimplemented.
 
 ### Operator actions on related issues (#243)
 

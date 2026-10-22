@@ -137,8 +137,11 @@ Each line is a summary; the linked document is the precise statement.
   operator's whole shell, and the controller blocks if its own checkout's
   HEAD or branch moved while the agent ran. Whatever an agent leaves running is killed when its
   invocation ends, and what the kill could not remove is reported rather
-  than hidden
-  ([ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md)).
+  than hidden; the orphans of a process that makes itself a subreaper, and
+  anything handed to a service manager (`systemd-run`, `at`), escape this
+  unseen
+  ([ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md),
+  [Security boundaries](docs/security.md#other-limits)).
   By default the agent is not sandboxed: it runs as the operator, with
   network access and the allow-listed provider credentials.
   ([Usage](docs/usage.md#how-agents-are-separated-from-your-checkout))

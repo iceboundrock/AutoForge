@@ -80,9 +80,12 @@ or under the outer sandbox.
   well-known token shapes, credential variables, authorization headers and
   URL passwords, and no environment dump is ever written.
   ([Secrets and logging](agent-guides/secrets-and-logging.md))
-- **Nothing an agent starts outlives its invocation** on Linux: the
-  executor kills the process group and the orphans it catches as a
-  subreaper, and reports what it could not remove.
+- **What an agent leaves running is stopped when its invocation ends,** on
+  Linux: the executor kills the launch's process group and the orphans it
+  catches as a subreaper, and reports what it could not remove. This is
+  containment, not a promise that nothing outlives a launch: some
+  processes escape it, and the executor cannot report those
+  ([Other limits](#other-limits)).
   ([ADR 0002](adr/0002-executor-nothing-outlives-the-invocation.md))
 - **The outer sandbox, when you enable it.** Under `sandbox.mode: required`
   every agent, validation command and pre-merge command runs inside
@@ -224,6 +227,20 @@ repository's default `GITHUB_TOKEN` permissions to read-only.
   controller's files by absolute path; the controller detects some of it
   (a moved checkout, a commit that is not the worktree's own, a GitHub write
   it did not journal) and blocks, not all of it.
+- **Processes that outlive an invocation.** Process containment covers
+  the launch's process group and the orphans re-parented to the
+  controller; there is no cgroup. A descendant that makes itself a
+  subreaper keeps its orphans out of the controller's reach, and anything
+  handed to a service manager or another session's process (`systemd-run`,
+  `at`, a container runtime, an SSH host) is outside containment
+  altogether. The executor does not see either, so it reports neither. An
+  unsandboxed agent also outlives a controller killed with SIGKILL. Under
+  an enforced sandbox the kernel removes everything left in the launch's
+  PID namespace when it ends, a self-made subreaper included, but not what
+  the launch started through a service outside the namespace that it can
+  still reach.
+  ([ADR 0002 §4b](adr/0002-executor-nothing-outlives-the-invocation.md#4b-amendment-processes-that-leave-the-group-132),
+  [§4e](adr/0002-executor-nothing-outlives-the-invocation.md#4e-amendment-sandboxed-launches-167-2026-10-12))
 - **Shared hosts.** Claude Code receives its prompt on its command line,
   which other local users can read from `/proc` unless the host hides
   other users' processes. Prompts carry redacted project text and paths,
@@ -255,7 +272,7 @@ whole cycle on a scratch repository is still to be verified.
 | Metadata | Read | Read | every fine-grained token; the repository and its default branch |
 | Contents | Read and write | Read and write | fetching; pushing the issue's branch (fast-forward only, never the default branch); comparing branches; the merge |
 | Pull requests | Read and write | Read and write | opening or adopting the PR, the review comment, closing and reopening a replanned PR, the merge |
-| Issues | Read and write | Read and write | reading issues, comments and the EPIC's sub-issues and dependencies; follow-up issues; the acceptance comment; the EPIC progress comment and roadmap (only after a merge) |
+| Issues | Read and write | Read and write | reading issues, comments and the EPIC's sub-issues and dependencies, including the comments you post on other issues for a fix, which the controller only reads; follow-up issues; the acceptance comment on the run's issue; the EPIC progress comment and roadmap (only after a merge) |
 | Checks, Commit statuses | Read | Read | the check results of the PR's head |
 | Actions | not needed | Read | the merge gate's check that a required check ran the base branch's workflow |
 | Workflows | not recommended | not recommended | pushing commits that change `.github/workflows/`; without it GitHub refuses such a push and the run blocks |
@@ -280,14 +297,15 @@ repository's `.gitignore` does not know them:
 - `.autoforge/` (the default state directory: `state.json`, run logs with
   every prompt and agent output, and the read context), or whatever
   `--state-dir` or `state_dir` names inside the checkout;
-- `autoforge.yaml` (your configuration, if you keep it in the checkout).
+- `autoforge.yaml` and `autoforge.local.*` (your configuration and local
+  overrides, if you keep them in the checkout).
 
 The run logs and read context are redacted, but only to a baseline: never
 commit them. Add them to the repository's `.gitignore`, or, to keep the
 change out of the repository, to `.git/info/exclude`:
 
 ```bash
-printf '%s\n' '.autoforge/' 'autoforge.yaml' >> .git/info/exclude
+printf '%s\n' '.autoforge/' 'autoforge.yaml' 'autoforge.local.*' >> .git/info/exclude
 ```
 
 AutoForge's other files (the lock, agent worktrees, scheduler namespaces,

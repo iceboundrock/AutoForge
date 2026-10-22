@@ -1064,7 +1064,7 @@ ownership or discard uncommitted user changes.
   login shell that change a variable such as `GH_TOKEN`). Nothing was recorded:
   remove the setting (`autoforge doctor` lists it too) and run the same
   command again. A config that fails to load because `env_allowlist` names
-  a credential variable: delete that entry
+  a variable `gh` or git reads a credential from: delete that entry
   ([Configuration: agent environment](configuration.md#agent-environment)).
 - **"refusing to launch opencode: it would load the configuration of an
   organization connected to it":** OpenCode would load an organization's
