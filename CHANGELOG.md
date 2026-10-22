@@ -30,6 +30,10 @@ so.
   repaired; a target or comment listing it cannot read refuses it as well,
   naming the target. `run` refuses to replace a `BLOCKED` or `FAILED` run that holds
   operator actions without `--force`.
+- When `FIX` cannot verify an action, because a bound comment was edited or
+  deleted or a target cannot be read, `status` and `status --json` report
+  it as `verification_failed` with the reason until the next check or a new
+  binding, not as merely pending or bound.
 - The state file is protocol 11 (prompt version 12): an older AutoForge
   refuses it, and this one refuses a file labelled older that carries
   operator state.

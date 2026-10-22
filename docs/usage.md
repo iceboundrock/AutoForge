@@ -340,6 +340,13 @@ remove it), and the next commands. For each action, either:
   comment is edited or deleted before `FIX` verifies it, `FIX` blocks again
   naming both digests: bind it again or post the payload.
 
+`status` reads nothing from GitHub, so it shows what `FIX` last found. When
+that verification failed (a bound comment edited or deleted, or a target
+that cannot be read or is no longer an issue of the repository), the action
+shows `verification failed at FIX's last check: …` (`state:
+"verification_failed"` with its `reason` in `status --json`) until the next
+`FIX` pass finds otherwise, or a new binding replaces the old one.
+
 `resume` re-enters `FIX`, which reads every target and verifies every
 action before anything else; it then publishes the rest of the plan. While
 one is still missing it blocks again, naming what is verified so far. A

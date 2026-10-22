@@ -1067,8 +1067,17 @@ class EffectRecord:
         elif observed is not None:
             _fail(f"{what}.observed", f"must be null while the record is {stage.value}")
         reason = _str(data["reason"], f"{what}.reason", MAX_CONFLICT_REASON_CHARS)
-        if (stage == Stage.CONFLICT) != bool(reason):
-            _fail(f"{what}.reason", "is set exactly when the record is a conflict")
+        # K10 (#243): an intended operator comment may keep the diagnostic of
+        # its last failed verification (:meth:`diagnosed`); it stays pending.
+        diagnosed = kind == EffectKind.OPERATOR_COMMENT and stage == Stage.INTENDED
+        if (stage == Stage.CONFLICT and not reason) or (
+            reason and stage != Stage.CONFLICT and not diagnosed
+        ):
+            _fail(
+                f"{what}.reason",
+                "is set exactly when the record is a conflict, or an intended operator comment "
+                "whose last verification failed",
+            )
         record = cls(
             position=position,
             kind=kind,
@@ -1148,11 +1157,24 @@ class EffectRecord:
     def observing(self, observed: dict) -> EffectRecord:
         if not self.pending:
             raise StateError(f"effect record {self.position} is {self.stage.value}; not observed")
-        record = replace(self, stage=Stage.OBSERVED, observed=dict(observed))
+        record = replace(self, stage=Stage.OBSERVED, observed=dict(observed), reason="")
         return EffectRecord.from_dict(record.to_dict())
 
     def conflicting(self, reason: str) -> EffectRecord:
         return replace(self, stage=Stage.CONFLICT, reason=bounded_reason(reason))
+
+    def diagnosed(self, reason: str) -> EffectRecord:
+        """K10 (#243): still ``intended``, with why its last verification failed, or "".
+
+        A changed or deleted bound comment, or a target that no longer
+        qualifies or cannot be read, is kept as the record's redacted,
+        bounded ``reason`` until the next verification replaces it or finds
+        nothing wrong ("" clears it), so an offline ``status`` reports
+        ``verification_failed`` with the reason (PR #254 R3-F3).
+        """
+        if self.kind != EffectKind.OPERATOR_COMMENT or self.stage != Stage.INTENDED:
+            raise StateError(f"effect record {self.position} cannot carry a verification failure")
+        return replace(self, reason=bounded_reason(reason) if reason else "")
 
     def reopened(self) -> EffectRecord:
         """A ``conflict`` the operator resolved: reconciled again, as ``attempted``.
@@ -1198,11 +1220,15 @@ class EffectRecord:
         return dict(value) if isinstance(value, dict) else None
 
     def binding_to(self, comment_url: str, comment_id: int, body_sha256: str) -> EffectRecord:
-        """K10 bound by the operator to one existing comment, digest-pinned (#243)."""
+        """K10 bound by the operator to one existing comment, digest-pinned (#243).
+
+        The new binding supersedes the last verification's failure, which
+        is cleared: the next verification is of this binding.
+        """
         if self.kind != EffectKind.OPERATOR_COMMENT or self.stage != Stage.INTENDED:
             raise StateError(f"effect record {self.position} cannot be bound to evidence")
         binding = {"comment_url": comment_url, "comment_id": comment_id, "body_sha256": body_sha256}
-        record = replace(self, precondition={**self.precondition, "binding": binding})
+        record = replace(self, precondition={**self.precondition, "binding": binding}, reason="")
         return EffectRecord.from_dict(record.to_dict())
 
     @property
@@ -2834,6 +2860,11 @@ class Decision:
     # CONFLICT only because the bound is spent and the write is still absent:
     # right after an issue that is "not visible yet", not yet a conflict.
     exhausted: bool = False
+    # HOLD (K10, #243): the verification failed (the bound comment changed,
+    # is gone or is another action's evidence; the target no longer
+    # qualifies), not merely "awaiting the operator". The prefix pass keeps
+    # the reason on the record, so an offline ``status`` reports it.
+    failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -2988,7 +3019,9 @@ def decide_operator_comment(
     (``bound``) unless another action consumes it. Everything else is a
     hold, which sends nothing: where :func:`decide_create` would issue, this
     waits for the operator. ``target_problem`` (transferred, deleted,
-    unreadable) holds as well.
+    unreadable) holds as well. A hold on a target problem or on bound
+    evidence that does not verify is :attr:`Decision.failed`; only "nothing
+    on the target carries it yet" is not.
     """
     taken = taken or {}
     terminal = _terminal(record)
@@ -2996,7 +3029,9 @@ def decide_operator_comment(
         return terminal
     action = f"{record.describe()} ({record.action_id})"
     if target_problem:
-        return Decision(Action.HOLD, reason=f"{action}: {target_problem}; nothing was verified")
+        return Decision(
+            Action.HOLD, reason=f"{action}: {target_problem}; nothing was verified", failed=True
+        )
     if defects:
         return Decision(
             Action.CONFLICT,
@@ -3072,6 +3107,7 @@ def decide_operator_comment(
                     f"{other}, and one comment verifies one action; bind another comment or "
                     "post the payload"
                 ),
+                failed=True,
             )
         bound = [c for c in listing if c.comment_id == binding["comment_id"]]
         if bound and sha256_text(bound[0].body) == binding["body_sha256"]:
@@ -3092,6 +3128,7 @@ def decide_operator_comment(
                 f"bound (bound sha256 {binding['body_sha256']}, now {now}); bind it again or "
                 "post the payload"
             ),
+            failed=True,
         )
     return Decision(
         Action.HOLD,

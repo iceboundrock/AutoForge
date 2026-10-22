@@ -4367,6 +4367,78 @@ def test_verify_saves_a_conflict_once():
     assert fake.effect_writes == []
 
 
+def test_verify_keeps_a_failed_verification_until_a_pass_clears_it():
+    """PR #254 R3-F3: a bound comment that changed holds, and the failure is
+    saved on the record, still intended with no attempt, so an offline
+    ``status`` can name it. The same failure again saves nothing, another
+    one replaces it, and a pass that only awaits the operator clears it."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE3, "A related issue")
+    record = operator_record(binding=K10_BINDING)
+    op = OperatorCommentOp(fake, plan=[record])
+    saves = saves_for(fake)
+    edited = fake.add_comment(ISSUE3, 400, "Edited after it was bound.")
+    changed = verify(record, op, saves)
+    assert (changed.record.stage, changed.record.attempts) == (Stage.INTENDED, 0)
+    assert "changed since it was bound" in changed.record.reason
+    assert K10_BINDING["body_sha256"] in changed.record.reason
+    assert sha256_text(edited.body) in changed.record.reason
+    assert changed.held == changed.record.reason and not changed.issued
+    assert saves.last == changed.record and len(saves.log) == 1
+    assert verify(changed.record, op, saves).record == changed.record and len(saves.log) == 1
+    fake.comments[ISSUE3] = []
+    gone = verify(changed.record, op, saves)
+    assert "now none: the comment is gone" in gone.record.reason
+    assert saves.last == gone.record and len(saves.log) == 2
+    plain = operator_record()
+    op = OperatorCommentOp(fake, plan=[plain])
+    fake.get_issue_errors[ISSUE3] = GitHubError("HTTP 403: Resource not accessible")
+    unreadable = verify(plain, op, saves)
+    assert f"issue {ISSUE3} cannot be read (HTTP 403" in unreadable.record.reason
+    assert len(saves.log) == 3
+    del fake.get_issue_errors[ISSUE3]
+    cleared = verify(unreadable.record, op, saves)
+    assert cleared.record == plain and saves.last == plain and len(saves.log) == 4
+    assert "awaiting the operator" in cleared.held
+    assert fake.effect_writes == []
+
+
+def test_only_a_verification_that_failed_is_a_failed_hold():
+    """PR #254 R3-F3: a target problem, and bound evidence that is gone,
+    changed or another action's, are failed verifications; a target that
+    carries nothing yet only awaits the operator."""
+    record = operator_record()
+    assert not decide_k10(record, listing=[CHATTER]).failed
+    problem = f"issue {ISSUE3} is not found (deleted, or not readable with this token)"
+    assert decide_k10(record, listing=[], target_problem=problem).failed
+    bound = operator_record(binding=K10_BINDING)
+    listed = k10_listed(400, EVIDENCE_TEXT)
+    assert decide_k10(bound, listing=[CHATTER]).failed
+    assert decide_k10(bound, listing=[k10_listed(400, "Edited.")]).failed
+    assert decide_k10(bound, listing=[listed], taken={400: "X-" + "1" * 16}).failed
+    assert decide_k10(bound, listing=[listed]).action is Action.OBSERVE
+
+
+def test_a_failed_verification_is_kept_on_an_intended_operator_comment_only():
+    """PR #254 R3-F3: an intended K10 loads with the reason its last
+    verification failed; no other kind or stage keeps a reason outside a
+    conflict. Observing the record, or binding it anew, clears the reason."""
+    failed = operator_record().diagnosed("the target cannot be read")
+    assert EffectRecord.from_dict(json.loads(json.dumps(failed.to_dict()))) == failed
+    assert failed.diagnosed("") == operator_record()
+    assert failed.observing(exact_evidence(failed)).reason == ""
+    rebound = failed.binding_to(K10_BINDING["comment_url"], 400, K10_BINDING["body_sha256"])
+    assert rebound.reason == "" and rebound.binding == K10_BINDING
+    observed = {**operator_dict(), "stage": "observed", "observed": K10_EXACT, "reason": "x"}
+    pushed = {**push_record().to_dict(), "reason": "x"}
+    for raw in (observed, pushed):
+        with pytest.raises(StateError, match="reason is set exactly when the record is a conflict"):
+            EffectRecord.from_dict(raw)
+    for record in (push_record(), failed.observing(exact_evidence(failed))):
+        with pytest.raises(StateError, match="cannot carry a verification failure"):
+            record.diagnosed("x")
+
+
 @pytest.mark.parametrize("action", [Action.ISSUE, Action.REBASE])
 def test_verify_refuses_a_decision_to_write(action):
     """No K10 decision ever issues; one that did would be a controller bug,
@@ -4777,7 +4849,9 @@ def test_a_bound_comment_is_verified_by_its_digest_end_to_end(now):
         assert driven.record.observed == K10_BOUND_EVIDENCE
         assert saves.stages == [(Stage.OBSERVED, 0, 0)]
         return
-    assert driven.record == record and saves.log == []
+    # Still intended, the failure saved as its reason (PR #254 R3-F3).
+    assert driven.record == record.diagnosed(driven.held)
+    assert saves.log == [(driven.record, 0)]
     assert f"the bound comment {url} changed since it was bound" in driven.held
     assert f"bound sha256 {sha256_text(EVIDENCE_TEXT)}" in driven.held
 
@@ -4884,17 +4958,21 @@ def _forbidden(fake: FakeGitHub) -> None:
     ],
 )
 def test_a_target_that_no_longer_qualifies_is_held_without_reading_its_listing(break_target, says):
-    """Every conclusive target problem is a hold naming it: nothing is saved,
-    the listing is not read, and even the exact payload is not adopted."""
+    """Every conclusive target problem is a hold naming it: the listing is
+    not read and even the exact payload is not adopted. The record stays
+    intended with no attempt; the failure is saved once as its redacted
+    reason, for an offline ``status`` (PR #254 R3-F3)."""
     fake, plan = operator_world()
     record = plan[0]
     fake.add_comment(ISSUE3, 300, record.body)
     break_target(fake)
     saves = saves_for(fake)
     driven = verify(record, OperatorCommentOp(fake, plan=plan), saves)
-    assert driven.record == record and saves.log == [] and not driven.issued
+    assert driven.record == record.diagnosed(driven.held) and not driven.issued
+    assert (driven.record.stage, driven.record.attempts) == (Stage.INTENDED, 0)
+    assert saves.log == [(driven.record, 0)]
     assert says in driven.held and "nothing was verified" in driven.held
-    assert SECRET not in driven.held
+    assert SECRET not in driven.held and SECRET not in driven.record.reason
     assert ("get_issue_comments", ISSUE3) not in fake.calls
 
 
@@ -4989,12 +5067,13 @@ def test_a_target_github_answers_with_another_object_is_held_through_the_real_cl
     answered, says
 ):
     """``gh issue view`` of the target answering with a pull request or a
-    transferred issue is GitHubWrongTargetError, a hold naming the answer."""
+    transferred issue is GitHubWrongTargetError, a hold naming the answer,
+    saved as the still-intended record's failure (PR #254 R3-F3)."""
     record = operator_record()
     conversation = IssueConversation(ISSUE3, [record.body], answers=answered)
     github = GitHubClient(runner=conversation, retry_delay_seconds=0)
     saves: list[EffectRecord] = []
     driven = verify(record, OperatorCommentOp(github, plan=[record]), count_saves(saves))
-    assert driven.record == record and saves == []
+    assert driven.record == record.diagnosed(driven.held) and saves == [driven.record]
     assert f"issue {ISSUE3} {says}" in driven.held
     assert (conversation.views, conversation.pages_read) == (1, 0)

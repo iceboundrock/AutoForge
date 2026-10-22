@@ -1226,8 +1226,13 @@ target URL, the identity and the marker are the controller's.
 
   A target that is not found, answers as a pull request or as another
   object (transferred), or cannot be read for a conclusive reason holds
-  the record, naming it. The observed result is `{"url", "comment_id",
-  "evidence", "body_sha256"}`. Whoever posted the comment is irrelevant
+  the record, naming it. Such a hold, and one on a bound comment that
+  changed, is gone or is another action's evidence, is a failed
+  verification: the prefix pass saves its redacted, bounded reason on the
+  still-`intended` record, which `status` shows as `verification_failed`.
+  The next pass replaces it, or clears it when it finds nothing wrong, and
+  a new binding clears it (PR #254 R3-F3). The observed result is
+  `{"url", "comment_id", "evidence", "body_sha256"}`. Whoever posted the comment is irrelevant
   (D9.3). Markers of earlier rounds or of dropped plans carry no key of
   this plan, so they never block it.
 - **Action id:** `X-` and the first 16 hex digits of the SHA-256 of the

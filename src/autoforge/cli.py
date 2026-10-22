@@ -2395,7 +2395,10 @@ def _operator_label(record: EffectRecord) -> tuple[str, str]:
     """``(state, label)`` of a persisted K10 record, as ``status`` names it (#243).
 
     "pending" means not yet verified, never "not posted": ``status`` reads
-    nothing from GitHub.
+    nothing from GitHub. ``verification_failed`` is a conflict, or what
+    FIX's last verification of a pending action found wrong (a changed or
+    deleted bound comment, a target that cannot be read or no longer
+    qualifies), kept on the record as its reason (PR #254 R3-F3).
     """
     if record.stage is Stage.OBSERVED:
         observed = record.observed or {}
@@ -2407,6 +2410,11 @@ def _operator_label(record: EffectRecord) -> tuple[str, str]:
         return "verified", f"verified ({how}): {observed.get('url', '-')}"
     if record.stage is Stage.CONFLICT:
         return "verification_failed", f"verification failed: {record.reason}"
+    if record.reason:
+        return (
+            "verification_failed",
+            f"verification failed at FIX's last check: {record.reason}",
+        )
     if record.binding is not None:
         return (
             "evidence_bound",

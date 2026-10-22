@@ -604,6 +604,111 @@ def test_a_bound_comment_edited_before_it_is_observed_holds(tmp_state_dir):
     assert "changed since it was bound" in reason and sha256_text(c16.body) in reason
 
 
+def _status(eng) -> list[dict]:
+    """``status --json``'s ``operator_actions``, from the state file alone (offline)."""
+    from autoforge import cli
+
+    return cli._operator_actions(load_state(eng.paths.state_file))
+
+
+@pytest.mark.parametrize("change", ["edited", "deleted"])
+def test_a_failed_verification_of_bound_evidence_is_kept_for_status(tmp_state_dir, change):
+    """PR #254 R3-F3: the bound comment edited or deleted before FIX verifies
+    it blocks with both digests, and the reloaded state reports the action
+    ``verification_failed`` with that reason, never ``evidence_bound``. A
+    new binding replaces the obsolete failure, and its verification
+    completes FIX."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(operator("R1-F1", (16, NOTE16))))
+    assert eng.step().next_phase == "BLOCKED"
+    x16 = _k10(eng, T16).action_id
+    c16 = _post(gh, T16, 5016, "Existing notes.")
+    assert eng.unblock(REASON, bind_evidence=[(x16, c16.url)]).unblocked
+    [entry] = _status(eng)
+    assert (entry["state"], entry["reason"]) == ("evidence_bound", "")
+    if change == "edited":
+        gh.comments[T16] = [replace(c16, body="Existing notes, edited.")]
+        now = sha256_text("Existing notes, edited.")
+    else:
+        gh.comments[T16] = []
+        now = "none: the comment is gone"
+    assert eng.step().next_phase == "BLOCKED"
+    [entry] = _status(eng)
+    assert entry["state"] == "verification_failed", entry
+    assert f"the bound comment {c16.url} changed since it was bound" in entry["reason"]
+    assert f"bound sha256 {sha256_text(c16.body)}, now {now}" in entry["reason"]
+    assert entry["binding"]["comment_id"] == 5016 and entry["comment_url"] == ""
+    record = _k10(eng, T16)
+    assert (record.stage, record.attempts) == (Stage.INTENDED, 0)
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"{len(record.body)} characters, sha256 {sha256_text(record.body)}): verification " in (
+        reason
+    )
+    fresh = _post(gh, T16, 5017, "Existing notes, restated.")
+    assert eng.unblock(REASON, bind_evidence=[(x16, fresh.url)]).unblocked
+    [entry] = _status(eng)
+    assert (entry["state"], entry["reason"]) == ("evidence_bound", "")
+    assert entry["binding"]["comment_id"] == 5017
+    assert eng.step().next_phase == "REVIEW"
+    [entry] = _status(eng)
+    assert (entry["state"], entry["evidence"], entry["reason"]) == ("verified", "bound", "")
+    assert entry["comment_url"] == fresh.url
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "listing", "gone"])
+def test_a_conclusive_target_failure_is_kept_for_status_until_a_pass_clears_it(
+    tmp_state_dir, monkeypatch, failure
+):
+    """PR #254 R3-F3: #16 cannot be verified (its issue or its comments
+    cannot be read, or it is gone) while #158's payload is verified: the
+    reloaded state reports #16 ``verification_failed`` naming the target,
+    and the EPIC's untouched action plain ``pending``. Once #16 reads again
+    and the EPIC's payload is posted, the next pass clears #16's failure:
+    nothing is on #16 yet, so it is pending once more."""
+    gh = FakeGitHub()
+    note1 = "Coordination note for the EPIC."
+    asks = operator("R1-F1", (16, NOTE16), (158, NOTE158), (1, note1))
+    eng = _operating(tmp_state_dir, gh, fixer(asks))
+    assert eng.step().next_phase == "BLOCKED"
+    x16, x158, x1 = (_k10(eng, t).action_id for t in (T16, T158, EPIC))
+    _post(gh, T158, 9158, payload(T158, NOTE158))
+    assert eng.unblock(REASON).unblocked
+    real_comments = gh.get_issue_comments
+    issue16 = gh.issues[T16]
+    if failure == "unreadable":
+        gh.get_issue_errors[T16] = GitHubError("HTTP 403: Resource not accessible")
+        says = f"issue {T16} cannot be read (HTTP 403"
+    elif failure == "listing":
+
+        def listing(url):
+            if url == T16:
+                raise GitHubError("HTTP 403: Resource not accessible")
+            return real_comments(url)
+
+        monkeypatch.setattr(gh, "get_issue_comments", listing)
+        says = f"the comments of {T16} cannot be read (HTTP 403"
+    else:
+        del gh.issues[T16]
+        says = f"issue {T16} is not found"
+    assert eng.step().next_phase == "BLOCKED"
+    states = {e["action_id"]: e for e in _status(eng)}
+    assert states[x16]["state"] == "verification_failed", states[x16]
+    assert says in states[x16]["reason"] and "nothing was verified" in states[x16]["reason"]
+    assert (states[x158]["state"], states[x158]["reason"]) == ("verified", "")
+    assert (states[x1]["state"], states[x1]["reason"]) == ("pending", "")
+    gh.get_issue_errors.pop(T16, None)
+    monkeypatch.setattr(gh, "get_issue_comments", real_comments)
+    gh.issues[T16] = issue16
+    _post(gh, EPIC, 9001, payload(EPIC, note1))
+    assert eng.unblock(REASON).unblocked
+    assert eng.step().next_phase == "BLOCKED"
+    states = {e["action_id"]: e for e in _status(eng)}
+    assert (states[x16]["state"], states[x16]["reason"]) == ("pending", "")
+    assert states[x1]["state"] == "verified"
+    reason = load_state(eng.paths.state_file).block_reason
+    assert f"): pending: operator_comment effect 0 on {T16} ({x16}): awaiting" in reason
+
+
 @pytest.mark.parametrize("case", ["wrong parent", "own key", "other repo", "same again"])
 def test_a_binding_outside_the_rules_is_refused_byte_identical(tmp_state_dir, case):
     gh = FakeGitHub()

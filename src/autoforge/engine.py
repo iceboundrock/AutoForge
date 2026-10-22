@@ -14753,7 +14753,11 @@ class ControllerEngine:
         The plan's leading K10 records are each reconciled, never issued; the
         pass does not stop at the first hold or conflict, and each
         observation or conflict is saved as it is made (:func:`verify`), so
-        a partial completion is durable. ``records`` is updated in place.
+        a partial completion is durable. A failed verification (a changed or
+        deleted bound comment, a target that cannot be read or no longer
+        qualifies) is saved as the record's reason, and cleared by a pass
+        that finds nothing wrong, so ``status`` reports what this pass found
+        (PR #254 R3-F3). ``records`` is updated in place.
         When any is not observed, FIX blocks with one controller-rendered
         reason naming each action, and nothing after the prefix is sent. An
         unavailable GitHub propagates with what was saved so far.
@@ -14775,14 +14779,18 @@ class ControllerEngine:
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
-                open_.append(
-                    (
-                        record,
-                        f"{record.describe()} ({record.action_id}): the comments of "
-                        f"{record.target['issue_url']} cannot be read ({exc}); nothing was "
-                        "verified",
-                    )
+                why = (
+                    f"{record.describe()} ({record.action_id}): the comments of "
+                    f"{record.target['issue_url']} cannot be read ({exc}); nothing was "
+                    "verified"
                 )
+                # A conclusive failure: kept on the record for an offline
+                # status, like a failed hold (PR #254 R3-F3).
+                diagnosed = record.diagnosed(why)
+                if diagnosed != record:
+                    self._persist_effect(diagnosed)
+                records[index] = diagnosed
+                open_.append((diagnosed, why))
                 continue
             records[index] = driven.record
             if driven.held:
@@ -14817,8 +14825,12 @@ class ControllerEngine:
                 ),
                 "",
             )
-            what = "verification failed" if record.stage is Stage.CONFLICT else "pending"
-            if record.stage is not Stage.CONFLICT and record.binding is not None:
+            # A conflict, or a hold that keeps its failure on the record
+            # (PR #254 R3-F3), is a failed verification, as status says.
+            what = "pending"
+            if record.stage is Stage.CONFLICT or record.reason:
+                what = "verification failed"
+            elif record.binding is not None:
                 what = "evidence bound, not verified"
             lines.append(
                 f"{record.action_id} (comment on {record.target['issue_url']} for "

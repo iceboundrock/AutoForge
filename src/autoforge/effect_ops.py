@@ -226,9 +226,12 @@ def drive(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven
 def verify(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven:
     """Reconcile an operator-performed record (K10, #243); never issue anything.
 
-    ``observed`` and ``conflict`` are persisted as made; a hold returns the
-    record unchanged with :attr:`Driven.held`. A decision to issue is
-    impossible for the kind and is refused as a controller bug. Raises
+    ``observed`` and ``conflict`` are persisted as made. A hold returns the
+    record, still ``intended``, with :attr:`Driven.held`; a failed
+    verification (:attr:`Decision.failed`) is kept as its reason, and a
+    plain "awaiting the operator" clears an earlier one, each persisted
+    only when it changes the record (PR #254 R3-F3). A decision to issue
+    is impossible for the kind and is refused as a controller bug. Raises
     :class:`GitHubUnavailableError` with nothing persisted when the target
     cannot be read now.
     """
@@ -238,7 +241,10 @@ def verify(record: EffectRecord, op: EffectOperation, persist: Persist) -> Drive
     if decision.action is Action.DONE:
         return Driven(record, issued=False)
     if decision.action is Action.HOLD:
-        return Driven(record, issued=False, held=decision.reason)
+        diagnosed = record.diagnosed(decision.reason if decision.failed else "")
+        if diagnosed != record:
+            persist(diagnosed)
+        return Driven(diagnosed, issued=False, held=decision.reason)
     if decision.action is Action.OBSERVE:
         record = record.observing(decision.observed or {})
         persist(record)

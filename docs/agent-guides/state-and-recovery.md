@@ -160,7 +160,11 @@ A REMOTE run also records the effect state of the current phase entry (ADR
   PR, transaction), the identity, the exact target, the precondition, the
   payload exactly as it is sent, the attempt count (at most
   `MAX_EFFECT_ATTEMPTS`, 2), the stage (`intended`, `attempted`, `observed`,
-  `conflict`), the observed object and a conflict reason. Only redacted,
+  `conflict`), the observed object and a conflict reason (on an `intended`
+  operator comment, the reason its last verification failed: a changed or
+  deleted bound comment, or a target that cannot be read or no longer
+  qualifies, replaced or cleared by the next verification and cleared by a
+  new binding; `status` reports it as `verification_failed`). Only redacted,
   bounded values are stored: a payload that is not redaction-invariant is
   refused, never redacted into something else, and no credential, header or
   environment value is ever stored. At most `MAX_EFFECTS_PER_PLAN` records,

@@ -2775,6 +2775,42 @@ def test_status_action_prints_an_operator_payload_and_a_bound_state(
     assert first["state"] == "evidence_bound" and first["binding"]["comment_id"] == 5016
 
 
+def test_status_reports_a_failed_verification_of_bound_evidence(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """PR #254 R3-F3: a bound comment edited before 'resume' verifies it
+    blocks with the digest mismatch, and the offline status, human and
+    --json, reports the action verification_failed with that reason, never
+    evidence_bound; the other action stays plain pending."""
+    from dataclasses import replace
+
+    from autoforge.effects import sha256_text
+
+    sd, ids = _blocked_on_operator(tmp_path, monkeypatch, fakes)
+    gh = fakes["gh"]
+    comment = gh.add_comment(T16, 5016, "Existing notes.")
+    argv = ["--state-dir", sd, "unblock", "--bind-evidence", ids[T16], comment.url]
+    assert cli.main([*argv, "--reason", "bound the existing note"]) == 0
+    gh.comments[T16] = [replace(comment, body="Existing notes, edited.")]
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    assert load_state(Path(sd) / "state.json").phase == Phase.BLOCKED
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert (
+        f"{ids[T16]}  comment on {T16}  verification failed at FIX's last check: "
+        f"operator_comment effect 0 on {T16} ({ids[T16]}): the bound comment {comment.url} "
+        "changed since it was bound"
+    ) in out
+    assert f"{ids[T158]}  comment on {T158}  pending (not yet verified)" in out
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    first, second = json.loads(capsys.readouterr().out)["operator_actions"]
+    assert first["state"] == "verification_failed" and first["binding"]["comment_id"] == 5016
+    assert f"bound sha256 {sha256_text(comment.body)}, now " in first["reason"]
+    assert sha256_text("Existing notes, edited.") in first["reason"]
+    assert (second["state"], second["reason"]) == ("pending", "")
+
+
 def test_unblock_declines_several_operator_actions_at_once(tmp_path, capsys, monkeypatch, fakes):
     sd, ids = _blocked_on_operator(tmp_path, monkeypatch, fakes)
     capsys.readouterr()
