@@ -97,14 +97,21 @@ def payload(target: str, text: str, fid: str = "R1-F1", round_: int = 1) -> str:
 
 
 def _operating(
-    tmp_state_dir, gh: FakeGitHub, script, policy: str = "approve", round_: int = 1, findings=1
+    tmp_state_dir,
+    gh: FakeGitHub,
+    script,
+    policy: str = "approve",
+    round_: int = 1,
+    findings=1,
+    body: str = ISSUE_BODY,
 ):
     """A run in FIX (``round_``, ``findings`` open) whose issue references #16 and #158.
 
     #16 is closed and #158 open, both issues of the run's repository; the
     EPIC is #1. The PR's HEAD is a real commit on the origin's PR branch.
+    ``body`` is the run's issue body.
     """
-    gh.add_issue(ISSUE, "Ship the feature", body=ISSUE_BODY)
+    gh.add_issue(ISSUE, "Ship the feature", body=body)
     gh.add_issue(T16, "Scheduler", state="CLOSED")
     gh.add_issue(T158, "Worker")
     gh.add_issue(EPIC, "EPIC")
@@ -469,6 +476,86 @@ def test_the_allowed_set_is_the_entrys_even_when_the_issue_body_changes(tmp_stat
     out = eng.unblock(REASON)
     assert not out.unblocked and "changed since FIX read it" in out.message
     assert eng.paths.state_file.read_text() == raw
+
+
+# GitHub numbers issues from 1: an incidental `#0` names no issue (PR #254 R3-F1).
+ZERO_REFERENCES = [
+    pytest.param(" It ran on worker #0.", id="shorthand"),
+    pytest.param(" Padded: #000.", id="padded-shorthand"),
+    pytest.param(f" See {REPO}/issues/0.", id="url"),
+    pytest.param(f" Worker #0, also {REPO}/issues/00.", id="both"),
+]
+
+
+def _every_save_loads(monkeypatch) -> list[dict]:
+    """Load each state the engine saves, as the next command would; their entry observations."""
+    import autoforge.engine as engine_module
+
+    real = engine_module.save_state
+    observations: list[dict] = []
+
+    def checked(state, path, **kwargs):
+        real(state, path, **kwargs)
+        loaded = load_state(path)
+        loaded.phase_effects()
+        observations.append(loaded.entry_observation)
+
+    monkeypatch.setattr(engine_module, "save_state", checked)
+    return observations
+
+
+@pytest.mark.parametrize("extra", ZERO_REFERENCES)
+def test_a_zero_reference_never_stops_an_ordinary_fix(tmp_state_dir, monkeypatch, extra):
+    """PR #254 R3-F1: a FIX that requests no operator action proceeds to
+    REVIEW over an issue body naming `#0`; every state it saves loads again,
+    and the allowed set it recorded holds issue numbers only."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(NO_CHANGE, commit=False), body=ISSUE_BODY + extra)
+    observations = _every_save_loads(monkeypatch)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    targets = [o["operator_targets"] for o in observations if "operator_targets" in o]
+    assert targets and all(t["numbers"] == [16, 158, 1] for t in targets)
+    assert targets[0]["issue_body_sha256"] == sha256_text(ISSUE_BODY + extra)
+    load_state(eng.paths.state_file).phase_effects()
+
+
+@pytest.mark.parametrize("extra", ZERO_REFERENCES)
+def test_a_zero_reference_is_no_allowed_target(tmp_state_dir, monkeypatch, extra):
+    """The fixer is offered the real targets only, and the plan it asks for
+    blocks on them with a state every later command can load."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH), body=ISSUE_BODY + extra)
+    _every_save_loads(monkeypatch)
+    assert eng.step().next_phase == "BLOCKED"
+    [launch] = eng.provider.calls
+    assert "- #16 (referenced by the run's issue body)" in launch.prompt
+    assert "- #0 " not in launch.prompt
+    s = load_state(eng.paths.state_file)
+    assert s.phase_effects().observation.operator_targets.numbers == (16, 158, 1)
+    assert [r.target["issue_url"] for r in _records(eng)[:2]] == [T16, T158]
+
+
+def test_an_entry_observation_the_loader_refuses_is_never_saved(tmp_state_dir, monkeypatch):
+    """PR #254 R3-F1: the FIX entry observation is validated as a later load
+    validates it before the pre-launch save. One that fails is a controller
+    defect, raised with state.json unchanged and nothing launched."""
+    from autoforge.effects import OperatorTargets
+    from autoforge.engine import ControllerEngine
+    from autoforge.errors import StateError
+
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    eng._save()
+    raw = eng.paths.state_file.read_text()
+    before = eng.state.entry_observation
+    bad = OperatorTargets((0,), {0: ("issue_body",)}, sha256_text(ISSUE_BODY))
+    monkeypatch.setattr(ControllerEngine, "_operator_targets_at_entry", lambda self: bad)
+    with pytest.raises(StateError, match=r"operator_targets\.numbers\[0\] must be >= 1, got 0"):
+        eng.step()
+    assert eng.paths.state_file.read_text() == raw
+    assert eng.state.entry_observation == before
+    assert eng.provider.calls == []
 
 
 # -- binding existing comments ---------------------------------------------------------

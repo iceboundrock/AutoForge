@@ -3682,7 +3682,12 @@ class ControllerEngine:
 
     def _issue_references(self, body: str) -> list[int]:
         """The issue numbers ``body`` references (`#n` or an issue URL of this
-        repository), in order of first mention, each once."""
+        repository), in order of first mention, each once.
+
+        GitHub numbers issues from 1, so `#0` (or `#000`, or `.../issues/0`)
+        names none and is skipped: an incidental "worker #0" never becomes
+        a number the controller reads or persists (PR #254 R3-F1).
+        """
         repository = self._require_state().repository.lower()
         numbers: list[int] = []
         for match in _ISSUE_REFERENCE_RE.finditer(body):
@@ -3692,7 +3697,7 @@ class ControllerEngine:
                 number = int(match.group(3))
             else:
                 continue
-            if number not in numbers:
+            if number >= 1 and number not in numbers:
                 numbers.append(number)
         return numbers
 
@@ -6600,15 +6605,17 @@ class ControllerEngine:
             # D4.4: persisted by the pre-launch save, so that a branch head, a
             # marker PR, an unmarked PR on the branch or the default branch
             # found by a later entry is explained by this read or not at all.
-            state.entry_observation = EntryObservation(
-                Phase.ANALYZE_EXECUTE,
-                state.current_issue_url,
-                state.current_pr_url,
-                {ref: remote_head, f"refs/heads/{default_branch}": base_sha},
-                base_sha,
-                {render_implementation_marker(state.current_issue_url): None},
-                {ref: adopt_url or None},
-            ).to_dict()
+            self._record_entry_observation(
+                EntryObservation(
+                    Phase.ANALYZE_EXECUTE,
+                    state.current_issue_url,
+                    state.current_pr_url,
+                    {ref: remote_head, f"refs/heads/{default_branch}": base_sha},
+                    base_sha,
+                    {render_implementation_marker(state.current_issue_url): None},
+                    {ref: adopt_url or None},
+                )
+            )
         self._analyze_entry = _AnalyzeEntry(
             issue_url=state.current_issue_url,
             default_branch=default_branch,
@@ -10803,20 +10810,40 @@ class ControllerEngine:
             # later entry finds is explained by this read or not at all. The
             # operator actions' allowed targets are read once here too
             # (#243): a relaunch of this entry offers the same set.
-            state.entry_observation = EntryObservation(
-                Phase.FIX,
-                state.current_issue_url,
-                state.current_pr_url,
-                {ref: reviewed},
-                reviewed,
-                observed,
-                operator_targets=self._operator_targets_at_entry(),
-            ).to_dict()
+            self._record_entry_observation(
+                EntryObservation(
+                    Phase.FIX,
+                    state.current_issue_url,
+                    state.current_pr_url,
+                    {ref: reviewed},
+                    reviewed,
+                    observed,
+                    operator_targets=self._operator_targets_at_entry(),
+                )
+            )
         self._existing_follow_ups = own
         self._existing_pr_follow_ups = deferred
         state.current_head_sha = pr.head_sha
         self._save()
         return None
+
+    def _record_entry_observation(self, observation: EntryObservation) -> None:
+        """Set the entry observation the pre-launch save persists (D4.4).
+
+        Validated with the rest of the phase's effect state exactly as a
+        later load validates it, before any save: an observation the loader
+        would refuse is never written, so no save leaves a state that cannot
+        be loaded again (PR #254 R3-F1). A refusal is a controller defect,
+        raised as :class:`StateError` with the state as it was.
+        """
+        state = self._require_state()
+        previous = state.entry_observation
+        state.entry_observation = observation.to_dict()
+        try:
+            state.phase_effects()
+        except StateError:
+            state.entry_observation = previous
+            raise
 
     def _operator_targets_at_entry(self) -> OperatorTargets | None:
         """The issues this FIX entry allows operator comments on, or ``None`` (#243).
@@ -11145,14 +11172,16 @@ class ControllerEngine:
         if observation is None:
             # D4.4: persisted by the pre-launch save, so that a comment found
             # by a later entry is explained by this read or not at all.
-            state.entry_observation = EntryObservation(
-                Phase.UPDATE_EPIC,
-                state.current_issue_url,
-                state.current_pr_url,
-                {},
-                None,
-                {marker: holder.obj.url if holder is not None else None},
-            ).to_dict()
+            self._record_entry_observation(
+                EntryObservation(
+                    Phase.UPDATE_EPIC,
+                    state.current_issue_url,
+                    state.current_pr_url,
+                    {},
+                    None,
+                    {marker: holder.obj.url if holder is not None else None},
+                )
+            )
         return None
 
     def _unjournaled_progress_text(self, url: str) -> str:
@@ -11467,14 +11496,16 @@ class ControllerEngine:
             # D4.4: persisted by the pre-launch save, so that a replacement
             # branch, or a base the plan names, found by a later entry is
             # explained by this read or not at all.
-            state.entry_observation = EntryObservation(
-                Phase.REPLAN_REEXECUTE,
-                state.current_issue_url,
-                state.current_pr_url,
-                {ref: None, base_ref: base_sha},
-                base_sha,
-                {},
-            ).to_dict()
+            self._record_entry_observation(
+                EntryObservation(
+                    Phase.REPLAN_REEXECUTE,
+                    state.current_issue_url,
+                    state.current_pr_url,
+                    {ref: None, base_ref: base_sha},
+                    base_sha,
+                    {},
+                )
+            )
         self._replan_entry = _ReplanEntry(txn.transaction_id, branch, base_sha)
         return None
 

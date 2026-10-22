@@ -1047,7 +1047,10 @@ a stated reason it has none. The coverage that must keep working:
   outside the rules, and a target that is a PR or missing, are
   corrections, an unreadable target blocks and a transient read
   propagates; `off` offers nothing; the allowed set is the entry's even
-  when the issue body changes; bound evidence is verified as
+  when the issue body changes; a `#0` in the issue body, shorthand or URL,
+  is no target, an ordinary `FIX` over it proceeds and every state it
+  saves loads again, and an entry observation the loader would refuse is
+  never saved (PR #254 R3-F1); bound evidence is verified as
   operator-bound, an edited bound comment holds, the binding rules refuse
   and one comment is never evidence for two actions (another action's
   exact payload is never bound, and the prefix pass, a plain unblock and
