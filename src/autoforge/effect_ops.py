@@ -1076,9 +1076,20 @@ class OperatorCommentOp:
         it (PR #254 R1-F1).
         """
         try:
-            issue = self.github.get_issue(target_url)
+            return self.target_mismatch(target_url, issue_url)
         except GitHubNotFoundError:
             return f"issue {target_url} is not found (deleted, or not readable with this token)"
+
+    def target_mismatch(self, target_url: str, issue_url: str) -> str:
+        """:meth:`target_disqualification` of a target GitHub finds, or "" (#243).
+
+        Another object or another repository is a reason. Not found
+        propagates like every other failure, for a caller to which a missing
+        target is no reason: a decline, where it holds no marker (PR #254
+        R4-F1).
+        """
+        try:
+            issue = self.github.get_issue(target_url)
         except GitHubWrongTargetError as exc:
             what = "a pull request" if exc.is_pull_request else "another object"
             return f"issue {target_url} answers as {what} ({exc.answered_url})"

@@ -23,6 +23,7 @@ from autoforge.effects import EffectRecord, Stage, operator_comment_body, sha256
 from autoforge.errors import (
     ConfigurationError,
     GitHubError,
+    GitHubNotFoundError,
     GitHubUnavailableError,
     GitHubWrongTargetError,
 )
@@ -1072,6 +1073,79 @@ def test_a_decline_is_refused_while_anything_of_the_plan_is_on_github(tmp_state_
     out = eng.unblock(REASON, decline_action=[x158])
     assert not out.unblocked and expect in out.message, out.message
     assert eng.paths.state_file.read_text() == raw
+
+
+MOVED = "https://github.com/elsewhere/repo/issues/9"
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("case", ["permission", "transferred"])
+def test_a_decline_reads_every_pending_target_first(tmp_state_dir, monkeypatch, case, dry_run):
+    """PR #254 R4-F1: declining #16 reads #158's target as well, before the
+    plan is dropped. A conclusive failure to read it while its listing
+    answers, or an answer for another object (a transfer, whose old listing
+    reports not found), refuses naming #158's action and target, with the
+    state byte-identical, also as a dry run; a transient one propagates."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    assert eng.step().next_phase == "BLOCKED"
+    x16, x158 = _k10(eng, T16).action_id, _k10(eng, T158).action_id
+    if case == "permission":
+        gh.get_issue_errors[T158] = GitHubError("HTTP 403: Resource not accessible")
+        expect = f"because {T158} cannot be read (HTTP 403"
+    else:
+        gh.get_issue_errors[T158] = GitHubWrongTargetError(f"{T158} answers as {MOVED}", MOVED)
+        listing = gh.get_issue_comments
+
+        def old_listing(url: str):
+            if url == T158:
+                raise GitHubNotFoundError(f"issue not found: {url}")
+            return listing(url)
+
+        monkeypatch.setattr(gh, "get_issue_comments", old_listing)
+        expect = f"because issue {T158} answers as another object ({MOVED})"
+    raw = eng.paths.state_file.read_text()
+    calls = len(gh.calls)
+    out = eng.unblock(REASON, decline_action=[x16], dry_run=dry_run)
+    assert not out.unblocked, out.message
+    assert f"({x158}) cannot be checked, {expect}" in out.message, out.message
+    assert "nothing was declined" in out.message
+    assert ("get_issue", T158) in gh.calls[calls:]
+    assert eng.paths.state_file.read_text() == raw
+    gh.get_issue_errors[T158] = GitHubUnavailableError("connection reset")
+    with pytest.raises(GitHubUnavailableError):
+        eng.unblock(REASON, decline_action=[x16], dry_run=dry_run)
+    assert eng.paths.state_file.read_text() == raw
+    del gh.get_issue_errors[T158]  # readable again: the decline goes through
+    out = eng.unblock(REASON, decline_action=[x16], dry_run=dry_run)
+    assert ("would re-enter FIX" in out.message) if dry_run else out.unblocked, out.message
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("named", [False, True])
+def test_a_decline_beside_or_of_a_target_that_is_gone_declines(tmp_state_dir, named, dry_run):
+    """A pending target that is not found holds no marker: it refuses no
+    decline, whether its action is named (it is declined) or not (it is
+    withdrawn)."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    assert eng.step().next_phase == "BLOCKED"
+    x16, x158 = _k10(eng, T16).action_id, _k10(eng, T158).action_id
+    del gh.issues[T158]
+    raw = eng.paths.state_file.read_text()
+    calls = len(gh.calls)
+    out = eng.unblock(REASON, decline_action=[x158 if named else x16], dry_run=dry_run)
+    assert ("get_issue", T158) in gh.calls[calls:]
+    if dry_run:
+        assert out.message.startswith("[dry-run] would re-enter FIX"), out.message
+        assert eng.paths.state_file.read_text() == raw
+        return
+    assert out.unblocked and out.phase == "FIX", out.message
+    outcomes = load_state(eng.paths.state_file).operator_comment_outcomes
+    assert [(o["action_id"], o["outcome"]) for o in outcomes] == [
+        (x16, "withdrawn" if named else "declined"),
+        (x158, "declined" if named else "withdrawn"),
+    ]
 
 
 def test_the_decline_bound_is_shared_with_acceptance_actions(tmp_state_dir):

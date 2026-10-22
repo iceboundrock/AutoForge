@@ -1512,8 +1512,11 @@ extended:
   conflict is repaired, never declined, and dropping the plan would discard
   it silently); and across every target's complete listing no key of a
   record not yet observed, no misplaced marker of the plan and no bound
-  comment now verifiable appears. A target that is not found holds no
-  marker; any other read failure refuses. The rationale's "a decline is
+  comment now verifiable appears. Every pending record's target is read
+  first, named or not (PR #254 R4-F1). A target that is not found holds no
+  marker; any other read failure, and an answer for another object or
+  another repository (a transfer), refuses, naming the action and the
+  target, and a transient one propagates. The rationale's "a decline is
   refused once the marker is on the issue" thus applies to the records not
   yet observed only: an observed K10 is no reason to refuse. A key left on
   GitHub for a record the decline drops would wait to conflict with a
@@ -2867,10 +2870,13 @@ In addition:
     holds; one comment is never evidence for two actions;
   - a plain unblock without progress, a decline refused while anything of
     the plan is on GitHub unsaved or in conflict, and every other refusal
-    leave the state byte-identical, also as dry runs; a decline after
-    partial completion keeps the verified comment and withdraws the
-    others; the decline bound is shared with K9; `--approve-action X-…` is
-    refused; drift records each action `verified` or `stale`;
+    leave the state byte-identical, also as dry runs; a decline reads
+    every pending target, named or not, refuses on one it cannot read or
+    that answers as another object, and declines beside or of one that is
+    not found; a decline after partial completion keeps the verified
+    comment and withdraws the others; the decline bound is shared with K9;
+    `--approve-action X-…` is refused; drift records each action
+    `verified` or `stale`;
   - the 54-record plan fits both bounds of D2.4;
   - a protocol-10 file migrates under D13.10, and one carrying the new
     state is refused;

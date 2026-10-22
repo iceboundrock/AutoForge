@@ -384,8 +384,11 @@ declined, the others are withdrawn, and `resume` runs the fixer again with
 your reason in its prompt. A declined action is never requested again
 unchanged, and verified work is never requested again. Declines count with
 acceptance-action declines toward the same 16 per review round. An action in
-conflict is repaired, never declined. `--approve-action X-…` is refused:
-there is nothing for the controller to send.
+conflict is repaired, never declined. Every pending action's target is read
+first, named or not: a target transferred, in another repository or no
+longer readable refuses the decline, naming it, while one that is not found
+does not. `--approve-action X-…` is refused: there is nothing for the
+controller to send.
 
 A push to the PR or a change of its base while operator actions are pending
 makes `unblock` re-enter `FIX`, which only reads: each action is recorded

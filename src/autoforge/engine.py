@@ -8227,7 +8227,7 @@ class ControllerEngine:
             return self._operator_progress(op, pending, pr, canonical)
         if request.verb == "bind":
             return self._operator_bind(op, request, plan, pr, canonical)
-        return self._operator_decline(request, plan, pr, canonical)
+        return self._operator_decline(op, request, plan, pr, canonical)
 
     def _operator_op(self, records: Sequence[EffectRecord]) -> OperatorCommentOp:
         """K10's read-only operation over the plan ``records`` (#243).
@@ -8582,6 +8582,7 @@ class ControllerEngine:
 
     def _operator_decline(
         self,
+        op: OperatorCommentOp,
         request: OperatorRequest,
         plan: Sequence[EffectRecord],
         pr: PRInfo,
@@ -8589,16 +8590,40 @@ class ControllerEngine:
     ) -> UnblockDecision:
         """``--decline-action X-...``: only when nothing of the plan is on GitHub unsaved (#243).
 
-        No record may be in conflict (a conflict is repaired, never
-        declined), and across every target's complete listing no key of a
-        record not yet observed, no misplaced marker of the plan and no
-        bound comment now observable may appear: dropping the plan would
-        otherwise leave a key on GitHub to conflict with a later request,
-        or discard evidence. A target that is not found holds no marker;
-        any other read failure refuses. The declines count against the
-        round's shared bound.
+        Every pending action's target is read first, named in the command or
+        not (PR #254 R4-F1): one that answers as another object, is in
+        another repository or cannot be read conclusively refuses, naming the
+        action and the target, and a transient failure propagates. No record
+        may be in conflict (a conflict is repaired, never declined), and
+        across every target's complete listing no key of a record not yet
+        observed, no misplaced marker of the plan and no bound comment now
+        observable may appear: dropping the plan would otherwise leave a key
+        on GitHub to conflict with a later request, or discard evidence. A
+        target that is not found holds no marker; any other read failure
+        refuses. The declines count against the round's shared bound.
         """
         state = self._require_state()
+        for record in plan:
+            if record.stage is Stage.OBSERVED:
+                continue
+            target_url = record.target["issue_url"]
+            try:
+                problem = op.target_mismatch(target_url, state.current_issue_url)
+            except GitHubUnavailableError:
+                raise
+            except GitHubNotFoundError:
+                continue
+            except GitHubError as exc:
+                problem = f"{target_url} cannot be read ({exc})"
+            if problem:
+                return UnblockDecision(
+                    None,
+                    f"unblock {request.flag} is refused: {record.describe()} "
+                    f"({record.action_id}) cannot be checked, because {problem}, so the "
+                    "controller cannot tell that nothing of the plan is there; nothing was "
+                    "declined and nothing is saved. Fix the cause, then unblock again",
+                    pr=pr,
+                )
         conflicts = [r.action_id for r in plan if r.stage is Stage.CONFLICT]
         if conflicts:
             return UnblockDecision(

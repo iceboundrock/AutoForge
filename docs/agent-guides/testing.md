@@ -1059,10 +1059,13 @@ a stated reason it has none. The coverage that must keep working:
   refuses on one it cannot read, named or not, also as a dry run (R2-F3);
   `--approve-action X-…` is refused; a decline keeps a verified comment,
   withdraws the other pending actions, is refused while anything of the
-  plan is on GitHub, and shares the round's bound with K9; drift records
-  each action `verified` or `stale`; `status` names a committed candidate
-  held behind the actions, and says nothing was committed only when
-  nothing was (R2-F2); a bound comment edited or deleted, and a target or
+  plan is on GitHub, reads every pending target and refuses on one it
+  cannot read or that answers as another object, named or not, also as a
+  dry run, while one that is not found is declined or withdrawn (R4-F1),
+  and shares the round's bound with K9; drift records each action
+  `verified` or `stale`; `status` names a committed candidate held behind
+  the actions, and says nothing was committed only when nothing was
+  (R2-F2); a bound comment edited or deleted, and a target or
   its comments that cannot be read or are gone, leave the reloaded
   `status` and `status --json` reporting `verification_failed` with the
   reason, until a new binding or the next pass replaces or clears it

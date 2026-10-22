@@ -28,8 +28,11 @@ so.
 - A plain `unblock` of a run waiting on operator actions is refused, with
   nothing written, until one of them is on GitHub or a recorded conflict is
   repaired; a target or comment listing it cannot read refuses it as well,
-  naming the target. `run` refuses to replace a `BLOCKED` or `FAILED` run that holds
-  operator actions without `--force`.
+  naming the target. `--decline-action` reads every pending action's
+  target first, as `--bind-evidence` does, and refuses, naming it, on one
+  that cannot be read or was transferred; a target that is not found can
+  still be declined. `run` refuses to replace a `BLOCKED` or `FAILED` run
+  that holds operator actions without `--force`.
 - When `FIX` cannot verify an action, because a bound comment was edited or
   deleted or a target cannot be read, `status` and `status --json` report
   it as `verification_failed` with the reason until the next check or a new

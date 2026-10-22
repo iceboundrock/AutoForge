@@ -842,7 +842,11 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
     yet saved as verified, a misplaced marker of the plan or a bound
     comment now verifiable (run a plain unblock and `resume` first), when
     a listing cannot be read, and past the round's shared
-    `MAX_DECLINES_PER_ROUND`.
+    `MAX_DECLINES_PER_ROUND`. Every pending action's target is read first,
+    named or not: one that answers as another object (a transfer), is in
+    another repository or cannot be read conclusively refuses, naming the
+    action and the target; one that is not found holds no marker and may
+    be declined.
   - **`--approve-action X-…`** is a usage error: there is nothing to
     approve.
 
