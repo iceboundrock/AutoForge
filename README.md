@@ -67,6 +67,18 @@ verification discipline, and the controller makes zero `gh` invocations.
 
 Each line is a summary; the linked document is the precise statement.
 
+- **Read the security boundaries before a first run.** Agents run as you,
+  with network access and your model credentials, and are not sandboxed
+  by default, so a deliberate read of your credential files by absolute
+  path is outside the credential guarantee below. On a public repository
+  anyone who can comment on the issue or PR an agent reads can try to
+  steer it, and everything an agent reads goes to your model vendor. Run
+  AutoForge on issues whose authors you trust, as a dedicated user or in
+  a VM or container, or under `sandbox.mode: required`.
+  [Security boundaries](docs/security.md) lists what AutoForge protects
+  and what it does not, the GitHub token permissions it needs and the
+  recommended settings; [SECURITY.md](SECURITY.md) says how to report a
+  vulnerability.
 - **Agent output is a claim; the controller decides.** State advances only
   on a strictly validated `CONTROL_RESULT` block plus independent
   verification, never on prose such as "done" or "LGTM". An invalid
@@ -146,7 +158,8 @@ Each line is a summary; the linked document is the precise statement.
 - **Agents hold no GitHub credential.** The controller makes every GitHub
   write itself; agents, validation commands and pre-merge commands get no
   GitHub or git credential through anything AutoForge controls: no token
-  variable can be allow-listed, `gh` finds no login, credential helpers,
+  variable `gh` or git reads can be allow-listed (a token you forward under
+  another name is yours to keep out), `gh` finds no login, credential helpers,
   askpass and the SSH agent and keys are switched off where repository
   configuration cannot switch them back on, curl and wget read no
   configured header, a launch's shells read none of your zsh startup
@@ -338,6 +351,7 @@ most common entry points:
 | work without GitHub | [Local mode](docs/local-mode.md) |
 | run phases through Pi on a DeepSeek API key or a ChatGPT subscription | [Pi operator guide](docs/pi.md) |
 | configure profiles, bounds and the merge gate | [Configuration](docs/configuration.md), [`autoforge.example.yaml`](autoforge.example.yaml) |
+| know what AutoForge protects, which GitHub token it needs, or report a vulnerability | [Security boundaries](docs/security.md), [SECURITY.md](SECURITY.md) |
 | understand the phases and legal transitions | [Workflow](docs/agent-guides/workflow.md) |
 | know what is verified on GitHub, and what gates a merge | [GitHub safety](docs/agent-guides/github-safety.md) |
 | know how state, locking and crash recovery work | [State and recovery](docs/agent-guides/state-and-recovery.md) |

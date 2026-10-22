@@ -29,6 +29,8 @@ description of how AutoForge behaves.
 
 | Document | Read it for |
 |---|---|
+| [Security boundaries](security.md) | start here before a first run: what AutoForge protects and what it does not (agents run as you, the same-user residual, prompt injection on public repositories, the opt-in sandbox, the redaction baseline, what goes to model vendors), the GitHub token permissions it needs, the runtime files to keep out of git, and recommended settings |
+| [Security policy](../SECURITY.md) | supported versions, how to report a vulnerability privately, what to expect, what is in and out of scope |
 | [GitHub safety](agent-guides/github-safety.md) | GitHub as source of truth, per-phase verification of agent claims, dry-run guarantees, agents holding no GitHub credential (the operation classification, credential routes, threat model, read context), the controller-owned merge and its gate, `doctor`'s branch-rule check, EPIC updates |
 | [CONTROL_RESULT protocol](agent-guides/control-result-protocol.md) | the machine-readable result block, per-phase required fields, payload bounds, findings versus observations |
 | [Replan transaction](agent-guides/replan-transaction.md) | the durable `REPLAN_REEXECUTE` transaction: provenance, the checkpointed close, compensation and recovery |

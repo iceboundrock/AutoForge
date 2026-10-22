@@ -1509,10 +1509,11 @@ the sandbox or is refused):
 **Out of scope:** kernel or `bwrap` exploits, a malicious operator, network
 egress, resource exhaustion beyond ADR 0002 and the tmpfs bounds, side
 channels, credentials the operator deliberately projects, the operator's
-own unsandboxed tools, and every launch under `disabled`. **Not yet**
-(#169): `preferred`, the capability gate before anything is saved, and
-`doctor`'s capability, hard-link, sandbox-directory and loopback-listener
-reports.
+own unsandboxed tools, and every launch under `disabled`, or one that
+`preferred` let fall back to logical isolation (LOCAL only, said at each
+launch; #169 added `preferred`, the capability gate before anything is
+saved, and `doctor`'s capability, hard-link, sandbox-directory and
+loopback-listener reports: [Usage: outer sandbox](../usage.md#outer-sandbox)).
 
 ## Merge safety
 

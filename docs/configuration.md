@@ -9,15 +9,22 @@ sections. It does not repeat every option.
 ## Creating and passing a config file
 
 ```bash
-cp autoforge.example.yaml autoforge.yaml     # git-ignored: local to one checkout
+cp autoforge.example.yaml autoforge.yaml     # local to one checkout: keep it out of git
 uv run autoforge --config autoforge.yaml doctor
 uv run autoforge --config autoforge.yaml run --epic <EPIC URL> --issue <issue URL>
 ```
 
 `--config` and `--state-dir` are options of the `autoforge` command itself,
 so they go before the subcommand. Without `--config` the controller uses its
-built-in defaults. `autoforge.yaml` and `autoforge.local.*` files are
-git-ignored; do not commit a config that names credentials or local paths.
+built-in defaults. AutoForge's own repository git-ignores `autoforge.yaml`
+and `autoforge.local.*`; the repository you run AutoForge on does not, so
+add them, and the state directory `.autoforge/`, to its `.gitignore` or to
+`.git/info/exclude`
+([Security boundaries](security.md#keep-autoforges-files-out-of-git)).
+Do not commit a config that names credentials or local paths. In LOCAL
+mode under the outer sandbox, keep the file outside the repository root:
+the root is writable to every enforced launch, and the next command reads
+the file again ([Security boundaries](security.md#the-outer-sandbox-is-opt-in-and-linux-only)).
 
 Edit the file to change model identifiers, effort, agent limits and provider
 options without touching controller source. Provider-specific flags are

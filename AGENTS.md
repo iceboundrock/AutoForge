@@ -74,13 +74,15 @@ runtime state belonging to one operator.
   `git worktree` it creates itself (`<git common dir>/autoforge/worktrees/<n>`
   by default), never in the checkout it is run from; the agent inherits an
   allow-listed environment (`execution.env_allowlist`), not the operator's
-  whole shell, that carries no GitHub or git credential (no credential
-  variable can be listed; the controller sets an empty `gh` configuration,
-  disables git credential helpers, askpass and the SSH agent, gives curl and
-  wget an empty configuration and its shells none of the operator's zsh
-  startup files, keeps the agent CLI's MCP servers, plugins and hooks off,
-  and refuses a launch a repository setting, a login shell's startup file
-  or an OpenCode organization integration would still hand one;
+  whole shell, that carries no GitHub or git credential (no variable `gh`
+  or git reads a credential from can be listed, though a token under a name
+  of the operator's own is not recognised; the controller sets an empty
+  `gh` configuration, disables git credential helpers, askpass and the SSH
+  agent, gives curl and wget an empty configuration and its shells none of
+  the operator's zsh startup files, keeps the agent CLI's MCP servers,
+  plugins and hooks off, and refuses a launch a repository setting, a login
+  shell's startup file or an OpenCode organization integration would still
+  hand one;
   `src/autoforge/child_env.py`, `src/autoforge/providers.py`); and the
   controller reads HEAD and branch of its own checkout before and after each
   invocation and enters `BLOCKED` if they moved. A dry run creates no
@@ -217,8 +219,11 @@ docs/sdk-policy.md                     SDK providers: what a launch may load, to
                                        roots, credentials, environment, interaction-data bounds
 docs/configuration.md                  config files, formats, strict key validation, profiles
 docs/development.md                    make targets, CI, what a green `ci` does and does not prove
+docs/security.md                       operator guide: security boundaries, what AutoForge does and
+                                       does not protect, GitHub token permissions, recommended settings
 README.md                              operator-facing landing page: overview, key properties,
                                        install, quick start, maturity
+SECURITY.md                            security policy: supported versions, private reporting, scope
 ```
 
 ## Routing rules

@@ -5,6 +5,26 @@ so.
 
 ## Unreleased
 
+### Security policy and security boundaries (#257)
+
+- [`SECURITY.md`](SECURITY.md): supported versions (the latest commit of
+  `main`), private reporting through GitHub's private vulnerability
+  reporting, what to expect, and what is in and out of scope.
+- [Security boundaries](docs/security.md), for operators: what AutoForge
+  protects and what it does not (agents run as you with network access
+  and your model credentials; the same-user residual under the default
+  `sandbox.mode: disabled`; prompt injection on public repositories; the
+  opt-in, Linux-only sandbox; the redaction baseline and the credential
+  shapes it misses; what goes to model vendors; pushed code running in
+  your CI), the GitHub token permissions it needs, the runtime files to
+  keep out of git, and recommended settings. No behaviour changes.
+- The documentation no longer says that no credential variable can be
+  allow-listed: the names `gh` and git read a credential from are refused,
+  but a token under a name of your own is not recognised and reaches every
+  launch if you list it. `autoforge.yaml` and `.autoforge/` are git-ignored
+  only in AutoForge's own repository; add them to the `.gitignore` or
+  `.git/info/exclude` of the repository you run it on.
+
 ### Operator actions on related issues (#243)
 
 - A `FIX` agent may resolve a finding as `operator_acceptance`: one to four
