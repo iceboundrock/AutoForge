@@ -13,6 +13,8 @@
   acts on a repository at a time) without removing it (D10, D11), and
   `docs/agent-guides/state-and-recovery.md` points here for the
   generalization.
+- **Amended by #243:** D9.4 (operator actions, ADR 0004 K10, at worker
+  entry and in `epic status`).
 - **Where:** placement is decided per decision and collected in §5.
   Existing code this record builds on: `src/autoforge/locking.py`,
   `engine.py`, `state.py`, `transitions.py`, `cli.py`, `executor.py`,
@@ -84,8 +86,8 @@ facts of #177's body that changed in between.
   (`cli.py` `--state-dir` :100, `config.state_dir`). LOCAL's is
   `<git dir>/autoforge/state`.
 - The state schema is `AutoForgeState` (`state.py` :390) at
-  `__protocol_version__` "10": #160 took 7, #211 8, #219 9 and #172 10, and
-  #23 reserves 6 for #126.
+  `__protocol_version__` "11": #160 took 7, #211 8, #219 9, #172 10 and
+  #243 11, and #23 reserves 6 for #126.
 - Worktrees are one per issue (`_agent_worktree_name`, `engine.py` :1771):
   `<common dir>/autoforge/worktrees/<n>`, or `<execution.worktree_dir>/<n>`.
   Between issues, `UPDATE_EPIC` uses `epic-<n>`. The worktree root is part
@@ -880,6 +882,25 @@ engine inputs; the engine learns no scheduler concept.
   namespace's `--state-dir` and the `--config`; the operator runs one after
   the scheduler has exited (`unblock` takes L0), then `epic resume`.
 
+**Amended by #243.** Operator actions (ADR 0004 K10: comments on other
+issues that the operator posts and the controller only verifies) park the
+state in `BLOCKED` the same way, so the issue is `held:settled-namespace`.
+A worker verifies them only in the engine's `FIX` prefix pass, as a
+standalone run does; it never binds or declines, and the scheduler never
+interprets, performs or verifies an action. For a `BLOCKED` namespace,
+`epic status` names the namespace's `unblock` and `epic resume` as the
+steps, and says in the row that an operator action is posted by the
+operator (`status --action X-...` prints its exact payload), bound with
+`unblock --bind-evidence X-... <comment URL>` or declined with
+`--decline-action X-...`, all run after the scheduler has exited. The
+row names the commands' shapes; the ids, and each action's commands with
+the namespace's `--state-dir` and the `--config`, are listed by the
+namespace's own `status`, which the row names. That `status` names
+`epic resume`, never a standalone `resume`, as the continuation (D17.3),
+for an acceptance action as well. K10 is not a controller write, so D13.2's
+table needs no row. The operator's steps are in
+[BLOCKED on operator actions](../usage.md#blocked-on-operator-actions).
+
 **D9.5 (#182).** **A fresh issue** starts through the same path as
 `autoforge run <epic> <issue>`: `INITIALIZING` (`_verify_issue_selectable`),
 then `ANALYZE_EXECUTE`, whose entry reconciliation
@@ -1633,8 +1654,9 @@ certificates (#170–#175) are consumed, not changed.
   `reset_for_new_issue` :1226, `StatePaths` :1584 and
   `quarantine_state_file` :1783; `_CONTAINMENT_LOCK` is at `executor.py`
   :917 (refused at :1025); `edit_issue_body` at `github.py` :1325.
-- **The state protocol is 10, not 5.** The scheduler's schemas stay outside
-  `AutoForgeState` (D18.2).
+- **The state protocol is 11, not 5** (10 when this record was accepted;
+  #243 took 11). The scheduler's schemas stay outside `AutoForgeState`
+  (D18.2).
 - **Agents no longer push or fetch.** Every REMOTE GitHub write is the
   controller's: an effect K1–K9, or one of ADR 0004 D5.4's writes (the
   merge, disabling auto-merge, the replan close, receipt and reopen, the

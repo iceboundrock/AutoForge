@@ -43,6 +43,7 @@ from .errors import (
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    GitHubWrongTargetError,
 )
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .locking import assert_shared_git_lock_free
@@ -1554,9 +1555,23 @@ class GitHubClient:
         data = self._api_json(
             ["issue", "view", ref.canonical, "--json", "url,number,title,state,body"]
         )
+        answered = data.get("url") if isinstance(data, dict) else None
+        if isinstance(answered, str) and "/pull/" in answered:
+            try:
+                pr = parse_pr_url(answered).canonical
+            except ConfigurationError:
+                pr = ""
+            if pr:
+                raise GitHubWrongTargetError(
+                    f"issue {ref.canonical}: `gh` answered with pull request {pr}", pr
+                )
         issue = _decode_issue(data, f"issue {ref.canonical}")
         if not parse_issue_url(issue.url).same_target(ref):
-            raise GitHubError(f"issue {ref.canonical}: `gh` answered with {issue.url}")
+            # A pull request of that number, or the issue it was transferred
+            # to: typed, so a caller can name which (#243).
+            raise GitHubWrongTargetError(
+                f"issue {ref.canonical}: `gh` answered with {issue.url}", issue.url
+            )
         return issue
 
     def get_issue_state(self, url: str) -> str:

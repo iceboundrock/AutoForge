@@ -382,7 +382,13 @@ creates the follow-up issues, appends the deferral markers and pushes the
 commit itself, from a plan it journals before anything is sent ("After
 FIX" below). The prompt offers the `acceptance_action` resolution as
 `safety.acceptance_actions` allows (not at all under `off`) and lists the
-actions the operator declined for the round.
+actions the operator declined for the round. An operator action (#243,
+ADR 0004 K10) is a comment on another issue that the operator posts and
+the controller only verifies: the controller never posts one, under any
+setting. The prompt offers the `operator_acceptance` resolution only when
+the entry recorded allowed targets (below), lists the round's declined
+operator actions and the operator comments already verified for the
+round.
 
 The journal is read first. A persisted completion context means the
 fixer's result was already accepted and its plan saved: the phase is
@@ -456,6 +462,16 @@ such an issue to the fixer. The one-shot re-entry of a run upgraded while a
 fixer of the previous contract was publishing (D13.6) has no observation to
 honor: its follow-ups are handed over as found.
 
+Unless `safety.acceptance_actions` is `off`, the entry also reads the run's
+issue once and records in the observation the issues an operator action
+may target (`operator_targets`, ADR 0004 D5.8): the issues its body
+references (`#n` or an issue URL of the repository, first mention first,
+at most 60), minus the run's issue and PR, plus the EPIC when it is in the
+run's repository, each with why it is allowed, and the body's digest. A
+conclusive read failure records none and offers no operator action; a
+transient one propagates, nothing launched. Every relaunch of the entry is
+held to that set, even when the issue body changes since.
+
 Last, the reviewed HEAD is fetched into the shared object store through
 the controller's transport (objects only; no ref moves), so the fixer
 starts from it and contacts no remote. A failed fetch propagates: nothing
@@ -472,8 +488,8 @@ for it:
 
 - `previous_head_sha` is the reviewed HEAD the findings are bound to
 - the resolutions cover exactly the open finding IDs, one each, as
-  `fixed`, `follow_up_created`, `no_change_with_rationale` or (#211)
-  `acceptance_action`
+  `fixed`, `follow_up_created`, `no_change_with_rationale`, (#211)
+  `acceptance_action` or (#243) `operator_acceptance`
 - an `acceptance_action` (at most one per result) is refused under
   `safety.acceptance_actions: off`, when the comment the controller renders
   from it (its header, the text, the finding's marker) fails the credential
@@ -481,6 +497,17 @@ for it:
   action id is one the operator declined for this round, and once the
   operator declined `MAX_DECLINES_PER_ROUND` (16) actions of the round,
   the most its history keeps (PR #221 R3-F1)
+- an `operator_acceptance` (at most four actions per result, never beside
+  an `acceptance_action`) is refused under `off`, when the entry recorded
+  no allowed target, at the same shared decline bound, for a target outside
+  the entry's set, for a (finding, target) already verified this round,
+  when its text links outside the run's repository, when the comment the
+  controller renders from it (its header, the text, the action's marker)
+  fails the published-content rules as a whole, and when its action id is
+  one the operator declined for this round. Each target is read: one
+  GitHub answers as missing or as a pull request is a correction; any
+  other conclusive failure (transferred, another repository, no
+  permission) blocks the result; a transient one propagates
 - a finding whose follow-up issue the entry found is resolved as
   `follow_up_created` with exactly that issue
 - any other deferral either names an issue the entry handed over (a
@@ -520,7 +547,10 @@ Then, in order, all from one persisted plan:
    nothing planned or sent. Otherwise the `acceptance_comment` record
    (K9, first; its target the run's issue, derived from state, and its
    authorization the setting now: `policy` with its own id approved under
-   `auto`, `operator` with none under `approve`), the `follow_up_issue` records (K5,
+   `auto`, `operator` with none under `approve`) or the `operator_comment`
+   records (K10, first, in result order; each target from the entry's set,
+   with why it is allowed and the body digest the entry read, and no
+   binding), the `follow_up_issue` records (K5,
    in result order, against a watermark read now), the `follow_up_append`
    records (K6, one per handed-over issue, its findings' markers in result
    order, against the digest of the body read now) and the `push` record
@@ -562,9 +592,19 @@ Then, in order, all from one persisted plan:
      or recreates follow-up issues. A record issued but not read back yet
      is left to its own reconciliation, which reads the same marker before
      anything is sent again.
-3. The records are driven in plan order. The acceptance comment comes
-   first: it is posted only once authorized and while the run's issue is
-   open in the PR's repository, and read back from the issue's complete
+3. The records are driven in plan order. Operator comments come first,
+   in a prefix pass that sends nothing (#243): each is verified from its
+   target's complete comment listing (its exact payload, or the comment
+   the operator bound, unchanged; ADR 0004 K10), and its observation or
+   conflict saved before the next is read. The pass does not stop at the
+   first one still waiting; while any is not verified, the step blocks
+   naming each (its id, target, finding, payload size and SHA-256, and the
+   `status --action`, `unblock --bind-evidence` and `--decline-action`
+   commands; see
+   [BLOCKED on operator actions](../usage.md#blocked-on-operator-actions)),
+   and nothing later in the plan is sent. Otherwise the acceptance
+   comment comes first: it is posted only once authorized and while the
+   run's issue is open in the PR's repository, and read back from the issue's complete
    comment listing as exactly one comment with its marker and its exact
    bytes (whoever posted it), adopted only while the issue is still open
    in the PR's repository (PR #221 R1-F2). Until then it is held: nothing
@@ -604,7 +644,9 @@ Then, in order, all from one persisted plan:
    other head is drift. Only then are the resolutions recorded
    (`last_fix_resolutions`, each deferral with the URL GitHub returned, and
    an acceptance action with its verified comment's `acceptance_comment_url`;
-   `acceptance_outcomes` records it `verified`),
+   `acceptance_outcomes` records it `verified`; an operator acceptance with
+   its `operator_evidence`, each verified comment's URL, evidence class and
+   digests, and `operator_comment_outcomes` records each `verified`),
    the open findings cleared and the phase advanced to `REVIEW`, whose
    prompt renders those resolutions as `PREVIOUS_FIX_RESOLUTIONS`: data
    for the reviewer to check, never a reply posted on the PR.
@@ -827,7 +869,12 @@ may ask for on the run's own issue, which also needs an authorization
 action id, a hash of its owner, target, marker and exact bytes that is
 recomputed from the record, so an approval never carries over to other
 bytes). There is no generic write: the agent supplies only the text, and a
-URL, target, method, path or command in its request is refused.
+URL, target, method, path or command in its request is refused. #243 adds
+K10, the first operator-performed kind: a comment on another issue of the
+repository that the operator posts and the controller only verifies. It
+adds no write: its operation is read-only (`OperatorCommentOp.issue`
+raises), `drive` refuses its record and `effect_ops.verify` is its one
+path, so no setting makes the controller post one (ADR 0004 D2.1a).
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,
@@ -900,8 +947,9 @@ URL, target, method, path or command in its request is refused.
 Agent text the controller publishes under the operator's identity
 (`progress`, `roadmap_section`, `pr_title`, `pr_body`, a review's prose
 sections and its findings' titles, locations and required resolutions, a
-new follow-up issue's title and body, an acceptance comment's body, and
-the payloads of later kinds) is
+new follow-up issue's title and body, an acceptance comment's body, an
+operator comment's text, which the operator posts under their identity
+(#243), and the payloads of later kinds) is
 refused by
 `result_parser.published_text_problem`, and the agent is asked to correct
 it, when it contains:
@@ -920,6 +968,15 @@ controller composes from several fields (the review comment before its
 marker): a fence one field leaves open and a later field closes, or raw
 HTML in one field, can leave a mention outside code that each field alone
 kept in code.
+
+An operator comment's text (#243, ADR 0004 D8.3) is held to more: at most
+`MAX_OPERATOR_COMMENT_CHARS` (16000), no image and no raw HTML outside code
+(`operator_markup_problem`), and every link or bare URL inside the run's
+repository (`operator_comment_link_problem`: no other host, repository or
+scheme, no relative, `www.` or e-mail link, no `..`, also once entity and
+percent escapes are decoded). The controller applies the link rule when it
+checks the result and again when it loads a saved record, and judges the
+whole rendered payload (header, text, marker) as above.
 
 A commit the controller pushes is published too. Every commit of the range
 from the base to the candidate is read back by the transport and refused
@@ -954,6 +1011,8 @@ make no GitHub call and are out of scope.
 | post a round's review comment | controller-only | the controller, effect K4 |
 | create a follow-up issue, append a follow-up marker | controller-only | the controller, effects K5, K6 |
 | post the EPIC progress comment; splice the EPIC roadmap | controller-only | the controller, effect K8 and the roadmap write |
+| post the acceptance comment on the run's issue | controller-only | the controller, effect K9, once authorized (#211) |
+| post a comment on another issue of the run's repository as acceptance evidence | controller-only | the operator; the controller never posts it and verifies it as effect K10 (#243) |
 | close, reopen or comment on the source PR of a replan | controller-only | the controller's replan transaction |
 | merge; disable auto-merge | controller-only | the controller, behind `safety.allow_merge` |
 | edit a comment in place, close an issue, delete a branch, labels, assignees, milestones, any other REST or GraphQL mutation | controller-only | nobody: there is no kind for it |

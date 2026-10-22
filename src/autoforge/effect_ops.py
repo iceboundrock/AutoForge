@@ -22,12 +22,21 @@ Every kind of the closed set (ADR 0004 D5.1) has one operation here:
 :class:`PushOp` (K1), :class:`ImplementationPrOp` (K2), :class:`AdoptPrOp`
 (K3), :class:`ReviewCommentOp` (K4), :class:`FollowUpIssueOp` (K5),
 :class:`FollowUpAppendOp` (K6), :class:`ReplacementPrOp` (K7),
-:class:`ProgressCommentOp` (K8) and :class:`AcceptanceCommentOp` (K9). A K9
+:class:`ProgressCommentOp` (K8), :class:`AcceptanceCommentOp` (K9) and
+:class:`OperatorCommentOp` (K10). A K9
 write may also be *held* (``Action.HOLD``, #211): nothing is sent until the
 operator approves it, nothing is sent or adopted while the run's issue does
 not qualify, and :func:`drive` returns the record unchanged with the
 reason, also when the issue stopped qualifying between the write and its
-read-back. Each ``reconcile`` is a complete identity
+read-back.
+
+K10 (#243) is **read-only**: the operator performs the comment and the
+controller only verifies it. :class:`OperatorCommentOp` reads the target's
+complete comment listing and the target itself; its ``issue`` raises
+:class:`OperatorPerformedError` naming the record, :func:`drive` refuses an
+operator-performed record before anything is persisted or sent, and
+:func:`verify` is the one way such a record changes stage (``observed`` or
+``conflict``, saved as made). Each ``reconcile`` is a complete identity
 read (D4.5): an open listing read to its end, or an all-states read bounded
 by a head-branch filter or a number watermark, never the search API. Each
 ``issue`` is exactly one write. What an operation checks is the record's own
@@ -39,7 +48,7 @@ records.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -47,6 +56,7 @@ from .claims import (
     ACCEPTANCE,
     FOLLOW_UP,
     IMPLEMENTATION,
+    OPERATOR_COMMENT,
     PROGRESS,
     REVIEW,
     MarkerKind,
@@ -60,10 +70,12 @@ from .effects import (
     EffectKind,
     EffectRecord,
     Found,
+    Listed,
     Stage,
     decide_acceptance,
     decide_append,
     decide_create,
+    decide_operator_comment,
     decide_push,
 )
 from .errors import (
@@ -71,13 +83,15 @@ from .errors import (
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    GitHubWrongTargetError,
     GitTransportError,
+    StateError,
 )
 from .git_transport import GitTransport, PushOutcome
 from .github import GitHubClient, IssueInfo, PRInfo
 from .redaction import credential_classes, redact
 from .replan_txn import scan_replan_markers
-from .validation import parse_issue_url, parse_pr_url
+from .validation import parse_issue_url, parse_pr_url, same_issue_url
 
 Persist = Callable[[EffectRecord], None]
 
@@ -88,6 +102,10 @@ class EffectOperation(Protocol):
     def reconcile(self, record: EffectRecord) -> Decision: ...
 
     def issue(self, record: EffectRecord) -> None: ...
+
+
+class OperatorPerformedError(StateError):
+    """A K10 record reached a write path: the controller never issues it (#243)."""
 
 
 class EffectPending(GitHubUnavailableError):
@@ -121,7 +139,15 @@ def drive(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven
     persisted or charged), or :class:`EffectPending` after an issue whose
     read-back did not show it. A conclusive read failure
     (:class:`GitHubError`) propagates unchanged for the caller to block on.
+
+    An operator-performed record (K10, #243) is refused before any read,
+    persist or write: :func:`verify` is its one path.
     """
+    if record.operator_performed:
+        raise OperatorPerformedError(
+            f"{record.describe()} ({record.action_id}) is operator-performed; the controller "
+            "never issues it, so it is verified, never driven"
+        )
     decision = op.reconcile(record)
     if decision.action is Action.DONE:
         return Driven(record, issued=False)
@@ -194,6 +220,43 @@ def drive(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven
         f"{record.describe()} was issued (attempt {record.attempts}) but its read-back does "
         "not show it yet; the record stays attempted and 'resume' reconciles it before "
         "anything is sent again"
+    )
+
+
+def verify(record: EffectRecord, op: EffectOperation, persist: Persist) -> Driven:
+    """Reconcile an operator-performed record (K10, #243); never issue anything.
+
+    ``observed`` and ``conflict`` are persisted as made. A hold returns the
+    record, still ``intended``, with :attr:`Driven.held`; a failed
+    verification (:attr:`Decision.failed`) is kept as its reason, and a
+    plain "awaiting the operator" clears an earlier one, each persisted
+    only when it changes the record (PR #254 R3-F3). A decision to issue
+    is impossible for the kind and is refused as a controller bug. Raises
+    :class:`GitHubUnavailableError` with nothing persisted when the target
+    cannot be read now.
+    """
+    if not record.operator_performed:
+        raise OperatorPerformedError(f"{record.describe()} is not operator-performed")
+    decision = op.reconcile(record)
+    if decision.action is Action.DONE:
+        return Driven(record, issued=False)
+    if decision.action is Action.HOLD:
+        diagnosed = record.diagnosed(decision.reason if decision.failed else "")
+        if diagnosed != record:
+            persist(diagnosed)
+        return Driven(diagnosed, issued=False, held=decision.reason)
+    if decision.action is Action.OBSERVE:
+        record = record.observing(decision.observed or {})
+        persist(record)
+        return Driven(record, issued=False)
+    if decision.action is Action.CONFLICT:
+        if record.stage is not Stage.CONFLICT:
+            record = record.conflicting(decision.reason)
+            persist(record)
+        return Driven(record, issued=False)
+    raise OperatorPerformedError(
+        f"{record.describe()} ({record.action_id}): a verification decided to "
+        f"{decision.action.value}, which an operator-performed record never does"
     )
 
 
@@ -900,6 +963,148 @@ class AcceptanceCommentOp:
         self.github.create_issue_comment(record.target["issue_url"], record.body)
 
 
+class OperatorCommentOp:
+    """K10: one operator comment on another issue of the run's repository (#243). Read-only.
+
+    Identity: the ``ai-operator-comment`` marker for (run issue, PR, round,
+    finding, target) on the target. The operator posts it; the controller
+    never does. Completion: exactly one comment of the target's complete
+    listing carries the marker and its body equals the payload (``exact``),
+    or the comment the operator bound is in the listing with its digest
+    unchanged (``bound``). ``plan`` is the FIX plan's records: a marker of
+    another K10 of the plan, meant for another issue, found on this target
+    is a misplaced payload and a conflict. The target is read too: it must
+    still be an issue of the run's repository (open or closed).
+
+    One comment verifies one action (PR #254 R2-F1): a comment another
+    record of the plan is observed on, one carrying the marker of another
+    record of the plan (its exact evidence, observed or not yet), and one
+    ``reserved`` names (``{comment id: action id}``, the comments verified
+    for other actions earlier in the round) is never this record's evidence.
+    """
+
+    def __init__(
+        self,
+        github: GitHubClient,
+        plan: Sequence[EffectRecord] = (),
+        reserved: Mapping[int, str] | None = None,
+    ) -> None:
+        self.github = github
+        self.plan = tuple(plan)
+        self.reserved = dict(reserved or {})
+
+    def reconcile(self, record: EffectRecord) -> Decision:
+        if record.stage in (Stage.OBSERVED, Stage.CONFLICT):
+            return decide_operator_comment(record, own=(), misplaced=(), listing=())
+        target_url = record.target["issue_url"]
+        problem = self.target_problem(target_url, record.owner.issue_url)
+        if problem:
+            return decide_operator_comment(
+                record, own=(), misplaced=(), listing=(), target_problem=problem
+            )
+        return self.reconcile_listing(record)
+
+    def reconcile_listing(self, record: EffectRecord) -> Decision:
+        """:meth:`reconcile` from the target's complete listing alone (#243).
+
+        For a caller that has read the target itself
+        (:meth:`target_disqualification`). Any failure to read the listing
+        propagates.
+        """
+        if record.stage in (Stage.OBSERVED, Stage.CONFLICT):
+            return decide_operator_comment(record, own=(), misplaced=(), listing=())
+        target_url = record.target["issue_url"]
+        comments = self.github.get_issue_comments(target_url)
+        listing = [Listed(url=c.url, comment_id=c.id, body=c.body) for c in comments]
+        collection = collect(OPERATOR_COMMENT, comments, "comment")
+        key = scan(OPERATOR_COMMENT, record.marker).claims[0].key
+        siblings = [
+            r
+            for r in self.plan
+            if r.kind is EffectKind.OPERATOR_COMMENT and r.position != record.position
+        ]
+        others = {
+            scan(OPERATOR_COMMENT, r.marker).claims[0].key
+            for r in siblings
+            if not same_issue_url(r.target["issue_url"], target_url)
+        }
+        claimants = {scan(OPERATOR_COMMENT, r.marker).claims[0].key: r.action_id for r in siblings}
+        own = [
+            Listed(url=h.obj.url, comment_id=h.obj.id, body=h.obj.body)
+            for h in collection.holders
+            if h.claim.key == key
+        ]
+        misplaced = [
+            Listed(url=h.obj.url, comment_id=h.obj.id, body=h.obj.body)
+            for h in collection.holders
+            if h.claim.key in others
+        ]
+        taken = dict(self.reserved)
+        for r in siblings:
+            if r.stage is Stage.OBSERVED:
+                taken[int((r.observed or {})["comment_id"])] = r.action_id
+        for h in collection.holders:
+            if h.claim.key in claimants:
+                taken.setdefault(h.obj.id, claimants[h.claim.key])
+        return decide_operator_comment(
+            record,
+            own=own,
+            misplaced=misplaced,
+            listing=listing,
+            defects=collection.defects,
+            taken={cid: a for cid, a in taken.items() if a != record.action_id},
+        )
+
+    def target_problem(self, target_url: str, issue_url: str) -> str:
+        """Why the target no longer qualifies (transferred, deleted, a PR), or "".
+
+        A transient failure propagates; every conclusive one is a reason.
+        """
+        try:
+            return self.target_disqualification(target_url, issue_url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return f"issue {target_url} cannot be read ({redact(str(exc))})"
+
+    def target_disqualification(self, target_url: str, issue_url: str) -> str:
+        """:meth:`target_problem` from an answer GitHub gave, or "" (#243).
+
+        Not found, another object or another repository is a reason. Any
+        other conclusive failure propagates, like a transient one: an
+        ``unblock`` refuses on a target it cannot read rather than holding
+        it (PR #254 R1-F1).
+        """
+        try:
+            return self.target_mismatch(target_url, issue_url)
+        except GitHubNotFoundError:
+            return f"issue {target_url} is not found (deleted, or not readable with this token)"
+
+    def target_mismatch(self, target_url: str, issue_url: str) -> str:
+        """:meth:`target_disqualification` of a target GitHub finds, or "" (#243).
+
+        Another object or another repository is a reason. Not found
+        propagates like every other failure, for a caller to which a missing
+        target is no reason: a decline, where it holds no marker (PR #254
+        R4-F1).
+        """
+        try:
+            issue = self.github.get_issue(target_url)
+        except GitHubWrongTargetError as exc:
+            what = "a pull request" if exc.is_pull_request else "another object"
+            return f"issue {target_url} answers as {what} ({exc.answered_url})"
+        repository = parse_issue_url(issue_url).repository
+        if not _same_repository(issue.repository or repository, repository):
+            return f"issue {target_url} is no longer in the run's repository {repository}"
+        return ""
+
+    def issue(self, record: EffectRecord) -> None:
+        raise OperatorPerformedError(
+            f"{record.describe()} ({record.action_id}) is operator-performed; the controller "
+            "never posts it"
+        )
+
+
 _GITHUB_OPS: dict[EffectKind, Callable[[GitHubClient], EffectOperation]] = {
     EffectKind.IMPLEMENTATION_PR: ImplementationPrOp,
     EffectKind.ADOPT_PR: AdoptPrOp,
@@ -909,6 +1114,8 @@ _GITHUB_OPS: dict[EffectKind, Callable[[GitHubClient], EffectOperation]] = {
     EffectKind.REPLACEMENT_PR: ReplacementPrOp,
     EffectKind.PROGRESS_COMMENT: ProgressCommentOp,
     EffectKind.ACCEPTANCE_COMMENT: AcceptanceCommentOp,
+    # Read-only: its ``issue`` raises (#243).
+    EffectKind.OPERATOR_COMMENT: OperatorCommentOp,
 }
 
 
@@ -945,6 +1152,8 @@ __all__ = [
     "FollowUpAppendOp",
     "FollowUpIssueOp",
     "ImplementationPrOp",
+    "OperatorCommentOp",
+    "OperatorPerformedError",
     "ProgressCommentOp",
     "PushOp",
     "PushRefusedError",
@@ -953,4 +1162,5 @@ __all__ = [
     "drive",
     "operation_for",
     "raise_conflict",
+    "verify",
 ]

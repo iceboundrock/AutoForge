@@ -11,6 +11,7 @@ from autoforge.errors import (
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
+    GitHubWrongTargetError,
 )
 from autoforge.executor import ExecutionResult
 from autoforge.github import (
@@ -25,6 +26,7 @@ from autoforge.github import (
     is_access_denied_gh_failure,
     parse_actions_run_url,
 )
+from autoforge.validation import parse_pr_url
 
 
 def _res(payload: object, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
@@ -1829,7 +1831,9 @@ _PR_ROW = {
         ("not an object", "non-object"),
         (dict(_ISSUE_ROW, url=None), "not a GitHub issue URL"),
         ({k: v for k, v in _ISSUE_ROW.items() if k != "url"}, "not a GitHub issue URL"),
-        (dict(_ISSUE_ROW, url="https://github.com/o/r/pull/9"), "not a GitHub issue URL"),
+        # A PR URL that is not one either; a well-formed PR URL is a wrong target
+        # in the view (``test_an_issue_view_answered_with_a_pull_request_...``).
+        (dict(_ISSUE_ROW, url="https://github.com/o/r/pull/9/files"), "not a GitHub issue URL"),
         (dict(_ISSUE_ROW, url="https://github.com/o/r/issues/9?x=1"), "not a GitHub issue URL"),
         (dict(_ISSUE_ROW, number=10), "field 'number' is 10 but the url names #9"),
         (dict(_ISSUE_ROW, number="9"), "field 'number' is not an integer"),
@@ -1842,7 +1846,7 @@ _PR_ROW = {
         "non-object",
         "null-url",
         "missing-url",
-        "pr-url",
+        "pr-url-with-path",
         "url-with-query",
         "number-disagrees",
         "string-number",
@@ -1865,6 +1869,91 @@ def test_a_malformed_issue_row_is_a_github_error_in_every_listing_and_view(row, 
     single = _client(lambda req: _res(row))
     with pytest.raises(GitHubError, match=needle):
         single.get_issue("https://github.com/o/r/issues/9")
+
+
+@pytest.mark.parametrize(
+    "answered",
+    [
+        "https://github.com/o/r/pull/9",
+        "https://github.com/O/R/pull/9/",
+        "https://github.com/o/x/pull/12",
+    ],
+    ids=["same-number", "spelled-differently", "another-repository"],
+)
+def test_an_issue_view_answered_with_a_pull_request_is_a_typed_wrong_target(answered):
+    """#243: ``gh issue view`` of a number that is a pull request answers with
+    the pull request. That is GitHub's conclusive answer, not a malformed
+    row: typed, with the URL it answered, so a caller can say "a pull
+    request" without parsing the message. Decided before the row is decoded,
+    so the rest of the row does not matter. A listing row with a PR URL is
+    still a malformed row."""
+    canonical = parse_pr_url(answered).canonical
+    for row in (dict(_ISSUE_ROW, url=answered), {"url": answered}):
+        gh = _client(lambda req, row=row: _res(row))
+        with pytest.raises(GitHubWrongTargetError) as exc:
+            gh.get_issue("https://github.com/o/r/issues/9")
+        assert isinstance(exc.value, GitHubError)
+        assert exc.value.is_pull_request and exc.value.answered_url == canonical
+        assert str(exc.value) == (
+            f"issue https://github.com/o/r/issues/9: `gh` answered with pull request {canonical}"
+        )
+    gh = _client(lambda req: _res([_ISSUE_ROW, dict(_ISSUE_ROW, url=answered)]))
+    with pytest.raises(GitHubError, match="not a GitHub issue URL") as listing:
+        gh.list_open_issues("o/r", strict=True)
+    assert not isinstance(listing.value, GitHubWrongTargetError)
+
+
+@pytest.mark.parametrize(
+    "answered",
+    [
+        "https://github.com/o/x/issues/9",
+        "https://github.com/p/r/issues/9",
+        "https://github.com/o/r/issues/10",
+        "https://github.com/o/x/issues/41",
+    ],
+    ids=["other-repository", "other-owner", "other-number", "transferred"],
+)
+def test_an_issue_view_answered_with_another_issue_is_a_typed_wrong_target(answered):
+    """A transferred issue answers as the issue it became; any answer that is
+    not the issue asked for is a wrong target that is no pull request."""
+    number = int(answered.rsplit("/", 1)[1])
+    gh = _client(lambda req: _res(dict(_ISSUE_ROW, url=answered, number=number)))
+    with pytest.raises(GitHubWrongTargetError) as exc:
+        gh.get_issue("https://github.com/o/r/issues/9")
+    assert not exc.value.is_pull_request and exc.value.answered_url == answered
+    assert str(exc.value) == f"issue https://github.com/o/r/issues/9: `gh` answered with {answered}"
+
+
+@pytest.mark.parametrize(
+    "answered", ["https://github.com/o/r/issues/9", "https://github.com/O/R/issues/9"]
+)
+def test_an_issue_view_answered_with_the_issue_asked_for_is_unchanged(answered):
+    """The ordinary case: one read, the issue as GitHub spells it, no error."""
+    seen = []
+
+    def handler(req):
+        seen.append(req.command)
+        return _res(dict(_ISSUE_ROW, url=answered))
+
+    issue = _client(handler).get_issue("https://github.com/o/r/issues/9")
+    assert (issue.url, issue.number, issue.title, issue.state) == (answered, 9, "Follow-up", "OPEN")
+    assert len(seen) == 1
+    assert seen[0][-5:] == [
+        "issue",
+        "view",
+        "https://github.com/o/r/issues/9",
+        "--json",
+        "url,number,title,state,body",
+    ]
+
+
+def test_an_issue_of_a_repository_named_pull_is_not_a_pull_request():
+    answered = "https://github.com/o/pull/issues/9"
+    gh = _client(lambda req: _res(dict(_ISSUE_ROW, url=answered)))
+    with pytest.raises(GitHubWrongTargetError) as exc:
+        gh.get_issue("https://github.com/o/r/issues/9")
+    assert exc.value.answered_url == answered
+    assert not exc.value.is_pull_request
 
 
 @pytest.mark.parametrize(
@@ -1911,7 +2000,7 @@ def test_a_view_that_answers_with_another_object_is_refused():
     with pytest.raises(GitHubError, match="answered with .*pull/43"):
         gh.get_pr("https://github.com/o/r/pull/42")
     gh = _client(lambda req: _res(dict(_ISSUE_ROW, url="https://github.com/o/x/issues/9")))
-    with pytest.raises(GitHubError, match="answered with .*o/x/issues/9"):
+    with pytest.raises(GitHubWrongTargetError, match="answered with .*o/x/issues/9"):
         gh.get_issue("https://github.com/o/r/issues/9")
     # A casing variant of the requested URL is the same object.
     gh = _client(lambda req: _res(dict(_PR_ROW, url="https://github.com/O/R/pull/1")))

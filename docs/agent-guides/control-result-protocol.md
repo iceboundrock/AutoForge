@@ -241,6 +241,9 @@ MAX_FIX_RATIONALE_CHARS         rationale length (after stripping), both modes
 MAX_URL_CHARS                   any URL field, checked before the URL is parsed
 MAX_ACCEPTANCE_BODY_CHARS       an acceptance action's body (60000), REMOTE only
 MAX_ACCEPTANCE_ACTIONS_PER_FIX  acceptance actions per FIX result (1), REMOTE only
+MAX_OPERATOR_COMMENT_CHARS      an operator action's body (16000), REMOTE only
+MAX_OPERATOR_ACTIONS_PER_FIX    operator actions per FIX result (4), REMOTE only
+MAX_OPERATOR_ISSUE_NUMBER       an operator action's issue number (999999999)
 ```
 
 The resolution count is equal to the finding count by construction: the
@@ -312,12 +315,13 @@ not a key of this phase any more.
 | `previous_head_sha` | required SHA; a cross-check only: the engine refuses a value other than the reviewed HEAD the open findings are bound to |
 | `head_sha` | required SHA; a cross-check only: the engine reads the worktree's `HEAD` itself and refuses a value that differs from it |
 | `resolutions` | required list, at most `MAX_RESOLUTIONS_PER_FIX`, distinct `finding_id`s; the engine refuses any set other than exactly the open findings |
-| `resolutions[].resolution` | `fixed`, `follow_up_created`, `no_change_with_rationale` or `acceptance_action` (#211) |
+| `resolutions[].resolution` | `fixed`, `follow_up_created`, `no_change_with_rationale`, `acceptance_action` (#211) or `operator_acceptance` (#243) |
 | `resolutions[].commit_sha` | optional SHA, on `fixed` only; the engine refuses one outside the commits after the reviewed HEAD up to `head_sha` |
 | `resolutions[].follow_up_issue_url` | on `follow_up_created` only, exclusive with `follow_up_issue`: an issue URL bounded by `MAX_URL_CHARS`; the engine refuses one it did not hand over and the current issue |
 | `resolutions[].follow_up_issue` | on `follow_up_created` only, exclusive with `follow_up_issue_url`: an object with `title` (one line, at most `MAX_FOLLOW_UP_TITLE_CHARS`, 256) and `body` (multi-line, at most `MAX_FOLLOW_UP_BODY_CHARS`, 60000), both non-blank |
 | `resolutions[].acceptance_action` | on `acceptance_action` only, and required there: exactly `{"kind": "issue_comment", "body": "<Markdown>"}`; `body` multi-line, non-blank, at most `MAX_ACCEPTANCE_BODY_CHARS` (60000); a `url`, `issue`, `repository`, `target`, `method`, `path` or `command` key is refused by name, any other key as unknown, any other kind as unsupported; at most `MAX_ACCEPTANCE_ACTIONS_PER_FIX` (1) per result |
-| `resolutions[].rationale` | at most `MAX_FIX_RATIONALE_CHARS`; at least `MIN_RATIONALE_CHARS` on `no_change_with_rationale` and `acceptance_action` |
+| `resolutions[].operator_acceptance` | on `operator_acceptance` only, and required there: exactly `{"actions": [...]}`, 1 to `MAX_OPERATOR_ACTIONS_PER_FIX` (4) actions, each exactly `{"kind": "related_issue_comment", "issue": <n>, "body": "<Markdown>"}`; `issue` a JSON integer from 1 to `MAX_OPERATOR_ISSUE_NUMBER`, never a URL or `#n`, and not twice in one finding; `body` multi-line, non-blank, at most `MAX_OPERATOR_COMMENT_CHARS` (16000), with no image or raw HTML outside code; a `url`, `repository`, `owner`, `repo`, `target`, `method`, `path` or `command` key is refused by name at either level, any other key as unknown, any other kind as unsupported; at most `MAX_OPERATOR_ACTIONS_PER_FIX` (4) across the result, never beside an `acceptance_action` |
+| `resolutions[].rationale` | at most `MAX_FIX_RATIONALE_CHARS`; at least `MIN_RATIONALE_CHARS` on `no_change_with_rationale`, `acceptance_action` and `operator_acceptance` |
 | `tests` | optional list of one-line strings, at most `MAX_TESTS_REPORTED` (50) entries of `MAX_TEST_CHARS` (500); recorded, never published |
 
 A new follow-up issue's `title` and `body` pass the published-content
@@ -353,6 +357,30 @@ data. LOCAL `FIX` is unchanged: it has no follow-ups and no acceptance
 actions, and its own resolutions (`LOCAL_FIX_RESOLUTIONS`); a LOCAL
 `acceptance_action` is refused with "LOCAL runs perform no external
 writes".
+
+An `operator_acceptance` (#243, ADR 0004 K10) asks the operator to post a
+comment on another issue of the run's repository, one the run's issue
+references or the EPIC; the controller never posts it and only verifies
+it. Its `body` passes the published-content policy and the operator
+rules (`validate_operator_comment_body`; [github-safety.md](github-safety.md),
+"Published content"). The parser does not know the repository, so the
+engine applies the link rule (every link inside the run's repository,
+`operator_comment_link_problem`) when it checks the result. The engine
+renders each action as the controller's header, the text and the action's
+`ai-operator-comment` marker, judges that payload as a whole, and also
+refuses the resolution under `safety.acceptance_actions: off`, when the
+entry recorded no allowed target, at the shared decline bound (K9's and
+K10's declines of the round together), for an issue outside the entry's
+allowed set, for a (finding, target) already verified this round, for an
+action id the operator declined for the round, and for a target GitHub
+answers as missing or as a pull request; any other conclusive failure
+reading a target blocks instead ([github-safety.md](github-safety.md),
+"After FIX"). Like an acceptance action it names no commit or follow-up and
+claims no other external change. The recorded resolution carries the
+round's verified comments as `operator_evidence` (`[]` for every other
+resolution), and the next reviewer receives them as data
+(`operator-evidence.md`). A LOCAL `operator_acceptance` is refused: a LOCAL
+run has no GitHub and no operator actions.
 
 ### REPLAN_REEXECUTE fields
 

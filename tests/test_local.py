@@ -3442,6 +3442,7 @@ def test_a_local_state_cannot_hold_a_github_only_phase(tmp_path):
         "review_certificate": {},
         "producer_validation_failure": {},
         "validation_override_seq": None,
+        "operator_comment_outcomes": [],
     }
     assert load_state_from(path, good).phase == Phase.REVIEW
     for phase in ("READY_FOR_MERGE", "MERGE", "UPDATE_EPIC", "REPLAN_REEXECUTE"):

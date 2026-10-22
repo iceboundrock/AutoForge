@@ -23,10 +23,12 @@ uv run autoforge run --epic https://github.com/owner/repo/issues/1 \
 uv run autoforge status            # human summary
 uv run autoforge status --json     # machine-readable; `replan_journal` says whether the
                                    # raw `replan_transaction` beside it is readable,
-                                   # `acceptance_actions` lists the acceptance actions and
+                                   # `acceptance_actions` lists the acceptance actions,
+                                   # `operator_actions` the operator actions and
                                    # `review_certificate_status` the review certificate
 uv run autoforge status --action A-0123456789abcdef   # the exact payload bytes of
-                                   # an acceptance action (exit 1 for an unknown id)
+                                   # an acceptance action or an operator action (X-…)
+                                   # (exit 1 for an unknown id)
 
 uv run autoforge step              # exactly one phase step
 uv run autoforge step --dry-run    # preview the next step
@@ -55,6 +57,17 @@ uv run autoforge unblock --reason "reran the flaky check; it is green"
 # then `resume`. Mutually exclusive; --dry-run works here too
 uv run autoforge unblock --approve-action A-0123456789abcdef --reason "checked the text"
 uv run autoforge unblock --decline-action A-0123456789abcdef --reason "overstates coverage"
+
+# FIX operator actions await you: you post each comment yourself (the
+# controller never does), or bind a comment already there, or withdraw them
+# (repeatable); then `resume`
+uv run autoforge status --action X-0123456789abcdef | \
+  gh issue comment https://github.com/owner/repo/issues/16 --body-file -
+uv run autoforge unblock --reason "posted the note on #16"
+uv run autoforge unblock --bind-evidence X-0123456789abcdef \
+  https://github.com/owner/repo/issues/16#issuecomment-123 --reason "the note is there"
+uv run autoforge unblock --decline-action X-0123456789abcdef \
+  --decline-action X-fedcba9876543210 --reason "not this issue's job"
 ```
 
 Pass a config file with the global option, before the subcommand:
@@ -222,7 +235,8 @@ write that conflicts after the plan was saved (reopen the follow-up issue
 the controller created, put the issue body back, or leave the PR branch at
 the reviewed HEAD or the planned commit, then `unblock`: the plan
 completes without running the fixer again). A FIX acceptance action that
-awaits you also blocks the run; see the next section. A push to the PR branch the controller did not make, before
+awaits you also blocks the run, and so do FIX operator actions; see the next
+two sections. A push to the PR branch the controller did not make, before
 or after the fixer ran, is not a block: the PR goes back to `REVIEW` of the
 pushed HEAD; so does a PR retargeted to another base, or a base rewritten
 under its name, at any point of the phase. A LOCAL
@@ -274,6 +288,115 @@ controller publishes the comment during the `FIX` step without stopping; with
 `off` the fixer is told the resolution is unavailable and a result using it is
 refused. The comment counts only after the controller read it back from
 GitHub, and the next review still judges whether it resolves the finding.
+
+### BLOCKED on operator actions
+
+A finding sometimes asks for text on *another* issue: a coordination note
+on an issue the run's issue references, or a status line on the EPIC. The
+fixer cannot post it, and neither does the controller: it resolves the
+finding as `operator_acceptance` with one to four `related_issue_comment`
+actions (four at most per result too), each naming a target issue and the
+comment's text, and **you** post each comment. The controller only plans
+them, shows you the exact bytes and verifies afterwards what is on GitHub.
+
+The allowed targets are fixed when `FIX` starts: the issues the run's issue
+body references (`#N` or a URL of the run's repository; the first 60), plus
+the EPIC, minus the run's own issue and PR. An edit of the issue body later
+changes nothing for that `FIX` step. A target must be an existing issue of
+the run's repository (open or closed), never a pull request. The text is at
+most 16000 characters, with no image and no raw HTML, and links only to
+`https://github.com/<the run's repository>/...`. A result may not mix
+`operator_acceptance` with `acceptance_action`. A LOCAL run and
+`safety.acceptance_actions: off` refuse the resolution (the fixer is told it
+is unavailable); `approve` and `auto` both offer it, and it always waits for
+you.
+
+The step blocks before anything else of the plan is sent: the follow-up
+issues and the push of the fixer's commit wait until every operator action
+is verified. `status` shows an `Operator actions (FIX, review round N,
+finding F …)` block with one `X-…` line per action (`pending (not yet
+verified)`, `evidence bound, not yet verified: <url>`, `verified (exact):
+<url>`, `verified (operator-bound; …): <url>` or `verification failed: …`),
+why each target is allowed, the payload's size and SHA-256, the push held
+back, the agent worktree that holds the unpushed commit (do not reset or
+remove it), and the next commands. For each action, either:
+
+- **post it:** `autoforge status --action X-… | gh issue comment <target>
+  --body-file -` posts exactly the payload (its `ai-operator-comment`
+  marker included) on the target; then `autoforge unblock --reason "..."`
+  and `resume`. The comment counts as `exact` evidence when it is the one
+  comment of the target carrying that marker and its bytes are the
+  payload's.
+- **bind a comment already there:** `autoforge unblock --bind-evidence X-…
+  <comment URL> --reason "..."` (repeatable, one pair per action), then
+  `resume`. The comment must be an issue comment of the run's repository on
+  the action's target, in the target's complete comment listing, carry no
+  controller marker (an earlier round's payload of this run for the same
+  target may be bound, another action's payload of this plan may not), and
+  be bound to, verified for or carry the payload of no other action of the
+  round: one comment verifies one action. Every pending action's target is
+  read first, and one that cannot be read refuses the binding. The
+  binding records the comment's digest: the evidence is `bound`. If that
+  comment is edited or deleted before `FIX` verifies it, `FIX` blocks again
+  naming both digests: bind it again or post the payload.
+
+`status` reads nothing from GitHub, so it shows what `FIX` last found. When
+that verification failed (a bound comment edited or deleted, or a target
+that cannot be read or is no longer an issue of the repository), the action
+shows `verification failed at FIX's last check: …` (`state:
+"verification_failed"` with its `reason` in `status --json`) until the next
+`FIX` pass finds otherwise, or a new binding replaces the old one.
+
+`resume` re-enters `FIX`, which reads every target and verifies every
+action before anything else; it then publishes the rest of the plan. While
+one is still missing it blocks again, naming what is verified so far. A
+plain `unblock` is refused, with nothing written, unless something changed
+since the block: a pending action is now on GitHub, or a recorded conflict
+no longer reproduces (a new conflict is not progress). A target that cannot
+be read (a permission lost, say) refuses the unblock, naming it; one that is
+not found or answers as a pull request holds its action, and a conflict
+recorded on it is not re-checked until it can be read. A conflict blocks
+with the comments named; repair it, then `unblock`:
+
+- the payload posted twice: delete one;
+- the marker with other bytes (typically a paste in the web UI, which
+  changes line endings or whitespace; text copied from a terminal can also
+  lose trailing spaces and pick up the shell's end-of-line mark, as the
+  web paste of the byte-fidelity capture in `docs/development.md` did):
+  edit the comment back to the exact bytes, or delete it and post again
+  through the pipe above;
+- one action's payload posted on another action's target: delete it there
+  and post it on its own target.
+
+A payload posted on an issue that no action targets is neither read nor
+detected: check the target in the `gh issue comment` line before you run
+it. A comment edited or deleted after `FIX` verified it is not checked again
+by the controller; the next review's `operator-evidence.md` shows what is
+there now. An edit of the run's issue body after `FIX` started keeps the
+actions bound to the targets `FIX` read, and `unblock` says the body
+changed; a target transferred, deleted or no longer readable blocks naming
+it (a target that is not found can be declined).
+
+To withdraw them instead: `autoforge unblock --decline-action X-…
+--reason "..."` (repeatable; name every action you decline). The unsent plan
+is dropped: an action already verified stays verified, the named ones are
+declined, the others are withdrawn, and `resume` runs the fixer again with
+your reason in its prompt. A declined action is never requested again
+unchanged, and verified work is never requested again. Declines count with
+acceptance-action declines toward the same 16 per review round. An action in
+conflict is repaired, never declined. Every pending action's target is read
+first, named or not: a target transferred, in another repository or no
+longer readable refuses the decline, naming it, while one that is not found
+does not. `--approve-action X-…` is refused: there is nothing for the
+controller to send.
+
+A push to the PR or a change of its base while operator actions are pending
+makes `unblock` re-enter `FIX`, which only reads: each action is recorded
+`verified` or `stale`, and the PR goes back to `REVIEW`. The next review is
+handed `operator-evidence.md`, the operator comments verified for the round,
+and still judges whether they resolve the finding. `run` refuses to replace a
+`BLOCKED` or `FAILED` run that holds operator actions without `--force`; the
+comments stay on GitHub either way.
 
 ### DONE and FAILED
 
@@ -685,7 +808,8 @@ redacted. What it reads depends on the command:
   `.autoforge/` or a local one in the git directory; `--state-dir` skips
   that lookup.
 - `unblock --dry-run` does the same lookup, then reads GitHub to report the
-  decision it would make (with `--approve-action` or `--decline-action` too).
+  decision it would make (with `--approve-action`, `--decline-action` or
+  `--bind-evidence` too).
 
 ## Where things live
 

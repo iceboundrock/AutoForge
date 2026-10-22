@@ -13,9 +13,11 @@ Commands:
           live GitHub state, re-enters a phase through validate_transition or
           refuses and stays BLOCKED; the reason is recorded in state and the log.
           --approve-action / --decline-action decide on an acceptance action
-          a FIX plan awaits (#211)
+          a FIX plan awaits (#211); --bind-evidence binds an existing comment
+          to an operator action and --decline-action (repeatable) declines
+          operator actions (#243)
   status  show the persisted run summary (--json for machine output; --action
-          prints an acceptance action's exact payload)
+          prints an acceptance or operator action's exact payload)
   local   LOCAL mode: feature Markdown -> implement -> review -> fix -> DONE,
           with no GitHub involved at any point (init / run / doctor)
   epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
@@ -259,11 +261,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     action.add_argument(
         "--decline-action",
-        default="",
+        action="append",
+        default=None,
         metavar="ACTION_ID",
         help=(
-            "decline the acceptance action a FIX plan awaits: the unsent plan is dropped and "
-            "FIX launches the fixer again with the decline in its prompt"
+            "decline the acceptance action (A-...) a FIX plan awaits, or one or more operator "
+            "actions (X-..., repeatable; the plan's other pending operator actions are "
+            "withdrawn and its verified ones kept): the unsent plan is dropped and FIX "
+            "launches the fixer again with the decline in its prompt"
+        ),
+    )
+    action.add_argument(
+        "--bind-evidence",
+        action="append",
+        nargs=2,
+        default=None,
+        metavar=("ACTION_ID", "COMMENT_URL"),
+        help=(
+            "bind an existing comment on an operator action's target issue as its evidence "
+            "(repeatable): 'resume' verifies the comment is there and unchanged; the "
+            "controller never judges whether it is adequate"
         ),
     )
 
@@ -275,8 +292,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         metavar="ACTION_ID",
         help=(
-            "print the exact payload of a pending acceptance action and nothing else "
-            "(exit 1 when no such action is persisted)"
+            "print the exact payload of a pending acceptance (A-...) or operator (X-...) "
+            "action and nothing else (exit 1 when no such action is persisted)"
         ),
     )
 
@@ -1486,6 +1503,25 @@ def _existing_run_guard(
             file=sys.stderr,
         )
         return 2, False
+    operator = _operator_records(existing) if existing.phase in _KEEPING_PHASES else []
+    if operator and not force:
+        # #243: a BLOCKED or FAILED run keeps its FIX plan, and an operator
+        # action of it may already be on GitHub; replacing the run silently
+        # would forget what the operator was asked to post.
+        named = "; ".join(
+            f"{r.action_id} on {r.target['issue_url']}"
+            + (f" ({(r.observed or {}).get('url')})" if r.stage is Stage.OBSERVED else "")
+            for r in operator
+        )
+        print(
+            redact(
+                f"autoforge: error: existing run {existing.run_id} in phase "
+                f"{existing.phase.value} holds operator actions ({named}) — see 'status', "
+                f"or use '{command} --force' to discard the run (the comments stay on GitHub)"
+            ),
+            file=sys.stderr,
+        )
+        return 2, False
     return None, False
 
 
@@ -1681,7 +1717,9 @@ def cmd_unblock(args) -> int:
     if not args.state_dir:
         _bind_existing_run(engine)
     approve = str(getattr(args, "approve_action", "") or "")
-    decline = str(getattr(args, "decline_action", "") or "")
+    raw_decline = getattr(args, "decline_action", None) or []
+    decline = [raw_decline] if isinstance(raw_decline, str) else [str(d) for d in raw_decline]
+    bind = [(str(a), str(u)) for a, u in getattr(args, "bind_evidence", None) or []]
     # The words a configuration refusal prints for this command (#219).
     words = ("unblock", "--reason", "<why>")
     if args.dry_run:
@@ -1690,7 +1728,11 @@ def cmd_unblock(args) -> int:
         if state.phase == Phase.BLOCKED:
             _check_configuration(engine, args, *words, dry_run=True)
         outcome = engine.unblock(
-            args.reason, dry_run=True, approve_action=approve, decline_action=decline
+            args.reason,
+            dry_run=True,
+            approve_action=approve,
+            decline_action=decline,
+            bind_evidence=bind,
         )
         print_unblock_outcome(outcome)
         return 0
@@ -1702,7 +1744,9 @@ def cmd_unblock(args) -> int:
         _guard_scheduler_ownership(engine, state, "unblock")
         if state.phase == Phase.BLOCKED:
             _check_configuration(engine, args, *words, dry_run=False)
-        outcome = engine.unblock(args.reason, approve_action=approve, decline_action=decline)
+        outcome = engine.unblock(
+            args.reason, approve_action=approve, decline_action=decline, bind_evidence=bind
+        )
     print_unblock_outcome(outcome)
     if not outcome.unblocked:
         return 1
@@ -1970,6 +2014,7 @@ def cmd_status(args) -> int:
             **state.to_dict(),
             "replan_journal": _replan_journal_summary(txn),
             "acceptance_actions": _acceptance_actions(state),
+            "operator_actions": _operator_actions(state),
             "review_certificate_status": _review_certificate_status(state, certificate),
             "outer_sandbox": {
                 "mode": engine.config.sandbox.mode,
@@ -1986,7 +2031,13 @@ def cmd_status(args) -> int:
     if state.mode == WorkflowMode.LOCAL:
         print(redact(_render_local_status(state, txn, evidence)))
         return 0
-    print(redact(_render_status(state, txn, _render_acceptance_actions(state, engine), evidence)))
+    if engine.state_dir_in_scheduler_root() and not engine.continue_command:
+        # A scheduler namespace's run (ADR 0008 D17.3) is continued by the
+        # scheduler, as a worker names it: a standalone 'resume' refuses it.
+        config = ("--config", args.config) if args.config else ()
+        engine.continue_command = (*config, "epic", "resume", state.epic_url)
+    actions = _render_acceptance_actions(state, engine) + _render_operator_actions(state, engine)
+    print(redact(_render_status(state, txn, actions, evidence)))
     return 0
 
 
@@ -2158,7 +2209,7 @@ def _acceptance_records(state: AutoForgeState) -> list[EffectRecord]:
 
 
 def _print_action_payload(state: AutoForgeState, action_id: str) -> int:
-    """``status --action``: the exact payload bytes of a persisted acceptance action (#211).
+    """``status --action``: the exact payload bytes of a persisted action (#211, #243).
 
     Exactly the body the controller would publish (and an operator may post
     instead), with nothing before or after it; it is redaction-invariant by
@@ -2166,7 +2217,7 @@ def _print_action_payload(state: AutoForgeState, action_id: str) -> int:
     persisted record has (a declined or stale action keeps no payload), or a
     LOCAL run, exits 1 and prints nothing.
     """
-    for record in _acceptance_records(state):
+    for record in (*_acceptance_records(state), *_operator_records(state)):
         if record.action_id == action_id.strip():
             sys.stdout.write(record.body)
             sys.stdout.flush()
@@ -2324,6 +2375,194 @@ def _render_acceptance_actions(state: AutoForgeState, engine: ControllerEngine) 
         lines.append(
             f"Acceptance action {outcome['action_id']} (review round {outcome['round']}, finding "
             f"{outcome['finding_id']}): {label}{reason}"
+        )
+    return lines
+
+
+# The terminal phases that keep a FIX plan for the operator (D2.4): a fresh
+# run over one holding operator actions is refused without --force (#243).
+_KEEPING_PHASES = (Phase.BLOCKED, Phase.FAILED)
+
+
+def _operator_records(state: AutoForgeState) -> list[EffectRecord]:
+    """The persisted K10 records of the current plan (#243); none for a LOCAL run."""
+    if state.mode == WorkflowMode.LOCAL:
+        return []
+    return [r for r in state.phase_effects().records if r.kind is EffectKind.OPERATOR_COMMENT]
+
+
+def _operator_label(record: EffectRecord) -> tuple[str, str]:
+    """``(state, label)`` of a persisted K10 record, as ``status`` names it (#243).
+
+    "pending" means not yet verified, never "not posted": ``status`` reads
+    nothing from GitHub. ``verification_failed`` is a conflict, or what
+    FIX's last verification of a pending action found wrong (a changed or
+    deleted bound comment, a target that cannot be read or no longer
+    qualifies), kept on the record as its reason (PR #254 R3-F3).
+    """
+    if record.stage is Stage.OBSERVED:
+        observed = record.observed or {}
+        how = (
+            "exact"
+            if observed.get("evidence") == "exact"
+            else "operator-bound; adequacy not verified by the controller"
+        )
+        return "verified", f"verified ({how}): {observed.get('url', '-')}"
+    if record.stage is Stage.CONFLICT:
+        return "verification_failed", f"verification failed: {record.reason}"
+    if record.reason:
+        return (
+            "verification_failed",
+            f"verification failed at FIX's last check: {record.reason}",
+        )
+    if record.binding is not None:
+        return (
+            "evidence_bound",
+            f"evidence bound, not yet verified: {record.binding['comment_url']}",
+        )
+    return "pending", "pending (not yet verified)"
+
+
+def _operator_actions(state: AutoForgeState) -> list[dict]:
+    """The derived ``operator_actions`` of ``status --json`` (#243).
+
+    One entry per persisted K10 record of the current plan, then one per
+    ``operator_comment_outcomes`` entry, each with its ``state``: pending,
+    evidence_bound, verified, verification_failed, declined, withdrawn or
+    stale. ``verified`` comes only from an observed record or a recorded
+    outcome, never from an assertion.
+    """
+    from .claims import OPERATOR_COMMENT, scan
+
+    out: list[dict] = []
+    for record in _operator_records(state):
+        claim = scan(OPERATOR_COMMENT, record.marker).claims[0]
+        status, _ = _operator_label(record)
+        observed = record.observed or {}
+        out.append(
+            {
+                "action_id": record.action_id,
+                "kind": "related_issue_comment",
+                "performer": "operator",
+                "target": record.target["issue_url"],
+                "pr": record.owner.pr_url,
+                "round": claim.round,
+                "finding_id": claim.finding_id,
+                "allowed_by": list(record.precondition["allowed_by"]),
+                "state": status,
+                "evidence": str(observed.get("evidence", "")),
+                "binding": record.binding,
+                "payload_chars": len(record.body),
+                "payload_sha256": sha256_text(record.body),
+                "comment_url": str(observed.get("url", "")),
+                "reason": record.reason,
+            }
+        )
+    for outcome in state.operator_comment_outcomes if state.mode != WorkflowMode.LOCAL else ():
+        out.append(
+            {
+                "action_id": outcome["action_id"],
+                "kind": "related_issue_comment",
+                "performer": "operator",
+                "target": outcome["target"],
+                "pr": state.current_pr_url,
+                "round": outcome["round"],
+                "finding_id": outcome["finding_id"],
+                "allowed_by": [],
+                "state": outcome["outcome"],
+                "evidence": outcome["evidence"],
+                "binding": None,
+                "payload_chars": None,
+                "payload_sha256": outcome["payload_sha256"],
+                "comment_url": outcome["comment_url"],
+                "reason": outcome["reason"],
+            }
+        )
+    return out
+
+
+def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) -> list[str]:
+    """The human ``Operator actions`` blocks of ``status`` (#243); none without one."""
+    from .claims import OPERATOR_COMMENT, scan
+
+    records = _operator_records(state)
+    lines: list[str] = []
+    why = '"..."'
+    findings: dict[str, list[EffectRecord]] = {}
+    for record in records:
+        fid = scan(OPERATOR_COMMENT, record.marker).claims[0].finding_id
+        findings.setdefault(fid, []).append(record)
+    allowed_text = {"issue_body": "referenced by the run's issue body", "epic": "the run's EPIC"}
+    for fid, mine in findings.items():
+        claim = scan(OPERATOR_COMMENT, mine[0].marker).claims[0]
+        title = next(
+            (str(f.get("title", "")) for f in state.open_findings if f.get("id") == fid), ""
+        )
+        lines.append(
+            f"Operator actions (FIX, review round {claim.round}, finding {fid} {title})".rstrip()
+        )
+        for record in mine:
+            action = record.action_id
+            _, label = _operator_label(record)
+            lines.append(f"  {action}  comment on {record.target['issue_url']}  {label}")
+            if record.stage is Stage.OBSERVED:
+                continue
+            allowed = "; ".join(
+                allowed_text.get(str(b), str(b)) for b in record.precondition["allowed_by"]
+            )
+            lines += [
+                f"      allowed:   {allowed} (issue body sha256 "
+                f"{record.precondition['issue_body_sha256']})",
+                f"      payload:   {len(record.body)} chars, sha256 {sha256_text(record.body)}",
+                "      evidence:  exactly one comment on the target with this action's marker "
+                "and exactly these bytes, or an existing comment you bind",
+            ]
+    pending = [r for r in records if r.stage is not Stage.OBSERVED]
+    if pending:
+        # The rest of the plan follows the K10 prefix: the push and the
+        # follow-up writes are found in the whole saved plan (PR #254 R2-F2).
+        plan = state.phase_effects().records
+        push = next((r for r in plan if r.kind is EffectKind.PUSH), None)
+        if push is not None and push.stage is not Stage.OBSERVED:
+            lines += [
+                f"  held back: push of {str(push.payload['sha'])[:12]}, after every operator "
+                "action is verified",
+                f"  worktree:  {engine.agent_worktree_description()} holds the unpushed "
+                "candidate; do not reset it",
+            ]
+        else:
+            lines.append("  held back: nothing was committed, so nothing is pushed")
+        others = sum(
+            1 for r in plan if r.kind in (EffectKind.FOLLOW_UP_ISSUE, EffectKind.FOLLOW_UP_APPEND)
+        )
+        if others:
+            lines.append(f"             {others} follow-up write(s) are held back as well")
+        first = pending[0]
+        action = first.action_id
+        kept = [r.action_id for r in records if r.stage is Stage.OBSERVED]
+        declines = [a for r in pending for a in ("--decline-action", r.action_id)]
+        lines += [
+            f"  next:      read it:  {engine.cli_command('status', '--action', action)}",
+            f"             post it:  {engine.cli_command('status', '--action', action)} | "
+            f"gh issue comment {first.target['issue_url']} --body-file -",
+            "             or bind:  "
+            f"{engine.cli_command('unblock', '--bind-evidence', action)} <comment URL> "
+            f"--reason {why}",
+            f"             then:     {engine.cli_command('unblock', '--reason')} {why} && "
+            f"{engine.resume_command()}",
+            f"             withdraw: {engine.cli_command('unblock', *declines, '--reason')} {why}"
+            + (f"  (keeps {', '.join(kept)} verified)" if kept else ""),
+        ]
+    for outcome in state.operator_comment_outcomes if state.mode != WorkflowMode.LOCAL else ():
+        label = (
+            f"verified ({outcome['evidence']}): {outcome['comment_url']}"
+            if outcome["outcome"] == "verified"
+            else outcome["outcome"]
+        )
+        reason = f" ({outcome['reason']})" if outcome["reason"] else ""
+        lines.append(
+            f"Operator action {outcome['action_id']} (review round {outcome['round']}, finding "
+            f"{outcome['finding_id']}, comment on {outcome['target']}): {label}{reason}"
         )
     return lines
 

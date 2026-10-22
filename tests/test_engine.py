@@ -1958,6 +1958,7 @@ def test_fix_the_controller_pushes_the_fixers_commit(tmp_state_dir):
             "follow_up_issue_url": "",
             "commit_sha": "",
             "acceptance_comment_url": "",
+            "operator_evidence": [],
         }
     ]
     assert s.effect_records == [] and s.completion_context == {} and s.entry_observation == {}
@@ -2093,7 +2094,12 @@ def test_fix_entry_with_the_pr_retargeted_goes_to_review_without_a_fixer(tmp_sta
     eng.state.current_base_ref = "main"
     eng.state.reviewed_merge_base_sha = MERGE_BASE
     eng.state.last_fix_resolutions = [
-        {"finding_id": "R0-F1", "resolution": "fixed", "acceptance_comment_url": ""}
+        {
+            "finding_id": "R0-F1",
+            "resolution": "fixed",
+            "acceptance_comment_url": "",
+            "operator_evidence": [],
+        }
     ]
     gh.prs[PR].base_ref = "release/1.x"
     out = eng.step()
@@ -2171,7 +2177,12 @@ def test_fix_entry_with_the_base_rewritten_goes_to_review_without_a_fixer(tmp_st
     eng.state.current_base_ref = "main"
     eng.state.reviewed_merge_base_sha = MERGE_BASE
     eng.state.last_fix_resolutions = [
-        {"finding_id": "R0-F1", "resolution": "fixed", "acceptance_comment_url": ""}
+        {
+            "finding_id": "R0-F1",
+            "resolution": "fixed",
+            "acceptance_comment_url": "",
+            "operator_evidence": [],
+        }
     ]
     gh.merge_base = MERGE_BASE_B
     out = eng.step()
@@ -2606,6 +2617,7 @@ def test_fix_creates_the_follow_up_issue_the_fixer_asks_for(tmp_state_dir):
             "follow_up_issue_url": ISSUE43,
             "commit_sha": "",
             "acceptance_comment_url": "",
+            "operator_evidence": [],
         }
     ]
 
@@ -2684,6 +2696,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "follow_up_issue_url": "",
             "commit_sha": new[0],
             "acceptance_comment_url": "",
+            "operator_evidence": [],
         },
         {
             "finding_id": "R2-F2",
@@ -2692,6 +2705,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "follow_up_issue_url": ISSUE43,
             "commit_sha": "",
             "acceptance_comment_url": "",
+            "operator_evidence": [],
         },
         {
             "finding_id": "R2-F3",
@@ -2700,6 +2714,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "follow_up_issue_url": ISSUE3,
             "commit_sha": "",
             "acceptance_comment_url": "",
+            "operator_evidence": [],
         },
         {
             "finding_id": "R2-F4",
@@ -2708,6 +2723,7 @@ def test_fix_round_mixing_every_resolution_creates_appends_then_pushes(tmp_state
             "follow_up_issue_url": "",
             "commit_sha": "",
             "acceptance_comment_url": "",
+            "operator_evidence": [],
         },
     ]
 
@@ -8025,6 +8041,7 @@ def _as_protocol_5(eng, *, attempt: int) -> None:
         "review_certificate",
         "producer_validation_failure",
         "validation_override_seq",
+        "operator_comment_outcomes",
     ):
         data.pop(key, None)
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
@@ -8053,7 +8070,7 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     assert "posted by an agent under the previous contract" in call.prompt
     assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_issue_url == ISSUE3 and s.protocol_version == "10"
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "11"
     assert s.effect_records == []  # adopted with no record (D13.7)
 
 
@@ -12643,6 +12660,7 @@ def test_fix_acceptance_action_approved_is_published_then_the_fix_pushed(tmp_sta
             "follow_up_issue_url": "",
             "commit_sha": "",
             "acceptance_comment_url": comment.url,
+            "operator_evidence": [],
         }
     ]
     [outcome] = s.acceptance_outcomes
@@ -13009,8 +13027,8 @@ def test_fix_acceptance_declines_of_the_round_outlive_the_history_bound(tmp_stat
     assert all(action in again.prompt for action in declined)
     assert f"these {MAX_DECLINES_PER_ROUND} declines are the most it records" in again.prompt
     assert (
-        f"the operator declined {MAX_DECLINES_PER_ROUND} acceptance actions of review round 2, "
-        "the most the controller records for one round"
+        f"the operator declined {MAX_DECLINES_PER_ROUND} actions of review round 2 (acceptance "
+        "and operator actions together), the most the controller records for one round"
     ) in corrected.prompt
     assert gh.effect_writes == [] and gh.comments.get(ISSUE, []) == []
     s = load_state(eng.paths.state_file)
@@ -13102,7 +13120,7 @@ def _refusal_case(eng, gh, case: str) -> dict:
         ("stale decline", "refused as stale"),
         (
             "decline at the round's bound",
-            f"already records {MAX_DECLINES_PER_ROUND} declined acceptance actions",
+            f"already records {MAX_DECLINES_PER_ROUND} declined actions (acceptance and operator",
         ),
     ],
 )
@@ -13129,7 +13147,7 @@ def test_unblock_acceptance_flags_are_checked_before_anything_is_read(tmp_state_
     eng = _accepting(tmp_state_dir, gh, fixer(acceptance("R1-F1")))
     assert eng.step().next_phase == "BLOCKED"
     calls = len(gh.calls)
-    with pytest.raises(ConfigurationError, match="not both"):
+    with pytest.raises(ConfigurationError, match="takes one of"):
         eng.unblock(REASON_211, approve_action="A-" + "0" * 16, decline_action="A-" + "1" * 16)
     with pytest.raises(ConfigurationError, match="A-<16 hex digits>"):
         eng.unblock(REASON_211, approve_action="A-123")

@@ -305,6 +305,33 @@ class GitHubNotFoundError(GitHubError):
     """
 
 
+class GitHubWrongTargetError(GitHubError):
+    """GitHub answered a read of one object with another object (conclusive, #243).
+
+    ``gh issue view`` of an issue number that is a pull request answers
+    with the pull request, and one of a transferred issue answers with the
+    issue it became. ``answered_url`` is the URL GitHub answered with, so a
+    caller can tell the two apart (``is_pull_request``) without parsing the
+    message.
+    """
+
+    def __init__(self, message: str, answered_url: str = "") -> None:
+        super().__init__(message)
+        self.answered_url = answered_url
+
+    @property
+    def is_pull_request(self) -> bool:
+        """Whether GitHub answered with a pull request URL (not, say, an issue of a repository
+        named ``pull``)."""
+        from .validation import parse_pr_url  # validation imports this module
+
+        try:
+            parse_pr_url(self.answered_url)
+        except ConfigurationError:
+            return False
+        return True
+
+
 class SnapshotRefused(AutoForgeError):
     """An EPIC's dependency graph cannot be taken as a complete snapshot (ADR 0008 D3, #179).
 

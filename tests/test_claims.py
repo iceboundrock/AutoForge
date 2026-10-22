@@ -19,6 +19,7 @@ from autoforge.claims import (
     ACCEPTANCE,
     FOLLOW_UP,
     IMPLEMENTATION,
+    OPERATOR_COMMENT,
     PROGRESS,
     REVIEW,
     AcceptanceClaim,
@@ -26,6 +27,7 @@ from autoforge.claims import (
     FollowUpClaim,
     ImplementationClaim,
     MarkerKind,
+    OperatorCommentClaim,
     ProgressClaim,
     ReviewClaim,
     collect,
@@ -33,6 +35,7 @@ from autoforge.claims import (
     render_acceptance_marker,
     render_follow_up_marker,
     render_implementation_marker,
+    render_operator_comment_marker,
     render_progress_marker,
     scan,
 )
@@ -72,8 +75,15 @@ VALID = {
     PROGRESS.name: {"issue": ISSUE, "pr": PR},
     FOLLOW_UP.name: {"finding_id": "R1-F1", "pr": PR},
     ACCEPTANCE.name: {"finding_id": "R2-F1", "issue": ISSUE, "pr": PR, "round": 2},
+    OPERATOR_COMMENT.name: {
+        "finding_id": "R2-F1",
+        "issue": ISSUE,
+        "pr": PR,
+        "round": 2,
+        "target": ISSUE3,
+    },
 }
-KINDS = [IMPLEMENTATION, REVIEW, PROGRESS, FOLLOW_UP, ACCEPTANCE]
+KINDS = [IMPLEMENTATION, REVIEW, PROGRESS, FOLLOW_UP, ACCEPTANCE, OPERATOR_COMMENT]
 
 
 def _valid(kind):
@@ -97,6 +107,17 @@ def test_each_kind_decodes_its_documented_payload_to_a_typed_claim():
     assert scan(ACCEPTANCE, marker("ai-acceptance", _valid(ACCEPTANCE))).claims == (
         AcceptanceClaim(
             issue=parse_issue_url(ISSUE), pr=parse_pr_url(PR), round=2, finding_id="R2-F1"
+        ),
+    )
+    assert scan(
+        OPERATOR_COMMENT, marker("ai-operator-comment", _valid(OPERATOR_COMMENT))
+    ).claims == (
+        OperatorCommentClaim(
+            issue=parse_issue_url(ISSUE),
+            pr=parse_pr_url(PR),
+            round=2,
+            finding_id="R2-F1",
+            target=parse_issue_url(ISSUE3),
         ),
     )
     for kind in KINDS:
@@ -185,7 +206,7 @@ def test_whitespace_around_the_name_and_payload_is_not_part_of_the_marker(text):
     assert result.defects == () and result.claims[0].key == parse_issue_url(ISSUE).identity
 
 
-@pytest.mark.parametrize("kind", [IMPLEMENTATION, REVIEW, PROGRESS, FOLLOW_UP])
+@pytest.mark.parametrize("kind", [IMPLEMENTATION, REVIEW, PROGRESS, FOLLOW_UP, OPERATOR_COMMENT])
 @pytest.mark.parametrize("gap", ["", " ", "  ", "\n", "\t \n "], ids=repr)
 def test_every_marker_the_scanner_reads_opens_as_the_shared_marker_opening(kind, gap):
     """The result parser refuses ``CONTROLLER_MARKER_OPEN_RE`` in agent text it
@@ -283,6 +304,27 @@ def _cases():
     yield ACCEPTANCE, {**a, "finding_id": "R2-F1 "}, "not a finding id"
     yield ACCEPTANCE, {**a, "issue": PR}, "issue is not a GitHub issue URL"
     yield ACCEPTANCE, {**a, "pr": ISSUE}, "pr is not a GitHub pull request URL"
+    yield ACCEPTANCE, {**a, "target": ISSUE3}, "unknown key(s) target"
+    o = _valid(OPERATOR_COMMENT)
+    yield OPERATOR_COMMENT, {k: v for k, v in o.items() if k != "target"}, "missing key(s) target"
+    yield OPERATOR_COMMENT, {k: v for k, v in o.items() if k != "round"}, "missing key(s) round"
+    yield OPERATOR_COMMENT, {k: v for k, v in o.items() if k != "pr"}, "missing key(s) pr"
+    yield OPERATOR_COMMENT, {k: v for k, v in o.items() if k != "issue"}, "missing key(s) issue"
+    yield OPERATOR_COMMENT, {k: v for k, v in o.items() if k != "finding_id"}, "missing key(s)"
+    yield OPERATOR_COMMENT, {**o, "url": ISSUE3}, "unknown key(s) url"
+    yield OPERATOR_COMMENT, {**o, "on": ISSUE3}, "unknown key(s) on"
+    yield OPERATOR_COMMENT, {**o, "round": 0}, "round must be a JSON integer >= 1"
+    yield OPERATOR_COMMENT, {**o, "round": True}, "round must be a JSON integer >= 1"
+    yield OPERATOR_COMMENT, {**o, "round": "2"}, "round must be a JSON integer >= 1"
+    yield OPERATOR_COMMENT, {**o, "round": 2.0}, "round must be a JSON integer >= 1"
+    yield OPERATOR_COMMENT, {**o, "finding_id": "R1-F1"}, "does not belong to round 2"
+    yield OPERATOR_COMMENT, {**o, "finding_id": "R2-F1 "}, "not a finding id"
+    yield OPERATOR_COMMENT, {**o, "finding_id": 1}, "finding_id must be a string"
+    yield OPERATOR_COMMENT, {**o, "issue": PR}, "issue is not a GitHub issue URL"
+    yield OPERATOR_COMMENT, {**o, "pr": ISSUE}, "pr is not a GitHub pull request URL"
+    yield OPERATOR_COMMENT, {**o, "target": PR41}, "target is not a GitHub issue URL"
+    yield OPERATOR_COMMENT, {**o, "target": 3}, "target must be a GitHub issue URL string"
+    yield OPERATOR_COMMENT, {**o, "target": "#3"}, "target is not a GitHub issue URL"
 
 
 @pytest.mark.parametrize(
@@ -306,6 +348,7 @@ def test_an_over_long_finding_id_is_refused_without_being_quoted():
     [
         pytest.param(IMPLEMENTATION, "ai-implementation", "issue", "issue", id="issue-url"),
         pytest.param(FOLLOW_UP, "ai-follow-up", "pr", "pull request", id="pr-url"),
+        pytest.param(OPERATOR_COMMENT, "ai-operator-comment", "target", "issue", id="target"),
     ],
 )
 def test_an_over_long_url_is_refused_by_length_without_being_quoted(kind, name, key, what):
@@ -348,7 +391,9 @@ def test_a_payload_that_is_not_a_json_object_is_a_defect(kind, payload, reason):
 
 
 # -- object rules --------------------------------------------------------------------------
-@pytest.mark.parametrize("kind", [IMPLEMENTATION, REVIEW, PROGRESS], ids=lambda k: k.name)
+@pytest.mark.parametrize(
+    "kind", [IMPLEMENTATION, REVIEW, PROGRESS, OPERATOR_COMMENT], ids=lambda k: k.name
+)
 def test_an_object_carrying_two_single_kind_markers_is_defective_whatever_they_say(kind):
     same = marker(kind.name, _valid(kind)) * 2
     result = scan(kind, same)
@@ -365,6 +410,30 @@ def test_a_pr_marked_for_two_issues_proves_neither():
     result = scan(IMPLEMENTATION, body)
     assert [c.issue.number for c in result.claims] == [2, 3]
     assert result.defects and "carries 2 ai-implementation markers" in result.defects[0]
+
+
+def test_an_operator_comment_marked_for_two_targets_proves_neither():
+    """#243: an operator comment is evidence for one action, like an acceptance
+    comment: two ``ai-operator-comment`` markers on one comment are a defect,
+    even when their keys differ (two targets of one finding)."""
+    body = marker("ai-operator-comment", _valid(OPERATOR_COMMENT)) + marker(
+        "ai-operator-comment",
+        {**_valid(OPERATOR_COMMENT), "target": "https://github.com/owner/repo/issues/4"},
+    )
+    result = scan(OPERATOR_COMMENT, body)
+    assert [c.target.number for c in result.claims] == [3, 4]
+    assert result.defects and "carries 2 ai-operator-comment markers" in result.defects[0]
+
+
+def test_an_acceptance_and_an_operator_marker_never_read_as_each_other():
+    """Both kinds name an issue, a PR, a round and a finding; neither scanner
+    reads the other's marker, as a claim or as a defect."""
+    operator = marker("ai-operator-comment", _valid(OPERATOR_COMMENT))
+    acceptance = marker("ai-acceptance", _valid(ACCEPTANCE))
+    assert scan(ACCEPTANCE, operator) == scan(ACCEPTANCE, "")
+    assert scan(OPERATOR_COMMENT, acceptance) == scan(OPERATOR_COMMENT, "")
+    both = scan(OPERATOR_COMMENT, acceptance + operator)
+    assert len(both.claims) == 1 and both.defects == ()
 
 
 def test_a_follow_up_issue_may_carry_several_markers_with_distinct_keys():
@@ -572,6 +641,91 @@ def test_renderers_emit_canonical_urls_and_round_trip_through_the_decoders():
         2,
         "R2-F3",
     )
+
+
+def _operator_key(
+    issue: str = ISSUE,
+    pr: str = PR,
+    round_: int = 2,
+    finding_id: str = "R2-F3",
+    target: str = ISSUE3,
+):
+    rendered = render_operator_comment_marker(issue, pr, round_, finding_id, target)
+    (claim,) = scan(OPERATOR_COMMENT, rendered).claims
+    return claim.key
+
+
+def test_operator_comment_marker_renders_and_round_trips():
+    """#243: the controller renders the marker the operator posts; scanning it
+    back gives the claim with the same key, URLs canonical, keys sorted."""
+    rendered = render_operator_comment_marker(ISSUE, PR + "/", 2, "R2-F3", ISSUE3 + "/")
+    assert rendered == (
+        f'<!-- ai-operator-comment: {{"finding_id": "R2-F3", "issue": "{ISSUE}", '
+        f'"pr": "{PR}", "round": 2, "target": "{ISSUE3}"}} -->'
+    )
+    result = scan(OPERATOR_COMMENT, f"The operator's note.\n\n{rendered}\n")
+    assert result.defects == ()
+    (claim,) = result.claims
+    assert claim == OperatorCommentClaim(
+        issue=parse_issue_url(ISSUE),
+        pr=parse_pr_url(PR),
+        round=2,
+        finding_id="R2-F3",
+        target=parse_issue_url(ISSUE3),
+    )
+    assert claim.key == (
+        parse_issue_url(ISSUE).identity,
+        parse_pr_url(PR).identity,
+        2,
+        "R2-F3",
+        parse_issue_url(ISSUE3).identity,
+    )
+
+
+def test_operator_comment_key_distinguishes_every_field_and_ignores_url_spelling():
+    """Two rounds, two findings, two targets, two PRs or two runs' issues of
+    one finding never share a key; a casing variant of a URL is the same key."""
+    base = _operator_key()
+    variants = [
+        _operator_key(round_=3, finding_id="R3-F3"),
+        _operator_key(finding_id="R2-F4"),
+        _operator_key(target="https://github.com/owner/repo/issues/4"),
+        _operator_key(target="https://github.com/owner/other/issues/3"),
+        _operator_key(pr=PR41),
+        _operator_key(issue="https://github.com/owner/repo/issues/5"),
+    ]
+    assert len({base, *variants}) == 1 + len(variants)
+    spelled = _operator_key(
+        issue="https://github.com/OWNER/Repo/issues/2",
+        pr="https://github.com/Owner/REPO/pull/42",
+        target="https://github.com/owner/REPO/issues/3",
+    )
+    assert spelled == base
+
+
+def test_the_issue_an_operator_comment_is_on_is_not_part_of_its_key():
+    """A payload posted on the wrong issue still carries its key, so two
+    comments holding one key are two claimants wherever they sit."""
+    rendered = render_operator_comment_marker(ISSUE, PR, 2, "R2-F3", ISSUE3)
+    on_target = Obj(f"{ISSUE3}#issuecomment-1", rendered)
+    misplaced = Obj("https://github.com/owner/repo/issues/4#issuecomment-2", rendered)
+    c = collect(OPERATOR_COMMENT, [on_target, misplaced], "comment")
+    assert c.defects == ()
+    with pytest.raises(ClaimConflictError, match="2 comments carry the ai-operator-comment"):
+        c.claimants(_operator_key(), "R2-F3 on #3").at_most_one()
+    alone = collect(OPERATOR_COMMENT, [misplaced], "comment")
+    assert alone.claimants(_operator_key(), "R2-F3 on #3").exactly_one().obj is misplaced
+
+
+def test_operator_comment_renderer_refuses_a_marker_the_decoder_would_reject():
+    with pytest.raises(ConfigurationError):
+        render_operator_comment_marker(ISSUE, PR, 2, "R2-F3", PR41)  # a PR is not a target
+    with pytest.raises(ConfigurationError):
+        render_operator_comment_marker(ISSUE, ISSUE3, 2, "R2-F3", ISSUE3)
+    with pytest.raises(ValueError, match="does not belong to round 2"):
+        render_operator_comment_marker(ISSUE, PR, 2, "R1-F3", ISSUE3)
+    with pytest.raises(ValueError, match="round must be a JSON integer >= 1"):
+        render_operator_comment_marker(ISSUE, PR, 0, "R0-F3", ISSUE3)
 
 
 # Valid git branch names that contain an HTML comment delimiter (or would

@@ -121,7 +121,12 @@ the file valid.
   step). The value is recorded with the action when the `FIX` plan is
   saved, so changing it later never widens an authorization already on
   disk. See [Running the remote workflow: BLOCKED on an acceptance
-  action](usage.md#blocked-on-an-acceptance-action).
+  action](usage.md#blocked-on-an-acceptance-action). The same setting
+  governs operator actions (#243), the comments on *other* issues a `FIX`
+  agent may ask the operator to post: `off` refuses that resolution too,
+  while `approve` and `auto` both offer it, and it always waits for the
+  operator, who posts each comment (the controller never does); see
+  [BLOCKED on operator actions](usage.md#blocked-on-operator-actions).
 
 `autoforge doctor` (and `autoforge local doctor`) reports whether the file
 loads and validates. Doctor is read-only apart from creating the state

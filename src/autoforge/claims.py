@@ -1,7 +1,8 @@
 """Durable GitHub claims: the one identity contract for controller-adoptable writes.
 
 An agent's GitHub write (an implementation PR, a review comment, an EPIC
-progress comment, a follow-up issue, an acceptance comment) is something a later controller entry
+progress comment, a follow-up issue, an acceptance comment, an operator
+comment) is something a later controller entry
 must be able to *find again* and something the post-agent read-back must be
 able to *hold the agent to*. Both need the same answer to the same question:
 "which object is this phase's write?". This module owns that answer.
@@ -11,7 +12,7 @@ The identity of such a write is a **marker**: an HTML comment
 agent's prompt and the agent copies verbatim into the object. Each marker
 kind has exactly one typed payload (:class:`ImplementationClaim`,
 :class:`ReviewClaim`, :class:`ProgressClaim`, :class:`FollowUpClaim`,
-:class:`AcceptanceClaim`), one
+:class:`AcceptanceClaim`, :class:`OperatorCommentClaim`), one
 exact-schema decoder, one renderer, and one ``key``: the value two claims
 are compared by. Nothing outside this module parses a marker.
 
@@ -24,8 +25,8 @@ The contract every consumer gets from :func:`collect`:
   (:class:`ClaimConflictError`), because "no object claims this key" cannot
   be proven while an object carries a claim that could not be read.
 - **One object, one compatible identity.** A PR carries at most one
-  implementation marker, a comment at most one review, progress or
-  acceptance marker,
+  implementation marker, a comment at most one review, progress,
+  acceptance or operator-comment marker,
   an issue any number of follow-up markers with distinct keys. An object
   that publishes more is defective, whatever the extra marker names: a
   provenance that names two things proves neither.
@@ -171,6 +172,35 @@ class AcceptanceClaim:
     @property
     def key(self) -> Hashable:
         return (self.issue.identity, self.pr.identity, self.round, self.finding_id)
+
+
+@dataclass(frozen=True)
+class OperatorCommentClaim:
+    """``ai-operator-comment``: a comment on another issue names the finding it is evidence for.
+
+    The operator, never the controller, posts it (K10, #243). The key is the
+    run's issue, the PR, the round, the finding id and the ``target`` issue
+    the comment is meant for, so two rounds, two PRs or two targets of one
+    finding never share a key. The issue the comment is *on* is not part of
+    the key: a payload posted on the wrong issue still carries its key, and
+    the controller reads it there as a misplaced payload.
+    """
+
+    issue: GitHubIssueRef
+    pr: GitHubPullRequestRef
+    round: int
+    finding_id: str
+    target: GitHubIssueRef
+
+    @property
+    def key(self) -> Hashable:
+        return (
+            self.issue.identity,
+            self.pr.identity,
+            self.round,
+            self.finding_id,
+            self.target.identity,
+        )
 
 
 @dataclass(frozen=True)
@@ -344,6 +374,20 @@ def _decode_acceptance(payload: dict) -> AcceptanceClaim:
     )
 
 
+def _decode_operator_comment(payload: dict) -> OperatorCommentClaim:
+    _exact_keys(payload, ("finding_id", "issue", "pr", "round", "target"))
+    round_ = payload["round"]
+    if not isinstance(round_, int) or isinstance(round_, bool) or round_ < 1:
+        raise ValueError(f"round must be a JSON integer >= 1, got {round_!r}")
+    return OperatorCommentClaim(
+        issue=_issue_ref(payload, "issue"),
+        pr=_pr_ref(payload, "pr"),
+        round=round_,
+        finding_id=_finding_id(payload["finding_id"], "finding_id", round_),
+        target=_issue_ref(payload, "target"),
+    )
+
+
 def _decode_follow_up(payload: dict) -> FollowUpClaim:
     _exact_keys(payload, ("finding_id", "pr"))
     return FollowUpClaim(
@@ -434,6 +478,9 @@ REVIEW: MarkerKind[ReviewClaim] = MarkerKind("ai-review-result", _decode_review,
 PROGRESS: MarkerKind[ProgressClaim] = MarkerKind("ai-epic-progress", _decode_progress, False)
 FOLLOW_UP: MarkerKind[FollowUpClaim] = MarkerKind("ai-follow-up", _decode_follow_up, True)
 ACCEPTANCE: MarkerKind[AcceptanceClaim] = MarkerKind("ai-acceptance", _decode_acceptance, False)
+OPERATOR_COMMENT: MarkerKind[OperatorCommentClaim] = MarkerKind(
+    "ai-operator-comment", _decode_operator_comment, False
+)
 
 
 def render_implementation_marker(issue_url: str) -> str:
@@ -477,6 +524,21 @@ def render_acceptance_marker(issue_url: str, pr_url: str, round_: int, finding_i
             "issue": parse_issue_url(issue_url).canonical,
             "pr": parse_pr_url(pr_url).canonical,
             "round": round_,
+        }
+    )
+
+
+def render_operator_comment_marker(
+    issue_url: str, pr_url: str, round_: int, finding_id: str, target_url: str
+) -> str:
+    """The exact ``ai-operator-comment`` marker of one operator comment (K10, #243)."""
+    return OPERATOR_COMMENT.render(
+        {
+            "finding_id": finding_id,
+            "issue": parse_issue_url(issue_url).canonical,
+            "pr": parse_pr_url(pr_url).canonical,
+            "round": round_,
+            "target": parse_issue_url(target_url).canonical,
         }
     )
 
@@ -639,6 +701,7 @@ __all__ = [
     "FOLLOW_UP",
     "IMPLEMENTATION",
     "MAX_BASE_REF_CHARS",
+    "OPERATOR_COMMENT",
     "PROGRESS",
     "REVIEW",
     "AcceptanceClaim",
@@ -648,6 +711,7 @@ __all__ = [
     "Holder",
     "ImplementationClaim",
     "MarkerKind",
+    "OperatorCommentClaim",
     "ProgressClaim",
     "ReviewClaim",
     "Scan",
@@ -655,6 +719,7 @@ __all__ = [
     "render_acceptance_marker",
     "render_follow_up_marker",
     "render_implementation_marker",
+    "render_operator_comment_marker",
     "render_progress_marker",
     "render_review_marker",
     "scan",

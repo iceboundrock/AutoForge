@@ -36,6 +36,17 @@ High-priority coverage includes:
   an unblock `action`, a K9 record or an `acceptance_source` is refused,
   unchanged; each malformed outcome and recorded URL is refused; a LOCAL
   run carries none; a new issue resets the outcomes
+- operator-action state (#243, `tests/test_state.py`): every outcome
+  round-trips under protocol 11; a protocol-10 file, a `FIX` plan included,
+  loads in every phase migrated and is relabelled; an older file carrying
+  `operator_comment_outcomes`, a K10 record, `operator_targets`,
+  `operator_sources` or `operator_evidence` is refused, unchanged; a
+  protocol-11 file missing the outcomes is refused; each malformed outcome
+  is refused, and a `verified` one is unique per action and comment; the
+  outcome bound fits one round and drops the oldest entries, never the
+  round being fixed; declines of a round count K9's and K10's together; a
+  LOCAL run carries none; the outcomes belong to the issue they were
+  recorded for
 - recorded configuration (#219, `tests/test_config_fingerprint.py`,
   `tests/test_state.py`, `tests/test_cli.py`): every fingerprinted profile
   key and the worktree root is compared and named, and no other key is; a
@@ -314,6 +325,15 @@ High-priority coverage includes:
   kind, the body bounds and the published-content policy, the rationale
   rule, no commit or follow-up beside it, at most one per result, and the
   LOCAL refusal
+- the `operator_acceptance` resolution (#243, `tests/test_result_parser.py`):
+  the documented bounds, inclusive; its closed shape at both levels, every
+  target key refused by name, an unknown key or kind; `issue` a JSON
+  integer, never twice in one finding (two findings may name one issue);
+  the body bounds, the published-content policy and no image or raw HTML
+  outside code; the link rule (only into the run's repository, also once
+  decoded, in any link form) applied only with a repository; at most four
+  actions per result, never beside an `acceptance_action`; the rationale
+  rule; and the LOCAL refusal
 
 ### Execution
 
@@ -1013,6 +1033,50 @@ a stated reason it has none. The coverage that must keep working:
   generic per-kind effect tests run for K9, with its hold, approval and
   load rules; `status`, `status --json` and `status --action` show the
   action and its exact bytes
+- operator actions (#243, ADR 0004 K10; `tests/test_operator_actions.py`
+  for the engine, unblock and `status --action`, K10 in
+  `tests/test_effects.py`, the marker in `tests/test_claims.py`,
+  `operator-evidence.md` in `tests/test_read_context.py`, the typed
+  wrong-target read in `tests/test_github.py`, `status`, `unblock` and the
+  `run` guard in `tests/test_cli.py`): under `approve` and `auto` alike the
+  plan is saved with the K10 records first and the step blocks with
+  nothing sent; exact payloads complete it without relaunching the fixer;
+  a plain unblock on an assertion, and every other refused unblock, leaves
+  the state byte-identical, also as a dry run; changed line endings, a
+  payload posted twice or on the wrong issue are conflicts; a request
+  outside the rules, and a target that is a PR or missing, are
+  corrections, an unreadable target blocks and a transient read
+  propagates; `off` offers nothing; the allowed set is the entry's even
+  when the issue body changes; a `#0` in the issue body, shorthand or URL,
+  is no target, an ordinary `FIX` over it proceeds and every state it
+  saves loads again, and an entry observation the loader would refuse is
+  never saved (PR #254 R3-F1); bound evidence is verified as
+  operator-bound, an edited bound comment holds, the binding rules refuse
+  and one comment is never evidence for two actions (another action's
+  exact payload is never bound, and the prefix pass, a plain unblock and
+  drift never verify one comment twice, PR #254 R2-F1), while an earlier
+  round's payload may be bound; a binding reads every pending target and
+  refuses on one it cannot read, named or not, also as a dry run (R2-F3);
+  `--approve-action X-…` is refused; a decline keeps a verified comment,
+  withdraws the other pending actions, is refused while anything of the
+  plan is on GitHub, reads every pending target and refuses on one it
+  cannot read or that answers as another object, named or not, also as a
+  dry run, while one that is not found is declined or withdrawn (R4-F1),
+  and shares the round's bound with K9; drift records each action
+  `verified` or `stale`; `status` names a committed candidate held behind
+  the actions, and says nothing was committed only when nothing was
+  (R2-F2); a bound comment edited or deleted, and a target or
+  its comments that cannot be read or are gone, leave the reloaded
+  `status` and `status --json` reporting `verification_failed` with the
+  reason, until a new binding or the next pass replaces or clears it
+  (R3-F3); every K10 read-back row and each of D2.1a's six
+  layers in `tests/test_effects.py`, a comment past the first hundred and
+  a target GitHub answers with another object through the real client
+  included; the maintainer-captured byte-fidelity fixture replayed through
+  the real client in `tests/test_operator_comment_fidelity.py` (the
+  captured pipe comment is the payload byte for byte and exact evidence;
+  the captured web paste lost a hard break's trailing spaces and gained
+  trailing bytes, and is a conflict; see `docs/development.md`)
 - `REPLAN_REEXECUTE`'s publication (#164, `tests/test_replan.py`, "The
   controller publishes the replacement"): the replan agent commits on the
   base its prompt names and publishes nothing, and the controller pushes
@@ -1146,6 +1210,14 @@ a stated reason it has none. The coverage that must keep working:
   stops qualifying before its read-back is held, never `EffectPending`,
   with or without its comment on the issue, and a refused one is a
   `conflict` naming the issue (PR #221 R2-F1)
+- operator comments (#243): a process killed after either observation save
+  of the prefix pass, or before the completion save, is completed by the
+  next process from the journal with one marked comment per target, two
+  `verified` outcomes, one fixer launch and the PR at the reviewed HEAD
+  (`test_operator_notes_survive_a_restart_at_every_window` in
+  `tests/test_integration.py`); `verify` saves an observation or a conflict
+  once and a hold never, and a target or listing that cannot be read
+  raises with nothing saved (`tests/test_effects.py`)
 
 ### Integration
 
@@ -1161,6 +1233,16 @@ INITIALIZING
 ```
 
 without external writes.
+
+The operator-action path (#243, `tests/test_integration.py`) runs it
+with REVIEW raising a finding the fixer resolves as two operator actions
+on closed related issues (PR #242's reproduction): blocked with nothing
+posted; a ticked checkbox, a "done" comment and a reason with URLs
+fulfilling nothing; each exact payload verified as the operator posts it,
+across a restart; REVIEW round 2 reading both as evidence and coming back
+clean; one fixer launch, no push, no merge and no comment the controller
+posted on either issue. Its bound and withdrawn variants run the same
+loop.
 
 Maintain, too, the scheduler's end-to-end loop (#183, ADR 0008;
 `tests/test_epic_commands.py`, `tests/test_epic_recovery.py`): offline and

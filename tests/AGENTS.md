@@ -147,6 +147,14 @@ read it before adding tests for a listed area.
   to it for a netrc entry). `tests/test_providers.py` has a fake
   `opencode` that resolves its configuration, organizations cached in a
   2.0.26-shaped database included, as 2.0.26 does.
+- `tests/operator_comment_fidelity.py` is no test: it is the tool a
+  maintainer runs by hand, with their own `gh` login, to capture the
+  byte-fidelity fixture of an operator comment (#243;
+  `docs/development.md`). It renders payloads and reads a scratch issue,
+  and never writes to GitHub. `tests/test_operator_comment_fidelity.py`
+  replays the committed fixture (the maintainer's capture on scratch issue
+  #264) offline and tests the tool against a fake runner; never write or
+  edit the fixture by hand.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the

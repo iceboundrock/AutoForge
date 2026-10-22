@@ -5,6 +5,42 @@ so.
 
 ## Unreleased
 
+### Operator actions on related issues (#243)
+
+- A `FIX` agent may resolve a finding as `operator_acceptance`: one to four
+  comments (four at most per result) on *other* issues of the run's
+  repository, those the run's issue body references or the EPIC, as `FIX`
+  read them when it started. The controller never posts them: the run
+  blocks before anything else of the plan is sent, `status` lists each
+  `X-…` action with its target and payload hash, `status --action X-…`
+  prints the exact bytes, and the operator posts each, binds an existing
+  comment (`unblock --bind-evidence X-… <comment URL>`) or withdraws them
+  (`unblock --decline-action X-…`, now repeatable). `FIX` verifies every
+  comment on GitHub before it publishes the rest of the plan, one comment
+  for one action only, and the next review reads the verified comments
+  ([BLOCKED on operator actions](docs/usage.md#blocked-on-operator-actions)).
+  Post through the pipe `status` prints: a capture on a scratch issue
+  confirmed that it comes back byte for byte, while a paste into the web
+  UI did not and is a conflict to repair.
+- `safety.acceptance_actions: off` refuses that resolution too; `approve`
+  (the default) and `auto` offer it. Acceptance and operator declines share
+  the bound of 16 per review round.
+- A plain `unblock` of a run waiting on operator actions is refused, with
+  nothing written, until one of them is on GitHub or a recorded conflict is
+  repaired; a target or comment listing it cannot read refuses it as well,
+  naming the target. `--decline-action` reads every pending action's
+  target first, as `--bind-evidence` does, and refuses, naming it, on one
+  that cannot be read or was transferred; a target that is not found can
+  still be declined. `run` refuses to replace a `BLOCKED` or `FAILED` run
+  that holds operator actions without `--force`.
+- When `FIX` cannot verify an action, because a bound comment was edited or
+  deleted or a target cannot be read, `status` and `status --json` report
+  it as `verification_failed` with the reason until the next check or a new
+  binding, not as merely pending or bound.
+- The state file is protocol 11 (prompt version 12): an older AutoForge
+  refuses it, and this one refuses a file labelled older that carries
+  operator state.
+
 ### Pi: DeepSeek and the ChatGPT subscription (EPIC #127)
 
 - `provider: pi` runs any phase through [Pi](docs/pi.md) 1.0.0 or newer, an

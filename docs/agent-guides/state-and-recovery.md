@@ -56,7 +56,10 @@ Expected state includes data such as:
   `autoforge unblock`: timestamp, reason, the block reason it cleared, the
   phase re-entered and the controller's detail, plus `action`
   (`approved A-…` or `declined A-…`) when it approved or declined an
-  acceptance action (#211); refused unblocks are only in
+  acceptance action (#211), and `bound X-… <comment URL>` (one per pair,
+  `; `-separated) or `declined X-…` (followed by `(withdrawn: X-…)` when
+  the decline withdrew other pending actions) when it bound evidence to,
+  or declined, operator actions (#243); refused unblocks are only in
   the run log; the list is kept across issue switches, redacted before it is
   written, and validated on load like every other list field)
 - the recorded configuration of a REMOTE run (`config_fingerprint`, #219).
@@ -106,7 +109,27 @@ A round holds at most `MAX_DECLINES_PER_ROUND` (16) declines, below the
 history's bound: once it holds that many, `FIX` refuses any further
 acceptance action of the round, and a file with more in any round is
 refused. The FIX prompt lists the round's declines, and the controller
-refuses a declined id again. A
+refuses a declined id again. A REMOTE `last_fix_resolutions` entry also
+carries `operator_evidence` (#243): the operator comments on other issues
+verified for its finding in the round, each `action_id`, `target`,
+`comment_url`, `evidence` (`exact` or `bound`), `body_sha256` and
+`payload_sha256`, and `[]` when none. `operator_comment_outcomes` lists
+what became of the current PR's operator actions (ADR 0004 K10) once their
+plan is gone: one entry per action (`action_id`, `round`, `finding_id`,
+`target`, `outcome` `verified`, `declined`, `withdrawn` or `stale`,
+`evidence` `exact` or `bound` for a verified one and `""` otherwise,
+`comment_url` and `body_sha256` of a verified comment, `payload_sha256` of
+the requested payload, whose text is not kept, `at`, and the redacted,
+bounded `reason`). A `verified` entry is unique per (action, comment). The
+list holds at most `MAX_OPERATOR_COMMENT_OUTCOMES` (80), which is at least
+`(MAX_DECLINES_PER_ROUND + 1) × MAX_OPERATOR_ACTIONS_PER_FIX` (68), so one
+round always fits; the oldest entries are dropped, never one of the round
+being fixed. It is validated on load and reset with the other per-PR
+fields, and read by `status`, by the FIX prompt and result check (a
+declined id, or a (finding, target) already verified in the round, is a
+correction) and by REVIEW's `operator-evidence.md`. The round's `declined`
+entries of both histories count together toward `MAX_DECLINES_PER_ROUND`;
+a `withdrawn` one does not. A
 LOCAL run carries none of this. A
 REMOTE run also records its replan history: `execution_attempt` (initial
 implementation is 1),
@@ -126,11 +149,22 @@ A REMOTE run also records the effect state of the current phase entry (ADR
   append, replacement PR, progress comment; and, since #211, the acceptance
   comment, whose precondition also records its `authorization`, `operator`
   or `policy`, and the `approved_action_id`, which must equal the action id
-  recomputed from the record), its owner (run, phase, issue,
+  recomputed from the record; and, since #243, the operator comment, which
+  the operator performs and the controller only verifies: never
+  `attempted`, its attempt count 0, its precondition recording why its
+  target is allowed, the digest of the issue body the target was read from
+  and the operator's `binding` (`null`, or the bound comment's URL, id and
+  body digest), and its observed result the comment's URL and id, its
+  `evidence`, `exact` or `bound`, and its body's digest), its owner (run,
+  phase, issue,
   PR, transaction), the identity, the exact target, the precondition, the
   payload exactly as it is sent, the attempt count (at most
   `MAX_EFFECT_ATTEMPTS`, 2), the stage (`intended`, `attempted`, `observed`,
-  `conflict`), the observed object and a conflict reason. Only redacted,
+  `conflict`), the observed object and a conflict reason (on an `intended`
+  operator comment, the reason its last verification failed: a changed or
+  deleted bound comment, or a target that cannot be read or no longer
+  qualifies, replaced or cleared by the next verification and cleared by a
+  new binding; `status` reports it as `verification_failed`). Only redacted,
   bounded values are stored: a payload that is not redaction-invariant is
   refused, never redacted into something else, and no credential, header or
   environment value is ever stored. At most `MAX_EFFECTS_PER_PLAN` records,
@@ -149,7 +183,16 @@ A REMOTE run also records the effect state of the current phase entry (ADR
   refused. The `ANALYZE_EXECUTE` observation also records the default
   branch it read, as a ref at the base. The `REPLAN_REEXECUTE` observation
   (#164) records the derived replacement branch as absent and the
-  transaction's default branch at the base the replan agent builds on.
+  transaction's default branch at the base the replan agent builds on. A
+  `FIX` observation (#243) also records, under the optional key
+  `operator_targets`, the issues an operator action may target, read once
+  from the run's issue before the first launch (ADR 0004 D5.8): `numbers`
+  (the issues its body references, first mention first, at most 60, then
+  the EPIC), `allowed_by` per number (`issue_body`, `epic`) and
+  `issue_body_sha256`. It never holds the run's issue or PR, no other
+  phase stores it, and it is absent when the run offers no operator
+  action (`safety.acceptance_actions: off`, an issue that could not be
+  read conclusively, or an entry observed under protocol 10).
 - `completion_context`: what the phase needs to finish without relaunching
   its agent once its result is accepted (D4.6). For `UPDATE_EPIC` this is
   the roadmap section, the validated selection, the digests of the EPIC body
@@ -162,9 +205,16 @@ A REMOTE run also records the effect state of the current phase entry (ADR
   position of the `follow_up_issue` or `follow_up_append` record that
   records the deferral), plus `acceptance_source`, the plan position of the
   `acceptance_comment` record of the one `acceptance_action` resolution, or
-  `null` (#211). The plan holds the acceptance comment first (at most one),
-  then the creates, then the appends, then the `push` of the candidate,
-  last, when the fixer committed. For `REPLAN_REEXECUTE` (#164) it is the transaction id and
+  `null` (#211), and `operator_sources`, the plan positions of the
+  `operator_comment` records of an `operator_acceptance` resolution, or
+  `null` (#243). The plan holds the acceptance comment first (at most one),
+  or the operator comments first (at most four, in result order, never
+  beside an acceptance comment), then the creates, then the appends, then
+  the `push` of the candidate, last, when the fixer committed. Each
+  operator comment is named by a resolution of its finding and round,
+  and its target, `allowed_by` and body digest equal the entry
+  observation's `operator_targets`. For `REPLAN_REEXECUTE` (#164) it is
+  the transaction id and
   the two counts the replacement's transaction marker attests; the plan is
   the `push` of the candidate to the derived replacement branch, then the
   `replacement_pr` from it.
@@ -176,7 +226,10 @@ precedes the write (D4.1). The effect state belongs to one phase entry, and
 every save settles it (`settle_phase_effects`, D2.4): a save in another
 phase drops it, except `BLOCKED` and `FAILED`, which keep it for the
 operator and for `unblock` back into the phase (which reconciles a
-`conflict` record again, with its attempt count kept). The fields are
+`conflict` record again, with its attempt count kept). Because of that,
+`run` refuses to replace a `BLOCKED` or `FAILED` run whose plan holds
+operator actions unless `--force` is given, naming each action and any
+observed comment (#243); the comments stay on GitHub either way. The fields are
 validated on load against the run's issue, PR and phase, and a corrupt or
 incomplete value fails loudly, never replaced by a default. Every protocol-7
 save writes all four fields, so a protocol-7 file missing one is refused:
@@ -411,6 +464,8 @@ Protocol 8 → 9 (#219) added the recorded configuration of a REMOTE run (`confi
 
 Protocol 9 → 10 (#172) added the [validation evidence](#validation-evidence) above: `validation_records`, `validation_attempt`, `review_evidence`, `review_certificate`, `producer_validation_failure` and `validation_override_seq`. Every protocol-10 save writes all six, so a protocol-10 file missing one is refused: an absent marker read as "none" would hide the crash the resume path must record. A protocol-9 file, and every older file its own rules load, loads in every phase with all six at their empty values (no record, no marker, no binding, no certificate, no counter, `null` watermark), fabricating nothing, and is relabelled on its next save. A protocol-9 (or older) file that carries any of the six, even empty, is a hand edit or a foreign file and is refused, unchanged. The records have their own `schema` (1). The number is the implementation's; it is settled on #23 and #158 before the change merges.
 
+Protocol 10 → 11 (#243, ADR 0004 D13.10) added the operator-action state: `operator_comment_outcomes`, `operator_targets` in a `FIX` entry observation, `operator_sources` on each `FIX` completion-context resolution, `operator_evidence` on each REMOTE `last_fix_resolutions` entry and the `operator_comment` effect record, whose `binding` is part of the same bump. Every protocol-11 save writes `operator_comment_outcomes`, so a protocol-11 file missing it is refused. A protocol-10 file, and every older file its own rules load, loads in every phase and is relabelled on its next save, with no outcomes, no `operator_targets` (that entry offers no operator action), `operator_sources: null` and `operator_evidence: []`, which is exactly what a protocol-10 controller meant: it never asked the operator for anything. Its K9 state is kept as written. A protocol-10 (or older) file that carries any of these, even empty, is a hand edit or a foreign file and is refused, unchanged. The number is the implementation's; it is settled on #23 before the change merges (#158 is closed).
+
 Protocol 5 → 7 (#160) added the effect state above (`effect_records`, `entry_observation`, `completion_context`, `launch_label`). Protocol 6 is skipped: #23 reserves it for #126, and the number this bump takes must be settled on #23 before it merges. State persisted under protocol 5, or under any older protocol that its own rules load, carries no effect state and loads as none; a legacy file that does carry one of these fields is a hand edit or a foreign file and is refused. A legacy REMOTE file with `attempt >= 1` gets the launch label `agent_publishes` for a phase whose agent published under the previous contract, so that the first entry of this version knows an agent may already have published (D13.3). `UPDATE_EPIC` is the one such phase whose publication this version performs itself: its one-shot legacy re-entry adopts the progress comment that agent posted, with no record, and asks for the selection only (D13.7; [github-safety.md](github-safety.md), "Before UPDATE_EPIC"). LOCAL state, whatever its protocol, carries no effect state.
 
 ---
@@ -428,7 +483,7 @@ Examples:
 
 Resume logic must inspect actual Git/GitHub state before repeating destructive or duplicative actions.
 
-A controller effect (ADR 0004) is resumed from its record and never re-sent blind. Every crash window has one answer: a crash before the intent is saved means nothing happened and the step re-runs; an `intended` or `attempted` record is reconciled by its identity before anything is sent, so a write that landed before the save is adopted as `observed` (no second write) and one that did not is issued again within the attempt bound; an object that a human created or changed between the intent and the write, a conflicting identity, or two marker-bearing objects make the record `conflict` (`BLOCKED`, naming the object); an exhausted bound is `BLOCKED` naming the record and the manual step; and a transient GitHub failure during reconciliation leaves the state unchanged for `resume`. A phase whose effect landed finishes from its completion context without relaunching its agent. `FIX` (#163) is the case with the most windows, and each has one outcome: a crash before the plan is saved sent nothing, so `resume` launches the fixer again, against the entry observation saved before the first launch (a follow-up issue found later that it does not explain blocks); a crash after the plan is saved, at any stage of any create, append or push, completes the plan from the journal without relaunching the fixer, each record adopted or issued at most once in plan order; a PR head at the planned candidate is the controller's own push and never takes a `REVIEW` detour; and a head that is neither the reviewed HEAD nor the candidate is someone else's push (`FIX -> REVIEW`, the plan dropped, no fix recorded). An acceptance comment (#211) adds its own: a crash after the plan save, before the `BLOCKED` save, re-reads the issue at `resume` and blocks again with nothing sent and no launch; an approval saved by `unblock` is published by the next `resume` (`attempted` saved first); a comment that landed before its `observed` save is adopted, never posted twice, as is the exact payload an operator posted; a marked comment with other bytes, or two, is a `conflict`; a comment without the marker is not evidence and the action keeps waiting; a second approval, or one with a stale or mismatched id, is refused with the state byte-identical; a push to the PR while it waits refuses an approval or a decline as stale, and a plain `unblock` routes the drift to `REVIEW`, recording the action `stale`; a closed issue, or one outside the run's repository, holds the comment and the adoption of an exact one, landed or posted, with nothing later in the plan sent (PR #221 R1-F2), also when the issue stops qualifying between the comment's write and its read-back: that step blocks with the eligibility reason, the record stays `attempted` and the reason says the comment was sent (PR #221 R2-F1); and a K9 already `observed` is never sent again while the rest of the plan completes. `REPLAN_REEXECUTE` (#164) has the same split: a crash before its push and PR plan is saved sent nothing, so `resume` launches the replan agent again on the base the entry observation recorded (a replacement branch, or a PR carrying the transaction's marker, found later is not the controller's and rejects the transaction); a crash after it, before the push, between the push and the PR or after the PR was created, completes the plan without relaunching the agent, and the PR is created only while the derived branch still holds the pushed candidate. The journal never stands in for GitHub on replay: before the completion sends anything it re-reads the PR's base and merge base (moved: the same `REVIEW` route, findings carried), its head repository and branch (no longer the plan's target: `BLOCKED`), and the open issues against every resolution, including follow-ups already journaled as `observed` (closed, unmarked, duplicated, or a marker the controller did not write: `BLOCKED`). The run log's `events.jsonl` is never read by any recovery path.
+A controller effect (ADR 0004) is resumed from its record and never re-sent blind. Every crash window has one answer: a crash before the intent is saved means nothing happened and the step re-runs; an `intended` or `attempted` record is reconciled by its identity before anything is sent, so a write that landed before the save is adopted as `observed` (no second write) and one that did not is issued again within the attempt bound; an object that a human created or changed between the intent and the write, a conflicting identity, or two marker-bearing objects make the record `conflict` (`BLOCKED`, naming the object); an exhausted bound is `BLOCKED` naming the record and the manual step; and a transient GitHub failure during reconciliation leaves the state unchanged for `resume`. A phase whose effect landed finishes from its completion context without relaunching its agent. `FIX` (#163) is the case with the most windows, and each has one outcome: a crash before the plan is saved sent nothing, so `resume` launches the fixer again, against the entry observation saved before the first launch (a follow-up issue found later that it does not explain blocks); a crash after the plan is saved, at any stage of any create, append or push, completes the plan from the journal without relaunching the fixer, each record adopted or issued at most once in plan order; a PR head at the planned candidate is the controller's own push and never takes a `REVIEW` detour; and a head that is neither the reviewed HEAD nor the candidate is someone else's push (`FIX -> REVIEW`, the plan dropped, no fix recorded). An acceptance comment (#211) adds its own: a crash after the plan save, before the `BLOCKED` save, re-reads the issue at `resume` and blocks again with nothing sent and no launch; an approval saved by `unblock` is published by the next `resume` (`attempted` saved first); a comment that landed before its `observed` save is adopted, never posted twice, as is the exact payload an operator posted; a marked comment with other bytes, or two, is a `conflict`; a comment without the marker is not evidence and the action keeps waiting; a second approval, or one with a stale or mismatched id, is refused with the state byte-identical; a push to the PR while it waits refuses an approval or a decline as stale, and a plain `unblock` routes the drift to `REVIEW`, recording the action `stale`; a closed issue, or one outside the run's repository, holds the comment and the adoption of an exact one, landed or posted, with nothing later in the plan sent (PR #221 R1-F2), also when the issue stops qualifying between the comment's write and its read-back: that step blocks with the eligibility reason, the record stays `attempted` and the reason says the comment was sent (PR #221 R2-F1); and a K9 already `observed` is never sent again while the rest of the plan completes. Operator actions (#243, ADR 0004 K10) are never sent at all, so their windows are reads: a crash after the plan save, before the `BLOCKED` save, re-reads every target at `resume` and blocks again with nothing sent and no launch; each record's `observed` (or `conflict`) is saved before the next target is read, so after a crash between two of them the next pass re-reads only the records still pending; a binding saved by `unblock` is verified by the next `resume`, which completes the rest of the plan; a decline is one save (plan dropped, outcomes appended, history entry), so it either happened or the state is unchanged; and a push to the PR while they wait refuses a binding or a decline as stale, and a plain `unblock` lets `FIX` route the drift to `REVIEW`, recording each action `verified` (already observed, or found by a read-only reconcile that saves nothing) or `stale`, never posted. `REPLAN_REEXECUTE` (#164) has the same split: a crash before its push and PR plan is saved sent nothing, so `resume` launches the replan agent again on the base the entry observation recorded (a replacement branch, or a PR carrying the transaction's marker, found later is not the controller's and rejects the transaction); a crash after it, before the push, between the push and the PR or after the PR was created, completes the plan without relaunching the agent, and the PR is created only while the derived branch still holds the pushed candidate. The journal never stands in for GitHub on replay: before the completion sends anything it re-reads the PR's base and merge base (moved: the same `REVIEW` route, findings carried), its head repository and branch (no longer the plan's target: `BLOCKED`), and the open issues against every resolution, including follow-ups already journaled as `observed` (closed, unmarked, duplicated, or a marker the controller did not write: `BLOCKED`). The run log's `events.jsonl` is never read by any recovery path.
 
 A validator (#172, ADR 0006 D10.7, §2.16) has its own windows. A crash before the attempt marker is saved recorded nothing, and the caller runs the definition again. A crash with the marker saved, the validator running or already exited, leaves the marker: the next `step` or `resume`, under the lock and before anything else of the step, appends an `INTERRUPTED` record built from the marker alone and clears the marker in the same save, and the definition runs again when its phase does. An exit 0 the controller did not record is therefore never a `PASS`. The record and the marker clear are one save, so a crash between them is impossible; a marker whose record exists (only a hand edit makes one) is cleared and nothing is appended, which also makes a duplicate resume idempotent. More than two `INTERRUPTED` records for one candidate, definition and policy (those at or below the operator's override watermark not counted) enters `BLOCKED` in the save that writes the third, naming the candidate and the definition. A launch or setup failure clears the marker in the next save and writes no record.
 

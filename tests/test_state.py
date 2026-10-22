@@ -36,10 +36,13 @@ from autoforge.effects import (
 )
 from autoforge.errors import StateError
 from autoforge.replan_txn import ReplanAttestation, render_marker
-from autoforge.result_parser import Finding, ReviewResult
+from autoforge.result_parser import MAX_OPERATOR_ACTIONS_PER_FIX, Finding, ReviewResult
 from autoforge.state import (
     MAX_ACCEPTANCE_OUTCOMES,
     MAX_DECLINES_PER_ROUND,
+    MAX_OPERATOR_COMMENT_OUTCOMES,
+    MIN_OPERATOR_COMMENT_OUTCOMES,
+    OPERATOR_COMMENT_OUTCOMES,
     AutoForgeState,
     StatePaths,
     load_state,
@@ -64,6 +67,31 @@ def _drop_validation(d: dict) -> dict:
     """``d`` without protocol 10's fields, as an older controller wrote it."""
     for key in _VALIDATION_KEYS:
         del d[key]
+    return d
+
+
+# Protocol 11's own field (#243): no older label wrote it.
+_OPERATOR_KEYS = ("operator_comment_outcomes",)
+
+
+def _drop_operator(d: dict) -> dict:
+    """``d`` without protocol 11's operator-action state, as an older controller wrote it.
+
+    The field itself, and the keys protocol 11 added inside older fields: a
+    FIX entry observation's ``operator_targets``, a FIX context resolution's
+    ``operator_sources`` and a REMOTE ``last_fix_resolutions`` entry's
+    ``operator_evidence``.
+    """
+    for key in _OPERATOR_KEYS:
+        del d[key]
+    observation = d.get("entry_observation")
+    if isinstance(observation, dict):
+        observation.pop("operator_targets", None)
+    context = d.get("completion_context")
+    for r in context.get("resolutions", []) if isinstance(context, dict) else ():
+        r.pop("operator_sources", None)
+    for r in d.get("last_fix_resolutions", []):
+        r.pop("operator_evidence", None)
     return d
 
 
@@ -170,6 +198,7 @@ def test_load_missing_required_field_raises(tmp_path):
         "review_certificate": {},
         "producer_validation_failure": {},
         "validation_override_seq": None,
+        "operator_comment_outcomes": [],
     }
     p.write_text(json.dumps({"phase": "REVIEW", **effects}), encoding="utf-8")
     with pytest.raises(StateError, match="run_id"):
@@ -414,17 +443,18 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
     """
     path = tmp_path / "state.json"
     base = make_state().to_dict()
-    assert base["protocol_version"] == "10"
+    assert base["protocol_version"] == "11"
     del base["acceptance_outcomes"]  # protocol 8's own field (#211)
     del base["config_fingerprint"]  # protocol 9's own field (#219)
     _drop_validation(base)  # protocol 10's own fields (#172)
+    _drop_operator(base)  # protocol 11's own field (#243)
     for journal in ({}, {"stage": "rejected", "rejection_reason": "refused by verification"}):
         data = dict(base, protocol_version="1", replan_transaction=journal)
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "10" and loaded.replan_transaction == journal
+        assert loaded.protocol_version == "11" and loaded.replan_transaction == journal
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "10"
+        assert json.loads(path.read_text())["protocol_version"] == "11"
     in_flight = {
         "stage": "prepared",
         "transaction_id": "a" * 32,
@@ -524,11 +554,12 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
         "acceptance_outcomes",
         "config_fingerprint",
         *_VALIDATION_KEYS,
+        *_OPERATOR_KEYS,
     ):
         del data[missing]
     path.write_text(json.dumps(data), encoding="utf-8")
     loaded = load_state(path)
-    assert loaded.protocol_version == "10" and loaded.phase == phase
+    assert loaded.protocol_version == "11" and loaded.phase == phase
     assert (loaded.reviewed_pr_url, loaded.reviewed_base_ref, loaded.current_base_ref) == (
         "",
         "",
@@ -537,7 +568,7 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
     assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
     assert loaded.reviewed_head_sha == "a" * 40  # what protocol 2 did record is kept
     save_state(loaded, path)
-    assert json.loads(path.read_text())["protocol_version"] == "10"
+    assert json.loads(path.read_text())["protocol_version"] == "11"
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
@@ -591,16 +622,17 @@ def test_protocol_3_is_relabelled_outside_the_merge_phases(tmp_path, phase):
             "acceptance_outcomes",
             "config_fingerprint",
             *_VALIDATION_KEYS,
+            *_OPERATOR_KEYS,
         ):
             del data[missing]
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "10" and loaded.phase == phase
+        assert loaded.protocol_version == "11" and loaded.phase == phase
         assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
         assert loaded.reviewed_pr_url == PR42 and loaded.reviewed_base_ref == "main"
         assert loaded.replan_transaction == journal
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "10"
+        assert json.loads(path.read_text())["protocol_version"] == "11"
 
 
 @pytest.mark.parametrize("phase", list(Phase))
@@ -681,13 +713,14 @@ def test_protocol_4_is_relabelled_in_every_phase_without_a_replan_past_the_write
         del data["acceptance_outcomes"]  # protocol 8's own field (#211)
         del data["config_fingerprint"]  # protocol 9's own field (#219)
         _drop_validation(data)  # protocol 10's own fields (#172)
+        _drop_operator(data)  # protocol 11's own field (#243)
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "10" and loaded.phase == phase
+        assert loaded.protocol_version == "11" and loaded.phase == phase
         assert loaded.replan_transaction == journal
         assert loaded.reviewed_merge_base_sha == "d" * 40  # the binding is kept whole
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "10"
+        assert json.loads(path.read_text())["protocol_version"] == "11"
 
 
 @pytest.mark.parametrize("phase", list(Phase))
@@ -1801,6 +1834,7 @@ def _fix_context(resolutions=None):
                 "commit_sha": commit,
                 "follow_up_source": source,
                 "acceptance_source": None,
+                "operator_sources": None,
             }
             for fid, resolution, commit, source in resolutions
         ),
@@ -1990,16 +2024,16 @@ def _effect_fields(source):
     return {key: getattr(source, key) for key in _EFFECT_KEYS}
 
 
-# -- round trips under protocol 10 -----------------------------------------------------
+# -- round trips under protocol 11 -----------------------------------------------------
 
 
-def test_the_controller_speaks_protocol_10():
+def test_the_controller_speaks_protocol_11():
     """ADR 0004 D13.1: #160 is protocol 7, #211 (the acceptance comment, K9) is 8,
-    #219 (the recorded configuration) is 9, #172 (validation evidence) is 10;
-    6 is reserved for #126."""
+    #219 (the recorded configuration) is 9, #172 (validation evidence) is 10,
+    #243 (operator actions, K10) is 11; 6 is reserved for #126."""
     from autoforge import __protocol_version__
 
-    assert __protocol_version__ == "10"
+    assert __protocol_version__ == "11"
 
 
 @pytest.mark.parametrize(
@@ -2011,17 +2045,17 @@ def test_the_controller_speaks_protocol_10():
         (Stage.CONFLICT, Phase.BLOCKED),
     ],
 )
-def test_effect_state_round_trips_in_every_record_stage_under_protocol_10(tmp_path, stage, phase):
+def test_effect_state_round_trips_in_every_record_stage_under_protocol_11(tmp_path, stage, phase):
     """D2.1-D2.3, D4.4, D4.6, D13.3: a record in each stage, the entry observation,
     the completion context and the launch label survive save and load unchanged,
-    in a file labelled protocol 10. A conflict is persisted with the run BLOCKED
+    in a file labelled protocol 11. A conflict is persisted with the run BLOCKED
     in the phase it stopped, which keeps the pieces bound to that phase."""
     p = tmp_path / "state.json"
     s = _update_epic_state(stage, phase=phase)
     save_state(s, p)
 
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "10"
+    assert raw["protocol_version"] == "11"
     assert raw["effect_records"][0]["stage"] == stage.value
     loaded = load_state(p)
     assert loaded == s
@@ -2134,7 +2168,10 @@ R0 = ("effect_records", 0)
         (_pop((*R0, "payload")), "is missing key(s) ['payload']"),
         (_set((*R0, "extra"), 1), "has unknown key(s) ['extra']"),
         (_set((*R0, "position"), 1), "is at position 1, not 0"),
-        (_set((*R0, "position"), 51), "position must be in [0, 50], got 51"),
+        (
+            _set((*R0, "position"), MAX_EFFECTS_PER_PLAN),
+            f"position must be in [0, {MAX_EFFECTS_PER_PLAN - 1}], got {MAX_EFFECTS_PER_PLAN}",
+        ),
         (_set((*R0, "kind"), "comment"), "is not a Wave 1 effect kind: 'comment'"),
         (_set((*R0, "kind"), "push"), "is a push effect, which UPDATE_EPIC never plans"),
         (_set((*R0, "stage"), "done"), "stage is not a stage: 'done'"),
@@ -3079,14 +3116,17 @@ def test_records_persisted_without_their_completion_context_are_refused(tmp_path
 
 
 def test_effect_records_over_the_per_plan_count_are_refused(tmp_path):
-    """D2.4: a plan holds at most one push plus one effect per finding; a longer
-    list is refused before any record in it is parsed."""
-    assert MAX_EFFECTS_PER_PLAN == 51
+    """D2.4: a plan holds at most one push, one effect per deferred finding and
+    (#243) the operator comments of one more finding; a longer list is refused
+    before any record in it is parsed."""
+    assert MAX_EFFECTS_PER_PLAN == 54
     s = _update_epic_state()
     s.effect_records = [{}] * (MAX_EFFECTS_PER_PLAN + 1)
     p = tmp_path / "state.json"
     save_state(s, p)
-    with pytest.raises(StateError, match="holds 52 records, over 51"):
+    with pytest.raises(
+        StateError, match=f"holds {MAX_EFFECTS_PER_PLAN + 1} records, over {MAX_EFFECTS_PER_PLAN}"
+    ):
         load_state(p)
 
 
@@ -3176,25 +3216,31 @@ def test_a_local_run_with_empty_effect_fields_loads(tmp_path):
 
 
 def _legacy(protocol, **kw):
-    """The dict an older controller wrote: no protocol-7, -8, -9 or -10 field at all."""
+    """The dict an older controller wrote: no protocol-7, -8, -9, -10 or -11 field at all."""
     d = make_state(**kw).to_dict()
     d["protocol_version"] = protocol
-    for key in (*_EFFECT_KEYS, "acceptance_outcomes", "config_fingerprint", *_VALIDATION_KEYS):
+    for key in (
+        *_EFFECT_KEYS,
+        "acceptance_outcomes",
+        "config_fingerprint",
+        *_VALIDATION_KEYS,
+        *_OPERATOR_KEYS,
+    ):
         del d[key]
     return d
 
 
 @pytest.mark.parametrize("protocol", ["1", "2", "3", "4", "5"])
-def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_10_on_save(tmp_path, protocol):
+def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_11_on_save(tmp_path, protocol):
     """D13.2: protocol 5 (the label before effects) and the older legacy labels
     load with no records, no observation and no context, and the next save writes
-    protocol 10 with the four fields at their empty values."""
+    protocol 11 with the four fields at their empty values."""
     p = _write(
         tmp_path / "state.json",
         _legacy(protocol, phase=Phase.REVIEW, current_pr_url=PR42, review_round=1),
     )
     loaded = load_state(p)
-    assert loaded.protocol_version == "10"
+    assert loaded.protocol_version == "11"
     assert loaded.phase_effects().empty
     assert _effect_fields(loaded) == {
         "effect_records": [],
@@ -3204,9 +3250,10 @@ def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_10_on_save(t
     }
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "10"
+    assert raw["protocol_version"] == "11"
     assert raw["acceptance_outcomes"] == [] and raw["config_fingerprint"] == {}
     assert raw["validation_records"] == [] and raw["validation_override_seq"] is None
+    assert raw["operator_comment_outcomes"] == []
     assert _effect_fields(raw) == _effect_fields(loaded)
     assert load_state(p) == loaded
 
@@ -3265,7 +3312,13 @@ def test_a_legacy_local_state_gets_no_launch_label(tmp_path):
     loads with no label, so its protocol-7 save stays loadable as LOCAL."""
     d = _local_state(attempt=1).to_dict()
     d["protocol_version"] = "5"
-    for key in (*_EFFECT_KEYS, "acceptance_outcomes", "config_fingerprint", *_VALIDATION_KEYS):
+    for key in (
+        *_EFFECT_KEYS,
+        "acceptance_outcomes",
+        "config_fingerprint",
+        *_VALIDATION_KEYS,
+        *_OPERATOR_KEYS,
+    ):
         del d[key]
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
@@ -3318,10 +3371,11 @@ def test_a_protocol_7_or_8_file_missing_an_effect_field_is_refused_and_left_unch
     plan at all, and the phase would complete from its context without
     publishing it."""
     d = _update_epic_state(stage).to_dict()
-    assert d["protocol_version"] == "10"
+    assert d["protocol_version"] == "11"
     d["protocol_version"] = protocol
     del d["config_fingerprint"]  # protocol 9's own field (#219)
     _drop_validation(d)  # protocol 10's own fields (#172)
+    _drop_operator(d)  # protocol 11's own field (#243)
     if protocol == "7":
         del d["acceptance_outcomes"]
     del d[missing]
@@ -3363,12 +3417,12 @@ def test_a_legacy_file_with_effect_fields_at_their_empty_values_loads(tmp_path):
     d = _legacy("5", phase=Phase.UPDATE_EPIC, attempt=1, current_pr_url=PR42)
     d.update(effect_records=[], entry_observation={}, completion_context={}, launch_label="")
     loaded = load_state(_write(tmp_path / "state.json", d))
-    assert loaded.protocol_version == "10"
+    assert loaded.protocol_version == "11"
     assert loaded.phase_effects().empty
     assert loaded.launch_label == LABEL_AGENT_PUBLISHES
 
 
-@pytest.mark.parametrize("protocol", ["6", "11", 7, 8, 9, 10])
+@pytest.mark.parametrize("protocol", ["6", "12", 7, 8, 9, 10, 11])
 def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(tmp_path, protocol):
     """D13.1: protocol 6 is reserved for #126 and was never written by any
     released controller, so it is not a legacy label this controller migrates;
@@ -3380,7 +3434,7 @@ def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(tmp_
     before = p.read_bytes()
     with pytest.raises(StateError) as exc:
         load_state(p)
-    assert f"unsupported protocol_version {protocol!r} (controller speaks '10')" in str(exc.value)
+    assert f"unsupported protocol_version {protocol!r} (controller speaks '11')" in str(exc.value)
     assert p.read_bytes() == before
 
 
@@ -3572,6 +3626,7 @@ FIXED_ENTRY = {
     "follow_up_issue_url": "",
     "commit_sha": CANDIDATE_SHA,
     "acceptance_comment_url": "",
+    "operator_evidence": [],
 }
 ACCEPTED_ENTRY = {
     "finding_id": "R1-F1",
@@ -3580,6 +3635,7 @@ ACCEPTED_ENTRY = {
     "follow_up_issue_url": "",
     "commit_sha": "",
     "acceptance_comment_url": ACCEPTANCE_COMMENT_URL,
+    "operator_evidence": [],
 }
 UNBLOCK_ENTRY = {
     "at": "2026-01-01T00:00:00+00:00",
@@ -3589,6 +3645,11 @@ UNBLOCK_ENTRY = {
     "detail": "approved",
     "action": f"approved {ACTION_ID}",
 }
+
+
+def _drop_operator_evidence(entry: dict) -> dict:
+    """A copy of a ``last_fix_resolutions`` entry as a controller before protocol 11 wrote it."""
+    return {k: v for k, v in entry.items() if k != "operator_evidence"}
 
 
 def _after_fix(**kw):
@@ -3610,6 +3671,7 @@ def _as_protocol_7(d: dict) -> dict:
     del d["acceptance_outcomes"]
     del d["config_fingerprint"]
     _drop_validation(d)
+    _drop_operator(d)
     for r in d["completion_context"].get("resolutions", []):
         del r["acceptance_source"]
     for r in d["last_fix_resolutions"]:
@@ -3627,22 +3689,25 @@ def test_acceptance_state_round_trips_under_protocol_8(tmp_path):
     assert loaded == _after_fix(updated_at=loaded.updated_at)
 
 
-def test_a_protocol_7_file_loads_migrated_and_is_relabelled_10_on_save(tmp_path):
+def test_a_protocol_7_file_loads_migrated_and_is_relabelled_11_on_save(tmp_path):
     """Protocol 7 loads: its FIX plan's resolutions name no acceptance
-    comment, its recorded resolutions verified none, and it has no outcomes.
-    The next save writes the current protocol with those values."""
+    comment and no operator comment, its recorded resolutions verified none,
+    and it has no outcomes. The next save writes the current protocol with
+    those values."""
     d = _fix_state().to_dict()
     d["last_fix_resolutions"] = [dict(FIXED_ENTRY)]
     p = _write(tmp_path / "state.json", _as_protocol_7(d))
     loaded = load_state(p)
-    assert loaded.protocol_version == "10" and loaded.acceptance_outcomes == []
+    assert loaded.protocol_version == "11" and loaded.acceptance_outcomes == []
+    assert loaded.operator_comment_outcomes == []
     assert loaded.last_fix_resolutions == [FIXED_ENTRY]
     context = loaded.phase_effects().context
     assert isinstance(context, FixContext)
     assert all(r["acceptance_source"] is None for r in context.resolutions)
+    assert all(r["operator_sources"] is None for r in context.resolutions)
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "10" and raw["acceptance_outcomes"] == []
+    assert raw["protocol_version"] == "11" and raw["acceptance_outcomes"] == []
     assert load_state(p) == loaded
 
 
@@ -3654,7 +3719,7 @@ def test_a_protocol_7_file_loads_migrated_and_is_relabelled_10_on_save(tmp_path)
         (lambda d: d.update(acceptance_outcomes=[]), "'acceptance_outcomes'"),
         (lambda d: d.update(unblock_history=[dict(UNBLOCK_ENTRY)]), "an 'action' in"),
         (
-            lambda d: d.update(last_fix_resolutions=[dict(ACCEPTED_ENTRY)]),
+            lambda d: d.update(last_fix_resolutions=[_drop_operator_evidence(ACCEPTED_ENTRY)]),
             "'acceptance_comment_url' in 'last_fix_resolutions'",
         ),
     ],
@@ -3672,6 +3737,7 @@ def test_an_older_file_carrying_acceptance_state_is_refused_and_left_unchanged(
         d["protocol_version"] = "7"
         del d["acceptance_outcomes"], d["config_fingerprint"]
         _drop_validation(d)
+        _drop_operator(d)
     else:
         d = _legacy(protocol, phase=Phase.REVIEW, current_pr_url=PR42)
     plant(d)
@@ -3831,16 +3897,16 @@ def _recorded_config(**over) -> dict:
     return record
 
 
-def test_a_recorded_configuration_round_trips_under_protocol_10(tmp_path):
+def test_a_recorded_configuration_round_trips_under_protocol_11(tmp_path):
     p = tmp_path / "state.json"
     s = make_state(phase=Phase.REVIEW, config_fingerprint=_recorded_config())
     save_state(s, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "10" and raw["config_fingerprint"] == _recorded_config()
+    assert raw["protocol_version"] == "11" and raw["config_fingerprint"] == _recorded_config()
     assert load_state(p) == s
 
 
-def test_a_protocol_8_file_loads_with_no_recorded_configuration_and_is_relabelled_10(tmp_path):
+def test_a_protocol_8_file_loads_with_no_recorded_configuration_and_is_relabelled_11(tmp_path):
     """No recorded configuration means "not checked": the file loads in any
     phase, its own acceptance state untouched (it is protocol 8's, not
     migrated), and the next save writes the current protocol with ``{}``."""
@@ -3848,14 +3914,15 @@ def test_a_protocol_8_file_loads_with_no_recorded_configuration_and_is_relabelle
     d["protocol_version"] = "8"
     del d["config_fingerprint"]
     _drop_validation(d)
+    _drop_operator(d)
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
-    assert loaded.protocol_version == "10" and loaded.config_fingerprint == {}
+    assert loaded.protocol_version == "11" and loaded.config_fingerprint == {}
     assert loaded.last_fix_resolutions[0]["acceptance_comment_url"] == ACCEPTANCE_COMMENT_URL
     assert loaded.acceptance_outcomes == _after_fix().acceptance_outcomes
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "10" and raw["config_fingerprint"] == {}
+    assert raw["protocol_version"] == "11" and raw["config_fingerprint"] == {}
     assert load_state(p) == loaded
 
 
@@ -3872,6 +3939,7 @@ def test_an_older_file_carrying_a_recorded_configuration_is_refused_and_left_unc
         d = make_state(phase=Phase.REVIEW, current_pr_url=PR42).to_dict()
         d["protocol_version"] = protocol
         _drop_validation(d)
+        _drop_operator(d)
         if protocol == "7":
             del d["acceptance_outcomes"]
     d["config_fingerprint"] = value
@@ -3885,15 +3953,17 @@ def test_an_older_file_carrying_a_recorded_configuration_is_refused_and_left_unc
     assert p.read_bytes() == before
 
 
-@pytest.mark.parametrize("protocol", ["9", "10"])
+@pytest.mark.parametrize("protocol", ["9", "10", "11"])
 def test_a_protocol_9_file_missing_its_recorded_configuration_is_refused(tmp_path, protocol):
     """Every protocol-9 save writes the field, ``{}`` included, and so does
     every later one: read as absent it would switch the check off for the
     rest of the run."""
     d = make_state(config_fingerprint=_recorded_config()).to_dict()
     del d["config_fingerprint"]
+    if protocol in ("9", "10"):
+        d["protocol_version"] = protocol
+        _drop_operator(d)
     if protocol == "9":
-        d["protocol_version"] = "9"
         _drop_validation(d)
     p = _write(tmp_path / "state.json", d)
     with pytest.raises(StateError) as exc:
@@ -3983,7 +4053,7 @@ def _validation_marker() -> dict:
     }
 
 
-def test_validation_evidence_round_trips_under_protocol_10(tmp_path):
+def test_validation_evidence_round_trips_under_protocol_11(tmp_path):
     p = tmp_path / "state.json"
     s = make_state(
         phase=Phase.REVIEW,
@@ -3993,7 +4063,7 @@ def test_validation_evidence_round_trips_under_protocol_10(tmp_path):
     )
     save_state(s, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "10"
+    assert raw["protocol_version"] == "11"
     assert [r["outcome"] for r in raw["validation_records"]] == ["PASS", "FAIL"]
     loaded = load_state(p)
     assert loaded == s
@@ -4016,11 +4086,11 @@ def test_loading_a_pending_marker_is_read_only(tmp_path):
 def test_an_older_file_loads_in_every_phase_with_no_validation_evidence(tmp_path, phase, protocol):
     """D15.4: a file from before protocol 10 loads with every field at its
     empty value, fabricating no record, marker, binding or certificate, and
-    the next save writes protocol 10."""
+    the next save writes the current protocol."""
     if protocol == "5":
         d = _legacy("5", phase=phase)
     else:
-        d = _drop_validation(make_state(phase=phase).to_dict())
+        d = _drop_operator(_drop_validation(make_state(phase=phase).to_dict()))
         d["protocol_version"] = protocol
         if protocol in ("7", "8"):
             del d["config_fingerprint"]
@@ -4028,7 +4098,7 @@ def test_an_older_file_loads_in_every_phase_with_no_validation_evidence(tmp_path
             del d["acceptance_outcomes"]
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
-    assert loaded.protocol_version == "10" and loaded.phase == phase
+    assert loaded.protocol_version == "11" and loaded.phase == phase
     assert {key: getattr(loaded, key) for key in _VALIDATION_KEYS} == {
         "validation_records": [],
         "validation_attempt": {},
@@ -4039,7 +4109,7 @@ def test_an_older_file_loads_in_every_phase_with_no_validation_evidence(tmp_path
     }
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "10" and raw["validation_records"] == []
+    assert raw["protocol_version"] == "11" and raw["validation_records"] == []
 
 
 @pytest.mark.parametrize("protocol", ["5", "7", "8", "9"])
@@ -4050,7 +4120,7 @@ def test_an_older_file_carrying_validation_evidence_is_refused(tmp_path, protoco
     if protocol == "5":
         d = _legacy("5", phase=Phase.REVIEW)
     else:
-        d = _drop_validation(make_state(phase=Phase.REVIEW).to_dict())
+        d = _drop_operator(_drop_validation(make_state(phase=Phase.REVIEW).to_dict()))
         d["protocol_version"] = protocol
         if protocol in ("7", "8"):
             del d["config_fingerprint"]
@@ -4065,15 +4135,21 @@ def test_an_older_file_carrying_validation_evidence_is_refused(tmp_path, protoco
     assert p.read_bytes() == before
 
 
+@pytest.mark.parametrize("protocol", ["10", "11"])
 @pytest.mark.parametrize("key", _VALIDATION_KEYS)
-def test_a_protocol_10_file_missing_a_validation_field_is_refused(tmp_path, key):
+def test_a_protocol_10_file_missing_a_validation_field_is_refused(tmp_path, key, protocol):
+    """Every protocol-10 save writes all six, and so does every later one."""
     d = make_state().to_dict()
+    if protocol == "10":
+        d["protocol_version"] = "10"
+        _drop_operator(d)
     del d[key]
     p = _write(tmp_path / "state.json", d)
     with pytest.raises(StateError) as exc:
         load_state(p)
     message = str(exc.value)
-    assert f"labelled protocol_version '10' but is missing required field(s) {key!r}" in message
+    needle = f"labelled protocol_version {protocol!r} but is missing required field(s) {key!r}"
+    assert needle in message
     assert "not a run with no evidence" in message
 
 
@@ -4125,3 +4201,610 @@ def test_validation_evidence_belongs_to_the_issue_it_was_recorded_for():
         "producer_validation_failure": {},
         "validation_override_seq": None,
     }
+
+
+# -- operator actions (#243, protocol 11) -------------------------------------------------
+#
+# ``operator_comment_outcomes`` records what became of each operator action
+# (K10) of the current PR, and a REMOTE ``last_fix_resolutions`` entry's
+# ``operator_evidence`` the operator comments verified for its finding. A
+# target is another issue of the run's repository, never the run's own.
+
+OPERATOR_ACTION_ID = "X-" + "0123456789abcdef"
+OTHER_OPERATOR_ACTION_ID = "X-" + "fedcba9876543210"
+OPERATOR_TARGET = "https://github.com/owner/repo/issues/5"
+OPERATOR_COMMENT_URL = f"{OPERATOR_TARGET}#issuecomment-11"
+OPERATOR_BODY_SHA256 = "c" * 64
+OPERATOR_PAYLOAD_SHA256 = "e" * 64
+
+
+def _operator_outcome(**kw):
+    """One ``operator_comment_outcomes`` entry (declined unless ``kw`` says otherwise)."""
+    entry = {
+        "action_id": OPERATOR_ACTION_ID,
+        "round": 1,
+        "finding_id": "R1-F1",
+        "target": OPERATOR_TARGET,
+        "outcome": "declined",
+        "evidence": "",
+        "comment_url": "",
+        "body_sha256": "",
+        "payload_sha256": OPERATOR_PAYLOAD_SHA256,
+        "at": "2026-01-01T00:00:00+00:00",
+        "reason": "that issue is not the place for this note",
+    }
+    entry.update(kw)
+    return entry
+
+
+def _verified_outcome(**kw):
+    """A ``verified`` entry: the operator's comment observed on its target."""
+    return _operator_outcome(
+        **{
+            "outcome": "verified",
+            "evidence": "exact",
+            "comment_url": OPERATOR_COMMENT_URL,
+            "body_sha256": OPERATOR_BODY_SHA256,
+            "reason": "",
+            **kw,
+        }
+    )
+
+
+def _operator_evidence(**kw):
+    """One ``operator_evidence`` item of a REMOTE ``last_fix_resolutions`` entry."""
+    item = {
+        "action_id": OPERATOR_ACTION_ID,
+        "target": OPERATOR_TARGET,
+        "comment_url": OPERATOR_COMMENT_URL,
+        "evidence": "exact",
+        "body_sha256": OPERATOR_BODY_SHA256,
+        "payload_sha256": OPERATOR_PAYLOAD_SHA256,
+    }
+    item.update(kw)
+    return item
+
+
+OPERATOR_ENTRY = {
+    "finding_id": "R1-F1",
+    "resolution": "operator_acceptance",
+    "rationale": "The finding asks for a note on another issue, which the operator posted.",
+    "follow_up_issue_url": "",
+    "commit_sha": "",
+    "acceptance_comment_url": "",
+    "operator_evidence": [_operator_evidence()],
+}
+
+
+def _after_operator_fix(**kw):
+    """A REMOTE run in REVIEW after a FIX round with a verified operator action."""
+    base = dict(
+        phase=Phase.REVIEW,
+        current_pr_url=PR42,
+        review_round=1,
+        last_fix_resolutions=[dict(OPERATOR_ENTRY), dict(FIXED_ENTRY)],
+        operator_comment_outcomes=[_verified_outcome()],
+    )
+    base.update(kw)
+    return make_state(**base)
+
+
+def _as_protocol(d: dict, protocol: str) -> dict:
+    """``d`` as the controller of an older ``protocol`` (7 to 10) wrote it."""
+    if protocol == "7":
+        return _as_protocol_7(d)
+    d["protocol_version"] = protocol
+    _drop_operator(d)  # protocol 11's own field (#243)
+    if protocol in ("8", "9"):
+        _drop_validation(d)  # protocol 10's own fields (#172)
+    if protocol == "8":
+        del d["config_fingerprint"]  # protocol 9's own field (#219)
+    return d
+
+
+def test_every_operator_outcome_round_trips_under_protocol_11(tmp_path):
+    """A verified action (``exact`` or ``bound`` evidence), a declined, a
+    withdrawn and a stale one, and the evidence a resolution names, survive
+    save and load unchanged in a file labelled protocol 11."""
+    outcomes = [
+        _verified_outcome(),
+        _verified_outcome(
+            action_id=OTHER_OPERATOR_ACTION_ID,
+            evidence="bound",
+            comment_url=f"{OPERATOR_TARGET}#issuecomment-12",
+        ),
+        _operator_outcome(),
+        _operator_outcome(outcome="withdrawn", reason=""),
+        _operator_outcome(outcome="stale", reason=""),
+    ]
+    assert sorted({o["outcome"] for o in outcomes}) == sorted(OPERATOR_COMMENT_OUTCOMES)
+    p = tmp_path / "state.json"
+    save_state(_after_operator_fix(operator_comment_outcomes=outcomes), p)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    assert raw["protocol_version"] == "11" and raw["operator_comment_outcomes"] == outcomes
+    loaded = load_state(p)
+    assert loaded.operator_comment_outcomes == outcomes
+    assert loaded.last_fix_resolutions[0]["operator_evidence"] == [_operator_evidence()]
+    assert loaded.last_fix_resolutions[1]["operator_evidence"] == []
+    assert loaded == _after_operator_fix(
+        operator_comment_outcomes=outcomes, updated_at=loaded.updated_at
+    )
+
+
+@pytest.mark.parametrize("phase", list(Phase))
+def test_a_protocol_10_file_loads_in_every_phase_with_no_operator_state(tmp_path, phase):
+    """A protocol-10 file is this protocol's shape without the operator-action
+    state: it loads in every phase with no outcome, and the next save writes
+    protocol 11 with ``[]``."""
+    d = _as_protocol(make_state(phase=phase, current_pr_url=PR42).to_dict(), "10")
+    assert "operator_comment_outcomes" not in d
+    p = _write(tmp_path / "state.json", d)
+    loaded = load_state(p)
+    assert loaded.protocol_version == "11" and loaded.phase == phase
+    assert loaded.operator_comment_outcomes == []
+    save_state(loaded, p)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    assert raw["protocol_version"] == "11" and raw["operator_comment_outcomes"] == []
+    assert load_state(p) == loaded
+
+
+def test_a_protocol_10_fix_plan_loads_migrated_and_is_relabelled_11_on_save(tmp_path):
+    """A protocol-10 FIX entry observed no operator targets, its plan's
+    resolutions name no operator comment and its recorded resolutions
+    verified none: it loads with ``operator_sources: null`` and
+    ``operator_evidence: []``, and offers no operator action."""
+    d = _fix_state().to_dict()
+    d["last_fix_resolutions"] = [dict(FIXED_ENTRY)]
+    p = _write(tmp_path / "state.json", _as_protocol(d, "10"))
+    loaded = load_state(p)
+    assert loaded.protocol_version == "11" and loaded.operator_comment_outcomes == []
+    assert loaded.last_fix_resolutions == [FIXED_ENTRY]
+    effects = loaded.phase_effects()
+    assert isinstance(effects.context, FixContext)
+    assert all(r["operator_sources"] is None for r in effects.context.resolutions)
+    assert effects.observation is not None and effects.observation.operator_targets is None
+    save_state(loaded, p)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    assert raw["protocol_version"] == "11" and raw["operator_comment_outcomes"] == []
+    assert raw["last_fix_resolutions"][0]["operator_evidence"] == []
+    assert load_state(p) == loaded
+
+
+def test_a_protocol_10_local_file_loads_and_is_relabelled_11(tmp_path):
+    """LOCAL has no operator actions: a protocol-10 LOCAL file loads with no
+    outcome, its resolutions gain no evidence, and the next save loads."""
+    resolutions = [{"finding_id": "R1-F1", "resolution": "fixed"}]
+    d = _as_protocol(_local_state(last_fix_resolutions=resolutions).to_dict(), "10")
+    p = _write(tmp_path / "state.json", d)
+    loaded = load_state(p)
+    assert loaded.protocol_version == "11" and loaded.operator_comment_outcomes == []
+    assert loaded.last_fix_resolutions == resolutions
+    save_state(loaded, p)
+    assert json.loads(p.read_text(encoding="utf-8"))["operator_comment_outcomes"] == []
+    assert load_state(p) == loaded
+
+
+@pytest.mark.parametrize("protocol", ["5", "7", "8", "9", "10"])
+@pytest.mark.parametrize(
+    ("plant", "named"),
+    [
+        (
+            lambda d: d.update(operator_comment_outcomes=[_operator_outcome()]),
+            "'operator_comment_outcomes'",
+        ),
+        (lambda d: d.update(operator_comment_outcomes=[]), "'operator_comment_outcomes'"),
+        (
+            lambda d: d.update(
+                last_fix_resolutions=[
+                    {k: v for k, v in FIXED_ENTRY.items() if k != "acceptance_comment_url"}
+                ]
+            ),
+            "'operator_evidence' in 'last_fix_resolutions'",
+        ),
+    ],
+    ids=["outcomes", "empty-outcomes", "evidence"],
+)
+def test_an_older_file_carrying_operator_state_is_refused_and_left_unchanged(
+    tmp_path, protocol, plant, named
+):
+    """No controller before protocol 11 wrote operator-action state, so an
+    older label carrying any is a hand edit or a foreign file: refused, never
+    merged, and the file is not rewritten. The label decides, not the value:
+    ``operator_comment_outcomes`` is refused even as the empty list a
+    protocol-11 save writes, and ``operator_evidence`` even as ``[]``."""
+    if protocol == "5":
+        d = _legacy(protocol, phase=Phase.REVIEW, current_pr_url=PR42)
+    else:
+        d = _as_protocol(make_state(phase=Phase.REVIEW, current_pr_url=PR42).to_dict(), protocol)
+    plant(d)
+    p = _write(tmp_path / "state.json", d)
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    message = str(exc.value)
+    assert f"labelled protocol_version {protocol!r}, which never wrote" in message
+    assert named in message and "protocol-11 operator-action state" in message
+    assert p.read_bytes() == before
+
+
+@pytest.mark.parametrize("protocol", ["7", "8", "9", "10"])
+@pytest.mark.parametrize("planted", ["record", "sources", "targets"])
+def test_an_older_fix_plan_carrying_operator_state_is_refused_and_left_unchanged(
+    tmp_path, protocol, planted
+):
+    """A K10 record, a context resolution's ``operator_sources`` (even null)
+    and an entry observation's ``operator_targets`` are protocol 11's too."""
+    d = _as_protocol(_fix_state().to_dict(), protocol)
+    if planted == "record":
+        d["effect_records"][0]["kind"] = "operator_comment"
+        named = "an 'operator_comment' effect record"
+    elif planted == "sources":
+        d["completion_context"]["resolutions"][0]["operator_sources"] = None
+        named = "'operator_sources' in 'completion_context'"
+    else:
+        d["entry_observation"]["operator_targets"] = None
+        named = "'operator_targets' in 'entry_observation'"
+    p = _write(tmp_path / "state.json", d)
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert f"labelled protocol_version {protocol!r}, which never wrote" in str(exc.value)
+    assert named in str(exc.value)
+    assert p.read_bytes() == before
+
+
+def test_a_protocol_11_file_missing_its_operator_outcomes_is_refused(tmp_path):
+    """Every protocol-11 save writes the field, ``[]`` included: read as the
+    empty default, an absent one would drop the round's declined actions and
+    let the same request through again. An unlabelled file is read as the
+    current protocol."""
+    d = _after_operator_fix().to_dict()
+    del d["operator_comment_outcomes"]
+    for label in ("labelled protocol_version '11'", "no protocol_version label (read as '11')"):
+        if "no protocol_version" in label:
+            del d["protocol_version"]
+        p = _write(tmp_path / "state.json", d)
+        before = p.read_bytes()
+        with pytest.raises(StateError) as exc:
+            load_state(p)
+        message = str(exc.value)
+        assert f"{label} but is missing required field(s) 'operator_comment_outcomes'" in message
+        assert "not a PR with none" in message
+        assert p.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("entries", "match"),
+    [
+        ([_operator_outcome(note="x")], "must hold exactly"),
+        (
+            [{k: v for k, v in _operator_outcome().items() if k != "payload_sha256"}],
+            "must hold exactly",
+        ),
+        ([_operator_outcome(action_id=ACTION_ID)], "action id of the form X-<16 hex>"),
+        ([_operator_outcome(action_id="X-0123")], "action id of the form X-<16 hex>"),
+        ([_operator_outcome(round=0)], r"round must be an integer >= 1"),
+        ([_operator_outcome(round=True)], r"round must be an integer >= 1"),
+        ([_operator_outcome(finding_id="R2-F1")], "must be a finding id of its round"),
+        ([_operator_outcome(outcome="approved")], "outcome must be one of"),
+        ([_operator_outcome(outcome="verified")], "evidence must be one of"),
+        ([_verified_outcome(evidence="")], "evidence must be one of"),
+        ([_verified_outcome(evidence="observed")], "evidence must be one of"),
+        ([_verified_outcome(comment_url="")], r"\.comment_url: "),
+        (
+            [_verified_outcome(comment_url=f"{EFFECT_ISSUE}#issuecomment-11")],
+            "is not a canonical comment URL on its target",
+        ),
+        (
+            [
+                _verified_outcome(
+                    comment_url="https://GitHub.com/owner/repo/issues/5#issuecomment-11"
+                )
+            ],
+            "is not a canonical comment URL on its target",
+        ),
+        ([_verified_outcome(body_sha256="")], r"body_sha256 must be a 64-character"),
+        ([_verified_outcome(body_sha256="C" * 64)], r"body_sha256 must be a 64-character"),
+        ([_operator_outcome(payload_sha256="")], r"payload_sha256 must be a 64-character"),
+        ([_operator_outcome(comment_url=OPERATOR_COMMENT_URL)], "no operator comment was verified"),
+        ([_operator_outcome(evidence="exact")], "evidence must be empty for a declined action"),
+        (
+            [_operator_outcome(outcome="withdrawn", evidence="bound")],
+            "evidence must be empty for a withdrawn action",
+        ),
+        (
+            [_operator_outcome(outcome="stale", comment_url=OPERATOR_COMMENT_URL)],
+            "no operator comment was verified",
+        ),
+        (
+            [_operator_outcome(outcome="stale", body_sha256=OPERATOR_BODY_SHA256)],
+            r"body_sha256 must be empty",
+        ),
+        ([_operator_outcome(target=EFFECT_ISSUE)], "is the run's own issue"),
+        (
+            [_operator_outcome(target="https://github.com/Owner/Repo/issues/2")],
+            "is the run's own issue",
+        ),
+        (
+            [_operator_outcome(target="https://github.com/other/repo/issues/5")],
+            "is not an issue of repository 'owner/repo'",
+        ),
+        (
+            [_operator_outcome(target="https://github.com/owner/repo/issues/05")],
+            "must be stored in its canonical form",
+        ),
+        ([_operator_outcome(target=PR42)], r"\.target: expected a GitHub issue URL"),
+        ([_operator_outcome(at="")], "non-empty timestamp"),
+        ([_operator_outcome(reason="r" * (MAX_CONFLICT_REASON_CHARS + 1))], "at most"),
+        (
+            [_verified_outcome(), _verified_outcome(evidence="bound")],
+            rf"\[1\] verifies action {OPERATOR_ACTION_ID} on one comment twice",
+        ),
+        (
+            [_operator_outcome(outcome="stale")] * (MAX_OPERATOR_COMMENT_OUTCOMES + 1),
+            f"holds {MAX_OPERATOR_COMMENT_OUTCOMES + 1} entries, over "
+            f"{MAX_OPERATOR_COMMENT_OUTCOMES}",
+        ),
+        (
+            [_operator_outcome()] * (MAX_DECLINES_PER_ROUND + 1),
+            f"hold {MAX_DECLINES_PER_ROUND + 1} declines of review round 1, over",
+        ),
+        (["declined"], "must be a list of objects"),
+        ({}, "must be a list of objects"),
+    ],
+)
+def test_a_malformed_operator_outcome_is_refused(tmp_path, entries, match):
+    d = make_state(phase=Phase.REVIEW, current_pr_url=PR42).to_dict()
+    d["operator_comment_outcomes"] = entries
+    with pytest.raises(StateError, match=match):
+        load_state(_write(tmp_path / "state.json", d))
+
+
+def test_a_verified_outcome_is_unique_per_action_and_comment(tmp_path):
+    """One action verified on two comments, or two actions on one comment,
+    is two outcomes; only the same action on the same comment is one twice."""
+    d = make_state(phase=Phase.REVIEW, current_pr_url=PR42).to_dict()
+    d["operator_comment_outcomes"] = [
+        _verified_outcome(),
+        _verified_outcome(evidence="bound", comment_url=f"{OPERATOR_TARGET}#issuecomment-12"),
+        _verified_outcome(action_id=OTHER_OPERATOR_ACTION_ID),
+    ]
+    loaded = load_state(_write(tmp_path / "state.json", d))
+    assert len(loaded.operator_comment_outcomes) == 3
+
+
+def test_declines_of_one_round_are_bounded_across_acceptance_and_operator_outcomes(tmp_path):
+    """K9's and K10's declines share one bound per round: each list within it
+    on its own is not enough. A withdrawal is not a decline, and a decline of
+    another round does not count against this one."""
+    d = make_state(phase=Phase.REVIEW, current_pr_url=PR42, review_round=2).to_dict()
+    acceptance = [_outcome()] * (MAX_DECLINES_PER_ROUND // 2)
+    operator = [_operator_outcome()] * (MAX_DECLINES_PER_ROUND - len(acceptance))
+    d["acceptance_outcomes"] = acceptance
+    d["operator_comment_outcomes"] = (
+        operator
+        + [_operator_outcome(outcome="withdrawn")] * MAX_DECLINES_PER_ROUND
+        + [_operator_outcome(round=2, finding_id="R2-F1")] * MAX_DECLINES_PER_ROUND
+    )
+    loaded = load_state(_write(tmp_path / "state.json", d))
+    assert loaded.round_declines() == MAX_DECLINES_PER_ROUND  # round 2's: the state's own round
+    d["operator_comment_outcomes"].append(_operator_outcome())
+    with pytest.raises(StateError) as exc:
+        load_state(_write(tmp_path / "state.json", d))
+    assert (
+        "state fields 'acceptance_outcomes' and 'operator_comment_outcomes' hold "
+        f"{MAX_DECLINES_PER_ROUND + 1} declines of review round 1, over {MAX_DECLINES_PER_ROUND}"
+    ) in str(exc.value)
+
+
+def test_round_declines_counts_both_kinds_of_decline_of_the_round_being_fixed():
+    """A K9 and a K10 decline of the round each count once; a withdrawal, a
+    stale or verified outcome, and a decline of another round do not."""
+    s = make_state(phase=Phase.FIX, current_pr_url=PR42, review_round=2)
+    s.acceptance_outcomes = [
+        _outcome(round=2, finding_id="R2-F1"),
+        _outcome(round=2, finding_id="R2-F1", outcome="stale"),
+        _outcome(),
+    ]
+    s.operator_comment_outcomes = [
+        _operator_outcome(round=2, finding_id="R2-F1"),
+        _operator_outcome(round=2, finding_id="R2-F2"),
+        _operator_outcome(round=2, finding_id="R2-F1", outcome="withdrawn"),
+        _operator_outcome(round=2, finding_id="R2-F1", outcome="stale"),
+        _verified_outcome(round=2, finding_id="R2-F1"),
+        _operator_outcome(),
+        _operator_outcome(),
+    ]
+    assert s.round_declines() == 3
+    s.review_round = 1
+    assert s.round_declines() == 3
+    s.review_round = 3
+    assert s.round_declines() == 0
+    s.review_round = 2
+    s.acceptance_outcomes = []
+    assert s.round_declines() == 2
+
+
+def _operator_entry(round_: int, n: int, outcome: str = "declined") -> dict:
+    """The ``n``-th distinct ``operator_comment_outcomes`` entry of ``round_``."""
+    action_id = f"X-{round_:08x}{n:08x}"
+    finding_id = f"R{round_}-F1"
+    if outcome == "verified":
+        return _verified_outcome(
+            round=round_,
+            finding_id=finding_id,
+            action_id=action_id,
+            comment_url=f"{OPERATOR_TARGET}#issuecomment-{n + 1}",
+        )
+    return _operator_outcome(
+        round=round_, finding_id=finding_id, action_id=action_id, outcome=outcome
+    )
+
+
+def _operator_round(round_: int) -> list[dict]:
+    """The most one round records: MAX_DECLINES_PER_ROUND decline cycles of
+    MAX_OPERATOR_ACTIONS_PER_FIX actions (one declined, the others withdrawn
+    with it), then a plan of MAX_OPERATOR_ACTIONS_PER_FIX verified ones."""
+    entries = []
+    for cycle in range(MAX_DECLINES_PER_ROUND + 1):
+        for n in range(MAX_OPERATOR_ACTIONS_PER_FIX):
+            if cycle == MAX_DECLINES_PER_ROUND:
+                outcome = "verified"
+            else:
+                outcome = "declined" if n == 0 else "withdrawn"
+            entries.append(
+                _operator_entry(round_, cycle * MAX_OPERATOR_ACTIONS_PER_FIX + n, outcome)
+            )
+    return entries
+
+
+def test_one_round_of_operator_outcomes_fits_the_bound():
+    """#243: a round holds at most MAX_DECLINES_PER_ROUND decline cycles and
+    one completing plan, each of at most MAX_OPERATOR_ACTIONS_PER_FIX
+    actions; the bound never drops an entry of the round being fixed, so it
+    must hold that many."""
+    assert MIN_OPERATOR_COMMENT_OUTCOMES == (
+        (MAX_DECLINES_PER_ROUND + 1) * MAX_OPERATOR_ACTIONS_PER_FIX
+    )
+    assert MIN_OPERATOR_COMMENT_OUTCOMES == 68
+    assert MAX_OPERATOR_COMMENT_OUTCOMES == 80
+    assert MAX_OPERATOR_COMMENT_OUTCOMES >= MIN_OPERATOR_COMMENT_OUTCOMES
+    assert len(_operator_round(1)) == MIN_OPERATOR_COMMENT_OUTCOMES
+
+
+def test_the_operator_outcome_bound_drops_the_oldest_entries_never_one_of_the_round_being_fixed():
+    """Past the bound the oldest entries go, but never one of the current
+    round, whatever its outcome and wherever it stands: a decline refuses
+    its request again and a verification is what REVIEW is told."""
+    outcomes = list(OPERATOR_COMMENT_OUTCOMES)
+    older = [
+        _operator_entry(1, n, outcomes[n % len(outcomes)])
+        for n in range(MAX_OPERATOR_COMMENT_OUTCOMES)
+    ]
+    s = make_state(phase=Phase.FIX, current_pr_url=PR42, review_round=2)
+    s.operator_comment_outcomes = list(older)
+    active: list[dict] = []
+    for n in range(MIN_OPERATOR_COMMENT_OUTCOMES):
+        active.append(_operator_entry(2, n, outcomes[n % len(outcomes)]))
+        s.operator_comment_outcomes.append(active[-1])
+        s.bound_operator_comment_outcomes()
+        assert len(s.operator_comment_outcomes) == MAX_OPERATOR_COMMENT_OUTCOMES
+        assert s.operator_comment_outcomes == older[n + 1 :] + active
+    # The round's entries stay even as the oldest of the list.
+    s.operator_comment_outcomes = active + older
+    s.operator_comment_outcomes.append(_operator_entry(2, len(active), "stale"))
+    s.bound_operator_comment_outcomes()
+    kept = len(active)
+    assert s.operator_comment_outcomes[:kept] == active
+    assert s.operator_comment_outcomes[kept:-1] == older[kept + 1 :]
+    assert s.operator_comment_outcomes[-1]["outcome"] == "stale"
+    assert len(s.operator_comment_outcomes) == MAX_OPERATOR_COMMENT_OUTCOMES
+    # Within the bound nothing is dropped.
+    s.operator_comment_outcomes = older[:3]
+    s.bound_operator_comment_outcomes()
+    assert s.operator_comment_outcomes == older[:3]
+
+
+def test_a_full_round_of_operator_outcomes_survives_the_bound_and_loads(tmp_path):
+    """The largest round, after an earlier one as large: the bound keeps the
+    whole current round and the newest of the earlier one, and the result
+    is a state that loads, its round's declines at the shared bound."""
+    s = make_state(phase=Phase.REVIEW, current_pr_url=PR42, review_round=2)
+    s.operator_comment_outcomes = _operator_round(1) + _operator_round(2)
+    s.bound_operator_comment_outcomes()
+    room = MAX_OPERATOR_COMMENT_OUTCOMES - MIN_OPERATOR_COMMENT_OUTCOMES
+    assert s.operator_comment_outcomes == _operator_round(1)[-room:] + _operator_round(2)
+    assert s.round_declines() == MAX_DECLINES_PER_ROUND
+    p = tmp_path / "state.json"
+    save_state(s, p)
+    assert load_state(p).operator_comment_outcomes == s.operator_comment_outcomes
+
+
+def _with_evidence(**kw) -> dict:
+    """``OPERATOR_ENTRY`` with one ``operator_evidence`` item changed by ``kw``."""
+    return {**OPERATOR_ENTRY, "operator_evidence": [_operator_evidence(**kw)]}
+
+
+@pytest.mark.parametrize(
+    ("entry", "match"),
+    [
+        (
+            _drop_operator_evidence(FIXED_ENTRY),
+            r"'last_fix_resolutions'\[0\]\.operator_evidence is missing",
+        ),
+        ({**FIXED_ENTRY, "operator_evidence": None}, "must be a list of at most"),
+        (
+            {**OPERATOR_ENTRY, "operator_evidence": [_operator_evidence()] * 81},
+            "must be a list of at most",
+        ),
+        ({**OPERATOR_ENTRY, "operator_evidence": ["x"]}, "must hold exactly"),
+        (
+            {**OPERATOR_ENTRY, "operator_evidence": [{**_operator_evidence(), "round": 1}]},
+            "must hold exactly",
+        ),
+        (_with_evidence(action_id=ACTION_ID), "action id of the form X-<16 hex>"),
+        (_with_evidence(evidence=""), r"\.evidence must be one of"),
+        (_with_evidence(evidence="observed"), r"\.evidence must be one of"),
+        (_with_evidence(comment_url=""), r"\.comment_url: "),
+        (
+            _with_evidence(comment_url="https://GitHub.com/owner/repo/issues/5#issuecomment-11"),
+            "is not a canonical comment URL on its target",
+        ),
+        (
+            _with_evidence(comment_url=f"{FOLLOW_UP_ISSUE}#issuecomment-11"),
+            "is not a canonical comment URL on its target",
+        ),
+        (
+            _with_evidence(target=EFFECT_ISSUE, comment_url=f"{EFFECT_ISSUE}#issuecomment-11"),
+            "is the run's own issue",
+        ),
+        (
+            _with_evidence(
+                target="https://github.com/other/repo/issues/5",
+                comment_url="https://github.com/other/repo/issues/5#issuecomment-11",
+            ),
+            "is not an issue of repository 'owner/repo'",
+        ),
+        (_with_evidence(body_sha256=""), r"body_sha256 must be a 64-character"),
+        (_with_evidence(payload_sha256="0" * 63), r"payload_sha256 must be a 64-character"),
+    ],
+)
+def test_a_recorded_resolution_carries_well_formed_operator_evidence(tmp_path, entry, match):
+    """A REMOTE ``last_fix_resolutions`` entry carries the operator comments
+    verified for its finding, ``[]`` when none; every item names a canonical
+    comment on another issue of the run's repository, observed by its digests."""
+    d = make_state(phase=Phase.REVIEW, current_pr_url=PR42).to_dict()
+    d["last_fix_resolutions"] = [entry]
+    with pytest.raises(StateError, match=match):
+        load_state(_write(tmp_path / "state.json", d))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        (
+            "operator_comment_outcomes",
+            [_operator_outcome()],
+            "'operator_comment_outcomes' is set on a LOCAL run",
+        ),
+        (
+            "last_fix_resolutions",
+            [{"finding_id": "R1-F1", "resolution": "fixed", "operator_evidence": []}],
+            "carries 'operator_evidence' on a LOCAL run",
+        ),
+    ],
+)
+def test_a_local_run_carries_no_operator_state(tmp_path, field, value, match):
+    """LOCAL runs have no GitHub, so they have no operator actions: neither an
+    outcome nor a resolution's evidence list, even empty."""
+    d = _local_state().to_dict()
+    assert d["operator_comment_outcomes"] == []
+    d[field] = value
+    with pytest.raises(StateError, match=match):
+        load_state(_write(tmp_path / "state.json", d))
+
+
+def test_operator_outcomes_belong_to_the_issue_they_were_recorded_for():
+    state = _after_operator_fix()
+    state.reset_for_new_issue("https://github.com/owner/repo/issues/3")
+    assert state.operator_comment_outcomes == [] and state.last_fix_resolutions == []

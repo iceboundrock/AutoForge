@@ -738,8 +738,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   revision its marker binds, without launching the reviewer. `OPEN` with a
   persisted `FIX` plan (a fixer's result accepted and its writes planned,
   #163) -> `FIX`, which completes the plan from the journal without
-  launching the fixer, unless its acceptance action awaits the operator
-  (below). `OPEN` at the
+  launching the fixer, unless its acceptance action or operator actions
+  await the operator (below). `OPEN` at the
   reviewed HEAD and base with a
   clean review whose review certificate applies (ADR 0006 D12.3) ->
   `READY_FOR_MERGE` (the merge gate re-verifies from there); with a clean
@@ -803,6 +803,56 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   A flag on a run with no waiting action refuses, quoting the decision a
   plain unblock would make. After an approval the record is authorized, so
   a later block (a closed issue, say) is left with a plain unblock.
+- **Operator actions awaiting the operator** (#243, ADR 0004 K10). A
+  `FIX` plan's operator comments (first in the plan, at most four) ask the
+  operator to post a comment on another issue of the repository; the
+  controller never posts one and only verifies it. The prefix pass blocks
+  with every action not yet verified named, and nothing later in the plan
+  sent. Every decision re-reads the PR first: when it moved, a plain
+  unblock re-enters `FIX`, which records each action `verified` or `stale`
+  and routes the drift to `REVIEW`, sending nothing, and a flag refuses as
+  stale. Otherwise:
+  - **no flag** -> `FIX` only on progress, from a read-only reconcile: an
+    action now verifiable (its exact payload, or its bound comment
+    unchanged) or a recorded conflict that no longer reproduces on a
+    target whose listing was read; `FIX` saves each verified action and
+    completes the plan without launching the fixer. Without progress the
+    unblock refuses, naming each action: a reason, a checkbox or a comment
+    that is not the payload is never evidence. A target that is not found
+    or answers as another object holds its action (a conflict there is not
+    re-checked); any other conclusive failure to read a target or its
+    comments refuses, naming both, as it does for `--bind-evidence`.
+  - **`--bind-evidence X-… <comment URL>`** (repeatable) -> `FIX` when
+    every pair meets ADR 0004 D5.9's rules: the record is pending (not in
+    conflict), the comment is an issue comment of the run's repository
+    that GitHub places on the action's target and its complete listing
+    holds, it carries no controller marker but, at most, an earlier
+    round's operator marker for the same target (never another action of
+    the plan's), and no other action is bound to, observed on or, earlier
+    in the round, verified on it; the history entry's `action` is
+    `bound X-… <URL>`, and `resume` verifies the comment against the bound
+    digest. Every pending action's target is read first, named or not: one
+    that cannot be read conclusively refuses, naming the action and the
+    target. One comment verifies one action at verification too.
+  - **`--decline-action X-…`** (repeatable) -> `FIX` afresh: the plan is
+    dropped, the named actions are recorded `declined`, the plan's other
+    pending ones `withdrawn` and the verified ones `verified`, and the
+    fixer relaunches with the decline in its prompt. Refused while any
+    action is in conflict, while a target lists the key of an action not
+    yet saved as verified, a misplaced marker of the plan or a bound
+    comment now verifiable (run a plain unblock and `resume` first), when
+    a listing cannot be read, and past the round's shared
+    `MAX_DECLINES_PER_ROUND`. Every pending action's target is read first,
+    named or not: one that answers as another object (a transfer), is in
+    another repository or cannot be read conclusively refuses, naming the
+    action and the target; one that is not found holds no marker and may
+    be declined.
+  - **`--approve-action X-…`** is a usage error: there is nothing to
+    approve.
+
+  The flags exclude each other; an unknown or repeated id refuses. The
+  operator's steps are in
+  [BLOCKED on operator actions](../usage.md#blocked-on-operator-actions).
 - **Refusal.** A refusal leaves the state file byte-identical: the run stays
   `BLOCKED` with its reason, and only the run log records the attempt
   (`<run_id>/NNN-blocked-unblock-1/`, with the operator's reason, the block
@@ -816,7 +866,7 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   `current_merge_base_sha` is cleared for the next `REVIEW` entry to read;
   the review binding (`reviewed_*`) is never rewritten by this path. The action is
   appended to `unblock_history` (timestamp, reason, cleared block reason,
-  phase, detail, and `action` for an approval or a decline) and to the run log, `block_reason` is cleared and `attempt`
+  phase, detail, and `action` for an approval, a decline or a binding) and to the run log, `block_reason` is cleared and `attempt`
   reset. No agent runs and no step is charged: the operator reviews the
   outcome and runs `resume`, whose entry probe for that phase runs again.
 - **The validation override watermark** (ADR 0006 D14.2, #173). An applied

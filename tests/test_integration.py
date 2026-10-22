@@ -11,12 +11,20 @@ import dataclasses
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import autoforge.engine as engine_mod
-from autoforge.claims import render_implementation_marker, render_progress_marker
+from autoforge import cli
+from autoforge.claims import (
+    OPERATOR_COMMENT,
+    render_implementation_marker,
+    render_progress_marker,
+    scan,
+)
 from autoforge.config import default_config
+from autoforge.effects import EffectKind, EffectRecord, Stage
 from autoforge.errors import StateTransitionError
 from autoforge.state import load_state
 from autoforge.transitions import Phase, decide_next_phase
@@ -29,8 +37,10 @@ from tests.conftest import (
     assert_isolated_launch,
     assert_isolated_names,
     block,
+    connect_origin,
     controller_review_comment,
     fix_commit,
+    fixer,
     implement,
     launch_environment,
     make_engine,
@@ -629,7 +639,14 @@ def test_a_mixed_config_routes_each_profile_to_its_own_provider(
 
 EXPECTED_READ_CONTEXT = {
     "ANALYZE_EXECUTE": {"README.md", "issue.md"},
-    "REVIEW": {"README.md", "issue.md", "pull-request.md", "checks.md", "follow-up-issues.md"},
+    "REVIEW": {
+        "README.md",
+        "issue.md",
+        "pull-request.md",
+        "checks.md",
+        "follow-up-issues.md",
+        "operator-evidence.md",
+    },
     "FIX": {"README.md", "issue.md", "review-comment.md", "follow-up-issues.md"},
     "UPDATE_EPIC": {"README.md", "epic.md", "epic-issues.md"},
 }
@@ -741,3 +758,261 @@ def test_an_all_pi_run_gets_the_same_isolation_in_every_child(
             "git_terminal_prompt": "0",
             "git_identity": "Operator Name",
         }, entry
+
+
+# -- operator actions end to end: PR #242's reproduction (#243, section 12.1) -----------
+T16 = "https://github.com/owner/repo/issues/16"
+T158 = "https://github.com/owner/repo/issues/158"
+NOTES = {
+    T16: "Coordination note from #2: the scheduler contract is recorded in ADR 0008.",
+    T158: "Coordination note from #2: workers settle at their single-issue boundary.",
+}
+NOTES_FINDING = {
+    "id": "R1-F1",
+    "classification": "blocked",
+    "title": "coordination notes missing",
+    "location": "docs/adr/0008.md:1",
+    "required_resolution": "the acceptance criteria require coordination notes on #16 and #158",
+}
+
+
+def _notes_resolution(*targets: str) -> dict:
+    return {
+        "finding_id": "R1-F1",
+        "resolution": "operator_acceptance",
+        "rationale": "The acceptance criteria require coordination notes on #16 and #158, "
+        "which only the operator can post.",
+        "operator_acceptance": {
+            "actions": [
+                {
+                    "kind": "related_issue_comment",
+                    "issue": int(t.rsplit("/", 1)[1]),
+                    "body": NOTES[t],
+                }
+                for t in targets
+            ]
+        },
+    }
+
+
+def _notes_run(tmp_state_dir, reviews: list[str], fixes: list[dict] | None = None):
+    """A run to BLOCKED on two operator actions: (engine, GitHub, fixer prompts).
+
+    The issue body references #16 and #158, both closed; REVIEW round 1
+    raises R1-F1 [blocked]; the fixer commits nothing and asks the operator
+    for both notes. ``reviews`` collects each later round's operator
+    evidence; a later FIX launch takes the next of ``fixes``.
+    """
+    gh = FakeGitHub()
+    gh.issues[ISSUE].body = "Implement the feature; post coordination notes on #16 and #158."
+    gh.add_issue(T16, "Scheduler", state="CLOSED")
+    gh.add_issue(T158, "Worker", state="CLOSED")
+    fix_prompts: list[str] = []
+    queue = [_notes_resolution(T16, T158), *(fixes or [])]
+    run = SimpleNamespace(eng=None, agent=None)
+
+    def agent(req):
+        eng = run.eng
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        if req.phase == "REVIEW":
+            head = gh.prs[eng.state.current_pr_url].head_sha
+            if "Round 1" in req.prompt:
+                return block(review_result(1, head, [NOTES_FINDING]))
+            reviews.append((read_context_of(req.prompt) / "operator-evidence.md").read_text())
+            assert "is a claim, not evidence" in req.prompt
+            return block(review_result(2, head))
+        if req.phase == "FIX":
+            assert_isolated_launch(eng, req)
+            fix_prompts.append(req.prompt)
+            return fixer(queue.pop(0), commit=False)(req)
+        raise AssertionError(f"unexpected call {req.phase}")
+
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
+    run.eng, run.agent = eng, agent
+    eng._save()
+    for expected in ("ANALYZE_EXECUTE", "REVIEW", "FIX", "BLOCKED"):
+        out = eng.step()
+        assert out.next_phase == expected, out.message
+    return eng, gh, fix_prompts, run
+
+
+def _restarted(eng, tmp_state_dir, gh, run):
+    """A new controller process on the same state, git remote, GitHub and agent."""
+    eng.close()
+    again = make_engine(tmp_state_dir, run.agent, github=gh)
+    connect_origin(again, eng.origin)
+    again.origin = eng.origin
+    again.load()
+    run.eng = again
+    return again
+
+
+def _operator_records(eng) -> dict[str, EffectRecord]:
+    records = [EffectRecord.from_dict(r) for r in load_state(eng.paths.state_file).effect_records]
+    return {r.target["issue_url"]: r for r in records if r.kind is EffectKind.OPERATOR_COMMENT}
+
+
+def _marked(gh: FakeGitHub, target: str) -> list:
+    return [c for c in gh.comments.get(target, []) if scan(OPERATOR_COMMENT, c.body).claims]
+
+
+def _die_after_call(fn, n: int):
+    """``fn``, whose ``n``-th call completes and then the process dies (a power loss)."""
+    calls = {"n": 0}
+
+    def wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == n:
+            raise RuntimeError("power loss")
+        return result
+
+    return wrapper
+
+
+def test_operator_notes_on_related_issues_end_to_end(tmp_state_dir):
+    """PR #242's reproduction: two notes the fixer cannot post. The plan is
+    saved before BLOCKED and nothing is posted by the controller; assertions
+    (a ticked checkbox, a "done" comment, a reason with URLs) fulfil nothing;
+    each exact payload is verified as posted, partial completion survives a
+    restart, and REVIEW round 2 reads both as exact evidence. One fixer
+    launch in all, no K1, no merge."""
+    reviews: list[str] = []
+    eng, gh, fix_prompts, run = _notes_run(tmp_state_dir, reviews)
+    reviewed = gh.prs[eng.state.current_pr_url].head_sha
+    records = _operator_records(eng)
+    assert list(records) == [T16, T158]
+    assert [r.stage for r in records.values()] == [Stage.INTENDED, Stage.INTENDED]
+    assert all(r.action_id.startswith("X-") for r in records.values())
+    assert [w[0] for w in gh.effect_writes] == ["create_pull_request", "create_pr_comment"]
+    x16, x158 = records[T16].action_id, records[T158].action_id
+    listed = cli._operator_actions(load_state(eng.paths.state_file))
+    assert [(a["action_id"], a["state"]) for a in listed] == [(x16, "pending"), (x158, "pending")]
+
+    # Assertion is not evidence: nothing is read as fulfilment, nothing is written.
+    gh.prs[eng.state.current_pr_url].body += "\n- [x] coordination notes posted on #16 and #158"
+    gh.add_comment(ISSUE, 7001, f"done: {T16}#issuecomment-1 and {T158}#issuecomment-2")
+    raw = eng.paths.state_file.read_bytes()
+    out = eng.unblock(f"posted them: {T16}#issuecomment-1 {T158}#issuecomment-2")
+    assert not out.unblocked and out.phase == "BLOCKED", out.message
+    assert eng.paths.state_file.read_bytes() == raw and len(fix_prompts) == 1
+
+    # #16 first: verified exact, saved, and the run blocks on #158 alone.
+    gh.add_comment(T16, 9016, records[T16].body)
+    assert eng.unblock("posted #16's note").phase == "FIX"
+    assert eng.step().next_phase == "BLOCKED"
+    eng = _restarted(eng, tmp_state_dir, gh, run)
+    records = _operator_records(eng)
+    assert records[T16].stage is Stage.OBSERVED and records[T16].observed["evidence"] == "exact"
+    assert records[T158].stage is Stage.INTENDED
+    assert f"Verified so far: {x16}" in eng.state.block_reason
+
+    gh.add_comment(T158, 9158, records[T158].body)
+    assert eng.unblock("posted #158's note").phase == "FIX"
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert x16 in out.message and x158 in out.message
+    state = load_state(eng.paths.state_file)
+    assert state.review_round == 1 and state.current_head_sha == reviewed
+    assert [
+        (o["action_id"], o["outcome"], o["evidence"]) for o in state.operator_comment_outcomes
+    ] == [
+        (x16, "verified", "exact"),
+        (x158, "verified", "exact"),
+    ]
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    [evidence] = reviews
+    assert evidence.count("verified, exact") == 2 and NOTES[T16] in evidence
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.READY_FOR_MERGE and state.last_review_result == "clean"
+    assert len(fix_prompts) == 1 and gh.prs[eng.state.current_pr_url].head_sha == reviewed
+    assert [len(_marked(gh, t)) for t in (T16, T158)] == [1, 1]
+    writes = [w[0] for w in gh.effect_writes]
+    assert "create_issue_comment" not in writes and not any("merge" in w for w in writes)
+
+
+@pytest.mark.parametrize(
+    "die", ["after the first observation", "after the second observation", "before completion"]
+)
+def test_operator_notes_survive_a_restart_at_every_window(tmp_state_dir, die):
+    """Both payloads posted at once; the FIX step dies after each observation
+    save, or before the completion save. A new process completes FIX from the
+    journal: one marker comment per target, two verified outcomes, the fixer
+    launched once, the PR still at the reviewed HEAD."""
+    reviews: list[str] = []
+    eng, gh, fix_prompts, run = _notes_run(tmp_state_dir, reviews)
+    reviewed = gh.prs[eng.state.current_pr_url].head_sha
+    for target, record in _operator_records(eng).items():
+        gh.add_comment(target, 9000 + int(target.rsplit("/", 1)[1]), record.body)
+    assert eng.unblock("posted both notes").phase == "FIX"
+    if die == "before completion":
+        eng._record_operator_outcomes = _die_after_call(eng._record_operator_outcomes, 1)
+    else:
+        nth = 1 if die == "after the first observation" else 2
+        eng._persist_effect = _die_after_call(eng._persist_effect, nth)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    assert load_state(eng.paths.state_file).phase == Phase.FIX
+    eng = _restarted(eng, tmp_state_dir, gh, run)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    state = load_state(eng.paths.state_file)
+    outcomes = [(o["outcome"], o["evidence"]) for o in state.operator_comment_outcomes]
+    assert outcomes == [("verified", "exact"), ("verified", "exact")]
+    assert [len(_marked(gh, t)) for t in (T16, T158)] == [1, 1]
+    assert len(fix_prompts) == 1 and gh.prs[eng.state.current_pr_url].head_sha == reviewed
+    assert "create_issue_comment" not in [w[0] for w in gh.effect_writes]
+
+
+def test_operator_notes_bound_to_existing_comments(tmp_state_dir):
+    """Variant: unmarked notes already on #16 and #158 are bound in one
+    unblock; both are verified ``bound`` and REVIEW is told the controller
+    did not judge their adequacy."""
+    reviews: list[str] = []
+    eng, gh, fix_prompts, _ = _notes_run(tmp_state_dir, reviews)
+    records = _operator_records(eng)
+    c16 = gh.add_comment(T16, 5016, "Coordination note (2026-10-05): see ADR 0008.")
+    c158 = gh.add_comment(T158, 5158, "Coordination note (2026-10-05): workers settle.")
+    out = eng.unblock(
+        "the notes were posted earlier",
+        bind_evidence=[(records[T16].action_id, c16.url), (records[T158].action_id, c158.url)],
+    )
+    assert out.unblocked and out.phase == "FIX", out.message
+    assert eng.step().next_phase == "REVIEW"
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    [evidence] = reviews
+    assert evidence.count("operator-bound; adequacy not verified by the controller") == 2
+    state = load_state(eng.paths.state_file)
+    assert [o["evidence"] for o in state.operator_comment_outcomes] == ["bound", "bound"]
+    assert len(fix_prompts) == 1 and "create_issue_comment" not in str(gh.effect_writes)
+
+
+def test_operator_notes_withdrawn_after_one_is_verified(tmp_state_dir):
+    """Variant: #16 is verified, then #158's action is declined. #16 stays a
+    verified outcome, #158 is declined, and the fixer runs once more with
+    both listed in its prompt."""
+    reviews: list[str] = []
+    no_change = {
+        "finding_id": "R1-F1",
+        "resolution": "no_change_with_rationale",
+        "rationale": "The #16 note covers the contract; #158 needs no separate note, as "
+        "the operator decided when declining it.",
+    }
+    eng, gh, fix_prompts, _ = _notes_run(tmp_state_dir, reviews, fixes=[no_change])
+    records = _operator_records(eng)
+    gh.add_comment(T16, 9016, records[T16].body)
+    assert eng.unblock("posted #16's note").phase == "FIX"
+    assert eng.step().next_phase == "BLOCKED"
+    x16, x158 = records[T16].action_id, records[T158].action_id
+    out = eng.unblock("#158 needs no note", decline_action=[x158])
+    assert out.unblocked and out.phase == "FIX", out.message
+    state = load_state(eng.paths.state_file)
+    assert [(o["action_id"], o["outcome"]) for o in state.operator_comment_outcomes] == [
+        (x16, "verified"),
+        (x158, "declined"),
+    ]
+    assert eng.step().next_phase == "REVIEW"
+    assert len(fix_prompts) == 2
+    assert x16 in fix_prompts[1] and x158 in fix_prompts[1]
+    assert "#158 needs no note" in fix_prompts[1]

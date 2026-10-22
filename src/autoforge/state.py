@@ -43,10 +43,12 @@ from . import __prompt_version__, __protocol_version__, __version__
 from .config_fingerprint import RecordedConfiguration
 from .effects import (
     ACTION_ID_RE,
+    EVIDENCE_CLASSES,
     LABEL_AGENT_PUBLISHES,
     LABEL_NONE,
     LAUNCH_LABELS,
     MAX_CONFLICT_REASON_CHARS,
+    OPERATOR_ACTION_ID_RE,
     PUBLISHING_PHASES,
     Binding,
     EffectKind,
@@ -57,7 +59,7 @@ from .errors import ConfigurationError, StateError
 from .evidence import EvidenceFields, RecordView, check_evidence
 from .loop_guard import validate_review_history
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
-from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS
+from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS, MAX_OPERATOR_ACTIONS_PER_FIX
 from .run_contract import LocalRunContract
 from .runlog import validate_run_id
 from .safefs import HardLinksUnavailable, ReadLimitExceeded, SafeRoot, entry_kind
@@ -280,9 +282,15 @@ _PRE_ACCEPTANCE_PROTOCOL = "7"
 # relabelled.
 _PRE_CONFIG_PROTOCOL = "8"
 # The label before candidate validation evidence (#172, ADR 0006 D15.1). A
-# protocol-9 file is this protocol's shape without the six Wave 2B fields:
-# it is loaded in every phase with them empty (D15.4), and relabelled.
-_PREVIOUS_PROTOCOL = "9"
+# protocol-9 file is protocol 10's shape without the six Wave 2B fields: it
+# is loaded in every phase with them empty (D15.4), and relabelled.
+_PRE_VALIDATION_PROTOCOL = "9"
+# The label before operator acceptance actions (#243, ADR 0004 D13.10). A
+# protocol-10 file is this protocol's shape without the operator-action
+# state: it is loaded in every phase with ``operator_comment_outcomes: []``,
+# no ``operator_targets``, ``operator_sources: null`` and
+# ``operator_evidence: []``, and relabelled.
+_PREVIOUS_PROTOCOL = "10"
 # The fields protocol 7 added (#160): the effect records, the entry
 # observation and the completion context of the current phase entry, and the
 # launch label. A legacy file never carries one; one that does is a hand edit
@@ -309,6 +317,12 @@ _VALIDATION_FIELDS = (
     "producer_validation_failure",
     "validation_override_seq",
 )
+# The field protocol 11 added (#243): the outcomes of this PR's operator
+# actions. Protocol 11 also added the K10 effect kind, a FIX entry
+# observation's ``operator_targets``, a FIX context resolution's
+# ``operator_sources`` and a REMOTE ``last_fix_resolutions`` entry's
+# ``operator_evidence`` (:func:`_operator_state_in`).
+_OPERATOR_FIELDS = ("operator_comment_outcomes",)
 # ``acceptance_outcomes`` (#211): what became of each acceptance action of
 # the current PR. Bounded: at most one action is requested per FIX result,
 # and the writer drops the oldest entries past the bound
@@ -331,6 +345,41 @@ _ACCEPTANCE_OUTCOME_KEYS = (
     "comment_url",
     "reason",
 )
+# ``operator_comment_outcomes`` (#243): what became of each operator action
+# (K10) of the current PR. ``verified`` is an observed comment (``exact`` or
+# ``bound`` evidence), ``declined`` an action the operator declined,
+# ``withdrawn`` a pending action dropped with a decline (it may be requested
+# again), ``stale`` one the PR's revision left behind. Bounded like
+# ``acceptance_outcomes``, never dropping an entry of the round being fixed:
+# one round holds at most MAX_DECLINES_PER_ROUND decline cycles of at most
+# MAX_OPERATOR_ACTIONS_PER_FIX entries each, plus the round's completion or
+# drift, so the bound below that product (68) is what always fits one round.
+OPERATOR_COMMENT_OUTCOMES = ("verified", "declined", "withdrawn", "stale")
+MAX_OPERATOR_COMMENT_OUTCOMES = 80
+MIN_OPERATOR_COMMENT_OUTCOMES = (MAX_DECLINES_PER_ROUND + 1) * MAX_OPERATOR_ACTIONS_PER_FIX
+assert MAX_OPERATOR_COMMENT_OUTCOMES >= MIN_OPERATOR_COMMENT_OUTCOMES
+_OPERATOR_OUTCOME_KEYS = (
+    "action_id",
+    "round",
+    "finding_id",
+    "target",
+    "outcome",
+    "evidence",
+    "comment_url",
+    "body_sha256",
+    "payload_sha256",
+    "at",
+    "reason",
+)
+_OPERATOR_EVIDENCE_KEYS = (
+    "action_id",
+    "target",
+    "comment_url",
+    "evidence",
+    "body_sha256",
+    "payload_sha256",
+)
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
 # The phases in which the persisted clean review is consumed by the merge
 # gate, and so the phases a state without the review's full binding cannot
 # be loaded in.
@@ -461,7 +510,8 @@ class AutoForgeState:
     # Resolutions reported by the last FIX round (verified by the controller).
     # A REMOTE entry also carries ``acceptance_comment_url``: the comment
     # the controller verified for an ``acceptance_action`` resolution, else
-    # "" (#211).
+    # "" (#211); and ``operator_evidence``: the operator comments verified
+    # for the finding in this round (#243), ``[]`` when none.
     last_fix_resolutions: list[dict] = field(default_factory=list)
     # The outcomes of the current PR's acceptance actions (#211), oldest
     # first: ``action_id``, ``round``, ``finding_id``, ``outcome``
@@ -471,6 +521,15 @@ class AutoForgeState:
     # prompt and by the FIX result check (a declined action is not
     # requested again in its round). Per PR, REMOTE only.
     acceptance_outcomes: list[dict] = field(default_factory=list)
+    # The outcomes of the current PR's operator actions (K10, #243), oldest
+    # first: ``action_id``, ``round``, ``finding_id``, ``target`` (the issue
+    # the comment is for), ``outcome`` (verified | declined | withdrawn |
+    # stale), ``evidence`` (exact | bound for a verified one, else ""),
+    # ``comment_url`` and ``body_sha256`` (the verified comment, else ""),
+    # ``payload_sha256`` (the requested text's rendering), ``at`` and
+    # ``reason``. Read by ``status``, the FIX prompt and result check and
+    # REVIEW's ``operator-evidence.md``. Per PR, REMOTE only.
+    operator_comment_outcomes: list[dict] = field(default_factory=list)
     # One entry per completed review round of the current PR (see
     # loop_guard.review_record): round, reviewed_head_sha, result
     # (needs_fix | clean | stale), finding_count, fingerprint (digest of the
@@ -777,6 +836,15 @@ class AutoForgeState:
         #   fabricated, and what an empty field means is the gates' to
         #   decide. An older file that carries any of them, even empty, is
         #   refused, never merged.
+        # - 10 -> 11: operator acceptance actions (K10, #243): the operator
+        #   posts a comment on another issue and the controller verifies it.
+        #   ``operator_comment_outcomes``, a K10 effect record, a FIX entry
+        #   observation's ``operator_targets``, a FIX context resolution's
+        #   ``operator_sources`` and a REMOTE ``last_fix_resolutions``
+        #   entry's ``operator_evidence``. An older file has none of them and
+        #   is loaded in every phase with none (a FIX entry observed under
+        #   protocol 10 therefore offers no operator action). An older file
+        #   that carries any of them is refused, never merged.
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
@@ -812,6 +880,7 @@ class AutoForgeState:
             _refuse_acceptance_state(data, str(raw_protocol))
             _refuse_config_fingerprint(data, str(raw_protocol))
             _refuse_validation_fields(data, str(raw_protocol))
+            _refuse_operator_state(data, str(raw_protocol))
         elif raw_protocol == _PRE_ACCEPTANCE_PROTOCOL:
             # 7 -> 8 (#211): the same shape without the acceptance-action
             # state. Every protocol-7 save wrote the effect fields, exactly
@@ -821,13 +890,15 @@ class AutoForgeState:
             _refuse_acceptance_state(data, raw_protocol)
             _refuse_config_fingerprint(data, raw_protocol)
             _refuse_validation_fields(data, raw_protocol)
+            _refuse_operator_state(data, raw_protocol)
         elif raw_protocol == _PRE_CONFIG_PROTOCOL:
             # 8 -> 9 (#219): the same shape without the recorded
             # configuration, which it never wrote and which is refused.
             _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
             _refuse_config_fingerprint(data, raw_protocol)
             _refuse_validation_fields(data, raw_protocol)
-        elif raw_protocol == _PREVIOUS_PROTOCOL:
+            _refuse_operator_state(data, raw_protocol)
+        elif raw_protocol == _PRE_VALIDATION_PROTOCOL:
             # 9 -> 10 (#172): the same shape without the validation
             # evidence, which it never wrote and which is refused.
             _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
@@ -839,6 +910,26 @@ class AutoForgeState:
                 "not a run with none recorded",
             )
             _refuse_validation_fields(data, raw_protocol)
+            _refuse_operator_state(data, raw_protocol)
+        elif raw_protocol == _PREVIOUS_PROTOCOL:
+            # 10 -> 11 (#243): the same shape without the operator-action
+            # state, which it never wrote and which is refused.
+            _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
+            _require_fields(
+                data,
+                raw_protocol,
+                _CONFIG_FIELDS,
+                "recorded configuration",
+                "not a run with none recorded",
+            )
+            _require_fields(
+                data,
+                raw_protocol,
+                _VALIDATION_FIELDS,
+                "validation evidence",
+                "not a run with no evidence",
+            )
+            _refuse_operator_state(data, raw_protocol)
         elif raw_protocol != __protocol_version__:
             raise StateError(
                 f"unsupported protocol_version {raw_protocol!r} "
@@ -874,6 +965,17 @@ class AutoForgeState:
                 "validation evidence",
                 "not a run with no evidence",
             )
+            # Every protocol-11 save writes it, ``[]`` included, so an
+            # absent one is a truncation or a hand edit: read as the empty
+            # default it would drop a declined action of the round and let
+            # the same request through again.
+            _require_fields(
+                data,
+                raw_protocol,
+                _OPERATOR_FIELDS,
+                "operator-action outcomes",
+                "not a PR with none",
+            )
         # A LOCAL state written before the run contract existed has no
         # persisted definition of what it reviewed under. It is not migrated:
         # the only source a migration could fill the contract from is the
@@ -894,12 +996,17 @@ class AutoForgeState:
         kwargs["protocol_version"] = __protocol_version__
         if raw_protocol not in (
             _PRE_CONFIG_PROTOCOL,
+            _PRE_VALIDATION_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ) and (mode == WorkflowMode.REMOTE):
             # Before protocol 8 only: a protocol-8 file carries its own
             # acceptance state, which the migration would overwrite.
             kwargs.update(_acceptance_migration(data))
+        if raw_protocol != __protocol_version__ and mode == WorkflowMode.REMOTE:
+            # Before protocol 11 (#243): over the acceptance migration, so a
+            # pre-8 file gains both.
+            kwargs.update(_operator_migration(kwargs))
         if legacy and mode == WorkflowMode.REMOTE:
             attempt = data.get("attempt", 0)
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1:
@@ -1030,6 +1137,7 @@ class AutoForgeState:
         _validate_unblock_history(state.unblock_history)
         # After the shapes it reads (last_fix_resolutions, unblock_history).
         _validate_acceptance_state(state)
+        _validate_operator_state(state)
         _validate_config_fingerprint(state)
         for name in _MINIMUM_ONE_FIELDS:
             if getattr(state, name) < 1:
@@ -1162,6 +1270,37 @@ class AutoForgeState:
             kept.append(outcome)
         self.acceptance_outcomes = kept
 
+    def round_declines(self) -> int:
+        """Declines of the round being fixed, K9's and K10's together (#243).
+
+        The one bound on decline-driven relaunches
+        (:data:`MAX_DECLINES_PER_ROUND`) is shared by both kinds; a
+        withdrawal is not a decline and is not counted.
+        """
+        return sum(
+            1
+            for outcomes in (self.acceptance_outcomes, self.operator_comment_outcomes)
+            for o in outcomes
+            if o["outcome"] == "declined" and o["round"] == self.review_round
+        )
+
+    def bound_operator_comment_outcomes(self) -> None:
+        """Drop the oldest ``operator_comment_outcomes`` past the bound, never this round's.
+
+        An entry of the round being fixed is what refuses a declined
+        request again, and what tells the fixer and REVIEW what was
+        verified, so it is kept (#243). One round fits the bound
+        (:data:`MIN_OPERATOR_COMMENT_OUTCOMES`), so the bound always holds.
+        """
+        excess = len(self.operator_comment_outcomes) - MAX_OPERATOR_COMMENT_OUTCOMES
+        kept: list[dict] = []
+        for outcome in self.operator_comment_outcomes:
+            if excess > 0 and outcome["round"] != self.review_round:
+                excess -= 1
+                continue
+            kept.append(outcome)
+        self.operator_comment_outcomes = kept
+
     def drop_phase_effects(self) -> None:
         """Forget the current entry's effect state: the save that commits the phase (D2.4)."""
         self.effect_records = []
@@ -1250,6 +1389,7 @@ class AutoForgeState:
         self.prior_findings = []
         self.last_fix_resolutions = []
         self.acceptance_outcomes = []
+        self.operator_comment_outcomes = []
         self.review_history = []
         self.verification_failures = []
         self.premerge_verified_head_sha = ""
@@ -1374,6 +1514,76 @@ def _refuse_acceptance_state(data: dict, protocol: str) -> None:
             "acceptance-action state -- it is a hand edit or a foreign file, not an older "
             "controller's state"
         )
+
+
+def _operator_state_in(data: dict) -> list[str]:
+    """What of protocol 11's operator-action state (#243) ``data`` carries, named.
+
+    The label decides, not the value: ``operator_comment_outcomes`` is
+    protocol 11's own field, so an older file that carries it at all, even
+    empty, was not written by the controller its label names.
+    """
+    found: list[str] = []
+    if "operator_comment_outcomes" in data:
+        found.append("'operator_comment_outcomes'")
+    records = data.get("effect_records")
+    if isinstance(records, list) and any(
+        isinstance(r, dict) and r.get("kind") == EffectKind.OPERATOR_COMMENT.value for r in records
+    ):
+        found.append("an 'operator_comment' effect record")
+    observation = data.get("entry_observation")
+    if isinstance(observation, dict) and "operator_targets" in observation:
+        found.append("'operator_targets' in 'entry_observation'")
+    context = data.get("completion_context")
+    resolutions = context.get("resolutions") if isinstance(context, dict) else None
+    if isinstance(resolutions, list) and any(
+        isinstance(r, dict) and "operator_sources" in r for r in resolutions
+    ):
+        found.append("'operator_sources' in 'completion_context'")
+    last = data.get("last_fix_resolutions")
+    if isinstance(last, list) and any(
+        isinstance(r, dict) and "operator_evidence" in r for r in last
+    ):
+        found.append("'operator_evidence' in 'last_fix_resolutions'")
+    return found
+
+
+def _refuse_operator_state(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 11 never wrote operator-action state (#243)."""
+    planted = _operator_state_in(data)
+    if planted:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            f"{', '.join(planted)}; refusing to load a file that carries protocol-11 "
+            "operator-action state -- it is a hand edit or a foreign file, not an older "
+            "controller's state"
+        )
+
+
+def _operator_migration(data: dict) -> dict:
+    """The fields of an older REMOTE file as protocol 11 writes them (#243).
+
+    A FIX context resolution gains ``operator_sources: null`` and a
+    ``last_fix_resolutions`` entry ``operator_evidence: []``: an older
+    controller never recorded an operator action. Malformed values are
+    passed through for validation to refuse.
+    """
+    out: dict = {"operator_comment_outcomes": []}
+    last = data.get("last_fix_resolutions")
+    if isinstance(last, list):
+        out["last_fix_resolutions"] = [
+            {**r, "operator_evidence": []} if isinstance(r, dict) else r for r in last
+        ]
+    context = data.get("completion_context")
+    if isinstance(context, dict) and isinstance(context.get("resolutions"), list):
+        out["completion_context"] = {
+            **context,
+            "resolutions": [
+                {**r, "operator_sources": None} if isinstance(r, dict) else r
+                for r in context["resolutions"]
+            ],
+        }
+    return out
 
 
 def _acceptance_migration(data: dict) -> dict:
@@ -1506,6 +1716,166 @@ def _validate_acceptance_state(state: AutoForgeState) -> None:
             what,
             entry.get("resolution") == "acceptance_action",
         )
+
+
+def _operator_target_field(state: AutoForgeState, value: object, what: str) -> str:
+    """``value`` is the canonical URL of another issue of the run's repository (#243)."""
+    if not isinstance(value, str):
+        raise StateError(f"{what} must be an issue URL string")
+    try:
+        target = parse_issue_url(value)
+    except ConfigurationError as exc:
+        raise StateError(f"{what}: {exc}") from None
+    if target.canonical != value:
+        raise StateError(f"{what} must be stored in its canonical form")
+    if state.repository and not target.same_repository(state.repository):
+        raise StateError(f"{what} is not an issue of repository {state.repository!r}")
+    try:
+        own = parse_issue_url(state.current_issue_url) if state.current_issue_url else None
+    except ConfigurationError as exc:
+        raise StateError(f"{what}: the run's issue URL is malformed ({exc})") from None
+    if own is not None and target.same_target(own):
+        raise StateError(f"{what} is the run's own issue, which an operator action never targets")
+    return value
+
+
+def _operator_comment_field(value: object, target: str, what: str, required: bool) -> None:
+    """``value`` is a comment URL on ``target`` when ``required``, else ""."""
+    if not isinstance(value, str):
+        raise StateError(f"{what} must be a string")
+    if not required:
+        if value:
+            raise StateError(f"{what} must be empty: no operator comment was verified")
+        return
+    try:
+        comment = parse_comment_url(value)
+    except ConfigurationError as exc:
+        raise StateError(f"{what}: {exc}") from None
+    if comment.canonical != value or not comment.on(parse_issue_url(target)):
+        raise StateError(f"{what} is not a canonical comment URL on its target {target}")
+
+
+def _digest_field(value: object, what: str, required: bool) -> None:
+    if not isinstance(value, str) or not (
+        _HEX64_RE.fullmatch(value) if required else value in ("",)
+    ):
+        raise StateError(
+            f"{what} must be a 64-character lowercase SHA-256 hex digest"
+            if required
+            else f"{what} must be empty"
+        )
+
+
+def _validate_operator_evidence(state: AutoForgeState, value: object, what: str) -> None:
+    """One ``last_fix_resolutions`` entry's ``operator_evidence`` (#243)."""
+    if not isinstance(value, list) or len(value) > MAX_OPERATOR_COMMENT_OUTCOMES:
+        raise StateError(
+            f"{what} must be a list of at most {MAX_OPERATOR_COMMENT_OUTCOMES} objects"
+        )
+    for j, item in enumerate(value):
+        where = f"{what}[{j}]"
+        if not isinstance(item, dict) or sorted(item) != sorted(_OPERATOR_EVIDENCE_KEYS):
+            raise StateError(f"{where} must hold exactly {', '.join(_OPERATOR_EVIDENCE_KEYS)}")
+        action_id = item["action_id"]
+        if not isinstance(action_id, str) or not OPERATOR_ACTION_ID_RE.match(action_id):
+            raise StateError(f"{where}.action_id must be an action id of the form X-<16 hex>")
+        target = _operator_target_field(state, item["target"], f"{where}.target")
+        _operator_comment_field(item["comment_url"], target, f"{where}.comment_url", True)
+        if item["evidence"] not in EVIDENCE_CLASSES:
+            raise StateError(f"{where}.evidence must be one of {EVIDENCE_CLASSES}")
+        _digest_field(item["body_sha256"], f"{where}.body_sha256", True)
+        _digest_field(item["payload_sha256"], f"{where}.payload_sha256", True)
+
+
+def _validate_operator_state(state: AutoForgeState) -> None:
+    """``operator_comment_outcomes`` and ``operator_evidence`` (#243), strictly.
+
+    A LOCAL run has no GitHub and no operator actions, so it carries
+    neither. A REMOTE ``last_fix_resolutions`` entry carries the operator
+    comments verified for its finding, ``[]`` when none. A ``verified``
+    outcome is unique per (action id, comment), and the round's declines,
+    K9's and K10's together, stay within :data:`MAX_DECLINES_PER_ROUND`.
+    """
+    outcomes = state.operator_comment_outcomes
+    if not isinstance(outcomes, list) or not all(isinstance(o, dict) for o in outcomes):
+        raise StateError("state field 'operator_comment_outcomes' must be a list of objects")
+    if state.mode == WorkflowMode.LOCAL:
+        if outcomes:
+            raise StateError(
+                "state field 'operator_comment_outcomes' is set on a LOCAL run, which has no "
+                "operator actions; refusing to load"
+            )
+        if any("operator_evidence" in r for r in state.last_fix_resolutions):
+            raise StateError(
+                "state field 'last_fix_resolutions' carries 'operator_evidence' on a LOCAL run, "
+                "which has no operator actions; refusing to load"
+            )
+        return
+    if len(outcomes) > MAX_OPERATOR_COMMENT_OUTCOMES:
+        raise StateError(
+            f"state field 'operator_comment_outcomes' holds {len(outcomes)} entries, over "
+            f"{MAX_OPERATOR_COMMENT_OUTCOMES}"
+        )
+    verified: set[tuple[str, int]] = set()
+    for i, entry in enumerate(outcomes):
+        what = f"state field 'operator_comment_outcomes'[{i}]"
+        if sorted(entry) != sorted(_OPERATOR_OUTCOME_KEYS):
+            raise StateError(f"{what} must hold exactly {', '.join(_OPERATOR_OUTCOME_KEYS)}")
+        action_id = entry["action_id"]
+        if not isinstance(action_id, str) or not OPERATOR_ACTION_ID_RE.match(action_id):
+            raise StateError(f"{what}.action_id must be an action id of the form X-<16 hex>")
+        round_ = entry["round"]
+        if not isinstance(round_, int) or isinstance(round_, bool) or round_ < 1:
+            raise StateError(f"{what}.round must be an integer >= 1")
+        fid = entry["finding_id"]
+        match = (
+            FINDING_ID_RE.match(fid)
+            if isinstance(fid, str) and len(fid) <= MAX_FINDING_ID_CHARS
+            else None
+        )
+        if match is None or int(match.group("round")) != round_:
+            raise StateError(f"{what}.finding_id must be a finding id of its round")
+        target = _operator_target_field(state, entry["target"], f"{what}.target")
+        outcome = entry["outcome"]
+        if outcome not in OPERATOR_COMMENT_OUTCOMES:
+            raise StateError(f"{what}.outcome must be one of {OPERATOR_COMMENT_OUTCOMES}")
+        is_verified = outcome == "verified"
+        if is_verified:
+            if entry["evidence"] not in EVIDENCE_CLASSES:
+                raise StateError(f"{what}.evidence must be one of {EVIDENCE_CLASSES}")
+        elif entry["evidence"] != "":
+            raise StateError(f"{what}.evidence must be empty for a {outcome} action")
+        _operator_comment_field(entry["comment_url"], target, f"{what}.comment_url", is_verified)
+        _digest_field(entry["body_sha256"], f"{what}.body_sha256", is_verified)
+        _digest_field(entry["payload_sha256"], f"{what}.payload_sha256", True)
+        if not isinstance(entry["at"], str) or not entry["at"]:
+            raise StateError(f"{what}.at must be a non-empty timestamp")
+        reason = entry["reason"]
+        if not isinstance(reason, str) or len(reason) > MAX_CONFLICT_REASON_CHARS:
+            raise StateError(
+                f"{what}.reason must be a string of at most {MAX_CONFLICT_REASON_CHARS} characters"
+            )
+        if is_verified:
+            key = (action_id, parse_comment_url(entry["comment_url"]).comment_id)
+            if key in verified:
+                raise StateError(f"{what} verifies action {action_id} on one comment twice")
+            verified.add(key)
+    declines: dict[int, int] = {}
+    for entry in (*state.acceptance_outcomes, *outcomes):
+        if entry["outcome"] == "declined":
+            declines[entry["round"]] = declines.get(entry["round"], 0) + 1
+    for round_, count in declines.items():
+        if count > MAX_DECLINES_PER_ROUND:
+            raise StateError(
+                f"state fields 'acceptance_outcomes' and 'operator_comment_outcomes' hold "
+                f"{count} declines of review round {round_}, over {MAX_DECLINES_PER_ROUND}, the "
+                "most one round records"
+            )
+    for i, entry in enumerate(state.last_fix_resolutions):
+        what = f"state field 'last_fix_resolutions'[{i}].operator_evidence"
+        if "operator_evidence" not in entry:
+            raise StateError(f"{what} is missing")
+        _validate_operator_evidence(state, entry["operator_evidence"], what)
 
 
 def _comment_url_field(state: AutoForgeState, value: object, what: str, required: bool) -> None:
