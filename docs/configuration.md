@@ -9,15 +9,22 @@ sections. It does not repeat every option.
 ## Creating and passing a config file
 
 ```bash
-cp autoforge.example.yaml autoforge.yaml     # git-ignored: local to one checkout
+cp autoforge.example.yaml autoforge.yaml     # local to one checkout: keep it out of git
 uv run autoforge --config autoforge.yaml doctor
 uv run autoforge --config autoforge.yaml run --epic <EPIC URL> --issue <issue URL>
 ```
 
 `--config` and `--state-dir` are options of the `autoforge` command itself,
 so they go before the subcommand. Without `--config` the controller uses its
-built-in defaults. `autoforge.yaml` and `autoforge.local.*` files are
-git-ignored; do not commit a config that names credentials or local paths.
+built-in defaults. AutoForge's own repository git-ignores `autoforge.yaml`
+and `autoforge.local.*`; the repository you run AutoForge on does not, so
+add them, and the state directory `.autoforge/`, to its `.gitignore` or to
+`.git/info/exclude`
+([Security boundaries](security.md#keep-autoforges-files-out-of-git)).
+Do not commit a config that names credentials or local paths. In LOCAL
+mode under the outer sandbox, keep the file outside the repository root:
+the root is writable to every enforced launch, and the next command reads
+the file again ([Security boundaries](security.md#the-outer-sandbox-is-opt-in-and-linux-only)).
 
 Edit the file to change model identifiers, effort, agent limits and provider
 options without touching controller source. Provider-specific flags are
@@ -628,6 +635,10 @@ included):
 | `NETRC` | where curl (8.16 and later), Python's `requests` and Go find the `.netrc` they take a password from |
 | `BASH_ENV`, `ENV`, `ZDOTDIR` | where a shell finds a startup file it runs before a command, which can export a credential |
 
+The rule goes by name: a token you forward under a name of your own
+(`MY_GITHUB_PAT`, say) is not recognised, and reaches every launch if you
+list it or a prefix that covers it.
+
 Earlier versions forwarded `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, `GIT_SSH`,
 `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GH_TOKEN`, `GITHUB_TOKEN`,
 `GH_HOST` and `GH_CONFIG_DIR` by default. A config that copied the old
@@ -976,10 +987,10 @@ worktrees and, from a REMOTE agent, your checkout.
   A provider CLI that is a script whose absolute `#!` line reaches its
   interpreter, or `env`, through links (Homebrew's `opt/` into `Cellar/`)
   is launched as written: each link on the way is recreated inside, and
-  nothing beside it is visible.
-  Operator-declared read-only paths are #169's (D15.4) and not available
-  yet, so under `required` a validation or pre-merge command must find
-  what it runs under `/usr` or in the workspace.
+  nothing beside it is visible. Declare such a tool's directory in
+  `sandbox.read_only_paths` (above) to make it visible read-only; without
+  one, a validation or pre-merge command must find what it runs under
+  `/usr` or in the workspace.
 - **Environment.** A path-valued variable AutoForge knows (the CA-bundle
   names, the per-launch configuration it sets, the provider's own) is unset
   when what it names is not visible inside, and `PATH` keeps only its

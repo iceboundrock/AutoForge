@@ -890,11 +890,14 @@ the step rather than running it without the sandbox
 The agent holds no GitHub or git credential (#165). The controller pushes,
 opens the PR, posts the review comment, creates follow-up issues and
 updates the EPIC itself; the agent writes the text and commits locally. No
-credential variable can be allow-listed, and each launch gets an empty `gh`
-configuration, a placeholder `GH_TOKEN`, a git configuration holding only
-your author identity, and git settings no repository configuration can
-override that disable credential helpers, askpass and the SSH agent and
-keys ([Configuration: agent environment](configuration.md#agent-environment)).
+variable `gh` or git reads a credential from can be allow-listed (a token
+you forward under a name of your own, `MY_GITHUB_PAT` say, is not
+recognised and reaches every launch: do not list one), and each launch
+gets an empty `gh` configuration, a placeholder `GH_TOKEN`, a git
+configuration holding only your author identity, and git settings no
+repository configuration can override that disable credential helpers,
+askpass and the SSH agent and keys
+([Configuration: agent environment](configuration.md#agent-environment)).
 What the agent needs from GitHub (the issue, the PR and its checks, the
 review comment it acts on, the EPIC) the controller reads first and writes,
 redacted and bounded, into `<state dir>/read-context/<run-id>/`; the prompt
@@ -1061,7 +1064,7 @@ ownership or discard uncommitted user changes.
   login shell that change a variable such as `GH_TOKEN`). Nothing was recorded:
   remove the setting (`autoforge doctor` lists it too) and run the same
   command again. A config that fails to load because `env_allowlist` names
-  a credential variable: delete that entry
+  a variable `gh` or git reads a credential from: delete that entry
   ([Configuration: agent environment](configuration.md#agent-environment)).
 - **"refusing to launch opencode: it would load the configuration of an
   organization connected to it":** OpenCode would load an organization's
