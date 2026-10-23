@@ -16,8 +16,15 @@ so.
   `sandbox.mode: disabled`; prompt injection on public repositories; the
   opt-in, Linux-only sandbox; the redaction baseline and the credential
   shapes it misses; what goes to model vendors; pushed code running in
-  your CI), the GitHub token permissions it needs, the runtime files to
-  keep out of git, and recommended settings. No behaviour changes.
+  your CI), the open security issues the audit found, each with its issue
+  and a mitigation until it is fixed, the GitHub token permissions it
+  needs, the runtime files to keep out of git, and recommended settings.
+  No behaviour changes.
+- The token permissions record what real fine-grained tokens did on
+  disposable repositories. On a private repository whose pull requests
+  have checks a fine-grained token cannot be used: GitHub refuses it the
+  check runs, the pull request read fails and a run stops at `REVIEW`
+  (#291). Use `gh auth login` or a classic token with `repo` there.
 - The documentation no longer says that no credential variable can be
   allow-listed: the names `gh` and git read a credential from are refused,
   but a token under a name of your own is not recognised and reaches every

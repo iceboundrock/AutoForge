@@ -1,8 +1,9 @@
 # Security boundaries
 
 This page is for operators. It says what AutoForge protects, what it does
-not, which GitHub token permissions it needs, which of its files to keep out
-of git, and how to try it on a repository you care about. Each section
+not, which security issues are open, which GitHub token permissions it
+needs, which of its files to keep out of git, and how to try it on a
+repository you care about. Each section
 names the document that holds the precise statement; this page is the
 summary, and where they differ the linked document wins. To report a
 vulnerability, see [`SECURITY.md`](../SECURITY.md).
@@ -251,6 +252,38 @@ repository's default `GITHUB_TOKEN` permissions to read-only.
   keychain is a same-user resource (a launch's placeholder `GH_TOKEN` keeps
   `gh` from asking it).
 
+## Open security issues
+
+The security audit of
+[#257](https://github.com/iceboundrock/AutoForge/issues/257), at commit
+`388ecb3`, found these issues in what `main` does today. Each has its own
+issue; the severities are the maintainer's
+([findings](https://github.com/iceboundrock/AutoForge/issues/257#issuecomment-6347159802),
+[#289 and #291](https://github.com/iceboundrock/AutoForge/issues/257#issuecomment-6370644928)).
+The Critical and High ones block the Public Alpha release until they are
+fixed ([#255](https://github.com/iceboundrock/AutoForge/issues/255)); until
+then, apply the mitigation in the last column.
+
+| Issue | Severity | What happens today | Until it is fixed |
+|---|---|---|---|
+| [#280](https://github.com/iceboundrock/AutoForge/issues/280) | Critical | In LOCAL mode under `sandbox.mode: required` or `preferred`, an enforced launch can rewrite a `--config` file inside the repository root, and the next command runs on what it says, `sandbox.mode`, `github.command` and the profiles' commands included | Keep the `--config` file outside the repository root ([why](#the-outer-sandbox-is-opt-in-and-linux-only)) |
+| [#281](https://github.com/iceboundrock/AutoForge/issues/281) | High | A recognised token right after a line break, a tab or a character JSON escapes as `\u...` in a step's result is printed unredacted on the terminal and in a scheduler worker's log | Treat that output and the worker logs as sensitive, and do not share them |
+| [#282](https://github.com/iceboundrock/AutoForge/issues/282) | High | Google API keys (`AIza...`) are neither redacted nor refused in published text, and OpenCode launches receive `GEMINI_*` and `GOOGLE_*` | Keep such variables out of the shell you run AutoForge from unless a profile needs them ([why](#redaction-is-a-baseline)) |
+| [#283](https://github.com/iceboundrock/AutoForge/issues/283) | High | `merge.delete_branch: true` passes `--delete-branch` to `gh pr merge`, which, per `gh`, deletes the local branch of that name too, running git in the checkout you started AutoForge from; under `disabled`, a git hook an agent planted there runs with the controller's credential within reach | Keep `merge.delete_branch: false`, the default |
+| [#284](https://github.com/iceboundrock/AutoForge/issues/284) | High | A recognised token directly after an ANSI escape sequence is not redacted, and OpenCode's saved `stderr.log` carries such sequences | Treat run logs as sensitive: never commit or share them ([how](#keep-autoforges-files-out-of-git)) |
+| [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | Other credential shapes are not recognised: AWS access keys, private-key blocks, `gsk_`, `xai-`, `npm_`, `glpat-`, `hf_`, and a key of no known shape under a prefixed name such as `GEMINI_API_KEY` | As for #282 |
+| [#286](https://github.com/iceboundrock/AutoForge/issues/286) | Medium | One allow-list serves every launch, and it refuses only the names `gh` and git read a credential from ([why](#other-limits)) | List no variable you would not give to the agents and to the code under review alike |
+| [#287](https://github.com/iceboundrock/AutoForge/issues/287) | Medium | In a sequential EPIC run, `UPDATE_EPIC` may pick any open issue of the repository next, on a public repository possibly one a stranger opened | Prefer `autoforge epic run`, which admits only the EPIC's sub-issues |
+| [#289](https://github.com/iceboundrock/AutoForge/issues/289) | Medium | With `safety.verify_check_definition: false` or an empty `safety.required_checks`, an empty check rollup passes the merge gate unless the branch requires a check; `doctor` reports a GitHub Free plan restriction as a token that cannot read the branch rules | Keep both settings at their defaults, or keep the merge gate closed ([why](#check-runs-on-a-private-repository)) |
+| [#291](https://github.com/iceboundrock/AutoForge/issues/291) | Medium | With a fine-grained token on a private repository whose pull requests have checks, REVIEW and FIX stop with an error instead of blocking with a reason, and `doctor` does not detect it | Use `gh auth login` or a classic token with `repo` there ([why](#check-runs-on-a-private-repository)) |
+
+Also disclosed: pushed code runs in your CI before any review
+([above](#pushed-code-runs-in-your-ci)); AutoForge's own CI pins its GitHub
+Actions by tag, not by commit SHA
+([#288](https://github.com/iceboundrock/AutoForge/issues/288)); and the
+`autoforge` distribution on PyPI is an unrelated project
+([#256](https://github.com/iceboundrock/AutoForge/issues/256)).
+
 ## GitHub token permissions
 
 AutoForge uses the `gh` login of the user who runs it (or the `GH_TOKEN`
@@ -260,23 +293,152 @@ it. Every call AutoForge makes is about the run's repository: none reads
 the user, an organization, a team or a project. The one exception is a
 "blocked by" link of an EPIC's issue to an issue in another repository,
 which `autoforge epic` reads; a token that cannot read it keeps that issue
-blocked. So a fine-grained personal access token restricted to the one
-repository is expected to be enough.
+blocked. A fine-grained personal access token restricted to the one
+repository covers every permission in the table below, but not on a
+private repository whose pull requests have checks: there GitHub refuses
+it the pull requests' check runs, the `gh pr view` AutoForge reads a pull
+request with fails, and a run stops at REVIEW (see
+[Check runs on a private repository](#check-runs-on-a-private-repository)).
+Use `gh auth login` or a classic token there.
 
-The table is derived from every `gh` call and git push in the code;
-whether a real fine-grained token with exactly these permissions runs a
-whole cycle on a scratch repository is still to be verified.
+The table is derived from every `gh` call and git push in the code. The
+last column says what real fine-grained tokens did on disposable
+repositories ([evidence on #257](https://github.com/iceboundrock/AutoForge/issues/257#issuecomment-6357194136),
+[private check runs](https://github.com/iceboundrock/AutoForge/issues/257#issuecomment-6369613898)).
+"Private" results come from a private repository with the merge gate
+closed. "Public" results come from a public repository, where every read
+succeeds without any permission, so only the writes and denials there say
+something about the token.
 
-| Fine-grained repository permission | Merge gate closed (default) | Merge gate open | What needs it |
-|---|---|---|---|
-| Metadata | Read | Read | every fine-grained token; the repository and its default branch |
-| Contents | Read and write | Read and write | fetching; pushing the issue's branch (fast-forward only, never the default branch); comparing branches; the merge |
-| Pull requests | Read and write | Read and write | opening or adopting the PR, the review comment, closing and reopening a replanned PR, the merge |
-| Issues | Read and write | Read and write | reading issues, comments and the EPIC's sub-issues and dependencies, including the comments you post on other issues for a fix, which the controller only reads; follow-up issues; the acceptance comment on the run's issue; the EPIC progress comment and roadmap (only after a merge) |
-| Checks, Commit statuses | Read | Read | the check results of the PR's head |
-| Actions | not needed | Read | the merge gate's check that a required check ran the base branch's workflow |
-| Workflows | not recommended | not recommended | pushing commits that change `.github/workflows/`; without it GitHub refuses such a push and the run blocks |
-| Administration | not needed | optional, Read | only `doctor`'s classic branch-protection row, which is skipped without it |
+| Fine-grained repository permission | Merge gate closed (default) | Merge gate open | What needs it | Real-token result |
+|---|---|---|---|---|
+| Metadata | Read | Read | every fine-grained token; the repository and its default branch | private: works |
+| Contents | Read and write | Read and write | fetching; pushing the issue's branch (fast-forward only, never the default branch); comparing branches; the merge | private: fetch, push, compare work; the merge worked on a public repository only |
+| Pull requests | Read and write | Read and write | opening or adopting the PR, the review comment, closing and reopening a replanned PR, the merge | private: works on a pull request without check runs, except the merge, which was not tried there; on one with a check run, reading it fails (see *(Checks)*); public: squash merge through a ruleset requiring a pull request and `ci` worked |
+| Issues | Read and write | Read and write | reading issues, comments and the EPIC's sub-issues and dependencies, including the comments you post on other issues for a fix, which the controller only reads; follow-up issues; the acceptance comment on the run's issue; the EPIC progress comment and roadmap (only after a merge) | private: works |
+| Commit statuses | Read | Read | legacy commit statuses in the check results of the PR's head | private: the combined status read works |
+| *(Checks)* | *not offered* | *not offered* | the check runs in the check results of the PR's head, which AutoForge's read of a pull request always requests | fine-grained tokens have no Checks permission; private: refused, both the REST check-runs read (HTTP 403) and the check run in a pull request's `statusCheckRollup`, which fails the whole `gh pr view`; public: works without any permission |
+| Actions | not needed | Read | the merge gate's check that a required check ran the base branch's workflow | private: not tested (denied without it, as expected); public only: works |
+| Workflows | not recommended | not recommended | pushing commits that change `.github/workflows/`; without it GitHub refuses such a push and the run blocks | without it, the push is refused on private and public repositories |
+| Administration | not needed | optional, Read | only `doctor`'s classic branch-protection row, which is skipped without it | without it: denied on private and public; with it: public only |
+
+### Check runs on a private repository
+
+A fine-grained personal access token cannot read a private repository's
+check runs, and AutoForge has no way around that:
+
+- **What GitHub offers.** A fine-grained token has no Checks permission to
+  select, and GitHub's list of fine-grained token limitations includes
+  calling the Checks API. GitHub's page for listing a commit's check runs
+  names fine-grained tokens with a "Checks" read permission, but no such
+  permission can be selected.
+- **What GitHub did.** On a private repository it refused a fine-grained
+  token the REST check-runs read (HTTP 403) and, on a pull request with a
+  GitHub Actions check run, the check run inside the pull request's
+  `statusCheckRollup` ("Resource not accessible by personal access
+  token"), while it returned the pull request, its head commit and the
+  rollup's overall state. On a pull request without check runs the same
+  read worked. On a public repository both reads succeed for anyone, so a
+  public result proves nothing about this.
+- **What AutoForge calls.** It never calls the REST Checks API, but the
+  `gh pr view` it reads a pull request with in REVIEW, FIX and the merge
+  phases always includes `statusCheckRollup`, and `gh` fails the whole read
+  when GitHub refuses part of it.
+
+What follows for AutoForge (from the code; a complete run was not tried):
+
+- **A run stops at REVIEW.** ANALYZE_EXECUTE opens the pull request; REVIEW
+  and FIX then cannot read it and stop before launching an agent, with
+  `autoforge: error: … Resource not accessible by personal access token`.
+  The phase does not change, so every `resume` stops the same way
+  ([#291](https://github.com/iceboundrock/AutoForge/issues/291)). Nothing is
+  written or merged, and closing the merge gate does not avoid it.
+- **No permission fixes it.** There is no Checks permission to add; adding
+  Actions: Read was not tested and is not expected to help.
+- **Use another credential there.** `gh auth login` (an OAuth token with
+  the `repo` scope) read the same check run; a classic token with `repo` is
+  documented to. Either reaches every repository its account can reach; a
+  dedicated GitHub account that is a collaborator on that repository only
+  narrows it. A GitHub App installation token can be given Checks: read,
+  but it expires after an hour and AutoForge cannot renew it during a run.
+- **The merge gate fails closed on a missing check,** with the
+  defaults. It requires each `safety.required_checks` context (default
+  `ci`) to appear exactly once in the rollup, as a GitHub Actions run at
+  the reviewed HEAD that ran the base branch's workflow. A check missing
+  from the rollup blocks the merge; it is never taken as passed. A read
+  that fails conclusively (refused, not found) blocks the run; a transient
+  one is retried within `merge.max_verification_attempts`.
+- **The defaults matter.** With `safety.verify_check_definition: false` or
+  an empty `safety.required_checks`, the controller only requires that every
+  check it can see succeeded. An empty rollup, for example because no CI
+  ran, then passes unless the branch itself requires a check
+  ([#289](https://github.com/iceboundrock/AutoForge/issues/289)).
+
+### Private and public repositories
+
+| | Merge gate closed | Merge gate open |
+|---|---|---|
+| Private repository | A fine-grained token worked at the API level for every call the probe made on a pull request without check runs, except the REST check-runs read. Once the pull request has a check run, GitHub refuses it the pull request's check results and AutoForge stops at REVIEW: use `gh auth login` or a classic token with `repo`. A whole `autoforge run` with either is untested. | A fine-grained token cannot be used, for the same reason; on GitHub Free the branch cannot require checks |
+| Public repository | Not tested on its own; the open-gate test covers the same calls | Tested at the API level: a fine-grained token without Administration merged a pull request through an active ruleset requiring a pull request and `ci`, after the check was green. Reads prove nothing on a public repository, and a whole `autoforge run` is untested. |
+
+### GitHub Free and private repositories
+
+On GitHub Free a private repository can have neither rulesets nor
+classic branch protection. GitHub refuses those endpoints to every caller,
+the owner included, with "Upgrade to GitHub Pro or make this repository
+public to enable this feature." That answer is about the plan, not about
+the token, and changing the token does not change it. On such a
+repository:
+
+- nothing can require a pull request or the `ci` check on the default
+  branch, and Contents: write can push to it directly (AutoForge itself
+  never does);
+- `doctor`'s required-check row cannot read the branch rules and is
+  skipped, and its message currently says the token cannot read them
+  ([#289](https://github.com/iceboundrock/AutoForge/issues/289)).
+
+Keep the merge gate closed there, or use a plan whose private
+repositories can require checks. A public repository can, but it brings
+the prompt-injection exposure described
+[above](#prompt-injection-and-public-repositories-in-particular).
+
+### Verification status
+
+Real fine-grained tokens were run against AutoForge's call shapes on
+disposable repositories, without AutoForge itself
+([evidence](https://github.com/iceboundrock/AutoForge/issues/257#issuecomment-6357194136)).
+The maintainer accepted this verification within the scope below
+([decision](https://github.com/iceboundrock/AutoForge/issues/257#issuecomment-6370644928)):
+it does not approve fine-grained tokens for private repositories whose
+pull requests have checks, and it does not claim that a complete private
+run or any other credential type was verified.
+
+- **Verified:**
+  - on a private repository with the merge gate closed: the reads and
+    writes the test made, covering issues, comments, sub-issues and
+    dependencies, branches and pushes, pull requests, the status rollup
+    of a pull request without check runs, and commit statuses;
+  - on a private repository, `gh auth login` with `repo` (the repository
+    owner's account) reading a pull request's check run through
+    AutoForge's own `gh pr view` fields;
+  - that the token reaches no other private repository;
+  - that a workflow push is refused without Workflows;
+  - on a public repository with the gate open: the merge through an
+    active ruleset without Administration.
+- **Failed:** a fine-grained token reading check runs on a private
+  repository, through the REST Checks API (HTTP 403) and in a pull
+  request's `statusCheckRollup`, which fails AutoForge's read of the pull
+  request ([evidence](https://github.com/iceboundrock/AutoForge/issues/257#issuecomment-6369613898)).
+- **Inconclusive:** reading a private repository's branch rules, which
+  GitHub Free does not offer.
+- **Unverified:**
+  - the merge gate on a private repository;
+  - a complete `autoforge run` with any credential on a private
+    repository, or with a fine-grained token;
+  - a fine-grained token with Actions: Read, and a pull request with only
+    a commit status;
+  - classic tokens, GitHub App tokens, and `gh auth login` with an account
+    that does not own the repository.
 
 With a classic token or `gh auth login`, that is `repo` for a private
 repository or `public_repo` for a public one. AutoForge's own calls need
@@ -287,7 +449,8 @@ doctor` checks that `gh` is logged in, not which permissions the login has.
 Contents: write cannot be limited to some branches, so protect the default
 branch with a branch rule or ruleset that requires a pull request and the
 `ci` check: AutoForge itself refuses to push to it, and `doctor` checks
-that the check is required.
+that the check is required. On GitHub Free that needs a public repository
+([above](#github-free-and-private-repositories)).
 
 ## Keep AutoForge's files out of git
 
@@ -324,12 +487,20 @@ sandbox directories) are under `.git/autoforge/`, which git never tracks.
 3. **Use dedicated, spend-limited model keys,** not the keys you use
    elsewhere, so that a leaked or misused key costs little and can be
    revoked alone.
-4. **Use a fine-grained GitHub token** restricted to the repositories you
-   run AutoForge on, with the permissions [above](#github-token-permissions),
-   and without Workflows: write unless you need it.
+4. **Use the narrowest GitHub credential that works.** On a public
+   repository, a fine-grained token restricted to it, with the permissions
+   [above](#github-token-permissions), and without Workflows: write unless
+   you need it. On a private repository whose pull requests have checks a
+   fine-grained token does not work
+   ([why](#check-runs-on-a-private-repository)): use `gh auth login` or a
+   classic token with `repo`, preferably for a dedicated account that can
+   reach only that repository.
 5. **Keep the merge gate closed** (the default) and merge yourself. If you
-   open it, keep `safety.protected_merge_paths` at its default, require a
-   CI check on the default branch (`doctor` checks that it is required),
+   open it, keep `safety.protected_merge_paths`, `safety.required_checks`
+   and `safety.verify_check_definition` at their defaults, require a CI
+   check on the default branch (`doctor` checks that it is required; a
+   GitHub Free private repository cannot require one, see
+   [above](#github-free-and-private-repositories)),
    and keep `merge.delete_branch: false` (the default): with it, `gh pr
    merge --delete-branch` deletes the local branch of that name as well,
    and runs git for that in the checkout you started AutoForge from.
