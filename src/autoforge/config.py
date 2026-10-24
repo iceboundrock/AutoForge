@@ -386,11 +386,12 @@ class SafetyConfig:
     )
     # Status-check contexts the default branch is expected to *require*
     # (repository ruleset or classic branch protection). The merge gate
-    # trusts "every check on the PR succeeded", which says nothing about
-    # whether any check had to exist: with the requirement gone, a PR with no
-    # check runs is vacuously green. `autoforge doctor` reads the effective
-    # branch rules and fails when one of these contexts is not required. An
-    # empty list only requires that *some* status check is required.
+    # trusts "every check on the PR succeeded" and refuses a rollup with no
+    # check at all (#289), but which checks had to exist is a branch rule.
+    # `autoforge doctor` reads the effective branch rules and fails when one
+    # of these contexts is not required, or, with `allow_merge` true, when
+    # it cannot read the rules (#289). An empty list only requires that
+    # *some* status check is required.
     required_checks: list[str] = field(default_factory=lambda: list(DEFAULT_REQUIRED_CHECKS))
     # Whether READY_FOR_MERGE / MERGE also verify *where* each required check
     # came from. A green `ci` proves that the workflow defining it ran to

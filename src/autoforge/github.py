@@ -43,6 +43,7 @@ from .errors import (
     GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
+    GitHubPlanLimitedError,
     GitHubUnavailableError,
     GitHubWrongTargetError,
 )
@@ -136,11 +137,13 @@ def is_not_found_gh_failure(stderr: str) -> bool:
 
 # Conclusive "you may not read this" answers: no credentials at all (`gh`
 # prints ``To get started with GitHub CLI, please run:  gh auth login``),
-# rejected credentials (``HTTP 401: Bad credentials``) or a token / plan that
-# cannot see the object (``HTTP 403``, ``Must have admin rights``, ``Resource
-# not accessible by integration``). A read-only diagnostic distinguishes these
+# rejected credentials (``HTTP 401: Bad credentials``) or a token that cannot
+# see the object (``HTTP 403``, ``Must have admin rights``, ``Resource not
+# accessible by integration``). A read-only diagnostic distinguishes these
 # from a *negative answer*: they say nothing about the repository, only about
-# what this token may see of it.
+# what this token may see of it. GitHub's plan-entitlement 403 is not one of
+# them (#289, :func:`is_plan_limited_gh_failure`): it is about the plan, and
+# no token permission changes it.
 _ACCESS_DENIED_MARKERS = (
     "gh auth login",
     "bad credentials",
@@ -154,7 +157,13 @@ _ACCESS_DENIED_HTTP_STATUS = re.compile(r"\bhttp\s+40[13]\b")
 
 
 def is_access_denied_gh_failure(stderr: str) -> bool:
-    """Whether a failed `gh` invocation's stderr says the token may not read the object."""
+    """Whether a failed `gh` invocation's stderr says the token may not read the object.
+
+    A plan limitation is not (#289): its HTTP 403 names a paid plan, and
+    no token permission changes it.
+    """
+    if is_plan_limited_gh_failure(stderr):
+        return False
     text = stderr.lower()
     return any(m in text for m in _ACCESS_DENIED_MARKERS) or bool(
         _ACCESS_DENIED_HTTP_STATUS.search(text)
@@ -1433,7 +1442,7 @@ class GitHubClient:
 
     @staticmethod
     def _conclusive(message: str, stderr: str | None = None) -> GitHubError:
-        """A non-transient failure: a refused checks read, not found, or any other refusal.
+        """A non-transient failure: a refused checks read, a plan limit, not found, or other.
 
         ``stderr`` is the raw tail `gh` printed (``message`` quotes it
         redacted, after the command line); the checks refusal is read from
@@ -1441,9 +1450,13 @@ class GitHubClient:
         itself. A checks refusal is classified first: the PR exists, so it
         must never be read as not-found (#291).
         """
-        credential = checks_access_denial(message if stderr is None else stderr)
+        answer = message if stderr is None else stderr
+        credential = checks_access_denial(answer)
         if credential:
             return GitHubChecksAccessError(message, credential=credential)
+        # The plan, not the credential (#289): never access denied, never absence.
+        if is_plan_limited_gh_failure(answer):
+            return GitHubPlanLimitedError(message)
         if is_not_found_gh_failure(message):
             return GitHubNotFoundError(message)
         return GitHubError(message)

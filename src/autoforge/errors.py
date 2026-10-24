@@ -325,6 +325,18 @@ class GitHubChecksAccessError(GitHubError):
         self.credential = credential
 
 
+class GitHubPlanLimitedError(GitHubError):
+    """GitHub's plan for the repository does not offer what was read (conclusive, #289).
+
+    On GitHub Free a private repository has no rulesets and no classic
+    branch protection, and GitHub answers those endpoints with ``HTTP 403
+    "Upgrade to GitHub Pro or make this repository public to enable this
+    feature."`` to every caller, the owner's admin login included. That is
+    about the plan, not about the credential: no token permission changes
+    it, so it is never reported as access denied.
+    """
+
+
 class GitHubWrongTargetError(GitHubError):
     """GitHub answered a read of one object with another object (conclusive, #243).
 

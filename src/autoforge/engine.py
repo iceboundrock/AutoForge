@@ -10001,6 +10001,18 @@ class ControllerEngine:
         checks = pr.checks
         if checks is None:
             return f"the check results of PR {url} were not read, so they cannot be judged"
+        # An empty rollup was read and is empty: GitHub reports no check run
+        # and no commit status for the head. "Every check succeeded" over no
+        # check is vacuous, so it is never a pass, whatever
+        # safety.required_checks and safety.verify_check_definition say (#289).
+        if not checks:
+            return (
+                f"PR {url} has no check in its status rollup: GitHub reports no check run "
+                "or commit status for its head, and an empty rollup is not a set of passed "
+                "checks, so the controller never merges it, whatever safety.required_checks "
+                "and safety.verify_check_definition say. Make CI report on the PR's head, then "
+                "'unblock'; or merge it by hand"
+            )
         if pr.is_draft:
             return f"PR {url} is a draft"
 

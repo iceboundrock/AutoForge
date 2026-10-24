@@ -140,8 +140,11 @@ safety:
   # is not `active`, or it has bypass actors. A token that cannot read the
   # rules -- or can read them but not who may bypass them, which GitHub shows
   # only with write access to the ruleset -- reports SKIP, never a false
-  # alarm and never OK. An empty list ([]) requires only that *some* status
-  # check is required.
+  # alarm and never OK; with `allow_merge: true` rules it cannot read at all
+  # (a token without access, or GitHub Free, whose private repositories have
+  # no rulesets) are a FAIL instead (#289). An empty list ([]) requires only
+  # that *some* status check is required. Whatever this list says, the merge
+  # gate never merges a PR whose status rollup holds no check (#289).
   required_checks:
     - "ci"
   # Compare each required check's *definition* with the base branch's before
