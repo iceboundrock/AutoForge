@@ -681,8 +681,10 @@ Two checks keep a weaker containment from arriving unannounced (#280).
 launches write (the checkout, every registered worktree, the sandbox
 directories): it walks the path as the kernel looks it up (`lookup_directories`, so a
 link in or into such a tree shows) and refuses a second hard link. The CLI
-(`_load_cfg`), the scheduler's worker and `doctor`'s config row refuse
-such a file before anything reads it. `ControllerEngine.check_run_configuration`
+(`_load_cfg`), the scheduler's worker and `doctor`'s config row parse the
+file first, because the `sandbox.mode` it sets selects the check, and then
+refuse such a file before anything acts on it: no phase, launch or write
+follows, and no command it names runs. `ControllerEngine.check_run_configuration`
 compares the mode with the run's `sandbox_pin` (`sandbox_pin.py`) beside
 #219's recorded configuration, and refuses a weaker one unless
 `--accept-config-change`.

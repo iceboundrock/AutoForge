@@ -516,9 +516,12 @@ def _add_max_parallel(parser: argparse.ArgumentParser) -> None:
 def _load_cfg(args) -> AutoForgeConfig:
     """The ``--config`` file, or the built-in defaults; refused when a launch could rewrite it.
 
-    Under ``required`` or ``preferred``, a file inside a tree the
-    repository's enforced launches write is a ConfigurationError (exit 2)
-    for every command, before anything reads what it says (#280,
+    The file is parsed first, since the ``sandbox.mode`` it sets decides
+    whether the placement check applies at all. Under ``required`` or
+    ``preferred``, a file inside a tree the repository's enforced launches
+    write is then a ConfigurationError (exit 2) for every command, before
+    anything acts on what it says: no phase, launch or write follows, and no
+    command it names runs (#280,
     :func:`autoforge.engine.config_file_placement_problem`).
     """
     cfg = load_config_file(args.config)
