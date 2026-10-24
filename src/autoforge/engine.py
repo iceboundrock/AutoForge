@@ -9153,6 +9153,36 @@ class ControllerEngine:
             f"nothing was merged or counted. {remedy[:1].upper()}{remedy[1:]}, then 'unblock'"
         )
 
+    def _checks_refused_reason(
+        self, url: str, reviewed_ref: GitHubPullRequestRef, exc: GitHubChecksAccessError
+    ) -> str:
+        """The BLOCKED reason for a refused checks read at the merge gate (#291).
+
+        A PR that is already merged (a MERGE crash recovery, or a human's
+        merge that ``unblock`` sent to READY_FOR_MERGE to reconcile) is not
+        "nothing was merged": one identity read tells the two apart, so the
+        reason says what GitHub holds. It stays a BLOCKED either way: the
+        controller reconciles and counts a merge only after a successful
+        checks read, never on the identity read. An identity read that
+        fails, or answers with another PR, keeps the general reason.
+        """
+        general = self._checks_refused_text(url, exc)
+        try:
+            pr = self.github.get_pr(url)
+        except GitHubError:
+            return general
+        if pr.state != "MERGED" or (pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref)):
+            return general
+        remedy = checks_access_remedy(exc.credential)
+        return (
+            f"PR {url} is already MERGED on GitHub (head {pr.head_sha[:12] or '?'}), but this "
+            "controller cannot reconcile or count that merge: GitHub refused this credential "
+            f"({exc.credential or 'the token'}) the PR's check runs: {exc}. The controller "
+            "records a merge only after a successful checks read, never on the PR's state "
+            "alone, so the merge was not counted and the run cannot go on to UPDATE_EPIC. "
+            f"{remedy[:1].upper()}{remedy[1:]}, then 'unblock'"
+        )
+
     def _verify_pr_for_merge(
         self, phase: Phase, plan: StepPlan, allow_merge: bool
     ) -> PRInfo | StepOutcome:
@@ -9195,7 +9225,10 @@ class ControllerEngine:
           PR or comment) -> BLOCKED
         - GitHub refused this credential the PR's check results (#291) ->
           BLOCKED naming the credential limitation and its remedy, before
-          anything else is read: the gate needs a successful checks read
+          anything else is judged: the gate needs a successful checks read.
+          One identity read only tells an already MERGED PR apart, so the
+          reason says it merged and was not counted; it is never reconciled
+          or counted without the checks read
         """
         state = self._require_state()
         self._check_merge_gate(allow_merge)
@@ -9246,7 +9279,7 @@ class ControllerEngine:
         try:
             pr = self.github.get_pr_with_checks(url)
         except GitHubChecksAccessError as exc:
-            return self._block(phase, plan, self._checks_refused_text(url, exc))
+            return self._block(phase, plan, self._checks_refused_reason(url, reviewed_ref, exc))
         except GitHubError as exc:
             return self._github_read_failed(phase, plan, f"PR {url} could not be read", exc)
         if parse_pr_url(pr.url or url).repository.lower() != state.repository.lower():

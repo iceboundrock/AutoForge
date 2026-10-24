@@ -194,6 +194,21 @@ def test_the_refusal_is_read_from_github_s_answer_not_from_the_command_line():
     assert "statusCheckRollup" in str(info.value)  # in the quoted command line only
 
 
+def test_a_refusal_before_a_transient_tail_is_still_the_refusal():
+    """Transience and the refusal are judged on the same answer (#291 review R6).
+
+    The quoted tail is the last 1000 characters; a refusal printed before it,
+    followed by a long tail that names a transient failure, is still the
+    refusal: typed, and asked once, never retried and reported unavailable.
+    """
+    calls: list = []
+    stderr = ROLLUP_REFUSED + "\n" + "x" * 1200 + "\nconnection reset by peer"
+    gh = GitHubClient(runner=_failing(calls, stderr), transient_retries=2, retry_delay_seconds=0)
+    with pytest.raises(GitHubChecksAccessError):
+        gh.get_pr_with_checks("https://github.com/o/r/pull/42")
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     "stderr",
     [

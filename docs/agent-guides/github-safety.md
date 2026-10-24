@@ -865,13 +865,21 @@ Where the checks read is refused:
   bound to come from the identity read and are verified as before.
 - `FIX` makes no checks read.
 - `READY_FOR_MERGE` and `MERGE` are `BLOCKED` on the first refusal, before
-  anything else is read from the PR. The reason names the refusal, the
+  anything else is judged. The reason names the refusal, the
   credential and its remedy (`gh auth login`, an OAuth login, or a classic
   token with the `repo` scope; a GitHub App installation token needs Checks:
   read), and ends with `unblock`. Nothing is merged or counted and no
   re-check is spent: reading again returns the same refusal. HEAD-SHA and
   PR-identity binding, the review certificate and the check-definition
   comparison are unchanged; they run only on a checks read that succeeded.
+- One identity read follows the refusal, only to tell an already merged PR
+  apart (a `MERGE` crash recovery, or a human's merge that `unblock` sent to
+  `READY_FOR_MERGE` to reconcile). The reason then says the PR is already
+  merged, at which head, and that the controller cannot reconcile or count
+  that merge with this credential; it is still `BLOCKED`, never reconciled
+  on the identity read, so the run cannot reach `UPDATE_EPIC` until a
+  credential that may read the checks is in place. An identity read that
+  fails, or answers with another PR, keeps the general reason.
 
 `doctor`'s checks-read row makes the same read before a run
 ("Doctor's checks-read check" below).
@@ -1864,9 +1872,12 @@ number of check results on each head (one GraphQL query that reads
 the check runs), then makes the checks read (`get_pr_with_checks`) on up
 to three of those with at least one result:
 
-- **PASS** (`OK`) only when the read returned at least one check run.
-  Commit statuses are not what GitHub refuses, so a pull request whose
-  results are statuses only proves nothing and the next candidate is read.
+- **PASS** (`OK`) only when the read returned at least one check run, the
+  result GitHub was seen to refuse (#257). Whether GitHub refuses such a
+  token a pull request whose results are commit statuses only was not
+  tried, so a read of one proves nothing about check runs: the next
+  candidate is read, and if none holds a check run the row is UNKNOWN,
+  never PASS. A refusal of any candidate's read is DENIED.
 - **DENIED** when GitHub refused the read: the checks refusal, with the
   credential's remedy, or a refusal of the pull request itself. It is a
   `FAIL` while the configuration's half of the merge gate is open

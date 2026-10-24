@@ -572,9 +572,12 @@ class Doctor:
         :data:`CHECKS_READ_TRIES` of them. Read-only; it never reads, prints
         or stores a token.
 
-        PASS only when the read returned at least one check *run*: commit
-        statuses are not what GitHub refuses, so a PR that has only those
-        proves nothing. DENIED when GitHub refused the read, a FAIL while the
+        PASS only when the read returned at least one check *run*, the
+        result GitHub was seen to refuse (#257). Whether it refuses a PR
+        whose results are commit statuses only was not tried, so reading
+        one proves nothing about check runs: the next candidate is read,
+        and none with a check run is UNKNOWN. DENIED when GitHub refused the
+        read (whatever the PR's results), a FAIL while the
         configuration's half of the merge gate is open (every merge would be
         BLOCKED) and a WARN otherwise. UNKNOWN (a SKIP, never a PASS) when no
         PR could be tried or the answer was a plan limitation, a not-found or
@@ -619,10 +622,7 @@ class Doctor:
                     exc,
                 )
             except GitHubError as exc:
-                if not (
-                    isinstance(exc, (GitHubUnavailableError, GitHubNotFoundError))
-                    or is_plan_limited_gh_failure(str(exc))
-                ) and is_access_denied_gh_failure(str(exc)):
+                if _pr_read_refused(exc):
                     return self._checks_read_denied(
                         f"GitHub refused this gh login the pull request {url} itself (see the "
                         "'gh authenticated' row)",
@@ -661,13 +661,15 @@ class Doctor:
 
     @staticmethod
     def _checks_read_unknown(what: str, exc: GitHubError) -> CheckResult:
-        if is_plan_limited_gh_failure(str(exc)):
-            why = "a GitHub plan limitation, not this login's permissions"
-        elif isinstance(exc, GitHubUnavailableError):
+        # The client's typed answers first; only a plain GitHubError is
+        # classified by its text.
+        if isinstance(exc, GitHubUnavailableError):
             why = "a transient GitHub failure; run doctor again"
         elif isinstance(exc, GitHubNotFoundError):
             why = "the repository or pull request was not found by this login"
-        elif is_access_denied_gh_failure(str(exc)):
+        elif is_plan_limited_gh_failure(str(exc)):
+            why = "a GitHub plan limitation, not this login's permissions"
+        elif type(exc) is GitHubError and is_access_denied_gh_failure(str(exc)):
             why = "this login may not make that read (see the 'gh authenticated' row)"
         else:
             why = "an answer this check cannot classify"
@@ -1392,6 +1394,22 @@ class Doctor:
         results.extend(self.scheduler_checks(gh))
         results.extend(self.sandbox_checks(local=False))
         return results
+
+
+def _pr_read_refused(exc: GitHubError) -> bool:
+    """Whether GitHub refused this login the pull request itself (#291).
+
+    Classified by the client's types first: only a plain conclusive
+    :class:`GitHubError` can be such a refusal. Every typed answer says
+    something else (transient, not found, a refused checks read, another
+    PR), and a plan limitation is about the plan, not the login.
+    """
+    text = str(exc)
+    return (
+        type(exc) is GitHubError
+        and not is_plan_limited_gh_failure(text)
+        and is_access_denied_gh_failure(text)
+    )
 
 
 def _missing_contexts(contexts: list[str], expected: list[str]) -> list[str]:

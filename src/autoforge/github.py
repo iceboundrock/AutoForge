@@ -1427,8 +1427,10 @@ class GitHubClient:
         tail = res.stderr.strip()[-1000:]
         message = f"`gh {' '.join(args)}` failed (exit {res.exit_code}): {redact(tail)}"
         # GitHub refusing the check results is an answer, never a reason to
-        # retry, whatever else the tail says (#291).
-        transient = is_transient_gh_failure(tail) and not checks_access_denial(tail)
+        # retry, whatever else the tail says (#291). It is looked for in the
+        # whole stderr, where _conclusive classifies it, so a refusal before
+        # the tail is never retried and then reported as unavailable.
+        transient = is_transient_gh_failure(tail) and not checks_access_denial(res.stderr)
         return message, transient
 
     @staticmethod

@@ -20,7 +20,10 @@ so.
   a reason that names the credential and the remedy: `gh auth login`, or a
   classic token with the `repo` scope (a GitHub App installation token
   needs Checks: read). Nothing is merged, and the refusal is never read as
-  an empty rollup or retried.
+  an empty rollup or retried. A PR that is already merged (a crash during
+  `MERGE`, or a merge by hand) is named as merged in that reason, but its
+  merge is not reconciled or counted without the checks read, so with
+  such a credential the run cannot go on to `UPDATE_EPIC`.
 - GitHub's refusal (`Resource not accessible by personal access token`, or
   `by integration`, on a `statusCheckRollup` path) is a typed, conclusive
   error. A 404, a transient failure and bad credentials are classified as
