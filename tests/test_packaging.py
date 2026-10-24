@@ -299,3 +299,38 @@ def test_the_dist_check_fails_metadata_that_is_not_pyproject_tomls(
     wheel = _wheel(tmp_path, metadata=_metadata(**{field: value}))
     with pytest.raises(CheckFailed, match=field if field != "Requires-Dist" else "dependency"):
         dist_check.check_wheel(wheel, STEM, DATA)
+
+
+# What the installed command prints on a REMOTE dry run, as far as the dist check
+# looks; the stand-ins below print it and then misbehave in one way each.
+_REMOTE_PLAN = (
+    'echo "Template: analyze_execute.md"; echo "--- prompt preview ---"; '
+    'echo "<<<CONTROL_RESULT>>>"'
+)
+
+
+@pytest.mark.parametrize(
+    "then, refusal",
+    [
+        ("", None),
+        ("gh api user || true", r"called gh: 'api user\\n'"),
+        ("mkdir .autoforge", r"changed the scratch repository: \['\.autoforge'\]"),
+        (": > .git/index.lock", r"changed the scratch repository: \['\.git/index\.lock'\]"),
+        ("echo x >> .git/HEAD", r"changed the scratch repository: \['\.git/HEAD'\]"),
+        ('echo "{{ISSUE_URL}}"', "unrendered variable"),
+    ],
+)
+def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
+    tmp_path: Path, then: str, refusal: str | None
+):
+    """``remote_dry_run`` on a stand-in for the installed command (real git, fake gh)."""
+    command = tmp_path / "autoforge"
+    command.write_text(f"#!/bin/sh\n{_REMOTE_PLAN}\n{then}\n", encoding="utf-8")
+    command.chmod(0o755)
+    git = dist_check.shutil.which("git")
+    assert git is not None
+    if refusal is None:
+        dist_check.remote_dry_run(str(command), git, tmp_path, dist_check._child_env())
+        return
+    with pytest.raises(CheckFailed, match=refusal):
+        dist_check.remote_dry_run(str(command), git, tmp_path, dist_check._child_env())

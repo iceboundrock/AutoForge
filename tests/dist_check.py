@@ -32,9 +32,12 @@ imports the ``autoforge`` of the source tree:
 4. From that environment: ``autoforge --version`` and ``autoforge --help``;
    every prompt template loaded and rendered from the installed package
    (this file again, with ``--installed``, on the environment's own
-   interpreter); and ``autoforge local run --dry-run --full-prompt`` in a
+   interpreter); ``autoforge local run --dry-run --full-prompt`` in a
    scratch git repository, which renders a phase prompt through the
-   installed engine and must write no state.
+   installed engine and must write no state; and a REMOTE ``autoforge run
+   --dry-run --full-prompt`` in another, with a ``gh`` on ``PATH`` that
+   records any call and fails it, which must render the ANALYZE_EXECUTE
+   prompt, call no ``gh`` and leave the repository byte-identical.
 5. The SHA-256 of each artifact is printed, appended to the job summary
    (``$GITHUB_STEP_SUMMARY``) when that is set, and written to
    ``--sha256sums`` in ``sha256sum -c`` format when asked.
@@ -75,6 +78,9 @@ SDIST_TOP_FILES = frozenset(
 MIN_METADATA_VERSION = (2, 4)
 # The feature slug of the LOCAL dry run.
 LOCAL_SLUG = "dist-check"
+# The URLs of the REMOTE dry run: never read, since a dry run calls no gh.
+REMOTE_EPIC = "https://github.com/example/dist-check/issues/1"
+REMOTE_ISSUE = "https://github.com/example/dist-check/issues/2"
 _PLACEHOLDER = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
 _CONTROL_RESULT = "<<<CONTROL_RESULT>>>"
 
@@ -396,26 +402,7 @@ def smoke(bin_dir: Path, work: Path, version: str) -> None:
     git = shutil.which("git")
     _check(git is not None, "git is not on PATH")
     assert git is not None
-    repo = work / "local-repo"
-    repo.mkdir()
-    _run([git, "init", "--quiet", "--initial-branch=main", str(repo)], cwd=work, env=env)
-    _run(
-        [
-            git,
-            "-c",
-            "user.name=AutoForge dist check",
-            "-c",
-            "user.email=dist-check@example.invalid",
-            "commit",
-            "--quiet",
-            "--allow-empty",
-            "--no-verify",
-            "-m",
-            "empty",
-        ],
-        cwd=repo,
-        env=env,
-    )
+    repo = _scratch_repository(git, work / "local-repo", env)
     _run([autoforge, "local", "init", LOCAL_SLUG], cwd=repo, env=env)
     plan = _run(
         [autoforge, "local", "run", f"features/{LOCAL_SLUG}.md", "--dry-run", "--full-prompt"],
@@ -438,6 +425,86 @@ def smoke(bin_dir: Path, work: Path, version: str) -> None:
         f"the LOCAL dry run changed the scratch repository: {status}",
     )
     _say("ok: autoforge local run --dry-run --full-prompt rendered the ANALYZE_EXECUTE prompt")
+
+    remote_dry_run(autoforge, git, work, env)
+
+
+def _scratch_repository(git: str, repo: Path, env: dict[str, str]) -> Path:
+    """A new git repository at ``repo`` with one empty commit on ``main``."""
+    repo.mkdir()
+    _run([git, "init", "--quiet", "--initial-branch=main", str(repo)], cwd=repo.parent, env=env)
+    _run(
+        [
+            git,
+            "-c",
+            "user.name=AutoForge dist check",
+            "-c",
+            "user.email=dist-check@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--no-verify",
+            "-m",
+            "empty",
+        ],
+        cwd=repo,
+        env=env,
+    )
+    return repo
+
+
+def _tree(root: Path) -> dict[str, bytes | None]:
+    """Every path under ``root`` (``.git`` included), with each file's bytes."""
+    return {
+        str(path.relative_to(root)): path.read_bytes() if path.is_file() else None
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def remote_dry_run(autoforge: str, git: str, work: Path, env: dict[str, str]) -> None:
+    """A REMOTE ``run --dry-run`` renders a prompt, calls no ``gh`` and writes nothing.
+
+    The repository has no ``origin`` and the issue URLs name no real
+    repository: a dry run plans from in-memory state alone. The ``gh``
+    first on ``PATH`` records its arguments and fails, so any call shows.
+    """
+    fake_bin = work / "fake-gh-bin"
+    fake_bin.mkdir()
+    calls = work / "gh-calls.log"
+    fake = fake_bin / "gh"
+    fake.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {shlex.quote(str(calls))}\nexit 1\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    remote_env = dict(env, PATH=f"{fake_bin}{os.pathsep}{env.get('PATH', '')}")
+    repo = _scratch_repository(git, work / "remote-repo", remote_env)
+    before = _tree(repo)
+    plan = _run(
+        [
+            autoforge,
+            "run",
+            "--epic",
+            REMOTE_EPIC,
+            "--issue",
+            REMOTE_ISSUE,
+            "--dry-run",
+            "--full-prompt",
+        ],
+        cwd=repo,
+        env=remote_env,
+    ).stdout
+    for needle in ("Template: analyze_execute.md", "--- prompt preview ---", _CONTROL_RESULT):
+        _check(needle in plan, f"the REMOTE dry run printed no {needle!r}")
+    _check(not _PLACEHOLDER.search(plan), "the REMOTE dry run's prompt has an unrendered variable")
+    if calls.exists():
+        raise CheckFailed(f"the REMOTE dry run called gh: {calls.read_text(encoding='utf-8')!r}")
+    after = _tree(repo)
+    changed = sorted({path for path, _ in set(before.items()) ^ set(after.items())})
+    _check(not changed, f"the REMOTE dry run changed the scratch repository: {changed}")
+    _say(
+        "ok: autoforge run --dry-run --full-prompt rendered the ANALYZE_EXECUTE prompt, no gh call"
+    )
 
 
 def record_digests(paths: list[Path], sha256sums: Path | None) -> None:

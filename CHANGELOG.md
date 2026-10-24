@@ -20,7 +20,8 @@ so.
   the required `ci` check): builds the sdist and a wheel from it, checks
   their files and metadata, installs the wheel outside the checkout, runs
   `autoforge --version` and `--help`, renders every template from the
-  installed package and runs a LOCAL dry run.
+  installed package and runs a LOCAL and a REMOTE dry run (the REMOTE one
+  calls no `gh`).
 - [Compatibility](docs/compatibility.md): what AutoForge runs on, each
   entry labelled supported, untested or unsupported with its evidence. The
   first prerelease claims Linux x86_64 with CPython 3.11 and 3.12 only;
