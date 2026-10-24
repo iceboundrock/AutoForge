@@ -189,8 +189,8 @@ Each line is a summary; the linked document is the precise statement.
 
 ## Prerequisites
 
-[Compatibility](docs/compatibility.md) has the full matrix and the evidence
-for each entry.
+[Compatibility](https://github.com/iceboundrock/AutoForge/blob/main/docs/compatibility.md)
+has the full matrix and the evidence for each entry.
 
 - Linux on x86_64. macOS, Linux ARM64 and WSL2 are untested; Windows is
   unsupported (AutoForge's lock needs POSIX `fcntl`)
@@ -201,14 +201,14 @@ for each entry.
   client lists branch rules and a PR's changed files with
   `gh api --paginate --slurp`, which older releases reject; `autoforge doctor`
   refuses an older `gh` up front. `gh` is **not** needed for
-  [local mode](#local-mode-no-github)
+  [local mode](https://github.com/iceboundrock/AutoForge#local-mode-no-github)
 - `claude` (Claude Code CLI) for `analyze_execute` / `fix` profiles
 - `opencode` (OpenCode CLI) 2.0.0 or newer for the `review_*`,
   `replan_reexecute` and `update_epic` profiles; 1.x is refused by `doctor`
-  (see [OpenCode profiles](docs/configuration.md#opencode-profiles))
+  (see [OpenCode profiles](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md#opencode-profiles))
 - `pi` 1.0.0 or newer, only if a profile you route to uses `provider: pi`,
   holding a DeepSeek API key or signed in with your ChatGPT subscription
-  (see the [Pi operator guide](docs/pi.md)). `doctor` checks
+  (see the [Pi operator guide](https://github.com/iceboundrock/AutoForge/blob/main/docs/pi.md)). `doctor` checks
   only the agent CLIs your configured profiles actually reach
 - a state directory (`.autoforge/` by default; `--state-dir` or
   `state_dir` in config) on a filesystem with hard links: run logs and
@@ -225,7 +225,7 @@ authentication, no `origin` remote).
 
 CLI flag syntax in `autoforge.example.yaml` was checked against the locally
 installed CLIs (Claude Code 2.1.263, OpenCode 2.0.23, gh 2.100.0); the
-versions verified since are in [Compatibility](docs/compatibility.md#agent-clis).
+versions verified since are in [Compatibility](https://github.com/iceboundrock/AutoForge/blob/main/docs/compatibility.md#agent-clis).
 
 ## Installation
 
@@ -233,11 +233,23 @@ The distribution is **`autoforge-cli`**; the command it installs is
 `autoforge`. `autoforge` on PyPI is an unrelated project: never
 `pip install autoforge`.
 
-**From a git commit** (works now). Install the command into its own
-environment with `uv tool`, from a commit at or after the one that
-introduced `autoforge-cli` (#256; an earlier commit installs a package
-without its prompt templates). Pin a full commit SHA, or a release tag
-once one exists:
+**From PyPI.** Versions of `autoforge-cli` are published to PyPI as
+prereleases; the [releases page](https://github.com/iceboundrock/AutoForge/releases)
+lists each published version with the SHA-256 digests of its files, and if
+it lists none, none has been published yet. Install one only after checking
+that its PyPI project page links back to this repository:
+
+```bash
+uv tool install --python 3.12 --prerelease allow autoforge-cli
+```
+
+`--prerelease allow` is needed while every published version is a
+prerelease (`0.x`, [Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md#version-scheme)).
+
+**From a git commit.** Install the command into its own environment with
+`uv tool`, from a commit at or after the one that introduced
+`autoforge-cli` (#256; an earlier commit installs a package without its
+prompt templates). Pin a full commit SHA, or a release tag (`v<version>`):
 
 ```bash
 uv tool install --python 3.12 'git+https://github.com/iceboundrock/AutoForge@<commit>'
@@ -248,22 +260,14 @@ autoforge --version
 `uv tool uninstall autoforge-cli` removes it. Add the YAML extra with
 `'autoforge-cli[yaml] @ git+https://github.com/iceboundrock/AutoForge@<commit>'`.
 
-**From a built wheel** (works now). From a checkout of the commit you want:
+**From a built wheel.** From a checkout of the commit you want:
 
 ```bash
 uv build                 # dist/autoforge_cli-<version>.tar.gz and -py3-none-any.whl
 uv tool install --python 3.12 dist/autoforge_cli-<version>-py3-none-any.whl
 ```
 
-**From PyPI** (not yet available). Once the first prerelease of
-`autoforge-cli` is published (#295), and only after checking that its PyPI
-project page links back to this repository:
-
-```bash
-uv tool install --python 3.12 --prerelease allow autoforge-cli
-```
-
-Until then, `autoforge-cli` does not exist on PyPI. [Releasing](docs/releasing.md)
+[Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md)
 describes how a version is built and published.
 
 Whichever way it was installed, run `autoforge` from a checkout of the
@@ -279,11 +283,11 @@ uv run autoforge --help
 ```
 
 `uv run autoforge` is the same command, run from that clone's `.venv`.
-[Development](docs/development.md) has the checks CI runs.
+[Development](https://github.com/iceboundrock/AutoForge/blob/main/docs/development.md) has the checks CI runs.
 
 To configure profiles, bounds or the merge gate, copy
 `autoforge.example.yaml` to `autoforge.yaml` and pass it with `--config`
-before the subcommand; see [Configuration](docs/configuration.md).
+before the subcommand; see [Configuration](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md).
 
 ## Quick start
 

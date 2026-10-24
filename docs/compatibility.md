@@ -89,7 +89,8 @@ passed on that interpreter on one machine, and claims nothing about 3.14.
 
 | Version | Status | Evidence or reason |
 |---|---|---|
-| 2.48.0 or newer | **supported** | The floor `doctor` enforces (`gh >= 2.48.0 is required`): the client lists branch rules and a PR's changed files with `gh api --paginate --slurp`, which older releases reject. Versions with a recorded run: 2.100.0 (the flag syntax of `autoforge.example.yaml`) and 2.102.1 (the operator-comment byte-fidelity capture of 2026-10-21, [Development](development.md#the-operator-comment-byte-fidelity-capture)). The test suite runs no real `gh`: an in-memory fake, or a fake `gh` executable, stands in. |
+| 2.100.0, 2.102.1 | **supported** | Recorded runs: 2.100.0 (the flag syntax of `autoforge.example.yaml`) and 2.102.1 (the operator-comment byte-fidelity capture of 2026-10-21, [Development](development.md#the-operator-comment-byte-fidelity-capture)). |
+| any other version from 2.48.0 | untested | 2.48.0 is the floor `doctor` enforces (`gh >= 2.48.0 is required`): the client lists branch rules and a PR's changed files with `gh api --paginate --slurp`, which older releases reject. Nothing has run these versions: the test suite runs no real `gh`, and an in-memory fake, or a fake `gh` executable, stands in. |
 | older than 2.48.0 | **unsupported** | Refused by `doctor`. |
 
 `gh` must be authenticated (`gh auth login`, or a `GH_TOKEN` in the shell
@@ -137,6 +138,13 @@ Linux host can use `required`: that is a property of the host, established
 by a real minimal launch, never by a version number
 ([ADR 0005 D14.1](adr/0005-outer-sandbox-and-host-resource-capability-model.md#214-platform-capability-levels-item-14)).
 
+The outer sandbox is experimental: it is opt-in enforcement on a host that
+can enforce it, and it becomes supported only once a `make test-sandbox`
+run on a capable host is recorded at the release candidate
+([#255 C4](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6377402004)).
+The host table below therefore says *capable* where a host enforced, not
+**supported**.
+
 `doctor` reports it in two rows. `outer sandbox: capability (one minimal
 sandboxed launch)` says `supported (bwrap <version>)`, or `unsupported:
 this host cannot provide <capability> (<reason>)`, naming the first
@@ -160,7 +168,7 @@ or refused before anything is saved or launched.
 
 | Host | Status | Evidence or reason |
 |---|---|---|
-| Fedora 44, kernel 7.2.x, SELinux enforcing, bubblewrap 0.12.0 | **supported** | Recorded: ADR 0005 §4 and `make test-sandbox` on the maintainer's host. |
+| Fedora 44, kernel 7.2.x, SELinux enforcing, bubblewrap 0.12.0 | capable (enforces); experimental | Recorded: ADR 0005 §4 and `make test-sandbox` on the maintainer's host. Experimental until a release candidate records such a run ([#255 C4](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6377402004)). |
 | `ubuntu-latest` (hosted CI) | measured on every run | The `sandbox` job records bwrap's version and `--overlay`, the user-namespace policy, an unprivileged namespace launch and the Landlock ABI in its summary, and requires the real-backend tests wherever the runner measures capable. There is no fixed answer: each run's summary is the record ([Development](development.md#the-outer-sandbox)). |
 | a kernel before 6.12 (for example the default kernels of Ubuntu 24.04 and Debian 12), or Landlock disabled | **unsupported** | No Landlock ABI 6. |
 | unprivileged user namespaces disabled by a sysctl or an LSM policy | **unsupported** | Until the policy allows them. |

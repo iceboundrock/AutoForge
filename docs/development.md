@@ -201,7 +201,11 @@ credential:
 6. runs a LOCAL dry run (`autoforge local init`, then
    `autoforge local run ... --dry-run --full-prompt`) in a scratch
    repository and checks it rendered the prompt, wrote no state and changed
-   nothing but the feature file;
+   nothing but the feature file, then a REMOTE dry run (`autoforge run
+   --epic ... --issue ... --dry-run --full-prompt`) in another, with a fake
+   `gh` first on `PATH` that records any call, and checks it rendered the
+   ANALYZE_EXECUTE prompt, called no `gh` and left the repository
+   byte-identical;
 7. prints the SHA-256 of both files (and, with `--sha256sums FILE`, writes
    them in `sha256sum` format).
 
