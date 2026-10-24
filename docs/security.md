@@ -94,7 +94,10 @@ or under the outer sandbox.
   the system runtime, its worktree, read-only git metadata, a private home
   and what its provider declares. Your home, your `gh` and git credential
   files, `~/.ssh`, the SSH agent, the session bus, controller state, the
-  lock and other worktrees are absent.
+  lock and other worktrees are absent. A run keeps the mode it was started
+  under unless you accept a weaker one, and a configuration file a launch
+  could rewrite is refused
+  ([below](#the-outer-sandbox-is-opt-in-and-linux-only)).
   ([Usage: outer sandbox](usage.md#outer-sandbox),
   [GitHub safety: outer sandbox threat model](agent-guides/github-safety.md#outer-sandbox-threat-model-adr-0005))
 
@@ -165,11 +168,31 @@ enforced, an agent still runs as your UID, keeps the host network (loopback
 services included) and can read the model credential its provider is
 given. There is no sandbox on macOS.
 
-In LOCAL mode the repository root is writable to every enforced launch,
-and AutoForge reads its configuration file again at every command. Keep
-the `--config` file outside the repository root when you rely on the
-sandbox: a file inside it can be rewritten by a sandboxed agent, and the
-next command would run on what it says, `sandbox.mode` included.
+Every enforced launch writes a tree of the repository: the repository root
+in LOCAL mode, the issue's agent worktree in REMOTE mode, and the
+repository's sandbox directories in both. AutoForge reads its configuration
+file again at every command, so a file an agent could rewrite would decide
+what the next command runs, `sandbox.mode`, `github.command` and the
+profiles' commands included. Under `required` or `preferred` every command,
+a scheduler's worker and `autoforge doctor` therefore refuse a `--config`
+file that lies in the checkout or in any worktree registered to it, that
+is reached through a symbolic link in one, or that has a second hard link;
+the refusal names the file and the fix (move it outside, for example to
+`~/.config/autoforge/`, or set `sandbox.mode: disabled`), and `doctor` runs
+none of the commands such a file names. One writable place is not
+checked: a provider's own directory that its agent is given read-write (a
+dedicated `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR` or OpenCode database
+directory). Keep the configuration out of it too.
+
+A run is also pinned to the `sandbox.mode` it was created under. A later
+`step`, `resume` or `unblock` under a weaker mode is refused before
+anything runs: `required` to `preferred` or `disabled` in LOCAL mode, and
+`required` or `preferred` to `disabled` in REMOTE mode, where `preferred`
+is `required`. That includes a command run without the run's `--config`,
+which falls back to the built-in `disabled`. To continue under the weaker
+mode anyway, repeat the command with `--accept-config-change`: the change
+is written to the run log first, and the run is pinned to the new mode.
+A stronger mode is pinned without asking. `autoforge status` shows the pin.
 
 ### Redaction is a baseline
 
@@ -268,7 +291,7 @@ last column says what still applies.
 
 | Issue | Severity | What happens today | Until it is fixed |
 |---|---|---|---|
-| [#280](https://github.com/iceboundrock/AutoForge/issues/280) | Critical | In LOCAL mode under `sandbox.mode: required` or `preferred`, an enforced launch can rewrite a `--config` file inside the repository root, and the next command runs on what it says, `sandbox.mode`, `github.command` and the profiles' commands included | Keep the `--config` file outside the repository root ([why](#the-outer-sandbox-is-opt-in-and-linux-only)) |
+| [#280](https://github.com/iceboundrock/AutoForge/issues/280) | Critical | *Fixed on `main`.* Under `sandbox.mode: required` or `preferred`, every command, a scheduler's worker and `doctor` refuse a `--config` file an enforced launch could rewrite (in the checkout or a worktree of the repository, reached through a link in one, or with a second hard link), and a run is pinned to the `sandbox.mode` it was created under: a later command under a weaker one is refused unless `--accept-config-change`, which the run log records | Keep the `--config` file out of a provider's own writable directory too, which is not checked ([why](#the-outer-sandbox-is-opt-in-and-linux-only)) |
 | [#281](https://github.com/iceboundrock/AutoForge/issues/281) | High | A recognised token right after a line break, a tab or a character JSON escapes as `\u...` in a step's result is printed unredacted on the terminal and in a scheduler worker's log | Treat that output and the worker logs as sensitive, and do not share them |
 | [#282](https://github.com/iceboundrock/AutoForge/issues/282) | High | Google API keys (`AIza...`) are neither redacted nor refused in published text, and OpenCode launches receive `GEMINI_*` and `GOOGLE_*` | Keep such variables out of the shell you run AutoForge from unless a profile needs them ([why](#redaction-is-a-baseline)) |
 | [#283](https://github.com/iceboundrock/AutoForge/issues/283) | High | `merge.delete_branch: true` passes `--delete-branch` to `gh pr merge`, which, per `gh`, deletes the local branch of that name too, running git in the checkout you started AutoForge from; under `disabled`, a git hook an agent planted there runs with the controller's credential within reach | Keep `merge.delete_branch: false`, the default |
@@ -503,7 +526,8 @@ repository's `.gitignore` does not know them:
   every prompt and agent output, and the read context), or whatever
   `--state-dir` or `state_dir` names inside the checkout;
 - `autoforge.yaml` and `autoforge.local.*` (your configuration and local
-  overrides, if you keep them in the checkout).
+  overrides, if you keep them in the checkout; under `sandbox.mode:
+  required` or `preferred` AutoForge refuses a configuration file there).
 
 The run logs and read context are redacted, but only to a baseline: never
 commit them. Add them to the repository's `.gitignore`, or, to keep the
@@ -524,8 +548,10 @@ sandbox directories) are under `.git/autoforge/`, which git never tracks.
 2. **Isolate the agent's user.** Run AutoForge as a dedicated OS user, or
    in a VM or container, holding only the credentials it needs; or use
    `sandbox.mode: required` on a Linux host that can enforce it (check with
-   `autoforge doctor`). In LOCAL mode, keep the `--config` file outside the
-   repository root ([why](#the-outer-sandbox-is-opt-in-and-linux-only)).
+   `autoforge doctor`). Keep the `--config` file outside the repository
+   and its worktrees, which that mode requires, and pass it to every
+   command of a run: a weaker `sandbox.mode` is refused
+   ([why](#the-outer-sandbox-is-opt-in-and-linux-only)).
 3. **Use dedicated, spend-limited model keys,** not the keys you use
    elsewhere, so that a leaked or misused key costs little and can be
    revoked alone.

@@ -25,10 +25,17 @@ and `autoforge.local.*`; the repository you run AutoForge on does not, so
 add them, and the state directory `.autoforge/`, to its `.gitignore` or to
 `.git/info/exclude`
 ([Security boundaries](security.md#keep-autoforges-files-out-of-git)).
-Do not commit a config that names credentials or local paths. In LOCAL
-mode under the outer sandbox, keep the file outside the repository root:
-the root is writable to every enforced launch, and the next command reads
-the file again ([Security boundaries](security.md#the-outer-sandbox-is-opt-in-and-linux-only)).
+Do not commit a config that names credentials or local paths. Under
+`sandbox.mode: required` or `preferred`, keep the file outside the
+repository and every worktree of it, for example in `~/.config/autoforge/`:
+an enforced launch writes those trees, the next command reads the file
+again, and so every command, and `autoforge doctor`, refuses a file there
+(one reached through a link into them, or with a second hard link,
+included), naming it and the fix. Pass the same file to every command of a
+run: the run is pinned to the `sandbox.mode` it was created under, and a
+command under a weaker one, the built-in `disabled` of a command without
+`--config` included, is refused unless repeated with
+`--accept-config-change` ([Security boundaries](security.md#the-outer-sandbox-is-opt-in-and-linux-only)).
 
 Edit the file to change model identifiers, effort, agent limits and provider
 options without touching controller source. Provider-specific flags are
@@ -201,8 +208,11 @@ configuration that differs in any of these, naming each changed key and the
 command that restores the recorded one. `--accept-config-change` makes the
 new values the run's, and the change is recorded in the run log. Every
 other key (a profile's `command`, `extra_args` and `options`, the loop
-bounds, the merge gate, the agent environment, `sandbox.mode`) may change
-between commands. A run refuses, before any state is written, a
+bounds, the merge gate, the agent environment) may change between
+commands, except that `sandbox.mode` may not weaken: every run, LOCAL and
+REMOTE, is pinned to the mode it was created under, and the same commands
+refuse a weaker one with the same opt-in (#280,
+[Outer sandbox](#outer-sandbox)). A run refuses, before any state is written, a
 configuration the record could not hold: a `provider`, `model` or `effort`
 over 512 characters, or an `update_epic` limit that is not a positive
 integer (`doctor` reports it). See
@@ -961,9 +971,39 @@ so its plan is the same on every host. `status` shows the mode and what it
 means, without probing. `doctor` and `local doctor` show the capability
 result and what the mode will do on this host
 ([Usage: outer sandbox](usage.md#outer-sandbox)).
-The mode is not part of a LOCAL run's contract (D12.3), and no state
-records it, so a run started under one mode resumes under another
-(D15.3).
+The mode is not part of a LOCAL run's contract (D12.3). Every run is
+pinned to the mode it was created under instead (#280, D15.3 as amended):
+
+- a later `step`, `resume` or `unblock` under a **weaker** mode is refused
+  before any phase executes, with nothing written, naming the pinned mode,
+  this command's and the two ways on. Weaker is what a launch gets:
+  `disabled` is weaker than LOCAL's `preferred`, which is weaker than
+  `required`; in a REMOTE run `preferred` is `required`, so only
+  `disabled` is weaker. A command run without the run's `--config` falls
+  back to the built-in `disabled`, and is refused like any other;
+- repeated with `--accept-config-change`, the command writes the change to
+  the run log (a `<PHASE>-config-change` record naming the pin it
+  replaces) before anything else, pins the run to the weaker mode, and
+  continues;
+- a **stronger** mode is pinned with the command's next save, so going
+  back down is a weaker mode like any other;
+- a run whose state file predates the pin (protocol 11 or older) is not
+  checked once, and is pinned to the mode its first `step`, `resume` or
+  `unblock` runs under.
+
+`status` shows the pin and whether this configuration's mode keeps it. The
+pin records configuration, never enforcement: whether a launch ran inside
+the sandbox stays its execution record's, and a host that can no longer
+enforce `required` is refused at the gate as before.
+
+Under `required` or `preferred` the `--config` file itself must lie
+outside every tree an enforced launch writes: the checkout, every worktree
+registered to the repository (the agent worktrees included) and the
+repository's sandbox directories. A file there, one reached through a
+symbolic link in one of them, and one with a second hard link are refused
+by every command (exit 2, nothing run, launched or written), by a
+scheduler's worker, and by `doctor`'s config row, which then runs none of
+the commands the file names ([Security boundaries](security.md#the-outer-sandbox-is-opt-in-and-linux-only)).
 
 **What a sandboxed launch sees.** An empty root, then only what ADR 0005
 §2.5 grants its launch class

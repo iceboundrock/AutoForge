@@ -42,8 +42,9 @@ uv run autoforge resume            # continue until a stop phase / --max-steps
 # the whole run and is not reset by resume
 
 # step, resume and unblock refuse a configuration whose profile routing or
-# agent worktree root differs from the one the run was recorded under; to
-# change it deliberately (recorded in the run log):
+# agent worktree root differs from the one the run was recorded under, or
+# whose sandbox.mode is weaker than the one it is pinned to; to change it
+# deliberately (recorded in the run log):
 uv run autoforge --config autoforge.yaml resume --accept-config-change
 
 # only with safety.allow_merge: true in config — the controller verifies on
@@ -983,6 +984,19 @@ never called sandboxed.
   "validation command ...") on stderr, and its execution record says
   `"sandbox": {"enforced": false, "mode": "preferred", "isolation":
   "logical isolation only", "fallback": "<reason>"}`.
+- **Across commands (#280):** a run is pinned to the mode it was created
+  under, and `status` shows the pin. `step`, `resume` and `unblock` refuse
+  a weaker mode before any phase executes, a command run without the run's
+  `--config` (the built-in `disabled`) included, unless repeated with
+  `--accept-config-change`, which writes the change to the run log first
+  and pins the weaker mode. A stronger mode is pinned without asking
+  ([Configuration: outer sandbox](configuration.md#outer-sandbox)).
+- **Where the configuration lives (#280):** under `required` or
+  `preferred`, every command, `doctor` and a scheduler's worker refuse a
+  `--config` file inside the checkout or any worktree of the repository
+  (or reached through a link into one, or with a second hard link), since an
+  enforced launch could rewrite it. Keep it in, for example,
+  `~/.config/autoforge/`.
 
 AutoForge never commits to the default branch, never deletes a worktree it
 created, and never creates or cleans up local branches or any other
@@ -1096,6 +1110,21 @@ ownership or discard uncommitted user changes.
   unprivileged user namespaces, a kernel with Landlock ABI 6), or set
   `sandbox.mode: disabled` (logical isolation only) or, in LOCAL,
   `preferred`, and run the same command again.
+- **"the configuration file ... lies in ..., a tree that launches inside
+  the outer sandbox write"** (exit 2; also "is reached through ..." or
+  "has N hard links"): under `required` or `preferred` the `--config` file
+  is where an enforced launch could rewrite it (#280). Nothing was run,
+  launched or written. Move it outside the checkout and every worktree of
+  the repository, for example to `~/.config/autoforge/`, and pass that
+  path; or set `sandbox.mode: disabled`. `doctor` reports the same in its
+  config row and runs none of the commands the file names.
+- **"run ... is pinned to sandbox.mode ..., and this command's
+  sandbox.mode, ..., contains its launches less"** (exit 2): the command
+  runs under a weaker mode than the run was created under, often because
+  it was run without the run's `--config`. Nothing was written. Run it with
+  a configuration that sets the pinned mode, or repeat it with
+  `--accept-config-change` to continue under the weaker one (recorded in
+  the run log).
 - **"sandbox.read_only_paths[N] ... overlaps ..., which no launch may see":**
   an operator read-only path names, contains or lies inside the state
   directory, the lock, `<git common dir>/autoforge`, another worktree or (in
@@ -1227,7 +1256,11 @@ To continue under this command's configuration instead, repeat it with --accept-
 
 Everything else in the configuration may change between commands without a
 refusal: the loop bounds and step budget, the merge gate, `env_allowlist`,
-the `sandbox` section, and a profile's `command`, `extra_args` and `options`. The
+the `sandbox` section, and a profile's `command`, `extra_args` and `options`.
+The one exception is a weaker `sandbox.mode`: every run, LOCAL included, is
+pinned to the mode it was created under, and the same commands refuse a
+weaker one, with the same `--accept-config-change`
+([Outer sandbox](#outer-sandbox)); a refusal that has both lists both. The
 record holds none of them, and no value that could carry a secret. The
 validation evidence does depend on some of them: `validation.commands`,
 the allow-list, `execution.command_timeout_seconds` and the `sandbox`

@@ -470,6 +470,13 @@ sandbox:
   # token variable; Pi needs a PI_CODING_AGENT_DIR of its own.
   # Whatever the mode, the controller reads an issue worktree's HEAD through
   # the git common dir and imports the agent's objects strictly.
+  # Under `required` or `preferred` (#280): keep this file outside the
+  # checkout and every worktree of the repository (e.g. ~/.config/autoforge/),
+  # where an enforced launch could rewrite it -- every command and doctor
+  # refuse it there; and pass it to every command of a run, which is pinned
+  # to the mode it was created under: a weaker mode (the built-in `disabled`
+  # of a command without --config included) is refused unless repeated with
+  # --accept-config-change.
   mode: disabled
   # `isolated`: validation commands (LOCAL and REMOTE) / pre-merge verification commands
   # run in a network namespace of their own (no host loopback service, no

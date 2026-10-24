@@ -674,6 +674,19 @@ gets: the allow-listed variables with the adapter's
 the compiled description passed through `rewrite_environment`. Its output
 is redacted before its first line is picked and clipped.
 
+Two checks keep a weaker containment from arriving unannounced (#280).
+`engine.config_file_placement_problem` asks
+`sandbox_policy.config_file_problem` whether, under `required` or
+`preferred`, the `--config` file lies in a tree the repository's enforced
+launches write (the checkout, every registered worktree, the sandbox
+directories): it walks the path as the kernel looks it up (`lookup_directories`, so a
+link in or into such a tree shows) and refuses a second hard link. The CLI
+(`_load_cfg`), the scheduler's worker and `doctor`'s config row refuse
+such a file before anything reads it. `ControllerEngine.check_run_configuration`
+compares the mode with the run's `sandbox_pin` (`sandbox_pin.py`) beside
+#219's recorded configuration, and refuses a weaker one unless
+`--accept-config-change`.
+
 The environment is rewritten (D8.2, `rewrite_environment`): a path-valued
 name AutoForge knows (the CA-bundle names of `DEFAULT_ENV_ALLOWLIST`,
 `child_env.OVERRIDE_PATH_NAMES`, the provider's `path_names`) whose

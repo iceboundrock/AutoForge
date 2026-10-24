@@ -81,6 +81,19 @@ Expected state includes data such as:
   written that could not load again. It is `{}` for a LOCAL run, whose run contract
   defines it ([The run contract](../local-mode.md#the-run-contract)), and
   for a run loaded from a protocol-8 file until its next command records it
+- the sandbox pin of every run, LOCAL and REMOTE (`sandbox_pin`, #280): the
+  `sandbox.mode` the run is held to, with its `source` (`created` by `run`
+  or `local run`, `upgraded` from a file without one, `strengthened` by a
+  command under a stronger mode, `accepted` by `--accept-config-change`
+  under a weaker one) and `recorded_at`, under `schema` 1. `step`, `resume`
+  and `unblock` refuse a weaker mode before any phase executes, writing
+  nothing, unless the operator accepts it; an accepted downgrade goes to the
+  run log (`<PHASE>-config-change`, with `recorded_sandbox_pin`) before the
+  state save. It holds the configured mode, never whether a launch was
+  enforced (ADR 0005 D16.1), and is validated on load
+  (`sandbox_pin.py`, an exact key set; a pin that does not parse is
+  refused, never read as none). It is `{}` for a run loaded from a
+  protocol-11 file until its next `step`, `resume` or `unblock` pins it
 - candidate validation evidence (#172, [below](#validation-evidence)):
   `validation_records`, `validation_attempt`, `review_evidence`,
   `review_certificate`, `producer_validation_failure` and
@@ -466,6 +479,8 @@ Protocol 9 → 10 (#172) added the [validation evidence](#validation-evidence) a
 
 Protocol 10 → 11 (#243, ADR 0004 D13.10) added the operator-action state: `operator_comment_outcomes`, `operator_targets` in a `FIX` entry observation, `operator_sources` on each `FIX` completion-context resolution, `operator_evidence` on each REMOTE `last_fix_resolutions` entry and the `operator_comment` effect record, whose `binding` is part of the same bump. Every protocol-11 save writes `operator_comment_outcomes`, so a protocol-11 file missing it is refused. A protocol-10 file, and every older file its own rules load, loads in every phase and is relabelled on its next save, with no outcomes, no `operator_targets` (that entry offers no operator action), `operator_sources: null` and `operator_evidence: []`, which is exactly what a protocol-10 controller meant: it never asked the operator for anything. Its K9 state is kept as written. A protocol-10 (or older) file that carries any of these, even empty, is a hand edit or a foreign file and is refused, unchanged. The number is the implementation's; it is settled on #23 before the change merges (#158 is closed).
 
+Protocol 11 → 12 (#280, ADR 0005 D17.1 as amended) added the sandbox pin (`sandbox_pin`) above, for LOCAL and REMOTE runs alike. Every protocol-12 save writes it, `{}` included, so a protocol-12 file missing it is refused: read as absent, it would switch the check off. A protocol-11 file, and every older file its own rules load, loads in every phase with `{}` and is relabelled on its next save. It is not checked once: the first `step`, `resume` or `unblock` pins the mode it runs under as `upgraded`, saved with that command's next save, and later commands are checked against it. A protocol-11 (or older) file that carries the field, `{}` included, is a hand edit or a foreign file and is refused, unchanged. The pin has its own `schema` (1), and unlike #219's record it is never refused for a new fact: a sandbox fact added later (the backend of a REMOTE run, #273) takes a new schema whose parser still reads schema 1 with that fact absent, and the next command pins it, so a run created before it stays loadable. The number is the implementation's; it is settled on #23 before the change merges.
+
 Protocol 5 → 7 (#160) added the effect state above (`effect_records`, `entry_observation`, `completion_context`, `launch_label`). Protocol 6 is skipped, and stays skipped for good: #23 once reserved it for #126, which now takes the next number like every other bump (see "Numbering a new protocol" below). The number this bump took was settled on #23 before it merged. State persisted under protocol 5, or under any older protocol that its own rules load, carries no effect state and loads as none; a legacy file that does carry one of these fields is a hand edit or a foreign file and is refused. A legacy REMOTE file with `attempt >= 1` gets the launch label `agent_publishes` for a phase whose agent published under the previous contract, so that the first entry of this version knows an agent may already have published (D13.3). `UPDATE_EPIC` is the one such phase whose publication this version performs itself: its one-shot legacy re-entry adopts the progress comment that agent posted, with no record, and asks for the selection only (D13.7; [github-safety.md](github-safety.md), "Before UPDATE_EPIC"). LOCAL state, whatever its protocol, carries no effect state.
 
 **Numbering a new protocol.** A change that adds or changes persisted state takes N + 1, where N is `__protocol_version__` on `main` when its PR is ready to merge, and it makes that bump alone: two independent persisted changes never share one. Before the PR merges, its issue announces N → N + 1, the new fields and the migration rule on #23, the home of protocol numbering. If `main` moves past N first, the PR rebases, takes the new N + 1 and says so there; after the merge, #23 records the squash commit. No number is reserved ahead of time. Label 6 stays skipped: never written, and refused as unknown like a future label (`tests/test_state.py`, `test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged`). Each bump states its migration rule in this section, in the form above: what a file of the previous protocol loads as, what an older-labelled file carrying the new state is refused as, and which new field a file of the new protocol must carry.
@@ -778,8 +793,9 @@ them (a link anywhere in their path refuses that launch), lie there
 whatever `execution.worktree_dir` says, and are never deleted, moved or
 pruned by AutoForge: remove an issue's with its worktree. Nothing in
 `state.json` names them; they are derived from the git directory and the
-worktree name (D17.1), so a run resumes under either mode with no
-migration (D15.3).
+worktree name (D17.1), so a run resumes under a stronger mode, or under a
+weaker one the operator accepted (`sandbox_pin`, #280), with no migration
+(D15.3).
 
 What an agent commits under enforcement stays in `objects/` until the
 controller imports it strictly into the shared store (D6.5), which it does

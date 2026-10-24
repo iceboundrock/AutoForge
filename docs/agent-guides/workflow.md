@@ -495,7 +495,9 @@ its profile routing and its agent worktree root (#219,
 re-entry under another model or in another, empty worktree is not the same
 phase continued, so a difference refuses before anything runs, unless the
 operator accepts it with `--accept-config-change`, which the run log
-records. The engine cannot tell a first entry from a re-entry after an
+records. Every run, LOCAL included, is also held to the `sandbox.mode` it
+is pinned to: a weaker one is refused the same way, with the same opt-in
+(#280). The engine cannot tell a first entry from a re-entry after an
 interrupted step (timeout, non-zero exit, malformed result, verification
 failure, refused run-log write, crash). In every one of those the agent
 may already have done its GitHub work. GitHub
