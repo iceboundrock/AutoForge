@@ -135,9 +135,14 @@ jobs:
       # floating major tags after v7, so `@v10` does not resolve.
       - uses: astral-sh/setup-uv@v10.0.1
         with:
+          # The uv the release build of pypi-publish.yml uses, pinned to the
+          # same version and archive SHA-256 there (test_publish_workflow.py).
+          version: "0.13.5"
+          checksum: "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f"
           python-version: ${{ matrix.python-version }}
-          # No cache: the build backend is resolved and fetched afresh, as
-          # for a release build.
+          # No cache: the build backend that build-constraints.txt pins is
+          # fetched afresh and checked against its hashes, as for a release
+          # build.
           enable-cache: false
       - run: make dist-check DIST_PYTHON=${{ matrix.python-version }}
 

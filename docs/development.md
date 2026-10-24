@@ -183,7 +183,11 @@ credential:
    checkout, so a stale `*.egg-info` or an ignored file of the working tree
    cannot reach an artifact;
 2. builds the sdist from that copy and the wheel from the sdist
-   (`uv build`), which is how an installer builds the sdist too;
+   (`uv build`), which is how an installer builds the sdist too, with the
+   build backend [`build-constraints.txt`](../build-constraints.txt) pins:
+   that setuptools, installed only if its SHA-256 is one the file lists
+   (`--build-constraints`, `--require-hashes`), and the wheel must name it
+   as its `Generator`;
 3. checks both: the exact set of files each ships (every module and every
    prompt template, `LICENSE`, and nothing else; `MANIFEST.in` keeps the
    tests out of the sdist), `LICENSE` byte for byte, and the core metadata

@@ -23,7 +23,12 @@
 # workflow uses no secret.
 #
 # Every action is pinned to a full commit SHA; the comment names its release.
-# tests/test_publish_workflow.py keeps all of the above.
+# uv is pinned to one version and the SHA-256 of its archive, the same pin as
+# CI's `dist` job, and the build backend to the hashes of
+# build-constraints.txt. One input is not pinned by content: the
+# publish action runs in a container image it pulls from ghcr.io by a tag
+# (the commit SHA), and a registry tag can be moved; docs/releasing.md
+# records this. tests/test_publish_workflow.py keeps all of the above.
 name: pypi-publish
 
 on:
@@ -59,6 +64,10 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          # The uv CI's dist job runs, and its x86_64 Linux archive's SHA-256
+          # (setup-uv v10.0.1 knows no checksum for it on its own).
+          version: "0.13.5"
+          checksum: "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f"
           python-version: "3.12"
           enable-cache: false
       - name: Check the tag, build once, inspect, install outside the checkout and run

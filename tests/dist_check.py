@@ -4,7 +4,9 @@
 ``.github/workflows/ci.yml`` on every Python the CI matrix tests. It needs
 ``uv`` and ``git`` on ``PATH`` and nothing else: no GitHub call, no
 credential, no agent CLI. Its only network access is ``uv`` fetching the
-build backend (``[build-system] requires``) from the package index.
+build backend (``[build-system] requires``) from the package index, pinned
+by ``build-constraints.txt`` and installed only if its SHA-256 is one that
+file lists (``--build-constraints``, ``--require-hashes``).
 
 It runs on the interpreter it checks (``uv run --no-project --python X
 python -I tests/dist_check.py``). Isolated mode (``-I``) keeps this file's
@@ -17,7 +19,8 @@ imports the ``autoforge`` of the source tree:
    ``SOURCES.txt`` setuptools would carry into the sdist, or ``build/``)
    reaches the artifacts, and the tree itself is never written. ``uv build``
    writes the sdist of that copy, then a wheel built from that sdist, into
-   ``--out-dir`` (else a temporary directory outside the source tree).
+   ``--out-dir`` (else a temporary directory outside the source tree). The
+   wheel must name the pinned backend as its ``Generator``.
 2. The sdist holds exactly ``LICENSE``, ``MANIFEST.in``, ``README.md``,
    ``pyproject.toml``, ``PKG-INFO``, ``setup.cfg``, the egg-info, the modules and the
    resources ``[tool.setuptools.package-data]`` declares. The wheel holds
@@ -82,10 +85,18 @@ SDIST_TOP_FILES = frozenset(
 )
 # The oldest core-metadata version with License-Expression (PEP 639).
 MIN_METADATA_VERSION = (2, 4)
-# The versions the release procedure allows (docs/releasing.md): PEP 440 in its
-# canonical form, X.Y.Z with an optional aN / bN / rcN pre-release. A release's
-# tag is `v` and that version.
+# The versions a release may have (docs/releasing.md): PEP 440 in its canonical
+# form, X.Y.Z with an optional aN / bN / rcN pre-release. A release's tag is `v`
+# and that version.
 RELEASE_VERSION = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)((a|b|rc)(0|[1-9]\d*))?")
+# The versions `main` may carry: a release version, or one with a PEP 440
+# development suffix .devM between releases (0.1.0a1.dev0 after 0.1.0a0 is
+# published). A release build refuses a .devM version.
+DEVELOPMENT_VERSION = re.compile(RELEASE_VERSION.pattern + r"(\.dev(0|[1-9]\d*))?")
+# The build backend's pins, with their hashes (#295).
+BUILD_CONSTRAINTS = "build-constraints.txt"
+_PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][0-9A-Za-z.!+-]*)")
+_HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
 # The feature slug of the LOCAL dry run.
 LOCAL_SLUG = "dist-check"
 # The URLs of the REMOTE dry run: never read, since a dry run calls no gh.
@@ -328,8 +339,40 @@ def copy_source(work: Path) -> Path:
     return copy
 
 
+def build_constraints(root: Path = REPO_ROOT) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """``build-constraints.txt``: each pinned name, its version and its SHA-256 hashes.
+
+    Strict: every requirement is ``name==version`` with at least one
+    ``--hash=sha256:`` option and nothing else, so ``--require-hashes`` can
+    never meet a pin it would resolve freely.
+    """
+    text = (root / BUILD_CONSTRAINTS).read_text(encoding="utf-8")
+    pins: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for line in re.sub(r"\\\n", " ", text).splitlines():
+        words = line.split("#", 1)[0].split()
+        if not words:
+            continue
+        pin = _PIN.fullmatch(words[0])
+        _check(pin is not None, f"{BUILD_CONSTRAINTS}: {words[0]!r} is not name==version")
+        assert pin is not None
+        hashes = tuple(words[1:])
+        _check(
+            bool(hashes) and all(_HASH.fullmatch(word) for word in hashes),
+            f"{BUILD_CONSTRAINTS}: {pin.group(1)} needs --hash=sha256:<digest> options only",
+        )
+        name = re.sub(r"[-_.]+", "-", pin.group(1)).lower()
+        _check(name not in pins, f"{BUILD_CONSTRAINTS}: {name} is pinned twice")
+        pins[name] = (pin.group(2), hashes)
+    _check(bool(pins), f"{BUILD_CONSTRAINTS} pins nothing")
+    return pins
+
+
 def build(source: Path, out_dir: Path) -> tuple[Path, Path]:
-    """``uv build``: the sdist of ``source``, then a wheel built from it, into ``out_dir``."""
+    """``uv build``: the sdist of ``source``, then a wheel built from it, into ``out_dir``.
+
+    The backend is installed from ``build-constraints.txt`` only, each file
+    checked against the hashes there.
+    """
     uv = os.environ.get("UV") or shutil.which("uv")
     _check(uv is not None, "uv is not on PATH")
     assert uv is not None
@@ -341,6 +384,9 @@ def build(source: Path, out_dir: Path) -> tuple[Path, Path]:
             "--python",
             sys.executable,
             "--no-create-gitignore",
+            "--build-constraints",
+            str(source / BUILD_CONSTRAINTS),
+            "--require-hashes",
             "--out-dir",
             str(out_dir),
             str(source),
@@ -521,7 +567,8 @@ def check_release_tag(tag: str, version: str) -> None:
     """A release is built only from the tag ``v<version>`` of a version the procedure allows."""
     _check(
         RELEASE_VERSION.fullmatch(version) is not None,
-        f"the version {version!r} is not a release version X.Y.Z[aN|bN|rcN] (docs/releasing.md)",
+        f"the version {version!r} is not a release version X.Y.Z[aN|bN|rcN]: a .devM "
+        "version is never released (docs/releasing.md)",
     )
     _check(
         tag == f"v{version}",
@@ -584,7 +631,12 @@ def check_distributions(
         stem = distribution_stem(name, version)
         check_sdist(sdist, stem, data, source)
         generator = check_wheel(wheel, stem, data, source)
-        _say(f"built by {generator}")
+        backend = build_constraints(source)["setuptools"][0]
+        _check(
+            generator == f"setuptools ({backend})",
+            f"the wheel was built by {generator!r}, not the pinned setuptools {backend}",
+        )
+        _say(f"built by {generator}, the version {BUILD_CONSTRAINTS} pins")
         bin_dir = install(wheel, work)
         _check(not bin_dir.is_relative_to(REPO_ROOT), "the environment is inside the source tree")
         smoke(bin_dir, work, version)

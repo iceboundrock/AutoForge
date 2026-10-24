@@ -5,12 +5,11 @@ so.
 
 ## 0.1.0a0 (unreleased)
 
-The version is set to `0.1.0a0`, #295's registration prerelease of
+The version is `0.1.0a0`, #295's registration prerelease of
 `autoforge-cli`: a pre-Alpha snapshot, not validated for unattended
-production use, and not the Public Alpha (#255). It is not tagged or
-published yet; this heading gets its date when it is
-([Releasing](docs/releasing.md)). Until then, everything below is on `main`
-only.
+production use, and not the Public Alpha (#255). The heading says
+`unreleased` until the release-prep commit the release's tag names gives it
+its date ([Releasing](docs/releasing.md#the-changelog)).
 
 ### PyPI publishing through Trusted Publishing (#295)
 
@@ -21,8 +20,18 @@ only.
   `publish` job in the protected `pypi` environment, the only one with
   `id-token: write`, re-verifies exactly those files and uploads them with
   attestations. Every action is pinned to a commit SHA; no PyPI token or
-  repository secret exists. Nothing is published until the maintainer has
-  done the one-time setup, pushed a tag and approved the deployment.
+  repository secret exists. An upload needs the maintainer's one-time
+  setup, a version tag the maintainer pushed and the maintainer's approval
+  of that run's deployment.
+- The release build's tools are pinned by content: uv by version and the
+  SHA-256 of its archive, the same pin as CI's `dist` job, and the build
+  backend by `build-constraints.txt`, whose setuptools `uv build` installs
+  only with a listed SHA-256 (`make dist-check` and the `dist` job too).
+  The publish action's container image is pulled by a registry tag, which
+  a commit pin does not fix; [Releasing](docs/releasing.md#the-workflow)
+  records this residual.
+- Between releases `main` carries a development version `X.Y.Z[aN].devM`
+  (after `0.1.0a0`, `0.1.0a1.dev0`); a release build refuses one.
 - [Releasing](docs/releasing.md#publishing-to-pypi) documents that setup
   (the PyPI pending trusted publisher, the `pypi` environment, the tag
   ruleset), rehearsals, troubleshooting and the checks after an upload,
@@ -51,10 +60,10 @@ only.
   first prerelease claims Linux x86_64 with CPython 3.11 and 3.12 only;
   Windows is unsupported.
 - The [README](README.md#installation) documents installing the command
-  with `uv tool` from a git commit or a built wheel, and from PyPI once
-  `autoforge-cli` is published (#295); [Releasing](docs/releasing.md)
-  documents the version and tag scheme and the release procedure. No
-  release is cut and nothing is published.
+  with `uv tool` from PyPI, where `autoforge-cli` is published as
+  prereleases (#295), from a git commit or from a built wheel;
+  [Releasing](docs/releasing.md) documents the version and tag scheme and
+  the release procedure.
 
 ### Security policy and security boundaries (#257)
 

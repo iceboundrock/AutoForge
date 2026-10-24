@@ -43,13 +43,18 @@ release.
 ## Version scheme
 
 Versions follow [PEP 440](https://peps.python.org/pep-0440/), in its
-canonical form `X.Y.Z` with an optional pre-release suffix `aN`, `bN` or
-`rcN` (no `.devN`, `.postN` or local `+...` part).
-`tests/test_packaging.py` refuses any other form.
+canonical form. A release's version is `X.Y.Z` with an optional
+pre-release suffix `aN`, `bN` or `rcN`. Between releases, `main` carries
+the next version with a development suffix `.devM`, so that nothing built
+from `main` bears the number of a published release; a release build
+(`tests/dist_check.py --release-tag`) refuses a `.devM` version. No version
+has a `.postN` or local `+...` part, and `tests/test_packaging.py` refuses
+any other form.
 
 | Version | What it is |
 |---|---|
 | `0.1.0a0` | the registration prerelease of #295: the first upload, pre-Alpha, not the Go |
+| `0.1.0a1.dev0`, `0.1.0a1.dev1`, ... | `main` after `0.1.0a0` is published; never released |
 | `0.1.0a1`, `0.1.0a2`, ... | Public Alpha prereleases; the first one after #255's Go is the Public Alpha |
 | `0.1.0b1`, `0.1.0rc1`, `0.1.0` | later, when the project decides |
 
@@ -78,7 +83,8 @@ with the date.
 ## Procedure
 
 1. **Release-prep pull request.** From a feature branch, never on `main`:
-   set the version in `pyproject.toml` and `src/autoforge/__init__.py`;
+   set the version in `pyproject.toml` and `src/autoforge/__init__.py`
+   (`main`'s development version without its `.devM` suffix);
    turn `## Unreleased` into the release's section; re-check every cell of
    [the compatibility matrix](compatibility.md) against this commit and the
    current releases of each tool, and record the date; update
@@ -142,8 +148,20 @@ with the date.
 9. **Verify what was published,** from the index, in a clean environment
    outside any checkout ([After the upload](#after-the-upload)).
 10. **Record** the tag, the commit, the workflow run, the SHA-256 of each
-    file, the PyPI URL and the verification on the release's issues (for
-    `0.1.0a0`, #295, #256 and #255; for the Public Alpha, #255).
+    file, the PyPI URL, the image digest the `publish` step's log names
+    ([The workflow](#the-workflow)) and the verification on the release's
+    issues (for `0.1.0a0`, #295, #256 and #255; for the Public Alpha, #255).
+11. **Follow-up pull request, right after the upload.** From a feature
+    branch:
+    - set `main` to the next development version, in both places (after
+      `0.1.0a0`, `0.1.0a1.dev0`), and open a new, empty `## Unreleased`
+      section in `CHANGELOG.md`;
+    - after the first upload, correct every statement that says
+      `autoforge-cli` is not published yet: [`SECURITY.md`](../SECURITY.md),
+      [Security boundaries](security.md) and
+      [Compatibility](compatibility.md); the README's Installation section
+      is written to stay true, and is checked too;
+    - link the record of step 10 on #256 and #255 from the pull request.
 
 ## Publishing to PyPI
 
@@ -184,6 +202,39 @@ Every action is pinned by full commit SHA, with its release tag beside it.
 The workflow uses no repository or environment secret.
 `tests/test_publish_workflow.py` fails when any of this changes: a trigger,
 a permission, the environment, a pin, or the steps of either job.
+
+What `build` runs is pinned by content as well. uv is pinned to one version
+and the SHA-256 of its x86_64 Linux archive (`version` and `checksum` of
+`astral-sh/setup-uv`), the same pin as CI's `dist` job, so the release
+builds with the uv CI checked. The build backend is pinned by
+[`build-constraints.txt`](../build-constraints.txt): `uv build` installs
+setuptools only in the version listed there and only if its SHA-256 is one
+listed there (`--build-constraints`, `--require-hashes`), and the dist check
+fails a wheel that another setuptools built. The runner's own Python 3.12
+is the runner image's.
+
+**Known residual: the publish action's container image.**
+`pypa/gh-action-pypi-publish` runs in a container image it pulls from
+`ghcr.io/pypa/gh-action-pypi-publish` by a tag named after the commit SHA
+the workflow pins, and a registry tag can be moved, so the commit pin does
+not fix the code that uploads. On 2026-10-23 that tag served the image
+digest `sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc`,
+the same as the action's `release-v1` tag and not that of its `v1.14.3`
+tag (`sha256:a20ee5e9a490ada64fce0c9176418a4fd5afad3b80e70fb4745803c1309dcdfc`).
+The action documents no way to pin the image by digest, so this stays as
+it is: the image runs with the `publish` job's OIDC token, which PyPI
+exchanges for an upload token for `autoforge-cli` only, valid for minutes,
+and it also signs the PEP 740 attestations. The `publish` step's log names
+the digest it pulled; step 10 of the [procedure](#procedure) records it.
+
+To move a pin: uv's `version` and `checksum` change together in both
+workflows (the checksum is the SHA-256 of `uv-x86_64-unknown-linux-gnu.tar.gz`
+on that uv release's GitHub page), and `tests/test_publish_workflow.py`
+fails when the two workflows differ. setuptools' version and hashes in
+`build-constraints.txt` change together, to the SHA-256 that
+`https://pypi.org/pypi/setuptools/<version>/json` lists for that release's
+wheel and sdist, and `tests/test_packaging.py` fails when the file pins
+anything but the build requirements, or a pin without a hash.
 
 ### One-time setup
 
@@ -292,6 +343,8 @@ Optional, and not needed for `0.1.0a0`:
 
 5. The GitHub release attaches the files of the run's `release` artifact
    (`gh run download <run id> --name release`), the files PyPI serves.
+6. The follow-up pull request of step 11 of the [procedure](#procedure)
+   opens the next development version.
 
 ### Troubleshooting
 
@@ -299,6 +352,8 @@ Optional, and not needed for `0.1.0a0`:
 |---|---|
 | `build` fails at "Refuse anything but a version tag" | The run is not for a tag `v*` (a dispatch from a branch, say). Dispatch it from the tag. |
 | `build` fails with "the tag ... does not name the package's version" | The tag is not `v` followed by `[project].version`, or the version is not in the [scheme](#version-scheme). Nothing was uploaded; release the next version from a corrected commit. |
+| `build` fails with "a .devM version is never released" | The release-prep pull request kept `main`'s `.devM` suffix. Nothing was uploaded; release from a commit that drops it. |
+| `build` fails with "Hash mismatch for `setuptools`", or setup-uv's "Checksum ... did not match" | A file the pins name is not the file the index or the release serves. Do not loosen a pin to get past it: find out why, then fix it through a pull request and release the next version. |
 | `build` fails in the dist check | The same failure `make dist-check` shows locally; `main` should not have passed CI with it. Fix it through a pull request and release the next version. |
 | The run waits at `publish` | It waits for the required reviewer's approval: **Review deployments**. |
 | `publish` cannot deploy: the tag is not allowed to deploy to `pypi` | The ref does not match the environment's `v*` rule. |

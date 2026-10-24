@@ -13,7 +13,9 @@ installs, see ``tests/test_config.py``) and fail when
   ``run`` script interpolates an expression instead of reading a variable;
 - ``build`` stops building the artifacts once with the dist check CI runs and
   recording their digests, or ``publish`` stops re-verifying exactly those
-  files before it uploads them.
+  files before it uploads them;
+- ``build``'s uv is not pinned to one version and its archive's SHA-256, or
+  not to the same pin as CI's ``dist`` job.
 
 PyPI's trusted publisher names the workflow's file name and the environment
 (docs/releasing.md), so both are pinned here too. Nothing here runs the
@@ -40,6 +42,9 @@ DATA: dict[Any, Any] = yaml.safe_load(TEXT)
 TRIGGERS = DATA.get("on", DATA.get(True))
 JOBS: dict[str, dict[str, Any]] = DATA["jobs"]
 PINNED = re.compile(r"^[\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$")
+CI: dict[Any, Any] = yaml.safe_load(
+    (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+)
 
 
 def _steps(job: str) -> list[dict[str, Any]]:
@@ -150,6 +155,22 @@ def test_build_builds_once_with_the_dist_check_ci_runs_and_records_the_digests()
         "${{ runner.temp }}/release/SHA256SUMS",
     ]
     assert upload["if-no-files-found"] == "error"
+
+
+def test_build_uses_the_uv_of_ci_dist_job_pinned_by_version_and_checksum():
+    """One uv, by exact version and archive SHA-256, for the release build and CI's dist job."""
+    setup = _step("build", "astral-sh/setup-uv")["with"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", setup["version"]), setup["version"]
+    assert re.fullmatch(r"[0-9a-f]{64}", setup["checksum"]), setup["checksum"]
+    (ci_step,) = [
+        step
+        for step in CI["jobs"]["dist"]["steps"]
+        if step.get("uses", "").startswith("astral-sh/setup-uv@")
+    ]
+    pin = {key: setup[key] for key in ("version", "checksum")}
+    assert {key: ci_step["with"].get(key) for key in pin} == pin
+    (release,) = re.findall(r"astral-sh/setup-uv@[0-9a-f]{40} # (v[\d.]+)", TEXT)
+    assert ci_step["uses"] == f"astral-sh/setup-uv@{release}"
 
 
 def test_publish_reverifies_exactly_the_recorded_files_and_uploads_them_with_attestations():

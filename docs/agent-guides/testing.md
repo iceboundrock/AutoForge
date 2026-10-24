@@ -1433,7 +1433,11 @@ without building:
   copyright line, declared through PEP 639 (`license`, `license-files`, a
   setuptools floor that supports them, no License classifier)
 - `[project].version` equals `autoforge.__version__` and is a canonical
-  release or pre-release version
+  release or pre-release version, or one with a `.devM` suffix between
+  releases, which the release build refuses
+- `build-constraints.txt` pins exactly the build requirements, each to one
+  final version that satisfies them with at least one SHA-256, and its
+  parser refuses a pin without a hash or with any other option
 - every non-Python file under `src/autoforge/` is declared package data or
   deliberately left out, the prompt directory holds exactly the registered
   templates, and only the known modules read package resources
@@ -1468,6 +1472,8 @@ step outputs it hands on. `tests/test_publish_workflow.py` reads
   exactly once with the dist check on a CI Python, or uploading the files
   and `SHA256SUMS`, or `publish` stops re-verifying them before the upload,
   with attestations and without `skip-existing`
+- `build`'s uv is not one exact version with its archive's SHA-256, or not
+  the same pin as CI's `dist` job
 - the re-verify script itself, run with `bash` on synthetic files, accepts
   a changed file, an extra file, another version, a different
   `SHA256SUMS` or no recorded digests

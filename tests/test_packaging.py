@@ -57,9 +57,10 @@ PACKAGE_RELATIVE_READS = {
 }
 # Ways to reach a package resource other than __file__; none is used today.
 RESOURCE_MODULES = ("importlib.resources", "importlib_resources", "pkgutil", "pkg_resources")
-# The versions the release procedure allows (docs/releasing.md), shared with the
-# release build's tag check.
+# The versions a release may have, and those `main` may carry between releases
+# (docs/releasing.md), shared with the release build's tag check.
 RELEASE_VERSION = dist_check.RELEASE_VERSION
+DEVELOPMENT_VERSION = dist_check.DEVELOPMENT_VERSION
 # The copyright line #256 D1 recorded.
 COPYRIGHT = "Copyright (c) 2026 Ruoshi Li"
 
@@ -102,12 +103,83 @@ def test_the_build_backend_supports_license_expressions():
     assert DATA["build-system"]["build-backend"] == "setuptools.build_meta"
 
 
-def test_the_version_has_one_value():
-    """pyproject.toml and `autoforge.__version__` agree, in the release scheme's form."""
-    assert PROJECT["version"] == autoforge.__version__
-    assert RELEASE_VERSION.fullmatch(PROJECT["version"]), (
-        f"{PROJECT['version']!r} is not X.Y.Z[aN|bN|rcN] (docs/releasing.md)"
+def test_the_build_backend_is_pinned_with_its_hashes():
+    """build-constraints.txt pins exactly the build requirements, each with a SHA-256 (#295)."""
+    pins = dist_check.build_constraints()
+    requires = {}
+    for requirement in DATA["build-system"]["requires"]:
+        match = re.fullmatch(r"([A-Za-z0-9._-]+)>=(\d+(?:\.\d+)*)", requirement)
+        assert match, f"unexpected build requirement {requirement!r}; update this test"
+        requires[match.group(1).lower()] = tuple(int(n) for n in match.group(2).split("."))
+    assert set(pins) == set(requires)
+    for name, (version, hashes) in pins.items():
+        assert re.fullmatch(r"\d+(\.\d+)*", version), f"{name}=={version} is not a final release"
+        assert tuple(int(n) for n in version.split(".")) >= requires[name]
+        assert len(set(hashes)) == len(hashes) >= 1
+
+
+_HASH_0, _HASH_1 = (f"--hash=sha256:{digit * 64}" for digit in "01")
+
+
+@pytest.mark.parametrize(
+    "text, reason",
+    [
+        ("setuptools>=84\n", "is not name==version"),
+        ("setuptools==84.2.1\n", "needs --hash=sha256"),
+        ("setuptools==84.2.1 --hash=md5:00\n", "needs --hash=sha256"),
+        (f"setuptools==84.2.1 --index-url https://example.invalid {_HASH_0}", "needs --hash"),
+        (f"setuptools==84.2.1 {_HASH_0}\nSetuptools==84.2.0 {_HASH_1}\n", "pinned twice"),
+        ("# nothing\n", "pins nothing"),
+    ],
+)
+def test_the_build_constraints_refuse_a_pin_without_a_hash(tmp_path: Path, text: str, reason: str):
+    (tmp_path / dist_check.BUILD_CONSTRAINTS).write_text(text, encoding="utf-8")
+    with pytest.raises(CheckFailed, match=reason):
+        dist_check.build_constraints(tmp_path)
+
+
+def test_the_build_constraints_read_continued_lines(tmp_path: Path):
+    digest = "a" * 64
+    (tmp_path / dist_check.BUILD_CONSTRAINTS).write_text(
+        f"# comment\nsetuptools==84.2.1 \\\n    --hash=sha256:{digest}  # wheel\n", encoding="utf-8"
     )
+    assert dist_check.build_constraints(tmp_path) == {
+        "setuptools": ("84.2.1", (f"--hash=sha256:{digest}",))
+    }
+
+
+def test_the_version_has_one_value():
+    """pyproject.toml and `autoforge.__version__` agree, in the version scheme's form."""
+    assert PROJECT["version"] == autoforge.__version__
+    assert DEVELOPMENT_VERSION.fullmatch(PROJECT["version"]), (
+        f"{PROJECT['version']!r} is not X.Y.Z[aN|bN|rcN][.devM] (docs/releasing.md)"
+    )
+
+
+@pytest.mark.parametrize(
+    "version, released",
+    [
+        ("0.1.0a0", True),
+        ("0.1.0a1", True),
+        ("0.1.0rc1", True),
+        ("1.2.3", True),
+        ("0.1.0a1.dev0", False),
+        ("0.1.0a1.dev12", False),
+        ("0.1.0.dev0", False),
+    ],
+)
+def test_main_carries_a_release_or_a_development_version(version: str, released: bool):
+    """`main` may carry X.Y.Z[aN|bN|rcN].devM between releases; only the rest is released."""
+    assert DEVELOPMENT_VERSION.fullmatch(version)
+    assert bool(RELEASE_VERSION.fullmatch(version)) is released
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["0.1.0a1.dev", "0.1.0a1.dev01", "0.1.0a1-dev0", "0.1.0a1.post1", "0.1.0a1.dev0+local", "0.1"],
+)
+def test_main_carries_no_other_version(version: str):
+    assert not DEVELOPMENT_VERSION.fullmatch(version)
 
 
 def test_every_file_in_the_package_is_shipped_or_named_as_not_shipped():
@@ -228,9 +300,9 @@ def _metadata(**overrides: str) -> str:
     return "".join(f"{k}: {v}\n" for k, v in fields) + "\nREADME\n"
 
 
-def _wheel(tmp_path: Path, drop: str = "", metadata: str | None = None) -> Path:
-    path = tmp_path / f"{STEM}-py3-none-any.whl"
-    info = f"{STEM}.dist-info/"
+def _wheel(tmp_path: Path, drop: str = "", metadata: str | None = None, stem: str = STEM) -> Path:
+    path = tmp_path / f"{stem}-py3-none-any.whl"
+    info = f"{stem}.dist-info/"
     with zipfile.ZipFile(path, "w") as archive:
         for name in sorted(dist_check.wheel_package_files() - {drop}):
             archive.writestr(name, (REPO_ROOT / "src" / name).read_bytes())
@@ -327,6 +399,7 @@ def test_a_release_tag_names_its_version(tag: str, version: str):
         ("refs/tags/v0.1.0a0", "0.1.0a0", "does not name"),
         ("v0.1.0-alpha0", "0.1.0a0", "does not name"),
         ("v0.1.0.dev1", "0.1.0.dev1", "not a release version"),
+        ("v0.1.0a1.dev0", "0.1.0a1.dev0", "never released"),
         ("v0.1.0a0+local", "0.1.0a0+local", "not a release version"),
         ("v01.1.0", "01.1.0", "not a release version"),
     ],
@@ -348,6 +421,25 @@ def test_the_release_build_refuses_a_wrong_tag_before_it_builds(monkeypatch, cap
     monkeypatch.setattr(dist_check, "build", no_build)
     assert dist_check.main(["--release-tag", "v0.0.0"]) == 1
     assert "does not name the package's version" in capsys.readouterr().err
+
+
+def test_a_development_version_builds_but_is_never_released(tmp_path: Path, monkeypatch, capsys):
+    """A .devM `main` passes the artifact checks; `--release-tag` refuses it before it builds."""
+    version = "0.1.0a1.dev0"
+    data = {**DATA, "project": {**PROJECT, "version": version}}
+    stem = dist_check.distribution_stem(PROJECT["name"], version)
+    assert stem == "autoforge_cli-0.1.0a1.dev0"
+    wheel = _wheel(tmp_path, metadata=_metadata(Version=version), stem=stem)
+    assert dist_check.check_wheel(wheel, stem, data) == "synthetic"
+
+    def no_build(*args, **kwargs):  # pragma: no cover - reaching it is the failure
+        raise AssertionError("built a release of a development version")
+
+    monkeypatch.setattr(dist_check, "pyproject", lambda root=REPO_ROOT: data)
+    monkeypatch.setattr(dist_check, "copy_source", no_build)
+    monkeypatch.setattr(dist_check, "build", no_build)
+    assert dist_check.main(["--release-tag", f"v{version}"]) == 1
+    assert "a .devM version is never released" in capsys.readouterr().err
 
 
 def test_the_digests_become_the_steps_outputs_and_sha256sums(tmp_path: Path, monkeypatch):
