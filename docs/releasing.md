@@ -35,8 +35,11 @@ release.
   `pyproject.toml`), and PyPI resolves no relative link. Its Prerequisites
   and Installation sections therefore link absolutely, to `main`; the
   relative links of its other sections are broken on PyPI, a known
-  limitation. Text in the README stays true after an upload: it never says
-  that nothing is published.
+  limitation. Text in the README stays true both before and after an
+  upload: it never says that nothing is published, and never that a
+  version is. Its PyPI method is conditional on a published version and
+  points at the releases page for which ones exist; the git commit and
+  built wheel methods are the ones that work from any commit.
 
 ## Version scheme
 
