@@ -3,9 +3,11 @@
 # procedure, and what to check after an upload.
 #
 # It runs only for a version tag: on the push of a tag `v*`, or by hand
-# (`workflow_dispatch`) with "Use workflow from" set to such a tag, so that
-# the workflow file, the code and the deployment ref of a run are all the
-# tag's. It never runs on a pull request or a branch, and takes no input.
+# (`workflow_dispatch`) for such a tag, with `gh workflow run
+# pypi-publish.yml --ref <tag>` (not the Actions tab's form, whose documented
+# selector picks a branch), so that the workflow file, the code and the
+# deployment ref of a run are all the tag's. It never runs on a pull request
+# or a branch, and takes no input.
 #
 # `build` reads the repository and cannot mint an OIDC token. It refuses any
 # ref but a version tag, then builds the sdist and the wheel exactly once

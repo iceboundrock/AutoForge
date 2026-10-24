@@ -184,10 +184,21 @@ pushed and the maintainer's approval of that run's deployment.
 ### The workflow
 
 [`.github/workflows/pypi-publish.yml`](../.github/workflows/pypi-publish.yml)
-runs only for a version tag: when a tag `v*` is pushed, or by hand from the
-Actions tab with **Use workflow from** set to such a tag. It never runs on
-a pull request or a branch push and takes no input, so the workflow file,
-the code and the deployment ref of a run are all the tag's.
+runs only for a version tag: when a tag `v*` is pushed, or when it is
+dispatched by hand for such a tag, from your checkout:
+
+```bash
+gh workflow run pypi-publish.yml --ref v0.1.0a0
+```
+
+`--ref` takes a branch or a tag, and so does the `ref` of the REST API's
+[workflow dispatch](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
+(`POST /repos/iceboundrock/AutoForge/actions/workflows/pypi-publish.yml/dispatches`).
+The procedure does not use the Actions tab's **Run workflow** form, whose
+documented selector picks a branch, and `build` refuses a run for a branch.
+The workflow never runs on a pull request or a branch push and takes no
+input, so the workflow file, the code and the deployment ref of a run are
+all the tag's.
 
 1. **`build`**, with `contents: read` and no `id-token`: checks out the tag
    without keeping the token, checks that the tag is `v` followed by
@@ -359,7 +370,7 @@ Optional, and not needed for `0.1.0a0`:
 
 | Symptom | Cause and what to do |
 |---|---|
-| `build` fails at "Refuse anything but a version tag" | The run is not for a tag `v*` (a dispatch from a branch, say). Dispatch it from the tag. |
+| `build` fails at "Refuse anything but a version tag" | The run is not for a tag `v*` (a dispatch for a branch, say). Dispatch it for the tag: `gh workflow run pypi-publish.yml --ref <tag>` ([The workflow](#the-workflow)). |
 | `build` fails with "the tag ... does not name the package's version" | The tag is not `v` followed by `[project].version`, or the version is not in the [scheme](#version-scheme). Nothing was uploaded; release the next version from a corrected commit. |
 | `build` fails with "a .devM version is never released" | The release-prep pull request kept `main`'s `.devM` suffix. Nothing was uploaded; release from a commit that drops it. |
 | `build` fails with "Hash mismatch for `setuptools`", or setup-uv's "Checksum ... did not match" | A file the pins name is not the file the index or the release serves. Do not loosen a pin to get past it: find out why, then fix it through a pull request and release the next version. |
