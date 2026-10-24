@@ -35,6 +35,33 @@ so.
   or UNKNOWN (no such pull request, a plan limit, a not-found or a
   transient failure; never a PASS).
 
+### License, packaging and installation (#256)
+
+- AutoForge is licensed under the MIT License ([`LICENSE`](LICENSE)),
+  declared as PEP 639 metadata (`License-Expression: MIT`).
+- The distribution is renamed **`autoforge-cli`**; the import package and
+  the `autoforge` command keep their names. The `autoforge` distribution on
+  PyPI is an unrelated project. In a development clone, `make sync` (or
+  `uv sync`) replaces the old editable install.
+- The wheel now ships every prompt template. Before, a wheel built from
+  this repository had none of them, so an installed `autoforge` could not
+  render a prompt; only the editable install of a clone worked.
+- New CI job `dist` (`make dist-check`, on Python 3.11 and 3.12, part of
+  the required `ci` check): builds the sdist and a wheel from it, checks
+  their files and metadata, installs the wheel outside the checkout, runs
+  `autoforge --version` and `--help`, renders every template from the
+  installed package and runs a LOCAL and a REMOTE dry run (the REMOTE one
+  calls no `gh`).
+- [Compatibility](docs/compatibility.md): what AutoForge runs on, each
+  entry labelled supported, untested or unsupported with its evidence. The
+  first prerelease claims Linux x86_64 with CPython 3.11 and 3.12 only;
+  Windows is unsupported.
+- The [README](README.md#installation) documents installing the command
+  with `uv tool` from a git commit or a built wheel, and from PyPI once
+  `autoforge-cli` is published (#295); [Releasing](docs/releasing.md)
+  documents the version and tag scheme and the release procedure. No
+  release is cut and nothing is published.
+
 ### Security policy and security boundaries (#257)
 
 - [`SECURITY.md`](SECURITY.md): supported versions (the latest commit of

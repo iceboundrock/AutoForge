@@ -6,6 +6,10 @@ For the GitHub-free workflow see [Local mode](local-mode.md); for the config
 file see [Configuration](configuration.md). Installation and prerequisites
 are in the [README](../README.md#prerequisites).
 
+The commands are written `uv run autoforge ...`, the form inside a
+development clone of AutoForge. With the command installed
+([Installation](../README.md#installation)), drop the `uv run`.
+
 ## Commands
 
 ```bash

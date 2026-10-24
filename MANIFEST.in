@@ -1,0 +1,7 @@
+# The sdist carries what building the wheel needs: pyproject.toml, README.md,
+# LICENSE and src/, whose resources [tool.setuptools.package-data] declares.
+# setuptools would also add tests/test_*.py by default, but not the fixtures
+# and fakes those need (tests/conftest.py, tests/fixtures/), so that copy
+# could not run; the suite runs from a checkout (docs/development.md).
+# tests/dist_check.py checks the sdist's file list.
+prune tests

@@ -1639,7 +1639,7 @@ def _minimal_yaml_parse(text: str) -> object:
 # -- the YAML subset parser ------------------------------------------------
 #
 # Two backends read the same `.yaml` file: PyYAML for an operator who
-# installed `autoforge[yaml]`, this parser for one who did not. A scalar the
+# installed `autoforge-cli[yaml]`, this parser for one who did not. A scalar the
 # two resolve *differently* is the failure mode the parser below is built
 # against (#40). The file it feeds decides routing, loop bounds, timeouts and
 # `safety.allow_merge`, and nothing downstream can tell that `on` was read as

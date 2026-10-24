@@ -10,12 +10,16 @@ they diverge, a green CI run stops meaning "the local checks pass", and the
 controller's MERGE gate — which requires every check on the PR to have
 succeeded — would be verifying something weaker than it looks.
 
-The one hosted job outside `make check` is ``sandbox`` (#169): the outer
+Two hosted jobs run outside `make check`. ``sandbox`` (#169) is the outer
 sandbox's real backend on the runner, which measures what the runner provides
 and requires the real-backend tests wherever it can enforce. It runs exactly
 one Makefile target, ``test-sandbox-measured``, and
 ``test_the_sandbox_job_measures_the_runner_and_requires_the_backend_where_it_can``
-pins both sides.
+pins both sides. ``dist`` (#256) builds the sdist and the wheel, installs the
+wheel outside the checkout and runs it, on every interpreter of the matrix; it
+runs exactly ``make dist-check`` with that interpreter, and
+``test_the_dist_job_checks_the_installed_artifacts_on_every_ci_python`` pins
+both sides.
 
 These are text guards, not a YAML parser (the project has no YAML dependency
 outside the optional `yaml` extra). They read the workflow with whole-line
@@ -64,6 +68,12 @@ SANDBOX_JOB_COMMANDS = [
 SANDBOX_MEASURED_TARGET = "test-sandbox-measured"
 SANDBOX_REQUIRED_TARGET = "test-sandbox"
 SANDBOX_MEASUREMENT = "uv run python -m tests.sandbox_host"
+# The hosted job that builds, installs and runs the distributions (#256), the
+# one command it runs, and what that command expands to for an interpreter.
+DIST_JOB = "dist"
+DIST_TARGET = "dist-check"
+DIST_JOB_COMMANDS = ["make dist-check DIST_PYTHON=${{ matrix.python-version }}"]
+DIST_EXPANSION = "uv run --no-project --python {version} python -I tests/dist_check.py"
 _RUN_LINE = re.compile(r"^\s*(?:-\s*)?run:\s*(.+?)\s*$", flags=re.MULTILINE)
 
 
@@ -95,8 +105,12 @@ def _block(text: str, key: str, indent: int = 0) -> str:
     raise AssertionError(f"the CI workflow declares no {key!r} block at indent {indent}")
 
 
+def _job(text: str, name: str) -> str:
+    return _block(_block(text, "jobs"), name, indent=2)
+
+
 def _sandbox_job(text: str) -> str:
-    return _block(_block(text, "jobs"), SANDBOX_JOB, indent=2)
+    return _job(text, SANDBOX_JOB)
 
 
 def _job_names(text: str) -> list[str]:
@@ -161,18 +175,21 @@ def _make_variable(name: str) -> list[str]:
     raise AssertionError(f"Makefile defines no {name} variable")
 
 
-def _make_dry_run(target: str, directory: Path = REPO_ROOT) -> list[str]:
+def _make_dry_run(
+    target: str, directory: Path = REPO_ROOT, assignments: tuple[str, ...] = ()
+) -> list[str]:
     """The commands ``make <target>`` would run, with variables and pattern rules expanded.
 
     ``directory`` is where make runs (and reads its Makefile from); ``--silent``
     also drops the "Nothing to be done" notice, so a target that expands to
-    nothing yields an empty list rather than prose.
+    nothing yields an empty list rather than prose. ``assignments`` are
+    ``NAME=value`` overrides on make's command line, as a CI step passes them.
     """
     make = shutil.which("make")
     if make is None:
         pytest.skip("GNU make is not installed; the Makefile cannot be expanded here")
     result = subprocess.run(
-        [make, "--dry-run", "--silent", "-C", str(directory), target],
+        [make, "--dry-run", "--silent", "-C", str(directory), target, *assignments],
         capture_output=True,
         text=True,
         check=False,
@@ -229,9 +246,12 @@ def test_make_check_runs_exactly_what_ci_runs():
         (*MIRRORED_MAKE_TARGETS, LOCKFILE_MAKE_TARGET)
     ), "`make check` must run the lockfile check plus the mirrored targets and nothing else"
     mirrored = {command for target in MIRRORED_MAKE_TARGETS for command in rules[target].recipe}
-    # The sandbox job is the one hosted job outside `make check`; its commands
-    # are pinned by test_the_sandbox_job_measures_the_runner_and_requires_...
-    code = _code().replace(_sandbox_job(_code()), "")
+    # The sandbox and dist jobs are the hosted jobs outside `make check`; their
+    # commands are pinned by test_the_sandbox_job_measures_the_runner_and_...
+    # and test_the_dist_job_checks_the_installed_artifacts_on_every_ci_python.
+    code = _code()
+    for job in (SANDBOX_JOB, DIST_JOB):
+        code = code.replace(_job(code, job), "")
     for command in _RUN_LINE.findall(code):
         if command in ("|", ">"):
             continue  # a block scalar: the aggregate job's `exit 1`, not a check command
@@ -286,6 +306,38 @@ def test_the_sandbox_job_measures_the_runner_and_requires_the_backend_where_it_c
         "a module that launches the real backend is not run by the sandbox targets"
     )
     assert SANDBOX_MEASURED_TARGET not in _make_rules()["check"].prerequisites
+
+
+def test_the_dist_job_checks_the_installed_artifacts_on_every_ci_python():
+    """The built artifacts are installed and run on every claimed interpreter (#256).
+
+    The `dist` job runs exactly `make dist-check` with the matrix entry's
+    interpreter, over the same interpreters as the `test` matrix and the
+    Makefile's CI_PYTHON_VERSIONS (the ones docs/compatibility.md claims), and
+    the target runs tests/dist_check.py on that bare interpreter in isolated
+    mode: no `uv sync`, so the check imports only what the wheel installed.
+    It is not part of `make check`, and its checkout keeps no token.
+    """
+    code = _code()
+    assert DIST_JOB in _job_names(code), "the CI workflow has no job for the distributions"
+    job = _job(code, DIST_JOB)
+    assert "runs-on: ubuntu-latest" in job
+    assert _RUN_LINE.findall(job) == DIST_JOB_COMMANDS
+    versions = _make_variable(MATRIX_MAKE_VARIABLE)
+    assert _matrix_python_versions(job) == versions == _matrix_python_versions(code), (
+        "the dist job must cover exactly the interpreters the test matrix covers"
+    )
+    assert "persist-credentials: false" in job, "the dist job's checkout must keep no token"
+    assert "uv sync" not in job, "the dist job must not install the project from the tree"
+    for version in versions:
+        assert _make_dry_run(DIST_TARGET, assignments=(f"DIST_PYTHON={version}",)) == [
+            DIST_EXPANSION.format(version=version)
+        ]
+    (default,) = _make_dry_run(DIST_TARGET)
+    assert default.split()[4] in versions, (
+        f"`make {DIST_TARGET}` without DIST_PYTHON must use a CI interpreter: {default!r}"
+    )
+    assert DIST_TARGET not in _make_rules()["check"].prerequisites
 
 
 def test_ci_installs_from_the_lockfile():

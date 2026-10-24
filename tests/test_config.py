@@ -93,7 +93,7 @@ def no_pyyaml(monkeypatch):
 def yaml_backend(request):
     """Run a YAML case under PyYAML and under the subset parser.
 
-    An operator with ``autoforge[yaml]`` reads every config through PyYAML,
+    An operator with ``autoforge-cli[yaml]`` reads every config through PyYAML,
     and PyYAML's own answers (last duplicate wins, any root type, typed keys)
     are exactly where the loader's fail-closed rules need their own check,
     so a rule proven only on the subset parser is proven on the wrong path.
@@ -1517,7 +1517,7 @@ def test_premerge_verification_keys_reject_bad_shapes(tmp_path, section, body, k
 
 # -- the two YAML backends must read the same file the same way (#40) -------
 #
-# An operator who installed `autoforge[yaml]` reads every `.yaml` config
+# An operator who installed `autoforge-cli[yaml]` reads every `.yaml` config
 # through PyYAML; one who did not reads it through the built-in subset
 # parser. The file decides routing, loop bounds, timeouts and
 # `safety.allow_merge`, and nothing downstream can notice that `on` was read
@@ -1985,7 +1985,7 @@ def test_dev_group_keeps_pyyaml_so_ci_exercises_the_pyyaml_branch():
     their PyYAML half when it does not. CI installs `--group dev` and nothing
     else, so dropping PyYAML from that group would retire this whole file's
     PyYAML coverage silently, leaving the branch an operator gets from
-    `pip install autoforge[yaml]` exercised by no environment (#40).
+    the `yaml` extra of `autoforge-cli` exercised by no environment (#40).
     """
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
