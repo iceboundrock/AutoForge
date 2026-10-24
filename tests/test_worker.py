@@ -362,6 +362,13 @@ def _refusal_cases():
         w.write_config({"github": {"timeout_seconds": 77}})  # edited since the start
         return replace(args, config=w.config_path)
 
+    def config_in_the_checkout(w, args):
+        path = w.repo / "autoforge.json"  # a tree an enforced launch writes (#280)
+        path.write_text(json.dumps({"sandbox": {"mode": "required"}}), encoding="utf-8")
+        w.config_path = str(path)
+        w.start_scheduler()  # the digest matches; where the file lies does not
+        return replace(args, config=w.config_path)
+
     def l0_identity(w, args):
         return replace(args, l0_fd=os.open(w.tmp_path, os.O_RDONLY | os.O_DIRECTORY))
 
@@ -387,6 +394,7 @@ def _refusal_cases():
         "invocation": (invocation, "invocation"),
         "scheduler-invocation": (scheduler_invocation, "scheduler.json names invocation"),
         "config-digest": (config_digest_changed, "digest differs"),
+        "config-in-the-checkout": (config_in_the_checkout, "autoforge.json lies in"),
         "l0-identity": (l0_identity, "names another object"),
         "l2-identity": (l2_identity, "names another object"),
         "l0-not-held": (l0_not_held, "nothing holds it"),

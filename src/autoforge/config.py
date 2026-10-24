@@ -701,9 +701,15 @@ class SandboxConfig:
       ``required``, since nobody watches an unattended fallback (D12.2).
 
     Not part of LOCAL's run contract (D12.3): it decides how a launch is
-    contained, not what the run is, so a run resumes under another mode.
-    The candidate read and the strict import of an issue's private objects
-    (D6.3-D6.5) apply in every mode.
+    contained, not what the run is. A run is pinned to the mode it is created
+    under instead (#280, :mod:`autoforge.sandbox_pin`): a later command under
+    a stronger mode moves the pin up, and one under a weaker mode is refused
+    unless the operator accepts it with ``--accept-config-change``. Under
+    ``required`` or ``preferred`` the ``--config`` file must lie outside every
+    tree the repository's enforced launches write, or every command refuses
+    it (:func:`autoforge.sandbox_policy.config_file_problem`). The candidate
+    read and the strict import of an issue's private objects (D6.3-D6.5)
+    apply in every mode.
 
     ``validation_network`` and ``premerge_network`` are ``host`` (the
     default) or ``isolated``: a validation command (LOCAL, or REMOTE

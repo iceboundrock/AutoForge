@@ -5885,6 +5885,7 @@ def _protocol_1_state_file(eng, journal: dict, *, protocol: str = "1") -> dict:
     for key in _VALIDATION_FIELDS:  # protocol 10's own fields (#172)
         data.pop(key, None)
     data.pop("operator_comment_outcomes", None)  # protocol 11's own field (#243)
+    data.pop("sandbox_pin", None)  # protocol 12's own field (#280)
     data["phase"] = Phase.REPLAN_REEXECUTE.value
     data["current_issue_url"] = ISSUE
     data["current_pr_url"] = PR
@@ -6103,12 +6104,12 @@ def test_a_protocol_4_journal_before_the_write_loads_and_relabels(tmp_state_dir,
     eng.save()
     _protocol_1_state_file(eng, _protocol_4_journal(stage), protocol="4")
     loaded = eng.load()
-    assert loaded.protocol_version == "11"
+    assert loaded.protocol_version == "12"
     txn = _txn(eng)
     assert txn.stage is stage and not txn.journal_defects
     assert txn.source_closed_event_count == 0 and txn.close_attempts == 0
     eng.save()
-    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "11"
+    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "12"
     if stage is ReplanStage.VERIFIED:
         # The write proceeds from the relabelled journal and records the
         # watermark the protocol-4 controller never did.
@@ -6147,7 +6148,7 @@ def test_the_legacy_journal_refusal_knows_only_the_legacy_protocols():
 
     assert LEGACY_JOURNAL_PROTOCOLS == frozenset({"1", "2", "3", "4"})
     journal = _seed_dict(ReplanStage.PREPARED)
-    for protocol in ("5", "7", "8", "9", "10", "11", "0", ""):
+    for protocol in ("5", "7", "8", "9", "10", "11", "12", "0", ""):
         with pytest.raises(ValueError, match="not a legacy journal protocol"):
             legacy_journal_refusal(journal, protocol=protocol, written_by="0.1.0")
     for protocol in ("1", "2", "3"):
@@ -6178,10 +6179,10 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
-        assert loaded.protocol_version == "11"
+        assert loaded.protocol_version == "12"
         assert loaded.replan_transaction == journal
         eng.save()
-        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "11"
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "12"
     # A legacy file that predates the journal field altogether is the same
     # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
@@ -6189,7 +6190,7 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
     del data["replan_transaction"], data["acceptance_outcomes"], data["config_fingerprint"]
     for key in _VALIDATION_FIELDS:
         del data[key]
-    del data["operator_comment_outcomes"]
+    del data["operator_comment_outcomes"], data["sandbox_pin"]
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
     assert eng.load().replan_transaction == {}
 
@@ -6231,10 +6232,11 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     # this controller wrote the journal, so a missing field is a missing
     # field, whichever protocol step introduced it.
     data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "11"
+    data["protocol_version"] = "12"
     data["acceptance_outcomes"] = []
     data["config_fingerprint"] = {}
     data["operator_comment_outcomes"] = []
+    data["sandbox_pin"] = {}
     data.update(
         validation_records=[],
         validation_attempt={},

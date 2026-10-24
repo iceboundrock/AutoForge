@@ -3,8 +3,10 @@
 What ``test_sandbox_policy.py`` reads from a description, run: a fake agent
 started by the Claude Code adapter in a REMOTE issue worktree commits
 through the overlay and the controller imports its commit; a LOCAL
-validation command cannot write the git directory; an export command sees
-only its tree, without a network when asked. The module skips with the
+validation command cannot write the git directory; a LOCAL agent reaches a
+configuration file in its root, which is why one there is refused (#280),
+and none outside it; an export command sees only its tree, without a
+network when asked. The module skips with the
 probe's reason on a host that cannot enforce a launch, as
 ``test_sandbox_bwrap.py`` does.
 """
@@ -37,7 +39,13 @@ from autoforge.errors import SandboxTamperError
 from autoforge.executor import ExecutionRequest, execute
 from autoforge.providers import AgentRequest, ClaudeCodeProvider, OpenCodeProvider, PiProvider
 from autoforge.sandbox import NetworkPosition
-from autoforge.sandbox_policy import LaunchClass, LaunchFacts, SandboxPlan, describe_launch
+from autoforge.sandbox_policy import (
+    LaunchClass,
+    LaunchFacts,
+    SandboxPlan,
+    config_file_problem,
+    describe_launch,
+)
 from autoforge.transitions import Phase
 
 from .conftest import (
@@ -810,6 +818,83 @@ def test_a_local_validation_command_cannot_write_the_git_directory(backend, layo
     assert _git("-C", str(paths["repo"]), "branch", "--list", "agent-branch") == ""
     assert _git("-C", str(paths["repo"]), "stash", "list") == ""
     assert (paths["repo"] / "built.txt").exists()
+
+
+_CONFIG_TEXT = '{"version": 1, "sandbox": {"mode": "required"}}\n'
+
+
+def test_a_local_agent_reaches_a_config_file_in_its_root_and_none_outside(backend, layout):
+    """#280 through the real backend. An enforced LOCAL agent writes its
+    repository root, so a configuration file there is rewritten: that is why
+    every command refuses one (:func:`config_file_problem`). Outside the
+    root -- an operator directory, the home's ``~/.config/autoforge`` -- the
+    agent cannot reach the file, by its path, through ``..``, or through a
+    link it plants in the root, and the file is byte-identical afterwards."""
+    from dataclasses import replace
+
+    paths = layout
+    repo = paths["repo"]
+    inside = _sentinel(repo / "autoforge.json", _CONFIG_TEXT)
+    elsewhere = _sentinel(paths["base"] / "operator" / "autoforge.json", _CONFIG_TEXT)
+    in_home = _sentinel(paths["home"] / ".config" / "autoforge" / "autoforge.json", _CONFIG_TEXT)
+    facts = replace(_local_facts(paths), launch_class=LaunchClass.LOCAL_AGENT)
+    description = describe_launch(facts, None, {})
+    payload = '{"version": 1, "sandbox": {"mode": "disabled"}}\n'
+    dotdot = os.path.relpath(elsewhere, repo)
+    code = (
+        f"payload = {payload!r}\n"
+        "def rewrite(path):\n"
+        "    os.makedirs(os.path.dirname(path), exist_ok=True)\n"
+        "    with open(path + '.new', 'w') as fh:\n"
+        "        fh.write(payload)\n"
+        "    os.replace(path + '.new', path)\n"
+        "def through_link(target):\n"
+        "    os.symlink(target, 'planted.json')\n"
+        "    write('planted.json', payload)\n"
+        # The plain writes first: a rewrite creates the missing directories in
+        # the launch's own root, which nothing outside sees.
+        "report = {\n"
+        f"  'inside': attempt(lambda: rewrite({str(inside)!r})),\n"
+        f"  'elsewhere': attempt(lambda: write({str(elsewhere)!r}, payload)),\n"
+        f"  'dotdot': attempt(lambda: write({dotdot!r}, payload)),\n"
+        f"  'link': attempt(lambda: through_link({str(elsewhere)!r})),\n"
+        f"  'elsewhere_replaced': attempt(lambda: rewrite({str(elsewhere)!r})),\n"
+        f"  'in_home': attempt(lambda: rewrite({str(in_home)!r})),\n"
+        "}\n"
+        "print(json.dumps(report))\n"
+    )
+    report = _probe(description, repo, code)
+    assert report["inside"] == "ok"
+    assert inside.read_text() == payload  # the hazard the placement rule refuses
+    assert config_file_problem(str(inside), (str(repo),), "required")
+    for name in ("elsewhere", "dotdot", "link"):
+        assert report[name] == "ENOENT", (name, report)
+    assert elsewhere.read_bytes() == _CONFIG_TEXT.encode()
+    assert in_home.read_bytes() == _CONFIG_TEXT.encode()  # the launch's home is its own
+    for config in (elsewhere, in_home):
+        assert config_file_problem(str(config), (str(repo),), "required") == ""
+
+
+def test_a_required_local_run_with_its_config_file_in_the_root_launches_nothing(
+    backend, tmp_path, monkeypatch, capsys
+):
+    """#280 end to end on a host that enforces: the file the previous test
+    shows an agent rewriting is refused before the run exists, so no launch
+    ever writes it and it is byte-identical."""
+    from autoforge import cli
+
+    from .test_local import local_repo
+
+    root = local_repo(tmp_path / "work")
+    inside = _sentinel(root / "autoforge.json", _CONFIG_TEXT)
+    monkeypatch.chdir(root)
+    assert cli.main(["--config", str(inside), "local", "run", "features/add-filter.md"]) == 2
+    err = capsys.readouterr().err
+    assert f"the configuration file {inside} lies in {root}, a tree that " in err
+    assert "Nothing was run, launched or written." in err
+    assert inside.read_bytes() == _CONFIG_TEXT.encode()
+    assert not (root / ".git" / "autoforge" / "state").exists()
+    assert not (root / ".git" / "autoforge" / "sandbox").exists()
 
 
 def test_an_export_command_sees_its_tree_and_no_network_when_isolated(backend, layout):

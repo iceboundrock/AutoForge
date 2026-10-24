@@ -63,6 +63,7 @@ from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS, MAX_OPERATOR_ACT
 from .run_contract import LocalRunContract
 from .runlog import validate_run_id
 from .safefs import HardLinksUnavailable, ReadLimitExceeded, SafeRoot, entry_kind
+from .sandbox_pin import SandboxPin
 from .transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
 from .validation import parse_comment_url, parse_issue_url, parse_pr_url
 
@@ -286,11 +287,15 @@ _PRE_CONFIG_PROTOCOL = "8"
 # is loaded in every phase with them empty (D15.4), and relabelled.
 _PRE_VALIDATION_PROTOCOL = "9"
 # The label before operator acceptance actions (#243, ADR 0004 D13.10). A
-# protocol-10 file is this protocol's shape without the operator-action
+# protocol-10 file is protocol 11's shape without the operator-action
 # state: it is loaded in every phase with ``operator_comment_outcomes: []``,
 # no ``operator_targets``, ``operator_sources: null`` and
 # ``operator_evidence: []``, and relabelled.
-_PREVIOUS_PROTOCOL = "10"
+_PRE_OPERATOR_PROTOCOL = "10"
+# The label before a run pinned its sandbox mode (#280). A protocol-11 file
+# is this protocol's shape without ``sandbox_pin``: it is loaded in every
+# phase with none, which is "not checked", and relabelled.
+_PREVIOUS_PROTOCOL = "11"
 # The fields protocol 7 added (#160): the effect records, the entry
 # observation and the completion context of the current phase entry, and the
 # launch label. A legacy file never carries one; one that does is a hand edit
@@ -323,6 +328,9 @@ _VALIDATION_FIELDS = (
 # ``operator_sources`` and a REMOTE ``last_fix_resolutions`` entry's
 # ``operator_evidence`` (:func:`_operator_state_in`).
 _OPERATOR_FIELDS = ("operator_comment_outcomes",)
+# The field protocol 12 added (#280): the sandbox mode the run is pinned to
+# (:mod:`autoforge.sandbox_pin`), ``{}`` when none is.
+_PIN_FIELDS = ("sandbox_pin",)
 # ``acceptance_outcomes`` (#211): what became of each acceptance action of
 # the current PR. Bounded: at most one action is requested per FIX result,
 # and the writer drops the oldest entries past the bound
@@ -675,6 +683,14 @@ class AutoForgeState:
     # defines it) and for a run created before the field existed (not
     # checked; the next command records one). Kept across issues.
     config_fingerprint: dict = field(default_factory=dict)
+    # The sandbox mode the run is pinned to (#280), LOCAL and REMOTE alike:
+    # the mode, how and when it was pinned, in the closed form of
+    # :class:`autoforge.sandbox_pin.SandboxPin`. Written when the run is
+    # created; ``resume``, ``step`` and ``unblock`` refuse a weaker mode
+    # unless the operator accepts the change, and pin a stronger one. ``{}``
+    # for a run created before the field existed (not checked; the next
+    # command pins one). Kept across issues.
+    sandbox_pin: dict = field(default_factory=dict)
 
     # -- candidate validation evidence (ADR 0006, #172) -------------------
     # Every field below is strictly parsed, bounded (D10.3), digest-checked
@@ -845,6 +861,15 @@ class AutoForgeState:
         #   is loaded in every phase with none (a FIX entry observed under
         #   protocol 10 therefore offers no operator action). An older file
         #   that carries any of them is refused, never merged.
+        # - 11 -> 12: every run pins its sandbox mode (``sandbox_pin``,
+        #   #280), which ``resume``, ``step`` and ``unblock`` hold their own
+        #   mode against. An older file has none and is loaded in every phase
+        #   with none, which is "not checked" (the next of those commands
+        #   pins one). It is never filled at load from the configuration of
+        #   the moment: a load (``status``) runs on no configuration, and the
+        #   mode a command runs under is what the pin is compared with. An
+        #   older file that carries the field, even empty, is refused, never
+        #   merged.
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
@@ -881,6 +906,7 @@ class AutoForgeState:
             _refuse_config_fingerprint(data, str(raw_protocol))
             _refuse_validation_fields(data, str(raw_protocol))
             _refuse_operator_state(data, str(raw_protocol))
+            _refuse_sandbox_pin(data, str(raw_protocol))
         elif raw_protocol == _PRE_ACCEPTANCE_PROTOCOL:
             # 7 -> 8 (#211): the same shape without the acceptance-action
             # state. Every protocol-7 save wrote the effect fields, exactly
@@ -891,6 +917,7 @@ class AutoForgeState:
             _refuse_config_fingerprint(data, raw_protocol)
             _refuse_validation_fields(data, raw_protocol)
             _refuse_operator_state(data, raw_protocol)
+            _refuse_sandbox_pin(data, raw_protocol)
         elif raw_protocol == _PRE_CONFIG_PROTOCOL:
             # 8 -> 9 (#219): the same shape without the recorded
             # configuration, which it never wrote and which is refused.
@@ -898,6 +925,7 @@ class AutoForgeState:
             _refuse_config_fingerprint(data, raw_protocol)
             _refuse_validation_fields(data, raw_protocol)
             _refuse_operator_state(data, raw_protocol)
+            _refuse_sandbox_pin(data, raw_protocol)
         elif raw_protocol == _PRE_VALIDATION_PROTOCOL:
             # 9 -> 10 (#172): the same shape without the validation
             # evidence, which it never wrote and which is refused.
@@ -911,7 +939,8 @@ class AutoForgeState:
             )
             _refuse_validation_fields(data, raw_protocol)
             _refuse_operator_state(data, raw_protocol)
-        elif raw_protocol == _PREVIOUS_PROTOCOL:
+            _refuse_sandbox_pin(data, raw_protocol)
+        elif raw_protocol == _PRE_OPERATOR_PROTOCOL:
             # 10 -> 11 (#243): the same shape without the operator-action
             # state, which it never wrote and which is refused.
             _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
@@ -930,6 +959,33 @@ class AutoForgeState:
                 "not a run with no evidence",
             )
             _refuse_operator_state(data, raw_protocol)
+            _refuse_sandbox_pin(data, raw_protocol)
+        elif raw_protocol == _PREVIOUS_PROTOCOL:
+            # 11 -> 12 (#280): the same shape without the sandbox pin, which
+            # it never wrote and which is refused.
+            _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
+            _require_fields(
+                data,
+                raw_protocol,
+                _CONFIG_FIELDS,
+                "recorded configuration",
+                "not a run with none recorded",
+            )
+            _require_fields(
+                data,
+                raw_protocol,
+                _VALIDATION_FIELDS,
+                "validation evidence",
+                "not a run with no evidence",
+            )
+            _require_fields(
+                data,
+                raw_protocol,
+                _OPERATOR_FIELDS,
+                "operator-action outcomes",
+                "not a PR with none",
+            )
+            _refuse_sandbox_pin(data, raw_protocol)
         elif raw_protocol != __protocol_version__:
             raise StateError(
                 f"unsupported protocol_version {raw_protocol!r} "
@@ -976,6 +1032,16 @@ class AutoForgeState:
                 "operator-action outcomes",
                 "not a PR with none",
             )
+            # Every protocol-12 save writes it, ``{}`` included, so an
+            # absent one is not "not pinned": read as the empty default it
+            # would switch the sandbox check off for the rest of the run.
+            _require_fields(
+                data,
+                raw_protocol,
+                _PIN_FIELDS,
+                "sandbox pin",
+                "not a run with none pinned",
+            )
         # A LOCAL state written before the run contract existed has no
         # persisted definition of what it reviewed under. It is not migrated:
         # the only source a migration could fill the contract from is the
@@ -997,13 +1063,17 @@ class AutoForgeState:
         if raw_protocol not in (
             _PRE_CONFIG_PROTOCOL,
             _PRE_VALIDATION_PROTOCOL,
+            _PRE_OPERATOR_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ) and (mode == WorkflowMode.REMOTE):
             # Before protocol 8 only: a protocol-8 file carries its own
             # acceptance state, which the migration would overwrite.
             kwargs.update(_acceptance_migration(data))
-        if raw_protocol != __protocol_version__ and mode == WorkflowMode.REMOTE:
+        if (
+            raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__)
+            and mode == WorkflowMode.REMOTE
+        ):
             # Before protocol 11 (#243): over the acceptance migration, so a
             # pre-8 file gains both.
             kwargs.update(_operator_migration(kwargs))
@@ -1139,6 +1209,7 @@ class AutoForgeState:
         _validate_acceptance_state(state)
         _validate_operator_state(state)
         _validate_config_fingerprint(state)
+        _validate_sandbox_pin(state)
         for name in _MINIMUM_ONE_FIELDS:
             if getattr(state, name) < 1:
                 raise StateError(f"state field {name!r} must be a valid integer")
@@ -1454,6 +1525,21 @@ def _refuse_config_fingerprint(data: dict, protocol: str) -> None:
         )
 
 
+def _refuse_sandbox_pin(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 12 never pinned a sandbox mode (#280).
+
+    The label decides, not the value: ``sandbox_pin`` is protocol 12's own
+    field, so an older file that carries it at all, even ``{}``, was not
+    written by the controller its label names.
+    """
+    if "sandbox_pin" in data:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            "'sandbox_pin'; refusing to load a file that carries a protocol-12 sandbox pin "
+            "-- it is a hand edit or a foreign file, not an older controller's state"
+        )
+
+
 def _refuse_validation_fields(data: dict, protocol: str) -> None:
     """A file labelled before protocol 10 never wrote validation evidence (#172).
 
@@ -1633,6 +1719,23 @@ def _validate_config_fingerprint(state: AutoForgeState) -> None:
         RecordedConfiguration.from_dict(recorded)
     except StateError as exc:
         raise StateError(f"state field 'config_fingerprint': {exc}") from None
+
+
+def _validate_sandbox_pin(state: AutoForgeState) -> None:
+    """``sandbox_pin`` (#280): ``{}`` or a whole pin, for a LOCAL and a REMOTE run alike.
+
+    A pin that does not parse is corruption, never "not pinned": read as
+    none, it would switch the check off.
+    """
+    pin = state.sandbox_pin
+    if not isinstance(pin, dict):
+        raise StateError("state field 'sandbox_pin' must be an object")
+    if not pin:
+        return
+    try:
+        SandboxPin.from_dict(pin)
+    except StateError as exc:
+        raise StateError(f"state field 'sandbox_pin': {exc}") from None
 
 
 def _validate_acceptance_state(state: AutoForgeState) -> None:

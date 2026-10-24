@@ -3154,6 +3154,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     ):
         del data[key]  # protocol 10's own fields (#172)
     del data["operator_comment_outcomes"]  # protocol 11's own field (#243)
+    del data["sandbox_pin"]  # protocol 12's own field (#280)
     data["protocol_version"] = "8"
     with open(state_file, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
@@ -3171,8 +3172,9 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     assert f"--config {cfg} is recorded as the run's" in out.err
     assert "ANALYZE_EXECUTE -> REVIEW" in out.out
     saved = load_state(state_file)
-    assert saved.protocol_version == "11"
+    assert saved.protocol_version == "12"
     assert saved.config_fingerprint["source"] == "upgraded"
+    assert saved.sandbox_pin["mode"] == "disabled" and saved.sandbox_pin["source"] == "upgraded"
     assert saved.config_fingerprint["profiles"]["analyze_execute"]["model"] == "opus"
     assert cli.main(["--state-dir", sd, "status"]) == 0
     assert f"Config:     --config {cfg} (upgraded " in capsys.readouterr().out
@@ -3255,13 +3257,14 @@ def test_run_refuses_a_model_its_recorded_configuration_could_not_hold_before_an
 
 
 def test_a_host_that_cannot_enforce_a_required_sandbox_refuses_step_with_exit_2(
-    tmp_path, capsys, monkeypatch, fakes, sandbox_probe
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes, sandbox_probe
 ):
     """#169 (ADR 0005 D12.2): the pre-launch gate's refusal is a configuration
     error at the CLI; it names the capability and the `disabled` alternative,
     and the run's files are unchanged. `status` names the mode without a probe."""
     monkeypatch.chdir(tmp_path)
-    cfg = _config(tmp_path / "autoforge.json", sandbox={"mode": "required"})
+    outside = tmp_path_factory.mktemp("operator-config")  # outside the repository (#280)
+    cfg = _config(outside / "autoforge.json", sandbox={"mode": "required"})
     sd = str(tmp_path / ".autoforge")
     run = ["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]
     assert cli.main([*run, "--max-steps", "1"]) == 0  # INITIALIZING launches nothing
@@ -3279,6 +3282,83 @@ def test_a_host_that_cannot_enforce_a_required_sandbox_refuses_step_with_exit_2(
     out = capsys.readouterr().out
     assert "Outer sandbox:\n  required (sandbox.mode)" in out
     assert sandbox_probe.calls == 1
+
+
+@pytest.mark.parametrize("mode", ["required", "preferred"])
+def test_an_enforced_run_refuses_a_config_file_inside_the_repository(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes, mode
+):
+    """#280: a sandboxed launch writes the checkout, so a configuration file
+    in it could be rewritten by an agent and read by the next command. Every
+    command that loads it refuses, naming the file and the fix, before
+    anything is run, launched or written; outside the repository, or under
+    ``disabled``, the same file is loaded."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "conf").mkdir()
+    inside = _config(tmp_path / "conf" / "autoforge.json", sandbox={"mode": mode})
+    sd = str(tmp_path / ".autoforge")
+    run = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    for argv in (run, [*run, "--dry-run"], ["--state-dir", sd, "status"]):
+        assert cli.main(["--config", inside, *argv]) == 2
+        err = capsys.readouterr().err
+        assert f"autoforge: error: the configuration file {inside} lies in " in err
+        assert f"(sandbox.mode is {mode})" in err
+        assert "Move it outside every working tree of this repository" in err
+        assert "Nothing was run, launched or written." in err
+    assert _files(sd) == {}
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+
+    outside = _config(tmp_path_factory.mktemp("operator") / "a.json", sandbox={"mode": mode})
+    assert cli.main(["--config", outside, *run]) == 0
+    disabled = _config(tmp_path / "conf" / "disabled.json", sandbox={"mode": "disabled"})
+    capsys.readouterr()
+    assert cli.main(["--config", disabled, "--state-dir", sd, "status"]) == 0
+
+
+@pytest.mark.parametrize("pinned", ["required", "preferred"])
+def test_a_resume_without_the_runs_sandbox_mode_refuses_until_accepted(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes, pinned
+):
+    """#280: a command run without the run's --config falls back to
+    ``disabled``. The run pinned the mode it was created under, so the step
+    refuses with nothing written; accepted, the change is in the run log
+    before the phase runs, and the run is pinned to ``disabled``."""
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path_factory.mktemp("operator") / "a.json", sandbox={"mode": pinned})
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE,
+                     "--max-steps", "1"]) == 0  # fmt: skip
+    pin = load_state(os.path.join(sd, "state.json")).sandbox_pin
+    assert (pin["mode"], pin["source"]) == (pinned, "created")
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert f"  pinned: {pinned} (created " in out
+    assert "this configuration's sandbox.mode, disabled, is weaker" in out
+    before = _files(sd)
+    for command in (["step"], ["resume"], ["resume", "--dry-run"]):
+        assert cli.main(["--state-dir", sd, *command]) == 2
+        err = capsys.readouterr().err
+        assert f'\n  sandbox.mode: "{pinned}" -> "disabled"\n' in err
+        assert f"'{command[0]}' refuses before any phase executes; nothing was written" in err
+    assert _files(sd) == before
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+
+    fakes["handler"] = implement
+    assert cli.main(["--state-dir", sd, "step", "--accept-config-change"]) == 0
+    out = capsys.readouterr()
+    assert "the run is pinned to sandbox.mode disabled from now on:" in out.err
+    assert "ANALYZE_EXECUTE -> REVIEW" in out.out
+    pin = load_state(os.path.join(sd, "state.json")).sandbox_pin
+    assert (pin["mode"], pin["source"]) == ("disabled", "accepted")
+    events = _events(sd)
+    [change] = [e for e in events if e["phase"].endswith("-config-change")]
+    assert change["phase"] == "ANALYZE_EXECUTE-config-change"
+    assert change["metadata"]["changes"] == [
+        {"key": "sandbox.mode", "recorded": f'"{pinned}"', "current": '"disabled"'}
+    ]
+    assert change["metadata"]["recorded_sandbox_pin"]["mode"] == pinned
+    assert events.index(change) < [e["phase"] for e in events].index("ANALYZE_EXECUTE")
 
 
 def test_the_scheduler_worker_entry_point_is_hidden_and_routed(monkeypatch, capsys):

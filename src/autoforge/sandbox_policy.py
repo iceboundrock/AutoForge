@@ -39,10 +39,16 @@ recorded. A refusal of the compiler becomes a launch refusal
 (:class:`~autoforge.errors.SandboxLaunchRefusedError`), on the path a
 failure to spawn takes.
 
+:func:`config_file_problem` answers the converse question for the
+controller's own input (#280): whether the ``--config`` file lies where an
+enforced launch writes, so that the next command would run on what an
+agent left there.
+
 Pure except for the compiler's ``realpath`` and ``lstat``, ``realpath`` of
 the environment's path values and ``lstat`` and ``readlink`` on their way,
-and the first line of an executable read for its interpreter; nothing is
-created or launched here.
+the first line of an executable read for its interpreter, and the
+configuration file's lookup walk (``lstat`` and ``readlink``) and link
+count; nothing is created or launched here.
 """
 
 from __future__ import annotations
@@ -349,6 +355,103 @@ def operator_path_problem(operator_paths: tuple[str, ...], denied_roots: tuple[s
                     "controller's directory under the git common dir, another worktree, and "
                     "in REMOTE the operator's checkout)"
                 )
+    return ""
+
+
+# The links a lookup follows before it is a loop, as the kernel counts them
+# (``MAXSYMLINKS``): past it ``open`` fails, so nothing further is reached.
+_MAX_LOOKUP_LINKS = 40
+
+
+def lookup_directories(path: str) -> tuple[str, ...]:
+    """Each directory, resolved, in which opening ``path`` looks up a name (#280).
+
+    Whoever can write one of them can replace what ``path`` opens: move the
+    entry away and put another file or a link in its place. The walk follows
+    symbolic links as the kernel does (a relative target from the directory
+    holding the link, an absolute one from ``/``), so a link inside a tree
+    and a link into one both show. It stops at a name that is not there, and
+    after more links than a lookup follows: nothing past either is reached
+    yet, and the directory the name was looked up in is already listed.
+    ``lstat`` and ``readlink`` only; nothing is opened.
+    """
+    looked_up: list[str] = []
+    current = "/"
+    pending = [part for part in os.path.abspath(path).split("/") if part]
+    links = 0
+    while pending:
+        name = pending.pop(0)
+        if name == ".":
+            continue
+        if name == "..":
+            current = posixpath.dirname(current)
+            continue
+        if current not in looked_up:
+            looked_up.append(current)
+        entry = posixpath.join(current, name)
+        try:
+            is_link = os.path.islink(entry)
+            if not is_link and not os.path.lexists(entry):
+                break
+            target = os.readlink(entry) if is_link else ""
+        except OSError:
+            break
+        if not is_link:
+            current = entry
+            continue
+        links += 1
+        if links > _MAX_LOOKUP_LINKS:
+            break
+        if target.startswith("/"):
+            current = "/"
+        pending[:0] = [part for part in target.split("/") if part]
+    return tuple(looked_up)
+
+
+def config_file_problem(config_file: str, written_roots: tuple[str, ...], mode: str) -> str:
+    """Why an enforced launch could rewrite the configuration file, as a refusal; "" if none.
+
+    ``written_roots`` are the trees the repository's enforced launches write
+    and that outlive the launch: its working trees (the checkout, and every
+    worktree registered to it, the agent worktrees included) and its sandbox
+    directories (the caches). A file is within reach when opening it looks
+    up a name in one of them (:func:`lookup_directories`), and when it has a
+    second hard link, which may lie in one (ADR 0005 D4.4). The next command
+    would run on what such a file says: the sandbox mode, the controller's
+    GitHub command and the commands of every profile ``doctor`` checks
+    (#280). Both sides are compared resolved.
+    """
+    config_file = os.path.abspath(config_file)
+    direct = os.path.realpath(config_file) == config_file
+    roots = [(root, os.path.realpath(root)) for root in written_roots]
+    walked = lookup_directories(config_file)
+    for directory in walked:
+        for root, resolved in roots:
+            if _inside(directory, resolved):
+                # The deepest directory of the walk in this root names the lookup.
+                deepest = [d for d in walked if _inside(d, resolved)][-1]
+                where = "lies in" if direct else f"is reached through {deepest}, in"
+                return (
+                    f"the configuration file {config_file} {where} {root}, a tree that "
+                    f"launches inside the outer sandbox write (sandbox.mode is {mode}): a "
+                    "sandboxed agent could rewrite it, and the next command would run on what "
+                    "it says, sandbox.mode, github.command and the profiles' commands "
+                    "included (#280). Move it outside every working tree of this repository "
+                    "(for example to ~/.config/autoforge/) and pass that path with --config, "
+                    "or set sandbox.mode: disabled"
+                )
+    try:
+        links = os.stat(config_file).st_nlink
+    except OSError:
+        return ""
+    if links > 1:
+        return (
+            f"the configuration file {config_file} has {links} hard links, and another one "
+            "may lie in a tree that launches inside the outer sandbox write (sandbox.mode is "
+            f"{mode}; ADR 0005 D4.4): a sandboxed agent could rewrite it through that link "
+            "(#280). Copy it to a file of its own outside every working tree of this "
+            "repository and pass that path with --config, or set sandbox.mode: disabled"
+        )
     return ""
 
 

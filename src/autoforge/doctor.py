@@ -255,6 +255,22 @@ class Doctor:
                 fingerprint_routing(cfg)
         except ConfigurationError as exc:
             return CheckResult("config", False, str(exc))
+        # #280: a file an enforced launch could have rewritten is refused
+        # here as every command refuses it, and since ``self.config`` stays
+        # unset, no check runs a command it names (a profile's ``command``,
+        # ``github.command``).
+        from .engine import config_file_placement_problem
+
+        problem = config_file_placement_problem(
+            cfg,
+            os.path.abspath(self.config_path) if self.config_path else "",
+            self.cwd,
+            self.runner,
+        )
+        if problem:
+            return CheckResult(
+                "config", False, f"{problem}; doctor runs no command this file names"
+            )
         self.config = cfg
         src = self.config_path or "(built-in defaults)"
         return CheckResult("config", True, f"{src}; profiles: {', '.join(sorted(cfg.profiles))}")

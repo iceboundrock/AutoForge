@@ -32,10 +32,12 @@ from autoforge.sandbox_policy import (
     LaunchClass,
     LaunchFacts,
     ProviderRequirements,
+    config_file_problem,
     describe_launch,
     executable_requirements,
     install_root,
     interpreter_of,
+    lookup_directories,
     sandbox_request,
 )
 
@@ -653,3 +655,117 @@ def test_pi_declares_its_agent_directory_and_never_the_operators(tmp_path):
     )
     with pytest.raises(SandboxLaunchRefusedError, match="D7.2"):
         describe_launch(_remote(paths), needs, {})
+
+
+# -- where a configuration file may lie (#280) -------------------------------------
+
+
+def _tree(tmp_path) -> tuple[Path, Path, Path]:
+    """A resolved base, a written root inside it, and a directory outside the root."""
+    base = Path(os.path.realpath(tmp_path))
+    root = base / "repo"
+    (root / "conf").mkdir(parents=True)
+    outside = base / "operator"
+    outside.mkdir()
+    return base, root, outside
+
+
+def test_the_lookup_walk_lists_each_directory_a_name_is_looked_up_in(tmp_path):
+    base, root, _ = _tree(tmp_path)
+    (root / "conf" / "a.yaml").write_text("version: 1\n")
+    walked = lookup_directories(str(root / "conf" / "a.yaml"))
+    assert walked[0] == "/"
+    assert walked[-2:] == (str(root), str(root / "conf"))
+    assert lookup_directories(str(root / "conf" / "missing" / "a.yaml"))[-1] == str(root / "conf")
+
+
+def test_the_lookup_walk_follows_links_as_the_kernel_does(tmp_path):
+    base, root, outside = _tree(tmp_path)
+    (root / "conf" / "a.yaml").write_text("version: 1\n")
+    (outside / "absolute").symlink_to(root / "conf")
+    (outside / "relative").symlink_to(os.path.join("..", "repo", "conf"))
+    (outside / "dotdot").symlink_to(os.path.join("..", "repo", "conf", "..", "conf"))
+    for link in ("absolute", "relative", "dotdot"):
+        walked = lookup_directories(str(outside / link / "a.yaml"))
+        assert str(outside) in walked and walked[-1] == str(root / "conf"), link
+
+
+def test_the_lookup_walk_stops_at_a_link_loop(tmp_path):
+    base, _, outside = _tree(tmp_path)
+    (outside / "a").symlink_to(outside / "b")
+    (outside / "b").symlink_to(outside / "a")
+    assert lookup_directories(str(outside / "a" / "x.yaml"))[-1] == str(outside)
+
+
+def test_a_configuration_file_in_a_written_root_is_refused(tmp_path):
+    _, root, _ = _tree(tmp_path)
+    cfg = root / "conf" / "autoforge.yaml"
+    cfg.write_text("version: 1\n")
+    problem = config_file_problem(str(cfg), (str(root),), "required")
+    assert problem.startswith(f"the configuration file {cfg} lies in {root}, a tree that ")
+    assert "(sandbox.mode is required)" in problem
+    assert "a sandboxed agent could rewrite it" in problem
+    assert "Move it outside every working tree of this repository" in problem
+    assert "set sandbox.mode: disabled" in problem
+
+
+def test_a_configuration_file_outside_every_written_root_passes(tmp_path):
+    base, root, outside = _tree(tmp_path)
+    cfg = outside / "autoforge.yaml"
+    cfg.write_text("version: 1\n")
+    assert config_file_problem(str(cfg), (str(root),), "required") == ""
+    # A file beside the root, in its parent, is not inside it.
+    beside = base / "autoforge.yaml"
+    beside.write_text("version: 1\n")
+    assert config_file_problem(str(beside), (str(root),), "preferred") == ""
+    # Nor is a sibling whose name only begins like the root's.
+    sibling = base / "repo-config"
+    sibling.mkdir()
+    (sibling / "a.yaml").write_text("version: 1\n")
+    assert config_file_problem(str(sibling / "a.yaml"), (str(root),), "required") == ""
+
+
+def test_a_link_from_outside_into_a_written_root_is_refused(tmp_path):
+    _, root, outside = _tree(tmp_path)
+    (root / "conf" / "autoforge.yaml").write_text("version: 1\n")
+    (outside / "autoforge.yaml").symlink_to(root / "conf" / "autoforge.yaml")
+    (outside / "dir").symlink_to(root / "conf")
+    for spelled in (outside / "autoforge.yaml", outside / "dir" / "autoforge.yaml"):
+        problem = config_file_problem(str(spelled), (str(root),), "required")
+        assert f"the configuration file {spelled} is reached through " in problem
+        assert f", in {root}, a tree that " in problem
+
+
+def test_a_link_inside_a_written_root_to_a_file_outside_is_refused(tmp_path):
+    """The agent replaces the link, not the file it names."""
+    _, root, outside = _tree(tmp_path)
+    (outside / "autoforge.yaml").write_text("version: 1\n")
+    (root / "conf" / "autoforge.yaml").symlink_to(outside / "autoforge.yaml")
+    problem = config_file_problem(str(root / "conf" / "autoforge.yaml"), (str(root),), "required")
+    assert f"is reached through {root / 'conf'}, in {root}" in problem
+
+
+def test_a_written_root_spelled_through_a_link_is_compared_resolved(tmp_path):
+    base, root, _ = _tree(tmp_path)
+    cfg = root / "conf" / "autoforge.yaml"
+    cfg.write_text("version: 1\n")
+    (base / "alias").symlink_to(root)
+    problem = config_file_problem(str(cfg), (str(base / "alias"),), "required")
+    assert f"lies in {base / 'alias'}, a tree that " in problem
+
+
+def test_a_configuration_file_with_a_second_hard_link_is_refused(tmp_path):
+    """ADR 0005 D4.4: a hard link shows nowhere in the walk."""
+    _, root, outside = _tree(tmp_path)
+    cfg = outside / "autoforge.yaml"
+    cfg.write_text("version: 1\n")
+    os.link(cfg, root / "conf" / "linked.yaml")
+    problem = config_file_problem(str(cfg), (str(root),), "preferred")
+    assert f"the configuration file {cfg} has 2 hard links" in problem
+    assert "Copy it to a file of its own outside every working tree" in problem
+
+
+def test_a_missing_configuration_file_is_judged_by_where_it_would_be(tmp_path):
+    _, root, outside = _tree(tmp_path)
+    assert "lies in" in config_file_problem(str(root / "conf" / "x.yaml"), (str(root),), "required")
+    assert config_file_problem(str(outside / "x.yaml"), (str(root),), "required") == ""

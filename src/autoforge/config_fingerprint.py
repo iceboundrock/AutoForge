@@ -48,10 +48,19 @@ and the change is recorded.
 
 Everything outside the fingerprint may change between steps without it:
 loop bounds and the step budget, correction attempts, the merge gate and
-its verification commands, the environment allow-list, the GitHub client,
-and ``sandbox.mode`` (a run resumes under either mode, ADR 0005 D15.3).
-They bound, verify or contain what an agent does without choosing the
-agent or its worktree, and each is read at the step that uses it.
+its verification commands, the environment allow-list and the GitHub
+client. They bound or verify what an agent does without choosing the agent
+or its worktree, and each is read at the step that uses it.
+
+``sandbox.mode`` is not in the fingerprint either, but it may not weaken
+between steps (#280, ADR 0005 D15.3 as amended): the run is pinned to the
+mode it was created under (:mod:`autoforge.sandbox_pin`), in LOCAL and
+REMOTE runs alike, and the same comparison
+(:meth:`~autoforge.engine.ControllerEngine.check_run_configuration`) refuses
+a weaker one beside any change here, with the same opt-in. It is kept out
+of this record because the record refuses any drift and any schema but its
+own, while the pin refuses only a weaker mode and must load in a run
+created before it.
 
 A state file written before this field existed has none: it loads, is not
 checked, and the first ``resume``, ``step`` or ``unblock`` records the

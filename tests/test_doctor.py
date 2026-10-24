@@ -390,6 +390,55 @@ def test_doctor_fails_a_config_whose_routing_a_remote_run_could_not_record(tmp_p
     assert local.check_config(local_required_profiles).ok
 
 
+@pytest.mark.parametrize("mode", ["required", "preferred"])
+def test_doctor_runs_nothing_a_config_inside_the_repository_names(tmp_path, mode):
+    """#280: an enforced launch writes the checkout, so a configuration file
+    in it may say what an agent wrote. The config row fails as every command
+    refuses the file, and no row runs a command it names: no agent's
+    ``--version``, no ``github.command``. Outside the repository both run."""
+    from tests.conftest import git_repo
+
+    repo = git_repo(tmp_path / "repo")
+    data = {
+        "version": 1,
+        "sandbox": {"mode": mode},
+        "github": {"command": "/opt/af-test/gh-from-config"},
+        "profiles": {"analyze_execute": {"command": "/opt/af-test/claude-from-config"}},
+    }
+    inside = repo / "autoforge.json"
+    outside = tmp_path / "operator" / "autoforge.json"
+    outside.parent.mkdir()
+    for path in (inside, outside):
+        path.write_text(json.dumps(data))
+    named = ("/opt/af-test/gh-from-config", "/opt/af-test/claude-from-config")
+
+    def doctor(config, calls):
+        fake = _runner_factory(calls=calls)
+
+        def runner(req):  # the repository's real layout; every other command scripted
+            if req.command[0] == "git" and "rev-parse" in req.command:
+                return execute(req)
+            return fake(req)
+
+        return Doctor(config_path=str(config), cwd=str(repo), runner=runner)
+
+    calls: list[list[str]] = []
+    d = doctor(inside, calls)
+    rows = {r.name: r for r in d.run_all()}
+    row = rows["config"]
+    assert not row.ok and row.required
+    assert row.detail.startswith(f"the configuration file {inside} lies in {repo}, a tree ")
+    assert row.detail.endswith("; doctor runs no command this file names")
+    assert d.config is None
+    assert not any(name.startswith("agent ") for name in rows), sorted(rows)
+    assert not any(argv[0] in named for argv in calls), calls
+
+    calls = []
+    rows = {r.name: r for r in doctor(outside, calls).run_all()}
+    assert rows["config"].ok
+    assert {argv[0] for argv in calls} >= set(named)
+
+
 def test_failures_are_reported_not_raised(tmp_path):
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory(fail=("gh auth", "opencode")))
     results = {r.name: r for r in d.run_all()}
