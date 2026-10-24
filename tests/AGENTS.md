@@ -215,7 +215,8 @@ REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.
 sandbox pin and config placement      test_sandbox_pin.py (strength, the record, the engine's
 (#280)                                refusal, opt-in log, strengthen and upgrade, REMOTE and
                                       LOCAL; CLI: test_cli.py; load and protocol: test_state.py);
-                                      the placement rule: test_sandbox_policy.py, doctor:
+                                      the placement rule (the providers' writable
+                                      directories included): test_sandbox_policy.py, doctor:
                                       test_doctor.py, worker: test_worker.py, real backend:
                                       test_sandbox_routing.py; the `..` spellings CLI and
                                       doctor share: conftest.dotdot_config_paths

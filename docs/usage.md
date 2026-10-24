@@ -993,10 +993,14 @@ never called sandboxed.
   ([Configuration: outer sandbox](configuration.md#outer-sandbox)).
 - **Where the configuration lives (#280):** under `required` or
   `preferred`, every command, `doctor` and a scheduler's worker refuse a
-  `--config` file inside the checkout or any worktree of the repository
-  (or reached through a link into one, passing through one before a `..`,
-  or with a second hard link), since an enforced launch could rewrite it.
-  Keep it in, for example, `~/.config/autoforge/`.
+  `--config` file inside the checkout, any worktree of the repository or a
+  directory a provider is given read-write (a dedicated
+  `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR` or OpenCode database
+  directory), or reached through a link into one, passing through one
+  before a `..`, or with a second hard link, since an enforced launch could
+  rewrite it. Keep it in, for example, `~/.config/autoforge/`, and run a
+  run's commands from the same environment: a provider directory given
+  only under another one is not known.
 
 AutoForge never commits to the default branch, never deletes a worktree it
 created, and never creates or cleans up local branches or any other
@@ -1113,15 +1117,22 @@ ownership or discard uncommitted user changes.
 - **"the configuration file ... lies in ..., a tree that launches inside
   the outer sandbox write"** (exit 2; also "is reached through ...", "has
   N hard links" or "opens another file than its lookup walk was followed
-  to"): under `required` or `preferred` the `--config` file is where an
-  enforced launch could rewrite it (#280). Nothing was run, launched or
+  to"; "the sandbox declaration of profile ... cannot be read" when a
+  provider's declaration could not be asked): under `required` or
+  `preferred` the `--config` file is where an enforced launch could
+  rewrite it, or is not shown not to be (#280). Nothing was run, launched or
   written. "Is reached through" names a directory of such a tree the path
   looks a name up in: a symbolic link leads there, or the path passes
   through it before a `..`, which is followed as the command opens it,
-  never tidied. Move the file outside the checkout and every worktree of
-  the repository, for example to `~/.config/autoforge/`, and pass its own
-  path; or set `sandbox.mode: disabled`. `doctor` reports the same in its
-  config row and runs none of the commands the file names.
+  never tidied. When the directory is a provider's (the message names
+  `$CLAUDE_CONFIG_DIR`, `$PI_CODING_AGENT_DIR` or `$OPENCODE_DB` and the
+  profiles whose launches write it), every enforced launch of that
+  provider writes it, wherever it lies. Move the file outside the
+  checkout, every worktree of the repository and every such directory,
+  for example to `~/.config/autoforge/`, and pass its own path; or give
+  the provider another directory; or set `sandbox.mode: disabled`.
+  `doctor` reports the same in its config row and runs none of the
+  commands the file names.
 - **"run ... is pinned to sandbox.mode ..., and this command's
   sandbox.mode, ..., contains its launches less"** (exit 2): the command
   runs under a weaker mode than the run was created under, often because

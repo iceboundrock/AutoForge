@@ -58,7 +58,8 @@ sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005
                     the SandboxPlan, the path-valued environment rewrite (D8.2),
                     executable and install-root resolution; no provider branch, no
                     workflow decision, launches nothing (#168); where a --config file
-                    may lie under an enforced mode (config_file_problem, #280)
+                    may lie under an enforced mode (config_file_problem, #280) and
+                    what a provider's declaration makes writable (declared_writable)
 agent_worktree.py   the agent worktree's git surface in every sandbox.mode: registry
                     binding and listing (D6.4, #223), candidate read through the
                     common dir (D6.3),

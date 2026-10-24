@@ -677,9 +677,16 @@ is redacted before its first line is picked and clipped.
 Two checks keep a weaker containment from arriving unannounced (#280).
 `engine.config_file_placement_problem` asks
 `sandbox_policy.config_file_problem` whether, under `required` or
-`preferred`, the `--config` file lies in a tree the repository's enforced
-launches write (the checkout, every registered worktree, the sandbox
-directories): it walks the path the loader was given, made absolute but
+`preferred`, the `--config` file lies in a directory enforced launches
+write and keep: the checkout, every registered worktree, the sandbox
+directories, and every directory a provider's declaration makes writable
+(`engine.provider_written_directories`, which asks each configured
+profile's adapter and every other known provider's,
+`AgentProvider.written_directories` over the launch environment without
+the adapter's per-launch isolation names, `sandbox_policy.declared_writable`
+naming the `state` and `dir-rw` items `sandbox_request` projects
+writable; the engine holds no provider branch). It walks the path the
+loader was given, made absolute but
 never normalized (`absolute_spelling`: `os.path.abspath` would collapse a
 `..` after a link and name another file), as the kernel looks it up
 (`lookup_directories`, so a link in or into such a tree shows, and so does

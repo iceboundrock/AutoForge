@@ -27,8 +27,10 @@ add them, and the state directory `.autoforge/`, to its `.gitignore` or to
 ([Security boundaries](security.md#keep-autoforges-files-out-of-git)).
 Do not commit a config that names credentials or local paths. Under
 `sandbox.mode: required` or `preferred`, keep the file outside the
-repository and every worktree of it, for example in `~/.config/autoforge/`:
-an enforced launch writes those trees, the next command reads the file
+repository, every worktree of it and every directory a provider is given
+read-write (a dedicated `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR` or
+OpenCode database directory), for example in `~/.config/autoforge/`: an
+enforced launch writes those directories, the next command reads the file
 again, and so every command, and `autoforge doctor`, refuses a file there
 (one whose path passes through them, by a symbolic link or before a `..`,
 or with a second hard link, included), naming it and the fix. Pass the
@@ -997,19 +999,27 @@ the sandbox stays its execution record's, and a host that can no longer
 enforce `required` is refused at the gate as before.
 
 Under `required` or `preferred` the `--config` file itself must lie
-outside every tree an enforced launch writes: the checkout, every worktree
-registered to the repository (the agent worktrees included) and the
-repository's sandbox directories. A file there, one reached through a
-symbolic link in one of them, and one with a second hard link are refused
-by every command (exit 2, nothing run, launched or written), by a
-scheduler's worker, and by `doctor`'s config row, which then runs none of
-the commands the file names ([Security boundaries](security.md#the-outer-sandbox-is-opt-in-and-linux-only)).
-The path is checked as given, the way the command opens it, never tidied
-first: in `alias/../autoforge.yaml` the `..` is taken where the link
-`alias` leads, and a path that looks up a name in one of those trees is
-refused even when a `..` leads back out of it, since an agent can replace
-what it looks up there. A relative path is followed from the current
-directory.
+outside every directory an enforced launch writes and keeps: the checkout,
+every worktree registered to the repository (the agent worktrees
+included), the repository's sandbox directories, and every directory a
+provider's own declaration gives its launches read-write (a dedicated
+`CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, or the directory of an
+absolute `OPENCODE_DB`). The providers' directories are those every
+provider AutoForge knows would be given under the environment the command
+runs in, whether or not a profile of the file names it: an agent that
+rewrote the file could name it. A file in one of these, one reached
+through a symbolic link in one of them, and one with a second hard link
+are refused by every command (exit 2, nothing run, launched or written),
+by a scheduler's worker, and by `doctor`'s config row, which then runs
+none of the commands the file names ([Security boundaries](security.md#the-outer-sandbox-is-opt-in-and-linux-only)).
+A provider directory given only under another environment than the
+command's is not known to it, so run every command of a run from the same
+environment. The path is checked as given, the way the command opens it,
+never tidied first: in `alias/../autoforge.yaml` the `..` is taken where
+the link `alias` leads, and a path that looks up a name in one of those
+directories is refused even when a `..` leads back out of it, since an
+agent can replace what it looks up there. A relative path is followed
+from the current directory.
 
 **What a sandboxed launch sees.** An empty root, then only what ADR 0005
 §2.5 grants its launch class

@@ -76,9 +76,10 @@ pinned to it instead (#280): a later `step` or `resume` under a weaker mode
 refused unless repeated with `--accept-config-change`, which the run log
 records, and a stronger mode is pinned without asking. Since the root is
 writable to every enforced launch, a `--config` file inside it (or in any
-worktree of the repository) is refused under `required` or `preferred` by
-every command and by `local doctor`: keep it outside, for example in
-`~/.config/autoforge/`
+worktree of the repository, or in a directory a provider is given
+read-write, such as a dedicated `CLAUDE_CONFIG_DIR`) is refused under
+`required` or `preferred` by every command and by `local doctor`: keep it
+outside, for example in `~/.config/autoforge/`
 ([Configuration: outer sandbox](configuration.md#outer-sandbox)).
 
 **No commit is ever required and HEAD never has to move.** The implementation

@@ -1611,10 +1611,20 @@ amended). REMOTE needs this pin as much as LOCAL. Its controller runs
 writes its agent worktree, and a REMOTE `resume` without `--config` falls
 back to `disabled` too. #219's recorded configuration
 (`src/autoforge/config_fingerprint.py`) does not hold the mode, so both modes
-are pinned. The `--config` file itself must lie outside every tree an
-enforced launch writes: the checkout, every worktree registered to the
-repository and its sandbox directories, reached through a symbolic link
-in one or aliased by a second hard link included (D4.4). Under `required` or
+are pinned. The `--config` file itself must lie outside every directory
+an enforced launch writes and keeps: the checkout, every worktree
+registered to the repository and its sandbox directories, and every
+directory a provider's declaration makes writable (a `dir-rw` item such
+as a dedicated `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR` or OpenCode
+database directory, or a `state` directory), reached through a symbolic
+link in one or aliased by a second hard link included (D4.4). The
+providers' directories are asked of every known provider's own
+declaration (D13.1) over the environment the command runs in, the one its
+launches inherit, the providers no profile of the file names included:
+the file under check cannot say which providers matter, since an agent
+that rewrote it could name another. A directory a provider was given only
+under another environment is not known to a later command; the operator
+runs a run's commands from one environment. Under `required` or
 `preferred` every command, the scheduler's worker and `doctor` refuse such
 a file (`config_file_problem` in `src/autoforge/sandbox_policy.py`), and
 `doctor` then runs no command the file names. The path is the one the
@@ -1629,7 +1639,11 @@ file than the one loaded.
 
 *Rejected.* **Masking the configuration file in the LOCAL root.** A file
 in a writable projection cannot be masked, and a mask deeper in the tree
-is undone by renaming one of its ancestors.
+is undone by renaming one of its ancestors. The same holds in a
+provider's writable directory, so the file is refused there too, never
+masked. **Asking only the providers the file's profiles name.** The
+profiles are what the file says, which an agent that rewrote it decides,
+and another configuration's launches write the directories of others.
 
 **D15.4 (#169).** **Operator-declared read-only paths are supported**, in
 configuration, for toolchains, interpreters and files a build needs outside
