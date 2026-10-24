@@ -1,10 +1,25 @@
 [project]
-name = "autoforge"
-version = "0.1.0"
+name = "autoforge-cli"
+version = "0.1.0a0"
 description = "Autonomous orchestration for AI-driven software development (deterministic controller over Claude Code / OpenCode / gh)."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+keywords = ["ai", "coding-agent", "orchestration", "github", "cli"]
+
+[project.urls]
+Homepage = "https://github.com/iceboundrock/AutoForge"
+Source = "https://github.com/iceboundrock/AutoForge"
+Issues = "https://github.com/iceboundrock/AutoForge/issues"
 dependencies = []
 
 [project.optional-dependencies]
@@ -20,6 +35,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"autoforge.prompts" = ["*.md"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10", "pyyaml>=6"]
