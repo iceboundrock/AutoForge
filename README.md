@@ -233,23 +233,14 @@ The distribution is **`autoforge-cli`**; the command it installs is
 `autoforge`. `autoforge` on PyPI is an unrelated project: never
 `pip install autoforge`.
 
-**From PyPI.** Versions of `autoforge-cli` are published to PyPI as
-prereleases; the [releases page](https://github.com/iceboundrock/AutoForge/releases)
-lists each published version with the SHA-256 digests of its files, and if
-it lists none, none has been published yet. Install one only after checking
-that its PyPI project page links back to this repository:
-
-```bash
-uv tool install --python 3.12 --prerelease allow autoforge-cli
-```
-
-`--prerelease allow` is needed while every published version is a
-prerelease (`0.x`, [Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md#version-scheme)).
+A git commit, or a wheel built from one, installs from any commit at or
+after the one that introduced `autoforge-cli` (#256; an earlier commit
+installs a package without its prompt templates); the PyPI method needs a
+published version.
 
 **From a git commit.** Install the command into its own environment with
-`uv tool`, from a commit at or after the one that introduced
-`autoforge-cli` (#256; an earlier commit installs a package without its
-prompt templates). Pin a full commit SHA, or a release tag (`v<version>`):
+`uv tool`. Pin a full commit SHA, or the tag of a published version
+(`v<version>`):
 
 ```bash
 uv tool install --python 3.12 'git+https://github.com/iceboundrock/AutoForge@<commit>'
@@ -267,6 +258,22 @@ uv build                 # dist/autoforge_cli-<version>.tar.gz and -py3-none-any
 uv tool install --python 3.12 dist/autoforge_cli-<version>-py3-none-any.whl
 ```
 
+**From PyPI, once a version is published.** Until the first upload
+([#295](https://github.com/iceboundrock/AutoForge/issues/295)),
+`autoforge-cli` is not on PyPI and the command below fails: uv reports that
+`autoforge-cli` was not found in the package registry. The
+[releases page](https://github.com/iceboundrock/AutoForge/releases) lists
+each version that has been published, with the SHA-256 digests of its
+files; if it lists none, install from a git commit or a built wheel
+instead. Install a published version only after checking that its PyPI
+project page links back to this repository:
+
+```bash
+uv tool install --python 3.12 --prerelease allow autoforge-cli
+```
+
+`--prerelease allow` is needed while every published version is a
+prerelease (`0.x`, [Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md#version-scheme)).
 [Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md)
 describes how a version is built and published.
 
