@@ -3317,6 +3317,54 @@ def test_an_enforced_run_refuses_a_config_file_inside_the_repository(
     assert cli.main(["--config", disabled, "--state-dir", sd, "status"]) == 0
 
 
+# A provider directory an enforced launch writes, by the variable that names it,
+# the provider's adapter label, and the provider (#280, R3-F1).
+_PROVIDER_DIRS = {
+    "CLAUDE_CONFIG_DIR": ("the Claude Code configuration directory ($CLAUDE_CONFIG_DIR)", "claude"),
+    "PI_CODING_AGENT_DIR": ("Pi's agent directory ($PI_CODING_AGENT_DIR)", "pi"),
+    "OPENCODE_DB": ("the OpenCode database directory ($OPENCODE_DB)", "opencode"),
+}
+
+
+@pytest.mark.parametrize("variable", sorted(_PROVIDER_DIRS))
+def test_an_enforced_run_refuses_a_config_file_in_a_providers_writable_directory(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes, variable
+):
+    """#280 (R3-F1): a dedicated ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR``
+    or OpenCode database directory is writable to every enforced launch of
+    its provider, outside the repository and kept afterwards. A configuration
+    file there could say what an agent wrote, its ``sandbox.mode`` unchanged,
+    so the pin would not see it: every command refuses it before anything is
+    run, launched or written. With the variable unset the same file loads."""
+    monkeypatch.chdir(tmp_path)
+    directory = Path(os.path.realpath(tmp_path_factory.mktemp("provider-dir")))
+    cfg = _config(directory / "autoforge.json", sandbox={"mode": "required"})
+    value = f"{directory}/af.db" if variable == "OPENCODE_DB" else str(directory)
+    monkeypatch.setenv(variable, value)
+    label, provider = _PROVIDER_DIRS[variable]
+    sd = str(tmp_path / ".autoforge")
+    run = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    commands = (
+        run,
+        [*run, "--dry-run"],
+        ["--state-dir", sd, "status"],
+        ["local", "run", "features/add-filter.md"],
+    )
+    for argv in commands:
+        assert cli.main(["--config", cfg, *argv]) == 2, argv
+        err = capsys.readouterr().err
+        assert f"error: the configuration file {cfg} lies in {directory}, {label}, " in err
+        assert f"which every sandboxed launch of {provider} " in err
+        assert "(sandbox.mode is required): a sandboxed agent could rewrite it" in err
+        assert "Nothing was run, launched or written." in err
+    assert _files(sd) == {}
+    assert not (tmp_path / ".git" / "autoforge" / "state").exists()
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+
+    monkeypatch.delenv(variable)
+    assert cli.main(["--config", cfg, *run]) == 0
+
+
 @pytest.mark.parametrize("spelling", DOTDOT_SPELLINGS)
 def test_an_enforced_run_refuses_a_config_path_whose_dotdot_reaches_into_the_repository(
     tmp_path, tmp_path_factory, capsys, monkeypatch, fakes, spelling

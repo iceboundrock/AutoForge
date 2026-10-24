@@ -706,8 +706,9 @@ class SandboxConfig:
     a stronger mode moves the pin up, and one under a weaker mode is refused
     unless the operator accepts it with ``--accept-config-change``. Under
     ``required`` or ``preferred`` the ``--config`` file must lie outside every
-    tree the repository's enforced launches write, or every command refuses
-    it (:func:`autoforge.sandbox_policy.config_file_problem`). The candidate
+    tree the repository's enforced launches write and every directory a
+    provider's launches are given read-write, or every command refuses it
+    (:func:`autoforge.engine.config_file_placement_problem`). The candidate
     read and the strict import of an issue's private objects (D6.3-D6.5)
     apply in every mode.
 

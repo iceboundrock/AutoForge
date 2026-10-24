@@ -175,6 +175,7 @@ from .config import (
     ACCEPTANCE_ACTIONS_AUTO,
     ACCEPTANCE_ACTIONS_OFF,
     DEFAULT_STATE_DIR,
+    KNOWN_PROVIDERS,
     SANDBOX_PREFERRED,
     SANDBOX_REQUIRED,
     AgentLimits,
@@ -390,7 +391,7 @@ from .prompts import (
     render,
     render_phase,
 )
-from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
+from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry, provider_for
 from .read_context import (
     MAX_LISTED_ISSUES,
     OperatorEvidence,
@@ -1323,6 +1324,68 @@ def sandbox_mode_summary(sandbox: SandboxConfig, local: bool) -> str:
     )
 
 
+def provider_written_directories(cfg: AutoForgeConfig) -> dict[str, str]:
+    """The directories the providers' sandboxed launches write that outlive them (#280).
+
+    What each provider's own declaration makes writable over the environment
+    a launch inherits from this process
+    (:meth:`~autoforge.providers.AgentProvider.written_directories`): a
+    dedicated ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR`` or OpenCode
+    database directory, each as declared, mapped to the phrase that says
+    what it is and whose launches write it.
+
+    Every profile ``cfg`` configures is asked, and a declaration of one that
+    cannot be read is a ConfigurationError naming it. So is every other
+    known provider, with a profile of its defaults: which providers matter
+    cannot be taken from the file being checked, since an agent that
+    rewrote it could name another, and a launch of another configuration on
+    this host writes those directories too. A provider that cannot be asked
+    without options of its own (an SDK provider, whose roots are the
+    repository's sandbox directories) is passed over there: no profile of
+    its defaults could launch.
+    """
+    home = _operator_home()
+    allowlist = cfg.execution.environment_names()
+    writers: dict[tuple[str, str], dict[str, list[str]]] = {}
+
+    def ask(profile: ProfileConfig, names: list[str]) -> None:
+        written = provider_for(profile).written_directories(profile, allowlist, home)
+        for directory in written:
+            writers.setdefault(directory, {}).setdefault(profile.provider, []).extend(names)
+
+    for name in sorted(cfg.profiles):
+        profile = cfg.profiles[name]
+        try:
+            ask(profile, [name])
+        except (AutoForgeError, OSError) as exc:
+            raise ConfigurationError(
+                f"the sandbox declaration of profile {name!r} (provider {profile.provider}) "
+                f"cannot be read ({exc})"
+            ) from exc
+    configured = {profile.provider for profile in cfg.profiles.values()}
+    for provider in KNOWN_PROVIDERS:
+        if provider not in configured:
+            try:
+                ask(ProfileConfig(name=f"(any {provider} profile)", provider=provider), [])
+            except (AutoForgeError, OSError):
+                continue
+
+    def whose(by_provider: dict[str, list[str]]) -> str:
+        return " and ".join(
+            f"{provider} (profile {', '.join(names)})"
+            if names
+            else f"{provider} (no profile of this file, but another configuration's)"
+            for provider, names in by_provider.items()
+        )
+
+    described: dict[str, list[str]] = {}
+    for (path, what), by in writers.items():
+        described.setdefault(path, []).append(
+            f"{what}, which every sandboxed launch of {whose(by)} writes"
+        )
+    return {path: "; ".join(phrases) for path, phrases in described.items()}
+
+
 def config_file_placement_problem(
     cfg: AutoForgeConfig, config_file: str, workdir: str | Path = ".", runner=None
 ) -> str:
@@ -1330,17 +1393,27 @@ def config_file_placement_problem(
 
     #280. Asked wherever a command loads a configuration file under
     ``required`` or ``preferred``: the CLI for every command, ``doctor``, a
-    scheduler's worker. The trees the repository's enforced launches write
-    are its working trees, the checkout ``workdir`` is in and every worktree
-    registered to the repository (a LOCAL launch writes the checkout, a
-    REMOTE one its agent worktree), and its sandbox directories (the caches).
-    Both modes ask: a LOCAL run's launches write the checkout a REMOTE
-    command loads its file from too, and the REMOTE controller runs
-    ``github.command`` with the GitHub credential. Under ``disabled`` no
-    launch is enforced and nothing is asked (the same-user residual,
-    docs/security.md). Outside a git repository no launch writes a tree of
-    it, so nothing is refused there; a registry that cannot be listed is a
-    refusal, since nothing then shows the file outside every worktree.
+    scheduler's worker. What enforced launches write and keep is asked
+    about: the repository's working trees, the checkout ``workdir`` is in
+    and every worktree registered to the repository (a LOCAL launch writes
+    the checkout, a REMOTE one its agent worktree), the repository's sandbox
+    directories (the caches), and every directory a provider's declaration
+    makes writable (:func:`provider_written_directories`), which the
+    launches of every repository write. Both modes ask: a LOCAL run's
+    launches write the checkout a REMOTE command loads its file from too,
+    and the REMOTE controller runs ``github.command`` with the GitHub
+    credential. Under ``disabled`` no launch is enforced and nothing is
+    asked (the same-user residual, docs/security.md). Outside a git
+    repository no launch writes a tree of it, so only the providers'
+    directories are asked about there; a provider declaration that cannot
+    be read, or a registry that cannot be listed, is a refusal, since
+    nothing then shows the file outside what launches write.
+
+    The providers' directories are those this process's environment
+    declares, the environment its own launches inherit: one a provider was
+    given only under another environment, by a command run from another
+    shell, is not known here (docs/security.md).
+
     ``config_file`` is the path the loader was given, unnormalized: a
     caller that made it absolute with ``os.path.abspath`` would have
     collapsed a ``..`` after a link, and the check would examine another
@@ -1349,19 +1422,27 @@ def config_file_placement_problem(
     if not config_file or not cfg.sandbox.enabled:
         return ""
     config_file = absolute_spelling(config_file)
+    mode = cfg.sandbox.mode
+    try:
+        declared = provider_written_directories(cfg)
+    except ConfigurationError as exc:
+        return (
+            f"{exc}, so the configuration file {config_file} is not shown to lie outside the "
+            "directories its launches write"
+        )
     workspace = LocalWorkspace(workdir=workdir, runner=runner or execute)
     try:
         root = workspace.root()
         dirs = workspace.git_dirs()
     except (AutoForgeError, OSError):
-        return ""
+        return config_file_problem(config_file, (), mode, declared)
     try:
         trees = registered_worktree_roots(dirs[-1])
     except VerificationError as exc:
         return f"{exc}, so the configuration file {config_file} is not shown to lie outside them"
     roots = {str(root), *(str(tree) for tree in trees)}
     roots.update(str(directory / SANDBOX_DIR) for directory in dirs)
-    return config_file_problem(config_file, tuple(sorted(roots)), cfg.sandbox.mode)
+    return config_file_problem(config_file, tuple(sorted(roots)), mode, declared)
 
 
 def _refusal_facts(exc: BaseException) -> dict[str, object]:

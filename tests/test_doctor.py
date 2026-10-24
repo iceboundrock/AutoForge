@@ -451,6 +451,47 @@ def test_doctor_runs_nothing_a_config_inside_the_repository_names(tmp_path, mode
     assert {argv[0] for argv in calls} >= set(_NAMED)
 
 
+@pytest.mark.parametrize("variable", ["CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "OPENCODE_DB"])
+def test_doctor_runs_nothing_a_config_in_a_providers_writable_directory_names(
+    tmp_path, monkeypatch, variable
+):
+    """#280 (R3-F1): a provider's dedicated directory is writable to every
+    enforced launch of it, outside the repository. A configuration file
+    there may say what an agent wrote, its ``sandbox.mode`` unchanged: the
+    config row fails, in ``doctor`` and in ``local doctor``, and no row runs
+    a command it names. Without the variable the same file's commands run."""
+    from tests.conftest import git_repo
+
+    base = Path(os.path.realpath(tmp_path))
+    repo = git_repo(base / "repo")
+    directory = base / "provider-dir"
+    directory.mkdir()
+    config = directory / "autoforge.json"
+    config.write_text(_placement_config("required"))
+    value = f"{directory}/af.db" if variable == "OPENCODE_DB" else str(directory)
+    monkeypatch.setenv(variable, value)
+
+    calls: list[list[str]] = []
+    d = _placement_doctor(config, repo, calls)
+    rows = {r.name: r for r in d.run_all()}
+    row = rows["config"]
+    assert not row.ok and row.required
+    assert row.detail.startswith(f"the configuration file {config} lies in {directory}, ")
+    assert f"(${variable}), which every sandboxed launch of " in row.detail
+    assert row.detail.endswith("; doctor runs no command this file names")
+    assert d.config is None
+    assert not any(name.startswith("agent ") for name in rows), sorted(rows)
+    assert not any(argv[0] in _NAMED for argv in calls), calls
+    local = _placement_doctor(config, repo, calls)
+    assert not local.check_config(local_required_profiles).ok and local.config is None
+
+    monkeypatch.delenv(variable)
+    calls = []
+    rows = {r.name: r for r in _placement_doctor(config, repo, calls).run_all()}
+    assert rows["config"].ok
+    assert {argv[0] for argv in calls} >= set(_NAMED)
+
+
 @pytest.mark.parametrize("spelling", DOTDOT_SPELLINGS)
 def test_doctor_runs_nothing_a_config_path_whose_dotdot_reaches_into_the_repository_names(
     tmp_path, monkeypatch, spelling

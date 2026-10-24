@@ -436,6 +436,35 @@ def test_a_mismatched_start_is_refused_before_any_state_access(world, capsys, ca
     os.fstat(args.l2_fd)
 
 
+def test_a_config_in_a_providers_writable_directory_is_refused_at_the_start(
+    world, capsys, monkeypatch
+):
+    """#280 (R3-F1): as every command refuses it. A dedicated
+    ``CLAUDE_CONFIG_DIR`` is writable to every enforced Claude Code launch,
+    outside the repository, so a configuration file there may say what an
+    agent wrote; the worker's environment declares it as its launches would
+    get it."""
+    w = world({})
+    to_ready(w)
+    args = w.admit()
+    directory = w.tmp_path / "claude-autoforge"
+    directory.mkdir()
+    path = directory / "autoforge.json"
+    path.write_text(json.dumps({"sandbox": {"mode": "required"}}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(directory))
+    w.config_path = str(path)
+    w.start_scheduler()  # the digest matches; where the file lies does not
+    args = replace(args, config=w.config_path)
+    before = w.tree()
+    assert w.run(args) == 2
+    err = capsys.readouterr().err
+    assert "refused to start, nothing was read or written" in err
+    assert f"autoforge.json lies in {directory}, the Claude Code configuration directory" in err
+    assert w.tree() == before
+    assert not w.ns.state_dir.exists()
+    assert w.provider.calls == [] and w.gh.calls == []
+
+
 @pytest.mark.parametrize(
     "words, expected",
     [

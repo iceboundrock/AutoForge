@@ -11,7 +11,8 @@ Commands:
           run whose pinned sandbox.mode this invocation's is weaker than, unless
           --accept-config-change (#219, #280). Under sandbox.mode required or
           preferred every command refuses a --config file inside a tree the
-          repository's sandboxed launches write (#280)
+          repository's sandboxed launches write, or a directory a provider's
+          launches are given read-write (#280)
   unblock the operator's explicit exit from BLOCKED: the controller re-inspects
           live GitHub state, re-enters a phase through validate_transition or
           refuses and stays BLOCKED; the reason is recorded in state and the log.
@@ -520,7 +521,8 @@ def _load_cfg(args) -> AutoForgeConfig:
     The file is parsed first, since the ``sandbox.mode`` it sets decides
     whether the placement check applies at all. Under ``required`` or
     ``preferred``, a file inside a tree the repository's enforced launches
-    write is then a ConfigurationError (exit 2) for every command, before
+    write, or a directory a provider's launches are given read-write, is
+    then a ConfigurationError (exit 2) for every command, before
     anything acts on what it says: no phase, launch or write follows, and no
     command it names runs (#280,
     :func:`autoforge.engine.config_file_placement_problem`). The check is

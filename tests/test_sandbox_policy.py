@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from autoforge.config import ProfileConfig
+from autoforge.config import ProfileConfig, default_config
+from autoforge.engine import config_file_placement_problem
 from autoforge.errors import SandboxLaunchRefusedError
 from autoforge.providers import ClaudeCodeProvider, OpenCodeProvider, PiProvider
 from autoforge.sandbox import (
@@ -23,6 +24,7 @@ from autoforge.sandbox import (
     Link,
     Mask,
     NetworkPosition,
+    Origin,
     Overlay,
     PrivateTmpfs,
 )
@@ -34,6 +36,7 @@ from autoforge.sandbox_policy import (
     ProviderRequirements,
     absolute_spelling,
     config_file_problem,
+    declared_writable,
     describe_launch,
     executable_requirements,
     install_root,
@@ -886,3 +889,222 @@ def test_a_file_the_lookup_walk_does_not_end_at_is_refused(tmp_path):
         f"the configuration file {spelled} opens another file than its lookup walk was followed to"
     )
     assert "(sandbox.mode is required; #280)" in problem
+
+
+# -- the directories a provider's own launches write (#280, R3-F1) ------------------
+# A dedicated ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR`` or OpenCode database
+# directory is projected writable into every launch of its provider and outlives
+# it: a configuration file there is one an agent can rewrite.
+
+_DECLARED_WHAT = (
+    "the Claude Code configuration directory ($CLAUDE_CONFIG_DIR), which every sandboxed "
+    "launch of claude (profile fix) writes"
+)
+
+
+def test_a_declaration_makes_its_state_and_dir_rw_items_writable_and_nothing_else(tmp_path):
+    """What :func:`declared_writable` names is what :func:`sandbox_request`
+    projects read-write from the declaration: never a read-only file, an
+    ``env`` item or a keyring login."""
+    needs = ProviderRequirements(
+        config=("/opt/tool/conf",),
+        home_config=("/home/u/.tool/settings.json",),
+        state=("/srv/tool-state",),
+        auth=(
+            AuthItem(AuthMode.ENV, "TOOL_API_KEY"),
+            AuthItem(AuthMode.FILE_RO, "the tool login", "/home/u/.tool/login.json"),
+            AuthItem(AuthMode.DIR_RW, "the tool directory ($TOOL_DIR)", "/srv/tool"),
+            AuthItem(AuthMode.KEYRING, "the tool keyring login", "tool"),
+        ),
+    )
+    assert declared_writable(needs) == (
+        ("/srv/tool-state", "a state directory its provider declares (/srv/tool-state)"),
+        ("/srv/tool", "the tool directory ($TOOL_DIR)"),
+    )
+    request = sandbox_request(_local(_layout(tmp_path)), needs)
+    projected = [
+        p.source
+        for p in request.projections
+        if p.origin is Origin.DECLARED and p.access is Access.WRITABLE
+    ]
+    assert projected == [path for path, _ in declared_writable(needs)]
+
+
+def test_each_provider_names_the_directories_its_launches_write(tmp_path, monkeypatch):
+    """Each adapter's own declaration, over the environment a launch
+    inherits: ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR`` and the directory
+    of ``OPENCODE_DB``. An operator's ``OPENCODE_CONFIG_DIR`` is not one:
+    every OpenCode launch replaces it with an empty directory of its own."""
+    base = Path(os.path.realpath(tmp_path))
+    home = str(base / "home")
+    allowlist = default_config().execution.environment_names()
+
+    def written(provider) -> tuple[tuple[str, str], ...]:
+        profile = ProfileConfig(name="p", provider=provider.name)
+        return provider.written_directories(profile, allowlist, home)
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", f"{base}/claude")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", f"{base}/pi")
+    monkeypatch.setenv("OPENCODE_DB", f"{base}/opencode/af.db")
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", f"{base}/opencode-config")
+    assert written(ClaudeCodeProvider()) == (
+        (f"{base}/claude", "the Claude Code configuration directory ($CLAUDE_CONFIG_DIR)"),
+    )
+    assert written(PiProvider()) == ((f"{base}/pi", "Pi's agent directory ($PI_CODING_AGENT_DIR)"),)
+    assert written(OpenCodeProvider()) == (
+        (f"{base}/opencode", "the OpenCode database directory ($OPENCODE_DB)"),
+    )
+    for name in ("CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "OPENCODE_DB"):
+        monkeypatch.delenv(name)
+    for provider in (ClaudeCodeProvider(), PiProvider(), OpenCodeProvider()):
+        assert written(provider) == (), provider.name
+
+
+def test_a_configuration_file_in_a_providers_writable_directory_is_refused(tmp_path):
+    base, root, outside = _tree(tmp_path)
+    claude = base / "claude-autoforge"
+    (claude / "conf").mkdir(parents=True)
+    declared = {str(claude): _DECLARED_WHAT}
+    for cfg in (claude / "autoforge.yaml", claude / "conf" / "autoforge.yaml"):
+        cfg.write_text("version: 1\n")
+        problem = config_file_problem(str(cfg), (str(root),), "required", declared)
+        assert problem.startswith(
+            f"the configuration file {cfg} lies in {claude}, {_DECLARED_WHAT} "
+            "(sandbox.mode is required): a sandboxed agent could rewrite it"
+        )
+        assert "Move it outside that directory and every working tree" in problem
+        assert "give the provider another directory, or set sandbox.mode: disabled" in problem
+    assert "lies in" in config_file_problem(str(claude / "x.yaml"), (), "preferred", declared)
+
+
+def test_a_path_through_a_providers_writable_directory_is_refused(tmp_path):
+    """The agent replaces what the lookup passes in the directory: a link to
+    a file outside, a link into it, a name a ``..`` leaves again."""
+    base, root, outside = _tree(tmp_path)
+    claude = base / "claude-autoforge"
+    (claude / "conf").mkdir(parents=True)
+    (claude / "autoforge.yaml").write_text("version: 1\n")
+    (outside / "a.yaml").write_text("version: 1\n")
+    (claude / "linked.yaml").symlink_to(outside / "a.yaml")
+    (outside / "alias").symlink_to(claude / "conf")
+    declared = {str(claude): _DECLARED_WHAT}
+    for spelled in (
+        str(claude / "linked.yaml"),
+        f"{outside}/alias/../autoforge.yaml",
+        f"{claude}/conf/../../operator/a.yaml",
+    ):
+        problem = config_file_problem(spelled, (str(root),), "required", declared)
+        assert problem.startswith(f"the configuration file {spelled} is reached through "), spelled
+        assert f", in {claude}, {_DECLARED_WHAT} (sandbox.mode is required)" in problem
+    # Spelled through a link, the declared directory is compared resolved.
+    (base / "claude-alias").symlink_to(claude)
+    alias = {str(base / "claude-alias"): _DECLARED_WHAT}
+    assert "lies in" in config_file_problem(str(claude / "autoforge.yaml"), (), "required", alias)
+
+
+def test_a_configuration_file_beside_or_above_a_providers_directory_passes(tmp_path):
+    """A provider writes only inside its directory: neither a file beside it
+    nor one whose own directory holds it is within reach."""
+    base, root, outside = _tree(tmp_path)
+    (outside / "a.yaml").write_text("version: 1\n")
+    (base / "a.yaml").write_text("version: 1\n")
+    declared = {str(outside / "claude"): _DECLARED_WHAT, str(base / "operator-x"): _DECLARED_WHAT}
+    (outside / "claude").mkdir()
+    (base / "operator-x").mkdir()
+    assert config_file_problem(str(outside / "a.yaml"), (str(root),), "required", declared) == ""
+    assert config_file_problem(str(base / "a.yaml"), (str(root),), "required", declared) == ""
+
+
+def _placement_cfg(mode: str = "required"):
+    cfg = default_config()
+    cfg.sandbox.mode = mode
+    return cfg
+
+
+def test_the_placement_check_asks_every_configured_profiles_provider(tmp_path, monkeypatch):
+    """#280 (R3-F1) where every command asks: the default profiles route
+    ``analyze_execute`` and ``fix`` to Claude Code, whose dedicated
+    ``CLAUDE_CONFIG_DIR`` every launch writes, so a file there is refused,
+    outside any repository too; beside it the file passes, and under
+    ``disabled`` nothing is asked."""
+    base = Path(os.path.realpath(tmp_path))
+    claude = base / "claude-autoforge"
+    claude.mkdir()
+    (base / "operator").mkdir()
+    inside, beside = claude / "autoforge.yaml", base / "operator" / "autoforge.yaml"
+    for path in (inside, beside):
+        path.write_text("version: 1\n")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
+    monkeypatch.chdir(base)  # no git repository here
+    for mode in ("required", "preferred"):
+        problem = config_file_placement_problem(_placement_cfg(mode), str(inside), base)
+        assert problem.startswith(
+            f"the configuration file {inside} lies in {claude}, the Claude Code configuration "
+            "directory ($CLAUDE_CONFIG_DIR), which every sandboxed launch of claude (profile "
+            f"analyze_execute, fix) writes (sandbox.mode is {mode})"
+        )
+        assert config_file_placement_problem(_placement_cfg(mode), str(beside), base) == ""
+    assert config_file_placement_problem(_placement_cfg("disabled"), str(inside), base) == ""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert config_file_placement_problem(_placement_cfg(), str(inside), base) == ""
+
+
+@pytest.mark.parametrize("variable", ["PI_CODING_AGENT_DIR", "OPENCODE_DB"])
+def test_the_placement_check_asks_a_provider_no_profile_names(tmp_path, monkeypatch, variable):
+    """Which providers matter is not the file's to say: an agent that
+    rewrote it could name another, and another configuration's launches
+    write the directory too. No default profile uses Pi, yet a file in
+    ``PI_CODING_AGENT_DIR`` is refused; nor, once no profile uses OpenCode,
+    may a file lie in its database directory."""
+    base = Path(os.path.realpath(tmp_path))
+    directory = base / "provider-dir"
+    directory.mkdir()
+    cfg_file = directory / "autoforge.yaml"
+    cfg_file.write_text("version: 1\n")
+    value = str(directory) if variable == "PI_CODING_AGENT_DIR" else f"{directory}/af.db"
+    monkeypatch.setenv(variable, value)
+    cfg = _placement_cfg()
+    provider = "pi" if variable == "PI_CODING_AGENT_DIR" else "opencode"
+    for profile in cfg.profiles.values():
+        profile.provider = "claude" if profile.provider == provider else profile.provider
+    problem = config_file_placement_problem(cfg, str(cfg_file), base)
+    assert problem.startswith(f"the configuration file {cfg_file} lies in {directory}, ")
+    assert (
+        f"which every sandboxed launch of {provider} (no profile of this file, but another "
+        "configuration's) writes (sandbox.mode is required)"
+    ) in problem
+
+
+def test_one_directory_two_providers_write_is_named_for_both(tmp_path, monkeypatch):
+    base = Path(os.path.realpath(tmp_path))
+    shared = base / "shared"
+    shared.mkdir()
+    cfg_file = shared / "autoforge.yaml"
+    cfg_file.write_text("version: 1\n")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(shared))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(shared))
+    problem = config_file_placement_problem(_placement_cfg(), str(cfg_file), base)
+    assert problem.startswith(
+        f"the configuration file {cfg_file} lies in {shared}, the Claude Code configuration "
+        "directory ($CLAUDE_CONFIG_DIR), which every sandboxed launch of claude (profile "
+        "analyze_execute, fix) writes; Pi's agent directory ($PI_CODING_AGENT_DIR), which every "
+        "sandboxed launch of pi (no profile of this file, but another configuration's) writes "
+        "(sandbox.mode is required)"
+    )
+
+
+def test_a_profile_whose_declaration_cannot_be_read_refuses_the_file(tmp_path):
+    """Nothing then shows the file outside what that profile's launches write."""
+    base = Path(os.path.realpath(tmp_path))
+    cfg_file = base / "autoforge.yaml"
+    cfg_file.write_text("version: 1\n")
+    cfg = _placement_cfg()
+    cfg.profiles["odd"] = ProfileConfig(name="odd", provider="no-such-provider")
+    problem = config_file_placement_problem(cfg, str(cfg_file), base)
+    assert problem.startswith(
+        "the sandbox declaration of profile 'odd' (provider no-such-provider) cannot be read ("
+    )
+    assert problem.endswith(
+        f"so the configuration file {cfg_file} is not shown to lie outside the directories its "
+        "launches write"
+    )

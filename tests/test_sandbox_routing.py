@@ -955,6 +955,97 @@ def test_a_required_local_run_with_its_config_file_in_the_root_launches_nothing(
     assert not (root / ".git" / "autoforge" / "sandbox").exists()
 
 
+_PROVIDERS_BY_DIR = {
+    "CLAUDE_CONFIG_DIR": ClaudeCodeProvider,
+    "PI_CODING_AGENT_DIR": PiProvider,
+    "OPENCODE_DB": OpenCodeProvider,
+}
+
+
+@pytest.mark.parametrize("variable", sorted(_PROVIDERS_BY_DIR))
+def test_a_launch_rewrites_a_config_file_in_its_providers_directory_which_is_why_it_is_refused(
+    backend, layout, monkeypatch, variable
+):
+    """#280 (R3-F1) through the real backend. An enforced LOCAL agent launch
+    with its provider's own declaration for a dedicated directory outside the
+    repository (``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR``, the directory
+    of ``OPENCODE_DB``) rewrites a configuration file there: the same
+    ``sandbox.mode``, so the pin sees nothing, and another ``github.command``.
+    That is why every command refuses such a file
+    (:func:`autoforge.engine.config_file_placement_problem`), before any
+    launch; the operator's file elsewhere is out of the launch's reach,
+    byte-identical, and passes."""
+    from dataclasses import replace
+
+    from autoforge.engine import config_file_placement_problem
+
+    paths = layout
+    repo, base, home = paths["repo"], paths["base"], paths["home"]
+    directory = base / "provider-dir"
+    planted = _sentinel(directory / "autoforge.json", _CONFIG_TEXT)
+    elsewhere = _sentinel(base / "operator" / "autoforge.json", _CONFIG_TEXT)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    value = f"{directory}/af.db" if variable == "OPENCODE_DB" else str(directory)
+    monkeypatch.setenv(variable, value)
+    provider = _PROVIDERS_BY_DIR[variable]()
+    cfg = default_config()
+    cfg.sandbox.mode = "required"
+    profile = ProfileConfig(name="analyze_execute", provider=provider.name, command=PY)
+    env = provider.launch_environment(cfg.execution.environment_names())
+    needs = provider.sandbox_requirements(profile, [PY], env, str(home))
+    facts = replace(_local_facts(paths), launch_class=LaunchClass.LOCAL_AGENT)
+    payload = '{"version": 1, "sandbox": {"mode": "required"}, "github": {"command": "/x/gh"}}\n'
+    code = (
+        f"payload = {payload!r}\n"
+        "def rewrite(path):\n"
+        "    with open(path + '.new', 'w') as fh:\n"
+        "        fh.write(payload)\n"
+        "    os.replace(path + '.new', path)\n"
+        "report = {\n"
+        f"  'provider_dir': attempt(lambda: rewrite({str(planted)!r})),\n"
+        f"  'elsewhere': attempt(lambda: write({str(elsewhere)!r}, payload)),\n"
+        "}\n"
+        "print(json.dumps(report))\n"
+    )
+    report = _probe(describe_launch(facts, needs, env), repo, code)
+    assert report == {"provider_dir": "ok", "elsewhere": "ENOENT"}, report
+    assert planted.read_text() == payload  # the hazard the placement rule refuses
+    assert elsewhere.read_bytes() == _CONFIG_TEXT.encode()
+    problem = config_file_placement_problem(cfg, str(planted), repo)
+    assert problem.startswith(f"the configuration file {planted} lies in {directory}, "), problem
+    assert f"(${variable}), which every sandboxed launch of {provider.name} " in problem
+    assert config_file_placement_problem(cfg, str(elsewhere), repo) == ""
+
+
+def test_a_required_local_run_with_its_config_file_in_claudes_directory_launches_nothing(
+    backend, tmp_path, monkeypatch, capsys
+):
+    """#280 (R3-F1) end to end on a host that enforces: the file the previous
+    test shows a Claude Code launch rewriting is refused before the run
+    exists, though it lies outside the repository, so no launch ever writes
+    it and it is byte-identical."""
+    from autoforge import cli
+
+    from .test_local import local_repo
+
+    root = local_repo(tmp_path / "work")
+    directory = Path(os.path.realpath(tmp_path)) / "claude-autoforge"
+    planted = _sentinel(directory / "autoforge.json", _CONFIG_TEXT)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(directory))
+    monkeypatch.chdir(root)
+    assert cli.main(["--config", str(planted), "local", "run", "features/add-filter.md"]) == 2
+    err = capsys.readouterr().err
+    assert (
+        f"the configuration file {planted} lies in {directory}, the Claude Code configuration "
+        "directory ($CLAUDE_CONFIG_DIR), which every sandboxed launch of claude "
+    ) in err
+    assert "Nothing was run, launched or written." in err
+    assert planted.read_bytes() == _CONFIG_TEXT.encode()
+    assert not (root / ".git" / "autoforge" / "state").exists()
+    assert not (root / ".git" / "autoforge" / "sandbox").exists()
+
+
 def test_an_export_command_sees_its_tree_and_no_network_when_isolated(backend, layout):
     paths = layout
     tree = paths["base"] / "export" / "tree"

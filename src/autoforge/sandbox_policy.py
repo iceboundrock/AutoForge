@@ -41,8 +41,9 @@ failure to spawn takes.
 
 :func:`config_file_problem` answers the converse question for the
 controller's own input (#280): whether the ``--config`` file lies where an
-enforced launch writes, so that the next command would run on what an
-agent left there.
+enforced launch writes, the repository's trees and what the providers'
+declarations make writable (:func:`declared_writable`), so that the next
+command would run on what an agent left there.
 
 Pure except for the compiler's ``realpath`` and ``lstat``, ``realpath`` of
 the environment's path values and ``lstat`` and ``readlink`` on their way,
@@ -437,18 +438,41 @@ def _lookup(path: str) -> tuple[tuple[str, ...], str]:
     return tuple(looked_up), current
 
 
-def config_file_problem(config_file: str, written_roots: tuple[str, ...], mode: str) -> str:
+def declared_writable(needs: ProviderRequirements) -> tuple[tuple[str, str], ...]:
+    """Each host directory a provider's declaration makes writable, with what it is (#280).
+
+    Its state directories and the directory of every ``dir-rw`` credential
+    item, as :func:`sandbox_request` projects them read-write: what a
+    launch of the provider writes on the host besides the engine's roots,
+    a dedicated ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR`` or OpenCode
+    database directory among them. Each is ``(path, phrase)``, the path as
+    declared.
+    """
+    state = [(path, f"a state directory its provider declares ({path})") for path in needs.state]
+    auth = [(item.source, item.label) for item in needs.auth if item.mode is AuthMode.DIR_RW]
+    return (*state, *auth)
+
+
+def config_file_problem(
+    config_file: str,
+    written_roots: tuple[str, ...],
+    mode: str,
+    declared: Mapping[str, str] | None = None,
+) -> str:
     """Why an enforced launch could rewrite the configuration file, as a refusal; "" if none.
 
     ``written_roots`` are the trees the repository's enforced launches write
     and that outlive the launch: its working trees (the checkout, and every
     worktree registered to it, the agent worktrees included) and its sandbox
-    directories (the caches). A file is within reach when opening it looks
-    up a name in one of them (:func:`lookup_directories`), and when it has a
-    second hard link, which may lie in one (ADR 0005 D4.4). The next command
-    would run on what such a file says: the sandbox mode, the controller's
-    GitHub command and the commands of every profile ``doctor`` checks
-    (#280). Both sides are compared resolved.
+    directories (the caches). ``declared`` are
+    the directories the providers' declarations make writable
+    (:func:`declared_writable`), each with the phrase that says what it is
+    and whose launches write it. A file is within reach when opening it
+    looks up a name in one of either (:func:`lookup_directories`), and when
+    it has a second hard link, which may lie in one (ADR 0005 D4.4). The
+    next command would run on what such a file says: the sandbox mode, the
+    controller's GitHub command and the commands of every profile
+    ``doctor`` checks (#280). Both sides are compared resolved.
 
     ``config_file`` is the path the loader was given, relative or not. It
     is walked as spelled (:func:`absolute_spelling`), never normalized
@@ -461,14 +485,25 @@ def config_file_problem(config_file: str, written_roots: tuple[str, ...], mode: 
     """
     config_file = absolute_spelling(config_file)
     direct = os.path.realpath(config_file) == config_file
-    roots = [(root, os.path.realpath(root)) for root in written_roots]
+    roots = [(root, os.path.realpath(root), "") for root in written_roots]
+    roots += [(root, os.path.realpath(root), what) for root, what in (declared or {}).items()]
     walked, reached = _lookup(config_file)
     for directory in walked:
-        for root, resolved in roots:
+        for root, resolved, what in roots:
             if _inside(directory, resolved):
                 # The deepest directory of the walk in this root names the lookup.
                 deepest = [d for d in walked if _inside(d, resolved)][-1]
                 where = "lies in" if direct else f"is reached through {deepest}, in"
+                if what:
+                    return (
+                        f"the configuration file {config_file} {where} {root}, {what} "
+                        f"(sandbox.mode is {mode}): a sandboxed agent could rewrite it, and the "
+                        "next command would run on what it says, sandbox.mode, github.command "
+                        "and the profiles' commands included (#280). Move it outside that "
+                        "directory and every working tree of this repository (for example to "
+                        "~/.config/autoforge/) and pass that path with --config, give the "
+                        "provider another directory, or set sandbox.mode: disabled"
+                    )
                 return (
                     f"the configuration file {config_file} {where} {root}, a tree that "
                     f"launches inside the outer sandbox write (sandbox.mode is {mode}): a "
@@ -495,7 +530,8 @@ def config_file_problem(config_file: str, written_roots: tuple[str, ...], mode: 
             "may lie in a tree that launches inside the outer sandbox write (sandbox.mode is "
             f"{mode}; ADR 0005 D4.4): a sandboxed agent could rewrite it through that link "
             "(#280). Copy it to a file of its own outside every working tree of this "
-            "repository and pass that path with --config, or set sandbox.mode: disabled"
+            "repository and every directory a provider's launches write, and pass that path "
+            "with --config, or set sandbox.mode: disabled"
         )
     return ""
 
