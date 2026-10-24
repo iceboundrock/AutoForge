@@ -10062,6 +10062,20 @@ class ControllerEngine:
             return f"PR {url} has failing or inconclusive checks: {', '.join(failed)}"
         if pending:
             raise VerificationError(f"PR {url} has checks still running: {', '.join(pending)}")
+        #    ... and at least one of them actually succeeded: a NEUTRAL or
+        #    SKIPPED conclusion fails nothing, but a rollup of only those is
+        #    no more a set of passed checks than an empty one. An automatic
+        #    merge never passes only because no check failed, whatever
+        #    safety.required_checks and safety.verify_check_definition say (#289).
+        if not any(check.succeeded for check in checks):
+            results = sorted({(c.conclusion or c.state or "?").upper() for c in checks})
+            return (
+                f"PR {url} has no successful check in its status rollup: every check it holds "
+                f"ended {', '.join(results)}, and a rollup in which nothing succeeded is not a "
+                "set of passed checks, so the controller never merges it, whatever "
+                "safety.required_checks and safety.verify_check_definition say. Make CI report "
+                "a success on the PR's head, then 'unblock'; or merge it by hand"
+            )
         #    ... and the required ones came from the definition the base
         #    branch has, not merely from a run that reported the same name.
         redefined = self._check_definition_problem(pr)

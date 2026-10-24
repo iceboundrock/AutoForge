@@ -765,6 +765,11 @@ Verify:
   over no check is vacuous
 - every check in the status rollup passes (all checks, not only the
   required ones)
+- at least one of them actually succeeded (#289): a check run that
+  concluded `SUCCESS` or a commit status in state `SUCCESS`. `NEUTRAL` and
+  `SKIPPED` fail nothing, but a rollup of only those is `BLOCKED` under
+  every configuration too: an automatic merge never passes only because no
+  check failed
 - each required check's run has the same jobs and steps as the base branch's
   own run of that workflow (`safety.verify_check_definition`): a green check
   is produced by the PR's copy of the workflow, so its name alone proves only
@@ -1659,8 +1664,10 @@ the write), reading only controller state and GitHub, never an agent claim.
   `REVIEW`; ordinary commits landing on the base do not move it), not a
   draft, no change to any `safety.protected_merge_paths` entry, a status
   rollup that holds at least one check (an empty one is `BLOCKED` under
-  every configuration, #289), every check in it succeeded (all checks, not
-  only required ones),
+  every configuration, #289), every check in it passed (all checks, not
+  only required ones) and at least one of them concluded `SUCCESS` (a
+  rollup of only `NEUTRAL` or `SKIPPED` entries is `BLOCKED` under every
+  configuration, #289),
   `mergeable = MERGEABLE`, `mergeStateStatus` in `CLEAN`/`HAS_HOOKS`, no
   auto-merge armed, and no merge queue on the base branch (`gh pr merge`
   would otherwise arm auto-merge or enqueue instead of merging, leaving an
@@ -1668,7 +1675,7 @@ the write), reading only controller state and GitHub, never an agent claim.
   also pass the definition comparison, and every
   `merge.verification_commands` command must pass (both below).
 - Conclusive negatives (closed PR, conflict, an empty status rollup, a
-  failing check, branch protection, queue, a recorded review comment GitHub
+  rollup in which nothing succeeded, a failing check, branch protection, queue, a recorded review comment GitHub
   no longer backs, a failing local command) -> `BLOCKED`.
 - Inconclusive data (checks still running, the base branch's own run still
   running, `mergeable = UNKNOWN`, an unfetchable reviewed commit, or the
@@ -1762,7 +1769,7 @@ untouched workflow file (a reusable action, a `Makefile` target the workflow
 calls by a different job or step name) but it is structural: a step whose
 name stayed the same while its command changed passes. Setting the key to
 `false`, or leaving `required_checks` empty, skips the comparison; an empty
-status rollup is still refused before it (#289).
+status rollup, or one in which nothing succeeded, is still refused (#289).
 
 ### Controller-run verification commands
 
@@ -1846,10 +1853,10 @@ re-verified), bounded by the same `merge.max_verification_attempts`, then
 ### Doctor's branch-rule check
 
 `doctor` verifies that the default branch still requires the CI check. The
-pre-merge gate trusts "every check on the PR succeeded" and refuses a
-rollup with no check at all (#289), but which check *had* to exist is a
-branch rule: with the ruleset gone, a PR whose only check is some other
-green one passes the gate. That ruleset lives in
+pre-merge gate trusts "every check on the PR passed" and refuses a
+rollup with no check at all or no success in it (#289), but which check
+*had* to exist is a branch rule: with the ruleset gone, a PR whose only
+check is some other green one passes the gate. That ruleset lives in
 repository settings, outside version control, so `autoforge doctor` reads
 the effective rules of the default branch
 (`gh api repos/{owner}/{repo}/rules/branches/{branch}`, every page) and
@@ -1858,9 +1865,9 @@ reports which contexts a `required_status_checks` rule names, whether each of
 enforcement is `active`, and whether it has bypass actors. Any of those
 missing is a `FAIL` with the settings URL and the rule to add. A repository
 still on classic branch protection is checked through that instead
-(`enforce_admins` standing in for "no bypass actors"). Rules it cannot read
-at all are not shown to require anything (#289), and how that is reported
-depends on the merge gate:
+(`enforce_admins` standing in for "no bypass actors"). Rules it cannot verify
+are not shown to require anything (#289), and how that is reported depends
+on the merge gate:
 
 - GitHub's plan offers no rulesets or branch protection on the repository
   (GitHub Free's private repositories: `HTTP 403 "Upgrade to GitHub Pro or
@@ -1873,15 +1880,23 @@ depends on the merge gate:
   is classified this way; the rulesets listing is a hint only.
 - The token may not read the rules (no credentials, a non-admin token
   reading classic protection, not found).
+- GitHub could not be read at all (a transient failure): nothing was
+  verified; running doctor again answers it.
+- GitHub returns a ruleset's `bypass_actors` only to a token with write
+  access to it, and this answer withholds them *and* omits
+  `current_user_can_bypass`: whether the controller's own login may skip
+  the rule is unverified.
 
-Either is a `FAIL` while the configuration's half of the merge gate is open
+Each is a `FAIL` while the configuration's half of the merge gate is open
 (`safety.allow_merge: true`): an unattended merge would rest on a
-requirement nobody verified. With the gate closed it is a `SKIP` that says
-why. A transient GitHub failure is a `SKIP` either way; so is a *partial*
-read: GitHub returns a ruleset's `bypass_actors` only to a token with write
-access to it, and a rule this token can see but whose bypass list it cannot
-is `SKIP` rather than `OK` (a token that GitHub says may itself bypass the
-rule is a `FAIL` either way). The row is never an unverified `OK`.
+requirement nobody verified. The text names the way out for its cause
+(for the plan: a public repository or a plan that offers rules, never a
+token permission), or closing the gate. With the gate closed it is a `SKIP`
+that says why. A hidden bypass list is a `SKIP` either way when GitHub does
+say `current_user_can_bypass: never`: the required checks were read and the
+controller's login cannot bypass them, though "no bypass actors" is
+unverified (a token that GitHub says may itself bypass the rule is a `FAIL`
+either way). The row is never an unverified `OK`.
 `doctor --json` carries a skip as `"skipped": true`. The check is read-only
 and runs in `doctor` only: the `READY_FOR_MERGE` gate itself does not yet
 consult branch rules.

@@ -109,7 +109,6 @@ from .github import (
     GitHubClient,
     checks_access_remedy,
     is_access_denied_gh_failure,
-    is_plan_limited_gh_failure,
     parse_gh_version,
 )
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
@@ -421,22 +420,24 @@ class Doctor:
         runs vacuously green. The requirement lives in repository settings,
         outside version control, so this is the only place drift is caught.
 
-        Read-only. When the branch rules cannot be read -- GitHub's plan
-        offers none on this repository (#289), the token may not read them,
-        or GitHub reports the repository not found -- nothing shows that the
-        merge gate's "every check succeeded" has a required check behind it.
-        With the configuration's half of the merge gate open
-        (``safety.allow_merge: true``) that is a FAIL; with it closed a SKIP
-        that says why. A plan limitation is named as one and never sent to
-        the token's permissions: no permission changes it. A transient
-        GitHub failure is a SKIP either way: it says nothing about the
-        branch, and running doctor again answers it. A partial answer is a
-        SKIP too: GitHub returns a ruleset's bypass actors only to a token
-        with write access to it, so a rule this token can see but whose
-        bypass list it cannot is not shown to be unbypassable, while the
-        required checks it names were read. A problem that *is* visible (a
-        missing context, a non-active ruleset, a bypass actor) is a FAIL
-        regardless of what stayed hidden. Never an unverified OK.
+        Read-only. When the branch rules cannot be verified -- GitHub's
+        plan offers none on this repository (#289), the token may not read
+        them, GitHub reports the repository not found, or GitHub could not
+        be read at all (transient) -- nothing shows that the merge gate's
+        "every check succeeded" has a required check behind it. With the
+        configuration's half of the merge gate open (``safety.allow_merge:
+        true``) that is a FAIL; with it closed a SKIP that says why. A plan
+        limitation is named as one and never sent to the token's
+        permissions: no permission changes it. The same holds for a rule
+        whose bypass actors GitHub withholds (it returns them only with
+        write access to the ruleset) when it also does not say whether this
+        token may bypass it: whether the controller's own login can skip the
+        rule is then unverified. When GitHub does say that this token may
+        never bypass it, the hidden list is a SKIP either way: the required
+        checks were read and the controller cannot bypass them. A problem
+        that *is* visible (a missing context, a non-active ruleset, a bypass
+        actor) is a FAIL regardless of what stayed hidden. Never an
+        unverified OK.
         """
         name = REQUIRED_CHECKS_ROW
         cfg = self.config
@@ -448,23 +449,32 @@ class Doctor:
         try:
             return self._required_checks(client, self.repo, cfg.safety.required_checks)
         except GitHubUnavailableError as exc:
-            return CheckResult.skip(name, f"GitHub could not be read (transient): {exc}")
+            return self._required_checks_unverifiable(
+                f"GitHub could not be read (transient; run doctor again): {exc}",
+                "run doctor again",
+            )
         except GitHubPlanLimitedError as exc:
-            return self._required_checks_unverifiable(_plan_limited_text(self.repo, exc))
+            return self._required_checks_unverifiable(
+                _plan_limited_text(self.repo, exc), _PLAN_REMEDY
+            )
         except GitHubError as exc:
             if isinstance(exc, GitHubNotFoundError) or is_access_denied_gh_failure(str(exc)):
                 return self._required_checks_unverifiable(
-                    f"this token cannot read the branch rules of {self.repo}: {exc}"
+                    f"this token cannot read the branch rules of {self.repo}: {exc}",
+                    _READ_RULES_REMEDY,
                 )
             return CheckResult(name, False, str(exc))
 
-    def _required_checks_unverifiable(self, why: str) -> CheckResult:
-        """No answer about the default branch's required checks: FAIL with the gate open (#289).
+    def _required_checks_unverifiable(self, why: str, remedy: str) -> CheckResult:
+        """No verified answer about the default branch's required checks (#289).
 
-        The merge gate's own rollup check refuses an empty rollup, but only a
-        branch rule makes a check *required*: with ``safety.allow_merge:
-        true`` and nothing doctor can read requiring one, the unattended
-        merge rests on a property no one verified.
+        A FAIL with the gate open, a SKIP that says why with it closed. The
+        merge gate's own rollup check refuses a rollup in which nothing
+        succeeded, but only a branch rule makes a check *required*: with
+        ``safety.allow_merge: true`` and nothing doctor can verify requiring
+        one, the unattended merge rests on a property no one verified.
+        ``remedy`` is the way out for this cause, never a permission for a
+        plan limitation.
         """
         name = REQUIRED_CHECKS_ROW
         if self.config is not None and self.config.merge_allowed_by_config:
@@ -473,8 +483,8 @@ class Doctor:
                 False,
                 redact(
                     f"{why}; with safety.allow_merge=true the merge gate would merge without "
-                    "a branch rule doctor could verify requires a check: close the gate "
-                    "(safety.allow_merge: false) or make the requirement readable"
+                    f"a branch rule doctor could verify requires a check: {remedy}, or close "
+                    "the gate (safety.allow_merge: false)"
                 ),
             )
         return CheckResult.skip(
@@ -499,7 +509,8 @@ class Doctor:
         # established only by an explicitly empty list; `current_user_can_
         # bypass` is returned to every caller and a token that may bypass the
         # rule is a bypass actor whether or not the list is visible.
-        unseen: list[str] = []
+        unseen: list[str] = []  # list hidden; GitHub says this token may never bypass
+        unverified: list[str] = []  # list hidden, and nothing said about this token
         for ruleset_id in sorted({rule.ruleset_id for rule in rules}):
             ruleset = client.get_ruleset(repo, ruleset_id)
             label = f"ruleset '{ruleset.name}' (#{ruleset.id})"
@@ -514,7 +525,7 @@ class Doctor:
             elif can_bypass not in ("", "never"):
                 problems.append(f"{label} can be bypassed by this token ({can_bypass})")
             elif ruleset.bypass_actors is None:
-                unseen.append(label)
+                (unverified if can_bypass == "" else unseen).append(label)
         sources = ", ".join(
             f"ruleset #{rule.ruleset_id} ({rule.ruleset_source_type or '?'} {rule.ruleset_source})"
             for rule in rules
@@ -529,10 +540,21 @@ class Doctor:
             if unseen
             else []
         )
+        if unverified:
+            hidden.append(
+                f"bypass actors of {', '.join(unverified)} are not visible to this token, and "
+                "GitHub did not say whether this token may bypass the rule, so whether the "
+                "controller's own login can skip the required checks is unverified"
+            )
         if problems:
             # A visible problem is conclusive whatever else stayed hidden;
             # the hidden part is still named so the remedy is known to be partial.
             return CheckResult(name, False, "; ".join([summary, *problems, *hidden]))
+        if unverified:
+            return self._required_checks_unverifiable(
+                "; ".join([summary, *hidden]),
+                "run doctor with a login that has write access to the ruleset",
+            )
         if hidden:
             return CheckResult.skip(name, f"{summary}; {hidden[0]}")
         return CheckResult(name, True, summary)
@@ -554,7 +576,8 @@ class Doctor:
         except GitHubPlanLimitedError as exc:
             return self._required_checks_unverifiable(
                 f"no active ruleset requires a status check on '{branch}', and "
-                + _plan_limited_text(repo, exc)
+                + _plan_limited_text(repo, exc),
+                _PLAN_REMEDY,
             )
         except GitHubError as exc:
             if not is_access_denied_gh_failure(str(exc)):
@@ -564,6 +587,7 @@ class Doctor:
             return self._required_checks_unverifiable(
                 f"no active ruleset requires a status check on '{branch}', and this token "
                 f"cannot read its classic branch protection (Administration: read): {exc}",
+                _READ_RULES_REMEDY,
             )
         if classic is not None and classic.required_status_checks:
             contexts = sorted(classic.required_contexts)
@@ -708,7 +732,7 @@ class Doctor:
             why = "a transient GitHub failure; run doctor again"
         elif isinstance(exc, GitHubNotFoundError):
             why = "the repository or pull request was not found by this login"
-        elif is_plan_limited_gh_failure(str(exc)):
+        elif isinstance(exc, GitHubPlanLimitedError):
             why = "a GitHub plan limitation, not this login's permissions"
         elif type(exc) is GitHubError and is_access_denied_gh_failure(str(exc)):
             why = "this login may not make that read (see the 'gh authenticated' row)"
@@ -1437,6 +1461,12 @@ class Doctor:
         return results
 
 
+# The way out of an unverifiable required-check row, by cause (#289). A plan
+# limitation is never sent to the token's permissions.
+_PLAN_REMEDY = "make the repository public or move it to a plan that offers rules"
+_READ_RULES_REMEDY = "run doctor with a login that may read the branch rules"
+
+
 def _plan_limited_text(repo: str, exc: GitHubError) -> str:
     """What doctor says about GitHub's plan-entitlement 403 (#289): the plan, never the token."""
     return (
@@ -1451,17 +1481,12 @@ def _plan_limited_text(repo: str, exc: GitHubError) -> str:
 def _pr_read_refused(exc: GitHubError) -> bool:
     """Whether GitHub refused this login the pull request itself (#291).
 
-    Classified by the client's types first: only a plain conclusive
+    Classified by the client's types: only a plain conclusive
     :class:`GitHubError` can be such a refusal. Every typed answer says
     something else (transient, not found, a refused checks read, another
-    PR), and a plan limitation is about the plan, not the login.
+    PR, a plan limitation, which is about the plan, not the login).
     """
-    text = str(exc)
-    return (
-        type(exc) is GitHubError
-        and not is_plan_limited_gh_failure(text)
-        and is_access_denied_gh_failure(text)
-    )
+    return type(exc) is GitHubError and is_access_denied_gh_failure(str(exc))
 
 
 def _missing_contexts(contexts: list[str], expected: list[str]) -> list[str]:

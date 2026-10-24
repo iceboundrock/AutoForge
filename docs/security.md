@@ -276,7 +276,7 @@ last column says what still applies.
 | [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | Other credential shapes are not recognised: AWS access keys, private-key blocks, `gsk_`, `xai-`, `npm_`, `glpat-`, `hf_`, and a key of no known shape under a prefixed name such as `GEMINI_API_KEY` | As for #282 |
 | [#286](https://github.com/iceboundrock/AutoForge/issues/286) | Medium | One allow-list serves every launch, and it refuses only the names `gh` and git read a credential from ([why](#other-limits)) | List no variable you would not give to the agents and to the code under review alike |
 | [#287](https://github.com/iceboundrock/AutoForge/issues/287) | Medium | In a sequential EPIC run, `UPDATE_EPIC` may pick any open issue of the repository next, on a public repository possibly one a stranger opened | Prefer `autoforge epic run`, which admits only the EPIC's sub-issues |
-| [#289](https://github.com/iceboundrock/AutoForge/issues/289) | Medium | *Fixed on `main`.* The merge gate refuses an empty check rollup under every configuration, `safety.verify_check_definition: false` and an empty `safety.required_checks` included; `doctor` names a GitHub Free plan restriction as the plan, never as a token permission, and its required-check row fails while `safety.allow_merge: true` and the requirement cannot be verified | A branch rule is still what makes a check *required*: with the gate open, keep both settings at their defaults and a CI check required ([why](#check-runs-on-a-private-repository)) |
+| [#289](https://github.com/iceboundrock/AutoForge/issues/289) | Medium | *Fixed on `main`.* The merge gate refuses an empty check rollup, and one in which no check succeeded, under every configuration, `safety.verify_check_definition: false` and an empty `safety.required_checks` included; `doctor` names a GitHub Free plan restriction as the plan, never as a token permission, and its required-check row fails while `safety.allow_merge: true` and the requirement cannot be verified (the plan, a token without access, not found, a transient failure, or a hidden bypass list with no word on this token) | A branch rule is still what makes a check *required*: with the gate open, keep both settings at their defaults and a CI check required ([why](#check-runs-on-a-private-repository)) |
 | [#291](https://github.com/iceboundrock/AutoForge/issues/291) | Medium | *Fixed on `main`.* With a fine-grained token on a private repository whose pull requests have checks, REVIEW and FIX now run without the check results (the reviewer is told they are unknown), the merge gate blocks with a reason naming the credential and its remedy, and `doctor`'s "pull request check runs readable" row reports it | With the merge gate open, use `gh auth login` or a classic token with `repo` there ([why](#check-runs-on-a-private-repository)) |
 
 Also disclosed: pushed code runs in your CI before any review
@@ -395,13 +395,15 @@ was not tried):
   check at all, for example because no CI ran, is `BLOCKED` under every
   configuration, `safety.verify_check_definition: false` and an empty
   `safety.required_checks` included
-  ([#289](https://github.com/iceboundrock/AutoForge/issues/289)). A refused
-  read is never taken for an empty one.
+  ([#289](https://github.com/iceboundrock/AutoForge/issues/289)). So is a
+  rollup in which nothing succeeded (only `NEUTRAL` or `SKIPPED` entries):
+  a merge never passes only because no check failed. A refused read is
+  never taken for an empty one.
 - **The defaults still matter.** With `safety.verify_check_definition:
   false` or an empty `safety.required_checks`, the controller requires
-  only that the rollup has a check and that every check in it succeeded:
-  one green check that is not the CI you meant is enough. Only a branch
-  rule makes a particular check required.
+  only that the rollup has a successful check and that none failed: one
+  green check that is not the CI you meant is enough. Only a branch rule
+  makes a particular check required.
 
 ### Private and public repositories
 

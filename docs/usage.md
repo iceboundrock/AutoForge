@@ -170,10 +170,11 @@ check runs, #291), the run is `BLOCKED` at once with a reason naming the
 credential and the remedy (`gh auth login`, or a classic token with the
 `repo` scope), never merged and never re-checked; change the credential,
 then `unblock`. `autoforge doctor`'s "pull request check runs readable" row
-finds this before a run. A PR whose status rollup holds no check at all is
-`BLOCKED` too, whatever `safety.required_checks` and
-`safety.verify_check_definition` say (#289): make CI report on the PR's
-head, then `unblock`, or merge it yourself. Every gate pass also requires the round's review
+finds this before a run. A PR whose status rollup holds no check at all,
+or no successful one (only `NEUTRAL` or `SKIPPED` entries), is `BLOCKED`
+too, whatever `safety.required_checks` and `safety.verify_check_definition`
+say (#289): make CI report a success on the PR's head, then `unblock`, or
+merge it yourself. Every gate pass also requires the round's review
 certificate to apply to the live PR and to the configuration in force,
 before the review comment is re-read or any local command runs; a refusal
 is `BLOCKED`, never retried (see

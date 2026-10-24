@@ -8,21 +8,24 @@ so.
 ### An empty check rollup never merges; GitHub Free is a plan limit (#289)
 
 - The merge gate refuses a pull request whose status rollup holds no check
-  at all, under every configuration. Before, `safety.verify_check_definition:
+  at all, or in which no check succeeded (only `NEUTRAL` or `SKIPPED`
+  entries), under every configuration. Before, `safety.verify_check_definition:
   false` or `safety.required_checks: []` let such a PR through unless a
-  branch rule required a check. A pull request whose checks all succeeded
-  merges as before, and a refused checks read (#291) is never taken for an
-  empty rollup.
+  branch rule required a check. A pull request with a successful check and
+  none failing merges as before, and a refused checks read (#291) is never
+  taken for an empty rollup.
 - GitHub's plan-entitlement answer ("Upgrade to GitHub Pro or make this
   repository public to enable this feature.", GitHub Free's private
   repositories) is a typed error, never an access denial. `doctor`'s
   required-check row names it as the plan and never sends you to the
   token's permissions.
 - That row is now a `FAIL` when `safety.allow_merge: true` and the branch
-  rules cannot be read (the plan, a token without access, not found), and a
-  `SKIP` that says why with the gate closed. A transient failure stays a
-  `SKIP`. **Behaviour change:** a configuration with the merge gate open
-  on a repository whose rules doctor cannot read now fails `doctor`.
+  rules cannot be verified (the plan, a token without access, not found, a
+  transient failure, or a ruleset whose bypass list GitHub withholds
+  without saying whether this token may bypass it), and a `SKIP` that says
+  why with the gate closed. **Behaviour change:** a configuration with the
+  merge gate open on a repository whose rules doctor cannot verify now
+  fails `doctor`.
 
 ### Check results a credential may not read (#291)
 

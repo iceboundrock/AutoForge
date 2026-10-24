@@ -855,7 +855,11 @@ def test_get_pr_parses_merge_state_and_auto_merge():
 def test_check_outcome_classification(state, conclusion, outcome):
     from autoforge.github import CheckInfo
 
-    assert CheckInfo(name="ci", state=state, conclusion=conclusion).outcome == outcome
+    check = CheckInfo(name="ci", state=state, conclusion=conclusion)
+    assert check.outcome == outcome
+    # Only an actual success succeeded: NEUTRAL and SKIPPED fail nothing but
+    # are not one (#289).
+    assert check.succeeded == ((state, conclusion) in {("COMPLETED", "SUCCESS"), ("SUCCESS", "")})
 
 
 def test_get_pr_checks_parses_check_runs_and_status_contexts():

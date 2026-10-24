@@ -6349,6 +6349,60 @@ def test_valid_checks_still_merge_without_the_definition_gate(tmp_state_dir, fak
     assert len(fake_github.merges) == 1
 
 
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize(
+    "safety",
+    [{}, {"verify_check_definition": False}, {"required_checks": []}],
+    ids=["defaults", "no-definition-check", "no-required-checks"],
+)
+@pytest.mark.parametrize(
+    "checks",
+    [
+        [ci_check(conclusion="SKIPPED")],
+        [ci_check(conclusion="NEUTRAL")],
+        [ci_check(conclusion="SKIPPED"), CheckInfo("docs", "COMPLETED", "NEUTRAL")],
+    ],
+    ids=["skipped", "neutral", "skipped-and-neutral"],
+)
+def test_a_rollup_in_which_nothing_succeeded_never_merges(
+    tmp_state_dir, fake_github, phase, safety, checks
+):
+    """#289 (review R3): an automatic merge never passes only because no check failed.
+
+    NEUTRAL and SKIPPED fail nothing, but a rollup of only those is not a
+    set of passed checks: BLOCKED under every configuration, conclusive,
+    nothing merged or counted.
+    """
+    fake_github.add_pr(head_sha=SHA_A, checks=checks)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    for key, value in safety.items():
+        setattr(eng.config.safety, key, value)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.attempt == 0
+    assert f"PR {PR} has no successful check in its status rollup" in s.block_reason
+    assert "a rollup in which nothing succeeded is not a set of passed checks" in s.block_reason
+    assert fake_github.merges == [] and s.counted_merged_prs == []
+
+
+@pytest.mark.parametrize(
+    "safety",
+    [{}, {"verify_check_definition": False}, {"required_checks": []}],
+    ids=["defaults", "no-definition-check", "no-required-checks"],
+)
+def test_one_success_beside_a_skipped_check_still_merges(tmp_state_dir, fake_github, safety):
+    """#289 (review R3) changes nothing for a rollup with a success and nothing failing."""
+    fake_github.add_pr(
+        head_sha=SHA_A, checks=[ci_check(), CheckInfo("docs", "COMPLETED", "SKIPPED")]
+    )
+    eng = _in_merge(tmp_state_dir, fake_github)
+    for key, value in safety.items():
+        setattr(eng.config.safety, key, value)
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    assert len(fake_github.merges) == 1
+
+
 def test_a_refused_checks_read_is_not_an_empty_one_at_the_gate(tmp_state_dir, fake_github):
     """#291: the identity read's ``checks=None`` is "not read", never "no checks"."""
     from autoforge.github import PRInfo

@@ -334,6 +334,21 @@ class CheckInfo:
             return "failure"
         return "unknown"
 
+    @property
+    def succeeded(self) -> bool:
+        """Whether this entry reports an actual success (#289).
+
+        A check run that completed with ``SUCCESS``, or a commit status in
+        state ``SUCCESS``. ``NEUTRAL`` and ``SKIPPED`` are an ``outcome`` of
+        ``success`` (they fail nothing) but not a success: the merge gate
+        needs at least one entry that is.
+        """
+        state = (self.state or "").upper()
+        conclusion = (self.conclusion or "").upper()
+        if state == "COMPLETED":
+            return conclusion == "SUCCESS"
+        return state == "SUCCESS" and not conclusion
+
 
 @dataclass(frozen=True)
 class ActionsRunRef:

@@ -34,7 +34,8 @@ def _status_rule(*contexts, ruleset_id=22792049):
 
 def _ruleset(enforcement="active", bypass_actors=(), can_bypass="never", ruleset_id=22792049):
     """``bypass_actors=None`` is the field GitHub withholds from a token without
-    write access to the ruleset (the read itself still succeeds)."""
+    write access to the ruleset (the read itself still succeeds);
+    ``can_bypass=None`` is an answer without ``current_user_can_bypass``."""
     data = {
         "id": ruleset_id,
         "name": "main",
@@ -48,6 +49,8 @@ def _ruleset(enforcement="active", bypass_actors=(), can_bypass="never", ruleset
     }
     if bypass_actors is None:
         del data["bypass_actors"]
+    if can_bypass is None:
+        del data["current_user_can_bypass"]
     return data
 
 
@@ -686,6 +689,41 @@ def test_required_check_hidden_bypass_actors_is_skipped_never_ok(tmp_path):
     assert "enforcement is 'evaluate', not 'active'" in check.detail
 
 
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_required_check_hidden_bypass_actors_when_github_says_this_token_never_bypasses(
+    tmp_path, gate_open
+):
+    """#289 (review R4): with ``current_user_can_bypass: never`` the controller's own login
+    cannot skip the rule, so the hidden list is a SKIP whatever the gate, never an OK."""
+    check = _required_checks(
+        tmp_path, gate_open=gate_open, github={RULESET_ENDPOINT: _ruleset(bypass_actors=None)}
+    )
+    assert check.skipped and not check.ok and not check.required, check
+    assert "'no bypass actors' is unverified" in check.detail
+
+
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_required_check_hidden_bypass_actors_without_a_word_on_this_token(tmp_path, gate_open):
+    """#289 (review R4): GitHub withholds the bypass list *and* does not say whether this
+    token may bypass the rule: the controller's own bypass is unverified. A FAIL with the
+    merge gate open, a SKIP that says why with it closed; never an OK."""
+    check = _required_checks(
+        tmp_path,
+        gate_open=gate_open,
+        github={RULESET_ENDPOINT: _ruleset(bypass_actors=None, can_bypass=None)},
+    )
+    assert not check.ok
+    assert check.detail.startswith("'main' requires: ci via ruleset #22792049")
+    assert "GitHub did not say whether this token may bypass the rule" in check.detail
+    assert "controller's own login can skip the required checks is unverified" in check.detail
+    if gate_open:
+        assert check.label == "FAIL" and check.required and not check.skipped
+        assert "run doctor with a login that has write access to the ruleset" in check.detail
+    else:
+        assert check.label == "SKIP" and check.skipped
+        assert "the merge gate is closed" in check.detail
+
+
 def test_required_check_token_that_can_bypass_fails_even_when_actors_are_hidden(tmp_path):
     """`current_user_can_bypass` is returned to every caller; a token that may bypass the
     rule is a bypass actor whether or not GitHub shows the list."""
@@ -751,8 +789,14 @@ def test_required_check_plan_limit_names_the_plan_never_the_token(tmp_path, gith
     # Never the token's permissions.
     assert "this token cannot read" not in check.detail
     assert "Administration" not in check.detail
+    assert "readable" not in check.detail and "a login that may read" not in check.detail
     if gate_open:
         assert check.label == "FAIL" and check.required and not check.skipped
+        # The way out is the plan's (#289 review R5).
+        assert (
+            "make the repository public or move it to a plan that offers rules, or close the gate"
+            in check.detail
+        )
     else:
         assert check.label == "SKIP" and check.skipped
         assert "the merge gate is closed" in check.detail
@@ -768,19 +812,31 @@ def test_required_check_plan_limited_ruleset_listing_is_a_hint_only(tmp_path):
     assert "Upgrade to GitHub" not in check.detail
 
 
-def test_required_check_transient_failure_is_skipped_even_with_the_gate_open(tmp_path):
-    """A transient failure says nothing about the branch; running doctor again answers it."""
-    check = _required_checks(
-        tmp_path, gate_open=True, github={RULES_ENDPOINT: (1, "error connecting to api.github.com")}
-    )
-    assert check.skipped and "transient" in check.detail
+@pytest.mark.parametrize(
+    "github",
+    [
+        {RULES_ENDPOINT: (1, "error connecting to api.github.com")},
+        {RULES_ENDPOINT: [_status_rule("ci")], RULESET_ENDPOINT: (1, "HTTP 502: Bad Gateway")},
+        {RULES_ENDPOINT: [], PROTECTION_ENDPOINT: (1, "error connecting to api.github.com")},
+    ],
+    ids=["rules", "ruleset", "classic-protection"],
+)
+def test_required_check_transient_failure_fails_with_the_gate_open(tmp_path, github):
+    """#289 (review R1): with safety.allow_merge=true a requirement doctor could not
+    verify, for whatever reason, is a FAIL: a transient failure verified nothing."""
+    check = _required_checks(tmp_path, gate_open=True, github=github)
+    assert check.label == "FAIL" and check.required and not check.skipped, check
+    assert "GitHub could not be read (transient; run doctor again)" in check.detail
+    assert "safety.allow_merge=true" in check.detail and "run doctor again" in check.detail
 
 
 def test_required_check_transient_failure_is_skipped(tmp_path):
+    """With the merge gate closed, a transient failure is a SKIP that says why."""
     check = _required_checks(
         tmp_path, github={RULES_ENDPOINT: (1, "error connecting to api.github.com")}
     )
     assert check.skipped and "transient" in check.detail
+    assert "the merge gate is closed" in check.detail
 
 
 def test_required_check_other_conclusive_failure_is_reported(tmp_path):
