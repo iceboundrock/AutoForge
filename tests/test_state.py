@@ -2039,7 +2039,7 @@ def _effect_fields(source):
     return {key: getattr(source, key) for key in _EFFECT_KEYS}
 
 
-# -- round trips under protocol 11 -----------------------------------------------------
+# -- round trips under the current protocol --------------------------------------------
 
 
 def test_the_controller_speaks_protocol_12():
@@ -2061,11 +2061,14 @@ def test_the_controller_speaks_protocol_12():
         (Stage.CONFLICT, Phase.BLOCKED),
     ],
 )
-def test_effect_state_round_trips_in_every_record_stage_under_protocol_11(tmp_path, stage, phase):
+def test_effect_state_round_trips_in_every_record_stage_under_the_current_protocol(
+    tmp_path, stage, phase
+):
     """D2.1-D2.3, D4.4, D4.6, D13.3: a record in each stage, the entry observation,
     the completion context and the launch label survive save and load unchanged,
-    in a file labelled protocol 11. A conflict is persisted with the run BLOCKED
-    in the phase it stopped, which keeps the pieces bound to that phase."""
+    in a file labelled with the current protocol. A conflict is persisted with
+    the run BLOCKED in the phase it stopped, which keeps the pieces bound to that
+    phase."""
     p = tmp_path / "state.json"
     s = _update_epic_state(stage, phase=phase)
     save_state(s, p)
@@ -3248,10 +3251,10 @@ def _legacy(protocol, **kw):
 
 
 @pytest.mark.parametrize("protocol", ["1", "2", "3", "4", "5"])
-def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_11_on_save(tmp_path, protocol):
+def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_on_save(tmp_path, protocol):
     """D13.2: protocol 5 (the label before effects) and the older legacy labels
     load with no records, no observation and no context, and the next save writes
-    protocol 11 with the four fields at their empty values."""
+    the current protocol with the four fields at their empty values."""
     p = _write(
         tmp_path / "state.json",
         _legacy(protocol, phase=Phase.REVIEW, current_pr_url=PR42, review_round=1),
@@ -3708,7 +3711,7 @@ def test_acceptance_state_round_trips_under_protocol_8(tmp_path):
     assert loaded == _after_fix(updated_at=loaded.updated_at)
 
 
-def test_a_protocol_7_file_loads_migrated_and_is_relabelled_11_on_save(tmp_path):
+def test_a_protocol_7_file_loads_migrated_and_is_relabelled_on_save(tmp_path):
     """Protocol 7 loads: its FIX plan's resolutions name no acceptance
     comment and no operator comment, its recorded resolutions verified none,
     and it has no outcomes. The next save writes the current protocol with
@@ -3916,7 +3919,7 @@ def _recorded_config(**over) -> dict:
     return record
 
 
-def test_a_recorded_configuration_round_trips_under_protocol_11(tmp_path):
+def test_a_recorded_configuration_round_trips_under_the_current_protocol(tmp_path):
     p = tmp_path / "state.json"
     s = make_state(phase=Phase.REVIEW, config_fingerprint=_recorded_config())
     save_state(s, p)
@@ -3925,7 +3928,7 @@ def test_a_recorded_configuration_round_trips_under_protocol_11(tmp_path):
     assert load_state(p) == s
 
 
-def test_a_protocol_8_file_loads_with_no_recorded_configuration_and_is_relabelled_11(tmp_path):
+def test_a_protocol_8_file_loads_with_no_recorded_configuration_and_is_relabelled(tmp_path):
     """No recorded configuration means "not checked": the file loads in any
     phase, its own acceptance state untouched (it is protocol 8's, not
     migrated), and the next save writes the current protocol with ``{}``."""
@@ -4075,7 +4078,7 @@ def _validation_marker() -> dict:
     }
 
 
-def test_validation_evidence_round_trips_under_protocol_11(tmp_path):
+def test_validation_evidence_round_trips_under_the_current_protocol(tmp_path):
     p = tmp_path / "state.json"
     s = make_state(
         phase=Phase.REVIEW,
@@ -4327,10 +4330,10 @@ def _as_protocol(d: dict, protocol: str) -> dict:
     return d
 
 
-def test_every_operator_outcome_round_trips_under_protocol_11(tmp_path):
+def test_every_operator_outcome_round_trips_under_the_current_protocol(tmp_path):
     """A verified action (``exact`` or ``bound`` evidence), a declined, a
     withdrawn and a stale one, and the evidence a resolution names, survive
-    save and load unchanged in a file labelled protocol 11."""
+    save and load unchanged in a file labelled with the current protocol."""
     outcomes = [
         _verified_outcome(),
         _verified_outcome(
@@ -4360,7 +4363,7 @@ def test_every_operator_outcome_round_trips_under_protocol_11(tmp_path):
 def test_a_protocol_10_file_loads_in_every_phase_with_no_operator_state(tmp_path, phase):
     """A protocol-10 file is this protocol's shape without the operator-action
     state: it loads in every phase with no outcome, and the next save writes
-    protocol 11 with ``[]``."""
+    the current protocol with ``[]``."""
     d = _as_protocol(make_state(phase=phase, current_pr_url=PR42).to_dict(), "10")
     assert "operator_comment_outcomes" not in d
     p = _write(tmp_path / "state.json", d)
@@ -4373,7 +4376,7 @@ def test_a_protocol_10_file_loads_in_every_phase_with_no_operator_state(tmp_path
     assert load_state(p) == loaded
 
 
-def test_a_protocol_10_fix_plan_loads_migrated_and_is_relabelled_11_on_save(tmp_path):
+def test_a_protocol_10_fix_plan_loads_migrated_and_is_relabelled_on_save(tmp_path):
     """A protocol-10 FIX entry observed no operator targets, its plan's
     resolutions name no operator comment and its recorded resolutions
     verified none: it loads with ``operator_sources: null`` and
@@ -4395,7 +4398,7 @@ def test_a_protocol_10_fix_plan_loads_migrated_and_is_relabelled_11_on_save(tmp_
     assert load_state(p) == loaded
 
 
-def test_a_protocol_10_local_file_loads_and_is_relabelled_11(tmp_path):
+def test_a_protocol_10_local_file_loads_and_is_relabelled(tmp_path):
     """LOCAL has no operator actions: a protocol-10 LOCAL file loads with no
     outcome, its resolutions gain no evidence, and the next save loads."""
     resolutions = [{"finding_id": "R1-F1", "resolution": "fixed"}]
@@ -4856,7 +4859,7 @@ PIN = {
 
 
 @pytest.mark.parametrize("local", [False, True], ids=["remote", "local"])
-def test_a_sandbox_pin_round_trips_under_protocol_12(tmp_path, local):
+def test_a_sandbox_pin_round_trips_under_the_current_protocol(tmp_path, local):
     """Both modes pin: the field is beside LOCAL's contract and REMOTE's recorded configuration."""
     state = _local_state(sandbox_pin=dict(PIN)) if local else make_state(sandbox_pin=dict(PIN))
     p = tmp_path / "state.json"
@@ -4867,10 +4870,10 @@ def test_a_sandbox_pin_round_trips_under_protocol_12(tmp_path, local):
 
 
 @pytest.mark.parametrize("local", [False, True], ids=["remote", "local"])
-def test_a_protocol_11_file_loads_unpinned_and_is_relabelled_12(tmp_path, local):
+def test_a_protocol_11_file_loads_unpinned_and_is_relabelled(tmp_path, local):
     """A protocol-11 file is this protocol's shape without the pin: it loads
     with ``{}`` (not checked; the next step, resume or unblock pins it), and
-    the next save writes protocol 12."""
+    the next save writes the current protocol."""
     d = (_local_state() if local else make_state(phase=Phase.REVIEW)).to_dict()
     d["protocol_version"] = "11"
     _drop_pin(d)
