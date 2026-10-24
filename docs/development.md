@@ -183,7 +183,11 @@ credential:
    checkout, so a stale `*.egg-info` or an ignored file of the working tree
    cannot reach an artifact;
 2. builds the sdist from that copy and the wheel from the sdist
-   (`uv build`), which is how an installer builds the sdist too;
+   (`uv build`), which is how an installer builds the sdist too, with the
+   build backend [`build-constraints.txt`](../build-constraints.txt) pins:
+   that setuptools, installed only if its SHA-256 is one the file lists
+   (`--build-constraints`, `--require-hashes`), and the wheel must name it
+   as its `Generator`;
 3. checks both: the exact set of files each ships (every module and every
    prompt template, `LICENSE`, and nothing else; `MANIFEST.in` keeps the
    tests out of the sdist), `LICENSE` byte for byte, and the core metadata
@@ -240,6 +244,14 @@ workflow's matrix, or the mirrored commands drift apart, or when the
 `sandbox` job stops running exactly `make test-sandbox-measured` over every
 real-backend module, or the `dist` job stops running `make dist-check` on
 every CI interpreter.
+
+The repository's other workflow, `pypi-publish`
+(`.github/workflows/pypi-publish.yml`), is not CI: it never runs on a pull
+request or a branch, only for a version tag `v*`, and publishes that
+release to PyPI after the maintainer approved it
+([Releasing: publishing to PyPI](releasing.md#publishing-to-pypi)).
+`tests/test_publish_workflow.py` pins its triggers, permissions, pins and
+steps.
 
 The workflow uses no repository or organization secrets, but its jobs are
 not credential-free: GitHub gives every run an automatic `GITHUB_TOKEN`, and

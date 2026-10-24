@@ -282,7 +282,9 @@ last column says what still applies.
 Also disclosed: pushed code runs in your CI before any review
 ([above](#pushed-code-runs-in-your-ci)); AutoForge's own CI pins its GitHub
 Actions by tag, not by commit SHA
-([#288](https://github.com/iceboundrock/AutoForge/issues/288)); and the
+([#288](https://github.com/iceboundrock/AutoForge/issues/288)), while its
+publishing workflow pins every action by commit SHA
+([Releasing](releasing.md#publishing-to-pypi)); and the
 `autoforge` distribution on PyPI is an unrelated project: AutoForge's is
 `autoforge-cli`
 ([#256](https://github.com/iceboundrock/AutoForge/issues/256)), not yet
