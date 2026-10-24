@@ -20,12 +20,20 @@ make check        # lock-check + the four CI commands, on the local interpreter
 make check-matrix # pytest on every CI Python (3.11, 3.12), opt-in
 make test-sandbox # the real-backend sandbox tests; fail (not skip) without a backend
 make test-sandbox-measured # what CI's `sandbox` job runs: measure, then require where capable
+make dist-check   # what CI's `dist` job runs: build, check, install and run the artifacts
 ```
 
 Run `make check` before declaring a change complete, and `make check-matrix`
 when a change could be interpreter-sensitive. Run `make test-sandbox` too
 when a change touches the outer sandbox (`sandbox*.py`, the executor, a
-provider's declaration, the engine's launch routing).
+provider's declaration, the engine's launch routing), and `make dist-check`
+when a change touches packaging, a resource the package reads at runtime
+(a prompt template), or the command line's entry point
+([The built distributions](#the-built-distributions)).
+
+The distribution is named `autoforge-cli`; the import package and the
+command are `autoforge`. A `.venv` made before the rename still lists the
+old name: `make sync` replaces it.
 
 ## The live Pi smoke test
 
@@ -162,6 +170,52 @@ development host. The rest of the suite stands in for the probe (`tests/conftest
 `sandbox_probe` fixture answers "supported" without a launch), so every
 mode and the pre-launch gate are tested on any host.
 
+## The built distributions
+
+`make check` tests the source tree, through an editable install; it never
+looks at what a user installs. `make dist-check` (`tests/dist_check.py`,
+standard library only) tests the artifacts themselves, offline apart from
+fetching the build backend, with no agent, no GitHub access and no
+credential:
+
+1. copies the files git tracks or would track (`git ls-files --cached
+   --others --exclude-standard`) to a scratch directory outside the
+   checkout, so a stale `*.egg-info` or an ignored file of the working tree
+   cannot reach an artifact;
+2. builds the sdist from that copy and the wheel from the sdist
+   (`uv build`), which is how an installer builds the sdist too;
+3. checks both: the exact set of files each ships (every module and every
+   prompt template, `LICENSE`, and nothing else; `MANIFEST.in` keeps the
+   tests out of the sdist), `LICENSE` byte for byte, and the core metadata
+   (Metadata-Version 2.4 or later, `Name: autoforge-cli`, the version,
+   `License-Expression: MIT`, `License-File: LICENSE`, `Requires-Python`, the
+   classifiers, no dependency outside an extra, and the `autoforge` console
+   script);
+4. installs the wheel, not editable and from no index, into a fresh virtual
+   environment outside the checkout, and runs `autoforge --version` and
+   `autoforge --help` there;
+5. from that environment's interpreter, imports `autoforge` from the
+   installed package (never the checkout), checks that the prompt templates
+   on disk are exactly the registered ones, and renders every one of them
+   the way the engine does, each phase template with its common template;
+6. runs a LOCAL dry run (`autoforge local init`, then
+   `autoforge local run ... --dry-run --full-prompt`) in a scratch
+   repository and checks it rendered the prompt, wrote no state and changed
+   nothing but the feature file;
+7. prints the SHA-256 of both files (and, with `--sha256sums FILE`, writes
+   them in `sha256sum` format).
+
+It runs on one interpreter, `DIST_PYTHON` (default 3.12):
+`make dist-check DIST_PYTHON=3.11` checks the other one CI runs. It removes
+its scratch directory when it passes and keeps it, naming it, when it fails.
+`--out-dir DIR` keeps the two files, which is how a release builds them once
+([Releasing](releasing.md)). `tests/test_packaging.py`, part of `make check`,
+is the cheap half: it fails when a non-Python file under
+`src/autoforge/` is neither declared as package data nor deliberately left
+out, when code reads a package resource from a module it does not know,
+when the two version strings differ, or when the classifiers drift from
+the Python versions CI runs.
+
 ## Continuous integration
 
 The same checks run hosted on every pull request and every push to
@@ -169,7 +223,10 @@ The same checks run hosted on every pull request and every push to
 (`uv sync --locked`): `pytest` on Python 3.11 and 3.12, and `ruff check` /
 `ruff format --check` / `mypy` once. A third job, `sandbox`, runs the outer
 sandbox's real backend on the runner (`make test-sandbox-measured`,
-[The outer sandbox](#the-outer-sandbox)). `make check` runs the same commands
+[The outer sandbox](#the-outer-sandbox)). A fourth, `dist`, builds the sdist
+and the wheel and installs and runs the wheel, on 3.11 and 3.12
+(`make dist-check`, [The built distributions](#the-built-distributions)).
+`make check` runs the same commands
 plus the lockfile check, but only on the interpreter the local environment
 resolves (`.python-version`); `make check-matrix` runs `pytest` on each CI
 interpreter in its own isolated environment (`uv run --isolated --locked
@@ -177,14 +234,16 @@ interpreter in its own isolated environment (`uv run --isolated --locked
 `CI_PYTHON_VERSIONS`; `tests/test_ci_workflow.py` fails when that list, the
 workflow's matrix, or the mirrored commands drift apart, or when the
 `sandbox` job stops running exactly `make test-sandbox-measured` over every
-real-backend module.
+real-backend module, or the `dist` job stops running `make dist-check` on
+every CI interpreter.
 
 The workflow uses no repository or organization secrets, but its jobs are
 not credential-free: GitHub gives every run an automatic `GITHUB_TOKEN`, and
 the workflow's `permissions: contents: read` limits it to reading the
 repository. `actions/checkout` and `setup-uv` use that token by default
 (checkout also leaves it in the checkout's git config for the rest of the
-job); the tests themselves need no credential. The aggregate `ci` job is
+job, except in `dist`, which checks out with `persist-credentials: false`);
+the tests themselves need no credential. The aggregate `ci` job is
 a single stable check name that survives adding or renaming a matrix entry,
 and it is required on `main` by a repository ruleset. That is what gives the
 controller's pre-merge gate ("every check on the PR succeeded") something

@@ -189,7 +189,13 @@ Each line is a summary; the linked document is the precise statement.
 
 ## Prerequisites
 
-- Python 3.11+ (managed via `uv`)
+[Compatibility](docs/compatibility.md) has the full matrix and the evidence
+for each entry.
+
+- Linux on x86_64. macOS, Linux ARM64 and WSL2 are untested; Windows is
+  unsupported (AutoForge's lock needs POSIX `fcntl`)
+- CPython 3.11 or 3.12, the versions CI tests; 3.13 and later are untested.
+  `uv` fetches one when the host has none (`--python 3.12` below)
 - `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/))
 - `git`, and `gh` (GitHub CLI **2.48.0 or newer**, authenticated): the
   client lists branch rules and a PR's changed files with
@@ -218,15 +224,62 @@ or
 authentication, no `origin` remote).
 
 CLI flag syntax in `autoforge.example.yaml` was checked against the locally
-installed CLIs (Claude Code 2.1.263, OpenCode 2.0.23, gh 2.100.0).
+installed CLIs (Claude Code 2.1.263, OpenCode 2.0.23, gh 2.100.0); the
+versions verified since are in [Compatibility](docs/compatibility.md#agent-clis).
 
 ## Installation
 
+The distribution is **`autoforge-cli`**; the command it installs is
+`autoforge`. `autoforge` on PyPI is an unrelated project: never
+`pip install autoforge`.
+
+**From a git commit** (works now). Install the command into its own
+environment with `uv tool`, from a commit at or after the one that
+introduced `autoforge-cli` (#256; an earlier commit installs a package
+without its prompt templates). Pin a full commit SHA, or a release tag
+once one exists:
+
 ```bash
-uv sync                  # create .venv, install autoforge (editable) + dev tools
+uv tool install --python 3.12 'git+https://github.com/iceboundrock/AutoForge@<commit>'
+autoforge --version
+```
+
+`uv tool install --reinstall` with another commit replaces it, and
+`uv tool uninstall autoforge-cli` removes it. Add the YAML extra with
+`'autoforge-cli[yaml] @ git+https://github.com/iceboundrock/AutoForge@<commit>'`.
+
+**From a built wheel** (works now). From a checkout of the commit you want:
+
+```bash
+uv build                 # dist/autoforge_cli-<version>.tar.gz and -py3-none-any.whl
+uv tool install --python 3.12 dist/autoforge_cli-<version>-py3-none-any.whl
+```
+
+**From PyPI** (not yet available). Once the first prerelease of
+`autoforge-cli` is published (#295), and only after checking that its PyPI
+project page links back to this repository:
+
+```bash
+uv tool install --python 3.12 --prerelease allow autoforge-cli
+```
+
+Until then, `autoforge-cli` does not exist on PyPI. [Releasing](docs/releasing.md)
+describes how a version is built and published.
+
+Whichever way it was installed, run `autoforge` from a checkout of the
+repository whose issues it drives (or, in LOCAL mode, whose feature file it
+implements); `autoforge doctor` checks the rest.
+
+**For development** on AutoForge itself, from a clone of this repository:
+
+```bash
+uv sync                  # create .venv, install autoforge-cli (editable) + dev tools
 uv sync --extra yaml     # optional: full YAML config support (PyYAML)
 uv run autoforge --help
 ```
+
+`uv run autoforge` is the same command, run from that clone's `.venv`.
+[Development](docs/development.md) has the checks CI runs.
 
 To configure profiles, bounds or the merge gate, copy
 `autoforge.example.yaml` to `autoforge.yaml` and pass it with `--config`
@@ -240,25 +293,25 @@ repository (cross-repo runs are rejected).
 
 ```bash
 # 1. check the environment (writes nothing but a state-dir probe)
-uv run autoforge doctor
+autoforge doctor
 
 # 2. preview without touching anything (no subprocess, no gh call, no state file)
-uv run autoforge run --epic https://github.com/owner/repo/issues/1 \
-               --issue https://github.com/owner/repo/issues/2 --dry-run
+autoforge run --epic https://github.com/owner/repo/issues/1 \
+              --issue https://github.com/owner/repo/issues/2 --dry-run
 
 # 3. create a run and drive it until READY_FOR_MERGE / BLOCKED / FAILED
-uv run autoforge run --epic https://github.com/owner/repo/issues/1 \
-               --issue https://github.com/owner/repo/issues/2
+autoforge run --epic https://github.com/owner/repo/issues/1 \
+              --issue https://github.com/owner/repo/issues/2
 
 # 4. inspect it, and continue after an interruption
-uv run autoforge status
-uv run autoforge resume
+autoforge status
+autoforge resume
 ```
 
 With the merge gate closed (the default) the run stops at
 `READY_FOR_MERGE` with a banner naming the issue, PR, review round and
 reviewed HEAD, and a human merges the PR. Only with `safety.allow_merge:
-true` in config does `uv run autoforge resume --allow-merge` let the
+true` in config does `autoforge resume --allow-merge` let the
 controller verify the PR on GitHub and merge it itself.
 
 A run in `BLOCKED` stays there until you fix the cause and run
@@ -275,7 +328,7 @@ where a run stops, and how to recover are in
 [Running the remote workflow](docs/usage.md).
 
 To work through an EPIC's issues several at a time,
-`uv run autoforge epic run https://github.com/owner/repo/issues/1` runs up to
+`autoforge epic run https://github.com/owner/repo/issues/1` runs up to
 `scheduler.max_parallel` (1-4) of them at once, admitted in dependency order
 from GitHub's native sub-issues and "blocked by" links, each in its own
 worker, namespace and worktree. Every worker stops at its settlement
@@ -329,11 +382,11 @@ cannot, says at every launch that it runs with logical isolation only
 ([Local mode](docs/local-mode.md#what-the-controller-does-and-does-not-do)).
 
 ```bash
-uv run autoforge local doctor                    # config, git, agent CLIs; never gh
-uv run autoforge local init add-transaction-filter
+autoforge local doctor                    # config, git, agent CLIs; never gh
+autoforge local init add-transaction-filter
 # a human (with or without an AI) refines features/add-transaction-filter.md
-uv run autoforge local run features/add-transaction-filter.md --dry-run
-uv run autoforge local run features/add-transaction-filter.md
+autoforge local run features/add-transaction-filter.md --dry-run
+autoforge local run features/add-transaction-filter.md
 ```
 
 The specification is frozen for the whole run (its SHA-256 is re-checked
@@ -350,6 +403,7 @@ most common entry points:
 
 | I want to… | Read |
 |---|---|
+| know which OS, Python, git, `gh`, agent CLI and sandbox host it runs on | [Compatibility](docs/compatibility.md) |
 | run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/usage.md#troubleshooting-and-recovery) |
 | work without GitHub | [Local mode](docs/local-mode.md) |
 | run phases through Pi on a DeepSeek API key or a ChatGPT subscription | [Pi operator guide](docs/pi.md) |
@@ -360,6 +414,7 @@ most common entry points:
 | know how state, locking and crash recovery work | [State and recovery](docs/agent-guides/state-and-recovery.md) |
 | see how the code is divided | [Architecture](docs/agent-guides/architecture.md), [module map](src/autoforge/AGENTS.md) |
 | contribute, run the checks, write tests | [Development](docs/development.md), [Testing](docs/agent-guides/testing.md) |
+| cut or publish a release | [Releasing](docs/releasing.md) |
 | read the design records | [ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md), [ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md), [ADR 0003](docs/adr/0003-pi-agent-provider.md) |
 
 Coding agents working on this repository start at [AGENTS.md](AGENTS.md).

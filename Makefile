@@ -1,4 +1,4 @@
-.PHONY: test test-sandbox test-sandbox-measured lint typecheck fmt fmt-check lock-check check check-matrix sync lock
+.PHONY: test test-sandbox test-sandbox-measured lint typecheck fmt fmt-check lock-check check check-matrix dist-check sync lock
 
 # The interpreters the hosted CI matrix runs `pytest` on (`python-version:`
 # in .github/workflows/ci.yml). tests/test_ci_workflow.py fails when the two
@@ -43,6 +43,18 @@ test-sandbox:
 test-sandbox-measured:
 	uv run python -m tests.sandbox_host
 	AUTOFORGE_REQUIRE_SANDBOX_BACKEND=auto uv run pytest -rs $(SANDBOX_TESTS)
+
+# Build the sdist and the wheel, install the wheel non-editably into a fresh
+# environment outside the source tree, and run the installed command and every
+# prompt template from it (tests/dist_check.py, #256). What the hosted CI's
+# `dist` job runs on each interpreter of CI_PYTHON_VERSIONS (DIST_PYTHON set
+# per matrix entry); locally it defaults to a tested interpreter, never to
+# .python-version's. `--no-project` runs the check on that bare interpreter,
+# so it never imports the source tree. Not part of `check`: it builds and
+# installs, and fetches the build backend from the package index.
+DIST_PYTHON ?= 3.12
+dist-check:
+	uv run --no-project --python $(DIST_PYTHON) python -I tests/dist_check.py
 
 lint:
 	uv run ruff check src tests

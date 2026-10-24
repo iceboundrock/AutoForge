@@ -12,17 +12,22 @@ recommend for a repository you care about.
 AutoForge is pre-release software (the Public Alpha line, version `0.x`).
 There are no release branches and no maintained older versions: security
 fixes land on `main`, and only the latest commit of `main` is supported. Update your checkout
-(`git pull`, then `uv sync --locked`) to receive a fix.
+(`git pull`, then `uv sync --locked`), or reinstall the command at that
+commit ([Installation](README.md#installation)), to receive a fix.
 
 | Version | Supported |
 |---|---|
 | `main` (Public Alpha, `0.x`) | yes, latest commit only |
 | anything older | no |
 
-AutoForge is installed from a checkout of this repository. It is not
-published on PyPI: the `autoforge` distribution there is an unrelated
-project, so `pip install autoforge` or `uv tool install autoforge` installs
-someone else's code.
+AutoForge is installed from this repository: from a commit, from a wheel
+built from one, or from a development clone
+([Installation](README.md#installation)). Its distribution is named
+`autoforge-cli`, which is not yet published on PyPI
+([#295](https://github.com/iceboundrock/AutoForge/issues/295)). The
+`autoforge` distribution on PyPI is an unrelated project, so
+`pip install autoforge` or `uv tool install autoforge` installs someone
+else's code.
 
 ## Reporting a vulnerability
 

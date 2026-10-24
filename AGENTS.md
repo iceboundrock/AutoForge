@@ -218,7 +218,12 @@ docs/pi-policy.md                      Pi: what an unattended run may load, tool
 docs/sdk-policy.md                     SDK providers: what a launch may load, tools, permissions,
                                        roots, credentials, environment, interaction-data bounds
 docs/configuration.md                  config files, formats, strict key validation, profiles
-docs/development.md                    make targets, CI, what a green `ci` does and does not prove
+docs/compatibility.md                  what AutoForge runs on (OS, Python, git, gh, agent CLIs, sandbox
+                                       host, filesystem, provider auth), each claim with its evidence
+docs/development.md                    make targets, CI, the built-distribution check, what a green
+                                       `ci` does and does not prove
+docs/releasing.md                      distribution name, version and tag scheme, changelog, the
+                                       maintainer's release procedure
 docs/security.md                       operator guide: security boundaries, what AutoForge does and
                                        does not protect, GitHub token permissions, recommended settings
 README.md                              operator-facing landing page: overview, key properties,
