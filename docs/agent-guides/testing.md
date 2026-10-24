@@ -930,6 +930,21 @@ a stated reason it has none. The coverage that must keep working:
   gate open, WARN closed) on a refusal, UNKNOWN without a candidate, on
   statuses only, a plan limit, a not-found or a transient failure, and
   prints no token
+- the empty rollup and the plan limit (#289, `tests/test_engine.py`,
+  `tests/test_github.py`, `tests/test_doctor.py`): in `READY_FOR_MERGE`
+  and `MERGE` a rollup read and empty is `BLOCKED` with defaults, with
+  `verify_check_definition: false` and with `required_checks: []`, before
+  any other readiness read, and so is a rollup of only `NEUTRAL` or
+  `SKIPPED` entries, while a rollup with a success and nothing failing
+  still merges under each; GitHub Free's plan 403 on the effective rules,
+  a ruleset, the rulesets listing and classic protection is
+  `GitHubPlanLimitedError`, asked once and never access denied, while a
+  genuine 403 and a 404 keep their classes; `doctor`'s required-check row
+  names the plan and never a token permission, and an unverifiable
+  requirement (plan, access denied, not found, a transient failure, a
+  hidden bypass list without `current_user_can_bypass`) is `FAIL` with
+  `safety.allow_merge: true` and `SKIP` with it closed, while a hidden
+  bypass list with `current_user_can_bypass: never` is `SKIP` either way
 - follow-up issue verification
 - typed effect writes are never retried on an ambiguous outcome, while reads
   keep their transient retry (`tests/test_github.py`)

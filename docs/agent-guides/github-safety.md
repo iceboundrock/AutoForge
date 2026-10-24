@@ -759,8 +759,17 @@ Verify:
 - the PR's check results were read, with the PR, in one checks read
   ("The PR identity read and the checks read" below); GitHub refusing this
   credential them is `BLOCKED`, never "no checks" and never passed
+- the status rollup holds at least one check (#289): a rollup read and
+  empty is `BLOCKED` under every configuration, `verify_check_definition:
+  false` and `required_checks: []` included, because "every check passed"
+  over no check is vacuous
 - every check in the status rollup passes (all checks, not only the
   required ones)
+- at least one of them actually succeeded (#289): a check run that
+  concluded `SUCCESS` or a commit status in state `SUCCESS`. `NEUTRAL` and
+  `SKIPPED` fail nothing, but a rollup of only those is `BLOCKED` under
+  every configuration too: an automatic merge never passes only because no
+  check failed
 - each required check's run has the same jobs and steps as the base branch's
   own run of that workflow (`safety.verify_check_definition`): a green check
   is produced by the PR's copy of the workflow, so its name alone proves only
@@ -1653,17 +1662,21 @@ the write), reading only controller state and GitHub, never an agent claim.
 - GitHub must then report: that PR open at the reviewed HEAD and base from
   the reviewed merge base (a base rewritten under its name goes back to
   `REVIEW`; ordinary commits landing on the base do not move it), not a
-  draft, no change to any `safety.protected_merge_paths` entry, every check
-  in the status rollup succeeded (all checks, not only required ones),
+  draft, no change to any `safety.protected_merge_paths` entry, a status
+  rollup that holds at least one check (an empty one is `BLOCKED` under
+  every configuration, #289), every check in it passed (all checks, not
+  only required ones) and at least one of them concluded `SUCCESS` (a
+  rollup of only `NEUTRAL` or `SKIPPED` entries is `BLOCKED` under every
+  configuration, #289),
   `mergeable = MERGEABLE`, `mergeStateStatus` in `CLEAN`/`HAS_HOOKS`, no
   auto-merge armed, and no merge queue on the base branch (`gh pr merge`
   would otherwise arm auto-merge or enqueue instead of merging, leaving an
   asynchronous merge the controller does not own). Every required check must
   also pass the definition comparison, and every
   `merge.verification_commands` command must pass (both below).
-- Conclusive negatives (closed PR, conflict, failing check, branch
-  protection, queue, a recorded review comment GitHub no longer backs, a
-  failing local command) -> `BLOCKED`.
+- Conclusive negatives (closed PR, conflict, an empty status rollup, a
+  rollup in which nothing succeeded, a failing check, branch protection, queue, a recorded review comment GitHub
+  no longer backs, a failing local command) -> `BLOCKED`.
 - Inconclusive data (checks still running, the base branch's own run still
   running, `mergeable = UNKNOWN`, an unfetchable reviewed commit, or the
   PR / changed-file / merge-queue read itself failing transiently: timeout,
@@ -1755,7 +1768,8 @@ inconclusive. This catches a PR that rewrites what the check *is* through an
 untouched workflow file (a reusable action, a `Makefile` target the workflow
 calls by a different job or step name) but it is structural: a step whose
 name stayed the same while its command changed passes. Setting the key to
-`false`, or leaving `required_checks` empty, skips the comparison.
+`false`, or leaving `required_checks` empty, skips the comparison; an empty
+status rollup, or one in which nothing succeeded, is still refused (#289).
 
 ### Controller-run verification commands
 
@@ -1839,9 +1853,10 @@ re-verified), bounded by the same `merge.max_verification_attempts`, then
 ### Doctor's branch-rule check
 
 `doctor` verifies that the default branch still requires the CI check. The
-pre-merge gate trusts "every check on the PR succeeded", which says nothing
-about whether any check *had* to exist: with the branch ruleset gone, a PR
-with no check runs at all is vacuously green. That ruleset lives in
+pre-merge gate trusts "every check on the PR passed" and refuses a
+rollup with no check at all or no success in it (#289), but which check
+*had* to exist is a branch rule: with the ruleset gone, a PR whose only
+check is some other green one passes the gate. That ruleset lives in
 repository settings, outside version control, so `autoforge doctor` reads
 the effective rules of the default branch
 (`gh api repos/{owner}/{repo}/rules/branches/{branch}`, every page) and
@@ -1850,16 +1865,41 @@ reports which contexts a `required_status_checks` rule names, whether each of
 enforcement is `active`, and whether it has bypass actors. Any of those
 missing is a `FAIL` with the settings URL and the rule to add. A repository
 still on classic branch protection is checked through that instead
-(`enforce_admins` standing in for "no bypass actors"). A read the token is
-not allowed to make (no credentials, a plan that hides rulesets, a non-admin
-token and no ruleset) or a transient GitHub failure is `SKIP`, never a false
-alarm; so is a *partial* read: GitHub returns a ruleset's `bypass_actors`
-only to a token with write access to it, and a rule this token can see but
-whose bypass list it cannot is `SKIP` rather than `OK` (a token that GitHub
-says may itself bypass the rule is a `FAIL` either way). `doctor --json`
-carries a skip as `"skipped": true`. The check is read-only and runs in
-`doctor` only: the `READY_FOR_MERGE` gate itself does not yet consult branch
-rules.
+(`enforce_admins` standing in for "no bypass actors"). Rules it cannot verify
+are not shown to require anything (#289), and how that is reported depends
+on the merge gate:
+
+- GitHub's plan offers no rulesets or branch protection on the repository
+  (GitHub Free's private repositories: `HTTP 403 "Upgrade to GitHub Pro or
+  make this repository public to enable this feature."`, to every caller,
+  the owner included). The client types that answer
+  (`GitHubPlanLimitedError`) and never classifies it as access denied, and
+  the row names the plan, says no token permission changes it, and names
+  the ways out (a public repository, or GitHub Pro, Team or Enterprise).
+  Each branch-rule read (effective rules, a ruleset, classic protection)
+  is classified this way; the rulesets listing is a hint only.
+- The token may not read the rules (no credentials, a non-admin token
+  reading classic protection, not found).
+- GitHub could not be read at all (a transient failure): nothing was
+  verified; running doctor again answers it.
+- GitHub returns a ruleset's `bypass_actors` only to a token with write
+  access to it, and this answer withholds them *and* omits
+  `current_user_can_bypass`: whether the controller's own login may skip
+  the rule is unverified.
+
+Each is a `FAIL` while the configuration's half of the merge gate is open
+(`safety.allow_merge: true`): an unattended merge would rest on a
+requirement nobody verified. The text names the way out for its cause
+(for the plan: a public repository or a plan that offers rules, never a
+token permission), or closing the gate. With the gate closed it is a `SKIP`
+that says why. A hidden bypass list is a `SKIP` either way when GitHub does
+say `current_user_can_bypass: never`: the required checks were read and the
+controller's login cannot bypass them, though "no bypass actors" is
+unverified (a token that GitHub says may itself bypass the rule is a `FAIL`
+either way). The row is never an unverified `OK`.
+`doctor --json` carries a skip as `"skipped": true`. The check is read-only
+and runs in `doctor` only: the `READY_FOR_MERGE` gate itself does not yet
+consult branch rules.
 
 ### Doctor's checks-read check
 

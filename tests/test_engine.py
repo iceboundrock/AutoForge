@@ -5512,7 +5512,7 @@ def test_definition_gate_ignores_job_order(tmp_state_dir, fake_github):
 @pytest.mark.parametrize(
     ("prepare", "expected"),
     [
-        (lambda gh: setattr(gh.prs[PR], "checks", []), "appears 0 times"),
+        (lambda gh: setattr(gh.prs[PR], "checks", [ci_check(name="lint")]), "appears 0 times"),
         (lambda gh: setattr(gh.prs[PR], "checks", [ci_check(), ci_check()]), "appears 2 times"),
         (
             lambda gh: setattr(gh.prs[PR], "checks", [CheckInfo("ci", "COMPLETED", "SUCCESS")]),
@@ -6299,6 +6299,108 @@ def test_the_recorded_refusal_through_the_real_client_blocks_the_gate(tmp_state_
     assert len(calls) == 2 and all(cmd[1:3] == ["pr", "view"] for cmd in calls)
     assert "statusCheckRollup" in calls[0][calls[0].index("--json") + 1]
     assert "statusCheckRollup" not in calls[1][calls[1].index("--json") + 1]
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize(
+    "safety",
+    [{}, {"verify_check_definition": False}, {"required_checks": []}],
+    ids=["defaults", "no-definition-check", "no-required-checks"],
+)
+def test_an_empty_rollup_never_merges_under_any_configuration(
+    tmp_state_dir, fake_github, phase, safety
+):
+    """#289: a rollup read and empty is not "every check succeeded".
+
+    Before #289, ``safety.verify_check_definition: false`` or an empty
+    ``safety.required_checks`` let a PR with no check at all through, unless
+    a branch rule required one. Now the gate refuses it under every
+    configuration: BLOCKED, conclusive, nothing merged or counted.
+    """
+    fake_github.add_pr(head_sha=SHA_A, checks=[])
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    for key, value in safety.items():
+        setattr(eng.config.safety, key, value)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.attempt == 0
+    assert f"PR {PR} has no check in its status rollup" in s.block_reason
+    assert "an empty rollup is not a set of passed checks" in s.block_reason
+    assert fake_github.merges == [] and s.counted_merged_prs == []
+    # Refused on the checks read alone: no changed-file, Actions or queue read.
+    names = {call[0] for call in fake_github.calls}
+    assert "get_pr_changed_files" not in names and "get_pr_merge_queue_status" not in names
+    assert _actions_calls(fake_github) == []
+
+
+@pytest.mark.parametrize(
+    "safety",
+    [{"verify_check_definition": False}, {"required_checks": []}],
+    ids=["no-definition-check", "no-required-checks"],
+)
+def test_valid_checks_still_merge_without_the_definition_gate(tmp_state_dir, fake_github, safety):
+    """#289 changes nothing for a rollup that has checks and all of them succeeded."""
+    fake_github.add_pr(head_sha=SHA_A, checks=[ci_check(), CheckInfo("legacy", "SUCCESS")])
+    eng = _in_merge(tmp_state_dir, fake_github)
+    for key, value in safety.items():
+        setattr(eng.config.safety, key, value)
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    assert len(fake_github.merges) == 1
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize(
+    "safety",
+    [{}, {"verify_check_definition": False}, {"required_checks": []}],
+    ids=["defaults", "no-definition-check", "no-required-checks"],
+)
+@pytest.mark.parametrize(
+    "checks",
+    [
+        [ci_check(conclusion="SKIPPED")],
+        [ci_check(conclusion="NEUTRAL")],
+        [ci_check(conclusion="SKIPPED"), CheckInfo("docs", "COMPLETED", "NEUTRAL")],
+    ],
+    ids=["skipped", "neutral", "skipped-and-neutral"],
+)
+def test_a_rollup_in_which_nothing_succeeded_never_merges(
+    tmp_state_dir, fake_github, phase, safety, checks
+):
+    """#289 (review R3): an automatic merge never passes only because no check failed.
+
+    NEUTRAL and SKIPPED fail nothing, but a rollup of only those is not a
+    set of passed checks: BLOCKED under every configuration, conclusive,
+    nothing merged or counted.
+    """
+    fake_github.add_pr(head_sha=SHA_A, checks=checks)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    for key, value in safety.items():
+        setattr(eng.config.safety, key, value)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.attempt == 0
+    assert f"PR {PR} has no successful check in its status rollup" in s.block_reason
+    assert "a rollup in which nothing succeeded is not a set of passed checks" in s.block_reason
+    assert fake_github.merges == [] and s.counted_merged_prs == []
+
+
+@pytest.mark.parametrize(
+    "safety",
+    [{}, {"verify_check_definition": False}, {"required_checks": []}],
+    ids=["defaults", "no-definition-check", "no-required-checks"],
+)
+def test_one_success_beside_a_skipped_check_still_merges(tmp_state_dir, fake_github, safety):
+    """#289 (review R3) changes nothing for a rollup with a success and nothing failing."""
+    fake_github.add_pr(
+        head_sha=SHA_A, checks=[ci_check(), CheckInfo("docs", "COMPLETED", "SKIPPED")]
+    )
+    eng = _in_merge(tmp_state_dir, fake_github)
+    for key, value in safety.items():
+        setattr(eng.config.safety, key, value)
+    assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
+    assert len(fake_github.merges) == 1
 
 
 def test_a_refused_checks_read_is_not_an_empty_one_at_the_gate(tmp_state_dir, fake_github):

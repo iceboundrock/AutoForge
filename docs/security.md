@@ -276,7 +276,7 @@ last column says what still applies.
 | [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | Other credential shapes are not recognised: AWS access keys, private-key blocks, `gsk_`, `xai-`, `npm_`, `glpat-`, `hf_`, and a key of no known shape under a prefixed name such as `GEMINI_API_KEY` | As for #282 |
 | [#286](https://github.com/iceboundrock/AutoForge/issues/286) | Medium | One allow-list serves every launch, and it refuses only the names `gh` and git read a credential from ([why](#other-limits)) | List no variable you would not give to the agents and to the code under review alike |
 | [#287](https://github.com/iceboundrock/AutoForge/issues/287) | Medium | In a sequential EPIC run, `UPDATE_EPIC` may pick any open issue of the repository next, on a public repository possibly one a stranger opened | Prefer `autoforge epic run`, which admits only the EPIC's sub-issues |
-| [#289](https://github.com/iceboundrock/AutoForge/issues/289) | Medium | With `safety.verify_check_definition: false` or an empty `safety.required_checks`, an empty check rollup passes the merge gate unless the branch requires a check; `doctor` reports a GitHub Free plan restriction as a token that cannot read the branch rules | Keep both settings at their defaults, or keep the merge gate closed ([why](#check-runs-on-a-private-repository)) |
+| [#289](https://github.com/iceboundrock/AutoForge/issues/289) | Medium | *Fixed on `main`.* The merge gate refuses an empty check rollup, and one in which no check succeeded, under every configuration, `safety.verify_check_definition: false` and an empty `safety.required_checks` included; `doctor` names a GitHub Free plan restriction as the plan, never as a token permission, and its required-check row fails while `safety.allow_merge: true` and the requirement cannot be verified (the plan, a token without access, not found, a transient failure, or a hidden bypass list with no word on this token) | A branch rule is still what makes a check *required*: with the gate open, keep both settings at their defaults and a CI check required ([why](#check-runs-on-a-private-repository)) |
 | [#291](https://github.com/iceboundrock/AutoForge/issues/291) | Medium | *Fixed on `main`.* With a fine-grained token on a private repository whose pull requests have checks, REVIEW and FIX now run without the check results (the reviewer is told they are unknown), the merge gate blocks with a reason naming the credential and its remedy, and `doctor`'s "pull request check runs readable" row reports it | With the merge gate open, use `gh auth login` or a classic token with `repo` there ([why](#check-runs-on-a-private-repository)) |
 
 Also disclosed: pushed code runs in your CI before any review
@@ -394,11 +394,19 @@ was not tried):
   from the rollup blocks the merge; it is never taken as passed. A read
   that fails conclusively (refused, not found) blocks the run; a transient
   one is retried within `merge.max_verification_attempts`.
-- **The defaults matter.** With `safety.verify_check_definition: false` or
-  an empty `safety.required_checks`, the controller only requires that every
-  check it can see succeeded. An empty rollup, for example because no CI
-  ran, then passes unless the branch itself requires a check
-  ([#289](https://github.com/iceboundrock/AutoForge/issues/289)).
+- **An empty rollup never merges.** A rollup that was read and holds no
+  check at all, for example because no CI ran, is `BLOCKED` under every
+  configuration, `safety.verify_check_definition: false` and an empty
+  `safety.required_checks` included
+  ([#289](https://github.com/iceboundrock/AutoForge/issues/289)). So is a
+  rollup in which nothing succeeded (only `NEUTRAL` or `SKIPPED` entries):
+  a merge never passes only because no check failed. A refused read is
+  never taken for an empty one.
+- **The defaults still matter.** With `safety.verify_check_definition:
+  false` or an empty `safety.required_checks`, the controller requires
+  only that the rollup has a successful check and that none failed: one
+  green check that is not the CI you meant is enough. Only a branch rule
+  makes a particular check required.
 
 ### Private and public repositories
 
@@ -419,8 +427,10 @@ repository:
 - nothing can require a pull request or the `ci` check on the default
   branch, and Contents: write can push to it directly (AutoForge itself
   never does);
-- `doctor`'s required-check row cannot read the branch rules and is
-  skipped, and its message currently says the token cannot read them
+- `doctor`'s required-check row cannot read the branch rules. It says
+  that this is the plan, not the token, and that no token permission
+  changes it; it is a `FAIL` while `safety.allow_merge: true` and a `SKIP`
+  with the gate closed, never an `OK`
   ([#289](https://github.com/iceboundrock/AutoForge/issues/289)).
 
 Keep the merge gate closed there, or use a plan whose private

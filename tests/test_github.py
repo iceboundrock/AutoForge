@@ -11,6 +11,7 @@ from autoforge.errors import (
     GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
+    GitHubPlanLimitedError,
     GitHubUnavailableError,
     GitHubWrongTargetError,
 )
@@ -310,6 +311,54 @@ def test_the_plan_entitlement_403_is_recognised(stderr):
 )
 def test_the_plan_entitlement_403_is_matched_narrowly(stderr):
     assert not is_plan_limited_gh_failure(stderr)
+
+
+PLAN_403 = (
+    "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+)
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda gh: gh.get_required_status_check_rules("o/r", "main"),
+        lambda gh: gh.get_ruleset("o/r", 7),
+        lambda gh: gh.list_rulesets("o/r"),
+        lambda gh: gh.get_branch_protection("o/r", "main"),
+    ],
+    ids=["rules", "ruleset", "rulesets", "classic-protection"],
+)
+def test_a_plan_limited_branch_rule_read_is_typed_and_not_access_denied(read):
+    """#289: GitHub Free's 403 is the plan, not the token: typed, conclusive, never retried."""
+    calls: list = []
+    gh = GitHubClient(runner=_failing(calls, PLAN_403), transient_retries=2, retry_delay_seconds=0)
+    with pytest.raises(GitHubPlanLimitedError) as info:
+        read(gh)
+    assert not isinstance(info.value, GitHubNotFoundError)
+    assert not is_access_denied_gh_failure(str(info.value))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda gh: gh.get_required_status_check_rules("o/r", "main"),
+        lambda gh: gh.get_branch_protection("o/r", "main"),
+    ],
+    ids=["rules", "classic-protection"],
+)
+def test_a_genuine_403_and_404_on_a_branch_rule_read_are_classified_as_before(read):
+    gh = GitHubClient(
+        runner=_failing([], "gh: Must have admin rights to Repository. (HTTP 403)"),
+        retry_delay_seconds=0,
+    )
+    with pytest.raises(GitHubError) as info:
+        read(gh)
+    assert type(info.value) is GitHubError and is_access_denied_gh_failure(str(info.value))
+    gh = GitHubClient(runner=_failing([], "gh: Not Found (HTTP 404)"), retry_delay_seconds=0)
+    with pytest.raises(GitHubNotFoundError):
+        gh.get_required_status_check_rules("o/r", "main")
+    assert gh.get_branch_protection("o/r", "main") is None  # GitHub's "not protected"
 
 
 def test_the_checks_probe_candidates_are_open_prs_with_check_results():
@@ -806,7 +855,11 @@ def test_get_pr_parses_merge_state_and_auto_merge():
 def test_check_outcome_classification(state, conclusion, outcome):
     from autoforge.github import CheckInfo
 
-    assert CheckInfo(name="ci", state=state, conclusion=conclusion).outcome == outcome
+    check = CheckInfo(name="ci", state=state, conclusion=conclusion)
+    assert check.outcome == outcome
+    # Only an actual success succeeded: NEUTRAL and SKIPPED fail nothing but
+    # are not one (#289).
+    assert check.succeeded == ((state, conclusion) in {("COMPLETED", "SUCCESS"), ("SUCCESS", "")})
 
 
 def test_get_pr_checks_parses_check_runs_and_status_contexts():

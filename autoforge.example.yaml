@@ -137,11 +137,16 @@ safety:
   # and nothing else notices when that rule is disabled, renamed or given a
   # bypass actor. `autoforge doctor` reads the effective rules of the default
   # branch and FAILs when one of these contexts is not required, the ruleset
-  # is not `active`, or it has bypass actors. A token that cannot read the
-  # rules -- or can read them but not who may bypass them, which GitHub shows
-  # only with write access to the ruleset -- reports SKIP, never a false
-  # alarm and never OK. An empty list ([]) requires only that *some* status
-  # check is required.
+  # is not `active`, or it has bypass actors. Rules it cannot verify (a
+  # token without access, GitHub Free, whose private repositories have no
+  # rulesets, a transient failure, or a bypass list GitHub shows only with
+  # write access to the ruleset and no word on whether this token may bypass
+  # it) report SKIP with `allow_merge: false` and FAIL with `allow_merge:
+  # true` (#289); never OK. A hidden bypass list where GitHub says this token
+  # may never bypass the rule is a SKIP either way. An empty list ([])
+  # requires only that *some* status check is required. Whatever this list
+  # says, the merge gate never merges a PR whose status rollup holds no check,
+  # or no successful one (#289).
   required_checks:
     - "ci"
   # Compare each required check's *definition* with the base branch's before
