@@ -36,6 +36,12 @@ wget's configuration and zsh's startup files need no check: a launch's
 curl, wget and zsh read the controller's empty ones instead. The
 ``origin`` URL is shown redacted.
 
+A REMOTE run's doctor also makes the merge gate's checks read on one open
+pull request whose head has check results (#291): GitHub refuses a
+fine-grained personal access token the check runs of a private repository,
+which no permission it can be given changes. PASS needs a check run read;
+no such pull request is UNKNOWN, never a PASS.
+
 Every run shows the parallel EPIC scheduler's settings (``scheduler.*``,
 bounded by the configuration loader). ``doctor --epic <url>`` adds the
 scheduler's own checks (ADR 0008, #183): the coordination root (the git
@@ -83,6 +89,7 @@ from .epic_graph import build_epic_snapshot, evaluate, ready_set
 from .errors import (
     ConfigurationError,
     ExecutionError,
+    GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
@@ -99,7 +106,9 @@ from .executor import (
 from .github import (
     GH_MIN_VERSION,
     GitHubClient,
+    checks_access_remedy,
     is_access_denied_gh_failure,
+    is_plan_limited_gh_failure,
     parse_gh_version,
 )
 from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
@@ -139,6 +148,12 @@ REMOTE_POST_MERGE_PROFILES = ["update_epic"]
 
 # Name of the `doctor` row that verifies the default branch's required checks.
 REQUIRED_CHECKS_ROW = "default branch requires checks"
+# Name of the `doctor` row that tries the merge gate's checks read (#291).
+CHECKS_READ_ROW = "pull request check runs readable"
+# How many candidate PRs that row reads before it gives up on finding a check
+# run: each is one `gh pr view`, and a candidate whose results are commit
+# statuses only proves nothing about check runs.
+CHECKS_READ_TRIES = 3
 
 
 @dataclass
@@ -543,6 +558,122 @@ class Doctor:
         if classic is not None:
             detail += " (classic branch protection exists but requires no status check)"
         return CheckResult(name, False, "; ".join([detail, *hints, remedy]))
+
+    def check_checks_read(self, gh: str) -> CheckResult:
+        """Whether this `gh` login may read a pull request's check runs (#291).
+
+        The merge gate reads a PR's check results with
+        :meth:`GitHubClient.get_pr_with_checks`, and GitHub refuses a
+        fine-grained personal access token the check runs of a private
+        repository's PR: no permission it can be given grants them. This row
+        makes that same read, with the same `gh` command and login, on an
+        open PR whose head has at least one check result (selected by count,
+        :meth:`GitHubClient.list_checks_probe_candidates`), up to
+        :data:`CHECKS_READ_TRIES` of them. Read-only; it never reads, prints
+        or stores a token.
+
+        PASS only when the read returned at least one check *run*, the
+        result GitHub was seen to refuse (#257). Whether it refuses a PR
+        whose results are commit statuses only was not tried, so reading
+        one proves nothing about check runs: the next candidate is read,
+        and none with a check run is UNKNOWN. DENIED when GitHub refused the
+        read (whatever the PR's results), a FAIL while the
+        configuration's half of the merge gate is open (every merge would be
+        BLOCKED) and a WARN otherwise. UNKNOWN (a SKIP, never a PASS) when no
+        PR could be tried or the answer was a plan limitation, a not-found or
+        a transient failure: none of those says what this login may read.
+        """
+        name = CHECKS_READ_ROW
+        cfg = self.config
+        if cfg is None:
+            return CheckResult.skip(name, "(config check failed)")
+        if self.repo is None:
+            return CheckResult.skip(name, "(GitHub remote check failed)")
+        repo = self.repo
+        client = GitHubClient(gh_command=gh, timeout_seconds=self.timeout, runner=self._runner)
+        try:
+            candidates = client.list_checks_probe_candidates(repo)
+        except GitHubChecksAccessError as exc:
+            # Even the count was refused: that is the refusal itself.
+            return self._checks_read_denied(
+                f"GitHub refused this gh login the check results of {repo}'s open pull "
+                f"requests: {checks_access_remedy(exc.credential)}",
+                exc,
+            )
+        except GitHubError as exc:
+            return self._checks_read_unknown(
+                f"the open pull requests of {repo} could not be listed to pick one to read", exc
+            )
+        if not candidates:
+            return CheckResult.skip(
+                name,
+                f"UNKNOWN: no recently updated open pull request of {repo} has a check result "
+                "on its head, so the checks read the merge gate makes was not tried; run doctor "
+                "again while one does",
+            )
+        tried: list[str] = []
+        for url, _count in candidates[:CHECKS_READ_TRIES]:
+            try:
+                pr = client.get_pr_with_checks(url)
+            except GitHubChecksAccessError as exc:
+                return self._checks_read_denied(
+                    f"GitHub refused this gh login the check results of {url}: "
+                    f"{checks_access_remedy(exc.credential)}",
+                    exc,
+                )
+            except GitHubError as exc:
+                if _pr_read_refused(exc):
+                    return self._checks_read_denied(
+                        f"GitHub refused this gh login the pull request {url} itself (see the "
+                        "'gh authenticated' row)",
+                        exc,
+                    )
+                return self._checks_read_unknown(f"the checks read of {url} failed", exc)
+            runs = [check for check in pr.checks or [] if check.kind == "CheckRun"]
+            if runs:
+                return CheckResult(
+                    name,
+                    True,
+                    f"PASS: this gh login read {len(pr.checks or [])} check result(s) of {url}, "
+                    f"{len(runs)} of them check runs, with the merge gate's own read",
+                )
+            tried.append(url)
+        return CheckResult.skip(
+            name,
+            f"UNKNOWN: the check results of {', '.join(tried)} hold no check run (commit "
+            "statuses only), which proves nothing about the check runs GitHub may refuse",
+        )
+
+    def _checks_read_denied(self, what: str, exc: GitHubError) -> CheckResult:
+        gate_open = self.config is not None and self.config.merge_allowed_by_config
+        consequence = (
+            "with safety.allow_merge=true every merge would be BLOCKED at READY_FOR_MERGE"
+            if gate_open
+            else "a run with the merge gate open would be BLOCKED at READY_FOR_MERGE; "
+            "REVIEW and FIX proceed without the check results"
+        )
+        return CheckResult(
+            CHECKS_READ_ROW,
+            False,
+            redact(f"DENIED: {what}; {consequence}. GitHub's answer: {exc}"),
+            required=gate_open,
+        )
+
+    @staticmethod
+    def _checks_read_unknown(what: str, exc: GitHubError) -> CheckResult:
+        # The client's typed answers first; only a plain GitHubError is
+        # classified by its text.
+        if isinstance(exc, GitHubUnavailableError):
+            why = "a transient GitHub failure; run doctor again"
+        elif isinstance(exc, GitHubNotFoundError):
+            why = "the repository or pull request was not found by this login"
+        elif is_plan_limited_gh_failure(str(exc)):
+            why = "a GitHub plan limitation, not this login's permissions"
+        elif type(exc) is GitHubError and is_access_denied_gh_failure(str(exc)):
+            why = "this login may not make that read (see the 'gh authenticated' row)"
+        else:
+            why = "an answer this check cannot classify"
+        return CheckResult.skip(CHECKS_READ_ROW, redact(f"UNKNOWN: {what} ({why}): {exc}"))
 
     def check_gh_version(self, gh: str) -> CheckResult:
         """`gh` runs and is at least :data:`GH_MIN_VERSION`.
@@ -1258,10 +1389,27 @@ class Doctor:
         results.append(self.check_agent_environment())
         results.append(self.check_launch_credentials())
         results.append(self.check_required_checks(gh))
+        results.append(self.check_checks_read(gh))
         results.append(self.check_state_dir())
         results.extend(self.scheduler_checks(gh))
         results.extend(self.sandbox_checks(local=False))
         return results
+
+
+def _pr_read_refused(exc: GitHubError) -> bool:
+    """Whether GitHub refused this login the pull request itself (#291).
+
+    Classified by the client's types first: only a plain conclusive
+    :class:`GitHubError` can be such a refusal. Every typed answer says
+    something else (transient, not found, a refused checks read, another
+    PR), and a plan limitation is about the plan, not the login.
+    """
+    text = str(exc)
+    return (
+        type(exc) is GitHubError
+        and not is_plan_limited_gh_failure(text)
+        and is_access_denied_gh_failure(text)
+    )
 
 
 def _missing_contexts(contexts: list[str], expected: list[str]) -> list[str]:

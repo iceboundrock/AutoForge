@@ -305,6 +305,26 @@ class GitHubNotFoundError(GitHubError):
     """
 
 
+class GitHubChecksAccessError(GitHubError):
+    """GitHub refused this credential a pull request's check results (conclusive, #291).
+
+    ``gh pr view --json ...,statusCheckRollup`` fails as a whole when GitHub
+    answers the rollup with "Resource not accessible by personal access
+    token" (or "... by integration"): a fine-grained personal access token
+    on a private repository whose PR has a check run, which cannot be given
+    Checks: read. The PR exists and the token may read it; only its checks
+    are refused. So this is never a not-found, never transient (a retry
+    reads the same refusal) and never "no checks": a caller that needs the
+    checks fails closed on it, and one that does not reads the PR without
+    them. ``credential`` is GitHub's name for what it refused:
+    ``personal access token`` or ``integration``.
+    """
+
+    def __init__(self, message: str, credential: str = "") -> None:
+        super().__init__(message)
+        self.credential = credential
+
+
 class GitHubWrongTargetError(GitHubError):
     """GitHub answered a read of one object with another object (conclusive, #243).
 

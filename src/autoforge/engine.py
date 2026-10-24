@@ -255,6 +255,7 @@ from .errors import (
     ControlResultValidationError,
     ExecutionError,
     ExecutionTimeoutError,
+    GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
@@ -338,6 +339,7 @@ from .github import (
     PRInfo,
     WorkflowRunJobs,
     build_merge_argv,
+    checks_access_remedy,
 )
 from .interaction import InteractionBroker, Lifecycle, Resolver, Unattended
 from .local_workspace import (
@@ -394,6 +396,7 @@ from .read_context import (
     OperatorEvidence,
     ReadContext,
     render_checks,
+    render_checks_refused,
     render_comment,
     render_issue,
     render_issue_list,
@@ -3550,9 +3553,9 @@ class ControllerEngine:
                 )
         if phase in (Phase.REVIEW, Phase.REPLAN_REEXECUTE) and pr_url:
             title = "Previous pull request" if phase == Phase.REPLAN_REEXECUTE else "Pull request"
-            pr_text, checks = self._read_pr_files(pr_url, title)
+            pr_text, checks = self._read_pr_files(pr_url, title, checks=phase == Phase.REVIEW)
             context.add("pull-request.md", "the pull request, its body and comments", pr_text)
-            if phase == Phase.REVIEW and checks is not None:
+            if checks is not None:
                 context.add("checks.md", "the check summary of the PR's head commit", checks)
         if phase == Phase.REVIEW and s.last_review_comment_url:
             context.add(
@@ -3650,13 +3653,29 @@ class ControllerEngine:
             return unreadable(title, url, exc)
         return render_issue(issue, thread, title)
 
-    def _read_pr_files(self, url: str, title: str) -> tuple[str, str | None]:
+    def _read_pr_files(self, url: str, title: str, *, checks: bool) -> tuple[str, str | None]:
+        """The PR file, and with ``checks`` its check summary (REVIEW's read context).
+
+        Only REVIEW's prompt names the check summary, so only it requests
+        the checks. A credential GitHub refuses them (#291) still gets the
+        PR from an identity read, and the summary says the checks were
+        refused, never that there are none.
+        """
+        summary: str | None = None
         try:
-            pr = self.github.get_pr(url)
+            if checks:
+                try:
+                    pr = self.github.get_pr_with_checks(url)
+                    summary = render_checks(pr)
+                except GitHubChecksAccessError:
+                    pr = self.github.get_pr(url)
+                    summary = render_checks_refused(pr)
+            else:
+                pr = self.github.get_pr(url)
             thread = self.github.get_pr_comments(url)
         except GitHubError as exc:
             return unreadable(title, url, exc), None
-        return render_pr(pr, thread, title), render_checks(pr)
+        return render_pr(pr, thread, title), summary
 
     def _read_comment_file(self, url: str, title: str) -> str:
         try:
@@ -9122,6 +9141,48 @@ class ControllerEngine:
             "merged or counted. Fix the cause and inspect the PR on GitHub manually.",
         )
 
+    @staticmethod
+    def _checks_refused_text(url: str, exc: GitHubChecksAccessError) -> str:
+        """Why the merge gate blocks on a refused checks read (#291): the credential, the fix."""
+        remedy = checks_access_remedy(exc.credential)
+        return (
+            f"the check results of PR {url} could not be read: GitHub refused this "
+            f"credential ({exc.credential or 'the token'}) the PR's check runs: {exc}. "
+            "The merge gate needs a successful checks read; a refused one is never taken "
+            "as 'no checks' or as passed, and re-checking reads the same refusal, so "
+            f"nothing was merged or counted. {remedy[:1].upper()}{remedy[1:]}, then 'unblock'"
+        )
+
+    def _checks_refused_reason(
+        self, url: str, reviewed_ref: GitHubPullRequestRef, exc: GitHubChecksAccessError
+    ) -> str:
+        """The BLOCKED reason for a refused checks read at the merge gate (#291).
+
+        A PR that is already merged (a MERGE crash recovery, or a human's
+        merge that ``unblock`` sent to READY_FOR_MERGE to reconcile) is not
+        "nothing was merged": one identity read tells the two apart, so the
+        reason says what GitHub holds. It stays a BLOCKED either way: the
+        controller reconciles and counts a merge only after a successful
+        checks read, never on the identity read. An identity read that
+        fails, or answers with another PR, keeps the general reason.
+        """
+        general = self._checks_refused_text(url, exc)
+        try:
+            pr = self.github.get_pr(url)
+        except GitHubError:
+            return general
+        if pr.state != "MERGED" or (pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref)):
+            return general
+        remedy = checks_access_remedy(exc.credential)
+        return (
+            f"PR {url} is already MERGED on GitHub (head {pr.head_sha[:12] or '?'}), but this "
+            "controller cannot reconcile or count that merge: GitHub refused this credential "
+            f"({exc.credential or 'the token'}) the PR's check runs: {exc}. The controller "
+            "records a merge only after a successful checks read, never on the PR's state "
+            "alone, so the merge was not counted and the run cannot go on to UPDATE_EPIC. "
+            f"{remedy[:1].upper()}{remedy[1:]}, then 'unblock'"
+        )
+
     def _verify_pr_for_merge(
         self, phase: Phase, plan: StepPlan, allow_merge: bool
     ) -> PRInfo | StepOutcome:
@@ -9162,6 +9223,12 @@ class ControllerEngine:
           ``merge.max_verification_attempts``
         - GitHub read failed conclusively (auth, permissions, unresolvable
           PR or comment) -> BLOCKED
+        - GitHub refused this credential the PR's check results (#291) ->
+          BLOCKED naming the credential limitation and its remedy, before
+          anything else is judged: the gate needs a successful checks read.
+          One identity read only tells an already MERGED PR apart, so the
+          reason says it merged and was not counted; it is never reconciled
+          or counted without the checks read
         """
         state = self._require_state()
         self._check_merge_gate(allow_merge)
@@ -9205,8 +9272,14 @@ class ControllerEngine:
                 f"{reviewed[:12]} on base {reviewed_base!r} and is not re-bound. Nothing "
                 "was merged or counted; inspect the state file and the PR manually.",
             )
+        # The gate judges the checks, so it reads the PR with them, in one
+        # answer (#291): the checks are those of the HEAD it compares. A
+        # credential GitHub refuses them is a named, conclusive BLOCKED,
+        # never "no checks"; the identity read alone never reaches the gate.
         try:
-            pr = self.github.get_pr(url)
+            pr = self.github.get_pr_with_checks(url)
+        except GitHubChecksAccessError as exc:
+            return self._block(phase, plan, self._checks_refused_reason(url, reviewed_ref, exc))
         except GitHubError as exc:
             return self._github_read_failed(phase, plan, f"PR {url} could not be read", exc)
         if parse_pr_url(pr.url or url).repository.lower() != state.repository.lower():
@@ -9956,6 +10029,11 @@ class ControllerEngine:
         exact HEAD is acceptable right now.
         """
         url = pr.url
+        # A PR read without its check results (the identity read, #291) says
+        # nothing about them: it is never judged, and never as "no checks".
+        checks = pr.checks
+        if checks is None:
+            return f"the check results of PR {url} were not read, so they cannot be judged"
         if pr.is_draft:
             return f"PR {url} is a draft"
 
@@ -9966,8 +10044,8 @@ class ControllerEngine:
 
         # 2. checks: all of them, not only the ones GitHub marks required
         #    (gh does not expose which are required; stricter is safer).
-        failed = [c.name or "?" for c in pr.checks if c.outcome in ("failure", "unknown")]
-        pending = [c.name or "?" for c in pr.checks if c.outcome == "pending"]
+        failed = [c.name or "?" for c in checks if c.outcome in ("failure", "unknown")]
+        pending = [c.name or "?" for c in checks if c.outcome == "pending"]
         if failed:
             return f"PR {url} has failing or inconclusive checks: {', '.join(failed)}"
         if pending:
@@ -10101,6 +10179,8 @@ class ControllerEngine:
         url = pr.url
         if not pr.base_ref:
             return f"PR {url} reports no base branch, so its checks have no reference definition"
+        if pr.checks is None:
+            return f"the check results of PR {url} were not read, so they cannot be judged"
         base_tip = ""
         references: dict[int, tuple[int, WorkflowRunJobs]] = {}
         for context in safety.required_checks:

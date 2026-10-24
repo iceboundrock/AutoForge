@@ -27,6 +27,7 @@ from autoforge.certificate import Revision, remote_certificate  # noqa: E402
 from autoforge.config import default_config  # noqa: E402
 from autoforge.engine import ControllerEngine  # noqa: E402
 from autoforge.errors import (  # noqa: E402
+    GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
@@ -306,6 +307,24 @@ class FakeAgent:
         )
 
 
+# GitHub's answer to a fine-grained token reading a private PR's check runs
+# (#291), as `gh pr view --json ...,statusCheckRollup` prints it; a GitHub
+# App installation token without Checks: read gets it worded "by integration".
+CHECKS_REFUSAL = (
+    "GraphQL: Resource not accessible by {credential} "
+    "(repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup.contexts.nodes.0)"
+)
+
+
+def checks_refused(url: str = PR, credential: str = "personal access token"):
+    """The error the real client raises for :data:`CHECKS_REFUSAL` on ``url``'s checks read."""
+    answer = CHECKS_REFUSAL.format(credential=credential)
+    return GitHubChecksAccessError(
+        f"`gh pr view {url} --json ...,statusCheckRollup` failed (exit 1): {answer}",
+        credential=credential,
+    )
+
+
 class FakeGitHub:
     """In-memory GitHub read model. Tests mutate it to simulate agent actions.
 
@@ -370,6 +389,10 @@ class FakeGitHub:
         self.commented_prs: list[tuple[str, str]] = []
         self.get_pr_failures: int = 0  # next N get_pr calls raise GitHubUnavailableError
         self.get_pr_error: GitHubError | None = None  # every get_pr call raises this
+        # Every checks read (get_pr_with_checks) raises this, the identity
+        # read (get_pr) answers: GitHub refusing a fine-grained token a
+        # private PR's check runs (#291) is ``checks_refused()``.
+        self.checks_error: GitHubError | None = None
         self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
         # get_issue calls for these URLs (canonical) raise; others answer.
         self.get_issue_errors: dict[str, GitHubError] = {}
@@ -647,8 +670,7 @@ class FakeGitHub:
             raise self.close_events_error
         return self.close_events.get(self._events_key(url), 0)
 
-    def get_pr(self, url: str) -> PRInfo:
-        self.calls.append(("get_pr", url))
+    def _pr_view(self, url: str) -> PRInfo:
         if self.get_pr_error is not None:
             raise self.get_pr_error
         if self.get_pr_failures > 0:
@@ -661,6 +683,19 @@ class FakeGitHub:
         # have -- a stale checkpoint comparison would silently self-heal.
         return replace(self._stored(url))
 
+    def get_pr(self, url: str) -> PRInfo:
+        """The identity read: no ``statusCheckRollup``, so ``checks`` is None (#291)."""
+        self.calls.append(("get_pr", url))
+        return replace(self._pr_view(url), checks=None)
+
+    def get_pr_with_checks(self, url: str) -> PRInfo:
+        """The checks read: the identity fields and the head's checks (a list, maybe [])."""
+        self.calls.append(("get_pr_with_checks", url))
+        if self.checks_error is not None:
+            raise self.checks_error
+        pr = self._pr_view(url)
+        return replace(pr, checks=list(pr.checks or []))
+
     def get_pr_head_sha(self, url: str) -> str:
         return self.get_pr(url).head_sha
 
@@ -671,7 +706,7 @@ class FakeGitHub:
         return self.get_pr(url).head_ref
 
     def get_pr_checks(self, url: str):
-        return self.get_pr(url).checks
+        return self.get_pr_with_checks(url).checks
 
     def get_pr_changed_files(self, url: str) -> ChangedFiles:
         from autoforge.validation import parse_pr_url
@@ -765,10 +800,11 @@ class FakeGitHub:
         return WorkflowRuns(runs=runs, total=len(runs) + self.workflow_runs_unlisted)
 
     def pr_exists(self, url: str) -> bool:
+        # As the real client: only a conclusive not-found is absence.
         try:
             self.get_pr(url)
             return True
-        except GitHubError:
+        except GitHubNotFoundError:
             return False
 
     def list_open_prs(self, repo: str) -> list[PRInfo]:

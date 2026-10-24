@@ -60,6 +60,52 @@ HEALTHY_GITHUB = {
 }
 
 
+# The open PR the checks-read row probes (#291), and what `gh` answers for it.
+PROBE_PR = "https://github.com/owner/repo/pull/7"
+CHECK_RUN = {
+    "__typename": "CheckRun",
+    "name": "ci",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "workflowName": "CI",
+}
+STATUS_CONTEXT = {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS"}
+
+
+def _probe_listing(*prs):
+    """The candidate listing's GraphQL answer: ``(number, totalCount)`` per open PR."""
+    nodes = [
+        {
+            "url": f"https://github.com/owner/repo/pull/{number}",
+            "number": number,
+            "commits": {
+                "nodes": [
+                    {
+                        "commit": {
+                            "oid": "a" * 40,
+                            "statusCheckRollup": {"contexts": {"totalCount": total}},
+                        }
+                    }
+                ]
+            },
+        }
+        for number, total in prs
+    ]
+    return {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
+
+
+HEALTHY_PROBE = _probe_listing((7, 1))
+HEALTHY_PR_VIEWS = {PROBE_PR: [CHECK_RUN]}
+# GitHub's answer to a fine-grained token reading a private PR's check runs (#291).
+ROLLUP_REFUSED = (
+    "GraphQL: Resource not accessible by personal access token "
+    "(repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup.contexts.nodes.0)"
+)
+PLAN_LIMITED = (
+    "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+)
+
+
 # What a recent enough `gh --version` prints (first line).
 GH_VERSION_LINE = "gh version 2.48.0 (2024-04-09)"
 # What `opencode --version` prints on a supported CLI (#186).
@@ -91,6 +137,8 @@ def _runner_factory(
     opencode_code=0,
     git_config="",
     claude_help=CLAUDE_HELP,
+    checks_probe=HEALTHY_PROBE,
+    pr_views=None,
 ):
     """Fake runner. ``github`` maps a `gh api` endpoint to its JSON payload, or to
     an ``(exit_code, stderr)`` pair for a failed read; ``--paginate --slurp``
@@ -98,9 +146,17 @@ def _runner_factory(
     is what an OpenCode command's ``--version`` prints (``None``: the binary
     is missing), with exit status ``opencode_code``. ``git_config`` is what
     the launch preflight's ``git config --list --show-scope -z`` prints, and
-    ``claude_help`` what ``claude --help`` does."""
+    ``claude_help`` what ``claude --help`` does. ``checks_probe`` is the
+    answer to the checks-read row's candidate listing (``gh api graphql``)
+    and ``pr_views`` maps a PR URL to its status-check rollup (``gh pr
+    view``), each an answer or an ``(exit_code, stderr)`` pair (#291)."""
     responses = dict(HEALTHY_GITHUB)
     responses.update(github or {})
+    views = HEALTHY_PR_VIEWS if pr_views is None else pr_views
+
+    def failed(argv, cwd, payload):
+        code, stderr = payload
+        return ExecutionResult(argv, cwd, code, "", stderr, "t", "t")
 
     def runner(req):
         if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
@@ -121,6 +177,28 @@ def _runner_factory(
             out = json.dumps(
                 {"nameWithOwner": "owner/repo", "defaultBranchRef": {"name": default_branch}}
             )
+        elif argv[:3] == ["gh", "api", "graphql"]:
+            if isinstance(checks_probe, tuple):
+                return failed(argv, req.cwd, checks_probe)
+            out = json.dumps(checks_probe)
+        elif argv[:3] == ["gh", "pr", "view"]:
+            url = argv[3]
+            if url not in views:
+                return ExecutionResult(argv, req.cwd, 1, "", f"unscripted {url}", "t", "t")
+            if isinstance(views[url], tuple):
+                return failed(argv, req.cwd, views[url])
+            row = {
+                "url": url,
+                "number": int(url.rsplit("/", 1)[1]),
+                "title": "PR",
+                "state": "OPEN",
+                "headRefOid": "a" * 40,
+                "baseRefName": "main",
+                "headRefName": "feature",
+            }
+            if "statusCheckRollup" in argv[argv.index("--json") + 1].split(","):
+                row["statusCheckRollup"] = views[url]
+            out = json.dumps(row)
         elif argv[:2] == ["gh", "api"]:
             endpoint = argv[-1]
             paginated = "--slurp" in argv
@@ -173,6 +251,7 @@ def test_all_checks_pass(tmp_path):
         "cwd is a git repository",
         "GitHub remote",
         "default branch requires checks",
+        "pull request check runs readable",
         "state dir writable",
     ):
         assert expected in names
@@ -477,12 +556,20 @@ def test_required_check_present_and_enforced(tmp_path):
     # Effective rules are read with every page, and the ruleset once for its enforcement.
     assert ["gh", "api", "--paginate", "--slurp", RULES_ENDPOINT] in calls
     assert ["gh", "api", RULESET_ENDPOINT] in calls
-    # Every `gh api` call is a GET: `doctor` never mutates.
+    # Every REST `gh api` call is a GET: `doctor` never mutates.
     api_calls = [argv for argv in calls if argv[:2] == ["gh", "api"]]
-    assert api_calls
+    rest = [argv for argv in api_calls if argv[2] != "graphql"]
+    assert rest
     assert not any(
-        flag in argv for argv in api_calls for flag in ("-X", "--method", "-f", "-F", "--input")
+        flag in argv for argv in rest for flag in ("-X", "--method", "-f", "-F", "--input")
     )
+    # The checks-read row's candidate listing (#291) is GraphQL, which `gh`
+    # POSTs with `-f` fields: a query, never a mutation, and no other method.
+    graphql = [argv for argv in api_calls if argv[2] == "graphql"]
+    assert len(graphql) == 1
+    (query,) = [a for a in graphql[0] if a.startswith("query=")]
+    assert query.startswith("query=query(") and "mutation" not in query
+    assert not any(flag in graphql[0] for flag in ("-X", "--method", "-F", "--input"))
 
 
 def test_required_check_not_required_fails_with_remedy(tmp_path):
@@ -709,6 +796,131 @@ def test_required_check_skipped_when_prerequisites_failed(tmp_path):
     d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
     check = {r.name: r for r in d.run_all()}["default branch requires checks"]
     assert check.skipped and check.detail == "(config check failed)"
+
+
+# -- the checks-read row (#291) ---------------------------------------------------
+CHECKS_READ_ROW = "pull request check runs readable"
+TOKEN = "ghp_" + "Q" * 36
+
+
+def _checks_read(tmp_path, *, gate_open=False, **kwargs):
+    """The checks-read row of a full doctor run, and every argv the run made."""
+    calls: list = []
+    config = None
+    if gate_open:
+        cfg = tmp_path / "gate.json"
+        cfg.write_text('{"version": 1, "safety": {"allow_merge": true}}')
+        config = str(cfg)
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory(calls=calls, **kwargs))
+    return {r.name: r for r in d.run_all()}[CHECKS_READ_ROW], calls
+
+
+def _pr_views(calls):
+    return [argv for argv in calls if argv[:3] == ["gh", "pr", "view"]]
+
+
+def test_checks_read_passes_only_on_the_merge_gate_s_own_read_of_a_check_run(tmp_path):
+    row, calls = _checks_read(tmp_path)
+    assert row.ok and row.label == "OK  " and row.detail.startswith("PASS: ")
+    assert PROBE_PR in row.detail and "1 of them check runs" in row.detail
+    # The controller's own checks read: the same `gh`, the rollup requested.
+    (view,) = _pr_views(calls)
+    assert view[:4] == ["gh", "pr", "view", PROBE_PR]
+    assert "statusCheckRollup" in view[view.index("--json") + 1].split(",")
+    # Read-only and token-free: no write, no `gh auth token`.
+    assert not any("token" in argv for argv in calls)
+    assert not any(a in ("-X", "--method") for argv in calls for a in argv)
+
+
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_checks_read_denied_names_the_credential_and_its_remedy(tmp_path, gate_open):
+    """GitHub's refusal is DENIED: a FAIL with the merge gate's config half open."""
+    row, calls = _checks_read(
+        tmp_path, gate_open=gate_open, pr_views={PROBE_PR: (1, ROLLUP_REFUSED)}
+    )
+    assert not row.ok and not row.skipped
+    assert row.label == ("FAIL" if gate_open else "WARN")
+    assert row.detail.startswith("DENIED: ")
+    assert "fine-grained personal access token cannot be given Checks: read" in row.detail
+    assert "`gh auth login`" in row.detail and "`repo` scope" in row.detail
+    assert "READY_FOR_MERGE" in row.detail
+    assert len(_pr_views(calls)) == 1  # a refusal is an answer: never retried
+
+
+def test_checks_read_without_a_candidate_is_unknown_never_a_pass(tmp_path):
+    row, calls = _checks_read(tmp_path, checks_probe=_probe_listing((8, 0)))
+    assert row.skipped and not row.ok and row.label == "SKIP"
+    assert row.detail.startswith("UNKNOWN: ") and "was not tried" in row.detail
+    assert _pr_views(calls) == []
+
+
+def test_checks_read_of_commit_statuses_only_is_unknown(tmp_path):
+    """A commit status is not what GitHub refuses; only a check run proves the read."""
+    prs = [f"https://github.com/owner/repo/pull/{n}" for n in (7, 8, 9, 10)]
+    row, calls = _checks_read(
+        tmp_path,
+        checks_probe=_probe_listing((7, 1), (8, 2), (9, 1), (10, 1)),
+        pr_views={url: [STATUS_CONTEXT] for url in prs},
+    )
+    assert row.skipped and row.detail.startswith("UNKNOWN: ")
+    assert "no check run" in row.detail
+    # At most doctor_module.CHECKS_READ_TRIES reads.
+    assert [argv[3] for argv in _pr_views(calls)] == prs[: doctor_module.CHECKS_READ_TRIES]
+
+
+def test_checks_read_tries_the_next_candidate_after_statuses_only(tmp_path):
+    second = "https://github.com/owner/repo/pull/8"
+    row, _ = _checks_read(
+        tmp_path,
+        checks_probe=_probe_listing((7, 1), (8, 3)),
+        pr_views={PROBE_PR: [STATUS_CONTEXT], second: [STATUS_CONTEXT, CHECK_RUN]},
+    )
+    assert row.ok and second in row.detail and "2 check result(s)" in row.detail
+
+
+@pytest.mark.parametrize("where", ["listing", "view"])
+@pytest.mark.parametrize(
+    ("stderr", "reason"),
+    [
+        (PLAN_LIMITED, "a GitHub plan limitation, not this login's permissions"),
+        ("gh: Not Found (HTTP 404)", "was not found"),
+        ("HTTP 502: Bad Gateway", "transient"),
+    ],
+    ids=["plan-limited", "not-found", "transient"],
+)
+def test_checks_read_that_cannot_answer_is_unknown(tmp_path, monkeypatch, where, stderr, reason):
+    import autoforge.github as github
+
+    monkeypatch.setattr(github.time, "sleep", lambda seconds: None)
+    failure = (1, stderr)
+    kwargs = {"checks_probe": failure} if where == "listing" else {"pr_views": {PROBE_PR: failure}}
+    row, _ = _checks_read(tmp_path, gate_open=True, **kwargs)
+    # Even with the gate open: none of these says what this login may read.
+    assert row.skipped and row.label == "SKIP" and row.detail.startswith("UNKNOWN: ")
+    assert reason in row.detail
+    assert "token permissions" not in row.detail and "Checks: read" not in row.detail
+
+
+def test_checks_read_refused_the_pr_itself_is_denied(tmp_path):
+    row, _ = _checks_read(tmp_path, pr_views={PROBE_PR: (1, "HTTP 401: Bad credentials")})
+    assert not row.ok and row.label == "WARN" and row.detail.startswith("DENIED: ")
+    assert "'gh authenticated' row" in row.detail
+
+
+def test_checks_read_never_prints_a_token(tmp_path):
+    leaked = f"{ROLLUP_REFUSED}\nAuthorization: token {TOKEN}"
+    for kwargs in (
+        {"pr_views": {PROBE_PR: (1, leaked)}},
+        {"checks_probe": (1, f"HTTP 401: Bad credentials {TOKEN}")},
+    ):
+        row, _ = _checks_read(tmp_path, gate_open=True, **kwargs)
+        assert TOKEN not in row.detail, row
+
+
+def test_checks_read_skipped_when_prerequisites_failed(tmp_path):
+    row, calls = _checks_read(tmp_path, git_remote="git@gitlab.com:o/r.git")
+    assert row.skipped and row.detail == "(GitHub remote check failed)"
+    assert not any(argv[:3] == ["gh", "api", "graphql"] for argv in calls)
 
 
 def test_premerge_verification_reported_and_never_run(tmp_path):
