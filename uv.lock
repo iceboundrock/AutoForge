@@ -71,7 +71,7 @@ wheels = [
 ]
 
 [[package]]
-name = "autoforge"
+name = "autoforge-cli"
 version = "0.1.0"
 source = { editable = "." }
 

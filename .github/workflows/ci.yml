@@ -106,6 +106,41 @@ jobs:
       - run: uv sync --locked --group dev
       - run: make test-sandbox-measured
 
+  dist:
+    # The installable artifacts (#256): `make dist-check` builds the sdist
+    # and a wheel from that sdist, checks their files and metadata (name
+    # `autoforge-cli`, the version, `License-Expression: MIT`, LICENSE in
+    # both), installs the wheel non-editably into a fresh environment outside
+    # the checkout, and from there runs `autoforge --version` and `--help`,
+    # renders every prompt template from the installed package and makes a
+    # LOCAL dry run (tests/dist_check.py). It runs on every interpreter the
+    # `test` matrix runs, which are the ones docs/compatibility.md claims.
+    # There is no `uv sync`: the check runs on the bare interpreter and
+    # imports only the installed package. Like every job here it calls no
+    # provider and needs no credential; its one download is the build
+    # backend, from the package index.
+    name: dist (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The same list as `test`; tests/test_ci_workflow.py keeps them equal.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The build backend is third-party code; it gets no token.
+          persist-credentials: false
+      # Pinned to a full version on purpose: setup-uv stopped publishing
+      # floating major tags after v7, so `@v10` does not resolve.
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: ${{ matrix.python-version }}
+          # No cache: the build backend is resolved and fetched afresh, as
+          # for a release build.
+          enable-cache: false
+      - run: make dist-check DIST_PYTHON=${{ matrix.python-version }}
+
   ci:
     # One stable check name to mark required in branch protection, so adding
     # or renaming a matrix entry does not silently drop the requirement.
@@ -113,12 +148,12 @@ jobs:
     # a SKIPPED check run as passing, so this job must never skip its way to
     # green.
     name: ci
-    needs: [test, static, sandbox]
+    needs: [test, static, sandbox, dist]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Require every job to have succeeded
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
         run: |
-          echo "test=${{ needs.test.result }} static=${{ needs.static.result }} sandbox=${{ needs.sandbox.result }}"
+          echo "test=${{ needs.test.result }} static=${{ needs.static.result }} sandbox=${{ needs.sandbox.result }} dist=${{ needs.dist.result }}"
           exit 1

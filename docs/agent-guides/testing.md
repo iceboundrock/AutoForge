@@ -1455,6 +1455,39 @@ offline:
 - `tests/test_doctor.py`: the `api_key` route's OK auth row reads the same
   after the redaction `autoforge doctor` prints it through
 
+### Packaging and the installed artifact (#256)
+
+`make check` tests the source tree through an editable install, which
+finds every file under `src/` whether or not a wheel would ship it.
+`tests/test_packaging.py` (in `make check`) keeps covered, offline and
+without building:
+
+- the distribution is `autoforge-cli`, the `autoforge` console script
+  points at `autoforge.cli:main`, and `LICENSE` is the MIT text with its
+  copyright line, declared through PEP 639 (`license`, `license-files`, a
+  setuptools floor that supports them, no License classifier)
+- `[project].version` equals `autoforge.__version__` and is a canonical
+  release or pre-release version
+- every non-Python file under `src/autoforge/` is declared package data or
+  deliberately left out, the prompt directory holds exactly the registered
+  templates, and only the known modules read package resources
+- the Python classifiers and `requires-python` follow the Makefile's
+  `CI_PYTHON_VERSIONS`, and the OS and implementation classifiers claim
+  only Linux and CPython
+- the artifact checks of `tests/dist_check.py` accept a complete synthetic
+  sdist and wheel and refuse one that misses a template, carries a stray
+  test, or has wrong metadata (name, version, license expression, metadata
+  version, `Requires-Python`, a dependency outside an extra)
+- its REMOTE dry-run check, run on a stand-in for the installed command
+  with real git and a recording fake `gh`, refuses a `gh` call, any write
+  to the scratch repository (`.git` included) and an unrendered variable
+
+`make dist-check` (CI's `dist` job, on every CI Python) builds the real
+artifacts and runs the installed wheel outside the checkout
+([Development](../development.md#the-built-distributions)). It is the only
+check that sees what a user installs; a change to packaging, to a resource
+the package reads, or to the entry point runs it.
+
 ### SDK policy (#149, docs/sdk-policy.md)
 
 The SDK providers cannot launch yet, so their policy is held at its own

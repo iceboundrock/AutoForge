@@ -14,6 +14,10 @@ uv run autoforge --config autoforge.yaml doctor
 uv run autoforge --config autoforge.yaml run --epic <EPIC URL> --issue <issue URL>
 ```
 
+(`uv run autoforge` is the form inside a development clone of AutoForge;
+with the command installed, see [Installation](../README.md#installation),
+it is `autoforge --config autoforge.yaml ...`.)
+
 `--config` and `--state-dir` are options of the `autoforge` command itself,
 so they go before the subcommand. Without `--config` the controller uses its
 built-in defaults. AutoForge's own repository git-ignores `autoforge.yaml`
