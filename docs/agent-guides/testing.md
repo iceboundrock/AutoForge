@@ -1451,6 +1451,27 @@ artifacts and runs the installed wheel outside the checkout
 check that sees what a user installs; a change to packaging, to a resource
 the package reads, or to the entry point runs it.
 
+The release build (#295) is the same check with `--release-tag`;
+`tests/test_packaging.py` also covers its tag check (only `v<version>`, of
+a version in the scheme, and refused before anything is built) and the
+step outputs it hands on. `tests/test_publish_workflow.py` reads
+`.github/workflows/pypi-publish.yml` and fails when:
+
+- anything but a pushed tag `v*` or an input-less manual dispatch starts it
+- the workflow grants a permission, `build` gets more than `contents: read`
+  or any `id-token`, or `publish` gets anything but `id-token: write`,
+  leaves the `pypi` environment or stops needing `build`
+- an action is not pinned to a full commit SHA with its release beside it,
+  a secret is referenced, a `run` script interpolates an expression, or
+  the upload names a user, a password or another index
+- `build` stops refusing a non-tag ref first, keeping no token, building
+  exactly once with the dist check on a CI Python, or uploading the files
+  and `SHA256SUMS`, or `publish` stops re-verifying them before the upload,
+  with attestations and without `skip-existing`
+- the re-verify script itself, run with `bash` on synthetic files, accepts
+  a changed file, an extra file, another version, a different
+  `SHA256SUMS` or no recorded digests
+
 ### SDK policy (#149, docs/sdk-policy.md)
 
 The SDK providers cannot launch yet, so their policy is held at its own

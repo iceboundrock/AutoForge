@@ -37,7 +37,13 @@ imports the ``autoforge`` of the source tree:
    installed engine and must write no state.
 5. The SHA-256 of each artifact is printed, appended to the job summary
    (``$GITHUB_STEP_SUMMARY``) when that is set, and written to
-   ``--sha256sums`` in ``sha256sum -c`` format when asked.
+   ``--sha256sums`` in ``sha256sum -c`` format when asked. When
+   ``$GITHUB_OUTPUT`` is set, the version and those lines become the step's
+   outputs ``version`` and ``sha256sums``.
+
+``--release-tag TAG`` builds a release (``.github/workflows/pypi-publish.yml``,
+docs/releasing.md): before anything is built it refuses a tag other than
+``v<version>``, and a version outside the release scheme.
 
 Exit status 0 means every check passed. A failure says what failed, keeps
 the scratch directory for inspection and exits 1.
@@ -73,6 +79,10 @@ SDIST_TOP_FILES = frozenset(
 )
 # The oldest core-metadata version with License-Expression (PEP 639).
 MIN_METADATA_VERSION = (2, 4)
+# The versions the release procedure allows (docs/releasing.md): PEP 440 in its
+# canonical form, X.Y.Z with an optional aN / bN / rcN pre-release. A release's
+# tag is `v` and that version.
+RELEASE_VERSION = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)((a|b|rc)(0|[1-9]\d*))?")
 # The feature slug of the LOCAL dry run.
 LOCAL_SLUG = "dist-check"
 _PLACEHOLDER = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
@@ -440,7 +450,19 @@ def smoke(bin_dir: Path, work: Path, version: str) -> None:
     _say("ok: autoforge local run --dry-run --full-prompt rendered the ANALYZE_EXECUTE prompt")
 
 
-def record_digests(paths: list[Path], sha256sums: Path | None) -> None:
+def check_release_tag(tag: str, version: str) -> None:
+    """A release is built only from the tag ``v<version>`` of a version the procedure allows."""
+    _check(
+        RELEASE_VERSION.fullmatch(version) is not None,
+        f"the version {version!r} is not a release version X.Y.Z[aN|bN|rcN] (docs/releasing.md)",
+    )
+    _check(
+        tag == f"v{version}",
+        f"the tag {tag!r} does not name the package's version {version!r}: it must be 'v{version}'",
+    )
+
+
+def record_digests(paths: list[Path], sha256sums: Path | None, version: str) -> None:
     lines = [f"{_sha256(path)}  {path.name}" for path in paths]
     for line in lines:
         _say(f"sha256 {line}")
@@ -454,11 +476,25 @@ def record_digests(paths: list[Path], sha256sums: Path | None) -> None:
             handle.write(f"### Distributions (CPython {python})\n\n```text\n")
             handle.write("".join(f"{line}\n" for line in lines))
             handle.write("```\n\n")
+    # The step's outputs, which pypi-publish.yml hands from its build job to its
+    # publish job: the version and the digests that job re-verifies.
+    output = os.environ.get("GITHUB_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as handle:
+            handle.write(f"version={version}\n")
+            handle.write("sha256sums<<SHA256SUMS_END\n")
+            handle.write("".join(f"{line}\n" for line in lines))
+            handle.write("SHA256SUMS_END\n")
 
 
-def check_distributions(out_dir: Path | None, sha256sums: Path | None) -> None:
+def check_distributions(
+    out_dir: Path | None, sha256sums: Path | None, release_tag: str | None = None
+) -> None:
     data = pyproject()
     name, version = data["project"]["name"], data["project"]["version"]
+    if release_tag is not None:
+        check_release_tag(release_tag, version)
+        _say(f"ok: the tag {release_tag} names the version {version}")
     work = Path(tempfile.mkdtemp(prefix="autoforge-dist-check-")).resolve()
     _check(
         not work.is_relative_to(REPO_ROOT),
@@ -485,7 +521,7 @@ def check_distributions(out_dir: Path | None, sha256sums: Path | None) -> None:
         bin_dir = install(wheel, work)
         _check(not bin_dir.is_relative_to(REPO_ROOT), "the environment is inside the source tree")
         smoke(bin_dir, work, version)
-        record_digests([sdist, wheel], sha256sums)
+        record_digests([sdist, wheel], sha256sums, version)
     except CheckFailed:
         _say(f"FAILED; the scratch directory {work} is kept")
         raise
@@ -563,6 +599,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out-dir", type=Path, help="keep the sdist and the wheel here")
     parser.add_argument("--sha256sums", type=Path, help="write the artifacts' SHA-256 here")
+    parser.add_argument(
+        "--release-tag",
+        help="build a release: refuse unless this tag is 'v' and the package's version",
+    )
     parser.add_argument("--installed", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--expect-version", help=argparse.SUPPRESS)
     parser.add_argument("--source-root", type=Path, help=argparse.SUPPRESS)
@@ -571,7 +611,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.installed:
             check_installed(args.expect_version, args.source_root)
         else:
-            check_distributions(args.out_dir, args.sha256sums)
+            check_distributions(args.out_dir, args.sha256sums, args.release_tag)
     except CheckFailed as exc:
         print(f"dist-check: FAILED: {exc}", file=sys.stderr, flush=True)
         return 1

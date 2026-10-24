@@ -15,12 +15,16 @@ package directory and the package's source, build nothing, and fail when
   drift from what #256 decided (D1 to D3) and ``docs/compatibility.md`` states.
 
 They also run the dist check's own artifact checks on synthetic artifacts, so
-that a wheel or an sdist missing a template is shown to fail it.
+that a wheel or an sdist missing a template is shown to fail it, and its
+release-build half (#295): the tag check that refuses a tag other than
+``v<version>`` before anything is built, and the digests it hands from
+``pypi-publish.yml``'s build job to the publish job.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import re
 import tarfile
@@ -53,9 +57,9 @@ PACKAGE_RELATIVE_READS = {
 }
 # Ways to reach a package resource other than __file__; none is used today.
 RESOURCE_MODULES = ("importlib.resources", "importlib_resources", "pkgutil", "pkg_resources")
-# The versions the release procedure allows (docs/releasing.md): PEP 440 in its
-# canonical form, X.Y.Z with an optional aN / bN / rcN pre-release.
-RELEASE_VERSION = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)((a|b|rc)(0|[1-9]\d*))?")
+# The versions the release procedure allows (docs/releasing.md), shared with the
+# release build's tag check.
+RELEASE_VERSION = dist_check.RELEASE_VERSION
 # The copyright line #256 D1 recorded.
 COPYRIGHT = "Copyright (c) 2026 Ruoshi Li"
 
@@ -299,3 +303,70 @@ def test_the_dist_check_fails_metadata_that_is_not_pyproject_tomls(
     wheel = _wheel(tmp_path, metadata=_metadata(**{field: value}))
     with pytest.raises(CheckFailed, match=field if field != "Requires-Dist" else "dependency"):
         dist_check.check_wheel(wheel, STEM, DATA)
+
+
+@pytest.mark.parametrize(
+    "tag, version",
+    [
+        ("v0.1.0a0", "0.1.0a0"),
+        ("v0.1.0a1", "0.1.0a1"),
+        ("v0.1.0rc1", "0.1.0rc1"),
+        ("v1.2.3", "1.2.3"),
+    ],
+)
+def test_a_release_tag_names_its_version(tag: str, version: str):
+    dist_check.check_release_tag(tag, version)
+
+
+@pytest.mark.parametrize(
+    "tag, version, reason",
+    [
+        ("0.1.0a0", "0.1.0a0", "does not name"),
+        ("v0.1.0", "0.1.0a0", "does not name"),
+        ("v0.1.0a0 ", "0.1.0a0", "does not name"),
+        ("refs/tags/v0.1.0a0", "0.1.0a0", "does not name"),
+        ("v0.1.0-alpha0", "0.1.0a0", "does not name"),
+        ("v0.1.0.dev1", "0.1.0.dev1", "not a release version"),
+        ("v0.1.0a0+local", "0.1.0a0+local", "not a release version"),
+        ("v01.1.0", "01.1.0", "not a release version"),
+    ],
+)
+def test_the_release_build_refuses_a_tag_that_is_not_its_version(
+    tag: str, version: str, reason: str
+):
+    with pytest.raises(CheckFailed, match=reason):
+        dist_check.check_release_tag(tag, version)
+
+
+def test_the_release_build_refuses_a_wrong_tag_before_it_builds(monkeypatch, capsys):
+    """`--release-tag` is checked first: a wrong tag builds, installs and uploads nothing."""
+
+    def no_build(*args, **kwargs):  # pragma: no cover - reaching it is the failure
+        raise AssertionError("built for a tag that does not name the version")
+
+    monkeypatch.setattr(dist_check, "copy_source", no_build)
+    monkeypatch.setattr(dist_check, "build", no_build)
+    assert dist_check.main(["--release-tag", "v0.0.0"]) == 1
+    assert "does not name the package's version" in capsys.readouterr().err
+
+
+def test_the_digests_become_the_steps_outputs_and_sha256sums(tmp_path: Path, monkeypatch):
+    """What pypi-publish.yml's publish job re-verifies is what the build job wrote."""
+    sdist = tmp_path / f"{STEM}.tar.gz"
+    wheel = tmp_path / f"{STEM}-py3-none-any.whl"
+    sdist.write_bytes(b"sdist")
+    wheel.write_bytes(b"wheel")
+    output, summary, sums = tmp_path / "output", tmp_path / "summary", tmp_path / "SHA256SUMS"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    dist_check.record_digests([sdist, wheel], sums, PROJECT["version"])
+    lines = [
+        f"{hashlib.sha256(b'sdist').hexdigest()}  {sdist.name}",
+        f"{hashlib.sha256(b'wheel').hexdigest()}  {wheel.name}",
+    ]
+    assert sums.read_text(encoding="utf-8") == "".join(f"{line}\n" for line in lines)
+    assert output.read_text(encoding="utf-8") == (
+        f"version={PROJECT['version']}\n"
+        "sha256sums<<SHA256SUMS_END\n" + "".join(f"{line}\n" for line in lines) + "SHA256SUMS_END\n"
+    )
+    assert all(line in summary.read_text(encoding="utf-8") for line in lines)

@@ -237,6 +237,14 @@ workflow's matrix, or the mirrored commands drift apart, or when the
 real-backend module, or the `dist` job stops running `make dist-check` on
 every CI interpreter.
 
+The repository's other workflow, `pypi-publish`
+(`.github/workflows/pypi-publish.yml`), is not CI: it never runs on a pull
+request or a branch, only for a version tag `v*`, and publishes that
+release to PyPI after the maintainer approved it
+([Releasing: publishing to PyPI](releasing.md#publishing-to-pypi)).
+`tests/test_publish_workflow.py` pins its triggers, permissions, pins and
+steps.
+
 The workflow uses no repository or organization secrets, but its jobs are
 not credential-free: GitHub gives every run an automatic `GITHUB_TOKEN`, and
 the workflow's `permissions: contents: read` limits it to reading the

@@ -3,7 +3,31 @@
 Notable changes for operators. A default changes only where an entry says
 so.
 
-## Unreleased
+## 0.1.0a0 (unreleased)
+
+The version is set to `0.1.0a0`, #295's registration prerelease of
+`autoforge-cli`: a pre-Alpha snapshot, not validated for unattended
+production use, and not the Public Alpha (#255). It is not tagged or
+published yet; this heading gets its date when it is
+([Releasing](docs/releasing.md)). Until then, everything below is on `main`
+only.
+
+### PyPI publishing through Trusted Publishing (#295)
+
+- New workflow `pypi-publish` (`.github/workflows/pypi-publish.yml`), run
+  only for a version tag `v*`: a `build` job without OIDC builds the sdist
+  and the wheel once with the dist check CI runs, after checking that the
+  tag is `v` and the package's version, and records their SHA-256; a
+  `publish` job in the protected `pypi` environment, the only one with
+  `id-token: write`, re-verifies exactly those files and uploads them with
+  attestations. Every action is pinned to a commit SHA; no PyPI token or
+  repository secret exists. Nothing is published until the maintainer has
+  done the one-time setup, pushed a tag and approved the deployment.
+- [Releasing](docs/releasing.md#publishing-to-pypi) documents that setup
+  (the PyPI pending trusted publisher, the `pypi` environment, the tag
+  ruleset), rehearsals, troubleshooting and the checks after an upload,
+  and the security preflight that keeps a public upload waiting while
+  #280 to #284 are open.
 
 ### License, packaging and installation (#256)
 

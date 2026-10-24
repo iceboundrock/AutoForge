@@ -223,7 +223,8 @@ docs/compatibility.md                  what AutoForge runs on (OS, Python, git, 
 docs/development.md                    make targets, CI, the built-distribution check, what a green
                                        `ci` does and does not prove
 docs/releasing.md                      distribution name, version and tag scheme, changelog, the
-                                       maintainer's release procedure
+                                       maintainer's release procedure, PyPI Trusted Publishing
+                                       (`pypi-publish.yml`) and its one-time setup
 docs/security.md                       operator guide: security boundaries, what AutoForge does and
                                        does not protect, GitHub token permissions, recommended settings
 README.md                              operator-facing landing page: overview, key properties,
