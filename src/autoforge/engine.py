@@ -497,6 +497,7 @@ from .sandbox_policy import (
     LaunchClass,
     LaunchFacts,
     SandboxPlan,
+    absolute_spelling,
     class_summary,
     config_file_problem,
     describe_launch,
@@ -1340,9 +1341,14 @@ def config_file_placement_problem(
     docs/security.md). Outside a git repository no launch writes a tree of
     it, so nothing is refused there; a registry that cannot be listed is a
     refusal, since nothing then shows the file outside every worktree.
+    ``config_file`` is the path the loader was given, unnormalized: a
+    caller that made it absolute with ``os.path.abspath`` would have
+    collapsed a ``..`` after a link, and the check would examine another
+    file than the one loaded (:func:`~autoforge.sandbox_policy.absolute_spelling`).
     """
     if not config_file or not cfg.sandbox.enabled:
         return ""
+    config_file = absolute_spelling(config_file)
     workspace = LocalWorkspace(workdir=workdir, runner=runner or execute)
     try:
         root = workspace.root()

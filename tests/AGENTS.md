@@ -217,7 +217,8 @@ sandbox pin and config placement      test_sandbox_pin.py (strength, the record,
                                       LOCAL; CLI: test_cli.py; load and protocol: test_state.py);
                                       the placement rule: test_sandbox_policy.py, doctor:
                                       test_doctor.py, worker: test_worker.py, real backend:
-                                      test_sandbox_routing.py
+                                      test_sandbox_routing.py; the `..` spellings CLI and
+                                      doctor share: conftest.dotdot_config_paths
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py
                                       (engine, REMOTE and LOCAL; load and protocol: test_state.py)
 candidate validation gates (#173)     test_validation_gates.py (producers, REVIEW entry, LOCAL

@@ -47,8 +47,9 @@ agent left there.
 Pure except for the compiler's ``realpath`` and ``lstat``, ``realpath`` of
 the environment's path values and ``lstat`` and ``readlink`` on their way,
 the first line of an executable read for its interpreter, and the
-configuration file's lookup walk (``lstat`` and ``readlink``) and link
-count; nothing is created or launched here.
+configuration file's lookup walk (``lstat`` and ``readlink``, from the
+working directory for a relative path), its ``stat`` and link count;
+nothing is created or launched here.
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ import re
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from .child_env import OVERRIDE_PATH_NAMES
 from .errors import SandboxLaunchRefusedError, SandboxPolicyError
@@ -363,21 +365,48 @@ def operator_path_problem(operator_paths: tuple[str, ...], denied_roots: tuple[s
 _MAX_LOOKUP_LINKS = 40
 
 
+def absolute_spelling(path: str | os.PathLike[str]) -> str:
+    """``path`` as the configuration loader opens it, made absolute with every ``..`` kept (#280).
+
+    The loader opens ``Path(path)``, which drops only ``.`` components and
+    repeated slashes, and a relative path from the working directory: so
+    the working directory is joined to it and nothing else is collapsed.
+    ``os.path.abspath`` would remove ``name/..`` before ``name`` is
+    followed, and when ``name`` is a symbolic link what is left names
+    another file than the one ``open`` reaches. Whatever checks where the
+    file lies, records it or hands it to another process spells it so.
+    """
+    return os.fspath(Path(path).absolute())
+
+
 def lookup_directories(path: str) -> tuple[str, ...]:
     """Each directory, resolved, in which opening ``path`` looks up a name (#280).
 
     Whoever can write one of them can replace what ``path`` opens: move the
-    entry away and put another file or a link in its place. The walk follows
-    symbolic links as the kernel does (a relative target from the directory
-    holding the link, an absolute one from ``/``), so a link inside a tree
-    and a link into one both show. It stops at a name that is not there, and
-    after more links than a lookup follows: nothing past either is reached
-    yet, and the directory the name was looked up in is already listed.
-    ``lstat`` and ``readlink`` only; nothing is opened.
+    entry away and put another file or a link in its place. A relative path
+    is walked from the working directory, and the path is taken as spelled
+    (:func:`absolute_spelling`): a ``..`` leads to the parent of the
+    directory the walk has reached, any link before it already followed, as
+    the kernel takes it, and a directory a name was looked up in stays
+    listed when a ``..`` leads back out of it. Symbolic links are followed
+    as the kernel does (a relative target from the directory holding the
+    link, an absolute one from ``/``), so a link inside a tree and a link
+    into one both show. It stops at a name that is not there, and after more
+    links than a lookup follows: nothing past either is reached yet, and the
+    directory the name was looked up in is already listed. ``lstat`` and
+    ``readlink`` only; nothing is opened.
+    """
+    return _lookup(path)[0]
+
+
+def _lookup(path: str) -> tuple[tuple[str, ...], str]:
+    """:func:`lookup_directories`, and the entry the walk ends at, resolved.
+
+    The entry is "" when the walk stops before the last name.
     """
     looked_up: list[str] = []
     current = "/"
-    pending = [part for part in os.path.abspath(path).split("/") if part]
+    pending = [part for part in absolute_spelling(path).split("/") if part]
     links = 0
     while pending:
         name = pending.pop(0)
@@ -392,20 +421,20 @@ def lookup_directories(path: str) -> tuple[str, ...]:
         try:
             is_link = os.path.islink(entry)
             if not is_link and not os.path.lexists(entry):
-                break
+                return tuple(looked_up), ""
             target = os.readlink(entry) if is_link else ""
         except OSError:
-            break
+            return tuple(looked_up), ""
         if not is_link:
             current = entry
             continue
         links += 1
         if links > _MAX_LOOKUP_LINKS:
-            break
+            return tuple(looked_up), ""
         if target.startswith("/"):
             current = "/"
         pending[:0] = [part for part in target.split("/") if part]
-    return tuple(looked_up)
+    return tuple(looked_up), current
 
 
 def config_file_problem(config_file: str, written_roots: tuple[str, ...], mode: str) -> str:
@@ -420,11 +449,20 @@ def config_file_problem(config_file: str, written_roots: tuple[str, ...], mode: 
     would run on what such a file says: the sandbox mode, the controller's
     GitHub command and the commands of every profile ``doctor`` checks
     (#280). Both sides are compared resolved.
+
+    ``config_file`` is the path the loader was given, relative or not. It
+    is walked as spelled (:func:`absolute_spelling`), never normalized
+    first: a ``..`` after a link is taken where the link leads, so a file
+    in a root is not passed under the name of one beside it, and a path
+    that looks up a name in a root and leaves it again is within reach
+    there. The file examined is the one the path opens: the walk has to end
+    at it, or nothing shows where it is reached from and it is refused, and
+    its own link count is read.
     """
-    config_file = os.path.abspath(config_file)
+    config_file = absolute_spelling(config_file)
     direct = os.path.realpath(config_file) == config_file
     roots = [(root, os.path.realpath(root)) for root in written_roots]
-    walked = lookup_directories(config_file)
+    walked, reached = _lookup(config_file)
     for directory in walked:
         for root, resolved in roots:
             if _inside(directory, resolved):
@@ -441,9 +479,16 @@ def config_file_problem(config_file: str, written_roots: tuple[str, ...], mode: 
                     "or set sandbox.mode: disabled"
                 )
     try:
-        links = os.stat(config_file).st_nlink
+        opened = os.stat(config_file)
     except OSError:
         return ""
+    try:
+        followed = bool(reached) and os.path.samestat(opened, os.stat(reached))
+    except OSError:
+        followed = False
+    if not followed:
+        return _not_followed(config_file, mode)
+    links = opened.st_nlink
     if links > 1:
         return (
             f"the configuration file {config_file} has {links} hard links, and another one "
@@ -453,6 +498,15 @@ def config_file_problem(config_file: str, written_roots: tuple[str, ...], mode: 
             "repository and pass that path with --config, or set sandbox.mode: disabled"
         )
     return ""
+
+
+def _not_followed(config_file: str, mode: str) -> str:
+    return (
+        f"the configuration file {config_file} opens another file than its lookup walk was "
+        "followed to, so nothing shows that it lies outside every tree that launches inside "
+        f"the outer sandbox write (sandbox.mode is {mode}; #280). Pass the file's own path "
+        "with --config, or set sandbox.mode: disabled"
+    )
 
 
 @dataclass(frozen=True)

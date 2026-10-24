@@ -32,6 +32,7 @@ from autoforge.sandbox_policy import (
     LaunchClass,
     LaunchFacts,
     ProviderRequirements,
+    absolute_spelling,
     config_file_problem,
     describe_launch,
     executable_requirements,
@@ -769,3 +770,119 @@ def test_a_missing_configuration_file_is_judged_by_where_it_would_be(tmp_path):
     _, root, outside = _tree(tmp_path)
     assert "lies in" in config_file_problem(str(root / "conf" / "x.yaml"), (str(root),), "required")
     assert config_file_problem(str(outside / "x.yaml"), (str(root),), "required") == ""
+
+
+# A ``..`` is taken where the walk is, never collapsed first (#280, R2-F1): with
+# ``operator/alias`` a link to ``repo/conf``, ``operator/alias/../a.yaml`` opens
+# ``repo/a.yaml``, and ``os.path.abspath`` spells it ``operator/a.yaml``.
+
+
+def test_the_absolute_spelling_keeps_every_dotdot_and_joins_the_working_directory(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    here = os.getcwd()
+    assert absolute_spelling("alias/../a.yaml") == f"{here}/alias/../a.yaml"
+    assert absolute_spelling("../x/./a.yaml") == f"{here}/../x/a.yaml"
+    assert absolute_spelling("/operator//alias/../a.yaml") == "/operator/alias/../a.yaml"
+    assert absolute_spelling(Path("/operator/a.yaml")) == "/operator/a.yaml"
+
+
+def _dotdot_tree(tmp_path) -> tuple[Path, Path, Path]:
+    """``operator/{absolute,relative}`` link to ``repo/conf``; ``a.yaml`` in both parents."""
+    base, root, outside = _tree(tmp_path)
+    for directory in (root, outside):
+        (directory / "a.yaml").write_text("version: 1\n")
+    (outside / "absolute").symlink_to(root / "conf")
+    (outside / "relative").symlink_to(os.path.join("..", "repo", "conf"))
+    return base, root, outside
+
+
+@pytest.mark.parametrize("link", ["absolute", "relative"])
+def test_a_dotdot_after_a_link_into_a_written_root_is_refused(tmp_path, link):
+    _, root, outside = _dotdot_tree(tmp_path)
+    spelled = f"{outside}/{link}/../a.yaml"
+    assert os.path.realpath(spelled) == str(root / "a.yaml")  # what the loader opens
+    problem = config_file_problem(spelled, (str(root),), "required")
+    assert problem.startswith(f"the configuration file {spelled} is reached through {root}, ")
+    assert f", in {root}, a tree that " in problem
+    assert str(root) in lookup_directories(spelled)
+    # The lexically collapsed spelling is the operator's file, which passes.
+    assert config_file_problem(os.path.abspath(spelled), (str(root),), "required") == ""
+
+
+@pytest.mark.parametrize("link", ["absolute", "relative"])
+def test_a_relative_path_with_a_dotdot_after_a_link_is_walked_from_the_working_directory(
+    tmp_path, monkeypatch, link
+):
+    _, root, outside = _dotdot_tree(tmp_path)
+    monkeypatch.chdir(outside)
+    problem = config_file_problem(f"{link}/../a.yaml", (str(root),), "preferred")
+    assert problem.startswith(
+        f"the configuration file {os.getcwd()}/{link}/../a.yaml is reached through {root}, "
+    )
+    monkeypatch.chdir(root)  # from inside the root, a .. that leaves it looks up nothing there
+    assert config_file_problem("../operator/a.yaml", (str(root),), "required") == ""
+    assert "reached through" in config_file_problem(
+        f"../operator/{link}/../a.yaml", (str(root),), "required"
+    )
+
+
+def test_a_path_that_looks_up_a_name_in_a_written_root_and_leaves_it_is_refused(
+    tmp_path, monkeypatch
+):
+    """The file opened is outside, but the agent can replace ``conf``, which the
+    lookup goes through, with a link that keeps the ``..`` inside the root."""
+    base, root, outside = _dotdot_tree(tmp_path)
+    for spelled in (f"{root}/conf/../../operator/a.yaml", f"{root}/conf/../conf/../a.yaml"):
+        problem = config_file_problem(spelled, (str(root),), "required")
+        assert problem.startswith(f"the configuration file {spelled} is reached through "), spelled
+        assert f", in {root}, a tree that " in problem
+    monkeypatch.chdir(root)
+    problem = config_file_problem("conf/../../operator/a.yaml", (str(root),), "required")
+    assert f"is reached through {root}, in {root}" in problem
+    # A directory the walk passes outside every root, and back out of, is no reach.
+    (outside / "sub").mkdir()
+    assert config_file_problem(f"{outside}/sub/../a.yaml", (str(root),), "required") == ""
+
+
+def test_a_dotdot_after_a_link_that_stays_outside_every_written_root_passes(tmp_path):
+    base, root, outside = _tree(tmp_path)
+    elsewhere = base / "elsewhere"
+    (elsewhere / "conf").mkdir(parents=True)
+    (elsewhere / "a.yaml").write_text("version: 1\n")
+    (outside / "alias").symlink_to(elsewhere / "conf")
+    assert config_file_problem(f"{outside}/alias/../a.yaml", (str(root),), "required") == ""
+
+
+def test_the_hard_links_counted_are_the_file_opened(tmp_path):
+    """The lexical twin has one link; the file the path opens has two."""
+    base, root, outside = _tree(tmp_path)
+    elsewhere = base / "elsewhere"
+    (elsewhere / "conf").mkdir(parents=True)
+    (elsewhere / "a.yaml").write_text("version: 1\n")
+    os.link(elsewhere / "a.yaml", root / "conf" / "linked.yaml")
+    (outside / "a.yaml").write_text("version: 1\n")
+    (outside / "alias").symlink_to(elsewhere / "conf")
+    spelled = f"{outside}/alias/../a.yaml"
+    assert f"the configuration file {spelled} has 2 hard links" in config_file_problem(
+        spelled, (str(root),), "required"
+    )
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs Linux's /proc")
+def test_a_file_the_lookup_walk_does_not_end_at_is_refused(tmp_path):
+    """A /proc magic link reads as the path of a deleted file, which the walk
+    cannot follow, while ``open`` reaches the file anyway: the walk would
+    have examined something else than the file opened."""
+    _, root, outside = _tree(tmp_path)
+    cfg = outside / "a.yaml"
+    cfg.write_text("version: 1\n")
+    with open(cfg, encoding="utf-8") as handle:
+        cfg.unlink()
+        spelled = f"/proc/self/fd/{handle.fileno()}"
+        problem = config_file_problem(spelled, (str(root),), "required")
+    assert problem.startswith(
+        f"the configuration file {spelled} opens another file than its lookup walk was followed to"
+    )
+    assert "(sandbox.mode is required; #280)" in problem

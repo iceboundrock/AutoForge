@@ -121,6 +121,7 @@ from .redaction import redact, redact_argv, redact_dict
 from .replan_txn import ReplanTransaction
 from .run_namespace import namespace_issue_of_state_dir
 from .sandbox_pin import SandboxPin
+from .sandbox_policy import absolute_spelling
 from .scheduler import EpicScheduler, SchedulerInputs
 from .scheduler_stop import StopMode
 from .sdk_policy import MAX_ANSWER_CHARS
@@ -522,12 +523,12 @@ def _load_cfg(args) -> AutoForgeConfig:
     write is then a ConfigurationError (exit 2) for every command, before
     anything acts on what it says: no phase, launch or write follows, and no
     command it names runs (#280,
-    :func:`autoforge.engine.config_file_placement_problem`).
+    :func:`autoforge.engine.config_file_placement_problem`). The check is
+    given the path as the loader was, never normalized: a ``..`` after a
+    link names another file once collapsed.
     """
     cfg = load_config_file(args.config)
-    problem = config_file_placement_problem(
-        cfg, os.path.abspath(args.config) if args.config else ""
-    )
+    problem = config_file_placement_problem(cfg, args.config or "")
     if problem:
         raise ConfigurationError(f"{problem}. Nothing was run, launched or written.")
     return cfg
@@ -598,7 +599,7 @@ def _engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
     state_dir = args.state_dir or cfg.state_dir
     engine = ControllerEngine(config=cfg, state_dir=state_dir)
     engine.cli_global_flags = _global_flags(args)
-    engine.config_file = os.path.abspath(args.config) if args.config else ""
+    engine.config_file = absolute_spelling(args.config) if args.config else ""
     return engine
 
 
@@ -1940,7 +1941,7 @@ def cmd_epic_run(args, *, resume: bool) -> int:
         epic_url=epic_url,
         config=cfg,
         graph=graph,
-        config_path=os.path.abspath(args.config) if args.config else "",
+        config_path=absolute_spelling(args.config) if args.config else "",
         max_parallel=args.max_parallel,
         accept_config_change=resume and args.accept_config_change,
         standalone_state_dir=standalone,

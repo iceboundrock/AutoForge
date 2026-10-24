@@ -1,6 +1,8 @@
 """Doctor: read-only checks with a fake command runner."""
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -10,7 +12,7 @@ from autoforge.doctor import Doctor
 from autoforge.executor import ExecutionResult, execute
 from autoforge.profiles import local_required_profiles
 from autoforge.redaction import redact
-from tests.conftest import is_shell_probe
+from tests.conftest import DOTDOT_SPELLINGS, dotdot_config_paths, is_shell_probe
 
 RULES_ENDPOINT = "repos/owner/repo/rules/branches/main"
 RULESET_ENDPOINT = "repos/owner/repo/rulesets/22792049"
@@ -390,6 +392,33 @@ def test_doctor_fails_a_config_whose_routing_a_remote_run_could_not_record(tmp_p
     assert local.check_config(local_required_profiles).ok
 
 
+# The commands a configuration file of the placement tests names (#280).
+_NAMED = ("/opt/af-test/gh-from-config", "/opt/af-test/claude-from-config")
+
+
+def _placement_config(mode: str) -> str:
+    return json.dumps(
+        {
+            "version": 1,
+            "sandbox": {"mode": mode},
+            "github": {"command": _NAMED[0]},
+            "profiles": {"analyze_execute": {"command": _NAMED[1]}},
+        }
+    )
+
+
+def _placement_doctor(config, repo, calls: list[list[str]]) -> Doctor:
+    """A doctor of ``repo`` on ``config``: git's real layout, every other command scripted."""
+    fake = _runner_factory(calls=calls)
+
+    def runner(req):
+        if req.command[0] == "git" and "rev-parse" in req.command:
+            return execute(req)
+        return fake(req)
+
+    return Doctor(config_path=str(config), cwd=str(repo), runner=runner)
+
+
 @pytest.mark.parametrize("mode", ["required", "preferred"])
 def test_doctor_runs_nothing_a_config_inside_the_repository_names(tmp_path, mode):
     """#280: an enforced launch writes the checkout, so a configuration file
@@ -399,31 +428,14 @@ def test_doctor_runs_nothing_a_config_inside_the_repository_names(tmp_path, mode
     from tests.conftest import git_repo
 
     repo = git_repo(tmp_path / "repo")
-    data = {
-        "version": 1,
-        "sandbox": {"mode": mode},
-        "github": {"command": "/opt/af-test/gh-from-config"},
-        "profiles": {"analyze_execute": {"command": "/opt/af-test/claude-from-config"}},
-    }
     inside = repo / "autoforge.json"
     outside = tmp_path / "operator" / "autoforge.json"
     outside.parent.mkdir()
     for path in (inside, outside):
-        path.write_text(json.dumps(data))
-    named = ("/opt/af-test/gh-from-config", "/opt/af-test/claude-from-config")
-
-    def doctor(config, calls):
-        fake = _runner_factory(calls=calls)
-
-        def runner(req):  # the repository's real layout; every other command scripted
-            if req.command[0] == "git" and "rev-parse" in req.command:
-                return execute(req)
-            return fake(req)
-
-        return Doctor(config_path=str(config), cwd=str(repo), runner=runner)
+        path.write_text(_placement_config(mode))
 
     calls: list[list[str]] = []
-    d = doctor(inside, calls)
+    d = _placement_doctor(inside, repo, calls)
     rows = {r.name: r for r in d.run_all()}
     row = rows["config"]
     assert not row.ok and row.required
@@ -431,12 +443,52 @@ def test_doctor_runs_nothing_a_config_inside_the_repository_names(tmp_path, mode
     assert row.detail.endswith("; doctor runs no command this file names")
     assert d.config is None
     assert not any(name.startswith("agent ") for name in rows), sorted(rows)
-    assert not any(argv[0] in named for argv in calls), calls
+    assert not any(argv[0] in _NAMED for argv in calls), calls
 
     calls = []
-    rows = {r.name: r for r in doctor(outside, calls).run_all()}
+    rows = {r.name: r for r in _placement_doctor(outside, repo, calls).run_all()}
     assert rows["config"].ok
-    assert {argv[0] for argv in calls} >= set(named)
+    assert {argv[0] for argv in calls} >= set(_NAMED)
+
+
+@pytest.mark.parametrize("spelling", DOTDOT_SPELLINGS)
+def test_doctor_runs_nothing_a_config_path_whose_dotdot_reaches_into_the_repository_names(
+    tmp_path, monkeypatch, spelling
+):
+    """#280 (R2-F1): doctor walks the path the loader opens, a ``..`` after a
+    link included: ``operator/<link>/../autoforge.json`` opens the
+    checkout's file, and ``conf/..`` looks up ``conf`` in the checkout before
+    leaving it, where an agent can replace it. The config row fails and no
+    command the file names runs, though the lexically collapsed path, the
+    operator's own file saying the same, would pass."""
+    from tests.conftest import git_repo
+
+    base = os.path.realpath(tmp_path)
+    repo = git_repo(Path(base) / "repo")
+    operator = Path(base) / "operator"
+    operator.mkdir()
+    for directory in (repo, operator):
+        (directory / "autoforge.json").write_text(_placement_config("required"))
+    spelled = dotdot_config_paths(repo, operator)[spelling]
+    monkeypatch.chdir(repo)  # the relative spellings are the checkout's
+    assert os.path.abspath(spelled) == str(operator / "autoforge.json")
+    calls: list[list[str]] = []
+    d = _placement_doctor(spelled, repo, calls)
+    rows = {r.name: r for r in d.run_all()}
+    row = rows["config"]
+    assert not row.ok and row.required
+    absolute = os.path.join(base, "repo", spelled)
+    assert row.detail.startswith(f"the configuration file {absolute} is reached through ")
+    assert f", in {repo}, a tree " in row.detail
+    assert row.detail.endswith("; doctor runs no command this file names")
+    assert d.config is None
+    assert not any(name.startswith("agent ") for name in rows), sorted(rows)
+    assert not any(argv[0] in _NAMED for argv in calls), calls
+
+    calls = []  # the collapsed path is the operator's file, whose commands doctor runs
+    rows = {r.name: r for r in _placement_doctor(os.path.abspath(spelled), repo, calls).run_all()}
+    assert rows["config"].ok
+    assert {argv[0] for argv in calls} >= set(_NAMED)
 
 
 def test_failures_are_reported_not_raised(tmp_path):

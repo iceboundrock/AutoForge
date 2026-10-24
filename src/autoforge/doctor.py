@@ -261,12 +261,7 @@ class Doctor:
         # ``github.command``).
         from .engine import config_file_placement_problem
 
-        problem = config_file_placement_problem(
-            cfg,
-            os.path.abspath(self.config_path) if self.config_path else "",
-            self.cwd,
-            self.runner,
-        )
+        problem = config_file_placement_problem(cfg, self.config_path or "", self.cwd, self.runner)
         if problem:
             return CheckResult(
                 "config", False, f"{problem}; doctor runs no command this file names"

@@ -22,6 +22,7 @@ from autoforge.state import AutoForgeState, load_state, quarantine_state_file, s
 from autoforge.transitions import Phase, WorkflowMode
 from tests.conftest import (
     BRANCH,
+    DOTDOT_SPELLINGS,
     EPIC,
     FOLLOW_UP_TEXT,
     FOLLOW_UP_TITLE,
@@ -35,6 +36,7 @@ from tests.conftest import (
     ci_check,
     comment_url,
     connect_origin,
+    dotdot_config_paths,
     fixed,
     fixer,
     git_repo,
@@ -3313,6 +3315,58 @@ def test_an_enforced_run_refuses_a_config_file_inside_the_repository(
     disabled = _config(tmp_path / "conf" / "disabled.json", sandbox={"mode": "disabled"})
     capsys.readouterr()
     assert cli.main(["--config", disabled, "--state-dir", sd, "status"]) == 0
+
+
+@pytest.mark.parametrize("spelling", DOTDOT_SPELLINGS)
+def test_an_enforced_run_refuses_a_config_path_whose_dotdot_reaches_into_the_repository(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes, spelling
+):
+    """#280 (R2-F1): the check walks the path the loader opens, a ``..`` after
+    a link included, and a path that looks up a name in the checkout is
+    within reach even when it leaves it again (an agent can replace ``conf``
+    with a link that keeps the ``..`` inside). Refused before anything is
+    run, launched or written, though the lexically collapsed path, the
+    operator's own file, would pass."""
+    monkeypatch.chdir(tmp_path)
+    operator = Path(os.path.realpath(tmp_path_factory.mktemp("operator")))
+    _config(tmp_path / "autoforge.json", sandbox={"mode": "required"})  # an agent can rewrite
+    twin = _config(operator / "autoforge.json", sandbox={"mode": "required"})
+    spelled = dotdot_config_paths(Path(os.getcwd()), operator)[spelling]
+    assert os.path.abspath(spelled) == twin
+    sd = str(tmp_path / ".autoforge")
+    run = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    for argv in (run, [*run, "--dry-run"], ["--state-dir", sd, "status"]):
+        assert cli.main(["--config", spelled, *argv]) == 2
+        err = capsys.readouterr().err
+        absolute = os.path.join(os.getcwd(), spelled)
+        assert f"autoforge: error: the configuration file {absolute} is reached through " in err
+        assert "(sandbox.mode is required)" in err
+        assert "Nothing was run, launched or written." in err
+    assert _files(sd) == {}
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+
+
+def test_a_config_path_whose_dotdot_stays_outside_is_loaded_and_recorded_as_spelled(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes
+):
+    """#280 (R2-F1): a ``..`` after a link that leads outside every tree is
+    accepted, and the run records the path as spelled: collapsed, it would
+    name another file, which a resume line would then load."""
+    monkeypatch.chdir(tmp_path)
+    operator = Path(os.path.realpath(tmp_path_factory.mktemp("operator")))
+    elsewhere = Path(os.path.realpath(tmp_path_factory.mktemp("elsewhere")))
+    (elsewhere / "conf").mkdir()
+    _config(elsewhere / "autoforge.json", sandbox={"mode": "required"})
+    (operator / "away").symlink_to(elsewhere / "conf")
+    spelled = f"{operator}/away/../autoforge.json"
+    sd = str(tmp_path / ".autoforge")
+    run = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(["--config", spelled, *run]) == 0
+    recorded = load_state(os.path.join(sd, "state.json")).config_fingerprint
+    assert recorded["config_file"] == spelled
+    capsys.readouterr()
+    assert cli.main(["--config", spelled, "--state-dir", sd, "status"]) == 0
+    assert f"Config:     --config {spelled} (created " in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("pinned", ["required", "preferred"])

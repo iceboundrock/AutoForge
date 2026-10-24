@@ -5,8 +5,9 @@ started by the Claude Code adapter in a REMOTE issue worktree commits
 through the overlay and the controller imports its commit; a LOCAL
 validation command cannot write the git directory; a LOCAL agent reaches a
 configuration file in its root, which is why one there is refused (#280),
-and none outside it; an export command sees only its tree, without a
-network when asked. The module skips with the
+and none outside it, and redirects a path that passes through its root
+before a ``..``; an export command sees only its tree, without a network
+when asked. The module skips with the
 probe's reason on a host that cannot enforce a launch, as
 ``test_sandbox_bwrap.py`` does.
 """
@@ -873,6 +874,63 @@ def test_a_local_agent_reaches_a_config_file_in_its_root_and_none_outside(backen
     assert in_home.read_bytes() == _CONFIG_TEXT.encode()  # the launch's home is its own
     for config in (elsewhere, in_home):
         assert config_file_problem(str(config), (str(repo),), "required") == ""
+
+
+def test_a_local_agent_rewrites_what_a_dotdot_spelling_opens_which_is_why_it_is_refused(
+    backend, layout
+):
+    """#280 (R2-F1) through the real backend. ``operator/alias`` links to the
+    root's ``linked``, so ``operator/alias/../autoforge.json`` opens the
+    root's file, which an enforced LOCAL agent rewrites.
+    ``repo/passed/../../operator/autoforge.json`` opens the operator's own
+    file, outside the root, but looks up ``passed`` in it: the agent
+    replaces ``passed`` with a link that keeps the ``..`` in the root, and
+    the path then opens a file it wrote. The check refuses both before the
+    launch; collapsed by ``os.path.abspath``, both name the operator's file,
+    which passes and is untouched."""
+    from dataclasses import replace
+
+    paths = layout
+    repo = paths["repo"]
+    _sentinel(repo / "autoforge.json", _CONFIG_TEXT)
+    _sentinel(repo / "linked" / "keep.txt")
+    _sentinel(repo / "passed" / "keep.txt")
+    twin = _sentinel(paths["base"] / "operator" / "autoforge.json", _CONFIG_TEXT)
+    (twin.parent / "alias").symlink_to(repo / "linked")
+    through_link = f"{twin.parent}/alias/../autoforge.json"
+    leaving = f"{repo}/passed/../../operator/autoforge.json"
+    assert os.path.realpath(leaving) == str(twin)  # outside the root, until the launch
+    for spelled in (through_link, leaving):
+        assert "is reached through" in config_file_problem(spelled, (str(repo),), "required")
+        assert os.path.abspath(spelled) == str(twin)
+        assert config_file_problem(os.path.abspath(spelled), (str(repo),), "required") == ""
+    facts = replace(_local_facts(paths), launch_class=LaunchClass.LOCAL_AGENT)
+    payload = '{"version": 1, "sandbox": {"mode": "required"}, "github": {"command": "/x"}}\n'
+    code = (
+        f"payload = {payload!r}\n"
+        "def rewrite(path):\n"
+        "    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)\n"
+        "    with open(path + '.new', 'w') as fh:\n"
+        "        fh.write(payload)\n"
+        "    os.replace(path + '.new', path)\n"
+        "def redirect():\n"
+        "    os.makedirs('x/y')\n"
+        "    os.rename('passed', 'passed.moved')\n"
+        "    os.symlink('x/y', 'passed')\n"
+        "report = {\n"
+        "  'file': attempt(lambda: rewrite('autoforge.json')),\n"
+        "  'passed': attempt(redirect),\n"
+        "  'planted': attempt(lambda: rewrite('operator/autoforge.json')),\n"
+        "}\n"
+        "print(json.dumps(report))\n"
+    )
+    report = _probe(describe_launch(facts, None, {}), repo, code)
+    assert report == {"file": "ok", "passed": "ok", "planted": "ok"}, report
+    for spelled in (through_link, leaving):
+        with open(spelled, encoding="utf-8") as handle:
+            assert handle.read() == payload, spelled  # what the agent wrote
+        assert "is reached through" in config_file_problem(spelled, (str(repo),), "required")
+    assert twin.read_bytes() == _CONFIG_TEXT.encode()
 
 
 def test_a_required_local_run_with_its_config_file_in_the_root_launches_nothing(
