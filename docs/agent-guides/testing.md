@@ -1448,6 +1448,9 @@ without building:
   sdist and wheel and refuse one that misses a template, carries a stray
   test, or has wrong metadata (name, version, license expression, metadata
   version, `Requires-Python`, a dependency outside an extra)
+- its REMOTE dry-run check, run on a stand-in for the installed command
+  with real git and a recording fake `gh`, refuses a `gh` call, any write
+  to the scratch repository (`.git` included) and an unrendered variable
 
 `make dist-check` (CI's `dist` job, on every CI Python) builds the real
 artifacts and runs the installed wheel outside the checkout
