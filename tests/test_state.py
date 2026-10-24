@@ -2030,7 +2030,7 @@ def _effect_fields(source):
 def test_the_controller_speaks_protocol_11():
     """ADR 0004 D13.1: #160 is protocol 7, #211 (the acceptance comment, K9) is 8,
     #219 (the recorded configuration) is 9, #172 (validation evidence) is 10,
-    #243 (operator actions, K10) is 11; 6 is reserved for #126."""
+    #243 (operator actions, K10) is 11; 6 is skipped for good."""
     from autoforge import __protocol_version__
 
     assert __protocol_version__ == "11"
@@ -3424,10 +3424,11 @@ def test_a_legacy_file_with_effect_fields_at_their_empty_values_loads(tmp_path):
 
 @pytest.mark.parametrize("protocol", ["6", "12", 7, 8, 9, 10, 11])
 def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(tmp_path, protocol):
-    """D13.1: protocol 6 is reserved for #126 and was never written by any
-    released controller, so it is not a legacy label this controller migrates;
-    it is refused exactly like a future label (and a non-string label), and the
-    file is not rewritten. Pinned so that adopting 6 is a deliberate change."""
+    """D13.1: protocol 6 is skipped for good (it was once reserved for #126) and
+    was never written by any released controller, so it is not a legacy label
+    this controller migrates; it is refused exactly like a future label (and a
+    non-string label), and the file is not rewritten. Pinned so that adopting 6
+    is a deliberate change."""
     d = make_state().to_dict()
     d["protocol_version"] = protocol
     p = _write(tmp_path / "state.json", d)

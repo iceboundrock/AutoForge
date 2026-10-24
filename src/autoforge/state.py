@@ -269,7 +269,7 @@ def _validate_local_pending(state: AutoForgeState) -> None:
 # review binding (``_REVIEW_BINDING_GAPS``), protocol 4 only the journal.
 # Protocol 5 is the last label before the controller owned external effects
 # (ADR 0004 D13.1, #160): it is the immediate predecessor of protocol 7 (6 is
-# reserved for #126) and is loaded under D13.2.
+# skipped for good, never written) and is loaded under D13.2.
 _LEGACY_PROTOCOLS = LEGACY_JOURNAL_PROTOCOLS | {"5"}
 # The label before the controller could publish an acceptance comment
 # (#211). A protocol-7 file is protocol 8's shape without the acceptance

@@ -348,6 +348,8 @@ merged without a human. `epic status` shows each child's category and next
 step without taking a lock, `epic stop` drains it, and `epic resume`
 recovers after a crash, a kill or a reboot
 ([Running an EPIC in parallel](docs/usage.md#running-an-epic-in-parallel)).
+It is experimental: it is verified offline only and has not yet driven a
+real EPIC ([Current maturity](#current-maturity)).
 
 ## Local mode (no GitHub)
 
@@ -439,27 +441,52 @@ repeated review with SHA binding → `READY_FOR_MERGE`; the bounded REVIEW/FIX
 loop with stagnation detection and the `REPLAN_REEXECUTE` transaction;
 journal-first recovery of an interrupted push or PR creation;
 bounded correction retry for malformed results; `doctor`; redacted
-per-invocation logs; LOCAL mode against a feature Markdown file; the outer
-sandbox on Linux (`sandbox.mode`, off by default), with its capability
-probe, pre-launch gate and `doctor` rows, its boundary tested across every
-provider path on a capable host (`make test-sandbox`). Hosted CI measures
-its runner on every run (its `bwrap`, user-namespace policy and Landlock
-ABI, in the job summary) and requires the real-backend tests wherever the
-runner can enforce; where it cannot, they skip with the probe's reason.
+per-invocation logs; LOCAL mode against a feature Markdown file.
 
-**Implemented and verified, but exercised only against the in-memory fake:**
-the controller-owned `MERGE` step behind the merge safety gate (off by
-default), including its pre-merge verification, and `UPDATE_EPIC`. Every
-claim these phases depend on is re-read from GitHub before state advances,
-but no automated test has ever merged a real PR or edited a real EPIC, so
-treat an opened gate as unproven against real services.
+**Opt-in, and only on a host that can enforce it:** the outer sandbox on
+Linux (`sandbox.mode`, off by default), with its capability probe,
+pre-launch gate and `doctor` rows. It needs Linux 6.12+ with Landlock ABI 6,
+unprivileged user, PID and IPC namespaces (some distributions restrict
+them), and a bubblewrap that can mount an overlay (0.11 or later)
+([ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md)).
+`sandbox.mode: disabled` and a `preferred` fallback are not sandboxed. Its
+boundary is tested across every provider path on a capable host
+(`make test-sandbox`). Hosted CI measures its runner on every run (its
+`bwrap`, user-namespace policy and Landlock ABI, in the job summary) and
+requires the real-backend tests wherever the runner can enforce; where it
+cannot, they skip with the probe's reason. It is experimental until a
+`make test-sandbox` run on a capable host is recorded at the release
+candidate.
 
-**Implemented and verified offline, new:** the parallel EPIC scheduler
-(`autoforge epic run|resume|status|stop|archive`, ADR 0008). Its crash
-windows are tested by killing real scheduler and worker processes at each
-one, but against the in-memory GitHub and scripted agents only, and it has
-not yet driven a real EPIC: run it on an EPIC you watch, with `epic status`
-open.
+**Experimental: implemented and verified, but exercised only against the
+in-memory fake:** the controller-owned `MERGE` step behind the merge safety
+gate (off by default), including its pre-merge verification, and
+`UPDATE_EPIC`. Every claim these phases depend on is re-read from GitHub
+before state advances, but no automated test has ever merged a real PR or
+edited a real EPIC, so treat an opened gate as unproven against real
+services. The supported path keeps the gate closed: a human reviews and
+merges the PR the run leaves at `READY_FOR_MERGE`.
+
+**Experimental: implemented and verified offline:** the parallel EPIC
+scheduler (`autoforge epic run|resume|status|stop|archive`, ADR 0008). Its
+crash windows are tested by killing real scheduler and worker processes at
+each one, but against the in-memory GitHub and scripted agents only, and it
+has not yet driven a real EPIC: run it on an EPIC you watch, with
+`epic status` open.
+
+**Experimental:** acceptance actions on other issues, which the operator
+posts or binds (`unblock --bind-evidence`, #243). They are tested offline
+and have been used once for real, in a run on this repository. They stay
+experimental until they are used on a repository other than AutoForge.
+
+**Experimental and opt-in:** Pi as a provider (`provider: pi`, the
+[Pi operator guide](docs/pi.md)). No built-in profile uses it, and its one
+recorded live run is a LOCAL review on DeepSeek (#135).
+
+The Public Alpha release claims these capabilities at exactly these levels
+([#255](https://github.com/iceboundrock/AutoForge/issues/255), conditions
+C1–C7). An earlier registration prerelease of the package (#295) is not the
+Public Alpha and claims no more than this.
 
 **Explicitly not yet:** unattended production operation; the controller
 feeding CI results into the review prompt (the reviewer is asked to inspect
