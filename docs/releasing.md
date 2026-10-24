@@ -85,6 +85,10 @@ with the date.
 
 ## Procedure
 
+Run every step from your checkout of this repository, whose `origin` is
+`iceboundrock/AutoForge` on GitHub: step 6 pushes the tag to `origin`, and
+step 8's `gh` commands find the repository from it.
+
 1. **Release-prep pull request.** From a feature branch, never on `main`:
    set the version in `pyproject.toml` and `src/autoforge/__init__.py`
    (`main`'s development version without its `.devM` suffix);
@@ -109,13 +113,15 @@ with the date.
    ```
 
 5. **Rehearse the build, from the tag.** From a clean checkout of the
-   tag, run exactly what the workflow's `build` job will run:
+   tag, run exactly what the workflow's `build` job will run. The
+   subshell leaves your shell in your checkout: the clone's `origin` is
+   that local checkout, not GitHub.
 
    ```bash
    git clone --quiet --branch v0.1.0a0 --depth 1 "file://$PWD" ../release/src
-   cd ../release/src
-   uv run --no-project --python 3.12 python -I tests/dist_check.py \
-     --release-tag v0.1.0a0 --out-dir ../rehearsal --sha256sums ../rehearsal.sha256
+   (cd ../release/src &&
+     uv run --no-project --python 3.12 python -I tests/dist_check.py \
+       --release-tag v0.1.0a0 --out-dir ../rehearsal --sha256sums ../rehearsal.sha256)
    ```
 
    This refuses a tag that does not name the version, builds the sdist and
