@@ -75,6 +75,7 @@ from tests.conftest import (
     ACCEPTANCE_TEXT,
     BASE_RUN_ID,
     BRANCH,
+    CHECKS_REFUSAL,
     CI_RUN_ID,
     CI_WORKFLOW_ID,
     EPIC,
@@ -6197,9 +6198,107 @@ def test_a_refused_checks_read_blocks_the_merge_gate_and_names_the_remedy(
     else:
         assert "cannot be given Checks: read" in s.block_reason
     assert "`gh auth login`" in s.block_reason and "`repo` scope" in s.block_reason
+    assert "already MERGED" not in s.block_reason
     assert fake_github.merges == [] and s.counted_merged_prs == []
-    # One checks read; nothing after it.
-    assert fake_github.calls[before:] == [("get_pr_with_checks", PR)]
+    # One checks read, then one identity read that only tells an already
+    # merged PR apart (#291 review R2); nothing else.
+    assert fake_github.calls[before:] == [("get_pr_with_checks", PR), ("get_pr", PR)]
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_a_refused_checks_read_of_a_merged_pr_says_it_merged_and_was_not_counted(
+    tmp_state_dir, fake_github, phase
+):
+    """#291 (review R2): a MERGE crash recovery, or a human's merge that
+    ``unblock`` sent to READY_FOR_MERGE, with a credential refused the checks.
+
+    The reason says what GitHub holds (merged, at which head) instead of
+    "nothing was merged", and stays a BLOCKED: the merge is never
+    reconciled or counted on the identity read alone.
+    """
+    fake_github.add_pr(head_sha=SHA_A, state="MERGED")
+    fake_github.checks_error = checks_refused()
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    before = len(fake_github.calls)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.attempt == 0
+    assert f"PR {PR} is already MERGED on GitHub (head {SHA_A[:12]})" in s.block_reason
+    assert "cannot reconcile or count that merge" in s.block_reason
+    assert "the merge was not counted" in s.block_reason
+    assert "Resource not accessible by personal access token" in s.block_reason
+    assert "`gh auth login`" in s.block_reason
+    assert "nothing was merged" not in s.block_reason
+    assert s.counted_merged_prs == [] and fake_github.merges == []
+    assert fake_github.calls[before:] == [("get_pr_with_checks", PR), ("get_pr", PR)]
+
+
+def test_a_refused_checks_read_keeps_the_general_reason_when_the_pr_cannot_be_read(
+    tmp_state_dir, fake_github
+):
+    """#291 (review R2): an identity read that fails too says nothing about a merge."""
+    fake_github.add_pr(head_sha=SHA_A, state="MERGED")
+    fake_github.checks_error = checks_refused()
+    fake_github.get_pr_error = GitHubUnavailableError("`gh pr view` failed: connection reset")
+    eng = _in_merge(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert f"the check results of PR {PR} could not be read" in s.block_reason
+    assert "already MERGED" not in s.block_reason
+    assert s.counted_merged_prs == [] and fake_github.merges == []
+
+
+@pytest.mark.parametrize("pr_state", ["OPEN", "MERGED"])
+def test_the_recorded_refusal_through_the_real_client_blocks_the_gate(tmp_state_dir, pr_state):
+    """#291 (review R8): GitHub's recorded refusal, through the real GitHubClient.
+
+    The scripted `gh` fails the checks read with the stderr #257 recorded and
+    answers the identity read; the real client classifies the refusal, and
+    the READY_FOR_MERGE gate blocks with the credential's remedy, after one
+    checks read (never retried) and one identity read. Nothing is merged.
+    """
+    calls: list[list[str]] = []
+    row = {
+        "url": PR,
+        "number": 42,
+        "title": "PR",
+        "state": pr_state,
+        "headRefOid": SHA_A,
+        "baseRefName": "main",
+        "headRefName": BRANCH,
+        "mergeable": "MERGEABLE",
+    }
+
+    def gh_runner(req):
+        calls.append(req.command)
+        fields = req.command[req.command.index("--json") + 1].split(",")
+        refused = "statusCheckRollup" in fields
+        return ExecutionResult(
+            command=req.command,
+            cwd=None,
+            exit_code=1 if refused else 0,
+            stdout="" if refused else json.dumps(row),
+            stderr=CHECKS_REFUSAL.format(credential="personal access token") + "\n"
+            if refused
+            else "",
+            started_at="",
+            finished_at="",
+        )
+
+    gh = GitHubClient(runner=gh_runner, retry_delay_seconds=0, transient_retries=2)
+    eng = _in_merge(tmp_state_dir, gh, phase=Phase.READY_FOR_MERGE)  # type: ignore[arg-type]
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.attempt == 0
+    assert "Resource not accessible by personal access token" in s.block_reason
+    assert "cannot be given Checks: read" in s.block_reason
+    assert ("already MERGED" in s.block_reason) == (pr_state == "MERGED")
+    assert len(calls) == 2 and all(cmd[1:3] == ["pr", "view"] for cmd in calls)
+    assert "statusCheckRollup" in calls[0][calls[0].index("--json") + 1]
+    assert "statusCheckRollup" not in calls[1][calls[1].index("--json") + 1]
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])

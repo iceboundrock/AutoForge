@@ -922,7 +922,10 @@ a stated reason it has none. The coverage that must keep working:
   rollup is conclusive; `pr_exists` answers `False` only on a not-found;
   under the refusal `REVIEW` and `FIX` launch (the reviewer's `checks.md`
   says the checks are unknown) and `READY_FOR_MERGE` / `MERGE` block with
-  the credential's remedy after one read, nothing merged; `doctor`'s
+  the credential's remedy after one checks read and one identity read,
+  nothing merged, an already merged PR named as merged and not counted,
+  and GitHub's recorded refusal driven through the real client into the
+  gate; a refusal before a transient-looking tail is still the refusal; `doctor`'s
   checks-read row is PASS only on a check run read, DENIED (FAIL with the
   gate open, WARN closed) on a refusal, UNKNOWN without a candidate, on
   statuses only, a plan limit, a not-found or a transient failure, and

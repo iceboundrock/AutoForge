@@ -365,7 +365,11 @@ was not tried):
   read the check results, and GitHub's refusal is `BLOCKED` at once, with a
   reason naming the credential and the remedy below. Nothing is merged or
   counted, and no re-check is spent, since it would read the same refusal.
-  Change the credential, then `unblock`.
+  Change the credential, then `unblock`. A pull request merged by hand, or
+  by a `MERGE` that crashed before it recorded the merge, is named as
+  merged in that reason, but the controller does not count a merge it
+  could not check, so with such a credential the run cannot reach
+  `UPDATE_EPIC`.
 - **`doctor` detects it.** Its "pull request check runs readable" row makes
   the merge gate's checks read on an open pull request whose head has a
   check run: PASS when it read one, DENIED when GitHub refused it (a FAIL
