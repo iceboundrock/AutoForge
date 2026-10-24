@@ -44,7 +44,7 @@ description of how AutoForge behaves.
 | Document | Read it for |
 |---|---|
 | [Development](development.md) | `make` targets, CI, the built-distribution check, and what a green `ci` does and does not prove |
-| [Releasing](releasing.md) | the distribution name, the version and tag scheme, the changelog, and the maintainer's procedure for building, tagging, publishing and verifying a release |
+| [Releasing](releasing.md) | the distribution name, the version and tag scheme, the changelog, and the maintainer's procedure for building, tagging, publishing and verifying a release; the `pypi-publish` workflow, Trusted Publishing's one-time PyPI and GitHub setup, troubleshooting, and why the first upload is not the Public Alpha's Go |
 | [Testing](agent-guides/testing.md) | the coverage contract and high-priority test areas |
 | [Test scope](../tests/AGENTS.md) | fixtures and fakes, and what a test may never do |
 | [AGENTS.md](../AGENTS.md) | the repository contract: precedence, safety invariants, routing rules for which guide to read before a change |

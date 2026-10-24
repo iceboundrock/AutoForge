@@ -252,9 +252,11 @@ LOCAL mode                            test_local*.py
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
 packaging, built artifacts (#256)     test_packaging.py (metadata, license, version, declared package
                                       data, resource reads, classifiers; the artifact checks on
-                                      synthetic files and the REMOTE dry-run check),
-                                      tests/dist_check.py (no test: what
-                                      `make dist-check` and CI's `dist` job run)
+                                      synthetic files, the REMOTE dry-run check, the release
+                                      tag check, the digests handed on and the hashed build
+                                      constraints), tests/dist_check.py (no test: what
+                                      `make dist-check`, CI's `dist` job and the release build
+                                      run); the PyPI workflow (#295): test_publish_workflow.py
 launch environment, no credential     test_child_env.py (engine and doctor: test_engine.py,
                                       test_integration.py, test_local.py, test_doctor.py)
 agent read context                    test_read_context.py (collection: test_engine.py,
