@@ -122,6 +122,17 @@ the file valid.
   config loader rather than silently disabling the rule.
 - `safety.protected_merge_paths: []` disables that gate; leaving the key
   empty (`null`) is a configuration error rather than a silent opt-out.
+- `safety.verify_check_definition: false` and `safety.required_checks: []`
+  turn off the check-definition comparison; they do not let a PR without
+  checks through. The merge gate refuses a status rollup that holds no check,
+  or no successful one (only `NEUTRAL` or `SKIPPED` entries), under every
+  configuration (#289), and requires every check it holds to have passed.
+  `required_checks` is also what `autoforge doctor` expects the default
+  branch to require: an empty list asks only that *some* check is required,
+  and a requirement doctor cannot verify (GitHub's plan offers no rulesets
+  there, the token may not read them, GitHub could not be read, or a
+  ruleset's bypass list is hidden without a word on this token) is a `FAIL`
+  while `safety.allow_merge: true` (#289).
 - `safety.acceptance_actions` is `off`, `approve` (the default) or `auto`
   (a bare YAML `off`, read as false, means `off`); anything else is a
   configuration error. It decides who authorizes the one comment a `FIX`

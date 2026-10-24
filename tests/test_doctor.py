@@ -34,7 +34,8 @@ def _status_rule(*contexts, ruleset_id=22792049):
 
 def _ruleset(enforcement="active", bypass_actors=(), can_bypass="never", ruleset_id=22792049):
     """``bypass_actors=None`` is the field GitHub withholds from a token without
-    write access to the ruleset (the read itself still succeeds)."""
+    write access to the ruleset (the read itself still succeeds);
+    ``can_bypass=None`` is an answer without ``current_user_can_bypass``."""
     data = {
         "id": ruleset_id,
         "name": "main",
@@ -48,6 +49,8 @@ def _ruleset(enforcement="active", bypass_actors=(), can_bypass="never", ruleset
     }
     if bypass_actors is None:
         del data["bypass_actors"]
+    if can_bypass is None:
+        del data["current_user_can_bypass"]
     return data
 
 
@@ -58,6 +61,52 @@ HEALTHY_GITHUB = {
     RULESETS_ENDPOINT: [_ruleset()],
     PROTECTION_ENDPOINT: (1, "gh: Branch not protected (HTTP 404)"),
 }
+
+
+# The open PR the checks-read row probes (#291), and what `gh` answers for it.
+PROBE_PR = "https://github.com/owner/repo/pull/7"
+CHECK_RUN = {
+    "__typename": "CheckRun",
+    "name": "ci",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "workflowName": "CI",
+}
+STATUS_CONTEXT = {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS"}
+
+
+def _probe_listing(*prs):
+    """The candidate listing's GraphQL answer: ``(number, totalCount)`` per open PR."""
+    nodes = [
+        {
+            "url": f"https://github.com/owner/repo/pull/{number}",
+            "number": number,
+            "commits": {
+                "nodes": [
+                    {
+                        "commit": {
+                            "oid": "a" * 40,
+                            "statusCheckRollup": {"contexts": {"totalCount": total}},
+                        }
+                    }
+                ]
+            },
+        }
+        for number, total in prs
+    ]
+    return {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
+
+
+HEALTHY_PROBE = _probe_listing((7, 1))
+HEALTHY_PR_VIEWS = {PROBE_PR: [CHECK_RUN]}
+# GitHub's answer to a fine-grained token reading a private PR's check runs (#291).
+ROLLUP_REFUSED = (
+    "GraphQL: Resource not accessible by personal access token "
+    "(repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup.contexts.nodes.0)"
+)
+PLAN_LIMITED = (
+    "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+)
 
 
 # What a recent enough `gh --version` prints (first line).
@@ -91,6 +140,8 @@ def _runner_factory(
     opencode_code=0,
     git_config="",
     claude_help=CLAUDE_HELP,
+    checks_probe=HEALTHY_PROBE,
+    pr_views=None,
 ):
     """Fake runner. ``github`` maps a `gh api` endpoint to its JSON payload, or to
     an ``(exit_code, stderr)`` pair for a failed read; ``--paginate --slurp``
@@ -98,9 +149,17 @@ def _runner_factory(
     is what an OpenCode command's ``--version`` prints (``None``: the binary
     is missing), with exit status ``opencode_code``. ``git_config`` is what
     the launch preflight's ``git config --list --show-scope -z`` prints, and
-    ``claude_help`` what ``claude --help`` does."""
+    ``claude_help`` what ``claude --help`` does. ``checks_probe`` is the
+    answer to the checks-read row's candidate listing (``gh api graphql``)
+    and ``pr_views`` maps a PR URL to its status-check rollup (``gh pr
+    view``), each an answer or an ``(exit_code, stderr)`` pair (#291)."""
     responses = dict(HEALTHY_GITHUB)
     responses.update(github or {})
+    views = HEALTHY_PR_VIEWS if pr_views is None else pr_views
+
+    def failed(argv, cwd, payload):
+        code, stderr = payload
+        return ExecutionResult(argv, cwd, code, "", stderr, "t", "t")
 
     def runner(req):
         if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
@@ -121,6 +180,28 @@ def _runner_factory(
             out = json.dumps(
                 {"nameWithOwner": "owner/repo", "defaultBranchRef": {"name": default_branch}}
             )
+        elif argv[:3] == ["gh", "api", "graphql"]:
+            if isinstance(checks_probe, tuple):
+                return failed(argv, req.cwd, checks_probe)
+            out = json.dumps(checks_probe)
+        elif argv[:3] == ["gh", "pr", "view"]:
+            url = argv[3]
+            if url not in views:
+                return ExecutionResult(argv, req.cwd, 1, "", f"unscripted {url}", "t", "t")
+            if isinstance(views[url], tuple):
+                return failed(argv, req.cwd, views[url])
+            row = {
+                "url": url,
+                "number": int(url.rsplit("/", 1)[1]),
+                "title": "PR",
+                "state": "OPEN",
+                "headRefOid": "a" * 40,
+                "baseRefName": "main",
+                "headRefName": "feature",
+            }
+            if "statusCheckRollup" in argv[argv.index("--json") + 1].split(","):
+                row["statusCheckRollup"] = views[url]
+            out = json.dumps(row)
         elif argv[:2] == ["gh", "api"]:
             endpoint = argv[-1]
             paginated = "--slurp" in argv
@@ -148,8 +229,15 @@ def _runner_factory(
     return runner
 
 
-def _required_checks(tmp_path, **kwargs):
-    d = Doctor(cwd=str(tmp_path), runner=_runner_factory(**kwargs))
+def _required_checks(tmp_path, gate_open=False, **kwargs):
+    """The required-check row of a full doctor run; ``gate_open`` sets
+    ``safety.allow_merge: true`` (the configuration's half of the gate)."""
+    config = None
+    if gate_open:
+        cfg = tmp_path / "gate-open.json"
+        cfg.write_text('{"version": 1, "safety": {"allow_merge": true}}')
+        config = str(cfg)
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory(**kwargs))
     return {r.name: r for r in d.run_all()}["default branch requires checks"]
 
 
@@ -173,6 +261,7 @@ def test_all_checks_pass(tmp_path):
         "cwd is a git repository",
         "GitHub remote",
         "default branch requires checks",
+        "pull request check runs readable",
         "state dir writable",
     ):
         assert expected in names
@@ -477,12 +566,20 @@ def test_required_check_present_and_enforced(tmp_path):
     # Effective rules are read with every page, and the ruleset once for its enforcement.
     assert ["gh", "api", "--paginate", "--slurp", RULES_ENDPOINT] in calls
     assert ["gh", "api", RULESET_ENDPOINT] in calls
-    # Every `gh api` call is a GET: `doctor` never mutates.
+    # Every REST `gh api` call is a GET: `doctor` never mutates.
     api_calls = [argv for argv in calls if argv[:2] == ["gh", "api"]]
-    assert api_calls
+    rest = [argv for argv in api_calls if argv[2] != "graphql"]
+    assert rest
     assert not any(
-        flag in argv for argv in api_calls for flag in ("-X", "--method", "-f", "-F", "--input")
+        flag in argv for argv in rest for flag in ("-X", "--method", "-f", "-F", "--input")
     )
+    # The checks-read row's candidate listing (#291) is GraphQL, which `gh`
+    # POSTs with `-f` fields: a query, never a mutation, and no other method.
+    graphql = [argv for argv in api_calls if argv[2] == "graphql"]
+    assert len(graphql) == 1
+    (query,) = [a for a in graphql[0] if a.startswith("query=")]
+    assert query.startswith("query=query(") and "mutation" not in query
+    assert not any(flag in graphql[0] for flag in ("-X", "--method", "-F", "--input"))
 
 
 def test_required_check_not_required_fails_with_remedy(tmp_path):
@@ -592,6 +689,41 @@ def test_required_check_hidden_bypass_actors_is_skipped_never_ok(tmp_path):
     assert "enforcement is 'evaluate', not 'active'" in check.detail
 
 
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_required_check_hidden_bypass_actors_when_github_says_this_token_never_bypasses(
+    tmp_path, gate_open
+):
+    """#289 (review R4): with ``current_user_can_bypass: never`` the controller's own login
+    cannot skip the rule, so the hidden list is a SKIP whatever the gate, never an OK."""
+    check = _required_checks(
+        tmp_path, gate_open=gate_open, github={RULESET_ENDPOINT: _ruleset(bypass_actors=None)}
+    )
+    assert check.skipped and not check.ok and not check.required, check
+    assert "'no bypass actors' is unverified" in check.detail
+
+
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_required_check_hidden_bypass_actors_without_a_word_on_this_token(tmp_path, gate_open):
+    """#289 (review R4): GitHub withholds the bypass list *and* does not say whether this
+    token may bypass the rule: the controller's own bypass is unverified. A FAIL with the
+    merge gate open, a SKIP that says why with it closed; never an OK."""
+    check = _required_checks(
+        tmp_path,
+        gate_open=gate_open,
+        github={RULESET_ENDPOINT: _ruleset(bypass_actors=None, can_bypass=None)},
+    )
+    assert not check.ok
+    assert check.detail.startswith("'main' requires: ci via ruleset #22792049")
+    assert "GitHub did not say whether this token may bypass the rule" in check.detail
+    assert "controller's own login can skip the required checks is unverified" in check.detail
+    if gate_open:
+        assert check.label == "FAIL" and check.required and not check.skipped
+        assert "run doctor with a login that has write access to the ruleset" in check.detail
+    else:
+        assert check.label == "SKIP" and check.skipped
+        assert "the merge gate is closed" in check.detail
+
+
 def test_required_check_token_that_can_bypass_fails_even_when_actors_are_hidden(tmp_path):
     """`current_user_can_bypass` is returned to every caller; a token that may bypass the
     rule is a bypass actor whether or not GitHub shows the list."""
@@ -604,25 +736,107 @@ def test_required_check_token_that_can_bypass_fails_even_when_actors_are_hidden(
         assert "ruleset 'main' (#22792049) can be bypassed by this token (always)" in check.detail
 
 
+DENIED_RULE_READS = (
+    "gh: Bad credentials (HTTP 401)",
+    "gh: Must have admin rights to Repository. (HTTP 403)",
+    "gh: Not Found (HTTP 404)",
+    "To get started with GitHub CLI, please run:  gh auth login",
+)
+
+
 def test_required_check_read_denied_is_skipped_not_failed(tmp_path):
-    """A token that may not read rulesets has not shown anything: SKIP, and doctor still passes."""
-    for stderr in (
-        "gh: Bad credentials (HTTP 401)",
-        "gh: Must have admin rights to Repository. (HTTP 403)",
-        "gh: Not Found (HTTP 404)",
-        "To get started with GitHub CLI, please run:  gh auth login",
-    ):
+    """With the merge gate closed, a token that may not read rulesets has not
+    shown anything: SKIP, and doctor still passes."""
+    for stderr in DENIED_RULE_READS:
         check = _required_checks(tmp_path, github={RULES_ENDPOINT: (1, stderr)})
         assert check.skipped and not check.ok and not check.required, (stderr, check)
         assert check.label == "SKIP"
         assert "cannot read the branch rules of owner/repo" in check.detail
+        assert "the merge gate is closed" in check.detail
+
+
+def test_required_check_read_denied_fails_with_the_merge_gate_open(tmp_path):
+    """#289: with safety.allow_merge=true an unverifiable requirement is a FAIL, never a SKIP."""
+    for stderr in DENIED_RULE_READS:
+        check = _required_checks(tmp_path, gate_open=True, github={RULES_ENDPOINT: (1, stderr)})
+        assert not check.ok and not check.skipped and check.required, (stderr, check)
+        assert check.label == "FAIL"
+        assert "cannot read the branch rules of owner/repo" in check.detail
+        assert "safety.allow_merge=true" in check.detail
+
+
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+@pytest.mark.parametrize(
+    "github",
+    [
+        {RULES_ENDPOINT: (1, PLAN_LIMITED)},
+        {RULES_ENDPOINT: [], PROTECTION_ENDPOINT: (1, PLAN_LIMITED)},
+        {RULES_ENDPOINT: [_status_rule("ci")], RULESET_ENDPOINT: (1, PLAN_LIMITED)},
+    ],
+    ids=["rules", "classic-protection", "ruleset"],
+)
+def test_required_check_plan_limit_names_the_plan_never_the_token(tmp_path, github, gate_open):
+    """#289: GitHub Free's 403 is the plan: named as such, never sent to token permissions.
+
+    A FAIL with the merge gate open (nothing can require the check), a SKIP
+    that says why with it closed; never an unverified OK.
+    """
+    check = _required_checks(tmp_path, gate_open=gate_open, github=github)
+    assert not check.ok
+    assert "does not offer rulesets or branch protection" in check.detail
+    assert "this is the plan, not the token" in check.detail
+    assert "GitHub Pro, Team or Enterprise" in check.detail
+    # Never the token's permissions.
+    assert "this token cannot read" not in check.detail
+    assert "Administration" not in check.detail
+    assert "readable" not in check.detail and "a login that may read" not in check.detail
+    if gate_open:
+        assert check.label == "FAIL" and check.required and not check.skipped
+        # The way out is the plan's (#289 review R5).
+        assert (
+            "make the repository public or move it to a plan that offers rules, or close the gate"
+            in check.detail
+        )
+    else:
+        assert check.label == "SKIP" and check.skipped
+        assert "the merge gate is closed" in check.detail
+
+
+def test_required_check_plan_limited_ruleset_listing_is_a_hint_only(tmp_path):
+    """The listing only makes the remedy concrete: its plan 403 changes no answer."""
+    check = _required_checks(
+        tmp_path, github={RULES_ENDPOINT: [], RULESETS_ENDPOINT: (1, PLAN_LIMITED)}
+    )
+    assert not check.ok and not check.skipped and check.required
+    assert "no rule requires a status check on 'main'" in check.detail
+    assert "Upgrade to GitHub" not in check.detail
+
+
+@pytest.mark.parametrize(
+    "github",
+    [
+        {RULES_ENDPOINT: (1, "error connecting to api.github.com")},
+        {RULES_ENDPOINT: [_status_rule("ci")], RULESET_ENDPOINT: (1, "HTTP 502: Bad Gateway")},
+        {RULES_ENDPOINT: [], PROTECTION_ENDPOINT: (1, "error connecting to api.github.com")},
+    ],
+    ids=["rules", "ruleset", "classic-protection"],
+)
+def test_required_check_transient_failure_fails_with_the_gate_open(tmp_path, github):
+    """#289 (review R1): with safety.allow_merge=true a requirement doctor could not
+    verify, for whatever reason, is a FAIL: a transient failure verified nothing."""
+    check = _required_checks(tmp_path, gate_open=True, github=github)
+    assert check.label == "FAIL" and check.required and not check.skipped, check
+    assert "GitHub could not be read (transient; run doctor again)" in check.detail
+    assert "safety.allow_merge=true" in check.detail and "run doctor again" in check.detail
 
 
 def test_required_check_transient_failure_is_skipped(tmp_path):
+    """With the merge gate closed, a transient failure is a SKIP that says why."""
     check = _required_checks(
         tmp_path, github={RULES_ENDPOINT: (1, "error connecting to api.github.com")}
     )
     assert check.skipped and "transient" in check.detail
+    assert "the merge gate is closed" in check.detail
 
 
 def test_required_check_other_conclusive_failure_is_reported(tmp_path):
@@ -668,6 +882,16 @@ def test_required_check_classic_protection_unreadable_is_skipped(tmp_path):
     )
     assert check.skipped
     assert "cannot read its classic branch protection" in check.detail
+    # With the merge gate open the same answer is a FAIL (#289).
+    check = _required_checks(
+        tmp_path,
+        gate_open=True,
+        github={
+            RULES_ENDPOINT: [],
+            PROTECTION_ENDPOINT: (1, "gh: Must have admin rights to Repository. (HTTP 403)"),
+        },
+    )
+    assert check.label == "FAIL" and "Administration: read" in check.detail
 
 
 def test_required_check_uses_configured_contexts(tmp_path):
@@ -709,6 +933,131 @@ def test_required_check_skipped_when_prerequisites_failed(tmp_path):
     d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
     check = {r.name: r for r in d.run_all()}["default branch requires checks"]
     assert check.skipped and check.detail == "(config check failed)"
+
+
+# -- the checks-read row (#291) ---------------------------------------------------
+CHECKS_READ_ROW = "pull request check runs readable"
+TOKEN = "ghp_" + "Q" * 36
+
+
+def _checks_read(tmp_path, *, gate_open=False, **kwargs):
+    """The checks-read row of a full doctor run, and every argv the run made."""
+    calls: list = []
+    config = None
+    if gate_open:
+        cfg = tmp_path / "gate.json"
+        cfg.write_text('{"version": 1, "safety": {"allow_merge": true}}')
+        config = str(cfg)
+    d = Doctor(config_path=config, cwd=str(tmp_path), runner=_runner_factory(calls=calls, **kwargs))
+    return {r.name: r for r in d.run_all()}[CHECKS_READ_ROW], calls
+
+
+def _pr_views(calls):
+    return [argv for argv in calls if argv[:3] == ["gh", "pr", "view"]]
+
+
+def test_checks_read_passes_only_on_the_merge_gate_s_own_read_of_a_check_run(tmp_path):
+    row, calls = _checks_read(tmp_path)
+    assert row.ok and row.label == "OK  " and row.detail.startswith("PASS: ")
+    assert PROBE_PR in row.detail and "1 of them check runs" in row.detail
+    # The controller's own checks read: the same `gh`, the rollup requested.
+    (view,) = _pr_views(calls)
+    assert view[:4] == ["gh", "pr", "view", PROBE_PR]
+    assert "statusCheckRollup" in view[view.index("--json") + 1].split(",")
+    # Read-only and token-free: no write, no `gh auth token`.
+    assert not any("token" in argv for argv in calls)
+    assert not any(a in ("-X", "--method") for argv in calls for a in argv)
+
+
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_checks_read_denied_names_the_credential_and_its_remedy(tmp_path, gate_open):
+    """GitHub's refusal is DENIED: a FAIL with the merge gate's config half open."""
+    row, calls = _checks_read(
+        tmp_path, gate_open=gate_open, pr_views={PROBE_PR: (1, ROLLUP_REFUSED)}
+    )
+    assert not row.ok and not row.skipped
+    assert row.label == ("FAIL" if gate_open else "WARN")
+    assert row.detail.startswith("DENIED: ")
+    assert "fine-grained personal access token cannot be given Checks: read" in row.detail
+    assert "`gh auth login`" in row.detail and "`repo` scope" in row.detail
+    assert "READY_FOR_MERGE" in row.detail
+    assert len(_pr_views(calls)) == 1  # a refusal is an answer: never retried
+
+
+def test_checks_read_without_a_candidate_is_unknown_never_a_pass(tmp_path):
+    row, calls = _checks_read(tmp_path, checks_probe=_probe_listing((8, 0)))
+    assert row.skipped and not row.ok and row.label == "SKIP"
+    assert row.detail.startswith("UNKNOWN: ") and "was not tried" in row.detail
+    assert _pr_views(calls) == []
+
+
+def test_checks_read_of_commit_statuses_only_is_unknown(tmp_path):
+    """A commit status is not what GitHub refuses; only a check run proves the read."""
+    prs = [f"https://github.com/owner/repo/pull/{n}" for n in (7, 8, 9, 10)]
+    row, calls = _checks_read(
+        tmp_path,
+        checks_probe=_probe_listing((7, 1), (8, 2), (9, 1), (10, 1)),
+        pr_views={url: [STATUS_CONTEXT] for url in prs},
+    )
+    assert row.skipped and row.detail.startswith("UNKNOWN: ")
+    assert "no check run" in row.detail
+    # At most doctor_module.CHECKS_READ_TRIES reads.
+    assert [argv[3] for argv in _pr_views(calls)] == prs[: doctor_module.CHECKS_READ_TRIES]
+
+
+def test_checks_read_tries_the_next_candidate_after_statuses_only(tmp_path):
+    second = "https://github.com/owner/repo/pull/8"
+    row, _ = _checks_read(
+        tmp_path,
+        checks_probe=_probe_listing((7, 1), (8, 3)),
+        pr_views={PROBE_PR: [STATUS_CONTEXT], second: [STATUS_CONTEXT, CHECK_RUN]},
+    )
+    assert row.ok and second in row.detail and "2 check result(s)" in row.detail
+
+
+@pytest.mark.parametrize("where", ["listing", "view"])
+@pytest.mark.parametrize(
+    ("stderr", "reason"),
+    [
+        (PLAN_LIMITED, "a GitHub plan limitation, not this login's permissions"),
+        ("gh: Not Found (HTTP 404)", "was not found"),
+        ("HTTP 502: Bad Gateway", "transient"),
+    ],
+    ids=["plan-limited", "not-found", "transient"],
+)
+def test_checks_read_that_cannot_answer_is_unknown(tmp_path, monkeypatch, where, stderr, reason):
+    import autoforge.github as github
+
+    monkeypatch.setattr(github.time, "sleep", lambda seconds: None)
+    failure = (1, stderr)
+    kwargs = {"checks_probe": failure} if where == "listing" else {"pr_views": {PROBE_PR: failure}}
+    row, _ = _checks_read(tmp_path, gate_open=True, **kwargs)
+    # Even with the gate open: none of these says what this login may read.
+    assert row.skipped and row.label == "SKIP" and row.detail.startswith("UNKNOWN: ")
+    assert reason in row.detail
+    assert "token permissions" not in row.detail and "Checks: read" not in row.detail
+
+
+def test_checks_read_refused_the_pr_itself_is_denied(tmp_path):
+    row, _ = _checks_read(tmp_path, pr_views={PROBE_PR: (1, "HTTP 401: Bad credentials")})
+    assert not row.ok and row.label == "WARN" and row.detail.startswith("DENIED: ")
+    assert "'gh authenticated' row" in row.detail
+
+
+def test_checks_read_never_prints_a_token(tmp_path):
+    leaked = f"{ROLLUP_REFUSED}\nAuthorization: token {TOKEN}"
+    for kwargs in (
+        {"pr_views": {PROBE_PR: (1, leaked)}},
+        {"checks_probe": (1, f"HTTP 401: Bad credentials {TOKEN}")},
+    ):
+        row, _ = _checks_read(tmp_path, gate_open=True, **kwargs)
+        assert TOKEN not in row.detail, row
+
+
+def test_checks_read_skipped_when_prerequisites_failed(tmp_path):
+    row, calls = _checks_read(tmp_path, git_remote="git@gitlab.com:o/r.git")
+    assert row.skipped and row.detail == "(GitHub remote check failed)"
+    assert not any(argv[:3] == ["gh", "api", "graphql"] for argv in calls)
 
 
 def test_premerge_verification_reported_and_never_run(tmp_path):

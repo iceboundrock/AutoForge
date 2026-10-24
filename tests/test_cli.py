@@ -770,10 +770,13 @@ def test_resume_with_gate_open_rechecks_inconclusive_ready_for_merge_then_blocks
     gh.prs[PR].mergeable = "UNKNOWN"
 
     # gate closed (flag missing): resume is a no-op banner, GitHub is not read
-    n_reads = gh.calls.count(("get_pr", PR))
+    def pr_reads():  # the identity read and the gate's checks read (#291)
+        return gh.calls.count(("get_pr", PR)) + gh.calls.count(("get_pr_with_checks", PR))
+
+    n_reads = pr_reads()
     assert cli.main(["--config", cfg, "--state-dir", sd, "resume"]) == 0
     assert "A human must review and merge the PR." in capsys.readouterr().out
-    assert gh.calls.count(("get_pr", PR)) == n_reads
+    assert pr_reads() == n_reads
 
     # gate open: each resume performs one verification attempt and keeps the phase
     for n in (1, 2):
@@ -783,7 +786,7 @@ def test_resume_with_gate_open_rechecks_inconclusive_ready_for_merge_then_blocks
         assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
         status = json.loads(capsys.readouterr().out)
         assert status["phase"] == "READY_FOR_MERGE" and status["attempt"] == n
-    assert gh.calls.count(("get_pr", PR)) == n_reads + 2
+    assert pr_reads() == n_reads + 2
 
     # bound reached: BLOCKED, nothing merged
     assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 1

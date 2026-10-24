@@ -36,6 +36,12 @@ wget's configuration and zsh's startup files need no check: a launch's
 curl, wget and zsh read the controller's empty ones instead. The
 ``origin`` URL is shown redacted.
 
+A REMOTE run's doctor also makes the merge gate's checks read on one open
+pull request whose head has check results (#291): GitHub refuses a
+fine-grained personal access token the check runs of a private repository,
+which no permission it can be given changes. PASS needs a check run read;
+no such pull request is UNKNOWN, never a PASS.
+
 Every run shows the parallel EPIC scheduler's settings (``scheduler.*``,
 bounded by the configuration loader). ``doctor --epic <url>`` adds the
 scheduler's own checks (ADR 0008, #183): the coordination root (the git
@@ -83,8 +89,10 @@ from .epic_graph import build_epic_snapshot, evaluate, ready_set
 from .errors import (
     ConfigurationError,
     ExecutionError,
+    GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
+    GitHubPlanLimitedError,
     GitHubUnavailableError,
     LockError,
     SnapshotRefused,
@@ -99,6 +107,7 @@ from .executor import (
 from .github import (
     GH_MIN_VERSION,
     GitHubClient,
+    checks_access_remedy,
     is_access_denied_gh_failure,
     parse_gh_version,
 )
@@ -139,6 +148,12 @@ REMOTE_POST_MERGE_PROFILES = ["update_epic"]
 
 # Name of the `doctor` row that verifies the default branch's required checks.
 REQUIRED_CHECKS_ROW = "default branch requires checks"
+# Name of the `doctor` row that tries the merge gate's checks read (#291).
+CHECKS_READ_ROW = "pull request check runs readable"
+# How many candidate PRs that row reads before it gives up on finding a check
+# run: each is one `gh pr view`, and a candidate whose results are commit
+# statuses only proves nothing about check runs.
+CHECKS_READ_TRIES = 3
 
 
 @dataclass
@@ -405,14 +420,24 @@ class Doctor:
         runs vacuously green. The requirement lives in repository settings,
         outside version control, so this is the only place drift is caught.
 
-        Read-only, and skipped -- never failed -- when the answer cannot be
-        read: no credentials, a token or plan that cannot see rulesets, or a
-        transient GitHub failure say nothing about the branch. The same
-        holds for a partial answer: GitHub returns a ruleset's bypass actors
-        only to a token with write access to it, and a rule this token can
-        see but whose bypass list it cannot is not shown to be unbypassable.
-        A problem that *is* visible (a missing context, a non-active
-        ruleset, a bypass actor) is a FAIL regardless of what stayed hidden.
+        Read-only. When the branch rules cannot be verified -- GitHub's
+        plan offers none on this repository (#289), the token may not read
+        them, GitHub reports the repository not found, or GitHub could not
+        be read at all (transient) -- nothing shows that the merge gate's
+        "every check succeeded" has a required check behind it. With the
+        configuration's half of the merge gate open (``safety.allow_merge:
+        true``) that is a FAIL; with it closed a SKIP that says why. A plan
+        limitation is named as one and never sent to the token's
+        permissions: no permission changes it. The same holds for a rule
+        whose bypass actors GitHub withholds (it returns them only with
+        write access to the ruleset) when it also does not say whether this
+        token may bypass it: whether the controller's own login can skip the
+        rule is then unverified. When GitHub does say that this token may
+        never bypass it, the hidden list is a SKIP either way: the required
+        checks were read and the controller cannot bypass them. A problem
+        that *is* visible (a missing context, a non-active ruleset, a bypass
+        actor) is a FAIL regardless of what stayed hidden. Never an
+        unverified OK.
         """
         name = REQUIRED_CHECKS_ROW
         cfg = self.config
@@ -424,13 +449,48 @@ class Doctor:
         try:
             return self._required_checks(client, self.repo, cfg.safety.required_checks)
         except GitHubUnavailableError as exc:
-            return CheckResult.skip(name, f"GitHub could not be read (transient): {exc}")
+            return self._required_checks_unverifiable(
+                f"GitHub could not be read (transient; run doctor again): {exc}",
+                "run doctor again",
+            )
+        except GitHubPlanLimitedError as exc:
+            return self._required_checks_unverifiable(
+                _plan_limited_text(self.repo, exc), _PLAN_REMEDY
+            )
         except GitHubError as exc:
             if isinstance(exc, GitHubNotFoundError) or is_access_denied_gh_failure(str(exc)):
-                return CheckResult.skip(
-                    name, f"this token cannot read the branch rules of {self.repo}: {exc}"
+                return self._required_checks_unverifiable(
+                    f"this token cannot read the branch rules of {self.repo}: {exc}",
+                    _READ_RULES_REMEDY,
                 )
             return CheckResult(name, False, str(exc))
+
+    def _required_checks_unverifiable(self, why: str, remedy: str) -> CheckResult:
+        """No verified answer about the default branch's required checks (#289).
+
+        A FAIL with the gate open, a SKIP that says why with it closed. The
+        merge gate's own rollup check refuses a rollup in which nothing
+        succeeded, but only a branch rule makes a check *required*: with
+        ``safety.allow_merge: true`` and nothing doctor can verify requiring
+        one, the unattended merge rests on a property no one verified.
+        ``remedy`` is the way out for this cause, never a permission for a
+        plan limitation.
+        """
+        name = REQUIRED_CHECKS_ROW
+        if self.config is not None and self.config.merge_allowed_by_config:
+            return CheckResult(
+                name,
+                False,
+                redact(
+                    f"{why}; with safety.allow_merge=true the merge gate would merge without "
+                    f"a branch rule doctor could verify requires a check: {remedy}, or close "
+                    "the gate (safety.allow_merge: false)"
+                ),
+            )
+        return CheckResult.skip(
+            name,
+            redact(f"{why} (the merge gate is closed, so no unattended merge relies on it)"),
+        )
 
     def _required_checks(self, client: GitHubClient, repo: str, expected: list[str]) -> CheckResult:
         name = REQUIRED_CHECKS_ROW
@@ -449,7 +509,8 @@ class Doctor:
         # established only by an explicitly empty list; `current_user_can_
         # bypass` is returned to every caller and a token that may bypass the
         # rule is a bypass actor whether or not the list is visible.
-        unseen: list[str] = []
+        unseen: list[str] = []  # list hidden; GitHub says this token may never bypass
+        unverified: list[str] = []  # list hidden, and nothing said about this token
         for ruleset_id in sorted({rule.ruleset_id for rule in rules}):
             ruleset = client.get_ruleset(repo, ruleset_id)
             label = f"ruleset '{ruleset.name}' (#{ruleset.id})"
@@ -464,7 +525,7 @@ class Doctor:
             elif can_bypass not in ("", "never"):
                 problems.append(f"{label} can be bypassed by this token ({can_bypass})")
             elif ruleset.bypass_actors is None:
-                unseen.append(label)
+                (unverified if can_bypass == "" else unseen).append(label)
         sources = ", ".join(
             f"ruleset #{rule.ruleset_id} ({rule.ruleset_source_type or '?'} {rule.ruleset_source})"
             for rule in rules
@@ -479,10 +540,21 @@ class Doctor:
             if unseen
             else []
         )
+        if unverified:
+            hidden.append(
+                f"bypass actors of {', '.join(unverified)} are not visible to this token, and "
+                "GitHub did not say whether this token may bypass the rule, so whether the "
+                "controller's own login can skip the required checks is unverified"
+            )
         if problems:
             # A visible problem is conclusive whatever else stayed hidden;
             # the hidden part is still named so the remedy is known to be partial.
             return CheckResult(name, False, "; ".join([summary, *problems, *hidden]))
+        if unverified:
+            return self._required_checks_unverifiable(
+                "; ".join([summary, *hidden]),
+                "run doctor with a login that has write access to the ruleset",
+            )
         if hidden:
             return CheckResult.skip(name, f"{summary}; {hidden[0]}")
         return CheckResult(name, True, summary)
@@ -501,15 +573,21 @@ class Doctor:
             classic = client.get_branch_protection(repo, branch)
         except GitHubUnavailableError:
             raise
+        except GitHubPlanLimitedError as exc:
+            return self._required_checks_unverifiable(
+                f"no active ruleset requires a status check on '{branch}', and "
+                + _plan_limited_text(repo, exc),
+                _PLAN_REMEDY,
+            )
         except GitHubError as exc:
             if not is_access_denied_gh_failure(str(exc)):
                 raise
             # Rulesets require nothing, and the only other mechanism cannot
             # be read: no conclusion either way.
-            return CheckResult.skip(
-                name,
+            return self._required_checks_unverifiable(
                 f"no active ruleset requires a status check on '{branch}', and this token "
-                f"cannot read its classic branch protection: {exc}",
+                f"cannot read its classic branch protection (Administration: read): {exc}",
+                _READ_RULES_REMEDY,
             )
         if classic is not None and classic.required_status_checks:
             contexts = sorted(classic.required_contexts)
@@ -531,7 +609,9 @@ class Doctor:
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            if not is_access_denied_gh_failure(str(exc)):
+            if not (
+                isinstance(exc, GitHubPlanLimitedError) or is_access_denied_gh_failure(str(exc))
+            ):
                 raise
             rulesets = []
         hints = [
@@ -543,6 +623,122 @@ class Doctor:
         if classic is not None:
             detail += " (classic branch protection exists but requires no status check)"
         return CheckResult(name, False, "; ".join([detail, *hints, remedy]))
+
+    def check_checks_read(self, gh: str) -> CheckResult:
+        """Whether this `gh` login may read a pull request's check runs (#291).
+
+        The merge gate reads a PR's check results with
+        :meth:`GitHubClient.get_pr_with_checks`, and GitHub refuses a
+        fine-grained personal access token the check runs of a private
+        repository's PR: no permission it can be given grants them. This row
+        makes that same read, with the same `gh` command and login, on an
+        open PR whose head has at least one check result (selected by count,
+        :meth:`GitHubClient.list_checks_probe_candidates`), up to
+        :data:`CHECKS_READ_TRIES` of them. Read-only; it never reads, prints
+        or stores a token.
+
+        PASS only when the read returned at least one check *run*, the
+        result GitHub was seen to refuse (#257). Whether it refuses a PR
+        whose results are commit statuses only was not tried, so reading
+        one proves nothing about check runs: the next candidate is read,
+        and none with a check run is UNKNOWN. DENIED when GitHub refused the
+        read (whatever the PR's results), a FAIL while the
+        configuration's half of the merge gate is open (every merge would be
+        BLOCKED) and a WARN otherwise. UNKNOWN (a SKIP, never a PASS) when no
+        PR could be tried or the answer was a plan limitation, a not-found or
+        a transient failure: none of those says what this login may read.
+        """
+        name = CHECKS_READ_ROW
+        cfg = self.config
+        if cfg is None:
+            return CheckResult.skip(name, "(config check failed)")
+        if self.repo is None:
+            return CheckResult.skip(name, "(GitHub remote check failed)")
+        repo = self.repo
+        client = GitHubClient(gh_command=gh, timeout_seconds=self.timeout, runner=self._runner)
+        try:
+            candidates = client.list_checks_probe_candidates(repo)
+        except GitHubChecksAccessError as exc:
+            # Even the count was refused: that is the refusal itself.
+            return self._checks_read_denied(
+                f"GitHub refused this gh login the check results of {repo}'s open pull "
+                f"requests: {checks_access_remedy(exc.credential)}",
+                exc,
+            )
+        except GitHubError as exc:
+            return self._checks_read_unknown(
+                f"the open pull requests of {repo} could not be listed to pick one to read", exc
+            )
+        if not candidates:
+            return CheckResult.skip(
+                name,
+                f"UNKNOWN: no recently updated open pull request of {repo} has a check result "
+                "on its head, so the checks read the merge gate makes was not tried; run doctor "
+                "again while one does",
+            )
+        tried: list[str] = []
+        for url, _count in candidates[:CHECKS_READ_TRIES]:
+            try:
+                pr = client.get_pr_with_checks(url)
+            except GitHubChecksAccessError as exc:
+                return self._checks_read_denied(
+                    f"GitHub refused this gh login the check results of {url}: "
+                    f"{checks_access_remedy(exc.credential)}",
+                    exc,
+                )
+            except GitHubError as exc:
+                if _pr_read_refused(exc):
+                    return self._checks_read_denied(
+                        f"GitHub refused this gh login the pull request {url} itself (see the "
+                        "'gh authenticated' row)",
+                        exc,
+                    )
+                return self._checks_read_unknown(f"the checks read of {url} failed", exc)
+            runs = [check for check in pr.checks or [] if check.kind == "CheckRun"]
+            if runs:
+                return CheckResult(
+                    name,
+                    True,
+                    f"PASS: this gh login read {len(pr.checks or [])} check result(s) of {url}, "
+                    f"{len(runs)} of them check runs, with the merge gate's own read",
+                )
+            tried.append(url)
+        return CheckResult.skip(
+            name,
+            f"UNKNOWN: the check results of {', '.join(tried)} hold no check run (commit "
+            "statuses only), which proves nothing about the check runs GitHub may refuse",
+        )
+
+    def _checks_read_denied(self, what: str, exc: GitHubError) -> CheckResult:
+        gate_open = self.config is not None and self.config.merge_allowed_by_config
+        consequence = (
+            "with safety.allow_merge=true every merge would be BLOCKED at READY_FOR_MERGE"
+            if gate_open
+            else "a run with the merge gate open would be BLOCKED at READY_FOR_MERGE; "
+            "REVIEW and FIX proceed without the check results"
+        )
+        return CheckResult(
+            CHECKS_READ_ROW,
+            False,
+            redact(f"DENIED: {what}; {consequence}. GitHub's answer: {exc}"),
+            required=gate_open,
+        )
+
+    @staticmethod
+    def _checks_read_unknown(what: str, exc: GitHubError) -> CheckResult:
+        # The client's typed answers first; only a plain GitHubError is
+        # classified by its text.
+        if isinstance(exc, GitHubUnavailableError):
+            why = "a transient GitHub failure; run doctor again"
+        elif isinstance(exc, GitHubNotFoundError):
+            why = "the repository or pull request was not found by this login"
+        elif isinstance(exc, GitHubPlanLimitedError):
+            why = "a GitHub plan limitation, not this login's permissions"
+        elif type(exc) is GitHubError and is_access_denied_gh_failure(str(exc)):
+            why = "this login may not make that read (see the 'gh authenticated' row)"
+        else:
+            why = "an answer this check cannot classify"
+        return CheckResult.skip(CHECKS_READ_ROW, redact(f"UNKNOWN: {what} ({why}): {exc}"))
 
     def check_gh_version(self, gh: str) -> CheckResult:
         """`gh` runs and is at least :data:`GH_MIN_VERSION`.
@@ -1258,10 +1454,39 @@ class Doctor:
         results.append(self.check_agent_environment())
         results.append(self.check_launch_credentials())
         results.append(self.check_required_checks(gh))
+        results.append(self.check_checks_read(gh))
         results.append(self.check_state_dir())
         results.extend(self.scheduler_checks(gh))
         results.extend(self.sandbox_checks(local=False))
         return results
+
+
+# The way out of an unverifiable required-check row, by cause (#289). A plan
+# limitation is never sent to the token's permissions.
+_PLAN_REMEDY = "make the repository public or move it to a plan that offers rules"
+_READ_RULES_REMEDY = "run doctor with a login that may read the branch rules"
+
+
+def _plan_limited_text(repo: str, exc: GitHubError) -> str:
+    """What doctor says about GitHub's plan-entitlement 403 (#289): the plan, never the token."""
+    return (
+        f"GitHub's plan for {repo} does not offer rulesets or branch protection on this "
+        "repository (GitHub Free offers neither on a private repository), so nothing can "
+        "require a check on its default branch; this is the plan, not the token, and no "
+        "token permission changes it: make the repository public or move it to a plan "
+        f"that offers them (GitHub Pro, Team or Enterprise). GitHub's answer: {exc}"
+    )
+
+
+def _pr_read_refused(exc: GitHubError) -> bool:
+    """Whether GitHub refused this login the pull request itself (#291).
+
+    Classified by the client's types: only a plain conclusive
+    :class:`GitHubError` can be such a refusal. Every typed answer says
+    something else (transient, not found, a refused checks read, another
+    PR, a plan limitation, which is about the plan, not the login).
+    """
+    return type(exc) is GitHubError and is_access_denied_gh_failure(str(exc))
 
 
 def _missing_contexts(contexts: list[str], expected: list[str]) -> list[str]:

@@ -96,11 +96,12 @@ passed on that interpreter on one machine, and claims nothing about 3.14.
 `gh` must be authenticated (`gh auth login`, or a `GH_TOKEN` in the shell
 you start AutoForge from) with the permissions in
 [Security boundaries: GitHub token permissions](security.md#github-token-permissions),
-which records what real fine-grained tokens did. A fine-grained token
-cannot be used on a private repository whose pull requests have checks
-([#291](https://github.com/iceboundrock/AutoForge/issues/291)): use
-`gh auth login` or a classic token with `repo` there. LOCAL mode needs no
-`gh` at all.
+which records what real fine-grained tokens did. On a private repository
+whose pull requests have checks a fine-grained token cannot read the
+check results, so the merge gate blocks on it
+([#291](https://github.com/iceboundrock/AutoForge/issues/291)): to merge
+there, use `gh auth login` or a classic token with `repo`. LOCAL mode
+needs no `gh` at all.
 
 ## Agent CLIs
 

@@ -142,6 +142,9 @@ def render_checks(pr: PRInfo) -> str:
         f"- For the PR's head commit at the time of reading: `{pr.head_sha}`",
         "",
     ]
+    if pr.checks is None:
+        # An identity read: nothing is known about the checks (#291).
+        return "\n".join([*lines, "(the check results were not read for this launch)", ""])
     if not pr.checks:
         return "\n".join([*lines, "(GitHub reports no check for this commit)", ""])
     lines += ["| Check | Status | Conclusion | Outcome |", "|---|---|---|---|"]
@@ -151,6 +154,29 @@ def render_checks(pr: PRInfo) -> str:
             "| " + " | ".join(escape_inline(redact(c)).replace("|", "\\|") for c in cells) + " |"
         )
     return "\n".join([*lines, ""])
+
+
+def render_checks_refused(pr: PRInfo) -> str:
+    """The check summary GitHub refused the controller's credential (#291).
+
+    The PR itself was read; its check results were not, and that is neither
+    "no check" nor "every check passed".
+    """
+    return "\n".join(
+        [
+            "# Checks",
+            "",
+            _HEADER,
+            "",
+            f"- For the PR's head commit at the time of reading: `{pr.head_sha}`",
+            "",
+            "GitHub refused the controller's credential this PR's check results "
+            "(GitHubChecksAccessError), so they are unknown for this launch: not "
+            '"no check" and not "every check passed". Review the change itself; the merge '
+            "gate reads the checks again and refuses to merge without them.",
+            "",
+        ]
+    )
 
 
 def render_comment(comment: CommentInfo, title: str) -> str:

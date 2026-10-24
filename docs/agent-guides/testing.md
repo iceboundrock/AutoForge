@@ -911,6 +911,40 @@ a stated reason it has none. The coverage that must keep working:
   parked in `READY_FOR_MERGE` / `MERGE` whose comment is gone, on another
   PR, names another round, HEAD, base or merge base, or says `needs_fix_round: true`
   blocks without a merge; the happy path reads it exactly once per pass
+- the PR identity read and the checks read (#291, `tests/test_github.py`,
+  `tests/test_engine.py`, `tests/test_integration.py`,
+  `tests/test_doctor.py`): the identity read never requests
+  `statusCheckRollup` and reads as "not read", never as "no checks";
+  GitHub's checks refusal for a fine-grained token or an integration on a
+  `statusCheckRollup` path is `GitHubChecksAccessError`, asked once, never
+  a not-found, while the same phrase on another path, a bare 403, a 404, a
+  transient failure and bad credentials keep their classes; a malformed
+  rollup is conclusive; `pr_exists` answers `False` only on a not-found;
+  under the refusal `REVIEW` and `FIX` launch (the reviewer's `checks.md`
+  says the checks are unknown) and `READY_FOR_MERGE` / `MERGE` block with
+  the credential's remedy after one checks read and one identity read,
+  nothing merged, an already merged PR named as merged and not counted,
+  and GitHub's recorded refusal driven through the real client into the
+  gate; a refusal before a transient-looking tail is still the refusal; `doctor`'s
+  checks-read row is PASS only on a check run read, DENIED (FAIL with the
+  gate open, WARN closed) on a refusal, UNKNOWN without a candidate, on
+  statuses only, a plan limit, a not-found or a transient failure, and
+  prints no token
+- the empty rollup and the plan limit (#289, `tests/test_engine.py`,
+  `tests/test_github.py`, `tests/test_doctor.py`): in `READY_FOR_MERGE`
+  and `MERGE` a rollup read and empty is `BLOCKED` with defaults, with
+  `verify_check_definition: false` and with `required_checks: []`, before
+  any other readiness read, and so is a rollup of only `NEUTRAL` or
+  `SKIPPED` entries, while a rollup with a success and nothing failing
+  still merges under each; GitHub Free's plan 403 on the effective rules,
+  a ruleset, the rulesets listing and classic protection is
+  `GitHubPlanLimitedError`, asked once and never access denied, while a
+  genuine 403 and a 404 keep their classes; `doctor`'s required-check row
+  names the plan and never a token permission, and an unverifiable
+  requirement (plan, access denied, not found, a transient failure, a
+  hidden bypass list without `current_user_can_bypass`) is `FAIL` with
+  `safety.allow_merge: true` and `SKIP` with it closed, while a hidden
+  bypass list with `current_user_can_bypass: never` is `SKIP` either way
 - follow-up issue verification
 - typed effect writes are never retried on an ambiguous outcome, while reads
   keep their transient retry (`tests/test_github.py`)

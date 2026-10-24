@@ -8,8 +8,10 @@ import pytest
 
 from autoforge.errors import (
     ConfigurationError,
+    GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
+    GitHubPlanLimitedError,
     GitHubUnavailableError,
     GitHubWrongTargetError,
 )
@@ -23,7 +25,10 @@ from autoforge.github import (
     ChangedFile,
     GitHubClient,
     WorkflowJob,
+    checks_access_denial,
     is_access_denied_gh_failure,
+    is_checks_access_denied_gh_failure,
+    is_plan_limited_gh_failure,
     parse_actions_run_url,
 )
 from autoforge.validation import parse_pr_url
@@ -61,29 +66,193 @@ def test_get_issue():
     assert issue.number == 2 and issue.state == "OPEN" and issue.title == "Bug"
 
 
+_VIEW_ROW = {
+    "url": "https://github.com/o/r/pull/42",
+    "number": 42,
+    "title": "Fix",
+    "state": "OPEN",
+    "headRefOid": "deadbeef",
+    "baseRefName": "main",
+    "headRefName": "autoforge/2-x",
+    "mergeable": "MERGEABLE",
+}
+
+
+def _json_fields(command: list[str]) -> list[str]:
+    return command[command.index("--json") + 1].split(",")
+
+
+def _pr_view_handler(calls, rollup):
+    """`gh pr view` answering with the rollup only when it was asked for, as `gh` does."""
+
+    def handler(req):
+        calls.append(req.command)
+        row = dict(_VIEW_ROW)
+        if "statusCheckRollup" in _json_fields(req.command):
+            row["statusCheckRollup"] = rollup
+        return _res(row)
+
+    return handler
+
+
 def test_get_pr_with_checks():
+    calls: list = []
     gh = _client(
-        lambda req: _res(
-            {
-                "url": "https://github.com/o/r/pull/42",
-                "number": 42,
-                "title": "Fix",
-                "state": "OPEN",
-                "headRefOid": "deadbeef",
-                "baseRefName": "main",
-                "headRefName": "autoforge/2-x",
-                "mergeable": "MERGEABLE",
-                "statusCheckRollup": [
-                    {"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
-                ],
-            }
-        )
+        _pr_view_handler(calls, [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}])
     )
     pr = gh.get_pr("https://github.com/o/r/pull/42")
     assert pr.head_sha == "deadbeef"
     assert gh.get_pr_head_sha("https://github.com/o/r/pull/42") == "deadbeef"
     assert gh.get_pr_state("https://github.com/o/r/pull/42") == "OPEN"
     assert gh.get_pr_checks("https://github.com/o/r/pull/42")[0].name == "ci"
+    with_checks = gh.get_pr_with_checks("https://github.com/o/r/pull/42")
+    assert with_checks.checks_read
+    assert [c.name for c in with_checks.checks or []] == ["ci"]
+
+
+def test_the_identity_read_never_requests_the_check_results():
+    """#291: a read that does not judge checks does not ask for them, and says so."""
+    calls: list = []
+    gh = _client(_pr_view_handler(calls, [{"name": "ci"}]))
+    pr = gh.get_pr("https://github.com/o/r/pull/42")
+    assert pr.checks is None and not pr.checks_read  # not read: never "no checks"
+    assert "statusCheckRollup" not in _json_fields(calls[0])
+    gh.get_pr_with_checks("https://github.com/o/r/pull/42")
+    # The checks read is the identity read plus the rollup, in one answer.
+    assert set(_json_fields(calls[1])) == set(_json_fields(calls[0])) | {"statusCheckRollup"}
+
+
+@pytest.mark.parametrize("rollup", [[], None])
+def test_an_empty_rollup_is_read_and_empty_not_unread(rollup):
+    pr = _client(_pr_view_handler([], rollup)).get_pr_with_checks("https://github.com/o/r/pull/42")
+    assert pr.checks == [] and pr.checks_read
+
+
+@pytest.mark.parametrize(
+    "rollup",
+    [{"name": "ci"}, "ci", [{"name": "ci"}, "garbage"], [None]],
+    ids=["object", "string", "a-non-object-entry", "a-null-entry"],
+)
+def test_a_malformed_rollup_is_conclusive_never_a_shorter_one(rollup):
+    gh = _client(_pr_view_handler([], rollup))
+    with pytest.raises(GitHubError, match="statusCheckRollup is not a list|not an object"):
+        gh.get_pr_with_checks("https://github.com/o/r/pull/42")
+
+
+def test_a_checks_read_whose_answer_lacks_the_rollup_is_conclusive():
+    gh = _client(lambda req: _res(dict(_VIEW_ROW)))
+    with pytest.raises(GitHubError, match="no statusCheckRollup field"):
+        gh.get_pr_with_checks("https://github.com/o/r/pull/42")
+
+
+# GitHub's answer to a fine-grained token reading a private PR with a check run
+# (iceboundrock/autoforge-token-scratch#7, #291).
+ROLLUP_REFUSED = (
+    "GraphQL: Resource not accessible by personal access token "
+    "(repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup.contexts.nodes.0)"
+)
+# The same refusal of a GitHub App installation token without Checks: read.
+ROLLUP_REFUSED_INTEGRATION = (
+    "GraphQL: Resource not accessible by integration "
+    "(repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup.contexts.nodes.0)"
+)
+
+
+def _failing(calls, stderr):
+    def handler(req):
+        calls.append(req.command)
+        return _res({}, exit_code=1, stderr=stderr + "\n")
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("stderr", "credential"),
+    [(ROLLUP_REFUSED, "personal access token"), (ROLLUP_REFUSED_INTEGRATION, "integration")],
+    ids=["fine-grained-pat", "integration"],
+)
+def test_a_refused_checks_read_is_typed_conclusive_and_never_retried(stderr, credential):
+    calls: list = []
+    gh = GitHubClient(runner=_failing(calls, stderr), transient_retries=3, retry_delay_seconds=0)
+    with pytest.raises(GitHubChecksAccessError) as info:
+        gh.get_pr_with_checks("https://github.com/o/r/pull/42")
+    assert info.value.credential == credential
+    # Neither a not-found nor transient, and asked exactly once.
+    assert not isinstance(info.value, (GitHubNotFoundError, GitHubUnavailableError))
+    assert len(calls) == 1
+    assert "Resource not accessible by" in str(info.value)
+
+
+def test_the_refusal_is_read_from_github_s_answer_not_from_the_command_line():
+    """The command line names statusCheckRollup itself; only stderr can classify."""
+    gh = GitHubClient(
+        runner=_failing([], "gh: Resource not accessible by personal access token (HTTP 403)"),
+        retry_delay_seconds=0,
+    )
+    with pytest.raises(GitHubError) as info:
+        gh.get_pr_with_checks("https://github.com/o/r/pull/42")
+    assert type(info.value) is GitHubError
+    assert "statusCheckRollup" in str(info.value)  # in the quoted command line only
+
+
+def test_a_refusal_before_a_transient_tail_is_still_the_refusal():
+    """Transience and the refusal are judged on the same answer (#291 review R6).
+
+    The quoted tail is the last 1000 characters; a refusal printed before it,
+    followed by a long tail that names a transient failure, is still the
+    refusal: typed, and asked once, never retried and reported unavailable.
+    """
+    calls: list = []
+    stderr = ROLLUP_REFUSED + "\n" + "x" * 1200 + "\nconnection reset by peer"
+    gh = GitHubClient(runner=_failing(calls, stderr), transient_retries=2, retry_delay_seconds=0)
+    with pytest.raises(GitHubChecksAccessError):
+        gh.get_pr_with_checks("https://github.com/o/r/pull/42")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # The same phrase on another path is not about checks.
+        "GraphQL: Resource not accessible by personal access token (repository.pullRequest.labels)",
+        "GraphQL: Resource not accessible by integration (repository.issue.comments.nodes.0)",
+        # A bare 403 with no path names no checks.
+        "gh: Resource not accessible by personal access token (HTTP 403)",
+        "HTTP 403: Must have admin rights to Repository.",
+        # Another credential wording is not matched.
+        "GraphQL: Resource not accessible by user (repository.pullRequest.statusCheckRollup)",
+    ],
+)
+def test_the_checks_refusal_is_matched_narrowly(stderr):
+    assert not is_checks_access_denied_gh_failure(stderr)
+    assert checks_access_denial(stderr) == ""
+    gh = GitHubClient(runner=_failing([], stderr), retry_delay_seconds=0)
+    with pytest.raises(GitHubError) as info:
+        gh.get_pr_with_checks("https://github.com/o/r/pull/42")
+    assert not isinstance(info.value, GitHubChecksAccessError)
+
+
+def test_a_genuine_404_transient_and_authentication_failure_keep_their_classes():
+    """#291: a 404, a transient failure and bad credentials are classified as before."""
+    url = "https://github.com/o/r/pull/42"
+    calls: list = []
+    missing = "GraphQL: Could not resolve to a PullRequest with the number of 42. (repository)"
+    gh = GitHubClient(runner=_failing(calls, missing), retry_delay_seconds=0)
+    with pytest.raises(GitHubNotFoundError):
+        gh.get_pr_with_checks(url)
+    assert len(calls) == 1
+    calls.clear()
+    gh = GitHubClient(
+        runner=_failing(calls, "HTTP 502: Bad Gateway"), transient_retries=1, retry_delay_seconds=0
+    )
+    with pytest.raises(GitHubUnavailableError):
+        gh.get_pr_with_checks(url)
+    assert len(calls) == 2  # retried once, as every read is
+    calls.clear()
+    gh = GitHubClient(runner=_failing(calls, "HTTP 401: Bad credentials"), retry_delay_seconds=0)
+    with pytest.raises(GitHubError) as info:
+        gh.get_pr_with_checks(url)
+    assert type(info.value) is GitHubError and len(calls) == 1
 
 
 def test_gh_failure_raises_github_error():
@@ -91,7 +260,136 @@ def test_gh_failure_raises_github_error():
     with pytest.raises(GitHubError, match="failed"):
         gh.get_issue("https://github.com/o/r/issues/999")
     assert gh.issue_exists("https://github.com/o/r/issues/999") is False
-    assert gh.pr_exists("https://github.com/o/r/pull/999") is False
+
+
+def test_pr_exists_reads_only_a_not_found_as_absence():
+    """#291: a refused, failed or unclassified read is not a PR that does not exist.
+
+    Before #291 every failure of the read answered False, so a refused
+    checks read made an existing PR look absent.
+    """
+    url = "https://github.com/o/r/pull/999"
+    missing = "GraphQL: Could not resolve to a PullRequest with the number of 999. (repository)"
+    assert GitHubClient(runner=_failing([], missing)).pr_exists(url) is False
+    for stderr, error in (
+        (ROLLUP_REFUSED, GitHubChecksAccessError),
+        ("HTTP 401: Bad credentials", GitHubError),
+        ("not found", GitHubError),  # not one of GitHub's not-found answers
+    ):
+        gh = GitHubClient(runner=_failing([], stderr), retry_delay_seconds=0)
+        with pytest.raises(error):
+            gh.pr_exists(url)
+    calls: list = []
+    assert _client(_pr_view_handler(calls, [])).pr_exists("https://github.com/o/r/pull/42")
+    assert "statusCheckRollup" not in _json_fields(calls[0])
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. "
+        "(HTTP 403)",
+        "gh: Upgrade to GitHub Team to enable this feature. (HTTP 403)",
+        "HTTP 403: Upgrade to GitHub Enterprise or make this repository public to enable "
+        "this feature.",
+    ],
+)
+def test_the_plan_entitlement_403_is_recognised(stderr):
+    assert is_plan_limited_gh_failure(stderr)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Resource not accessible by personal access token (HTTP 403)",
+        "HTTP 403: Must have admin rights to Repository.",
+        # GitHub's sentence without its 403 is not the answer matched.
+        "Upgrade to GitHub Pro or make this repository public to enable this feature.",
+        "gh: Upgrade your plan to enable this feature (HTTP 403)",
+        "gh: Not Found (HTTP 404)",
+    ],
+)
+def test_the_plan_entitlement_403_is_matched_narrowly(stderr):
+    assert not is_plan_limited_gh_failure(stderr)
+
+
+PLAN_403 = (
+    "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+)
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda gh: gh.get_required_status_check_rules("o/r", "main"),
+        lambda gh: gh.get_ruleset("o/r", 7),
+        lambda gh: gh.list_rulesets("o/r"),
+        lambda gh: gh.get_branch_protection("o/r", "main"),
+    ],
+    ids=["rules", "ruleset", "rulesets", "classic-protection"],
+)
+def test_a_plan_limited_branch_rule_read_is_typed_and_not_access_denied(read):
+    """#289: GitHub Free's 403 is the plan, not the token: typed, conclusive, never retried."""
+    calls: list = []
+    gh = GitHubClient(runner=_failing(calls, PLAN_403), transient_retries=2, retry_delay_seconds=0)
+    with pytest.raises(GitHubPlanLimitedError) as info:
+        read(gh)
+    assert not isinstance(info.value, GitHubNotFoundError)
+    assert not is_access_denied_gh_failure(str(info.value))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda gh: gh.get_required_status_check_rules("o/r", "main"),
+        lambda gh: gh.get_branch_protection("o/r", "main"),
+    ],
+    ids=["rules", "classic-protection"],
+)
+def test_a_genuine_403_and_404_on_a_branch_rule_read_are_classified_as_before(read):
+    gh = GitHubClient(
+        runner=_failing([], "gh: Must have admin rights to Repository. (HTTP 403)"),
+        retry_delay_seconds=0,
+    )
+    with pytest.raises(GitHubError) as info:
+        read(gh)
+    assert type(info.value) is GitHubError and is_access_denied_gh_failure(str(info.value))
+    gh = GitHubClient(runner=_failing([], "gh: Not Found (HTTP 404)"), retry_delay_seconds=0)
+    with pytest.raises(GitHubNotFoundError):
+        gh.get_required_status_check_rules("o/r", "main")
+    assert gh.get_branch_protection("o/r", "main") is None  # GitHub's "not protected"
+
+
+def test_the_checks_probe_candidates_are_open_prs_with_check_results():
+    calls: list = []
+
+    def node(number, total):
+        rollup = None if total is None else {"contexts": {"totalCount": total}}
+        return {
+            "url": f"https://github.com/o/r/pull/{number}",
+            "number": number,
+            "commits": {"nodes": [{"commit": {"oid": "a" * 40, "statusCheckRollup": rollup}}]},
+        }
+
+    def handler(req):
+        calls.append(req.command)
+        nodes = [node(7, 2), node(8, 0), node(9, None), node(10, 1)]
+        return _res({"data": {"repository": {"pullRequests": {"nodes": nodes}}}})
+
+    found = _client(handler).list_checks_probe_candidates("o/r")
+    assert found == [("https://github.com/o/r/pull/7", 2), ("https://github.com/o/r/pull/10", 1)]
+    assert calls[0][1:3] == ["api", "graphql"]
+    query = next(a for a in calls[0] if a.startswith("query="))
+    assert "totalCount" in query and "states: [OPEN]" in query
+    # Counts only: the selection never reads the check-run nodes it is to test.
+    assert "__typename" not in query and "conclusion" not in query
+
+
+def test_a_malformed_checks_probe_answer_is_conclusive():
+    gh = _client(lambda req: _res({"data": {"repository": {"pullRequests": {}}}}))
+    with pytest.raises(GitHubError, match="no pull-request nodes"):
+        gh.list_checks_probe_candidates("o/r")
 
 
 def test_get_repo():
@@ -557,7 +855,11 @@ def test_get_pr_parses_merge_state_and_auto_merge():
 def test_check_outcome_classification(state, conclusion, outcome):
     from autoforge.github import CheckInfo
 
-    assert CheckInfo(name="ci", state=state, conclusion=conclusion).outcome == outcome
+    check = CheckInfo(name="ci", state=state, conclusion=conclusion)
+    assert check.outcome == outcome
+    # Only an actual success succeeded: NEUTRAL and SKIPPED fail nothing but
+    # are not one (#289).
+    assert check.succeeded == ((state, conclusion) in {("COMPLETED", "SUCCESS"), ("SUCCESS", "")})
 
 
 def test_get_pr_checks_parses_check_runs_and_status_contexts():
@@ -2713,7 +3015,7 @@ def test_list_prs_for_head_filters_by_head_and_sees_every_state():
     pr = prs[0]
     assert pr.head_sha == "abc" + "0" * 37 and pr.base_ref == "main"
     assert pr.head_ref == "autoforge/2-feature" and pr.head_repository == "o/r"
-    assert pr.linked_issue_numbers == [] and pr.checks == []
+    assert pr.linked_issue_numbers == [] and pr.checks is None  # not read (#291)
     (req,) = seen
     assert req.command[:4] == ["gh", "api", "--paginate", "--slurp"]
     from urllib.parse import parse_qs, urlsplit
