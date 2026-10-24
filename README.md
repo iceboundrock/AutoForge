@@ -389,7 +389,8 @@ boundary is tested across every provider path on a capable host
 `bwrap`, user-namespace policy and Landlock ABI, in the job summary) and
 requires the real-backend tests wherever the runner can enforce; where it
 cannot, they skip with the probe's reason. It is experimental until a
-`make test-sandbox` run on a capable host is recorded for a release.
+`make test-sandbox` run on a capable host is recorded at the release
+candidate.
 
 **Experimental: implemented and verified, but exercised only against the
 in-memory fake:** the controller-owned `MERGE` step behind the merge safety
