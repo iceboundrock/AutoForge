@@ -22,6 +22,7 @@ from autoforge.read_context import (
     ReadContext,
     bounded,
     render_checks,
+    render_checks_refused,
     render_comments,
     render_issue,
     render_issue_states,
@@ -87,7 +88,18 @@ def test_a_pr_names_its_head_and_base_and_the_checks_their_commit():
     checks = render_checks(pr)
     assert f"`{'a' * 40}`" in checks
     assert "| ci \\| lint | COMPLETED | FAILURE | failure |" in checks
-    assert "no check" in render_checks(PRInfo(PR, 42, "PR", "OPEN", "b" * 40))
+    # Read and empty is "no check"; not read is neither that nor a pass (#291).
+    assert "no check" in render_checks(PRInfo(PR, 42, "PR", "OPEN", "b" * 40, checks=[]))
+    unread = render_checks(PRInfo(PR, 42, "PR", "OPEN", "b" * 40))
+    assert "not read" in unread and "no check" not in unread
+
+
+def test_a_refused_checks_read_is_rendered_as_unknown_never_as_none_or_passed():
+    """#291: the agent learns the checks are unknown, not that there are none."""
+    text = render_checks_refused(PRInfo(PR, 42, "PR", "OPEN", "c" * 40))
+    assert f"`{'c' * 40}`" in text and "refused" in text
+    assert "unknown" in text and "refuses to merge without them" in text
+    assert "| " not in text  # no table: nothing was read
 
 
 def test_issue_states_list_unreadable_references_and_the_cut():

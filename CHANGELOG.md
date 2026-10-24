@@ -5,6 +5,33 @@ so.
 
 ## Unreleased
 
+### Check results a credential may not read (#291)
+
+- AutoForge reads a pull request in one of two ways: an identity read
+  (state, HEAD, base, branch, body, links) that no longer requests the
+  check results, and a checks read that does. Only the merge gate and
+  `REVIEW`'s read context make the checks read, so a credential GitHub
+  refuses a private repository's check runs (a fine-grained personal
+  access token, which cannot be given Checks: read) no longer stops
+  `REVIEW` and `FIX` with an unclassified error that every `resume`
+  repeated. The reviewer's `checks.md` says the check results are unknown,
+  not absent.
+- `READY_FOR_MERGE` and `MERGE` block at once on a refused checks read, with
+  a reason that names the credential and the remedy: `gh auth login`, or a
+  classic token with the `repo` scope (a GitHub App installation token
+  needs Checks: read). Nothing is merged, and the refusal is never read as
+  an empty rollup or retried.
+- GitHub's refusal (`Resource not accessible by personal access token`, or
+  `by integration`, on a `statusCheckRollup` path) is a typed, conclusive
+  error. A 404, a transient failure and bad credentials are classified as
+  before, and a PR whose read was refused or failed is no longer reported
+  as one that does not exist.
+- `autoforge doctor` has a "pull request check runs readable" row: it makes
+  the merge gate's checks read on an open pull request with a check run.
+  PASS, DENIED (a FAIL with `safety.allow_merge: true`, a WARN otherwise)
+  or UNKNOWN (no such pull request, a plan limit, a not-found or a
+  transient failure; never a PASS).
+
 ### Security policy and security boundaries (#257)
 
 - [`SECURITY.md`](SECURITY.md): supported versions (the latest commit of
@@ -22,9 +49,9 @@ so.
   No behaviour changes.
 - The token permissions record what real fine-grained tokens did on
   disposable repositories. On a private repository whose pull requests
-  have checks a fine-grained token cannot be used: GitHub refuses it the
-  check runs, the pull request read fails and a run stops at `REVIEW`
-  (#291). Use `gh auth login` or a classic token with `repo` there.
+  have checks GitHub refuses a fine-grained token the check runs, so it
+  cannot be used to merge there (#291, above). Use `gh auth login` or a
+  classic token with `repo` there.
 - The documentation no longer says that no credential variable can be
   allow-listed: the names `gh` and git read a credential from are refused,
   but a token under a name of your own is not recognised and reaches every

@@ -37,6 +37,7 @@ from tests.conftest import (
     assert_isolated_launch,
     assert_isolated_names,
     block,
+    checks_refused,
     connect_origin,
     controller_review_comment,
     fix_commit,
@@ -725,6 +726,51 @@ def test_every_remote_launch_gets_no_credential_route_and_its_read_context(
         event = json.loads(line)
         if "metadata" in event:
             assert "GH_TOKEN" in event["metadata"]["env_set"]
+
+
+def test_a_refused_checks_read_lets_review_and_fix_run_and_blocks_the_merge(tmp_state_dir):
+    """#291: GitHub refuses the controller's fine-grained token a private PR's
+    check runs. Every identity read still answers, so REVIEW and FIX run on
+    the trusted PR and HEAD (the reviewer told the checks are unknown, not
+    absent), and the merge gate, which needs the checks, BLOCKS at
+    READY_FOR_MERGE on the first refusal, naming the credential and its
+    remedy: nothing merged, nothing counted, the refusal read once."""
+    gh = FakeGitHub()
+    gh.checks_error = checks_refused()
+    inner = _full_lifecycle_agent(gh)
+    reviewed_checks: list[str] = []
+
+    def agent(req):
+        if req.phase == "REVIEW":
+            reviewed_checks.append((read_context_of(req.prompt) / "checks.md").read_text())
+        return inner(req)
+
+    eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)
+    eng.config.safety.allow_merge = True
+    eng._save()
+    outcomes = eng.run(max_steps=50, allow_merge=True)
+
+    assert [req.phase for req in eng.provider.calls] == [
+        "ANALYZE_EXECUTE",
+        "REVIEW",
+        "FIX",
+        "REVIEW",
+    ]
+    assert [o.next_phase for o in outcomes][-2:] == ["READY_FOR_MERGE", "BLOCKED"]
+    assert len(reviewed_checks) == 2
+    for text in reviewed_checks:
+        assert "GitHub refused the controller's credential" in text and "unknown" in text
+        assert "| " not in text  # no check listed: none was read
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED
+    reason = s.block_reason or ""
+    assert f"the check results of PR {PR} could not be read" in reason
+    assert "Resource not accessible by personal access token" in reason
+    assert "cannot be given Checks: read" in reason and "`gh auth login`" in reason
+    assert reason.endswith("then 'unblock'")
+    assert gh.merges == [] and s.counted_merged_prs == []
+    # Two REVIEW launches and one merge-gate read: a refusal is never re-checked.
+    assert gh.calls.count(("get_pr_with_checks", PR)) == 3
 
 
 def test_an_all_pi_run_gets_the_same_isolation_in_every_child(

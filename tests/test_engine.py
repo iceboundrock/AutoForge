@@ -96,6 +96,7 @@ from tests.conftest import (
     analyze_payload,
     block,
     certify_review,
+    checks_refused,
     ci_check,
     ci_jobs,
     comment_url,
@@ -6162,10 +6163,55 @@ def test_ready_for_merge_verifies_on_github_before_entering_merge(tmp_state_dir,
     eng = _in_ready(tmp_state_dir, fake_github)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "MERGE" and "GitHub confirms" in out.message
-    assert ("get_pr", PR) in fake_github.calls
+    # The gate judges checks, so it makes the checks read (#291).
+    assert ("get_pr_with_checks", PR) in fake_github.calls
     assert ("get_pr_merge_queue_status", PR) in fake_github.calls
     assert fake_github.merges == []  # READY_FOR_MERGE never writes
     assert load_state(eng.paths.state_file).phase == Phase.MERGE
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize("credential", ["personal access token", "integration"])
+def test_a_refused_checks_read_blocks_the_merge_gate_and_names_the_remedy(
+    tmp_state_dir, fake_github, phase, credential
+):
+    """#291: the gate needs the checks; GitHub refusing them is a BLOCKED, never a pass.
+
+    Conclusive: no retry, no re-check budget spent, nothing else read from
+    the PR, nothing merged or counted. The reason names the refusal and the
+    credential's own remedy.
+    """
+    fake_github.add_pr(head_sha=SHA_A)
+    fake_github.checks_error = checks_refused(credential=credential)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    before = len(fake_github.calls)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.attempt == 0
+    assert f"the check results of PR {PR} could not be read" in s.block_reason
+    assert f"Resource not accessible by {credential}" in s.block_reason
+    assert "never taken as 'no checks' or as passed" in s.block_reason
+    if credential == "integration":
+        assert "needs Checks: read on this repository" in s.block_reason
+    else:
+        assert "cannot be given Checks: read" in s.block_reason
+    assert "`gh auth login`" in s.block_reason and "`repo` scope" in s.block_reason
+    assert fake_github.merges == [] and s.counted_merged_prs == []
+    # One checks read; nothing after it.
+    assert fake_github.calls[before:] == [("get_pr_with_checks", PR)]
+
+
+def test_a_refused_checks_read_is_not_an_empty_one_at_the_gate(tmp_state_dir, fake_github):
+    """#291: the identity read's ``checks=None`` is "not read", never "no checks"."""
+    from autoforge.github import PRInfo
+
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_ready(tmp_state_dir, fake_github)
+    pr = replace(fake_github.prs[PR], checks=None)
+    assert isinstance(pr, PRInfo)
+    problem = eng._merge_readiness_problem(pr)
+    assert problem is not None and "were not read" in problem
 
 
 def test_ready_for_merge_gate_closed_reads_nothing(tmp_state_dir, fake_github):
@@ -6621,7 +6667,8 @@ def test_conclusive_read_failure_via_resume_blocks_without_retry(tmp_state_dir, 
     eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
     outcomes = eng.run(max_steps=50, allow_merge=True)
     assert [o.next_phase for o in outcomes] == ["BLOCKED"]
-    assert fake_github.calls.count(("get_pr", PR)) == 1
+    # The gate's one PR read is the checks read (#291).
+    assert fake_github.calls.count(("get_pr_with_checks", PR)) == 1
     assert fake_github.merges == []
 
 
@@ -6674,8 +6721,10 @@ def test_merge_counts_only_after_github_confirms_merged(tmp_state_dir, fake_gith
     assert out.next_phase == "UPDATE_EPIC"
     calls = fake_github.calls
     merge_idx = next(i for i, c in enumerate(calls) if c[0] == "merge_pr")
-    assert any(c == ("get_pr", PR) for c in calls[:merge_idx])  # verified before writing
-    assert any(c == ("get_pr", PR) for c in calls[merge_idx + 1 :])  # re-read after writing
+    # Verified, checks included, before writing (#291) ...
+    assert any(c == ("get_pr_with_checks", PR) for c in calls[:merge_idx])
+    # ... and re-read after writing: the outcome needs no checks.
+    assert any(c == ("get_pr", PR) for c in calls[merge_idx + 1 :])
 
 
 # -- UPDATE_EPIC: next_issue_url is verified before switching issues (issue #12) ----------------
@@ -10274,6 +10323,11 @@ def test_merge_refuses_when_github_answers_with_another_pr(tmp_state_dir, fake_g
     other = fake_github.prs[PR_B]
     orig_get_pr = fake_github.get_pr
     fake_github.get_pr = lambda url: replace(other) if url == PR else orig_get_pr(url)
+    # The gate reads the PR with its checks (#291): that read answers wrongly too.
+    orig_checks_read = fake_github.get_pr_with_checks
+    fake_github.get_pr_with_checks = lambda url: (
+        replace(other) if url == PR else orig_checks_read(url)
+    )
     eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED"

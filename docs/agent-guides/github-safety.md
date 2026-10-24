@@ -756,6 +756,9 @@ Verify:
 
 - PR remains open
 - PR is mergeable
+- the PR's check results were read, with the PR, in one checks read
+  ("The PR identity read and the checks read" below); GitHub refusing this
+  credential them is `BLOCKED`, never "no checks" and never passed
 - every check in the status rollup passes (all checks, not only the
   required ones)
 - each required check's run has the same jobs and steps as the base branch's
@@ -815,6 +818,63 @@ decided on: `BLOCKED`, not counted.
 Never advance the workflow solely because an LLM said an operation succeeded.
 
 ---
+
+## The PR identity read and the checks read
+
+`GitHubClient` reads a pull request in one of two ways (#291):
+
+- **The identity read** (`get_pr`): state, HEAD, base, branch,
+  mergeability, draft, auto-merge, body, head repository and closing
+  issues. It does not request `statusCheckRollup`, and its `checks` is
+  `None`, which means *not read*: it is never "no checks". Every caller
+  that binds or verifies a PR without judging its checks uses it: the
+  `REVIEW` and `FIX` bindings and read-backs (`_require_open_pr` and its
+  callers), PR discovery and adoption in `ANALYZE_EXECUTE`, the adopted
+  PR's effect reconcile, the replan transaction, `unblock`, the post-merge
+  re-read and `pr_exists`. A listing (`list_open_prs`, `list_all_prs`,
+  `list_prs_for_head`) carries no check results either.
+- **The checks read** (`get_pr_with_checks`): the same fields and the
+  head's status-check rollup in one `gh pr view` answer, so the checks
+  judged are those of the HEAD read with them. Its `checks` is always a
+  list, and `[]` is GitHub reporting no check for that head. A rollup that
+  is not a list of objects is a conclusive `GitHubError`, never a shorter
+  list: an entry dropped as unreadable could be the failing one. Only the
+  merge gate (`READY_FOR_MERGE`, `MERGE`) and `REVIEW`'s read context make
+  this read.
+
+GitHub refuses a fine-grained personal access token the check runs of a
+private repository's pull request, and no permission it can be given
+changes that. It answers `Resource not accessible by personal access token`
+on a `statusCheckRollup` path, and `gh` then fails the whole view. The
+client classifies that answer, and the same answer for a GitHub App
+installation token (`... by integration`) on a `statusCheckRollup` path, as
+`GitHubChecksAccessError`: conclusive, never retried, never a not-found and
+never `[]`. The classification reads GitHub's answer, never the command
+line (which names `statusCheckRollup` itself); the same phrase on another
+path, and a bare HTTP 403, are not this error. A 404, a transient failure
+and an authentication failure keep their own classes. `pr_exists` answers
+`False` only on a conclusive not-found; a refused or failed read
+propagates, since it is not a PR that does not exist.
+
+Where the checks read is refused:
+
+- `REVIEW` proceeds. Its read context's `checks.md` says that GitHub
+  refused the controller's credential the check results, so they are
+  unknown (neither "no check" nor "every check passed"), and that the merge
+  gate reads them again. The PR, HEAD, base and merge base the review is
+  bound to come from the identity read and are verified as before.
+- `FIX` makes no checks read.
+- `READY_FOR_MERGE` and `MERGE` are `BLOCKED` on the first refusal, before
+  anything else is read from the PR. The reason names the refusal, the
+  credential and its remedy (`gh auth login`, an OAuth login, or a classic
+  token with the `repo` scope; a GitHub App installation token needs Checks:
+  read), and ends with `unblock`. Nothing is merged or counted and no
+  re-check is spent: reading again returns the same refusal. HEAD-SHA and
+  PR-identity binding, the review certificate and the check-definition
+  comparison are unchanged; they run only on a checks read that succeeded.
+
+`doctor`'s checks-read row makes the same read before a run
+("Doctor's checks-read check" below).
 
 ## Dry-run safety
 
@@ -1284,7 +1344,8 @@ An agent with no credential reads GitHub through **controller-supplied read
 context** only (ADR 0004 D10). Before each REMOTE launch the engine reads,
 through the typed client, what that phase's prompt names: the issue and its
 comments (`ANALYZE_EXECUTE`, `REVIEW`, `FIX`, `REPLAN_REEXECUTE`); the PR,
-its comments and the check summary of its head commit (`REVIEW`); the
+its comments and the check summary of its head commit (`REVIEW`; a
+summary GitHub refused the controller says so, #291); the
 previous round's review comment (`REVIEW`) or the verified one (`FIX`); the
 follow-up issues handed over (`REVIEW`, `FIX`); the EPIC and the state and
 title of each issue it references (`UPDATE_EPIC`); the source PR with its
@@ -1604,7 +1665,9 @@ the write), reading only controller state and GitHub, never an agent claim.
   then `BLOCKED`.
 - A read that fails conclusively (bad credentials, missing permissions, a
   PR that no longer resolves) is `BLOCKED` immediately: re-running would not
-  change it.
+  change it. So is a checks read GitHub refuses this credential (#291): the
+  reason names the credential and its remedy, and the refusal is never
+  taken as an empty rollup.
 - HEAD, base or merge-base drift -> `REVIEW`; a PR found already merged in
   `READY_FOR_MERGE` -> `MERGE`, to reconcile and count it once.
 - With the PR, HEAD, base and merge base confirmed, the round's review
@@ -1790,10 +1853,35 @@ carries a skip as `"skipped": true`. The check is read-only and runs in
 `doctor` only: the `READY_FOR_MERGE` gate itself does not yet consult branch
 rules.
 
+### Doctor's checks-read check
+
+`doctor`'s "pull request check runs readable" row (#291) tells an operator
+before a run whether the merge gate's checks read will be refused. It uses
+the controller's `gh` command and login and never reads, prints or stores a
+token. It lists the most recently updated open pull requests with the
+number of check results on each head (one GraphQL query that reads
+`contexts.totalCount` only, which GitHub answers even to a token it refuses
+the check runs), then makes the checks read (`get_pr_with_checks`) on up
+to three of those with at least one result:
+
+- **PASS** (`OK`) only when the read returned at least one check run.
+  Commit statuses are not what GitHub refuses, so a pull request whose
+  results are statuses only proves nothing and the next candidate is read.
+- **DENIED** when GitHub refused the read: the checks refusal, with the
+  credential's remedy, or a refusal of the pull request itself. It is a
+  `FAIL` while the configuration's half of the merge gate is open
+  (`safety.allow_merge: true`; every merge would block) and a `WARN`
+  otherwise (`REVIEW` and `FIX` proceed without the checks).
+- **UNKNOWN** (`SKIP`) when no recently updated open pull request has a
+  check result, when no candidate's results held a check run, and when
+  GitHub's answer was a plan limitation, a not-found or a transient
+  failure: none of those says what this login may read. It is never a
+  PASS.
+
 `doctor` as a whole is read-only apart from creating the state directory
 if it is missing and a probe file it creates and removes there; its GitHub
-reads (`gh repo view`, `gh api`
-GETs of the default branch's rules) never write.
+reads (`gh repo view`, `gh api` GETs of the default branch's rules, the
+checks row's GraphQL query and `gh pr view`) never write.
 
 ---
 

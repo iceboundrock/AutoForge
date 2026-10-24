@@ -40,6 +40,7 @@ from urllib.parse import quote, urlencode
 
 from .errors import (
     ConfigurationError,
+    GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
     GitHubUnavailableError,
@@ -160,6 +161,80 @@ def is_access_denied_gh_failure(stderr: str) -> bool:
     )
 
 
+# GitHub refusing a credential the check results of a PR (#291). GraphQL
+# answers the CheckRun (or StatusContext) node inside ``statusCheckRollup``
+# with ``Resource not accessible by personal access token (<path>)`` -- a
+# fine-grained token on a private repository, which cannot be given Checks:
+# read -- and `gh pr view` then fails the whole read. A GitHub App
+# installation token without Checks: read gets the same refusal worded "by
+# integration": the same fact (this credential may not read these check
+# results, the PR itself is readable), so it is the same class. The match
+# is narrow: the phrase must name one of those two credentials and the
+# GraphQL path in parentheses after it must run through
+# ``statusCheckRollup``. The same phrase on any other path (a comment, a
+# label), or a bare ``HTTP 403``, is not a checks refusal and keeps its
+# ordinary classification.
+_CHECKS_ACCESS_DENIED = re.compile(
+    r"resource not accessible by (personal access token|integration)\s*"
+    r"\(([^()\n]*\bstatuscheckrollup\b[^()\n]*)\)",
+    re.IGNORECASE,
+)
+
+
+def checks_access_denial(stderr: str) -> str:
+    """The credential GitHub refused a PR's check results, or "" (#291).
+
+    ``personal access token`` or ``integration``, read from GitHub's own
+    refusal of a ``statusCheckRollup`` path; anything else is "".
+    """
+    match = _CHECKS_ACCESS_DENIED.search(stderr or "")
+    return match.group(1).lower() if match else ""
+
+
+def is_checks_access_denied_gh_failure(stderr: str) -> bool:
+    """Whether a failed `gh` invocation's stderr is GitHub refusing a PR's check results."""
+    return bool(checks_access_denial(stderr))
+
+
+def checks_access_remedy(credential: str) -> str:
+    """What lets the controller read check results, for the credential GitHub refused (#291).
+
+    The engine's BLOCKED reason and `doctor`'s checks row say the same.
+    """
+    if credential == "integration":
+        return (
+            "a GitHub App installation token needs Checks: read on this repository: grant "
+            "it, or run AutoForge with `gh auth login` (an OAuth login) or a classic token "
+            "with the `repo` scope"
+        )
+    return (
+        "a fine-grained personal access token cannot be given Checks: read, so on a "
+        "private repository whose pull requests have check runs run AutoForge with "
+        "`gh auth login` (an OAuth login) or a classic token with the `repo` scope"
+    )
+
+
+# GitHub's plan does not offer the feature (#289): on GitHub Free a private
+# repository has no rulesets and no classic branch protection, and GitHub
+# answers those endpoints with ``HTTP 403 "Upgrade to GitHub Pro or make
+# this repository public to enable this feature."`` to every caller, the
+# owner's admin login included. That is about the plan, not about the
+# token, and no permission changes it. Matched narrowly: GitHub's own
+# sentence naming a paid plan (Pro, Team or Enterprise) *and* an HTTP 403;
+# any other 403 is an ordinary access refusal.
+_PLAN_LIMITED = re.compile(
+    r"\bupgrade to github (?:pro|team|enterprise)\b[^.\n]{0,80}?\bto enable this feature\b",
+    re.IGNORECASE,
+)
+_HTTP_403 = re.compile(r"\bhttp\s+403\b", re.IGNORECASE)
+
+
+def is_plan_limited_gh_failure(stderr: str) -> bool:
+    """Whether a failed `gh` invocation's stderr is GitHub's plan-entitlement 403."""
+    text = stderr or ""
+    return bool(_PLAN_LIMITED.search(text)) and bool(_HTTP_403.search(text))
+
+
 # The oldest `gh` the client works with. `gh api --paginate --slurp` (the
 # page-of-pages listing behind every paginated read: branch rules in `doctor`,
 # a PR's changed files at the merge gate) arrived in 2.48.0; an older `gh`
@@ -219,6 +294,10 @@ class CheckInfo:
     # *definition* that produced a green required check (see
     # :func:`parse_actions_run_url`). Empty for a legacy commit status.
     details_url: str = ""
+    # GitHub's ``__typename`` of the rollup entry: ``CheckRun`` (a check run,
+    # what a fine-grained token is refused on a private repository, #291) or
+    # ``StatusContext`` (a legacy commit status); "" when GitHub named none.
+    kind: str = ""
 
     @property
     def actions_run(self) -> ActionsRunRef | None:
@@ -367,11 +446,23 @@ class PRInfo:
     repository: str = ""
     head_repository: str = ""
     linked_issue_numbers: list[int] = field(default_factory=list)
-    checks: list[CheckInfo] = field(default_factory=list)
+    # The check results of the PR's head as GitHub reported them, or None
+    # when this read did not request them (#291). Only
+    # :meth:`GitHubClient.get_pr_with_checks` fills it: ``[]`` is "read, and
+    # GitHub reports no check", a list is what was read. An identity read
+    # (:meth:`GitHubClient.get_pr`, every listing) leaves it None, so a
+    # caller that needs checks can never mistake "not read" (or "refused",
+    # which raises :class:`GitHubChecksAccessError`) for "no checks".
+    checks: list[CheckInfo] | None = None
 
     @property
     def is_open(self) -> bool:
         return self.state == "OPEN"
+
+    @property
+    def checks_read(self) -> bool:
+        """Whether this PRInfo carries the check results GitHub reported (possibly none)."""
+        return self.checks is not None
 
 
 @dataclass(frozen=True)
@@ -511,10 +602,32 @@ class ClassicBranchProtection:
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
+# The PR identity read (:meth:`GitHubClient.get_pr`): everything a caller
+# binds a PR by, and no check results. GitHub refuses a fine-grained token
+# the check runs of a private PR and `gh` then fails the *whole* view
+# (#291), so a read that does not need checks never asks for them.
 _PR_FIELDS = (
     "url,number,title,state,headRefOid,baseRefName,headRefName,mergeable,mergeStateStatus,"
     "autoMergeRequest,isDraft,body,headRepository,headRepositoryOwner,"
-    "closingIssuesReferences,statusCheckRollup"
+    "closingIssuesReferences"
+)
+# The checks read (:meth:`GitHubClient.get_pr_with_checks`): the same fields
+# and the head's check results, in one GraphQL answer, so the checks a
+# caller judges are those of the HEAD it judged them with.
+_PR_CHECKS_FIELDS = f"{_PR_FIELDS},statusCheckRollup"
+# The open PRs `doctor` may probe the checks read on (#291): the most
+# recently updated ones, each with the number of check results on its head
+# commit. ``contexts.totalCount`` is returned even to a token GitHub
+# refuses the check-run nodes themselves, so it selects a candidate without
+# being the read it tests.
+_CHECKS_PROBE_PAGE_SIZE = 20
+_CHECKS_PROBE_QUERY = (
+    "query($owner: String!, $name: String!) {"
+    " repository(owner: $owner, name: $name) {"
+    f" pullRequests(first: {_CHECKS_PROBE_PAGE_SIZE}, states: [OPEN],"
+    " orderBy: {field: UPDATED_AT, direction: DESC}) {"
+    " nodes { url number commits(last: 1) { nodes { commit { oid"
+    " statusCheckRollup { contexts { totalCount } } } } } } } } }"
 )
 # Page size of a PR's changed-files listing; every page is read. GitHub stops
 # the endpoint at 3000 files whatever the paging, so a listing that does not
@@ -635,6 +748,40 @@ def _linked_issue_nodes(connection: object, what: str) -> list[dict]:
         if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
             raise GitHubError(f"{what}: a linked issue has no issue number: {node!r:.200}")
     return nodes
+
+
+def _rollup_checks(row: dict, what: str) -> list[CheckInfo] | None:
+    """The check results of a PR row, or None when the row did not carry them (#291).
+
+    Absent: the read did not request ``statusCheckRollup`` (an identity read
+    or a listing), which says nothing about the checks. ``null`` or ``[]``:
+    read, and GitHub reports none. Any other value than a list of objects is
+    a conclusive GitHubError: an entry dropped as unreadable could be the one
+    failing check, so a malformed rollup is never read as a shorter one.
+    """
+    if "statusCheckRollup" not in row:
+        return None
+    rollup = row.get("statusCheckRollup")
+    if rollup is None:
+        return []
+    if not isinstance(rollup, list):
+        raise GitHubError(f"{what}: statusCheckRollup is not a list: {rollup!r:.200}")
+    checks: list[CheckInfo] = []
+    for c in rollup:
+        if not isinstance(c, dict):
+            raise GitHubError(f"{what}: a status check is not an object: {c!r:.200}")
+        details = c.get("detailsUrl") or c.get("targetUrl") or ""
+        kind = c.get("__typename")
+        checks.append(
+            CheckInfo(
+                name=str(c.get("name", "") or c.get("context", "")),
+                state=str(c.get("status", "") or c.get("state", "")).upper(),
+                conclusion=str(c.get("conclusion", "")).upper(),
+                details_url=details if isinstance(details, str) else "",
+                kind=kind if isinstance(kind, str) else "",
+            )
+        )
+    return checks
 
 
 def _text_field(row: dict, key: str, what: str) -> str:
@@ -905,7 +1052,8 @@ def _rest_pr_row(row: object, what: str) -> dict:
     and the head commit, a closed PR with a ``merged_at`` is ``MERGED`` (REST
     has no merged state), and ``auto_merge`` is the armed auto-merge.
     Closing-issue references, mergeability and checks are not in the REST
-    listing; a caller that needs them reads the PR with ``get_pr``.
+    listing (``checks`` is None, not read); a caller that needs them reads
+    the PR with ``get_pr``, or ``get_pr_with_checks`` for the checks.
     """
     data = _row_object(row, what)
     head = data.get("head")
@@ -1278,11 +1426,24 @@ class GitHubClient:
         """
         tail = res.stderr.strip()[-1000:]
         message = f"`gh {' '.join(args)}` failed (exit {res.exit_code}): {redact(tail)}"
-        return message, is_transient_gh_failure(tail)
+        # GitHub refusing the check results is an answer, never a reason to
+        # retry, whatever else the tail says (#291).
+        transient = is_transient_gh_failure(tail) and not checks_access_denial(tail)
+        return message, transient
 
     @staticmethod
-    def _conclusive(message: str) -> GitHubError:
-        """A non-transient failure: not found, or any other conclusive refusal."""
+    def _conclusive(message: str, stderr: str | None = None) -> GitHubError:
+        """A non-transient failure: a refused checks read, not found, or any other refusal.
+
+        ``stderr`` is the raw tail `gh` printed (``message`` quotes it
+        redacted, after the command line); the checks refusal is read from
+        it, never from the command line, which names ``statusCheckRollup``
+        itself. A checks refusal is classified first: the PR exists, so it
+        must never be read as not-found (#291).
+        """
+        credential = checks_access_denial(message if stderr is None else stderr)
+        if credential:
+            return GitHubChecksAccessError(message, credential=credential)
         if is_not_found_gh_failure(message):
             return GitHubNotFoundError(message)
         return GitHubError(message)
@@ -1290,9 +1451,11 @@ class GitHubClient:
     def _run_gh(self, args: list[str], allow_fail: bool = False) -> ExecutionResult:
         attempts = self.transient_retries + 1
         last_error = ""
+        last_stderr: str | None = None
         transient = False
         for i in range(attempts):
             res = self._invoke(args)
+            last_stderr = None
             if res.timed_out:
                 last_error = self._timeout_message(args)
                 transient = True
@@ -1306,6 +1469,7 @@ class GitHubClient:
                 )
             elif res.exit_code != 0:
                 last_error, transient = self._exit_failure(args, res)
+                last_stderr = res.stderr
             else:
                 return res
             if allow_fail and not transient:
@@ -1315,7 +1479,7 @@ class GitHubClient:
             time.sleep(self.retry_delay_seconds)
         if transient:
             raise GitHubUnavailableError(last_error)
-        raise self._conclusive(last_error)
+        raise self._conclusive(last_error, last_stderr)
 
     def _run_gh_once(self, args: list[str], *, stdin: bytes | None = None) -> ExecutionResult:
         """Run `gh` exactly once: the transport of a write (ADR 0004 D4.3).
@@ -1336,7 +1500,7 @@ class GitHubClient:
             message, transient = self._exit_failure(args, res)
             if transient:
                 raise GitHubUnavailableError(f"{message}; the outcome is unknown")
-            raise self._conclusive(message)
+            raise self._conclusive(message, res.stderr)
         if res.truncated:
             # The write was accepted (exit 0) but its reply is not readable:
             # unlike a read, this is not a conclusive failure, the write may
@@ -1705,18 +1869,7 @@ class GitHubClient:
                 f"{what}: url {url!r} is not a GitHub pull request URL ({exc})"
             ) from exc
         number = _number_field(data, "number", what, ref.number)
-        checks = []
-        for c in data.get("statusCheckRollup") or []:
-            if isinstance(c, dict):
-                details = c.get("detailsUrl") or c.get("targetUrl") or ""
-                checks.append(
-                    CheckInfo(
-                        name=str(c.get("name", "") or c.get("context", "")),
-                        state=str(c.get("status", "") or c.get("state", "")).upper(),
-                        conclusion=str(c.get("conclusion", "")).upper(),
-                        details_url=details if isinstance(details, str) else "",
-                    )
-                )
+        checks = _rollup_checks(data, what)
         linked: list[int] = []
         for linked_issue in data.get("closingIssuesReferences") or []:
             if isinstance(linked_issue, dict) and isinstance(linked_issue.get("number"), int):
@@ -1746,12 +1899,38 @@ class GitHubClient:
             checks=checks,
         )
 
-    def get_pr(self, url: str) -> PRInfo:
+    def _view_pr(self, url: str, fields: str) -> PRInfo:
         ref = parse_pr_url(url)
-        data = self._api_json(["pr", "view", ref.canonical, "--json", _PR_FIELDS])
+        data = self._api_json(["pr", "view", ref.canonical, "--json", fields])
         pr = self._pr_from_data(data, f"PR {ref.canonical}")
         if not parse_pr_url(pr.url).same_target(ref):
             raise GitHubError(f"PR {ref.canonical}: `gh` answered with {pr.url}")
+        return pr
+
+    def get_pr(self, url: str) -> PRInfo:
+        """The PR's identity read: state, HEAD, base, branch, body, links; no check results.
+
+        ``statusCheckRollup`` is not requested, so a credential GitHub
+        refuses the PR's check runs (#291) still reads the PR, and
+        ``checks`` is None ("not read"), never ``[]``. Every caller that
+        does not judge checks uses this read.
+        """
+        return self._view_pr(url, _PR_FIELDS)
+
+    def get_pr_with_checks(self, url: str) -> PRInfo:
+        """The PR's checks read: the identity fields and the head's check results, at once.
+
+        One ``gh pr view`` answer, so the checks are those of the HEAD it
+        reports. ``checks`` is always a list here: ``[]`` is GitHub reporting
+        no check for the head, which is not a set of passed checks. GitHub
+        refusing this credential the check results raises
+        :class:`GitHubChecksAccessError` (conclusive, never retried, never a
+        not-found and never ``[]``); a 404, a transient failure and an
+        authentication failure are classified as for every other read.
+        """
+        pr = self._view_pr(url, _PR_CHECKS_FIELDS)
+        if pr.checks is None:
+            raise GitHubError(f"PR {pr.url}: `gh` returned no statusCheckRollup field")
         return pr
 
     def get_pr_head_sha(self, url: str) -> str:
@@ -1764,7 +1943,65 @@ class GitHubClient:
         return self.get_pr(url).head_ref
 
     def get_pr_checks(self, url: str) -> list[CheckInfo]:
-        return self.get_pr(url).checks
+        checks = self.get_pr_with_checks(url).checks
+        if checks is None:  # get_pr_with_checks never returns one; never read it as []
+            raise GitHubError(f"PR {url}: its check results were not read")
+        return checks
+
+    def list_checks_probe_candidates(self, repo: str) -> list[tuple[str, int]]:
+        """Open PRs whose head has check results, for `doctor`'s checks probe (#291).
+
+        ``(url, count)`` for each of the most recently updated open PRs
+        (one page of :data:`_CHECKS_PROBE_PAGE_SIZE`) whose head commit's
+        rollup counts at least one check result, in that order. The count
+        is GitHub's ``contexts.totalCount``, which it returns even to a
+        credential it refuses the check-run nodes, so this read selects a
+        PR to probe and proves nothing about the checks read itself. Not a
+        complete listing: a probe that finds no candidate here knows nothing.
+        """
+        what = f"open PRs of {repo} with check results"
+        owner, _, name = repo.partition("/")
+        data = self._graphql_data(
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={_CHECKS_PROBE_QUERY}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+            ],
+            what,
+        )
+        repository = data.get("repository")
+        connection = repository.get("pullRequests") if isinstance(repository, dict) else None
+        nodes = connection.get("nodes") if isinstance(connection, dict) else None
+        if not isinstance(nodes, list):
+            raise GitHubError(f"{what}: no pull-request nodes: {data!r:.200}")
+        found: list[tuple[str, int]] = []
+        for node in nodes:
+            row = _row_object(node, what)
+            url = _text_field(row, "url", what)
+            try:
+                ref = parse_pr_url(url)
+            except ConfigurationError as exc:
+                raise GitHubError(f"{what}: url {url!r} is not a pull request URL") from exc
+            commits = row.get("commits")
+            heads = commits.get("nodes") if isinstance(commits, dict) else None
+            if not isinstance(heads, list):
+                raise GitHubError(f"{what}: {ref.canonical} has no commit nodes")
+            count = 0
+            for head in heads:
+                commit = head.get("commit") if isinstance(head, dict) else None
+                rollup = commit.get("statusCheckRollup") if isinstance(commit, dict) else None
+                contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+                total = contexts.get("totalCount") if isinstance(contexts, dict) else 0
+                if isinstance(total, int) and not isinstance(total, bool):
+                    count = max(count, total)
+            if count > 0:
+                found.append((ref.canonical, count))
+        return found
 
     def get_pr_changed_files(self, url: str) -> ChangedFiles:
         """Every file the PR changes, a rename's former path included.
@@ -2035,10 +2272,17 @@ class GitHubClient:
         return WorkflowRuns(runs=tuple(runs), total=total)
 
     def pr_exists(self, url: str) -> bool:
+        """Whether GitHub resolves the PR: False only for a conclusive not-found.
+
+        Any other failure propagates: a refused read (authentication,
+        permissions, a refused checks read, #291), malformed data or a
+        transient error says nothing about whether the PR exists, so it is
+        never reported as its absence.
+        """
         try:
             self.get_pr(url)
             return True
-        except GitHubError:
+        except GitHubNotFoundError:
             return False
 
     def _walk_connection(
@@ -2374,7 +2618,8 @@ class GitHubClient:
 
         The rows go through the one PR decoder; the REST listing carries
         neither closing-issue references, mergeability nor checks, so those
-        are empty: a caller that needs them reads the PR with :meth:`get_pr`.
+        are empty (``checks`` None, not read): a caller that needs them reads
+        the PR with :meth:`get_pr`, or :meth:`get_pr_with_checks` for the checks.
         """
         repo = _repository_path(repository)
         if not isinstance(branch, str) or not branch.strip() or ":" in branch:
