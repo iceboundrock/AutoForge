@@ -179,7 +179,11 @@ file that lies in the checkout or in any worktree registered to it, that
 is reached through a symbolic link in one, or that has a second hard link;
 the refusal names the file and the fix (move it outside, for example to
 `~/.config/autoforge/`, or set `sandbox.mode: disabled`), and `doctor` runs
-none of the commands such a file names. One writable place is not
+none of the commands such a file names. The path is followed as the
+command opens it, never tidied first: a `..` after a symbolic link is
+taken where the link leads, and a path that passes through such a tree
+and leaves it again by `..` is refused too, since an agent could replace
+the entry it passes through. One writable place is not
 checked: a provider's own directory that its agent is given read-write (a
 dedicated `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR` or OpenCode database
 directory). Keep the configuration out of it too.
@@ -291,7 +295,7 @@ last column says what still applies.
 
 | Issue | Severity | What happens today | Until it is fixed |
 |---|---|---|---|
-| [#280](https://github.com/iceboundrock/AutoForge/issues/280) | Critical | *Fixed on `main`.* Under `sandbox.mode: required` or `preferred`, every command, a scheduler's worker and `doctor` refuse a `--config` file an enforced launch could rewrite (in the checkout or a worktree of the repository, reached through a link in one, or with a second hard link), and a run is pinned to the `sandbox.mode` it was created under: a later command under a weaker one is refused unless `--accept-config-change`, which the run log records | Keep the `--config` file out of a provider's own writable directory too, which is not checked ([why](#the-outer-sandbox-is-opt-in-and-linux-only)) |
+| [#280](https://github.com/iceboundrock/AutoForge/issues/280) | Critical | *Fixed on `main`.* Under `sandbox.mode: required` or `preferred`, every command, a scheduler's worker and `doctor` refuse a `--config` file an enforced launch could rewrite (in the checkout or a worktree of the repository, reached through a link in one, passing through one before a `..`, or with a second hard link), and a run is pinned to the `sandbox.mode` it was created under: a later command under a weaker one is refused unless `--accept-config-change`, which the run log records | Keep the `--config` file out of a provider's own writable directory too, which is not checked ([why](#the-outer-sandbox-is-opt-in-and-linux-only)) |
 | [#281](https://github.com/iceboundrock/AutoForge/issues/281) | High | A recognised token right after a line break, a tab or a character JSON escapes as `\u...` in a step's result is printed unredacted on the terminal and in a scheduler worker's log | Treat that output and the worker logs as sensitive, and do not share them |
 | [#282](https://github.com/iceboundrock/AutoForge/issues/282) | High | Google API keys (`AIza...`) are neither redacted nor refused in published text, and OpenCode launches receive `GEMINI_*` and `GOOGLE_*` | Keep such variables out of the shell you run AutoForge from unless a profile needs them ([why](#redaction-is-a-baseline)) |
 | [#283](https://github.com/iceboundrock/AutoForge/issues/283) | High | `merge.delete_branch: true` passes `--delete-branch` to `gh pr merge`, which, per `gh`, deletes the local branch of that name too, running git in the checkout you started AutoForge from; under `disabled`, a git hook an agent planted there runs with the controller's credential within reach | Keep `merge.delete_branch: false`, the default |

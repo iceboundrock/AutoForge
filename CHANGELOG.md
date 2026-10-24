@@ -17,14 +17,17 @@ its date ([Releasing](docs/releasing.md#the-changelog)).
   scheduler's worker and `autoforge doctor` refuse a `--config` file that
   an enforced launch could rewrite: one inside the checkout or inside any
   worktree registered to the repository (the agent worktrees included),
-  one reached through a symbolic link in such a tree, and one with a
-  second hard link. The command exits 2 with nothing run, launched or
-  written, naming the file and the fix; `doctor`'s config row fails and
-  runs none of the commands the file names. **Behaviour change:** under
-  those modes an `autoforge.yaml` kept in the checkout is refused by every
-  command, `status` included. Move it outside, for example to
-  `~/.config/autoforge/`, or set `sandbox.mode: disabled`. A provider's own
-  read-write directory is not checked; keep the file out of it too
+  one reached through a symbolic link in such a tree, one whose path
+  passes through such a tree before a `..` (the path is followed as the
+  command opens it, a `..` after a link included, never tidied first), and
+  one with a second hard link. The command exits 2 with nothing run,
+  launched or written, naming the file and the fix; `doctor`'s config row
+  fails and runs none of the commands the file names. **Behaviour
+  change:** under those modes an `autoforge.yaml` kept in the checkout is
+  refused by every command, `status` included. Move it outside, for
+  example to `~/.config/autoforge/`, or set `sandbox.mode: disabled`. A
+  provider's own read-write directory is not checked; keep the file out of
+  it too
   ([Security boundaries](docs/security.md#the-outer-sandbox-is-opt-in-and-linux-only)).
 - Every run, LOCAL and REMOTE, is pinned to the `sandbox.mode` it was
   created under by `run`, `local run` or a scheduler's worker. `step`,

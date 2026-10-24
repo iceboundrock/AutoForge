@@ -679,8 +679,14 @@ Two checks keep a weaker containment from arriving unannounced (#280).
 `sandbox_policy.config_file_problem` whether, under `required` or
 `preferred`, the `--config` file lies in a tree the repository's enforced
 launches write (the checkout, every registered worktree, the sandbox
-directories): it walks the path as the kernel looks it up (`lookup_directories`, so a
-link in or into such a tree shows) and refuses a second hard link. The CLI
+directories): it walks the path the loader was given, made absolute but
+never normalized (`absolute_spelling`: `os.path.abspath` would collapse a
+`..` after a link and name another file), as the kernel looks it up
+(`lookup_directories`, so a link in or into such a tree shows, and so does
+a lookup in one that a `..` leaves again), requires the walk to end at the
+file the path opens, and refuses a second hard link of that file. Callers
+pass the path unnormalized, and what records it or hands it to a worker
+spells it with `absolute_spelling` too. The CLI
 (`_load_cfg`), the scheduler's worker and `doctor`'s config row parse the
 file first, because the `sandbox.mode` it sets selects the check, and then
 refuse such a file before anything acts on it: no phase, launch or write

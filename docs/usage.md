@@ -994,9 +994,9 @@ never called sandboxed.
 - **Where the configuration lives (#280):** under `required` or
   `preferred`, every command, `doctor` and a scheduler's worker refuse a
   `--config` file inside the checkout or any worktree of the repository
-  (or reached through a link into one, or with a second hard link), since an
-  enforced launch could rewrite it. Keep it in, for example,
-  `~/.config/autoforge/`.
+  (or reached through a link into one, passing through one before a `..`,
+  or with a second hard link), since an enforced launch could rewrite it.
+  Keep it in, for example, `~/.config/autoforge/`.
 
 AutoForge never commits to the default branch, never deletes a worktree it
 created, and never creates or cleans up local branches or any other
@@ -1111,11 +1111,15 @@ ownership or discard uncommitted user changes.
   `sandbox.mode: disabled` (logical isolation only) or, in LOCAL,
   `preferred`, and run the same command again.
 - **"the configuration file ... lies in ..., a tree that launches inside
-  the outer sandbox write"** (exit 2; also "is reached through ..." or
-  "has N hard links"): under `required` or `preferred` the `--config` file
-  is where an enforced launch could rewrite it (#280). Nothing was run,
-  launched or written. Move it outside the checkout and every worktree of
-  the repository, for example to `~/.config/autoforge/`, and pass that
+  the outer sandbox write"** (exit 2; also "is reached through ...", "has
+  N hard links" or "opens another file than its lookup walk was followed
+  to"): under `required` or `preferred` the `--config` file is where an
+  enforced launch could rewrite it (#280). Nothing was run, launched or
+  written. "Is reached through" names a directory of such a tree the path
+  looks a name up in: a symbolic link leads there, or the path passes
+  through it before a `..`, which is followed as the command opens it,
+  never tidied. Move the file outside the checkout and every worktree of
+  the repository, for example to `~/.config/autoforge/`, and pass its own
   path; or set `sandbox.mode: disabled`. `doctor` reports the same in its
   config row and runs none of the commands the file names.
 - **"run ... is pinned to sandbox.mode ..., and this command's

@@ -1617,7 +1617,15 @@ repository and its sandbox directories, reached through a symbolic link
 in one or aliased by a second hard link included (D4.4). Under `required` or
 `preferred` every command, the scheduler's worker and `doctor` refuse such
 a file (`config_file_problem` in `src/autoforge/sandbox_policy.py`), and
-`doctor` then runs no command the file names.
+`doctor` then runs no command the file names. The path is the one the
+loader opens, made absolute without being normalized, and is walked as
+the kernel looks it up: a `..` after a link is taken where the link
+leads, a path that looks up a name in such a tree and leaves it again by
+`..` is within reach (the agent can replace that entry), and the walk
+must end at the file the path opens, whose own link count is read.
+Checking only the file's resolved location would miss a replaced
+intermediate entry; lexically collapsing `..` first examines another
+file than the one loaded.
 
 *Rejected.* **Masking the configuration file in the LOCAL root.** A file
 in a writable projection cannot be masked, and a mask deeper in the tree
