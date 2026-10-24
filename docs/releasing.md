@@ -31,6 +31,12 @@ release.
   project: never publish, document or recommend `pip install autoforge`.
 - A release's tag is **`v<version>`**, for example `v0.1.0a0`: the letter
   `v` and the exact version, nothing else.
+- `README.md` is also the project description PyPI shows (`readme` in
+  `pyproject.toml`), and PyPI resolves no relative link. Its Prerequisites
+  and Installation sections therefore link absolutely, to `main`; the
+  relative links of its other sections are broken on PyPI, a known
+  limitation. Text in the README stays true after an upload: it never says
+  that nothing is published.
 
 ## Version scheme
 
