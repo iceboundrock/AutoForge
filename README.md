@@ -407,9 +407,10 @@ each one, but against the in-memory GitHub and scripted agents only, and it
 has not yet driven a real EPIC: run it on an EPIC you watch, with
 `epic status` open.
 
-**New:** acceptance actions on other issues, which the operator posts or
-binds (`unblock --bind-evidence`, #243). They are tested offline and have
-been used once for real, in a run on this repository.
+**Experimental:** acceptance actions on other issues, which the operator
+posts or binds (`unblock --bind-evidence`, #243). They are tested offline
+and have been used once for real, in a run on this repository. They stay
+experimental until they are used on a repository other than AutoForge.
 
 **Experimental and opt-in:** Pi as a provider (`provider: pi`, the
 [Pi operator guide](docs/pi.md)). No built-in profile uses it, and its one
