@@ -1,25 +1,67 @@
 [project]
-name = "autoforge"
+# The distribution name on PyPI (#256 D2): `autoforge` there is an unrelated
+# project. The import package and the command both stay `autoforge`.
+name = "autoforge-cli"
+# Kept equal to `autoforge.__version__` by tests/test_packaging.py; the
+# release procedure (docs/releasing.md) bumps both together.
 version = "0.1.0"
 description = "Autonomous orchestration for AI-driven software development (deterministic controller over Claude Code / OpenCode / gh)."
 readme = "README.md"
+# The oldest interpreter the code runs on, not a support claim: the supported
+# interpreters are the classifiers below and docs/compatibility.md, which
+# follow the CI matrix. No upper bound (docs/compatibility.md, "Python").
 requires-python = ">=3.11"
-license = { text = "MIT" }
+# PEP 639: an SPDX expression and the file it names (#256 D1).
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ruoshi Li" }]
+keywords = ["ai", "agents", "orchestration", "code-review", "github", "claude-code", "opencode"]
+# Only what docs/compatibility.md claims supported (#256 D3): Linux, CPython
+# 3.11 and 3.12. tests/test_packaging.py keeps the Python classifiers equal
+# to the CI matrix.
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development",
+]
 dependencies = []
 
 [project.optional-dependencies]
 # Full YAML config support (without it, the built-in subset parser is used).
 yaml = ["pyyaml>=6"]
 
+[project.urls]
+Homepage = "https://github.com/iceboundrock/AutoForge"
+Documentation = "https://github.com/iceboundrock/AutoForge/tree/main/docs"
+Source = "https://github.com/iceboundrock/AutoForge"
+Issues = "https://github.com/iceboundrock/AutoForge/issues"
+Changelog = "https://github.com/iceboundrock/AutoForge/blob/main/CHANGELOG.md"
+
 [project.scripts]
 autoforge = "autoforge.cli:main"
 
 [build-system]
-requires = ["setuptools>=61"]
+# 77.0 is the first setuptools with PEP 639 (`license` as an SPDX expression,
+# `license-files`); an older one rejects both.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Every file the package reads at runtime ships in the wheel and the sdist:
+# the prompt templates (`prompts_dir()`). tests/test_packaging.py fails when a
+# file in the package is neither listed here nor named as not shipped, and
+# when code reads a new file relative to the package.
+[tool.setuptools.package-data]
+"autoforge.prompts" = ["*.md"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10", "pyyaml>=6"]

@@ -281,8 +281,11 @@ Also disclosed: pushed code runs in your CI before any review
 ([above](#pushed-code-runs-in-your-ci)); AutoForge's own CI pins its GitHub
 Actions by tag, not by commit SHA
 ([#288](https://github.com/iceboundrock/AutoForge/issues/288)); and the
-`autoforge` distribution on PyPI is an unrelated project
-([#256](https://github.com/iceboundrock/AutoForge/issues/256)).
+`autoforge` distribution on PyPI is an unrelated project: AutoForge's is
+`autoforge-cli`
+([#256](https://github.com/iceboundrock/AutoForge/issues/256)), not yet
+published there
+([#295](https://github.com/iceboundrock/AutoForge/issues/295)).
 
 ## GitHub token permissions
 
@@ -507,8 +510,10 @@ sandbox directories) are under `.git/autoforge/`, which git never tracks.
 6. **Keep repository secrets away from branch CI** and make the default
    `GITHUB_TOKEN` read-only ([why](#pushed-code-runs-in-your-ci)).
 7. **Keep AutoForge's files out of git** ([above](#keep-autoforges-files-out-of-git)).
-8. **Install from a checkout** of this repository with `uv sync --locked`.
-   AutoForge is not published on PyPI; the `autoforge` distribution there
-   is an unrelated project.
+8. **Install from this repository,** pinned to a commit you chose
+   ([Installation](../README.md#installation)), or from a clone with
+   `uv sync --locked`. The distribution is `autoforge-cli`, not yet
+   published on PyPI; the `autoforge` distribution there is an unrelated
+   project.
 9. **Run `autoforge doctor` first,** and read the launch environment, the
    credential preflight and the sandbox rows.

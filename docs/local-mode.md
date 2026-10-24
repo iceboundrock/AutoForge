@@ -79,6 +79,10 @@ pushes, stashes, resets or switches branches on your behalf.
 
 ## The interview-sized example
 
+The commands are written `uv run autoforge ...`, the form inside a
+development clone of AutoForge. With the command installed
+([Installation](../README.md#installation)), drop the `uv run`.
+
 ```bash
 uv run autoforge local init add-transaction-filter
 # a human (with or without an AI) refines features/add-transaction-filter.md

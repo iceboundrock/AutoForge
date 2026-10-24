@@ -11,6 +11,7 @@ description of how AutoForge behaves.
 | Document | Read it for |
 |---|---|
 | [Getting started](../README.md#quick-start) | prerequisites, installation, `doctor`, a dry run, a first run, `resume` |
+| [Compatibility](compatibility.md) | what AutoForge runs on and the evidence for each claim: OS and architecture, Python, git, `gh` and its token, each agent CLI's minimum and verified versions, the outer sandbox's host requirements, the filesystem, provider authentication and billing |
 | [Running the remote workflow](usage.md) | every command, where a run stops (`READY_FOR_MERGE`, `BLOCKED`), opt-in merge, `unblock`, how agents are separated from your checkout (not sandboxed unless `sandbox.mode: required`), troubleshooting and recovery |
 | [Local mode](local-mode.md) | the GitHub-free workflow over a feature Markdown file: the workspace fingerprint, dirty trees, the review/fix bound, validation commands, dry run and resume |
 | [Pi operator guide](pi.md) | running phases through Pi on a DeepSeek API key (its first target) or a ChatGPT subscription with no API key: installing Pi and giving it a credential yourself, a profile to copy for each, model and thinking level, `doctor`'s Pi rows and their remedies, security, LOCAL mode, limitations, unattended use, and the opt-in live smoke test |
@@ -42,7 +43,8 @@ description of how AutoForge behaves.
 
 | Document | Read it for |
 |---|---|
-| [Development](development.md) | `make` targets, CI, and what a green `ci` does and does not prove |
+| [Development](development.md) | `make` targets, CI, the built-distribution check, and what a green `ci` does and does not prove |
+| [Releasing](releasing.md) | the distribution name, the version and tag scheme, the changelog, and the maintainer's procedure for building, tagging, publishing and verifying a release |
 | [Testing](agent-guides/testing.md) | the coverage contract and high-priority test areas |
 | [Test scope](../tests/AGENTS.md) | fixtures and fakes, and what a test may never do |
 | [AGENTS.md](../AGENTS.md) | the repository contract: precedence, safety invariants, routing rules for which guide to read before a change |
