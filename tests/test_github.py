@@ -3894,10 +3894,10 @@ def test_the_transport_reads_an_error_body_only_to_its_small_bound(loopback):
     assert reply.status == 403 and len(reply.body) == EXACT_READ_ERROR_BYTES
 
 
-def test_the_transport_bounds_the_whole_reply_by_the_timeout(loopback):
-    """A server trickling its answer (a byte every 50 ms, each read well inside the socket
+def test_the_transport_bounds_the_whole_body_by_the_timeout(loopback):
+    """A server trickling its body (a byte every 50 ms, each read well inside the socket
     timeout) is cut off at the deadline: an OSError, which the client reads as
-    inconclusive."""
+    inconclusive. The status line and headers are bounded per socket read only (#329)."""
     started = time.monotonic()
     with pytest.raises(OSError, match="took longer"):
         _get(loopback, "/slow", timeout=0.5)
