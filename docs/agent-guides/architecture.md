@@ -870,6 +870,18 @@ run outside that retry and return the created object's identity: an
 ambiguous outcome is reported as unknown, never re-sent, and the effect layer
 decides by reading. There is no generic passthrough of `gh` arguments.
 
+Its exact reads (`get_pr_exact`, `get_issue_exact`, `get_comment_exact`,
+#327) are the one path that does not go through `gh`: `gh` rewrites control
+characters and the text of their JSON escapes in every reply it prints, so
+an effect's completion read-back cannot prove a body from `gh`'s print. An
+exact read is one bounded, read-only HTTPS `GET` of one object under
+`https://api.github.com/`, with the token `gh auth token` prints, through an
+injectable transport (`https=`, default `github.https_get`). It is still the
+client's credential and the client's classification; the effect operations
+call it only to judge one object whose text `gh` printed otherwise, or
+whose payload holds a `^` another text can print as
+([GitHub safety](github-safety.md#ghs-sanitizer-and-the-exact-read-327)).
+
 ### Controller effects and git transport
 
 The effect layer sits between the engine and the GitHub client (ADR 0004):

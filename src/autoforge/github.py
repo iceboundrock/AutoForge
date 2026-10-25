@@ -23,15 +23,28 @@ agent claims, and it performs every GitHub write itself through it:
   its receipt and the compensating :meth:`GitHubClient.reopen_pr` for a
   verified replacement lifecycle, never deleting a branch; and the EPIC
   roadmap splice, :meth:`GitHubClient.edit_issue_body`.
+
+Every call goes through `gh` except the exact reads (#327):
+:meth:`GitHubClient.get_pr_exact`, :meth:`GitHubClient.get_issue_exact` and
+:meth:`GitHubClient.get_comment_exact` read one object from GitHub's REST
+API directly (:func:`https_get`), with the credential `gh auth token`
+prints, because `gh` rewrites the text it prints and an effect's read-back
+must compare GitHub's own bytes. They are read-only and bounded.
 """
 
 from __future__ import annotations
 
+import functools
+import http.client
+import io
 import json
 import os
 import re
+import ssl
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -625,6 +638,216 @@ class ClassicBranchProtection:
 
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
+
+# -- the exact read -------------------------------------------------------------
+# `gh` rewrites every JSON reply before printing it (go-gh's asciisanitizer on
+# the HTTP transport, which no flag turns off): a C0 or C1 control character
+# and its JSON escape become caret notation, and so does the *literal text* of
+# an escape, the six characters `\u001b` written in a body, which the reply
+# carries as `\\u001b` and `gh` prints as `\^[`. The rewrite is not reversible
+# (`\^[` is also what the literal text `\^[` reads as), so no comparison of
+# what `gh` printed can prove that a body is a given text. An effect's
+# completion read-back needs that proof; the exact read gives it, by reading
+# one object with GitHub's REST API directly, under the credential `gh` holds.
+# What it reads is compared, never printed.
+EXACT_READ_ROOT = "https://api.github.com/"
+# A PR, issue or comment object: 65536 characters of body, each at most 12
+# bytes as a JSON escape, plus the rest of the object, well inside this.
+EXACT_READ_MAX_BYTES = 1 << 21
+_EXACT_READ_HEADERS = (
+    ("Accept", "application/vnd.github+json"),
+    ("X-GitHub-Api-Version", "2022-11-28"),
+    ("User-Agent", "autoforge"),
+)
+_JSON_CONTENT_TYPE_RE = re.compile(r"^application/json\s*(?:;|$)", re.IGNORECASE)
+# What `gh auth token` may print: visible ASCII, so it can never end the
+# Authorization header and start another.
+_API_TOKEN_RE = re.compile(r"[\x21-\x7e]{1,4096}")
+
+
+@dataclass(frozen=True)
+class HttpsRequest:
+    """One GET of the exact read. ``headers`` carries the credential: never in a repr."""
+
+    url: str
+    headers: tuple[tuple[str, str], ...] = field(repr=False)
+    timeout_seconds: float
+    max_bytes: int
+
+
+@dataclass(frozen=True)
+class HttpsReply:
+    """What GitHub answered: the status, the headers (names lower-cased) and the body.
+
+    ``body`` is at most ``max_bytes + 1`` bytes, so a longer one is seen as
+    too long without being read whole. For a status that is not 2xx it is at
+    most :data:`EXACT_READ_ERROR_BYTES`, read only to tell a rate limit from
+    a refusal and never quoted.
+    """
+
+    status: int
+    headers: dict[str, str]
+    body: bytes = field(repr=False)
+
+
+HttpsGet = Callable[[HttpsRequest], HttpsReply]
+# What is read of an error reply: enough for GitHub's JSON message.
+EXACT_READ_ERROR_BYTES = 4096
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is the answer, never followed: a redirect would carry the credential elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class _DeadlineReader(io.RawIOBase):
+    """The raw reader of one reply: no receive on ``sock`` outlasts ``deadline``.
+
+    ``http.client`` reads everything of a reply through one buffered reader
+    over this: the status line, the headers, a chunked body's framing and its
+    trailers, and the body. One of its calls can take many receives (a line,
+    a chunk's size, the trailers after the last chunk), and a socket timeout
+    bounds each receive alone, so a server sending a byte at a time inside it
+    would never trip it. Each receive here waits at most until the deadline,
+    and none starts after it, whatever call it is part of.
+    """
+
+    def __init__(self, sock, deadline: float, timeout: float) -> None:
+        super().__init__()
+        self._sock = sock
+        self._raw = sock.makefile("rb", buffering=0)
+        self._deadline = deadline
+        self._timeout = timeout
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer):
+        remaining = self._deadline - time.monotonic()
+        try:
+            if remaining <= 0:
+                raise TimeoutError
+            self._sock.settimeout(remaining)
+            return self._raw.readinto(buffer)
+        except TimeoutError:  # the deadline has passed, or this receive reached it
+            raise TimeoutError(f"the reply took longer than {self._timeout:g}s") from None
+
+    def close(self) -> None:
+        if not self.closed:
+            self._raw.close()
+        super().close()
+
+
+class _DeadlineResponse(http.client.HTTPResponse):
+    """A reply read through a :class:`_DeadlineReader` instead of the socket's own file."""
+
+    def __init__(self, sock, *args, deadline, timeout, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        self.fp.close()  # nothing has been read from it
+        self.fp = io.BufferedReader(_DeadlineReader(sock, deadline, timeout))
+
+
+class _DeadlineHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    """Opens the request so that every reply on its connection is read by one deadline.
+
+    That is the request's reply, and a proxy's answer to the tunnel opened
+    for it. One handler serves both schemes, so the transport's tests on a
+    loopback ``http`` server read a reply as the read of GitHub does.
+    """
+
+    def __init__(self, context: ssl.SSLContext, deadline: float, timeout: float) -> None:
+        super().__init__(context=context)
+        self._response = functools.partial(_DeadlineResponse, deadline=deadline, timeout=timeout)
+
+    def do_open(self, http_class, req, **http_conn_args):
+        def connection(*args, **kwargs):
+            opened = http_class(*args, **kwargs)
+            opened.response_class = self._response
+            return opened
+
+        return super().do_open(connection, req, **http_conn_args)
+
+
+def _read_bounded(stream, limit: int) -> bytes:
+    """Up to ``limit`` bytes of ``stream``."""
+    body = bytearray()
+    while len(body) < limit:
+        chunk = stream.read1(min(1 << 16, limit - len(body)))
+        if not chunk:
+            break
+        body += chunk
+    return bytes(body)
+
+
+def _tls_context() -> ssl.SSLContext:
+    """A client context that verifies the certificate chain and the host name.
+
+    ``ssl.create_default_context`` with the system's trust store, without its
+    ``SSLKEYLOGFILE`` handling: that would write the session secrets of the
+    connection carrying the credential to a file (and fail every read when
+    the variable names an unwritable path). ``PROTOCOL_TLS_CLIENT`` sets
+    ``CERT_REQUIRED`` and ``check_hostname``.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_default_certs(ssl.Purpose.SERVER_AUTH)
+    return context
+
+
+def https_get(request: HttpsRequest) -> HttpsReply:
+    """The exact read's transport: one GET, the certificate verified, no redirect followed.
+
+    Connecting (the TCP connection, the TLS handshake, sending the request)
+    is bounded by ``timeout_seconds`` on each socket operation. The reply is
+    read in all within ``timeout_seconds`` of the call: its status line,
+    headers, a chunked body's framing and trailers, and its body
+    (:class:`_DeadlineReader`), so a server that trickles any of it cannot
+    hold the controller. The body is read up to ``max_bytes + 1`` bytes. A
+    status that is not 2xx is returned for the client to classify, with at
+    most :data:`EXACT_READ_ERROR_BYTES` of its body. Connection and TLS
+    failures, and the deadline, raise as ``urllib`` raises them (an
+    ``OSError``). The TLS context verifies the chain and the host name
+    (:func:`_tls_context`). The proxy variables
+    apply, as they do to `gh`; HTTPS through a proxy is a tunnel, so the
+    certificate verified is still GitHub's.
+    """
+    timeout = request.timeout_seconds
+    deadline = time.monotonic() + timeout
+    opener = urllib.request.build_opener(
+        _NoRedirect(), _DeadlineHandler(_tls_context(), deadline, timeout)
+    )
+    req = urllib.request.Request(request.url, headers=dict(request.headers), method="GET")
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            headers = {name.lower(): value for name, value in resp.headers.items()}
+            body = _read_bounded(resp, request.max_bytes + 1)
+            return HttpsReply(resp.status, headers, body)
+    except urllib.error.HTTPError as exc:
+        with exc:
+            headers = {name.lower(): value for name, value in (exc.headers or {}).items()}
+            limit = min(EXACT_READ_ERROR_BYTES, request.max_bytes)
+            body = _read_bounded(exc, limit) if exc.fp is not None else b""
+            return HttpsReply(exc.code, headers, body)
+
+
+def _exact_transport_failure(exc: Exception, what: str) -> GitHubError:
+    """What a failure the exact read's transport raised means; no reply was read.
+
+    A certificate that does not verify is conclusive (whoever answered is
+    not known to be GitHub); a connection that failed or broke is
+    inconclusive, as `gh`'s own are; anything else is conclusive.
+    """
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return GitHubError(
+            f"{what}: the TLS certificate did not verify ({redact(str(reason)):.200})"
+        )
+    detail = f"{type(exc).__name__}: {redact(str(exc)):.200}"
+    if isinstance(exc, (OSError, http.client.HTTPException)):
+        return GitHubUnavailableError(f"{what}: GitHub could not be read ({detail})")
+    return GitHubError(f"{what}: the exact read failed ({detail})")
+
 
 # The PR identity read (:meth:`GitHubClient.get_pr`): everything a caller
 # binds a PR by, and no check results. GitHub refuses a fine-grained token
@@ -1407,7 +1630,7 @@ def _decode_blocker(row: object, what: str) -> BlockerNode:
 
 
 class GitHubClient:
-    """Thin typed wrapper around `gh`. Inject ``runner`` for tests."""
+    """Thin typed wrapper around `gh`. Inject ``runner`` (and ``https``) for tests."""
 
     def __init__(
         self,
@@ -1416,10 +1639,12 @@ class GitHubClient:
         runner: Runner | None = None,
         transient_retries: int = 1,
         retry_delay_seconds: float = 2.0,
+        https: HttpsGet | None = None,
     ) -> None:
         self.gh_command = gh_command
         self.timeout_seconds = timeout_seconds
         self._runner: Runner = runner or execute
+        self._https: HttpsGet = https or https_get
         self.transient_retries = max(0, transient_retries)
         self.retry_delay_seconds = retry_delay_seconds
 
@@ -1629,6 +1854,81 @@ class GitHubClient:
                 )
         return [item for page in data for item in page]
 
+    def _api_token(self, what: str) -> str:
+        """The credential `gh` holds for github.com, for one exact read.
+
+        ``gh auth token`` prints the token `gh` itself would send (``GH_TOKEN``
+        or ``GITHUB_TOKEN`` when set, else the login's). It stays in memory for
+        the one request: never in argv, a file or a message. A failure names
+        the command and `gh`'s redacted stderr, never what it printed.
+        """
+        args = ["auth", "token", "--hostname", "github.com"]
+        res = self._invoke(args)
+        if res.timed_out:
+            raise GitHubUnavailableError(f"{what}: {self._timeout_message(args)}")
+        if res.exit_code != 0:
+            message, transient = self._exit_failure(args, res)
+            raise (GitHubUnavailableError if transient else GitHubError)(f"{what}: {message}")
+        token = "" if res.truncated else res.stdout.strip()
+        if not _API_TOKEN_RE.fullmatch(token):
+            raise GitHubError(f"{what}: `gh auth token` printed no usable credential")
+        return token
+
+    def _exact_object(self, path: str, what: str) -> dict:
+        """One REST object as GitHub holds it, past `gh`'s sanitizer (the exact read).
+
+        ``path`` is relative to :data:`EXACT_READ_ROOT`, built by a typed
+        caller from a parsed URL, so the read reaches GitHub's API and nothing
+        else. It sends one GET with the credential `gh` holds, follows no
+        redirect and reads a bounded reply. Failures are classified as `gh`'s
+        are: no connection, a 5xx, a 429 or a rate-limited 403 (by its headers
+        or GitHub's message) is GitHubUnavailableError (inconclusive), a 404
+        GitHubNotFoundError, and
+        any other status, a redirect, a certificate that does not verify, or a
+        reply that is not one JSON object within the bound a conclusive
+        GitHubError. No message quotes the reply.
+        """
+        assert_shared_git_lock_free("call GitHub")
+        # The credential goes straight into the request, whose repr leaves the
+        # headers out: no local of this frame holds it on its own.
+        request = HttpsRequest(
+            url=EXACT_READ_ROOT + path,
+            headers=(*_EXACT_READ_HEADERS, ("Authorization", "Bearer " + self._api_token(what))),
+            timeout_seconds=self.timeout_seconds,
+            max_bytes=EXACT_READ_MAX_BYTES,
+        )
+        try:
+            reply = self._https(request)
+        except Exception as exc:  # every transport failure is classified, none escapes
+            raise _exact_transport_failure(exc, what) from None
+        status = reply.status
+        # A primary limit sends its headers; a secondary limit may send neither,
+        # only GitHub's message, which is read for this and never quoted.
+        rate_limited = (
+            reply.headers.get("x-ratelimit-remaining") == "0"
+            or "retry-after" in reply.headers
+            or b"rate limit" in reply.body[:EXACT_READ_ERROR_BYTES].lower()
+        )
+        if status >= 500 or status == 429 or (status == 403 and rate_limited):
+            raise GitHubUnavailableError(f"{what}: GitHub answered HTTP {status}")
+        if status == 404:
+            raise GitHubNotFoundError(f"{what}: GitHub answered HTTP 404")
+        if status != 200:
+            redirect = " (a redirect, which is never followed)" if 300 <= status < 400 else ""
+            raise GitHubError(f"{what}: GitHub answered HTTP {status}{redirect}")
+        content_type = reply.headers.get("content-type", "")
+        if not _JSON_CONTENT_TYPE_RE.match(content_type):
+            raise GitHubError(f"{what}: GitHub answered {content_type[:80]!r}, not JSON")
+        if len(reply.body) > EXACT_READ_MAX_BYTES:
+            raise GitHubError(f"{what}: the reply is over {EXACT_READ_MAX_BYTES} bytes")
+        try:
+            data = json.loads(reply.body.decode("utf-8"))
+        except ValueError:
+            raise GitHubError(f"{what}: the reply is not UTF-8 JSON") from None
+        if not isinstance(data, dict):
+            raise GitHubError(f"{what}: the reply is not a JSON object")
+        return data
+
     # -- environment / doctor --------------------------------------------
     def version(self) -> str:
         res = self._run_gh(["--version"])
@@ -1766,6 +2066,21 @@ class GitHubClient:
             raise GitHubWrongTargetError(
                 f"issue {ref.canonical}: `gh` answered with {issue.url}", issue.url
             )
+        return issue
+
+    def get_issue_exact(self, url: str) -> IssueInfo:
+        """The issue as GitHub holds it, its title and body byte for byte (the exact read).
+
+        :meth:`get_pr_exact` for an issue. A pull request of that number, or
+        an issue transferred away (GitHub redirects it), is a conclusive
+        GitHubError.
+        """
+        ref = parse_issue_url(url)
+        what = f"exact read of {ref.canonical}"
+        path = f"repos/{_repository_path(ref.repository)}/issues/{ref.number}"
+        issue = _decode_issue(_rest_issue_row(self._exact_object(path, what)), what)
+        if not parse_issue_url(issue.url).same_target(ref):
+            raise GitHubWrongTargetError(f"{what}: GitHub answered with {issue.url}", issue.url)
         return issue
 
     def get_issue_state(self, url: str) -> str:
@@ -1946,6 +2261,25 @@ class GitHubClient:
         does not judge checks uses this read.
         """
         return self._view_pr(url, _PR_FIELDS)
+
+    def get_pr_exact(self, url: str) -> PRInfo:
+        """The PR as GitHub holds it, its title and body byte for byte (the exact read).
+
+        The fields a REST listing row carries (:meth:`list_prs_for_head`),
+        through the one PR decoder: state, HEAD, refs, head repository, title
+        and body; no checks, closing issues or mergeability. An effect's
+        read-back makes it when the text `gh` printed differs from the
+        payload, since `gh`'s sanitizer may have rewritten it. An answer
+        naming another PR is a conclusive GitHubError.
+        """
+        ref = parse_pr_url(url)
+        what = f"exact read of {ref.canonical}"
+        path = f"repos/{_repository_path(ref.repository)}/pulls/{ref.number}"
+        data = self._exact_object(path, what)
+        pr = self._pr_from_data(_rest_pr_row(data, what), what)
+        if not parse_pr_url(pr.url).same_target(ref):
+            raise GitHubError(f"{what}: GitHub answered with {pr.url}")
+        return pr
 
     def get_pr_with_checks(self, url: str) -> PRInfo:
         """The PR's checks read: the identity fields and the head's check results, at once.
@@ -2876,8 +3210,27 @@ class GitHubClient:
         )
         return _decode_rest_comment(data, ref)
 
+    def get_comment_exact(self, comment_url: str) -> CommentInfo:
+        """The comment as GitHub holds it, its body byte for byte (the exact read).
+
+        :meth:`get_pr_exact` for an issue-style comment. Unlike
+        :meth:`get_comment`, an answer for a comment on another parent than
+        the URL names is a conclusive GitHubError: the read-back compares a
+        comment it found on that parent.
+        """
+        ref: GitHubCommentRef = parse_comment_url(comment_url)
+        what = f"exact read of {ref.canonical}"
+        path = f"repos/{_repository_path(ref.parent.repository)}/issues/comments/{ref.comment_id}"
+        comment = _decode_rest_comment(self._exact_object(path, what), ref)
+        if not parse_comment_url(comment.url).same_target(ref):
+            raise GitHubError(f"{what}: GitHub answered with {comment.url}")
+        return comment
+
 
 __all__ = [
+    "EXACT_READ_ERROR_BYTES",
+    "EXACT_READ_MAX_BYTES",
+    "EXACT_READ_ROOT",
     "MAX_BODY_CHARS",
     "MAX_TITLE_CHARS",
     "MERGE_METHODS",
@@ -2887,6 +3240,8 @@ __all__ = [
     "GitHubClient",
     "GitHubIssueRef",
     "GitHubPullRequestRef",
+    "HttpsReply",
+    "HttpsRequest",
     "IssueInfo",
     "MergeQueueStatus",
     "PRInfo",
@@ -2894,4 +3249,5 @@ __all__ = [
     "build_disable_auto_merge_argv",
     "build_edit_issue_body_argv",
     "build_merge_argv",
+    "https_get",
 ]

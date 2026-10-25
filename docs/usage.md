@@ -224,6 +224,12 @@ the plan was saved (put the branch back, or delete it if it did not exist,
 then `unblock`: the plan completes without launching the agent). A default
 branch changed after the plan was saved blocks before the planned PR is
 created: make the planned branch the default again, then `unblock`.
+A run that an earlier version blocked on the controller's own PR, issue or
+comment because its text held something like `\u001b` (#327: `gh` prints
+that text as `\^[`, so the read-back saw another body) needs only
+`unblock`: the read-back now reads the object's exact text from GitHub and
+binds it, with nothing written again
+([GitHub safety](agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)).
 `REVIEW` blocks on a comment carrying the round's review marker that it did
 not post, whether it was there before the reviewer ran (a human's, or one a
 reviewer of an earlier AutoForge version posted) or appeared while it ran:

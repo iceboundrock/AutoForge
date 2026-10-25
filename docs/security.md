@@ -335,7 +335,14 @@ published there
 AutoForge uses the `gh` login of the user who runs it (or the `GH_TOKEN`
 of the shell you start it from) for every GitHub call, and hands it to git
 through `gh auth git-credential` for every fetch and push; agents never see
-it. Every call AutoForge makes is about the run's repository: none reads
+it. One kind of read goes around `gh`: to check that a PR, issue or comment
+it created holds exactly the text it sent, AutoForge reads that one object
+from `https://api.github.com/` itself, with the token `gh auth token`
+prints, because `gh` rewrites control characters in what it prints (#327).
+That read is a `GET`, follows no redirect, verifies GitHub's certificate,
+ignores `SSLKEYLOGFILE` (so no TLS key log of that connection is written),
+and keeps the token in memory for the one request; it needs no permission
+beyond reading the object. Every call AutoForge makes is about the run's repository: none reads
 the user, an organization, a team or a project. The one exception is a
 "blocked by" link of an EPIC's issue to an issue in another repository,
 which `autoforge epic` reads; a token that cannot read it keeps that issue

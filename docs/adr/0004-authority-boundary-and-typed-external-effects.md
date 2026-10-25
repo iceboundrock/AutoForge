@@ -564,6 +564,23 @@ published, and §2.9 applies to it.
 
 A listing that cannot be read to the end is `BLOCKED`, as today.
 
+**D4.5a (#327).** A complete identity read through `gh` proves which
+objects carry an identity, but not their text: `gh` rewrites control
+characters, and the literal text of their JSON escapes, into caret
+notation before printing, and the rewrite is not reversible. A create
+kind's completion read-back that finds exactly one object, whose
+conditions other than its title and body hold and whose text differs on
+`gh`'s read or whose payload holds a `^` (every rewrite leaves one, so only
+such a payload can read back equal from other bytes), reads that object
+again through the client's exact read (one bounded, read-only REST `GET`
+under `https://api.github.com/`, with the credential `gh` holds, never
+redirected) and judges the whole completion predicate on it, byte for
+byte. Two holders, or one whose other conditions fail, are decided as
+before, without it. An exact read that fails raises as an identity read
+does: nothing is persisted or sent, and a conclusive failure blocks.
+[GitHub safety](../agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)
+has the boundary and its limits.
+
 **D4.6 (#160).** **The completion context.** Once its effects are observed,
 a phase still has work to do: `_apply_review` consumes the round and applies
 the replan policy, `_apply_fix` records the resolutions, and

@@ -1,11 +1,19 @@
 """GitHub client with injected fake `gh` runner (no network)."""
 
+import http.client
+import http.server
 import json
 import os
+import ssl
+import threading
+import time
+import urllib.error
+import urllib.request
 from dataclasses import replace
 
 import pytest
 
+import autoforge.github as github_module
 from autoforge.errors import (
     ConfigurationError,
     GitHubChecksAccessError,
@@ -17,6 +25,9 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionResult
 from autoforge.github import (
+    EXACT_READ_ERROR_BYTES,
+    EXACT_READ_MAX_BYTES,
+    EXACT_READ_ROOT,
     MAX_BODY_CHARS,
     MAX_TITLE_CHARS,
     STRICT_ISSUE_LIST_LIMIT,
@@ -24,14 +35,18 @@ from autoforge.github import (
     ActionsRunRef,
     ChangedFile,
     GitHubClient,
+    HttpsReply,
+    HttpsRequest,
     WorkflowJob,
     checks_access_denial,
+    https_get,
     is_access_denied_gh_failure,
     is_checks_access_denied_gh_failure,
     is_plan_limited_gh_failure,
     parse_actions_run_url,
 )
 from autoforge.validation import parse_pr_url
+from tests.conftest import gh_sanitized, gh_sanitized_json
 
 
 def _res(payload: object, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
@@ -3409,3 +3424,568 @@ def test_graph_reads_keep_the_transient_retry_of_reads(read):
     assert len(attempts) == 3
     # Every graph read is a plain GET: no method override, no payload.
     assert all("--method" not in argv and "--input" not in argv for argv in attempts)
+
+
+# -- `gh`'s JSON sanitizer, as the fakes model it (#327) ---------------------------------
+#
+# go-gh v2.17.0 (linked by gh 2.103), pkg/asciisanitizer/sanitizer_test.go,
+# TestSanitizerTransform: every vector, Go raw strings as Python raw strings
+# and Go's UTF-8 escapes of C1 characters as the characters. The vectors
+# without ``json`` carry no escape text, so the JSON-mode port answers them
+# as upstream's raw mode does.
+_UPSTREAM_SANITIZER_VECTORS = [
+    pytest.param(
+        "The quick brown fox jumped over the lazy dog",
+        "The quick brown fox jumped over the lazy dog",
+        id="no-control-characters",
+    ),
+    pytest.param(
+        r"\u001B \\u001B \\\u001B \\\\u001B \\u001B\\u001B",
+        r"^[ \\^[ \\^[ \\\\^[ \\^[\\^[",
+        id="json-keeps-valid-json",
+    ),
+    pytest.param(r"0\u0000", "0^@", id="json-c0-character"),
+    pytest.param(
+        r"0\u0000 1\u0001 2\u0002 3\u0003 4\u0004 5\u0005 6\u0006 7\u0007 8\u0008 9\u0009 "
+        r"A\u000a B\u000b C\u000c D\u000d E\u000e F\u000f "
+        r"10\u0010 11\u0011 12\u0012 13\u0013 14\u0014 15\u0015 16\u0016 17\u0017 18\u0018 "
+        r"19\u0019 1A\u001a 1B\u001b 1C\u001c 1D\u001d 1E\u001e 1F\u001f",
+        r"0^@ 1^A 2^B 3^C 4^D 5^E 6^F 7^G 8^H 9\u0009 "
+        r"A\u000a B\u000b C^L D\u000d E^N F^O "
+        r"10^P 11^Q 12^R 13^S 14^T 15^U 16^V 17^W 18^X "
+        r"19^Y 1A^Z 1B^[ 1C^\\ 1D^] 1E^^ 1F^_",
+        id="json-c0-characters",
+    ),
+    pytest.param(
+        r"80\u0080 81\u0081 82\u0082 83\u0083 84\u0084 85\u0085 86\u0086 87\u0087 88\u0088 "
+        r"89\u0089 8A\u008a 8B\u008b 8C\u008c 8D\u008d 8E\u008e 8F\u008f "
+        r"90\u0090 91\u0091 92\u0092 93\u0093 94\u0094 95\u0095 96\u0096 97\u0097 98\u0098 "
+        r"99\u0099 9A\u009a 9B\u009b 9C\u009c 9D\u009d 9E\u009e 9F\u009f",
+        r"80^@ 81^A 82^B 83^C 84^D 85^E 86^F 87^G 88^H "
+        r"89^I 8A^J 8B^K 8C^L 8D^M 8E^N 8F^O "
+        r"90^P 91^Q 92^R 93^S 94^T 95^U 96^V 97^W 98^X "
+        r"99^Y 9A^Z 9B^[ 9C^\\ 9D^] 9E^^ 9F^_",
+        id="json-c1-characters",
+    ),
+    pytest.param("0\x00", "0^@", id="c0-character"),
+    pytest.param(
+        "0\x00 1\x01 2\x02 3\x03 4\x04 5\x05 6\x06 7\x07 8\x08 9\x09 "
+        "A\x0a B\x0b C\x0c D\x0d E\x0e F\x0f "
+        "10\x10 11\x11 12\x12 13\x13 14\x14 15\x15 16\x16 17\x17 18\x18 19\x19 "
+        "1A\x1a 1B\x1b 1C\x1c 1D\x1d 1E\x1e 1F\x1f",
+        "0^@ 1^A 2^B 3^C 4^D 5^E 6^F 7^G 8^H 9\t "
+        "A\n B\v C^L D\r E^N F^O "
+        "10^P 11^Q 12^R 13^S 14^T 15^U 16^V 17^W 18^X 19^Y "
+        "1A^Z 1B^[ 1C^\\\\ 1D^] 1E^^ 1F^_",
+        id="c0-characters",
+    ),
+    pytest.param("80\x80", "80^@", id="c1-character"),
+    pytest.param(
+        "80\x80 81\x81 82\x82 83\x83 84\x84 85\x85 86\x86 87\x87 88\x88 89\x89 "
+        "8A\x8a 8B\x8b 8C\x8c 8D\x8d 8E\x8e 8F\x8f "
+        "90\x90 91\x91 92\x92 93\x93 94\x94 95\x95 96\x96 97\x97 98\x98 99\x99 "
+        "9A\x9a 9B\x9b 9C\x9c 9D\x9d 9E\x9e 9F\x9f",
+        "80^@ 81^A 82^B 83^C 84^D 85^E 86^F 87^G 88^H 89^I "
+        "8A^J 8B^K 8C^L 8D^M 8E^N 8F^O "
+        "90^P 91^Q 92^R 93^S 94^T 95^U 96^V 97^W 98^X 99^Y "
+        "9A^Z 9B^[ 9C^\\\\ 9D^] 9E^^ 9F^_",
+        id="c1-characters",
+    ),
+]
+
+
+@pytest.mark.parametrize(("wire", "printed"), _UPSTREAM_SANITIZER_VECTORS)
+def test_the_fakes_sanitizer_is_gh_s_on_upstream_s_own_vectors(wire, printed):
+    """The fakes' model of `gh`'s sanitizer (``gh_sanitized_json``) is go-gh's: every
+    vector of upstream's own test, so what a fake prints is what `gh` prints."""
+    assert gh_sanitized_json(wire) == printed
+
+
+def test_gh_prints_the_text_of_an_escape_as_caret_notation_and_loses_which_it_was():
+    """PR #314: a body holding the six characters ``\\u001b`` reads back through `gh`
+    three characters shorter, as ``\\^[``, which is also how the literal text
+    ``\\^[`` reads. The rewrite is not reversible, so no comparison of what `gh`
+    printed proves a text; a real ESC becomes ``^[``. Text without a control
+    character or its escape text prints as it is."""
+    sent = "caret notation (`\\u001b[0m`)"
+    printed = gh_sanitized(sent)
+    assert printed == "caret notation (`\\^[[0m`)"
+    assert len(sent) - len(printed) == 3
+    assert gh_sanitized("caret notation (`\\^[[0m`)") == printed
+    assert gh_sanitized("\x1b[0m and \x9b31m") == "^[[0m and ^[31m"
+    plain = "## Summary\n\n- tabs\tand CRLF\r\n kept; `\\n` and `\\\\` too\n<!-- autoforge -->"
+    assert gh_sanitized(plain) == plain
+
+
+# -- the exact read: GitHub's REST API past `gh`'s sanitizer (#327) ------------------------
+
+_EXACT_TOKEN = "gho_ExactReadStandin0123456789abcdefABCD"
+# Text `gh` would print otherwise: escape text, a real ESC and a C1 CSI.
+_EXACT_TEXT = "caret notation (`\\u001b[0m`), a real \x1b[1mESC\x1b[0m and \x9b31m"
+_EXACT_PR_URL = "https://github.com/o/r/pull/42"
+_EXACT_ISSUE_URL = "https://github.com/o/r/issues/7"
+_EXACT_COMMENT_URL = "https://github.com/o/r/pull/42#issuecomment-5"
+
+
+def _json_reply(data: object, status: int = 200, **headers: str) -> HttpsReply:
+    return HttpsReply(
+        status,
+        {"content-type": "application/json; charset=utf-8", **headers},
+        json.dumps(data, ensure_ascii=False).encode(),
+    )
+
+
+def _exact_client(reply=None, *, token: ExecutionResult | None = None, raises=None):
+    """A client whose `gh` only prints a token and whose HTTPS transport is recorded."""
+    gh_calls: list = []
+    gets: list[HttpsRequest] = []
+
+    def runner(req):
+        gh_calls.append(req)
+        assert req.command == ["gh", "auth", "token", "--hostname", "github.com"]
+        assert req.stdin_data is None
+        return token if token is not None else _raw(_EXACT_TOKEN + "\n")
+
+    def https(request: HttpsRequest) -> HttpsReply:
+        gets.append(request)
+        if raises is not None:
+            raise raises
+        return reply
+
+    client = GitHubClient(runner=runner, https=https, timeout_seconds=17, retry_delay_seconds=0)
+    return gh_calls, gets, client
+
+
+_EXACT_READS = [
+    pytest.param(
+        "get_pr_exact",
+        _EXACT_PR_URL,
+        {**_rest_pr(42), "title": _EXACT_TEXT, "body": _EXACT_TEXT},
+        "repos/o/r/pulls/42",
+        id="pr",
+    ),
+    pytest.param(
+        "get_issue_exact",
+        _EXACT_ISSUE_URL,
+        {**_listing_row(7, 0), "title": _EXACT_TEXT, "body": _EXACT_TEXT},
+        "repos/o/r/issues/7",
+        id="issue",
+    ),
+    pytest.param(
+        "get_comment_exact",
+        _EXACT_COMMENT_URL,
+        _rest_comment(body=_EXACT_TEXT),
+        "repos/o/r/issues/comments/5",
+        id="comment",
+    ),
+]
+
+
+@pytest.mark.parametrize(("read", "url", "row", "path"), _EXACT_READS)
+def test_an_exact_read_returns_github_s_text_byte_for_byte_with_one_bounded_get(
+    read, url, row, path
+):
+    """One GET of the object under GitHub's API root, with the token `gh auth token`
+    printed as a bearer credential, the client's timeout and the size bound. The text
+    comes back as GitHub holds it: escape text, ESC and C1 characters unchanged."""
+    gh_calls, gets, client = _exact_client(_json_reply(row))
+    obj = getattr(client, read)(url)
+
+    assert obj.body == _EXACT_TEXT
+    if read != "get_comment_exact":
+        assert obj.title == _EXACT_TEXT
+    (request,) = gets
+    assert request.url == EXACT_READ_ROOT + path == f"https://api.github.com/{path}"
+    assert dict(request.headers) == {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "autoforge",
+        "Authorization": f"Bearer {_EXACT_TOKEN}",
+    }
+    assert request.timeout_seconds == 17 and request.max_bytes == EXACT_READ_MAX_BYTES
+    # The credential is read by `gh auth token` alone, and is never in a repr.
+    (token_call,) = gh_calls
+    assert token_call.command == ["gh", "auth", "token", "--hostname", "github.com"]
+    assert _EXACT_TOKEN not in repr(request)
+
+
+def test_the_identity_read_through_gh_and_the_exact_read_differ_only_by_the_sanitizer():
+    """The same PR, read through `gh` (its JSON through the sanitizer) and exactly: the
+    identity fields agree, and only the exact read holds the body as GitHub does."""
+    rest = {**_rest_pr(42), "body": _EXACT_TEXT}
+    view = {
+        **_VIEW_ROW,
+        "body": _EXACT_TEXT,
+        "headRepository": {"name": "r"},
+        "headRepositoryOwner": {"login": "o"},
+    }
+    printed = gh_sanitized_json(json.dumps(view, ensure_ascii=False))
+    through_gh = _client(lambda req: replace(_res(None), stdout=printed)).get_pr(_EXACT_PR_URL)
+    _, _, client = _exact_client(_json_reply(rest))
+    exact = client.get_pr_exact(_EXACT_PR_URL)
+
+    assert through_gh.body == gh_sanitized(_EXACT_TEXT) != _EXACT_TEXT
+    assert exact.body == _EXACT_TEXT
+    assert (exact.number, exact.state, exact.base_ref) == (42, "OPEN", "main")
+    assert (through_gh.number, through_gh.state, through_gh.base_ref) == (42, "OPEN", "main")
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "expected"),
+    [
+        (500, {}, GitHubUnavailableError),
+        (502, {}, GitHubUnavailableError),
+        (503, {}, GitHubUnavailableError),
+        (429, {}, GitHubUnavailableError),
+        (403, {"x-ratelimit-remaining": "0"}, GitHubUnavailableError),
+        (403, {"retry-after": "60"}, GitHubUnavailableError),
+        (401, {}, GitHubError),
+        (403, {}, GitHubError),
+        (404, {}, GitHubNotFoundError),
+        (301, {"location": "https://evil.example/"}, GitHubError),
+        (302, {}, GitHubError),
+        (201, {}, GitHubError),
+    ],
+)
+def test_an_exact_read_classifies_github_s_status(status, headers, expected):
+    """A 5xx, a 429 or a rate-limited 403 is inconclusive (read again later); a 404 is
+    not found; anything else that is not 200 (401, a plain 403, a redirect, which is
+    never followed) is conclusive. No message quotes the token."""
+    _, _, client = _exact_client(_json_reply(_rest_pr(42), status, **headers))
+    with pytest.raises(GitHubError) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is expected
+    assert f"HTTP {status}" in str(info.value)
+    assert _EXACT_TOKEN not in str(info.value)
+    if 300 <= status < 400:
+        assert "never followed" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            b'{"message": "You have exceeded a secondary rate limit. Please wait."}',
+            GitHubUnavailableError,
+        ),
+        (b'{"message": "API rate limit exceeded for user ID 1."}', GitHubUnavailableError),
+        (b'{"message": "Resource not accessible by integration"}', GitHubError),
+        (b"", GitHubError),
+    ],
+    ids=["secondary-limit", "primary-limit", "refused", "no-body"],
+)
+def test_a_403_is_a_rate_limit_by_github_s_message_too_and_never_quoted(message, expected):
+    """A secondary rate limit can answer 403 with neither rate-limit header: GitHub's
+    message says so, and it is read for that alone, never repeated."""
+    _, _, client = _exact_client(HttpsReply(403, {"content-type": "application/json"}, message))
+    with pytest.raises(GitHubError) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is expected
+    assert "secondary" not in str(info.value) and "integration" not in str(info.value)
+
+
+_HOSTILE_REPLY = f'{{"body": "{_SECRET} \x1b]8;;https://attacker.example/\x07'.encode()
+
+
+@pytest.mark.parametrize(
+    ("headers", "body", "needle"),
+    [
+        ({"content-type": "text/html"}, b"<html>", "not JSON"),
+        ({"content-type": "application/vnd.github+json"}, b"{}", "not JSON"),
+        ({}, b"{}", "not JSON"),
+        (
+            {"content-type": "application/json"},
+            b"{" + b" " * EXACT_READ_MAX_BYTES + b"}",
+            f"over {EXACT_READ_MAX_BYTES} bytes",
+        ),
+        ({"content-type": "application/json"}, b'{"body": "\xff\xfe"}', "not UTF-8 JSON"),
+        ({"content-type": "application/json"}, _HOSTILE_REPLY, "not UTF-8 JSON"),
+        ({"content-type": "application/json"}, b"[1, 2]", "not a JSON object"),
+        ({"content-type": "application/json"}, b'"text"', "not a JSON object"),
+    ],
+    ids=["html", "vendor-type", "no-type", "oversize", "bad-utf8", "truncated", "array", "string"],
+)
+def test_an_exact_read_refuses_a_reply_that_is_not_one_bounded_json_object(headers, body, needle):
+    """Fail closed on the reply: conclusive, and never quoting what came back."""
+    _, _, client = _exact_client(HttpsReply(200, headers, body))
+    with pytest.raises(GitHubError, match=needle) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is GitHubError
+    for fragment in (_SECRET, "attacker", "\x1b", "<html>"):
+        assert fragment not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("read", "url", "row", "error"),
+    [
+        ("get_pr_exact", _EXACT_PR_URL, _rest_pr(43), GitHubError),
+        ("get_issue_exact", _EXACT_ISSUE_URL, _listing_row(8, 0), GitHubWrongTargetError),
+        (
+            "get_comment_exact",
+            _EXACT_COMMENT_URL,
+            _rest_comment(html_url="https://github.com/o/r/pull/41#issuecomment-5"),
+            GitHubError,
+        ),
+    ],
+    ids=["pr", "issue", "comment"],
+)
+def test_an_exact_read_answered_with_another_object_is_conclusive(read, url, row, error):
+    _, _, client = _exact_client(_json_reply(row))
+    with pytest.raises(error, match="GitHub answered with"):
+        getattr(client, read)(url)
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected", "needle"),
+    [
+        (urllib.error.URLError(ConnectionRefusedError(111, "refused")), GitHubUnavailableError, ""),
+        (TimeoutError("timed out"), GitHubUnavailableError, "timed out"),
+        (http.client.RemoteDisconnected("closed"), GitHubUnavailableError, "closed"),
+        (
+            urllib.error.URLError(ssl.SSLCertVerificationError(1, "self-signed certificate")),
+            GitHubError,
+            "did not verify",
+        ),
+        (ValueError("unknown url type"), GitHubError, "failed"),
+        (OSError(f"proxy said Authorization: Bearer {_SECRET}"), GitHubUnavailableError, ""),
+    ],
+    ids=["refused", "timeout", "disconnected", "certificate", "other", "credential-in-error"],
+)
+def test_an_exact_read_classifies_a_transport_failure_and_redacts_it(raised, expected, needle):
+    """No connection, a timeout or a broken reply is inconclusive; a certificate that
+    does not verify, or anything else, conclusive. The text is redacted."""
+    _, _, client = _exact_client(raises=raised)
+    with pytest.raises(GitHubError) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is expected
+    assert needle in str(info.value)
+    assert _SECRET not in str(info.value) and _EXACT_TOKEN not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("token", "expected", "needle"),
+    [
+        (
+            _raw("", exit_code=1, stderr="You are not logged into any GitHub hosts."),
+            GitHubError,
+            "not logged",
+        ),
+        (_raw("", exit_code=1, stderr="HTTP 502: Bad Gateway"), GitHubUnavailableError, "502"),
+        (replace(_raw(""), timed_out=True, exit_code=-9), GitHubUnavailableError, "timed out"),
+        (_raw("\n"), GitHubError, "no usable credential"),
+        (_raw("gho_one gho_two\n"), GitHubError, "no usable credential"),
+        (_raw("gho_x\r\nX-Injected: 1\n"), GitHubError, "no usable credential"),
+        (replace(_raw(_EXACT_TOKEN), stdout_truncated=True), GitHubError, "no usable credential"),
+    ],
+    ids=["unauthenticated", "transient", "timeout", "empty", "two-words", "header-split", "cut"],
+)
+def test_an_exact_read_without_a_usable_credential_sends_nothing(token, expected, needle):
+    """`gh auth token` failing, or printing anything but one visible token, ends the read
+    before any request: the failure classified as `gh`'s are, what it printed unquoted."""
+    _, gets, client = _exact_client(_json_reply(_rest_pr(42)), token=token)
+    with pytest.raises(GitHubError, match=needle) as info:
+        client.get_pr_exact(_EXACT_PR_URL)
+    assert type(info.value) is expected
+    assert gets == []
+    assert "gho_one" not in str(info.value) and "X-Injected" not in str(info.value)
+
+
+def test_an_exact_read_refuses_a_url_outside_github_before_any_request():
+    """The path is built from a parsed github.com URL: nothing else is reachable."""
+    gh_calls, gets, client = _exact_client(_json_reply(_rest_pr(42)))
+    for url in ("https://evil.example/o/r/pull/42", "https://github.com/o/../pull/42"):
+        with pytest.raises((GitHubError, ConfigurationError)):
+            client.get_pr_exact(url)
+    assert gh_calls == [] and gets == []
+
+
+# -- the exact read's transport, against a loopback server ---------------------------------
+
+
+class _Loopback(http.server.BaseHTTPRequestHandler):
+    """Answers by path; records each request's path and headers on the server."""
+
+    def log_message(self, *args) -> None:  # keep pytest's output clean
+        pass
+
+    def do_GET(self) -> None:
+        self.server.seen.append((self.path, dict(self.headers.items())))
+        if self.path == "/ok":
+            self._answer(200, b'{"ok": true}')
+        elif self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/ok")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/big":
+            self._answer(200, b"x" * 5000)
+        elif self.path == "/error":
+            self._answer(500, b"an error body that is never quoted")
+        elif self.path == "/big-error":
+            self._answer(403, b"y" * 10_000)
+        elif self.path == "/slow":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            for _ in range(100):
+                try:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.05)
+        elif self.path == "/chunked":
+            self.wfile.write(_CHUNKED_HEAD + _CHUNKED_BODY + b"0\r\nX-Trailer: x\r\n\r\n")
+        # Each of these sends a byte or a line every 100 ms for 6 s, each receive well
+        # inside the socket timeout, so only a deadline on the whole reply ends it.
+        elif self.path == "/slow-headers":
+            self._trickle(b"HTTP/1.1 200 OK\r\n", b"X-Slow: x\r\n", b"Content-Length: 0\r\n\r\n")
+        elif self.path == "/slow-chunk-size":
+            # A chunk extension: http.client reads the chunk-size line in one call.
+            self._trickle(_CHUNKED_HEAD + b"c;", b"x", b'\r\n{"ok": true}\r\n0\r\n\r\n')
+        elif self.path == "/slow-trailers":
+            # The whole body, then trailers, which http.client reads and discards
+            # inside the call that returns the end of the body.
+            self._trickle(_CHUNKED_HEAD + _CHUNKED_BODY + b"0\r\n", b"X-Trailer: x\r\n", b"\r\n")
+        elif self.path == "/slow-error":
+            head = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 60\r\n\r\n"
+            self._trickle(head, b" ", b"")
+
+    def do_CONNECT(self) -> None:
+        """A proxy that trickles its answer to the tunnel an ``https`` read opens."""
+        self.server.seen.append((self.path, dict(self.headers.items())))
+        self._trickle(b"HTTP/1.1 200 Connection established\r\n", b"X-Proxy: x\r\n", b"\r\n")
+
+    def _answer(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _trickle(self, head: bytes, piece: bytes, tail: bytes) -> None:
+        """Raw bytes: ``head``, then ``piece`` 60 times 100 ms apart, then ``tail``."""
+        try:
+            self.wfile.write(head)
+            for _ in range(60):
+                time.sleep(0.1)
+                self.wfile.write(piece)
+            self.wfile.write(tail)
+        except OSError:  # the client gave up
+            return
+
+
+_CHUNKED_HEAD = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+)
+_CHUNKED_BODY = b'5\r\n{"ok"\r\n7\r\n: true}\r\n'
+
+
+@pytest.fixture
+def loopback(monkeypatch):
+    for name in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Loopback)
+    server.daemon_threads = True
+    server.seen = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+def _get(server, path: str, *, max_bytes: int = 1000, timeout: float = 5) -> HttpsReply:
+    url = f"http://127.0.0.1:{server.server_address[1]}{path}"
+    headers = (("Accept", "application/json"), ("Authorization", "Bearer loopback-token"))
+    return https_get(HttpsRequest(url, headers, timeout, max_bytes))
+
+
+def test_the_transport_sends_the_headers_and_returns_the_answer(loopback):
+    reply = _get(loopback, "/ok")
+    assert (reply.status, reply.body) == (200, b'{"ok": true}')
+    assert reply.headers["content-type"] == "application/json; charset=utf-8"
+    ((path, headers),) = loopback.seen
+    assert path == "/ok" and headers["Authorization"] == "Bearer loopback-token"
+
+
+def test_the_transport_never_follows_a_redirect(loopback):
+    """A redirect would carry the credential to wherever it points: it is the answer."""
+    reply = _get(loopback, "/redirect")
+    assert reply.status == 302 and reply.body == b""
+    assert [path for path, _ in loopback.seen] == ["/redirect"]
+
+
+def test_the_transport_reads_one_byte_past_the_bound_and_no_more(loopback):
+    assert len(_get(loopback, "/big", max_bytes=1000).body) == 1001
+    assert len(_get(loopback, "/big", max_bytes=10_000).body) == 5000
+
+
+def test_the_transport_reads_an_error_body_only_to_its_small_bound(loopback):
+    """An error body is read for the client to tell a rate limit from a refusal, at
+    most EXACT_READ_ERROR_BYTES of it."""
+    reply = _get(loopback, "/error")
+    assert (reply.status, reply.body) == (500, b"an error body that is never quoted")
+    reply = _get(loopback, "/big-error", max_bytes=100_000)
+    assert reply.status == 403 and len(reply.body) == EXACT_READ_ERROR_BYTES
+
+
+def test_the_transport_reads_a_chunked_reply_whole(loopback):
+    reply = _get(loopback, "/chunked")
+    assert (reply.status, reply.body) == (200, b'{"ok": true}')
+
+
+@pytest.mark.parametrize(
+    "path", ["/slow", "/slow-headers", "/slow-chunk-size", "/slow-trailers", "/slow-error"]
+)
+def test_the_transport_bounds_the_whole_reply_by_the_timeout(loopback, path):
+    """A server trickling any part of its reply (the body, the status line and headers,
+    a chunk's framing, the trailers after the last chunk, an error body), each receive
+    well inside the socket timeout, is cut off at the deadline: an OSError, which the
+    client reads as inconclusive."""
+    started = time.monotonic()
+    with pytest.raises(OSError, match="took longer"):
+        _get(loopback, path, timeout=0.5)
+    assert time.monotonic() - started < 3
+
+
+def test_the_transport_bounds_a_proxy_s_answer_to_its_tunnel_by_the_timeout(loopback, monkeypatch):
+    """Through a proxy, an ``https`` read first opens a tunnel; the proxy's answer is read
+    by the same deadline. The tunnel never opens, so nothing reaches the named host."""
+    monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{loopback.server_address[1]}")
+    started = time.monotonic()
+    with pytest.raises(OSError, match="took longer"):
+        https_get(HttpsRequest("https://example.invalid/x", (), 0.5, 1000))
+    assert time.monotonic() - started < 3
+    assert [path for path, _ in loopback.seen] == ["example.invalid:443"]
+
+
+def test_the_transport_verifies_github_s_certificate_and_writes_no_key_log(monkeypatch, tmp_path):
+    """The TLS context verifies the certificate chain and the host name, and ignores
+    SSLKEYLOGFILE: the session secrets of the connection carrying the credential are
+    never written to a file (nor is the file opened, which would fail every read for
+    a path that cannot be written)."""
+    keylog = tmp_path / "keys.log"
+    monkeypatch.setenv("SSLKEYLOGFILE", str(keylog))
+    contexts: list[ssl.SSLContext] = []
+    make = github_module._tls_context
+
+    def recording():
+        contexts.append(make())
+        return contexts[-1]
+
+    monkeypatch.setattr(github_module, "_tls_context", recording)
+
+    def refuse(self, req, *args, **kwargs):
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", refuse)
+    with pytest.raises(urllib.error.URLError):
+        https_get(HttpsRequest(EXACT_READ_ROOT + "rate_limit", (), 1, 10))
+    (context,) = contexts
+    assert context.verify_mode is ssl.CERT_REQUIRED and context.check_hostname
+    assert context.keylog_filename is None and not keylog.exists()
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "missing" / "keys.log"))
+    assert make().keylog_filename is None  # an unwritable path changes nothing

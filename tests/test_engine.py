@@ -993,6 +993,133 @@ def test_analyze_pr_create_that_never_landed_is_sent_again_by_the_next_process(
     assert [p.url for p in fake_github.prs.values() if MARKER in p.body] == [PR]
 
 
+# A PR body explaining terminal output, as PR #314's did (#327): the six
+# characters of a JSON escape, which `gh` prints as `\^[`.
+ESCAPE_BODY = "Strips caret notation (`\\u001b[0m`) from a log line.\n\nTested with `pytest`."
+
+
+def _logs_pushes(origin) -> Path:
+    """Record every push the bare origin receives from now on; the log's path."""
+    log = origin.bare / "pushes.log"
+    hook = origin.bare / "hooks" / "update"
+    hook.write_text(f'#!/bin/sh\necho "$1 $3" >> "{log}"\n')
+    hook.chmod(0o755)
+    return log
+
+
+def _pushes(log: Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def test_analyze_a_pr_body_gh_prints_otherwise_is_bound_on_its_exact_read(
+    tmp_state_dir, fake_github
+):
+    """#327: the agent's PR body holds the text of an escape; `gh` prints it back as
+    caret notation. The PR's read-back judges it on the exact read and binds it: no
+    conflict, one create, and the body GitHub holds is the journal's byte for byte."""
+    fake_github.gh_sanitizes = True
+    eng = make_engine(
+        tmp_state_dir,
+        lambda req: implement(req, pr_body=ESCAPE_BODY),
+        github=fake_github,
+        origin=True,
+    )
+    out = _analyzed(eng)
+    assert out.next_phase == "REVIEW", out.message
+    assert eng.state.current_pr_url == PR
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+    assert fake_github.prs[PR].body == f"{ESCAPE_BODY}\n\n{CLOSING}"
+    assert ("get_pr_exact", PR) in fake_github.calls
+
+
+def test_analyze_a_crash_after_a_landed_pr_gh_prints_otherwise_resumes_without_side_effects(
+    tmp_state_dir, fake_github
+):
+    """Test E (#327): the push is observed, the PR create lands, and GitHub goes dark
+    before its read-back; the process stops with the record attempted. The next
+    process reads the PR exactly and completes the phase: no agent, no push, no
+    second create."""
+    fake_github.gh_sanitizes = True
+    eng = make_engine(
+        tmp_state_dir,
+        lambda req: implement(req, pr_body=ESCAPE_BODY),
+        github=fake_github,
+        origin=True,
+    )
+    pushes = _logs_pushes(eng.origin)
+    create = fake_github.create_pull_request
+
+    def lands_then_github_goes_dark(*args, **kwargs):
+        fake_github.effect_read_errors["list_prs_for_head"] = GitHubUnavailableError("HTTP 502")
+        return create(*args, **kwargs)
+
+    fake_github.create_pull_request = lands_then_github_goes_dark
+    fake_github.write_failures.append(
+        ("create_pull_request", GitHubUnavailableError("gh: HTTP 502"), True)
+    )
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    with pytest.raises(GitHubUnavailableError, match="'resume' reconciles it"):
+        eng.step()
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert _pushes(pushes) == [f"refs/heads/autoforge/2 {candidate}"]
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    assert [(r["stage"], r["attempts"]) for r in data["effect_records"]] == [
+        ("observed", 1),
+        ("attempted", 1),
+    ]
+
+    del fake_github.effect_read_errors["list_prs_for_head"]
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == []
+    assert eng2.state.current_pr_url == PR and eng2.state.current_head_sha == candidate
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+    assert _pushes(pushes) == [f"refs/heads/autoforge/2 {candidate}"]
+
+
+def test_analyze_a_conflict_from_gh_s_rewritten_body_unblocks_into_review_without_writes(
+    tmp_state_dir, fake_github
+):
+    """PR #314's recovery (#327): a controller that compared `gh`'s print blocked on its
+    own PR, a conflict whose record keeps its one attempt. With the exact read,
+    'unblock' re-enters the phase and the plan completes from the journal: the PR is
+    observed and bound, no agent is launched, nothing is pushed or created again."""
+    fake_github.gh_sanitizes = True
+    eng = make_engine(
+        tmp_state_dir,
+        lambda req: implement(req, pr_body=ESCAPE_BODY),
+        github=fake_github,
+        origin=True,
+    )
+    pushes = _logs_pushes(eng.origin)
+    read_exactly = fake_github.get_pr_exact
+    # The controller before #327: its read-back compared the text `gh` printed.
+    fake_github.get_pr_exact = fake_github.get_pr
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED"
+    assert "carries its identity but is not the object" in eng.state.block_reason
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+    candidate = _worktree_head(eng.provider.calls[0])
+    journal_body = fake_github.prs[PR].body
+
+    fake_github.get_pr_exact = read_exactly
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    preview = eng2.unblock("the PR is the controller's own", dry_run=True)
+    assert "completes from its persisted plan without launching the agent" in preview.message
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+    assert eng2.unblock("the PR is the controller's own").unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == []
+    assert eng2.state.current_pr_url == PR and eng2.state.current_head_sha == candidate
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+    assert _pushes(pushes) == [f"refs/heads/autoforge/2 {candidate}"]
+    assert fake_github.prs[PR].body == journal_body == f"{ESCAPE_BODY}\n\n{CLOSING}"
+    data = json.loads(eng2.paths.state_file.read_text(encoding="utf-8"))
+    assert data["phase"] == "REVIEW"
+
+
 def test_analyze_branch_moved_after_the_plan_conflicts_and_unblock_completes_the_plan(
     tmp_state_dir, fake_github, monkeypatch
 ):
