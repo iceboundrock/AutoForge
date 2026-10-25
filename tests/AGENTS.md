@@ -74,6 +74,14 @@ read it before adding tests for a listed area.
   `analyze_payload`), and `scripted(...)` answers successive calls of one
   agent. An autouse fixture fails any test whose engine would reach the
   network git remote.
+- `gh` prints every title and body through its JSON sanitizer (#327).
+  `FakeGitHub.gh_sanitizes = True` makes the fake's `gh` reads do the same
+  (`gh_sanitized`, pinned to go-gh's own vectors in `tests/test_github.py`)
+  while `get_pr_exact`, `get_issue_exact` and `get_comment_exact` return
+  what the fake holds; `exact_read_error` makes every exact read raise. A
+  real `GitHubClient` takes its HTTPS transport as `https=`; the autouse
+  `_no_network_exact_read` fixture fails a test whose client would reach
+  `api.github.com`, so give it `https=...` or use the fake.
 - The controller publishes `REPLAN_REEXECUTE` too (#164): the replan agent
   commits on the base its prompt names and the controller pushes it to the
   derived replacement branch and creates the replacement PR. In

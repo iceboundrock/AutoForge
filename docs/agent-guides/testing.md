@@ -930,6 +930,34 @@ a stated reason it has none. The coverage that must keep working:
   gate open, WARN closed) on a refusal, UNKNOWN without a candidate, on
   statuses only, a plan limit, a not-found or a transient failure, and
   prints no token
+- `gh`'s sanitizer and the exact read (#327, `tests/test_effects.py`,
+  `tests/test_github.py`, `tests/test_engine.py`): the fakes' model of the
+  sanitizer (`gh_sanitized_json`, `gh_sanitized` in `tests/conftest.py`)
+  matches every vector of go-gh's own test; for every create kind (K2, K4,
+  K5, K7, K8, K9) a payload `gh` prints otherwise is observed on its exact
+  read, adopted or after its write, and after a crash before the observed
+  save, with one write in all; an object holding the caret notation itself
+  is a conflict from either stage; a payload holding a `^` is judged on the
+  exact read even when `gh`'s read matches, so an object holding the
+  control characters it names is a conflict and the payload held as sent
+  is observed; an exact read that fails (timeout, 5xx,
+  network, 401, 403, 404, invalid JSON, oversize, no credential) raises,
+  saves nothing and sends nothing, and after a write leaves the record
+  attempted; two holders, and an object whose other conditions fail, are a
+  conflict with no exact read; the exact read judges the other conditions
+  again; a payload `gh` prints as it is makes the same requests with the
+  sanitizer as without and no exact read; a hostile remote body (terminal
+  escapes, C1, a credential, escape text) is never quoted; the client's
+  exact read is one bounded `GET` under the API root with the bearer token
+  `gh auth token` printed (never in argv or a repr), classifies statuses
+  (a 403 as a rate limit by its headers or GitHub's message, never quoted),
+  transport failures and malformed replies as `gh`'s failures are, and the
+  transport follows no redirect, reads at most one byte past its bound and
+  at most `EXACT_READ_ERROR_BYTES` of an error reply, bounds the whole body
+  by the timeout, verifies the certificate and ignores `SSLKEYLOGFILE`;
+  the #314 recovery (a conflict an earlier
+  version recorded, `unblock`, `REVIEW`) launches no agent and writes and
+  pushes nothing
 - the empty rollup and the plan limit (#289, `tests/test_engine.py`,
   `tests/test_github.py`, `tests/test_doctor.py`): in `READY_FOR_MERGE`
   and `MERGE` a rollup read and empty is `BLOCKED` with defaults, with

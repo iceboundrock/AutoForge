@@ -112,7 +112,7 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
 from autoforge.git_transport import GitRemote, GitTransport
-from autoforge.github import GitHubClient
+from autoforge.github import GitHubClient, HttpsReply, HttpsRequest
 from autoforge.locking import SharedGitLock
 from autoforge.replan_txn import ReplanAttestation, render_marker
 from autoforge.result_parser import (
@@ -134,6 +134,8 @@ from tests.conftest import (
     SHA_C,
     FakeGitHub,
     comment_url,
+    gh_sanitized,
+    gh_sanitized_json,
 )
 
 REPO = "owner/repo"
@@ -290,7 +292,11 @@ def append_record(
 
 
 def replacement_record(
-    *, watermark: int = 42, head: str = REPLACEMENT_BRANCH, position: int = 1
+    *,
+    watermark: int = 42,
+    head: str = REPLACEMENT_BRANCH,
+    position: int = 1,
+    summary: str = f"Replaces {PR} for {ISSUE}.",
 ) -> EffectRecord:
     return EffectRecord.plan(
         position,
@@ -301,12 +307,12 @@ def replacement_record(
         precondition={"absent": True, "watermark": watermark},
         payload={
             "title": "Replace PR #42 for #2",
-            "body": replacement_pr_body(f"Replaces {PR} for {ISSUE}.", ISSUE, REPLAN_MARKER),
+            "body": replacement_pr_body(summary, ISSUE, REPLAN_MARKER),
         },
     )
 
 
-def review_record() -> EffectRecord:
+def review_record(text: str = "No findings.") -> EffectRecord:
     return EffectRecord.plan(
         0,
         EffectKind.REVIEW_COMMENT,
@@ -314,11 +320,11 @@ def review_record() -> EffectRecord:
         identity={"pr_url": PR, "marker": REVIEW_MARKER},
         target={"pr_url": PR},
         precondition={"absent": True},
-        payload={"body": f"## Review round 1\n\nNo findings.\n\n{REVIEW_MARKER}"},
+        payload={"body": f"## Review round 1\n\n{text}\n\n{REVIEW_MARKER}"},
     )
 
 
-def progress_record() -> EffectRecord:
+def progress_record(text: str = "Issue #2 is done; PR #42 merged.") -> EffectRecord:
     return EffectRecord.plan(
         0,
         EffectKind.PROGRESS_COMMENT,
@@ -326,9 +332,7 @@ def progress_record() -> EffectRecord:
         identity={"epic_url": EPIC, "marker": PROGRESS_MARKER},
         target={"epic_url": EPIC},
         precondition={"absent": True},
-        payload={
-            "body": progress_comment_body("Issue #2 is done; PR #42 merged.", PROGRESS_MARKER)
-        },
+        payload={"body": progress_comment_body(text, PROGRESS_MARKER)},
     )
 
 
@@ -2405,6 +2409,341 @@ def test_a_created_object_a_human_closed_before_the_save_is_a_conflict(case):
     assert len(fake.effect_writes) == 1 and case.landed(fake, record) == [created]
 
 
+# -- `gh`'s sanitizer and the exact read (#327) ----------------------------------------
+
+# A payload explaining terminal output, as PR #314's body did: the six
+# characters of a JSON escape. GitHub holds them as sent; `gh` prints them as
+# `\^[` (see `gh_sanitized` in tests/conftest.py).
+ESCAPE_TEXT = "It strips caret notation (`\\u001b[0m`) from a log line."
+EXACT_READS = ("get_pr_exact", "get_issue_exact", "get_comment_exact")
+
+# Each create kind's record with ``text`` in its body, built from the plain
+# record `Case.setup` returned (for the watermark it read).
+WITH_TEXT: dict[str, Callable[[EffectRecord, str], EffectRecord]] = {
+    K2.name: lambda _, text: impl_record(body=f"Implements {ISSUE}.\n\n{text}\n\n{CLOSING}"),
+    K4.name: lambda _, text: review_record(text),
+    K5.name: lambda plain, text: follow_up_record(
+        watermark=plain.precondition["watermark"],
+        body=follow_up_issue_body(text, PR, "R1-F1"),
+    ),
+    K7.name: lambda plain, text: replacement_record(
+        watermark=plain.precondition["watermark"], summary=text
+    ),
+    K8.name: lambda _, text: progress_record(text),
+    K9.name: lambda _, text: acceptance_record(text=text),
+}
+by_create_case = pytest.mark.parametrize("case", CREATE_CASES, ids=repr)
+
+
+def text_world(case: Case, text: str) -> tuple[FakeGitHub, EffectRecord]:
+    """``world_of(case)`` with `gh` sanitizing and ``text`` in the payload's body."""
+    fake, plain = world_of(case)
+    fake.gh_sanitizes = True
+    return fake, WITH_TEXT[case.name](plain, text)
+
+
+def escaped_world(case: Case) -> tuple[FakeGitHub, EffectRecord]:
+    """``text_world`` with ESCAPE_TEXT, which `gh` prints otherwise."""
+    fake, record = text_world(case, ESCAPE_TEXT)
+    assert gh_sanitized(record.body) != record.body
+    return fake, record
+
+
+def exact_reads(fake: FakeGitHub) -> list[str]:
+    """The URL of every exact read made, in order."""
+    return [call[1] for call in fake.calls if call[0] in EXACT_READS]
+
+
+def hold_body(fake: FakeGitHub, url: str, body: str) -> None:
+    """The object at ``url`` holds ``body`` on GitHub from now on (a human's edit)."""
+    if url in fake.prs:
+        fake.prs[url].body = body
+        return
+    if url in fake.issues:
+        fake.issues[url].body = body
+        return
+    for comments in fake.comments.values():
+        for index, comment in enumerate(comments):
+            if comment.url == url:
+                comments[index] = replace(comment, body=body)
+                return
+    raise AssertionError(f"no object at {url}")
+
+
+@by_create_case
+def test_an_object_gh_prints_otherwise_is_adopted_on_its_exact_read(case):
+    """#327: GitHub holds the payload byte for byte and `gh` prints its escape text as
+    caret notation. The one object whose other conditions hold is read again past the
+    sanitizer and observed: no conflict, no write, the record's payload untouched."""
+    fake, record = escaped_world(case)
+    url = case.plant(fake, record)
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.OBSERVED, 0, 0)]
+    assert not driven.issued and fake.effect_writes == []
+    assert driven.record.observed is not None and driven.record.observed["url"] == url
+    assert driven.record.payload == record.payload
+    assert exact_reads(fake) == [url]
+
+
+@by_create_case
+def test_a_write_gh_prints_otherwise_is_observed_by_its_read_back(case):
+    """#327 as it happened: the write lands byte for byte and its read-back through `gh`
+    differs. The read-back judges the one object on its exact read: observed, one write."""
+    fake, record = escaped_world(case)
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.ATTEMPTED, 1, 0), (Stage.OBSERVED, 1, 1)]
+    assert driven.issued and len(fake.effect_writes) == 1
+    assert driven.record.observed is not None
+    assert case.landed(fake, record) == [driven.record.observed["url"]]
+    assert driven.record.payload == record.payload
+
+
+@by_create_case
+def test_a_crash_after_a_write_gh_prints_otherwise_resumes_without_a_second_write(case):
+    """The process dies between that write and the observed save. The next entry reads
+    the attempted record's object exactly and observes it: nothing is sent twice."""
+    fake, record = escaped_world(case)
+    op = operation_for(record, fake)
+    crashing = saves_for(fake, crash_on=Stage.OBSERVED)
+    with pytest.raises(Crash):
+        drive(record, op, crashing)
+    persisted = crashing.last
+    assert (persisted.stage, persisted.attempts) == (Stage.ATTEMPTED, 1)
+
+    saves = saves_for(fake)
+    driven = drive(persisted, op, saves)
+    assert saves.stages == [(Stage.OBSERVED, 1, 1)]
+    assert not driven.issued and len(fake.effect_writes) == 1
+    assert len(case.landed(fake, record)) == 1
+
+
+@pytest.mark.parametrize("attempted", [False, True], ids=["intended", "attempted"])
+@by_create_case
+def test_an_object_holding_the_caret_notation_itself_is_a_conflict(case, attempted):
+    """Equality stays byte for byte: an object that holds `\\^[` itself (what `gh` prints
+    for the payload) is not the payload. Its exact read differs, so it is a conflict
+    naming it, from either stage, and nothing is written."""
+    fake, record = escaped_world(case)
+    url = case.plant(fake, record)
+    hold_body(fake, url, gh_sanitized(record.body))
+    start = record.attempting() if attempted else record
+    saves = saves_for(fake)
+    driven = drive(start, operation_for(start, fake), saves)
+
+    assert saves.stages == [(Stage.CONFLICT, start.attempts, 0)]
+    assert not driven.issued and fake.effect_writes == []
+    assert url in driven.record.reason
+    assert exact_reads(fake) == [url]
+
+
+# Caret notation written as text: what `gh` prints for a control character.
+CARET_TEXT = "Stop the watcher with ^C; ^[ starts an escape sequence."
+
+
+@by_create_case
+def test_an_object_gh_prints_as_a_caret_payload_is_judged_on_its_exact_read(case):
+    """Equality through `gh` is not proof when the payload holds a ``^``: an object
+    holding the control characters themselves (``\x03`` where the payload says ``^C``)
+    prints exactly as the payload. Its exact read differs, so it is a conflict, and
+    nothing is written."""
+    fake, record = text_world(case, CARET_TEXT)
+    url = case.plant(fake, record)
+    hold_body(fake, url, record.body.replace("^C", "\x03").replace("^[", "\x1b"))
+    assert gh_sanitized(fake_body(fake, url)) == record.body  # `gh` cannot tell them apart
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.CONFLICT, 0, 0)]
+    assert fake.effect_writes == [] and url in driven.record.reason
+    assert exact_reads(fake) == [url]
+
+
+@by_create_case
+def test_a_caret_payload_on_github_byte_for_byte_is_adopted_after_its_exact_read(case):
+    """The same payload held as sent: `gh`'s read matches, the exact read confirms it,
+    and the object is observed with no write."""
+    fake, record = text_world(case, CARET_TEXT)
+    url = case.plant(fake, record)
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.OBSERVED, 0, 0)]
+    assert fake.effect_writes == [] and driven.record.observed["url"] == url
+    assert exact_reads(fake) == [url]
+
+
+def fake_body(fake: FakeGitHub, url: str) -> str:
+    """The body the fake's GitHub holds at ``url``."""
+    if url in fake.prs:
+        return fake.prs[url].body
+    if url in fake.issues:
+        return fake.issues[url].body
+    (body,) = [c.body for cs in fake.comments.values() for c in cs if c.url == url]
+    return body
+
+
+EXACT_READ_FAILURES = [
+    pytest.param(GitHubUnavailableError("exact read: timed out after 60s"), id="timeout"),
+    pytest.param(GitHubUnavailableError("exact read: GitHub answered HTTP 502"), id="5xx"),
+    pytest.param(GitHubUnavailableError("exact read: connection refused"), id="network"),
+    pytest.param(GitHubError("exact read: GitHub answered HTTP 401"), id="401"),
+    pytest.param(GitHubError("exact read: GitHub answered HTTP 403"), id="403"),
+    pytest.param(GitHubNotFoundError("exact read: GitHub answered HTTP 404"), id="404"),
+    pytest.param(GitHubError("exact read: the reply is not UTF-8 JSON"), id="invalid-json"),
+    pytest.param(GitHubError("exact read: the reply is over 2097152 bytes"), id="oversize"),
+    pytest.param(
+        GitHubError("exact read: `gh auth token` printed no usable credential"),
+        id="unauthenticated",
+    ),
+]
+
+
+@pytest.mark.parametrize("error", EXACT_READ_FAILURES)
+@pytest.mark.parametrize("attempted", [False, True], ids=["intended", "attempted"])
+@by_create_case
+def test_an_exact_read_that_fails_decides_nothing_and_sends_nothing(case, attempted, error):
+    """A text that could not be read exactly is never a reason to write: the failure
+    raises as an identity read's own does (unavailable: 'resume' reads again; conclusive:
+    the caller blocks), nothing is saved or sent, and an attempted record keeps the
+    attempt it spent, so a second create can never follow."""
+    fake, record = escaped_world(case)
+    url = case.plant(fake, record)
+    fake.exact_read_error = error
+    start = record.attempting() if attempted else record
+    saves = saves_for(fake)
+    with pytest.raises(GitHubError) as info:
+        drive(start, operation_for(start, fake), saves)
+
+    assert info.value is error
+    assert saves.log == [] and fake.effect_writes == []
+    assert exact_reads(fake) == [url]
+
+
+@by_create_case
+def test_a_write_whose_exact_read_back_is_unavailable_is_pending_and_never_sent_again(case):
+    """The write lands; its exact read-back times out. The record stays attempted
+    (EffectPending); the next entry reads it exactly and observes it, one write in all."""
+    fake, record = escaped_world(case)
+    fake.exact_read_error = GitHubUnavailableError("exact read: timed out after 60s")
+    op = operation_for(record, fake)
+    saves = saves_for(fake)
+    with pytest.raises(EffectPending):
+        drive(record, op, saves)
+    assert saves.stages == [(Stage.ATTEMPTED, 1, 0)]
+
+    fake.exact_read_error = None
+    driven = drive(saves.last, op, saves)
+    assert saves.stages[-1] == (Stage.OBSERVED, 1, 1)
+    assert not driven.issued and len(fake.effect_writes) == 1
+
+
+@by_create_case
+def test_two_holders_are_a_conflict_without_an_exact_read(case):
+    """Two objects carrying one identity are a conflict whatever their text: neither is
+    read exactly, and both are named."""
+    fake, record = escaped_world(case)
+    mine = case.plant(fake, record)
+    other = case.second_holder(fake, record)
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.CONFLICT, 0, 0)]
+    assert fake.effect_writes == [] and exact_reads(fake) == []
+    assert mine in driven.record.reason and other in driven.record.reason
+    assert "2 objects carry its identity" in driven.record.reason
+
+
+@pytest.mark.parametrize("case", CLOSABLE_CASES, ids=repr)
+def test_an_object_whose_other_conditions_fail_is_a_conflict_without_an_exact_read(case):
+    """No sanitizer closes an object: one whose conditions other than its text fail on
+    `gh`'s read is a conflict at once, never read exactly."""
+    fake, record = escaped_world(case)
+    url = case.plant(fake, record)
+    case.close(fake, url)
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.CONFLICT, 0, 0)]
+    assert fake.effect_writes == [] and exact_reads(fake) == []
+    assert url in driven.record.reason
+
+
+@pytest.mark.parametrize("case", [K2, K7], ids=repr)
+def test_the_exact_read_judges_the_other_conditions_again(case):
+    """The exact read is the object as GitHub holds it now, judged on the whole
+    predicate: a PR closed between `gh`'s read and the exact read is not adopted on its
+    text alone."""
+    fake, record = escaped_world(case)
+    url = case.plant(fake, record)
+    read_exactly = fake.get_pr_exact
+
+    def closed_meanwhile(pr_url: str):
+        fake.prs[url].state = "CLOSED"
+        return read_exactly(pr_url)
+
+    fake.get_pr_exact = closed_meanwhile  # type: ignore[method-assign]
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.CONFLICT, 0, 0)]
+    assert fake.effect_writes == [] and url in driven.record.reason
+
+
+@by_create_case
+def test_a_payload_gh_prints_as_it_is_takes_no_exact_read_and_no_extra_request(case):
+    """The common case is unchanged: a body without a control character or the text of
+    its escape reads back equal through `gh`, so adoption and a write's read-back make
+    the same requests with the sanitizer as without it, and no exact read."""
+    for plant in (False, True):
+        calls = []
+        for sanitizes in (False, True):
+            fake, record = world_of(case)
+            fake.gh_sanitizes = sanitizes
+            assert gh_sanitized(record.body) == record.body
+            if plant:
+                case.plant(fake, record)
+            driven = drive(record, operation_for(record, fake), saves_for(fake))
+            assert driven.record.stage is Stage.OBSERVED
+            assert driven.issued is not plant
+            calls.append(fake.calls)
+        assert calls[0] == calls[1]
+        assert exact_reads(fake) == []
+
+
+# A remote body as hostile as a body can be: an OSC 8 hyperlink and a screen
+# clear (real ESC and BEL), a C1 CSI, a credential, the text of an escape and
+# doubled backslashes.
+HOSTILE = (
+    "\x1b]8;;https://attacker.example/\x07click\x1b]8;;\x07 \x1b[2J \x9b31m"
+    f" {CREDENTIAL_TEXT} \\u001b[0m \\\\u001b \\\\ quoted-tail"
+)
+
+
+@by_create_case
+def test_a_hostile_remote_text_is_compared_and_never_quoted(case):
+    """What the exact read returns is compared, never repeated: a remote body holding
+    terminal escapes, a credential and escape text leaves only the object's URL in the
+    conflict reason and its error, and the record's payload as it was planned."""
+    fake, record = escaped_world(case)
+    url = case.plant(fake, record)
+    hold_body(fake, url, f"{record.body}\n{HOSTILE}")
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.CONFLICT, 0, 0)] and fake.effect_writes == []
+    assert driven.record.payload == record.payload and driven.record.observed is None
+    with pytest.raises(EffectConflictError) as info:
+        raise_conflict(driven.record)
+    for text in (driven.record.reason, str(info.value)):
+        assert url in text
+        for fragment in ("\x1b", "\x9b", "\x07", "attacker.example", SECRET, "^[", "quoted"):
+            assert fragment not in text
+
+
 # -- complete comment listings behind the real client (K4, K8) -------------------------
 
 
@@ -2414,7 +2753,11 @@ class CommentConversation:
     Serves the GraphQL comment walk at most 100 comments a page, by cursor,
     and the REST comment create, which appends a comment. ``lose_reply``
     makes the next create land and then fail as `gh` does on a lost reply
-    (HTTP 502), an unknown outcome. Every other `gh` call fails the test.
+    (HTTP 502), an unknown outcome. ``gh auth token`` answers a stand-in
+    token and :meth:`exact` is the exact read of one comment (the client's
+    ``https``). ``sanitize`` passes every page through `gh`'s JSON sanitizer
+    (:func:`gh_sanitized_json`), as `gh` prints it. Every other `gh` call
+    fails the test.
     """
 
     PAGE = 100
@@ -2426,6 +2769,8 @@ class CommentConversation:
         self.pages_read = 0
         self.creates = 0
         self.lose_reply = False
+        self.sanitize = False
+        self.exact_requests: list[HttpsRequest] = []
         for body in bodies:
             self.add(body)
 
@@ -2450,7 +2795,22 @@ class CommentConversation:
                 return self._reply("", exit_code=1, stderr="HTTP 502: Bad Gateway")
             cid = int(url.rsplit("-", 1)[1])
             return self._reply(json.dumps({"id": cid, "html_url": url}))
+        if command[1:] == ["auth", "token", "--hostname", "github.com"]:
+            return self._reply("gho_standin\n")
         raise AssertionError(f"unexpected gh call: {command}")
+
+    def exact(self, request: HttpsRequest) -> HttpsReply:
+        self.exact_requests.append(request)
+        cid = int(request.url.rsplit("/", 1)[1])
+        (body,) = [b for c, b in self.comments if c == cid]
+        row = {
+            "id": cid,
+            "html_url": comment_url(self.parent_url, cid),
+            "body": body,
+            "user": {"login": "someone"},
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        return HttpsReply(200, {"content-type": "application/json"}, json.dumps(row).encode())
 
     def _page(self, command: list[str]) -> ExecutionResult:
         self.pages_read += 1
@@ -2473,6 +2833,8 @@ class CommentConversation:
             "nodes": nodes,
         }
         data = {"data": {"repository": {self.parent: {"comments": connection}}}}
+        if self.sanitize:
+            return self._reply(gh_sanitized_json(json.dumps(data, ensure_ascii=False)))
         return self._reply(json.dumps(data))
 
     @staticmethod
@@ -2498,7 +2860,8 @@ FILLER = [f"Comment {n}, carrying no marker." for n in range(150)]
 
 def conversation_client(parent_url: str, bodies: list[str]):
     conversation = CommentConversation(parent_url, bodies)
-    return conversation, GitHubClient(runner=conversation, retry_delay_seconds=0)
+    client = GitHubClient(runner=conversation, retry_delay_seconds=0, https=conversation.exact)
+    return conversation, client
 
 
 def count_saves(log: list[EffectRecord]) -> Callable[[EffectRecord], None]:
@@ -2590,6 +2953,54 @@ def test_a_comment_listing_that_cannot_reach_its_end_never_reads_as_absent(
     with pytest.raises(GitHubUnavailableError, match="502"):
         drive(record, operation_for(record, github), count_saves(saves))
     assert saves == [] and conversation.creates == 0
+
+
+@pytest.mark.parametrize(("build", "parent_url", "marker"), COMMENT_KINDS)
+def test_a_comment_gh_prints_otherwise_is_observed_on_its_exact_read_behind_the_real_client(
+    build, parent_url, marker
+):
+    """#327 behind the real client: `gh` prints the page with the comment's escape text
+    as caret notation; the client's exact read (one GET of that comment from GitHub's
+    API, with the token `gh auth token` printed) returns it byte for byte, and the
+    landed comment is observed: no second post."""
+    record = build(ESCAPE_TEXT)
+    conversation, github = conversation_client(parent_url, FILLER)
+    conversation.sanitize = True
+    landed = conversation.add(record.body)
+    attempted = record.attempting()
+
+    saves: list[EffectRecord] = []
+    driven = drive(attempted, operation_for(attempted, github), count_saves(saves))
+
+    assert not driven.issued and conversation.creates == 0
+    assert [(r.stage, r.attempts) for r in saves] == [(Stage.OBSERVED, 1)]
+    assert driven.record.observed == {"url": landed}
+    (request,) = conversation.exact_requests
+    assert request.url == "https://api.github.com/repos/owner/repo/issues/comments/5150"
+    assert ("Authorization", "Bearer gho_standin") in request.headers
+    assert "gho_standin" not in repr(request)
+
+
+@pytest.mark.parametrize(("build", "parent_url", "marker"), COMMENT_KINDS)
+def test_a_comment_holding_the_caret_notation_is_a_conflict_behind_the_real_client(
+    build, parent_url, marker
+):
+    """The same conversation, but the comment holds `\\^[` itself: `gh` prints what it
+    would print for the payload, the exact read shows another text, and the record
+    is a conflict naming the comment. Nothing is posted."""
+    record = build(ESCAPE_TEXT)
+    conversation, github = conversation_client(parent_url, FILLER)
+    conversation.sanitize = True
+    other = conversation.add(gh_sanitized(record.body))
+    attempted = record.attempting()
+
+    saves: list[EffectRecord] = []
+    driven = drive(attempted, operation_for(attempted, github), count_saves(saves))
+
+    assert not driven.issued and conversation.creates == 0
+    assert [r.stage for r in saves] == [Stage.CONFLICT]
+    assert other in driven.record.reason
+    assert len(conversation.exact_requests) == 1
 
 
 # -- K1: push, against a local bare repository -----------------------------------------
