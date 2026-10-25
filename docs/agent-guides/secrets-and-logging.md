@@ -99,6 +99,55 @@ C1 byte. Both are linear. `MAX_GROWTH_FACTOR` is unchanged: the escape is
 no part of the replaced run, and at two characters or more it separates
 repeated matches no tighter than a one-character separator does.
 
+## Escaped text: redact the structure first (#281)
+
+Until #281 the CLI printed a step's agent result as
+`redact(json.dumps(result))`, a line that reaches the terminal and, through
+`worker.py`, a scheduler worker's persisted log. JSON writes a quote as
+`\"`, so a quoted assignment in a result string (`GH_TOKEN="..."`) read
+`GH_TOKEN=\"...\"` there, and the value pattern stopped at the backslash
+and printed the secret after it in the clear. (A token after a written-out
+`\n`, `\t` or `\uXXXX` was recognised since
+[#284](#where-a-recognised-credential-starts-284).) Two rules now hold:
+
+- **A structure the controller serializes is redacted first, string by
+  string** (`redact_obj`,
+  [below](#what-is-redacted-before-it-is-persisted)), never as its
+  serialized text: the step-outcome line (`print_step_outcome`, for `run`,
+  `step`, `resume` and the worker), the replan `escalation` in `status`'s
+  journal lines, in a dry run's `replan policy:` note and in the
+  `ESCALATION_REASON` prompt variable (the prompt is logged as `prompt.md`
+  and previewed by a dry run as text). A dry run's notes, which quote state
+  such as a recorded refusal, are redacted like its variables.
+- **Text no one can redact first is matched as escaped.** An agent's stdout
+  and stderr are captured whole into `stdout.log` and `stderr.log`, its
+  result among them as the JSON it printed, and an error can quote an
+  excerpt. The assignment patterns (`env-assignment`, `secret-assignment`,
+  `oauth-assignment`, `oauth-bare-assignment`) take their optional quote
+  behind up to seven backslashes too (`\"`, `\'` as a Python repr writes it,
+  `\\\"` for JSON inside a JSON string, three levels deep at most, the
+  bound `oauth-field` has), and keep a backslash that starts the closing
+  escaped quote out of the value: `GH_TOKEN=\"***REDACTED***\"`, so JSON
+  redacted as text still parses. A quote behind eight backslashes or more
+  is not recognised, nor, as before, an `Authorization` header whose value
+  is quoted, escaped or not.
+
+Every place that serializes and redacts was checked for #281: the JSON
+documents `status --json`, `doctor --json` and `epic status --json` print
+are redacted before they are serialized, as are the run log's JSON files
+and journal and the scheduler's claim `detail`; the engine redacts agent
+text field by field as it writes it to state, so the prompt variables
+serialized from state (the FIX resolutions, operator and acceptance
+outcomes) carry redacted strings; the other `json.dumps` calls build
+digests, canonical forms, internal files or a process's input, none of
+them passed to `redact`.
+
+`MAX_GROWTH_FACTOR` is unchanged: an escaped quote, like a plain one, is
+kept and no part of the replaced run, and a value is still at least one
+character (`HF_TOKEN=\"x\"`, 14 to 27, is pinned with the other growth
+units). The backslash runs are bounded, so the patterns stay linear, and
+`redact` stays idempotent.
+
 ## Launch environment and credential checks (#165)
 
 What #165 adds reports names, never values:
@@ -294,13 +343,15 @@ linear in its size; a change to the allocator must keep that, and
 
 A structure is redacted string by string, never as its serialized text
 (#206). Run over JSON, a pattern can consume the syntax around a value (an
-empty `GITHUB_TOKEN=` takes the closing quote, a value before an escaped
-quote its backslash), so parsing the redacted text back can fail. (A
-secret right after an escape there, `\n` or `\uXXXX`, follows a letter or
-a digit; it was missed until #284 and is recognised now,
-[above](#where-a-recognised-credential-starts-284).) The run log's
-`control-result.json` and the journal's `parsed_result` therefore cross
-`redact_dict` like the metadata. The one
+empty `GITHUB_TOKEN=` takes the closing quote), so parsing the redacted
+text back can fail. (A secret right after an escape there, `\n` or
+`\uXXXX`, follows a letter or a digit; it was missed until #284 and is
+recognised now, [above](#where-a-recognised-credential-starts-284). A
+quoted value behind JSON's `\"` lost the backslash and kept the secret
+until #281, [above](#escaped-text-redact-the-structure-first-281).) The run
+log's `control-result.json` and the journal's `parsed_result` therefore
+cross `redact_dict` like the metadata, and the CLI's step outcome
+`redact_obj`. The one
 shape that spans a key and its value, a quoted OAuth credential field
 (`"refresh": "..."`), is recognised by the key: `redact_obj` replaces a
 non-empty string under a key that names such a field (the `oauth-field`

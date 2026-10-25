@@ -17,7 +17,8 @@ A step is ``{"do": ...}``:
 
 - ``implement``: one commit in the agent's worktree, reported as success;
 - ``review``: a clean review of the PR head, of round ``round`` (1 by default);
-- ``blocked``: the agent reports the issue blocked;
+- ``blocked``: the agent reports the issue blocked, with ``message``
+  (``stuck`` by default) and the fields of ``extra`` beside it;
 - ``garbage``: no ``CONTROL_RESULT`` at all (a failing provider);
 - ``hold``: write ``started``, then wait for ``gate``; with ``stubborn`` the
   first ``KeyboardInterrupt`` (the scheduler's first SIGINT) is noted in
@@ -185,7 +186,13 @@ def main(argv: list[str]) -> int:
             return block(review_result(step.get("round", 1), pr.head_sha))
         if kind == "blocked":
             return block(
-                {"phase": req.phase, "status": "blocked", "issue_url": url, "message": "stuck"}
+                {
+                    "phase": req.phase,
+                    "status": "blocked",
+                    "issue_url": url,
+                    "message": step.get("message", "stuck"),
+                    **step.get("extra", {}),
+                }
             )
         if kind == "hold":
             return ""

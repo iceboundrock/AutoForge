@@ -11,11 +11,12 @@ from pathlib import Path
 import pytest
 
 from autoforge import cli
-from autoforge.engine import ControllerEngine
+from autoforge.engine import ControllerEngine, StepOutcome
 from autoforge.errors import GitHubError, LockError
 from autoforge.executor import ExecutionResult, execute
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
+from autoforge.redaction import redact, redact_obj
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
 from autoforge.scheduler_state import Admission, ClaimKind, StateRef, open_claim
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
@@ -542,6 +543,109 @@ def test_state_derived_run_id_is_redacted_on_every_terminal_line(
     captured = capsys.readouterr()
     assert FAKE_SECRET not in captured.out + captured.err
     assert "workflow already DONE (run ***REDACTED***)" in captured.out
+
+
+# F2 (#281): a dummy token directly after each character JSON writes as an
+# escape (a newline, a tab, a carriage return, a quote, a backslash, a control
+# character, and non-ASCII text, which `json.dumps` turns into `\uXXXX`).
+F2_TOKEN = "ghp_" + "F2dummyToken" * 3
+F2_SECRET = "dummy-F2-value-0123456789"
+F2_LEADS = ("\n", "\t", "\r", '"', "\\", "\x01", "é", "\U0001f600")
+
+
+def _f2_result() -> dict:
+    """An agent result carrying the dummies at every depth, beside values a
+    pattern run over the JSON text would break: an empty assignment (it took
+    the closing quote) and an OAuth field whose value holds a space."""
+    return {
+        "phase": "ANALYZE_EXECUTE",
+        "status": "blocked",
+        "message": "".join(f"{lead}{F2_TOKEN}" for lead in F2_LEADS),
+        "tests": [
+            f"pytest\n{F2_TOKEN}",
+            {"command": f'GH_TOKEN="{F2_SECRET}" make check', "passed": False},
+            ["GITHUB_TOKEN=", "after"],
+        ],
+        "details": {"count": 3, "ratio": 0.5, "none": None, "nested": [f"é{F2_TOKEN}", 7]},
+        "refresh": "FAKE refresh value",
+        f"key\t{F2_TOKEN}": "a key is redacted too",
+    }
+
+
+def test_step_outcome_redacts_the_result_before_serializing_it(capsys):
+    """#281 (F2): the result line was the result's JSON text redacted whole,
+    and that text escapes what stands before a value, so a pattern could miss
+    a credential there or consume the syntax around one. Each string is
+    redacted first: no dummy is printed, the line still parses, and nested
+    structures and non-string values are kept apart from redaction."""
+    result = _f2_result()
+    outcome = StepOutcome(
+        "run-f2", "ANALYZE_EXECUTE", "BLOCKED", False, result=result, message="agent reported"
+    )
+    cli.print_step_outcome(outcome)
+    out = capsys.readouterr().out
+    assert F2_TOKEN not in out and F2_SECRET not in out and "FAKE refresh" not in out
+    (line,) = [text for text in out.splitlines() if text.startswith("  result=")]
+    printed = json.loads(line.removeprefix("  result="))
+    assert printed == redact_obj(result)
+    assert printed["message"] == "".join(f"{lead}***REDACTED***" for lead in F2_LEADS)
+    assert printed["tests"] == [
+        "pytest\n***REDACTED***",
+        {"command": 'GH_TOKEN="***REDACTED***" make check', "passed": False},
+        ["GITHUB_TOKEN=", "after"],
+    ]
+    assert printed["details"] == {
+        "count": 3,
+        "ratio": 0.5,
+        "none": None,
+        "nested": ["é***REDACTED***", 7],
+    }
+    assert printed["refresh"] == "***REDACTED***"
+    assert printed["key\t***REDACTED***"] == "a key is redacted too"
+    assert result == _f2_result()  # the outcome's own result is left as it was
+
+
+def test_status_and_dry_run_redact_the_replan_escalation_before_serializing_it(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#281: the escalation is a free-form mapping from state; status printed
+    it as JSON text, redacted only as part of the whole output, and the
+    dry-run plan printed it in a note with no redaction at all. Both now
+    redact it string by string first, and every plan note crosses the same
+    boundary as the plan's variables."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    escalation = {
+        "trigger": "workflow_stagnation",
+        "workflow_stagnation_reason": f'stuck:\n{F2_TOKEN} GH_TOKEN="{F2_SECRET}"',
+        "recent_finding_counts": [2, 2],
+    }
+    data["phase"] = "REPLAN_REEXECUTE"
+    data["replan_transaction"] = {
+        "stage": "rejected",
+        "escalation": escalation,
+        "rejection_reason": f"refused: GH_TOKEN={F2_SECRET}",
+    }
+    state_file.write_text(json.dumps(data))
+    redacted = json.dumps(redact_obj(escalation), sort_keys=True)
+
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert F2_TOKEN not in out and F2_SECRET not in out
+    assert f"  escalation:  {redacted}" in out
+
+    assert cli.main(["--state-dir", sd, "step", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert F2_TOKEN not in out and F2_SECRET not in out
+    assert f"Note:     replan policy: {redacted}" in out
+    assert redact(f"refused: GH_TOKEN={F2_SECRET}") in out
 
 
 def test_status_json_keeps_journal_entries_whose_redacted_keys_collide(

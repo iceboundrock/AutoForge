@@ -7,7 +7,9 @@ fields (``refresh`` / ``access`` / ``id_token`` / ``chatgpt-account-id``) and
 credentials embedded in URLs before stdout / stderr / commands are persisted
 by the run logger. A shape is recognised where it starts a token: at the start
 of the text, after a character that cannot be part of it, or directly after
-an escape sequence (``ESC[0m``, ``\\n``, ``\\u00e9``; see ``_ESCAPE``).
+an escape sequence (``ESC[0m``, ``\\n``, ``\\u00e9``; see ``_ESCAPE``). An
+assignment's quoted value is recognised behind an escaped quote too
+(``GH_TOKEN=\\"...\\"``, as JSON writes it; see ``_QUOTE``).
 
 Every pattern has a stable class name. :func:`credential_classes` reports
 which classes a text carries without saying where, so a refusal of agent
@@ -78,6 +80,22 @@ _ESCAPE = (
 )
 
 
+# The optional quote around an assignment's value, also as escaped text
+# writes it (#281): JSON and a C or Python string literal write a quote as
+# ``\"`` or ``\'``, so in a serialized document (an agent's CONTROL_RESULT on
+# stdout, a structure printed as JSON) ``GH_TOKEN="..."`` reads
+# ``GH_TOKEN=\"...\"``. A plain quote alone stopped the value at the
+# backslash and left the secret after it in the clear. Up to seven
+# backslashes (JSON carried in a JSON string, three deep) are taken with the
+# quote, the bound ``oauth-field`` uses, so a run of them is never rescanned.
+_QUOTE = r"(?:\\{0,7}[\"'])?"
+# A backslash inside an assignment's value, unless it starts the escaped
+# closing quote, which is kept in its own group with the backslashes before
+# it: the replacement leaves ``\"`` whole and the JSON around it intact. The
+# lookahead is bounded like ``_QUOTE``.
+_VALUE_BACKSLASH = r"\\(?!\\{0,6}[\"'])"
+
+
 def _token(
     name: str, body: str, replacement: str, *, flags: str = "", token_chars: str = "A-Za-z0-9_"
 ) -> _Pattern:
@@ -115,7 +133,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
         r"(GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|"
         r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY|"
         r"ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENCODE_SERVER_PASSWORD)"
-        r"(\s*[:=]\s*)([\"']?)([^\s\"';]+)([\"']?)",
+        rf"(\s*[:=]\s*)({_QUOTE})((?:[^\s\"';\\]|{_VALUE_BACKSLASH})+)({_QUOTE})",
         r"\1\2\3***REDACTED***\5",
         flags="(?i)",
     ),
@@ -174,8 +192,8 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # (``GEMINI_API_KEY=``) is not recognised here (#285).
     _token(
         "secret-assignment",
-        r"(token|passwd|password|secret|api[_-]?key)(\s*[:=]\s*)([\"']?)"
-        r"([A-Za-z0-9_\-./+]{12,})([\"']?)",
+        rf"(token|passwd|password|secret|api[_-]?key)(\s*[:=]\s*)({_QUOTE})"
+        rf"([A-Za-z0-9_\-./+]{{12,}})({_QUOTE})",
         r"\1\2\3***REDACTED***\5",
         flags="(?i)",
     ),
@@ -203,7 +221,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token(
         "oauth-assignment",
         r"((?:refresh|access|id)_token|chatgpt[-_]account[-_]id)"
-        r"(\s*[:=]\s*)([\"']?)[^\s\"';,&]+",
+        rf"(\s*[:=]\s*)({_QUOTE})(?:[^\s\"';,&\\]|{_VALUE_BACKSLASH})+",
         r"\1\2\3***REDACTED***",
         flags="(?i)",
         token_chars="A-Za-z0-9",
@@ -213,7 +231,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # characters counts; ``access: denied`` and ``refresh=true`` stay.
     _token(
         "oauth-bare-assignment",
-        r"(refresh|access)(=)([\"']?)[^\s\"';,&]{16,}",
+        rf"(refresh|access)(=)({_QUOTE})(?:[^\s\"';,&\\]|{_VALUE_BACKSLASH}){{16,}}",
         r"\1\2\3***REDACTED***",
         flags="(?i)",
     ),
@@ -248,6 +266,8 @@ _OAUTH_FIELD_KEY = re.compile(rf"(?i){_OAUTH_FIELD_NAMES}")
 # sequence it starts at (#284) is put back unchanged, no part of the replaced
 # run; at two characters or more it separates repeated matches no tighter
 # than the one-character separators above, so it raises no ratio either.
+# The escaped quote an assignment's value may stand in (#281, ``_QUOTE``) is
+# kept like a plain one, no part of the replaced run either.
 # ``tests/test_redaction.py`` pins the factor against the worst-case shape of
 # every pattern and the wrapping case; a new pattern must keep it, or raise
 # it together with the persisted bound in :mod:`autoforge.loop_guard` that
@@ -313,8 +333,9 @@ def redact_obj(value: object) -> object:
     document: a pattern run over JSON text can consume the syntax around a
     value (an empty ``GITHUB_TOKEN=`` takes the closing quote, #206), so the
     redacted text may no longer parse. (A secret right after an escape there,
-    ``\\n`` or ``\\u00e9``, follows a letter or a digit; it is recognised since
-    #284, but the syntax is still at risk.) The one shape that spans a key
+    ``\\n`` or ``\\u00e9``, follows a letter or a digit, and a quoted value
+    stands behind ``\\"``; they are recognised since #284 and #281, but the
+    syntax is still at risk.) The one shape that spans a key
     and its value, a quoted OAuth credential field (``"refresh": "..."``,
     ``oauth-field``), is recognised by the key instead: a non-empty string
     under a key that names such a field, whole and in any case, is replaced

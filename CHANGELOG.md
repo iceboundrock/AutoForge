@@ -11,6 +11,24 @@ production use, and not the Public Alpha (#255). The heading says
 `unreleased` until the release-prep commit the release's tag names gives it
 its date ([Releasing](docs/releasing.md#the-changelog)).
 
+### A step's result is redacted before it is printed as JSON (#281)
+
+- The `result=` line `run`, `step`, `resume` and a scheduler worker print
+  for a step redacts each string of the agent's result before it
+  serializes the result, rather than the JSON text after: JSON writes a
+  quote as `\"`, and a quoted assignment in a result (`GH_TOKEN="..."`,
+  `password: "..."`, `refresh_token="..."`) kept its value in the clear on
+  the terminal and in the worker's log. The replan escalation `status` and
+  a dry run print is redacted the same way, and every note of a dry run's
+  plan is redacted now, as its variables were.
+- Text that is already escaped, such as the JSON an agent prints to the
+  `stdout.log` of its run log, has the quoted value of such an assignment
+  redacted behind an escaped quote too (`\"`, `\'`, JSON inside a JSON
+  string up to three levels deep), in every run log, in state and in the
+  CLI's output; published agent text carrying one is refused. The escaped
+  quotes are kept, so redacted JSON text still parses
+  ([Secrets and logging](docs/agent-guides/secrets-and-logging.md#escaped-text-redact-the-structure-first-281)).
+
 ### Redaction after an escape sequence (#284)
 
 - A recognised credential directly after an ANSI escape sequence is
