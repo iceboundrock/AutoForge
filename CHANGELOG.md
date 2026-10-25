@@ -11,6 +11,24 @@ production use, and not the Public Alpha (#255). The heading says
 `unreleased` until the release-prep commit the release's tag names gives it
 its date ([Releasing](docs/releasing.md#the-changelog)).
 
+### Redaction after an escape sequence (#284)
+
+- A recognised credential directly after an ANSI escape sequence is
+  redacted: OpenCode writes `ESC[0m` right before an error's text on
+  stderr, the patterns started at a word boundary and there is none after
+  its `m`, so a token there reached `stderr.log` in the clear. The same holds after a JSON, C or shell
+  escape written out (`\n`, `\t`, `\u00e9`, `\u001b[0m`, `\033[0m`,
+  `\e[0m`, caret notation's `^[[0m`), after a non-ASCII letter, and after
+  any other character that cannot be part of the token, in every run log,
+  in state and in the CLI's output; published agent text carrying one is
+  refused. The escape itself is kept. A backslash before an escape letter
+  counts as an escape wherever it stands, so a token after a path
+  separator such as `C:\Users\nghp_...` is redacted too
+  ([Secrets and logging](docs/agent-guides/secrets-and-logging.md#where-a-recognised-credential-starts-284)).
+- Unchanged: a shape inside a longer identifier (`xghp_...`,
+  `risk-assessment`) is still no credential, and a known name behind a
+  prefix (`GEMINI_API_KEY=`) is still not recognised (#285).
+
 ### The configuration file and a run's sandbox mode (#280)
 
 - Under `sandbox.mode: required` or `preferred`, every command, a
