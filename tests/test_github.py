@@ -3835,6 +3835,27 @@ class _Loopback(http.server.BaseHTTPRequestHandler):
                 except OSError:
                     return
                 time.sleep(0.05)
+        elif self.path == "/chunked":
+            self.wfile.write(_CHUNKED_HEAD + _CHUNKED_BODY + b"0\r\nX-Trailer: x\r\n\r\n")
+        # Each of these sends a byte or a line every 100 ms for 6 s, each receive well
+        # inside the socket timeout, so only a deadline on the whole reply ends it.
+        elif self.path == "/slow-headers":
+            self._trickle(b"HTTP/1.1 200 OK\r\n", b"X-Slow: x\r\n", b"Content-Length: 0\r\n\r\n")
+        elif self.path == "/slow-chunk-size":
+            # A chunk extension: http.client reads the chunk-size line in one call.
+            self._trickle(_CHUNKED_HEAD + b"c;", b"x", b'\r\n{"ok": true}\r\n0\r\n\r\n')
+        elif self.path == "/slow-trailers":
+            # The whole body, then trailers, which http.client reads and discards
+            # inside the call that returns the end of the body.
+            self._trickle(_CHUNKED_HEAD + _CHUNKED_BODY + b"0\r\n", b"X-Trailer: x\r\n", b"\r\n")
+        elif self.path == "/slow-error":
+            head = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 60\r\n\r\n"
+            self._trickle(head, b" ", b"")
+
+    def do_CONNECT(self) -> None:
+        """A proxy that trickles its answer to the tunnel an ``https`` read opens."""
+        self.server.seen.append((self.path, dict(self.headers.items())))
+        self._trickle(b"HTTP/1.1 200 Connection established\r\n", b"X-Proxy: x\r\n", b"\r\n")
 
     def _answer(self, status: int, body: bytes) -> None:
         self.send_response(status)
@@ -3842,6 +3863,23 @@ class _Loopback(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _trickle(self, head: bytes, piece: bytes, tail: bytes) -> None:
+        """Raw bytes: ``head``, then ``piece`` 60 times 100 ms apart, then ``tail``."""
+        try:
+            self.wfile.write(head)
+            for _ in range(60):
+                time.sleep(0.1)
+                self.wfile.write(piece)
+            self.wfile.write(tail)
+        except OSError:  # the client gave up
+            return
+
+
+_CHUNKED_HEAD = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+)
+_CHUNKED_BODY = b'5\r\n{"ok"\r\n7\r\n: true}\r\n'
 
 
 @pytest.fixture
@@ -3894,14 +3932,34 @@ def test_the_transport_reads_an_error_body_only_to_its_small_bound(loopback):
     assert reply.status == 403 and len(reply.body) == EXACT_READ_ERROR_BYTES
 
 
-def test_the_transport_bounds_the_whole_body_by_the_timeout(loopback):
-    """A server trickling its body (a byte every 50 ms, each read well inside the socket
-    timeout) is cut off at the deadline: an OSError, which the client reads as
-    inconclusive. The status line and headers are bounded per socket read only (#329)."""
+def test_the_transport_reads_a_chunked_reply_whole(loopback):
+    reply = _get(loopback, "/chunked")
+    assert (reply.status, reply.body) == (200, b'{"ok": true}')
+
+
+@pytest.mark.parametrize(
+    "path", ["/slow", "/slow-headers", "/slow-chunk-size", "/slow-trailers", "/slow-error"]
+)
+def test_the_transport_bounds_the_whole_reply_by_the_timeout(loopback, path):
+    """A server trickling any part of its reply (the body, the status line and headers,
+    a chunk's framing, the trailers after the last chunk, an error body), each receive
+    well inside the socket timeout, is cut off at the deadline: an OSError, which the
+    client reads as inconclusive."""
     started = time.monotonic()
     with pytest.raises(OSError, match="took longer"):
-        _get(loopback, "/slow", timeout=0.5)
+        _get(loopback, path, timeout=0.5)
     assert time.monotonic() - started < 3
+
+
+def test_the_transport_bounds_a_proxy_s_answer_to_its_tunnel_by_the_timeout(loopback, monkeypatch):
+    """Through a proxy, an ``https`` read first opens a tunnel; the proxy's answer is read
+    by the same deadline. The tunnel never opens, so nothing reaches the named host."""
+    monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{loopback.server_address[1]}")
+    started = time.monotonic()
+    with pytest.raises(OSError, match="took longer"):
+        https_get(HttpsRequest("https://example.invalid/x", (), 0.5, 1000))
+    assert time.monotonic() - started < 3
+    assert [path for path, _ in loopback.seen] == ["example.invalid:443"]
 
 
 def test_the_transport_verifies_github_s_certificate_and_writes_no_key_log(monkeypatch, tmp_path):

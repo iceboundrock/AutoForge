@@ -953,8 +953,10 @@ a stated reason it has none. The coverage that must keep working:
   (a 403 as a rate limit by its headers or GitHub's message, never quoted),
   transport failures and malformed replies as `gh`'s failures are, and the
   transport follows no redirect, reads at most one byte past its bound and
-  at most `EXACT_READ_ERROR_BYTES` of an error reply, bounds the whole body
-  by the timeout, verifies the certificate and ignores `SSLKEYLOGFILE`;
+  at most `EXACT_READ_ERROR_BYTES` of an error reply, reads a chunked reply
+  whole, bounds the whole reply by the timeout (a trickled body, status line
+  and headers, chunk size, trailers, error body, and a proxy's answer to its
+  tunnel), verifies the certificate and ignores `SSLKEYLOGFILE`;
   the #314 recovery (a conflict an earlier
   version recorded, `unblock`, `REVIEW`) launches no agent and writes and
   pushes nothing

@@ -34,7 +34,9 @@ must compare GitHub's own bytes. They are read-only and bounded.
 
 from __future__ import annotations
 
+import functools
 import http.client
+import io
 import json
 import os
 import re
@@ -700,12 +702,78 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _read_bounded(stream, limit: int, deadline: float, timeout: float) -> bytes:
-    """Up to ``limit`` bytes of ``stream``, all of them before ``deadline``."""
+class _DeadlineReader(io.RawIOBase):
+    """The raw reader of one reply: no receive on ``sock`` outlasts ``deadline``.
+
+    ``http.client`` reads everything of a reply through one buffered reader
+    over this: the status line, the headers, a chunked body's framing and its
+    trailers, and the body. One of its calls can take many receives (a line,
+    a chunk's size, the trailers after the last chunk), and a socket timeout
+    bounds each receive alone, so a server sending a byte at a time inside it
+    would never trip it. Each receive here waits at most until the deadline,
+    and none starts after it, whatever call it is part of.
+    """
+
+    def __init__(self, sock, deadline: float, timeout: float) -> None:
+        super().__init__()
+        self._sock = sock
+        self._raw = sock.makefile("rb", buffering=0)
+        self._deadline = deadline
+        self._timeout = timeout
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer):
+        remaining = self._deadline - time.monotonic()
+        try:
+            if remaining <= 0:
+                raise TimeoutError
+            self._sock.settimeout(remaining)
+            return self._raw.readinto(buffer)
+        except TimeoutError:  # the deadline has passed, or this receive reached it
+            raise TimeoutError(f"the reply took longer than {self._timeout:g}s") from None
+
+    def close(self) -> None:
+        if not self.closed:
+            self._raw.close()
+        super().close()
+
+
+class _DeadlineResponse(http.client.HTTPResponse):
+    """A reply read through a :class:`_DeadlineReader` instead of the socket's own file."""
+
+    def __init__(self, sock, *args, deadline, timeout, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        self.fp.close()  # nothing has been read from it
+        self.fp = io.BufferedReader(_DeadlineReader(sock, deadline, timeout))
+
+
+class _DeadlineHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    """Opens the request so that every reply on its connection is read by one deadline.
+
+    That is the request's reply, and a proxy's answer to the tunnel opened
+    for it. One handler serves both schemes, so the transport's tests on a
+    loopback ``http`` server read a reply as the read of GitHub does.
+    """
+
+    def __init__(self, context: ssl.SSLContext, deadline: float, timeout: float) -> None:
+        super().__init__(context=context)
+        self._response = functools.partial(_DeadlineResponse, deadline=deadline, timeout=timeout)
+
+    def do_open(self, http_class, req, **http_conn_args):
+        def connection(*args, **kwargs):
+            opened = http_class(*args, **kwargs)
+            opened.response_class = self._response
+            return opened
+
+        return super().do_open(connection, req, **http_conn_args)
+
+
+def _read_bounded(stream, limit: int) -> bytes:
+    """Up to ``limit`` bytes of ``stream``."""
     body = bytearray()
     while len(body) < limit:
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"the reply took longer than {timeout:g}s")
         chunk = stream.read1(min(1 << 16, limit - len(body)))
         if not chunk:
             break
@@ -730,34 +798,36 @@ def _tls_context() -> ssl.SSLContext:
 def https_get(request: HttpsRequest) -> HttpsReply:
     """The exact read's transport: one GET, the certificate verified, no redirect followed.
 
-    Connecting, and the status line and headers, are bounded by
-    ``timeout_seconds`` on each socket operation; the body is also read
-    within ``timeout_seconds`` of the call in all, so a server that trickles
-    it cannot hold the controller. The body is read up to ``max_bytes + 1``
-    bytes. A status that is not 2xx is returned for the client to classify,
-    with at most :data:`EXACT_READ_ERROR_BYTES` of its body. Connection and
-    TLS failures, and the deadline, raise as ``urllib`` raises them (an
+    Connecting (the TCP connection, the TLS handshake, sending the request)
+    is bounded by ``timeout_seconds`` on each socket operation. The reply is
+    read in all within ``timeout_seconds`` of the call: its status line,
+    headers, a chunked body's framing and trailers, and its body
+    (:class:`_DeadlineReader`), so a server that trickles any of it cannot
+    hold the controller. The body is read up to ``max_bytes + 1`` bytes. A
+    status that is not 2xx is returned for the client to classify, with at
+    most :data:`EXACT_READ_ERROR_BYTES` of its body. Connection and TLS
+    failures, and the deadline, raise as ``urllib`` raises them (an
     ``OSError``). The TLS context verifies the chain and the host name
     (:func:`_tls_context`). The proxy variables
     apply, as they do to `gh`; HTTPS through a proxy is a tunnel, so the
     certificate verified is still GitHub's.
     """
-    opener = urllib.request.build_opener(
-        _NoRedirect(), urllib.request.HTTPSHandler(context=_tls_context())
-    )
-    req = urllib.request.Request(request.url, headers=dict(request.headers), method="GET")
     timeout = request.timeout_seconds
     deadline = time.monotonic() + timeout
+    opener = urllib.request.build_opener(
+        _NoRedirect(), _DeadlineHandler(_tls_context(), deadline, timeout)
+    )
+    req = urllib.request.Request(request.url, headers=dict(request.headers), method="GET")
     try:
         with opener.open(req, timeout=timeout) as resp:
             headers = {name.lower(): value for name, value in resp.headers.items()}
-            body = _read_bounded(resp, request.max_bytes + 1, deadline, timeout)
+            body = _read_bounded(resp, request.max_bytes + 1)
             return HttpsReply(resp.status, headers, body)
     except urllib.error.HTTPError as exc:
         with exc:
             headers = {name.lower(): value for name, value in (exc.headers or {}).items()}
             limit = min(EXACT_READ_ERROR_BYTES, request.max_bytes)
-            body = _read_bounded(exc, limit, deadline, timeout) if exc.fp is not None else b""
+            body = _read_bounded(exc, limit) if exc.fp is not None else b""
             return HttpsReply(exc.code, headers, body)
 
 

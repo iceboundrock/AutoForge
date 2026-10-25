@@ -1063,8 +1063,13 @@ PR.
   trust store, with no key log (`SSLKEYLOGFILE` is ignored: it would write
   the secrets of the connection that carries the credential to a file); no
   redirect followed (a 3xx would carry the credential elsewhere; it is a
-  conclusive error); the client's `timeout_seconds` on connecting and on
-  each socket operation, and on reading the whole body; at most
+  conclusive error); the client's `timeout_seconds` on each socket
+  operation of connecting (the TCP connection, the TLS handshake, sending
+  the request), and on reading the whole reply from the start of the call:
+  the status line, the headers, a chunked body's framing and trailers, and
+  the body, every receive waiting at most until that deadline, so a server
+  that trickles any of it cannot hold the controller (a proxy's answer to
+  the tunnel is read the same way); at most
   `EXACT_READ_MAX_BYTES` (2 MiB) of a body and `EXACT_READ_ERROR_BYTES`
   (4 KiB) of an error reply read;
 - read-only: no other method exists, and nothing on GitHub changes.
@@ -1114,11 +1119,9 @@ follow-up append) and the EPIC roadmap edit read the body through `gh`, so
 a base holding escape text or a control character would be rewritten by
 the controller's own write; K10 evidence compares a comment `gh` printed.
 These are follow-up work (#328), not part of #327. So are the open
-points of the exact read itself (#329): one deadline for the whole reply
-(the body has one; the status line and headers are bounded per socket
-read), how a 404 or a credential failure of the exact read is classified
-in K7, where any conclusive failure ends the replan, and a `doctor` row
-for it.
+points of the exact read itself (#329): how a 404 or a credential failure
+of the exact read is classified in K7, where any conclusive failure ends
+the replan, and a `doctor` row for it.
 
 **Troubleshooting.** A create that blocks with *"… carries its identity
 but is not the object the controller intended (another body, title, head
