@@ -68,7 +68,7 @@ from types import FrameType
 from typing import TYPE_CHECKING, NoReturn, TextIO
 
 from .config import AutoForgeConfig, config_digest, load_config_file
-from .engine import ControllerEngine, StepOutcome
+from .engine import ControllerEngine, StepOutcome, config_file_placement_problem
 from .errors import (
     AutoForgeError,
     ConfigurationError,
@@ -406,6 +406,10 @@ def _start(args: WorkerArguments) -> _Started:
             "scheduler started with (its digest differs from scheduler.json's): it was "
             "edited since; stop the scheduler and start it again"
         )
+    # As every command refuses it (#280): an enforced launch could rewrite it.
+    placement = config_file_placement_problem(config, args.config, args.repository)
+    if placement:
+        _refuse(placement)
     repository = f"https://github.com/{scheduler.repository_owner}/{scheduler.repository_name}"
     return _Started(
         args=args,

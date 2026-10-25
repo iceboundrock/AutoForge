@@ -7,8 +7,12 @@ Commands:
   step    execute exactly one phase step from persisted state
   resume  continue a persisted run until a stop phase / max-steps; step, resume and
           unblock refuse a REMOTE run whose recorded configuration (profile
-          routing, agent worktree root) this invocation's differs from, unless
-          --accept-config-change (#219)
+          routing, agent worktree root) this invocation's differs from, and any
+          run whose pinned sandbox.mode this invocation's is weaker than, unless
+          --accept-config-change (#219, #280). Under sandbox.mode required or
+          preferred every command refuses a --config file inside a tree the
+          repository's sandboxed launches write, or a directory a provider's
+          launches are given read-write (#280)
   unblock the operator's explicit exit from BLOCKED: the controller re-inspects
           live GitHub state, re-enters a phase through validate_transition or
           refuses and stays BLOCKED; the reason is recorded in state and the log.
@@ -62,6 +66,7 @@ from .engine import (
     StepOutcome,
     StepPlan,
     UnblockOutcome,
+    config_file_placement_problem,
     sandbox_mode_summary,
 )
 from .epic_commands import (
@@ -116,6 +121,8 @@ from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predic
 from .redaction import redact, redact_argv, redact_dict
 from .replan_txn import ReplanTransaction
 from .run_namespace import namespace_issue_of_state_dir
+from .sandbox_pin import SandboxPin
+from .sandbox_policy import absolute_spelling
 from .scheduler import EpicScheduler, SchedulerInputs
 from .scheduler_stop import StopMode
 from .sdk_policy import MAX_ANSWER_CHARS
@@ -308,8 +315,10 @@ def _add_accept_config_change(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "continue a REMOTE run although this invocation's profile routing or agent "
-            "worktree root differs from the configuration the run was recorded under: the "
-            "change is written to the run log and becomes the run's configuration (#219)"
+            "worktree root differs from the configuration the run was recorded under, or any "
+            "run although this invocation's sandbox.mode is weaker than the one it is pinned "
+            "to: the change is written to the run log and becomes the run's configuration "
+            "(#219, #280)"
         ),
     )
 
@@ -507,7 +516,24 @@ def _add_max_parallel(parser: argparse.ArgumentParser) -> None:
 
 
 def _load_cfg(args) -> AutoForgeConfig:
-    return load_config_file(args.config)
+    """The ``--config`` file, or the built-in defaults; refused when a launch could rewrite it.
+
+    The file is parsed first, since the ``sandbox.mode`` it sets decides
+    whether the placement check applies at all. Under ``required`` or
+    ``preferred``, a file inside a tree the repository's enforced launches
+    write, or a directory a provider's launches are given read-write, is
+    then a ConfigurationError (exit 2) for every command, before
+    anything acts on what it says: no phase, launch or write follows, and no
+    command it names runs (#280,
+    :func:`autoforge.engine.config_file_placement_problem`). The check is
+    given the path as the loader was, never normalized: a ``..`` after a
+    link names another file once collapsed.
+    """
+    cfg = load_config_file(args.config)
+    problem = config_file_placement_problem(cfg, args.config or "")
+    if problem:
+        raise ConfigurationError(f"{problem}. Nothing was run, launched or written.")
+    return cfg
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -575,15 +601,16 @@ def _engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
     state_dir = args.state_dir or cfg.state_dir
     engine = ControllerEngine(config=cfg, state_dir=state_dir)
     engine.cli_global_flags = _global_flags(args)
-    engine.config_file = os.path.abspath(args.config) if args.config else ""
+    engine.config_file = absolute_spelling(args.config) if args.config else ""
     return engine
 
 
 def _check_configuration(engine: ControllerEngine, args, *words: str, dry_run: bool) -> None:
-    """The recorded-configuration gate of ``step``, ``resume`` and ``unblock`` (#219).
+    """The recorded-configuration and sandbox-pin gate of ``step``, ``resume`` and ``unblock``.
 
     Refuses (``ConfigurationDriftError``, exit 2) before any phase executes
-    when this invocation's configuration differs from the run's, unless
+    when this invocation's configuration differs from the run's (#219) or
+    its ``sandbox.mode`` is weaker than the run's pin (#280), unless
     ``--accept-config-change``; prints the engine's notice on stderr.
     """
     notice = engine.check_run_configuration(
@@ -1636,6 +1663,8 @@ def cmd_local_run(args) -> int:
         engine.new_local_run(args.feature, allow_dirty=args.allow_dirty)
         engine.validate_config()
         assert engine.state is not None
+        # The sandbox mode later commands of the run are held to (#280).
+        engine.record_run_configuration()
         if corrupt:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
@@ -1914,7 +1943,7 @@ def cmd_epic_run(args, *, resume: bool) -> int:
         epic_url=epic_url,
         config=cfg,
         graph=graph,
-        config_path=os.path.abspath(args.config) if args.config else "",
+        config_path=absolute_spelling(args.config) if args.config else "",
         max_parallel=args.max_parallel,
         accept_config_change=resume and args.accept_config_change,
         standalone_state_dir=standalone,
@@ -2052,8 +2081,26 @@ def _render_outer_sandbox(state: AutoForgeState, config: AutoForgeConfig) -> lis
     A mode that may fall back says so; a ``disabled`` run reads "logical
     isolation only". Whether this host can enforce is ``doctor``'s to show.
     """
-    summary = sandbox_mode_summary(config.sandbox, state.mode == WorkflowMode.LOCAL)
-    return ["", "Outer sandbox:", f"  {summary}"]
+    local = state.mode == WorkflowMode.LOCAL
+    summary = sandbox_mode_summary(config.sandbox, local)
+    return ["", "Outer sandbox:", f"  {summary}", f"  {_sandbox_pin_line(state, config, local)}"]
+
+
+def _sandbox_pin_line(state: AutoForgeState, config: AutoForgeConfig, local: bool) -> str:
+    """The run's sandbox pin (#280) for ``status``, and whether this configuration keeps it."""
+    if not state.sandbox_pin:
+        return (
+            "pinned: none (the state file predates #280); the next step, resume or unblock "
+            "pins the sandbox.mode it runs under"
+        )
+    pin = SandboxPin.from_dict(state.sandbox_pin)
+    line = f"pinned: {pin.describe()}"
+    if pin.direction(config.sandbox.mode, local=local) < 0:
+        return (
+            f"{line}; this configuration's sandbox.mode, {config.sandbox.mode}, is weaker, so "
+            "step, resume and unblock refuse it unless --accept-config-change"
+        )
+    return f"{line}; step, resume and unblock refuse a weaker sandbox.mode"
 
 
 def _review_certificate_check(

@@ -11,9 +11,11 @@
   `sandbox.read_only_paths`, `src/autoforge/doctor_sandbox.py`, the
   per-class policy in the dry-run plan and the parity suite,
   `tests/test_sandbox_parity.py`). D13.1 is amended by #225 (a script's
-  absolute `#!` line is reached as written), and D6.3 and D6.4 by #223
+  absolute `#!` line is reached as written), D6.3 and D6.4 by #223
   (the controller's reads of the admin dir follow no link the agent
-  planted). It is implemented by #167 (the launch
+  planted), and D12.3, D15.3 and D17.1 by #280 (a run is pinned to the
+  `sandbox.mode` it was created under, in state protocol 12, and a
+  `--config` file an enforced launch could rewrite is refused). It is implemented by #167 (the launch
   description, the policy compiler and the Linux `bwrap` backend in the
   executor layer), #168
   (provider declarations, engine facts, the routing of every launch, the git
@@ -1376,6 +1378,22 @@ DYNAMIC, like the provider, model and command (`run_contract.py` :58): it
 decides how a launch is contained, not what the run is. A run started under
 one mode resumes under another.
 
+*Amended by #280 (2026-10-24): the mode is pinned, beside the contract.*
+"Resumes under another" held for a stronger mode and made a weaker one a
+silent downgrade. A command run without the run's `--config` falls back to
+the built-in `disabled`. A configuration file in the LOCAL root, which every
+enforced launch writes, let an agent switch the sandbox off for every launch
+after its own. The mode stays out of the contract, which refuses any drift
+and is never migrated. Instead every run, LOCAL and REMOTE, records the mode
+it is created under (`state.sandbox_pin`, `src/autoforge/sandbox_pin.py`).
+`step`, `resume` and `unblock` (and a scheduler's worker resuming an issue)
+refuse a weaker mode before any phase executes, with nothing written, unless
+`--accept-config-change`, which writes the change to the run log before the
+run is pinned to it. Strength is what a launch gets: `disabled` is weaker than
+LOCAL's `preferred`, which is weaker than `required`; REMOTE's `preferred` is
+`required` (D12.2). A stronger mode moves the pin up with the command's next
+save. The pin holds configuration, never enforcement (D16.1).
+
 **D12.4 (#169).** **What each surface shows.**
 
 - **Dry run:** the compiled policy by launch class and role (paths where
@@ -1583,6 +1601,50 @@ layer of an overlay over the shared store, so commits made before the
 upgrade stay readable. D6.5's import keeps commits made under enforcement
 readable after a change of mode.
 
+*Amended by #280 (2026-10-24): to a weaker mode only by the operator's
+decision.* A run stopped mid-phase still resumes under a stronger mode with
+no migration of its sandbox directories, and its candidate stays readable
+after a change either way. A weaker mode is refused unless the operator
+passes `--accept-config-change`, which the run log records (D12.3 as
+amended). REMOTE needs this pin as much as LOCAL. Its controller runs
+`github.command` with the GitHub credential, every enforced REMOTE agent
+writes its agent worktree, and a REMOTE `resume` without `--config` falls
+back to `disabled` too. #219's recorded configuration
+(`src/autoforge/config_fingerprint.py`) does not hold the mode, so both modes
+are pinned. The `--config` file itself must lie outside every directory
+an enforced launch writes and keeps: the checkout, every worktree
+registered to the repository and its sandbox directories, and every
+directory a provider's declaration makes writable (a `dir-rw` item such
+as a dedicated `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR` or OpenCode
+database directory, or a `state` directory), reached through a symbolic
+link in one or aliased by a second hard link included (D4.4). The
+providers' directories are asked of every known provider's own
+declaration (D13.1) over the environment the command runs in, the one its
+launches inherit, the providers no profile of the file names included:
+the file under check cannot say which providers matter, since an agent
+that rewrote it could name another. A directory a provider was given only
+under another environment is not known to a later command; the operator
+runs a run's commands from one environment. Under `required` or
+`preferred` every command, the scheduler's worker and `doctor` refuse such
+a file (`config_file_problem` in `src/autoforge/sandbox_policy.py`), and
+`doctor` then runs no command the file names. The path is the one the
+loader opens, made absolute without being normalized, and is walked as
+the kernel looks it up: a `..` after a link is taken where the link
+leads, a path that looks up a name in such a tree and leaves it again by
+`..` is within reach (the agent can replace that entry), and the walk
+must end at the file the path opens, whose own link count is read.
+Checking only the file's resolved location would miss a replaced
+intermediate entry; lexically collapsing `..` first examines another
+file than the one loaded.
+
+*Rejected.* **Masking the configuration file in the LOCAL root.** A file
+in a writable projection cannot be masked, and a mask deeper in the tree
+is undone by renaming one of its ancestors. The same holds in a
+provider's writable directory, so the file is refused there too, never
+masked. **Asking only the providers the file's profiles name.** The
+profiles are what the file says, which an agent that rewrote it decides,
+and another configuration's launches write the directories of others.
+
 **D15.4 (#169).** **Operator-declared read-only paths are supported**, in
 configuration, for toolchains, interpreters and files a build needs outside
 `/usr` and `/etc` (a Linuxbrew prefix, a language toolchain under the home,
@@ -1639,6 +1701,17 @@ the cache.
 *Rejected.* **Persisting the enforcement state of each launch.** The
 controller would then read it, contradicting D16.1.
 
+*Amended by #280 (2026-10-24): protocol 12.* The exception was used once.
+The sandbox pin (D12.3 as amended) is a persisted field, `sandbox_pin`, and
+is protocol 12 of its own, announced on #23. It holds the configured mode,
+never whether a launch was enforced, so D16.1 stands. A protocol-11 file
+loads with `{}` and is pinned by its first `step`, `resume` or `unblock`.
+A file labelled older than 12 that carries the field is refused, and so is
+a protocol-12 file without it
+([State and recovery](../agent-guides/state-and-recovery.md)). A sandbox
+fact added later (#273) goes into the same record under a new pin schema
+whose parser still reads schema 1.
+
 ## 3. Process lifecycle
 
 For both the one-shot path (`execute()`: Claude text, OpenCode, Pi's
@@ -1689,7 +1762,8 @@ refuses before the spawn (D12.2).
   graces hold for the outer group (inner processes get none, D10.5), and
   its bounds and "one contained invocation per controller process" hold.
 - **The event journal stays audit-only.**
-- **No state protocol bump** (D17.1).
+- **No state protocol bump** (D17.1), but for #280's sandbox pin
+  (protocol 12, D17.1 as amended).
 - **#165's logical isolation stays in force** inside the sandbox, and alone
   under `disabled` or a `preferred` fallback. This record re-implements none
   of it.
@@ -1740,7 +1814,8 @@ refuses before the spawn (D12.2).
   of its own launch class; #171 takes the export location #168 chooses, and
   #172's validation in an export uses the same class. A policy digest for
   #172 can be derived from the role-level inputs of D13.2.
-- **#23.** Not involved unless D17.1's exception is ever used.
+- **#23.** Not involved unless D17.1's exception is ever used. #280 used
+  it (protocol 12).
 
 ## 7. Decision ownership
 
@@ -1752,6 +1827,7 @@ Each decision has exactly one implementing child, or is documentation only.
 | #168 | D2.1, D3.1, D5.1, D6.1–D6.7, D7.1, D8.1–D8.4, D9.2, D10.7, D12.1, D12.3, D13.1, D13.2, D15.2, D15.3 |
 | #169 | D1.2, D4.4, D7.3, D8.5, D9.3, D12.2, D12.4, D13.5, D14.1, D15.4 |
 | documentation only | D1.1, D7.4, D15.1, D16.1, D17.1 |
+| #280 (amendments) | D12.3, D15.3, D17.1 |
 
 ### 7.1 Where this record differs from a child issue's body
 
@@ -1855,8 +1931,9 @@ repositories only. No real credential, login or provider call.
   backends where the installed git supports them.
 - Recovery: a crash between a launch and its import leaves the commit
   readable at the next launch or candidate read (D6.5); a run stopped under
-  `required` resumes under `disabled`, and the other way round, with the
-  candidate readable (D15.3).
+  `disabled` resumes under `required`, and, with `--accept-config-change`,
+  the other way round, with the candidate readable (D15.3 as amended by
+  #280; without it the weaker mode is refused).
 - The environment: `HOME`, `XDG_*` and `TMPDIR` are rewritten, a dangling
   path variable is unset and named, `PATH` keeps only reachable entries.
 - A per-launch home: a file an agent writes into the home is gone at the

@@ -648,11 +648,13 @@ def test_an_accepted_change_whose_config_path_could_not_be_recorded_logs_nothing
 
 def test_a_local_run_records_and_checks_nothing(tmp_path):
     """A LOCAL run is defined by its run contract; the provider and model are
-    dynamic there (:mod:`autoforge.run_contract`)."""
+    dynamic there (:mod:`autoforge.run_contract`). Its sandbox mode is pinned
+    as a REMOTE run's is (#280, ``tests/test_sandbox_pin.py``)."""
     repo = local_repo(tmp_path)
     eng = make_local_engine(repo, write_feature(repo))
     eng.record_run_configuration()
     assert eng.state.config_fingerprint == {}
+    assert eng.state.sandbox_pin["mode"] == "disabled"
     eng.config.profiles["fix"].model = "opus"
     assert eng.check_run_configuration(("resume",)) == ""
     assert eng.state.config_fingerprint == {}

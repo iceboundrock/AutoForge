@@ -11,6 +11,48 @@ production use, and not the Public Alpha (#255). The heading says
 `unreleased` until the release-prep commit the release's tag names gives it
 its date ([Releasing](docs/releasing.md#the-changelog)).
 
+### The configuration file and a run's sandbox mode (#280)
+
+- Under `sandbox.mode: required` or `preferred`, every command, a
+  scheduler's worker and `autoforge doctor` refuse a `--config` file that
+  an enforced launch could rewrite: one inside the checkout or inside any
+  worktree registered to the repository (the agent worktrees included),
+  one inside a directory a provider is given read-write (a dedicated
+  `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR` or OpenCode database
+  directory, of every provider AutoForge knows under the command's
+  environment, whether or not the file's profiles name it), one reached
+  through a symbolic link in such a directory, one whose path passes
+  through one before a `..` (the path is followed as the command opens
+  it, a `..` after a link included, never tidied first), and one with a
+  second hard link. The command exits 2 with nothing run,
+  launched or written, naming the file and the fix; `doctor`'s config row
+  fails and runs none of the commands the file names. **Behaviour
+  change:** under those modes an `autoforge.yaml` kept in the checkout is
+  refused by every command, `status` included. Move it outside, for
+  example to `~/.config/autoforge/`, or set `sandbox.mode: disabled`. A
+  provider directory given only under another environment than the
+  command's is not known to it: run a run's commands from one environment
+  ([Security boundaries](docs/security.md#the-outer-sandbox-is-opt-in-and-linux-only)).
+- Every run, LOCAL and REMOTE, is pinned to the `sandbox.mode` it was
+  created under by `run`, `local run` or a scheduler's worker. `step`,
+  `resume` and `unblock` refuse a weaker mode with exit 2 before any phase
+  executes, writing nothing; that includes a command run without the
+  run's `--config`, which falls back to the built-in `disabled`. Weaker is
+  what a launch gets: `disabled`, then LOCAL's `preferred`, then
+  `required`; in a REMOTE run `preferred` is `required`. Repeated with
+  `--accept-config-change`, the command writes the change to the run log
+  first (a `<PHASE>-config-change` record naming the pin it replaces),
+  pins the run to the weaker mode and continues. A stronger mode is pinned
+  without asking. `status` shows the pin and whether this configuration
+  keeps it. **Behaviour change:** before, `sandbox.mode` could change
+  between the commands of a run without notice
+  ([Configuration: outer sandbox](docs/configuration.md#outer-sandbox)).
+- A run whose state file predates the pin is not checked once: its first
+  `step`, `resume` or `unblock` pins the mode it runs under.
+- The state file is protocol 12: an older AutoForge refuses it, and this
+  one refuses a file labelled older that carries `sandbox_pin`, even
+  empty, and a protocol-12 or unlabelled file without it.
+
 ### PyPI publishing through Trusted Publishing (#295)
 
 - New workflow `pypi-publish` (`.github/workflows/pypi-publish.yml`), run

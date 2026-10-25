@@ -57,7 +57,9 @@ sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005
                     LaunchFacts from the engine, ProviderRequirements from an adapter,
                     the SandboxPlan, the path-valued environment rewrite (D8.2),
                     executable and install-root resolution; no provider branch, no
-                    workflow decision, launches nothing (#168)
+                    workflow decision, launches nothing (#168); where a --config file
+                    may lie under an enforced mode (config_file_problem, #280) and
+                    what a provider's declaration makes writable (declared_writable)
 agent_worktree.py   the agent worktree's git surface in every sandbox.mode: registry
                     binding and listing (D6.4, #223), candidate read through the
                     common dir (D6.3),
@@ -99,6 +101,8 @@ run_namespace.py    the parallel EPIC scheduler's per-issue run identities (RunK
 run_contract.py     the durable contract of a LOCAL run
 config_fingerprint.py  the recorded configuration of a REMOTE run (profile routing,
                     agent worktree root) that step/resume/unblock compare (#219)
+sandbox_pin.py      the sandbox.mode every run is pinned to; step/resume/unblock refuse
+                    a weaker one unless --accept-config-change (#280)
 local_workspace.py  LOCAL mode working-tree verification
 safefs.py           filesystem capability boundary for every controller write
 locking.py          the lock domains of ADR 0008 (#180): L0 (ControllerLock, keyed by the git
@@ -203,7 +207,7 @@ prompts/update_epic*.md                           -> docs/agent-guides/github-sa
                                                      typed-external-effects.md for effects)
 state.py, effects.py, evidence.py, certificate.py,
 run_contract.py, safefs.py, config_fingerprint.py,
-locking.py, errors.py,
+sandbox_pin.py, locking.py, errors.py,
 engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
 run_namespace.py, ownership.py, locking.py (lock
 domains), scheduler_state.py,

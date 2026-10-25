@@ -254,6 +254,7 @@ from .sandbox_policy import (
     AuthMode,
     ProviderRequirements,
     SandboxPlan,
+    declared_writable,
     executable_requirements,
 )
 from .sdk_policy import (
@@ -663,6 +664,32 @@ class AgentProvider:
             spelled_paths=spelled,
             path_names=self.path_names,
         )
+
+    def written_directories(
+        self, profile: ProfileConfig, env_allowlist: tuple[str, ...] | None, home: str
+    ) -> tuple[tuple[str, str], ...]:
+        """The host directories a sandboxed launch of ``profile`` writes that outlive it (#280).
+
+        Each directory :meth:`sandbox_requirements` makes writable, with what
+        it is (:func:`~autoforge.sandbox_policy.declared_writable`), declared
+        over the environment a launch with ``env_allowlist`` inherits from
+        this process. The names :meth:`integration_isolation` sets are left
+        out of it: every launch sets them to a directory or file made for it
+        and removed afterwards, which nothing the operator keeps is in. What
+        a ``--config`` file may not lie in under an enforced mode, since an
+        agent could rewrite it there
+        (:func:`autoforge.engine.config_file_placement_problem`). Names and
+        paths only: nothing is created, and no file is read but an
+        executable's first line.
+        """
+        isolated = set(self.isolation_names)
+        env = {
+            name: value
+            for name, value in self.launch_environment(env_allowlist).items()
+            if name not in isolated
+        }
+        needs = self.sandbox_requirements(profile, [profile.command or self.name], env, home)
+        return declared_writable(needs)
 
     # -- shared behaviour -------------------------------------------------
     def build_command(self, req: AgentRequest) -> list[str]:

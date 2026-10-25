@@ -70,8 +70,17 @@ A LOCAL launch also masks the REMOTE default state directory
 `<root>/.autoforge`, but it cannot know a REMOTE state directory configured
 elsewhere inside the root (ADR 0005 D13.2): if you run REMOTE runs from the
 same checkout, keep their state directory at its default or outside the
-repository root. The mode is not part of the run contract, so a run may be
-resumed under the other one.
+repository root. The mode is not part of the run contract; the run is
+pinned to it instead (#280): a later `step` or `resume` under a weaker mode
+(`required` to `preferred` or `disabled`, `preferred` to `disabled`) is
+refused unless repeated with `--accept-config-change`, which the run log
+records, and a stronger mode is pinned without asking. Since the root is
+writable to every enforced launch, a `--config` file inside it (or in any
+worktree of the repository, or in a directory a provider is given
+read-write, such as a dedicated `CLAUDE_CONFIG_DIR`) is refused under
+`required` or `preferred` by every command and by `local doctor`: keep it
+outside, for example in `~/.config/autoforge/`
+([Configuration: outer sandbox](configuration.md#outer-sandbox)).
 
 **No commit is ever required and HEAD never has to move.** The implementation
 and its fixes live in the working tree; AutoForge never commits, stages,

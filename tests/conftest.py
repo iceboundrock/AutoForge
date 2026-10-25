@@ -1246,6 +1246,38 @@ def git_repo(path) -> Path:
     return root
 
 
+# The ``--config`` spellings of :func:`dotdot_config_paths` (#280, R2-F1).
+DOTDOT_SPELLINGS = (
+    "absolute-link",
+    "relative-link",
+    "relative-path",
+    "leaves-the-checkout",
+    "leaves-it-relative",
+)
+
+
+def dotdot_config_paths(checkout: Path, operator: Path) -> dict[str, str]:
+    """``--config`` paths that open ``checkout``'s file or pass through it (#280, R2-F1).
+
+    ``operator/absolute`` and ``operator/relative`` link to ``checkout/conf``,
+    so ``operator/<link>/../autoforge.json`` opens ``checkout/autoforge.json``;
+    a ``conf/..`` path looks up ``conf`` in the checkout and leaves it again.
+    The relative ones are relative to ``checkout``. Collapsed by
+    ``os.path.abspath``, every one names ``operator/autoforge.json``.
+    """
+    (checkout / "conf").mkdir(exist_ok=True)
+    (operator / "absolute").symlink_to(checkout / "conf")
+    (operator / "relative").symlink_to(os.path.relpath(checkout / "conf", operator))
+    up = os.path.relpath(operator, checkout)
+    return {
+        "absolute-link": f"{operator}/absolute/../autoforge.json",
+        "relative-link": f"{operator}/relative/../autoforge.json",
+        "relative-path": f"{up}/absolute/../autoforge.json",
+        "leaves-the-checkout": f"{checkout}/conf/../{up}/autoforge.json",
+        "leaves-it-relative": f"conf/../{up}/autoforge.json",
+    }
+
+
 GIT_IDENT = ("-c", "user.name=AutoForge tests", "-c", "user.email=tests@example.invalid")
 
 

@@ -175,6 +175,7 @@ from .config import (
     ACCEPTANCE_ACTIONS_AUTO,
     ACCEPTANCE_ACTIONS_OFF,
     DEFAULT_STATE_DIR,
+    KNOWN_PROVIDERS,
     SANDBOX_PREFERRED,
     SANDBOX_REQUIRED,
     AgentLimits,
@@ -390,7 +391,7 @@ from .prompts import (
     render,
     render_phase,
 )
-from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry
+from .providers import AgentExecutionResult, AgentRequest, ProviderRegistry, provider_for
 from .read_context import (
     MAX_LISTED_ISSUES,
     OperatorEvidence,
@@ -484,6 +485,10 @@ from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
 from .sandbox import LaunchDescription, NetworkPosition, SandboxFacts
 from .sandbox_bwrap import Capability, ProbeResult
+from .sandbox_pin import MODE_KEY, SandboxPin
+from .sandbox_pin import SOURCE_ACCEPTED as PIN_ACCEPTED
+from .sandbox_pin import SOURCE_STRENGTHENED as PIN_STRENGTHENED
+from .sandbox_pin import SOURCE_UPGRADED as PIN_UPGRADED
 from .sandbox_policy import (
     CACHE,
     LOCAL_SANDBOX_KEY,
@@ -493,7 +498,9 @@ from .sandbox_policy import (
     LaunchClass,
     LaunchFacts,
     SandboxPlan,
+    absolute_spelling,
     class_summary,
+    config_file_problem,
     describe_launch,
     launch_template,
     operator_path_problem,
@@ -1317,6 +1324,127 @@ def sandbox_mode_summary(sandbox: SandboxConfig, local: bool) -> str:
     )
 
 
+def provider_written_directories(cfg: AutoForgeConfig) -> dict[str, str]:
+    """The directories the providers' sandboxed launches write that outlive them (#280).
+
+    What each provider's own declaration makes writable over the environment
+    a launch inherits from this process
+    (:meth:`~autoforge.providers.AgentProvider.written_directories`): a
+    dedicated ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR`` or OpenCode
+    database directory, each as declared, mapped to the phrase that says
+    what it is and whose launches write it.
+
+    Every profile ``cfg`` configures is asked, and a declaration of one that
+    cannot be read is a ConfigurationError naming it. So is every other
+    known provider, with a profile of its defaults: which providers matter
+    cannot be taken from the file being checked, since an agent that
+    rewrote it could name another, and a launch of another configuration on
+    this host writes those directories too. A provider that cannot be asked
+    without options of its own (an SDK provider, whose roots are the
+    repository's sandbox directories) is passed over there: no profile of
+    its defaults could launch.
+    """
+    home = _operator_home()
+    allowlist = cfg.execution.environment_names()
+    writers: dict[tuple[str, str], dict[str, list[str]]] = {}
+
+    def ask(profile: ProfileConfig, names: list[str]) -> None:
+        written = provider_for(profile).written_directories(profile, allowlist, home)
+        for directory in written:
+            writers.setdefault(directory, {}).setdefault(profile.provider, []).extend(names)
+
+    for name in sorted(cfg.profiles):
+        profile = cfg.profiles[name]
+        try:
+            ask(profile, [name])
+        except (AutoForgeError, OSError) as exc:
+            raise ConfigurationError(
+                f"the sandbox declaration of profile {name!r} (provider {profile.provider}) "
+                f"cannot be read ({exc})"
+            ) from exc
+    configured = {profile.provider for profile in cfg.profiles.values()}
+    for provider in KNOWN_PROVIDERS:
+        if provider not in configured:
+            try:
+                ask(ProfileConfig(name=f"(any {provider} profile)", provider=provider), [])
+            except (AutoForgeError, OSError):
+                continue
+
+    def whose(by_provider: dict[str, list[str]]) -> str:
+        return " and ".join(
+            f"{provider} (profile {', '.join(names)})"
+            if names
+            else f"{provider} (no profile of this file, but another configuration's)"
+            for provider, names in by_provider.items()
+        )
+
+    described: dict[str, list[str]] = {}
+    for (path, what), by in writers.items():
+        described.setdefault(path, []).append(
+            f"{what}, which every sandboxed launch of {whose(by)} writes"
+        )
+    return {path: "; ".join(phrases) for path, phrases in described.items()}
+
+
+def config_file_placement_problem(
+    cfg: AutoForgeConfig, config_file: str, workdir: str | Path = ".", runner=None
+) -> str:
+    """Why ``config_file`` is one an enforced launch could rewrite, as a refusal; "" if not.
+
+    #280. Asked wherever a command loads a configuration file under
+    ``required`` or ``preferred``: the CLI for every command, ``doctor``, a
+    scheduler's worker. What enforced launches write and keep is asked
+    about: the repository's working trees, the checkout ``workdir`` is in
+    and every worktree registered to the repository (a LOCAL launch writes
+    the checkout, a REMOTE one its agent worktree), the repository's sandbox
+    directories (the caches), and every directory a provider's declaration
+    makes writable (:func:`provider_written_directories`), which the
+    launches of every repository write. Both modes ask: a LOCAL run's
+    launches write the checkout a REMOTE command loads its file from too,
+    and the REMOTE controller runs ``github.command`` with the GitHub
+    credential. Under ``disabled`` no launch is enforced and nothing is
+    asked (the same-user residual, docs/security.md). Outside a git
+    repository no launch writes a tree of it, so only the providers'
+    directories are asked about there; a provider declaration that cannot
+    be read, or a registry that cannot be listed, is a refusal, since
+    nothing then shows the file outside what launches write.
+
+    The providers' directories are those this process's environment
+    declares, the environment its own launches inherit: one a provider was
+    given only under another environment, by a command run from another
+    shell, is not known here (docs/security.md).
+
+    ``config_file`` is the path the loader was given, unnormalized: a
+    caller that made it absolute with ``os.path.abspath`` would have
+    collapsed a ``..`` after a link, and the check would examine another
+    file than the one loaded (:func:`~autoforge.sandbox_policy.absolute_spelling`).
+    """
+    if not config_file or not cfg.sandbox.enabled:
+        return ""
+    config_file = absolute_spelling(config_file)
+    mode = cfg.sandbox.mode
+    try:
+        declared = provider_written_directories(cfg)
+    except ConfigurationError as exc:
+        return (
+            f"{exc}, so the configuration file {config_file} is not shown to lie outside the "
+            "directories its launches write"
+        )
+    workspace = LocalWorkspace(workdir=workdir, runner=runner or execute)
+    try:
+        root = workspace.root()
+        dirs = workspace.git_dirs()
+    except (AutoForgeError, OSError):
+        return config_file_problem(config_file, (), mode, declared)
+    try:
+        trees = registered_worktree_roots(dirs[-1])
+    except VerificationError as exc:
+        return f"{exc}, so the configuration file {config_file} is not shown to lie outside them"
+    roots = {str(root), *(str(tree) for tree in trees)}
+    roots.update(str(directory / SANDBOX_DIR) for directory in dirs)
+    return config_file_problem(config_file, tuple(sorted(roots)), mode, declared)
+
+
 def _refusal_facts(exc: BaseException) -> dict[str, object]:
     """What a refused sandboxed launch recorded, for the run log; {} for none."""
     facts = getattr(exc, "facts", None)
@@ -1723,19 +1851,36 @@ class ControllerEngine:
     def record_run_configuration(self, source: str = SOURCE_CREATED) -> None:
         """Record this invocation's configuration as the run's, in memory.
 
-        ``run`` calls it on the run it creates, before its first save. A
-        LOCAL run records none: its run contract defines it. A configuration
-        the record could not be read back with is refused
-        (ConfigurationError), and nothing is recorded.
+        ``run``, ``local run`` and a scheduler's worker call it on the run
+        they create, before its first save. Every run pins the sandbox mode
+        it is created under (#280, :mod:`autoforge.sandbox_pin`); a REMOTE
+        run also records its profile routing and agent worktree root (#219),
+        which a LOCAL run's contract defines instead. A configuration the
+        record could not be read back with is refused (ConfigurationError),
+        and nothing is recorded.
         """
         state = self._require_state()
-        if state.is_local:
-            return
-        state.config_fingerprint = RecordedConfiguration(
-            fingerprint=self.invocation_config_fingerprint(),
+        pin = self._sandbox_pin_record(source)
+        if not state.is_local:
+            state.config_fingerprint = self._fingerprint_record(
+                self.invocation_config_fingerprint(), source
+            )
+        state.sandbox_pin = pin
+
+    def _fingerprint_record(self, fingerprint: ConfigFingerprint, source: str) -> dict:
+        """The persisted form of ``fingerprint`` as this invocation's; ConfigurationError
+        when the state file could not hold it."""
+        return RecordedConfiguration(
+            fingerprint=fingerprint,
             config_file=self.config_file,
             source=source,
             recorded_at=utcnow_iso(),
+        ).persisted()
+
+    def _sandbox_pin_record(self, source: str) -> dict:
+        """The persisted pin of this invocation's ``sandbox.mode`` (#280)."""
+        return SandboxPin(
+            mode=self.config.sandbox.mode, source=source, recorded_at=utcnow_iso()
         ).persisted()
 
     def check_run_configuration(
@@ -1745,89 +1890,211 @@ class ControllerEngine:
 
         ``resume``, ``step`` and ``unblock`` call it once the run is loaded;
         ``words`` is the command, for the one a refusal prints. Returns a
-        notice for the operator, "" when there is nothing to say:
+        notice for the operator, "" when there is nothing to say. Two
+        records are compared.
 
-        - a LOCAL run: nothing (its run contract is checked by :meth:`load`);
-        - a run with no recorded configuration (a state file written before
-          #219): not checked, and this invocation's is recorded
-          (``upgraded``), to be saved with the command's next save;
-        - the recorded configuration: nothing;
-        - another one: :class:`ConfigurationDriftError` naming each changed
-          key, with nothing written, unless ``accept_change``. Then the
-          change goes to the run log first and the new configuration is
-          recorded (``accepted``) and saved, before anything else runs.
+        The sandbox pin (#280, every run): a weaker ``sandbox.mode`` than the
+        pinned one is refused; a stronger one is pinned (``strengthened``),
+        and a run with no pin (a state file written before #280) is not
+        checked and pins this invocation's mode (``upgraded``), both saved
+        with the command's next save.
+
+        The recorded configuration (#219, a REMOTE run; a LOCAL run's
+        contract is checked by :meth:`load`): a run with none (a state file
+        written before #219) is not checked and records this invocation's
+        (``upgraded``), saved with the command's next save; another one is
+        refused.
+
+        A refusal is :class:`ConfigurationDriftError` naming each changed
+        key, with nothing written, unless ``accept_change``. Then the change,
+        a weaker mode included, goes to the run log first, and the new
+        configuration is recorded (``accepted``) and the run pinned to the
+        new mode (``accepted``) and saved, before anything else runs.
 
         A dry run records, logs and saves nothing; it refuses as the command
-        would, or says what it would record or accept. Outside a git checkout
-        it compares the routing only, and says so.
+        would, or says what it would record, pin or accept. Outside a git
+        checkout it compares the routing only, and says so.
 
         A configuration that could not be recorded (one its state file could
         not be loaded again with) is refused with ConfigurationError, in a
         dry run too, before anything is recorded or logged.
         """
         state = self._require_state()
-        if state.is_local:
-            return ""
-        if not state.config_fingerprint:
-            if dry_run:
-                fingerprint_routing(self.config)  # refused as the command would refuse it
-                return (
-                    f"[dry-run] run {state.run_id} has no recorded configuration (its state "
-                    "file predates #219), so it is not checked; without --dry-run this "
-                    f"command records {self._config_origin()} as the run's"
-                )
-            self.record_run_configuration(SOURCE_UPGRADED)
-            return (
-                f"run {state.run_id} had no recorded configuration (its state file predates "
-                f"#219), so it was not checked; {self._config_origin()} is recorded as the "
-                "run's with its next save, and later commands are checked against it"
-            )
-        recorded = RecordedConfiguration.from_dict(state.config_fingerprint)
+        recorded: RecordedConfiguration | None = None
+        current: ConfigFingerprint | None = None
+        changes: list[ConfigChange] = []
         unresolved = ""
-        try:
-            current = self.invocation_config_fingerprint()
-        except (AutoForgeError, OSError) as exc:
-            if not dry_run:
-                raise
-            # A dry run may be planned outside any repository, where the
-            # default root (one git read) cannot be resolved: the routing is
-            # still compared, and the notice says the root was not.
-            current = ConfigFingerprint.from_config(self.config, recorded.fingerprint.worktree_root)
-            unresolved = (
-                "[dry-run] the agent worktree root was not compared: the default one is "
-                f"resolved from the checkout's git directory ({exc})"
-            )
-        changes = recorded.fingerprint.changes(current)
-        if not changes:
-            return unresolved
-        if not accept_change:
-            refusal = self._config_drift_refusal(recorded, changes, words)
+        upgrade = not state.is_local and not state.config_fingerprint
+        if upgrade:
+            fingerprint_routing(self.config)  # refused as recording it would refuse it
+        elif not state.is_local:
+            recorded = RecordedConfiguration.from_dict(state.config_fingerprint)
+            try:
+                current = self.invocation_config_fingerprint()
+            except (AutoForgeError, OSError) as exc:
+                if not dry_run:
+                    raise
+                # A dry run may be planned outside any repository, where the
+                # default root (one git read) cannot be resolved: the routing
+                # is still compared, and the notice says the root was not.
+                current = ConfigFingerprint.from_config(
+                    self.config, recorded.fingerprint.worktree_root
+                )
+                unresolved = (
+                    "[dry-run] the agent worktree root was not compared: the default one is "
+                    f"resolved from the checkout's git directory ({exc})"
+                )
+            changes = recorded.fingerprint.changes(current)
+        pin = SandboxPin.from_dict(state.sandbox_pin) if state.sandbox_pin else None
+        mode = self.config.sandbox.mode
+        direction = pin.direction(mode, local=state.is_local) if pin is not None else 0
+        downgrade = (
+            ConfigChange(MODE_KEY, json.dumps(pin.mode), json.dumps(mode))
+            if pin is not None and direction < 0
+            else None
+        )
+        accepted = [*changes, *([downgrade] if downgrade else [])]
+        if accepted and not accept_change:
+            refusals = []
+            if changes:
+                assert recorded is not None
+                refusals.append(self._config_drift_refusal(recorded, changes, words))
+            if pin is not None and downgrade is not None:
+                refusals.append(self._sandbox_downgrade_refusal(pin, words))
+            refusal = "\n".join(refusals)
             raise ConfigurationDriftError(f"{refusal}\n{unresolved}" if unresolved else refusal)
-        listed = "".join(f"\n  {change.line()}" for change in changes)
         # Built first: a record that could not be read back is refused, in a
         # dry run too, with nothing logged.
-        record = RecordedConfiguration(
-            fingerprint=current,
-            config_file=self.config_file,
-            source=SOURCE_ACCEPTED,
-            recorded_at=utcnow_iso(),
-        ).persisted()
-        if dry_run:
-            accepted = (
-                f"[dry-run] would accept the configuration change of run {state.run_id} and "
-                f"record it in the run log:{listed}"
+        fingerprint: dict | None = None
+        if changes:
+            assert current is not None
+            fingerprint = self._fingerprint_record(current, SOURCE_ACCEPTED)
+        elif upgrade and not dry_run:
+            fingerprint = self._fingerprint_record(
+                self.invocation_config_fingerprint(), SOURCE_UPGRADED
             )
-            return f"{accepted}\n{unresolved}" if unresolved else accepted
-        # Logged before the state write: a refused log write leaves the run
-        # on its recorded configuration, and an accepted change is never on
-        # disk without its record.
-        self._log_config_change(words, recorded, changes)
-        state.config_fingerprint = record
-        self.save()
+        pin_source = (
+            PIN_UPGRADED
+            if pin is None
+            else PIN_ACCEPTED
+            if downgrade
+            else PIN_STRENGTHENED
+            if direction > 0
+            else ""
+        )
+        new_pin = self._sandbox_pin_record(pin_source) if pin_source else None
+        notices = self._configuration_notices(
+            upgrade, accepted, pin, dry_run=dry_run, fingerprint_changed=bool(changes)
+        )
+        if unresolved:
+            notices.insert(1 if accepted or upgrade else 0, unresolved)
+        if dry_run:
+            return "\n".join(notices)
+        if accepted:
+            # Logged before the state write: a refused log write leaves the
+            # run on its recorded configuration and pin, and an accepted
+            # change is never on disk without its record.
+            self._log_config_change(words, recorded, accepted, pin if downgrade else None)
+        if fingerprint is not None:
+            state.config_fingerprint = fingerprint
+        if new_pin is not None:
+            state.sandbox_pin = new_pin
+        if accepted:
+            self.save()
+        return "\n".join(notices)
+
+    def _configuration_notices(
+        self,
+        upgrade: bool,
+        accepted: list[ConfigChange],
+        pin: SandboxPin | None,
+        *,
+        dry_run: bool,
+        fingerprint_changed: bool,
+    ) -> list[str]:
+        """What :meth:`check_run_configuration` tells the operator, in order: the recorded
+        configuration's upgrade or accepted change first, then the pin's."""
+        state = self._require_state()
+        run = state.run_id
+        mode = self.config.sandbox.mode
+        out: list[str] = []
+        if upgrade:
+            out.append(
+                f"[dry-run] run {run} has no recorded configuration (its state file predates "
+                "#219), so it is not checked; without --dry-run this command records "
+                f"{self._config_origin()} as the run's"
+                if dry_run
+                else f"run {run} had no recorded configuration (its state file predates #219), "
+                f"so it was not checked; {self._config_origin()} is recorded as the run's with "
+                "its next save, and later commands are checked against it"
+            )
+        if accepted:
+            listed = "".join(f"\n  {change.line()}" for change in accepted)
+            if dry_run:
+                out.append(
+                    f"[dry-run] would accept the configuration change of run {run} and record "
+                    f"it in the run log:{listed}"
+                )
+            elif fingerprint_changed:
+                pinned = (
+                    f", and the run is pinned to sandbox.mode {mode}"
+                    if any(change.key == MODE_KEY for change in accepted)
+                    else ""
+                )
+                out.append(
+                    f"accepted the configuration change of run {run} (--accept-config-change); "
+                    f"it is in the run log, and {self._config_origin()} is the run's "
+                    f"configuration from now on{pinned}:{listed}"
+                )
+            else:
+                out.append(
+                    f"accepted the configuration change of run {run} (--accept-config-change); "
+                    f"it is in the run log, and the run is pinned to sandbox.mode {mode} from "
+                    f"now on:{listed}"
+                )
+        weaker = (
+            "a later command under a weaker sandbox.mode is refused unless it is repeated "
+            "with --accept-config-change"
+        )
+        if pin is None:
+            out.append(
+                f"[dry-run] run {run} has no sandbox pin (its state file predates #280), so its "
+                f"sandbox.mode is not checked; without --dry-run this command pins it to "
+                f"sandbox.mode {mode}"
+                if dry_run
+                else f"run {run} had no sandbox pin (its state file predates #280), so its "
+                f"sandbox.mode was not checked; it is pinned to sandbox.mode {mode} with its "
+                f"next save, and {weaker}"
+            )
+        elif pin.direction(mode, local=state.is_local) > 0:
+            out.append(
+                f"[dry-run] would pin run {run} to the stronger sandbox.mode {mode} (pinned: "
+                f"{pin.mode})"
+                if dry_run
+                else f"run {run} is pinned to the stronger sandbox.mode {mode} (it was "
+                f"{pin.mode}) with this command's next save; {weaker}"
+            )
+        return out
+
+    def _sandbox_downgrade_refusal(self, pin: SandboxPin, words: Sequence[str]) -> str:
+        """Why ``words`` refuses a weaker ``sandbox.mode`` than the run's pin (#280)."""
+        state = self._require_state()
+        mode = self.config.sandbox.mode
+        command = words[0] if words else "this command"
         return (
-            f"accepted the configuration change of run {state.run_id} "
-            f"(--accept-config-change); it is in the run log, and {self._config_origin()} is "
-            f"the run's configuration from now on:{listed}"
+            f"run {state.run_id} is pinned to sandbox.mode {pin.describe()}, and this "
+            f"command's sandbox.mode, {mode}, contains its launches less, so '{command}' "
+            "refuses before any phase executes; nothing was written. A run's later launches "
+            "get less containment than its earlier ones only by the operator's decision: a "
+            "command run without the run's --config falls back to the built-in default, "
+            "disabled, and a sandboxed agent must not be able to turn the sandbox off by "
+            "rewriting a configuration file (#280). Changed (pinned -> this command):\n"
+            f'  {MODE_KEY}: "{pin.mode}" -> "{mode}"\n'
+            f"To continue under the pinned mode, run it with a configuration that sets "
+            f"sandbox.mode: {pin.mode}.\n"
+            "To continue under this command's mode instead, repeat it with "
+            "--accept-config-change: the change is written to the run log, and the run is "
+            f"pinned to sandbox.mode {mode}."
         )
 
     def _config_origin(self) -> str:
@@ -1887,11 +2154,34 @@ class ControllerEngine:
         return shlex.join(["autoforge", *flags, *words])
 
     def _log_config_change(
-        self, words: Sequence[str], recorded: RecordedConfiguration, changes: list[ConfigChange]
+        self,
+        words: Sequence[str],
+        recorded: RecordedConfiguration | None,
+        changes: list[ConfigChange],
+        pin: SandboxPin | None,
     ) -> None:
-        """One controller-only run-log record of an accepted configuration change (#219)."""
+        """One controller-only run-log record of an accepted configuration change.
+
+        #219's recorded configuration (``recorded``, a REMOTE run's) and
+        #280's sandbox pin (``pin``, when the change weakens it) are named
+        beside the changes, as they stood before the change.
+        """
         state = self._require_state()
         now = utcnow_iso()
+        metadata: dict[str, object] = {
+            "command": words[0] if words else "",
+            "accepted": True,
+            "changes": [change.to_dict() for change in changes],
+        }
+        if recorded is not None:
+            metadata.update(
+                recorded_config_file=recorded.config_file,
+                recorded_source=recorded.source,
+                recorded_at=recorded.recorded_at,
+            )
+        if pin is not None:
+            metadata["recorded_sandbox_pin"] = pin.to_dict()
+        metadata["config_file"] = self.config_file
         record = ExecutionRecord(
             run_id=state.run_id,
             seq=0,
@@ -1904,15 +2194,7 @@ class ControllerEngine:
             prompt_version=state.prompt_version,
             started_at=now,
             finished_at=now,
-            metadata={
-                "command": words[0] if words else "",
-                "accepted": True,
-                "changes": [change.to_dict() for change in changes],
-                "recorded_config_file": recorded.config_file,
-                "recorded_source": recorded.source,
-                "recorded_at": recorded.recorded_at,
-                "config_file": self.config_file,
-            },
+            metadata=metadata,
         )
         self._logger().log_execution(record)
 

@@ -39,10 +39,18 @@ recorded. A refusal of the compiler becomes a launch refusal
 (:class:`~autoforge.errors.SandboxLaunchRefusedError`), on the path a
 failure to spawn takes.
 
+:func:`config_file_problem` answers the converse question for the
+controller's own input (#280): whether the ``--config`` file lies where an
+enforced launch writes, the repository's trees and what the providers'
+declarations make writable (:func:`declared_writable`), so that the next
+command would run on what an agent left there.
+
 Pure except for the compiler's ``realpath`` and ``lstat``, ``realpath`` of
 the environment's path values and ``lstat`` and ``readlink`` on their way,
-and the first line of an executable read for its interpreter; nothing is
-created or launched here.
+the first line of an executable read for its interpreter, and the
+configuration file's lookup walk (``lstat`` and ``readlink``, from the
+working directory for a relative path), its ``stat`` and link count;
+nothing is created or launched here.
 """
 
 from __future__ import annotations
@@ -55,6 +63,7 @@ import re
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from .child_env import OVERRIDE_PATH_NAMES
 from .errors import SandboxLaunchRefusedError, SandboxPolicyError
@@ -350,6 +359,190 @@ def operator_path_problem(operator_paths: tuple[str, ...], denied_roots: tuple[s
                     "in REMOTE the operator's checkout)"
                 )
     return ""
+
+
+# The links a lookup follows before it is a loop, as the kernel counts them
+# (``MAXSYMLINKS``): past it ``open`` fails, so nothing further is reached.
+_MAX_LOOKUP_LINKS = 40
+
+
+def absolute_spelling(path: str | os.PathLike[str]) -> str:
+    """``path`` as the configuration loader opens it, made absolute with every ``..`` kept (#280).
+
+    The loader opens ``Path(path)``, which drops only ``.`` components and
+    repeated slashes, and a relative path from the working directory: so
+    the working directory is joined to it and nothing else is collapsed.
+    ``os.path.abspath`` would remove ``name/..`` before ``name`` is
+    followed, and when ``name`` is a symbolic link what is left names
+    another file than the one ``open`` reaches. Whatever checks where the
+    file lies, records it or hands it to another process spells it so.
+    """
+    return os.fspath(Path(path).absolute())
+
+
+def lookup_directories(path: str) -> tuple[str, ...]:
+    """Each directory, resolved, in which opening ``path`` looks up a name (#280).
+
+    Whoever can write one of them can replace what ``path`` opens: move the
+    entry away and put another file or a link in its place. A relative path
+    is walked from the working directory, and the path is taken as spelled
+    (:func:`absolute_spelling`): a ``..`` leads to the parent of the
+    directory the walk has reached, any link before it already followed, as
+    the kernel takes it, and a directory a name was looked up in stays
+    listed when a ``..`` leads back out of it. Symbolic links are followed
+    as the kernel does (a relative target from the directory holding the
+    link, an absolute one from ``/``), so a link inside a tree and a link
+    into one both show. It stops at a name that is not there, and after more
+    links than a lookup follows: nothing past either is reached yet, and the
+    directory the name was looked up in is already listed. ``lstat`` and
+    ``readlink`` only; nothing is opened.
+    """
+    return _lookup(path)[0]
+
+
+def _lookup(path: str) -> tuple[tuple[str, ...], str]:
+    """:func:`lookup_directories`, and the entry the walk ends at, resolved.
+
+    The entry is "" when the walk stops before the last name.
+    """
+    looked_up: list[str] = []
+    current = "/"
+    pending = [part for part in absolute_spelling(path).split("/") if part]
+    links = 0
+    while pending:
+        name = pending.pop(0)
+        if name == ".":
+            continue
+        if name == "..":
+            current = posixpath.dirname(current)
+            continue
+        if current not in looked_up:
+            looked_up.append(current)
+        entry = posixpath.join(current, name)
+        try:
+            is_link = os.path.islink(entry)
+            if not is_link and not os.path.lexists(entry):
+                return tuple(looked_up), ""
+            target = os.readlink(entry) if is_link else ""
+        except OSError:
+            return tuple(looked_up), ""
+        if not is_link:
+            current = entry
+            continue
+        links += 1
+        if links > _MAX_LOOKUP_LINKS:
+            return tuple(looked_up), ""
+        if target.startswith("/"):
+            current = "/"
+        pending[:0] = [part for part in target.split("/") if part]
+    return tuple(looked_up), current
+
+
+def declared_writable(needs: ProviderRequirements) -> tuple[tuple[str, str], ...]:
+    """Each host directory a provider's declaration makes writable, with what it is (#280).
+
+    Its state directories and the directory of every ``dir-rw`` credential
+    item, as :func:`sandbox_request` projects them read-write: what a
+    launch of the provider writes on the host besides the engine's roots,
+    a dedicated ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR`` or OpenCode
+    database directory among them. Each is ``(path, phrase)``, the path as
+    declared.
+    """
+    state = [(path, f"a state directory its provider declares ({path})") for path in needs.state]
+    auth = [(item.source, item.label) for item in needs.auth if item.mode is AuthMode.DIR_RW]
+    return (*state, *auth)
+
+
+def config_file_problem(
+    config_file: str,
+    written_roots: tuple[str, ...],
+    mode: str,
+    declared: Mapping[str, str] | None = None,
+) -> str:
+    """Why an enforced launch could rewrite the configuration file, as a refusal; "" if none.
+
+    ``written_roots`` are the trees the repository's enforced launches write
+    and that outlive the launch: its working trees (the checkout, and every
+    worktree registered to it, the agent worktrees included) and its sandbox
+    directories (the caches). ``declared`` are
+    the directories the providers' declarations make writable
+    (:func:`declared_writable`), each with the phrase that says what it is
+    and whose launches write it. A file is within reach when opening it
+    looks up a name in one of either (:func:`lookup_directories`), and when
+    it has a second hard link, which may lie in one (ADR 0005 D4.4). The
+    next command would run on what such a file says: the sandbox mode, the
+    controller's GitHub command and the commands of every profile
+    ``doctor`` checks (#280). Both sides are compared resolved.
+
+    ``config_file`` is the path the loader was given, relative or not. It
+    is walked as spelled (:func:`absolute_spelling`), never normalized
+    first: a ``..`` after a link is taken where the link leads, so a file
+    in a root is not passed under the name of one beside it, and a path
+    that looks up a name in a root and leaves it again is within reach
+    there. The file examined is the one the path opens: the walk has to end
+    at it, or nothing shows where it is reached from and it is refused, and
+    its own link count is read.
+    """
+    config_file = absolute_spelling(config_file)
+    direct = os.path.realpath(config_file) == config_file
+    roots = [(root, os.path.realpath(root), "") for root in written_roots]
+    roots += [(root, os.path.realpath(root), what) for root, what in (declared or {}).items()]
+    walked, reached = _lookup(config_file)
+    for directory in walked:
+        for root, resolved, what in roots:
+            if _inside(directory, resolved):
+                # The deepest directory of the walk in this root names the lookup.
+                deepest = [d for d in walked if _inside(d, resolved)][-1]
+                where = "lies in" if direct else f"is reached through {deepest}, in"
+                if what:
+                    return (
+                        f"the configuration file {config_file} {where} {root}, {what} "
+                        f"(sandbox.mode is {mode}): a sandboxed agent could rewrite it, and the "
+                        "next command would run on what it says, sandbox.mode, github.command "
+                        "and the profiles' commands included (#280). Move it outside that "
+                        "directory and every working tree of this repository (for example to "
+                        "~/.config/autoforge/) and pass that path with --config, give the "
+                        "provider another directory, or set sandbox.mode: disabled"
+                    )
+                return (
+                    f"the configuration file {config_file} {where} {root}, a tree that "
+                    f"launches inside the outer sandbox write (sandbox.mode is {mode}): a "
+                    "sandboxed agent could rewrite it, and the next command would run on what "
+                    "it says, sandbox.mode, github.command and the profiles' commands "
+                    "included (#280). Move it outside every working tree of this repository "
+                    "(for example to ~/.config/autoforge/) and pass that path with --config, "
+                    "or set sandbox.mode: disabled"
+                )
+    try:
+        opened = os.stat(config_file)
+    except OSError:
+        return ""
+    try:
+        followed = bool(reached) and os.path.samestat(opened, os.stat(reached))
+    except OSError:
+        followed = False
+    if not followed:
+        return _not_followed(config_file, mode)
+    links = opened.st_nlink
+    if links > 1:
+        return (
+            f"the configuration file {config_file} has {links} hard links, and another one "
+            "may lie in a tree that launches inside the outer sandbox write (sandbox.mode is "
+            f"{mode}; ADR 0005 D4.4): a sandboxed agent could rewrite it through that link "
+            "(#280). Copy it to a file of its own outside every working tree of this "
+            "repository and every directory a provider's launches write, and pass that path "
+            "with --config, or set sandbox.mode: disabled"
+        )
+    return ""
+
+
+def _not_followed(config_file: str, mode: str) -> str:
+    return (
+        f"the configuration file {config_file} opens another file than its lookup walk was "
+        "followed to, so nothing shows that it lies outside every tree that launches inside "
+        f"the outer sandbox write (sandbox.mode is {mode}; #280). Pass the file's own path "
+        "with --config, or set sandbox.mode: disabled"
+    )
 
 
 @dataclass(frozen=True)

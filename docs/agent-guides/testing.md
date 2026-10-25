@@ -37,9 +37,9 @@ High-priority coverage includes:
   unchanged; each malformed outcome and recorded URL is refused; a LOCAL
   run carries none; a new issue resets the outcomes
 - operator-action state (#243, `tests/test_state.py`): every outcome
-  round-trips under protocol 11; a protocol-10 file, a `FIX` plan included,
-  loads in every phase migrated and is relabelled; an older file carrying
-  `operator_comment_outcomes`, a K10 record, `operator_targets`,
+  round-trips under the current protocol; a protocol-10 file, a `FIX`
+  plan included, loads in every phase migrated and is relabelled; an older
+  file carrying `operator_comment_outcomes`, a K10 record, `operator_targets`,
   `operator_sources` or `operator_evidence` is refused, unchanged; a
   protocol-11 file missing the outcomes is refused; each malformed outcome
   is refused, and a `verified` one is unique per action and comment; the

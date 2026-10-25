@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from autoforge.config import ProfileConfig
+from autoforge.config import ProfileConfig, default_config
+from autoforge.engine import config_file_placement_problem
 from autoforge.errors import SandboxLaunchRefusedError
 from autoforge.providers import ClaudeCodeProvider, OpenCodeProvider, PiProvider
 from autoforge.sandbox import (
@@ -23,6 +24,7 @@ from autoforge.sandbox import (
     Link,
     Mask,
     NetworkPosition,
+    Origin,
     Overlay,
     PrivateTmpfs,
 )
@@ -32,10 +34,14 @@ from autoforge.sandbox_policy import (
     LaunchClass,
     LaunchFacts,
     ProviderRequirements,
+    absolute_spelling,
+    config_file_problem,
+    declared_writable,
     describe_launch,
     executable_requirements,
     install_root,
     interpreter_of,
+    lookup_directories,
     sandbox_request,
 )
 
@@ -653,3 +659,452 @@ def test_pi_declares_its_agent_directory_and_never_the_operators(tmp_path):
     )
     with pytest.raises(SandboxLaunchRefusedError, match="D7.2"):
         describe_launch(_remote(paths), needs, {})
+
+
+# -- where a configuration file may lie (#280) -------------------------------------
+
+
+def _tree(tmp_path) -> tuple[Path, Path, Path]:
+    """A resolved base, a written root inside it, and a directory outside the root."""
+    base = Path(os.path.realpath(tmp_path))
+    root = base / "repo"
+    (root / "conf").mkdir(parents=True)
+    outside = base / "operator"
+    outside.mkdir()
+    return base, root, outside
+
+
+def test_the_lookup_walk_lists_each_directory_a_name_is_looked_up_in(tmp_path):
+    base, root, _ = _tree(tmp_path)
+    (root / "conf" / "a.yaml").write_text("version: 1\n")
+    walked = lookup_directories(str(root / "conf" / "a.yaml"))
+    assert walked[0] == "/"
+    assert walked[-2:] == (str(root), str(root / "conf"))
+    assert lookup_directories(str(root / "conf" / "missing" / "a.yaml"))[-1] == str(root / "conf")
+
+
+def test_the_lookup_walk_follows_links_as_the_kernel_does(tmp_path):
+    base, root, outside = _tree(tmp_path)
+    (root / "conf" / "a.yaml").write_text("version: 1\n")
+    (outside / "absolute").symlink_to(root / "conf")
+    (outside / "relative").symlink_to(os.path.join("..", "repo", "conf"))
+    (outside / "dotdot").symlink_to(os.path.join("..", "repo", "conf", "..", "conf"))
+    for link in ("absolute", "relative", "dotdot"):
+        walked = lookup_directories(str(outside / link / "a.yaml"))
+        assert str(outside) in walked and walked[-1] == str(root / "conf"), link
+
+
+def test_the_lookup_walk_stops_at_a_link_loop(tmp_path):
+    base, _, outside = _tree(tmp_path)
+    (outside / "a").symlink_to(outside / "b")
+    (outside / "b").symlink_to(outside / "a")
+    assert lookup_directories(str(outside / "a" / "x.yaml"))[-1] == str(outside)
+
+
+def test_a_configuration_file_in_a_written_root_is_refused(tmp_path):
+    _, root, _ = _tree(tmp_path)
+    cfg = root / "conf" / "autoforge.yaml"
+    cfg.write_text("version: 1\n")
+    problem = config_file_problem(str(cfg), (str(root),), "required")
+    assert problem.startswith(f"the configuration file {cfg} lies in {root}, a tree that ")
+    assert "(sandbox.mode is required)" in problem
+    assert "a sandboxed agent could rewrite it" in problem
+    assert "Move it outside every working tree of this repository" in problem
+    assert "set sandbox.mode: disabled" in problem
+
+
+def test_a_configuration_file_outside_every_written_root_passes(tmp_path):
+    base, root, outside = _tree(tmp_path)
+    cfg = outside / "autoforge.yaml"
+    cfg.write_text("version: 1\n")
+    assert config_file_problem(str(cfg), (str(root),), "required") == ""
+    # A file beside the root, in its parent, is not inside it.
+    beside = base / "autoforge.yaml"
+    beside.write_text("version: 1\n")
+    assert config_file_problem(str(beside), (str(root),), "preferred") == ""
+    # Nor is a sibling whose name only begins like the root's.
+    sibling = base / "repo-config"
+    sibling.mkdir()
+    (sibling / "a.yaml").write_text("version: 1\n")
+    assert config_file_problem(str(sibling / "a.yaml"), (str(root),), "required") == ""
+
+
+def test_a_link_from_outside_into_a_written_root_is_refused(tmp_path):
+    _, root, outside = _tree(tmp_path)
+    (root / "conf" / "autoforge.yaml").write_text("version: 1\n")
+    (outside / "autoforge.yaml").symlink_to(root / "conf" / "autoforge.yaml")
+    (outside / "dir").symlink_to(root / "conf")
+    for spelled in (outside / "autoforge.yaml", outside / "dir" / "autoforge.yaml"):
+        problem = config_file_problem(str(spelled), (str(root),), "required")
+        assert f"the configuration file {spelled} is reached through " in problem
+        assert f", in {root}, a tree that " in problem
+
+
+def test_a_link_inside_a_written_root_to_a_file_outside_is_refused(tmp_path):
+    """The agent replaces the link, not the file it names."""
+    _, root, outside = _tree(tmp_path)
+    (outside / "autoforge.yaml").write_text("version: 1\n")
+    (root / "conf" / "autoforge.yaml").symlink_to(outside / "autoforge.yaml")
+    problem = config_file_problem(str(root / "conf" / "autoforge.yaml"), (str(root),), "required")
+    assert f"is reached through {root / 'conf'}, in {root}" in problem
+
+
+def test_a_written_root_spelled_through_a_link_is_compared_resolved(tmp_path):
+    base, root, _ = _tree(tmp_path)
+    cfg = root / "conf" / "autoforge.yaml"
+    cfg.write_text("version: 1\n")
+    (base / "alias").symlink_to(root)
+    problem = config_file_problem(str(cfg), (str(base / "alias"),), "required")
+    assert f"lies in {base / 'alias'}, a tree that " in problem
+
+
+def test_a_configuration_file_with_a_second_hard_link_is_refused(tmp_path):
+    """ADR 0005 D4.4: a hard link shows nowhere in the walk."""
+    _, root, outside = _tree(tmp_path)
+    cfg = outside / "autoforge.yaml"
+    cfg.write_text("version: 1\n")
+    os.link(cfg, root / "conf" / "linked.yaml")
+    problem = config_file_problem(str(cfg), (str(root),), "preferred")
+    assert f"the configuration file {cfg} has 2 hard links" in problem
+    assert "Copy it to a file of its own outside every working tree" in problem
+
+
+def test_a_missing_configuration_file_is_judged_by_where_it_would_be(tmp_path):
+    _, root, outside = _tree(tmp_path)
+    assert "lies in" in config_file_problem(str(root / "conf" / "x.yaml"), (str(root),), "required")
+    assert config_file_problem(str(outside / "x.yaml"), (str(root),), "required") == ""
+
+
+# A ``..`` is taken where the walk is, never collapsed first (#280, R2-F1): with
+# ``operator/alias`` a link to ``repo/conf``, ``operator/alias/../a.yaml`` opens
+# ``repo/a.yaml``, and ``os.path.abspath`` spells it ``operator/a.yaml``.
+
+
+def test_the_absolute_spelling_keeps_every_dotdot_and_joins_the_working_directory(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    here = os.getcwd()
+    assert absolute_spelling("alias/../a.yaml") == f"{here}/alias/../a.yaml"
+    assert absolute_spelling("../x/./a.yaml") == f"{here}/../x/a.yaml"
+    assert absolute_spelling("/operator//alias/../a.yaml") == "/operator/alias/../a.yaml"
+    assert absolute_spelling(Path("/operator/a.yaml")) == "/operator/a.yaml"
+
+
+def _dotdot_tree(tmp_path) -> tuple[Path, Path, Path]:
+    """``operator/{absolute,relative}`` link to ``repo/conf``; ``a.yaml`` in both parents."""
+    base, root, outside = _tree(tmp_path)
+    for directory in (root, outside):
+        (directory / "a.yaml").write_text("version: 1\n")
+    (outside / "absolute").symlink_to(root / "conf")
+    (outside / "relative").symlink_to(os.path.join("..", "repo", "conf"))
+    return base, root, outside
+
+
+@pytest.mark.parametrize("link", ["absolute", "relative"])
+def test_a_dotdot_after_a_link_into_a_written_root_is_refused(tmp_path, link):
+    _, root, outside = _dotdot_tree(tmp_path)
+    spelled = f"{outside}/{link}/../a.yaml"
+    assert os.path.realpath(spelled) == str(root / "a.yaml")  # what the loader opens
+    problem = config_file_problem(spelled, (str(root),), "required")
+    assert problem.startswith(f"the configuration file {spelled} is reached through {root}, ")
+    assert f", in {root}, a tree that " in problem
+    assert str(root) in lookup_directories(spelled)
+    # The lexically collapsed spelling is the operator's file, which passes.
+    assert config_file_problem(os.path.abspath(spelled), (str(root),), "required") == ""
+
+
+@pytest.mark.parametrize("link", ["absolute", "relative"])
+def test_a_relative_path_with_a_dotdot_after_a_link_is_walked_from_the_working_directory(
+    tmp_path, monkeypatch, link
+):
+    _, root, outside = _dotdot_tree(tmp_path)
+    monkeypatch.chdir(outside)
+    problem = config_file_problem(f"{link}/../a.yaml", (str(root),), "preferred")
+    assert problem.startswith(
+        f"the configuration file {os.getcwd()}/{link}/../a.yaml is reached through {root}, "
+    )
+    monkeypatch.chdir(root)  # from inside the root, a .. that leaves it looks up nothing there
+    assert config_file_problem("../operator/a.yaml", (str(root),), "required") == ""
+    assert "reached through" in config_file_problem(
+        f"../operator/{link}/../a.yaml", (str(root),), "required"
+    )
+
+
+def test_a_path_that_looks_up_a_name_in_a_written_root_and_leaves_it_is_refused(
+    tmp_path, monkeypatch
+):
+    """The file opened is outside, but the agent can replace ``conf``, which the
+    lookup goes through, with a link that keeps the ``..`` inside the root."""
+    base, root, outside = _dotdot_tree(tmp_path)
+    for spelled in (f"{root}/conf/../../operator/a.yaml", f"{root}/conf/../conf/../a.yaml"):
+        problem = config_file_problem(spelled, (str(root),), "required")
+        assert problem.startswith(f"the configuration file {spelled} is reached through "), spelled
+        assert f", in {root}, a tree that " in problem
+    monkeypatch.chdir(root)
+    problem = config_file_problem("conf/../../operator/a.yaml", (str(root),), "required")
+    assert f"is reached through {root}, in {root}" in problem
+    # A directory the walk passes outside every root, and back out of, is no reach.
+    (outside / "sub").mkdir()
+    assert config_file_problem(f"{outside}/sub/../a.yaml", (str(root),), "required") == ""
+
+
+def test_a_dotdot_after_a_link_that_stays_outside_every_written_root_passes(tmp_path):
+    base, root, outside = _tree(tmp_path)
+    elsewhere = base / "elsewhere"
+    (elsewhere / "conf").mkdir(parents=True)
+    (elsewhere / "a.yaml").write_text("version: 1\n")
+    (outside / "alias").symlink_to(elsewhere / "conf")
+    assert config_file_problem(f"{outside}/alias/../a.yaml", (str(root),), "required") == ""
+
+
+def test_the_hard_links_counted_are_the_file_opened(tmp_path):
+    """The lexical twin has one link; the file the path opens has two."""
+    base, root, outside = _tree(tmp_path)
+    elsewhere = base / "elsewhere"
+    (elsewhere / "conf").mkdir(parents=True)
+    (elsewhere / "a.yaml").write_text("version: 1\n")
+    os.link(elsewhere / "a.yaml", root / "conf" / "linked.yaml")
+    (outside / "a.yaml").write_text("version: 1\n")
+    (outside / "alias").symlink_to(elsewhere / "conf")
+    spelled = f"{outside}/alias/../a.yaml"
+    assert f"the configuration file {spelled} has 2 hard links" in config_file_problem(
+        spelled, (str(root),), "required"
+    )
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs Linux's /proc")
+def test_a_file_the_lookup_walk_does_not_end_at_is_refused(tmp_path):
+    """A /proc magic link reads as the path of a deleted file, which the walk
+    cannot follow, while ``open`` reaches the file anyway: the walk would
+    have examined something else than the file opened."""
+    _, root, outside = _tree(tmp_path)
+    cfg = outside / "a.yaml"
+    cfg.write_text("version: 1\n")
+    with open(cfg, encoding="utf-8") as handle:
+        cfg.unlink()
+        spelled = f"/proc/self/fd/{handle.fileno()}"
+        problem = config_file_problem(spelled, (str(root),), "required")
+    assert problem.startswith(
+        f"the configuration file {spelled} opens another file than its lookup walk was followed to"
+    )
+    assert "(sandbox.mode is required; #280)" in problem
+
+
+# -- the directories a provider's own launches write (#280, R3-F1) ------------------
+# A dedicated ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR`` or OpenCode database
+# directory is projected writable into every launch of its provider and outlives
+# it: a configuration file there is one an agent can rewrite.
+
+_DECLARED_WHAT = (
+    "the Claude Code configuration directory ($CLAUDE_CONFIG_DIR), which every sandboxed "
+    "launch of claude (profile fix) writes"
+)
+
+
+def test_a_declaration_makes_its_state_and_dir_rw_items_writable_and_nothing_else(tmp_path):
+    """What :func:`declared_writable` names is what :func:`sandbox_request`
+    projects read-write from the declaration: never a read-only file, an
+    ``env`` item or a keyring login."""
+    needs = ProviderRequirements(
+        config=("/opt/tool/conf",),
+        home_config=("/home/u/.tool/settings.json",),
+        state=("/srv/tool-state",),
+        auth=(
+            AuthItem(AuthMode.ENV, "TOOL_API_KEY"),
+            AuthItem(AuthMode.FILE_RO, "the tool login", "/home/u/.tool/login.json"),
+            AuthItem(AuthMode.DIR_RW, "the tool directory ($TOOL_DIR)", "/srv/tool"),
+            AuthItem(AuthMode.KEYRING, "the tool keyring login", "tool"),
+        ),
+    )
+    assert declared_writable(needs) == (
+        ("/srv/tool-state", "a state directory its provider declares (/srv/tool-state)"),
+        ("/srv/tool", "the tool directory ($TOOL_DIR)"),
+    )
+    request = sandbox_request(_local(_layout(tmp_path)), needs)
+    projected = [
+        p.source
+        for p in request.projections
+        if p.origin is Origin.DECLARED and p.access is Access.WRITABLE
+    ]
+    assert projected == [path for path, _ in declared_writable(needs)]
+
+
+def test_each_provider_names_the_directories_its_launches_write(tmp_path, monkeypatch):
+    """Each adapter's own declaration, over the environment a launch
+    inherits: ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR`` and the directory
+    of ``OPENCODE_DB``. An operator's ``OPENCODE_CONFIG_DIR`` is not one:
+    every OpenCode launch replaces it with an empty directory of its own."""
+    base = Path(os.path.realpath(tmp_path))
+    home = str(base / "home")
+    allowlist = default_config().execution.environment_names()
+
+    def written(provider) -> tuple[tuple[str, str], ...]:
+        profile = ProfileConfig(name="p", provider=provider.name)
+        return provider.written_directories(profile, allowlist, home)
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", f"{base}/claude")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", f"{base}/pi")
+    monkeypatch.setenv("OPENCODE_DB", f"{base}/opencode/af.db")
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", f"{base}/opencode-config")
+    assert written(ClaudeCodeProvider()) == (
+        (f"{base}/claude", "the Claude Code configuration directory ($CLAUDE_CONFIG_DIR)"),
+    )
+    assert written(PiProvider()) == ((f"{base}/pi", "Pi's agent directory ($PI_CODING_AGENT_DIR)"),)
+    assert written(OpenCodeProvider()) == (
+        (f"{base}/opencode", "the OpenCode database directory ($OPENCODE_DB)"),
+    )
+    for name in ("CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "OPENCODE_DB"):
+        monkeypatch.delenv(name)
+    for provider in (ClaudeCodeProvider(), PiProvider(), OpenCodeProvider()):
+        assert written(provider) == (), provider.name
+
+
+def test_a_configuration_file_in_a_providers_writable_directory_is_refused(tmp_path):
+    base, root, outside = _tree(tmp_path)
+    claude = base / "claude-autoforge"
+    (claude / "conf").mkdir(parents=True)
+    declared = {str(claude): _DECLARED_WHAT}
+    for cfg in (claude / "autoforge.yaml", claude / "conf" / "autoforge.yaml"):
+        cfg.write_text("version: 1\n")
+        problem = config_file_problem(str(cfg), (str(root),), "required", declared)
+        assert problem.startswith(
+            f"the configuration file {cfg} lies in {claude}, {_DECLARED_WHAT} "
+            "(sandbox.mode is required): a sandboxed agent could rewrite it"
+        )
+        assert "Move it outside that directory and every working tree" in problem
+        assert "give the provider another directory, or set sandbox.mode: disabled" in problem
+    assert "lies in" in config_file_problem(str(claude / "x.yaml"), (), "preferred", declared)
+
+
+def test_a_path_through_a_providers_writable_directory_is_refused(tmp_path):
+    """The agent replaces what the lookup passes in the directory: a link to
+    a file outside, a link into it, a name a ``..`` leaves again."""
+    base, root, outside = _tree(tmp_path)
+    claude = base / "claude-autoforge"
+    (claude / "conf").mkdir(parents=True)
+    (claude / "autoforge.yaml").write_text("version: 1\n")
+    (outside / "a.yaml").write_text("version: 1\n")
+    (claude / "linked.yaml").symlink_to(outside / "a.yaml")
+    (outside / "alias").symlink_to(claude / "conf")
+    declared = {str(claude): _DECLARED_WHAT}
+    for spelled in (
+        str(claude / "linked.yaml"),
+        f"{outside}/alias/../autoforge.yaml",
+        f"{claude}/conf/../../operator/a.yaml",
+    ):
+        problem = config_file_problem(spelled, (str(root),), "required", declared)
+        assert problem.startswith(f"the configuration file {spelled} is reached through "), spelled
+        assert f", in {claude}, {_DECLARED_WHAT} (sandbox.mode is required)" in problem
+    # Spelled through a link, the declared directory is compared resolved.
+    (base / "claude-alias").symlink_to(claude)
+    alias = {str(base / "claude-alias"): _DECLARED_WHAT}
+    assert "lies in" in config_file_problem(str(claude / "autoforge.yaml"), (), "required", alias)
+
+
+def test_a_configuration_file_beside_or_above_a_providers_directory_passes(tmp_path):
+    """A provider writes only inside its directory: neither a file beside it
+    nor one whose own directory holds it is within reach."""
+    base, root, outside = _tree(tmp_path)
+    (outside / "a.yaml").write_text("version: 1\n")
+    (base / "a.yaml").write_text("version: 1\n")
+    declared = {str(outside / "claude"): _DECLARED_WHAT, str(base / "operator-x"): _DECLARED_WHAT}
+    (outside / "claude").mkdir()
+    (base / "operator-x").mkdir()
+    assert config_file_problem(str(outside / "a.yaml"), (str(root),), "required", declared) == ""
+    assert config_file_problem(str(base / "a.yaml"), (str(root),), "required", declared) == ""
+
+
+def _placement_cfg(mode: str = "required"):
+    cfg = default_config()
+    cfg.sandbox.mode = mode
+    return cfg
+
+
+def test_the_placement_check_asks_every_configured_profiles_provider(tmp_path, monkeypatch):
+    """#280 (R3-F1) where every command asks: the default profiles route
+    ``analyze_execute`` and ``fix`` to Claude Code, whose dedicated
+    ``CLAUDE_CONFIG_DIR`` every launch writes, so a file there is refused,
+    outside any repository too; beside it the file passes, and under
+    ``disabled`` nothing is asked."""
+    base = Path(os.path.realpath(tmp_path))
+    claude = base / "claude-autoforge"
+    claude.mkdir()
+    (base / "operator").mkdir()
+    inside, beside = claude / "autoforge.yaml", base / "operator" / "autoforge.yaml"
+    for path in (inside, beside):
+        path.write_text("version: 1\n")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
+    monkeypatch.chdir(base)  # no git repository here
+    for mode in ("required", "preferred"):
+        problem = config_file_placement_problem(_placement_cfg(mode), str(inside), base)
+        assert problem.startswith(
+            f"the configuration file {inside} lies in {claude}, the Claude Code configuration "
+            "directory ($CLAUDE_CONFIG_DIR), which every sandboxed launch of claude (profile "
+            f"analyze_execute, fix) writes (sandbox.mode is {mode})"
+        )
+        assert config_file_placement_problem(_placement_cfg(mode), str(beside), base) == ""
+    assert config_file_placement_problem(_placement_cfg("disabled"), str(inside), base) == ""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert config_file_placement_problem(_placement_cfg(), str(inside), base) == ""
+
+
+@pytest.mark.parametrize("variable", ["PI_CODING_AGENT_DIR", "OPENCODE_DB"])
+def test_the_placement_check_asks_a_provider_no_profile_names(tmp_path, monkeypatch, variable):
+    """Which providers matter is not the file's to say: an agent that
+    rewrote it could name another, and another configuration's launches
+    write the directory too. No default profile uses Pi, yet a file in
+    ``PI_CODING_AGENT_DIR`` is refused; nor, once no profile uses OpenCode,
+    may a file lie in its database directory."""
+    base = Path(os.path.realpath(tmp_path))
+    directory = base / "provider-dir"
+    directory.mkdir()
+    cfg_file = directory / "autoforge.yaml"
+    cfg_file.write_text("version: 1\n")
+    value = str(directory) if variable == "PI_CODING_AGENT_DIR" else f"{directory}/af.db"
+    monkeypatch.setenv(variable, value)
+    cfg = _placement_cfg()
+    provider = "pi" if variable == "PI_CODING_AGENT_DIR" else "opencode"
+    for profile in cfg.profiles.values():
+        profile.provider = "claude" if profile.provider == provider else profile.provider
+    problem = config_file_placement_problem(cfg, str(cfg_file), base)
+    assert problem.startswith(f"the configuration file {cfg_file} lies in {directory}, ")
+    assert (
+        f"which every sandboxed launch of {provider} (no profile of this file, but another "
+        "configuration's) writes (sandbox.mode is required)"
+    ) in problem
+
+
+def test_one_directory_two_providers_write_is_named_for_both(tmp_path, monkeypatch):
+    base = Path(os.path.realpath(tmp_path))
+    shared = base / "shared"
+    shared.mkdir()
+    cfg_file = shared / "autoforge.yaml"
+    cfg_file.write_text("version: 1\n")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(shared))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(shared))
+    problem = config_file_placement_problem(_placement_cfg(), str(cfg_file), base)
+    assert problem.startswith(
+        f"the configuration file {cfg_file} lies in {shared}, the Claude Code configuration "
+        "directory ($CLAUDE_CONFIG_DIR), which every sandboxed launch of claude (profile "
+        "analyze_execute, fix) writes; Pi's agent directory ($PI_CODING_AGENT_DIR), which every "
+        "sandboxed launch of pi (no profile of this file, but another configuration's) writes "
+        "(sandbox.mode is required)"
+    )
+
+
+def test_a_profile_whose_declaration_cannot_be_read_refuses_the_file(tmp_path):
+    """Nothing then shows the file outside what that profile's launches write."""
+    base = Path(os.path.realpath(tmp_path))
+    cfg_file = base / "autoforge.yaml"
+    cfg_file.write_text("version: 1\n")
+    cfg = _placement_cfg()
+    cfg.profiles["odd"] = ProfileConfig(name="odd", provider="no-such-provider")
+    problem = config_file_placement_problem(cfg, str(cfg_file), base)
+    assert problem.startswith(
+        "the sandbox declaration of profile 'odd' (provider no-such-provider) cannot be read ("
+    )
+    assert problem.endswith(
+        f"so the configuration file {cfg_file} is not shown to lie outside the directories its "
+        "launches write"
+    )
