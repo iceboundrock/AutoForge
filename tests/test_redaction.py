@@ -1,5 +1,6 @@
 """Redaction: common token patterns are masked, normal text untouched."""
 
+import ast
 import json
 import time
 
@@ -310,10 +311,10 @@ def test_redact_obj_suffix_allocation_is_linear_in_the_colliding_keys():
 
 def test_redact_obj_redacts_each_string_never_the_serialized_document():
     """#206: a pattern run over a document's JSON text consumes the syntax
-    around a value (an empty assignment takes the closing quote, a value
-    before an escaped quote its backslash) and misses a secret right after an
-    escape, which follows a letter or a digit there. Each string is redacted
-    on its own."""
+    around a value (an empty assignment takes the closing quote; until #281 a
+    value before an escaped quote took its backslash) and, until #284, missed
+    a secret right after an escape, which follows a letter or a digit there.
+    Each string is redacted on its own."""
     token = "ghp_" + "e" * 36
     value = {
         "GH_TOKEN=": ["GITHUB_TOKEN=", "id_token:", 'GITHUB_TOKEN=abc"def'],
@@ -552,6 +553,98 @@ def test_a_token_after_an_escape_in_serialized_json_is_redacted():
     }
 
 
+# Each assignment shape that takes a quoted value, with a dummy one (#281).
+_QUOTED_VALUE = "dummy-F2-value-0123456789"
+_QUOTED_ASSIGNMENTS = [
+    ("env-assignment", f'GH_TOKEN="{_QUOTED_VALUE}"'),
+    ("env-assignment", f"OPENAI_API_KEY = '{_QUOTED_VALUE}'"),
+    ("secret-assignment", f'password: "{_QUOTED_VALUE}"'),
+    ("oauth-assignment", f'refresh_token="{_QUOTED_VALUE}"'),
+    ("oauth-bare-assignment", f'access="{_QUOTED_VALUE}"'),
+]
+
+
+def _json_string(text, depth):
+    for _ in range(depth):
+        text = json.dumps(text)
+    return text
+
+
+@pytest.mark.parametrize("prefix", ["", "push failed:\n"], ids=["start", "after-newline"])
+@pytest.mark.parametrize("depth", [1, 2, 3], ids=["json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(
+    ("name", "text"), _QUOTED_ASSIGNMENTS, ids=[text for _, text in _QUOTED_ASSIGNMENTS]
+)
+def test_a_quoted_value_is_redacted_behind_an_escaped_quote(name, text, depth, prefix):
+    """F2 (#281): JSON writes a quote as ``\\"``, and a result printed or
+    captured as JSON text read ``GH_TOKEN=\\"...\\"``: the value stopped at
+    the backslash and the secret after it was kept. The quote is taken behind
+    the backslashes of up to three levels of JSON in JSON and kept, so the
+    redacted text still decodes, to what redacting the string itself gives."""
+    escaped = _json_string(prefix + text, depth)
+    out = redact(escaped)
+    assert _QUOTED_VALUE not in out
+    decoded = out
+    for _ in range(depth):
+        decoded = json.loads(decoded)
+    assert decoded == redact(prefix + text)
+    assert credential_classes(escaped) == (name,)
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(
+    ("name", "text"), _QUOTED_ASSIGNMENTS, ids=[text for _, text in _QUOTED_ASSIGNMENTS]
+)
+def test_a_quoted_value_is_redacted_in_a_python_repr(name, text):
+    """A Python repr of a string that holds both quotes writes ``'`` as
+    ``\\'``; that escape is taken and kept the same way."""
+    value = f"""{text} beside "double" and 'single' quotes"""
+    out = redact(repr(value))
+    assert _QUOTED_VALUE not in out
+    assert ast.literal_eval(out) == redact(value)
+    assert credential_classes(repr(value)) == (name,)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # A backslash inside a value is still part of it.
+        ("GH_TOKEN=C:\\dir\\x1 done", "GH_TOKEN=***REDACTED*** done"),
+        ("GH_TOKEN=\\nabc", "GH_TOKEN=***REDACTED***"),
+        # One that starts an escaped quote ends the value and is kept.
+        ('GH_TOKEN=abc\\"rest', 'GH_TOKEN=***REDACTED***\\"rest'),
+        ('"GH_TOKEN=abc\\\\\\"rest"', '"GH_TOKEN=***REDACTED***\\\\\\"rest"'),
+        # An escaped quote with no value has nothing to redact, and the JSON
+        # around it is no value either.
+        ('{"a": "GH_TOKEN=\\"", "b": 1}', '{"a": "GH_TOKEN=\\"", "b": 1}'),
+    ],
+    ids=["path", "written-out-newline", "escaped-quote", "json-in-json-quote", "empty"],
+)
+def test_an_escaped_quote_ends_a_value_and_a_backslash_inside_one_stays(text, expected):
+    assert redact(text) == expected
+    assert redact(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GH_TOKEN=" + "\\" * 250_000,
+        'GH_TOKEN=\\"' * 50_000,
+        "access=" + "\\" * 250_000,
+        "refresh_token=" + "\\" * 6 + "x" * 50_000 + "\\" * 6 + "y" * 50_000,
+        "password=" + ("\\" * 7 + '"') * 30_000,
+    ],
+    ids=["value-backslashes", "escaped-quotes", "bare-backslashes", "runs", "quote-runs"],
+)
+def test_the_escaped_quote_rule_stays_linear(text):
+    """The backslashes before a quote and the lookahead past one inside a
+    value are bounded, so a quarter-megabyte of them is redacted well inside
+    the budget."""
+    started = time.perf_counter()
+    redact(text)
+    assert time.perf_counter() - started < 3.0
+
+
 def test_redact_obj_redacts_a_token_after_an_ansi_escape_at_any_depth():
     """State and the CLI's documents cross ``redact_obj``: the same rule
     holds in every string of a structure."""
@@ -607,6 +700,8 @@ def test_the_escape_rule_stays_linear(text):
 _WORST_CASE_UNITS = {
     "named_assignment": "HF_TOKEN=x;",
     "named_assignment_quoted": 'HF_TOKEN="x"',
+    # The quote as JSON writes it (#281): kept like a plain one, 14 to 27.
+    "named_assignment_escaped_quote": 'HF_TOKEN=\\"x\\"',
     "bearer_header": "Authorization:Token x ",
     "basic_header": "Authorization:Basic x ",
     "url_credential": "ab://x@",

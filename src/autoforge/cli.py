@@ -118,7 +118,7 @@ from .interaction import (
 from .local_workspace import init_feature_file
 from .locking import ControllerLock, repository_lock_path
 from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
-from .redaction import redact, redact_argv, redact_dict
+from .redaction import redact, redact_argv, redact_dict, redact_obj
 from .replan_txn import ReplanTransaction
 from .run_namespace import namespace_issue_of_state_dir
 from .sandbox_pin import SandboxPin
@@ -2633,7 +2633,8 @@ def _render_replan_journal(txn: ReplanTransaction | None) -> list[str]:
     lines += [
         f"  source PR:   {txn.source_pr_url or '-'}",
         f"  replacement: {txn.replacement_pr_url or '-'}",
-        f"  escalation:  {json.dumps(txn.escalation, sort_keys=True)}",
+        # A structure from state, redacted before it is serialized (#281).
+        f"  escalation:  {json.dumps(redact_obj(txn.escalation), sort_keys=True)}",
     ]
     if txn.rejection_reason:
         lines.append(f"  rejected:    {txn.rejection_reason}")
@@ -2847,8 +2848,10 @@ def print_plan(plan: StepPlan, full_prompt: bool = False) -> None:
     print(f"Expected next: {plan.expected_next or '-'}")
     if plan.legal_next:
         print(f"Legal next: {', '.join(plan.legal_next)}")
+    # A note can quote state (a recorded refusal, an effect's target, the
+    # replan escalation), so it crosses the boundary the variables do.
     for note in plan.notes:
-        print(f"Note:     {note}")
+        print(f"Note:     {redact(note)}")
     if plan.variables:
         print("Variables:")
         for k, v in sorted(plan.variables.items()):
@@ -2864,12 +2867,17 @@ def print_plan(plan: StepPlan, full_prompt: bool = False) -> None:
 
 def print_step_outcome(o: StepOutcome) -> None:
     # Every field here came out of state or an agent result, `run_id`
-    # included, so each line is redacted whole rather than per field.
+    # included, so the first line is redacted whole rather than per field.
+    # Both lines reach the terminal and a scheduler worker's persisted log.
     print(redact(f"[{o.run_id}] {o.previous_phase} -> {o.next_phase}: {o.message}"))
     if o.plan is not None and o.plan.command:
         print(f"  profile={o.plan.profile_name} model={o.plan.model}")
     if o.result is not None:
-        print(redact(f"  result={json.dumps(o.result, sort_keys=True)}"))
+        # The agent's result is redacted string by string before it is
+        # serialized, never as its JSON text (#281): the text escapes what
+        # stands before a value (`\n`, `\"`, `\u00e9`), and a redaction of
+        # the escaped text is only as good as the patterns' escape rules.
+        print(f"  result={json.dumps(redact_obj(o.result), sort_keys=True)}")
 
 
 if __name__ == "__main__":

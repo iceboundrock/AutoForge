@@ -371,6 +371,31 @@ def test_a_blocked_issue_is_settled_and_never_relaunched_while_others_continue(b
     assert b.admitted() == [2, 3]
 
 
+def test_a_credential_in_an_agent_result_reaches_no_file_of_the_worker(bench):
+    """#281 (F2): the worker log persists the CLI's step outcome, whose
+    result line printed the agent's result as JSON text redacted whole. A
+    dummy token right after each character JSON escapes, and a quoted
+    assignment's value, at two depths of the result, reach neither that log
+    nor any other file of the issue's namespace: state, the run log, and its
+    ``stdout.log``, which holds the result as the agent printed it."""
+    token = "ghp_" + "F2workerToken" * 3
+    secret = "dummy-F2-worker-0123456789"
+    leads = ("\n", "\t", "\r", '"', "\\", "\x01", "é")
+    message = "".join(f"{lead}{token}" for lead in leads) + f' GH_TOKEN="{secret}"'
+    extra = {"details": {"tests": [f"pytest\n{token}", f"password='{secret}'"], "count": 3}}
+    b = bench()
+    b.issue(2, ({"do": "blocked", "message": message, "extra": extra},))
+    assert b.scheduler(max_parallel=1).run() == 0
+    assert b.state(2).phase is Phase.BLOCKED
+    log = Path(b.claims(2).history[-1].claim.worker.log)
+    assert "  result=" in log.read_text(encoding="utf-8")
+    files = [path for path in b.ns(2).directory.rglob("*") if path.is_file()]
+    assert log in files and any(path.name == "stdout.log" for path in files)
+    for path in files:
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        assert token not in text and secret not in text, path
+
+
 def test_a_failing_provider_is_the_engines_failure_and_the_scheduler_only_finalizes(bench):
     b = bench()
     b.issue(2, ({"do": "garbage"}, {"do": "garbage"}))

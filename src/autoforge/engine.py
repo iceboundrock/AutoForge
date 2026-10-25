@@ -406,7 +406,7 @@ from .read_context import (
     render_pr,
     unreadable,
 )
-from .redaction import redact, redact_argv, redact_dict
+from .redaction import redact, redact_argv, redact_dict, redact_obj
 from .replan import HistoricalReviewCollector, ReplanDecision, evaluate_replan_policy
 from .replan_txn import (
     CLOSE_BEGUN_STAGES,
@@ -3753,7 +3753,10 @@ class ControllerEngine:
                     "PREVIOUS_BRANCH": txn.source_branch or s.current_branch,
                     "PREVIOUS_HEAD_SHA": txn.source_head_sha or s.current_head_sha,
                     "DEFAULT_BRANCH": txn.base_branch or "(verified at execution)",
-                    "ESCALATION_REASON": json.dumps(txn.escalation, sort_keys=True),
+                    # A structure from state, redacted before it is
+                    # serialized (#281): the prompt is logged and previewed
+                    # as text.
+                    "ESCALATION_REASON": json.dumps(redact_obj(txn.escalation), sort_keys=True),
                     "EXECUTION_ATTEMPT": txn.expected_execution_attempt or s.execution_attempt + 1,
                     "HISTORICAL_FINDING_COUNT": txn.evidence_finding_count,
                     "HISTORICAL_FINDINGS": txn.rendered_findings or pending,
@@ -4259,7 +4262,9 @@ class ControllerEngine:
             stage_notes, expected_next = self._replan_plan(replan_txn)
             notes.extend(stage_notes)
             if replan_txn.escalation:
-                notes.append(f"replan policy: {json.dumps(replan_txn.escalation, sort_keys=True)}")
+                # Redacted before it is serialized, like the status line (#281).
+                escalation = json.dumps(redact_obj(replan_txn.escalation), sort_keys=True)
+                notes.append(f"replan policy: {escalation}")
             notes.append(f"replan transaction stage: {replan_txn.stage.value}")
             journaled = isinstance(s.phase_effects().context, ReplanContext)
             if journaled or not may_invoke_agent(replan_txn):
