@@ -38,7 +38,12 @@ operator-performed record before anything is persisted or sent, and
 :func:`verify` is the one way such a record changes stage (``observed`` or
 ``conflict``, saved as made). Each ``reconcile`` is a complete identity
 read (D4.5): an open listing read to its end, or an all-states read bounded
-by a head-branch filter or a number watermark, never the search API. Each
+by a head-branch filter or a number watermark, never the search API. A
+create's completion is judged byte for byte on GitHub's text: `gh` prints
+control characters and the text of their escapes as caret notation, so the
+one object whose text differs on `gh`'s read, or matches a payload holding
+a ``^``, is judged again on the client's exact read (D4.5a,
+:func:`_exactly`, #327). Each
 ``issue`` is exactly one write. What an operation checks is the record's own
 identity, target and payload; a consumer's further completion predicates
 (K2's and K7's head SHA against K1's observed candidate, K7's
@@ -49,8 +54,8 @@ records.
 from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, replace
+from typing import Any, Protocol, TypeVar
 
 from .claims import (
     ACCEPTANCE,
@@ -59,6 +64,7 @@ from .claims import (
     OPERATOR_COMMENT,
     PROGRESS,
     REVIEW,
+    Holder,
     MarkerKind,
     collect,
     scan,
@@ -88,7 +94,7 @@ from .errors import (
     StateError,
 )
 from .git_transport import GitTransport, PushOutcome
-from .github import GitHubClient, IssueInfo, PRInfo
+from .github import CommentInfo, GitHubClient, IssueInfo, PRInfo
 from .redaction import credential_classes, redact
 from .replan_txn import scan_replan_markers
 from .validation import parse_issue_url, parse_pr_url, same_issue_url
@@ -330,6 +336,80 @@ def _unique_issues(objects: Iterable[IssueInfo]) -> list[IssueInfo]:
     return out
 
 
+_Obj = TypeVar("_Obj")
+
+
+def _printed_alike(record: EffectRecord) -> bool:
+    """Whether another text could print as ``record``'s payload through `gh`.
+
+    Every rewrite of `gh`'s sanitizer leaves caret notation, a ``^``, where
+    a control character or the text of its escape was. A title and body
+    without one can only have read back equal from the same bytes; with one,
+    an object holding a control character there (``\\x03`` for ``^C``)
+    prints the same, so equality on `gh`'s read proves nothing.
+    """
+    return "^" in record.body or "^" in str(record.payload.get("title", ""))
+
+
+def _exactly(
+    record: EffectRecord,
+    found: list[Found],
+    objects: Sequence[_Obj],
+    placed: Callable[[_Obj], bool],
+    completes_exactly: Callable[[_Obj], bool],
+) -> list[Found]:
+    """``found``, its one object judged on GitHub's exact text when `gh`'s read cannot tell.
+
+    `gh` rewrites a control character, and the literal text of its JSON
+    escape (the six characters ``\\u001b`` in a body), into caret notation
+    before the controller reads it (see the exact read in
+    :mod:`autoforge.github`), so a create that landed byte for byte can read
+    back as another text, and (:func:`_printed_alike`) another text can read
+    back as the payload. When exactly one object (``objects[0]``) carries
+    the identity and its conditions other than its text hold on `gh`'s read
+    (``placed``), ``completes_exactly`` reads it again past the sanitizer
+    and judges the whole completion predicate on that read (the text, and
+    the other conditions once more) if its text differed, or matched a
+    payload another text could print as. Equality stays byte for byte; only
+    the read changes. Two or more objects are a conflict whatever their
+    text, so none is read again; neither is an object whose other conditions
+    fail, which no sanitizer explains, nor one that matched a payload with
+    no ``^``, which only its own bytes print as. An exact read that fails
+    raises as every identity read does (GitHubUnavailableError: nothing
+    persisted or sent; GitHubError: the caller blocks), so a text that could
+    not be read exactly is never a reason to write.
+    """
+    if len(found) != 1 or not placed(objects[0]):
+        return found
+    if found[0].in_end_state and not _printed_alike(record):
+        return found
+    return [replace(found[0], in_end_state=completes_exactly(objects[0]))]
+
+
+def _comment_found(
+    github: GitHubClient, record: EffectRecord, holders: Iterable[Holder[CommentInfo, Any]]
+) -> list[Found]:
+    """A comment create's holders (K4, K8, K9): in the end state when bodied as the payload.
+
+    The holders come from the complete listing of the comment's parent, so a
+    comment has no condition but its body; one whose body `gh` printed
+    otherwise, or alike a payload with a ``^``, is judged on its exact read
+    (:func:`_exactly`), which also proves it is that comment on that parent.
+    """
+    comments: list[CommentInfo] = [h.obj for h in holders]
+    found = [
+        Found(url=c.url, in_end_state=c.body == record.body, observed={"url": c.url})
+        for c in comments
+    ]
+    return _exactly(
+        record,
+        found,
+        comments,
+        lambda _: True,
+        lambda c: github.get_comment_exact(c.url).body == record.body,
+    )
+
+
 def append_problem(what: str, kind: MarkerKind, payload: str) -> str:
     """D5.5: why a composed append payload may not be persisted, or "".
 
@@ -512,23 +592,38 @@ class ImplementationPrOp:
         if claimants.defects:
             return _unreadable(record, f"open PRs of {repo}", claimants.defects)
         on_head_numbers = {pr.number for pr in on_head}
+
+        def placed(pr: PRInfo) -> bool:
+            return (
+                pr.number in on_head_numbers
+                and pr.is_open
+                and pr.head_ref == head
+                and _same_repo_head(pr)
+                and pr.base_ref == record.target["base"]
+            )
+
+        def completes(pr: PRInfo) -> bool:
+            return placed(pr) and pr.title == record.payload["title"] and pr.body == record.body
+
+        prs = _unique([*on_head, *(h.obj for h in claimants.holders)])
         found = [
             Found(
                 url=pr.url,
-                in_end_state=(
-                    pr.number in on_head_numbers
-                    and pr.is_open
-                    and pr.head_ref == head
-                    and _same_repo_head(pr)
-                    and pr.base_ref == record.target["base"]
-                    and pr.title == record.payload["title"]
-                    and pr.body == record.body
-                ),
+                in_end_state=completes(pr),
                 observed={"url": pr.url, "number": pr.number},
             )
-            for pr in _unique([*on_head, *(h.obj for h in claimants.holders)])
+            for pr in prs
         ]
-        return decide_create(record, found)
+        return decide_create(
+            record,
+            _exactly(
+                record,
+                found,
+                prs,
+                placed,
+                lambda pr: completes(self.github.get_pr_exact(pr.url)),
+            ),
+        )
 
     def issue(self, record: EffectRecord) -> None:
         self.github.create_pull_request(
@@ -639,15 +734,7 @@ class ReviewCommentOp:
         )
         if claimants.defects:
             return _unreadable(record, "PR's comments", claimants.defects)
-        found = [
-            Found(
-                url=h.obj.url,
-                in_end_state=h.obj.body == record.body,
-                observed={"url": h.obj.url},
-            )
-            for h in claimants.holders
-        ]
-        return decide_create(record, found)
+        return decide_create(record, _comment_found(self.github, record, claimants.holders))
 
     def issue(self, record: EffectRecord) -> None:
         self.github.create_pr_comment(record.target["pr_url"], record.body)
@@ -688,22 +775,41 @@ class FollowUpIssueOp:
         )
         if claimants.defects:
             return _unreadable(record, f"issues of {repo}", claimants.defects)
+
+        def placed(issue: IssueInfo) -> bool:
+            return (
+                issue.number > watermark
+                and issue.is_open
+                and _same_repository(issue.repository, repo)
+                and not _same_issue(issue.url, record.owner.issue_url)
+            )
+
+        def completes(issue: IssueInfo) -> bool:
+            return (
+                placed(issue)
+                and issue.title == record.payload["title"]
+                and issue.body == record.body
+            )
+
+        holders = [h.obj for h in claimants.holders]
         found = [
             Found(
-                url=h.obj.url,
-                in_end_state=(
-                    h.obj.number > watermark
-                    and h.obj.is_open
-                    and _same_repository(h.obj.repository, repo)
-                    and not _same_issue(h.obj.url, record.owner.issue_url)
-                    and h.obj.title == record.payload["title"]
-                    and h.obj.body == record.body
-                ),
-                observed={"url": h.obj.url, "number": h.obj.number},
+                url=issue.url,
+                in_end_state=completes(issue),
+                observed={"url": issue.url, "number": issue.number},
             )
-            for h in claimants.holders
+            for issue in holders
         ]
-        return decide_create(record, found)
+        return decide_create(
+            record,
+            _exactly(
+                record,
+                found,
+                holders,
+                placed,
+                lambda issue: completes(self.github.get_issue_exact(issue.url)),
+            ),
+        )
 
     def issue(self, record: EffectRecord) -> None:
         self.github.create_issue(
@@ -822,24 +928,39 @@ class ReplacementPrOp:
         if malformed:
             return _unreadable(record, f"PRs of {repo} above #{watermark}", malformed)
         on_head_numbers = {pr.number for pr in on_head}
+
+        def placed(pr: PRInfo) -> bool:
+            return (
+                pr.number in on_head_numbers
+                and pr.number > watermark
+                and pr.is_open
+                and pr.head_ref == head
+                and _same_repo_head(pr)
+                and pr.base_ref == record.target["base"]
+            )
+
+        def completes(pr: PRInfo) -> bool:
+            return placed(pr) and pr.title == record.payload["title"] and pr.body == record.body
+
+        prs = _unique([*on_head, *holders])
         found = [
             Found(
                 url=pr.url,
-                in_end_state=(
-                    pr.number in on_head_numbers
-                    and pr.number > watermark
-                    and pr.is_open
-                    and pr.head_ref == head
-                    and _same_repo_head(pr)
-                    and pr.base_ref == record.target["base"]
-                    and pr.title == record.payload["title"]
-                    and pr.body == record.body
-                ),
+                in_end_state=completes(pr),
                 observed={"url": pr.url, "number": pr.number},
             )
-            for pr in _unique([*on_head, *holders])
+            for pr in prs
         ]
-        return decide_create(record, found)
+        return decide_create(
+            record,
+            _exactly(
+                record,
+                found,
+                prs,
+                placed,
+                lambda pr: completes(self.github.get_pr_exact(pr.url)),
+            ),
+        )
 
     def issue(self, record: EffectRecord) -> None:
         self.github.create_pull_request(
@@ -884,15 +1005,7 @@ class ProgressCommentOp:
                     f"({'; '.join(claimants.defects)})"
                 ),
             )
-        found = [
-            Found(
-                url=h.obj.url,
-                in_end_state=h.obj.body == record.body,
-                observed={"url": h.obj.url},
-            )
-            for h in claimants.holders
-        ]
-        return decide_create(record, found)
+        return decide_create(record, _comment_found(self.github, record, claimants.holders))
 
     def issue(self, record: EffectRecord) -> None:
         self.github.create_issue_comment(record.target["epic_url"], record.body)
@@ -936,14 +1049,7 @@ class AcceptanceCommentOp:
                     f"({'; '.join(claimants.defects)})"
                 ),
             )
-        found = [
-            Found(
-                url=h.obj.url,
-                in_end_state=h.obj.body == record.body,
-                observed={"url": h.obj.url},
-            )
-            for h in claimants.holders
-        ]
+        found = _comment_found(self.github, record, claimants.holders)
         problem = self._issue_problem(issue_url, record.owner.pr_url)
         return decide_acceptance(record, found, issue_problem=problem)
 

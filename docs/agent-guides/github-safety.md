@@ -973,6 +973,12 @@ path, so no setting makes the controller post one (ADR 0004 D2.1a).
   are not used. A listing that cannot be read to its end (a failed page,
   a page with no next cursor, a cursor seen twice) is an error, never an
   absent comment.
+- **Completion is judged on GitHub's exact text.** `gh` rewrites the JSON
+  it prints, so a create's read-back that finds one object with its
+  identity, in place, whose title or body `gh` printed otherwise, or whose
+  payload holds a `^` (which another text can print as), reads that object
+  once more past `gh` (the exact read, below) and judges it there.
+  Equality stays byte for byte.
 - **Records before writes.** A record (`src/autoforge/effects.py`) holds
   the kind, the identity, the exact target, the precondition, the payload,
   the attempt count, the stage and the observed result. It moves from
@@ -1018,6 +1024,118 @@ path, so no setting makes the controller post one (ADR 0004 D2.1a).
   of which starts a hook, the monitor or a filter, plus the launch
   preflight's `git config --list`, which goes through the hardened local
   request like every controller git process (#165).
+
+### `gh`'s sanitizer and the exact read (#327)
+
+`gh` rewrites every JSON reply before it prints it: go-gh's
+`asciisanitizer` is installed on its HTTP transport (seen in gh 2.103.2,
+which links go-gh v2.17.0). Each C0 or C1 control character, and its JSON
+escape, becomes caret notation, and so does the *text* of an escape: a
+body holding the six characters `\u001b`, which GitHub's JSON carries as
+`\\u001b`, prints as `\^[`, three characters shorter. The sanitizer works
+on the reply's bytes before any JSON is decoded; `gh`'s cache and its
+`GH_DEBUG` log see the rewritten reply too, and no flag, Accept type or
+command turns it off. It is a terminal protection and it does its job, but
+it makes every `gh` read of a title or body **lossy** for the controller:
+`\^[` is also what the literal text `\^[` prints as, so no comparison of
+what `gh` printed can prove that an object holds a given text. Normalising
+the payload, or treating `\^[` and `\u001b` as equal, would accept a body
+the controller never wrote.
+
+That is how #327 was found: the body of PR #314 (#284's run) explained
+terminal output and held `\u001b[0m` as text. The create landed byte for
+byte, the read-back printed by `gh` was 4405 characters against the
+journal's 4408, and the record became a conflict on the controller's own
+PR.
+
+**The exact read.** `GitHubClient.get_pr_exact`, `get_issue_exact` and
+`get_comment_exact` read one object with GitHub's REST API directly:
+
+- one `GET` of `https://api.github.com/repos/<owner>/<repo>/pulls/<n>`,
+  `.../issues/<n>` or `.../issues/comments/<id>`, the path built from a
+  parsed `github.com` URL (`_repository_path`), so no other host,
+  repository or path is reachable;
+- the credential is the one `gh` holds for `github.com`, printed by
+  `gh auth token --hostname github.com` and sent as a bearer token. It
+  stays in memory for the one request: never in argv, a file, the state,
+  a log or an error, and `HttpsRequest`'s repr leaves the headers out;
+- TLS that verifies the chain and the host name against the system's
+  trust store, with no key log (`SSLKEYLOGFILE` is ignored: it would write
+  the secrets of the connection that carries the credential to a file); no
+  redirect followed (a 3xx would carry the credential elsewhere; it is a
+  conclusive error); the client's `timeout_seconds` on each socket
+  operation of connecting (the TCP connection, the TLS handshake, sending
+  the request), and on reading the whole reply from the start of the call:
+  the status line, the headers, a chunked body's framing and trailers, and
+  the body, every receive waiting at most until that deadline, so a server
+  that trickles any of it cannot hold the controller (a proxy's answer to
+  the tunnel is read the same way); at most
+  `EXACT_READ_MAX_BYTES` (2 MiB) of a body and `EXACT_READ_ERROR_BYTES`
+  (4 KiB) of an error reply read;
+- read-only: no other method exists, and nothing on GitHub changes.
+
+Its failures are classified as `gh`'s are, and none of them is ever a
+reason to write. No connection, a timeout, a 5xx, a 429 or a rate-limited
+403 (by its headers, or by GitHub's message, which a secondary limit may
+send alone) is `GitHubUnavailableError`: nothing is saved or sent and `resume`
+reads again (after a write, `EffectPending`, the record still
+`attempted`). A 404 is `GitHubNotFoundError`; a 401, any other 403, a
+redirect, a certificate that does not verify, a reply that is not one
+`application/json` object within the bound, an answer naming another
+object, or a `gh auth token` that fails or prints anything but one visible
+token is a conclusive `GitHubError`, and the phase blocks with nothing
+sent again. No message quotes the reply; an error reply is read only to
+tell a rate limit from a refusal.
+
+**When it runs, and what stays strict.** Only in a create's completion
+read-back (K2 implementation PR, K4 review comment, K5 follow-up issue,
+K7 replacement PR, K8 progress comment, K9 acceptance comment), and only
+when exactly one object carries the identity, every condition other than
+its text holds on `gh`'s read (for a PR: open, on the planned head branch
+of the run's repository, onto the planned base, among the head's PRs and
+above the watermark where there is one; for a follow-up issue: open, above
+the watermark, in the repository, not the run's issue; for a comment: on
+the parent's complete listing), and either its title or body differs on
+`gh`'s read or the payload's title or body holds a `^`. Every rewrite of
+the sanitizer leaves a `^`, so a payload without one can read back equal
+only from its own bytes, while one with `^C` in it also reads back equal
+from an object holding the control character `\x03` there. The
+whole completion predicate is then judged again on the exact object: the
+title and body byte for byte, and every other condition once more, so a PR
+closed in between is not adopted on its text. Two objects carrying one
+identity are a conflict without any exact read; so is one whose other
+conditions fail, which no sanitizer explains. A payload without a `^`
+whose object `gh` prints as it is takes no exact read and no extra request.
+The persisted payload is never changed to fit a read-back.
+
+**Terminal protection is not turned off.** Everything `gh` prints still
+goes through its sanitizer. The exact read's text is compared and then
+dropped: it is never printed, logged, put in a conflict reason or an
+error, or handed to an agent. The read context an agent gets is still
+`gh`'s sanitized read.
+
+**Not covered yet.** The base an append is composed on (K3 adoption, K6
+follow-up append) and the EPIC roadmap edit read the body through `gh`, so
+a base holding escape text or a control character would be rewritten by
+the controller's own write; K10 evidence compares a comment `gh` printed.
+These are follow-up work (#328), not part of #327. So are the open
+points of the exact read itself (#329): how a 404 or a credential failure
+of the exact read is classified in K7, where any conclusive failure ends
+the replan, and a `doctor` row for it.
+
+**Troubleshooting.** A create that blocks with *"… carries its identity
+but is not the object the controller intended (another body, title, head
+or state)"* on what looks like the controller's own object: with this
+version the read-back already judged it on its exact read, so the object
+really differs (a human edit, another head or base, a closed object);
+compare it with the payload in `status --json`. A run blocked that way by
+an earlier version, on an object whose body holds `\u001b`-like text,
+recovers with `unblock`: the conflict reopens with its attempt count kept,
+the read-back runs again with the exact read and observes the object, and
+nothing is written again. An exact read that keeps failing names its cause
+in the reason: `gh auth status` and `gh auth token --hostname github.com`
+must work for the user running AutoForge, and `api.github.com` must be
+reachable (the proxy variables apply, as they do to `gh`).
 
 ### Published content
 

@@ -29,6 +29,22 @@ its date ([Releasing](docs/releasing.md#the-changelog)).
   `risk-assessment`) is still no credential, and a known name behind a
   prefix (`GEMINI_API_KEY=`) is still not recognised (#285).
 
+### A PR, issue or comment whose text `gh` rewrites is no longer a conflict (#327)
+
+- `gh` prints control characters, and the text of their JSON escapes (a
+  body explaining terminal output that holds `\u001b`), as caret notation,
+  so the read-back of a PR, issue or comment the controller had just
+  created byte for byte could show another body, and the run blocked on its
+  own object. The read-back now reads that one object's exact text from
+  `https://api.github.com/` (a `GET` with the token `gh auth token`
+  prints, no redirect, bounded in size and time) and compares it byte for
+  byte; every other identity condition is still checked. A payload holding
+  a `^` is read this way even when `gh`'s print matches, since an object
+  holding the control character it names prints the same. A failure of that
+  read never leads to a second write. A run already blocked this way
+  recovers with `unblock`
+  ([GitHub safety](docs/agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)).
+
 ### The configuration file and a run's sandbox mode (#280)
 
 - Under `sandbox.mode: required` or `preferred`, every command, a

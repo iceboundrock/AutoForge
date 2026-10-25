@@ -325,6 +325,55 @@ def checks_refused(url: str = PR, credential: str = "personal access token"):
     )
 
 
+# `gh`'s JSON sanitizer: go-gh's asciisanitizer (v2.17.0, the version gh 2.103
+# links), which `gh` runs on every JSON reply before printing it. A C0 or C1
+# control character, and a JSON escape of one, become caret notation. It reads
+# the reply's bytes, not JSON, so the *text* of an escape written in a body
+# (the six characters `\u001b`, sent as `\\u001b`) is rewritten too: to `\^[`,
+# with a backslash added to keep the JSON valid. `tests/test_github.py` pins
+# this port to upstream's own test vectors.
+_GH_CARET = {
+    c: "^" + ("\\\\" if c % 0x80 == 0x1C else chr(0x40 + c % 0x80))
+    for c in [*range(0x20), *range(0x80, 0xA0)]
+    if c not in (0x09, 0x0A, 0x0B, 0x0D)
+}
+_GH_JSON_CARET = {f"\\u{c:04x}": caret for c, caret in _GH_CARET.items()}
+
+
+def gh_sanitized_json(wire: str) -> str:
+    """The JSON text ``wire`` as go-gh's sanitizer (JSON mode) rewrites it."""
+    out: list[str] = []
+    add_escape = False
+    i = 0
+    while i < len(wire):
+        char = wire[i]
+        caret = _GH_CARET.get(ord(char))
+        if caret is not None:
+            out.append(caret)
+            i += 1
+            continue
+        caret = _GH_JSON_CARET.get(wire[i : i + 6].lower())
+        if caret is not None:
+            out.append("\\" + caret if add_escape else caret)
+            add_escape = False
+            i += 6
+            continue
+        out.append(char)
+        add_escape = not add_escape if char == "\\" else False
+        i += 1
+    return "".join(out)
+
+
+def gh_sanitized(text: str) -> str:
+    """``text`` as `gh` prints it: GitHub's JSON of it through the sanitizer, decoded.
+
+    GitHub's encoder is modelled by ``json.dumps(..., ensure_ascii=False)``:
+    a control character as its ``\\u00XX`` escape (``\\b``, ``\\f``, ``\\n``,
+    ``\\r`` and ``\\t`` as the short ones), everything else as UTF-8.
+    """
+    return json.loads(gh_sanitized_json(json.dumps(text, ensure_ascii=False)))
+
+
 class FakeGitHub:
     """In-memory GitHub read model. Tests mutate it to simulate agent actions.
 
@@ -414,6 +463,12 @@ class FakeGitHub:
         # every get_pr_comments / get_issue_comments call raises this
         self.comments_error: GitHubError | None = None
         self.get_comment_error: GitHubError | None = None  # every get_comment call raises this
+        # Every read through `gh` returns titles and bodies as `gh` prints them,
+        # through its JSON sanitizer (:func:`gh_sanitized`); the exact reads
+        # (get_pr_exact, get_issue_exact, get_comment_exact) return what the
+        # fake's GitHub holds. Off, every read returns what it holds.
+        self.gh_sanitizes: bool = False
+        self.exact_read_error: GitHubError | None = None  # every exact read raises this
         # GitHub Actions read model behind `safety.verify_check_definition`:
         # runs by id, their jobs, and where each branch points. `add_pr`
         # registers the PR's own run at its HEAD; the base branch has one
@@ -591,7 +646,7 @@ class FakeGitHub:
         # Like GitHub, resolve owner/repo case-insensitively (identity = repo + number).
         for known, info in self.issues.items():
             if parse_issue_url(known).same_target(ref):
-                return info
+                return self._gh_prints(info)
         raise GitHubNotFoundError(f"issue not found: {url}")
 
     def get_issue_state(self, url: str) -> str:
@@ -619,7 +674,7 @@ class FakeGitHub:
                 "and the set of follow-up issues cannot be established"
             )
         return [
-            replace(i)
+            self._gh_prints(replace(i))
             for i in self.issues.values()
             if i.is_open and self._same_repo(i.repository, repo)
         ]
@@ -686,7 +741,7 @@ class FakeGitHub:
     def get_pr(self, url: str) -> PRInfo:
         """The identity read: no ``statusCheckRollup``, so ``checks`` is None (#291)."""
         self.calls.append(("get_pr", url))
-        return replace(self._pr_view(url), checks=None)
+        return self._gh_prints(replace(self._pr_view(url), checks=None))
 
     def get_pr_with_checks(self, url: str) -> PRInfo:
         """The checks read: the identity fields and the head's checks (a list, maybe [])."""
@@ -694,7 +749,7 @@ class FakeGitHub:
         if self.checks_error is not None:
             raise self.checks_error
         pr = self._pr_view(url)
-        return replace(pr, checks=list(pr.checks or []))
+        return self._gh_prints(replace(pr, checks=list(pr.checks or [])))
 
     def get_pr_head_sha(self, url: str) -> str:
         return self.get_pr(url).head_sha
@@ -816,7 +871,7 @@ class FakeGitHub:
                 "next page but no cursor that reaches it (None)"
             )
         return [
-            replace(p)
+            self._gh_prints(replace(p))
             for p in self.prs.values()
             if p.is_open and self._same_repo(p.repository, repo)
         ]
@@ -829,7 +884,11 @@ class FakeGitHub:
                 f"{repo} has at least 1000 pull requests, so the listing may be "
                 "truncated and the set of candidates cannot be established"
             )
-        return [replace(p) for p in self.prs.values() if self._same_repo(p.repository, repo)]
+        return [
+            self._gh_prints(replace(p))
+            for p in self.prs.values()
+            if self._same_repo(p.repository, repo)
+        ]
 
     def latest_pr_number(self, repo: str) -> int:
         """Highest PR number in the repo, open or closed (the real watermark)."""
@@ -861,7 +920,7 @@ class FakeGitHub:
         # Comments are keyed by the URL they were posted under; the PR or
         # issue they belong to is the same whatever spelling that URL used.
         return [
-            c
+            self._gh_prints(c)
             for known, cs in self.comments.items()
             if parse_github_url(known).same_target(ref)
             for c in cs
@@ -887,8 +946,44 @@ class FakeGitHub:
                 if posted.comment_id == wanted.comment_id and posted.parent.same_repository(
                     wanted.parent
                 ):
-                    return replace(c)
+                    return self._gh_prints(replace(c))
         raise GitHubNotFoundError(f"`gh api` failed (exit 1): comment not found: {url}")
+
+    # -- the exact read: GitHub's text byte for byte, past `gh`'s sanitizer -------
+    def _gh_prints(self, obj):
+        """``obj`` as `gh` prints it: its title and body sanitized while ``gh_sanitizes``."""
+        if not self.gh_sanitizes:
+            return obj
+        fields = [name for name in ("title", "body") if hasattr(obj, name)]
+        return replace(obj, **{name: gh_sanitized(getattr(obj, name)) for name in fields})
+
+    def _exact_read(self, name: str, url: str) -> None:
+        self.calls.append((name, url))
+        if self.exact_read_error is not None:
+            raise self.exact_read_error
+
+    def get_pr_exact(self, url: str) -> PRInfo:
+        self._exact_read("get_pr_exact", url)
+        return replace(self._stored(url), checks=None)
+
+    def get_issue_exact(self, url: str) -> IssueInfo:
+        self._exact_read("get_issue_exact", url)
+        ref = parse_issue_url(url)
+        for known, info in self.issues.items():
+            if parse_issue_url(known).same_target(ref):
+                return replace(info)
+        raise GitHubNotFoundError(f"exact read of {url}: GitHub answered HTTP 404")
+
+    def get_comment_exact(self, url: str) -> CommentInfo:
+        from autoforge.validation import parse_comment_url
+
+        self._exact_read("get_comment_exact", url)
+        wanted = parse_comment_url(url)
+        for cs in self.comments.values():
+            for c in cs:
+                if parse_comment_url(c.url).same_target(wanted):
+                    return replace(c)
+        raise GitHubNotFoundError(f"exact read of {url}: GitHub answered HTTP 404")
 
     def merge_pr(
         self,
@@ -1183,7 +1278,7 @@ class FakeGitHub:
         if isinstance(watermark, bool) or not isinstance(watermark, int) or watermark < 0:
             raise GitHubError(f"list_issues_above: watermark {watermark!r} is not a number")
         issues = [
-            replace(i)
+            self._gh_prints(replace(i))
             for i in self.issues.values()
             if self._same_repo(i.repository, repository) and i.number > watermark
         ]
@@ -1193,7 +1288,7 @@ class FakeGitHub:
         self._effect_read("list_prs_for_head", repository, branch)
         self._follow_origin()
         prs = [
-            replace(p)
+            self._gh_prints(replace(p))
             for p in self.prs.values()
             if self._same_repo(p.repository, repository)
             and p.head_ref == branch
@@ -1733,6 +1828,28 @@ def _no_network_git_remote(monkeypatch):
     _OFFLINE_FETCHES.clear()
     monkeypatch.setattr(engine_module, "GitRemote", LocalOnly)
     monkeypatch.setattr(engine_module, "GitTransport", OfflineAware)
+
+
+@pytest.fixture(autouse=True)
+def _no_network_exact_read(monkeypatch):
+    """No test reaches GitHub through the exact read's HTTPS transport.
+
+    A ``GitHubClient`` built without ``https=`` takes
+    ``autoforge.github.https_get`` when it is constructed, so every client a
+    test builds that way gets this stand-in, which fails the test (with
+    pytest's own outcome, a BaseException the client's classification of
+    transport failures never catches). The tests of the transport itself
+    call the function they imported, against a loopback server.
+    """
+    import autoforge.github as github_module
+
+    def offline(request):
+        pytest.fail(
+            f"a test reached the network exact read of {request.url}; give the client "
+            "https=... or use FakeGitHub"
+        )
+
+    monkeypatch.setattr(github_module, "https_get", offline)
 
 
 @pytest.fixture(autouse=True)
