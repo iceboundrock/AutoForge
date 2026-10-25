@@ -5,7 +5,9 @@ Covers common env-var assignments, ``Authorization`` headers, well-known
 token shapes (GitHub PATs, OpenAI / Anthropic keys, JWTs), OAuth credential
 fields (``refresh`` / ``access`` / ``id_token`` / ``chatgpt-account-id``) and
 credentials embedded in URLs before stdout / stderr / commands are persisted
-by the run logger.
+by the run logger. A shape is recognised where it starts a token: at the start
+of the text, after a character that cannot be part of it, or directly after
+an escape sequence (``ESC[0m``, ``\\n``, ``\\u00e9``; see ``_ESCAPE``).
 
 Every pattern has a stable class name. :func:`credential_classes` reports
 which classes a text carries without saying where, so a refusal of agent
@@ -20,39 +22,109 @@ from typing import NamedTuple
 
 
 class _Pattern(NamedTuple):
-    """One secret shape: its stable class name, the regex and its replacement."""
+    """One secret shape: its stable class name, the regexes and the replacements.
+
+    ``regex`` finds the shape and ``replacement`` rewrites it. A shape that
+    starts a token (:func:`_token`) has a second pass, ``after_escape``,
+    which finds it directly after an escape sequence and keeps that sequence
+    through ``escape_replacement``; the others have none.
+    """
 
     name: str
     regex: re.Pattern[str]
     replacement: str
+    after_escape: re.Pattern[str] | None = None
+    escape_replacement: str = ""
+
+
+# Where a recognised credential may start (#284). There is no regex word
+# boundary (``\b``) after the ``m`` of an ANSI colour code (``ESC[0m``, which
+# OpenCode writes right before an error's text on stderr) or after the ``n``
+# of a ``\n`` written out as two characters (JSON text, a C or Python string
+# literal): both are word characters, so a token directly after one was
+# missed. A token therefore starts at the start of the text, after any
+# character that cannot be part of it (any but an ASCII letter, a digit or
+# ``_``, unless a pattern names its own set; a non-ASCII letter is no part of
+# an ASCII token), or directly after one of these escape sequences:
+#
+# - an ANSI / VT escape sequence: a CSI (``ESC[``, or the C1 byte, then
+#   parameter, intermediate and final bytes) or a two-character escape
+#   (``ESC(B``, ``ESC7``), its ESC also as JSON, C, a shell and caret
+#   notation spell it (``\u001b``, ``\x1b``, ``\033``, ``\e``, ``^[``); an OSC
+#   or DCS string ends in BEL or ``ESC\``, already no token character;
+# - a backslash escape as JSON, C and Python write one: a single letter
+#   (``\n``, ``\t``, ``\b``, ...), ``\xHH``, ``\uHHHH``, ``\UHHHHHHHH`` and octal.
+#
+# A backslash and such a letter count as an escape wherever they occur, a
+# path separator before a token included (``C:\Users\nghp_...``): the rule
+# errs on redacting. Only the escape right before a token matters, so a run
+# of them (``ESC[91mESC[1m``) needs nothing more. The escapes are matched
+# case-sensitively inside a ``(?i)`` pattern too: ``\N`` is no escape.
+#
+# Each alternative below starts with its literal ESC, backslash, caret or C1
+# byte, so the regex engine scans for those characters and tries an
+# ``after_escape`` pass nowhere else: on text with few of them the second
+# pass costs a fraction of the first, and each candidate scans one escape,
+# so both stay linear.
+_ESCAPE_TAIL = r"(?:\[[0-?]*[ -/]*[@-~]|[ -/]*[0-~])"
+_ESCAPE = (
+    r"(?-i:"
+    rf"\x1b{_ESCAPE_TAIL}"
+    rf"|\\(?:(?:u001[bB]|U0000001[bB]|x1[bB]|0?33|e){_ESCAPE_TAIL}"
+    r"|[abefnrtv]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|[0-7]{1,3})"
+    rf"|\^\[{_ESCAPE_TAIL}"
+    r"|\x9b[0-?]*[ -/]*[@-~]"
+    r")"
+)
+
+
+def _token(
+    name: str, body: str, replacement: str, *, flags: str = "", token_chars: str = "A-Za-z0-9_"
+) -> _Pattern:
+    """The pattern for a shape that starts a token, by the rule above.
+
+    ``regex`` finds ``body`` at the start of the text or after any character
+    but ``token_chars``. ``after_escape`` finds it directly after an escape
+    sequence, taken in as the ``lead`` group, and ``escape_replacement``
+    puts that back before ``replacement``, whose ``\\N`` references move one
+    group on past it. A new pattern is built here, never on ``\\b``.
+    """
+    return _Pattern(
+        name,
+        re.compile(rf"{flags}(?<![{token_chars}]){body}"),
+        replacement,
+        re.compile(rf"{flags}(?P<lead>{_ESCAPE}){body}"),
+        r"\g<lead>" + re.sub(r"\\(\d+)", lambda m: rf"\g<{int(m[1]) + 1}>", replacement),
+    )
 
 
 # The OAuth credential fields a quoted key names: the ``oauth-field`` pattern
 # below, and :func:`redact_obj` for a mapping entry under such a key.
 _OAUTH_FIELD_NAMES = r"refresh|access|(?:refresh|access|id)_token|chatgpt[-_]account[-_]id"
 
-# Applied in this order, each to the previous one's output; the order is part
-# of :func:`redact`'s output and of the class :func:`credential_classes`
+# Applied in this order, each to the previous one's output, a pattern's
+# ``after_escape`` pass right after its ``regex``; the order is part of
+# :func:`redact`'s output and of the class :func:`credential_classes`
 # reports. An ``sk-ant-`` key with at least eight characters after ``sk-`` is
 # replaced by ``openai-key`` before ``anthropic-key`` sees it, so it is
 # reported under that class.
 _PATTERNS: tuple[_Pattern, ...] = (
     # VAR=secret / VAR: secret assignments for well-known names.
-    _Pattern(
+    _token(
         "env-assignment",
-        re.compile(
-            r"(?i)\b(GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|"
-            r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY|"
-            r"ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENCODE_SERVER_PASSWORD)"
-            r"(\s*[:=]\s*)([\"']?)([^\s\"';]+)([\"']?)"
-        ),
+        r"(GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|"
+        r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY|"
+        r"ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENCODE_SERVER_PASSWORD)"
+        r"(\s*[:=]\s*)([\"']?)([^\s\"';]+)([\"']?)",
         r"\1\2\3***REDACTED***\5",
+        flags="(?i)",
     ),
     # Authorization: Bearer <token> / Token <token> / Basic <base64>
-    _Pattern(
+    _token(
         "authorization-header",
-        re.compile(r"(?i)\b(Authorization\s*:\s*(?:Bearer|Token|Basic)\s+)([^\s\"';]+)"),
+        r"(Authorization\s*:\s*(?:Bearer|Token|Basic)\s+)([^\s\"';]+)",
         r"\1***REDACTED***",
+        flags="(?i)",
     ),
     # Credentials embedded in a URL: everything between ``scheme://`` and
     # ``@`` (``https://x-access-token:<token>@github.com/...``,
@@ -65,10 +137,11 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # delimiter. The scheme is bounded and the class excludes ``/``, so a
     # candidate never scans past the ``://`` of the next one: the pass stays
     # linear over the 16 MiB an executor capture can be.
-    _Pattern(
+    _token(
         "url-userinfo",
-        re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,31}://)[^\s/?#@]+@"),
+        r"([a-z][a-z0-9+.-]{1,31}://)[^\s/?#@]+@",
         r"\1***REDACTED***@",
+        flags="(?i)",
     ),
     # JWTs: three base64url segments, the first a ``{"`` JSON header. Only
     # the header has a floor: ``eyJ`` is ``{"`` plus the first key character,
@@ -76,42 +149,43 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # The payload and signature may be short or empty, as the compact
     # serialization permits: ``{}`` is ``e30``, an unsecured ``alg: none``
     # token (RFC 7519 §6) has an empty signature, and detached content
-    # (RFC 7515 App. F) an empty payload. A lookbehind rather than ``\b``
+    # (RFC 7515 App. F) an empty payload. ``-`` is a token character here,
     # so a ``-eyJ`` inside a segment is not a fresh candidate that rescans
-    # the run (base64url admits ``-``); each run is then scanned by at most
-    # three candidates and the pass stays linear. Placed before the shorter
-    # token shapes so one of them cannot replace a slice of the token and
-    # leave the rest unrecognised.
-    _Pattern(
+    # the run (base64url admits ``-``, and no escape starts inside one); each
+    # run is then scanned by at most three candidates and the pass stays
+    # linear. Placed before the shorter token shapes so one of them cannot
+    # replace a slice of the token and leave the rest unrecognised.
+    _token(
         "jwt",
-        re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*"),
+        r"eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*",
         "***REDACTED***",
+        token_chars="A-Za-z0-9_-",
     ),
     # GitHub fine-grained PATs
-    _Pattern(
-        "github-fine-grained-pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{8,}"), "***REDACTED***"
-    ),
+    _token("github-fine-grained-pat", r"github_pat_[A-Za-z0-9_]{8,}", "***REDACTED***"),
     # GitHub classic PATs and app / OAuth tokens
-    _Pattern("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{8,}"), "***REDACTED***"),
+    _token("github-token", r"gh[pousr]_[A-Za-z0-9_]{8,}", "***REDACTED***"),
     # OpenAI-style sk- keys (incl. project variant sk-proj-...)
-    _Pattern("openai-key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}"), "***REDACTED***"),
+    _token("openai-key", r"sk-(?:proj-)?[A-Za-z0-9_-]{8,}", "***REDACTED***"),
     # Anthropic keys
-    _Pattern("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}"), "***REDACTED***"),
-    # Generic long bearer-ish assignments: token/password/secret = <value>
-    _Pattern(
+    _token("anthropic-key", r"sk-ant-[A-Za-z0-9_-]{8,}", "***REDACTED***"),
+    # Generic long bearer-ish assignments: token/password/secret = <value>.
+    # ``_`` is a token character before the name, so a prefixed one
+    # (``GEMINI_API_KEY=``) is not recognised here (#285).
+    _token(
         "secret-assignment",
-        re.compile(
-            r"(?i)\b(token|passwd|password|secret|api[_-]?key)(\s*[:=]\s*)([\"']?)"
-            r"([A-Za-z0-9_\-./+]{12,})([\"']?)"
-        ),
+        r"(token|passwd|password|secret|api[_-]?key)(\s*[:=]\s*)([\"']?)"
+        r"([A-Za-z0-9_\-./+]{12,})([\"']?)",
         r"\1\2\3***REDACTED***\5",
+        flags="(?i)",
     ),
     # OAuth credential fields as a quoted key and value, the shape of an OAuth
     # token response, Pi's ``auth.json`` and a Python mapping's repr:
     # ``"refresh": "..."``, ``'access_token': '...'``, ``"id_token": "..."``,
     # ``"chatgpt_account_id": "..."``. Only a quoted key followed by a quoted
     # value matches, so prose ("refresh the page", "access: denied") is
-    # untouched. The same escaping before both quotes (``\"refresh\": \"...``)
+    # untouched. A quote starts it, so it needs no ``after_escape`` pass. The
+    # same escaping before both quotes (``\"refresh\": \"...``)
     # covers JSON carried inside a JSON string; the bound on it keeps a run of
     # backslashes from being rescanned from every position.
     _Pattern(
@@ -123,23 +197,25 @@ _PATTERNS: tuple[_Pattern, ...] = (
     ),
     # The same credentials as an assignment or header: ``refresh_token=...``
     # (a query string, a form body, a shell variable), ``id_token: ...`` and
-    # the ``chatgpt-account-id: ...`` request header. A lookbehind rather than
-    # ``\b`` so a prefixed name (``oauth_refresh_token=``) is caught too.
-    _Pattern(
+    # the ``chatgpt-account-id: ...`` request header. ``_`` is no token
+    # character before the name, so a prefixed one (``oauth_refresh_token=``)
+    # is caught too.
+    _token(
         "oauth-assignment",
-        re.compile(
-            r"(?i)(?<![A-Za-z0-9])((?:refresh|access|id)_token|chatgpt[-_]account[-_]id)"
-            r"(\s*[:=]\s*)([\"']?)[^\s\"';,&]+"
-        ),
+        r"((?:refresh|access|id)_token|chatgpt[-_]account[-_]id)"
+        r"(\s*[:=]\s*)([\"']?)[^\s\"';,&]+",
         r"\1\2\3***REDACTED***",
+        flags="(?i)",
+        token_chars="A-Za-z0-9",
     ),
     # Bare ``refresh=`` / ``access=`` with a token-length value. Those words
     # are ordinary prose, so only an ``=`` assignment of at least 16
     # characters counts; ``access: denied`` and ``refresh=true`` stay.
-    _Pattern(
+    _token(
         "oauth-bare-assignment",
-        re.compile(r"(?i)(?<![A-Za-z0-9_])(refresh|access)(=)([\"']?)[^\s\"';,&]{16,}"),
+        r"(refresh|access)(=)([\"']?)[^\s\"';,&]{16,}",
         r"\1\2\3***REDACTED***",
+        flags="(?i)",
     ),
 )
 
@@ -168,6 +244,10 @@ _OAUTH_FIELD_KEY = re.compile(rf"(?i){_OAUTH_FIELD_NAMES}")
 # replacement and shrinks or keeps the length; every other value class excludes
 # ``*``, so a marker is never part of those matches at all. The characters
 # around a replaced run are untouched, so no new short match appears beside it.
+# An ``after_escape`` pass is one more pattern in that order, and the escape
+# sequence it starts at (#284) is put back unchanged, no part of the replaced
+# run; at two characters or more it separates repeated matches no tighter
+# than the one-character separators above, so it raises no ratio either.
 # ``tests/test_redaction.py`` pins the factor against the worst-case shape of
 # every pattern and the wrapping case; a new pattern must keep it, or raise
 # it together with the persisted bound in :mod:`autoforge.loop_guard` that
@@ -181,8 +261,16 @@ def redact(text: str | None) -> str:
         return ""
     if not isinstance(text, str):
         text = str(text)
-    for _name, pattern, replacement in _PATTERNS:
-        text = pattern.sub(replacement, text)
+    for entry in _PATTERNS:
+        text = _apply(entry, text)
+    return text
+
+
+def _apply(entry: _Pattern, text: str) -> str:
+    """``text`` with one pattern's passes applied, ``after_escape`` second."""
+    text = entry.regex.sub(entry.replacement, text)
+    if entry.after_escape is not None:
+        text = entry.after_escape.sub(entry.escape_replacement, text)
     return text
 
 
@@ -196,10 +284,10 @@ def credential_classes(text: str) -> tuple[str, ...]:
     """
     found: list[str] = []
     redacted = text
-    for name, pattern, replacement in _PATTERNS:
-        replaced = pattern.sub(replacement, redacted)
+    for entry in _PATTERNS:
+        replaced = _apply(entry, redacted)
         if replaced != redacted:
-            found.append(name)
+            found.append(entry.name)
         redacted = replaced
     # Exact by construction: should a later pattern ever restore what an
     # earlier one changed, the text is still what ``redact`` returns.
@@ -223,12 +311,14 @@ def redact_obj(value: object) -> object:
 
     Each string is redacted on its own, never as part of a serialized
     document: a pattern run over JSON text can consume the syntax around a
-    value (an empty ``GITHUB_TOKEN=`` takes the closing quote, #206), and a
-    secret right after an escape (``\\n``, ``\\u00e9``) follows a letter or a
-    digit there and is missed. The one shape that spans a key and its value, a quoted
-    OAuth credential field (``"refresh": "..."``, ``oauth-field``), is
-    recognised by the key instead: a non-empty string under a key that names
-    such a field, whole and in any case, is replaced whole. No key of a
+    value (an empty ``GITHUB_TOKEN=`` takes the closing quote, #206), so the
+    redacted text may no longer parse. (A secret right after an escape there,
+    ``\\n`` or ``\\u00e9``, follows a letter or a digit; it is recognised since
+    #284, but the syntax is still at risk.) The one shape that spans a key
+    and its value, a quoted OAuth credential field (``"refresh": "..."``,
+    ``oauth-field``), is recognised by the key instead: a non-empty string
+    under a key that names such a field, whole and in any case, is replaced
+    whole. No key of a
     parser-bounded field (a finding, a resolution) names one, so the bounds
     that depend on :data:`MAX_GROWTH_FACTOR` still hold.
 

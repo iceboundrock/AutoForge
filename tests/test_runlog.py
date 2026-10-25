@@ -11,6 +11,7 @@ import os
 import pytest
 
 from autoforge.errors import StateError
+from autoforge.providers import _OPENCODE_ERROR_LINE_RE, _OPENCODE_TOOL_FAILED_LINE_RE
 from autoforge.runlog import ExecutionRecord, RunLogger, validate_run_id
 from autoforge.sandbox import SandboxFacts
 
@@ -1115,6 +1116,40 @@ def test_a_secret_after_a_json_escape_never_reaches_the_control_result_or_journa
         assert secret not in json.dumps(journal)
     assert journal["parsed_result"]["message"] == (
         "push failed:\n***REDACTED***\n\tGH_TOKEN=***REDACTED***"
+    )
+
+
+def test_a_token_right_after_an_ansi_escape_never_reaches_the_output_logs(tmp_path):
+    """#284: OpenCode prints an error as ``ESC[91mESC[1mError: ESC[0m<message>``
+    and a failed tool as ``ESC[0m✗ ESC[0m<title> failed`` on stderr. ``ESC[0m``
+    ends in a word character, so a token right after one failed the patterns'
+    word boundary and was saved to ``stderr.log`` in the clear. The escapes
+    themselves are kept, so the log still reads as the terminal showed it."""
+    key = "sk-ant-api03-" + "f" * 32
+    token = "ghp_" + "g" * 36
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"
+    error_line = f"\x1b[91m\x1b[1mError: \x1b[0m{key}"
+    tool_line = f"\x1b[0m✗ \x1b[0m{token} failed"
+    assert _OPENCODE_ERROR_LINE_RE.match(error_line)
+    assert _OPENCODE_TOOL_FAILED_LINE_RE.match(tool_line)
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1", seq=0, phase="ANALYZE_EXECUTE", attempt=1, provider="opencode"
+        ),
+        prompt="p",
+        stdout=f"\x1b[1m{jwt}\x1b[0m\n",
+        stderr=f"{tool_line}\n{error_line}\n\x1b[91m\x1b[1mError: \x1b[0mGH_TOKEN={token}\n",
+    )
+    stdout = (step / "stdout.log").read_text(encoding="utf-8")
+    stderr = (step / "stderr.log").read_text(encoding="utf-8")
+    for secret in (key, token, jwt):
+        assert secret not in stdout and secret not in stderr
+    assert stdout == "\x1b[1m***REDACTED***\x1b[0m\n"
+    assert stderr == (
+        "\x1b[0m✗ \x1b[0m***REDACTED*** failed\n"
+        "\x1b[91m\x1b[1mError: \x1b[0m***REDACTED***\n"
+        "\x1b[91m\x1b[1mError: \x1b[0mGH_TOKEN=***REDACTED***\n"
     )
 
 

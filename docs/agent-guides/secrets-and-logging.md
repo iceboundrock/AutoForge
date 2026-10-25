@@ -33,7 +33,9 @@ Authorization: Bearer ... / Token ... / Basic ...
 
 and the well-known token shapes on their own (`ghp_*` and the other classic
 GitHub prefixes, `github_pat_*`, `sk-*`, `sk-ant-*`, three-segment `eyJ...`
-JWTs) and the whole userinfo of a URL (`https://x-access-token:...@github.com/...`).
+JWTs) and the whole userinfo of a URL (`https://x-access-token:...@github.com/...`),
+each where it starts a token
+([below](#where-a-recognised-credential-starts-284)).
 
 Redaction is defense in depth; do not claim it detects every possible secret.
 
@@ -44,6 +46,58 @@ resolution bound in `loop_guard`) depend on that factor, so a new pattern
 must keep it, or raise it together with those bounds and their tests.
 
 Do not log the entire process environment.
+
+## Where a recognised credential starts (#284)
+
+A pattern recognises a credential only where it starts a token, so that a
+shape inside a longer identifier is not taken for one (`risk-assessment`
+holds `sk-assessment`, `laughs_together` holds `ghs_together`). Until #284
+that start was a regex word boundary (`\b`), and there is none after the
+`m` of an ANSI colour code (`ESC[0m`) or the `n` of a `\n` written out as
+two characters: a token right after one was kept in the clear, and
+OpenCode's `stderr.log` carries such sequences
+(`ESC[91mESC[1mError: ESC[0m<message>`, `providers.py`). Every pattern of
+`redaction.py` is now built on one rule (`_token`; the quoted `oauth-field`
+shape, which a quote starts, needs none). A credential starts:
+
+- at the start of the text;
+- after any character that cannot be part of it: anything but an ASCII
+  letter, a digit or `_`. A JWT excludes `-` as well, which base64url
+  admits; the OAuth assignment names (`refresh_token=`, `id_token:`) do not
+  exclude `_`, so a prefixed `oauth_refresh_token=` is caught;
+- directly after an escape sequence: an ANSI / VT sequence (a CSI, after
+  `ESC[` or the C1 byte, or a two-character escape such as `ESC(B`), its
+  ESC also as JSON, C, a shell and caret notation write it (`\u001b[0m`,
+  `\x1b[1m`, `\033[0m`, `\e[0m`, `^[[0m`); or a backslash escape written
+  out (`\n`, `\t` and the other single letters, `\xHH`, `\uHHHH`,
+  `\UHHHHHHHH`, octal). The escape is kept; only the credential after it
+  is replaced.
+
+Every sink that redacts goes through these patterns (the run log and its
+`stdout.log` and `stderr.log`, state, the CLI's output), and so does the
+content policy's `credential_classes`, so the rule holds in all of them.
+What changed against `\b`, beyond the escapes, each pinned in
+`tests/test_redaction.py`:
+
+- a non-ASCII letter or digit right before a token is a boundary now,
+  where `\b` took it for a word character: `caféghp_...` is redacted;
+- a backslash before one of the escape letters counts as an escape
+  wherever it stands, a path separator (`C:\Users\nghp_...`) or a
+  written-out escaped backslash (`\\n`) included: the rule errs on
+  redacting.
+
+Unchanged: a shape right after an ASCII letter, a digit or `_` is still no
+token (`xghp_...`, `MY_GITHUB_TOKEN=`), nor is one after an escape that
+more of an identifier follows (`ESC[0mxghp_...`). A known name behind a
+prefix (`GEMINI_API_KEY=`) is #285's to recognise and a new shape such as
+Google's `AIza...` #282's; a new pattern is built with `_token`, never on
+`\b`.
+
+A pattern that starts a token runs as two passes, the second, which takes
+the escape in and puts it back, only at an ESC, a backslash, a caret or the
+C1 byte. Both are linear. `MAX_GROWTH_FACTOR` is unchanged: the escape is
+no part of the replaced run, and at two characters or more it separates
+repeated matches no tighter than a one-character separator does.
 
 ## Launch environment and credential checks (#165)
 
@@ -241,10 +295,12 @@ linear in its size; a change to the allocator must keep that, and
 A structure is redacted string by string, never as its serialized text
 (#206). Run over JSON, a pattern can consume the syntax around a value (an
 empty `GITHUB_TOKEN=` takes the closing quote, a value before an escaped
-quote its backslash), so parsing the redacted text back can fail, and a
-secret right after an escape (`\n`, `\uXXXX`) follows a letter or a digit
-there and is missed. The run log's `control-result.json` and the journal's
-`parsed_result` therefore cross `redact_dict` like the metadata. The one
+quote its backslash), so parsing the redacted text back can fail. (A
+secret right after an escape there, `\n` or `\uXXXX`, follows a letter or
+a digit; it was missed until #284 and is recognised now,
+[above](#where-a-recognised-credential-starts-284).) The run log's
+`control-result.json` and the journal's `parsed_result` therefore cross
+`redact_dict` like the metadata. The one
 shape that spans a key and its value, a quoted OAuth credential field
 (`"refresh": "..."`), is recognised by the key: `redact_obj` replaces a
 non-empty string under a key that names such a field (the `oauth-field`

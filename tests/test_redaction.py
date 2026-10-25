@@ -386,6 +386,219 @@ def test_redact_obj_leaves_other_keys_and_empty_or_scalar_credential_values_alon
     assert redact_obj(value) == value
 
 
+# One dummy of every recognised class, what ``redact`` makes of it, and the
+# class ``credential_classes`` reports it under.
+_CLASS_SAMPLES = [
+    ("env-assignment", "GH_TOKEN=abc123XYZ", "GH_TOKEN=***REDACTED***", "env-assignment"),
+    (
+        "authorization-header",
+        "Authorization: Bearer abcdef123456",
+        "Authorization: Bearer ***REDACTED***",
+        "authorization-header",
+    ),
+    ("url-userinfo", "https://u:p@h/r", "https://***REDACTED***@h/r", "url-userinfo"),
+    ("jwt", _JWT, "***REDACTED***", "jwt"),
+    ("github-fine-grained-pat", _FINE_GRAINED_PAT, "***REDACTED***", "github-fine-grained-pat"),
+    ("github-token", "ghp_abcdefghijklmnop", "***REDACTED***", "github-token"),
+    ("openai-key", "sk-proj-abcdef123456", "***REDACTED***", "openai-key"),
+    # Replaced by the ``sk-`` pattern first; its own passes are checked alone.
+    ("anthropic-key", "sk-ant-abcdefghij123", "***REDACTED***", "openai-key"),
+    (
+        "secret-assignment",
+        "password=hunter2hunter2",
+        "password=***REDACTED***",
+        "secret-assignment",
+    ),
+    (
+        "oauth-field",
+        '"access_token": "FAKE-access"',
+        '"access_token": "***REDACTED***"',
+        "oauth-field",
+    ),
+    (
+        "oauth-assignment",
+        "refresh_token=FAKE_REFRESH_TOKEN",
+        "refresh_token=***REDACTED***",
+        "oauth-assignment",
+    ),
+    (
+        "oauth-bare-assignment",
+        "access=FAKE_ACCESS_VALUE_0000",
+        "access=***REDACTED***",
+        "oauth-bare-assignment",
+    ),
+]
+
+# What a credential can directly follow (#284): the start of the text; ANSI
+# sequences as OpenCode writes them on stderr (``providers.py``) and as other
+# tools do; the same sequences written out in JSON, C, a shell and caret
+# notation; backslash escapes written out; and any other character that is
+# no part of a token. A word precedes each, so only the lead is a boundary.
+_LEADS = {
+    "start": "",
+    "sgr-reset": "\x1b[0m",
+    "sgr-run": "\x1b[91m\x1b[1m",
+    "opencode-error": "\x1b[91m\x1b[1mError: \x1b[0m",
+    "opencode-tool-failed": "\x1b[0m✗ \x1b[0m",
+    "charset-escape": "\x1b(B",
+    "c1-csi": "\x9b1m",
+    "json-newline": "\\n",
+    "json-tab": "\\t",
+    "json-unicode": "\\u00e9",
+    "json-esc": "\\u001b[0m",
+    "json-in-json-newline": "\\\\n",
+    "c-hex-esc": "\\x1b[1m",
+    "c-octal-esc": "\\033[0m",
+    "shell-esc": "\\e[0m",
+    "caret-esc": "^[[0m",
+    "non-ascii-letter": "é",
+    "equals": "=",
+    "colon": ":",
+    "double-quote": '"',
+    "single-quote": "'",
+    "space": " ",
+    "newline": "\n",
+    "tab": "\t",
+}
+
+
+def _after(lead, text):
+    return f"word{lead}{text} done" if lead else f"{text} done"
+
+
+@pytest.mark.parametrize("lead", list(_LEADS.values()), ids=list(_LEADS))
+@pytest.mark.parametrize(
+    ("name", "sample", "expected", "reported"), _CLASS_SAMPLES, ids=[c[0] for c in _CLASS_SAMPLES]
+)
+def test_a_credential_is_recognised_after_an_escape_or_any_non_token_character(
+    name, sample, expected, reported, lead
+):
+    """#284: ``ESC[0m`` ends in ``m`` and a written-out ``\\n`` in ``n``, word
+    characters both, so a word-boundary anchor missed a token right after
+    one, and OpenCode's ``stderr.log`` carries such sequences. Every class is
+    redacted after each lead, by ``redact`` and by its own pattern alone,
+    named by ``credential_classes``, and the lead is kept as it was."""
+    text = _after(lead, sample)
+    assert redact(text) == _after(lead, expected)
+    assert credential_classes(text) == (reported,)
+    assert redact(redact(text)) == redact(text)
+    entry = next(entry for entry in _PATTERNS if entry.name == name)
+    alone = entry.regex.sub(entry.replacement, text)
+    if entry.after_escape is not None:
+        alone = entry.after_escape.sub(entry.escape_replacement, alone)
+    assert alone == _after(lead, expected)
+
+
+# A shape inside a longer identifier is no token, as under the word boundary
+# before #284: an ASCII letter, a digit or ``_`` right before it (``-`` too
+# for a JWT), an escape followed by more of the identifier, or a backslash
+# before a letter that makes no escape. A known name behind a prefix
+# (``GEMINI_API_KEY``) is #285's.
+_INSIDE_IDENTIFIERS = [
+    "xghp_abcdefghijklmnop",
+    "1ghp_abcdefghijklmnop",
+    "_ghp_abcdefghijklmnop",
+    "laughs_together_forever",
+    "risk-assessment-pipeline",
+    "the task-scheduler-daemon",
+    "xgithub_pat_11ABCDEFG0abcdefghij",
+    "myeyJhbGciOiJIUzI1NiJ9.e30.c2ln",
+    "my-eyJhbGciOiJIUzI1NiJ9.e30.c2ln",
+    "MY_GITHUB_TOKEN=abc123XYZ",
+    "GEMINI_API_KEY=abcdefghijklmnop",
+    "xpassword=hunter2hunter2",
+    "preaccess=FAKE_ACCESS_VALUE_0000",
+    "XAuthorization: Bearer abcdef123456",
+    "\x1b[0mxghp_abcdefghijklmnop",
+    "\\nxghp_abcdefghijklmnop",
+    "\\Nghp_abcdefghijklmnop",
+    "\\qsk-abcdefghij123456",
+]
+
+
+@pytest.mark.parametrize("text", _INSIDE_IDENTIFIERS)
+def test_a_shape_inside_a_longer_identifier_is_no_token(text):
+    assert redact(text) == text
+    assert credential_classes(text) == ()
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("caféghp_abcdefghijklmnop", "café***REDACTED***"),
+        ("Пароль:sk-abcdefghij123456", "Пароль:***REDACTED***"),
+        ("C:\\Users\\nghp_abcdefghijklmnop", "C:\\Users\\n***REDACTED***"),
+    ],
+    ids=["non-ascii-letter", "non-ascii-word", "path-separator"],
+)
+def test_the_boundary_changes_documented_since_284(text, expected):
+    """What #284 changed beyond escapes, as ``secrets-and-logging.md`` says:
+    a non-ASCII letter is no part of an ASCII token (``\\b`` took it for a word
+    character), and a backslash before an escape letter is an escape even
+    where it separates a path: the rule errs on redacting."""
+    assert redact(text) == expected
+
+
+def test_a_token_after_an_escape_in_serialized_json_is_redacted():
+    """The boundary rule F2 (#281) relies on: a result printed as JSON text
+    writes a newline as ``\\n``, a tab as ``\\t`` and a non-ASCII character as
+    ``\\uXXXX``, and a token right after any of them is redacted there,
+    leaving the JSON syntax intact."""
+    token = "ghp_" + "e" * 36
+    line = redact(json.dumps({"message": f"push failed:\n{token}\t{token}—{token}"}))
+    assert token not in line
+    assert json.loads(line) == {
+        "message": "push failed:\n***REDACTED***\t***REDACTED***—***REDACTED***"
+    }
+
+
+def test_redact_obj_redacts_a_token_after_an_ansi_escape_at_any_depth():
+    """State and the CLI's documents cross ``redact_obj``: the same rule
+    holds in every string of a structure."""
+    token = "ghp_" + "f" * 36
+    value = {"block_reason": f"\x1b[91m\x1b[1mError: \x1b[0m{token}", "tail": [f"\x1b[1m{token}"]}
+    assert redact_obj(value) == {
+        "block_reason": "\x1b[91m\x1b[1mError: \x1b[0m***REDACTED***",
+        "tail": ["\x1b[1m***REDACTED***"],
+    }
+
+
+def test_every_pattern_but_the_quoted_oauth_field_starts_a_token_after_an_escape():
+    """A new pattern is built with ``_token``, never anchored on ``\\b``: only
+    ``oauth-field``, which a quote starts, has no ``after_escape`` pass."""
+    assert [entry.name for entry in _PATTERNS if entry.after_escape is None] == ["oauth-field"]
+    assert not [entry.name for entry in _PATTERNS if r"\b" in entry.regex.pattern]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\x1b[0ma" * 50_000,
+        "\\n" * 125_000,
+        "\x1b[" + "0;" * 125_000,
+        "\\u001b[" + "1" * 250_000 + "mghp_",
+        "^[" * 125_000,
+        "\\" * 250_000,
+    ],
+    ids=[
+        "ansi-before-letters",
+        "backslash-escapes",
+        "long-csi",
+        "long-written-out-csi",
+        "carets",
+        "backslashes",
+    ],
+)
+def test_the_escape_rule_stays_linear(text):
+    """Every candidate starts at an ESC, a backslash, a caret or the C1 byte
+    and scans one escape; a quarter-megabyte of escape-heavy text, which a
+    scan restarted at every candidate would take minutes over, is redacted
+    well inside the budget."""
+    started = time.perf_counter()
+    redact(text)
+    assert time.perf_counter() - started < 3.0
+
+
 # The shortest text each pattern recognises, with the separator that lets the
 # shape repeat, so the filled case below is meaningful. The bare shape without
 # the separator has a marginally higher ratio (``HF_TOKEN=x``, 10 to 23, is
@@ -412,8 +625,22 @@ _WORST_CASE_UNITS = {
     "oauth_bare_assignment": "access=aaaaaaaaaaaaaaaa ",
 }
 
+# The same units right after an escape (#284), so that every ``after_escape``
+# pass is pinned as well: ``ESC[0m``, inside which no plain pass can start a
+# match (after ``ESC[m`` a URL scheme could start at the ``m``), and the two
+# shortest escapes, two characters each: a written-out ``\n`` and the C1
+# CSI. The escape is kept and separates repeats, so no unit grows faster
+# than its plain one.
+_ESCAPE_LEADS = {"ansi": "\x1b[0m", "backslash": "\\n", "c1": "\x9bm"}
+_ESCAPED_UNITS = {
+    f"{lead}_{unit}": prefix + text
+    for lead, prefix in _ESCAPE_LEADS.items()
+    for unit, text in _WORST_CASE_UNITS.items()
+}
+_GROWTH_UNITS = {**_WORST_CASE_UNITS, **_ESCAPED_UNITS}
 
-@pytest.mark.parametrize("unit", sorted(_WORST_CASE_UNITS), ids=str)
+
+@pytest.mark.parametrize("unit", sorted(_GROWTH_UNITS), ids=str)
 def test_redaction_growth_is_bounded(unit):
     """``redact`` never more than ``MAX_GROWTH_FACTOR``-uples a text.
 
@@ -423,7 +650,7 @@ def test_redaction_growth_is_bounded(unit):
     every accepted resolution (#33). A new pattern must keep the factor or
     raise both together.
     """
-    text = _WORST_CASE_UNITS[unit]
+    text = _GROWTH_UNITS[unit]
     single = redact(text)
     assert "***REDACTED***" in single  # the unit really is recognised
     assert len(single) <= MAX_GROWTH_FACTOR * len(text)
@@ -442,6 +669,18 @@ def test_every_redaction_pattern_has_a_growth_pin():
     """
     units = list(_WORST_CASE_UNITS.values())
     unpinned = [entry.name for entry in _PATTERNS if not any(entry.regex.search(u) for u in units)]
+    assert unpinned == []
+
+
+def test_every_after_escape_pass_has_a_growth_pin():
+    """The same guard for the second pass of every pattern that starts a
+    token: each finds one of the escaped units on its own."""
+    units = list(_ESCAPED_UNITS.values())
+    unpinned = [
+        entry.name
+        for entry in _PATTERNS
+        if entry.after_escape is not None and not any(entry.after_escape.search(u) for u in units)
+    ]
     assert unpinned == []
 
 
@@ -514,14 +753,18 @@ _CREDENTIAL_CORPUS = [
     _NORMAL_TEXT,
     *(text for text, _ in _OAUTH_FIELD_CASES),
     *_OAUTH_PROSE,
-    *_WORST_CASE_UNITS.values(),
-    *(unit * 50 for unit in _WORST_CASE_UNITS.values()),
+    *_GROWTH_UNITS.values(),
+    *(unit * 50 for unit in _GROWTH_UNITS.values()),
+    *(_after(lead, sample) for _, sample, _, _ in _CLASS_SAMPLES for lead in _LEADS.values()),
+    *_INSIDE_IDENTIFIERS,
     "Authorization: Bearer HF_TOKEN=x GH_TOKEN=ghp_aaaaaaaa token=sk-aaaaaaaaaaaa",
     'https://HF_TOKEN="x"@h',
     # Already redacted text is clean: no pattern changes it again.
     "HF_TOKEN=***REDACTED***",
     "Authorization: Bearer ***REDACTED***",
     "https://***REDACTED***@github.com/o/r.git",
+    "\x1b[91m\x1b[1mError: \x1b[0m***REDACTED***",
+    "line\\n***REDACTED***",
     "",
 ]
 
