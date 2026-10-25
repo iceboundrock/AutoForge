@@ -209,6 +209,7 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        SDK providers: isolated helpers, interaction contract,
                                        parallel EPIC scheduler: authority, run identity, claims, locks)
 docs/README.md                         human-oriented documentation index, by intent
+docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
 docs/pi.md                             operator guide: Pi on a DeepSeek API key or a ChatGPT
@@ -325,7 +326,10 @@ validation, safe failure, and recoverability over autonomous convenience.
 
 ## Non-code artifacts
 
-Issues, PR descriptions, specs, plans, reviews, and every other non-code artifact give readers the context and judgment the diff cannot, not a narrated diff or filler, and are published in full on GitHub. The full rules:
+Issues, PR descriptions, specs, plans, reviews, and every other non-code artifact give readers the context and judgment the diff cannot, not a narrated diff or filler, and are published in full on GitHub.
+
+Before writing, editing or publishing any non-code artifact, read
+`docs/non-code-rules.md` for the full writing and publishing rules.
 
 @docs/non-code-rules.md
 
