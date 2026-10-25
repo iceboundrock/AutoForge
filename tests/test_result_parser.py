@@ -7,6 +7,7 @@ import time
 import pytest
 
 from autoforge import loop_guard
+from autoforge.effects import acceptance_comment_problem, operator_comment_problem
 from autoforge.errors import ControlResultError, ControlResultValidationError
 from autoforge.prompts import CONTROL_CHAR_RE, escape_inline
 from autoforge.redaction import MAX_GROWTH_FACTOR, redact_dict
@@ -68,7 +69,19 @@ from autoforge.result_parser import (
     validate_roadmap_section,
 )
 from autoforge.transitions import Phase, WorkflowMode
-from tests.conftest import BRANCH, ISSUE, PR, REVIEW_PROSE, SHA_A, SHA_B, SHA_C, block, comment_url
+from tests.conftest import (
+    BRANCH,
+    GOOGLE_API_KEY,
+    GOOGLE_KEY_BODY,
+    ISSUE,
+    PR,
+    REVIEW_PROSE,
+    SHA_A,
+    SHA_B,
+    SHA_C,
+    block,
+    comment_url,
+)
 
 GOOD_REVIEW = {
     "phase": "REVIEW",
@@ -216,6 +229,8 @@ _ANALYZE = {
         ("pr_title", "Fixes owner/repo#3", "closing keyword"),
         ("pr_body", "Thanks @octocat", "@-mention"),
         ("pr_body", "Set GH_TOKEN=FAKEtoken123456 first", "credential-shaped"),
+        ("pr_body", f"Set GEMINI_API_KEY={GOOGLE_API_KEY} first", "google-api-key"),
+        ("pr_title", f"Call the API with {GOOGLE_API_KEY}", "google-api-key"),
         ("tests", ["pytest\n12 passed"], "control character"),
         ("tests", ["pytest"] * 51, "at most 50"),
         ("tests", "pytest", "tests"),
@@ -228,6 +243,7 @@ def test_analyze_result_text_is_bounded_and_held_to_the_published_policy(key, va
     with pytest.raises(ControlResultValidationError, match=rule) as info:
         AnalyzeExecuteResult.from_payload(dict(_ANALYZE, **{key: value}))
     assert "octocat" not in str(info.value) and "FAKEtoken" not in str(info.value)
+    assert GOOGLE_KEY_BODY not in str(info.value)
 
 
 @pytest.mark.parametrize(
@@ -318,6 +334,8 @@ def test_replan_result_names_no_replacement_target():
         ("pr_title", "Resolves GH-4", "closing keyword"),
         ("pr_body", "Thanks @octocat", "@-mention"),
         ("pr_body", "Set GH_TOKEN=FAKEtoken123456 first", "credential-shaped"),
+        ("pr_body", f"Set GEMINI_API_KEY={GOOGLE_API_KEY} first", "google-api-key"),
+        ("pr_title", f"Call the API with {GOOGLE_API_KEY}", "google-api-key"),
     ],
 )
 def test_replan_pr_text_is_held_to_the_published_policy(key, value, rule):
@@ -327,6 +345,7 @@ def test_replan_pr_text_is_held_to_the_published_policy(key, value, rule):
         ReplanReexecuteResult.from_payload(_replan(**{key: value}))
     assert str(info.value).startswith("REPLAN_REEXECUTE")
     assert "octocat" not in str(info.value) and "FAKEtoken" not in str(info.value)
+    assert GOOGLE_KEY_BODY not in str(info.value)
 
 
 def test_failure_status_skips_schema_but_needs_message():
@@ -2328,6 +2347,8 @@ _CREDENTIALS = [
     ("authorization-header", "Authorization: Bearer FAKEbearer123", "FAKEbearer123"),
     ("url-userinfo", "https://user:FAKEpass123@example.com/x", "FAKEpass123"),
     ("jwt", "eyJhIjowfQ.e30.c2ln", "eyJhIjowfQ"),
+    ("google-api-key", GOOGLE_API_KEY, GOOGLE_KEY_BODY),
+    ("google-api-key", f"GEMINI_API_KEY={GOOGLE_API_KEY}", GOOGLE_KEY_BODY),
     ("github-fine-grained-pat", "github_pat_FAKE0000000000", "FAKE0000000000"),
     ("github-token", "ghp_FAKE00000000", "FAKE00000000"),
     ("openai-key", "sk-proj-FAKE00000000", "FAKE00000000"),
@@ -2461,6 +2482,48 @@ def test_rules_apply_in_order_marker_credential_closing_mention():
     assert "marker" in published_text_problem("f", f"{mention} {closing} {cred} {marker}")
     assert "credential" in published_text_problem("f", f"{mention} {closing} {cred}")
     assert "closing keyword" in published_text_problem("f", f"{mention} {closing}")
+
+
+_GOOGLE_KEY_TEXTS = [
+    f"GEMINI_API_KEY={GOOGLE_API_KEY}",
+    f'GOOGLE_API_KEY="{GOOGLE_API_KEY}"',
+    f"curl 'https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}'",
+    f"stderr read: line\\n{GOOGLE_API_KEY}",
+    json.dumps({"apiKey": GOOGLE_API_KEY}),
+]
+
+
+@pytest.mark.parametrize(
+    "text",
+    _GOOGLE_KEY_TEXTS,
+    ids=["gemini-assignment", "google-assignment", "url-query", "after-escape", "json"],
+)
+def test_a_google_api_key_is_refused_by_every_published_content_check(text):
+    """#282: the published-content checks refuse only the classes
+    ``credential_classes`` reports, and an ``AIza`` key was none of them, so
+    agent text carrying one could be published under the operator's
+    identity. It is refused, never rewritten, by the field rule, the whole
+    payload rule, the comments composed of several fields (whose credential
+    rule is the payload's, run before :func:`published_markdown_problem`
+    judges their mentions) and the commit-message rule, each naming the
+    class and never the key."""
+    body = f"Configured the client.\n\n{text}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body),
+        published_payload_problem("PR body", f"{body}\n\nCloses #2"),
+        acceptance_comment_problem(body, "R1-F1"),
+        operator_comment_problem(body, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{text}", repository="owner/repo", issue_number=2
+        ),
+        _refusal(lambda: _full(progress=body)),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert "credential-shaped string (pattern class: google-api-key)" in msg
+        assert "never redacted" in msg
+        assert GOOGLE_KEY_BODY not in msg
+    assert published_markdown_problem("review comment", body) is None  # mentions only
 
 
 def test_payload_is_judged_whole_for_credentials():

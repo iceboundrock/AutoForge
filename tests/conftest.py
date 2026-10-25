@@ -68,6 +68,13 @@ SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
 BRANCH = "autoforge/2-feature"
+# A dummy Google API key (#282): ``AIza`` and 35 characters of the key's
+# alphabet, ``-`` and ``_`` among them. Built in pieces, so that no literal
+# key-shaped string stands in the repository for a secret scanner to flag;
+# ``GOOGLE_KEY_BODY`` is what must not appear where the key was redacted or
+# refused.
+GOOGLE_KEY_BODY = "SyFAKE-dummy_" + "0" * 22
+GOOGLE_API_KEY = "AIza" + GOOGLE_KEY_BODY
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)
 # and the base branch's `push` run at its tip (the reference definition).

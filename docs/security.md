@@ -216,12 +216,13 @@ Redaction recognises well-known shapes and variable names and makes no
 claim of completeness. A secret of an unrecognised shape that an agent
 prints, or that a command echoes, can reach a run log, and agent text that
 carries one can be published. The state directory is stored in the clear.
-Among the shapes not recognised today are Google API keys (`AIza...`),
-which an OpenCode launch receives whenever your shell sets a `GEMINI_*` or
-`GOOGLE_*` variable, AWS access keys, private-key blocks, and a key
-assigned to a prefixed name (`GEMINI_API_KEY=...`) whose value has no known
-shape. Keep such variables out of the shell you run AutoForge from unless
-a profile needs them.
+Google API keys (`AIza...`) are recognised by their shape, under any name
+([#282](https://github.com/iceboundrock/AutoForge/issues/282)). Among the
+shapes not recognised today are AWS access keys, private-key blocks, and a
+key assigned to a prefixed name (`GEMINI_API_KEY=...`) whose value has no
+known shape; an OpenCode launch receives every `GEMINI_*` and `GOOGLE_*`
+variable your shell sets. Keep such variables out of the shell you run
+AutoForge from unless a profile needs them.
 
 ### Your content goes to model vendors
 
@@ -309,7 +310,7 @@ last column says what still applies.
 |---|---|---|---|
 | [#280](https://github.com/iceboundrock/AutoForge/issues/280) | Critical | *Fixed on `main`.* Under `sandbox.mode: required` or `preferred`, every command, a scheduler's worker and `doctor` refuse a `--config` file an enforced launch could rewrite (in the checkout or a worktree of the repository, in a provider's read-write directory such as a dedicated `CLAUDE_CONFIG_DIR`, reached through a link in one, passing through one before a `..`, or with a second hard link), and a run is pinned to the `sandbox.mode` it was created under: a later command under a weaker one is refused unless `--accept-config-change`, which the run log records | Run every command of a run, and `doctor`, from the same environment: a provider directory given only under another one is not known ([why](#the-outer-sandbox-is-opt-in-and-linux-only)) |
 | [#281](https://github.com/iceboundrock/AutoForge/issues/281) | High | *Fixed on `main`.* A step's result is redacted string by string before it is printed as JSON on the terminal and in a scheduler worker's log, and so is the replan escalation `status` and a dry run print; a quoted assignment value behind an escaped quote (`GH_TOKEN=\"...\"`, as an agent's result reads in its `stdout.log`) is redacted in the run logs, state and the CLI's output, and refused in published text | Redaction is still a baseline ([why](#redaction-is-a-baseline)): treat run logs and worker logs as sensitive and never commit or share them ([how](#keep-autoforges-files-out-of-git)) |
-| [#282](https://github.com/iceboundrock/AutoForge/issues/282) | High | Google API keys (`AIza...`) are neither redacted nor refused in published text, and OpenCode launches receive `GEMINI_*` and `GOOGLE_*` | Keep such variables out of the shell you run AutoForge from unless a profile needs them ([why](#redaction-is-a-baseline)) |
+| [#282](https://github.com/iceboundrock/AutoForge/issues/282) | High | *Fixed on `main`.* A Google API key (`AIza` and 35 characters), under any name or none, in a URL's query string and after an escape sequence, is redacted in the run logs (`stdout.log` and `stderr.log` included), state and the CLI's output, and refused in published text and commit messages | OpenCode launches still receive `GEMINI_*` and `GOOGLE_*`, and a value of no known shape under such a name is not recognised (#285): keep such variables out of the shell you run AutoForge from unless a profile needs them ([why](#redaction-is-a-baseline)) |
 | [#283](https://github.com/iceboundrock/AutoForge/issues/283) | High | `merge.delete_branch: true` passes `--delete-branch` to `gh pr merge`, which, per `gh`, deletes the local branch of that name too, running git in the checkout you started AutoForge from; under `disabled`, a git hook an agent planted there runs with the controller's credential within reach | Keep `merge.delete_branch: false`, the default |
 | [#284](https://github.com/iceboundrock/AutoForge/issues/284) | High | *Fixed on `main`.* A recognised token directly after an ANSI escape sequence (`ESC[0m`, which OpenCode's saved `stderr.log` carries), a backslash escape written out (`\n`, `\t`, `\uXXXX`) or any other character that cannot be part of it is redacted in the run logs, state and the CLI's output, and refused in published text | Redaction is still a baseline ([why](#redaction-is-a-baseline)): treat run logs as sensitive and never commit or share them ([how](#keep-autoforges-files-out-of-git)) |
 | [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | Other credential shapes are not recognised: AWS access keys, private-key blocks, `gsk_`, `xai-`, `npm_`, `glpat-`, `hf_`, and a key of no known shape under a prefixed name such as `GEMINI_API_KEY` | As for #282 |

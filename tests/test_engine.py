@@ -82,6 +82,8 @@ from tests.conftest import (
     FOLLOW_UP_TEXT,
     FOLLOW_UP_TITLE,
     GIT_IDENT,
+    GOOGLE_API_KEY,
+    GOOGLE_KEY_BODY,
     ISSUE,
     ISSUE3,
     MAIN_SHA,
@@ -426,6 +428,20 @@ _FAKE_TOKEN = "gh" + "p_" + "FAKE0000000000000000000000000000000000"
             _from_start,
             "commit message contains a credential-shaped string",
             id="commit-carries-a-credential",
+        ),
+        pytest.param(
+            lambda req: (
+                implement(req) if commit_in(req.cwd, f"Call it with {GOOGLE_API_KEY}") else ""
+            ),
+            _from_start,
+            "commit message contains a credential-shaped string (pattern class: google-api-key)",
+            id="commit-carries-a-google-api-key",
+        ),
+        pytest.param(
+            lambda req: implement(req, pr_body=f"Adds it.\n\nGEMINI_API_KEY={GOOGLE_API_KEY}"),
+            _reports_head,
+            "credential-shaped string (pattern class: google-api-key)",
+            id="body-carries-a-google-api-key",
         ),
         pytest.param(
             lambda req: implement(req, pr_body="Adds it. Fixes #2"),
@@ -6986,6 +7002,34 @@ def test_agent_message_is_bounded_before_it_reaches_state(tmp_state_dir, fake_gi
     assert s.block_reason.endswith("see the run log")
     assert " characters of the block reason omitted; " in s.block_reason
     assert out.message == f"agent reported {status}: {s.block_reason}"
+
+
+def test_a_google_api_key_an_agent_prints_never_reaches_state_or_the_logs(
+    tmp_state_dir, fake_github
+):
+    """#282: an OpenCode launch inherits ``GEMINI_*`` and ``GOOGLE_*``. An
+    agent that printed its environment and blocked quoting its ``AIza`` key
+    put it in ``stdout.log`` and ``stderr.log``, in the block reason of
+    ``state.json`` and in the step outcome in the clear; it is redacted at
+    every sink, and nothing is written to GitHub."""
+    message = f"GEMINI_API_KEY={GOOGLE_API_KEY} is refused by the API"
+    payload = {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": message}
+    env_dump = f"GEMINI_API_KEY={GOOGLE_API_KEY}\nGOOGLE_API_KEY={GOOGLE_API_KEY}\n"
+    eng = make_engine(tmp_state_dir, [env_dump + block(payload)], github=fake_github, origin=True)
+    eng.provider.stderr = f"\x1b[91m\x1b[1mError: \x1b[0m{GOOGLE_API_KEY}\n"
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    redacted = "GEMINI_API_KEY=***REDACTED*** is refused by the API"
+    assert out.message == f"agent reported blocked: {redacted}"
+    s = load_state(eng.paths.state_file)
+    assert s.block_reason == redacted
+    assert GOOGLE_KEY_BODY not in eng.paths.state_file.read_text()
+    logs = [path for path in (eng.paths.logs_dir / s.run_id).rglob("*") if path.is_file()]
+    assert {"stdout.log", "stderr.log"} <= {path.name for path in logs}
+    for path in logs:
+        assert GOOGLE_KEY_BODY not in path.read_text(), path
+    assert fake_github.effect_writes == []
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
