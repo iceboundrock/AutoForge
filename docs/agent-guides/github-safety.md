@@ -1004,8 +1004,24 @@ path, so no setting makes the controller post one (ADR 0004 D2.1a).
   (re-hashed). Fetches write objects only and create or move no ref. The
   pre-merge evidence fetch runs on it, and every git process goes through
   the executor.
+- **Every controller `gh` process** (`github.gh_workdir`,
+  `github.gh_request`, #283) starts in a fresh empty directory the
+  controller creates outside the checkout and removes once `gh` exits,
+  with `GIT_DIR` naming that directory, so any git `gh` runs finds no
+  repository and exits: not the checkout, not one a `GIT_DIR` of the
+  operator's shell names, not one around a temporary directory inside a
+  checkout. No call relies on its working directory to name the
+  repository: every one names it, and the repository a run starts in is
+  read from the checkout's `origin` through the hardened local request
+  and then from GitHub (`gh repo view <owner>/<repo>`), which follows a
+  rename. A relative `github.command` is made absolute first. `doctor`'s
+  `gh --version` and `gh auth status` run the same way. The one `gh` that
+  runs elsewhere is `gh auth git-credential`, which git starts as the
+  credential helper of the transport's own fetch and push, in the private
+  git directory the transport made for it (above).
 - **Every other controller git process** runs in the operator's repository
   through `git_transport.local_git_request` (ADR 0004 D7.3, D7.5): the
+  run's `origin` read at `INITIALIZING`, the
   per-issue worktree's `git worktree add` and its identity read, the
   candidate read and the strict import, the workspace reader
   (`rev-parse`, `symbolic-ref`, `status`), the lock's common-dir read and
@@ -1210,7 +1226,8 @@ make no GitHub call and are out of scope.
 | post a comment on another issue of the run's repository as acceptance evidence | controller-only | the operator; the controller never posts it and verifies it as effect K10 (#243) |
 | close, reopen or comment on the source PR of a replan | controller-only | the controller's replan transaction |
 | merge; disable auto-merge | controller-only | the controller, behind `safety.allow_merge` |
-| edit a comment in place, close an issue, delete a branch, labels, assignees, milestones, any other REST or GraphQL mutation | controller-only | nobody: there is no kind for it |
+| delete the merged PR's head branch on GitHub | controller-only | the controller, after a verified merge, behind `merge.delete_branch` (#283) |
+| edit a comment in place, close an issue, delete any other branch, labels, assignees, milestones, any other REST or GraphQL mutation | controller-only | nobody: there is no kind for it |
 | read an issue, a PR, comments, checks, the EPIC and its issues | read-only external | the controller, into the agent's read context (below) |
 | `git fetch` of the revisions a phase works on | network read | the controller, before the launch (objects only) |
 | read the diff of the bound revision | agent-local | the agent, `git diff` over what the controller fetched |
@@ -1521,7 +1538,8 @@ humans acting concurrently on GitHub. GitHub is the source of truth.
 2. **No steering of the controller.** Repository state an agent can write
    (configuration, hooks, `origin`, include directives, replacement refs,
    grafts, the commit-graph) cannot steer, or run code in, the controller's
-   own git network operations and `gh` calls (D7.3, D7.5).
+   own git network operations and `gh` calls (D7.3, D7.5; every `gh` runs
+   outside any repository, #283).
 3. **Every write is accounted for.** Every Wave 1 externally visible write
    is a typed controller effect with a durable record; anything else with a
    Wave 1 identity is detected and blocks, and is never adopted.
@@ -1751,7 +1769,9 @@ and the file that set it.
 
 When the gate is open, the *controller* performs the merge itself:
 `gh pr merge --<merge.method> --match-head-commit <reviewed HEAD>` through
-`GitHubClient`, with no prompt and no agent invocation.
+`GitHubClient`, with no prompt and no agent invocation. It never passes
+`--delete-branch`, whatever `merge.delete_branch` says: that flag deletes
+the local branch too (below).
 
 `READY_FOR_MERGE` is entered for an open PR only in the write that issues
 the round's review certificate, or by an `unblock` while that certificate
@@ -1968,6 +1988,47 @@ GitHub (an already-merged PR is recovered and counted once; an open one is
 re-verified), bounded by the same `merge.max_verification_attempts`, then
 `BLOCKED`.
 
+### Deleting the merged head branch
+
+With `merge.delete_branch: true` (default `false`) the controller deletes
+the merged PR's head branch on GitHub, and only there (#283). It is part
+of the merge's own mechanism (ADR 0004 D5.4), not an effect kind (no kind
+deletes a ref, D6.3):
+
+- **When.** Only once the merge is verified and counted as above; a PR
+  left open, merged at another HEAD or into another base deletes nothing.
+- **What.** One `DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`
+  (`GitHubClient.delete_branch_ref`) in the run's own repository, of the
+  branch GitHub names as the PR's head. It is skipped when the head is in
+  another repository (a fork, or one GitHub no longer names), when it is
+  not the branch the run bound, when it is the PR's base or the
+  repository's default branch as GitHub reports it now (the client refuses
+  the default branch again before anything starts), and when the exact
+  ref read (`git/ref/heads/<branch>`) finds it gone or at a commit other
+  than the merged HEAD: a push after the merge is work the merge did not
+  include. A push between that read and the `DELETE` is not seen, as with
+  `gh`'s own deletion: the branch is deleted, and the pushed commit is
+  left only in the pusher's clone.
+- **At most once.** The save that counts the merge is its checkpoint,
+  made in `MERGE` before the `DELETE` is sent. A crash before it counted
+  nothing, so the `MERGE` re-entry recovers the merge without repeating
+  it and deletes the branch then; a re-entry that finds the merge counted
+  never sends the `DELETE` again, it only reads the branch back.
+- **Read back, never blocking.** The outcome is the ref read again, never
+  `gh`'s exit status, and it is a note in the step's message: deleted, not
+  deleted and why, or unknown when the read fails. The merge is verified
+  and counted either way, and the run moves on.
+
+No local branch is deleted or checked out. `gh pr merge --delete-branch`
+does both (gh 2.103.2, `pkg/cmd/pr/merge/merge.go`, `deleteLocalBranch`):
+when the directory it runs in has the head branch, it checks out the base
+(or creates it), runs `git pull --ff-only` with `gh` as the credential
+helper, removes a linked worktree that has the branch checked out, and
+runs `git branch -D`. Even without the flag, every `gh pr merge` asks git
+there whether the branch exists (`git rev-parse --verify
+refs/heads/<branch>`), which is why every `gh` the controller starts runs
+in an empty directory of its own ([Controller-owned effects](#controller-owned-effects)).
+
 ### Doctor's branch-rule check
 
 `doctor` verifies that the default branch still requires the CI check. The
@@ -2049,7 +2110,7 @@ to three of those with at least one result:
 
 `doctor` as a whole is read-only apart from creating the state directory
 if it is missing and a probe file it creates and removes there; its GitHub
-reads (`gh repo view`, `gh api` GETs of the default branch's rules, the
+reads (`gh repo view <owner>/<repo>`, `gh api` GETs of the default branch's rules, the
 checks row's GraphQL query and `gh pr view`) never write.
 
 ---

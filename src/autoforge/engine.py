@@ -536,6 +536,7 @@ from .validation import (
     parse_comment_url,
     parse_issue_url,
     parse_pr_url,
+    parse_remote_repository,
     same_issue_url,
     same_pr_url,
     validate_epic_and_issue,
@@ -4232,6 +4233,7 @@ class ControllerEngine:
                     *self._premerge_plan_notes(),
                     "would run the command below (bound to the reviewed HEAD via "
                     "--match-head-commit), then re-read the PR and require state MERGED",
+                    *self._delete_branch_plan_notes(s),
                 ],
                 command=self._merge_plan_command(),
             )
@@ -4444,8 +4446,21 @@ class ControllerEngine:
                 s.current_pr_url,
                 method=self.config.merge.method,
                 match_head_sha=(s.reviewed_head_sha or "").lower(),
-                delete_branch=self.config.merge.delete_branch,
             ),
+        ]
+
+    def _delete_branch_plan_notes(self, s: AutoForgeState) -> list[str]:
+        """Dry-run: what ``merge.delete_branch`` would do after the merge (#283)."""
+        if not self.config.merge.delete_branch:
+            return []
+        branch = s.current_branch or "(the PR's head branch)"
+        return [
+            f"merge.delete_branch: once GitHub reports the PR MERGED at the reviewed HEAD, "
+            f"would delete {branch!r} on GitHub only (DELETE "
+            f"repos/{s.repository}/git/refs/heads/<branch>), and only if the PR's head is "
+            "in this repository, the branch is neither its base nor the repository's "
+            "default branch, and GitHub still has it at the merged HEAD; no local branch "
+            "is deleted or checked out"
         ]
 
     def _merge_plan_command(self) -> list[str]:
@@ -6582,11 +6597,14 @@ class ControllerEngine:
         """Preflight: repository/issue verification, then -> ANALYZE_EXECUTE."""
         state = self._require_state()
         self.validate_config()
-        repo = self.github.current_repo()
+        home = self._checkout_repository()
+        # GitHub's name for it: a renamed repository answers with its new one.
+        repo = self.github.get_repo(home)
         if repo.name_with_owner.lower() != state.repository.lower():
             raise VerificationError(
-                f"repository mismatch: cwd resolves to {repo.name_with_owner!r} via gh, "
-                f"but the issue/epic belong to {state.repository!r}"
+                f"repository mismatch: this checkout's 'origin' is {home!r} "
+                f"({repo.name_with_owner!r} on GitHub), but the issue/epic belong to "
+                f"{state.repository!r}"
             )
         issue = self._verify_issue_selectable(state.current_issue_url, switching=False)
         nxt = self._next_phase(Phase.INITIALIZING, {})
@@ -6601,6 +6619,42 @@ class ControllerEngine:
                 f"verified issue #{issue.number} ({issue.state}); INITIALIZING -> {nxt.value}"
             ),
         )
+
+    def _checkout_repository(self) -> str:
+        """``owner/repo`` of this checkout's ``origin`` remote, read by the controller's git.
+
+        Read locally through the hardened request, as ``doctor`` and the
+        ``epic`` commands read it, and never by `gh`: `gh repo view` without
+        a repository finds it from the git of its working directory, and no
+        `gh` the controller starts runs in a repository (#283).
+        """
+        try:
+            res = (self._runner or execute)(
+                local_git_request(
+                    ["remote", "get-url", "origin"],
+                    cwd=str(self.workdir),
+                    timeout_seconds=GIT_TIMEOUT_SECONDS,
+                )
+            )
+        except ExecutionError as exc:
+            raise VerificationError(
+                "a run starts in a checkout of the issue's repository, and this checkout's "
+                f"'origin' remote cannot be read: git could not be run ({redact(str(exc))[:500]})"
+            ) from exc
+        if res.timed_out or res.truncated or res.exit_code != 0:
+            lines = (res.stderr or res.stdout).strip().splitlines()
+            detail = lines[0][:500] if lines else f"git remote get-url exited {res.exit_code}"
+            raise VerificationError(
+                "a run starts in a checkout of the issue's repository, and this checkout's "
+                f"'origin' remote cannot be read: {redact(detail)}"
+            )
+        try:
+            return parse_remote_repository(res.stdout)
+        except ConfigurationError as exc:
+            raise VerificationError(
+                "a run starts in a checkout of the issue's repository, and this checkout's "
+                f"'origin' remote does not name one: {redact(str(exc))[:500]}"
+            ) from exc
 
     def _verify_issue_selectable(self, url: str, *, switching: bool) -> IssueInfo:
         """Verify on GitHub that ``url`` is an issue this run may work on.
@@ -9380,8 +9434,8 @@ class ControllerEngine:
                 phase,
                 plan,
                 f"{reason}. GitHub data stayed inconclusive for {state.attempt} verification "
-                f"attempt(s) (merge.max_verification_attempts={limit}); giving up. Nothing "
-                "was merged or counted; inspect the PR on GitHub manually.",
+                f"attempt(s) (merge.max_verification_attempts={limit}); giving up. "
+                f"{self._merge_so_far()}; inspect the PR on GitHub manually.",
             )
         self._save()
         raise VerificationError(
@@ -9424,9 +9478,29 @@ class ControllerEngine:
             phase,
             plan,
             f"{what}: {exc}. This is not a transient GitHub failure (authentication, "
-            "permissions, or the PR itself), so re-checking would not help; nothing was "
-            "merged or counted. Fix the cause and inspect the PR on GitHub manually.",
+            "permissions, or the PR itself), so re-checking would not help. "
+            f"{self._merge_so_far()}. Fix the cause and inspect the PR on GitHub manually.",
         )
+
+    def _merge_already_counted(self) -> bool:
+        """True when an earlier MERGE step of this run counted the current PR's merge.
+
+        Only a MERGE re-entry after the save :meth:`_delete_merged_branch`
+        makes before the branch deletion (#283) finds that, and a failure
+        there must not report the merge as uncounted.
+        """
+        state = self._require_state()
+        try:
+            canonical = parse_pr_url(state.current_pr_url).canonical
+        except ConfigurationError:
+            return False
+        return state.phase == Phase.MERGE and canonical in state.counted_merged_prs
+
+    def _merge_so_far(self) -> str:
+        """What a MERGE-gate failure leaves behind, as a sentence without its full stop."""
+        if self._merge_already_counted():
+            return "An earlier step of this run merged and counted the PR; nothing more was merged"
+        return "Nothing was merged or counted"
 
     @staticmethod
     def _checks_refused_text(url: str, exc: GitHubChecksAccessError) -> str:
@@ -9460,6 +9534,14 @@ class ControllerEngine:
             return general
         if pr.state != "MERGED" or (pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref)):
             return general
+        if self._merge_already_counted():
+            return (
+                f"PR {url} is already MERGED on GitHub (head {pr.head_sha[:12] or '?'}), and "
+                "an earlier step of this run counted that merge; this step could not re-read "
+                f"it: GitHub refused this credential ({exc.credential or 'the token'}) the "
+                f"PR's check runs: {exc}. 'unblock' takes the run on to UPDATE_EPIC, which "
+                "reads no check"
+            )
         remedy = checks_access_remedy(exc.credential)
         return (
             f"PR {url} is already MERGED on GitHub (head {pr.head_sha[:12] or '?'}), but this "
@@ -9577,7 +9659,7 @@ class ControllerEngine:
                 plan,
                 f"GitHub answered {url} with PR {pr.url}, which is not the reviewed PR "
                 f"{state.reviewed_pr_url}; refusing to merge a PR no review decided on. "
-                "Nothing was merged or counted.",
+                f"{self._merge_so_far()}.",
             )
         if pr.state == "MERGED":
             if phase == Phase.READY_FOR_MERGE:
@@ -10225,12 +10307,7 @@ class ControllerEngine:
 
         merge_error = ""
         try:
-            self.github.merge_pr(
-                url,
-                method=self.config.merge.method,
-                match_head_sha=reviewed,
-                delete_branch=self.config.merge.delete_branch,
-            )
+            self.github.merge_pr(url, method=self.config.merge.method, match_head_sha=reviewed)
         except GitHubError as exc:
             merge_error = str(exc)
 
@@ -10653,6 +10730,7 @@ class ControllerEngine:
         url = parse_pr_url(pr.url or state.current_pr_url).canonical
         newly = state.record_merge(url)  # idempotent across crash/resume
         state.current_head_sha = pr.head_sha
+        branch_note = self._delete_merged_branch(pr, newly_counted=newly)
         # The merge was verified at the reviewed revision (the drift case
         # left through _revision_drift_to_review before anything was counted).
         nxt = self._next_phase(Phase.MERGE, {"head_changed_after_review": False})
@@ -10667,8 +10745,129 @@ class ControllerEngine:
             plan=plan,
             message=(
                 f"PR {url} {how} at reviewed HEAD {pr.head_sha[:12]}; {counted} "
-                f"({state.merged_since_epic_update} since last EPIC update); MERGE -> {nxt.value}"
+                f"({state.merged_since_epic_update} since last EPIC update){branch_note}; "
+                f"MERGE -> {nxt.value}"
             ),
+        )
+
+    def _delete_merged_branch(self, pr: PRInfo, *, newly_counted: bool) -> str:
+        """``merge.delete_branch``: delete the merged PR's head branch on GitHub, once (#283).
+
+        Called by :meth:`_complete_merge` only, after GitHub reported the PR
+        MERGED at the reviewed HEAD into the reviewed base, before the save
+        that leaves MERGE. It deletes one remote ref, ``refs/heads/<head>``
+        of the run's repository, through
+        :meth:`GitHubClient.delete_branch_ref`, and nothing local: `gh pr
+        merge --delete-branch` also deletes the local branch, checking out
+        and pulling another first when the checkout it runs in has it, so it
+        is never used. The ref is deleted only when the PR's head is in the
+        run's repository (a fork's branch is not the run's), it is the branch
+        the run bound, it is neither the PR's base nor the repository's
+        default branch as GitHub names it now, and GitHub still has it at the
+        merged HEAD (a push after the merge is work the merge did not
+        include). Anything else deletes nothing.
+
+        The deletion is sent at most once per merge. The save that counts
+        the merge, made here in MERGE before it is sent, is its checkpoint:
+        a MERGE re-entry that finds the PR already counted (a crash after
+        that save) never sends it again, it only reads the branch back. A
+        crash before that save repeats nothing either: the PR reads MERGED,
+        so the merge is recovered rather than repeated, and the branch, if
+        GitHub still has it at the merged HEAD, is deleted then. The outcome
+        is read back from GitHub, never taken from `gh`'s exit status, and
+        returned as a note for the step's message; it never blocks the run,
+        whose merge is verified and counted either way.
+        """
+        if not self.config.merge.delete_branch:
+            return ""
+        state = self._require_state()
+        repository = state.repository
+        branch = pr.head_ref
+        if not newly_counted:
+            return self._merged_branch_readback(pr, "", resumed=True)
+        default_branch, refusal = self._merged_branch_refusal(pr)
+        if refusal:
+            return f"; head branch not deleted: {refusal}"
+        # The checkpoint: from here on a re-entry finds the merge counted.
+        self._save()
+        failure = ""
+        try:
+            self.github.delete_branch_ref(repository, branch, default_branch=default_branch)
+        except GitHubError as exc:
+            failure = str(exc)
+        return self._merged_branch_readback(pr, failure, resumed=False)
+
+    def _merged_branch_refusal(self, pr: PRInfo) -> tuple[str, str]:
+        """``(default branch, "")`` when the merged head branch may be deleted, else the reason."""
+        state = self._require_state()
+        repository = state.repository
+        branch = pr.head_ref
+        if not branch:
+            return "", f"GitHub reports no head branch for PR {pr.url}"
+        if pr.head_repository.lower() != repository.lower():
+            where = pr.head_repository or "a repository GitHub no longer names"
+            return "", (
+                f"{branch!r} is in {where}, not in {repository}; a fork's branch is not "
+                "the run's to delete"
+            )
+        if state.current_branch and branch != state.current_branch:
+            return "", (
+                f"GitHub names the PR's head branch {branch!r}, but this run is bound to "
+                f"{state.current_branch!r}"
+            )
+        if branch in (pr.base_ref, state.reviewed_base_ref):
+            return "", f"{branch!r} is the PR's base branch"
+        try:
+            default_branch = self.github.get_repo(repository).default_branch
+        except GitHubError as exc:
+            return "", f"the default branch of {repository} could not be read ({exc})"
+        if not default_branch:
+            return "", f"GitHub names no default branch for {repository}"
+        if branch.lower() == default_branch.lower():
+            return "", f"{branch!r} is the default branch of {repository}"
+        try:
+            head = self.github.get_branch_ref(repository, branch)
+        except GitHubError as exc:
+            return "", f"{branch!r} could not be read ({exc})"
+        if head is None:
+            return "", f"{branch!r} no longer exists on GitHub"
+        if head != pr.head_sha:
+            return "", (
+                f"{branch!r} now points at {head[:12]}, not at the merged HEAD "
+                f"{pr.head_sha[:12]}: what was pushed after the merge is not the controller's "
+                "to delete"
+            )
+        return default_branch, ""
+
+    def _merged_branch_readback(self, pr: PRInfo, failure: str, *, resumed: bool) -> str:
+        """The step-message note on the merged head branch, as GitHub reports it now.
+
+        ``failure`` is what the deletion's call raised, if anything;
+        ``resumed`` says this step sent no deletion because an earlier one of
+        the same merge may have.
+        """
+        repository = self._require_state().repository
+        branch = pr.head_ref
+        if resumed:
+            why = (
+                " (an earlier step of this merge counted it before sending its deletion, "
+                "which is never sent twice)"
+            )
+        else:
+            why = f" (the deletion failed: {failure})" if failure else ""
+        try:
+            head = self.github.get_branch_ref(repository, branch)
+        except GitHubError as exc:
+            return (
+                f"; whether head branch {branch!r} was deleted is unknown{why}: it could not "
+                f"be read back ({exc}); check it on GitHub"
+            )
+        if head is None:
+            done = "is gone from GitHub" if resumed else "deleted on GitHub"
+            return f"; head branch {branch!r} {done} (read back as absent)"
+        return (
+            f"; head branch {branch!r} not deleted{why}: GitHub still has it at {head[:12]}; "
+            "delete it there if it should go"
         )
 
     def _analyze_plan_notes(self, s: AutoForgeState) -> list[str]:

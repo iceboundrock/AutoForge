@@ -108,6 +108,8 @@ from .github import (
     GH_MIN_VERSION,
     GitHubClient,
     checks_access_remedy,
+    gh_request,
+    gh_workdir,
     is_access_denied_gh_failure,
     parse_gh_version,
 )
@@ -212,10 +214,24 @@ class Doctor:
 
     # -- helpers -----------------------------------------------------------------
     def _run(self, argv: list[str]) -> tuple[bool, str]:
+        return self._run_request(
+            ExecutionRequest(command=argv, cwd=self.cwd, timeout_seconds=self.timeout)
+        )
+
+    def _run_gh(self, argv: list[str]) -> tuple[bool, str]:
+        """:meth:`_run` for a `gh` argv: in an empty directory of its own, never the checkout.
+
+        The controller runs every `gh` that way (#283), and so does doctor.
+        """
         try:
-            res = self._runner(
-                ExecutionRequest(command=argv, cwd=self.cwd, timeout_seconds=self.timeout)
-            )
+            with gh_workdir() as workdir:
+                return self._run_request(gh_request(argv, workdir, timeout_seconds=self.timeout))
+        except GitHubError as exc:  # no empty directory could be made
+            return False, str(exc)
+
+    def _run_request(self, request: ExecutionRequest) -> tuple[bool, str]:
+        try:
+            res = self._runner(request)
         except Exception as exc:  # spawn failure / missing binary
             return False, f"{type(exc).__name__}: {exc}"
         text = (res.stdout or "").strip() or (res.stderr or "").strip()
@@ -762,7 +778,7 @@ class Doctor:
         unknown version is not a known-good one.
         """
         name = "gh available"
-        ok, detail = self._run([gh, "--version"])
+        ok, detail = self._run_gh([gh, "--version"])
         if not ok:
             return CheckResult(name, False, detail)
         minimum = ".".join(str(part) for part in GH_MIN_VERSION)
@@ -781,7 +797,7 @@ class Doctor:
         return CheckResult(name, True, detail)
 
     def check_gh_auth(self, gh: str) -> CheckResult:
-        ok, detail = self._run([gh, "auth", "status"])
+        ok, detail = self._run_gh([gh, "auth", "status"])
         return CheckResult("gh authenticated", ok, detail)
 
     def check_feature_spec(self, spec_path: str) -> CheckResult:

@@ -19,6 +19,9 @@
   (D13.10); and amendments to D1.1, D2.4, D4.7, D5.1, D5.7, D8.3 and §4.
   [BLOCKED on operator actions](../usage.md#blocked-on-operator-actions)
   is the operator's guide.
+- **Amended by #283:** the merge's mechanism (D5.4) deletes the merged
+  head branch itself, on GitHub only, and every `gh` the controller starts
+  runs outside any repository.
 - **Decides:** #159, for EPIC #158 (Wave 1).
 - **Where:** placement is decided in §2.12. Existing code this record
   builds on: `src/autoforge/github.py`, `claims.py`, `result_parser.py`,
@@ -1323,8 +1326,17 @@ phase-specific evidence:
 - the splice checks the body before and after its write.
 
 Migrating them into effect records would add risk with no new safety.
+
 #160 only pins with a test that the close receipt is presence-checked
 (`has_close_receipt`), so a duplicate receipt is harmless.
+
+**Amended (#283).** `merge.delete_branch` no longer passes
+`--delete-branch` to `gh pr merge`, which deletes the local branch as well
+as the remote one. The merge's mechanism deletes the merged PR's head
+branch on GitHub itself, one `DELETE` of `refs/heads/<branch>` in the run's
+repository, after the merge is verified and counted, at most once, and
+never a fork's branch, the base or the default branch. It stays outside the
+effect kinds (D6.3: no kind deletes a ref).
 
 **D5.5 (#160).** **A body append is a frozen block over a recorded base.**
 K3 and K6 are the two kinds whose payload contains bytes the controller did

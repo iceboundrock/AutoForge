@@ -114,6 +114,7 @@ from tests.conftest import (
     follow_up_issue_body,
     git_out,
     git_repo,
+    github_origin,
     implement,
     implementation_pr_body,
     is_shell_probe,
@@ -207,10 +208,66 @@ def test_initializing_rejects_closed_issue(tmp_state_dir, fake_github):
 
 
 def test_initializing_rejects_repository_mismatch(tmp_state_dir):
-    gh = FakeGitHub(repo="someone/else")
+    gh = FakeGitHub(repo="someone/else")  # this checkout's origin
     eng = make_engine(tmp_state_dir, [], github=gh)
-    with pytest.raises(VerificationError, match="repository mismatch"):
+    with pytest.raises(VerificationError, match="repository mismatch: this checkout's 'origin'"):
         eng.step()
+    assert eng.state.phase == Phase.INITIALIZING
+
+
+def test_initializing_reads_the_checkout_origin_locally_and_github_names_it(
+    tmp_state_dir, fake_github
+):
+    """#283: the checkout's repository is its ``origin``, read by the controller's own git;
+    no `gh` runs in the checkout to find it. GitHub's name for it is what is compared,
+    so an origin still naming a renamed repository passes."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    github_origin(eng.workdir, "owner/old-name")
+    fake_github.repo_names["owner/old-name"] = "owner/repo"
+    seen = []
+
+    def runner(req):
+        seen.append((req.command, req.cwd))
+        return execute(req)
+
+    eng._runner = runner
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    assert ("get_repo", "owner/old-name") in fake_github.calls
+    reads = [cmd for cmd, _ in seen if cmd[-3:] == ["remote", "get-url", "origin"]]
+    assert len(reads) == 1 and reads[0][0] == "git"
+    assert set(LOCAL_GIT_SWITCHES) <= set(reads[0])  # the hardened local request
+
+
+@pytest.mark.parametrize(
+    "origin", [None, "https://gitlab.com/owner/repo.git"], ids=["no-origin", "not-github"]
+)
+def test_initializing_refuses_a_checkout_whose_origin_names_no_repository(
+    tmp_state_dir, fake_github, origin
+):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    if origin is None:
+        git_out("-C", str(eng.workdir), "remote", "remove", "origin")
+    else:
+        git_out("-C", str(eng.workdir), "remote", "set-url", "origin", origin)
+    with pytest.raises(VerificationError, match="this checkout's 'origin' remote"):
+        eng.step()
+    assert eng.state.phase == Phase.INITIALIZING
+    assert not any(call[0] == "get_repo" for call in fake_github.calls)
+
+
+def test_initializing_names_the_origin_when_git_cannot_be_run(tmp_state_dir, fake_github):
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+
+    def no_git(req):
+        if req.command[-3:] == ["remote", "get-url", "origin"]:
+            raise ExecutionError("cannot execute 'git': No such file or directory")
+        return execute(req)
+
+    eng._runner = no_git
+    with pytest.raises(VerificationError, match="'origin' remote cannot be read: git could not"):
+        eng.step()
+    assert eng.state.phase == Phase.INITIALIZING
+    assert not any(call[0] == "get_repo" for call in fake_github.calls)
 
 
 def test_initializing_rejects_missing_issue_as_verification_error(tmp_state_dir, fake_github):
@@ -4885,7 +4942,7 @@ def test_merge_when_explicitly_enabled_is_done_by_controller(tmp_state_dir, fake
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC", out.message
     assert "merged by the controller" in out.message
-    assert fake_github.merges == [(PR, "squash", SHA_A, False)]
+    assert fake_github.merges == [(PR, "squash", SHA_A)]
     assert fake_github.prs[PR].state == "MERGED"
     assert eng.provider.calls == []  # no agent invocation in MERGE
     assert eng.state.counted_merged_prs == [PR] and eng.state.merged_since_epic_update == 1
@@ -4894,26 +4951,23 @@ def test_merge_when_explicitly_enabled_is_done_by_controller(tmp_state_dir, fake
     assert persisted.phase == Phase.UPDATE_EPIC and persisted.counted_merged_prs == [PR]
 
 
-def test_merge_uses_configured_method_and_delete_branch(tmp_state_dir, fake_github):
+@pytest.mark.parametrize("delete_branch", [False, True])
+def test_merge_uses_configured_method_and_never_passes_delete_branch(
+    tmp_state_dir, fake_github, delete_branch
+):
+    """#283: `gh pr merge --delete-branch` deletes the local branch too, so it is never
+    passed; merge.delete_branch deletes the remote head branch on its own
+    (tests/test_merge_branch.py)."""
     fake_github.add_pr(head_sha=SHA_A)
     eng = _in_merge(tmp_state_dir, fake_github)
     eng.config.merge.method = "rebase"
-    eng.config.merge.delete_branch = True
+    eng.config.merge.delete_branch = delete_branch
     plan = eng.step(dry_run=True, allow_merge=True).plan
-    assert plan.command == [
-        "gh",
-        "pr",
-        "merge",
-        PR,
-        "--rebase",
-        "--match-head-commit",
-        SHA_A,
-        "--delete-branch",
-    ]
+    assert plan.command == ["gh", "pr", "merge", PR, "--rebase", "--match-head-commit", SHA_A]
     assert plan.profile_name.startswith("(none") and plan.prompt_full == ""
     assert fake_github.merges == []  # dry-run never merges
     assert eng.step(allow_merge=True).next_phase == "UPDATE_EPIC"
-    assert fake_github.merges == [(PR, "rebase", SHA_A, True)]
+    assert fake_github.merges == [(PR, "rebase", SHA_A)]
 
 
 def test_merge_head_moved_after_clean_review_goes_back_to_review(tmp_state_dir, fake_github):
@@ -5173,7 +5227,7 @@ def test_gate_reads_the_review_comment_exactly_once_per_pass(tmp_state_dir, fake
     assert out.next_phase == "UPDATE_EPIC", out.message
     reads = [c for c in fake_github.calls if c[0] == "get_comment"]
     assert reads == [("get_comment", comment_url(PR, REVIEW_CID))] * 2
-    assert fake_github.merges == [(PR, "squash", SHA_A, False)]
+    assert fake_github.merges == [(PR, "squash", SHA_A)]
 
 
 def test_gate_re_reads_the_review_comment_the_controller_posted(tmp_state_dir, fake_github):
@@ -5190,7 +5244,7 @@ def test_gate_re_reads_the_review_comment_the_controller_posted(tmp_state_dir, f
     assert out.next_phase == "UPDATE_EPIC", out.message
     reads = [c for c in fake_github.calls if c[0] == "get_comment"]
     assert reads == [("get_comment", posted)] * 2
-    assert fake_github.merges == [(PR, "squash", SHA_A, False)]
+    assert fake_github.merges == [(PR, "squash", SHA_A)]
 
 
 def test_gate_blocks_when_the_comment_the_controller_posted_was_edited(tmp_state_dir, fake_github):

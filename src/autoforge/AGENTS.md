@@ -68,7 +68,8 @@ agent_worktree.py   the agent worktree's git surface in every sandbox.mode: regi
 github.py           GitHubClient over `gh`, the only holder of a GitHub credential:
                     verification reads, the reads behind an agent's read context, typed
                     controller writes (never retried on an ambiguous outcome) +
-                    controller-owned merge
+                    controller-owned merge and merged-head-branch deletion; every
+                    `gh` runs in an empty directory of its own (`gh_workdir`, #283)
 child_env.py        what every agent and repository-command launch gets instead of a
                     credential: forbidden env names, per-launch overrides (empty gh
                     config, identity-only git config, command-scope resets, empty

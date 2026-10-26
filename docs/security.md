@@ -68,8 +68,9 @@ or under the outer sandbox.
   (`gh pr merge --match-head-commit`). A PR that changes
   `.github/workflows/` is never merged unattended. No agent is ever asked
   to merge. AutoForge never pushes to the default branch, pushes a branch
-  only as a new branch or a fast-forward, deletes no worktree, and deletes
-  no branch unless you set `merge.delete_branch: true`.
+  only as a new branch or a fast-forward, deletes no worktree and no local
+  branch, and deletes a remote branch only when you set
+  `merge.delete_branch: true`: then the merged PR's head branch, on GitHub.
   ([GitHub safety: merge safety](agent-guides/github-safety.md#merge-safety))
 - **Agent output is a claim.** State advances only on a strictly validated
   result plus the controller's own reads of GitHub and git; nothing an
@@ -311,7 +312,7 @@ last column says what still applies.
 | [#280](https://github.com/iceboundrock/AutoForge/issues/280) | Critical | *Fixed on `main`.* Under `sandbox.mode: required` or `preferred`, every command, a scheduler's worker and `doctor` refuse a `--config` file an enforced launch could rewrite (in the checkout or a worktree of the repository, in a provider's read-write directory such as a dedicated `CLAUDE_CONFIG_DIR`, reached through a link in one, passing through one before a `..`, or with a second hard link), and a run is pinned to the `sandbox.mode` it was created under: a later command under a weaker one is refused unless `--accept-config-change`, which the run log records | Run every command of a run, and `doctor`, from the same environment: a provider directory given only under another one is not known ([why](#the-outer-sandbox-is-opt-in-and-linux-only)) |
 | [#281](https://github.com/iceboundrock/AutoForge/issues/281) | High | *Fixed on `main`.* A step's result is redacted string by string before it is printed as JSON on the terminal and in a scheduler worker's log, and so is the replan escalation `status` and a dry run print; a quoted assignment value behind an escaped quote (`GH_TOKEN=\"...\"`, as an agent's result reads in its `stdout.log`) is redacted in the run logs, state and the CLI's output, and refused in published text | Redaction is still a baseline ([why](#redaction-is-a-baseline)): treat run logs and worker logs as sensitive and never commit or share them ([how](#keep-autoforges-files-out-of-git)) |
 | [#282](https://github.com/iceboundrock/AutoForge/issues/282) | High | *Fixed on `main`.* A Google API key (`AIza` and 35 characters), under any name or none, in a URL's query string and after an escape sequence, is redacted in the run logs (`stdout.log` and `stderr.log` included), state and the CLI's output, and refused in published text and commit messages | OpenCode launches still receive `GEMINI_*` and `GOOGLE_*`, and a value of no known shape under such a name is not recognised (#285): keep such variables out of the shell you run AutoForge from unless a profile needs them ([why](#redaction-is-a-baseline)) |
-| [#283](https://github.com/iceboundrock/AutoForge/issues/283) | High | `merge.delete_branch: true` passes `--delete-branch` to `gh pr merge`, which, per `gh`, deletes the local branch of that name too, running git in the checkout you started AutoForge from; under `disabled`, a git hook an agent planted there runs with the controller's credential within reach | Keep `merge.delete_branch: false`, the default |
+| [#283](https://github.com/iceboundrock/AutoForge/issues/283) | High | *Fixed on `main`.* Every `gh` the controller starts runs in an empty directory of its own with `GIT_DIR` naming that directory, so any git it runs finds no repository, and none relies on its working directory to name one; `merge.delete_branch: true` no longer passes `--delete-branch` (which deletes the local branch too, checking out and pulling another first, in the directory `gh` runs in): after a verified merge the controller deletes the PR's head branch on GitHub only, once, through `DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`, never for a fork's head, the base or the default branch, nor once the branch moved past the merged HEAD | `merge.delete_branch: false` (the default) still deletes nothing; `gh auth git-credential`, the credential helper of the controller's own fetch and push, still runs in the private git directory the controller made for that transfer ([how](agent-guides/github-safety.md#controller-owned-effects), [the deletion](agent-guides/github-safety.md#deleting-the-merged-head-branch)) |
 | [#284](https://github.com/iceboundrock/AutoForge/issues/284) | High | *Fixed on `main`.* A recognised token directly after an ANSI escape sequence (`ESC[0m`, which OpenCode's saved `stderr.log` carries), a backslash escape written out (`\n`, `\t`, `\uXXXX`) or any other character that cannot be part of it is redacted in the run logs, state and the CLI's output, and refused in published text | Redaction is still a baseline ([why](#redaction-is-a-baseline)): treat run logs as sensitive and never commit or share them ([how](#keep-autoforges-files-out-of-git)) |
 | [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | Other credential shapes are not recognised: AWS access keys, private-key blocks, `gsk_`, `xai-`, `npm_`, `glpat-`, `hf_`, and a key of no known shape under a prefixed name such as `GEMINI_API_KEY` | As for #282 |
 | [#286](https://github.com/iceboundrock/AutoForge/issues/286) | Medium | One allow-list serves every launch, and it refuses only the names `gh` and git read a credential from ([why](#other-limits)) | List no variable you would not give to the agents and to the code under review alike |
@@ -595,9 +596,9 @@ sandbox directories) are under `.git/autoforge/`, which git never tracks.
    check on the default branch (`doctor` checks that it is required; a
    GitHub Free private repository cannot require one, see
    [above](#github-free-and-private-repositories)),
-   and keep `merge.delete_branch: false` (the default): with it, `gh pr
-   merge --delete-branch` deletes the local branch of that name as well,
-   and runs git for that in the checkout you started AutoForge from.
+   and decide whether the merged head branch should go: with
+   `merge.delete_branch: true` the controller deletes it on GitHub after
+   the merge, and never a local branch.
 6. **Keep repository secrets away from branch CI** and make the default
    `GITHUB_TOKEN` read-only ([why](#pushed-code-runs-in-your-ci)).
 7. **Keep AutoForge's files out of git** ([above](#keep-autoforges-files-out-of-git)).

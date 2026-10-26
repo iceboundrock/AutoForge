@@ -159,6 +159,23 @@ High-priority coverage includes:
   `status --json` show it, its applicability and the not-a-permission
   note; no prompt, read context or published payload carries it; Claude
   Code, OpenCode and Pi issue the same certificate
+- `merge.delete_branch` and `gh`'s working directory (#283,
+  `tests/test_merge_branch.py`, `tests/test_github.py`): every `gh` the
+  client and `doctor` start runs in a fresh empty directory of its own with
+  `GIT_DIR` naming it, removed afterwards, and a `gh` that runs git there,
+  as gh 2.103.2's `pr merge` does, finds no repository, with `GIT_DIR`
+  inherited or a temporary directory inside a checkout; the merge argv
+  never carries `--delete-branch`; the ref read and the `DELETE` name
+  exactly `refs/heads/<branch>` of the repository, the `DELETE` sent once
+  and refused for the default branch before anything starts; in `MERGE`
+  the deletion follows the verified merge, is skipped for a fork's head,
+  the base, the default branch, a branch the run did not bind, one moved
+  past the merged HEAD or gone, and a read that failed, never for a merge
+  left open, refused for a moved HEAD or made at another HEAD; its outcome
+  is read back and never blocks; a crash after the merge, after the
+  checkpoint or after the `DELETE` repeats neither; and with the head
+  branch checked out in the operator's checkout, `MERGE` starts no process
+  there, with `merge.delete_branch` on and off
 - the merge gate's certificate check (#175, `tests/test_merge_certificate.py`,
   with the existing merge tests in `tests/test_engine.py` certifying their
   hand-built clean reviews): in `READY_FOR_MERGE` and in `MERGE`, an

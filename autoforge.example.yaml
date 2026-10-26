@@ -198,7 +198,12 @@ merge:
   # armed, no merge queue on the base branch.
   # The same verification runs in READY_FOR_MERGE before MERGE is entered.
   method: squash          # squash | merge | rebase
-  delete_branch: false    # add --delete-branch
+  # After a verified merge, delete the PR's head branch on GitHub (one
+  # DELETE of refs/heads/<branch> in this repository; never a fork's branch,
+  # the base or the default branch, nor one pushed to after the merge). No
+  # local branch is deleted or checked out: `gh pr merge --delete-branch`,
+  # which does both, is never used.
+  delete_branch: false
   # Inconclusive GitHub data (mergeable UNKNOWN, checks still running, the
   # post-merge re-read failed) is re-checked on `resume --allow-merge` (or
   # `step --allow-merge`), one attempt per invocation, at most this many
@@ -428,6 +433,8 @@ profiles:
 
 github:
   # `gh` binary name / path. All GitHub reads/verification go through `gh`.
+  # Every `gh` runs in an empty directory of its own, never in the checkout,
+  # so a relative path is resolved against the directory AutoForge starts in.
   command: gh
   timeout_seconds: 120
 

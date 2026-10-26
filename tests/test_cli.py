@@ -43,6 +43,7 @@ from tests.conftest import (
     fixed,
     fixer,
     git_repo,
+    github_origin,
     implement,
     is_shell_probe,
     make_engine,
@@ -54,8 +55,11 @@ from tests.conftest import (
 
 @pytest.fixture(autouse=True)
 def _tmp_path_is_a_repository(tmp_path):
-    """The CLI locks the repository containing its cwd; tests chdir into tmp_path."""
-    git_repo(tmp_path)
+    """The CLI locks the repository containing its cwd; tests chdir into tmp_path.
+
+    Its ``origin`` names the run's repository, which INITIALIZING reads (#283).
+    """
+    github_origin(git_repo(tmp_path))
 
 
 @pytest.fixture
@@ -980,7 +984,7 @@ def test_resume_with_gate_open_merges_via_controller_to_done(tmp_path, capsys, m
     out = capsys.readouterr().out
     implemented = fakes["origin"].head("autoforge/2")
     assert implemented is not None
-    assert gh.merges == [(PR, "squash", implemented, False)]
+    assert gh.merges == [(PR, "squash", implemented)]
     assert [c.phase for c in fakes["provider"].calls] == [
         "ANALYZE_EXECUTE",
         "REVIEW",
