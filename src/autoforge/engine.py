@@ -4196,9 +4196,9 @@ class ControllerEngine:
                 "INITIALIZING -> ANALYZE_EXECUTE (verify repository + issue; no agent)",
                 "ANALYZE_EXECUTE",
                 notes=[
-                    "would read this checkout's 'origin' with the controller's own local git "
-                    "(never via gh) and verify that GitHub's current name for that repository "
-                    "is the run's repository (a renamed repository still matches)",
+                    "would read this checkout's 'origin' with the controller's hardened local "
+                    "git request (never via gh) and verify that GitHub's current name for that "
+                    "repository is the run's repository (a renamed repository still matches)",
                     "would then verify the issue: in the run's repository and not the EPIC, "
                     "and via gh that it exists and is OPEN",
                     "would check for an existing open PR for the issue (recovery)",

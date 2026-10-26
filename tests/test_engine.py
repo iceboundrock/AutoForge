@@ -277,7 +277,8 @@ def test_initializing_dry_run_describes_the_origin_check(tmp_state_dir, fake_git
     out = eng.step(dry_run=True)
     assert fake_github.calls == [] and eng.state.phase == Phase.INITIALIZING
     notes = "\n".join(out.plan.notes)
-    assert "this checkout's 'origin'" in notes and "never via gh" in notes
+    assert "this checkout's 'origin'" in notes and "hardened local git request" in notes
+    assert "never via gh" in notes
     assert "GitHub's current name" in notes and "renamed repository" in notes
     assert "cwd" not in notes and "cwd" not in out.plan.routing
 
