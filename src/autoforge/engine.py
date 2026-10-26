@@ -4199,8 +4199,8 @@ class ControllerEngine:
                     "would read this checkout's 'origin' with the controller's own local git "
                     "(never via gh) and verify that GitHub's current name for that repository "
                     "is the run's repository (a renamed repository still matches)",
-                    "would verify via gh: the issue is in the run's repository, is not the "
-                    "EPIC, exists and is OPEN",
+                    "would then verify the issue: in the run's repository and not the EPIC, "
+                    "and via gh that it exists and is OPEN",
                     "would check for an existing open PR for the issue (recovery)",
                 ],
             )
