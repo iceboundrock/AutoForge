@@ -270,6 +270,18 @@ def test_initializing_names_the_origin_when_git_cannot_be_run(tmp_state_dir, fak
     assert not any(call[0] == "get_repo" for call in fake_github.calls)
 
 
+def test_initializing_dry_run_describes_the_origin_check(tmp_state_dir, fake_github):
+    """The plan names the check `_initialize` makes (#283): the checkout's `origin`, read
+    by the controller's own git, compared by GitHub's current name; not a `gh` in the cwd."""
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    out = eng.step(dry_run=True)
+    assert fake_github.calls == [] and eng.state.phase == Phase.INITIALIZING
+    notes = "\n".join(out.plan.notes)
+    assert "this checkout's 'origin'" in notes and "never via gh" in notes
+    assert "GitHub's current name" in notes and "renamed repository" in notes
+    assert "cwd" not in notes and "cwd" not in out.plan.routing
+
+
 def test_initializing_rejects_missing_issue_as_verification_error(tmp_state_dir, fake_github):
     del fake_github.issues[ISSUE]
     eng = make_engine(tmp_state_dir, [], github=fake_github)

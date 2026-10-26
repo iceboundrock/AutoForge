@@ -4193,10 +4193,14 @@ class ControllerEngine:
         if s.phase == Phase.INITIALIZING:
             return self._deterministic_plan(
                 s,
-                "INITIALIZING -> ANALYZE_EXECUTE (verify repository + issue via gh; no agent)",
+                "INITIALIZING -> ANALYZE_EXECUTE (verify repository + issue; no agent)",
                 "ANALYZE_EXECUTE",
                 notes=[
-                    "would verify: cwd repo == issue repo, issue exists, issue is OPEN",
+                    "would read this checkout's 'origin' with the controller's own local git "
+                    "(never via gh) and verify that GitHub's current name for that repository "
+                    "is the run's repository (a renamed repository still matches)",
+                    "would verify via gh: the issue is in the run's repository, is not the "
+                    "EPIC, exists and is OPEN",
                     "would check for an existing open PR for the issue (recovery)",
                 ],
             )
