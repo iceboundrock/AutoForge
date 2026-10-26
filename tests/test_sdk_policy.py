@@ -945,7 +945,9 @@ def _claude_probe(tmp_path: Path, flags: list[str], policy) -> tuple[dict, list[
     (roots.config / "CLAUDE.md").write_text(f"{_SENTINEL} user CLAUDE.md\n", encoding="utf-8")
     _StandIn.bodies = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _StandIn)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
     thread.start()
     try:
         env = {

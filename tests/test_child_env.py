@@ -18,6 +18,7 @@ import netrc
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -653,7 +654,9 @@ class _HeaderRecorder(http.server.BaseHTTPRequestHandler):
 def loopback():
     server = http.server.HTTPServer(("127.0.0.1", 0), _HeaderRecorder)
     server.seen = []  # type: ignore[attr-defined]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
     thread.start()
     yield server
     server.shutdown()
@@ -727,6 +730,35 @@ def test_a_launchs_plain_wget_sends_no_header_of_the_operators_configuration(
 
 
 # -- the preflight --------------------------------------------------------------
+
+# The directories tests/conftest.py's autouse fixtures gave each test, in this process.
+_ISOLATION_SEEN: list[tuple[Path, ...]] = []
+
+
+@pytest.mark.parametrize("turn", ["first", "second"])
+def test_every_test_gets_its_own_empty_private_directories_for_the_preflight(
+    tmp_path_factory, turn
+):
+    """The home, OpenCode data directory and Claude Code configuration directory
+    the autouse fixtures hand the preflight are new, empty and 0700 for every
+    test, under pytest's basetemp (#341): what one test writes there, as
+    tests/test_local.py writes a ``~/.profile``, never reaches another. The
+    second turn checks against the first where both ran in one process."""
+    import autoforge.providers as providers_module
+
+    home = Path(str(child_env.operator_home()))
+    data_dir = providers_module.opencode_data_dir({})
+    config_dir = providers_module.claude_config_files({})[0].parent
+    ours = (home, data_dir, config_dir)
+    assert len(set(ours)) == 3
+    for directory in ours:
+        assert directory.is_relative_to(tmp_path_factory.getbasetemp())
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert list(directory.iterdir()) == []
+    assert not {d for seen in _ISOLATION_SEEN for d in seen} & set(ours)
+    _ISOLATION_SEEN.append(ours)
+    for directory in ours:
+        (directory / "written").write_text(turn)
 
 
 def _problems(repo: Path) -> list[str]:

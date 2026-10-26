@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -1859,8 +1860,21 @@ def _no_network_exact_read(monkeypatch):
     monkeypatch.setattr(github_module, "https_get", offline)
 
 
+@pytest.fixture(scope="session")
+def _isolation_root(tmp_path_factory) -> Path:
+    """Where the three fixtures below make each test's empty directories.
+
+    ``tmp_path_factory.mktemp`` lists the whole basetemp to number every
+    directory it makes, so three of them for every test cost time that grows
+    with the number of tests already run (#341). ``tempfile.mkdtemp`` names
+    one under this root at random instead of listing it; each directory is
+    still new, empty, 0700 and the test's own.
+    """
+    return tmp_path_factory.mktemp("isolation")
+
+
 @pytest.fixture(autouse=True)
-def _no_operator_netrc(monkeypatch, tmp_path_factory):
+def _no_operator_netrc(monkeypatch, _isolation_root):
     """The launch preflight (#165) reads an empty home, not the developer's.
 
     ``~/.netrc`` with a GitHub entry, or a ``~/.profile`` that exports a
@@ -1870,7 +1884,7 @@ def _no_operator_netrc(monkeypatch, tmp_path_factory):
     """
     import autoforge.child_env as child_env_module
 
-    home = tmp_path_factory.mktemp("operator-home")
+    home = Path(tempfile.mkdtemp(prefix="home-", dir=_isolation_root))
     monkeypatch.setattr(child_env_module, "operator_home", lambda: str(home))
 
 
@@ -1936,7 +1950,7 @@ def _one_shell_probe_per_answer(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_operator_opencode_data(monkeypatch, tmp_path_factory):
+def _no_operator_opencode_data(monkeypatch, _isolation_root):
     """An OpenCode launch's organization check (#165) reads an empty data
     directory, not the developer's.
 
@@ -1947,13 +1961,13 @@ def _no_operator_opencode_data(monkeypatch, tmp_path_factory):
     """
     import autoforge.providers as providers_module
 
-    data_dir = tmp_path_factory.mktemp("operator-opencode-data")
+    data_dir = Path(tempfile.mkdtemp(prefix="opencode-", dir=_isolation_root))
     monkeypatch.setattr(providers_module, "opencode_data_dir", lambda env: data_dir)
     monkeypatch.delenv("OPENCODE_DB", raising=False)
 
 
 @pytest.fixture(autouse=True)
-def _no_operator_claude_config(monkeypatch, tmp_path_factory):
+def _no_operator_claude_config(monkeypatch, _isolation_root):
     """A Claude Code launch's configuration check (#165) reads files in an
     empty directory, not the developer's settings and global configuration.
 
@@ -1964,7 +1978,7 @@ def _no_operator_claude_config(monkeypatch, tmp_path_factory):
     """
     import autoforge.providers as providers_module
 
-    config_dir = tmp_path_factory.mktemp("operator-claude-config")
+    config_dir = Path(tempfile.mkdtemp(prefix="claude-", dir=_isolation_root))
     files = [config_dir / "settings.json", config_dir / ".claude.json"]
     monkeypatch.setattr(providers_module, "claude_config_files", lambda env: files)
 

@@ -3890,7 +3890,9 @@ def loopback(monkeypatch):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Loopback)
     server.daemon_threads = True
     server.seen = []
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
     thread.start()
     yield server
     server.shutdown()
