@@ -48,6 +48,7 @@ description of how AutoForge behaves.
 | [Testing](agent-guides/testing.md) | the coverage contract and high-priority test areas |
 | [Test scope](../tests/AGENTS.md) | fixtures and fakes, and what a test may never do |
 | [AGENTS.md](../AGENTS.md) | the repository contract: precedence, safety invariants, routing rules for which guide to read before a change |
+| [Non-code artifacts](non-code-rules.md) | writing and publishing issues, PR descriptions, specs, plans and reviews; language and translation rules |
 
 ## Architecture decisions
 

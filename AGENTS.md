@@ -209,6 +209,7 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        SDK providers: isolated helpers, interaction contract,
                                        parallel EPIC scheduler: authority, run identity, claims, locks)
 docs/README.md                         human-oriented documentation index, by intent
+docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
 docs/pi.md                             operator guide: Pi on a DeepSeek API key or a ChatGPT
@@ -325,14 +326,12 @@ validation, safe failure, and recoverability over autonomous convenience.
 
 ## Non-code artifacts
 
-Anything a task produces that is not code (design docs, specs, plans, research notes, assessments) must end up on GitHub. A copy on disk alone does not count.
+Issues, PR descriptions, specs, plans, reviews, and every other non-code artifact give readers the context and judgment the diff cannot, not a narrated diff or filler, and are published in full on GitHub.
 
-- Write non-code artifacts in English.
-- Post the artifact as a comment on the relevant issue. If the work has no issue yet, create one first; if the artifact is about changes already under review, post it to the PR instead.
-- Post the full content, not a summary or a file path. Several child repos keep planning notes in gitignored local directories (for example `__ref__/plan/` in `ltbase.api`, see #497); a local working copy is fine, but it is invisible to everyone else and does not survive the branch.
-- Do not force-add gitignored planning files to make them shareable. The issue comment is the sharing mechanism.
-- Say in the comment which artifact it is and where the working copy lives, so a later reader knows whether they are looking at a plan, a spec, or a review.
-- Anything that must become a durable repository convention still belongs in that repo's `docs/` (an ADR, runbook, or reference page). The issue comment records the thinking; `docs/` records the decision.
+Before writing, editing or publishing any non-code artifact, read
+`docs/non-code-rules.md` for the full writing and publishing rules.
+
+@docs/non-code-rules.md
 
 ## PR rules
 
