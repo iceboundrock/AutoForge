@@ -2,14 +2,15 @@
 
 Baseline protection only — no detector claims to catch every secret shape.
 Covers common env-var assignments, ``Authorization`` headers, well-known
-token shapes (GitHub PATs, OpenAI / Anthropic keys, JWTs), OAuth credential
-fields (``refresh`` / ``access`` / ``id_token`` / ``chatgpt-account-id``) and
-credentials embedded in URLs before stdout / stderr / commands are persisted
-by the run logger. A shape is recognised where it starts a token: at the start
-of the text, after a character that cannot be part of it, or directly after
-an escape sequence (``ESC[0m``, ``\\n``, ``\\u00e9``; see ``_ESCAPE``). An
-assignment's quoted value is recognised behind an escaped quote too
-(``GH_TOKEN=\\"...\\"``, as JSON writes it; see ``_QUOTE``).
+token shapes (GitHub PATs, OpenAI / Anthropic keys, Google API keys, JWTs),
+OAuth credential fields (``refresh`` / ``access`` / ``id_token`` /
+``chatgpt-account-id``) and credentials embedded in URLs before stdout /
+stderr / commands are persisted by the run logger. A shape is recognised
+where it starts a token: at the start of the text, after a character that
+cannot be part of it, or directly after an escape sequence (``ESC[0m``,
+``\\n``, ``\\u00e9``; see ``_ESCAPE``). An assignment's quoted value is
+recognised behind an escaped quote too (``GH_TOKEN=\\"...\\"``, as JSON
+writes it; see ``_QUOTE``).
 
 Every pattern has a stable class name. :func:`credential_classes` reports
 which classes a text carries without saying where, so a refusal of agent
@@ -179,6 +180,22 @@ _PATTERNS: tuple[_Pattern, ...] = (
         "***REDACTED***",
         token_chars="A-Za-z0-9_-",
     ),
+    # Google API keys (#282): ``AIza`` and 35 base64url characters, 39 in all,
+    # the key OpenCode launches inherit under ``GEMINI_*`` and ``GOOGLE_*``
+    # names, which no assignment pattern knows (#285); the shape recognises
+    # the value under any name, in a URL's ``?key=`` and alone. Case-sensitive
+    # and the whole token: ``-`` is a token character on both sides, as
+    # for a JWT, and a run of the key's characters that goes on past the 39
+    # is no key, so a near-miss of either length is left. The body is fixed,
+    # so each candidate scans at most 40 characters and the pass is linear.
+    # Placed before the GitHub and ``sk-`` shapes so that one starting after a
+    # ``-`` inside a key cannot replace a slice of it and leave the rest.
+    _token(
+        "google-api-key",
+        r"AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])",
+        "***REDACTED***",
+        token_chars="A-Za-z0-9_-",
+    ),
     # GitHub fine-grained PATs
     _token("github-fine-grained-pat", r"github_pat_[A-Za-z0-9_]{8,}", "***REDACTED***"),
     # GitHub classic PATs and app / OAuth tokens
@@ -189,7 +206,8 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token("anthropic-key", r"sk-ant-[A-Za-z0-9_-]{8,}", "***REDACTED***"),
     # Generic long bearer-ish assignments: token/password/secret = <value>.
     # ``_`` is a token character before the name, so a prefixed one
-    # (``GEMINI_API_KEY=``) is not recognised here (#285).
+    # (``GEMINI_API_KEY=``) is not recognised here (#285); a Google API key
+    # under it is, by its shape (``google-api-key``).
     _token(
         "secret-assignment",
         rf"(token|passwd|password|secret|api[_-]?key)(\s*[:=]\s*)({_QUOTE})"

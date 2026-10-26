@@ -1408,7 +1408,8 @@ records ([Local mode](local-mode.md#validation-commands)).
 Every agent invocation is logged under `<state dir>/logs/<run-id>/`. Logs
 and CLI output pass through baseline secret redaction (`GITHUB_TOKEN`,
 `GH_TOKEN`, `*_API_KEY`, `Authorization: Bearer` / `Basic`, `ghp_*`,
-`github_pat_*`, `sk-*`, JWTs, the `user:password@` part of a URL, …),
+`github_pat_*`, `sk-*`, Google API keys `AIza...`, JWTs, the
+`user:password@` part of a URL, …),
 state-derived output included: `status` and `status --json` redact what they
 print (a `block_reason` echoes agent text; a journal can be hand-edited)
 without rewriting `state.json`. No environment dump is ever written.

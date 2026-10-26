@@ -11,6 +11,24 @@ production use, and not the Public Alpha (#255). The heading says
 `unreleased` until the release-prep commit the release's tag names gives it
 its date ([Releasing](docs/releasing.md#the-changelog)).
 
+### Google API keys are redacted and refused (#282)
+
+- A Google API key (`AIza` and 35 characters of `[0-9A-Za-z_-]`) is
+  recognised by its shape, under any name or none: the `GEMINI_*` and
+  `GOOGLE_*` variables an OpenCode launch inherits, a URL's `?key=`, JSON,
+  and directly after an escape sequence. It is redacted in every run log
+  (`stdout.log` and `stderr.log` included), in state and in the CLI's
+  output, and published agent text or a commit message carrying one is
+  refused under the new class `google-api-key`. Before, an agent that
+  printed its environment saved the key in the clear, and agent text
+  carrying one could be published under your identity
+  ([Secrets and logging](docs/agent-guides/secrets-and-logging.md#google-api-keys-282)).
+- Only the whole token is a key: a run of the key's characters longer or
+  shorter than 39, a wrong prefix (the shape is case-sensitive) and a shape
+  inside a longer identifier are left. OpenCode launches still receive
+  `GEMINI_*` and `GOOGLE_*`, and a value of no known shape under such a
+  name is still not recognised (#285).
+
 ### A step's result is redacted before it is printed as JSON (#281)
 
 - The `result=` line `run`, `step`, `resume` and a scheduler worker print

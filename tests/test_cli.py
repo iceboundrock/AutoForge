@@ -27,6 +27,8 @@ from tests.conftest import (
     EPIC,
     FOLLOW_UP_TEXT,
     FOLLOW_UP_TITLE,
+    GOOGLE_API_KEY,
+    GOOGLE_KEY_BODY,
     ISSUE,
     PR,
     SHA_A,
@@ -603,6 +605,49 @@ def test_step_outcome_redacts_the_result_before_serializing_it(capsys):
     assert printed["refresh"] == "***REDACTED***"
     assert printed["key\t***REDACTED***"] == "a key is redacted too"
     assert result == _f2_result()  # the outcome's own result is left as it was
+
+
+def test_cli_output_redacts_a_google_api_key(tmp_path, capsys, monkeypatch, fakes):
+    """#282: an ``AIza`` key in an agent's result, in the step outcome's
+    message and in a block reason that state holds is printed redacted, by
+    the step-outcome lines and by ``status`` and ``status --json``."""
+    quoted = f"GEMINI_API_KEY={GOOGLE_API_KEY}"
+    result = {
+        "phase": "ANALYZE_EXECUTE",
+        "status": "blocked",
+        "message": f"{quoted} is refused",
+        "tests": [f"curl 'https://example.test/v1?key={GOOGLE_API_KEY}': 403"],
+    }
+    outcome = StepOutcome(
+        "run-282", "ANALYZE_EXECUTE", "BLOCKED", False, result=result, message=quoted
+    )
+    cli.print_step_outcome(outcome)
+    out = capsys.readouterr().out
+    assert GOOGLE_KEY_BODY not in out
+    assert "[run-282] ANALYZE_EXECUTE -> BLOCKED: GEMINI_API_KEY=***REDACTED***\n" in out
+    (line,) = [text for text in out.splitlines() if text.startswith("  result=")]
+    printed = json.loads(line.removeprefix("  result="))
+    assert printed["message"] == "GEMINI_API_KEY=***REDACTED*** is refused"
+    assert printed["tests"] == ["curl 'https://example.test/v1?key=***REDACTED***': 403"]
+
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(argv) == 0
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "BLOCKED"
+    data["block_reason"] = f"agent said: {quoted}"
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    assert GOOGLE_KEY_BODY not in out
+    assert "Reason:     agent said: GEMINI_API_KEY=***REDACTED***" in out
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed_text = capsys.readouterr().out
+    assert GOOGLE_KEY_BODY not in printed_text
+    assert json.loads(printed_text)["block_reason"] == "agent said: GEMINI_API_KEY=***REDACTED***"
 
 
 def test_status_and_dry_run_redact_the_replan_escalation_before_serializing_it(

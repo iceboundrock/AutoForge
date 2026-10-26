@@ -32,9 +32,9 @@ Authorization: Bearer ... / Token ... / Basic ...
 ```
 
 and the well-known token shapes on their own (`ghp_*` and the other classic
-GitHub prefixes, `github_pat_*`, `sk-*`, `sk-ant-*`, three-segment `eyJ...`
-JWTs) and the whole userinfo of a URL (`https://x-access-token:...@github.com/...`),
-each where it starts a token
+GitHub prefixes, `github_pat_*`, `sk-*`, `sk-ant-*`, Google API keys
+`AIza...`, three-segment `eyJ...` JWTs) and the whole userinfo of a URL
+(`https://x-access-token:...@github.com/...`), each where it starts a token
 ([below](#where-a-recognised-credential-starts-284)).
 
 Redaction is defense in depth; do not claim it detects every possible secret.
@@ -62,9 +62,10 @@ shape, which a quote starts, needs none). A credential starts:
 
 - at the start of the text;
 - after any character that cannot be part of it: anything but an ASCII
-  letter, a digit or `_`. A JWT excludes `-` as well, which base64url
-  admits; the OAuth assignment names (`refresh_token=`, `id_token:`) do not
-  exclude `_`, so a prefixed `oauth_refresh_token=` is caught;
+  letter, a digit or `_`. A JWT and a Google API key exclude `-` as well,
+  which base64url admits; the OAuth assignment names (`refresh_token=`,
+  `id_token:`) do not exclude `_`, so a prefixed `oauth_refresh_token=` is
+  caught;
 - directly after an escape sequence: an ANSI / VT sequence (a CSI, after
   `ESC[` or the C1 byte, or a two-character escape such as `ESC(B`), its
   ESC also as JSON, C, a shell and caret notation write it (`\u001b[0m`,
@@ -89,15 +90,47 @@ What changed against `\b`, beyond the escapes, each pinned in
 Unchanged: a shape right after an ASCII letter, a digit or `_` is still no
 token (`xghp_...`, `MY_GITHUB_TOKEN=`), nor is one after an escape that
 more of an identifier follows (`ESC[0mxghp_...`). A known name behind a
-prefix (`GEMINI_API_KEY=`) is #285's to recognise and a new shape such as
-Google's `AIza...` #282's; a new pattern is built with `_token`, never on
-`\b`.
+prefix (`GEMINI_API_KEY=`) is #285's to recognise; a new pattern is built
+with `_token`, never on `\b`, as the Google API key class
+([below](#google-api-keys-282)) is.
 
 A pattern that starts a token runs as two passes, the second, which takes
 the escape in and puts it back, only at an ESC, a backslash, a caret or the
 C1 byte. Both are linear. `MAX_GROWTH_FACTOR` is unchanged: the escape is
 no part of the replaced run, and at two characters or more it separates
 repeated matches no tighter than a one-character separator does.
+
+## Google API keys (#282)
+
+OpenCode launches inherit the `GEMINI_*` and `GOOGLE_*` variables
+(`OpenCodeProvider.environment_names`), and no pattern knew a Google API
+key: the prefixed names are no `secret-assignment` (`_` before `API_KEY`
+is a token character, #285), and the key matched no token shape. An agent
+that printed its environment, or an error that quoted the key, put it in
+`stdout.log` or `stderr.log` in the clear, and agent text carrying one
+passed the published-content check.
+
+The `google-api-key` class recognises the key by its shape, under any name
+or none: `AIza` and 35 characters of `[0-9A-Za-z_-]`, 39 in all,
+case-sensitive. The whole token must be the key: `-` is a token character
+on both sides, as for a JWT, and a run of the key's alphabet that goes on
+past the 39 is no key, so a near-miss of either length, a wrong prefix and
+a shape inside a longer identifier are left (each pinned in
+`tests/test_redaction.py`). It is built with `_token`, so it is recognised
+after an escape sequence too (`ESC[0mAIza...`, `\nAIza...`). It runs after
+the JWT pattern, which takes a key that is one of its segments with it, and
+before the GitHub and `sk-` shapes: `-` is no token character for those, so
+one starting after a `-` inside a key would otherwise replace a slice of it
+and leave the key's first characters in the clear.
+
+Like every class it reaches each redacting sink (the run log, its
+`stdout.log` and `stderr.log`, state and the CLI's output) and
+`credential_classes`, so the published-content, payload and commit-message
+checks refuse a text carrying one by name, never rewriting it. The body is
+fixed, so the pattern stays linear, and a key shrinks under redaction (39
+characters to the 14 of the marker), so `MAX_GROWTH_FACTOR` is unchanged.
+Not recognised still: a value of no known shape under a prefixed name
+(`GEMINI_API_KEY=<anything else>`) and the other shapes #285 lists.
 
 ## Escaped text: redact the structure first (#281)
 

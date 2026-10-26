@@ -13,6 +13,7 @@ from autoforge.redaction import (
     redact,
     redact_obj,
 )
+from tests.conftest import GOOGLE_API_KEY, GOOGLE_KEY_BODY
 
 
 def test_github_token_assignment():
@@ -125,6 +126,153 @@ def test_jwt_header_shorter_than_a_json_object_is_not_a_token():
     that happens to start ``eyJ``, not a JWT, whatever follows its dots."""
     text = "eyJhIjow.e30.c2ln"
     assert redact(text) == text
+
+
+# The dummy key of ``tests/conftest.py`` (#282) in the shapes a log shows it.
+_GOOGLE_KEY_TEXTS = [
+    (GOOGLE_API_KEY, "***REDACTED***"),
+    (f"GEMINI_API_KEY={GOOGLE_API_KEY}", "GEMINI_API_KEY=***REDACTED***"),
+    (f"GOOGLE_API_KEY={GOOGLE_API_KEY}", "GOOGLE_API_KEY=***REDACTED***"),
+    (f'export GOOGLE_API_KEY="{GOOGLE_API_KEY}"', 'export GOOGLE_API_KEY="***REDACTED***"'),
+    (f"GEMINI_API_KEY: '{GOOGLE_API_KEY}'", "GEMINI_API_KEY: '***REDACTED***'"),
+    (json.dumps({"apiKey": GOOGLE_API_KEY}), '{"apiKey": "***REDACTED***"}'),
+    (
+        json.dumps({"env": {"GEMINI_API_KEY": GOOGLE_API_KEY}}),
+        '{"env": {"GEMINI_API_KEY": "***REDACTED***"}}',
+    ),
+    (
+        json.dumps(json.dumps({"apiKey": GOOGLE_API_KEY})),
+        json.dumps(json.dumps({"apiKey": "***REDACTED***"})),
+    ),
+    (
+        f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}",
+        "https://generativelanguage.googleapis.com/v1beta/models?key=***REDACTED***",
+    ),
+    (
+        f"GET /maps/api/geocode/json?address=x&key={GOOGLE_API_KEY}&sensor=false HTTP/1.1",
+        "GET /maps/api/geocode/json?address=x&key=***REDACTED***&sensor=false HTTP/1.1",
+    ),
+    (f"x-goog-api-key: {GOOGLE_API_KEY}", "x-goog-api-key: ***REDACTED***"),
+    (f"{GOOGLE_API_KEY}\nsecond line", "***REDACTED***\nsecond line"),
+    (f"first line\n{GOOGLE_API_KEY}", "first line\n***REDACTED***"),
+    (f"first\r\n{GOOGLE_API_KEY}\r\nlast", "first\r\n***REDACTED***\r\nlast"),
+    # What ``env`` prints: one assignment a line, each key at a line's end.
+    (
+        f"HOME=/home/u\nGEMINI_API_KEY={GOOGLE_API_KEY}\nGOOGLE_API_KEY={GOOGLE_API_KEY}\n",
+        "HOME=/home/u\nGEMINI_API_KEY=***REDACTED***\nGOOGLE_API_KEY=***REDACTED***\n",
+    ),
+]
+_GOOGLE_KEY_TEXT_IDS = [
+    "alone",
+    "gemini-assignment",
+    "google-assignment",
+    "quoted-export",
+    "single-quoted",
+    "json",
+    "nested-json",
+    "json-in-json",
+    "url-query-last",
+    "url-query-middle",
+    "header",
+    "line-start",
+    "line-end",
+    "crlf",
+    "env-dump",
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _GOOGLE_KEY_TEXTS, ids=_GOOGLE_KEY_TEXT_IDS)
+def test_a_google_api_key_is_redacted_wherever_it_stands(text, expected):
+    """#282: OpenCode launches inherit ``GEMINI_*`` and ``GOOGLE_*``, and an
+    agent that printed its environment put the key in its log in the clear:
+    no pattern knew the shape, and a prefixed name is no ``secret-assignment``
+    (#285). The shape is recognised under any name and none, in JSON, in a
+    URL's query string and at either end of a line, and reported by class."""
+    assert redact(text) == expected
+    assert credential_classes(text) == ("google-api-key",)
+    assert redact(expected) == expected
+
+
+# Not a Google API key: the wrong length either way (a run of the key's
+# alphabet that goes on is no key), the wrong prefix (the shape is
+# case-sensitive), a character outside the alphabet, a shape inside a longer
+# identifier (``-`` included, as for a JWT), and a short value behind a
+# prefixed name, which is #285's.
+_GOOGLE_KEY_NEAR_MISSES = [
+    GOOGLE_API_KEY[:-1],
+    GOOGLE_API_KEY + "0",
+    GOOGLE_API_KEY + "-",
+    GOOGLE_API_KEY + "_",
+    "AIzb" + GOOGLE_KEY_BODY,
+    "AIZA" + GOOGLE_KEY_BODY,
+    "aiza" + GOOGLE_KEY_BODY,
+    "AIz" + GOOGLE_KEY_BODY + "0",
+    "AIza" + GOOGLE_KEY_BODY[:10] + "+" + GOOGLE_KEY_BODY[11:],
+    "x" + GOOGLE_API_KEY,
+    "_" + GOOGLE_API_KEY,
+    "1" + GOOGLE_API_KEY,
+    "-" + GOOGLE_API_KEY,
+    "\x1b[0mx" + GOOGLE_API_KEY,
+    f"GEMINI_API_KEY={GOOGLE_API_KEY[:-1]}",
+]
+
+
+@pytest.mark.parametrize("text", _GOOGLE_KEY_NEAR_MISSES)
+def test_a_near_miss_of_a_google_api_key_is_left(text):
+    assert redact(text) == text
+    assert credential_classes(text) == ()
+
+
+def test_a_google_api_key_is_replaced_whole_before_a_shorter_shape_takes_a_slice():
+    """``-`` is in the key's alphabet and no token character for the GitHub
+    and ``sk-`` shapes, so a ``ghp_``, ``github_pat_`` or ``sk-`` after one
+    inside a key would start a match there and leave the key's head in the
+    clear: the key is replaced first. A JWT, which comes before it, takes a
+    key that is one of its segments with it, and a ``sk-`` key whose tail
+    reads like a Google key stays the ``sk-`` key it is."""
+    for body in ("ab-ghp_" + "0" * 28, "ab-github_pat_" + "0" * 21, "ab-sk-" + "0" * 29):
+        key = "AIza" + body
+        assert len(key) == 39
+        assert redact(f"key={key} end") == "key=***REDACTED*** end"
+        assert credential_classes(key) == ("google-api-key",)
+    jwt = f"eyJhbGciOiJIUzI1NiJ9.{GOOGLE_API_KEY}.c2ln"
+    assert redact(jwt) == "***REDACTED***" and credential_classes(jwt) == ("jwt",)
+    sk = f"sk-proj-{GOOGLE_API_KEY}"
+    assert redact(sk) == "***REDACTED***" and credential_classes(sk) == ("openai-key",)
+
+
+def test_redact_obj_redacts_a_google_api_key_at_any_depth():
+    """State and the CLI's documents cross ``redact_obj``: a key under a
+    ``GEMINI_*`` name, in a list and as a mapping key is redacted too."""
+    value = {
+        "GEMINI_API_KEY": GOOGLE_API_KEY,
+        "env": [f"GOOGLE_API_KEY={GOOGLE_API_KEY}", 7],
+        f"key {GOOGLE_API_KEY}": "a key is redacted too",
+    }
+    assert redact_obj(value) == {
+        "GEMINI_API_KEY": "***REDACTED***",
+        "env": ["GOOGLE_API_KEY=***REDACTED***", 7],
+        "key ***REDACTED***": "a key is redacted too",
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "AIza" * 250_000,
+        ("AIza" + "0" * 34 + " ") * 25_000,
+        "-AIza" * 200_000,
+        ("\\nAIza" + "0" * 36) * 20_000,
+        "\x1b[0m" + "AIza" + "0" * 1_000_000,
+    ],
+    ids=["prefixes", "one-short", "dashed-prefixes", "after-escapes-one-long", "long-run"],
+)
+def test_the_google_api_key_pattern_stays_linear(text):
+    """The body is fixed: each candidate scans at most 40 characters, so a
+    megabyte of near-misses is scanned well inside the budget."""
+    started = time.perf_counter()
+    assert credential_classes(text) == ()
+    assert time.perf_counter() - started < 3.0
 
 
 _URL_CREDENTIAL_CASES = [
@@ -399,6 +547,7 @@ _CLASS_SAMPLES = [
     ),
     ("url-userinfo", "https://u:p@h/r", "https://***REDACTED***@h/r", "url-userinfo"),
     ("jwt", _JWT, "***REDACTED***", "jwt"),
+    ("google-api-key", GOOGLE_API_KEY, "***REDACTED***", "google-api-key"),
     ("github-fine-grained-pat", _FINE_GRAINED_PAT, "***REDACTED***", "github-fine-grained-pat"),
     ("github-token", "ghp_abcdefghijklmnop", "***REDACTED***", "github-token"),
     ("openai-key", "sk-proj-abcdef123456", "***REDACTED***", "openai-key"),
@@ -708,6 +857,8 @@ _WORST_CASE_UNITS = {
     # Header at its ten-character floor, empty payload and signature; ``.``
     # ends the shape, so it repeats without a separator.
     "jwt": "eyJaaaaaaa..",
+    # Fixed at 39 characters, so it only shrinks: 40 to 15.
+    "google_api_key": "AIza" + "a" * 35 + " ",
     "github_fine_grained_pat": "github_pat_aaaaaaaa ",
     "github_pat": "ghp_aaaaaaaa ",
     "sk_key": "sk-aaaaaaaa ",
@@ -814,6 +965,7 @@ def test_every_redaction_pattern_has_its_stable_class_name():
         "authorization-header",
         "url-userinfo",
         "jwt",
+        "google-api-key",
         "github-fine-grained-pat",
         "github-token",
         "openai-key",
@@ -843,6 +995,8 @@ _CREDENTIAL_CORPUS = [
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0",
     *_SHORT_JWTS,
     "eyJhIjow.e30.c2ln",
+    *(text for text, _ in _GOOGLE_KEY_TEXTS),
+    *_GOOGLE_KEY_NEAR_MISSES,
     *(text for text, _ in _URL_CREDENTIAL_CASES),
     *_URLS_WITHOUT_USERINFO,
     _NORMAL_TEXT,
@@ -883,6 +1037,7 @@ def test_credential_classes_corpus_has_both_sides():
         ("Authorization: Bearer abcdef123456", ("authorization-header",)),
         ("postgresql://app:s3cr3t@db.internal:5432/app", ("url-userinfo",)),
         (_JWT, ("jwt",)),
+        (f"GEMINI_API_KEY={GOOGLE_API_KEY}", ("google-api-key",)),
         (_FINE_GRAINED_PAT, ("github-fine-grained-pat",)),
         ("ghp_abcdefghijklmnop", ("github-token",)),
         ("sk-proj-abcdef123456", ("openai-key",)),

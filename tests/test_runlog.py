@@ -14,6 +14,7 @@ from autoforge.errors import StateError
 from autoforge.providers import _OPENCODE_ERROR_LINE_RE, _OPENCODE_TOOL_FAILED_LINE_RE
 from autoforge.runlog import ExecutionRecord, RunLogger, validate_run_id
 from autoforge.sandbox import SandboxFacts
+from tests.conftest import GOOGLE_API_KEY, GOOGLE_KEY_BODY
 
 
 def test_runlog_layout_and_redaction(tmp_path):
@@ -1151,6 +1152,51 @@ def test_a_token_right_after_an_ansi_escape_never_reaches_the_output_logs(tmp_pa
         "\x1b[91m\x1b[1mError: \x1b[0m***REDACTED***\n"
         "\x1b[91m\x1b[1mError: \x1b[0mGH_TOKEN=***REDACTED***\n"
     )
+
+
+def test_a_google_api_key_an_opencode_agent_prints_never_reaches_the_logs(tmp_path):
+    """#282: OpenCode launches inherit ``GEMINI_*`` and ``GOOGLE_*``, so an
+    agent that printed its environment, or an error quoting the key, saved an
+    ``AIza`` key to ``stdout.log`` and ``stderr.log`` in the clear, and a
+    result or command line quoting it to the step's records and the journal.
+    It is redacted in every file, after OpenCode's ANSI escapes as well, and
+    the escapes are kept."""
+    error_line = f"\x1b[91m\x1b[1mError: \x1b[0m{GOOGLE_API_KEY}"
+    assert _OPENCODE_ERROR_LINE_RE.match(error_line)
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", f"--api-key={GOOGLE_API_KEY}"],
+            error=f"agent exited 1: GOOGLE_API_KEY={GOOGLE_API_KEY}",
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": f"the run needs GEMINI_API_KEY, set to {GOOGLE_API_KEY}",
+                "tests": [f"curl 'https://example.test/v1?key={GOOGLE_API_KEY}': 403"],
+            },
+        ),
+        prompt="p",
+        stdout=f"HOME=/home/u\nGEMINI_API_KEY={GOOGLE_API_KEY}\nGOOGLE_API_KEY={GOOGLE_API_KEY}\n",
+        stderr=f"{error_line}\n",
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"stdout.log", "stderr.log", "control-result.json"}
+    for path in files:
+        assert GOOGLE_KEY_BODY not in path.read_text(encoding="utf-8"), path
+    assert (step / "stdout.log").read_text(encoding="utf-8") == (
+        "HOME=/home/u\nGEMINI_API_KEY=***REDACTED***\nGOOGLE_API_KEY=***REDACTED***\n"
+    )
+    assert (step / "stderr.log").read_text(encoding="utf-8") == (
+        "\x1b[91m\x1b[1mError: \x1b[0m***REDACTED***\n"
+    )
+    result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
+    assert result["message"] == "the run needs GEMINI_API_KEY, set to ***REDACTED***"
+    assert result["tests"] == ["curl 'https://example.test/v1?key=***REDACTED***': 403"]
 
 
 def test_an_oauth_credential_field_in_a_parsed_result_is_still_redacted(tmp_path):
