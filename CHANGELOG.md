@@ -40,7 +40,9 @@ its date ([Releasing](docs/releasing.md#the-changelog)).
   `git@github-work:` is not one), at the first step, naming the remote.
 - A relative `github.command` (`./bin/gh`) is resolved against the
   directory AutoForge starts in, as before; a bare name is still looked up
-  on `PATH`.
+  on `PATH`, and a relative `PATH` entry (`bin`, `.`, an empty one) still
+  means a directory under the one AutoForge starts in, for `gh` and for
+  the programs `gh` runs.
 
 ### Google API keys are redacted and refused (#282)
 

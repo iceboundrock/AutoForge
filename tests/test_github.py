@@ -808,6 +808,7 @@ def test_every_gh_process_starts_in_an_empty_directory_of_its_own(tmp_path, monk
     with ``GIT_DIR`` naming that directory, and the directory is gone afterwards."""
     checkout = _checkout(tmp_path)
     monkeypatch.chdir(checkout)
+    monkeypatch.setenv("PATH", os.defpath)  # absolute entries: nothing to anchor
     seen: list[str] = []
 
     def runner(req):
@@ -870,6 +871,68 @@ def test_a_relative_gh_command_still_names_what_it_named(tmp_path, monkeypatch):
     GitHubClient(gh_command="tools/gh", runner=runner).version()
     GitHubClient(gh_command="gh", runner=runner).version()
     assert seen == [str(tmp_path / "tools" / "gh"), "gh"]
+
+
+def _version_gh(directory: Path, version: str) -> None:
+    """A `gh` in ``directory`` that answers ``--version`` with ``version``."""
+    directory.mkdir(parents=True, exist_ok=True)
+    gh = directory / "gh"
+    gh.write_text(f"#!/bin/sh\necho 'gh version {version}'\n")
+    gh.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    ("entry", "where"),
+    [("bin", "bin"), ("./bin", "bin"), ("", "."), (".", ".")],
+    ids=["relative", "dot-relative", "empty", "dot"],
+)
+def test_a_bare_gh_found_through_a_relative_path_entry_is_found_still(
+    tmp_path, monkeypatch, entry, where
+):
+    """A bare ``github.command`` is looked up on ``PATH`` as from the controller's
+    directory, although the child starts in an empty one of its own."""
+    work = tmp_path / "work"
+    _version_gh(work / where, "0.0.0-relative")
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("PATH", os.pathsep.join([entry, os.defpath]))
+    assert GitHubClient(retry_delay_seconds=0).version() == "gh version 0.0.0-relative"
+
+
+def test_a_relative_path_entry_never_reaches_the_directory_gh_starts_in(tmp_path, monkeypatch):
+    """From the empty directory `gh` starts in, ``..`` is the shared temporary directory
+    it was made in. The entry still means the controller's parent directory."""
+    shared = tmp_path / "shared-tmp"
+    _version_gh(shared, "planted")
+    monkeypatch.setattr(tempfile, "tempdir", str(shared))
+    _version_gh(tmp_path, "0.0.0-operator")
+    (tmp_path / "work").mkdir()
+    monkeypatch.chdir(tmp_path / "work")
+    monkeypatch.setenv("PATH", os.pathsep.join(["..", os.defpath]))
+    assert GitHubClient(retry_delay_seconds=0).version() == "gh version 0.0.0-operator"
+
+
+def test_relative_path_entries_are_anchored_for_gh_and_what_it_runs(tmp_path, monkeypatch):
+    """`gh` looks git up on the same ``PATH``, so the child's ``PATH`` itself carries
+    the anchored entries; the command stays a bare name, looked up on it."""
+    monkeypatch.chdir(tmp_path)
+    here = os.getcwd()
+    monkeypatch.setenv("PATH", os.pathsep.join(["bin", "", ".", "/usr/bin", "../tools"]))
+    seen = []
+    GitHubClient(runner=lambda req: seen.append(req) or _res({}), retry_delay_seconds=0).version()
+    (req,) = seen
+    assert req.command == ["gh", "--version"]
+    assert req.env == {
+        "GIT_DIR": req.cwd,
+        "PATH": os.pathsep.join(
+            [
+                os.path.join(here, "bin"),
+                here,
+                here,
+                "/usr/bin",
+                os.path.join(os.path.dirname(here), "tools"),
+            ]
+        ),
+    }
 
 
 def test_gh_workdir_failure_is_a_github_error_and_starts_nothing(monkeypatch):

@@ -1014,7 +1014,11 @@ path, so no setting makes the controller post one (ADR 0004 D2.1a).
   repository: every one names it, and the repository a run starts in is
   read from the checkout's `origin` through the hardened local request
   and then from GitHub (`gh repo view <owner>/<repo>`), which follows a
-  rename. A relative `github.command` is made absolute first. `doctor`'s
+  rename. A relative `github.command` is made absolute first, and so is
+  each relative `PATH` entry the child inherits, so a bare `gh`, and
+  every program `gh` starts, is looked up as from the controller's own
+  directory: left relative, `..` would reach the shared temporary
+  directory the empty one was made in. `doctor`'s
   `gh --version` and `gh auth status` run the same way. The one `gh` that
   runs elsewhere is `gh auth git-credential`, which git starts as the
   credential helper of the transport's own fetch and push, in the private

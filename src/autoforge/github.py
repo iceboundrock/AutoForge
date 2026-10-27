@@ -686,18 +686,46 @@ def gh_request(
     timeout_seconds: int,
     stdin: bytes | None = None,
 ) -> ExecutionRequest:
-    """The request that runs ``command``, a `gh` argv, in ``workdir`` (:func:`gh_workdir`)."""
+    """The request that runs ``command``, a `gh` argv, in ``workdir`` (:func:`gh_workdir`).
+
+    ``command`` still names what it named from the controller's own directory,
+    now that the child starts elsewhere: a relative path is made absolute, and
+    so is each relative ``PATH`` entry (:func:`_anchored_search_path`), where a
+    bare name, and every program `gh` itself starts, is looked up.
+    """
     executable = command[0]
     if os.sep in executable and not os.path.isabs(executable):
-        # A relative ``github.command`` still names what it named from the
-        # controller's own directory, now that the child starts elsewhere.
         executable = os.path.abspath(executable)
+    env = {"GIT_DIR": workdir}
+    search_path = _anchored_search_path(os.environ.get("PATH"))
+    if search_path is not None:
+        env["PATH"] = search_path
     return ExecutionRequest(
         command=[executable, *command[1:]],
         cwd=workdir,
-        env={"GIT_DIR": workdir},
+        env=env,
         timeout_seconds=timeout_seconds,
         stdin_data=stdin,
+    )
+
+
+def _anchored_search_path(path: str | None) -> str | None:
+    """``path``, a ``PATH`` value, each relative entry made absolute from this directory.
+
+    The empty entry, like ``.``, is the current directory, as exec's lookup
+    reads it. Left relative, an entry would be looked up from the empty
+    directory a `gh` starts in: ``bin`` would no longer find what it found,
+    and ``..`` would reach the shared temporary directory that one was made
+    in. None when ``PATH`` is unset or every entry is absolute, since the
+    child's lookup then does not depend on its directory.
+    """
+    if path is None:
+        return None
+    entries = path.split(os.pathsep)
+    if all(os.path.isabs(entry) for entry in entries):
+        return None
+    return os.pathsep.join(
+        entry if os.path.isabs(entry) else os.path.abspath(entry or os.curdir) for entry in entries
     )
 
 

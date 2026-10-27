@@ -434,7 +434,8 @@ profiles:
 github:
   # `gh` binary name / path. All GitHub reads/verification go through `gh`.
   # Every `gh` runs in an empty directory of its own, never in the checkout,
-  # so a relative path is resolved against the directory AutoForge starts in.
+  # so a relative path, and a relative PATH entry a bare name is found
+  # through, is resolved against the directory AutoForge starts in.
   command: gh
   timeout_seconds: 120
 

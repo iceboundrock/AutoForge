@@ -164,7 +164,10 @@ High-priority coverage includes:
   client and `doctor` start runs in a fresh empty directory of its own with
   `GIT_DIR` naming it, removed afterwards, and a `gh` that runs git there,
   as gh 2.103.2's `pr merge` does, finds no repository, with `GIT_DIR`
-  inherited or a temporary directory inside a checkout; the merge argv
+  inherited or a temporary directory inside a checkout; a relative
+  `github.command`, and a bare one found through a relative or empty
+  `PATH` entry, are found as from the controller's directory, and `..`
+  never reaches the temporary directory; the merge argv
   never carries `--delete-branch`; the ref read and the `DELETE` name
   exactly `refs/heads/<branch>` of the repository, the `DELETE` sent once
   and refused for the default branch before anything starts; in `MERGE`
