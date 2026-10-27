@@ -1006,7 +1006,8 @@ path, so no setting makes the controller post one (ADR 0004 D2.1a).
   the executor.
 - **Every controller `gh` process** (`github.gh_workdir`,
   `github.gh_request`, #283) starts in a fresh empty directory the
-  controller creates outside the checkout and removes once `gh` exits,
+  controller creates in the temporary directory (outside the checkout
+  unless `TMPDIR` lies inside it) and removes once `gh` exits,
   with `GIT_DIR` naming that directory, so any git `gh` runs finds no
   repository and exits: not the checkout, not one a `GIT_DIR` of the
   operator's shell names, not one around a temporary directory inside a
@@ -1542,8 +1543,8 @@ humans acting concurrently on GitHub. GitHub is the source of truth.
 2. **No steering of the controller.** Repository state an agent can write
    (configuration, hooks, `origin`, include directives, replacement refs,
    grafts, the commit-graph) cannot steer, or run code in, the controller's
-   own git network operations and `gh` calls (D7.3, D7.5; every `gh` runs
-   outside any repository, #283).
+   own git network operations and `gh` calls (D7.3, D7.5; no git a `gh`
+   starts finds a repository, #283).
 3. **Every write is accounted for.** Every Wave 1 externally visible write
    is a typed controller effect with a durable record; anything else with a
    Wave 1 identity is detected and blocks, and is never adopted.

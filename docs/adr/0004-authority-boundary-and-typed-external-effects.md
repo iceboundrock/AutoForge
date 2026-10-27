@@ -21,7 +21,7 @@
   is the operator's guide.
 - **Amended by #283:** the merge's mechanism (D5.4) deletes the merged
   head branch itself, on GitHub only, and every `gh` the controller starts
-  runs outside any repository.
+  runs where no git it starts finds a repository.
 - **Decides:** #159, for EPIC #158 (Wave 1).
 - **Where:** placement is decided in §2.12. Existing code this record
   builds on: `src/autoforge/github.py`, `claims.py`, `result_parser.py`,

@@ -657,7 +657,7 @@ Runner = Callable[[ExecutionRequest], ExecutionResult]
 # git reads the shared repository's configuration and runs its hooks, which an
 # agent can write, with the controller's credential in the environment. So
 # every `gh` the controller starts runs in a fresh, empty directory of its
-# own, outside any repository, and with ``GIT_DIR`` naming that same
+# own, in the temporary directory, and with ``GIT_DIR`` naming that same
 # directory: it is no git directory, so a git that `gh` starts fails instead
 # of finding a repository, whatever the controller's own environment says (an
 # inherited ``GIT_DIR``, a ``TMPDIR`` inside a checkout). Nothing the
