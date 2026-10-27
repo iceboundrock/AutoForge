@@ -1354,13 +1354,18 @@ def github_origin(repo, repository: str = "owner/repo") -> Path:
 
     INITIALIZING reads the checkout's repository from its ``origin``, locally
     (#283): an engine's checkout needs one, as an operator's has. Nothing
-    ever fetches from it: the controller's transport uses its own URL.
+    ever fetches from it: the controller's transport uses its own URL. An
+    ``origin`` that already names ``repository`` is left alone, so engines
+    built on one checkout at once (``tests/test_shared_git.py``) read it
+    without racing each other for ``.git/config``.
     """
     root = Path(repo)
     url = f"https://github.com/{repository}.git"
     has = subprocess.run(
         ["git", "-C", str(root), "remote", "get-url", "origin"], capture_output=True, text=True
     )
+    if has.returncode == 0 and has.stdout.strip() == url:
+        return root
     verb = "set-url" if has.returncode == 0 else "add"
     subprocess.run(["git", "-C", str(root), "remote", verb, "origin", url], check=True)
     return root

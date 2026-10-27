@@ -33,7 +33,15 @@ from autoforge.git_transport import NO_AUTO_MAINTENANCE
 from autoforge.locking import SharedGitLock
 from autoforge.premerge import export_commit_tree
 from autoforge.safefs import SafeRoot
-from tests.conftest import GIT_IDENT, ISSUE, FakeGitHub, git_repo, implement, make_engine
+from tests.conftest import (
+    GIT_IDENT,
+    ISSUE,
+    FakeGitHub,
+    git_repo,
+    github_origin,
+    implement,
+    make_engine,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -275,6 +283,7 @@ def test_l1_concurrent_worktree_add_for_different_issues(tmp_path):
     holds L1 alone, and the registry and the store stay consistent."""
     repo = git_repo(tmp_path / "repo")
     head = _commit(repo, "a.txt", "a\n")
+    github_origin(repo)  # set once, before the children: each make_engine only reads it
     common = Path(os.path.realpath(repo / ".git"))
     issues = (2, 3, 4, 5)
     outputs = _run_together(
