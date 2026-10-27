@@ -2013,7 +2013,11 @@ deletes a ref, D6.3):
   made in `MERGE` before the `DELETE` is sent. A crash before it counted
   nothing, so the `MERGE` re-entry recovers the merge without repeating
   it and deletes the branch then; a re-entry that finds the merge counted
-  never sends the `DELETE` again, it only reads the branch back.
+  never sends the `DELETE` again, it only reads the branch back. That
+  re-entry runs even when the checkpoint spent the last step of
+  `workflow.max_total_steps`: it merges and deletes nothing, and blocking
+  it would report the counted merge as one that never happened
+  ([workflow.md](workflow.md#loop-bounds)).
 - **Read back, never blocking.** The outcome is the ref read again, never
   `gh`'s exit status, and it is a note in the step's message: deleted, not
   deleted and why, or unknown when the read fails. The merge is verified

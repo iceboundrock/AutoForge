@@ -396,6 +396,113 @@ def test_a_failed_re_entry_after_the_checkpoint_says_the_merge_is_counted(
     assert load_state(eng2.paths.state_file).counted_merged_prs == [PR]
 
 
+# -- the crash windows at the step limit: the checkpoint spends the budget --------------------
+
+
+def _at_the_step_limit(eng):
+    """Make the MERGE step the last one ``workflow.max_total_steps`` allows."""
+    eng.config.workflow.max_total_steps = eng.state.step_count + 1
+    return eng.config.workflow.max_total_steps
+
+
+def _dying(gh, where):
+    """Make the controller die ``where`` in MERGE; returns what undoes it."""
+    name = "merge_pr" if where == "after-the-merge" else "delete_branch_ref"
+    real = getattr(gh, name)
+    if where == "before-the-delete":
+
+        def die_before_sending(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        gh.delete_branch_ref = die_before_sending
+    else:
+        _interrupting(gh, name)
+    return lambda: setattr(gh, name, real)
+
+
+@pytest.mark.parametrize(
+    ("where", "counted", "note", "deleted"),
+    [
+        ("after-the-merge", [], "deleted on GitHub (read back as absent)", [(REPO, BRANCH)]),
+        ("before-the-delete", [PR], "not deleted (an earlier step of this merge counted it", []),
+        ("after-the-delete", [PR], "is gone from GitHub (read back as absent)", [(REPO, BRANCH)]),
+    ],
+)
+def test_a_crash_at_the_step_limit_finishes_the_merge_on_resume(
+    tmp_state_dir, fake_github, where, counted, note, deleted
+):
+    """A crash before the checkpoint charged nothing, so the re-entry runs within the
+    budget; one after it finds the budget spent and the merge counted, and still
+    finishes MERGE: it reads back, sends nothing, and the budget stops the next step."""
+    eng = _merging(tmp_state_dir, fake_github)
+    limit = _at_the_step_limit(eng)
+    undo = _dying(fake_github, where)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step(allow_merge=True)
+    undo()
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase == Phase.MERGE and saved.counted_merged_prs == counted
+    assert saved.step_count == (limit if counted else limit - 1)
+    eng2 = _reopened(eng, tmp_state_dir, fake_github)
+    out = eng2.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC", out.message
+    assert f"; head branch {BRANCH!r} {note}" in out.message
+    assert len(fake_github.merges) == 1 and fake_github.deleted_branches == deleted
+    saved = load_state(eng2.paths.state_file)
+    assert saved.phase == Phase.UPDATE_EPIC and not saved.block_reason
+    assert saved.counted_merged_prs == [PR] and saved.merged_since_epic_update == 1
+    assert saved.step_count == limit + (1 if counted else 0)
+    assert eng2.step().next_phase == "BLOCKED"
+    assert f"workflow.max_total_steps={limit} is reached" in eng2.state.block_reason
+
+
+def test_the_dry_run_at_the_step_limit_says_which_merge_finishes(tmp_state_dir, fake_github):
+    eng = _merging(tmp_state_dir, fake_github)
+    eng.state.step_count = _at_the_step_limit(eng)
+    (note,) = [n for n in eng.plan_step().notes if "max_total_steps" in n]
+    assert note.startswith("would enter BLOCKED without executing:")
+    eng.state.step_count -= 1
+    _dying(fake_github, "before-the-delete")
+    with pytest.raises(KeyboardInterrupt):
+        eng.step(allow_merge=True)
+    (note,) = [
+        n
+        for n in _reopened(eng, tmp_state_dir, fake_github).plan_step().notes
+        if "max_total_steps" in n
+    ]
+    assert f"an earlier step of this run counted the merge of {PR}" in note
+    assert "merging and deleting nothing" in note and "budget ends the run at the next step" in note
+
+
+def test_an_uncounted_merge_at_the_step_limit_still_blocks_before_merging(
+    tmp_state_dir, fake_github
+):
+    eng = _merging(tmp_state_dir, fake_github)
+    eng.state.step_count = _at_the_step_limit(eng)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED" and "max_total_steps" in eng.state.block_reason
+    assert fake_github.merges == [] and fake_github.deleted_branches == []
+
+
+def test_a_counted_merge_github_reports_open_again_is_never_merged_twice(
+    tmp_state_dir, fake_github
+):
+    """The budget lets a counted MERGE finish because it cannot merge: a counted PR is
+    never merged again, whatever GitHub answers."""
+    eng = _merging(tmp_state_dir, fake_github)
+    _at_the_step_limit(eng)
+    undo = _dying(fake_github, "before-the-delete")
+    with pytest.raises(KeyboardInterrupt):
+        eng.step(allow_merge=True)
+    undo()
+    fake_github.prs[PR].state = "OPEN"
+    eng2 = _reopened(eng, tmp_state_dir, fake_github)
+    out = eng2.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    assert "refusing to merge it again" in eng2.state.block_reason
+    assert len(fake_github.merges) == 1 and fake_github.deleted_branches == []
+
+
 # -- the regression: the operator's checkout through MERGE ------------------------------------
 
 

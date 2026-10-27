@@ -4227,6 +4227,7 @@ class ControllerEngine:
                 "MERGE (controller runs `gh pr merge` itself; no agent, no prompt)",
                 "UPDATE_EPIC (only after gh reports the PR as MERGED)",
                 notes=[
+                    *self._merge_budget_plan_notes(s),
                     MERGE_GATE_MESSAGE,
                     "would verify: last review clean and bound to this PR, PR open at the "
                     "reviewed HEAD, base and merge base, the recorded review comment "
@@ -4451,6 +4452,20 @@ class ControllerEngine:
                 method=self.config.merge.method,
                 match_head_sha=(s.reviewed_head_sha or "").lower(),
             ),
+        ]
+
+    def _merge_budget_plan_notes(self, s: AutoForgeState) -> list[str]:
+        """Dry-run: what an exhausted step budget does to MERGE (:meth:`_budget_may_stop`)."""
+        budget = step_budget_reason(s.step_count, self.config.workflow.max_total_steps)
+        if not budget:
+            return []
+        if self._budget_may_stop(Phase.MERGE):
+            return [f"would enter BLOCKED without executing: {budget}"]
+        return [
+            f"step budget reached ({budget}), but an earlier step of this run counted the "
+            f"merge of {s.current_pr_url} before sending its head branch's deletion; would "
+            "finish MERGE by re-reading the PR and the branch, merging and deleting nothing; "
+            "the step counts and the budget ends the run at the next step"
         ]
 
     def _delete_branch_plan_notes(self, s: AutoForgeState) -> list[str]:
@@ -9245,7 +9260,7 @@ class ControllerEngine:
     def _budget_may_stop(self, phase: Phase) -> bool:
         """Whether the exhausted step budget blocks ``phase`` before it executes.
 
-        Every phase but one: a REPLAN_REEXECUTE journal that has begun
+        Every phase but two. A REPLAN_REEXECUTE journal that has begun
         closing the source PR is a persisted decision the controller
         finishes (:func:`budget_may_stop`). Blocking it would leave the
         source closed by the controller with nothing in the run's state
@@ -9254,7 +9269,17 @@ class ControllerEngine:
         writes nothing but the one bounded retry of a close the source's
         issue events prove never ran (#69); the budget ends the run at the
         next step instead.
+
+        And a MERGE whose merge an earlier step of this run already counted:
+        that step saved the count, and the step it was charged as, before
+        sending the head branch's deletion (:meth:`_delete_merged_branch`,
+        #283). What is left re-reads the PR and the branch and leaves MERGE;
+        it sends nothing (:meth:`_merge_step` refuses to merge a counted PR),
+        and blocking it would report a merge GitHub has, and the run
+        counted, as one that never happened.
         """
+        if phase is Phase.MERGE:
+            return not self._merge_already_counted()
         if phase is not Phase.REPLAN_REEXECUTE:
             return True
         journal = self._require_state().replan_transaction
@@ -9490,8 +9515,9 @@ class ControllerEngine:
         """True when an earlier MERGE step of this run counted the current PR's merge.
 
         Only a MERGE re-entry after the save :meth:`_delete_merged_branch`
-        makes before the branch deletion (#283) finds that, and a failure
-        there must not report the merge as uncounted.
+        makes before the branch deletion (#283) finds that: a failure there
+        must not report the merge as uncounted, and an exhausted step budget
+        does not block it (:meth:`_budget_may_stop`).
         """
         state = self._require_state()
         try:
@@ -10304,6 +10330,16 @@ class ControllerEngine:
         verified = self._verify_pr_for_merge(Phase.MERGE, plan, allow_merge)
         if isinstance(verified, StepOutcome):
             return verified
+        if self._merge_already_counted():
+            # GitHub never reopens a merged PR, so this is not reached; were it
+            # reached, a step the budget let run (_budget_may_stop) would merge.
+            return self._block(
+                Phase.MERGE,
+                plan,
+                f"an earlier step of this run verified and counted the merge of PR "
+                f"{state.current_pr_url}, but GitHub now reports it {verified.state}; "
+                "refusing to merge it again. Inspect the PR on GitHub manually.",
+            )
         url = state.current_pr_url
         reviewed = (state.reviewed_head_sha or "").lower()
         reviewed_base = state.reviewed_base_ref
