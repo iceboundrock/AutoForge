@@ -911,6 +911,24 @@ def test_a_relative_path_entry_never_reaches_the_directory_gh_starts_in(tmp_path
     assert GitHubClient(retry_delay_seconds=0).version() == "gh version 0.0.0-operator"
 
 
+@pytest.mark.parametrize("lookup", ["path", "command"])
+def test_relative_gh_lookup_preserves_symlink_before_parent(tmp_path, monkeypatch, lookup):
+    """The kernel resolves ``..`` after following the link, not lexically."""
+    work = tmp_path / "work"
+    work.mkdir()
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    (work / "link").symlink_to(real_bin, target_is_directory=True)
+    _version_gh(tmp_path / "real" / "tools", "original")
+    _version_gh(work / "tools", "decoy")
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("PATH", os.pathsep.join(["link/../tools", os.defpath]))
+    command = "gh" if lookup == "path" else "link/../tools/gh"
+    assert (
+        GitHubClient(gh_command=command, retry_delay_seconds=0).version() == "gh version original"
+    )
+
+
 def test_relative_path_entries_are_anchored_for_gh_and_what_it_runs(tmp_path, monkeypatch):
     """`gh` looks git up on the same ``PATH``, so the child's ``PATH`` itself carries
     the anchored entries; the command stays a bare name, looked up on it."""
@@ -927,9 +945,9 @@ def test_relative_path_entries_are_anchored_for_gh_and_what_it_runs(tmp_path, mo
             [
                 os.path.join(here, "bin"),
                 here,
-                here,
+                os.path.join(here, "."),
                 "/usr/bin",
-                os.path.join(os.path.dirname(here), "tools"),
+                os.path.join(here, "../tools"),
             ]
         ),
     }

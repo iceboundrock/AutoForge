@@ -695,7 +695,7 @@ def gh_request(
     """
     executable = command[0]
     if os.sep in executable and not os.path.isabs(executable):
-        executable = os.path.abspath(executable)
+        executable = os.path.join(os.getcwd(), executable)
     env = {"GIT_DIR": workdir}
     search_path = _anchored_search_path(os.environ.get("PATH"))
     if search_path is not None:
@@ -717,15 +717,18 @@ def _anchored_search_path(path: str | None) -> str | None:
     directory a `gh` starts in: ``bin`` would no longer find what it found,
     and ``..`` would reach the shared temporary directory that one was made
     in. None when ``PATH`` is unset or every entry is absolute, since the
-    child's lookup then does not depend on its directory.
+    child's lookup then does not depend on its directory. Do not normalize
+    ``..``: the kernel must follow any preceding symlink before resolving it.
     """
     if path is None:
         return None
     entries = path.split(os.pathsep)
     if all(os.path.isabs(entry) for entry in entries):
         return None
+    cwd = os.getcwd()
     return os.pathsep.join(
-        entry if os.path.isabs(entry) else os.path.abspath(entry or os.curdir) for entry in entries
+        entry if os.path.isabs(entry) else os.path.join(cwd, entry) if entry else cwd
+        for entry in entries
     )
 
 
