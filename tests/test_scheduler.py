@@ -176,6 +176,13 @@ class Bench:
     def has(self, name: str) -> bool:
         return (self.markers / name).exists()
 
+    def noted(self, name: str) -> int:
+        """How many SIGINTs a stubborn step has outlived, by its ``noted`` marker."""
+        try:
+            return int((self.markers / name).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return 0
+
     def open_gate(self, name: str) -> None:
         (self.markers / name).touch()
 
@@ -536,6 +543,7 @@ def test_a_scheduler_exit_with_a_live_worker_keeps_standalone_commands_out(
 ):
     b = bench()
     sd = _blocked_standalone_run(b, monkeypatch, capsys)
+    # Outlives both SIGINTs, so it is alive after its scheduler exits, until its gate opens.
     stubborn = 2 if how == "second-interrupt" else 0
     b.issue(
         2,
@@ -573,6 +581,13 @@ def test_a_scheduler_exit_with_a_live_worker_keeps_standalone_commands_out(
         assert "still run" in "\n".join(b.lines)
         assert time.monotonic() - started < b.config.scheduler.stop_grace_seconds
     (child,) = sched.children
+    if how == "second-interrupt":
+        # run() sent the second SIGINT before it returned: the worker is looked
+        # at once it has outlived it, not while that SIGINT is still in flight.
+        deadline = time.monotonic() + DEADLINE
+        while b.noted("n2") < 2 and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert b.noted("n2") == 2, "the worker never outlived the second SIGINT"
     assert child.poll() is None, "the worker outlived its scheduler"
     # The worker holds L0 by inheritance: no standalone controller runs.
     with pytest.raises(LockError):
@@ -713,7 +728,7 @@ def test_the_grace_expiring_forwards_a_second_sigint_and_exits(bench, no_sigkill
                 "do": "hold",
                 "started": b.marker("s2"),
                 "gate": b.marker("g2"),
-                "stubborn": 2,
+                "stubborn": 1,  # outlives the first SIGINT, so the grace runs out
                 "noted": b.marker("n2"),
             },
         ),
