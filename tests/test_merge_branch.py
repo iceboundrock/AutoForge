@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from autoforge.errors import GitHubError, GitHubUnavailableError
+from autoforge.errors import ExecutionError, GitHubError, GitHubUnavailableError
 from autoforge.github import GH_WORKDIR_PREFIX, GitHubClient
 from autoforge.state import load_state
 from autoforge.transitions import Phase
@@ -293,6 +293,81 @@ def test_a_deletion_that_cannot_be_read_back_is_reported_unknown(tmp_state_dir, 
     assert out.next_phase == "UPDATE_EPIC", out.message
     assert f"whether head branch {BRANCH!r} was deleted is unknown" in out.message
     assert "check it on GitHub" in out.message and fake_github.deleted_branches == [(REPO, BRANCH)]
+
+
+# What the executor raises when `gh` cannot be started; the client lets it through.
+_NO_GH = "executable not found: gh ([Errno 2] No such file or directory: 'gh')"
+
+
+def _no_gh_for_the_default_branch(gh):
+    gh.get_repo_error = ExecutionError(_NO_GH)
+
+
+def _no_gh_for_the_ref(gh):
+    gh.branch_ref_error = ExecutionError(_NO_GH)
+
+
+def _no_gh_for_the_deletion(gh):
+    gh.delete_branch_error = ExecutionError(_NO_GH)
+
+
+def _no_gh_for_the_read_back(gh):
+    real = gh.delete_branch_ref
+
+    def delete_then_lose_gh(*args, **kwargs):
+        real(*args, **kwargs)
+        gh.branch_ref_error = ExecutionError(_NO_GH)
+
+    gh.delete_branch_ref = delete_then_lose_gh
+
+
+@pytest.mark.parametrize(
+    ("no_gh", "note", "left"),
+    [
+        (
+            _no_gh_for_the_default_branch,
+            f"head branch not deleted: the default branch of {REPO} could not be read ({_NO_GH})",
+            True,
+        ),
+        (
+            _no_gh_for_the_ref,
+            f"head branch not deleted: {BRANCH!r} could not be read ({_NO_GH})",
+            True,
+        ),
+        (
+            _no_gh_for_the_deletion,
+            f"head branch {BRANCH!r} not deleted (the deletion failed: {_NO_GH}): GitHub still "
+            f"has it at {SHA_A[:12]}",
+            True,
+        ),
+        (
+            _no_gh_for_the_read_back,
+            f"whether head branch {BRANCH!r} was deleted is unknown: it could not be read back "
+            f"({_NO_GH})",
+            False,
+        ),
+    ],
+    ids=lambda v: v.__name__.removeprefix("_no_gh_for_the_") if callable(v) else "",
+)
+def test_a_gh_that_cannot_be_started_is_a_note_after_the_verified_merge(
+    tmp_state_dir, fake_github, no_gh, note, left
+):
+    """A `gh` that cannot be started raises the executor's ExecutionError, not a
+    GitHubError. Before the checkpoint (the two reads) or after it (the deletion and
+    its read-back), it is a cleanup failure like any other: the step still leaves
+    MERGE with the merge counted, says what it knows of the branch, and the deletion
+    is sent at most once."""
+    eng = _merging(tmp_state_dir, fake_github)
+    _after_merge(fake_github, no_gh)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC", out.message
+    assert f"; {note}" in out.message
+    checkpointed = no_gh in (_no_gh_for_the_deletion, _no_gh_for_the_read_back)
+    assert fake_github.deleted_branches == ([(REPO, BRANCH)] if checkpointed else [])
+    assert (fake_github.branch_heads.get(BRANCH) == SHA_A) is left
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase == Phase.UPDATE_EPIC and saved.counted_merged_prs == [PR]
+    assert len(fake_github.merges) == 1
 
 
 # -- the crash windows: neither the merge nor the deletion is sent twice ---------------------

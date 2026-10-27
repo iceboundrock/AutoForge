@@ -28,6 +28,7 @@ from autoforge.certificate import Revision, remote_certificate  # noqa: E402
 from autoforge.config import default_config  # noqa: E402
 from autoforge.engine import ControllerEngine  # noqa: E402
 from autoforge.errors import (  # noqa: E402
+    ExecutionError,
     GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
@@ -419,12 +420,13 @@ class FakeGitHub:
         # would send, as (repository, branch); ``delete_branch_error`` makes it
         # raise, after deleting when ``delete_branch_lands`` (the reply was
         # lost), before otherwise. ``branch_ref_error`` makes get_branch_ref
-        # raise, ``get_repo_error`` get_repo.
+        # raise, ``get_repo_error`` get_repo. An ExecutionError is the real
+        # client's when `gh` cannot be started.
         self.deleted_branches: list[tuple[str, str]] = []
-        self.delete_branch_error: GitHubError | None = None
+        self.delete_branch_error: GitHubError | ExecutionError | None = None
         self.delete_branch_lands: bool = False
-        self.branch_ref_error: GitHubError | None = None
-        self.get_repo_error: GitHubError | None = None
+        self.branch_ref_error: GitHubError | ExecutionError | None = None
+        self.get_repo_error: GitHubError | ExecutionError | None = None
         # GitHub's current name for a repository it renamed, by old name.
         self.repo_names: dict[str, str] = {}
         self.disabled_auto: list[str] = []  # PRs on which disable_auto_merge ran

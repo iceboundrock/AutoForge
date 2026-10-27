@@ -172,7 +172,8 @@ High-priority coverage includes:
   the base, the default branch, a branch the run did not bind, one moved
   past the merged HEAD or gone, and a read that failed, never for a merge
   left open, refused for a moved HEAD or made at another HEAD; its outcome
-  is read back and never blocks; a crash after the merge, after the
+  is read back and never blocks, not even when `gh` cannot be started
+  for a read or the `DELETE`; a crash after the merge, after the
   checkpoint or after the `DELETE` repeats neither, also when the
   checkpoint spent the last step of the budget, whose re-entry still
   finishes `MERGE` and never merges a counted PR again; and with the head

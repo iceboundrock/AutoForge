@@ -621,6 +621,11 @@ _EXPORT_SETUP_FAILURES = (MaterializationError, ExecutionError, OSError)
 # commit's bytes. Each is a setup failure of the candidate (ADR 0006 D10.5),
 # never a record.
 _CANDIDATE_READ_FAILURES = (ExecutionError, VerificationError, GitTransportError)
+# What a call of the merged head branch's cleanup can raise (#283): the
+# client's GitHubError, and the executor's ExecutionError when `gh` cannot be
+# started at all. After a verified merge each is a note in the step's
+# message, never an exception out of it.
+_BRANCH_CLEANUP_ERRORS = (GitHubError, ExecutionError)
 # Where a REMOTE candidate's export is written for validation (ADR 0006 D6.2):
 # a fresh private directory per definition launch, beside the pre-merge one.
 VALIDATION_EXPORT_PREFIX = "autoforge-validate-"
@@ -10816,7 +10821,9 @@ class ControllerEngine:
         GitHub still has it at the merged HEAD, is deleted then. The outcome
         is read back from GitHub, never taken from `gh`'s exit status, and
         returned as a note for the step's message; it never blocks the run,
-        whose merge is verified and counted either way.
+        whose merge is verified and counted either way. So every read and the
+        deletion catch :data:`_BRANCH_CLEANUP_ERRORS`: a `gh` that cannot be
+        started is an ExecutionError, not a GitHubError, and is a note too.
         """
         if not self.config.merge.delete_branch:
             return ""
@@ -10833,7 +10840,7 @@ class ControllerEngine:
         failure = ""
         try:
             self.github.delete_branch_ref(repository, branch, default_branch=default_branch)
-        except GitHubError as exc:
+        except _BRANCH_CLEANUP_ERRORS as exc:
             failure = str(exc)
         return self._merged_branch_readback(pr, failure, resumed=False)
 
@@ -10859,7 +10866,7 @@ class ControllerEngine:
             return "", f"{branch!r} is the PR's base branch"
         try:
             default_branch = self.github.get_repo(repository).default_branch
-        except GitHubError as exc:
+        except _BRANCH_CLEANUP_ERRORS as exc:
             return "", f"the default branch of {repository} could not be read ({exc})"
         if not default_branch:
             return "", f"GitHub names no default branch for {repository}"
@@ -10867,7 +10874,7 @@ class ControllerEngine:
             return "", f"{branch!r} is the default branch of {repository}"
         try:
             head = self.github.get_branch_ref(repository, branch)
-        except GitHubError as exc:
+        except _BRANCH_CLEANUP_ERRORS as exc:
             return "", f"{branch!r} could not be read ({exc})"
         if head is None:
             return "", f"{branch!r} no longer exists on GitHub"
@@ -10897,7 +10904,7 @@ class ControllerEngine:
             why = f" (the deletion failed: {failure})" if failure else ""
         try:
             head = self.github.get_branch_ref(repository, branch)
-        except GitHubError as exc:
+        except _BRANCH_CLEANUP_ERRORS as exc:
             return (
                 f"; whether head branch {branch!r} was deleted is unknown{why}: it could not "
                 f"be read back ({exc}); check it on GitHub"

@@ -2020,8 +2020,10 @@ deletes a ref, D6.3):
   ([workflow.md](workflow.md#loop-bounds)).
 - **Read back, never blocking.** The outcome is the ref read again, never
   `gh`'s exit status, and it is a note in the step's message: deleted, not
-  deleted and why, or unknown when the read fails. The merge is verified
-  and counted either way, and the run moves on.
+  deleted and why, or unknown when the read fails. A read or a `DELETE`
+  that fails, a `gh` that cannot even be started included, is such a
+  note, never the step's error. The merge is verified and counted either
+  way, and the run moves on.
 
 No local branch is deleted or checked out. `gh pr merge --delete-branch`
 does both (gh 2.103.2, `pkg/cmd/pr/merge/merge.go`, `deleteLocalBranch`):
