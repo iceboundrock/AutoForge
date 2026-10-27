@@ -242,6 +242,13 @@ merge gate certificate check (#175)   test_merge_certificate.py (each requiremen
                                       policy drift, the invalidation matrix, MERGE crash
                                       windows, legacy states, the resume banner, provider
                                       parity); the existing merge gate: test_engine.py
+merge.delete_branch, gh's working     test_merge_branch.py (the remote-only deletion, each
+directory (#283)                      refusal, no deletion before a verified merge, read-back,
+                                      the crash windows, no git in the checkout through MERGE
+                                      with a `gh` that runs git: conftest.local_git_gh); every
+                                      `gh` in an empty directory, the scoped ref read and
+                                      DELETE: test_github.py; the INITIALIZING origin read:
+                                      test_engine.py
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
 live Pi smoke test (#135)             test_live_pi.py (opt-in: -m live, AUTOFORGE_LIVE_PI=1; its

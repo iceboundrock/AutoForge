@@ -11,6 +11,39 @@ production use, and not the Public Alpha (#255). The heading says
 `unreleased` until the release-prep commit the release's tag names gives it
 its date ([Releasing](docs/releasing.md#the-changelog)).
 
+### `gh` runs outside your checkout; `merge.delete_branch` deletes only the remote branch (#283)
+
+- Every `gh` the controller starts, `doctor`'s included, runs in an empty
+  directory of its own with `GIT_DIR` naming it, so no git `gh` runs can
+  reach the checkout you started AutoForge from or any other repository.
+  Before, `gh` ran in that checkout, and every `gh pr merge` asked git
+  there about the PR's head branch.
+- `merge.delete_branch: true` no longer passes `--delete-branch` to
+  `gh pr merge`, which deleted the local branch of that name too, checking
+  out and pulling another branch first when the checkout had it. After a
+  verified merge the controller deletes the PR's head branch on GitHub
+  only (`DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`), at most
+  once, and never a fork's branch, the base, the default branch, or a
+  branch pushed to after the merge. The outcome, read back from GitHub, is
+  a note in the step's message, and never blocks the run. The default,
+  `false`, deletes nothing
+  ([GitHub safety](docs/agent-guides/github-safety.md#deleting-the-merged-head-branch)).
+- A run checks the repository it belongs to against the checkout's
+  `origin` remote, read with the controller's hardened git and named as
+  GitHub names it now (a renamed repository still matches). Before, `gh`
+  chose one of the checkout's remotes by its own rules, which can prefer
+  `upstream` or `github` over `origin`, so a checkout whose `origin` is a
+  fork of the run's repository is now refused.
+  So is one whose `origin` does not name a github.com repository in a form
+  the `epic` commands and `doctor` already require (`https://github.com/`,
+  `ssh://git@github.com/` or `git@github.com:`; an SSH host alias such as
+  `git@github-work:` is not one), at the first step, naming the remote.
+- A relative `github.command` (`./bin/gh`) is resolved against the
+  directory AutoForge starts in, as before; a bare name is still looked up
+  on `PATH`, and a relative `PATH` entry (`bin`, `.`, an empty one) still
+  means a directory under the one AutoForge starts in, for `gh` and for
+  the programs `gh` runs.
+
 ### Google API keys are redacted and refused (#282)
 
 - A Google API key (`AIza` and 35 characters of `[0-9A-Za-z_-]`) is

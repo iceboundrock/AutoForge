@@ -5,11 +5,13 @@ import http.server
 import json
 import os
 import ssl
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +30,7 @@ from autoforge.github import (
     EXACT_READ_ERROR_BYTES,
     EXACT_READ_MAX_BYTES,
     EXACT_READ_ROOT,
+    GH_WORKDIR_PREFIX,
     MAX_BODY_CHARS,
     MAX_TITLE_CHARS,
     STRICT_ISSUE_LIST_LIMIT,
@@ -46,7 +49,14 @@ from autoforge.github import (
     parse_actions_run_url,
 )
 from autoforge.validation import parse_pr_url
-from tests.conftest import gh_sanitized, gh_sanitized_json
+from tests.conftest import (
+    gh_sanitized,
+    gh_sanitized_json,
+    git_out,
+    git_repo,
+    local_git_gh,
+    local_git_gh_runs,
+)
 
 
 def _res(payload: object, exit_code: int = 0, stderr: str = "") -> ExecutionResult:
@@ -756,15 +766,312 @@ def test_auth_and_permission_failures_are_not_not_found(stderr):
     assert not isinstance(info.value, (GitHubNotFoundError, GitHubUnavailableError))
 
 
-def test_current_repo_uses_repo_view():
+# -- where `gh` runs (#283) ---------------------------------------------------------------
+_CHECKOUT_BRANCH = "autoforge/2-x"
+
+
+def _checkout(tmp_path):
+    """The operator's checkout, on the PR's head branch, as the controller's cwd."""
+    repo = git_repo(tmp_path / "checkout")
+    git_out("-C", str(repo), "checkout", "-q", "-b", _CHECKOUT_BRANCH)
+    return repo
+
+
+def _client_calls(gh: GitHubClient) -> None:
+    """One of each kind of `gh` the client starts: reads, writes, the merge, the deletion."""
+    pr = "https://github.com/o/r/pull/42"
+    issue = "https://github.com/o/r/issues/2"
+    calls = [
+        gh.version,
+        gh.auth_status,
+        lambda: gh.get_repo("o/r"),
+        lambda: gh.get_issue(issue),
+        lambda: gh.get_pr(pr),
+        lambda: gh.get_branch_ref("o/r", _CHECKOUT_BRANCH),
+        lambda: gh.list_open_prs("o/r"),
+        lambda: gh.create_pr_comment(pr, "text"),
+        lambda: gh.edit_issue_body(issue, "text"),
+        lambda: gh.merge_pr(pr, match_head_sha="a" * 40),
+        lambda: gh.disable_auto_merge(pr),
+        lambda: gh.delete_branch_ref("o/r", _CHECKOUT_BRANCH, default_branch="main"),
+    ]
+    for call in calls:
+        try:
+            call()
+        except GitHubError:
+            pass  # the scripted reply is not what each read expects; the request is the point
+
+
+def test_every_gh_process_starts_in_an_empty_directory_of_its_own(tmp_path, monkeypatch):
+    """#283: no `gh` the client starts has the operator's checkout, or any repository, as
+    its working directory. Each runs in a fresh empty directory, outside the checkout,
+    with ``GIT_DIR`` naming that directory, and the directory is gone afterwards."""
+    checkout = _checkout(tmp_path)
+    monkeypatch.chdir(checkout)
+    monkeypatch.setenv("PATH", os.defpath)  # absolute entries: nothing to anchor
+    seen: list[str] = []
+
+    def runner(req):
+        cwd = req.cwd
+        assert cwd is not None and os.path.isabs(cwd) and os.path.isdir(cwd)
+        assert os.listdir(cwd) == []
+        assert not Path(cwd).resolve().is_relative_to(checkout.resolve())
+        assert req.env == {"GIT_DIR": cwd}
+        assert os.path.basename(cwd).startswith(GH_WORKDIR_PREFIX)
+        seen.append(cwd)
+        return _res({}, exit_code=0)
+
+    _client_calls(GitHubClient(runner=runner, retry_delay_seconds=0))
+    assert len(seen) >= 12 and len(set(seen)) == len(seen)  # one directory per process
+    assert not any(os.path.exists(cwd) for cwd in seen)
+
+
+@pytest.mark.parametrize(
+    "environment",
+    ["clean", "inherited-git-dir", "tmpdir-in-the-checkout"],
+)
+def test_a_gh_that_runs_git_cannot_touch_the_operators_checkout(tmp_path, monkeypatch, environment):
+    """#283: the real client starts a `gh` that runs git where it was started, from the
+    operator's checkout, for the merge and the branch deletion. That git finds no
+    repository: the checkout keeps its branch and HEAD, even when the controller's own
+    environment names the checkout's git directory or puts the temporary directory
+    inside the checkout."""
+    checkout = _checkout(tmp_path)
+    head = git_out("-C", str(checkout), "rev-parse", "HEAD")
+    fake, log = local_git_gh(tmp_path / "bin", _CHECKOUT_BRANCH)
+    if environment == "inherited-git-dir":
+        monkeypatch.setenv("GIT_DIR", str(checkout / ".git"))
+    if environment == "tmpdir-in-the-checkout":
+        inside = checkout / "tmp"
+        inside.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(inside))
+    monkeypatch.chdir(checkout)
+    gh = GitHubClient(gh_command=str(fake), retry_delay_seconds=0)
+    gh.merge_pr("https://github.com/o/r/pull/42", match_head_sha="a" * 40)
+    gh.delete_branch_ref("o/r", _CHECKOUT_BRANCH, default_branch="main")
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    cwds, outcomes = local_git_gh_runs(log)
+    assert len(cwds) == 2 and checkout.resolve() not in {Path(c) for c in cwds}
+    # Every git the fake ran failed: none of them found a repository.
+    assert outcomes == [f"{op} 128" for op in ("rev-parse", "checkout", "branch-D")] * 2
+    assert git_out("-C", str(checkout), "branch", "--show-current") == _CHECKOUT_BRANCH
+    assert git_out("-C", str(checkout), "rev-parse", "HEAD") == head
+
+
+def test_a_relative_gh_command_still_names_what_it_named(tmp_path, monkeypatch):
+    """A relative ``github.command`` is resolved from the controller's directory, since the
+    child now starts in another one."""
+    monkeypatch.chdir(tmp_path)
     seen = []
 
-    def handler(req):
-        seen.append(req.command)
-        return _res({"nameWithOwner": "o/r", "defaultBranchRef": {"name": "main"}})
+    def runner(req):
+        seen.append(req.command[0])
+        return _res({}, exit_code=0)
 
-    assert _client(handler).current_repo().name_with_owner == "o/r"
-    assert seen[0][:3] == ["gh", "repo", "view"]
+    GitHubClient(gh_command="tools/gh", runner=runner).version()
+    GitHubClient(gh_command="gh", runner=runner).version()
+    assert seen == [str(tmp_path / "tools" / "gh"), "gh"]
+
+
+def _version_gh(directory: Path, version: str) -> None:
+    """A `gh` in ``directory`` that answers ``--version`` with ``version``."""
+    directory.mkdir(parents=True, exist_ok=True)
+    gh = directory / "gh"
+    gh.write_text(f"#!/bin/sh\necho 'gh version {version}'\n")
+    gh.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    ("entry", "where"),
+    [("bin", "bin"), ("./bin", "bin"), ("", "."), (".", ".")],
+    ids=["relative", "dot-relative", "empty", "dot"],
+)
+def test_a_bare_gh_found_through_a_relative_path_entry_is_found_still(
+    tmp_path, monkeypatch, entry, where
+):
+    """A bare ``github.command`` is looked up on ``PATH`` as from the controller's
+    directory, although the child starts in an empty one of its own."""
+    work = tmp_path / "work"
+    _version_gh(work / where, "0.0.0-relative")
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("PATH", os.pathsep.join([entry, os.defpath]))
+    assert GitHubClient(retry_delay_seconds=0).version() == "gh version 0.0.0-relative"
+
+
+def test_a_relative_path_entry_never_reaches_the_directory_gh_starts_in(tmp_path, monkeypatch):
+    """From the empty directory `gh` starts in, ``..`` is the shared temporary directory
+    it was made in. The entry still means the controller's parent directory."""
+    shared = tmp_path / "shared-tmp"
+    _version_gh(shared, "planted")
+    monkeypatch.setattr(tempfile, "tempdir", str(shared))
+    _version_gh(tmp_path, "0.0.0-operator")
+    (tmp_path / "work").mkdir()
+    monkeypatch.chdir(tmp_path / "work")
+    monkeypatch.setenv("PATH", os.pathsep.join(["..", os.defpath]))
+    assert GitHubClient(retry_delay_seconds=0).version() == "gh version 0.0.0-operator"
+
+
+@pytest.mark.parametrize("lookup", ["path", "command"])
+def test_relative_gh_lookup_preserves_symlink_before_parent(tmp_path, monkeypatch, lookup):
+    """The kernel resolves ``..`` after following the link, not lexically."""
+    work = tmp_path / "work"
+    work.mkdir()
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    (work / "link").symlink_to(real_bin, target_is_directory=True)
+    _version_gh(tmp_path / "real" / "tools", "original")
+    _version_gh(work / "tools", "decoy")
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("PATH", os.pathsep.join(["link/../tools", os.defpath]))
+    command = "gh" if lookup == "path" else "link/../tools/gh"
+    assert (
+        GitHubClient(gh_command=command, retry_delay_seconds=0).version() == "gh version original"
+    )
+
+
+def test_relative_path_entries_are_anchored_for_gh_and_what_it_runs(tmp_path, monkeypatch):
+    """`gh` looks git up on the same ``PATH``, so the child's ``PATH`` itself carries
+    the anchored entries; the command stays a bare name, looked up on it."""
+    monkeypatch.chdir(tmp_path)
+    here = os.getcwd()
+    monkeypatch.setenv("PATH", os.pathsep.join(["bin", "", ".", "/usr/bin", "../tools"]))
+    seen = []
+    GitHubClient(runner=lambda req: seen.append(req) or _res({}), retry_delay_seconds=0).version()
+    (req,) = seen
+    assert req.command == ["gh", "--version"]
+    assert req.env == {
+        "GIT_DIR": req.cwd,
+        "PATH": os.pathsep.join(
+            [
+                os.path.join(here, "bin"),
+                here,
+                os.path.join(here, "."),
+                "/usr/bin",
+                os.path.join(here, "../tools"),
+            ]
+        ),
+    }
+
+
+def test_gh_workdir_failure_is_a_github_error_and_starts_nothing(monkeypatch):
+    def refuse(*a, **kw):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", refuse)
+    started = []
+    gh = GitHubClient(runner=lambda req: started.append(req) or _res({}), retry_delay_seconds=0)
+    with pytest.raises(GitHubError, match="empty working directory for gh"):
+        gh.get_repo("o/r")
+    assert started == []
+
+
+# -- the merged head branch's deletion (#283) -----------------------------------------------
+def test_get_branch_ref_reads_one_exact_ref():
+    seen = []
+
+    def runner(req):
+        seen.append(req.command)
+        return _res(
+            {
+                "ref": "refs/heads/feature/a#1",
+                "object": {"sha": "A" * 40, "type": "commit"},
+            }
+        )
+
+    assert _client(runner).get_branch_ref("o/r", "feature/a#1") == "a" * 40
+    # The singular endpoint (the plural one answers a prefix with every ref under it).
+    assert seen == [["gh", "api", "repos/o/r/git/ref/heads/feature/a%231"]]
+
+
+def test_get_branch_ref_404_is_absent_and_other_failures_are_not():
+    gh = _client(lambda req: _res({}, exit_code=1, stderr="gh: Not Found (HTTP 404)"))
+    assert gh.get_branch_ref("o/r", "b") is None
+    gh = GitHubClient(
+        runner=lambda req: _res({}, exit_code=1, stderr="HTTP 403: Resource not accessible"),
+        retry_delay_seconds=0,
+    )
+    with pytest.raises(GitHubError) as info:
+        gh.get_branch_ref("o/r", "b")
+    assert not isinstance(info.value, GitHubNotFoundError)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        [{"ref": "refs/heads/b-1", "object": {"sha": "a" * 40, "type": "commit"}}],
+        {"ref": "refs/heads/other", "object": {"sha": "a" * 40, "type": "commit"}},
+        {"ref": "refs/heads/b", "object": {"sha": "a" * 40, "type": "tag"}},
+        {"ref": "refs/heads/b", "object": {"sha": "abc", "type": "commit"}},
+        {"ref": "refs/heads/b"},
+    ],
+    ids=["a-prefix-listing", "another-ref", "not-a-commit", "short-sha", "no-object"],
+)
+def test_get_branch_ref_refuses_an_answer_for_anything_but_that_ref(reply):
+    with pytest.raises(GitHubError) as info:
+        _client(lambda req: _res(reply)).get_branch_ref("o/r", "b")
+    assert not isinstance(info.value, GitHubNotFoundError)
+
+
+def test_delete_branch_ref_sends_one_scoped_rest_delete():
+    seen = []
+
+    def runner(req):
+        seen.append((req.command, req.stdin_data))
+        return ExecutionResult(req.command, req.cwd, 0, "", "", "t", "t")
+
+    _client(runner).delete_branch_ref("o/r", "autoforge/2-x", default_branch="main")
+    assert seen == [
+        (["gh", "api", "--method", "DELETE", "repos/o/r/git/refs/heads/autoforge/2-x"], None)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("repository", "branch", "default"),
+    [
+        ("o/r", "main", "main"),
+        ("o/r", "Main", "main"),
+        ("o/r", "feature", ""),
+        ("o/r", "", "main"),
+        ("o/r", "a/../main", "main"),
+        ("o/r", "-x", "main"),
+        ("o/r", "a b", "main"),
+        ("o/r", "a/", "main"),
+        ("o/r", "x.lock", "main"),
+        ("o/r", "refs/heads/a@{1}", "main"),
+        ("o/../x", "feature", "main"),
+        ("{owner}/{repo}", "feature", "main"),
+    ],
+)
+def test_delete_branch_ref_refuses_before_any_process_starts(repository, branch, default):
+    """The default branch (in any letter case), an unknown default, a name that is not
+    one branch and a repository path that is not one repository are refused unsent."""
+    started = []
+    gh = _client(lambda req: started.append(req) or _res({}))
+    with pytest.raises(GitHubError):
+        gh.delete_branch_ref(repository, branch, default_branch=default)
+    assert started == []
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        ("gh: Bad Gateway (HTTP 502)", GitHubUnavailableError),
+        ("gh: Reference does not exist (HTTP 422)", GitHubError),
+    ],
+)
+def test_delete_branch_ref_is_sent_once_whatever_the_outcome(stderr, expected):
+    """A deletion is never re-sent on an ambiguous outcome (D4.3): the caller reads the
+    ref back instead."""
+    started = []
+
+    def runner(req):
+        started.append(req.command)
+        return ExecutionResult(req.command, req.cwd, 1, "", stderr, "t", "t")
+
+    gh = GitHubClient(runner=runner, transient_retries=3, retry_delay_seconds=0)
+    with pytest.raises(expected):
+        gh.delete_branch_ref("o/r", "b", default_branch="main")
+    assert len(started) == 1
 
 
 def test_build_merge_argv_and_merge_pr():
@@ -781,15 +1088,11 @@ def test_build_merge_argv_and_merge_pr():
         "--match-head-commit",
         sha,
     ]
-    assert build_merge_argv(url, "rebase", sha, delete_branch=True) == [
-        "pr",
-        "merge",
-        url,
-        "--rebase",
-        "--match-head-commit",
-        sha,
-        "--delete-branch",
-    ]
+    # #283: never `--delete-branch`, which deletes the local branch too.
+    with pytest.raises(TypeError):
+        build_merge_argv(url, "rebase", sha, delete_branch=True)  # type: ignore[call-arg]
+    for method in ("squash", "merge", "rebase"):
+        assert "--delete-branch" not in build_merge_argv(url, method, sha)
     with pytest.raises(ConfigurationError, match="merge.method"):
         build_merge_argv(url, "fast-forward", sha)
     # The merge is always bound to a full reviewed HEAD SHA — never unbound.

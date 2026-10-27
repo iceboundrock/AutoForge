@@ -18,9 +18,11 @@ from __future__ import annotations
 import ast
 import os
 import re
+import select
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 from autoforge import locking
@@ -31,7 +33,15 @@ from autoforge.git_transport import NO_AUTO_MAINTENANCE
 from autoforge.locking import SharedGitLock
 from autoforge.premerge import export_commit_tree
 from autoforge.safefs import SafeRoot
-from tests.conftest import GIT_IDENT, ISSUE, FakeGitHub, git_repo, implement, make_engine
+from tests.conftest import (
+    GIT_IDENT,
+    ISSUE,
+    FakeGitHub,
+    git_repo,
+    github_origin,
+    implement,
+    make_engine,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -191,7 +201,10 @@ def _run_together(scripts: list[list[str]]) -> list[list[str]]:
     """Start every child, release them at once, return each one's output lines.
 
     Each child gets the barrier's two descriptors (``READY_FD``, ``GO_FD``)
-    and runs past it only once all of them are ready.
+    and runs past it only once all of them are ready. No child can end
+    before it is released, so one that has fails the test with its stderr:
+    the others still hold the pipe open, so the read alone would wait
+    forever.
     """
     ready_r, ready_w = os.pipe()
     go_r, go_w = os.pipe()
@@ -211,10 +224,13 @@ def _run_together(scripts: list[list[str]]) -> list[list[str]]:
     os.close(go_r)
     try:
         arrived = 0
+        deadline = time.monotonic() + 300
         while arrived < len(children):
-            chunk = os.read(ready_r, len(children))
-            assert chunk, "a child ended before the barrier"
-            arrived += len(chunk)
+            ended = [child for child in children if child.poll() is not None]
+            assert not ended, f"a child ended before the barrier: {ended[0].communicate()[1]}"
+            assert time.monotonic() < deadline, "the children never all reached the barrier"
+            if select.select([ready_r], [], [], 0.1)[0]:
+                arrived += len(os.read(ready_r, len(children)))
         os.write(go_w, b"g" * len(children))
         results = [child.communicate(timeout=300) for child in children]
     finally:
@@ -267,6 +283,7 @@ def test_l1_concurrent_worktree_add_for_different_issues(tmp_path):
     holds L1 alone, and the registry and the store stay consistent."""
     repo = git_repo(tmp_path / "repo")
     head = _commit(repo, "a.txt", "a\n")
+    github_origin(repo)  # set once, before the children: each make_engine only reads it
     common = Path(os.path.realpath(repo / ".git"))
     issues = (2, 3, 4, 5)
     outputs = _run_together(

@@ -67,6 +67,7 @@ from .conftest import (
     connect_origin,
     git_out,
     git_repo,
+    github_origin,
     implement,
     make_engine,
     review_result,
@@ -95,7 +96,8 @@ class World:
 
     def __init__(self, tmp_path: Path, monkeypatch, config: dict | None = None) -> None:
         self.tmp_path = tmp_path
-        self.repo = git_repo(tmp_path / "repo")
+        # Its ``origin`` names the run's repository, which INITIALIZING reads (#283).
+        self.repo = github_origin(git_repo(tmp_path / "repo"))
         (tmp_path / "origin").mkdir()
         self.origin = Origin.seeded(tmp_path / "origin", self.repo)
         self.gh = FakeGitHub()

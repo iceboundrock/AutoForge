@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ from autoforge.certificate import Revision, remote_certificate  # noqa: E402
 from autoforge.config import default_config  # noqa: E402
 from autoforge.engine import ControllerEngine  # noqa: E402
 from autoforge.errors import (  # noqa: E402
+    ExecutionError,
     GitHubChecksAccessError,
     GitHubError,
     GitHubNotFoundError,
@@ -398,7 +400,7 @@ class FakeGitHub:
         self.comments: dict[str, list[CommentInfo]] = {}
         self.calls: list[tuple] = []
         # Controller-owned merge simulation (see merge_pr).
-        self.merges: list[tuple[str, str, str, bool]] = []
+        self.merges: list[tuple[str, str, str]] = []
         self.merge_error: str = ""  # non-empty -> merge_pr raises GitHubError
         self.merge_leaves_open: bool = False  # gh exits 0 but PR stays OPEN (merge queue)
         self.merge_arms_auto: bool = False  # ... and that call armed auto-merge on the PR
@@ -415,6 +417,19 @@ class FakeGitHub:
         self.changed_files_total: dict[str, int] = {}
         self.changed_files_error: str | GitHubError = ""
         self.disable_auto_error: str = ""  # non-empty -> disable_auto_merge raises
+        # merge.delete_branch (#283): every remote branch deletion the client
+        # would send, as (repository, branch); ``delete_branch_error`` makes it
+        # raise, after deleting when ``delete_branch_lands`` (the reply was
+        # lost), before otherwise. ``branch_ref_error`` makes get_branch_ref
+        # raise, ``get_repo_error`` get_repo. An ExecutionError is the real
+        # client's when `gh` cannot be started.
+        self.deleted_branches: list[tuple[str, str]] = []
+        self.delete_branch_error: GitHubError | ExecutionError | None = None
+        self.delete_branch_lands: bool = False
+        self.branch_ref_error: GitHubError | ExecutionError | None = None
+        self.get_repo_error: GitHubError | ExecutionError | None = None
+        # GitHub's current name for a repository it renamed, by old name.
+        self.repo_names: dict[str, str] = {}
         self.disabled_auto: list[str] = []  # PRs on which disable_auto_merge ran
         self.closed_prs: list[tuple[str, str]] = []
         self.reopened_prs: list[tuple[str, str]] = []
@@ -637,12 +652,14 @@ class FakeGitHub:
         self.workflow_runs[CI_RUN_ID] = replace(self.workflow_runs[CI_RUN_ID], head_sha=sha)
 
     # -- client API --------------------------------------------------------------
-    def current_repo(self) -> RepoInfo:
-        self.calls.append(("current_repo",))
-        return RepoInfo(name_with_owner=self.repo, default_branch=self.default_branch)
-
     def get_repo(self, repo: str) -> RepoInfo:
-        return RepoInfo(name_with_owner=repo, default_branch=self.default_branch)
+        self.calls.append(("get_repo", repo))
+        if self.get_repo_error is not None:
+            raise self.get_repo_error
+        return RepoInfo(
+            name_with_owner=self.repo_names.get(repo.lower(), repo),
+            default_branch=self.default_branch,
+        )
 
     def get_issue(self, url: str) -> IssueInfo:
         self.calls.append(("get_issue", url))
@@ -823,6 +840,29 @@ class FakeGitHub:
         self._actions_failure()
         return self._branch_head(branch)
 
+    def get_branch_ref(self, repository: str, branch: str) -> str | None:
+        """Mimic the exact ref read: the branch's commit, None once it is gone (#283)."""
+        self.calls.append(("get_branch_ref", repository, branch))
+        if self.branch_ref_error is not None:
+            raise self.branch_ref_error
+        if branch in self.branch_heads:
+            return self.branch_heads[branch]
+        return self.origin.head(branch) if self.origin is not None else None
+
+    def delete_branch_ref(self, repository: str, branch: str, *, default_branch: str) -> None:
+        """Mimic ``DELETE repos/<repo>/git/refs/heads/<branch>``, refused as the client refuses."""
+        self.calls.append(("delete_branch_ref", repository, branch, default_branch))
+        if not default_branch or branch.lower() == default_branch.lower():
+            raise GitHubError(f"deleting branch {branch!r}: refused, it is the default branch")
+        self.deleted_branches.append((repository, branch))
+        if self.delete_branch_error is not None and not self.delete_branch_lands:
+            raise self.delete_branch_error
+        self.branch_heads.pop(branch, None)
+        if self.origin is not None and self.origin.head(branch) is not None:
+            self.origin.delete(branch)
+        if self.delete_branch_error is not None:
+            raise self.delete_branch_error
+
     def _branch_head(self, branch: str) -> str:
         if branch in self.branch_heads:
             return self.branch_heads[branch]
@@ -993,19 +1033,13 @@ class FakeGitHub:
                     return replace(c)
         raise GitHubNotFoundError(f"exact read of {url}: GitHub answered HTTP 404")
 
-    def merge_pr(
-        self,
-        url: str,
-        method: str = "squash",
-        match_head_sha: str = "",
-        delete_branch: bool = False,
-    ) -> None:
+    def merge_pr(self, url: str, method: str = "squash", match_head_sha: str = "") -> None:
         """Mimic `gh pr merge --<method> --match-head-commit <sha>` on the fake."""
         from autoforge.validation import parse_pr_url
 
         canonical = parse_pr_url(url).canonical
-        self.calls.append(("merge_pr", canonical, method, match_head_sha, delete_branch))
-        self.merges.append((canonical, method, match_head_sha, delete_branch))
+        self.calls.append(("merge_pr", canonical, method, match_head_sha))
+        self.merges.append((canonical, method, match_head_sha))
         if self.merge_error:
             raise GitHubError(self.merge_error)
         pr = self._stored(canonical)
@@ -1316,6 +1350,28 @@ def scripted_config():
     return cfg
 
 
+def github_origin(repo, repository: str = "owner/repo") -> Path:
+    """Give the checkout ``repo`` an ``origin`` naming ``repository`` on github.com.
+
+    INITIALIZING reads the checkout's repository from its ``origin``, locally
+    (#283): an engine's checkout needs one, as an operator's has. Nothing
+    ever fetches from it: the controller's transport uses its own URL. An
+    ``origin`` that already names ``repository`` is left alone, so engines
+    built on one checkout at once (``tests/test_shared_git.py``) read it
+    without racing each other for ``.git/config``.
+    """
+    root = Path(repo)
+    url = f"https://github.com/{repository}.git"
+    has = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"], capture_output=True, text=True
+    )
+    if has.returncode == 0 and has.stdout.strip() == url:
+        return root
+    verb = "set-url" if has.returncode == 0 else "add"
+    subprocess.run(["git", "-C", str(root), "remote", verb, "origin", url], check=True)
+    return root
+
+
 def git_repo(path) -> Path:
     """Make ``path`` a git repository with one commit unless it already is one.
 
@@ -1484,6 +1540,46 @@ def commit_in(cwd, message: str = "Implement the feature (#2)") -> str:
     """One (empty) commit on the agent worktree's detached HEAD; the new HEAD."""
     git_out("-C", str(cwd), *GIT_IDENT, "commit", "-q", "--allow-empty", "-m", message)
     return git_out("-C", str(cwd), "rev-parse", "HEAD")
+
+
+_LOCAL_GIT_GH = """#!/bin/sh
+# A `gh` that does in its working directory what gh 2.103.2 does there for
+# `gh pr merge --delete-branch` (pkg/cmd/pr/merge/merge.go): ask git for the
+# local head branch, move the checkout off it, delete it. It does so for every
+# command, and exits 0 with no output.
+log={log}
+printf 'cwd %s\\n' "$(pwd -P)" >> "$log"
+git rev-parse --verify refs/heads/{branch} >/dev/null 2>&1
+printf 'rev-parse %s\\n' "$?" >> "$log"
+git checkout -q --detach >/dev/null 2>&1
+printf 'checkout %s\\n' "$?" >> "$log"
+git branch -D {branch} >/dev/null 2>&1
+printf 'branch-D %s\\n' "$?" >> "$log"
+exit 0
+"""
+
+
+def local_git_gh(where, branch: str) -> tuple[Path, Path]:
+    """A fake `gh` that runs git on ``branch`` where it is started (#283), and its log.
+
+    The log has a ``cwd <dir>`` line per start, then ``<op> <exit>`` for each
+    git it ran (``rev-parse``, ``checkout``, ``branch-D``): 128 is git finding
+    no repository.
+    """
+    root = Path(where)
+    root.mkdir(parents=True, exist_ok=True)
+    log = root / "gh.log"
+    gh = root / "gh"
+    gh.write_text(_LOCAL_GIT_GH.format(log=shlex.quote(str(log)), branch=shlex.quote(branch)))
+    gh.chmod(0o755)
+    return gh, log
+
+
+def local_git_gh_runs(log: Path) -> tuple[list[str], list[str]]:
+    """``(working directories, git outcomes)`` from a :func:`local_git_gh` log."""
+    lines = log.read_text().splitlines() if log.exists() else []
+    cwds = [line.split(" ", 1)[1] for line in lines if line.startswith("cwd ")]
+    return cwds, [line for line in lines if not line.startswith("cwd ")]
 
 
 @contextmanager
@@ -1710,7 +1806,8 @@ def make_engine(
     """Engine wired to a ScriptedProvider (agents) and FakeGitHub (verification).
 
     ``workdir`` defaults to the parent of ``state_dir`` (the test's tmp_path),
-    made a git repository so the engine can derive its repository lock.
+    made a git repository so the engine can derive its repository lock, with
+    an ``origin`` naming the fake's repository (:func:`github_origin`).
     ``origin`` attaches a seeded bare origin (:func:`attach_origin`), which
     an ANALYZE_EXECUTE entry needs: the controller fetches from and pushes
     to it (#161). The engine keeps it as ``eng.origin``.
@@ -1718,6 +1815,10 @@ def make_engine(
     cfg = cfg or default_config()
     if workdir is None:
         workdir = git_repo(Path(state_dir).parent)
+    # As FakeGitHub's ``repo`` (the repository the run's checkout belongs to);
+    # a workdir that is no repository (the lock tests) has no remote to set.
+    if (Path(workdir) / ".git").exists():
+        github_origin(workdir, getattr(github, "repo", "owner/repo"))
     provider = ScriptedProvider(script, exit_code=exit_code)
     registry = ProviderRegistry(overrides={"claude": provider, "opencode": provider})
     gh = github or FakeGitHub()

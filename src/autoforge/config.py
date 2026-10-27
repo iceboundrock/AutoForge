@@ -446,7 +446,9 @@ class MergeConfig:
     """How the *controller* merges once the gate is open (never an agent)."""
 
     method: str = "squash"  # squash | merge | rebase  -> gh pr merge --<method>
-    delete_branch: bool = False  # gh pr merge --delete-branch
+    # After a verified merge, delete the PR's head branch on GitHub only (a
+    # scoped REST call, never `gh pr merge --delete-branch`, #283).
+    delete_branch: bool = False
     # Inconclusive GitHub data (mergeability UNKNOWN, checks still running,
     # post-merge re-read failed) is re-checked on `resume` at most this many
     # times per phase; then the run is BLOCKED instead of retrying forever.

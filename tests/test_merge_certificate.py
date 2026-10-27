@@ -210,7 +210,7 @@ def test_a_certificate_and_every_live_gate_continue_to_the_existing_merge(tmp_st
     reads = comment_reads(gh)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "UPDATE_EPIC" and "merged by the controller" in out.message
-    assert gh.merges == [(PR, "squash", head, False)]
+    assert gh.merges == [(PR, "squash", head)]
     assert comment_reads(gh) == reads + 1, "MERGE re-read the review comment itself"
     assert runs(marker) == 1, "the premerge_verified_* cache rule is unchanged"
     s = saved(eng)
@@ -250,7 +250,7 @@ def test_no_certificate_blocks_before_anything_else_and_unblock_decides_review(
     cert = saved(eng).review_certificate
     assert cert["review_round"] == 2 and cert["reviewed_head_sha"] == head
     assert merges_through(eng) == ["MERGE", "UPDATE_EPIC"]
-    assert gh.merges == [(PR, "squash", head, False)]
+    assert gh.merges == [(PR, "squash", head)]
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
@@ -297,7 +297,7 @@ def test_a_set_or_policy_changed_since_issuance_blocks_naming_it(
     assert decision.unblocked and decision.phase == "READY_FOR_MERGE"
     assert "review certificate of round 1 applies" in decision.message
     assert merges_through(eng3) == ["MERGE", "UPDATE_EPIC"]
-    assert gh.merges == [(PR, "squash", head, False)]
+    assert gh.merges == [(PR, "squash", head)]
     assert saved(eng3).review_round == 1, "no new round"
 
 
@@ -583,7 +583,7 @@ def test_a_push_after_the_clean_review_certifies_the_new_head_alone(tmp_state_di
     assert cert["review_round"] == 2 and cert["reviewed_head_sha"] == new
     assert cert["records"] == [{"seq": validated["seq"], "digest": validated["digest"]}]
     assert merges_through(eng) == ["MERGE", "UPDATE_EPIC"]
-    assert gh.merges == [(PR, "squash", new, False)]
+    assert gh.merges == [(PR, "squash", new)]
 
 
 def test_unblock_after_a_push_decides_review_and_the_old_certificate_never_applies(
@@ -624,7 +624,7 @@ def test_a_base_that_advanced_with_the_merge_base_unchanged_keeps_the_certificat
     gh.prs[PR].merge_state_status = "CLEAN"
     eng.unblock(REASON)
     assert merges_through(eng) == ["MERGE", "UPDATE_EPIC"]
-    assert gh.merges == [(PR, "squash", head, False)]
+    assert gh.merges == [(PR, "squash", head)]
     assert saved(eng).review_round == 1, "no new round"
 
 
@@ -695,7 +695,7 @@ def test_a_moved_base_routes_to_review_reuses_the_records_and_certifies_the_new_
         cert["reviewed_merge_base_sha"],
     ) == (head, base, merge_base)
     assert merges_through(eng) == ["MERGE", "UPDATE_EPIC"]
-    assert gh.merges == [(PR, "squash", head, False)]
+    assert gh.merges == [(PR, "squash", head)]
 
 
 def _edited_to_needs_fix(gh, head, merge_base):
@@ -791,7 +791,7 @@ def test_an_old_certificate_stays_as_history_and_the_next_producer_validates_a_n
     ]
     assert cert["validation_set_digest"] != first["validation_set_digest"]
     assert merges_through(eng2) == ["MERGE", "UPDATE_EPIC"]
-    assert gh.merges == [(PR, "squash", fix, False)]
+    assert gh.merges == [(PR, "squash", fix)]
 
 
 def test_a_replan_replacement_inherits_no_certificate(tmp_state_dir):
@@ -853,7 +853,7 @@ def test_a_replan_replacement_inherits_no_certificate(tmp_state_dir):
     assert cert["records"] == [{"seq": record["seq"], "digest": record["digest"]}]
     assert records_for(s, eng.source), "the source's records stay as history too"
     assert merges_through(eng) == ["MERGE", "UPDATE_EPIC"]
-    assert gh.merges == [(REPLACEMENT_PR, "squash", replacement, False)]
+    assert gh.merges == [(REPLACEMENT_PR, "squash", replacement)]
     assert gh.prs[PR].state == "CLOSED"
 
 
@@ -1028,7 +1028,7 @@ def test_a_crash_during_merge_verification_reruns_it_and_the_certificate_check(
     eng2 = reopened(eng, tmp_state_dir, gh)
     assert merges_through(eng2) == ["MERGE", "UPDATE_EPIC"]
     assert checked == [1, 2], "checked before the rerun at the gate pass, and again at MERGE"
-    assert runs(marker) == 2 and gh.merges == [(PR, "squash", head, False)]
+    assert runs(marker) == 2 and gh.merges == [(PR, "squash", head)]
 
 
 def test_a_push_while_the_review_entry_validates_certifies_only_the_new_head(tmp_state_dir):
@@ -1067,7 +1067,7 @@ def test_a_push_while_the_review_entry_validates_certifies_only_the_new_head(tmp
     assert (cert["review_round"], cert["candidate"]["commit"]) == (2, new)
     assert cert["records"] == [{"seq": validated["seq"], "digest": validated["digest"]}]
     assert merges_through(eng) == ["MERGE", "UPDATE_EPIC"]
-    assert gh.merges == [(PR, "squash", new, False)]
+    assert gh.merges == [(PR, "squash", new)]
 
 
 def test_a_restart_with_a_valid_certificate_merges(tmp_state_dir):
@@ -1075,7 +1075,7 @@ def test_a_restart_with_a_valid_certificate_merges(tmp_state_dir):
     eng, head = ready(tmp_state_dir, gh, PASSES)
     eng2 = reopened(eng, tmp_state_dir, gh, ["no agent runs at the gate"])
     assert merges_through(eng2) == ["MERGE", "UPDATE_EPIC"]
-    assert eng2.provider.calls == [] and gh.merges == [(PR, "squash", head, False)]
+    assert eng2.provider.calls == [] and gh.merges == [(PR, "squash", head)]
 
 
 @pytest.mark.parametrize("phase", [Phase.REVIEW, Phase.READY_FOR_MERGE, Phase.MERGE, Phase.BLOCKED])
@@ -1202,7 +1202,7 @@ def test_the_gate_routes_the_same_behind_every_provider(tmp_path_factory):
         messages.append(eng.unblock(REASON).message)
         messages += [eng.step(allow_merge=True).message for _ in range(2)]
         s = saved(eng)
-        assert s.phase == Phase.UPDATE_EPIC and gh.merges == [(PR, "squash", heads[-1], False)]
+        assert s.phase == Phase.UPDATE_EPIC and gh.merges == [(PR, "squash", heads[-1])]
         seen.append([_normalized(m, s) for m in messages[2:]])
         if provider == "pi":
             assert eng.provider.calls == [], "the Pi fake answered, not the scripted provider"

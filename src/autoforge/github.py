@@ -18,7 +18,9 @@ agent claims, and it performs every GitHub write itself through it:
   returns is informational; the caller's read-back is the evidence;
 - the writes that keep their own mechanisms (D5.4):
   :meth:`GitHubClient.merge_pr`, always behind the safety gate and bound to
-  the reviewed HEAD via ``--match-head-commit``;
+  the reviewed HEAD via ``--match-head-commit``, and the merged PR's remote
+  head branch deletion behind ``merge.delete_branch``,
+  :meth:`GitHubClient.delete_branch_ref` (#283);
   :meth:`GitHubClient.disable_auto_merge`; :meth:`GitHubClient.close_pr`,
   its receipt and the compensating :meth:`GitHubClient.reopen_pr` for a
   verified replacement lifecycle, never deleting a branch; and the EPIC
@@ -30,6 +32,10 @@ Every call goes through `gh` except the exact reads (#327):
 API directly (:func:`https_get`), with the credential `gh auth token`
 prints, because `gh` rewrites the text it prints and an effect's read-back
 must compare GitHub's own bytes. They are read-only and bounded.
+
+Every `gh` process starts in an empty directory of its own, never in the
+operator's checkout (:func:`gh_workdir`, #283): `gh` runs git where it is
+started, and nothing it is asked here needs a local repository.
 """
 
 from __future__ import annotations
@@ -40,12 +46,14 @@ import io
 import json
 import os
 import re
+import shutil
 import ssl
 import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import NoReturn
@@ -639,6 +647,91 @@ class ClassicBranchProtection:
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 
+# -- where `gh` runs (#283) -------------------------------------------------------
+# `gh` runs git in its own working directory for some commands. gh 2.103.2's
+# `gh pr merge` asks git whether the PR's head branch exists locally on every
+# merge, and with `--delete-branch` it may check out the base branch, pull,
+# prune or remove a worktree, and then deletes the local branch
+# (pkg/cmd/pr/merge/merge.go; its git client sets no repository directory, so
+# git runs where `gh` was started). Started in the operator's checkout, that
+# git reads the shared repository's configuration and runs its hooks, which an
+# agent can write, with the controller's credential in the environment. So
+# every `gh` the controller starts runs in a fresh, empty directory of its
+# own, in the temporary directory, and with ``GIT_DIR`` naming that same
+# directory: it is no git directory, so a git that `gh` starts fails instead
+# of finding a repository, whatever the controller's own environment says (an
+# inherited ``GIT_DIR``, a ``TMPDIR`` inside a checkout). Nothing the
+# controller asks of `gh` needs a local repository: every call names its
+# repository, PR or issue explicitly.
+GH_WORKDIR_PREFIX = "autoforge-gh-"
+
+
+@contextmanager
+def gh_workdir() -> Iterator[str]:
+    """A fresh empty directory for one `gh` process, removed once it has exited (#283)."""
+    try:
+        path = tempfile.mkdtemp(prefix=GH_WORKDIR_PREFIX)
+    except OSError as exc:
+        raise GitHubError(f"cannot create an empty working directory for gh: {exc}") from exc
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def gh_request(
+    command: Sequence[str],
+    workdir: str,
+    *,
+    timeout_seconds: int,
+    stdin: bytes | None = None,
+) -> ExecutionRequest:
+    """The request that runs ``command``, a `gh` argv, in ``workdir`` (:func:`gh_workdir`).
+
+    ``command`` still names what it named from the controller's own directory,
+    now that the child starts elsewhere: a relative path is made absolute, and
+    so is each relative ``PATH`` entry (:func:`_anchored_search_path`), where a
+    bare name, and every program `gh` itself starts, is looked up.
+    """
+    executable = command[0]
+    if os.sep in executable and not os.path.isabs(executable):
+        executable = os.path.join(os.getcwd(), executable)
+    env = {"GIT_DIR": workdir}
+    search_path = _anchored_search_path(os.environ.get("PATH"))
+    if search_path is not None:
+        env["PATH"] = search_path
+    return ExecutionRequest(
+        command=[executable, *command[1:]],
+        cwd=workdir,
+        env=env,
+        timeout_seconds=timeout_seconds,
+        stdin_data=stdin,
+    )
+
+
+def _anchored_search_path(path: str | None) -> str | None:
+    """``path``, a ``PATH`` value, each relative entry made absolute from this directory.
+
+    The empty entry, like ``.``, is the current directory, as exec's lookup
+    reads it. Left relative, an entry would be looked up from the empty
+    directory a `gh` starts in: ``bin`` would no longer find what it found,
+    and ``..`` would reach the shared temporary directory that one was made
+    in. None when ``PATH`` is unset or every entry is absolute, since the
+    child's lookup then does not depend on its directory. Do not normalize
+    ``..``: the kernel must follow any preceding symlink before resolving it.
+    """
+    if path is None:
+        return None
+    entries = path.split(os.pathsep)
+    if all(os.path.isabs(entry) for entry in entries):
+        return None
+    cwd = os.getcwd()
+    return os.pathsep.join(
+        entry if os.path.isabs(entry) else os.path.join(cwd, entry) if entry else cwd
+        for entry in entries
+    )
+
+
 # -- the exact read -------------------------------------------------------------
 # `gh` rewrites every JSON reply before printing it (go-gh's asciisanitizer on
 # the HTTP transport, which no flag turns off): a C0 or C1 control character
@@ -1171,6 +1264,26 @@ def _repository_path(repository: str) -> str:
     return f"{owner}/{name}"
 
 
+# What ``git check-ref-format`` refuses in a branch name, plus whitespace: a
+# branch the controller deletes or reads by name is one exact ref, never a
+# path that could reach another (``..``) or a pattern.
+_BRANCH_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]|\.\.|@\{|//|/\.|\.lock(?:/|\Z)")
+
+
+def _branch_path(branch: str, what: str) -> str:
+    """``branch`` as it goes into a ``git/ref/heads/`` REST path: one branch, percent-encoded."""
+    if (
+        not isinstance(branch, str)
+        or not branch
+        or branch == "@"
+        or branch.startswith(("/", ".", "-"))
+        or branch.endswith(("/", "."))
+        or _BRANCH_FORBIDDEN_RE.search(branch)
+    ):
+        raise GitHubError(f"{what}: {branch!r:.120} is not a branch name")
+    return quote(branch, safe="/")
+
+
 def _check_write_bounds(what: str, *, body: str, title: str | None = None) -> None:
     """Refuse a payload GitHub would refuse, before any process runs."""
     if not isinstance(body, str):
@@ -1333,18 +1446,16 @@ def _rest_pr_row(row: object, what: str) -> dict:
     }
 
 
-def build_merge_argv(
-    pr_url: str,
-    method: str = "squash",
-    match_head_sha: str = "",
-    delete_branch: bool = False,
-) -> list[str]:
+def build_merge_argv(pr_url: str, method: str = "squash", match_head_sha: str = "") -> list[str]:
     """Pure argv builder for ``gh pr merge`` (no ``gh`` prefix, no execution).
 
     Shared by :meth:`GitHubClient.merge_pr` and the engine's dry-run plan so
     the command shown in dry-run is exactly the one that would run.
     ``match_head_sha`` must be the full 40-hex reviewed HEAD; GitHub then
-    refuses the merge server-side if the PR HEAD moved.
+    refuses the merge server-side if the PR HEAD moved. It never carries
+    ``--delete-branch``, which deletes the local branch too (#283):
+    ``merge.delete_branch`` deletes the remote head branch only, through
+    :meth:`GitHubClient.delete_branch_ref`.
     """
     if method not in MERGE_METHODS:
         raise ConfigurationError(f"merge.method must be one of {MERGE_METHODS}, got {method!r}")
@@ -1354,10 +1465,7 @@ def build_merge_argv(
             f"got {match_head_sha!r}"
         )
     ref = parse_pr_url(pr_url)
-    argv = ["pr", "merge", ref.canonical, f"--{method}", "--match-head-commit", match_head_sha]
-    if delete_branch:
-        argv.append("--delete-branch")
-    return argv
+    return ["pr", "merge", ref.canonical, f"--{method}", "--match-head-commit", match_head_sha]
 
 
 def build_disable_auto_merge_argv(pr_url: str) -> list[str]:
@@ -1653,13 +1761,15 @@ class GitHubClient:
         # No GitHub call while this process holds the shared-Git lock (ADR
         # 0008 D11.2): its holder must never wait on anything remote.
         assert_shared_git_lock_free("call GitHub")
-        return self._runner(
-            ExecutionRequest(
-                command=[self.gh_command, *args],
-                timeout_seconds=self.timeout_seconds,
-                stdin_data=stdin,
+        with gh_workdir() as workdir:
+            return self._runner(
+                gh_request(
+                    [self.gh_command, *args],
+                    workdir,
+                    timeout_seconds=self.timeout_seconds,
+                    stdin=stdin,
+                )
             )
-        )
 
     def _timeout_message(self, args: list[str]) -> str:
         return f"`gh {' '.join(args)}` timed out after {self.timeout_seconds}s"
@@ -1938,12 +2048,14 @@ class GitHubClient:
     def auth_status(self) -> tuple[bool, str]:
         """(authenticated?, human-readable detail). Never raises for non-auth."""
         try:
-            res = self._runner(
-                ExecutionRequest(
-                    command=[self.gh_command, "auth", "status"],
-                    timeout_seconds=self.timeout_seconds,
+            with gh_workdir() as workdir:
+                res = self._runner(
+                    gh_request(
+                        [self.gh_command, "auth", "status"],
+                        workdir,
+                        timeout_seconds=self.timeout_seconds,
+                    )
                 )
-            )
         except Exception as exc:  # spawn failure etc.
             return False, str(exc)
         text = (res.stdout or "") + (res.stderr or "")
@@ -1955,14 +2067,6 @@ class GitHubClient:
         data = self._api_json(["repo", "view", repo, "--json", "nameWithOwner,defaultBranchRef"])
         return RepoInfo(
             name_with_owner=data.get("nameWithOwner", repo),
-            default_branch=(data.get("defaultBranchRef") or {}).get("name", ""),
-        )
-
-    def current_repo(self) -> RepoInfo:
-        """Repository detected from the cwd's git remote (via gh)."""
-        data = self._api_json(["repo", "view", "--json", "nameWithOwner,defaultBranchRef"])
-        return RepoInfo(
-            name_with_owner=data.get("nameWithOwner", ""),
             default_branch=(data.get("defaultBranchRef") or {}).get("name", ""),
         )
 
@@ -2566,6 +2670,34 @@ class GitHubClient:
             raise GitHubError(f"branch {branch!r} of {repository} has no readable head SHA")
         return sha.lower()
 
+    def get_branch_ref(self, repository: str, branch: str) -> str | None:
+        """The commit ``refs/heads/<branch>`` of ``repository`` points at; None when absent.
+
+        One exact ref, through ``git/ref/heads/<branch>``: the singular
+        endpoint answers that ref or a 404, where the plural one answers a
+        prefix with every ref under it. A 404 is the branch not existing
+        (the caller reads a repository it can read). An answer naming another
+        ref, or a ref that is not a commit, is a conclusive GitHubError,
+        never "absent" (#283).
+        """
+        what = f"branch {branch!r} of {repository}"
+        path = f"repos/{_repository_path(repository)}/git/ref/heads/{_branch_path(branch, what)}"
+        try:
+            data = self._api_json(["api", path])
+        except GitHubNotFoundError:
+            return None
+        target = data.get("object")
+        sha = target.get("sha") if isinstance(target, dict) else None
+        if (
+            data.get("ref") != f"refs/heads/{branch}"
+            or not isinstance(target, dict)
+            or target.get("type") != "commit"
+            or not isinstance(sha, str)
+            or not _FULL_SHA_RE.fullmatch(sha.lower())
+        ):
+            raise GitHubError(f"{what}: GitHub answered with another ref, or an unreadable one")
+        return sha.lower()
+
     def get_merge_base_sha(self, repository: str, base_ref: str, head_sha: str) -> str:
         """The merge base of a base branch and a commit (lower-case SHA).
 
@@ -3080,22 +3212,39 @@ class GitHubClient:
         _replied_object(reply, what, repository=ref.repository, expect=None, number=ref.number)
 
     # -- merge (the only write; controller-owned, engine-gated) ------------------
-    def merge_pr(
-        self,
-        url: str,
-        method: str = "squash",
-        match_head_sha: str = "",
-        delete_branch: bool = False,
-    ) -> None:
+    def merge_pr(self, url: str, method: str = "squash", match_head_sha: str = "") -> None:
         """Run ``gh pr merge`` bound to ``match_head_sha``.
 
         Raises GitHubError when ``gh`` fails (conflict, branch protection,
         HEAD moved, permissions, ...). A normal return only means ``gh``
         exited 0: callers must re-read the PR and confirm ``state == MERGED``
         before treating the merge as done (merge queues / auto-merge may
-        leave the PR open).
+        leave the PR open). No branch is deleted here (#283).
         """
-        self._run_gh(build_merge_argv(url, method, match_head_sha, delete_branch))
+        self._run_gh(build_merge_argv(url, method, match_head_sha))
+
+    def delete_branch_ref(self, repository: str, branch: str, *, default_branch: str) -> None:
+        """Delete ``refs/heads/<branch>`` of ``repository`` on GitHub, and nothing else (#283).
+
+        The controller's one branch deletion, behind ``merge.delete_branch``:
+        ``DELETE repos/<owner>/<repo>/git/refs/heads/<branch>``, a REST call
+        that names its repository and its ref, so no local git runs and no
+        local branch or worktree is touched. ``default_branch`` is the
+        repository's default branch as the caller just read it from GitHub:
+        that branch (in any letter case), and an empty answer, are refused
+        before any process starts, so no caller reaches the default branch
+        through this method. Sent exactly once, outside the transient retry
+        (D4.3): an ambiguous outcome is reconciled by reading the ref back
+        (:meth:`get_branch_ref`), never by sending the deletion again.
+        """
+        what = f"deleting branch {branch!r} of {repository}"
+        path = f"repos/{_repository_path(repository)}/git/refs/heads/{_branch_path(branch, what)}"
+        if not default_branch or branch.lower() == default_branch.lower():
+            raise GitHubError(
+                f"{what}: refused, the repository's default branch is "
+                f"{default_branch or '(unknown)'!r}, and it is never deleted; nothing was sent"
+            )
+        self._run_gh_once(["api", "--method", "DELETE", path])
 
     def disable_auto_merge(self, url: str) -> None:
         """Disarm GitHub auto-merge on ``url`` (``gh pr merge --disable-auto``).

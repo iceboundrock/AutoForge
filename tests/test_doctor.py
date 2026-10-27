@@ -10,6 +10,7 @@ import autoforge.doctor as doctor_module
 import autoforge.executor as executor_module
 from autoforge.doctor import Doctor
 from autoforge.executor import ExecutionResult, execute
+from autoforge.github import GH_WORKDIR_PREFIX
 from autoforge.profiles import local_required_profiles
 from autoforge.redaction import redact
 from tests.conftest import DOTDOT_SPELLINGS, dotdot_config_paths, is_shell_probe
@@ -581,6 +582,33 @@ def test_a_missing_gh_is_reported_as_before(tmp_path):
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory(fail=("gh --version",)))
     result = {r.name: r for r in d.run_all()}["gh available"]
     assert not result.ok and "boom" in result.detail
+
+
+def test_doctors_gh_rows_run_gh_outside_the_checkout(tmp_path, monkeypatch):
+    """#283: `gh --version` and `gh auth status` run as the client's `gh` does, each in
+    an empty directory of its own with ``GIT_DIR`` naming it, never in the checkout;
+    and a bare `gh` found through a relative ``PATH`` entry is still found there."""
+    checkout = tmp_path / "checkout"
+    (checkout / "bin").mkdir(parents=True)
+    log = tmp_path / "gh.log"
+    gh = checkout / "bin" / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'printf "%s %s %s\\n" "$1" "$(pwd -P)" "$GIT_DIR" >> "$AUTOFORGE_TEST_GH_LOG"\n'
+        'if [ "$1" = --version ]; then echo "gh version 2.103.2 (2026-10-23)"; '
+        'else echo "Logged in to github.com"; fi\n'
+    )
+    gh.chmod(0o755)
+    monkeypatch.setenv("AUTOFORGE_TEST_GH_LOG", str(log))
+    monkeypatch.setenv("PATH", os.pathsep.join(["bin", os.defpath]))
+    monkeypatch.chdir(checkout)
+    d = Doctor(cwd=str(checkout))
+    assert d.check_gh_version("gh").ok and d.check_gh_auth("gh").ok
+    runs = [line.split(" ") for line in log.read_text().splitlines()]
+    assert [arg for arg, _, _ in runs] == ["--version", "auth"]
+    for _, cwd, git_dir in runs:
+        assert Path(cwd).name.startswith(GH_WORKDIR_PREFIX) and Path(git_dir).resolve() == Path(cwd)
+        assert not Path(cwd).is_relative_to(checkout.resolve()) and not Path(cwd).exists()
 
 
 def test_non_github_remote_fails(tmp_path):

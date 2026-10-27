@@ -268,7 +268,7 @@ def test_gate_open_loop_merges_via_controller_then_update_epic_to_done(tmp_state
 
     implemented = eng.origin.head("autoforge/2")
     assert implemented is not None
-    assert gh.merges == [(PR, "squash", implemented, False)]
+    assert gh.merges == [(PR, "squash", implemented)]
     assert gh.prs[PR].state == "MERGED"
     assert phases_seen == ["ANALYZE_EXECUTE", "REVIEW", "UPDATE_EPIC"]  # no MERGE agent call
     s = load_state(eng.paths.state_file)
@@ -433,7 +433,7 @@ def test_every_lifecycle_transition_is_decided_by_decide_next_phase(tmp_state_di
     ]
     s = load_state(eng.paths.state_file)
     assert s.phase == Phase.DONE
-    assert gh.merges == [(PR, "squash", s.reviewed_head_sha, False)]
+    assert gh.merges == [(PR, "squash", s.reviewed_head_sha)]
     assert s.reviewed_head_sha == eng.origin.head("autoforge/2")
 
 
@@ -562,7 +562,7 @@ def test_an_all_pi_run_routes_every_launch_through_its_profile(tmp_state_dir, tm
     assert {e["cwd"] for e in launches} == {worktree}
     assert len(fake.auth_checks()) == len(expected)  # one OAuth preflight per launch
     assert eng.provider.calls == []
-    assert gh.merges == [(PR, "squash", eng.origin.head("autoforge/2"), False)]
+    assert gh.merges == [(PR, "squash", eng.origin.head("autoforge/2"))]
     # ADR 0004 parity: the Pi agent returned the PR text, each round's review
     # and the progress text; the controller opened the PR (#161), posted each
     # round's review comment (#162) and posted the progress on the EPIC with
@@ -632,7 +632,7 @@ def test_a_mixed_config_routes_each_profile_to_its_own_provider(
     ] == [PI_PROFILES[name] for name in on_pi]
     assert all(req.profile.provider == "claude" for req in eng.provider.calls)
     fixed = eng.origin.head("autoforge/2")
-    assert gh.merges == [(PR, "squash", fixed, False)]
+    assert gh.merges == [(PR, "squash", fixed)]
     assert load_state(eng.paths.state_file).reviewed_head_sha == fixed
 
 
