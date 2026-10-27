@@ -20,9 +20,12 @@ A step is ``{"do": ...}``:
 - ``blocked``: the agent reports the issue blocked, with ``message``
   (``stuck`` by default) and the fields of ``extra`` beside it;
 - ``garbage``: no ``CONTROL_RESULT`` at all (a failing provider);
-- ``hold``: write ``started``, then wait for ``gate``; with ``stubborn`` the
-  first ``KeyboardInterrupt`` (the scheduler's first SIGINT) is noted in
-  ``interrupted`` and outlived, the second is not.
+- ``hold``: write ``started``, then wait for ``gate``. ``stubborn`` is how
+  many SIGINTs the wait outlives (none by default), each counted in
+  ``noted`` as it is outlived; the next one raises ``KeyboardInterrupt``.
+  With 1 the worker outlives the scheduler's first SIGINT and is ended by
+  its second; with 2 it outlives both, and its scheduler, until ``gate``
+  opens (#346).
 
 ``started`` and ``gate`` may be given on any step: the step first creates
 ``started`` and waits for ``gate`` to exist. Synchronization is by files.
@@ -48,6 +51,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from types import FrameType
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))  # ``-P``: the tests package is imported from here only
@@ -60,21 +64,45 @@ def _touch(path: str | None) -> None:
         Path(path).write_text(f"{os.getpid()}\n", encoding="utf-8")
 
 
-def _wait_for(path: str | None, *, stubborn: bool = False, noted: str | None = None) -> None:
+def _note(path: str | None, count: int) -> None:
+    """``count`` in ``path``, replaced whole: a reader never sees a partial count."""
+    if path:
+        tmp = f"{path}.{count}.tmp"
+        Path(tmp).write_text(f"{count}\n", encoding="utf-8")
+        os.replace(tmp, path)
+
+
+def _wait_for(path: str | None, *, stubborn: int = 0, noted: str | None = None) -> None:
+    """Wait for ``path`` to exist, outliving the first ``stubborn`` SIGINTs.
+
+    A SIGINT handler of the wait's own counts them, so whether one is
+    outlived never depends on where it lands: a ``KeyboardInterrupt``
+    caught around the sleep would end the worker when it arrived between
+    two sleeps.
+    """
     if not path:
         return
-    deadline = time.monotonic() + GATE_SECONDS
-    interrupted = False
-    while not os.path.exists(path):
-        if time.monotonic() > deadline:
-            raise SystemExit(f"scheduler_worker: the gate {path} never opened")
-        try:
+    outlived = 0
+
+    def outlive(signum: int, frame: FrameType | None) -> None:
+        nonlocal outlived
+        if outlived >= stubborn:
+            raise KeyboardInterrupt
+        outlived += 1
+        _note(noted, outlived)
+
+    previous = signal.getsignal(signal.SIGINT)
+    if stubborn:
+        signal.signal(signal.SIGINT, outlive)
+    try:
+        deadline = time.monotonic() + GATE_SECONDS
+        while not os.path.exists(path):
+            if time.monotonic() > deadline:
+                raise SystemExit(f"scheduler_worker: the gate {path} never opened")
             time.sleep(0.02)
-        except KeyboardInterrupt:
-            if not stubborn or interrupted:
-                raise
-            interrupted = True
-            _touch(noted)
+    finally:
+        if stubborn:
+            signal.signal(signal.SIGINT, previous)
 
 
 class _World:
@@ -174,7 +202,7 @@ def main(argv: list[str]) -> int:
     def agent(req) -> str:
         step = steps.pop(0) if steps else {"do": "garbage"}
         _touch(step.get("started"))
-        _wait_for(step.get("gate"), stubborn=step.get("stubborn", False), noted=step.get("noted"))
+        _wait_for(step.get("gate"), stubborn=step.get("stubborn", 0), noted=step.get("noted"))
         kind = step["do"]
         if kind == "implement":
             git_out("-C", req.cwd, *GIT_IDENT, "commit", "-q", "--allow-empty", "-m",
