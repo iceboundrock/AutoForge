@@ -44,10 +44,10 @@ checkout or branch switch blocks the run before another agent starts. The
 block reason ends with the repository to inspect and the `local run` command
 that starts the next run of the same feature, with the `--config` /
 `--state-dir` this one was started with. It detects
-nothing else. Real containment is a sandbox, which LOCAL v1 does not provide
-under the default `sandbox.mode: disabled`
+nothing else. Real containment is a sandbox, and LOCAL v1 provides none
+under the default `sandbox.mode: disabled`, which is logical isolation only
 ([ADR 0001](adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md)
-§2.2 and §8.1; isolation is tracked in #10).
+§2.2 and §8.1).
 
 `sandbox.mode: required` (#168,
 [ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md))

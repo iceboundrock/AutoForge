@@ -1,7 +1,6 @@
 # ADR 0006. Candidate validation evidence and controller review certificates
 
-- **Status:** accepted. This is a design record; nothing in it is
-  implemented yet. It is implemented by #171 (the byte-exact REMOTE
+- **Status:** accepted, and implemented by #171 (the byte-exact REMOTE
   materializer and its hash-back proof, also used by the merge gate's
   export), #172 (validation definitions, execution policy, durable
   `ValidationRecord`s, LOCAL convergence, and the one state migration),
@@ -9,9 +8,7 @@
   section), #174 (review certificates, entering `READY_FOR_MERGE` and LOCAL
   `DONE`) and #175 (drift, recovery, the operator override, and the
   certificate check in the merge gate's `READY_FOR_MERGE` and `MERGE`
-  passes). The number is assigned when the record merges: if another ADR
-  merges first, this record takes the next free number, and its index
-  entries move with it.
+  passes).
 - **Decides:** #170, for EPIC #158 (Wave 2B).
 - **Amends:** ADR 0001 §5.10, with a dated note recording the LOCAL
   convergence rule (D7.4). No other ADR's text changes.

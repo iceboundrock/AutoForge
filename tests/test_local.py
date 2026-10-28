@@ -3614,10 +3614,12 @@ def test_the_readme_no_github_promise_is_the_controllers_not_the_runs():
     assert "It detects nothing else." in flat
     assert "a `gh` write or a push from the agent is not" in flat
 
-    # The honest answer for real containment points at the ADR and the isolation track.
+    # The honest answer for real containment points at the ADR and at the outer
+    # sandbox; #10's isolation track is closed (#240).
     assert "docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md" in flat
     assert "§2.2" in flat and "§8.1" in flat
-    assert "tracked in #10" in flat
+    assert "tracked in #10" not in flat
+    assert "ADR 0005's outer sandbox (#166–#169)" in flat
 
 
 def test_a_local_transient_failure_is_not_relaunched(tmp_path):
