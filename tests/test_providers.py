@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from contextlib import closing, contextmanager
@@ -29,6 +30,7 @@ from autoforge.providers import (
     ScriptedProvider,
     claude_config_files,
     claude_isolation_env,
+    claude_login_path,
     claude_shell,
     opencode_data_dir,
     opencode_isolation_env,
@@ -1858,6 +1860,132 @@ def test_claudes_bash_tool_runs_no_function_or_alias_of_a_startup_file(
 
 
 @pytest.mark.usefixtures("_no_operator_claude_shell")
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+@pytest.mark.parametrize("shell", _CLAUDE_SHELLS)
+def test_claudes_bash_tool_keeps_the_launchs_path_in_a_login_shell(
+    tmp_path, monkeypatch, shell, output_format
+):
+    """#347: without a snapshot 2.1.296 runs a command in a login shell,
+    whose ``/etc/profile`` may set ``PATH`` outright (Debian's does), and the
+    command would not find the ``gh`` the launch put on ``PATH``. A test
+    cannot change ``/etc/profile``, so the operator's login file stands in
+    for it. The launch's ``CLAUDE_ENV_FILE`` sets ``PATH`` back; the same
+    launch without the adapter's isolation loses it."""
+    startup = f"PATH={tmp_path / 'system-path'}; export PATH\n"
+    with monkeypatch.context() as m:
+        lost, _log = _bash_tool_run(
+            tmp_path / "control",
+            m,
+            shell,
+            startup,
+            isolate=False,
+            snapshot=False,
+            output_format=output_format,
+        )
+    assert "not found" in lost and _GH_REFUSED not in lost
+    out, log = _bash_tool_run(
+        tmp_path / "launch",
+        monkeypatch,
+        shell,
+        startup,
+        snapshot=False,
+        output_format=output_format,
+    )
+    assert log["snapshot"] is False and log["shell"] == shell
+    assert _GH_REFUSED in out
+
+
+@pytest.mark.parametrize("shell", _CLAUDE_SHELLS)
+def test_the_launchs_path_comes_back_in_a_login_shell_only(tmp_path, shell):
+    """#347: in a login shell the line sets ``PATH`` to the launch's, quoted
+    for bash and zsh alike; in any other (a command after a snapshot) it
+    leaves ``PATH`` as the shell has it."""
+    launch_path = f"{tmp_path}/it's a $dir:/usr/bin:/bin"
+    show = 'printf "\\n%s" "$PATH"'
+    env = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+
+    def path_in(args: list[str], script: str) -> str:
+        ran = subprocess.run(
+            [shell, *args, script], env=env, capture_output=True, text=True, timeout=60
+        )
+        assert ran.returncode == 0, ran.stderr
+        return ran.stdout.rpartition("\n")[2]
+
+    line = claude_login_path(launch_path)
+    assert path_in(["-c", "-l"], line + show) == launch_path
+    assert path_in(["-c"], line + show) == path_in(["-c"], show)
+
+
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+@pytest.mark.parametrize(
+    ("env_set", "env_unset", "restored"),
+    [
+        ((("PATH", "/inside/bin:/usr/bin"),), (), "/inside/bin:/usr/bin"),
+        ((), ("PATH",), None),
+    ],
+    ids=["moved", "unset"],
+)
+def test_the_path_a_claude_login_shell_gets_back_is_the_sandboxs(
+    monkeypatch, output_format, env_set, env_unset, restored
+):
+    """Inside a sandbox, which keeps only the ``PATH`` entries visible there
+    and spells them as they are seen there (D8.2), the line holds that
+    ``PATH``, and there is none when the sandbox unsets it."""
+    from autoforge import providers
+    from autoforge.sandbox import LaunchDescription
+
+    class Launched(Exception):
+        pass
+
+    texts = []
+
+    def launch(req):
+        texts.append(Path(req.env["CLAUDE_ENV_FILE"]).read_text())
+        raise Launched
+
+    description = LaunchDescription(mounts=(), env_set=env_set, env_unset=env_unset)
+    monkeypatch.setattr(
+        ClaudeCodeProvider, "sandboxed", lambda self, req, command, env: (command, description)
+    )
+    monkeypatch.setattr(providers, "start_duplex", launch)
+    profile = default_config().profile("fix")
+    if output_format == "text":
+        profile = _text(profile)
+    req = AgentRequest("FIX", "p", "/tmp", profile, None, 7, env_allowlist=("PATH",))
+    with pytest.raises(Launched):
+        ClaudeCodeProvider(runner=launch).execute(req)
+    expected = CLAUDE_SHELL_CLEANER + (claude_login_path(restored) if restored else "")
+    assert texts == [expected]
+
+
+def test_a_launchs_started_environment_is_the_one_the_executor_and_the_sandbox_give(
+    monkeypatch,
+):
+    """:meth:`AgentProvider.started_environment` composes what the CLI starts
+    with as the executor and the sandbox backend do."""
+    from autoforge.executor import _child_environment
+    from autoforge.sandbox import LaunchDescription
+    from autoforge.sandbox_bwrap import _environment
+
+    monkeypatch.setenv("PATH", "/host/bin:/usr/bin")
+    monkeypatch.setenv("CLAUDE_CODE_PASSED", "1")
+    monkeypatch.setenv("NOT_ALLOWED", "1")
+    provider = ClaudeCodeProvider()
+    env = {"GH_CONFIG_DIR": "/nowhere/gh", "CLAUDE_ENV_FILE": "/f"}
+    profile = default_config().profile("fix")
+    req = AgentRequest("FIX", "p", "/tmp", profile, None, 7, env_allowlist=("PATH",), env=env)
+    child = _child_environment(provider.environment_allowlist(req), env)
+    assert provider.started_environment(req, env, None) == child
+    assert child["CLAUDE_CODE_PASSED"] == "1" and "NOT_ALLOWED" not in child
+    description = LaunchDescription(
+        mounts=(), env_set=(("PATH", "/inside/bin"),), env_unset=("GH_CONFIG_DIR",)
+    )
+    started = provider.started_environment(req, env, description)
+    assert started == _environment(description, child)
+    assert started["PATH"] == "/inside/bin" and "GH_CONFIG_DIR" not in started
+
+
+@pytest.mark.usefixtures("_no_operator_claude_shell")
 @pytest.mark.parametrize("shell", _CLAUDE_SHELLS)
 def test_claudes_bash_tool_cleaner_works_on_the_one_shot_path(tmp_path, monkeypatch, shell):
     """``output_format: text`` launches through the shared one-shot path,
@@ -1939,8 +2067,9 @@ def test_claudes_bash_tool_runs_in_no_program_of_the_operators(
 
 
 def test_the_claude_shell_environment_file_lives_as_long_as_the_launch(tmp_path, monkeypatch):
-    """The cleaner is a file of the launch's own (mode 0600 in a 0700
-    directory), there while Claude Code runs and removed after it."""
+    """The cleaner, then the launch's ``PATH`` for a login shell, is a file
+    of the launch's own (mode 0600 in a 0700 directory), there while Claude
+    Code runs and removed after it."""
     from autoforge import providers
     from tests import claude_fake
 
@@ -1964,7 +2093,8 @@ def test_the_claude_shell_environment_file_lives_as_long_as_the_launch(tmp_path,
     req = AgentRequest("FIX", "p", str(tmp_path), profile, 900, 30, env_allowlist=("PATH",))
     assert ClaudeCodeProvider().execute(req).ok
     [(path, text, mode, dir_mode)] = seen
-    assert text == CLAUDE_SHELL_CLEANER and mode == 0o600 and dir_mode == 0o700
+    assert text == CLAUDE_SHELL_CLEANER + claude_login_path(os.environ["PATH"])
+    assert mode == 0o600 and dir_mode == 0o700
     assert not path.exists() and not path.parent.exists()
 
 

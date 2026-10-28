@@ -68,6 +68,9 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     the ``env`` of the user's settings or of the global configuration would
     set a variable over them or over the controller's
     (:func:`claude_configuration_problems`).
+  * a Bash tool command that runs in a login shell (without a snapshot)
+    gets back the ``PATH`` of the launch, which ``/etc/profile`` may set
+    outright: the same file sets it there (:func:`claude_login_path`, #347).
   * exit code 0 on success; 1 on model/auth errors (message on stdout).
 
 OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
@@ -231,6 +234,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import sqlite3
 import tempfile
@@ -685,6 +689,17 @@ class AgentProvider:
         """
         yield {}
 
+    def complete_isolation(
+        self, isolation: Mapping[str, str], environment: Mapping[str, str]
+    ) -> None:
+        """Finish what :meth:`integration_isolation` prepared for one launch
+        once ``environment``, everything its CLI starts with
+        (:meth:`started_environment`), is known: after the sandbox's
+        description and before the CLI starts. One that cannot is an
+        :class:`ExecutionError`, and nothing is launched. The base adapter has
+        nothing to finish.
+        """
+
     def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
         """Refuse a launch whose CLI would still load an integration that
         neither its flags nor :meth:`integration_isolation` keep off (#165).
@@ -823,6 +838,25 @@ class AgentProvider:
             command = [needs.executable, *command[1:]]
         return command, description
 
+    def started_environment(
+        self,
+        req: AgentRequest,
+        env: Mapping[str, str] | None,
+        description: LaunchDescription | None,
+    ) -> dict[str, str]:
+        """Everything the CLI of ``req`` starts with: the variables of this
+        process its allow-list passes, ``env`` (what :meth:`sandboxed` was
+        given) over them and, in a sandbox, ``description``'s over those
+        (D8.2), as the executor and the backend compose them."""
+        started = {**self.launch_environment(req.env_allowlist), **(env or {})}
+        if description is None:
+            return started
+        started = {
+            name: value for name, value in started.items() if name not in description.env_unset
+        }
+        started.update(description.env_set)
+        return started
+
     def launch_allowlist(self, base: tuple[str, ...]) -> tuple[str, ...]:
         """``base`` (the configured allow-list) plus this provider's own names.
 
@@ -855,6 +889,7 @@ class AgentProvider:
         with self.integration_isolation() as isolation:
             env = {**(req.env or {}), **isolation} if isolation else req.env
             command, description = self.sandboxed(req, command, env)
+            self.complete_isolation(isolation, self.started_environment(req, env, description))
             res = self._runner(
                 ExecutionRequest(
                     command=command,
@@ -1005,6 +1040,29 @@ CLAUDE_SHELL_CLEANER = (
     "else __af_left=; __af_x=${__af_left:?AutoForge: this command would run in a shell "
     "AutoForge cannot clear of shell startup functions and aliases (#165)}; fi; }\n"
 )
+
+
+def claude_login_path(path: str) -> str:
+    """What a launch's ``CLAUDE_ENV_FILE`` holds after
+    :data:`CLAUDE_SHELL_CLEANER` when the launch starts Claude Code with
+    ``path`` as its ``PATH`` (#347): a login shell sets ``PATH`` back to it.
+
+    Without a snapshot, 2.1.296 runs a command in a login shell (2.1.310 to
+    2.1.312 too, read from the build), whose ``/etc/profile`` may set
+    ``PATH`` outright (Debian's does), so the command would not find what
+    the launch put on ``PATH``. With one the shell is no login shell, and
+    ``PATH`` stays as the snapshot left it (2.1.310 to 2.1.312 write their
+    own ``PATH`` there). The block is a line of its own, parsed after the
+    cleaner has removed every function and alias, and its command words are
+    ``\\``-quoted all the same.
+    """
+    return (
+        "# Written by AutoForge for the same launch (#347): a login shell, in which a "
+        "command runs without a shell snapshot, gets back the PATH of the launch.\n"
+        "{ if [[ -n ${BASH_VERSION-} ]] && \\builtin shopt -q login_shell || "
+        "[[ -n ${ZSH_VERSION-} && -o login ]]; then "
+        f"PATH={shlex.quote(path)}; \\builtin export PATH; fi; }}\n"
+    )
 
 
 def claude_shell(shell: str) -> str:
@@ -1184,6 +1242,7 @@ class ClaudeCodeProvider(AgentProvider):
         ``CLAUDE_ENV_FILE``, a bash or zsh to run Bash tool commands in and no
         shell prefix (:func:`claude_isolation_env`): no function or alias of
         the operator's shell startup files runs in one (#165).
+        :meth:`complete_isolation` adds the launch's ``PATH`` (#347).
 
         The directory (``mkdtemp``, mode 0700) is removed when the launch
         ends; one that cannot be made or written is an
@@ -1204,6 +1263,24 @@ class ClaudeCodeProvider(AgentProvider):
             yield claude_isolation_env(env_file, claude_shell(child_shell()))
         finally:
             shutil.rmtree(env_dir, ignore_errors=True)
+
+    def complete_isolation(
+        self, isolation: Mapping[str, str], environment: Mapping[str, str]
+    ) -> None:
+        """Add :func:`claude_login_path` of the ``PATH`` Claude Code starts
+        with (inside a sandbox, as rewritten there) to the launch's
+        ``CLAUDE_ENV_FILE``; nothing when it starts with no ``PATH``, or
+        :meth:`integration_isolation` named no such file."""
+        env_file = isolation.get("CLAUDE_ENV_FILE")
+        path = environment.get("PATH")
+        if not env_file or not path:
+            return
+        try:
+            fd = os.open(env_file, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                handle.write(claude_login_path(path))
+        except OSError as exc:
+            raise ExecutionError(f"cannot prepare the claude shell environment: {exc}") from exc
 
     def integration_preflight(self, env_allowlist: tuple[str, ...] | None) -> None:
         """Refuse a launch while Claude Code's own configuration would set a
@@ -1318,6 +1395,7 @@ class ClaudeCodeProvider(AgentProvider):
         with self.integration_isolation() as isolation:
             env = {**(req.env or {}), **isolation}
             command, description = self.sandboxed(req, self.build_command(req), env)
+            self.complete_isolation(isolation, self.started_environment(req, env, description))
             duplex = DuplexRequest(
                 command=command,
                 cwd=req.cwd,

@@ -5,6 +5,17 @@ so.
 
 ## Unreleased
 
+### Claude Code's Bash tool keeps the launch's `PATH` in a login shell (#347)
+
+- When Claude Code has no shell snapshot (writing one failed), it runs
+  each Bash tool command in a login shell, which reads `/etc/profile`.
+  Debian's sets `PATH` outright, so such a command ran with Debian's
+  default `PATH` (plus what your login file adds) and missed any other
+  directory the launch had on it. The launch's `CLAUDE_ENV_FILE` now sets
+  the `PATH` Claude Code starts with back in a login shell, inside the
+  sandbox as the sandbox rewrites it. Commands that run after a snapshot
+  are unchanged. Nothing changes a default.
+
 ## 0.1.0a0 (2026-10-28)
 
 `autoforge-cli` `0.1.0a0` is #295's registration prerelease: a pre-Alpha

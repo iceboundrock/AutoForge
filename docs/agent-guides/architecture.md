@@ -275,7 +275,10 @@ Code's `--safe-mode`, `--strict-mcp-config` and `--setting-sources=user`,
 Pi's #132 policy) or, where a flag does not reach, the variables of
 `AgentProvider.integration_isolation` set over the controller's
 (OpenCode's empty configuration directory, Claude Code's
-`CLAUDE_ENV_FILE` cleaner and shell); an integration neither reaches is
+`CLAUDE_ENV_FILE` cleaner and shell), which
+`AgentProvider.complete_isolation` finishes once the sandbox has rewritten
+the launch's environment (Claude Code's file gets the `PATH` the CLI starts
+with, for a login shell, #347); an integration neither reaches is
 refused by `AgentProvider.integration_preflight`, which the engine calls
 with the credential preflight (OpenCode's connected organization, Claude
 Code settings whose `env` would undo the launch's isolation); `doctor`

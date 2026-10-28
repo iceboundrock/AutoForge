@@ -1411,6 +1411,17 @@ never the boundary.
     over whatever the operator's shell passed through `CLAUDE_*`: either
     could name a program of the operator's to run every command in or
     through.
+  - The same file gives a login shell back the launch's `PATH` (#347).
+    A login shell reads `/etc/profile`, and Debian's sets `PATH` outright,
+    so without a snapshot a command would not find what the launch put on
+    `PATH`. After the cleaner, the file sets `PATH` to the one Claude Code
+    starts with (`providers.claude_login_path`; in a sandbox, as rewritten
+    there), in a login shell only. With a snapshot the shell is no login
+    shell, and 2.1.310 to 2.1.312 (read from the build) write their own
+    `PATH` into the snapshot. The file is completed once the sandbox's
+    description is known (`AgentProvider.complete_isolation`), before
+    Claude Code starts. `PATH` decides which programs a command finds, not
+    which credentials it can reach.
   - 2.1.296 also sets the `env` of the user's settings (`settings.json` in
     `CLAUDE_CONFIG_DIR`, else `~/.claude`) and of its global configuration
     (`.config.json` there when it exists, else `.claude.json` in
