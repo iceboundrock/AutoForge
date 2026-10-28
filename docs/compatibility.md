@@ -21,8 +21,14 @@ aggregate `ci` check ([Development](development.md#continuous-integration)).
 A release is supported only once its own artifacts pass the same checks
 ([Releasing](releasing.md)).
 
-This page was last checked against the commit that added it (#256), on
-2026-10-23. The EPIC's release-candidate step
+The platform and Python claims were checked on 2026-10-28 against
+`main` at `5297dce6328246c4ec893e61fb66fbd212aaeb53`: the
+[CI run](https://github.com/iceboundrock/AutoForge/actions/runs/40626181650)
+passed the Python 3.11 and 3.12 test and dist jobs on Linux x86_64. Those
+jobs build their own artifacts; the exact files for a release still need
+their own checks. The other cells retain their recorded evidence from
+2026-10-23; this check did not re-verify current agent CLI releases or
+other hosts. The EPIC's release-candidate step
 ([#255](https://github.com/iceboundrock/AutoForge/issues/255), Stage 5)
 re-checks every cell against the release candidate's commit and the
 then-current releases of each tool.
