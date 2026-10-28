@@ -35,6 +35,14 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
   * ``--permission-mode bypassPermissions`` is required for unattended
     edits and local git; ``--permission-prompts none`` would silently
     deny anything that prompts. Configure via profile ``options``.
+  * nothing asks a person (#258; run on 2.1.312 against a loopback
+    stand-in of the Messages API, so no model was called): a tool call the
+    profile's mode does not allow, or that a deny rule of the user settings
+    names, is refused at once and the agent goes on without it (exit 0),
+    and ``AskUserQuestion`` is not offered under ``-p``. The stream says
+    which (claude_stream.py); the adapter names them in a run that fails
+    anyway and in the run log (:func:`_name_refused`). ``text`` output
+    carries none of it.
   * ``--safe-mode`` and ``--strict-mcp-config`` (#165): no hook, installed
     plugin or MCP server of the user's, the project's or a plugin's
     configuration runs, so none can hand the agent a GitHub token of its
@@ -119,9 +127,24 @@ OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
     ``stderr`` or a timeout is never classified. Not visible to this check:
     an error the CLI does not print (it prints one execution failure only
     when no step failed before it) and an exit 1 without any error line (a
-    cancelled permission prompt); both are failed exits all the same.
+    cancelled permission prompt, below); both are failed exits all the same.
   * bash/edit tools run without ``--auto`` under the default agent;
     ``--auto`` is opt-in via ``options.auto_approve: true``.
+  * a request of the agent's is refused, never put to a person (#258; run
+    on 2.1.4 against a loopback stand-in of the Messages API, so no model
+    was called, and read from its build). Without ``--auto``, a permission
+    a rule asks for (with the empty configuration below, a read of ``.env``
+    asked; a read outside the worktree did not) prints
+    ``ESC[93mESC[1m! ESC[0mpermission requested: <permission> (<patterns>);
+    auto-rejecting`` and is rejected. The ``question`` tool is offered, and
+    a question is cancelled: its failed line, then the error line
+    :data:`_OPENCODE_QUESTION_CANCELLED`, with no question text. Either way
+    the model is told to go on without it, and the run goes on and exits 0.
+    2.0.26 was read, not run, to exit 1 with no error line after a cancelled
+    permission prompt; whether it printed the line above is not recorded.
+    So an exit 1 with no run-level error after such a line is that refusal,
+    reported as ADR 0007 D7.6's failure; any other failed run only has the
+    refusals added to its text (:func:`_name_refused`).
   * ``opencode --version`` prints ``opencode v2.0.23``; 1.x printed the
     bare version and rejects this argv, so ``autoforge doctor`` requires
     :data:`OPENCODE_MIN_VERSION`.
@@ -160,6 +183,10 @@ run against an installed Pi)::
   * ``pi --version`` prints the bare version; ``pi auth check --model <m>
     --json --no-refresh`` reports, read-only, whether Pi holds a credential
     for the model's provider (``autoforge doctor``).
+  * nothing asks (#258; read from the 1.3.0 build and docs): Pi has no
+    permission rule and no question tool, and under ``--no-extensions`` and
+    ``--no-approve`` no dialog opens. An extension dialog would be
+    cancelled and fail the run, naming its method (pi_rpc.py).
 
 The CLIs are launched with cwd = the directory the engine chose (a
 per-issue worktree for a REMOTE run, the contract's repository root for a
@@ -243,10 +270,17 @@ from .executor_duplex import (
     Timeout,
     start_duplex,
 )
-from .interaction import NO_CAPABILITIES, Capabilities, InteractionBroker, InteractionOutcome
+from .interaction import (
+    NO_CAPABILITIES,
+    Capabilities,
+    InteractionBroker,
+    InteractionOutcome,
+    Lifecycle,
+    RequestKind,
+)
 from .loop_detect import LIMIT_LOOP, LoopMonitor, LoopReport
 from .pi_rpc import PiConversation, encodable
-from .progress import ProgressEvent, ProgressKind, ProgressSink, guarded
+from .progress import ProgressEvent, ProgressKind, ProgressSink, clean, guarded
 from .redaction import redact
 from .sandbox import LaunchDescription, SandboxFacts
 from .sandbox_policy import (
@@ -361,7 +395,9 @@ class AgentExecutionResult:
     # may have exited 0 (Pi shuts down in order whether its run failed or
     # not): a short, bounded, already-redacted reason. The engine treats it
     # like a non-zero exit (ADR 0003 §2.6). A one-shot CLI adapter sets it
-    # only when the CLI exited 0 without reading the whole prompt from stdin.
+    # only when the CLI exited 0 without reading the whole prompt from stdin,
+    # or when a run that failed anyway had a request of the agent's refused
+    # by the CLI, which it names (#258, :func:`_name_refused`).
     provider_failure: str | None = None
     # A failed run the adapter recognised as a known transient failure of
     # the provider (#164): a short, fixed reason naming it, never text taken
@@ -391,7 +427,9 @@ class AgentExecutionResult:
     # ``provider_failure``, and the engine raises InteractionRequiredError,
     # never correcting or relaunching), ``interrupted``, or ``paused`` with
     # the pending request (#126 persists it). ``None`` for a launch without
-    # a broker: every existing provider, unchanged.
+    # a broker, with one exception: a CLI adapter, which has no broker and
+    # declares no capability, reports ``failed`` when its CLI's output shows
+    # that a request the CLI refused is what failed the run (#258, D7.6).
     interaction: InteractionOutcome | None = None
 
     @property
@@ -525,6 +563,74 @@ def _finish_loop(
         result.timed_out = True
         result.timeout_limit = LIMIT_LOOP
         result.provider_failure = None
+    return result
+
+
+# Where an operator reads what to do about a request the CLI refused (#258).
+REFUSED_REQUEST_GUIDE = "docs/usage.md, 'An agent asked for permission or input'"
+MAX_REFUSED_SUBJECT_CHARS = 160
+
+
+def _requests(refused: list[tuple[RequestKind, str]], count: int) -> str:
+    """What the agent asked for, for a failure: the first request, and how many more."""
+    kind, subject = refused[0]
+    if kind is RequestKind.PERMISSION:
+        text = f"permission ({subject})" if subject else "permission"
+    else:
+        text = "an answer to a question"
+    if count > 1:
+        text += f" and {count - 1} more request{'s' if count > 2 else ''}"
+    return text
+
+
+def _name_refused(
+    result: AgentExecutionResult,
+    refused: list[tuple[RequestKind, str]],
+    count: int,
+    name: str,
+    cli: str,
+    *,
+    ended_by_it: str = "",
+) -> AgentExecutionResult:
+    """Name on ``result`` the ``count`` requests of the agent's the CLI refused (#258).
+
+    ``refused`` is the first of them, each its kind and its cleaned subject;
+    ``name`` is the adapter's and ``cli`` the CLI's, as a reader knows it.
+    The run log always gets the count and the first one (``provider_summary``).
+    A run that ends usable is left as it is: the CLI told the agent it was
+    refused, and the agent went on without it. A timeout keeps its own text.
+
+    ``ended_by_it``, the adapter's finding that the refusal is all that
+    failed the run (with what to do about it), makes the failure the named
+    one of ADR 0007 D7.6: ``provider_failure`` says what the agent asked for
+    and ``interaction`` is ``failed``, so the engine raises
+    InteractionRequiredError, never corrected and never relaunched: a
+    relaunch would ask again. The adapter declares no capability for it
+    (D5.3). Any other failure keeps its own reason, its exit status and a
+    transient finding, and only has the refusal added to its text: the
+    refusal may not be why it failed.
+    """
+    if not count:
+        return result
+    kind, subject = refused[0]
+    result.provider_summary["refused_requests"] = count
+    result.provider_summary["refused_request"] = f"{kind} ({subject})" if subject else str(kind)
+    if result.timed_out:
+        return result
+    asked = _requests(refused, count)
+    if ended_by_it:
+        result.provider_failure = (
+            f"{name}: the agent asked for {asked}, which an unattended run "
+            f"cannot give; {ended_by_it}"
+        )
+        result.transient_failure = None
+        result.interaction = InteractionOutcome(Lifecycle.FAILED)
+    elif result.provider_failure or result.exit_code != 0:
+        failure = result.provider_failure or f"{name}: exited {result.exit_code}"
+        result.provider_failure = (
+            f"{failure}; during the run the agent asked for {asked}, which {cli} refused "
+            f"({REFUSED_REQUEST_GUIDE})"
+        )
     return result
 
 
@@ -1267,7 +1373,10 @@ class ClaudeCodeProvider(AgentProvider):
             last_activity_at=res.last_activity_at,
             sandbox=res.sandbox,
         )
-        return _finish_loop(result, monitor, killed=res.stopped)
+        result = _finish_loop(result, monitor, killed=res.stopped)
+        # A refusal never ends a -p run (claude_stream.py): the agent goes on
+        # without what it asked for, so a failure is never the refusal's alone.
+        return _name_refused(result, stream.refused, stream.refused_count, self.name, "Claude Code")
 
 
 def _read_claude_stream(
@@ -1630,7 +1739,34 @@ class OpenCodeProvider(AgentProvider):
             if errors and all(e in _OPENCODE_OPENAI_TRANSIENT_ERRORS for e in errors):
                 reasons = dict.fromkeys(_OPENCODE_OPENAI_TRANSIENT_ERRORS[e] for e in errors)
                 result.transient_failure = "opencode: " + ", ".join(reasons)
-        return result
+        refused = _opencode_refused_requests(result.stderr)
+        ended_by_it = ""
+        if (
+            refused
+            and result.exit_code == 1
+            and result.provider_failure is None
+            and not result.stderr_truncated
+            and not _opencode_run_errors(result.stderr)
+        ):
+            # An exit 1 with no run-level error of its own: what the 2.0.x
+            # builds did once they had refused a permission (module docstring).
+            remedy = (
+                "Keep the issue's work inside the worktree, or change the issue so the agent "
+                "need not ask; options.auto_approve: true approves every permission no rule "
+                "denies, and is dangerous"
+                if any(kind is RequestKind.PERMISSION for kind, _ in refused)
+                else "Change the issue so the agent need not ask"
+            )
+            if any(kind is RequestKind.QUESTION for kind, _ in refused):
+                remedy += "; a question cannot be answered until #126 lands"
+            ended_by_it = (
+                f"OpenCode refused {'them' if len(refused) > 1 else 'it'} and exited 1 with no "
+                f"error of its own. {remedy}. 'resume' starts a fresh session, which may ask "
+                f"again ({REFUSED_REQUEST_GUIDE})"
+            )
+        return _name_refused(
+            result, refused, len(refused), self.name, "OpenCode", ended_by_it=ended_by_it
+        )
 
 
 # How OpenCode 2.0.26 prints an error on stderr: `ESC[91mESC[1mError: ESC[0m`
@@ -1653,6 +1789,46 @@ _OPENCODE_OPENAI_TRANSIENT_ERRORS = {
         "error persists."
     ): "OpenAI server_error",
 }
+
+
+# How OpenCode prints a request it refuses (#258; 2.1.4, run against a
+# loopback stand-in, and read from its build). A permission an agent's rule
+# asks for, without `--auto`: `ESC[93mESC[1m! ESC[0mpermission requested:
+# <permission> (<patterns, comma-separated>); auto-rejecting`. A question,
+# cancelled: the question tool's failed line, then this as its error line.
+_OPENCODE_PERMISSION_LINE_RE = re.compile(
+    r"\x1b\[93m\x1b\[1m! \x1b\[0mpermission requested: (\S+) \((.*)\); auto-rejecting"
+)
+_OPENCODE_QUESTION_CANCELLED = (
+    "This non-interactive run cannot ask the user questions, so the question was cancelled. "
+    "Continue without an answer; make reasonable assumptions and state them."
+)
+
+
+def _opencode_refused_requests(stderr: str) -> list[tuple[RequestKind, str]]:
+    """The requests OpenCode printed on ``stderr`` that it refused, in order:
+    each permission line, with its permission and patterns as the subject,
+    and each failed tool whose error is the cancelled question's (no subject:
+    OpenCode prints no question text). Lines as in :func:`_opencode_run_errors`;
+    text that is not such a line on its own (a diff, a file, a command's
+    output that quotes one) is no request."""
+    refused: list[tuple[RequestKind, str]] = []
+    previous = ""
+    for line in stderr.split("\n"):
+        line = line.removesuffix("\r")
+        permission = _OPENCODE_PERMISSION_LINE_RE.fullmatch(line)
+        error = _OPENCODE_ERROR_LINE_RE.fullmatch(line)
+        if permission:
+            subject = clean(f"{permission[1]}: {permission[2]}", MAX_REFUSED_SUBJECT_CHARS)
+            refused.append((RequestKind.PERMISSION, subject))
+        elif (
+            error
+            and error[1] == _OPENCODE_QUESTION_CANCELLED
+            and _OPENCODE_TOOL_FAILED_LINE_RE.fullmatch(previous)
+        ):
+            refused.append((RequestKind.QUESTION, ""))
+        previous = line
+    return refused
 
 
 def _opencode_run_errors(stderr: str) -> list[str]:

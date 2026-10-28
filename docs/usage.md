@@ -1075,6 +1075,9 @@ ownership or discard uncommitted user changes.
     the built-in defaults (no `--config`): another model, other limits and
     another worktree. A REMOTE run refuses that: see
     [the configuration a run was recorded under](#the-configuration-a-run-was-recorded-under).
+- **"the agent asked for permission (...)" or "an answer to a question"**
+  in a failure: see
+  [An agent asked for permission or input](#an-agent-asked-for-permission-or-input).
 - **"run ... was recorded under ..., and this command's configuration
   differs from it"** (exit 2): see
   [the configuration a run was recorded under](#the-configuration-a-run-was-recorded-under).
@@ -1218,6 +1221,60 @@ ownership or discard uncommitted user changes.
   Its `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
   `ai-implementation` marker and blocks on two, so close the PR you do not
   keep. See [Replan transaction](agent-guides/replan-transaction.md).
+
+### An agent asked for permission or input
+
+An unattended run has no one to ask. When an agent wants a permission a
+rule only grants on approval, or an answer to a question, the agent CLI
+refuses the request itself and, on the versions below, tells the agent to
+go on without it. AutoForge cannot answer either until #126 (and the SDK
+providers, #151 and #152) land.
+
+| CLI (version; how this is known) | A permission that needs approval | A question |
+|---|---|---|
+| Claude Code (2.1.312; run against a loopback stand-in of the Messages API, no model called) | With `options.permission_mode: bypassPermissions`, the default, nothing was asked, a write under `.git/` or `.claude/` included. Under another mode (`manual`, `dontAsk`, ...) a call the mode does not allow, or one a deny rule of your Claude Code user settings names, is refused at once. The agent is told to go on without it, and the run exits 0. | `AskUserQuestion` is not offered under `-p`. A call to it anyway fails ("No such tool available") and the run goes on. |
+| OpenCode (2.1.4; run against the same stand-in, and read from its build) | Without `options.auto_approve`, a rule that asks prints `! permission requested: <permission> (<patterns>); auto-rejecting` on stderr and is rejected. With the empty configuration every launch gets, reading `.env` asked; reading outside the worktree did not. The agent is told to go on without it, and the run exits 0. | The `question` tool is offered, and a question is cancelled: `✗ Asked 1 question failed`, then an error line telling the agent to assume and say so. The run exits 0. The question's text is not printed. |
+| OpenCode (2.0.26; read from its build, not re-verified) | Exits 1 with no error line once it has refused one. Whether it printed the `permission requested` line is not recorded. | Not recorded. |
+| Pi (1.3.0; read from its build and docs) | Pi has no permission rules: tools run with your account's permissions. | No question tool. Under `--no-extensions` and `--no-approve`, which every launch passes, nothing opens a dialog. One that did would be cancelled and fail the run, naming its method (`pi: an extension asked for input (...)`). |
+
+What AutoForge does with it:
+
+- **A run that ends usable is left to its result.** The agent went on
+  without what it asked for, and its `CONTROL_RESULT` decides, as before.
+  The step's `execution.json` records how many requests were refused and
+  the first one (`provider_summary.refused_requests`,
+  `refused_request`).
+- **A refused request that is all that failed the run** (OpenCode exiting
+  1 with no error line of its own after a `permission requested` or
+  cancelled-question line) fails the step as
+  `agent '<profile>' failed: opencode: the agent asked for permission (read:
+  .env), which an unattended run cannot give; ...`, with what to do and the
+  usual "State unchanged" lines. It is not corrected and not relaunched,
+  since a relaunch would ask again (ADR 0007 D7.6).
+- **Any other failed run** keeps its own reason, exit status and
+  relaunch behaviour, and its text adds `during the run the agent asked
+  for ..., which <CLI> refused`. The refusal may not be why it failed.
+- **A CLI that goes silent** after a request is killed by the idle limit
+  like any silent CLI ([Agent limits](#agent-limits)).
+- **When nothing in the output identifies a request**, the failure is the
+  generic one: Claude Code with `options.output_format: text`, which prints
+  no stream, and an OpenCode exit 1 with no error line and no request line.
+  AutoForge does not guess from other text.
+
+What to do:
+
+- **A permission:** keep the issue's work inside the worktree, or change
+  the issue so the agent does not need it. For OpenCode,
+  `options.auto_approve: true` approves every permission no rule denies,
+  reading a `.env` file of secrets included, so it is dangerous. For Claude
+  Code, `bypassPermissions` (the default) asks for nothing, and a deny rule
+  of your user settings (`~/.claude/settings.json`, or the one under
+  `CLAUDE_CONFIG_DIR`, which every launch reads) refuses what it names
+  whatever the mode.
+- **A question:** change the issue so the agent need not ask; it cannot be
+  answered yet.
+- `resume` starts a fresh agent session with the same prompt, so it may
+  ask again.
 
 ### The configuration a run was recorded under
 

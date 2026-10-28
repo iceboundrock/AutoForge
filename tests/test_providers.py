@@ -344,6 +344,148 @@ def test_opencode_classifies_a_listed_error_only_for_an_untruncated_openai_exit_
     assert result.provider_failure is None
 
 
+# -- requests OpenCode refused (#258) ------------------------------------------------
+# What opencode 2.1.4 printed on stderr, byte for byte, when the model read
+# `.env` and when it called the question tool (run against a loopback
+# stand-in of the Messages API, 2026-10-27): each refused, the run went on
+# and exited 0.
+OC_PERMISSION = "\x1b[93m\x1b[1m! \x1b[0mpermission requested: read (.env); auto-rejecting"
+OC_READ_ENV_RUN = (
+    "\x1b[0m\n> build · claude-sonnet-4-5\n"
+    f"{OC_PERMISSION}\n"
+    "\x1b[0m✗ \x1b[0mRead .env failed\n"
+    "\x1b[91m\x1b[1mError: \x1b[0mThis non-interactive run cannot ask the user for permission, "
+    "so the request was rejected. Continue without this action.\n"
+    "> build · claude-sonnet-4-5\n"
+)
+OC_QUESTION_RUN = (
+    "\x1b[0m\n> build · claude-sonnet-4-5\n"
+    "\x1b[0m✗ \x1b[0mAsked 1 question failed\n"
+    "\x1b[91m\x1b[1mError: \x1b[0mThis non-interactive run cannot ask the user questions, so "
+    "the question was cancelled. Continue without an answer; make reasonable assumptions and "
+    "state them.\n"
+    "> build · claude-sonnet-4-5\n"
+)
+GUIDE = "(docs/usage.md, 'An agent asked for permission or input')"
+PERMISSION_ENDED = (
+    "opencode: the agent asked for permission (read: .env), which an unattended run cannot "
+    "give; OpenCode refused it and exited 1 with no error of its own. Keep the issue's work "
+    "inside the worktree, or change the issue so the agent need not ask; options.auto_approve: "
+    "true approves every permission no rule denies, and is dangerous. 'resume' starts a fresh "
+    f"session, which may ask again {GUIDE}"
+)
+QUESTION_ENDED = (
+    "opencode: the agent asked for an answer to a question, which an unattended run cannot "
+    "give; OpenCode refused it and exited 1 with no error of its own. Change the issue so the "
+    "agent need not ask; a question cannot be answered until #126 lands. 'resume' starts a "
+    f"fresh session, which may ask again {GUIDE}"
+)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (OC_READ_ENV_RUN, [("permission", "read: .env")]),
+        (OC_QUESTION_RUN, [("question", "")]),
+        (
+            OC_QUESTION_RUN + OC_PERMISSION.replace("read (.env)", "edit (src/a.py, src/b.py)"),
+            [("question", ""), ("permission", "edit: src/a.py, src/b.py")],
+        ),
+        (f"{OC_PERMISSION}\r\n", [("permission", "read: .env")]),
+        # The subject is cleaned, redacted and bounded like any shown value.
+        (
+            OC_PERMISSION.replace("read (.env)", "bash (curl -H token ghp_" + "a" * 36 + ")"),
+            [("permission", "bash: curl -H token ***REDACTED***")],
+        ),
+        # Not on a line of its own, or not as OpenCode prints it: no request.
+        (f"| {OC_PERMISSION}\n", []),
+        ("permission requested: read (.env); auto-rejecting\n", []),
+        (OC_PERMISSION.removesuffix("; auto-rejecting") + "\n", []),
+        # The cancelled question's text as a run-level error is no tool's.
+        (OC_QUESTION_RUN.replace("\x1b[0m✗ \x1b[0mAsked 1 question failed\n", ""), []),
+        (OC_ERROR + "Some other tool error\n", []),
+        ("> build · gpt-6-luna\n", []),
+    ],
+)
+def test_opencode_reads_the_requests_it_refused_from_its_stderr(stderr, expected):
+    from autoforge.providers import _opencode_refused_requests
+
+    assert [(str(k), s) for k, s in _opencode_refused_requests(stderr)] == expected
+
+
+def test_opencode_names_a_refused_permission_that_is_all_that_failed_the_run():
+    """The 2.0.x shape: an exit 1 with no run-level error once a permission
+    was refused. ADR 0007 D7.6's failure, which the engine never corrects
+    or relaunches, with no capability declared."""
+    from autoforge.interaction import NO_CAPABILITIES, InteractionOutcome, Lifecycle
+
+    result = _opencode_run(f"> build · gpt-6-luna\n{OC_PERMISSION}\n")
+    assert result.provider_failure == PERMISSION_ENDED
+    assert result.interaction == InteractionOutcome(Lifecycle.FAILED)
+    assert result.exit_code == 1 and result.transient_failure is None
+    assert result.provider_summary["refused_requests"] == 1
+    assert result.provider_summary["refused_request"] == "permission (read: .env)"
+    assert OpenCodeProvider().interaction_capabilities(_opencode_profile()) == NO_CAPABILITIES
+
+
+def test_opencode_names_a_cancelled_question_and_every_kind_it_refused():
+    assert _opencode_run(OC_QUESTION_RUN).provider_failure == QUESTION_ENDED
+    both = _opencode_run(OC_QUESTION_RUN + OC_READ_ENV_RUN).provider_failure
+    assert both.startswith(
+        "opencode: the agent asked for an answer to a question and 1 more request, which "
+        "an unattended run cannot give; OpenCode refused them and exited 1"
+    )
+    assert "options.auto_approve: true" in both and "until #126 lands" in both
+
+
+@pytest.mark.parametrize("stderr", [OC_READ_ENV_RUN, OC_QUESTION_RUN])
+def test_a_refused_request_the_agent_went_on_without_changes_nothing(stderr):
+    """2.1.4: the request is refused, the agent is told to go on without it,
+    and the run exits 0. The outcome is the agent's; the run log says what
+    was refused."""
+    result = _opencode_run(stderr, exit_code=0)
+    assert result.provider_failure is None and result.interaction is None
+    assert result.provider_summary["refused_requests"] == 1
+
+
+@pytest.mark.parametrize(
+    ("run", "failure", "transient"),
+    [
+        # A run-level error of its own: it, not the refusal, may be why.
+        (
+            {"stderr": f"{OC_PERMISSION}\n{OC_WS_CLOSED}\n"},
+            "opencode: exited 1",
+            WS_CLOSED_REASON,
+        ),
+        (
+            {"stderr": f"{OC_PERMISSION}\n{OC_ERROR}insufficient_quota\n"},
+            "opencode: exited 1",
+            None,
+        ),
+        # A cut stderr may hide the error the run died of.
+        ({"stderr": f"{OC_PERMISSION}\n", "stderr_truncated": True}, "opencode: exited 1", None),
+        ({"stderr": f"{OC_PERMISSION}\n", "exit_code": 2}, "opencode: exited 2", None),
+    ],
+)
+def test_any_other_failed_run_keeps_its_reason_and_has_the_refusal_added(run, failure, transient):
+    result = _opencode_run(**run)
+    assert result.provider_failure == (
+        f"{failure}; during the run the agent asked for permission (read: .env), which "
+        f"OpenCode refused {GUIDE}"
+    )
+    assert result.interaction is None and result.transient_failure == transient
+
+
+def test_a_timeout_after_a_refused_request_stays_a_timeout():
+    result = _opencode_run(f"{OC_PERMISSION}\n", timed_out=True)
+    assert result.timed_out and result.provider_failure is None and result.interaction is None
+    assert result.provider_summary["refused_requests"] == 1
+
+
+def _opencode_profile() -> ProfileConfig:
+    return ProfileConfig(name="review", provider="opencode", model="openai/gpt-6-luna")
+
+
 def test_opencode_rejects_a_variant_in_the_model():
     p = ProfileConfig(name="r", provider="opencode", model="openai/gpt-5.6-luna#high", effort="")
     with pytest.raises(ConfigurationError, match="effort") as err:
@@ -523,6 +665,95 @@ def test_results_held_back_while_a_background_agent_runs_end_their_turns(tmp_pat
     assert res.stdout == text
     summary = res.provider_summary
     assert summary["results"] == 2 and summary["num_turns"] == 6
+
+
+def _claude_denial(tool_id: str, name: str) -> str:
+    """The record claude 2.1.312 printed when it refused a tool call (#258)."""
+    from tests import claude_fake
+
+    return claude_fake.line(
+        {
+            "type": "system",
+            "subtype": "permission_denied",
+            "tool_name": name,
+            "tool_use_id": tool_id,
+            "message": "touch in 'x' needs approval.",
+        }
+    )
+
+
+def _claude_refusal(tail: list) -> list:
+    """A Bash call the CLI refused, as 2.1.312 under ``manual`` streamed it."""
+    from tests import claude_fake
+
+    return [
+        claude_fake.init(),
+        claude_fake.tool_use("t1", "Bash", command="touch x", description="Create the file"),
+        _claude_denial("t1", "Bash"),
+        claude_fake.tool_result("t1", "touch needs approval", is_error=True),
+        *tail,
+    ]
+
+
+def test_claude_names_a_refused_permission_in_a_run_that_fails_anyway(tmp_path):
+    """#258: a refusal never ends a -p run, so a failed one keeps its own
+    reason and has the refusal added; it is no interaction failure."""
+    from tests import claude_fake
+
+    denials = [{"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "touch x"}}]
+    _, res = _claude_run(
+        tmp_path,
+        _claude_refusal(
+            [
+                claude_fake.result(
+                    "", is_error=True, subtype="error_max_turns", permission_denials=denials
+                )
+            ]
+        ),
+    )
+    assert res.provider_failure == (
+        "claude: the run ended in an error (subtype error_max_turns, terminal_reason "
+        "completed); during the run the agent asked for permission (Bash: Create the file), "
+        f"which Claude Code refused {GUIDE}"
+    )
+    assert res.interaction is None and res.transient_failure is None
+    assert "touch" not in res.provider_failure  # never the command line
+    summary = res.provider_summary
+    assert summary["refused_requests"] == 1
+    assert summary["refused_request"] == "permission (Bash: Create the file)"
+    assert summary["failure"].startswith("claude: the run ended in an error")
+
+
+def test_claude_names_a_refused_question_in_a_run_that_exits_without_a_result(tmp_path):
+    from tests import claude_fake
+
+    _, res = _claude_run(
+        tmp_path,
+        [
+            claude_fake.init(),
+            claude_fake.tool_use("q1", "AskUserQuestion", questions=[{"question": "Which?"}]),
+            claude_fake.tool_result(
+                "q1", "No such tool available: AskUserQuestion.", is_error=True
+            ),
+        ],
+        exit_code=1,
+    )
+    assert res.provider_failure == (
+        "claude: exited without a result event (exit 1); during the run the agent asked for "
+        f"an answer to a question, which Claude Code refused {GUIDE}"
+    )
+    assert res.interaction is None
+
+
+def test_claude_records_a_refusal_the_agent_went_on_without_and_succeeds(tmp_path):
+    """2.1.312 under ``manual``: the call is refused, the agent goes on
+    without it and the run exits 0. The outcome is the agent's."""
+    from tests import claude_fake
+
+    _, res = _claude_run(tmp_path, _claude_refusal([claude_fake.result("done")]))
+    assert res.ok and res.stdout == "done"
+    assert res.provider_failure is None and res.interaction is None
+    assert res.provider_summary["refused_requests"] == 1
 
 
 def _looping(n: int, *, tail: list | None = None) -> list:
@@ -1091,7 +1322,7 @@ def test_a_progress_sink_that_raises_never_fails_the_claude_run(tmp_path):
 
 # -- a fake `opencode` behind the real executor (#186) -------------------------------
 _FAKE_OPENCODE = r"""
-import hashlib, json, os, sys
+import hashlib, json, os, sys, time
 
 home = sys.argv[1]
 argv = sys.argv[2:]
@@ -1105,18 +1336,38 @@ else:
     data = sys.stdin.buffer.read()
 with open(os.path.join(home, "log.json"), "w", encoding="utf-8") as f:
     json.dump({"argv": argv, "sha256": hashlib.sha256(data).hexdigest(), "len": len(data)}, f)
-sys.stderr.write("> build \u00b7 tool traces go to stderr\n")
+with open(os.path.join(home, "stderr"), encoding="utf-8") as f:
+    sys.stderr.write(f.read())
+sys.stderr.flush()
+with open(os.path.join(home, "silence"), encoding="utf-8") as f:
+    time.sleep(float(f.read()))
 with open(os.path.join(home, "answer"), encoding="utf-8") as f:
     sys.stdout.write(f.read())
+with open(os.path.join(home, "exit"), encoding="utf-8") as f:
+    sys.exit(int(f.read()))
 """
 
 
-def _fake_opencode(tmp_path, mode="read", answer="done\n"):
+def _fake_opencode(
+    tmp_path,
+    mode="read",
+    answer="done\n",
+    *,
+    stderr="> build \u00b7 tool traces go to stderr\n",
+    exit_code=0,
+    silence=0.0,
+):
+    """A fake ``opencode`` that reads its prompt as ``mode`` says, writes
+    ``stderr``, says nothing for ``silence`` seconds, then prints ``answer``
+    and exits ``exit_code``."""
     home = tmp_path / "fake-opencode"
     home.mkdir()
     (home / "fake.py").write_text(_FAKE_OPENCODE, encoding="utf-8")
     (home / "mode").write_text(mode, encoding="utf-8")
     (home / "answer").write_text(answer, encoding="utf-8")
+    (home / "stderr").write_text(stderr, encoding="utf-8")
+    (home / "silence").write_text(str(silence), encoding="utf-8")
+    (home / "exit").write_text(str(exit_code), encoding="utf-8")
     command = home / "opencode"
     command.write_text(
         f'#!/bin/sh\nexec "{sys.executable}" "{home / "fake.py"}" "{home}" "$@"\n',
@@ -1191,6 +1442,32 @@ def test_a_fake_opencode_that_exits_without_reading_its_whole_prompt_fails(tmp_p
         "opencode: the prompt was not delivered: the CLI exited without reading "
         f"the last {len(prompt) - taken} bytes of it"
     )
+
+
+def test_a_fake_opencode_that_exits_1_on_a_refused_permission_fails_naming_it(tmp_path):
+    """#258 end to end through the real executor: the refusal is the failure."""
+    from autoforge.interaction import Lifecycle
+
+    _, profile = _fake_opencode(
+        tmp_path, answer="", stderr=f"> build · gpt-6-luna\n{OC_PERMISSION}\n", exit_code=1
+    )
+    res = OpenCodeProvider().execute(AgentRequest("REVIEW", "p", str(tmp_path), profile, None, 30))
+    assert res.exit_code == 1 and not res.timed_out
+    assert res.provider_failure == PERMISSION_ENDED
+    assert res.interaction is not None and res.interaction.lifecycle is Lifecycle.FAILED
+
+
+def test_a_fake_opencode_silent_after_a_refused_permission_ends_at_the_idle_limit(tmp_path):
+    """#258: nothing waits on an agent's request past the idle limit (#193).
+    A CLI that went quiet after one is killed as any silent CLI is, and the
+    result is that timeout, not the refusal."""
+    _, profile = _fake_opencode(tmp_path, stderr=f"{OC_PERMISSION}\n", silence=60)
+    started = time.monotonic()
+    res = OpenCodeProvider().execute(AgentRequest("REVIEW", "p", str(tmp_path), profile, 1, 60))
+    assert time.monotonic() - started < 30
+    assert res.timed_out and res.timeout_limit == "idle"
+    assert res.provider_failure is None and res.interaction is None
+    assert res.provider_summary["refused_requests"] == 1
 
 
 @pytest.mark.parametrize(

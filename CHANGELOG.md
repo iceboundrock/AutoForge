@@ -11,6 +11,24 @@ production use, and not the Public Alpha (#255). The heading says
 `unreleased` until the release-prep commit the release's tag names gives it
 its date ([Releasing](docs/releasing.md#the-changelog)).
 
+### A request an agent CLI refused is named (#258)
+
+- Claude Code and OpenCode never put an agent's permission request or
+  question to a person in an unattended run: the CLI refuses it and tells
+  the agent to go on without it, and the run usually exits 0 (Claude Code
+  2.1.312 and OpenCode 2.1.4, run against a loopback stand-in of the
+  model API). Such a run's outcome is unchanged, and its `execution.json`
+  now counts the refused requests and names the first
+  (`provider_summary.refused_requests`, `refused_request`).
+- An OpenCode exit 1 with no error of its own after a refused request (how
+  2.0.26 was read to end such a run) now fails the step as
+  `the agent asked for permission (read: .env), which an unattended run
+  cannot give`, or `an answer to a question`, with what to do, instead of
+  a bare `exited 1`. It is never corrected or relaunched; the phase is
+  unchanged. Any other failed run keeps its reason and relaunch behaviour
+  and adds the refusal to its text. Nothing changes a default
+  ([An agent asked for permission or input](docs/usage.md#an-agent-asked-for-permission-or-input)).
+
 ### `gh` runs outside your checkout; `merge.delete_branch` deletes only the remote branch (#283)
 
 - Every `gh` the controller starts, `doctor`'s included, runs in an empty

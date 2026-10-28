@@ -89,6 +89,22 @@ name, the digest of its whole ``input`` (kept from the ``tool_use`` until
 its ``tool_result`` arrives) and the digest of the whole ``tool_result``
 block but its ``tool_use_id``; ``system/api_retry`` is a retry and an
 ``assistant`` record a completed turn. Only names and digests leave here.
+
+Refused requests (#258, run on claude 2.1.312 against a loopback stand-in
+of the Messages API, 2026-10-27): a ``-p`` run asks no one. A tool call
+that needs a permission its mode does not grant (``manual``, ``dontAsk``,
+``acceptEdits`` for a command) or that a deny rule of the user settings
+names is refused at once: a ``system/permission_denied`` record (``tool_name``,
+``tool_use_id``), an error ``tool_result`` telling the model to go on
+without it, and the call listed in the turn's ``result`` under
+``permission_denials`` (``tool_name``, ``tool_use_id``, ``tool_input``); the
+run goes on and exits 0. ``bypassPermissions``, the adapter's default,
+asked for nothing in that run (a write under ``.git/`` and ``.claude/``
+included). ``AskUserQuestion`` is not offered to the model under ``-p``; a
+call to it anyway gets an error ``tool_result``. Each of these is kept in
+:attr:`ClaudeStream.refused`, once per ``tool_use_id``: its kind and, for a
+permission, the tool's name and its one allow-listed input
+(:data:`TOOL_DETAILS`), never a command line.
 """
 
 from __future__ import annotations
@@ -97,6 +113,7 @@ import json
 import math
 from decimal import ROUND_HALF_UP, Decimal
 
+from .interaction import RequestKind
 from .loop_detect import LoopObserver, action_fingerprint, digest
 from .progress import ProgressEvent, ProgressKind, ProgressSink, clean, relative_path
 
@@ -116,6 +133,8 @@ TOOL_DETAILS: dict[str, str] = {
     "Agent": "description",
 }
 _PATH_INPUTS = frozenset({"file_path", "notebook_path"})
+# The tool through which the model asks the user a question.
+QUESTION_TOOL = "AskUserQuestion"
 # Record types that are activity only. Any other type is counted as unknown
 # (forward compatibility) and is activity too.
 _ACTIVITY_TYPES = frozenset({"rate_limit_event"})
@@ -125,8 +144,11 @@ _PER_TURN_COUNTS = ("num_turns", "duration_ms")
 # and to fingerprint the call once it completes. Past the bound a result is
 # still counted, only not named, and is no action for the loop detector.
 MAX_OPEN_TOOLS = 1024
+# Refused requests kept to name; past it they are still counted.
+MAX_REFUSED = 64
 MAX_REASON_CHARS = 400
 MAX_VALUE_CHARS = 120
+MAX_SUBJECT_CHARS = 160
 _MAX_COUNT = 10**15
 # A run that cost more than this is not a reading to believe.
 _MAX_COST_USD = Decimal(1_000_000)
@@ -154,7 +176,8 @@ class ClaudeStream:
     """One stream-json invocation as a reducer. Not thread-safe; one driver owns it.
 
     When the stream is over, :attr:`text` holds the final assistant text on
-    success and :attr:`failure` the bounded, redacted reason otherwise.
+    success and :attr:`failure` the bounded, redacted reason otherwise, and
+    :attr:`refused` the requests the CLI refused, whatever the outcome.
     """
 
     def __init__(
@@ -182,8 +205,15 @@ class ClaudeStream:
         # The per-turn counts summed over the results so far. A count one
         # result lacks makes its sum unknown, and it is dropped for good.
         self._per_turn: dict[str, int] = dict.fromkeys(_PER_TURN_COUNTS, 0)
-        # Open tool calls: their name and, with a loop observer, their input's digest.
-        self._open_tools: dict[str, tuple[str, bytes]] = {}
+        # Open tool calls: their name, with a loop observer their input's
+        # digest, and their allow-listed input (:data:`TOOL_DETAILS`).
+        self._open_tools: dict[str, tuple[str, bytes, str]] = {}
+        # Requests the CLI refused (module docstring): the first
+        # :data:`MAX_REFUSED`, each its kind and its cleaned subject ("" for
+        # none), and how many there were; a ``tool_use_id`` counts once.
+        self.refused: list[tuple[RequestKind, str]] = []
+        self.refused_count = 0
+        self._refused_ids: set[str] = set()
         self._records = 0
         self._oversize = 0
         self._unknown = 0
@@ -309,6 +339,12 @@ class ClaudeStream:
         denials = record.get("permission_denials")
         if isinstance(denials, list):
             summary["permission_denials"] = len(denials)
+            for denial in denials:
+                if isinstance(denial, dict):
+                    name = denial.get("tool_name")
+                    name = name if isinstance(name, str) else ""
+                    detail = self._detail(name, denial.get("tool_input"))
+                    self._refuse(RequestKind.PERMISSION, denial.get("tool_use_id"), name, detail)
         self._result = summary
         result = record.get("result")
         if is_error is True:
@@ -363,6 +399,14 @@ class ClaudeStream:
             if attempt is not None:
                 detail = f"attempt {attempt}" + (f" of {limit}" if limit is not None else "")
             self._send(ProgressEvent(ProgressKind.PROVIDER_RETRY, detail=detail))
+        elif subtype == "permission_denied":
+            tool_id = record.get("tool_use_id")
+            call = self._open_tools.get(tool_id) if isinstance(tool_id, str) else None
+            name = record.get("tool_name")
+            if not isinstance(name, str):
+                name = call[0] if call is not None else ""
+            self._refuse(RequestKind.PERMISSION, tool_id, name, call[2] if call else "")
+            self._send(ProgressEvent(ProgressKind.ACTIVITY))
         else:
             # Hooks, status and compaction notices: liveness only. A hook's
             # output is the operator's, and is never shown.
@@ -400,20 +444,36 @@ class ClaudeStream:
         name = name if isinstance(name, str) else ""
         tool_id = block.get("id")
         tool_input = block.get("input")
+        detail = self._detail(name, tool_input)
         if isinstance(tool_id, str) and len(self._open_tools) < MAX_OPEN_TOOLS:
             self._open_tools[tool_id] = (
                 name,
                 digest(tool_input) if self._loop is not None else b"",
+                detail,
             )
-        detail = ""
-        field = TOOL_DETAILS.get(name)
-        if field is not None and isinstance(tool_input, dict):
-            value = tool_input.get(field)
-            if field in _PATH_INPUTS:
-                detail = relative_path(value, self._cwd)
-            elif isinstance(value, str):
-                detail = value
         self._send(ProgressEvent(ProgressKind.TOOL_STARTED, tool=name, detail=detail))
+
+    def _detail(self, name: str, tool_input: object) -> str:
+        """The one input of ``name``'s call shown for it (:data:`TOOL_DETAILS`), or ""."""
+        field = TOOL_DETAILS.get(name)
+        if field is None or not isinstance(tool_input, dict):
+            return ""
+        value = tool_input.get(field)
+        if field in _PATH_INPUTS:
+            return relative_path(value, self._cwd)
+        return value if isinstance(value, str) else ""
+
+    def _refuse(self, kind: RequestKind, tool_id: object, name: str, detail: str) -> None:
+        """Keep a request the CLI refused, once per ``tool_use_id``."""
+        if isinstance(tool_id, str):
+            if tool_id in self._refused_ids:
+                return
+            if len(self._refused_ids) < MAX_OPEN_TOOLS:
+                self._refused_ids.add(tool_id)
+        self.refused_count += 1
+        if len(self.refused) < MAX_REFUSED:
+            subject = f"{name}: {detail}" if name and detail else name
+            self.refused.append((kind, clean(subject, MAX_SUBJECT_CHARS)))
 
     def _user(self, record: dict) -> None:
         sent = False
@@ -425,6 +485,10 @@ class ClaudeStream:
             name = call[0] if call is not None else ""
             if block.get("is_error") is True:
                 self._tool_errors += 1
+                if name == QUESTION_TOOL:
+                    # Not offered under -p (module docstring): the question
+                    # reached no one. Its text is the model's; only the kind is kept.
+                    self._refuse(RequestKind.QUESTION, tool_id, "", "")
                 self._send(ProgressEvent(ProgressKind.TOOL_FAILED, tool=name))
             else:
                 self._send(ProgressEvent(ProgressKind.TOOL_FINISHED, tool=name))

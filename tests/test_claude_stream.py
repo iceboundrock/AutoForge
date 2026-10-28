@@ -12,6 +12,7 @@ import pytest
 
 from autoforge import claude_stream
 from autoforge.claude_stream import ClaudeStream
+from autoforge.interaction import RequestKind
 from autoforge.progress import ProgressEvent, ProgressKind
 from tests.conftest import DECODER_LIMIT_RECORDS
 
@@ -589,4 +590,80 @@ def test_an_api_retry_is_reported_and_an_assistant_message_ends_a_turn():
 def test_without_a_loop_observer_inputs_are_not_digested():
     stream = ClaudeStream(cwd=CWD, emit=lambda event: None)
     stream.feed(_line(_assistant(_tool_use("t1", "Bash", command="make test"))))
-    assert stream._open_tools == {"t1": ("Bash", b"")}
+    assert stream._open_tools == {"t1": ("Bash", b"", "")}
+
+
+# -- requests the CLI refused (#258) ---------------------------------------------------
+def _denied(tool_id: str, name: str, **extra) -> dict:
+    """claude 2.1.312's record of a tool call it refused."""
+    record = {"type": "system", "subtype": "permission_denied", "tool_name": name}
+    return {**record, "tool_use_id": tool_id, "message": "needs approval.", **extra}
+
+
+def test_a_refused_call_is_kept_once_with_its_tool_and_its_allow_listed_input():
+    """As 2.1.312 streams a refusal: its record, an error tool result, and
+    the call again in the result's ``permission_denials``. One request each;
+    a Bash call shows its description, never its command."""
+    denials = [
+        {"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "touch x"}},
+        {"tool_name": "Write", "tool_use_id": "t2", "tool_input": {"file_path": f"{CWD}/a.py"}},
+    ]
+    stream, events = _run(
+        _assistant(_tool_use("t1", "Bash", command="touch x", description="Create the file")),
+        _denied("t1", "Bash"),
+        _tool_result("t1", is_error=True),
+        _assistant(_tool_use("t2", "Write", file_path=f"{CWD}/a.py", content="x")),
+        _denied("t2", "Write", decision_reason_type="mode"),
+        _tool_result("t2", is_error=True),
+        _result(permission_denials=denials),
+    )
+    assert stream.failure is None and stream.text == TEXT
+    assert stream.refused == [
+        (RequestKind.PERMISSION, "Bash: Create the file"),
+        (RequestKind.PERMISSION, "Write: a.py"),
+    ]
+    assert stream.refused_count == 2
+    assert "touch" not in repr(stream.refused)
+    # The refusal record is liveness only.
+    assert [e.kind for e in events].count(ProgressKind.ACTIVITY) == 2
+
+
+def test_a_refusal_is_read_from_the_result_alone_and_from_its_record_alone():
+    """A stream with no ``permission_denied`` record (the field is older than
+    it) names the call from its listed input; a run that ends before its
+    result names it from the record."""
+    listed = [{"tool_name": "Read", "tool_use_id": "t9", "tool_input": {"file_path": "/etc/x"}}]
+    stream, _ = _run(_result(permission_denials=listed))
+    assert stream.refused == [(RequestKind.PERMISSION, "Read: /etc/x")]
+    stream, _ = _run(
+        _assistant(_tool_use("t1", "Edit", file_path=f"{CWD}/b.py")), _denied("t1", "Edit")
+    )
+    assert stream.failure is not None and stream.refused == [(RequestKind.PERMISSION, "Edit: b.py")]
+
+
+def test_a_question_is_refused_only_when_its_call_failed():
+    stream, _ = _run(
+        _assistant(_tool_use("q1", "AskUserQuestion", questions=[{"question": "Which?"}])),
+        _tool_result("q1", is_error=True, content="No such tool available"),
+        _assistant(_tool_use("q2", "AskUserQuestion", questions=[])),
+        _tool_result("q2"),
+        _result(permission_denials=[]),
+    )
+    assert stream.refused == [(RequestKind.QUESTION, "")] and stream.refused_count == 1
+
+
+def test_refused_subjects_are_cleaned_and_bounded_and_their_number_is_not():
+    token = "ghp_" + "a" * 36
+    many = [
+        {"tool_name": "Bash", "tool_use_id": f"t{i}", "tool_input": {"description": "x" * 500}}
+        for i in range(claude_stream.MAX_REFUSED + 6)
+    ]
+    stream, _ = _run(
+        _assistant(_tool_use("s", "Bash", description=f"\x1b[31mDeploy {token}\x1b[0m")),
+        _denied("s", "Bash"),
+        _result(permission_denials=many),
+    )
+    assert stream.refused[0] == (RequestKind.PERMISSION, "Bash: Deploy ***REDACTED***")
+    assert len(stream.refused) == claude_stream.MAX_REFUSED
+    assert stream.refused_count == claude_stream.MAX_REFUSED + 7
+    assert all(len(s) <= claude_stream.MAX_SUBJECT_CHARS for _, s in stream.refused)

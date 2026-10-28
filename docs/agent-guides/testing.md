@@ -1676,3 +1676,24 @@ their own boundaries (`tests/test_interaction.py`). Keep covered:
   under the repository lock, a broker per launch, a claimed pause with
   nothing persisted, a LOCAL launch charge kept, and a dry run that asks
   no one.
+
+### Requests a CLI refused (#258)
+
+The CLI providers have no broker: their CLIs refuse a permission or a
+question themselves. Keep covered, on the fake `opencode` and `claude` and
+on synthetic stderr and stream lines (`tests/test_providers.py`,
+`tests/test_claude_stream.py`, the engine in `tests/test_engine.py`):
+
+- each recognised shape (OpenCode 2.1.4's permission line and cancelled
+  question, byte for byte; Claude's `system/permission_denied`, the
+  result's `permission_denials`, a failed `AskUserQuestion`), and text that
+  only quotes one is none. A subject is cleaned, redacted and bounded, a
+  Bash call shows its description and never its command, and a call is
+  counted once;
+- an OpenCode exit 1 with no run-level error after a refusal ends in
+  `InteractionRequiredError` naming the request and what to do, the phase
+  unchanged, with no correction and no relaunch; any other failure keeps
+  its reason and transient relaunch with the refusal added; a run that
+  ends usable keeps its outcome; a timeout stays a timeout;
+- an exit 1 that names no request keeps today's message, and a CLI silent
+  after a refusal is ended by the idle limit.
