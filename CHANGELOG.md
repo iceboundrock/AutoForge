@@ -3,13 +3,13 @@
 Notable changes for operators. A default changes only where an entry says
 so.
 
-## 0.1.0a0 (unreleased)
+## 0.1.0a0 (2026-10-28)
 
-The version is `0.1.0a0`, #295's registration prerelease of
-`autoforge-cli`: a pre-Alpha snapshot, not validated for unattended
-production use, and not the Public Alpha (#255). The heading says
-`unreleased` until the release-prep commit the release's tag names gives it
-its date ([Releasing](docs/releasing.md#the-changelog)).
+`autoforge-cli` `0.1.0a0` is #295's registration prerelease: a pre-Alpha
+snapshot, not validated for unattended production use, and not the Public
+Alpha (#255). The date above is planned until publication; if publication
+moves to another UTC date, correct it before the final merge and tag
+([Releasing](docs/releasing.md#the-changelog)).
 
 ### `gh` runs outside your checkout; `merge.delete_branch` deletes only the remote branch (#283)
 
@@ -259,8 +259,8 @@ its date ([Releasing](docs/releasing.md#the-changelog)).
   first prerelease claims Linux x86_64 with CPython 3.11 and 3.12 only;
   Windows is unsupported.
 - The [README](README.md#installation) documents installing the command
-  with `uv tool` from PyPI, where `autoforge-cli` is published as
-  prereleases (#295), from a git commit or from a built wheel;
+  with `uv tool` from PyPI once `autoforge-cli` is published (#295), from a
+  git commit or from a built wheel;
   [Releasing](docs/releasing.md) documents the version and tag scheme and
   the release procedure.
 

@@ -37,11 +37,10 @@ release.
   `pyproject.toml`), and PyPI resolves no relative link. Its Prerequisites
   and Installation sections therefore link absolutely, to `main`; the
   relative links of its other sections are broken on PyPI, a known
-  limitation. Text in the README stays true both before and after an
-  upload: it never says that nothing is published, and never that a
-  version is. Its PyPI method is conditional on a published version and
-  points at the releases page for which ones exist; the git commit and
-  built wheel methods are the ones that work from any commit.
+  limitation. Its PyPI method is conditional on a published version and
+  points at the releases page for which ones exist; its statement that the
+  first upload has not happened must be updated after that upload. The git
+  commit and built wheel methods work from any commit.
 
 ## Version scheme
 
@@ -169,8 +168,8 @@ the `gh` commands of steps 3 and 8 find the repository from it.
     - after the first upload, correct every statement that says
       `autoforge-cli` is not published yet: [`SECURITY.md`](../SECURITY.md),
       [Security boundaries](security.md) and
-      [Compatibility](compatibility.md); the README's Installation section
-      is written to stay true, and is checked too;
+      [Compatibility](compatibility.md) and the README's Installation
+      section;
     - in [Security boundaries: open security issues](security.md#open-security-issues),
       say which release carries the fixes of the rows marked *Fixed on
       `main`*, whose introduction says that no release does yet;
@@ -281,10 +280,12 @@ workflow.
 2. **A tag ruleset for `v*`.** In **Settings → Rules → Rulesets**, a new
    **tag** ruleset, enforcement **Active**, targeting the tag pattern `v*`,
    with **Restrict creations**, **Restrict updates** and **Restrict
-   deletions** and **Block force pushes**, and the repository admin role
-   (the maintainer) as the only bypass actor. Only the maintainer can then
-   create, move or delete a release tag, and the procedure never moves or
-   deletes one. AutoForge's controller pushes branches only, never a tag.
+   deletions** and **Block force pushes**. Restrict bypass to authorized
+   maintainers: the configured actors are the maintainer's account and the
+   repository admin role, so check who holds that role. The bypass applies
+   to all these rules, not only creation: the procedure never moves or
+   deletes a release tag. AutoForge's controller pushes branches only,
+   never a tag.
 3. **No secret.** `gh secret list` and `gh secret list --env pypi` print
    nothing. Trusted Publishing needs no PyPI token, and none is created.
 4. **A pending trusted publisher on PyPI,** last. Signed in to PyPI as the
@@ -341,6 +342,14 @@ Optional, and not needed for `0.1.0a0`:
    `pypi-publish` run for it starts.
 2. When `build` has passed, open the run and check that it is for the tag
    you pushed and the commit it names, and read the digests in its summary.
+   Before approval, download that run's `release` artifact, check its
+   SHA-256 against the build summary, and install its exact wheel
+   non-editably in a fresh environment outside the checkout on CPython 3.11
+   as well. Check
+   `autoforge --version`, `--help` and every installed prompt template, as
+   the build job did on 3.12. CI's 3.11 job builds different files and
+   cannot prove the release wheel works there
+   ([#256 D3](https://github.com/iceboundrock/AutoForge/issues/256#issuecomment-6375246718)).
 3. Approve the `pypi` deployment (**Review deployments**). `publish`
    re-verifies the files and uploads them. Reject it to stop without
    uploading anything; the tag stays, and the next attempt is the next
