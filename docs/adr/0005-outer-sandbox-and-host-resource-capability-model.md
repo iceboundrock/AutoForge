@@ -1739,11 +1739,11 @@ refuses before the spawn (D12.2).
 | rootless podman, default settings | yes (planning) | user and PID namespaces work, a new procfs is refused (`EPERM`): unsupported unless run with `--security-opt unmask=/proc/* --security-opt label=disable` |
 | an AutoForge sandbox nested in a sandbox that passed `--disable-userns` | yes | the inner `bwrap` fails (`ENOSPC`) |
 | hosted CI, `ubuntu-latest` | on every CI run | the `sandbox` job installs `bwrap` from the distribution, records its version and `--overlay`, the user-namespace sysctls, an unprivileged namespace launch and the Landlock ABI in its summary (`tests/sandbox_host.py`), and requires the real-backend tests wherever the runner measures capable (docs/development.md, "The outer sandbox") |
-| Ubuntu 23.10 and later with AppArmor's `kernel.apparmor_restrict_unprivileged_userns` | no | #169 verifies and documents |
-| Debian with `kernel.unprivileged_userns_clone=0` | no | #169 verifies and documents |
-| Docker, default seccomp profile | no | #169 verifies and documents |
-| WSL2 | no | #169 verifies and documents |
-| a kernel before 6.12 (for example the default kernels of Ubuntu 24.04 and Debian 12), or Landlock disabled | no | no abstract-socket scope: unsupported (D14.1); #169 verifies and documents |
+| Ubuntu 23.10 and later with AppArmor's `kernel.apparmor_restrict_unprivileged_userns` | no | not measured on such a host. Unsupported while the policy refuses unprivileged user namespaces (D14.1). What #169 established holds on any host: the probe names the capability it finds missing (it classifies `bwrap`'s user-namespace refusals as `an unprivileged user namespace`, tested on their text), `required` and REMOTE's `preferred` refuse with the probe's reason before the step saves or launches anything, LOCAL's `preferred` falls back visibly (D12.2), and `doctor` reports it. Hosted CI records this sysctl on its runner (row above) |
+| Debian with `kernel.unprivileged_userns_clone=0` | no | not measured on such a host. Unsupported while the sysctl is 0 (D14.1); probed, refused and reported as in the Ubuntu row (`bwrap`'s message naming this sysctl is classified as `an unprivileged user namespace`, tested on its text). Hosted CI records this sysctl on its runner |
+| Docker, default seccomp profile | no | not measured; whether its default seccomp profile lets the probe's launch through is unknown. A refusal is handled as in the Ubuntu row |
+| WSL2 | no | not measured; WSL2 is untested ([Compatibility](../compatibility.md)). A refusal is handled as in the Ubuntu row |
+| a kernel before 6.12 (for example the default kernels of Ubuntu 24.04 and Debian 12), or Landlock disabled | no | not measured on such a host. No abstract-socket scope: unsupported (D14.1). The launch reads the kernel's Landlock ABI before it spawns anything and refuses below 6, which the probe names `the Landlock abstract-socket scope (Landlock ABI 6, Linux 6.12 or later)` (tested with a stubbed ABI); refused and reported as in the Ubuntu row. Hosted CI records its runner's kernel and Landlock ABI |
 | macOS | n/a | unsupported in Wave 2A |
 | Windows | n/a | not an AutoForge platform |
 

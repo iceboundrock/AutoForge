@@ -139,7 +139,11 @@ definition by its index and asks for an actionable finding that names it.
 At the correction bound it is the usual `ControlResultValidationError`:
 the phase stays `REVIEW` and nothing is published. A result with findings
 over a failure, and a clean result over all-`PASS` records or an empty set,
-are accepted as before.
+are accepted as before. A clean result accepted here is what the round's
+review certificate records: if the round completes, the write that enters
+`READY_FOR_MERGE` (LOCAL: `DONE`) issues it from the records this check
+compared the verdict with (ADR 0006 D12; [workflow.md](workflow.md),
+"Candidate validation gates").
 
 Producers (`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`) are not asked
 about validation either: their `tests` / `verification` fields stay the

@@ -1,13 +1,12 @@
 # ADR 0004. Authority boundary and typed external effects
 
-- **Status:** accepted. This is a design record; nothing in it is implemented
-  yet. It is implemented by #160 (effect records, reconciliation, typed
-  operations, the controller git transport, the `UPDATE_EPIC` progress
-  comment and the one protocol bump), #161 (`ANALYZE_EXECUTE`), #162
-  (`REVIEW`), #163 (`FIX`), #164 (`REPLAN_REEXECUTE`) and #165 (credential
-  removal and the agent read path). The number is assigned when the record
-  merges: if another ADR merges first, this record takes the next free
-  number, and its index entries move with it.
+- **Status:** accepted, and implemented by #160 (effect records,
+  reconciliation, typed operations, the controller git transport, the
+  `UPDATE_EPIC` progress comment and the one protocol bump), #161
+  (`ANALYZE_EXECUTE`), #162 (`REVIEW`), #163 (`FIX`), #164
+  (`REPLAN_REEXECUTE`) and #165 (credential removal and the agent read
+  path). The amendments below, and D4.5a (#327), were each made by the
+  change that implements them.
 - **Amended by #211:** effect kind K9 (the acceptance comment on the run's
   own issue), its authorization precondition (D5.6), the decline of an
   unsent acceptance action (D5.7), its D1.2 row and its own protocol bump

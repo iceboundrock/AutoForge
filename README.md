@@ -388,12 +388,12 @@ controller *does* detect is a moved git anchor: HEAD and the checked-out branch
 are compared with the values the run was pinned to before and after every
 phase, and before every correction relaunch within one, so a commit, reset,
 checkout or branch switch blocks the run before another agent starts. It detects
-nothing else. Real containment is a sandbox, which LOCAL v1 does not provide
-under the default `sandbox.mode: disabled`
+nothing else. Real containment is a sandbox, and LOCAL v1 provides none
+under the default `sandbox.mode: disabled`, which is logical isolation only
 ([ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md)
-§2.2 and §8.1; isolation is tracked in #10). With `sandbox.mode: required`
-every LOCAL agent and validation command runs inside ADR 0005's outer
-sandbox, where the git directory is read-only, so a commit, stash or branch
+§2.2 and §8.1). With `sandbox.mode: required` every LOCAL agent and
+validation command runs inside ADR 0005's outer sandbox (#166–#169),
+where the git directory is read-only, so a commit, stash or branch
 switch fails outright; the agent still runs as your UID on the host
 network. `preferred` does the same where the host can enforce and, where it
 cannot, says at every launch that it runs with logical isolation only
@@ -433,7 +433,7 @@ most common entry points:
 | see how the code is divided | [Architecture](docs/agent-guides/architecture.md), [module map](src/autoforge/AGENTS.md) |
 | contribute, run the checks, write tests | [Development](docs/development.md), [Testing](docs/agent-guides/testing.md) |
 | cut or publish a release | [Releasing](docs/releasing.md) |
-| read the design records | [ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md), [ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md), [ADR 0003](docs/adr/0003-pi-agent-provider.md) |
+| read the design records | [ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md), [ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md), [ADR 0003](docs/adr/0003-pi-agent-provider.md), [ADR 0004](docs/adr/0004-authority-boundary-and-typed-external-effects.md), [ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md), [ADR 0006](docs/adr/0006-candidate-validation-evidence-and-review-certificates.md), [ADR 0007](docs/adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md) (partly implemented) |
 
 Coding agents working on this repository start at [AGENTS.md](AGENTS.md).
 
@@ -442,8 +442,10 @@ Coding agents working on this repository start at [AGENTS.md](AGENTS.md).
 **Supported now (Phase 2):** GitHub issue → Claude Code implementation → the
 controller's push and PR, read back via `gh` → OpenCode review with
 round-based model routing → Claude Code remediation of finding IDs →
-repeated review with SHA binding → `READY_FOR_MERGE`; the bounded REVIEW/FIX
-loop with stagnation detection and the `REPLAN_REEXECUTE` transaction;
+repeated review with SHA binding → `READY_FOR_MERGE`, entered only in the
+write that issues the clean round's review certificate (below); the
+bounded REVIEW/FIX loop with stagnation detection and the
+`REPLAN_REEXECUTE` transaction;
 journal-first recovery of an interrupted push or PR creation;
 bounded correction retry for malformed results; `doctor`; redacted
 per-invocation logs; LOCAL mode against a feature Markdown file.
@@ -463,14 +465,49 @@ cannot, they skip with the probe's reason. It is experimental until a
 `make test-sandbox` run on a capable host is recorded at the release
 candidate.
 
+**Opt-in, off until configured:** controller-run validation of the exact
+candidate
+([ADR 0006](docs/adr/0006-candidate-validation-evidence-and-review-certificates.md)).
+`validation.commands` (REMOTE) and `local.validation_commands` (LOCAL) are
+empty by default, so nothing is validated until you configure them. Then
+the controller runs each command itself against the exact candidate an
+agent hands back, a REMOTE commit in a byte-exact export of its tree or
+the LOCAL working tree in place (where a command that changes the tree
+must converge), and keeps each outcome in the state file as a durable
+`ValidationRecord`, reused for the same candidate, command and policy. A
+REMOTE candidate is pushed or published only once every command has
+passed on it. Before a reviewer launches, the controller requires records
+for the candidate under review (REMOTE validates a PR head that has none,
+such as a human's push), shows their outcomes in the review prompt's
+evidence section, and refuses a clean verdict over a failing record. A
+record says what the controller observed when it ran a command, not
+that the change is correct, that GitHub CI passed or that the result
+holds on another host; under `sandbox.mode: disabled` every command runs
+unsandboxed as your UID.
+
+**Always on, with or without validation:** the review certificate a clean
+round issues on its way to `READY_FOR_MERGE` or LOCAL `DONE`. It states
+which candidate and revision were reviewed clean, which validation set the
+reviewer was presented, and that every record in it passed; with nothing
+configured the set is empty, and the certificate certifies a clean review
+and no validation. It is a prerequisite, not permission to merge: it is
+not a GitHub approval or a CI result, and it is never shown to an agent or
+published.
+
 **Experimental: implemented and verified, but exercised only against the
 in-memory fake:** the controller-owned `MERGE` step behind the merge safety
-gate (off by default), including its pre-merge verification, and
-`UPDATE_EPIC`. Every claim these phases depend on is re-read from GitHub
-before state advances, but no automated test has ever merged a real PR or
-edited a real EPIC, so treat an opened gate as unproven against real
-services. The supported path keeps the gate closed: a human reviews and
-merges the PR the run leaves at `READY_FOR_MERGE`.
+gate (off by default), including its pre-merge verification and its
+review-certificate check (#175), and `UPDATE_EPIC`. Every claim these
+phases depend on is re-read from GitHub before state advances, but no
+automated test has ever merged a real PR or edited a real EPIC, so treat
+an opened gate as unproven against real services. The supported path
+keeps the gate closed: a human reviews and merges the PR the run leaves at
+`READY_FOR_MERGE`. The gate refuses a certificate that does not apply to
+the live PR revision or to the validation configuration in force, and
+still re-reads every fact it decides on from GitHub. A run saved in
+`READY_FOR_MERGE` or `MERGE` before certificates existed holds none: the
+gate refuses it while its PR is open (`BLOCKED`, nothing merged), and
+`unblock` sends it to a new validated `REVIEW` round.
 
 **Experimental: implemented and verified offline:** the parallel EPIC
 scheduler (`autoforge epic run|resume|status|stop|archive`, ADR 0008). Its
