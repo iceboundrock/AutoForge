@@ -905,7 +905,10 @@ a stated reason it has none. The coverage that must keep working:
   aliases (snapshot and login shell, a startup file that shadows the
   cleaner's builtins, an operator's `CLAUDE_CODE_SHELL` or
   `CLAUDE_CODE_SHELL_PREFIX`, the repository's settings `env`), while the
-  same launch without the adapter's isolation does; a launch whose Claude
+  same launch without the adapter's isolation does, and keeps the launch's
+  `PATH` in a login shell whose startup file sets it outright (as Debian's
+  `/etc/profile` does, #347; in a sandbox, the `PATH` as rewritten
+  there); a launch whose Claude
   user settings or global configuration set a variable that would undo
   its isolation, or cannot be read, is refused before the CLI starts,
   naming the file and the variable, never the value (`test_providers.py`,

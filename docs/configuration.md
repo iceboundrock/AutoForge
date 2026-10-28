@@ -717,6 +717,11 @@ repository's runs in a launch:
   empty, whatever your shell sets. A command that relies on one of your
   functions or aliases fails in a launch; put what it needs in a script on
   `PATH` instead.
+- A Bash tool command runs with the `PATH` the launch gives Claude Code,
+  login shell or not. A login shell reads `/etc/profile`, and some
+  distributions' (Debian's) set `PATH` outright, so the same file sets the
+  launch's `PATH` back in a login shell, which is where a command runs when
+  Claude Code has no snapshot. Any other shell's `PATH` is left alone.
 - Claude Code sets the `env` of your user settings (`~/.claude/settings.json`,
   or `settings.json` in `CLAUDE_CONFIG_DIR`) and of its global
   configuration (`~/.claude.json`, or the one in `CLAUDE_CONFIG_DIR`) over
