@@ -37,10 +37,9 @@ release.
   `pyproject.toml`), and PyPI resolves no relative link. Its Prerequisites
   and Installation sections therefore link absolutely, to `main`; the
   relative links of its other sections are broken on PyPI, a known
-  limitation. Its PyPI method is conditional on a published version and
-  points at the releases page for which ones exist; its statement that the
-  first upload has not happened must be updated after that upload. The git
-  commit and built wheel methods work from any commit.
+  limitation. Its PyPI method links the PyPI project page and the releases
+  page, which list the published versions (the first, `0.1.0a0`, on
+  2026-10-28). The git commit and built wheel methods work from any commit.
 
 ## Version scheme
 
