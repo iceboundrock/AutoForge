@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 from dataclasses import replace
@@ -70,6 +71,21 @@ def local_repo(tmp_path) -> Path:
     write_feature(root)
     commit_all(root, "initial")
     return root
+
+
+@pytest.fixture(params=[0o002, 0o022, 0o077], ids=lambda m: f"umask{m:04o}")
+def creation_umask(request):
+    """Run a test under a 0002, a 0022 and a 0077 umask (#350).
+
+    The fingerprint records each file's full permission bits, and a new file
+    gets what the umask leaves of 0666: 0664 under 0002, 0644 under 0022. A
+    test that undoes a ``chmod`` must restore the mode the file started
+    with; running it under each umask here checks that it does, whatever
+    umask the shell that started pytest had.
+    """
+    previous = os.umask(request.param)
+    yield request.param
+    os.umask(previous)
 
 
 def impl_result(changed: bool = True, summary: str = "Implemented the filter.") -> str:
@@ -283,7 +299,7 @@ def test_fingerprint_tracks_tracked_untracked_and_clean_alike(tmp_path):
     assert ws.snapshot().fingerprint == stable
 
 
-def test_fingerprint_notices_a_mode_change_on_an_already_dirty_file(tmp_path):
+def test_fingerprint_notices_a_mode_change_on_an_already_dirty_file(tmp_path, creation_umask):
     """R3-F3: content + status code do not describe a working tree; the mode does too.
 
     On a file that is *already* modified, `chmod +x` moves neither the
@@ -297,6 +313,7 @@ def test_fingerprint_notices_a_mode_change_on_an_already_dirty_file(tmp_path):
     ws = LocalWorkspace(workdir=root)
     script = root / IMPL_FILE
     script.write_text("print('hi')\n", encoding="utf-8")  # dirty, mode unchanged
+    original = stat.S_IMODE(script.stat().st_mode)  # what the umask made it
     dirty = ws.snapshot().fingerprint
 
     script.chmod(0o755)
@@ -304,7 +321,7 @@ def test_fingerprint_notices_a_mode_change_on_an_already_dirty_file(tmp_path):
     assert [e.mode for e in ws.snapshot().entries if e.path == IMPL_FILE] == ["0755"]
 
     # ... and back again: the fingerprint is a function of the tree, not a ratchet.
-    script.chmod(0o644)
+    script.chmod(original)
     assert ws.snapshot().fingerprint == dirty
 
     # The same holds for a file that is only *newly* executable and untracked.
@@ -3370,7 +3387,7 @@ def test_a_checkpoint_from_another_phase_is_not_closed_by_a_clean_review(tmp_pat
 
 
 # -- PR #44 R4: the fingerprint's edges ---------------------------------------
-def test_a_mode_change_is_bound_even_with_core_filemode_disabled(tmp_path):
+def test_a_mode_change_is_bound_even_with_core_filemode_disabled(tmp_path, creation_umask):
     """R4-F4: `core.fileMode=false` hides `chmod +x` on a *clean* tracked file.
 
     Git then reports no porcelain entry at all, so the path is never
@@ -3385,11 +3402,12 @@ def test_a_mode_change_is_bound_even_with_core_filemode_disabled(tmp_path):
     clean = ws.snapshot().fingerprint
 
     script = root / IMPL_FILE  # committed, clean, not executable
+    original = stat.S_IMODE(script.stat().st_mode)  # what the umask made it
     script.chmod(0o755)
     assert ws.snapshot().fingerprint != clean
     assert [e.mode for e in ws.snapshot().entries if e.path == IMPL_FILE] == ["0755"]
 
-    script.chmod(0o644)
+    script.chmod(original)
     assert ws.snapshot().fingerprint == clean
 
 
