@@ -87,7 +87,7 @@ with the date.
 
 Run every step from your checkout of this repository, whose `origin` is
 `iceboundrock/AutoForge` on GitHub: step 6 pushes the tag to `origin`, and
-step 8's `gh` commands find the repository from it.
+the `gh` commands of steps 3 and 8 find the repository from it.
 
 1. **Release-prep pull request.** From a feature branch, never on `main`:
    set the version in `pyproject.toml` and `src/autoforge/__init__.py`
@@ -103,7 +103,8 @@ step 8's `gh` commands find the repository from it.
    `dist (py3.11)` and `dist (py3.12)`.
 3. **Security preflight.** No public release while a Critical or High
    security issue is open, unless a reviewed containment that actually
-   prevents the affected unsafe path exists and is recorded on the issue
+   prevents the affected unsafe path exists and is recorded on the issue,
+   nor from a commit that lacks the fix of a closed one
    ([Security preflight](#security-preflight),
    [Security boundaries: open security issues](security.md#open-security-issues)).
 4. **Tag locally.** An annotated tag on that merge commit, not pushed yet:
@@ -170,6 +171,9 @@ step 8's `gh` commands find the repository from it.
       [Security boundaries](security.md) and
       [Compatibility](compatibility.md); the README's Installation section
       is written to stay true, and is checked too;
+    - in [Security boundaries: open security issues](security.md#open-security-issues),
+      say which release carries the fixes of the rows marked *Fixed on
+      `main`*, whose introduction says that no release does yet;
     - link the record of step 10 on #256 and #255 from the pull request.
 
 ## Publishing to PyPI
@@ -406,3 +410,44 @@ exists and is recorded on the issue. For `0.1.0a0` that means each of
 ([Security boundaries: open security issues](security.md#open-security-issues))
 is closed, or has such a containment recorded on it, before the tag is
 pushed.
+
+A fix counts only if the commit you tag carries it. Each of the five was
+fixed on `main` by one squash-merged pull request:
+
+| Issue | Severity | Fixed on `main` by |
+|---|---|---|
+| #280 | Critical | `f4fd5ef` (#305) |
+| #281 | High | `d6fe4fd` (#334) |
+| #282 | High | `1f6abad` (#336) |
+| #283 | High | `9a7d8f9` (#337) |
+| #284 | High | `e611475` (#314) |
+
+Step 3 of the [procedure](#procedure) checks, for the commit step 4 will
+tag, that it carries every fix and that every issue is closed on GitHub.
+The first loop prints nothing when the commit carries all five fixes, and
+`missing <fix>` for each it does not; the second prints each issue's
+state:
+
+```bash
+commit=<commit of main>
+for fix in \
+  f4fd5efec6d5ffbf12397a0ba59560eeb2379148 \
+  d6fe4fd4f37ddcc2d55fc53f01228b2a7d9dce3a \
+  1f6abad5debe375594fc2ab6d13cbe5cfac96396 \
+  9a7d8f9afc6e66992008ff211f58d1518be8a197 \
+  e611475bca9862e6f15689c7e66d1a4b59626478; do
+  git merge-base --is-ancestor "$fix" "$commit" || echo "missing $fix"
+done
+for issue in 280 281 282 283 284; do
+  echo "#$issue $(gh issue view "$issue" --json state --jq .state)"
+done
+```
+
+Each issue must print `CLOSED`. An issue that prints `OPEN` blocks the
+upload unless its reviewed containment is recorded on it. Then check
+for what the audit did not find: no other open issue is rated Critical or
+High, and the repository's **Security** tab lists no advisory rated
+Critical or High that is still in triage or a draft (a private
+vulnerability report arrives there in triage,
+[`SECURITY.md`](../SECURITY.md#reporting-a-vulnerability)). Record the
+output on #295 with the commit it checked.
