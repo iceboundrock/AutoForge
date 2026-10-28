@@ -180,8 +180,10 @@ its date ([Releasing](docs/releasing.md#the-changelog)).
 - [Releasing](docs/releasing.md#publishing-to-pypi) documents that setup
   (the PyPI pending trusted publisher, the `pypi` environment, the tag
   ruleset), rehearsals, troubleshooting and the checks after an upload,
-  and the security preflight that keeps a public upload waiting while
-  #280 to #284 are open.
+  and the security preflight that keeps a public upload waiting while a
+  Critical or High security issue is open. For this version that is #280
+  to #284, fixed above; the preflight checks that the tagged commit
+  carries each fix and that each issue is closed.
 
 ### An empty check rollup never merges; GitHub Free is a plan limit (#289)
 
