@@ -34,6 +34,7 @@ from autoforge.errors import (
     GitHubNotFoundError,
     GitHubUnavailableError,
     GitTransportError,
+    InteractionRequiredError,
     StateError,
     StateTransitionError,
     VerificationError,
@@ -10092,6 +10093,160 @@ def test_unrelated_opencode_failure_is_not_retried(tmp_state_dir, fake_github):
     state = load_state(eng.paths.state_file)
     assert state.phase == Phase.REVIEW and state.attempt == 1
     assert len(calls) == 1
+
+
+# -- a request the CLI refused (#258) --------------------------------------------------
+OC_PERMISSION = "\x1b[93m\x1b[1m! \x1b[0mpermission requested: read (.env); auto-rejecting"
+# opencode 2.1.4's cancelled question: the tool's failed line, then its error line.
+OC_QUESTION = (
+    "\x1b[0m✗ \x1b[0mAsked 1 question failed\n\x1b[91m\x1b[1mError: \x1b[0mThis "
+    "non-interactive run cannot ask the user questions, so the question was cancelled. "
+    "Continue without an answer; make reasonable assumptions and state them."
+)
+REFUSAL_GUIDE = "docs/usage.md, 'An agent asked for permission or input'"
+
+
+@pytest.mark.parametrize(
+    ("line", "asked", "remedy"),
+    [
+        (OC_PERMISSION, "permission (read: .env)", "options.auto_approve: true approves"),
+        (OC_QUESTION, "an answer to a question", "cannot be answered until #126 lands"),
+    ],
+    ids=["permission", "question"],
+)
+def test_a_refused_request_that_failed_the_run_is_named_and_neither_corrected_nor_relaunched(
+    tmp_state_dir, fake_github, line, asked, remedy
+):
+    """#258: an OpenCode exit 1 whose only cause on stderr is a refused
+    request ends in ADR 0007 D7.6's failure through the real adapter: the
+    request is named with what to do, the phase is unchanged, and nothing is
+    corrected or relaunched, though either is still allowed."""
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    eng.config.execution.max_correction_attempts = 3
+    stderr = f"> build · gpt-6-luna\n{line}\n"
+    calls = _install_opencode_responses(eng, [(1, "", stderr)] * 4)
+
+    with pytest.raises(InteractionRequiredError) as excinfo:
+        eng.step()
+
+    message = str(excinfo.value)
+    assert (
+        f"agent 'review_round_1' failed: opencode: the agent asked for {asked}, which an "
+        "unattended run cannot give; OpenCode refused it and exited 1 with no error of its own."
+    ) in message
+    assert remedy in message and "'resume' starts a fresh session" in message
+    assert REFUSAL_GUIDE in message
+    assert "Not relaunched: it would ask again (ADR 0007 D7.6)" in message
+    assert "State unchanged." in message and "resume:" in message
+    assert len(calls) == 1
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW and state.attempt == 1 and state.review_round == 0
+    _, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert f"the agent asked for {asked}" in execution["error"]
+    assert execution["provider_summary"]["refused_requests"] == 1
+
+
+@pytest.mark.parametrize(
+    "stderr", ["> build · gpt-6-luna\n", ""], ids=["no-error-line", "empty-stderr"]
+)
+def test_an_exit_1_that_names_no_request_keeps_todays_failure(tmp_state_dir, fake_github, stderr):
+    """#258 item 3: nothing on stderr identifies a request, so nothing is
+    guessed: the generic failed exit, as before."""
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    calls = _install_opencode_responses(eng, [(1, "", stderr)])
+
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+
+    assert not isinstance(excinfo.value, InteractionRequiredError)
+    message = str(excinfo.value)
+    assert f"agent 'review_round_1' exited 1. stderr tail: {stderr}".rstrip() in message
+    assert "asked for" not in message and "D7.6" not in message
+    assert len(calls) == 1 and load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+def test_a_transient_failure_after_a_refused_request_is_still_relaunched(
+    tmp_state_dir, fake_github
+):
+    """A run-level error of its own, not the refusal, failed the run: its
+    outcome is unchanged (relaunched as transient), and the log adds the
+    refusal to the failure's text."""
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    calls = _install_opencode_responses(
+        eng,
+        [
+            (1, "", f"{OC_PERMISSION}\n{WS_CLOSED}"),
+            (0, block(review_payload(1, SHA_A, [])), f"{OC_PERMISSION}\n"),
+        ],
+    )
+
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert len(calls) == 2
+    run_dir, _ = _step_dir(eng)
+    first, second = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    assert (first / "error.txt").read_text(encoding="utf-8").strip() == (
+        "opencode: exited 1; during the run the agent asked for permission (read: .env), "
+        f"which OpenCode refused ({REFUSAL_GUIDE}) (transient: {TRANSIENT})"
+    )
+    execution = json.loads((second / "execution.json").read_text(encoding="utf-8"))
+    assert execution["exit_code"] == 0
+    assert execution["provider_summary"]["refused_request"] == "permission (read: .env)"
+
+
+def _claude_refusing(tail: list) -> list:
+    """A Bash call claude 2.1.312 refused under ``manual`` (#258), then ``tail``."""
+    from tests import claude_fake
+
+    denied = {"type": "system", "subtype": "permission_denied", "tool_name": "Bash"}
+    return [
+        claude_fake.init(),
+        claude_fake.tool_use("t1", "Bash", command="touch x", description="Create the file"),
+        claude_fake.line({**denied, "tool_use_id": "t1", "message": "needs approval."}),
+        claude_fake.tool_result("t1", "touch needs approval", is_error=True),
+        *tail,
+    ]
+
+
+def test_a_claude_refusal_the_agent_went_on_without_leaves_the_outcome_to_its_result(
+    tmp_path, fake_github
+):
+    """#258: a -p run refuses the call and goes on; its result decides, as
+    before, and the run log records what was refused."""
+    from tests import claude_fake
+    from tests.test_progress import ANALYZE_OK, _engine_on_fake_claude
+
+    eng, _ = _engine_on_fake_claude(
+        tmp_path, fake_github, _claude_refusing([claude_fake.result(block(ANALYZE_OK))])
+    )
+    assert eng.step().next_phase == "REVIEW"
+    _, step = _step_dir(eng)
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert execution["provider_summary"]["refused_request"] == "permission (Bash: Create the file)"
+
+
+def test_a_claude_run_that_fails_after_a_refusal_keeps_its_reason_and_names_the_refusal(
+    tmp_path, fake_github
+):
+    from tests import claude_fake
+    from tests.test_progress import _engine_on_fake_claude
+
+    error = claude_fake.result("", is_error=True, subtype="error_during_execution")
+    eng, _ = _engine_on_fake_claude(tmp_path, fake_github, _claude_refusing([error]))
+    eng.config.execution.max_correction_attempts = 3
+
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+
+    assert not isinstance(excinfo.value, InteractionRequiredError)
+    message = str(excinfo.value)
+    assert "failed: claude: the run ended in an error (subtype error_during_execution" in message
+    assert (
+        "during the run the agent asked for permission (Bash: Create the file), which Claude "
+        f"Code refused ({REFUSAL_GUIDE})"
+    ) in message
+    assert "touch x" not in message
+    assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
 
 
 def test_a_transient_failure_after_the_agent_opened_a_marker_pr_blocks_instead_of_relaunching(

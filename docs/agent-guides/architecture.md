@@ -226,7 +226,14 @@ are planned. ADR 0007 decides how an SDK provider fits these boundaries:
   persisted. Until #126 lands the broker never pauses: the `pause`
   policy, its pending record, the operator commands and recovery are
   #126's. Every adapter declares no capability (D5.3), so every ask
-  fails today, whatever the policy.
+  fails today, whatever the policy. A CLI adapter gets no broker: its CLI
+  refuses an ask itself and tells the agent to go on. When the CLI's output
+  shows that such a refusal is all that failed the run (an OpenCode exit 1
+  with no error of its own), the adapter reports `failed` itself, with the
+  request named in `provider_failure`, and the engine handles it as D7.6's
+  failure. Any other refusal its output shows is only added to the text of
+  a failure and counted in `provider_summary` (#258,
+  [usage](../usage.md#an-agent-asked-for-permission-or-input)).
 - **A capability exists only after its gate passes.** The gate is an
   isolated runtime probe, per ADR 0007 §3.
 
