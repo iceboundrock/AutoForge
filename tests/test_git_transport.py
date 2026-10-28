@@ -676,13 +676,19 @@ def test_planted_ancestry_passes_neither_the_ancestry_nor_the_fast_forward_check
     base = world.commit("base")
     world.publish(base, "refs/heads/main")
     world.publish(base, "refs/heads/feature")
-    unrelated = world.commit("unrelated")
-    _plant(world, mechanism, unrelated, (base,))
+    below = world.commit("unrelated root")
+    unrelated = world.commit("unrelated", below)
+    # Planted below the candidate, on the path a walk takes (#348): git 2.47's
+    # ``merge-base`` reads the commits named on its command line from their
+    # objects and consults the commit-graph only for the commits it walks to,
+    # so a forged graph entry for the candidate itself fools 2.55 but not 2.47.
+    _plant(world, mechanism, below, (base,))
     # The attack: the shared repository's own git now says it descends.
     assert git_ok("-C", str(world.shared), "merge-base", "--is-ancestor", base, unrelated)
 
     transport = world.transport()
     assert not transport.descends_from(unrelated, base)
+    assert world.reads_of(below) != []  # the walk read the planted commit's own bytes
     with pytest.raises(GitTransportError) as info:
         transport.push(sha=unrelated, branch="feature", expected_old=base, default_branch="main")
     assert unrelated in str(info.value) and base in str(info.value)
