@@ -3,13 +3,13 @@
 Notable changes for operators. A default changes only where an entry says
 so.
 
+## Unreleased
+
 ## 0.1.0a0 (2026-10-28)
 
 `autoforge-cli` `0.1.0a0` is #295's registration prerelease: a pre-Alpha
 snapshot, not validated for unattended production use, and not the Public
-Alpha (#255). The date above is planned until publication; if publication
-moves to another UTC date, correct it before the final merge and tag
-([Releasing](docs/releasing.md#the-changelog)).
+Alpha (#255).
 
 ### A request an agent CLI refused is named (#258)
 

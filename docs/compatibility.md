@@ -9,7 +9,8 @@ labels:
 - **untested**: nothing proves it either way; it may work;
 - **unsupported**: known not to work, with the reason.
 
-The first prerelease claims Linux x86_64 with CPython 3.11 and 3.12 only
+The first prerelease, `0.1.0a0` (published on PyPI on 2026-10-28), claims
+Linux x86_64 with CPython 3.11 and 3.12 only
 ([#256 D3](https://github.com/iceboundrock/AutoForge/issues/256#issuecomment-6375246718)).
 macOS, Linux ARM64 and Python 3.13 and later are later, separately tracked
 work, and stay untested until CI or a recorded run proves them.
@@ -19,7 +20,16 @@ The CI jobs cited below are those of
 `ubuntu-latest` (x86_64) runner. They are required on `main` through the
 aggregate `ci` check ([Development](development.md#continuous-integration)).
 A release is supported only once its own artifacts pass the same checks
-([Releasing](releasing.md)).
+([Releasing](releasing.md)). `0.1.0a0`'s did, on Linux x86_64. Its release
+build, on CPython 3.12, checked the sdist, built the wheel from it, checked
+the wheel, and installed and ran it outside the checkout
+([run 40639977759](https://github.com/iceboundrock/AutoForge/actions/runs/40639977759));
+those two files are the ones PyPI serves. After the upload, the wheel PyPI
+serves was installed outside any checkout and passed the same
+install-and-run checks on CPython 3.11 and 3.12
+([record](https://github.com/iceboundrock/AutoForge/issues/295#issuecomment-6462493048)).
+No record installs the sdist from PyPI: its evidence is the release build's
+check of it and the wheel built from it.
 
 The platform and Python claims were checked on 2026-10-28 against
 `main` at `5297dce6328246c4ec893e61fb66fbd212aaeb53`: the

@@ -4,7 +4,7 @@
 name = "autoforge-cli"
 # Kept equal to `autoforge.__version__` by tests/test_packaging.py; the
 # release procedure (docs/releasing.md) bumps both together.
-version = "0.1.0a0"
+version = "0.1.0a1.dev0"
 description = "Autonomous orchestration for AI-driven software development (deterministic controller over Claude Code / OpenCode / gh)."
 readme = "README.md"
 # The oldest interpreter the code runs on, not a support claim: the supported

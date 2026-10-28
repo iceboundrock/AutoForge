@@ -235,8 +235,8 @@ The distribution is **`autoforge-cli`**; the command it installs is
 
 A git commit, or a wheel built from one, installs from any commit at or
 after the one that introduced `autoforge-cli` (#256; an earlier commit
-installs a package without its prompt templates); the PyPI method needs a
-published version.
+installs a package without its prompt templates); the PyPI method installs
+a published version.
 
 **From a git commit.** Install the command into its own environment with
 `uv tool`. Pin a full commit SHA, or the tag of a published version
@@ -258,22 +258,27 @@ uv build                 # dist/autoforge_cli-<version>.tar.gz and -py3-none-any
 uv tool install --python 3.12 dist/autoforge_cli-<version>-py3-none-any.whl
 ```
 
-**From PyPI, once a version is published.** Until the first upload
-([#295](https://github.com/iceboundrock/AutoForge/issues/295)),
-`autoforge-cli` is not on PyPI and the command below fails: uv reports that
-`autoforge-cli` was not found in the package registry. The
+**From PyPI.** The published versions are at
+<https://pypi.org/project/autoforge-cli/>, and the
 [releases page](https://github.com/iceboundrock/AutoForge/releases) lists
-each version that has been published, with the SHA-256 digests of its
-files; if it lists none, install from a git commit or a built wheel
-instead. Install a published version only after checking that its PyPI
-project page links back to this repository:
+them. The first, `0.1.0a0` (2026-10-28), is #295's registration
+prerelease: a pre-Alpha snapshot, not validated for unattended production
+use, and not the Public Alpha
+([#255](https://github.com/iceboundrock/AutoForge/issues/255)). Each file
+PyPI serves was built and uploaded by this repository's `pypi-publish`
+workflow and carries a PEP 740 attestation naming that workflow. Install
+only after checking that the PyPI project page links back to this
+repository:
 
 ```bash
 uv tool install --python 3.12 --prerelease allow autoforge-cli
 ```
 
 `--prerelease allow` is needed while every published version is a
-prerelease (`0.x`, [Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md#version-scheme)).
+prerelease (`0.x`, [Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md#version-scheme));
+`'autoforge-cli==0.1.0a0'` pins one. A published version carries only the
+fixes of the commit it was built from, while security fixes land on `main`
+([Security policy](https://github.com/iceboundrock/AutoForge/blob/main/SECURITY.md#supported-versions)).
 [Releasing](https://github.com/iceboundrock/AutoForge/blob/main/docs/releasing.md)
 describes how a version is built and published.
 
@@ -485,7 +490,7 @@ recorded live run is a LOCAL review on DeepSeek (#135).
 
 The Public Alpha release claims these capabilities at exactly these levels
 ([#255](https://github.com/iceboundrock/AutoForge/issues/255), conditions
-C1–C7). An earlier registration prerelease of the package (#295) is not the
+C1–C7). The registration prerelease `0.1.0a0` on PyPI (#295) is not the
 Public Alpha and claims no more than this.
 
 **Explicitly not yet:** unattended production operation; the controller

@@ -20,14 +20,15 @@ commit ([Installation](README.md#installation)), to receive a fix.
 | `main` (pre-Alpha, `0.x`) | yes, latest commit only |
 | anything older | no |
 
-AutoForge is installed from this repository: from a commit, from a wheel
-built from one, or from a development clone
+AutoForge is installed from PyPI, from a commit of this repository, from a
+wheel built from one, or from a development clone
 ([Installation](README.md#installation)). Its distribution is named
-`autoforge-cli`, which is not yet published on PyPI
-([#295](https://github.com/iceboundrock/AutoForge/issues/295)). The
-`autoforge` distribution on PyPI is an unrelated project, so
-`pip install autoforge` or `uv tool install autoforge` installs someone
-else's code.
+`autoforge-cli`; the versions on PyPI, from `0.1.0a0` (#295) on, are
+pre-Alpha prereleases. Each is a snapshot of one commit of `main`, so it
+counts as *anything older* above once `main` moves past that commit: a fix
+reaches PyPI only in a later version. The `autoforge` distribution on PyPI
+is an unrelated project, so `pip install autoforge` or
+`uv tool install autoforge` installs someone else's code.
 
 ## Reporting a vulnerability
 

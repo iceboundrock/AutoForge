@@ -412,11 +412,17 @@ def test_the_release_build_refuses_a_tag_that_is_not_its_version(
 
 
 def test_the_release_build_refuses_a_wrong_tag_before_it_builds(monkeypatch, capsys):
-    """`--release-tag` is checked first: a wrong tag builds, installs and uploads nothing."""
+    """`--release-tag` is checked first: a wrong tag builds, installs and uploads nothing.
+
+    The version is a release one whatever `main` carries, so the tag is what is
+    refused; a `.devM` version is refused on its own (the test below).
+    """
+    release = {**DATA, "project": {**PROJECT, "version": "0.1.0a1"}}
 
     def no_build(*args, **kwargs):  # pragma: no cover - reaching it is the failure
         raise AssertionError("built for a tag that does not name the version")
 
+    monkeypatch.setattr(dist_check, "pyproject", lambda root=REPO_ROOT: release)
     monkeypatch.setattr(dist_check, "copy_source", no_build)
     monkeypatch.setattr(dist_check, "build", no_build)
     assert dist_check.main(["--release-tag", "v0.0.0"]) == 1
