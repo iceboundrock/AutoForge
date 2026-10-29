@@ -237,70 +237,111 @@ The evidence behind it is `tests/parallel_bench.py`, a tool run by hand
 rather than a test. It runs the default suite once per configuration and
 repeat, interleaving the configurations so that a change in the host's
 load spreads over all of them. It reconciles every run's per-test outcomes
-(its JUnit XML) with the first serial run's, so a test that a configuration
-loses, adds, skips or fails is named rather than folded into a total. It
-reports each configuration's median and p95 (nearest rank: with fewer than
-20 repeats, the slowest run) and the host's provenance, and the same
-command on the same `--out` resumes an interrupted benchmark:
+(its JUnit XML) with those of the first serial run that passed, so a test
+that a configuration loses, adds, skips or fails is named rather than
+folded into a total. Only a clean run is timed: the median and p95 (nearest
+rank: with fewer than 20 repeats, the slowest run) of a configuration are
+its clean runs', and it has none when no run was clean. It measures a
+commit, refusing a worktree with anything changed or untracked, and records
+the host's provenance. The same command on the same `--out` resumes an
+interrupted benchmark, running again any run that left no JUnit report, and
+refuses an `--out` measured on another commit, interpreter, host or set of
+CPUs:
 
 ```bash
 uv run --isolated --locked --python 3.12 python -m tests.parallel_bench \
-    --repeats 3 --config n4-load --config n2-load --once serial --out /var/tmp/bench
+    --repeats 3 --config serial --config n4-load --config n8-load --out /var/tmp/bench \
+    -- -o tmp_path_retention_policy=none
 ```
 
-What #340 measured, on a 4-CPU, 8 GB Fedora 44 workstation that was running
-other work at the same time (Git 2.56, pytest 9.1.1, pytest-xdist 3.8.0).
+What #340 measured, on two hosts with pytest 9.1.1 and pytest-xdist 3.8.0:
+
+- **A**, a 4-CPU, 8 GB Fedora 44 workstation that was running other work at
+  the same time (Git 2.56).
+- **B**, a Proxmox container allowed 8 of the 12 hardware threads of a
+  6-core Intel i7-8700K, with 16 GB, Debian 13, Linux 7.0 and Git 2.47.3,
+  and `TMPDIR` on a tmpfs `/tmp`; other sessions shared it, mostly idle.
+
 Times are wall seconds of the whole `pytest` process; a run is clean when it
-exits 0 with every test's outcome the serial run's. 236f261 is before #340's
-fixes to the tests below, 722d88f after them:
+exits 0 with every test's outcome that of its session's first passing
+serial run, and only clean runs are timed. Every run in the table, all
+after #340's fixes to the tests below, was clean: 722d88f on A, and 0255ca2
+on B, which differs from 722d88f only in `tests/parallel_bench.py`, its
+tests and this page.
 
-| Python, commit | configuration | runs | clean | median | p95 | min | speedup |
+| host, Python, commit | configuration | runs | clean | median | p95 | min | speedup |
 |---|---|---|---|---|---|---|---|
-| 3.12.15, 722d88f | serial | 1 | 1 | 1431 | 1431 | 1431 | 1.00x |
-| 3.12.15, 722d88f | n2-load | 3 | 3 | 847 | 849 | 827 | 1.69x |
-| 3.12.15, 722d88f | n4-load | 3 | 3 | 627 | 642 | 626 | 2.28x |
-| 3.11.17, 236f261 | serial | 2 | 2 | 1443 | 1445 | 1442 | 1.00x |
-| 3.11.17, 236f261 | n2-load | 1 | 0 | 818 | 818 | 818 | 1.76x |
-| 3.11.17, 236f261 | n4-load | 1 | 0 | 628 | 628 | 628 | 2.30x |
-| 3.11.17, 236f261 | n4-worksteal | 1 | 1 | 635 | 635 | 635 | 2.27x |
-| 3.11.17, 236f261 | n2-loadfile | 1 | 1 | 854 | 854 | 854 | 1.69x |
-| 3.11.17, 236f261 | n4-loadfile | 1 | 0 | 665 | 665 | 665 | 2.17x |
+| B, 3.11.18, 0255ca2 | serial | 3 | 3 | 501 | 501 | 495 | 1.00x |
+| B, 3.11.18, 0255ca2 | n4-load | 3 | 3 | 139 | 139 | 138 | 3.60x |
+| B, 3.11.18, 0255ca2 | n8-load | 3 | 3 | 93 | 103 | 85 | 5.40x |
+| B, 3.12.15, 0255ca2 | serial | 3 | 3 | 509 | 532 | 505 | 1.00x |
+| B, 3.12.15, 0255ca2 | n4-load | 3 | 3 | 144 | 155 | 142 | 3.53x |
+| B, 3.12.15, 0255ca2 | n8-load | 3 | 3 | 95 | 98 | 84 | 5.37x |
+| A, 3.12.15, 722d88f | serial | 1 | 1 | 1431 | 1431 | 1431 | 1.00x |
+| A, 3.12.15, 722d88f | n2-load | 3 | 3 | 847 | 849 | 827 | 1.69x |
+| A, 3.12.15, 722d88f | n4-load | 3 | 3 | 627 | 642 | 626 | 2.28x |
 
-- **Four workers give about 2.3x, not 4x.** The 3.11 serial run's tests
-  add up to 1430 seconds (11,585 tests, none longer than 11 seconds), so
-  four workers could reach about 360; each test takes longer when four run
-  at once (the load average reached about 5 on the 4 CPUs).
-- **`load`, not `loadfile`.** `worksteal` was within a run's noise of
-  `load`. `loadfile` keeps a module on one worker, and `test_engine.py`
-  alone is 22% of the serial time.
-- **Isolation.** Every serial run was clean. On 236f261 the parallel runs
-  failed four tests that pass serially; before that, five real-backend
-  sandbox tests had failed under `-n 4` with a 76-character `TMPDIR`, and
-  `tests/dist_check.py`'s REMOTE dry-run check failed under CPU load. All
-  but one were a race or a limit that the workers' load or their
-  `popen-gw<N>/` directories exposed, not state shared between tests, and
-  #340 fixed them (the rules are in
+Before the fixes, on A with Python 3.11.17 at 236f261, one screening run
+per configuration found the defects: `n2-load`, `n4-load` and `n4-loadfile`
+failed four tests between them that pass serially, while both serial runs,
+`n4-worksteal` (635 seconds) and `n2-loadfile` (854) were clean.
+
+- **The speedup depends on idle CPUs.** On B four workers give 3.6x and
+  eight 5.4x, on both interpreters; on A four gave 2.3x, sharing its 4 CPUs
+  with other work (the load average reached about 5). Each test runs slower
+  the more workers share the cores: under 3.11 on B the tests add up to
+  about 490 seconds serially, 510 on four workers and 570 on eight (on 6
+  physical cores), so with each worker's start-up and the slowest test (up
+  to 14 seconds) at the end, eight workers finish in 85 to 103 seconds
+  rather than 71.
+- **`load`, not `loadfile`.** `loadfile` keeps a module on one worker, and
+  `test_engine.py` alone takes 77 of B's 490 seconds (22% of A's serial
+  time), more than an even eighth of the suite: on eight workers, the one
+  that gets it finishes last. On A before the fixes, `worksteal` was within
+  a run's noise of `load`.
+- **Isolation.** Every serial run was clean. Before the fixes, five
+  real-backend sandbox tests had failed under `-n 4` with a 76-character
+  `TMPDIR`, and `tests/dist_check.py`'s REMOTE dry-run check failed under
+  CPU load. All but one of the failures were a race or a limit that the
+  workers' load or their `popen-gw<N>/` directories exposed, not state
+  shared between tests, and #340 fixed them (the rules are in
   [tests/AGENTS.md](../tests/AGENTS.md#what-a-test-may-never-do)). One
   failure has no explanation yet: under `n4-loadfile`,
   `test_ctrl_c_at_a_real_controlling_terminal_still_interrupts_and_settings_come_back`
   (`tests/test_interaction.py`) waited 30 seconds for its child to exit
   after Ctrl-C at a pseudo-terminal. 40 runs of the same child under CPU
-  load all ended at once, and it did not recur in the 3.12 runs above or in
-  a 3.11 `-n 4` run after the fixes.
+  load all ended at once, it did not recur on A after the fixes, and on B
+  it passed in under half a second in all 18 runs.
+- **What B could not run.** 81 tests skip on B in every run, serial or not:
+  60 real-backend sandbox tests (its kernel offers no Landlock ABI 6), 16
+  that need zsh, and the 5 opt-in probes. After the fixes, the sandbox
+  tests have run on workers on A under 3.12 only; under 3.11 they run
+  serially, in CI's `sandbox` job wherever its runner can enforce.
+- **The temporary directory.** pytest keeps the `tmp_path` trees of the
+  last three sessions, and a quarter of the way through one serial run its
+  tree already held 78,000 files and directories: on B, `/tmp`'s 1,048,576
+  inodes ran out during the first serial run and thousands of tests
+  errored. Hence `-o tmp_path_retention_policy=none` above, which removes a
+  session's tree when it ends and changes nothing else. `TMPDIR` cannot
+  move just anywhere: the sandbox policy refuses paths under `/dev` and
+  `/run` (with it under `/dev/shm`, 92 tests failed serially), and on B's
+  disk a serial run was a quarter done after 30 minutes.
 
 The recommendation that follows:
 
 - **Locally**, `make test-parallel` with as many workers as the host has
   CPUs, and no more than its memory holds: a serial run's resident size
   peaked at 0.5 GB, and each worker is such a process. On a 2-CPU host,
-  `PYTEST_WORKERS=2`. Not `-n auto`: it counts CPUs and nothing else.
+  `PYTEST_WORKERS=2`; on B, eight. Not `-n auto`: it counts CPUs and nothing
+  else.
 - **In CI**, the suite stays serial. Running it on workers is a change to
   `.github/workflows/ci.yml`, a protected path that takes a human's review.
-  Make that change once the Ctrl-C failure above is explained, after this
-  benchmark has run on the runner itself (it records the runner's usable
-  CPUs), and with `-n` set to that count and `--dist=load`. A parallel job
-  replaces the serial one only while its runs reconcile clean, and goes
-  back to serial if it flakes.
+  Make that change once the Ctrl-C failure above is explained and the
+  real-backend sandbox tests have run clean on workers under 3.11 too,
+  after this benchmark has run on the runner itself (it records the
+  runner's usable CPUs), and with `-n` set to that count and
+  `--dist=load`. A parallel job replaces the serial one only while its runs
+  reconcile clean, and goes back to serial if it flakes.
 
 ## Continuous integration
 

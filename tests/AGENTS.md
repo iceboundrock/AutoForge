@@ -175,11 +175,11 @@ read it before adding tests for a listed area.
   edit the fixture by hand.
 - `tests/parallel_bench.py` is no test either: the benchmark a maintainer
   runs by hand to time the suite serially and on pytest-xdist workers, and
-  to reconcile every run, test by test, with the first serial one (#340;
-  `docs/development.md`, "The suite on several workers").
-  `tests/test_parallel_bench.py` tests its parsing, reconciliation and
-  statistics on synthetic reports, and runs a three-test suite serially
-  and on two workers.
+  to reconcile every run, test by test, with the first serial one that
+  passed (#340; `docs/development.md`, "The suite on several workers").
+  `tests/test_parallel_bench.py` tests its parsing, reconciliation,
+  statistics and resume on synthetic reports and stand-in runs, and runs a
+  three-test suite serially and on two workers.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
