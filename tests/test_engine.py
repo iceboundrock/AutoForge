@@ -11649,7 +11649,7 @@ def test_the_issue_worktree_is_reused_across_phases_as_the_agent_left_it(
 
 
 def test_a_path_that_is_not_a_worktree_of_this_repository_is_refused_not_adopted(
-    tmp_state_dir, fake_github
+    tmp_state_dir, tmp_path_factory, fake_github
 ):
     repo = git_repo(tmp_state_dir.parent)
     _commit(repo, "a.txt", "1", "base")
@@ -11662,7 +11662,7 @@ def test_a_path_that_is_not_a_worktree_of_this_repository_is_refused_not_adopted
     assert eng.provider.calls == [] and (stale / "leftover.txt").exists()
 
     # A worktree of *another* repository is refused too.
-    other = git_repo(tmp_state_dir.parent.parent / f"{tmp_state_dir.parent.name}-other")
+    other = git_repo(tmp_path_factory.mktemp("other"))
     (stale / "leftover.txt").unlink()
     stale.rmdir()
     _git(other, "worktree", "add", "-q", "--detach", str(stale), "HEAD")
@@ -11692,7 +11692,7 @@ def test_a_subdirectory_of_an_existing_tree_is_not_adopted_as_a_worktree(
 
 
 def test_a_symlink_at_the_worktree_path_is_refused_whatever_it_points_to(
-    tmp_state_dir, fake_github
+    tmp_state_dir, tmp_path_factory, fake_github
 ):
     """A link at the expected path answers `git -C` and realpath as its *target*;
     a link to the operator's checkout or to another worktree of this repository
@@ -11716,7 +11716,7 @@ def test_a_symlink_at_the_worktree_path_is_refused_whatever_it_points_to(
     expected.symlink_to(repo)
     refused()
     # To another worktree of the same repository (the operator's own).
-    other = repo.parent / f"{repo.name}-operator-tree"
+    other = tmp_path_factory.mktemp("operator-tree") / "tree"
     _git(repo, "worktree", "add", "-q", "--detach", str(other), "HEAD")
     expected.symlink_to(other)
     refused()
@@ -11785,14 +11785,14 @@ def test_a_symlinked_parent_of_the_worktree_path_is_refused_before_creation(
 
 
 def test_an_existing_worktree_is_reused_only_when_the_repository_registers_it(
-    tmp_state_dir, fake_github
+    tmp_state_dir, tmp_path_factory, fake_github
 ):
     """The directory answering git as a worktree of this repository is not
     enough: the entry itself must be in `git worktree list`."""
     repo = git_repo(tmp_state_dir.parent)
     _commit(repo, "a.txt", "1", "base")
     expected = repo / ".git" / "autoforge" / "worktrees" / "2"
-    other = repo.parent / f"{repo.name}-operator-tree"
+    other = tmp_path_factory.mktemp("operator-tree") / "tree"
     _git(repo, "worktree", "add", "-q", "--detach", str(other), "HEAD")
     # A copy of a real worktree of this repository: its `.git` file points at the
     # registry entry of the *other* tree, so git answers the copy as that tree.

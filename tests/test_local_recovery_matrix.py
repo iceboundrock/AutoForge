@@ -715,7 +715,9 @@ def test_a_journal_enlarged_by_the_agent_refuses_the_post_run_append_bounded(tmp
     eng2.close()
 
 
-def test_a_foreign_file_the_agent_renamed_over_the_journal_receives_nothing(tmp_path):
+def test_a_foreign_file_the_agent_renamed_over_the_journal_receives_nothing(
+    tmp_path, tmp_path_factory
+):
     """PR #91 review, fifth round, end to end: the agent renames a small
     single-link regular file of the operator's over ``events.jsonl`` while
     it runs. Every check an open of the *name* can make passes for that
@@ -737,8 +739,7 @@ def test_a_foreign_file_the_agent_renamed_over_the_journal_receives_nothing(tmp_
     journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
     # The operator's file lives outside the working tree, so that it is not
     # part of the workspace fingerprint the retry is judged against.
-    outside = tmp_path.parent / f"{tmp_path.name}-outside"
-    outside.mkdir()
+    outside = tmp_path_factory.mktemp("outside")
     foreign = outside / "operator-notes.txt"
     foreign.write_text("operator data\n", encoding="utf-8")
     foreign_ino = foreign.stat().st_ino

@@ -170,6 +170,14 @@ read it before adding tests for a listed area.
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.
+- A passed test's `tmp_path` is deleted when the test ends
+  (`tmp_path_retention_policy = "failed"` in `pyproject.toml`), and a later
+  test with the same first 30 characters of name then gets the same path. A
+  directory a test needs outside its `tmp_path` (outside the repository
+  `git_repo(tmp_path)` makes, for instance) comes from
+  `tmp_path_factory.mktemp(...)`, whose names are never reused in a session,
+  never from `tmp_path.parent`: a sibling named after `tmp_path.name`
+  outlives its test and is found again by the next one to get that name.
 
 ## Where a behaviour is tested
 

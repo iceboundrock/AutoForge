@@ -1956,7 +1956,9 @@ def test_second_controller_from_a_subdirectory_with_default_state_dir_is_refused
     assert load_state(tmp_path / ".autoforge" / "state.json").phase == Phase.REVIEW
 
 
-def test_second_controller_in_a_linked_worktree_is_refused(tmp_path, capsys, monkeypatch, fakes):
+def test_second_controller_in_a_linked_worktree_is_refused(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes
+):
     """R6-F1: a linked `git worktree` shares the repository lock of the main checkout."""
     import subprocess
 
@@ -1977,7 +1979,7 @@ def test_second_controller_in_a_linked_worktree_is_refused(tmp_path, capsys, mon
         ],
         check=True,
     )
-    worktree = tmp_path.parent / f"{tmp_path.name}-wt"
+    worktree = tmp_path_factory.mktemp("linked") / "wt"
     subprocess.run(["git", "-C", str(tmp_path), "worktree", "add", "-q", str(worktree)], check=True)
     assert repository_lock_path(worktree) == repository_lock_path(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -2001,11 +2003,10 @@ def test_second_controller_in_a_linked_worktree_is_refused(tmp_path, capsys, mon
 
 @pytest.mark.parametrize("command", ["run", "step", "resume"])
 def test_commands_refuse_to_run_outside_a_git_repository(
-    tmp_path, capsys, monkeypatch, fakes, command
+    tmp_path_factory, capsys, monkeypatch, fakes, command
 ):
     """No repository identity -> no lock -> exit 2 before any state is written or agent runs."""
-    outside = tmp_path.parent / f"{tmp_path.name}-not-a-repo"
-    outside.mkdir()
+    outside = tmp_path_factory.mktemp("not-a-repo")
     monkeypatch.chdir(outside)
     sd = outside / ".autoforge"
     if command != "run":
@@ -2027,12 +2028,13 @@ def test_commands_refuse_to_run_outside_a_git_repository(
         assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
 
 
-def test_dry_run_needs_no_repository_and_spawns_no_git(tmp_path, capsys, monkeypatch, fakes):
+def test_dry_run_needs_no_repository_and_spawns_no_git(
+    tmp_path_factory, capsys, monkeypatch, fakes
+):
     """Dry-run takes no lock, so it neither resolves the repository nor runs git."""
     import autoforge.engine as engine_mod
 
-    outside = tmp_path.parent / f"{tmp_path.name}-not-a-repo"
-    outside.mkdir()
+    outside = tmp_path_factory.mktemp("not-a-repo")
     monkeypatch.chdir(outside)
 
     def never(*a, **k):
@@ -2088,12 +2090,14 @@ def test_standalone_commands_refuse_a_state_dir_inside_the_scheduler_root(
         assert _files(sd) == before
 
 
-def test_the_refusal_is_decided_on_the_resolved_path(tmp_path, capsys, monkeypatch, fakes):
+def test_the_refusal_is_decided_on_the_resolved_path(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes
+):
     """A relative path, a symbolic link and config.state_dir all reach the namespace."""
     monkeypatch.chdir(tmp_path)
     scheduler = tmp_path / ".git" / "autoforge" / "scheduler"
     scheduler.mkdir(parents=True)
-    link = tmp_path.parent / f"{tmp_path.name}-link"
+    link = tmp_path_factory.mktemp("links") / "scheduler"
     link.symlink_to(scheduler, target_is_directory=True)
     run = ["run", "--epic", EPIC, "--issue", ISSUE]
     for sd in (".git/autoforge/scheduler/issues/1/state", str(link / "issues" / "1" / "state")):
