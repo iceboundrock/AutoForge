@@ -75,8 +75,10 @@ addopts = "-q -rs -m 'not live'"
 markers = [
     "live: calls a real agent and a real model; opt-in, never in `make check` or CI (docs/development.md)",
 ]
-# A passed test's tmp_path is deleted when the test ends; a failed test's is
-# kept to inspect. Keeping every one fills a tmpfs /tmp (docs/development.md).
+# A passed test's tmp_path is deleted when the test ends; one that failed or
+# errored keeps it to inspect. Keeping every one fills a tmpfs /tmp
+# (docs/development.md). tests/tmp_path_retention.py makes the per-test
+# decision, because pytest's own reads only the call phase.
 tmp_path_retention_policy = "failed"
 
 [tool.ruff]

@@ -314,14 +314,17 @@ a real model call, is the opt-in live smoke test
 selects.
 
 A test's `tmp_path` is deleted as soon as the test passes
-(`tmp_path_retention_policy = "failed"` in `pyproject.toml`); a failed
-test's stays under the session's basetemp for inspection. Kept, a full run's
-`tmp_path` directories come to about 900 MB, which on a host whose `/tmp` is
-a tmpfs (Fedora's default, half the RAM) is memory, and stays until a reboot
-or `systemd-tmpfiles` ages it out. Directories a fixture makes with
-`tmp_path_factory.mktemp` last the whole session; pytest removes the
-basetemp after a green run unless `--basetemp` named it. To keep every
-test's directory while debugging, run
+(`tmp_path_retention_policy = "failed"` in `pyproject.toml`); the directory
+of a test that failed, or errored in a fixture's setup or teardown, stays
+under the session's basetemp for inspection. pytest's own `failed` reads
+only the call phase and would delete an errored test's, so
+`tests/tmp_path_retention.py` replaces its `tmp_path` and decides after the
+teardown report. Kept, a full run's `tmp_path` directories come to about
+900 MB, which on a host whose `/tmp` is a tmpfs (Fedora's default, half the
+RAM) is memory, and stays until a reboot or `systemd-tmpfiles` ages it out.
+Directories a fixture makes with `tmp_path_factory.mktemp` last the whole
+session; pytest removes the basetemp after a green run unless `--basetemp`
+named it. To keep every test's directory while debugging, run
 `uv run pytest -o tmp_path_retention_policy=all ...`.
 
 - [testing.md](agent-guides/testing.md): the coverage contract, including
