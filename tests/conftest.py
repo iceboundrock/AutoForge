@@ -62,6 +62,7 @@ from autoforge.providers import ProviderRegistry, ScriptedProvider  # noqa: E402
 from autoforge.result_parser import BEGIN, END  # noqa: E402
 from autoforge.state import utcnow_iso  # noqa: E402
 from autoforge.validation import parse_issue_url  # noqa: E402
+from tests import tmp_path_retention  # noqa: E402
 
 EPIC = "https://github.com/owner/repo/issues/1"
 ISSUE = "https://github.com/owner/repo/issues/2"
@@ -2194,6 +2195,13 @@ def offline_tree(sha: str) -> str:
 
     digest = hashlib.sha256(f"tree of {sha}".encode()).hexdigest()
     return digest[: len(sha)]
+
+
+# Every test's tmp_path, and its removal once the test has passed (#396). pytest's
+# own keeps a test's directory only when its call phase failed, not when one of
+# its fixtures failed in setup or teardown; a fixture here overrides pytest's.
+tmp_path = tmp_path_retention.tmp_path
+pytest_runtest_makereport = tmp_path_retention.pytest_runtest_makereport
 
 
 @pytest.fixture

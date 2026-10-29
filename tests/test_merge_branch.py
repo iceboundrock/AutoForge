@@ -599,7 +599,9 @@ class _RealGhWrites(FakeGitHub):
 
 
 @pytest.mark.parametrize("delete_branch", [False, True], ids=["off", "on"])
-def test_merge_runs_no_git_in_the_operators_checkout(tmp_state_dir, monkeypatch, delete_branch):
+def test_merge_runs_no_git_in_the_operators_checkout(
+    tmp_state_dir, tmp_path_factory, monkeypatch, delete_branch
+):
     """The operator's checkout has the PR's head branch checked out, which is what
     makes gh's `--delete-branch` check out another branch, pull and delete it. The
     `gh` here runs those git commands in its working directory; none of them
@@ -607,7 +609,7 @@ def test_merge_runs_no_git_in_the_operators_checkout(tmp_state_dir, monkeypatch,
     checkout = git_repo(tmp_state_dir.parent)
     git_out("-C", str(checkout), "checkout", "-q", "-b", BRANCH)
     head = git_out("-C", str(checkout), "rev-parse", "HEAD")
-    fake, log = local_git_gh(checkout.parent / f"{checkout.name}-bin", BRANCH)
+    fake, log = local_git_gh(tmp_path_factory.mktemp("gh-bin"), BRANCH)
     gh = _RealGhWrites(fake)
     eng = _merging(tmp_state_dir, gh, delete_branch=delete_branch)
     started: list[tuple[list[str], str | None]] = []
