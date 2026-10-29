@@ -30,6 +30,16 @@ read it before adding tests for a listed area.
 - Never weaken an assertion, a safety gate, or a verification step to make an
   implementation pass. A test that documents a deliberately unfixed edge case
   says so in its docstring, as `tests/test_replan.py` does.
+- Never depend on running alone. `make test-parallel` runs the suite on
+  pytest-xdist workers (#340): processes that share the host and its load,
+  with every `tmp_path` under a `popen-gw<N>/` of its own. Each of these
+  passed serially and failed there: a wall-clock budget for what is a
+  cost (measure the process's CPU time, `time.process_time()`); a scan of
+  `/proc` for a child that had not yet said it runs; a snapshot of a
+  repository that `git commit`'s detached automatic maintenance could
+  still write to (conftest's commits pass `NO_AUTO_MAINTENANCE`); an
+  AF_UNIX path past `sun_path`'s 107 bytes (bind it with
+  `conftest.bind_unix`).
 
 ## Fixtures and fakes (`tests/conftest.py`)
 
@@ -163,6 +173,13 @@ read it before adding tests for a listed area.
   replays the committed fixture (the maintainer's capture on scratch issue
   #264) offline and tests the tool against a fake runner; never write or
   edit the fixture by hand.
+- `tests/parallel_bench.py` is no test either: the benchmark a maintainer
+  runs by hand to time the suite serially and on pytest-xdist workers, and
+  to reconcile every run, test by test, with the first serial one (#340;
+  `docs/development.md`, "The suite on several workers").
+  `tests/test_parallel_bench.py` tests its parsing, reconciliation and
+  statistics on synthetic reports, and runs a three-test suite serially
+  and on two workers.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
