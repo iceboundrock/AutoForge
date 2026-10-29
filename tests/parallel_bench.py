@@ -38,6 +38,13 @@ It measures a commit: it refuses a worktree with anything changed, staged or
 untracked (``git status``), before the first run and after every run, and an
 ``--out`` inside the worktree.
 
+Every run loads this module as a pytest plugin (``-p tests.parallel_bench``),
+which records how pytest-xdist actually ran it: on how many workers, with
+which distribution. Whatever else sets xdist's options (``PYTEST_ADDOPTS``,
+the pytest arguments after ``--``, the repository's ``addopts``) applies to
+every configuration, so a run that did not run as its configuration names
+stops the benchmark, unrecorded: a ``serial`` run on workers is no reference.
+
 Nothing is written but ``--out``: ``provenance.json``, a JUnit XML file, a
 log and a record per run, and ``results.json``; the Markdown report goes to
 stdout. The same command again, on the same ``--out``, keeps every run that
@@ -64,12 +71,18 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# The module each run loads as a plugin, and its option naming where the run's mode goes.
+PLUGIN = "tests.parallel_bench"
+MODE_OPTION = "--parallel-bench-mode"
 SERIAL = "serial"
 DISTRIBUTIONS = ("load", "loadfile", "loadscope", "loadgroup", "worksteal")
 _CONFIG = re.compile(r"n(?P<workers>[1-9][0-9]*)-(?P<dist>[a-z]+)")
@@ -94,6 +107,10 @@ class Config:
     def pytest_args(self) -> list[str]:
         return [] if not self.workers else ["-n", str(self.workers), f"--dist={self.dist}"]
 
+    def mode(self) -> dict[str, object]:
+        """How a run of this configuration is distributed, as the plugin records it."""
+        return {"workers": self.workers, "dist": self.dist or "no"}
+
 
 def parse_config(name: str) -> Config:
     """``serial`` or ``n<workers>-<dist>``; anything else is refused."""
@@ -106,6 +123,40 @@ def parse_config(name: str) -> Config:
             f"<dist> one of {', '.join(DISTRIBUTIONS)}"
         )
     return Config(name, int(match["workers"]), match["dist"])
+
+
+# The plugin. pytest-xdist calls pytest_xdist_setupnodes in the controlling
+# process, once, with a spec per worker, and only when it distributes the run.
+# That process writes the mode as the session ends; a worker never does.
+_WORKERS = pytest.StashKey[int]()
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        MODE_OPTION, metavar="PATH", help="tests/parallel_bench.py: record the run's xdist mode"
+    )
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_setupnodes(config: pytest.Config, specs: Sequence[object]) -> None:
+    config.stash[_WORKERS] = len(specs)
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    config = session.config
+    path = config.getoption(MODE_OPTION)
+    if not path or hasattr(config, "workerinput"):
+        return
+    workers = config.stash.get(_WORKERS, 0)
+    mode = {"workers": workers, "dist": config.getoption("dist", "no") if workers else "no"}
+    Path(path).write_text(json.dumps(mode) + "\n", encoding="utf-8")
+
+
+def describe_mode(mode: dict[str, object]) -> str:
+    """How a run ran, for a message: ``serially``, ``on 4 workers (--dist=load)``."""
+    if not mode.get("workers"):
+        return "serially"
+    return f"on {mode['workers']} workers (--dist={mode.get('dist')})"
 
 
 def junit_outcomes(xml_text: str) -> dict[str, str]:
@@ -195,6 +246,8 @@ class Run:
     load_after: tuple[float, float, float]
     junit: str
     log: str
+    # What the plugin recorded; ``None`` when the run left no record of it.
+    mode: dict[str, object] | None = None
     # Against the reference run, filled in once it is known.
     differences: dict[str, list] = field(default_factory=dict)
 
@@ -211,17 +264,21 @@ def run_pytest(
     *,
     cwd: Path = REPO_ROOT,
 ) -> Run:
-    """One timed ``pytest`` process of ``config``, its report and log under ``out``."""
+    """One timed ``pytest`` process of ``config``, its report, mode and log under ``out``."""
     stem = f"{config.name}-{repeat}"
-    junit, log = out / f"{stem}.xml", out / f"{stem}.log"
-    # An earlier attempt's report is not this run's, which may leave none.
+    junit, mode, log = out / f"{stem}.xml", out / f"{stem}.mode.json", out / f"{stem}.log"
+    # An earlier attempt's report and mode are not this run's, which may leave none.
     junit.unlink(missing_ok=True)
+    mode.unlink(missing_ok=True)
     argv = [
         sys.executable,
         "-m",
         "pytest",
         "-p",
         "no:cacheprovider",
+        "-p",
+        PLUGIN,
+        f"{MODE_OPTION}={mode}",
         f"--junitxml={junit}",
         *config.pytest_args(),
         *extra,
@@ -243,7 +300,17 @@ def run_pytest(
         load_after=os.getloadavg(),
         junit=str(junit),
         log=str(log),
+        mode=read_mode(mode),
     )
+
+
+def read_mode(path: Path) -> dict[str, object] | None:
+    """The mode the plugin recorded in ``path``; ``None`` when there is none that parses."""
+    try:
+        mode = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return mode if isinstance(mode, dict) else None
 
 
 def read_outcomes(junit: Path) -> dict[str, str] | None:
@@ -507,6 +574,21 @@ def main(argv: list[str] | None = None) -> int:
                 if problem:
                     parser.exit(2, f"{parser.prog}: error: {problem}; {record.stem} not recorded\n")
                 outcomes = read_outcomes(Path(run.junit))
+                # A run that left anything to read ran as its configuration names, or
+                # whatever made it run otherwise makes every later run of it do the same.
+                if run.mode is None and outcomes is not None:
+                    problem = (
+                        f"{record.stem} left a JUnit report but no record of how pytest-xdist "
+                        f"ran it: the {PLUGIN} plugin did not run, or could not write"
+                    )
+                elif run.mode is not None and run.mode != config.mode():
+                    problem = (
+                        f"{record.stem} ran {describe_mode(run.mode)}, not as {config.name}: "
+                        "something besides the configuration set pytest-xdist's options "
+                        "(PYTEST_ADDOPTS, the pytest arguments after --, the repository's addopts)"
+                    )
+                if problem:
+                    parser.exit(2, f"{parser.prog}: error: {problem}; {record.stem} not recorded\n")
                 if outcomes is None:
                     note = " (no JUnit report: not recorded, runs again on resume)"
                 else:

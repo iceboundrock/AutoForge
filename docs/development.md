@@ -239,7 +239,11 @@ repeat, interleaving the configurations so that a change in the host's
 load spreads over all of them. It reconciles every run's per-test outcomes
 (its JUnit XML) with those of the first serial run that passed, so a test
 that a configuration loses, adds, skips or fails is named rather than
-folded into a total. Only a clean run is timed: the median and p95 (nearest
+folded into a total. Each run loads the tool as a pytest plugin that
+records how pytest-xdist actually ran it, and a run that did not run as its
+configuration names stops the benchmark unrecorded: a `-n` in
+`PYTEST_ADDOPTS` or after `--` applies to every configuration, `serial`
+included. Only a clean run is timed: the median and p95 (nearest
 rank: with fewer than 20 repeats, the slowest run) of a configuration are
 its clean runs', and it has none when no run was clean. It measures a
 commit, refusing a worktree with anything changed or untracked, and records

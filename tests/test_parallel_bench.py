@@ -9,6 +9,7 @@ that both report the same tests with the same outcomes.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -45,8 +46,10 @@ REPORT = """<?xml version="1.0" encoding="utf-8"?>
 def test_a_configuration_is_serial_or_workers_and_a_distribution():
     assert parse_config("serial") == Config("serial")
     assert parse_config("serial").pytest_args() == []
+    assert parse_config("serial").mode() == {"workers": 0, "dist": "no"}
     assert parse_config("n4-worksteal") == Config("n4-worksteal", 4, "worksteal")
     assert parse_config("n2-loadfile").pytest_args() == ["-n", "2", "--dist=loadfile"]
+    assert parse_config("n2-loadfile").mode() == {"workers": 2, "dist": "loadfile"}
 
 
 @pytest.mark.parametrize("name", ["n0-load", "n2-each", "n2load", "4", "auto", "n-load", ""])
@@ -197,9 +200,28 @@ def test_the_tool_refuses_before_running_anything(tmp_path, capsys, argv, messag
     assert not (tmp_path / "out").exists()
 
 
-def test_a_serial_and_a_two_worker_run_report_the_same_tests(tmp_path: Path, monkeypatch):
+def _child_pytest(monkeypatch, tmp_path: Path) -> None:
+    """A nested pytest's environment: none of this session's, the plugin importable,
+    and a temporary root of its own.
+
+    A run loads ``tests.parallel_bench`` as a plugin, which the benchmark's
+    working directory provides and a suite under ``tmp_path`` does not. A
+    pytest that ends removes the older ``pytest-<n>`` directories of its
+    temporary root that hold no lock, and a session under
+    ``tmp_path_retention_policy=none`` (as the benchmark runs it) holds none:
+    in the shared root, five nested runs removed this session's own.
+    """
     for name in ("PYTEST_ADDOPTS", "PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT"):
         monkeypatch.delenv(name, raising=False)
+    path = [str(parallel_bench.REPO_ROOT), os.environ.get("PYTHONPATH", "")]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, path)))
+    temproot = tmp_path / "temproot"
+    temproot.mkdir()
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(temproot))
+
+
+def test_a_serial_and_a_two_worker_run_report_the_same_tests(tmp_path: Path, monkeypatch):
+    _child_pytest(monkeypatch, tmp_path)
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "test_tiny.py").write_text(
@@ -223,7 +245,32 @@ def test_a_serial_and_a_two_worker_run_report_the_same_tests(tmp_path: Path, mon
     assert not any(reconcile(reports[0], reports[1]).values())
     for run in runs:
         assert run.returncode == 0 and run.counts == {"passed": 2, "skipped": 1}
+        assert run.mode == parse_config(run.config).mode()
     assert "created: 2/2 workers" in Path(runs[1].log).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("config", "addopts", "extra", "ran"),
+    [
+        ("serial", "-n 2", [], {"workers": 2, "dist": "load"}),
+        ("n2-load", "", ["-n", "0"], {"workers": 0, "dist": "no"}),
+        # -d sets --dist=load after every --dist, whatever their order.
+        ("n2-worksteal", "-d", [], {"workers": 2, "dist": "load"}),
+    ],
+)
+def test_worker_options_from_the_environment_or_the_arguments_show_in_the_mode(
+    tmp_path: Path, monkeypatch, config, addopts, extra, ran
+):
+    _child_pytest(monkeypatch, tmp_path)
+    monkeypatch.setenv("PYTEST_ADDOPTS", addopts)
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_tiny.py").write_text("def test_one(): pass\ndef test_two(): pass\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    run = parallel_bench.run_pytest(parse_config(config), 0, out, extra, cwd=suite)
+    assert run.returncode == 0
+    assert run.mode == ran != parse_config(config).mode()
 
 
 def _fake_runs(
@@ -232,6 +279,7 @@ def _fake_runs(
     failing: tuple[str, ...] = (),
     no_report: tuple[str, ...] = (),
     changes: list[str] | None = None,
+    ran: dict[str, dict[str, object] | None] | None = None,
     **facts: object,
 ) -> list[str]:
     """Stand-ins for the host, its worktree and pytest.
@@ -240,7 +288,9 @@ def _fake_runs(
     ``commit`` with ``changes`` beside it (none by default; the list is read
     at every check), and every run passes one test, or fails it when
     ``failing`` names the run (``serial-0``), or cannot start and leaves no
-    report when ``no_report`` does. The list names each run made.
+    report or mode when ``no_report`` does. A run runs as its configuration
+    names unless ``ran`` gives the mode it records. The list names each run
+    made.
     """
     made: list[str] = []
     beside = [] if changes is None else changes
@@ -263,6 +313,7 @@ def _fake_runs(
         junit.unlink(missing_ok=True)
         if stem in no_report:
             return Run(config.name, repeat, 0.5, 4, {}, (1, 1, 1), (1, 1, 1), str(junit), "x.log")
+        mode = (ran or {}).get(stem, config.mode())
         failed = stem in failing
         junit.write_text(
             '<testsuite><testcase classname="tests.t" name="test_x">'
@@ -279,6 +330,7 @@ def _fake_runs(
             (2, 2, 2),
             str(junit),
             "",
+            mode,
         )
 
     monkeypatch.setattr(parallel_bench, "run_pytest", run_pytest)
@@ -347,8 +399,7 @@ def test_a_missing_or_malformed_report_reads_as_none(tmp_path, report_text):
 
 
 def test_a_pytest_that_cannot_start_leaves_no_report_not_an_earlier_ones(tmp_path, monkeypatch):
-    for name in ("PYTEST_ADDOPTS", "PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT"):
-        monkeypatch.delenv(name, raising=False)
+    _child_pytest(monkeypatch, tmp_path)
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "test_tiny.py").write_text("def test_one(): pass\n")
@@ -356,10 +407,13 @@ def test_a_pytest_that_cannot_start_leaves_no_report_not_an_earlier_ones(tmp_pat
     out.mkdir()
     stale = out / "serial-0.xml"
     stale.write_text('<testsuite><testcase classname="test_tiny" name="test_one"/></testsuite>')
+    stale_mode = out / "serial-0.mode.json"
+    stale_mode.write_text('{"workers": 0, "dist": "no"}')
     run = parallel_bench.run_pytest(parse_config("serial"), 0, out, ["--no-such-option"], cwd=suite)
     assert run.returncode == 4  # pytest's usage error
-    assert not stale.exists()
+    assert not stale.exists() and not stale_mode.exists()
     assert parallel_bench.read_outcomes(Path(run.junit)) is None
+    assert run.mode is None
 
 
 def test_a_run_without_a_report_is_failed_unrecorded_and_runs_again(tmp_path, monkeypatch, capsys):
@@ -378,6 +432,45 @@ def test_a_run_without_a_report_is_failed_unrecorded_and_runs_again(tmp_path, mo
     made = _fake_runs(monkeypatch)
     assert parallel_bench.main(argv) == 0
     assert made == ["n2-load-0"]
+
+
+@pytest.mark.parametrize(
+    ("stem", "ran", "message"),
+    [
+        (
+            "serial-0",
+            {"workers": 4, "dist": "load"},
+            "serial-0 ran on 4 workers (--dist=load), not as serial: something besides the "
+            "configuration set pytest-xdist's options (PYTEST_ADDOPTS,",
+        ),
+        ("n2-load-0", {"workers": 0, "dist": "no"}, "n2-load-0 ran serially, not as n2-load: "),
+        (
+            "n2-load-0",
+            {"workers": 2, "dist": "worksteal"},
+            "n2-load-0 ran on 2 workers (--dist=worksteal), not as n2-load: ",
+        ),
+        (
+            "n2-load-0",
+            None,
+            "n2-load-0 left a JUnit report but no record of how pytest-xdist ran it: "
+            "the tests.parallel_bench plugin did not run",
+        ),
+    ],
+)
+def test_a_run_that_did_not_run_as_its_configuration_stops_the_benchmark(
+    tmp_path, monkeypatch, capsys, stem, ran, message
+):
+    out = tmp_path / "out"
+    made = _fake_runs(monkeypatch, ran={stem: ran})
+    argv = ["--config", "serial", "--config", "n2-load", "--repeats", "1", "--out", str(out)]
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(argv)
+    assert exited.value.code == 2
+    err = capsys.readouterr().err
+    assert message in err and err.rstrip().endswith(f"{stem} not recorded")
+    assert made[-1] == stem
+    assert not (out / f"{stem}.json").exists()
+    assert not (out / "results.json").exists()
 
 
 @pytest.mark.parametrize("damage", ["report", "record"])

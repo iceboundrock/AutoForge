@@ -179,7 +179,8 @@ read it before adding tests for a listed area.
   passed (#340; `docs/development.md`, "The suite on several workers").
   `tests/test_parallel_bench.py` tests its parsing, reconciliation,
   statistics and resume on synthetic reports and stand-in runs, and runs a
-  three-test suite serially and on two workers.
+  three-test suite serially and on two workers, and with worker options
+  that override the configuration's.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
