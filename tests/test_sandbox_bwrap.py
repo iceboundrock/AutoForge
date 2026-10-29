@@ -50,7 +50,7 @@ from autoforge.sandbox import (
     SandboxRequest,
     compile_launch,
 )
-from tests.conftest import SYSTEM_PYTHON, real_sandbox_backend
+from tests.conftest import SYSTEM_PYTHON, bind_unix, real_sandbox_backend
 
 PY = SYSTEM_PYTHON
 RO = Access.READ_ONLY
@@ -161,7 +161,7 @@ def test_nothing_outside_the_projections_is_reachable(tmp_path: Path, backend: s
     agent = b / "agent"
     agent.mkdir()
     listener = socket.socket(socket.AF_UNIX)
-    listener.bind(str(agent / "ssh-agent.sock"))
+    bind_unix(listener, agent / "ssh-agent.sock")
     listener.listen(1)
     real_home = pwd.getpwuid(os.getuid()).pw_dir
     description = _describe(b, projections=(P(ws, RW),))
@@ -169,11 +169,14 @@ def test_nothing_outside_the_projections_is_reachable(tmp_path: Path, backend: s
         seen = _report(
             description,
             f"""
-def connect(path):
+def connect(path):  # by name from its directory, as conftest.bind_unix binds it
     s = socket.socket(socket.AF_UNIX)
+    cwd = os.getcwd()
     try:
-        s.connect(path)
+        os.chdir(os.path.dirname(path))
+        s.connect(os.path.basename(path))
     finally:
+        os.chdir(cwd)
         s.close()
 print(json.dumps({{
     "sentinels": [attempt(lambda p=p: read(p)) for p in {sentinels!r}],

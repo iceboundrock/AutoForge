@@ -1616,6 +1616,23 @@ def watched_fifo(path: Path) -> Iterator[list[str]]:
         watchdog.join()
 
 
+def bind_unix(sock, path: Path) -> None:
+    """Bind the AF_UNIX ``sock`` at ``path``, however long ``path`` is.
+
+    ``sun_path`` holds 107 bytes, and a path under ``tmp_path`` can be
+    longer: under a long ``TMPDIR``, or under pytest-xdist, whose workers
+    add ``popen-gw<N>`` to every one (#340). Bound by its name from its
+    directory, the socket is at the same place. A probe that connects to it
+    does the same (``os.chdir`` to the directory, then the name).
+    """
+    cwd = os.getcwd()
+    os.chdir(path.parent)
+    try:
+        sock.bind(path.name)
+    finally:
+        os.chdir(cwd)
+
+
 def publish_pr_head(
     eng: ControllerEngine,
     parent: str = "HEAD",
