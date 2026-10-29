@@ -231,16 +231,29 @@ def _fake_runs(
     commit: str = "c0",
     failing: tuple[str, ...] = (),
     no_report: tuple[str, ...] = (),
+    changes: list[str] | None = None,
+    **facts: object,
 ) -> list[str]:
-    """Stand-ins for the host and pytest: every run passes one test, or fails it when
-    ``failing`` names the run (``serial-0``), or cannot start and leaves no report when
-    ``no_report`` does; the list names each run made."""
+    """Stand-ins for the host, its worktree and pytest.
+
+    The host's provenance is ``commit`` and ``facts``, the worktree is
+    ``commit`` with ``changes`` beside it (none by default; the list is read
+    at every check), and every run passes one test, or fails it when
+    ``failing`` names the run (``serial-0``), or cannot start and leaves no
+    report when ``no_report`` does. The list names each run made.
+    """
     made: list[str] = []
+    beside = [] if changes is None else changes
     monkeypatch.setattr(
         parallel_bench,
         "provenance",
-        lambda: {key: commit if key == "commit" else "same" for key in parallel_bench.COMPARABLE},
+        lambda: {
+            **{key: "same" for key in parallel_bench.COMPARABLE},
+            "commit": commit,
+            **facts,
+        },
     )
+    monkeypatch.setattr(parallel_bench, "source", lambda: (commit, list(beside)))
     monkeypatch.setattr(parallel_bench, "collect", lambda extra: {"selected": 1})
 
     def run_pytest(config, repeat, out, extra):
@@ -396,3 +409,81 @@ def test_an_out_directory_of_another_commit_is_refused(tmp_path, monkeypatch, ca
     assert exited.value.code == 2
     assert "holds runs measured with another commit" in capsys.readouterr().err
     assert made == []
+
+
+def test_an_out_directory_of_another_cpu_set_of_the_same_size_is_refused(
+    tmp_path, monkeypatch, capsys
+):
+    out = tmp_path / "out"
+    argv = ["--config", "serial", "--repeats", "1", "--out", str(out)]
+    _fake_runs(monkeypatch, cpus_usable=2, cpu_affinity=[0, 1])
+    assert parallel_bench.main(argv) == 0
+    (out / "serial-0.json").unlink()
+    made = _fake_runs(monkeypatch, cpus_usable=2, cpu_affinity=[0, 6])
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(argv)
+    assert exited.value.code == 2
+    assert "holds runs measured with another cpu_affinity" in capsys.readouterr().err
+    assert made == []
+
+
+def test_a_worktree_with_changes_is_refused_before_anything_runs(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "out"
+    made = _fake_runs(monkeypatch, changes=[" M src/autoforge/engine.py", "?? tests/test_new.py"])
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(["--config", "serial", "--out", str(out)])
+    assert exited.value.code == 2
+    assert "uncommitted changes (src/autoforge/engine.py, tests/test_new.py)" in (
+        capsys.readouterr().err
+    )
+    assert made == []
+    assert not out.exists()
+
+
+def test_a_resume_refuses_other_uncommitted_changes_on_the_same_commit(
+    tmp_path, monkeypatch, capsys
+):
+    out = tmp_path / "out"
+    argv = ["--config", "serial", "--config", "n2-load", "--repeats", "1", "--out", str(out)]
+    _fake_runs(monkeypatch)
+    assert parallel_bench.main(argv) == 0
+    (out / "n2-load-0.json").unlink()
+    made = _fake_runs(monkeypatch, changes=[" M tests/conftest.py"])
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(argv)
+    assert exited.value.code == 2
+    assert "uncommitted changes (tests/conftest.py)" in capsys.readouterr().err
+    assert made == []
+
+
+def test_a_change_during_a_run_stops_the_benchmark_before_recording_it(
+    tmp_path, monkeypatch, capsys
+):
+    out = tmp_path / "out"
+    changes: list[str] = []
+    made = _fake_runs(monkeypatch, changes=changes)
+    fake = parallel_bench.run_pytest
+
+    def run_while_editing(*args):
+        changes.append(" M src/autoforge/engine.py")
+        return fake(*args)
+
+    monkeypatch.setattr(parallel_bench, "run_pytest", run_while_editing)
+    argv = ["--config", "serial", "--config", "n2-load", "--repeats", "1", "--out", str(out)]
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(argv)
+    assert exited.value.code == 2
+    assert "serial-0 not recorded" in capsys.readouterr().err
+    assert made == ["serial-0"]
+    assert not (out / "serial-0.json").exists()
+
+
+def test_an_out_directory_inside_the_worktree_is_refused(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(parallel_bench, "REPO_ROOT", tmp_path.resolve())
+    made = _fake_runs(monkeypatch)
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(["--config", "serial", "--out", str(tmp_path / "bench")])
+    assert exited.value.code == 2
+    assert "--out must lie outside" in capsys.readouterr().err
+    assert made == []
+    assert not (tmp_path / "bench").exists()

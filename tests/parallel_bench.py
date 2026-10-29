@@ -34,15 +34,20 @@ xdist's ``load``, ``loadfile``, ``loadscope``, ``loadgroup`` and ``worksteal``::
         --config serial --config n2-load --config n4-load --once n4-loadfile \\
         --out /tmp/bench
 
+It measures a commit: it refuses a worktree with anything changed, staged or
+untracked (``git status``), before the first run and after every run, and an
+``--out`` inside the worktree.
+
 Nothing is written but ``--out``: ``provenance.json``, a JUnit XML file, a
 log and a record per run, and ``results.json``; the Markdown report goes to
 stdout. The same command again, on the same ``--out``, keeps every run that
 has its record and makes only the others, so a benchmark of several hours
 survives an interruption; it refuses an ``--out`` measured on another commit,
-interpreter, pytest, xdist, CPU set or pytest arguments. A run is recorded
-only once its JUnit report reads: one that left none (pytest could not
-start, or was killed) is reported as failed, not reconciled or timed, and
-runs again on resume.
+interpreter, pytest, xdist, host (CPUs, memory, kernel, git), set of CPUs
+this process may run on, or pytest arguments. A run is recorded only once
+its JUnit report reads: one that left none (pytest could not start, or was
+killed) is reported as failed, not reconciled or timed, and runs again on
+resume.
 """
 
 from __future__ import annotations
@@ -298,15 +303,16 @@ def _mem_total() -> str:
 
 def provenance() -> dict[str, object]:
     """Where and on what the numbers were measured."""
+    affinity = sorted(os.sched_getaffinity(0))
     return {
         "measured_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "commit": _command("git", "rev-parse", "HEAD"),
-        "worktree_clean": _command("git", "status", "--porcelain") == "",
         "python": platform.python_version(),
         "pytest": _version("pytest"),
         "pytest_xdist": _version("pytest-xdist"),
         "cpus": os.cpu_count(),
-        "cpus_usable": len(os.sched_getaffinity(0)),
+        "cpus_usable": len(affinity),
+        "cpu_affinity": affinity,
         "memory": _mem_total(),
         "platform": platform.platform(),
         "git": _command("git", "--version"),
@@ -314,17 +320,50 @@ def provenance() -> dict[str, object]:
     }
 
 
-# What two sessions on one --out must share for their runs to be comparable.
+# What two sessions on one --out must share for their runs to be comparable. The
+# source is the commit alone, as a worktree with changes is refused; the CPUs are
+# the set this process may run on, not only how many: two sets of one size can
+# differ in which cores share a physical one.
 COMPARABLE = (
     "commit",
-    "worktree_clean",
     "python",
     "pytest",
     "pytest_xdist",
-    "cpus_usable",
+    "cpus",
+    "cpu_affinity",
+    "memory",
+    "platform",
+    "git",
     "pytest_addopts",
     "pytest_args",
 )
+
+
+def source() -> tuple[str, list[str]]:
+    """The commit checked out, and each path ``git status`` lists beside it.
+
+    Changed, staged and untracked paths are listed (ignored ones are not): an
+    untracked test module is collected like any other.
+    """
+    return (
+        _command("git", "rev-parse", "HEAD"),
+        _command("git", "--no-optional-locks", "status", "--porcelain").splitlines(),
+    )
+
+
+def source_problem(commit: str) -> str:
+    """Why the worktree is not ``commit`` with nothing beside it; ``""`` when it is."""
+    head, changes = source()
+    if not head or head != commit:
+        return f"HEAD is {head or 'unknown'}, not the measured commit {commit or 'unknown'}"
+    if changes:
+        listed = ", ".join(line.split(maxsplit=1)[-1] for line in changes[:5])
+        more = f" and {len(changes) - 5} more" if len(changes) > 5 else ""
+        return (
+            f"the worktree has uncommitted changes ({listed}{more}): "
+            "a benchmark measures a commit with nothing changed, staged or untracked"
+        )
+    return ""
 
 
 def collect(extra: list[str]) -> dict[str, int]:
@@ -430,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("a configuration is given more than once")
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
+    if args.out.resolve().is_relative_to(REPO_ROOT):
+        parser.error(f"--out must lie outside {REPO_ROOT}, the worktree it measures")
     facts = {**provenance(), "pytest_args": args.extra}
     recorded = args.out / "provenance.json"
     if recorded.exists():
@@ -438,7 +479,10 @@ def main(argv: list[str] | None = None) -> int:
         if changed:
             parser.error(f"{args.out} holds runs measured with another {', '.join(changed)}")
         facts = before
-    else:
+    problem = source_problem(str(facts["commit"]))
+    if problem:
+        parser.error(problem)
+    if not recorded.exists():
         args.out.mkdir(parents=True, exist_ok=True)
         facts["collected"] = collect(args.extra)
         recorded.write_text(json.dumps(facts, indent=2) + "\n", encoding="utf-8")
@@ -455,6 +499,9 @@ def main(argv: list[str] | None = None) -> int:
                 # Recorded is only a run whose report reads: any other runs again.
                 record.unlink(missing_ok=True)
                 run = run_pytest(config, repeat, args.out, args.extra)
+                problem = source_problem(str(facts["commit"]))
+                if problem:
+                    parser.exit(2, f"{parser.prog}: error: {problem}; {record.stem} not recorded\n")
                 outcomes = read_outcomes(Path(run.junit))
                 if outcomes is None:
                     note = " (no JUnit report: not recorded, runs again on resume)"
