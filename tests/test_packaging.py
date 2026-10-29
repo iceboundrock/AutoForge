@@ -503,3 +503,20 @@ def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
         return
     with pytest.raises(CheckFailed, match=refusal):
         dist_check.remote_dry_run(str(command), git, tmp_path, dist_check._child_env())
+
+
+def test_the_scratch_repository_starts_no_detached_maintenance(tmp_path: Path):
+    """``git commit`` leaves ``git maintenance run --auto --detach`` running
+    (Git 2.47 and later), which takes ``.git/objects/maintenance.lock`` after
+    the commit has returned. The REMOTE dry run compares the scratch
+    repository before and after it, and under pytest-xdist's load saw that
+    write as the dry run's (#340); so its commit runs with automatic
+    maintenance off. GIT_TRACE records every command git starts."""
+    git = dist_check.shutil.which("git")
+    assert git is not None
+    trace = tmp_path / "trace"
+    env = dict(dist_check._child_env(), GIT_TRACE=str(trace))
+    dist_check._scratch_repository(git, tmp_path / "repo", env)
+    text = trace.read_text(encoding="utf-8")
+    assert "trace: built-in: git commit" in text
+    assert "maintenance" not in text

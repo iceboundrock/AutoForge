@@ -258,15 +258,21 @@ def test_the_tree_snapshot_sees_content_mode_and_new_entries_only_outside_git_an
 def test_a_process_running_in_or_naming_the_directory_is_found(tmp_path):
     inside = tmp_path / "work" / "repo"
     inside.mkdir(parents=True)
+    sleep = "import time; print('ready', flush=True); time.sleep(60)"
     sleepers = [
-        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=inside),
+        subprocess.Popen([sys.executable, "-c", sleep], cwd=inside, stdout=subprocess.PIPE),
         subprocess.Popen(
-            [sys.executable, "-c", "import time, sys; time.sleep(60)", str(tmp_path / "work")]
+            [sys.executable, "-c", sleep, str(tmp_path / "work")], stdout=subprocess.PIPE
         ),
     ]
     # Without /proc (not Linux) only a command line is visible.
     expected = sleepers if os.path.isdir("/proc/self") else sleepers[1:]
     try:
+        # Popen returns once the child's exec has begun, which can be before
+        # its new command line is in /proc: under load the scan read an empty
+        # one (#340). Each sleeper says when it runs.
+        for proc in sleepers:
+            assert proc.stdout is not None and proc.stdout.readline() == b"ready\n"
         found = processes_under(tmp_path / "work")
         assert {p.pid for p in expected} <= set(found)
         assert os.getpid() not in found
@@ -274,6 +280,8 @@ def test_a_process_running_in_or_naming_the_directory_is_found(tmp_path):
         for proc in sleepers:
             proc.kill()
             proc.wait()
+            if proc.stdout is not None:
+                proc.stdout.close()
     assert processes_under(tmp_path / "work") == []
 
 

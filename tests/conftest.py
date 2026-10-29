@@ -42,7 +42,12 @@ from autoforge.evidence import (  # noqa: E402
     find_evidence,
 )
 from autoforge.executor import ExecutionResult  # noqa: E402
-from autoforge.git_transport import CommitRecord, GitRemote, GitTransport  # noqa: E402
+from autoforge.git_transport import (  # noqa: E402
+    NO_AUTO_MAINTENANCE,
+    CommitRecord,
+    GitRemote,
+    GitTransport,
+)
 from autoforge.github import (  # noqa: E402
     ChangedFile,
     ChangedFiles,
@@ -1380,6 +1385,13 @@ def git_repo(path) -> Path:
     needs a real repository, and a REMOTE agent launch adds a per-issue
     worktree detached at HEAD, which needs a commit to start from; ``git
     init`` plus an empty commit costs a few milliseconds.
+
+    The commit starts no automatic maintenance: since Git 2.47 ``git commit``
+    leaves ``git maintenance run --auto --detach`` running, which writes
+    ``objects/maintenance.lock`` after the commit has returned, so a test
+    that snapshots the repository raced with it and lost under load (#340).
+    The ``-c`` options are the command's own, never the repository's
+    configuration, which the controller's own maintenance tests depend on.
     """
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
@@ -1390,6 +1402,7 @@ def git_repo(path) -> Path:
                 "git",
                 "-C",
                 str(root),
+                *NO_AUTO_MAINTENANCE,
                 "-c",
                 "user.name=AutoForge tests",
                 "-c",
@@ -1537,8 +1550,21 @@ def connect_origin(eng: ControllerEngine, origin: Origin) -> None:
 
 
 def commit_in(cwd, message: str = "Implement the feature (#2)") -> str:
-    """One (empty) commit on the agent worktree's detached HEAD; the new HEAD."""
-    git_out("-C", str(cwd), *GIT_IDENT, "commit", "-q", "--allow-empty", "-m", message)
+    """One (empty) commit on the agent worktree's detached HEAD; the new HEAD.
+
+    No automatic maintenance, for the reason :func:`git_repo` gives.
+    """
+    git_out(
+        "-C",
+        str(cwd),
+        *NO_AUTO_MAINTENANCE,
+        *GIT_IDENT,
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        message,
+    )
     return git_out("-C", str(cwd), "rev-parse", "HEAD")
 
 
@@ -2311,7 +2337,10 @@ def write_feature(repo, name: str = "add-filter", body: str = FEATURE_MD) -> Pat
 
 
 def commit_all(repo, message: str = "wip") -> None:
-    """Commit everything in ``repo`` (tests need a clean baseline tree)."""
+    """Commit everything in ``repo`` (tests need a clean baseline tree).
+
+    No automatic maintenance, for the reason :func:`git_repo` gives.
+    """
     root = Path(repo)
     subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
     subprocess.run(
@@ -2319,6 +2348,7 @@ def commit_all(repo, message: str = "wip") -> None:
             "git",
             "-C",
             str(root),
+            *NO_AUTO_MAINTENANCE,
             "-c",
             "user.email=t@example.com",
             "-c",

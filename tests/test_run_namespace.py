@@ -41,7 +41,15 @@ from autoforge.runlog import ExecutionRecord
 from autoforge.safefs import SafeRoot, UnsafePathError
 from autoforge.state import AutoForgeState, load_state, save_state
 
-from .conftest import DECODER_LIMIT_RECORDS, EPIC, ISSUE, git_repo, make_engine
+from .conftest import (
+    DECODER_LIMIT_RECORDS,
+    EPIC,
+    ISSUE,
+    commit_all,
+    commit_in,
+    git_repo,
+    make_engine,
+)
 
 REPOSITORY_ID = 700_001
 ISSUE_IDS = {11: 9_011, 12: 9_012, 13: 9_013, 2: 9_002}
@@ -559,6 +567,26 @@ def test_lookup_and_listing_never_create_quarantine_or_modify(common, tmp_path):
     assert load_issue_namespace(fresh, 11).kind is NamespaceKind.ABSENT
     assert list_issue_namespaces(fresh) == rn.NamespaceListing((), (), ())
     assert _tree(fresh) == before
+
+
+def test_the_fixtures_commit_without_starting_detached_maintenance(tmp_path, monkeypatch):
+    """``git commit`` leaves ``git maintenance run --auto --detach`` running
+    (Git 2.47 and later), which takes ``objects/maintenance.lock`` after the
+    commit has returned. The test above snapshots a repository that
+    ``git_repo`` has just made, and failed under pytest-xdist's load when
+    that write landed after the snapshot (#340); so conftest's commits run
+    with automatic maintenance off. GIT_TRACE records every command git
+    starts."""
+    trace = tmp_path / "trace"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+    repo = git_repo(tmp_path / "repo")
+    commit_in(repo, "second")
+    (repo / "file.txt").write_text("x\n", encoding="utf-8")
+    commit_all(repo, "third")
+    text = trace.read_text(encoding="utf-8")
+    assert text.count("trace: built-in: git commit") == 3
+    assert "maintenance" not in text
+    assert "git gc" not in text
 
 
 def test_two_issue_states_at_once(common, tmp_path):
