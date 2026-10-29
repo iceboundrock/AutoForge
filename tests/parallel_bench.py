@@ -39,7 +39,10 @@ log and a record per run, and ``results.json``; the Markdown report goes to
 stdout. The same command again, on the same ``--out``, keeps every run that
 has its record and makes only the others, so a benchmark of several hours
 survives an interruption; it refuses an ``--out`` measured on another commit,
-interpreter, pytest, xdist, CPU set or pytest arguments.
+interpreter, pytest, xdist, CPU set or pytest arguments. A run is recorded
+only once its JUnit report reads: one that left none (pytest could not
+start, or was killed) is reported as failed, not reconciled or timed, and
+runs again on resume.
 """
 
 from __future__ import annotations
@@ -205,6 +208,8 @@ def run_pytest(
     """One timed ``pytest`` process of ``config``, its report and log under ``out``."""
     stem = f"{config.name}-{repeat}"
     junit, log = out / f"{stem}.xml", out / f"{stem}.log"
+    # An earlier attempt's report is not this run's, which may leave none.
+    junit.unlink(missing_ok=True)
     argv = [
         sys.executable,
         "-m",
@@ -235,6 +240,18 @@ def run_pytest(
     )
 
 
+def read_outcomes(junit: Path) -> dict[str, str] | None:
+    """:func:`junit_outcomes` of a run's report; ``None`` when it left none that parses.
+
+    pytest writes the report as the session ends: a run that could not start
+    (an unknown argument, a plugin that would not load) or was killed has none.
+    """
+    try:
+        return junit_outcomes(junit.read_text(encoding="utf-8"))
+    except (OSError, ValueError, ET.ParseError):
+        return None
+
+
 def load_run(path: Path) -> Run:
     """A run :func:`main` recorded in ``path``."""
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -242,6 +259,16 @@ def load_run(path: Path) -> Run:
     for key in ("load_before", "load_after"):
         data[key] = tuple(data[key])
     return Run(**data)
+
+
+def kept_run(record: Path) -> tuple[Run, dict[str, str]] | None:
+    """The run ``record`` holds and its report's outcomes; ``None`` unless both can be read."""
+    try:
+        run = load_run(record)
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    outcomes = read_outcomes(Path(run.junit))
+    return None if outcomes is None else (run, outcomes)
 
 
 def _command(*argv: str) -> str:
@@ -416,36 +443,54 @@ def main(argv: list[str] | None = None) -> int:
         facts["collected"] = collect(args.extra)
         recorded.write_text(json.dumps(facts, indent=2) + "\n", encoding="utf-8")
     runs: list[Run] = []
+    reports: list[dict[str, str] | None] = []
     for repeat in range(args.repeats):
         for config in configs + (once if repeat == 0 else []):
             record = args.out / f"{config.name}-{repeat}.json"
-            if record.exists():
-                run = load_run(record)
-                kept = " (kept)"
+            kept = kept_run(record)
+            if kept is not None:
+                run, outcomes = kept
+                note = " (kept)"
             else:
+                # Recorded is only a run whose report reads: any other runs again.
+                record.unlink(missing_ok=True)
                 run = run_pytest(config, repeat, args.out, args.extra)
-                record.write_text(json.dumps(asdict(run), indent=2) + "\n", encoding="utf-8")
-                kept = ""
+                outcomes = read_outcomes(Path(run.junit))
+                if outcomes is None:
+                    note = " (no JUnit report: not recorded, runs again on resume)"
+                else:
+                    partial = record.with_suffix(".partial")
+                    partial.write_text(json.dumps(asdict(run), indent=2) + "\n", encoding="utf-8")
+                    partial.replace(record)
+                    note = ""
             print(
-                f"{config.name} #{repeat}: {run.seconds}s exit {run.returncode}{kept}",
+                f"{config.name} #{repeat}: {run.seconds}s exit {run.returncode}{note}",
                 file=sys.stderr,
                 flush=True,
             )
             runs.append(run)
+            reports.append(outcomes)
     # A serial run that failed is no reference: a run that passed would differ from it.
-    reference_run = next((r for r in runs if r.config == SERIAL and r.returncode == 0), None)
+    reference_run, reference = next(
+        (
+            (run, outcomes)
+            for run, outcomes in zip(runs, reports, strict=True)
+            if run.config == SERIAL and run.returncode == 0 and outcomes is not None
+        ),
+        (None, None),
+    )
     slowest: list[tuple[str, float]] = []
+    for run, outcomes in zip(runs, reports, strict=True):
+        if outcomes is None:
+            run.differences = {"unreconciled": [f"no readable JUnit report: see {run.log}"]}
+        elif reference is None:
+            run.differences = {"unreconciled": ["no serial run passed to reconcile it with"]}
+        else:
+            run.differences = reconcile(reference, outcomes)
     if reference_run is None:
         facts["reference"] = "none: no serial run passed"
-        for run in runs:
-            run.differences = {"unreconciled": ["no serial run passed to reconcile it with"]}
     else:
         facts["reference"] = f"{SERIAL} #{reference_run.repeat}"
-        reference = junit_outcomes(Path(reference_run.junit).read_text(encoding="utf-8"))
-        for run in runs:
-            run.differences = reconcile(
-                reference, junit_outcomes(Path(run.junit).read_text("utf-8"))
-            )
         slowest = sorted(
             junit_file_seconds(Path(reference_run.junit).read_text(encoding="utf-8")).items(),
             key=lambda item: -item[1],

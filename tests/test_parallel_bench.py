@@ -226,9 +226,15 @@ def test_a_serial_and_a_two_worker_run_report_the_same_tests(tmp_path: Path, mon
     assert "created: 2/2 workers" in Path(runs[1].log).read_text(encoding="utf-8")
 
 
-def _fake_runs(monkeypatch, commit: str = "c0", failing: tuple[str, ...] = ()) -> list[str]:
+def _fake_runs(
+    monkeypatch,
+    commit: str = "c0",
+    failing: tuple[str, ...] = (),
+    no_report: tuple[str, ...] = (),
+) -> list[str]:
     """Stand-ins for the host and pytest: every run passes one test, or fails it when
-    ``failing`` names the run (``serial-0``); the list names each run made."""
+    ``failing`` names the run (``serial-0``), or cannot start and leaves no report when
+    ``no_report`` does; the list names each run made."""
     made: list[str] = []
     monkeypatch.setattr(
         parallel_bench,
@@ -240,8 +246,11 @@ def _fake_runs(monkeypatch, commit: str = "c0", failing: tuple[str, ...] = ()) -
     def run_pytest(config, repeat, out, extra):
         stem = f"{config.name}-{repeat}"
         made.append(stem)
-        failed = stem in failing
         junit = out / f"{stem}.xml"
+        junit.unlink(missing_ok=True)
+        if stem in no_report:
+            return Run(config.name, repeat, 0.5, 4, {}, (1, 1, 1), (1, 1, 1), str(junit), "x.log")
+        failed = stem in failing
         junit.write_text(
             '<testsuite><testcase classname="tests.t" name="test_x">'
             + ('<failure message="boom"/>' if failed else "")
@@ -314,6 +323,66 @@ def test_the_same_command_again_keeps_every_recorded_run(tmp_path, monkeypatch, 
     assert made == ["n2-load-1"]
     assert capsys.readouterr().err.count("(kept)") == 3
     assert (out / "results.json").read_text(encoding="utf-8") == first
+
+
+@pytest.mark.parametrize("report_text", [None, "", '<testsuite><testcase name="t"', "\xff\xfe"])
+def test_a_missing_or_malformed_report_reads_as_none(tmp_path, report_text):
+    junit = tmp_path / "run.xml"
+    if report_text is not None:
+        junit.write_bytes(report_text.encode("latin-1"))
+    assert parallel_bench.read_outcomes(junit) is None
+
+
+def test_a_pytest_that_cannot_start_leaves_no_report_not_an_earlier_ones(tmp_path, monkeypatch):
+    for name in ("PYTEST_ADDOPTS", "PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT"):
+        monkeypatch.delenv(name, raising=False)
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_tiny.py").write_text("def test_one(): pass\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    stale = out / "serial-0.xml"
+    stale.write_text('<testsuite><testcase classname="test_tiny" name="test_one"/></testsuite>')
+    run = parallel_bench.run_pytest(parse_config("serial"), 0, out, ["--no-such-option"], cwd=suite)
+    assert run.returncode == 4  # pytest's usage error
+    assert not stale.exists()
+    assert parallel_bench.read_outcomes(Path(run.junit)) is None
+
+
+def test_a_run_without_a_report_is_failed_unrecorded_and_runs_again(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "out"
+    argv = ["--config", "serial", "--config", "n2-load", "--repeats", "1", "--out", str(out)]
+    _fake_runs(monkeypatch, no_report=("n2-load-0",))
+    assert parallel_bench.main(argv) == 1
+    assert not (out / "n2-load-0.json").exists()
+    results = _results(out)
+    assert results["runs"][1]["differences"] == {
+        "unreconciled": ["no readable JUnit report: see x.log"]
+    }
+    assert [(row["clean"], row["median"]) for row in results["summary"]] == [(1, 10.0), (0, None)]
+    assert "n2-load #0: 0.5s exit 4 (no JUnit report" in capsys.readouterr().err
+
+    made = _fake_runs(monkeypatch)
+    assert parallel_bench.main(argv) == 0
+    assert made == ["n2-load-0"]
+
+
+@pytest.mark.parametrize("damage", ["report", "record"])
+def test_a_kept_run_whose_report_or_record_no_longer_reads_runs_again(
+    tmp_path, monkeypatch, damage
+):
+    out = tmp_path / "out"
+    argv = ["--config", "serial", "--config", "n2-load", "--repeats", "1", "--out", str(out)]
+    _fake_runs(monkeypatch)
+    assert parallel_bench.main(argv) == 0
+    if damage == "report":
+        (out / "n2-load-0.xml").unlink()
+    else:
+        (out / "n2-load-0.json").write_text('{"config": "n2-load", "rep')
+    made = _fake_runs(monkeypatch)
+    assert parallel_bench.main(argv) == 0
+    assert made == ["n2-load-0"]
+    assert parallel_bench.kept_run(out / "n2-load-0.json") is not None
 
 
 def test_an_out_directory_of_another_commit_is_refused(tmp_path, monkeypatch, capsys):
