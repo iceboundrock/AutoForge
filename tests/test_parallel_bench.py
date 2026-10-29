@@ -8,6 +8,7 @@ that both report the same tests with the same outcomes.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from tests.parallel_bench import (
     p95,
     parse_config,
     reconcile,
+    report,
     summarize,
     summary_counts,
 )
@@ -123,26 +125,58 @@ def _run(config: str, seconds: float, returncode: int = 0, **differences) -> Run
     return run
 
 
-def test_a_run_that_differs_or_fails_is_not_clean_and_still_counts_towards_the_times():
+CONFIGS = [Config("serial"), Config("n2-load", 2, "load")]
+
+
+def test_only_a_clean_run_is_timed():
     runs = [
         _run("serial", 100.0),
         _run("serial", 120.0),
-        _run("serial", 10.0, returncode=1),
+        _run("serial", 10.0, returncode=1),  # stopped early
         _run("n2-load", 50.0),
-        _run("n2-load", 60.0, changed=[["t", "passed", "failure"]]),
+        _run("n2-load", 20.0, missing=["t"]),  # finished sooner by losing tests
     ]
-    rows = summarize(runs, [Config("serial"), Config("n2-load", 2, "load")])
-    assert rows[0] == {
-        "config": "serial",
-        "runs": 3,
-        "clean": 2,
-        "median": 100.0,
-        "p95": 120.0,
-        "min": 10.0,
-        "speedup": 1.0,
+    rows = summarize(runs, CONFIGS)
+    assert rows == [
+        {
+            "config": "serial",
+            "runs": 3,
+            "clean": 2,
+            "median": 110.0,
+            "p95": 120.0,
+            "min": 100.0,
+            "speedup": 1.0,
+        },
+        {
+            "config": "n2-load",
+            "runs": 2,
+            "clean": 1,
+            "median": 50.0,
+            "p95": 50.0,
+            "min": 50.0,
+            "speedup": 2.2,
+        },
+    ]
+
+
+def test_a_configuration_without_a_clean_run_has_no_times():
+    runs = [_run("serial", 100.0), _run("n2-load", 30.0, changed=[["t", "passed", "failure"]])]
+    rows = summarize(runs, CONFIGS)
+    assert rows[1] == {
+        "config": "n2-load",
+        "runs": 1,
+        "clean": 0,
+        "median": None,
+        "p95": None,
+        "min": None,
+        "speedup": None,
     }
-    assert rows[1]["clean"] == 1
-    assert rows[1]["speedup"] == round(100.0 / 55.0, 2)
+    assert "| n2-load | 1 | 0 | — | — | — | — |" in report(rows, runs, {})
+
+
+def test_without_a_clean_serial_run_no_configuration_has_a_speedup():
+    rows = summarize([_run("serial", 10.0, returncode=1), _run("n2-load", 50.0)], CONFIGS)
+    assert [(row["median"], row["speedup"]) for row in rows] == [(None, None), (50.0, None)]
 
 
 @pytest.mark.parametrize(
@@ -192,8 +226,9 @@ def test_a_serial_and_a_two_worker_run_report_the_same_tests(tmp_path: Path, mon
     assert "created: 2/2 workers" in Path(runs[1].log).read_text(encoding="utf-8")
 
 
-def _fake_runs(monkeypatch, commit: str = "c0") -> list[str]:
-    """Stand-ins for the host and pytest: every run passes one test; the list names each run."""
+def _fake_runs(monkeypatch, commit: str = "c0", failing: tuple[str, ...] = ()) -> list[str]:
+    """Stand-ins for the host and pytest: every run passes one test, or fails it when
+    ``failing`` names the run (``serial-0``); the list names each run made."""
     made: list[str] = []
     monkeypatch.setattr(
         parallel_bench,
@@ -203,15 +238,21 @@ def _fake_runs(monkeypatch, commit: str = "c0") -> list[str]:
     monkeypatch.setattr(parallel_bench, "collect", lambda extra: {"selected": 1})
 
     def run_pytest(config, repeat, out, extra):
-        made.append(f"{config.name}-{repeat}")
-        junit = out / f"{config.name}-{repeat}.xml"
-        junit.write_text('<testsuite><testcase classname="tests.t" name="test_x"/></testsuite>')
+        stem = f"{config.name}-{repeat}"
+        made.append(stem)
+        failed = stem in failing
+        junit = out / f"{stem}.xml"
+        junit.write_text(
+            '<testsuite><testcase classname="tests.t" name="test_x">'
+            + ('<failure message="boom"/>' if failed else "")
+            + "</testcase></testsuite>"
+        )
         return Run(
             config.name,
             repeat,
             10.0 + repeat,
-            0,
-            {"passed": 1},
+            int(failed),
+            {"failed" if failed else "passed": 1},
             (1, 1, 1),
             (2, 2, 2),
             str(junit),
@@ -220,6 +261,42 @@ def _fake_runs(monkeypatch, commit: str = "c0") -> list[str]:
 
     monkeypatch.setattr(parallel_bench, "run_pytest", run_pytest)
     return made
+
+
+def _results(out: Path) -> dict:
+    return json.loads((out / "results.json").read_text(encoding="utf-8"))
+
+
+def test_a_failed_first_serial_run_is_no_reference_and_is_not_timed(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    _fake_runs(monkeypatch, failing=("serial-0",))
+    argv = ["--config", "serial", "--config", "n2-load", "--repeats", "2", "--out", str(out)]
+    assert parallel_bench.main(argv) == 1
+    results = _results(out)
+    assert results["provenance"]["reference"] == "serial #1"
+    assert results["runs"][0]["differences"]["changed"] == [
+        ["tests.t::test_x", "passed", "failure"]
+    ]
+    assert [(row["clean"], row["median"], row["speedup"]) for row in results["summary"]] == [
+        (1, 11.0, 1.0),
+        (2, 10.5, round(11.0 / 10.5, 2)),
+    ]
+
+
+def test_without_a_passing_serial_run_nothing_is_reconciled_or_timed(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "out"
+    _fake_runs(monkeypatch, failing=("serial-0",))
+    argv = ["--config", "serial", "--config", "n2-load", "--repeats", "1", "--out", str(out)]
+    assert parallel_bench.main(argv) == 1
+    results = _results(out)
+    assert results["provenance"]["reference"] == "none: no serial run passed"
+    assert [run["differences"] for run in results["runs"]] == [
+        {"unreconciled": ["no serial run passed to reconcile it with"]}
+    ] * 2
+    assert [(row["clean"], row["median"], row["speedup"]) for row in results["summary"]] == [
+        (0, None, None)
+    ] * 2
+    assert "  - unreconciled: no serial run passed" in capsys.readouterr().out
 
 
 def test_the_same_command_again_keeps_every_recorded_run(tmp_path, monkeypatch, capsys):

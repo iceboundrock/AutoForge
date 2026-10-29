@@ -9,13 +9,16 @@ configuration and repeat, and for each run records
 - the outcome of every test, read from the run's JUnit XML;
 - the counts of pytest's summary line (passed, skipped, deselected, ...).
 
-It then reconciles every run against the first serial one: the same test ids
-with the same outcomes, so a test that a configuration loses, adds, skips or
-fails shows up by name rather than as a changed total. A run that differs is
-reported, never averaged away. The report gives each configuration's median
-and p95 (nearest rank: with fewer than 20 repeats that is the slowest run)
-and the host the numbers came from: commit, interpreter, pytest and xdist
-versions, CPUs, memory, kernel, git and the load average around every run.
+It then reconciles every run against the first serial one that passed: the
+same test ids with the same outcomes, so a test that a configuration loses,
+adds, skips or fails shows up by name rather than as a changed total. A run
+that differs, or fails, is reported and never timed: the report gives each
+configuration's median and p95 (nearest rank: with fewer than 20 repeats
+that is the slowest run) over its clean runs only, and none for a
+configuration without one; without a passing serial run nothing is
+reconciled and nothing is timed. It also gives the host the numbers came
+from: commit, interpreter, pytest and xdist versions, CPUs, memory, kernel,
+git and the load average around every run.
 
 Runs are interleaved (every configuration once, then every configuration
 again), so a change in the host's load over the session spreads across all
@@ -310,46 +313,60 @@ def collect(extra: list[str]) -> dict[str, int]:
 
 
 def summarize(runs: list[Run], configs: list[Config]) -> list[dict[str, object]]:
-    """One row per configuration: its runs, how many were clean, median, p95, speedup.
+    """One row per configuration: its runs, how many were clean, and the clean ones' times.
 
-    Every run counts towards the times, a run that was not clean too: the
-    ``clean`` column says how many were, and the report names what differed.
+    Only a clean run is timed. One that failed, or lost or changed a test,
+    ran another suite than the reference, often a shorter one, and would make
+    its configuration look faster; the ``clean`` column says how many runs
+    were timed and the report names what the others did. A configuration
+    with no clean run has no median, p95, min or speedup (``None``), and
+    without a clean serial run no configuration has a speedup.
     """
-    serial_median = statistics.median(r.seconds for r in runs if r.config == SERIAL)
+    serial = [r.seconds for r in runs if r.config == SERIAL and r.clean]
+    serial_median = statistics.median(serial) if serial else None
     rows = []
     for config in configs:
         mine = [r for r in runs if r.config == config.name]
-        seconds = [r.seconds for r in mine]
-        median = statistics.median(seconds)
+        seconds = [r.seconds for r in mine if r.clean]
+        median = statistics.median(seconds) if seconds else None
         rows.append(
             {
                 "config": config.name,
                 "runs": len(mine),
-                "clean": sum(r.clean for r in mine),
-                "median": round(median, 1),
-                "p95": round(p95(seconds), 1),
-                "min": round(min(seconds), 1),
-                "speedup": round(serial_median / median, 2),
+                "clean": len(seconds),
+                "median": round(median, 1) if median is not None else None,
+                "p95": round(p95(seconds), 1) if seconds else None,
+                "min": round(min(seconds), 1) if seconds else None,
+                "speedup": (
+                    round(serial_median / median, 2)
+                    if serial_median is not None and median is not None
+                    else None
+                ),
             }
         )
     return rows
 
 
+def _cell(value: object, suffix: str = "") -> str:
+    """A table cell: ``—`` for a time that was withheld."""
+    return "—" if value is None else f"{value}{suffix}"
+
+
 def report(rows: list[dict[str, object]], runs: list[Run], facts: dict[str, object]) -> str:
-    """The Markdown report: provenance, the table, then every run that was not clean."""
+    """The Markdown report: provenance, the table, then every run and what it did not match."""
     lines = ["## Provenance", ""]
     lines += [f"- {key}: `{value}`" for key, value in facts.items()]
     lines += [
         "",
-        "## Results (wall seconds)",
+        "## Results (wall seconds of the clean runs)",
         "",
         "| config | runs | clean | median | p95 | min | speedup |",
         "|---|---|---|---|---|---|---|",
     ]
     for row in rows:
         lines.append(
-            f"| {row['config']} | {row['runs']} | {row['clean']} | {row['median']} "
-            f"| {row['p95']} | {row['min']} | {row['speedup']}x |"
+            f"| {row['config']} | {row['runs']} | {row['clean']} | {_cell(row['median'])} "
+            f"| {_cell(row['p95'])} | {_cell(row['min'])} | {_cell(row['speedup'], 'x')} |"
         )
     lines += ["", "## Runs", ""]
     for run in runs:
@@ -415,14 +432,24 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
             runs.append(run)
-    reference_run = next(r for r in runs if r.config == SERIAL)
-    reference = junit_outcomes(Path(reference_run.junit).read_text(encoding="utf-8"))
-    for run in runs:
-        run.differences = reconcile(reference, junit_outcomes(Path(run.junit).read_text("utf-8")))
-    slowest = sorted(
-        junit_file_seconds(Path(reference_run.junit).read_text(encoding="utf-8")).items(),
-        key=lambda item: -item[1],
-    )[:15]
+    # A serial run that failed is no reference: a run that passed would differ from it.
+    reference_run = next((r for r in runs if r.config == SERIAL and r.returncode == 0), None)
+    slowest: list[tuple[str, float]] = []
+    if reference_run is None:
+        facts["reference"] = "none: no serial run passed"
+        for run in runs:
+            run.differences = {"unreconciled": ["no serial run passed to reconcile it with"]}
+    else:
+        facts["reference"] = f"{SERIAL} #{reference_run.repeat}"
+        reference = junit_outcomes(Path(reference_run.junit).read_text(encoding="utf-8"))
+        for run in runs:
+            run.differences = reconcile(
+                reference, junit_outcomes(Path(run.junit).read_text("utf-8"))
+            )
+        slowest = sorted(
+            junit_file_seconds(Path(reference_run.junit).read_text(encoding="utf-8")).items(),
+            key=lambda item: -item[1],
+        )[:15]
     facts["slowest_modules_serial"] = [f"{name} {secs:.0f}s" for name, secs in slowest]
     rows = summarize(runs, configs + once)
     (args.out / "results.json").write_text(
