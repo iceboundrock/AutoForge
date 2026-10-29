@@ -411,19 +411,26 @@ def test_an_out_directory_of_another_commit_is_refused(tmp_path, monkeypatch, ca
     assert made == []
 
 
-def test_an_out_directory_of_another_cpu_set_of_the_same_size_is_refused(
-    tmp_path, monkeypatch, capsys
+@pytest.mark.parametrize(
+    ("key", "first", "then"),
+    [
+        ("cpu_affinity", [0, 1], [0, 6]),  # one size, other cores
+        ("tmpdir", "/tmp", "/var/tmp/bench-tmp"),
+    ],
+)
+def test_an_out_directory_of_another_cpu_set_or_tmpdir_is_refused(
+    tmp_path, monkeypatch, capsys, key, first, then
 ):
     out = tmp_path / "out"
     argv = ["--config", "serial", "--repeats", "1", "--out", str(out)]
-    _fake_runs(monkeypatch, cpus_usable=2, cpu_affinity=[0, 1])
+    _fake_runs(monkeypatch, cpus_usable=2, **{key: first})
     assert parallel_bench.main(argv) == 0
     (out / "serial-0.json").unlink()
-    made = _fake_runs(monkeypatch, cpus_usable=2, cpu_affinity=[0, 6])
+    made = _fake_runs(monkeypatch, cpus_usable=2, **{key: then})
     with pytest.raises(SystemExit) as exited:
         parallel_bench.main(argv)
     assert exited.value.code == 2
-    assert "holds runs measured with another cpu_affinity" in capsys.readouterr().err
+    assert f"holds runs measured with another {key}" in capsys.readouterr().err
     assert made == []
 
 

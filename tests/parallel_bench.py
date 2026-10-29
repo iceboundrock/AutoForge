@@ -44,10 +44,10 @@ stdout. The same command again, on the same ``--out``, keeps every run that
 has its record and makes only the others, so a benchmark of several hours
 survives an interruption; it refuses an ``--out`` measured on another commit,
 interpreter, pytest, xdist, host (CPUs, memory, kernel, git), set of CPUs
-this process may run on, or pytest arguments. A run is recorded only once
-its JUnit report reads: one that left none (pytest could not start, or was
-killed) is reported as failed, not reconciled or timed, and runs again on
-resume.
+this process may run on, temporary directory, or pytest arguments. A run is
+recorded only once its JUnit report reads: one that left none (pytest could
+not start, or was killed) is reported as failed, not reconciled or timed,
+and runs again on resume.
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
@@ -317,13 +318,15 @@ def provenance() -> dict[str, object]:
         "platform": platform.platform(),
         "git": _command("git", "--version"),
         "pytest_addopts": os.environ.get("PYTEST_ADDOPTS", ""),
+        "tmpdir": tempfile.gettempdir(),
     }
 
 
 # What two sessions on one --out must share for their runs to be comparable. The
 # source is the commit alone, as a worktree with changes is refused; the CPUs are
 # the set this process may run on, not only how many: two sets of one size can
-# differ in which cores share a physical one.
+# differ in which cores share a physical one. The temporary directory holds every
+# test's tmp_path: its file system and the length of its path change what runs.
 COMPARABLE = (
     "commit",
     "python",
@@ -335,6 +338,7 @@ COMPARABLE = (
     "platform",
     "git",
     "pytest_addopts",
+    "tmpdir",
     "pytest_args",
 )
 
