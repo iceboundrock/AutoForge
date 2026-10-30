@@ -1033,6 +1033,113 @@ def test_a_limit_that_falls_due_within_the_grace_after_a_failure_still_wins(tmp_
     assert res.provider_summary["failure"] == _FAILED_TURNS["error_result"]
 
 
+# How a stream fails when its stdout ends and the CLI has not exited, the
+# reason each is, and what the stop adds to it (#394, R1-F1): a failure
+# recorded before EOF, or one EOF itself records, a turn without its result.
+_FAILED_AT_EOF = {
+    **{kind: (kind, reason, "") for kind, reason in _FAILED_TURNS.items()},
+    "no_result": ("", "claude: exited without a result event", " closed its stdout but"),
+    "turn_without_result": (
+        "turn",
+        "claude: exited inside a turn that has no result event",
+        " closed its stdout but",
+    ),
+}
+
+
+def _fails_by_eof(kind: str) -> list:
+    """A stream that has failed the run, or fails it at EOF, by ``kind``."""
+    from tests import claude_fake
+
+    turn, _, _ = _FAILED_AT_EOF[kind]
+    if turn == "":
+        return [claude_fake.init()]
+    if turn == "turn":
+        return [claude_fake.init(), claude_fake.result("first"), claude_fake.init()]
+    return [claude_fake.init(), *_failed_turn(turn)]
+
+
+@pytest.mark.parametrize("kind", sorted(_FAILED_AT_EOF))
+def test_a_claude_that_closes_its_stdout_and_runs_on_after_its_run_failed_is_stopped(
+    tmp_path, monkeypatch, kind
+):
+    """#394, R1-F1: EOF on stdout is not the CLI's exit. A CLI that closes
+    its stdout after its stream failed the run, or whose stream EOF fails
+    for want of a result, and works on (here with a helper in its group)
+    gets the same grace from the failure as one still writing, then is
+    stopped with its whole group and reported as the stream's failure and
+    the stop. Before the fix the driver returned at EOF and ``finish()``
+    waited for the CLI until its ceiling, a timeout that hid the failure."""
+    import time
+
+    from autoforge import executor, providers
+    from tests import claude_fake
+    from tests.test_executor import _gone, _kill_quietly
+
+    monkeypatch.setattr(providers, "CLAUDE_FAILED_EXIT_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    home, res = _claude_run(
+        tmp_path,
+        [*_fails_by_eof(kind), {"close_stdout": True}, {"spawn_holder": 60}, {"sleep": 60}],
+        timeout=30,
+        idle=20,
+    )
+    elapsed = time.monotonic() - started
+    (pid,) = claude_fake.holders(home)
+    try:
+        assert elapsed < 10, elapsed  # the grace and the kill, never a limit
+        assert res.stopped_on_failure and res.exit_code == -1
+        assert not res.timed_out and res.timeout_limit == ""
+        _, reason, closed = _FAILED_AT_EOF[kind]
+        failure = f"{reason}; claude{closed} was still running 0.5s later and was stopped"
+        assert res.provider_failure == failure
+        assert res.provider_summary["failure"] == failure
+        assert res.stdout == "" and not res.ok
+        assert _gone(pid, within=5), "the helper outlived the stopped invocation"
+    finally:
+        _kill_quietly(pid)
+
+
+@pytest.mark.parametrize("kind", ["error_result", "no_result"])
+def test_a_claude_that_closes_its_stdout_and_exits_within_the_grace_keeps_its_status(
+    tmp_path, monkeypatch, kind
+):
+    """R1-F1: past EOF too, the grace keeps the CLI's own exit and status for
+    a CLI that ends by itself soon after its stdout and its failure."""
+    from autoforge import providers
+
+    monkeypatch.setattr(providers, "CLAUDE_FAILED_EXIT_GRACE_SECONDS", 5.0)
+    lines = [*_fails_by_eof(kind), {"close_stdout": True}, {"sleep": 0.5}]
+    _, res = _claude_run(tmp_path, lines, exit_code=3)
+    assert res.exit_code == 3 and not res.stopped_on_failure and not res.timed_out
+    _, reason, closed = _FAILED_AT_EOF[kind]
+    assert res.provider_failure == (f"{reason} (exit 3)" if closed else reason)
+
+
+@pytest.mark.parametrize(("limit", "timeout", "idle"), [("max_runtime", 1, None), ("idle", 30, 1)])
+@pytest.mark.parametrize("kind", ["error_result", "no_result"])
+def test_a_limit_that_falls_due_within_the_grace_after_eof_still_wins(
+    tmp_path, monkeypatch, kind, limit, timeout, idle
+):
+    """R1-F1 keeps ADR 0003 §2.6's rule past EOF: a CLI still running when a
+    limit falls due inside the grace is a timeout, the failure kept in the
+    summary."""
+    import time
+
+    from autoforge import executor
+
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    started = time.monotonic()
+    lines = [*_fails_by_eof(kind), {"close_stdout": True}, {"sleep": 60}]
+    _, res = _claude_run(tmp_path, lines, timeout=timeout, idle=idle)
+    assert time.monotonic() - started < 8  # the limit, well within the 10 s grace
+    assert res.timed_out and res.timeout_limit == limit and res.exit_code == -1
+    assert res.provider_failure is None and not res.stopped_on_failure
+    _, reason, closed = _FAILED_AT_EOF[kind]
+    assert res.provider_summary["failure"] == (f"{reason} (exit -1)" if closed else reason)
+
+
 def test_a_fake_claude_that_overruns_its_timeout_is_killed_and_timed_out(tmp_path):
     import time
 

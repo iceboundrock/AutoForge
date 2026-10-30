@@ -18,8 +18,9 @@ so.
   failed is now stopped with everything it started, and the step's error
   and end line name the failure (`...; claude was still running 10s later
   and was stopped`). `execution.json` says `ended_by: provider_failure`
-  with exit code -1. A CLI that exits by itself within the 10 s keeps its
-  own status, as before. The state is unchanged and `resume` relaunches
+  with exit code -1. So is a CLI that closes its stdout and runs on, after
+  the failure or without the turn's result. A CLI that exits by itself
+  within the 10 s keeps its own status, as before. The state is unchanged and `resume` relaunches
   the phase, as for any failed launch. Nothing changes a default.
 
 ### A `prompt_version` other than the controller's own is refused (#302)

@@ -367,8 +367,10 @@ turn, and its records keep §4c's idle limit away, so a run whose outcome the
 stream has already decided would otherwise run on to its ceiling. The Claude
 adapter stops a CLI still running `CLAUDE_FAILED_EXIT_GRACE_SECONDS` (10 s)
 after its stream failed, through the same `DuplexChild.stop()`, and reports
-the stream's failure, not a timeout. The executor is unchanged and still
-knows nothing of why.
+the stream's failure, not a timeout. EOF on stdout does not end that grace:
+a CLI that closed its stdout and runs on is waited for and stopped the
+same way, where `finish()` would wait for it until a limit. The executor is
+unchanged and still knows nothing of why.
 
 Tests for §4d: `tests/test_executor.py` stops a child that keeps writing
 from its `on_chunk` hook (the result is `stopped`, not `timed_out`) and

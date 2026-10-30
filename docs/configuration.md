@@ -484,7 +484,8 @@ claude -p --output-format stream-json --verbose --model <model> --effort <effort
   provider failure. A failed turn does not end the CLI, and no later turn
   can undo the failure, so a CLI still running 10 s after it (a background
   task kept it alive for another turn) is stopped with everything it
-  started, and the step's error names the failure and the stop
+  started, its stdout closed or not, and the step's error names the
+  failure and the stop
   (`execution.json`: `ended_by: provider_failure`), not a timeout. A record
   larger than the per-line bound is counted and skipped unless it is the
   `result` record, which must arrive whole.

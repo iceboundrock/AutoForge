@@ -1422,9 +1422,12 @@ Progress is observability, never part of an outcome. Keep covered:
   grace after the failure, reported as that failure and the stop
   (`stopped_on_failure`), never a timeout, with no progress event after
   the failure; a CLI that exits within the grace keeps its own status; a
-  limit that falls due within the grace still wins; and through the engine
-  the error and the end line name the failure, the phase is unchanged and
-  `execution.json` says `ended_by: provider_failure`
+  limit that falls due within the grace still wins; the same three past
+  EOF, for a CLI that closes its stdout after the failure and for one whose
+  stream EOF fails for want of a result (`close_stdout` in
+  `tests/claude_fake.py`), the stop reaching a helper in its group; and
+  through the engine the error and the end line name the failure, the
+  phase is unchanged and `execution.json` says `ended_by: provider_failure`
 - cleaning (`tests/test_progress.py`): escapes and controls stripped
   before redaction and redaction before the clip, so a token split by an
   escape or cut by the bound is never shown

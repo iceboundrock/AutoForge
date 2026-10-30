@@ -1432,13 +1432,16 @@ class ClaudeCodeProvider(AgentProvider):
                 res = child.finish()
         timed_out = cut in (_Cut.DEADLINE, _Cut.LOOP) or res.timed_out
         failure = stream.failure
-        if stream.exited_early:
-            failure = f"{failure} (exit {res.exit_code})"
-        elif cut is _Cut.FAILED:
+        if cut is _Cut.FAILED:
+            # A stream that failed at EOF said "exited": the CLI had only
+            # closed its stdout (R1-F1).
+            closed = " closed its stdout but" if stream.exited_early else ""
             failure = (
-                f"{failure}; claude was still running "
+                f"{failure}; claude{closed} was still running "
                 f"{CLAUDE_FAILED_EXIT_GRACE_SECONDS:g}s later and was stopped"
             )
+        elif stream.exited_early:
+            failure = f"{failure} (exit {res.exit_code})"
         elif res.records_overflowed and failure is None:
             failure = "claude: stream-json lines arrived faster than they were read"
         summary = stream.summary()
@@ -1511,9 +1514,15 @@ def _read_claude_stream(
     failure (#394): a later turn cannot redeem it and the reducer reads
     nothing more, so the CLI would otherwise go on working, unseen and for
     nothing, until its ceiling, its output keeping the idle limit away. A
-    limit that falls due within the grace still wins.
+    limit that falls due within the grace still wins. EOF ends neither the
+    grace nor the wait (R1-F1): a CLI that closed its stdout after the
+    failure, or whose stream EOF fails for want of a result, is waited for
+    and stopped the same way, where ``finish()`` would wait for it until a
+    limit. Only EOF on a stream that has not failed, or from a CLI that has
+    exited, ends the wait.
     """
     failed_at: float | None = None
+    ended = False
     while True:
         item = child.read_line(timeout=CLAUDE_EXIT_POLL_SECONDS)
         if isinstance(item, Record):
@@ -1526,8 +1535,11 @@ def _read_claude_stream(
             stream.framing_error("stdout lines arrived faster than they were read")
             return None
         elif isinstance(item, Eof):
-            stream.stream_ended()
-            return None
+            if not ended:
+                ended = True
+                stream.stream_ended()
+            if stream.failure is None or child.exited():
+                return None
         elif item.deadline_exceeded:
             return _Cut.DEADLINE
         if loop is not None and loop.verdict is not None and child.stop():
@@ -1538,8 +1550,16 @@ def _read_claude_stream(
             now = time.monotonic()
             if failed_at is None:
                 failed_at = now
-            if now - failed_at >= CLAUDE_FAILED_EXIT_GRACE_SECONDS and child.stop():
+            stop_at = failed_at + CLAUDE_FAILED_EXIT_GRACE_SECONDS
+            if now >= stop_at and child.stop():
                 return _Cut.FAILED
+            if ended:
+                # Past EOF every read returns at once: wait for the CLI here,
+                # never past the grace or the deadline, which the next read
+                # enforces as it does before EOF.
+                time.sleep(
+                    max(0.0, min(CLAUDE_EXIT_POLL_SECONDS, stop_at - now, child.deadline() - now))
+                )
 
 
 def opencode_isolation_env(config_dir: str) -> dict[str, str]:
