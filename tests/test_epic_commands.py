@@ -39,7 +39,15 @@ from autoforge.scheduler_stop import SCHEDULER_CHANGED, stop_request_path
 from autoforge.state import AutoForgeState, load_state, save_state, utcnow_iso
 from autoforge.transitions import Phase
 
-from .conftest import GIT_IDENT, commit_all, git_out, write_feature
+from .conftest import (
+    GIT_IDENT,
+    UNLOADABLE_STATES,
+    commit_all,
+    git_out,
+    state_tree,
+    unloadable_state,
+    write_feature,
+)
 from .test_scheduler import (
     BOOTSTRAP,
     EPIC,
@@ -1199,6 +1207,87 @@ def test_a_done_standalone_state_holds_nothing_and_a_scheduler_issue_refuses_run
     code, _, err = e.cli("--state-dir", str(other), "run", "--epic", EPIC, "--issue", url(2))
     assert code == 2 and "epic" in err and "scheduler" in err
     assert not (other / "state.json").exists()
+
+
+@pytest.mark.parametrize("kind", UNLOADABLE_STATES)
+def test_an_unloadable_standalone_state_holds_nothing_is_reported_and_is_left_alone(
+    epic, tmp_path, kind
+):
+    """ADR 0009 D4 (#385): a state at ``config.state_dir`` that does not load
+    holds no issue, so the pass admits as it would with none and says why;
+    ``epic status`` reports it as a problem. Neither moves, rewrites or
+    creates anything there. The file would hold #2 if it loaded."""
+    standalone = tmp_path / "standalone"
+    e = epic({"state_dir": str(standalone)})
+    b = e.b
+    b.issue(2)
+    standalone_state(standalone, 2, Phase.REVIEW)
+    state_file = standalone / "state.json"
+    raw, reason = unloadable_state(kind, state_file.read_bytes())
+    state_file.write_bytes(raw)
+    (standalone / "logs" / "standalone").mkdir(parents=True)
+    (standalone / "logs" / "standalone" / "run.log").write_text("a run log\n", encoding="utf-8")
+    before = state_tree(standalone)
+    code, _, _ = e.run()
+    assert code == 0 and b.admitted() == [2], e.said
+    assert f"the standalone state {state_file} cannot be read: " in e.said and reason in e.said
+    assert "is held" not in e.said
+    assert b.state(2).phase is Phase.READY_FOR_MERGE
+    assert state_tree(standalone) == before
+    code, doc = e.status()
+    assert code == 1
+    (problem,) = doc["problems"]
+    assert problem.startswith(f"the standalone state {state_file} cannot be read: ")
+    assert reason in problem
+    assert doc["children"][0]["category"] == "ready-for-merge"
+    assert state_tree(standalone) == before
+
+
+@pytest.mark.parametrize("mode", ["SATELLITE", None])
+def test_a_namespace_state_whose_mode_is_not_remote_is_held_as_uncertain(epic, mode):
+    """ADR 0009 D4 (#385): the scheduler only creates REMOTE states; a
+    namespace state of any other mode cannot be read, so the issue is held
+    for the operator and never admitted, with no claim opened and its state
+    and binding left as they were."""
+    e = epic()
+    b = e.b
+    b.issue(2)
+    _bind(b, 2, issue_id=b.graph.issue(2, R).id)
+    standalone_state(b.ns(2).state_dir, 2, Phase.REVIEW)  # a REMOTE state of #2
+    data = json.loads(b.ns(2).state_file.read_text(encoding="utf-8"))
+    data["mode"] = mode
+    b.ns(2).state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes())
+    code, _, _ = e.run()
+    assert code == 0 and b.admitted() == [] and b.claims(2) is None, e.said
+    assert f"issue #2 is uncertain: state file has unknown mode {mode!r}" in e.said
+    row = e.rows()[2]
+    assert row["category"] == "uncertain"
+    assert row["classification"] == "uncertain(state-corrupt)"
+    assert f"unknown mode {mode!r}" in row["detail"]
+    assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
+
+
+def test_namespace_work_leaves_the_git_dirs_autoforge_state_alone(epic):
+    """ADR 0009 D3 and D4 (#385): ``<git dir>/autoforge/state``, where LOCAL
+    kept its runs, is no state any ``epic`` command reads. A state there that
+    would hold #2 holds nothing: #2 is admitted, run, shown and archived, and
+    the directory, its logs included, stays exactly as it was."""
+    e = epic()
+    b = e.b
+    b.issue(2)
+    legacy = b.root / "autoforge" / "state"
+    standalone_state(legacy, 2, Phase.REVIEW)
+    (legacy / "logs" / "standalone").mkdir(parents=True)
+    (legacy / "logs" / "standalone" / "run.log").write_text("a run log\n", encoding="utf-8")
+    before = state_tree(legacy)
+    assert e.run()[0] == 0 and b.admitted() == [2], e.said
+    assert str(legacy) not in e.said
+    assert b.state(2).phase is Phase.READY_FOR_MERGE
+    code, doc = e.status()
+    assert code == 0 and doc["problems"] == [] and str(legacy) not in json.dumps(doc)
+    assert e.cli("epic", "archive", EPIC, "2")[0] == 0
+    assert state_tree(legacy) == before
 
 
 def test_local_mode_is_unaffected_by_scheduler_namespaces(epic):

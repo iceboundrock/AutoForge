@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import time
+from collections.abc import Callable
 
 import pytest
 
@@ -5876,9 +5877,17 @@ _VALIDATION_FIELDS = (
 )
 
 
-def _protocol_1_state_file(eng, journal: dict, *, protocol: str = "1") -> dict:
-    """Rewrite the engine's state file as the ``protocol`` controller left it."""
+def _protocol_1_state_file(
+    eng, journal: dict, *, protocol: str = "1", local_fields: Callable[[dict], dict] | None = None
+) -> dict:
+    """Rewrite the engine's state file as the ``protocol`` controller left it.
+
+    ``local_fields`` (the conftest fixture) gives it LOCAL's twelve fields at
+    their empty values or none of them (ADR 0009 D8, #385).
+    """
     data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    if local_fields is not None:
+        local_fields(data)
     data["protocol_version"] = protocol
     data.pop("acceptance_outcomes", None)  # protocol 8's own field (#211)
     data.pop("config_fingerprint", None)  # protocol 9's own field (#219)
@@ -5910,7 +5919,7 @@ def test_r7f1_a_protocol_1_journal_is_refused_by_the_journal_loader_only_as_corr
 
 @pytest.mark.parametrize("stage", _PROTOCOL_1_STAGES, ids=lambda s: s.value)
 def test_r7f1_an_in_flight_protocol_1_journal_is_refused_at_the_state_boundary(
-    tmp_state_dir, stage
+    tmp_state_dir, stage, local_fields
 ):
     """Every in-flight stage written by the protocol-1 controller, the close
     window included: the state file does not load, nothing is read from or
@@ -5918,7 +5927,7 @@ def test_r7f1_an_in_flight_protocol_1_journal_is_refused_at_the_state_boundary(
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
     eng.save()
-    data = _protocol_1_state_file(eng, _protocol_1_journal(stage))
+    data = _protocol_1_state_file(eng, _protocol_1_journal(stage), local_fields=local_fields)
     before = eng.paths.state_file.read_bytes()
     with pytest.raises(StateError) as info:
         eng.load()
@@ -5965,7 +5974,9 @@ def test_a_protocol_2_journal_is_refused_by_the_journal_loader_only_as_corruptio
 
 
 @pytest.mark.parametrize("stage", _PROTOCOL_1_STAGES, ids=lambda s: s.value)
-def test_an_in_flight_protocol_2_journal_is_refused_at_the_state_boundary(tmp_state_dir, stage):
+def test_an_in_flight_protocol_2_journal_is_refused_at_the_state_boundary(
+    tmp_state_dir, stage, local_fields
+):
     """Every in-flight stage written by the protocol-2 controller is refused
     the way a protocol-1 one is, naming the binding it lacks -- the base --
     rather than the PR and issue; nothing is read from or written to GitHub,
@@ -5973,7 +5984,9 @@ def test_an_in_flight_protocol_2_journal_is_refused_at_the_state_boundary(tmp_st
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
     eng.save()
-    data = _protocol_1_state_file(eng, _protocol_2_journal(stage), protocol="2")
+    data = _protocol_1_state_file(
+        eng, _protocol_2_journal(stage), protocol="2", local_fields=local_fields
+    )
     before = eng.paths.state_file.read_bytes()
     with pytest.raises(StateError) as info:
         eng.load()
@@ -6014,7 +6027,9 @@ def test_a_protocol_3_journal_is_refused_by_the_journal_loader_only_as_corruptio
 
 
 @pytest.mark.parametrize("stage", _PROTOCOL_1_STAGES, ids=lambda s: s.value)
-def test_an_in_flight_protocol_3_journal_is_refused_at_the_state_boundary(tmp_state_dir, stage):
+def test_an_in_flight_protocol_3_journal_is_refused_at_the_state_boundary(
+    tmp_state_dir, stage, local_fields
+):
     """Every in-flight stage written by the protocol-3 controller is refused
     the way a protocol-2 one is, naming the binding it lacks -- the merge
     base -- and never migrated by reading the merge base GitHub reports now
@@ -6024,7 +6039,9 @@ def test_an_in_flight_protocol_3_journal_is_refused_at_the_state_boundary(tmp_st
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
     eng.save()
-    data = _protocol_1_state_file(eng, _protocol_3_journal(stage), protocol="3")
+    data = _protocol_1_state_file(
+        eng, _protocol_3_journal(stage), protocol="3", local_fields=local_fields
+    )
     before = eng.paths.state_file.read_bytes()
     with pytest.raises(StateError) as info:
         eng.load()
@@ -6063,7 +6080,7 @@ def test_a_protocol_4_journal_past_the_write_is_refused_by_the_loader_only_as_co
 
 @pytest.mark.parametrize("stage", _PROTOCOL_4_REFUSED_STAGES, ids=lambda s: s.value)
 def test_an_in_flight_protocol_4_journal_past_the_write_is_refused_at_the_state_boundary(
-    tmp_state_dir, stage
+    tmp_state_dir, stage, local_fields
 ):
     """A protocol-4 journal at or after SUPERSEDE_INTENT is refused the way
     the earlier protocols' are, naming the binding it lacks -- the closed-event
@@ -6074,7 +6091,9 @@ def test_an_in_flight_protocol_4_journal_past_the_write_is_refused_at_the_state_
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
     eng.save()
-    data = _protocol_1_state_file(eng, _protocol_4_journal(stage), protocol="4")
+    data = _protocol_1_state_file(
+        eng, _protocol_4_journal(stage), protocol="4", local_fields=local_fields
+    )
     before = eng.paths.state_file.read_bytes()
     with pytest.raises(StateError) as info:
         eng.load()
@@ -6123,7 +6142,9 @@ def test_a_protocol_4_journal_before_the_write_loads_and_relabels(tmp_state_dir,
         assert len(gh.closed_prs) == 1
 
 
-def test_an_unreadable_stage_in_a_protocol_4_journal_is_still_a_refusal(tmp_state_dir):
+def test_an_unreadable_stage_in_a_protocol_4_journal_is_still_a_refusal(
+    tmp_state_dir, local_fields
+):
     """The stage scoping of the protocol-4 gap applies to stages this
     controller knows; a stage it cannot read is refused as in-flight legacy,
     never handed to the loader as corruption."""
@@ -6132,12 +6153,14 @@ def test_an_unreadable_stage_in_a_protocol_4_journal_is_still_a_refusal(tmp_stat
     eng.save()
     journal = _protocol_4_journal(ReplanStage.PREPARED)
     journal["stage"] = "from_a_future_version"
-    _protocol_1_state_file(eng, journal, protocol="4")
+    _protocol_1_state_file(eng, journal, protocol="4", local_fields=local_fields)
+    before = eng.paths.state_file.read_bytes()
     with pytest.raises(StateError) as info:
         eng.load()
     assert "protocol_version '4' with a replan in flight" in str(info.value)
     assert "corrupt" not in str(info.value)
     assert eng.provider.calls == [] and gh.closed_prs == []
+    assert eng.paths.state_file.read_bytes() == before
 
 
 def test_the_legacy_journal_refusal_knows_only_the_legacy_protocols():
@@ -6266,18 +6289,22 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     assert gh.closed_prs == [] and eng.provider.calls == []
 
 
-def test_r7f1_an_unreadable_stage_in_a_protocol_1_journal_is_still_a_refusal(tmp_state_dir):
+def test_r7f1_an_unreadable_stage_in_a_protocol_1_journal_is_still_a_refusal(
+    tmp_state_dir, local_fields
+):
     gh = FakeGitHub()
     eng, _ = _seeded_engine(tmp_state_dir, gh, ReplanStage.PENDING)
     eng.save()
     journal = _protocol_1_journal(ReplanStage.PENDING)
     journal["stage"] = 7
-    _protocol_1_state_file(eng, journal)
+    _protocol_1_state_file(eng, journal, local_fields=local_fields)
+    before = eng.paths.state_file.read_bytes()
     with pytest.raises(StateError) as info:
         eng.load()
     assert "unreadable stage 7" in str(info.value)
     assert "cannot be determined from local state" in str(info.value)
     assert eng.provider.calls == [] and gh.closed_prs == []
+    assert eng.paths.state_file.read_bytes() == before
 
 
 # =============================================================================

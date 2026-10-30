@@ -32,6 +32,7 @@ from tests.conftest import (
     ISSUE,
     PR,
     SHA_A,
+    UNLOADABLE_STATES,
     FakeGitHub,
     Origin,
     acceptance,
@@ -50,6 +51,8 @@ from tests.conftest import (
     publish_pr_head,
     review_result,
     sample_contract,
+    state_tree,
+    unloadable_state,
 )
 
 
@@ -754,7 +757,7 @@ def test_status_json_keeps_journal_entries_whose_redacted_keys_collide(
 
 
 def test_status_and_resume_refuse_an_in_flight_protocol_1_replan(
-    tmp_path, capsys, monkeypatch, fakes
+    tmp_path, capsys, monkeypatch, fakes, local_fields
 ):
     """#66 R7-F1: a protocol-1 state with a replan in the close window is a
     protocol incompatibility reported at the boundary -- not a corrupt journal,
@@ -767,7 +770,7 @@ def test_status_and_resume_refuse_an_in_flight_protocol_1_replan(
     )
     capsys.readouterr()
     state_file = tmp_path / ".autoforge" / "state.json"
-    data = json.loads(state_file.read_text())
+    data = local_fields(json.loads(state_file.read_text()))
     data["protocol_version"] = "1"
     data["phase"] = "REPLAN_REEXECUTE"
     data["current_pr_url"] = PR
@@ -1406,6 +1409,141 @@ def test_run_force_moves_invalid_utf8_state_aside(tmp_path, capsys, monkeypatch,
     assert str(quarantined[0]) in err
     assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["phase"] == "ANALYZE_EXECUTE"
+
+
+# -- a state that does not load (ADR 0009 D4; #385) -------------------------------------
+# What the removal of LOCAL leaves a LOCAL state to: the paths every state the
+# loader refuses takes. Pinned on today's code for an unknown mode, an unknown
+# label and invalid JSON, in a state directory that holds a run's logs.
+
+# What the refused file carries and the new run must not: its identity, its
+# counters and its text.
+_PLANTED = {
+    "run_id": "af-planted-run",
+    "review_round": 4,
+    "execution_attempt": 3,
+    "escalation_count": 2,
+    "merged_since_epic_update": 1,
+    "counted_merged_prs": ["https://github.com/owner/repo/pull/4241"],
+    "step_count": 41,
+    "block_reason": "planted by the test",
+}
+
+
+def _run_argv_of(max_steps: int) -> list[str]:
+    return ["run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", str(max_steps)]
+
+
+def _a_run_left_unloadable(tmp_path, capsys, kind: str) -> tuple[Path, bytes, str]:
+    """A run started in ``tmp_path/.autoforge``, its state then made ``kind``.
+
+    Returns the state directory, the bytes of its unloadable ``state.json``
+    and the loader's reason. Before it is made unloadable the state is one
+    that loads, carrying :data:`_PLANTED`; the run's logs stay beside it.
+    """
+    sd = tmp_path / ".autoforge"
+    cli.main(["--state-dir", str(sd), *_run_argv_of(2)])  # the agent's launch writes its logs
+    capsys.readouterr()
+    assert any((sd / "logs").iterdir())
+    state_file = sd / "state.json"
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    data.update(_PLANTED)
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    assert load_state(state_file).run_id == _PLANTED["run_id"]
+    raw, reason = unloadable_state(kind, state_file.read_bytes())
+    state_file.write_bytes(raw)
+    return sd, raw, reason
+
+
+@pytest.mark.parametrize("kind", UNLOADABLE_STATES)
+def test_status_step_resume_and_unblock_refuse_a_state_that_does_not_load(
+    tmp_path, capsys, monkeypatch, fakes, kind
+):
+    """ADR 0009 D4: each command loads the state before it saves, pins,
+    records a configuration or opens a run log, so a refusal (exit 2, the
+    loader's reason) leaves the state directory and its logs as they were.
+    Each command runs twice, with ``--state-dir`` and from the configured
+    location, and the tree is compared with its snapshot after every one."""
+    monkeypatch.chdir(tmp_path)
+    sd, _, reason = _a_run_left_unloadable(tmp_path, capsys, kind)
+    before = state_tree(sd)
+    calls = (len(fakes["gh"].calls), len(fakes["provider"].calls))
+    commands = (
+        ["status"],
+        ["status", "--json"],
+        ["step"],
+        ["resume"],
+        ["unblock", "--reason", "the operator looked"],
+    )
+    for where in (["--state-dir", str(sd)], []):
+        for words in commands:
+            for _ in range(2):
+                assert cli.main([*where, *words]) == 2, words
+                captured = capsys.readouterr()
+                assert reason in captured.err and captured.out == "", words
+                assert state_tree(sd) == before, words
+    assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
+
+
+@pytest.mark.parametrize("kind", UNLOADABLE_STATES)
+def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
+    tmp_path, capsys, monkeypatch, fakes, kind
+):
+    """ADR 0009 D4, ``run --force`` audited. Without ``--force``: exit 2, the
+    directory as it was. With it: the file is moved aside byte for byte under
+    ``state.json.corrupt-<timestamp>``, beside an earlier archive of that very
+    name, which it does not replace; the run logs stay; the move is printed;
+    and the new run is built from the command alone, with nothing of the
+    moved file in it."""
+    import stat
+    from datetime import datetime
+
+    from autoforge import state as state_mod
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 30, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.chdir(tmp_path)
+    sd, raw, reason = _a_run_left_unloadable(tmp_path, capsys, kind)
+    earlier = sd / "state.json.corrupt-20261030T120000Z"
+    earlier.write_bytes(b"an earlier archive")
+    before = state_tree(sd)
+    assert cli.main(["--state-dir", str(sd), *_run_argv_of(1)]) == 2
+    err = capsys.readouterr().err
+    assert reason in err and "'run --force'" in err
+    assert state_tree(sd) == before
+
+    monkeypatch.setattr(state_mod, "datetime", FrozenDatetime)
+    assert cli.main(["--state-dir", str(sd), *_run_argv_of(1), "--force"]) == 0
+    err = capsys.readouterr().err
+    moved = sd / "state.json.corrupt-20261030T120000Z.1"
+    assert f"autoforge: moved unreadable state file aside: {moved}" in err
+    assert moved.read_bytes() == raw
+    after = state_tree(sd)
+    for name, entry in before.items():
+        if name != "state.json" and not stat.S_ISDIR(entry[0]):  # the logs, the archive
+            assert after[name] == entry, name
+    assert sorted(p.name for p in sd.glob("state.json*")) == [
+        "state.json",
+        earlier.name,
+        moved.name,
+    ]
+    fresh = json.loads((sd / "state.json").read_text(encoding="utf-8"))
+    assert fresh["run_id"] != _PLANTED["run_id"] and fresh["mode"] == "REMOTE"
+    assert fresh["epic_url"] == EPIC and fresh["current_issue_url"] == ISSUE
+    assert fresh["phase"] == "ANALYZE_EXECUTE" and fresh["step_count"] == 1
+    assert (fresh["review_round"], fresh["execution_attempt"], fresh["escalation_count"]) == (
+        0,
+        1,
+        0,
+    )
+    assert fresh["merged_since_epic_update"] == 0 and fresh["counted_merged_prs"] == []
+    assert fresh["block_reason"] == ""
+    assert "planted" not in (sd / "state.json").read_text(encoding="utf-8")
+    assert "pull/4241" not in (sd / "state.json").read_text(encoding="utf-8")
+    assert load_state(sd / "state.json").run_id == fresh["run_id"]
 
 
 def test_run_refuses_dangling_symlink_state_without_force(tmp_path, capsys, monkeypatch, fakes):
