@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -627,6 +628,53 @@ def test_a_pinned_deadline_is_not_moved_by_later_output(monkeypatch):
     assert child.deadline() == pinned
     assert time.monotonic() - started < 3
     assert res.timed_out and res.timeout_limit == "idle"
+
+
+def test_output_after_a_pin_is_not_the_last_activity(monkeypatch):
+    """What Pi writes in answer to the abort after a limit is its shutdown:
+    the record keeps the last output from before the pin, so the timeout
+    names when the silence began, not when the abort was answered (#343)."""
+    monkeypatch.setattr(executor, "_KILL_GRACE_SECONDS", 0.5)
+    with start_duplex(
+        DuplexRequest(
+            command=[PY, "-c", _TICKER, "stdout", "1000", "0.05"],
+            idle_timeout_seconds=0.5,
+            max_runtime_seconds=30,
+        )
+    ) as child:
+        assert isinstance(child.read_line(timeout=10), Record)
+        child.pin_deadline()
+        pinned_at = datetime.now(UTC)
+        got = _drain(child)
+        res = child.finish()
+    assert got[-1] == Timeout(deadline_exceeded=True)
+    assert sum(isinstance(o, Record) for o in got) > 2  # it went on writing
+    assert res.last_activity_at is not None
+    # A chunk the reader took as the pin was made may still count.
+    assert datetime.fromisoformat(res.last_activity_at) <= pinned_at + timedelta(seconds=0.1)
+
+
+def test_what_a_child_writes_while_it_is_killed_is_not_its_last_activity():
+    """The idle kill's SIGTERM answered with a record, as a CLI flushes its
+    last ones: the record is read, and the last activity stays the output
+    one idle limit before the end (#343)."""
+    code = (
+        "import os, signal, sys, time\n"
+        "def stop(*_):\n"
+        "    sys.stdout.write('stopping\\n'); sys.stdout.flush(); os._exit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "print('working', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    with start_duplex(
+        DuplexRequest(command=[PY, "-c", code], idle_timeout_seconds=0.8, max_runtime_seconds=30)
+    ) as child:
+        got = _drain(child)
+        res = child.finish()
+    assert got[0] == Record(b"working") and got[-1] == Timeout(deadline_exceeded=True)
+    assert res.timed_out and res.timeout_limit == "idle" and res.last_activity_at is not None
+    silent = datetime.fromisoformat(res.finished_at) - datetime.fromisoformat(res.last_activity_at)
+    assert silent.total_seconds() >= 0.75
 
 
 def test_a_wind_down_puts_the_kill_after_the_limit_and_a_pin_fixes_both(monkeypatch):

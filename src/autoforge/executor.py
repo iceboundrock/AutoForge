@@ -279,7 +279,9 @@ class ExecutionResult:
     # wall-clock ceiling); empty otherwise.
     timeout_limit: str = ""
     # When the child last wrote anything on stdout or stderr (UTC, ISO
-    # 8601); ``None`` when it wrote nothing at all.
+    # 8601); ``None`` when it wrote nothing at all. On a timeout or a stop,
+    # the last output before the group kill: what the child writes while it
+    # is killed is not counted (:meth:`_Limits.pin`, #343).
     last_activity_at: str | None = None
     # The caller set :attr:`ExecutionRequest.stop` before the child exited,
     # so the group was killed; ``exit_code`` is then -1. Never set together
@@ -509,7 +511,8 @@ class _Limits:
     the chunk in one assignment, so a waiter on another thread reads either
     the previous chunk's time or this one's, never a mixture. Only output
     touches it: what the controller writes to the child is not activity,
-    and neither is any time spent waiting on someone else.
+    and neither is any time spent waiting on someone else, nor what the
+    child writes once :meth:`pin` has run.
     """
 
     def __init__(self, idle: float | None, ceiling: float | None) -> None:
@@ -520,10 +523,13 @@ class _Limits:
         self._last: tuple[float, float] | None = None
         # (deadline, limit) once :meth:`pin` has fixed them.
         self._pinned: tuple[float, str] | None = None
+        # :meth:`pin` has run: from here on output is the child's shutdown.
+        self._ending = False
 
     def touch(self) -> None:
-        """A chunk of output arrived."""
-        self._last = (time.monotonic(), time.time())
+        """A chunk of output arrived; once :meth:`pin` has run, it is not recorded."""
+        if not self._ending:
+            self._last = (time.monotonic(), time.time())
 
     def _due(self) -> tuple[float, str] | None:
         idle_at = None
@@ -553,11 +559,18 @@ class _Limits:
         return deadline is not None and time.monotonic() >= deadline
 
     def pin(self) -> None:
-        """Fix the current deadline: output from here on no longer moves it.
+        """Fix the current deadline and the last activity: output from here
+        on moves neither.
 
-        For a caller that has decided to end the invocation and is giving
-        the child a bounded chance to shut down in order. Idempotent.
+        For a caller that has decided to end the invocation (a limit fired,
+        a stop, Pi's abort) and is giving the child a bounded chance to shut
+        down in order. What the child writes meanwhile (the records a CLI
+        flushes on SIGTERM, Pi's answer to the abort) is its shutdown, not
+        progress, so :meth:`last_activity_at` keeps naming the output before
+        the decision: an idle timeout's record says when the silence began,
+        not when the kill was answered (#343). Idempotent.
         """
+        self._ending = True
         if self._pinned is None:
             self._pinned = self._due()
 
@@ -1524,6 +1537,8 @@ def _execute(
         timed_out = bool(ended) and not stopped
         timeout_limit = ended if timed_out else ""
         if timed_out or stopped:
+            # What the group writes while it is killed is not progress.
+            limits.pin()
             left = _terminate_group(pgid, proc, readers, contained)
         else:
             # The child has exited, but the invocation is over only at EOF

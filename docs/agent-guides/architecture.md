@@ -314,8 +314,9 @@ and then from the last chunk either reader saw, and a wall-clock ceiling
 (`timeout_seconds`, `MAX_DEADLINE_SECONDS` when the profile sets none).
 Whichever is due first fires, a tie goes to the ceiling, and
 `ExecutionResult.timeout_limit` (`idle` or `max_runtime`) and
-`last_activity_at` say which and when the child last wrote. A command that
-is not an agent has no idle timeout, only `timeout_seconds`
+`last_activity_at` say which and when the child last wrote before the kill
+(what it writes while it is killed is captured but is not activity, #343).
+A command that is not an agent has no idle timeout, only `timeout_seconds`
 (`execution.command_timeout_seconds`). Which limits a profile gets, and that
 a provider whose output is no progress signal (Claude in text mode,
 `reports_activity`) runs under its ceiling alone, is configuration

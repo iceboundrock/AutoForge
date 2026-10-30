@@ -1242,6 +1242,64 @@ def test_a_fake_claude_that_goes_silent_is_killed_at_its_idle_timeout(tmp_path):
     assert res.last_activity_at is not None
 
 
+def _between_turns() -> list:
+    """#343's five Claude idle kills: the agent started the suite in the
+    background and ended its turn to wait for it, and the CLI, kept alive by
+    the task, wrote nothing until the limit."""
+    from tests import claude_fake
+
+    return [
+        claude_fake.init(),
+        claude_fake.tool_use(
+            "t1", "Bash", description="Run the full suite in the background", run_in_background=True
+        ),
+        claude_fake.tool_result("t1", "Command running in background with ID: b1"),
+        claude_fake.result("The suite is running; I'll report the result when it finishes."),
+    ]
+
+
+def _inside_a_tool_call() -> list:
+    from tests import claude_fake
+
+    return [claude_fake.init(), claude_fake.tool_use("t1", "Bash", description="Run the suite")]
+
+
+@pytest.mark.parametrize(
+    ("where", "stood"),
+    [("between-turns", (1, 1, 0)), ("inside-a-tool-call", (1, 0, 1))],
+)
+def test_a_silent_claude_is_killed_and_its_summary_says_where_it_stood(tmp_path, where, stood):
+    """A silence in either place is an idle timeout, as before; the summary
+    (``turns``, ``results``, ``open_tool_calls``) says which it was, and the
+    last activity is the last record, one idle limit before the end."""
+    from datetime import datetime
+
+    lines = _between_turns() if where == "between-turns" else _inside_a_tool_call()
+    _, res = _claude_run(tmp_path, [*lines, {"sleep": 60}], timeout=30, idle=1)
+    assert res.timed_out and res.timeout_limit == "idle" and res.provider_failure is None
+    summary = res.provider_summary
+    assert (summary["turns"], summary["results"], summary["open_tool_calls"]) == stood
+    assert res.last_activity_at is not None
+    silent = datetime.fromisoformat(res.finished_at) - datetime.fromisoformat(res.last_activity_at)
+    assert silent.total_seconds() >= 0.95
+
+
+def test_the_controllers_heartbeat_does_not_keep_a_silent_agent_alive(tmp_path):
+    """The "still running, last activity ..." lines the operator sees while
+    an agent is silent are the controller's own: they never reach the
+    agent's output, so they cannot reset its idle timer (#343)."""
+    from autoforge.progress import ProgressReporter
+    from tests import claude_fake
+
+    _, profile = claude_fake.fake_claude(tmp_path, [*_between_turns(), {"sleep": 60}])
+    shown: list[str] = []
+    with ProgressReporter("FIX", [shown.append], heartbeat_after=0.2, poll_seconds=0.05) as rep:
+        req = AgentRequest("FIX", "fix it", str(tmp_path), profile, 1, 30, progress=rep.sink)
+        res = ClaudeCodeProvider().execute(req)
+    assert res.timed_out and res.timeout_limit == "idle"
+    assert any("still running, last activity" in line for line in shown), shown
+
+
 def test_a_fake_claude_that_keeps_streaming_outlives_its_idle_timeout(tmp_path):
     import time
 

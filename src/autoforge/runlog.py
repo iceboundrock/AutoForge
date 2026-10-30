@@ -259,7 +259,8 @@ class ExecutionRecord:
     timed_out: bool = False
     # When it timed out: which limit fired (``executor.LIMIT_IDLE`` /
     # ``LIMIT_MAX_RUNTIME``). Whatever happened: when its last output was
-    # seen (UTC ISO 8601), ``None`` when it wrote nothing.
+    # seen (UTC ISO 8601), ``None`` when it wrote nothing; on a kill, its
+    # last output before the kill (#343).
     timeout_limit: str = ""
     last_activity_at: str | None = None
     # An agent's invocation (#194): how it ended (``exit``, the limit that

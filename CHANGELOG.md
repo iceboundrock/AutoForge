@@ -5,6 +5,28 @@ so.
 
 ## Unreleased
 
+### An idle timeout names when the silence began, and a Claude run's summary says where it stood (#343)
+
+- `last_activity_at` in `execution.json`, and the time in the error
+  (`made no progress for 900s (last activity ...)`), counted what an agent
+  wrote while it was being killed: Claude flushes a few records on
+  SIGTERM, and Pi answers its `abort`. In all nine idle kills in one
+  operator's logs it fell 0.04 to 2 s before `finished_at`, so the error
+  named a time one idle timeout after the agent had gone silent. It is now
+  the last output before the kill or a loop stop; what follows is still
+  captured in the logs.
+- A Claude run's `provider_summary` adds `turns` (opened) and
+  `open_tool_calls` (calls whose result had not arrived). With `results`
+  they say whether a killed run was inside a tool call or between turns,
+  its CLI kept alive by a background task or wakeup the agent had left
+  pending. Five of the nine kills were between turns, three of those
+  waiting for a test suite the agent had started in the background. The
+  other four were three OpenCode runs hung after a dropped connection and
+  one Pi `bash` call that printed nothing. What helps in each case is in
+  [Reading an idle timeout](docs/usage.md#reading-an-idle-timeout).
+- Nothing is killed sooner or later than before, and nothing is retried
+  that was not. No default, configuration key or prompt changes.
+
 ### Agents are told the block goes in their final reply, and a correction quotes the reply it corrects (#393)
 
 - The controller reads the `CONTROL_RESULT` block only from the end of an

@@ -752,7 +752,73 @@ profiles.analyze_execute.max_runtime_seconds`. The state is unchanged,
 nothing is retried automatically, the error says where to look and how to
 resume ([Troubleshooting](#troubleshooting-and-recovery)), and the step's
 `execution.json` records `timeout_limit` (`idle` or `max_runtime`), both
-configured values and `last_activity_at`.
+configured values and `last_activity_at`. That is the agent's last output
+before the kill: what a CLI writes while it is killed (Claude flushes a few
+records on SIGTERM, Pi answers its `abort`) is kept in the logs but not
+counted. A record written before #343 counted it, so its
+`last_activity_at` is a second or two before `finished_at`, and the
+silence really began one idle timeout earlier.
+
+### Reading an idle timeout
+
+An idle timeout says that nothing reached the controller for that long,
+not why. Find where the silence was before raising a limit: the last line
+of the step's `progress.log` before the heartbeats is the last thing the
+agent did, and `provider_summary` in its `execution.json` says where the
+stream stood (a Claude run's `turns` and `open_tool_calls` are recorded
+from #343 on). These are the causes #343 found in the nine idle kills
+recorded on one operator's machine between 2026-10-12 and 2026-10-26, and
+what helps with each:
+
+- **Claude waiting between turns** (`results` equal to `turns`,
+  `open_tool_calls` 0; five of the nine). The agent ended its turn while
+  something it had started was still pending (a background `Bash` task, a
+  `Monitor`, a `ScheduleWakeup`), and the CLI stays alive and silent until
+  that fires and the next turn begins. A background task's output goes to
+  the task's own file, never into the stream, so it cannot reset the timer.
+  In three of the five the agent's reply said it would report once the
+  test suite it had started in the background finished, and the suite ran
+  past the limit: past 900 s once, past 1800 s twice. This repository's
+  serial suite took about 24 minutes on a busy 4-CPU workstation
+  ([Development](development.md)). Raise `idle_timeout_seconds` on the
+  profiles that run the suite (`analyze_execute`, `fix`) above the longest
+  it takes on your machine, or make it finish sooner
+  (`make test-parallel`). In the other two the reply was already final,
+  with its `CONTROL_RESULT` block, and whatever was still pending kept the
+  CLI alive anyway. The kill discards that reply and `resume` runs the
+  phase again; a higher limit only waits longer for what is pending.
+- **Claude inside a tool call** (`results` below `turns`,
+  `open_tool_calls` above 0). The stream carries nothing while a tool runs.
+  None of the nine was this: Claude's `Bash` tool ended every foreground
+  command within about ten minutes, below the default limit. A tool that
+  stays silent longer needs the profile's limit raised above it.
+- **Pi inside `bash`** (one of the nine; `tool_executions` is one more than
+  `loop_actions`). Pi 1.3.0 forwards a command's output while it runs, so a
+  silent `bash` call is a command that printed nothing: a test run whose
+  output goes to a file or through `tail`, or a command that hangs. The
+  command is not recorded. Raise the profile's limit above how long that
+  command stays silent, or have it print as it goes: `pytest -q` flushes a
+  dot as each test ends, so only a single test longer than the limit is
+  silent.
+- **OpenCode after a dropped connection** (three of the nine). OpenCode
+  printed `Transport: The socket connection was closed unexpectedly` on
+  stderr and never exited. That is the hang the idle timeout exists for:
+  `resume` relaunches it, and a higher limit only keeps it hanging longer.
+
+`execution.command_timeout_seconds` (default 1800) is not an agent limit:
+it bounds only the commands the controller runs itself
+(`validation.commands`, the pre-merge and LOCAL validation commands), and
+how long a GitHub CI run took says nothing about either. Whatever the
+cause, a higher idle timeout also lets a hung agent hang that much longer,
+so raise it only on the profiles that need it, and set
+`max_runtime_seconds` when the run must still end by a known time. Do not
+make the agent print just to keep the timer alive. A Claude tool's output
+reaches the stream only once the tool ends, and a background task's never
+does, so it changes nothing there; where it does reach the controller as
+it is written (OpenCode's text, Pi's `bash` updates) it hides a hang from
+the idle timeout. In OpenCode's output, loop detection's
+repeated-lines signal catches a repeated line or a counter, but on Pi only
+`max_runtime_seconds` would end it.
 
 ## Loop detection
 
@@ -1051,7 +1117,8 @@ ownership or discard uncommitted user changes.
   retried automatically and leaves the phase unchanged for `resume`. Inspect
   each invocation under `<state dir>/logs/<run-id>/`; a transient failure's
   `error.txt` says `(transient: ...)`. A timeout says which limit fired and
-  the key that set it; see [Agent limits](#agent-limits) before raising one.
+  the key that set it; see [Reading an idle timeout](#reading-an-idle-timeout)
+  before raising one.
 
   Every agent failure that leaves the phase unchanged (a timeout or loop
   kill, a failed exit or provider failure, an agent that could not be

@@ -100,7 +100,11 @@ their count; ``total_cost_usd`` is the session's so far, so the last one's
 is the invocation's. The cost is integer micro-USD, and a value that is
 absent or unreadable is left out rather than reported as zero. So is a sum
 once one ``result`` lacks its count: what the others add up to is not the
-invocation's total.
+invocation's total. The turns opened and the tool calls still waiting for
+their ``tool_result`` say where a killed run stood: in the real runs #343
+examined, the stream sent nothing while a tool ran (a foreground ``Bash``
+call, ten minutes at most) nor between turns while a background task or a
+wakeup kept the CLI alive, so an idle timeout fires in one or the other.
 
 Loop detection (#194): given a :class:`~autoforge.loop_detect.LoopObserver`,
 each completed tool call is reported as an action fingerprinted from its
@@ -324,6 +328,12 @@ class ClaudeStream:
         return {
             **self._result,
             "results": self._results,
+            # Where the stream stood when it ended (#343): ``turns`` equal to
+            # ``results`` is a CLI between turns, kept alive by something the
+            # agent left pending; fewer results with an open tool call is a
+            # CLI inside that call.
+            "turns": self._turns,
+            "open_tool_calls": len(self._open_tools),
             "records": self._records,
             "oversize_records": self._oversize,
             "unknown_events": self._unknown,
