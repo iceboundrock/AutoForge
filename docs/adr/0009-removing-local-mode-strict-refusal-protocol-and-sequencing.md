@@ -600,8 +600,8 @@ EPIC #383's issues.
 |---|---|---|---|
 | S1a. Replace first | #386 (RET-A3) | Every REPLACE row of Appendix A: REMOTE's git reader out of `local_workspace.py` and free of `config.local` (C1); a REMOTE or mode-neutral test for each row of A.2.3, among them the live Pi flow's REMOTE form (G) and the candidate-validation preflight tests (H); the helpers other modules import from `test_local.py`, moved to a shared home. LOCAL still works | This record |
 | S1b. Pin the state | #385 (RET-A2) | Tests written against today's code that S2 and S3 must keep passing: every REMOTE refusal D8 keeps, the protocol-1 merge-phase refusal no test pins yet, and the `run --force` and scheduler audits of D4. No behaviour change. LOCAL still works | This record |
-| S2. Close every way in | #387 (RET-A4) | D3 to D5: the `local` subcommand; the `local:` key (the internal `LocalConfig` type stays until S3, read by nothing reachable); the loader's mode refusal; the probe; the scheduler's LOCAL skip; `dist_check.py`'s LOCAL half; the example's `local:` block; the live Pi flow's LOCAL form; the current documents; the changelog entry. LOCAL becomes unreachable, but its code is still there | S1a: C1 before the `local:` key goes, G before the key and the subcommand go. S1b |
-| S3. Delete | #388 (RET-A5) | Every DELETE row, with its tests: the LOCAL engine paths, transitions, prompts and result models, `run_contract.py`, the rest of `local_workspace.py`, the LOCAL launch classes, the workspace record variant and the `local` certificate kind, `doctor`'s LOCAL subset, `LocalConfig`. D8's protocol bump. The instruction maps, the agent guides and the test contracts. D11's ADR notes | S2. The protocol number confirmed on #23 |
+| S2. Close every way in | #387 (RET-A4) | D3 to D5: the `local` subcommand; the `local:` key (the internal `LocalConfig` type stays until S3, read by nothing reachable); the loader's mode refusal; the probe; the scheduler's LOCAL skip; `dist_check.py`'s LOCAL half; the example's `local:` block; the live Pi flow's LOCAL form; the current documents; the changelog entry. The tests those closures break or empty, each deleted, rewritten to assert its refusal or cut to its REMOTE rows (A.2.1's S2 column), and the test contracts' requirements they leave without a test (A.2.5). LOCAL becomes unreachable, but its code is still there, and so are the tests that call it directly | S1a: C1 before the `local:` key goes; G before the key and the subcommand go; B and C before the mode refusal. S1b |
+| S3. Delete | #388 (RET-A5) | Every DELETE row of A.1, with the tests that still call it after S2: the LOCAL engine paths, transitions, prompts and result models, `run_contract.py`, the rest of `local_workspace.py`, the LOCAL launch classes, the workspace record variant and the `local` certificate kind, `doctor`'s LOCAL subset, `LocalConfig`. D8's protocol bump. The instruction maps, the agent guides and the rest of the test contracts. D11's ADR notes | S2. The protocol number confirmed on #23 |
 | S4. Measure and close | #389 (RET-A6) | Appendix B's commands, and `tests/parallel_bench.py --config serial --repeats 3`, run again on `4b03151` and on S3's last commit, back to back on one host; the full check set; the installed-package checks; the documentation audit; release readiness without a release | S2 and S3 |
 
 Why this order:
@@ -621,6 +621,17 @@ Why this order:
 - **S3 comes after S2.** Deleting code that is still reachable would break
   LOCAL while it is supported. Once S2 has made the code unreachable, S3 is
   a deletion whose safety S1b's and S2's tests already pin.
+- **Each step retires the tests of what it removes, and leaves the full
+  suite passing.** A test that drives a behaviour a step removes is deleted
+  in that step, rewritten to assert the refusal that replaces it, or cut to
+  its REMOTE rows. None is skipped, deselected or marked expected to fail to
+  bridge two steps. S2 shuts every way into LOCAL, so it retires every test
+  that reaches LOCAL through one: the `local` subcommand, a `local:` block
+  read from a file, a LOCAL state loaded from disk, the probe, README's
+  LOCAL text, the live Pi flow's LOCAL form. That is 160 functions,
+  measured, not estimated (A.2). The other LOCAL tests call LOCAL code
+  directly, through `make_local_engine`'s state in memory or as units of a
+  module, and pass after S2. S3 deletes them with that code.
 - **Every merge leaves a coherent interface.**
   - After S1a and S1b, LOCAL works and REMOTE is unchanged.
   - After S2, nothing starts, configures, continues or shows a LOCAL run,
@@ -720,6 +731,18 @@ row that names LOCAL.
 - `dist_check.py` passes on its REMOTE half, and REMOTE's CLI tests pass
   unchanged.
 - S1a's and S1b's tests pass.
+- *The full suite passes at S2's last commit,* CI's real-backend sandbox
+  job included, with no test skipped, deselected or marked expected to fail
+  for LOCAL.
+  - Every function of A.2.1's S2 column is gone, rewritten to assert the
+    refusal that replaces it, or cut to its REMOTE rows. A REPLACE original
+    among them (B, C, G) goes only once its S1a replacement passes on
+    `main`, so no shared regression is unprotected at any commit.
+  - A test that S2 breaks and the column does not list, one added since
+    `02ce244` (§4), is S2's as well. S2 may retire more of the LOCAL tests
+    early, never fewer.
+  - The test contracts drop what S2 retires and require the refusals above
+    (A.2.5).
 
 **S3 exit tests (#388).** These hold the removal to D8's table. A refused
 file must be left byte-identical, with no `.corrupt-*` file and no relabel.
@@ -813,8 +836,9 @@ content is the warning, for the users of one pre-Alpha upload.
   step after every refusal, and S1b pins each refusal on today's code, with
   the LOCAL fields present and absent.
 - **Unreachable LOCAL code between S2 and S3.** It still compiles and is
-  type-checked. S2's tests show that no entry point reaches it, and S3
-  deletes it. S2 and S3 should land close together.
+  type-checked, and the LOCAL tests that call it directly still run (A.2).
+  S2's tests show that no entry point reaches it, and S3 deletes it with
+  those tests. S2 and S3 should land close together.
 - **The protocol bump meets another persisted change.** The numbering rule
   already settles it: whichever merges second takes the next number.
 - **The order against the Public Alpha is undecided** (§5.2). Until it is
@@ -825,9 +849,19 @@ content is the warning, for the users of one pre-Alpha upload.
 
 ## 5. Related issues and the EPIC's order, read on 2026-10-30
 
-#384 asks for #155 and #255 to be reviewed, and for precise edits and
-dependency changes to be proposed on them. This section is that review,
-from each issue's current body, comments and native links.
+#384 asks for #155 and #255 to be reviewed, for the LOCAL-only edits to be
+applied to #155, and for a change to C7 to be proposed on #255 without
+changing any gate. This section is that review, from each issue's body,
+comments and native links as read on 2026-10-30, and the text of the edits
+and the proposal.
+
+**What this record does not evidence is that they were made.** Neither its
+text nor PR #406's description shows what #155 and #255 carry. The
+evidence is one comment on each issue that the controller reads back and
+verifies for PR #406: on #155, a note carrying §5.1's edits; on #255, the
+proposal comment already posted there (§5.2), bound as the evidence rather
+than posted a second time. Until both are verified, this part of #384 is
+unverified, not done.
 
 ### 5.1 #155: SDK provider parity
 
@@ -864,11 +898,12 @@ Everything else in #155 stays as written:
 - sandbox and credential isolation;
 - offline, deterministic CI.
 
-These edits are made in #155's body alongside this record, as an amendment
-that strikes each LOCAL line through and states its REMOTE form, so the
-original text stays readable. No dependency edge is added in either
-direction. D2 lets an SDK change refuse a LOCAL run instead of implementing
-it, so #155 need not wait for #383, and #383 need not wait for #155.
+These are the edits #384 asks to apply to #155. They go to #155 as an
+amendment note that lists each LOCAL line beside its REMOTE form, so that
+the original text stays readable; that note, verified on #155, is their
+evidence (§5). No dependency edge is added in either direction. D2 lets an
+SDK change refuse a LOCAL run instead of implementing it, so #155 need not
+wait for #383, and #383 need not wait for #155.
 
 One line of #155 predates protocols 7 to 12: "Protocol migration 5→next
 version and all older replan compatibility refusals retained". Read with
@@ -939,9 +974,10 @@ LOCAL run does not survive the removal. Without a fallback, option 2's
 cost is higher than it was under the earlier design. Option 3 is a
 proposal for #255, not a decision. Until the maintainer decides, neither
 EPIC gains a dependency on the other, and C7 stays as recorded. The
-proposal is
-[posted on #255](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6531809299)
-for that decision.
+proposal for that decision is
+[a comment on #255](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6531809299).
+It counts as made once the controller has verified that comment on #255
+(§5), and it is not posted again.
 
 ### 5.3 EPIC #383: steps, workstreams and dependencies
 
@@ -963,8 +999,8 @@ proposed.
 |---|---|---|
 | S1a | #386 (RET-A3) | Names the reader split (C1) and A.2.3's eight rows, H's two cases among them, each with its deletion prerequisite |
 | S1b | #385 (RET-A2) | Narrowed from a legacy-compatibility contract to REMOTE state pins and the generic-refusal audits. The mode refusal moves to #387 and the migration rule to #388 |
-| S2 | #387 (RET-A4) | Removes the public surface completely, with no stub. It gains the mode refusal, the probe's deletion and the scheduler skip's. The LOCAL prompt templates, ADR 0001's note and the instruction maps move to #388 |
-| S3 | #388 (RET-A5) | Deletes the unreachable runtime and evidence code, carries D8's bump and the #23 announcement, and keeps no legacy discriminator |
+| S2 | #387 (RET-A4) | Removes the public surface completely, with no stub. It gains the mode refusal, the probe's deletion and the scheduler skip's, and the retirement of every LOCAL test those closures break, with the test contracts' requirements for them (A.2.1, A.2.5), so that the suite passes at its last commit. The LOCAL prompt templates, ADR 0001's note and the instruction maps move to #388 |
+| S3 | #388 (RET-A5) | Deletes the unreachable runtime and evidence code with the unit tests that still call it, carries D8's bump and the #23 announcement, and keeps no legacy discriminator |
 | S4 | #389 (RET-A6) | Measures, verifies, audits the documents and installed package, reads back the native links, and prepares the release without making it |
 
 **#385 is narrowed, not merged into #388.** Its remaining work is pinning
@@ -979,7 +1015,7 @@ and it moves there.
 | #385 ← #384, #386 ← #384 | Yes | Yes | Yes | |
 | #385 ↔ #386 | No | None | No | Independent |
 | #387 ← #385 | Yes | Yes | Yes | The pins exist before the mode refusal lands |
-| #387 ← #386 | "Coordinate" | Hard | Yes | C1 before the `local:` key goes; G before the key and the subcommand go |
+| #387 ← #386 | "Coordinate" | Hard | Yes | C1 before the `local:` key goes; G before the key and the subcommand go; B's and C's replacements before S2 retires their LOCAL originals (A.2) |
 | #388 ← #385, #386, #387 | Yes | Yes | Yes | Nothing reachable is deleted, and no LOCAL-only security regression is deleted before its REMOTE replacement passes (A.2.3 H) |
 | #388's protocol bump ← #23 | No | Confirmed on #23 before the merge (D8) | No | A process gate, not an issue edge |
 | #389 ← #387, #388 | Yes | Yes | Yes | |
@@ -987,9 +1023,10 @@ and it moves there.
 | #255 and #383 | No; #383 names #255 as interacting work | Undecided (§5.2) | No | No edge until the maintainer decides |
 | #155 and #383 | No; #383 names #155 as interacting work | None (§5.1) | No | |
 
-The issue bodies of #383 to #389 are rewritten to this plan alongside this
-record. GitHub keeps each body as the authoritative copy, and the native
-links above are the ones the EPIC scheduler reads.
+GitHub keeps each issue body as the authoritative copy of that step's
+scope, and the native links above are the ones the EPIC scheduler reads.
+So a body that disagrees with this table is brought into line before its
+step starts, and S4 reads the native links back.
 
 ## Appendix A. Reference inventory
 
@@ -1123,35 +1160,267 @@ in scope. #405 added two of them since `4b03151`, one DELETE
 |---|---|---|
 | DELETE | 276 | Tests of LOCAL-only behaviour |
 | REPLACE | 46 | Shared coverage that today runs only through LOCAL (A.2.3) |
-| GENERIC STRICT REFUSAL | 12 | The earlier revision's LEGACY tests. Each asserted that a LOCAL artifact loads, is shown or is left alone. Each is rewritten to assert D3's and D4's generic refusal and an untouched file, or deleted where an S1b or S2 test covers the same case |
+| GENERIC STRICT REFUSAL | 12 | The earlier revision's LEGACY tests. Each asserted that a LOCAL artifact loads, is shown or is left alone. Each is rewritten in S2 to assert D3's and D4's generic refusal and an untouched file, or deleted where an S1b or S2 test covers the same case |
 | PRESERVE SHARED, edited | 55 | 49 drop a LOCAL row or parameter, 6 move out of a LOCAL-only module |
 | PRESERVE SHARED, untouched | 3,885 | |
 
+**Which step retires each.** S2 retires 160 of the 389, and S3 all the
+rest but two: `test_unknown_mode_fails_loudly`, which S2 extends with a
+`"LOCAL"` case, and the `test_run_namespace.py` test S1b keeps. Of S2's
+160, 122 are DELETE, 19 REPLACE (B 2, C 2, G 15), 10 GENERIC and 8
+PRESERVE edited; one, the correction-fence test, is split, its REMOTE half
+moving. A.2.1's last column counts them by module, and the list below names
+them.
+
+S2's share was measured, not read off the classes. A prototype of S2's
+closures was applied to an export of `02ce244`, deleting no LOCAL code: the
+`local` subparser and its dispatch removed; `local` out of the top-level
+keys and its block no longer parsed; the loader refusing `mode: "LOCAL"`
+with today's unknown-mode message; the probe returning at once; the
+scheduler's LOCAL skip removed; README's "Local mode (no GitHub)" section,
+`docs/local-mode.md` and the example's `local:` block deleted. The full
+suite ran on the export with and without it, on Python 3.14.10 with
+`pytest -n 8`, on Appendix B's host, on 2026-10-30.
+
+- **147 functions (211 items) pass without the prototype and fail with
+  it**: 114 on the loader's refusal, the rest on the subcommand, the key,
+  the probe and README's text. A 148th, the live Pi api-key rehearsal,
+  fails on both, because the export is not a git checkout; with the
+  prototype it fails earlier, at `local doctor`.
+- **2 pass with it only because every LOCAL file is now refused**: the
+  fuzz module's illegal-state and random-corruption tests. With the refusal
+  changed to raise an exception no test expects, a second run of 25
+  modules (every module above with LOCAL state tests, and the replan and
+  scheduler-state modules) fails exactly these two. After S2 they assert
+  nothing about the loader.
+- **2 were skipped**, because that host cannot run the real-backend sandbox
+  tests: the two `test_sandbox_routing.py` tests that start a `required`
+  LOCAL run through `local run`. argparse refuses them at S2.
+- **8 go with the live Pi flow's LOCAL form**: the live test, the six
+  rehearsals that stop before the flow reaches LOCAL, and the check that
+  names the live test.
+
+The other 229 pass with the prototype. They call LOCAL code directly,
+through `make_local_engine`'s state in memory or as units of a module,
+never through an entry point S2 closes; `step` works on the state it holds
+and does not read it back. A's, E's, F's and H's originals are among them,
+so their deletion prerequisites stay with S3 (A.2.3). Two limits: the
+prototype is not S2's code, and a test added after `02ce244` is not in the
+list. S2's exit tests cover both by requiring the full suite to pass (D12).
+
+<details>
+<summary>The 160 functions S2 retires, by module</summary>
+
+Untagged entries are DELETE. `test_state.py`'s nine untagged entries are
+seven DELETE and two GENERIC, as A.2.1 counts them.
+
+- `test_cli.py` (3):
+  - `test_a_configured_scheduler_state_dir_is_refused_before_the_run_is_looked_for` (GENERIC)
+  - `test_an_enforced_run_refuses_a_config_file_in_a_providers_writable_directory` (PRESERVE)
+  - `test_local_run_refuses_a_state_dir_inside_the_scheduler_root` (GENERIC)
+- `test_config.py` (9):
+  - `test_a_non_mapping_local_block_is_refused` (GENERIC)
+  - `test_known_key_tables_name_real_fields` (PRESERVE)
+  - `test_local_block_rejects_unusable_values`
+  - `test_local_exclude_is_normalized_deduplicated_and_sorted`
+  - `test_local_validation_commands_have_the_same_bounds`
+  - `test_local_validation_commands_stay_argv_arrays`
+  - `test_non_mapping_sections_are_rejected_everywhere` (PRESERVE)
+  - `test_typos_from_the_issue_are_rejected` (PRESERVE)
+  - `test_unknown_keys_are_rejected_in_every_section` (GENERIC)
+- `test_doctor.py` (1):
+  - `test_local_doctor_checks_a_pi_reviewer`
+- `test_durable_run_contract.py` (22):
+  - `test_a_changed_snapshot_algorithm_refuses_the_resume`
+  - `test_a_configuration_changed_between_invocations_refuses_the_resume`
+  - `test_a_contract_rewritten_in_state_json_cannot_launder_a_policy_change`
+  - `test_a_correction_diagnostic_cannot_break_out_of_its_block` (split: REMOTE half moves)
+  - `test_a_legacy_local_state_without_a_contract_is_refused_not_filled_in` (GENERIC)
+  - `test_a_relocated_checkout_refuses_the_resume_on_both_roots`
+  - `test_a_state_file_copied_to_another_state_directory_refuses_the_resume`
+  - `test_an_exclusion_containing_a_comma_resumes_under_itself_and_refuses_its_split`
+  - `test_an_exclusion_that_matches_nothing_is_still_drift`
+  - `test_bootstrap_does_not_follow_a_link_at_the_state_directory_or_its_parent` (REPLACE C)
+  - `test_control_the_root_verifier_is_what_passes_from_a_subdirectory_too`
+  - `test_documented_limit_an_in_place_replacement_with_copied_contents_is_not_detectable` (REPLACE C)
+  - `test_every_command_that_binds_a_run_is_refused_by_the_gate` (GENERIC)
+  - `test_removing_an_exclusion_is_drift_too`
+  - `test_reproduction_a_resume_from_a_subdirectory_still_runs_the_root_verifier`
+  - `test_reproduction_an_exclusion_added_after_the_implementation_is_refused`
+  - `test_the_cwd_a_run_is_created_from_is_not_recorded_because_nothing_runs_from_it`
+  - `test_the_dry_run_plan_names_the_frozen_execution_directory`
+  - `test_the_fix_budget_is_the_recorded_one_not_the_current_one`
+  - `test_the_policy_change_is_refused_between_review_and_fix_as_well`
+  - `test_the_step_budget_is_the_recorded_one_not_the_current_one`
+  - `test_the_unchanged_invocation_resumes_and_finishes`
+- `test_epic_commands.py` (1):
+  - `test_local_mode_is_unaffected_by_scheduler_namespaces` (GENERIC)
+- `test_interaction.py` (1):
+  - `test_a_local_interaction_failure_keeps_the_launch_charge`
+- `test_live_pi.py` (1):
+  - `test_one_local_review_runs_on_the_operators_real_pi` (REPLACE G)
+- `test_live_pi_support.py` (15):
+  - `test_a_credential_of_the_other_type_fails_its_route` (REPLACE G)
+  - `test_a_forward_naming_an_unset_key_fails_step_2` (REPLACE G)
+  - `test_a_key_forwarded_on_purpose_is_named_reaches_the_launch_and_is_scanned_for` (REPLACE G)
+  - `test_a_missing_pi_fails_the_preconditions_and_launches_nothing` (REPLACE G)
+  - `test_a_model_error_on_the_api_key_route_is_the_providers_refusal` (REPLACE G)
+  - `test_a_model_pi_does_not_resolve_fails_the_preconditions` (REPLACE G)
+  - `test_a_new_session_entry_fails_the_side_effect_step` (REPLACE G)
+  - `test_a_provider_key_fails_step_2_is_not_unset_and_stops_before_any_launch` (REPLACE G)
+  - `test_a_provider_refusal_is_named_and_the_later_checks_still_run` (REPLACE G)
+  - `test_a_review_answer_without_a_valid_control_result_fails_step_4` (REPLACE G)
+  - `test_a_review_that_writes_into_the_tree_fails_twice_over` (REPLACE G)
+  - `test_an_auth_check_that_does_not_allow_the_api_key_route_stops_before_any_launch` (REPLACE G)
+  - `test_the_live_test_is_deselected_by_default_and_skips_without_its_variable` (PRESERVE)
+  - `test_the_smoke_flow_passes_on_the_api_key_route_against_a_fake_pi` (REPLACE G)
+  - `test_the_smoke_flow_passes_on_the_optional_oauth_route_against_a_fake_pi` (REPLACE G)
+- `test_local.py` (41):
+  - `test_a_checkpoint_from_another_phase_is_not_closed_by_a_clean_review`
+  - `test_a_correction_refused_at_its_template_is_not_charged_as_a_launch`
+  - `test_a_crash_between_corrections_resumes_under_the_remaining_bound`
+  - `test_a_failed_fix_validation_does_not_charge_a_fix_round`
+  - `test_a_failed_phase_is_re_invoked_against_its_original_baseline`
+  - `test_a_journal_refused_before_the_launch_is_not_charged_as_a_launch`
+  - `test_a_local_agent_failure_names_its_log_and_resume_command_but_no_worktree`
+  - `test_a_local_agent_message_is_bounded_before_it_reaches_state`
+  - `test_a_local_state_cannot_hold_a_github_only_phase`
+  - `test_a_local_transient_failure_is_not_relaunched`
+  - `test_a_malformed_result_is_not_corrected_while_a_process_its_launch_started_may_run`
+  - `test_a_planted_step_name_is_refused_before_the_launch_not_after_the_agent`
+  - `test_a_pre_launch_refusal_on_a_resumed_entry_keeps_the_earlier_charge`
+  - `test_a_profile_refused_before_the_launch_is_not_charged_as_a_launch`
+  - `test_a_resume_cannot_hide_the_implementation_behind_a_new_exclusion`
+  - `test_a_resume_that_widens_the_cost_bounds_is_refused_too`
+  - `test_a_reviewer_that_switches_branches_is_not_corrected`
+  - `test_a_run_directory_refused_before_the_launch_is_not_charged_as_a_launch`
+  - `test_a_run_directory_that_cannot_be_published_into_is_refused_before_the_launch`
+  - `test_a_state_file_with_a_malformed_pending_checkpoint_is_refused`
+  - `test_a_state_file_with_an_unknown_field_is_corruption` (REPLACE B)
+  - `test_a_template_refused_before_the_launch_is_not_charged_as_a_launch`
+  - `test_an_anchor_a_launch_moved_blocks_before_its_correction`
+  - `test_an_oversized_unresolved_rationale_never_reaches_the_block_reason`
+  - `test_cli_local_init_and_status`
+  - `test_cli_local_init_refuses_while_another_controller_holds_the_lock`
+  - `test_cli_local_run_dry_run_writes_nothing`
+  - `test_cli_local_run_refuses_a_dirty_tree`
+  - `test_cli_local_status_describes_a_journal_the_state_carries`
+  - `test_cli_local_status_hides_github_fields`
+  - `test_cli_local_status_redacts_the_block_reason`
+  - `test_correction_retries_are_charged_against_the_same_durable_bound`
+  - `test_fifty_unresolved_rationales_at_the_bound_produce_a_bounded_block_reason`
+  - `test_local_doctor_checks_only_the_reachable_providers`
+  - `test_local_doctor_requires_only_the_reachable_reviewer_profiles`
+  - `test_local_run_is_resumable_from_persisted_state`
+  - `test_pi_correction_retries_are_charged_as_scripted_ones_are`
+  - `test_the_existing_run_guard_names_the_subcommand_that_was_typed`
+  - `test_the_new_run_an_anchor_refusal_prints_continues_with_the_flags_given`
+  - `test_the_readme_no_github_promise_is_the_controllers_not_the_runs`
+  - `test_the_recorded_policy_is_canonical_not_the_operators_spelling`
+- `test_local_recovery_matrix.py` (22):
+  - `test_a_crash_after_the_agents_side_effect_does_not_demand_the_work_twice`
+  - `test_a_crash_after_the_transition_is_persisted_does_not_repeat_the_phase`
+  - `test_a_crash_after_validation_but_before_the_transition_is_persisted`
+  - `test_a_crash_at_validation_keeps_the_phase_unverified`
+  - `test_a_crash_before_a_clean_review_is_persisted_re_reviews`
+  - `test_a_crash_before_a_findings_review_is_persisted_does_not_charge_a_round`
+  - `test_a_crash_before_the_agent_ran_leaves_the_phase_to_be_done`
+  - `test_a_crash_on_the_launch_charge_is_a_launch_that_never_happened`
+  - `test_a_crash_window_used_to_commit_blocks_rather_than_resuming`
+  - `test_a_fix_round_is_not_charged_twice_by_a_crash`
+  - `test_a_foreign_file_the_agent_renamed_over_the_journal_receives_nothing`
+  - `test_a_journal_enlarged_by_the_agent_refuses_the_post_run_append_bounded`
+  - `test_a_reviewer_that_edits_the_tree_and_crashes_cannot_have_its_edit_reviewed`
+  - `test_a_reviewer_that_edits_the_tree_and_returns_is_refused_and_stays_refused`
+  - `test_a_timed_out_agent_that_enlarged_the_journal_keeps_its_checkpoint`
+  - `test_an_operator_edit_between_a_verified_phase_and_review_blocks_too`
+  - `test_an_oversized_event_journal_left_by_an_agent_is_refused_not_materialised`
+  - `test_every_crash_point_leaves_state_that_loads`
+  - `test_the_dry_run_plan_for_review_reports_an_unverified_tree`
+  - `test_the_implementation_file_the_dead_agent_wrote_is_never_reverted`
+  - `test_the_tree_moving_while_the_controller_was_dead_blocks_the_review`
+  - `test_validation_command_output_is_part_of_the_verified_tree`
+- `test_local_state_fuzz.py` (4):
+  - `test_a_round_trip_through_disk_preserves_every_field`
+  - `test_an_illegal_local_state_never_loads`
+  - `test_random_corruption_either_fails_or_is_legal` (REPLACE B)
+  - `test_the_baseline_state_loads`
+- `test_merge_certificate.py` (2):
+  - `test_local_a_certificate_names_only_the_workspace_its_round_reviewed`
+  - `test_local_fingerprint_drift_before_review_certifies_nothing`
+- `test_ownership.py` (1):
+  - `test_what_holds_nothing` (GENERIC)
+- `test_review_certificate.py` (4):
+  - `test_local_a_crash_before_the_done_write_leaves_no_certificate`
+  - `test_local_a_fix_round_certifies_the_new_workspace_only`
+  - `test_local_done_carries_a_certificate_of_the_reviewed_workspace`
+  - `test_local_done_is_never_entered_without_an_applicable_certificate`
+- `test_sandbox_pin.py` (1):
+  - `test_a_local_run_refuses_a_weaker_mode_unless_accepted`
+- `test_sandbox_routing.py` (2):
+  - `test_a_required_local_run_with_its_config_file_in_claudes_directory_launches_nothing`
+  - `test_a_required_local_run_with_its_config_file_in_the_root_launches_nothing`
+- `test_state.py` (12):
+  - `test_a_legacy_local_state_gets_no_launch_label`
+  - `test_a_local_run_carries_no_acceptance_state`
+  - `test_a_local_run_carries_no_operator_state`
+  - `test_a_local_run_carrying_a_recorded_configuration_is_refused`
+  - `test_a_local_run_carrying_any_effect_state_is_refused`
+  - `test_a_local_run_refuses_a_remote_record`
+  - `test_a_local_run_with_empty_effect_fields_loads`
+  - `test_a_malformed_sandbox_pin_is_refused_never_read_as_unpinned` (PRESERVE)
+  - `test_a_protocol_10_local_file_loads_and_is_relabelled`
+  - `test_a_protocol_11_file_loads_unpinned_and_is_relabelled` (PRESERVE)
+  - `test_a_protocol_7_local_file_missing_an_effect_field_is_refused`
+  - `test_a_sandbox_pin_round_trips_under_the_current_protocol` (PRESERVE)
+- `test_validation_evidence.py` (8):
+  - `test_a_changed_local_validation_command_is_refused_before_anything_runs`
+  - `test_a_failing_local_validation_is_a_fail_record_and_the_message_is_unchanged`
+  - `test_a_failing_local_validation_whose_tree_cannot_be_walked_keeps_its_message`
+  - `test_a_local_contract_beyond_the_bounds_blocks_before_the_agent`
+  - `test_a_local_validation_leaves_records_with_start_and_end_fingerprints`
+  - `test_a_marker_is_recorded_before_a_plan_that_refuses_the_working_tree`
+  - `test_an_interrupted_local_validation_is_recorded_on_resume_and_rerun`
+  - `test_the_local_review_binding_passes_with_validation_records`
+- `test_validation_gates.py` (10):
+  - `test_local_a_changed_contract_at_review_entry_is_refused_before_anything_runs`
+  - `test_local_a_failure_is_final_only_for_the_tree_it_ran_on`
+  - `test_local_a_fix_binds_the_next_review_to_new_evidence`
+  - `test_local_a_legacy_review_with_no_evidence_blocks_without_validating`
+  - `test_local_a_non_idempotent_validator_is_not_verified_then_blocks`
+  - `test_local_a_validator_writing_an_excluded_path_converges_without_a_rerun`
+  - `test_local_an_idempotent_generator_converges_with_one_confirming_run`
+  - `test_local_an_unchanged_tree_with_a_failure_is_not_validated_again`
+  - `test_local_review_needs_evidence_for_the_bound_fingerprint_itself`
+  - `test_local_runs_make_no_github_call`
+
+</details>
+
 #### A.2.1 By module
 
-| Module | Functions | In scope | Class |
-|---|---|---|---|
-| `test_local.py` | 117 | 117 | DELETE 107; REPLACE 8 (A.2.3 A, B, H); move 1 (`test_saved_state_without_a_mode_field_loads_as_remote`); GENERIC 1 (`test_unknown_mode_fails_loudly`, which gains a `"LOCAL"` case) |
-| `test_local_recovery_matrix.py` | 24 | 24 | DELETE (journal cases covered in `test_runlog.py` and REMOTE `test_engine.py`) |
-| `test_local_red_team.py` | 21 | 21 | DELETE (the artifact-name case is covered in `test_runlog.py`; the state-directory replacement partly in `test_state.py`, the rest in A.2.3 C) |
-| `test_local_state_fuzz.py` | 6 | 6 | DELETE 4; REPLACE 2 (A.2.3 B) |
-| `test_local_workspace_matrix.py` | 9 | 9 | DELETE |
-| `test_durable_run_contract.py` | 43 | 43 | DELETE 30; REPLACE 6 (A.2.3 C, D); move 5 (two AST guards on state access, the `link(2)` publication test, the REMOTE worktree test, the REMOTE half of a correction-fence test); GENERIC 2 |
-| `test_live_pi.py`, `test_live_pi_support.py` | 1, 28 | 1, 15 | REPLACE 15 (A.2.3 G); 13 checks of the support module are mode-free |
-| `test_doctor_sandbox.py` | 18 | 14 | REPLACE 12 (A.2.3 E); DELETE 1; PRESERVE 1 |
-| `test_sandbox_routing.py` | 21 | 8 | DELETE 6; REPLACE 2 (A.2.3 E, F) |
-| `test_sandbox_policy.py` | 54 | 3 | DELETE 2; REPLACE 1 (A.2.3 F) |
-| `test_state.py` | 160 | 12 | DELETE 7; GENERIC 2; PRESERVE 3 (drop the `local` id) |
-| `test_config.py` | 142 | 14 | DELETE 6; PRESERVE 6; GENERIC 2 (the `local` row of the unknown-key test, now expecting a refusal; the non-mapping `local:` block) |
-| `test_certificate.py`, `test_validation_evidence.py`, `test_validation_gates.py`, `test_review_certificate.py`, `test_merge_certificate.py` | 40, 37, 44, 20, 29 | 9, 9, 10, 4, 2 | DELETE (each has REMOTE sections) |
-| `test_evidence.py`, `test_result_parser.py`, `test_transitions.py` | 77, 134, 19 | 10, 15, 5 | DELETE 5, 4, 2; PRESERVE the rest (drop LOCAL parametrizations) |
-| `test_sandbox_gate.py`, `test_sandbox_pin.py`, `test_config_fingerprint.py` | 12, 15, 35 | 5, 4, 2 | DELETE 5, 2, 2; PRESERVE 2 in `test_sandbox_pin.py` |
-| `test_cli.py`, `test_ownership.py`, `test_epic_commands.py`, `test_run_namespace.py` | 119, 16, 32, 45 | 3, 1, 1, 1 | GENERIC 2, 1, 1, 1 (`test_run_namespace.py`'s is `test_legacy_standalone_state_is_never_read_moved_or_modified`, which S1b keeps); PRESERVE 1 in `test_cli.py` |
-| `test_doctor.py`, `test_prompts.py`, `test_routing.py`, `test_sandbox_parity.py` | 122, 53, 5, 1 | 4, 12, 1, 1 | DELETE 2 in `test_doctor.py`; PRESERVE the rest (drop the LOCAL row, template or profile) |
-| `test_sdk_policy.py`, `test_interaction.py`, `test_unblock.py` | 46, 73, 39 | 1 each | DELETE |
-| `test_safefs.py` | 49 | 0 | PRESERVE. Introduced with LOCAL, uses none of it |
-| `test_engine.py`, `test_lock_domains.py` | 557, 39 | 0 | PRESERVE; they import `StatusEntry` and `GIT_TIMEOUT_SECONDS` from `local_workspace` (C1) |
-| The other 46 modules | 1,972 | 0 | PRESERVE |
+| Module | Functions | In scope | Class | Retired in S2 |
+|---|---|---|---|---|
+| `test_local.py` | 117 | 117 | DELETE 107; REPLACE 8 (A.2.3 A, B, H); move 1 (`test_saved_state_without_a_mode_field_loads_as_remote`); GENERIC 1 (`test_unknown_mode_fails_loudly`, which gains a `"LOCAL"` case) | 41: DELETE 40, REPLACE 1 (B). The GENERIC test gains its case |
+| `test_local_recovery_matrix.py` | 24 | 24 | DELETE (journal cases covered in `test_runlog.py` and REMOTE `test_engine.py`) | 22 |
+| `test_local_red_team.py` | 21 | 21 | DELETE (the artifact-name case is covered in `test_runlog.py`; the state-directory replacement partly in `test_state.py`, the rest in A.2.3 C) | None |
+| `test_local_state_fuzz.py` | 6 | 6 | DELETE 4; REPLACE 2 (A.2.3 B) | 4: DELETE 3, REPLACE 1 (B's random-corruption test) |
+| `test_local_workspace_matrix.py` | 9 | 9 | DELETE | None |
+| `test_durable_run_contract.py` | 43 | 43 | DELETE 30; REPLACE 6 (A.2.3 C, D); move 5 (two AST guards on state access, the `link(2)` publication test, the REMOTE worktree test, the REMOTE half of a correction-fence test); GENERIC 2 | 22: DELETE 17, REPLACE 2 (C), GENERIC 2, and the correction-fence test, split |
+| `test_live_pi.py`, `test_live_pi_support.py` | 1, 28 | 1, 15 | REPLACE 15 (A.2.3 G); 13 checks of the support module are mode-free | All 16: the LOCAL flow goes in S2 |
+| `test_doctor_sandbox.py` | 18 | 14 | REPLACE 12 (A.2.3 E); DELETE 1; PRESERVE 1 | None |
+| `test_sandbox_routing.py` | 21 | 8 | DELETE 6; REPLACE 2 (A.2.3 E, F) | 2: DELETE (the two started through `local run`) |
+| `test_sandbox_policy.py` | 54 | 3 | DELETE 2; REPLACE 1 (A.2.3 F) | None |
+| `test_state.py` | 160 | 12 | DELETE 7; GENERIC 2; PRESERVE 3 (drop the `local` id) | All 12 |
+| `test_config.py` | 142 | 14 | DELETE 6; PRESERVE 6; GENERIC 2 (the `local` row of the unknown-key test, now expecting a refusal; the non-mapping `local:` block) | 9: DELETE 4, PRESERVE 3, GENERIC 2 |
+| `test_certificate.py`, `test_validation_evidence.py`, `test_validation_gates.py`, `test_review_certificate.py`, `test_merge_certificate.py` | 40, 37, 44, 20, 29 | 9, 9, 10, 4, 2 | DELETE (each has REMOTE sections) | 0, 8, 10, 4, 2 |
+| `test_evidence.py`, `test_result_parser.py`, `test_transitions.py` | 77, 134, 19 | 10, 15, 5 | DELETE 5, 4, 2; PRESERVE the rest (drop LOCAL parametrizations) | None |
+| `test_sandbox_gate.py`, `test_sandbox_pin.py`, `test_config_fingerprint.py` | 12, 15, 35 | 5, 4, 2 | DELETE 5, 2, 2; PRESERVE 2 in `test_sandbox_pin.py` | 1 DELETE in `test_sandbox_pin.py` |
+| `test_cli.py`, `test_ownership.py`, `test_epic_commands.py`, `test_run_namespace.py` | 119, 16, 32, 45 | 3, 1, 1, 1 | GENERIC 2, 1, 1, 1 (`test_run_namespace.py`'s is `test_legacy_standalone_state_is_never_read_moved_or_modified`, which S1b keeps); PRESERVE 1 in `test_cli.py` | All but `test_run_namespace.py`'s: 3, 1, 1 |
+| `test_doctor.py`, `test_prompts.py`, `test_routing.py`, `test_sandbox_parity.py` | 122, 53, 5, 1 | 4, 12, 1, 1 | DELETE 2 in `test_doctor.py`; PRESERVE the rest (drop the LOCAL row, template or profile) | 1 DELETE in `test_doctor.py` |
+| `test_sdk_policy.py`, `test_interaction.py`, `test_unblock.py` | 46, 73, 39 | 1 each | DELETE | `test_interaction.py`'s |
+| `test_safefs.py` | 49 | 0 | PRESERVE. Introduced with LOCAL, uses none of it | |
+| `test_engine.py`, `test_lock_domains.py` | 557, 39 | 0 | PRESERVE; they import `StatusEntry` and `GIT_TIMEOUT_SECONDS` from `local_workspace` (C1) | |
+| The other 46 modules | 1,972 | 0 | PRESERVE | |
 
 #### A.2.2 Fixtures and helpers
 
@@ -1181,13 +1450,17 @@ in scope. #405 added two of them since `4b03151`, one DELETE
   rendered note (`test_engine.py`). They move with the git plumbing (C1).
 - **B. The state loader** (3): the unknown-field refusal (`test_local.py`),
   the only fuzz test of the loader and the non-object JSON roots
-  (`test_local_state_fuzz.py`). They become REMOTE state tests.
+  (`test_local_state_fuzz.py`). They become REMOTE state tests. S2 retires
+  the unknown-field and random-corruption originals (A.2), so these
+  replacements pass on `main` before S2.
 - **C. The state root under a running engine** (5,
   `test_durable_run_contract.py`): a state directory replaced mid-run, a
   `state.json` replaced by a symbolic link or hard-linked elsewhere, the
   documented undetectable in-place copy, a link at the state directory or
   its parent at bootstrap. `test_state.py` covers only rename-aside and a
-  symbolic link at `state_root()`.
+  symbolic link at `state_root()`. S2 retires the bootstrap and in-place
+  copy originals, which load a LOCAL state from disk (A.2), so these
+  replacements pass on `main` before S2.
 - **D. Findings fencing** (1): finding text cannot break out of the
   findings block, which `_format_findings` renders for REMOTE `FIX` and
   `REVIEW` too.
@@ -1239,23 +1512,24 @@ in scope. #405 added two of them since `4b03151`, one DELETE
 
 #### A.2.4 Shared safety and its preservation owner
 
-Each shared invariant a LOCAL test protects today has an owner who keeps it
-protected before S3 deletes that test.
+Each shared invariant a LOCAL test protects today has an owner, who
+protects it another way before the step that retires that test (S2 or S3,
+A.2).
 
 | Invariant | Protected only through LOCAL today | Owner and prerequisite |
 |---|---|---|
 | A credential helper never reaches a validation command | H-A | #386 (S1a), the mutation-checked REMOTE test |
 | A login-shell startup file never changes a validation command's isolation | H-B | #386 (S1a), the same |
 | Git reads take no optional lock, no fsmonitor and no credential | A | #386: the tests move with the reader (C1) |
-| The state loader refuses unknown fields and non-object roots, and survives fuzzing | B | #386: REMOTE state tests |
-| The state root holds under a running engine (replaced directory, links, bootstrap) | C | #386: REMOTE or neutral tests |
+| The state loader refuses unknown fields and non-object roots, and survives fuzzing | B | #386: REMOTE state tests, passing before S2 |
+| The state root holds under a running engine (replaced directory, links, bootstrap) | C | #386: REMOTE or neutral tests, passing before S2 |
 | Finding text cannot break out of its block | D | #386 |
 | `doctor`'s sandbox rows are right | E | #386: REMOTE rows |
 | Launch-class declarations stay read-only, and a provider cannot rewrite its `--config` | F | #386, on a REMOTE class; the real-backend test runs where a host can enforce |
-| A live model run through the real CLI | G | #386: the REMOTE flow and its offline rehearsals |
+| A live model run through the real CLI | G | #386: the REMOTE flow and its offline rehearsals, passing before S2 |
 | Sandbox pinning and enforcement | `test_sandbox_pin.py`'s and `test_sandbox_gate.py`'s LOCAL rows | PRESERVE: their REMOTE rows stay. Apart from E and F above, no REMOTE sandbox test depends on LOCAL |
 | Candidate validation, evidence and certificate binding | None: each module has REMOTE sections | PRESERVE. S3 adds the refusal of LOCAL kinds in a REMOTE file |
-| Crash recovery | `test_local_recovery_matrix.py`'s journal cases | PRESERVE: `test_runlog.py` and REMOTE `test_engine.py` cover them; #386 confirms each case before S3 |
+| Crash recovery | `test_local_recovery_matrix.py`'s journal cases | PRESERVE: `test_runlog.py` and REMOTE `test_engine.py` cover them; #386 confirms each case before S2, which retires 22 of the 24 |
 | Provider interaction and launch accounting | LOCAL's three-launch bound and `LocalBinding` | Nothing shared: REMOTE's bounds have their own tests, and #155's REMOTE forms (§5.1) |
 | Scheduler state ownership | The LOCAL skip and the LOCAL namespace mismatch | #385 (S1b): the generic tests of D4 |
 | REMOTE state refusals under the drop step | None, but the drop step could weaken them | #385 (S1b) pins them; #388 (S3) keeps them |
@@ -1269,10 +1543,33 @@ as required. In `tests/AGENTS.md` that is the LOCAL fixtures, the
 LOCAL" in the sandbox-pin, evidence, gate and certificate rows, and the
 live Pi row. In `testing.md` it is the state, CONTROL_RESULT, execution,
 outer sandbox and launch routing, credential, parity, live Pi, SDK,
-interaction and epic requirements. S3 removes those requirements, and adds
-D4's and D5's generic refusals as required coverage: a `mode: "LOCAL"`
-state refused with nothing written, a `local:` key refused, `autoforge
-local` rejected, and no probe of LOCAL's location.
+interaction and epic requirements.
+
+A requirement leaves the contracts in the step that retires its last test,
+so that they never require coverage the suite no longer has. One that S2
+empties only in part is narrowed in S2 to what is left.
+
+- **S2** removes what its retirements empty (A.2). In `tests/AGENTS.md`:
+  the gate row's "LOCAL convergence", the certificate row's "LOCAL `DONE`
+  writes", "LOCAL" among the epic commands' cases, and the live Pi row's
+  LOCAL flow. In `testing.md`: the effect, acceptance, operator-action and
+  recorded-configuration requirements on a LOCAL state; LOCAL validation
+  records and `local.validation_commands`; the gates' LOCAL convergence;
+  LOCAL `DONE`'s certificate and LOCAL fingerprint drift at the merge gate;
+  `local run`'s refusal of a state directory inside the scheduler root and
+  "LOCAL unaffected" among the standalone guards, both now D4's refusal;
+  the interaction requirement's LOCAL launch charge; `local doctor`; and
+  the live Pi flow. S2 adds D4's and D5's generic refusals as required
+  coverage, in the PR that brings them: a `mode: "LOCAL"` state refused
+  with nothing written, a `local:` key refused, `autoforge local` rejected,
+  and no probe of LOCAL's location.
+- **S3** removes the rest as it deletes the code those tests call: the
+  LOCAL fixtures, the `test_local*.py` and `test_durable_run_contract.py`
+  rows, and "REMOTE and LOCAL" in the sandbox-pin and evidence rows of
+  `tests/AGENTS.md`; in `testing.md`, the CONTROL_RESULT requirements (the
+  LOCAL refusals of `acceptance_action` and `operator_acceptance` among
+  them), execution, outer sandbox and launch routing, credential (H), Pi
+  parity, SDK, and the certificate's LOCAL fingerprint and contract fields.
 
 ### A.3 Documents, configuration, CI and release artifacts
 
@@ -1295,8 +1592,8 @@ for documents #405 did not change.
 | `docs/agent-guides/control-result-protocol.md` (S3) | the LOCAL REVIEW and FIX protocol | "REMOTE and LOCAL alike" and the other LOCAL asides | |
 | `docs/agent-guides/workflow.md` (S3) | the LOCAL gate bullet and the three-launch bound | the LOCAL topology, `REVIEW → DONE`, the unblock edge, certificate, pin, relaunch | |
 | `docs/agent-guides/state-and-recovery.md` (S3) | | persistent state, validation evidence, locking, runtime artifacts, namespaces, error handling; N + 1's migration rule added | the protocol history (:482) |
-| `docs/agent-guides/github-safety.md`, `testing.md`, `replan-transaction.md`, `secrets-and-logging.md` (S3) | "LOCAL prompts" (`github-safety.md` :1265–1266); "LOCAL on Pi" parity (`testing.md`) | the rest (A.2.5 for `testing.md`) | |
-| `AGENTS.md`, `src/autoforge/AGENTS.md`, `tests/AGENTS.md` (S3) | the `local-mode.md` map line; `run_contract.py`, `local_workspace.py`; the LOCAL fixtures and test rows; this record's LOCAL routing rule | `preferred` in the isolation terms (:56–66); the ADR map line; the module map; the LOCAL production rule (:184–189), keeping its `safefs.py` pointer to ADR 0001 §5.4 | |
+| `docs/agent-guides/github-safety.md`, `testing.md`, `replan-transaction.md`, `secrets-and-logging.md` (S3; `testing.md` in S2 and S3, A.2.5) | "LOCAL prompts" (`github-safety.md` :1265–1266); "LOCAL on Pi" parity (`testing.md`) | the rest (A.2.5 for `testing.md`) | |
+| `AGENTS.md`, `src/autoforge/AGENTS.md`, `tests/AGENTS.md` (S3; `tests/AGENTS.md` in S2 and S3, A.2.5) | the `local-mode.md` map line; `run_contract.py`, `local_workspace.py`; the LOCAL fixtures and test rows; this record's LOCAL routing rule | `preferred` in the isolation terms (:56–66); the ADR map line; the module map; the LOCAL production rule (:184–189), keeping its `safefs.py` pointer to ADR 0001 §5.4 | |
 | `autoforge.example.yaml` (S2) | the `local:` block (:506–598) | `execution`, `scheduler` and `sandbox` comments | |
 | `CHANGELOG.md` (S2, S3) | | | the LOCAL lines of #395, #302, #280, #256 and the Pi entry; the removal entry (D10) is new |
 | `.github/workflows/ci.yml` (S2) | | the `dist` job's comment (:109–121), which already omits the REMOTE dry run | |
