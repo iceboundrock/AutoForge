@@ -5,6 +5,23 @@ so.
 
 ## Unreleased
 
+### A `prompt_version` other than the controller's own is refused (#302)
+
+- `autoforge.example.yaml` set `prompt_version: v1`, and the controller
+  records that key as the run's prompt version, so a config copied from it
+  made every run's state file, run logs and prompt headers say `v1` while
+  the controller rendered its current templates (`v12`). The key never
+  selected templates. The example no longer sets it, and a value other
+  than the controller's built-in label is now a load error naming that
+  label. The error quotes the configured value only when it is shaped like
+  a label (`v1`); anything else is named by its type, never repeated.
+- If your config has `prompt_version: v1`, every command, `doctor`
+  included, refuses it until you delete the line. A run created under that
+  line keeps `v1` as its recorded version: a REMOTE one resumes and goes on
+  saying `v1`, as every REMOTE run keeps its creation-time label across an
+  upgrade; a LOCAL one refuses to resume once the line is gone, since its
+  contract recorded `v1`, so start it again. Nothing changes a default.
+
 ### Claude Code's Bash tool keeps the launch's `PATH` in a login shell (#347)
 
 - When Claude Code has no shell snapshot (writing one failed), it runs

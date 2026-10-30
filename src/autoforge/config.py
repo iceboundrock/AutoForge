@@ -1274,6 +1274,57 @@ def _merge_loop_detection(loop: LoopDetectionConfig, exe: dict, source: str) -> 
             setattr(loop, key, value)
 
 
+# The shape of a prompt label (``__prompt_version__``, the example's old
+# ``v1``): the only refused ``prompt_version`` the error quotes back.
+_PROMPT_LABEL_RE = re.compile(r"v[0-9]{1,6}")
+
+# What a refused ``prompt_version`` that is not a string is called instead.
+_VALUE_KINDS: dict[type, str] = {
+    type(None): "null",
+    bool: "a boolean",
+    int: "an integer",
+    float: "a number",
+    dict: "a mapping",
+    list: "a list",
+}
+
+
+def _prompt_version(raw: object, source: str) -> str:
+    """The configured ``prompt_version``: the built-in label, or ConfigurationError.
+
+    The key selects nothing. The controller renders its own templates
+    whatever it says, and records it as the run's prompt version in the
+    state file, the run logs, every prompt header and a LOCAL run's
+    contract. Another value would make all of those name templates that
+    were not rendered, and would hide a template change across an upgrade
+    from the LOCAL contract gate, which compares this label (#302).
+
+    The refusal quotes a value only when it is shaped like a label. Any
+    other string, and every other type, is named and never repeated: a
+    mis-indented line can put anything under the key, a password ``redact``
+    does not recognise included.
+    """
+    if isinstance(raw, str) and raw == __prompt_version__:
+        return raw
+    if isinstance(raw, str) and _PROMPT_LABEL_RE.fullmatch(raw):
+        found = repr(raw)
+    else:
+        if isinstance(raw, str):
+            kind = "a string"
+        else:
+            kind = _VALUE_KINDS.get(type(raw), f"a {type(raw).__name__}")
+        found = (
+            f"{kind} (not repeated here: only a value shaped like a prompt label, "
+            "'v' and a number, is)"
+        )
+    raise ConfigurationError(
+        f"{source}: 'prompt_version' is {found}, but this controller's prompt templates "
+        f"are {__prompt_version__!r}. The key does not select templates; it only labels "
+        "the ones rendered in the state file, the run logs and every prompt, so another "
+        "value records the wrong version. Remove the key: the built-in version then applies"
+    )
+
+
 def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeConfig:
     _reject_unknown_keys(data, TOP_LEVEL_KEYS, source, "the top level")
     version = data.get("version", CONFIG_VERSION)
@@ -1284,7 +1335,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     if "state_dir" in data:
         base.state_dir = str(data["state_dir"])
     if "prompt_version" in data:
-        base.prompt_version = str(data["prompt_version"])
+        base.prompt_version = _prompt_version(data["prompt_version"], source)
     exe = _section(data, "execution", source, EXECUTION_KEYS, removed=REMOVED_EXECUTION_KEYS)
     # The executor treats a non-positive wall-clock timeout as "no timeout at
     # all", and an unbounded subprocess would hold the repository lock

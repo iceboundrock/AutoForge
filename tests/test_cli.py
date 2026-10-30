@@ -1118,6 +1118,47 @@ def test_doctor_with_fake_runner(tmp_path, capsys, monkeypatch):
     assert not rules["ok"] and rules["required"] and not rules["skipped"]
 
 
+def test_a_refused_prompt_version_prints_nothing_written_under_it(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#302 R1-F1: a mis-indented line puts a password under `prompt_version`,
+    and a mistyped scalar can be one. Redaction does not recognise this one,
+    so the refusal every command prints, and doctor's config row in both
+    output modes, name the value's type and never its contents."""
+    monkeypatch.chdir(tmp_path)
+    passphrase = "correct horse battery staple"
+    assert passphrase in redact(repr({"password": passphrase}))  # only not quoting it helps
+
+    def runner(req):
+        return ExecutionResult(req.command, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    sd = str(tmp_path / ".autoforge")
+    path = tmp_path / "autoforge.yaml"
+    run = ["run", "--epic", EPIC, "--issue", ISSUE, "--dry-run"]
+    for text, kind in (
+        (f"prompt_version:\n  password: {passphrase}\n", "a mapping"),
+        (f"prompt_version: {passphrase}\n", "a string"),
+    ):
+        path.write_text(f"version: 1\n{text}", encoding="utf-8")
+        refusal = f"{path}: 'prompt_version' is {kind} (not repeated here"
+        for command in (["status"], run):
+            assert cli.main(["--config", str(path), "--state-dir", sd, *command]) == 2
+            out = capsys.readouterr()
+            assert f"autoforge: error: {refusal}" in out.err
+            assert "correct horse" not in out.out + out.err
+        assert cli.main(["--config", str(path), "--state-dir", sd, "doctor"]) == 1
+        out = capsys.readouterr()
+        assert f"[FAIL] config: {refusal}" in out.out
+        assert "correct horse" not in out.out + out.err
+        assert cli.main(["--config", str(path), "--state-dir", sd, "doctor", "--json"]) == 1
+        out = capsys.readouterr()
+        row = next(c for c in json.loads(out.out)["checks"] if c["name"] == "config")
+        assert not row["ok"] and row["detail"].startswith(refusal)
+        assert "correct horse" not in out.out + out.err
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+
+
 def test_doctor_reports_an_unreadable_branch_rule_as_skipped(tmp_path, capsys, monkeypatch):
     """Issue #41: a token that cannot read rulesets is SKIP, and doctor still exits 0."""
     monkeypatch.chdir(tmp_path)

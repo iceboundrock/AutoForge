@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from autoforge import config
+from autoforge import __prompt_version__, config
 from autoforge.child_env import FORBIDDEN_ENV_NAMES, FORBIDDEN_ENV_PREFIXES, forbidden_env_entry
 from autoforge.config import default_config, load_config_file, validate_required_profiles
 from autoforge.errors import ConfigurationError
@@ -120,6 +120,98 @@ def test_example_yaml_loads_without_pyyaml(tmp_path, no_pyyaml):
     assert cfg.safety.allow_merge is False
     assert cfg.merge_allowed_by_config is False
     assert cfg.execution.max_correction_attempts == 1
+
+
+def test_the_example_yaml_leaves_the_prompt_version_built_in(yaml_backend):
+    """#302: the example set `prompt_version: v1`, so every run started from
+    a copy of it recorded v1 while the controller rendered its current
+    templates. The example sets no value, not even the current label, which
+    the next template bump would leave behind."""
+    import autoforge
+
+    example = Path(autoforge.__file__).parents[2] / "autoforge.example.yaml"
+    assert load_config_file(example).prompt_version == __prompt_version__
+    assert not re.search(r"(?m)^\s*prompt_version\s*:", example.read_text(encoding="utf-8"))
+
+
+# Near misses of the built-in label included: the comparison is exact, so a
+# value is either the label or refused, never normalised into it. Each with
+# what the refusal says it is: only a label's shape is quoted back.
+OTHER_PROMPT_VERSIONS = [
+    ("v1", "'v1'"),
+    ("v0", "'v0'"),
+    (__prompt_version__.upper(), "a string"),
+    (f"{__prompt_version__} ", "a string"),
+    ("", "a string"),
+    (12, "an integer"),
+    (True, "a boolean"),
+    (1.5, "a number"),
+    (None, "null"),
+    ([__prompt_version__], "a list"),
+    ({"version": __prompt_version__}, "a mapping"),
+]
+
+
+@pytest.mark.parametrize(("value", "shown"), OTHER_PROMPT_VERSIONS, ids=repr)
+def test_a_prompt_version_other_than_the_built_in_label_is_refused(tmp_path, value, shown):
+    """#302: the key selects no templates, so any other value would make the
+    state file, the run logs, every prompt and a LOCAL run's contract name
+    templates that were not rendered."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "prompt_version": value}), encoding="utf-8")
+    with pytest.raises(ConfigurationError) as exc:
+        load_config_file(p)
+    message = str(exc.value)
+    assert f"'prompt_version' is {shown}" in message
+    if shown != repr(value):
+        assert "(not repeated here: only a value shaped like a prompt label" in message
+        assert f"'prompt_version' is {value!r}" not in message
+    assert f"prompt templates are {__prompt_version__!r}" in message
+    assert "Remove the key" in message
+
+
+# A passphrase no redaction pattern recognises: only an error that does not
+# quote it keeps it out of the output.
+PASSPHRASE = "correct horse battery staple"
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        (f"prompt_version:\n  password: {PASSPHRASE}\n", "a mapping"),
+        (f"prompt_version:\n  - {PASSPHRASE}\n", "a list"),
+        (f"prompt_version: {PASSPHRASE}\n", "a string"),
+    ],
+    ids=["mapping", "list", "scalar"],
+)
+def test_a_refused_prompt_version_never_repeats_what_was_written_under_it(
+    tmp_path, yaml_backend, text, kind
+):
+    """#302 R1-F1: an indentation mistake puts the next lines, a password
+    included, under `prompt_version`, and a mistyped scalar can be one too.
+    The refusal names the value's type on both YAML backends, never its
+    contents."""
+    p = tmp_path / "autoforge.yaml"
+    p.write_text(f"version: 1\n{text}", encoding="utf-8")
+    with pytest.raises(ConfigurationError) as exc:
+        load_config_file(p)
+    message = str(exc.value)
+    assert f"'prompt_version' is {kind} (not repeated here" in message
+    assert "correct horse" not in message and "password" not in message
+
+
+def test_the_copied_example_line_is_refused_on_both_yaml_backends(tmp_path, yaml_backend):
+    """The line every config copied from the example before #302 carries."""
+    p = tmp_path / "autoforge.yaml"
+    p.write_text("version: 1\nstate_dir: .autoforge\n\nprompt_version: v1\n", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=r"'prompt_version' is 'v1'.*Remove the key"):
+        load_config_file(p)
+
+
+def test_a_prompt_version_repeating_the_built_in_label_loads(tmp_path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"version": 1, "prompt_version": __prompt_version__}), encoding="utf-8")
+    assert load_config_file(p).prompt_version == __prompt_version__
 
 
 def test_json_config_overrides_model(tmp_path):

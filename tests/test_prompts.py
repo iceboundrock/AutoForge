@@ -797,6 +797,36 @@ def test_prompt_version_is_rendered_and_was_bumped_for_the_prompt_changes(engine
     assert rendered.startswith(header)
 
 
+def test_runs_from_the_example_config_record_and_render_the_built_in_version(
+    tmp_state_dir, fake_github, tmp_path
+):
+    """#302: the Quick start copies autoforge.example.yaml, which set
+    `prompt_version: v1`; every run from it said v1 in its state, its logs,
+    its prompts and (LOCAL) its contract, while rendering newer templates."""
+    from pathlib import Path
+
+    import autoforge
+    from autoforge import __prompt_version__
+    from autoforge.config import load_config_file
+    from tests.conftest import commit_all, git_repo, make_engine, make_local_engine, write_feature
+
+    cfg = load_config_file(Path(autoforge.__file__).parents[2] / "autoforge.example.yaml")
+    header = f"# AutoForge controller instructions (trusted): {__prompt_version__}\n"
+
+    remote = make_engine(tmp_state_dir, [], github=fake_github, cfg=cfg)
+    assert remote.state.prompt_version == __prompt_version__
+    remote.state.phase = Phase.ANALYZE_EXECUTE
+    assert remote.render_prompt_for(Phase.ANALYZE_EXECUTE).startswith(header)
+
+    root = git_repo(tmp_path / "local")
+    write_feature(root)
+    commit_all(root, "spec")
+    local = make_local_engine(root, "features/add-filter.md", cfg=cfg)
+    assert local.state.prompt_version == __prompt_version__
+    assert local.state.local_run_contract["prompt_version"] == __prompt_version__
+    assert local.render_prompt_for(Phase.ANALYZE_EXECUTE).startswith(header)
+
+
 REMOTE_TEMPLATES = (
     "common.md",
     "analyze_execute.md",
