@@ -137,15 +137,19 @@ Then, in order, all from one persisted plan:
    (make the planned branch the default again, then `unblock`). The push
    is driven, then the PR record. An adopted PR is written to only once
    GitHub shows it onto the default branch and headed at the candidate: a
-   head still at the branch's old value is GitHub catching up (transient),
-   any other head or base blocks.
+   head still at the branch's old value is GitHub catching up, read again
+   within the step ("GitHub catching up with a push" below) and
+   transient once that wait is spent; any other head or base blocks, as
+   does a default branch read again after such a wait and found changed.
 3. The read-back: one complete listing of the open PRs, in which exactly
    one carries the issue's marker, and it is the PR the record observed,
    open, of this repository, headed at exactly the pushed candidate on
    `autoforge/<n>` and based on the default branch. A head still at the
-   branch's old value is transient; any other mismatch blocks. Only then
-   is the PR bound (`current_pr_url`, `current_head_sha`,
-   `current_branch`) and the review history reset.
+   branch's old value, when nothing else is wrong, is waited for the same
+   way and transient once the wait is spent; any other mismatch blocks,
+   as does a default branch read again after such a wait and found
+   changed. Only then is the PR bound (`current_pr_url`,
+   `current_head_sha`, `current_branch`) and the review history reset.
 
 A replan's replacement PR is held to the same marker rule, marker and
 sole-claimant alike, by the transaction's target predicates on one
@@ -640,8 +644,14 @@ Then, in order, all from one persisted plan:
    with the fix not recorded and the findings open; the plan stays saved,
    so `unblock` completes it from the journal and sends nothing GitHub
    already holds (PR #205 R3-F2). A head still at the
-   reviewed HEAD after the push is GitHub catching up (transient); any
-   other head is drift. Only then are the resolutions recorded
+   reviewed HEAD after the push, when the base, the merge base and the
+   push target all hold, is GitHub catching up, waited for within
+   the step ("GitHub catching up with a push" below) and transient
+   once that wait is spent; one of them lost while the head still lags
+   is routed as above at once, and any other head is drift. After such a
+   wait the open issues are listed and checked again, since a follow-up
+   can be closed or unmarked during it. Only then are the
+   resolutions recorded
    (`last_fix_resolutions`, each deferral with the URL GitHub returned, and
    an acceptance action with its verified comment's `acceptance_comment_url`;
    `acceptance_outcomes` records it `verified`; an operator acceptance with
@@ -892,6 +902,41 @@ Where the checks read is refused:
 
 `doctor`'s checks-read row makes the same read before a run
 ("Doctor's checks-read check" below).
+
+### GitHub catching up with a push
+
+GitHub moves a pull request's head asynchronously after a push to its
+branch: the branch can show the new commit while the PR (`headRefOid` of
+the identity read and of a listing) still shows the old one (on PR #402
+apparently for about 13 s, inferred from its update time, not measured).
+Three reads come right after the controller's own push: `ANALYZE_EXECUTE`'s
+check before it adopts a PR, its read-back of the published PR, and `FIX`'s
+read-back. Each treats a PR still headed at the commit the push replaced
+(the branch's old value, the reviewed HEAD) as GitHub catching up, when the
+checks it makes before the head pass. Such a read is made again after each
+pause of `PUSHED_HEAD_WAIT_SECONDS` (1, 2, 4, 8, 15, 15 and 15 s, 60 s in
+all) within the same step, and the step goes on as soon as a read is
+anything else (#403); the run's progress output says that it waits. Every
+read is held to the rules of the first, so a head that turns into a third
+commit is still drift or a block, and a read that fails ends the wait with
+its error. A head still there after the last pause is
+`GitHubUnavailableError`, and `resume` reads it again.
+
+Waiting only for the head means a read that fails any other rule is not
+waited for, and what the step read before the wait is read again after
+it (PR #404). `FIX` keeps waiting only while the PR's base and merge base
+are still the ones the findings are bound to and its head branch is still
+the plan's push target, so a retarget or a base rewritten during the wait
+goes to `REVIEW` at once and a lost push target blocks, instead of ending
+as a transient lag; after a wait it lists the open issues and checks every
+resolution again before recording the fix. `ANALYZE_EXECUTE` reads the
+default branch again after a wait and blocks, adopting and binding
+nothing, when it is no longer the one the step read before its push.
+
+The wait is fixed, not configured: 60 s is several times the one lag seen
+so far, and short enough not to leave a real outage unreported for long.
+The re-reads change no state and send nothing: the plan and the push
+record are saved before the read-back.
 
 ## Dry-run safety
 

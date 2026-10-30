@@ -115,13 +115,14 @@ import os
 import re
 import secrets
 import shlex
+import time
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, TypeVar
 
 from . import __prompt_version__, sandbox_bwrap
 from .agent_worktree import (
@@ -641,6 +642,17 @@ REMOTE_VALIDATION_PROFILE = "(controller candidate validation command)"
 # only: each relaunch follows the phase-entry reconciliation, and LOCAL has
 # none (its write phases are bounded by the durable launch checkpoint).
 MAX_TRANSIENT_RETRIES = 2
+
+# The pauses of a read-back that finds a PR still headed at the commit the
+# controller's own push to its branch replaced (#403): GitHub moves a PR's
+# head asynchronously after a push (on PR #402 apparently about 13 s, an
+# inference from its update time), so the PR is read again after each pause,
+# within the same step, until it shows anything else. 60 s in all; a head
+# still not moved then is transient, for 'resume', as before. A failing read
+# is not waited out: the client's own retry has already been spent on it.
+PUSHED_HEAD_WAIT_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 15.0, 15.0, 15.0)
+# What such a read-back reads: a PR, or the listing entry that holds one.
+_Read = TypeVar("_Read")
 
 # What a prompt names as its read context before the launch writes one (a
 # plan or a dry run, which write nothing).
@@ -1632,6 +1644,7 @@ class ControllerEngine:
         runner=None,
         github: GitHubClient | None = None,
         providers: ProviderRegistry | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
         self._paths = StatePaths.from_state_dir(state_dir or config.state_dir or ".autoforge")
@@ -1649,6 +1662,10 @@ class ControllerEngine:
         # An injected client (tests) is used as given.
         self._github = github
         self._runner = runner
+        # How the controller pauses between the reads of a PR GitHub has not
+        # moved yet after its push (:meth:`_await_pushed_head`); tests
+        # inject one that returns at once.
+        self._sleep = sleep
         # The remote the controller's own git transport talks to (ADR 0004
         # D7.1): ``https://github.com/<repository>.git`` unless a test
         # injects a ``file://`` one. Never ``origin``, never configuration.
@@ -14031,6 +14048,66 @@ class ControllerEngine:
             adopted=records[1].kind is EffectKind.ADOPT_PR,
         )
 
+    def _await_pushed_head(
+        self, read: Callable[[], _Read], lagging: Callable[[_Read], bool], what: str
+    ) -> tuple[_Read, bool]:
+        """``read()`` again while it shows a PR GitHub has not moved off the pushed-over head.
+
+        GitHub moves a PR's head asynchronously after a push to its branch,
+        so a read-back made right after the controller's push can still show
+        the commit that push replaced (#403). While ``lagging`` says the
+        latest read shows exactly that and nothing else the caller would
+        refuse, the read is made again after each pause of
+        :data:`PUSHED_HEAD_WAIT_SECONDS`; the latest read is returned once
+        it does not lag or the pauses are spent, and the caller applies its
+        own rules to it (a head still lagging is transient, for 'resume').
+        A read that raises ends the wait with its error. The reads change
+        no state and send nothing: the plan and the push record were saved
+        before the read-back began. ``what`` is the line saying why the
+        controller waits, shown on the run's progress output.
+
+        Returns the latest read and whether the controller paused: what
+        the caller read before a pause (a default branch, an issue
+        listing) may have changed during it, and is read again before
+        anything is written or recorded on it (PR #404 R1-F2, R1-F3).
+        """
+        latest = read()
+        if not lagging(latest):
+            return latest, False
+        if self.progress_output is not None:
+            self.progress_output(
+                redact(
+                    f"autoforge: {what}; waiting up to {sum(PUSHED_HEAD_WAIT_SECONDS):g}s for "
+                    "GitHub to move it"
+                )
+            )
+        for pause in PUSHED_HEAD_WAIT_SECONDS:
+            self._sleep(pause)
+            latest = read()
+            if not lagging(latest):
+                break
+        return latest, True
+
+    def _default_branch_moved(self, read: str) -> str:
+        """Why the default branch, read again after a wait, is no longer ``read``, or "".
+
+        ANALYZE_EXECUTE reads the default branch once, before its push; a
+        wait for GitHub to move a PR head (:meth:`_await_pushed_head`) can
+        outlast a rename or a switch of it, so the PR is adopted or bound
+        only once the default branch is read again after the wait and found
+        unchanged (PR #404 R1-F3). Raises what the read raises.
+        """
+        state = self._require_state()
+        current = self.github.get_repo(state.repository).default_branch
+        if current == read:
+            return ""
+        return (
+            f"the default branch of {state.repository} is {current!r}, but this step read "
+            f"{read!r} before it waited for GitHub to move the PR head: the default branch was "
+            "renamed or switched during the wait, and the controller adopts and binds an "
+            "implementation PR only onto the default branch it read (ADR 0004 K2)"
+        )
+
     def _adopted_head_problem(
         self, url: str, candidate: str, expected_old: str | None, default_branch: str
     ) -> str:
@@ -14039,12 +14116,30 @@ class ControllerEngine:
         The adoption binds the issue's marker to the PR's code, so it is
         written only once GitHub shows that code to be the candidate, on a
         PR that still targets the default branch. A head still at the
-        branch's old value is GitHub catching up with the push
-        (:class:`GitHubUnavailableError`, for 'resume'); any other head is
-        something else pushed to the branch, and blocks, as does another
-        base.
+        branch's old value is GitHub catching up with the push: it is read
+        again, a bounded number of times (:meth:`_await_pushed_head`), and a
+        head that is still there is :class:`GitHubUnavailableError`, for
+        'resume'; any other head is something else pushed to the branch, and
+        blocks, as does another base, or a default branch that changed
+        while the controller waited (PR #404 R1-F3).
         """
-        pr = self.github.get_pr(url)
+        pr, waited = self._await_pushed_head(
+            lambda: self.github.get_pr(url),
+            lambda pr: (
+                pr.base_ref == default_branch
+                and expected_old is not None
+                and pr.head_sha != candidate
+                and pr.head_sha == expected_old
+            ),
+            f"PR {url} is still headed at {expected_old} after the push of {candidate}",
+        )
+        moved = self._default_branch_moved(default_branch) if waited else ""
+        if moved:
+            return (
+                f"{moved}, so the controller does not adopt PR {url}. Nothing was written to "
+                "the PR. Inspect the default branch and the PR, then 'unblock': the step reads "
+                "the default branch again and adopts the PR only if it targets that branch"
+            )
         if pr.base_ref != default_branch:
             return (
                 f"PR {url} targets {pr.base_ref!r}, not the default branch {default_branch!r}: "
@@ -14057,7 +14152,8 @@ class ControllerEngine:
         if expected_old is not None and pr.head_sha == expected_old:
             raise GitHubUnavailableError(
                 f"PR {url} is still headed at {expected_old} after the push of {candidate}; "
-                "GitHub has not caught up yet, and 'resume' reads it again before adopting it"
+                f"GitHub has not caught up within {sum(PUSHED_HEAD_WAIT_SECONDS):g}s, and "
+                "'resume' reads it again before adopting it"
             )
         return (
             f"PR {url} is headed at {pr.head_sha or 'nothing readable'}, not at the candidate "
@@ -14082,13 +14178,45 @@ class ControllerEngine:
         PRs, in which exactly one carries this issue's implementation
         marker, and it is the PR the record observed, open, headed at the
         candidate on ``branch`` of this repository and based on the default
-        branch. A head still at the branch's old value is GitHub catching up
-        (transient); any other mismatch blocks.
+        branch. A head still at the branch's old value is GitHub catching up:
+        the listing is read again, a bounded number of times
+        (:meth:`_await_pushed_head`), and a head that is still there is
+        transient; any other mismatch blocks, as does a default branch that
+        changed while the controller waited (PR #404 R1-F3).
         """
         state = self._require_state()
         issue = parse_issue_url(state.current_issue_url)
+
+        def problems_of(pr: PRInfo) -> list[str]:
+            found = parse_pr_url(pr.url).canonical
+            problems = []
+            if found != url:
+                problems.append(f"the open PR carrying the marker is {found}")
+            if not pr.is_open:
+                problems.append(f"it is {pr.state}")
+            if pr.head_repository and pr.head_repository.lower() != state.repository.lower():
+                problems.append(f"it is headed in {pr.head_repository}")
+            if pr.head_ref != branch:
+                problems.append(f"it is headed at branch {pr.head_ref!r}")
+            if pr.base_ref != default_branch:
+                problems.append(f"it is based on {pr.base_ref!r}, not {default_branch!r}")
+            return problems
+
+        def lagging(holder: Holder[PRInfo, ImplementationClaim]) -> bool:
+            pr = holder.obj
+            return (
+                expected_old is not None
+                and pr.head_sha != candidate
+                and pr.head_sha == expected_old
+                and not problems_of(pr)
+            )
+
         try:
-            holder = self._implementation_prs(issue).exactly_one()
+            holder, waited = self._await_pushed_head(
+                lambda: self._implementation_prs(issue).exactly_one(),
+                lagging,
+                f"PR {url} is still headed at {expected_old} after the push of {candidate}",
+            )
         except GitHubUnavailableError:
             raise
         except (GitHubError, ClaimConflictError) as exc:
@@ -14098,23 +14226,22 @@ class ControllerEngine:
                 "issue's marker, then 'unblock'"
             )
         pr = holder.obj
-        found = parse_pr_url(pr.url).canonical
-        problems = []
-        if found != url:
-            problems.append(f"the open PR carrying the marker is {found}")
-        if not pr.is_open:
-            problems.append(f"it is {pr.state}")
-        if pr.head_repository and pr.head_repository.lower() != state.repository.lower():
-            problems.append(f"it is headed in {pr.head_repository}")
-        if pr.head_ref != branch:
-            problems.append(f"it is headed at branch {pr.head_ref!r}")
-        if pr.base_ref != default_branch:
-            problems.append(f"it is based on {pr.base_ref!r}, not {default_branch!r}")
+        problems = problems_of(pr)
+        if waited:
+            try:
+                moved = self._default_branch_moved(default_branch)
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                moved = f"the default branch could not be read again after the wait: {exc}"
+            if moved:
+                problems.append(moved)
         if not problems and pr.head_sha != candidate:
-            if expected_old is not None and pr.head_sha == expected_old:
+            if lagging(holder):
                 raise GitHubUnavailableError(
                     f"PR {url} is still headed at {expected_old} after the push of "
-                    f"{candidate}; 'resume' reads it back again"
+                    f"{candidate}; GitHub has not caught up within "
+                    f"{sum(PUSHED_HEAD_WAIT_SECONDS):g}s, and 'resume' reads it back again"
                 )
             problems.append(f"it is headed at {pr.head_sha or 'nothing readable'}")
         if problems:
@@ -15016,6 +15143,23 @@ class ControllerEngine:
         that cannot be read for a conclusive reason blocks; an empty binding
         (an older state file) has nothing to compare. ``None`` when bound.
         """
+        unbound = self._fix_unbound(pr, when)
+        if unbound is None:
+            return None
+        reason, stale = unbound
+        return self._fix_drift(pr, reason) if stale else (Phase.BLOCKED, reason)
+
+    def _fix_unbound(self, pr: PRInfo, when: str) -> tuple[str, bool] | None:
+        """:meth:`_fix_rebound`'s rule, changing nothing: why ``pr`` left the binding, or ``None``.
+
+        ``(reason, True)`` when its base or merge base left the findings'
+        binding (the review is stale), ``(reason, False)`` when the merge
+        base could not be read for a conclusive reason (it blocks). An
+        unreadable base raises :class:`VerificationError`, an unavailable
+        GitHub propagates. Also asked of each read made while FIX waits for
+        GitHub to move the PR head after its push: a PR no longer bound is
+        not waited for (PR #404 R1-F1).
+        """
         state = self._require_state()
         reviewed_base = state.reviewed_base_ref
         if not reviewed_base:
@@ -15027,11 +15171,11 @@ class ControllerEngine:
                 f"confirmed as findings of this PR's diff; {when}"
             )
         if pr.base_ref != reviewed_base:
-            return self._fix_drift(
-                pr,
+            return (
                 f"PR base changed to {pr.base_ref!r} from the reviewed base {reviewed_base!r} "
                 f"that the open findings of round {state.review_round} are bound to (the "
                 f"findings describe the diff against the old base); {when}",
+                True,
             )
         reviewed_merge_base = state.reviewed_merge_base_sha
         if not reviewed_merge_base:
@@ -15045,18 +15189,19 @@ class ControllerEngine:
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            return Phase.BLOCKED, (
+            return (
                 f"{exc}. This is not a transient GitHub failure, so the open findings of round "
                 f"{state.review_round} cannot be confirmed as findings of this PR's diff; "
-                f"{when}. Fix the cause, then 'unblock'"
+                f"{when}. Fix the cause, then 'unblock'",
+                False,
             )
         if merge_base != reviewed_merge_base:
-            return self._fix_drift(
-                pr,
+            return (
                 f"PR merge base moved to {merge_base[:12]} from the reviewed merge base "
                 f"{reviewed_merge_base[:12]} that the open findings of round "
                 f"{state.review_round} are bound to (base {pr.base_ref!r} was rewritten under "
                 f"its name; the findings describe the diff from the old merge base); {when}",
+                True,
             )
         return None
 
@@ -15350,7 +15495,13 @@ class ControllerEngine:
         A conflict or a conclusive failure blocks with the records as
         persisted; an unavailable GitHub, a write whose outcome is not
         readable yet, or a PR head GitHub has not moved yet, propagates for
-        'resume'.
+        'resume'. The last is first read again a bounded number of times
+        (:meth:`_await_pushed_head`, #403), since GitHub moves a PR's head
+        a few seconds after a push to its branch, but only while it is the
+        one mismatch: a base, merge base or head branch that left the plan's
+        binding is routed at once, the head notwithstanding (PR #404 R1-F1),
+        and the open issues are read against every resolution again after
+        such a wait (R1-F2).
         """
         state = self._require_state()
         effects = state.phase_effects()
@@ -15426,34 +15577,61 @@ class ControllerEngine:
         problem = self._fix_disposition_problem(context, records, observation)
         if problem:
             return self._fix_disposition_block(problem, "the fix is not recorded")
-        latest = self._require_open_pr()
-        head = latest.head_sha.lower()
-        if push is not None and head == reviewed:
-            raise GitHubUnavailableError(
-                f"PR {state.current_pr_url} is still headed at the reviewed HEAD {reviewed} "
-                f"after the push of {candidate}; GitHub has not caught up yet, and 'resume' "
-                "reads it back again"
+        when = "read back after the FIX plan was sent"
+
+        def lagging(pr: PRInfo) -> bool:
+            # Only GitHub catching up with the push is waited for: a PR whose
+            # base, merge base or head branch also left the plan's binding is
+            # routed below at once (PR #404 R1-F1).
+            return (
+                push is not None
+                and pr.head_sha.lower() == reviewed
+                and self._fix_unbound(pr, when) is None
+                and not self._fix_target_problem(pr, push, observation)
             )
-        if head != candidate:
+
+        latest, waited = self._await_pushed_head(
+            self._require_open_pr,
+            lagging,
+            f"PR {state.current_pr_url} is still headed at the reviewed HEAD {reviewed} after "
+            f"the push of {candidate}",
+        )
+        if waited:
+            # The listing above predates the wait: a follow-up closed,
+            # unmarked or joined during it contradicts the plan as much as
+            # one before it (PR #404 R1-F2).
+            problem = self._fix_disposition_problem(context, records, observation)
+            if problem:
+                return self._fix_disposition_block(problem, "the fix is not recorded")
+        head = latest.head_sha.lower()
+        behind = push is not None and head == reviewed
+        if head != candidate and not behind:
             return self._fix_drift(
                 latest,
                 f"PR HEAD {head[:12]} is not the candidate {candidate[:12]} the controller "
                 "verified (a push the controller did not make)",
             )
-        outcome = self._fix_rebound(latest, "read back after the FIX plan was sent")
+        outcome = self._fix_rebound(latest, when)
         if outcome is not None:
             return outcome
         problem = self._fix_target_problem(latest, push, observation)
         if problem:
-            # The candidate on the PR is the controller's own push, so this is
-            # not drift: the plan stays saved and is completed from the
-            # journal once the PR is headed at its branch again (R3-F2).
+            # The PR is headed at the candidate, the controller's own push,
+            # or still at the reviewed HEAD GitHub has not moved off yet, so
+            # this is not drift: the plan stays saved and is completed from
+            # the journal once the PR is headed at its branch again (R3-F2).
             return Phase.BLOCKED, (
                 f"{problem}, read back after the FIX plan was sent. The controller records a "
                 "fix only for the head branch the review bound and the FIX plan names; the fix "
                 f"of review round {state.review_round} is not recorded and the findings stay "
                 "open. Inspect the PR, then 'unblock': FIX completes from the persisted plan, "
                 "which sends nothing GitHub already holds"
+            )
+        if behind:
+            raise GitHubUnavailableError(
+                f"PR {state.current_pr_url} is still headed at the reviewed HEAD {reviewed} "
+                f"after the push of {candidate}; GitHub has not caught up within "
+                f"{sum(PUSHED_HEAD_WAIT_SECONDS):g}s, and 'resume' reads it back again"
             )
         state.last_fix_resolutions = [
             {

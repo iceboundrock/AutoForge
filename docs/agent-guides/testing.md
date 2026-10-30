@@ -1334,6 +1334,21 @@ a stated reason it has none. The coverage that must keep working:
   `tests/test_integration.py`); `verify` saves an observation or a conflict
   once and a hold never, and a target or listing that cannot be read
   raises with nothing saved (`tests/test_effects.py`)
+- a PR head GitHub has not moved yet after the controller's push (#403,
+  `tests/test_engine.py`): at `ANALYZE_EXECUTE`'s adoption, at its
+  read-back of a PR created on a branch that already had a head, and at
+  `FIX`'s read-back, a PR that shows the candidate after some of the pauses
+  completes the step with nothing sent twice; one still at the old head
+  once every pause is spent is transient, and `resume` completes from the
+  journal without a launch; a third head during the wait is drift or a
+  block at once; a lagging head on another base blocks with no pause. In
+  `FIX`, a lagging PR retargeted, its base rewritten or its push target
+  lost, at the first read or during the wait, goes to `REVIEW` or blocks
+  at once with no fix recorded, and a follow-up closed or unmarked during
+  a pause blocks with the fix not recorded; in `ANALYZE_EXECUTE`, a
+  default branch renamed during either wait blocks with nothing adopted or
+  bound (PR #404). No test sleeps: `make_engine` records each pause in
+  `eng.sleeps`
 
 ### Integration
 

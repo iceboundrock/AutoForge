@@ -1854,7 +1854,9 @@ def make_engine(
     an ``origin`` naming the fake's repository (:func:`github_origin`).
     ``origin`` attaches a seeded bare origin (:func:`attach_origin`), which
     an ANALYZE_EXECUTE entry needs: the controller fetches from and pushes
-    to it (#161). The engine keeps it as ``eng.origin``.
+    to it (#161). The engine keeps it as ``eng.origin``. The engine never
+    sleeps: each pause of a read-back waiting for GitHub to move a PR head
+    (#403) returns at once and is recorded in ``eng.sleeps``.
     """
     cfg = cfg or default_config()
     if workdir is None:
@@ -1866,11 +1868,18 @@ def make_engine(
     provider = ScriptedProvider(script, exit_code=exit_code)
     registry = ProviderRegistry(overrides={"claude": provider, "opencode": provider})
     gh = github or FakeGitHub()
+    sleeps: list[float] = []
     eng = ControllerEngine(
-        config=cfg, state_dir=state_dir, workdir=workdir, github=gh, providers=registry
+        config=cfg,
+        state_dir=state_dir,
+        workdir=workdir,
+        github=gh,
+        providers=registry,
+        sleep=sleeps.append,
     )
     eng.new_run(EPIC, ISSUE)
     eng.provider = provider  # type: ignore[attr-defined]
+    eng.sleeps = sleeps  # type: ignore[attr-defined]
     if origin:
         eng.origin = attach_origin(eng)  # type: ignore[attr-defined]
     return eng
