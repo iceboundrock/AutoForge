@@ -1270,6 +1270,13 @@ known and the retry path is bounded. Current cases include:
   the corrections, each after the phase-entry reconciliation, and none while
   a process the failed launch started may still be running
 - temporary GitHub/network error
+- a read-back right after the controller's own push that still shows the
+  PR headed at the commit the push replaced (GitHub moves a PR's head
+  asynchronously, #403): the PR is read again after each pause of
+  `PUSHED_HEAD_WAIT_SECONDS` (60 s in all) within the same step, only while
+  that head is the one mismatch; still there afterwards, it is a
+  `GitHubUnavailableError` for `resume`. The re-reads change no state and
+  send nothing
 - malformed CONTROL_RESULT correction attempt, none while a process the
   launch started may still be running, and in LOCAL mode none after a
   launch that moved the git anchor

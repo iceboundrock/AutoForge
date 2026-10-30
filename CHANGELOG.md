@@ -5,6 +5,24 @@ so.
 
 ## Unreleased
 
+### A push GitHub has not yet shown on the PR is waited for, not left to `resume` (#403)
+
+- GitHub moves a PR's head a few seconds after a push to its branch. When
+  `FIX` read the PR back right after pushing the fixer's commit and still
+  found the reviewed HEAD, `run` stopped with `GitHub has not caught up
+  yet` and the run waited in `FIX` until an operator ran `resume`. That
+  read, and `ANALYZE_EXECUTE`'s two reads after its push (before adopting
+  an existing PR, and the read-back of the published PR), now read the PR
+  again within the step, after pauses of 1, 2, 4, 8, 15, 15 and 15 s, and
+  go on as soon as GitHub shows the pushed commit. The progress output
+  says `waiting up to 60s for GitHub to move it`. A PR still at the old
+  head after 60 s stops the step as before (`GitHub has not caught up
+  within 60s`), and `resume` reads it again. Each read is held to the same
+  rules as before: a head that turns into another commit is still a push
+  the controller did not make, and another base or branch still blocks.
+  The extra reads save nothing and send nothing. Nothing changes a
+  default, and there is no new configuration key.
+
 ### A Claude run that failed on a model API outage is relaunched, as an OpenCode one is (#395)
 
 - Once Claude Code has spent its own retries of a request to the model
