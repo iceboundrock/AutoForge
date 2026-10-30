@@ -162,8 +162,9 @@ and printed the secret after it in the clear. (A token after a written-out
   bound `oauth-field` has), and keep a backslash that starts the closing
   escaped quote out of the value: `GH_TOKEN=\"***REDACTED***\"`, so JSON
   redacted as text still parses. A quote behind eight backslashes or more
-  is not recognised, nor, as before, an `Authorization` header whose value
-  is quoted, escaped or not.
+  is not recognised. An `Authorization` header whose value is quoted,
+  escaped or not, was not recognised either until #393
+  ([below](#quoted-keys-and-a-code-fence-after-a-separator-393)).
 
 Every place that serializes and redacts was checked for #281: the JSON
 documents `status --json`, `doctor --json` and `epic status --json` print
@@ -180,6 +181,46 @@ kept and no part of the replaced run, and a value is still at least one
 character (`HF_TOKEN=\"x\"`, 14 to 27, is pinned with the other growth
 units). The backslash runs are bounded, so the patterns stay linear, and
 `redact` stays idempotent.
+
+## Quoted keys, and a code fence after a separator (#393)
+
+A correction's prompt quotes the end of the refused reply, so whatever
+`redact` misses in a reply goes to the next agent and into its
+`prompt.md`, as it already went into the refused launch's `stdout.log`.
+That quote exposed two gaps in the named patterns. Both are closed in
+`redaction.py` itself, so every sink and `credential_classes` get them.
+
+- **A credential's name as a quoted key.** JSON, a Python mapping's repr,
+  a TOML quoted key and YAML write `"GITHUB_TOKEN": "..."`. The key's
+  closing quote stood between the name and the separator, so
+  `env-assignment` never matched, and a value of no known token shape was
+  kept in the clear. `env-assignment`, `secret-assignment` (`"api_key":`,
+  `"password":`, `"token":`) and `authorization-header`
+  (`"Authorization": "Bearer ..."`, a headers mapping) now take an optional
+  quote after the name, escaped as `_QUOTE` takes one, and keep it with
+  the separator. The header's value keeps an escaped closing quote whole,
+  as an assignment's does. The OAuth names already had `oauth-field` for
+  this shape. Unchanged: a prefixed name (`"MY_GITHUB_TOKEN"`) is still
+  #285's, an empty value is left, and `redact_obj`, which redacts a key and
+  its value apart, still recognises only the OAuth keys by name.
+- **A code fence on a later line is never a value.** The space after an
+  assignment's separator may cross a line break, so that a YAML value on
+  the next line is still caught. A prompt quotes untrusted text in a fence,
+  and a quoted reply that ended in an empty `GITHUB_TOKEN=` (or
+  `Authorization: Bearer`, `id_token:`) had its closing fence taken for the
+  value when the run log redacted the prompt again. `prompt.md` then
+  showed the quote unterminated, and so differed from the prompt that was
+  sent. The space after a separator (`_SPACE_TO_VALUE`) now never runs onto
+  a line that starts with three backticks or tildes, indented or not. This
+  gives up no protection: the fence line was all that was ever replaced,
+  and a secret written in a code block under the name was left as before.
+  A value on the same line is a value whatever it starts with, and a value
+  on a later line that starts no fence is still redacted.
+
+Both keep `MAX_GROWTH_FACTOR`: a quoted key only lengthens the matched
+text (`"HF_TOKEN":"x"`, 14 to 27, is pinned with the other growth units).
+Both stay linear: the key's quote is bounded like a value's, and each line
+break after a separator is tried once.
 
 ## Launch environment and credential checks (#165)
 
@@ -371,7 +412,14 @@ writers follow, so a secret the bound would cut in half is replaced before
 the cut. The quote is redacted before the agent sees it, not only where
 `prompt.md` logs it, and state never holds it; the run log records its
 sizes alone (`metadata.correction_reply` in `request.json`).
-`tests/test_engine.py` puts a secret across the bound.
+`tests/test_engine.py` puts a secret, and a credential under a quoted key,
+across the bound. `prompt.md` redacts the prompt again and shows the quote
+as sent, closing fence included
+([above](#quoted-keys-and-a-code-fence-after-a-separator-393)). The one
+difference left errs toward redacting: when the cut puts a token shape at
+the start of the quote that the character before it hid (`xghp_...` cut
+after the `x`), `prompt.md` redacts it and the prompt does not. The prompt
+then holds only what redacting the whole reply left.
 
 `redact_obj` / `redact_dict` redact mapping keys as well as values, and a
 mapping never loses an entry to that: two distinct keys that redact to the

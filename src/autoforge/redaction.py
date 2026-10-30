@@ -10,7 +10,9 @@ where it starts a token: at the start of the text, after a character that
 cannot be part of it, or directly after an escape sequence (``ESC[0m``,
 ``\\n``, ``\\u00e9``; see ``_ESCAPE``). An assignment's quoted value is
 recognised behind an escaped quote too (``GH_TOKEN=\\"...\\"``, as JSON
-writes it; see ``_QUOTE``).
+writes it; see ``_QUOTE``), and a named assignment or header under a
+quoted key (``"GITHUB_TOKEN": "..."``, ``"Authorization": "Bearer ..."``).
+A line that starts a code fence is never a value (``_SPACE_TO_VALUE``).
 
 Every pattern has a stable class name. :func:`credential_classes` reports
 which classes a text carries without saying where, so a refusal of agent
@@ -95,6 +97,16 @@ _QUOTE = r"(?:\\{0,7}[\"'])?"
 # it: the replacement leaves ``\"`` whole and the JSON around it intact. The
 # lookahead is bounded like ``_QUOTE``.
 _VALUE_BACKSLASH = r"\\(?!\\{0,6}[\"'])"
+# The space between an assignment's separator and its value (#393): a run on
+# the same line, or one across a line break, but never onto a line that
+# starts a code fence (three backticks or tildes, indented or not). A prompt
+# quotes untrusted text in a fence, and a quoted reply that ended in an empty
+# ``GITHUB_TOKEN=`` had its closing fence taken for the value when the run
+# log redacted the prompt again, so ``prompt.md`` no longer showed the prompt
+# as sent. A fence on a later line is never the value: a secret written in a
+# code block under the name was never the replaced run, only the fence was.
+# Each line break is tried once, so the scan stays linear.
+_SPACE_TO_VALUE = r"(?:[^\S\r\n]*|\s*[\r\n][^\S\r\n]*(?!`{3}|~{3}))"
 
 
 def _token(
@@ -128,20 +140,30 @@ _OAUTH_FIELD_NAMES = r"refresh|access|(?:refresh|access|id)_token|chatgpt[-_]acc
 # replaced by ``openai-key`` before ``anthropic-key`` sees it, so it is
 # reported under that class.
 _PATTERNS: tuple[_Pattern, ...] = (
-    # VAR=secret / VAR: secret assignments for well-known names.
+    # VAR=secret / VAR: secret assignments for well-known names. The name may
+    # be a quoted key (#393): JSON, a Python mapping's repr and a TOML quoted
+    # key write ``"GITHUB_TOKEN": "..."``, where the key's closing quote
+    # stands between the name and the separator, and a value of no known
+    # shape was kept in the clear. That quote, escaped as ``_QUOTE`` takes
+    # one, is kept with the separator.
     _token(
         "env-assignment",
         r"(GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|"
         r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY|"
         r"ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENCODE_SERVER_PASSWORD)"
-        rf"(\s*[:=]\s*)({_QUOTE})((?:[^\s\"';\\]|{_VALUE_BACKSLASH})+)({_QUOTE})",
+        rf"({_QUOTE}\s*[:=]{_SPACE_TO_VALUE})({_QUOTE})((?:[^\s\"';\\]|{_VALUE_BACKSLASH})+)"
+        rf"({_QUOTE})",
         r"\1\2\3***REDACTED***\5",
         flags="(?i)",
     ),
-    # Authorization: Bearer <token> / Token <token> / Basic <base64>
+    # Authorization: Bearer <token> / Token <token> / Basic <base64>, also as
+    # a quoted key and value (``"Authorization": "Bearer ..."``, a headers
+    # mapping, #393), whose escaped closing quote stays whole as an
+    # assignment's does.
     _token(
         "authorization-header",
-        r"(Authorization\s*:\s*(?:Bearer|Token|Basic)\s+)([^\s\"';]+)",
+        rf"(Authorization{_QUOTE}\s*:\s*{_QUOTE}(?:Bearer|Token|Basic)(?=\s){_SPACE_TO_VALUE})"
+        rf"((?:[^\s\"';\\]|{_VALUE_BACKSLASH})+)",
         r"\1***REDACTED***",
         flags="(?i)",
     ),
@@ -204,14 +226,15 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token("openai-key", r"sk-(?:proj-)?[A-Za-z0-9_-]{8,}", "***REDACTED***"),
     # Anthropic keys
     _token("anthropic-key", r"sk-ant-[A-Za-z0-9_-]{8,}", "***REDACTED***"),
-    # Generic long bearer-ish assignments: token/password/secret = <value>.
+    # Generic long bearer-ish assignments: token/password/secret = <value>,
+    # the name also as a quoted key (``"api_key": "..."``, #393).
     # ``_`` is a token character before the name, so a prefixed one
     # (``GEMINI_API_KEY=``) is not recognised here (#285); a Google API key
     # under it is, by its shape (``google-api-key``).
     _token(
         "secret-assignment",
-        rf"(token|passwd|password|secret|api[_-]?key)(\s*[:=]\s*)({_QUOTE})"
-        rf"([A-Za-z0-9_\-./+]{{12,}})({_QUOTE})",
+        rf"(token|passwd|password|secret|api[_-]?key)({_QUOTE}\s*[:=]{_SPACE_TO_VALUE})"
+        rf"({_QUOTE})([A-Za-z0-9_\-./+]{{12,}})({_QUOTE})",
         r"\1\2\3***REDACTED***\5",
         flags="(?i)",
     ),
@@ -239,7 +262,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token(
         "oauth-assignment",
         r"((?:refresh|access|id)_token|chatgpt[-_]account[-_]id)"
-        rf"(\s*[:=]\s*)({_QUOTE})(?:[^\s\"';,&\\]|{_VALUE_BACKSLASH})+",
+        rf"(\s*[:=]{_SPACE_TO_VALUE})({_QUOTE})(?:[^\s\"';,&\\]|{_VALUE_BACKSLASH})+",
         r"\1\2\3***REDACTED***",
         flags="(?i)",
         token_chars="A-Za-z0-9",

@@ -10462,6 +10462,56 @@ def test_the_quoted_reply_is_redacted_before_it_is_bounded(tmp_state_dir, fake_g
         }
 
 
+@pytest.mark.parametrize("across", [False, True], ids=["whole", "across-the-bound"])
+def test_a_credential_under_a_quoted_key_is_never_quoted(tmp_state_dir, fake_github, across):
+    """#393: a reply holding a credential as a JSON key and a value of no
+    known shape reaches neither the correction prompt nor its ``prompt.md``.
+    Across the bound the cut falls inside the key's name, so cutting before
+    redacting would have left the value with no name before it."""
+    from autoforge.engine import MAX_CORRECTION_REPLY_CHARS
+
+    opaque = "FAKE0opaque0" + "Jx7" * 6
+    entry = '{"GITHUB_TOKEN": "' + opaque + '", "CI": "1"}'
+    reply = f"I ran the suite with this environment: {entry}\n"
+    if across:
+        inside = len(entry) - entry.index("TOKEN")
+        tail = " " + "y" * (MAX_CORRECTION_REPLY_CHARS - inside - 1)
+        reply = "x" * 500 + " " + entry + tail
+        assert reply[-MAX_CORRECTION_REPLY_CHARS:].startswith('TOKEN": "' + opaque)
+    eng = _in_analyze(tmp_state_dir, fake_github, scripted(reply, implement))
+    assert eng.step().next_phase == "REVIEW"
+    sent = eng.provider.calls[1].prompt
+    logged = (_step_logs(eng)[1] / "prompt.md").read_text(encoding="utf-8")
+    for prompt in (sent, logged):
+        assert "Jx7" not in prompt
+        quoted = _reply_quote(prompt)[1]
+        assert '"GITHUB_TOKEN": "***REDACTED***"' in quoted
+        assert bool(_reply_quote(prompt)[0]) is across
+    assert _reply_quote(sent) == _reply_quote(logged)
+
+
+@pytest.mark.parametrize(
+    "ending",
+    ["GITHUB_TOKEN=", "GH_TOKEN: ", '"GITHUB_TOKEN": ', "Authorization: Bearer", "id_token="],
+)
+def test_prompt_md_shows_a_reply_ending_in_an_empty_assignment_as_sent(
+    tmp_state_dir, fake_github, ending
+):
+    """#393: the run log redacts the prompt again for ``prompt.md``, and the
+    space after an empty assignment's separator ran across the line break
+    into the quote's closing fence, which was replaced as the value: the log
+    showed the quote unterminated. A code fence line is never a value, so
+    the logged prompt is the one sent, fence and all."""
+    reply = f"Work done; the variable is unset here:\n{ending}"
+    eng = _in_analyze(tmp_state_dir, fake_github, scripted(reply, implement))
+    assert eng.step().next_phase == "REVIEW"
+    sent = eng.provider.calls[1].prompt
+    logged = (_step_logs(eng)[1] / "prompt.md").read_text(encoding="utf-8")
+    assert _reply_quote(sent) == _reply_quote(logged) == ("", reply)
+    assert logged.endswith(f"{ending}\n```\n")
+    assert logged == sent
+
+
 def test_hostile_text_in_the_quoted_reply_stays_verbatim_inside_its_fence(
     tmp_state_dir, fake_github
 ):

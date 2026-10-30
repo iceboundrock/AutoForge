@@ -714,6 +714,10 @@ _QUOTED_ASSIGNMENTS = [
     ("secret-assignment", f'password: "{_QUOTED_VALUE}"'),
     ("oauth-assignment", f'refresh_token="{_QUOTED_VALUE}"'),
     ("oauth-bare-assignment", f'access="{_QUOTED_VALUE}"'),
+    # The name as a quoted key (#393).
+    ("env-assignment", f'"GITHUB_TOKEN": "{_QUOTED_VALUE}"'),
+    ("secret-assignment", f'"api_key": "{_QUOTED_VALUE}"'),
+    ("authorization-header", f'"Authorization": "Bearer {_QUOTED_VALUE}"'),
 ]
 
 
@@ -798,6 +802,133 @@ def test_the_escaped_quote_rule_stays_linear(text):
     assert time.perf_counter() - started < 3.0
 
 
+# A credential's name as a quoted key (#393), each with what ``redact`` makes of
+# it and the class ``credential_classes`` reports. Every value is a fake.
+_QUOTED_KEY_CASES = [
+    (
+        '{"GITHUB_TOKEN": "FAKE0opaque0value"}',
+        '{"GITHUB_TOKEN": "***REDACTED***"}',
+        "env-assignment",
+    ),
+    ("{'GH_TOKEN': 'FAKE0opaque0value'}", "{'GH_TOKEN': '***REDACTED***'}", "env-assignment"),
+    # A TOML quoted key, and a key in any case with space before its colon.
+    ('"OPENAI_API_KEY" = "FAKE0opaque"', '"OPENAI_API_KEY" = "***REDACTED***"', "env-assignment"),
+    ('{"github_token" : "FAKE0opaque"}', '{"github_token" : "***REDACTED***"}', "env-assignment"),
+    # YAML: a quoted key, a plain value.
+    ('"HF_TOKEN": FAKE0opaque', '"HF_TOKEN": ***REDACTED***', "env-assignment"),
+    ('{"api_key": "FAKE0opaque0value"}', '{"api_key": "***REDACTED***"}', "secret-assignment"),
+    ('{"password":"FAKE0opaque0value"}', '{"password":"***REDACTED***"}', "secret-assignment"),
+    (
+        '{"Authorization": "Bearer FAKE0opaque"}',
+        '{"Authorization": "Bearer ***REDACTED***"}',
+        "authorization-header",
+    ),
+    (
+        "{'authorization': 'Basic RkFLRTpGQUtF'}",
+        "{'authorization': 'Basic ***REDACTED***'}",
+        "authorization-header",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "name"), _QUOTED_KEY_CASES, ids=[c[0] for c in _QUOTED_KEY_CASES]
+)
+def test_a_credential_under_a_quoted_key_is_redacted(text, expected, name):
+    """#393: JSON, a Python mapping's repr, a TOML quoted key and YAML write
+    a credential's name as a quoted key, and the key's closing quote stood
+    between the name and the separator: a value of no known shape was kept
+    in the clear, and a correction prompt that quoted such a reply passed it
+    to the next agent. The quote is taken with the separator and kept."""
+    assert redact(text) == expected
+    assert credential_classes(text) == (name,)
+    assert redact(expected) == expected
+
+
+_QUOTED_KEY_NEAR_MISSES = [
+    '"GITHUB_TOKEN" is set in the environment',
+    '{"GITHUB_TOKEN_FILE": "/run/secrets/token"}',
+    # A prefixed name is #285's to recognise, quoted or not.
+    '{"MY_GITHUB_TOKEN": "FAKE0opaque0value"}',
+    '{"GITHUB_TOKEN": "", "next": 1}',
+    '{"token": "short"}',
+    '{"Authorization": "none"}',
+]
+
+
+@pytest.mark.parametrize("text", _QUOTED_KEY_NEAR_MISSES)
+def test_a_quoted_key_with_no_value_of_its_own_is_left(text):
+    assert redact(text) == text
+
+
+# An empty assignment at the end of a fenced text, as a correction prompt
+# quotes a reply that ended in one (#393).
+_EMPTY_ASSIGNMENT_ENDINGS = [
+    "GITHUB_TOKEN=",
+    "GH_TOKEN: ",
+    '"GITHUB_TOKEN": ',
+    "HF_TOKEN=\r",
+    "Authorization: Bearer",
+    '"Authorization": "Bearer ',
+    "id_token=",
+    "password:",
+]
+
+
+@pytest.mark.parametrize("ending", _EMPTY_ASSIGNMENT_ENDINGS)
+def test_a_code_fence_on_a_later_line_is_never_a_value(ending):
+    """#393: the space after an assignment's separator ran across the line
+    break, so redacting a prompt that quoted a reply ending in an empty
+    ``GITHUB_TOKEN=`` took the closing fence for its value, and ``prompt.md``
+    no longer showed the prompt as sent. A line that starts a code fence,
+    indented or not, of backticks or tildes, is never a value; the fenced
+    text is a fixed point of ``redact``."""
+    from autoforge.prompts import fenced_untrusted_block
+
+    block = fenced_untrusted_block(f"Done.\n{ending}", "text")
+    assert redact(block) == block
+    for fence in ("```", "````", "   ```", "~~~"):
+        text = f"{ending}\n{fence}\nmore"
+        assert redact(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # A value on a later line is still a value.
+        ("GITHUB_TOKEN:\n  FAKE0opaque", "GITHUB_TOKEN:\n  ***REDACTED***"),
+        ("Authorization: Bearer\n  FAKE0opaque", "Authorization: Bearer\n  ***REDACTED***"),
+        ("id_token:\r\n\tFAKE0opaque", "id_token:\r\n\t***REDACTED***"),
+        # Two backticks start no fence.
+        ("GITHUB_TOKEN:\n``FAKE0opaque", "GITHUB_TOKEN:\n***REDACTED***"),
+        # On the same line a value is a value, whatever it starts with.
+        ("GITHUB_TOKEN=```FAKE0opaque", "GITHUB_TOKEN=***REDACTED***"),
+    ],
+    ids=["later-line", "header-later-line", "crlf-tab", "two-backticks", "same-line"],
+)
+def test_a_value_that_starts_no_fence_line_is_still_redacted(text, expected):
+    assert redact(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GH_TOKEN=" + "\n " * 125_000 + "```",
+        "Authorization: Bearer" + "\r\n" * 125_000 + "~~~",
+        ("id_token:\n```" + "\n") * 25_000,
+        '"GITHUB_TOKEN"\\\\\\\\' * 25_000,
+    ],
+    ids=["one-long-run", "header-crlf-run", "many-fences", "many-escaped-quoted-keys"],
+)
+def test_the_quoted_key_and_fence_rules_stay_linear(text):
+    """Each line break after a separator is tried once, and the key's quote
+    is bounded like a value's, so a quarter-megabyte is redacted well inside
+    the budget."""
+    started = time.perf_counter()
+    assert redact(text) == text
+    assert time.perf_counter() - started < 3.0
+
+
 def test_redact_obj_redacts_a_token_after_an_ansi_escape_at_any_depth():
     """State and the CLI's documents cross ``redact_obj``: the same rule
     holds in every string of a structure."""
@@ -855,7 +986,10 @@ _WORST_CASE_UNITS = {
     "named_assignment_quoted": 'HF_TOKEN="x"',
     # The quote as JSON writes it (#281): kept like a plain one, 14 to 27.
     "named_assignment_escaped_quote": 'HF_TOKEN=\\"x\\"',
+    # The name as a quoted key (#393), longer still: 14 to 27.
+    "named_assignment_quoted_key": '"HF_TOKEN":"x"',
     "bearer_header": "Authorization:Token x ",
+    "bearer_header_quoted_key": '"Authorization":"Token x"',
     "basic_header": "Authorization:Basic x ",
     "url_credential": "ab://x@",
     # Header at its ten-character floor, empty payload and signature; ``.``
@@ -1006,6 +1140,9 @@ _CREDENTIAL_CORPUS = [
     _NORMAL_TEXT,
     *(text for text, _ in _OAUTH_FIELD_CASES),
     *_OAUTH_PROSE,
+    *(text for text, _, _ in _QUOTED_KEY_CASES),
+    *_QUOTED_KEY_NEAR_MISSES,
+    *(f"{ending}\n```" for ending in _EMPTY_ASSIGNMENT_ENDINGS),
     *_GROWTH_UNITS.values(),
     *(unit * 50 for unit in _GROWTH_UNITS.values()),
     *(_after(lead, sample) for _, sample, _, _ in _CLASS_SAMPLES for lead in _LEADS.values()),

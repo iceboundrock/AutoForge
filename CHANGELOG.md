@@ -23,6 +23,16 @@ so.
   what it relies on against the worktree, and its result passes every
   check a first launch's does. Its `request.json` records the quote's
   sizes (`metadata.correction_reply`); nothing of it is persisted in state.
+- Redaction, everywhere it applies, now recognises a credential's name as
+  a quoted key (`"GITHUB_TOKEN": "..."`, `"api_key": "..."`,
+  `"Authorization": "Bearer ..."`, as JSON, a Python repr, TOML or YAML
+  write it). Before, a value of no known token shape under such a key was
+  kept in the clear, and a quoted reply would have passed it to the
+  correction. A line that starts a code fence is no longer taken for an
+  assignment's value, so a quoted reply that ends in an empty
+  `GITHUB_TOKEN=` keeps its closing fence in `prompt.md`. Published text
+  that holds a credential under a quoted key is now refused by name, as
+  the unquoted form already was.
 - Limits: this is a mitigation. It does not address a Claude turn that ends
   while a background task the agent started is still running: such a
   reply is corrected within `execution.max_correction_attempts` like any

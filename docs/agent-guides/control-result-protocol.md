@@ -107,10 +107,14 @@ now also quotes the end of the refused launch's final reply
   correction's result passes the same parse, per-phase checks, candidate
   read, validation gates, effect reconciliation and transitions as any
   other launch's; a block inside the quote never counts.
-- **Run log.** The correction's `prompt.md` shows the excerpt as sent;
-  `request.json` records only its sizes (`metadata.correction_reply`:
-  `kept_chars`, `reply_chars`, `cut`), so correction overhead can later be
-  compared with the 8 to 29 minutes the three corrections of #393 took.
+- **Run log.** The correction's `prompt.md` shows the excerpt as sent: the
+  run log redacts the prompt again, and a code fence line is never taken
+  for an assignment's value, so a reply that ends in an empty
+  `GITHUB_TOKEN=` keeps its closing fence there
+  (`secrets-and-logging.md`). `request.json` records only its sizes
+  (`metadata.correction_reply`: `kept_chars`, `reply_chars`, `cut`), so
+  correction overhead can later be compared with the 8 to 29 minutes the
+  three corrections of #393 took.
 
 The parser's size-only rejections still never quote an oversized field in
 the diagnosis. The quoted reply is what the agent wrote, field included,
