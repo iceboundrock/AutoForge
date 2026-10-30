@@ -481,8 +481,13 @@ claude -p --output-format stream-json --verbose --model <model> --effort <effort
   subtype other than `success`) in any turn, a `result` record with no turn
   left to close, a line that is not JSON, or a turn
   without its `result` record when the CLI exits fails the step as a
-  provider failure. A record larger than the per-line bound is counted and skipped
-  unless it is the `result` record, which must arrive whole.
+  provider failure. A failed turn does not end the CLI, and no later turn
+  can undo the failure, so a CLI still running 10 s after it (a background
+  task kept it alive for another turn) is stopped with everything it
+  started, and the step's error names the failure and the stop
+  (`execution.json`: `ended_by: provider_failure`), not a timeout. A record
+  larger than the per-line bound is counted and skipped unless it is the
+  `result` record, which must arrive whole.
 - `text` is the opt-out: the CLI prints the final text once, at exit, so
   the run shows no progress and gives no sign of activity while it works
   (the pre-launch line, the heartbeat and the end line still appear). It

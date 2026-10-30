@@ -721,7 +721,8 @@ requirement named (#120). Same layout either way:
             execution.json                 # exit code, timing, timed_out, the limit that fired
                                            # (idle / max_runtime / loop), configured limits, last
                                            # activity, truncation, leftovers, error; for an agent
-                                           # also ended_by (exit / idle / max_runtime / loop), loop
+                                           # also ended_by (exit / idle / max_runtime / loop /
+                                           # provider_failure: stopped after its run failed), loop
                                            # detection settings, loop warnings and the loop report
                                            # (names, counts and times only), provider_summary with
                                            # the loop_* calibration fields; the outer sandbox's

@@ -5,6 +5,23 @@ so.
 
 ## Unreleased
 
+### A Claude run whose stream has failed is stopped, not left to its ceiling (#394)
+
+- A failed turn (an API error once the CLI's retries are spent, a
+  non-`success` result, a malformed line) fails the step whatever the CLI
+  does next, but it does not end `claude -p`: a background task the agent
+  left pending keeps the CLI working on another turn. The controller
+  showed nothing more of that work, only heartbeats with an unchanging
+  event count; the CLI's output kept the idle limit away; and the run went
+  on until `max_runtime_seconds`, whose timeout then replaced the real
+  error in the step's message. A CLI still running 10 s after its stream
+  failed is now stopped with everything it started, and the step's error
+  and end line name the failure (`...; claude was still running 10s later
+  and was stopped`). `execution.json` says `ended_by: provider_failure`
+  with exit code -1. A CLI that exits by itself within the 10 s keeps its
+  own status, as before. The state is unchanged and `resume` relaunches
+  the phase, as for any failed launch. Nothing changes a default.
+
 ### A `prompt_version` other than the controller's own is refused (#302)
 
 - `autoforge.example.yaml` set `prompt_version: v1`, and the controller

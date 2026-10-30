@@ -13260,7 +13260,11 @@ class ControllerEngine:
             record.timed_out = result.timed_out
             record.timeout_limit = result.timeout_limit
             record.last_activity_at = result.last_activity_at
-            record.ended_by = (result.timeout_limit or "timeout") if result.timed_out else "exit"
+            if result.timed_out:
+                record.ended_by = result.timeout_limit or "timeout"
+            else:
+                # The adapter stopped a CLI that ran on after its run had failed (#394).
+                record.ended_by = "provider_failure" if result.stopped_on_failure else "exit"
             if result.loop is not None:
                 record.loop = result.loop.record()
                 record.loop_warnings = result.loop.warnings

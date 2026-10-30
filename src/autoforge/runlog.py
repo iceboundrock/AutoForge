@@ -262,9 +262,10 @@ class ExecutionRecord:
     # seen (UTC ISO 8601), ``None`` when it wrote nothing.
     timeout_limit: str = ""
     last_activity_at: str | None = None
-    # An agent's invocation (#194): how it ended (``exit``, or the limit that
-    # killed it: ``idle``, ``max_runtime`` or ``loop``; empty when it could
-    # not be run), the loop detector's settings
+    # An agent's invocation (#194): how it ended (``exit``, the limit that
+    # killed it: ``idle``, ``max_runtime`` or ``loop``, or ``provider_failure``
+    # when the adapter stopped it after its run had already failed, #394;
+    # empty when it could not be run), the loop detector's settings
     # (``LoopDetectionConfig.as_dict``), what the detector found
     # (``LoopReport.record``: names, counts and times, never a tool input,
     # result, output line or digest; ``None`` when nothing) and how many
