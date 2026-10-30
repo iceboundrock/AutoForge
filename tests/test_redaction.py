@@ -445,12 +445,16 @@ def test_redact_obj_suffix_allocation_is_linear_in_the_colliding_keys():
     admits files of tens of megabytes, so `status --json` must not turn a
     mapping whose keys all redact to one text into a quadratic scan of the
     taken suffixes. Rescanning from ``#2`` per entry took seconds at 10,000
-    keys; a per-text counter keeps the whole pass well under the budget."""
+    keys; a per-text counter keeps the whole pass well under the budget.
+
+    The budget is CPU time, the work this process did: other processes on
+    the host (pytest-xdist's other workers) stretch the wall time without
+    changing it, to three times its serial second under ``-n 4`` (#340)."""
     count = 20_000
     value = {f"GITHUB_TOKEN=secret{i}": i for i in range(count)}
-    started = time.perf_counter()
+    started = time.process_time()
     out = redact_obj(value)
-    assert time.perf_counter() - started < 3.0
+    assert time.process_time() - started < 3.0
     assert isinstance(out, dict) and len(out) == count
     assert list(out.values()) == list(range(count))
     assert all(key.startswith("GITHUB_TOKEN=***REDACTED***") for key in out)

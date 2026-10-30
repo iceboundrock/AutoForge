@@ -57,6 +57,7 @@ from autoforge.sandbox import (
     SysPolicy,
     compile_launch,
 )
+from tests.conftest import bind_unix
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "autoforge"
 RO = Access.READ_ONLY
@@ -145,9 +146,26 @@ def _symlinked_source(b: Path) -> tuple[SandboxRequest, str, str]:
 def _socket(b: Path) -> tuple[SandboxRequest, str, str]:
     path = str(b / "agent.sock")
     sock = socket.socket(socket.AF_UNIX)
-    sock.bind(path)
+    bind_unix(sock, b / "agent.sock")
     sock.close()
     return _request(b, projections=(P(path, RO, DECLARED),)), path, "C3 kinds"
+
+
+def test_a_socket_is_bound_at_a_path_longer_than_sun_path(tmp_path: Path) -> None:
+    """``sun_path`` holds 107 bytes; under pytest-xdist or a long ``TMPDIR`` a
+    socket under ``tmp_path`` can be longer (#340). ``conftest.bind_unix``
+    binds it there anyway, and leaves the working directory as it was."""
+    path = _dir(tmp_path / ("d" * 120)) + "/agent.sock"
+    cwd = os.getcwd()
+    sock = socket.socket(socket.AF_UNIX)
+    try:
+        with pytest.raises(OSError, match="too long"):
+            sock.bind(path)
+        bind_unix(sock, Path(path))
+        assert stat.S_ISSOCK(os.lstat(path).st_mode)
+    finally:
+        sock.close()
+    assert os.getcwd() == cwd
 
 
 def _fifo(b: Path) -> tuple[SandboxRequest, str, str]:

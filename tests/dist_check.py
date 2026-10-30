@@ -486,12 +486,23 @@ def smoke(bin_dir: Path, work: Path, version: str) -> None:
 
 
 def _scratch_repository(git: str, repo: Path, env: dict[str, str]) -> Path:
-    """A new git repository at ``repo`` with one empty commit on ``main``."""
+    """A new git repository at ``repo`` with one empty commit on ``main``.
+
+    The commit starts no automatic maintenance: since Git 2.47 ``git commit``
+    leaves ``git maintenance run --auto --detach`` running, which takes
+    ``.git/objects/maintenance.lock`` after the commit has returned, and the
+    REMOTE dry run's comparison of the repository before and after it saw
+    that as the dry run's write when the host was busy (#340).
+    """
     repo.mkdir()
     _run([git, "init", "--quiet", "--initial-branch=main", str(repo)], cwd=repo.parent, env=env)
     _run(
         [
             git,
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
             "-c",
             "user.name=AutoForge dist check",
             "-c",

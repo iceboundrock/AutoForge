@@ -64,7 +64,7 @@ where = ["src"]
 "autoforge.prompts" = ["*.md"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10", "pyyaml>=6"]
+dev = ["pytest>=8", "ruff>=0.4", "mypy>=1.10", "pyyaml>=6", "pytest-xdist>=3.8"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,4 +1,4 @@
-.PHONY: test test-sandbox test-sandbox-measured lint typecheck fmt fmt-check lock-check check check-matrix dist-check sync lock
+.PHONY: test test-parallel test-sandbox test-sandbox-measured lint typecheck fmt fmt-check lock-check check check-matrix dist-check sync lock
 
 # The interpreters the hosted CI matrix runs `pytest` on (`python-version:`
 # in .github/workflows/ci.yml). tests/test_ci_workflow.py fails when the two
@@ -24,6 +24,14 @@ lock-check:
 
 test:
 	uv run pytest
+
+# `test` on several workers (pytest-xdist, #340): the same tests, options and
+# outcomes, which tests/parallel_bench.py reconciled test by test against the
+# serial run (docs/development.md, "The suite on several workers"). Opt-in,
+# like check-matrix: `check` and CI still run `test`.
+PYTEST_WORKERS ?= 4
+test-parallel:
+	uv run pytest -n $(PYTEST_WORKERS) --dist=load
 
 # The tests that launch the real outer-sandbox backend (bubblewrap), on a host
 # that must be able to enforce it: each skips with the probe's reason

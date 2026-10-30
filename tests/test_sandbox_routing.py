@@ -53,6 +53,7 @@ from .conftest import (
     GIT_IDENT,
     SYSTEM_PYTHON,
     FakeGitHub,
+    bind_unix,
     certify_review,
     git_repo,
     make_local_engine,
@@ -198,11 +199,15 @@ def _fake_agent(paths, name: str, output: str, marker: str) -> Path:
     script = (
         f"#!{PY}\n{_PROBE}\n"
         "import socket\n"
+        # By name from its directory, as conftest.bind_unix binds it.
         "def connect_unix(path):\n"
         "    s = socket.socket(socket.AF_UNIX)\n"
+        "    cwd = os.getcwd()\n"
         "    try:\n"
-        "        s.connect(path)\n"
+        "        os.chdir(os.path.dirname(path))\n"
+        "        s.connect(os.path.basename(path))\n"
         "    finally:\n"
+        "        os.chdir(cwd)\n"
         "        s.close()\n"
         "def read_through_link(target):\n"
         "    os.symlink(target, 'escape')\n"
@@ -250,7 +255,7 @@ def test_a_remote_agent_commits_through_the_overlay_and_reaches_nothing_else(
     marker = f"autoforge-routing-{uuid.uuid4().hex}"
     tool = _fake_agent(paths, name, output, marker)
     agent_socket = socket.socket(socket.AF_UNIX)
-    agent_socket.bind(str(paths["base"] / "ssh-agent.sock"))
+    bind_unix(agent_socket, paths["base"] / "ssh-agent.sock")
     agent_socket.listen(1)
     monkeypatch.setenv("HOME", str(paths["home"]))
     monkeypatch.setenv("PATH", f"{tool.parent}:/usr/bin:/bin")
