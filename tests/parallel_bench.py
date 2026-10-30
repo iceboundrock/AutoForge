@@ -481,13 +481,15 @@ def source() -> tuple[str, list[str]]:
     """The commit checked out, and each path ``git status`` lists beside it.
 
     Changed, staged and untracked paths are listed (ignored ones are not): an
-    untracked test module is collected like any other. Raises
-    :class:`UnreadableWorktree` when git fails: a status that could not be
-    read lists nothing, and that is no clean worktree.
+    untracked test module is collected like any other. Untracked files are
+    asked for, each by name, as ``status.showUntrackedFiles=no`` would
+    otherwise hide every one. Raises :class:`UnreadableWorktree` when git
+    fails: a status that could not be read lists nothing, and that is no
+    clean worktree.
     """
     return (
         _git("rev-parse", "HEAD").strip(),
-        _git("--no-optional-locks", "status", "--porcelain").splitlines(),
+        _git("--no-optional-locks", "status", "--porcelain", "--untracked-files=all").splitlines(),
     )
 
 

@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -637,8 +638,57 @@ def test_the_worktree_is_read_from_git_and_a_status_git_cannot_read_is_no_clean_
     assert parallel_bench._git("rev-parse", "HEAD").strip() == head
     problem = parallel_bench.source_problem(head)
     assert problem.startswith(
-        "the worktree could not be read (`git --no-optional-locks status --porcelain` exited 128"
+        "the worktree could not be read "
+        "(`git --no-optional-locks status --porcelain --untracked-files=all` exited 128"
     )
+
+
+def test_an_untracked_module_git_is_set_to_hide_is_refused_before_and_after_a_run(
+    tmp_path, monkeypatch, capsys
+):
+    repo = git_repo(tmp_path / "repo")
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "status.showUntrackedFiles", "no"], check=True
+    )
+    module = repo / "tests" / "test_uncommitted.py"
+    module.parent.mkdir()
+    module.write_text("def test_x(): pass\n")
+    # The setting is in effect: a plain git status lists nothing.
+    plain = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert plain.stdout == ""
+    monkeypatch.setattr(parallel_bench, "REPO_ROOT", repo)
+    real_source = parallel_bench.source
+    made = _fake_runs(monkeypatch, commit=real_source()[0])
+    monkeypatch.setattr(parallel_bench, "source", real_source)
+    out = tmp_path / "out"
+    argv = ["--config", "serial", "--repeats", "1", "--out", str(out)]
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(argv)
+    assert exited.value.code == 2
+    assert "uncommitted changes (tests/test_uncommitted.py)" in capsys.readouterr().err
+    assert made == [] and not out.exists()
+
+    module.unlink()
+    fake = parallel_bench.run_pytest
+
+    def run_while_adding(*args):
+        module.write_text("def test_x(): pass\n")
+        return fake(*args)
+
+    monkeypatch.setattr(parallel_bench, "run_pytest", run_while_adding)
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(argv)
+    assert exited.value.code == 2
+    err = capsys.readouterr().err
+    assert "uncommitted changes (tests/test_uncommitted.py)" in err
+    assert "serial-0 not recorded" in err
+    assert made == ["serial-0"]
+    assert not (out / "serial-0.json").exists()
 
 
 def test_a_worktree_git_cannot_read_is_refused_before_and_after_a_run(
