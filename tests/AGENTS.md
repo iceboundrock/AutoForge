@@ -49,9 +49,13 @@ read it before adding tests for a listed area.
   reaches for GitHub.
 - `engine`, `fake_github`, `tmp_state_dir`, `repo` and `make_engine` /
   `make_local_engine` build a controller against those fakes; `block(...)`
-  builds a well-formed `CONTROL_RESULT` block. The controller posts the
-  review comment (#162): a reviewer returns `review_result(...)` (the full
-  REMOTE `REVIEW` payload, prose included) and posts nothing, and
+  builds a well-formed `CONTROL_RESULT` block. A `make_engine` engine never
+  sleeps: a read-back waiting for GitHub to move a PR head after the
+  controller's push (#403) records each pause in `eng.sleeps`, and
+  `FakeGitHub.pr_heads_lag` keeps the PR heads where they are. The
+  controller posts the review comment (#162): a reviewer returns
+  `review_result(...)` (the full REMOTE `REVIEW` payload, prose included)
+  and posts nothing, and
   `controller_review_comment(eng, round)` returns the one comment carrying
   that round's marker. `review_comment_body(...)` builds a comment someone
   else posted: an earlier round's evidence for a test that starts past
