@@ -673,10 +673,13 @@ No probe consumes a review round, a `review_history` entry, or an attempt.
 exits 0 but its `CONTROL_RESULT` is missing or invalid, the controller
 re-invokes it (`execution.max_correction_attempts`, default once) with a
 correction prompt that tells it to inspect real Git/GitHub state first and
-not repeat completed operations. The correction is a re-entry like `resume`:
-the same GitHub reconciliation above runs before the relaunch, so an agent
-that created the PR, pushed the fix, or posted the comment before losing its
-result block is reconciled with (the PR adopted, the pushed HEAD reviewed,
+not repeat completed operations, and quotes the end of the refused launch's
+final reply, redacted and bounded, as untrusted data to orient by, never as
+evidence (#393; [control-result-protocol.md](control-result-protocol.md),
+"The correction quotes the refused reply"). The correction is a re-entry
+like `resume`: the same GitHub reconciliation above runs before the
+relaunch, so an agent that created the PR, pushed the fix, or posted the
+comment before losing its result block is reconciled with (the PR adopted, the pushed HEAD reviewed,
 the comment handed over) rather than relaunched. In LOCAL mode a correction
 is one more write-capable launch, so it is charged against and checkpointed
 in the same durable per-phase bound (three launches per phase entry) as the

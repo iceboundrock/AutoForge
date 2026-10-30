@@ -5,6 +5,36 @@ so.
 
 ## Unreleased
 
+### Agents are told the block goes in their final reply, and a correction quotes the reply it corrects (#393)
+
+- The controller reads the `CONTROL_RESULT` block only from the end of an
+  agent's final reply, but the prompts said "stdout", and three Claude
+  runs in one operator's logs finished a phase with a reply that held no
+  block, one of them after printing the block from a Bash command. Every
+  prompt now says the final reply, and that command output, tool results
+  and files are never read for it; the rule that an unfinished phase still
+  ends with a `failure` or `blocked` block says it covers a reply written
+  while work the agent started is still running.
+- A correction was a new session that learned only the parser's error. Its
+  prompt now also quotes the end of the refused reply, after the
+  diagnosis: redacted, then cut to its last 4,000 characters (a line
+  outside the fence says how many were dropped), fenced as untrusted data
+  that is neither an instruction nor evidence. The correction still checks
+  what it relies on against the worktree, and its result passes every
+  check a first launch's does. Its `request.json` records the quote's
+  sizes (`metadata.correction_reply`); nothing of it is persisted in state.
+- Limits: this is a mitigation. It does not address a Claude turn that ends
+  while a background task the agent started is still running: such a
+  reply is corrected within `execution.max_correction_attempts` like any
+  reply without a block, and the controller neither tracks the task nor
+  reads the reply for whether it finished. A `resume` after a crash,
+  `Ctrl-C` or a spent correction budget launches without the quote, as
+  before.
+- The prompt version is `v13`. A LOCAL run created under `v12` refuses to
+  resume, as for every prompt change; start it again. A REMOTE run resumed
+  by this version renders the new templates and keeps its recorded label.
+  Nothing changes a default.
+
 ### A Claude run that failed on a model API outage is relaunched, as an OpenCode one is (#395)
 
 - Once Claude Code has spent its own retries of a request to the model

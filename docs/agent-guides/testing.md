@@ -383,6 +383,18 @@ High-priority coverage includes:
   `orphan_survived_kill`) is not corrected, in REMOTE and LOCAL mode, and
   the error names the leftover; `orphans_unchecked` alone is still corrected
   (#209)
+- a correction quotes the end of the refused launch's final reply (#393),
+  in REMOTE and LOCAL mode, for a reply without markers, markers around
+  invalid JSON, a YAML-like section, a commit made without a block (the
+  correction's block still checked against the worktree, another
+  `head_sha` refused), a reply saying a task is still running (corrected
+  within the bound, then the usual `ControlResultValidationError`), and a
+  Claude reply whose block only a Bash command printed (the tool output
+  never quoted); the quote is redacted before it is bounded (a secret
+  across the bound), the same every time, verbatim inside one fence
+  (instruction-shaped lines, a long backtick run, `{{...}}` text), replaced
+  by each correction, kept by a transient relaunch, never in state or the
+  read context, and a block inside it never counts
 - an agent failure that leaves the state unchanged (a timeout, a failed
   exit, a provider failure, a launch the executor refused, a malformed
   result not corrected, with or without a survivor) says `State unchanged`

@@ -1000,6 +1000,68 @@ def render_validation_failure(view: RecordView, count: int) -> str:
     )
 
 
+# How much of a refused launch's final reply its correction quotes (#393):
+# the last characters of the redacted reply. 4,000 keeps whole the longest
+# refused reply #393 records (3,222 characters, the run on #340) and bounds
+# what a runaway reply adds to the prompt.
+MAX_CORRECTION_REPLY_CHARS = 4000
+# What ``{{PREVIOUS_REPLY_BLOCK}}`` holds for a reply with no text in it,
+# rather than an empty fence.
+CORRECTION_REPLY_EMPTY = "(Your previous final reply held no text.)"
+
+
+@dataclass(frozen=True)
+class ReplyExcerpt:
+    """The end of a refused launch's final reply, as its correction quotes it (#393).
+
+    Built by :meth:`of` from the launch's ``stdout_tail``, exactly the text
+    :func:`parse_control_result` searched, and from nothing else of the
+    launch. The reply is redacted whole and only then cut to its last
+    :data:`MAX_CORRECTION_REPLY_CHARS` characters: the order
+    :func:`~autoforge.state.bound_block_reason` follows, since a secret cut
+    by the bound would no longer match its pattern. ``total`` is the length
+    of the redacted reply. The same reply always gives the same excerpt.
+
+    Untrusted agent text, held only by the ``_invoke_phase`` call that
+    refused the reply: never persisted, and never read back for state, a
+    candidate, evidence or a phase. The run log records its sizes alone
+    (:meth:`metadata`).
+    """
+
+    text: str
+    total: int
+
+    @classmethod
+    def of(cls, reply: str) -> ReplyExcerpt:
+        clean = redact(reply)
+        return cls(clean[-MAX_CORRECTION_REPLY_CHARS:], len(clean))
+
+    @property
+    def cut(self) -> bool:
+        return len(self.text) < self.total
+
+    def metadata(self) -> dict[str, int | bool]:
+        """The sizes a correction's ``request.json`` records, never the text."""
+        return {"kept_chars": len(self.text), "reply_chars": self.total, "cut": self.cut}
+
+    def render(self) -> str:
+        """``{{PREVIOUS_REPLY_BLOCK}}``: the controller's omission line, then the fenced text.
+
+        The omission line, outside the fence, is there only when characters
+        were dropped. A reply with no text in it renders
+        :data:`CORRECTION_REPLY_EMPTY`.
+        """
+        if not self.cut and not self.text.strip():
+            return CORRECTION_REPLY_EMPTY
+        block = fenced_untrusted_block(self.text, "text")
+        if not self.cut:
+            return block
+        return (
+            f"[AutoForge omitted the first {self.total - len(self.text)} of {self.total} "
+            f"characters of that reply; the last {len(self.text)} follow.]\n\n{block}"
+        )
+
+
 def generate_run_id() -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"af-{stamp}-{secrets.token_hex(3)}"
@@ -4160,7 +4222,20 @@ class ControllerEngine:
             return UPDATE_EPIC_RE_REQUEST_TEMPLATE
         return template
 
-    def render_prompt_for(self, phase: Phase, correction_error: str | None = None) -> str:
+    def render_prompt_for(
+        self,
+        phase: Phase,
+        correction_error: str | None = None,
+        previous_reply: ReplyExcerpt | None = None,
+    ) -> str:
+        """The prompt of the next launch of ``phase``; a correction's with ``correction_error``.
+
+        A correction quotes the diagnosis and the end of the refused reply
+        (``previous_reply``, #393), each fenced as untrusted data. Without an
+        excerpt the correction template's ``{{PREVIOUS_REPLY_BLOCK}}`` is
+        left unfilled, so the render refuses it rather than send a
+        correction that does not show the reply it corrects.
+        """
         local = self.mode == WorkflowMode.LOCAL
         template = self._launch_template(phase)
         if template is None:
@@ -4176,7 +4251,12 @@ class ControllerEngine:
         if correction_error is not None:
             correction = render(
                 load_template("correction.md"),
-                {"PREVIOUS_ERROR_BLOCK": fenced_untrusted_block(correction_error[:2000], "text")},
+                {
+                    "PREVIOUS_ERROR_BLOCK": fenced_untrusted_block(correction_error[:2000], "text"),
+                    "PREVIOUS_REPLY_BLOCK": (
+                        previous_reply.render() if previous_reply is not None else None
+                    ),
+                },
             )
             prompt = prompt + "\n\n---\n\n" + correction
         return prompt
@@ -13048,6 +13128,10 @@ class ControllerEngine:
         (:attr:`AgentExecutionResult.may_have_survivor`): the relaunch would
         race it in the same working directory.
 
+        A correction quotes the end of the refused launch's final reply
+        (:class:`ReplyExcerpt`, #393): untrusted text to orient the new
+        session, held only here, never persisted and never read back.
+
         A launch that times out, fails or cannot be run, and a result that
         is not corrected, raise with the phase unchanged; the step completes
         their text (:meth:`_state_unchanged_text`) from the working directory
@@ -13086,6 +13170,11 @@ class ControllerEngine:
         # capability it goes through.
         logger = self._logger()
         correction_error: str | None = None
+        # The end of the refused launch's final reply, which the correction
+        # quotes (#393). Set and replaced together with ``correction_error``:
+        # a transient relaunch after a correction keeps both, and each
+        # correction quotes the launch just before it, never an earlier one.
+        previous_reply: ReplyExcerpt | None = None
         attempt = 0
         corrections_used = 0
         transient_retries = 0
@@ -13134,7 +13223,7 @@ class ControllerEngine:
             if state.mode == WorkflowMode.REMOTE and phase in WORKTREE_STATE_PHASES:
                 self._worktree_state, worktree_note = self._read_worktree_state(cwd)
             try:
-                prompt = self.render_prompt_for(phase, correction_error)
+                prompt = self.render_prompt_for(phase, correction_error, previous_reply)
             finally:
                 self._read_context_dir = None
                 self._worktree_state = None
@@ -13226,6 +13315,9 @@ class ControllerEngine:
             )
             if worktree_note is not None:
                 record.metadata["worktree_state"] = worktree_note
+            if previous_reply is not None:
+                # The quoted reply's sizes, never its text (#393).
+                record.metadata["correction_reply"] = previous_reply.metadata()
             result: AgentExecutionResult | None = None
             self._import_problem = ""
             try:
@@ -13455,6 +13547,7 @@ class ControllerEngine:
                     # the top of the loop charges it against the same durable
                     # bound as the launch that preceded it, or refuses.
                     correction_error = f"{type(exc).__name__}: {detail}"
+                    previous_reply = ReplyExcerpt.of(result.stdout_tail)
                     corrections_used += 1
                     continue
                 raise ControlResultValidationError(failed) from exc

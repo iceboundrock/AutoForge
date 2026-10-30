@@ -364,6 +364,15 @@ of that read (`metadata.worktree_state` in `request.json`), which quotes a
 failed read's last git output line, crosses `redact_dict` with the rest of
 the metadata.
 
+A correction's prompt quotes the end of the refused launch's final reply
+(#393). `ReplyExcerpt.of` redacts the whole reply and only then keeps its
+last `MAX_CORRECTION_REPLY_CHARS` characters, the order the block-reason
+writers follow, so a secret the bound would cut in half is replaced before
+the cut. The quote is redacted before the agent sees it, not only where
+`prompt.md` logs it, and state never holds it; the run log records its
+sizes alone (`metadata.correction_reply` in `request.json`).
+`tests/test_engine.py` puts a secret across the bound.
+
 `redact_obj` / `redact_dict` redact mapping keys as well as values, and a
 mapping never loses an entry to that: two distinct keys that redact to the
 same text (`GITHUB_TOKEN=a`, `GITHUB_TOKEN=b`) are kept apart with a `#2`,

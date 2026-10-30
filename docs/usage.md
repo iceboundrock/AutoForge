@@ -1023,8 +1023,17 @@ ownership or discard uncommitted user changes.
   [Workflow: re-entering a phase](agent-guides/workflow.md#re-entering-a-phase).
 - **An agent failed, timed out or returned a malformed result:** a malformed
   `CONTROL_RESULT` from an agent that exited 0 is retried with a correction
-  prompt (`execution.max_correction_attempts`, default once), unless that
-  launch may have left a process running: then the error says so
+  prompt (`execution.max_correction_attempts`, default once). The controller
+  reads the block only from the end of the agent's final reply, never from
+  a command's output or a file, and the correction prompt quotes the end of
+  the refused reply (its last 4,000 characters, redacted, fenced as
+  untrusted data) after the controller's diagnosis, so the new session can
+  see what the previous one said it had done; it still checks that against
+  the worktree. The correction's `request.json` records the quote's sizes
+  (`metadata.correction_reply`), its `prompt.md` the quote as sent. A
+  `resume` after a crash or a spent correction budget quotes nothing. No
+  correction is launched when the refused launch may have left a process
+  running: then the error says so
   (`Not re-invoked: a process the launch started may still be running`,
   followed by which one); stop it before `resume`. The one failed
   exit relaunched automatically is a launch its adapter reports as transient
