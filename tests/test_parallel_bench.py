@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import re
 from pathlib import Path
 
 import pytest
@@ -508,11 +510,14 @@ def test_an_out_directory_of_another_commit_is_refused(tmp_path, monkeypatch, ca
 @pytest.mark.parametrize(
     ("key", "first", "then"),
     [
+        # Another machine whose other facts all match.
+        ("host_id", "0d1f6a9c3b2e4f70", "7c41e09b5a3d2f18"),
+        ("cpu_model", "Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz", "AMD Ryzen 5 5600X"),
         ("cpu_affinity", [0, 1], [0, 6]),  # one size, other cores
         ("tmpdir", "/tmp", "/var/tmp/bench-tmp"),
     ],
 )
-def test_an_out_directory_of_another_cpu_set_or_tmpdir_is_refused(
+def test_an_out_directory_of_another_host_cpu_set_or_tmpdir_is_refused(
     tmp_path, monkeypatch, capsys, key, first, then
 ):
     out = tmp_path / "out"
@@ -526,6 +531,42 @@ def test_an_out_directory_of_another_cpu_set_or_tmpdir_is_refused(
     assert exited.value.code == 2
     assert f"holds runs measured with another {key}" in capsys.readouterr().err
     assert made == []
+
+
+def test_the_host_is_a_keyed_hash_of_its_machine_id_and_name():
+    machine_id = "4f2b9e0c7d1a43e6b8c5f9a2d7e0b1c3"
+    host = parallel_bench.host_id(machine_id, "bench")
+    assert re.fullmatch(r"[0-9a-f]{16}", host)
+    assert host == parallel_bench.host_id(machine_id, "bench")
+    assert host != parallel_bench.host_id(machine_id[:-1] + "4", "bench")
+    assert host != parallel_bench.host_id(machine_id, "bench2")
+    assert machine_id[:16] not in host
+
+
+@pytest.mark.parametrize(
+    ("cpuinfo", "model"),
+    [
+        (
+            "processor\t: 0\nmodel name\t: Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz\n\n"
+            "processor\t: 1\nmodel name\t: Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz\n",
+            "Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz",
+        ),
+        ("model name\t: B core\nmodel name\t: A core\nmodel\t\t: 158\n", "A core; B core"),
+        ("processor\t: 0\nCPU part\t: 0xd08\n", "unknown"),
+        ("", "unknown"),
+    ],
+)
+def test_the_cpu_model_is_each_model_name_cpuinfo_lists(cpuinfo, model):
+    assert parallel_bench.cpu_model(cpuinfo) == model
+
+
+def test_provenance_has_every_fact_a_resume_compares_and_no_machine_id(monkeypatch):
+    machine_id = "4f2b9e0c7d1a43e6b8c5f9a2d7e0b1c3"
+    monkeypatch.setattr(parallel_bench, "_machine_id", lambda: machine_id)
+    facts = parallel_bench.provenance()
+    assert set(parallel_bench.COMPARABLE) - {"pytest_args"} <= set(facts)
+    assert facts["host_id"] == parallel_bench.host_id(machine_id, platform.node())
+    assert machine_id not in json.dumps(facts)
 
 
 def test_a_worktree_with_changes_is_refused_before_anything_runs(tmp_path, monkeypatch, capsys):

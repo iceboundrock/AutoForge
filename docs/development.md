@@ -243,14 +243,15 @@ folded into a total. Each run loads the tool as a pytest plugin that
 records how pytest-xdist actually ran it, and a run that did not run as its
 configuration names stops the benchmark unrecorded: a `-n` in
 `PYTEST_ADDOPTS` or after `--` applies to every configuration, `serial`
-included. Only a clean run is timed: the median and p95 (nearest
-rank: with fewer than 20 repeats, the slowest run) of a configuration are
-its clean runs', and it has none when no run was clean. It measures a
-commit, refusing a worktree with anything changed or untracked, or one git
-fails to read, and records the host's provenance. The same command on the same `--out` resumes an
-interrupted benchmark, running again any run that left no JUnit report, and
-refuses an `--out` measured on another commit, interpreter, host or set of
-CPUs:
+included. Only a clean run is timed: the median and p95 (nearest rank: with
+fewer than 20 repeats, the slowest run) of a configuration are its clean
+runs', and it has none when no run was clean. It measures a commit,
+refusing a worktree with anything changed or untracked, or one git fails to
+read, and records the host's provenance. The same command on the same
+`--out` resumes an interrupted benchmark, running again any run that left
+no JUnit report, and refuses an `--out` measured on another commit,
+interpreter, host (the machine, by a keyed hash of its machine ID and host
+name, and its CPU model) or set of CPUs:
 
 ```bash
 uv run --isolated --locked --python 3.12 python -m tests.parallel_bench \

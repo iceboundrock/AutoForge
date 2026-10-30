@@ -17,8 +17,9 @@ configuration's median and p95 (nearest rank: with fewer than 20 repeats
 that is the slowest run) over its clean runs only, and none for a
 configuration without one; without a passing serial run nothing is
 reconciled and nothing is timed. It also gives the host the numbers came
-from: commit, interpreter, pytest and xdist versions, CPUs, memory, kernel,
-git and the load average around every run.
+from: commit, interpreter, pytest and xdist versions, the machine (a keyed
+hash of its machine ID and host name), CPU model, CPUs, memory, kernel, git
+and the load average around every run.
 
 Runs are interleaved (every configuration once, then every configuration
 again), so a change in the host's load over the session spreads across all
@@ -50,16 +51,18 @@ log and a record per run, and ``results.json``; the Markdown report goes to
 stdout. The same command again, on the same ``--out``, keeps every run that
 has its record and makes only the others, so a benchmark of several hours
 survives an interruption; it refuses an ``--out`` measured on another commit,
-interpreter, pytest, xdist, host (CPUs, memory, kernel, git), set of CPUs
-this process may run on, temporary directory, or pytest arguments. A run is
-recorded only once its JUnit report reads: one that left none (pytest could
-not start, or was killed) is reported as failed, not reconciled or timed,
-and runs again on resume.
+interpreter, pytest, xdist, host (the machine, its CPU model, CPUs, memory,
+kernel, git), set of CPUs this process may run on, temporary directory, or
+pytest arguments. A run is recorded only once its JUnit report reads: one
+that left none (pytest could not start, or was killed) is reported as
+failed, not reconciled or timed, and runs again on resume.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -369,6 +372,47 @@ def _mem_total() -> str:
     return "unknown"
 
 
+def _machine_id() -> str:
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            return Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    return ""
+
+
+# machine-id(5): the ID is confidential, and an application that needs a stable
+# identifier of the machine records a hash of it keyed with its own fixed key.
+_HOST_KEY = b"autoforge tests/parallel_bench host"
+
+
+def host_id(machine_id: str, hostname: str) -> str:
+    """The machine, by a keyed hash of its machine ID and host name.
+
+    The machine ID tells installations apart, the host name machines without
+    one; a change in either is another host.
+    """
+    message = f"{machine_id}\0{hostname}".encode()
+    return hmac.new(_HOST_KEY, message, hashlib.sha256).hexdigest()[:16]
+
+
+def cpu_model(cpuinfo: str) -> str:
+    """Each CPU model ``/proc/cpuinfo`` names (``model name``); ``unknown`` without one."""
+    models = {
+        value.strip()
+        for key, sep, value in (line.partition(":") for line in cpuinfo.splitlines())
+        if sep and key.strip() == "model name"
+    }
+    return "; ".join(sorted(models)) or "unknown"
+
+
+def _cpuinfo() -> str:
+    try:
+        return Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def provenance() -> dict[str, object]:
     """Where and on what the numbers were measured."""
     affinity = sorted(os.sched_getaffinity(0))
@@ -378,6 +422,8 @@ def provenance() -> dict[str, object]:
         "python": platform.python_version(),
         "pytest": _version("pytest"),
         "pytest_xdist": _version("pytest-xdist"),
+        "host_id": host_id(_machine_id(), platform.node()),
+        "cpu_model": cpu_model(_cpuinfo()),
         "cpus": os.cpu_count(),
         "cpus_usable": len(affinity),
         "cpu_affinity": affinity,
@@ -390,15 +436,19 @@ def provenance() -> dict[str, object]:
 
 
 # What two sessions on one --out must share for their runs to be comparable. The
-# source is the commit alone, as a worktree with changes is refused; the CPUs are
-# the set this process may run on, not only how many: two sets of one size can
-# differ in which cores share a physical one. The temporary directory holds every
-# test's tmp_path: its file system and the length of its path change what runs.
+# source is the commit alone, as a worktree with changes is refused. The host is
+# the machine and its CPU model as well as the facts below, which two machines
+# with CPUs of different speeds can share. The CPUs are the set this process may
+# run on, not only how many: two sets of one size can differ in which cores share
+# a physical one. The temporary directory holds every test's tmp_path: its file
+# system and the length of its path change what runs.
 COMPARABLE = (
     "commit",
     "python",
     "pytest",
     "pytest_xdist",
+    "host_id",
+    "cpu_model",
     "cpus",
     "cpu_affinity",
     "memory",
