@@ -16,6 +16,15 @@ so.
   sandbox as the sandbox rewrites it. Commands that run after a snapshot
   are unchanged. Nothing changes a default.
 
+### A provider path under `~/.cache` is refused naming `~/.cache` (#301)
+
+- Under `required`, a launch that gets the persistent cache shows it at
+  `~/.cache`, so it refuses a provider CLI or a provider's directory under
+  your `~/.cache` (C6), as before. The refusal named only the cache's
+  directory in the repository (`.git/autoforge/sandbox/<n>/cache`), which
+  does not contain the path refused; it now also names `~/.cache`, where
+  that directory appears. Nothing changes a default.
+
 ## 0.1.0a0 (2026-10-28)
 
 `autoforge-cli` `0.1.0a0` is #295's registration prerelease: a pre-Alpha

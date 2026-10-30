@@ -1148,9 +1148,12 @@ def _place_declared(proj: _Proj, entries: list[Mount], declared: list[_Proj]) ->
         consistent = _rebase(proj.target, outer.target, outer.source) == proj.source
         if outer.access is Access.READ_ONLY and proj.access is Access.READ_ONLY and consistent:
             return None
-        raise _refuse(
-            proj.source, "C6 overlaps", f"{proj.label} overlaps the projection {outer.source}"
+        # A relocated projection (the cache at ``~/.cache``) is named where it
+        # appears too: its source alone does not overlap the path (#301).
+        where = (
+            outer.source if outer.target == outer.source else f"of {outer.source} at {outer.target}"
         )
+        raise _refuse(proj.source, "C6 overlaps", f"{proj.label} overlaps the projection {where}")
     if isinstance(outer, Overlay | Link):
         raise _refuse(proj.source, "C6 overlaps", f"{proj.label} overlaps {outer.target}")
     return Bind(proj.source, proj.target, proj.access, proj.is_dir)

@@ -373,6 +373,44 @@ def test_a_path_in_a_relocated_projection_is_named_where_it_appears(tmp_path):
     assert env_set["PATH"] == f"{inside / 'bin'}:/usr/bin"
 
 
+@pytest.mark.parametrize("access", [Access.READ_ONLY, Access.WRITABLE])
+def test_a_provider_path_under_the_relocated_cache_is_refused_where_it_appears(tmp_path, access):
+    """The cache projected at ``~/.cache`` hides the operator's own, so a
+    provider path there (a ``TMPDIR`` under ``~/.cache``, #301) is refused
+    (C6), naming the cache directory and where it appears. Without the
+    persistent cache the path lies in the private home and is projected."""
+    paths = _layout(tmp_path)
+    under = paths["home"] / ".cache" / "tmp" / "pi"
+    under.mkdir(parents=True)
+    needs = (
+        ProviderRequirements(install_roots=(str(under),))
+        if access is Access.READ_ONLY
+        else ProviderRequirements(
+            auth=(AuthItem(AuthMode.DIR_RW, "Pi", str(under), env_name="PI_CODING_AGENT_DIR"),)
+        )
+    )
+    with pytest.raises(SandboxLaunchRefusedError, match="C6 overlaps") as caught:
+        describe_launch(_remote(paths), needs, {})
+    cache, inside = paths["sandbox"] / "cache", paths["home"] / ".cache"
+    assert f"refuses {under}: C6 overlaps:" in str(caught.value)
+    assert f"overlaps the projection of {cache} at {inside}" in str(caught.value)
+    description = describe_launch(_remote(paths, cache=False), needs, {})
+    assert _mount(description, str(under)).access is access
+
+
+def test_a_provider_path_in_a_projection_at_its_own_path_is_refused_naming_it_once(tmp_path):
+    """C6: a writable declared directory inside the launch's read-only
+    configuration, projected where it lies on the host, names that path."""
+    paths = _layout(tmp_path)
+    inner = paths["config"] / "gh"
+    needs = ProviderRequirements(state=(str(inner),))
+    with pytest.raises(SandboxLaunchRefusedError, match="C6 overlaps") as caught:
+        describe_launch(_remote(paths), needs, {})
+    assert str(caught.value).endswith(
+        f"{inner} (provider) overlaps the projection {paths['config']}"
+    )
+
+
 def test_linked_path_entries_are_named_where_they_are_projected(tmp_path):
     """A ``PATH`` entry through a link the sandbox does not recreate is the
     projected directory; one through a link it recreates keeps its spelling."""

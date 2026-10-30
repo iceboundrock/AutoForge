@@ -628,6 +628,11 @@ Four more files, the same split by what they need from the host:
   - the D7.2 refusals, each naming the path and the rule: a declared
     writable directory on an operator root, a keyring login, a declared
     path inside a denied root; an auth directory named by its variable;
+  - the C6 refusal of a provider path inside a projection: one under the
+    cache at `~/.cache`, read-only or writable, names the cache directory
+    and `~/.cache` (a launch without the cache projects it in the private
+    home), and one inside a projection at its own path names that path
+    (#301);
   - install roots (the package or the directory, a prefix with its `lib`,
     never the home) and a script's interpreter; an absolute `#!` through
     a link outside every root as a spelled path whose one link is
@@ -750,8 +755,10 @@ Four more files, the same split by what they need from the host:
   export command that sees its tree and no network when isolated; a
   `required` LOCAL run that reaches `DONE`; a `required` pre-merge command
   that sees only the export; an all-Pi run sandboxed in every child,
-  the auth preflight included; a `HEAD` an agent replaced with a link to a
-  file invisible inside, which the import refuses before git reads it,
+  the auth preflight included, under a home of its own so that a `TMPDIR`
+  under `~/.cache` does not put its Pi paths under the cache (#301); a
+  `HEAD` an agent replaced with a link to a file invisible inside, which
+  the import refuses before git reads it,
   leaving the commit out of the shared store; such a `HEAD` link, or a
   reference a regular `HEAD` names, to a FIFO on the host that neither the
   import, the candidate read, the registry listing nor the binding opens
