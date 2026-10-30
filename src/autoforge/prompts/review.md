@@ -77,8 +77,9 @@ the run: it is never adopted.
    body, base or labels, close or reopen it, request or submit a GitHub
    review, or resolve conversations. A defect you find, a typo included,
    is a finding for the FIX round, never something you fix yourself. You
-   write nothing to GitHub at all; your only output is the CONTROL_RESULT on
-   stdout, from which the controller posts the round's comment. The
+   write nothing to GitHub at all; your only output is the CONTROL_RESULT at
+   the end of your final reply, from which the controller posts the round's
+   comment. The
    controller reads the PR HEAD again after
    you exit: the round is bound to `{{REVIEWED_HEAD_SHA}}`, and a push
    during it, yours included, makes the round stale: it is consumed against

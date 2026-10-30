@@ -195,7 +195,7 @@ you are asked to correct it, when it contains:
 
 ## CONTROL_RESULT schema (exact)
 
-Emit exactly one block at the end of stdout:
+Emit exactly one block at the end of your final reply:
 
 ```text
 <<<CONTROL_RESULT>>>

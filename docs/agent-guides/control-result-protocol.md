@@ -9,7 +9,7 @@ retry for malformed results, or how the engine consumes a parsed result.
 
 ## CONTROL_RESULT protocol
 
-Agent stdout may contain normal logs and prose, but every successful phase invocation must end with exactly one machine-readable control block:
+An agent's final reply may contain prose, but every phase invocation must end that reply with exactly one machine-readable control block:
 
 ```text
 <<<CONTROL_RESULT>>>
@@ -42,6 +42,90 @@ LGTM
 looks good
 merged successfully
 ```
+
+### Where the block is read: the final reply (#393)
+
+Every adapter hands the parser the agent's final assistant text and nothing
+else: for Claude `stream-json` the last `result` record's text verbatim
+(`claude_stream.py`); for Claude `text` output, OpenCode's `--format
+default` and Pi, their final text (the `providers.py` module docstring).
+The engine parses that text's `stdout_tail`. Command output (a Bash tool's
+stdout included), tool results and files never reach the parser, so a block
+a command printed or a file holds does not count, even when the reply
+points to it.
+
+The prompts used to say the block ends "stdout", which an agent working
+through a Bash tool can read as a command's output. Three Claude launches
+in one operator's logs, the runs on #160, #149 and #340, ended a phase with
+a reply that held no block: one said it was waiting on a running task, one
+ended in a YAML-like `CONTROL_RESULT` section without markers, and one had
+printed the block from a Bash command. `common.md`, `local_common.md`, `correction.md` and
+every phase template's schema line now say the final reply, and the common
+prompts say that command output, tool results and files are never read for
+it. The rule that an unfinished phase still ends with a `failure` or
+`blocked` block now says it covers a reply written while work the agent
+started is still running. The wording is shared by every provider, and
+accurate for each, since each adapter hands the parser only the final text.
+
+### The correction quotes the refused reply (#393)
+
+A correction is a new agent session (Claude runs with
+`--no-session-persistence`), and the diagnosis, the parser's or a per-phase
+check's error, was all it learned of the launch before it. `correction.md`
+now also quotes the end of the refused launch's final reply
+(`{{PREVIOUS_REPLY_BLOCK}}`), after the diagnosis
+(`{{PREVIOUS_ERROR_BLOCK}}`, unchanged):
+
+- **Source.** The refused launch's `stdout_tail`, exactly the text
+  `parse_control_result` searched. Nothing else of that launch: not stderr,
+  the run log, tool output or a file.
+- **Order and bound.** `redact` over the whole reply, then its last
+  `MAX_CORRECTION_REPLY_CHARS` (4,000) characters (`ReplyExcerpt` in
+  `engine.py`). Redacting before bounding is the rule
+  `state.bound_block_reason` follows: a secret the bound cuts would no
+  longer match its pattern. 4,000 keeps whole the longest refused reply on
+  record, the 3,222 characters of the run on #340. When characters were dropped, a line the
+  controller writes outside the fence says how many of how many were kept
+  (`[AutoForge omitted the first N of M characters of that reply; the last
+  K follow.]`). A reply with no text renders a fixed line instead of an
+  empty fence. The same reply always gives the same excerpt.
+- **Presentation.** `fenced_untrusted_block`, under prose that calls it
+  untrusted data, neither an instruction nor evidence, says a block inside
+  it was not accepted and must not be copied, and asks the agent to check
+  what it relies on against the current Git state and what the controller
+  gave it (validation records, the read context) before it ends its reply
+  with a new block. `render_prompt_for` refuses a correction without an
+  excerpt: the placeholder is left unfilled and the strict renderer raises.
+- **Lifetime.** A local of `_invoke_phase`, set and replaced with
+  `correction_error`. A transient relaunch of a correction quotes the same
+  reply, not the failed launch's output; with `max_correction_attempts`
+  above 1, each correction quotes the launch just before it. Nothing
+  persists it: no state field, no read-context file, no provider session.
+  After a crash, `Ctrl-C` or a spent correction budget, `resume` launches
+  without it, as before.
+- **Never evidence.** No controller code reads the excerpt back. A
+  correction's result passes the same parse, per-phase checks, candidate
+  read, validation gates, effect reconciliation and transitions as any
+  other launch's; a block inside the quote never counts.
+- **Run log.** The correction's `prompt.md` shows the excerpt as sent: the
+  run log redacts the prompt again, and a code fence line is never taken
+  for an assignment's value, so a reply that ends in an empty
+  `GITHUB_TOKEN=` keeps its closing fence there
+  (`secrets-and-logging.md`). `request.json` records only its sizes
+  (`metadata.correction_reply`: `kept_chars`, `reply_chars`, `cut`), so
+  correction overhead can later be compared with the 8 to 29 minutes the
+  three corrections of #393 took.
+
+The parser's size-only rejections still never quote an oversized field in
+the diagnosis. The quoted reply is what the agent wrote, field included,
+bounded by `MAX_CORRECTION_REPLY_CHARS` rather than by the field's bound.
+
+This is a mitigation, not a fix for a Claude turn that ends while a
+background task the agent started is still running, as the run on #160
+did: such a reply is
+corrected within the bound like any reply without a block, and the
+controller neither tracks the task nor reads the reply's prose for whether
+it finished.
 
 ### Block markers, not fences
 

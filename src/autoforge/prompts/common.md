@@ -97,8 +97,10 @@ directory. Every commit you need is in the local object store: use `git`.
 
 ## Output protocol (mandatory)
 
-Your stdout may contain any human-readable progress logs, but it MUST end
-with exactly one machine-readable block:
+The controller reads your result from one place only: the end of your
+final reply, the last message you write before you finish. That reply may
+contain any human-readable summary, but it MUST end with exactly one
+machine-readable block:
 
 ```text
 <<<CONTROL_RESULT>>>
@@ -110,7 +112,11 @@ with exactly one machine-readable block:
   (booleans are `true`/`false`, SHAs are the full 40-character strings that
   `git rev-parse` returned verbatim;
   the controller rejects an abbreviated SHA).
-- Emit the block only once, as the very last thing on stdout. The
+- Write the block itself in that final reply. The controller never reads
+  command output (the stdout of a Bash command included), tool results or
+  files for it: a block that a command prints or a file holds does not
+  count, even when your reply points to it.
+- Emit the block only once, as the very last thing in your final reply. The
   `<<<CONTROL_RESULT>>>` / `<<<END_CONTROL_RESULT>>>` markers are what the
   controller reads; a Markdown code fence around them, as in the schema
   examples below, is neither required nor harmful.
@@ -120,7 +126,11 @@ with exactly one machine-readable block:
   not inside it.
 - If the phase could not be completed, still emit the block with
   `"status": "failure"` (or `"status": "blocked"` when a human decision is
-  required) and a human-readable `"message"`; never omit it.
+  required) and a human-readable `"message"`; never omit it. That covers a
+  reply you write while work you started (a test run, a build, any
+  background task) is still running, too: the controller may take that
+  reply as your final one and does not wait for the work, so let the work
+  finish before you write it.
 
 ## Context variables
 

@@ -892,7 +892,7 @@ produced, return the blocked result below rather than fabricating success.
 
 # 26. CONTROL_RESULT
 
-After committing and verifying the replacement implementation, stdout must end with exactly one:
+After committing and verifying the replacement implementation, your final reply must end with exactly one:
 
 ```text
 <<<CONTROL_RESULT>>>

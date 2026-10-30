@@ -1835,6 +1835,40 @@ def test_correction_retries_are_charged_against_the_same_durable_bound(tmp_path,
     assert "without ever producing a verified result" in eng.state.block_reason
 
 
+def test_a_local_correction_quotes_the_reply_it_corrects(tmp_path):
+    """#393 in LOCAL mode: the correction quotes the end of the refused reply,
+    redacted and fenced, after the diagnosis, as a REMOTE one does; the run
+    log records its sizes and the state file none of it."""
+    root = local_repo(tmp_path)
+    eng = make_local_engine(root, "features/add-filter.md")
+    _run_to(eng, root, Phase.ANALYZE_EXECUTE)
+    secret = "ghp_" + "Kx7" * 12
+    reply = f"Implemented the filter with GH_TOKEN={secret}; the tests pass.\n"
+    eng.provider._handler = scripted(
+        eng,
+        root,
+        [(lambda r: touch_impl(r, "v1\n"), lambda e: reply), (None, lambda e: impl_result())],
+    )
+    assert eng.step().next_phase == "REVIEW"
+    first, second = eng.provider.calls[-2:]
+    assert not first.correction and second.correction
+    quoted = second.prompt.split("then end this reply\nwith a new block.\n\n", 1)[1]
+    assert quoted == (
+        "```text\nImplemented the filter with GH_TOKEN=***REDACTED***; the tests pass.\n```\n"
+    )
+    assert "Kx7" not in second.prompt
+    steps = sorted(p for p in (eng.paths.logs_dir / eng.state.run_id).iterdir() if p.is_dir())
+    request = json.loads((steps[-1] / "request.json").read_text(encoding="utf-8"))
+    assert request["correction"] is True
+    size = len(reply) - len(secret) + len("***REDACTED***")
+    assert request["metadata"]["correction_reply"] == {
+        "kept_chars": size,
+        "reply_chars": size,
+        "cut": False,
+    }
+    assert "Implemented the filter with" not in eng.paths.state_file.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
 def test_a_crash_between_corrections_resumes_under_the_remaining_bound(tmp_path, phase):
     """A malformed first attempt, then a crash: `resume` sees the two launches.
