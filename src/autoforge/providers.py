@@ -28,7 +28,8 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     other records become live progress (:mod:`autoforge.progress`), and an
     error result in any turn, a result outside a turn, a malformed line or
     a turn without its result is a
-    :attr:`AgentExecutionResult.provider_failure`.
+    :attr:`AgentExecutionResult.provider_failure`; a CLI still running
+    :data:`CLAUDE_FAILED_EXIT_GRACE_SECONDS` after it is stopped (#394).
   * ``options.output_format: text`` is the opt-out: the final text is
     printed once, at exit, and the run reports no progress and no activity
     while it runs.
@@ -230,6 +231,7 @@ calibration figures join ``provider_summary`` in every mode.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import json
 import os
 import pwd
@@ -403,6 +405,10 @@ class AgentExecutionResult:
     # or when a run that failed anyway had a request of the agent's refused
     # by the CLI, which it names (#258, :func:`_name_refused`).
     provider_failure: str | None = None
+    # The adapter stopped a CLI still running after its protocol had already
+    # failed the run (#394): ``provider_failure`` names that failure and the
+    # stop, ``exit_code`` is -1, and nothing timed out.
+    stopped_on_failure: bool = False
     # A failed run the adapter recognised as a known transient failure of
     # the provider (#164): a short, fixed reason naming it, never text taken
     # from the output. It is a fact about this failure, not a decision: it
@@ -938,6 +944,12 @@ CLAUDE_MAX_PENDING_BYTES = 2 * CLAUDE_MAX_RECORD_BYTES
 # stdout keeps EOF away, and this is how late its exit grace (ADR 0002) can
 # start.
 CLAUDE_EXIT_POLL_SECONDS = 0.25
+# How long a CLI still running once its stream has failed the run is given
+# to exit on its own before the driver stops it (#394). A failed turn does
+# not end ``claude -p``: a background task still pending keeps it alive for
+# another turn, whose work no later turn can redeem. A CLI whose failing
+# record was its last exits well within it and keeps its own status.
+CLAUDE_FAILED_EXIT_GRACE_SECONDS = 10.0
 # What every launch adds so that no integration of the operator's or the
 # repository's configuration runs (#165): one may hold a GitHub token of its
 # own. ``--safe-mode`` keeps hooks, installed plugins, MCP servers, skills,
@@ -1384,7 +1396,10 @@ class ClaudeCodeProvider(AgentProvider):
         kill, never the timeout. ``stdout`` of the result is the last
         ``result`` text, tail-bounded as the executor's capture is; a failure
         inside the stream is ``provider_failure`` and a timeout wins over it.
-        ``exit_code`` is always the real process status.
+        Once the stream has failed the run, a CLI still running
+        :data:`CLAUDE_FAILED_EXIT_GRACE_SECONDS` later is stopped (#394):
+        nothing it does after that can change the outcome. ``exit_code`` is
+        always the real process status, -1 when the CLI was killed.
         """
         if self.output_format(req.profile) != "stream-json":
             return super().execute(req)
@@ -1413,11 +1428,19 @@ class ClaudeCodeProvider(AgentProvider):
                 sandbox=description,
             )
             with start_duplex(duplex) as child:
-                cut_short = _read_claude_stream(child, stream, monitor)
+                cut = _read_claude_stream(child, stream, monitor)
                 res = child.finish()
-        timed_out = cut_short or res.timed_out or res.stopped
+        timed_out = cut in (_Cut.DEADLINE, _Cut.LOOP) or res.timed_out
         failure = stream.failure
-        if stream.exited_early:
+        if cut is _Cut.FAILED:
+            # A stream that failed at EOF said "exited": the CLI had only
+            # closed its stdout (R1-F1).
+            closed = " closed its stdout but" if stream.exited_early else ""
+            failure = (
+                f"{failure}; claude{closed} was still running "
+                f"{CLAUDE_FAILED_EXIT_GRACE_SECONDS:g}s later and was stopped"
+            )
+        elif stream.exited_early:
             failure = f"{failure} (exit {res.exit_code})"
         elif res.records_overflowed and failure is None:
             failure = "claude: stream-json lines arrived faster than they were read"
@@ -1446,21 +1469,33 @@ class ClaudeCodeProvider(AgentProvider):
             orphan_survived_kill=res.orphan_survived_kill,
             orphans_unchecked=res.orphans_unchecked,
             provider_failure=None if timed_out else failure,
+            stopped_on_failure=cut is _Cut.FAILED,
             provider_summary=summary,
             timeout_limit=res.timeout_limit,
             last_activity_at=res.last_activity_at,
             sandbox=res.sandbox,
         )
-        result = _finish_loop(result, monitor, killed=res.stopped)
+        result = _finish_loop(result, monitor, killed=cut is _Cut.LOOP)
         # A refusal never ends a -p run (claude_stream.py): the agent goes on
         # without what it asked for, so a failure is never the refusal's alone.
         return _name_refused(result, stream.refused, stream.refused_count, self.name, "Claude Code")
 
 
+class _Cut(enum.Enum):
+    """Why :func:`_read_claude_stream` ended an invocation whose CLI was still running."""
+
+    # A limit fell due: a timeout.
+    DEADLINE = "deadline"
+    # Stopped on the loop detector's verdict (#194): a timeout whose limit is ``loop``.
+    LOOP = "loop"
+    # Stopped once the stream had failed the run (#394): that failure.
+    FAILED = "failed"
+
+
 def _read_claude_stream(
     child: DuplexChild, stream: ClaudeStream, loop: LoopMonitor | None = None
-) -> bool:
-    """Feed every stdout outcome to ``stream`` through its end; True on the deadline.
+) -> _Cut | None:
+    """Feed every stdout outcome to ``stream`` through its end; what cut it short, if anything.
 
     The CLI's exit, not EOF, ends the wait: a descendant still holding its
     stdout, silent or writing, must not hold the invocation to the deadline
@@ -1473,7 +1508,21 @@ def _read_claude_stream(
     at the deadline is a timeout. A verdict of ``loop`` (#194) on a CLI
     still running stops it, and the caller's ``finish()`` reports
     ``stopped``.
+
+    So does a stream that has failed the run with the CLI still running
+    :data:`CLAUDE_FAILED_EXIT_GRACE_SECONDS` after the driver first saw the
+    failure (#394): a later turn cannot redeem it and the reducer reads
+    nothing more, so the CLI would otherwise go on working, unseen and for
+    nothing, until its ceiling, its output keeping the idle limit away. A
+    limit that falls due within the grace still wins. EOF ends neither the
+    grace nor the wait (R1-F1): a CLI that closed its stdout after the
+    failure, or whose stream EOF fails for want of a result, is waited for
+    and stopped the same way, where ``finish()`` would wait for it until a
+    limit. Only EOF on a stream that has not failed, or from a CLI that has
+    exited, ends the wait.
     """
+    failed_at: float | None = None
+    ended = False
     while True:
         item = child.read_line(timeout=CLAUDE_EXIT_POLL_SECONDS)
         if isinstance(item, Record):
@@ -1484,16 +1533,33 @@ def _read_claude_stream(
             stream.framing_error("stdout ended inside an unterminated line")
         elif isinstance(item, Overflow):
             stream.framing_error("stdout lines arrived faster than they were read")
-            return False
+            return None
         elif isinstance(item, Eof):
-            stream.stream_ended()
-            return False
+            if not ended:
+                ended = True
+                stream.stream_ended()
+            if stream.failure is None or child.exited():
+                return None
         elif item.deadline_exceeded:
-            return True
+            return _Cut.DEADLINE
         if loop is not None and loop.verdict is not None and child.stop():
-            return False
+            return _Cut.LOOP
         if child.exited():
             child.finish()
+        elif stream.failure is not None:
+            now = time.monotonic()
+            if failed_at is None:
+                failed_at = now
+            stop_at = failed_at + CLAUDE_FAILED_EXIT_GRACE_SECONDS
+            if now >= stop_at and child.stop():
+                return _Cut.FAILED
+            if ended:
+                # Past EOF every read returns at once: wait for the CLI here,
+                # never past the grace or the deadline, which the next read
+                # enforces as it does before EOF.
+                time.sleep(
+                    max(0.0, min(CLAUDE_EXIT_POLL_SECONDS, stop_at - now, child.deadline() - now))
+                )
 
 
 def opencode_isolation_env(config_dir: str) -> dict[str, str]:

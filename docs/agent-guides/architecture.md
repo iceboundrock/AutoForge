@@ -153,7 +153,14 @@ process exited 0. It does so through a provider-neutral optional
 `AgentExecutionResult.provider_failure` (ADR 0003 §2.6), which the engine
 treats like a non-zero exit: `ExecutionError`, state unchanged, stdout and
 stderr recorded. The engine checks `timed_out` first, then
-`provider_failure`, then the exit code, then the parser. A flat, bounded,
+`provider_failure`, then the exit code, then the parser. A failure does not
+always end the process: a Claude stream fails the run in one turn while a
+background task keeps the CLI alive for another, which no later turn can
+redeem. The Claude adapter therefore stops a CLI still running a short
+grace after its stream failed (`CLAUDE_FAILED_EXIT_GRACE_SECONDS`,
+`DuplexChild.stop()`, #394) and reports that failure, not a timeout, with
+`stopped_on_failure`, which the engine records as `ended_by:
+provider_failure`. A flat, bounded,
 redacted `provider_summary` (scalars only) goes to `execution.json`. The engine names no provider in that
 check. The adapter returns the text the parser reads as `stdout`, which for
 Pi is the final assistant message, never raw protocol records.
@@ -313,8 +320,9 @@ end the invocation early (ADR 0002 §4d, #194): it sets
 `ExecutionRequest.stop` (or calls `DuplexChild.stop()`), and the group is
 killed through the same path; the result says `stopped`, never why.
 `ExecutionRequest.on_chunk` hands the caller every chunk read, after it is
-captured. The reason to stop, a loop, is the provider layer's
-(`loop_detect.py`, below). Once the child has
+captured. The reasons to stop, a loop (`loop_detect.py`, below) and a
+Claude stream that has already failed the run (#394), are the provider
+layer's. Once the child has
 exited on its own, the other two conditions
 are given a short exit grace (`_EXIT_GRACE_SECONDS`): a child that left
 nothing behind clears them at once, a helper it is shutting down as it

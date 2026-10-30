@@ -600,3 +600,66 @@ def test_a_failed_stream_ends_with_its_failure_and_logs_its_summary(tmp_path, fa
     execution = json.loads((progress_log.parent / "execution.json").read_text(encoding="utf-8"))
     assert execution["provider_summary"]["is_error"] is True
     assert execution["provider_summary"]["failure"].startswith("claude: the run ended in an error")
+    assert execution["ended_by"] == "exit"
+
+
+def test_a_failed_stream_whose_cli_runs_on_ends_the_step_with_its_failure(
+    tmp_path, fake_github, monkeypatch
+):
+    """#394, as run #340's FIX saw it: the API errors exhaust the CLI's retries
+    and fail the turn, and a background benchmark keeps the CLI working on a
+    turn of its own. The step ends a grace after the failure, not at a limit:
+    the error and the end line name the stream's failure, the state is
+    unchanged, and ``execution.json`` says the adapter stopped it."""
+    import time
+
+    from autoforge import providers
+    from autoforge.errors import ExecutionTimeoutError
+    from autoforge.transitions import Phase
+
+    monkeypatch.setattr(providers, "CLAUDE_FAILED_EXIT_GRACE_SECONDS", 0.5)
+    retry = {"type": "system", "subtype": "api_retry", "attempt": 10, "max_retries": 10}
+    script: list = [
+        claude_fake.init(),
+        claude_fake.tool_use(
+            "b1", "Bash", command="make bench", description="Run benchmarks", run_in_background=True
+        ),
+        claude_fake.tool_result("b1", "Command running in background"),
+        claude_fake.line(retry),
+        claude_fake.result("API Error: Overloaded", is_error=True, api_error_status=529),
+        claude_fake.line({"type": "system", "subtype": "task_notification"}),
+        claude_fake.init(),
+        claude_fake.tool_use("b2", "Bash", command="cat bench.out", description="Poll benchmarks"),
+        claude_fake.tool_result("b2", "round 1 done"),
+    ]
+    for n in range(300):
+        script += [{"sleep": 0.1}, claude_fake.thinking(f"step {n}")]
+    eng, state_dir = _engine_on_fake_claude(tmp_path, fake_github, script)
+    lines: list[str] = []
+    eng.progress_output = lines.append
+    started = time.monotonic()
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+    assert time.monotonic() - started < 20
+    assert not isinstance(excinfo.value, ExecutionTimeoutError)
+    failure = (
+        "claude: the run ended in an error (subtype success, terminal_reason completed, "
+        "api_error_status 529): API Error: Overloaded; claude was still running 0.5s later "
+        "and was stopped"
+    )
+    assert str(excinfo.value).startswith(f"agent 'analyze_execute' failed: {failure}")
+    assert "maximum runtime" not in str(excinfo.value)
+    assert eng.state.phase == Phase.ANALYZE_EXECUTE
+    shown = [line.split("] ", 1)[1] for line in lines]
+    assert shown[1:] == [
+        "agent started (claude-fable-5-1)",
+        "Bash Run benchmarks",
+        "provider retry (attempt 10 of 10)",
+        f"agent failed: {failure}, 4 progress events",
+    ]
+    (progress_log,) = state_dir.rglob("progress.log")
+    execution = json.loads((progress_log.parent / "execution.json").read_text(encoding="utf-8"))
+    assert execution["ended_by"] == "provider_failure"
+    assert execution["timed_out"] is False and execution["timeout_limit"] == ""
+    assert execution["exit_code"] == -1
+    assert execution["provider_summary"]["failure"] == failure

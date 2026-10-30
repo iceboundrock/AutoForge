@@ -14,7 +14,10 @@ inherits its stdout, the way a server an agent left running holds it: the
 helper sleeps ``spawn_holder`` seconds, writes its ``then`` text (raw, so
 its LF is the caller's) and exits, or with ``every`` writes ``then`` every
 ``every`` seconds for as long, the way a chatty one keeps stdout busy; its
-pid is appended to ``holders`` in the fake's home. No real agent runs.
+pid is appended to ``holders`` in the fake's home. A ``close_stdout`` step
+points the fake's stdout at ``/dev/null`` and goes on with the script, the
+way a CLI that closed its stdout but has not exited does (a helper started
+after it does not hold stdout either). No real agent runs.
 """
 
 from __future__ import annotations
@@ -61,6 +64,12 @@ for step in script["lines"]:
         )
         with open(os.path.join(home, "holders"), "a", encoding="utf-8") as f:
             f.write(f"{holder.pid}\n")
+        continue
+    if isinstance(step, dict) and step.get("close_stdout"):
+        sys.stdout.flush()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.close(devnull)
         continue
     if isinstance(step, dict):
         time.sleep(step["sleep"])

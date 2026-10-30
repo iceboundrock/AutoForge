@@ -228,6 +228,8 @@ class ClaudeStream:
         """Reduce one stdout line (without its LF)."""
         self._records += 1
         if self.failure is not None:
+            # The outcome is decided: a later turn cannot redeem it. The
+            # driver stops a CLI that runs on after it (#394).
             return
         try:
             record = json.loads(data.decode("utf-8"))
