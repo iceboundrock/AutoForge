@@ -1443,10 +1443,13 @@ schema of §2.10–§2.12 and the two small fields of D5.2 and D14.2 (D11.2).
 
 **D15.2 (#172).** **Numbering and independence.** The number is assigned
 when #172 is ready to merge, never reserved. On `main` `1412765` the
-protocol is `7`: #160's bump took 5 → 7, and #23 reserves 6 for #126. The
-Wave 2B bump is separate from #126 / #134 and from #160's. Whichever lands
-later rebases its migration rule onto the earlier one, and they are never
-combined.
+protocol is `7`: #160's bump took 5 → 7, and #23 reserves 6 for #126. On
+2026-10-23 #23 released that reservation: label 6 stays skipped for good,
+and no number is reserved ahead of time
+([state-and-recovery.md](../agent-guides/state-and-recovery.md), "Numbering
+a new protocol"). The Wave 2B bump is separate from #126 / #134 and from
+#160's. Whichever lands later rebases its migration rule onto the earlier
+one, and they are never combined.
 
 **D15.3 (documentation only).** **Announcement.** The bump is announced on
 #23 and #158 before #172 merges. #170's planning posted the coordination
@@ -1576,7 +1579,9 @@ the parity work (#155) are consumed, not changed.
 - **The producer crash window** that #170 left conditional on #159 item 8 is
   resolved by ADR 0004 D8.4 and W1: the agent is relaunched, and the same
   candidate reuses its records (§2.16).
-- **#160's bump has landed** as protocol 7, with 6 reserved for #126 (D15.2).
+- **#160's bump has landed** as protocol 7, with 6 reserved for #126 (D15.2)
+  at the time; #23 released that reservation on 2026-10-23, and label 6
+  stays skipped for good.
 - **`workspace_policy_digest`** is the run contract's
   `WorkspacePolicy.digest()`; the contract has no field of that name (D2.6).
 - **There is no `sandbox.mode` on `main`;** until #168 lands, P's mode is

@@ -87,7 +87,10 @@ facts of #177's body that changed in between.
   `<git dir>/autoforge/state`.
 - The state schema is `AutoForgeState` (`state.py` :390) at
   `__protocol_version__` "11": #160 took 7, #211 8, #219 9, #172 10 and
-  #243 11, and #23 reserves 6 for #126.
+  #243 11, and #23 reserves 6 for #126. On 2026-10-23 #23 released that
+  reservation: label 6 stays skipped for good
+  ([state-and-recovery.md](../agent-guides/state-and-recovery.md),
+  "Numbering a new protocol").
 - Worktrees are one per issue (`_agent_worktree_name`, `engine.py` :1771):
   `<common dir>/autoforge/worktrees/<n>`, or `<execution.worktree_dir>/<n>`.
   Between issues, `UPDATE_EPIC` uses `epic-<n>`. The worktree root is part

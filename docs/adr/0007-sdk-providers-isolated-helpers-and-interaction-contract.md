@@ -78,6 +78,10 @@ on `main` `af439c2`.
   reserved for #126 and refused as unknown (`state.py`, the comment above
   `_LEGACY_PROTOCOLS`; `tests/test_state.py`,
   `test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged`).
+  This is a snapshot at protocol 9: on 2026-10-23 #23 released the
+  reservation, and label 6 now stays skipped for good, still refused as
+  unknown ([state-and-recovery.md](../agent-guides/state-and-recovery.md),
+  "Numbering a new protocol").
 - The CLI exits 0, 1 (`BLOCKED`, a failed step) or 2 (configuration, state
   or configuration drift). No status means "waiting for a human".
 - The repository lock (`locking.py`) is held for a whole CLI command
@@ -882,8 +886,9 @@ passes.**
   merged now), and its number is settled on #23 first, under ADR 0004
   D13.1's rule.
 - Label `6` stays skipped for good: never written, and refused as unknown,
-  as `tests/test_state.py` pins. #126 updates the comments that call it
-  "reserved for #126".
+  as `tests/test_state.py` pins. The comments that called it "reserved for
+  #126" were updated by PR #296, after #23 released the reservation on
+  2026-10-23, so that task no longer falls to #126.
 - #134, #149, #151 and #152 add no persisted field and no bump. A
   provider's session data is part of #126's record, and no protocol version
   is reserved per provider.

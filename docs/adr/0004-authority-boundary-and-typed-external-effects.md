@@ -2436,7 +2436,11 @@ imports a provider, so an SDK provider inherits the layer unchanged.
 
 **D13.1 (#160).** **One protocol bump, made alone by #160.** It is numbered
 at merge time and never takes the 5 → 6 that #23 reserves for #126 (with
-#134 riding it). Whichever bump lands second rebases its migration rule onto
+#134 riding it). That reservation was the state when this was decided: on
+2026-10-23 #23 released it, label 6 stays skipped for good, and #126 takes
+the next number like every other bump. The current rule is
+[state-and-recovery.md](../agent-guides/state-and-recovery.md), "Numbering
+a new protocol". Whichever bump lands second rebases its migration rule onto
 the other, and the number is settled on #23 first. A field that a phase
 child finds it needs follows the EPIC's rule:
 
@@ -2535,10 +2539,11 @@ is.
 
 **D13.9 (#211).** **K9 is its own protocol bump.** Under D13.1's rule a
 field added after #160 is its own bump, made alone. The implementation
-labels it `8`: never 6 (reserved for #126), and not combined with #126's
-or #172's bump. The number is settled on #23 and #158 before it merges, and
-the label moves with that decision. The migration rule follows D13.2, by
-label and never by shape:
+labels it `8`: never 6 (reserved for #126 at the time; #23 released the
+reservation on 2026-10-23 and label 6 stays skipped, D13.1), and not
+combined with #126's or #172's bump. The number is settled on #23 and #158
+before it merges, and the label moves with that decision. The migration
+rule follows D13.2, by label and never by shape:
 
 - a protocol-7 file loads in every phase and is relabelled on its next
   save: no acceptance outcomes, `acceptance_source: null` on each `FIX`
@@ -2552,14 +2557,15 @@ label and never by shape:
 
 **D13.10 (#243).** **K10 is its own protocol bump.** Under D13.1's rule
 it is made alone: protocol 10 → 11, and the prompt version `v11` → `v12`.
-It is never 6 (reserved for #126) and is not combined with #126's bump or
-any other; whichever of the two lands second rebases its migration rule
-onto the other. The number is announced and confirmed on #23 before the
-change merges, and the label moves with that decision. D13.1 and D13.9
-also name #158, the EPIC this record decides for, as the place to announce
-a bump; #158 is closed and #243 belongs to no EPIC, so #23 is the place of
-record, and an EPIC-side mirror is the owner's choice. The migration rule
-follows D13.2, by label and never by shape:
+It is never 6 (reserved for #126 at the time; #23 released the reservation
+on 2026-10-23 and label 6 stays skipped, D13.1) and is not combined with
+#126's bump or any other; whichever of the two lands second rebases its
+migration rule onto the other. The number is announced and confirmed on
+#23 before the change merges, and the label moves with that decision.
+D13.1 and D13.9 also name #158, the EPIC this record decides for, as the
+place to announce a bump; #158 is closed and #243 belongs to no EPIC, so
+#23 is the place of record, and an EPIC-side mirror is the owner's choice.
+The migration rule follows D13.2, by label and never by shape:
 
 - a protocol-10 file loads in every phase and is relabelled on its next
   save, with `operator_comment_outcomes: []`, no `operator_targets` in the
