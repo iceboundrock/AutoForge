@@ -186,8 +186,8 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
   GitHub-only concern leak into it. Its workspace and filesystem boundary is
   recorded in `docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md`;
   read that ADR before changing `local_workspace.py`, `run_contract.py` or
-  `safefs.py`. LOCAL is being retired: ADR 0009
-  (`docs/adr/0009-retiring-local-mode-legacy-runs-protocol-and-sequencing.md`)
+  `safefs.py`. LOCAL is being removed: ADR 0009
+  (`docs/adr/0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md`)
   classifies every LOCAL reference and says what a change to it may still do.
 
 ## Routing by module
