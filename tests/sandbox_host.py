@@ -14,8 +14,9 @@ test-sandbox-measured``, which the ``sandbox`` job of
   ``user.max_user_namespaces``) and whether an unprivileged ``bwrap`` gets
   new user, PID and IPC namespaces and a new procfs;
 - the kernel's Landlock ABI (6, Linux 6.12, for the abstract-socket scope),
-  or, when the kernel gives none, what it answered (Landlock disabled at
-  boot, no Landlock call),
+  or, when the kernel gives none, what it answered (``EOPNOTSUPP``, Landlock
+  disabled at boot, and ``ENOSYS``, no Landlock call, unless a seccomp
+  filter returned either),
 
 prints it, and appends it to ``$GITHUB_STEP_SUMMARY`` when that is set, so
 each CI run keeps what its runner measured.
@@ -51,9 +52,11 @@ MIN_LANDLOCK_ABI = 6
 _SYS_LANDLOCK_CREATE_RULESET = 444
 _LANDLOCK_CREATE_RULESET_VERSION = 1
 # What a refusal of that call means, by errno (landlock_create_ruleset(2)).
+# A seccomp filter can return either without the call reaching the kernel,
+# so neither is recorded as certain (PR #408 R1-F2).
 _LANDLOCK_REFUSALS = {
-    errno.EOPNOTSUPP: "EOPNOTSUPP: Landlock is built in but disabled at boot",
-    errno.ENOSYS: "ENOSYS: the kernel has no Landlock call",
+    errno.EOPNOTSUPP: "EOPNOTSUPP: Landlock disabled at boot, or a seccomp filter's answer",
+    errno.ENOSYS: "ENOSYS: no Landlock call, or a seccomp filter's answer",
 }
 
 # The sysctls that decide whether an unprivileged process may create a user

@@ -1418,9 +1418,13 @@ _LANDLOCK_ANSWERS = [
     pytest.param(
         -1,
         errno.EOPNOTSUPP,
-        "Landlock is built into the kernel but disabled at boot (landlock_create_ruleset "
-        "failed (EOPNOTSUPP: Operation not supported)); it is enabled by adding landlock to "
-        "the kernel's lsm= boot parameter, the host's for a container",
+        "Landlock looks disabled at boot (landlock_create_ruleset failed (EOPNOTSUPP: "
+        "Operation not supported)): the kernel answers so when Landlock is built in but not "
+        "enabled at boot, but a seccomp filter can return the same errno without the call "
+        "reaching the kernel; to enable Landlock, add landlock to the kernel's lsm= boot "
+        "parameter (the host's, for a container) and keep every module of the list the kernel "
+        "boots with (its lsm=, or without one its CONFIG_LSM): lsm= replaces that whole list, "
+        "so lsm=landlock alone turns the list's other modules off",
         id="disabled-at-boot",
     ),
     pytest.param(
@@ -1458,7 +1462,7 @@ def test_a_kernel_without_the_landlock_scope_refuses_as_it_answered(
     code: int,
     named: str,
 ) -> None:
-    """Landlock disabled at boot, absent, or too old: each refusal says which (#349).
+    """Landlock disabled at boot (or a seccomp filter's answer), absent, or too old (#349).
 
     The real scope reads the kernel's answer, its errno included, before
     anything is spawned; the refusal is typed as the Landlock capability.
@@ -1491,6 +1495,27 @@ def test_the_probe_says_how_the_kernel_lacks_the_landlock_scope(
     assert named in probed.reason
     assert named in probed.describe()
     assert fake_bwrap.log() == []
+
+
+def test_the_eopnotsupp_refusal_is_qualified_and_keeps_the_other_modules() -> None:
+    """``EOPNOTSUPP`` may be a seccomp filter's, and ``lsm=`` replaces the whole list.
+
+    The refusal does not state as fact that Landlock is disabled at boot,
+    since a seccomp filter can return the same errno (PR #408 R1-F2). Its
+    remedy says to keep the modules the kernel boots with and why: an
+    operator with no ``lsm=`` who set ``lsm=landlock`` would turn every
+    other security module off (PR #408 R1-F1).
+    """
+    problem = sandbox_bwrap._landlock_problem(0, errno.EOPNOTSUPP)
+    assert "Landlock is built into the kernel but disabled at boot" not in problem
+    assert "a seccomp filter can return the same errno" in problem
+    assert "keep every module of the list the kernel boots with" in problem
+    assert "without one its CONFIG_LSM" in problem
+    assert "lsm= replaces that whole list" in problem
+    assert "lsm=landlock alone turns the list's other modules off" in problem
+    # Only the disabled-at-boot answer gives a boot remedy.
+    for code in (errno.ENOSYS, errno.EPERM):
+        assert "lsm=" not in sandbox_bwrap._landlock_problem(0, code)
 
 
 @pytest.mark.parametrize("abi", [6, 7])

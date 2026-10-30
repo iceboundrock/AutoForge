@@ -188,13 +188,22 @@ reason in parentheses says what the kernel answered when asked for its ABI:
 
 - `the kernel's Landlock ABI is 5`: Landlock runs, but its ABI is older
   than 6; the kernel is older than 6.12.
-- `Landlock is built into the kernel but disabled at boot`
-  (`EOPNOTSUPP`): Landlock is not among the security modules the kernel
-  booted with. It is enabled by its `CONFIG_LSM` or by adding `landlock` to
-  the `lsm=` boot parameter, which replaces the whole list
+- `Landlock looks disabled at boot` (`EOPNOTSUPP`): the kernel answers so
+  when Landlock is built in but not among the security modules it booted
+  with. The answer is not proof of that: a seccomp filter can return the
+  same errno without the call reaching the kernel, and nothing in the
+  answer tells the two apart.
+  If Landlock is disabled, it is enabled by the kernel's `CONFIG_LSM` or by
+  adding `landlock` to the `lsm=` boot parameter
   ([the kernel's Landlock documentation](https://docs.kernel.org/userspace-api/landlock.html#boot-time-configuration)).
-  A container runs on its host's kernel, so for a container this is the
-  host's boot setting.
+  `lsm=` replaces the kernel's whole list of security modules, so add
+  `landlock` to the list it boots with and keep every module already in
+  it: the `lsm=` in `/proc/cmdline` when there is one, else the kernel's
+  `CONFIG_LSM`. On a command line with no `lsm=`, `lsm=landlock` alone
+  would turn off the modules of `CONFIG_LSM` it leaves out, such as
+  AppArmor or SELinux and Yama. After a reboot, `landlock: Up and running.`
+  in the kernel log confirms it. A container runs on its host's kernel, so
+  for a container this is the host's boot setting.
 - `the kernel has no Landlock call` (`ENOSYS`): a kernel before 5.13 or
   one built without Landlock, or a seccomp filter that hides the call.
 - `the kernel did not report its Landlock ABI`, with the errno: any other
@@ -206,7 +215,7 @@ reason in parentheses says what the kernel answered when asked for its ABI:
 | `ubuntu-latest` (hosted CI) | measured on every run | The `sandbox` job records bwrap's version and `--overlay`, the user-namespace policy, an unprivileged namespace launch and the Landlock ABI in its summary, and requires the real-backend tests wherever the runner measures capable. There is no fixed answer: each run's summary is the record ([Development](development.md#the-outer-sandbox)). |
 | a kernel before 6.12 (for example the default kernels of Ubuntu 24.04 and Debian 12) | **unsupported** | No Landlock ABI 6. |
 | a kernel with Landlock built in but disabled at boot, whatever its version | **unsupported** | No Landlock ABI at all: the kernel answers `EOPNOTSUPP`. |
-| an LXC container on a Proxmox VE kernel (`7.0.14-20-pve`) | **unsupported** as measured; the remedy is not verified | Inside the container Landlock answered `EOPNOTSUPP` ([#349](https://github.com/iceboundrock/AutoForge/issues/349)); `bwrap` 0.12.0 with `--overlay` and unprivileged user and PID namespaces were there. The container runs under a seccomp filter and cannot read the boot list of security modules. Whether adding `landlock` to the Proxmox host's `lsm=` boot parameter is enough inside the container, and what the probe finds missing after that, is not measured. |
+| an LXC container on a Proxmox VE kernel (`7.0.14-20-pve`) | **unsupported** as measured; the cause and the remedy are not verified | Inside the container the call for the Landlock ABI failed with `EOPNOTSUPP` ([#349](https://github.com/iceboundrock/AutoForge/issues/349)); `bwrap` 0.12.0 with `--overlay` and unprivileged user and PID namespaces were there. That answer does not show that Landlock is disabled: the container runs under a seccomp filter, which can return the same errno, and cannot read the boot list of security modules, so whether the Proxmox host booted without Landlock or the filter refused the call is not known. Whether adding `landlock` to the Proxmox host's `lsm=` boot parameter is enough inside the container, and what the probe finds missing after that, is not measured. |
 | unprivileged user namespaces disabled by a sysctl or an LSM policy | **unsupported** | Until the policy allows them. |
 | rootless podman, default settings | **unsupported** | A new procfs is refused (measured, ADR 0005 §4); it works with `--security-opt unmask=/proc/* --security-opt label=disable`. |
 | Docker (default seccomp profile), WSL2 | untested | Not measured. |

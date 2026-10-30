@@ -235,6 +235,13 @@ def _landlock_problem(abi: int, code: int) -> str:
     the call (before 5.13, built without Landlock, or behind a seccomp
     filter that hides it). Each is named as the kernel answered, so a
     kernel recent enough is never told that it is too old (#349).
+
+    A seccomp filter can return any errno without the call reaching the
+    kernel, ``EOPNOTSUPP`` included, so that answer is not proof that
+    Landlock is disabled, and the refusal says so. Its remedy, the ``lsm=``
+    boot parameter, replaces the kernel's whole list of security modules:
+    the refusal says to keep the modules already listed, so that following
+    it does not turn them off (PR #408 R1-F1, R1-F2).
     """
     if abi >= _LANDLOCK_MIN_ABI:
         return ""
@@ -246,8 +253,12 @@ def _landlock_problem(abi: int, code: int) -> str:
     call = f"landlock_create_ruleset failed ({_errno_text(code)})"
     if code == errno.EOPNOTSUPP:
         return (
-            f"Landlock is built into the kernel but disabled at boot ({call}); it is enabled "
-            "by adding landlock to the kernel's lsm= boot parameter, the host's for a container"
+            f"Landlock looks disabled at boot ({call}): the kernel answers so when Landlock is "
+            "built in but not enabled at boot, but a seccomp filter can return the same errno "
+            "without the call reaching the kernel; to enable Landlock, add landlock to the "
+            "kernel's lsm= boot parameter (the host's, for a container) and keep every module "
+            "of the list the kernel boots with (its lsm=, or without one its CONFIG_LSM): lsm= "
+            "replaces that whole list, so lsm=landlock alone turns the list's other modules off"
         )
     if code == errno.ENOSYS:
         return (

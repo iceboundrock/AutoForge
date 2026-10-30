@@ -117,15 +117,19 @@ def test_a_host_without_bwrap_is_measured_and_named(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("code", "answered"),
     [
-        (errno.EOPNOTSUPP, "EOPNOTSUPP: Landlock is built in but disabled at boot"),
-        (errno.ENOSYS, "ENOSYS: the kernel has no Landlock call"),
+        (errno.EOPNOTSUPP, "EOPNOTSUPP: Landlock disabled at boot, or a seccomp filter's answer"),
+        (errno.ENOSYS, "ENOSYS: no Landlock call, or a seccomp filter's answer"),
         (errno.EPERM, "EPERM"),
     ],
 )
 def test_a_kernel_that_gives_no_landlock_abi_is_measured_with_its_answer(
     monkeypatch, code, answered
 ):
-    """A kernel with Landlock disabled at boot is not recorded as merely too old (#349)."""
+    """A kernel that gives no ABI is not recorded as merely too old (#349).
+
+    Nor is its answer recorded as certain: a seccomp filter can return
+    ``EOPNOTSUPP`` or ``ENOSYS`` itself (PR #408 R1-F2).
+    """
     if not sys.platform.startswith("linux"):
         pytest.skip("the call is Linux's")
 

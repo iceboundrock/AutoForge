@@ -551,7 +551,8 @@ exactly when `tests/sandbox_host.py` measures the host capable
   `bwrap` on `PATH`: an old `bwrap` without `--overlay`, with user
   namespaces refused and a Landlock ABI below 6, is measured incapable and
   each lack named; a kernel that gives no Landlock ABI is recorded with its
-  answer (disabled at boot, no Landlock call, another errno; #349); a
+  answer (`EOPNOTSUPP` or `ENOSYS`, each recorded as possibly a seccomp
+  filter's, or another errno; #349); a
   capable one is measured capable; no `bwrap` is named;
   the measurement is printed and appended to the CI job summary. It also
   covers what each value of the variable makes of a probe that says
@@ -594,7 +595,10 @@ exactly when `tests/sandbox_host.py` measures the host capable
     `landlock_create_ruleset`, errno included: an ABI below 6, Landlock
     disabled at boot (`EOPNOTSUPP`), no Landlock call (`ENOSYS`) or another
     errno, each named as answered, and only an ABI below 6 told that it
-    needs Linux 6.12 (#349);
+    needs Linux 6.12 (#349). The `EOPNOTSUPP` refusal is not stated as
+    certain, since a seccomp filter can return that errno, and is the only
+    one with a boot remedy, which says to keep the modules the kernel boots
+    with because `lsm=` replaces the whole list (PR #408 R1-F1, R1-F2);
   - the typed capability probe (#169, D14.1): each refusal text (this
     module's own and `bwrap` 0.12's) classified as the capability it
     names; on the fake backend, a probe that passes with a real launch's
