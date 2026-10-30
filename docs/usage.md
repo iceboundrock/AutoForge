@@ -752,23 +752,71 @@ profiles.analyze_execute.max_runtime_seconds`. The state is unchanged,
 nothing is retried automatically, the error says where to look and how to
 resume ([Troubleshooting](#troubleshooting-and-recovery)), and the step's
 `execution.json` records `timeout_limit` (`idle` or `max_runtime`), both
-configured values and `last_activity_at`. That is the agent's last output
-before the kill: what a CLI writes while it is killed (Claude flushes a few
-records on SIGTERM, Pi answers its `abort`) is kept in the logs but not
-counted. A record written before #343 counted it, so its
+configured values and `last_activity_at`: when the executor last saw
+output on the agent's stdout or stderr before it decided to end the run.
+What the CLI writes after that (Claude flushes a few records on SIGTERM,
+Pi answers its `abort`) is drained from its pipes but not counted, and
+only part of it is kept:
+
+- `stderr.log` keeps the agent CLI's stderr, the shutdown's included.
+- `stdout.log` keeps an OpenCode or text-mode Claude run's stdout, the
+  shutdown's included.
+- A stream-json Claude run and a Pi run write records on stdout, which
+  their adapter reduces into `provider_summary` in `execution.json`. No
+  record is logged: `stdout.log` holds only reply text, the last `result`
+  text a Claude run received (an earlier turn's, or none, when it was
+  killed inside a later one) or a Pi run's final reply, which a killed Pi
+  run never has. The Claude adapter stops reading the stream once the run
+  is to end (a limit, a loop stop), so the records written while the CLI
+  is killed are not reduced either, and its summary is the stream as it
+  stood at that moment. Pi's answer to the abort is read only to see the
+  abort settle.
+
+Both logs are bounded; `stdout_truncated` and `stderr_truncated` say when
+one was cut. A record written before #343 counted the shutdown, so its
 `last_activity_at` is a second or two before `finished_at`, and the
 silence really began one idle timeout earlier.
 
 ### Reading an idle timeout
 
 An idle timeout says that nothing reached the controller for that long,
-not why. Find where the silence was before raising a limit: the last line
-of the step's `progress.log` before the heartbeats is the last thing the
-agent did, and `provider_summary` in its `execution.json` says where the
-stream stood (a Claude run's `turns` and `open_tool_calls` are recorded
-from #343 on). These are the causes #343 found in the nine idle kills
-recorded on one operator's machine between 2026-10-12 and 2026-10-26, and
-what helps with each:
+not why, and the records do not always say what the agent did last. Find
+where the silence was before raising a limit:
+
+- **When the silence began.** `finished_at` minus `last_activity_at` in
+  `execution.json` is how long the agent wrote nothing on either stream.
+  In the step's `progress.log`, a heartbeat (`still running, last activity
+  14m02s ago, 812 events`) is printed once no line has been printed for
+  two minutes, and every two minutes after that. Its prefix is the time
+  since the launch, so the prefix minus the age is when the last progress
+  event came, and the event count stops growing once the agent is silent.
+  `started_at`, the spawn, comes a little after the prefix's zero, so it
+  puts that roughly on the clock of `last_activity_at`. An event is what
+  the adapter reports, not every chunk of output, so the two can differ:
+  Claude's stderr, and the notices it writes between turns, move
+  `last_activity_at` but are no event.
+- **What came last.** The last line printed before the heartbeats is the
+  last event that was printed, not necessarily the last event. A finished
+  tool and bare activity (a notice, a hook, every chunk of OpenCode's
+  output) print nothing, and thinking and writing print one line per 30 s
+  at most. When the heartbeat puts the last event well after that line,
+  unprinted events came in between: a `Bash Run the suite` line can name a
+  command that ended long before the silence, and nothing records what
+  followed it. Only when the two agree, within those 30 s, is that line
+  the last event. `progress.log` keeps its first MiB of lines; a run that
+  printed more ends with a line counting the ones left out, and the lines
+  around the silence are among those.
+- **Where the stream stood.** `provider_summary` says what the adapter had
+  counted when the run ended: a Claude run's `turns`, `results` and
+  `open_tool_calls` (recorded from #343 on, and read with the caveats
+  below), a Pi run's `tool_executions` and `loop_actions`. OpenCode reports
+  no tool calls. Nothing records a tool's input beyond the one detail a
+  progress line shows, or its output, so where these leave it open, what
+  the agent did last is unknown.
+
+These are the causes #343 found in the nine idle kills recorded on one
+operator's machine between 2026-10-12 and 2026-10-26, and what helps with
+each:
 
 - **Claude waiting between turns** (`results` equal to `turns`,
   `open_tool_calls` 0; five of the nine). The agent ended its turn while
@@ -788,10 +836,11 @@ what helps with each:
   CLI alive anyway. The kill discards that reply and `resume` runs the
   phase again; a higher limit only waits longer for what is pending.
 - **Claude inside a tool call** (`results` below `turns`,
-  `open_tool_calls` above 0). The stream carries nothing while a tool runs.
-  None of the nine was this: Claude's `Bash` tool ended every foreground
-  command within about ten minutes, below the default limit. A tool that
-  stays silent longer needs the profile's limit raised above it.
+  `open_tool_calls` above 0, unless a caveat after this list applies).
+  The stream carries nothing while a tool runs. None of the nine was this:
+  Claude's `Bash` tool ended every foreground command within about ten
+  minutes, below the default limit. A tool that stays silent longer needs
+  the profile's limit raised above it.
 - **Pi inside `bash`** (one of the nine; `tool_executions` is one more than
   `loop_actions`). Pi 1.3.0 forwards a command's output while it runs, so a
   silent `bash` call is a command that printed nothing: a test run whose
@@ -804,6 +853,32 @@ what helps with each:
   printed `Transport: The socket connection was closed unexpectedly` on
   stderr and never exited. That is the hang the idle timeout exists for:
   `resume` relaunches it, and a higher limit only keeps it hanging longer.
+
+The Claude counts are what the stream showed, not what the CLI was doing.
+`results` equal to `turns` is every turn the stream opened having ended,
+but anything else has more than one reading:
+
+- **A background agent.** A turn that ends while an `Agent` call run in
+  the background is still working gets its `result` only once no
+  background agent is left, and the next turn opens all the same
+  (verified on claude 2.1.293). So `results` below `turns` can be turns
+  that are over and wait for their results, and the background agent's
+  own tool calls count in `open_tool_calls` like the main conversation's:
+  a conversation between turns whose background agent runs the test suite
+  shows the counts of a foreground tool call. An `Agent` line in
+  `progress.log` is the sign to look for; the summary does not tell the
+  two apart.
+- **No tool running.** `results` below `turns` with `open_tool_calls` 0
+  and no background agent is a turn still open with no call in flight:
+  after a tool's result, before the model's next record.
+- **A skipped record.** A record past the per-line bound, such as a
+  `tool_result` quoting a large file, is skipped and counted in
+  `oversize_records`. Its call then stays open, so with `oversize_records`
+  above 0 `open_tool_calls` can count calls that have ended, and a skipped
+  `tool_use` is a call never counted.
+- **The bound.** At most 1024 calls are tracked open at once, and a call
+  without an id is not tracked; past the bound `open_tool_calls` stops
+  growing.
 
 `execution.command_timeout_seconds` (default 1800) is not an agent limit:
 it bounds only the commands the controller runs itself

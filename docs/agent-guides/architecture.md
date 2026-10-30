@@ -315,7 +315,9 @@ and then from the last chunk either reader saw, and a wall-clock ceiling
 Whichever is due first fires, a tie goes to the ceiling, and
 `ExecutionResult.timeout_limit` (`idle` or `max_runtime`) and
 `last_activity_at` say which and when the child last wrote before the kill
-(what it writes while it is killed is captured but is not activity, #343).
+(what it writes while it is killed is still drained but is not activity,
+#343; the duplex handle queues stdout records for its caller rather than
+capturing them, so only its stderr capture keeps them).
 A command that is not an agent has no idle timeout, only `timeout_seconds`
 (`execution.command_timeout_seconds`). Which limits a profile gets, and that
 a provider whose output is no progress signal (Claude in text mode,

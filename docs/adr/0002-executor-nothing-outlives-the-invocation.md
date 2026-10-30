@@ -313,8 +313,13 @@ nine idle kills on record put `last_activity_at` 0.04 to 2 s before
 invocation (a limit fired, a stop, a pinned deadline) now also fixes the
 last activity: `_Limits.pin()` stops recording chunks, `execute()` pins
 before its group kill, and the duplex handle pins when it marks a timeout
-or stops. The chunks are still read and captured, and still move no
-deadline; only `last_activity_at` keeps the output before the decision.
+or stops. The chunks are still drained, and still move no deadline; only
+`last_activity_at` keeps the output before the decision. Draining is not
+keeping: `execute()` captures both streams and the duplex handle its
+stderr, but the duplex handle's stdout records go to its caller: the
+Claude adapter stops reading them once a limit or a stop ends the run, and
+Pi's adapter reads its answer to the abort only to see it settle. Neither
+logs a record.
 
 Tests for §4c: `tests/test_executor.py` and `tests/test_executor_duplex.py`
 run a child that writes on stdout, or on stderr, for longer than the idle
@@ -324,7 +329,7 @@ writing (killed one idle timeout after its last output), and an active
 child under a ceiling (killed at `max_runtime`); `_Limits` is also driven
 by a fake clock (first due wins, a tie goes to the ceiling, a pinned
 deadline stays put, and so does the last activity). Both run a child that
-answers the kill's SIGTERM with output, which is captured but is not its
+answers the kill's SIGTERM with output, which is drained but is not its
 last activity (#343). `tests/test_providers.py` and `tests/test_pi_rpc.py`
 carry the same cases through the Claude stream and a fake Pi.
 `tests/test_engine.py` checks the error text and `execution.json` for each

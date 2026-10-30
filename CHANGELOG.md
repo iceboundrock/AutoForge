@@ -5,7 +5,7 @@ so.
 
 ## Unreleased
 
-### An idle timeout names when the silence began, and a Claude run's summary says where it stood (#343)
+### An idle timeout names when the silence began, and a Claude run's summary records where its stream stood (#343)
 
 - `last_activity_at` in `execution.json`, and the time in the error
   (`made no progress for 900s (last activity ...)`), counted what an agent
@@ -13,17 +13,27 @@ so.
   SIGTERM, and Pi answers its `abort`. In all nine idle kills in one
   operator's logs it fell 0.04 to 2 s before `finished_at`, so the error
   named a time one idle timeout after the agent had gone silent. It is now
-  the last output before the kill or a loop stop; what follows is still
-  captured in the logs.
+  the last output before the kill or a loop stop. What follows is drained
+  but not counted, and only part of it is kept: every `stderr.log` keeps
+  what the CLI writes there, and an OpenCode or text-mode Claude run's
+  `stdout.log` its stdout, but a stream-json Claude run's and a Pi run's
+  stdout records are reduced into `provider_summary` and never logged, and
+  Claude's records written while it is killed are not reduced either.
 - A Claude run's `provider_summary` adds `turns` (opened) and
   `open_tool_calls` (calls whose result had not arrived). With `results`
-  they say whether a killed run was inside a tool call or between turns,
-  its CLI kept alive by a background task or wakeup the agent had left
-  pending. Five of the nine kills were between turns, three of those
-  waiting for a test suite the agent had started in the background. The
-  other four were three OpenCode runs hung after a dropped connection and
-  one Pi `bash` call that printed nothing. What helps in each case is in
-  [Reading an idle timeout](docs/usage.md#reading-an-idle-timeout).
+  they suggest whether a killed run was between turns, its CLI kept alive
+  by a background task or wakeup the agent had left pending, or inside a
+  tool call. They are not a verdict: a turn that ends while a background
+  agent runs gets its result late and that agent's own calls count as
+  open, a skipped oversize `tool_result` leaves its call open, and at most
+  1024 open calls are tracked. Five of the nine kills were between turns,
+  three of those waiting for a test suite the agent had started in the
+  background. The other four were three OpenCode runs hung after a
+  dropped connection and one Pi `bash` call that printed nothing.
+  [Reading an idle timeout](docs/usage.md#reading-an-idle-timeout) says
+  what helps in each case, how to tell from the heartbeats in
+  `progress.log` when the silence began, and that the last line printed
+  is not always the last thing the agent did.
 - Nothing is killed sooner or later than before, and nothing is retried
   that was not. No default, configuration key or prompt changes.
 

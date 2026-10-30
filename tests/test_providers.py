@@ -1284,6 +1284,23 @@ def test_a_silent_claude_is_killed_and_its_summary_says_where_it_stood(tmp_path,
     assert silent.total_seconds() >= 0.95
 
 
+def test_what_a_killed_claude_flushes_is_not_reduced_and_only_its_stderr_is_kept(tmp_path):
+    """The records the CLI writes on the idle kill's SIGTERM are drained, not
+    read: the summary is the stream as it stood at the kill, stdout keeps
+    only the last reply received, and only stderr keeps the shutdown (#343)."""
+    from tests import claude_fake
+
+    flushed = [claude_fake.init(), claude_fake.tool_use("t9", "Bash", description="Flushed")]
+    sigterm = {"on_sigterm": {"lines": flushed, "stderr": "stopping on SIGTERM\n"}}
+    _, res = _claude_run(tmp_path, [sigterm, *_between_turns(), {"sleep": 60}], timeout=30, idle=1)
+    assert res.timed_out and res.timeout_limit == "idle"
+    summary = res.provider_summary
+    assert summary["records"] == len(_between_turns())
+    assert (summary["turns"], summary["results"], summary["open_tool_calls"]) == (1, 1, 0)
+    assert res.stdout == "The suite is running; I'll report the result when it finishes."
+    assert "stopping on SIGTERM" in res.stderr
+
+
 def test_the_controllers_heartbeat_does_not_keep_a_silent_agent_alive(tmp_path):
     """The "still running, last activity ..." lines the operator sees while
     an agent is silent are the controller's own: they never reach the

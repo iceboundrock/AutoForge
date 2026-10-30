@@ -288,7 +288,8 @@ one-week backstop is the only wall-clock bound.
   So is a Claude CLI that ended its turn and waits, silent, for a
   background task the agent left running, such as a test suite: what the
   task prints never reaches the stream. [Reading an idle
-  timeout](usage.md#reading-an-idle-timeout) tells the cases apart.
+  timeout](usage.md#reading-an-idle-timeout) tells the cases apart, and
+  says where the records leave it open.
 - **The trade-off.** The idle timeout catches a silent hang, not a busy
   one: output that keeps flowing resets it. [Loop detection](#loop-detection)
   catches an agent that keeps repeating itself and, in the default `kill`

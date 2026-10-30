@@ -453,9 +453,14 @@ High-priority coverage includes:
   continued output is still killed by its pinned deadline. A Claude run
   silent between turns, and one silent inside a tool call, is killed at
   the idle timeout with a summary that says which (`turns`, `results`,
-  `open_tool_calls`), the controller's heartbeat does not keep a silent
-  agent alive, and a real `pytest -q` suite longer than the idle timeout
-  survives it through a pipe but not through a tail (#343). The engine
+  `open_tool_calls`), and the counts that read more than one way are
+  pinned as they are: turns waiting for results held back by a background
+  agent, that agent's open call, a skipped oversize `tool_result` and the
+  open-call bound. The records a killed Claude flushes on SIGTERM are not
+  reduced and not in its stdout, and only its stderr is kept; the
+  controller's heartbeat does not keep a silent agent alive, and a real
+  `pytest -q` suite longer than the idle timeout survives it through a
+  pipe but not through a tail (#343). The engine
   names the limit and the last activity in the error and in
   `execution.json`, a text-mode Claude profile without a ceiling is never
   launched, and configuration rejects the legacy `timeout_seconds` keys by
