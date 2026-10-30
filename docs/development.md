@@ -246,8 +246,8 @@ configuration names stops the benchmark unrecorded: a `-n` in
 included. Only a clean run is timed: the median and p95 (nearest
 rank: with fewer than 20 repeats, the slowest run) of a configuration are
 its clean runs', and it has none when no run was clean. It measures a
-commit, refusing a worktree with anything changed or untracked, and records
-the host's provenance. The same command on the same `--out` resumes an
+commit, refusing a worktree with anything changed or untracked, or one git
+fails to read, and records the host's provenance. The same command on the same `--out` resumes an
 interrupted benchmark, running again any run that left no JUnit report, and
 refuses an `--out` measured on another commit, interpreter, host or set of
 CPUs:

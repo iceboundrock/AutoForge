@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from tests import parallel_bench
+from tests.conftest import git_repo
 from tests.parallel_bench import (
     Config,
     Run,
@@ -574,6 +575,64 @@ def test_a_change_during_a_run_stops_the_benchmark_before_recording_it(
         parallel_bench.main(argv)
     assert exited.value.code == 2
     assert "serial-0 not recorded" in capsys.readouterr().err
+    assert made == ["serial-0"]
+    assert not (out / "serial-0.json").exists()
+
+
+def test_the_worktree_is_read_from_git_and_a_status_git_cannot_read_is_no_clean_one(
+    tmp_path, monkeypatch
+):
+    repo = git_repo(tmp_path / "repo")
+    monkeypatch.setattr(parallel_bench, "REPO_ROOT", repo)
+    head = parallel_bench.source()[0]
+    assert len(head) == 40
+    assert parallel_bench.source_problem(head) == ""
+    (repo / "new.py").write_text("")
+    assert "uncommitted changes (new.py)" in parallel_bench.source_problem(head)
+    (repo / "new.py").unlink()
+
+    # A corrupt index: HEAD still reads, git status fails and prints nothing.
+    (repo / ".git" / "index").write_bytes(b"not an index")
+    assert parallel_bench._git("rev-parse", "HEAD").strip() == head
+    problem = parallel_bench.source_problem(head)
+    assert problem.startswith(
+        "the worktree could not be read (`git --no-optional-locks status --porcelain` exited 128"
+    )
+
+
+def test_a_worktree_git_cannot_read_is_refused_before_and_after_a_run(
+    tmp_path, monkeypatch, capsys
+):
+    out = tmp_path / "out"
+    argv = ["--config", "serial", "--repeats", "1", "--out", str(out)]
+    made = _fake_runs(monkeypatch)
+    failure = parallel_bench.UnreadableWorktree("`git status` exited 128: fatal: bad index")
+
+    def unreadable():
+        raise failure
+
+    monkeypatch.setattr(parallel_bench, "source", unreadable)
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(argv)
+    assert exited.value.code == 2
+    assert "the worktree could not be read (`git status` exited 128" in capsys.readouterr().err
+    assert made == [] and not out.exists()
+
+    readable = [True]
+    monkeypatch.setattr(
+        parallel_bench, "source", lambda: ("c0", []) if readable[0] else unreadable()
+    )
+    fake = parallel_bench.run_pytest
+
+    def run_then_break(*args):
+        readable[0] = False
+        return fake(*args)
+
+    monkeypatch.setattr(parallel_bench, "run_pytest", run_then_break)
+    with pytest.raises(SystemExit) as exited:
+        parallel_bench.main(argv)
+    assert exited.value.code == 2
+    assert "could not be read" in capsys.readouterr().err
     assert made == ["serial-0"]
     assert not (out / "serial-0.json").exists()
 

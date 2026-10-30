@@ -35,8 +35,8 @@ xdist's ``load``, ``loadfile``, ``loadscope``, ``loadgroup`` and ``worksteal``::
         --out /tmp/bench
 
 It measures a commit: it refuses a worktree with anything changed, staged or
-untracked (``git status``), before the first run and after every run, and an
-``--out`` inside the worktree.
+untracked (``git status``), or one git fails to read, before the first run
+and after every run, and an ``--out`` inside the worktree.
 
 Every run loads this module as a pytest plugin (``-p tests.parallel_bench``),
 which records how pytest-xdist actually ran it: on how many workers, with
@@ -410,21 +410,46 @@ COMPARABLE = (
 )
 
 
+class UnreadableWorktree(Exception):
+    """``git`` could not say what the worktree holds."""
+
+
+def _git(*args: str) -> str:
+    """What ``git`` prints; :class:`UnreadableWorktree` when it cannot run or fails."""
+    command = " ".join(("git", *args))
+    try:
+        completed = subprocess.run(["git", *args], capture_output=True, text=True, cwd=REPO_ROOT)
+    except OSError as exc:
+        raise UnreadableWorktree(f"`{command}` could not run: {exc.strerror}") from exc
+    if completed.returncode:
+        detail = "; ".join(completed.stderr.strip().splitlines()) or "no message"
+        raise UnreadableWorktree(f"`{command}` exited {completed.returncode}: {detail}")
+    return completed.stdout
+
+
 def source() -> tuple[str, list[str]]:
     """The commit checked out, and each path ``git status`` lists beside it.
 
     Changed, staged and untracked paths are listed (ignored ones are not): an
-    untracked test module is collected like any other.
+    untracked test module is collected like any other. Raises
+    :class:`UnreadableWorktree` when git fails: a status that could not be
+    read lists nothing, and that is no clean worktree.
     """
     return (
-        _command("git", "rev-parse", "HEAD"),
-        _command("git", "--no-optional-locks", "status", "--porcelain").splitlines(),
+        _git("rev-parse", "HEAD").strip(),
+        _git("--no-optional-locks", "status", "--porcelain").splitlines(),
     )
 
 
 def source_problem(commit: str) -> str:
     """Why the worktree is not ``commit`` with nothing beside it; ``""`` when it is."""
-    head, changes = source()
+    try:
+        head, changes = source()
+    except UnreadableWorktree as exc:
+        return (
+            f"the worktree could not be read ({exc}): a benchmark measures a commit "
+            "it has seen to have nothing changed, staged or untracked"
+        )
     if not head or head != commit:
         return f"HEAD is {head or 'unknown'}, not the measured commit {commit or 'unknown'}"
     if changes:
