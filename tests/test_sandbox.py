@@ -27,6 +27,7 @@ import stat
 import subprocess
 import sys
 import types
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1387,15 +1388,116 @@ def test_a_backend_without_overlays_refuses_an_overlay(
     assert fake_bwrap.log() == []
 
 
-@_linux_only
-def test_a_kernel_without_the_landlock_scope_refuses(
-    tmp_path: Path, fake_bwrap: FakeBwrap, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _kernel_answering(result: int, code: int = 0) -> Callable[..., int]:
+    """``landlock_create_ruleset`` asked for the ABI, answered ``result`` with errno ``code``."""
+
+    def syscall(
+        number: ctypes.c_long, attr: ctypes.c_void_p, size: ctypes.c_size_t, flags: ctypes.c_uint32
+    ) -> int:
+        assert number.value == sandbox_bwrap._SYS_LANDLOCK_CREATE_RULESET
+        assert (attr.value, size.value) == (None, 0)
+        assert flags.value == sandbox_bwrap._LANDLOCK_CREATE_RULESET_VERSION
+        ctypes.set_errno(code)
+        return result
+
+    return syscall
+
+
+def _landlock_answer(monkeypatch: pytest.MonkeyPatch, result: int, code: int = 0) -> None:
+    """The real process scope, reading the kernel's answer from a scripted call."""
+    real = sandbox_bwrap._landlock_abi
     monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _REAL_SCOPE)
-    monkeypatch.setattr(sandbox_bwrap, "_landlock_abi", lambda _syscall: 5)
-    with pytest.raises(SandboxLaunchRefusedError, match="Landlock ABI is 5.*needs ABI 6"):
+    monkeypatch.setattr(
+        sandbox_bwrap, "_landlock_abi", lambda _syscall: real(_kernel_answering(result, code))
+    )
+
+
+# What the kernel answers, and how the refusal names it (#349). Only a
+# kernel that reported an ABI is told that it needs Linux 6.12.
+_LANDLOCK_ANSWERS = [
+    pytest.param(
+        -1,
+        errno.EOPNOTSUPP,
+        "Landlock is built into the kernel but disabled at boot (landlock_create_ruleset "
+        "failed (EOPNOTSUPP: Operation not supported)); it is enabled by adding landlock to "
+        "the kernel's lsm= boot parameter, the host's for a container",
+        id="disabled-at-boot",
+    ),
+    pytest.param(
+        -1,
+        errno.ENOSYS,
+        "the kernel has no Landlock call (landlock_create_ruleset failed (ENOSYS: Function not "
+        "implemented)): a kernel before Linux 5.13 or built without Landlock, or a seccomp "
+        "filter that hides the call",
+        id="no-call",
+    ),
+    pytest.param(
+        -1,
+        errno.EPERM,
+        "the kernel did not report its Landlock ABI (landlock_create_ruleset failed (EPERM: "
+        "Operation not permitted))",
+        id="refused",
+    ),
+    pytest.param(
+        5,
+        0,
+        "the kernel's Landlock ABI is 5; the abstract-socket scope needs ABI 6 (Linux 6.12 or "
+        "later)",
+        id="abi-too-old",
+    ),
+]
+
+
+@_linux_only
+@pytest.mark.parametrize(("result", "code", "named"), _LANDLOCK_ANSWERS)
+def test_a_kernel_without_the_landlock_scope_refuses_as_it_answered(
+    tmp_path: Path,
+    fake_bwrap: FakeBwrap,
+    monkeypatch: pytest.MonkeyPatch,
+    result: int,
+    code: int,
+    named: str,
+) -> None:
+    """Landlock disabled at boot, absent, or too old: each refusal says which (#349).
+
+    The real scope reads the kernel's answer, its errno included, before
+    anything is spawned; the refusal is typed as the Landlock capability.
+    """
+    _landlock_answer(monkeypatch, result, code)
+    with pytest.raises(SandboxLaunchRefusedError) as info:
         execute(ExecutionRequest(command=["/bin/true"], sandbox=_description(tmp_path)))
+    message = str(info.value)
+    assert message == f"the sandbox cannot be established: {named}"
+    assert ("6.12" in message) == (result > 0)
+    assert sandbox_bwrap.classify(message) is sandbox_bwrap.Capability.LANDLOCK
     assert fake_bwrap.log() == []
+
+
+@_linux_only
+@pytest.mark.parametrize(("result", "code", "named"), _LANDLOCK_ANSWERS)
+def test_the_probe_says_how_the_kernel_lacks_the_landlock_scope(
+    tmp_path: Path,
+    fake_bwrap: FakeBwrap,
+    monkeypatch: pytest.MonkeyPatch,
+    result: int,
+    code: int,
+    named: str,
+) -> None:
+    """The gate's refusal and ``doctor``'s capability row carry the kernel's answer (#349)."""
+    _landlock_answer(monkeypatch, result, code)
+    probed = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert not probed.supported
+    assert probed.capability is sandbox_bwrap.Capability.LANDLOCK
+    assert named in probed.reason
+    assert named in probed.describe()
+    assert fake_bwrap.log() == []
+
+
+@pytest.mark.parametrize("abi", [6, 7])
+def test_a_kernel_with_landlock_abi_6_or_later_is_not_refused(abi: int) -> None:
+    answer = sandbox_bwrap._landlock_abi(_kernel_answering(abi))
+    assert answer == (abi, 0)
+    assert sandbox_bwrap._landlock_problem(*answer) == ""
 
 
 @_linux_only
@@ -1490,7 +1592,7 @@ def test_a_scope_step_that_fails_in_the_child_is_named_across_the_spawn(
     and call gone; the refusal still names the call and its errno, which
     the child recorded, and nothing ran.
     """
-    monkeypatch.setattr(sandbox_bwrap, "_landlock_abi", lambda _syscall: 6)
+    monkeypatch.setattr(sandbox_bwrap, "_landlock_abi", lambda _syscall: (6, 0))
     monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _scope_failing_at(failing))
     with pytest.raises(SandboxLaunchRefusedError) as info:
         execute(
@@ -1520,7 +1622,7 @@ def test_the_probe_tells_a_keyring_failure_from_a_landlock_one(
     named: str,
 ) -> None:
     """The probe's launch, end to end, names which scope capability failed (PR #231 R2-F4)."""
-    monkeypatch.setattr(sandbox_bwrap, "_landlock_abi", lambda _syscall: 6)
+    monkeypatch.setattr(sandbox_bwrap, "_landlock_abi", lambda _syscall: (6, 0))
     monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _scope_failing_at(failing))
     result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
     assert not result.supported
@@ -1630,8 +1732,12 @@ def test_the_options_travel_in_a_descriptor(
         ("bwrap: Can't make overlay mount on /newroot/x with options ...: EINVAL", "overlay"),
         (
             "the kernel's Landlock ABI is 4; the abstract-socket scope needs ABI 6 (Linux "
-            "6.12) with Landlock enabled",
+            "6.12 or later)",
             "landlock",
+        ),
+        *(
+            (f"the sandbox cannot be established: {p.values[2]}", "landlock")
+            for p in _LANDLOCK_ANSWERS
         ),
         (
             "the launch's process could not join a new session keyring or restrict itself to "

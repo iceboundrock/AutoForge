@@ -11,6 +11,8 @@ ABI a stand-in, so nothing depends on this host's own capability.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import sys
 from pathlib import Path
 
@@ -71,7 +73,7 @@ def _report(**changes) -> sandbox_host.HostReport:
 
 def test_an_old_bwrap_without_namespaces_or_landlock_is_measured_incapable(tmp_path, monkeypatch):
     bin_dir = _path_with(tmp_path, monkeypatch, OLD_BWRAP)
-    monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: 4)
+    monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: (4, ""))
     report = sandbox_host.measure()
     assert report.bwrap == str(bin_dir / "bwrap") and report.bwrap_version == "0.9.0"
     assert not report.bwrap_overlay
@@ -93,7 +95,7 @@ def test_an_old_bwrap_without_namespaces_or_landlock_is_measured_incapable(tmp_p
 
 def test_a_capable_host_is_measured_capable_and_the_tests_said_required(tmp_path, monkeypatch):
     _path_with(tmp_path, monkeypatch, CAPABLE_BWRAP)
-    monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: 6)
+    monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: (6, ""))
     report = sandbox_host.measure()
     assert report.bwrap_version == "0.12.0" and report.bwrap_overlay
     assert report.namespaces == "" and report.capable and report.missing == []
@@ -105,11 +107,38 @@ def test_a_capable_host_is_measured_capable_and_the_tests_said_required(tmp_path
 
 def test_a_host_without_bwrap_is_measured_and_named(tmp_path, monkeypatch):
     _path_with(tmp_path, monkeypatch, None)
-    monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: 6)
+    monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: (6, ""))
     report = sandbox_host.measure()
     assert report.missing == ["bwrap on PATH"]
     text = report.markdown()
     assert "| bwrap | not found on PATH |" in text and "not measured (no bwrap)" in text
+
+
+@pytest.mark.parametrize(
+    ("code", "answered"),
+    [
+        (errno.EOPNOTSUPP, "EOPNOTSUPP: Landlock is built in but disabled at boot"),
+        (errno.ENOSYS, "ENOSYS: the kernel has no Landlock call"),
+        (errno.EPERM, "EPERM"),
+    ],
+)
+def test_a_kernel_that_gives_no_landlock_abi_is_measured_with_its_answer(
+    monkeypatch, code, answered
+):
+    """A kernel with Landlock disabled at boot is not recorded as merely too old (#349)."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("the call is Linux's")
+
+    class Libc:
+        def syscall(self, *_args: object) -> int:
+            ctypes.set_errno(code)
+            return -1
+
+    monkeypatch.setattr(sandbox_host.ctypes, "CDLL", lambda *_args, **_kwargs: Libc())
+    assert sandbox_host.landlock_abi() == (0, answered)
+    report = _report(landlock_abi=0, landlock_error=answered)
+    assert report.missing == [f"Landlock ABI 6 (the kernel's is unavailable ({answered}))"]
+    assert f"| Landlock ABI | unavailable ({answered}) |" in report.markdown()
 
 
 def test_only_linux_has_a_backend():

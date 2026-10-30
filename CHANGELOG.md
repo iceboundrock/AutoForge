@@ -5,6 +5,28 @@ so.
 
 ## Unreleased
 
+### The outer sandbox says why a kernel lacks the Landlock scope, not only that it does (#349)
+
+- A host whose kernel did not report a Landlock ABI was told "the kernel's
+  Landlock ABI is unavailable; the abstract-socket scope needs ABI 6 (Linux
+  6.12) with Landlock enabled", even on Linux 7.0 with Landlock disabled at
+  boot (an LXC container on a Proxmox VE kernel). The refusal, the
+  capability probe and `doctor`'s capability and mode rows now give the
+  kernel's answer: an ABI below 6 by its number, Landlock built in but
+  disabled at boot (`EOPNOTSUPP`, with the `lsm=` boot parameter that
+  enables it, the host's for a container), no Landlock call (`ENOSYS`: a
+  kernel before 5.13 or without Landlock, or a seccomp filter that hides
+  it), or any other errno. Only the first says it needs Linux 6.12.
+  [Compatibility](docs/compatibility.md#outer-sandbox) lists the four, and
+  records the Proxmox VE container as unsupported as measured: whether
+  enabling Landlock on the Proxmox host is enough inside the container is
+  not yet verified.
+- `tests/sandbox_host.py`, which CI's `sandbox` job runs, records the same
+  answer in its summary instead of "unavailable".
+- Which hosts can enforce does not change, and neither does the
+  capability the gate and `doctor` name (`landlock`). No default,
+  configuration key or prompt changes.
+
 ### An idle timeout names when the silence began, and a Claude run's summary records where its stream stood (#343)
 
 - `last_activity_at` in `execution.json`, and the time in the error

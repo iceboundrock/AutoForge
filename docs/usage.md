@@ -1274,7 +1274,9 @@ ownership or discard uncommitted user changes.
   `preferred` in REMOTE): the pre-launch gate refused the step. Nothing was
   launched, saved or charged. `autoforge doctor` (or `local doctor`) shows
   the same capability row; make the host capable (install `bwrap`, allow
-  unprivileged user namespaces, a kernel with Landlock ABI 6), or set
+  unprivileged user namespaces, a kernel with Landlock ABI 6 that booted
+  with Landlock enabled; the row's reason says which of the two a kernel
+  lacks, see [Compatibility](compatibility.md#outer-sandbox)), or set
   `sandbox.mode: disabled` (logical isolation only) or, in LOCAL,
   `preferred`, and run the same command again.
 - **"the configuration file ... lies in ..., a tree that launches inside
