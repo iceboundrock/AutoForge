@@ -207,7 +207,9 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        outer sandbox and host-resource capability model,
                                        candidate validation evidence and review certificates,
                                        SDK providers: isolated helpers, interaction contract,
-                                       parallel EPIC scheduler: authority, run identity, claims, locks)
+                                       parallel EPIC scheduler: authority, run identity, claims, locks;
+                                       removing LOCAL mode (policy accepted, not implemented):
+                                       no compatibility, strict refusal, the protocol, sequencing)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
@@ -269,6 +271,11 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   commands) or changing the repository lock, read
   `docs/adr/0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md`
   in addition to `state-and-recovery.md`.
+- If changing LOCAL mode (`autoforge local`, `local_workspace.py`,
+  `run_contract.py`, a LOCAL branch of shared code), read
+  `docs/adr/0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md`
+  first: LOCAL is being removed (EPIC #383), and that record decides what
+  a change to it may still do.
 - If changing `src/autoforge/result_parser.py`, a prompt template, the
   per-phase required result fields, or how the engine consumes a parsed
   result, read `docs/agent-guides/control-result-protocol.md`.
