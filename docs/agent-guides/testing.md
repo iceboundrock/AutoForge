@@ -318,6 +318,24 @@ High-priority coverage includes:
   settlement and a durable pause comes first; an open claim without a
   state owns its issue for `run`, a claim file of closed claims owns
   nothing, and an unreadable one owns its issue
+- the state pins of LOCAL's removal (ADR 0009 D4, D8, D12 S1b; #385;
+  `tests/test_state.py`, `tests/test_replan.py`, `tests/test_cli.py`,
+  `tests/test_scheduler_state.py`, `tests/test_epic_commands.py`), written
+  against the code before the removal: every refusal D8 keeps runs on its
+  file with LOCAL's twelve fields at their empty values and without them,
+  a protocol-1 file in `READY_FOR_MERGE` or `MERGE` included; a `mode`
+  other than absent or `"REMOTE"` is refused under every label, unknown
+  ones and none included. On an unknown mode, an unknown label and invalid
+  JSON, `status`, `step`, `resume` and `unblock` exit 2 and leave the
+  state directory and its logs as they were; `run` refuses, and
+  `run --force` moves the file aside byte for byte, beside an archive of
+  the same name it does not replace, prints the move and starts a run with
+  nothing of it. Such a file at `config.state_dir` holds no issue and is
+  reported by the scheduler's pass and by `epic status`, a namespace state
+  of any mode but REMOTE holds its issue as uncertain, and no `epic`
+  command touches `<git dir>/autoforge/state`. #387 and #388 keep these
+  passing, apart from the expected protocol label and any row that names
+  LOCAL
 
 ### Transitions
 

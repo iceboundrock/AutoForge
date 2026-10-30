@@ -1010,6 +1010,14 @@ def _uncertain_case(common: Path, case: str, tmp_path: Path) -> tuple[IssueNames
         raw["protocol_version"] = "99"
         ns.state_file.write_text(json.dumps(raw))
         return ns, "state-corrupt"
+    if case in ("state of an unknown mode", "state of a mode that is not a string"):
+        # ADR 0009 D4 (#385): the scheduler only creates REMOTE states, and
+        # one of any other mode is a state that cannot be read.
+        _save(ns, Phase.REVIEW)
+        raw = json.loads(ns.state_file.read_text())
+        raw["mode"] = "SATELLITE" if case == "state of an unknown mode" else None
+        ns.state_file.write_text(json.dumps(raw))
+        return ns, "state-corrupt"
     if case == "state of another issue":
         with ns.state_paths().open_root(create=True) as root:
             save_state(_state(9, Phase.REVIEW), ns.state_file, root=root)
@@ -1053,6 +1061,8 @@ UNCERTAIN_CASES = [
     "missing state",
     "corrupt state",
     "state of unknown protocol",
+    "state of an unknown mode",
+    "state of a mode that is not a string",
     "state of another issue",
     "state of another epic",
     "state of another repository",

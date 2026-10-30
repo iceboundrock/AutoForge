@@ -50,7 +50,7 @@ from autoforge.state import (
 )
 from autoforge.transitions import Phase, WorkflowMode
 
-from .conftest import DECODER_LIMIT_RECORDS, sample_contract
+from .conftest import DECODER_LIMIT_RECORDS, LOCAL_STATE_FIELDS, sample_contract
 
 # Protocol 10's own fields (#172): no older label wrote any of them.
 _VALIDATION_KEYS = (
@@ -157,34 +157,56 @@ def test_load_missing_raises_helpful_error(tmp_path):
         load_state(tmp_path / "nope" / "state.json")
 
 
-def test_load_corrupted_json_raises_and_does_not_clobber(tmp_path):
+def _saved_state_bytes(local_fields) -> bytes:
+    """A whole REMOTE state file as a save writes it, shaped by ``local_fields``."""
+    return json.dumps(local_fields(make_state(phase=Phase.REVIEW).to_dict())).encode("utf-8")
+
+
+def test_load_corrupted_json_raises_and_does_not_clobber(tmp_path, local_fields):
     p = tmp_path / "state.json"
-    p.write_text('{"phase": "REVIEW", "run_id": ', encoding="utf-8")
-    with pytest.raises(StateError, match="[Cc]orrupt"):
-        load_state(p)
-    # file untouched — loader never writes
-    assert p.read_text(encoding="utf-8") == '{"phase": "REVIEW", "run_id": '
+    torn = _saved_state_bytes(local_fields)[:-1]  # a whole state, one byte short
+    for raw in (b'{"phase": "REVIEW", "run_id": ', torn):
+        p.write_bytes(raw)
+        with pytest.raises(StateError, match="[Cc]orrupt"):
+            load_state(p)
+        # file untouched — loader never writes
+        assert p.read_bytes() == raw
 
 
-def test_load_invalid_utf8_raises_state_error_and_does_not_clobber(tmp_path):
+def test_load_invalid_utf8_raises_state_error_and_does_not_clobber(tmp_path, local_fields):
     """Invalid UTF-8 is corruption, not a read error: it must surface as StateError."""
     p = tmp_path / "state.json"
-    raw = b'\xff\xfe{"phase": "REVIEW"}'
-    p.write_bytes(raw)
-    with pytest.raises(StateError, match="[Cc]orrupt.*UTF-8"):
-        load_state(p)
-    assert p.read_bytes() == raw
+    whole = _saved_state_bytes(local_fields)
+    assert b'"af-test-1"' in whole
+    for raw in (b'\xff\xfe{"phase": "REVIEW"}', whole.replace(b'"af-test-1"', b'"af-\xfftest-1"')):
+        p.write_bytes(raw)
+        with pytest.raises(StateError, match="[Cc]orrupt.*UTF-8"):
+            load_state(p)
+        assert p.read_bytes() == raw
 
 
-@pytest.mark.parametrize("raw", DECODER_LIMIT_RECORDS.values(), ids=DECODER_LIMIT_RECORDS.keys())
-def test_load_past_the_decoders_limits_is_corrupt_state_and_does_not_clobber(tmp_path, raw):
+def _past_the_decoders_limits(local_fields) -> dict[str, bytes]:
+    """:data:`DECODER_LIMIT_RECORDS` again, each inside a whole state file."""
+    whole = _saved_state_bytes(local_fields)
+    assert whole.endswith(b"}")
+    return {
+        name: whole[:-1] + b', "n": ' + record[len(b'{"type": "x", "n": ') :]
+        for name, record in DECODER_LIMIT_RECORDS.items()
+    }
+
+
+@pytest.mark.parametrize("name", DECODER_LIMIT_RECORDS.keys())
+def test_load_past_the_decoders_limits_is_corrupt_state_and_does_not_clobber(
+    tmp_path, name, local_fields
+):
     """ValueError and RecursionError from the decoder are corruption too, never an escape."""
     p = tmp_path / "state.json"
-    p.write_bytes(raw)
-    with pytest.raises(StateError, match="[Cc]orrupt.*integer or nesting limit") as info:
-        load_state(p)
-    assert len(str(info.value)) < len(str(p)) + 200
-    assert p.read_bytes() == raw
+    for raw in (DECODER_LIMIT_RECORDS[name], _past_the_decoders_limits(local_fields)[name]):
+        p.write_bytes(raw)
+        with pytest.raises(StateError, match="[Cc]orrupt.*integer or nesting limit") as info:
+            load_state(p)
+        assert len(str(info.value)) < len(str(p)) + 200
+        assert p.read_bytes() == raw
 
 
 def test_load_unknown_phase_raises(tmp_path):
@@ -445,7 +467,7 @@ def test_replan_state_defaults_and_reset_are_backward_compatible(tmp_path):
     assert loaded.replan_transaction == {}
 
 
-def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
+def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path, local_fields):
     """#66 R7-F1: the 1 -> 2 protocol change is confined to the replan journal.
 
     A protocol-1 file with an empty or terminal journal loads and is
@@ -457,6 +479,7 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path):
     path = tmp_path / "state.json"
     base = make_state().to_dict()
     assert base["protocol_version"] == "12"
+    local_fields(base)  # protocol 1 wrote none, some or all of LOCAL's (ADR 0009 D8)
     del base["acceptance_outcomes"]  # protocol 8's own field (#211)
     del base["config_fingerprint"]  # protocol 9's own field (#219)
     _drop_validation(base)  # protocol 10's own fields (#172)
@@ -518,14 +541,14 @@ def _clean_review_state(**kw):
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
-def test_protocol_2_is_refused_in_the_merge_phases(tmp_path, phase):
+def test_protocol_2_is_refused_in_the_merge_phases(tmp_path, phase, local_fields):
     """#68: protocol 2 did not record which PR and base the clean review was
     posted on. A file parked before MERGE cannot be bound after the fact --
     filling the binding from ``current_pr_url`` would be exactly the trust
     the binding exists to remove -- so it is refused at the boundary, left
     unchanged, with the PR and HEAD named so the operator can look."""
     path = tmp_path / "state.json"
-    data = _clean_review_state(phase=phase).to_dict()
+    data = local_fields(_clean_review_state(phase=phase).to_dict())
     data["protocol_version"] = "2"
     data["controller_version"] = "0.2.0"
     for missing in ("reviewed_pr_url", "reviewed_base_ref", "current_base_ref"):
@@ -546,6 +569,51 @@ def test_protocol_2_is_refused_in_the_merge_phases(tmp_path, phase):
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(StateError, match="did not record which PR and base branch"):
         load_state(path)
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+def test_protocol_1_is_refused_in_the_merge_phases(tmp_path, phase, local_fields):
+    """ADR 0009 D8 (#385): protocol 1 recorded no more of the clean review's
+    binding than protocol 2 did, so a protocol-1 file parked before MERGE is
+    refused the same way, left unchanged, with the PR and HEAD named. The
+    file is what protocol 1 wrote: none of the binding protocols 3 and 4
+    added and none of the fields protocols 7 to 12 added. Its journal is
+    empty, terminal or absent, so the journal rule lets it through and the
+    binding rule decides."""
+    path = tmp_path / "state.json"
+    base = local_fields(_clean_review_state(phase=phase).to_dict())
+    base["protocol_version"] = "1"
+    base["controller_version"] = "0.1.0"
+    for missing in (
+        "reviewed_pr_url",
+        "reviewed_base_ref",
+        "current_base_ref",
+        "reviewed_merge_base_sha",
+        "current_merge_base_sha",
+        *_EFFECT_KEYS,
+        "acceptance_outcomes",
+        "config_fingerprint",
+        *_VALIDATION_KEYS,
+        *_OPERATOR_KEYS,
+        *_PIN_KEYS,
+    ):
+        del base[missing]
+    rejected = {"stage": "rejected", "rejection_reason": "refused by verification"}
+    for journal in ({}, rejected, None):
+        data = dict(base, replan_transaction=journal)
+        if journal is None:
+            del data["replan_transaction"]
+        raw = json.dumps(data)
+        path.write_text(raw, encoding="utf-8")
+        with pytest.raises(StateError) as info:
+            load_state(path)
+        message = str(info.value)
+        assert "written by controller 0.1.0 under protocol_version '1'" in message
+        assert f"phase {phase.value}" in message and "pull/42" in message
+        assert ("a" * 40) in message
+        assert "protocol '1' did not record which PR and base branch that review was" in message
+        assert "Nothing was merged or counted" in message and "corrupt" not in message
+        assert path.read_text(encoding="utf-8") == raw
 
 
 @pytest.mark.parametrize(
@@ -586,7 +654,7 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
-def test_protocol_3_is_refused_in_the_merge_phases(tmp_path, phase):
+def test_protocol_3_is_refused_in_the_merge_phases(tmp_path, phase, local_fields):
     """#96: protocol 3 bound the clean review to its PR and base name but
     not to the merge base its diff was computed from. A file parked before
     MERGE cannot be bound after the fact -- reading the merge base now would
@@ -596,7 +664,7 @@ def test_protocol_3_is_refused_in_the_merge_phases(tmp_path, phase):
     every earlier protocol: a protocol-3 journal that is empty or rejected
     is not in flight, so the binding rule decides."""
     path = tmp_path / "state.json"
-    data = _clean_review_state(phase=phase).to_dict()
+    data = local_fields(_clean_review_state(phase=phase).to_dict())
     data["protocol_version"] = "3"
     data["controller_version"] = "0.3.0"
     for missing in ("reviewed_merge_base_sha", "current_merge_base_sha"):
@@ -651,7 +719,7 @@ def test_protocol_3_is_relabelled_outside_the_merge_phases(tmp_path, phase):
 
 
 @pytest.mark.parametrize("phase", list(Phase))
-def test_protocol_3_is_refused_with_a_replan_in_flight(tmp_path, phase):
+def test_protocol_3_is_refused_with_a_replan_in_flight(tmp_path, phase, local_fields):
     """#96: protocol 3 did not record the merge base the replan decision was
     bound to, so a protocol-3 file with a replan in flight is refused in
     every phase the way a protocol-1 or protocol-2 one is -- never migrated
@@ -664,7 +732,7 @@ def test_protocol_3_is_refused_with_a_replan_in_flight(tmp_path, phase):
         "transaction_id": "a" * 32,
         "source_pr_url": PR42,
     }
-    data = _clean_review_state(phase=phase, replan_transaction=in_flight).to_dict()
+    data = local_fields(_clean_review_state(phase=phase, replan_transaction=in_flight).to_dict())
     data["protocol_version"] = "3"
     data["controller_version"] = "0.3.0"
     for missing in ("reviewed_merge_base_sha", "current_merge_base_sha"):
@@ -740,7 +808,7 @@ def test_protocol_4_is_relabelled_in_every_phase_without_a_replan_past_the_write
 
 @pytest.mark.parametrize("phase", list(Phase))
 @pytest.mark.parametrize("stage", ["supersede_intent", "compensating", "superseded"])
-def test_protocol_4_is_refused_with_a_replan_past_the_write(tmp_path, phase, stage):
+def test_protocol_4_is_refused_with_a_replan_past_the_write(tmp_path, phase, stage, local_fields):
     """#69: protocol 4 did not record, with the close intent, the source PR's
     closed-event count or the number of close attempts, so a protocol-4 file
     whose replan has reached the write is refused in every phase -- never
@@ -755,7 +823,7 @@ def test_protocol_4_is_refused_with_a_replan_past_the_write(tmp_path, phase, sta
         "replacement_pr_url": "https://github.com/owner/repo/pull/43",
         "close_intent_at": "2026-01-01T00:00:00+00:00",
     }
-    data = _clean_review_state(phase=phase, replan_transaction=in_flight).to_dict()
+    data = local_fields(_clean_review_state(phase=phase, replan_transaction=in_flight).to_dict())
     data["protocol_version"] = "4"
     data["controller_version"] = "0.4.0"
     raw = json.dumps(data)
@@ -1334,7 +1402,9 @@ def test_load_symlink_to_fifo_fails_loudly_without_blocking(tmp_path):
     assert p.is_symlink() and os.readlink(p) == "real.fifo"
 
 
-def test_load_oversized_state_file_is_corrupt_state_without_materialising_it(tmp_path, monkeypatch):
+def test_load_oversized_state_file_is_corrupt_state_without_materialising_it(
+    tmp_path, monkeypatch, local_fields
+):
     """R10-F3: an oversized or sparse ``state.json`` is refused, never read whole.
 
     The file is a sparse hole far past the budget: on any filesystem that
@@ -1349,10 +1419,6 @@ def test_load_oversized_state_file_is_corrupt_state_without_materialising_it(tmp
     from autoforge.state import MAX_STATE_FILE_BYTES
 
     p = tmp_path / "state.json"
-    p.write_bytes(b'{"phase": "REVIEW"}')
-    os.truncate(p, 16 * MAX_STATE_FILE_BYTES)
-    assert p.stat().st_size == 16 * MAX_STATE_FILE_BYTES
-
     asked: list[int] = []
     real_fdopen = safefs.os.fdopen
 
@@ -1368,10 +1434,19 @@ def test_load_oversized_state_file_is_corrupt_state_without_materialising_it(tmp
         return fh
 
     monkeypatch.setattr(safefs.os, "fdopen", fdopen_with_counted_reads)
-    with pytest.raises(StateError, match="[Cc]orrupt.*larger than .* bytes.*refusing to overwrite"):
-        load_state(p)
-    assert asked and max(asked) == MAX_STATE_FILE_BYTES + 1, asked
-    assert p.stat().st_size == 16 * MAX_STATE_FILE_BYTES, "loader never writes"
+    for head in (b'{"phase": "REVIEW"}', _saved_state_bytes(local_fields)):
+        p.write_bytes(head)
+        os.truncate(p, 16 * MAX_STATE_FILE_BYTES)
+        assert p.stat().st_size == 16 * MAX_STATE_FILE_BYTES
+        asked.clear()
+        with pytest.raises(
+            StateError, match="[Cc]orrupt.*larger than .* bytes.*refusing to overwrite"
+        ):
+            load_state(p)
+        assert asked and max(asked) == MAX_STATE_FILE_BYTES + 1, asked
+        assert p.stat().st_size == 16 * MAX_STATE_FILE_BYTES, "loader never writes"
+        with open(p, "rb") as f:
+            assert f.read(len(head)) == head
 
 
 def test_load_state_file_at_the_budget_still_loads(tmp_path):
@@ -3361,12 +3436,12 @@ def test_a_legacy_local_state_gets_no_launch_label(tmp_path):
     ],
 )
 def test_a_legacy_file_carrying_effect_state_is_refused_and_left_unchanged(
-    tmp_path, protocol, field, value
+    tmp_path, protocol, field, value, local_fields
 ):
     """D13.2: a legacy label never wrote effect state, so a legacy file carrying
     any non-empty effect field is a hand edit or a foreign file: refused, never
     merged, and the file is not rewritten."""
-    d = _legacy(protocol, phase=Phase.UPDATE_EPIC, attempt=1, current_pr_url=PR42)
+    d = local_fields(_legacy(protocol, phase=Phase.UPDATE_EPIC, attempt=1, current_pr_url=PR42))
     d[field] = value
     p = _write(tmp_path / "state.json", d)
     before = p.read_bytes()
@@ -3383,7 +3458,7 @@ def test_a_legacy_file_carrying_effect_state_is_refused_and_left_unchanged(
 )
 @pytest.mark.parametrize("stage", [Stage.INTENDED, Stage.ATTEMPTED])
 def test_a_protocol_7_or_8_file_missing_an_effect_field_is_refused_and_left_unchanged(
-    tmp_path, protocol, missing, stage
+    tmp_path, protocol, missing, stage, local_fields
 ):
     """D13.2 loads only a legacy label with no effect state. A protocol-7 save
     writes all four fields, and a protocol-8 one ``acceptance_outcomes`` too
@@ -3400,7 +3475,7 @@ def test_a_protocol_7_or_8_file_missing_an_effect_field_is_refused_and_left_unch
     if protocol == "7":
         del d["acceptance_outcomes"]
     del d[missing]
-    p = _write(tmp_path / "state.json", d)
+    p = _write(tmp_path / "state.json", local_fields(d))
     before = p.read_bytes()
     with pytest.raises(StateError) as exc:
         load_state(p)
@@ -3409,13 +3484,13 @@ def test_a_protocol_7_or_8_file_missing_an_effect_field_is_refused_and_left_unch
     assert p.read_bytes() == before
 
 
-def test_an_unlabelled_file_missing_an_effect_field_is_refused(tmp_path):
+def test_an_unlabelled_file_missing_an_effect_field_is_refused(tmp_path, local_fields):
     """Every controller has written ``protocol_version``; a file without one is
     read as the current protocol, so deleting the label as well as
     ``effect_records`` does not turn a pending progress comment into no plan."""
     d = _update_epic_state(Stage.INTENDED).to_dict()
     del d["protocol_version"], d["effect_records"]
-    p = _write(tmp_path / "state.json", d)
+    p = _write(tmp_path / "state.json", local_fields(d))
     with pytest.raises(StateError) as exc:
         load_state(p)
     assert "is missing required field(s) 'effect_records'" in str(exc.value)
@@ -3444,13 +3519,15 @@ def test_a_legacy_file_with_effect_fields_at_their_empty_values_loads(tmp_path):
 
 
 @pytest.mark.parametrize("protocol", ["6", "13", 7, 8, 9, 10, 11, 12])
-def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(tmp_path, protocol):
+def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(
+    tmp_path, protocol, local_fields
+):
     """D13.1: protocol 6 is skipped for good (it was once reserved for #126) and
     was never written by any released controller, so it is not a legacy label
     this controller migrates; it is refused exactly like a future label (and a
     non-string label), and the file is not rewritten. Pinned so that adopting 6
     is a deliberate change."""
-    d = make_state().to_dict()
+    d = local_fields(make_state().to_dict())
     d["protocol_version"] = protocol
     p = _write(tmp_path / "state.json", d)
     before = p.read_bytes()
@@ -3458,6 +3535,52 @@ def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(tmp_
         load_state(p)
     assert f"unsupported protocol_version {protocol!r} (controller speaks '12')" in str(exc.value)
     assert p.read_bytes() == before
+
+
+_EVERY_LABEL = [*(str(n) for n in range(1, 14)), None]
+
+
+@pytest.mark.parametrize("label", _EVERY_LABEL, ids=lambda label: f"label-{label}")
+@pytest.mark.parametrize("mode", ["SATELLITE", "remote", "", None, 1, ["REMOTE"]], ids=repr)
+def test_a_mode_other_than_remote_is_refused_under_every_label_and_left_unchanged(
+    tmp_path, mode, label, local_fields
+):
+    """ADR 0009 D4 and D8 step 1 (#385): ``mode`` absent or ``"REMOTE"`` loads,
+    and any other value, a non-string one included, is refused with the
+    loader's own error. The mode is read before the label, so it decides
+    under every label: one that loads today, 6, one no controller wrote yet
+    (``13``) and none."""
+    d = local_fields(make_state(phase=Phase.REVIEW).to_dict())
+    d["mode"] = mode
+    if label is None:
+        del d["protocol_version"]
+    else:
+        d["protocol_version"] = label
+    p = _write(tmp_path / "state.json", d)
+    before = p.read_bytes()
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert str(exc.value) == f"state file has unknown mode {mode!r}"
+    assert p.read_bytes() == before
+
+
+def test_the_local_fields_are_the_twelve_every_remote_save_writes_empty():
+    """``conftest.LOCAL_STATE_FIELDS`` names exactly LOCAL's twelve fields
+    (ADR 0009 §1.1) at the value a REMOTE save writes, so the pins that run
+    with and without them (#385) test the file a REMOTE run has today."""
+    from dataclasses import fields
+
+    saved = make_state().to_dict()
+    assert {name: saved[name] for name in LOCAL_STATE_FIELDS} == LOCAL_STATE_FIELDS
+    defaults = {
+        f.name: f.default_factory() if callable(f.default_factory) else f.default
+        for f in fields(AutoForgeState)
+    }
+    assert {name: defaults[name] for name in LOCAL_STATE_FIELDS} == LOCAL_STATE_FIELDS
+    names = [f.name for f in fields(AutoForgeState)]
+    first = names.index("feature_spec_path")
+    assert names[first : first + len(LOCAL_STATE_FIELDS)] == list(LOCAL_STATE_FIELDS)
+    assert len(LOCAL_STATE_FIELDS) == 12
 
 
 # -- record lifetime: settle_phase_effects (D2.4) ------------------------------------------
@@ -3773,8 +3896,10 @@ def test_an_older_file_carrying_acceptance_state_is_refused_and_left_unchanged(
 
 
 @pytest.mark.parametrize("planted", ["record", "source"])
-def test_a_protocol_7_plan_carrying_an_acceptance_comment_is_refused(tmp_path, planted):
-    d = _as_protocol_7(_fix_state().to_dict())
+def test_a_protocol_7_plan_carrying_an_acceptance_comment_is_refused(
+    tmp_path, planted, local_fields
+):
+    d = local_fields(_as_protocol_7(_fix_state().to_dict()))
     if planted == "record":
         d["effect_records"][0]["kind"] = "acceptance_comment"
         named = "an 'acceptance_comment' effect record"
@@ -3976,7 +4101,9 @@ def test_an_older_file_carrying_a_recorded_configuration_is_refused_and_left_unc
 
 
 @pytest.mark.parametrize("protocol", ["9", "10", "11", "12"])
-def test_a_protocol_9_file_missing_its_recorded_configuration_is_refused(tmp_path, protocol):
+def test_a_protocol_9_file_missing_its_recorded_configuration_is_refused(
+    tmp_path, protocol, local_fields
+):
     """Every protocol-9 save writes the field, ``{}`` included, and so does
     every later one: read as absent it would switch the check off for the
     rest of the run."""
@@ -3990,7 +4117,7 @@ def test_a_protocol_9_file_missing_its_recorded_configuration_is_refused(tmp_pat
         _drop_pin(d)
     if protocol == "9":
         _drop_validation(d)
-    p = _write(tmp_path / "state.json", d)
+    p = _write(tmp_path / "state.json", local_fields(d))
     with pytest.raises(StateError) as exc:
         load_state(p)
     message = str(exc.value)
@@ -4139,7 +4266,9 @@ def test_an_older_file_loads_in_every_phase_with_no_validation_evidence(tmp_path
 
 @pytest.mark.parametrize("protocol", ["5", "7", "8", "9"])
 @pytest.mark.parametrize("key", _VALIDATION_KEYS)
-def test_an_older_file_carrying_validation_evidence_is_refused(tmp_path, protocol, key):
+def test_an_older_file_carrying_validation_evidence_is_refused(
+    tmp_path, protocol, key, local_fields
+):
     """The label decides, not the value: protocol 10's fields are refused in
     an older file even at their empty values."""
     if protocol == "5":
@@ -4152,7 +4281,7 @@ def test_an_older_file_carrying_validation_evidence_is_refused(tmp_path, protoco
         if protocol == "7":
             del d["acceptance_outcomes"]
     d[key] = make_state().to_dict()[key]
-    p = _write(tmp_path / "state.json", d)
+    p = _write(tmp_path / "state.json", local_fields(d))
     before = p.read_bytes()
     with pytest.raises(StateError) as exc:
         load_state(p)
@@ -4162,7 +4291,9 @@ def test_an_older_file_carrying_validation_evidence_is_refused(tmp_path, protoco
 
 @pytest.mark.parametrize("protocol", ["10", "11", "12"])
 @pytest.mark.parametrize("key", _VALIDATION_KEYS)
-def test_a_protocol_10_file_missing_a_validation_field_is_refused(tmp_path, key, protocol):
+def test_a_protocol_10_file_missing_a_validation_field_is_refused(
+    tmp_path, key, protocol, local_fields
+):
     """Every protocol-10 save writes all six, and so does every later one."""
     d = make_state().to_dict()
     if protocol == "10":
@@ -4172,7 +4303,7 @@ def test_a_protocol_10_file_missing_a_validation_field_is_refused(tmp_path, key,
         d["protocol_version"] = "11"
         _drop_pin(d)
     del d[key]
-    p = _write(tmp_path / "state.json", d)
+    p = _write(tmp_path / "state.json", local_fields(d))
     with pytest.raises(StateError) as exc:
         load_state(p)
     message = str(exc.value)
@@ -4481,12 +4612,12 @@ def test_an_older_fix_plan_carrying_operator_state_is_refused_and_left_unchanged
     assert p.read_bytes() == before
 
 
-def test_a_protocol_11_file_missing_its_operator_outcomes_is_refused(tmp_path):
+def test_a_protocol_11_file_missing_its_operator_outcomes_is_refused(tmp_path, local_fields):
     """Every protocol-11 save writes the field, ``[]`` included, and so does
     every later one: read as the empty default, an absent one would drop the
     round's declined actions and let the same request through again. An
     unlabelled file is read as the current protocol."""
-    older = _drop_pin(_after_operator_fix().to_dict())
+    older = local_fields(_drop_pin(_after_operator_fix().to_dict()))
     older["protocol_version"] = "11"
     del older["operator_comment_outcomes"]
     p = _write(tmp_path / "state.json", older)
@@ -4496,7 +4627,7 @@ def test_a_protocol_11_file_missing_its_operator_outcomes_is_refused(tmp_path):
         "labelled protocol_version '11' but is missing required field(s) "
         "'operator_comment_outcomes'"
     ) in str(exc.value)
-    d = _after_operator_fix().to_dict()
+    d = local_fields(_after_operator_fix().to_dict())
     del d["operator_comment_outcomes"]
     for label in ("labelled protocol_version '12'", "no protocol_version label (read as '12')"):
         if "no protocol_version" in label:
@@ -4911,11 +5042,11 @@ def test_an_older_file_carrying_a_sandbox_pin_is_refused_and_left_unchanged(
     assert p.read_bytes() == before
 
 
-def test_a_protocol_12_file_missing_its_sandbox_pin_is_refused(tmp_path):
+def test_a_protocol_12_file_missing_its_sandbox_pin_is_refused(tmp_path, local_fields):
     """Every protocol-12 save writes the field, ``{}`` included: read as the
     empty default, an absent one would switch the check off. An unlabelled
     file is read as the current protocol."""
-    d = make_state(sandbox_pin=dict(PIN)).to_dict()
+    d = local_fields(make_state(sandbox_pin=dict(PIN)).to_dict())
     del d["sandbox_pin"]
     for label in ("labelled protocol_version '12'", "no protocol_version label (read as '12')"):
         if "no protocol_version" in label:

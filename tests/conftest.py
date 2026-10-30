@@ -109,6 +109,100 @@ DECODER_LIMIT_RECORDS = {
     "deep-nesting": b'{"type": "x", "n": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
 }
 
+# -- the state pins of LOCAL's removal (ADR 0009 D8, D12 S1b; #385) ---------------------
+# The twelve state fields LOCAL mode added (ADR 0009 §1.1), at the empty value
+# every REMOTE save writes them with. A protocol-1 file carries none, some or
+# all of them, every later save all twelve. Each refusal the removal keeps is
+# pinned on a file with all twelve at these values and on one with none of
+# them, so that dropping the fields (#388) cannot turn either into a file that
+# loads, or refuse it for another reason.
+LOCAL_STATE_FIELDS = {
+    "feature_spec_path": "",
+    "feature_spec_sha256": "",
+    "base_head_sha": "",
+    "base_branch": "",
+    "local_run_contract": {},
+    "workspace_fingerprint": "",
+    "reviewed_workspace_fingerprint": "",
+    "local_fix_rounds": 0,
+    "local_pending_phase": "",
+    "local_pending_fingerprint": "",
+    "local_pending_attempts": 0,
+    "baseline_dirty_paths": [],
+}
+
+
+@pytest.fixture(params=["with-local-fields", "without-local-fields"])
+def local_fields(request) -> Callable[[dict], dict]:
+    """Give a state file's dict LOCAL's twelve fields at their empty values, or none of them.
+
+    The callable changes the dict in place and returns it: a test applies it
+    to the dict it is about to write, and so runs once on each file.
+    """
+    present = request.param == "with-local-fields"
+
+    def shape(data: dict) -> dict:
+        for name, empty in LOCAL_STATE_FIELDS.items():
+            if present:
+                data[name] = type(empty)()
+            else:
+                data.pop(name, None)
+        return data
+
+    return shape
+
+
+def state_tree(root: Path) -> dict[str, tuple]:
+    """Every entry under ``root``, ``root`` included, links unfollowed.
+
+    Each is its kind, inode, modification time and, for a regular file, the
+    SHA-256 of its bytes (a link's target for a link). Two equal snapshots
+    mean nothing under ``root`` was written: no file changed or was replaced,
+    and no entry was created, renamed or removed, not even one created and
+    removed again in between (its directory's modification time moves).
+    """
+    import hashlib
+    import stat as stat_mod
+
+    out: dict[str, tuple] = {}
+    for base, dirs, files in os.walk(root):
+        for path in [base] + [os.path.join(base, name) for name in dirs + files]:
+            st = os.lstat(path)
+            if stat_mod.S_ISLNK(st.st_mode):
+                content = os.readlink(path)
+            elif stat_mod.S_ISREG(st.st_mode):
+                content = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            else:
+                content = None
+            kind = stat_mod.S_IFMT(st.st_mode)
+            out[os.path.relpath(path, root)] = (kind, st.st_ino, st.st_mtime_ns, content)
+    return out
+
+
+# The three states that do not load whose handling ADR 0009 D4 audits: an
+# unknown mode, an unknown protocol label and invalid JSON.
+UNLOADABLE_STATES = ("unknown-mode", "unknown-label", "invalid-json")
+
+
+def unloadable_state(kind: str, saved: bytes) -> tuple[bytes, str]:
+    """``saved``, a state file that loads, made one of :data:`UNLOADABLE_STATES`.
+
+    Returns its bytes and the part of the loader's refusal that names why.
+    The label is one no controller will reach; the invalid JSON is the file
+    torn one byte short of its closing brace.
+    """
+    if kind == "invalid-json":
+        whole = saved.rstrip()  # a save ends the file with a newline
+        assert whole.endswith(b"}")
+        return whole[:-1], "invalid JSON"
+    data = json.loads(saved)
+    if kind == "unknown-mode":
+        data["mode"] = "SATELLITE"
+        return json.dumps(data).encode("utf-8"), "state file has unknown mode 'SATELLITE'"
+    assert kind == "unknown-label", kind
+    data["protocol_version"] = "99"
+    return json.dumps(data).encode("utf-8"), "unsupported protocol_version '99'"
+
 
 def ci_check(
     name: str = "ci",

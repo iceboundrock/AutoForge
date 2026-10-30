@@ -192,6 +192,18 @@ read it before adding tests for a listed area.
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
   test); read it after the `with` block (#223).
+- The state pins of LOCAL's removal (ADR 0009 D8, D12 S1b; #385) are
+  written against the code before it. The `local_fields` fixture runs a
+  state-file test twice: its callable gives the dict a test is about to
+  write LOCAL's twelve fields (`LOCAL_STATE_FIELDS`) at their empty
+  values, or none of them. Every refusal D8 keeps takes it.
+  `state_tree(root)` snapshots a directory (each entry's kind, inode,
+  modification time and bytes), so two equal snapshots mean nothing there
+  was written, replaced or created and removed again.
+  `unloadable_state(kind, saved)` makes a state file that loads into one of
+  `UNLOADABLE_STATES`: an unknown mode, an unknown label, invalid JSON.
+  #387 and #388 keep these tests passing unchanged, apart from the expected
+  protocol label and any row that names LOCAL.
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.
@@ -218,6 +230,10 @@ byte-exact export and its proof       test_materialize.py (the merge gate's: tes
                                       test_engine.py)
 effect operations, git transport      test_effects.py, test_git_transport.py
 state, contract, filesystem boundary  test_state.py, test_durable_run_contract.py, test_safefs.py
+the state pins of LOCAL's removal     test_state.py, test_replan.py (the refusals D8 keeps, with and
+(ADR 0009 S1b, #385)                  without LOCAL's fields), test_cli.py (a state that does not
+                                      load: every command, run --force), test_scheduler_state.py,
+                                      test_epic_commands.py (the scheduler's passes)
 scheduler namespaces (#178)           test_run_namespace.py (RunKey, layout, binding, lookup,
                                       listing, archive, engine binding); the standalone
                                       state-dir refusal: test_cli.py
