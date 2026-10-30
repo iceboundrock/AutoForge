@@ -26,11 +26,32 @@ _PATH = pytest.StashKey[Path]()
 _FAILED = pytest.StashKey[bool]()
 
 
+# The next number to try for each name, by basetemp.
+_NEXT: dict[tuple[Path, str], int] = {}
+
+
 @pytest.fixture
 def tmp_path(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """pytest's ``tmp_path``, named as pytest names it, removed by the hook below."""
+    """pytest's ``tmp_path``, named as pytest names it, removed by the hook below.
+
+    pytest's ``mktemp`` lists the whole basetemp to number a directory, and
+    leaves a ``<name>current`` link there for every name, so making one cost
+    more the more tests had run, removed or not (#341). This counts per name
+    instead and lists nothing: the first number not yet used in this session
+    whose directory can be made, so a name is never reused in a session.
+    """
     name = re.sub(r"[\W]", "_", request.node.name)[:30]
-    path = tmp_path_factory.mktemp(name, numbered=True)
+    root = tmp_path_factory.getbasetemp()
+    number = _NEXT.get((root, name), 0)
+    while True:
+        path = root / f"{name}{number}"
+        number += 1
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        break
+    _NEXT[(root, name)] = number
     request.node.stash[_PATH] = path
     return path
 

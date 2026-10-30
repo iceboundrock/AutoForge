@@ -754,6 +754,101 @@ def test_direct_child_that_survives_sigkill_is_not_waited_for(monkeypatch):
         real_wait(proc, timeout=5)
 
 
+def _spy_on_waits(monkeypatch) -> list[float | None]:
+    """The timeout of every ``Popen.wait`` call from here on, in order."""
+    import subprocess
+
+    real_wait = subprocess.Popen.wait
+    waits: list[float | None] = []
+
+    def spying_wait(self, timeout=None):
+        waits.append(timeout)
+        return real_wait(self, timeout=timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", spying_wait)
+    return waits
+
+
+needs_pidfd = pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="no pidfd_open here")
+
+
+@needs_pidfd
+def test_the_exit_wait_reaps_the_child_once_it_has_exited_without_polling(monkeypatch):
+    """With a pidfd, the wait for a child's exit ends when the child exits,
+    and ``Popen.wait`` only reaps it: one call, with no time left to poll in
+    (#341). CPython's own ``wait(timeout)`` sleeps between ``waitpid``
+    polls, up to 50 ms each."""
+    import subprocess
+
+    proc = subprocess.Popen([PY, "-c", "import time; time.sleep(0.3)"])
+    waits = _spy_on_waits(monkeypatch)
+    assert executor._wait_exit(proc, 30) == 0
+    assert proc.returncode == 0
+    assert waits == [0]
+
+
+@needs_pidfd
+def test_the_exit_wait_raises_the_timeout_proc_wait_raises(monkeypatch):
+    """A child still running when the timeout runs out is left running, and
+    the wait raises ``TimeoutExpired`` as ``Popen.wait`` does."""
+    import subprocess
+
+    proc = subprocess.Popen([PY, "-c", "import time; time.sleep(60)"])
+    try:
+        waits = _spy_on_waits(monkeypatch)
+        with pytest.raises(subprocess.TimeoutExpired):
+            executor._wait_exit(proc, 0.2)
+        assert waits == [0]
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("pidfd", ["missing", "refused"])
+def test_without_a_pidfd_the_exit_wait_is_proc_wait(monkeypatch, pidfd):
+    """Where ``pidfd_open`` is missing (another system) or refused (a kernel
+    before 5.3, a seccomp policy), the wait is ``Popen.wait(timeout)`` itself."""
+    import errno
+    import subprocess
+
+    def refused(pid, flags=0):
+        raise OSError(errno.ENOSYS, "pidfd_open")
+
+    if pidfd == "missing":
+        monkeypatch.delattr(os, "pidfd_open", raising=False)
+    else:
+        monkeypatch.setattr(os, "pidfd_open", refused, raising=False)
+    proc = subprocess.Popen([PY, "-c", "raise SystemExit(4)"])
+    waits = _spy_on_waits(monkeypatch)
+    assert executor._wait_exit(proc, 30) == 4
+    assert waits == [30]
+
+
+def test_the_exit_wait_opens_no_pidfd_for_a_reaped_child_or_without_a_timeout(monkeypatch):
+    """A child already reaped has a pid that may name another process by
+    now, so no pidfd is opened for it; nor for an unbounded wait, which
+    blocks in ``waitpid`` and never polls."""
+    import subprocess
+
+    opened: list[int] = []
+    real_open = getattr(os, "pidfd_open", None)
+
+    def recording_open(pid, flags=0):
+        opened.append(pid)
+        if real_open is None:
+            raise OSError("no pidfd_open")
+        return real_open(pid, flags)
+
+    monkeypatch.setattr(os, "pidfd_open", recording_open, raising=False)
+    reaped = subprocess.Popen([PY, "-c", "raise SystemExit(2)"])
+    reaped.wait()
+    assert executor._wait_exit(reaped, 30) == 2
+    unbounded = subprocess.Popen([PY, "-c", "raise SystemExit(3)"])
+    assert executor._wait_exit(unbounded, None) == 3
+    assert opened == []
+
+
 def test_describe_leftovers_names_each_fact_and_nothing_when_clean():
     assert (
         executor.describe_leftovers(

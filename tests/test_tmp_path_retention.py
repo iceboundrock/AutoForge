@@ -88,17 +88,19 @@ FAILED = {
 }
 
 
-def _left_behind(tmp_path: Path, *options: str) -> dict[str, str]:
+def _run(tmp_path: Path, suite: str, *options: str) -> subprocess.CompletedProcess[str]:
+    """``suite`` run by a pytest of its own in ``tmp_path``, its basetemp ``tmp_path/basetemp``."""
     (tmp_path / "pytest.ini").write_text("[pytest]\ntmp_path_retention_policy = failed\n")
     (tmp_path / "conftest.py").write_text(CONFTEST)
-    (tmp_path / "test_suite.py").write_text(SUITE)
+    (tmp_path / "test_suite.py").write_text(suite)
     basetemp = tmp_path / "basetemp"
     # None of this session's pytest settings reach the inner one: a --basetemp
     # in PYTEST_ADDOPTS would have it empty this session's basetemp.
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     env["PYTHONPATH"] = str(REPO)
-    run = subprocess.run(
+    env["RECORD"] = str(tmp_path / "record")
+    return subprocess.run(
         [
             sys.executable,
             "-m",
@@ -115,6 +117,11 @@ def _left_behind(tmp_path: Path, *options: str) -> dict[str, str]:
         text=True,
         timeout=120,
     )
+
+
+def _left_behind(tmp_path: Path, *options: str) -> dict[str, str]:
+    run = _run(tmp_path, SUITE, *options)
+    basetemp = tmp_path / "basetemp"
     assert run.returncode == 1, run.stdout + run.stderr
     assert "2 failed, 3 passed, 1 skipped, 3 errors" in run.stdout, run.stdout
     return {
@@ -134,3 +141,43 @@ def test_the_all_policy_keeps_every_tmp_path(tmp_path):
         "test_passes0": "passed",
         "test_skips0": "skipped",
     }
+
+
+NAMING_SUITE = """\
+import os
+from pathlib import Path
+
+import pytest
+
+SCANNED = []
+_scandir = os.scandir
+
+
+def _recording_scandir(path="."):
+    if not isinstance(path, int):  # shutil.rmtree lists by descriptor
+        SCANNED.append(Path(os.fspath(path)))
+    return _scandir(path)
+
+
+os.scandir = _recording_scandir
+
+
+@pytest.mark.parametrize("n", range(3))
+def test_a_name_longer_than_thirty_characters(n, tmp_path, tmp_path_factory):
+    basetemp = tmp_path_factory.getbasetemp()
+    with open(os.environ["RECORD"], "a") as fh:
+        print(tmp_path.relative_to(basetemp), SCANNED.count(basetemp), file=fh)
+"""
+
+
+def test_a_tmp_path_is_numbered_without_listing_the_basetemp_and_never_reused(tmp_path):
+    """Three tests whose names share their first 30 characters get that
+    prefix numbered 0, 1 and 2, though each passed and its directory was
+    removed before the next was made, and making them lists the basetemp
+    not once (#341): pytest's ``mktemp`` lists it for every directory, and
+    a removed directory's number was handed out again."""
+    run = _run(tmp_path, NAMING_SUITE)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert (tmp_path / "record").read_text().splitlines() == [
+        f"test_a_name_longer_than_thirty{n} 0" for n in range(3)
+    ]
