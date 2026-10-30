@@ -116,6 +116,143 @@ def test_is_error_is_checked_before_the_subtype():
     )
 
 
+SERVER_SIDE = (
+    "This is a server-side issue, usually temporary — try again in a moment. If it persists, "
+    "check your inference gateway (127.0.0.1:40147)."
+)
+
+
+def _api_error(status: object, message: str, **over) -> dict:
+    """How claude 2.1.314 ends a turn on a model API error once its own
+    retries are spent (#395; run against a loopback stand-in of the Messages
+    API): its message as the result, ``terminal_reason: api_error``, and the
+    HTTP status, ``None`` when the request got no answer."""
+    record = _result(
+        is_error=True,
+        terminal_reason="api_error",
+        stop_reason="stop_sequence",
+        num_turns=1,
+        api_error_status=status,
+        result=message,
+        permission_denials=[],
+    )
+    record.update(over)
+    return record
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (529, f"API Error: 529 overloaded_error message. {SERVER_SIDE}"),
+        (500, f"API Error: 500 api_error message. {SERVER_SIDE}"),
+        (502, f"API Error: 502 api_error message. {SERVER_SIDE}"),
+        (503, f"API Error: 503 api_error message. {SERVER_SIDE}"),
+        (504, f"API Error: 504 api_error message. {SERVER_SIDE}"),
+        (408, "API Error: 408 timeout_error message"),
+    ],
+)
+def test_a_turn_ended_by_a_server_error_or_a_request_timeout_is_transient(status, message):
+    """#395: the failure is the one it always was; the stream adds a fixed
+    reason naming the status, never the message."""
+    stream, _ = _run(_api_error(status, message))
+    assert stream.text is None
+    assert stream.failure == (
+        "claude: the run ended in an error (subtype success, terminal_reason api_error, "
+        f"api_error_status {status}): {message}"
+    )
+    assert stream.transient == f"claude: API error {status}"
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param(_api_error(400, "API Error: 400 invalid_request_error message"), id="400"),
+        pytest.param(
+            _api_error(401, "Failed to authenticate. API Error: 401 authentication_error message"),
+            id="401",
+        ),
+        pytest.param(
+            _api_error(403, "Failed to authenticate. API Error: 403 permission_error message"),
+            id="403",
+        ),
+        pytest.param(
+            _api_error(404, "There's an issue with the selected model (claude-sonnet-5-5)."),
+            id="404",
+        ),
+        pytest.param(
+            _api_error(413, "Request too large (max 32MB).", terminal_reason="image_error"),
+            id="413",
+        ),
+        pytest.param(
+            _api_error(429, "API Error: Request rejected (429) · rate_limit_error message"),
+            id="429",
+        ),
+        pytest.param(
+            _api_error(
+                None,
+                "API Error: Connection refused — a firewall or proxy may be blocking it "
+                "(ECONNREFUSED)",
+                api_error="connection_failed",
+            ),
+            id="connection-refused",
+        ),
+        pytest.param(
+            _api_error(
+                None,
+                "API Error: Connection dropped (ECONNRESET). Check the gateway set in "
+                "ANTHROPIC_BASE_URL, then try again.",
+                api_error="connection_failed",
+            ),
+            id="connection-dropped",
+        ),
+        pytest.param(_api_error(None, "Request timed out"), id="client-timeout"),
+        pytest.param(
+            _api_error(
+                529,
+                f"API Error: 529 overloaded_error message. {SERVER_SIDE}",
+                api_error_status=None,
+            ),
+            id="status-only-in-the-text",
+        ),
+        pytest.param(
+            _api_error(529, "Overloaded", terminal_reason="completed"), id="not-an-api-error-turn"
+        ),
+        pytest.param(_result(is_error=True, api_error_status=529, result="x"), id="no-reason"),
+        pytest.param(_api_error("529", "Overloaded"), id="status-a-string"),
+        pytest.param(_api_error(True, "Overloaded"), id="status-a-boolean"),
+    ],
+)
+def test_no_other_error_result_is_transient(record):
+    """#395: a 4xx other than 408, 429 included, an error without a status
+    and an error result that did not end its turn on an API error fail the
+    run and are not transient, whatever their text says."""
+    stream, _ = _run(record)
+    assert stream.failure is not None and stream.text is None
+    assert stream.transient is None
+
+
+def test_a_transient_api_error_in_a_later_turn_is_transient():
+    init = {"type": "system", "subtype": "init", "model": "claude-fable-5-1"}
+    stream, _ = _run(_result(), init, _api_error(529, "Overloaded"))
+    assert stream.summary()["results"] == 2
+    assert stream.failure is not None and stream.transient == "claude: API error 529"
+
+
+def test_a_transient_api_error_after_the_run_failed_otherwise_is_not_transient():
+    """The first failure is the run's: a later API error is not read."""
+    for first in (b"not json", _line(_result(subtype="error_max_turns"))):
+        stream, _ = _run(first, _api_error(529, "Overloaded"))
+        assert stream.failure is not None and "529" not in stream.failure
+        assert stream.transient is None
+
+
+def test_a_run_that_succeeds_or_ends_without_a_result_is_not_transient():
+    assert _run(_result())[0].transient is None
+    stream, _ = _run({"type": "system", "subtype": "api_retry", "attempt": 10, "max_retries": 10})
+    assert stream.failure == "claude: exited without a result event"
+    assert stream.transient is None
+
+
 def test_a_subtype_other_than_success_is_a_failure():
     stream, _ = _run(_result(subtype="error_max_turns", result=TEXT))
     assert stream.text is None

@@ -910,7 +910,72 @@ def test_a_fake_claude_failure_is_a_provider_failure_with_no_stdout(
     assert res.provider_failure is not None and res.provider_failure.startswith(failure)
     assert res.provider_summary["failure"] == res.provider_failure
     assert res.stdout == "" and res.exit_code == exit_code and not res.timed_out
-    assert not res.stopped_on_failure
+    assert not res.stopped_on_failure and res.transient_failure is None
+
+
+# The message claude 2.1.314 ends a turn with when a request to the model API
+# failed (#395; run against a loopback stand-in of the Messages API).
+_API_ERRORS = {
+    529: (
+        "API Error: 529 overloaded_error message. This is a server-side issue, usually "
+        "temporary — try again in a moment."
+    ),
+    503: (
+        "API Error: 503 api_error message. This is a server-side issue, usually temporary — "
+        "try again in a moment."
+    ),
+    408: "API Error: 408 timeout_error message",
+    429: "API Error: Request rejected (429) · rate_limit_error message",
+    401: "Failed to authenticate. API Error: 401 authentication_error message",
+    None: "Request timed out",
+}
+
+
+@pytest.mark.parametrize(
+    ("status", "transient"),
+    [
+        (529, "claude: API error 529"),
+        (503, "claude: API error 503"),
+        (408, "claude: API error 408"),
+        (429, None),
+        (401, None),
+        (None, None),
+    ],
+)
+def test_a_claude_turn_ended_by_a_model_api_error_is_transient_only_for_408_or_5xx(
+    tmp_path, status, transient
+):
+    """#395: a failed exit like any other, whose failure the adapter also
+    reports as transient for a server error or a request timeout (408), with
+    a fixed reason; any other 4xx and an error without a status are not."""
+    from autoforge.progress import ProgressKind
+    from tests import claude_fake
+
+    events: list = []
+    lines = claude_fake.api_failure(status, _API_ERRORS[status])
+    _, res = _claude_run(tmp_path, lines, exit_code=1, events=events)
+    assert res.exit_code == 1 and not res.timed_out and not res.stopped_on_failure
+    reported = "" if status is None else f", api_error_status {status}"
+    assert res.provider_failure == (
+        "claude: the run ended in an error (subtype success, terminal_reason api_error"
+        f"{reported}): {_API_ERRORS[status]}"
+    )
+    assert res.transient_failure == transient
+    assert res.stdout == "" and not res.ok
+    retries = [e.detail for e in events if e.kind == ProgressKind.PROVIDER_RETRY]
+    assert retries == ["attempt 1 of 1"]
+
+
+def test_a_claude_text_run_that_a_model_api_error_ended_is_not_transient(tmp_path):
+    """#395: ``text`` output is the CLI's message alone, with no record to
+    tell a server error by, so the failed exit is not classified."""
+    from tests import claude_fake
+
+    _, profile = claude_fake.fake_claude(tmp_path, [_API_ERRORS[529]], exit_code=1)
+    req = AgentRequest("FIX", "fix it", str(tmp_path), _text(profile), None, 30)
+    res = ClaudeCodeProvider().execute(req)
+    assert res.exit_code == 1 and res.stdout.startswith("API Error: 529")
+    assert res.transient_failure is None
 
 
 def _runs_on(seconds: float = 30) -> list:
@@ -934,7 +999,7 @@ def _runs_on(seconds: float = 30) -> list:
 # Failures the stream records while the CLI runs on, and the reason each is.
 _FAILED_TURNS = {
     "error_result": (
-        "claude: the run ended in an error (subtype success, terminal_reason completed, "
+        "claude: the run ended in an error (subtype success, terminal_reason api_error, "
         "api_error_status 529): API Error: Repeated 529 Overloaded errors"
     ),
     "error_subtype": "claude: the run did not succeed (subtype error_max_turns)",
@@ -942,12 +1007,16 @@ _FAILED_TURNS = {
 }
 
 
+# The one of them that is also transient (#395), stopped or not (#394).
+_TRANSIENT_TURNS = {"error_result": "claude: API error 529"}
+
+
 def _failed_turn(kind: str) -> list:
     from tests import claude_fake
 
     if kind == "error_result":
         text = "API Error: Repeated 529 Overloaded errors"
-        return [claude_fake.result(text, is_error=True, api_error_status=529)]
+        return [claude_fake.api_error(529, text)]
     if kind == "error_subtype":
         return [claude_fake.result("done", subtype="error_max_turns")]
     return ["not json"]  # inside the turn: the CLI goes on with it
@@ -995,6 +1064,7 @@ def test_a_claude_that_runs_on_after_its_run_failed_is_stopped(tmp_path, monkeyp
         failure = f"{_FAILED_TURNS[kind]}; claude was still running 0.5s later and was stopped"
         assert res.provider_failure == failure
         assert res.provider_summary["failure"] == failure
+        assert res.transient_failure == _TRANSIENT_TURNS.get(kind)
         assert res.stdout == "" and not res.ok
         started_tools = [e.detail for e in events if e.kind == ProgressKind.TOOL_STARTED]
         assert started_tools == ["a.py"]
@@ -1016,6 +1086,7 @@ def test_a_claude_that_exits_within_the_grace_after_its_run_failed_is_not_stoppe
     _, res = _claude_run(tmp_path, lines, exit_code=1)
     assert res.exit_code == 1 and not res.stopped_on_failure and not res.timed_out
     assert res.provider_failure == _FAILED_TURNS["error_result"]
+    assert res.transient_failure == _TRANSIENT_TURNS["error_result"]
 
 
 def test_a_limit_that_falls_due_within_the_grace_after_a_failure_still_wins(tmp_path, monkeypatch):
@@ -1030,6 +1101,8 @@ def test_a_limit_that_falls_due_within_the_grace_after_a_failure_still_wins(tmp_
     _, res = _claude_run(tmp_path, lines, timeout=1)
     assert res.timed_out and res.timeout_limit == "max_runtime"
     assert res.provider_failure is None and not res.stopped_on_failure
+    # A timeout is never transient, whatever failed before it (#395).
+    assert res.transient_failure is None
     assert res.provider_summary["failure"] == _FAILED_TURNS["error_result"]
 
 
@@ -1095,6 +1168,7 @@ def test_a_claude_that_closes_its_stdout_and_runs_on_after_its_run_failed_is_sto
         failure = f"{reason}; claude{closed} was still running 0.5s later and was stopped"
         assert res.provider_failure == failure
         assert res.provider_summary["failure"] == failure
+        assert res.transient_failure == _TRANSIENT_TURNS.get(kind)
         assert res.stdout == "" and not res.ok
         assert _gone(pid, within=5), "the helper outlived the stopped invocation"
     finally:
@@ -1115,6 +1189,7 @@ def test_a_claude_that_closes_its_stdout_and_exits_within_the_grace_keeps_its_st
     assert res.exit_code == 3 and not res.stopped_on_failure and not res.timed_out
     _, reason, closed = _FAILED_AT_EOF[kind]
     assert res.provider_failure == (f"{reason} (exit 3)" if closed else reason)
+    assert res.transient_failure == _TRANSIENT_TURNS.get(kind)
 
 
 @pytest.mark.parametrize(("limit", "timeout", "idle"), [("max_runtime", 1, None), ("idle", 30, 1)])
@@ -1136,6 +1211,7 @@ def test_a_limit_that_falls_due_within_the_grace_after_eof_still_wins(
     assert time.monotonic() - started < 8  # the limit, well within the 10 s grace
     assert res.timed_out and res.timeout_limit == limit and res.exit_code == -1
     assert res.provider_failure is None and not res.stopped_on_failure
+    assert res.transient_failure is None
     _, reason, closed = _FAILED_AT_EOF[kind]
     assert res.provider_summary["failure"] == (f"{reason} (exit -1)" if closed else reason)
 

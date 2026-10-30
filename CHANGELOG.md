@@ -5,6 +5,25 @@ so.
 
 ## Unreleased
 
+### A Claude run that failed on a model API outage is relaunched, as an OpenCode one is (#395)
+
+- Once Claude Code has spent its own retries of a request to the model
+  API, the turn ends in an error, and the step failed with the phase
+  unchanged until an operator ran `resume`. Under `stream-json` (the
+  default), a turn that ended this way with HTTP status 408 or any 5xx
+  (529 is overloaded) is now reported as transient, and a REMOTE run
+  relaunches it at most twice per step, after re-reading GitHub, as it has
+  relaunched OpenCode's listed OpenAI errors since #164. `error.txt` and
+  the step's error say `(transient: claude: API error 529)`, and
+  `not relaunched: ...` once the bound is spent. A relaunch is the launch
+  `resume` would make: a new agent, told what the worktree holds
+  uncommitted (#187). The relaunched CLI goes through its own retries again
+  before it gives up, so no delay is added. Not relaunched, as before: any
+  other 4xx (a 429 may be a plan's usage limit), an error with no status (a
+  refused or dropped connection, the CLI's own request timeout), any
+  failure of an `output_format: text` profile, and every failure in LOCAL
+  mode. Nothing changes a default.
+
 ### A Claude run whose stream has failed is stopped, not left to its ceiling (#394)
 
 - A failed turn (an API error once the CLI's retries are spent, a

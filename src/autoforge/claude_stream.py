@@ -70,6 +70,25 @@ The outcome:
   between turns, the operator's ``SessionEnd`` hooks after the last one)
   are counted and otherwise ignored.
 
+Model API errors (#395, run on claude 2.1.314 against a loopback stand-in of
+the Messages API, 2026-10-30): once the CLI has spent its own retries of a
+request (``system/api_retry``, ``attempt`` of ``max_retries``), the turn ends
+with an ``assistant`` record holding the CLI's error message and a ``result``
+with ``subtype: success``, ``is_error: true``, ``terminal_reason: api_error``
+and the HTTP status as ``api_error_status``, and the CLI exits 1. A failing
+``result`` with that terminal reason and a status of 408 (a request timeout)
+or 5xx (529 is overloaded; the CLI words every 5xx as a server-side issue,
+usually temporary) makes the failure transient: :attr:`ClaudeStream.transient`
+is a fixed reason naming the status. Nothing else does. Not another 4xx: 400,
+401, 403 and 404 are the request's, the credential's or the model's; a 429
+may be a plan's usage limit, which resets hours later; a 413 ends with
+``terminal_reason: image_error``. Not an error without a status: a refused or
+dropped connection (``api_error: connection_failed``, which a wrong
+``ANTHROPIC_BASE_URL`` gives too) or the CLI's own request timeout, which
+carries neither a status nor an ``api_error`` and is told apart only by its
+message text. No message text is read for this: the record's typed fields are
+the whole check.
+
 Progress: each record becomes at least one :class:`~autoforge.progress.ProgressEvent`
 (liveness for #193), and the only strings an event carries are the model
 name and one allow-listed input per tool (:data:`TOOL_DETAILS`) -- never a
@@ -150,6 +169,10 @@ MAX_REASON_CHARS = 400
 MAX_VALUE_CHARS = 120
 MAX_SUBJECT_CHARS = 160
 _MAX_COUNT = 10**15
+# The ``api_error_status`` values of a turn that ended on a model API error
+# that make the failure transient (module docstring, #395): a request
+# timeout and every server error.
+TRANSIENT_API_STATUSES = frozenset({408, *range(500, 600)})
 # A run that cost more than this is not a reading to believe.
 _MAX_COST_USD = Decimal(1_000_000)
 
@@ -176,8 +199,10 @@ class ClaudeStream:
     """One stream-json invocation as a reducer. Not thread-safe; one driver owns it.
 
     When the stream is over, :attr:`text` holds the final assistant text on
-    success and :attr:`failure` the bounded, redacted reason otherwise, and
-    :attr:`refused` the requests the CLI refused, whatever the outcome.
+    success and :attr:`failure` the bounded, redacted reason otherwise,
+    :attr:`transient` a fixed reason when that failure is a transient model
+    API error, and :attr:`refused` the requests the CLI refused, whatever
+    the outcome.
     """
 
     def __init__(
@@ -192,6 +217,10 @@ class ClaudeStream:
         self._loop = loop
         self.text: str | None = None
         self.failure: str | None = None
+        # Set with ``failure`` when the result that failed the run ended its
+        # turn on a transient model API error (module docstring): a fixed
+        # reason naming the status, never text from the stream.
+        self.transient: str | None = None
         # stdout ended inside a turn; the driver names the exit code.
         self.exited_early = False
         # Turns opened so far: the first with the stream, each later one by
@@ -361,6 +390,10 @@ class ClaudeStream:
                 f"claude: the run ended in an error ({', '.join(facts)})"
                 + (f": {excerpt}" if excerpt else "")
             )
+            # The first failure decides the outcome (:meth:`feed`), so this
+            # result's failure is the run's.
+            if record.get("terminal_reason") == "api_error" and status in TRANSIENT_API_STATUSES:
+                self.transient = f"claude: API error {status}"
         elif is_error is not False:
             self._protocol("the result event has no boolean 'is_error'")
         elif subtype != "success":

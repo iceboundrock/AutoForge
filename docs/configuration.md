@@ -489,6 +489,16 @@ claude -p --output-format stream-json --verbose --model <model> --effort <effort
   (`execution.json`: `ended_by: provider_failure`), not a timeout. A record
   larger than the per-line bound is counted and skipped unless it is the
   `result` record, which must arrive whole.
+- Under `stream-json`, a failure that is a turn ended by a model API error
+  once the CLI's own retries are spent, with HTTP status 408 or 5xx (529
+  is overloaded), is reported to the engine as transient, and a REMOTE run
+  relaunches it at most twice per step, after the phase's GitHub entry
+  checks, as it does OpenCode's. A relaunched CLI goes through its own
+  retries again before it gives up. No other failure is relaunched: not
+  another 4xx (a 429 may be a plan's usage limit), not an error without a
+  status (a refused or dropped connection, the CLI's own request timeout),
+  and not any failure of a `text` run, whose output has no record to tell
+  one by.
 - `text` is the opt-out: the CLI prints the final text once, at exit, so
   the run shows no progress and gives no sign of activity while it works
   (the pre-launch line, the heartbeat and the end line still appear). It

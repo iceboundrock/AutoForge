@@ -1033,7 +1033,10 @@ ownership or discard uncommitted user changes.
   `server_error: An error occurred while processing your request. ...`,
   even when the session recovered from it and printed a result: OpenCode
   exits 1 once it has printed one, and a result from a failed exit is not
-  read): a REMOTE run relaunches it at most twice per step, after
+  read; and a Claude Code `stream-json` run whose turn ended on a model API
+  error with status 408 or 5xx once the CLI's own retries were spent, 529
+  overloaded among them, but never another 4xx such as a 429): a REMOTE run
+  relaunches it at most twice per step, after
   re-reading GitHub, and when it stops the error says why ("not relaunched:
   ..."). Any other non-zero exit, a timeout or a verification failure is not
   retried automatically and leaves the phase unchanged for `resume`. Inspect

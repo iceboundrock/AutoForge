@@ -90,8 +90,9 @@ Safety rules:
   ambiguous recovery) never trigger blind retries. A failed launch the
   adapter recognised as a known transient failure of its provider
   (``transient_failure``; today an OpenAI socket OpenCode saw close with
-  code 1000 or 1008, or OpenAI's generic server error, #164, #226) is
-  relaunched in REMOTE mode at most
+  code 1000 or 1008, or OpenAI's generic server error, #164, #226, and a
+  Claude Code turn that ended on a model API error with status 408 or 5xx,
+  #395) is relaunched in REMOTE mode at most
   :data:`MAX_TRANSIENT_RETRIES` times per step, each relaunch after the
   phase-entry reconciliation, and never while a process the failed launch
   started may still be running. A malformed CONTROL_RESULT keeps its
