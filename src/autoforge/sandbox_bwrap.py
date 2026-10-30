@@ -201,15 +201,71 @@ def _backend_info(path: str) -> _BackendInfo:
     return info
 
 
-def _landlock_abi(syscall: Callable[..., int]) -> int:
-    """The kernel's Landlock ABI version; 0 when Landlock is absent or disabled."""
+def _errno_text(code: int) -> str:
+    """``EPERM: Operation not permitted``; "no errno" for 0.
+
+    Linux gives ``EOPNOTSUPP`` and ``ENOTSUP`` one number, and Python names
+    it ``ENOTSUP``; the Landlock calls document ``EOPNOTSUPP``.
+    """
+    if not code:
+        return "no errno"
+    name = "EOPNOTSUPP" if code == errno.EOPNOTSUPP else errno.errorcode.get(code, str(code))
+    return f"{name}: {os.strerror(code)}"
+
+
+def _landlock_abi(syscall: Callable[..., int]) -> tuple[int, int]:
+    """The kernel's Landlock ABI version and 0, or 0 and the errno of the kernel's refusal."""
     abi = syscall(
         ctypes.c_long(_SYS_LANDLOCK_CREATE_RULESET),
         ctypes.c_void_p(None),
         ctypes.c_size_t(0),
         ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION),
     )
-    return max(int(abi), 0)
+    if abi < 0:
+        return 0, ctypes.get_errno()
+    return int(abi), 0
+
+
+def _landlock_problem(abi: int, code: int) -> str:
+    """Why the kernel's answer rules the abstract-socket scope out; "" when it does not.
+
+    ``landlock_create_ruleset(2)``, asked for the version, answers with the
+    ABI or refuses, and the refusal says why: ``EOPNOTSUPP`` is a kernel
+    with Landlock built in but not enabled at boot, ``ENOSYS`` one without
+    the call (before 5.13, built without Landlock, or behind a seccomp
+    filter that hides it). Each is named as the kernel answered, so a
+    kernel recent enough is never told that it is too old (#349).
+
+    A seccomp filter can return any errno without the call reaching the
+    kernel, ``EOPNOTSUPP`` included, so that answer is not proof that
+    Landlock is disabled, and the refusal says so. Its remedy, the ``lsm=``
+    boot parameter, replaces the kernel's whole list of security modules:
+    the refusal says to keep the modules already listed, so that following
+    it does not turn them off (PR #408 R1-F1, R1-F2).
+    """
+    if abi >= _LANDLOCK_MIN_ABI:
+        return ""
+    if abi > 0:
+        return (
+            f"the kernel's Landlock ABI is {abi}; the abstract-socket scope needs ABI "
+            f"{_LANDLOCK_MIN_ABI} (Linux 6.12 or later)"
+        )
+    call = f"landlock_create_ruleset failed ({_errno_text(code)})"
+    if code == errno.EOPNOTSUPP:
+        return (
+            f"Landlock looks disabled at boot ({call}): the kernel answers so when Landlock is "
+            "built in but not enabled at boot, but a seccomp filter can return the same errno "
+            "without the call reaching the kernel; to enable Landlock, add landlock to the "
+            "kernel's lsm= boot parameter (the host's, for a container) and keep every module "
+            "of the list the kernel boots with (its lsm=, or without one its CONFIG_LSM): lsm= "
+            "replaces that whole list, so lsm=landlock alone turns the list's other modules off"
+        )
+    if code == errno.ENOSYS:
+        return (
+            f"the kernel has no Landlock call ({call}): a kernel before Linux 5.13 or built "
+            "without Landlock, or a seccomp filter that hides the call"
+        )
+    return f"the kernel did not report its Landlock ABI ({call})"
 
 
 class _ProcessScope:
@@ -242,12 +298,9 @@ class _ProcessScope:
             raise _refused(
                 f"the session keyring call is not known for this architecture ({machine})"
             )
-        abi = _landlock_abi(self._syscall)
-        if abi < _LANDLOCK_MIN_ABI:
-            raise _refused(
-                f"the kernel's Landlock ABI is {abi or 'unavailable'}; the abstract-socket scope "
-                f"needs ABI {_LANDLOCK_MIN_ABI} (Linux 6.12) with Landlock enabled"
-            )
+        problem = _landlock_problem(*_landlock_abi(self._syscall))
+        if problem:
+            raise _refused(problem)
         # Every argument is built here, so the forked child allocates as
         # little as it can: other threads of the controller may hold the
         # allocator's locks at the fork.
@@ -303,9 +356,7 @@ class _ProcessScope:
         if self._record.closed or not 0 < self._record[0] <= len(_SCOPE_STEPS):
             return ""
         call, purpose = _SCOPE_STEPS[self._record[0] - 1]
-        code = self._record[1]
-        why = f"{errno.errorcode.get(code, code)}: {os.strerror(code)}" if code else "no errno"
-        return f"could not {purpose}: {call} failed ({why})"
+        return f"could not {purpose}: {call} failed ({_errno_text(self._record[1])})"
 
     def close(self) -> None:
         """Release the shared record. Idempotent."""

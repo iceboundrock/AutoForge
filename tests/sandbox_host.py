@@ -14,6 +14,9 @@ test-sandbox-measured``, which the ``sandbox`` job of
   ``user.max_user_namespaces``) and whether an unprivileged ``bwrap`` gets
   new user, PID and IPC namespaces and a new procfs;
 - the kernel's Landlock ABI (6, Linux 6.12, for the abstract-socket scope),
+  or, when the kernel gives none, what it answered (``EOPNOTSUPP``, Landlock
+  disabled at boot, and ``ENOSYS``, no Landlock call, unless a seccomp
+  filter returned either),
 
 prints it, and appends it to ``$GITHUB_STEP_SUMMARY`` when that is set, so
 each CI run keeps what its runner measured.
@@ -32,6 +35,7 @@ and one trivial command in the new namespaces are the only processes run.
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
 import platform
 import shutil
@@ -47,6 +51,13 @@ MIN_LANDLOCK_ABI = 6
 # flag that asks for the ABI version.
 _SYS_LANDLOCK_CREATE_RULESET = 444
 _LANDLOCK_CREATE_RULESET_VERSION = 1
+# What a refusal of that call means, by errno (landlock_create_ruleset(2)).
+# A seccomp filter can return either without the call reaching the kernel,
+# so neither is recorded as certain (PR #408 R1-F2).
+_LANDLOCK_REFUSALS = {
+    errno.EOPNOTSUPP: "EOPNOTSUPP: Landlock disabled at boot, or a seccomp filter's answer",
+    errno.ENOSYS: "ENOSYS: no Landlock call, or a seccomp filter's answer",
+}
 
 # The sysctls that decide whether an unprivileged process may create a user
 # namespace, by their /proc/sys path.
@@ -75,6 +86,8 @@ class HostReport:
     # "" when the unprivileged namespace launch succeeded, else why it did not.
     namespaces: str
     landlock_abi: int
+    # "" when the kernel gave an ABI, else what it answered instead.
+    landlock_error: str = ""
 
     @property
     def missing(self) -> list[str]:
@@ -96,11 +109,15 @@ class HostReport:
                     f"bwrap ({self.namespaces})"
                 )
         if self.landlock_abi < MIN_LANDLOCK_ABI:
-            found.append(
-                f"Landlock ABI {MIN_LANDLOCK_ABI} (the kernel's is "
-                f"{self.landlock_abi or 'unavailable'})"
-            )
+            found.append(f"Landlock ABI {MIN_LANDLOCK_ABI} (the kernel's is {self.landlock})")
         return found
+
+    @property
+    def landlock(self) -> str:
+        """The kernel's Landlock ABI, or why it has none."""
+        if self.landlock_abi:
+            return str(self.landlock_abi)
+        return f"unavailable ({self.landlock_error})" if self.landlock_error else "unavailable"
 
     @property
     def capable(self) -> bool:
@@ -129,7 +146,7 @@ class HostReport:
             ("bwrap", bwrap),
             *((f"sysctl {name.replace('/', '.')}", value) for name, value in self.sysctls),
             ("unprivileged bwrap: user, PID and IPC namespaces, new procfs", namespaces),
-            ("Landlock ABI", str(self.landlock_abi or "unavailable")),
+            ("Landlock ABI", self.landlock),
         ]
 
     def markdown(self) -> str:
@@ -201,10 +218,13 @@ def _distribution() -> str:
     return "unknown distribution"
 
 
-def landlock_abi() -> int:
-    """The kernel's Landlock ABI version; 0 when Landlock is absent, disabled or not Linux."""
+def landlock_abi() -> tuple[int, str]:
+    """The kernel's Landlock ABI version and "", or 0 and what the kernel answered instead.
+
+    Not Linux, or no ``syscall`` to call, is 0 and "".
+    """
     if not sys.platform.startswith("linux"):
-        return 0
+        return 0, ""
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         abi = libc.syscall(
@@ -214,8 +234,11 @@ def landlock_abi() -> int:
             ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION),
         )
     except (OSError, AttributeError):
-        return 0
-    return max(int(abi), 0)
+        return 0, ""
+    if abi >= 0:
+        return int(abi), ""
+    code = ctypes.get_errno()
+    return 0, _LANDLOCK_REFUSALS.get(code) or errno.errorcode.get(code, f"errno {code}")
 
 
 def _namespaces(bwrap: str) -> str:
@@ -244,6 +267,7 @@ def measure() -> HostReport:
         if not isinstance(helped, str):
             overlay = "--overlay" in helped.stdout + helped.stderr
         namespaces = _namespaces(bwrap)
+    abi, refusal = landlock_abi()
     return HostReport(
         platform=sys.platform,
         kernel=platform.release(),
@@ -253,7 +277,8 @@ def measure() -> HostReport:
         bwrap_overlay=overlay,
         sysctls=tuple((name, _sysctl(name)) for name in USERNS_SYSCTLS),
         namespaces=namespaces,
-        landlock_abi=landlock_abi(),
+        landlock_abi=abi,
+        landlock_error=refusal,
     )
 
 

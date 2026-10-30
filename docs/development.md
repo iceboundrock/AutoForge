@@ -140,7 +140,9 @@ The measurement records what a host provides for the backend:
   AppArmor `kernel.apparmor_restrict_unprivileged_userns` and
   `user.max_user_namespaces`, and whether an unprivileged `bwrap` gets new
   user, PID and IPC namespaces and a new procfs;
-- the kernel's Landlock ABI.
+- the kernel's Landlock ABI or, when it gives none, its answer:
+  `EOPNOTSUPP` (Landlock disabled at boot), `ENOSYS` (no Landlock call),
+  either of which a seccomp filter can also return, or another errno.
 
 It calls the host capable when it is Linux, its `bwrap` can mount an
 overlay, the namespace launch succeeds and the Landlock ABI is at least 6.
@@ -318,7 +320,8 @@ failed four tests between them that pass serially, while both serial runs,
   load all ended at once, it did not recur on A after the fixes, and on B
   it passed in under half a second in all 18 runs.
 - **What B could not run.** 81 tests skip on B in every run, serial or not:
-  60 real-backend sandbox tests (its kernel offers no Landlock ABI 6), 16
+  60 real-backend sandbox tests (its call for the Landlock ABI fails with
+  `EOPNOTSUPP`, [#349](https://github.com/iceboundrock/AutoForge/issues/349)), 16
   that need zsh, and the 5 opt-in probes. After the fixes, the sandbox
   tests have run on workers on A under 3.12 only; under 3.11 they run
   serially, in CI's `sandbox` job wherever its runner can enforce.
