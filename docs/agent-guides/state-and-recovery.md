@@ -1276,7 +1276,9 @@ known and the retry path is bounded. Current cases include:
   `PUSHED_HEAD_WAIT_SECONDS` (60 s in all) within the same step, only while
   that head is the one mismatch; still there afterwards, it is a
   `GitHubUnavailableError` for `resume`. The re-reads change no state and
-  send nothing
+  send nothing, and what the step read before the wait (the open issues in
+  `FIX`, the default branch in `ANALYZE_EXECUTE`) is read again after it
+  (PR #404)
 - malformed CONTROL_RESULT correction attempt, none while a process the
   launch started may still be running, and in LOCAL mode none after a
   launch that moved the git anchor

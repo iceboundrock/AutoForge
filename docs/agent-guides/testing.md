@@ -1327,8 +1327,14 @@ a stated reason it has none. The coverage that must keep working:
   completes the step with nothing sent twice; one still at the old head
   once every pause is spent is transient, and `resume` completes from the
   journal without a launch; a third head during the wait is drift or a
-  block at once; a lagging head on another base blocks with no pause. No
-  test sleeps: `make_engine` records each pause in `eng.sleeps`
+  block at once; a lagging head on another base blocks with no pause. In
+  `FIX`, a lagging PR retargeted, its base rewritten or its push target
+  lost, at the first read or during the wait, goes to `REVIEW` or blocks
+  at once with no fix recorded, and a follow-up closed or unmarked during
+  a pause blocks with the fix not recorded; in `ANALYZE_EXECUTE`, a
+  default branch renamed during either wait blocks with nothing adopted or
+  bound (PR #404). No test sleeps: `make_engine` records each pause in
+  `eng.sleeps`
 
 ### Integration
 

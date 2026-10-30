@@ -747,6 +747,94 @@ def test_analyze_read_back_does_not_wait_out_a_lagging_head_on_another_base(
     assert eng.state.current_pr_url == ""
 
 
+@pytest.mark.parametrize("caught_up", [True, False], ids=["caught-up", "bound-spent"])
+def test_analyze_adoption_after_the_default_branch_changed_during_the_wait_blocks(
+    tmp_state_dir, fake_github, caught_up
+):
+    """PR #404 R1-F3: the step reads the default branch before its push, and
+    the wait for GitHub to move the PR head can outlast a rename of it. The
+    default branch is read again after the wait, and the PR is not adopted
+    onto one that is no longer the default, whether GitHub caught up with
+    the push or not: nothing is written to it. With the branch the default
+    again, 'unblock' adopts it from the journal without a launch."""
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    fake_github.pr_heads_lag = True
+
+    def renames():
+        _rename_main_to_trunk(eng, fake_github)
+        fake_github.pr_heads_lag = not caught_up
+
+    _github_catches_up(eng, 2, renames)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED", out.message
+    assert eng.sleeps == ([1.0, 2.0] if caught_up else list(PUSHED_HEAD_WAIT_SECONDS))
+    reason = eng.state.block_reason
+    assert (
+        "the default branch of owner/repo is 'trunk', but this step read 'main' before it "
+        "waited for GitHub to move the PR head"
+    ) in reason
+    assert f"so the controller does not adopt PR {PR41}. Nothing was written to the PR" in reason
+    assert fake_github.effect_writes == [] and MARKER not in fake_github.prs[PR41].body
+    assert eng.state.current_pr_url == ""
+
+    fake_github.default_branch = "main"
+    fake_github.pr_heads_lag = False
+    assert eng.unblock("main is the default branch again").unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert f"adopted PR {PR41}" in out.message and len(eng.provider.calls) == 1
+    assert fake_github.prs[PR41].body == f"Started by hand.\n\n{CLOSING}"
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
+
+
+@pytest.mark.parametrize("caught_up", [True, False], ids=["caught-up", "bound-spent"])
+def test_analyze_read_back_after_the_default_branch_changed_during_the_wait_blocks(
+    tmp_state_dir, fake_github, caught_up
+):
+    """PR #404 R1-F3 at the read-back of a created PR: a default branch
+    renamed while the controller waited for GitHub to move the PR head is
+    read before the PR is bound, and a PR onto the old one is not bound,
+    whether GitHub caught up with the push or not. With the branch the
+    default again, 'unblock' binds it from the journal, nothing sent again."""
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+
+    def stale(record):
+        fake_github.pr_heads_lag = True
+        fake_github.set_head(earlier, PR)
+
+    def renames():
+        _rename_main_to_trunk(eng, fake_github)
+        if caught_up:
+            fake_github.set_head(eng.origin.head("autoforge/2"), PR)
+
+    _after_persisting(eng, EffectKind.IMPLEMENTATION_PR, Stage.OBSERVED, stale)
+    _github_catches_up(eng, 3, renames)
+    out = _analyzed(eng)
+    assert out.next_phase == "BLOCKED", out.message
+    assert eng.sleeps == ([1.0, 2.0, 4.0] if caught_up else list(PUSHED_HEAD_WAIT_SECONDS))
+    reason = eng.state.block_reason
+    assert f"PR {PR} does not read back as the implementation the controller published" in reason
+    assert (
+        "the default branch of owner/repo is 'trunk', but this step read 'main' before it "
+        "waited for GitHub to move the PR head"
+    ) in reason
+    assert eng.state.current_pr_url == ""
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+
+    candidate = _worktree_head(eng.provider.calls[0])
+    fake_github.default_branch = "main"
+    fake_github.set_head(candidate, PR)
+    assert eng.unblock("main is the default branch again").unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng.state.current_pr_url == PR and eng.state.current_head_sha == candidate
+    assert len(eng.provider.calls) == 1
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+
+
 @pytest.mark.parametrize(
     ("setup", "reason"),
     [
@@ -4492,6 +4580,7 @@ def test_fix_read_back_still_at_the_reviewed_head_after_the_wait_is_for_resume(t
     launching the fixer or pushing again."""
     gh = FakeGitHub()
     eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    _bound_to_main(eng)  # each read's base and merge base still hold (PR #404 R1-F1)
     reviewed = eng.state.reviewed_head_sha
     gh.pr_heads_lag = True
     with pytest.raises(GitHubUnavailableError, match="has not caught up within 60s"):
@@ -4527,6 +4616,119 @@ def test_fix_read_back_head_moved_elsewhere_during_the_wait_is_drift(tmp_state_d
     s = load_state(eng.paths.state_file)
     assert s.last_review_result == "stale" and s.last_fix_resolutions == []
     assert s.current_head_sha == SHA_C and [f["id"] for f in s.prior_findings] == ["R1-F1"]
+
+
+@pytest.mark.parametrize("when", ["before", "during"])
+@pytest.mark.parametrize("change", ["retargeted", "rewritten", "push-target"])
+def test_fix_read_back_does_not_wait_out_a_lagging_pr_that_left_the_binding(
+    tmp_state_dir, change, when
+):
+    """PR #404 R1-F1: FIX waits only while the head GitHub has not moved is
+    the one mismatch. A PR still at the reviewed HEAD but retargeted, its
+    base rewritten under its name, or headed at another branch, at the first
+    read after the push or during the wait, is routed at once, never left
+    to 'resume' as GitHub catching up: a base or merge base that left the
+    findings' binding to REVIEW of the actual revision, another push target
+    to BLOCKED with the plan kept. No fix is recorded either way."""
+    gh = FakeGitHub()
+    eng = _in_fix(tmp_state_dir, gh, fixer(fixed("R1-F1")), origin=True)
+    _bound_to_main(eng)
+    reviewed = eng.state.reviewed_head_sha
+    gh.pr_heads_lag = True
+
+    def changes(*_):
+        if change == "retargeted":
+            gh.prs[PR].base_ref = "release/1.x"
+        elif change == "rewritten":
+            gh.merge_base = MERGE_BASE_B
+        else:
+            gh.prs[PR].head_ref = "another-branch"
+
+    if when == "before":
+        _after_persisting(eng, EffectKind.PUSH, Stage.OBSERVED, changes)
+    else:
+        _github_catches_up(eng, 1, changes)
+    out = eng.step()
+    assert eng.sleeps == ([] if when == "before" else [1.0])
+    candidate = _worktree_head(eng.provider.calls[0])
+    assert eng.origin.head(BRANCH) == candidate and gh.prs[PR].head_sha == reviewed
+    s = load_state(eng.paths.state_file)
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    if change == "push-target":
+        assert out.next_phase == "BLOCKED", out.message
+        assert (
+            f"PR {PR} is headed at refs/heads/another-branch, but the FIX plan was made for "
+            f"refs/heads/{BRANCH}, read back after the FIX plan was sent"
+        ) in s.block_reason
+        assert [f["id"] for f in s.open_findings] == ["R1-F1"]
+        assert [r["stage"] for r in s.effect_records] == ["observed"]
+        return
+    assert out.next_phase == "REVIEW", out.message
+    if change == "retargeted":
+        assert "base changed to 'release/1.x' from the reviewed base 'main'" in out.message
+    else:
+        assert f"PR merge base moved to {MERGE_BASE_B[:12]}" in out.message
+    assert "read back after the FIX plan was sent" in out.message
+    assert "no fix recorded" in out.message
+    assert s.last_review_result == "stale" and s.prior_findings == [_finding(1)]
+    assert s.open_findings == [] and s.effect_records == []
+
+
+@pytest.mark.parametrize("change", ["closed", "unmarked"])
+def test_fix_follow_up_changed_during_the_wait_blocks_without_recording_the_fix(
+    tmp_state_dir, change
+):
+    """PR #404 R1-F2: the open issues are read against every resolution
+    before the PR is read back, and the wait for GitHub to move the PR head
+    comes between. The follow-up the plan created, closed or unmarked by a
+    human during a pause, is read again after the wait, so the fix is not
+    recorded on a deferral GitHub contradicts: it blocks with the findings
+    open and the plan saved. Once the follow-up is back, 'unblock' completes
+    FIX from the journal with nothing sent again."""
+    gh = FakeGitHub()
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(fixed("R1-F1"), new_follow_up("R1-F2")),
+        [_finding(1, 1), _finding(1, 2)],
+        origin=True,
+    )
+    gh.pr_heads_lag = True
+    created: dict[str, str] = {}
+
+    def changes():
+        issue = gh.issues[ISSUE43]
+        created["body"] = issue.body
+        if change == "closed":
+            issue.state = "CLOSED"
+        else:
+            issue.body = "A deferred problem, its marker removed."
+        gh.pr_heads_lag = False
+
+    _github_catches_up(eng, 2, changes)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert eng.sleeps == [1.0, 2.0]
+    candidate = _worktree_head(eng.provider.calls[0])
+    s = load_state(eng.paths.state_file)
+    assert "The open issues contradict the FIX plan" in s.block_reason
+    assert "the fix is not recorded" in s.block_reason
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2"]
+    assert [r["stage"] for r in s.effect_records] == ["observed", "observed"]
+    assert eng.origin.head(BRANCH) == candidate == gh.prs[PR].head_sha
+    writes = list(gh.effect_writes)
+
+    gh.issues[ISSUE43].state = "OPEN"
+    gh.issues[ISSUE43].body = created["body"]
+    eng2 = _resumed(eng, tmp_state_dir, gh, "never")
+    assert eng2.unblock("the follow-up is open and marked again").unblocked
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.effect_writes == writes and eng2.provider.calls == [] and eng2.sleeps == []
+    s = load_state(eng2.paths.state_file)
+    assert s.last_review_result == "fixed" and s.current_head_sha == candidate
+    assert s.last_fix_resolutions[1]["follow_up_issue_url"] == ISSUE43
 
 
 def test_fix_human_push_before_the_controllers_is_refused_by_the_lease_and_reviewed(

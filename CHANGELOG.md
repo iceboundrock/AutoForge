@@ -20,8 +20,13 @@ so.
   within 60s`), and `resume` reads it again. Each read is held to the same
   rules as before: a head that turns into another commit is still a push
   the controller did not make, and another base or branch still blocks.
-  The extra reads save nothing and send nothing. Nothing changes a
-  default, and there is no new configuration key.
+  In `FIX`, a PR retargeted, its base rewritten or its branch changed is
+  routed at once even while its head still lags, not waited out. What a
+  step read before the wait is read again after it: `FIX` checks the
+  follow-up issues again before recording the fix, and `ANALYZE_EXECUTE`
+  blocks when the default branch changed during the wait. The extra reads
+  save nothing and send nothing. Nothing changes a default, and there is
+  no new configuration key.
 
 ### A Claude run that failed on a model API outage is relaunched, as an OpenCode one is (#395)
 
