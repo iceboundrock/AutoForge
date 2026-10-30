@@ -223,9 +223,9 @@ def test_a_turn_ended_by_a_server_error_or_a_request_timeout_is_transient(status
     ],
 )
 def test_no_other_error_result_is_transient(record):
-    """#395: a 4xx, 429 included, an error without a status and an error
-    result that did not end its turn on an API error fail the run and are
-    not transient, whatever their text says."""
+    """#395: a 4xx other than 408, 429 included, an error without a status
+    and an error result that did not end its turn on an API error fail the
+    run and are not transient, whatever their text says."""
     stream, _ = _run(record)
     assert stream.failure is not None and stream.text is None
     assert stream.transient is None

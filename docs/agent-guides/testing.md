@@ -369,10 +369,10 @@ High-priority coverage includes:
   run-level error beside it, a message that only starts the same way, a
   truncated stderr or a timeout is never transient); Claude Code's reads
   only the typed fields of the error `result` that failed the run (#395: a
-  turn that ended on an API error with a 408 or 5xx status is transient; a
-  4xx, 429 included, an error without a status, a later API error after an
-  earlier failure, a timeout and `text` output never are, whatever the
-  message says); the engine relaunches
+  turn that ended on an API error with a 408 or 5xx status is transient;
+  any other 4xx, 429 included, an error without a status, a later API
+  error after an earlier failure, a timeout and `text` output never are,
+  whatever the message says); the engine relaunches
   it after the phase-entry reconciliation, which may resolve or block the
   phase instead, at most `MAX_TRANSIENT_RETRIES` times per step however it
   interleaves with corrections, never in LOCAL mode or while a process the

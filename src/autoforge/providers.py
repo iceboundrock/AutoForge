@@ -79,9 +79,9 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     HTTP status as ``api_error_status``. With a status of 408 or 5xx (529 is
     overloaded) the failure is also a
     :attr:`AgentExecutionResult.transient_failure` (``claude: API error
-    <status>``); a 4xx, 429 included, an error without a status (a refused
-    or dropped connection, the CLI's own request timeout) and any other
-    failure are not (claude_stream.py says why). Whether to relaunch is the
+    <status>``); any other 4xx, 429 included, an error without a status (a
+    refused or dropped connection, the CLI's own request timeout) and any
+    other failure are not (claude_stream.py says why). Whether to relaunch is the
     engine's policy. A relaunched CLI begins with its own retries, so the
     relaunch itself waits through another retry schedule before giving up.
     ``text`` output is not classified.

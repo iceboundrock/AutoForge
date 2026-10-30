@@ -924,6 +924,7 @@ _API_ERRORS = {
         "API Error: 503 api_error message. This is a server-side issue, usually temporary — "
         "try again in a moment."
     ),
+    408: "API Error: 408 timeout_error message",
     429: "API Error: Request rejected (429) · rate_limit_error message",
     401: "Failed to authenticate. API Error: 401 authentication_error message",
     None: "Request timed out",
@@ -935,17 +936,18 @@ _API_ERRORS = {
     [
         (529, "claude: API error 529"),
         (503, "claude: API error 503"),
+        (408, "claude: API error 408"),
         (429, None),
         (401, None),
         (None, None),
     ],
 )
-def test_a_claude_turn_that_a_model_api_error_ended_is_transient_only_for_a_server_error(
+def test_a_claude_turn_ended_by_a_model_api_error_is_transient_only_for_408_or_5xx(
     tmp_path, status, transient
 ):
     """#395: a failed exit like any other, whose failure the adapter also
-    reports as transient for a server error, with a fixed reason; a 4xx and
-    an error without a status are not."""
+    reports as transient for a server error or a request timeout (408), with
+    a fixed reason; any other 4xx and an error without a status are not."""
     from autoforge.progress import ProgressKind
     from tests import claude_fake
 

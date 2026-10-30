@@ -79,9 +79,9 @@ and the HTTP status as ``api_error_status``, and the CLI exits 1. A failing
 ``result`` with that terminal reason and a status of 408 (a request timeout)
 or 5xx (529 is overloaded; the CLI words every 5xx as a server-side issue,
 usually temporary) makes the failure transient: :attr:`ClaudeStream.transient`
-is a fixed reason naming the status. Nothing else does. Not a 4xx: 400, 401,
-403 and 404 are the request's, the credential's or the model's; a 429 may be
-a plan's usage limit, which resets hours later; a 413 ends with
+is a fixed reason naming the status. Nothing else does. Not another 4xx: 400,
+401, 403 and 404 are the request's, the credential's or the model's; a 429
+may be a plan's usage limit, which resets hours later; a 413 ends with
 ``terminal_reason: image_error``. Not an error without a status: a refused or
 dropped connection (``api_error: connection_failed``, which a wrong
 ``ANTHROPIC_BASE_URL`` gives too) or the CLI's own request timeout, which

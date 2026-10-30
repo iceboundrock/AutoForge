@@ -18,8 +18,8 @@ so.
   `not relaunched: ...` once the bound is spent. A relaunch is the launch
   `resume` would make: a new agent, told what the worktree holds
   uncommitted (#187). The relaunched CLI goes through its own retries again
-  before it gives up, so no delay is added. Not relaunched, as before: a
-  4xx (a 429 may be a plan's usage limit), an error with no status (a
+  before it gives up, so no delay is added. Not relaunched, as before: any
+  other 4xx (a 429 may be a plan's usage limit), an error with no status (a
   refused or dropped connection, the CLI's own request timeout), any
   failure of an `output_format: text` profile, and every failure in LOCAL
   mode. Nothing changes a default.
