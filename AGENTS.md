@@ -208,7 +208,8 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        candidate validation evidence and review certificates,
                                        SDK providers: isolated helpers, interaction contract,
                                        parallel EPIC scheduler: authority, run identity, claims, locks;
-                                       proposed: retiring LOCAL mode, legacy LOCAL runs, sequencing)
+                                       retiring LOCAL mode (policy accepted, not implemented):
+                                       legacy LOCAL runs, the protocol, sequencing)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
