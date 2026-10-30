@@ -135,21 +135,25 @@ def test_the_example_yaml_leaves_the_prompt_version_built_in(yaml_backend):
 
 
 # Near misses of the built-in label included: the comparison is exact, so a
-# value is either the label or refused, never normalised into it.
+# value is either the label or refused, never normalised into it. Each with
+# what the refusal says it is: only a label's shape is quoted back.
 OTHER_PROMPT_VERSIONS = [
-    "v1",
-    "v0",
-    __prompt_version__.upper(),
-    f"{__prompt_version__} ",
-    "",
-    12,
-    True,
-    None,
+    ("v1", "'v1'"),
+    ("v0", "'v0'"),
+    (__prompt_version__.upper(), "a string"),
+    (f"{__prompt_version__} ", "a string"),
+    ("", "a string"),
+    (12, "an integer"),
+    (True, "a boolean"),
+    (1.5, "a number"),
+    (None, "null"),
+    ([__prompt_version__], "a list"),
+    ({"version": __prompt_version__}, "a mapping"),
 ]
 
 
-@pytest.mark.parametrize("value", OTHER_PROMPT_VERSIONS, ids=repr)
-def test_a_prompt_version_other_than_the_built_in_label_is_refused(tmp_path, value):
+@pytest.mark.parametrize(("value", "shown"), OTHER_PROMPT_VERSIONS, ids=repr)
+def test_a_prompt_version_other_than_the_built_in_label_is_refused(tmp_path, value, shown):
     """#302: the key selects no templates, so any other value would make the
     state file, the run logs, every prompt and a LOCAL run's contract name
     templates that were not rendered."""
@@ -158,9 +162,42 @@ def test_a_prompt_version_other_than_the_built_in_label_is_refused(tmp_path, val
     with pytest.raises(ConfigurationError) as exc:
         load_config_file(p)
     message = str(exc.value)
-    assert f"'prompt_version' is {value!r}" in message
+    assert f"'prompt_version' is {shown}" in message
+    if shown != repr(value):
+        assert "(not repeated here: only a value shaped like a prompt label" in message
+        assert f"'prompt_version' is {value!r}" not in message
     assert f"prompt templates are {__prompt_version__!r}" in message
     assert "Remove the key" in message
+
+
+# A passphrase no redaction pattern recognises: only an error that does not
+# quote it keeps it out of the output.
+PASSPHRASE = "correct horse battery staple"
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        (f"prompt_version:\n  password: {PASSPHRASE}\n", "a mapping"),
+        (f"prompt_version:\n  - {PASSPHRASE}\n", "a list"),
+        (f"prompt_version: {PASSPHRASE}\n", "a string"),
+    ],
+    ids=["mapping", "list", "scalar"],
+)
+def test_a_refused_prompt_version_never_repeats_what_was_written_under_it(
+    tmp_path, yaml_backend, text, kind
+):
+    """#302 R1-F1: an indentation mistake puts the next lines, a password
+    included, under `prompt_version`, and a mistyped scalar can be one too.
+    The refusal names the value's type on both YAML backends, never its
+    contents."""
+    p = tmp_path / "autoforge.yaml"
+    p.write_text(f"version: 1\n{text}", encoding="utf-8")
+    with pytest.raises(ConfigurationError) as exc:
+        load_config_file(p)
+    message = str(exc.value)
+    assert f"'prompt_version' is {kind} (not repeated here" in message
+    assert "correct horse" not in message and "password" not in message
 
 
 def test_the_copied_example_line_is_refused_on_both_yaml_backends(tmp_path, yaml_backend):

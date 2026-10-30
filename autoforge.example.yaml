@@ -25,10 +25,11 @@ version: 1
 
 state_dir: .autoforge
 
-# `prompt_version` is left unset. The prompt version a run records (in the
-# state file, the run logs and every prompt) is the controller's own label
-# for the templates it renders, and the key does not select templates: it
-# may only repeat that label, and any other value is refused at load.
+# `prompt_version` is left unset. The prompt version a new run records (in
+# the state file, the run logs and every prompt) is the controller's own
+# label for the templates it renders, and the key does not select templates:
+# it may only repeat that label, and any other value is refused at load. A
+# run keeps the label it was created with; see docs/configuration.md.
 
 execution:
   # An agent is killed once it has written nothing (stdout or stderr) for

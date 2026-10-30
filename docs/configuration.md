@@ -159,17 +159,33 @@ the file valid.
   operator, who posts each comment (the controller never does); see
   [BLOCKED on operator actions](usage.md#blocked-on-operator-actions).
 - `prompt_version` selects nothing: the controller always renders its own
-  prompt templates, and the prompt version a run records (in its state
-  file, its run logs, the header of every prompt and a LOCAL run's
-  contract) is the controller's built-in label for them. The key may only
-  repeat that label. Any other value is refused at load, naming both,
-  because the run's evidence would then name templates that were not
+  prompt templates, and the key may only repeat the controller's built-in
+  label for them. Any other value is refused at load, naming that label,
+  because a new run would then record a version whose templates were not
   rendered, and a LOCAL run's contract would not notice a template change
-  across an upgrade. Leave it unset, as the example file does (#302). A
-  config copied from the example before then carries `prompt_version: v1`:
-  delete the line. A run created under it keeps `v1` as its recorded
-  version; a LOCAL one refuses to resume once the line is gone (its
-  contract recorded `v1`), so start it again.
+  across an upgrade. The refusal quotes the configured value only when it
+  is shaped like a label (`v` and a number); anything else is named by its
+  type, since a mis-indented line can put a password under the key. Leave
+  it unset, as the example file does (#302).
+
+  The check covers the configuration a command loads, and so the version a
+  run records when it is created: in its state file, its run logs, the
+  header of every prompt and a LOCAL run's contract. A run keeps that
+  label for its whole life. A LOCAL run's contract holds it, and a
+  controller with another label refuses to resume the run, so a LOCAL
+  run's label always names the templates its prompts were rendered from. A
+  REMOTE run has no such check: resumed by an upgraded controller, it
+  renders the new templates while its state, its run logs and every prompt
+  header go on naming the label it was created with. A REMOTE run's
+  recorded prompt version therefore says which templates the run started
+  on, not which ones a later step was sent; the step's own `prompt.md` in
+  the run log is what it was sent.
+
+  A config copied from the example before #302 carries
+  `prompt_version: v1`: delete the line. A run created under it keeps `v1`
+  as its recorded version. A REMOTE one resumes and goes on saying `v1`; a
+  LOCAL one refuses to resume once the line is gone (its contract recorded
+  `v1`), so start it again.
 
 `autoforge doctor` (and `autoforge local doctor`) reports whether the file
 loads and validates. Doctor is read-only apart from creating the state
