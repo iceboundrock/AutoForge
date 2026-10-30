@@ -1274,6 +1274,26 @@ def _merge_loop_detection(loop: LoopDetectionConfig, exe: dict, source: str) -> 
             setattr(loop, key, value)
 
 
+def _prompt_version(raw: object, source: str) -> str:
+    """The configured ``prompt_version``: the built-in label, or ConfigurationError.
+
+    The key selects nothing. The controller renders its own templates
+    whatever it says, and records it as the run's prompt version in the
+    state file, the run logs, every prompt header and a LOCAL run's
+    contract. Another value would make all of those name templates that
+    were not rendered, and would hide a template change across an upgrade
+    from the LOCAL contract gate, which compares this label (#302).
+    """
+    if isinstance(raw, str) and raw == __prompt_version__:
+        return raw
+    raise ConfigurationError(
+        f"{source}: 'prompt_version' is {raw!r}, but this controller's prompt templates "
+        f"are {__prompt_version__!r}. The key does not select templates; it only labels "
+        "the ones rendered in the state file, the run logs and every prompt, so another "
+        "value records the wrong version. Remove the key: the built-in version then applies"
+    )
+
+
 def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeConfig:
     _reject_unknown_keys(data, TOP_LEVEL_KEYS, source, "the top level")
     version = data.get("version", CONFIG_VERSION)
@@ -1284,7 +1304,7 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
     if "state_dir" in data:
         base.state_dir = str(data["state_dir"])
     if "prompt_version" in data:
-        base.prompt_version = str(data["prompt_version"])
+        base.prompt_version = _prompt_version(data["prompt_version"], source)
     exe = _section(data, "execution", source, EXECUTION_KEYS, removed=REMOVED_EXECUTION_KEYS)
     # The executor treats a non-positive wall-clock timeout as "no timeout at
     # all", and an unbounded subprocess would hold the repository lock

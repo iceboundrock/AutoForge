@@ -158,6 +158,18 @@ the file valid.
   while `approve` and `auto` both offer it, and it always waits for the
   operator, who posts each comment (the controller never does); see
   [BLOCKED on operator actions](usage.md#blocked-on-operator-actions).
+- `prompt_version` selects nothing: the controller always renders its own
+  prompt templates, and the prompt version a run records (in its state
+  file, its run logs, the header of every prompt and a LOCAL run's
+  contract) is the controller's built-in label for them. The key may only
+  repeat that label. Any other value is refused at load, naming both,
+  because the run's evidence would then name templates that were not
+  rendered, and a LOCAL run's contract would not notice a template change
+  across an upgrade. Leave it unset, as the example file does (#302). A
+  config copied from the example before then carries `prompt_version: v1`:
+  delete the line. A run created under it keeps `v1` as its recorded
+  version; a LOCAL one refuses to resume once the line is gone (its
+  contract recorded `v1`), so start it again.
 
 `autoforge doctor` (and `autoforge local doctor`) reports whether the file
 loads and validates. Doctor is read-only apart from creating the state
@@ -167,7 +179,7 @@ directory if it is missing and a probe file it creates and removes there.
 
 | Section | What it controls | Where the behaviour is specified |
 |---|---|---|
-| top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` | [State and recovery](agent-guides/state-and-recovery.md) |
+| top level | `version`, `state_dir` (default `.autoforge`), `prompt_version` (leave unset: it may only repeat the controller's built-in label, see [Validation](#validation-every-key-must-be-one-the-controller-reads)) | [State and recovery](agent-guides/state-and-recovery.md) |
 | `execution` | the default agent limits (`default_idle_timeout_seconds` 900, `default_max_runtime_seconds` unset), loop detection (`loop_detection`, mode `kill`; unset, `warn` on Pi and in `UPDATE_EPIC`), the wall-clock bound on controller-run commands (`command_timeout_seconds` 1800), `max_correction_attempts` (default 1), the agent environment allow-list (`env_allowlist`, `env_allowlist_extra`; a GitHub or git credential route is refused, see [Agent environment](#agent-environment)), the per-issue agent worktree location (`worktree_dir`) | [Architecture](agent-guides/architecture.md), [Running the remote workflow](usage.md) |
 | `safety` | the merge gate (`allow_merge`, default `false`), `protected_merge_paths` (default `.github/workflows/`), `required_checks` (default `ci`), `verify_check_definition` (default `true`); who authorizes a `FIX` acceptance comment (`acceptance_actions`: `off`, `approve` (default) or `auto`) | [GitHub safety](agent-guides/github-safety.md#merge-safety), [Running the remote workflow](usage.md#blocked-on-an-acceptance-action) |
 | `merge` | how the controller merges once the gate is open: `method` (default `squash`), `delete_branch` (default `false`; after a verified merge, delete the PR's head branch on GitHub only, never a local branch, see [Deleting the merged head branch](agent-guides/github-safety.md#deleting-the-merged-head-branch)), `max_verification_attempts` (default 5), `verification_commands` (argv lists, empty by default) | [GitHub safety](agent-guides/github-safety.md#merge-safety) |
