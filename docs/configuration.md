@@ -1055,7 +1055,10 @@ worktrees and, from a REMOTE agent, your checkout.
   validation commands. Every other agent launch (`REVIEW`, `UPDATE_EPIC`)
   and a pre-merge command get only the one in their private home, so a
   reviewer never loads what an implementer left there. Your own `~/.cache`
-  is never visible.
+  is never visible. So a launch that gets the persistent cache refuses a
+  provider CLI or a provider's directory (`PI_CODING_AGENT_DIR`, say) that
+  lies under your `~/.cache`, naming the path, the rule (C6), the cache
+  directory and `~/.cache`; install it elsewhere.
 - **Toolchains.** A tool installed under your home (`~/.local/bin`, a
   version manager) or in `/opt` is not visible to an agent's tools or to a
   repository command, and `PATH` loses those entries: only the provider

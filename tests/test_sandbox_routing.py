@@ -1182,10 +1182,19 @@ def test_an_all_pi_run_is_sandboxed_in_every_child(
 ):
     """Every Pi launch and its auth preflight run inside, with Pi's own
     directory (``PI_CODING_AGENT_DIR``) its one writable login location, and
-    the run reaches DONE through the controller's merge."""
+    the run reaches DONE through the controller's merge.
+
+    The run has a home of its own (#301). A launch that produces a change
+    gets the persistent cache at ``~/.cache``, which hides whatever lies
+    there on the host, so a provider path under the operator's ``~/.cache``
+    is refused (C6, pinned in ``test_sandbox_policy.py``). This test's tree
+    lies under the operator's ``~/.cache`` whenever ``TMPDIR`` does; its own
+    home's ``.cache`` holds nothing of it.
+    """
     from .pi_fake import PiFake, make_pi_engine
     from .test_integration import _six_round_agent
 
+    monkeypatch.setenv("HOME", os.path.realpath(tmp_path_factory.mktemp("home")))
     fake = PiFake(tmp_path_factory.mktemp("pi"))
     # The fake re-executes itself with the system Python, which the sandbox
     # shows, from an install directory of its own (its home is Pi's
