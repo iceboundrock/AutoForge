@@ -2,9 +2,10 @@
 
 - **Status:** proposed. This is a design record; nothing in it is
   implemented, and it changes no behaviour. RET-A2 and RET-A3 start once
-  the maintainer signs off its decisions on #384. ADR 0001 stays accepted,
-  and nothing in any ADR is marked superseded, until the removal ships
-  (D11).
+  the maintainer signs off its decisions on #384. No sign-off has been
+  given yet; when it is, this line links it and records what it changed.
+  ADR 0001 stays accepted, and nothing in any ADR is marked superseded,
+  until the removal ships (D11).
 - **Decides:** #384 (RET-A1), for EPIC #383.
 - **Planned against:** `main` `4b03151` (2026-10-30); every line number in
   this record is at that commit. #384 was written against `01c5b7e`. Of the
@@ -24,7 +25,9 @@
   `0.1.0a0` registration prerelease).
 - **Inputs:** the repository at `4b03151` and #384's text. EPIC #383,
   #155 and #255 could not be read when this record was written; what it
-  assumes about them is stated where it is used (§5).
+  assumes about them is stated where it is used (§5). #384's review of
+  #155 and #255 is therefore not done, and that acceptance item stays open
+  until both are read (§5).
 
 ## 1. Context
 
@@ -63,7 +66,7 @@ state:
 
 By the inventory's estimate (Appendix A.1), about 4,500 of the 74,840
 lines under `src/autoforge/` go. 387 of the suite's 4,254 test functions
-touch LOCAL, and 44 of those carry coverage REMOTE needs (Appendix A.2);
+touch LOCAL, and 46 of those carry coverage REMOTE needs (Appendix A.2);
 the six modules that exist only for LOCAL are 568 of the 11,723 collected
 items and 6.4% of the measured test time (Appendix B).
 
@@ -154,19 +157,24 @@ default location keeps one probe, because an operator who upgrades and
 types `autoforge resume` must be told about the run rather than told there
 is none:
 
-- A command given `--state-dir`, or a configured non-default `state_dir`
-  (LOCAL honoured that setting too), reads that directory's `state.json` as
-  today. A file there with `mode: "LOCAL"` is a legacy LOCAL run.
-- A command given neither keeps today's two-location rule
-  (`_bind_existing_run`, `cli.py` :634–667): it looks for `state.json` at
-  the configured location and at `<git dir>/autoforge/state/`, where
-  `<git dir>` is the checkout's own git directory
-  (`<common dir>/worktrees/<name>` in a linked worktree). A file only at
-  the LOCAL location is read to confirm its `mode`.
-- Two matches stay a refusal, as today, with a message that calls the LOCAL
-  one a legacy run this controller cannot continue and names `--state-dir`
-  for the REMOTE one. Picking the REMOTE run silently would be right only
-  when the operator meant it; the refusal costs one flag.
+- A command given `--state-dir` reads that directory's `state.json` alone,
+  as today: the flag is the operator's answer to which run is meant. A
+  file there with `mode: "LOCAL"` is a legacy LOCAL run.
+- A command not given `--state-dir` keeps today's two-location rule
+  (`_bind_existing_run`, `cli.py` :634–667), whatever `state_dir` is
+  configured to: it looks for `state.json` at the configured location
+  (`.autoforge`, or a non-default `state_dir`, which LOCAL honoured too)
+  and at `<git dir>/autoforge/state/`, where `<git dir>` is the checkout's
+  own git directory (`<common dir>/worktrees/<name>` in a linked
+  worktree). A non-default `state_dir` does not end the probe today
+  (`engine.local_state_paths()` ignores it, `engine.py` :3061–3063), and
+  it does not after the removal: a LOCAL run left at the default location
+  from before the setting was changed is still found. The one match found
+  is read to confirm its `mode`.
+- Two matches stay a refusal, as today, with a message that names both
+  files, calls each whose `mode` is `"LOCAL"` a legacy run this controller
+  cannot continue, and names `--state-dir`. Picking one silently would be
+  right only when the operator meant it; the refusal costs one flag.
 
 Detection reads at most `MAX_STATE_FILE_BYTES` through the state root's
 capability (`safefs.py`), as a load does, and decides on `mode` alone,
@@ -208,14 +216,16 @@ legacy summary is its legacy form.
   stays until a later decision removes it.
 - **A top-level `local:` key is a load error** for every command that
   reads configuration, `doctor` and the `epic` commands included, naming
-  the removal and the remedy: delete the block, and move
-  `local.validation_commands` to `validation.commands` if REMOTE runs
-  should run them. Today removing `local` from the known keys would already
-  fail such a file, with "unknown key(s) under 'the top level': local"; the
-  special case (a few lines beside the section-level removed-key mechanism,
-  `config.py` :1225) exists to name the remedy. Ignoring the block with a
-  warning was rejected: the operator would believe the validation commands
-  it lists still run.
+  the removal and the remedy: keep the file as it is if a LOCAL run may
+  still need the fallback, which reads the run's configuration `local:`
+  block included (D9); delete the block from the copy the new release
+  reads, and move `local.validation_commands` to `validation.commands` if
+  REMOTE runs should run them. Today removing `local` from the known keys
+  would already fail such a file, with "unknown key(s) under 'the top
+  level': local"; the special case (a few lines beside the section-level
+  removed-key mechanism, `config.py` :1225) exists to name the remedy.
+  Ignoring the block with a warning was rejected: the operator would
+  believe the validation commands it lists still run.
 
 ### D6. No LOCAL evidence becomes REMOTE evidence
 
@@ -261,13 +271,25 @@ announced on #23 with the rule below. No number is reserved now.
 - **What N + 1 writes:** no LOCAL field. It keeps `mode`, always
   `"REMOTE"`: `status --json` consumers read it, and the detection of D3
   stays the same across labels.
-- **What an older REMOTE file loads as:** in every phase, with the LOCAL
-  fields dropped, provided each is absent or holds the empty value every
-  REMOTE save wrote (`""`, `0`, `{}`, `[]`). A file older than LOCAL
-  (2026-09-10) carries none of them; every protocol-7 and later save
-  carries all twelve. It is relabelled on its next save. A REMOTE file with
-  a non-empty LOCAL field is a hand edit or a foreign file and is refused,
-  unchanged, as today.
+- **What an older REMOTE file loads as:** what today's controller loads it
+  as, with the LOCAL fields dropped, and nothing more. The drop is not a
+  new migration path: every per-protocol rule of the loader
+  (`AutoForgeState.from_dict`, `state.py` :765–1084, up to the
+  unknown-field check) stays and runs first, its migrations and its
+  refusals alike. A protocol-1 to 3 file parked in
+  `READY_FOR_MERGE` or `MERGE` (`_legacy_review_binding_refusal`), a
+  protocol-1 to 4 file whose replan journal is in flight at a stage its
+  label could not bind (`replan_txn.legacy_journal_refusal`), a file
+  carrying state its label never wrote, a protocol-7 to 12 file missing a
+  field its label always wrote, and protocol 6 stay refused, unchanged,
+  because the binding they lack cannot be reconstructed now any more than
+  before. The LOCAL fields are dropped only from a file those rules
+  accept, and only when each is absent or holds the empty value every
+  REMOTE save wrote (`""`, `0`, `{}`, `[]`). They arrived on 2026-09-10
+  and 11, under protocol 1, so a protocol-1 file carries none, some or all
+  of them, and every protocol-2 and later save carries all twelve. It is
+  relabelled on its next save. A REMOTE file with a non-empty LOCAL field
+  is a hand edit or a foreign file and is refused, unchanged, as today.
 - **What an older LOCAL file is:** a legacy LOCAL run (D3, D4). Never
   loaded as state, relabelled or migrated.
 - **What N + 1 refuses:** a file labelled N + 1 that carries any LOCAL
@@ -293,13 +315,32 @@ a change to its document and goes into the changelog entry (D10).
 
 **`autoforge-cli==0.1.0a0` stays installable as the way to finish or
 inspect a LOCAL run**, run from an environment of its own so that it never
-replaces the operator's newer install:
+replaces the operator's newer install, from the run's checkout, with the
+configuration file the run was started with:
 
 ```bash
-uv tool run --from 'autoforge-cli==0.1.0a0' autoforge --state-dir <dir> status
-uv tool run --from 'autoforge-cli==0.1.0a0' autoforge --state-dir <dir> resume
+cd <the run's checkout>
+uv tool run --from 'autoforge-cli==0.1.0a0' autoforge --config <the run's configuration> --state-dir <dir> status
+uv tool run --from 'autoforge-cli==0.1.0a0' autoforge --config <the run's configuration> --state-dir <dir> resume
 ```
 
+- **The run's configuration is part of the fallback.** `0.1.0a0` finds no
+  configuration file by itself: without `--config` it runs on its
+  defaults. It holds every command on a LOCAL run, `status` included, to
+  the run contract, which records the repository root, the state
+  directory, the workspace policy (`local.exclude` and both cost bounds),
+  `local.validation_commands`, `local.max_fix_rounds`,
+  `workflow.max_total_steps` and the prompt version, and it holds `resume`
+  to the run's sandbox pin. A run started under any non-default value of
+  these refuses both commands without its own file. So the operator keeps
+  that file as it was, `local:` block included, apart from the copy the
+  new release reads (D5), and passes it; `--config` is left out only for a
+  run started without one. The repository root is the current directory's
+  (`0.1.0a0`'s engine takes `.`), which is why the commands run from the
+  run's checkout. `--state-dir` names the directory D4's refusal names. The
+  refusal's fallback text shows these commands with that directory filled
+  in and the configuration as a placeholder, since the new release cannot
+  know which file the run was started with.
 - **It is not yanked** while any release names it as the fallback. An
   exact `==` pin still installs a yanked release, but installers warn, and
   the fallback should not rest on that.
@@ -315,7 +356,9 @@ uv tool run --from 'autoforge-cli==0.1.0a0' autoforge --state-dir <dir> resume
   tag; the removal keeps it so, or this record is revisited), and D8 keeps
   each from loading state the other wrote under a newer protocol.
 - **Without PyPI**, the tag is the source: `git checkout v0.1.0a0`, then
-  `uv sync --locked`, in a clone of its own.
+  `uv sync --locked`, in a clone of its own, and that clone's
+  `.venv/bin/autoforge` is run in place of `uv tool run ... autoforge`
+  above, from the run's checkout and with the same arguments.
 
 ### D10. Release communication
 
@@ -366,9 +409,9 @@ confirm, since this record could not read it.
 
 | Step | Lands | Exit tests |
 |---|---|---|
-| S1. Replace first | Every REPLACE row of Appendix A: REMOTE's git reader out of `local_workspace.py` and free of `config.local`; a REMOTE or mode-neutral test for each shared mechanism tested only through LOCAL (A.2.3), the live Pi smoke test in a REMOTE form among them; the helpers other modules import from `test_local.py` moved to a shared home. LOCAL still works. | Each REPLACE row names its new test, and it passes with LOCAL still present. No REMOTE test is weakened. A test fails if `engine.workspace()` (or its successor) reads `config.local`. |
-| S2. Close the entry points | D3 to D7: the detector, the `status` summary, the refusals of `step`, `resume`, `unblock`, `run` and `run --force`, the scheduler's skip through the detector, the `local` stub, the `local:` error, the `doctor` row, `preferred` as `required`. LOCAL becomes unreachable; its code is still there. `dist_check.py` drops its LOCAL dry run and checks the stub from the installed wheel instead. The changelog entry, `docs/local-mode.md`'s legacy page, the README and the operator documents of A.3. | State files produced by `0.1.0a0`'s own code (its `local run` against a fake agent CLI), committed as produced: each LOCAL phase, a pending launch checkpoint, `DONE`, `BLOCKED`, a drifted contract. Every command of D4 exits as specified and leaves the legacy state directory byte-identical (a hash of the tree before and after). The stub and the `local:` error touch no file. A scheduler pass with a legacy LOCAL state at `config.state_dir` admits as before. |
-| S3. Delete | Every DELETE row, with its tests: the LOCAL engine paths, transitions, prompts and result models, `run_contract.py`, the rest of `local_workspace.py`, the LOCAL launch classes, the workspace record variant and the `local` certificate kind, `doctor`'s LOCAL subset. The protocol bump of D8, announced on #23. D11's ADR notes. | Protocol-12 REMOTE files captured from `main` in every phase load and relabel with the LOCAL fields dropped, and so does a pre-LOCAL file without them; a protocol-12 REMOTE file with a non-empty LOCAL field, and an N + 1 file with any LOCAL field or a `mode` other than `"REMOTE"`, are refused unchanged; `0.1.0a0` refuses an N + 1 file. The S2 tests still pass. A structural test fails on `LOCAL_LEGAL_EDGES`, a LOCAL launch class or an import of a deleted module, and on `WorkflowMode.LOCAL` outside the detector. |
+| S1. Replace first | Every REPLACE row of Appendix A: REMOTE's git reader out of `local_workspace.py` and free of `config.local`; a REMOTE or mode-neutral test for each shared mechanism tested only through LOCAL (A.2.3), the live Pi smoke test in a REMOTE form among them; the helpers other modules import from `test_local.py` moved to a shared home. LOCAL still works. | Each REPLACE row names its new test, and it passes with LOCAL still present; among them, H's two REMOTE candidate-validation tests of the credential preflight, without which S3 may not delete `test_local.py`'s. No REMOTE test is weakened. A test fails if `engine.workspace()` (or its successor) reads `config.local`. |
+| S2. Close the entry points | D3 to D7: the detector, the `status` summary, the refusals of `step`, `resume`, `unblock`, `run` and `run --force`, the scheduler's skip through the detector, the `local` stub, the `local:` error, the `doctor` row, `preferred` as `required`. LOCAL becomes unreachable; its code is still there. `dist_check.py` drops its LOCAL dry run and checks the stub from the installed wheel instead. The changelog entry, `docs/local-mode.md`'s legacy page, the README and the operator documents of A.3. | State files produced by `0.1.0a0`'s own code (its `local run` against a fake agent CLI), committed as produced: each LOCAL phase, a pending launch checkpoint, `DONE`, `BLOCKED`, a drifted contract. Every command of D4 exits as specified and leaves the legacy state directory byte-identical (a hash of the tree before and after). Without `--state-dir`, under the default `state_dir` and under a non-default one: a run only at the configured location and a run only at `<git dir>/autoforge/state` are each found and judged by their `mode`, and one at each is refused with both named and neither touched; with `--state-dir`, only that directory is read. The stub and the `local:` error touch no file. A scheduler pass with a legacy LOCAL state at `config.state_dir` admits as before. The fallback (D9): a LOCAL run that `0.1.0a0` started under a non-default contract (`local.validation_commands`, `local.max_fix_rounds`, `local.exclude`) and pin (`sandbox.mode: preferred`), with its configuration file kept beside it, is accepted by `0.1.0a0`'s `status` and `resume` given D9's arguments from its checkout, and refused, with the moved fields named, without `--config`; the new release refuses it as any legacy run. That half runs `0.1.0a0`'s own code from its tag, so it is opt-in like the live Pi test and recorded in S2's PR. |
+| S3. Delete | Every DELETE row, with its tests: the LOCAL engine paths, transitions, prompts and result models, `run_contract.py`, the rest of `local_workspace.py`, the LOCAL launch classes, the workspace record variant and the `local` certificate kind, `doctor`'s LOCAL subset. The protocol bump of D8, announced on #23. D11's ADR notes. | Protocol-12 REMOTE files captured from `main` in every phase load and relabel with the LOCAL fields dropped, and so does a pre-LOCAL file without them; a protocol-12 REMOTE file with a non-empty LOCAL field or missing a field protocol 12 always wrote, and an N + 1 file with any LOCAL field or a `mode` other than `"REMOTE"`, are refused unchanged; `0.1.0a0` refuses an N + 1 file. Every per-protocol load test of `test_state.py` keeps passing with only its LOCAL rows dropped and its expected label moved to N + 1, the refusals included (`test_protocol_1_is_migrated_only_without_a_replan_in_flight`, `test_protocol_2_is_refused_in_the_merge_phases`, `test_protocol_3_is_refused_in_the_merge_phases`, `test_protocol_3_is_refused_with_a_replan_in_flight`, `test_protocol_4_is_refused_with_a_replan_past_the_write`, and the planted- and missing-field refusals of protocols 5 to 12), and each of those refusals is run again on its file with the twelve LOCAL fields present at their empty values, so that dropping them can never let a refused file through. The S2 tests still pass. A structural test fails on `LOCAL_LEGAL_EDGES`, a LOCAL launch class or an import of a deleted module, and on `WorkflowMode.LOCAL` outside the detector. |
 | S4. Measure and close | The instruction maps (`AGENTS.md`, `src/autoforge/AGENTS.md`, `tests/AGENTS.md`, `docs/README.md`) drop LOCAL; Appendix B's commands run again, and `tests/parallel_bench.py --config serial --repeats 3` runs on `4b03151` and on the removal's last commit, back to back on one host. | The after-numbers are recorded beside Appendix B's, with the commands, interpreters, host and load. A difference is reported as measured, and called a speedup only when the repeated runs put it beyond their spread: Appendix B's two pytest runs differ by 36 s between interpreters alone. |
 
 S1 comes first because a coverage loss is invisible in a diff of
@@ -419,22 +462,37 @@ content is the warning, for a population of one pre-Alpha upload's users.
 
 ## 5. Open questions and proposed edits elsewhere
 
+#384 asks for open #155 and the launch EPIC #255 to be reviewed and for
+precise edits and dependency changes to be proposed on them. Neither
+issue could be read, so that review is not done and the item stays open.
+What follows is drawn from the repository alone: drafts to check against
+each issue's current text, and the questions that check must answer,
+before anything is proposed on either issue.
+
 - **#255 (Public Alpha).** README's maturity section lists LOCAL as
   "Supported now" and says the Public Alpha claims "these capabilities at
   exactly these levels (#255, conditions C1–C7)". If the removal ships
   first, the Public Alpha never claims LOCAL, and its security audit,
   compatibility matrix and README cover REMOTE only; if #255's Go comes
   first, the Public Alpha ships LOCAL frozen (D2) and the removal follows.
-  The recommendation is the first. Proposed edit to #255: a Go/No-Go item
+  The recommendation is the first. Draft edit to #255: a Go/No-Go item
   "LOCAL removed (EPIC #383 S2 shipped), or shipped frozen and documented
   as such", and S1 as a dependency of any #255 evidence gathered through
   LOCAL. Pi's recorded live run, the acceptance evidence of #135, is a
-  LOCAL REVIEW (`docs/development.md`, README).
+  LOCAL REVIEW (`docs/development.md`, README). To check on #255: whether
+  C1–C7 name LOCAL or README's "Supported now" tier; which of its open
+  children gather evidence through LOCAL (the live Pi run among them);
+  and whether it already orders itself against EPIC #383.
 - **#155 (provider parity).** ADR 0006 D17.2 reuses #155's parity method,
-  and `tests/test_sandbox_parity.py` has a LOCAL validation case. Proposed
+  and `tests/test_sandbox_parity.py` has a LOCAL validation case. Draft
   edit to #155: its parity cases cover the REMOTE launch classes only, and
-  no new case adds a LOCAL one (D2). Whether #155's open scope contains
-  LOCAL work could not be checked.
+  no new case adds a LOCAL one (D2). To check on #155: whether it is still
+  open; whether its open scope names a LOCAL case, a LOCAL launch class or
+  `preferred`'s fallback; and whether it blocks or is blocked by anything
+  S1 to S3 touch.
+
+Two choices of this record's own are open to the sign-off:
+
 - **The exit status of the legacy `status` (D4).** 2 makes a legacy run
   read as an error to a script; 0 would make it read as healthy. This
   record chooses 2.
@@ -547,8 +605,9 @@ mechanism depends on LOCAL:
 - **C3.** `status --json` of a REMOTE run prints those fields
   (`cli.py` :2038–2041 promises an additive shape). D8, D10.
 - **C4.** `_bind_existing_run` probes LOCAL's location on every REMOTE
-  `status`, `step`, `resume` and `unblock` and can refuse two runs. D3
-  keeps it as the legacy probe.
+  `status`, `step`, `resume` and `unblock` without `--state-dir`, whatever
+  `state_dir` is configured to, and can refuse two runs. D3 keeps it as
+  the legacy probe.
 - **C5.** `preferred` has a fallback only in LOCAL. D7.
 - **C6.** The scheduler's reverse guard skips a LOCAL state; if it failed
   to load instead, every pass would warn. D4.
@@ -566,8 +625,8 @@ those): definitions matching `^def test_`, `^    def test_` or
 
 | Class | Functions | What it means |
 |---|---|---|
-| DELETE | 277 | Tests of LOCAL-only behaviour |
-| REPLACE | 44 | Shared coverage that today runs only through LOCAL (A.2.3) |
+| DELETE | 275 | Tests of LOCAL-only behaviour |
+| REPLACE | 46 | Shared coverage that today runs only through LOCAL (A.2.3) |
 | LEGACY | 12 | Tests that now assert a LOCAL artifact loads or is left alone, to be rewritten as refusals or read-only display; the `local` stub and `local:` refusals have no test yet |
 | PRESERVE SHARED, edited | 54 | 48 drop a LOCAL row or parameter, 6 move out of a LOCAL-only module |
 | PRESERVE SHARED, untouched | 3,867 | |
@@ -576,7 +635,7 @@ those): definitions matching `^def test_`, `^    def test_` or
 
 | Module | Functions | In scope | Class |
 |---|---|---|---|
-| `test_local.py` | 116 | 116 | DELETE 108; REPLACE 6 (A.2.3 A, B); move 1 (`test_saved_state_without_a_mode_field_loads_as_remote`); LEGACY 1 (`test_unknown_mode_fails_loudly`) |
+| `test_local.py` | 116 | 116 | DELETE 106; REPLACE 8 (A.2.3 A, B, H); move 1 (`test_saved_state_without_a_mode_field_loads_as_remote`); LEGACY 1 (`test_unknown_mode_fails_loudly`) |
 | `test_local_recovery_matrix.py` | 24 | 24 | DELETE (journal cases covered in `test_runlog.py` and REMOTE `test_engine.py`) |
 | `test_local_red_team.py` | 21 | 21 | DELETE (the artifact-name case is covered in `test_runlog.py`; the state-directory replacement partly in `test_state.py`) |
 | `test_local_state_fuzz.py` | 6 | 6 | DELETE 4; REPLACE 2 (A.2.3 B) |
@@ -653,6 +712,25 @@ those): definitions matching `^def test_`, `^    def test_` or
   `test_an_all_pi_run_gets_the_same_isolation_in_every_child`). A REMOTE
   form needs a GitHub stand-in, the in-memory fake or a scratch
   repository, which is S1's design question.
+- **H. The credential preflight of a validation command** (2,
+  `test_local.py` :3850, :3873): a credential helper written into the
+  repository's configuration, and a login-shell startup file written to
+  export a credential, by the agent after its own launch was checked, stop
+  the validation command before it runs and leave the phase unverified.
+  REMOTE candidate validation runs the same preflight before each command
+  (`engine.py` :6181–6190), where a refusal is re-checked once and becomes
+  `ValidationInconclusiveError`: `BLOCKED`, no record, nothing pushed or
+  published (:6349–6354). No test plants either file before it
+  (`test_validation_evidence.py` reaches that error only through a
+  validator that cannot be launched). S1 adds a
+  REMOTE test for each, planting the file between a producer's launch and
+  its candidate validation and asserting with a probe command that the
+  command did not run. The REMOTE command runs in an export with no git
+  dir, so the helper case may instead show a command that runs where no
+  repository configuration reaches it; which of the two the code does was
+  not checked here, and the test settles it and asserts it. The REMOTE
+  pre-merge verification's startup-file test (`test_engine.py` :13627) is
+  another launch and does not count.
 
 #### A.2.4 Test contracts to rewrite
 
@@ -716,9 +794,6 @@ stays as written. `CLAUDE.md`, `SECURITY.md`, `pyproject.toml`,
   legacy LOCAL state under a linked worktree's own git dir. Not verified;
   S2 checks what an enforced REMOTE launch can see of a legacy state
   directory.
-- No test makes REMOTE candidate validation's `child_env` preflight refuse
-  (a planted credential helper or startup file); LOCAL has such tests
-  (`test_local.py`), which S3 deletes.
 
 ## Appendix B. Baseline before the removal
 
