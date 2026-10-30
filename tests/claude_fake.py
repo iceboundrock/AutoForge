@@ -17,7 +17,10 @@ its LF is the caller's) and exits, or with ``every`` writes ``then`` every
 pid is appended to ``holders`` in the fake's home. A ``close_stdout`` step
 points the fake's stdout at ``/dev/null`` and goes on with the script, the
 way a CLI that closed its stdout but has not exited does (a helper started
-after it does not hold stdout either). No real agent runs.
+after it does not hold stdout either). Given ``later`` scripts, each launch
+after the first plays the next of them, and the last one again once they
+run out, so a relaunch can end otherwise than the launch before it. No real
+agent runs.
 """
 
 from __future__ import annotations
@@ -53,10 +56,16 @@ with open(os.path.join(home, "log.json"), "w", encoding="utf-8") as f:
     )
 with open(os.path.join(home, "script.json"), encoding="utf-8") as f:
     script = json.load(f)
+launches = os.path.join(home, "launches")
+launch = os.path.getsize(launches) if os.path.exists(launches) else 0
+with open(launches, "a", encoding="utf-8") as f:
+    f.write(".")
+runs = [script, *script["later"]]
+run = runs[min(launch, len(runs) - 1)]
 sentinel = os.environ.get("CLAUDE_TEST_SENTINEL", "")
 cwd = json.dumps(os.getcwd())[1:-1]
 head = None
-for step in script["lines"]:
+for step in run["lines"]:
     if isinstance(step, dict) and "spawn_holder" in step:
         holder = subprocess.Popen(
             [sys.executable, "-c", script["holder"], str(step["spawn_holder"]),
@@ -82,8 +91,8 @@ for step in script["lines"]:
         step = step.replace("$HEAD", head)
     sys.stdout.write(step.replace("$SENTINEL", sentinel).replace("$CWD", cwd) + "\n")
     sys.stdout.flush()
-sys.stderr.write(script["stderr"])
-sys.exit(script["exit"])
+sys.stderr.write(run["stderr"])
+sys.exit(run["exit"])
 """
 
 
@@ -127,6 +136,46 @@ def result(text: str, **over: object) -> str:
     return line(record)
 
 
+def api_error(status: int | None, text: str, **over: object) -> str:
+    """The ``result`` of a turn claude 2.1.314 ended on a model API error
+    once its own retries were spent (#395; run against a loopback stand-in of
+    the Messages API): its message as the result, ``terminal_reason:
+    api_error`` and the HTTP status, ``None`` for a request with no answer.
+    The CLI then exits 1."""
+    return result(
+        text,
+        is_error=True,
+        terminal_reason="api_error",
+        stop_reason="stop_sequence",
+        num_turns=1,
+        api_error_status=status,
+        **over,
+    )
+
+
+def api_failure(status: int | None, text: str) -> list[str]:
+    """A whole run claude 2.1.314 ends on a model API error (#395): its
+    ``init``, the notice of its one retry (``CLAUDE_CODE_MAX_RETRIES=1``; 10
+    by default), the error message as the turn's text and :func:`api_error`.
+    """
+    retry = {
+        "type": "system",
+        "subtype": "api_retry",
+        "attempt": 1,
+        "max_retries": 1,
+        "retry_delay_ms": 500,
+        "error_status": status,
+    }
+    message = {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": text}]},
+        "error": "server_error",
+        "is_api_error_message": True,
+        "api_error_status": status,
+    }
+    return [init(), line(retry), line(message), api_error(status, text)]
+
+
 def fake_claude(
     tmp_path: Path,
     lines: list[str | dict],
@@ -134,13 +183,21 @@ def fake_claude(
     exit_code: int = 0,
     stderr: str = "",
     profile_name: str = "fix",
+    later: tuple[tuple[list[str | dict], int], ...] = (),
 ) -> tuple[Path, ProfileConfig]:
-    """Write the fake and its script; return its home and a stream-json profile."""
+    """Write the fake and its script; return its home and a stream-json profile.
+
+    ``later`` holds the ``(lines, exit_code)`` of each launch after the
+    first, the last one repeated once they run out.
+    """
     home = tmp_path / "fake-claude"
     home.mkdir()
     (home / "fake.py").write_text(_SCRIPT, encoding="utf-8")
+    runs = [{"lines": run, "exit": status, "stderr": ""} for run, status in later]
     (home / "script.json").write_text(
-        json.dumps({"lines": lines, "exit": exit_code, "stderr": stderr, "holder": _HOLDER}),
+        json.dumps(
+            {"lines": lines, "exit": exit_code, "stderr": stderr, "holder": _HOLDER, "later": runs}
+        ),
         encoding="utf-8",
     )
     command = home / "claude"
@@ -158,6 +215,12 @@ def fake_claude(
         options={"permission_mode": "bypassPermissions"},
     )
     return home, profile
+
+
+def launches(home: Path) -> int:
+    """How many times the fake was launched."""
+    path = home / "launches"
+    return path.stat().st_size if path.exists() else 0
 
 
 def log(home: Path) -> dict:

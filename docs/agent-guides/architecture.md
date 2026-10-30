@@ -174,15 +174,19 @@ is the engine's policy, keyed on that field alone (no provider name, no
 error text): in REMOTE mode at most `MAX_TRANSIENT_RETRIES` (2) relaunches
 per step, counted apart from the CONTROL_RESULT corrections, each after the
 checkout check and the phase-entry reconciliation, and none while a process
-the failed launch started may still be running. Today the one
-classification is OpenCode's: an exit 1 of an `openai/*` model whose
+the failed launch started may still be running. Today there are two
+classifications. OpenCode's: an exit 1 of an `openai/*` model whose
 run-level errors, read from the error lines OpenCode itself prints rather
 than from text anywhere in its trace, are all on the adapter's list, each
 compared as a whole message: `WebSocket closed with code 1000` (#164),
 `WebSocket closed with code 1008` and OpenAI's generic
 `server_error: An error occurred while processing your request. ...`
-(#226). The adapter's docstring says why each is listed and what that
-check cannot see.
+(#226). Claude Code's (#395): a `stream-json` run whose failure is a turn
+that ended on a model API error, the error `result` carrying
+`terminal_reason: api_error` and an `api_error_status` of 408 or 5xx, read
+from those typed fields and never from the message text. Each adapter's
+docstring (for Claude, `claude_stream.py`'s) says why each case is listed
+and what its check cannot see.
 
 #### SDK providers and interactions (partly implemented, ADR 0007)
 

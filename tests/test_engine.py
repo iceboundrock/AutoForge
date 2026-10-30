@@ -10095,6 +10095,131 @@ def test_unrelated_opencode_failure_is_not_retried(tmp_state_dir, fake_github):
     assert len(calls) == 1
 
 
+# -- a Claude turn that a model API error ended (#395) ----------------------------------
+# The messages claude 2.1.314 ended such a turn with (run against a loopback
+# stand-in of the Messages API).
+OVERLOADED = (
+    "API Error: 529 overloaded_error message. This is a server-side issue, usually "
+    "temporary — try again in a moment."
+)
+UNAVAILABLE = (
+    "API Error: 503 api_error message. This is a server-side issue, usually temporary — "
+    "try again in a moment."
+)
+RATE_LIMITED = "API Error: Request rejected (429) · rate_limit_error message"
+
+
+def _api_error_text(status: int, message: str) -> str:
+    return (
+        "claude: the run ended in an error (subtype success, terminal_reason api_error, "
+        f"api_error_status {status}): {message}"
+    )
+
+
+def _review_on_fake_claude(tmp_path, eng, lines, *, exit_code=0, later=()):
+    """Route the next REVIEW to the real Claude adapter over the fake
+    ``claude`` (``later``: each later launch's lines and exit); its home."""
+    from autoforge.profiles import profile_for_phase
+    from autoforge.providers import ClaudeCodeProvider
+    from tests import claude_fake
+
+    home, fake = claude_fake.fake_claude(tmp_path, lines, exit_code=exit_code, later=later)
+    profile = profile_for_phase(eng.config, Phase.REVIEW, eng.state.review_round)
+    eng.config.profiles[profile.name] = replace(
+        profile,
+        provider="claude",
+        model=fake.model,
+        effort=fake.effort,
+        command=fake.command,
+        options={**fake.options, "output_format": "stream-json"},
+        extra_args=[],
+    )
+    eng.providers._overrides["claude"] = ClaudeCodeProvider()
+    return home
+
+
+def test_a_claude_turn_a_server_error_ended_is_relaunched_after_reconciling(
+    tmp_path, tmp_state_dir, fake_github
+):
+    """#395: a reviewer whose Claude Code turn ended on a 529 and then on a
+    503, each once the CLI's own retries were spent, is relaunched as an
+    OpenCode run is (#164): each relaunch after the phase-entry
+    reconciliation, and each failed launch logged as the failed exit it was."""
+    from tests import claude_fake
+
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    reviewed = [claude_fake.init(), claude_fake.result(block(review_payload(1, SHA_A, [])))]
+    home = _review_on_fake_claude(
+        tmp_path,
+        eng,
+        claude_fake.api_failure(529, OVERLOADED),
+        exit_code=1,
+        later=((claude_fake.api_failure(503, UNAVAILABLE), 1), (reviewed, 0)),
+    )
+    original_entry = eng._remote_entry
+    reconciliations = []
+
+    def counted_entry(previous, plan):
+        reconciliations.append(previous)
+        return original_entry(previous, plan)
+
+    eng._remote_entry = counted_entry
+    out = eng.step()
+
+    assert out.next_phase == "READY_FOR_MERGE", out.message
+    assert claude_fake.launches(home) == 3
+    assert reconciliations == [Phase.REVIEW, Phase.REVIEW, Phase.REVIEW]
+    run_dir, _ = _step_dir(eng)
+    steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
+    executions = [json.loads((p / "execution.json").read_text(encoding="utf-8")) for p in steps]
+    assert [e["exit_code"] for e in executions] == [1, 1, 0]
+    assert [e["error"] for e in executions[:2]] == [
+        f"{_api_error_text(529, OVERLOADED)} (transient: claude: API error 529)",
+        f"{_api_error_text(503, UNAVAILABLE)} (transient: claude: API error 503)",
+    ]
+    progress = (steps[0] / "progress.log").read_text(encoding="utf-8")
+    assert "provider retry (attempt 1 of 1)" in progress
+    assert "(transient: claude: API error 529)" in progress
+    assert [(p / "control-result.json").exists() for p in steps] == [False, False, True]
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "launches"),
+    [(529, OVERLOADED, 1 + MAX_TRANSIENT_RETRIES), (429, RATE_LIMITED, 1)],
+    ids=["overloaded-throughout", "rate-limited"],
+)
+def test_a_claude_api_error_that_persists_or_is_not_transient_fails_the_step(
+    tmp_path, tmp_state_dir, fake_github, status, message, launches
+):
+    """#395: an outage that outlasts the step's bound fails it as an
+    OpenCode one does, naming the bound; a 429, which may be a plan's usage
+    limit, is an ordinary failed exit, never relaunched. Either way the
+    phase is unchanged for ``resume``."""
+    from tests import claude_fake
+
+    eng = _in_review(tmp_state_dir, fake_github, [])
+    home = _review_on_fake_claude(
+        tmp_path, eng, claude_fake.api_failure(status, message), exit_code=1
+    )
+
+    with pytest.raises(ExecutionError) as excinfo:
+        eng.step()
+
+    error = str(excinfo.value)
+    assert f"failed: {_api_error_text(status, message)}" in error
+    if status == 529:
+        assert (
+            "(transient: claude: API error 529; not relaunched: this step already relaunched "
+            f"it {MAX_TRANSIENT_RETRIES} time(s), the bound of {MAX_TRANSIENT_RETRIES})"
+        ) in error
+    else:
+        assert "transient" not in error
+    assert "State unchanged" in error and "resume" in error
+    assert claude_fake.launches(home) == launches
+    state = load_state(eng.paths.state_file)
+    assert state.phase == Phase.REVIEW and state.review_round == 0
+
+
 # -- a request the CLI refused (#258) --------------------------------------------------
 OC_PERMISSION = "\x1b[93m\x1b[1m! \x1b[0mpermission requested: read (.env); auto-rejecting"
 # opencode 2.1.4's cancelled question: the tool's failed line, then its error line.

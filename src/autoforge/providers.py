@@ -73,6 +73,18 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     gets back the ``PATH`` of the launch, which ``/etc/profile`` may set
     outright: the same file sets it there (:func:`claude_login_path`, #347).
   * exit code 0 on success; 1 on model/auth errors (message on stdout).
+  * a turn that ends on a model API error once the CLI's own retries are
+    spent (#395; run on 2.1.314 against a loopback stand-in of the Messages
+    API) is an error ``result`` with ``terminal_reason: api_error`` and the
+    HTTP status as ``api_error_status``. With a status of 408 or 5xx (529 is
+    overloaded) the failure is also a
+    :attr:`AgentExecutionResult.transient_failure` (``claude: API error
+    <status>``); a 4xx, 429 included, an error without a status (a refused
+    or dropped connection, the CLI's own request timeout) and any other
+    failure are not (claude_stream.py says why). Whether to relaunch is the
+    engine's policy. A relaunched CLI begins with its own retries, so the
+    relaunch itself waits through another retry schedule before giving up.
+    ``text`` output is not classified.
 
 OpenCode (``opencode 2.0.x``, #186; run against 2.0.23)::
 
@@ -1399,7 +1411,10 @@ class ClaudeCodeProvider(AgentProvider):
         Once the stream has failed the run, a CLI still running
         :data:`CLAUDE_FAILED_EXIT_GRACE_SECONDS` later is stopped (#394):
         nothing it does after that can change the outcome. ``exit_code`` is
-        always the real process status, -1 when the CLI was killed.
+        always the real process status, -1 when the CLI was killed. A
+        failure that is a turn ended by a transient model API error is also
+        a ``transient_failure`` (#395); ``text`` output carries no record to
+        tell it by.
         """
         if self.output_format(req.profile) != "stream-json":
             return super().execute(req)
@@ -1470,6 +1485,9 @@ class ClaudeCodeProvider(AgentProvider):
             orphans_unchecked=res.orphans_unchecked,
             provider_failure=None if timed_out else failure,
             stopped_on_failure=cut is _Cut.FAILED,
+            # A failure the stream recognised as a transient model API error
+            # (#395) stays one when the CLI was stopped after it (#394).
+            transient_failure=None if timed_out or failure is None else stream.transient,
             provider_summary=summary,
             timeout_limit=res.timeout_limit,
             last_activity_at=res.last_activity_at,

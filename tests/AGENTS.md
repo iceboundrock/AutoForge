@@ -107,7 +107,10 @@ read it before adding tests for a listed area.
   transcript is replaced by the `HEAD` of its cwd, such as a commit made
   before the run), and can leave
   a helper holding its stdout after it exits, silent or writing lines on an
-  interval, or close its stdout and run on (`close_stdout`); the real
+  interval, or close its stdout and run on (`close_stdout`); given `later`
+  scripts, each launch after the first plays the next one
+  (`launches(home)` counts them), and `api_failure` is a run claude 2.1.314
+  ended on a model API error (#395); the real
   `ClaudeCodeProvider` launches it, so the stream path is tested end to end
   without a real agent. `fake_claude_bash_tool` there is a fake `claude`
   whose Bash tool runs one command the way 2.1.296 does: settings `env` by

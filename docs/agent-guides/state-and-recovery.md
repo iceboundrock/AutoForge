@@ -1264,7 +1264,8 @@ known and the retry path is bounded. Current cases include:
 - a failed agent launch its adapter reported as a known transient failure
   (`transient_failure`; today an OpenCode `openai/*` run whose run-level
   errors are all `WebSocket closed with code 1000` or `1008` or OpenAI's
-  generic `server_error` message), in a REMOTE run: at
+  generic `server_error` message, and a Claude Code run whose turn ended on
+  a model API error with status 408 or 5xx), in a REMOTE run: at
   most `MAX_TRANSIENT_RETRIES` (2) relaunches per step, counted apart from
   the corrections, each after the phase-entry reconciliation, and none while
   a process the failed launch started may still be running
