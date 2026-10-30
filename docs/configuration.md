@@ -285,6 +285,11 @@ one-week backstop is the only wall-clock bound.
   OpenCode's text. A tool call that prints nothing for longer than the idle
   timeout, such as a long silent test run inside one shell command, is no
   progress and is killed; raise `idle_timeout_seconds` on that profile.
+  So is a Claude CLI that ended its turn and waits, silent, for a
+  background task the agent left running, such as a test suite: what the
+  task prints never reaches the stream. [Reading an idle
+  timeout](usage.md#reading-an-idle-timeout) tells the cases apart, and
+  says where the records leave it open.
 - **The trade-off.** The idle timeout catches a silent hang, not a busy
   one: output that keeps flowing resets it. [Loop detection](#loop-detection)
   catches an agent that keeps repeating itself and, in the default `kill`

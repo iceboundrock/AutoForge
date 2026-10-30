@@ -667,8 +667,8 @@ class DuplexChild:
         For a caller that has decided to end the invocation (an abort, an
         orderly shutdown) and gives the child a bounded chance to settle
         within the deadline it had; a child that keeps writing meanwhile
-        cannot stretch that chance. :meth:`limit_due` is fixed with it.
-        Idempotent.
+        cannot stretch that chance. :meth:`limit_due` is fixed with it, and
+        so is the result's ``last_activity_at`` (#343). Idempotent.
         """
         self._limits.pin()
 
@@ -879,7 +879,10 @@ class DuplexChild:
         )
 
     def _mark_timed_out(self) -> None:
-        """Record the timeout and the limit it was; caller holds the lock."""
+        """Record the timeout and the limit it was; caller holds the lock.
+        The limits are pinned first, so what the group writes while it is
+        killed is not its last activity (#343)."""
+        self._limits.pin()
         self._timed_out = True
         self._timeout_limit = self._limits.limit()
 
@@ -899,6 +902,7 @@ class DuplexChild:
             if self._left is not None or self._proc.poll() is not None:
                 return False
             self._stopped = True
+            self._limits.pin()
             self._kill()
             return True
 

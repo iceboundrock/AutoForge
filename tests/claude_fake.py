@@ -17,10 +17,12 @@ its LF is the caller's) and exits, or with ``every`` writes ``then`` every
 pid is appended to ``holders`` in the fake's home. A ``close_stdout`` step
 points the fake's stdout at ``/dev/null`` and goes on with the script, the
 way a CLI that closed its stdout but has not exited does (a helper started
-after it does not hold stdout either). Given ``later`` scripts, each launch
-after the first plays the next of them, and the last one again once they
-run out, so a relaunch can end otherwise than the launch before it. No real
-agent runs.
+after it does not hold stdout either). An ``on_sigterm`` step makes a
+SIGTERM print its ``lines`` and its ``stderr`` and exit 0, the way the CLI
+flushes its last records when it is killed. Given ``later`` scripts, each
+launch after the first plays the next of them, and the last one again once
+they run out, so a relaunch can end otherwise than the launch before it. No
+real agent runs.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ _HOLDER = (
 )
 
 _SCRIPT = r"""
-import json, os, subprocess, sys, time
+import json, os, signal, subprocess, sys, time
 
 home = sys.argv[1]
 with open(os.path.join(home, "log.json"), "w", encoding="utf-8") as f:
@@ -73,6 +75,16 @@ for step in run["lines"]:
         )
         with open(os.path.join(home, "holders"), "a", encoding="utf-8") as f:
             f.write(f"{holder.pid}\n")
+        continue
+    if isinstance(step, dict) and "on_sigterm" in step:
+        def stop(*_, answer=step["on_sigterm"]):
+            for text in answer.get("lines", []):
+                sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+            sys.stderr.write(answer.get("stderr", ""))
+            sys.stderr.flush()
+            os._exit(0)
+        signal.signal(signal.SIGTERM, stop)
         continue
     if isinstance(step, dict) and step.get("close_stdout"):
         sys.stdout.flush()

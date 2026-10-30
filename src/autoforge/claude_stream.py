@@ -100,7 +100,18 @@ their count; ``total_cost_usd`` is the session's so far, so the last one's
 is the invocation's. The cost is integer micro-USD, and a value that is
 absent or unreadable is left out rather than reported as zero. So is a sum
 once one ``result`` lacks its count: what the others add up to is not the
-invocation's total.
+invocation's total. The turns opened and the tool calls still waiting for
+their ``tool_result`` say where a killed run's stream stood: in the real
+runs #343 examined, the stream sent nothing while a tool ran (a foreground
+``Bash`` call, ten minutes at most) nor between turns while a background
+task or a wakeup kept the CLI alive, so an idle timeout fires in one or the
+other. They are what the stream showed, not a verdict: turns that ended
+while a background agent ran wait for their held-back results, so fewer
+results than turns can be turns already over; that agent's own calls are
+open calls like the main conversation's; a ``tool_result`` skipped past the
+per-line bound leaves its call open; and a call past :data:`MAX_OPEN_TOOLS`,
+or without an id, is never counted open. Only ``results`` equal to
+``turns`` (every turn opened has ended) reads one way.
 
 Loop detection (#194): given a :class:`~autoforge.loop_detect.LoopObserver`,
 each completed tool call is reported as an action fingerprinted from its
@@ -324,6 +335,15 @@ class ClaudeStream:
         return {
             **self._result,
             "results": self._results,
+            # Where the stream stood when it ended (#343): ``turns`` equal to
+            # ``results`` is a CLI between turns, kept alive by something the
+            # agent left pending. Fewer results with an open tool call is a
+            # CLI inside that call, or a background agent's call while the
+            # turns it outlived wait for their held results, or a call
+            # whose oversize result was skipped (module docstring). The
+            # count stops at MAX_OPEN_TOOLS.
+            "turns": self._turns,
+            "open_tool_calls": len(self._open_tools),
             "records": self._records,
             "oversize_records": self._oversize,
             "unknown_events": self._unknown,

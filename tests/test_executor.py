@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import tracemalloc
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -371,6 +372,127 @@ def test_a_pinned_deadline_ignores_later_output(monkeypatch):
     assert (limits.deadline(), limits.limit()) == (1010.0, executor.LIMIT_IDLE)
     clock.now = 1010.0
     assert limits.expired()
+
+
+def test_a_pin_keeps_the_last_activity_from_before_it(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(executor, "time", clock)
+    limits = executor._Limits(idle=10, ceiling=None)
+    clock.now = 1003.0
+    limits.touch()
+    clock.now = 1013.0
+    limits.pin()
+    clock.now = 1014.0
+    limits.touch()  # the child's answer to the kill
+    assert limits.last_activity_at() == "2023-11-14T22:30:03+00:00"
+
+
+# Prints one line and sleeps; on SIGTERM it prints one more and exits, the way
+# a CLI flushes its last records when it is killed.
+_ANSWERS_SIGTERM = (
+    "import os, signal, sys, time\n"
+    "def stop(*_):\n"
+    "    sys.stdout.write('stopping\\n'); sys.stdout.flush(); os._exit(0)\n"
+    "signal.signal(signal.SIGTERM, stop)\n"
+    "print('working', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+@pytest.mark.parametrize("ending", ["idle", "stop"])
+def test_what_a_child_writes_while_it_is_killed_is_not_its_last_activity(ending):
+    """#343: every idle kill on record named the records the CLI wrote while
+    it was killed as its last activity, a second or two before the end, so
+    "made no progress for 900s (last activity ...)" named a time 900 s after
+    the silence began. The output is still captured; it is not activity."""
+    stop = threading.Event()
+    armed = threading.Event()
+
+    def on_output(name: str) -> None:
+        # The stop comes as long after the first output as the idle limit would.
+        if ending == "stop" and not armed.is_set():
+            armed.set()
+            threading.Timer(0.8, stop.set).start()
+
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", _ANSWERS_SIGTERM],
+            timeout_seconds=30,
+            idle_timeout_seconds=0.8 if ending == "idle" else None,
+            stop=stop,
+            on_output=on_output,
+        )
+    )
+    assert (res.timed_out, res.stopped) == (ending == "idle", ending == "stop")
+    assert res.stdout == "working\nstopping\n"
+    assert res.last_activity_at is not None
+    silent = datetime.fromisoformat(res.finished_at) - datetime.fromisoformat(res.last_activity_at)
+    assert silent.total_seconds() >= 0.75
+
+
+# Eight tests of half a second each, which ``pytest -q`` reports with a dot as
+# each one ends.
+_SLOW_SUITE = (
+    "import time\n"
+    "import pytest\n"
+    "@pytest.mark.parametrize('n', range(8))\n"
+    "def test_slow(n):\n"
+    "    time.sleep(0.5)\n"
+)
+# Runs its argv with the output read in full and prints only the tail once
+# it ends, the way ``pytest | tail`` or ``make check > log`` holds it back.
+_TAILED = (
+    "import subprocess, sys\n"
+    "out = subprocess.run(sys.argv[1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
+    "sys.stdout.write(out.stdout.decode()[-200:])\n"
+)
+# The inner pytest gets none of this run's own pytest variables, and its own
+# empty configuration rather than whatever lies above ``tmp_path``.
+_PYTEST_ENV = ("PATH", "HOME", "TMPDIR", "LANG")
+
+
+def _slow_pytest(tmp_path: Path) -> list[str]:
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    suite = tmp_path / "test_slow.py"
+    suite.write_text(_SLOW_SUITE, encoding="utf-8")
+    return [PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(suite)]
+
+
+def test_pytest_progress_through_a_pipe_keeps_a_long_suite_alive(tmp_path):
+    """#343: ``pytest -q`` flushes each test's dot into a pipe as the test
+    ends (pytest 9.1.1), so a suite longer than the idle limit runs to its end
+    as long as no single test, and not its start-up, outlasts the limit."""
+    started = time.monotonic()
+    res = execute(
+        ExecutionRequest(
+            command=_slow_pytest(tmp_path),
+            cwd=str(tmp_path),
+            timeout_seconds=60,
+            idle_timeout_seconds=3,
+            env_allowlist=_PYTEST_ENV,
+        )
+    )
+    assert res.ok and not res.timed_out, (res.stdout, res.stderr)
+    assert "8 passed" in res.stdout
+    assert time.monotonic() - started >= 4  # longer than its idle limit
+
+
+def test_pytest_progress_held_back_by_a_tail_is_no_progress(tmp_path):
+    """The same suite through a tail writes nothing until it ends: the run is
+    killed at the idle limit with the suite still running, the suite with
+    it. The silence is the pipeline's, not pytest's (#343)."""
+    res = execute(
+        ExecutionRequest(
+            command=[PY, "-c", _TAILED, *_slow_pytest(tmp_path)],
+            cwd=str(tmp_path),
+            timeout_seconds=60,
+            idle_timeout_seconds=1,
+            env_allowlist=_PYTEST_ENV,
+        )
+    )
+    assert res.timed_out and res.timeout_limit == executor.LIMIT_IDLE
+    assert res.stdout == "" and res.last_activity_at is None
+    assert not (res.group_survived_kill or res.capture_abandoned)
 
 
 # A child that spawns a descendant which inherits stdout/stderr, prints the

@@ -502,6 +502,120 @@ def test_a_result_sent_at_once_and_results_held_back_mix_in_one_run():
     assert stream.summary()["results"] == 3
 
 
+@pytest.mark.parametrize(
+    ("records", "turns", "results", "open_calls"),
+    [
+        # Inside a foreground tool call: its result has not arrived.
+        ((_INIT, _assistant(_tool_use("t1", "Bash", description="Run the suite"))), 1, 0, 1),
+        # Between turns: the turn ended on a background task's start, and
+        # the CLI waits for it (#343's five Claude idle kills).
+        (
+            (
+                _INIT,
+                _assistant(_tool_use("t1", "Bash", run_in_background=True)),
+                _tool_result("t1", content="Command running in background with ID: b1"),
+                _result(result="The suite is running; I'll report when it finishes."),
+            ),
+            1,
+            1,
+            0,
+        ),
+        # A later turn, opened by the task's notice, ended too.
+        (
+            (
+                _INIT,
+                _result(result="waiting"),
+                {"type": "system", "subtype": "task_notification"},
+                _INIT,
+                _assistant(_tool_use("t2", "Read", file_path=f"{CWD}/a.py")),
+                _tool_result("t2"),
+                _result(),
+            ),
+            2,
+            2,
+            0,
+        ),
+    ],
+    ids=["inside-a-tool-call", "between-turns", "two-turns-closed"],
+)
+def test_the_summary_says_where_a_stream_stood_when_it_ended(records, turns, results, open_calls):
+    """A run killed while its stream was silent left no record of why; the
+    turns opened, the results and the tool calls still open tell a CLI
+    inside a tool call from one kept alive between turns (#343)."""
+    stream, _ = _run(*records, ended=False)
+    summary = stream.summary()
+    assert (summary["turns"], summary["results"], summary["open_tool_calls"]) == (
+        turns,
+        results,
+        open_calls,
+    )
+
+
+def _stood(stream: ClaudeStream) -> tuple[int, int, int]:
+    summary = stream.summary()
+    return summary["turns"], summary["results"], summary["open_tool_calls"]
+
+
+def test_turns_over_but_held_back_for_a_background_agent_read_as_unfinished():
+    """Turns that ended while a background agent ran wait for their results
+    (verified on claude 2.1.293): killed then, the CLI is between turns, yet
+    the summary shows three turns and no result, with no call open (#343)."""
+    stream, _ = _held_run(())
+    assert _stood(stream) == (3, 0, 0)
+
+
+def test_a_background_agents_open_call_reads_like_a_foreground_one():
+    """A background agent's own call is an open call: a parent between turns
+    while its agent runs the suite shows the same counts as a parent inside
+    a foreground call, and the summary does not tell them apart (#343)."""
+    background, _ = _run(
+        _INIT,
+        _assistant(_tool_use("a1", "Agent", description="Run the suite")),
+        {"type": "system", "subtype": "task_started", "task_id": "a"},
+        _tool_result("a1"),
+        _assistant({"type": "text", "text": "The agent is running the suite."}),
+        {
+            **_assistant(_tool_use("s1", "Bash", description="Run the suite")),
+            "parent_tool_use_id": "a1",
+        },
+        ended=False,
+    )
+    foreground, _ = _run(
+        _INIT, _assistant(_tool_use("t1", "Bash", description="Run the suite")), ended=False
+    )
+    assert _stood(background) == _stood(foreground) == (1, 0, 1)
+
+
+@pytest.mark.parametrize(
+    ("result", "stood"), [(False, (1, 0, 1)), (True, (1, 1, 1))], ids=["in-turn", "turn-over"]
+)
+def test_a_skipped_tool_result_leaves_its_call_open(result, stood):
+    """A ``tool_result`` past the per-line bound is skipped, so the call it
+    ended stays open: inside the turn it reads as a call still running, and
+    after the turn's result as an open call between turns. Only
+    ``oversize_records`` says why (#343)."""
+    stream = ClaudeStream(cwd=CWD)
+    stream.feed(_line(_INIT))
+    stream.feed(_line(_assistant(_tool_use("t1", "Read", file_path=f"{CWD}/big.json"))))
+    stream.oversize(1024)
+    if result:
+        stream.feed(_line(_result()))
+    assert _stood(stream) == stood
+    assert stream.summary()["oversize_records"] == 1
+
+
+def test_calls_past_the_bound_or_without_an_id_are_not_counted_open(monkeypatch):
+    monkeypatch.setattr(claude_stream, "MAX_OPEN_TOOLS", 2)
+    stream, _ = _run(
+        _INIT,
+        _assistant(*(_tool_use(f"t{n}", "Read", file_path=f"{CWD}/{n}.py") for n in range(3))),
+        _assistant({"type": "tool_use", "name": "Bash", "input": {}}),
+        ended=False,
+    )
+    assert stream.summary()["tool_calls"] == 4
+    assert _stood(stream) == (1, 0, 2)
+
+
 def test_stdout_ending_before_every_held_result_arrived_is_a_failure():
     """The text of an earlier turn is never the outcome: a run whose last
     turn has no result failed, however many results arrived."""
