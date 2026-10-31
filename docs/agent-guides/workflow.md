@@ -533,7 +533,7 @@ The reconciliation covers GitHub, not the agent worktree, which every launch
 of the issue reuses as the last one left it (#187). So before each launch of
 a REMOTE write phase (`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`), a
 relaunch included, the controller reads the worktree's `git status`
-(`LocalWorkspace.status_entries`, the read #189's failure text counts) and,
+(`GitWorkspace.status_entries`, the read #189's failure text counts) and,
 when it lists anything, renders the branch, `HEAD` and a bounded list of
 status codes and paths, never file content, into the prompt
 (`{{WORKTREE_STATE}}`, from `prompts/worktree_state.md`, which also holds

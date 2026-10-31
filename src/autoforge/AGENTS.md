@@ -104,7 +104,11 @@ config_fingerprint.py  the recorded configuration of a REMOTE run (profile routi
                     agent worktree root) that step/resume/unblock compare (#219)
 sandbox_pin.py      the sandbox.mode every run is pinned to; step/resume/unblock refuse
                     a weaker one unless --accept-config-change (#280)
-local_workspace.py  LOCAL mode working-tree verification
+git_workspace.py    the controller's git reader of a working tree in every mode: root,
+                    git dirs, HEAD, branch, status; hardened, no optional lock, reads
+                    no configuration (ADR 0009 C1, #386)
+local_workspace.py  LOCAL mode working-tree verification: the walk, snapshot and
+                    fingerprint over git_workspace's reads
 safefs.py           filesystem capability boundary for every controller write
 locking.py          the lock domains of ADR 0008 (#180): L0 (ControllerLock, keyed by the git
                     common dir; shared and adopted close-only), L2 (IssueRunLock and its
@@ -246,8 +250,8 @@ routing, sandbox directories, the pre-launch
 gate), doctor_sandbox.py                          -> docs/agent-guides/architecture.md
                                                      (Launch routing) + ADR 0005 and
                                                      docs/configuration.md (Outer sandbox)
-agent_worktree.py, engine.py (strict import,
-candidate read)                                   -> docs/agent-guides/github-safety.md
+agent_worktree.py, git_workspace.py, engine.py
+(strict import, candidate read, checkout anchor) -> docs/agent-guides/github-safety.md
                                                      and state-and-recovery.md + ADR 0005
                                                      D6
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
