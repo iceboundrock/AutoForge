@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 
@@ -85,6 +86,71 @@ BRANCH = "autoforge/2-feature"
 # refused.
 GOOGLE_KEY_BODY = "SyFAKE-dummy_" + "0" * 22
 GOOGLE_API_KEY = "AIza" + GOOGLE_KEY_BODY
+# Dummies of the shapes #285 adds, each at its real length and built in
+# pieces as the Google key is; each ``*_BODY`` is what must not appear where
+# its credential was redacted or refused.
+AWS_KEY_BODY = "FAKE0DUMMY000000"
+AWS_ACCESS_KEY_ID = "AKI" + "A" + AWS_KEY_BODY
+GROQ_KEY_BODY = "FAKEdummy" + "0" * 43
+GROQ_API_KEY = "gs" + "k_" + GROQ_KEY_BODY
+XAI_KEY_BODY = "FAKE_dummy" + "0" * 70
+XAI_API_KEY = "xa" + "i-" + XAI_KEY_BODY
+NPM_TOKEN_BODY = "FAKEdummy" + "0" * 27
+NPM_TOKEN = "np" + "m_" + NPM_TOKEN_BODY
+GITLAB_PAT_BODY = "FAKE-dummy_" + "0" * 9
+GITLAB_PAT = "gl" + "pat-" + GITLAB_PAT_BODY
+HF_TOKEN_BODY = "FAKEdummy" + "x" * 25
+HUGGINGFACE_TOKEN = "h" + "f_" + HF_TOKEN_BODY
+# A dummy RSA private key in PEM: two 64-character base64 lines and a short
+# last one. It decodes to no key.
+PRIVATE_KEY_BODY = "MIIEFAKEdummy0private0key0body0" + "A" * 33
+PEM_BEGIN = "-----BEGIN" + " RSA PRIVATE KEY-----"
+PEM_END = "-----END" + " RSA PRIVATE KEY-----"
+PRIVATE_KEY = f"{PEM_BEGIN}\n{PRIVATE_KEY_BODY}\n{PRIVATE_KEY_BODY}\nFAKE+/==\n{PEM_END}"
+# The same body rewrapped at eight characters a line, as ``fold -w 8`` writes
+# a key OpenSSL still reads (#285 review): no line holds 16 base64 characters
+# in a row. ``SHORT_WRAPPED_KEY_LINE`` is one of its lines, what must not
+# appear once it is redacted or refused.
+SHORT_WRAPPED_KEY_LINES = [
+    (PRIVATE_KEY_BODY * 2)[i : i + 8] for i in range(0, 2 * len(PRIVATE_KEY_BODY), 8)
+]
+SHORT_WRAPPED_KEY_LINE = SHORT_WRAPPED_KEY_LINES[1]
+SHORT_WRAPPED_KEY = "\n".join([PEM_BEGIN, *SHORT_WRAPPED_KEY_LINES, "FAKE+/==", PEM_END])
+# A value of no known shape under a prefixed name (#285).
+SUFFIX_SECRET = "FAKE0opaque0value"
+SUFFIX_ASSIGNMENT = f"DEEPSEEK_API_KEY={SUFFIX_SECRET}"
+# Every #285 dummy: the class ``credential_classes`` names it under, the
+# text, and what must not appear once it is redacted or refused.
+SHAPES_285 = [
+    ("private-key", PRIVATE_KEY, PRIVATE_KEY_BODY),
+    ("gitlab-pat", GITLAB_PAT, GITLAB_PAT_BODY),
+    ("aws-access-key-id", AWS_ACCESS_KEY_ID, AWS_KEY_BODY),
+    ("groq-api-key", GROQ_API_KEY, GROQ_KEY_BODY),
+    ("xai-api-key", XAI_API_KEY, XAI_KEY_BODY),
+    ("npm-token", NPM_TOKEN, NPM_TOKEN_BODY),
+    ("huggingface-token", HUGGINGFACE_TOKEN, HF_TOKEN_BODY),
+    ("credential-suffix-assignment", SUFFIX_ASSIGNMENT, SUFFIX_SECRET),
+]
+# Values under a lower-case prefixed name that the review of #285 (round 2)
+# found kept in the clear, each valid YAML, shell or form syntax: an unquoted
+# word of letters alone, one with punctuation, a form body ``urlencode``
+# wrote, and quoted values that span lines or hold a doubled quote. Each with
+# its id, the text and what must not appear once it is redacted or refused:
+# the part of the value a partial redaction left.
+PUNCTUATION_SECRET = "FAKE$p&ss!w#rd%^*(x)-+=[]{}|<>?/~,.:FAKEtail"
+FORM_SECRET = "FAKE form/value+with=signs&FAKEtail"
+WHOLE_VALUES_285 = [
+    ("alphabetic", "client_secret: FAKEalphaword", "FAKEalphaword"),
+    ("punctuation", f"db_password: {PUNCTUATION_SECRET}", "FAKEtail"),
+    (
+        "form-encoded",
+        urlencode({"grant_type": "client_credentials", "client_secret": FORM_SECRET}),
+        "FAKEtail",
+    ),
+    ("multi-line-shell", 'export DB_PASSWORD="FAKEfirst\nFAKEsecond"', "FAKEsecond"),
+    ("multi-line-yaml", 'client_secret: "FAKEfirst\n  FAKEsecond"', "FAKEsecond"),
+    ("yaml-doubled-quote", "db_password: 'FAKE''FAKEafter'", "FAKEafter"),
+]
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)
 # and the base branch's `push` run at its tip (the reference definition).

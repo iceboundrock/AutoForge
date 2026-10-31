@@ -5,6 +5,55 @@ so.
 
 ## Unreleased
 
+### More credential shapes are redacted and refused (#285)
+
+- AWS access key ids (`AKIA...`, `ASIA...`), private-key blocks, GitLab
+  (`glpat-`), Groq (`gsk_`), xAI (`xai-`), npm (`npm_`) and Hugging Face
+  (`hf_`) tokens are recognised by their shape, and a value assigned to a
+  name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a
+  prefix by its name: any value under an upper-case name (`GEMINI_API_KEY`,
+  `DEEPSEEK_API_KEY`, `DB_PASSWORD`), and under a lower- or mixed-case one
+  (`client_secret`, `db_password`) a quoted value or an unquoted word of any
+  characters that does not read as code: letters alone, punctuation, a
+  form body's `%` escapes. Each is redacted in
+  every run log (`stdout.log` and `stderr.log` included), in state and in
+  the CLI's output, and published agent text or a commit message carrying
+  one is refused under its class (`aws-access-key-id`, `private-key`,
+  `gitlab-pat`, `groq-api-key`, `xai-api-key`, `npm-token`,
+  `huggingface-token`, `credential-suffix-assignment`). Before, an agent
+  that printed one saved it in the clear, and agent text carrying one could
+  be published under your identity
+  ([Secrets and logging](docs/agent-guides/secrets-and-logging.md#the-remaining-credential-shapes-285)).
+- A private-key block is replaced whole, its BEGIN and END lines with it,
+  also when its body is wrapped in lines shorter than 16 characters (a key
+  rewrapped with `fold -w 8` is still a valid key). One whose END line is
+  missing (a capture cut inside the key) loses its BEGIN line and the body
+  after it, and may take a line of words that follows the body. A BEGIN
+  line with no key material after it, a public key and a certificate are
+  left, so text about the format stays publishable.
+- A quoted value under a credential name, well-known or prefixed, is
+  redacted whole, up to its closing quote (`DB_PASSWORD="two words; more"`),
+  where it stopped at the first space or semicolon before and left the
+  rest in the clear. The quote may be escaped, as JSON writes it, doubled
+  inside the value (`'it''s'`, as YAML writes one), and the value may span
+  lines, as a shell or YAML string does; a quote in code or prose that opens
+  no value does not take the lines after it. An unquoted value ends at a
+  line break written out (`\n` in JSON text), so a `NAME: value` line after
+  it is redacted in turn.
+- A value under such a name as a mapping's key (`{"GEMINI_API_KEY": ...}`,
+  `{"client_secret": ...}`, `{"GITHUB_TOKEN": ...}`) is redacted in the
+  structures the run log, state and the CLI print, at any depth, where only
+  the OAuth field names were recognised as keys before.
+- **Behaviour change:** agent text that assigns a value to such a name
+  (`MY_SERVICE_TOKEN=...`, `client_secret = "..."`, `client_secret: ...`)
+  is now refused where it was published before. Under a lower-case name a
+  word that reads as code is not, so quoted code that passes a credential
+  on (`api_token=api_token`, `client_secret=self.client_secret`,
+  `def f(api_token: str)`, `x_token = sha256(data)`, `page_token=None`) is
+  still accepted; a variable named otherwise (`client_secret=cs`) reads as a
+  password and is refused. A value of a known shape under such a name is
+  reported by the shape's class, as before.
+
 ### A sequential run's next issue must be a sub-issue of the EPIC (#287)
 
 **Behaviour change:** `UPDATE_EPIC` switches only to a native sub-issue of

@@ -1595,9 +1595,11 @@ on GitHub is counted once without one, as before.
 
 Every agent invocation is logged under `<state dir>/logs/<run-id>/`. Logs
 and CLI output pass through baseline secret redaction (`GITHUB_TOKEN`,
-`GH_TOKEN`, `*_API_KEY`, `Authorization: Bearer` / `Basic`, `ghp_*`,
-`github_pat_*`, `sk-*`, Google API keys `AIza...`, JWTs, the
-`user:password@` part of a URL, …),
+`GH_TOKEN`, a `*_API_KEY`, `*_TOKEN`, `*_SECRET` or `*_PASSWORD` name,
+`Authorization: Bearer` / `Basic`, `ghp_*`, `github_pat_*`,
+`sk-*`, Google API keys `AIza...`, AWS access key ids, `glpat-*`, `gsk_*`,
+`xai-*`, `npm_*`, `hf_*`, private-key blocks, JWTs, the `user:password@`
+part of a URL, …),
 state-derived output included: `status` and `status --json` redact what they
 print (a `block_reason` echoes agent text; a journal can be hand-edited)
 without rewriting `state.json`. No environment dump is ever written.
