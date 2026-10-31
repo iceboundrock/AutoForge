@@ -323,6 +323,52 @@ def test_doctor_fails_a_claude_whose_help_fails(tmp_path):
     assert not row.ok and "exited 1" in row.detail and "boom" not in row.detail
 
 
+def _claude_help_runner(help_text: str):
+    """The healthy fake, with ``claude --help`` printing exactly ``help_text``."""
+    healthy = _runner_factory()
+
+    def runner(req):
+        if req.command == ["claude", "--help"]:
+            return ExecutionResult(req.command, req.cwd, 0, help_text, "", "t", "t")
+        return healthy(req)
+
+    return runner
+
+
+# What Claude Code 2.1.314 printed to a pipe: the first 8,192 bytes of its help,
+# ending mid-line, before any of the three flags (#259).
+CUT_HELP = ("Usage: claude [options] [command] [prompt]\n" + "  --add-dir <dirs>  x\n" * 400)[:8192]
+
+
+def test_doctor_skips_a_claude_help_cut_short_rather_than_failing_it(tmp_path):
+    """#259: Claude Code 2.1.314 writes 8 or 16 KiB of its 22 KiB help to a pipe and
+    exits mid-line. The flags past the cut are unknown, not missing: a SKIP that says
+    so and how to check, never "update Claude Code" and never an OK."""
+    assert not CUT_HELP.endswith("\n")
+    d = Doctor(cwd=str(tmp_path), runner=_claude_help_runner(CUT_HELP))
+    row = {r.name: r for r in d.run_all()}[CLAUDE_ISOLATION_ROW]
+    assert row.label == "SKIP" and not row.ok and not row.required
+    assert row.detail.startswith("`claude --help` stopped mid-line after 8192 bytes, before it ")
+    assert "--safe-mode, --strict-mcp-config, --setting-sources" in row.detail
+    assert "error: unknown option" in row.detail and "claude-help.txt" in row.detail
+    assert "update Claude Code" not in row.detail and "--add-dir" not in row.detail
+
+
+def test_a_cut_help_that_lists_every_flag_still_passes(tmp_path):
+    """The cut matters only for what it hides: every flag before it is a pass."""
+    d = Doctor(cwd=str(tmp_path), runner=_claude_help_runner(CLAUDE_HELP + "  --verbose  Ove"))
+    row = {r.name: r for r in d.run_all()}[CLAUDE_ISOLATION_ROW]
+    assert row.ok and row.label == "OK  "
+
+
+def test_a_whole_help_without_the_flags_still_fails(tmp_path):
+    """A help that ends at a line break was printed whole: missing flags are missing."""
+    help_text = "Usage: claude [options]\n  --add-dir <dirs>  x\n"
+    d = Doctor(cwd=str(tmp_path), runner=_claude_help_runner(help_text))
+    row = {r.name: r for r in d.run_all()}[CLAUDE_ISOLATION_ROW]
+    assert row.label == "FAIL" and row.required and "update Claude Code" in row.detail
+
+
 def test_doctor_reports_the_limits_of_every_reachable_profile(tmp_path):
     """#193: informational, both values for each profile a run can launch."""
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory())
@@ -752,12 +798,17 @@ def test_required_check_present_and_enforced(tmp_path):
     assert not any(flag in graphql[0] for flag in ("-X", "--method", "-F", "--input"))
 
 
-def test_required_check_not_required_fails_with_remedy(tmp_path):
-    """No ruleset and no classic protection: FAIL, with the settings URL and rule named."""
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_required_check_not_required_fails_with_remedy(tmp_path, gate_open):
+    """No ruleset and no classic protection: the settings URL and rule named, a FAIL
+    with the merge gate open and a WARN with it closed (#259)."""
     check = _required_checks(
-        tmp_path, github={RULES_ENDPOINT: [{"type": "deletion", "ruleset_id": 1}]}
+        tmp_path,
+        gate_open=gate_open,
+        github={RULES_ENDPOINT: [{"type": "deletion", "ruleset_id": 1}]},
     )
-    assert not check.ok and check.required and not check.skipped
+    assert not check.ok and check.required is gate_open and not check.skipped
+    assert check.label == ("FAIL" if gate_open else "WARN")
     assert check.detail.startswith("no rule requires a status check on 'main'")
     assert "https://github.com/owner/repo/settings/rules" in check.detail
     assert "naming ci" in check.detail and "no bypass actors" in check.detail
@@ -788,16 +839,21 @@ def test_required_check_enforcement_disabled_fails_and_names_the_ruleset(tmp_pat
     assert "ruleset 'main' (#22792049) exists but its enforcement is 'disabled'" in check.detail
 
 
-def test_required_check_missing_rule_stays_a_failure_when_the_listing_is_denied(tmp_path):
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_required_check_missing_rule_stays_a_failure_when_the_listing_is_denied(
+    tmp_path, gate_open
+):
     """The ruleset listing only enriches the remedy; a denied listing is not a SKIP."""
     check = _required_checks(
         tmp_path,
+        gate_open=gate_open,
         github={
             RULES_ENDPOINT: [],
             RULESETS_ENDPOINT: (1, "gh: Resource not accessible by integration (HTTP 403)"),
         },
     )
-    assert not check.ok and check.required and not check.skipped
+    assert not check.ok and not check.skipped
+    assert check.label == ("FAIL" if gate_open else "WARN")
     assert "no rule requires a status check on 'main'" in check.detail
     assert "settings/rules" in check.detail
 
@@ -840,7 +896,8 @@ def test_required_check_hidden_bypass_actors_is_skipped_never_ok(tmp_path):
     assert "'no bypass actors' is unverified" in check.detail
 
     # The visible half still decides when it is a problem: hidden actors never
-    # soften a missing context or a non-active ruleset into a SKIP.
+    # soften a missing context or a non-active ruleset into a SKIP (it is a
+    # WARN with the merge gate closed, #259, and a FAIL with it open).
     check = _required_checks(
         tmp_path,
         github={
@@ -848,7 +905,7 @@ def test_required_check_hidden_bypass_actors_is_skipped_never_ok(tmp_path):
             RULESET_ENDPOINT: _ruleset(bypass_actors=None),
         },
     )
-    assert not check.ok and not check.skipped and check.required
+    assert not check.ok and not check.skipped and check.label == "WARN"
     assert "required contexts do not include 'ci'" in check.detail
     assert "are not visible to this token" in check.detail
 
@@ -894,15 +951,20 @@ def test_required_check_hidden_bypass_actors_without_a_word_on_this_token(tmp_pa
         assert "the merge gate is closed" in check.detail
 
 
-def test_required_check_token_that_can_bypass_fails_even_when_actors_are_hidden(tmp_path):
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_required_check_token_that_can_bypass_fails_even_when_actors_are_hidden(
+    tmp_path, gate_open
+):
     """`current_user_can_bypass` is returned to every caller; a token that may bypass the
     rule is a bypass actor whether or not GitHub shows the list."""
     for actors in (None, ()):
         check = _required_checks(
             tmp_path,
+            gate_open=gate_open,
             github={RULESET_ENDPOINT: _ruleset(bypass_actors=actors, can_bypass="always")},
         )
-        assert not check.ok and not check.skipped and check.required, (actors, check)
+        assert not check.ok and not check.skipped, (actors, check)
+        assert check.label == ("FAIL" if gate_open else "WARN"), (actors, check)
         assert "ruleset 'main' (#22792049) can be bypassed by this token (always)" in check.detail
 
 
@@ -977,7 +1039,7 @@ def test_required_check_plan_limited_ruleset_listing_is_a_hint_only(tmp_path):
     check = _required_checks(
         tmp_path, github={RULES_ENDPOINT: [], RULESETS_ENDPOINT: (1, PLAN_LIMITED)}
     )
-    assert not check.ok and not check.skipped and check.required
+    assert not check.ok and not check.skipped and check.label == "WARN"
     assert "no rule requires a status check on 'main'" in check.detail
     assert "Upgrade to GitHub" not in check.detail
 
@@ -1092,6 +1154,75 @@ def test_required_check_reads_the_default_branch_not_main(tmp_path):
     )
     assert check.ok and "'trunk' requires: ci" in check.detail
     assert not any(argv[-1] == RULES_ENDPOINT for argv in calls)
+
+
+_CLASSIC_WITHOUT_CI = {
+    "required_status_checks": {"strict": False, "contexts": ["build"], "checks": []},
+    "enforce_admins": {"enabled": False},
+}
+# Each answer shows the default branch not requiring `ci` as doctor wants it.
+VISIBLE_GAPS = {
+    "no-rule": {RULES_ENDPOINT: [{"type": "deletion", "ruleset_id": 1}]},
+    "renamed-context": {RULES_ENDPOINT: [_status_rule("build")]},
+    "rule-without-context": {RULES_ENDPOINT: [_status_rule()]},
+    "ruleset-disabled": {RULES_ENDPOINT: [], RULESETS_ENDPOINT: [_ruleset(enforcement="disabled")]},
+    "ruleset-not-active": {RULESET_ENDPOINT: _ruleset(enforcement="evaluate")},
+    "bypass-actor": {
+        RULESET_ENDPOINT: _ruleset(
+            bypass_actors=[{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+        )
+    },
+    "classic-without-ci": {RULES_ENDPOINT: [], PROTECTION_ENDPOINT: _CLASSIC_WITHOUT_CI},
+    "classic-requires-nothing": {
+        RULES_ENDPOINT: [],
+        PROTECTION_ENDPOINT: {"enforce_admins": {"enabled": True}},
+    },
+}
+
+
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+@pytest.mark.parametrize("github", list(VISIBLE_GAPS.values()), ids=list(VISIBLE_GAPS))
+def test_a_visible_gap_fails_with_the_merge_gate_open_and_warns_with_it_closed(
+    tmp_path, github, gate_open
+):
+    """#259: only the merge gate relies on a required check, so a fresh repository
+    without CI or rules passes doctor while the configuration's half of the gate is
+    closed, and still sees what to fix: a WARN that says so, never an OK and never a
+    SKIP. With ``safety.allow_merge: true`` the same gap is the FAIL it always was."""
+    d = Doctor(
+        config_path=_gate_config(tmp_path, gate_open),
+        cwd=str(tmp_path),
+        runner=_runner_factory(github=github),
+    )
+    results = d.run_all()
+    check = {r.name: r for r in results}["default branch requires checks"]
+    assert not check.ok and not check.skipped
+    closed_note = "only the merge gate relies on this, and it is closed"
+    if gate_open:
+        assert check.label == "FAIL" and check.required
+        assert closed_note not in check.detail
+    else:
+        assert check.label == "WARN" and not check.required
+        assert check.detail.endswith(
+            f"({closed_note}: a run stops at READY_FOR_MERGE for you to merge; "
+            "fix it before you set safety.allow_merge: true)"
+        )
+    # Nothing else of this healthy fake fails, so the row alone decides doctor's exit.
+    failed = [r.name for r in results if not r.ok and r.required]
+    assert failed == (["default branch requires checks"] if gate_open else [])
+
+
+def test_a_repository_without_a_default_branch_fails_whatever_the_gate(tmp_path):
+    """A run needs a default branch to start from, so this is no merge-gate-only gap."""
+    check = _required_checks(tmp_path, default_branch="")
+    assert check.label == "FAIL" and check.required
+    assert check.detail == "owner/repo: GitHub reports no default branch"
+
+
+def _gate_config(tmp_path, gate_open: bool) -> str:
+    cfg = tmp_path / "gate.json"
+    cfg.write_text(json.dumps({"version": 1, "safety": {"allow_merge": gate_open}}))
+    return str(cfg)
 
 
 def test_required_check_skipped_when_prerequisites_failed(tmp_path):

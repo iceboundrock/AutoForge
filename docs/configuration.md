@@ -141,7 +141,10 @@ the file valid.
   and a requirement doctor cannot verify (GitHub's plan offers no rulesets
   there, the token may not read them, GitHub could not be read, or a
   ruleset's bypass list is hidden without a word on this token) is a `FAIL`
-  while `safety.allow_merge: true` (#289).
+  while `safety.allow_merge: true` (#289). A requirement it can see is
+  missing (no rule, a context not required, an inactive ruleset, a bypass
+  actor) is a `FAIL` while `safety.allow_merge: true` and a `WARN` while
+  it is false: only the merge gate relies on it (#259).
 - `safety.acceptance_actions` is `off`, `approve` (the default) or `auto`
   (a bare YAML `off`, read as false, means `off`); anything else is a
   configuration error. It decides who authorizes the one comment a `FIX`

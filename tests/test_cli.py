@@ -12,7 +12,7 @@ import pytest
 
 from autoforge import cli
 from autoforge.engine import ControllerEngine, StepOutcome
-from autoforge.errors import GitHubError, LockError
+from autoforge.errors import ExecutionError, GitHubError, LockError
 from autoforge.executor import ExecutionResult, execute
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.providers import ProviderRegistry, ScriptedProvider
@@ -844,7 +844,7 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     out = capsys.readouterr().out
     assert rc == 0
     assert "AutoForge workflow reached READY_FOR_MERGE." in out
-    assert "Automatic merge is disabled in this milestone." in out
+    assert "The merge gate is closed: a human must review and merge the PR." in out
     head = fakes["origin"].head("autoforge/2")  # the commit the controller published
     assert head is not None
     assert load_state(tmp_path / ".autoforge" / "state.json").current_head_sha == head
@@ -924,7 +924,7 @@ def test_resume_with_gate_open_rechecks_inconclusive_ready_for_merge_then_blocks
     assert (
         cli.main(["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
     )
-    assert "Automatic merge is disabled" in capsys.readouterr().out  # no --allow-merge: holds
+    assert "The merge gate is closed" in capsys.readouterr().out  # no --allow-merge: holds
     gh.prs[PR].mergeable = "UNKNOWN"
 
     # gate closed (flag missing): resume is a no-op banner, GitHub is not read
@@ -933,7 +933,7 @@ def test_resume_with_gate_open_rechecks_inconclusive_ready_for_merge_then_blocks
 
     n_reads = pr_reads()
     assert cli.main(["--config", cfg, "--state-dir", sd, "resume"]) == 0
-    assert "A human must review and merge the PR." in capsys.readouterr().out
+    assert "a human must review and merge the PR." in capsys.readouterr().out
     assert pr_reads() == n_reads
 
     # gate open: each resume performs one verification attempt and keeps the phase
@@ -980,7 +980,7 @@ def test_resume_with_gate_open_merges_via_controller_to_done(tmp_path, capsys, m
     )
     out = capsys.readouterr().out
     assert "READY_FOR_MERGE -> MERGE" in out or "MERGE" in out
-    assert "Automatic merge is disabled" not in out
+    assert "The merge gate is closed" not in out
     assert gh.merges == []
 
     assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 0
@@ -1022,7 +1022,7 @@ def test_ready_banner_with_gate_open_and_exhausted_budget(tmp_path, capsys, monk
     out = capsys.readouterr().out
     assert rc == 0 and "AutoForge workflow reached READY_FOR_MERGE." in out
     assert "step budget (--max-steps) ran out before MERGE" in out
-    assert "Automatic merge is disabled" not in out
+    assert "The merge gate is closed" not in out
     assert fakes["gh"].merges == []
 
 
@@ -1119,6 +1119,36 @@ def test_doctor_with_fake_runner(tmp_path, capsys, monkeypatch):
     # `gh api` answers "ok 1.0" here, not JSON: a conclusive read failure is a FAIL.
     rules = next(c for c in data["checks"] if c["name"] == "default branch requires checks")
     assert not rules["ok"] and rules["required"] and not rules["skipped"]
+
+
+def test_doctor_without_gh_reports_every_row(tmp_path, capsys, monkeypatch):
+    """#259: before `gh` was installed, doctor printed `autoforge: error:
+    executable not found: gh` and no row, since the rows that read GitHub
+    let the spawn failure escape. They are skipped now; 'gh available'
+    fails and says why."""
+    monkeypatch.chdir(tmp_path)
+
+    def runner(req):
+        argv = req.command
+        if argv[0] == "gh":
+            raise ExecutionError("executable not found: gh ([Errno 2] No such file or directory)")
+        if argv[:3] == ["git", "remote", "get-url"]:
+            return ExecutionResult(argv, req.cwd, 0, "https://github.com/o/r.git\n", "", "t", "t")
+        return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    epic = ["--epic", "https://github.com/o/r/issues/1"]
+    rc = cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor", *epic])
+    out = capsys.readouterr().out
+    assert rc == 1 and "autoforge: error" not in out
+    assert "[FAIL] gh available: ExecutionError: executable not found: gh" in out
+    for row in (
+        "default branch requires checks",
+        "pull request check runs readable",
+        "EPIC sub-issues and dependencies readable",
+    ):
+        assert f"[SKIP] {row}: gh could not be started (executable not found: gh" in out
+    assert "[OK  ] state dir writable" in out
 
 
 def test_a_refused_prompt_version_prints_nothing_written_under_it(

@@ -297,11 +297,18 @@ uv run autoforge --help
 `uv run autoforge` is the same command, run from that clone's `.venv`.
 [Development](https://github.com/iceboundrock/AutoForge/blob/main/docs/development.md) has the checks CI runs.
 
-To configure profiles, bounds or the merge gate, copy
-`autoforge.example.yaml` to `autoforge.yaml` and pass it with `--config`
-before the subcommand; see [Configuration](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md).
+To configure profiles, bounds or the merge gate, copy a starter
+configuration from [`examples/`](https://github.com/iceboundrock/AutoForge/tree/main/examples),
+or `autoforge.example.yaml` (every key), to `autoforge.yaml` and pass it
+with `--config` before the subcommand; see [Configuration](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md).
 
 ## Quick start
+
+New to AutoForge? [Getting started](https://github.com/iceboundrock/AutoForge/blob/main/docs/getting-started.md)
+walks through a first run on a repository of your own: prerequisites,
+installing, a throwaway repository with an EPIC and an issue, a starter
+configuration, what each `doctor` row means, a dry run, a real run, and the
+common first-run failures with their fixes. The commands in brief:
 
 Run these from a checkout of the repository the issues belong to. URLs must
 be HTTPS GitHub issue URLs, and the EPIC and the issue must be in that same
@@ -421,6 +428,7 @@ most common entry points:
 
 | I want to… | Read |
 |---|---|
+| make a first run on a repository of my own, step by step | [Getting started](docs/getting-started.md), starter configurations in [`examples/`](examples) |
 | know which OS, Python, git, `gh`, agent CLI and sandbox host it runs on | [Compatibility](docs/compatibility.md) |
 | run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/usage.md#troubleshooting-and-recovery) |
 | work without GitHub | [Local mode](docs/local-mode.md) |

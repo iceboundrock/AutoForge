@@ -5,6 +5,43 @@ so.
 
 ## Unreleased
 
+### A first run, from nothing: the guide, starter configurations, and a `doctor` that a new repository can pass (#259)
+
+- [Getting started](docs/getting-started.md) takes a newcomer from nothing
+  to a first run on a throwaway repository: prerequisites, installing,
+  the EPIC and the issue to write, keeping `.autoforge/` and
+  `autoforge.yaml` out of git, a configuration, what each `doctor` row
+  means, a dry run, a real run, `READY_FOR_MERGE` and `BLOCKED`, and the
+  common first-run failures with their exact messages.
+  [Clean-room first run](docs/clean-room.md) is the procedure that checks
+  it at each release candidate.
+- Two starter configurations under `examples/`:
+  `starter-two-providers.yaml`, the built-in routing written out, and
+  `starter-claude-only.yaml`, Claude Code for every phase, whose review is
+  therefore not cross-vendor. Tests load and validate both, and the built-in
+  defaults do not change.
+- **`doctor`'s "default branch requires checks" row is a `WARN`, not a
+  `FAIL`, while the merge gate is closed** and the default branch visibly
+  does not require the check (no rule, a missing context, an inactive
+  ruleset, a bypass actor). Only the merge gate relies on that rule, and a
+  run with the gate closed stops at `READY_FOR_MERGE` for a human, so a
+  new repository without CI no longer fails its first `doctor`. With
+  `safety.allow_merge: true` it is a `FAIL` as before, and the merge gate's
+  own checks do not change.
+- `doctor` without `gh` installed printed `autoforge: error: executable not
+  found: gh` and no row. It now prints every row: `gh available` fails, and
+  the rows that read GitHub are skipped.
+- `doctor` no longer fails `agent 'claude' keeps integrations off` when
+  Claude Code cut its `--help` short: 2.1.314 writes only part of it to a
+  pipe, before the flags the row looks for. A help that ends mid-line is a
+  `SKIP` that says so and how to check by hand.
+- The `READY_FOR_MERGE` banner said "Automatic merge is disabled in this
+  milestone"; it now says the merge gate is closed and what opens it.
+- `make dist-check` also installs the wheel with `uv tool install`, and,
+  with no credential and no agent CLI, checks `doctor`'s rows that need
+  neither, with the built-in routing and with each starter, and a dry run
+  with each starter.
+
 ### The outer sandbox says why a kernel lacks the Landlock scope, not only that it does (#349)
 
 - A host whose kernel did not report a Landlock ABI was told "the kernel's

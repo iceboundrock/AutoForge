@@ -1,0 +1,61 @@
+# AutoForge starter configuration: the built-in routing, written out.
+#
+# Claude Code implements (analyze_execute) and fixes (fix); OpenCode reviews
+# every round, replans and, after a merge, updates the EPIC. The review is
+# cross-vendor: a model of another vendor reads what the implementer wrote.
+# You need both CLIs installed and signed in, and both vendors bill you
+# (docs/compatibility.md, "Provider authentication and billing").
+#
+# Every value here is the built-in default, so this file runs exactly what
+# AutoForge runs without --config; it is here to show which models you pay
+# for and to be edited. Replace a model with one your account can use:
+# `claude --model` takes an alias (fable, opus, sonnet) or a full model
+# name, and `opencode models` lists OpenCode's provider/model ids. A run
+# records each profile's provider, model and effort, and `resume` refuses a
+# file that changed them unless you add --accept-config-change.
+#
+# Save it as autoforge.yaml in your checkout, keep it out of git, and pass
+# it before the subcommand (docs/getting-started.md):
+#   autoforge --config autoforge.yaml doctor
+# autoforge.example.yaml lists every key, with its default and what it does.
+
+version: 1
+
+safety:
+  # Closed: a run stops at READY_FOR_MERGE and you merge the pull request.
+  allow_merge: false
+  # The status check your CI reports on a pull request. Only the merge gate
+  # relies on it; `doctor` checks that the default branch requires it, and
+  # shows a WARN while the gate is closed and no rule requires it.
+  required_checks:
+    - "ci"
+
+profiles:
+  analyze_execute:
+    provider: claude
+    model: fable
+    effort: high
+  fix:
+    provider: claude
+    model: fable
+    effort: high
+  review_round_1:
+    provider: opencode
+    model: openai/gpt-5.6-luna
+    effort: high
+  review_round_2_5:
+    provider: opencode
+    model: openai/gpt-5.6-terra
+    effort: high
+  review_round_6_plus:
+    provider: opencode
+    model: openai/gpt-5.6-sol
+    effort: medium
+  replan_reexecute:
+    provider: opencode
+    model: openai/gpt-5.6-terra
+    effort: high
+  update_epic:
+    provider: opencode
+    model: openai/gpt-5.6-sol
+    effort: high

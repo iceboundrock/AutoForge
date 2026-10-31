@@ -1130,7 +1130,7 @@ def test_resume_with_the_gate_closed_says_whether_the_certificate_applies(
         assert cli.main(["--state-dir", str(tmp_state_dir), "resume"]) == 0
         out = capsys.readouterr().out
         assert "AutoForge workflow reached READY_FOR_MERGE." in out
-        assert "Automatic merge is disabled in this milestone." in out
+        assert "The merge gate is closed: a human must review and merge the PR." in out
         (line,) = [line for line in out.splitlines() if "Review certificate:" in line]
         return line.strip()
 

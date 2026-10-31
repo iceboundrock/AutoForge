@@ -678,7 +678,7 @@ _ISSUE_REFERENCE_RE = re.compile(
 
 
 MERGE_GATE_MESSAGE = (
-    "Automatic merge is disabled in this milestone: MERGE requires BOTH config "
+    "Automatic merge is disabled: MERGE requires BOTH config "
     "'safety.allow_merge: true' AND the CLI flag '--allow-merge'."
 )
 

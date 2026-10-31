@@ -520,3 +520,73 @@ def test_the_scratch_repository_starts_no_detached_maintenance(tmp_path: Path):
     text = trace.read_text(encoding="utf-8")
     assert "trace: built-in: git commit" in text
     assert "maintenance" not in text
+
+
+# -- the first run's checks (#259) ------------------------------------------------
+def test_the_first_run_knows_each_starter_and_the_clis_it_routes_to():
+    """``STARTER_AGENTS`` is the starters of examples/ and what each routes a
+    profile to, and ``BUILT_IN_AGENTS`` is the built-in routing's, so the
+    install smoke's agent rows are checked against the configurations."""
+    from autoforge.config import default_config, load_config_file
+
+    examples = sorted((REPO_ROOT / "examples").glob("*.yaml"))
+    assert [path.name for path in examples] == sorted(dist_check.STARTER_AGENTS)
+    for path in examples:
+        providers = {p.provider for p in load_config_file(path).profiles.values()}
+        assert providers == dist_check.STARTER_AGENTS[path.name], path.name
+    providers = {p.provider for p in default_config().profiles.values()}
+    assert providers == dist_check.BUILT_IN_AGENTS
+
+
+def _row(name: str, ok: bool = True, detail: str = "detail", **flags: bool) -> dict:
+    return {
+        "name": name,
+        "ok": ok,
+        "required": flags.get("required", True),
+        "skipped": flags.get("skipped", False),
+        "detail": detail,
+    }
+
+
+def _first_run_report(*agents: str, **replace: dict) -> dict:
+    """A doctor --json report without a sign-in: the credential-free rows OK, the rest failing."""
+    rows = [_row(name) for name in dist_check.CREDENTIAL_FREE_ROWS]
+    rows[[r["name"] for r in rows].index("merge gate")]["detail"] = "CLOSED: safety.allow_merge"
+    rows += [_row("gh authenticated", ok=False), _row("default branch requires checks", ok=False)]
+    rows += [_row(f"agent '{cli}' available (analyze_execute)", ok=False) for cli in agents]
+    rows += [_row(f"agent '{cli}' keeps integrations off (fix)", ok=False) for cli in agents]
+    rows = [replace.get(row["name"], row) for row in rows]
+    return {"ok": False, "checks": [row for row in rows if row]}
+
+
+def test_the_first_run_doctor_check_accepts_rows_that_need_a_sign_in_failing():
+    report = _first_run_report("claude", "opencode")
+    dist_check.check_first_run_doctor(report, frozenset({"claude", "opencode"}), "x.yaml")
+
+
+@pytest.mark.parametrize(
+    "replace, refusal",
+    [
+        ({"loop detection": {}}, "printed no 'loop detection' row"),
+        ({"config": _row("config", ok=False)}, "'config' is not OK"),
+        ({"GitHub remote": _row("GitHub remote", skipped=True)}, "'GitHub remote' is not OK"),
+        (
+            {"merge gate": _row("merge gate", detail="OPEN: both halves")},
+            "merge gate is not closed",
+        ),
+    ],
+)
+def test_the_first_run_doctor_check_refuses_a_credential_free_row_that_is_not_ok(
+    replace: dict, refusal: str
+):
+    report = _first_run_report("claude", **replace)
+    with pytest.raises(CheckFailed, match=refusal):
+        dist_check.check_first_run_doctor(report, frozenset({"claude"}), "x.yaml")
+
+
+def test_the_first_run_doctor_check_refuses_agent_rows_the_configuration_does_not_route_to():
+    report = _first_run_report("claude", "opencode")
+    with pytest.raises(
+        CheckFailed, match=r"agent CLIs \['claude', 'opencode'\], expected \['claude'\]"
+    ):
+        dist_check.check_first_run_doctor(report, frozenset({"claude"}), "x.yaml")
