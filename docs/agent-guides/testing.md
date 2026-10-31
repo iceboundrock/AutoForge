@@ -405,10 +405,15 @@ High-priority coverage includes:
   REMOTE run beside it; and a LOCAL state at `config.state_dir` is the
   scheduler hold's problem, holds nothing, and the pass admits as before
 - protocol 13, which removed LOCAL's twelve fields (ADR 0009 D6, D8, D12
-  S3; #388; `tests/test_state.py`): protocol-12 REMOTE files in every
-  phase, a file under each older label that loads, a protocol-1 file from
-  before LOCAL with none of the fields and one with some of them load,
-  and their next save writes label 13 and none of the fields; a file
+  S3; #388; `tests/test_state.py`): protocol-12 REMOTE files that
+  `main`'s own controller saved in every phase, each with the state that
+  phase persists (`tests/fixtures/state_protocol_12`, captured byte for
+  byte from 7df9917 by the script beside them and never rebuilt by this
+  tree's serializer), load without a write, keep every other field, and
+  their next save writes label 13 and none of the twelve; so do built
+  protocol-12 files with the fields present or absent, a file under each
+  older label that loads, a protocol-1 file from before LOCAL with none
+  of the fields and one with some of them; a file
   labelled 12 or older with any one of the twelve non-empty is refused,
   one case per field, and a protocol-13 or unlabelled file carrying any
   of them, even empty, is refused, each left byte for byte with no

@@ -1,7 +1,9 @@
 """State: serialize/deserialize, atomic save/load, corruption, idempotency."""
 
 import errno
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -3767,7 +3769,9 @@ def test_a_protocol_12_file_loads_in_every_phase_and_is_relabelled_without_the_l
     """ADR 0009 D8 step 3: a protocol-12 REMOTE file, every LOCAL field empty
     (as every REMOTE save wrote it) or absent, loads in every phase with them
     dropped and nothing else changed; the load writes nothing, and the next
-    save writes label 13 and none of the twelve."""
+    save writes label 13 and none of the twelve. A built file, so that the
+    absent variant is covered too; the files `main` itself saved are the
+    captures below."""
     state = _clean_review_state(phase=phase)
     d = local_fields(state.to_dict())
     d["protocol_version"] = "12"
@@ -3782,6 +3786,171 @@ def test_a_protocol_12_file_loads_in_every_phase_and_is_relabelled_without_the_l
     assert raw["protocol_version"] == "13"
     assert not set(raw) & set(LOCAL_STATE_FIELDS)
     assert set(raw) == _PROTOCOL_12_KEYS - set(LOCAL_STATE_FIELDS)
+
+
+# -- protocol 12 as `main` saved it: captured, never rebuilt (ADR 0009 S3, #388 R1-F2) ------
+
+# State files the controller of `main` (7df9917, protocol 12) saved while its
+# own scripted tests drove it through every phase, copied byte for byte by
+# tests/fixtures/state_protocol_12/capture_protocol_12.py, which also wrote
+# captures.json: the source commit and, per file, the test, the phase and the
+# SHA-256. Nothing here comes from this tree's serializer.
+_CAPTURES = Path(__file__).parent / "fixtures" / "state_protocol_12"
+_CAPTURE_MANIFEST = json.loads((_CAPTURES / "captures.json").read_text(encoding="utf-8"))
+_CAPTURED = [entry["file"] for entry in _CAPTURE_MANIFEST["files"]]
+
+# What the captures of each phase hold between them beyond the fields every
+# phase carries: the state a run persists in that phase, so that the drop step
+# runs over it rather than over a mostly empty state with another phase name.
+_CAPTURED_PHASE_STATE = {
+    Phase.INITIALIZING: {"config_fingerprint", "sandbox_pin"},
+    Phase.ANALYZE_EXECUTE: {
+        "effect_records",
+        "entry_observation",
+        "completion_context",
+        "launch_label",
+        "validation_records",
+        "producer_validation_failure",
+        "validation_override_seq",
+        "unblock_history",
+    },
+    Phase.REVIEW: {
+        "review_evidence",
+        "effect_records",
+        "completion_context",
+        "validation_records",
+        "review_history",
+        "last_fix_resolutions",
+        "operator_comment_outcomes",
+        "superseded_prs",
+        "escalation_count",
+        "prior_findings",
+    },
+    Phase.FIX: {
+        "open_findings",
+        "entry_observation",
+        "effect_records",
+        "review_evidence",
+        "acceptance_outcomes",
+        "producer_validation_failure",
+        "verification_failures",
+    },
+    Phase.REPLAN_REEXECUTE: {
+        "replan_transaction",
+        "open_findings",
+        "effect_records",
+        "validation_records",
+        "validation_attempt",
+    },
+    Phase.READY_FOR_MERGE: {
+        "review_certificate",
+        "review_evidence",
+        "validation_records",
+        "acceptance_outcomes",
+        "unblock_history",
+    },
+    Phase.MERGE: {
+        "review_certificate",
+        "validation_records",
+        "premerge_verified_head_sha",
+        "premerge_verified_commands",
+    },
+    Phase.UPDATE_EPIC: {
+        "counted_merged_prs",
+        "merged_since_epic_update",
+        "effect_records",
+        "entry_observation",
+        "completion_context",
+        "next_issue_rejections",
+        "validation_records",
+    },
+    Phase.DONE: {"counted_merged_prs", "review_certificate"},
+    Phase.BLOCKED: {"block_reason", "open_findings", "replan_transaction", "next_issue_rejections"},
+    Phase.FAILED: {"block_reason", "replan_transaction", "open_findings"},
+}
+
+
+def _is_empty(value) -> bool:
+    return value is None or value is False or value in ("", 0, [], {})
+
+
+def _captured(name: str) -> tuple[bytes, dict]:
+    data = (_CAPTURES / name).read_bytes()
+    return data, json.loads(data)
+
+
+def test_the_protocol_12_captures_are_mains_own_saves_in_every_phase():
+    """The captures are what they claim: protocol-12 REMOTE files in `main`'s
+    save format, unchanged since the capture, with exactly the keys `main`
+    wrote and LOCAL's twelve at their empty values. Between them they cover
+    every phase, each with the state that phase persists, every journal stage
+    REPLAN_REEXECUTE writes, and every field of protocol 13 non-empty at least
+    once."""
+    assert _CAPTURE_MANIFEST["source_commit"] == "7df991782f8d8b918b3d8119baa342d617f783b9"
+    assert _CAPTURE_MANIFEST["protocol_version"] == "12"
+    assert sorted(p.name for p in _CAPTURES.iterdir() if p.name != "__pycache__") == sorted(
+        [*_CAPTURED, "captures.json", "capture_protocol_12.py"]
+    )
+    held: dict[Phase, set[str]] = {phase: set() for phase in Phase}
+    stages = set()
+    for entry in _CAPTURE_MANIFEST["files"]:
+        data, raw = _captured(entry["file"])
+        assert hashlib.sha256(data).hexdigest() == entry["sha256"], entry["file"]
+        assert data == (json.dumps(raw, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        assert raw["protocol_version"] == "12" and raw["mode"] == "REMOTE"
+        assert raw["phase"] == entry["phase"]
+        assert set(raw) == _PROTOCOL_12_KEYS
+        for name, empty in LOCAL_STATE_FIELDS.items():
+            assert raw[name] == empty and type(raw[name]) is type(empty), (entry["file"], name)
+        held[Phase(raw["phase"])] |= {k for k, v in raw.items() if not _is_empty(v)}
+        if raw["phase"] == "REPLAN_REEXECUTE":
+            stages.add(raw["replan_transaction"]["stage"])
+    for phase, fields in _CAPTURED_PHASE_STATE.items():
+        assert fields <= held[phase], (phase, sorted(fields - held[phase]))
+    assert stages == {
+        "pending",
+        "prepared",
+        "verified",
+        "supersede_intent",
+        "superseded",
+        "compensating",
+        "rejected",
+    }
+    assert set().union(*held.values()) == _PROTOCOL_12_KEYS - set(LOCAL_STATE_FIELDS)
+
+
+@pytest.mark.parametrize("name", _CAPTURED)
+def test_a_protocol_12_file_main_saved_loads_without_a_write_and_its_next_save_is_protocol_13(
+    tmp_path, name
+):
+    """ADR 0009 S3's positive exit test on `main`'s own files: each loads in
+    its phase with the twelve LOCAL fields dropped and every other field as
+    `main` saved it; the load writes nothing (bytes, inode and mtime kept, no
+    file beside it); the next save writes label 13, none of the twelve, and
+    the rest unchanged but for its own timestamp; and that file loads again."""
+    data, raw = _captured(name)
+    p = tmp_path / "state.json"
+    p.write_bytes(data)
+    stat = p.stat()
+    before = (p.read_bytes(), stat.st_ino, stat.st_mtime_ns)
+    loaded = load_state(p)
+    stat = p.stat()
+    assert (p.read_bytes(), stat.st_ino, stat.st_mtime_ns) == before
+    assert [x.name for x in tmp_path.iterdir()] == ["state.json"]
+
+    kept = {k: v for k, v in raw.items() if k not in LOCAL_STATE_FIELDS}
+    assert loaded.protocol_version == "13"
+    assert loaded.phase == Phase(raw["phase"]) and loaded.mode == WorkflowMode.REMOTE
+    assert loaded.to_dict() == {**kept, "protocol_version": "13"}
+
+    save_state(loaded, p)
+    saved = json.loads(p.read_text(encoding="utf-8"))
+    assert saved["protocol_version"] == "13"
+    assert set(saved) == set(kept) == _PROTOCOL_12_KEYS - set(LOCAL_STATE_FIELDS)
+    for key, value in kept.items():
+        if key not in ("protocol_version", "updated_at"):
+            assert saved[key] == value, key
+    assert load_state(p).to_dict() == saved
 
 
 @pytest.mark.parametrize("label", _OLDER_LABELS)

@@ -292,9 +292,11 @@ S2, #387)                             a LOCAL state under every label and in the
                                       test_state.py (the loader),
                                       test_ownership.py, test_epic_commands.py (the scheduler,
                                       the epic commands' refusal of the key)
-protocol 13: LOCAL's state fields     test_state.py (the drop step, one refusal per field, a
-and evidence kinds removed (ADR 0009  protocol-13 or unlabelled file carrying one),
-S3, #388)                             test_cli.py (status --json carries none of them),
+protocol 13: LOCAL's state fields     test_state.py (the drop step on main's own protocol-12
+and evidence kinds removed (ADR 0009  saves in every phase, tests/fixtures/state_protocol_12,
+S3, #388)                             and on built files; one refusal per field, a
+                                      protocol-13 or unlabelled file carrying one),
+                                      test_cli.py (status --json carries none of them),
                                       test_evidence.py, test_certificate.py,
                                       test_review_certificate.py (LOCAL kinds refused as
                                       unknown), test_local_removal.py (structural: no LOCAL

@@ -1,0 +1,221 @@
+{
+  "acceptance_outcomes": [],
+  "attempt": 1,
+  "base_branch": "",
+  "base_head_sha": "",
+  "baseline_dirty_paths": [],
+  "block_reason": "",
+  "completion_context": {
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "phase": "ANALYZE_EXECUTE"
+  },
+  "config_fingerprint": {
+    "config_file": "/tmp/autoforge-protocol-12-capture/test_resume_with_gate_open_mer0/autoforge.json",
+    "profiles": {
+      "analyze_execute": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "fable",
+        "provider": "claude"
+      },
+      "fix": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "fable",
+        "provider": "claude"
+      },
+      "replan_reexecute": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-terra",
+        "provider": "opencode"
+      },
+      "review_round_1": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-luna",
+        "provider": "opencode"
+      },
+      "review_round_2_5": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-terra",
+        "provider": "opencode"
+      },
+      "review_round_6_plus": {
+        "effort": "medium",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-sol",
+        "provider": "opencode"
+      },
+      "update_epic": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-sol",
+        "provider": "opencode"
+      }
+    },
+    "recorded_at": "2026-10-31T10:31:37.897192+00:00",
+    "schema": 1,
+    "source": "created",
+    "worktree_root": "/tmp/autoforge-protocol-12-capture/test_resume_with_gate_open_mer0/.git/autoforge/worktrees"
+  },
+  "controller_version": "0.1.0a1.dev0",
+  "counted_merged_prs": [],
+  "created_at": "2026-10-31T10:31:37.891949+00:00",
+  "current_base_ref": "",
+  "current_branch": "",
+  "current_head_sha": "",
+  "current_issue_url": "https://github.com/owner/repo/issues/2",
+  "current_merge_base_sha": "",
+  "current_pr_url": "",
+  "effect_records": [
+    {
+      "attempts": 1,
+      "completion": "remote_ref_equals_candidate",
+      "identity": {
+        "candidate_sha": "6192d1fc1b3e43f7da407f099c35104ee931204a",
+        "ref": "refs/heads/autoforge/2",
+        "repository": "owner/repo"
+      },
+      "kind": "push",
+      "observed": {
+        "sha": "6192d1fc1b3e43f7da407f099c35104ee931204a"
+      },
+      "owner": {
+        "issue_url": "https://github.com/owner/repo/issues/2",
+        "phase": "ANALYZE_EXECUTE",
+        "pr_url": "",
+        "run_id": "af-20261031T103137Z-7721fb",
+        "transaction_id": ""
+      },
+      "payload": {
+        "sha": "6192d1fc1b3e43f7da407f099c35104ee931204a"
+      },
+      "position": 0,
+      "precondition": {
+        "base_sha": "0e83301ea445d6261c7cf436146d540e6718f14a",
+        "expected_old": null
+      },
+      "reason": "",
+      "stage": "observed",
+      "target": {
+        "ref": "refs/heads/autoforge/2",
+        "repository": "owner/repo"
+      }
+    },
+    {
+      "attempts": 1,
+      "completion": "one_pr_on_head_branch_matching_payload",
+      "identity": {
+        "head_branch": "autoforge/2",
+        "marker": "<!-- ai-implementation: {\"issue\": \"https://github.com/owner/repo/issues/2\"} -->",
+        "repository": "owner/repo"
+      },
+      "kind": "implementation_pr",
+      "observed": {
+        "number": 42,
+        "url": "https://github.com/owner/repo/pull/42"
+      },
+      "owner": {
+        "issue_url": "https://github.com/owner/repo/issues/2",
+        "phase": "ANALYZE_EXECUTE",
+        "pr_url": "",
+        "run_id": "af-20261031T103137Z-7721fb",
+        "transaction_id": ""
+      },
+      "payload": {
+        "body": "Adds the feature.\n\nTested with `pytest`.\n\nCloses #2\n\n<!-- ai-implementation: {\"issue\": \"https://github.com/owner/repo/issues/2\"} -->",
+        "title": "Add the feature"
+      },
+      "position": 1,
+      "precondition": {
+        "absent": true
+      },
+      "reason": "",
+      "stage": "observed",
+      "target": {
+        "base": "main",
+        "head": "autoforge/2",
+        "repository": "owner/repo"
+      }
+    }
+  ],
+  "entry_observation": {
+    "base_sha": "0e83301ea445d6261c7cf436146d540e6718f14a",
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "objects": {
+      "<!-- ai-implementation: {\"issue\": \"https://github.com/owner/repo/issues/2\"} -->": null
+    },
+    "phase": "ANALYZE_EXECUTE",
+    "pr_url": "",
+    "prs": {
+      "refs/heads/autoforge/2": null
+    },
+    "refs": {
+      "refs/heads/autoforge/2": null,
+      "refs/heads/main": "0e83301ea445d6261c7cf436146d540e6718f14a"
+    }
+  },
+  "epic_url": "https://github.com/owner/repo/issues/1",
+  "escalation_count": 0,
+  "execution_attempt": 1,
+  "feature_spec_path": "",
+  "feature_spec_sha256": "",
+  "last_fix_resolutions": [],
+  "last_review_comment_url": "",
+  "last_review_needs_fix": null,
+  "last_review_result": "",
+  "launch_label": "controller_publishes",
+  "local_fix_rounds": 0,
+  "local_pending_attempts": 0,
+  "local_pending_fingerprint": "",
+  "local_pending_phase": "",
+  "local_run_contract": {},
+  "merged_since_epic_update": 0,
+  "mode": "REMOTE",
+  "next_issue_rejections": [],
+  "open_findings": [],
+  "operator_comment_outcomes": [],
+  "phase": "ANALYZE_EXECUTE",
+  "premerge_verified_commands": [],
+  "premerge_verified_head_sha": "",
+  "prior_findings": [],
+  "producer_validation_failure": {},
+  "prompt_version": "v14",
+  "protocol_version": "12",
+  "replan_transaction": {},
+  "repository": "owner/repo",
+  "review_certificate": {},
+  "review_evidence": {},
+  "review_history": [],
+  "review_round": 0,
+  "reviewed_base_ref": "",
+  "reviewed_head_sha": "",
+  "reviewed_merge_base_sha": "",
+  "reviewed_pr_url": "",
+  "reviewed_workspace_fingerprint": "",
+  "run_id": "af-20261031T103137Z-7721fb",
+  "sandbox_pin": {
+    "mode": "disabled",
+    "recorded_at": "2026-10-31T10:31:37.892317+00:00",
+    "schema": 1,
+    "source": "created"
+  },
+  "step_count": 2,
+  "superseded_prs": [],
+  "unblock_history": [],
+  "updated_at": "2026-10-31T10:31:38.279488+00:00",
+  "validation_attempt": {},
+  "validation_override_seq": null,
+  "validation_records": [],
+  "verification_failures": [],
+  "workspace_fingerprint": ""
+}
