@@ -688,22 +688,6 @@ class RemoteBinding:
 
 
 @dataclass(frozen=True)
-class LocalBinding:
-    """The workflow identity a LOCAL launch is bound to (D5.1): the state
-    root, the phase, and the launch index of the logical invocation's first
-    launch."""
-
-    state_root: str
-    phase: str
-    launch_index: int
-
-    def __post_init__(self) -> None:
-        _path(self.state_root, "a state root")
-        _identity(self.phase, "a phase")
-        _counter(self.launch_index, "a launch index", 1)
-
-
-@dataclass(frozen=True)
 class SessionIdentity:
     """What a pending interaction binds (D5.1, D8.4): a continuation launches
     only when the current launch would produce an equal identity.
@@ -723,7 +707,7 @@ class SessionIdentity:
     cwd: str
     session_root: str
     session_id: str
-    workflow: RemoteBinding | LocalBinding
+    workflow: RemoteBinding
 
     def __post_init__(self) -> None:
         for name in ("provider", "sdk_version", "runtime_version", "profile", "session_id"):
@@ -734,7 +718,7 @@ class SessionIdentity:
                 raise InteractionDataError(f"a session's {name} is not a SHA-256")
         _path(self.cwd, "a session's cwd")
         _path(self.session_root, "a session's root")
-        if not isinstance(self.workflow, (RemoteBinding, LocalBinding)):
+        if not isinstance(self.workflow, RemoteBinding):
             raise InteractionDataError("a session's workflow binding is of no known mode")
 
 

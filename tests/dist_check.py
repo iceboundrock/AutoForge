@@ -24,7 +24,9 @@ imports the ``autoforge`` of the source tree:
 2. The sdist holds exactly ``LICENSE``, ``MANIFEST.in``, ``README.md``,
    ``pyproject.toml``, ``PKG-INFO``, ``setup.cfg``, the egg-info, the modules and the
    resources ``[tool.setuptools.package-data]`` declares. The wheel holds
-   exactly those modules and resources and its dist-info. Both carry the
+   exactly those modules and resources and its dist-info. Neither carries a
+   LOCAL prompt template (``autoforge/prompts/local_*.md``), which LOCAL's
+   removal deleted (ADR 0009 D12 S3, #388), whatever the tree declares. Both carry the
    metadata ``pyproject.toml`` declares (``Name: autoforge-cli``, the
    version, ``License-Expression: MIT``, ``License-File: LICENSE``, the
    classifiers, ``Requires-Python``) and ``LICENSE`` byte for byte. A file
@@ -100,6 +102,9 @@ _HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
 REMOTE_EPIC = "https://github.com/example/dist-check/issues/1"
 REMOTE_ISSUE = "https://github.com/example/dist-check/issues/2"
 _PLACEHOLDER = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
+# LOCAL mode's prompt templates, deleted with it (ADR 0009 D12 S3, #388): no
+# artifact and no installed package may carry one again.
+_LOCAL_TEMPLATE = re.compile(r"(?:^|/)autoforge/prompts/local_[^/]*\.md$")
 _CONTROL_RESULT = "<<<CONTROL_RESULT>>>"
 
 
@@ -142,6 +147,11 @@ def declared_resources(root: Path = REPO_ROOT, data: dict | None = None) -> set[
 def wheel_package_files(root: Path = REPO_ROOT) -> set[str]:
     """What the wheel must hold outside its dist-info: the modules and the resources."""
     return package_modules(root) | declared_resources(root)
+
+
+def local_templates(names) -> list[str]:
+    """The LOCAL prompt templates (``autoforge/prompts/local_*.md``) among ``names``."""
+    return sorted(name for name in names if _LOCAL_TEMPLATE.search(name))
 
 
 def distribution_stem(name: str, version: str) -> str:
@@ -260,6 +270,8 @@ def check_sdist(path: Path, stem: str, data: dict, root: Path = REPO_ROOT) -> No
         egg_info = f"src/{stem.split('-', 1)[0]}.egg-info/"
         expected = SDIST_TOP_FILES | {f"src/{name}" for name in wheel_package_files(root)}
         found = {name for name in names if not name.startswith(egg_info)}
+        local = local_templates(found)
+        _check(not local, f"{path.name} carries LOCAL prompt templates: {local}")
         missing, extra = sorted(expected - found), sorted(found - expected)
         _check(not missing, f"{path.name} is missing {missing}")
         _check(not extra, f"{path.name} carries files it should not: {extra}")
@@ -283,6 +295,8 @@ def check_wheel(path: Path, stem: str, data: dict, root: Path = REPO_ROOT) -> st
     with zipfile.ZipFile(path) as archive:
         names = {name for name in archive.namelist() if not name.endswith("/")}
         package = {name for name in names if not name.startswith(dist_info)}
+        local = local_templates(package)
+        _check(not local, f"{path.name} carries LOCAL prompt templates: {local}")
         expected = wheel_package_files(root)
         missing, extra = sorted(expected - package), sorted(package - expected)
         _check(not missing, f"{path.name} is missing {missing}")
@@ -663,6 +677,8 @@ def check_installed(expect_version: str, source_root: Path) -> None:
     on_disk = sorted(path.name for path in directory.glob("*.md"))
     registered = sorted(prompts.TEMPLATE_FILES)
     _check(on_disk == registered, f"installed templates {on_disk}, registered {registered}")
+    local = local_templates(f"autoforge/prompts/{name}" for name in {*on_disk, *registered})
+    _check(not local, f"the installed package carries LOCAL prompt templates: {local}")
     _check(engine.check_template_files() == [], f"missing: {engine.check_template_files()}")
 
     def variables(*names: str) -> dict[str, str | int | None]:
@@ -675,17 +691,13 @@ def check_installed(expect_version: str, source_root: Path) -> None:
         _check(not phase or _CONTROL_RESULT in text, f"{what} asks for no CONTROL_RESULT")
 
     rendered: set[str] = set()
-    tables = (
-        (engine.PHASE_TEMPLATE, prompts.COMMON_TEMPLATE),
-        (engine.LOCAL_PHASE_TEMPLATE, prompts.LOCAL_COMMON_TEMPLATE),
-    )
-    for table, common in tables:
-        for phase, name in table.items():
-            if name is None:
-                continue
-            text = prompts.render_phase(name, variables(common, name), common_template=common)
-            checked(text, f"{phase.value} ({common} + {name})", phase=True)
-            rendered |= {common, name}
+    common = prompts.COMMON_TEMPLATE
+    for phase, name in engine.PHASE_TEMPLATE.items():
+        if name is None:
+            continue
+        text = prompts.render_phase(name, variables(common, name), common_template=common)
+        checked(text, f"{phase.value} ({common} + {name})", phase=True)
+        rendered |= {common, name}
     rerequest = engine.UPDATE_EPIC_RE_REQUEST_TEMPLATE
     text = prompts.render_phase(rerequest, variables(prompts.COMMON_TEMPLATE, rerequest))
     checked(text, f"UPDATE_EPIC re-request ({rerequest})", phase=False)

@@ -8,8 +8,6 @@ reaches a backend; the scripted provider records what the engine asked for.
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -20,8 +18,7 @@ from autoforge.errors import ConfigurationError, SandboxCapabilityError, Sandbox
 from autoforge.sandbox_bwrap import Capability
 from autoforge.state import load_state
 from autoforge.transitions import Phase
-from tests.conftest import implement, make_engine, make_local_engine
-from tests.local_helpers import impl_result, local_repo, review_result, scripted, touch_impl
+from tests.conftest import implement, make_engine
 
 
 def _cfg(mode: str):
@@ -172,88 +169,17 @@ def test_status_names_the_mode_without_probing(tmp_state_dir, fake_github, sandb
     assert sandbox_probe.calls == 0
 
 
-# -- LOCAL ---------------------------------------------------------------------
-def _local(tmp_path, mode: str, validation=True):
-    root = local_repo(tmp_path)
-    cfg = _cfg(mode)
-    if validation:
-        cfg.local.validation_commands = [["python3", "-c", "pass"]]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-            (None, lambda e: review_result(e.state.workspace_fingerprint)),
-        ],
+# -- preferred is required (ADR 0009 D7) -------------------------------------------
+def test_a_setup_failure_after_the_gate_never_runs_unenforced(
+    tmp_state_dir, fake_github, sandbox_probe
+):
+    """``preferred`` has no fallback: a launch the backend refuses after the gate
+    is refused, once, enforced, and nothing re-runs without the sandbox."""
+    eng = make_engine(
+        tmp_state_dir, implement, github=fake_github, cfg=_cfg("preferred"), origin=True
     )
-    return eng
-
-
-def test_required_refuses_a_local_step_before_it_is_charged(tmp_path, sandbox_probe):
-    eng = _local(tmp_path, "required")
-    assert eng.step().next_phase == "ANALYZE_EXECUTE"
-    sandbox_probe.unsupported(Capability.LANDLOCK, "the kernel's Landlock ABI is 4")
-    before = _snapshot(eng)
-    with pytest.raises(SandboxCapabilityError) as caught:
-        eng.step()
-    message = str(caught.value)
-    assert "Landlock" in message and "autoforge local doctor" in message
-    assert "or preferred to fall back" in message
-    assert _snapshot(eng) == before
-    assert eng.provider.calls == []
-
-
-def test_preferred_falls_back_visibly_in_local(tmp_path, sandbox_probe):
-    eng = _local(tmp_path, "preferred")
     said: list[str] = []
     eng.progress_output = said.append
-    sandbox_probe.unsupported(Capability.USER_NAMESPACE, "no user namespaces here")
-    assert eng.step().next_phase == "ANALYZE_EXECUTE"
-    (plan,) = [o.plan for o in eng.run(max_steps=1, dry_run=True)]
-    (mode_note,) = [n for n in plan.notes if n.startswith("outer sandbox:")]
-    assert "preferred" in mode_note and "logical isolation only" in mode_note
-    assert "never called sandboxed" in mode_note
-    assert any(n.startswith("outer sandbox policy, LOCAL agent") for n in plan.notes)
-    assert any(n.startswith("outer sandbox policy, LOCAL validation command") for n in plan.notes)
-    assert sandbox_probe.calls == 0
-
-    eng.run(max_steps=5)
-    assert eng.state.phase == Phase.DONE
-    assert all(req.sandbox is None for req in eng.provider.calls)
-    assert eng.provider.descriptions == []
-    fallback = {
-        "enforced": False,
-        "mode": "preferred",
-        "isolation": "logical isolation only",
-        "fallback": "unsupported: this host cannot provide an unprivileged user namespace "
-        "(no user namespaces here)",
-    }
-    executions = _executions(eng)
-    assert {e["phase"] for e in executions} >= {"ANALYZE_EXECUTE", "REVIEW"}
-    assert any("validation" in e["phase"] for e in executions)
-    for execution in executions:
-        assert execution["execution"]["sandbox"] == fallback, execution["phase"]
-    # On stderr at each launch, never "sandboxed".
-    notices = [line for line in said if "logical isolation only" in line]
-    assert any("this agent" in line for line in notices)
-    assert any("validation command" in line for line in notices)
-    assert all("NOT inside the outer sandbox" in line for line in notices)
-    assert sandbox_probe.calls == 1
-    status = _render_outer_sandbox(eng.state, eng.config)[2]
-    assert "fall" in status and "logical isolation only" in status
-
-
-def test_preferred_on_a_capable_local_host_is_enforced(tmp_path, sandbox_probe):
-    eng = _local(tmp_path, "preferred", validation=False)
-    eng.run(max_steps=5)
-    assert eng.state.phase == Phase.DONE
-    assert all(req.sandbox is not None for req in eng.provider.calls)
-    assert len(eng.provider.descriptions) == 2
-
-
-def test_a_setup_failure_after_the_gate_never_falls_back(tmp_path, sandbox_probe):
-    eng = _local(tmp_path, "preferred", validation=False)
     assert eng.step().next_phase == "ANALYZE_EXECUTE"
     launched = []
 
@@ -264,39 +190,7 @@ def test_a_setup_failure_after_the_gate_never_falls_back(tmp_path, sandbox_probe
     eng.provider.execute = refuses  # type: ignore[method-assign]
     with pytest.raises(SandboxLaunchRefusedError, match="set the sandbox up"):
         eng.step()
-    # One launch, enforced; nothing re-ran without the sandbox.
     assert len(launched) == 1 and launched[0].sandbox is not None
-
-
-def test_a_local_operator_path_is_checked_against_the_local_launchs_denied_roots(
-    tmp_path, tmp_path_factory, sandbox_probe
-):
-    """The LOCAL checkout is every LOCAL launch's workspace, not a denied root (PR #231 R1-F2).
-
-    ``.git/config`` lies in the root's read-only git projection, which each
-    LOCAL launch already shows: the gate lets it through and the launch drops
-    it as covered (C6). What a LOCAL launch's denied roots do hold, the
-    controller's directory in the git dir or another registered worktree,
-    is still refused before anything of the step.
-    """
-    eng = _local(tmp_path, "required", validation=False)
-    root = Path(eng.local_contract().repository_root)
-    assert eng.step().next_phase == "ANALYZE_EXECUTE"
-    other = tmp_path_factory.mktemp("other-worktree")
-    subprocess.run(
-        ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(other)], check=True
-    )
-    for denied in (root / ".git" / "autoforge", other / "src"):
-        eng.config.sandbox.read_only_paths = [str(denied)]
-        before = _snapshot(eng)
-        with pytest.raises(ConfigurationError, match=r"sandbox\.read_only_paths\[0\].*overlaps"):
-            eng.step()
-        assert _snapshot(eng) == before and eng.provider.calls == []
-
-    config = root / ".git" / "config"
-    eng.config.sandbox.read_only_paths = [str(config)]
-    eng.run(max_steps=5)
-    assert eng.state.phase == Phase.DONE
-    assert len(eng.provider.descriptions) == 2
-    for description in eng.provider.descriptions:
-        assert description.covered == (os.path.realpath(config),)
+    assert not [line for line in said if "logical isolation only" in line]
+    for execution in _executions(eng):
+        assert execution["execution"].get("sandbox", {}).get("fallback") is None

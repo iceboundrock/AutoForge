@@ -3,8 +3,7 @@
 The same probe runs inside every way AutoForge launches a process: Claude
 Code with text and with stream-json output, OpenCode, Pi's RPC child and its
 ``auth check`` preflight, a provider-neutral adapter that declares nothing
-of its own, and the two classes of repository-defined command (a LOCAL
-validation command and an export command). Each writes what it observed
+of its own, and the repository-defined export command. Each writes what it observed
 into its working directory; the reports must agree on every sentinel and
 fact: the same things hidden, the same things read-only, the same private
 ``/tmp`` and home, the same namespaces, the same abstract-socket scope.
@@ -367,24 +366,9 @@ def _agent_paths(paths, monkeypatch) -> dict[str, dict]:
 
 
 def _command_paths(paths, monkeypatch) -> dict[str, dict]:
-    """Launch both classes of repository-defined command; each one's report."""
+    """Launch the repository-defined export command; its report."""
     _host(paths, monkeypatch)
-    git_dir = paths["common"]
-    cache = git_dir / "autoforge" / "sandbox" / "local" / "cache"
-    cache.mkdir(parents=True)
     classes = {
-        "local-validation": LaunchFacts(
-            launch_class=LaunchClass.LOCAL_VALIDATION,
-            workspace=str(paths["repo"]),
-            home=str(paths["home"]),
-            controller_env={},
-            git_entry=str(git_dir),
-            git_dir=str(git_dir),
-            common_dir=str(git_dir),
-            cache=str(cache),
-            controller_config=str(paths["config"]),
-            denied_roots=(str(git_dir / "autoforge"), str(paths["state"])),
-        ),
         "export-command": LaunchFacts(
             launch_class=LaunchClass.EXPORT_COMMAND,
             workspace=str(paths["export"]),
@@ -454,7 +438,6 @@ def test_every_launch_path_sees_the_same_boundary(backend, world, monkeypatch):
         "claude-stream-json",
         "claude-text",
         "export-command",
-        "local-validation",
         "neutral",
         "opencode",
         "pi-preflight",

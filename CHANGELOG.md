@@ -141,6 +141,32 @@ everywhere: its fallback to logical isolation existed only in LOCAL. No
 REMOTE launch changes, and a REMOTE run pinned to `preferred` compares as
 before.
 
+### The state file is protocol 13, without LOCAL's twelve fields (#388)
+
+**Behaviour change:** with LOCAL's code gone (ADR 0009), the state file
+is protocol 13 and `status --json` loses twelve keys:
+`feature_spec_path`, `feature_spec_sha256`, `base_head_sha`,
+`base_branch`, `local_run_contract`, `workspace_fingerprint`,
+`reviewed_workspace_fingerprint`, `local_fix_rounds`,
+`local_pending_phase`, `local_pending_fingerprint`,
+`local_pending_attempts` and `baseline_dirty_paths`. They were LOCAL
+mode's, and a REMOTE run always held them empty. `mode` stays, always
+`"REMOTE"`. Nothing else in the file changes.
+
+- A REMOTE state file of an earlier protocol loads as before when each of
+  the twelve is absent or empty (`""`, `0`, `{}` or `[]`), as every REMOTE
+  run saved them. Loading it writes nothing; its next save writes
+  protocol 13 without them.
+- A file of an earlier protocol with any of the twelve not empty is
+  refused and left as it was. Only LOCAL wrote such a value, so the file
+  is hand-edited or foreign. Protocol 12 refused only a non-empty
+  `local_run_contract` or `local_pending_*`.
+- A protocol-13 or unlabelled file carrying any of the twelve, even
+  empty, is refused as carrying an unknown field.
+- A LOCAL state is refused by its mode under every protocol, 13 included,
+  before any of this (#387).
+- An older AutoForge refuses a protocol-13 file.
+
 ### The outer sandbox says why a kernel lacks the Landlock scope, not only that it does (#349)
 
 - A host whose kernel did not report a Landlock ABI was told "the kernel's

@@ -15,12 +15,6 @@ mount (D7.1).
   ``<common>/objects`` whose upper layer is the issue's private object
   directory (D6.1); the read context read-only; the issue's cache at
   ``~/.cache`` for the launches that produce a change.
-- **LOCAL agent and LOCAL validation command:** the repository root
-  writable, its ``.git`` entry, git dir and common dir read-only (so a LOCAL
-  agent cannot commit, stash or branch), ``<git dir>/autoforge``,
-  ``<common>/autoforge`` and ``<common>/worktrees`` masked (the checkout's own
-  admin dir carved out read-only); the checkout's cache at ``~/.cache`` for
-  the launches that produce a change and for validation.
 - **Export command (pre-merge verification):** the exported tree writable,
   nothing else of the repository, no persistent cache.
 
@@ -81,10 +75,9 @@ from .sandbox import (
 )
 
 # Where the controller-owned sandbox directories live (D8.4): under
-# ``<git common dir>/autoforge/sandbox/<key>`` for REMOTE (the key is the
-# worktree's name) and ``<git dir>/autoforge/sandbox/local`` for LOCAL.
+# ``<git common dir>/autoforge/sandbox/<key>``, the key being the worktree's
+# name.
 SANDBOX_DIR = "autoforge/sandbox"
-LOCAL_SANDBOX_KEY = "local"
 PRIVATE_OBJECTS = "objects"
 OVERLAY_WORK = "overlay-work"
 CACHE = "cache"
@@ -109,8 +102,6 @@ class LaunchClass(enum.Enum):
     """The rows of ADR 0005 §2.5 a launch gets."""
 
     REMOTE_AGENT = "REMOTE agent"
-    LOCAL_AGENT = "LOCAL agent"
-    LOCAL_VALIDATION = "LOCAL validation command"
     EXPORT_COMMAND = "export command"
 
 
@@ -184,10 +175,10 @@ class LaunchFacts:
 
     ``workspace`` is what the launch works in (the issue worktree, the
     repository root, the exported tree). ``git_entry`` is the workspace's
-    ``.git``; ``git_dir`` is its own git directory (a REMOTE worktree's
-    admin dir, a LOCAL checkout's git dir) and ``common_dir`` the shared
-    one. ``private_objects`` and ``overlay_work`` are the issue's object
-    overlay layers, ``cache`` the persistent cache when the launch gets one
+    ``.git``; ``git_dir`` is its own git directory (the worktree's admin
+    dir) and ``common_dir`` the shared one. ``private_objects`` and
+    ``overlay_work`` are the issue's object overlay layers, ``cache`` the
+    persistent cache when the launch gets one
     (empty: its cache is inside the private home), ``read_context`` the
     launch's read context, ``controller_config`` the directory #165's
     overrides point into. ``home`` is the operator's home and
@@ -286,22 +277,6 @@ def sandbox_request(
         )
         if facts.read_context:
             engine(facts.read_context, read_only, "the read context")
-    elif kind in (LaunchClass.LOCAL_AGENT, LaunchClass.LOCAL_VALIDATION):
-        engine(facts.workspace, writable, "the repository root", carve_out=False)
-        engine(facts.git_entry, read_only, "the root's .git", carve_out=False)
-        if facts.git_dir != facts.git_entry:
-            # A linked worktree: its admin dir, carved out of the masked
-            # ``<common>/worktrees``.
-            engine(facts.git_dir, read_only, "the checkout's git dir")
-        if common not in (facts.git_entry, facts.git_dir):
-            engine(common, read_only, "the git common dir")
-        for path in (
-            posixpath.join(facts.git_dir, "autoforge"),
-            posixpath.join(common, "autoforge"),
-            posixpath.join(common, "worktrees"),
-        ):
-            if path not in masks:
-                masks.append(path)
     else:
         engine(facts.workspace, writable, "the exported tree", carve_out=False)
     if facts.cache and kind is not LaunchClass.EXPORT_COMMAND:
@@ -314,7 +289,7 @@ def sandbox_request(
             carve_out=False,
         )
 
-    agent = kind in (LaunchClass.REMOTE_AGENT, LaunchClass.LOCAL_AGENT)
+    agent = kind is LaunchClass.REMOTE_AGENT
     declared = _declared(needs if agent else None, facts.operator_paths, facts.home)
     projections += declared.projections
     network = NetworkPosition.HOST if agent else facts.network
@@ -707,18 +682,15 @@ def summary_facts(
     )
     if launch_class is LaunchClass.EXPORT_COMMAND:
         return facts
-    if launch_class is LaunchClass.REMOTE_AGENT:
-        return dataclasses.replace(
-            facts,
-            git_entry=posixpath.join(role("workspace"), ".git"),
-            git_dir=role("admin-dir"),
-            common_dir=role("common-dir"),
-            private_objects=role("private-objects"),
-            overlay_work=role("overlay-work"),
-            read_context=role("read-context"),
-        )
-    entry = posixpath.join(role("workspace"), ".git")
-    return dataclasses.replace(facts, git_entry=entry, git_dir=entry, common_dir=entry)
+    return dataclasses.replace(
+        facts,
+        git_entry=posixpath.join(role("workspace"), ".git"),
+        git_dir=role("admin-dir"),
+        common_dir=role("common-dir"),
+        private_objects=role("private-objects"),
+        overlay_work=role("overlay-work"),
+        read_context=role("read-context"),
+    )
 
 
 def class_summary(facts: LaunchFacts) -> str:
@@ -746,7 +718,7 @@ def class_summary(facts: LaunchFacts) -> str:
             f"overlay: {overlay.label or _shown(overlay.lower)}, its writes landing in "
             f"{_shown(overlay.upper)}"
         )
-    if facts.launch_class in (LaunchClass.REMOTE_AGENT, LaunchClass.LOCAL_AGENT):
+    if facts.launch_class is LaunchClass.REMOTE_AGENT:
         parts.append(
             "the provider's executable, install roots, configuration and model credential "
             "as its adapter declares them"
@@ -787,23 +759,17 @@ def template_facts(
     launch_class: LaunchClass,
     network: NetworkPosition,
     *,
-    separate_git_dir: bool = False,
-    linked: bool = False,
     operator_paths: tuple[str, ...] = (),
 ) -> LaunchFacts:
     """A repository-defined command's facts with every concrete path a role name.
 
     The role-level inputs the engine passes the compiler for a validator
-    (ADR 0006 D8.1), before any path is bound: the export or the repository
-    root is ``candidate-root``, and so on, and every denied root is one
+    (ADR 0006 D8.1), before any path is bound: the export is
+    ``candidate-root``, and so on, and every denied root is one
     ``denied-roots`` role, since how many worktrees are registered is not a
-    fact of the policy. For LOCAL validation, ``separate_git_dir`` says the
-    root's ``.git`` is a file naming the git directory and ``linked`` that
-    the checkout is a linked worktree with a common dir of its own: the
-    layout decides which of them §2.5 projects, never where they are.
-    ``operator_paths`` (``sandbox.read_only_paths``, D15.4) are
-    configuration, not paths of the launch: they are in the template as
-    configured.
+    fact of the policy. ``operator_paths`` (``sandbox.read_only_paths``,
+    D15.4) are configuration, not paths of the launch: they are in the
+    template as configured. Only the export command has a template.
     """
     workspace = role("candidate-root")
     facts = LaunchFacts(
@@ -816,19 +782,9 @@ def template_facts(
         network=network,
         operator_paths=operator_paths,
     )
-    if launch_class is LaunchClass.EXPORT_COMMAND:
-        return facts
-    if launch_class is not LaunchClass.LOCAL_VALIDATION:
+    if launch_class is not LaunchClass.EXPORT_COMMAND:
         raise ValueError(f"no policy template for the {launch_class.value}")
-    entry = posixpath.join(workspace, ".git")
-    git_dir = role("git-dir") if separate_git_dir or linked else entry
-    return dataclasses.replace(
-        facts,
-        git_entry=entry,
-        git_dir=git_dir,
-        common_dir=role("common-dir") if linked else git_dir,
-        cache=role("cache"),
-    )
+    return facts
 
 
 def launch_template(facts: LaunchFacts) -> dict:

@@ -245,11 +245,9 @@ def sdk_launch_allowlist(
 
 # -- configuration and session roots (ADR 0007 D2.7; ADR 0005 C5, D8.3, D8.4) --
 # Under the issue's controller-owned sandbox directory
-# (``<git common dir>/autoforge/sandbox/<worktree>`` in REMOTE,
-# ``<git dir>/autoforge/sandbox/local`` in LOCAL; ``sandbox_policy``), so a
-# root is never inside a working tree, the LOCAL fingerprinted tree
-# included (its git directory is excluded by identity), is per issue, and
-# persists for a continuation on the same directory (D8.4).
+# (``<git common dir>/autoforge/sandbox/<worktree>``; ``sandbox_policy``), so
+# a root is never inside a working tree, is per issue, and persists for a
+# continuation on the same directory (D8.4).
 SDK_ROOT_DIR = "sdk"
 # How many days a dedicated root keeps a session transcript (Claude's
 # ``cleanupPeriodDays``); a continuation whose transcript is gone is

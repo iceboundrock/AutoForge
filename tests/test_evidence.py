@@ -29,11 +29,9 @@ from autoforge.evidence import (
     MAX_DEFINITIONS,
     MAX_RECORDS,
     MAX_TAIL_CHARS,
-    METHOD_IN_PLACE,
     NO_SANDBOX_TEMPLATE,
     Definition,
     EvidenceFields,
-    LocalCandidate,
     Outcome,
     Policy,
     PrHeadProvenance,
@@ -92,8 +90,37 @@ def remote(commit: str = COMMIT, tree: str = TREE, provenance=None) -> RemoteCan
     )
 
 
-def local(fingerprint: str = FINGERPRINT) -> LocalCandidate:
-    return LocalCandidate(fingerprint, WORKSPACE_POLICY, RUN)
+# -- the LOCAL shapes a protocol-12 file could hold (ADR 0009 D6, D8) ---------------
+# The code that wrote them is removed, so they are built by hand, as
+# ``git show 7df9917:src/autoforge/evidence.py`` wrote them: the ``local``
+# candidate, the workspace record variant (the REMOTE record's keys plus the
+# fingerprints of the walks before and after the run) and its marker.
+
+
+def local_candidate(fingerprint: str = FINGERPRINT) -> dict:
+    return {
+        "kind": "local",
+        "fingerprint": fingerprint,
+        "workspace_policy_digest": WORKSPACE_POLICY,
+        "run_id": RUN,
+    }
+
+
+def workspace_record(seq: int = 1, **kw) -> dict:
+    """A workspace-variant ValidationRecord, digested as LOCAL digested one."""
+    rec = record(seq, pol=policy(method="in-place"), **kw)
+    rec["candidate"] = local_candidate()
+    rec["start_fingerprint"] = FINGERPRINT
+    rec["end_fingerprint"] = FINGERPRINT
+    return redigest(rec)
+
+
+def workspace_marker() -> dict:
+    """A workspace-variant attempt marker: the candidate and its start fingerprint."""
+    raw = marker(pol=policy(method="in-place"))
+    raw["candidate"] = local_candidate()
+    raw["start_fingerprint"] = FINGERPRINT
+    return raw
 
 
 def policy(**over) -> Policy:
@@ -129,15 +156,13 @@ DEF1 = Definition(1, ("ruff", "check"))
 
 def record(seq: int = 1, *, candidate=None, definition=DEF0, pol=None, run_log=RUN_LOG, **kw):
     res = kw.pop("res", None) or result(**kw)
-    cand = candidate or remote()
     return observed_record(
         seq=seq,
-        candidate=cand,
+        candidate=candidate or remote(),
         definition=definition,
         policy=pol or policy(),
         result=res,
         run_log=run_log,
-        end_fingerprint=FINGERPRINT if isinstance(cand, LocalCandidate) else "",
     )
 
 
@@ -151,10 +176,9 @@ def marker(candidate=None, definition=DEF0, pol=None, run_log=RUN_LOG) -> dict:
     )
 
 
-def check(records=(), *, is_local: bool = False, **fields):
+def check(records=(), **fields):
     return check_evidence(
         EvidenceFields(validation_records=list(records), **fields),
-        local=is_local,
         repository=REPO,
         run_id=RUN,
     )
@@ -273,20 +297,20 @@ def test_the_disabled_template_is_the_fixed_no_sandbox_one():
     assert policy(mode="required").requires_enforcement
 
 
-def test_preferred_requires_enforcement_except_where_it_may_fall_back():
-    """ADR 0005 D12.2: REMOTE's ``preferred`` refuses as ``required`` does, so its
-    evidence must be enforced; LOCAL's (the in-place method) may fall back, and
-    its records say ``enforced: false``."""
+def test_preferred_requires_enforcement_as_required_does():
+    """ADR 0005 D12.2, ADR 0009 D7: ``preferred`` refuses as ``required`` does,
+    whatever the method, so its evidence must be enforced. The two modes stay
+    two policies."""
     assert policy(mode="preferred").requires_enforcement
-    assert not policy(mode="preferred", method=METHOD_IN_PLACE).requires_enforcement
-    assert policy(mode="required", method=METHOD_IN_PLACE).requires_enforcement
+    assert policy(mode="preferred", method="in-place").requires_enforcement
+    assert policy(mode="required", method="in-place").requires_enforcement
     assert policy(mode="preferred").digest != policy(mode="required").digest
 
 
-@pytest.mark.parametrize("launch_class", [LaunchClass.EXPORT_COMMAND, LaunchClass.LOCAL_VALIDATION])
-def test_the_template_is_the_concrete_request_with_every_path_a_role(tmp_path, launch_class):
+def test_the_template_is_the_concrete_request_with_every_path_a_role(tmp_path):
     """Two concrete launches, in two directories, are one template once their
     paths are spelled as roles; the template itself names no concrete path."""
+    launch_class = LaunchClass.EXPORT_COMMAND
     template = launch_template(template_facts(launch_class, NetworkPosition.HOST))
     for name in ("one", "two"):
         root = tmp_path / name
@@ -305,11 +329,6 @@ def test_the_template_is_the_concrete_request_with_every_path_a_role(tmp_path, l
             controller_config=paths["/@controller-config"],
             denied_roots=(paths["/@denied-roots"],),
         )
-        if launch_class is LaunchClass.LOCAL_VALIDATION:
-            entry = paths["/@candidate-root"] + "/.git"
-            facts = replace(
-                facts, git_entry=entry, git_dir=entry, common_dir=entry, cache=paths["/@cache"]
-            )
         text = json.dumps(launch_template(facts))
         for role, concrete in sorted(paths.items(), key=lambda kv: -len(kv[1])):
             text = text.replace(concrete, role)
@@ -317,14 +336,10 @@ def test_the_template_is_the_concrete_request_with_every_path_a_role(tmp_path, l
     assert str(tmp_path) not in json.dumps(template)
 
 
-def test_the_template_changes_with_the_network_class_and_git_layout():
+def test_the_template_changes_with_the_network_and_only_the_export_command_has_one():
     host = launch_template(template_facts(LaunchClass.EXPORT_COMMAND, NetworkPosition.HOST))
     isolated = launch_template(template_facts(LaunchClass.EXPORT_COMMAND, NetworkPosition.ISOLATED))
-    plain = launch_template(template_facts(LaunchClass.LOCAL_VALIDATION, NetworkPosition.HOST))
-    linked = launch_template(
-        template_facts(LaunchClass.LOCAL_VALIDATION, NetworkPosition.HOST, linked=True)
-    )
-    assert len({json.dumps(t, sort_keys=True) for t in (host, isolated, plain, linked)}) == 4
+    assert json.dumps(host, sort_keys=True) != json.dumps(isolated, sort_keys=True)
     with pytest.raises(ValueError, match="no policy template"):
         template_facts(LaunchClass.REMOTE_AGENT, NetworkPosition.HOST)
 
@@ -385,12 +400,10 @@ def test_identity_excludes_provenance():
     assert RemoteCandidate("Owner/Repo", "sha1", COMMIT, TREE, a.provenance).identity == a.identity
 
 
-def test_a_local_record_carries_its_start_and_end_fingerprints():
-    rec = record(candidate=local())
-    assert rec["start_fingerprint"] == FINGERPRINT and rec["end_fingerprint"] == FINGERPRINT
-    rec["start_fingerprint"] = "e" * 64
-    with pytest.raises(StateError, match="start_fingerprint"):
-        parse_record(redigest(rec))
+def test_a_record_carries_no_workspace_fingerprint():
+    rec = record()
+    assert "start_fingerprint" not in rec and "end_fingerprint" not in rec
+    assert not hasattr(parse_record(rec), "end_fingerprint")
 
 
 def test_a_record_edited_by_hand_fails_its_digest():
@@ -442,9 +455,47 @@ def test_a_mixed_candidate_is_refused():
     raw = remote().to_dict() | {"fingerprint": FINGERPRINT}
     with pytest.raises(StateError, match="unknown key"):
         parse_candidate(raw)
-    raw = local().to_dict() | {"commit": COMMIT}
-    with pytest.raises(StateError, match="unknown key"):
-        parse_candidate(raw)
+
+
+# -- the LOCAL kinds are unknown kinds (ADR 0009 D6, D8; ADR 0006 D2.7) ---------------
+
+
+def test_a_local_candidate_is_refused_as_an_unknown_kind():
+    with pytest.raises(StateError, match=r"candidate\.kind must be 'remote', got 'local'"):
+        parse_candidate(local_candidate())
+    with pytest.raises(StateError, match="must be 'remote'"):
+        parse_candidate(local_candidate() | {"commit": COMMIT})
+
+
+def test_a_workspace_variant_record_is_refused():
+    """The record LOCAL wrote, whole and digested: its fingerprint keys are not a
+    record's, and without them its candidate is still of an unknown kind."""
+    rec = workspace_record()
+    with pytest.raises(StateError, match="unknown key.*end_fingerprint.*start_fingerprint"):
+        parse_record(rec)
+    del rec["start_fingerprint"], rec["end_fingerprint"]
+    with pytest.raises(StateError, match="candidate.kind must be 'remote', got 'local'"):
+        parse_record(redigest(rec))
+
+
+def test_a_workspace_variant_marker_is_refused():
+    raw = workspace_marker()
+    with pytest.raises(StateError, match="unknown key.*start_fingerprint"):
+        parse_marker(raw)
+    del raw["start_fingerprint"]
+    with pytest.raises(StateError, match="candidate.kind must be 'remote', got 'local'"):
+        parse_marker(raw)
+
+
+def test_evidence_naming_a_workspace_record_is_refused_whole():
+    """In a REMOTE state's validation fields: the records, the marker and a
+    record beside a valid one are each refused, never skipped."""
+    with pytest.raises(StateError, match="end_fingerprint"):
+        check([workspace_record()])
+    with pytest.raises(StateError, match="end_fingerprint"):
+        check([record(1), workspace_record(2)])
+    with pytest.raises(StateError, match="start_fingerprint"):
+        check(validation_attempt=workspace_marker())
 
 
 def test_a_sha256_candidate_round_trips():
@@ -605,13 +656,6 @@ def test_an_interrupted_record_is_built_from_the_marker_alone():
     assert "no launch claimed" in record_summary(view)
 
 
-def test_a_local_marker_carries_its_start_fingerprint():
-    raw = marker(candidate=local())
-    assert parse_marker(raw).candidate == local()
-    rec = interrupted_record(seq=1, marker=raw, recovered_at=FINISHED)
-    assert rec["start_fingerprint"] == FINGERPRINT and "end_fingerprint" not in rec
-
-
 def test_an_interrupted_record_carrying_observations_is_refused():
     rec = interrupted_record(seq=1, marker=marker(), recovered_at=FINISHED)
     rec["exit_code"] = 0
@@ -753,9 +797,8 @@ def _certificate(records, **over) -> dict:
     return cert
 
 
-def test_empty_evidence_is_valid_in_both_modes():
+def test_empty_evidence_is_valid():
     assert check() == []
-    assert check(is_local=True) == []
 
 
 def test_records_load_in_increasing_seq_only():
@@ -767,18 +810,10 @@ def test_records_load_in_increasing_seq_only():
         check([one, one])
 
 
-def test_a_record_of_the_other_mode_repository_or_run_is_refused():
-    with pytest.raises(StateError, match="local candidate in a REMOTE run"):
-        check([record(candidate=local())])
-    with pytest.raises(StateError, match="remote candidate in a LOCAL run"):
-        check([record()], is_local=True)
+def test_a_record_of_another_repository_or_run_is_refused():
     foreign = RemoteCandidate("other/repo", "sha1", COMMIT, TREE, WorktreeProvenance(7, "7", True))
     with pytest.raises(StateError, match="names repository"):
         check([record(candidate=foreign)])
-    with pytest.raises(StateError, match="names run"):
-        check(
-            [record(candidate=LocalCandidate(FINGERPRINT, WORKSPACE_POLICY, "af-2"))], is_local=True
-        )
     with pytest.raises(StateError, match="this run's log directory"):
         check([record(run_log="af-2/0001-review-validation-1")])
 
@@ -921,26 +956,43 @@ def test_a_certificate_marker_key_round_must_be_an_integer(review_round, stored,
         check([one], review_certificate=cert)
 
 
-def test_a_local_certificate_names_the_reviewed_fingerprint():
-    one = record(1, candidate=local())
+def local_certificate(record_: dict | None = None) -> dict:
+    """A ``local`` certificate as LOCAL issued one (the removed ``local_certificate``)."""
+    one = record_ or workspace_record()
     cert = {
         "schema": 1,
         "kind": "local",
-        "candidate": local().to_dict(),
+        "candidate": local_candidate(),
         "review_round": 1,
-        "records": [{"seq": 1, "digest": one["digest"]}],
+        "records": [{"seq": one["seq"], "digest": one["digest"]}],
         "validation_set_digest": set_digest([DEF0.digest]),
-        "policy_digest": policy().digest,
+        "policy_digest": policy(method="in-place").digest,
         "clean": {"needs_fix_round": False, "actionable_findings": 0},
         "issued_at": FINISHED,
         "reviewed_workspace_fingerprint": FINGERPRINT,
     }
     cert["digest"] = ev.certificate_digest(cert)
-    check([one], is_local=True, review_certificate=cert)
-    cert["reviewed_workspace_fingerprint"] = "e" * 64
-    cert["digest"] = ev.certificate_digest(cert)
-    with pytest.raises(StateError, match="differs from the candidate's"):
-        check([one], is_local=True, review_certificate=cert)
+    return cert
+
+
+def test_a_local_certificate_is_refused_as_an_unknown_kind():
+    """ADR 0009 D6: whatever it names, a REMOTE record included, a ``local``
+    certificate does not load; nor does a REMOTE one relabelled ``local``."""
+    one = record(1)
+    with pytest.raises(StateError, match=r"review_certificate'\.kind must be 'remote'"):
+        check([one], review_certificate=local_certificate(one))
+    relabelled = _certificate([one], kind="local")
+    with pytest.raises(StateError, match=r"review_certificate'\.kind must be 'remote'"):
+        check([one], review_certificate=relabelled)
+    with pytest.raises(StateError, match="must be 'remote'"):
+        ev.check_certificate(local_certificate(one), check([one]), repository=REPO)
+
+
+def test_a_binding_naming_a_local_candidate_is_refused():
+    one = record(1)
+    bound = _binding([one]) | {"candidate": local_candidate()}
+    with pytest.raises(StateError, match="must be 'remote', got 'local'"):
+        check([one], review_evidence=bound)
 
 
 def test_the_failure_counter_names_a_retained_fail_or_timeout_of_its_commit():
@@ -955,8 +1007,6 @@ def test_the_failure_counter_names_a_retained_fail_or_timeout_of_its_commit():
         check([failed], producer_validation_failure=counter | {"candidate_commit": "e" * 40})
     with pytest.raises(StateError, match="must be in"):
         check([failed], producer_validation_failure=counter | {"count": 4})
-    with pytest.raises(StateError, match="must be empty for a LOCAL run"):
-        check(is_local=True, producer_validation_failure=counter)
 
 
 @pytest.mark.parametrize(("watermark", "ok"), [(0, True), (2, True), (3, False), (-1, False)])
@@ -967,11 +1017,6 @@ def test_the_override_watermark_is_between_zero_and_the_highest_seq(watermark, o
     else:
         with pytest.raises(StateError, match="validation_override_seq"):
             check(records, validation_override_seq=watermark)
-
-
-def test_a_local_run_has_no_watermark():
-    with pytest.raises(StateError, match="LOCAL has no unblock"):
-        check(is_local=True, validation_override_seq=0)
 
 
 # -- retention (D11.4) -----------------------------------------------------------------
@@ -1066,34 +1111,6 @@ def test_eligibility_is_applicability_first_and_never_provenance():
     assert ev.eligible(view, remote(provenance=PrHeadProvenance(PR)), DEF0, policy(), None)
     interrupted = parse_record(interrupted_record(seq=2, marker=marker(), recovered_at=FINISHED))
     assert not ev.eligible(interrupted, remote(), DEF0, policy(), None)
-
-
-def test_a_local_pass_is_evidence_only_for_a_tree_it_ended_on():
-    """D7.2: a passing command that moved the tree passed on a tree that is gone."""
-    stayed = record(1, candidate=local())
-    moved = observed_record(
-        seq=2,
-        candidate=local(),
-        definition=DEF0,
-        policy=policy(),
-        result=result(),
-        run_log=RUN_LOG,
-        end_fingerprint="e" * 64,
-    )
-    moved_fail = observed_record(
-        seq=3,
-        candidate=local(),
-        definition=DEF0,
-        policy=policy(),
-        result=result(1),
-        run_log=RUN_LOG,
-        end_fingerprint="e" * 64,
-    )
-    a, b, c = _views(stayed, moved, moved_fail)
-    assert ev.eligible(a, local(), DEF0, policy(), None)
-    assert not ev.eligible(b, local(), DEF0, policy(), None)
-    # A failure is final for the tree it started on, wherever it ended.
-    assert ev.eligible(c, local(), DEF0, policy(), None)
 
 
 def test_the_newest_eligible_record_is_the_one_reused():
@@ -1214,12 +1231,10 @@ def test_the_failure_counter_counts_one_phase_entry_up_to_the_bound():
     assert counter["count"] == ev.MAX_FAILURE_COUNT
 
 
-def test_the_failure_counter_names_a_remote_failure_only():
+def test_the_failure_counter_names_a_failure_only():
     (passed,) = _views(record(1))
-    (local_fail,) = _views(record(2, exit_code=1, candidate=local()))
-    for view in (passed, local_fail):
-        with pytest.raises(ValueError, match="REMOTE FAIL or TIMEOUT"):
-            ev.failure_counter("FIX", {}, view)
+    with pytest.raises(ValueError, match="REMOTE FAIL or TIMEOUT"):
+        ev.failure_counter("FIX", {}, passed)
 
 
 # -- a narrower run never stands for the full one (ADR 0010, #342) ---------------------

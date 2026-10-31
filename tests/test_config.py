@@ -285,7 +285,7 @@ def test_the_sandbox_is_disabled_by_default(tmp_path):
     cfg = default_config().sandbox
     assert (cfg.mode, cfg.validation_network, cfg.premerge_network) == ("disabled", "host", "host")
     assert not cfg.enabled and cfg.read_only_paths == []
-    assert not cfg.refuses_unenforced(local=True) and not cfg.refuses_unenforced(local=False)
+    assert not cfg.refuses_unenforced()
 
 
 @pytest.mark.parametrize(
@@ -308,18 +308,18 @@ def test_the_sandbox_section_is_read(tmp_path, name, text):
     p.write_text(text, encoding="utf-8")
     cfg = load_config_file(p).sandbox
     assert cfg.mode == "required" and cfg.enabled
-    assert cfg.refuses_unenforced(local=True) and cfg.refuses_unenforced(local=False)
+    assert cfg.refuses_unenforced()
     assert (cfg.validation_network, cfg.premerge_network) == ("isolated", "isolated")
 
 
-def test_preferred_falls_back_in_local_only(tmp_path):
-    """ADR 0005 D12.2: REMOTE's ``preferred`` refuses exactly as ``required`` does."""
+def test_preferred_refuses_unenforced_exactly_as_required_does(tmp_path):
+    """ADR 0005 D12.2, ADR 0009 D7: ``preferred`` refuses exactly as
+    ``required`` does; its fallback was LOCAL's alone and went with it."""
     p = tmp_path / "cfg.yaml"
     p.write_text("version: 1\nsandbox:\n  mode: preferred\n", encoding="utf-8")
     cfg = load_config_file(p).sandbox
     assert cfg.mode == "preferred" and cfg.enabled
-    assert not cfg.refuses_unenforced(local=True)
-    assert cfg.refuses_unenforced(local=False)
+    assert cfg.refuses_unenforced()
 
 
 def _read_only_paths(tmp_path, monkeypatch, paths, **env):
@@ -793,10 +793,9 @@ def test_known_key_tables_name_real_fields(keys, config_cls):
 
     names = {f.name for f in fields(config_cls)}
     assert set(keys) <= names, set(keys) - names
-    # Fields the loader deliberately does not read from the file. `local` is
-    # LocalConfig at its defaults, which no file sets since its key went
-    # (ADR 0009 D5, #387) and which goes with the LOCAL code (#388).
-    derived = {"allow_merge_source", "name", "local"}
+    # Fields the loader deliberately does not read from the file. `local`
+    # is not one: LocalConfig went with the LOCAL code (ADR 0009, #388).
+    derived = {"allow_merge_source", "name"}
     assert names - set(keys) <= derived, names - set(keys) - derived
 
 
@@ -1507,13 +1506,15 @@ def test_a_local_block_of_any_shape_is_an_unknown_top_level_key(tmp_path, name, 
     assert "must be a mapping" not in message
 
 
-def test_local_defaults_are_the_documented_ones():
-    local = default_config().local
-    assert local.max_fix_rounds == 1
-    assert local.validation_commands == []
-    assert local.exclude == []
-    assert local.max_workspace_entries == 50_000
-    assert local.max_workspace_bytes == 512 * 1024 * 1024
+def test_the_configuration_has_no_local_section():
+    """LocalConfig is gone with the LOCAL code (ADR 0009 A.1, #388): the
+    configuration has no ``local`` attribute for any code to read."""
+    from dataclasses import fields
+
+    cfg = default_config()
+    assert "local" not in {f.name for f in fields(type(cfg))}
+    assert not hasattr(cfg, "local")
+    assert not hasattr(config, "LocalConfig")
 
 
 # -- safety.required_checks (issue #41) -------------------------------------------------

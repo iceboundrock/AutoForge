@@ -24,6 +24,11 @@
   projections, cross-provider parity). The number is assigned when the
   record merges: if another ADR merges first, this record takes the next
   free number, and its index entries move with it.
+- **Superseded in part by:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md), which removed LOCAL
+  mode (#388): §1.3 and §2.3 to §2.6 (the LOCAL launch classes, the
+  resource table's LOCAL column, the shared cache), §2.8, §2.9, D12.3,
+  D12.4 and §2.13 to §2.15, for LOCAL. D12.2's fallback is replaced by
+  ADR 0009 D7: `preferred` means `required`.
 - **Decides:** #166, for EPIC #158 (Wave 2A).
 - **Where:** placement is decided in §2.13. Existing code this record
   builds on: `src/autoforge/executor.py`, `executor_duplex.py`,

@@ -128,7 +128,7 @@ def test_the_import_scan_reads_every_spelling_of_an_import(tmp_path):
     (tests / "test_a.py").write_text(
         "from autoforge import evidence as ev\n"
         "import autoforge.state\n"
-        "from .local_helpers import thing\n"
+        "from .epic_cli import thing\n"
         "from tests.pi_fake import PiFake\n"
         "import os\n"
         "def test_x():\n"
@@ -139,7 +139,7 @@ def test_the_import_scan_reads_every_spelling_of_an_import(tmp_path):
     found = ft.importers(tmp_path)
     assert found["autoforge.evidence"] == {"test_a", "test_b"}
     assert found["autoforge.state"] == found["autoforge.config"] == {"test_a"}
-    assert found["tests.local_helpers"] == found["tests.pi_fake"] == {"test_a"}
+    assert found["tests.epic_cli"] == found["tests.pi_fake"] == {"test_a"}
     assert "os" not in found
 
 

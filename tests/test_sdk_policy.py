@@ -31,7 +31,6 @@ from autoforge.config import (
 )
 from autoforge.errors import ConfigurationError, InteractionDataError
 from autoforge.executor import ExecutionRequest, execute
-from autoforge.local_workspace import LocalWorkspace
 from autoforge.providers import (
     AgentRequest,
     ClaudeSdkProvider,
@@ -39,7 +38,7 @@ from autoforge.providers import (
     provider_for,
 )
 from autoforge.redaction import MAX_GROWTH_FACTOR, redact
-from autoforge.sandbox_policy import LOCAL_SANDBOX_KEY, SANDBOX_DIR, AuthMode
+from autoforge.sandbox_policy import SANDBOX_DIR, AuthMode
 from autoforge.sdk_policy import (
     ASK,
     CLAUDE_SDK_DENIED_TOOLS,
@@ -542,20 +541,6 @@ def _write_everywhere(paths) -> None:
     for path in paths:
         path.mkdir(parents=True, exist_ok=True)
         (path / "session.jsonl").write_text('{"synthetic": true}\n', encoding="utf-8")
-
-
-def test_roots_never_change_the_local_fingerprint(tmp_path):
-    workdir = git_repo(tmp_path / "repo")
-    (workdir / "tracked.txt").write_text("x\n", encoding="utf-8")
-    workspace = LocalWorkspace(workdir=workdir)
-    before = workspace.snapshot().fingerprint
-    git_dir = workspace.git_dirs()[0]
-    sandbox = git_dir / SANDBOX_DIR / LOCAL_SANDBOX_KEY
-    claude, opencode = ClaudeSdkRoots.under(sandbox), OpenCodeSdkRoots.under(sandbox)
-    _write_everywhere([*claude.writable(), *opencode.writable(), opencode.empty_config])
-    assert LocalWorkspace(workdir=workdir).snapshot().fingerprint == before
-    for root in (*claude.writable(), *opencode.writable()):
-        assert root_inside(root, git_dir)
 
 
 def test_remote_roots_are_outside_the_issue_worktree(tmp_path):

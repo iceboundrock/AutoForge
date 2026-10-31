@@ -45,10 +45,9 @@ read it before adding tests for a listed area.
 
 - `ScriptedProvider` (`src/autoforge/providers.py`) handlers stand in for
   every agent call and do what the real agent would (commit, push a fix,
-  answer with a result); `ExplodingGitHub` fails a test if LOCAL mode
-  reaches for GitHub.
-- `engine`, `fake_github`, `tmp_state_dir`, `repo` and `make_engine` /
-  `make_local_engine` build a controller against those fakes; `block(...)`
+  answer with a result).
+- `engine`, `fake_github`, `tmp_state_dir`, `repo` and `make_engine`
+  build a controller against those fakes; `block(...)`
   builds a well-formed `CONTROL_RESULT` block. A `make_engine` engine never
   sleeps: a read-back waiting for GitHub to move a PR head after the
   controller's push (#403) records each pause in `eng.sleeps`, and
@@ -231,18 +230,13 @@ read it before adding tests for a listed area.
   `unloadable_state(kind, saved)` makes a state file that loads into one of
   `UNLOADABLE_STATES`: an unknown mode, an unknown label, invalid JSON and,
   since LOCAL was removed (#387), a LOCAL state.
-  #387 and #388 keep these tests passing unchanged, apart from the expected
-  protocol label and any row that names LOCAL.
+  They keep passing unchanged after the removal, with only the expected
+  protocol label moved to 13 (#388).
 - The shared coverage LOCAL's removal must not lose (ADR 0009 A.2.3, A.2.4,
-  D12 S1a; #386) is REMOTE or mode-neutral tests, each beside a LOCAL test
-  that stays until #387 or #388. Each docstring carries `ADR 0009 A.2.3
-  <row> (#386)` (or A.2.4) and the node id of the LOCAL test it replaces,
-  so that a grep for that id finds its replacement before the LOCAL test is
-  deleted. `tests/local_helpers.py` holds the scripted-run helpers other
-  modules imported from `tests/test_local.py` (`local_repo`,
-  `impl_result`, `review_result`, `finding`, `fix_result`, `scripted`,
-  `touch_impl`, `IMPL_FILE`); like `make_local_engine`, they build LOCAL
-  runs and go with LOCAL's code.
+  D12 S1a; #386) is REMOTE or mode-neutral tests. Each docstring carries
+  `ADR 0009 A.2.3 <row> (#386)` (or A.2.4) and the node id of the LOCAL
+  test it replaced. The LOCAL tests, their helpers and LOCAL's fixtures
+  went with LOCAL's code (#387, #388).
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.
@@ -278,9 +272,8 @@ GitHub client, pre-merge evidence     test_github.py, test_premerge.py
 byte-exact export and its proof       test_materialize.py (the merge gate's: test_premerge.py,
                                       test_engine.py)
 effect operations, git transport      test_effects.py, test_git_transport.py
-state, contract, filesystem boundary  test_state.py, test_durable_run_contract.py, test_safefs.py
-the controller's git reader           test_git_workspace.py (hardened reads; no config.local read
-                                      by engine.workspace() or a REMOTE run, ADR 0009 C1)
+state, filesystem boundary            test_state.py, test_state_root.py, test_safefs.py
+the controller's git reader           test_git_workspace.py (hardened reads)
 the shared coverage of LOCAL's        test_git_workspace.py (A), test_state_fuzz.py (B),
 removal (ADR 0009 S1a, #386)          test_state_root.py (C), test_findings_fence.py (D),
                                       test_doctor_sandbox.py, test_sandbox_routing.py,
@@ -296,9 +289,17 @@ LOCAL's ways in, closed (ADR 0009     test_cli.py (autoforge local, --help, a lo
 S2, #387)                             a LOCAL state under every label and in the lock's
                                       directory, no read of <git dir>/autoforge/state),
                                       test_config.py (the key),
-                                      test_state.py, test_local.py (the loader),
+                                      test_state.py (the loader),
                                       test_ownership.py, test_epic_commands.py (the scheduler,
                                       the epic commands' refusal of the key)
+protocol 13: LOCAL's state fields     test_state.py (the drop step, one refusal per field, a
+and evidence kinds removed (ADR 0009  protocol-13 or unlabelled file carrying one),
+S3, #388)                             test_cli.py (status --json carries none of them),
+                                      test_evidence.py, test_certificate.py,
+                                      test_review_certificate.py (LOCAL kinds refused as
+                                      unknown), test_local_removal.py (structural: no LOCAL
+                                      topology, launch class, mode or deleted module),
+                                      test_packaging.py (no local_*.md packaged)
 scheduler namespaces (#178)           test_run_namespace.py (RunKey, layout, binding, lookup,
                                       listing, archive, engine binding); the standalone
                                       state-dir refusal: test_cli.py
@@ -338,15 +339,15 @@ recovery (#183)                       JSON keys, stop, archive, dry run, --force
 REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.py; load and
                                       protocol: test_state.py)
 sandbox pin and config placement      test_sandbox_pin.py (strength, the record, the engine's
-(#280)                                refusal, opt-in log, strengthen and upgrade, REMOTE and
-                                      LOCAL; CLI: test_cli.py; load and protocol: test_state.py);
+(#280)                                refusal, opt-in log, strengthen and upgrade; CLI:
+                                      test_cli.py; load and protocol: test_state.py);
                                       the placement rule (the providers' writable
                                       directories included): test_sandbox_policy.py, doctor:
                                       test_doctor.py, worker: test_worker.py, real backend:
                                       test_sandbox_routing.py; the `..` spellings CLI and
                                       doctor share: conftest.dotdot_config_paths
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py
-                                      (engine, REMOTE and LOCAL; load and protocol: test_state.py)
+                                      (engine; load and protocol: test_state.py)
 candidate validation gates (#173)     test_validation_gates.py (producers, REVIEW entry,
                                       override, provider parity; REPLAN rejection:
                                       test_replan.py)
@@ -389,7 +390,6 @@ boundary alike; the gate and modes;   test_sandbox_parity.py; `make test-sandbox
 doctor's rows                         instead), test_engine_sandbox.py,
                                       test_sandbox_gate.py, test_doctor_sandbox.py,
                                       test_sandbox_host.py (the host measurement)
-LOCAL mode                            test_local*.py
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
 fast feedback targets and what keeps  test_fast_targets.py (the mapping, the selection, never a
 them from evidence (#342, ADR 0010)   gate, the default suite's options); test_evidence.py,
@@ -405,7 +405,8 @@ packaging, built artifacts (#256)     test_packaging.py (metadata, license, vers
                                       `make dist-check`, CI's `dist` job and the release build
                                       run); the PyPI workflow (#295): test_publish_workflow.py
 launch environment, no credential     test_child_env.py (engine and doctor: test_engine.py,
-                                      test_integration.py, test_local.py, test_doctor.py)
+                                      test_integration.py, test_validation_evidence.py,
+                                      test_doctor.py)
 agent read context                    test_read_context.py (collection: test_engine.py,
                                       test_integration.py)
 ```

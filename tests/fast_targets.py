@@ -138,7 +138,6 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/epic_graph.py": ("test_epic_commands", "test_epic_recovery"),
     "src/autoforge/executor_duplex.py": ("test_providers",),
     "src/autoforge/executor_supervised.py": ("test_scheduler", "test_worker"),
-    "src/autoforge/local_workspace.py": ("test_validation_gates",),
     "src/autoforge/loop_detect.py": ("test_claude_stream", "test_engine"),
     "src/autoforge/materialize.py": (
         "test_premerge",
@@ -151,7 +150,6 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/premerge.py": ("test_engine", "test_merge_certificate"),
     "src/autoforge/replan_txn.py": ("test_cli",),
     "src/autoforge/roadmap.py": ("test_engine",),
-    "src/autoforge/run_contract.py": ("test_local", "test_validation_evidence"),
     "src/autoforge/run_namespace.py": ("test_engine",),
     "src/autoforge/sandbox.py": ("test_sandbox_gate", "test_engine"),
     "src/autoforge/sandbox_bwrap.py": ("test_engine_sandbox",),
@@ -171,7 +169,6 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/epic_cli.py": ("test_epic_recovery",),
     "tests/fast_targets.py": (),
     "tests/live_pi.py": (),
-    "tests/local_helpers.py": (),
     "tests/operator_comment_fidelity.py": (),
     "tests/parallel_bench.py": (),
     "tests/pi_fake.py": (),

@@ -61,9 +61,8 @@ runtime state belonging to one operator.
   launch is **enforced** only when it actually ran inside it (its record
   says `enforced: true`). `disabled` is logical isolation only; `required`
   refuses a host that cannot enforce before anything of the step is saved
-  or launched; `preferred` falls back to logical isolation only in LOCAL,
-  visibly, and is `required` in REMOTE. Never describe a launch that fell
-  back, or one under `disabled`, as sandboxed.
+  or launched; `preferred` is kept as a name for `required` (ADR 0009 D7).
+  Never describe a launch under `disabled` as sandboxed.
 
 ### The code under work lives on a feature branch or a worktree
 
@@ -202,13 +201,14 @@ docs/agent-guides/
   secrets-and-logging.md               redaction and what may never be logged or committed
   testing.md                           testing requirements and high-priority coverage
 docs/adr/                              accepted design records (LOCAL mode workspace boundary,
+                                       superseded by ADR 0009 but for what it says of `safefs.py`,
                                        executor: nothing an agent starts outlives its invocation,
                                        Pi provider, authority boundary and typed external effects,
                                        outer sandbox and host-resource capability model,
                                        candidate validation evidence and review certificates,
                                        SDK providers: isolated helpers, interaction contract,
                                        parallel EPIC scheduler: authority, run identity, claims, locks;
-                                       removing LOCAL mode (policy accepted, not implemented):
+                                       removing LOCAL mode (implemented; #389 measures it):
                                        no compatibility, strict refusal, the protocol, sequencing;
                                        fast feedback and full validation: FAST is never evidence,
                                        the controller selects FULL, the coverage mapping)
@@ -272,11 +272,6 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   commands) or changing the repository lock, read
   `docs/adr/0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md`
   in addition to `state-and-recovery.md`.
-- If changing LOCAL mode (`autoforge local`, `local_workspace.py`,
-  `run_contract.py`, a LOCAL branch of shared code), read
-  `docs/adr/0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md`
-  first: LOCAL is being removed (EPIC #383), and that record decides what
-  a change to it may still do.
 - If changing `src/autoforge/result_parser.py`, a prompt template, the
   per-phase required result fields, or how the engine consumes a parsed
   result, read `docs/agent-guides/control-result-protocol.md`.

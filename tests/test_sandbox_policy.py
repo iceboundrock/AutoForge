@@ -110,26 +110,6 @@ def _remote(paths: dict[str, Path], *, cache: bool = True) -> LaunchFacts:
     )
 
 
-def _local(paths: dict[str, Path], kind: LaunchClass = LaunchClass.LOCAL_AGENT) -> LaunchFacts:
-    git_dir = paths["common"]
-    cache = git_dir / "autoforge" / "sandbox" / "local" / "cache"
-    cache.mkdir(parents=True)
-    state = git_dir / "autoforge" / "state"
-    state.mkdir(parents=True)
-    return LaunchFacts(
-        launch_class=kind,
-        workspace=str(paths["repo"]),
-        home=str(paths["home"]),
-        controller_env={},
-        git_entry=str(git_dir),
-        git_dir=str(git_dir),
-        common_dir=str(git_dir),
-        cache=str(cache),
-        controller_config=str(paths["config"]),
-        denied_roots=(str(state), str(git_dir / "autoforge"), str(paths["repo"] / ".autoforge")),
-    )
-
-
 def _mount(description: LaunchDescription, target: str):
     found = [m for m in description.mounts if m.target == target]
     assert found, f"nothing mounted at {target}"
@@ -173,28 +153,6 @@ def test_a_review_launch_has_no_persistent_cache(tmp_path):
     homes = [m for m in description.mounts if isinstance(m, PrivateTmpfs)]
     assert str(paths["home"]) in [m.target for m in homes]
     assert not any(m.target == str(paths["home"] / ".cache") for m in description.mounts)
-
-
-def test_a_local_launch_sees_its_git_dir_read_only_and_its_state_masked(tmp_path):
-    paths = _layout(tmp_path)
-    description = describe_launch(_local(paths), None, {})
-    root = _mount(description, str(paths["repo"]))
-    assert isinstance(root, Bind) and root.access is Access.WRITABLE
-    assert _mount(description, str(paths["common"])).access is Access.READ_ONLY
-    for masked in ("autoforge", "worktrees"):
-        assert isinstance(_mount(description, f"{paths['common']}/{masked}"), Mask)
-    assert not any(isinstance(m, Overlay) for m in description.mounts)
-    # The issue worktrees and the LOCAL state are behind the mask.
-    assert description.inside_path(str(paths["worktree"])) is None
-    assert description.inside_path(str(paths["common"] / "autoforge" / "state")) is None
-    assert description.inside_path(str(paths["common"] / "HEAD")) is not None
-
-
-def test_a_local_validation_command_may_run_without_a_network(tmp_path):
-    paths = _layout(tmp_path)
-    facts = _local(paths, LaunchClass.LOCAL_VALIDATION)
-    facts = LaunchFacts(**{**facts.__dict__, "network": NetworkPosition.ISOLATED})
-    assert describe_launch(facts, None, {}).network is NetworkPosition.ISOLATED
 
 
 def test_an_agent_never_runs_without_a_network(tmp_path):
@@ -940,41 +898,14 @@ _DECLARED_WHAT = (
 )
 
 
-def test_a_declaration_makes_its_state_and_dir_rw_items_writable_and_nothing_else(tmp_path):
-    """What :func:`declared_writable` names is what :func:`sandbox_request`
-    projects read-write from the declaration: never a read-only file, an
-    ``env`` item or a keyring login."""
-    needs = ProviderRequirements(
-        config=("/opt/tool/conf",),
-        home_config=("/home/u/.tool/settings.json",),
-        state=("/srv/tool-state",),
-        auth=(
-            AuthItem(AuthMode.ENV, "TOOL_API_KEY"),
-            AuthItem(AuthMode.FILE_RO, "the tool login", "/home/u/.tool/login.json"),
-            AuthItem(AuthMode.DIR_RW, "the tool directory ($TOOL_DIR)", "/srv/tool"),
-            AuthItem(AuthMode.KEYRING, "the tool keyring login", "tool"),
-        ),
-    )
-    assert declared_writable(needs) == (
-        ("/srv/tool-state", "a state directory its provider declares (/srv/tool-state)"),
-        ("/srv/tool", "the tool directory ($TOOL_DIR)"),
-    )
-    request = sandbox_request(_local(_layout(tmp_path)), needs)
-    projected = [
-        p.source
-        for p in request.projections
-        if p.origin is Origin.DECLARED and p.access is Access.WRITABLE
-    ]
-    assert projected == [path for path, _ in declared_writable(needs)]
-
-
 @pytest.mark.parametrize("cache", [True, False], ids=["agent", "review"])
 def test_a_remote_agent_declaration_makes_its_state_and_dir_rw_items_writable_only(tmp_path, cache):
     """ADR 0009 A.2.3 F (#386): the REMOTE replacement of
-    test_sandbox_policy.py::test_a_declaration_makes_its_state_and_dir_rw_items_writable_and_nothing_else.
+    test_sandbox_policy.py::test_a_declaration_makes_its_state_and_dir_rw_items_writable_and_nothing_else,
+    deleted with LOCAL (#388).
 
-    The same on a REMOTE agent launch, with its cache and without it (a
-    REVIEW): what :func:`declared_writable` names is what
+    On a REMOTE agent launch, with its cache and without it (a REVIEW):
+    what :func:`declared_writable` names is what
     :func:`sandbox_request` projects read-write from the declaration, never
     a read-only file, an ``env`` item or a keyring login.
     """

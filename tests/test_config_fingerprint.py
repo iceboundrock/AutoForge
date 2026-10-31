@@ -45,8 +45,7 @@ from autoforge.profiles import REQUIRED_PROFILES
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.state import load_state
 
-from .conftest import FakeGitHub, make_engine, make_local_engine, write_feature
-from .local_helpers import local_repo
+from .conftest import FakeGitHub, make_engine
 
 ROOT = "/srv/worktrees"
 
@@ -592,14 +591,6 @@ def test_a_run_refuses_a_configuration_it_could_not_record_before_any_state(tmp_
     assert not eng.paths.state_file.exists()
 
 
-def test_a_local_run_does_not_hold_its_routing_to_the_record(tmp_path):
-    """A LOCAL run records no configuration, so nothing about it is bounded here."""
-    repo = local_repo(tmp_path)
-    eng = make_local_engine(repo, write_feature(repo))
-    eng.config.profiles["fix"].model = "m" * 513
-    eng.validate_config()
-
-
 def test_a_model_at_the_bound_is_recorded_and_the_run_loads_again(tmp_path):
     cfg = default_config()
     cfg.profiles["fix"].model = "m" * 512
@@ -644,20 +635,6 @@ def test_an_accepted_change_whose_config_path_could_not_be_recorded_logs_nothing
         later.check_run_configuration(("resume",), accept_change=True)
     assert eng.paths.state_file.read_bytes() == before
     assert _events(later) == []
-
-
-def test_a_local_run_records_and_checks_nothing(tmp_path):
-    """A LOCAL run is defined by its run contract; the provider and model are
-    dynamic there (:mod:`autoforge.run_contract`). Its sandbox mode is pinned
-    as a REMOTE run's is (#280, ``tests/test_sandbox_pin.py``)."""
-    repo = local_repo(tmp_path)
-    eng = make_local_engine(repo, write_feature(repo))
-    eng.record_run_configuration()
-    assert eng.state.config_fingerprint == {}
-    assert eng.state.sandbox_pin["mode"] == "disabled"
-    eng.config.profiles["fix"].model = "opus"
-    assert eng.check_run_configuration(("resume",)) == ""
-    assert eng.state.config_fingerprint == {}
 
 
 def test_the_schema_is_pinned():

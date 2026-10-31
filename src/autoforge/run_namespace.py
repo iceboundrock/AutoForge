@@ -20,8 +20,8 @@ own, found again from the repository alone after a crash:
         workers/          worker console logs (#182)
 
   The common dir is the anchor: every component below it is AutoForge's own
-  and is opened descriptor-relative with ``O_NOFOLLOW`` (``safefs``), as a
-  LOCAL run's state is (:class:`autoforge.state.StatePaths`). The issue's
+  and is opened descriptor-relative with ``O_NOFOLLOW`` (``safefs``,
+  :class:`autoforge.state.StatePaths`). The issue's
   worktree is not in the namespace: it keeps the engine's derivation
   (:meth:`autoforge.engine.ControllerEngine.issue_worktree_path`), so a
   worker reuses the worktree a standalone run made for the same issue.

@@ -4966,7 +4966,7 @@ def test_fix_no_change_requires_rationale(tmp_state_dir):
 # -- redaction at the persistence boundary (#81) -----------------------------------
 # REVIEW findings and FIX resolutions are agent-authored text that lands in
 # plain `state.json` and in `status --json`; the engine redacts them before
-# they are assigned to state, mirroring the LOCAL-mode test in test_local.py.
+# they are assigned to state.
 def test_remote_review_findings_with_a_credential_never_reach_state_or_the_pr(tmp_state_dir):
     """Since #162 a REMOTE finding is published in the round's comment, so a
     credential-shaped one is refused by the published-content policy before
@@ -9408,7 +9408,7 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     assert "posted by an agent under the previous contract" in call.prompt
     assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_issue_url == ISSUE3 and s.protocol_version == "12"
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "13"
     assert s.effect_records == []  # adopted with no record (D13.7)
 
 
