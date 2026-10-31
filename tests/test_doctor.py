@@ -9,6 +9,7 @@ import pytest
 import autoforge.doctor as doctor_module
 import autoforge.executor as executor_module
 from autoforge.doctor import Doctor
+from autoforge.errors import ExecutionError
 from autoforge.executor import ExecutionResult, execute
 from autoforge.github import GH_WORKDIR_PREFIX
 from autoforge.profiles import local_required_profiles
@@ -1217,6 +1218,41 @@ def test_a_repository_without_a_default_branch_fails_whatever_the_gate(tmp_path)
     check = _required_checks(tmp_path, default_branch="")
     assert check.label == "FAIL" and check.required
     assert check.detail == "owner/repo: GitHub reports no default branch"
+
+
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_a_gh_that_cannot_start_for_the_rules_read_is_unverified_not_skipped(tmp_path, gate_open):
+    """#259 review: `gh --version` answered, so 'gh available' passes, and then the
+    rules read cannot start `gh`. The rule is unverified, which with the merge gate
+    open is the FAIL any unread rule is; a SKIP would let doctor pass without it."""
+    healthy = _runner_factory()
+
+    def runner(req):
+        if req.command[:3] == ["gh", "repo", "view"]:
+            raise ExecutionError("failed to spawn gh repo view: [Errno 24] Too many open files")
+        return healthy(req)
+
+    d = Doctor(config_path=_gate_config(tmp_path, gate_open), cwd=str(tmp_path), runner=runner)
+    results = d.run_all()
+    rows = {r.name: r for r in results}
+    assert rows["gh available"].ok
+    check = rows["default branch requires checks"]
+    assert not check.ok
+    assert check.detail.startswith(
+        "gh could not be started (failed to spawn gh repo view: [Errno 24] Too many open "
+        "files); see the 'gh available' row"
+    )
+    if gate_open:
+        assert check.label == "FAIL" and check.required and not check.skipped
+        assert "with safety.allow_merge=true the merge gate would merge without" in check.detail
+        assert "make gh runnable" in check.detail
+    else:
+        assert check.label == "SKIP" and check.skipped
+        assert check.detail.endswith(
+            "(the merge gate is closed, so no unattended merge relies on it)"
+        )
+    failed = [r.name for r in results if not r.ok and r.required]
+    assert failed == (["default branch requires checks"] if gate_open else [])
 
 
 def _gate_config(tmp_path, gate_open: bool) -> str:

@@ -447,25 +447,24 @@ class Doctor:
         runs vacuously green. The requirement lives in repository settings,
         outside version control, so this is the only place drift is caught.
 
-        Read-only. When the branch rules cannot be verified -- GitHub's
-        plan offers none on this repository (#289), the token may not read
-        them, GitHub reports the repository not found, or GitHub could not
-        be read at all (transient) -- nothing shows that the merge gate's
-        "every check succeeded" has a required check behind it. With the
-        configuration's half of the merge gate open (``safety.allow_merge:
-        true``) that is a FAIL; with it closed a SKIP that says why. A plan
-        limitation is named as one and never sent to the token's
-        permissions: no permission changes it. The same holds for a rule
-        whose bypass actors GitHub withholds (it returns them only with
-        write access to the ruleset) when it also does not say whether this
-        token may bypass it: whether the controller's own login can skip the
-        rule is then unverified. When GitHub does say that this token may
-        never bypass it, the hidden list is a SKIP either way: the required
-        checks were read and the controller cannot bypass them. A problem
-        that *is* visible (no rule, a missing context, a non-active ruleset,
-        a bypass actor) decides the row whatever stayed hidden: a FAIL with
-        the gate open and a WARN with it closed (#259,
-        :meth:`_required_checks_missing`). Never an unverified OK.
+        Read-only. When the branch rules cannot be verified -- GitHub's plan
+        offers none on this repository (#289), the token may not read them,
+        GitHub reports the repository not found, GitHub could not be read at all
+        (transient), or `gh` itself could not be started -- nothing shows that
+        the merge gate's "every check succeeded" has a required check behind it.
+        With the configuration's half of the merge gate open
+        (``safety.allow_merge: true``) that is a FAIL; with it closed a SKIP
+        that says why. A plan limitation is named as one and never sent to the
+        token's permissions: no permission changes it. The same holds for a rule
+        whose bypass actors GitHub withholds (it returns them only with write
+        access to the ruleset) when it also does not say whether this token may
+        bypass it: whether the controller's own login can skip the rule is then
+        unverified. When GitHub does say that this token may never bypass it,
+        the hidden list is a SKIP either way: the required checks were read and
+        the controller cannot bypass them. A problem that *is* visible (no rule,
+        a missing context, a non-active ruleset, a bypass actor) decides the row
+        whatever stayed hidden: a FAIL with the gate open and a WARN with it
+        closed (#259, :meth:`_required_checks_missing`). Never an unverified OK.
         """
         name = REQUIRED_CHECKS_ROW
         cfg = self.config
@@ -477,7 +476,12 @@ class Doctor:
         try:
             return self._required_checks(client, self.repo, cfg.safety.required_checks)
         except ExecutionError as exc:
-            return _gh_not_started(name, exc)
+            # Unverified like any other unread rule, whatever 'gh available'
+            # said: a `gh` that answered --version may still fail to start
+            # here, and an open gate must not pass on a SKIP (#259).
+            return self._required_checks_unverifiable(
+                _gh_not_started_text(exc), "make gh runnable (see the 'gh available' row)"
+            )
         except GitHubUnavailableError as exc:
             return self._required_checks_unverifiable(
                 f"GitHub could not be read (transient; run doctor again): {exc}",
@@ -1540,10 +1544,17 @@ def _gh_not_started(name: str, exc: ExecutionError) -> CheckResult:
     """A row that reads GitHub when `gh` itself could not be started (#259).
 
     A first `doctor` before `gh` is installed showed one line, `executable
-    not found: gh`, and no row at all. The row is skipped and the run goes on;
-    the 'gh available' row, required, already fails and says why.
+    not found: gh`, and no row at all. The row is skipped and the run goes on:
+    for the rows that use this, an unread answer is a SKIP whatever the merge
+    gate, and the 'gh available' row normally fails and says why. The
+    required-check row, which fails an unread answer with the gate open,
+    goes through :meth:`Doctor._required_checks_unverifiable` instead.
     """
-    return CheckResult.skip(name, f"gh could not be started ({exc}); see the 'gh available' row")
+    return CheckResult.skip(name, _gh_not_started_text(exc))
+
+
+def _gh_not_started_text(exc: ExecutionError) -> str:
+    return f"gh could not be started ({exc}); see the 'gh available' row"
 
 
 # The way out of an unverifiable required-check row, by cause (#289). A plan

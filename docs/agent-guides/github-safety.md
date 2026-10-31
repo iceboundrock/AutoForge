@@ -2137,6 +2137,9 @@ gate:
   reading classic protection, not found).
 - GitHub could not be read at all (a transient failure): nothing was
   verified; running doctor again answers it.
+- `gh` itself could not be started for the read (#259), even when the
+  earlier `gh available` row passed: nothing was read, so with the gate
+  open this is the same `FAIL`, never a `SKIP` that lets doctor pass.
 - GitHub returns a ruleset's `bypass_actors` only to a token with write
   access to it, and this answer withholds them *and* omits
   `current_user_can_bypass`: whether the controller's own login may skip

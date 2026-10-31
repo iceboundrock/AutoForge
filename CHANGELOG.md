@@ -30,7 +30,9 @@ so.
   own checks do not change.
 - `doctor` without `gh` installed printed `autoforge: error: executable not
   found: gh` and no row. It now prints every row: `gh available` fails, and
-  the rows that read GitHub are skipped.
+  the rows that read GitHub are skipped, except that "default branch
+  requires checks" fails with the merge gate open, as it does whenever it
+  cannot read the branch rules.
 - `doctor` no longer fails `agent 'claude' keeps integrations off` when
   Claude Code cut its `--help` short: 2.1.314 writes only part of it to a
   pipe, before the flags the row looks for. A help that ends mid-line is a
