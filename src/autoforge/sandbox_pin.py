@@ -78,7 +78,7 @@ from .errors import ConfigurationError, StateError
 #: schema whose parser also reads this one (see "The record" above).
 PIN_SCHEMA = 1
 
-#: How the pin came to be: ``created`` by ``run`` or ``local run``;
+#: How the pin came to be: ``created`` by ``run`` (or a scheduler's worker);
 #: ``upgraded`` by the first command that found a state file written before
 #: #280 without one; ``strengthened`` by a command under a stronger mode;
 #: ``accepted`` by an operator's ``--accept-config-change`` under a weaker one.

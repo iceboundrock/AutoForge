@@ -2,9 +2,8 @@
 
 How to drive an EPIC and its issues through AutoForge's GitHub workflow:
 the commands, where a run stops and what to do there, and how to recover.
-For the GitHub-free workflow see [Local mode](local-mode.md); for the config
-file see [Configuration](configuration.md). Installation and prerequisites
-are in the [README](../README.md#prerequisites).
+For the config file see [Configuration](configuration.md). Installation and
+prerequisites are in the [README](../README.md#prerequisites).
 
 The commands are written `uv run autoforge ...`, the form inside a
 development clone of AutoForge. With the command installed
@@ -261,8 +260,7 @@ awaits you also blocks the run, and so do FIX operator actions; see the next
 two sections. A push to the PR branch the controller did not make, before
 or after the fixer ran, is not a block: the PR goes back to `REVIEW` of the
 pushed HEAD; so does a PR retargeted to another base, or a base rewritten
-under its name, at any point of the phase. A LOCAL
-run cannot be unblocked. The decision table is in
+under its name, at any point of the phase. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
 
 ### BLOCKED on an acceptance action
@@ -328,9 +326,9 @@ changes nothing for that `FIX` step. A target must be an existing issue of
 the run's repository (open or closed), never a pull request. The text is at
 most 16000 characters, with no image and no raw HTML, and links only to
 `https://github.com/<the run's repository>/...`. A result may not mix
-`operator_acceptance` with `acceptance_action`. A LOCAL run and
-`safety.acceptance_actions: off` refuse the resolution (the fixer is told it
-is unavailable); `approve` and `auto` both offer it, and it always waits for
+`operator_acceptance` with `acceptance_action`.
+`safety.acceptance_actions: off` refuses the resolution (the fixer is told
+it is unavailable); `approve` and `auto` both offer it, and it always waits for
 you.
 
 The step blocks before anything else of the plan is sent: the follow-up
@@ -516,7 +514,7 @@ uv run autoforge epic archive https://github.com/owner/repo/issues/1 7
   state (`.autoforge/state.json`, or `state_dir`) is held until that run is
   `DONE`; finish it with `run`/`resume`. A standalone `run`, `step`,
   `resume` or `unblock` refuses an issue a scheduler namespace owns
-  (exit 2) until `epic archive` releases it. LOCAL runs are unaffected.
+  (exit 2) until `epic archive` releases it.
 
 ### `epic status`: one category per child
 
@@ -667,10 +665,10 @@ answer.
 
 ## Watching an agent run
 
-While an agent runs, `run`, `step` and `resume` (and `local run`) print live
-progress lines to **stderr**, and each step's outcome to stdout as soon as
-that step finishes, not after the whole loop. A progress line is prefixed
-with the time since the launch, the phase and, in a remote run, the issue:
+While an agent runs, `run`, `step` and `resume` print live progress lines
+to **stderr**, and each step's outcome to stdout as soon as that step
+finishes, not after the whole loop. A progress line is prefixed with the
+time since the launch, the phase and the issue:
 
 ```text
 [00:00:00 ANALYZE_EXECUTE #160] launching analyze_execute (claude, model fable, effort high), idle timeout 900s, max runtime unset, loop detection kill, attempt 1, worktree /repo/.git/autoforge/worktrees/160, log .autoforge/logs/<run-id>/001-analyze_execute-1
@@ -882,7 +880,7 @@ but anything else has more than one reading:
 
 `execution.command_timeout_seconds` (default 1800) is not an agent limit:
 it bounds only the commands the controller runs itself
-(`validation.commands`, the pre-merge and LOCAL validation commands), and
+(`validation.commands` and the pre-merge commands), and
 how long a GitHub CI run took says nothing about either. Whatever the
 cause, a higher idle timeout also lets a hung agent hang that much longer,
 so raise it only on the profiles that need it, and set
@@ -966,13 +964,9 @@ redacted. What it reads depends on the command:
 - `run --dry-run` previews a new run and launches no subprocess: no `git`,
   no `gh`.
 - `step --dry-run` and `resume --dry-run` preview the existing run and make
-  no `gh` call. Without `--state-dir` they first run two read-only
-  `git rev-parse` calls to find which run is meant, a remote one under
-  `.autoforge/` or a local one in the git directory; `--state-dir` skips
-  that lookup.
-- `unblock --dry-run` does the same lookup, then reads GitHub to report the
-  decision it would make (with `--approve-action`, `--decline-action` or
-  `--bind-evidence` too).
+  no `gh` call.
+- `unblock --dry-run` reads GitHub to report the decision it would make
+  (with `--approve-action`, `--decline-action` or `--bind-evidence` too).
 
 ## Where things live
 
@@ -997,10 +991,10 @@ redacted. What it reads depends on the command:
 - **Scheduler namespaces:** `<repo>/.git/autoforge/scheduler/` belongs to
   the parallel EPIC scheduler (ADR 0008;
   [Running an EPIC in parallel](#running-an-epic-in-parallel)): one directory
-  per issue, with its own state. `run`, `step`,
-  `resume` and `local run` refuse a `--state-dir` or `state_dir` that
-  resolves inside it (exit 2, before the lock is taken); `status` reads such
-  a state directory and `unblock` acts on it. An issue whose namespace
+  per issue, with its own state. `run`, `step` and `resume` refuse a
+  `--state-dir` or `state_dir` that resolves inside it (exit 2, before the
+  lock is taken); `status` reads such a state directory and `unblock` acts
+  on it. An issue whose namespace
   holds a state, or whose run lock a live worker holds, belongs to the
   scheduler: `run`, `step`, `resume` and `unblock` refuse to act on it
   (exit 2, nothing written) until `autoforge epic archive` releases it, and
@@ -1019,7 +1013,6 @@ redacted. What it reads depends on the command:
   created at the issue's first enforced launch and never deleted: remove
   them with the worktree
   ([State and recovery: runtime artifacts](agent-guides/state-and-recovery.md#runtime-artifacts)).
-  A LOCAL run's cache is `<repo>/.git/autoforge/sandbox/local/cache`.
   `doctor` lists them with their sizes.
 
 ### How agents are separated from your checkout
@@ -1074,36 +1067,32 @@ the same command again.
 `autoforge doctor` runs the same check. What this does not stop (a
 deliberate read of `~/.config/gh/hosts.yml` by absolute path, for one) is
 in [GitHub safety](agent-guides/github-safety.md#threat-model); ADR 0005's
-outer sandbox (`sandbox.mode: required`, or `preferred` where the host can
-enforce) closes it for every enforced launch
+outer sandbox (`sandbox.mode: required`, or its alias `preferred`) closes
+it for every enforced launch
 ([GitHub safety: outer sandbox threat model](agent-guides/github-safety.md#outer-sandbox-threat-model-adr-0005)).
 
 ### Outer sandbox
 
-`sandbox.mode` (ADR 0005, #168, #169) chooses between three postures, and
+`sandbox.mode` (ADR 0005, #168, #169) chooses between two postures, and
 every surface names the one in force:
 
 | `sandbox.mode` | the host can enforce | the host cannot enforce |
 |---|---|---|
 | `disabled` (default) | logical isolation only | logical isolation only |
 | `required` | every launch enforced | refused before the step: nothing saved, charged or launched |
-| `preferred`, REMOTE | every launch enforced | refused, exactly as `required` |
-| `preferred`, LOCAL | every launch enforced | every launch with logical isolation only, said at each launch |
+| `preferred` (an alias of `required`) | every launch enforced | refused, exactly as `required` |
 
 *Logical isolation* is what every mode has: the per-issue worktree, the
 environment allow-list and the controller's own `gh`, git and shell
 configuration. The *outer sandbox* is the OS-enforced boundary on top. A
-launch is *enforced* only when it ran inside it; a `preferred` fallback is
-never called sandboxed.
+launch is *enforced* only when it ran inside it.
 
-- **Before a run:** `autoforge doctor` (or `autoforge local doctor`, which
-  makes no GitHub call) shows the capability probe's result, one real
-  minimal sandboxed launch that names the first thing the host lacks
-  (`bwrap`, an unprivileged user, PID or IPC namespace, a new procfs, the
-  sandbox's bind mounts, an overlay mount, Landlock ABI 6), and what the
-  mode does with it: `disabled` is a WARN ("logical isolation only", a
-  risk); `required` or REMOTE's `preferred` on a host that cannot enforce is
-  a FAIL; LOCAL's `preferred` there is a WARN that launches will fall back.
+- **Before a run:** `autoforge doctor` shows the capability probe's
+  result, one real minimal sandboxed launch that names the first thing the
+  host lacks (`bwrap`, an unprivileged user, PID or IPC namespace, a new
+  procfs, the sandbox's bind mounts, an overlay mount, Landlock ABI 6), and
+  what the mode does with it: `disabled` is a WARN ("logical isolation only", a
+  risk); `required` or `preferred` on a host that cannot enforce is a FAIL.
   It also shows the policy each launch class gets; for each provider its
   declaration (paths and credential classes, never a value) and, when the
   sandbox is enabled and the host can enforce, its `--version` run inside
@@ -1122,15 +1111,10 @@ never called sandboxed.
 - **The dry run** shows the mode and its outcome and the compiled policy by
   launch class. It runs no probe, so it reads the same on every host.
 - **`status`** shows the mode and what it means, without probing.
-- **At a step:** under `required`, and under REMOTE's `preferred`, a step
-  that may launch first runs the probe (once per controller process). A
-  host that cannot enforce is a configuration error, exit 2, before the
-  step saves, charges or launches anything; the state is byte-identical.
-  Under LOCAL's `preferred` each launch that falls back prints "this agent
-  runs with logical isolation only, NOT inside the outer sandbox: ..." (or
-  "validation command ...") on stderr, and its execution record says
-  `"sandbox": {"enforced": false, "mode": "preferred", "isolation":
-  "logical isolation only", "fallback": "<reason>"}`.
+- **At a step:** under `required` or `preferred`, a step that may launch
+  first runs the probe (once per controller process). A host that cannot
+  enforce is a configuration error, exit 2, before the step saves, charges
+  or launches anything; the state is byte-identical.
 - **Across commands (#280):** a run is pinned to the mode it was created
   under, and `status` shows the pin. `step`, `resume` and `unblock` refuse
   a weaker mode before any phase executes, a command run without the run's
@@ -1210,8 +1194,7 @@ ownership or discard uncommitted user changes.
 
   - `worktree` is the issue's agent worktree, with the number of paths
     `git status` reports there as changed or untracked: what the attempt
-    left behind. The count is left out when that read fails. A LOCAL run
-    prints no `worktree` line: its agent works in your checkout. AutoForge
+    left behind. The count is left out when that read fails. AutoForge
     leaves those changes where they are, and the next launch of a phase
     that writes (`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`) is told
     about them: its prompt names the worktree's branch and `HEAD` and lists
@@ -1238,11 +1221,10 @@ ownership or discard uncommitted user changes.
 - **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
   `autoforge unblock --reason "..."` and `autoforge resume` (see above),
   with the `--config` / `--state-dir` the run was started with; `unblock`
-  prints that `resume` command. A LOCAL run cannot be unblocked: start a new
-  `local run`. A run blocked because a checkout moved (the checkout the
-  controller is run from, or a LOCAL run's repository: an agent committed,
-  reset or switched branches) ends with where to look and what to run,
-  already carrying those flags:
+  prints that `resume` command. A run blocked because the checkout the
+  controller is run from moved (an agent committed, reset or switched
+  branches) ends with where to look and what to run, already carrying
+  those flags:
 
   ```text
     checkout:  /home/me/code/AutoForge
@@ -1251,8 +1233,6 @@ ownership or discard uncommitted user changes.
   Inspect the checkout and the agent's GitHub work first: 'unblock' re-inspects GitHub and re-enters a phase, and only then does 'resume' continue the run.
   ```
 
-  A LOCAL run prints a `new run:` line (`autoforge ... local run <the
-  feature's absolute path>`) instead of `unblock` and `resume`.
 - **"refusing to launch: a process AutoForge launches would be handed a
   GitHub or git credential":** the message names the setting (for example
   a credential helper in the repository's git configuration, a remote URL
@@ -1270,15 +1250,15 @@ ownership or discard uncommitted user changes.
   [Configuration: agent environment](configuration.md#agent-environment))
   and run the same command again.
 - **"this host cannot enforce the outer sandbox: it cannot provide ..."**
-  (`SandboxCapabilityError`, exit 2; `sandbox.mode: required`, or
-  `preferred` in REMOTE): the pre-launch gate refused the step. Nothing was
-  launched, saved or charged. `autoforge doctor` (or `local doctor`) shows
-  the same capability row; make the host capable (install `bwrap`, allow
-  unprivileged user namespaces, a kernel with Landlock ABI 6 that booted
-  with Landlock enabled; the row's reason says which of the two a kernel
-  lacks, see [Compatibility](compatibility.md#outer-sandbox)), or set
-  `sandbox.mode: disabled` (logical isolation only) or, in LOCAL,
-  `preferred`, and run the same command again.
+  (`SandboxCapabilityError`, exit 2; `sandbox.mode: required` or
+  `preferred`): the pre-launch gate refused the step. Nothing was launched,
+  saved or charged. `autoforge doctor` shows the same capability row; make
+  the host capable (install `bwrap`, allow unprivileged user namespaces, a
+  kernel with Landlock ABI 6 that booted with Landlock enabled; the row's
+  reason says which of the two a kernel lacks, see
+  [Compatibility](compatibility.md#outer-sandbox)), or set
+  `sandbox.mode: disabled` (logical isolation only), and run the same
+  command again.
 - **"the configuration file ... lies in ..., a tree that launches inside
   the outer sandbox write"** (exit 2; also "is reached through ...", "has
   N hard links" or "opens another file than its lookup walk was followed
@@ -1307,8 +1287,8 @@ ownership or discard uncommitted user changes.
   the run log).
 - **"sandbox.read_only_paths[N] ... overlaps ..., which no launch may see":**
   an operator read-only path names, contains or lies inside the state
-  directory, the lock, `<git common dir>/autoforge`, another worktree or (in
-  REMOTE) your checkout. Nothing was launched; narrow or remove the entry.
+  directory, the lock, `<git common dir>/autoforge`, another worktree or
+  your checkout. Nothing was launched; narrow or remove the entry.
 - **"the sandbox cannot be established ..."** (`SandboxLaunchRefusedError`,
   the sandbox enforced): the launch did not run, and nothing ran
   without the sandbox. The message names the cause: a backend that failed
@@ -1491,8 +1471,8 @@ To continue under this command's configuration instead, repeat it with --accept-
 Everything else in the configuration may change between commands without a
 refusal: the loop bounds and step budget, the merge gate, `env_allowlist`,
 the `sandbox` section, and a profile's `command`, `extra_args` and `options`.
-The one exception is a weaker `sandbox.mode`: every run, LOCAL included, is
-pinned to the mode it was created under, and the same commands refuse a
+The one exception is a weaker `sandbox.mode`: every run is pinned to the
+mode it was created under, and the same commands refuse a
 weaker one, with the same `--accept-config-change`
 ([Outer sandbox](#outer-sandbox)); a refusal that has both lists both. The
 record holds none of them, and no value that could carry a secret. The
@@ -1511,9 +1491,7 @@ compares the routing only and says so.
 `Config:     --config /home/me/code/AutoForge/autoforge.yaml (created 2026-10-06T10:15:00.512837+00:00)`.
 A state file written before this check (protocol 8) has no recorded
 configuration. It loads and resumes unchecked, and the first `step`,
-`resume` or `unblock` records the configuration it runs on (`upgraded`). A
-LOCAL run is not checked this way: its
-[run contract](local-mode.md#the-run-contract) defines it.
+`resume` or `unblock` records the configuration it runs on (`upgraded`).
 
 ### Candidate validation evidence
 
@@ -1572,9 +1550,9 @@ What you can inspect:
 A review certificate is the controller's own record of one clean review of
 one exact validated candidate (ADR 0006 D1.2): it is not a GitHub approval,
 a CI result or permission to merge, and it is never shown to an agent or
-published. `REVIEW -> READY_FOR_MERGE` (and LOCAL `REVIEW -> DONE`) is
-entered only in the write that issues it; a clean round whose certificate
-cannot be issued exactly as recorded blocks instead. If the validation set
+published. `REVIEW -> READY_FOR_MERGE` is entered only in the write that
+issues it; a clean round whose certificate cannot be issued exactly as
+recorded blocks instead. If the validation set
 or policy changed after the reviewer was presented its evidence, the
 certificate is still issued from what was presented and the run blocks
 naming the change: restore the configuration and `unblock` (the certificate
@@ -1612,9 +1590,6 @@ A push to the PR, a retarget or a rewritten base still goes back to
 `REVIEW` before the certificate is consulted, and the new round certifies
 the new revision; a base that only advanced keeps it. A PR already merged
 on GitHub is counted once without one, as before.
-
-LOCAL runs show the same block for their `local.validation_commands`
-records ([Local mode](local-mode.md#validation-commands)).
 
 ## Logging and redaction
 

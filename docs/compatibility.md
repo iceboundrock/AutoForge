@@ -116,8 +116,7 @@ which records what real fine-grained tokens did. On a private repository
 whose pull requests have checks a fine-grained token cannot read the
 check results, so the merge gate blocks on it
 ([#291](https://github.com/iceboundrock/AutoForge/issues/291)): to merge
-there, use `gh auth login` or a classic token with `repo`. LOCAL mode
-needs no `gh` at all.
+there, use `gh auth login` or a classic token with `repo`.
 
 ## Agent CLIs
 
@@ -130,7 +129,7 @@ adapter's own verification or a recorded run, not on CI.
 |---|---|---|---|
 | Claude Code (`claude`) | none (below) | 2.1.263 (the flag syntax of `autoforge.example.yaml`); 2.1.291 to 2.1.293 (the `stream-json` runs the stream reducer was built from); 2.1.296 (the integration isolation and the Bash tool's shell, read from the build and checked against it); 2.1.312 (what a `-p` run does with a call that needs a permission and with `AskUserQuestion`, run against a loopback stand-in of the Messages API, #258); 2.1.314 (the `result` a turn ends with when a request to the model API failed, for statuses 400, 401, 403, 404, 408, 413, 429, 500, 502, 503, 504 and 529 and for a refused, dropped or timed-out connection, run against a loopback stand-in of the Messages API, #395). Source: the docstring of `src/autoforge/providers.py`. | before 2.1.263; after 2.1.296 (the maintainer's host had 2.1.306 on 2026-10-21, with no recorded run), but for 2.1.312's refusals and 2.1.314's API errors |
 | OpenCode (`opencode`) | 2.0.0 (`opencode >= 2.0.0 is required`; 1.x prints another version format and rejects the argv) | 2.0.23 (argv, stdin delivery and output, run against); 2.0.26 (the configuration isolation and the error lines, read from the build and checked with `opencode api --standalone`); 2.0.32 (the retry rule, read from the build); 2.1.4 (what a refused permission and a cancelled question print, run against a loopback stand-in of the Messages API and read from the build, #258). Source: the docstring of `src/autoforge/providers.py`. | after 2.0.32 (the maintainer's host had 2.1.1 on 2026-10-21, with no recorded run), but for 2.1.4's refusals |
-| Pi (`pi`), optional | 1.0.0 (`pi >= 1.0.0 is required`; ADR 0003 §2.8) | 1.0.1 (the adapter's verification, [Pi operator guide](pi.md#install-pi-yourself)); 1.3.0 (the live smoke test on a DeepSeek API key, steps 1 to 6 passed, [#135](https://github.com/iceboundrock/AutoForge/issues/135#issuecomment-6308736531)); 1.3.0 again (no permission rule and no question tool, read from the build and docs, #258) | the ChatGPT sign-in route on any version; versions other than those two |
+| Pi (`pi`), optional | 1.0.0 (`pi >= 1.0.0 is required`; ADR 0003 §2.8) | 1.0.1 (the adapter's verification, [Pi operator guide](pi.md#install-pi-yourself)); 1.3.0 (the live smoke test on a DeepSeek API key, steps 1 to 6 passed, in its LOCAL form, which went with LOCAL mode, [#135](https://github.com/iceboundrock/AutoForge/issues/135#issuecomment-6308736531)); 1.3.0 again (no permission rule and no question tool, read from the build and docs, #258) | the ChatGPT sign-in route on any version; versions other than those two |
 | `claude-sdk`, `opencode-sdk` | not launchable | Their policy and configuration validate ([SDK policy](sdk-policy.md)), but the helpers that would launch them have not landed (#151, #152): `doctor` fails their `can launch` row and every launch is refused. | **unsupported** until the helpers land |
 
 **Why Claude Code has no minimum version (#256 item 8).** Instead of a
@@ -148,8 +147,8 @@ shape surfaces as a provider failure of the step, not as a wrong state.
 
 ## Outer sandbox
 
-`sandbox.mode: required`, and `preferred` where it enforces, need a host
-that can enforce ADR 0005's outer sandbox. The default, `disabled`, needs
+`sandbox.mode: required`, and its alias `preferred`, need a host that can
+enforce ADR 0005's outer sandbox. The default, `disabled`, needs
 none of this. Supported on Linux x86_64 above does **not** mean that every
 Linux host can use `required`: that is a property of the host, established
 by a real minimal launch, never by a version number
@@ -167,8 +166,8 @@ sandboxed launch)` says `supported (bwrap <version>)`, or `unsupported:
 this host cannot provide <capability> (<reason>)`, naming the first
 requirement below that the probe found missing, in the words of the table's
 second column. `outer sandbox: mode (<mode>)` says what the configured mode
-does on this host: enforced, falling back visibly (`preferred` in LOCAL),
-or refused before anything is saved or launched.
+does on this host: enforced, or refused before anything is saved or
+launched.
 
 | Requirement | How `doctor` names it when missing |
 |---|---|
@@ -225,7 +224,7 @@ reason in parentheses says what the kernel answered when asked for its ABI:
 
 | Requirement | Status | Evidence or reason |
 |---|---|---|
-| The state directory (`.autoforge/` for a remote run, `<git dir>/autoforge/state` for a LOCAL one, or `--state-dir` / `state_dir`) on a filesystem with hard links | **supported** on the runner's filesystem (`test (py3.11)`, `test (py3.12)`) and on XFS (the maintainer's host, `make check`) | Run logs and other controller files are published with `link(2)` so that a crash never leaves one half-written, and there is no non-atomic fallback. |
+| The state directory (`.autoforge/` by default, or `--state-dir` / `state_dir`) on a filesystem with hard links | **supported** on the runner's filesystem (`test (py3.11)`, `test (py3.12)`) and on XFS (the maintainer's host, `make check`) | Run logs and other controller files are published with `link(2)` so that a crash never leaves one half-written, and there is no non-atomic fallback. |
 | A state directory on vfat/exFAT, or on a FUSE, SMB/CIFS or overlay mount without hard links | **unsupported** | `doctor`'s `state dir writable` row fails and names the requirement; a run refuses the directory the same way. |
 | The worktrees (`<git common dir>/autoforge/worktrees/<n>` by default) | as the repository's own filesystem | Created with `git worktree`; under `required`, `doctor`'s `outer sandbox: hard links in writable trees` row reports regular files with more than one link there. |
 

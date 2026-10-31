@@ -230,17 +230,13 @@ and nothing else.
 | `opencode-sdk` | `<sandbox dir>/sdk/opencode-sdk/{home,config,data,cache,state}` as `HOME` and `XDG_*_HOME`, plus `empty-config` as `OPENCODE_CONFIG_DIR` | the server's database and session history, logs and caches. Verified on runtime 2.0.32: the server wrote to the data, cache and state roots, and nothing else in the probe's directory changed. |
 
 The `<sandbox dir>` is the issue's controller-owned sandbox directory from
-`sandbox_policy`:
-
-- REMOTE: `<git common dir>/autoforge/sandbox/<worktree>`;
-- LOCAL: `<git dir>/autoforge/sandbox/local`.
+`sandbox_policy`, `<git common dir>/autoforge/sandbox/<worktree>`.
 
 That gives three properties:
 
-- **Never in a working tree.** A root never pollutes the LOCAL reviewed
-  tree, because a LOCAL fingerprint excludes the repository's own git
-  directory by identity. Tested: writing every root leaves the fingerprint
-  unchanged.
+- **Never in a working tree.** A root lies under the git common dir, never
+  inside the issue worktree, so it never pollutes the reviewed tree.
+  Tested: no root lies inside the issue worktree.
 - **Per issue.**
 - **Persistent.** A continuation runs on the same directory as its paused
   launch (D8.4).
@@ -440,8 +436,7 @@ field and the rule, never the value.
 - the launch allow-list. A real subprocess, started with synthetic secrets
   for other providers in the controller's environment, receives none of
   them, and the controller's `os.environ` is unchanged;
-- the roots: writing every root leaves a LOCAL fingerprint unchanged, and
-  the REMOTE roots lie outside the issue worktree;
+- the roots lie outside the issue worktree;
 - the interaction-data bounds;
 - the new redaction names and their growth bound;
 - the adapters' refusals;

@@ -35,12 +35,11 @@ imports the ``autoforge`` of the source tree:
 4. From that environment: ``autoforge --version`` and ``autoforge --help``;
    every prompt template loaded and rendered from the installed package
    (this file again, with ``--installed``, on the environment's own
-   interpreter); ``autoforge local run --dry-run --full-prompt`` in a
-   scratch git repository, which renders a phase prompt through the
-   installed engine and must write no state; and a REMOTE ``autoforge run
-   --dry-run --full-prompt`` in another, with a ``gh`` on ``PATH`` that
-   records any call and fails it, which must render the ANALYZE_EXECUTE
-   prompt, call no ``gh`` and leave the repository byte-identical.
+   interpreter); and a REMOTE ``autoforge run --dry-run --full-prompt`` in
+   a scratch git repository, with a ``gh`` on ``PATH`` that records any
+   call and fails it, which must render the ANALYZE_EXECUTE prompt through
+   the installed engine, call no ``gh`` and leave the repository
+   byte-identical.
 5. The SHA-256 of each artifact is printed, appended to the job summary
    (``$GITHUB_STEP_SUMMARY``) when that is set, and written to
    ``--sha256sums`` in ``sha256sum -c`` format when asked. When
@@ -97,8 +96,6 @@ DEVELOPMENT_VERSION = re.compile(RELEASE_VERSION.pattern + r"(\.dev(0|[1-9]\d*))
 BUILD_CONSTRAINTS = "build-constraints.txt"
 _PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][0-9A-Za-z.!+-]*)")
 _HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
-# The feature slug of the LOCAL dry run.
-LOCAL_SLUG = "dist-check"
 # The URLs of the REMOTE dry run: never read, since a dry run calls no gh.
 REMOTE_EPIC = "https://github.com/example/dist-check/issues/1"
 REMOTE_ISSUE = "https://github.com/example/dist-check/issues/2"
@@ -429,7 +426,7 @@ def install(wheel: Path, work: Path) -> Path:
 
 
 def smoke(bin_dir: Path, work: Path, version: str) -> None:
-    """The installed command, the installed templates and a LOCAL dry run."""
+    """The installed command, the installed templates and a REMOTE dry run."""
     env = _child_env()
     autoforge = str(bin_dir / "autoforge")
     out = _run([autoforge, "--version"], cwd=work, env=env).stdout.strip()
@@ -458,30 +455,6 @@ def smoke(bin_dir: Path, work: Path, version: str) -> None:
     git = shutil.which("git")
     _check(git is not None, "git is not on PATH")
     assert git is not None
-    repo = _scratch_repository(git, work / "local-repo", env)
-    _run([autoforge, "local", "init", LOCAL_SLUG], cwd=repo, env=env)
-    plan = _run(
-        [autoforge, "local", "run", f"features/{LOCAL_SLUG}.md", "--dry-run", "--full-prompt"],
-        cwd=repo,
-        env=env,
-    ).stdout
-    for needle in ("Template: local_analyze_execute.md", "--- prompt preview ---", _CONTROL_RESULT):
-        _check(needle in plan, f"the LOCAL dry run printed no {needle!r}")
-    _check(not _PLACEHOLDER.search(plan), "the LOCAL dry run's prompt has an unrendered variable")
-    # A dry run takes the repository lock, whose file stays; it writes no state.
-    controller = repo / ".git" / "autoforge"
-    written = sorted(p.name for p in controller.iterdir()) if controller.exists() else []
-    _check(
-        set(written) <= {"controller.lock"},
-        f"the LOCAL dry run wrote controller files: {written}",
-    )
-    status = _run([git, "status", "--porcelain"], cwd=repo, env=env).stdout.split("\n")
-    _check(
-        [line for line in status if line] == ["?? features/"],
-        f"the LOCAL dry run changed the scratch repository: {status}",
-    )
-    _say("ok: autoforge local run --dry-run --full-prompt rendered the ANALYZE_EXECUTE prompt")
-
     remote_dry_run(autoforge, git, work, env)
 
 

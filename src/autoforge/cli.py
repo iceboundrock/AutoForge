@@ -22,8 +22,6 @@ Commands:
           operator actions (#243)
   status  show the persisted run summary (--json for machine output; --action
           prints an acceptance or operator action's exact payload)
-  local   LOCAL mode: feature Markdown -> implement -> review -> fix -> DONE,
-          with no GitHub involved at any point (init / run / doctor)
   epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
           --dry-run and --force), resume, status (lock-free, --json), stop
           (lock-free, --now) and archive; every 'epic' command refuses
@@ -52,7 +50,7 @@ from .certificate import NOT_A_PERMISSION
 from .certificate import describe as describe_certificate
 from .config import MAX_PARALLEL_BOUNDS, AutoForgeConfig, load_config_file
 from .config_fingerprint import RecordedConfiguration
-from .doctor import CheckResult, run_doctor, run_local_doctor
+from .doctor import CheckResult, run_doctor
 from .effects import (
     AUTHORIZATION_POLICY,
     MAX_EFFECT_ATTEMPTS,
@@ -115,7 +113,6 @@ from .interaction import (
     Unavailable,
     UnavailableReason,
 )
-from .local_workspace import init_feature_file
 from .locking import ControllerLock, repository_lock_path
 from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
 from .redaction import redact, redact_argv, redact_dict, redact_obj
@@ -304,7 +301,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    _add_local_parser(sub)
     _add_epic_parser(sub)
     return p
 
@@ -321,69 +317,6 @@ def _add_accept_config_change(parser: argparse.ArgumentParser) -> None:
             "(#219, #280)"
         ),
     )
-
-
-def _add_local_parser(sub) -> None:
-    """`autoforge local ...`: the GitHub-free workflow.
-
-    ``status``/``step``/``resume`` stay mode-agnostic (they read the mode from
-    persisted state), so only the commands that *differ* live here.
-    """
-    loc = sub.add_parser(
-        "local",
-        help="local mode: drive a feature Markdown file with no GitHub involved",
-        description=(
-            "LOCAL mode: features/<slug>.md -> ANALYZE_EXECUTE -> REVIEW -> FIX -> "
-            "REVIEW -> DONE, entirely in the working tree. No gh, no PR, no push, "
-            "no merge, no commits. Use 'autoforge status/step/resume' as usual."
-        ),
-    )
-    lsub = loc.add_subparsers(dest="local_command", required=True)
-
-    li = lsub.add_parser("init", help="create features/<slug>.md from the template")
-    li.add_argument("slug", help="feature slug, e.g. add-transaction-filter")
-    li.add_argument(
-        "--feature-dir",
-        default=None,
-        help="directory for the file (default: config local.feature_dir)",
-    )
-    li.add_argument(
-        "--force",
-        action="store_true",
-        help="overwrite an existing feature file (refused by default)",
-    )
-
-    lr = lsub.add_parser(
-        "run", help="create a local run from a feature Markdown file and advance it"
-    )
-    lr.add_argument("feature", help="path to the feature Markdown file (inside this repository)")
-    lr.add_argument("--dry-run", action="store_true", help="plan only; no side effects")
-    lr.add_argument(
-        "--force",
-        action="store_true",
-        help="discard an existing non-terminal run (see 'run --force')",
-    )
-    lr.add_argument(
-        "--max-steps", type=_positive_int, default=50, help="steps for this invocation (>= 1)"
-    )
-    lr.add_argument(
-        "--allow-dirty",
-        action="store_true",
-        help=(
-            "start even though the working tree has changes other than the feature file; "
-            "they are recorded in the run and reported to the reviewer, never treated as "
-            "part of the implementation"
-        ),
-    )
-    lr.add_argument(
-        "--full-prompt", action="store_true", help="print full rendered prompt in dry-run"
-    )
-
-    ld = lsub.add_parser(
-        "doctor", help="check config/git/agent CLIs for local mode (never touches GitHub)"
-    )
-    ld.add_argument("--json", action="store_true", dest="as_json")
-    ld.add_argument("--feature", default=None, help="also validate this feature Markdown path")
 
 
 def _add_epic_parser(sub) -> None:
@@ -561,15 +494,6 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(args)
         if args.command == "epic":
             return cmd_epic(args)
-        if args.command == "local":
-            if args.local_command == "init":
-                return cmd_local_init(args)
-            if args.local_command == "run":
-                return cmd_local_run(args)
-            if args.local_command == "doctor":
-                return cmd_local_doctor(args)
-            parser.error(f"unknown local command {args.local_command}")
-            return 2
         parser.error(f"unknown command {args.command}")
         return 2
     except (ConfigurationError, StateError, StateTransitionError, LockError) as exc:
@@ -620,53 +544,6 @@ def _check_configuration(engine: ControllerEngine, args, *words: str, dry_run: b
         print(redact(f"autoforge: {notice}"), file=sys.stderr)
 
 
-def _local_engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
-    """An engine for a LOCAL command, with its state directory resolved.
-
-    LOCAL state never lives in the reviewed working tree; see
-    :meth:`ControllerEngine.bind_local_state_dir`.
-    """
-    engine = _engine_for(args, cfg)
-    engine.bind_local_state_dir(args.state_dir)
-    return engine
-
-
-def _bind_existing_run(engine: ControllerEngine) -> None:
-    """Resolve which run a mode-agnostic command (`resume`, `step`, `status`) means.
-
-    A REMOTE run keeps its state under `config.state_dir` (`.autoforge` by
-    default); a LOCAL run keeps it in the git directory, because the LOCAL
-    fingerprint covers the working tree. The two locations are disjoint and
-    the mode is not known until state is read, so the command looks for a
-    `state.json` in both. Exactly one match is used. Two matches is a real
-    ambiguity and is refused rather than resolved by precedence: picking one
-    would silently `resume` the wrong workflow. Zero matches leaves the
-    configured location so the error names it.
-
-    `--state-dir` is an answer to this question, so it is never second-guessed
-    (the caller does not reach here when it was given).
-    """
-    configured = engine.paths
-    try:
-        local = engine.local_state_paths()
-    except (AutoForgeError, OSError):
-        # Not a git repository (or git is unusable): only the configured
-        # location can hold a run, and any real problem surfaces there.
-        return
-    if os.path.abspath(local.state_dir) == os.path.abspath(configured.state_dir):
-        return
-    here = os.path.lexists(configured.state_file)
-    there = os.path.lexists(local.state_file)
-    if here and there:
-        raise StateError(
-            f"two runs exist: a remote-style one at {configured.state_file} and a local "
-            f"one at {local.state_file}. Pass --state-dir to say which one this command "
-            "means; the controller will not pick for you."
-        )
-    if there:
-        engine.paths = local
-
-
 def _guard_scheduler_ownership(
     engine: ControllerEngine, state: AutoForgeState, command: str
 ) -> None:
@@ -690,24 +567,32 @@ def _guard_scheduler_ownership(
     engine.issue_ownership = standalone_ownership_predicate(root, exempt_issue=exempt)
 
 
-def _bind_standalone_run(engine: ControllerEngine, args, command: str) -> None:
-    """:func:`_bind_existing_run` for a standalone ``step`` or ``resume`` (ADR 0008 D17.3).
+def _refuse_scheduler_state_dir(engine: ControllerEngine, args, command: str) -> None:
+    """ADR 0008 D17.3 for a standalone ``step`` or ``resume``: before the lock.
 
     The state directory this invocation names (``--state-dir`` or
-    ``config.state_dir``) is judged before the binding looks for a run in it
-    or in LOCAL's location: one inside the scheduler root that holds no
-    ``state.json`` would otherwise give way to a LOCAL run's, and the command
-    would continue that run instead of refusing. The directory bound is
-    judged again. Both before the lock and before any state is read; a dry
-    run is judged by neither (:meth:`ControllerEngine.refuse_scheduler_state_dir`).
+    ``config.state_dir``) is the only one the command reads, and one inside
+    the scheduler root is a namespace's, so it is refused before the lock is
+    taken and before any state is read. A dry run is not judged
+    (:meth:`ControllerEngine.refuse_scheduler_state_dir`).
     """
     if not args.dry_run:
         engine.refuse_scheduler_state_dir(command)
-    if args.state_dir:
-        return
-    _bind_existing_run(engine)
-    if not args.dry_run:
-        engine.refuse_scheduler_state_dir(command)
+
+
+def _refuse_unloadable_state_before_the_lock(engine: ControllerEngine) -> None:
+    """Load the state once before the lock, only to refuse one that does not load.
+
+    Taking the controller lock creates ``controller.lock`` or rewrites its
+    PID record, and that file lies in the state directory when the state
+    directory is the lock's own (``--state-dir <git common dir>/autoforge``).
+    A refusal needs no lock and writes nothing, so a missing state and one
+    that does not load, a LOCAL one among them (ADR 0009 D4, #387), are
+    refused before the lock is taken and leave the directory as it was. The
+    snapshot decides nothing else: ``step``, ``resume`` and ``unblock`` read
+    the state again under the lock and act on that one alone.
+    """
+    engine.load()
 
 
 def _doctor_runner():
@@ -723,17 +608,6 @@ def cmd_doctor(args) -> int:
         epic_url=args.epic,
     )
     return _report_checks(results, args.as_json, "AutoForge doctor (read-only checks)")
-
-
-def cmd_local_doctor(args) -> int:
-    """`autoforge local doctor`: no gh, no gh auth, no 'origin' remote."""
-    results = run_local_doctor(
-        config_path=args.config,
-        state_dir=args.state_dir,
-        runner=_doctor_runner(),
-        feature_spec_path=args.feature,
-    )
-    return _report_checks(results, args.as_json, "AutoForge doctor — local mode (read-only checks)")
 
 
 def _report_checks(results: list[CheckResult], as_json: bool, title: str) -> int:
@@ -1224,10 +1098,10 @@ def _discard_typeahead(fd: int) -> None:
 class TerminalResolver:
     """Asks the operator at this terminal (ADR 0007 D5.1, D7.4, D7.7; #134).
 
-    The engine's resolver for a real ``run``, ``local run``, ``step`` and
-    ``resume``. It reads stdin and shows the request on stderr, where the
-    live progress is, when stderr is a terminal; stdout stays the step
-    outcomes'. A redirected stderr (a pipe, a file) or none at all is never
+    The engine's resolver for a real ``run``, ``step`` and ``resume``. It
+    reads stdin and shows the request on stderr, where the live progress
+    is, when stderr is a terminal; stdout stays the step outcomes'. A
+    redirected stderr (a pipe, a file) or none at all is never
     written to: the request is shown on the terminal it reads instead
     (:func:`_shown_on`). Before it asks it checks that stdin is a terminal
     (D7.4) and drops anything typed ahead. While it asks it edits the line
@@ -1487,15 +1361,17 @@ def _existing_run_guard(
 ) -> tuple[int | None, bool]:
     """Decide whether a fresh run may overwrite the run at ``engine.paths``.
 
-    Returns ``(exit_code_or_None, corrupt)``. Must be called with the
-    controller lock held: a verdict taken before the lock could go stale.
+    Returns ``(exit_code_or_None, corrupt)``. A verdict that lets the run
+    go ahead must be taken with the controller lock held: one taken before
+    the lock could go stale. A refusal writes nothing, so ``run`` also asks
+    once before it takes the lock, and returns at once when refused (#387).
     The inspection goes through the engine's held state root -- the same
     capability the first save and every later write will use -- so the
     directory that is inspected is the directory that is written.
 
     ``command`` is the subcommand the operator actually typed, so the advice
-    names a command that can be copied (`run --force`, `local run --force`)
-    rather than a bare flag.
+    names a command that can be copied (`run --force`) rather than a bare
+    flag.
     """
     paths = engine.paths
     try:
@@ -1569,6 +1445,12 @@ def cmd_run(args) -> int:
     # A state directory inside the scheduler root is a namespace's, never a
     # standalone run's (ADR 0008 D17.3); refused before the lock is taken.
     engine.refuse_scheduler_state_dir("run")
+    # A run the state already there refuses is refused before the lock too:
+    # the refusal writes nothing, and taking the lock would write its PID
+    # record in the state directory when that is the lock's own (#387).
+    rc, _ = _existing_run_guard(engine, args.force)
+    if rc is not None:
+        return rc
     # Inspect, decide, quarantine, write the first state AND execute under
     # one continuous lock: a verdict taken before the lock could go stale
     # (another controller may have repaired, replaced or created state.json
@@ -1601,84 +1483,9 @@ def cmd_run(args) -> int:
     return _finish(engine, outcomes, args.allow_merge, printed=True)
 
 
-def cmd_local_init(args) -> int:
-    """Create features/<slug>.md under the repository lock. No --force, no overwrite.
-
-    The controller lock covers this the same way it covers `local run`. A
-    feature specification is not a scratch file: a run freezes its SHA-256 and
-    re-checks it around every phase, so `local init --force` racing an active
-    run could rewrite the specification while the controller was hashing it,
-    rendering it into a prompt or verifying it — which is precisely the
-    "an agent cannot rewrite its own acceptance criteria" guarantee, undone
-    from the operator's side. One controller at a time owns the repository,
-    and creating this file is a controller write like any other.
-    """
-    cfg = _load_cfg(args)
-    engine = _local_engine_for(args, cfg)
-    with engine.locked():
-        path = init_feature_file(
-            engine.local_workspace(),
-            args.slug,
-            feature_dir=args.feature_dir or cfg.local.feature_dir,
-            overwrite=args.force,
-        )
-    rel = os.path.relpath(path, os.getcwd())
-    print(f"Created {rel}")
-    print()
-    print("Next:")
-    print(f"  1. Describe the feature in {rel} (problem, requirements, acceptance criteria).")
-    print(f"  2. autoforge local run {rel}")
-    print()
-    print("The specification is frozen (SHA-256) when the run starts: edit it before, not during.")
-    return 0
-
-
-def cmd_local_run(args) -> int:
-    """Create a LOCAL run from a feature Markdown file and advance it.
-
-    Mirrors ``cmd_run`` minus everything GitHub: no EPIC, no issue, no merge
-    gate. The engine never constructs a GitHubClient for a LOCAL run.
-    """
-    cfg = _load_cfg(args)
-    engine = _local_engine_for(args, cfg)
-
-    if args.dry_run:
-        # Fully side-effect-free: in-memory state, plan printed, nothing
-        # written, no agent invoked and no validation command executed.
-        engine.new_local_run(args.feature, allow_dirty=args.allow_dirty)
-        engine.validate_config()
-        outcomes = engine.run(max_steps=args.max_steps, dry_run=True)
-        for o in outcomes:
-            assert o.plan is not None
-            print_plan(o.plan, full_prompt=args.full_prompt)
-        return 0
-
-    engine.refuse_scheduler_state_dir("local run")
-    # One continuous lock over inspect -> decide -> first save -> execute,
-    # for the same reasons as `cmd_run`.
-    with engine.locked():
-        rc, corrupt = _existing_run_guard(engine, args.force, "local run")
-        if rc is not None:
-            return rc
-        engine.new_local_run(args.feature, allow_dirty=args.allow_dirty)
-        engine.validate_config()
-        assert engine.state is not None
-        # The sandbox mode later commands of the run are held to (#280).
-        engine.record_run_configuration()
-        if corrupt:
-            moved = engine.quarantine_state()
-            print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
-        engine.save()
-        _attach_terminal(engine)
-        outcomes = engine.run(
-            max_steps=args.max_steps, dry_run=False, on_outcome=_print_outcome_now
-        )
-    return _finish(engine, outcomes, allow_merge=False, printed=True)
-
-
 def cmd_step(args) -> int:
     engine = _engine_for(args)
-    _bind_standalone_run(engine, args, "step")
+    _refuse_scheduler_state_dir(engine, args, "step")
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
@@ -1688,6 +1495,7 @@ def cmd_step(args) -> int:
         if outcome.plan is not None:
             print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
+    _refuse_unloadable_state_before_the_lock(engine)
     # Load and execute under one lock: a snapshot loaded before the lock
     # could already have been replaced by another controller.
     with engine.locked():
@@ -1702,7 +1510,7 @@ def cmd_step(args) -> int:
 
 def cmd_resume(args) -> int:
     engine = _engine_for(args)
-    _bind_standalone_run(engine, args, "resume")
+    _refuse_scheduler_state_dir(engine, args, "resume")
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
@@ -1715,6 +1523,7 @@ def cmd_resume(args) -> int:
             assert o.plan is not None
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
+    _refuse_unloadable_state_before_the_lock(engine)
     # Load, decide and execute under one lock: a snapshot loaded before the
     # lock could already have been replaced by another controller.
     with engine.locked():
@@ -1743,8 +1552,6 @@ def cmd_unblock(args) -> int:
     here: the operator reviews the outcome and runs ``resume``.
     """
     engine = _engine_for(args)
-    if not args.state_dir:
-        _bind_existing_run(engine)
     approve = str(getattr(args, "approve_action", "") or "")
     raw_decline = getattr(args, "decline_action", None) or []
     decline = [raw_decline] if isinstance(raw_decline, str) else [str(d) for d in raw_decline]
@@ -1765,6 +1572,7 @@ def cmd_unblock(args) -> int:
         )
         print_unblock_outcome(outcome)
         return 0
+    _refuse_unloadable_state_before_the_lock(engine)
     # Load, decide and write under one lock, like `step`. An accepted
     # configuration change is its own recorded write, made before the
     # decision: a refused unblock leaves it in place.
@@ -1983,10 +1791,11 @@ def cmd_epic_status(args) -> int:
 
 
 def _epic_repository_id(args) -> Callable[[str], int]:
-    """GitHub's numeric id of a repository, as ``epic stop`` and ``epic archive`` read it.
+    """GitHub's numeric id of a repository, as ``epic stop`` reads it.
 
-    Called once a ``scheduler.json`` or a binding is found to compare with,
-    so the configuration is loaded then.
+    Called once a ``scheduler.json`` is found to compare with, so the
+    configuration is loaded then; ``epic stop`` writes nothing before.
+    ``epic archive`` loads it before it takes L0 (:func:`cmd_epic_archive`).
     """
 
     def read(repository: str) -> int:
@@ -2008,12 +1817,22 @@ def cmd_epic_stop(args) -> int:
 
 
 def cmd_epic_archive(args) -> int:
-    """``epic archive``: under L0 (a held one is exit 2); GitHub is read for the binding's id."""
+    """``epic archive``: under L0 (a held one is exit 2); GitHub is read for the binding's id.
+
+    The configuration is loaded before L0 is taken, since taking it writes
+    the lock file's holder record: a refused configuration leaves the lock
+    file as it was, or absent. GitHub is still read only once a binding is
+    found to compare with.
+    """
     epic = parse_issue_url(args.epic)
+    cfg = _load_cfg(args)
     lock_path = repository_lock_path(os.getcwd())
     with ControllerLock(lock_path):
         report = archive_issue(
-            lock_path.parent.parent, epic.canonical, args.issue, _epic_repository_id(args)
+            lock_path.parent.parent,
+            epic.canonical,
+            args.issue,
+            lambda repository: _epic_graph(cfg).get_repository_id(repository),
         )
     for line in report.lines():
         print(line)
@@ -2022,8 +1841,6 @@ def cmd_epic_archive(args) -> int:
 
 def cmd_status(args) -> int:
     engine = _engine_for(args)
-    if not args.state_dir:
-        _bind_existing_run(engine)
     state = engine.load()  # StateError when missing/corrupt
     if getattr(args, "action", ""):
         return _print_action_payload(state, args.action)

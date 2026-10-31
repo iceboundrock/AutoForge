@@ -5,6 +5,102 @@ so.
 
 ## Unreleased
 
+### LOCAL mode is removed (#387)
+
+**Behaviour change:** LOCAL mode, the GitHub-free workflow, is removed
+without compatibility and without a deprecation release (ADR 0009).
+`autoforge local` (`init`, `run`, `doctor`), the `local:` configuration
+key, LOCAL runs and `docs/local-mode.md` are gone. No release from this one
+on continues, shows, migrates or converts a LOCAL run, and nothing of one
+becomes REMOTE evidence.
+
+What an operator with LOCAL files meets:
+
+- `autoforge local …` exits 2 with argparse's
+  `invalid choice: 'local'`, before any configuration is read, any lock
+  taken or any file touched.
+- A configuration file with a top-level `local:` block is refused by every
+  command that loads it, the `epic` commands included:
+  `<file>: unknown key(s) under 'the top level': local (known: …)`, exit 2.
+  `doctor` reports the same text as its failing `config` row and exits 1.
+  The controller copies no LOCAL setting into a REMOTE one: commands that
+  were in `local.validation_commands` validate REMOTE runs only once they
+  are in `validation.commands`, which runs each in a byte-exact export of
+  the candidate commit, not in the working tree.
+- A command no longer looks for a run at `<git dir>/autoforge/state`, where
+  a LOCAL run kept its state by default. Without `--state-dir` it reads
+  `state_dir` only (`.autoforge` by default) and, with a LOCAL state only
+  in the git directory, says `no state file at .autoforge/state.json — …`.
+- A LOCAL state in a directory a command does read (`--state-dir`, or a
+  `state_dir` the LOCAL run also used) is refused by `status`,
+  `status --json`, `step`, `resume` and `unblock` with
+  `state file has unknown mode 'LOCAL'`, exit 2, and nothing is written.
+  `run` refuses it as an unreadable state file, exit 2. `run --force`
+  moves it aside as `state.json.corrupt-<UTC timestamp>`, never replacing
+  an existing file, and starts a REMOTE run that reads nothing of it. The
+  `.corrupt-` suffix is what every state file that does not load is moved
+  aside under, not a finding that the file is damaged.
+- With such a state at `state_dir`, `epic run` admits as before and says
+  `the standalone state … cannot be read: state file has unknown mode 'LOCAL'`;
+  `epic status` lists the same problem.
+
+No command continues, converts or deletes what a LOCAL run left. A LOCAL
+state in a directory a command reads is read only to be refused or
+reported as above, and `run --force` moves it aside; `doctor` lists the
+LOCAL sandbox cache, by size, among the sandbox directories. Nothing else
+of a LOCAL run is read, and keeping it costs disk space only.
+
+What a LOCAL run left, which you may archive or remove by hand:
+
+- its state file and its run logs in its state directory:
+  `<git dir>/autoforge/state` by default (`.git/autoforge/state` from a
+  main checkout, `.git/worktrees/<name>/autoforge/state` from a linked
+  one), or the `--state-dir` or non-default `state_dir` it was started
+  with. The state file is `state.json`, or `state.json.corrupt-<timestamp>`
+  once `run --force` has moved it aside; its `mode` field is `LOCAL`, and
+  its `run_id` field names its logs, `logs/<run_id>/`;
+- `<git dir>/autoforge/sandbox/local`, the sandbox cache, if a run used the
+  outer sandbox;
+- the `local:` block of the configuration file.
+
+A state directory can hold REMOTE runs as well, and removing it whole
+destroys them. A REMOTE run started there with the same `--state-dir` or
+`state_dir` keeps its `state.json` and `logs/<run_id>/` there, and so does
+the REMOTE run `run --force` started: after it, the directory holds that
+run's state and logs beside the LOCAL `state.json.corrupt-<timestamp>`.
+Before you archive or remove anything in a state directory:
+
+1. Run `autoforge status` on it (`--state-dir <dir>`, or the configuration
+   that names it). If it shows a run, that run is REMOTE and may be one you
+   are still running: keep `state.json` and `logs/<run_id>/` for the id on
+   its `Run:` line. `state.json` is the LOCAL run's only when `status` says
+   `state file has unknown mode 'LOCAL'`.
+2. Keep everything else that is not the LOCAL run's: the logs of other
+   runs, and every `.corrupt-` file whose `mode` field is not `LOCAL` (or
+   that has none), which an earlier REMOTE run left.
+3. Archive, then remove, only the LOCAL state file and its
+   `logs/<run_id>/`: for example `tar -czf local-run.tar.gz -C <dir>
+   <state file> logs/<run_id>`, then `rm -r <dir>/<state file>
+   <dir>/logs/<run_id>`, where `<state file>` is `state.json` or
+   `state.json.corrupt-<timestamp>`. Remove the directory itself only when
+   nothing else is left in it: `rmdir <dir>/logs <dir>` refuses otherwise.
+
+Never remove `<git common dir>/autoforge` as a whole: beside LOCAL's
+default state directory and sandbox cache, it holds REMOTE's worktrees,
+the repository lock, the scheduler's state and REMOTE's sandbox
+directories.
+
+`features/<slug>.md` and the changes a LOCAL run made in the working tree
+are your own work, not runtime state, and nothing above removes them: keep,
+commit or discard them as you would any other change. The working tree
+also holds the configuration file and, by default, REMOTE's state
+directory `.autoforge`; a clean-up of the working tree must keep both.
+
+`sandbox.mode: preferred` stays an accepted value and now means `required`
+everywhere: its fallback to logical isolation existed only in LOCAL. No
+REMOTE launch changes, and a REMOTE run pinned to `preferred` compares as
+before.
+
 ### The outer sandbox says why a kernel lacks the Landlock scope, not only that it does (#349)
 
 - A host whose kernel did not report a Landlock ABI was told "the kernel's

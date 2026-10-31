@@ -113,8 +113,8 @@ class OpenSchedulerClaimsError(SchedulerStateError):
 class SchedulerStateDirError(ConfigurationError):
     """A standalone command was pointed at a state directory inside the scheduler root.
 
-    ``run``, ``step``, ``resume`` and ``local run`` refuse a ``--state-dir``
-    or ``config.state_dir`` that resolves inside
+    ``run``, ``step`` and ``resume`` refuse a ``--state-dir`` or
+    ``config.state_dir`` that resolves inside
     ``<git common dir>/autoforge/scheduler/`` (ADR 0008 D17.3, #178), before
     the lock is taken or any state is read or written; the message names the
     scheduler commands instead. ``status`` reads such a directory and

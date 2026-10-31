@@ -1712,28 +1712,6 @@ def test_a_command_shared_by_pi_and_opencode_must_pass_both_floors(tmp_path, ver
     assert sorted(probes) == ["--version", "--version", "auth"]
 
 
-def test_local_doctor_checks_a_pi_reviewer(tmp_path):
-    root = tmp_path / "repo"
-    root.mkdir()
-    config = _write_config(
-        tmp_path,
-        {"review_round_1": _pi_profile()},
-        {"local": {"max_fix_rounds": 0}},
-    )
-    base = _pi_runner()
-
-    def runner(req):
-        if req.command[:2] == ["git", "rev-parse"]:
-            return ExecutionResult(req.command, req.cwd, 0, str(root) + "\n", "", "t", "t")
-        return base(req)
-
-    d = Doctor(config_path=config, cwd=str(root), state_dir=str(tmp_path / "state"), runner=runner)
-    results = {r.name: r for r in d.run_local()}
-    assert results["agent 'pi' available (review_round_1)"].ok
-    assert results["agent 'pi' auth ready (review_round_1)"].ok
-    assert results["loop detection"].detail.startswith("loop detection kill (")
-
-
 # -- instructions Pi loads from outside the checkout (#132) -----------------------
 PI_OUTSIDE = "pi loads no instructions from outside the checkout (review_round_2_5)"
 

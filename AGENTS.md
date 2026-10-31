@@ -215,7 +215,6 @@ docs/adr/                              accepted design records (LOCAL mode works
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
-docs/local-mode.md                     operator guide: LOCAL mode (no GitHub)
 docs/pi.md                             operator guide: Pi on a DeepSeek API key or a ChatGPT
                                        subscription, doctor's Pi rows, unattended use, the
                                        opt-in live smoke test

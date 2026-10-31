@@ -1003,28 +1003,6 @@ def test_a_local_agent_rewrites_what_a_dotdot_spelling_opens_which_is_why_it_is_
     assert twin.read_bytes() == _CONFIG_TEXT.encode()
 
 
-def test_a_required_local_run_with_its_config_file_in_the_root_launches_nothing(
-    backend, tmp_path, monkeypatch, capsys
-):
-    """#280 end to end on a host that enforces: the file the previous test
-    shows an agent rewriting is refused before the run exists, so no launch
-    ever writes it and it is byte-identical."""
-    from autoforge import cli
-
-    from .local_helpers import local_repo
-
-    root = local_repo(tmp_path / "work")
-    inside = _sentinel(root / "autoforge.json", _CONFIG_TEXT)
-    monkeypatch.chdir(root)
-    assert cli.main(["--config", str(inside), "local", "run", "features/add-filter.md"]) == 2
-    err = capsys.readouterr().err
-    assert f"the configuration file {inside} lies in {root}, a tree that " in err
-    assert "Nothing was run, launched or written." in err
-    assert inside.read_bytes() == _CONFIG_TEXT.encode()
-    assert not (root / ".git" / "autoforge" / "state").exists()
-    assert not (root / ".git" / "autoforge" / "sandbox").exists()
-
-
 _PROVIDERS_BY_DIR = {
     "CLAUDE_CONFIG_DIR": ClaudeCodeProvider,
     "PI_CODING_AGENT_DIR": PiProvider,
@@ -1145,34 +1123,6 @@ def test_a_remote_launch_rewrites_a_config_file_in_its_providers_directory_so_it
     assert problem.startswith(f"the configuration file {planted} lies in {directory}, "), problem
     assert f"(${variable}), which every sandboxed launch of {provider.name} " in problem
     assert config_file_placement_problem(cfg, str(elsewhere), repo) == ""
-
-
-def test_a_required_local_run_with_its_config_file_in_claudes_directory_launches_nothing(
-    backend, tmp_path, monkeypatch, capsys
-):
-    """#280 (R3-F1) end to end on a host that enforces: the file the previous
-    test shows a Claude Code launch rewriting is refused before the run
-    exists, though it lies outside the repository, so no launch ever writes
-    it and it is byte-identical."""
-    from autoforge import cli
-
-    from .local_helpers import local_repo
-
-    root = local_repo(tmp_path / "work")
-    directory = Path(os.path.realpath(tmp_path)) / "claude-autoforge"
-    planted = _sentinel(directory / "autoforge.json", _CONFIG_TEXT)
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(directory))
-    monkeypatch.chdir(root)
-    assert cli.main(["--config", str(planted), "local", "run", "features/add-filter.md"]) == 2
-    err = capsys.readouterr().err
-    assert (
-        f"the configuration file {planted} lies in {directory}, the Claude Code configuration "
-        "directory ($CLAUDE_CONFIG_DIR), which every sandboxed launch of claude "
-    ) in err
-    assert "Nothing was run, launched or written." in err
-    assert planted.read_bytes() == _CONFIG_TEXT.encode()
-    assert not (root / ".git" / "autoforge" / "state").exists()
-    assert not (root / ".git" / "autoforge" / "sandbox").exists()
 
 
 def test_an_export_command_sees_its_tree_and_no_network_when_isolated(backend, layout):

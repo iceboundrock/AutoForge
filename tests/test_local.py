@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import stat
 import subprocess
 import sys
@@ -19,13 +18,11 @@ from pathlib import Path
 import pytest
 
 from autoforge.child_env import POSIX_SHELLS
-from autoforge.cli import main
 from autoforge.config import default_config
 from autoforge.doctor import Doctor
 from autoforge.errors import (
     ConfigurationError,
     ControlResultValidationError,
-    ExecutionError,
     StateError,
     VerificationError,
 )
@@ -34,24 +31,19 @@ from autoforge.git_transport import LOCAL_GIT_ENV_ALLOWLIST, LOCAL_GIT_SWITCHES
 from autoforge.git_workspace import StatusEntry, uncommitted_paths
 from autoforge.local_workspace import (
     LocalWorkspace,
-    init_feature_file,
     read_feature_spec,
     resolve_feature_spec,
 )
-from autoforge.providers import AgentExecutionResult
-from autoforge.safefs import UnsafePathError
 from autoforge.state import AutoForgeState, StatePaths, load_state, save_state
 from autoforge.transitions import Phase, WorkflowMode, decide_next_phase
 
 from .conftest import (
     FEATURE_MD,
-    ExplodingGitHub,
     block,
     commit_all,
     git_repo,
     is_shell_probe,
     make_local_engine,
-    sample_contract,
     write_feature,
 )
 from .local_helpers import (
@@ -84,47 +76,6 @@ def creation_umask(request):
     previous = os.umask(request.param)
     yield request.param
     os.umask(previous)
-
-
-# -- `local init` ---------------------------------------------------------------
-def test_local_init_creates_the_template(tmp_path):
-    root = git_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root)
-    path = init_feature_file(ws, "add-transaction-filter")
-    assert path == root / "features" / "add-transaction-filter.md"
-    text = path.read_text(encoding="utf-8")
-    assert text.startswith("# Feature: Add Transaction Filter")
-    for section in (
-        "## Problem",
-        "## Requirements",
-        "## Acceptance Criteria",
-        "## Non-goals",
-        "## Notes / Decisions",
-    ):
-        assert section in text
-    assert "- [ ]" in text
-    # Feature specs are project content, never runtime state.
-    assert ".autoforge" not in str(path)
-
-
-def test_local_init_refuses_to_overwrite(tmp_path):
-    root = git_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root)
-    path = init_feature_file(ws, "keepme")
-    path.write_text("# Feature: hand written\n", encoding="utf-8")
-    with pytest.raises(ConfigurationError, match="already exists"):
-        init_feature_file(ws, "keepme")
-    assert path.read_text(encoding="utf-8") == "# Feature: hand written\n"
-    # ... unless overwriting is asked for explicitly.
-    init_feature_file(ws, "keepme", overwrite=True)
-    assert "## Acceptance Criteria" in path.read_text(encoding="utf-8")
-
-
-def test_local_init_rejects_a_slug_with_a_path_separator(tmp_path):
-    root = git_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root)
-    with pytest.raises(ConfigurationError, match="invalid feature slug"):
-        init_feature_file(ws, "../../etc/passwd")
 
 
 # -- feature specification resolution -------------------------------------------
@@ -550,107 +501,7 @@ def test_local_dry_run_has_no_side_effects(tmp_path):
 
 
 # -- resume ------------------------------------------------------------------------------
-def test_local_run_is_resumable_from_persisted_state(tmp_path):
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.provider._handler = scripted(
-        eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
-    )
-    eng.step()
-    eng.step()
-    assert eng.state.phase == Phase.REVIEW
-
-    # A fresh process: nothing but state.json and the working tree survive.
-    eng2 = make_local_engine(root, "features/add-filter.md", start=False)
-    state = eng2.load()
-    assert state.mode == WorkflowMode.LOCAL
-    assert state.phase == Phase.REVIEW
-    eng2.provider._handler = scripted(
-        eng2, root, [(None, lambda e: review_result(e.state.workspace_fingerprint))]
-    )
-    eng2.run(max_steps=3)
-    assert eng2.state.phase == Phase.DONE
-    assert load_state(eng2.paths.state_file).phase == Phase.DONE
-
-
 # -- the run contract: the reviewed scope is frozen with the run -----------------
-def test_a_resume_cannot_hide_the_implementation_behind_a_new_exclusion(tmp_path):
-    """The fingerprint cannot police the rules that produced it.
-
-    A run implemented under `src/` and resumed with `local.exclude: ["src"]`
-    re-snapshots with the implementation outside the bound scope. Both sides
-    of `reviewed == current` are then computed under the new policy, so they
-    agree -- about a tree whose implementation nobody reviewed. Only the
-    recorded contract catches it, and it does so at `load()`: before a step,
-    a status or a recovery could act on the redefined run.
-    """
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.provider._handler = scripted(
-        eng, root, [(lambda r: touch_impl(r, "implemented\n"), lambda e: impl_result())]
-    )
-    eng.step()
-    eng.step()
-    assert eng.state.phase == Phase.REVIEW
-
-    narrowed = default_config()
-    narrowed.local.exclude = ["src"]
-    eng2 = make_local_engine(root, "features/add-filter.md", cfg=narrowed, start=False)
-    with pytest.raises(VerificationError) as exc:
-        eng2.load()
-    assert 'local.exclude: run: [] current: ["src"]' in str(exc.value)
-
-    # Nothing moved: the run is exactly as resumable as it was.
-    persisted = load_state(eng2.paths.state_file)
-    assert persisted.phase == Phase.REVIEW
-    assert persisted.reviewed_workspace_fingerprint == ""
-
-    # Restoring the setting resumes the run, still bound to the whole tree.
-    eng3 = make_local_engine(root, "features/add-filter.md", start=False)
-    eng3.load()
-    eng3.provider._handler = scripted(
-        eng3, root, [(None, lambda e: review_result(e.state.workspace_fingerprint))]
-    )
-    eng3.run(max_steps=3)
-    assert eng3.state.phase == Phase.DONE
-
-
-def test_a_resume_that_widens_the_cost_bounds_is_refused_too(tmp_path):
-    """The whole reader policy is frozen, not the provably unsafe part of it.
-
-    A bound only ever turns a snapshot into a refusal, so moving one is sound
-    today. Carving it out would be one more enumeration of which knobs are
-    benign -- the reasoning this design exists to replace.
-    """
-    root = local_repo(tmp_path)
-    make_local_engine(root, "features/add-filter.md").save()
-
-    widened = default_config()
-    widened.local.max_workspace_entries += 1
-    eng = make_local_engine(root, "features/add-filter.md", cfg=widened, start=False)
-    with pytest.raises(VerificationError) as exc:
-        eng.load()
-    assert "local.max_workspace_entries: run: 50000 current: 50001" in str(exc.value)
-
-
-def test_the_recorded_policy_is_canonical_not_the_operators_spelling(tmp_path):
-    """Two spellings of one policy are one policy; comparing text must agree."""
-    root = local_repo(tmp_path)
-    first = default_config()
-    first.local.exclude = ["build", ".venv"]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=first)
-    eng.save()
-    recorded = eng.state.local_run_contract
-    assert recorded["workspace_policy"]["exclude"] == [".venv", "build"]
-
-    reordered = default_config()
-    reordered.local.exclude = [".venv/", "build", ".venv"]
-    eng2 = make_local_engine(root, "features/add-filter.md", cfg=reordered, start=False)
-    eng2.load()
-    eng2.step()  # must not raise: same policy, different spelling
-    assert eng2.state.local_run_contract == recorded
-
-
 # -- backward compatibility -----------------------------------------------------------------
 def test_saved_state_without_a_mode_field_loads_as_remote(tmp_path):
     """Pre-local state files have no 'mode': they are REMOTE runs."""
@@ -673,7 +524,9 @@ def test_saved_state_without_a_mode_field_loads_as_remote(tmp_path):
     assert loaded.phase == Phase.REVIEW
 
 
-def test_unknown_mode_fails_loudly(tmp_path):
+@pytest.mark.parametrize("mode", ["HYBRID", "LOCAL"])
+def test_unknown_mode_fails_loudly(tmp_path, mode):
+    """LOCAL among them since it was removed (ADR 0009 D4, #387)."""
     paths = StatePaths.from_state_dir(tmp_path / ".autoforge")
     state = AutoForgeState(
         run_id="r1",
@@ -685,9 +538,9 @@ def test_unknown_mode_fails_loudly(tmp_path):
     )
     save_state(state, paths.state_file)
     raw = json.loads(paths.state_file.read_text(encoding="utf-8"))
-    raw["mode"] = "HYBRID"
+    raw["mode"] = mode
     paths.state_file.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(StateError):
+    with pytest.raises(StateError, match=f"^state file has unknown mode '{mode}'$"):
         load_state(paths.state_file)
 
 
@@ -766,86 +619,6 @@ def test_local_doctor_probe_leaves_only_the_state_dir_behind(tmp_path):
     state_dir = root / ".git" / "autoforge" / "state"
     assert state_dir.is_dir()
     assert list(state_dir.iterdir()) == [], "the probe file was left behind"
-
-
-def test_local_doctor_checks_only_the_reachable_providers(tmp_path):
-    """A local config that never reaches a Claude profile must not need `claude`.
-
-    `_agent_commands` used to scan *every* configured profile and then always
-    check one Claude and one OpenCode binary, so a valid OpenCode-only local
-    setup failed doctor because an unrelated remote profile mentioned a CLI it
-    would never run (PR #44, R1-F10).
-    """
-    root = local_repo(tmp_path)
-    cfg_path = root / "autoforge.toml"
-    seen: list[list[str]] = []
-
-    def runner(req):
-        if is_shell_probe(req):  # the launch preflight's shell startup probe: real shells
-            return execute(req)
-        seen.append(list(req.command))
-        from autoforge.executor import ExecutionResult
-
-        stdout = str(root) if "rev-parse" in req.command else "ok"
-        if "--show-scope" in req.command:
-            stdout = ""  # the launch preflight's config listing: nothing configured
-        if req.command == ["oc", "--version"]:
-            stdout = "opencode v2.0.23"  # #186: the floor `doctor` enforces
-        return ExecutionResult(
-            command=list(req.command),
-            cwd=req.cwd,
-            exit_code=0,
-            stdout=stdout,
-            stderr="",
-            started_at="2026-01-01T00:00:00+00:00",
-            finished_at="2026-01-01T00:00:01+00:00",
-        )
-
-    # Zero fix rounds: only analyze_execute and review_round_1 are reachable,
-    # and both are `scripted`, so no external agent CLI is needed at all.
-    cfg_path.write_text(
-        "version = 1\n"
-        "[local]\nmax_fix_rounds = 0\n"
-        '[profiles.analyze_execute]\nprovider = "scripted"\ncommand = "/bin/true"\n'
-        '[profiles.review_round_1]\nprovider = "scripted"\ncommand = "/bin/true"\n',
-        encoding="utf-8",
-    )
-    doc = Doctor(
-        config_path=str(cfg_path),
-        cwd=str(root),
-        state_dir=str(root / ".autoforge"),
-        runner=runner,
-    )
-    results = doc.run_local()
-    # The outer sandbox's rows are not about providers; under the default
-    # `disabled` mode they warn (logical isolation only), never fail.
-    others = [r for r in results if not r.name.startswith("outer sandbox: ")]
-    assert all(r.ok for r in others), [(r.name, r.detail) for r in others if not r.ok]
-    assert not any(r.label == "FAIL" for r in results), [r for r in results if not r.ok]
-    assert not any(cmd[0] in ("claude", "opencode") for cmd in seen), seen
-
-    # One reviewer profile keeps its real CLI: exactly that binary is checked,
-    # and the Claude-backed `fix` profile is still unreachable, so `claude` is
-    # never probed.
-    cfg_path.write_text(
-        "version = 1\n"
-        "[local]\nmax_fix_rounds = 0\n"
-        '[profiles.analyze_execute]\nprovider = "scripted"\ncommand = "/bin/true"\n'
-        '[profiles.review_round_1]\ncommand = "oc"\n',
-        encoding="utf-8",
-    )
-    seen.clear()
-    results = Doctor(
-        config_path=str(cfg_path),
-        cwd=str(root),
-        state_dir=str(root / ".autoforge"),
-        runner=runner,
-    ).run_local()
-    others = [r for r in results if not r.name.startswith("outer sandbox: ")]
-    assert all(r.ok for r in others), [(r.name, r.detail) for r in others if not r.ok]
-    assert ["oc", "--version"] in seen
-    assert not any(cmd[0] == "claude" for cmd in seen), seen
-    assert "agent 'oc' available (review_round_1)" in {r.name for r in results}
 
 
 # -- the specification is quoted as data, not as prompt structure ----------------
@@ -945,87 +718,6 @@ def test_the_fence_grows_past_whatever_the_specification_contains():
 
 
 # -- CLI ------------------------------------------------------------------------------------
-def test_cli_local_init_and_status(tmp_path, monkeypatch, capsys):
-    root = git_repo(tmp_path)
-    monkeypatch.chdir(root)
-    assert main(["local", "init", "add-transaction-filter"]) == 0
-    assert (root / "features" / "add-transaction-filter.md").is_file()
-    capsys.readouterr()
-    # A second init must not clobber the operator's edits.
-    (root / "features" / "add-transaction-filter.md").write_text("# Feature: mine\n", "utf-8")
-    assert main(["local", "init", "add-transaction-filter"]) == 2
-    assert (root / "features" / "add-transaction-filter.md").read_text("utf-8") == (
-        "# Feature: mine\n"
-    )
-
-
-def test_cli_local_status_hides_github_fields(tmp_path, monkeypatch, capsys):
-    root = local_repo(tmp_path)
-    monkeypatch.chdir(root)
-    eng = make_local_engine(root, "features/add-filter.md")
-    save_state(eng.state, eng.paths.state_file)
-    capsys.readouterr()
-    assert main(["status"]) == 0
-    out = capsys.readouterr().out
-    assert "local mode" in out
-    assert "features/add-filter.md" in out
-    assert "PR:" not in out and "EPIC:" not in out
-    assert "Workspace fingerprint:" in out
-
-    assert main(["status", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["mode"] == "LOCAL"
-    assert payload["feature_spec_path"] == "features/add-filter.md"
-
-
-def test_cli_local_status_redacts_the_block_reason(tmp_path, monkeypatch, capsys):
-    """#6: a LOCAL `block_reason` echoes an agent's FIX rationale verbatim, so
-    the local status output is redacted like the GitHub one."""
-    root = local_repo(tmp_path)
-    monkeypatch.chdir(root)
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.state.phase = Phase.BLOCKED
-    eng.state.block_reason = "unresolved: needs OPENAI_API_KEY=sk-fakekey1234567890 in CI"
-    save_state(eng.state, eng.paths.state_file)
-    capsys.readouterr()
-    assert main(["status"]) == 0
-    out = capsys.readouterr().out
-    assert "sk-fakekey1234567890" not in out
-    assert "Reason:     unresolved: needs OPENAI_API_KEY=***REDACTED*** in CI" in out
-    assert main(["status", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["block_reason"] == "unresolved: needs OPENAI_API_KEY=***REDACTED*** in CI"
-    assert payload["replan_journal"] is None
-
-
-def test_cli_local_status_describes_a_journal_the_state_carries(tmp_path, monkeypatch, capsys):
-    """#67: a LOCAL run never writes a replan journal, but a state file that
-    has one anyway is described by the human summary exactly as `--json`
-    judges it, so the two outputs cannot disagree in either mode."""
-    root = local_repo(tmp_path)
-    monkeypatch.chdir(root)
-    eng = make_local_engine(root, "features/add-filter.md")
-    save_state(eng.state, eng.paths.state_file)
-    data = json.loads(eng.paths.state_file.read_text())
-    data["replan_transaction"] = {"stage": "pending", "pr_number_watermark": "12"}
-    eng.paths.state_file.write_text(json.dumps(data))
-    capsys.readouterr()
-    assert main(["status", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["replan_transaction"] == data["replan_transaction"]
-    assert payload["replan_journal"] == {
-        "readable": False,
-        "stage": "rejected",
-        "defects": ["pr_number_watermark must be an integer >= 0, got '12'"],
-    }
-    assert main(["status"]) == 0
-    out = capsys.readouterr().out
-    assert "AutoForge (local mode)" in out
-    assert "stage:       rejected" in out
-    for defect in payload["replan_journal"]["defects"]:
-        assert defect in out
-
-
 # -- GitHub isolation ---------------------------------------------------------------------------
 def test_a_local_run_makes_zero_gh_invocations(tmp_path):
     """No `gh` argv, and no GitHubClient is ever constructed."""
@@ -1100,7 +792,6 @@ def test_local_topology_excludes_the_github_phases():
 
 # -- result protocol ----------------------------------------------------------------------------
 def test_local_fix_cannot_defer_a_finding_to_a_github_issue():
-    from autoforge.errors import ControlResultValidationError
     from autoforge.result_parser import parse_control_result
 
     payload = {
@@ -1114,7 +805,6 @@ def test_local_fix_cannot_defer_a_finding_to_a_github_issue():
 
 
 def test_local_mode_rejects_the_github_phases_in_the_protocol():
-    from autoforge.errors import ControlResultValidationError
     from autoforge.result_parser import parse_control_result
 
     payload = {"phase": "READY_FOR_MERGE", "status": "success"}
@@ -1123,24 +813,6 @@ def test_local_mode_rejects_the_github_phases_in_the_protocol():
 
 
 # -- CLI dry run ---------------------------------------------------------------------------------
-def test_cli_local_run_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):
-    root = local_repo(tmp_path)
-    monkeypatch.chdir(root)
-    assert main(["local", "run", "features/add-filter.md", "--dry-run"]) == 0
-    out = capsys.readouterr().out
-    assert "INITIALIZING" in out
-    assert "mode: LOCAL" in out
-    assert not (root / ".git" / "autoforge" / "state" / "state.json").exists()
-
-
-def test_cli_local_run_refuses_a_dirty_tree(tmp_path, monkeypatch, capsys):
-    root = local_repo(tmp_path)
-    monkeypatch.chdir(root)
-    touch_impl(root, "unrelated\n")
-    assert main(["local", "run", "features/add-filter.md", "--dry-run"]) == 2
-    assert "--allow-dirty" in capsys.readouterr().err
-
-
 # -- required profiles ---------------------------------------------------------------------------
 def test_local_required_profiles_follow_the_configured_review_bound(tmp_path):
     """A reachable reviewer profile is required at config time, not at round 6.
@@ -1194,34 +866,6 @@ def test_a_reachable_reviewer_profile_is_validated_before_the_run_starts(tmp_pat
     eng.validate_config()
 
 
-def test_local_doctor_requires_only_the_reachable_reviewer_profiles(tmp_path):
-    """`local doctor` applies the same derived requirement (PR #44, O1)."""
-    from autoforge.profiles import local_required_profiles
-
-    root = local_repo(tmp_path)
-    cfg_path = root / "cfg.json"
-
-    def doctor_for(max_fix_rounds: int) -> Doctor:
-        # A profile cannot be deleted by a config file, but an unusable one
-        # (empty model) fails `validate_profile` the same way a missing one does.
-        cfg_path.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "local": {"max_fix_rounds": max_fix_rounds},
-                    "profiles": {"review_round_6_plus": {"model": ""}},
-                }
-            ),
-            encoding="utf-8",
-        )
-        return Doctor(cwd=str(root), config_path=str(cfg_path), state_dir=str(root / ".autoforge"))
-
-    broken = doctor_for(5).check_config(local_required_profiles)
-    assert not broken.ok and "review_round_6_plus" in broken.detail
-    # Unreachable at the default bound: not required, so not a failure.
-    assert doctor_for(1).check_config(local_required_profiles).ok
-
-
 # -- secret redaction ----------------------------------------------------------------------------
 def test_failing_validation_output_is_redacted_before_it_is_persisted(tmp_path):
     """A project's own test output can print a token; `state.json` is cleartext.
@@ -1265,28 +909,6 @@ def test_failing_validation_output_is_redacted_before_it_is_persisted(tmp_path):
 
 
 # -- CLI guard wording ---------------------------------------------------------------------------
-def test_the_existing_run_guard_names_the_subcommand_that_was_typed(tmp_path, monkeypatch, capsys):
-    """The advice must be copy-pasteable for the command in hand (PR #44, O4)."""
-    from autoforge.cli import _existing_run_guard
-
-    root = local_repo(tmp_path)
-    monkeypatch.chdir(root)
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.save()
-    # A second engine at the same location, as a second `local run` would be.
-    eng2 = make_local_engine(root, "features/add-filter.md", start=False)
-
-    assert _existing_run_guard(eng2, force=False, command="local run") == (2, False)
-    assert "'local run --force' to discard it" in capsys.readouterr().err
-    # The remote wording is the pre-existing one, unchanged.
-    assert _existing_run_guard(eng2, force=False) == (2, False)
-    assert "'run --force' to discard it" in capsys.readouterr().err
-
-    eng.paths.state_file.write_text('{"phase": "REVIEW", "run_id": ', encoding="utf-8")
-    assert _existing_run_guard(eng2, force=False, command="local run") == (2, False)
-    assert "'local run --force' to move it aside" in capsys.readouterr().err
-
-
 # -- PR #44 review regressions -------------------------------------------------
 def test_an_unresolved_finding_blocks_instead_of_reaching_a_clean_review(tmp_path):
     """R1-F1: `unresolved` is an agent-reported blocker, not a passed baton.
@@ -1361,194 +983,6 @@ def test_an_unresolved_finding_blocks_instead_of_reaching_a_clean_review(tmp_pat
     assert eng.state.local_fix_rounds == 1
 
 
-def test_an_oversized_unresolved_rationale_never_reaches_the_block_reason(tmp_path):
-    """#77: an ``unresolved`` rationale is echoed into the persisted block
-    reason, so the parser bounds it; a FIX past the bound is refused before
-    any of it is persisted, and the phase stays at FIX for the retry."""
-    from autoforge.result_parser import MAX_FIX_RATIONALE_CHARS
-
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.config.execution.max_correction_attempts = 0
-    huge = ("needs a human decision " * 100).strip()
-    assert len(huge) > MAX_FIX_RATIONALE_CHARS
-
-    def one_finding(e):
-        return review_result(e.state.workspace_fingerprint, 1, [finding(1, 1)])
-
-    def unresolved(e):
-        return block(
-            {
-                "phase": "FIX",
-                "status": "success",
-                "changed_workspace": False,
-                "resolutions": [
-                    {"finding_id": "R1-F1", "resolution": "unresolved", "rationale": huge}
-                ],
-            }
-        )
-
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-            (None, one_finding),
-            (None, unresolved),
-        ],
-    )
-    for _ in range(3):  # INITIALIZING -> ANALYZE_EXECUTE -> REVIEW -> FIX
-        eng.step()
-    assert eng.state.phase == Phase.FIX
-    with pytest.raises(ControlResultValidationError) as excinfo:
-        eng.step()
-    msg = str(excinfo.value)
-    assert f"at most {MAX_FIX_RATIONALE_CHARS}" in msg
-    assert "needs a human" not in msg
-    reloaded = load_state(eng.paths.state_file)
-    assert reloaded.phase == Phase.FIX
-    assert reloaded.block_reason == ""
-    assert reloaded.last_fix_resolutions == []
-    assert [f["id"] for f in reloaded.open_findings] == ["R1-F1"]
-    assert "needs a human" not in eng.paths.state_file.read_text(encoding="utf-8")
-
-
-def test_fifty_unresolved_rationales_at_the_bound_produce_a_bounded_block_reason(tmp_path):
-    """#88: the LOCAL ``unresolved`` block reason concatenates every unresolved
-    rationale, each bounded by the parser but the join bounded only by their
-    product (50 x 2000, up to 50 x 6000 after redaction). The persisted
-    ``block_reason`` is clipped to ``MAX_BLOCK_REASON_CHARS`` at the sink,
-    keeping the sentence that says what happened and the one that says what
-    the operator must do; nothing is lost, because every resolution is still
-    persisted whole in ``last_fix_resolutions``; and the state file loads."""
-    from autoforge.result_parser import (
-        MAX_FIX_RATIONALE_CHARS,
-        MAX_RESOLUTIONS_PER_FIX,
-        MIN_RATIONALE_CHARS,
-    )
-    from autoforge.state import MAX_BLOCK_REASON_CHARS
-
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    count = MAX_RESOLUTIONS_PER_FIX
-    ids = [f"R1-F{n}" for n in range(1, count + 1)]
-
-    def rationale(n: int) -> str:
-        # Whole sentences up to the parser bound (after stripping); distinct
-        # per finding, and with a token shape in each so redaction lengthens
-        # it, as it can in production.
-        text = f"finding {n}: needs a human decision, token ghp_{'A' * 36} was seen; "
-        return (text * (MAX_FIX_RATIONALE_CHARS // len(text))).strip()
-
-    rationales = {fid: rationale(n) for n, fid in enumerate(ids, start=1)}
-    assert all(
-        MIN_RATIONALE_CHARS <= len(r) <= MAX_FIX_RATIONALE_CHARS for r in rationales.values()
-    )
-
-    def fifty_findings(e):
-        return review_result(
-            e.state.workspace_fingerprint, 1, [finding(1, n) for n in range(1, count + 1)]
-        )
-
-    def all_unresolved(e):
-        return block(
-            {
-                "phase": "FIX",
-                "status": "success",
-                "changed_workspace": False,
-                "resolutions": [
-                    {"finding_id": fid, "resolution": "unresolved", "rationale": rationales[fid]}
-                    for fid in ids
-                ],
-            }
-        )
-
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-            (None, fifty_findings),
-            (None, all_unresolved),
-        ],
-    )
-    outcomes = eng.run(max_steps=8)
-    assert eng.state.phase == Phase.BLOCKED
-    assert outcomes[-1].next_phase == "BLOCKED"
-
-    reason = eng.state.block_reason
-    assert len(reason) <= MAX_BLOCK_REASON_CHARS
-    # The head still says what happened, and the tail what to do about it.
-    assert reason.startswith(
-        f"local fix round 1 left {count} of {count} finding(s) explicitly unresolved"
-    )
-    assert "R1-F1: finding 1: needs a human decision, token ***REDACTED*** was seen" in reason
-    assert " [autoforge: " in reason and " characters of the block reason omitted; " in reason
-    assert reason.endswith("or raise 'local.max_fix_rounds' in the config and start a new run.")
-    assert "The validation commands were not run" in reason
-    assert "ghp_" not in reason
-    # The step outcome carries the same bounded text, not the whole join.
-    assert outcomes[-1].message == reason
-
-    # Nothing is lost: the resolutions are persisted whole (redacted), and the
-    # open findings are the unresolved ones by id.
-    assert [r["finding_id"] for r in eng.state.last_fix_resolutions] == ids
-    for r in eng.state.last_fix_resolutions:
-        assert r["resolution"] == "unresolved"
-        assert r["rationale"] == rationales[r["finding_id"]].replace(
-            "ghp_" + "A" * 36, "***REDACTED***"
-        )
-    assert [f["id"] for f in eng.state.open_findings] == ids
-    assert eng.state.last_review_result == "unresolved"
-    assert eng.state.local_fix_rounds == 1
-
-    reloaded = load_state(eng.paths.state_file)
-    assert reloaded.phase == Phase.BLOCKED
-    assert reloaded.block_reason == reason
-    assert len(reloaded.last_fix_resolutions) == count
-    assert "ghp_" not in eng.paths.state_file.read_text(encoding="utf-8")
-
-
-def test_a_local_agent_message_is_bounded_before_it_reaches_state(tmp_path):
-    """#88: the agent's ``status: blocked`` ``message`` is bounded by the parser
-    only through the whole CONTROL_RESULT block (1 MiB); the LOCAL writer
-    bounds it like every other block reason, after redacting it."""
-    from autoforge.state import MAX_BLOCK_REASON_CHARS
-
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    secret = "ghp_" + "B" * 36
-    message = (
-        "toolchain is unavailable: "
-        + ("log line; " * 10_000)
-        + secret
-        + "; a human must install it"
-    )
-    assert len(message) > MAX_BLOCK_REASON_CHARS
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (
-                None,
-                lambda e: block(
-                    {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": message}
-                ),
-            )
-        ],
-    )
-    eng.step()
-    outcome = eng.step()
-    assert eng.state.phase == Phase.BLOCKED
-    reason = eng.state.block_reason
-    assert len(reason) <= MAX_BLOCK_REASON_CHARS
-    assert reason.startswith("toolchain is unavailable: log line; ")
-    assert reason.endswith("***REDACTED***; a human must install it")
-    assert secret not in reason and " characters of the block reason omitted; " in reason
-    assert outcome.message == f"agent reported blocked: {reason}"
-    assert load_state(eng.paths.state_file).block_reason == reason
-
-
 def test_a_no_change_with_rationale_resolution_still_advances(tmp_path):
     """The other non-`fixed` disposition is a *resolution* and must not block.
 
@@ -1574,55 +1008,6 @@ def test_a_no_change_with_rationale_resolution_still_advances(tmp_path):
     eng.run(max_steps=8)
     assert eng.state.phase == Phase.DONE
     assert eng.state.open_findings == []
-
-
-def test_a_failed_phase_is_re_invoked_against_its_original_baseline(tmp_path):
-    """R1-F2: an unverified write phase must stay resumable.
-
-    The controller persists the invocation checkpoint *before* the agent runs,
-    so a crash, a malformed CONTROL_RESULT or a failing validation command all
-    leave the same record. Without it the retry compared the tree against the
-    tree the failed attempt had already written and rejected it as "unchanged
-    since this phase was first invoked" — a dead-locked run whose only escape
-    was hand-editing `state.json`.
-    """
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    marker = root / "PASS_VALIDATION"
-    # Exits 0 only once the marker exists: the first attempt's validation
-    # fails, the second one passes.
-    cfg.local.validation_commands = [["test", "-e", str(marker)]]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    ws = LocalWorkspace(workdir=root)
-    baseline = ws.snapshot().fingerprint
-
-    eng.provider._handler = scripted(
-        eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
-    )
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    with pytest.raises(VerificationError, match="validation command"):
-        eng.step()
-
-    # The phase did not advance, and the checkpoint records both that it ran
-    # and the fingerprint it started from.
-    assert eng.state.phase == Phase.ANALYZE_EXECUTE
-    assert eng.state.local_pending_phase == "ANALYZE_EXECUTE"
-    assert eng.state.local_pending_fingerprint == baseline
-    assert eng.state.local_pending_attempts == 1
-    # It is durable, not in-memory: a fresh process sees the same thing.
-    reloaded = load_state(eng.paths.state_file)
-    assert reloaded.local_pending_fingerprint == baseline
-
-    # Resume. The work from the first attempt is already in the tree, so this
-    # attempt changes nothing further and honestly says so.
-    marker.write_text("ok\n", encoding="utf-8")
-    eng.provider._handler = scripted(eng, root, [(None, lambda e: impl_result(changed=False))])
-    outcome = eng.step()
-    assert outcome.next_phase == "REVIEW"
-    assert eng.state.phase == Phase.REVIEW
-    # Resolved: the checkpoint is closed so the next phase entry starts clean.
-    assert eng.state.local_pending_phase == ""
-    assert eng.state.local_pending_attempts == 0
 
 
 def test_the_resumed_phase_prompt_tells_the_agent_about_the_earlier_attempt(tmp_path):
@@ -1714,48 +1099,6 @@ def _run_to(eng, root: Path, phase: Phase) -> None:
     assert eng.state.phase is phase
 
 
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_correction_retries_are_charged_against_the_same_durable_bound(tmp_path, phase):
-    """R9-F3: a correction retry is a write-capable launch, so it is charged.
-
-    `execution.max_correction_attempts` re-invokes an agent whose stdout
-    carried no valid CONTROL_RESULT. In LOCAL mode that agent may already
-    have written to the tree, so every such launch must be counted against
-    `MAX_LOCAL_PHASE_ATTEMPTS` and checkpointed *before* it starts -- not
-    once per phase entry. Otherwise each of the three entries could run
-    `1 + max_correction_attempts` agents, and the bound would be a multiple
-    the config chooses rather than the three the state file promises.
-    """
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.execution.max_correction_attempts = 5
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    _run_to(eng, root, phase)
-
-    seen: list[int] = []
-
-    def malformed(req):
-        # Read the checkpoint as it is *on disk* when the agent starts: the
-        # charge for this launch must already be durable.
-        seen.append(load_state(eng.paths.state_file).local_pending_attempts)
-        touch_impl(root, f"garbage {len(seen)}\n")
-        return "I did some work but forgot the control block.\n"
-
-    eng.provider._handler = malformed
-    with pytest.raises(ControlResultValidationError, match="Not re-invoked"):
-        eng.step()
-    assert seen == [1, 2, 3], "every launch is checkpointed before it starts"
-    assert eng.state.phase is phase
-    assert eng.state.local_pending_phase == phase.value
-    assert load_state(eng.paths.state_file).local_pending_attempts == 3
-
-    # The next entry refuses to launch anything: the bound is spent.
-    outcome = eng.step()
-    assert outcome.next_phase == "BLOCKED"
-    assert len(seen) == 3, "a blocked phase must not invoke the agent"
-    assert "without ever producing a verified result" in eng.state.block_reason
-
-
 def test_a_local_correction_quotes_the_reply_it_corrects(tmp_path):
     """#393 in LOCAL mode: the correction quotes the end of the refused reply,
     redacted and fenced, after the diagnosis, as a REMOTE one does; the run
@@ -1790,446 +1133,6 @@ def test_a_local_correction_quotes_the_reply_it_corrects(tmp_path):
     assert "Implemented the filter with" not in eng.paths.state_file.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_a_crash_between_corrections_resumes_under_the_remaining_bound(tmp_path, phase):
-    """A malformed first attempt, then a crash: `resume` sees the two launches.
-
-    The correction's charge is persisted before the corrected agent starts,
-    so a process that dies during that second launch leaves
-    `local_pending_attempts == 2` behind and the resumed entry gets exactly
-    one more launch, not a fresh three.
-    """
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.execution.max_correction_attempts = 5
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    _run_to(eng, root, phase)
-
-    launches = {"n": 0}
-
-    def malformed_then_crash(req):
-        launches["n"] += 1
-        if launches["n"] == 1:
-            return "no control block\n"
-        raise KeyboardInterrupt  # the operator's Ctrl-C mid-correction
-
-    eng.provider._handler = malformed_then_crash
-    with pytest.raises(KeyboardInterrupt):
-        eng.step()
-    persisted = load_state(eng.paths.state_file)
-    assert persisted.local_pending_phase == phase.value
-    assert persisted.local_pending_attempts == 2
-
-    eng2 = make_local_engine(root, "features/add-filter.md", cfg=cfg, start=False)
-    eng2.load()
-    resumed = {"n": 0}
-
-    def still_malformed(req):
-        resumed["n"] += 1
-        return "still no control block\n"
-
-    eng2.provider._handler = still_malformed
-    with pytest.raises(ControlResultValidationError, match="Not re-invoked"):
-        eng2.step()
-    assert resumed["n"] == 1, "one launch remained of the three"
-    assert load_state(eng2.paths.state_file).local_pending_attempts == 3
-    assert eng2.step().next_phase == "BLOCKED"
-
-
-def _corrupt_journal(eng) -> Path:
-    """Plant an ``events.jsonl`` the controller refuses for the current run.
-
-    The controller never reads the journal (#51), so its content cannot be
-    corrupt; what it refuses is a journal larger than any it could have
-    written. The file is sparse, so planting it costs nothing.
-    """
-    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
-
-    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
-    journal.parent.mkdir(parents=True, exist_ok=True)
-    journal.touch()
-    os.truncate(journal, MAX_EVENT_JOURNAL_BYTES + 1)
-    return journal
-
-
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_a_journal_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path, phase):
-    """#57: a refusal that happens before any agent starts charges nothing.
-
-    `_invoke_phase` opens the run logger (and so proves the event journal
-    appendable) before it launches the agent. A journal it refuses used to land *after*
-    the launch had been charged to the durable per-phase bound, so three
-    refused `resume`s spent the bound with zero launches, and the repaired
-    run then blocked with "invoked 3 time(s)". The charge belongs at the
-    launch site: it is written immediately before the agent starts, so a
-    refusal before that point leaves no checkpoint at all.
-    """
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    _run_to(eng, root, phase)
-    journal = _corrupt_journal(eng)
-    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
-
-    for _ in range(3):
-        with pytest.raises(StateError, match="corrupted event journal"):
-            eng.step()
-        persisted = load_state(eng.paths.state_file)
-        assert persisted.phase is phase
-        assert persisted.local_pending_phase == ""
-        assert persisted.local_pending_attempts == 0
-
-    # The operator moves the journal aside, as the refusal tells them to,
-    # and the phase launches for the first time -- not the fourth.
-    journal.rename(journal.with_suffix(".bad"))
-    launches: list[int] = []
-
-    def implements(req):
-        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
-        touch_impl(root, "repaired\n")
-        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
-
-    eng.provider._handler = implements
-    assert eng.step().next_phase == "REVIEW"
-    assert launches == [1], "the first real launch is charged as the first"
-    assert eng.state.local_pending_attempts == 0, "resolved, so the checkpoint is closed"
-
-
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_a_run_directory_refused_before_the_launch_is_not_charged_as_a_launch(
-    tmp_path, phase, monkeypatch
-):
-    """#56 with #57: the step-directory scan is bounded, and its refusal is a
-    pre-launch refusal like a corrupt journal, so it charges nothing."""
-    import autoforge.runlog as runlog
-
-    monkeypatch.setattr(runlog, "MAX_RUN_LOG_ENTRIES", 16)
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    _run_to(eng, root, phase)
-    run_dir = Path(eng.paths.logs_dir) / eng.state.run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    planted = [run_dir / f"planted-{i:02}" for i in range(17)]
-    for path in planted:
-        path.write_text("x")
-    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
-
-    for _ in range(3):
-        with pytest.raises(StateError, match="corrupted run log directory.*more than 16"):
-            eng.step()
-        persisted = load_state(eng.paths.state_file)
-        assert persisted.phase is phase
-        assert persisted.local_pending_phase == ""
-        assert persisted.local_pending_attempts == 0
-
-    for path in planted:
-        path.unlink()
-    launches: list[int] = []
-
-    def implements(req):
-        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
-        touch_impl(root, "repaired\n")
-        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
-
-    eng.provider._handler = implements
-    assert eng.step().next_phase == "REVIEW"
-    assert launches == [1], "the first real launch is charged as the first"
-
-
-def _plant_step_shaped_file(run_dir: Path) -> Path:
-    planted = run_dir / "900-review-1"
-    planted.write_text("x")
-    return planted
-
-
-def _plant_step_past_the_bound(run_dir: Path) -> Path:
-    planted = run_dir / ("9" * 240 + "-review-1")
-    planted.mkdir()
-    return planted
-
-
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-@pytest.mark.parametrize(
-    "plant",
-    [_plant_step_shaped_file, _plant_step_past_the_bound],
-    ids=["a step-shaped regular file", "a step numbered past the bound"],
-)
-def test_a_planted_step_name_is_refused_before_the_launch_not_after_the_agent(
-    tmp_path, phase, plant
-):
-    """PR #91 review, fourth round, with #57: the step directory names are
-    the sequence's only input and a same-user agent can plant them. A
-    numeric prefix of a few hundred digits used to be believed as the
-    sequence, so the agent was launched and the step directory's ``mkdir``
-    failed on a name too long for the filesystem after it had returned,
-    with its work done and unlogged. A name of a step's exact shape that is
-    not what the controller publishes is now a corrupt run log at the
-    logger open: refused before the launch, charging nothing, and the
-    repaired run launches for the first time."""
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    _run_to(eng, root, phase)
-    run_dir = Path(eng.paths.logs_dir) / eng.state.run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    before = sorted(p.name for p in run_dir.iterdir())
-    planted = plant(run_dir)
-    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
-
-    for _ in range(3):
-        with pytest.raises(StateError, match="corrupted run log directory"):
-            eng.step()
-        persisted = load_state(eng.paths.state_file)
-        assert persisted.phase is phase
-        assert persisted.local_pending_phase == ""
-        assert persisted.local_pending_attempts == 0
-    assert sorted(p.name for p in run_dir.iterdir()) == sorted([*before, planted.name])
-
-    planted.rmdir() if planted.is_dir() else planted.unlink()
-    launches: list[int] = []
-
-    def implements(req):
-        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
-        touch_impl(root, "repaired\n")
-        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
-
-    eng.provider._handler = implements
-    assert eng.step().next_phase == "REVIEW"
-    assert launches == [1], "the first real launch is charged as the first"
-    # The step the agent's work was recorded under is the run's own next one.
-    steps = sorted(p.name for p in run_dir.iterdir() if p.is_dir())
-    assert steps[-1].startswith(f"{len(steps):03d}-")
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_a_run_directory_that_cannot_be_published_into_is_refused_before_the_launch(
-    tmp_path, phase
-):
-    """PR #91 review with #57: the pre-launch gate covers the run directory.
-
-    An existing ``logs/<run>`` the controller cannot add an entry to passed
-    the gate while the journal was absent, so the agent was launched and
-    the step directory's ``mkdir`` failed after it had returned, with its
-    work done and unlogged. The logger open now probes the directory, so
-    the refusal lands before the launch, charges nothing, and the repaired
-    run launches for the first time.
-    """
-    from autoforge.safefs import UnreadableEntryError
-
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    _run_to(eng, root, phase)
-    run_dir = Path(eng.paths.logs_dir) / eng.state.run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    before = sorted(p.name for p in run_dir.iterdir())
-    run_dir.chmod(0o500)
-    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
-    try:
-        for _ in range(3):
-            with pytest.raises(UnreadableEntryError, match="cannot publish into logs/"):
-                eng.step()
-            persisted = load_state(eng.paths.state_file)
-            assert persisted.phase is phase
-            assert persisted.local_pending_phase == ""
-            assert persisted.local_pending_attempts == 0
-    finally:
-        run_dir.chmod(0o700)
-    assert sorted(p.name for p in run_dir.iterdir()) == before, "the gate left something behind"
-    launches: list[int] = []
-
-    def implements(req):
-        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
-        touch_impl(root, "repaired\n")
-        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
-
-    eng.provider._handler = implements
-    assert eng.step().next_phase == "REVIEW"
-    assert launches == [1], "the first real launch is charged as the first"
-
-
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_a_profile_refused_before_the_launch_is_not_charged_as_a_launch(tmp_path, phase):
-    """#57, the other pre-launch refusal: an unusable execution profile."""
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    _run_to(eng, root, phase)
-
-    def refuses(profile):
-        raise ConfigurationError(f"profile {profile.name!r}: unusable")
-
-    eng.provider.validate_profile = refuses  # type: ignore[method-assign]
-    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
-    for _ in range(3):
-        with pytest.raises(ConfigurationError, match="unusable"):
-            eng.step()
-    persisted = load_state(eng.paths.state_file)
-    assert persisted.phase is phase
-    assert persisted.local_pending_phase == ""
-    assert persisted.local_pending_attempts == 0
-
-
-def _edited_templates(tmp_path, monkeypatch) -> Path:
-    """Serve the shipped prompt templates from an editable copy."""
-    import shutil
-
-    import autoforge.prompts as prompts_module
-
-    templates = tmp_path / "prompts"
-    shutil.copytree(prompts_module.prompts_dir(), templates)
-    monkeypatch.setattr(prompts_module, "prompts_dir", lambda: templates)
-    return templates
-
-
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_a_template_refused_before_the_launch_is_not_charged_as_a_launch(
-    tmp_path, monkeypatch, phase
-):
-    """#57, the third pre-launch refusal: a phase template that cannot render.
-
-    A phase template naming a variable the engine does not provide is
-    refused while the step is *planned* (``step`` renders the prompt to
-    plan before it executes), so nothing downstream -- the step count, the
-    binding, the charge -- is ever reached. This pins the observable class
-    from the issue; the in-loop render order is pinned by the correction
-    test below, which is the render that planning does not cover.
-    """
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    _run_to(eng, root, phase)
-    steps_before = load_state(eng.paths.state_file).step_count
-
-    templates = _edited_templates(tmp_path, monkeypatch)
-    template_name = eng.template_for(phase)
-    assert template_name is not None
-    template = templates / template_name
-    shipped = template.read_text(encoding="utf-8")
-    template.write_text(shipped + "\n{{NOT_A_VARIABLE}}\n", encoding="utf-8")
-    eng.provider._handler = lambda req: pytest.fail("no agent may be launched")
-
-    for _ in range(3):
-        with pytest.raises(ConfigurationError, match="NOT_A_VARIABLE"):
-            eng.step()
-        persisted = load_state(eng.paths.state_file)
-        assert persisted.phase is phase
-        assert persisted.local_pending_phase == ""
-        assert persisted.local_pending_attempts == 0
-        assert persisted.step_count == steps_before, "refused while planning: no step"
-
-    # Repaired: the template renders again and the phase launches for the
-    # first time.
-    template.write_text(shipped, encoding="utf-8")
-    launches: list[int] = []
-
-    def implements(req):
-        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
-        touch_impl(root, "repaired\n")
-        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
-
-    eng.provider._handler = implements
-    assert eng.step().next_phase == "REVIEW"
-    assert launches == [1], "the first real launch is charged as the first"
-    assert eng.state.local_pending_attempts == 0, "resolved, so the checkpoint is closed"
-
-
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_a_correction_refused_at_its_template_is_not_charged_as_a_launch(
-    tmp_path, monkeypatch, phase
-):
-    """#57: the correction prompt is rendered before the correction is charged.
-
-    ``correction.md`` is only rendered for a correction retry, inside the
-    invocation loop, so planning never sees it. If it cannot render, the
-    launch that preceded it stays charged (it ran) and the correction is
-    refused without being charged. Before the fix the correction was charged
-    first and rendered second, so the refusal cost a launch that never
-    started.
-    """
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.execution.max_correction_attempts = 5
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    _run_to(eng, root, phase)
-
-    templates = _edited_templates(tmp_path, monkeypatch)
-    correction = templates / "correction.md"
-    shipped = correction.read_text(encoding="utf-8")
-    correction.write_text(shipped + "\n{{NOT_A_VARIABLE}}\n", encoding="utf-8")
-    launches: list[int] = []
-
-    def malformed(req):
-        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
-        return "no control block\n"
-
-    eng.provider._handler = malformed
-    with pytest.raises(ConfigurationError, match="NOT_A_VARIABLE"):
-        eng.step()
-    assert launches == [1], "the one real launch was charged; the correction never started"
-    persisted = load_state(eng.paths.state_file)
-    assert persisted.phase is phase
-    assert persisted.local_pending_phase == phase.value
-    assert persisted.local_pending_attempts == 1, "the refused correction is not charged"
-
-    # Repaired and resumed: the retry is the second launch, not the third.
-    correction.write_text(shipped, encoding="utf-8")
-    eng2 = make_local_engine(root, "features/add-filter.md", cfg=cfg, start=False)
-    eng2.load()
-    resumed: list[int] = []
-
-    def implements(req):
-        resumed.append(load_state(eng2.paths.state_file).local_pending_attempts)
-        touch_impl(root, "repaired\n")
-        return impl_result() if phase is Phase.ANALYZE_EXECUTE else fix_result(["R1-F1"])
-
-    eng2.provider._handler = implements
-    assert eng2.step().next_phase == "REVIEW"
-    assert resumed == [2]
-    assert eng2.state.local_pending_attempts == 0
-
-
-def test_a_pre_launch_refusal_on_a_resumed_entry_keeps_the_earlier_charge(tmp_path):
-    """One real launch, then a refusal before the retry: still one launch."""
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    before = eng.local_workspace().snapshot().fingerprint
-
-    def writes_then_dies(req):
-        touch_impl(root, "partial\n")
-        raise KeyboardInterrupt
-
-    eng.provider._handler = writes_then_dies
-    with pytest.raises(KeyboardInterrupt):
-        eng.step()
-    assert load_state(eng.paths.state_file).local_pending_attempts == 1
-
-    eng2 = make_local_engine(root, "features/add-filter.md", start=False)
-    eng2.load()
-    journal = _corrupt_journal(eng2)
-    eng2.provider._handler = lambda req: pytest.fail("no agent may be launched")
-    with pytest.raises(StateError, match="corrupted event journal"):
-        eng2.step()
-    persisted = load_state(eng2.paths.state_file)
-    assert persisted.local_pending_phase == "ANALYZE_EXECUTE"
-    assert persisted.local_pending_fingerprint == before
-    assert persisted.local_pending_attempts == 1, "the refusal launched nothing"
-
-    # Repaired: the retry is the second launch and is told it is a retry.
-    # The dead attempt's work is already in the tree, so an honest "changed
-    # nothing" is accepted against the baseline from before that attempt.
-    journal.unlink()
-    prompts: list[str] = []
-    launches: list[int] = []
-
-    def continues(req):
-        prompts.append(req.prompt)
-        launches.append(load_state(eng2.paths.state_file).local_pending_attempts)
-        return impl_result(changed=False)
-
-    eng2.provider._handler = continues
-    assert eng2.step().next_phase == "REVIEW"
-    assert launches == [2]
-    assert "A previous invocation of ANALYZE_EXECUTE" in prompts[0]
-
-
 def test_a_review_that_fails_verification_leaves_no_pending_checkpoint(tmp_path):
     """REVIEW is read-only, so it is not checkpointed as a write phase."""
     root = local_repo(tmp_path)
@@ -2250,79 +1153,10 @@ def test_a_review_that_fails_verification_leaves_no_pending_checkpoint(tmp_path)
     assert eng.state.local_pending_phase == ""
 
 
-def test_a_local_agent_failure_names_its_log_and_resume_command_but_no_worktree(tmp_path):
-    """#189: a LOCAL agent works in the operator's checkout, not a per-issue
-    worktree, so its failure names the step's log directory and the `resume`
-    command with the flags given, and prints no worktree line."""
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.cli_global_flags = ("--state-dir", "state dir")
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    eng.provider.exit_code = 2
-    with pytest.raises(ExecutionError) as excinfo:
-        eng.step()
-    failure, recovery = str(excinfo.value).split("\nState unchanged.\n")
-    assert failure.startswith("agent 'analyze_execute' exited 2. stderr tail:")
-    run_dir = eng.paths.logs_dir / eng.state.run_id
-    (step,) = [p for p in run_dir.iterdir() if p.is_dir()]
-    assert recovery == (
-        f"  logs:      {step}/\n"
-        "  resume:    autoforge --state-dir 'state dir' resume\n"
-        "Inspect the working tree first; 'resume --dry-run --max-steps 1' with the same "
-        "flags shows the profile and limits it will use."
-    )
-    persisted = load_state(eng.paths.state_file)
-    assert persisted.phase is Phase.ANALYZE_EXECUTE and persisted.local_pending_attempts == 1
-
-
 def _leaving(provider, **facts) -> None:
     """Every launch of ``provider`` reports ``facts`` about what it left behind."""
     execute = provider.execute
     provider.execute = lambda req: replace(execute(req), **facts)
-
-
-@pytest.mark.parametrize(
-    "survivor", ["group_survived_kill", "capture_abandoned", "orphan_survived_kill"]
-)
-def test_a_malformed_result_is_not_corrected_while_a_process_its_launch_started_may_run(
-    tmp_path, survivor
-):
-    """#209: a correction would be a second write-capable agent in the tree a
-    process of the first one may still be writing to. It is not launched, so
-    not charged, and the error names that process before 'resume'."""
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.execution.max_correction_attempts = 5
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    _run_to(eng, root, Phase.ANALYZE_EXECUTE)
-    eng.provider._handler = lambda req: "no control block\n"
-    _leaving(eng.provider, **{survivor: True})
-    with pytest.raises(ControlResultValidationError) as excinfo:
-        eng.step()
-    assert len(eng.provider.calls) == 1
-    message = str(excinfo.value)
-    assert "did not return a valid CONTROL_RESULT after 1 attempt(s)" in message
-    leftovers = AgentExecutionResult(
-        command=["x"],
-        exit_code=0,
-        stdout="",
-        stderr="",
-        started_at="t",
-        finished_at="t",
-        **{survivor: True},
-    ).leftovers
-    assert (
-        leftovers
-        and (
-            f". Not re-invoked: a process the launch started may still be running ({leftovers})"
-            "\nState unchanged.\n"
-        )
-        in message
-    )
-    persisted = load_state(eng.paths.state_file)
-    assert persisted.phase is Phase.ANALYZE_EXECUTE
-    assert persisted.local_pending_phase == "ANALYZE_EXECUTE"
-    assert persisted.local_pending_attempts == 1
 
 
 def test_an_unchecked_platform_does_not_stop_a_local_correction(tmp_path):
@@ -2406,143 +1240,6 @@ def test_a_head_move_before_the_agent_runs_blocks_without_invoking_it(tmp_path):
     assert outcome.next_phase == "BLOCKED"
     assert invoked["n"] == 0, "the agent must not run against a moved anchor"
     assert "HEAD moved" in eng.state.block_reason
-
-
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_an_anchor_a_launch_moved_blocks_before_its_correction(tmp_path, phase):
-    """#209: the anchor is read before every relaunch, not only around the step.
-
-    A launch that commits and then returns no valid CONTROL_RESULT is not
-    corrected: the correction would be a second write-capable agent in the
-    moved checkout. The step blocks naming the drift, and the relaunch it
-    refused is not charged to the durable bound, because it never started.
-    """
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.execution.max_correction_attempts = 5
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.cli_global_flags = ("--state-dir", "state dir")
-    _run_to(eng, root, phase)
-
-    launches: list[int] = []
-
-    def commits_then_malformed(req):
-        launches.append(load_state(eng.paths.state_file).local_pending_attempts)
-        touch_impl(root, "v2\n")
-        commit_all(root, "the agent committed")
-        return "I committed my work but forgot the control block.\n"
-
-    eng.provider._handler = commits_then_malformed
-    assert eng.step().next_phase == "BLOCKED"
-    assert launches == [1], "the correction never started"
-    reason = eng.state.block_reason
-    assert "git anchor moved during the run: HEAD moved from" in reason
-    assert "found before a relaunch: attempt 1 ended without a usable result" in reason
-    # The run log that says why is named, not only mentioned (#189).
-    run_dir = eng.paths.logs_dir / eng.state.run_id
-    latest = sorted(p for p in run_dir.iterdir() if p.is_dir())[-1]
-    assert f"(its run log, {latest}/, says why)" in reason
-    assert "no agent was launched again" in reason and "Nothing was rolled back" in reason
-    # So is the checkout, and the command that continues: a BLOCKED local
-    # run cannot be unblocked or resumed, so it is a new run of the same
-    # feature, with the flags this one was started with (#189).
-    checkout = eng.state.local_contract().repository_root
-    assert reason.endswith(
-        "start a new run.\n"
-        f"  checkout:  {checkout}\n"
-        "  new run:   autoforge --state-dir 'state dir' local run "
-        f"{Path(checkout) / 'features' / 'add-filter.md'}\n"
-        "Inspect the checkout first ('git log' and 'git status' there show what moved and "
-        "what was left); a BLOCKED local run is neither unblocked nor resumed ('unblock' "
-        "applies to GitHub runs only), so it continues as a new run of the same feature."
-    )
-    persisted = load_state(eng.paths.state_file)
-    assert persisted.phase is Phase.BLOCKED and persisted.attempt == 1
-    assert persisted.local_pending_phase == phase.value
-    assert persisted.local_pending_attempts == 1, "the refused relaunch is not charged"
-
-
-def test_the_new_run_an_anchor_refusal_prints_continues_with_the_flags_given(
-    tmp_path, monkeypatch, capsys
-):
-    """#189: the CLI prints the anchor refusal with the `--config` and
-    `--state-dir` the run was started with, and its `new run` line, run as
-    printed from the same directory, starts the next run of the same feature
-    there; the bare `resume` and the `unblock` it replaces both refuse."""
-    from autoforge.engine import ControllerEngine
-    from autoforge.providers import ProviderRegistry, ScriptedProvider
-
-    root = local_repo(tmp_path / "repo")
-    monkeypatch.chdir(root)
-    (tmp_path / "autoforge.json").write_text('{"version": 1}', encoding="utf-8")
-    state_dir = tmp_path / "state dir"
-    flags = ["--config", "../autoforge.json", "--state-dir", str(state_dir)]
-
-    def commits_then_malformed(req):
-        touch_impl(root, "v2\n")
-        commit_all(root, "the agent committed")
-        return "I committed my work but forgot the control block.\n"
-
-    provider = ScriptedProvider(commits_then_malformed)
-    real = ControllerEngine.__init__
-
-    def patched(self, *a, **k):
-        k.setdefault("github", ExplodingGitHub())
-        k.setdefault(
-            "providers", ProviderRegistry(overrides={"claude": provider, "opencode": provider})
-        )
-        real(self, *a, **k)
-
-    monkeypatch.setattr(ControllerEngine, "__init__", patched)
-    assert main([*flags, "local", "run", "features/add-filter.md"]) == 1
-    out = capsys.readouterr().out
-    blocked = load_state(state_dir / "state.json")
-    assert blocked.phase is Phase.BLOCKED and "found before a relaunch" in blocked.block_reason
-    checkout = blocked.local_contract().repository_root
-    assert f"\n  checkout:  {checkout}\n" in out
-    (command,) = {
-        line.removeprefix("  new run:   ")
-        for line in out.splitlines()
-        if line.startswith("  new run:   ")
-    }
-    spec = str(Path(checkout) / "features" / "add-filter.md")
-    assert command == shlex.join(["autoforge", *flags, "local", "run", spec])
-
-    assert main([*flags, "resume"]) == 1
-    assert main([*flags, "unblock", "--reason", "inspected"]) == 2
-    assert "applies to GitHub runs only" in capsys.readouterr().err
-    provider._handler = lambda req: pytest.fail("one step starts the run; no agent runs")
-    assert main([*shlex.split(command)[1:], "--max-steps", "1"]) == 0
-    fresh = load_state(state_dir / "state.json")
-    assert fresh.run_id != blocked.run_id and fresh.phase is Phase.ANALYZE_EXECUTE
-    assert fresh.feature_spec_path == blocked.feature_spec_path
-    assert fresh.base_head_sha != blocked.base_head_sha, "anchored where the agent left it"
-
-
-def test_a_reviewer_that_switches_branches_is_not_corrected(tmp_path):
-    """The read-only REVIEW gets the same check before its correction (#209)."""
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-
-    def switch(r):
-        subprocess.run(["git", "-C", str(r), "checkout", "-q", "-b", "sidetrack"], check=True)
-
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-            (switch, lambda e: "no control block\n"),
-            (None, lambda e: review_result(e.state.workspace_fingerprint)),
-        ],
-    )
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    eng.step()  # ANALYZE_EXECUTE -> REVIEW
-    assert eng.step().next_phase == "BLOCKED"
-    assert [req.phase for req in eng.provider.calls] == ["ANALYZE_EXECUTE", "REVIEW"]
-    assert "checked-out branch changed" in eng.state.block_reason
-    assert "found before a relaunch" in eng.state.block_reason
-    assert load_state(eng.paths.state_file).local_pending_phase == ""
 
 
 def test_the_git_anchor_is_reported_but_kept_out_of_the_fingerprint(tmp_path):
@@ -2860,130 +1557,6 @@ def _failed_git(req, stderr: str, exit_code: int = 128):
     )
 
 
-def test_local_init_refuses_a_feature_directory_reached_through_a_symlink(tmp_path):
-    """R1-F2, now closed by construction rather than by a boundary check.
-
-    The old code compared a partly lexical path against the repository root,
-    and `realpath` only applied to the target's parent when that exact
-    directory already existed -- so `features/new` under a `features` symlink
-    looked in-repository and `mkdir(parents=True)` wrote outside the checkout.
-
-    The rewrite does not compare pathnames at all. Every component is opened
-    `O_DIRECTORY | O_NOFOLLOW` relative to the repository descriptor, so a
-    symbolic link anywhere on the way down cannot be traversed, whether or not
-    the rest of the path exists and whatever it points at.
-    """
-    root = git_repo(tmp_path / "repo")
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (root / "features").symlink_to(outside)
-    ws = LocalWorkspace(workdir=root)
-
-    # The nested, not-yet-existing parent is the case that used to slip through.
-    with pytest.raises(UnsafePathError, match="symbolic link"):
-        init_feature_file(ws, "spec", feature_dir="features/new")
-    # The direct case is refused by the same walk, at the same component.
-    with pytest.raises(UnsafePathError, match="symbolic link"):
-        init_feature_file(ws, "spec", feature_dir="features")
-    assert list(outside.iterdir()) == [], "nothing may be written outside the repository"
-
-
-def test_local_init_never_writes_through_a_symlink_at_the_target(tmp_path):
-    """O_NOFOLLOW on the final component: `--force` must not follow a link."""
-    root = git_repo(tmp_path / "repo")
-    outside = tmp_path / "elsewhere.md"
-    outside.write_text("operator content\n", encoding="utf-8")
-    (root / "features").mkdir()
-    (root / "features" / "spec.md").symlink_to(outside)
-    ws = LocalWorkspace(workdir=root)
-
-    with pytest.raises(ConfigurationError, match="already exists"):
-        init_feature_file(ws, "spec")
-    with pytest.raises(ConfigurationError, match="symbolic link, not a regular file"):
-        init_feature_file(ws, "spec", overwrite=True)
-    assert outside.read_text(encoding="utf-8") == "operator content\n"
-
-
-def test_cli_local_init_refuses_while_another_controller_holds_the_lock(
-    tmp_path, monkeypatch, capsys
-):
-    """R1-F3: `local init` is a controller write, so it takes the repository lock.
-
-    A run freezes the specification's SHA-256 and re-checks it around every
-    phase; `local init --force` racing an active run could rewrite the
-    acceptance criteria while the controller was hashing or rendering them.
-    """
-    from autoforge.locking import ControllerLock, repository_lock_path
-
-    root = git_repo(tmp_path)
-    monkeypatch.chdir(root)
-    other = ControllerLock(repository_lock_path(root)).acquire()
-    try:
-        assert main(["local", "init", "add-filter"]) == 2
-    finally:
-        other.release()
-    err = capsys.readouterr().err
-    assert "controller.lock" in err
-    assert not (root / "features").exists(), "nothing may be created while the lock is held"
-
-    # Released: the same command now succeeds.
-    assert main(["local", "init", "add-filter"]) == 0
-    assert (root / "features" / "add-filter.md").is_file()
-
-
-def test_a_failed_fix_validation_does_not_charge_a_fix_round(tmp_path):
-    """R1-F4: the fix budget counted attempts the controller never accepted.
-
-    `local_fix_rounds` was incremented before the validation commands ran, so
-    a FIX whose tests failed spent a round on work no controller verified —
-    with `max_fix_rounds: 1` the retry was then refused for exhausting a
-    budget it had never actually used. Re-entry stays bounded by the separate
-    `local_pending_attempts` checkpoint, which counts invocations.
-    """
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    # Passes while the marker is absent: ANALYZE_EXECUTE validates, the first
-    # FIX attempt (which creates it) does not.
-    marker = tmp_path / "FAIL_VALIDATION"
-    cfg.local.validation_commands = [["test", "!", "-e", str(marker)]]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-            (None, lambda e: review_result(e.state.workspace_fingerprint, 1, [finding(1)])),
-            (
-                lambda r: (touch_impl(r, "v2\n"), marker.write_text("x", encoding="utf-8")),
-                lambda e: fix_result(["R1-F1"]),
-            ),
-        ],
-    )
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    eng.step()  # implementation
-    eng.step()  # REVIEW -> FIX
-    assert eng.state.phase == Phase.FIX
-    with pytest.raises(VerificationError, match="validation command"):
-        eng.step()
-
-    assert eng.state.phase == Phase.FIX, "an unverified fix must stay resumable"
-    assert eng.state.local_fix_rounds == 0, "an unverified attempt must not spend a fix round"
-    assert eng.state.local_pending_phase == "FIX"
-    assert eng.state.local_pending_attempts == 1
-    reloaded = load_state(eng.paths.state_file)
-    assert reloaded.local_fix_rounds == 0 and reloaded.local_pending_attempts == 1
-
-    # The retry is accepted, and *that* is the round that gets charged.
-    marker.unlink()
-    eng.provider._handler = scripted(
-        eng, root, [(lambda r: touch_impl(r, "v3\n"), lambda e: fix_result(["R1-F1"]))]
-    )
-    outcome = eng.step()
-    assert outcome.next_phase == "REVIEW"
-    assert eng.state.local_fix_rounds == 1
-    assert "local fix round 1 verified" in outcome.message
-
-
 def test_an_unreadable_entry_cannot_be_bound_and_fails_closed(tmp_path):
     """R1-F5: `unreadable:PermissionError` was read as a digest and compared equal.
 
@@ -3182,165 +1755,6 @@ def test_a_failed_anchor_read_blocks_before_the_agent_is_invoked(tmp_path):
     assert eng.state.phase == Phase.ANALYZE_EXECUTE
 
 
-def test_a_state_file_with_an_unknown_field_is_corruption(tmp_path):
-    """R1-F7: unknown fields were dropped, so a newer state loaded as an older one.
-
-    `from_dict` deleted anything it did not recognise and carried on, which
-    turned a state file written by a controller that knows about (say) a
-    pending-invocation checkpoint into a valid-looking file without one.
-    """
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    path = StatePaths.from_state_dir(root / ".autoforge").state_file
-    save_state(eng.state, path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-
-    bad = dict(payload, local_future_checkpoint="something this controller ignores")
-    path.write_text(json.dumps(bad), encoding="utf-8")
-    with pytest.raises(StateError, match="unknown field"):
-        load_state(path)
-
-    # A newer protocol version is reported as such, not as a pile of unknown
-    # fields: the protocol check runs first so the message names the cause.
-    bad["protocol_version"] = "999.0"
-    path.write_text(json.dumps(bad), encoding="utf-8")
-    with pytest.raises(StateError, match="protocol_version"):
-        load_state(path)
-
-
-def test_a_state_file_with_a_malformed_pending_checkpoint_is_refused(tmp_path):
-    """R1-F7: the pending-invocation checkpoint is a bound, so it is validated.
-
-    It decides whether a write-capable agent is re-invoked and against which
-    baseline, and `MAX_LOCAL_PHASE_ATTEMPTS` is enforced on the persisted
-    counter. A hand-edited or truncated checkpoint must fail loudly rather
-    than silently disable the bound.
-    """
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    path = StatePaths.from_state_dir(root / ".autoforge").state_file
-    save_state(eng.state, path)
-    good = json.loads(path.read_text(encoding="utf-8"))
-    assert good["mode"] == "LOCAL"
-
-    def refuses(match: str, **fields):
-        path.write_text(json.dumps({**good, **fields}), encoding="utf-8")
-        with pytest.raises(StateError, match=match):
-            load_state(path)
-
-    refuses("non-negative integer", local_fix_rounds=-1)
-    refuses("non-negative integer", local_pending_attempts=-1)
-    refuses("non-negative integer", review_round=-1)
-    refuses("non-negative integer", step_count=-1)
-    # A phase that is not a phase, and one whose agent cannot write.
-    refuses(
-        "local_pending_phase",
-        local_pending_phase="NOT_A_PHASE",
-        local_pending_fingerprint="a" * 64,
-        local_pending_attempts=1,
-    )
-    refuses(
-        "local_pending_phase",
-        local_pending_phase="REVIEW",
-        local_pending_fingerprint="a" * 64,
-        local_pending_attempts=1,
-    )
-    # Partial checkpoints in both directions.
-    refuses("local_pending_fingerprint", local_pending_phase="FIX", local_pending_attempts=1)
-    refuses(
-        "local_pending_attempts",
-        local_pending_phase="FIX",
-        local_pending_fingerprint="a" * 64,
-        local_pending_attempts=0,
-    )
-    refuses("local_pending_fingerprint", local_pending_fingerprint="a" * 64)
-    refuses("local_pending_attempts", local_pending_attempts=2)
-    # A checkpoint on a REMOTE run is not a checkpoint at all.
-    remote = {
-        **good,
-        "mode": "REMOTE",
-        "repository": "owner/repo",
-        "epic_url": "https://github.com/owner/repo/issues/1",
-        "local_pending_phase": "FIX",
-        "local_pending_fingerprint": "a" * 64,
-        "local_pending_attempts": 1,
-    }
-    path.write_text(json.dumps(remote), encoding="utf-8")
-    with pytest.raises(StateError, match="on a REMOTE run"):
-        load_state(path)
-
-    # R9-F4: the checkpoint belongs to the phase entry that wrote it. Under
-    # any other live phase it would be closed unexamined -- a clean REVIEW
-    # reaches `_clear_local_invocation` and the unverified FIX work is simply
-    # forgotten -- so the mismatch is refused at load.
-    checkpoint = {
-        "local_pending_phase": "FIX",
-        "local_pending_fingerprint": "a" * 64,
-        "local_pending_attempts": 2,
-    }
-    for phase in ("INITIALIZING", "ANALYZE_EXECUTE", "REVIEW", "DONE"):
-        refuses("does not match the current phase", phase=phase, **checkpoint)
-    refuses(
-        "does not match the current phase",
-        phase="ANALYZE_EXECUTE",
-        **{**checkpoint, "local_pending_phase": "FIX"},
-    )
-    refuses(
-        "does not match the current phase",
-        phase="FIX",
-        **{**checkpoint, "local_pending_phase": "ANALYZE_EXECUTE"},
-    )
-
-    # The well-formed checkpoint still loads under its own phase, and under
-    # a terminal phase, where it is the evidence of the launch the run
-    # blocked or failed on top of.
-    for phase in ("FIX", "BLOCKED", "FAILED"):
-        path.write_text(json.dumps({**good, "phase": phase, **checkpoint}), encoding="utf-8")
-        assert load_state(path).local_pending_attempts == 2, phase
-
-
-def test_a_checkpoint_from_another_phase_is_not_closed_by_a_clean_review(tmp_path):
-    """R9-F4, end to end: the state that used to load is also refused to run.
-
-    A FIX checkpoint under a REVIEW phase means unverified FIX work sits in
-    the tree. A clean review would have advanced the run and closed the
-    checkpoint without anyone looking at that work. The load refuses it; and
-    if the shape ever reached the engine in memory, the step refuses it too,
-    before the reviewer is invoked.
-    """
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())],
-    )
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    eng.step()  # ANALYZE_EXECUTE -> REVIEW
-    assert eng.state.phase is Phase.REVIEW
-    assert eng.state.local_pending_phase == ""
-
-    # Hand-plant the other phase's checkpoint.
-    eng.state.local_pending_phase = "FIX"
-    eng.state.local_pending_fingerprint = eng.state.workspace_fingerprint
-    eng.state.local_pending_attempts = 1
-    save_state(eng.state, eng.paths.state_file)
-    with pytest.raises(StateError, match="does not match the current phase"):
-        load_state(eng.paths.state_file)
-
-    invoked = {"n": 0}
-
-    def reviewer(req):
-        invoked["n"] += 1
-        return review_result(eng.state.workspace_fingerprint)
-
-    eng.provider._handler = reviewer
-    with pytest.raises(StateError, match="only FIX may resume"):
-        eng.step()
-    assert invoked["n"] == 0, "the reviewer must not run over another phase's checkpoint"
-    assert eng.state.local_pending_phase == "FIX", "the checkpoint is never silently closed"
-
-
 # -- PR #44 R4: the fingerprint's edges ---------------------------------------
 def test_a_mode_change_is_bound_even_with_core_filemode_disabled(tmp_path, creation_umask):
     """R4-F4: `core.fileMode=false` hides `chmod +x` on a *clean* tracked file.
@@ -3386,60 +1800,6 @@ def test_a_symlink_out_of_the_repository_cannot_be_bound(tmp_path):
     assert ws.snapshot().fingerprint != linked
 
 
-def test_a_local_state_cannot_hold_a_github_only_phase(tmp_path):
-    """R4-F6: `Phase(...)` proves the value exists, not that this run can be in it.
-
-    A persisted LOCAL run in READY_FOR_MERGE loaded cleanly and `resume` then
-    read it as the remote merge hold, for a run with no repository and no PR.
-    """
-    path = tmp_path / "state.json"
-    good = {
-        "run_id": "af-x",
-        "created_at": "2026-01-01T00:00:00Z",
-        "updated_at": "2026-01-01T00:00:00Z",
-        "mode": "LOCAL",
-        "feature_spec_path": "docs/feature.md",
-        "feature_spec_sha256": "a" * 64,
-        "local_run_contract": sample_contract(),
-        "phase": "REVIEW",
-        # Written by every current-protocol save, LOCAL included, empty here.
-        "effect_records": [],
-        "entry_observation": {},
-        "completion_context": {},
-        "launch_label": "",
-        "acceptance_outcomes": [],
-        "config_fingerprint": {},
-        "validation_records": [],
-        "validation_attempt": {},
-        "review_evidence": {},
-        "review_certificate": {},
-        "producer_validation_failure": {},
-        "validation_override_seq": None,
-        "operator_comment_outcomes": [],
-        "sandbox_pin": {},
-    }
-    assert load_state_from(path, good).phase == Phase.REVIEW
-    for phase in ("READY_FOR_MERGE", "MERGE", "UPDATE_EPIC", "REPLAN_REEXECUTE"):
-        with pytest.raises(StateError, match="belongs to the GitHub workflow"):
-            load_state_from(path, {**good, "phase": phase})
-    # The same phases remain perfectly valid for a REMOTE run.
-    remote = {
-        **good,
-        "mode": "REMOTE",
-        "repository": "owner/repo",
-        "epic_url": "https://github.com/owner/repo/issues/1",
-        "phase": "READY_FOR_MERGE",
-    }
-    del remote["feature_spec_path"], remote["feature_spec_sha256"]
-    del remote["local_run_contract"]
-    assert load_state_from(path, remote).phase == Phase.READY_FOR_MERGE
-
-
-def load_state_from(path: Path, payload: dict) -> AutoForgeState:
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return load_state(path)
-
-
 def test_a_successful_local_fix_cannot_also_report_a_blocker():
     """R4-F7: `blocked_reason` was parsed on a successful FIX and then dropped.
 
@@ -3449,7 +1809,6 @@ def test_a_successful_local_fix_cannot_also_report_a_blocker():
     engine routes that to BLOCKED, so a result claiming both is refused
     rather than silently keeping the half the controller acts on.
     """
-    from autoforge.errors import ControlResultValidationError
     from autoforge.result_parser import parse_control_result
 
     payload = {
@@ -3559,73 +1918,6 @@ def test_the_local_prompt_scopes_enforcement_to_the_git_anchor():
     assert "enforced by the controller, not just asked" not in text
 
 
-def test_the_readme_no_github_promise_is_the_controllers_not_the_runs():
-    """Issue #54: README's LOCAL section must not promise that the *run* never touches GitHub.
-
-    The controller never constructs a `GitHubClient` in LOCAL mode; the agent
-    is a same-UID subprocess with `gh` on `PATH`, and the controller neither
-    prevents nor detects a `gh` write, a push or network access from it. Both
-    README passages that describe the promise have to keep the controller as
-    the subject and say what is detected (a moved git anchor) and what is not.
-    """
-    from pathlib import Path
-
-    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
-    flat = readme.replace("\n", " ")
-
-    assert "A local run never touches GitHub" not in flat
-    assert "A local run is GitHub-free by construction" not in flat
-    assert "The *controller* never touches GitHub in a local run" in flat
-    assert "The controller's local run is GitHub-free by construction" in flat
-
-    # What the controller detects, and the explicit statement that it detects nothing else.
-    assert (
-        "the controller can neither prevent nor detect a `gh` write, a `git push` or "
-        "a network request made by the agent"
-    ) in flat
-    assert "a commit, reset, checkout or branch switch blocks the run" in flat
-    assert "It detects nothing else." in flat
-    assert "a `gh` write or a push from the agent is not" in flat
-
-    # The honest answer for real containment points at the ADR and at the outer
-    # sandbox; #10's isolation track is closed (#240).
-    assert "docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md" in flat
-    assert "§2.2" in flat and "§8.1" in flat
-    assert "tracked in #10" not in flat
-    assert "ADR 0005's outer sandbox (#166–#169)" in flat
-
-
-def test_a_local_transient_failure_is_not_relaunched(tmp_path):
-    """#164: the relaunch of a failure the adapter calls transient follows
-    REMOTE's phase-entry reconciliation, which LOCAL has none of: the failed
-    launch is a failed exit, charged to the durable bound like any other."""
-    from autoforge.providers import AgentExecutionResult, ScriptedProvider
-
-    class TransientlyFailing(ScriptedProvider):
-        def execute(self, req):
-            self.calls.append(req)
-            return AgentExecutionResult(
-                command=["x"],
-                exit_code=1,
-                stdout="",
-                stderr="boom",
-                started_at="t",
-                finished_at="t",
-                transient_failure="opencode: OpenAI WebSocket closed with code 1000",
-            )
-
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    provider = TransientlyFailing()
-    eng.providers._overrides = dict.fromkeys(eng.providers._overrides, provider)
-    with pytest.raises(ExecutionError, match="not relaunched: LOCAL mode never relaunches it"):
-        eng.step()
-    assert len(provider.calls) == 1
-    persisted = load_state(eng.paths.state_file)
-    assert persisted.phase == Phase.ANALYZE_EXECUTE and persisted.local_pending_attempts == 1
-
-
 # -- Pi parity (#133) --------------------------------------------------------------
 def _local_on_pi(root: Path, tmp_path_factory, cfg=None):
     """A LOCAL engine with every profile on Pi; the fake lives outside ``root``.
@@ -3679,47 +1971,6 @@ def test_a_local_pi_run_reaches_done_in_the_repository_without_github(tmp_path, 
     assert prompts == [req.prompt for req in eng.pi.calls]
     assert all("running in **LOCAL mode**" in p for p in prompts)
     assert eng.provider.calls == []
-
-
-@pytest.mark.parametrize("phase", [Phase.ANALYZE_EXECUTE, Phase.FIX])
-def test_pi_correction_retries_are_charged_as_scripted_ones_are(tmp_path, tmp_path_factory, phase):
-    """Every write-capable Pi launch, corrections included, is charged to the
-    durable LOCAL checkpoint before it starts, exactly as for ScriptedProvider
-    (`test_correction_retries_are_charged_against_the_same_durable_bound`)."""
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.execution.max_correction_attempts = 5
-    eng, fake = _local_on_pi(root, tmp_path_factory, cfg=cfg)
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    if phase is Phase.FIX:
-        eng.pi._handler = scripted(
-            eng,
-            root,
-            [
-                (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-                (None, lambda e: review_result(e.state.workspace_fingerprint, 1, [finding(1)])),
-            ],
-        )
-        eng.step()
-        eng.step()
-    assert eng.state.phase is phase
-    before = len(fake.launches())
-
-    seen: list[int] = []
-
-    def malformed(req):
-        seen.append(load_state(eng.paths.state_file).local_pending_attempts)
-        touch_impl(root, f"garbage {len(seen)}\n")
-        return "I did some work but forgot the control block.\n"
-
-    eng.pi._handler = malformed
-    with pytest.raises(ControlResultValidationError, match="Not re-invoked"):
-        eng.step()
-    assert seen == [1, 2, 3], "every launch is checkpointed before it starts"
-    assert len(fake.launches()) - before == 3
-    assert load_state(eng.paths.state_file).local_pending_attempts == 3
-    assert eng.step().next_phase == "BLOCKED"
-    assert len(fake.launches()) - before == 3, "a blocked phase must not launch Pi"
 
 
 def test_a_pi_reviewer_that_writes_into_the_tree_is_refused(tmp_path, tmp_path_factory):

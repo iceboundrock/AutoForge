@@ -20,7 +20,7 @@ parity). What is covered:
   way out the block names;
 - each row of D14.1 at the consumers it reaches (a producer, the REVIEW
   entry, ``unblock``, the gate pass, MERGE and ``status``), the replan
-  replacement and LOCAL included;
+  replacement included;
 - the MERGE crash windows, a restart and the legacy states;
 - ``resume`` holding READY_FOR_MERGE, and the dry-run plan;
 - the same routing behind every provider (D17.2).
@@ -42,9 +42,7 @@ from autoforge import engine as engine_module
 from autoforge.certificate import Revision
 from autoforge.evidence import (
     Definition,
-    LocalCandidate,
     certificate_digest,
-    find_evidence,
     observed_record,
     parse_candidate,
 )
@@ -855,60 +853,6 @@ def test_a_replan_replacement_inherits_no_certificate(tmp_state_dir):
     assert merges_through(eng) == ["MERGE", "UPDATE_EPIC"]
     assert gh.merges == [(REPLACEMENT_PR, "squash", replacement)]
     assert gh.prs[PR].state == "CLOSED"
-
-
-# -- LOCAL: zero GitHub calls (D12.5) ---------------------------------------------------
-
-
-def _local_evidence_for(eng, fingerprint: str):
-    s = eng.state
-    configured = eng._configured_validation()
-    candidate = LocalCandidate(fingerprint, s.local_contract().workspace_policy.digest(), s.run_id)
-    return find_evidence(
-        s.validation_evidence(), candidate, configured.definitions, configured.policy, None
-    )
-
-
-def test_local_fingerprint_drift_before_review_certifies_nothing(tmp_path):
-    """Behind the exploding GitHub. The tree changes after the write phase
-    validated it: the existing drift handling blocks REVIEW, no certificate
-    is issued, and the records of the verified workspace are no evidence for
-    the changed one."""
-    from .local_helpers import touch_impl
-    from .test_review_certificate import implemented, local_run, reviewed
-
-    eng, root = local_run(tmp_path, [implemented(), reviewed()], PASSES)
-    eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    verified = eng.state.workspace_fingerprint
-    assert _local_evidence_for(eng, verified).complete
-    touch_impl(root, "an edit nothing validated\n")
-    assert eng.step().next_phase == "BLOCKED"
-    s = saved(eng)
-    assert s.review_certificate == {} and s.review_round == 0
-    now = eng.local_workspace().snapshot().fingerprint
-    assert now != verified and _local_evidence_for(eng, now).records == ()
-
-
-def test_local_a_certificate_names_only_the_workspace_its_round_reviewed(tmp_path):
-    """DONE holds the certificate of the reviewed workspace F. An edit after
-    it is F': no record is evidence for F', and against a state bound to F'
-    the certificate does not apply."""
-    from .local_helpers import touch_impl
-    from .test_review_certificate import implemented, local_run, reviewed
-
-    eng, root = local_run(tmp_path, [implemented(), reviewed()], PASSES)
-    assert [o.next_phase for o in eng.run(max_steps=5)] == ["ANALYZE_EXECUTE", "REVIEW", "DONE"]
-    s = saved(eng)
-    reviewed_fingerprint = s.reviewed_workspace_fingerprint
-    assert s.review_certificate["reviewed_workspace_fingerprint"] == reviewed_fingerprint
-    assert eng.review_certificate_problem() == ""
-    touch_impl(root, "an edit after DONE\n")
-    now = eng.local_workspace().snapshot().fingerprint
-    assert now != reviewed_fingerprint and _local_evidence_for(eng, now).records == ()
-    eng.state.reviewed_workspace_fingerprint = now
-    eng.state.workspace_fingerprint = now
-    assert eng.review_certificate_problem().startswith("its reviewed workspace")
 
 
 # -- the MERGE crash windows and recovery (§2.16) ---------------------------------------

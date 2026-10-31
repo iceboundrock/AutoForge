@@ -499,7 +499,6 @@ SECTION_SCHEMAS = [
     ("review", ("review",), ("replan", "{}"), config.REVIEW_KEYS),
     ("review.replan", ("review", "replan"), ("enabled", "false"), config.REPLAN_KEYS),
     ("workflow", ("workflow",), ("max_review_rounds", "3"), config.WORKFLOW_KEYS),
-    ("local", ("local",), ("max_fix_rounds", "0"), config.LOCAL_KEYS),
     ("scheduler", ("scheduler",), ("max_parallel", "2"), config.SCHEDULER_KEYS),
     ("profiles.fix", ("profiles", "fix"), ("effort", '"high"'), config.PROFILE_KEYS),
 ]
@@ -558,7 +557,6 @@ def test_unknown_keys_are_rejected_in_every_section(
         ('{"version": 1, "workflow": {"soft_threshold": 3}}', "workflow", "soft_threshold"),
         ('{"version": 1, "review": {"enabled": false}}', "review", "enabled"),
         ('{"version": 1, "merge": {"allow_merge": true}}', "merge", "allow_merge"),
-        ('{"version": 1, "local": {"max_review_rounds": 2}}', "local", "max_review_rounds"),
         ('{"version": 1, "github": {"cmd": "gh"}}', "github", "cmd"),
         # Top level: a section name misspelled, or a key that was never read.
         ('{"version": 1, "workflows": {"max_review_rounds": 3}}', "the top level", "workflows"),
@@ -784,7 +782,6 @@ def test_removed_execution_allow_merge_keeps_its_own_message(tmp_path):
         (config.REVIEW_KEYS, config.ReviewConfig),
         (config.REPLAN_KEYS, config.ReplanConfig),
         (config.WORKFLOW_KEYS, config.WorkflowConfig),
-        (config.LOCAL_KEYS, config.LocalConfig),
         (config.SCHEDULER_KEYS, config.EpicSchedulerConfig),
         (config.PROFILE_KEYS, config.ProfileConfig),
         (config.TOP_LEVEL_KEYS, config.AutoForgeConfig),
@@ -796,8 +793,10 @@ def test_known_key_tables_name_real_fields(keys, config_cls):
 
     names = {f.name for f in fields(config_cls)}
     assert set(keys) <= names, set(keys) - names
-    # Fields the loader deliberately does not read from the file.
-    derived = {"allow_merge_source", "name"}
+    # Fields the loader deliberately does not read from the file. `local` is
+    # LocalConfig at its defaults, which no file sets since its key went
+    # (ADR 0009 D5, #387) and which goes with the LOCAL code (#388).
+    derived = {"allow_merge_source", "name", "local"}
     assert names - set(keys) <= derived, names - set(keys) - derived
 
 
@@ -806,7 +805,7 @@ def test_every_key_in_the_example_file_is_known(tmp_path):
     from pathlib import Path
 
     cfg = load_config_file(Path(__file__).resolve().parents[1] / "autoforge.example.yaml")
-    assert cfg.workflow.max_review_rounds == 20 and cfg.local.max_workspace_entries == 50000
+    assert cfg.workflow.max_review_rounds == 20
 
 
 # Every JSON falsy value that is not a mapping. `data.get("safety", {}) or {}`
@@ -835,7 +834,7 @@ def test_non_mapping_safety_section_rejected_in_yaml_too(tmp_path, value):
 
 @pytest.mark.parametrize(
     "section",
-    ["execution", "github", "merge", "review", "workflow", "local", "profiles"],
+    ["execution", "github", "merge", "review", "workflow", "profiles"],
 )
 @pytest.mark.parametrize("value", FALSY_NON_MAPPINGS)
 def test_non_mapping_sections_are_rejected_everywhere(tmp_path, section, value):
@@ -1475,66 +1474,46 @@ def test_worktree_dir_is_optional_and_a_string(tmp_path):
         _execution_cfg(tmp_path, {"worktree_dir": 3})
 
 
-# -- the `local:` block ---------------------------------------------------------
-def _local_cfg(tmp_path, local: dict):
-    p = tmp_path / "cfg.json"
-    p.write_text(json.dumps({"version": 1, "local": local}), encoding="utf-8")
-    return load_config_file(p)
+# -- the `local:` block, gone (ADR 0009 D5, #387) ------------------------------
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"max_fix_rounds": 0},
+        {"max_review_rounds": 2},
+        {"validation_commands": [["make", "test"]]},
+        {},
+        ["features"],
+        None,
+        *FALSY_NON_MAPPINGS,
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("name", ["cfg.json", "cfg.yaml"])
+def test_a_local_block_of_any_shape_is_an_unknown_top_level_key(tmp_path, name, value):
+    """`local:` is refused like any key the loader does not read, whatever it holds.
+
+    A valid former LOCAL key, a former typo, an empty block and a value that
+    is not a mapping are all the same unknown key at the top level: nothing of
+    the block is read, so nothing of it can be accepted or refused on its own.
+    """
+    p = tmp_path / name
+    document = {"version": 1, "local": json.loads(value) if isinstance(value, str) else value}
+    p.write_text(json.dumps(document), encoding="utf-8")  # JSON is YAML too
+    with pytest.raises(ConfigurationError) as info:
+        load_config_file(p)
+    message = str(info.value)
+    assert f"{p}: unknown key(s) under 'the top level': local (known: " in message
+    assert "local" not in message.split("(known:")[1]
+    assert "must be a mapping" not in message
 
 
 def test_local_defaults_are_the_documented_ones():
     local = default_config().local
-    assert local.feature_dir == "features"
     assert local.max_fix_rounds == 1
     assert local.validation_commands == []
     assert local.exclude == []
     assert local.max_workspace_entries == 50_000
     assert local.max_workspace_bytes == 512 * 1024 * 1024
-
-
-def test_local_exclude_is_normalized_deduplicated_and_sorted(tmp_path):
-    """The list is hashed into the fingerprint and frozen with the run, so two
-    spellings of one policy have to reduce to one text."""
-    cfg = _local_cfg(tmp_path, {"exclude": ["build/", ".venv", "build", "/target/"]})
-    assert cfg.local.exclude == [".venv", "build", "target"]
-
-
-@pytest.mark.parametrize(
-    ("local", "match"),
-    [
-        ({"exclude": ".venv"}, "must be a list"),
-        ({"exclude": [".venv", 7]}, "must be a string"),
-        ({"exclude": [""]}, "must not be empty"),
-        ({"exclude": ["../outside"]}, "may not contain"),
-        ({"exclude": ["a/./b"]}, "may not contain"),
-        ({"feature_dir": "   "}, "must not be empty"),
-        ({"max_fix_rounds": -1}, "must be >= 0"),
-        ({"max_workspace_entries": 0}, "must be >= 1"),
-        ({"max_workspace_bytes": 0}, "must be >= 1"),
-        ({"validation_commands": ["uv run pytest"]}, "validation_commands"),
-        ({"validation_commands": [[]]}, "validation_commands"),
-    ],
-)
-def test_local_block_rejects_unusable_values(tmp_path, local, match):
-    with pytest.raises(ConfigurationError, match=match):
-        _local_cfg(tmp_path, local)
-
-
-def test_local_validation_commands_stay_argv_arrays(tmp_path):
-    cfg = _local_cfg(
-        tmp_path, {"validation_commands": [["uv", "run", "pytest", "-q"], ["./gradlew", "test"]]}
-    )
-    assert cfg.local.validation_commands == [
-        ["uv", "run", "pytest", "-q"],
-        ["./gradlew", "test"],
-    ]
-
-
-def test_a_non_mapping_local_block_is_refused(tmp_path):
-    p = tmp_path / "cfg.json"
-    p.write_text('{"version": 1, "local": ["features"]}', encoding="utf-8")
-    with pytest.raises(ConfigurationError, match="'local' must be a mapping"):
-        load_config_file(p)
 
 
 # -- safety.required_checks (issue #41) -------------------------------------------------
@@ -2430,20 +2409,6 @@ def test_validation_commands_stay_argv_arrays(tmp_path):
 def test_validation_block_rejects_unusable_values(tmp_path, validation, match):
     with pytest.raises(ConfigurationError, match=match):
         _validation_cfg(tmp_path, validation)
-
-
-@pytest.mark.parametrize(
-    ("commands", "match"),
-    [
-        ([["x"]] * 17, "17 definitions, over the bound of 16"),
-        ([["x"] * 33], "33 argv elements"),
-        ([["x" * 1025]], "1025 characters"),
-        ([["x" * 1024] * 4 + ["y"]], "4097 characters in all"),
-    ],
-)
-def test_local_validation_commands_have_the_same_bounds(tmp_path, commands, match):
-    with pytest.raises(ConfigurationError, match=f"local.*{match}"):
-        _local_cfg(tmp_path, {"validation_commands": commands})
 
 
 def test_validation_bounds_name_the_definition_never_the_argv(tmp_path):

@@ -97,7 +97,6 @@ from __future__ import annotations
 import hashlib
 import os
 import posixpath
-import re
 import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -760,13 +759,12 @@ class LocalWorkspace(GitWorkspace):
             f"Largest top-level entries seen so far:\n{listing}"
         )
 
-    # -- writes into the working tree -------------------------------------
+    # -- the working tree as a capability ----------------------------------
     def tree_root(self) -> SafeRoot:
-        """A write capability on the working tree (caller closes it).
+        """A capability on the working tree (caller closes it).
 
-        The only controller writes into the working tree are the ones
-        ``autoforge local init`` makes, and they go through the same boundary
-        as every other controller write.
+        The feature specification is read through it, behind the same
+        boundary as every other controller access.
         """
         return SafeRoot.open(self.root())
 
@@ -878,8 +876,7 @@ def read_feature_spec(workspace: LocalWorkspace, spec_path: str | Path) -> Featu
         ) from exc
     if not content.strip():
         raise ConfigurationError(
-            f"feature specification {resolved} is empty; describe the feature first "
-            "(see 'autoforge local init')"
+            f"feature specification {resolved} is empty; describe the feature first"
         )
     return FeatureSpec(
         path=resolved,
@@ -914,103 +911,3 @@ def verify_feature_spec_unchanged(
             "criteria. Restore the file, or start a new run for the changed requirements."
         )
     return spec
-
-
-# -- `autoforge local init` ---------------------------------------------------
-SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-
-FEATURE_TEMPLATE = """# Feature: {title}
-
-## Problem
-
-<!-- What is wrong or missing today, and for whom? One short paragraph. -->
-
-## Requirements
-
-- [ ] <!-- Concrete, checkable behaviour the implementation must provide. -->
-
-## Acceptance Criteria
-
-- [ ] <!-- How a reviewer decides this is done. One line per criterion. -->
-
-## Non-goals
-
-- <!-- Explicitly out of scope, so the agent does not invent work. -->
-
-## Notes / Decisions
-
-<!-- Constraints, prior art, files worth reading first, decisions already made. -->
-"""
-
-
-def slug_to_title(slug: str) -> str:
-    """``add-transaction-filter`` -> ``Add Transaction Filter``."""
-    words = [w for w in re.split(r"[-_.]+", slug) if w]
-    return " ".join(w[:1].upper() + w[1:] for w in words) or slug
-
-
-def feature_template(slug: str) -> str:
-    """The starting Markdown for ``autoforge local init <slug>``."""
-    return FEATURE_TEMPLATE.format(title=slug_to_title(slug))
-
-
-def init_feature_file(
-    workspace: LocalWorkspace,
-    slug: str,
-    feature_dir: str = "features",
-    overwrite: bool = False,
-) -> Path:
-    """Create ``<feature_dir>/<slug>.md`` from the template and return its path.
-
-    Refuses to overwrite an existing file unless ``overwrite`` is set: the
-    feature specification is the operator's own work, and clobbering it on a
-    mistyped slug would destroy exactly the input a run depends on.
-
-    The write goes through the working tree's :class:`~autoforge.safefs
-    .SafeRoot`, which is what makes this safe rather than a fourth hand-rolled
-    set of checks: no component of ``features/<slug>.md`` can be a symbolic
-    link, ``--force`` *replaces the name* instead of truncating an inode (so a
-    hard link planted at the target keeps its contents), and without
-    ``--force`` the create is ``O_EXCL``, which is atomic rather than a
-    check a racing writer can slip past.
-    """
-    if not SLUG_RE.match(slug):
-        raise ConfigurationError(
-            f"invalid feature slug {slug!r}: use lowercase letters, digits, '-', '_' or '.' "
-            "(no path separators), e.g. 'add-transaction-filter'"
-        )
-    root = workspace.root()
-    directory = Path(feature_dir)
-    if directory.is_absolute():
-        try:
-            rel_dir = directory.relative_to(root)
-        except ValueError:
-            raise ConfigurationError(
-                f"feature directory {feature_dir!r} is outside the repository {root}"
-            ) from None
-    else:
-        rel_dir = directory
-    rel = f"{rel_dir.as_posix()}/{slug}.md".lstrip("/")
-    if rel.startswith("..") or "/../" in f"/{rel}":
-        raise ConfigurationError(f"feature directory {feature_dir!r} escapes the repository {root}")
-    content = feature_template(slug).encode("utf-8")
-    with workspace.tree_root() as tree:
-        if overwrite:
-            existing = tree.lstat(rel)
-            if existing is not None and not stat.S_ISREG(existing.st_mode):
-                raise ConfigurationError(
-                    f"refusing to overwrite {root / rel}: it is a "
-                    f"{entry_kind(existing.st_mode)}, not a regular file. --force replaces "
-                    "a specification AutoForge could have written; it does not write through "
-                    "an entry the operator put there. Move it aside, or choose another slug."
-                )
-            tree.write_bytes(rel, content, mode=0o644)
-        else:
-            try:
-                tree.create_exclusive(rel, content, mode=0o644)
-            except FileExistsError:
-                raise ConfigurationError(
-                    f"feature specification already exists: {root / rel} — edit it, choose "
-                    "another slug, or pass --force to overwrite it"
-                ) from None
-    return root / rel

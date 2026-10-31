@@ -381,3 +381,65 @@ def test_random_corruption_of_a_remote_state_either_fails_or_is_legal(tmp_path, 
     # mutation here labels an older protocol, so nothing is migrated.
     loaded = state.to_dict()
     assert {k: loaded.get(k, "(dropped)") for k in payload} == payload
+
+
+# =============================================================================
+# A LOCAL checkpoint on a REMOTE state
+# =============================================================================
+
+# Every checkpoint LOCAL's loader accepted on a LOCAL run: a write phase's,
+# under that phase or kept as evidence by BLOCKED or FAILED.
+WELL_FORMED_CHECKPOINTS = (
+    (Phase.FIX, Phase.FIX),
+    (Phase.ANALYZE_EXECUTE, Phase.ANALYZE_EXECUTE),
+    (Phase.FIX, Phase.BLOCKED),
+    (Phase.ANALYZE_EXECUTE, Phase.FAILED),
+)
+
+
+@pytest.mark.parametrize(
+    ("pending", "phase"), WELL_FORMED_CHECKPOINTS, ids=lambda p: p.value.lower()
+)
+def test_a_remote_state_carrying_a_well_formed_local_checkpoint_is_refused(
+    tmp_path, pending, phase
+):
+    """A REMOTE run has no working-tree checkpoint, so one on its file is corruption.
+
+    The file is :func:`good_remote` in ``phase``, which loads, with a
+    checkpoint that is complete and consistent with that phase: only the
+    REMOTE-mode guard of the checkpoint refuses it, and the refusal names it.
+    ``load_state``, an engine's ``load`` and ``existing_run`` all refuse it,
+    and none of them writes the file. The random mutations above never build
+    such a checkpoint, so without this test they pass with the guard gone.
+
+    #387 (R2-F2): the REMOTE row of the deleted
+    tests/test_local.py::test_a_state_file_with_a_malformed_pending_checkpoint_is_refused
+    """
+    payload = dict(good_remote(), phase=phase.value)
+    if phase is Phase.BLOCKED or phase is Phase.FAILED:
+        payload["block_reason"] = "the run stopped on an unverified launch"
+    state_dir = tmp_path / ".autoforge"
+    state_dir.mkdir()
+    path = write(state_dir / "state.json", payload)
+    holds_every_remote_invariant(load_state(path))
+    payload.update(
+        local_pending_phase=pending.value,
+        local_pending_fingerprint="a" * 64,
+        local_pending_attempts=1,
+    )
+    path = write(path, payload)
+    raw = path.read_bytes()
+    refusal = re.escape(
+        f"state field 'local_pending_phase' is set ({pending.value!r}) on a REMOTE run, "
+        "which has no local working-tree checkpoint"
+    )
+    with pytest.raises(StateError, match=refusal):
+        load_state(path)
+    engine = ControllerEngine(default_config(), state_dir=state_dir)
+    with pytest.raises(StateError, match=refusal):
+        engine.load()
+    assert engine.state is None
+    with pytest.raises(StateError, match=refusal):
+        engine.existing_run()
+    engine.close()
+    assert path.read_bytes() == raw

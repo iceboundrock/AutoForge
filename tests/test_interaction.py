@@ -81,7 +81,7 @@ from autoforge.sdk_policy import (
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 
-from .conftest import commit_all, git_repo, implement, make_engine, make_local_engine, write_feature
+from .conftest import implement, make_engine
 
 TOKEN = "ghp_" + "a1B2" * 9
 DIGEST = input_digest({"command": "make test"}, "a test input")
@@ -1933,23 +1933,6 @@ def test_an_interrupted_turn_is_a_failed_launch_and_not_relaunched(tmp_state_dir
         eng.step()
     assert not isinstance(excinfo.value, InteractionRequiredError)
     assert len(provider.calls) == 1
-
-
-def test_a_local_interaction_failure_keeps_the_launch_charge(tmp_path):
-    root = git_repo(tmp_path)
-    (root / "src").mkdir(exist_ok=True)
-    (root / "src" / "app.py").write_text("def main():\n    pass\n", encoding="utf-8")
-    write_feature(root)
-    commit_all(root, "initial")
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    provider = _Asking("", FAIL)
-    _install(eng, provider)
-    with pytest.raises(InteractionRequiredError, match="interaction_policy is fail"):
-        eng.step()
-    assert len(provider.calls) == 1
-    persisted = load_state(eng.paths.state_file)
-    assert persisted.phase == Phase.ANALYZE_EXECUTE and persisted.local_pending_attempts == 1
 
 
 def test_a_dry_run_creates_no_broker_and_asks_no_one(tmp_state_dir, fake_github):

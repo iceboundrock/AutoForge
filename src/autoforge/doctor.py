@@ -1482,7 +1482,13 @@ class Doctor:
         results.append(self.check_launch_credentials())
         results.append(self.check_required_checks(gh))
         results.append(self.check_checks_read(gh))
-        results.append(self.check_state_dir())
+        # The probe creates the state directory and writes in it, so it runs
+        # only for a configuration that loaded: doctor writes nothing for one
+        # it refused, whose ``state_dir`` it has not read either.
+        if cfg is None:
+            results.append(CheckResult.skip("state dir writable", "(config check failed)"))
+        else:
+            results.append(self.check_state_dir())
         results.extend(self.scheduler_checks(gh))
         results.extend(self.sandbox_checks(local=False))
         return results

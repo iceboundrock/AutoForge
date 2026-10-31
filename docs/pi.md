@@ -8,8 +8,8 @@ The **ChatGPT subscription** you signed in to Pi with stays supported, with
 **no OpenAI Platform API key anywhere in AutoForge's environment**. The page
 covers installing Pi, giving it a credential, a profile to copy for each
 route, the choices a profile makes, `doctor`'s Pi rows and what each
-failure means, the security model, LOCAL mode, the limitations, and the
-opt-in smoke test that proves the setup on your machine.
+failure means, the security model, the limitations, and the opt-in smoke
+test that proves the setup on your machine.
 
 The decisions behind it, with their evidence, are in
 [ADR 0003](adr/0003-pi-agent-provider.md) (the RPC adapter) and the
@@ -84,8 +84,8 @@ level Pi would clamp ([Provider and model](#provider-model-and-thinking-level)).
   credential boundary**, which is why the store is preferred.
 
 **Under the outer sandbox.** With `sandbox.mode: required`, or `preferred`
-in REMOTE mode (where it is `required`), the sandbox hides your home and
-refuses an agent directory that is, contains or lies inside `~/.pi/agent`
+(its alias), the sandbox hides your home and refuses an agent directory
+that is, contains or lies inside `~/.pi/agent`
 ([Pi policy](pi-policy.md) §8). A sandboxed Pi launch therefore needs a
 **dedicated `PI_CODING_AGENT_DIR` holding its own credential**: export
 `PI_CODING_AGENT_DIR=/absolute/path` in the shell that runs `autoforge`,
@@ -238,9 +238,9 @@ carries the same profile, commented, for `review_round_2_5`.
 
 ## Doctor's Pi rows
 
-`autoforge doctor` (and `autoforge local doctor`) adds these rows for the
-Pi profiles the run can reach. Every probe runs under the environment an
-agent launch gets, never your whole shell, and none prints Pi's output.
+`autoforge doctor` adds these rows for the Pi profiles the run can reach.
+Every probe runs under the environment an agent launch gets, never your
+whole shell, and none prints Pi's output.
 
 | Row | Result | Meaning and remedy |
 |---|---|---|
@@ -309,21 +309,6 @@ The [Pi policy](pi-policy.md) is authoritative. In short:
   content reaches the model as task data, and an agent with `bash` can do
   whatever your user can.
 
-## LOCAL mode
-
-Pi works in [LOCAL mode](local-mode.md) as the other providers do:
-
-- Pi runs in the repository root, with the LOCAL prompts.
-- REVIEW is bound to the workspace fingerprint: a Pi reviewer that changes
-  the tree (an edit, or a `bash` command that writes) is refused, and the
-  phase does not advance. Exclude caches your tools rewrite with
-  `local.exclude` (for example `**/__pycache__`).
-- Every launch that may write, corrections included, is charged to the
-  LOCAL checkpoint before it starts, exactly as for the other providers.
-- Pi renames a `.pi/commands/` directory in its working directory to
-  `.pi/prompts/` at startup; in LOCAL mode REVIEW's tree check catches it
-  ([Pi policy](pi-policy.md), "Residual risks").
-
 ## Limitations
 
 - **RPC only.** Every launch is one fresh `pi --mode rpc` process with one
@@ -360,15 +345,12 @@ ADR 0002 §4b and the [Pi policy](pi-policy.md) §10 record:
 
 ## Prove it on your machine: the live smoke test
 
-`tests/test_live_pi.py` holds two opt-in tests, each running one real
-phase through your Pi and your credential:
-`test_one_local_review_runs_on_the_operators_real_pi` runs a LOCAL REVIEW,
-and `test_one_remote_review_runs_on_the_operators_real_pi` a REMOTE REVIEW
-against a GitHub stand-in that never reaches GitHub
-([The REMOTE test](#the-remote-test)). LOCAL mode is being removed
-(EPIC #383); the REMOTE test is the one that stays. Neither runs in
-`make check` or CI: the `live` marker deselects them unless you pass
-`-m live`, and they then skip unless `AUTOFORGE_LIVE_PI=1`. You name the
+`tests/test_live_pi.py::test_one_remote_review_runs_on_the_operators_real_pi`
+is an opt-in test that runs one real REVIEW through your Pi and your
+credential, on a REMOTE run against a GitHub stand-in that never reaches
+GitHub ([The GitHub stand-in](#the-github-stand-in)). It does not run in
+`make check` or CI: the `live` marker deselects it unless you pass
+`-m live`, and it then skips unless `AUTOFORGE_LIVE_PI=1`. You name the
 auth route, which has no default, so a report always says which route it
 proves:
 
@@ -384,21 +366,14 @@ proves:
 ```bash
 unset OPENAI_API_KEY DEEPSEEK_API_KEY  # the test fails, and does not unset them for you
 
-# DeepSeek, its key in Pi's own credential store, on a REMOTE run
+# DeepSeek, its key in Pi's own credential store
 AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live \
   tests/test_live_pi.py::test_one_remote_review_runs_on_the_operators_real_pi
-
-# the same route on a LOCAL run
-AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live \
-  tests/test_live_pi.py::test_one_local_review_runs_on_the_operators_real_pi
 
 # the ChatGPT sign-in (once before: `pi`, then /login openai)
 AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=oauth uv run pytest -m live \
   tests/test_live_pi.py::test_one_remote_review_runs_on_the_operators_real_pi
 ```
-
-Name the test: `tests/test_live_pi.py` alone runs both, which spends two
-REVIEWs.
 
 To forward the key instead of keeping it in Pi's store, export it and add
 `AUTOFORGE_LIVE_PI_FORWARD_KEY=DEEPSEEK_API_KEY` (the `api_key` route
@@ -406,10 +381,10 @@ only): the test's configuration then lists that name in
 `execution.env_allowlist_extra`, and the report names the route, never the
 value.
 
-Each test costs one small REVIEW of the account's quota (a few-line diff, at
+The test costs one small REVIEW of the account's quota (a few-line diff, at
 thinking level `low`). `AUTOFORGE_LIVE_PI_MODEL` and
 `AUTOFORGE_LIVE_PI_EFFORT` (default `low`) choose another model. In a
-temporary directory the LOCAL test:
+temporary directory the test:
 
 1. checks, and never performs, the preconditions: `pi` on `PATH`, at least
    1.0.0, and Pi's read-only `pi auth check --model M --json --no-refresh`
@@ -419,28 +394,42 @@ temporary directory the LOCAL test:
 2. checks that no provider key (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) is in
    its environment, so the credential reaches Pi through Pi's own store,
    except a key forwarded on purpose, which must then be set;
-3. runs `autoforge local doctor` with a configuration whose reviewers are
-   Pi with the route's `require_oauth`, and checks the "available" and
-   "auth ready" rows, with the route's `authType`;
-4. drives a LOCAL run on a throwaway repository: a scripted stand-in
-   implements a one-line feature, then **one REVIEW runs on Pi** through
-   AutoForge's own Pi adapter (no correction relaunch) and must return a
-   valid `CONTROL_RESULT`; the launch fails with `pi: model unavailable`
-   if the model is not among Pi's available ones;
-5. scans everything AutoForge wrote (state, journal, run logs and each
-   step's execution records, doctor's output) for JWTs, `Bearer`,
-   `refresh_token`, `"refresh"`, `"access"`, `chatgpt-account-id` /
-   `chatgpt_account_id` and `sk-` keys (DeepSeek's keys have that shape),
-   and for the forwarded key's own value, naming only the file and the
-   pattern;
-6. checks that the review left the tree unchanged, created no entry in
-   Pi's session directory (`<agent dir>/sessions`, compared by name) and
-   left no process running in or naming its directory;
+3. runs `autoforge doctor` with a configuration whose reviewers are Pi with
+   the route's `require_oauth`, and checks the "available" and
+   "auth ready" rows, with the route's `authType`. Its rows that need
+   GitHub (`gh available`, `gh authenticated`, the default branch's
+   required checks, the check runs read) fail or are skipped, as they must
+   without your login: the configuration's `github.command` is the
+   stand-in's `gh`, which answers nothing. The report lists them apart
+   from any other failure, and only the Pi rows decide the step;
+4. drives a REMOTE run on a throwaway repository: a scripted stand-in
+   commits a one-line feature in the issue's worktree, the controller
+   pushes it and opens the PR on the stand-in, then **one REVIEW runs on
+   Pi** in that worktree, of the PR's HEAD, through AutoForge's own Pi
+   adapter (no correction relaunch), and must return a valid
+   `CONTROL_RESULT`; the launch fails with `pi: model unavailable` if the
+   model is not among Pi's available ones. The controller posts the review
+   comment itself. A clean review leaves the run at `READY_FOR_MERGE`, and
+   nothing is merged: the merge gate stays closed;
+5. scans everything AutoForge wrote (the run's state directory, which this
+   test keeps outside the checkout, with its state, journal, run logs and
+   each step's execution records; the git directory's `autoforge/`, with
+   the lock and the issue's worktree; every request the controller sent to
+   the stand-in, the PR's title and body and the review comment among
+   them; doctor's output) for JWTs, `Bearer`, `refresh_token`,
+   `"refresh"`, `"access"`, `chatgpt-account-id` / `chatgpt_account_id`
+   and `sk-` keys (DeepSeek's keys have that shape), and for the forwarded
+   key's own value, naming only the file and the pattern;
+6. checks that the review left the checkout, the issue's worktree and the
+   worktree's HEAD unchanged, created no entry in Pi's session directory
+   (`<agent dir>/sessions`, compared by name) and left no process running
+   in or naming its directory;
 7. prints a report: the date, the AutoForge commit under test (and whether
    its tracked files differ from it), the auth route, the `authType` Pi
    resolved and where the credential lives, Pi's version, the model and
    thinking level (as configured and as Pi resolved them), the review's
-   duration and outcome, doctor's Pi rows, and each step's PASS or FAIL.
+   duration and outcome, doctor's Pi rows, what the controller wrote to
+   the stand-in, and each step's PASS or FAIL.
 
 A failed review says who refused it: `provider refused (<reason>)` (the
 credential, a usage limit or the account's balance, the model's
@@ -452,56 +441,31 @@ account id, email or plan name: its report is the evidence to post on the
 issue. Run it on the commit under review, so that the report's commit is
 the one reviewed.
 
-**More evidence, by hand.** To see the write phases too, route
-`analyze_execute` and `fix` to Pi as well and run `autoforge local init` /
-`local run` in a throwaway repository you create for it. A full run
-spends several model calls. Check that the run reaches `DONE` or a
-review's findings, that each step's `execution.json` shows the model Pi
-resolved, and that `git status` shows only the implementation.
-
-### The REMOTE test
-
-`test_one_remote_review_runs_on_the_operators_real_pi` runs the same seven
-steps on a REMOTE run, against a GitHub stand-in: the test suite's
-in-memory fake of GitHub, its git data in a bare repository in the test's
-temporary directory, which the controller's own git transport pushes to
-over `file://`. Nothing reaches GitHub, and the run needs no `gh` login.
-The test seeds that repository itself, over no git transport and with
-none of your git configuration or `GIT_*` variables, so a URL rewrite
-(`insteadOf`) in your `~/.gitconfig` cannot send the seed anywhere else.
-Its other git (the checkout's `origin`, the scripted implementation's
-commit, the HEADs it reports) ignores your `GIT_*` variables too, so a
-`GIT_DIR` set in your shell cannot make it write to another checkout, and
-it runs none of your git hooks.
-A throwaway repository on github.com would exercise GitHub too, but it
-would need your login and the network, and leave a branch, a PR and a
-comment to clean up, while what this test proves is Pi on a REMOTE review.
-The cost: the run proves nothing about `gh` or GitHub's API, and what the
-controller sends to GitHub is checked against the fake's model of it.
-
-Steps 1 and 2 are the LOCAL test's, and so is step 7, whose report also
-names the mode and what the controller wrote to the stand-in. The others
-differ:
-
-3. It runs `autoforge doctor`. Its rows that need GitHub (`gh available`,
-   `gh authenticated`, the default branch's required checks, the check runs
-   read) fail or are skipped, as they must without your login: the
-   configuration's `github.command` is the stand-in's `gh`, which answers
-   nothing. The report lists them apart from any other failure, and only
-   the Pi rows decide the step, as for `local doctor`.
-4. The scripted stand-in commits the feature in the issue's worktree, the
-   controller pushes it and opens the PR on the stand-in, and **one REVIEW
-   runs on Pi** in that worktree, of the PR's HEAD. The controller posts the
-   review comment itself. A clean review leaves the run at
-   `READY_FOR_MERGE`, and nothing is merged: the merge gate stays closed.
-5. The scan also covers every request the controller sent to the stand-in
-   (the PR's title and body and the review comment among them), the git
-   directory's `autoforge/` (the lock and the issue's worktree), and the
-   run's state directory, which this test keeps outside the checkout.
-6. The review must leave the checkout, the issue's worktree and the
-   worktree's HEAD unchanged.
-
 A REMOTE review is bound to the PR's HEAD commit, not to the files in its
 worktree, so the controller accepts a review whose reviewer wrote into the
 worktree without committing: step 4 passes, and step 6 is what reports it.
-A LOCAL review that writes is refused by the controller itself.
+
+**More evidence, by hand.** To see the write phases too, route
+`analyze_execute` and `fix` to Pi as well and run `autoforge run` on an
+issue of a throwaway repository you create for it. A full run spends
+several model calls. Check that the run reaches `READY_FOR_MERGE` or a
+review's findings, that each step's `execution.json` shows the model Pi
+resolved, and that the PR's diff holds only the implementation.
+
+### The GitHub stand-in
+
+The stand-in is the test suite's in-memory fake of GitHub, its git data in
+a bare repository in the test's temporary directory, which the
+controller's own git transport pushes to over `file://`. Nothing reaches
+GitHub, and the run needs no `gh` login. The test seeds that repository
+itself, over no git transport and with none of your git configuration or
+`GIT_*` variables, so a URL rewrite (`insteadOf`) in your `~/.gitconfig`
+cannot send the seed anywhere else. Its other git (the checkout's
+`origin`, the scripted implementation's commit, the HEADs it reports)
+ignores your `GIT_*` variables too, so a `GIT_DIR` set in your shell
+cannot make it write to another checkout, and it runs none of your git
+hooks. A throwaway repository on github.com would exercise GitHub too, but
+it would need your login and the network, and leave a branch, a PR and a
+comment to clean up, while what this test proves is Pi on a REMOTE review.
+The cost: the run proves nothing about `gh` or GitHub's API, and what the
+controller sends to GitHub is checked against the fake's model of it.

@@ -28,16 +28,15 @@ or under the outer sandbox.
 ## What AutoForge protects
 
 - **No GitHub credential reaches an agent or a repository command through
-  anything AutoForge controls.** Agents, LOCAL validation commands
-  (`local.validation_commands`), REMOTE candidate validation commands
+  anything AutoForge controls.** Agents, candidate validation commands
   (`validation.commands`) and pre-merge commands
   (`merge.verification_commands`) start from an allow-listed environment
   in which no variable `gh` or git reads a credential from can be listed,
-  an empty
-  `gh` configuration, a placeholder `GH_TOKEN`, a git configuration that
-  switches off credential helpers, askpass, the SSH agent and SSH keys, an
-  empty curl and wget configuration, and shells that read none of your
-  startup files; the provider CLIs load no MCP server, plugin or hook. A
+  an empty `gh` configuration, a placeholder `GH_TOKEN`, a git
+  configuration that switches off credential helpers, askpass, the SSH
+  agent and SSH keys, an empty curl and wget configuration, and shells
+  that read none of your startup files; the provider CLIs load no MCP
+  server, plugin or hook. A
   launch is refused, before anything is saved or charged, while a
   repository git setting, `~/.netrc`, a login shell's startup file, a
   Claude Code settings file or an organization connected to OpenCode would
@@ -169,9 +168,8 @@ enforced, an agent still runs as your UID, keeps the host network (loopback
 services included) and can read the model credential its provider is
 given. There is no sandbox on macOS.
 
-Every enforced launch writes a tree of the repository: the repository root
-in LOCAL mode, the issue's agent worktree in REMOTE mode, and the
-repository's sandbox directories in both. A launch also writes the
+Every enforced launch writes a tree of the repository: the issue's agent
+worktree, and the repository's sandbox directories. A launch also writes the
 directory its provider is given read-write, which lies wherever you put
 it and outlives the launch: a dedicated `CLAUDE_CONFIG_DIR`,
 `PI_CODING_AGENT_DIR` or OpenCode database directory (`OPENCODE_DB`'s).
@@ -203,9 +201,8 @@ run, and `doctor`, from the same environment.
 
 A run is also pinned to the `sandbox.mode` it was created under. A later
 `step`, `resume` or `unblock` under a weaker mode is refused before
-anything runs: `required` to `preferred` or `disabled` in LOCAL mode, and
-`required` or `preferred` to `disabled` in REMOTE mode, where `preferred`
-is `required`. That includes a command run without the run's `--config`,
+anything runs: `required` or `preferred` (an alias of `required`) to
+`disabled`. That includes a command run without the run's `--config`,
 which falls back to the built-in `disabled`. To continue under the weaker
 mode anyway, repeat the command with `--accept-config-change`: the change
 is written to the run log first, and the run is pinned to the new mode.
@@ -258,11 +255,10 @@ repository's default `GITHUB_TOKEN` permissions to read-only.
   and `CLAUDE_*` for Claude Code; `OPENCODE_*`, `OPENAI_*`, `ANTHROPIC_*`,
   `GEMINI_*` and `GOOGLE_*` for OpenCode.
   ([Configuration: agent environment](configuration.md#agent-environment))
-- **Repository commands are the PR's code.** `validation.commands`,
-  `local.validation_commands` and `merge.verification_commands` come from
-  your configuration, but what they run (tests, build scripts) is the
-  candidate's own code, with your user, the allow-listed environment and,
-  by default, the host network.
+- **Repository commands are the PR's code.** `validation.commands` and
+  `merge.verification_commands` come from your configuration, but what
+  they run (tests, build scripts) is the candidate's own code, with your
+  user, the allow-listed environment and, by default, the host network.
 - **The committed tree is not filtered.** Only commit messages are checked;
   review and you own what a PR changes.
 - **Same-user state.** An agent under `disabled` can change the
