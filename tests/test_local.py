@@ -31,11 +31,9 @@ from autoforge.git_transport import LOCAL_GIT_ENV_ALLOWLIST, LOCAL_GIT_SWITCHES
 from autoforge.git_workspace import StatusEntry, uncommitted_paths
 from autoforge.local_workspace import (
     LocalWorkspace,
-    init_feature_file,
     read_feature_spec,
     resolve_feature_spec,
 )
-from autoforge.safefs import UnsafePathError
 from autoforge.state import AutoForgeState, StatePaths, load_state, save_state
 from autoforge.transitions import Phase, WorkflowMode, decide_next_phase
 
@@ -78,47 +76,6 @@ def creation_umask(request):
     previous = os.umask(request.param)
     yield request.param
     os.umask(previous)
-
-
-# -- `local init` ---------------------------------------------------------------
-def test_local_init_creates_the_template(tmp_path):
-    root = git_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root)
-    path = init_feature_file(ws, "add-transaction-filter")
-    assert path == root / "features" / "add-transaction-filter.md"
-    text = path.read_text(encoding="utf-8")
-    assert text.startswith("# Feature: Add Transaction Filter")
-    for section in (
-        "## Problem",
-        "## Requirements",
-        "## Acceptance Criteria",
-        "## Non-goals",
-        "## Notes / Decisions",
-    ):
-        assert section in text
-    assert "- [ ]" in text
-    # Feature specs are project content, never runtime state.
-    assert ".autoforge" not in str(path)
-
-
-def test_local_init_refuses_to_overwrite(tmp_path):
-    root = git_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root)
-    path = init_feature_file(ws, "keepme")
-    path.write_text("# Feature: hand written\n", encoding="utf-8")
-    with pytest.raises(ConfigurationError, match="already exists"):
-        init_feature_file(ws, "keepme")
-    assert path.read_text(encoding="utf-8") == "# Feature: hand written\n"
-    # ... unless overwriting is asked for explicitly.
-    init_feature_file(ws, "keepme", overwrite=True)
-    assert "## Acceptance Criteria" in path.read_text(encoding="utf-8")
-
-
-def test_local_init_rejects_a_slug_with_a_path_separator(tmp_path):
-    root = git_repo(tmp_path)
-    ws = LocalWorkspace(workdir=root)
-    with pytest.raises(ConfigurationError, match="invalid feature slug"):
-        init_feature_file(ws, "../../etc/passwd")
 
 
 # -- feature specification resolution -------------------------------------------
@@ -1598,50 +1555,6 @@ def _failed_git(req, stderr: str, exit_code: int = 128):
         started_at="2026-01-01T00:00:00+00:00",
         finished_at="2026-01-01T00:00:01+00:00",
     )
-
-
-def test_local_init_refuses_a_feature_directory_reached_through_a_symlink(tmp_path):
-    """R1-F2, now closed by construction rather than by a boundary check.
-
-    The old code compared a partly lexical path against the repository root,
-    and `realpath` only applied to the target's parent when that exact
-    directory already existed -- so `features/new` under a `features` symlink
-    looked in-repository and `mkdir(parents=True)` wrote outside the checkout.
-
-    The rewrite does not compare pathnames at all. Every component is opened
-    `O_DIRECTORY | O_NOFOLLOW` relative to the repository descriptor, so a
-    symbolic link anywhere on the way down cannot be traversed, whether or not
-    the rest of the path exists and whatever it points at.
-    """
-    root = git_repo(tmp_path / "repo")
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (root / "features").symlink_to(outside)
-    ws = LocalWorkspace(workdir=root)
-
-    # The nested, not-yet-existing parent is the case that used to slip through.
-    with pytest.raises(UnsafePathError, match="symbolic link"):
-        init_feature_file(ws, "spec", feature_dir="features/new")
-    # The direct case is refused by the same walk, at the same component.
-    with pytest.raises(UnsafePathError, match="symbolic link"):
-        init_feature_file(ws, "spec", feature_dir="features")
-    assert list(outside.iterdir()) == [], "nothing may be written outside the repository"
-
-
-def test_local_init_never_writes_through_a_symlink_at_the_target(tmp_path):
-    """O_NOFOLLOW on the final component: `--force` must not follow a link."""
-    root = git_repo(tmp_path / "repo")
-    outside = tmp_path / "elsewhere.md"
-    outside.write_text("operator content\n", encoding="utf-8")
-    (root / "features").mkdir()
-    (root / "features" / "spec.md").symlink_to(outside)
-    ws = LocalWorkspace(workdir=root)
-
-    with pytest.raises(ConfigurationError, match="already exists"):
-        init_feature_file(ws, "spec")
-    with pytest.raises(ConfigurationError, match="symbolic link, not a regular file"):
-        init_feature_file(ws, "spec", overwrite=True)
-    assert outside.read_text(encoding="utf-8") == "operator content\n"
 
 
 def test_an_unreadable_entry_cannot_be_bound_and_fails_closed(tmp_path):

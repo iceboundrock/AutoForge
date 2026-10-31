@@ -20,7 +20,7 @@ import pytest
 
 from autoforge.config import default_config
 from autoforge.errors import ConfigurationError, StateError, VerificationError
-from autoforge.local_workspace import KIND_EXCLUDED, LocalWorkspace, init_feature_file
+from autoforge.local_workspace import KIND_EXCLUDED, LocalWorkspace
 from autoforge.safefs import SafeRoot, UnsafePathError
 from autoforge.state import Phase
 
@@ -265,37 +265,6 @@ def test_an_excluded_region_is_never_read_and_never_hides_a_link_out_of_it(tmp_p
     excluded = [e.path for e in snap.entries if e.kind == KIND_EXCLUDED]
     assert "build" in excluded
     assert not any(e.path.startswith("build/") for e in snap.entries), "descended into it anyway"
-
-
-# -- 11 ------------------------------------------------------------------------
-def test_local_init_force_never_writes_through_an_operators_entry(tmp_path):
-    """Invariant R. `--force` replaces a name AutoForge could have written.
-
-    The attack is R5-F4 generalised past hard links: plant *each* kind of
-    entry at `features/<slug>.md` and check the external sentinel afterwards.
-    A link is refused (it is not a regular file); a hard link is replaced, so
-    the linked inode keeps its bytes and its identity. In neither case does a
-    single byte reach outside the checkout.
-    """
-    root = repo(tmp_path)
-    sentinel = Path(tmp_path) / "precious.txt"
-    sentinel.write_text("do not lose me\n", encoding="utf-8")
-    before = sentinel.stat()
-    ws = LocalWorkspace(workdir=root)
-    spec = root / "features" / "new-thing.md"
-
-    spec.symlink_to(sentinel)
-    with pytest.raises(ConfigurationError, match="symbolic link"):
-        init_feature_file(ws, "new-thing", overwrite=True)
-    assert sentinel.read_text(encoding="utf-8") == "do not lose me\n"
-
-    spec.unlink()
-    os.link(sentinel, spec)
-    init_feature_file(ws, "new-thing", overwrite=True)
-    assert sentinel.read_text(encoding="utf-8") == "do not lose me\n"
-    assert sentinel.stat().st_ino == before.st_ino
-    assert spec.stat().st_ino != before.st_ino
-    assert spec.read_text(encoding="utf-8").startswith("# Feature:")
 
 
 # -- 12 ------------------------------------------------------------------------

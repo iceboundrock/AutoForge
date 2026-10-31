@@ -649,9 +649,6 @@ class LocalConfig:
     restored mtime.
     """
 
-    # Where ``autoforge local init`` writes feature specifications. Project
-    # data, never under the runtime state directory.
-    feature_dir: str = "features"
     validation_commands: list[list[str]] = field(default_factory=list)
     # Local review/fix bound: the initial REVIEW, at most this many FIX
     # rounds, then a final REVIEW. 0 disables FIX entirely (one review pass).

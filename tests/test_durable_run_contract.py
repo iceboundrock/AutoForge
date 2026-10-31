@@ -554,34 +554,36 @@ def test_create_exclusive_publishes_by_link_so_a_failure_leaves_no_final_name(
         fs.close()
 
 
-def test_a_local_init_whose_write_fails_leaves_no_partial_specification(tmp_path, monkeypatch):
-    """R7-F5 at the command: a specification is either whole or absent.
+def test_a_create_exclusive_whose_write_fails_leaves_no_partial_file(tmp_path, monkeypatch):
+    """R7-F5: a file made by ``create_exclusive`` is either whole or absent.
 
     The failure is injected at ``fsync`` -- after the bytes were written,
     before they were durable -- which is the moment a crash used to leave a
-    truncated ``features/<slug>.md`` that the retry then refused to replace.
+    truncated file that the retry then refused to replace.
     """
-    from autoforge.local_workspace import LocalWorkspace, init_feature_file
+    from autoforge.safefs import SafeRoot
 
-    root = local_repo(tmp_path / "repo")
-    features = root / "features"
-    before = sorted(p.name for p in features.iterdir())
+    root = tmp_path / "r"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "existing.md").write_text("keep\n")
+    before = sorted(p.name for p in (root / "sub").iterdir())
     real_fsync = os.fsync
 
     def failing_fsync(fd):
         raise OSError(5, "injected I/O error")
 
-    monkeypatch.setattr(os, "fsync", failing_fsync)
-    with pytest.raises(StateError, match="cannot write .*features/broken.md.*injected"):
-        init_feature_file(LocalWorkspace(workdir=root), "broken")
-    assert sorted(p.name for p in features.iterdir()) == before, (
-        "a partial specification or a temporary survived the failed write"
-    )
-    monkeypatch.setattr(os, "fsync", real_fsync)
-    # The name is free, so the retry creates the specification whole.
-    created = init_feature_file(LocalWorkspace(workdir=root), "broken")
-    assert created.name == "broken.md" and created.read_text().startswith("#")
-    assert sorted(p.name for p in features.iterdir()) == sorted([*before, "broken.md"])
+    with SafeRoot.open(root) as fs:
+        monkeypatch.setattr(os, "fsync", failing_fsync)
+        with pytest.raises(StateError, match="cannot write .*sub/broken.md.*injected"):
+            fs.create_exclusive("sub/broken.md", b"# whole\n")
+        assert sorted(p.name for p in (root / "sub").iterdir()) == before, (
+            "a partial file or a temporary survived the failed write"
+        )
+        monkeypatch.setattr(os, "fsync", real_fsync)
+        # The name is free, so the retry creates the file whole.
+        fs.create_exclusive("sub/broken.md", b"# whole\n")
+    assert (root / "sub" / "broken.md").read_bytes() == b"# whole\n"
+    assert sorted(p.name for p in (root / "sub").iterdir()) == sorted([*before, "broken.md"])
 
 
 # =============================================================================

@@ -1509,7 +1509,6 @@ def test_a_local_block_of_any_shape_is_an_unknown_top_level_key(tmp_path, name, 
 
 def test_local_defaults_are_the_documented_ones():
     local = default_config().local
-    assert local.feature_dir == "features"
     assert local.max_fix_rounds == 1
     assert local.validation_commands == []
     assert local.exclude == []
