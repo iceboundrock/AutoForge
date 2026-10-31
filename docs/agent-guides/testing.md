@@ -341,7 +341,10 @@ High-priority coverage includes:
     protocol named as such; seeded random corruption of a REMOTE file
     either fails or loads as a legal REMOTE state holding exactly what the
     file says; truncated JSON and every non-object root are corruption,
-    never "no state", for `load_state`, `load` and `existing_run`
+    never "no state", for `load_state`, `load` and `existing_run`; a
+    REMOTE file that loads, given a complete LOCAL pending checkpoint
+    consistent with its phase, is refused by the checkpoint's REMOTE-mode
+    guard, named, by all three, with nothing written (#387)
   - C, the state root under a running REMOTE engine
     (`tests/test_state_root.py`): a state directory replaced while the
     agent runs (a link, a FIFO, a prepared directory, a rename aside, the
