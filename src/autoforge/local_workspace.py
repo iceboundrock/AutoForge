@@ -99,14 +99,13 @@ import os
 import posixpath
 import re
 import stat
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 
 from .errors import ConfigurationError, VerificationError
-from .executor import ExecutionRequest, ExecutionResult, execute
-from .git_transport import local_git_request
+from .git_workspace import GIT_TIMEOUT_SECONDS, GitWorkspace, Runner
 from .prompts import escape_inline
 from .run_contract import WorkspacePolicy
 from .safefs import (
@@ -119,10 +118,6 @@ from .safefs import (
     readlink_at,
 )
 
-Runner = Callable[[ExecutionRequest], ExecutionResult]
-
-GIT_TIMEOUT_SECONDS = 60
-
 # Bytes read per file when hashing working-tree content.
 _CHUNK = 1024 * 1024
 
@@ -134,10 +129,6 @@ SNAPSHOT_TAG = "autoforge-workspace-v4"
 
 DEFAULT_MAX_ENTRIES = 50_000
 DEFAULT_MAX_BYTES = 512 * 1024 * 1024
-
-# A full object name as `git rev-parse` prints it (40 hex for SHA-1, 64 for a
-# SHA-256 repository). Anything else from a successful read is not an anchor.
-_OBJECT_NAME_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 def hash_bytes(data: bytes) -> str:
@@ -325,23 +316,13 @@ def _refuse(path: str, what: str, remedy: str) -> VerificationError:
     )
 
 
-@dataclass(frozen=True)
-class StatusEntry:
-    """One record of ``git status --porcelain=v1 -z``.
+class LocalWorkspace(GitWorkspace):
+    """Read-only view of the git working tree a LOCAL run operates on.
 
-    ``code`` is git's two-letter status (``" M"``, ``"A "``, ``"??"``, ...),
-    ``path`` the path the record names and ``orig_path`` the path a rename or
-    copy came from (``""`` for every other record). Paths are as git prints
-    them, relative to the working tree's root, and are not verified to exist.
+    The git reads (root, git directories, HEAD, branch, status) are
+    :class:`~autoforge.git_workspace.GitWorkspace`'s; this adds LOCAL's walk,
+    snapshot and fingerprint over them.
     """
-
-    code: str
-    path: str
-    orig_path: str = ""
-
-
-class LocalWorkspace:
-    """Read-only view of the git working tree a LOCAL run operates on."""
 
     def __init__(
         self,
@@ -352,16 +333,12 @@ class LocalWorkspace:
         max_entries: int = DEFAULT_MAX_ENTRIES,
         max_bytes: int = DEFAULT_MAX_BYTES,
     ) -> None:
-        self.workdir = Path(workdir)
-        self._runner: Runner = runner or execute
-        self.timeout = timeout_seconds
+        super().__init__(workdir, runner=runner, timeout_seconds=timeout_seconds)
         self.exclude: tuple[str, ...] = tuple(
             sorted({normalize_exclude_pattern(p) for p in exclude})
         )
         self.max_entries = max_entries
         self.max_bytes = max_bytes
-        self._root: Path | None = None
-        self._git_dirs: tuple[Path, ...] | None = None
         # Content-digest memo, keyed by identity *and* change indicators. The
         # key is a cache key only: it never becomes part of the fingerprint,
         # so a forged mtime can at worst cost a re-hash, never bind the wrong
@@ -385,86 +362,6 @@ class LocalWorkspace:
             snapshot_tag=SNAPSHOT_TAG,
         )
 
-    # -- git plumbing -----------------------------------------------------
-    def _git(self, argv: list[str], *, allow_failure: bool = False) -> ExecutionResult:
-        res = self._runner(
-            # --no-optional-locks: every call here is a read, and a
-            # `git status` that refreshes the index would write
-            # `.git/index` — a side effect a `--dry-run` must not have.
-            # Hardened like every controller git process (ADR 0004 D7.3):
-            # the repository's hooks and file-system monitor are the agent's
-            # to write, so neither runs, and nothing git starts holds a
-            # credential. None of this changes what a read reports.
-            local_git_request(
-                ["--no-optional-locks", *argv],
-                cwd=str(self.workdir),
-                timeout_seconds=self.timeout,
-            )
-        )
-        if res.timed_out:
-            raise VerificationError(f"`git {' '.join(argv)}` timed out in {self.workdir}")
-        if res.truncated:
-            # Head + marker + tail of a listing is not the working tree.
-            raise VerificationError(
-                f"`git {' '.join(argv)}` output in {self.workdir} was truncated at the "
-                "executor's capture bound"
-            )
-        if res.exit_code != 0 and not allow_failure:
-            detail = (res.stderr or res.stdout).strip().splitlines()
-            raise VerificationError(
-                f"`git {' '.join(argv)}` failed in {self.workdir}: "
-                f"{detail[-1] if detail else f'exit {res.exit_code}'}"
-            )
-        return res
-
-    def root(self) -> Path:
-        """Absolute path of the repository working tree containing ``workdir``."""
-        if self._root is None:
-            res = self._git(["rev-parse", "--show-toplevel"], allow_failure=True)
-            if res.exit_code != 0:
-                detail = (res.stderr or res.stdout).strip().splitlines()
-                raise VerificationError(
-                    f"{Path(self.workdir).resolve()} is not inside a git repository "
-                    f"({detail[-1] if detail else 'git rev-parse failed'}); "
-                    "local mode operates on a git working tree"
-                )
-            top = (res.stdout or "").strip()
-            if not top:
-                raise VerificationError(
-                    f"git did not report a working tree for {Path(self.workdir).resolve()}"
-                )
-            self._root = Path(os.path.realpath(top))
-        return self._root
-
-    def git_dirs(self) -> tuple[Path, ...]:
-        """This repository's git directories (per-worktree and common), resolved.
-
-        Both are needed: in a linked worktree ``--git-dir`` is
-        ``<main>/.git/worktrees/<name>`` while ``--git-common-dir`` is
-        ``<main>/.git``, and either can be the directory that physically sits
-        inside the tree being walked.
-        """
-        if self._git_dirs is None:
-            found: list[Path] = []
-            for flag in ("--git-dir", "--git-common-dir"):
-                res = self._git(["rev-parse", flag], allow_failure=True)
-                if res.exit_code != 0:
-                    raise VerificationError(
-                        f"cannot locate the git directory of {self.workdir} "
-                        f"(`git rev-parse {flag}` exited {res.exit_code}); the controller "
-                        "will not walk a working tree whose git directory it cannot identify, "
-                        "because it could not then tell the repository's own metadata apart "
-                        "from reviewable content"
-                    )
-                text = (res.stdout or "").strip()
-                if not text:
-                    raise VerificationError(
-                        f"`git rev-parse {flag}` returned nothing for {self.workdir}"
-                    )
-                found.append(Path(os.path.realpath(Path(self.workdir) / text)))
-            self._git_dirs = tuple(dict.fromkeys(found))
-        return self._git_dirs
-
     def local_state_dir(self) -> Path:
         """Where a LOCAL run keeps its runtime state by default.
 
@@ -475,117 +372,6 @@ class LocalWorkspace:
         kind of rule an agent writing into the tree can exploit.
         """
         return self.git_dirs()[0] / "autoforge" / "state"
-
-    def head_sha(self) -> str:
-        """Current HEAD, or "" when the repository has no commit yet.
-
-        ``rev-parse --verify --quiet`` rather than plain ``rev-parse``: it
-        separates "this ref does not resolve" (exit 1, the unborn HEAD of a
-        repository with no commit) from "the read failed" (exit 128: a damaged
-        repository, a permissions change, a missing object store).  Both used
-        to collapse into ``""``, which is also the legitimate value for an
-        unborn HEAD — so a failing read looked exactly like "HEAD has not
-        moved", and a run whose git identity could no longer be established
-        continued instead of failing closed.
-        """
-        res = self._git(["rev-parse", "--verify", "--quiet", "HEAD"], allow_failure=True)
-        if res.exit_code == 1:
-            return ""  # unborn HEAD: the ref does not resolve, and that is a fact
-        if res.exit_code != 0:
-            raise VerificationError(self._anchor_read_failure("HEAD", res))
-        sha = (res.stdout or "").strip().lower()
-        if not _OBJECT_NAME_RE.match(sha):
-            raise VerificationError(
-                f"`git rev-parse --verify HEAD` succeeded in {self.workdir} but returned "
-                f"{sha!r}, which is not an object name; the run's git anchor cannot be "
-                "established and the controller will not continue without it"
-            )
-        return sha
-
-    def branch(self) -> str:
-        """Checked-out branch name, or "" when HEAD is detached.
-
-        ``symbolic-ref`` rather than ``rev-parse --abbrev-ref HEAD``: the
-        latter reports the literal string "HEAD" for a detached HEAD, which is
-        indistinguishable from a branch actually named ``HEAD``. An unborn
-        HEAD still has a symbolic ref, so a repository with no commit reports
-        its branch normally.
-
-        ``--quiet`` makes a detached HEAD exit 1 silently, which is the one
-        non-zero status that means "not a symbolic ref" rather than "the read
-        failed"; every other status fails closed, for the reason given in
-        :meth:`head_sha`.
-        """
-        res = self._git(["symbolic-ref", "--quiet", "--short", "HEAD"], allow_failure=True)
-        if res.exit_code == 1:
-            return ""  # detached HEAD: not a symbolic ref, and that is a fact
-        if res.exit_code != 0:
-            raise VerificationError(self._anchor_read_failure("the checked-out branch", res))
-        name = (res.stdout or "").strip()
-        if not name:
-            raise VerificationError(
-                f"`git symbolic-ref HEAD` succeeded in {self.workdir} but named no branch; "
-                "the run's git anchor cannot be established"
-            )
-        return name
-
-    def _anchor_read_failure(self, what: str, res: ExecutionResult) -> str:
-        detail = (res.stderr or res.stdout or "").strip().splitlines()
-        return (
-            f"cannot read {what} in {self.workdir} (git exited {res.exit_code}: "
-            f"{detail[-1] if detail else 'no output'}). A local run is pinned to the HEAD "
-            "and branch it started on, and a failed read is not evidence that they are "
-            "unchanged — treating it as one would let the run continue over a repository "
-            "whose identity the controller can no longer establish."
-        )
-
-    def dirty_paths(self) -> list[str]:
-        """Paths git considers changed, for the *start-up dirty-tree policy* only.
-
-        This is a policy question ("is the operator's work in the way?"), not
-        an identity question: nothing derived from it enters the fingerprint.
-        Git's own notion of "changed" is exactly right here — it is the
-        operator's mental model of their uncommitted work — and it is exactly
-        wrong for identity, which is why the two are separate methods.
-        """
-        paths: list[str] = []
-        for entry in self.status_entries():
-            if entry.orig_path:
-                paths.append(entry.orig_path)
-            paths.append(entry.path)
-        return sorted(dict.fromkeys(paths))
-
-    def status_entries(self) -> list[StatusEntry]:
-        """The records behind :meth:`dirty_paths`, in git's order, with their codes.
-
-        The same single ``git status`` read, kept as git reports it rather
-        than reduced to a set of paths, for a caller that has to say *how*
-        each path is uncommitted (#187). It is the operator's notion of
-        uncommitted work, never an identity.
-        """
-        res = self._git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-        out = res.stdout or ""
-        fields = out.split("\0")
-        entries: list[StatusEntry] = []
-        index = 0
-        while index < len(fields):
-            record = fields[index]
-            index += 1
-            if not record:
-                continue
-            if len(record) < 4:
-                raise VerificationError(f"cannot parse `git status` record {record!r}")
-            code, path, old = record[:2], record[3:], ""
-            if code[0] in "RC" or code[1] in "RC":
-                # A rename or a copy (`status.renames=copies`) is two
-                # NUL-separated fields: "<code> <new>\0<old>". Read as a
-                # record of its own, the source path would be cut into a
-                # made-up code and path.
-                if index < len(fields):
-                    old = fields[index]
-                    index += 1
-            entries.append(StatusEntry(code=code, path=path, orig_path=old))
-        return entries
 
     # -- state directory --------------------------------------------------
     def check_state_dir_location(self, state_dir: str | Path) -> None:
@@ -996,29 +782,6 @@ def _is_within(path: Path, base: Path) -> bool:
     except ValueError:
         return False
     return True
-
-
-def uncommitted_paths(
-    workdir: str | Path,
-    runner: Runner | None = None,
-    *,
-    timeout_seconds: int = GIT_TIMEOUT_SECONDS,
-) -> list[str]:
-    """What ``git status`` reports as changed or untracked in ``workdir``, sorted.
-
-    The one read of "what uncommitted work is here" outside the LOCAL
-    dirty-tree policy (:meth:`LocalWorkspace.dirty_paths`, which it is):
-    a single ``git status --porcelain=v1 -z --untracked-files=all``, with no
-    optional locks, so the index is not refreshed, and with hooks and the
-    file-system monitor off. An agent failure that leaves the state
-    unchanged reports its count for the REMOTE agent worktree (#189), and a
-    write phase's prompt lists the same read's records, codes included
-    (:meth:`LocalWorkspace.status_entries`, #187). Like the policy, it is
-    the operator's notion of uncommitted work, never an identity. A read
-    that fails, times out or is truncated raises VerificationError; a
-    caller that cannot use the answer omits it rather than guessing.
-    """
-    return LocalWorkspace(workdir, runner=runner, timeout_seconds=timeout_seconds).dirty_paths()
 
 
 # -- feature specifications ---------------------------------------------------

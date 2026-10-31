@@ -46,7 +46,7 @@ from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.state import load_state
 
 from .conftest import FakeGitHub, make_engine, make_local_engine, write_feature
-from .test_local import local_repo
+from .local_helpers import local_repo
 
 ROOT = "/srv/worktrees"
 

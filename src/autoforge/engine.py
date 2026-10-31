@@ -335,6 +335,7 @@ from .git_transport import (
     published_range_problem,
     valid_branch_name,
 )
+from .git_workspace import GIT_TIMEOUT_SECONDS, GitWorkspace, StatusEntry, uncommitted_paths
 from .github import (
     CommentInfo,
     GitHubClient,
@@ -346,13 +347,10 @@ from .github import (
 )
 from .interaction import InteractionBroker, Lifecycle, Resolver, Unattended
 from .local_workspace import (
-    GIT_TIMEOUT_SECONDS,
     FeatureSpec,
     LocalWorkspace,
-    StatusEntry,
     WorkspaceSnapshot,
     read_feature_spec,
-    uncommitted_paths,
     verify_feature_spec_unchanged,
 )
 from .locking import (
@@ -1511,7 +1509,7 @@ def config_file_placement_problem(
             f"{exc}, so the configuration file {config_file} is not shown to lie outside the "
             "directories its launches write"
         )
-    workspace = LocalWorkspace(workdir=workdir, runner=runner or execute)
+    workspace = GitWorkspace(workdir=workdir, runner=runner or execute)
     try:
         root = workspace.root()
         dirs = workspace.git_dirs()
@@ -1681,7 +1679,8 @@ class ControllerEngine:
         self._replan_entry: _ReplanEntry | None = None
         self._replan_candidate = ""
         self._replan_rejection = ""
-        self._workspace: LocalWorkspace | None = None
+        self._workspace: GitWorkspace | None = None
+        self._local_workspace: LocalWorkspace | None = None
         # The per-issue agent worktree paths already derived (a git read
         # each), keyed by the worktree's name; see :meth:`agent_worktree_path`.
         self._agent_worktrees: dict[str, Path] = {}
@@ -1865,29 +1864,41 @@ class ControllerEngine:
         """The workflow of the loaded run (REMOTE before any state exists)."""
         return self.state.mode if self.state is not None else WorkflowMode.REMOTE
 
-    def workspace(self) -> LocalWorkspace:
-        """The local working-tree reader (LOCAL mode's source of truth).
+    def workspace(self) -> GitWorkspace:
+        """The git reader of the checkout the controller is run from, in either mode.
+
+        Its root, git directories, HEAD, branch and status: the agent
+        worktree's root, the sandbox's facts, the candidate read and the
+        checkout anchor read through it. It reads no configuration (ADR 0009
+        C1); LOCAL's walk and fingerprint are :meth:`local_workspace`'s.
+        """
+        if self._workspace is None:
+            self._workspace = GitWorkspace(workdir=self.workdir, runner=self._runner or execute)
+        return self._workspace
+
+    def local_workspace(self) -> LocalWorkspace:
+        """The LOCAL working-tree reader (LOCAL mode's source of truth).
 
         Built from the *current* configuration: for a new run that is the
         definition being created, and for a loaded run it is what the
         contract gate (:meth:`local_contract`) compares against the
         persisted definition before any phase executes.
         """
-        if self._workspace is None:
+        if self._local_workspace is None:
             local = self.config.local
-            self._workspace = LocalWorkspace(
+            self._local_workspace = LocalWorkspace(
                 workdir=self.workdir,
                 runner=self._runner or execute,
                 exclude=local.exclude,
                 max_entries=local.max_workspace_entries,
                 max_bytes=local.max_workspace_bytes,
             )
-        return self._workspace
+        return self._local_workspace
 
     # -- the LOCAL run contract ------------------------------------------
     def _invocation_contract(self) -> LocalRunContract:
         """What *this* invocation would define a LOCAL run as (never persisted twice)."""
-        return LocalRunContract.from_config(self.config, self.workspace(), self.paths)
+        return LocalRunContract.from_config(self.config, self.local_workspace(), self.paths)
 
     def local_contract(self) -> LocalRunContract:
         """The loaded LOCAL run's persisted contract, proven to match this invocation.
@@ -3116,13 +3127,13 @@ class ControllerEngine:
         state directory inside the reviewed tree is refused, never quietly
         excluded from the fingerprint.
         """
-        ws = self.workspace()
+        ws = self.local_workspace()
         self.paths = local_state_paths(ws, explicit=explicit, configured=self.config.state_dir)
         ws.check_state_dir_location(self.paths.state_dir)
 
     def local_state_paths(self) -> StatePaths:
         """LOCAL mode's *default* state location, ignoring any configured one."""
-        return local_state_paths(self.workspace())
+        return local_state_paths(self.local_workspace())
 
     def bind_issue_namespace(self, namespace: IssueNamespace) -> None:
         """Point :attr:`paths` at a scheduler namespace's state directory (ADR 0008 D5.3).
@@ -3196,7 +3207,7 @@ class ControllerEngine:
         (see :meth:`_check_baseline_clean`). Nothing is written to disk here;
         the caller persists the state under the controller lock.
         """
-        ws = self.workspace()
+        ws = self.local_workspace()
         ws.check_state_dir_location(self.paths.state_dir)
         spec = read_feature_spec(ws, feature_spec_path)
         dirty = self._check_baseline_clean(ws.dirty_paths(), spec, allow_dirty)
@@ -3745,14 +3756,14 @@ class ControllerEngine:
         """Re-read the frozen specification, requiring its hash to be unchanged."""
         s = self._require_state()
         return verify_feature_spec_unchanged(
-            self.workspace(),
+            self.local_workspace(),
             s.feature_spec_path,
             s.feature_spec_sha256,
             when=f"before {s.phase.value}",
         )
 
     def _local_snapshot_for_prompt(self) -> WorkspaceSnapshot:
-        return self._local_bound_snapshot or self.workspace().snapshot()
+        return self._local_bound_snapshot or self.local_workspace().snapshot()
 
     def _prompt_variables(self) -> dict[str, str | int | None]:
         s = self._require_state()
@@ -3866,7 +3877,7 @@ class ControllerEngine:
         fails renders no hint, never a guess, and the note says why; the
         launch goes ahead as it would have before the hint existed.
         """
-        workspace = LocalWorkspace(cwd, runner=self._runner)
+        workspace = GitWorkspace(cwd, runner=self._runner)
         try:
             entries = workspace.status_entries()
             if not entries:
@@ -5088,7 +5099,7 @@ class ControllerEngine:
         drift = self._git_anchor_drift()
         if drift:
             return self._block(previous, plan, self._local_anchor_block_reason(drift))
-        before = self.workspace().snapshot()
+        before = self.local_workspace().snapshot()
         if previous == Phase.REVIEW:
             # REVIEW never binds a new fingerprint. `workspace_fingerprint` is
             # the tree as the controller last *verified* it -- the bytes the
@@ -5338,7 +5349,7 @@ class ControllerEngine:
         state = self._require_state()
         self.local_contract()
         self.validate_config()
-        ws = self.workspace()
+        ws = self.local_workspace()
         # Refuses a state directory inside the reviewed tree before any
         # fingerprint is computed (see check_state_dir_location). The contract
         # already proves the state directory is the one the run was created
@@ -5416,12 +5427,12 @@ class ControllerEngine:
         """Re-derive what actually changed and cross-check the agent's claim."""
         state = self._require_state()
         verify_feature_spec_unchanged(
-            self.workspace(),
+            self.local_workspace(),
             state.feature_spec_path,
             state.feature_spec_sha256,
             when=f"after {phase.value}",
         )
-        after = self.workspace().snapshot()
+        after = self.local_workspace().snapshot()
         changed = after.fingerprint != before.fingerprint
         if claimed != changed:
             raise VerificationError(
@@ -5487,12 +5498,12 @@ class ControllerEngine:
                 "valid for the exact workspace it was bound to."
             )
         verify_feature_spec_unchanged(
-            self.workspace(),
+            self.local_workspace(),
             state.feature_spec_path,
             state.feature_spec_sha256,
             when="after REVIEW",
         )
-        after = self.workspace().snapshot()
+        after = self.local_workspace().snapshot()
         if after.fingerprint != bound:
             # REVIEW is read-only; a reviewer that edited the code changed the
             # very thing it was judging, so its verdict describes nothing that
@@ -5820,7 +5831,7 @@ class ControllerEngine:
                 f"{phase.value}."
             ) from refused
         try:
-            after = self.workspace().snapshot()
+            after = self.local_workspace().snapshot()
         except Exception as exc:
             # A walk that is refused is the existing refusal, and the
             # command leaves no record (D7.2); the marker goes with it.

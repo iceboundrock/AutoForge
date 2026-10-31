@@ -1617,7 +1617,7 @@ def cmd_local_init(args) -> int:
     engine = _local_engine_for(args, cfg)
     with engine.locked():
         path = init_feature_file(
-            engine.workspace(),
+            engine.local_workspace(),
             args.slug,
             feature_dir=args.feature_dir or cfg.local.feature_dir,
             overwrite=args.force,

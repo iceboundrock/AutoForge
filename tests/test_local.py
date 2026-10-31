@@ -31,13 +31,12 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionResult, execute
 from autoforge.git_transport import LOCAL_GIT_ENV_ALLOWLIST, LOCAL_GIT_SWITCHES
+from autoforge.git_workspace import StatusEntry, uncommitted_paths
 from autoforge.local_workspace import (
     LocalWorkspace,
-    StatusEntry,
     init_feature_file,
     read_feature_spec,
     resolve_feature_spec,
-    uncommitted_paths,
 )
 from autoforge.providers import AgentExecutionResult
 from autoforge.safefs import UnsafePathError
@@ -55,24 +54,23 @@ from .conftest import (
     sample_contract,
     write_feature,
 )
+from .local_helpers import (
+    IMPL_FILE,
+    finding,
+    fix_result,
+    impl_result,
+    local_repo,
+    review_result,
+    scripted,
+    touch_impl,
+)
 
-IMPL_FILE = "src/app.py"
 # Every git read of the workspace reader: hardened (ADR 0004 D7.3, D7.5) and
 # never taking the optional index lock.
 _GIT_READ = ["git", *LOCAL_GIT_SWITCHES, "--no-optional-locks"]
 
 
 # -- helpers ------------------------------------------------------------------
-def local_repo(tmp_path) -> Path:
-    """A git repository with one committed file and a feature specification."""
-    root = git_repo(tmp_path)
-    (root / "src").mkdir(exist_ok=True)
-    (root / IMPL_FILE).write_text("def main():\n    pass\n", encoding="utf-8")
-    write_feature(root)
-    commit_all(root, "initial")
-    return root
-
-
 @pytest.fixture(params=[0o002, 0o022, 0o077], ids=lambda m: f"umask{m:04o}")
 def creation_umask(request):
     """Run a test under a 0002, a 0022 and a 0077 umask (#350).
@@ -86,83 +84,6 @@ def creation_umask(request):
     previous = os.umask(request.param)
     yield request.param
     os.umask(previous)
-
-
-def impl_result(changed: bool = True, summary: str = "Implemented the filter.") -> str:
-    return block(
-        {
-            "phase": "ANALYZE_EXECUTE",
-            "status": "success",
-            "summary": summary,
-            "changed_workspace": changed,
-            "tests_attempted": ["pytest -q"],
-        }
-    )
-
-
-def review_result(fingerprint: str, round: int = 1, findings: list[dict] | None = None) -> str:
-    findings = findings or []
-    return block(
-        {
-            "phase": "REVIEW",
-            "status": "success",
-            "round": round,
-            "reviewed_workspace_fingerprint": fingerprint,
-            "needs_fix_round": bool(findings),
-            "findings": findings,
-            "observations": ["Reads cleanly."],
-        }
-    )
-
-
-def finding(round: int = 1, n: int = 1) -> dict:
-    return {
-        "id": f"R{round}-F{n}",
-        "classification": "non-blocked",
-        "title": "Missing test",
-        "location": IMPL_FILE,
-        "required_resolution": "Add a unit test for the date filter.",
-    }
-
-
-def fix_result(finding_ids: list[str], changed: bool = True, resolution: str = "fixed") -> str:
-    return block(
-        {
-            "phase": "FIX",
-            "status": "success",
-            "changed_workspace": changed,
-            "resolutions": [
-                {
-                    "finding_id": fid,
-                    "resolution": resolution,
-                    "rationale": "The behaviour is already covered elsewhere in the suite.",
-                }
-                for fid in finding_ids
-            ],
-            "blocked_reason": "",
-        }
-    )
-
-
-def touch_impl(root: Path, text: str) -> None:
-    (root / IMPL_FILE).write_text(text, encoding="utf-8")
-
-
-def scripted(engine, root: Path, steps: list):
-    """Handler that mutates the workspace like a real agent would.
-
-    ``steps`` are ``(mutate(root) | None, stdout_factory(engine))`` pairs
-    consumed in order.
-    """
-    queue = list(steps)
-
-    def handler(req):
-        mutate, stdout = queue.pop(0)
-        if mutate is not None:
-            mutate(root)
-        return stdout(engine)
-
-    return handler
 
 
 # -- `local init` ---------------------------------------------------------------
@@ -2269,7 +2190,7 @@ def test_a_pre_launch_refusal_on_a_resumed_entry_keeps_the_earlier_charge(tmp_pa
     root = local_repo(tmp_path)
     eng = make_local_engine(root, "features/add-filter.md")
     eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    before = eng.workspace().snapshot().fingerprint
+    before = eng.local_workspace().snapshot().fingerprint
 
     def writes_then_dies(req):
         touch_impl(root, "partial\n")

@@ -21,7 +21,7 @@ from autoforge.sandbox import Link, compile_launch
 from autoforge.sandbox_bwrap import Capability, ProbeResult
 from autoforge.sandbox_policy import AuthItem, AuthMode, ProviderRequirements, provider_request
 from tests.conftest import git_repo, make_local_engine
-from tests.test_local import local_repo
+from tests.local_helpers import local_repo
 
 SECRET = "sk-ant-doctor-test-value-0123456789"
 

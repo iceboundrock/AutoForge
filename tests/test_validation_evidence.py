@@ -49,7 +49,7 @@ from autoforge.state import load_state
 from autoforge.transitions import Phase
 
 from .conftest import GIT_IDENT, git_out, git_repo, make_engine, make_local_engine
-from .test_local import impl_result, local_repo, review_result, scripted, touch_impl
+from .local_helpers import impl_result, local_repo, review_result, scripted, touch_impl
 
 PY = sys.executable
 PROVENANCE = WorktreeProvenance(2, "2", True)

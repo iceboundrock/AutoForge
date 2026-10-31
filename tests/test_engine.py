@@ -10258,7 +10258,7 @@ def test_the_branch_is_quoted_in_a_code_span_no_backtick_in_it_can_close(branch,
     longer than any backtick run in the name, and a name that starts or ends
     with a backtick is padded so the run does not join the delimiter."""
     from autoforge.engine import render_worktree_state
-    from autoforge.local_workspace import StatusEntry
+    from autoforge.git_workspace import StatusEntry
 
     assert git_out("check-ref-format", "--branch", branch) == branch
     text = render_worktree_state([StatusEntry("??", "a.py")], SHA_A, branch)
@@ -10308,7 +10308,7 @@ def test_the_hint_is_bounded_and_quotes_each_path_as_data():
         MAX_WORKTREE_STATE_PATH_CHARS,
         render_worktree_state,
     )
-    from autoforge.local_workspace import StatusEntry
+    from autoforge.git_workspace import StatusEntry
 
     assert render_worktree_state([], SHA_A, "") == ""
     long = "deep/" + "x" * 400 + ".py"

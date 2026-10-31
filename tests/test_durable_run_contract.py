@@ -40,7 +40,7 @@ from autoforge.state import STATE_FILENAME
 from autoforge.transitions import Phase
 
 from .conftest import commit_all, make_local_engine, sample_contract
-from .test_local import IMPL_FILE, fix_result, impl_result, local_repo, review_result, scripted
+from .local_helpers import IMPL_FILE, fix_result, impl_result, local_repo, review_result, scripted
 
 SRC = Path(autoforge.__file__).parent
 
@@ -318,7 +318,7 @@ def test_a_configuration_changed_between_invocations_refuses_the_resume(
     eng2 = make_local_engine(root, "features/add-filter.md", start=False)
     eng2.load()
     mutate(eng2.config)
-    eng2._workspace = None  # a new invocation would rebuild the reader from config
+    eng2._local_workspace = None  # a new invocation would rebuild the reader from config
     with pytest.raises(VerificationError, match="does not match the current invocation"):
         eng2.step()
     assert _snapshot_dir(state_dir) == before
@@ -657,7 +657,7 @@ def test_the_policy_change_is_refused_between_review_and_fix_as_well(tmp_path):
     """Mid-lifecycle, not only before the first review."""
     root = local_repo(tmp_path / "repo")
     eng = make_local_engine(root, "features/add-filter.md")
-    from .test_local import finding
+    from .local_helpers import finding
 
     eng.provider._handler = scripted(
         eng,
@@ -1192,7 +1192,7 @@ def _render_fix_prompt(tmp_path, mutate_finding):
     markers inside a string, so the persisted evidence is the only place a
     payload of this shape can enter the controller from.
     """
-    from .test_local import finding
+    from .local_helpers import finding
 
     root = local_repo(tmp_path / "repo")
     eng = make_local_engine(root, "features/add-filter.md")

@@ -874,7 +874,7 @@ def test_local_fingerprint_drift_before_review_certifies_nothing(tmp_path):
     validated it: the existing drift handling blocks REVIEW, no certificate
     is issued, and the records of the verified workspace are no evidence for
     the changed one."""
-    from .test_local import touch_impl
+    from .local_helpers import touch_impl
     from .test_review_certificate import implemented, local_run, reviewed
 
     eng, root = local_run(tmp_path, [implemented(), reviewed()], PASSES)
@@ -886,7 +886,7 @@ def test_local_fingerprint_drift_before_review_certifies_nothing(tmp_path):
     assert eng.step().next_phase == "BLOCKED"
     s = saved(eng)
     assert s.review_certificate == {} and s.review_round == 0
-    now = eng.workspace().snapshot().fingerprint
+    now = eng.local_workspace().snapshot().fingerprint
     assert now != verified and _local_evidence_for(eng, now).records == ()
 
 
@@ -894,7 +894,7 @@ def test_local_a_certificate_names_only_the_workspace_its_round_reviewed(tmp_pat
     """DONE holds the certificate of the reviewed workspace F. An edit after
     it is F': no record is evidence for F', and against a state bound to F'
     the certificate does not apply."""
-    from .test_local import touch_impl
+    from .local_helpers import touch_impl
     from .test_review_certificate import implemented, local_run, reviewed
 
     eng, root = local_run(tmp_path, [implemented(), reviewed()], PASSES)
@@ -904,7 +904,7 @@ def test_local_a_certificate_names_only_the_workspace_its_round_reviewed(tmp_pat
     assert s.review_certificate["reviewed_workspace_fingerprint"] == reviewed_fingerprint
     assert eng.review_certificate_problem() == ""
     touch_impl(root, "an edit after DONE\n")
-    now = eng.workspace().snapshot().fingerprint
+    now = eng.local_workspace().snapshot().fingerprint
     assert now != reviewed_fingerprint and _local_evidence_for(eng, now).records == ()
     eng.state.reviewed_workspace_fingerprint = now
     eng.state.workspace_fingerprint = now

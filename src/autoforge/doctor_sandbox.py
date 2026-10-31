@@ -475,7 +475,7 @@ def _run_engine(doctor: Doctor, cfg: AutoForgeConfig, local: bool) -> _engine.Co
     )
     if local:
         eng.paths = _engine.local_state_paths(
-            eng.workspace(), explicit=doctor.state_dir, configured=cfg.state_dir
+            eng.local_workspace(), explicit=doctor.state_dir, configured=cfg.state_dir
         )
     return eng
 

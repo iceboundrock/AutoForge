@@ -411,7 +411,7 @@ def test_the_review_binding_is_recomputed_and_never_read_back_from_state(tmp_pat
     against is one it computes itself at that moment.
     """
     from .conftest import make_local_engine
-    from .test_local import IMPL_FILE, impl_result, local_repo, review_result, scripted
+    from .local_helpers import IMPL_FILE, impl_result, local_repo, review_result, scripted
 
     root = local_repo(tmp_path)
     eng = make_local_engine(root, root / "features" / "add-filter.md", cfg=default_config())
@@ -451,7 +451,7 @@ def test_an_agent_replacing_the_state_directory_mid_run_redirects_nothing(tmp_pa
     nothing, because no pathname is resolved again.
     """
     from .conftest import make_local_engine
-    from .test_local import IMPL_FILE, impl_result, local_repo, review_result, scripted
+    from .local_helpers import IMPL_FILE, impl_result, local_repo, review_result, scripted
 
     root = local_repo(tmp_path)
     outside = Path(tmp_path) / "outside"
@@ -507,7 +507,7 @@ def test_a_state_directory_replaced_by_an_ordinary_directory_redirects_nothing(t
     open must still reach that inode.
     """
     from .conftest import make_local_engine
-    from .test_local import IMPL_FILE, impl_result, local_repo, review_result, scripted
+    from .local_helpers import IMPL_FILE, impl_result, local_repo, review_result, scripted
 
     # The repository is a subdirectory so the planted directory is genuinely
     # outside the reviewed tree rather than merely somewhere the walk ignores.
@@ -574,7 +574,7 @@ def test_a_link_to_a_linked_worktrees_git_pointer_is_refused_before_and_after_bi
     bound its work for the reviewer).
     """
     from .conftest import make_local_engine
-    from .test_local import IMPL_FILE, impl_result, local_repo, review_result, scripted
+    from .local_helpers import IMPL_FILE, impl_result, local_repo, review_result, scripted
 
     main = local_repo(tmp_path / "main")
     linked = Path(tmp_path) / "linked"

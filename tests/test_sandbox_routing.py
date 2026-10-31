@@ -946,7 +946,7 @@ def test_a_required_local_run_with_its_config_file_in_the_root_launches_nothing(
     ever writes it and it is byte-identical."""
     from autoforge import cli
 
-    from .test_local import local_repo
+    from .local_helpers import local_repo
 
     root = local_repo(tmp_path / "work")
     inside = _sentinel(root / "autoforge.json", _CONFIG_TEXT)
@@ -1032,7 +1032,7 @@ def test_a_required_local_run_with_its_config_file_in_claudes_directory_launches
     it and it is byte-identical."""
     from autoforge import cli
 
-    from .test_local import local_repo
+    from .local_helpers import local_repo
 
     root = local_repo(tmp_path / "work")
     directory = Path(os.path.realpath(tmp_path)) / "claude-autoforge"
@@ -1112,7 +1112,7 @@ def test_a_required_local_run_validates_inside_the_sandbox(backend, tmp_path):
     """The engine routes a LOCAL validation command through the backend: it
     cannot create a file in the git directory (outside, it could), and the
     run still advances on its exit status."""
-    from .test_local import impl_result, local_repo, review_result, scripted, touch_impl
+    from .local_helpers import impl_result, local_repo, review_result, scripted, touch_impl
 
     root = local_repo(tmp_path)
     code = (

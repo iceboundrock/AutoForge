@@ -60,11 +60,11 @@ from .conftest import (
     review_result,
     scripted,
 )
-from .test_local import finding as local_finding
-from .test_local import fix_result as local_fix_result
-from .test_local import impl_result, local_repo, touch_impl
-from .test_local import review_result as local_review_result
-from .test_local import scripted as local_scripted
+from .local_helpers import finding as local_finding
+from .local_helpers import fix_result as local_fix_result
+from .local_helpers import impl_result, local_repo, touch_impl
+from .local_helpers import review_result as local_review_result
+from .local_helpers import scripted as local_scripted
 from .test_validation_gates import _route, failing_finding
 
 PY = sys.executable
