@@ -764,8 +764,7 @@ class LocalWorkspace(GitWorkspace):
         """A capability on the working tree (caller closes it).
 
         The feature specification is read through it, behind the same
-        boundary as every other controller access. The controller writes
-        nothing into the working tree.
+        boundary as every other controller access.
         """
         return SafeRoot.open(self.root())
 
