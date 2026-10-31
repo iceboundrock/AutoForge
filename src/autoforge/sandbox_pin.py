@@ -32,23 +32,19 @@ executes (:meth:`autoforge.engine.ControllerEngine.check_run_configuration`):
 - **as strong:** nothing changes.
 
 Strength is what a launch of the run gets (:func:`mode_strength`):
-``disabled`` is logical isolation only, LOCAL's ``preferred`` falls back to
-it where the host cannot enforce, and ``required`` never runs a launch
-unenforced, which is also what REMOTE's ``preferred`` does (ADR 0005
-D12.2). In a REMOTE run ``required`` and ``preferred`` are therefore one
-strength, and moving between them changes nothing.
+``disabled`` is logical isolation only, and ``required`` never runs a launch
+unenforced, which is also what ``preferred`` does (ADR 0005 D12.2, ADR 0009
+D7). ``required`` and ``preferred`` are therefore one strength, and moving
+between them changes nothing.
 
 The pin holds configuration, never enforcement. Whether a launch ran inside
 the sandbox stays the run log's (ADR 0005 D16.1), and the host's capability
 may change between commands without touching the pin: under ``required``
 an incapable host is refused at the gate, as before.
 
-It applies to LOCAL and REMOTE runs alike, beside LOCAL's run contract and
-REMOTE's recorded configuration rather than inside either. The contract
-refuses any drift and an older contract is never migrated; the recorded
-configuration is REMOTE's alone and refuses any schema but its own. The pin
-refuses only a weaker mode, and it must load in every run created before
-it existed.
+It sits beside the run's recorded configuration rather than inside it. The
+recorded configuration refuses any schema but its own; the pin refuses only
+a weaker mode, and it must load in every run created before it existed.
 
 The record
 ----------
@@ -95,17 +91,15 @@ _RECORD_KEYS = ("schema", "mode", "source", "recorded_at")
 _MAX_TIMESTAMP_CHARS = 64
 
 
-def mode_strength(mode: str, *, local: bool) -> int:
-    """What ``mode`` gives a launch of a LOCAL or REMOTE run, as an order.
+def mode_strength(mode: str) -> int:
+    """What ``mode`` gives a launch of the run, as an order.
 
-    0: logical isolation only (``disabled``). 1: enforced where the host can
-    be, logical isolation only elsewhere (LOCAL's ``preferred``). 2: never
-    run unenforced (``required``, and REMOTE's ``preferred``, D12.2).
+    0: logical isolation only (``disabled``). 1: never run unenforced
+    (``required``, and ``preferred``, which means ``required``: ADR 0005
+    D12.2, ADR 0009 D7).
     """
-    if mode == SANDBOX_REQUIRED:
-        return 2
-    if mode == SANDBOX_PREFERRED:
-        return 1 if local else 2
+    if mode in (SANDBOX_REQUIRED, SANDBOX_PREFERRED):
+        return 1
     return 0
 
 
@@ -117,9 +111,9 @@ class SandboxPin:
     source: str
     recorded_at: str
 
-    def direction(self, mode: str, *, local: bool) -> int:
+    def direction(self, mode: str) -> int:
         """-1 when ``mode`` is weaker than the pin, 1 when stronger, 0 when as strong."""
-        now, pinned = mode_strength(mode, local=local), mode_strength(self.mode, local=local)
+        now, pinned = mode_strength(mode), mode_strength(self.mode)
         return (now > pinned) - (now < pinned)
 
     def describe(self) -> str:

@@ -20,7 +20,7 @@ from autoforge.redaction import redact, redact_obj
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
 from autoforge.scheduler_state import Admission, ClaimKind, StateRef, open_claim
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
-from autoforge.transitions import Phase, WorkflowMode
+from autoforge.transitions import Phase
 from tests.conftest import (
     BRANCH,
     DOTDOT_SPELLINGS,
@@ -30,6 +30,7 @@ from tests.conftest import (
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     ISSUE,
+    LOCAL_STATE_FIELDS,
     PR,
     SHA_A,
     UNLOADABLE_STATES,
@@ -50,7 +51,6 @@ from tests.conftest import (
     make_engine,
     publish_pr_head,
     review_result,
-    sample_contract,
     state_tree,
     unloadable_state,
 )
@@ -256,6 +256,38 @@ def test_run_then_status_json(tmp_path, capsys, monkeypatch, fakes):
     assert data["repository"] == "owner/repo" and data["step_count"] == 1
     assert cli.main(["--state-dir", sd, "status"]) == 0
     assert "ANALYZE_EXECUTE" in capsys.readouterr().out
+
+
+def test_status_json_carries_none_of_the_local_fields_under_protocol_13(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#388 (ADR 0009 D8, D10): protocol 13 removed LOCAL's twelve fields from
+    the state file, so ``status --json`` prints none of them, for a run this
+    controller created and for a protocol-12 file that still carries them
+    empty, which loads with them dropped and is not rewritten by the read."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["protocol_version"] == "13" and printed["mode"] == "REMOTE"
+    assert not set(LOCAL_STATE_FIELDS) & set(printed)
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    assert not set(LOCAL_STATE_FIELDS) & set(data)
+    data["protocol_version"] = "12"
+    data.update({name: type(empty)() for name, empty in LOCAL_STATE_FIELDS.items()})
+    state_file.write_text(json.dumps(data))
+    before = state_file.read_bytes()
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert not set(LOCAL_STATE_FIELDS) & set(printed)
+    assert printed["protocol_version"] == "13"
+    assert state_file.read_bytes() == before
 
 
 def test_status_describes_a_corrupt_replan_transaction_instead_of_crashing(
@@ -1697,7 +1729,7 @@ def test_doctor_writes_no_state_directory_for_a_configuration_it_refused(
 
 
 # Every label a state file has had (1 to the current one), the next one, and none.
-_EVERY_LABEL = (*(str(n) for n in range(1, 14)), None)
+_EVERY_LABEL = (*(str(n) for n in range(1, 15)), None)
 # What a hand-built LOCAL state carries beside its mode when it is garbage: a
 # field no protocol knows, a field of the wrong type, and LOCAL's fields not
 # empty. The phase stays one LOCAL had: the loader reads it before the mode.
@@ -1791,7 +1823,7 @@ _LOCKING_COMMANDS = (
 
 
 @pytest.mark.parametrize("lock_file", ["absent", "existing"])
-@pytest.mark.parametrize("label", ["12", "13", None], ids=lambda label: f"label-{label}")
+@pytest.mark.parametrize("label", ["12", "13", "14", None], ids=lambda label: f"label-{label}")
 def test_a_local_state_in_the_locks_directory_is_refused_without_taking_the_lock(
     tmp_path, capsys, monkeypatch, fakes, label, lock_file
 ):
@@ -2636,25 +2668,7 @@ def test_a_configured_scheduler_state_dir_is_refused_before_the_run_is_looked_fo
     D4, #387), is left as it was."""
     monkeypatch.chdir(tmp_path)
     local = tmp_path / ".git" / "autoforge" / "state"
-    local.mkdir(parents=True)
-    save_state(
-        AutoForgeState(
-            run_id="af-local",
-            mode=WorkflowMode.LOCAL,
-            phase=Phase.REVIEW,
-            feature_spec_path="features/add-filter.md",
-            feature_spec_sha256="a" * 64,
-            local_run_contract=sample_contract(
-                repository_root=str(tmp_path), state_root=str(local)
-            ),
-            workspace_fingerprint="b" * 64,
-            base_head_sha="c" * 40,
-            base_branch="main",
-            created_at="2026-09-06T00:00:00+00:00",
-            updated_at="2026-09-06T00:00:00+00:00",
-        ),
-        local / "state.json",
-    )
+    _write_local_state(local, "12", True)
     sd = _namespace_state_dir(tmp_path)
     cfg = _config(tmp_path / "autoforge.json", state_dir=".git/autoforge/scheduler/issues/1/state")
     local_before = _files(local)
@@ -3833,7 +3847,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     assert f"--config {cfg} is recorded as the run's" in out.err
     assert "ANALYZE_EXECUTE -> REVIEW" in out.out
     saved = load_state(state_file)
-    assert saved.protocol_version == "12"
+    assert saved.protocol_version == "13"
     assert saved.config_fingerprint["source"] == "upgraded"
     assert saved.sandbox_pin["mode"] == "disabled" and saved.sandbox_pin["source"] == "upgraded"
     assert saved.config_fingerprint["profiles"]["analyze_execute"]["model"] == "opus"

@@ -18,7 +18,7 @@ from autoforge.errors import (
     StateTransitionError,
 )
 from autoforge.state import load_state
-from autoforge.transitions import UNBLOCK_TARGETS, Phase, WorkflowMode
+from autoforge.transitions import UNBLOCK_TARGETS, Phase
 from tests.conftest import (
     BRANCH,
     EPIC,
@@ -137,14 +137,6 @@ def test_unblock_bounds_the_reason_length(tmp_state_dir, fake_github):
     eng = _blocked(tmp_state_dir, fake_github)
     with pytest.raises(ConfigurationError, match="at most"):
         eng.unblock("x" * (engine_module.MAX_UNBLOCK_REASON_CHARS + 1))
-    assert fake_github.calls == []
-
-
-def test_unblock_is_not_available_to_local_runs(tmp_state_dir, fake_github):
-    eng = _blocked(tmp_state_dir, fake_github)
-    eng.state.mode = WorkflowMode.LOCAL
-    with pytest.raises(StateTransitionError, match="GitHub runs only"):
-        eng.unblock(REASON)
     assert fake_github.calls == []
 
 
@@ -644,7 +636,7 @@ def test_unblock_goes_through_validate_transition(tmp_state_dir, fake_github, mo
     certify_review(eng)
     seen = []
 
-    def refusing(frm, to, mode=WorkflowMode.REMOTE):
+    def refusing(frm, to):
         seen.append((frm, to))
         raise StateTransitionError(f"illegal transition {frm.value} -> {to.value}")
 

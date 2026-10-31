@@ -4,9 +4,8 @@ ADR 0006 Wave 2B end to end, offline: real git repositories under
 ``tmp_path``, real local Python validators, the in-memory GitHub and
 scripted agents. REMOTE validation is the engine's
 ``validate_remote_candidate`` entry point, which no phase calls yet (#173).
-LOCAL's in-place validation went with its way in (ADR 0009 D5, #387); what
-is left of it is the refusal of the REMOTE entry point on a LOCAL run, in
-memory. The pure value checks are in ``tests/test_evidence.py``.
+LOCAL's in-place validation is removed (ADR 0009, #387, #388). The pure
+value checks are in ``tests/test_evidence.py``.
 """
 
 from __future__ import annotations
@@ -57,10 +56,8 @@ from .conftest import (
     git_repo,
     implement,
     make_engine,
-    make_local_engine,
     pollute_operator_environment,
 )
-from .local_helpers import local_repo
 
 PY = sys.executable
 PROVENANCE = WorktreeProvenance(2, "2", True)
@@ -504,13 +501,6 @@ def test_a_sandbox_refusal_under_required_writes_nothing(tmp_path, monkeypatch):
     assert "bwrap is not installed" in run_logs(eng)
 
 
-def test_a_local_run_has_no_remote_entry_point(tmp_path):
-    root = local_repo(tmp_path)
-    eng = make_local_engine(root, "features/add-filter.md")
-    with pytest.raises(StateError, match="LOCAL run validates in place"):
-        eng.validate_remote_candidate("a" * 40, PROVENANCE)
-
-
 # -- REMOTE: a credential source planted during the producer's launch (#165) -----------
 #
 # ADR 0009 A.2.3 H (#386): the implementation agent writes it after its own
@@ -602,7 +592,8 @@ def test_a_helper_planted_by_the_producer_never_reaches_its_validation_command(
     agent launch in that worktree refuses the helper before it starts.
 
     ADR 0009 A.2.3 H-A (#386): the REMOTE replacement of
-    tests/test_local.py::test_a_credential_helper_planted_before_validation_leaves_the_phase_unverified
+    ``test_local.py::test_a_credential_helper_planted_before_validation_leaves_the_phase_unverified``,
+    deleted with LOCAL (#388)
     (case i, the helper).
     """
     scratch = tmp_path_factory.mktemp("probe")
@@ -687,7 +678,8 @@ def test_a_netrc_entry_planted_by_the_producer_refuses_its_validation_and_blocks
     candidate stays unvalidated and unpublished.
 
     ADR 0009 A.2.3 H-A (#386): the REMOTE replacement of
-    tests/test_local.py::test_a_credential_helper_planted_before_validation_leaves_the_phase_unverified
+    ``test_local.py::test_a_credential_helper_planted_before_validation_leaves_the_phase_unverified``,
+    deleted with LOCAL (#388)
     (case ii, ``~/.netrc``).
     """
     plant = plant_in_home(".netrc", f"machine github.com login x password {PLANTED}\n")
@@ -706,7 +698,8 @@ def test_a_startup_file_planted_by_the_producer_refuses_its_validation_and_block
     refuses, naming the shell and the variable, never the value.
 
     ADR 0009 A.2.3 H-B (#386): the REMOTE replacement of
-    tests/test_local.py::test_a_startup_file_planted_before_validation_leaves_the_phase_unverified
+    ``test_local.py::test_a_startup_file_planted_before_validation_leaves_the_phase_unverified``,
+    deleted with LOCAL (#388)
     """
     plant = plant_in_home(".profile", f"export GITHUB_TOKEN={PLANTED}\n")
     outcome = refused_validation(tmp_state_dir, tmp_path_factory, monkeypatch, plant)

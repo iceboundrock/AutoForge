@@ -6,7 +6,6 @@ from autoforge.errors import ControlResultValidationError, StateTransitionError
 from autoforge.state import AutoForgeState
 from autoforge.transitions import (
     LEGAL_EDGES,
-    LOCAL_LEGAL_EDGES,
     PHASE_SETTLEMENT,
     TERMINAL_PHASES,
     UNBLOCK_TARGETS,
@@ -82,18 +81,23 @@ def test_replan_reexecute_has_exactly_one_exit_and_one_entry():
 def test_terminal_phases_have_no_outgoing_edges_except_the_operators_unblock():
     """DONE and FAILED are final. BLOCKED's edges are the operator's, and only
     the operator's: `decide_next_phase` still refuses it, so no agent result
-    can route out of it, and the LOCAL topology has no way out at all."""
+    can route out of it."""
     assert LEGAL_EDGES[Phase.DONE] == frozenset()
     assert LEGAL_EDGES[Phase.FAILED] == frozenset()
     assert LEGAL_EDGES[Phase.BLOCKED] == UNBLOCK_TARGETS
     assert UNBLOCK_TARGETS == {to for frm, to in EXPECTED_LEGAL_EDGES if frm is Phase.BLOCKED}
     assert Phase.REPLAN_REEXECUTE not in UNBLOCK_TARGETS
     assert not (UNBLOCK_TARGETS & TERMINAL_PHASES)
-    for phase in TERMINAL_PHASES:
-        assert LOCAL_LEGAL_EDGES[phase] == frozenset()
-        assert not is_legal(phase, Phase.REVIEW, WorkflowMode.LOCAL)
     with pytest.raises(StateTransitionError, match="terminal"):
         decide_next_phase(Phase.BLOCKED, {"needs_fix_round": False})
+
+
+def test_the_one_workflow_mode_is_remote():
+    """LOCAL mode is removed (ADR 0009 D4, D8): the enum keeps the one value
+    every state file records, and the lookup refuses "LOCAL" like any other."""
+    assert [m.value for m in WorkflowMode] == ["REMOTE"]
+    with pytest.raises(ValueError):
+        WorkflowMode("LOCAL")
 
 
 def test_every_phase_appears_in_the_topology():
@@ -137,18 +141,6 @@ def test_decide_review_refuses_a_replan_on_a_stale_round():
         decide_next_phase(Phase.REVIEW, result)
 
 
-def test_local_review_has_no_stale_edge():
-    """A LOCAL review is bound to a workspace fingerprint the reviewer may not
-    change (the engine rejects a reviewer that did), so the observation is
-    never consulted there -- and never validated either, like ``replan``."""
-    assert not is_legal(Phase.REVIEW, Phase.REVIEW, WorkflowMode.LOCAL)
-    for observed in (True, "moved"):
-        result = {"needs_fix_round": True, "head_changed_after_review": observed}
-        assert decide_next_phase(Phase.REVIEW, result, WorkflowMode.LOCAL) == Phase.FIX
-        result = {"needs_fix_round": False, "head_changed_after_review": observed}
-        assert decide_next_phase(Phase.REVIEW, result, WorkflowMode.LOCAL) == Phase.DONE
-
-
 def test_decide_review_can_express_the_controllers_replan_decision():
     """REVIEW -> REPLAN_REEXECUTE is a legal edge, so the router must know it.
 
@@ -172,25 +164,6 @@ def test_decide_review_refuses_a_replan_over_a_clean_review():
         decide_next_phase(Phase.REVIEW, {"needs_fix_round": False, "replan": True})
     with pytest.raises(ControlResultValidationError, match="'replan' must be a boolean"):
         decide_next_phase(Phase.REVIEW, {"needs_fix_round": True, "replan": "yes"})
-
-
-@pytest.mark.parametrize(
-    "result",
-    [
-        {"needs_fix_round": True},
-        {"needs_fix_round": True, "replan": True},
-        {"needs_fix_round": True, "replan": "yes"},
-    ],
-    ids=["absent", "true", "not-a-boolean"],
-)
-def test_local_review_ignores_replan_silently(result):
-    """LOCAL mode has no REPLAN_REEXECUTE; the replan key is never consulted there.
-
-    Never consulted means never validated either: a ``replan`` that REMOTE
-    would route on or refuse still routes LOCAL's review with findings to FIX.
-    """
-    assert not is_legal(Phase.REVIEW, Phase.REPLAN_REEXECUTE, WorkflowMode.LOCAL)
-    assert decide_next_phase(Phase.REVIEW, result, WorkflowMode.LOCAL) == Phase.FIX
 
 
 def test_decide_ready_for_merge_is_controller_owned():
@@ -236,10 +209,10 @@ def test_decide_terminal_raises():
         decide_next_phase(Phase.DONE, {})
 
 
-# Every decision input the engine hands to ``decide_next_phase``, per phase and
-# mode, with the edge it must choose. The engine's tests prove it consults
-# the function; this table proves the function never chooses an edge the
-# topology of that mode does not have.
+# Every decision input the engine hands to ``decide_next_phase``, per phase,
+# with the edge it must choose. The engine's tests prove it consults the
+# function; this table proves the function never chooses an edge the
+# topology does not have.
 REMOTE_DECISIONS = [
     (Phase.INITIALIZING, {}, Phase.ANALYZE_EXECUTE),
     (Phase.ANALYZE_EXECUTE, {}, Phase.REVIEW),
@@ -261,37 +234,28 @@ REMOTE_DECISIONS = [
         Phase.ANALYZE_EXECUTE,
     ),
 ]
-LOCAL_DECISIONS = [
-    (Phase.INITIALIZING, {}, Phase.ANALYZE_EXECUTE),
-    (Phase.ANALYZE_EXECUTE, {}, Phase.REVIEW),
-    (Phase.REVIEW, {"needs_fix_round": True}, Phase.FIX),
-    (Phase.REVIEW, {"needs_fix_round": False}, Phase.DONE),
-    (Phase.FIX, {}, Phase.REVIEW),
-]
 
 
 @pytest.mark.parametrize(
-    ("mode", "current", "result", "expected"),
-    [(WorkflowMode.REMOTE, *row) for row in REMOTE_DECISIONS]
-    + [(WorkflowMode.LOCAL, *row) for row in LOCAL_DECISIONS],
-    ids=lambda v: v.value if isinstance(v, (Phase, WorkflowMode)) else None,
+    ("current", "result", "expected"),
+    REMOTE_DECISIONS,
+    ids=lambda v: v.value if isinstance(v, Phase) else None,
 )
-def test_every_decision_is_a_legal_edge_of_its_mode(mode, current, result, expected):
-    nxt = decide_next_phase(current, result, mode)
+def test_every_decision_is_a_legal_edge(current, result, expected):
+    nxt = decide_next_phase(current, result)
     assert nxt == expected
-    validate_transition(current, nxt, mode)  # must not raise
+    validate_transition(current, nxt)  # must not raise
 
 
-@pytest.mark.parametrize("mode", list(WorkflowMode), ids=lambda m: m.value)
-def test_decisions_cover_every_non_operator_edge_of_the_mode(mode):
+def test_decisions_cover_every_non_operator_edge():
     """The decision table above reaches every edge the topology declares,
     except the operator's unblock edges (taken by ``unblock`` alone) and the
     reserved post-merge edges (MERGE -> ANALYZE_EXECUTE / DONE, never chosen:
     UPDATE_EPIC runs after every merge). A new edge in the table without a
     decision that chooses it is dead topology; a decision that reaches no
     declared edge is refused by ``validate_transition`` in the test above."""
-    table = REMOTE_DECISIONS if mode is WorkflowMode.REMOTE else LOCAL_DECISIONS
-    edges = LEGAL_EDGES if mode is WorkflowMode.REMOTE else LOCAL_LEGAL_EDGES
+    table = REMOTE_DECISIONS
+    edges = LEGAL_EDGES
     reserved = {(Phase.MERGE, Phase.ANALYZE_EXECUTE), (Phase.MERGE, Phase.DONE)}
     declared = {(frm, to) for frm, tos in edges.items() for to in tos if frm is not Phase.BLOCKED}
     assert {(frm, expected) for frm, _, expected in table} == declared - reserved

@@ -22,22 +22,6 @@ Legal transitions::
     UPDATE_EPIC      -> ANALYZE_EXECUTE   (next_issue_url != null)
     UPDATE_EPIC      -> DONE              (next_issue_url == null)
 
-LOCAL runs (``WorkflowMode.LOCAL``) drive a much smaller topology over a
-feature Markdown file and the local working tree — no GitHub, no PR, no
-merge::
-
-    INITIALIZING     -> ANALYZE_EXECUTE
-    ANALYZE_EXECUTE  -> REVIEW
-    REVIEW           -> FIX               (needs_fix_round=true, fix budget left)
-    FIX              -> REVIEW
-    REVIEW           -> DONE              (needs_fix_round=false)
-
-``REVIEW -> READY_FOR_MERGE`` is deliberately *not* legal in LOCAL mode and
-``REVIEW -> DONE`` is deliberately *not* legal in REMOTE mode: nothing may
-reach DONE locally through the merge machinery, and no remote run may skip
-it. A LOCAL review that still has findings once the fix budget is spent
-enters BLOCKED, exactly like a remote loop bound.
-
 BLOCKED / FAILED are exceptional holding states reachable from any agent
 phase (agent reports blocked/failure, or the controller cannot verify
 GitHub state deterministically); they are outside the happy-path topology.
@@ -54,8 +38,7 @@ GitHub state and chosen the phase to re-enter; no agent result and no
     BLOCKED          -> UPDATE_EPIC       (PR merged and already counted)
 
 ``BLOCKED -> REPLAN_REEXECUTE`` is deliberately absent: REVIEW stays that
-transaction's only entry. FAILED and DONE keep no outgoing edge, and the
-LOCAL topology has no unblock edge at all.
+transaction's only entry. FAILED and DONE keep no outgoing edge.
 
 All transition logic lives here — never scattered across CLI handlers or
 the engine. ``decide_next_phase`` is the one function that chooses the next
@@ -78,16 +61,15 @@ if TYPE_CHECKING:
 
 
 class WorkflowMode(Enum):
-    """Which workflow a run executes.
+    """Which workflow a run executes: the GitHub lifecycle, the only one left.
 
-    REMOTE is the original GitHub lifecycle (Issue -> PR -> review -> merge).
-    LOCAL drives a feature Markdown file against the local working tree and
-    never touches GitHub. The mode is explicit controller state, never
-    inferred from whether some field happens to be empty.
+    LOCAL mode is removed (ADR 0009). Every state file still records
+    ``mode: "REMOTE"``, and the loader refuses any other value as an unknown
+    mode, ``"LOCAL"`` included, before it reads anything else of the file
+    (ADR 0009 D4, D8).
     """
 
     REMOTE = "REMOTE"
-    LOCAL = "LOCAL"
 
 
 class Phase(Enum):
@@ -111,13 +93,6 @@ TERMINAL_PHASES = frozenset({Phase.DONE, Phase.BLOCKED, Phase.FAILED})
 # merge is disabled by default. With the gate open (config AND --allow-merge)
 # the loop only stops at TERMINAL_PHASES.
 STOP_PHASES = TERMINAL_PHASES | frozenset({Phase.READY_FOR_MERGE})
-
-# LOCAL phases whose agent can change the working tree. REVIEW is excluded: it
-# is read-only and the controller *rejects* a reviewer that changed anything.
-# A pending-invocation checkpoint (``AutoForgeState.local_pending_phase``) may
-# name one of these and nothing else, which is why the tuple lives here rather
-# than in the engine: ``state`` validates a loaded checkpoint against it.
-LOCAL_WRITE_PHASES = (Phase.ANALYZE_EXECUTE, Phase.FIX)
 
 # Phases whose step invokes an agent through a provider. MERGE is NOT one of
 # them: the controller runs `gh pr merge` itself (agents never merge).
@@ -222,63 +197,22 @@ def issue_settlement(
     return PHASE_SETTLEMENT[state.phase]
 
 
-# LOCAL topology: no PR, no merge, no replan, no EPIC. A clean review is the
-# end of the run; findings the controller can no longer afford to fix enter
-# BLOCKED (an exceptional state, not an edge).
-LOCAL_LEGAL_EDGES: dict[Phase, frozenset[Phase]] = {
-    Phase.INITIALIZING: frozenset({Phase.ANALYZE_EXECUTE}),
-    Phase.ANALYZE_EXECUTE: frozenset({Phase.REVIEW}),
-    Phase.REVIEW: frozenset({Phase.FIX, Phase.DONE}),
-    Phase.FIX: frozenset({Phase.REVIEW}),
-    Phase.DONE: frozenset(),
-    Phase.BLOCKED: frozenset(),
-    Phase.FAILED: frozenset(),
-}
-
-# Phases a LOCAL run may ever execute. Everything else (REPLAN_REEXECUTE,
-# READY_FOR_MERGE, MERGE, UPDATE_EPIC) belongs to the GitHub lifecycle.
-LOCAL_PHASES = frozenset(
-    {
-        Phase.INITIALIZING,
-        Phase.ANALYZE_EXECUTE,
-        Phase.REVIEW,
-        Phase.FIX,
-        Phase.DONE,
-        Phase.BLOCKED,
-        Phase.FAILED,
-    }
-)
+def edges_for() -> dict[Phase, frozenset[Phase]]:
+    """The static topology (never mutate the returned mapping)."""
+    return LEGAL_EDGES
 
 
-def edges_for(mode: WorkflowMode = WorkflowMode.REMOTE) -> dict[Phase, frozenset[Phase]]:
-    """The static topology of ``mode`` (never mutate the returned mapping)."""
-    return LOCAL_LEGAL_EDGES if mode == WorkflowMode.LOCAL else LEGAL_EDGES
+def is_legal(frm: Phase, to: Phase) -> bool:
+    return to in LEGAL_EDGES.get(frm, frozenset())
 
 
-def stop_phases_for(mode: WorkflowMode = WorkflowMode.REMOTE) -> frozenset[Phase]:
-    """Phases at which ``run``/``resume`` stop looping.
-
-    A LOCAL run has no READY_FOR_MERGE holding state: it stops only on a
-    terminal phase.
-    """
-    return TERMINAL_PHASES if mode == WorkflowMode.LOCAL else STOP_PHASES
-
-
-def is_legal(frm: Phase, to: Phase, mode: WorkflowMode = WorkflowMode.REMOTE) -> bool:
-    return to in edges_for(mode).get(frm, frozenset())
-
-
-def validate_transition(frm: Phase, to: Phase, mode: WorkflowMode = WorkflowMode.REMOTE) -> None:
+def validate_transition(frm: Phase, to: Phase) -> None:
     """Raise StateTransitionError if ``frm -> to`` is not a legal edge."""
-    if not is_legal(frm, to, mode):
-        raise StateTransitionError(
-            f"illegal transition in {mode.value} mode: {frm.value} -> {to.value}"
-        )
+    if not is_legal(frm, to):
+        raise StateTransitionError(f"illegal transition: {frm.value} -> {to.value}")
 
 
-def decide_next_phase(
-    current: Phase, result: dict, mode: WorkflowMode = WorkflowMode.REMOTE
-) -> Phase:
+def decide_next_phase(current: Phase, result: dict) -> Phase:
     """Pure function: current phase + the controller's decision inputs -> next phase.
 
     This is the single place that chooses the next phase of a lifecycle step;
@@ -323,17 +257,6 @@ def decide_next_phase(
         return Phase.REVIEW
     if current == Phase.FIX:
         return Phase.REVIEW
-    if mode == WorkflowMode.LOCAL:
-        if current == Phase.REVIEW:
-            needs_fix = need("needs_fix_round")
-            if not isinstance(needs_fix, bool):
-                raise ControlResultValidationError("'needs_fix_round' must be a boolean")
-            # Whether the fix budget still allows a FIX is a controller policy
-            # decision (see engine._local_review_stop_reason); the topology only
-            # says both edges exist. A LOCAL review is bound to a workspace
-            # fingerprint the reviewer may not change, so it has no stale edge.
-            return Phase.FIX if needs_fix else Phase.DONE
-        raise StateTransitionError(f"phase {current.value} is not part of the LOCAL workflow")
     if current == Phase.REPLAN_REEXECUTE:
         return Phase.REVIEW
     if current == Phase.REVIEW:

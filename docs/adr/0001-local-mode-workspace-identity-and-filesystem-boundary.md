@@ -1,6 +1,11 @@
 # ADR 0001. LOCAL mode: workspace identity and the filesystem boundary
 
 - **Status:** accepted, implemented in PR #44 (`feature/local-mode`)
+- **Superseded by:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md), which removed LOCAL mode (#388),
+  except the parts that keep describing `safefs.py` for REMOTE: §5.4 (one
+  capability boundary for every controller write), the parts of §5.5 that
+  bound the run log and the state file, and the hard-link limitations of
+  §8.8 and §8.10. The rest stays as history.
 - **Reviewed PR HEAD:** `3fb17c1a7ca0552cc25b17664569f90cff4c5904`
 - **Base:** `main` (merge-base `316ba0365985b9c99b2d9858a8613462be960f2a`)
 - **Supersedes:** the `git status` fingerprint and the `safeio.py` pathname

@@ -204,9 +204,8 @@ run against an installed Pi)::
     ``--no-approve`` no dialog opens. An extension dialog would be
     cancelled and fail the run, naming its method (pi_rpc.py).
 
-The CLIs are launched with cwd = the directory the engine chose (a
-per-issue worktree for a REMOTE run, the contract's repository root for a
-LOCAL one), stdin = /dev/null or the adapter's payload
+The CLIs are launched with cwd = the directory the engine chose (the
+run's per-issue worktree), stdin = /dev/null or the adapter's payload
 (:meth:`AgentProvider.stdin_payload`), an idle limit and an optional
 wall-clock ceiling (:class:`AgentRequest`; #193), and an allow-listed
 environment (see executor.py): the engine passes the configured allow-list

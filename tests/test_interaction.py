@@ -54,7 +54,6 @@ from autoforge.interaction import (
     InteractionOutcome,
     InteractionRequest,
     Lifecycle,
-    LocalBinding,
     Pause,
     Question,
     QuestionOption,
@@ -431,7 +430,6 @@ def test_a_session_identity_is_equal_only_to_one_that_binds_the_same_session():
         {"policy_digest": "c" * 64},
         {"session_root": "/state/sdk/b"},
         {"workflow": RemoteBinding("owner/repo", 134, "ANALYZE_EXECUTE", 2, 0)},
-        {"workflow": LocalBinding("/repo/.git/autoforge/state", "ANALYZE_EXECUTE", 1)},
     ):
         assert _identity(**change) != _identity()
 
@@ -445,8 +443,6 @@ def test_a_session_identity_is_equal_only_to_one_that_binds_the_same_session():
         (lambda: _identity(workflow={"issue": 1}), "no known mode"),
         (lambda: RemoteBinding("owner/repo", 0, "FIX", 1, 0), "at least 1"),
         (lambda: RemoteBinding("o/r", 1, "FIX", 1, 0, head_sha="abc"), "full commit id"),
-        (lambda: LocalBinding("/state", "FIX", True), "at least 1"),
-        (lambda: LocalBinding("state", "FIX", 1), "absolute path"),
     ],
 )
 def test_a_session_identity_that_could_not_be_compared_exactly_is_refused(build, rule):

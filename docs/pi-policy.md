@@ -323,7 +323,7 @@ and left no process behind.
 **Gate for #135.** On a platform without a child subreaper (anything but
 Linux), every agent result carries `orphans_unchecked`, and its leftovers
 sentence says a process may still be running. The prompt rule in
-`common.md` / `local_common.md` is the only mitigation there. #135 gates
+`common.md` is the only mitigation there. #135 gates
 unattended Pi use on it: the [Pi operator guide](pi.md#unattended-use)
 states that Pi is attended only on such a platform, and `doctor` adds a
 row for the Pi profiles, `pi's detached tool processes are contained`,

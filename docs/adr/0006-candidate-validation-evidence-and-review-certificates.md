@@ -9,6 +9,11 @@
   `DONE`) and #175 (drift, recovery, the operator override, and the
   certificate check in the merge gate's `READY_FOR_MERGE` and `MERGE`
   passes).
+- **Superseded in part by:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md), which removed LOCAL
+  mode (#388): D1.2, D2.6 (`LocalCandidate`), D3.2, D3.5, D5.6, D5.7, D7.1
+  to D7.3 (the in-place convergence rule), the LOCAL record fields, D12.1,
+  D12.5, D12.6, D14.1 and D14.2. D2.7's kind check stays: a record or
+  certificate of the `local` kind is refused as an unknown kind.
 - **Decides:** #170, for EPIC #158 (Wave 2B).
 - **Amends:** ADR 0001 §5.10, with a dated note recording the LOCAL
   convergence rule (D7.4). No other ADR's text changes.

@@ -1,16 +1,16 @@
 """Candidate validation evidence: definitions, policy, records (ADR 0006, #172).
 
 The pure part of candidate validation. A **definition** is one trusted argv
-the operator configured (``validation.commands`` for REMOTE, the run
-contract's ``local.validation_commands`` for LOCAL), bound by a
+the operator configured (``validation.commands``), bound by a
 ``definition_digest`` over what runs (D3.5). **Policy P** is how it runs: the
 sandbox mode, a path-independent template of the outer sandbox, the
 environment allow-list's names, the timeout, ``contain_orphans`` and the
 materialization method, bound by a ``policy_digest`` (D8.1). A **candidate**
-is exactly one of two identities, :class:`RemoteCandidate` (repository,
-object format, commit and tree, plus its provenance) or
-:class:`LocalCandidate` (workspace fingerprint, workspace-policy digest and
-run id), under a ``kind`` discriminator (D2.1-D2.7).
+is a :class:`RemoteCandidate` (repository, object format, commit and tree,
+plus its provenance) under the ``kind`` discriminator ``remote``
+(D2.1-D2.7). LOCAL mode's ``local`` kind, its workspace record variant and
+its ``local`` certificate are removed (ADR 0009 D6, D8): the parsers refuse
+each as an unknown kind, so no LOCAL evidence loads into a REMOTE state.
 
 A ``ValidationRecord`` is what the controller observed when it ran one
 definition against one candidate under one policy (D10.1). It has one of
@@ -18,8 +18,7 @@ two shapes, chosen by its ``outcome``:
 
 - **observed** (``PASS``, ``FAIL``, ``TIMEOUT``): the enforcement facts the
   executor returned, the exit status, the timing, ADR 0002's leftovers and
-  the bounded output, and for LOCAL the fingerprints the walks before and
-  after the command read;
+  the bounded output;
 - **interrupted** (``INTERRUPTED``): built by the resume path from a
   leftover attempt marker alone (D10.7). It claims no launch and is never
   evidence.
@@ -58,7 +57,6 @@ from .errors import (
     ValidationInterruptedError,
 )
 from .executor import MAX_DEADLINE_SECONDS, ExecutionResult
-from .materialize import METHOD as METHOD_BYTE_EXACT
 from .redaction import MAX_GROWTH_FACTOR, redact, redact_argv
 from .result_parser import MAX_URL_CHARS
 from .runlog import RUN_ID_RE, STEP_DIR_RE
@@ -109,7 +107,6 @@ MAX_INTERRUPTIONS = 2
 
 # Enumerations.
 KIND_REMOTE = "remote"
-KIND_LOCAL = "local"
 PROVENANCE_WORKTREE = "worktree"
 PROVENANCE_PR_HEAD = "pr-head"
 OBJECT_FORMATS = {"sha1": 40, "sha256": 64}
@@ -118,8 +115,6 @@ CWD_ROLE = "candidate-root"
 MODES = ("disabled", "preferred", "required")
 NETWORKS = ("host", "isolated", "")
 FAILURE_PHASES = ("ANALYZE_EXECUTE", "FIX")
-METHOD_IN_PLACE = "in-place"
-METHODS = (METHOD_BYTE_EXACT, METHOD_IN_PLACE)
 
 # The canonical encodings' version labels (D3.5, D8.1).
 DEFINITION_ENCODING = "autoforge-validation-definition-v1"
@@ -310,15 +305,10 @@ class Policy:
     def requires_enforcement(self) -> bool:
         """D8.3: a record applies under this policy only when it was enforced.
 
-        Under ``required``, and under ``preferred`` in REMOTE, which refuses
-        as ``required`` does (ADR 0005 D12.2). LOCAL's ``preferred`` falls
-        back to logical isolation on a host that cannot enforce, and its
-        records say ``enforced: false`` honestly; the in-place method is
-        LOCAL's, so it tells the two apart.
+        Under ``required``, and under ``preferred``, which refuses as
+        ``required`` does (ADR 0005 D12.2, ADR 0009 D7).
         """
-        if self.mode == "preferred":
-            return self.method != METHOD_IN_PLACE
-        return self.mode == "required"
+        return self.mode in ("preferred", "required")
 
     def stored(self) -> dict:
         return {
@@ -402,33 +392,8 @@ class RemoteCandidate:
         return f"commit {self.commit[:12]} (tree {self.tree[:12]}) of {self.repository}"
 
 
-@dataclass(frozen=True)
-class LocalCandidate:
-    """LOCAL's validation identity: the workspace as ADR 0001 fingerprints it (D2.6)."""
-
-    fingerprint: str
-    workspace_policy_digest: str
-    run_id: str
-
-    kind = KIND_LOCAL
-
-    @property
-    def identity(self) -> tuple[str, ...]:
-        return (KIND_LOCAL, self.fingerprint, self.workspace_policy_digest, self.run_id)
-
-    def to_dict(self) -> dict:
-        return {
-            "kind": KIND_LOCAL,
-            "fingerprint": self.fingerprint,
-            "workspace_policy_digest": self.workspace_policy_digest,
-            "run_id": self.run_id,
-        }
-
-    def describe(self) -> str:
-        return f"workspace {self.fingerprint[:16]}..."
-
-
-Candidate = RemoteCandidate | LocalCandidate
+# The one candidate kind there is; the name the readers and writers use.
+Candidate = RemoteCandidate
 
 
 # -- field checks ----------------------------------------------------------------------
@@ -541,13 +506,6 @@ def _pr_url(value: object, what: str, repository: str) -> str:
     return text
 
 
-def _run_id(value: object, what: str) -> str:
-    text = _str(value, what, 128)
-    if not RUN_ID_RE.match(text) or text in (".", ".."):
-        _fail(what, "must be a run id (a single safe path component)")
-    return text
-
-
 def _run_log(value: object, what: str) -> str:
     text = _str(value, what, MAX_RUN_LOG_CHARS)
     run_id, slash, step = text.partition("/")
@@ -591,7 +549,6 @@ def _tail(value: object, what: str) -> str:
 # -- parsing ---------------------------------------------------------------------------
 
 _REMOTE_KEYS = ("kind", "repository", "object_format", "commit", "tree", "provenance")
-_LOCAL_KEYS = ("kind", "fingerprint", "workspace_policy_digest", "run_id")
 _WORKTREE_KEYS = ("kind", "issue_number", "worktree_id", "strict_import", "base_revision")
 _PR_HEAD_KEYS = ("kind", "pr_url")
 _DEFINITION_KEYS = ("index", "argv", "definition_digest", "scope")
@@ -638,7 +595,6 @@ _CERTIFICATE_REMOTE = (
     "reviewed_merge_base_sha",
     "comment",
 )
-_CERTIFICATE_LOCAL = ("reviewed_workspace_fingerprint",)
 _COMMENT_KEYS = ("url", "id", "marker_key")
 _MARKER_KEY_KEYS = (
     "review_round",
@@ -675,7 +631,7 @@ def _hex(text: str) -> bool:
 
 
 def parse_candidate(raw: object, what: str = "candidate") -> Candidate:
-    """A candidate of exactly one kind (D2.7): mixed fields are refused."""
+    """A ``remote`` candidate (D2.7): another kind or mixed fields are refused."""
     if not isinstance(raw, dict):
         _fail(what, f"must be an object, got {type(raw).__name__}")
     kind = raw.get("kind")
@@ -689,16 +645,7 @@ def parse_candidate(raw: object, what: str = "candidate") -> Candidate:
         if isinstance(provenance, WorktreeProvenance) and provenance.base_revision:
             _oid(provenance.base_revision, f"{what}.provenance.base_revision", object_format)
         return RemoteCandidate(repository, object_format, commit, tree, provenance)
-    if kind == KIND_LOCAL:
-        _exact(raw, _LOCAL_KEYS, what)
-        return LocalCandidate(
-            fingerprint=_hex64(raw["fingerprint"], f"{what}.fingerprint"),
-            workspace_policy_digest=_hex64(
-                raw["workspace_policy_digest"], f"{what}.workspace_policy_digest"
-            ),
-            run_id=_run_id(raw["run_id"], f"{what}.run_id"),
-        )
-    _fail(f"{what}.kind", f"must be {KIND_REMOTE!r} or {KIND_LOCAL!r}, got {kind!r:.40}")
+    _fail(f"{what}.kind", f"must be {KIND_REMOTE!r}, got {kind!r:.40}")
 
 
 def _parse_definition(raw: object, what: str) -> dict:
@@ -761,8 +708,6 @@ class RecordView:
     run_log: str
     enforced: bool = False
     exit_code: int | None = None
-    start_fingerprint: str = ""
-    end_fingerprint: str = ""
 
     @property
     def is_observed(self) -> bool:
@@ -777,28 +722,16 @@ def parse_record(raw: object, what: str = "validation record") -> RecordView:
     if outcome_value not in tuple(Outcome):
         _fail(f"{what}.outcome", f"must be one of {[o.value for o in Outcome]}")
     outcome = Outcome(str(outcome_value))
-    candidate_raw = raw.get("candidate")
-    local = isinstance(candidate_raw, dict) and candidate_raw.get("kind") == KIND_LOCAL
     keys = list(_BOTH_KEYS)
     keys += _INTERRUPTED_KEYS if outcome is Outcome.INTERRUPTED else _OBSERVED_KEYS
-    if local:
-        keys.append("start_fingerprint")
-        if outcome is not Outcome.INTERRUPTED:
-            keys.append("end_fingerprint")
     _exact(raw, keys, what)
     _int(raw["schema"], f"{what}.schema", SCHEMA, SCHEMA)
     seq = _int(raw["seq"], f"{what}.seq", 1, MAX_SEQ)
     digest = _hex64(raw["digest"], f"{what}.digest")
-    candidate = parse_candidate(candidate_raw, f"{what}.candidate")
+    candidate = parse_candidate(raw["candidate"], f"{what}.candidate")
     definition = _parse_definition(raw["definition"], f"{what}.definition")
     policy = _parse_policy(raw["policy"], f"{what}.policy")
     run_log = _run_log(raw["run_log"], f"{what}.run_log")
-    start = end = ""
-    if local:
-        start = _hex64(raw["start_fingerprint"], f"{what}.start_fingerprint")
-        assert isinstance(candidate, LocalCandidate)
-        if start != candidate.fingerprint:
-            _fail(f"{what}.start_fingerprint", "must equal the candidate's fingerprint")
     enforced = False
     exit_code: int | None = None
     if outcome is Outcome.INTERRUPTED:
@@ -821,8 +754,6 @@ def parse_record(raw: object, what: str = "validation record") -> RecordView:
         for key in _LEFTOVER_KEYS:
             _bool(raw["leftovers"][key], f"{what}.leftovers.{key}")
         _parse_output(raw["output"], f"{what}.output")
-        if local:
-            end = _hex64(raw["end_fingerprint"], f"{what}.end_fingerprint")
     if record_digest(raw) != digest:
         _fail(f"{what}.digest", "does not match the record: it was edited or corrupted")
     return RecordView(
@@ -839,8 +770,6 @@ def parse_record(raw: object, what: str = "validation record") -> RecordView:
         run_log=run_log,
         enforced=enforced,
         exit_code=exit_code,
-        start_fingerprint=start,
-        end_fingerprint=end,
     )
 
 
@@ -859,18 +788,12 @@ def parse_marker(raw: object, what: str = "validation_attempt") -> MarkerView:
     """The attempt marker (D11.2): what an interrupted record copies, nothing observed."""
     if not isinstance(raw, dict):
         _fail(what, f"must be an object, got {type(raw).__name__}")
-    candidate_raw = raw.get("candidate")
-    local = isinstance(candidate_raw, dict) and candidate_raw.get("kind") == KIND_LOCAL
-    _exact(raw, (*_MARKER_KEYS, *(("start_fingerprint",) if local else ())), what)
-    candidate = parse_candidate(candidate_raw, f"{what}.candidate")
+    _exact(raw, _MARKER_KEYS, what)
+    candidate = parse_candidate(raw["candidate"], f"{what}.candidate")
     definition = _parse_definition(raw["definition"], f"{what}.definition")
     policy = _parse_policy(raw["policy"], f"{what}.policy")
     run_log = _run_log(raw["run_log"], f"{what}.run_log")
     _timestamp(raw["marked_at"], f"{what}.marked_at")
-    if local:
-        assert isinstance(candidate, LocalCandidate)
-        if _hex64(raw["start_fingerprint"], f"{what}.start_fingerprint") != candidate.fingerprint:
-            _fail(f"{what}.start_fingerprint", "must equal the candidate's fingerprint")
     return MarkerView(
         raw=raw,
         candidate=candidate,
@@ -914,14 +837,12 @@ class EvidenceFields:
     validation_override_seq: int | None = None
 
 
-def check_evidence(
-    fields_: EvidenceFields, *, local: bool, repository: str, run_id: str
-) -> list[RecordView]:
+def check_evidence(fields_: EvidenceFields, *, repository: str, run_id: str) -> list[RecordView]:
     """Validate the six fields together; return the records, parsed. Read-only.
 
-    ``local`` is the state's mode, ``repository`` its REMOTE repository and
-    ``run_id`` its run: a record of the other mode's kind, of another
-    repository or run, or a run log of another run is refused (D2.7).
+    ``repository`` is the state's repository and ``run_id`` its run: a
+    record of another kind or repository, or a run log of another run, is
+    refused (D2.7).
     """
     records_raw = fields_.validation_records
     if not isinstance(records_raw, list):
@@ -935,7 +856,7 @@ def check_evidence(
     for i, raw in enumerate(records_raw):
         where = f"state field 'validation_records'[{i}]"
         view = parse_record(raw, where)
-        _check_candidate(view.candidate, f"{where}.candidate", local, repository, run_id)
+        _check_candidate(view.candidate, f"{where}.candidate", repository)
         _check_run_log(view.run_log, f"{where}.run_log", run_id)
         if records and view.seq <= records[-1].seq:
             _fail(f"{where}.seq", "must increase strictly")
@@ -948,34 +869,30 @@ def check_evidence(
     if marker:
         where = "state field 'validation_attempt'"
         pending = parse_marker(marker, where)
-        _check_candidate(pending.candidate, f"{where}.candidate", local, repository, run_id)
+        _check_candidate(pending.candidate, f"{where}.candidate", repository)
         _check_run_log(pending.run_log, f"{where}.run_log", run_id)
 
     binding = fields_.review_evidence
     if not isinstance(binding, dict):
         _fail("state field 'review_evidence'", "must be an object")
     if binding:
-        _check_binding(binding, by_seq, local, repository, run_id)
+        _check_binding(binding, by_seq, repository)
 
     certificate = fields_.review_certificate
     if not isinstance(certificate, dict):
         _fail("state field 'review_certificate'", "must be an object")
     if certificate:
-        _check_certificate(certificate, by_seq, local, repository, run_id)
+        _check_certificate(certificate, by_seq, repository)
 
     counter = fields_.producer_validation_failure
     if not isinstance(counter, dict):
         _fail("state field 'producer_validation_failure'", "must be an object")
     if counter:
-        if local:
-            _fail("state field 'producer_validation_failure'", "must be empty for a LOCAL run")
         _check_counter(counter, by_seq)
 
     watermark = fields_.validation_override_seq
     if watermark is not None:
         what = "state field 'validation_override_seq'"
-        if local:
-            _fail(what, "must be null for a LOCAL run: LOCAL has no unblock")
         _int(watermark, what, 0, MAX_SEQ)
         highest = records[-1].seq if records else 0
         if watermark > highest:
@@ -983,17 +900,9 @@ def check_evidence(
     return records
 
 
-def _check_candidate(
-    candidate: Candidate, where: str, local: bool, repository: str, run_id: str
-) -> None:
-    """D2.7: the state's own kind, repository and run."""
-    if local != isinstance(candidate, LocalCandidate):
-        mode = "LOCAL" if local else "REMOTE"
-        _fail(where, f"holds a {candidate.kind} candidate in a {mode} run")
-    if isinstance(candidate, LocalCandidate):
-        if candidate.run_id != run_id:
-            _fail(where, f"names run {candidate.run_id!r}, not this run {run_id!r}")
-    elif repository and candidate.repository.lower() != repository.lower():
+def _check_candidate(candidate: Candidate, where: str, repository: str) -> None:
+    """D2.7: the state's own repository (the kind is :func:`parse_candidate`'s)."""
+    if repository and candidate.repository.lower() != repository.lower():
         _fail(where, f"names repository {candidate.repository!r}, not {repository!r}")
 
 
@@ -1029,14 +938,12 @@ def _check_named(
     return named
 
 
-def _check_binding(
-    raw: dict, by_seq: Mapping[int, RecordView], local: bool, repository: str, run_id: str
-) -> None:
+def _check_binding(raw: dict, by_seq: Mapping[int, RecordView], repository: str) -> None:
     what = "state field 'review_evidence'"
     _exact(raw, _BINDING_KEYS, what)
     _int(raw["review_round"], f"{what}.review_round", 1, MAX_SEQ)
     candidate = parse_candidate(raw["candidate"], f"{what}.candidate")
-    _check_candidate(candidate, f"{what}.candidate", local, repository, run_id)
+    _check_candidate(candidate, f"{what}.candidate", repository)
     pairs = _parse_pairs(raw["records"], f"{what}.records")
     set_value = _hex64(raw["validation_set_digest"], f"{what}.validation_set_digest")
     policy_digest = _hex64(raw["policy_digest"], f"{what}.policy_digest")
@@ -1067,9 +974,7 @@ def check_certificate(
     raw: Mapping[str, object],
     records: Sequence[RecordView],
     *,
-    local: bool,
     repository: str,
-    run_id: str,
 ) -> None:
     """One certificate against the retained ``records``, exactly as a load checks it (D11.1).
 
@@ -1078,24 +983,21 @@ def check_certificate(
     """
     if not isinstance(raw, dict):
         _fail("state field 'review_certificate'", "must be an object")
-    _check_certificate(raw, {r.seq: r for r in records}, local, repository, run_id)
+    _check_certificate(raw, {r.seq: r for r in records}, repository)
 
 
-def _check_certificate(
-    raw: dict, by_seq: Mapping[int, RecordView], local: bool, repository: str, run_id: str
-) -> None:
+def _check_certificate(raw: dict, by_seq: Mapping[int, RecordView], repository: str) -> None:
     what = "state field 'review_certificate'"
     kind = raw.get("kind")
-    if kind not in (KIND_REMOTE, KIND_LOCAL):
-        _fail(f"{what}.kind", f"must be {KIND_REMOTE!r} or {KIND_LOCAL!r}")
-    extra = _CERTIFICATE_LOCAL if kind == KIND_LOCAL else _CERTIFICATE_REMOTE
-    _exact(raw, (*_CERTIFICATE_BOTH, *extra), what)
+    if kind != KIND_REMOTE:
+        _fail(f"{what}.kind", f"must be {KIND_REMOTE!r}")
+    _exact(raw, (*_CERTIFICATE_BOTH, *_CERTIFICATE_REMOTE), what)
     _int(raw["schema"], f"{what}.schema", SCHEMA, SCHEMA)
     digest = _hex64(raw["digest"], f"{what}.digest")
     candidate = parse_candidate(raw["candidate"], f"{what}.candidate")
     if candidate.kind != kind:
         _fail(f"{what}.kind", "differs from its candidate's kind")
-    _check_candidate(candidate, f"{what}.candidate", local, repository, run_id)
+    _check_candidate(candidate, f"{what}.candidate", repository)
     review_round = _int(raw["review_round"], f"{what}.review_round", 1, MAX_SEQ)
     pairs = _parse_pairs(raw["records"], f"{what}.records")
     set_value = _hex64(raw["validation_set_digest"], f"{what}.validation_set_digest")
@@ -1115,49 +1017,44 @@ def _check_certificate(
     if _int(clean["actionable_findings"], f"{what}.clean.actionable_findings", 0, 0) != 0:
         _fail(f"{what}.clean.actionable_findings", "must be 0")
     _timestamp(raw["issued_at"], f"{what}.issued_at")
-    if isinstance(candidate, LocalCandidate):
-        name = f"{what}.reviewed_workspace_fingerprint"
-        if _hex64(raw["reviewed_workspace_fingerprint"], name) != candidate.fingerprint:
-            _fail(name, "differs from the candidate's")
-    else:
-        pr_url = _pr_url(raw["reviewed_pr_url"], f"{what}.reviewed_pr_url", candidate.repository)
-        head = _oid(raw["reviewed_head_sha"], f"{what}.reviewed_head_sha", candidate.object_format)
-        if head != candidate.commit:
-            _fail(f"{what}.reviewed_head_sha", "differs from the candidate's commit")
-        base_ref = _ref(raw["reviewed_base_ref"], f"{what}.reviewed_base_ref")
-        merge_base = _oid(
-            raw["reviewed_merge_base_sha"],
-            f"{what}.reviewed_merge_base_sha",
-            candidate.object_format,
-        )
-        comment = _exact(raw["comment"], _COMMENT_KEYS, f"{what}.comment")
-        url = _str(comment["url"], f"{what}.comment.url", MAX_URL_CHARS)
-        try:
-            ref = parse_comment_url(url)
-        except ConfigurationError:
-            _fail(f"{what}.comment.url", "is not a GitHub comment URL")
-        if ref.canonical != url:
-            _fail(f"{what}.comment.url", "must be stored in its canonical form")
-        if not ref.on(parse_pr_url(pr_url)):
-            _fail(f"{what}.comment.url", "is not on the reviewed pull request")
-        if _int(comment["id"], f"{what}.comment.id", 1, MAX_COMMENT_ID) != ref.comment_id:
-            _fail(f"{what}.comment.id", "differs from the comment URL's id")
-        key_what = f"{what}.comment.marker_key"
-        key = _exact(comment["marker_key"], _MARKER_KEY_KEYS, key_what)
-        # The round is parsed strictly first: equality alone takes JSON 2.0
-        # (or true) for the integer it equals. The other three are compared
-        # with strings the certificate's own fields were parsed into, which
-        # only an equal string equals.
-        _int(key["review_round"], f"{key_what}.review_round", 1, MAX_SEQ)
-        expected = {
-            "review_round": review_round,
-            "reviewed_head_sha": head,
-            "reviewed_base_ref": base_ref,
-            "reviewed_merge_base_sha": merge_base,
-        }
-        for name, value in expected.items():
-            if key[name] != value:
-                _fail(f"{key_what}.{name}", "differs from the certificate's")
+    pr_url = _pr_url(raw["reviewed_pr_url"], f"{what}.reviewed_pr_url", candidate.repository)
+    head = _oid(raw["reviewed_head_sha"], f"{what}.reviewed_head_sha", candidate.object_format)
+    if head != candidate.commit:
+        _fail(f"{what}.reviewed_head_sha", "differs from the candidate's commit")
+    base_ref = _ref(raw["reviewed_base_ref"], f"{what}.reviewed_base_ref")
+    merge_base = _oid(
+        raw["reviewed_merge_base_sha"],
+        f"{what}.reviewed_merge_base_sha",
+        candidate.object_format,
+    )
+    comment = _exact(raw["comment"], _COMMENT_KEYS, f"{what}.comment")
+    url = _str(comment["url"], f"{what}.comment.url", MAX_URL_CHARS)
+    try:
+        ref = parse_comment_url(url)
+    except ConfigurationError:
+        _fail(f"{what}.comment.url", "is not a GitHub comment URL")
+    if ref.canonical != url:
+        _fail(f"{what}.comment.url", "must be stored in its canonical form")
+    if not ref.on(parse_pr_url(pr_url)):
+        _fail(f"{what}.comment.url", "is not on the reviewed pull request")
+    if _int(comment["id"], f"{what}.comment.id", 1, MAX_COMMENT_ID) != ref.comment_id:
+        _fail(f"{what}.comment.id", "differs from the comment URL's id")
+    key_what = f"{what}.comment.marker_key"
+    key = _exact(comment["marker_key"], _MARKER_KEY_KEYS, key_what)
+    # The round is parsed strictly first: equality alone takes JSON 2.0
+    # (or true) for the integer it equals. The other three are compared
+    # with strings the certificate's own fields were parsed into, which
+    # only an equal string equals.
+    _int(key["review_round"], f"{key_what}.review_round", 1, MAX_SEQ)
+    expected = {
+        "review_round": review_round,
+        "reviewed_head_sha": head,
+        "reviewed_base_ref": base_ref,
+        "reviewed_merge_base_sha": merge_base,
+    }
+    for name, value in expected.items():
+        if key[name] != value:
+            _fail(f"{key_what}.{name}", "differs from the certificate's")
     if certificate_digest(raw) != digest:
         _fail(f"{what}.digest", "does not match the certificate: it was edited or corrupted")
 
@@ -1272,7 +1169,6 @@ def observed_record(
     policy: Policy,
     result: ExecutionResult,
     run_log: str,
-    end_fingerprint: str = "",
 ) -> dict:
     """The record of one launched definition (D10.1), digest included."""
     outcome = outcome_of(result)
@@ -1306,9 +1202,6 @@ def observed_record(
             "stderr_tail_truncated": stderr_cut,
         },
     }
-    if isinstance(candidate, LocalCandidate):
-        record["start_fingerprint"] = candidate.fingerprint
-        record["end_fingerprint"] = end_fingerprint
     record["digest"] = record_digest(record)
     # A writer never produces a value the loader would refuse (D10.3): a
     # runner that reported a malformed time, say, fails here, before the save.
@@ -1332,8 +1225,6 @@ def attempt_marker(
         "run_log": run_log,
         "marked_at": marked_at,
     }
-    if isinstance(candidate, LocalCandidate):
-        marker["start_fingerprint"] = candidate.fingerprint
     parse_marker(marker, "the new validation attempt marker")
     return marker
 
@@ -1351,8 +1242,6 @@ def interrupted_record(*, seq: int, marker: Mapping[str, object], recovered_at: 
         "marked_at": marker["marked_at"],
         "recovered_at": recovered_at,
     }
-    if "start_fingerprint" in marker:
-        record["start_fingerprint"] = marker["start_fingerprint"]
     record["digest"] = record_digest(record)
     parse_record(record, "the new interrupted record")
     return record
@@ -1535,9 +1424,7 @@ def eligible(
     index, the policy digest, enforcement where the policy requires it; an
     ``INTERRUPTED`` record never is), and:
 
-    - a ``PASS`` is evidence, and stays so across an override; in LOCAL only
-      when the run ended where it started (D7.2): a validator that changed
-      covered bytes passed on a tree that no longer exists;
+    - a ``PASS`` is evidence, and stays so across an override;
     - a ``FAIL`` or ``TIMEOUT`` is terminal, reused rather than run again,
       unless its seq is at or below the operator's override watermark
       (D14.2): it is then historical and the definition runs again.
@@ -1545,7 +1432,7 @@ def eligible(
     if not applicable(view, candidate, definition.digest, policy):
         return False
     if view.outcome is Outcome.PASS:
-        return view.candidate.kind != KIND_LOCAL or view.end_fingerprint == view.start_fingerprint
+        return True
     return view.seq > (watermark or 0)
 
 
@@ -1571,7 +1458,7 @@ class Evidence:
     first non-PASS, as a run of the set would. The evidence is *complete*
     when every definition has a ``PASS``, *failed* when it stops at a
     ``FAIL`` or ``TIMEOUT``, and otherwise has a definition no eligible
-    record covers, which a gate runs (REMOTE) or refuses (LOCAL REVIEW).
+    record covers, which a gate runs.
     """
 
     candidate: Candidate
@@ -1666,7 +1553,7 @@ def binding_reusable(
     """D5.5, D5.7: whether a persisted binding is evidence for this launch, unchanged.
 
     Its round is the upcoming one, its candidate is the one just bound (the
-    PR head's commit in REMOTE, the bound fingerprint's identity in LOCAL),
+    PR head's commit),
     its set and policy digests are the ones in force, and no record it
     names is a ``FAIL`` or ``TIMEOUT`` the operator's override made
     historical.

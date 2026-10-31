@@ -1,7 +1,7 @@
 # ADR 0009. Removing LOCAL mode: no compatibility, strict refusal, the state protocol, sequencing and the baseline
 
-- **Status:** policy accepted, nothing implemented. This record changes no
-  behaviour.
+- **Status:** policy accepted, and implemented by #386 (S1a), #385 (S1b),
+  #387 (S2) and #388 (S3, state protocol 13); #389 (S4) remains.
   - *Decision:* LOCAL mode is removed completely, as a breaking change with
     no backward compatibility. The maintainer approved this on 2026-10-30
     in the
@@ -18,13 +18,15 @@
   - *Not decided here:* the state protocol's number (#23, when #388's PR
     is ready to merge, D8) and the order of EPIC #383 against the Public
     Alpha's release candidate (§5.2).
-  - *Implementation:* none. #385 to #389 implement this record after it
-    merges (D12, §5.3).
+  - *Implementation:* S1a (#386), S1b (#385), S2 (#387) and S3 (#388); S4
+    (#389), the measurement and the documentation audit, remains (D12,
+    §5.3).
   - *Release:* nothing is authorized. D10 says what the release that
     carries the removal must say; it is not a Go/No-Go, a tag or a
     publication.
-  - ADR 0001 stays accepted, and nothing in any ADR is marked superseded,
-    until the removal is complete on `main` (D11).
+  - The removal is complete on `main` with S3: ADR 0001 is marked
+    superseded, and the LOCAL decisions of ADR 0003 to 0008 carry their
+    notes (D11).
 - **Decides:** #384 (RET-A1), for EPIC #383.
 - **Planned against:** `main` `02ce244` (2026-10-30). Every line number in
   this record is at that commit. The inventory was taken at `4b03151`;
@@ -33,10 +35,10 @@
   five test modules and six documents. Every line reference into them was
   moved to `02ce244` and checked against the symbol it names, and the
   counts were taken again. Appendix B's baseline stays at `4b03151`.
-- **Will amend:** ADR 0001, superseded except the parts REMOTE still relies
+- **Amends:** ADR 0001, superseded except the parts REMOTE still relies
   on, and the LOCAL decisions of ADR 0003 to 0008 that Appendix A.4 lists,
-  superseded in part. Both take effect when the removal is complete on
-  `main` (D11).
+  superseded in part. Both took effect when the removal was complete on
+  `main` (#388, D11).
 - **Related:** ADR 0001 (LOCAL mode), ADR 0005 (the LOCAL launch classes
   and `preferred`), ADR 0006 (LOCAL candidate identity and the `local`
   certificate), ADR 0008 (the scheduler and standalone state); #23 (state
