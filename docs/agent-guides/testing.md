@@ -13,8 +13,8 @@ contract.
 Every behavioral change should include or update automated tests.
 
 Do not call real Claude Code/OpenCode/Pi/GitHub write APIs from unit tests.
-The one test that calls a real agent and model, the live Pi smoke test
-(#135), is opt-in and deselected by default (below).
+The only tests that call a real agent and model, the two live Pi smoke
+tests (#135), are opt-in and deselected by default (below).
 
 Use mocks, fakes, fixtures, and scripted providers.
 
@@ -336,6 +336,62 @@ High-priority coverage includes:
   command touches `<git dir>/autoforge/state`. #387 and #388 keep these
   passing, apart from the expected protocol label and any row that names
   LOCAL
+- the shared coverage LOCAL's removal must not lose (ADR 0009 A.2.3,
+  A.2.4, D12 S1a; #386): each shared invariant a LOCAL test was the only
+  test of has a REMOTE or mode-neutral test, written while LOCAL still
+  works, whose docstring names the LOCAL test it replaces. #387 and #388
+  delete no LOCAL test whose replacement is not on `main`:
+  - A, the git reader REMOTE uses (`tests/test_git_workspace.py`): no read
+    takes the optional index lock or refreshes a stale index, runs the
+    repository's fsmonitor, holds a credential or follows the operator's
+    `GIT_DIR`; `uncommitted_paths` is one hardened `git status`; a rename
+    or a copy is one record; a truncated or timed-out read, and a failed
+    HEAD or branch read, are refused. `engine.workspace()`,
+    `config_file_placement_problem` and a whole REMOTE `ANALYZE_EXECUTE`
+    read no field of `config.local` (ADR 0009 C1)
+  - B, the state loader (`tests/test_state_fuzz.py`): a REMOTE file with
+    an unknown field is refused, with and without LOCAL's fields, a newer
+    protocol named as such; seeded random corruption of a REMOTE file
+    either fails or loads as a legal REMOTE state holding exactly what the
+    file says; truncated JSON and every non-object root are corruption,
+    never "no state", for `load_state`, `load` and `existing_run`
+  - C, the state root under a running REMOTE engine
+    (`tests/test_state_root.py`): a state directory replaced while the
+    agent runs (a link, a FIFO, a prepared directory, a rename aside, the
+    parent renamed) is refused with nothing written, pushed or published;
+    `state.json` is replaced by name, never written through a link or a
+    hard link; an in-place copy is accepted (the documented limit); `run`
+    and `run --force` refuse a linked state directory, and a namespace
+    anchored at the git common dir a link at its state directory or its
+    parent
+  - D, findings fencing (`tests/test_findings_fence.py`): hostile finding
+    text in a REMOTE `FIX` prompt and in `REVIEW`'s prior findings stays
+    inside one fence, its one-line fields escaped
+  - E and F, the outer sandbox (`tests/test_doctor_sandbox.py`,
+    `tests/test_sandbox_routing.py`, `tests/test_sandbox_policy.py`):
+    every `doctor` sandbox row with `local=False` (REMOTE's classes and
+    profiles, the issue worktrees, the per-issue sandbox directories, the
+    denied roots with the checkout among them); each provider's
+    `--version` through the real backend; a declaration's writable items
+    on a REMOTE agent launch; a `REMOTE_AGENT` launch rewriting a
+    `--config` file in its provider's directory through the real backend
+  - G, the live Pi smoke test's REMOTE flow and its offline rehearsals
+    (below)
+  - H, a credential source the implementation agent plants during its own
+    launch, before its candidate is validated (`tests/test_validation_evidence.py`,
+    `tests/test_engine.py`): a `credential.helper` in the common dir's
+    `config` and the worktree's `config.worktree` never reaches the
+    validation command, which runs in an export git reads neither from,
+    and the next agent launch refuses it; a GitHub `~/.netrc` entry and a
+    `~/.profile` exporting `GITHUB_TOKEN` are refused before the command
+    runs: no record, `BLOCKED` naming the source and never the value,
+    nothing pushed or published
+  - crash recovery: the four journal cases of
+    `tests/test_local_recovery_matrix.py` are covered by
+    `tests/test_runlog.py` and REMOTE `tests/test_engine.py`, a foreign
+    file renamed over the journal during a REMOTE launch and a journal
+    refused before the launch, which charges no attempt, among them; its
+    other twenty tests are of LOCAL-only mechanisms
 
 ### Transitions
 
@@ -1565,14 +1621,23 @@ is scripted with the same handlers `ScriptedProvider` takes. Keep covered:
 
 ### The live Pi smoke test (#135)
 
-`tests/test_live_pi.py` runs one LOCAL REVIEW through the operator's real
-Pi and credential, on the auth route `AUTOFORGE_LIVE_PI_AUTH` names:
-`api_key` (DeepSeek first, `require_oauth: false`) or `oauth` (the ChatGPT
-sign-in, optional). It is marked `live`: `pyproject.toml`'s
-`-m 'not live'` deselects it from every default run, and selected with
-`-m live` it skips unless `AUTOFORGE_LIVE_PI=1`. Its flow and checks live
-in `tests/live_pi.py`; `tests/test_live_pi_support.py` keeps covered,
-offline:
+`tests/test_live_pi.py` runs one REVIEW through the operator's real Pi
+and credential, on the auth route `AUTOFORGE_LIVE_PI_AUTH` names: `api_key`
+(DeepSeek first, `require_oauth: false`) or `oauth` (the ChatGPT sign-in,
+optional). It has two tests, one model call each: a LOCAL REVIEW, and a
+REMOTE REVIEW (ADR 0009 A.2.3 G, #386), the one that stays once LOCAL is
+removed. Both are marked `live`: `pyproject.toml`'s `-m 'not live'`
+deselects them from every default run, and selected with `-m live` they
+skip unless `AUTOFORGE_LIVE_PI=1`. Their flows and checks live in
+`tests/live_pi.py`. The REMOTE flow runs the real `autoforge doctor`,
+decided by its Pi rows alone (its GitHub rows fail against the stand-in's
+`gh` by construction and are reported apart), then one REMOTE REVIEW of a
+PR the controller opened on `FakeGitHub` over a bare `file://` origin in
+the run's directory: nothing reaches GitHub. `tests/test_live_pi_support.py`
+keeps covered, offline, each check below for the LOCAL flow and its
+REMOTE counterpart, whose step 5 also scans every request sent to the
+stand-in and whose step 6 checks the checkout, the issue worktree and its
+HEAD:
 
 - the deselection: a default pytest process deselects it and runs nothing,
   and `-m live` without the variable skips with its reason
