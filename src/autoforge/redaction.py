@@ -1,9 +1,10 @@
 """Secret redaction for anything that lands in logs.
 
 Baseline protection only — no detector claims to catch every secret shape.
-Covers common env-var assignments and an upper-case name ending in a
-credential suffix (``GEMINI_API_KEY=``, ``DB_PASSWORD:``), ``Authorization``
-headers, private-key blocks, well-known token shapes (GitHub PATs, OpenAI /
+Covers common env-var assignments and a name ending in a credential suffix
+(``GEMINI_API_KEY=``, ``DB_PASSWORD:``, ``client_secret=`` with a literal
+value), ``Authorization`` headers, private-key blocks (also wrapped in short
+lines), well-known token shapes (GitHub PATs, OpenAI /
 Anthropic keys, Google API keys, JWTs, AWS access key ids, GitLab, Groq,
 xAI, npm and Hugging Face tokens), OAuth credential fields (``refresh`` /
 ``access`` / ``id_token`` / ``chatgpt-account-id``) and credentials embedded
@@ -12,9 +13,11 @@ A shape is recognised where it starts a token: at the start of the text,
 after a character that cannot be part of it, or directly after an escape
 sequence (``ESC[0m``, ``\\n``, ``\\u00e9``; see ``_ESCAPE``). An assignment's
 quoted value is recognised behind an escaped quote too
-(``GH_TOKEN=\\"...\\"``, as JSON writes it; see ``_QUOTE``), and a named
-assignment or header under a quoted key (``"GITHUB_TOKEN": "..."``,
-``"Authorization": "Bearer ..."``).
+(``GH_TOKEN=\\"...\\"``, as JSON writes it; see ``_QUOTE``) and replaced
+whole, to its closing quote (``_QUOTED_VALUE``), and a named assignment or
+header under a quoted key (``"GITHUB_TOKEN": "..."``,
+``"Authorization": "Bearer ..."``). :func:`redact_obj` knows a credential's
+name as a mapping's key too (``{"GEMINI_API_KEY": "..."}``).
 A line that starts a code fence is never a value (``_SPACE_TO_VALUE``).
 
 Every pattern has a stable class name. :func:`credential_classes` reports
@@ -110,12 +113,77 @@ _VALUE_BACKSLASH = r"\\(?!\\{0,6}[\"'])"
 # code block under the name was never the replaced run, only the fence was.
 # Each line break is tried once, so the scan stays linear.
 _SPACE_TO_VALUE = r"(?:[^\S\r\n]*|\s*[\r\n][^\S\r\n]*(?!`{3}|~{3}))"
+# A named assignment's value, its opening quote (``vbs``, the backslashes
+# before it, up to seven as ``_QUOTE`` takes, and ``vq``, the quote) optional.
+_VALUE_OPEN = r"((?P<vbs>\\{0,7})(?P<vq>[\"']))?"
+# A value no quote opens ends at a space, a quote, a semicolon or a backslash
+# that starts an escaped closing quote.
+_UNQUOTED_VALUE = rf"(?:[^\s\"';\\]|{_VALUE_BACKSLASH})+"
+# A value a quote opens is taken whole (#285): it runs to the quote that
+# closes it, spaces, semicolons and the other quote character included, so
+# ``DB_PASSWORD="correct horse; battery"`` is replaced entire where the value
+# used to stop at the first space and leave the rest in the clear. The
+# closing quote is the opening one behind exactly as many backslashes; the
+# same quote behind more is escaped inside the value (``"a\"b"`` as a shell
+# writes it, ``\"a\\\"b\"`` as JSON writes that in a string). The value also
+# ends at a line break, at the end of the text, and at the same quote behind
+# fewer backslashes, which closes the string an escaped value stands in
+# (``"GH_TOKEN=\"abc"``): an unterminated value goes as far as its line or
+# its string and no further. A run of backslashes is taken whole and every
+# alternative is possessive, so each character is read once and a candidate
+# that fails does so at its first character.
+_QUOTED_VALUE = (
+    r"(?:[^\\\"'\r\n]"
+    r"|\\++(?![\"'])"
+    r"|(?P=vbs)\\+[\"']"
+    r"|\\*+(?!(?P=vq))[\"']"
+    r")++"
+)
+# The closing quote of a value a quote opened, absent when the value was cut
+# short; ``_QUOTE``, as before, after one no quote opened.
+_VALUE_CLOSE = rf"((?(vq)(?:(?P=vbs)(?P=vq))?|{_QUOTE}))"
 # A named assignment after its name: the separator (the name's closing quote,
-# when it is a quoted key, kept with it), the value's optional quote, the
-# value and its closing quote, groups 2 to 5 of the patterns that name it.
+# when it is a quoted key, kept with it), the value's optional opening quote
+# (its backslashes and quote are groups of their own), the value and its
+# closing quote: groups 2, 3, 6 and 7 of a pattern whose name is group 1.
 _NAMED_VALUE = (
-    rf"({_QUOTE}\s*[:=]{_SPACE_TO_VALUE})({_QUOTE})((?:[^\s\"';\\]|{_VALUE_BACKSLASH})+)"
-    rf"({_QUOTE})"
+    rf"({_QUOTE}\s*[:=]{_SPACE_TO_VALUE}){_VALUE_OPEN}"
+    rf"((?(vq){_QUOTED_VALUE}|{_UNQUOTED_VALUE})){_VALUE_CLOSE}"
+)
+# The well-known credential variable names ``env-assignment`` recognises, in
+# any case; :func:`redact_obj` knows them as a mapping's keys too.
+_ENV_NAMES = (
+    r"GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|"
+    r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY|"
+    r"ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENCODE_SERVER_PASSWORD"
+)
+# A name with a credential suffix behind a prefix (#285), group 1 of
+# ``credential-suffix-assignment``. Upper case (``GEMINI_API_KEY``, group
+# ``upper``) is an environment variable's, whose value is anything, as a
+# well-known name's is. Lower or mixed case (``client_secret``,
+# ``my_GITHUB_TOKEN``, ``Db_Password``) is a code identifier's as often as a
+# configuration key's, so its value must read as a literal
+# (``_LITERAL_VALUE``). Both stop where the identifier does, so a candidate
+# reads one identifier.
+_SUFFIX_NAME = (
+    r"((?P<upper>[A-Z][A-Z0-9_]*_(?:API_KEY|TOKEN|SECRET|PASSWORD))"
+    r"|[A-Za-z][A-Za-z0-9_]*_(?i:api_key|token|secret|password))"
+)
+# The unquoted value a lower- or mixed-case prefixed name needs: a run of 8
+# characters or more of a token's alphabet (base64, base64url, hex and the
+# ``.`` and ``~`` of a client secret, ``=`` padding at its end), holding a
+# digit and a letter, that the end of the text, a space, a quote, a comma, a
+# semicolon, an ``&``, a ``#``, a closing bracket or a backslash ends. A code
+# expression is none: an identifier or a dotted name has no digit
+# (``api_token=api_token``, ``client_secret=self.client_secret``), a type no
+# digit either (``api_token: str``), and a call or a subscript goes on past
+# the run (``x_token=sha256(data)``, ``os.environ["X"]``). Neither ``:`` nor
+# ``=`` is in the run, so a run never holds the next candidate's separator
+# and is read by one candidate only; the lookaheads read it once more each.
+_LITERAL_CHAR = r"[A-Za-z0-9_\-.+/~]"
+_LITERAL_VALUE = (
+    rf"(?={_LITERAL_CHAR}*?[0-9])(?={_LITERAL_CHAR}*?[A-Za-z]){_LITERAL_CHAR}{{8,}}+=*+"
+    r"(?![^\s\"'`,;&#)\]}>|\\])"
 )
 
 # A private-key block (#285), as PEM (RFC 7468) writes one and OpenSSH and
@@ -142,11 +210,20 @@ _PEM_GAP = r"(?:[\s:,]|\\{1,7}[nrt]|-(?!----))"
 _PEM_BODY = rf"(?:{_PEM_GAP}*+[A-Za-z0-9+/=]++)*+"
 # Key material: 16 base64 characters in a row, which a block needs to be a
 # key. A BEGIN line alone, or one that prose or code quotes
-# (``startswith("-----BEGIN ...")``), is no credential. The lookahead for it
-# steps over a shorter run whole (``_PEM_SHORT_RUN``), so it reads each
-# character once.
-_PEM_KEY = r"[A-Za-z0-9+/]{16}"
-_PEM_SHORT_RUN = r"[A-Za-z0-9+/]{1,15}+(?![A-Za-z0-9+/])"
+# (``startswith("-----BEGIN ...")``), is no credential. A line break, as
+# written or written out (``\n`` and ``\r\n``, behind up to seven
+# backslashes, as JSON and JSON in JSON write them), and the indentation
+# after it may stand between any two of the 16 (``_PEM_WRAP``): a valid key
+# wrapped at fewer than 16 characters a line (``fold -w 8``) has no run of 16
+# on any line, and was no credential until #285's review. A space between
+# two runs still parts them, so the words of prose are none. The lookahead
+# for it steps over a shorter run whole (``_PEM_SHORT_RUN``, the same
+# wrapping allowed), so it reads each character once and a run of 16 at most
+# twice.
+_PEM_B64 = r"[A-Za-z0-9+/]"
+_PEM_WRAP = r"(?:\r?\n|\\{1,7}r\\{1,7}n|\\{1,7}n)[ \t]*"
+_PEM_KEY = rf"(?:{_PEM_B64}(?:{_PEM_WRAP})?+){{15}}{_PEM_B64}"
+_PEM_SHORT_RUN = rf"(?:{_PEM_B64}(?:{_PEM_WRAP})?+){{1,15}}+(?!{_PEM_B64})"
 
 
 def _token(
@@ -188,11 +265,12 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # (the ``n`` of a ``\n`` written out) is no reason to leave it. First,
     # because a block holds what other patterns would take a slice of: a
     # named assignment's value stops at the space in the BEGIN line
-    # (``DEPLOY_SECRET="-----BEGIN RSA``) and would leave the label and the
-    # key behind it unrecognised. Each candidate starts at a BEGIN line and
-    # scans to the next run of five dashes, where the next candidate starts,
-    # at most three times (the lookahead, the block, the body), so the pass
-    # is linear.
+    # (``DEPLOY_SECRET=-----BEGIN``), a quoted one at the end of that line
+    # (``DEPLOY_SECRET="-----BEGIN RSA ...``), and either would leave the
+    # label or the key behind it unrecognised. Each candidate starts at a
+    # BEGIN line and scans to the next run of five dashes, where the next
+    # candidate starts, at most three times (the lookahead, the block, the
+    # body), so the pass is linear.
     _token(
         "private-key",
         rf"-----BEGIN {_PEM_LABEL}-----(?:"
@@ -207,13 +285,12 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # key write ``"GITHUB_TOKEN": "..."``, where the key's closing quote
     # stands between the name and the separator, and a value of no known
     # shape was kept in the clear. That quote, escaped as ``_QUOTE`` takes
-    # one, is kept with the separator.
+    # one, is kept with the separator. A quoted value is replaced whole
+    # (#285, ``_QUOTED_VALUE``).
     _token(
         "env-assignment",
-        r"(GITHUB_TOKEN|GH_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|"
-        r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY|"
-        rf"ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENCODE_SERVER_PASSWORD){_NAMED_VALUE}",
-        r"\1\2\3***REDACTED***\5",
+        rf"({_ENV_NAMES}){_NAMED_VALUE}",
+        r"\1\2\3***REDACTED***\7",
         flags="(?i)",
     ),
     # Authorization: Bearer <token> / Token <token> / Basic <base64>, also as
@@ -327,28 +404,11 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token("npm-token", r"npm_[A-Za-z0-9]{20,}", "***REDACTED***"),
     # Hugging Face access tokens: ``hf_`` and 34 letters.
     _token("huggingface-token", r"hf_[A-Za-z0-9]{20,}", "***REDACTED***"),
-    # VAR=secret / VAR: secret for an upper-case name with a credential
-    # suffix behind a prefix (#285): ``GEMINI_API_KEY``, ``DEEPSEEK_API_KEY``,
-    # ``MY_GITHUB_TOKEN``, ``CLIENT_SECRET``, ``DB_PASSWORD``, the name also
-    # as a quoted key, any value, as for a well-known name. An OpenCode
-    # launch inherits ``GEMINI_*`` and ``GOOGLE_*``, and an agent that prints
-    # its environment prints such a name with its value. Case-sensitive: an
-    # environment variable's name is upper case, while a lower-case
-    # ``api_token`` is as often a code identifier (``def f(api_token: str)``)
-    # as a credential. After every token shape, so a value of a known shape
-    # is reported by its own class; a well-known name is ``env-assignment``'s.
-    # A candidate starts only where an identifier does and scans no further
-    # than its end and the value after it, so the pass is linear.
-    _token(
-        "credential-suffix-assignment",
-        rf"([A-Z][A-Z0-9_]*_(?:API_KEY|TOKEN|SECRET|PASSWORD)){_NAMED_VALUE}",
-        r"\1\2\3***REDACTED***\5",
-    ),
     # Generic long bearer-ish assignments: token/password/secret = <value>,
     # the name also as a quoted key (``"api_key": "..."``, #393).
     # ``_`` is a token character before the name, so a prefixed one
-    # (``client_secret=``) is not recognised here; an upper-case one
-    # (``GEMINI_API_KEY=``) is, by ``credential-suffix-assignment``.
+    # (``client_secret=``) is not recognised here; it is
+    # ``credential-suffix-assignment``'s (#285), last below.
     _token(
         "secret-assignment",
         rf"(token|passwd|password|secret|api[_-]?key)({_QUOTE}\s*[:=]{_SPACE_TO_VALUE})"
@@ -394,15 +454,54 @@ _PATTERNS: tuple[_Pattern, ...] = (
         r"\1\2\3***REDACTED***",
         flags="(?i)",
     ),
+    # VAR=secret / VAR: secret for a name with a credential suffix behind a
+    # prefix (#285): ``GEMINI_API_KEY``, ``DEEPSEEK_API_KEY``,
+    # ``MY_GITHUB_TOKEN``, ``client_secret``, ``db_password``, the name also as
+    # a quoted key. An OpenCode launch inherits ``GEMINI_*`` and ``GOOGLE_*``,
+    # an agent that prints its environment prints such a name with its value,
+    # and a configuration file or a form body names one in lower case
+    # (``client_secret: ...``, ``client_secret=...&grant_type=...``).
+    #
+    # - An upper-case name, an environment variable's, takes any value, as a
+    #   well-known name does, on the same line or the next.
+    # - A lower- or mixed-case name is a code identifier's as often
+    #   (``def f(api_token: str)``, ``api_token=api_token``), so its value,
+    #   on the same line, is a quoted one (a string literal, a JSON or YAML
+    #   string) or an unquoted literal (``_LITERAL_VALUE``).
+    #
+    # A quoted value is replaced whole (``_QUOTED_VALUE``) either way. Last,
+    # so a value of a known shape is reported by its own class, a well-known
+    # name is ``env-assignment``'s and an OAuth name (``access_token``,
+    # ``oauth_refresh_token``) an OAuth pattern's; what such a pattern left of
+    # a quoted value (the part after a space) is replaced here. A candidate
+    # starts only where an identifier does and scans no further than its end
+    # and the value after it, so the pass is linear.
+    _token(
+        "credential-suffix-assignment",
+        rf"{_SUFFIX_NAME}"
+        rf"({_QUOTE}(?(upper)\s*[:=]{_SPACE_TO_VALUE}|[^\S\r\n]*[:=][^\S\r\n]*))"
+        rf"{_VALUE_OPEN}"
+        rf"((?(vq){_QUOTED_VALUE}|(?(upper){_UNQUOTED_VALUE}|{_LITERAL_VALUE})))"
+        rf"{_VALUE_CLOSE}",
+        r"\1\3\4***REDACTED***\8",
+    ),
 )
 
 _REDACTED = "***REDACTED***"
 
-# A mapping key that names an OAuth credential field, whole (``fullmatch``).
-# ``{"refresh": "..."}`` is the shape ``oauth-field`` finds in a text, but
+# A mapping key that names a credential, whole (``fullmatch``) and in any
+# case: an OAuth credential field (``refresh``, ``id_token``), a well-known
+# variable name (``GITHUB_TOKEN``) and a name with a credential suffix behind
+# a prefix (``GEMINI_API_KEY``, ``client_secret``, #285). ``{"refresh":
+# "..."}`` and ``{"GEMINI_API_KEY": "..."}`` are shapes ``oauth-field``,
+# ``env-assignment`` and ``credential-suffix-assignment`` find in a text, but
 # :func:`redact_obj` hands :func:`redact` the key and its value apart, and
-# neither matches on its own; this is how it still sees the shape.
-_OAUTH_FIELD_KEY = re.compile(rf"(?i){_OAUTH_FIELD_NAMES}")
+# neither matches on its own; this is how it still sees them. A mapping's
+# string value is a literal, as a quoted value is in a text, so a key in
+# lower case needs no more than one in upper case.
+_CREDENTIAL_KEY = re.compile(
+    rf"(?i:{_OAUTH_FIELD_NAMES}|{_ENV_NAMES}|[a-z][a-z0-9_]*_(?:api_key|token|secret|password))"
+)
 
 # :func:`redact` never returns more than this many times its input's length.
 # Every pattern replaces a run of at least one character with the 14-character
@@ -413,17 +512,21 @@ _OAUTH_FIELD_KEY = re.compile(rf"(?i){_OAUTH_FIELD_NAMES}")
 # the ratio and no text exceeds it. The next worst is a one character secret
 # behind the shortest recognised name, a one-letter prefix and a credential
 # suffix (#285): ``A_TOKEN=x``, 9 to 22, a factor of 2.44 (``HF_TOKEN=x`` and
-# ``id_token=x``, 10 to 23, follow). Every token shape #285 adds is longer
-# than the marker and only shrinks, a private-key block (43 characters or
-# more) included. Growth does not compound across patterns: a later pattern can
-# only lengthen the text by matching a run *shorter* than the marker, and a
-# marker is never part of such a run. The value classes that admit ``*`` (the
-# named-assignment, header, URL-userinfo and OAuth-field values, and what a
-# private-key block holds between its BEGIN and END lines) can only take a
-# marker in whole, since none of the characters that end such a run occurs
-# in the marker, so a match containing one is already at least as long as its
-# replacement and shrinks or keeps the length; every other value class excludes
-# ``*``, so a marker is never part of those matches at all. The characters
+# ``id_token=x``, 10 to 23, follow); a lower-case one needs a quoted value
+# (``a_token="x"``, 11 to 24) or a literal of 8 characters, which shrinks.
+# Every token shape #285 adds is longer than the marker and only shrinks, a
+# private-key block (43 characters or more) included. A quoted value is taken
+# whole (#285), so a quoted value of one character is still the worst it does.
+# Growth does not compound across patterns: a later pattern can only lengthen
+# the text by matching a run *shorter* than the marker, and a marker is never
+# part of such a run. The value classes that admit ``*`` (the named-assignment
+# values, quoted or not, the header, URL-userinfo and OAuth-field values, and
+# what a private-key block holds between its BEGIN and END lines) can only take
+# a marker in whole, since none of the characters that end such a run (a
+# quote, a line break, a space) occurs in the marker, so a match containing
+# one is already at least as long as its replacement and shrinks or keeps the
+# length; every other value class excludes ``*``, so a marker is never part of
+# those matches at all. The characters
 # around a replaced run are untouched, so no new short match appears beside it.
 # An ``after_escape`` pass is one more pattern in that order, and the escape
 # sequence it starts at (#284) is put back unchanged, no part of the replaced
@@ -498,13 +601,19 @@ def redact_obj(value: object) -> object:
     redacted text may no longer parse. (A secret right after an escape there,
     ``\\n`` or ``\\u00e9``, follows a letter or a digit, and a quoted value
     stands behind ``\\"``; they are recognised since #284 and #281, but the
-    syntax is still at risk.) The one shape that spans a key
-    and its value, a quoted OAuth credential field (``"refresh": "..."``,
-    ``oauth-field``), is recognised by the key instead: a non-empty string
-    under a key that names such a field, whole and in any case, is replaced
-    whole. No key of a
-    parser-bounded field (a finding, a resolution) names one, so the bounds
-    that depend on :data:`MAX_GROWTH_FACTOR` still hold.
+    syntax is still at risk.) The shapes that span a key and its value are
+    recognised by the key instead: a non-empty string under a key that
+    names a credential, whole and in any case, is replaced whole. That is
+    an OAuth credential field (``"refresh": "..."``, ``oauth-field``), a
+    well-known variable name (``{"GITHUB_TOKEN": "..."}``) and a name with a
+    credential suffix behind a prefix (``{"GEMINI_API_KEY": "..."}``,
+    ``{"client_secret": "..."}``, #285), at any depth (an ``env`` mapping in
+    a record, a free-form ``escalation``). The entry keeps its key, so it is
+    never dropped. No key of a parser-bounded field (a finding, a
+    resolution) names a credential, so the bounds that depend on
+    :data:`MAX_GROWTH_FACTOR` still hold; and an entry, key and value, grows
+    less than that factor too, since the shortest such key (``access``) is
+    six characters and the marker 14.
 
     A mapping never loses an entry to redaction. Two distinct keys can
     redact to the same text (``GITHUB_TOKEN=a`` and ``GITHUB_TOKEN=b`` both
@@ -537,7 +646,7 @@ def redact_obj(value: object) -> object:
                     n += 1
                 next_suffix[key] = n + 1
                 key = f"{key}#{n}"
-            if isinstance(k, str) and isinstance(v, str) and v and _OAUTH_FIELD_KEY.fullmatch(k):
+            if isinstance(k, str) and isinstance(v, str) and v and _CREDENTIAL_KEY.fullmatch(k):
                 result[key] = _REDACTED
             else:
                 result[key] = redact_obj(v)

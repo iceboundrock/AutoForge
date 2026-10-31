@@ -106,6 +106,15 @@ PRIVATE_KEY_BODY = "MIIEFAKEdummy0private0key0body0" + "A" * 33
 PEM_BEGIN = "-----BEGIN" + " RSA PRIVATE KEY-----"
 PEM_END = "-----END" + " RSA PRIVATE KEY-----"
 PRIVATE_KEY = f"{PEM_BEGIN}\n{PRIVATE_KEY_BODY}\n{PRIVATE_KEY_BODY}\nFAKE+/==\n{PEM_END}"
+# The same body rewrapped at eight characters a line, as ``fold -w 8`` writes
+# a key OpenSSL still reads (#285 review): no line holds 16 base64 characters
+# in a row. ``SHORT_WRAPPED_KEY_LINE`` is one of its lines, what must not
+# appear once it is redacted or refused.
+SHORT_WRAPPED_KEY_LINES = [
+    (PRIVATE_KEY_BODY * 2)[i : i + 8] for i in range(0, 2 * len(PRIVATE_KEY_BODY), 8)
+]
+SHORT_WRAPPED_KEY_LINE = SHORT_WRAPPED_KEY_LINES[1]
+SHORT_WRAPPED_KEY = "\n".join([PEM_BEGIN, *SHORT_WRAPPED_KEY_LINES, "FAKE+/==", PEM_END])
 # A value of no known shape under a prefixed name (#285).
 SUFFIX_SECRET = "FAKE0opaque0value"
 SUFFIX_ASSIGNMENT = f"DEEPSEEK_API_KEY={SUFFIX_SECRET}"

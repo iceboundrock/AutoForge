@@ -742,6 +742,78 @@ def test_status_and_dry_run_redact_the_replan_escalation_before_serializing_it(
     assert redact(f"refused: GH_TOKEN={F2_SECRET}") in out
 
 
+# Opaque values under credential-named keys (#285 review): a prefixed name
+# with each suffix, in upper, lower and mixed case, and a well-known name.
+_KEYED_SECRETS = {
+    "GEMINI_API_KEY": "FAKE0keyed0gemini",
+    "CI_JOB_TOKEN": "FAKE keyed; job",
+    "OAUTH_CLIENT_SECRET": "FAKE0keyed0oauth",
+    "db_password": "FAKE0keyed0db",
+    "Client_Secret": "FAKE0keyed0mixed",
+    "GITHUB_TOKEN": "FAKE0keyed0github",
+}
+
+
+def _keyed_document():
+    return {
+        "trigger": "workflow_stagnation",
+        "env": dict(_KEYED_SECRETS, HOME="/home/u"),
+        "steps": [{"with": {"npm_token": "FAKE0keyed0npm"}}],
+    }
+
+
+def _assert_keyed_secrets_redacted(out):
+    for value in [*_KEYED_SECRETS.values(), "FAKE0keyed0npm"]:
+        assert value not in out
+    assert "/home/u" in out
+
+
+def test_cli_output_redacts_a_value_under_a_credential_key_at_any_depth(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#285 review: ``redact_obj`` redacted a mapping's key and value apart,
+    so an opaque value under ``GEMINI_API_KEY``, ``db_password`` or another
+    credential name was printed in the clear by the step-outcome line, by
+    ``status`` and ``status --json`` (the replan escalation, a free-form
+    mapping from state) and by a dry run's ``replan policy`` note. Each is
+    redacted, at any depth, and every entry is kept."""
+    result = {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": "m", **_keyed_document()}
+    outcome = StepOutcome("run-285", "ANALYZE_EXECUTE", "BLOCKED", False, result=result)
+    cli.print_step_outcome(outcome)
+    out = capsys.readouterr().out
+    _assert_keyed_secrets_redacted(out)
+    (line,) = [text for text in out.splitlines() if text.startswith("  result=")]
+    printed = json.loads(line.removeprefix("  result="))
+    assert printed["env"] == dict.fromkeys(_KEYED_SECRETS, "***REDACTED***") | {"HOME": "/home/u"}
+    assert printed["steps"] == [{"with": {"npm_token": "***REDACTED***"}}]
+
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(argv) == 0
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "REPLAN_REEXECUTE"
+    data["replan_transaction"] = {"stage": "rejected", "escalation": _keyed_document()}
+    state_file.write_text(json.dumps(data))
+    redacted = json.dumps(redact_obj(_keyed_document()), sort_keys=True)
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    out = capsys.readouterr().out
+    _assert_keyed_secrets_redacted(out)
+    assert f"  escalation:  {redacted}" in out
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    out = capsys.readouterr().out
+    _assert_keyed_secrets_redacted(out)
+    assert cli.main(["--state-dir", sd, "step", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    _assert_keyed_secrets_redacted(out)
+    assert f"Note:     replan policy: {redacted}" in out
+    assert json.loads(state_file.read_text())["replan_transaction"]["escalation"] == (
+        _keyed_document()
+    )
+
+
 def test_status_json_keeps_journal_entries_whose_redacted_keys_collide(
     tmp_path, capsys, monkeypatch, fakes
 ):

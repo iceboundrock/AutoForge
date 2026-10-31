@@ -99,6 +99,7 @@ from tests.conftest import (
     SHA_B,
     SHA_C,
     SHAPES_285,
+    SHORT_WRAPPED_KEY,
     SUFFIX_ASSIGNMENT,
     FakeGitHub,
     acceptance,
@@ -552,6 +553,24 @@ _FAKE_TOKEN = "gh" + "p_" + "FAKE0000000000000000000000000000000000"
             _from_start,
             "commit message contains a credential-shaped string (pattern class: private-key)",
             id="commit-carries-a-private-key",
+        ),
+        pytest.param(
+            lambda req: (
+                implement(req)
+                if commit_in(req.cwd, f"Add the deploy key\n\n{SHORT_WRAPPED_KEY}")
+                else ""
+            ),
+            _from_start,
+            "commit message contains a credential-shaped string (pattern class: private-key)",
+            id="commit-carries-a-short-wrapped-private-key",
+        ),
+        pytest.param(
+            lambda req: implement(
+                req, pr_body="Adds it.\n\nRun with client_secret=FAKE0opaque0value"
+            ),
+            _reports_head,
+            "credential-shaped string (pattern class: credential-suffix-assignment)",
+            id="body-carries-a-lower-case-prefixed-credential-name",
         ),
         pytest.param(
             lambda req: (

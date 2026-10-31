@@ -219,16 +219,20 @@ prints, or that a command echoes, can reach a run log, and agent text that
 carries one can be published. The state directory is stored in the clear.
 Google API keys (`AIza...`) are recognised by their shape, under any name
 ([#282](https://github.com/iceboundrock/AutoForge/issues/282)), and so are
-AWS access key ids, private-key blocks, GitLab, Groq, xAI, npm and Hugging
-Face tokens, and any value assigned to an upper-case name that ends in
-`_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` (`GEMINI_API_KEY=...`)
+AWS access key ids, private-key blocks (also wrapped in short lines),
+GitLab, Groq, xAI, npm and Hugging Face tokens, and a value assigned to a
+name that ends in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD`, as text
+or as a mapping's key: any value under an upper-case name
+(`GEMINI_API_KEY=...`), and a quoted value or a token-like literal under a
+lower-case one (`client_secret: ...`)
 ([#285](https://github.com/iceboundrock/AutoForge/issues/285)). Among what
-is still not recognised: a secret of no known shape under a lower-case name
-(`client_secret: ...`) or a name those suffixes do not cover (`SSH_KEY`),
-an AWS secret access key printed without its name, and the end of a private
-key whose first line was cut off. An OpenCode launch receives every
-`GEMINI_*` and `GOOGLE_*` variable your shell sets. Keep such variables out
-of the shell you run AutoForge from unless a profile needs them.
+is still not recognised: an unquoted password of words or punctuation under
+a lower-case name (`db_password=changeme`), a name those suffixes do not
+cover (`SSH_KEY`, `clientSecret`), an AWS secret access key printed without
+its name, and the end of a private key whose first line was cut off. An
+OpenCode launch receives every `GEMINI_*` and `GOOGLE_*` variable your
+shell sets. Keep such variables out of the shell you run AutoForge from
+unless a profile needs them.
 
 ### Your content goes to model vendors
 
@@ -320,7 +324,7 @@ release carries yet.
 | [#282](https://github.com/iceboundrock/AutoForge/issues/282) | High | *Fixed in `0.1.0a0`.* A Google API key (`AIza` and 35 characters), under any name or none, in a URL's query string and after an escape sequence, is redacted in the run logs (`stdout.log` and `stderr.log` included), state and the CLI's output, and refused in published text and commit messages | OpenCode launches still receive `GEMINI_*` and `GOOGLE_*`, and in `0.1.0a0` a value of no known shape under such a name is not recognised (on `main` it is, #285): keep such variables out of the shell you run AutoForge from unless a profile needs them ([why](#redaction-is-a-baseline)) |
 | [#283](https://github.com/iceboundrock/AutoForge/issues/283) | High | *Fixed in `0.1.0a0`.* Every `gh` the controller starts runs in an empty directory of its own with `GIT_DIR` naming that directory, so any git it runs finds no repository, and none relies on its working directory to name one; `merge.delete_branch: true` no longer passes `--delete-branch` (which deletes the local branch too, checking out and pulling another first, in the directory `gh` runs in): after a verified merge the controller deletes the PR's head branch on GitHub only, once, through `DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`, never for a fork's head, the base or the default branch, nor once the branch moved past the merged HEAD | `merge.delete_branch: false` (the default) still deletes nothing; `gh auth git-credential`, the credential helper of the controller's own fetch and push, still runs in the private git directory the controller made for that transfer ([how](agent-guides/github-safety.md#controller-owned-effects), [the deletion](agent-guides/github-safety.md#deleting-the-merged-head-branch)) |
 | [#284](https://github.com/iceboundrock/AutoForge/issues/284) | High | *Fixed in `0.1.0a0`.* A recognised token directly after an ANSI escape sequence (`ESC[0m`, which OpenCode's saved `stderr.log` carries), a backslash escape written out (`\n`, `\t`, `\uXXXX`) or any other character that cannot be part of it is redacted in the run logs, state and the CLI's output, and refused in published text | Redaction is still a baseline ([why](#redaction-is-a-baseline)): treat run logs as sensitive and never commit or share them ([how](#keep-autoforges-files-out-of-git)) |
-| [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | *Fixed after `0.1.0a0`.* AWS access key ids (`AKIA...`, `ASIA...`), private-key blocks (redacted whole), `glpat-`, `gsk_`, `xai-`, `npm_` and `hf_` tokens, and any value under an upper-case name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a prefix (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`) are redacted in the run logs, state and the CLI's output, and refused in published text and commit messages. In `0.1.0a0` none of them is recognised | Redaction is still a baseline: a lower-case name and the end of a cut-off private key are not recognised ([why](#redaction-is-a-baseline)); on `0.1.0a0`, keep such variables out of the shell you run AutoForge from unless a profile needs them |
+| [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | *Fixed after `0.1.0a0`.* AWS access key ids (`AKIA...`, `ASIA...`), private-key blocks (redacted whole), `glpat-`, `gsk_`, `xai-`, `npm_` and `hf_` tokens, and a value under a name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a prefix (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `client_secret`) are redacted in the run logs, state and the CLI's output, and refused in published text and commit messages. In `0.1.0a0` none of them is recognised | Redaction is still a baseline: an unquoted password of words under a lower-case name and the end of a cut-off private key are not recognised ([why](#redaction-is-a-baseline)); on `0.1.0a0`, keep such variables out of the shell you run AutoForge from unless a profile needs them |
 | [#286](https://github.com/iceboundrock/AutoForge/issues/286) | Medium | One allow-list serves every launch, and it refuses only the names `gh` and git read a credential from ([why](#other-limits)) | List no variable you would not give to the agents and to the code under review alike |
 | [#287](https://github.com/iceboundrock/AutoForge/issues/287) | Medium | *Fixed after `0.1.0a0`.* In a sequential EPIC run, `UPDATE_EPIC`'s next issue must be a native sub-issue of the EPIC with no sub-issues of its own, as `autoforge epic run` admits; any other selection, an issue the EPIC body only mentions included, is refused and asked again once, then `BLOCKED`. In `0.1.0a0` it could be any open issue of the repository, on a public repository possibly one a stranger opened | On `0.1.0a0`, prefer `autoforge epic run`. On `main`, an issue becomes selectable once someone adds it as a sub-issue of the EPIC: add only issues you would hand to an agent ([why](#prompt-injection-and-public-repositories-in-particular)) |
 | [#289](https://github.com/iceboundrock/AutoForge/issues/289) | Medium | *Fixed in `0.1.0a0`.* The merge gate refuses an empty check rollup, and one in which no check succeeded, under every configuration, `safety.verify_check_definition: false` and an empty `safety.required_checks` included; `doctor` names a GitHub Free plan restriction as the plan, never as a token permission, and its required-check row fails while `safety.allow_merge: true` and the requirement cannot be verified (the plan, a token without access, not found, a transient failure, or a hidden bypass list with no word on this token) | A branch rule is still what makes a check *required*: with the gate open, keep both settings at their defaults and a CI check required ([why](#check-runs-on-a-private-repository)) |

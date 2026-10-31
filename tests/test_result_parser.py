@@ -84,6 +84,8 @@ from tests.conftest import (
     SHA_B,
     SHA_C,
     SHAPES_285,
+    SHORT_WRAPPED_KEY,
+    SHORT_WRAPPED_KEY_LINE,
     block,
     comment_url,
 )
@@ -2574,8 +2576,26 @@ def test_a_285_shape_is_refused_by_every_published_content_check(cls, text, body
         "AWS access key ids start `AKIA` or `ASIA`; GitLab's tokens `glpat-`.",
         "Set the `GEMINI_API_KEY` and `DB_PASSWORD` variables before the run.",
         "`def fetch(api_token: str, page_token=None)` reads them.",
+        # Lower-case names in quoted code (#285 review): expressions, not
+        # literals.
+        "`self.client_secret = client_secret` and `api_token=api_token` pass it on.",
+        "`x_token = sha256(data)`, then `client_secret: ${CLIENT_SECRET}` in YAML.",
+        "`if not api_token:` raises `ConfigError2` on the next line.",
+        # A BEGIN line and a placeholder on the lines after it.
+        f"Paste it as\n\n```\n{PEM_BEGIN}\n<your key>\n...\n{PEM_END}\n```",
     ],
-    ids=["pem-header", "public-key", "snake-case-names", "prefixes", "names", "code"],
+    ids=[
+        "pem-header",
+        "public-key",
+        "snake-case-names",
+        "prefixes",
+        "names",
+        "code",
+        "lower-case-code",
+        "lower-case-calls",
+        "lower-case-condition",
+        "pem-placeholder",
+    ],
 )
 def test_text_about_the_285_shapes_is_still_publishable(text):
     """The checks refuse a credential, not a mention of one: a BEGIN line
@@ -2583,6 +2603,41 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
     variable named without a value and a lower-case parameter pass."""
     assert published_text_problem("pr_body", text) is None
     assert commit_message_problem(text, repository="owner/repo", issue_number=2) is None
+
+
+@pytest.mark.parametrize(
+    ("cls", "text", "body"),
+    [
+        # A valid key rewrapped at eight characters a line (#285 review).
+        ("private-key", SHORT_WRAPPED_KEY, SHORT_WRAPPED_KEY_LINE),
+        # A lower- or mixed-case prefixed name with a literal (#285 review).
+        ("credential-suffix-assignment", "client_secret=FAKE0opaque0value", "FAKE0opaque0value"),
+        ("credential-suffix-assignment", 'db_password = "FAKE spaced; value"', "spaced"),
+        ("credential-suffix-assignment", "my_GITHUB_TOKEN: abc123XYZ", "abc123XYZ"),
+    ],
+    ids=["short-wrapped-key", "lower-case-literal", "lower-case-quoted", "mixed-case"],
+)
+def test_a_shape_the_285_review_found_is_refused_by_every_published_content_check(cls, text, body):
+    """#285 review: a private key wrapped at fewer than 16 characters a line
+    and a value under a lower- or mixed-case prefixed name were no
+    credential, so agent text or a commit message carrying one could be
+    published. Each is refused by class, and never quoted."""
+    body_text = f"Configured the client.\n\n{text}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body_text),
+        published_payload_problem("PR body", f"{body_text}\n\nCloses #2"),
+        acceptance_comment_problem(body_text, "R1-F1"),
+        operator_comment_problem(body_text, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{text}", repository="owner/repo", issue_number=2
+        ),
+        _refusal(lambda: _full(progress=body_text)),
+        _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert f"credential-shaped string (pattern class: {cls})" in msg
+        assert body not in msg
 
 
 def test_a_private_key_block_in_a_commit_message_is_refused_whole():

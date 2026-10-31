@@ -31,6 +31,9 @@ from tests.conftest import (
     PRIVATE_KEY,
     PRIVATE_KEY_BODY,
     SHAPES_285,
+    SHORT_WRAPPED_KEY,
+    SHORT_WRAPPED_KEY_LINE,
+    SHORT_WRAPPED_KEY_LINES,
     SUFFIX_ASSIGNMENT,
     SUFFIX_SECRET,
     XAI_API_KEY,
@@ -652,10 +655,91 @@ def test_a_private_key_block_without_an_end_line_errs_on_redacting():
     assert redact(text) == "***REDACTED***. Done"
 
 
+def _rewrap(key, width):
+    """``key`` with its body rewrapped at ``width`` characters a line, as
+    ``fold -w`` writes it: a key OpenSSL still reads."""
+    begin, *body, end = key.split("\n")
+    joined = "".join(body)
+    return "\n".join([begin, *(joined[i : i + width] for i in range(0, len(joined), width)), end])
+
+
+_SHORT_WRAPPED_TEXTS = [
+    (SHORT_WRAPPED_KEY, "***REDACTED***"),
+    (_rewrap(PRIVATE_KEY, 4), "***REDACTED***"),
+    (_rewrap(PRIVATE_KEY, 1), "***REDACTED***"),
+    (SHORT_WRAPPED_KEY.replace("\n", "\r\n") + "\r\n", "***REDACTED***\r\n"),
+    (
+        "ssh_key: |\n" + "".join(f"  {line}\n" for line in SHORT_WRAPPED_KEY.split("\n")) + "x: 1",
+        "ssh_key: |\n  ***REDACTED***\nx: 1",
+    ),
+    (json.dumps({"key": SHORT_WRAPPED_KEY + "\n"}), json.dumps({"key": "***REDACTED***\n"})),
+    (
+        json.dumps(json.dumps({"key": SHORT_WRAPPED_KEY})),
+        json.dumps(json.dumps({"key": "***REDACTED***"})),
+    ),
+    (
+        json.dumps({"key": SHORT_WRAPPED_KEY.replace("\n", "\r\n")}),
+        json.dumps({"key": "***REDACTED***"}),
+    ),
+    # Its first lines alone, as ``head`` shows them or a capture cut them:
+    # the BEGIN line and the body after it go.
+    ("\n".join(SHORT_WRAPPED_KEY.split("\n")[:4]) + "\n$ ", "***REDACTED***\n$ "),
+    (f'DEPLOY_SECRET="{SHORT_WRAPPED_KEY}" next', 'DEPLOY_SECRET="***REDACTED***" next'),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    _SHORT_WRAPPED_TEXTS,
+    ids=[
+        "eight",
+        "four",
+        "one",
+        "crlf",
+        "yaml-block",
+        "json",
+        "json-in-json",
+        "json-crlf",
+        "head",
+        "quoted-env",
+    ],
+)
+def test_a_private_key_wrapped_in_short_lines_is_redacted_whole(text, expected):
+    """#285 review: key material was 16 base64 characters on one line, so a
+    valid key rewrapped at fewer a line (``fold -w 8``, which OpenSSL still
+    reads) was no credential: it reached the run log whole and passed the
+    published-content and commit-message checks. A line break and the
+    indentation after it may stand between any two of the 16 now."""
+    out = redact(text)
+    assert out == expected
+    assert "MIIEFAKE" not in out and SHORT_WRAPPED_KEY_LINE not in out
+    assert credential_classes(text) == ("private-key",)
+    assert redact(expected) == expected
+
+
+def test_a_normally_wrapped_key_is_still_one_block():
+    """The usual 64 and OpenSSH's 70 characters a line are unchanged."""
+    for width in (64, 70, 76):
+        text = f"$ cat key\n{_rewrap(SHORT_WRAPPED_KEY, width)}\n$ next"
+        assert redact(text) == "$ cat key\n***REDACTED***\n$ next"
+        assert credential_classes(text) == ("private-key",)
+
+
 # Not a private key: a public key, a certificate, a label in lower case or
 # behind four dashes, and a BEGIN line with no key material after it (alone,
-# quoted by code or prose, an empty block, a placeholder).
+# quoted by code or prose, an empty block, a placeholder). Material joined
+# across line breaks is no more than a line's words: a space parts two runs,
+# a blank line too, and a line of code or prose after a BEGIN line holds
+# fewer than 16 base64 characters joined to the next.
 _PEM_NEAR_MISSES = [
+    _pem("PUBLIC KEY", "\n".join(SHORT_WRAPPED_KEY_LINES)),
+    _pem("CERTIFICATE", "\n".join(SHORT_WRAPPED_KEY_LINES)),
+    f"{PEM_BEGIN}\nput\nyour\nkey\nhere\n{PEM_END}",
+    f"{PEM_BEGIN}\n<your key here>\n{PEM_END}",
+    f"{PEM_BEGIN}\nMIIE\n...\n{PEM_END}",
+    f"{PEM_BEGIN}\nMIIEFAKE\n\nAAAAAAA\n{PEM_END}",
+    f'if line.startswith("{PEM_BEGIN}"):\n    in_key = True\nelif line.startswith("{PEM_END}"):',
+    f"{PEM_BEGIN}\nthe key's lines follow here and the END line closes it",
     _pem("PUBLIC KEY", _PEM_BODY_LINES),
     _pem("RSA PUBLIC KEY", _PEM_BODY_LINES),
     _pem("CERTIFICATE", _PEM_BODY_LINES),
@@ -702,6 +786,12 @@ def test_a_private_key_block_is_replaced_before_any_pattern_takes_a_slice():
         # ``after_escape`` pass tries each backslash.
         PEM_BEGIN + "\\" * 250_000,
         (PEM_BEGIN + "\n" + "A" * 16 + "\n" + "-" * 4) * 20_000,
+        # #285 review: material joined across line breaks.
+        PEM_BEGIN + ("a\n" * 15 + " ") * 30_000,
+        (PEM_BEGIN + ("a\\n" * 15 + " ") * 10) * 3_000,
+        PEM_BEGIN + "a\n" * 500_000,
+        PEM_BEGIN + ("\\n" * 7 + "a") * 100_000,
+        (PEM_BEGIN + "\n" + "aaaa\n" * 4 + "-" * 4) * 20_000,
     ],
     ids=[
         "begin-lines",
@@ -713,6 +803,11 @@ def test_a_private_key_block_is_replaced_before_any_pattern_takes_a_slice():
         "dashes",
         "backslashes",
         "near-end-lines",
+        "short-wrapped-runs",
+        "written-out-wrapped-runs-per-begin",
+        "one-character-lines",
+        "written-out-breaks",
+        "short-wrapped-near-end-lines",
     ],
 )
 def test_the_private_key_pattern_stays_linear(text):
@@ -770,17 +865,69 @@ _SUFFIX_TEXT_IDS = [
     "after-ansi",
     "after-written-out-newline",
 ]
+# A lower- or mixed-case name (#285 review): a quoted value, or an unquoted
+# literal of 8 characters or more holding a digit and a letter, as a
+# configuration file, a form body, a query or a log line holds one.
+_LOWER_SUFFIX_TEXTS = [
+    (f"client_secret={SUFFIX_SECRET}", "client_secret=***REDACTED***"),
+    (f"client_secret: {SUFFIX_SECRET}", "client_secret: ***REDACTED***"),
+    ("my_GITHUB_TOKEN=abc123XYZ", "my_GITHUB_TOKEN=***REDACTED***"),
+    ("Gemini_API_KEY = FAKE-0.opaque~value==", "Gemini_API_KEY = ***REDACTED***"),
+    (
+        f"grant_type=client_credentials&client_secret={SUFFIX_SECRET}&scope=read",
+        "grant_type=client_credentials&client_secret=***REDACTED***&scope=read",
+    ),
+    (
+        f"https://h.example/cb?api_token={SUFFIX_SECRET}#x",
+        "https://h.example/cb?api_token=***REDACTED***#x",
+    ),
+    (f"db_password = '{SUFFIX_SECRET}'", "db_password = '***REDACTED***'"),
+    ('client_secret = "correct horse; battery"', 'client_secret = "***REDACTED***"'),
+    ("Client(api_token='x')", "Client(api_token='***REDACTED***')"),
+    (
+        json.dumps({"installed": {"client_id": "1", "client_secret": "two words"}}),
+        json.dumps({"installed": {"client_id": "1", "client_secret": "***REDACTED***"}}),
+    ),
+    ("{'db_password': 'p w'}", "{'db_password': '***REDACTED***'}"),
+    (
+        f'client_secret = "{SUFFIX_SECRET}"  # rotated',
+        'client_secret = "***REDACTED***"  # rotated',
+    ),
+    (f"\x1b[0mclient_secret={SUFFIX_SECRET}", "\x1b[0mclient_secret=***REDACTED***"),
+    (f"line\\nclient_secret={SUFFIX_SECRET}", "line\\nclient_secret=***REDACTED***"),
+]
+_LOWER_SUFFIX_TEXT_IDS = [
+    "ini",
+    "yaml",
+    "mixed-case",
+    "mixed-case-alphabet",
+    "form-body",
+    "query",
+    "single-quoted",
+    "double-quoted-with-space",
+    "keyword-argument",
+    "oauth-client-json",
+    "python-repr",
+    "comment-after",
+    "after-ansi",
+    "after-written-out-newline",
+]
 
 
-@pytest.mark.parametrize(("text", "expected"), _SUFFIX_TEXTS, ids=_SUFFIX_TEXT_IDS)
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    _SUFFIX_TEXTS + _LOWER_SUFFIX_TEXTS,
+    ids=_SUFFIX_TEXT_IDS + _LOWER_SUFFIX_TEXT_IDS,
+)
 def test_a_value_under_a_prefixed_credential_name_is_redacted(text, expected):
     """#285: ``GEMINI_API_KEY`` and ``DEEPSEEK_API_KEY`` are no well-known
     name, and ``_`` before ``API_KEY`` kept ``secret-assignment`` from
     seeing one, so a value of no known shape under such a name (an OpenCode
     launch inherits ``GEMINI_*`` and ``GOOGLE_*``) was printed in the clear.
-    An upper-case name ending in ``_API_KEY``, ``_TOKEN``, ``_SECRET`` or
-    ``_PASSWORD`` is recognised as a well-known one is, any value, in any
-    quoting the named patterns take."""
+    A name ending in ``_API_KEY``, ``_TOKEN``, ``_SECRET`` or ``_PASSWORD``
+    is recognised: in upper case as a well-known one is, any value, in any
+    quoting the named patterns take; in lower or mixed case (#285 review,
+    ``client_secret``) with a quoted value or an unquoted literal."""
     assert redact(text) == expected
     assert credential_classes(text) == ("credential-suffix-assignment",)
     assert redact(expected) == expected
@@ -812,15 +959,11 @@ def test_a_value_of_a_known_shape_under_a_prefixed_name_is_reported_by_its_shape
     assert credential_classes(text) == (name,)
 
 
-# Not a credential name: lower or mixed case (a code identifier), a suffix
-# that does not end the name, a plural, no separator, no value, a suffix the
-# rule does not take (``_KEY``), and a suffix with no prefix (the generic
-# ``secret-assignment``'s, which wants a value of 12 characters).
+# Not a credential name: a suffix that does not end the name, a plural, no
+# separator, no value, a suffix the rule does not take (``_KEY``), and a
+# suffix with no prefix (the generic ``secret-assignment``'s, which wants a
+# value of 12 characters).
 _SUFFIX_NEAR_MISSES = [
-    "max_token=5",
-    "def fetch(api_token: str, page_token=None):",
-    "my_GITHUB_TOKEN=abc123XYZ",
-    "Gemini_API_KEY=abc",
     "MY_TOKEN_FILE=/run/secrets/token",
     "GITHUB_TOKEN_PATH: /x",
     "MAX_TOKENS=4096",
@@ -832,12 +975,123 @@ _SUFFIX_NEAR_MISSES = [
     "API_KEY: short",
     "_TOKEN=x",
 ]
+# A lower- or mixed-case name in code (#285 review): its unquoted value is
+# an expression, not a literal. An identifier, a dotted name, a type, a
+# constant and a reference have no digit; a call or a subscript goes on past
+# its run; a literal of fewer than 8 characters, or of no letter, is none
+# either; and a value on the next line is a statement, not the name's.
+_LOWER_SUFFIX_NEAR_MISSES = [
+    "max_token=5",
+    "def fetch(api_token: str, page_token=None):",
+    "Gemini_API_KEY=abc",
+    "api_token=api_token",
+    "self.api_token = api_token",
+    "client_secret=self.client_secret,",
+    "page_token: Optional[str] = None",
+    "client_secret: ${CLIENT_SECRET}",
+    "api_token=$API_TOKEN",
+    "x_token = sha256(data)",
+    "x_token=hashlib.sha256(data).hexdigest()",
+    'api_token = os.environ["API_TOKEN"]',
+    "auth_token=base64.b64encode(raw)",
+    "if api_token:\n    headers2 = build(1)",
+    "if not client_secret:\n    raise ConfigError2",
+    "num_token = 12345678",
+    "x_token = v2_1",
+    "x_token=abcdefgh",
+    '{"page_token": null, "client_secret": ""}',
+    "api_token=<value>",
+    "client_secret = '' if x else None",
+]
 
 
-@pytest.mark.parametrize("text", _SUFFIX_NEAR_MISSES)
+@pytest.mark.parametrize("text", _SUFFIX_NEAR_MISSES + _LOWER_SUFFIX_NEAR_MISSES)
 def test_a_near_miss_of_a_prefixed_credential_name_is_left(text):
     assert redact(text) == text
     assert credential_classes(text) == ()
+
+
+# A quoted value under a credential name (#285 review), each with what
+# ``redact`` makes of it: the whole value goes, its spaces, semicolons, the
+# other quote and an escaped quote of its own included, and the quotes
+# around it stay.
+_WHOLE_QUOTED_VALUES = [
+    ('GEMINI_API_KEY="abc def;ghi"', 'GEMINI_API_KEY="***REDACTED***"'),
+    (
+        "export DB_PASSWORD='correct horse; battery' && run",
+        "export DB_PASSWORD='***REDACTED***' && run",
+    ),
+    ('X_TOKEN="it\'s; here" next', 'X_TOKEN="***REDACTED***" next'),
+    ("X_TOKEN='say \"hi\" now' next", "X_TOKEN='***REDACTED***' next"),
+    ('export X_TOKEN="a\\"b c" tail', 'export X_TOKEN="***REDACTED***" tail'),
+    ('X_TOKEN: "a b"\nnext: 1', 'X_TOKEN: "***REDACTED***"\nnext: 1'),
+    ('X_TOKEN = "a b"  # TOML', 'X_TOKEN = "***REDACTED***"  # TOML'),
+    ('GITHUB_TOKEN="a b; c"', 'GITHUB_TOKEN="***REDACTED***"'),
+    ('"GH_TOKEN": "a b"', '"GH_TOKEN": "***REDACTED***"'),
+    ('client_secret = "a b; c"', 'client_secret = "***REDACTED***"'),
+    ('X_TOKEN="C:\\Program Files\\x" end', 'X_TOKEN="***REDACTED***" end'),
+    # Unterminated: the value runs to the end of its line, or of the string
+    # it stands in, and no further.
+    ('X_TOKEN="cut short here\nnext line', 'X_TOKEN="***REDACTED***\nnext line'),
+    ('{"cmd": "X_TOKEN=\\"cut short"}', '{"cmd": "X_TOKEN=\\"***REDACTED***"}'),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _WHOLE_QUOTED_VALUES)
+def test_a_quoted_value_is_redacted_whole(text, expected):
+    """#285 review: a quoted value stopped at its first space or semicolon,
+    and the rest of it stayed in the clear. It runs to its closing quote."""
+    assert redact(text) == expected
+    assert redact(expected) == expected
+
+
+_SPACED_VALUE = "FAKE spaced; value \"x\" 'y'"
+_SPACED_ASSIGNMENTS = [
+    ("env-assignment", "GH_TOKEN={q}{v}{q}"),
+    ("env-assignment", '"GITHUB_TOKEN": {q}{v}{q}'),
+    ("credential-suffix-assignment", "GEMINI_API_KEY={q}{v}{q}"),
+    ("credential-suffix-assignment", '"DB_PASSWORD": {q}{v}{q}'),
+    ("credential-suffix-assignment", "client_secret = {q}{v}{q}"),
+]
+
+
+@pytest.mark.parametrize("quote", ['"', "'"], ids=["double", "single"])
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(
+    ("name", "template"), _SPACED_ASSIGNMENTS, ids=[t for _, t in _SPACED_ASSIGNMENTS]
+)
+def test_a_quoted_value_with_spaces_is_redacted_whole_at_any_escaping(name, template, depth, quote):
+    """The same whole value as shell-style text and as JSON, JSON in JSON and
+    three deep write it: the value's own quotes, escaped one level deeper
+    than its closing quote, stay inside it, and the redacted text decodes to
+    what redacting the text itself gives."""
+    inner = _SPACED_VALUE.replace(quote, "\\" + quote)
+    text = template.format(q=quote, v=inner)
+    assert redact(text) == template.format(q=quote, v="***REDACTED***")
+    escaped = _json_string(text, depth)
+    out = redact(escaped)
+    for word in ("FAKE", "spaced", "value"):
+        assert word not in out
+    decoded = out
+    for _ in range(depth):
+        decoded = json.loads(decoded)
+    assert decoded == redact(text)
+    assert credential_classes(escaped) == (name,)
+    assert redact(out) == out
+    assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+
+
+def test_a_quoted_value_is_redacted_whole_in_a_python_repr():
+    """A Python repr writes ``'`` as ``\\'`` in a string that holds both
+    quotes: the escaped quote opens and closes the value and stays."""
+    value = """X_TOKEN='a b; c' beside "double" quotes"""
+    out = redact(repr(value))
+    assert "a b; c" not in out
+    assert (
+        ast.literal_eval(out)
+        == redact(value)
+        == """X_TOKEN='***REDACTED***' beside "double" quotes"""
+    )
 
 
 @pytest.mark.parametrize(
@@ -848,6 +1102,16 @@ def test_a_near_miss_of_a_prefixed_credential_name_is_left(text):
         "A_TOKEN" * 140_000,
         "ABC_DEF_TOKEN " * 70_000,
         ("\\nA_TOKEN" + "_X" * 10) * 20_000,
+        # Lower case (#285 review): an identifier, and literals that fail
+        # each of the value's conditions, a candidate after the other.
+        "a" * 1_000_000,
+        "a_token=" * 125_000,
+        ("a_token=" + "abcdefgh" * 10 + " ") * 10_000,
+        ("a_token=" + "12345678" * 10 + " ") * 10_000,
+        ("a_token=" + "abcdefg1" * 10 + "(") * 10_000,
+        "a_token=" + "a-" * 500_000,
+        ("a_token:" + "a." * 50) * 10_000,
+        ('a_token="' + '"' * 3) * 80_000,
     ],
     ids=[
         "one-identifier",
@@ -855,24 +1119,55 @@ def test_a_near_miss_of_a_prefixed_credential_name_is_left(text):
         "suffixes-no-separator",
         "names-no-separator",
         "after-escapes",
+        "lower-identifier",
+        "lower-names-no-value",
+        "no-digit",
+        "no-letter",
+        "calls",
+        "long-run",
+        "dotted-names",
+        "empty-quotes",
     ],
 )
 def test_the_credential_suffix_pattern_stays_linear(text):
     """A candidate starts only where an identifier does and scans it to its
-    end, so a megabyte of identifiers is redacted well inside the budget."""
+    end and the value after it, which holds no next candidate's separator,
+    so a megabyte of identifiers and near-miss values is redacted well inside
+    the budget."""
     started = time.process_time()
     assert redact(text) == text
+    assert time.process_time() - started < 3.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'A_TOKEN="' + "x " * 500_000,
+        ('A_TOKEN="' + "x\\" * 10 + "'") * 20_000,
+        # JSON text: ``\"`` opens and closes, ``\\\"`` is one inside.
+        ('A_TOKEN=\\"' + 'a\\\\\\"' * 10 + '\\"') * 20_000,
+        ('a_token="' + "\\" * 1_000 + "\n") * 300,
+        'A_TOKEN="' + "\\" * 500_000,
+    ],
+    ids=["one-long-value", "other-quotes", "escaped-levels", "backslash-runs", "backslashes"],
+)
+def test_a_quoted_value_stays_linear(text):
+    """A quoted value is read once to its close, its line's end or its
+    string's: a backslash run whole, every alternative possessive."""
+    started = time.process_time()
+    redact(text)
     assert time.process_time() - started < 3.0
 
 
 def test_redact_obj_redacts_a_285_shape_at_any_depth():
     """State and the CLI's documents cross ``redact_obj``: each #285 shape is
     redacted in a nested value, a list and a mapping key. A value under a
-    prefixed name is redacted where the string holds the assignment; a
-    mapping's key and value are redacted apart, as for a well-known name."""
+    prefixed name is redacted where the string holds the assignment, and
+    where a mapping's key names it (below)."""
     value = {
         "env": [text for _, text, _ in SHAPES_285],
         f"key {GROQ_API_KEY}": {"nested": PRIVATE_KEY},
+        "vars": {"DEEPSEEK_API_KEY": SUFFIX_SECRET},
     }
     out = redact_obj(value)
     rendered = repr(out)
@@ -881,7 +1176,118 @@ def test_redact_obj_redacts_a_285_shape_at_any_depth():
     assert out == {
         "env": ["***REDACTED***"] * 7 + ["DEEPSEEK_API_KEY=***REDACTED***"],
         "key ***REDACTED***": {"nested": "***REDACTED***"},
+        "vars": {"DEEPSEEK_API_KEY": "***REDACTED***"},
     }
+
+
+def test_redact_obj_redacts_a_value_under_a_credential_name_key():
+    """#285 review: ``redact_obj`` redacts a mapping's key and its value
+    apart, and neither ``GEMINI_API_KEY`` alone nor an opaque value alone is
+    a credential, so ``{"GEMINI_API_KEY": "..."}`` (an ``env`` mapping in a
+    record, a free-form ``escalation``, a CLI document) kept the value in the
+    clear. A key that names a credential, a prefixed name with a credential
+    suffix in any case or a well-known name, has its non-empty string value
+    replaced whole, at any depth; the key and every other entry stay."""
+    value = {
+        "env": {
+            "GEMINI_API_KEY": SUFFIX_SECRET,
+            "DEEPSEEK_API_KEY": "x",
+            "MY_GITHUB_TOKEN": "two words; and more",
+            "CI_JOB_TOKEN": "FAKE",
+            "OAUTH_CLIENT_SECRET": "p@ss!",
+            "DB_PASSWORD": "hunter2",
+            "GITHUB_TOKEN": SUFFIX_SECRET,
+            "aws_secret_access_key": SUFFIX_SECRET,
+            "HOME": "/home/u",
+        },
+        "installed": {"client_id": "1.apps", "client_secret": "abc", "Db_Password": "p w"},
+        "steps": [{"with": {"npm_token": "short"}}, {"run": "make"}],
+        "count": 2,
+    }
+    out = redact_obj(value)
+    assert out == {
+        "env": {
+            "GEMINI_API_KEY": _R,
+            "DEEPSEEK_API_KEY": _R,
+            "MY_GITHUB_TOKEN": _R,
+            "CI_JOB_TOKEN": _R,
+            "OAUTH_CLIENT_SECRET": _R,
+            "DB_PASSWORD": _R,
+            "GITHUB_TOKEN": _R,
+            "aws_secret_access_key": _R,
+            "HOME": "/home/u",
+        },
+        "installed": {"client_id": "1.apps", "client_secret": _R, "Db_Password": _R},
+        "steps": [{"with": {"npm_token": _R}}, {"run": "make"}],
+        "count": 2,
+    }
+    assert SUFFIX_SECRET not in repr(out) and "hunter2" not in repr(out)
+    assert redact_obj(out) == out
+
+
+def test_redact_obj_leaves_a_key_that_names_no_credential_and_keeps_every_entry():
+    """The key must name the credential whole: a longer name, a plural, a
+    suffix the rule does not take, a bare generic name (whose text rule wants
+    a token-length value) and a key with no prefix are ordinary data, and an
+    empty or non-string value has nothing to hide. A key that redacts to the
+    same text as another is still suffixed, never dropped."""
+    value = {
+        "GITHUB_TOKEN_FILE": "/run/secrets/token",
+        "MY_TOKEN_PATH": "/x",
+        "max_tokens": "4096",
+        "input_tokens": 12,
+        "tokens": ["a", "b"],
+        "token": "short",
+        "SSH_KEY": "/home/u/.ssh/id_ed25519",
+        "_TOKEN": "x",
+        "api_key_id": "k-1",
+        "page_token": "",
+        "DB_PASSWORD": None,
+        "MY_SECRET": 7,
+        "CI_JOB_TOKEN": {"nested": "kept"},
+    }
+    assert redact_obj(value) == value
+    out = redact_obj({"GITHUB_TOKEN=a": "1", "GITHUB_TOKEN=b": "2", "X_TOKEN": "3"})
+    assert out == {
+        "GITHUB_TOKEN=***REDACTED***": "1",
+        "GITHUB_TOKEN=***REDACTED***#2": "2",
+        "X_TOKEN": _R,
+    }
+
+
+def test_redact_obj_keeps_the_growth_bound_for_a_credential_key():
+    """A value under a credential key becomes the 14-character marker, so a
+    short one grows; the key comes with it, and the shortest key that names
+    a credential is six characters (``access``), so an entry, key and value,
+    still grows less than ``MAX_GROWTH_FACTOR``: 7 to 20 at worst."""
+    for key in ("access", "a_token", "A_TOKEN", "GH_TOKEN", "id_token"):
+        out = redact_obj({key: "x"})
+        assert out == {key: _R}
+        assert len(key) + len(_R) <= MAX_GROWTH_FACTOR * (len(key) + 1)
+        serialized = json.dumps({key: "x"})
+        assert len(json.dumps(out)) <= MAX_GROWTH_FACTOR * len(serialized)
+
+
+def test_no_parser_bounded_field_is_a_credential_key():
+    """The persisted bounds that depend on ``MAX_GROWTH_FACTOR``
+    (``loop_guard.MAX_REQUIRED_RESOLUTION_CHARS``, the stored rationale) hold
+    for a finding's and a resolution's strings because no key of theirs
+    names a credential: such a key's value would be replaced by the marker,
+    which no factor bounds for a one-character value."""
+    import dataclasses
+
+    from autoforge import redaction
+    from autoforge.result_parser import Finding, FindingResolution, LocalFindingResolution
+
+    keys = {
+        *Finding(id="R1-F1", classification="blocked", required_resolution="x").to_dict(),
+        *FindingResolution(finding_id="R1-F1", resolution="fixed").to_dict(),
+        *LocalFindingResolution(finding_id="R1-F1", resolution="fixed").to_dict(),
+    }
+    for cls in (Finding, FindingResolution, LocalFindingResolution):
+        keys.update(f.name for f in dataclasses.fields(cls))
+    assert {"required_resolution", "rationale", "title"} <= keys
+    assert [k for k in keys if redaction._CREDENTIAL_KEY.fullmatch(k)] == []
 
 
 _URL_CREDENTIAL_CASES = [
@@ -1267,8 +1673,9 @@ def test_a_credential_is_recognised_after_an_escape_or_any_non_token_character(
 # A shape inside a longer identifier is no token, as under the word boundary
 # before #284: an ASCII letter, a digit or ``_`` right before it (``-`` too
 # for a JWT), an escape followed by more of the identifier, or a backslash
-# before a letter that makes no escape. A name behind a prefix is recognised
-# only when the whole name is upper case (#285, ``credential-suffix-assignment``).
+# before a letter that makes no escape. A name behind a prefix is an
+# identifier of its own in any case (#285, ``credential-suffix-assignment``),
+# so none is listed here.
 _INSIDE_IDENTIFIERS = [
     "xghp_abcdefghijklmnop",
     "1ghp_abcdefghijklmnop",
@@ -1279,8 +1686,6 @@ _INSIDE_IDENTIFIERS = [
     "xgithub_pat_11ABCDEFG0abcdefghij",
     "myeyJhbGciOiJIUzI1NiJ9.e30.c2ln",
     "my-eyJhbGciOiJIUzI1NiJ9.e30.c2ln",
-    "my_GITHUB_TOKEN=abc123XYZ",
-    "gemini_API_KEY=abcdefghijklmnop",
     "xpassword=hunter2hunter2",
     "preaccess=FAKE_ACCESS_VALUE_0000",
     "XAuthorization: Bearer abcdef123456",
@@ -1463,6 +1868,12 @@ _QUOTED_KEY_CASES = [
         "{'GEMINI_API_KEY': '***REDACTED***'}",
         "credential-suffix-assignment",
     ),
+    # In lower case too since #285's review: a quoted value is a literal.
+    (
+        '{"my_github_token": "FAKE0opaque0value"}',
+        '{"my_github_token": "***REDACTED***"}',
+        "credential-suffix-assignment",
+    ),
 ]
 
 
@@ -1483,8 +1894,8 @@ def test_a_credential_under_a_quoted_key_is_redacted(text, expected, name):
 _QUOTED_KEY_NEAR_MISSES = [
     '"GITHUB_TOKEN" is set in the environment',
     '{"GITHUB_TOKEN_FILE": "/run/secrets/token"}',
-    # A prefixed name in lower case is no credential name (#285).
-    '{"my_github_token": "FAKE0opaque0value"}',
+    # A prefixed name in lower case with no literal value (#285 review).
+    '{"my_github_token": null, "page_token": ""}',
     '{"GITHUB_TOKEN": "", "next": 1}',
     '{"token": "short"}',
     '{"Authorization": "none"}',
@@ -1648,6 +2059,13 @@ _WORST_CASE_UNITS = {
     # every token shape is longer than the marker and only shrinks.
     "credential_suffix_assignment": "A_TOKEN=x;",
     "credential_suffix_assignment_quoted_key": '"A_TOKEN":"x"',
+    # A quoted value is taken whole (#285 review): at one character it is
+    # the worst, 11 to 24, whatever the quote; a lower-case name with a
+    # quoted value is as long, and its unquoted literal (8 characters at
+    # least) only shrinks.
+    "credential_suffix_assignment_quoted_lower": 'a_token="x"',
+    "credential_suffix_assignment_escaped_lower": "a_token=\\'x\\'",
+    "credential_suffix_assignment_literal_lower": "a_token=abcdefg1 ",
     # The BEGIN line and 16 characters of key material, its floor: 44 to 15.
     "private_key": "-----BEGIN" + " PRIVATE KEY-----" + "a" * 16 + " ",
     "gitlab_pat": "gl" + "pat-" + "a" * 20 + " ",
@@ -1769,11 +2187,11 @@ def test_every_redaction_pattern_has_its_stable_class_name():
         "xai-api-key",
         "npm-token",
         "huggingface-token",
-        "credential-suffix-assignment",
         "secret-assignment",
         "oauth-field",
         "oauth-assignment",
         "oauth-bare-assignment",
+        "credential-suffix-assignment",
     ]
 
 

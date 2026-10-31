@@ -1048,6 +1048,49 @@ def test_the_event_journal_and_request_never_carry_an_unredacted_metadata_value(
     assert secret not in (step / "execution.json").read_text(encoding="utf-8")
 
 
+def test_a_value_under_a_credential_key_never_reaches_the_records(tmp_path):
+    """#285 review: a record's structures are redacted string by string, a
+    key apart from its value, so an opaque value under ``GEMINI_API_KEY`` or
+    ``client_secret`` in the metadata, the provider summary or the parsed
+    result was written to ``request.json``, ``execution.json``,
+    ``control-result.json`` and the journal in the clear. A key that names a
+    credential, at any depth, has its value redacted, and the entry stays."""
+    secrets = {
+        "GEMINI_API_KEY": "FAKE0record0gemini",
+        "DEEPSEEK_API_KEY": "FAKE record; deepseek",
+        "client_secret": "FAKE0record0client",
+        "Db_Password": "FAKE0record0db",
+        "GH_TOKEN": "FAKE0record0gh",
+    }
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            metadata={"validation": {"env": dict(secrets, PATH="/usr/bin")}},
+            provider_summary={"settings": [{"env": dict(secrets)}]},
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": "m",
+                "env": dict(secrets),
+            },
+        )
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"request.json", "control-result.json"}
+    for path in [*files, log.events_path]:
+        content = path.read_text(encoding="utf-8")
+        for value in secrets.values():
+            assert value not in content, (path, value)
+    redacted = dict.fromkeys(secrets, "***REDACTED***")
+    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
+    assert request["metadata"] == {"validation": {"env": redacted | {"PATH": "/usr/bin"}}}
+    result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
+    assert result["env"] == redacted
+
+
 # -- #206: the parsed result is redacted string by string ----------------------
 def _log_parsed_result(tmp_path, parsed_result):
     """Log one accepted result; return the step directory and its journal record."""

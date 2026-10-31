@@ -31,9 +31,10 @@ OPENCODE_SERVER_PASSWORD
 Authorization: Bearer ... / Token ... / Basic ...
 ```
 
-the value of any upper-case name that ends in `_API_KEY`, `_TOKEN`,
-`_SECRET` or `_PASSWORD` behind a prefix (`GEMINI_API_KEY`,
-`DEEPSEEK_API_KEY`), the well-known token shapes on their own (`ghp_*` and
+the value of any name that ends in `_API_KEY`, `_TOKEN`, `_SECRET` or
+`_PASSWORD` behind a prefix (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, any
+value; `client_secret`, a quoted value or a literal), also as a mapping's
+key, the well-known token shapes on their own (`ghp_*` and
 the other classic GitHub prefixes, `github_pat_*`, `sk-*`, `sk-ant-*`,
 Google API keys `AIza...`, three-segment `eyJ...` JWTs, AWS access key ids
 `AKIA...` / `ASIA...`, `glpat-*`, `gsk_*`, `xai-*`, `npm_*`, `hf_*`), a
@@ -96,8 +97,8 @@ What changed against `\b`, beyond the escapes, each pinned in
 Unchanged: a shape right after an ASCII letter, a digit or `_` is still no
 token (`xghp_...`, `my_GITHUB_TOKEN=`), nor is one after an escape that
 more of an identifier follows (`ESC[0mxghp_...`). A name behind a prefix
-(`GEMINI_API_KEY=`, `MY_GITHUB_TOKEN=`) is recognised since #285 when it is
-upper case and ends in a credential suffix
+(`GEMINI_API_KEY=`, `MY_GITHUB_TOKEN=`, `client_secret=`) is recognised
+since #285 when it ends in a credential suffix
 ([below](#the-remaining-credential-shapes-285)). A new pattern is built
 with `_token`, never on `\b`, as the Google API key class
 ([below](#google-api-keys-282)) and the classes #285 added are.
@@ -164,7 +165,7 @@ checks refuse it by name, never rewriting it.
 | `xai-api-key` | `xai-` and at least 20 characters of `[A-Za-z0-9_]` |
 | `npm-token` | `npm_` and at least 20 characters of `[A-Za-z0-9]` |
 | `huggingface-token` | `hf_` and at least 20 characters of `[A-Za-z0-9]` |
-| `credential-suffix-assignment` | an upper-case name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a prefix, with any value |
+| `credential-suffix-assignment` | a name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a prefix: in upper case with any value, in lower or mixed case with a quoted value or a literal |
 
 **The token shapes** are case-sensitive. A floor of 20 characters is below
 the length of every real token of each kind (52 for Groq, 80 for xAI, 36
@@ -196,11 +197,18 @@ JSON), so a key in a JSON key file keeps the JSON around it intact. It
 needs key material, 16 base64 characters in a row: a BEGIN line alone, one
 quoted by code (`startswith("-----BEGIN ...")`) or prose, an empty block and
 a placeholder (`...`) are no credential, so text about the format can be
-published. It starts anywhere but after a dash, a letter included (no
+published. A line break and the indentation after it may stand between any
+two of the 16, as written or written out (`\n`, `\r\n`, behind up to seven
+backslashes): a valid key rewrapped at fewer than 16 characters a line
+(`fold -w 8`, which OpenSSL still reads) has no run of 16 on any line, and
+was missed until the review of #285. A space or a blank line still parts two
+runs, so the words of a line of prose stay runs of their own, as before, and
+a short placeholder on lines of its own (`put`, `your`, `key`, `here`: 14
+joined) is no material either. It starts anywhere but after a dash, a letter included (no
 identifier holds a BEGIN line), and it runs first, before every other
-pattern: a named assignment's value stops at the space in the BEGIN line
-(`DEPLOY_SECRET="-----BEGIN RSA`), which would leave the label and the key
-behind it unrecognised.
+pattern: a named assignment's value stops at the space in the BEGIN line,
+or a quoted one at that line's end (`DEPLOY_SECRET="-----BEGIN RSA ...`),
+which would leave the label or the key behind it unrecognised.
 
 A block with no END line before the next run of five dashes (the first
 lines of a key file, a capture whose bound cut the key) loses its BEGIN line
@@ -215,36 +223,91 @@ kept both ends of a key, the omission marker between them, is one block.
 Not recognised: the end of a key whose BEGIN line is not in the text (a
 capture that kept only the key's tail, `tail` of a key file).
 
-**A prefixed credential name** (`credential-suffix-assignment`) is an
-upper-case name, letters, digits and `_`, starting with a letter and ending
-in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` after a prefix
-(`GEMINI_API_KEY`, `MY_GITHUB_TOKEN`, `CI_JOB_TOKEN`, `DB_PASSWORD`). Its
-value is taken as a well-known name's is (`env-assignment`): any value,
-quoted or not, behind an escaped quote, under a quoted key, on the next
-line, and directly after an escape. The rule is case-sensitive: an
-environment variable's name is upper case, and a lower-case `api_token` or
-`page_token` is as often a code identifier (`def f(api_token: str)`) as a
-credential, which would make review findings that quote code
-unpublishable. It runs after every token shape, so a value one of them
-knows is reported by that shape's class (`GEMINI_API_KEY=AIza...` stays
-`google-api-key`, `NPM_TOKEN=npm_...` `npm-token`), and a well-known name is
-still `env-assignment`'s. Not recognised: a prefixed name in lower or mixed
-case (`client_secret=`, which `secret-assignment` does not take either:
-`_` before its name is a token character), a suffix the rule does not take
-(`SSH_KEY`, `*_CREDENTIALS`), and, as for every name, a structure's key and
-value that `redact_obj` redacts apart (`{"GEMINI_API_KEY": "..."}` as a
-mapping, not as text).
+**A prefixed credential name** (`credential-suffix-assignment`) is a name
+of letters, digits and `_`, starting with a letter and ending in `_API_KEY`,
+`_TOKEN`, `_SECRET` or `_PASSWORD` after a prefix, the suffix in any case.
+What its value must be depends on the name's case:
+
+- **Upper case** (`GEMINI_API_KEY`, `MY_GITHUB_TOKEN`, `CI_JOB_TOKEN`,
+  `DB_PASSWORD`), an environment variable's: its value is taken as a
+  well-known name's is (`env-assignment`), any value, quoted or not,
+  behind an escaped quote, under a quoted key, on the next line, and
+  directly after an escape.
+- **Lower or mixed case** (`client_secret`, `db_password`,
+  `my_GITHUB_TOKEN`), which a configuration file, a form body
+  (`client_secret=...&grant_type=...`), a query and Google's OAuth client
+  JSON hold, but code as often (`def f(api_token: str)`,
+  `api_token=api_token`): its value, on the same line, is a quoted one (a
+  string literal, a JSON or YAML string) or an unquoted literal, a run of 8
+  characters or more of a token's alphabet (`[A-Za-z0-9_.+/~-]`, `=`
+  padding at its end) that holds a digit and a letter and that a space, a
+  quote, `,`, `;`, `&`, `#`, a closing bracket or the end of the text ends.
+  An identifier, a dotted name, a type and a reference have no digit
+  (`client_secret=self.client_secret`, `api_token: str`,
+  `client_secret: ${CLIENT_SECRET}`), a call or a subscript goes on past
+  the run (`x_token = sha256(data)`, `os.environ["X"]`), and a value on the
+  next line is a statement, not the name's (`if api_token:`), so quoted code
+  stays publishable. The cost: an unquoted password of words alone
+  (`db_password=changeme`) and one with punctuation the alphabet lacks
+  (`db_password=Sup3r$ecret!`) are not recognised under a lower-case name,
+  as they are under an upper-case one.
+
+**A quoted value is replaced whole**, for this rule and `env-assignment`:
+it runs to the quote that closes it, its spaces, semicolons and the other
+quote character included (`DB_PASSWORD="correct horse; battery"`), where it
+stopped at the first space or semicolon and left the rest in the clear
+until the review of #285. The closing quote is the opening one behind as
+many backslashes; the same quote behind more is escaped inside the value
+(`"a\"b"` as a shell writes it, `\"a\\\"b\"` as JSON writes that), so
+the value is found whole as text and as JSON, JSON in JSON and three deep
+write it, and the escaped closing quote stays, so the JSON still decodes.
+A value whose closing quote is missing runs to the end of its line, or to
+the same quote behind fewer backslashes, which closes the string it stands
+in (`"X_TOKEN=\"cut"`), and no further.
+
+The rule runs last, after every other pattern, so a value one of them knows
+is reported by that pattern's class (`GEMINI_API_KEY=AIza...` stays
+`google-api-key`, `NPM_TOKEN=npm_...` `npm-token`), a well-known name is
+still `env-assignment`'s, and an OAuth name (`access_token`,
+`oauth_refresh_token`) an OAuth pattern's; what such a pattern left of a
+quoted value, after a space, is replaced here and reported as this class
+too. Not recognised: a suffix the rule does not take (`SSH_KEY`,
+`*_CREDENTIALS`), a camelCase name (`clientSecret`), and a bare generic
+name (`password=`), which stays `secret-assignment`'s, with its value of 12
+token characters.
+
+**As a mapping's key.** `redact_obj` redacts a mapping's key and its value
+apart, and neither `GEMINI_API_KEY` nor an opaque value is a credential on
+its own, so `{"GEMINI_API_KEY": "..."}` (an `env` mapping in a record's
+metadata, a free-form `escalation`, a CLI document) kept the value in the
+clear until the review of #285. A key that names a credential, whole and in
+any case, now has its non-empty string value replaced whole, at any depth:
+a prefixed name with a credential suffix (`GEMINI_API_KEY`,
+`client_secret`), a well-known name (`GITHUB_TOKEN`) and, as before, an
+OAuth field (`refresh`, `id_token`). A mapping's string value is a literal,
+as a quoted value is in a text, so a lower-case key needs no more than an
+upper-case one. The entry and its key stay, a non-string or empty value is
+left, and a bare generic key (`token`, `password`) is not recognised.
 
 `MAX_GROWTH_FACTOR` is unchanged. The shortest recognised name is now a
 one-letter prefix and a suffix: `A_TOKEN=x`, 9 to 22 characters (2.44),
-below the URL shape's 2.86; every token shape is longer than the marker and
-only shrinks, a private-key block (43 characters or more) included, and
-what a block holds between its BEGIN and END lines can take a marker only
-whole, as the named values do. Every pattern stays linear: a token shape
-scans one run of its alphabet, the name rule one identifier and its value,
-and a private-key candidate scans to the next run of five dashes, where the
-next candidate starts, at most three times (its key-material lookahead
-steps over a run shorter than 16 whole). `tests/test_redaction.py` pins
+below the URL shape's 2.86; a lower-case one needs a quoted value
+(`a_token="x"`, 11 to 24) or a literal of 8 characters, which shrinks, and
+a quoted value taken whole is still at least one character. Every token
+shape is longer than the marker and only shrinks, a private-key block (43
+characters or more) included, and what a block holds between its BEGIN and
+END lines, like a quoted value, can take a marker only whole. A mapping's
+value under a credential key grows from one character to the marker's 14,
+but its key comes with it, the shortest (`access`) six characters, so an
+entry grows 7 to 20 at worst; no parser-bounded field (a finding, a
+resolution) has such a key, so the per-string bounds that depend on the
+factor hold. Every pattern stays linear: a token shape scans one run of its
+alphabet, the name rule one identifier and its value (a quoted value once
+to its close or its line's end, a literal's run holds no `:` or `=`, so no
+other candidate's separator), and a private-key candidate scans to the next
+run of five dashes, where the next candidate starts, at most three times
+(its key-material lookahead steps over a run shorter than 16 whole, line
+breaks included). `tests/test_redaction.py` pins
 each shape, its near-misses, the order, the growth units and the linear
 bounds, and `test_result_parser.py`, `test_runlog.py`, `test_engine.py` and
 `test_cli.py` each class in every check and sink.
@@ -317,10 +380,11 @@ That quote exposed two gaps in the named patterns. Both are closed in
   quote after the name, escaped as `_QUOTE` takes one, and keep it with
   the separator. The header's value keeps an escaped closing quote whole,
   as an assignment's does. The OAuth names already had `oauth-field` for
-  this shape. Unchanged: an empty value is left, and `redact_obj`, which
-  redacts a key and its value apart, still recognises only the OAuth keys
-  by name. A prefixed upper-case name (`"MY_GITHUB_TOKEN"`) is recognised
-  under a quoted key too since #285
+  this shape. Unchanged: an empty value is left. A prefixed name
+  (`"MY_GITHUB_TOKEN"`, `"client_secret"`) is recognised under a quoted key
+  too since #285, and `redact_obj`, which redacts a key and its value
+  apart, recognises a well-known or prefixed credential name as a key, as
+  it did the OAuth keys
   ([above](#the-remaining-credential-shapes-285)).
 - **A code fence on a later line is never a value.** The space after an
   assignment's separator may cross a line break, so that a YAML value on
@@ -560,14 +624,15 @@ quoted value behind JSON's `\"` lost the backslash and kept the secret
 until #281, [above](#escaped-text-redact-the-structure-first-281).) The run
 log's `control-result.json` and the journal's `parsed_result` therefore
 cross `redact_dict` like the metadata, and the CLI's step outcome
-`redact_obj`. The one
-shape that spans a key and its value, a quoted OAuth credential field
-(`"refresh": "..."`), is recognised by the key: `redact_obj` replaces a
-non-empty string under a key that names such a field (the `oauth-field`
-names, whole, in any case) whole. No parser-bounded field (a finding, a
-resolution) has such a key, so the bounds that depend on
-`MAX_GROWTH_FACTOR` are unaffected; `tests/test_redaction.py` checks that
-the structure covers every `oauth-field` case that is a JSON document.
+`redact_obj`. The shapes that span a key and its value, a quoted OAuth
+credential field (`"refresh": "..."`) and a well-known or prefixed
+credential name (`"GITHUB_TOKEN": "..."`, `"client_secret": "..."`, #285),
+are recognised by the key: `redact_obj` replaces a non-empty string under
+a key that names one, whole and in any case, whole. No parser-bounded
+field (a finding, a resolution) has such a key, so the bounds that depend
+on `MAX_GROWTH_FACTOR` are unaffected; `tests/test_redaction.py` pins that,
+and checks that the structure covers every `oauth-field` case that is a
+JSON document.
 
 Live progress (#192) is built to be safe where it is made, not where it is
 printed. A provider adapter maps its protocol to a `ProgressEvent`
