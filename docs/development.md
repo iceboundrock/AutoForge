@@ -38,37 +38,52 @@ old name: `make sync` replaces it.
 
 ## The live Pi smoke test
 
-`tests/test_live_pi.py` (#135) is the one test that calls a real agent and
-a real model: one LOCAL REVIEW through the operator's own Pi and the
-credential the operator gave it, on the auth route named by
+`tests/test_live_pi.py` (#135) holds the only tests that call a real agent
+and a real model, one REVIEW each through the operator's own Pi and the
+credential the operator gave it:
+`test_one_local_review_runs_on_the_operators_real_pi` on a LOCAL run, and
+`test_one_remote_review_runs_on_the_operators_real_pi` on a REMOTE run
+against a GitHub stand-in (the suite's in-memory fake and a bare repository
+in the test's temporary directory), which needs no `gh` login and writes
+nothing to GitHub. The REMOTE test exists because LOCAL
+mode is being removed (EPIC #383, ADR 0009 Appendix A.2.3 G): it is the
+live flow that stays. Both take the auth route named by
 `AUTOFORGE_LIVE_PI_AUTH`: `api_key` (DeepSeek first, with
 `require_oauth: false`; the acceptance run) or `oauth` (the ChatGPT
-sign-in; an optional regression run). It is opt-in twice over, so
-`make check` and CI never run it and stay offline:
+sign-in; an optional regression run). They are opt-in twice over, so
+`make check` and CI never run them and stay offline:
 
 - `pyproject.toml` registers a `live` marker and adds `-m 'not live'` to
-  pytest's default options, so a default run deselects it (it is collected
-  and deselected, never run). Passing `-m live` selects it, since a later
-  `-m` wins.
-- Selected, it skips with its reason unless `AUTOFORGE_LIVE_PI=1`. Any
+  pytest's default options, so a default run deselects them (they are
+  collected and deselected, never run). Passing `-m live` selects them,
+  since a later `-m` wins.
+- Selected, each skips with its reason unless `AUTOFORGE_LIVE_PI=1`. Any
   other non-empty value fails rather than being read as "no". It then
   fails unless `AUTOFORGE_LIVE_PI_AUTH` names a route: it has no default.
 
+Name the test to run, since the file alone runs both and spends two
+REVIEWs:
+
 ```bash
-AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live tests/test_live_pi.py
+AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live \
+  tests/test_live_pi.py::test_one_remote_review_runs_on_the_operators_real_pi
 ```
 
 The prerequisites (Pi installed and given its credential by you,
 `OPENAI_API_KEY` and `DEEPSEEK_API_KEY` unset unless one is forwarded on
-purpose), its seven steps, its cost (one small REVIEW of the account's
-quota) and what it never does are in the
+purpose), the seven steps, what the REMOTE test does differently (its
+doctor's GitHub rows fail against the stand-in by construction, and only
+its Pi rows count), the cost (one small REVIEW of the account's quota per
+test) and what neither test ever does are in the
 [Pi operator guide](pi.md#prove-it-on-your-machine-the-live-smoke-test).
-Its report names the AutoForge commit, the route and the `authType` and
-carries no key or account detail; post it on #135 as the evidence of a run.
+A report names the AutoForge commit, the route and the `authType` (and,
+for REMOTE, the mode and the stand-in) and carries no key or account
+detail; post it on #135 as the evidence of a run.
 `tests/test_live_pi_support.py` runs in `make check`: it checks the
 deselection in a pytest process of its own, the route settings, the
-credential scan and the other checks, and rehearses the whole flow on both
-routes against the fake `pi`.
+credential scan and the other checks, and rehearses both flows, LOCAL and
+REMOTE, on both routes against the fake `pi`, with one REMOTE rehearsal for
+each LOCAL one.
 
 ## The operator-comment byte-fidelity capture
 
