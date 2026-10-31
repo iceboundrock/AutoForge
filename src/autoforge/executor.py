@@ -80,6 +80,7 @@ import ctypes
 import math
 import os
 import re
+import select
 import selectors
 import signal
 import subprocess
@@ -880,23 +881,35 @@ def _wait_exit(proc: subprocess.Popen, timeout: float | None) -> int:
     at once: it reaps the child, or raises ``subprocess.TimeoutExpired`` when
     the timeout ran out first. Without a pidfd (another system, a kernel
     before 5.3, a call the host refuses), for a child already reaped, whose
-    pid may name another process by now, and without a timeout, which blocks
-    in ``waitpid`` and polls nothing, it is ``proc.wait(timeout)`` itself.
+    pid may name another process by now, without a timeout, which blocks in
+    ``waitpid`` and polls nothing, and past :data:`MAX_DEADLINE_SECONDS`,
+    it is ``proc.wait(timeout)`` itself.
     """
     pidfd_open = getattr(os, "pidfd_open", None)
-    if timeout is not None and proc.returncode is None and pidfd_open is not None:
+    if (
+        timeout is not None
+        # poll(2) takes an int of milliseconds; a week is far inside it.
+        and timeout <= MAX_DEADLINE_SECONDS
+        and proc.returncode is None
+        and pidfd_open is not None
+    ):
         try:
             pidfd = pidfd_open(proc.pid)
         except OSError:
-            pass
-        else:
-            try:
-                with selectors.DefaultSelector() as sel:
-                    sel.register(pidfd, selectors.EVENT_READ)
-                    sel.select(timeout)
-            finally:
-                os.close(pidfd)
+            return proc.wait(timeout=timeout)
+        try:
+            # poll(2) takes no descriptor of its own, so it cannot fail for
+            # want of one; a poll that fails all the same leaves the wait
+            # to proc.wait, as without a pidfd. A negative timeout is no
+            # time left, as for proc.wait, not poll's wait without end.
+            exited = select.poll()
+            exited.register(pidfd, select.POLLIN)
+            exited.poll(max(0, math.ceil(timeout * 1000)))
             timeout = 0
+        except OSError:
+            pass
+        finally:
+            os.close(pidfd)
     return proc.wait(timeout=timeout)
 
 
