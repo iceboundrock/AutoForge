@@ -143,7 +143,9 @@ def test_the_all_policy_keeps_every_tmp_path(tmp_path):
     }
 
 
-NAMING_SUITE = """\
+# Each test of a naming suite records its tmp_path, how many times the
+# basetemp has been listed by then, and what else it is given.
+RECORDING = """\
 import os
 from pathlib import Path
 
@@ -162,12 +164,20 @@ def _recording_scandir(path="."):
 os.scandir = _recording_scandir
 
 
+def record(tmp_path, basetemp, *also):
+    with open(os.environ["RECORD"], "a") as fh:
+        print(tmp_path.relative_to(basetemp), SCANNED.count(basetemp), *also, file=fh)
+"""
+
+NAMING_SUITE = (
+    RECORDING
+    + """
+
 @pytest.mark.parametrize("n", range(3))
 def test_a_name_longer_than_thirty_characters(n, tmp_path, tmp_path_factory):
-    basetemp = tmp_path_factory.getbasetemp()
-    with open(os.environ["RECORD"], "a") as fh:
-        print(tmp_path.relative_to(basetemp), SCANNED.count(basetemp), file=fh)
+    record(tmp_path, tmp_path_factory.getbasetemp())
 """
+)
 
 
 def test_a_tmp_path_is_numbered_without_listing_the_basetemp_and_never_reused(tmp_path):
@@ -180,4 +190,41 @@ def test_a_tmp_path_is_numbered_without_listing_the_basetemp_and_never_reused(tm
     assert run.returncode == 0, run.stdout + run.stderr
     assert (tmp_path / "record").read_text().splitlines() == [
         f"test_a_name_longer_than_thirty{n} 0" for n in range(3)
+    ]
+
+
+COLLIDING_SUITE = (
+    RECORDING
+    + """
+
+def test_a1(tmp_path, tmp_path_factory):
+    basetemp = tmp_path_factory.getbasetemp()
+    record(tmp_path, basetemp, (basetemp / "test_a10").exists())
+
+
+class Eleven:
+    # Not collected itself; each class below collects it as a test named test_a.
+    def test_a(self, tmp_path, tmp_path_factory):
+        basetemp = tmp_path_factory.getbasetemp()
+        record(tmp_path, basetemp, (basetemp / "test_a10").exists())
+
+
+for n in range(11):
+    globals()[f"TestA{n}"] = type(f"TestA{n}", (Eleven,), {})
+"""
+)
+
+
+def test_a_directory_another_name_numbered_into_is_not_reused_once_removed(tmp_path):
+    """``test_a1`` numbered 0 and ``test_a`` numbered 10 both read
+    ``test_a10``. The first test passes and its directory is removed, so
+    the eleventh ``test_a`` could make it again; it gets ``test_a11``, and
+    no test lists the basetemp to know (PR #411 review)."""
+    run = _run(tmp_path, COLLIDING_SUITE)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "12 passed" in run.stdout, run.stdout
+    assert (tmp_path / "record").read_text().splitlines() == [
+        "test_a10 0 True",
+        *(f"test_a{n} 0 False" for n in range(10)),
+        "test_a11 0 False",
     ]
