@@ -1809,14 +1809,18 @@ A laptop, not Appendix B's host, so no absolute number below compares with
 B's: an Intel i5-4300U (2 cores, 4 threads at 1.9 GHz, the `schedutil`
 governor), 7.6 GiB of memory, Fedora Linux 44 Server, Linux 7.2.13, Git
 2.56.0, uv 0.13.6, bubblewrap 0.12.0, zsh 5.9. Python 3.14.8 is the
-interpreter `.python-version` gives; 3.12.13 and 3.11.17 are CI's. pytest
-9.1.1, pytest-xdist 3.8.0. `TMPDIR` was a directory of the tmpfs `/tmp`,
+interpreter `.python-version` gives; for CI's 3.12 and 3.11, uv's own
+builds of 3.12.13 and 3.11.17 (and, in C.5, of 3.12.16). pytest 9.1.1,
+pytest-xdist 3.8.0. `TMPDIR` was a directory of the tmpfs `/tmp`,
 as in B.1, for every run of both commits. Each commit ran from a clone of
 its own outside the issue worktree, with a venv `uv sync --locked` made.
-Nothing else ran on the host but the agent session that drove the runs.
-It edited documents throughout, and during the first baseline run it also
-ran under `nice` about half a minute of the tests and checks this step
-adds; the load average around each run is in C.3.
+Besides the agent session that drove the runs and the controller that
+started it, the host ran an idle second agent session, an idle OpenCode
+server and a tunnel daemon, about 3% of one thread together. The driving
+session edited documents throughout, and during the first baseline run it
+also ran under `nice` about half a minute of the tests and checks this
+step adds; the load average around the runs is in C.3. The CPU ran at 2.6
+to 2.9 GHz under load, at 64 °C, with no throttling seen.
 
 ### C.2 Commands
 
@@ -1826,7 +1830,8 @@ with the repository's options, `-p no:cacheprovider` and its own JUnit
 report; its other steps are timed apart. The instrumented run of B.4 ran
 on four pytest-xdist workers, with the plugin writing one file per worker
 (its counts do not depend on the order of the tests; its run is no
-timing). `UV_OFFLINE=1` kept uv off the network after the benchmark.
+timing). `UV_OFFLINE=1` kept uv off the network after the benchmark,
+but for the download of C.5's CPython 3.12.16.
 
 ```bash
 # alternating: before, after, before, after, before, after (R = 1, 2, 3)
@@ -1844,21 +1849,200 @@ and a drift in the host's load lands on both.
 
 ### C.3 Results
 
-TBD-C3
+`make check`'s pytest on Python 3.14.8, as the benchmark ran it, three
+times for each commit. A per-test number is that test's median over its
+three runs.
+
+| Measure | `4b03151` (before) | `3eb68ac` (after) |
+|---|---|---|
+| Collected (default selection) | 11,723 items in 83 modules | 12,215 items in 83 modules |
+| Outcome, every run | 11,718 passed, 5 skipped, 1 deselected | 12,210 passed, 5 skipped, 1 deselected |
+| Wall time of the three runs | 904.1, 899.6, 896.0 s | 836.5, 833.1, 839.4 s |
+| Median (range) | 899.6 s (896.0 to 904.1) | 836.5 s (833.1 to 839.4) |
+| Time pytest reported | 901.9, 897.5, 893.8 s | 834.2, 830.8, 837.2 s |
+| Sum of per-test times | 887.1, 882.8, 879.0 s | 819.5, 816.2, 822.0 s |
+| The six LOCAL-only modules | 568 items, 49.7 s (5.6%) | none |
+| Items of 0.5 s or more | 360 items, 461.4 s | 315 items, 465.8 s |
+| Items under 0.1 s | 9,943 items, 79.6 s | 10,604 items, 83.2 s |
+| Load average at each run's start and end | 0.45 to 1.60 | 1.05 to 1.60 |
+
+- **The suite is faster at `3eb68ac`, beyond the spread.** Its median is
+  63.1 s (7.0%) under `4b03151`'s, and its slowest run (839.4 s) is
+  56.6 s under `4b03151`'s fastest (896.0 s), about seven times the wider
+  of the two spreads (8.1 s). Not the removal's alone: the eleven commits'
+  (C.9).
+- **Not by running fewer tests.** `3eb68ac` runs 492 more. Split by test
+  id:
+
+  | Test ids | Items | Before | After |
+  |---|---|---|---|
+  | In both commits | 10,653 | 790.7 s | 676.2 s |
+  | Only before | 1,070 | 90.5 s | |
+  | of them in the six LOCAL-only modules | 568 | 49.7 s | |
+  | of them in 26 shared modules | 502 | 40.8 s | |
+  | Only after | 1,562 | | 142.3 s |
+  | of them `test_fast_targets.py` (#342, ADR 0010) | 42 | | 58.4 s |
+  | of them the removal's five new modules | 264 | | 6.7 s |
+  | of them in shared modules | 1,256 | | 77.2 s |
+
+  The same 10,653 tests take 114.5 s (14.5%) less, more than the whole
+  gain: the tests that left took 90.5 s and those that came take 142.3 s.
+  The same tests gained most in `test_engine.py` (32.0 s), `test_replan.py`
+  (13.0 s), `test_merge_certificate.py` (10.5 s), `test_cli.py` (6.0 s)
+  and `test_validation_gates.py` (5.5 s), the modules that start the most
+  `git` processes (C.4). These runs cannot say which commit made them
+  faster: #341 changed how the executor waits for a child, the tests'
+  disk flushes and the fake GitHub's ref reads, and S1a to S3 changed the
+  shared fixtures. A hint only: on uv's CPython 3.12.13, which has no
+  `os.pidfd_open`, so that #341's pidfd wait falls back to polling (C.5),
+  the same tests gained 40.9 s (774.0 to 733.1 s, one run each, with the
+  failures C.5 describes), not 114.5 s.
+- **What the removal took out and put in.** The six LOCAL-only modules:
+  `test_local.py` 135 items and 30.6 s, `test_durable_run_contract.py` 77
+  and 8.2 s, `test_local_recovery_matrix.py` 24 and 6.4 s,
+  `test_local_workspace_matrix.py` 53 and 2.2 s, `test_local_red_team.py`
+  28 and 1.6 s, `test_local_state_fuzz.py` 251 and 0.8 s. Of the 502 ids
+  that left shared modules, 208 name LOCAL (13.1 s); the rest are tests
+  renamed or reparametrized for REMOTE, whose new ids are among those that
+  came (`test_transitions.py`'s `REMOTE-…` cases, `test_doctor_sandbox.py`'s
+  `…_in_remote` rows, `test_live_pi_support.py`'s REMOTE flow). The new
+  modules: `test_state_fuzz.py` 224 items, in place of
+  `test_local_state_fuzz.py`'s 251, `test_state_root.py` 18,
+  `test_git_workspace.py` 9 and `test_findings_fence.py` 3 (all S1a), and
+  `test_local_removal.py` 10 (S3). Which test now holds each invariant a
+  LOCAL test used to hold is C.6, which a test keeps true.
+- **The slowest tests** are the same at both but for three:
+  `test_local.py::test_failing_validation_command_names_what_it_left_behind`
+  (5.75 s) left, and
+  `test_fast_targets.py::test_the_selection_is_the_union_of_its_paths`
+  (6.77 s) and
+  `test_fast_targets.py::test_run_hands_pytest_exactly_the_selection_and_returns_its_status`
+  (4.39 s) came. The ten slowest sum to 52.4 s before and 52.2 s after.
+- **`-m live` selects one test at both**: `tests/test_live_pi.py`'s LOCAL
+  review at `4b03151`, its REMOTE review at `3eb68ac` (S1a).
+- **The five skips are the same at both**, all opt-in probes:
+  `test_pi_rpc.py`'s run of a real Pi (`AUTOFORGE_PI_E2E_BIN`) and four of
+  `test_sdk_policy.py`'s Claude and OpenCode SDK probes. Unlike B.1's host,
+  this one can enforce the outer sandbox and has zsh, so the real-backend
+  and zsh tests B.3 skipped ran here, and passed, at both commits.
+- **The rest of `make check`**, one run each, cold then warm:
+
+  | Step | Before | After |
+  |---|---|---|
+  | `lock-check` | 0.014 s, 0.014 s | 0.015 s, 0.014 s |
+  | `lint` | 0.367 s, 0.026 s | 0.351 s, 0.026 s |
+  | `fmt-check` (176 and 173 files) | 0.274 s, 0.027 s | 0.269 s, 0.026 s |
+  | `typecheck` (58 and 57 source files) | 7.61 s, 0.22 s | 7.36 s, 0.22 s |
+
+  Under 9 s together at both; one run each says nothing about their
+  difference. `make check` is its pytest, as in B.3.
+- **Against Appendix B.** B's host is another, faster one: its single
+  `make check` at `4b03151` took 602.0 s, against about 900 s here. Only
+  the two commits measured on one host compare.
+- **On 3.12.** B.2's 3.12 command ran at both commits on uv's CPython
+  3.12.13 and took 903.8 s and 918.1 s, but 102 and 98 of its tests failed
+  or errored for that interpreter (C.5), so neither number measures its
+  commit. The sum of per-test times was 856.6 s and 871.4 s, the LOCAL-only
+  modules 52.0 s of the first.
 
 ### C.4 Fixtures, subprocesses and files
 
-TBD-C4
+B.4's plugin at both commits, on four pytest-xdist workers (C.2): its
+counts, not its phase times, which four workers sharing four threads make
+no timing (the runs took 423.7 s and 526.6 s, the second at a load average
+over 4). It counts what B.4's does, and leaves out what B.4 says it leaves
+out.
+
+| Measure | `4b03151` (before) | `3eb68ac` (after) |
+|---|---|---|
+| Processes started through `Popen` | 69,814 | 59,274 |
+| of them `git` | 67,555 | 57,052 |
+| `git` from the six LOCAL-only modules | 7,310 (10.8%) | none |
+| Tests that take a `tmp_path` | 5,903 | 6,326 |
+| Entries left in their `tmp_path` | 231,723 | 228,386 |
+| Entries from the six LOCAL-only modules | 18,988 (8.2%) | none |
+
+- **`git` processes: 10,503 fewer (15.5%).** The six LOCAL-only modules
+  started 7,310 (`test_local.py` 3,921, `test_durable_run_contract.py`
+  1,322, `test_local_recovery_matrix.py` 1,201,
+  `test_local_workspace_matrix.py` 514, `test_local_red_team.py` 352).
+  Shared modules started fewer too: `test_replan.py` 9,029 to 6,590,
+  `test_merge_certificate.py` 4,956 to 3,879, `test_validation_gates.py`
+  3,079 to 2,357, `test_integration.py` 2,626 to 1,979; others more:
+  `test_live_pi_support.py` 384 to 1,519 (its REMOTE rehearsals, S1a),
+  `test_cli.py` 3,632 to 4,527, `test_state_root.py` 217 new.
+  `test_engine.py` started 21,213 and 21,344.
+- **`tmp_path` entries: 3,337 fewer (1.4%) from 423 more tests.** The six
+  LOCAL-only modules left 18,988; the new and changed REMOTE tests leave
+  most of it again: `test_engine.py` 70,690 to 75,499,
+  `test_live_pi_support.py` 1,418 to 5,832, `test_cli.py` 8,736 to 12,026,
+  `test_epic_commands.py` 4,649 to 6,050, the four new S1a modules 2,859
+  together (`test_state_root.py` 1,191, `test_state_fuzz.py` 833,
+  `test_git_workspace.py` 540, `test_findings_fence.py` 295). The test that leaves the most is still
+  `test_runlog.py::test_opening_the_logger_never_lists_sibling_runs`, 4,011
+  on purpose.
+- **Against B.4**, at the same `4b03151`: 67,555 `git` processes here and
+  66,898 on B's host, 231,723 entries from 5,903 tests here and 231,591
+  from 5,827 there. The hosts differ in the tests they skip (C.3) and in
+  Git (2.56.0 here, 2.47.3 there), which leaves its own files in a
+  repository it makes; the LOCAL-only modules' 7,310 `git` processes are
+  the same number on both.
 
 ### C.5 The regression on the final candidate
 
-TBD-C5
+On `ae0761c`, this step's code, tests and documents with C.3, C.4, C.5 and
+C.7 still to be written, from a clone of its own on C.1's host, between
+22:56 and 23:57 UTC. The commit that lands differs from it in this
+appendix's text only; `tests/test_removal_attestation.py`, which reads
+that text, and the linters ran again on it.
+
+| Check | Interpreter | Outcome |
+|---|---|---|
+| `make check` | 3.14.8 | Passed in 891.4 s. `lock-check`, `lint`, `fmt-check` (174 files) and `typecheck` (57 source files) clean; pytest collected 12,311 items in 84 modules: 12,306 passed, 5 skipped, 1 deselected, in 880.0 s |
+| `make test-py3.11` (`check-matrix`) | 3.11.17 | Passed: 12,306 passed, 5 skipped, 1 deselected, in 913.6 s |
+| `make test-py3.12` (`check-matrix`) | uv's 3.12.13 | Failed for the interpreter: 12,204 passed, 44 failed, 54 errors, 9 skipped, 1 deselected, in 895.5 s. The 98 that failed or errored are those that did at `3eb68ac` (below) |
+| `test-py3.12`'s recipe, `AUTOFORGE_REQUIRE_SANDBOX_BACKEND=1` | 3.12.16 | Passed: 12,306 passed, 5 skipped, 1 deselected, in 859.1 s |
+| `make test-sandbox-measured` | 3.14.8 | Passed: the host can enforce (bubblewrap 0.12.0 with `--overlay`; unprivileged user, PID and IPC namespaces and a new procfs granted; Landlock ABI 10), so the real-backend tests were required, and all 54 passed |
+| `make dist-check DIST_PYTHON=3.12` | 3.12.13 | Passed (C.7) |
+| `make dist-check DIST_PYTHON=3.11` | 3.11.17 | Passed (C.7) |
+
+- **The candidate adds 96 tests to `3eb68ac`'s**: 84 in
+  `tests/test_removal_attestation.py` and 12 in `tests/test_packaging.py`.
+- **Skips.** Each run that passed skipped the five opt-in probes of C.3 and
+  nothing else, so no real-backend or zsh test skipped. On uv's 3.12.13,
+  four tests of `tests/test_executor.py`'s pidfd wait skipped too, as they
+  do where the interpreter cannot open a pidfd.
+- **The REMOTE matrix against fakes** is in every pytest run above: the
+  scripted end-to-end loops of `tests/test_integration.py`, the REMOTE
+  flows of `tests/test_engine.py` and the EPIC modules against the
+  in-memory GitHub, and `tests/test_live_pi_support.py`'s rehearsals with
+  the fake `pi`. None reaches a network or a model.
+- **uv's CPython 3.12.13 cannot launch the real backend, at every commit
+  measured.** The build uv installed on this host in June 2026 has neither
+  `os.memfd_create` nor `os.pidfd_open`; 3.11.17, 3.12.16, 3.13.16 and
+  3.14.8 here have both. `sandbox_bwrap` hands a launch's arguments to
+  bubblewrap through a memfd, so on that build every real launch raises
+  `AttributeError`. B.2's 3.12 command failed on it at `4b03151` (42
+  failed, 60 errors) and at `3eb68ac` (44 failed, 54 errors), and
+  `make test-py3.12` on the candidate failed on the same 98 tests as at
+  `3eb68ac`. Of those, the tests of the three real-backend modules error
+  in their fixture's probe, 34 of `tests/test_sandbox.py` fail on the same
+  call, and the rest are the
+  fake-Pi rehearsals of `tests/test_live_pi_support.py`, whose `doctor`
+  step, which probes the backend, exits 1 without its report. On 3.12.16
+  the same suite passes with the real backend required (above). So this
+  predates the removal and is not its regression. It is no honest skip
+  either: on such an interpreter AutoForge fails with a traceback instead
+  of saying the backend is unavailable. S4 changes no product code; it is
+  left for an issue of its own.
 
 ### C.6 A.2.4's invariants and the tests that hold them on `main`
 
 Each invariant of A.2.4, in its words, with the tests that hold it at
-`3eb68ac`. Every test named here ran and passed in C.5's regression,
-except where a line says it skips on a host, or is opt-in.
+`3eb68ac` and the three this step adds to `tests/test_packaging.py`. Every
+test named here ran and passed in C.5's `make check`, but the live one,
+which is opt-in; on this host that includes those a line says skip where
+the outer sandbox cannot be enforced.
 `tests/test_removal_attestation.py` fails when this list and A.2.4's table
 disagree on the invariants, or when a test named here no longer exists.
 
@@ -2003,7 +2187,41 @@ disagree on the invariants, or when a test named here no longer exists.
 
 ### C.7 The installed wheel and sdist
 
-TBD-C7
+`make dist-check` on the candidate, on CI's two interpreters, offline: uv's
+cache held the build backend `build-constraints.txt` pins (setuptools
+84.2.1). Each run built the sdist and the wheel of `autoforge-cli
+0.1.0a1.dev0` from a copy of the source tree, installed the wheel
+non-editably into a fresh environment outside the source tree, and ran the
+installed command. Both passed: on 3.12.13 in 10.0 s, on 3.11.17 in 9.4 s.
+What it checks of the removal, besides its earlier checks:
+
+- **No file of LOCAL mode in either artifact or the installed package.**
+  No `prompts/local_*.md`, `local_workspace.py` or `run_contract.py` in the
+  sdist (82 files), the wheel (70 package files) or the installed package,
+  whatever the tree declares, and neither `autoforge.local_workspace` nor
+  `autoforge.run_contract` importable from the install. All 13 prompt
+  templates rendered from it.
+- **Each of LOCAL's ten ways in meets its generic refusal** (D3 to D5), in
+  a scratch repository whose state file says `mode: "LOCAL"`, beside a run
+  log of its own, and with a configuration file that has a `local:` key.
+  `--help` names no `local`. `autoforge local`, `autoforge local run
+  features/add-filter.md` and `autoforge local doctor` are argparse's
+  invalid choice; `--config <that file> status` is the unknown top-level
+  key; `status`, `status --json`, `--state-dir <its .autoforge> status`,
+  `step --dry-run`, `resume --dry-run` and `unblock --reason looked
+  --dry-run` are the loader's unknown mode. Each exited 2 with that
+  message, ran no `gh` (a recording fake was first on `PATH`), and left the
+  repository, its `.git`, state directory and run log included, and the
+  configuration file byte for byte as they were. `doctor`'s refusal of a
+  `local:` key is `tests/test_cli.py`'s, since `doctor` runs `gh` and the
+  agent CLIs.
+- **The check is itself tested**, offline, by `tests/test_packaging.py` on
+  stand-in commands that each misbehave one way, and it was run once
+  against `4b03151`'s command, where it fails as it should: that command's
+  `--help` names `local`.
+
+These builds are of an unreleased candidate on this host, for the record
+only. Nothing was published or tagged.
 
 ### C.8 The documentation audit
 
@@ -2061,9 +2279,9 @@ entries and the ADRs, which are history (D10, D11).
   a 4-CPU host with `TMPDIR` on a disk, and by less with it on a tmpfs
   (`docs/development.md`, "Where the serial suite's time goes"), four other
   changes with tests of their own (#393, #343, #349, #287) and ADR 0010's
-  tooling (#342). C.3's difference is all of
-  theirs together; C.3 and C.4 split it only by module, which says where
-  time and processes moved, not why.
+  tooling (#342). C.3's difference is all of theirs together; C.3 and C.4
+  split it by test and by module, which says where time and processes
+  moved, not which commit moved them.
 - **A release.** Nothing is tagged, published or declared ready. The next
   `0.1.0aN` needs the maintainer's approval, its own Go/No-Go and
   `docs/releasing.md`'s procedure; whether it is the Public Alpha is §5.2's
