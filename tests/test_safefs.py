@@ -1943,6 +1943,28 @@ def test_a_symlinked_directory_component_reports_the_link_not_enotdir(tmp_path):
             root.write_text("sub/artifact.txt", "x")
 
 
+@pytest.mark.parametrize("op_name", ["write_bytes", "create_exclusive"])
+def test_a_symlinked_component_above_a_missing_directory_is_refused(tmp_path, op_name):
+    """A link anywhere on the way down is refused, whether or not the rest exists.
+
+    Once ``features/new/spec.md`` under a ``features`` link looked inside the
+    repository: only an existing parent was resolved, and creating ``new``
+    wrote outside. Every component is opened ``O_DIRECTORY | O_NOFOLLOW``
+    relative to the root's descriptor, so the walk stops at the link before
+    it creates anything below it.
+    """
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (root_dir / "sub").symlink_to(outside)
+    with SafeRoot.open(root_dir) as root:
+        for rel in ("sub/new/artifact.txt", "sub/artifact.txt"):
+            with pytest.raises(UnsafePathError, match="symbolic link"):
+                OPERATIONS[op_name](root, rel)
+    assert list(outside.iterdir()) == [], "nothing may be written outside the root"
+
+
 def test_errno_constants_used_by_the_walk_exist(tmp_path):
     """A typo'd errno name would silently turn a refusal into a generic error."""
     for name in ("ELOOP", "ENOTDIR", "EACCES", "EPERM", "EISDIR", "ENXIO", "EEXIST"):

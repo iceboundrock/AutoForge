@@ -1,14 +1,15 @@
 """The live Pi smoke test (#135): its flow, its checks and its report.
 
-``tests/test_live_pi.py`` runs :func:`run_smoke` against the real ``pi`` and
-a credential the operator gave Pi beforehand; ``tests/test_live_pi_support.py``
-runs the same flow against the fake ``pi`` of ``tests/pi_fake.py``, offline,
-and tests each check on its own. A run takes one of two auth routes, named
-explicitly (``AUTOFORGE_LIVE_PI_AUTH``): ``api_key``, a provider API key with
-``require_oauth: false`` (DeepSeek first, the acceptance run of #135's
-amendment of 2026-10-20), or ``oauth``, the ChatGPT sign-in with
-``require_oauth: true`` (an optional regression run). One run is seven
-steps (docs/development.md, "The live Pi smoke test"):
+``tests/test_live_pi.py`` runs :func:`run_remote_smoke` against the real
+``pi`` and a credential the operator gave Pi beforehand;
+``tests/test_live_pi_support.py`` runs the same flow against the fake ``pi``
+of ``tests/pi_fake.py``, offline, and tests each check on its own. A run
+takes one of two auth routes, named explicitly (``AUTOFORGE_LIVE_PI_AUTH``):
+``api_key``, a provider API key with ``require_oauth: false`` (DeepSeek
+first, the acceptance run of #135's amendment of 2026-10-20), or ``oauth``,
+the ChatGPT sign-in with ``require_oauth: true`` (an optional regression
+run). One run is seven steps (docs/development.md, "The live Pi smoke
+test"), on a REMOTE run (ADR 0009 Appendix A.2.3 G):
 
 1. preconditions, checked and never performed: ``pi`` is installed, at
    least :data:`~autoforge.providers.PI_MIN_VERSION`, and Pi's read-only
@@ -16,14 +17,32 @@ steps (docs/development.md, "The live Pi smoke test"):
 2. no provider API key (:data:`PROVIDER_KEY_NAMES`) is in this process's
    environment, unless the operator forwards one on purpose
    (``AUTOFORGE_LIVE_PI_FORWARD_KEY``, the ``api_key`` route only);
-3. ``autoforge local doctor`` (the real CLI, in a process of its own) passes
-   its Pi rows: Pi available, auth ready with the route's ``authType``;
-4. one LOCAL REVIEW on Pi returns a valid ``CONTROL_RESULT``: a scripted
-   stand-in implements a one-line feature, so the review is the only model
-   call (``execution.max_correction_attempts: 0``);
-5. nothing AutoForge wrote holds a credential-shaped string;
-6. the review left no side effect AutoForge promised against: the tree is
-   unchanged, Pi's session directory gained no entry, no process is left;
+3. ``autoforge doctor --json``, the real CLI in a process of its own,
+   passes its Pi rows: Pi available, auth ready with the route's
+   ``authType``. The rows that need GitHub (``gh`` available and
+   authenticated, the default branch's required checks, the check runs
+   read) cannot pass without the operator's GitHub login, and this test
+   uses none: the configuration's ``github.command`` is the stand-in's
+   ``gh``, which exits 1 and reaches nothing. Those rows fail or skip by
+   construction and are reported as a fact. The Pi rows do not depend on
+   them: doctor derives them from the configuration and Pi alone. The real
+   CLI is preferred to an in-process ``Doctor`` restricted to the Pi rows
+   because it is what the operator runs, with the REMOTE set of reachable
+   profiles, in a process the test's own stand-ins do not reach;
+4. one REMOTE REVIEW on Pi returns a valid ``CONTROL_RESULT``: a scripted
+   stand-in implements a one-line feature as a commit in the per-issue
+   worktree, the controller pushes it and opens the PR, then the REVIEW of
+   that PR HEAD on Pi is the only model call
+   (``execution.max_correction_attempts: 0``). The controller posts the
+   round's comment itself;
+5. nothing AutoForge wrote holds a credential-shaped string: the state
+   directory (outside the checkout), the git directory's ``autoforge/``
+   (the lock and the per-issue worktree), every request the controller
+   sent to the GitHub stand-in (the PR's title and body, the review
+   comment), and doctor's output;
+6. the review left no side effect AutoForge promised against: the
+   checkout, its worktree and the worktree's HEAD are unchanged, Pi's
+   session directory gained no entry, no process is left;
 7. the report: what ran (the AutoForge commit, the route) and each step's
    outcome.
 
@@ -34,37 +53,7 @@ token, an account id, an email or a plan name. A model's or Pi's own error
 text is not printed either, since it may name the plan: a failure is
 reported by its category (#131's failure reasons), never by its detail.
 
-**The REMOTE flow** (:func:`run_remote_smoke`, ADR 0009 Appendix A.2.3 G):
-LOCAL mode is being removed (EPIC #383), and with it ``local doctor``, the
-``local:`` key and the LOCAL REVIEW above. The REMOTE flow runs the same
-seven steps on a REMOTE run, so that Pi keeps a live flow and offline
-rehearsals once the LOCAL one is gone. Steps 1, 2 and 7 are the same.
-The others:
-
-3. ``autoforge doctor --json``, the real CLI in a process of its own,
-   passes its Pi rows. The rows that need GitHub (``gh`` available and
-   authenticated, the default branch's required checks, the check runs read)
-   cannot pass without the operator's GitHub login, and this test uses none:
-   the configuration's ``github.command`` is the stand-in's ``gh``, which
-   exits 1 and reaches nothing. Those rows fail or skip by construction and
-   are reported as a fact. The Pi rows do not depend on them: doctor derives
-   them from the configuration and Pi alone, as for LOCAL. The real CLI is
-   preferred to an in-process ``Doctor`` restricted to the Pi rows because it
-   is what the operator runs, with the REMOTE set of reachable profiles, in
-   a process the test's own stand-ins do not reach.
-4. one REMOTE REVIEW on Pi: a scripted stand-in implements the one-line
-   feature as a commit in the per-issue worktree, the controller pushes it
-   and opens the PR, then the REVIEW of that PR HEAD on Pi is the only model
-   call and must return a valid ``CONTROL_RESULT``. The controller posts the
-   round's comment itself.
-5. the scan covers the state directory (outside the checkout), the git
-   directory's ``autoforge/`` (the lock and the per-issue worktree),
-   every request the controller sent to the GitHub stand-in (the PR's title
-   and body, the review comment), and doctor's output.
-6. the review left the checkout, its worktree and the worktree's HEAD
-   unchanged; the session and process checks are LOCAL's.
-
-**The GitHub stand-in** (the design question A.2.3 G leaves to S1a) is the
+**The GitHub stand-in** (the design question A.2.3 G left to #386) is the
 suite's in-memory ``FakeGitHub`` (``tests/conftest.py``), its git data in a
 bare repository under the run's directory that the controller's own git
 transport pushes to over ``file://``, as the engine tests' ``origin=True``
@@ -279,11 +268,9 @@ def entry_names(directory: Path) -> frozenset[str]:
 
 def tree_snapshot(root: Path) -> dict[str, str]:
     """Every entry of a working tree with a digest of what it holds, outside
-    its ``.git`` and the ``__pycache__`` directories the smoke config excludes
-    (``local.exclude``): an independent second look at what the LOCAL
-    fingerprint binds, and in the REMOTE flow the only look at the checkout
-    and the reviewer's worktree (a linked worktree's ``.git`` is a file, and
-    is compared like one)."""
+    its ``.git`` and its ``__pycache__`` directories: step 6's look at the
+    checkout and the reviewer's worktree (a linked worktree's ``.git`` is a
+    file, and is compared like one)."""
     snapshot: dict[str, str] = {}
     for parent, dirs, files in os.walk(root):
         dirs[:] = [
@@ -543,35 +530,14 @@ def _execution(settings: SmokeSettings) -> dict[str, object]:
     return execution
 
 
-def write_config(path: Path, settings: SmokeSettings) -> Path:
-    """The run's configuration: the implementer and fixer scripted, every
-    reviewer a LOCAL run can reach on Pi with the route's ``require_oauth``,
-    a forwarded key in ``execution.env_allowlist_extra``, and no correction
-    relaunch, so the review is one model call."""
-    reviewer = _reviewer(settings)
-    execution = _execution(settings)
-    data = {
-        "version": 1,
-        "execution": execution,
-        "local": {"exclude": ["**/__pycache__"]},
-        "profiles": {
-            "analyze_execute": {"provider": "scripted"},
-            "fix": {"provider": "scripted"},
-            "review_round_1": reviewer,
-            "review_round_2_5": reviewer,
-        },
-    }
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    return path
-
-
 def write_remote_config(path: Path, settings: SmokeSettings, gh: Path, state_dir: Path) -> Path:
     """The REMOTE run's configuration: every profile a REMOTE run can reach
     (``REQUIRED_PROFILES`` and ``update_epic``) scripted except the three
     reviewers, on Pi with the route's ``require_oauth``; ``gh``, the GitHub
     stand-in's, for every ``gh`` doctor or the controller runs; the state
     outside the checkout (``state_dir``), so that the checkout holds nothing
-    AutoForge writes; and LOCAL's ``execution``."""
+    AutoForge writes; and no correction relaunch, so the review is one
+    model call, with a forwarded key in ``execution.env_allowlist_extra``."""
     reviewer = _reviewer(settings)
     scripted = {"provider": "scripted"}
     data = {
@@ -616,24 +582,6 @@ def implement_in_worktree(req: AgentRequest) -> str:
         tests=[],
     )
     return block(payload)
-
-
-def implement(root: Path) -> Callable[[AgentRequest], str]:
-    """The scripted ANALYZE_EXECUTE: writes the feature, answers with its result."""
-    from tests.conftest import block
-
-    def handler(req: AgentRequest) -> str:
-        (root / IMPLEMENTATION).write_text(IMPLEMENTATION_PY, encoding="utf-8")
-        payload = {
-            "phase": "ANALYZE_EXECUTE",
-            "status": "success",
-            "summary": "Added greet(name) in greet.py.",
-            "changed_workspace": True,
-            "tests_attempted": [],
-        }
-        return block(payload)
-
-    return handler
 
 
 def _pi_profile(settings: SmokeSettings) -> ProfileConfig:
@@ -723,18 +671,10 @@ def check_no_api_key(settings: SmokeSettings, report: SmokeReport) -> None:
     )
 
 
-def run_doctor(
-    config: Path,
-    repo: Path,
-    settings: SmokeSettings,
-    report: SmokeReport,
-    subcommand: tuple[str, ...] = ("local", "doctor"),
-) -> str:
-    """Step 3: ``autoforge local doctor --json`` (or ``subcommand``: the
-    REMOTE flow's ``doctor``), the real CLI in its own process; returns what
-    it printed, which step 5 scans too. A row that needs GitHub
-    (:data:`DOCTOR_GITHUB_ROWS`, which ``local doctor`` has none of) is
-    reported apart from the other failures."""
+def run_doctor(config: Path, repo: Path, settings: SmokeSettings, report: SmokeReport) -> str:
+    """Step 3: ``autoforge doctor --json``, the real CLI in its own process;
+    returns what it printed, which step 5 scans too. A row that needs GitHub
+    (:data:`DOCTOR_GITHUB_ROWS`) is reported apart from the other failures."""
     proc = subprocess.run(
         [
             sys.executable,
@@ -742,7 +682,7 @@ def run_doctor(
             "autoforge.cli",
             "--config",
             str(config),
-            *subcommand,
+            "doctor",
             "--json",
         ],
         cwd=repo,
@@ -780,94 +720,8 @@ def run_doctor(
     return proc.stdout
 
 
-def run_smoke(
-    workdir: Path,
-    settings: SmokeSettings,
-    report: SmokeReport,
-    before_review: Callable[[ControllerEngine], None] | None = None,
-) -> None:
-    """Steps 1 to 6 in ``workdir`` (empty, of this run alone); ``report`` holds
-    the outcome. ``before_review`` lets the offline rehearsal arm its fake."""
-    from tests.conftest import ExplodingGitHub
-
-    _run_facts(settings, report)
-    sessions = pi_session_dir()
-    sessions_before = entry_names(sessions)
-    repo = write_repository(workdir / "repo")
-    config = write_config(workdir / "autoforge.json", settings)
-    doctor_output = ""
-
-    with report.step(STEPS[0]):
-        check_preconditions(settings, workdir, report)
-    with report.step(STEPS[1]):
-        check_no_api_key(settings, report)
-    with report.step(STEPS[2]):
-        doctor_output = run_doctor(config, repo, settings, report)
-    if not all(report.passed(name) for name in STEPS[:3]):
-        return
-
-    pi = RecordingPi()
-    tree_before: dict[str, str] | None = None
-    with report.step(STEPS[3]):
-        registry = ProviderRegistry(
-            overrides={"scripted": ScriptedProvider(implement(repo)), "pi": pi}
-        )
-        engine = ControllerEngine(
-            config=load_config_file(str(config)),
-            state_dir=None,
-            workdir=repo,
-            github=ExplodingGitHub(),  # type: ignore[arg-type]
-            providers=registry,
-        )
-        engine.bind_local_state_dir(None)
-        with engine.locked():
-            engine.new_local_run(FEATURE)
-            engine.validate_config()
-            engine.save()
-            engine.step()  # INITIALIZING -> ANALYZE_EXECUTE
-            engine.step()  # ANALYZE_EXECUTE (scripted) -> REVIEW
-            require(engine.state.phase is Phase.REVIEW, f"no REVIEW: {engine.state.phase.value}")
-            tree_before = tree_snapshot(repo)
-            if before_review is not None:
-                before_review(engine)
-            started = time.monotonic()
-            try:
-                engine.step()  # REVIEW on Pi
-            except Exception as exc:
-                raise StepFailed(_review_failure(pi, exc)) from None
-            finally:
-                report.facts["review"] = _review_facts(pi, time.monotonic() - started)
-        state = engine.state
-        require(len(pi.results) == 1, f"{len(pi.results)} Pi launches, not one")
-        require(
-            state.phase in (Phase.DONE, Phase.FIX),
-            f"the review did not complete: the run is {state.phase.value}",
-        )
-        findings = len(state.open_findings)
-        report.facts["review outcome"] = (
-            "clean, the run is DONE"
-            if state.phase is Phase.DONE
-            else f"{findings} finding(s), the run would FIX next"
-        )
-
-    with report.step(STEPS[4]):
-        values = forwarded_values(settings)
-        hits = scan_for_credentials(repo / ".git" / "autoforge", values)
-        hits += [("<doctor output>", name) for name in credential_hits(doctor_output, values)]
-        require(not hits, "; ".join(f"{path}: {name}" for path, name in hits))
-
-    with report.step(STEPS[5]):
-        problems = []
-        if tree_before is None:
-            problems.append("the review never started, so the tree was not compared")
-        elif tree_snapshot(repo) != tree_before:
-            problems.append("the review changed the working tree")
-        problems += _launch_side_effects(sessions, sessions_before, workdir, pi)
-        require(not problems, "; ".join(problems))
-
-
 def _run_facts(settings: SmokeSettings, report: SmokeReport) -> None:
-    """Step 7's facts of the run that both flows report first."""
+    """Step 7's facts of the run, reported after its mode."""
     report.facts["date (UTC)"] = datetime.datetime.now(datetime.UTC).date().isoformat()
     report.facts["AutoForge commit"] = autoforge_commit()
     report.facts["auth route"] = (
@@ -897,7 +751,7 @@ def _launch_side_effects(
     return problems
 
 
-# -- the REMOTE flow (ADR 0009 Appendix A.2.3 G) --------------------------------------
+# -- the flow (ADR 0009 Appendix A.2.3 G) -------------------------------------------
 def worktree_head(worktree: Path) -> str:
     """The HEAD of the per-issue worktree, or '' when it cannot be read.
 
@@ -944,9 +798,9 @@ def run_remote_smoke(
     report: SmokeReport,
     before_review: Callable[[ControllerEngine], None] | None = None,
 ) -> None:
-    """Steps 1 to 6 of the REMOTE flow in ``workdir`` (empty, of this run
-    alone); ``report`` holds the outcome. ``before_review`` lets the offline
-    rehearsal arm its fake."""
+    """Steps 1 to 6 in ``workdir`` (empty, of this run alone); ``report``
+    holds the outcome. ``before_review`` lets the offline rehearsal arm its
+    fake."""
     from tests.conftest import EPIC, ISSUE, FakeGitHub, Origin, connect_origin, github_origin
 
     report.facts["mode"] = REMOTE_MODE
@@ -967,7 +821,7 @@ def run_remote_smoke(
     with report.step(STEPS[1]):
         check_no_api_key(settings, report)
     with report.step(STEPS[2]):
-        doctor_output = run_doctor(config, repo, settings, report, ("doctor",))
+        doctor_output = run_doctor(config, repo, settings, report)
     if not all(report.passed(name) for name in STEPS[:3]):
         return
 

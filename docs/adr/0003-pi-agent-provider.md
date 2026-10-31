@@ -13,6 +13,9 @@
   (#148). Decided
   in #128 for EPIC #127. Implemented by #129 (config, doctor), #130
   (duplex child primitive), #131 (adapter), #132 (resource policy).
+- **Note:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) removed LOCAL mode (#388); the LOCAL
+  parts of §2.4 (Pi corrections under the LOCAL launch charge) and §3 no
+  longer apply.
 - **Where:** `src/autoforge/providers.py` (`PiProvider`),
   `src/autoforge/pi_rpc.py` (Pi wire protocol),
   `src/autoforge/executor_duplex.py` (duplex child handle, implemented), `src/autoforge/engine.py` (`_invoke_phase`, one

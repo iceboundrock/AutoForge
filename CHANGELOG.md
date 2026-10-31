@@ -47,6 +47,168 @@ so.
   neither, with the built-in routing and with each starter, and a dry run
   with each starter.
 
+### A sequential run's next issue must be a sub-issue of the EPIC (#287)
+
+**Behaviour change:** `UPDATE_EPIC` switches only to a native sub-issue of
+the EPIC, the rule `autoforge epic run` admits by. Until now the controller
+accepted any open issue of the repository other than the EPIC and the
+issue just finished, so on a public repository injected text could make a
+stranger's issue the next task (finding M6 of the #257 audit).
+
+- The selected issue must name the EPIC as its parent on GitHub and have
+  no sub-issues of its own. An issue the EPIC body only mentions, in a task
+  list or as `#n`, is refused, and so is a nested EPIC. A refusal takes the
+  bounded re-selection as before: the agent is asked once more with the
+  reason, then the run is `BLOCKED` on the issue it just finished, with
+  nothing switched. A sequential run over an EPIC that lists its issues
+  only in its body now stops there: add them as sub-issues of the EPIC, or
+  start each with `autoforge run`.
+- The check is one more read of the selected issue
+  (`GET /repos/{owner}/{repo}/issues/{n}`). An answer without the
+  sub-issue summaries blocks the run as a conclusive GitHub failure. An
+  issue that read reports closed is refused, even when the issue read
+  just before said `OPEN`.
+- `null` (the EPIC is complete) is no longer taken on the agent's word.
+  The controller reads the EPIC's sub-issue listing, which must hold as
+  many issues as the EPIC counts, as for `autoforge epic run`. While an
+  open sub-issue it would accept remains, `null` is refused and asked
+  again once, then the run is `BLOCKED`. A listing short of the EPIC's
+  count (GitHub leaves out a sub-issue the token may not read), or one
+  that cannot be read, blocks the run instead of ending it as `DONE`. The
+  check comes before the roadmap section that reports the EPIC complete
+  is written.
+- The first issue, the one `run --issue` names, is not held to the rule.
+- The agent's read context gains `epic-sub-issues.md`: the EPIC's native
+  sub-issues with their state and title, and the EPIC's own count of them,
+  so a sub-issue the EPIC body never names is still identified and an
+  incomplete listing says so. Both `UPDATE_EPIC` prompts state the rule.
+  The prompt version is `v14`; a REMOTE run resumed by this version
+  renders the new templates and keeps its recorded label.
+- Blockers are not read: the order of a sequential run stays the agent's
+  choice. No default or configuration key changes.
+
+### LOCAL mode is removed (#387)
+
+**Behaviour change:** LOCAL mode, the GitHub-free workflow, is removed
+without compatibility and without a deprecation release (ADR 0009).
+`autoforge local` (`init`, `run`, `doctor`), the `local:` configuration
+key, LOCAL runs and `docs/local-mode.md` are gone. No release from this one
+on continues, shows, migrates or converts a LOCAL run, and nothing of one
+becomes REMOTE evidence.
+
+What an operator with LOCAL files meets:
+
+- `autoforge local …` exits 2 with argparse's
+  `invalid choice: 'local'`, before any configuration is read, any lock
+  taken or any file touched.
+- A configuration file with a top-level `local:` block is refused by every
+  command that loads it, the `epic` commands included:
+  `<file>: unknown key(s) under 'the top level': local (known: …)`, exit 2.
+  `doctor` reports the same text as its failing `config` row and exits 1.
+  The controller copies no LOCAL setting into a REMOTE one: commands that
+  were in `local.validation_commands` validate REMOTE runs only once they
+  are in `validation.commands`, which runs each in a byte-exact export of
+  the candidate commit, not in the working tree.
+- A command no longer looks for a run at `<git dir>/autoforge/state`, where
+  a LOCAL run kept its state by default. Without `--state-dir` it reads
+  `state_dir` only (`.autoforge` by default) and, with a LOCAL state only
+  in the git directory, says `no state file at .autoforge/state.json — …`.
+- A LOCAL state in a directory a command does read (`--state-dir`, or a
+  `state_dir` the LOCAL run also used) is refused by `status`,
+  `status --json`, `step`, `resume` and `unblock` with
+  `state file has unknown mode 'LOCAL'`, exit 2, and nothing is written.
+  `run` refuses it as an unreadable state file, exit 2. `run --force`
+  moves it aside as `state.json.corrupt-<UTC timestamp>`, never replacing
+  an existing file, and starts a REMOTE run that reads nothing of it. The
+  `.corrupt-` suffix is what every state file that does not load is moved
+  aside under, not a finding that the file is damaged.
+- With such a state at `state_dir`, `epic run` admits as before and says
+  `the standalone state … cannot be read: state file has unknown mode 'LOCAL'`;
+  `epic status` lists the same problem.
+
+No command continues, converts or deletes what a LOCAL run left. A LOCAL
+state in a directory a command reads is read only to be refused or
+reported as above, and `run --force` moves it aside; `doctor` lists the
+LOCAL sandbox cache, by size, among the sandbox directories. Nothing else
+of a LOCAL run is read, and keeping it costs disk space only.
+
+What a LOCAL run left, which you may archive or remove by hand:
+
+- its state file and its run logs in its state directory:
+  `<git dir>/autoforge/state` by default (`.git/autoforge/state` from a
+  main checkout, `.git/worktrees/<name>/autoforge/state` from a linked
+  one), or the `--state-dir` or non-default `state_dir` it was started
+  with. The state file is `state.json`, or `state.json.corrupt-<timestamp>`
+  once `run --force` has moved it aside; its `mode` field is `LOCAL`, and
+  its `run_id` field names its logs, `logs/<run_id>/`;
+- `<git dir>/autoforge/sandbox/local`, the sandbox cache, if a run used the
+  outer sandbox;
+- the `local:` block of the configuration file.
+
+A state directory can hold REMOTE runs as well, and removing it whole
+destroys them. A REMOTE run started there with the same `--state-dir` or
+`state_dir` keeps its `state.json` and `logs/<run_id>/` there, and so does
+the REMOTE run `run --force` started: after it, the directory holds that
+run's state and logs beside the LOCAL `state.json.corrupt-<timestamp>`.
+Before you archive or remove anything in a state directory:
+
+1. Run `autoforge status` on it (`--state-dir <dir>`, or the configuration
+   that names it). If it shows a run, that run is REMOTE and may be one you
+   are still running: keep `state.json` and `logs/<run_id>/` for the id on
+   its `Run:` line. `state.json` is the LOCAL run's only when `status` says
+   `state file has unknown mode 'LOCAL'`.
+2. Keep everything else that is not the LOCAL run's: the logs of other
+   runs, and every `.corrupt-` file whose `mode` field is not `LOCAL` (or
+   that has none), which an earlier REMOTE run left.
+3. Archive, then remove, only the LOCAL state file and its
+   `logs/<run_id>/`: for example `tar -czf local-run.tar.gz -C <dir>
+   <state file> logs/<run_id>`, then `rm -r <dir>/<state file>
+   <dir>/logs/<run_id>`, where `<state file>` is `state.json` or
+   `state.json.corrupt-<timestamp>`. Remove the directory itself only when
+   nothing else is left in it: `rmdir <dir>/logs <dir>` refuses otherwise.
+
+Never remove `<git common dir>/autoforge` as a whole: beside LOCAL's
+default state directory and sandbox cache, it holds REMOTE's worktrees,
+the repository lock, the scheduler's state and REMOTE's sandbox
+directories.
+
+`features/<slug>.md` and the changes a LOCAL run made in the working tree
+are your own work, not runtime state, and nothing above removes them: keep,
+commit or discard them as you would any other change. The working tree
+also holds the configuration file and, by default, REMOTE's state
+directory `.autoforge`; a clean-up of the working tree must keep both.
+
+`sandbox.mode: preferred` stays an accepted value and now means `required`
+everywhere: its fallback to logical isolation existed only in LOCAL. No
+REMOTE launch changes, and a REMOTE run pinned to `preferred` compares as
+before.
+
+### The state file is protocol 13, without LOCAL's twelve fields (#388)
+
+**Behaviour change:** with LOCAL's code gone (ADR 0009), the state file
+is protocol 13 and `status --json` loses twelve keys:
+`feature_spec_path`, `feature_spec_sha256`, `base_head_sha`,
+`base_branch`, `local_run_contract`, `workspace_fingerprint`,
+`reviewed_workspace_fingerprint`, `local_fix_rounds`,
+`local_pending_phase`, `local_pending_fingerprint`,
+`local_pending_attempts` and `baseline_dirty_paths`. They were LOCAL
+mode's, and a REMOTE run always held them empty. `mode` stays, always
+`"REMOTE"`. Nothing else in the file changes.
+
+- A REMOTE state file of an earlier protocol loads as before when each of
+  the twelve is absent or empty (`""`, `0`, `{}` or `[]`), as every REMOTE
+  run saved them. Loading it writes nothing; its next save writes
+  protocol 13 without them.
+- A file of an earlier protocol with any of the twelve not empty is
+  refused and left as it was. Only LOCAL wrote such a value, so the file
+  is hand-edited or foreign. Protocol 12 refused only a non-empty
+  `local_run_contract` or `local_pending_*`.
+- A protocol-13 or unlabelled file carrying any of the twelve, even
+  empty, is refused as carrying an unknown field.
+- A LOCAL state is refused by its mode under every protocol, 13 included,
+  before any of this (#387).
+- An older AutoForge refuses a protocol-13 file.
+
 ### The outer sandbox says why a kernel lacks the Landlock scope, not only that it does (#349)
 
 - A host whose kernel did not report a Landlock ABI was told "the kernel's

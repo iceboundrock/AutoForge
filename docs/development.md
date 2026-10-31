@@ -19,18 +19,21 @@ make lock-check   # uv lock --check (what CI's `uv sync --locked` enforces)
 make check        # lock-check + the four CI commands, on the local interpreter
 make check-matrix # pytest on every CI Python (3.11, 3.12), opt-in
 make test-parallel # pytest on 4 pytest-xdist workers, opt-in, not a gate
+make test-fast    # the tests the changed paths map to, feedback only, not a gate
 make test-sandbox # the real-backend sandbox tests; fail (not skip) without a backend
 make test-sandbox-measured # what CI's `sandbox` job runs: measure, then require where capable
 make dist-check   # what CI's `dist` job runs: build, check, install and run the artifacts
 ```
 
 Run `make check` before declaring a change complete, and `make check-matrix`
-when a change could be interpreter-sensitive. Run `make test-sandbox` too
-when a change touches the outer sandbox (`sandbox*.py`, the executor, a
-provider's declaration, the engine's launch routing), and `make dist-check`
-when a change touches packaging, a resource the package reads at runtime
-(a prompt template), or the command line's entry point
-([The built distributions](#the-built-distributions)).
+when a change could be interpreter-sensitive. `make test-fast` is for
+feedback while working and replaces neither
+([Fast feedback while working](#fast-feedback-while-working)). Run
+`make test-sandbox` too when a change touches the outer sandbox
+(`sandbox*.py`, the executor, a provider's declaration, the engine's launch
+routing), and `make dist-check` when a change touches packaging, a resource
+the package reads at runtime (a prompt template), or the command line's
+entry point ([The built distributions](#the-built-distributions)).
 
 The distribution is named `autoforge-cli`; the import package and the
 command are `autoforge`. A `.venv` made before the rename still lists the
@@ -38,31 +41,24 @@ old name: `make sync` replaces it.
 
 ## The live Pi smoke test
 
-`tests/test_live_pi.py` (#135) holds the only tests that call a real agent
-and a real model, one REVIEW each through the operator's own Pi and the
-credential the operator gave it:
-`test_one_local_review_runs_on_the_operators_real_pi` on a LOCAL run, and
-`test_one_remote_review_runs_on_the_operators_real_pi` on a REMOTE run
-against a GitHub stand-in (the suite's in-memory fake and a bare repository
-in the test's temporary directory), which needs no `gh` login and writes
-nothing to GitHub. The REMOTE test exists because LOCAL
-mode is being removed (EPIC #383, ADR 0009 Appendix A.2.3 G): it is the
-live flow that stays. Both take the auth route named by
-`AUTOFORGE_LIVE_PI_AUTH`: `api_key` (DeepSeek first, with
+`tests/test_live_pi.py` (#135) holds the only test that calls a real agent
+and a real model: `test_one_remote_review_runs_on_the_operators_real_pi`
+runs one REVIEW through the operator's own Pi and the credential the
+operator gave it, on a REMOTE run against a GitHub stand-in (the suite's
+in-memory fake and a bare repository in the test's temporary directory),
+which needs no `gh` login and writes nothing to GitHub. It takes the auth
+route named by `AUTOFORGE_LIVE_PI_AUTH`: `api_key` (DeepSeek first, with
 `require_oauth: false`; the acceptance run) or `oauth` (the ChatGPT
-sign-in; an optional regression run). They are opt-in twice over, so
-`make check` and CI never run them and stay offline:
+sign-in; an optional regression run). It is opt-in twice over, so
+`make check` and CI never run it and stay offline:
 
 - `pyproject.toml` registers a `live` marker and adds `-m 'not live'` to
-  pytest's default options, so a default run deselects them (they are
-  collected and deselected, never run). Passing `-m live` selects them,
-  since a later `-m` wins.
-- Selected, each skips with its reason unless `AUTOFORGE_LIVE_PI=1`. Any
+  pytest's default options, so a default run deselects it (it is collected
+  and deselected, never run). Passing `-m live` selects it, since a later
+  `-m` wins.
+- Selected, it skips with its reason unless `AUTOFORGE_LIVE_PI=1`. Any
   other non-empty value fails rather than being read as "no". It then
   fails unless `AUTOFORGE_LIVE_PI_AUTH` names a route: it has no default.
-
-Name the test to run, since the file alone runs both and spends two
-REVIEWs:
 
 ```bash
 AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live \
@@ -71,19 +67,17 @@ AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live \
 
 The prerequisites (Pi installed and given its credential by you,
 `OPENAI_API_KEY` and `DEEPSEEK_API_KEY` unset unless one is forwarded on
-purpose), the seven steps, what the REMOTE test does differently (its
-doctor's GitHub rows fail against the stand-in by construction, and only
-its Pi rows count), the cost (one small REVIEW of the account's quota per
-test) and what neither test ever does are in the
+purpose), the seven steps (its doctor's GitHub rows fail against the
+stand-in by construction, and only its Pi rows count), the cost (one small
+REVIEW of the account's quota) and what the test never does are in the
 [Pi operator guide](pi.md#prove-it-on-your-machine-the-live-smoke-test).
-A report names the AutoForge commit, the route and the `authType` (and,
-for REMOTE, the mode and the stand-in) and carries no key or account
+A report names the AutoForge commit, the route, the `authType` and what
+the controller wrote to the stand-in, and carries no key or account
 detail; post it on #135 as the evidence of a run.
 `tests/test_live_pi_support.py` runs in `make check`: it checks the
 deselection in a pytest process of its own, the route settings, the
-credential scan and the other checks, and rehearses both flows, LOCAL and
-REMOTE, on both routes against the fake `pi`, with one REMOTE rehearsal for
-each LOCAL one.
+credential scan and the other checks, and rehearses the flow on both
+routes against the fake `pi`.
 
 ## The operator-comment byte-fidelity capture
 
@@ -220,13 +214,10 @@ credential:
    installed package (never the checkout), checks that the prompt templates
    on disk are exactly the registered ones, and renders every one of them
    the way the engine does, each phase template with its common template;
-6. runs a LOCAL dry run (`autoforge local init`, then
-   `autoforge local run ... --dry-run --full-prompt`) in a scratch
-   repository and checks it rendered the prompt, wrote no state and changed
-   nothing but the feature file, then a REMOTE dry run (`autoforge run
-   --epic ... --issue ... --dry-run --full-prompt`) in another, with a fake
-   `gh` first on `PATH` that records any call, and checks it rendered the
-   ANALYZE_EXECUTE prompt, called no `gh` and left the repository
+6. runs a REMOTE dry run (`autoforge run --epic ... --issue ...
+   --dry-run --full-prompt`) in a scratch repository, with a fake `gh`
+   first on `PATH` that records and fails any call, and checks it rendered
+   the ANALYZE_EXECUTE prompt, called no `gh` and left the repository
    byte-identical;
 7. runs the offline half of [Getting started](getting-started.md) (#259):
    `uv tool install` of the wheel alone (`--offline --no-index`), into tool
@@ -465,6 +456,50 @@ agrees with git's). `tests/test_safefs.py`'s
 stand-in from hiding an error a real flush would raise. Each change reverts
 on its own; the stand-in is the one to revert if a defect turns up that
 only a real flush in the test process would have caught.
+
+## Fast feedback while working
+
+`make test-fast` runs the test modules that the paths you changed map to,
+so a change gets feedback in seconds to a minute or two rather than after
+the whole suite (535 seconds serially at a4bc60c on Python 3.14 and host
+B of [The suite on several workers](#the-suite-on-several-workers)). The
+changed paths are what your commits, your index and your worktree changed
+since the merge base with `FAST_BASE` (`main` by default), each compared
+on its own so that one undoing another's change hides neither, and your
+untracked files; `FAST_PYTEST_ARGS` reach pytest:
+
+```bash
+make test-fast
+make test-fast FAST_BASE=origin/main FAST_PYTEST_ARGS="-n 4 -x"
+uv run python -m tests.fast_targets src/autoforge/evidence.py   # what it would select, and why
+```
+
+`tests/fast_targets.py` holds the mapping. A test module selects itself
+and every test module that imports it; a path with an entry selects the
+entry's test modules and every test module that imports its module; a
+module almost every test runs through (`engine.py`, `state.py`,
+`config.py`, the prompt templates, conftest and a few more) selects the
+whole suite, and so does any path without an entry (`pyproject.toml`, a
+document, a new module). A selection holding the live tests
+(`tests/test_live_pi.py`), which the default options deselect, holds
+their offline tests too, and never runs the live ones. On the same host
+and commit, a change to `tests/test_evidence.py` ran in 3 seconds when it
+selected itself alone (it now selects `test_certificate.py` too, which
+imports its helpers), one to
+`src/autoforge/scheduler.py` in 72 (four modules that wait on purpose),
+and one to `src/autoforge/evidence.py` in 125 (ten modules,
+`test_engine.py` among them). `tests/test_fast_targets.py` fails when a
+file under `src/autoforge/` or a helper module under `tests/` has no
+entry, so a new module needs one.
+
+A FAST run is feedback, never evidence
+([ADR 0010](adr/0010-fast-feedback-and-full-validation-evidence.md)). It
+selects where a regression is likely to show first, not every test that
+can observe a module: a test that reaches a module through the engine does
+not import it, so a change can pass `make test-fast` and fail the full
+suite. `make check`, `make check-matrix` and CI never run it, and the
+controller neither runs nor reads it: its `validation.commands`, the merge
+gate and the required `ci` check decide as before.
 
 ## Continuous integration
 

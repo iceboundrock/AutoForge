@@ -487,18 +487,13 @@ def _check_regular_fd(fd: int, flags: int, *, label: str) -> None:
         os.ftruncate(fd, 0)
 
 
-def readlink_at(dir_fd: int, name: str) -> str:
-    """Read a symbolic link's target text beneath ``dir_fd``."""
-    return os.readlink(name, dir_fd=dir_fd)
-
-
 @dataclass
 class WalkEntry:
     """One entry produced by :meth:`SafeRoot.walk`.
 
     ``dir_fd`` is the descriptor of the entry's *parent* directory and is
-    valid only until the walk advances; use it with :func:`open_regular_at` or
-    :func:`readlink_at` while handling the entry, never afterwards.  Set
+    valid only until the walk advances; use it with :func:`open_regular_at`
+    while handling the entry, never afterwards.  Set
     :attr:`skip` on a directory entry to stop the walk descending into it.
     """
 

@@ -1,4 +1,4 @@
-.PHONY: test test-parallel test-sandbox test-sandbox-measured lint typecheck fmt fmt-check lock-check check check-matrix dist-check sync lock
+.PHONY: test test-parallel test-fast test-sandbox test-sandbox-measured lint typecheck fmt fmt-check lock-check check check-matrix dist-check sync lock
 
 # The interpreters the hosted CI matrix runs `pytest` on (`python-version:`
 # in .github/workflows/ci.yml). tests/test_ci_workflow.py fails when the two
@@ -32,6 +32,17 @@ test:
 PYTEST_WORKERS ?= 4
 test-parallel:
 	uv run pytest -n $(PYTEST_WORKERS) --dist=load
+
+# Feedback while working, never a gate (ADR 0010): the test modules that the
+# paths changed since the merge base with FAST_BASE map to
+# (tests/fast_targets.py), or the full suite as soon as one of them maps to
+# it. It says what it selected and why. A FAST pass is no evidence: `check`,
+# `check-matrix` and CI never run this, and tests/test_fast_targets.py keeps
+# it that way. FAST_PYTEST_ARGS reach pytest, e.g. FAST_PYTEST_ARGS="-n 4 -x".
+FAST_BASE ?= main
+FAST_PYTEST_ARGS ?=
+test-fast:
+	uv run python -m tests.fast_targets --base $(FAST_BASE) --run -- $(FAST_PYTEST_ARGS)
 
 # The tests that launch the real outer-sandbox backend (bubblewrap), on a host
 # that must be able to enforce it: each skips with the probe's reason

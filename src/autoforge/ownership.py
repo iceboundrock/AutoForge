@@ -47,7 +47,7 @@ from .run_namespace import StateStatus, issue_namespace, load_issue_namespace
 from .safefs import SafeRoot
 from .scheduler_state import load_claim_file
 from .state import STATE_FILENAME, load_state
-from .transitions import Phase, WorkflowMode
+from .transitions import Phase
 from .validation import parse_issue_url
 
 # A reason quotes a loader's or a probe's message: redacted, then bounded.
@@ -198,9 +198,10 @@ def standalone_hold(state_dir: str | Path) -> StandaloneHold:
 
     ``state_dir`` is the configured one (``config.state_dir``); other
     ``--state-dir`` locations are unknowable, and the forward guard refuses
-    to continue them instead. An absent state, a ``DONE`` state, a LOCAL
-    state and a state naming no issue hold nothing. Nothing is created,
-    quarantined or written.
+    to continue them instead. An absent state, a ``DONE`` state and a state
+    naming no issue hold nothing; one that does not load, a LOCAL one among
+    them (ADR 0009 D4), holds nothing either and is the hold's ``problem``.
+    Nothing is created, quarantined or written.
     """
     state_file = Path(state_dir) / STATE_FILENAME
     try:
@@ -224,7 +225,7 @@ def standalone_hold(state_dir: str | Path) -> StandaloneHold:
             if gone:
                 return StandaloneHold(state_file)
             return StandaloneHold(state_file, problem=_bounded(str(exc)))
-    if state.mode is WorkflowMode.LOCAL or state.phase is Phase.DONE:
+    if state.phase is Phase.DONE:
         return StandaloneHold(state_file, phase=state.phase.value)
     if not state.current_issue_url:
         return StandaloneHold(state_file, phase=state.phase.value)

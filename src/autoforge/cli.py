@@ -22,8 +22,6 @@ Commands:
           operator actions (#243)
   status  show the persisted run summary (--json for machine output; --action
           prints an acceptance or operator action's exact payload)
-  local   LOCAL mode: feature Markdown -> implement -> review -> fix -> DONE,
-          with no GitHub involved at any point (init / run / doctor)
   epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
           --dry-run and --force), resume, status (lock-free, --json), stop
           (lock-free, --now) and archive; every 'epic' command refuses
@@ -52,7 +50,7 @@ from .certificate import NOT_A_PERMISSION
 from .certificate import describe as describe_certificate
 from .config import MAX_PARALLEL_BOUNDS, AutoForgeConfig, load_config_file
 from .config_fingerprint import RecordedConfiguration
-from .doctor import CheckResult, run_doctor, run_local_doctor
+from .doctor import CheckResult, run_doctor
 from .effects import (
     AUTHORIZATION_POLICY,
     MAX_EFFECT_ATTEMPTS,
@@ -93,9 +91,7 @@ from .errors import (
 )
 from .evidence import (
     MAX_FAILURE_COUNT,
-    LocalCandidate,
     Outcome,
-    RemoteCandidate,
     parse_marker,
     record_summary,
 )
@@ -115,7 +111,6 @@ from .interaction import (
     Unavailable,
     UnavailableReason,
 )
-from .local_workspace import init_feature_file
 from .locking import ControllerLock, repository_lock_path
 from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
 from .redaction import redact, redact_argv, redact_dict, redact_obj
@@ -127,7 +122,7 @@ from .scheduler import EpicScheduler, SchedulerInputs
 from .scheduler_stop import StopMode
 from .sdk_policy import MAX_ANSWER_CHARS
 from .state import AutoForgeState
-from .transitions import TERMINAL_PHASES, Phase, WorkflowMode
+from .transitions import TERMINAL_PHASES, Phase
 from .validation import parse_issue_url
 
 
@@ -304,7 +299,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    _add_local_parser(sub)
     _add_epic_parser(sub)
     return p
 
@@ -321,69 +315,6 @@ def _add_accept_config_change(parser: argparse.ArgumentParser) -> None:
             "(#219, #280)"
         ),
     )
-
-
-def _add_local_parser(sub) -> None:
-    """`autoforge local ...`: the GitHub-free workflow.
-
-    ``status``/``step``/``resume`` stay mode-agnostic (they read the mode from
-    persisted state), so only the commands that *differ* live here.
-    """
-    loc = sub.add_parser(
-        "local",
-        help="local mode: drive a feature Markdown file with no GitHub involved",
-        description=(
-            "LOCAL mode: features/<slug>.md -> ANALYZE_EXECUTE -> REVIEW -> FIX -> "
-            "REVIEW -> DONE, entirely in the working tree. No gh, no PR, no push, "
-            "no merge, no commits. Use 'autoforge status/step/resume' as usual."
-        ),
-    )
-    lsub = loc.add_subparsers(dest="local_command", required=True)
-
-    li = lsub.add_parser("init", help="create features/<slug>.md from the template")
-    li.add_argument("slug", help="feature slug, e.g. add-transaction-filter")
-    li.add_argument(
-        "--feature-dir",
-        default=None,
-        help="directory for the file (default: config local.feature_dir)",
-    )
-    li.add_argument(
-        "--force",
-        action="store_true",
-        help="overwrite an existing feature file (refused by default)",
-    )
-
-    lr = lsub.add_parser(
-        "run", help="create a local run from a feature Markdown file and advance it"
-    )
-    lr.add_argument("feature", help="path to the feature Markdown file (inside this repository)")
-    lr.add_argument("--dry-run", action="store_true", help="plan only; no side effects")
-    lr.add_argument(
-        "--force",
-        action="store_true",
-        help="discard an existing non-terminal run (see 'run --force')",
-    )
-    lr.add_argument(
-        "--max-steps", type=_positive_int, default=50, help="steps for this invocation (>= 1)"
-    )
-    lr.add_argument(
-        "--allow-dirty",
-        action="store_true",
-        help=(
-            "start even though the working tree has changes other than the feature file; "
-            "they are recorded in the run and reported to the reviewer, never treated as "
-            "part of the implementation"
-        ),
-    )
-    lr.add_argument(
-        "--full-prompt", action="store_true", help="print full rendered prompt in dry-run"
-    )
-
-    ld = lsub.add_parser(
-        "doctor", help="check config/git/agent CLIs for local mode (never touches GitHub)"
-    )
-    ld.add_argument("--json", action="store_true", dest="as_json")
-    ld.add_argument("--feature", default=None, help="also validate this feature Markdown path")
 
 
 def _add_epic_parser(sub) -> None:
@@ -561,15 +492,6 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(args)
         if args.command == "epic":
             return cmd_epic(args)
-        if args.command == "local":
-            if args.local_command == "init":
-                return cmd_local_init(args)
-            if args.local_command == "run":
-                return cmd_local_run(args)
-            if args.local_command == "doctor":
-                return cmd_local_doctor(args)
-            parser.error(f"unknown local command {args.local_command}")
-            return 2
         parser.error(f"unknown command {args.command}")
         return 2
     except (ConfigurationError, StateError, StateTransitionError, LockError) as exc:
@@ -620,53 +542,6 @@ def _check_configuration(engine: ControllerEngine, args, *words: str, dry_run: b
         print(redact(f"autoforge: {notice}"), file=sys.stderr)
 
 
-def _local_engine_for(args, cfg: AutoForgeConfig | None = None) -> ControllerEngine:
-    """An engine for a LOCAL command, with its state directory resolved.
-
-    LOCAL state never lives in the reviewed working tree; see
-    :meth:`ControllerEngine.bind_local_state_dir`.
-    """
-    engine = _engine_for(args, cfg)
-    engine.bind_local_state_dir(args.state_dir)
-    return engine
-
-
-def _bind_existing_run(engine: ControllerEngine) -> None:
-    """Resolve which run a mode-agnostic command (`resume`, `step`, `status`) means.
-
-    A REMOTE run keeps its state under `config.state_dir` (`.autoforge` by
-    default); a LOCAL run keeps it in the git directory, because the LOCAL
-    fingerprint covers the working tree. The two locations are disjoint and
-    the mode is not known until state is read, so the command looks for a
-    `state.json` in both. Exactly one match is used. Two matches is a real
-    ambiguity and is refused rather than resolved by precedence: picking one
-    would silently `resume` the wrong workflow. Zero matches leaves the
-    configured location so the error names it.
-
-    `--state-dir` is an answer to this question, so it is never second-guessed
-    (the caller does not reach here when it was given).
-    """
-    configured = engine.paths
-    try:
-        local = engine.local_state_paths()
-    except (AutoForgeError, OSError):
-        # Not a git repository (or git is unusable): only the configured
-        # location can hold a run, and any real problem surfaces there.
-        return
-    if os.path.abspath(local.state_dir) == os.path.abspath(configured.state_dir):
-        return
-    here = os.path.lexists(configured.state_file)
-    there = os.path.lexists(local.state_file)
-    if here and there:
-        raise StateError(
-            f"two runs exist: a remote-style one at {configured.state_file} and a local "
-            f"one at {local.state_file}. Pass --state-dir to say which one this command "
-            "means; the controller will not pick for you."
-        )
-    if there:
-        engine.paths = local
-
-
 def _guard_scheduler_ownership(
     engine: ControllerEngine, state: AutoForgeState, command: str
 ) -> None:
@@ -677,11 +552,8 @@ def _guard_scheduler_ownership(
     ``current_issue_url``, then hands the engine the same predicate, which
     ``_verify_issue_selectable`` applies to every issue it is asked about
     (``next_issue_url`` included). ``unblock`` of a namespace's own state
-    directory exempts that namespace. LOCAL runs name no issue and are not
-    checked.
+    directory exempts that namespace.
     """
-    if state.mode is WorkflowMode.LOCAL:
-        return
     root = engine.coordination_root()
     exempt = (
         namespace_issue_of_state_dir(engine.paths.state_dir, root) if command == "unblock" else None
@@ -690,24 +562,32 @@ def _guard_scheduler_ownership(
     engine.issue_ownership = standalone_ownership_predicate(root, exempt_issue=exempt)
 
 
-def _bind_standalone_run(engine: ControllerEngine, args, command: str) -> None:
-    """:func:`_bind_existing_run` for a standalone ``step`` or ``resume`` (ADR 0008 D17.3).
+def _refuse_scheduler_state_dir(engine: ControllerEngine, args, command: str) -> None:
+    """ADR 0008 D17.3 for a standalone ``step`` or ``resume``: before the lock.
 
     The state directory this invocation names (``--state-dir`` or
-    ``config.state_dir``) is judged before the binding looks for a run in it
-    or in LOCAL's location: one inside the scheduler root that holds no
-    ``state.json`` would otherwise give way to a LOCAL run's, and the command
-    would continue that run instead of refusing. The directory bound is
-    judged again. Both before the lock and before any state is read; a dry
-    run is judged by neither (:meth:`ControllerEngine.refuse_scheduler_state_dir`).
+    ``config.state_dir``) is the only one the command reads, and one inside
+    the scheduler root is a namespace's, so it is refused before the lock is
+    taken and before any state is read. A dry run is not judged
+    (:meth:`ControllerEngine.refuse_scheduler_state_dir`).
     """
     if not args.dry_run:
         engine.refuse_scheduler_state_dir(command)
-    if args.state_dir:
-        return
-    _bind_existing_run(engine)
-    if not args.dry_run:
-        engine.refuse_scheduler_state_dir(command)
+
+
+def _refuse_unloadable_state_before_the_lock(engine: ControllerEngine) -> None:
+    """Load the state once before the lock, only to refuse one that does not load.
+
+    Taking the controller lock creates ``controller.lock`` or rewrites its
+    PID record, and that file lies in the state directory when the state
+    directory is the lock's own (``--state-dir <git common dir>/autoforge``).
+    A refusal needs no lock and writes nothing, so a missing state and one
+    that does not load, a LOCAL one among them (ADR 0009 D4, D8), are
+    refused before the lock is taken and leave the directory as it was. The
+    snapshot decides nothing else: ``step``, ``resume`` and ``unblock`` read
+    the state again under the lock and act on that one alone.
+    """
+    engine.load()
 
 
 def _doctor_runner():
@@ -723,17 +603,6 @@ def cmd_doctor(args) -> int:
         epic_url=args.epic,
     )
     return _report_checks(results, args.as_json, "AutoForge doctor (read-only checks)")
-
-
-def cmd_local_doctor(args) -> int:
-    """`autoforge local doctor`: no gh, no gh auth, no 'origin' remote."""
-    results = run_local_doctor(
-        config_path=args.config,
-        state_dir=args.state_dir,
-        runner=_doctor_runner(),
-        feature_spec_path=args.feature,
-    )
-    return _report_checks(results, args.as_json, "AutoForge doctor — local mode (read-only checks)")
 
 
 def _report_checks(results: list[CheckResult], as_json: bool, title: str) -> int:
@@ -1224,10 +1093,10 @@ def _discard_typeahead(fd: int) -> None:
 class TerminalResolver:
     """Asks the operator at this terminal (ADR 0007 D5.1, D7.4, D7.7; #134).
 
-    The engine's resolver for a real ``run``, ``local run``, ``step`` and
-    ``resume``. It reads stdin and shows the request on stderr, where the
-    live progress is, when stderr is a terminal; stdout stays the step
-    outcomes'. A redirected stderr (a pipe, a file) or none at all is never
+    The engine's resolver for a real ``run``, ``step`` and ``resume``. It
+    reads stdin and shows the request on stderr, where the live progress
+    is, when stderr is a terminal; stdout stays the step outcomes'. A
+    redirected stderr (a pipe, a file) or none at all is never
     written to: the request is shown on the terminal it reads instead
     (:func:`_shown_on`). Before it asks it checks that stdin is a terminal
     (D7.4) and drops anything typed ahead. While it asks it edits the line
@@ -1487,15 +1356,17 @@ def _existing_run_guard(
 ) -> tuple[int | None, bool]:
     """Decide whether a fresh run may overwrite the run at ``engine.paths``.
 
-    Returns ``(exit_code_or_None, corrupt)``. Must be called with the
-    controller lock held: a verdict taken before the lock could go stale.
+    Returns ``(exit_code_or_None, corrupt)``. A verdict that lets the run
+    go ahead must be taken with the controller lock held: one taken before
+    the lock could go stale. A refusal writes nothing, so ``run`` also asks
+    once before it takes the lock, and returns at once when refused (#387).
     The inspection goes through the engine's held state root -- the same
     capability the first save and every later write will use -- so the
     directory that is inspected is the directory that is written.
 
     ``command`` is the subcommand the operator actually typed, so the advice
-    names a command that can be copied (`run --force`, `local run --force`)
-    rather than a bare flag.
+    names a command that can be copied (`run --force`) rather than a bare
+    flag.
     """
     paths = engine.paths
     try:
@@ -1569,6 +1440,12 @@ def cmd_run(args) -> int:
     # A state directory inside the scheduler root is a namespace's, never a
     # standalone run's (ADR 0008 D17.3); refused before the lock is taken.
     engine.refuse_scheduler_state_dir("run")
+    # A run the state already there refuses is refused before the lock too:
+    # the refusal writes nothing, and taking the lock would write its PID
+    # record in the state directory when that is the lock's own (#387).
+    rc, _ = _existing_run_guard(engine, args.force)
+    if rc is not None:
+        return rc
     # Inspect, decide, quarantine, write the first state AND execute under
     # one continuous lock: a verdict taken before the lock could go stale
     # (another controller may have repaired, replaced or created state.json
@@ -1601,84 +1478,9 @@ def cmd_run(args) -> int:
     return _finish(engine, outcomes, args.allow_merge, printed=True)
 
 
-def cmd_local_init(args) -> int:
-    """Create features/<slug>.md under the repository lock. No --force, no overwrite.
-
-    The controller lock covers this the same way it covers `local run`. A
-    feature specification is not a scratch file: a run freezes its SHA-256 and
-    re-checks it around every phase, so `local init --force` racing an active
-    run could rewrite the specification while the controller was hashing it,
-    rendering it into a prompt or verifying it — which is precisely the
-    "an agent cannot rewrite its own acceptance criteria" guarantee, undone
-    from the operator's side. One controller at a time owns the repository,
-    and creating this file is a controller write like any other.
-    """
-    cfg = _load_cfg(args)
-    engine = _local_engine_for(args, cfg)
-    with engine.locked():
-        path = init_feature_file(
-            engine.local_workspace(),
-            args.slug,
-            feature_dir=args.feature_dir or cfg.local.feature_dir,
-            overwrite=args.force,
-        )
-    rel = os.path.relpath(path, os.getcwd())
-    print(f"Created {rel}")
-    print()
-    print("Next:")
-    print(f"  1. Describe the feature in {rel} (problem, requirements, acceptance criteria).")
-    print(f"  2. autoforge local run {rel}")
-    print()
-    print("The specification is frozen (SHA-256) when the run starts: edit it before, not during.")
-    return 0
-
-
-def cmd_local_run(args) -> int:
-    """Create a LOCAL run from a feature Markdown file and advance it.
-
-    Mirrors ``cmd_run`` minus everything GitHub: no EPIC, no issue, no merge
-    gate. The engine never constructs a GitHubClient for a LOCAL run.
-    """
-    cfg = _load_cfg(args)
-    engine = _local_engine_for(args, cfg)
-
-    if args.dry_run:
-        # Fully side-effect-free: in-memory state, plan printed, nothing
-        # written, no agent invoked and no validation command executed.
-        engine.new_local_run(args.feature, allow_dirty=args.allow_dirty)
-        engine.validate_config()
-        outcomes = engine.run(max_steps=args.max_steps, dry_run=True)
-        for o in outcomes:
-            assert o.plan is not None
-            print_plan(o.plan, full_prompt=args.full_prompt)
-        return 0
-
-    engine.refuse_scheduler_state_dir("local run")
-    # One continuous lock over inspect -> decide -> first save -> execute,
-    # for the same reasons as `cmd_run`.
-    with engine.locked():
-        rc, corrupt = _existing_run_guard(engine, args.force, "local run")
-        if rc is not None:
-            return rc
-        engine.new_local_run(args.feature, allow_dirty=args.allow_dirty)
-        engine.validate_config()
-        assert engine.state is not None
-        # The sandbox mode later commands of the run are held to (#280).
-        engine.record_run_configuration()
-        if corrupt:
-            moved = engine.quarantine_state()
-            print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
-        engine.save()
-        _attach_terminal(engine)
-        outcomes = engine.run(
-            max_steps=args.max_steps, dry_run=False, on_outcome=_print_outcome_now
-        )
-    return _finish(engine, outcomes, allow_merge=False, printed=True)
-
-
 def cmd_step(args) -> int:
     engine = _engine_for(args)
-    _bind_standalone_run(engine, args, "step")
+    _refuse_scheduler_state_dir(engine, args, "step")
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
@@ -1688,6 +1490,7 @@ def cmd_step(args) -> int:
         if outcome.plan is not None:
             print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
+    _refuse_unloadable_state_before_the_lock(engine)
     # Load and execute under one lock: a snapshot loaded before the lock
     # could already have been replaced by another controller.
     with engine.locked():
@@ -1702,7 +1505,7 @@ def cmd_step(args) -> int:
 
 def cmd_resume(args) -> int:
     engine = _engine_for(args)
-    _bind_standalone_run(engine, args, "resume")
+    _refuse_scheduler_state_dir(engine, args, "resume")
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
@@ -1715,6 +1518,7 @@ def cmd_resume(args) -> int:
             assert o.plan is not None
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
+    _refuse_unloadable_state_before_the_lock(engine)
     # Load, decide and execute under one lock: a snapshot loaded before the
     # lock could already have been replaced by another controller.
     with engine.locked():
@@ -1743,8 +1547,6 @@ def cmd_unblock(args) -> int:
     here: the operator reviews the outcome and runs ``resume``.
     """
     engine = _engine_for(args)
-    if not args.state_dir:
-        _bind_existing_run(engine)
     approve = str(getattr(args, "approve_action", "") or "")
     raw_decline = getattr(args, "decline_action", None) or []
     decline = [raw_decline] if isinstance(raw_decline, str) else [str(d) for d in raw_decline]
@@ -1765,6 +1567,7 @@ def cmd_unblock(args) -> int:
         )
         print_unblock_outcome(outcome)
         return 0
+    _refuse_unloadable_state_before_the_lock(engine)
     # Load, decide and write under one lock, like `step`. An accepted
     # configuration change is its own recorded write, made before the
     # decision: a refused unblock leaves it in place.
@@ -1818,7 +1621,7 @@ def _resume_holding_state(
         how = (
             "and run 'autoforge unblock --reason ...' to have the controller re-inspect "
             "GitHub and re-enter a phase, or start a new run"
-            if state.phase == Phase.BLOCKED and state.mode != WorkflowMode.LOCAL
+            if state.phase == Phase.BLOCKED
             else "and start a new run"
         )
         print(
@@ -1983,10 +1786,11 @@ def cmd_epic_status(args) -> int:
 
 
 def _epic_repository_id(args) -> Callable[[str], int]:
-    """GitHub's numeric id of a repository, as ``epic stop`` and ``epic archive`` read it.
+    """GitHub's numeric id of a repository, as ``epic stop`` reads it.
 
-    Called once a ``scheduler.json`` or a binding is found to compare with,
-    so the configuration is loaded then.
+    Called once a ``scheduler.json`` is found to compare with, so the
+    configuration is loaded then; ``epic stop`` writes nothing before.
+    ``epic archive`` loads it before it takes L0 (:func:`cmd_epic_archive`).
     """
 
     def read(repository: str) -> int:
@@ -2008,12 +1812,22 @@ def cmd_epic_stop(args) -> int:
 
 
 def cmd_epic_archive(args) -> int:
-    """``epic archive``: under L0 (a held one is exit 2); GitHub is read for the binding's id."""
+    """``epic archive``: under L0 (a held one is exit 2); GitHub is read for the binding's id.
+
+    The configuration is loaded before L0 is taken, since taking it writes
+    the lock file's holder record: a refused configuration leaves the lock
+    file as it was, or absent. GitHub is still read only once a binding is
+    found to compare with.
+    """
     epic = parse_issue_url(args.epic)
+    cfg = _load_cfg(args)
     lock_path = repository_lock_path(os.getcwd())
     with ControllerLock(lock_path):
         report = archive_issue(
-            lock_path.parent.parent, epic.canonical, args.issue, _epic_repository_id(args)
+            lock_path.parent.parent,
+            epic.canonical,
+            args.issue,
+            lambda repository: _epic_graph(cfg).get_repository_id(repository),
         )
     for line in report.lines():
         print(line)
@@ -2022,8 +1836,6 @@ def cmd_epic_archive(args) -> int:
 
 def cmd_status(args) -> int:
     engine = _engine_for(args)
-    if not args.state_dir:
-        _bind_existing_run(engine)
     state = engine.load()  # StateError when missing/corrupt
     if getattr(args, "action", ""):
         return _print_action_payload(state, args.action)
@@ -2035,10 +1847,10 @@ def cmd_status(args) -> int:
     # both output modes cross the same redaction boundary as the run log.
     certificate = _review_certificate_check(engine, state)
     if args.as_json:
-        # to_dict() already carries "mode" plus the local fields, so the JSON
-        # shape stays additive for remote consumers; `replan_journal` and
-        # `acceptance_actions` are derived beside the raw fields, never
-        # merged into them.
+        # to_dict() carries "mode" and every persisted field; protocol 13
+        # removed LOCAL's twelve fields from it (#388, ADR 0009 D8, D10).
+        # `replan_journal` and `acceptance_actions` are derived beside the
+        # raw fields, never merged into them.
         document = {
             **state.to_dict(),
             "replan_journal": _replan_journal_summary(txn),
@@ -2047,9 +1859,7 @@ def cmd_status(args) -> int:
             "review_certificate_status": _review_certificate_status(state, certificate),
             "outer_sandbox": {
                 "mode": engine.config.sandbox.mode,
-                "summary": sandbox_mode_summary(
-                    engine.config.sandbox, state.mode == WorkflowMode.LOCAL
-                ),
+                "summary": sandbox_mode_summary(engine.config.sandbox),
             },
         }
         print(json.dumps(redact_dict(document), indent=2, sort_keys=True))
@@ -2057,9 +1867,6 @@ def cmd_status(args) -> int:
     evidence = _render_outer_sandbox(state, engine.config) + _render_validation_evidence(
         state, engine.config, certificate
     )
-    if state.mode == WorkflowMode.LOCAL:
-        print(redact(_render_local_status(state, txn, evidence)))
-        return 0
     if engine.state_dir_in_scheduler_root() and not engine.continue_command:
         # A scheduler namespace's run (ADR 0008 D17.3) is continued by the
         # scheduler, as a worker names it: a standalone 'resume' refuses it.
@@ -2078,15 +1885,14 @@ _STATUS_TAIL_CHARS = 200
 def _render_outer_sandbox(state: AutoForgeState, config: AutoForgeConfig) -> list[str]:
     """``sandbox.mode`` for ``status`` (ADR 0005 D12.4): configuration only, no probe.
 
-    A mode that may fall back says so; a ``disabled`` run reads "logical
-    isolation only". Whether this host can enforce is ``doctor``'s to show.
+    A ``disabled`` run reads "logical isolation only". Whether this host
+    can enforce is ``doctor``'s to show.
     """
-    local = state.mode == WorkflowMode.LOCAL
-    summary = sandbox_mode_summary(config.sandbox, local)
-    return ["", "Outer sandbox:", f"  {summary}", f"  {_sandbox_pin_line(state, config, local)}"]
+    summary = sandbox_mode_summary(config.sandbox)
+    return ["", "Outer sandbox:", f"  {summary}", f"  {_sandbox_pin_line(state, config)}"]
 
 
-def _sandbox_pin_line(state: AutoForgeState, config: AutoForgeConfig, local: bool) -> str:
+def _sandbox_pin_line(state: AutoForgeState, config: AutoForgeConfig) -> str:
     """The run's sandbox pin (#280) for ``status``, and whether this configuration keeps it."""
     if not state.sandbox_pin:
         return (
@@ -2095,7 +1901,7 @@ def _sandbox_pin_line(state: AutoForgeState, config: AutoForgeConfig, local: boo
         )
     pin = SandboxPin.from_dict(state.sandbox_pin)
     line = f"pinned: {pin.describe()}"
-    if pin.direction(config.sandbox.mode, local=local) < 0:
+    if pin.direction(config.sandbox.mode) < 0:
         return (
             f"{line}; this configuration's sandbox.mode, {config.sandbox.mode}, is weaker, so "
             "step, resume and unblock refuse it unless --accept-config-change"
@@ -2110,7 +1916,7 @@ def _review_certificate_check(
 
     ``None`` when none is held; otherwise ``(applicable, reason)``, with
     ``applicable`` ``None`` and the reason saying why when the check could
-    not run (a LOCAL contract that no longer matches this invocation, say).
+    not run (a configured validation set beyond its bounds, say).
     Reads the configuration in force, never GitHub: the live comparison is
     the merge gate's.
     """
@@ -2163,28 +1969,19 @@ def _render_validation_evidence(
     pending attempt marker, the override watermark, a producer's validation
     failure counter, whether a binding is held, the review certificate (what
     it names, whether it applies, as ``certificate`` says, and that it is no
-    merge permission), and the records of the current candidate: the REMOTE
-    current HEAD's or the LOCAL bound workspace's, else the newest record's.
-    Read-only: a marker is reported, never converted.
+    merge permission), and the records of the current candidate: the
+    current HEAD's, else the newest record's. Read-only: a marker is
+    reported, never converted.
     """
-    local = state.mode == WorkflowMode.LOCAL
-    if local:
-        key = "local.validation_commands (the run contract)"
-        count = len(state.local_contract().validation_commands)
-    else:
-        key = "validation.commands"
-        count = len(config.validation.commands)
+    count = len(config.validation.commands)
     mode = config.sandbox.mode
-    policy = f"{count} definition(s) in {key}; records are made under sandbox.mode {mode}"
+    policy = (
+        f"{count} definition(s) in validation.commands; records are made under sandbox.mode {mode}"
+    )
     if not config.sandbox.enabled:
         policy += (
             ", so validators run unsandboxed as the operator's UID and their records say "
             "enforced: false"
-        )
-    elif local and mode == "preferred":
-        policy += (
-            ", so on a host that cannot enforce the outer sandbox validators run unsandboxed "
-            "as the operator's UID and their records say enforced: false"
         )
     lines = ["", "Validation evidence:", f"  Policy:  {policy}"]
     records = state.validation_evidence()
@@ -2224,12 +2021,7 @@ def _render_validation_evidence(
     current = records[-1].candidate
     for view in reversed(records):
         candidate = view.candidate
-        if (
-            isinstance(candidate, RemoteCandidate) and candidate.commit == state.current_head_sha
-        ) or (
-            isinstance(candidate, LocalCandidate)
-            and candidate.fingerprint == state.workspace_fingerprint
-        ):
+        if candidate.commit == state.current_head_sha:
             current = candidate
             break
     mine = [r for r in records if r.candidate.identity == current.identity]
@@ -2249,9 +2041,7 @@ def _render_validation_evidence(
 
 
 def _acceptance_records(state: AutoForgeState) -> list[EffectRecord]:
-    """The persisted K9 records of the current plan (#211); none for a LOCAL run."""
-    if state.mode == WorkflowMode.LOCAL:
-        return []
+    """The persisted K9 records of the current plan (#211)."""
     return [r for r in state.phase_effects().records if r.kind is EffectKind.ACCEPTANCE_COMMENT]
 
 
@@ -2261,8 +2051,8 @@ def _print_action_payload(state: AutoForgeState, action_id: str) -> int:
     Exactly the body the controller would publish (and an operator may post
     instead), with nothing before or after it; it is redaction-invariant by
     the record's validation, so nothing is rewritten here. An id no
-    persisted record has (a declined or stale action keeps no payload), or a
-    LOCAL run, exits 1 and prints nothing.
+    persisted record has (a declined or stale action keeps no payload)
+    exits 1 and prints nothing.
     """
     for record in (*_acceptance_records(state), *_operator_records(state)):
         if record.action_id == action_id.strip():
@@ -2350,7 +2140,7 @@ def _render_acceptance_actions(state: AutoForgeState, engine: ControllerEngine) 
     from .claims import ACCEPTANCE, scan
 
     lines: list[str] = []
-    records = state.phase_effects().records if state.mode != WorkflowMode.LOCAL else ()
+    records = state.phase_effects().records
     push = next((r for r in records if r.kind is EffectKind.PUSH), None)
     for record in _acceptance_records(state):
         claim = scan(ACCEPTANCE, record.marker).claims[0]
@@ -2412,7 +2202,7 @@ def _render_acceptance_actions(state: AutoForgeState, engine: ControllerEngine) 
             )
         else:
             lines.append(f"  next:          {engine.resume_command()}")
-    for outcome in state.acceptance_outcomes if state.mode != WorkflowMode.LOCAL else ():
+    for outcome in state.acceptance_outcomes:
         label = (
             f"verified: {outcome['comment_url']}"
             if outcome["outcome"] == "verified"
@@ -2432,9 +2222,7 @@ _KEEPING_PHASES = (Phase.BLOCKED, Phase.FAILED)
 
 
 def _operator_records(state: AutoForgeState) -> list[EffectRecord]:
-    """The persisted K10 records of the current plan (#243); none for a LOCAL run."""
-    if state.mode == WorkflowMode.LOCAL:
-        return []
+    """The persisted K10 records of the current plan (#243)."""
     return [r for r in state.phase_effects().records if r.kind is EffectKind.OPERATOR_COMMENT]
 
 
@@ -2505,7 +2293,7 @@ def _operator_actions(state: AutoForgeState) -> list[dict]:
                 "reason": record.reason,
             }
         )
-    for outcome in state.operator_comment_outcomes if state.mode != WorkflowMode.LOCAL else ():
+    for outcome in state.operator_comment_outcomes:
         out.append(
             {
                 "action_id": outcome["action_id"],
@@ -2600,7 +2388,7 @@ def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) ->
             f"             withdraw: {engine.cli_command('unblock', *declines, '--reason')} {why}"
             + (f"  (keeps {', '.join(kept)} verified)" if kept else ""),
         ]
-    for outcome in state.operator_comment_outcomes if state.mode != WorkflowMode.LOCAL else ():
+    for outcome in state.operator_comment_outcomes:
         label = (
             f"verified ({outcome['evidence']}): {outcome['comment_url']}"
             if outcome["outcome"] == "verified"
@@ -2617,10 +2405,7 @@ def _render_operator_actions(state: AutoForgeState, engine: ControllerEngine) ->
 def _render_replan_journal(txn: ReplanTransaction | None) -> list[str]:
     """The human lines for a persisted replan journal; none without one.
 
-    Shared by both modes so a journal a state carries is described the same
-    way wherever it is found -- a LOCAL run never writes one, but a state
-    file that has one anyway is shown, not silently skipped, and the human
-    output then agrees with ``replan_journal`` in ``--json``.
+    The human output agrees with ``replan_journal`` in ``--json``.
     """
     if txn is None:
         return []
@@ -2712,62 +2497,6 @@ def _recorded_configuration(state: AutoForgeState) -> str:
         return "not recorded (state from before #219; the next step, resume or unblock records it)"
     recorded = RecordedConfiguration.from_dict(state.config_fingerprint)
     return f"{recorded.origin()} ({recorded.source} {recorded.recorded_at})"
-
-
-def _render_local_status(
-    state: AutoForgeState, txn: ReplanTransaction | None, evidence: list[str] | None = None
-) -> str:
-    """Human status for a LOCAL run (unredacted; the caller redacts).
-
-    Deliberately omits Issue/PR/branch/merge fields: a local run has none, and
-    printing empty ones would suggest the GitHub lifecycle is merely stalled.
-    A replan journal is shown only when the state carries one.
-    """
-    fix_budget = state.local_fix_rounds
-
-    lines = [
-        "AutoForge (local mode)",
-        "",
-        f"Run:        {state.run_id}",
-        f"Mode:       {state.mode.value} (no GitHub: no issue, no PR, no push, no merge)",
-        f"Feature:    {state.feature_spec_path or '-'}",
-        f"Frozen SHA: {state.feature_spec_sha256 or '-'}",
-        "",
-        f"Phase:      {state.phase.value}",
-        f"Review rounds completed: {state.review_round}",
-        f"Fix rounds completed:    {fix_budget}",
-        f"Last review:   {state.last_review_result or '-'}",
-        f"Open findings: {len(state.open_findings)}",
-    ]
-    for finding in state.open_findings:
-        lines.append(
-            f"  {finding.get('id', '?')} [{finding.get('severity', '?')}] "
-            f"{str(finding.get('title', '')).strip()[:80]}"
-        )
-    lines += [
-        "",
-        f"Base HEAD:   {state.base_head_sha or '(unborn)'}",
-        f"Workspace fingerprint: {state.workspace_fingerprint or '-'}",
-        f"Reviewed fingerprint:  {state.reviewed_workspace_fingerprint or '-'}",
-    ]
-    if state.baseline_dirty_paths:
-        lines.append("Pre-existing working-tree changes at run creation (--allow-dirty):")
-        for path in state.baseline_dirty_paths[:20]:
-            lines.append(f"  {path}")
-        if len(state.baseline_dirty_paths) > 20:
-            lines.append(f"  ... and {len(state.baseline_dirty_paths) - 20} more")
-    lines += _render_replan_journal(txn)
-    if state.block_reason:
-        lines.append(f"Reason:     {state.block_reason}")
-    lines += evidence or []
-    lines += [
-        "",
-        f"Steps executed: {state.step_count}",
-        "",
-        f"Created:    {state.created_at}",
-        f"Updated:    {state.updated_at}",
-    ]
-    return "\n".join(lines)
 
 
 # -- pretty printing ----------------------------------------------------------

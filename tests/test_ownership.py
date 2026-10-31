@@ -10,6 +10,7 @@ CLI's use of the forward guard is tested in ``test_cli.py``, the engine's in
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -35,9 +36,9 @@ from autoforge.scheduler_state import (
     open_claim,
 )
 from autoforge.state import AutoForgeState, save_state
-from autoforge.transitions import Phase, WorkflowMode
+from autoforge.transitions import Phase
 
-from .conftest import EPIC, git_repo, sample_contract
+from .conftest import EPIC, git_repo
 
 
 def _issue_url(n: int) -> str:
@@ -275,7 +276,7 @@ def test_a_standalone_state_before_done_holds_its_issue(tmp_path, phase):
     assert hold.holds
 
 
-@pytest.mark.parametrize("state", ["absent dir", "absent file", "done", "no issue", "local"])
+@pytest.mark.parametrize("state", ["absent dir", "absent file", "done", "no issue"])
 def test_what_holds_nothing(tmp_path, state):
     sd = tmp_path / ".autoforge"
     if state == "absent file":
@@ -284,36 +285,36 @@ def test_what_holds_nothing(tmp_path, state):
         _save_standalone(sd, _state(7, Phase.DONE))
     elif state == "no issue":
         _save_standalone(sd, _state(None, Phase.UPDATE_EPIC))
-    elif state == "local":
-        _save_standalone(
-            sd,
-            AutoForgeState(
-                run_id="af-local",
-                mode=WorkflowMode.LOCAL,
-                phase=Phase.REVIEW,
-                feature_spec_path="features/x.md",
-                feature_spec_sha256="a" * 64,
-                local_run_contract=sample_contract(
-                    repository_root=str(tmp_path), state_root=str(sd)
-                ),
-                workspace_fingerprint="b" * 64,
-                base_head_sha="c" * 40,
-                base_branch="main",
-                created_at="2026-10-18T00:00:00+00:00",
-                updated_at="2026-10-18T00:00:00+00:00",
-            ),
-        )
     hold = standalone_hold(sd)
     assert not hold.holds and hold.problem == ""
     assert not os.path.lexists(sd) or state != "absent dir"
 
 
-@pytest.mark.parametrize("damage", ["garbage", "symlink"])
+@pytest.mark.parametrize("damage", ["garbage", "symlink", "local"])
 def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, damage):
+    """A LOCAL run's state among them: the pass no longer skips it as LOCAL's
+    own (ADR 0009 D4, #387), so it is the hold's problem like any state that
+    does not load, and the pass still admits (``test_epic_commands``)."""
     sd = tmp_path / ".autoforge"
     sd.mkdir()
     if damage == "garbage":
         (sd / "state.json").write_text("{ not json " + "ghp_" + "b" * 36)
+    elif damage == "local":
+        # Written by hand, as a protocol-12 LOCAL run saved it: no code that
+        # writes one is left (#388).
+        local = _state(None, Phase.REVIEW, run_id="af-local", epic_url="").to_dict()
+        local.update(
+            mode="LOCAL",
+            protocol_version="12",
+            repository="",
+            feature_spec_path="features/x.md",
+            feature_spec_sha256="a" * 64,
+            local_run_contract={"schema": 2, "repository_root": str(tmp_path)},
+            workspace_fingerprint="b" * 64,
+            base_head_sha="c" * 40,
+            base_branch="main",
+        )
+        (sd / "state.json").write_text(json.dumps(local), encoding="utf-8")
     else:
         target = tmp_path / "elsewhere.json"
         save_state(_state(7), target)
@@ -323,4 +324,6 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     assert not hold.holds and hold.problem
     assert "ghp_" + "b" * 36 not in hold.problem
     assert len(hold.problem) <= MAX_REASON_CHARS
+    if damage == "local":
+        assert "state file has unknown mode 'LOCAL'" in hold.problem
     assert _tree(sd) == before, "never quarantined, created or written"

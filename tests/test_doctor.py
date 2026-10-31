@@ -12,7 +12,6 @@ from autoforge.doctor import Doctor
 from autoforge.errors import ExecutionError
 from autoforge.executor import ExecutionResult, execute
 from autoforge.github import GH_WORKDIR_PREFIX
-from autoforge.profiles import local_required_profiles
 from autoforge.redaction import redact
 from tests.conftest import DOTDOT_SPELLINGS, dotdot_config_paths, is_shell_probe
 
@@ -428,7 +427,7 @@ def test_doctor_fails_a_post_merge_profile_a_run_would_refuse_to_launch(tmp_path
 def test_doctor_fails_a_config_whose_routing_a_remote_run_could_not_record(tmp_path):
     """A REMOTE run records its routing in its state file (#219), and `run`
     refuses a value that record could not hold (R1-F1): so does doctor's
-    config row. A LOCAL run records none, and its doctor passes it."""
+    config row."""
     cfg = tmp_path / "c.json"
     cfg.write_text(json.dumps({"version": 1, "profiles": {"fix": {"model": "m" * 513}}}))
     d = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
@@ -436,8 +435,6 @@ def test_doctor_fails_a_config_whose_routing_a_remote_run_could_not_record(tmp_p
     assert not row.ok and row.required
     assert row.detail.startswith("profiles.fix.model must be a string of at most 512 characters")
     assert d.config is None
-    local = Doctor(config_path=str(cfg), cwd=str(tmp_path), runner=_runner_factory())
-    assert local.check_config(local_required_profiles).ok
 
 
 # The commands a configuration file of the placement tests names (#280).
@@ -506,8 +503,8 @@ def test_doctor_runs_nothing_a_config_in_a_providers_writable_directory_names(
     """#280 (R3-F1): a provider's dedicated directory is writable to every
     enforced launch of it, outside the repository. A configuration file
     there may say what an agent wrote, its ``sandbox.mode`` unchanged: the
-    config row fails, in ``doctor`` and in ``local doctor``, and no row runs
-    a command it names. Without the variable the same file's commands run."""
+    config row fails, and no row runs a command it names. Without the
+    variable the same file's commands run."""
     from tests.conftest import git_repo
 
     base = Path(os.path.realpath(tmp_path))
@@ -530,8 +527,6 @@ def test_doctor_runs_nothing_a_config_in_a_providers_writable_directory_names(
     assert d.config is None
     assert not any(name.startswith("agent ") for name in rows), sorted(rows)
     assert not any(argv[0] in _NAMED for argv in calls), calls
-    local = _placement_doctor(config, repo, calls)
-    assert not local.check_config(local_required_profiles).ok and local.config is None
 
     monkeypatch.delenv(variable)
     calls = []
@@ -1879,28 +1874,6 @@ def test_a_command_shared_by_pi_and_opencode_must_pass_both_floors(tmp_path, ver
     assert sorted(probes) == ["--version", "--version", "auth"]
 
 
-def test_local_doctor_checks_a_pi_reviewer(tmp_path):
-    root = tmp_path / "repo"
-    root.mkdir()
-    config = _write_config(
-        tmp_path,
-        {"review_round_1": _pi_profile()},
-        {"local": {"max_fix_rounds": 0}},
-    )
-    base = _pi_runner()
-
-    def runner(req):
-        if req.command[:2] == ["git", "rev-parse"]:
-            return ExecutionResult(req.command, req.cwd, 0, str(root) + "\n", "", "t", "t")
-        return base(req)
-
-    d = Doctor(config_path=config, cwd=str(root), state_dir=str(tmp_path / "state"), runner=runner)
-    results = {r.name: r for r in d.run_local()}
-    assert results["agent 'pi' available (review_round_1)"].ok
-    assert results["agent 'pi' auth ready (review_round_1)"].ok
-    assert results["loop detection"].detail.startswith("loop detection kill (")
-
-
 # -- instructions Pi loads from outside the checkout (#132) -----------------------
 PI_OUTSIDE = "pi loads no instructions from outside the checkout (review_round_2_5)"
 
@@ -2182,22 +2155,6 @@ def test_doctor_reports_the_agent_environment_by_name_only(tmp_path, monkeypatch
     assert credentials.ok and "identity supplied: user.name, user.email" in credentials.detail
     text = _all_text(results)
     assert FAKE_TOKEN not in text and "agent.sock" not in text and "Operator Name" not in text
-
-
-def test_local_doctor_runs_the_environment_checks_and_never_gh(tmp_path, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", FAKE_TOKEN)
-    calls: list[list[str]] = []
-    listing = "local\0credential.helper\nstore\0"
-    d = Doctor(
-        cwd=str(tmp_path),
-        state_dir=str(tmp_path / "state"),
-        runner=_runner_factory(calls=calls, git_config=listing),
-    )
-    rows = {r.name: r for r in d.run_local()}
-    assert rows["launch environment"].ok and "GH_TOKEN" in rows["launch environment"].detail
-    assert not rows["no credential reaches a launch"].ok
-    assert all(argv[0] != "gh" for argv in calls), calls
-    assert "GitHub remote" not in rows and "gh authenticated" not in rows
 
 
 def test_doctors_pi_probes_get_the_launch_environment(tmp_path):

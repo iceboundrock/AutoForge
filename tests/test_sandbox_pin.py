@@ -37,8 +37,7 @@ from autoforge.sandbox_pin import (
 )
 from autoforge.state import load_state
 
-from .conftest import FakeGitHub, make_engine, make_local_engine, write_feature
-from .local_helpers import local_repo
+from .conftest import FakeGitHub, make_engine
 
 AT = "2026-10-24T00:00:00+00:00"
 
@@ -59,37 +58,27 @@ def _pin(**over) -> dict:
 
 
 def test_strength_is_what_a_launch_of_the_run_gets():
-    """REMOTE's preferred never runs a launch unenforced (ADR 0005 D12.2)."""
-    assert [mode_strength(m, local=True) for m in ("disabled", "preferred", "required")] == [
-        0,
-        1,
-        2,
-    ]
-    assert [mode_strength(m, local=False) for m in ("disabled", "preferred", "required")] == [
-        0,
-        2,
-        2,
-    ]
+    """``preferred`` never runs a launch unenforced (ADR 0005 D12.2, ADR 0009 D7):
+    it is as strong as ``required``."""
+    assert [mode_strength(m) for m in ("disabled", "preferred", "required")] == [0, 1, 1]
 
 
 @pytest.mark.parametrize(
-    ("pinned", "mode", "local", "direction"),
+    ("pinned", "mode", "direction"),
     [
-        (SANDBOX_REQUIRED, SANDBOX_DISABLED, True, -1),
-        (SANDBOX_REQUIRED, SANDBOX_PREFERRED, True, -1),
-        (SANDBOX_PREFERRED, SANDBOX_DISABLED, True, -1),
-        (SANDBOX_PREFERRED, SANDBOX_REQUIRED, True, 1),
-        (SANDBOX_DISABLED, SANDBOX_PREFERRED, True, 1),
-        (SANDBOX_REQUIRED, SANDBOX_REQUIRED, True, 0),
-        (SANDBOX_REQUIRED, SANDBOX_DISABLED, False, -1),
-        (SANDBOX_PREFERRED, SANDBOX_DISABLED, False, -1),
-        (SANDBOX_REQUIRED, SANDBOX_PREFERRED, False, 0),
-        (SANDBOX_PREFERRED, SANDBOX_REQUIRED, False, 0),
+        (SANDBOX_REQUIRED, SANDBOX_DISABLED, -1),
+        (SANDBOX_PREFERRED, SANDBOX_DISABLED, -1),
+        (SANDBOX_DISABLED, SANDBOX_PREFERRED, 1),
+        (SANDBOX_DISABLED, SANDBOX_REQUIRED, 1),
+        (SANDBOX_REQUIRED, SANDBOX_PREFERRED, 0),
+        (SANDBOX_PREFERRED, SANDBOX_REQUIRED, 0),
+        (SANDBOX_REQUIRED, SANDBOX_REQUIRED, 0),
+        (SANDBOX_DISABLED, SANDBOX_DISABLED, 0),
     ],
 )
-def test_direction_compares_strength_not_names(pinned, mode, local, direction):
+def test_direction_compares_strength_not_names(pinned, mode, direction):
     pin = SandboxPin(mode=pinned, source=SOURCE_CREATED, recorded_at=AT)
-    assert pin.direction(mode, local=local) == direction
+    assert pin.direction(mode) == direction
 
 
 def test_the_record_round_trips():
@@ -281,56 +270,3 @@ def test_a_run_without_a_pin_is_not_checked_and_pins_its_mode(tmp_path):
     later.save()
     saved = SandboxPin.from_dict(load_state(eng.paths.state_file).sandbox_pin)
     assert (saved.mode, saved.source) == (SANDBOX_DISABLED, SOURCE_UPGRADED)
-
-
-# -- the engine: a LOCAL run -------------------------------------------------------
-
-
-def _local(tmp_path, mode: str):
-    repo = local_repo(tmp_path)
-    eng = make_local_engine(repo, write_feature(repo), cfg=_cfg(mode))
-    eng.record_run_configuration()
-    eng.save()
-    return repo, eng
-
-
-def _local_invocation(repo, eng: ControllerEngine, mode: str) -> ControllerEngine:
-    later = make_local_engine(
-        repo, None, cfg=_cfg(mode), state_dir=eng.paths.state_dir, start=False
-    )
-    later.load()
-    return later
-
-
-def test_a_local_run_pins_but_records_no_fingerprint(tmp_path):
-    """A LOCAL run's contract defines its routing; the pin is the only record."""
-    _, eng = _local(tmp_path, SANDBOX_PREFERRED)
-    assert eng.state.config_fingerprint == {}
-    pin = SandboxPin.from_dict(eng.state.sandbox_pin)
-    assert (pin.mode, pin.source) == (SANDBOX_PREFERRED, SOURCE_CREATED)
-
-
-@pytest.mark.parametrize(
-    ("pinned", "mode"),
-    [
-        (SANDBOX_REQUIRED, SANDBOX_DISABLED),
-        (SANDBOX_PREFERRED, SANDBOX_DISABLED),
-        (SANDBOX_REQUIRED, SANDBOX_PREFERRED),
-    ],
-)
-def test_a_local_run_refuses_a_weaker_mode_unless_accepted(tmp_path, pinned, mode):
-    repo, eng = _local(tmp_path, pinned)
-    before = eng.paths.state_file.read_bytes()
-    with pytest.raises(ConfigurationDriftError) as exc:
-        _local_invocation(repo, eng, mode).check_run_configuration(("step",))
-    assert f'\n  sandbox.mode: "{pinned}" -> "{mode}"\n' in str(exc.value)
-    assert "Changed (recorded -> this command)" not in str(exc.value)
-    assert eng.paths.state_file.read_bytes() == before
-    later = _local_invocation(repo, eng, mode)
-    later.check_run_configuration(("step",), accept_change=True)
-    saved = load_state(eng.paths.state_file)
-    assert saved.sandbox_pin["mode"] == mode and saved.sandbox_pin["source"] == SOURCE_ACCEPTED
-    assert saved.config_fingerprint == {}
-    [event] = _events(later)
-    assert event["metadata"]["recorded_sandbox_pin"]["mode"] == pinned
-    assert "recorded_config_file" not in event["metadata"]

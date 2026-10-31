@@ -2,11 +2,9 @@
 
 What ``test_sandbox_policy.py`` reads from a description, run: a fake agent
 started by the Claude Code adapter in a REMOTE issue worktree commits
-through the overlay and the controller imports its commit; a LOCAL
-validation command cannot write the git directory; a LOCAL agent reaches a
-configuration file in its root, which is why one there is refused (#280),
-and none outside it, and redirects a path that passes through its root
-before a ``..``; an export command sees only its tree, without a network
+through the overlay and the controller imports its commit, and rewrites a
+configuration file in its provider's own directory, which is why one there
+is refused (#280); an export command sees only its tree, without a network
 when asked. The module skips with the
 probe's reason on a host that cannot enforce a launch, as
 ``test_sandbox_bwrap.py`` does.
@@ -44,10 +42,8 @@ from autoforge.sandbox_policy import (
     LaunchClass,
     LaunchFacts,
     SandboxPlan,
-    config_file_problem,
     describe_launch,
 )
-from autoforge.transitions import Phase
 
 from .conftest import (
     GIT_IDENT,
@@ -56,7 +52,6 @@ from .conftest import (
     bind_unix,
     certify_review,
     git_repo,
-    make_local_engine,
     real_sandbox_backend,
     watched_fifo,
 )
@@ -708,71 +703,15 @@ def test_a_script_whose_absolute_env_names_a_link_launches(backend, layout, monk
     }
 
 
-def test_doctor_launches_each_providers_version_as_a_launch_would(backend, tmp_path, monkeypatch):
-    """The doctor's sandboxed ``--version`` gets a launch's environment (PR #231 R2-F2).
-
-    A fake ``claude`` whose ``--version`` needs ``$CLAUDE_CONFIG_DIR``, a
-    link in the home, to lead to a directory inside, and a fake
-    ``opencode`` whose ``--version`` needs ``$OPENCODE_CONFIG_DIR`` to be
-    an empty directory it can write: the operator's is their configuration
-    root, which every launch replaces with one of its own. Through the real
-    backend, both rows pass, as both CLIs' launches do.
-    """
-    base = Path(os.path.realpath(tmp_path))
-    home = base / "home"
-    real = base / "claude-autoforge"
-    real.mkdir()
-    alias = _linked(home / ".claude-autoforge", real)
-    operator_config = _sentinel(home / ".config" / "opencode" / "opencode.json", "{}\n").parent
-    claude = _sentinel(
-        base / "tools" / "claude" / "bin" / "claude",
-        f"#!{PY}\nimport os, sys\n"
-        "if not os.path.isdir(os.environ.get('CLAUDE_CONFIG_DIR', '')):\n"
-        "    sys.exit(3)\n"
-        "print('fake-claude 9.9.9')\n",
-    )
-    opencode = _sentinel(
-        base / "tools" / "opencode" / "bin" / "opencode",
-        f"#!{PY}\nimport os, sys\n"
-        "config = os.environ.get('OPENCODE_CONFIG_DIR', '')\n"
-        "if not os.path.isdir(config) or os.listdir(config):\n"
-        "    sys.exit(3)\n"
-        "open(os.path.join(config, 'written'), 'w').close()\n"
-        "print('fake-opencode 9.9.9')\n",
-    )
-    for tool in (claude, opencode):
-        tool.chmod(0o755)
-    for name in list(os.environ):
-        if name.startswith(("CLAUDE_", "ANTHROPIC_", "OPENCODE_", "PI_")):
-            monkeypatch.delenv(name)
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("PATH", f"{claude.parent}:{opencode.parent}:/usr/bin:/bin")
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alias))
-    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(operator_config))
-    doctor = Doctor(cwd=str(git_repo(base / "repo")))
-    doctor.config = default_config()
-    doctor.config.sandbox.mode = "required"
-    rows = {r.name: r for r in doctor.sandbox_checks(local=True)}
-    shown = {
-        name.split("'")[1]: row for name, row in rows.items() if "outer sandbox: provider" in name
-    }
-    assert set(shown) == {"claude", "opencode"}
-    assert shown["claude"].ok, shown["claude"].detail
-    assert "inside the sandbox: fake-claude 9.9.9" in shown["claude"].detail
-    assert shown["opencode"].ok, shown["opencode"].detail
-    assert "inside the sandbox: fake-opencode 9.9.9" in shown["opencode"].detail
-    # The operator's configuration root was not the one given, nor written.
-    assert sorted(os.listdir(operator_config)) == ["opencode.json"]
-
-
 def test_remote_doctor_launches_each_providers_version_as_a_launch_would(
     backend, tmp_path, monkeypatch
 ):
     """ADR 0009 A.2.3 E (#386): the REMOTE replacement of
-    test_sandbox_routing.py::test_doctor_launches_each_providers_version_as_a_launch_would.
+    test_sandbox_routing.py::test_doctor_launches_each_providers_version_as_a_launch_would,
+    deleted with LOCAL (#388).
 
-    ``autoforge doctor``'s rows (``local=False``), run from the checkout,
-    for the same fakes: a ``claude`` whose ``--version`` needs its linked
+    ``autoforge doctor``'s rows, run from the checkout, for two fakes: a
+    ``claude`` whose ``--version`` needs its linked
     ``$CLAUDE_CONFIG_DIR`` to lead to a directory inside, an ``opencode``
     whose ``--version`` needs an empty ``$OPENCODE_CONFIG_DIR`` it can
     write, though the operator's names their configuration root. Each
@@ -816,7 +755,7 @@ def test_remote_doctor_launches_each_providers_version_as_a_launch_would(
     doctor = Doctor(cwd=str(repo))
     doctor.config = default_config()
     doctor.config.sandbox.mode = "required"
-    rows = {r.name: r for r in doctor.sandbox_checks(local=False)}
+    rows = {r.name: r for r in doctor.sandbox_checks()}
     assert "outer sandbox: policy, REMOTE agent" in rows
     shown = {
         name.split("'")[1]: row for name, row in rows.items() if "outer sandbox: provider" in name
@@ -828,25 +767,6 @@ def test_remote_doctor_launches_each_providers_version_as_a_launch_would(
     assert "inside the sandbox: fake-opencode 9.9.9" in shown["opencode"].detail
     # The operator's configuration root was not the one given, nor written.
     assert sorted(os.listdir(operator_config)) == ["opencode.json"]
-
-
-def _local_facts(paths, network=NetworkPosition.HOST) -> LaunchFacts:
-    git_dir = paths["common"]
-    cache = git_dir / "autoforge" / "sandbox" / "local" / "cache"
-    cache.mkdir(parents=True)
-    return LaunchFacts(
-        launch_class=LaunchClass.LOCAL_VALIDATION,
-        workspace=str(paths["repo"]),
-        home=str(paths["home"]),
-        controller_env={},
-        git_entry=str(git_dir),
-        git_dir=str(git_dir),
-        common_dir=str(git_dir),
-        cache=str(cache),
-        controller_config=str(paths["config"]),
-        denied_roots=(str(git_dir / "autoforge"), str(paths["state"])),
-        network=network,
-    )
 
 
 def _probe(description, cwd: Path, code: str, **env: str) -> dict:
@@ -863,166 +783,7 @@ def _probe(description, cwd: Path, code: str, **env: str) -> dict:
     return json.loads(res.stdout.strip().splitlines()[-1])
 
 
-def test_a_local_validation_command_cannot_write_the_git_directory(backend, layout):
-    paths = layout
-    description = describe_launch(_local_facts(paths), None, {})
-    code = (
-        "git = ['git', '-c', 'user.name=V', '-c', 'user.email=v@example.invalid']\n"
-        "report = {\n"
-        "  'tree': attempt(lambda: write('built.txt')),\n"
-        "  'head': attempt(lambda: write('.git/HEAD')),\n"
-        f"  'state': attempt(lambda: read({str(paths['state'] / 'state.json')!r})),\n"
-        f"  'neighbour': attempt(lambda: read({str(paths['neighbour'] / 'neighbour.txt')!r})),\n"
-        "  'commit': subprocess.run(git + ['commit', '-q', '--allow-empty', '-m', 'v'],"
-        " capture_output=True).returncode,\n"
-        "  'stash': subprocess.run(git + ['stash', 'push', '-q'],"
-        " capture_output=True).returncode,\n"
-        "  'branch': subprocess.run(git + ['branch', 'agent-branch'],"
-        " capture_output=True).returncode,\n"
-        "}\n"
-        "print(json.dumps(report))\n"
-    )
-    report = _probe(description, paths["repo"], code)
-    assert report["tree"] == "ok" and report["head"] == "EROFS"
-    assert report["state"] == "ENOENT" and report["neighbour"] == "ENOENT"
-    assert report["commit"] != 0 and report["stash"] != 0 and report["branch"] != 0
-    assert _git("-C", str(paths["repo"]), "branch", "--list", "agent-branch") == ""
-    assert _git("-C", str(paths["repo"]), "stash", "list") == ""
-    assert (paths["repo"] / "built.txt").exists()
-
-
 _CONFIG_TEXT = '{"version": 1, "sandbox": {"mode": "required"}}\n'
-
-
-def test_a_local_agent_reaches_a_config_file_in_its_root_and_none_outside(backend, layout):
-    """#280 through the real backend. An enforced LOCAL agent writes its
-    repository root, so a configuration file there is rewritten: that is why
-    every command refuses one (:func:`config_file_problem`). Outside the
-    root -- an operator directory, the home's ``~/.config/autoforge`` -- the
-    agent cannot reach the file, by its path, through ``..``, or through a
-    link it plants in the root, and the file is byte-identical afterwards."""
-    from dataclasses import replace
-
-    paths = layout
-    repo = paths["repo"]
-    inside = _sentinel(repo / "autoforge.json", _CONFIG_TEXT)
-    elsewhere = _sentinel(paths["base"] / "operator" / "autoforge.json", _CONFIG_TEXT)
-    in_home = _sentinel(paths["home"] / ".config" / "autoforge" / "autoforge.json", _CONFIG_TEXT)
-    facts = replace(_local_facts(paths), launch_class=LaunchClass.LOCAL_AGENT)
-    description = describe_launch(facts, None, {})
-    payload = '{"version": 1, "sandbox": {"mode": "disabled"}}\n'
-    dotdot = os.path.relpath(elsewhere, repo)
-    code = (
-        f"payload = {payload!r}\n"
-        "def rewrite(path):\n"
-        "    os.makedirs(os.path.dirname(path), exist_ok=True)\n"
-        "    with open(path + '.new', 'w') as fh:\n"
-        "        fh.write(payload)\n"
-        "    os.replace(path + '.new', path)\n"
-        "def through_link(target):\n"
-        "    os.symlink(target, 'planted.json')\n"
-        "    write('planted.json', payload)\n"
-        # The plain writes first: a rewrite creates the missing directories in
-        # the launch's own root, which nothing outside sees.
-        "report = {\n"
-        f"  'inside': attempt(lambda: rewrite({str(inside)!r})),\n"
-        f"  'elsewhere': attempt(lambda: write({str(elsewhere)!r}, payload)),\n"
-        f"  'dotdot': attempt(lambda: write({dotdot!r}, payload)),\n"
-        f"  'link': attempt(lambda: through_link({str(elsewhere)!r})),\n"
-        f"  'elsewhere_replaced': attempt(lambda: rewrite({str(elsewhere)!r})),\n"
-        f"  'in_home': attempt(lambda: rewrite({str(in_home)!r})),\n"
-        "}\n"
-        "print(json.dumps(report))\n"
-    )
-    report = _probe(description, repo, code)
-    assert report["inside"] == "ok"
-    assert inside.read_text() == payload  # the hazard the placement rule refuses
-    assert config_file_problem(str(inside), (str(repo),), "required")
-    for name in ("elsewhere", "dotdot", "link"):
-        assert report[name] == "ENOENT", (name, report)
-    assert elsewhere.read_bytes() == _CONFIG_TEXT.encode()
-    assert in_home.read_bytes() == _CONFIG_TEXT.encode()  # the launch's home is its own
-    for config in (elsewhere, in_home):
-        assert config_file_problem(str(config), (str(repo),), "required") == ""
-
-
-def test_a_local_agent_rewrites_what_a_dotdot_spelling_opens_which_is_why_it_is_refused(
-    backend, layout
-):
-    """#280 (R2-F1) through the real backend. ``operator/alias`` links to the
-    root's ``linked``, so ``operator/alias/../autoforge.json`` opens the
-    root's file, which an enforced LOCAL agent rewrites.
-    ``repo/passed/../../operator/autoforge.json`` opens the operator's own
-    file, outside the root, but looks up ``passed`` in it: the agent
-    replaces ``passed`` with a link that keeps the ``..`` in the root, and
-    the path then opens a file it wrote. The check refuses both before the
-    launch; collapsed by ``os.path.abspath``, both name the operator's file,
-    which passes and is untouched."""
-    from dataclasses import replace
-
-    paths = layout
-    repo = paths["repo"]
-    _sentinel(repo / "autoforge.json", _CONFIG_TEXT)
-    _sentinel(repo / "linked" / "keep.txt")
-    _sentinel(repo / "passed" / "keep.txt")
-    twin = _sentinel(paths["base"] / "operator" / "autoforge.json", _CONFIG_TEXT)
-    (twin.parent / "alias").symlink_to(repo / "linked")
-    through_link = f"{twin.parent}/alias/../autoforge.json"
-    leaving = f"{repo}/passed/../../operator/autoforge.json"
-    assert os.path.realpath(leaving) == str(twin)  # outside the root, until the launch
-    for spelled in (through_link, leaving):
-        assert "is reached through" in config_file_problem(spelled, (str(repo),), "required")
-        assert os.path.abspath(spelled) == str(twin)
-        assert config_file_problem(os.path.abspath(spelled), (str(repo),), "required") == ""
-    facts = replace(_local_facts(paths), launch_class=LaunchClass.LOCAL_AGENT)
-    payload = '{"version": 1, "sandbox": {"mode": "required"}, "github": {"command": "/x"}}\n'
-    code = (
-        f"payload = {payload!r}\n"
-        "def rewrite(path):\n"
-        "    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)\n"
-        "    with open(path + '.new', 'w') as fh:\n"
-        "        fh.write(payload)\n"
-        "    os.replace(path + '.new', path)\n"
-        "def redirect():\n"
-        "    os.makedirs('x/y')\n"
-        "    os.rename('passed', 'passed.moved')\n"
-        "    os.symlink('x/y', 'passed')\n"
-        "report = {\n"
-        "  'file': attempt(lambda: rewrite('autoforge.json')),\n"
-        "  'passed': attempt(redirect),\n"
-        "  'planted': attempt(lambda: rewrite('operator/autoforge.json')),\n"
-        "}\n"
-        "print(json.dumps(report))\n"
-    )
-    report = _probe(describe_launch(facts, None, {}), repo, code)
-    assert report == {"file": "ok", "passed": "ok", "planted": "ok"}, report
-    for spelled in (through_link, leaving):
-        with open(spelled, encoding="utf-8") as handle:
-            assert handle.read() == payload, spelled  # what the agent wrote
-        assert "is reached through" in config_file_problem(spelled, (str(repo),), "required")
-    assert twin.read_bytes() == _CONFIG_TEXT.encode()
-
-
-def test_a_required_local_run_with_its_config_file_in_the_root_launches_nothing(
-    backend, tmp_path, monkeypatch, capsys
-):
-    """#280 end to end on a host that enforces: the file the previous test
-    shows an agent rewriting is refused before the run exists, so no launch
-    ever writes it and it is byte-identical."""
-    from autoforge import cli
-
-    from .local_helpers import local_repo
-
-    root = local_repo(tmp_path / "work")
-    inside = _sentinel(root / "autoforge.json", _CONFIG_TEXT)
-    monkeypatch.chdir(root)
-    assert cli.main(["--config", str(inside), "local", "run", "features/add-filter.md"]) == 2
-    err = capsys.readouterr().err
-    assert f"the configuration file {inside} lies in {root}, a tree that " in err
-    assert "Nothing was run, launched or written." in err
-    assert inside.read_bytes() == _CONFIG_TEXT.encode()
-    assert not (root / ".git" / "autoforge" / "state").exists()
-    assert not (root / ".git" / "autoforge" / "sandbox").exists()
 
 
 _PROVIDERS_BY_DIR = {
@@ -1033,67 +794,12 @@ _PROVIDERS_BY_DIR = {
 
 
 @pytest.mark.parametrize("variable", sorted(_PROVIDERS_BY_DIR))
-def test_a_launch_rewrites_a_config_file_in_its_providers_directory_which_is_why_it_is_refused(
-    backend, layout, monkeypatch, variable
-):
-    """#280 (R3-F1) through the real backend. An enforced LOCAL agent launch
-    with its provider's own declaration for a dedicated directory outside the
-    repository (``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR``, the directory
-    of ``OPENCODE_DB``) rewrites a configuration file there: the same
-    ``sandbox.mode``, so the pin sees nothing, and another ``github.command``.
-    That is why every command refuses such a file
-    (:func:`autoforge.engine.config_file_placement_problem`), before any
-    launch; the operator's file elsewhere is out of the launch's reach,
-    byte-identical, and passes."""
-    from dataclasses import replace
-
-    from autoforge.engine import config_file_placement_problem
-
-    paths = layout
-    repo, base, home = paths["repo"], paths["base"], paths["home"]
-    directory = base / "provider-dir"
-    planted = _sentinel(directory / "autoforge.json", _CONFIG_TEXT)
-    elsewhere = _sentinel(base / "operator" / "autoforge.json", _CONFIG_TEXT)
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    value = f"{directory}/af.db" if variable == "OPENCODE_DB" else str(directory)
-    monkeypatch.setenv(variable, value)
-    provider = _PROVIDERS_BY_DIR[variable]()
-    cfg = default_config()
-    cfg.sandbox.mode = "required"
-    profile = ProfileConfig(name="analyze_execute", provider=provider.name, command=PY)
-    env = provider.launch_environment(cfg.execution.environment_names())
-    needs = provider.sandbox_requirements(profile, [PY], env, str(home))
-    facts = replace(_local_facts(paths), launch_class=LaunchClass.LOCAL_AGENT)
-    payload = '{"version": 1, "sandbox": {"mode": "required"}, "github": {"command": "/x/gh"}}\n'
-    code = (
-        f"payload = {payload!r}\n"
-        "def rewrite(path):\n"
-        "    with open(path + '.new', 'w') as fh:\n"
-        "        fh.write(payload)\n"
-        "    os.replace(path + '.new', path)\n"
-        "report = {\n"
-        f"  'provider_dir': attempt(lambda: rewrite({str(planted)!r})),\n"
-        f"  'elsewhere': attempt(lambda: write({str(elsewhere)!r}, payload)),\n"
-        "}\n"
-        "print(json.dumps(report))\n"
-    )
-    report = _probe(describe_launch(facts, needs, env), repo, code)
-    assert report == {"provider_dir": "ok", "elsewhere": "ENOENT"}, report
-    assert planted.read_text() == payload  # the hazard the placement rule refuses
-    assert elsewhere.read_bytes() == _CONFIG_TEXT.encode()
-    problem = config_file_placement_problem(cfg, str(planted), repo)
-    assert problem.startswith(f"the configuration file {planted} lies in {directory}, "), problem
-    assert f"(${variable}), which every sandboxed launch of {provider.name} " in problem
-    assert config_file_placement_problem(cfg, str(elsewhere), repo) == ""
-
-
-@pytest.mark.parametrize("variable", sorted(_PROVIDERS_BY_DIR))
 def test_a_remote_launch_rewrites_a_config_file_in_its_providers_directory_so_it_is_refused(
     backend, layout, monkeypatch, variable
 ):
     """ADR 0009 A.2.3 F (#386): the REMOTE replacement of
-    test_sandbox_routing.py::test_a_launch_rewrites_a_config_file_in_its_providers_directory_which_is_why_it_is_refused.
+    test_sandbox_routing.py::test_a_launch_rewrites_a_config_file_in_its_providers_directory_which_is_why_it_is_refused,
+    deleted with LOCAL (#388).
 
     #280 (R3-F1) through the real backend, on a REMOTE agent launch in its
     issue worktree: with its provider's own declaration for a dedicated
@@ -1145,34 +851,6 @@ def test_a_remote_launch_rewrites_a_config_file_in_its_providers_directory_so_it
     assert problem.startswith(f"the configuration file {planted} lies in {directory}, "), problem
     assert f"(${variable}), which every sandboxed launch of {provider.name} " in problem
     assert config_file_placement_problem(cfg, str(elsewhere), repo) == ""
-
-
-def test_a_required_local_run_with_its_config_file_in_claudes_directory_launches_nothing(
-    backend, tmp_path, monkeypatch, capsys
-):
-    """#280 (R3-F1) end to end on a host that enforces: the file the previous
-    test shows a Claude Code launch rewriting is refused before the run
-    exists, though it lies outside the repository, so no launch ever writes
-    it and it is byte-identical."""
-    from autoforge import cli
-
-    from .local_helpers import local_repo
-
-    root = local_repo(tmp_path / "work")
-    directory = Path(os.path.realpath(tmp_path)) / "claude-autoforge"
-    planted = _sentinel(directory / "autoforge.json", _CONFIG_TEXT)
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(directory))
-    monkeypatch.chdir(root)
-    assert cli.main(["--config", str(planted), "local", "run", "features/add-filter.md"]) == 2
-    err = capsys.readouterr().err
-    assert (
-        f"the configuration file {planted} lies in {directory}, the Claude Code configuration "
-        "directory ($CLAUDE_CONFIG_DIR), which every sandboxed launch of claude "
-    ) in err
-    assert "Nothing was run, launched or written." in err
-    assert planted.read_bytes() == _CONFIG_TEXT.encode()
-    assert not (root / ".git" / "autoforge" / "state").exists()
-    assert not (root / ".git" / "autoforge" / "sandbox").exists()
 
 
 def test_an_export_command_sees_its_tree_and_no_network_when_isolated(backend, layout):
@@ -1230,42 +908,6 @@ def test_an_export_command_sees_its_tree_and_no_network_when_isolated(backend, l
             assert (report["network"] == "ok") is reaches, report
     finally:
         listener.close()
-
-
-def test_a_required_local_run_validates_inside_the_sandbox(backend, tmp_path):
-    """The engine routes a LOCAL validation command through the backend: it
-    cannot create a file in the git directory (outside, it could), and the
-    run still advances on its exit status."""
-    from .local_helpers import impl_result, local_repo, review_result, scripted, touch_impl
-
-    root = local_repo(tmp_path)
-    code = (
-        _PROBE
-        + "assert attempt(lambda: write('.git/validation-probe')) == 'EROFS'\n"
-        + "assert not os.path.exists('.git/autoforge/state')\n"
-    )
-    cfg = default_config()
-    cfg.sandbox.mode = "required"
-    cfg.local.validation_commands = [[PY, "-c", code]]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-            (None, lambda e: review_result(e.state.workspace_fingerprint)),
-        ],
-    )
-    eng.run(max_steps=5)
-    assert eng.state.phase == Phase.DONE
-    assert not (root / ".git" / "validation-probe").exists()
-    assert len(eng.provider.descriptions) == 2
-    run_dir = eng.paths.logs_dir / eng.state.run_id
-    (step,) = [p for p in run_dir.iterdir() if "-validation-" in p.name]
-    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
-    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
-    assert request["metadata"]["sandbox_mode"] == "required"
-    assert execution["sandbox"]["enforced"] is True
 
 
 def test_a_required_premerge_command_runs_in_the_export_alone(

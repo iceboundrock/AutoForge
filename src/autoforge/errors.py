@@ -28,10 +28,9 @@ class ConfigurationDriftError(ConfigurationError):
 class SandboxCapabilityError(ConfigurationError):
     """This host cannot enforce the outer sandbox, and the mode refuses (ADR 0005 D12.2).
 
-    Raised by the engine's pre-launch gate under ``sandbox.mode: required``,
-    and under ``preferred`` in a REMOTE run, before anything is spawned,
-    before the attempt counter is saved and before a LOCAL launch is
-    charged: state is unchanged and nothing needs recovery. A configuration
+    Raised by the engine's pre-launch gate under ``sandbox.mode: required``
+    and ``preferred``, before anything is spawned and before the attempt
+    counter is saved: state is unchanged and nothing needs recovery. A configuration
     or capability error, never a phase failure. ``capability`` names what
     the host lacks (``autoforge.sandbox_bwrap.Capability``'s value).
     """
@@ -113,8 +112,8 @@ class OpenSchedulerClaimsError(SchedulerStateError):
 class SchedulerStateDirError(ConfigurationError):
     """A standalone command was pointed at a state directory inside the scheduler root.
 
-    ``run``, ``step``, ``resume`` and ``local run`` refuse a ``--state-dir``
-    or ``config.state_dir`` that resolves inside
+    ``run``, ``step`` and ``resume`` refuse a ``--state-dir`` or
+    ``config.state_dir`` that resolves inside
     ``<git common dir>/autoforge/scheduler/`` (ADR 0008 D17.3, #178), before
     the lock is taken or any state is read or written; the message names the
     scheduler commands instead. ``status`` reads such a directory and
@@ -227,7 +226,7 @@ class InteractionRequiredError(ExecutionError):
     record exists to pause into (#126): nothing is pending. Never corrected
     and never relaunched as transient, since a relaunch would ask again; the
     phase is unchanged, and what was saved before the launch (the attempt
-    counter, a LOCAL launch charge) stands.
+    counter) stands.
     """
 
 
@@ -480,9 +479,8 @@ class ValidationDefinitionError(AutoForgeError):
     More than 16 definitions in a set, more than 32 elements in an argv, a
     blank element, an element over 1,024 characters or an argv over 4,096
     in all. The configuration loader turns it into a
-    :class:`ConfigurationError`; a LOCAL run contract persisted before the
-    bounds existed that holds one enters ``BLOCKED`` before any validator is
-    launched. The message names the definition and the bound, never the argv.
+    :class:`ConfigurationError`. The message names the definition and the
+    bound, never the argv.
     """
 
 

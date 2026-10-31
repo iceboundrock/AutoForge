@@ -53,13 +53,18 @@ agent claim against GitHub** before acting on it:
   the PR as ``MERGED`` at that HEAD into the reviewed base. If that call
   left auto-merge armed, the controller disarms it. No prompt is rendered
   and no provider is invoked.
-- UPDATE_EPIC: ``next_issue_url`` is verified exactly like the first issue
-  in INITIALIZING before the controller switches issues: it parses as an
+- UPDATE_EPIC: ``next_issue_url`` is verified like the first issue in
+  INITIALIZING before the controller switches issues: it parses as an
   issue URL of this repository, is neither the EPIC nor the issue just
-  finished, exists on GitHub and is OPEN. A rejected selection keeps the
-  phase (the agent is asked again once, with the controller's reason); a
-  second rejection enters BLOCKED. Only a verified issue reaches
-  ANALYZE_EXECUTE.
+  finished, exists on GitHub and is OPEN. It must also be one of the EPIC's
+  own issues, by the rule ``autoforge epic run`` admits by (#287): GitHub
+  names the EPIC as its parent, and it has no sub-issues of its own. A
+  ``null`` is held to GitHub too: the EPIC's sub-issue listing, complete
+  against the EPIC's own count, must hold no issue the controller would
+  accept. A rejected selection keeps the phase (the agent is asked again
+  once, with the controller's reason); a second rejection enters BLOCKED,
+  and so does a listing that is not complete. Only a verified issue
+  reaches ANALYZE_EXECUTE, and only a confirmed ``null`` reaches DONE.
 
 Loop bounds (``workflow:`` config, enforced from persisted state so
 ``resume`` never resets them; see ``loop_guard.py``):
@@ -140,7 +145,6 @@ from .certificate import (
     Revision,
     certificate_problem,
     configuration_drift,
-    local_certificate,
     remote_certificate,
 )
 from .child_env import (
@@ -176,9 +180,7 @@ from .claims import (
 from .config import (
     ACCEPTANCE_ACTIONS_AUTO,
     ACCEPTANCE_ACTIONS_OFF,
-    DEFAULT_STATE_DIR,
     KNOWN_PROVIDERS,
-    SANDBOX_PREFERRED,
     SANDBOX_REQUIRED,
     AgentLimits,
     AutoForgeConfig,
@@ -247,6 +249,7 @@ from .effects import (
     review_comment_problem,
     sha256_text,
 )
+from .epic_graph import read_children
 from .errors import (
     AutoForgeError,
     CandidateNotMaterializableError,
@@ -273,6 +276,7 @@ from .errors import (
     SandboxCapabilityError,
     SandboxLaunchRefusedError,
     SandboxTamperError,
+    SnapshotRefused,
     StateError,
     StateTransitionError,
     ValidationDefinitionError,
@@ -282,11 +286,8 @@ from .errors import (
 )
 from .evidence import (
     MAX_FAILURE_COUNT,
-    METHOD_IN_PLACE,
     NO_SANDBOX_TEMPLATE,
     Definition,
-    Evidence,
-    LocalCandidate,
     Outcome,
     Policy,
     PrHeadProvenance,
@@ -305,7 +306,6 @@ from .evidence import (
     duration_seconds,
     eligible_record,
     failure_counter,
-    find_evidence,
     next_seq,
     observed_record,
     parse_candidate,
@@ -346,13 +346,6 @@ from .github import (
     checks_access_remedy,
 )
 from .interaction import InteractionBroker, Lifecycle, Resolver, Unattended
-from .local_workspace import (
-    FeatureSpec,
-    LocalWorkspace,
-    WorkspaceSnapshot,
-    read_feature_spec,
-    verify_feature_spec_unchanged,
-)
 from .locking import (
     ControllerLock,
     SharedGitLock,
@@ -379,11 +372,10 @@ from .premerge import (
     export_commit_tree,
     fetch_pr_head,
 )
-from .profiles import REQUIRED_PROFILES, local_required_profiles, profile_for_phase
+from .profiles import REQUIRED_PROFILES, profile_for_phase
 from .progress import ProgressReporter
 from .prompts import (
     COMMON_TEMPLATE,
-    LOCAL_COMMON_TEMPLATE,
     TEMPLATE_FILES,
     escape_inline,
     fenced_untrusted_block,
@@ -404,6 +396,7 @@ from .read_context import (
     render_issue_states,
     render_operator_evidence,
     render_pr,
+    render_sub_issues,
     unreadable,
 )
 from .redaction import redact, redact_argv, redact_dict, redact_obj
@@ -457,9 +450,6 @@ from .result_parser import (
     AnalyzeExecuteResult,
     FindingResolution,
     FixResult,
-    LocalAnalyzeExecuteResult,
-    LocalFixResult,
-    LocalReviewResult,
     OperatorAction,
     ReplanReexecuteResult,
     ReviewResult,
@@ -479,7 +469,6 @@ from .roadmap import (
     splice_roadmap,
     split_roadmap,
 )
-from .run_contract import LocalRunContract, validate_local_run_contract
 from .run_namespace import IssueNamespace, check_standalone_state_dir, inside_scheduler_root
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
@@ -491,7 +480,6 @@ from .sandbox_pin import SOURCE_STRENGTHENED as PIN_STRENGTHENED
 from .sandbox_pin import SOURCE_UPGRADED as PIN_UPGRADED
 from .sandbox_policy import (
     CACHE,
-    LOCAL_SANDBOX_KEY,
     OVERLAY_WORK,
     PRIVATE_OBJECTS,
     SANDBOX_DIR,
@@ -520,14 +508,12 @@ from .state import (
     utcnow_iso,
 )
 from .transitions import (
-    LOCAL_WRITE_PHASES,
     STOP_PHASES,
     TERMINAL_PHASES,
     Phase,
     WorkflowMode,
     decide_next_phase,
     edges_for,
-    stop_phases_for,
     validate_transition,
 )
 from .validation import (
@@ -590,16 +576,6 @@ OPERATOR_ACTIONS_UNAVAILABLE = (
     'report `"status": "blocked"` with a `"message"` saying so.'
 )
 
-# How many times one LOCAL phase entry may launch a write-capable agent
-# before the run blocks. Every launch is charged and checkpointed before the
-# agent starts (see ``AutoForgeState.local_pending_phase``) -- the phase
-# entry's first launch and each correction retry after a malformed
-# CONTROL_RESULT alike (R9-F3) -- so a crash, a malformed result or a failing
-# validation command all leave a record that ``resume`` continues from, and
-# ``execution.max_correction_attempts`` can never multiply this bound.
-# Without it, a phase that can never be verified would be re-invoked by every
-# ``resume`` forever.
-MAX_LOCAL_PHASE_ATTEMPTS = 3
 
 # Launches of one REMOTE validation definition after a launch or setup
 # failure the executor or the sandbox backend reported, or #165's preflight
@@ -629,16 +605,14 @@ _BRANCH_CLEANUP_ERRORS = (GitHubError, ExecutionError)
 # Where a REMOTE candidate's export is written for validation (ADR 0006 D6.2):
 # a fresh private directory per definition launch, beside the pre-merge one.
 VALIDATION_EXPORT_PREFIX = "autoforge-validate-"
-LOCAL_VALIDATION_PROFILE = "(controller validation command)"
 REMOTE_VALIDATION_PROFILE = "(controller candidate validation command)"
 
 # Relaunches of one step after a failure its adapter recognised as transient
 # (``AgentExecutionResult.transient_failure``, #164). Counted apart from the
 # CONTROL_RESULT corrections and never reset within the step, so one step
 # launches at most ``1 + execution.max_correction_attempts +
-# MAX_TRANSIENT_RETRIES`` agents however the failures interleave. REMOTE
-# only: each relaunch follows the phase-entry reconciliation, and LOCAL has
-# none (its write phases are bounded by the durable launch checkpoint).
+# MAX_TRANSIENT_RETRIES`` agents however the failures interleave. Each
+# relaunch follows the phase-entry reconciliation.
 MAX_TRANSIENT_RETRIES = 2
 
 # The pauses of a read-back that finds a PR still headed at the commit the
@@ -685,8 +659,11 @@ MERGE_GATE_MESSAGE = (
 # How many times UPDATE_EPIC may select a next issue the controller rejects
 # (does not exist, CLOSED, other repository, the EPIC or the current issue)
 # before the run is BLOCKED: the first rejection is retried once with the
-# reason rendered into the prompt, the second one is final.
+# reason rendered into the prompt, the second one is final. A `null` the
+# controller refuses (an issue of the EPIC remains, #287) counts the same.
 MAX_NEXT_ISSUE_SELECTIONS = 2
+# How many of the issues that remain a refused `null` names (#287).
+_MAX_REMAINING_SHOWN = 10
 
 # `mergeStateStatus` values under which the controller is willing to call
 # `gh pr merge`. Everything else is a conclusive "not now" (BLOCKED) except
@@ -914,8 +891,6 @@ def _enforcement_text(view: RecordView) -> str:
 
 
 def _provenance_text(candidate: EvidenceCandidate) -> str:
-    if isinstance(candidate, LocalCandidate):
-        return "validated in place in the working tree"
     provenance = candidate.provenance
     if isinstance(provenance, PrHeadProvenance):
         return f"validated as the head of {escape_inline(provenance.pr_url)}"
@@ -957,8 +932,6 @@ def _untrusted_output(view: RecordView) -> str:
 
 
 def _candidate_text(candidate: EvidenceCandidate) -> str:
-    if isinstance(candidate, LocalCandidate):
-        return f"the working tree at fingerprint `{candidate.fingerprint}`"
     return f"commit `{candidate.commit}` (tree `{candidate.tree}`) of {candidate.repository}"
 
 
@@ -977,11 +950,7 @@ def render_validation_evidence(candidate: EvidenceCandidate, records: Sequence[R
     at most :data:`~autoforge.evidence.MAX_TAIL_CHARS` characters. An empty
     set says that no controller validation is configured.
     """
-    key = (
-        "local.validation_commands"
-        if isinstance(candidate, LocalCandidate)
-        else ("validation.commands")
-    )
+    key = "validation.commands"
     if not records:
         return VALIDATION_EVIDENCE_NONE.format(key=key)
     failing = [v for v in records if v.outcome is not Outcome.PASS]
@@ -1075,19 +1044,6 @@ class ReplyExcerpt:
 def generate_run_id() -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"af-{stamp}-{secrets.token_hex(3)}"
-
-
-# A local run never creates a PR or an Issue, so a phase whose only purpose
-# is a GitHub side effect has no local template at all.
-LOCAL_PHASE_TEMPLATE: dict[Phase, str | None] = {
-    Phase.INITIALIZING: None,  # deterministic: freeze the spec, read the tree
-    Phase.ANALYZE_EXECUTE: "local_analyze_execute.md",
-    Phase.REVIEW: "local_review.md",
-    Phase.FIX: "local_fix.md",
-    Phase.DONE: None,
-    Phase.BLOCKED: None,
-    Phase.FAILED: None,
-}
 
 
 PHASE_TEMPLATE: dict[Phase, str | None] = {
@@ -1270,40 +1226,6 @@ class UnblockOutcome:
     dry_run: bool = False
 
 
-def local_state_paths(
-    workspace: LocalWorkspace,
-    *,
-    explicit: str | Path | None = None,
-    configured: str | Path | None = None,
-) -> StatePaths:
-    """Where a LOCAL run keeps its runtime state.
-
-    A LOCAL run fingerprints *every* entry in the working tree, so its own
-    state directory cannot live there: it would invalidate its own fingerprint
-    on every step, or have to be carved out of it by path -- a region an agent
-    could then write into without moving the fingerprint. The default is
-    therefore ``<git dir>/autoforge/state``. The git directory is already
-    outside the reviewed tree for reasons that have nothing to do with
-    AutoForge, and it is the natural anchor: it is the deepest directory in
-    the chain the controller did not create, so every component below it is
-    opened ``O_NOFOLLOW`` from a descriptor (see
-    :class:`autoforge.state.StatePaths`).
-
-    ``explicit`` is ``--state-dir`` and is honoured as given. ``configured``
-    is ``config.state_dir``, which is REMOTE's setting: a value left at its
-    default is not a choice, and anything else is. Either way the caller
-    checks the result against the working tree; this function only decides
-    *which* directory is meant.
-    """
-    chosen = explicit or (
-        configured if configured and str(configured) != DEFAULT_STATE_DIR else None
-    )
-    if chosen is not None:
-        return StatePaths.from_state_dir(chosen)
-    git_dir = workspace.git_dirs()[0]
-    return StatePaths.from_state_dir(git_dir / "autoforge" / "state", anchor=git_dir)
-
-
 # What a REMOTE re-entry does before the phase's agent is launched again,
 # quoted in the error of an invocation interrupted after the agent returned.
 # Every REMOTE phase that launches an agent has an entry, because every one
@@ -1358,7 +1280,7 @@ def probe_sandbox() -> ProbeResult:
     return sandbox_bwrap.probe(home=_operator_home(), environ=os.environ)
 
 
-def sandbox_mode_summary(sandbox: SandboxConfig, local: bool) -> str:
+def sandbox_mode_summary(sandbox: SandboxConfig) -> str:
     """What ``sandbox.mode`` does, for the plan, ``status`` and ``doctor`` (ADR 0005 D12.4).
 
     Configuration only: nothing is probed, so the words are the same on
@@ -1371,24 +1293,15 @@ def sandbox_mode_summary(sandbox: SandboxConfig, local: bool) -> str:
             "whatever the operator can by absolute path, controller state and credentials "
             'included (a risk; docs/usage.md, "Outer sandbox")'
         )
-    networks = f"validation network {sandbox.validation_network}"
-    if not local:
-        networks += f", pre-merge network {sandbox.premerge_network}"
+    networks = (
+        f"validation network {sandbox.validation_network}, "
+        f"pre-merge network {sandbox.premerge_network}"
+    )
     paths = (
         f", {len(sandbox.read_only_paths)} operator read-only path(s) (sandbox.read_only_paths)"
         if sandbox.read_only_paths
         else ""
     )
-    doctor = "autoforge local doctor" if local else "autoforge doctor"
-    if sandbox.mode == SANDBOX_PREFERRED and local:
-        return (
-            "preferred (sandbox.mode): every LOCAL launch runs inside the outer sandbox when "
-            f"this host can enforce one; when it cannot, launches fall back to "
-            f"{LOGICAL_ISOLATION_ONLY}, which is said on stderr at the launch and in every "
-            "execution record and is never called sandboxed; whether this host can is "
-            f"established at the first launch of a step (`{doctor}` shows it now); "
-            f"{networks}{paths}"
-        )
     how = (
         "required (sandbox.mode)"
         if sandbox.mode == SANDBOX_REQUIRED
@@ -1398,8 +1311,8 @@ def sandbox_mode_summary(sandbox: SandboxConfig, local: bool) -> str:
     return (
         f"{how}: every agent launch and every repository-defined command runs inside it or is "
         "refused, never without it; a host that cannot enforce one is refused at the start of "
-        f"the step, before anything is saved, charged or launched (`{doctor}` shows whether "
-        f"this one can); {networks}{paths}"
+        "the step, before anything is saved, charged or launched (`autoforge doctor` shows "
+        f"whether this one can); {networks}{paths}"
     )
 
 
@@ -1474,13 +1387,11 @@ def config_file_placement_problem(
     ``required`` or ``preferred``: the CLI for every command, ``doctor``, a
     scheduler's worker. What enforced launches write and keep is asked
     about: the repository's working trees, the checkout ``workdir`` is in
-    and every worktree registered to the repository (a LOCAL launch writes
-    the checkout, a REMOTE one its agent worktree), the repository's sandbox
-    directories (the caches), and every directory a provider's declaration
-    makes writable (:func:`provider_written_directories`), which the
-    launches of every repository write. Both modes ask: a LOCAL run's
-    launches write the checkout a REMOTE command loads its file from too,
-    and the REMOTE controller runs ``github.command`` with the GitHub
+    and every worktree registered to the repository (an agent launch writes
+    its agent worktree), the repository's sandbox directories (the caches),
+    and every directory a provider's declaration makes writable
+    (:func:`provider_written_directories`), which the launches of every
+    repository write. The controller runs ``github.command`` with the GitHub
     credential. Under ``disabled`` no launch is enforced and nothing is
     asked (the same-user residual, docs/security.md). Outside a git
     repository no launch writes a tree of it, so only the providers'
@@ -1530,38 +1441,6 @@ def _refusal_facts(exc: BaseException) -> dict[str, object]:
     return facts.record() if isinstance(facts, SandboxFacts) else {}
 
 
-def _validation_failure(
-    definition: Definition, req: ExecutionRequest, result: ExecutionResult, phase: Phase
-) -> VerificationError | None:
-    """The error a LOCAL validation command that did not pass raises, or ``None``.
-
-    Both the command line and its output can carry a secret into
-    `state.verification_failures` (plain `state.json`) through the raised
-    message, so both are redacted here and not only on the run-log path.
-    Baseline protection: `redaction` claims no completeness.
-    """
-    shown = definition.shown
-    if result.timed_out:
-        return VerificationError(
-            _with_leftovers(
-                f"validation command {shown!r} timed out after {req.timeout_seconds}s",
-                result.leftovers,
-            )
-            + f"; {phase.value} is not verified."
-        )
-    if result.exit_code != 0:
-        tail = redact((result.stderr or result.stdout or "").strip())[-2000:]
-        return VerificationError(
-            _with_leftovers(
-                f"validation command {shown!r} failed with exit {result.exit_code}",
-                result.leftovers,
-            )
-            + f"; {phase.value} is not verified and the run stays in "
-            f"{phase.value}. Output tail: {tail}"
-        )
-    return None
-
-
 # How much of a record's argv a message or a prompt quotes: the record holds
 # it redacted and bounded already (ADR 0006 D10.3), and one line is enough
 # to name the definition next to its index.
@@ -1588,22 +1467,6 @@ def _validation_failure_text(view: RecordView) -> str:
         f"validation definition [{view.index}] {markdown_code_span(_shown_argv(view))} ended "
         f"{view.outcome.value} ({_outcome_detail(view)}) for {view.candidate.describe()} "
         f"(validation record #{view.seq}, run log {view.run_log})"
-    )
-
-
-def _reused_failure(view: RecordView, phase: Phase) -> VerificationError:
-    """The error a LOCAL ``FAIL`` or ``TIMEOUT`` record that is final for the tree raises.
-
-    The command is not run again on the tree it failed on (ADR 0006 D10.6):
-    a relaunch that left the tree unchanged fails the same way.
-    """
-    output = view.raw["output"]
-    tail = (output["stderr_tail"] or output["stdout_tail"]).strip()[-2000:]
-    return VerificationError(
-        f"validation command {' '.join(view.argv)!r} did not pass on this exact working tree "
-        f"({view.outcome.value}, {_outcome_detail(view)}; validation record #{view.seq}), and "
-        f"the tree is unchanged since, so it was not run again: {phase.value} is not verified "
-        f"and the run stays in {phase.value}. Output tail: {tail}"
     )
 
 
@@ -1654,10 +1517,10 @@ class ControllerEngine:
         self._state_root: SafeRoot | None = None
         self.workdir = str(workdir)
         self.providers = providers or ProviderRegistry(runner=runner)
-        # The GitHub client is built on first *use*, never on construction: a
-        # LOCAL run must reach DONE without a GitHubClient ever existing, and
-        # `local doctor` must work with no gh binary and no authentication.
-        # An injected client (tests) is used as given.
+        # The GitHub client is built on first *use*, never on construction:
+        # a command that never reads GitHub (``status``, a plan) must work
+        # with no gh binary and no authentication. An injected client (tests)
+        # is used as given.
         self._github = github
         self._runner = runner
         # How the controller pauses between the reads of a PR GitHub has not
@@ -1680,7 +1543,6 @@ class ControllerEngine:
         self._replan_candidate = ""
         self._replan_rejection = ""
         self._workspace: GitWorkspace | None = None
-        self._local_workspace: LocalWorkspace | None = None
         # The per-issue agent worktree paths already derived (a git read
         # each), keyed by the worktree's name; see :meth:`agent_worktree_path`.
         self._agent_worktrees: dict[str, Path] = {}
@@ -1700,15 +1562,6 @@ class ControllerEngine:
         # (ADR 0006 D5.5, D5.7, D9.1); reset at every REVIEW entry, so a plan
         # or a dry run renders a placeholder instead.
         self._evidence_bound = False
-        # The workspace snapshot bound immediately before a LOCAL agent
-        # phase. The prompt is rendered from it, so the fingerprint the
-        # reviewer is told to report is exactly the one persisted in state.
-        self._local_bound_snapshot: WorkspaceSnapshot | None = None
-        # True while the LOCAL phase being invoked is a *retry* of an
-        # invocation that was already launched once (see
-        # ``AutoForgeState.local_pending_phase``); the prompt then tells the
-        # agent that work from the earlier attempt may already be present.
-        self._local_resumed_invocation = False
         # Likewise for the FIX entry: the open follow-up issues it found
         # already carrying a marker for one of the open findings (rendered
         # into ``FOLLOW_UP_ISSUES``), and the candidate its result check
@@ -1851,7 +1704,7 @@ class ControllerEngine:
 
     @property
     def github(self) -> GitHubClient:
-        """The GitHub client, constructed on first use (never in LOCAL mode)."""
+        """The GitHub client, constructed on first use."""
         if self._github is None:
             self._github = GitHubClient(
                 gh_command=self.config.github.command,
@@ -1865,79 +1718,24 @@ class ControllerEngine:
         return self.state.mode if self.state is not None else WorkflowMode.REMOTE
 
     def workspace(self) -> GitWorkspace:
-        """The git reader of the checkout the controller is run from, in either mode.
+        """The git reader of the checkout the controller is run from.
 
         Its root, git directories, HEAD, branch and status: the agent
         worktree's root, the sandbox's facts, the candidate read and the
         checkout anchor read through it. It reads no configuration (ADR 0009
-        C1); LOCAL's walk and fingerprint are :meth:`local_workspace`'s.
+        C1).
         """
         if self._workspace is None:
             self._workspace = GitWorkspace(workdir=self.workdir, runner=self._runner or execute)
         return self._workspace
 
-    def local_workspace(self) -> LocalWorkspace:
-        """The LOCAL working-tree reader (LOCAL mode's source of truth).
-
-        Built from the *current* configuration: for a new run that is the
-        definition being created, and for a loaded run it is what the
-        contract gate (:meth:`local_contract`) compares against the
-        persisted definition before any phase executes.
-        """
-        if self._local_workspace is None:
-            local = self.config.local
-            self._local_workspace = LocalWorkspace(
-                workdir=self.workdir,
-                runner=self._runner or execute,
-                exclude=local.exclude,
-                max_entries=local.max_workspace_entries,
-                max_bytes=local.max_workspace_bytes,
-            )
-        return self._local_workspace
-
-    # -- the LOCAL run contract ------------------------------------------
-    def _invocation_contract(self) -> LocalRunContract:
-        """What *this* invocation would define a LOCAL run as (never persisted twice)."""
-        return LocalRunContract.from_config(self.config, self.local_workspace(), self.paths)
-
-    def local_contract(self) -> LocalRunContract:
-        """The loaded LOCAL run's persisted contract, proven to match this invocation.
-
-        This is the one gate between "state was read" and "anything is
-        executed or decided" (see :mod:`autoforge.run_contract`): it runs at
-        :meth:`load`, at the top of every LOCAL step, and at every use of a
-        run-defining value, because execution reads such values *from the
-        contract this returns* rather than from the configuration. Drift is a
-        VerificationError, not BLOCKED: the operator changed a setting (or
-        moved the checkout), and both restoring it and starting a new run
-        under the new one must stay possible. Nothing is persisted, so the
-        run is exactly as resumable afterwards as it was before.
-        """
-        state = self._require_state()
-        return validate_local_run_contract(state.local_contract(), self._invocation_contract())
-
     def _execution_cwd(self) -> str:
-        """The directory agents and validation commands are launched from.
+        """The directory agents are launched from.
 
-        For a LOCAL run this is the contract's ``repository_root``, never
-        the invocation's cwd. A validation command is an argv, and an argv
-        only means something relative to a directory: ``["./verify"]`` run
-        from ``src/`` is a different program, and ``["pytest"]`` run from a
-        subdirectory discovers a different rootdir and conftest. Freezing
-        the argv while letting the directory float would let a ``resume``
-        from a subdirectory silently redefine what verifies the run (round
-        11, R11-F1). Taking the directory from the contract -- which the
-        gate has already proven names this checkout -- is what makes the
-        invocation's cwd genuinely DYNAMIC (see :mod:`autoforge.run_contract`):
-        it decides where the repository is *found*, and nothing else.
-
-        A REMOTE run has no contract; its agents are launched in the
-        per-issue worktree (:meth:`_ensure_agent_worktree`), never in the
+        The per-issue worktree (:meth:`_ensure_agent_worktree`), never the
         checkout the controller is run from. GitHub, not a working-tree
-        verifier, is its source of truth.
+        verifier, is the run's source of truth.
         """
-        if self.mode is WorkflowMode.LOCAL:
-            return self.local_contract().repository_root
         return str(self._ensure_agent_worktree())
 
     # -- the REMOTE run's recorded configuration (#219) -----------------------
@@ -1948,20 +1746,18 @@ class ControllerEngine:
     def record_run_configuration(self, source: str = SOURCE_CREATED) -> None:
         """Record this invocation's configuration as the run's, in memory.
 
-        ``run``, ``local run`` and a scheduler's worker call it on the run
-        they create, before its first save. Every run pins the sandbox mode
-        it is created under (#280, :mod:`autoforge.sandbox_pin`); a REMOTE
-        run also records its profile routing and agent worktree root (#219),
-        which a LOCAL run's contract defines instead. A configuration the
-        record could not be read back with is refused (ConfigurationError),
-        and nothing is recorded.
+        ``run`` and a scheduler's worker call it on the run they create,
+        before its first save. Every run pins the sandbox mode it is created
+        under (#280, :mod:`autoforge.sandbox_pin`) and records its profile
+        routing and agent worktree root (#219). A configuration the record
+        could not be read back with is refused (ConfigurationError), and
+        nothing is recorded.
         """
         state = self._require_state()
         pin = self._sandbox_pin_record(source)
-        if not state.is_local:
-            state.config_fingerprint = self._fingerprint_record(
-                self.invocation_config_fingerprint(), source
-            )
+        state.config_fingerprint = self._fingerprint_record(
+            self.invocation_config_fingerprint(), source
+        )
         state.sandbox_pin = pin
 
     def _fingerprint_record(self, fingerprint: ConfigFingerprint, source: str) -> dict:
@@ -1996,8 +1792,7 @@ class ControllerEngine:
         checked and pins this invocation's mode (``upgraded``), both saved
         with the command's next save.
 
-        The recorded configuration (#219, a REMOTE run; a LOCAL run's
-        contract is checked by :meth:`load`): a run with none (a state file
+        The recorded configuration (#219): a run with none (a state file
         written before #219) is not checked and records this invocation's
         (``upgraded``), saved with the command's next save; another one is
         refused.
@@ -2021,10 +1816,10 @@ class ControllerEngine:
         current: ConfigFingerprint | None = None
         changes: list[ConfigChange] = []
         unresolved = ""
-        upgrade = not state.is_local and not state.config_fingerprint
+        upgrade = not state.config_fingerprint
         if upgrade:
             fingerprint_routing(self.config)  # refused as recording it would refuse it
-        elif not state.is_local:
+        else:
             recorded = RecordedConfiguration.from_dict(state.config_fingerprint)
             try:
                 current = self.invocation_config_fingerprint()
@@ -2044,7 +1839,7 @@ class ControllerEngine:
             changes = recorded.fingerprint.changes(current)
         pin = SandboxPin.from_dict(state.sandbox_pin) if state.sandbox_pin else None
         mode = self.config.sandbox.mode
-        direction = pin.direction(mode, local=state.is_local) if pin is not None else 0
+        direction = pin.direction(mode) if pin is not None else 0
         downgrade = (
             ConfigChange(MODE_KEY, json.dumps(pin.mode), json.dumps(mode))
             if pin is not None and direction < 0
@@ -2163,7 +1958,7 @@ class ControllerEngine:
                 f"sandbox.mode was not checked; it is pinned to sandbox.mode {mode} with its "
                 f"next save, and {weaker}"
             )
-        elif pin.direction(mode, local=state.is_local) > 0:
+        elif pin.direction(mode) > 0:
             out.append(
                 f"[dry-run] would pin run {run} to the stronger sandbox.mode {mode} (pinned: "
                 f"{pin.mode})"
@@ -2324,8 +2119,8 @@ class ControllerEngine:
 
         Under ``execution.worktree_dir`` when configured (relative to the
         controller's working directory), otherwise under
-        ``<git common dir>/autoforge/worktrees``, next to the controller lock
-        and a LOCAL run's state: inside the repository's git directory,
+        ``<git common dir>/autoforge/worktrees``, next to the controller
+        lock: inside the repository's git directory,
         which is outside every working tree of the checkout, so the
         operator's tree never contains it and the agent's never contains
         ``.autoforge/``, the lock or the operator's uncommitted work. The
@@ -2632,11 +2427,9 @@ class ControllerEngine:
 
         ``disabled``: never, and nothing is probed. Otherwise the host's
         capability decides: enforced when it can; when it cannot,
-        ``required`` and REMOTE's ``preferred`` raise
-        :class:`SandboxCapabilityError`, and LOCAL's ``preferred`` falls back
-        to logical isolation only. The fallback is decided here, from the
-        probe, never after a launch the backend refused (D10.8): a launch
-        meant to be enforced never re-runs unenforced.
+        ``required`` and ``preferred``, which means the same (ADR 0009 D7),
+        raise :class:`SandboxCapabilityError`. A launch meant to be enforced
+        never runs unenforced.
         """
         sandbox = self.config.sandbox
         if not sandbox.enabled:
@@ -2644,7 +2437,7 @@ class ControllerEngine:
         capability = self.sandbox_capability()
         if capability.supported:
             return True
-        if sandbox.refuses_unenforced(self.mode is WorkflowMode.LOCAL):
+        if sandbox.refuses_unenforced():
             raise self._capability_error(capability)
         return False
 
@@ -2653,8 +2446,8 @@ class ControllerEngine:
 
         Called at the start of a step that may launch an agent or a
         repository-defined command, before anything of the step is saved,
-        charged or spawned: under ``required``, and under ``preferred`` in
-        REMOTE, a host that cannot enforce refuses the step here, and state
+        charged or spawned: under ``required`` and ``preferred``, a host that
+        cannot enforce refuses the step here, and state
         stays byte-identical. Under ``disabled`` it probes nothing. An
         operator read-only path that overlaps what no launch may see is
         refused here too, whatever the host (D15.4).
@@ -2673,29 +2466,20 @@ class ControllerEngine:
         paths = tuple(self.config.sandbox.read_only_paths)
         if not paths:
             return ""
-        local_root = Path(self._execution_cwd()) if self.mode is WorkflowMode.LOCAL else None
-        return operator_path_problem(paths, self.gate_denied_roots(local_root))
+        return operator_path_problem(paths, self.gate_denied_roots())
 
-    def gate_denied_roots(self, local_root: Path | None) -> tuple[str, ...]:
+    def gate_denied_roots(self) -> tuple[str, ...]:
         """The denied roots the gate holds ``sandbox.read_only_paths`` against (D15.4).
 
-        They are the ones this run's launches compile with. ``local_root``
-        is a LOCAL run's repository root, ``None`` for a REMOTE run. A LOCAL
-        launch, agent or validation, works in that root, so the checkout is
-        not one of them: a path in its read-only git projection
-        (``.git/config``) is the launch's to show. A REMOTE step launches
+        They are the ones this run's launches compile with. A step launches
         its agent in the issue worktree and its export commands in a tree no
-        worktree is, so no registered worktree is excluded there, the
-        controller's checkout included. ``doctor`` asks the same question
-        before any run exists, so the mode is an argument here, not the
-        loaded run's.
+        worktree is, so no registered worktree is excluded, the controller's
+        checkout included. ``doctor`` asks the same question before any run
+        exists.
         """
-        if local_root is not None:
-            return self._denied_roots(local_root, local=True)
-        return self._denied_roots(Path("/"), local=False)
+        return self._denied_roots(Path("/"))
 
     def _capability_error(self, probe: ProbeResult) -> SandboxCapabilityError:
-        local = self.mode is WorkflowMode.LOCAL
         why = (
             "sandbox.mode is required"
             if self.config.sandbox.mode == SANDBOX_REQUIRED
@@ -2703,58 +2487,13 @@ class ControllerEngine:
         )
         capability = probe.capability or Capability.UNKNOWN
         alternatives = f"set sandbox.mode: disabled to run with {LOGICAL_ISOLATION_ONLY}"
-        if local:
-            alternatives += (
-                ", or preferred to fall back to it visibly where the host cannot enforce"
-            )
-        doctor = "autoforge local doctor" if local else "autoforge doctor"
         return SandboxCapabilityError(
             f"{why}, and this host cannot enforce the outer sandbox: it cannot provide "
             f"{capability.value} ({probe.reason}). Nothing was launched, saved or charged; the "
-            f"run is as it was. `{doctor}` shows the capability check; make the host capable, "
-            f'or {alternatives} (ADR 0005 D12.2; docs/usage.md, "Outer sandbox")',
+            "run is as it was. `autoforge doctor` shows the capability check; make the host "
+            f'capable, or {alternatives} (ADR 0005 D12.2; docs/usage.md, "Outer sandbox")',
             capability.key,
         )
-
-    def _sandbox_fallback(self) -> str:
-        """Why launches run with logical isolation only under LOCAL's ``preferred``; "" if not."""
-        probe = self._sandbox_probe
-        if (
-            self.config.sandbox.mode != SANDBOX_PREFERRED
-            or self.mode is not WorkflowMode.LOCAL
-            or probe is None
-            or probe.supported
-        ):
-            return ""
-        return probe.describe()
-
-    def _fallback_facts(self) -> dict[str, object]:
-        """The execution record's ``sandbox`` for a ``preferred`` fallback (D12.2); {} else."""
-        reason = self._sandbox_fallback()
-        if not reason:
-            return {}
-        return {
-            "enforced": False,
-            "mode": SANDBOX_PREFERRED,
-            "isolation": LOGICAL_ISOLATION_ONLY,
-            "fallback": reason,
-        }
-
-    def _fallback_notice(self, what: str) -> str:
-        """The stderr line of a ``preferred`` fallback at a launch (D12.2); "" when none."""
-        reason = self._sandbox_fallback()
-        if not reason:
-            return ""
-        return (
-            f"{what} runs with {LOGICAL_ISOLATION_ONLY}, NOT inside the outer sandbox: "
-            f"sandbox.mode is preferred, and {reason.removeprefix('unsupported: ')}"
-        )
-
-    def _say_fallback(self, what: str) -> None:
-        """A repository-defined command's fallback notice, on stderr (D12.2)."""
-        notice = self._fallback_notice(what)
-        if notice and self.progress_output is not None:
-            self.progress_output(redact(f"autoforge: {notice}"))
 
     def _step_may_launch(self, previous: Phase, allow_merge: bool) -> bool:
         """Whether a REMOTE step of ``previous`` may launch an agent or a command."""
@@ -2783,39 +2522,30 @@ class ControllerEngine:
         if not self._sandbox_enforced():
             return None
         change = phase in WORKTREE_STATE_PHASES
-        if self.mode is WorkflowMode.LOCAL:
-            facts = self._local_facts(LaunchClass.LOCAL_AGENT, cwd, overrides, cache=change)
-        else:
-            facts = self._remote_facts(cwd, overrides, read_context, cache=change)
-        return SandboxPlan(facts)
+        return SandboxPlan(self._remote_facts(cwd, overrides, read_context, cache=change))
 
     def _command_sandbox(
         self, launch_class: LaunchClass, cwd: str, overrides: Mapping[str, str], network: str
     ) -> LaunchDescription | None:
         """The description a repository-defined command runs in; ``None`` when disabled.
 
-        LOCAL validation shares the checkout's cache; an export command gets
-        none (ADR 0005 §2.5). ``network`` is the operator's opt-in (D9.2).
-        A refusal is :class:`SandboxLaunchRefusedError`, before anything runs;
-        ``None`` when the launch is not enforced (``disabled``, or LOCAL's
-        ``preferred`` on a host that cannot enforce).
+        An export command gets no cache (ADR 0005 §2.5). ``network`` is the
+        operator's opt-in (D9.2). A refusal is
+        :class:`SandboxLaunchRefusedError`, before anything runs; ``None``
+        when the launch is not enforced (``disabled``).
         """
         if not self._sandbox_enforced():
             return None
-        position = NetworkPosition(network)
-        if launch_class is LaunchClass.LOCAL_VALIDATION:
-            facts = self._local_facts(launch_class, cwd, overrides, cache=True, network=position)
-        else:
-            facts = LaunchFacts(
-                launch_class=launch_class,
-                workspace=cwd,
-                home=_operator_home(),
-                controller_env=dict(os.environ),
-                controller_config=overrides_directory(overrides),
-                denied_roots=self._denied_roots(Path(cwd)),
-                network=position,
-                operator_paths=tuple(self.config.sandbox.read_only_paths),
-            )
+        facts = LaunchFacts(
+            launch_class=launch_class,
+            workspace=cwd,
+            home=_operator_home(),
+            controller_env=dict(os.environ),
+            controller_config=overrides_directory(overrides),
+            denied_roots=self._denied_roots(Path(cwd)),
+            network=NetworkPosition(network),
+            operator_paths=tuple(self.config.sandbox.read_only_paths),
+        )
         env = {**select_environment(self.config.execution.environment_names()), **overrides}
         return describe_launch(facts, None, env)
 
@@ -2849,51 +2579,10 @@ class ControllerEngine:
             operator_paths=tuple(self.config.sandbox.read_only_paths),
         )
 
-    def _local_facts(
-        self,
-        launch_class: LaunchClass,
-        cwd: str,
-        overrides: Mapping[str, str],
-        *,
-        cache: bool,
-        network: NetworkPosition = NetworkPosition.HOST,
-    ) -> LaunchFacts:
-        """A LOCAL launch's facts: the repository root and its git directories."""
-        root = Path(cwd)
-        dirs = self.workspace().git_dirs()
-        git_dir, common = str(dirs[0]), str(dirs[-1])
-        entry = str(root / ".git")
-        if os.path.realpath(entry) == git_dir:
-            # The root's `.git` is the git directory itself (not a linked worktree).
-            git_dir = entry
-        if common == str(dirs[0]):
-            common = git_dir
-        base = Path(git_dir) / SANDBOX_DIR / LOCAL_SANDBOX_KEY
-        if cache:
-            self._sandbox_dirs(Path(git_dir), f"{SANDBOX_DIR}/{LOCAL_SANDBOX_KEY}", (CACHE,))
-        return LaunchFacts(
-            launch_class=launch_class,
-            workspace=str(root),
-            home=_operator_home(),
-            controller_env=dict(os.environ),
-            git_entry=entry,
-            git_dir=git_dir,
-            common_dir=common,
-            cache=str(base / CACHE) if cache else "",
-            controller_config=overrides_directory(overrides),
-            denied_roots=self._denied_roots(root),
-            network=network,
-            operator_paths=tuple(self.config.sandbox.read_only_paths),
-        )
-
-    def _denied_roots(self, workspace: Path, *, local: bool | None = None) -> tuple[str, ...]:
+    def _denied_roots(self, workspace: Path) -> tuple[str, ...]:
         """What no launch may see (ADR 0005 D13.2): the state directory and its run
-        logs, the lock, ``<git common dir>/autoforge``, every other registered
-        worktree, and for REMOTE the controller's checkout, for LOCAL the
-        default REMOTE state directory inside the root and the LOCAL state.
-        ``local`` is the run's mode when ``None``."""
-        if local is None:
-            local = self.mode is WorkflowMode.LOCAL
+        logs, the lock, ``<git common dir>/autoforge``, the controller's checkout
+        and every other registered worktree."""
         ws = self.workspace()
         dirs = ws.git_dirs()
         roots = [
@@ -2901,11 +2590,8 @@ class ControllerEngine:
             os.path.abspath(self.paths.logs_dir),
             str(self.lock_path()),
             str(dirs[-1] / "autoforge"),
+            str(ws.root()),
         ]
-        if local:
-            roots += [str(dirs[0] / "autoforge"), str(workspace / DEFAULT_STATE_DIR)]
-        else:
-            roots.append(str(ws.root()))
         roots += sorted(str(r) for r in registered_worktree_roots(dirs[-1]) if r != workspace)
         return tuple(dict.fromkeys(roots))
 
@@ -2926,7 +2612,7 @@ class ControllerEngine:
         L1 (ADR 0008 D12.1), and the launch after it does not. A lock not
         obtained within its bound (or a lock entry that is not the controller's
         file) refuses the launch like a directory that cannot be prepared, and
-        ``resume`` tries again. LOCAL's own git directory takes none.
+        ``resume`` tries again.
         """
         try:
             with (
@@ -2985,17 +2671,16 @@ class ControllerEngine:
     ) -> dict | StepOutcome:
         """:meth:`_invoke_phase`, with the operator's checkout pinned around it.
 
-        The LOCAL anchor check (:meth:`_git_anchor_drift`), reused for a
-        REMOTE run: HEAD and the checked-out branch of the checkout the
-        controller is run from are read before the first launch, again
-        before every relaunch (a correction, or the retry of a transient
-        failure), and after the invocation returns -- however it returns --
-        and a change is a :class:`CheckoutDriftError`, which the step turns
+        HEAD and the checked-out branch of the checkout the controller is
+        run from are read before the first launch, again before every
+        relaunch (a correction, or the retry of a transient failure), and
+        after the invocation returns -- however it returns -- and a change
+        is a :class:`CheckoutDriftError`, which the step turns
         into BLOCKED. The agents are launched in the per-issue worktree and
         told to work only there, so the checkout moving means an agent (or
         someone else) did what the prompts forbid, and the controller cannot
         tell which; nothing is rolled back. The read itself failing is a
-        VerificationError as in LOCAL mode: not evidence of no drift.
+        VerificationError: not evidence of no drift.
         """
         anchor = self._checkout_anchor()
 
@@ -3088,58 +2773,34 @@ class ControllerEngine:
         nothing is created) and the operator's paths as configured.
         """
         sandbox = self.config.sandbox
-        local = self.mode is WorkflowMode.LOCAL
-        notes = [f"outer sandbox: {sandbox_mode_summary(sandbox, local)}"]
+        notes = [f"outer sandbox: {sandbox_mode_summary(sandbox)}"]
         if not sandbox.enabled:
             return notes
         validation = NetworkPosition(sandbox.validation_network)
         paths = tuple(sandbox.read_only_paths)
-        if local:
-            classes = [
-                (LaunchClass.LOCAL_AGENT, validation, "ANALYZE_EXECUTE and FIX get the cache"),
-                (LaunchClass.LOCAL_VALIDATION, validation, ""),
-            ]
-        else:
-            classes = [
-                (
-                    LaunchClass.REMOTE_AGENT,
-                    validation,
-                    "ANALYZE_EXECUTE, FIX and REPLAN_REEXECUTE get the cache; REVIEW and "
-                    "UPDATE_EPIC get none",
-                ),
-                (
-                    LaunchClass.EXPORT_COMMAND,
-                    NetworkPosition(sandbox.premerge_network),
-                    "pre-merge verification; validation.commands use the validation network",
-                ),
-            ]
+        classes = [
+            (
+                LaunchClass.REMOTE_AGENT,
+                validation,
+                "ANALYZE_EXECUTE, FIX and REPLAN_REEXECUTE get the cache; REVIEW and "
+                "UPDATE_EPIC get none",
+            ),
+            (
+                LaunchClass.EXPORT_COMMAND,
+                NetworkPosition(sandbox.premerge_network),
+                "pre-merge verification; validation.commands use the validation network",
+            ),
+        ]
         for launch_class, network, note in classes:
             facts = summary_facts(launch_class, network, cache=True, operator_paths=paths)
             shown = f"{launch_class.value}" + (f" ({note})" if note else "")
             notes.append(f"outer sandbox policy, {shown}: {class_summary(facts)}")
         return notes
 
-    def bind_local_state_dir(self, explicit: str | Path | None = None) -> None:
-        """Point :attr:`paths` at where this LOCAL run keeps its runtime state.
-
-        See :func:`local_state_paths` for the rule. The resolved directory is
-        checked against the working tree here rather than at first write: a
-        state directory inside the reviewed tree is refused, never quietly
-        excluded from the fingerprint.
-        """
-        ws = self.local_workspace()
-        self.paths = local_state_paths(ws, explicit=explicit, configured=self.config.state_dir)
-        ws.check_state_dir_location(self.paths.state_dir)
-
-    def local_state_paths(self) -> StatePaths:
-        """LOCAL mode's *default* state location, ignoring any configured one."""
-        return local_state_paths(self.local_workspace())
-
     def bind_issue_namespace(self, namespace: IssueNamespace) -> None:
         """Point :attr:`paths` at a scheduler namespace's state directory (ADR 0008 D5.3).
 
-        What :meth:`bind_local_state_dir` is to a LOCAL run, for a worker
-        (#182): called before the run starts, it lets the unchanged engine
+        For a worker (#182): called before the run starts, it lets the unchanged engine
         run on ``<namespace>/state`` anchored at the coordination root, so
         every component from ``autoforge`` down is opened ``O_NOFOLLOW`` from
         the common dir's descriptor and never resolved from the working
@@ -3163,11 +2824,10 @@ class ControllerEngine:
         """Refuse a standalone ``command`` whose state dir lies in the scheduler root.
 
         ADR 0008 D17.3 (:func:`autoforge.run_namespace.check_standalone_state_dir`):
-        ``run``, ``step``, ``resume`` and ``local run`` call it before they
-        take the lock, ``step`` and ``resume`` also before they look for
-        their run (``cli._bind_standalone_run``); ``status`` and ``unblock``
-        do not. A dry run is not checked: it runs no git, so it has no
-        coordination root, and it writes nothing.
+        ``run``, ``step`` and ``resume`` call it before they take the lock
+        and before they read any state; ``status`` and ``unblock`` do not. A
+        dry run is not checked: it runs no git, so it has no coordination
+        root, and it writes nothing.
         """
         check_standalone_state_dir(self.paths.state_dir, self.coordination_root(), command)
 
@@ -3197,99 +2857,14 @@ class ControllerEngine:
         self._state_from_disk = False
         return self.state
 
-    def new_local_run(
-        self, feature_spec_path: str | Path, allow_dirty: bool = False
-    ) -> AutoForgeState:
-        """Create a LOCAL run frozen to ``feature_spec_path``.
-
-        Resolves and hashes the specification, records the repository's HEAD
-        and the current working-tree state, and applies the dirty-tree policy
-        (see :meth:`_check_baseline_clean`). Nothing is written to disk here;
-        the caller persists the state under the controller lock.
-        """
-        ws = self.local_workspace()
-        ws.check_state_dir_location(self.paths.state_dir)
-        spec = read_feature_spec(ws, feature_spec_path)
-        dirty = self._check_baseline_clean(ws.dirty_paths(), spec, allow_dirty)
-        snapshot = ws.snapshot()
-        # The one moment the current configuration *defines* the run. From
-        # here on it is only ever compared against this.
-        contract = self._invocation_contract()
-        now = utcnow_iso()
-        self.state = AutoForgeState(
-            run_id=generate_run_id(),
-            mode=WorkflowMode.LOCAL,
-            phase=Phase.INITIALIZING,
-            feature_spec_path=spec.relative_path,
-            feature_spec_sha256=spec.sha256,
-            base_head_sha=snapshot.head_sha,
-            base_branch=snapshot.branch,
-            local_run_contract=contract.to_dict(),
-            workspace_fingerprint=snapshot.fingerprint,
-            baseline_dirty_paths=dirty,
-            created_at=now,
-            updated_at=now,
-            prompt_version=contract.prompt_version,
-        )
-        self._state_from_disk = False
-        return self.state
-
-    @staticmethod
-    def _check_baseline_clean(
-        dirty_paths: list[str], spec: FeatureSpec, allow_dirty: bool
-    ) -> list[str]:
-        """Dirty-working-tree policy for a new local run.
-
-        v1 is deliberately strict: the tree must be clean apart from the
-        feature specification itself (which is typically brand new and
-        uncommitted). The controller does not try to tell an operator's
-        unrelated in-progress edit apart from the implementation it is about
-        to ask for — an agent may legitimately edit the very same file, so any
-        such split would be a heuristic, and a wrong one would either hide
-        real changes from the reviewer or attribute the operator's work to the
-        feature.
-
-        ``--allow-dirty`` does not make the controller smarter, it makes the
-        situation *explicit*: the pre-existing paths are recorded in state,
-        shown in ``status`` and named to the reviewer as pre-existing. They
-        are never silently absorbed — and their *contents* are pinned, because
-        the run's first fingerprint covers the whole working tree, dirty
-        baseline included.
-
-        The list comes from ``git status``, which is the operator's own notion
-        of "work in the way". That is the right input for this policy question
-        and the wrong one for identity, which is why the fingerprint is built
-        from the controller's own walk instead.
-        """
-        dirty = [p for p in dirty_paths if p != spec.relative_path]
-        if dirty and not allow_dirty:
-            listed = ", ".join(dirty[:20]) + ("..." if len(dirty) > 20 else "")
-            raise ConfigurationError(
-                f"the working tree has {len(dirty)} change(s) besides the feature "
-                f"specification: {listed}. A local run reviews the whole working tree, and "
-                "the controller will not guess which changes belong to this feature. Commit "
-                "or stash them first, or pass --allow-dirty to record them as pre-existing "
-                "(they are then reported to you and to the reviewer, not hidden)."
-            )
-        return dirty
-
     def load(self) -> AutoForgeState:
-        """Read the run at :attr:`paths` through the held state root.
-
-        A LOCAL run is additionally passed through the contract gate here,
-        so no command -- ``resume``, ``step``, ``status``, a crash recovery
-        -- can act on a run whose definition this invocation would change.
-        """
+        """Read the run at :attr:`paths` through the held state root."""
         try:
             root = self.state_root(create=False)
         except FileNotFoundError:
             # Reading never creates: no state directory means no run here.
             raise no_state_error(self.paths.state_file) from None
         state = load_state(self.paths.state_file, root=root)
-        if state.is_local:
-            # Gate *before* binding: an engine never holds a run whose
-            # definition this invocation would change.
-            validate_local_run_contract(state.local_contract(), self._invocation_contract())
         self.state = state
         self._state_from_disk = True
         return state
@@ -3298,8 +2873,7 @@ class ControllerEngine:
         """The run recorded at :attr:`paths`, or ``None`` when there is none.
 
         For the pre-flight of a *new* run: an unreadable or foreign state
-        file is a StateError for the caller to refuse or quarantine, and a
-        LOCAL run is *not* passed through the contract gate, because the
+        file is a StateError for the caller to refuse or quarantine: the
         question here is only whether something would be overwritten.
         """
         try:
@@ -3356,18 +2930,10 @@ class ControllerEngine:
     def validate_config(self) -> None:
         """Fail early (ConfigurationError) when a required profile is unusable.
 
-        A LOCAL run never enters REPLAN_REEXECUTE or UPDATE_EPIC, so it does
-        not require those profiles to be configured. Which reviewer profiles it
-        does require follows from `local.max_fix_rounds`, because local review
-        rounds are routed exactly like remote ones.
-
-        A REMOTE run also refuses a configuration whose routing its recorded
+        It also refuses a configuration whose routing the run's recorded
         configuration could not hold (#219): the state file would not load
         again (:func:`autoforge.config_fingerprint.fingerprint_routing`).
         """
-        if self.mode == WorkflowMode.LOCAL:
-            validate_required_profiles(self.config, local_required_profiles(self.config))
-            return
         validate_required_profiles(self.config, REQUIRED_PROFILES)
         fingerprint_routing(self.config)
 
@@ -3678,43 +3244,6 @@ class ControllerEngine:
             )
         )
 
-    def _validation_commands_text(self) -> str:
-        cmds = self.local_contract().validation_commands
-        if not cmds:
-            return "(none configured)"
-        return "; ".join(" ".join(argv) for argv in cmds)
-
-    def _local_prompt_variables(self) -> dict[str, str | int | None]:
-        """Prompt context for a LOCAL phase: spec + working tree, no GitHub."""
-        s = self._require_state()
-        spec = self._frozen_spec()
-        snapshot = self._local_snapshot_for_prompt()
-        workspace_note = snapshot.describe()
-        if s.baseline_dirty_paths:
-            workspace_note += (
-                " | pre-existing (NOT part of this feature, do not review or revert): "
-                + ", ".join(escape_inline(path) for path in s.baseline_dirty_paths[:20])
-            )
-        return {
-            "PROMPT_VERSION": s.prompt_version,
-            "REPO_ROOT": escape_inline(str(self.workspace().root())),
-            "FEATURE_SPEC_PATH": escape_inline(s.feature_spec_path),
-            "FEATURE_SPEC_SHA256": s.feature_spec_sha256,
-            "FEATURE_SPEC_BLOCK": fenced_untrusted_block(spec.content, "markdown"),
-            "BASE_HEAD_SHA": s.base_head_sha or "(no commit yet)",
-            "BASE_BRANCH": s.base_branch or "(detached HEAD)",
-            "PRIOR_ATTEMPT": self._prior_attempt_note(),
-            "WORKSPACE_FINGERPRINT": snapshot.fingerprint,
-            "WORKSPACE_STATUS": workspace_note,
-            "WORKSPACE_EXCLUSIONS": snapshot.describe_exclusions(),
-            "VALIDATION_COMMANDS": self._validation_commands_text(),
-            "REVIEW_ROUND": s.review_round + 1 if s.phase != Phase.FIX else s.review_round,
-            "FINDINGS": self._format_findings(s.open_findings),
-            "VALIDATION_EVIDENCE": self._format_validation_evidence(),
-            **REVIEW_BOUND_VARIABLES,
-            **FIX_BOUND_VARIABLES,
-        }
-
     def _format_validation_evidence(self) -> str:
         """``{{VALIDATION_EVIDENCE}}``: the REVIEW evidence section (ADR 0006 D9.1, D9.2).
 
@@ -3737,33 +3266,6 @@ class ControllerEngine:
         seq = counter["last_record_seq"]
         view = next(r for r in s.validation_evidence() if r.seq == seq)
         return render_validation_failure(view, counter["count"])
-
-    def _prior_attempt_note(self) -> str:
-        """What to tell an agent whose phase was already invoked once."""
-        s = self._require_state()
-        if not self._local_resumed_invocation or s.local_pending_phase != s.phase.value:
-            return "(none — this is the first attempt at this phase in this run)"
-        return (
-            f"A previous invocation of {s.phase.value} in this run was launched and never "
-            "produced a result the controller could verify (it crashed, returned an invalid "
-            "CONTROL_RESULT, or its validation commands failed). Work from that attempt may "
-            "already be present in the working tree. Read what is there before you change "
-            "anything, continue it rather than starting over, and do not revert or delete it "
-            "just because you did not write it in this invocation."
-        )
-
-    def _frozen_spec(self) -> FeatureSpec:
-        """Re-read the frozen specification, requiring its hash to be unchanged."""
-        s = self._require_state()
-        return verify_feature_spec_unchanged(
-            self.local_workspace(),
-            s.feature_spec_path,
-            s.feature_spec_sha256,
-            when=f"before {s.phase.value}",
-        )
-
-    def _local_snapshot_for_prompt(self) -> WorkspaceSnapshot:
-        return self._local_bound_snapshot or self.local_workspace().snapshot()
 
     def _prompt_variables(self) -> dict[str, str | int | None]:
         s = self._require_state()
@@ -3834,9 +3336,9 @@ class ControllerEngine:
             **REVIEW_BOUND_VARIABLES,
             **FIX_BOUND_VARIABLES,
         }
-        if s.phase == Phase.ANALYZE_EXECUTE and s.mode == WorkflowMode.REMOTE:
+        if s.phase == Phase.ANALYZE_EXECUTE:
             variables.update(self._analyze_prompt_variables())
-        if s.phase == Phase.UPDATE_EPIC and s.mode == WorkflowMode.REMOTE:
+        if s.phase == Phase.UPDATE_EPIC:
             variables.update(self._update_epic_request_variables())
         if s.phase == Phase.REPLAN_REEXECUTE:
             # Before `_prepare_replan` has run (plan/dry-run rendering) the
@@ -3978,6 +3480,11 @@ class ControllerEngine:
                     "the state and title of each issue the EPIC references",
                     self._read_epic_issues(epic_body),
                 )
+                context.add(
+                    "epic-sub-issues.md",
+                    "the EPIC's native sub-issues, the only issues it may select next",
+                    self._read_epic_sub_issues(s.epic_url),
+                )
         return context
 
     def _read_operator_evidence(self) -> str:
@@ -4117,6 +3624,27 @@ class ControllerEngine:
                 entries.append(url)
         return render_issue_states(entries, "Issues the EPIC references", len(numbers))
 
+    def _read_epic_sub_issues(self, url: str) -> str:
+        """The EPIC's direct native sub-issues (#287): the issues a selection
+        may name, checked again by :meth:`_verify_epic_sub_issue`.
+
+        Each with its title, from the listing read that carries them
+        (:meth:`~autoforge.github.GitHubClient.list_titled_sub_issues`), so
+        an EPIC that names its tasks only as native sub-issues still tells
+        the agent what they are; and with the EPIC's own count, so a listing
+        that leaves out a sub-issue the token may not read says so.
+        """
+        title = "Sub-issues of the EPIC"
+        try:
+            reported = self.github.get_issue_node(url).sub_issues_total
+            rows = self.github.list_titled_sub_issues(url)
+        except GitHubError as exc:
+            return unreadable(title, f"the sub-issues of {url}", exc)
+        titles = {node.ref.canonical.lower(): name for node, name in rows}
+        return render_sub_issues(
+            [node for node, _ in rows], title, reported=reported, titles=titles
+        )
+
     def _replan_publication_variables(self, txn: ReplanTransaction) -> dict[str, str | int | None]:
         """The replacement's base, branch and PR text bounds (#164).
 
@@ -4225,14 +3753,8 @@ class ControllerEngine:
         return fenced_untrusted_block(split.section, "markdown")
 
     def template_for(self, phase: Phase) -> str | None:
-        """The prompt template of ``phase`` in the loaded run's mode."""
-        table = LOCAL_PHASE_TEMPLATE if self.mode == WorkflowMode.LOCAL else PHASE_TEMPLATE
-        if self.mode == WorkflowMode.LOCAL and phase not in table:
-            raise StateTransitionError(
-                f"phase {phase.value} belongs to the REMOTE workflow and is never executed "
-                "by a local run"
-            )
-        return table.get(phase)
+        """The prompt template of ``phase``."""
+        return PHASE_TEMPLATE.get(phase)
 
     def _launch_template(self, phase: Phase) -> str | None:
         """The template the next launch of ``phase`` renders.
@@ -4242,11 +3764,7 @@ class ControllerEngine:
         the input the controller still needs.
         """
         template = self.template_for(phase)
-        if (
-            self.mode == WorkflowMode.REMOTE
-            and phase == Phase.UPDATE_EPIC
-            and self._update_epic_request() != UpdateEpicRequest.FULL
-        ):
+        if phase == Phase.UPDATE_EPIC and self._update_epic_request() != UpdateEpicRequest.FULL:
             return UPDATE_EPIC_RE_REQUEST_TEMPLATE
         return template
 
@@ -4264,18 +3782,12 @@ class ControllerEngine:
         left unfilled, so the render refuses it rather than send a
         correction that does not show the reply it corrects.
         """
-        local = self.mode == WorkflowMode.LOCAL
         template = self._launch_template(phase)
         if template is None:
             raise StateTransitionError(f"phase {phase.value} has no agent prompt")
         if template not in TEMPLATE_FILES:
             raise StateTransitionError(f"unknown template {template}")
-        variables = self._local_prompt_variables() if local else self._prompt_variables()
-        prompt = render_phase(
-            template,
-            variables,
-            common_template=LOCAL_COMMON_TEMPLATE if local else COMMON_TEMPLATE,
-        )
+        prompt = render_phase(template, self._prompt_variables(), common_template=COMMON_TEMPLATE)
         if correction_error is not None:
             correction = render(
                 load_template("correction.md"),
@@ -4294,8 +3806,6 @@ class ControllerEngine:
         s = self._require_state()
         if s.phase in TERMINAL_PHASES:
             raise StateTransitionError(f"phase {s.phase.value} is terminal — nothing to execute")
-        if s.mode == WorkflowMode.LOCAL:
-            return self._plan_local_step(s)
         plan = self._plan_remote_step(s)
         # In every phase: each REMOTE step converts a pending marker first.
         plan.notes.extend(
@@ -4425,136 +3935,9 @@ class ControllerEngine:
             review_round=s.review_round + 1 if s.phase == Phase.REVIEW else s.review_round,
             variables={k: str(v) for k, v in variables.items()},
             expected_next=expected_next,
-            legal_next=self._legal_next_for(s.phase, s.mode),
+            legal_next=self._legal_next_for(s.phase),
             notes=notes,
         )
-
-    def _plan_local_step(self, s: AutoForgeState) -> StepPlan:
-        """Plan one LOCAL step. Pure: reads git and the spec, writes nothing.
-
-        A dry run stops here, so this must never invoke an agent, run a
-        validation command, write state, or touch GitHub.
-        """
-        if s.phase == Phase.INITIALIZING:
-            plan = self._deterministic_plan(
-                s,
-                "INITIALIZING -> ANALYZE_EXECUTE (freeze the feature spec; no agent, no GitHub)",
-                "ANALYZE_EXECUTE",
-                notes=[
-                    "mode: LOCAL (no gh, no PR, no push, no merge, no commits)",
-                    f"feature specification: {s.feature_spec_path}",
-                    f"frozen SHA-256: {s.feature_spec_sha256}",
-                    "would verify: the specification is unchanged and the workspace is readable",
-                ],
-            )
-            plan.variables = {
-                "FEATURE_SPEC_PATH": s.feature_spec_path,
-                "FEATURE_SPEC_SHA256": s.feature_spec_sha256,
-                "BASE_HEAD_SHA": s.base_head_sha or "(no commit yet)",
-                "BASE_BRANCH": s.base_branch or "(detached HEAD)",
-                "WORKSPACE_FINGERPRINT": s.workspace_fingerprint,
-            }
-            return plan
-        profile = profile_for_phase(self.config, s.phase, s.review_round)
-        variables = self._local_prompt_variables()
-        prompt = self.render_prompt_for(s.phase)
-        command = self.providers.get(profile).build_command_for(profile, prompt)
-        notes: list[str] = [
-            "mode: LOCAL (no gh, no PR, no push, no merge)",
-            f"feature specification: {s.feature_spec_path} "
-            f"(frozen {s.feature_spec_sha256[:16]}...)",
-            f"git anchor the run is pinned to: "
-            f"{s.base_head_sha[:12] or '(unborn)'} on {s.base_branch or '(detached HEAD)'} "
-            "(a commit, reset, checkout or branch switch enters BLOCKED)",
-            f"workspace fingerprint now: {variables['WORKSPACE_FINGERPRINT']}",
-        ]
-        if s.local_pending_phase == s.phase.value:
-            notes.append(
-                f"a previous {s.phase.value} invocation was checkpointed and never verified "
-                f"({s.local_pending_attempts} of {MAX_LOCAL_PHASE_ATTEMPTS} attempt(s) used); "
-                "its work is credited against the fingerprint from before that attempt"
-            )
-        if s.baseline_dirty_paths:
-            notes.append(
-                "pre-existing working-tree changes recorded at run creation "
-                f"(--allow-dirty): {', '.join(s.baseline_dirty_paths[:20])}"
-            )
-        contract = self.local_contract()
-        budget = step_budget_reason(s.step_count, contract.max_total_steps)
-        if budget:
-            notes.append(f"would enter BLOCKED without executing: {budget}")
-        if s.phase == Phase.REVIEW:
-            cap = contract.max_review_rounds
-            if s.review_round >= cap:
-                notes.append(
-                    "would enter BLOCKED without invoking the reviewer: local review round "
-                    f"{s.review_round + 1} exceeds local.max_fix_rounds + 1 = {cap}"
-                )
-            notes.append(
-                f"review round {s.review_round + 1} of at most {cap} "
-                f"(local.max_fix_rounds={contract.max_fix_rounds})"
-            )
-            if variables["WORKSPACE_FINGERPRINT"] != s.workspace_fingerprint:
-                notes.append(
-                    "would enter BLOCKED without invoking the reviewer: the working tree "
-                    f"changed since the controller last verified it (bound "
-                    f"{s.workspace_fingerprint[:16]}...); REVIEW never re-binds"
-                )
-            notes.append(
-                "the review is bound to the tree the controller last verified "
-                f"({s.workspace_fingerprint[:16]}...); it is refused unless the tree still "
-                "matches when the reviewer starts, and unless the reviewer reports exactly "
-                "that value and leaves the tree unchanged"
-            )
-        else:
-            notes.append(
-                "would verify afterwards: the feature spec hash is unchanged, the workspace "
-                "changed as claimed, and every configured validation command exits 0"
-            )
-        cmds = contract.validation_commands
-        notes.append(
-            "validation commands that would run after this phase: "
-            + ("; ".join(" ".join(argv) for argv in cmds) if cmds else "(none configured)")
-        )
-        if s.phase in LOCAL_WRITE_PHASES:
-            notes.extend(self._validation_plan_notes(LaunchClass.LOCAL_VALIDATION, cmds))
-        notes.append(
-            "the agent and the validation commands run from the run's repository root "
-            f"{contract.repository_root} (frozen; never the invocation's cwd)"
-        )
-        notes.extend(self._sandbox_plan_notes())
-        return StepPlan(
-            phase=s.phase.value,
-            profile_name=profile.name,
-            provider=profile.provider,
-            model=profile.model,
-            effort=profile.effort,
-            command=command,
-            limits=self.config.agent_limits(profile),
-            loop_detection=self.config.execution.loop_detection.for_invocation(
-                profile.provider, s.phase.value
-            ),
-            prompt_length=len(prompt),
-            prompt_preview=prompt[:1200],
-            prompt_full=prompt,
-            routing=self._routing_info(s, profile.name),
-            template=self.template_for(s.phase) or "",
-            review_round=s.review_round + 1 if s.phase == Phase.REVIEW else s.review_round,
-            variables={k: str(v) for k, v in variables.items()},
-            expected_next=self._local_expected_next(s.phase),
-            legal_next=self._legal_next_for(s.phase, WorkflowMode.LOCAL),
-            notes=notes,
-        )
-
-    @staticmethod
-    def _local_expected_next(phase: Phase) -> str:
-        return {
-            Phase.INITIALIZING: "ANALYZE_EXECUTE",
-            Phase.ANALYZE_EXECUTE: "REVIEW (after workspace + validation verification)",
-            Phase.REVIEW: "DONE if clean, FIX if findings and the fix budget remains, "
-            "BLOCKED if findings remain after it",
-            Phase.FIX: "REVIEW (after workspace + validation verification)",
-        }.get(phase, "")
 
     def _merge_argv(self) -> list[str]:
         """Exact ``gh`` argv the controller would run to merge the current PR."""
@@ -4626,7 +4009,7 @@ class ControllerEngine:
             template="",
             review_round=state.review_round,
             expected_next=expected,
-            legal_next=ControllerEngine._legal_next_for(state.phase, state.mode),
+            legal_next=ControllerEngine._legal_next_for(state.phase),
             notes=notes,
         )
 
@@ -4648,8 +4031,8 @@ class ControllerEngine:
         }.get(phase, "")
 
     @staticmethod
-    def _legal_next_for(phase: Phase, mode: WorkflowMode = WorkflowMode.REMOTE) -> list[str]:
-        return sorted(p.value for p in edges_for(mode).get(phase, frozenset()))
+    def _legal_next_for(phase: Phase) -> list[str]:
+        return sorted(p.value for p in edges_for().get(phase, frozenset()))
 
     def _next_phase(self, current: Phase, decision: dict) -> Phase:
         """The lifecycle edge out of ``current`` for the controller's ``decision``.
@@ -4663,7 +4046,7 @@ class ControllerEngine:
         The chosen edge still goes through :func:`validate_transition` at the
         site that applies it.
         """
-        return decide_next_phase(current, decision, self.mode)
+        return decide_next_phase(current, decision)
 
     @staticmethod
     def _routing_info(state: AutoForgeState, profile_name: str) -> str:
@@ -4797,11 +4180,7 @@ class ControllerEngine:
         """
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
-        if self.mode == WorkflowMode.LOCAL:
-            # No READY_FOR_MERGE holding state exists locally.
-            stop_phases = stop_phases_for(WorkflowMode.LOCAL)
-        else:
-            stop_phases = TERMINAL_PHASES if self.merge_gate_open(allow_merge) else STOP_PHASES
+        stop_phases = TERMINAL_PHASES if self.merge_gate_open(allow_merge) else STOP_PHASES
         stop_phases = frozenset(stop_phases) | frozenset(extra_stop_phases)
         if dry_run:
             outcomes = [self._step_once(dry_run=True, allow_merge=allow_merge)]
@@ -4870,28 +4249,17 @@ class ControllerEngine:
         # for a step that may launch: a host that cannot enforce, under a
         # mode that refuses, leaves the run byte-identical -- no recovery
         # record, no plan snapshot, no step or attempt charged.
-        local = state.mode == WorkflowMode.LOCAL
-        if (
-            previous in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX)
-            if local
-            else self._step_may_launch(previous, allow_merge)
-        ):
+        if self._step_may_launch(previous, allow_merge):
             self._sandbox_gate()
         # Under the lock, before anything else of the step, the plan included
         # (ADR 0006 D11.3): a validation marker a crash left becomes its
-        # INTERRUPTED record. Planning can refuse -- a LOCAL plan snapshots
-        # the working tree, where the interrupted validator may have left a
-        # FIFO or an over-budget tree -- and a refusal must not strand the
-        # marker for every resume after it.
+        # INTERRUPTED record. A planning refusal must not strand the marker
+        # for every resume after it.
         recovered = self._recover_validation_attempt(previous)
         if recovered is not None:
             return recovered
         plan = self.plan_step()
 
-        if state.mode == WorkflowMode.LOCAL:
-            # A LOCAL run's step budget is part of its contract, so it is
-            # checked there, from the persisted value.
-            return self._local_step_once(previous, plan)
         # Cumulative step budget: measured on persisted state, so `resume`
         # continues the same budget. Checked before anything executes -- except
         # that a replan journal past the write is finished first (#71).
@@ -4935,7 +4303,7 @@ class ControllerEngine:
             )
         except CheckoutDriftError as exc:
             # The operator's checkout moved under the agent (the prompts
-            # forbid it; this is the controller enforcing it, as LOCAL does).
+            # forbid it; this is the controller enforcing it).
             return self._block(previous, plan, str(exc))
         except SandboxTamperError as exc:
             # The issue's private object directory names another object
@@ -5045,834 +4413,6 @@ class ControllerEngine:
             return self._reconcile_update_epic_entry(plan)
         return None
 
-    # ======================================================================
-    # LOCAL mode
-    #
-    # No GitHub client is ever constructed here. The working tree is the
-    # source of truth, exactly as GitHub is in REMOTE mode: every agent claim
-    # is re-derived from `git` by :mod:`autoforge.local_workspace` before it
-    # is acted on, and the frozen feature specification is re-hashed around
-    # every phase.
-    def _local_step_once(self, previous: Phase, plan: StepPlan) -> StepOutcome:
-        state = self._require_state()
-        # The contract gate, before anything is counted, verified or run.
-        contract = self.local_contract()
-        # Cumulative step budget, from the contract: the bound the run was
-        # created under, not today's `workflow.max_total_steps` (R9-F2 --
-        # the gate above already refuses a changed one, and execution reads
-        # run-defining values from the contract regardless).
-        budget = step_budget_reason(state.step_count, contract.max_total_steps)
-        if budget:
-            return self._block(previous, plan, self._local_budget_block_reason(budget))
-        if previous == Phase.INITIALIZING:
-            state.step_count += 1
-            return self._initialize_local(plan)
-        if previous not in (Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX):
-            raise StateTransitionError(f"phase {previous.value} is not part of the LOCAL workflow")
-        if previous in LOCAL_WRITE_PHASES:
-            # A contract persisted before the bounds existed (ADR 0006 D10.3)
-            # is refused before the agent and before any marker: a record
-            # never truncates an argv, and re-checking cannot change it.
-            problem = definition_problem(contract.validation_commands)
-            if problem:
-                return self._block(previous, plan, self._local_definition_block_reason(problem))
-        if previous == Phase.REVIEW:
-            cap = contract.max_review_rounds
-            if state.review_round >= cap:
-                # Round cap+1 never starts: its findings could never be fixed.
-                return self._block(
-                    previous,
-                    plan,
-                    self._local_block_reason(
-                        f"local review round {state.review_round + 1} would exceed the local "
-                        f"bound of {cap} review round(s) "
-                        f"(local.max_fix_rounds={contract.max_fix_rounds})"
-                    ),
-                )
-
-        state.step_count += 1
-        # Freeze check + git anchor + fingerprint binding, before the agent
-        # runs. The bound status is what the prompt is rendered from, so the
-        # fingerprint the reviewer is told to report is exactly the one
-        # persisted here.
-        self._frozen_spec()
-        drift = self._git_anchor_drift()
-        if drift:
-            return self._block(previous, plan, self._local_anchor_block_reason(drift))
-        before = self.local_workspace().snapshot()
-        if previous == Phase.REVIEW:
-            # REVIEW never binds a new fingerprint. `workspace_fingerprint` is
-            # the tree as the controller last *verified* it -- the bytes the
-            # validation commands passed on -- and a review is only ever bound
-            # to that. A tree that differs here was written by something the
-            # controller did not verify: a reviewer that edited the code and
-            # then crashed (or returned, was refused, and is being resumed), a
-            # process an agent left behind, or the operator. The controller
-            # cannot tell those apart and does not try; re-binding would let
-            # the next reviewer clear bytes no validation command ever saw
-            # (R10-F1), so the run blocks and the tree is left as it is.
-            if before.fingerprint != state.workspace_fingerprint:
-                return self._block(previous, plan, self._local_unverified_tree_block_reason(before))
-            # ADR 0006 D5.7: the evidence the write phase recorded for that
-            # fingerprint, and the binding naming it; LOCAL REVIEW runs none.
-            blocked = self._require_local_review_evidence(plan)
-            if blocked is not None:
-                return blocked
-        else:
-            state.workspace_fingerprint = before.fingerprint
-
-        # Durable invocation checkpoint for the write-capable phases. It is
-        # written by :meth:`_charge_local_launch` immediately before the agent
-        # starts (inside ``_invoke_phase``), so a crash mid-invocation, a
-        # malformed CONTROL_RESULT or a failing validation command all leave
-        # the same recoverable record: "this phase was launched once and its
-        # work may already be in the tree" -- and a refusal *before* the
-        # launch (a corrupt event journal, an unusable profile, a missing
-        # template) leaves no record, because nothing was launched (#57).
-        # Here the entry only decides whether it is a fresh one or a retry
-        # of a launched one, and whether the retry is still within bound.
-        baseline = before.fingerprint
-        if state.local_pending_phase and state.local_pending_phase != previous.value:
-            # `load_state` refuses this shape; the check is repeated here so
-            # that no in-memory path can resolve one phase and then close the
-            # checkpoint another phase left behind.
-            raise StateError(
-                f"cannot enter {previous.value}: the LOCAL checkpoint records an "
-                f"unverified {state.local_pending_phase} launch, which only "
-                f"{state.local_pending_phase} may resume"
-            )
-        if previous in LOCAL_WRITE_PHASES:
-            if state.local_pending_phase == previous.value:
-                # An earlier attempt at this same phase entry never produced a
-                # verified result. Its work counts, so "did anything actually
-                # get implemented?" is judged against the fingerprint from
-                # before *that* attempt, not against the tree it left behind.
-                baseline = state.local_pending_fingerprint or before.fingerprint
-                if state.local_pending_attempts >= MAX_LOCAL_PHASE_ATTEMPTS:
-                    return self._block(
-                        previous,
-                        plan,
-                        self._local_block_reason(
-                            f"{previous.value} was invoked {state.local_pending_attempts} "
-                            f"time(s) without ever producing a verified result, which is "
-                            f"the bound of {MAX_LOCAL_PHASE_ATTEMPTS}. The controller will "
-                            "not launch a write-capable agent at the same phase again"
-                        ),
-                    )
-                self._local_resumed_invocation = True
-
-        def anchored_relaunch() -> StepOutcome | None:
-            # :meth:`_invoke_phase` calls this before every relaunch (in LOCAL
-            # mode, a correction) and before charging it (#209): an anchor the
-            # launch before it moved blocks here, so no second write-capable
-            # agent starts in the moved checkout, and the refused relaunch is
-            # not charged to the durable bound.
-            drift = self._git_anchor_drift()
-            if not drift:
-                return None
-            return self._block(
-                previous,
-                plan,
-                self._local_anchor_block_reason(
-                    f"{drift}, found before a relaunch: attempt {state.attempt} ended without "
-                    f"a usable result ({self._launch_log_says_why()}), and no agent was "
-                    "launched again"
-                ),
-            )
-
-        self._local_bound_snapshot = before
-        self._save()
-        try:
-            invoked = self._invoke_phase(previous, anchored_relaunch)
-        except (ExecutionError, ControlResultValidationError) as exc:
-            # As in REMOTE mode (#189): the checkpoint above is what 'resume'
-            # retries against, and the error says where to look first.
-            exc.args = (self._state_unchanged_text(str(exc)),)
-            raise
-        finally:
-            self._local_bound_snapshot = None
-            self._local_resumed_invocation = False
-        if isinstance(invoked, StepOutcome):
-            return invoked
-        payload = invoked
-
-        status = payload.get("status")
-        if status in ("failure", "blocked"):
-            nxt = Phase.FAILED if status == "failure" else Phase.BLOCKED
-            # Agent-supplied text, persisted in a plain `state.json` and
-            # printed by the CLI: same redaction boundary as the run log, and
-            # the same bound as every other block reason (#88); the parser
-            # bounds this `message` only through the whole block's size.
-            message = bound_block_reason(
-                redact(str(payload.get("message", "") or f"agent reported {status}"))
-            )
-            state.phase = nxt
-            state.block_reason = message
-            self._clear_local_invocation()
-            self._save()
-            return self._outcome(
-                previous,
-                plan=plan,
-                result=payload,
-                message=f"agent reported {status}: {message}",
-            )
-
-        drift = self._git_anchor_drift()
-        if drift:
-            # The agent committed, reset or switched branches during its run.
-            # The prompts forbid it; this is the controller enforcing it.
-            return self._block(previous, plan, self._local_anchor_block_reason(drift))
-
-        try:
-            nxt_phase, message = self._verify_and_apply_local(previous, payload, before, baseline)
-        except (VerificationError, ControlResultValidationError) as exc:
-            # The agent ran and may have changed the working tree, but its
-            # claims did not verify. Persist the attempt so `resume` re-enters
-            # this phase from the real state of the tree — the invocation
-            # checkpoint above is what keeps that re-entry from mistaking
-            # already-produced work for work that was never done.
-            if isinstance(exc, VerificationError):
-                self._record_verification_failure(previous, exc)
-            self._save()
-            raise
-        self._clear_local_invocation()
-        if nxt_phase == Phase.BLOCKED:
-            return self._block(previous, plan, message)
-        validate_transition(previous, nxt_phase, WorkflowMode.LOCAL)
-        state.phase = nxt_phase
-        state.attempt = 0
-        self._save()
-        return self._outcome(previous, plan=plan, result=payload, message=message)
-
-    def _charge_local_launch(self, phase: Phase) -> str:
-        """Charge one write-capable launch of ``phase`` to the LOCAL checkpoint.
-
-        Called immediately before *every* launch of a write-capable agent --
-        the phase entry's first, a correction retry, a resumed attempt -- and
-        nowhere else, so that what is charged is exactly what was launched.
-        A refusal that lands earlier in ``_invoke_phase`` (the event journal,
-        the profile, the prompt template) therefore charges nothing (#57).
-
-        Returns ``""`` after charging, so the launch may proceed, or the
-        reason it may not: the checkpoint has already spent
-        :data:`MAX_LOCAL_PHASE_ATTEMPTS`. The charge is persisted by the
-        caller's pre-launch save (:meth:`_invoke_phase`), together with the
-        attempt counter, in the one write that precedes the agent: the
-        persisted count is what bounds the phase entry, and a launch that was
-        never charged is a launch a crash would let ``resume`` repeat. The
-        first launch of an entry opens the checkpoint (phase, the fingerprint
-        the entry was bound to, one attempt) in that same write; a checkpoint
-        is never persisted with zero launches. A REMOTE run, or a read-only
-        LOCAL phase, has no checkpoint to charge and is never refused here.
-        """
-        state = self._require_state()
-        if state.mode != WorkflowMode.LOCAL or phase not in LOCAL_WRITE_PHASES:
-            return ""
-        if not state.local_pending_phase:
-            if self._local_bound_snapshot is None:
-                raise StateError(
-                    f"cannot charge a {phase.value} launch: no workspace snapshot is bound"
-                )
-            state.local_pending_phase = phase.value
-            state.local_pending_fingerprint = self._local_bound_snapshot.fingerprint
-            state.local_pending_attempts = 0
-        elif state.local_pending_phase != phase.value:
-            raise StateError(
-                f"cannot charge a {phase.value} launch: the LOCAL checkpoint records "
-                f"{state.local_pending_phase}"
-            )
-        if state.local_pending_attempts >= MAX_LOCAL_PHASE_ATTEMPTS:
-            return (
-                f"{phase.value} has been launched {state.local_pending_attempts} time(s) "
-                f"without ever producing a verified result, which is the bound of "
-                f"{MAX_LOCAL_PHASE_ATTEMPTS}; the next step enters BLOCKED"
-            )
-        state.local_pending_attempts += 1
-        return ""
-
-    def _clear_local_invocation(self) -> None:
-        """Close the pending-invocation checkpoint (the phase is resolved)."""
-        state = self._require_state()
-        state.local_pending_phase = ""
-        state.local_pending_fingerprint = ""
-        state.local_pending_attempts = 0
-
-    def _git_anchor_drift(self) -> str:
-        """Describe how HEAD/branch moved since the run started, or "".
-
-        Two cheap `git` reads, deliberately not a full :meth:`status` call:
-        this runs immediately before and after every agent phase, and hashing
-        the tree to answer "did HEAD move?" would be wasteful.
-        """
-        state = self._require_state()
-        ws = self.workspace()
-        head, branch = ws.head_sha(), ws.branch()
-        drift: list[str] = []
-        if head != state.base_head_sha:
-            drift.append(
-                f"HEAD moved from {state.base_head_sha[:12] or '(unborn)'} to "
-                f"{head[:12] or '(unborn)'}"
-            )
-        if branch != state.base_branch:
-            drift.append(
-                f"the checked-out branch changed from "
-                f"{state.base_branch or '(detached HEAD)'} to {branch or '(detached HEAD)'}"
-            )
-        return " and ".join(drift)
-
-    def _local_anchor_block_reason(self, drift: str) -> str:
-        root = self._require_state().local_contract().repository_root
-        return self._local_block_reason(
-            f"the repository's git anchor moved during the run: {drift}. A local run never "
-            "commits, resets, checks out or switches branches, and it requires the same to "
-            "be true of the agents it invokes: the accumulated findings and the frozen "
-            "specification describe the working tree as it was anchored, and the controller "
-            "cannot tell an agent's commit from an operator's. Nothing was rolled back — "
-            "the controller never undoes a git operation it did not perform"
-        ) + self._moved_checkout_recovery(root)
-
-    def _local_unverified_tree_block_reason(self, now: WorkspaceSnapshot) -> str:
-        state = self._require_state()
-        return self._local_block_reason(
-            f"the working tree changed since the controller last verified it (fingerprint "
-            f"{state.workspace_fingerprint[:16]}... -> {now.fingerprint[:16]}...; now "
-            f"{now.describe()}). A review is bound only to a tree whose bytes passed the "
-            "validation commands, and REVIEW never re-binds to a tree it did not verify: "
-            "the change may be a reviewer's edit from an invocation that crashed or was "
-            "refused, a process an agent left running, or an operator's, and the controller "
-            "cannot tell those apart. Nothing was rolled back -- the controller never "
-            "undoes a write it did not perform"
-        )
-
-    def _initialize_local(self, plan: StepPlan) -> StepOutcome:
-        """Preflight for a local run: config, git, frozen spec. No GitHub."""
-        state = self._require_state()
-        self.local_contract()
-        self.validate_config()
-        ws = self.local_workspace()
-        # Refuses a state directory inside the reviewed tree before any
-        # fingerprint is computed (see check_state_dir_location). The contract
-        # already proves the state directory is the one the run was created
-        # with; this keeps the location rule itself in one place.
-        ws.check_state_dir_location(self.paths.state_dir)
-        spec = verify_feature_spec_unchanged(
-            ws, state.feature_spec_path, state.feature_spec_sha256, when="before ANALYZE_EXECUTE"
-        )
-        drift = self._git_anchor_drift()
-        if drift:
-            return self._block(Phase.INITIALIZING, plan, self._local_anchor_block_reason(drift))
-        snapshot = ws.snapshot()
-        state.workspace_fingerprint = snapshot.fingerprint
-        nxt = self._next_phase(Phase.INITIALIZING, {})
-        validate_transition(Phase.INITIALIZING, nxt, WorkflowMode.LOCAL)
-        state.phase = nxt
-        self._save()
-        return self._outcome(
-            Phase.INITIALIZING,
-            plan=plan,
-            message=(
-                f"froze feature specification {spec.relative_path} "
-                f"(sha256 {spec.sha256[:16]}...) at {snapshot.anchor}; "
-                f"INITIALIZING -> {nxt.value}"
-            ),
-        )
-
-    def _local_definition_block_reason(self, problem: str) -> str:
-        state = self._require_state()
-        return (
-            "this run's contract holds local.validation_commands beyond the bounds a "
-            f"validation record can hold: {problem} (at most 16 definitions, each at most 32 "
-            "non-blank argv elements of at most 1,024 characters and 4,096 in all). The "
-            "contract was written by an older controller and cannot change within the run, so "
-            "no agent or validation command was launched and nothing was recorded. The run "
-            f"stays on feature {state.feature_spec_path}; start a new run with commands within "
-            "the bounds"
-        )
-
-    def _local_block_reason(self, reason: str) -> str:
-        state = self._require_state()
-        return (
-            f"{reason}. The run stays on feature {state.feature_spec_path}; the work is left "
-            "in the working tree exactly as it is (nothing was committed, reverted or "
-            "discarded). A human must inspect the open findings, or raise "
-            "'local.max_fix_rounds' in the config and start a new run."
-        )
-
-    def _verify_and_apply_local(
-        self, phase: Phase, payload: dict, before: WorkspaceSnapshot, baseline: str
-    ) -> tuple[Phase, str]:
-        """Verify one LOCAL agent result.
-
-        ``before`` is the fingerprint from immediately before *this*
-        invocation, which is what the agent's own ``changed_workspace`` claim
-        describes. ``baseline`` is the fingerprint from before the *first*
-        invocation of this phase entry; on a first attempt they are the same
-        value, and on a retry ``baseline`` is what "an implementation exists"
-        is judged against, so work an earlier attempt already produced is not
-        demanded a second time.
-        """
-        if phase == Phase.ANALYZE_EXECUTE:
-            return self._apply_local_analyze(
-                LocalAnalyzeExecuteResult.from_payload(payload), before, baseline
-            )
-        if phase == Phase.REVIEW:
-            return self._apply_local_review(LocalReviewResult.from_payload(payload))
-        if phase == Phase.FIX:
-            return self._apply_local_fix(LocalFixResult.from_payload(payload), before, baseline)
-        raise StateTransitionError(f"phase {phase.value} does not accept local agent results")
-
-    def _verify_workspace_change(
-        self, phase: Phase, before: WorkspaceSnapshot, claimed: bool
-    ) -> WorkspaceSnapshot:
-        """Re-derive what actually changed and cross-check the agent's claim."""
-        state = self._require_state()
-        verify_feature_spec_unchanged(
-            self.local_workspace(),
-            state.feature_spec_path,
-            state.feature_spec_sha256,
-            when=f"after {phase.value}",
-        )
-        after = self.local_workspace().snapshot()
-        changed = after.fingerprint != before.fingerprint
-        if claimed != changed:
-            raise VerificationError(
-                f"{phase.value} reported changed_workspace={claimed} but the controller "
-                f"observed the working tree {'change' if changed else 'stay identical'} "
-                f"(fingerprint {before.fingerprint[:16]}... -> {after.fingerprint[:16]}...). "
-                f"Current state: {after.describe()}"
-            )
-        return after
-
-    def _apply_local_analyze(
-        self, res: LocalAnalyzeExecuteResult, before: WorkspaceSnapshot, baseline: str
-    ) -> tuple[Phase, str]:
-        state = self._require_state()
-        after = self._verify_workspace_change(Phase.ANALYZE_EXECUTE, before, res.changed_workspace)
-        if after.fingerprint == baseline:
-            raise VerificationError(
-                "ANALYZE_EXECUTE reported success but the working tree is unchanged since "
-                "this phase was first invoked: no implementation exists to review. An agent "
-                "that cannot implement the feature must report status 'blocked' or 'failure' "
-                "with a reason instead."
-            )
-        verified = self._verified_snapshot(Phase.ANALYZE_EXECUTE, after)
-        state.workspace_fingerprint = verified.fingerprint
-        state.last_review_result = ""
-        tests = (
-            f", tests attempted: {', '.join(res.tests_attempted)}" if res.tests_attempted else ""
-        )
-        nxt = self._next_phase(Phase.ANALYZE_EXECUTE, {})
-        return nxt, (
-            f"implementation verified: working tree now holds {verified.describe()}, "
-            f"fingerprint {verified.fingerprint[:16]}...{tests}; "
-            f"ANALYZE_EXECUTE -> {nxt.value}"
-        )
-
-    def _verified_snapshot(self, phase: Phase, after: WorkspaceSnapshot) -> WorkspaceSnapshot:
-        """Run the validation commands and return the tree they left behind.
-
-        ``after`` is the tree the agent produced. The commands are the
-        controller's own, from the contract, and they may write into the tree
-        (a test runner's cache, a build output), so the fingerprint the next
-        REVIEW is bound to is taken *after* they ran: it is the tree as the
-        controller's verification left it, and REVIEW refuses any other. When
-        no command is configured nothing controller-side touched the tree
-        and ``after`` is that fingerprint already; a second walk would only
-        re-derive it. With commands, it is the walk after the last one.
-        """
-        verified = self._run_validation_commands(phase, after)
-        return after if verified is None else verified
-
-    def _apply_local_review(self, res: LocalReviewResult) -> tuple[Phase, str]:
-        state = self._require_state()
-        expected_round = state.review_round + 1
-        bound = state.workspace_fingerprint
-        if res.round != expected_round:
-            raise VerificationError(
-                f"REVIEW round mismatch: expected {expected_round}, got {res.round}"
-            )
-        if res.reviewed_workspace_fingerprint != bound:
-            raise VerificationError(
-                f"REVIEW fingerprint mismatch: the controller bound workspace {bound}, "
-                f"the agent reviewed {res.reviewed_workspace_fingerprint}. A review is only "
-                "valid for the exact workspace it was bound to."
-            )
-        verify_feature_spec_unchanged(
-            self.local_workspace(),
-            state.feature_spec_path,
-            state.feature_spec_sha256,
-            when="after REVIEW",
-        )
-        after = self.local_workspace().snapshot()
-        if after.fingerprint != bound:
-            # REVIEW is read-only; a reviewer that edited the code changed the
-            # very thing it was judging, so its verdict describes nothing that
-            # still exists.
-            raise VerificationError(
-                f"the reviewer modified the working tree during REVIEW (fingerprint "
-                f"{bound[:16]}... -> {after.fingerprint[:16]}...). A local review must not "
-                f"change what it reviews. Current state: {after.describe()}"
-            )
-
-        # A valid review lifecycle: the round is consumed either way.
-        state.review_round = res.round
-        state.reviewed_workspace_fingerprint = bound
-        state.last_review_needs_fix = res.needs_fix_round
-        # Findings are agent-authored text persisted in plain `state.json` and
-        # rendered into the next FIX prompt, so they cross the same redaction
-        # boundary as the run log.
-        findings = [redact_dict(f.to_dict()) for f in res.findings]
-        # ``review_history`` is shared with REMOTE mode; locally the "reviewed
-        # head" slot carries the workspace fingerprint, which plays exactly
-        # the same role (what this verdict is valid for).
-        self._record_review(
-            res.round, bound, RESULT_NEEDS_FIX if res.needs_fix_round else RESULT_CLEAN, findings
-        )
-        nxt = self._next_phase(Phase.REVIEW, {"needs_fix_round": res.needs_fix_round})
-        if res.needs_fix_round:
-            state.last_review_result = "needs_fix"
-            state.open_findings = findings
-            budget = self.local_contract().max_fix_rounds
-            if state.local_fix_rounds >= budget:
-                return Phase.BLOCKED, self._local_block_reason(
-                    f"local review round {res.round}: {len(findings)} finding(s) remain after "
-                    f"{state.local_fix_rounds} fix round(s), which is the configured local "
-                    f"budget (local.max_fix_rounds={budget})"
-                )
-            return nxt, (
-                f"local review round {res.round}: {len(findings)} finding(s); REVIEW -> "
-                f"{nxt.value} (fix round {state.local_fix_rounds + 1} of {budget})"
-            )
-        state.last_review_result = "clean"
-        state.open_findings = []
-        # ADR 0006 D12.5: DONE only with a certificate, issued in the DONE
-        # write from the round's binding and the fingerprint the reviewer
-        # was bound to and re-checked against. GitHub is never consulted.
-        uncertified, _ = self._issue_review_certificate(
-            lambda records: local_certificate(
-                state.review_evidence,
-                records,
-                run_id=state.run_id,
-                review_round=res.round,
-                needs_fix_round=res.needs_fix_round,
-                actionable_findings=len(findings),
-                reviewed_workspace_fingerprint=bound,
-                issued_at=utcnow_iso(),
-            )
-        )
-        if uncertified:
-            return Phase.BLOCKED, (
-                f"local review round {res.round} was clean for workspace {bound[:16]}..., but "
-                f"{uncertified}, so DONE was not entered. The run stays on feature "
-                f"{state.feature_spec_path}; the work is left in the working tree exactly as it "
-                "is (nothing was committed, reverted or discarded). A LOCAL run has no unblock: "
-                "start a new local run"
-            )
-        return nxt, (
-            f"local review round {res.round} clean for workspace {bound[:16]}...; review "
-            f"certificate issued; REVIEW -> {nxt.value}. The implementation is in the working "
-            "tree; committing it is yours to do."
-        )
-
-    def _apply_local_fix(
-        self, res: LocalFixResult, before: WorkspaceSnapshot, baseline: str
-    ) -> tuple[Phase, str]:
-        state = self._require_state()
-        open_ids = [f["id"] for f in state.open_findings]
-        reported = [r.finding_id for r in res.resolutions]
-        missing = sorted(set(open_ids) - set(reported))
-        extra = sorted(set(reported) - set(open_ids))
-        if missing or extra:
-            raise VerificationError(
-                f"FIX resolutions must cover exactly the open findings; missing={missing} "
-                f"unknown={extra}"
-            )
-        after = self._verify_workspace_change(Phase.FIX, before, res.changed_workspace)
-        fixed = [r for r in res.resolutions if r.resolution == "fixed"]
-        if fixed and after.fingerprint == baseline:
-            raise VerificationError(
-                f"FIX claims {len(fixed)} 'fixed' resolution(s) but the working tree is "
-                "unchanged since this fix round was first invoked; nothing was actually fixed."
-            )
-        state.last_fix_resolutions = [redact_dict(r.to_dict()) for r in res.resolutions]
-        # The round number this attempt would conclude. `local_fix_rounds`
-        # counts fix rounds the controller *concluded* — either back to REVIEW
-        # or terminally BLOCKED — and deliberately not ones still in flight,
-        # so it is charged at each of those two exits rather than here. A FIX
-        # whose validation command fails is neither: the phase stays at FIX
-        # for `resume`, and charging the budget for an attempt no controller
-        # verified would spend a fix round on work that was never accepted and
-        # block a later round that would have been. Re-entry stays bounded by
-        # the separate `local_pending_attempts` checkpoint, which counts
-        # *invocations* and is what stops a phase that can never be completed.
-        round_no = state.local_fix_rounds + 1
-
-        # An 'unresolved' disposition is the agent saying the finding is real
-        # and it could not resolve it. That is an agent-reported blocker, and
-        # the controller must not let it evaporate: clearing `open_findings`
-        # here would let the next reviewer return a clean verdict and carry
-        # the run to DONE with an acknowledged, unaddressed finding in it.
-        # There is no "re-review it and see" policy to fall back on — the
-        # reviewer is a different profile with no memory of the disposition —
-        # so this is terminal and a human decides.
-        unresolved = [r for r in res.resolutions if not r.is_resolved]
-        if unresolved:
-            keep = {r.finding_id for r in unresolved}
-            state.open_findings = [f for f in state.open_findings if f.get("id") in keep]
-            state.last_review_result = "unresolved"
-            # Concluded, terminally: the round is charged.
-            state.local_fix_rounds = round_no
-            detail = "; ".join(
-                f"{r.finding_id}: {redact(r.rationale) or '(no rationale)'}" for r in unresolved
-            )
-            return Phase.BLOCKED, self._local_block_reason(
-                f"local fix round {round_no} left {len(unresolved)} of "
-                f"{len(res.resolutions)} finding(s) explicitly unresolved, so the "
-                f"implementation is not complete and no later review can clear them "
-                f"({detail}). The validation commands were not run"
-            )
-
-        verified = self._verified_snapshot(Phase.FIX, after)
-        state.workspace_fingerprint = verified.fingerprint
-        state.local_fix_rounds = round_no
-        state.open_findings = []
-        state.last_review_result = "fixed"
-        no_change = [r.finding_id for r in res.resolutions if r.resolution != "fixed"]
-        note = (
-            f", {len(no_change)} resolved without a change ({', '.join(no_change)})"
-            if no_change
-            else ""
-        )
-        nxt = self._next_phase(Phase.FIX, {})
-        return nxt, (
-            f"local fix round {round_no} verified: {len(res.resolutions)} "
-            f"resolution(s){note}; FIX -> {nxt.value} (round {state.review_round + 1})"
-        )
-
-    def _run_validation_commands(
-        self, phase: Phase, start: WorkspaceSnapshot
-    ) -> WorkspaceSnapshot | None:
-        """Run ``local.validation_commands`` until they converge; the tree they validated.
-
-        Controller-owned verification, not something an agent reports: the
-        commands come from configuration as argv arrays and are executed
-        through the normal executor, never through a shell. A command that
-        does not pass means the phase is not verified, so the run stays in
-        this phase for ``resume`` rather than advancing on an agent's word.
-
-        Each command that runs leaves a ``ValidationRecord`` in the state
-        file (ADR 0006 D10.1): its definition, policy P, the outcome, the
-        bounded output, and the fingerprints the walks before and after it
-        read. ``start`` is the walk before the first command (the tree the
-        agent produced, walked just before); the walk after each command is
-        the next one's start. The attempt marker is saved immediately before
-        each launch and cleared in the save that appends its record.
-
-        The convergence rule (D7.2): a record is evidence for its start
-        fingerprint only when it ended there too. When a passing command
-        changed covered bytes (F0 -> F1), the whole set runs once more from
-        F1, reusing what already ran on F1 and stayed there; it must end at
-        F1 with every command passing, and F1 is the tree returned. Anything
-        else does not converge, and the phase is not verified. A command
-        with an eligible record for the tree it would run on is not run
-        again (D10.6): a ``PASS`` that started and ended there, or a
-        ``FAIL`` or ``TIMEOUT``, which is final for that tree, so a relaunch
-        that left the tree unchanged fails again without running it.
-        Returns the tree the set was validated on, or ``None`` when none is
-        configured.
-        """
-        # From the contract, not the configuration: what verifies this run
-        # was decided when the run was created.
-        contract = self.local_contract()
-        commands = contract.validation_commands
-        if not commands:
-            return None
-        # The step entry refused a contract beyond the bounds (D10.3).
-        defs = definitions(commands)
-        policy = self._validation_policy(LaunchClass.LOCAL_VALIDATION)
-        snapshot, changed = self._local_validation_pass(phase, defs, policy, start)
-        if not changed:
-            return snapshot
-        # D7.2: a passing command changed covered bytes. One confirming run of
-        # the whole set, from the tree it left.
-        moved_from = start.fingerprint
-        confirmed, changed = self._local_validation_pass(phase, defs, policy, snapshot)
-        if changed:
-            raise VerificationError(
-                f"validation does not converge: the validation commands changed the files the "
-                f"workspace fingerprint covers ({moved_from[:16]}... -> "
-                f"{snapshot.fingerprint[:16]}...), and a confirming run of every command from "
-                f"{snapshot.fingerprint[:16]}... changed them again (-> "
-                f"{confirmed.fingerprint[:16]}...). The controller attributes evidence only to "
-                "a tree a passing run started and ended on. Exclude what the commands write "
-                "from the fingerprint (local.exclude in a new local run), or make them not "
-                f"write covered files; {phase.value} is not verified and the run stays in "
-                f"{phase.value}."
-            )
-        return confirmed
-
-    def _local_validation_pass(
-        self, phase: Phase, defs: Sequence[Definition], policy: Policy, start: WorkspaceSnapshot
-    ) -> tuple[WorkspaceSnapshot, bool]:
-        """One run of the set from ``start``: the tree it left, and whether any command moved it.
-
-        Each definition runs on the tree the walk before it read, unless an
-        eligible record for that tree exists (D10.6, D7.2). A command that
-        does not pass raises the phase's :class:`VerificationError`.
-        """
-        state = self._require_state()
-        workspace_policy = self.local_contract().workspace_policy.digest()
-        snapshot = start
-        changed = False
-        # The pass's records, reused or new: the evidence REVIEW binds, which
-        # no append of the pass may evict (D11.4).
-        kept: list[int] = []
-        for definition in defs:
-            candidate = LocalCandidate(snapshot.fingerprint, workspace_policy, state.run_id)
-            reused = eligible_record(
-                state.validation_evidence(), candidate, definition, policy, None
-            )
-            if reused is not None:
-                if reused.outcome is not Outcome.PASS:
-                    raise _reused_failure(reused, phase)
-                kept.append(reused.seq)
-                continue
-            record, after, failure = self._run_local_definition(
-                phase, definition, policy, candidate, tuple(kept)
-            )
-            kept.append(record["seq"])
-            changed = changed or record["end_fingerprint"] != record["start_fingerprint"]
-            snapshot = after
-            if failure is not None:
-                raise failure
-        return snapshot, changed
-
-    def _run_local_definition(
-        self,
-        phase: Phase,
-        definition: Definition,
-        policy: Policy,
-        candidate: LocalCandidate,
-        keep: tuple[int, ...] = (),
-    ) -> tuple[dict, WorkspaceSnapshot, VerificationError | None]:
-        """Launch one definition in place on ``candidate``: its record, the walk after it,
-        and the error it raises when it did not pass. ``keep`` are the pass's records
-        so far, which its append does not evict."""
-        state = self._require_state()
-        # Likewise the directory they run *from*: an argv is only a program
-        # relative to one (see :meth:`_execution_cwd`).
-        cwd = self._execution_cwd()
-        label = f"{phase.value}-validation"
-        logger = self._logger()
-        argv = list(definition.argv)
-        metadata = {"validation_command": argv, "feature": state.feature_spec_path}
-        # The commands are the repository's (a Makefile target, a test
-        # runner the tree defines): allow-listed environment, as for an
-        # agent, not the operator's whole shell, and the same credential
-        # preflight and controller-set variables (#165). The agent may
-        # have changed the repository's configuration since its own
-        # launch was checked, so a refusal leaves the phase unverified.
-        try:
-            identity = preflight(
-                cwd, self._runner, env_allowlist=self.config.execution.environment_names()
-            )
-        except ConfigurationError as exc:
-            raise VerificationError(
-                f"validation commands not run: {exc}; {phase.value} is not verified and "
-                f"the run stays in {phase.value}."
-            ) from exc
-        refused: SandboxLaunchRefusedError | None = None
-        logged = False
-        with isolated_overrides(identity) as overrides:
-            req = ExecutionRequest(
-                command=argv,
-                cwd=cwd,
-                timeout_seconds=self.config.execution.command_timeout_seconds,
-                env_allowlist=self.config.execution.environment_names(),
-                env=overrides,
-                contain_orphans=True,
-            )
-            try:
-                # The change's own code (ADR 0005 D3.1): sandboxed under
-                # `required` like the agent that wrote it, or not run.
-                req.sandbox = self._command_sandbox(
-                    LaunchClass.LOCAL_VALIDATION,
-                    cwd,
-                    overrides,
-                    self.config.sandbox.validation_network,
-                )
-            except SandboxLaunchRefusedError as exc:
-                refused = exc
-            else:
-                if req.sandbox is None:
-                    self._say_fallback(f"validation command {label}")
-                try:
-                    result, step_log, run_log = self._launch_validator(
-                        logger,
-                        label,
-                        LOCAL_VALIDATION_PROFILE,
-                        req,
-                        candidate,
-                        definition,
-                        policy,
-                        metadata,
-                    )
-                except SandboxLaunchRefusedError as exc:
-                    refused, logged = exc, True
-        if refused is not None:
-            # No record (ADR 0006 D8.5): the command never ran.
-            if not logged:
-                self._log_refused_command(
-                    label, LOCAL_VALIDATION_PROFILE, argv, cwd, refused, metadata
-                )
-            raise VerificationError(
-                f"validation command {definition.shown!r} not run: "
-                f"{refused}; {phase.value} is not verified and the run stays in "
-                f"{phase.value}."
-            ) from refused
-        try:
-            after = self.local_workspace().snapshot()
-        except Exception as exc:
-            # A walk that is refused is the existing refusal, and the
-            # command leaves no record (D7.2); the marker goes with it.
-            # The launch is still logged, and a command that failed is
-            # still reported as the failure it was.
-            state.validation_attempt = {}
-            self._save()
-            logger.log_execution(
-                self._validation_execution_record(
-                    label, LOCAL_VALIDATION_PROFILE, req, result, metadata, None
-                ),
-                "",
-                result.stdout or "",
-                result.stderr or "",
-                step_log=step_log,
-            )
-            failure = _validation_failure(definition, req, result, phase)
-            if failure is not None:
-                raise failure from exc
-            raise
-        record = observed_record(
-            seq=next_seq(state.validation_records),
-            candidate=candidate,
-            definition=definition,
-            policy=policy,
-            result=result,
-            run_log=run_log,
-            end_fingerprint=after.fingerprint,
-        )
-        self._append_validation_record(record, keep=keep)
-        logger.log_execution(
-            self._validation_execution_record(
-                label, LOCAL_VALIDATION_PROFILE, req, result, metadata, record
-            ),
-            "",
-            result.stdout or "",
-            result.stderr or "",
-            step_log=step_log,
-        )
-        return record, after, _validation_failure(definition, req, result, phase)
-
     # -- candidate validation evidence (ADR 0006, #172) -------------------------
     def _validation_policy(self, launch_class: LaunchClass) -> Policy:
         """Policy P for a validation set run as ``launch_class`` (ADR 0006 D8.1).
@@ -5881,43 +4421,22 @@ class ControllerEngine:
         ``required`` the template is §2.5's request for the launch class with
         every path a role name (:func:`template_facts`), under ``disabled``
         the fixed "no outer sandbox" template, since nothing contains the
-        validator. REMOTE reads no git here, so a dry run plans it anywhere.
+        validator. It reads no git, so a dry run plans it anywhere.
         """
         cfg = self.config
-        local = launch_class is LaunchClass.LOCAL_VALIDATION
         template: Mapping[str, object] = NO_SANDBOX_TEMPLATE
         if cfg.sandbox.enabled:
             position = NetworkPosition(cfg.sandbox.validation_network)
             paths = tuple(cfg.sandbox.read_only_paths)
-            if local:
-                separate, linked = self._local_git_layout()
-                facts = template_facts(
-                    launch_class,
-                    position,
-                    separate_git_dir=separate,
-                    linked=linked,
-                    operator_paths=paths,
-                )
-            else:
-                facts = template_facts(launch_class, position, operator_paths=paths)
-            template = launch_template(facts)
+            template = launch_template(template_facts(launch_class, position, operator_paths=paths))
         return Policy(
             mode=cfg.sandbox.mode,
             template=template,
             env_names=cfg.execution.environment_names(),
             timeout_seconds=cfg.execution.command_timeout_seconds,
             contain_orphans=True,
-            method=METHOD_IN_PLACE if local else MATERIALIZATION_METHOD,
+            method=MATERIALIZATION_METHOD,
         )
-
-    def _local_git_layout(self) -> tuple[bool, bool]:
-        """Whether the LOCAL root's ``.git`` names a git directory elsewhere, and
-        whether the checkout is a linked worktree: the layout :meth:`_local_facts`
-        projects, with no path in it."""
-        root = Path(self._execution_cwd())
-        dirs = self.workspace().git_dirs()
-        separate = os.path.realpath(root / ".git") != str(dirs[0])
-        return separate, str(dirs[-1]) != str(dirs[0])
 
     def _launch_validator(
         self,
@@ -5925,7 +4444,7 @@ class ControllerEngine:
         label: str,
         profile: str,
         req: ExecutionRequest,
-        candidate: LocalCandidate | RemoteCandidate,
+        candidate: RemoteCandidate,
         definition: Definition,
         policy: Policy,
         metadata: dict,
@@ -6004,7 +4523,7 @@ class ControllerEngine:
         """The run-log record of one validator launch; informational, never authority.
 
         ``record`` is the launch's ``ValidationRecord``, or ``None`` when it
-        left none (a LOCAL walk after it was refused).
+        left none.
         """
         state = self._require_state()
         execution = ExecutionRecord(
@@ -6040,8 +4559,6 @@ class ControllerEngine:
         )
         if result.sandbox is not None:
             execution.sandbox = result.sandbox.record()
-        else:
-            execution.sandbox = self._fallback_facts()
         if result.timed_out or result.exit_code != 0:
             execution.error = _with_leftovers(
                 f"timed out after {req.timeout_seconds}s"
@@ -6091,8 +4608,6 @@ class ControllerEngine:
         refusal at the gate is logged and re-raised with nothing written.
         """
         state = self._require_state()
-        if state.mode == WorkflowMode.LOCAL:
-            raise StateError("a LOCAL run validates in place, after its write phases")
         defs = definitions(self.config.validation.commands)
         policy = self._validation_policy(LaunchClass.EXPORT_COMMAND)
         runner = self._runner or execute
@@ -6533,75 +5048,13 @@ class ControllerEngine:
         self._evidence_bound = True
         return None
 
-    def _require_local_review_evidence(self, plan: StepPlan) -> StepOutcome | None:
-        """D5.7: the bound fingerprint's evidence, and the binding naming it, before the reviewer.
-
-        LOCAL REVIEW runs no validation: the write phase that bound
-        ``workspace_fingerprint`` recorded its evidence (D7.2). D5.5's reuse
-        rule applies with the bound fingerprint's candidate; on a mismatch
-        the binding is rewritten from the records. Evidence that is not
-        complete (only a state persisted before the records existed, or a
-        contract whose policy no longer matches them) blocks before any
-        launch.
-        """
-        state = self._require_state()
-        self._evidence_bound = False
-        contract = self.local_contract()
-        defs = definitions(contract.validation_commands)
-        policy = self._validation_policy(LaunchClass.LOCAL_VALIDATION)
-        candidate = LocalCandidate(
-            state.workspace_fingerprint, contract.workspace_policy.digest(), state.run_id
-        )
-        upcoming = state.review_round + 1
-        records = state.validation_evidence()
-        if not binding_reusable(
-            state.review_evidence,
-            records,
-            review_round=upcoming,
-            candidate=candidate,
-            validation_set_digest=validation_set_digest(defs),
-            policy_digest=policy.digest,
-            watermark=None,
-        ):
-            evidence = find_evidence(records, candidate, defs, policy, None)
-            if not evidence.complete:
-                return self._block(
-                    Phase.REVIEW, plan, self._local_no_evidence_block_reason(evidence)
-                )
-            state.review_evidence = binding(upcoming, evidence)
-        self._evidence_bound = True
-        return None
-
-    def _local_no_evidence_block_reason(self, evidence: Evidence) -> str:
-        state = self._require_state()
-        index = len(evidence.records)
-        failed = evidence.failed
-        detail = (
-            f"definition [{failed.index}] ended {failed.outcome.value} on it"
-            if failed is not None
-            else f"no record shows definition [{index}] of local.validation_commands passing "
-            "on it under the validation policy in force"
-        )
-        return self._local_block_reason(
-            f"no validation evidence for this LOCAL run; start a new local run. The "
-            f"workspace bound for review ({state.workspace_fingerprint[:16]}...) has no complete "
-            f"validation evidence ({detail}), so no reviewer was launched: a review is only "
-            "ever bound to a workspace the controller validated"
-        )
-
     # -- the review certificate (ADR 0006 D12, #174) ---------------------------
     def _configured_validation(self) -> Configured:
         """The set and policy P in force: what a certificate must have been issued under.
 
-        REMOTE from ``validation.commands``, LOCAL from the run contract, each
-        under the policy its gates validate with (:meth:`_validation_policy`).
+        ``validation.commands``, under the policy its gates validate with
+        (:meth:`_validation_policy`).
         """
-        state = self._require_state()
-        if state.mode == WorkflowMode.LOCAL:
-            return Configured(
-                definitions(self.local_contract().validation_commands),
-                self._validation_policy(LaunchClass.LOCAL_VALIDATION),
-            )
         return Configured(
             definitions(self.config.validation.commands),
             self._validation_policy(LaunchClass.EXPORT_COMMAND),
@@ -6626,8 +5079,7 @@ class ControllerEngine:
         """The clean round's certificate, set in memory for the write that completes it (D12.2).
 
         ``build`` issues it from the retained records
-        (:func:`~autoforge.certificate.remote_certificate` or
-        :func:`~autoforge.certificate.local_certificate`). The caller's
+        (:func:`~autoforge.certificate.remote_certificate`). The caller's
         transition write saves it with the phase, so no state holds a
         certificate for a phase that did not move, or a moved phase without
         one. Returns ``("", False)`` when the round may complete, and
@@ -6674,8 +5126,7 @@ class ControllerEngine:
     ) -> list[str]:
         """The validation set and policy P, for the plan and the dry run; runs nothing."""
         state = self._require_state()
-        local = launch_class is LaunchClass.LOCAL_VALIDATION
-        key = "local.validation_commands" if local else "validation.commands"
+        key = "validation.commands"
         notes: list[str] = []
         problem = definition_problem(commands)
         if problem:
@@ -6690,9 +5141,6 @@ class ControllerEngine:
                 "; under sandbox.mode disabled every validator runs unsandboxed as the "
                 "operator's UID, and its record says enforced: false"
                 if not self.config.sandbox.enabled
-                else "; under sandbox.mode preferred a host that cannot enforce runs every "
-                "validator unsandboxed, and its record says enforced: false"
-                if local and self.config.sandbox.mode == SANDBOX_PREFERRED
                 else ""
             )
             notes.append(
@@ -6703,18 +5151,17 @@ class ControllerEngine:
                 f"validation definition [{d.index}]: {d.shown!r} (digest {d.digest[:16]}...)"
                 for d in defs
             )
-            if not local:
+            notes.append(
+                "validation.commands gate every REMOTE candidate: ANALYZE_EXECUTE, FIX and "
+                "REPLAN_REEXECUTE validate the exact commit before anything is pushed or "
+                "published, and REVIEW requires evidence for the PR head before the "
+                "reviewer launches; a record names the exact commit and tree it ran against"
+            )
+            if state.validation_override_seq is not None:
                 notes.append(
-                    "validation.commands gate every REMOTE candidate: ANALYZE_EXECUTE, FIX and "
-                    "REPLAN_REEXECUTE validate the exact commit before anything is pushed or "
-                    "published, and REVIEW requires evidence for the PR head before the "
-                    "reviewer launches; a record names the exact commit and tree it ran against"
+                    f"validation override watermark: seq {state.validation_override_seq} "
+                    "(a FAIL or TIMEOUT at or below it is historical and runs again)"
                 )
-                if state.validation_override_seq is not None:
-                    notes.append(
-                        f"validation override watermark: seq {state.validation_override_seq} "
-                        "(a FAIL or TIMEOUT at or below it is historical and runs again)"
-                    )
         if state.validation_attempt:
             marker = parse_marker(state.validation_attempt)
             notes.append(
@@ -6796,12 +5243,13 @@ class ControllerEngine:
         ``next_issue_url``, untrusted). The issue must parse as a GitHub issue
         URL, belong to the run's repository, not be the EPIC itself, not be the
         current issue when ``switching`` (UPDATE_EPIC must not loop back onto the
-        issue just finished), exist on GitHub and be OPEN. Any of those failing
-        raises :class:`VerificationError` — a problem with the *selection*. No
-        GitHub read is made for a URL that already fails the local checks (a
-        foreign repository is never queried). A standalone engine's
-        :attr:`issue_ownership` predicate is one of those local checks (ADR
-        0008 D17.2): an issue a scheduler namespace owns is refused, so an
+        issue just finished), exist on GitHub and be OPEN, and when ``switching``
+        be one of the EPIC's own issues (:meth:`_verify_epic_sub_issue`, #287).
+        Any of those failing raises :class:`VerificationError` — a problem with
+        the *selection*. No GitHub read is made for a URL that already fails
+        the local checks (a foreign repository is never queried). A standalone
+        engine's :attr:`issue_ownership` predicate is one of those local checks
+        (ADR 0008 D17.2): an issue a scheduler namespace owns is refused, so an
         UPDATE_EPIC selection of one goes through the bounded rejection path.
 
         Identity (EPIC / current issue) is compared with
@@ -6852,7 +5300,53 @@ class ControllerEngine:
             raise VerificationError(
                 f"{what} {ref.canonical} is {issue.state}; only OPEN issues can be run"
             )
+        if switching:
+            self._verify_epic_sub_issue(ref)
         return issue
+
+    def _verify_epic_sub_issue(self, ref: GitHubIssueRef) -> None:
+        """Verify on GitHub that UPDATE_EPIC's selection is one of the EPIC's own issues (#287).
+
+        The rule ``autoforge epic run`` admits by (ADR 0008 D3.1, D3.6): a
+        direct native sub-issue of the EPIC (the parent GitHub names for it
+        is the EPIC) that has no sub-issues of its own. A task-list line or
+        a ``#n`` in the EPIC body is not a membership: prose is never
+        authority, and on a public repository anyone may open the issue it
+        names. The first issue is the operator's choice and is not held to
+        this. The issue must still be open in this read: it is the later of
+        the two, and an issue closed since :meth:`_verify_issue_selectable`
+        read it is refused rather than switched to on the earlier answer.
+        Failures are a :class:`VerificationError`, the selection's problem,
+        except as :meth:`_verify_issue_selectable` says.
+        """
+        state = self._require_state()
+        epic = parse_issue_url(state.epic_url)
+        try:
+            node = self.github.get_issue_node(ref.canonical)
+        except GitHubNotFoundError as exc:
+            raise VerificationError(
+                f"next issue {ref.canonical} does not exist on GitHub "
+                f"(or is not visible to this token): {exc}"
+            ) from exc
+        if node.parent is None or not node.parent.same_target(epic):
+            parent = node.parent.canonical if node.parent is not None else "none"
+            raise VerificationError(
+                f"next issue {ref.canonical} is not a sub-issue of the EPIC {epic.canonical} "
+                f"(its parent issue on GitHub: {parent}); a sequential run switches only to "
+                "one of the EPIC's native sub-issues, the issues 'autoforge epic run' admits"
+            )
+        if node.sub_issues_total > 0:
+            raise VerificationError(
+                f"next issue {ref.canonical} has {node.sub_issues_total} sub-issue(s) of its "
+                "own: it is an EPIC in its own right, which a sequential run never selects "
+                "(run it as its own EPIC)"
+            )
+        if not node.is_open:
+            raise VerificationError(
+                f"next issue {ref.canonical} is {node.state} "
+                f"({node.state_reason or 'no reason'}) on GitHub as its sub-issue read reports "
+                "it; only OPEN issues can be run"
+            )
 
     def _recover_pr(self, pr: PRInfo, plan: StepPlan | None) -> StepOutcome:
         """Bind the issue's open implementation PR and enter REVIEW without an agent.
@@ -7908,11 +6402,6 @@ class ControllerEngine:
         request: AcceptanceRequest | OperatorRequest | None = None,
     ) -> UnblockOutcome:
         state = self._require_state()
-        if state.mode == WorkflowMode.LOCAL:
-            raise StateTransitionError(
-                "unblock applies to GitHub runs only: a LOCAL run has no GitHub state to "
-                "re-inspect, so a BLOCKED local run is finished (start a new local run)"
-            )
         if state.phase != Phase.BLOCKED:
             raise StateTransitionError(
                 f"run {state.run_id} is in phase {state.phase.value}, not BLOCKED; unblock "
@@ -9344,8 +7833,8 @@ class ControllerEngine:
         agent-message writers apply; the CLI redacts what it prints from
         state on top of this. It is then bounded, after the redaction and
         for the same reason at the same sink (#88): a call site can
-        concatenate agent text (the LOCAL ``unresolved`` rationales), and
-        the reason is persisted on every save and printed by ``status``.
+        concatenate agent text (an agent's ``blocked`` message), and the
+        reason is persisted on every save and printed by ``status``.
         """
         state = self._require_state()
         reason = bound_block_reason(redact(reason))
@@ -9547,14 +8036,6 @@ class ControllerEngine:
             "would refuse and enter BLOCKED, closing nothing, if the replacement cannot be "
             "verified",
         ], f"{to_review} | BLOCKED if the replacement cannot be verified"
-
-    @staticmethod
-    def _local_budget_block_reason(reason: str) -> str:
-        return (
-            f"{reason}. This budget is cumulative for the run, is not reset by 'resume', and "
-            "is part of the run's contract: raising 'workflow.max_total_steps' in the config "
-            "does not extend this run. Start a new run under the larger budget."
-        )
 
     def _inconclusive(
         self,
@@ -10227,8 +8708,6 @@ class ControllerEngine:
         )
         if result.sandbox is not None:
             record.sandbox = result.sandbox.record()
-        else:
-            record.sandbox = self._fallback_facts()
         if result.timed_out or result.exit_code != 0:
             record.error = _with_leftovers(
                 f"timed out after {req.timeout_seconds}s"
@@ -10291,7 +8770,7 @@ class ControllerEngine:
             metadata={**metadata, "sandbox_mode": self.config.sandbox.mode},
         )
         record.error = f"{type(exc).__name__}: {exc}"
-        record.sandbox = _refusal_facts(exc) or self._fallback_facts()
+        record.sandbox = _refusal_facts(exc)
         self._logger().log_execution(record, "", "", "", step_log=step_log)
 
     def _revision_drift_to_review(
@@ -13120,14 +11599,6 @@ class ControllerEngine:
 
     # -- agent invocation + correction retry ---------------------------------------
     def _log_metadata(self, phase: Phase) -> dict[str, object]:
-        state = self._require_state()
-        if state.mode == WorkflowMode.LOCAL:
-            return {
-                "mode": "LOCAL",
-                "feature_spec_path": state.feature_spec_path,
-                "feature_spec_sha256": state.feature_spec_sha256,
-                "workspace_fingerprint": state.workspace_fingerprint,
-            }
         if phase == Phase.REPLAN_REEXECUTE:
             return self._replan_log_metadata()
         return {}
@@ -13139,20 +11610,16 @@ class ControllerEngine:
 
         ``before_relaunch`` is called before every relaunch, a correction or
         the retry of a failure the adapter recognised as transient (#164),
-        and before anything of the relaunch is charged or saved. In REMOTE
-        mode it is the checkout check and then the phase-entry reconciliation
+        and before anything of the relaunch is charged or saved. It is the
+        checkout check and then the phase-entry reconciliation
         (:meth:`_invoke_phase_anchored` over :meth:`_remote_entry`): the
         launch before it may already have done the phase's GitHub work, and
-        the relaunch must see it exactly as ``resume`` would. In LOCAL mode
-        it is the git-anchor check (:meth:`_local_step_once`, #209). An
-        outcome from it resolves the phase without relaunching and is
-        returned in place of a payload; an exception from it (the checkout
-        drift :meth:`_invoke_phase_anchored` checks there) propagates
-        without relaunching. A LOCAL run never retries a transient failure:
-        its write phases are judged against the durable launch checkpoint
-        and its review verification refuses a tree the reviewer changed.
-        Neither mode relaunches, for a correction or a transient failure, a
-        launch that may have left a process running
+        the relaunch must see it exactly as ``resume`` would. An outcome from
+        it resolves the phase without relaunching and is returned in place of
+        a payload; an exception from it (the checkout drift
+        :meth:`_invoke_phase_anchored` checks there) propagates without
+        relaunching. Nothing relaunches, for a correction or a transient
+        failure, a launch that may have left a process running
         (:attr:`AgentExecutionResult.may_have_survivor`): the relaunch would
         race it in the same working directory.
 
@@ -13176,8 +11643,7 @@ class ControllerEngine:
         interaction_settings = provider.interaction_settings(profile)
         max_corrections = max(0, self.config.execution.max_correction_attempts)
         # Read once per invocation, before the loop: the agent and the record
-        # of it are launched from the same directory, and for a LOCAL run
-        # that directory comes from the contract (see :meth:`_execution_cwd`).
+        # of it are launched from the same directory (see :meth:`_execution_cwd`).
         self._launch_cwd, self._launch_log = "", None
         cwd = self._execution_cwd()
         self._launch_cwd = cwd
@@ -13221,13 +11687,12 @@ class ControllerEngine:
                 if phase == Phase.UPDATE_EPIC
                 else UpdateEpicRequest.FULL
             )
-            if state.mode == WorkflowMode.REMOTE:
-                # ADR 0005 D6.5, in every mode: what an earlier launch left in
-                # the issue's private object directory (a crash before its
-                # import, a change of mode) is imported strictly before the
-                # agent starts again. A failure refuses the launch here, before
-                # anything is charged or saved; tampering blocks the run.
-                self._import_before_launch(Path(cwd))
+            # ADR 0005 D6.5, in every mode: what an earlier launch left in
+            # the issue's private object directory (a crash before its
+            # import, a change of mode) is imported strictly before the
+            # agent starts again. A failure refuses the launch here, before
+            # anything is charged or saved; tampering blocks the run.
+            self._import_before_launch(Path(cwd))
             # No GitHub or git credential may reach the agent (#165): the
             # configuration its git would read, ~/.netrc and what its shells
             # run at startup are checked, and so is an integration its CLI
@@ -13242,40 +11707,25 @@ class ControllerEngine:
             # holds no credential to read it itself) and written before the
             # prompt that names it is rendered; nothing is saved yet.
             read_context = ""
-            if state.mode == WorkflowMode.REMOTE:
-                read_context = self._write_read_context(phase, state.attempt + 1)
-                self._read_context_dir = read_context
+            read_context = self._write_read_context(phase, state.attempt + 1)
+            self._read_context_dir = read_context
             # What an earlier launch left uncommitted in the worktree, read
             # for every launch of a write phase, a relaunch included (#187).
             worktree_note: str | None = None
-            if state.mode == WorkflowMode.REMOTE and phase in WORKTREE_STATE_PHASES:
+            if phase in WORKTREE_STATE_PHASES:
                 self._worktree_state, worktree_note = self._read_worktree_state(cwd)
             try:
                 prompt = self.render_prompt_for(phase, correction_error, previous_reply)
             finally:
                 self._read_context_dir = None
                 self._worktree_state = None
-            # The launch is charged to the durable LOCAL bound here, after
-            # every step that can refuse without launching and immediately
-            # before the one that launches. The first launch of an entry is
-            # never refused (``_local_step_once`` already blocked a spent
-            # entry); a correction can be, and is then not re-invoked.
-            refusal = self._charge_local_launch(phase)
-            if refusal:
-                raise ControlResultValidationError(
-                    f"agent '{profile.name}' did not return a valid CONTROL_RESULT after "
-                    f"{attempt} attempt(s): {correction_error}. Not re-invoked: {refusal}"
-                )
             attempt += 1
             state.attempt += 1
-            if state.mode == WorkflowMode.REMOTE:
-                # D13.3: which publication contract this launch runs under,
-                # so a later version can tell a launch of its own from one
-                # whose agent published under the previous contract.
-                state.launch_label = launch_label_for(phase)
-            # The one write before the agent starts, in both modes: the
-            # attempt counter and, for a LOCAL write phase, the checkpoint
-            # charged just above land together, and for a REMOTE phase the
+            # D13.3: which publication contract this launch runs under, so a
+            # later version can tell a launch of its own from one whose agent
+            # published under the previous contract.
+            state.launch_label = launch_label_for(phase)
+            # The one write before the agent starts: the attempt counter, the
             # entry observation (D4.4) and the launch label. A crash while the
             # agent runs, or a refused run-log write after it returned,
             # therefore never leaves controller state claiming the phase was
@@ -13354,13 +11804,11 @@ class ControllerEngine:
                     # ADR 0005: under `sandbox.mode: required` every process
                     # of the launch runs inside the outer sandbox, or is
                     # refused here or at the spawn; it never runs without it.
-                    # LOCAL's `preferred` falls back here, from the probe, and
-                    # `_launch` says so (D12.2).
                     req.sandbox = self._agent_sandbox(phase, cwd, overrides, read_context)
                     result = self._launch(provider, req, limits, step_log, phase)
             except ExecutionError as exc:
                 record.error = f"{type(exc).__name__}: {exc}"
-                record.sandbox = _refusal_facts(exc) or self._fallback_facts()
+                record.sandbox = _refusal_facts(exc)
                 if broker is not None:
                     record.interaction = broker.record()
                 self._record_invocation(logger, record, prompt, "", "", phase, step_log)
@@ -13373,8 +11821,6 @@ class ControllerEngine:
                 }
             if result.sandbox is not None:
                 record.sandbox = result.sandbox.record()
-            else:
-                record.sandbox = self._fallback_facts()
             record.started_at = result.started_at
             record.finished_at = result.finished_at
             record.exit_code = result.exit_code
@@ -13458,9 +11904,7 @@ class ControllerEngine:
                     # transient; whether and how often to relaunch is decided
                     # here. Never while a process the failed launch started
                     # may still be running: the relaunch would race it.
-                    if state.mode == WorkflowMode.LOCAL:
-                        held = "LOCAL mode never relaunches it"
-                    elif result.may_have_survivor:
+                    if result.may_have_survivor:
                         held = "a process the launch started may still be running"
                     elif transient_retries >= MAX_TRANSIENT_RETRIES:
                         held = (
@@ -13476,40 +11920,27 @@ class ControllerEngine:
                     + f". stderr tail: {stderr[-2000:]}"
                 )
             try:
-                if state.mode == WorkflowMode.REMOTE:
-                    # ADR 0005 D6.5: the agent's new objects are imported
-                    # strictly before its result is checked; tampering is
-                    # recorded here and blocks the run.
-                    self._import_problem = self._import_after_launch(Path(cwd))
+                # ADR 0005 D6.5: the agent's new objects are imported
+                # strictly before its result is checked; tampering is
+                # recorded here and blocks the run.
+                self._import_problem = self._import_after_launch(Path(cwd))
                 # Only the tail of a truncated stdout is searched: the block
                 # is the last thing the agent writes, so the kept tail holds
                 # a whole one; a block before the cut is stale or spans it.
                 payload = parse_control_result(
-                    result.stdout_tail, phase, state.mode, update_epic_request=request
+                    result.stdout_tail, phase, update_epic_request=request
                 )
-                if (
-                    phase == Phase.UPDATE_EPIC
-                    and state.mode == WorkflowMode.REMOTE
-                    and payload.get("status") == "success"
-                ):
+                if phase == Phase.UPDATE_EPIC and payload.get("status") == "success":
                     # The controller's half of the schema (a required roadmap
                     # section, the publishable comment as a whole): refused
                     # here, it is corrected before anything is posted.
                     self._check_update_epic_result(payload, request)
-                if (
-                    phase == Phase.ANALYZE_EXECUTE
-                    and state.mode == WorkflowMode.REMOTE
-                    and payload.get("status") == "success"
-                ):
+                if phase == Phase.ANALYZE_EXECUTE and payload.get("status") == "success":
                     # The candidate the controller would publish, read from
                     # the worktree itself: refused here, it is corrected
                     # before anything is pushed or created (#161).
                     self._check_analyze_result(payload, cwd)
-                if (
-                    phase == Phase.REVIEW
-                    and state.mode == WorkflowMode.REMOTE
-                    and payload.get("status") == "success"
-                ):
+                if phase == Phase.REVIEW and payload.get("status") == "success":
                     # The comment the controller would post, rendered from the
                     # result: refused here, it is corrected before anything is
                     # posted (#162).
@@ -13519,21 +11950,13 @@ class ControllerEngine:
                     # validation record that did not pass is refused here, so
                     # it is corrected before anything is published.
                     self._check_review_evidence(payload)
-                if (
-                    phase == Phase.FIX
-                    and state.mode == WorkflowMode.REMOTE
-                    and payload.get("status") == "success"
-                ):
+                if phase == Phase.FIX and payload.get("status") == "success":
                     # The resolutions and the candidate the controller would
                     # publish, read from the worktree itself: refused here,
                     # it is corrected before anything is created or pushed
                     # (#163).
                     self._check_fix_result(payload, cwd)
-                if (
-                    phase == Phase.REPLAN_REEXECUTE
-                    and state.mode == WorkflowMode.REMOTE
-                    and payload.get("status") == "success"
-                ):
+                if phase == Phase.REPLAN_REEXECUTE and payload.get("status") == "success":
                     # The candidate the controller would publish, read from
                     # the worktree itself: corrected, or its rejection
                     # decided, before anything is pushed or created (#164).
@@ -13613,33 +12036,20 @@ class ControllerEngine:
         """Lines that end a block reason for a checkout that moved: where to look, what to run.
 
         A BLOCKED run is not resumed (``resume`` refuses a terminal phase),
-        so "inspect, then 'resume'" would be wrong here (#189). A REMOTE run
-        leaves BLOCKED through ``unblock``, which re-inspects GitHub and
-        re-enters a phase, and then resumes. A LOCAL run cannot be unblocked
-        (it has no GitHub state to re-inspect; :meth:`_unblock_once`): it is
-        continued by a new run of the same feature specification, which
-        ``checkout``, the run's repository root, locates. Both repeat the
-        flags this process was started with, as typed (:meth:`cli_command`).
+        so "inspect, then 'resume'" would be wrong here (#189). A run leaves
+        BLOCKED through ``unblock``, which re-inspects GitHub and re-enters a
+        phase, and then resumes. Both repeat the flags this process was
+        started with, as typed (:meth:`cli_command`).
         """
-        state = self._require_state()
-        lines = ["", f"  checkout:  {checkout}"]
-        if state.mode == WorkflowMode.LOCAL:
-            spec = str(Path(checkout) / state.feature_spec_path)
-            lines += [
-                f"  new run:   {self.cli_command('local', 'run', spec)}",
-                "Inspect the checkout first ('git log' and 'git status' there show what moved "
-                "and what was left); a BLOCKED local run is neither unblocked nor resumed "
-                "('unblock' applies to GitHub runs only), so it continues as a new run of the "
-                "same feature.",
-            ]
-        else:
-            unblock = self.cli_command("unblock", "--reason", "<what you found>")
-            lines += [
-                f"  unblock:   {unblock}",
-                f"  resume:    {self.resume_command()}",
-                "Inspect the checkout and the agent's GitHub work first: 'unblock' re-inspects "
-                "GitHub and re-enters a phase, and only then does 'resume' continue the run.",
-            ]
+        unblock = self.cli_command("unblock", "--reason", "<what you found>")
+        lines = [
+            "",
+            f"  checkout:  {checkout}",
+            f"  unblock:   {unblock}",
+            f"  resume:    {self.resume_command()}",
+            "Inspect the checkout and the agent's GitHub work first: 'unblock' re-inspects "
+            "GitHub and re-enters a phase, and only then does 'resume' continue the run.",
+        ]
         return "\n".join(lines)
 
     def _state_unchanged_text(self, failure: str) -> str:
@@ -13650,31 +12060,23 @@ class ControllerEngine:
         failure, an agent the executor could not run, a malformed result
         that is not corrected. The step adds it where the failure leaves
         :meth:`_invoke_phase`, so the paths cannot drift apart. It names the
-        latest launch's working directory, a REMOTE run's per-issue worktree,
-        with its uncommitted count when that read succeeds (a LOCAL agent
-        works in the operator's checkout, which gets no line), the step's
-        log directory, and :meth:`resume_command`. The paths and the flags
-        are the only values it adds; the text is redacted whole here, at
-        the sink, and again by the CLI where it prints it.
+        latest launch's working directory, the run's per-issue worktree, with
+        its uncommitted count when that read succeeds, the step's log
+        directory, and :meth:`resume_command`. The paths and the flags are
+        the only values it adds; the text is redacted whole here, at the
+        sink, and again by the CLI where it prints it.
         """
-        state = self._require_state()
-        remote = state.mode == WorkflowMode.REMOTE
         lines = [failure.rstrip(), "State unchanged."]
-        if remote and self._launch_cwd:
+        if self._launch_cwd:
             lines.append(
                 f"  worktree:  {self._launch_cwd}{self._uncommitted_note(self._launch_cwd)}"
             )
         if self._launch_log is not None:
             lines.append(f"  logs:      {self._launch_log}/")
         lines.append(f"  resume:    {self.resume_command()}")
-        where, shown = (
-            ("the real Git/GitHub state", "the profile, limits and worktree")
-            if remote
-            else ("the working tree", "the profile and limits")
-        )
         lines.append(
-            f"Inspect {where} first; 'resume --dry-run --max-steps 1' with the same flags "
-            f"shows {shown} it will use."
+            "Inspect the real Git/GitHub state first; 'resume --dry-run --max-steps 1' with the "
+            "same flags shows the profile, limits and worktree it will use."
         )
         return redact("\n".join(lines))
 
@@ -13708,9 +12110,9 @@ class ControllerEngine:
             raise
 
     def _progress_label(self, phase: Phase) -> str:
-        """The prefix of a launch's progress lines: the phase, and the issue in REMOTE mode."""
+        """The prefix of a launch's progress lines: the phase, and the run's issue."""
         state = self._require_state()
-        if state.mode == WorkflowMode.REMOTE and state.current_issue_url:
+        if state.current_issue_url:
             try:
                 return f"{phase.value} #{parse_issue_url(state.current_issue_url).number}"
             except ConfigurationError:
@@ -13747,9 +12149,6 @@ class ControllerEngine:
                     f"attempt {req.attempt}, "
                     f"worktree {req.cwd}, log {step_log.path}"
                 )
-                notice = self._fallback_notice("this agent") if req.sandbox is None else ""
-                if notice:
-                    reporter.line(notice)
                 req.progress = reporter.sink
                 try:
                     result = provider.execute(req)
@@ -13793,12 +12192,10 @@ class ControllerEngine:
         unchanged and nothing is launched again -- not even a correction --
         until the operator repairs it. The refusal names the invocation's own
         outcome, so the failure that was being recorded is not masked by the
-        failure to record it, and says what ``resume`` will do, which differs
-        by mode: a LOCAL launch was checkpointed and is retried against that
-        checkpoint; a REMOTE re-entry first reconciles with GitHub, where the
-        agent's side effects may already be.
+        failure to record it, and says what ``resume`` will do: the re-entry
+        first reconciles with GitHub, where the agent's side effects may
+        already be.
         """
-        state = self._require_state()
         try:
             logger.log_execution(record, prompt, stdout, stderr, step_log=step_log)
         except StateError as exc:
@@ -13806,19 +12203,12 @@ class ControllerEngine:
             # (an oversized journal, an unsafe path) and callers distinguish
             # on it. Only the message grows.
             outcome = record.error or "a CONTROL_RESULT the controller accepted"
-            if state.mode == WorkflowMode.LOCAL:
-                follow_up = (
-                    "Its launch was checkpointed before it started, so once the log "
-                    f"directory is repaired 'resume' re-enters {phase.value} as a retry "
-                    "judged against that checkpoint"
-                )
-            else:
-                reentry = _REMOTE_REENTRY_RECONCILIATION[phase]
-                follow_up = (
-                    "Its GitHub side effects (a comment, a push, a PR) may exist while the "
-                    "controller state does not record them. Repair the log directory, then "
-                    f"'resume': it re-enters {phase.value} and {reentry}"
-                )
+            reentry = _REMOTE_REENTRY_RECONCILIATION[phase]
+            follow_up = (
+                "Its GitHub side effects (a comment, a push, a PR) may exist while the "
+                "controller state does not record them. Repair the log directory, then "
+                f"'resume': it re-enters {phase.value} and {reentry}"
+            )
             exc.args = (
                 f"{exc}. This refusal interrupted attempt {record.attempt} of {phase.value} "
                 f"after the agent had returned with: {outcome}. {follow_up}.",
@@ -14338,10 +12728,7 @@ class ControllerEngine:
                 f"upcoming round {state.review_round + 1}"
             )
         candidate = parse_candidate(raw["candidate"], "state field 'review_evidence'.candidate")
-        if isinstance(candidate, LocalCandidate):
-            if candidate.fingerprint != state.workspace_fingerprint:
-                raise StateError("the review_evidence binding names another workspace")
-        elif candidate.commit != state.current_head_sha.lower():
+        if candidate.commit != state.current_head_sha.lower():
             raise StateError("the review_evidence binding names another PR head")
         named = bound_records(raw, state.validation_evidence())
         for view in named:
@@ -14757,7 +13144,6 @@ class ControllerEngine:
                 state.review_evidence,
                 records,
                 repository=state.repository,
-                run_id=state.run_id,
                 review_round=round_,
                 needs_fix_round=needs_fix_round,
                 actionable_findings=len(findings),
@@ -16479,7 +14865,7 @@ class ControllerEngine:
         after adopting a legacy comment (D13.7) follows the same rule.
         """
         state = self._require_state()
-        if state.mode != WorkflowMode.REMOTE or state.phase != Phase.UPDATE_EPIC:
+        if state.phase != Phase.UPDATE_EPIC:
             return UpdateEpicRequest.FULL
         context = self._update_epic_context()
         if context is not None and context.section_void and not context.selection_void:
@@ -16767,11 +15153,14 @@ class ControllerEngine:
 
         The same code for the step that saved the context and for every
         later entry (journal first, §2.10): the K8 record is reconciled and
-        issued at most once; the roadmap section is spliced when one is
-        stored and merges are pending, and the merge counter is reset only
-        after the read-back; then the selection is verified before the issue
-        switches. A rejected input is voided in the context and raised for
-        'resume' to re-request (D4.7); a conclusive GitHub failure blocks.
+        issued at most once; a ``null`` selection is confirmed on GitHub
+        before anything reports the EPIC complete
+        (:meth:`_confirm_epic_complete`, #287); the roadmap section is
+        spliced when one is stored and merges are pending, and the merge
+        counter is reset only after the read-back; then a selected issue is
+        verified before the issue switches. A rejected input is voided in the
+        context and raised for 'resume' to re-request (D4.7); a conclusive
+        GitHub failure blocks.
         """
         state = self._require_state()
         reason = self._drive_progress_records()
@@ -16790,6 +15179,11 @@ class ControllerEngine:
                 "progress comment posted or adopted; the roadmap section was not written and "
                 "the issue was not switched"
             )
+        selection = context.next_issue_url
+        if selection is None:
+            refused = self._confirm_epic_complete(context)
+            if refused is not None:
+                return refused
         try:
             roadmap_note = self._splice_roadmap_section(context)
         except GitHubUnavailableError:
@@ -16803,7 +15197,6 @@ class ControllerEngine:
                 "then 'resume'."
             )
         done = f"progress comment {published} on the EPIC; {roadmap_note}"
-        selection = context.next_issue_url
         if selection is None:
             state.next_issue_rejections = []
             nxt = self._next_phase(Phase.UPDATE_EPIC, {"next_issue_url": None})
@@ -16833,6 +15226,100 @@ class ControllerEngine:
             f"{done}; verified next issue #{issue.number} ({issue.state}); "
             f"UPDATE_EPIC -> {nxt.value}"
         )
+
+    def _confirm_epic_complete(self, context: UpdateEpicContext) -> tuple[Phase, str] | None:
+        """Hold a ``null`` selection to GitHub before the run ends as complete (#287).
+
+        ``None`` when :meth:`_verify_epic_complete` confirms that nothing
+        remains. A remaining issue is a rejected selection, and so is a
+        transient failure while reading (the same read may well succeed next
+        time): both take the bounded re-selection, the selection voided. A
+        listing that is not complete, or a conclusive GitHub failure, blocks:
+        asking the agent again would not make GitHub list what it left out.
+        Nothing here writes; the roadmap section that reports the EPIC
+        complete is written only after this.
+        """
+        state = self._require_state()
+        try:
+            self._verify_epic_complete()
+        except VerificationError as exc:
+            self._void_selection(context)
+            return self._reject_next_issue(str(exc), cause=exc)
+        except SnapshotRefused as exc:
+            if exc.transient:
+                self._void_selection(context)
+                return self._reject_next_issue(
+                    f"next_issue_url null: the EPIC {state.epic_url} could not be confirmed "
+                    f"complete (GitHub unavailable: {exc})",
+                    cause=exc,
+                )
+            return Phase.BLOCKED, (
+                f"next_issue_url null reports the EPIC {state.epic_url} complete, but its "
+                f"native sub-issues could not be read completely: {exc}. GitHub leaves a "
+                "sub-issue the token may not read out of the listing, so the controller "
+                "does not end the run on one that may miss an open issue. The progress "
+                f"comment stays published; the run stays on issue {state.current_issue_url}, "
+                "nothing was switched. Make every sub-issue of the EPIC readable to the "
+                "token, or remove the ones it may not read from the EPIC, then 'unblock'"
+            )
+        except GitHubUnavailableError as exc:
+            self._void_selection(context)
+            return self._reject_next_issue(
+                f"next_issue_url null: the EPIC {state.epic_url} could not be confirmed "
+                f"complete (GitHub unavailable: {exc})",
+                cause=exc,
+            )
+        except GitHubError as exc:
+            return Phase.BLOCKED, (
+                f"next_issue_url null reports the EPIC {state.epic_url} complete, but the "
+                f"EPIC could not be read on GitHub to confirm it: {exc}. This is not a "
+                "transient GitHub failure (authentication, permissions, or malformed data), "
+                "so asking the agent again would not help. The progress comment stays "
+                f"published; the run stays on issue {state.current_issue_url}, nothing was "
+                "switched. Fix the cause, then 'unblock'"
+            )
+        return None
+
+    def _verify_epic_complete(self) -> None:
+        """Verify on GitHub that no issue of the EPIC remains for a sequential run (#287).
+
+        ``next_issue_url`` null is the agent's claim that none remains, made
+        from a read context that may have shown the listing unreadable or
+        short. The controller reads the EPIC's native sub-issues itself,
+        complete by the rules the scheduler's snapshot applies
+        (:func:`~autoforge.epic_graph.read_children`: the listing holds every
+        sub-issue the EPIC counts, so one the token may not read is never
+        taken as absent). A sub-issue remains when this run would accept it
+        as a selection: in the run's repository, open, without sub-issues of
+        its own, not the issue just finished, and not owned by a scheduler
+        namespace. A remaining one raises :class:`VerificationError`; an
+        incomplete listing raises :class:`SnapshotRefused` and a failed read
+        of the EPIC its :class:`GitHubError`, for
+        :meth:`_confirm_epic_complete` to apply its policy.
+        """
+        state = self._require_state()
+        epic_ref = parse_issue_url(state.epic_url)
+        current = parse_issue_url(state.current_issue_url)
+        epic = self.github.get_issue_node(epic_ref.canonical)
+        remaining = [
+            child
+            for child in read_children(self.github, epic_ref, epic)
+            if child.is_open
+            and child.sub_issues_total == 0
+            and child.ref.same_repository(state.repository)
+            and not child.ref.same_target(current)
+            and not (self.issue_ownership is not None and self.issue_ownership(child.number))
+        ]
+        if remaining:
+            shown = ", ".join(f"#{child.number}" for child in remaining[:_MAX_REMAINING_SHOWN])
+            if len(remaining) > _MAX_REMAINING_SHOWN:
+                shown += f" and {len(remaining) - _MAX_REMAINING_SHOWN} more"
+            raise VerificationError(
+                f"next_issue_url null reports the EPIC {epic_ref.canonical} complete, but "
+                f"GitHub lists {len(remaining)} open sub-issue(s) of it that this run may "
+                f"select: {shown}. A sequential run ends only when none remains; select one "
+                "of them"
+            )
 
     def _void_selection(self, context: UpdateEpicContext) -> None:
         """D4.7: the rejected selection leaves the context; the rest stays published."""

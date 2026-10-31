@@ -82,7 +82,7 @@ from .errors import ConfigurationError, ControlResultError, ControlResultValidat
 from .prompts import CONTROL_CHAR_RE, CONTROL_CHARS
 from .redaction import credential_classes
 from .roadmap import ROADMAP_END_MARKER, ROADMAP_START_MARKER
-from .transitions import Phase, WorkflowMode
+from .transitions import Phase
 from .validation import parse_comment_url, parse_issue_url, parse_pr_url
 
 BEGIN = "<<<CONTROL_RESULT>>>"
@@ -103,7 +103,6 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # not a finding id (it would look like one and compare unequal to it).
 FINDING_ID_RE = re.compile(r"^R(?P<round>[1-9][0-9]*)-F(?P<n>[1-9][0-9]*)\Z")
 _FINDING_ID_RE = FINDING_ID_RE
-_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 ALLOWED_STATUSES = ("success", "failure", "blocked")
 FINDING_CLASSIFICATIONS = ("blocked", "non-blocked", "nit")
@@ -114,10 +113,6 @@ FIX_RESOLUTIONS = (
     "acceptance_action",
     "operator_acceptance",
 )
-# LOCAL mode has no GitHub, so a finding cannot be deferred to a follow-up
-# Issue. "unresolved" is the honest local disposition: the fixer could not
-# resolve it and says why. The controller treats it as a remaining finding.
-LOCAL_FIX_RESOLUTIONS = ("fixed", "no_change_with_rationale", "unresolved")
 MIN_RATIONALE_CHARS = 40
 
 # Bounds on the REVIEW payload the controller accepts. Review output is
@@ -144,8 +139,7 @@ MAX_FINDING_LOCATION_CHARS = 300
 MAX_FINDING_ID_CHARS = 32
 # Bounds on the FIX payload (#77). Every accepted resolution is persisted
 # whole in ``state.last_fix_resolutions`` (after redaction, which can lengthen
-# it), and in LOCAL mode an ``unresolved`` rationale is echoed into the
-# persisted ``block_reason`` that ``status`` shows. A FIX can never
+# it). A FIX can never
 # legitimately report more resolutions than the controller accepted findings,
 # so the count bound *is* the REVIEW's, derived rather than restated, and it
 # is checked before any element is parsed. The rationale bound times
@@ -327,7 +321,6 @@ def extract_last_block(stdout: str) -> str:
 def parse_control_result(
     stdout: str,
     expected_phase: Phase,
-    mode: WorkflowMode = WorkflowMode.REMOTE,
     *,
     update_epic_request: UpdateEpicRequest = UpdateEpicRequest.FULL,
 ) -> dict:
@@ -335,10 +328,8 @@ def parse_control_result(
 
     Returns the payload dict. Raises ControlResultError on extraction/JSON
     problems and ControlResultValidationError on schema/phase problems.
-    ``mode`` selects the per-phase schema: a LOCAL phase reports semantic
-    facts (a summary, a workspace fingerprint, finding resolutions) and never
-    a PR URL, a comment URL or a follow-up Issue. ``update_epic_request``
-    selects the UPDATE_EPIC schema (:class:`UpdateEpicRequest`).
+    ``update_epic_request`` selects the UPDATE_EPIC schema
+    (:class:`UpdateEpicRequest`).
     """
     raw = extract_last_block(stdout)
     if len(raw) > MAX_CONTROL_RESULT_CHARS:
@@ -368,7 +359,7 @@ def parse_control_result(
             f"unknown status {payload['status']!r} (expected one of {ALLOWED_STATUSES})"
         )
     if payload["status"] == "success":
-        validate_for_phase(expected_phase, payload, mode, update_epic_request=update_epic_request)
+        validate_for_phase(expected_phase, payload, update_epic_request=update_epic_request)
     else:
         msg = payload.get("message")
         if not isinstance(msg, str) or not msg.strip():
@@ -1020,12 +1011,11 @@ def _finding_id(payload: dict, key: str, phase: str, round: int | None = None) -
 
 
 def _parse_findings(payload: dict, round: int, needs_fix: bool) -> list[Finding]:
-    """The bounded, validated findings list of a REVIEW result (any mode).
+    """The bounded, validated findings list of a REVIEW result.
 
     The count is checked before any element is parsed, so an oversized list is
     refused without the controller doing per-element work on it, and the
-    review invariant (``needs_fix_round == (findings > 0)``) is enforced here
-    so REMOTE and LOCAL reviews cannot drift apart.
+    review invariant (``needs_fix_round == (findings > 0)``) is enforced here.
     """
     raw_findings = payload.get("findings")
     if not isinstance(raw_findings, list):
@@ -1129,8 +1119,7 @@ class ReviewResult:
     ``sections`` holds the prose of :data:`REVIEW_PROSE_SECTIONS`, in that
     order. Every field the controller renders into the review comment (the
     prose, and each finding's ``title``, ``location`` and
-    ``required_resolution``) is held to the published-content policy; the
-    findings' shape and bounds are LOCAL's too, unchanged.
+    ``required_resolution``) is held to the published-content policy.
     """
 
     round: int
@@ -1991,15 +1980,6 @@ class UpdateEpicResult:
         return cls(next_issue_url=nxt, roadmap_section=section, progress=progress)
 
 
-# -- LOCAL-mode typed models ----------------------------------------------
-# A local phase has no PR, no comment and no follow-up Issue, so it gets its
-# own small shapes instead of remote fields stuffed with empty strings or
-# fabricated URLs. Everything the controller can observe itself (HEAD, the
-# changed-file list, the fingerprint) is observed, not reported; the agent
-# reports only what it alone knows, plus the one or two claims worth
-# cross-checking against the controller's own observation.
-
-
 def _opt_str_list(payload: dict, key: str, phase: str) -> list[str]:
     raw = payload.get(key, [])
     if raw is None:
@@ -2009,203 +1989,9 @@ def _opt_str_list(payload: dict, key: str, phase: str) -> list[str]:
     return [x.strip() for x in raw if x.strip()]
 
 
-def _req_fingerprint(payload: dict, key: str, phase: str) -> str:
-    v = _req_str(payload, key, phase)
-    if not _FINGERPRINT_RE.match(v.lower()):
-        raise ControlResultValidationError(
-            f"{phase}: field {key!r} must be the 64-character workspace fingerprint the "
-            f"controller provided, got {v!r}"
-        )
-    return v.lower()
-
-
-@dataclass
-class LocalAnalyzeExecuteResult:
-    """What an implementation agent alone knows about a local run."""
-
-    summary: str
-    changed_workspace: bool
-    tests_attempted: list[str] = field(default_factory=list)
-
-    @classmethod
-    def from_payload(cls, p: dict) -> LocalAnalyzeExecuteResult:
-        ph = "ANALYZE_EXECUTE"
-        return cls(
-            summary=_req_str(p, "summary", ph),
-            # Cross-checked against the controller's own before/after
-            # fingerprint: a claim of "I changed nothing" over a modified
-            # tree (or the reverse) is a rejected result, not a nuance.
-            changed_workspace=_req_bool(p, "changed_workspace", ph),
-            tests_attempted=_opt_str_list(p, "tests_attempted", ph),
-        )
-
-
-@dataclass
-class LocalReviewResult:
-    round: int
-    reviewed_workspace_fingerprint: str
-    needs_fix_round: bool
-    findings: list[Finding] = field(default_factory=list)
-    observations: list[str] = field(default_factory=list)
-
-    @classmethod
-    def from_payload(cls, p: dict) -> LocalReviewResult:
-        ph = "REVIEW"
-        rnd = _req(p, "round", ph)
-        if not isinstance(rnd, int) or isinstance(rnd, bool) or rnd < 1:
-            raise ControlResultValidationError("'round' must be an int >= 1")
-        needs_fix = _req_bool(p, "needs_fix_round", ph)
-        findings = _parse_findings(p, rnd, needs_fix)
-        return cls(
-            round=rnd,
-            # Binds the review to exactly the workspace the controller
-            # fingerprinted before invoking the reviewer — the local
-            # analogue of binding a remote review to the PR HEAD SHA.
-            reviewed_workspace_fingerprint=_req_fingerprint(
-                p, "reviewed_workspace_fingerprint", ph
-            ),
-            needs_fix_round=needs_fix,
-            findings=findings,
-            observations=_opt_str_list(p, "observations", ph),
-        )
-
-
-@dataclass
-class LocalFindingResolution:
-    finding_id: str
-    resolution: str
-    rationale: str = ""
-
-    @classmethod
-    def from_payload(cls, raw: object, index: int) -> LocalFindingResolution:
-        ph = "FIX"
-        if not isinstance(raw, dict):
-            raise ControlResultValidationError(
-                f"{ph}: resolutions[{index}] must be an object with finding_id/resolution"
-            )
-        fid = _finding_id(raw, "finding_id", ph)
-        res = _req_str(raw, "resolution", ph)
-        if res not in LOCAL_FIX_RESOLUTIONS:
-            raise ControlResultValidationError(
-                f"{ph}: resolution for {fid} must be one of {LOCAL_FIX_RESOLUTIONS}, got {res!r}"
-                + (
-                    " — local runs have no GitHub, so a finding cannot be deferred to a "
-                    "follow-up Issue; use 'unresolved' with a rationale instead"
-                    if res == "follow_up_created"
-                    else " — LOCAL runs perform no external writes; resolve as `unresolved` "
-                    "with a rationale instead"
-                    if res == "acceptance_action"
-                    else " — LOCAL runs have no GitHub and no operator actions; resolve as "
-                    "`unresolved` with a rationale instead"
-                    if res == "operator_acceptance"
-                    else ""
-                )
-            )
-        subject = f"resolution for {fid}"
-        rationale = _multi_line(
-            _bounded(
-                _opt_str(raw, "rationale", ph), ph, subject, "rationale", MAX_FIX_RATIONALE_CHARS
-            ),
-            ph,
-            subject,
-            "rationale",
-        )
-        # Both non-fix dispositions are only acceptable with real reasoning:
-        # "won't fix" and "couldn't fix" are decisions a human has to judge.
-        if res in ("no_change_with_rationale", "unresolved") and len(rationale) < (
-            MIN_RATIONALE_CHARS
-        ):
-            raise ControlResultValidationError(
-                f"{ph}: {fid} uses {res} but the rationale is missing or too short "
-                f"(>= {MIN_RATIONALE_CHARS} chars of actual reasoning required)"
-            )
-        if "follow_up_issue_url" in raw:
-            raise ControlResultValidationError(
-                f"{ph}: {fid} carries 'follow_up_issue_url'; local runs never create "
-                "GitHub follow-up issues"
-            )
-        return cls(finding_id=fid, resolution=res, rationale=rationale)
-
-    def to_dict(self) -> dict:
-        return {
-            "finding_id": self.finding_id,
-            "resolution": self.resolution,
-            "rationale": self.rationale,
-        }
-
-    @property
-    def is_resolved(self) -> bool:
-        return self.resolution in ("fixed", "no_change_with_rationale")
-
-
-@dataclass
-class LocalFixResult:
-    resolutions: list[LocalFindingResolution] = field(default_factory=list)
-    changed_workspace: bool = False
-
-    @classmethod
-    def from_payload(cls, p: dict) -> LocalFixResult:
-        ph = "FIX"
-        resolutions = [
-            LocalFindingResolution.from_payload(r, i) for i, r in enumerate(_raw_resolutions(p))
-        ]
-        ids = [r.finding_id for r in resolutions]
-        if len(set(ids)) != len(ids):
-            raise ControlResultValidationError(f"duplicate resolution finding_ids: {ids}")
-        # `from_payload` only runs for status "success" (see
-        # `parse_control_result`), so a non-empty run-level blocker here is a
-        # result that contradicts itself: the protocol already carries one,
-        # as status "blocked" plus a message, and the engine routes that to
-        # BLOCKED. Accepting it alongside "success" gave the field nowhere to
-        # go -- it was parsed and dropped, so a FIX could report a blocker,
-        # pass validation, be reviewed clean and reach DONE with the blocker
-        # never seen by anyone. Rejecting it puts the claim back on the one
-        # channel the controller acts on rather than quietly keeping both.
-        blocker = p.get("blocked_reason")
-        if isinstance(blocker, str) and blocker.strip():
-            raise ControlResultValidationError(
-                f"{ph}: status 'success' carries a non-empty 'blocked_reason' "
-                f"({blocker.strip()[:200]!r}); a run-level blocker and a successful fix are "
-                "not both true. Report the obstacle as status 'blocked' with a 'message', or "
-                "report the finding it concerns with resolution 'unresolved' and a rationale"
-            )
-        if blocker is not None and not isinstance(blocker, str):
-            raise ControlResultValidationError(f"{ph}: field 'blocked_reason' must be a string")
-        return cls(
-            resolutions=resolutions,
-            changed_workspace=_req_bool(p, "changed_workspace", ph),
-        )
-
-
-# Phases a LOCAL run can never reach; they belong to the GitHub lifecycle.
-LOCAL_UNSUPPORTED_PHASES = frozenset(
-    {Phase.REPLAN_REEXECUTE, Phase.READY_FOR_MERGE, Phase.MERGE, Phase.UPDATE_EPIC}
-)
-
-
-def _validate_local_phase(phase: Phase, payload: dict) -> None:
-    if phase == Phase.ANALYZE_EXECUTE:
-        LocalAnalyzeExecuteResult.from_payload(payload)
-    elif phase == Phase.REVIEW:
-        LocalReviewResult.from_payload(payload)
-    elif phase == Phase.FIX:
-        LocalFixResult.from_payload(payload)
-    elif phase in LOCAL_UNSUPPORTED_PHASES:
-        raise ControlResultValidationError(
-            f"phase {phase.value} belongs to the REMOTE (GitHub) workflow and is never "
-            "executed by a local run"
-        )
-    else:
-        raise ControlResultValidationError(
-            f"phase {phase.value} is executed by the controller and never accepts an "
-            "agent CONTROL_RESULT"
-        )
-
-
 def validate_for_phase(
     phase: Phase,
     payload: dict,
-    mode: WorkflowMode = WorkflowMode.REMOTE,
     *,
     update_epic_request: UpdateEpicRequest = UpdateEpicRequest.FULL,
 ) -> None:
@@ -2214,9 +2000,6 @@ def validate_for_phase(
     ``update_epic_request`` selects the UPDATE_EPIC schema; other phases
     ignore it.
     """
-    if mode == WorkflowMode.LOCAL:
-        _validate_local_phase(phase, payload)
-        return
     if phase == Phase.ANALYZE_EXECUTE:
         AnalyzeExecuteResult.from_payload(payload)
     elif phase == Phase.REVIEW:

@@ -1,0 +1,290 @@
+{
+  "acceptance_outcomes": [],
+  "attempt": 1,
+  "base_branch": "",
+  "base_head_sha": "",
+  "baseline_dirty_paths": [],
+  "block_reason": "",
+  "completion_context": {
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "phase": "ANALYZE_EXECUTE"
+  },
+  "config_fingerprint": {},
+  "controller_version": "0.1.0a1.dev0",
+  "counted_merged_prs": [],
+  "created_at": "2026-10-31T10:31:43.700569+00:00",
+  "current_base_ref": "",
+  "current_branch": "",
+  "current_head_sha": "",
+  "current_issue_url": "https://github.com/owner/repo/issues/2",
+  "current_merge_base_sha": "",
+  "current_pr_url": "",
+  "effect_records": [
+    {
+      "attempts": 1,
+      "completion": "remote_ref_equals_candidate",
+      "identity": {
+        "candidate_sha": "6f45c2291c9a8a5f2f25d59095f57bf378f160d4",
+        "ref": "refs/heads/autoforge/2",
+        "repository": "owner/repo"
+      },
+      "kind": "push",
+      "observed": {
+        "sha": "6f45c2291c9a8a5f2f25d59095f57bf378f160d4"
+      },
+      "owner": {
+        "issue_url": "https://github.com/owner/repo/issues/2",
+        "phase": "ANALYZE_EXECUTE",
+        "pr_url": "",
+        "run_id": "af-20261031T103143Z-778d70",
+        "transaction_id": ""
+      },
+      "payload": {
+        "sha": "6f45c2291c9a8a5f2f25d59095f57bf378f160d4"
+      },
+      "position": 0,
+      "precondition": {
+        "base_sha": "6fbe0c7ac8257b7fdceb6ae2673baae01920e89d",
+        "expected_old": null
+      },
+      "reason": "",
+      "stage": "observed",
+      "target": {
+        "ref": "refs/heads/autoforge/2",
+        "repository": "owner/repo"
+      }
+    },
+    {
+      "attempts": 1,
+      "completion": "one_pr_on_head_branch_matching_payload",
+      "identity": {
+        "head_branch": "autoforge/2",
+        "marker": "<!-- ai-implementation: {\"issue\": \"https://github.com/owner/repo/issues/2\"} -->",
+        "repository": "owner/repo"
+      },
+      "kind": "implementation_pr",
+      "observed": {
+        "number": 42,
+        "url": "https://github.com/owner/repo/pull/42"
+      },
+      "owner": {
+        "issue_url": "https://github.com/owner/repo/issues/2",
+        "phase": "ANALYZE_EXECUTE",
+        "pr_url": "",
+        "run_id": "af-20261031T103143Z-778d70",
+        "transaction_id": ""
+      },
+      "payload": {
+        "body": "Adds the feature.\n\nTested with `pytest`.\n\nCloses #2\n\n<!-- ai-implementation: {\"issue\": \"https://github.com/owner/repo/issues/2\"} -->",
+        "title": "Add the feature"
+      },
+      "position": 1,
+      "precondition": {
+        "absent": true
+      },
+      "reason": "",
+      "stage": "observed",
+      "target": {
+        "base": "main",
+        "head": "autoforge/2",
+        "repository": "owner/repo"
+      }
+    }
+  ],
+  "entry_observation": {
+    "base_sha": "6fbe0c7ac8257b7fdceb6ae2673baae01920e89d",
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "objects": {
+      "<!-- ai-implementation: {\"issue\": \"https://github.com/owner/repo/issues/2\"} -->": null
+    },
+    "phase": "ANALYZE_EXECUTE",
+    "pr_url": "",
+    "prs": {
+      "refs/heads/autoforge/2": null
+    },
+    "refs": {
+      "refs/heads/autoforge/2": null,
+      "refs/heads/main": "6fbe0c7ac8257b7fdceb6ae2673baae01920e89d"
+    }
+  },
+  "epic_url": "https://github.com/owner/repo/issues/1",
+  "escalation_count": 0,
+  "execution_attempt": 1,
+  "feature_spec_path": "",
+  "feature_spec_sha256": "",
+  "last_fix_resolutions": [],
+  "last_review_comment_url": "",
+  "last_review_needs_fix": null,
+  "last_review_result": "",
+  "launch_label": "controller_publishes",
+  "local_fix_rounds": 0,
+  "local_pending_attempts": 0,
+  "local_pending_fingerprint": "",
+  "local_pending_phase": "",
+  "local_run_contract": {},
+  "merged_since_epic_update": 0,
+  "mode": "REMOTE",
+  "next_issue_rejections": [],
+  "open_findings": [],
+  "operator_comment_outcomes": [],
+  "phase": "ANALYZE_EXECUTE",
+  "premerge_verified_commands": [],
+  "premerge_verified_head_sha": "",
+  "prior_findings": [],
+  "producer_validation_failure": {},
+  "prompt_version": "v14",
+  "protocol_version": "12",
+  "replan_transaction": {},
+  "repository": "owner/repo",
+  "review_certificate": {},
+  "review_evidence": {},
+  "review_history": [],
+  "review_round": 0,
+  "reviewed_base_ref": "",
+  "reviewed_head_sha": "",
+  "reviewed_merge_base_sha": "",
+  "reviewed_pr_url": "",
+  "reviewed_workspace_fingerprint": "",
+  "run_id": "af-20261031T103143Z-778d70",
+  "sandbox_pin": {},
+  "step_count": 5,
+  "superseded_prs": [],
+  "unblock_history": [
+    {
+      "at": "2026-10-31T10:31:44.020028+00:00",
+      "block_reason": "ANALYZE_EXECUTE: the controller's validation of this phase's candidates failed 3 time(s), which is the bound of 3; the last: validation definition [0] `/tmp/autoforge-protocol-12-python/bin/python -c import os, sys; sys.exit(0 if os.path.exists('/tmp/autoforge-protocol-12-capture/test_unblock_sets_the_watermar0/environment-repaired') else 1)` ended FAIL (exit 1) for commit 6f45c2291c9a (tree 4b825dc642cb) of owner/repo (validation record #1, run log af-20261031T103143Z-778d70/002-analyze_execute-candidate-validation-1). Nothing was pushed or published, and no review started; the controller will not launch the agent at ANALYZE_EXECUTE again unattended. Read the record's run log for the full output, repair the change or validation.commands, then 'unblock': the unblock makes the failures recorded so far historical, so the next candidate is validated afresh",
+      "detail": "issue #2 is OPEN and no open PR implements it; ANALYZE_EXECUTE will launch the implementation agent",
+      "phase": "ANALYZE_EXECUTE",
+      "reason": "the CI host lost its toolchain; repaired"
+    }
+  ],
+  "updated_at": "2026-10-31T10:31:44.169910+00:00",
+  "validation_attempt": {},
+  "validation_override_seq": 1,
+  "validation_records": [
+    {
+      "candidate": {
+        "commit": "6f45c2291c9a8a5f2f25d59095f57bf378f160d4",
+        "kind": "remote",
+        "object_format": "sha1",
+        "provenance": {
+          "base_revision": "6fbe0c7ac8257b7fdceb6ae2673baae01920e89d",
+          "issue_number": 2,
+          "kind": "worktree",
+          "strict_import": false,
+          "worktree_id": "2"
+        },
+        "repository": "owner/repo",
+        "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+      },
+      "definition": {
+        "argv": [
+          "/tmp/autoforge-protocol-12-python/bin/python",
+          "-c",
+          "import os, sys; sys.exit(0 if os.path.exists('/tmp/autoforge-protocol-12-capture/test_unblock_sets_the_watermar0/environment-repaired') else 1)"
+        ],
+        "definition_digest": "b5b080fa93f97ecf7861fde1c5ae77dbbb75931ef899b623fcf2864abecf7a89",
+        "index": 0,
+        "scope": "candidate-tree"
+      },
+      "digest": "31338debea89c826f0fc3a91e984c03247f0cc95773788ac56033e0df18c709e",
+      "enforcement": {
+        "backend": "",
+        "backend_version": "",
+        "enforced": false,
+        "network": "",
+        "teardown": ""
+      },
+      "exit_code": 1,
+      "finished_at": "2026-10-31T10:31:43.848858+00:00",
+      "leftovers": {
+        "descendants_killed": false,
+        "group_survived_kill": false,
+        "orphan_survived_kill": false,
+        "orphans_killed": false,
+        "orphans_unchecked": false
+      },
+      "outcome": "FAIL",
+      "output": {
+        "stderr_bytes": 0,
+        "stderr_tail": "",
+        "stderr_tail_truncated": false,
+        "stdout_bytes": 0,
+        "stdout_tail": "",
+        "stdout_tail_truncated": false
+      },
+      "policy": {
+        "mode": "disabled",
+        "policy_digest": "2ce3433313d6d7e3ad1f221c8097789b5c027aba182ab86debeea78f647be382",
+        "timeout_seconds": 1800
+      },
+      "run_log": "af-20261031T103143Z-778d70/002-analyze_execute-candidate-validation-1",
+      "schema": 1,
+      "seq": 1,
+      "started_at": "2026-10-31T10:31:43.831243+00:00"
+    },
+    {
+      "candidate": {
+        "commit": "6f45c2291c9a8a5f2f25d59095f57bf378f160d4",
+        "kind": "remote",
+        "object_format": "sha1",
+        "provenance": {
+          "base_revision": "6fbe0c7ac8257b7fdceb6ae2673baae01920e89d",
+          "issue_number": 2,
+          "kind": "worktree",
+          "strict_import": false,
+          "worktree_id": "2"
+        },
+        "repository": "owner/repo",
+        "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+      },
+      "definition": {
+        "argv": [
+          "/tmp/autoforge-protocol-12-python/bin/python",
+          "-c",
+          "import os, sys; sys.exit(0 if os.path.exists('/tmp/autoforge-protocol-12-capture/test_unblock_sets_the_watermar0/environment-repaired') else 1)"
+        ],
+        "definition_digest": "b5b080fa93f97ecf7861fde1c5ae77dbbb75931ef899b623fcf2864abecf7a89",
+        "index": 0,
+        "scope": "candidate-tree"
+      },
+      "digest": "737ab0739462bf0e62b90904622864b8ac56f2865fb1d7a98d204db4c5a87dc3",
+      "enforcement": {
+        "backend": "",
+        "backend_version": "",
+        "enforced": false,
+        "network": "",
+        "teardown": ""
+      },
+      "exit_code": 0,
+      "finished_at": "2026-10-31T10:31:44.131346+00:00",
+      "leftovers": {
+        "descendants_killed": false,
+        "group_survived_kill": false,
+        "orphan_survived_kill": false,
+        "orphans_killed": false,
+        "orphans_unchecked": false
+      },
+      "outcome": "PASS",
+      "output": {
+        "stderr_bytes": 0,
+        "stderr_tail": "",
+        "stderr_tail_truncated": false,
+        "stdout_bytes": 0,
+        "stdout_tail": "",
+        "stdout_tail_truncated": false
+      },
+      "policy": {
+        "mode": "disabled",
+        "policy_digest": "2ce3433313d6d7e3ad1f221c8097789b5c027aba182ab86debeea78f647be382",
+        "timeout_seconds": 1800
+      },
+      "run_log": "af-20261031T103143Z-778d70/007-analyze_execute-candidate-validation-1",
+      "schema": 1,
+      "seq": 2,
+      "started_at": "2026-10-31T10:31:44.113703+00:00"
+    }
+  ],
+  "verification_failures": [],
+  "workspace_fingerprint": ""
+}

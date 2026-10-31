@@ -1,12 +1,11 @@
 """``doctor``'s outer-sandbox rows (ADR 0005 §2.12, §2.14; #169).
 
-Both ``autoforge doctor`` and ``autoforge local doctor`` show, read-only and
-with no GitHub call:
+``autoforge doctor`` shows, read-only and with no GitHub call:
 
 - the capability probe's result (D14.1) and what ``sandbox.mode`` will do on
   this host (D12.2, D12.4): ``disabled`` is reported as a risk, logical
-  isolation only; ``required``, and ``preferred`` in REMOTE, fail on a host
-  that cannot enforce; LOCAL's ``preferred`` warns that it falls back;
+  isolation only; ``required``, and ``preferred``, which means ``required``
+  (ADR 0009 D7), fail on a host that cannot enforce;
 - the policy by launch class (§2.5), as the dry-run plan shows it;
 - per provider, its compiled declaration -- paths and classes, never a
   value -- and, when ``sandbox.mode`` enables the sandbox and the host can
@@ -33,9 +32,9 @@ from typing import TYPE_CHECKING
 
 from . import engine as _engine
 from .config import SANDBOX_PREFERRED, AutoForgeConfig, ProfileConfig
-from .errors import AutoForgeError, ConfigurationError, ExecutionError, SandboxPolicyError
+from .errors import AutoForgeError, ExecutionError, SandboxPolicyError
 from .executor import ExecutionRequest
-from .profiles import REQUIRED_PROFILES, local_required_profiles
+from .profiles import REQUIRED_PROFILES
 from .providers import AgentProvider, PiProvider, provider_for
 from .redaction import redact
 from .sandbox import NetworkPosition, compile_launch
@@ -76,7 +75,7 @@ _TCP_LISTEN = "0A"
 class _Layout:
     """Where this repository's run would keep what an agent writes, or ``None`` outside git."""
 
-    # The trees an agent writes in: the LOCAL root, or the REMOTE issue worktrees.
+    # The trees an agent writes in: the issue worktrees.
     workspaces: list[Path] = field(default_factory=list)
     # ``<git dir>/autoforge/sandbox/<key>`` (D8.4).
     sandbox_dirs: list[Path] = field(default_factory=list)
@@ -85,19 +84,19 @@ class _Layout:
     denied: tuple[str, ...] = ()
 
 
-def sandbox_checks(doctor: Doctor, local: bool) -> list[CheckResult]:
+def sandbox_checks(doctor: Doctor) -> list[CheckResult]:
     """The outer sandbox's rows, in order; none when the configuration did not load."""
     cfg = doctor.config
     if cfg is None:
         return []
     probe = _engine.probe_sandbox()
-    layout = _layout(doctor, cfg, local)
+    layout = _layout(doctor, cfg)
     denied = layout.denied if layout is not None else ()
     return [
         capability_row(probe),
-        mode_row(cfg, probe, local),
-        *policy_rows(cfg, local),
-        *provider_rows(doctor, cfg, local, probe, denied),
+        mode_row(cfg, probe),
+        *policy_rows(cfg),
+        *provider_rows(doctor, cfg, probe, denied),
         operator_paths_row(cfg, layout),
         hard_links_row(layout),
         sandbox_dirs_row(layout),
@@ -125,7 +124,7 @@ def capability_row(probe: ProbeResult) -> CheckResult:
     )
 
 
-def mode_row(cfg: AutoForgeConfig, probe: ProbeResult, local: bool) -> CheckResult:
+def mode_row(cfg: AutoForgeConfig, probe: ProbeResult) -> CheckResult:
     """What ``sandbox.mode`` does on this host: OK, a risk (WARN), or a refusal (FAIL)."""
     sandbox = cfg.sandbox
     name = f"mode ({sandbox.mode})"
@@ -136,9 +135,7 @@ def mode_row(cfg: AutoForgeConfig, probe: ProbeResult, local: bool) -> CheckResu
             f"{_engine.LOGICAL_ISOLATION_ONLY}: agents and repository-defined commands run as "
             "the operator's UID without the outer sandbox and can reach whatever the operator "
             "can by absolute path, controller state and credentials included (a risk; set "
-            "sandbox.mode: required"
-            + (" or preferred" if local else "")
-            + " where the capability row is supported)",
+            "sandbox.mode: required where the capability row is supported)",
             required=False,
         )
     if probe.supported:
@@ -146,45 +143,29 @@ def mode_row(cfg: AutoForgeConfig, probe: ProbeResult, local: bool) -> CheckResu
     missing = (
         probe.capability.value if probe.capability else "a capability"
     ) + f" ({probe.reason})"
-    if sandbox.refuses_unenforced(local):
-        how = (
-            "required"
-            if sandbox.mode != SANDBOX_PREFERRED
-            else "preferred, which a REMOTE run treats as required"
-        )
-        alternatives = f"sandbox.mode: disabled ({_engine.LOGICAL_ISOLATION_ONLY})"
-        if local:
-            alternatives += ", or preferred (falls back visibly)"
-        return _row(
-            name,
-            False,
-            f"sandbox.mode is {how}, and this host cannot provide {missing}: every step that "
-            f"launches is refused before anything is saved or charged; make the host capable, "
-            f"or set {alternatives}",
-        )
+    how = (
+        "required"
+        if sandbox.mode != SANDBOX_PREFERRED
+        else "preferred, which a REMOTE run treats as required"
+    )
     return _row(
         name,
         False,
-        f"this host cannot provide {missing}, so under preferred every LOCAL launch falls back "
-        f"to {_engine.LOGICAL_ISOLATION_ONLY}, said on stderr at the launch and in its execution "
-        "record (enforced: false); it is not sandboxed",
-        required=False,
+        f"sandbox.mode is {how}, and this host cannot provide {missing}: every step that "
+        f"launches is refused before anything is saved or charged; make the host capable, "
+        f"or set sandbox.mode: disabled ({_engine.LOGICAL_ISOLATION_ONLY})",
     )
 
 
-def policy_rows(cfg: AutoForgeConfig, local: bool) -> list[CheckResult]:
+def policy_rows(cfg: AutoForgeConfig) -> list[CheckResult]:
     """§2.5's policy for each launch class the run can make, by role (as the dry-run plan)."""
     sandbox = cfg.sandbox
     validation = NetworkPosition(sandbox.validation_network)
     paths = tuple(sandbox.read_only_paths)
-    classes = (
-        [(LaunchClass.LOCAL_AGENT, validation), (LaunchClass.LOCAL_VALIDATION, validation)]
-        if local
-        else [
-            (LaunchClass.REMOTE_AGENT, validation),
-            (LaunchClass.EXPORT_COMMAND, NetworkPosition(sandbox.premerge_network)),
-        ]
-    )
+    classes = [
+        (LaunchClass.REMOTE_AGENT, validation),
+        (LaunchClass.EXPORT_COMMAND, NetworkPosition(sandbox.premerge_network)),
+    ]
     return [
         _row(
             f"policy, {launch_class.value}",
@@ -197,19 +178,13 @@ def policy_rows(cfg: AutoForgeConfig, local: bool) -> list[CheckResult]:
 
 
 # -- providers (D7.3, D14.1) ---------------------------------------------------
-def _reachable(cfg: AutoForgeConfig, local: bool) -> list[str]:
-    if local:
-        try:
-            return local_required_profiles(cfg)
-        except ConfigurationError:
-            return []
+def _reachable(cfg: AutoForgeConfig) -> list[str]:
     return [*REQUIRED_PROFILES, *(n for n in ("update_epic",) if n in cfg.profiles)]
 
 
 def provider_rows(
     doctor: Doctor,
     cfg: AutoForgeConfig,
-    local: bool,
     probe: ProbeResult,
     denied: tuple[str, ...] = (),
 ) -> list[CheckResult]:
@@ -219,7 +194,7 @@ def provider_rows(
     is refused, as every launch of it would be, before anything is launched.
     """
     groups: dict[tuple[str, str], list[ProfileConfig]] = {}
-    for name in _reachable(cfg, local):
+    for name in _reachable(cfg):
         profile = cfg.profiles.get(name)
         if profile is None or profile.provider == "scripted":
             continue
@@ -429,7 +404,7 @@ def _git_lines(doctor: Doctor, *args: str) -> list[str] | None:
     return [line for line in (res.stdout or "").splitlines() if line.strip()]
 
 
-def _layout(doctor: Doctor, cfg: AutoForgeConfig, local: bool) -> _Layout | None:
+def _layout(doctor: Doctor, cfg: AutoForgeConfig) -> _Layout | None:
     lines = _git_lines(
         doctor,
         "rev-parse",
@@ -440,44 +415,35 @@ def _layout(doctor: Doctor, cfg: AutoForgeConfig, local: bool) -> _Layout | None
     )
     if lines is None or len(lines) != 3 or not all(line.startswith("/") for line in lines):
         return None
-    root, git_dir, common = (Path(os.path.realpath(line)) for line in lines)
+    _root, git_dir, common = (Path(os.path.realpath(line)) for line in lines)
     try:
-        denied = _run_engine(doctor, cfg, local).gate_denied_roots(root if local else None)
+        denied = _run_engine(doctor, cfg).gate_denied_roots()
     except (AutoForgeError, OSError):
         return None
-    if local:
-        workspaces = [root]
-    else:
-        configured = cfg.execution.worktree_dir
-        holder = (
-            Path(os.path.realpath(Path(doctor.cwd) / configured))
-            if configured
-            else common / "autoforge" / "worktrees"
-        )
-        workspaces = sorted(p for p in _children(holder) if p.is_dir())
+    configured = cfg.execution.worktree_dir
+    holder = (
+        Path(os.path.realpath(Path(doctor.cwd) / configured))
+        if configured
+        else common / "autoforge" / "worktrees"
+    )
+    workspaces = sorted(p for p in _children(holder) if p.is_dir())
     sandbox_dirs: list[Path] = []
     for base in dict.fromkeys([common, git_dir]):
         sandbox_dirs += sorted(p for p in _children(base / SANDBOX_DIR) if p.is_dir())
     return _Layout(workspaces, sandbox_dirs, denied)
 
 
-def _run_engine(doctor: Doctor, cfg: AutoForgeConfig, local: bool) -> _engine.ControllerEngine:
+def _run_engine(doctor: Doctor, cfg: AutoForgeConfig) -> _engine.ControllerEngine:
     """An engine bound as this invocation's run would be, so its denied roots are the run's.
 
     The state directory is the one the CLI gives a run (``--state-dir``,
-    else ``state_dir``; LOCAL's resolved as ``bind_local_state_dir`` does,
-    the default ``<git dir>/autoforge/state``), relative to the working
-    directory as there; the lock, the git directories and the registered
-    worktrees are read as a launch reads them. Nothing is created or locked.
+    else ``state_dir``), relative to the working directory as there; the
+    lock, the git directories and the registered worktrees are read as a
+    launch reads them. Nothing is created or locked.
     """
-    eng = _engine.ControllerEngine(
+    return _engine.ControllerEngine(
         cfg, state_dir=doctor.state_dir or cfg.state_dir, workdir=doctor.cwd, runner=doctor.runner
     )
-    if local:
-        eng.paths = _engine.local_state_paths(
-            eng.local_workspace(), explicit=doctor.state_dir, configured=cfg.state_dir
-        )
-    return eng
 
 
 def _children(path: Path) -> list[Path]:
@@ -572,8 +538,8 @@ def hard_links_row(layout: _Layout | None) -> CheckResult:
         name,
         False,
         f"{shown}: each still aliases an inode outside, which a sandboxed launch can read and "
-        "write through; remove a REMOTE worktree or sandbox directory to have it recreated, "
-        "or break the link in the LOCAL tree (ADR 0005 D4.4)",
+        "write through; remove a REMOTE worktree or sandbox directory to have it recreated "
+        "(ADR 0005 D4.4)",
         required=False,
     )
 

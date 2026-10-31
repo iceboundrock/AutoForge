@@ -170,8 +170,7 @@ RPC without an error. Without the option, the default depends on the profile:
 
 The read set is defence in depth, **not a write barrier**: `bash` stays,
 because a reviewer needs `git` and `gh`. The real guard is unchanged:
-independent GitHub verification, and in LOCAL mode REVIEW's tree-drift
-check (ADR 0001 §5.10). Because the list is always explicit, a
+independent GitHub verification. Because the list is always explicit, a
 `defaultTools` setting in Pi's settings cannot widen it.
 
 **Evidence.** `core/tools/index.js:19-28`, `core/sdk.js:144-148`,
@@ -324,7 +323,7 @@ and left no process behind.
 **Gate for #135.** On a platform without a child subreaper (anything but
 Linux), every agent result carries `orphans_unchecked`, and its leftovers
 sentence says a process may still be running. The prompt rule in
-`common.md` / `local_common.md` is the only mitigation there. #135 gates
+`common.md` is the only mitigation there. #135 gates
 unattended Pi use on it: the [Pi operator guide](pi.md#unattended-use)
 states that Pi is attended only on such a platform, and `doctor` adds a
 row for the Pi profiles, `pi's detached tool processes are contained`,
@@ -342,9 +341,9 @@ changes.
   `.pi/commands/` to `.pi/prompts/` at startup (a settings migration)
   under the full policy argv, when `.pi/prompts/` does not exist. Verified
   on installed Pi 1.0.1. It changes the agent's worktree before the agent
-  runs. REMOTE verification sees the change only if it is committed, and
-  LOCAL REVIEW's tree-drift check catches it. Candidate follow-up: refuse
-  a Pi launch in a tree that has `.pi/commands/`.
+  runs. REMOTE verification sees the change only if it is committed.
+  Candidate follow-up: refuse a Pi launch in a tree that has
+  `.pi/commands/`.
 - **Global system prompt files** cannot be disabled by any flag. `doctor`
   only warns.
 - **Context files** from the main checkout and from directories above it
@@ -380,8 +379,9 @@ changes.
   marked `live` and deselected by default, runs under `-m live` with
   `AUTOFORGE_LIVE_PI=1` and a route, `AUTOFORGE_LIVE_PI_AUTH=api_key`
   (DeepSeek, `require_oauth: false`) or `oauth` (the ChatGPT sign-in): one
-  LOCAL REVIEW through the operator's Pi, then a credential scan of
-  everything AutoForge wrote and the side-effect checks
+  REMOTE REVIEW through the operator's Pi, against an in-memory GitHub
+  stand-in, then a credential scan of everything AutoForge wrote and the
+  side-effect checks
   ([Pi operator guide](pi.md#prove-it-on-your-machine-the-live-smoke-test)).
   `tests/test_live_pi_support.py` checks offline that it is deselected by
   default, its settings, its scan and its other checks, and rehearses its

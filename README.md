@@ -44,9 +44,7 @@ strictly validated prompts from file templates, invokes `claude` /
 lists only, never a shell), parses the machine-readable `CONTROL_RESULT`
 block from agent output, and verifies every claim on GitHub before it
 advances state. Every invocation is logged, redacted, under
-`<state dir>/logs/<run-id>/`; the state directory defaults to `.autoforge/`
-for a remote run and to `<git dir>/autoforge/state` for a
-[local run](docs/local-mode.md#resume-and-recovery).
+`<state dir>/logs/<run-id>/`; the state directory defaults to `.autoforge/`.
 
 It is a single-machine client tool, not a distributed service: one process
 on your own machine, driving your `git`, `gh`, and agent CLIs under your
@@ -57,11 +55,6 @@ effects are checkpointed before they are performed. What *is* remote and
 concurrent is GitHub and the humans acting on it, which is why nothing
 GitHub-side is believed without being read back. AutoForge never commits to
 the default branch.
-
-There is a second, explicit workflow for when there is no GitHub to
-orchestrate: [Local mode](#local-mode-no-github) drives a feature Markdown
-file against your working tree with the same controller and the same
-verification discipline, and the controller makes zero `gh` invocations.
 
 ## Key properties
 
@@ -95,11 +88,11 @@ Each line is a summary; the linked document is the precise statement.
   round and SHA; the fix commit is the fixer's own HEAD, descends from the
   reviewed HEAD and is the PR's head once the controller has pushed it; the
   follow-up issues the controller created or recorded a deferral in are the
-  one open issue per finding; the EPIC update and the next issue exist.
+  one open issue per finding; the EPIC update exists, and the next issue
+  is open and a native sub-issue of the EPIC.
   ([GitHub safety](docs/agent-guides/github-safety.md))
 - **Agents never merge.** Every agent prompt carries the rule "never merge a
-  pull request" (LOCAL prompts forbid `git merge` and have no PR to merge).
-  The merge is performed by the controller itself
+  pull request". The merge is performed by the controller itself
   (`gh pr merge --<method> --match-head-commit <reviewed HEAD>`), with no
   agent invocation.
 - **Merging is off by default and opt-in.** `MERGE` is reachable only when
@@ -120,8 +113,7 @@ Each line is a summary; the linked document is the precise statement.
   was posted on (by repository and number), its HEAD SHA, its base branch
   and its merge base. If the HEAD, the base branch or the merge base moves
   after the review, the run goes back to `REVIEW` instead of merging, and a
-  different PR than the reviewed one is `BLOCKED`; a local review is bound
-  to a workspace fingerprint in the same way.
+  different PR than the reviewed one is `BLOCKED`.
   ([Review binding](docs/agent-guides/workflow.md#bind-reviews-to-pr-head-sha-and-to-the-pr-identity))
 - **State is durable and runs are resumable.** State is written atomically
   and side effects are checkpointed before they are performed. `resume`
@@ -132,7 +124,7 @@ Each line is a summary; the linked document is the precise statement.
   cumulative step budget bound every run, so it cannot loop forever.
   ([State and recovery](docs/agent-guides/state-and-recovery.md))
 - **Agents are separated from your checkout and shell; sandboxing is
-  opt-in.** A remote agent runs in a per-issue `git worktree` the
+  opt-in.** An agent runs in a per-issue `git worktree` the
   controller creates, with an allow-listed environment rather than the
   operator's whole shell, and the controller blocks if its own checkout's
   HEAD or branch moved while the agent ran. Whatever an agent leaves running is killed when its
@@ -145,15 +137,14 @@ Each line is a summary; the linked document is the precise statement.
   By default the agent is not sandboxed: it runs as the operator, with
   network access and the allow-listed provider credentials.
   ([Usage](docs/usage.md#how-agents-are-separated-from-your-checkout))
-  `sandbox.mode: required` (Linux, `bwrap`) runs every agent, LOCAL
-  validation command and pre-merge command inside an outer sandbox, or
-  refuses it: an empty root with only the system runtime, the workspace,
-  read-only git metadata, a private home and what the provider declares, so
-  controller state, other worktrees and your credential files are out of
-  reach. It still runs as your UID, and agents keep the host network. A
-  host that cannot enforce one is refused before the step, with nothing
-  saved, charged or launched; `preferred` falls back to logical isolation
-  only in LOCAL, visibly, and refuses like `required` in REMOTE; `doctor`
+  `sandbox.mode: required` (Linux, `bwrap`) runs every agent, validation
+  command and pre-merge command inside an outer sandbox, or refuses it: an
+  empty root with only the system runtime, the workspace, read-only git
+  metadata, a private home and what the provider declares, so controller
+  state, other worktrees and your credential files are out of reach. It
+  still runs as your UID, and agents keep the host network. A host that
+  cannot enforce one is refused before the step, with nothing saved,
+  charged or launched; `preferred` means `required`; `doctor`
   shows which this host gets
   ([ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md),
   [Usage](docs/usage.md#outer-sandbox),
@@ -174,14 +165,6 @@ Each line is a summary; the linked document is the precise statement.
   deliberate same-user read of a credential file by absolute path is
   outside this guarantee.
   ([GitHub safety](docs/agent-guides/github-safety.md#agents-hold-no-github-credential))
-- **The controller's local run is GitHub-free by construction, not by
-  convention.** Local mode needs no GitHub: a local run never constructs the
-  GitHub client, so no authentication is needed and none is consulted. The
-  agent is outside that construction: it is asked not to touch GitHub and
-  gets no GitHub credential (as above), and only a moved git anchor (a
-  commit, reset, checkout or branch switch) is detected;
-  a `gh` write or a push from the agent is not
-  (see [Local mode](#local-mode-no-github)).
 - **Logs and CLI output are redacted.** Tokens, API keys and authorization
   headers are masked (a baseline, with no claim of completeness), and no
   environment dump is ever written.
@@ -200,8 +183,7 @@ has the full matrix and the evidence for each entry.
 - `git`, and `gh` (GitHub CLI **2.48.0 or newer**, authenticated): the
   client lists branch rules and a PR's changed files with
   `gh api --paginate --slurp`, which older releases reject; `autoforge doctor`
-  refuses an older `gh` up front. `gh` is **not** needed for
-  [local mode](https://github.com/iceboundrock/AutoForge#local-mode-no-github)
+  refuses an older `gh` up front
 - `claude` (Claude Code CLI) for `analyze_execute` / `fix` profiles
 - `opencode` (OpenCode CLI) 2.0.0 or newer for the `review_*`,
   `replan_reexecute` and `update_epic` profiles; 1.x is refused by `doctor`
@@ -218,10 +200,7 @@ has the full matrix and the evidence for each entry.
   `autoforge doctor`, refuse such a state directory and say why
 
 Run `autoforge doctor` to check all of the above (read-only apart from
-creating the state directory if it is missing and a probe file it removes),
-or
-`autoforge local doctor` for the local-mode subset (no `gh`, no GitHub
-authentication, no `origin` remote).
+creating the state directory if it is missing and a probe file it removes).
 
 CLI flag syntax in `autoforge.example.yaml` was checked against the locally
 installed CLIs (Claude Code 2.1.263, OpenCode 2.0.23, gh 2.100.0); the
@@ -283,8 +262,7 @@ fixes of the commit it was built from, while security fixes land on `main`
 describes how a version is built and published.
 
 Whichever way it was installed, run `autoforge` from a checkout of the
-repository whose issues it drives (or, in LOCAL mode, whose feature file it
-implements); `autoforge doctor` checks the rest.
+repository whose issues it drives; `autoforge doctor` checks the rest.
 
 **For development** on AutoForge itself, from a clone of this repository:
 
@@ -364,64 +342,6 @@ recovers after a crash, a kill or a reboot
 It is experimental: it is verified offline only and has not yet driven a
 real EPIC ([Current maturity](#current-maturity)).
 
-## Local mode (no GitHub)
-
-Sometimes there is no GitHub to orchestrate: a coding interview, a scratch
-repository, an air-gapped machine, or simply a change you want driven by the
-same review loop without opening an Issue. `autoforge local` is a separate,
-explicit workflow for exactly that: the same controller, the same
-"never trust the agent" discipline, none of the GitHub lifecycle.
-
-```text
-features/<slug>.md  →  INITIALIZING → ANALYZE_EXECUTE → REVIEW
-                                         → clean ─────────────▶ DONE
-                                         → findings ──────────▶ FIX → REVIEW
-                                         → findings after the fix budget ─▶ BLOCKED
-```
-
-The *controller* never touches GitHub in a local run: no `gh` invocation,
-no Issue, no PR, no comment, no push, no branch, no merge, no EPIC update, no
-follow-up issue, and no replan. The `GitHubClient` is not even constructed.
-Nothing is faked either: there are no placeholder PR URLs in local state or
-local prompts.
-
-That is a property of the controller, not of the agents it launches. An agent
-is a same-UID subprocess with `gh` on `PATH` and network access; it is
-instructed not to use them, and it gets no GitHub or git credential through
-anything AutoForge controls, so a `gh` write or a push fails unless the agent
-finds a credential on its own (by reading the operator's files by absolute
-path, say). Beyond that, the controller can neither prevent nor detect a
-`gh` write, a `git push` or a network request made by the agent. What the
-controller *does* detect is a moved git anchor: HEAD and the checked-out branch
-are compared with the values the run was pinned to before and after every
-phase, and before every correction relaunch within one, so a commit, reset,
-checkout or branch switch blocks the run before another agent starts. It detects
-nothing else. Real containment is a sandbox, and LOCAL v1 provides none
-under the default `sandbox.mode: disabled`, which is logical isolation only
-([ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md)
-§2.2 and §8.1). With `sandbox.mode: required` every LOCAL agent and
-validation command runs inside ADR 0005's outer sandbox (#166–#169),
-where the git directory is read-only, so a commit, stash or branch
-switch fails outright; the agent still runs as your UID on the host
-network. `preferred` does the same where the host can enforce and, where it
-cannot, says at every launch that it runs with logical isolation only
-([Local mode](docs/local-mode.md#what-the-controller-does-and-does-not-do)).
-
-```bash
-autoforge local doctor                    # config, git, agent CLIs; never gh
-autoforge local init add-transaction-filter
-# a human (with or without an AI) refines features/add-transaction-filter.md
-autoforge local run features/add-transaction-filter.md --dry-run
-autoforge local run features/add-transaction-filter.md
-```
-
-The specification is frozen for the whole run (its SHA-256 is re-checked
-before and after every agent phase), every review is bound to a fingerprint
-of the working tree, and the controller never commits, stages, pushes,
-stashes, resets or switches branches in a local run. The [Local mode guide](docs/local-mode.md) covers the
-workspace fingerprint, dirty working trees, the review/fix bound, validation
-commands, and resume and recovery.
-
 ## Documentation
 
 The [documentation index](docs/README.md) lists everything by intent. The
@@ -432,7 +352,6 @@ most common entry points:
 | make a first run on a repository of my own, step by step | [Getting started](docs/getting-started.md), starter configurations in [`examples/`](examples) |
 | know which OS, Python, git, `gh`, agent CLI and sandbox host it runs on | [Compatibility](docs/compatibility.md) |
 | run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/usage.md#troubleshooting-and-recovery) |
-| work without GitHub | [Local mode](docs/local-mode.md) |
 | run phases through Pi on a DeepSeek API key or a ChatGPT subscription | [Pi operator guide](docs/pi.md) |
 | configure profiles, bounds and the merge gate | [Configuration](docs/configuration.md), [`autoforge.example.yaml`](autoforge.example.yaml) |
 | know what AutoForge protects, which GitHub token it needs, or report a vulnerability | [Security boundaries](docs/security.md), [SECURITY.md](SECURITY.md) |
@@ -457,7 +376,7 @@ bounded REVIEW/FIX loop with stagnation detection and the
 `REPLAN_REEXECUTE` transaction;
 journal-first recovery of an interrupted push or PR creation;
 bounded correction retry for malformed results; `doctor`; redacted
-per-invocation logs; LOCAL mode against a feature Markdown file.
+per-invocation logs.
 
 **Opt-in, and only on a host that can enforce it:** the outer sandbox on
 Linux (`sandbox.mode`, off by default), with its capability probe,
@@ -465,41 +384,38 @@ pre-launch gate and `doctor` rows. It needs Linux 6.12+ with Landlock ABI 6,
 unprivileged user, PID and IPC namespaces (some distributions restrict
 them), and a bubblewrap that can mount an overlay (0.11 or later)
 ([ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md)).
-`sandbox.mode: disabled` and a `preferred` fallback are not sandboxed. Its
-boundary is tested across every provider path on a capable host
-(`make test-sandbox`). Hosted CI measures its runner on every run (its
-`bwrap`, user-namespace policy and Landlock ABI, in the job summary) and
-requires the real-backend tests wherever the runner can enforce; where it
-cannot, they skip with the probe's reason. It is experimental until a
+`sandbox.mode: disabled` is not sandboxed. Its boundary is tested across
+every provider path on a capable host (`make test-sandbox`). Hosted CI
+measures its runner on every run (its `bwrap`, user-namespace policy and
+Landlock ABI, in the job summary) and requires the real-backend tests
+wherever the runner can enforce; where it cannot, they skip with the
+probe's reason. It is experimental until a
 `make test-sandbox` run on a capable host is recorded at the release
 candidate.
 
 **Opt-in, off until configured:** controller-run validation of the exact
 candidate
 ([ADR 0006](docs/adr/0006-candidate-validation-evidence-and-review-certificates.md)).
-`validation.commands` (REMOTE) and `local.validation_commands` (LOCAL) are
-empty by default, so nothing is validated until you configure them. Then
-the controller runs each command itself against the exact candidate an
-agent hands back, a REMOTE commit in a byte-exact export of its tree or
-the LOCAL working tree in place (where a command that changes the tree
-must converge), and keeps each outcome in the state file as a durable
-`ValidationRecord`, reused for the same candidate, command and policy. A
-REMOTE candidate is pushed or published only once every command has
-passed on it. Before a reviewer launches, the controller requires records
-for the candidate under review (REMOTE validates a PR head that has none,
-such as a human's push), shows their outcomes in the review prompt's
-evidence section, and refuses a clean verdict over a failing record. A
-record says what the controller observed when it ran a command, not
-that the change is correct, that GitHub CI passed or that the result
-holds on another host; under `sandbox.mode: disabled` every command runs
-unsandboxed as your UID.
+`validation.commands` is empty by default, so nothing is validated until
+you configure it. Then the controller runs each command itself against the
+exact commit an agent hands back, in a byte-exact export of its tree, and
+keeps each outcome in the state file as a durable `ValidationRecord`,
+reused for the same candidate, command and policy. A candidate is pushed
+or published only once every command has passed on it. Before a reviewer
+launches, the controller requires records for the candidate under review
+(it validates a PR head that has none, such as a human's push), shows
+their outcomes in the review prompt's evidence section, and refuses a
+clean verdict over a failing record. A record says what the controller
+observed when it ran a command, not that the change is correct, that
+GitHub CI passed or that the result holds on another host; under
+`sandbox.mode: disabled` every command runs unsandboxed as your UID.
 
 **Always on, with or without validation:** the review certificate a clean
-round issues on its way to `READY_FOR_MERGE` or LOCAL `DONE`. It states
-which candidate and revision were reviewed clean, which validation set the
-reviewer was presented, and that every record in it passed; with nothing
-configured the set is empty, and the certificate certifies a clean review
-and no validation. It is a prerequisite, not permission to merge: it is
+round issues on its way to `READY_FOR_MERGE`. It states which candidate
+and revision were reviewed clean, which validation set the reviewer was
+presented, and that every record in it passed; with nothing configured the
+set is empty, and the certificate certifies a clean review and no
+validation. It is a prerequisite, not permission to merge: it is
 not a GitHub approval or a CI result, and it is never shown to an agent or
 published.
 
@@ -531,13 +447,17 @@ and have been used once for real, in a run on this repository. They stay
 experimental until they are used on a repository other than AutoForge.
 
 **Experimental and opt-in:** Pi as a provider (`provider: pi`, the
-[Pi operator guide](docs/pi.md)). No built-in profile uses it, and its one
-recorded live run is a LOCAL review on DeepSeek (#135).
+[Pi operator guide](docs/pi.md)). No built-in profile uses it. Its one
+recorded live run, a review on DeepSeek (#135), was in LOCAL mode, which is
+gone; no live run of the
+[live smoke test](docs/pi.md#prove-it-on-your-machine-the-live-smoke-test)'s
+REMOTE review is recorded yet.
 
 The Public Alpha release claims these capabilities at exactly these levels
 ([#255](https://github.com/iceboundrock/AutoForge/issues/255), conditions
 C1–C7). The registration prerelease `0.1.0a0` on PyPI (#295) is not the
-Public Alpha and claims no more than this.
+Public Alpha; it predates LOCAL's removal, and this section does not
+describe it.
 
 **Explicitly not yet:** unattended production operation; the controller
 feeding CI results into the review prompt (the reviewer is asked to inspect

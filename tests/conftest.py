@@ -55,6 +55,7 @@ from autoforge.github import (  # noqa: E402
     CommentInfo,
     CreatedObject,
     IssueInfo,
+    IssueNode,
     MergeQueueStatus,
     PRInfo,
     RepoInfo,
@@ -109,12 +110,13 @@ DECODER_LIMIT_RECORDS = {
     "deep-nesting": b'{"type": "x", "n": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
 }
 
-# -- the state pins of LOCAL's removal (ADR 0009 D8, D12 S1b; #385) ---------------------
+# -- the state pins of LOCAL's removal (ADR 0009 D8, D12 S1b and S3; #385, #388) --------
 # The twelve state fields LOCAL mode added (ADR 0009 §1.1), at the empty value
-# every REMOTE save writes them with. A protocol-1 file carries none, some or
-# all of them, every later save all twelve. Each refusal the removal keeps is
+# every REMOTE save wrote them with. A protocol-1 file carries none, some or
+# all of them, every save under labels 2 to 12 all twelve; protocol 13 drops
+# them (#388, ADR 0009 D8) and writes none. Each refusal the removal keeps is
 # pinned on a file with all twelve at these values and on one with none of
-# them, so that dropping the fields (#388) cannot turn either into a file that
+# them, so that dropping the fields cannot turn either into a file that
 # loads, or refuse it for another reason.
 LOCAL_STATE_FIELDS = {
     "feature_spec_path": "",
@@ -179,9 +181,10 @@ def state_tree(root: Path) -> dict[str, tuple]:
     return out
 
 
-# The three states that do not load whose handling ADR 0009 D4 audits: an
-# unknown mode, an unknown protocol label and invalid JSON.
-UNLOADABLE_STATES = ("unknown-mode", "unknown-label", "invalid-json")
+# The states that do not load whose handling ADR 0009 D4 audits: an unknown
+# mode, an unknown protocol label and invalid JSON (#385), and a LOCAL state,
+# which the loader refuses as an unknown mode since LOCAL was removed (#387).
+UNLOADABLE_STATES = ("unknown-mode", "unknown-label", "invalid-json", "local-mode")
 
 
 def unloadable_state(kind: str, saved: bytes) -> tuple[bytes, str]:
@@ -199,6 +202,9 @@ def unloadable_state(kind: str, saved: bytes) -> tuple[bytes, str]:
     if kind == "unknown-mode":
         data["mode"] = "SATELLITE"
         return json.dumps(data).encode("utf-8"), "state file has unknown mode 'SATELLITE'"
+    if kind == "local-mode":
+        data["mode"] = "LOCAL"
+        return json.dumps(data).encode("utf-8"), "state file has unknown mode 'LOCAL'"
     assert kind == "unknown-label", kind
     data["protocol_version"] = "99"
     return json.dumps(data).encode("utf-8"), "unsupported protocol_version '99'"
@@ -568,6 +574,18 @@ class FakeGitHub:
         self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
         # get_issue calls for these URLs (canonical) raise; others answer.
         self.get_issue_errors: dict[str, GitHubError] = {}
+        # Each issue's native parent, as GitHub's ``parent_issue_url`` names it
+        # (#287), by the canonical URL ``add_issue`` registered: an issue a test
+        # adds is a sub-issue of EPIC unless ``parent`` says otherwise; the EPIC
+        # and an issue the controller creates (a follow-up) have none.
+        # ``graph_error`` makes get_issue_node and both sub-issue listings
+        # raise; ``sub_issues_error`` the listings alone. ``hidden_sub_issues``
+        # are sub-issues GitHub counts for an issue (by canonical URL) but
+        # leaves out of its listing, as it does one the token may not read.
+        self.parents: dict[str, str | None] = {}
+        self.graph_error: GitHubError | None = None
+        self.sub_issues_error: GitHubError | None = None
+        self.hidden_sub_issues: dict[str, int] = {}
         # Controller-owned EPIC body write (edit_issue_body): every write is
         # recorded as (canonical url, body). ``edit_issue_error`` raises like
         # close_error; ``edit_issue_race`` is called before the write lands (a
@@ -647,7 +665,7 @@ class FakeGitHub:
         # Issues and PRs up to this number exist beyond the fake's listings
         # (GitHub's one shared sequence): a created PR or issue gets the next.
         self.last_number: int = 0
-        self.add_issue(EPIC, "EPIC")
+        self.add_issue(EPIC, "EPIC", parent=None)
         self.add_issue(ISSUE, "Feature")
 
     # -- test helpers ---------------------------------------------------------
@@ -688,7 +706,12 @@ class FakeGitHub:
                 self.set_head(sha, url)
 
     def add_issue(
-        self, url: str, title: str = "t", state: str = "OPEN", body: str = ""
+        self,
+        url: str,
+        title: str = "t",
+        state: str = "OPEN",
+        body: str = "",
+        parent: str | None = EPIC,
     ) -> IssueInfo:
         ref = parse_issue_url(url)
         info = IssueInfo(
@@ -700,6 +723,7 @@ class FakeGitHub:
             repository=ref.repository,
         )
         self.issues[ref.canonical] = info
+        self.parents[ref.canonical] = parse_issue_url(parent).canonical if parent else None
         return info
 
     def add_pr(
@@ -776,6 +800,55 @@ class FakeGitHub:
 
     def get_issue_state(self, url: str) -> str:
         return self.get_issue(url).state
+
+    def get_issue_node(self, url: str) -> IssueNode:
+        self.calls.append(("get_issue_node", url))
+        if self.graph_error is not None:
+            raise self.graph_error
+        ref = parse_issue_url(url)
+        for known in self.issues:
+            if parse_issue_url(known).same_target(ref):
+                return self._issue_node(known)
+        raise GitHubNotFoundError(f"issue not found: {url}")
+
+    def list_sub_issues(self, url: str) -> tuple[IssueNode, ...]:
+        self.calls.append(("list_sub_issues", url))
+        if (error := self.graph_error or self.sub_issues_error) is not None:
+            raise error
+        return tuple(self._issue_node(known) for known in self._children(url))
+
+    def list_titled_sub_issues(self, url: str) -> tuple[tuple[IssueNode, str], ...]:
+        self.calls.append(("list_titled_sub_issues", url))
+        if (error := self.graph_error or self.sub_issues_error) is not None:
+            raise error
+        return tuple(
+            (self._issue_node(known), self.issues[known].title) for known in self._children(url)
+        )
+
+    def _children(self, url: str) -> list[str]:
+        ref = parse_issue_url(url)
+        return [
+            known
+            for known, parent in self.parents.items()
+            if parent is not None and parse_issue_url(parent).same_target(ref)
+        ]
+
+    def _issue_node(self, known: str) -> IssueNode:
+        """The graph facts of a stored issue: no blockers, a closed one ``completed``."""
+        info = self.issues[known]
+        parent = self.parents.get(known)
+        return IssueNode(
+            id=100_000 + info.number,
+            number=info.number,
+            url=info.url,
+            repository=parse_issue_url(known).repository,
+            state="open" if info.is_open else "closed",
+            state_reason=None if info.is_open else "completed",
+            parent=parse_issue_url(parent) if parent else None,
+            sub_issues_total=len(self._children(known)) + self.hidden_sub_issues.get(known, 0),
+            blocked_by_total=0,
+            blocked_by_open=0,
+        )
 
     def edit_issue_body(self, url: str, body: str) -> None:
         canonical = parse_issue_url(url).canonical
@@ -1376,7 +1449,10 @@ class FakeGitHub:
         def perform() -> CreatedObject:
             number = self._next_number(repository)
             info = self.add_issue(
-                f"https://github.com/{repository}/issues/{number}", title=title, body=body
+                f"https://github.com/{repository}/issues/{number}",
+                title=title,
+                body=body,
+                parent=None,
             )
             return CreatedObject(url=info.url, number=number)
 
@@ -2089,7 +2165,6 @@ def certify_review(eng: ControllerEngine, tree: str = "e" * 40) -> dict:
         state.review_evidence,
         records,
         repository=state.repository,
-        run_id=state.run_id,
         review_round=state.review_round,
         needs_fix_round=False,
         actionable_findings=0,
@@ -2417,7 +2492,6 @@ def sandbox_probe(monkeypatch) -> SandboxProbe:
 # ``os.fsync`` (see ``_fsync_without_the_disk``).
 REAL_FSYNC_MODULES = frozenset(
     {
-        "test_durable_run_contract.py",
         "test_run_namespace.py",
         "test_runlog.py",
         "test_safefs.py",
@@ -2513,82 +2587,6 @@ def engine(tmp_state_dir, fake_github):
     return make_engine(tmp_state_dir, [], github=fake_github)
 
 
-# -- LOCAL mode -----------------------------------------------------------------
-class ExplodingGitHub:
-    """A GitHub client that fails the test on any use.
-
-    A LOCAL run must make zero GitHub calls, so the strongest available
-    assertion is to hand the engine a client that cannot be touched at all.
-    """
-
-    def __getattr__(self, name: str):
-        raise AssertionError(f"LOCAL mode touched GitHub: {name!r}")
-
-
-FEATURE_MD = """# Feature: Add Transaction Filter
-
-## Problem
-
-Users cannot filter transactions.
-
-## Requirements
-
-- [ ] Add a `--since` filter.
-
-## Acceptance Criteria
-
-- [ ] Filtering by date returns only later transactions.
-
-## Non-goals
-
-- Pagination.
-
-## Notes / Decisions
-
-None.
-"""
-
-
-def sample_contract(
-    *,
-    repository_root: str = "/repo",
-    state_root: str = "/repo/.git/autoforge/state",
-    exclude: tuple[str, ...] = (),
-    max_entries: int = 50_000,
-    max_bytes: int = 512 * 1024 * 1024,
-    validation_commands: tuple[tuple[str, ...], ...] = (),
-    max_fix_rounds: int = 1,
-    max_total_steps: int = 300,
-    prompt_version: str = "v1",
-) -> dict:
-    """A well-formed persisted LOCAL run contract (see ``autoforge.run_contract``)."""
-    from autoforge.local_workspace import SNAPSHOT_TAG
-    from autoforge.run_contract import LocalRunContract, WorkspacePolicy
-
-    return LocalRunContract(
-        repository_root=repository_root,
-        state_root=state_root,
-        workspace_policy=WorkspacePolicy(
-            exclude=exclude,
-            max_entries=max_entries,
-            max_bytes=max_bytes,
-            snapshot_tag=SNAPSHOT_TAG,
-        ),
-        validation_commands=validation_commands,
-        max_fix_rounds=max_fix_rounds,
-        max_total_steps=max_total_steps,
-        prompt_version=prompt_version,
-    ).to_dict()
-
-
-def write_feature(repo, name: str = "add-filter", body: str = FEATURE_MD) -> Path:
-    """Write ``features/<name>.md`` inside ``repo`` and return the path."""
-    path = Path(repo) / "features" / f"{name}.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    return path
-
-
 def commit_all(repo, message: str = "wip") -> None:
     """Commit everything in ``repo`` (tests need a clean baseline tree).
 
@@ -2613,45 +2611,6 @@ def commit_all(repo, message: str = "wip") -> None:
         ],
         check=True,
     )
-
-
-def make_local_engine(
-    workdir,
-    feature,
-    script=None,
-    cfg=None,
-    exit_code: int = 0,
-    state_dir=None,
-    allow_dirty: bool = False,
-    start: bool = True,
-):
-    """Engine wired for a LOCAL run: scripted agents, exploding GitHub.
-
-    No ``runner`` is injected: ``LocalWorkspace`` must run real ``git`` against
-    the real temporary repository, which is the whole point of the local trust
-    boundary.
-
-    ``state_dir`` is left unset by default so the engine resolves it the way
-    the CLI does -- ``<git dir>/autoforge/state``, outside the reviewed tree.
-    Tests that exercise state-dir placement pass one explicitly.
-    """
-    cfg = cfg or default_config()
-    provider = ScriptedProvider(script, exit_code=exit_code)
-    registry = ProviderRegistry(
-        overrides={"claude": provider, "opencode": provider, "scripted": provider}
-    )
-    eng = ControllerEngine(
-        config=cfg,
-        state_dir=state_dir,
-        workdir=workdir,
-        github=ExplodingGitHub(),  # type: ignore[arg-type]
-        providers=registry,
-    )
-    eng.bind_local_state_dir(state_dir)
-    if start:
-        eng.new_local_run(feature, allow_dirty=allow_dirty)
-    eng.provider = provider  # type: ignore[attr-defined]
-    return eng
 
 
 # -- what a launched process sees (#165) ----------------------------------------

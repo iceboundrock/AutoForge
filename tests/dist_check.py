@@ -24,7 +24,9 @@ imports the ``autoforge`` of the source tree:
 2. The sdist holds exactly ``LICENSE``, ``MANIFEST.in``, ``README.md``,
    ``pyproject.toml``, ``PKG-INFO``, ``setup.cfg``, the egg-info, the modules and the
    resources ``[tool.setuptools.package-data]`` declares. The wheel holds
-   exactly those modules and resources and its dist-info. Both carry the
+   exactly those modules and resources and its dist-info. Neither carries a
+   LOCAL prompt template (``autoforge/prompts/local_*.md``), which LOCAL's
+   removal deleted (ADR 0009 D12 S3, #388), whatever the tree declares. Both carry the
    metadata ``pyproject.toml`` declares (``Name: autoforge-cli``, the
    version, ``License-Expression: MIT``, ``License-File: LICENSE``, the
    classifiers, ``Requires-Python``) and ``LICENSE`` byte for byte. A file
@@ -35,12 +37,11 @@ imports the ``autoforge`` of the source tree:
 4. From that environment: ``autoforge --version`` and ``autoforge --help``;
    every prompt template loaded and rendered from the installed package
    (this file again, with ``--installed``, on the environment's own
-   interpreter); ``autoforge local run --dry-run --full-prompt`` in a
-   scratch git repository, which renders a phase prompt through the
-   installed engine and must write no state; and a REMOTE ``autoforge run
-   --dry-run --full-prompt`` in another, with a ``gh`` on ``PATH`` that
-   records any call and fails it, which must render the ANALYZE_EXECUTE
-   prompt, call no ``gh`` and leave the repository byte-identical.
+   interpreter); and a REMOTE ``autoforge run --dry-run --full-prompt`` in
+   a scratch git repository, with a ``gh`` on ``PATH`` that records any
+   call and fails it, which must render the ANALYZE_EXECUTE prompt through
+   the installed engine, call no ``gh`` and leave the repository
+   byte-identical.
 5. The offline half of a stranger's first run (#259, docs/getting-started.md):
    ``uv tool install`` of the wheel alone, into tool directories and a home
    of their own; then, with no credential and no agent CLI on ``PATH``,
@@ -106,12 +107,13 @@ DEVELOPMENT_VERSION = re.compile(RELEASE_VERSION.pattern + r"(\.dev(0|[1-9]\d*))
 BUILD_CONSTRAINTS = "build-constraints.txt"
 _PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][0-9A-Za-z.!+-]*)")
 _HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
-# The feature slug of the LOCAL dry run.
-LOCAL_SLUG = "dist-check"
 # The URLs of the REMOTE dry run: never read, since a dry run calls no gh.
 REMOTE_EPIC = "https://github.com/example/dist-check/issues/1"
 REMOTE_ISSUE = "https://github.com/example/dist-check/issues/2"
 _PLACEHOLDER = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
+# LOCAL mode's prompt templates, deleted with it (ADR 0009 D12 S3, #388): no
+# artifact and no installed package may carry one again.
+_LOCAL_TEMPLATE = re.compile(r"(?:^|/)autoforge/prompts/local_[^/]*\.md$")
 _CONTROL_RESULT = "<<<CONTROL_RESULT>>>"
 # The first run (#259, docs/getting-started.md). Its repository's origin is the
 # repository of the REMOTE URLs.
@@ -182,6 +184,11 @@ def declared_resources(root: Path = REPO_ROOT, data: dict | None = None) -> set[
 def wheel_package_files(root: Path = REPO_ROOT) -> set[str]:
     """What the wheel must hold outside its dist-info: the modules and the resources."""
     return package_modules(root) | declared_resources(root)
+
+
+def local_templates(names) -> list[str]:
+    """The LOCAL prompt templates (``autoforge/prompts/local_*.md``) among ``names``."""
+    return sorted(name for name in names if _LOCAL_TEMPLATE.search(name))
 
 
 def distribution_stem(name: str, version: str) -> str:
@@ -305,6 +312,8 @@ def check_sdist(path: Path, stem: str, data: dict, root: Path = REPO_ROOT) -> No
         egg_info = f"src/{stem.split('-', 1)[0]}.egg-info/"
         expected = SDIST_TOP_FILES | {f"src/{name}" for name in wheel_package_files(root)}
         found = {name for name in names if not name.startswith(egg_info)}
+        local = local_templates(found)
+        _check(not local, f"{path.name} carries LOCAL prompt templates: {local}")
         missing, extra = sorted(expected - found), sorted(found - expected)
         _check(not missing, f"{path.name} is missing {missing}")
         _check(not extra, f"{path.name} carries files it should not: {extra}")
@@ -328,6 +337,8 @@ def check_wheel(path: Path, stem: str, data: dict, root: Path = REPO_ROOT) -> st
     with zipfile.ZipFile(path) as archive:
         names = {name for name in archive.namelist() if not name.endswith("/")}
         package = {name for name in names if not name.startswith(dist_info)}
+        local = local_templates(package)
+        _check(not local, f"{path.name} carries LOCAL prompt templates: {local}")
         expected = wheel_package_files(root)
         missing, extra = sorted(expected - package), sorted(package - expected)
         _check(not missing, f"{path.name} is missing {missing}")
@@ -471,7 +482,7 @@ def install(wheel: Path, work: Path) -> Path:
 
 
 def smoke(bin_dir: Path, work: Path, version: str) -> None:
-    """The installed command, the installed templates and a LOCAL dry run."""
+    """The installed command, the installed templates and a REMOTE dry run."""
     env = _child_env()
     autoforge = str(bin_dir / "autoforge")
     out = _run([autoforge, "--version"], cwd=work, env=env).stdout.strip()
@@ -500,30 +511,6 @@ def smoke(bin_dir: Path, work: Path, version: str) -> None:
     git = shutil.which("git")
     _check(git is not None, "git is not on PATH")
     assert git is not None
-    repo = _scratch_repository(git, work / "local-repo", env)
-    _run([autoforge, "local", "init", LOCAL_SLUG], cwd=repo, env=env)
-    plan = _run(
-        [autoforge, "local", "run", f"features/{LOCAL_SLUG}.md", "--dry-run", "--full-prompt"],
-        cwd=repo,
-        env=env,
-    ).stdout
-    for needle in ("Template: local_analyze_execute.md", "--- prompt preview ---", _CONTROL_RESULT):
-        _check(needle in plan, f"the LOCAL dry run printed no {needle!r}")
-    _check(not _PLACEHOLDER.search(plan), "the LOCAL dry run's prompt has an unrendered variable")
-    # A dry run takes the repository lock, whose file stays; it writes no state.
-    controller = repo / ".git" / "autoforge"
-    written = sorted(p.name for p in controller.iterdir()) if controller.exists() else []
-    _check(
-        set(written) <= {"controller.lock"},
-        f"the LOCAL dry run wrote controller files: {written}",
-    )
-    status = _run([git, "status", "--porcelain"], cwd=repo, env=env).stdout.split("\n")
-    _check(
-        [line for line in status if line] == ["?? features/"],
-        f"the LOCAL dry run changed the scratch repository: {status}",
-    )
-    _say("ok: autoforge local run --dry-run --full-prompt rendered the ANALYZE_EXECUTE prompt")
-
     remote_dry_run(autoforge, git, work, env)
 
 
@@ -844,6 +831,8 @@ def check_installed(expect_version: str, source_root: Path) -> None:
     on_disk = sorted(path.name for path in directory.glob("*.md"))
     registered = sorted(prompts.TEMPLATE_FILES)
     _check(on_disk == registered, f"installed templates {on_disk}, registered {registered}")
+    local = local_templates(f"autoforge/prompts/{name}" for name in {*on_disk, *registered})
+    _check(not local, f"the installed package carries LOCAL prompt templates: {local}")
     _check(engine.check_template_files() == [], f"missing: {engine.check_template_files()}")
 
     def variables(*names: str) -> dict[str, str | int | None]:
@@ -856,17 +845,13 @@ def check_installed(expect_version: str, source_root: Path) -> None:
         _check(not phase or _CONTROL_RESULT in text, f"{what} asks for no CONTROL_RESULT")
 
     rendered: set[str] = set()
-    tables = (
-        (engine.PHASE_TEMPLATE, prompts.COMMON_TEMPLATE),
-        (engine.LOCAL_PHASE_TEMPLATE, prompts.LOCAL_COMMON_TEMPLATE),
-    )
-    for table, common in tables:
-        for phase, name in table.items():
-            if name is None:
-                continue
-            text = prompts.render_phase(name, variables(common, name), common_template=common)
-            checked(text, f"{phase.value} ({common} + {name})", phase=True)
-            rendered |= {common, name}
+    common = prompts.COMMON_TEMPLATE
+    for phase, name in engine.PHASE_TEMPLATE.items():
+        if name is None:
+            continue
+        text = prompts.render_phase(name, variables(common, name), common_template=common)
+        checked(text, f"{phase.value} ({common} + {name})", phase=True)
+        rendered |= {common, name}
     rerequest = engine.UPDATE_EPIC_RE_REQUEST_TEMPLATE
     text = prompts.render_phase(rerequest, variables(prompts.COMMON_TEMPLATE, rerequest))
     checked(text, f"UPDATE_EPIC re-request ({rerequest})", phase=False)

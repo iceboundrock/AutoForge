@@ -50,11 +50,6 @@ common dir) is on a filesystem whose ``flock`` is a local kernel lock
 is absent or a real directory owned by this user and not world-writable
 (``lstat`` only); and ``gh`` can read the EPIC's sub-issues and
 dependencies (#179's snapshot, its four reads). They create nothing.
-
-``autoforge local doctor`` runs the LOCAL subset: no `gh`, no `gh auth
-status`, no `origin` remote. A machine with no GitHub CLI and no GitHub
-credentials must pass it, so the checks it omits are omitted entirely rather
-than reported as warnings.
 """
 
 from __future__ import annotations
@@ -113,9 +108,8 @@ from .github import (
     is_access_denied_gh_failure,
     parse_gh_version,
 )
-from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .locking import check_local_lock_filesystem, repository_lock_path
-from .profiles import REQUIRED_PROFILES, local_required_profiles
+from .profiles import REQUIRED_PROFILES
 from .providers import (
     CLAUDE_ISOLATION_FLAGS,
     OPENCODE_MIN_VERSION,
@@ -138,7 +132,6 @@ from .validation import parse_issue_url, parse_remote_repository
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
 # A fixed list of required profile names, or a function of the loaded config.
-RequiredProfiles = list[str] | Callable[[AutoForgeConfig], list[str]]
 
 # Fallback executable for a provider whose profile does not set `command`,
 # matching the provider adapters' own defaults.
@@ -245,12 +238,8 @@ class Doctor:
         return CheckResult(name, ok, detail)
 
     # -- checks --------------------------------------------------------------------
-    def check_config(self, required_profiles: RequiredProfiles | None = None) -> CheckResult:
-        """Load the config and require its profiles.
-
-        ``required_profiles`` may be a fixed list or a callable, because a
-        LOCAL run's required reviewer profiles are derived from the config that
-        is only loaded here (see :func:`autoforge.profiles.local_required_profiles`).
+    def check_config(self) -> CheckResult:
+        """Load the config and require the profiles a REMOTE run reaches.
 
         ``self.config`` is set exactly when this check passes, and to what
         *this* attempt accepted. Every later check reads it, so it must not
@@ -263,12 +252,9 @@ class Doctor:
         self.config = None
         try:
             cfg = load_config_file(self.config_path)
-            required = required_profiles or REQUIRED_PROFILES
-            names = required(cfg) if callable(required) else required
-            validate_required_profiles(cfg, names)
-            if required_profiles is None:
-                # A REMOTE run: its routing is recorded in its state file (#219).
-                fingerprint_routing(cfg)
+            validate_required_profiles(cfg, REQUIRED_PROFILES)
+            # A run's routing is recorded in its state file (#219).
+            fingerprint_routing(cfg)
         except ConfigurationError as exc:
             return CheckResult("config", False, str(exc))
         # #280: a file an enforced launch could have rewritten is refused
@@ -831,80 +817,11 @@ class Doctor:
         ok, detail = self._run_gh([gh, "auth", "status"])
         return CheckResult("gh authenticated", ok, detail)
 
-    def check_feature_spec(self, spec_path: str) -> CheckResult:
-        """Validate a feature specification path the way `local run` would."""
-        from .local_workspace import read_feature_spec
-
-        name = "feature specification"
-        ws = self._workspace()
-        try:
-            spec = read_feature_spec(ws, spec_path)
-        except Exception as exc:
-            return CheckResult(name, False, f"{spec_path}: {exc}")
-        return CheckResult(name, True, f"{spec.relative_path} (sha256 {spec.sha256[:16]}...)")
-
-    def check_validation_commands(self) -> CheckResult:
-        """Report the configured local validation commands (never runs them)."""
-        cfg = self.config
-        cmds = cfg.local.validation_commands if cfg else []
-        name = "local validation commands"
-        if not cmds:
-            return CheckResult(name, True, "(none configured)", required=False)
-        return CheckResult(name, True, "; ".join(" ".join(argv) for argv in cmds))
-
-    def run_local(self, feature_spec_path: str | None = None) -> list[CheckResult]:
-        """Checks a LOCAL run needs — and nothing that touches GitHub.
-
-        No `gh` binary, no `gh auth status`, no `origin` remote: a local run
-        makes zero GitHub calls, so requiring any of them here would be a
-        false failure on exactly the machine local mode exists for.
-        """
-        # Which reviewer profiles a local run needs depends on its configured
-        # review bound, so the requirement is derived from the loaded config
-        # rather than from a fixed list (`local_required_profiles`). `doctor`
-        # therefore fails on a missing `review_round_6_plus` exactly when a run
-        # with this `local.max_fix_rounds` could actually ask for it.
-        results = [self.check_config(local_required_profiles)]
-        cfg = self.config
-        results.append(self._version_check("git available", ["git", "--version"]))
-        results.append(self.check_git_repo())
-        results.append(self.check_agent_environment())
-        results.append(self.check_launch_credentials())
-        results.extend(self._local_agent_checks(cfg))
-        results.append(self.check_local_state_dir())
-        results.append(self.check_validation_commands())
-        if feature_spec_path:
-            results.append(self.check_feature_spec(feature_spec_path))
-        results.extend(self.sandbox_checks(local=True))
-        return results
-
-    def sandbox_checks(self, local: bool) -> list[CheckResult]:
+    def sandbox_checks(self) -> list[CheckResult]:
         """The outer sandbox's rows (ADR 0005 D12.4, D14.1; :mod:`autoforge.doctor_sandbox`)."""
         from .doctor_sandbox import sandbox_checks
 
-        return sandbox_checks(self, local)
-
-    def _local_agent_checks(self, cfg: AutoForgeConfig | None) -> list[CheckResult]:
-        """The agent CLIs a LOCAL run can actually reach.
-
-        Derived from `local_required_profiles`, not from every configured
-        profile: a machine only needs the binaries the *reachable* local
-        profiles name. A local configuration that routes everything through
-        OpenCode must not fail because an unrelated remote profile mentions
-        `claude`, and one that uses only `scripted` profiles must not require
-        an external CLI at all.
-        """
-        if cfg is None:
-            return []
-        try:
-            reachable = local_required_profiles(cfg)
-        except ConfigurationError:
-            return []
-        return [
-            *self._agent_checks(cfg, reachable, "this local configuration"),
-            self.check_agent_limits(cfg, reachable),
-            self.check_loop_detection(cfg),
-        ]
+        return sandbox_checks(self)
 
     def check_agent_limits(self, cfg: AutoForgeConfig, reachable: list[str]) -> CheckResult:
         """Report the limits each reachable profile's agent runs under (#193).
@@ -1328,51 +1245,6 @@ class Doctor:
         ok, detail = provider.auth_verdict(profile, res.exit_code, res.stdout or "")
         return CheckResult(name, ok, f"{profile.model}: {detail}")
 
-    def _workspace(self):
-        """A LocalWorkspace over the doctor's cwd, configured like a real run."""
-        from .local_workspace import LocalWorkspace
-
-        cfg = self.config
-        local = cfg.local if cfg else None
-        return LocalWorkspace(
-            workdir=self.cwd,
-            runner=self._runner,
-            exclude=local.exclude if local else (),
-            max_entries=local.max_workspace_entries if local else DEFAULT_MAX_ENTRIES,
-            max_bytes=local.max_workspace_bytes if local else DEFAULT_MAX_BYTES,
-        )
-
-    def check_local_state_dir(self) -> CheckResult:
-        """Where this run would keep its state — outside the reviewed tree, writable.
-
-        This replaces the generic `check_state_dir` for local mode rather than
-        joining it: the generic check would create `.autoforge/` inside the
-        working tree, and in LOCAL mode that directory is part of what gets
-        fingerprinted. A read-only diagnostic must not change what a run would
-        review.
-        """
-        from .engine import local_state_paths
-
-        cfg = self.config
-        name = "state dir outside the reviewed working tree"
-        ws = self._workspace()
-        try:
-            paths = local_state_paths(
-                ws, explicit=self.state_dir, configured=cfg.state_dir if cfg else None
-            )
-            ws.check_state_dir_location(paths.state_dir)
-        except Exception as exc:
-            return CheckResult(name, False, str(exc))
-        # The probe goes through the same capability a run would hold
-        # (``StatePaths.open_root``: descriptor-relative from the git dir,
-        # refusing a symbolic link at any component), so the doctor cannot be
-        # made to write where the run would refuse to -- a symlinked
-        # ``<git dir>/autoforge`` fails this check instead of being followed.
-        writable = self._writable(lambda: paths.open_root(create=True))
-        if writable is not None:
-            return CheckResult(name, False, f"{paths.state_dir}: {writable}")
-        return CheckResult(name, True, str(paths.state_dir))
-
     @staticmethod
     def _writable(open_root: Callable[[], SafeRoot]) -> str | None:
         """None when a probe file can be created through ``open_root()``, else why not.
@@ -1534,9 +1406,15 @@ class Doctor:
         results.append(self.check_launch_credentials())
         results.append(self.check_required_checks(gh))
         results.append(self.check_checks_read(gh))
-        results.append(self.check_state_dir())
+        # The probe creates the state directory and writes in it, so it runs
+        # only for a configuration that loaded: doctor writes nothing for one
+        # it refused, whose ``state_dir`` it has not read either.
+        if cfg is None:
+            results.append(CheckResult.skip("state dir writable", "(config check failed)"))
+        else:
+            results.append(self.check_state_dir())
         results.extend(self.scheduler_checks(gh))
-        results.extend(self.sandbox_checks(local=False))
+        results.extend(self.sandbox_checks())
         return results
 
 
@@ -1605,16 +1483,3 @@ def run_doctor(
     return Doctor(
         config_path=config_path, state_dir=state_dir, cwd=cwd, runner=runner, epic_url=epic_url
     ).run_all()
-
-
-def run_local_doctor(
-    config_path: str | None = None,
-    state_dir: str | None = None,
-    cwd: str | None = None,
-    runner: Runner | None = None,
-    feature_spec_path: str | None = None,
-) -> list[CheckResult]:
-    """`autoforge local doctor`: the LOCAL checks only (never touches GitHub)."""
-    return Doctor(config_path=config_path, state_dir=state_dir, cwd=cwd, runner=runner).run_local(
-        feature_spec_path
-    )

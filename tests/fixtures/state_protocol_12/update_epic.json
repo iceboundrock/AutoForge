@@ -1,0 +1,251 @@
+{
+  "acceptance_outcomes": [],
+  "attempt": 1,
+  "base_branch": "",
+  "base_head_sha": "",
+  "baseline_dirty_paths": [],
+  "block_reason": "",
+  "completion_context": {
+    "entry_outside_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "next_issue_url": null,
+    "phase": "UPDATE_EPIC",
+    "pr_url": "https://github.com/owner/repo/pull/42",
+    "roadmap_section": "- [x] done",
+    "section_void": false,
+    "selection_void": false,
+    "spliced_outside_sha256": "003489a5dcf084732d772616f5424d9d55a52db4ce172bad45fd7216d5ad0e3d"
+  },
+  "config_fingerprint": {
+    "config_file": "/tmp/autoforge-protocol-12-capture/test_resume_with_gate_open_mer0/autoforge.json",
+    "profiles": {
+      "analyze_execute": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "fable",
+        "provider": "claude"
+      },
+      "fix": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "fable",
+        "provider": "claude"
+      },
+      "replan_reexecute": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-terra",
+        "provider": "opencode"
+      },
+      "review_round_1": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-luna",
+        "provider": "opencode"
+      },
+      "review_round_2_5": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-terra",
+        "provider": "opencode"
+      },
+      "review_round_6_plus": {
+        "effort": "medium",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-sol",
+        "provider": "opencode"
+      },
+      "update_epic": {
+        "effort": "high",
+        "idle_timeout_seconds": 900,
+        "max_runtime_seconds": null,
+        "model": "openai/gpt-5.6-sol",
+        "provider": "opencode"
+      }
+    },
+    "recorded_at": "2026-10-31T10:31:37.897192+00:00",
+    "schema": 1,
+    "source": "created",
+    "worktree_root": "/tmp/autoforge-protocol-12-capture/test_resume_with_gate_open_mer0/.git/autoforge/worktrees"
+  },
+  "controller_version": "0.1.0a1.dev0",
+  "counted_merged_prs": [
+    "https://github.com/owner/repo/pull/42"
+  ],
+  "created_at": "2026-10-31T10:31:37.891949+00:00",
+  "current_base_ref": "main",
+  "current_branch": "autoforge/2",
+  "current_head_sha": "6192d1fc1b3e43f7da407f099c35104ee931204a",
+  "current_issue_url": "https://github.com/owner/repo/issues/2",
+  "current_merge_base_sha": "0e83301ea445d6261c7cf436146d540e6718f14a",
+  "current_pr_url": "https://github.com/owner/repo/pull/42",
+  "effect_records": [
+    {
+      "attempts": 1,
+      "completion": "progress_comment_exactly_one_body_equals_payload",
+      "identity": {
+        "epic_url": "https://github.com/owner/repo/issues/1",
+        "marker": "<!-- ai-epic-progress: {\"issue\": \"https://github.com/owner/repo/issues/2\", \"pr\": \"https://github.com/owner/repo/pull/42\"} -->"
+      },
+      "kind": "progress_comment",
+      "observed": {
+        "url": "https://github.com/owner/repo/issues/1#issuecomment-950003"
+      },
+      "owner": {
+        "issue_url": "https://github.com/owner/repo/issues/2",
+        "phase": "UPDATE_EPIC",
+        "pr_url": "https://github.com/owner/repo/pull/42",
+        "run_id": "af-20261031T103137Z-7721fb",
+        "transaction_id": ""
+      },
+      "payload": {
+        "body": "Issue done; the PR is merged.\n\n<!-- ai-epic-progress: {\"issue\": \"https://github.com/owner/repo/issues/2\", \"pr\": \"https://github.com/owner/repo/pull/42\"} -->"
+      },
+      "position": 0,
+      "precondition": {
+        "absent": true
+      },
+      "reason": "",
+      "stage": "observed",
+      "target": {
+        "epic_url": "https://github.com/owner/repo/issues/1"
+      }
+    }
+  ],
+  "entry_observation": {
+    "base_sha": null,
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "objects": {
+      "<!-- ai-epic-progress: {\"issue\": \"https://github.com/owner/repo/issues/2\", \"pr\": \"https://github.com/owner/repo/pull/42\"} -->": null
+    },
+    "phase": "UPDATE_EPIC",
+    "pr_url": "https://github.com/owner/repo/pull/42",
+    "refs": {}
+  },
+  "epic_url": "https://github.com/owner/repo/issues/1",
+  "escalation_count": 0,
+  "execution_attempt": 1,
+  "feature_spec_path": "",
+  "feature_spec_sha256": "",
+  "last_fix_resolutions": [],
+  "last_review_comment_url": "https://github.com/owner/repo/pull/42#issuecomment-950002",
+  "last_review_needs_fix": false,
+  "last_review_result": "clean",
+  "launch_label": "controller_publishes",
+  "local_fix_rounds": 0,
+  "local_pending_attempts": 0,
+  "local_pending_fingerprint": "",
+  "local_pending_phase": "",
+  "local_run_contract": {},
+  "merged_since_epic_update": 1,
+  "mode": "REMOTE",
+  "next_issue_rejections": [],
+  "open_findings": [],
+  "operator_comment_outcomes": [],
+  "phase": "UPDATE_EPIC",
+  "premerge_verified_commands": [],
+  "premerge_verified_head_sha": "",
+  "prior_findings": [],
+  "producer_validation_failure": {},
+  "prompt_version": "v14",
+  "protocol_version": "12",
+  "replan_transaction": {},
+  "repository": "owner/repo",
+  "review_certificate": {
+    "candidate": {
+      "commit": "6192d1fc1b3e43f7da407f099c35104ee931204a",
+      "kind": "remote",
+      "object_format": "sha1",
+      "provenance": {
+        "kind": "pr-head",
+        "pr_url": "https://github.com/owner/repo/pull/42"
+      },
+      "repository": "owner/repo",
+      "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    },
+    "clean": {
+      "actionable_findings": 0,
+      "needs_fix_round": false
+    },
+    "comment": {
+      "id": 950002,
+      "marker_key": {
+        "review_round": 1,
+        "reviewed_base_ref": "main",
+        "reviewed_head_sha": "6192d1fc1b3e43f7da407f099c35104ee931204a",
+        "reviewed_merge_base_sha": "0e83301ea445d6261c7cf436146d540e6718f14a"
+      },
+      "url": "https://github.com/owner/repo/pull/42#issuecomment-950002"
+    },
+    "digest": "ddbbfc0685d21944185ff5a43a72b3cdf129febb72c626a7d0004abc3c3c848d",
+    "issued_at": "2026-10-31T10:31:38.371508+00:00",
+    "kind": "remote",
+    "policy_digest": "2ce3433313d6d7e3ad1f221c8097789b5c027aba182ab86debeea78f647be382",
+    "records": [],
+    "review_round": 1,
+    "reviewed_base_ref": "main",
+    "reviewed_head_sha": "6192d1fc1b3e43f7da407f099c35104ee931204a",
+    "reviewed_merge_base_sha": "0e83301ea445d6261c7cf436146d540e6718f14a",
+    "reviewed_pr_url": "https://github.com/owner/repo/pull/42",
+    "schema": 1,
+    "validation_set_digest": "8b355b8348e6b4ff81940eb87fad98a8cf126c67aa7cd785b28f9be771e29e82"
+  },
+  "review_evidence": {
+    "candidate": {
+      "commit": "6192d1fc1b3e43f7da407f099c35104ee931204a",
+      "kind": "remote",
+      "object_format": "sha1",
+      "provenance": {
+        "kind": "pr-head",
+        "pr_url": "https://github.com/owner/repo/pull/42"
+      },
+      "repository": "owner/repo",
+      "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    },
+    "policy_digest": "2ce3433313d6d7e3ad1f221c8097789b5c027aba182ab86debeea78f647be382",
+    "records": [],
+    "review_round": 1,
+    "validation_set_digest": "8b355b8348e6b4ff81940eb87fad98a8cf126c67aa7cd785b28f9be771e29e82"
+  },
+  "review_history": [
+    {
+      "finding_count": 0,
+      "fingerprint": "e3b0c44298fc1c14",
+      "resolutions": [],
+      "resolutions_truncated": false,
+      "result": "clean",
+      "review_comment_url": "https://github.com/owner/repo/pull/42#issuecomment-950002",
+      "reviewed_head_sha": "6192d1fc1b3e43f7da407f099c35104ee931204a",
+      "round": 1,
+      "timestamp": "2026-10-31T10:31:38.371317+00:00"
+    }
+  ],
+  "review_round": 1,
+  "reviewed_base_ref": "main",
+  "reviewed_head_sha": "6192d1fc1b3e43f7da407f099c35104ee931204a",
+  "reviewed_merge_base_sha": "0e83301ea445d6261c7cf436146d540e6718f14a",
+  "reviewed_pr_url": "https://github.com/owner/repo/pull/42",
+  "reviewed_workspace_fingerprint": "",
+  "run_id": "af-20261031T103137Z-7721fb",
+  "sandbox_pin": {
+    "mode": "disabled",
+    "recorded_at": "2026-10-31T10:31:37.892317+00:00",
+    "schema": 1,
+    "source": "created"
+  },
+  "step_count": 7,
+  "superseded_prs": [],
+  "unblock_history": [],
+  "updated_at": "2026-10-31T10:31:38.481621+00:00",
+  "validation_attempt": {},
+  "validation_override_seq": null,
+  "validation_records": [],
+  "verification_failures": [],
+  "workspace_fingerprint": ""
+}

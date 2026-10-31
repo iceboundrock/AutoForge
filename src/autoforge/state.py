@@ -60,11 +60,10 @@ from .evidence import EvidenceFields, RecordView, check_evidence
 from .loop_guard import validate_review_history
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS, MAX_OPERATOR_ACTIONS_PER_FIX
-from .run_contract import LocalRunContract
 from .runlog import validate_run_id
 from .safefs import HardLinksUnavailable, ReadLimitExceeded, SafeRoot, entry_kind
 from .sandbox_pin import SandboxPin
-from .transitions import LOCAL_PHASES, LOCAL_WRITE_PHASES, Phase, WorkflowMode
+from .transitions import Phase, WorkflowMode
 from .validation import parse_comment_url, parse_issue_url, parse_pr_url
 
 STATE_FILENAME = "state.json"
@@ -90,14 +89,11 @@ MAX_STATE_FILE_BYTES = 64 * 1024 * 1024
 # what a human reads before deciding -- not work a later phase acts on, so it
 # may be clipped, unlike a finding or a resolution (rejected at the parser,
 # never clipped).  Without a bound it was the one agent-derived field with no
-# bound of its own: a LOCAL FIX that leaves every finding ``unresolved``
-# concatenates up to ``MAX_RESOLUTIONS_PER_FIX`` rationales of up to
-# ``MAX_REQUIRED_RESOLUTION_CHARS`` each (~300 000 characters), and an agent's
-# ``status: blocked`` ``message`` is bounded only by the whole CONTROL_RESULT
-# block (1 MiB); either would be carried by every later load and rewrite of
-# ``state.json`` and printed whole by ``status``.  The bound keeps a couple of
-# full rationales and their surrounding text; what it drops is still in
-# ``last_fix_resolutions`` (persisted whole) or the run log's ``stdout.log``.
+# bound of its own: an agent's ``status: blocked`` ``message`` is bounded only
+# by the whole CONTROL_RESULT block (1 MiB), and it would be carried by every
+# later load and rewrite of ``state.json`` and printed whole by ``status``.
+# The bound keeps the head and tail of the reason; what it drops is still in
+# the run log's ``stdout.log``.
 MAX_BLOCK_REASON_CHARS = 8000
 # What :func:`bound_block_reason` keeps from the *end* of an over-long reason:
 # the controller composes its reasons as ``<what happened> (<detail>). <what
@@ -111,16 +107,6 @@ BLOCK_REASON_TAIL_CHARS = 1000
 # and :func:`bound_block_reason` keeps the total at or under
 # ``MAX_BLOCK_REASON_CHARS`` whatever the input.
 _BLOCK_REASON_MARKER_RESERVE = 200
-
-
-# Names AutoForge gives the entries it writes into a state directory.  They
-# are *names*, and nothing here treats a name as evidence of authorship: a
-# LOCAL state directory lives outside the reviewed working tree (see
-# :meth:`autoforge.local_workspace.LocalWorkspace.check_state_dir_location`),
-# so the controller never has to decide whether a file it found is one of its
-# own.  The old `is_runtime_artifact` name-shape allowlist existed only to
-# carve a state directory out of the workspace fingerprint, and there is no
-# longer anything to carve.
 
 
 def utcnow_iso() -> str:
@@ -187,82 +173,6 @@ def _validate_findings_field(name: str, findings: object) -> None:
             )
 
 
-def _validate_local_pending(state: AutoForgeState) -> None:
-    """Check the LOCAL pending-invocation checkpoint is internally consistent.
-
-    ``local_pending_phase`` records that a write-capable LOCAL phase was
-    launched and its work may already be in the working tree; the fingerprint
-    beside it is the tree from *before* the first attempt, and the attempt
-    count is what bounds re-entry.  The three fields are one record, so a file
-    carrying only some of them is corruption — and corruption that matters:
-    a lost ``local_pending_phase`` makes an already-launched phase look like a
-    first invocation (so "the tree is unchanged, nothing was implemented"
-    becomes unprovable), while a lost fingerprint silently rebases that
-    question onto the tree the failed attempt left behind.  A typo in the
-    phase value would do the same, which is why it is matched against
-    :data:`~autoforge.transitions.LOCAL_WRITE_PHASES` rather than merely being
-    a string.  And the record belongs to *one* phase entry: a checkpoint for
-    FIX under a run whose phase is REVIEW would be closed by the next clean
-    review without anyone looking at the work it records, so a mismatch is
-    refused unless the run has already ended in BLOCKED or FAILED, where the
-    checkpoint is crash evidence rather than a pending resumption (R9-F4).
-    """
-    pending = state.local_pending_phase
-    allowed = ", ".join(p.value for p in LOCAL_WRITE_PHASES)
-    if not pending:
-        if state.local_pending_fingerprint or state.local_pending_attempts:
-            raise StateError(
-                "state fields 'local_pending_fingerprint' and 'local_pending_attempts' "
-                "must be empty when 'local_pending_phase' is not set (found "
-                f"{state.local_pending_fingerprint!r} / {state.local_pending_attempts}); "
-                "a pending invocation without the phase it belongs to is corruption"
-            )
-        return
-    try:
-        pending_phase = Phase(pending)
-    except ValueError:
-        raise StateError(
-            f"state file has unknown local_pending_phase {pending!r} (expected one of {allowed})"
-        ) from None
-    if pending_phase not in LOCAL_WRITE_PHASES:
-        raise StateError(
-            f"state field 'local_pending_phase' must be one of {allowed}, not {pending!r}: "
-            "only a write-capable LOCAL phase can leave work in the tree to recover"
-        )
-    if state.mode != WorkflowMode.LOCAL:
-        raise StateError(
-            f"state field 'local_pending_phase' is set ({pending!r}) on a "
-            f"{state.mode.value} run, which has no local working-tree checkpoint"
-        )
-    if not state.local_pending_fingerprint:
-        raise StateError(
-            "state field 'local_pending_fingerprint' must be set whenever "
-            f"'local_pending_phase' is ({pending!r}): without the fingerprint from before "
-            "the first attempt the controller cannot tell work that was already produced "
-            "from work that was never done"
-        )
-    if state.local_pending_attempts < 1:
-        raise StateError(
-            "state field 'local_pending_attempts' must be at least 1 whenever "
-            f"'local_pending_phase' is ({pending!r}): the checkpoint is written when an "
-            "invocation is launched, so zero attempts is corruption"
-        )
-    if state.phase != pending_phase and state.phase not in (Phase.BLOCKED, Phase.FAILED):
-        # The checkpoint belongs to the phase entry that wrote it. A run
-        # whose current phase is a different, live phase would resolve that
-        # phase and then close a checkpoint it never examined, silently
-        # discarding the unverified work the checkpoint exists to recover.
-        # A terminal phase may keep it: a run that blocked or failed on top
-        # of an unverified launch carries the evidence of that launch, and
-        # nothing runs after it that could misread the record.
-        raise StateError(
-            f"state field 'local_pending_phase' ({pending!r}) does not match the current "
-            f"phase {state.phase.value!r}: a pending write-phase checkpoint can only be "
-            "resumed by the phase that wrote it, or kept as evidence by a terminal "
-            "BLOCKED/FAILED phase"
-        )
-
-
 # Protocol labels an older controller wrote that this one can still read,
 # each subject to the boundary rules its successors introduced (see
 # :meth:`AutoForgeState.from_dict`). Protocols 1-4 changed the replan
@@ -293,9 +203,14 @@ _PRE_VALIDATION_PROTOCOL = "9"
 # ``operator_evidence: []``, and relabelled.
 _PRE_OPERATOR_PROTOCOL = "10"
 # The label before a run pinned its sandbox mode (#280). A protocol-11 file
-# is this protocol's shape without ``sandbox_pin``: it is loaded in every
+# is protocol 12's shape without ``sandbox_pin``: it is loaded in every
 # phase with none, which is "not checked", and relabelled.
-_PREVIOUS_PROTOCOL = "11"
+_PRE_PIN_PROTOCOL = "11"
+# The label before LOCAL mode's removal (#388, ADR 0009 D8). A protocol-12
+# file is this protocol's shape with the twelve fields of
+# :data:`_LOCAL_FIELDS` beside it, each at its empty value in every REMOTE
+# save: it is loaded in every phase with them dropped, and relabelled.
+_PREVIOUS_PROTOCOL = "12"
 # The fields protocol 7 added (#160): the effect records, the entry
 # observation and the completion context of the current phase entry, and the
 # launch label. A legacy file never carries one; one that does is a hand edit
@@ -331,6 +246,26 @@ _OPERATOR_FIELDS = ("operator_comment_outcomes",)
 # The field protocol 12 added (#280): the sandbox mode the run is pinned to
 # (:mod:`autoforge.sandbox_pin`), ``{}`` when none is.
 _PIN_FIELDS = ("sandbox_pin",)
+# The twelve fields LOCAL mode wrote into every state file (ADR 0009 C2),
+# each with the value every REMOTE save wrote. Protocol 13 removed them with
+# LOCAL (#388, ADR 0009 D8): a file labelled 12 or older loads with each one
+# dropped when it is absent or at that value, and is refused when one holds
+# anything else, since only LOCAL code ever wrote one. A protocol-13 file
+# never carries one, so one that does is refused as an unknown field.
+_LOCAL_FIELDS: dict[str, object] = {
+    "feature_spec_path": "",
+    "feature_spec_sha256": "",
+    "base_head_sha": "",
+    "base_branch": "",
+    "local_run_contract": {},
+    "workspace_fingerprint": "",
+    "reviewed_workspace_fingerprint": "",
+    "local_fix_rounds": 0,
+    "local_pending_phase": "",
+    "local_pending_fingerprint": "",
+    "local_pending_attempts": 0,
+    "baseline_dirty_paths": [],
+}
 # ``acceptance_outcomes`` (#211): what became of each acceptance action of
 # the current PR. Bounded: at most one action is requested per FIX result,
 # and the writer drops the oldest entries past the bound
@@ -446,6 +381,33 @@ def _legacy_review_binding_refusal(
     )
 
 
+def _drop_local_fields(kwargs: dict, protocol: str) -> None:
+    """ADR 0009 D8's step 3: drop the empty LOCAL fields of an older file, or refuse it.
+
+    ``protocol`` is the file's label, one this controller loads and older
+    than its own. A field absent or at the value every REMOTE save wrote
+    (``""``, ``0``, ``{}``, ``[]``, matched by type as well) is dropped. A
+    field holding anything else is refused: only LOCAL code ever wrote one,
+    so in a file whose mode is REMOTE it is a hand edit or a foreign file,
+    and dropping it would discard what the label cannot explain. Nothing is
+    migrated from it.
+    """
+    held = sorted(
+        name
+        for name, empty in _LOCAL_FIELDS.items()
+        if name in kwargs and not (type(kwargs[name]) is type(empty) and kwargs[name] == empty)
+    )
+    if held:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r} and carries LOCAL mode's "
+            f"{', '.join(repr(n) for n in held)} with a value; LOCAL mode is removed and "
+            "only it ever wrote one, so the file is a hand edit or a foreign file, not REMOTE "
+            "state, and it is not migrated; refusing to load"
+        )
+    for name in _LOCAL_FIELDS:
+        kwargs.pop(name, None)
+
+
 @dataclass
 class AutoForgeState:
     protocol_version: str = __protocol_version__
@@ -454,10 +416,9 @@ class AutoForgeState:
 
     run_id: str = ""
 
-    # Which workflow this run executes. Explicit controller state, never
-    # inferred: a LOCAL run has no repository/EPIC/issue/PR at all, and a
-    # state file written before local mode existed has no 'mode' key and
-    # loads as REMOTE (see from_dict).
+    # Which workflow this run executes: always REMOTE, the one there is. A
+    # state file written before LOCAL mode existed has no 'mode' key and
+    # loads as REMOTE; any other value is refused (see from_dict).
     mode: WorkflowMode = WorkflowMode.REMOTE
 
     repository: str = ""
@@ -565,58 +526,6 @@ class AutoForgeState:
     # rather than re-deriving what the safe disposition should have been.
     replan_transaction: dict = field(default_factory=dict)
 
-    # -- LOCAL mode -----------------------------------------------------
-    # Repository-relative path of the frozen feature specification.
-    feature_spec_path: str = ""
-    # SHA-256 of the specification's bytes at run creation. Re-checked before
-    # and after every agent phase: an agent that rewrites its own acceptance
-    # criteria must not be able to make the run easier.
-    feature_spec_sha256: str = ""
-    # The *git anchor* a local run is pinned to: HEAD and the checked-out
-    # branch when the run was created ("" for an unborn HEAD, "" for a
-    # detached one). A local run never requires HEAD to move and never allows
-    # it to: the controller re-reads both around every agent phase and enters
-    # BLOCKED when either changed, so an agent that commits, resets or
-    # switches branches is caught by the controller rather than only
-    # forbidden by the prompt.
-    base_head_sha: str = ""
-    base_branch: str = ""
-    # The run's durable contract (see :mod:`autoforge.run_contract`): the
-    # repository root, state root, workspace policy, validation commands,
-    # fix-round budget and prompt version the run was *defined* with. Every
-    # later invocation compares what it would define against this before it
-    # executes anything, and execution reads these values from here -- never
-    # from the configuration of the moment -- so a resume can revalidate the
-    # contract but cannot redefine it. Persisted as the contract's own dict
-    # form and parsed strictly on load; ``{}`` for REMOTE runs.
-    local_run_contract: dict = field(default_factory=dict)
-    # Workspace fingerprint the controller bound before the current review
-    # (the local analogue of ``current_head_sha``).
-    workspace_fingerprint: str = ""
-    # Fingerprint the last completed review was bound to (the local analogue
-    # of ``reviewed_head_sha``).
-    reviewed_workspace_fingerprint: str = ""
-    # Completed local FIX rounds; bounded by ``local.max_fix_rounds``.
-    local_fix_rounds: int = 0
-    # Durable checkpoint for a LOCAL agent invocation that may already have
-    # written to the working tree. Persisted *before* the agent is launched,
-    # so a crash (or a rejected result) cannot make `resume` mistake work that
-    # already exists for work that was never done. ``local_pending_phase`` is
-    # the phase value, ``local_pending_fingerprint`` the fingerprint from
-    # *before the first* attempt of that phase entry, and
-    # ``local_pending_attempts`` how many invocations that entry has launched
-    # (bounded, so a phase that can never be completed blocks instead of
-    # looping over `resume`).
-    local_pending_phase: str = ""
-    local_pending_fingerprint: str = ""
-    local_pending_attempts: int = 0
-    # Working-tree paths that were already dirty when the run was created,
-    # other than the feature specification itself. Normally empty: `local run`
-    # refuses a dirty tree unless the operator passes --allow-dirty, and then
-    # these are named in status and in the review prompt rather than silently
-    # absorbed into the feature's implementation.
-    baseline_dirty_paths: list[str] = field(default_factory=list)
-
     # The HEAD (and the exact command list) that ``merge.verification_commands``
     # last passed on, so MERGE does not repeat what READY_FOR_MERGE proved
     # for the same commit. Either differing means the commands run again.
@@ -679,12 +588,11 @@ class AutoForgeState:
     # :class:`autoforge.config_fingerprint.RecordedConfiguration`. Written
     # when the run is created; ``resume``, ``step`` and ``unblock`` refuse a
     # configuration that differs from it unless the operator accepts the
-    # change, which replaces it. ``{}`` for a LOCAL run (its run contract
-    # defines it) and for a run created before the field existed (not
-    # checked; the next command records one). Kept across issues.
+    # change, which replaces it. ``{}`` for a run created before the field
+    # existed (not checked; the next command records one). Kept across issues.
     config_fingerprint: dict = field(default_factory=dict)
-    # The sandbox mode the run is pinned to (#280), LOCAL and REMOTE alike:
-    # the mode, how and when it was pinned, in the closed form of
+    # The sandbox mode the run is pinned to (#280): the mode, how and when
+    # it was pinned, in the closed form of
     # :class:`autoforge.sandbox_pin.SandboxPin`. Written when the run is
     # created; ``resume``, ``step`` and ``unblock`` refuse a weaker mode
     # unless the operator accepts the change, and pin a stronger one. ``{}``
@@ -724,23 +632,12 @@ class AutoForgeState:
     created_at: str = ""
     updated_at: str = ""
 
-    # -- the LOCAL run contract ------------------------------------------
-    def local_contract(self) -> LocalRunContract:
-        """The persisted contract of this LOCAL run (StateError for a REMOTE one)."""
-        if self.mode != WorkflowMode.LOCAL:
-            raise StateError("a REMOTE run has no local run contract")
-        return LocalRunContract.from_dict(self.local_run_contract)
-
     # -- serialization -------------------------------------------------
     def to_dict(self) -> dict:
         d = asdict(self)
         d["phase"] = self.phase.value
         d["mode"] = self.mode.value
         return d
-
-    @property
-    def is_local(self) -> bool:
-        return self.mode == WorkflowMode.LOCAL
 
     @classmethod
     def from_dict(cls, data: dict) -> AutoForgeState:
@@ -753,7 +650,10 @@ class AutoForgeState:
         except ValueError:
             raise StateError(f"state file has unknown phase {data.get('phase')!r}") from None
         # A state file written before LOCAL mode existed carries no 'mode'
-        # key; it is a REMOTE run and must keep loading unchanged.
+        # key; it is a REMOTE run and must keep loading unchanged. Every
+        # other value but "REMOTE" is refused here, "LOCAL" included (ADR
+        # 0009 D4, D8 step 1): under every label, before anything else of
+        # the file is read, so a LOCAL file never reaches the steps below.
         raw_mode = data.get("mode", WorkflowMode.REMOTE.value)
         if isinstance(raw_mode, WorkflowMode):
             mode = raw_mode
@@ -870,6 +770,13 @@ class AutoForgeState:
         #   mode a command runs under is what the pin is compared with. An
         #   older file that carries the field, even empty, is refused, never
         #   merged.
+        # - 12 -> 13: LOCAL mode is removed (#388, ADR 0009 D8), and with it
+        #   the twelve fields it wrote into every file (:data:`_LOCAL_FIELDS`).
+        #   After every rule above, a file labelled 12 or older is loaded with
+        #   each one dropped when it is absent or at its empty value, and is
+        #   refused, unchanged, when one holds anything else
+        #   (:func:`_drop_local_fields`). A protocol-13 or unlabelled file
+        #   carrying one, even empty, is refused by the unknown-field check.
         raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
@@ -960,7 +867,7 @@ class AutoForgeState:
             )
             _refuse_operator_state(data, raw_protocol)
             _refuse_sandbox_pin(data, raw_protocol)
-        elif raw_protocol == _PREVIOUS_PROTOCOL:
+        elif raw_protocol == _PRE_PIN_PROTOCOL:
             # 11 -> 12 (#280): the same shape without the sandbox pin, which
             # it never wrote and which is refused.
             _require_fields(data, raw_protocol, _EFFECT_FIELDS + _ACCEPTANCE_FIELDS, "effect state")
@@ -986,13 +893,15 @@ class AutoForgeState:
                 "not a PR with none",
             )
             _refuse_sandbox_pin(data, raw_protocol)
-        elif raw_protocol != __protocol_version__:
+        elif raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
             raise StateError(
                 f"unsupported protocol_version {raw_protocol!r} "
                 f"(controller speaks {__protocol_version__!r})"
             )
         else:
-            # Only a legacy label loads with no effect state (D13.2). Every
+            # Protocol 12 and 13 write the same fields but LOCAL's twelve,
+            # which step 3 below handles. Only a legacy label loads with no
+            # effect state (D13.2). Every
             # protocol-7 save writes all four fields, so one that is absent
             # is a truncation or a hand edit, never "nothing planned": a
             # missing ``effect_records`` read as the empty default would let
@@ -1042,20 +951,6 @@ class AutoForgeState:
                 "sandbox pin",
                 "not a run with none pinned",
             )
-        # A LOCAL state written before the run contract existed has no
-        # persisted definition of what it reviewed under. It is not migrated:
-        # the only source a migration could fill the contract from is the
-        # *current* configuration, and "missing field -> fill from current
-        # config" is precisely the silent rebinding the contract forbids.
-        if mode == WorkflowMode.LOCAL and (
-            "local_workspace_policy" in data or "local_run_contract" not in data
-        ):
-            raise StateError(
-                "state file is a LOCAL run created by a pre-release controller that did "
-                "not persist the run contract; it is not migrated, because the contract "
-                "cannot be reconstructed from the current configuration without "
-                "redefining the run -- start a new run"
-            )
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
@@ -1064,31 +959,35 @@ class AutoForgeState:
             _PRE_CONFIG_PROTOCOL,
             _PRE_VALIDATION_PROTOCOL,
             _PRE_OPERATOR_PROTOCOL,
+            _PRE_PIN_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
-        ) and (mode == WorkflowMode.REMOTE):
+        ):
             # Before protocol 8 only: a protocol-8 file carries its own
             # acceptance state, which the migration would overwrite.
             kwargs.update(_acceptance_migration(data))
-        if (
-            raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__)
-            and mode == WorkflowMode.REMOTE
-        ):
+        if raw_protocol not in (_PRE_PIN_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
             # Before protocol 11 (#243): over the acceptance migration, so a
             # pre-8 file gains both.
             kwargs.update(_operator_migration(kwargs))
-        if legacy and mode == WorkflowMode.REMOTE:
+        if legacy:
             attempt = data.get("attempt", 0)
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1:
                 kwargs["launch_label"] = (
                     LABEL_AGENT_PUBLISHES if phase in PUBLISHING_PHASES else LABEL_NONE
                 )
+        # ADR 0009 D8's step 3, after every per-protocol rule above: LOCAL's
+        # twelve fields leave a file labelled 12 or older, or refuse it. A
+        # protocol-13 file is not asked: one that carries any of them is
+        # refused by the unknown-field check below.
+        if raw_protocol != __protocol_version__:
+            _drop_local_fields(kwargs, str(raw_protocol))
         # Unknown fields are corruption, not forward compatibility: at this
         # protocol version the controller knows every field it writes, so an
         # unexpected key is a hand edit, a truncated merge or a foreign file.
-        # Dropping it silently would let `local_fix_round` (say) sit next to a
-        # `local_fix_rounds` that quietly kept its dataclass default of 0 —
-        # substituting a default for a bound the operator meant to set.
+        # Dropping it silently would let `review_rounds` (say) sit next to a
+        # `review_round` that quietly kept its dataclass default of 0 —
+        # substituting a default for a bound the run had reached.
         known = {f for f in cls.__dataclass_fields__}
         unknown = sorted(set(kwargs) - known)
         if unknown:
@@ -1102,29 +1001,8 @@ class AutoForgeState:
             state = cls(**{k: v for k, v in kwargs.items() if k in known})
         except TypeError as exc:
             raise StateError(f"state file has invalid fields: {exc}") from exc
-        # A phase that exists is not a phase this run can be in. `Phase(...)`
-        # above only proves the value is one the controller knows; LOCAL and
-        # REMOTE are two topologies over that one enum, and the LOCAL one has
-        # no REPLAN_REEXECUTE, READY_FOR_MERGE, MERGE or UPDATE_EPIC in it
-        # (see transitions.LOCAL_PHASES). Without this a corrupt or hand-edited
-        # `mode: LOCAL, phase: READY_FOR_MERGE` loads cleanly and `resume`
-        # reads it as the remote merge hold -- printing a merge banner, and
-        # with the gate open entering the GitHub pre-merge verification for a
-        # run that has no repository, no PR and nothing to merge. A state whose
-        # phase its own mode can never execute is corruption.
-        if state.mode == WorkflowMode.LOCAL and state.phase not in LOCAL_PHASES:
-            raise StateError(
-                f"state file is a LOCAL run in phase {state.phase.value}, which belongs to "
-                "the GitHub workflow and no local run can reach; refusing to load — "
-                "a phase outside the mode's own topology is corruption, not state"
-            )
-        # Required-field sanity. A LOCAL run has no repository/EPIC at all;
-        # its identity is the frozen feature specification instead.
-        required = ["run_id", "created_at", "updated_at"]
-        if state.mode == WorkflowMode.LOCAL:
-            required += ["feature_spec_path", "feature_spec_sha256", "local_run_contract"]
-        else:
-            required += ["repository", "epic_url"]
+        # Required-field sanity.
+        required = ["run_id", "created_at", "updated_at", "repository", "epic_url"]
         for req in required:
             if not getattr(state, req, None):
                 raise StateError(f"state file missing required field {req!r}")
@@ -1139,8 +1017,8 @@ class AutoForgeState:
         # A `str` field that arrives as `null`, a list or a number is
         # corruption for the same reason whichever field it is, and a
         # hand-written enumeration only closes the fields somebody thought of:
-        # `workspace_fingerprint: null` once loaded cleanly and reached the
-        # review binding as a value no reviewer's fingerprint could equal.
+        # a fingerprint field arriving as `null` once loaded cleanly and
+        # reached the review binding as a value no reviewer's could equal.
         # Declaring the type *is* declaring the contract, so the declaration
         # is what gets checked.
         for name, annotation in _SCALAR_FIELDS.items():
@@ -1148,27 +1026,13 @@ class AutoForgeState:
             # `bool` is an `int` in Python and would sail through as 0 or 1.
             if not isinstance(value, annotation) or isinstance(value, bool):
                 raise StateError(f"state field {name!r} must be {annotation.__name__}")
-        # Range, not just type: `local_fix_rounds: -1` would sail past the
-        # `>= max_fix_rounds` budget guard and buy the run unlimited extra fix
-        # rounds, and a negative `step_count` does the same to the cumulative
-        # step budget. A counter that cannot be trusted is not a counter.
+        # Range, not just type: `review_round: -1` would sail past the
+        # review-round cap and buy the run unlimited extra rounds, and a
+        # negative `step_count` does the same to the cumulative step budget.
+        # A counter that cannot be trusted is not a counter.
         for name in _NON_NEGATIVE_FIELDS:
             if getattr(state, name) < 0:
                 raise StateError(f"state field {name!r} must be a non-negative integer")
-        _validate_local_pending(state)
-        if not isinstance(state.local_run_contract, dict):
-            raise StateError("state field 'local_run_contract' must be an object")
-        if state.mode == WorkflowMode.LOCAL:
-            try:
-                LocalRunContract.from_dict(state.local_run_contract)
-            except StateError as exc:
-                raise StateError(f"state field 'local_run_contract': {exc}") from None
-        elif state.local_run_contract:
-            raise StateError("state field 'local_run_contract' must be empty for a REMOTE run")
-        if not isinstance(state.baseline_dirty_paths, list) or not all(
-            isinstance(path, str) for path in state.baseline_dirty_paths
-        ):
-            raise StateError("state field 'baseline_dirty_paths' must be a list of strings")
         if not isinstance(state.counted_merged_prs, list) or not all(
             isinstance(url, str) for url in state.counted_merged_prs
         ):
@@ -1263,7 +1127,6 @@ class AutoForgeState:
                 producer_validation_failure=self.producer_validation_failure,
                 validation_override_seq=self.validation_override_seq,
             ),
-            local=self.mode == WorkflowMode.LOCAL,
             repository=self.repository,
             run_id=self.run_id,
         )
@@ -1300,21 +1163,13 @@ class AutoForgeState:
         phase, issue, PR, round, open findings and replan transaction it is
         bound to; D4.6) and against the others (one phase, the context saved
         with the records, D2.4's bounds). A value that fails is corruption
-        and raises :class:`StateError`; a LOCAL run carries none (D13.2).
+        and raises :class:`StateError`.
         """
         if not isinstance(self.launch_label, str) or self.launch_label not in LAUNCH_LABELS:
             raise StateError(
                 f"state field 'launch_label' must be one of {sorted(LAUNCH_LABELS)}, got "
                 f"{self.launch_label!r:.60}"
             )
-        if self.mode == WorkflowMode.LOCAL:
-            present = [name for name in _EFFECT_FIELDS if getattr(self, name) not in ([], {}, "")]
-            if present:
-                raise StateError(
-                    f"state field(s) {', '.join(repr(n) for n in present)} are set on a LOCAL "
-                    "run, which performs no external effects; refusing to load"
-                )
-            return PhaseEffects()
         return load_phase_effects(
             self.effect_records,
             self.entry_observation,
@@ -1701,20 +1556,14 @@ def _acceptance_migration(data: dict) -> dict:
 def _validate_config_fingerprint(state: AutoForgeState) -> None:
     """``config_fingerprint`` (#219): ``{}`` or a whole recorded configuration.
 
-    A LOCAL run is defined by its run contract and records none. A REMOTE
-    record that does not parse is corruption, never "not recorded": read as
-    none, it would switch the check off.
+    A record that does not parse is corruption, never "not recorded": read
+    as none, it would switch the check off.
     """
     recorded = state.config_fingerprint
     if not isinstance(recorded, dict):
         raise StateError("state field 'config_fingerprint' must be an object")
     if not recorded:
         return
-    if state.mode == WorkflowMode.LOCAL:
-        raise StateError(
-            "state field 'config_fingerprint' is set on a LOCAL run, which its run contract "
-            "defines; refusing to load"
-        )
     try:
         RecordedConfiguration.from_dict(recorded)
     except StateError as exc:
@@ -1722,7 +1571,7 @@ def _validate_config_fingerprint(state: AutoForgeState) -> None:
 
 
 def _validate_sandbox_pin(state: AutoForgeState) -> None:
-    """``sandbox_pin`` (#280): ``{}`` or a whole pin, for a LOCAL and a REMOTE run alike.
+    """``sandbox_pin`` (#280): ``{}`` or a whole pin.
 
     A pin that does not parse is corruption, never "not pinned": read as
     none, it would switch the check off.
@@ -1741,31 +1590,13 @@ def _validate_sandbox_pin(state: AutoForgeState) -> None:
 def _validate_acceptance_state(state: AutoForgeState) -> None:
     """``acceptance_outcomes`` and ``acceptance_comment_url`` (#211), strictly.
 
-    A LOCAL run publishes nothing, so it carries neither, nor an unblock
-    ``action``. A REMOTE ``last_fix_resolutions`` entry carries the URL of
+    A ``last_fix_resolutions`` entry carries the URL of
     the comment the controller verified for an ``acceptance_action``
     resolution, and "" for any other.
     """
     outcomes = state.acceptance_outcomes
     if not isinstance(outcomes, list) or not all(isinstance(o, dict) for o in outcomes):
         raise StateError("state field 'acceptance_outcomes' must be a list of objects")
-    if state.mode == WorkflowMode.LOCAL:
-        if outcomes:
-            raise StateError(
-                "state field 'acceptance_outcomes' is set on a LOCAL run, which publishes "
-                "nothing; refusing to load"
-            )
-        if any("acceptance_comment_url" in r for r in state.last_fix_resolutions):
-            raise StateError(
-                "state field 'last_fix_resolutions' carries 'acceptance_comment_url' on a "
-                "LOCAL run, which publishes nothing; refusing to load"
-            )
-        if any(isinstance(e, dict) and "action" in e for e in state.unblock_history):
-            raise StateError(
-                "state field 'unblock_history' carries an acceptance 'action' on a LOCAL run, "
-                "which has no acceptance actions; refusing to load"
-            )
-        return
     if len(outcomes) > MAX_ACCEPTANCE_OUTCOMES:
         raise StateError(
             f"state field 'acceptance_outcomes' holds {len(outcomes)} entries, over "
@@ -1893,8 +1724,7 @@ def _validate_operator_evidence(state: AutoForgeState, value: object, what: str)
 def _validate_operator_state(state: AutoForgeState) -> None:
     """``operator_comment_outcomes`` and ``operator_evidence`` (#243), strictly.
 
-    A LOCAL run has no GitHub and no operator actions, so it carries
-    neither. A REMOTE ``last_fix_resolutions`` entry carries the operator
+    A ``last_fix_resolutions`` entry carries the operator
     comments verified for its finding, ``[]`` when none. A ``verified``
     outcome is unique per (action id, comment), and the round's declines,
     K9's and K10's together, stay within :data:`MAX_DECLINES_PER_ROUND`.
@@ -1902,18 +1732,6 @@ def _validate_operator_state(state: AutoForgeState) -> None:
     outcomes = state.operator_comment_outcomes
     if not isinstance(outcomes, list) or not all(isinstance(o, dict) for o in outcomes):
         raise StateError("state field 'operator_comment_outcomes' must be a list of objects")
-    if state.mode == WorkflowMode.LOCAL:
-        if outcomes:
-            raise StateError(
-                "state field 'operator_comment_outcomes' is set on a LOCAL run, which has no "
-                "operator actions; refusing to load"
-            )
-        if any("operator_evidence" in r for r in state.last_fix_resolutions):
-            raise StateError(
-                "state field 'last_fix_resolutions' carries 'operator_evidence' on a LOCAL run, "
-                "which has no operator actions; refusing to load"
-            )
-        return
     if len(outcomes) > MAX_OPERATOR_COMMENT_OUTCOMES:
         raise StateError(
             f"state field 'operator_comment_outcomes' holds {len(outcomes)} entries, over "
@@ -2042,8 +1860,6 @@ _SCALAR_FIELDS: dict[str, type] = {
 # The counters that bound the run. A negative one does not merely look wrong:
 # it disables the bound it is compared against.
 _NON_NEGATIVE_FIELDS = (
-    "local_fix_rounds",
-    "local_pending_attempts",
     "step_count",
     "review_round",
     "attempt",
@@ -2064,10 +1880,10 @@ class StatePaths:
     create and therefore resolves by pathname; ``relative`` is the path from
     it to the state directory, and every component of it is opened
     descriptor-relative with ``O_NOFOLLOW`` (see :mod:`autoforge.safefs`).
-    That split is the whole of the trust statement: for a LOCAL run the
-    anchor is the repository's git directory and the components below it are
-    AutoForge's own, so replacing one of them with a symbolic link cannot
-    move a controller write.
+    That split is the whole of the trust statement: when the anchor is a
+    directory AutoForge did not create and the components below it are
+    AutoForge's own, replacing one of them with a symbolic link cannot move a
+    controller write.
 
     The controller lock is *not* here: it is keyed by the repository
     identity, not by the caller-selectable state directory (see
@@ -2104,10 +1920,6 @@ class StatePaths:
             anchor=anchor_path,
             relative=tuple(relative),
         )
-
-    def canonical_state_dir(self) -> str:
-        """The state directory's canonical absolute pathname (contract form)."""
-        return os.path.realpath(os.path.abspath(self.state_dir))
 
     def open_root(self, *, create: bool = True) -> SafeRoot:
         """Open the state directory as a capability (the caller closes it).

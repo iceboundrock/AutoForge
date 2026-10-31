@@ -5,9 +5,9 @@ End to end and offline: real git repositories and a local bare origin under
 agents (the Pi fake for parity). What is covered:
 
 - issuance in the write that applies a clean round, ``REVIEW ->
-  READY_FOR_MERGE`` and LOCAL ``REVIEW -> DONE``, from the round's binding,
-  the review binding and the comment the controller posted (D12.2), and the
-  crash windows around it, #162's journal included;
+  READY_FOR_MERGE``, from the round's binding, the review binding and the
+  comment the controller posted (D12.2), and the crash windows around it,
+  #162's journal included;
 - configuration drift at issuance (D12.6) and inconsistent inputs, which
   enter ``BLOCKED`` instead;
 - the OPEN-PR unblock, which needs an applicable certificate to decide
@@ -31,14 +31,18 @@ from autoforge import cli
 from autoforge import engine as engine_module
 from autoforge.certificate import (
     NOT_A_PERMISSION,
-    CertificateIssuanceError,
-    Configured,
     Revision,
-    local_certificate,
 )
 from autoforge.config import default_config
 from autoforge.errors import StateError
-from autoforge.evidence import Definition, observed_record, parse_candidate, set_digest
+from autoforge.evidence import (
+    Definition,
+    certificate_digest,
+    observed_record,
+    parse_candidate,
+    record_digest,
+    set_digest,
+)
 from autoforge.executor import ExecutionResult
 from autoforge.sandbox_policy import LaunchClass
 from autoforge.state import load_state
@@ -46,6 +50,7 @@ from autoforge.transitions import Phase
 
 from .conftest import (
     BRANCH,
+    LOCAL_STATE_FIELDS,
     PR,
     FakeGitHub,
     analyze_payload,
@@ -60,11 +65,6 @@ from .conftest import (
     review_result,
     scripted,
 )
-from .local_helpers import finding as local_finding
-from .local_helpers import fix_result as local_fix_result
-from .local_helpers import impl_result, local_repo, touch_impl
-from .local_helpers import review_result as local_review_result
-from .local_helpers import scripted as local_scripted
 from .test_validation_gates import _route, failing_finding
 
 PY = sys.executable
@@ -407,6 +407,98 @@ def test_an_edited_certificate_is_refused_at_load_never_reissued(tmp_state_dir):
         load_state(eng.paths.state_file)
 
 
+# -- the removed LOCAL kinds in a REMOTE state file (ADR 0009 D6, D8) ------------------
+
+
+def _workspace_variant(raw: dict, seq: int, run_id: str) -> dict:
+    """``raw``, a REMOTE record, as LOCAL wrote one: a ``local`` candidate and the
+    fingerprints of the walks before and after the run, digested again."""
+    fingerprint = "c" * 64
+    rec = json.loads(json.dumps(raw))
+    rec["seq"] = seq
+    rec["candidate"] = {
+        "kind": "local",
+        "fingerprint": fingerprint,
+        "workspace_policy_digest": "d" * 64,
+        "run_id": run_id,
+    }
+    rec["start_fingerprint"] = rec["end_fingerprint"] = fingerprint
+    rec["digest"] = record_digest(rec)
+    return rec
+
+
+def _local_certificate(rec: dict) -> dict:
+    """The certificate the removed ``local_certificate`` issued for ``rec``'s workspace."""
+    cert = {
+        "schema": 1,
+        "kind": "local",
+        "candidate": rec["candidate"],
+        "review_round": 1,
+        "records": [{"seq": rec["seq"], "digest": rec["digest"]}],
+        "validation_set_digest": set_digest([rec["definition"]["definition_digest"]]),
+        "policy_digest": rec["policy"]["policy_digest"],
+        "clean": {"needs_fix_round": False, "actionable_findings": 0},
+        "issued_at": rec["finished_at"],
+        "reviewed_workspace_fingerprint": rec["candidate"]["fingerprint"],
+    }
+    cert["digest"] = certificate_digest(cert)
+    return cert
+
+
+def _with_record(data: dict) -> dict:
+    records = data["validation_records"]
+    rec = _workspace_variant(records[-1], records[-1]["seq"] + 1, data["run_id"])
+    return {**data, "validation_records": [*records, rec]}
+
+
+def _with_certificate(data: dict) -> dict:
+    """A ``local`` certificate naming the state's own last (REMOTE) record: the
+    records load, so the certificate's kind is what refuses."""
+    records = data["validation_records"]
+    workspace = _workspace_variant(records[-1], records[-1]["seq"], data["run_id"])
+    cert = _local_certificate(workspace)
+    cert["records"] = [{"seq": records[-1]["seq"], "digest": records[-1]["digest"]}]
+    cert["digest"] = certificate_digest(cert)
+    return {**data, "review_certificate": cert}
+
+
+def _relabelled(data: dict, label: str) -> dict:
+    """``data`` under ``label``: a protocol-12 file carries LOCAL's twelve fields empty."""
+    if label == "12":
+        return {**data, **LOCAL_STATE_FIELDS, "protocol_version": "12"}
+    return {**data, "protocol_version": label}
+
+
+@pytest.mark.parametrize("label", ["13", "12"])
+@pytest.mark.parametrize(
+    ("plant", "needle"),
+    [(_with_record, "end_fingerprint"), (_with_certificate, "review_certificate'.kind")],
+    ids=["workspace-record", "local-certificate"],
+)
+def test_a_remote_state_carrying_a_local_record_or_certificate_is_refused_unchanged(
+    tmp_state_dir, label, plant, needle
+):
+    """A workspace-variant record, or a ``local`` certificate beside its record, in
+    the state a certified REMOTE run saved: refused at load, under the current
+    label and under 12, whose file loads without them. Nothing is written: no
+    relabel, no ``.corrupt-*`` file."""
+    gh = FakeGitHub()
+    eng, _ = certified(tmp_state_dir, gh, PASSES)
+    eng.close()
+    path = eng.paths.state_file
+    data = _relabelled(json.loads(path.read_text()), label)
+    path.write_text(json.dumps(data))
+    assert load_state(path).review_certificate == data["review_certificate"]
+    path.write_text(json.dumps(plant(data)))
+    before = path.read_bytes()
+    listing = sorted(p.name for p in path.parent.iterdir())
+    with pytest.raises(StateError, match=re.escape(needle)):
+        load_state(path)
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in path.parent.iterdir()) == listing
+    assert not any(".corrupt-" in name for name in listing)
+
+
 def test_a_restart_in_ready_for_merge_holds_an_applicable_certificate(tmp_state_dir):
     gh = FakeGitHub()
     eng, _ = certified(tmp_state_dir, gh, PASSES)
@@ -562,133 +654,6 @@ def test_no_prompt_and_no_published_payload_carries_the_certificate(tmp_state_di
         assert "review_certificate" not in text
         assert cert["digest"] not in text
         assert cert["issued_at"] not in text
-
-
-# -- LOCAL (D12.5) ---------------------------------------------------------------------
-
-
-def local_run(tmp_path, steps, *commands):
-    from .conftest import make_local_engine
-
-    root = local_repo(tmp_path / "repo")
-    cfg = default_config()
-    cfg.local.validation_commands = [list(c) for c in commands]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = local_scripted(eng, root, steps)
-    return eng, root
-
-
-def implemented(text: str = "v1\n"):
-    return (lambda r: touch_impl(r, text), lambda e: impl_result())
-
-
-def reviewed(findings=None, round_: int = 1):
-    return (None, lambda e: local_review_result(e.state.workspace_fingerprint, round_, findings))
-
-
-@pytest.mark.parametrize("commands", [[PASSES], []], ids=["set", "empty set"])
-def test_local_done_carries_a_certificate_of_the_reviewed_workspace(tmp_path, commands):
-    """Behind the exploding GitHub: issuance makes no GitHub call."""
-    eng, root = local_run(tmp_path, [implemented(), reviewed()], *commands)
-    assert [o.next_phase for o in eng.run(max_steps=5)] == ["ANALYZE_EXECUTE", "REVIEW", "DONE"]
-    s = saved(eng)
-    cert, bound = s.review_certificate, s.review_evidence
-    assert cert["kind"] == "local"
-    assert cert["reviewed_workspace_fingerprint"] == s.reviewed_workspace_fingerprint
-    assert cert["candidate"]["fingerprint"] == s.workspace_fingerprint
-    assert cert["candidate"] == bound["candidate"]
-    assert cert["records"] == bound["records"] and len(cert["records"]) == len(commands)
-    assert cert["validation_set_digest"] == bound["validation_set_digest"]
-    assert cert["policy_digest"] == bound["policy_digest"]
-    assert cert["review_round"] == 1
-    assert "comment" not in cert
-    assert eng.review_certificate_problem() == ""
-    text = "\n".join(
-        cli._render_validation_evidence(s, eng.config, cli._review_certificate_check(eng, s))
-    )
-    assert "Review certificate: local, workspace" in text and "Applicable: yes" in text
-
-
-def test_local_a_fix_round_certifies_the_new_workspace_only(tmp_path):
-    steps = [
-        implemented(),
-        reviewed([local_finding()]),
-        (lambda r: touch_impl(r, "v2\n"), lambda e: local_fix_result(["R1-F1"])),
-        reviewed(round_=2),
-    ]
-    eng, root = local_run(tmp_path, steps, PASSES)
-    eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    assert eng.step().next_phase == "FIX"
-    s = saved(eng)
-    first, old_fingerprint = s.review_evidence, s.workspace_fingerprint
-    assert s.review_certificate == {}, "a round with findings is not certified"
-    assert eng.step().next_phase == "REVIEW"
-    assert eng.step().next_phase == "DONE"
-    s = saved(eng)
-    cert = s.review_certificate
-    assert cert["review_round"] == 2
-    assert cert["reviewed_workspace_fingerprint"] == s.workspace_fingerprint != old_fingerprint
-    assert cert["records"] == s.review_evidence["records"] != first["records"]
-    # The round-1 binding names F0: it issues nothing for the review of F1.
-    with pytest.raises(CertificateIssuanceError, match="not the reviewed workspace"):
-        local_certificate(
-            dict(first, review_round=2),
-            s.validation_evidence(),
-            run_id=s.run_id,
-            review_round=2,
-            needs_fix_round=False,
-            actionable_findings=0,
-            reviewed_workspace_fingerprint=s.workspace_fingerprint,
-            issued_at=cert["issued_at"],
-        )
-
-
-def test_local_done_is_never_entered_without_an_applicable_certificate(tmp_path, monkeypatch):
-    """A LOCAL difference at issuance is an invariant violation (the contract
-    holds the configuration for the run), and blocks all the same."""
-    eng, root = local_run(tmp_path, [implemented(), reviewed()], PASSES)
-    eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    real = eng._configured_validation
-
-    def drifted() -> Configured:
-        configured = real()
-        return Configured(configured.definitions[:0], configured.policy)
-
-    monkeypatch.setattr(eng, "_configured_validation", drifted)
-    assert eng.step().next_phase == "BLOCKED"
-    s = saved(eng)
-    assert s.phase == Phase.BLOCKED
-    assert "the validation set changed" in s.block_reason
-    assert "DONE was not entered" in s.block_reason and "start a new local run" in s.block_reason
-
-
-def test_local_a_crash_before_the_done_write_leaves_no_certificate(tmp_path, monkeypatch):
-    """LOCAL has no journal: the existing REVIEW recovery relaunches the
-    reviewer, and the DONE write issues the certificate."""
-    steps = [implemented(), reviewed(), reviewed()]
-    eng, root = local_run(tmp_path, steps, PASSES)
-    eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    real = engine_module.save_state
-
-    def failing(state, *args, **kwargs):
-        if state.phase == Phase.DONE:
-            raise OSError("disk full")
-        return real(state, *args, **kwargs)
-
-    monkeypatch.setattr(engine_module, "save_state", failing)
-    with pytest.raises(OSError, match="disk full"):
-        eng.step()
-    monkeypatch.setattr(engine_module, "save_state", real)
-    s = saved(eng)
-    assert s.phase == Phase.REVIEW and s.review_certificate == {}
-    eng.load()
-    assert eng.step().next_phase == "DONE"
-    s = saved(eng)
-    assert s.review_certificate["review_round"] == 1
-    assert eng.review_certificate_problem() == ""
 
 
 # -- provider parity (D17.2) -----------------------------------------------------------

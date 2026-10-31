@@ -71,13 +71,13 @@ execution:
     novelty_window_seconds: 1800
     max_line_repeats: 200
   # Wall-clock limit of each `merge.verification_commands` and
-  # `local.validation_commands` entry the controller runs itself.
+  # `validation.commands` entry the controller runs itself.
   command_timeout_seconds: 1800
   # A malformed CONTROL_RESULT with exit code 0 triggers at most this many
   # correction prompts before the step fails (0 disables correction).
   max_correction_attempts: 1
   # The environment agents, `merge.verification_commands` and
-  # `local.validation_commands` start from: only these variables of the
+  # `validation.commands` start from: only these variables of the
   # operator's environment are inherited (a trailing `*` is a prefix), and
   # each provider adapter adds the names its own CLI reads (claude:
   # ANTHROPIC_*, CLAUDE_*; opencode: OPENCODE_*, OPENAI_*, ANTHROPIC_*,
@@ -454,7 +454,7 @@ scheduler:
   # and stops at its settlement boundary (READY_FOR_MERGE, BLOCKED, FAILED).
   # Workers never merge and never update the EPIC, whatever
   # `safety.allow_merge` says. Every value is bounded; there is no unbounded
-  # mode. Ignored by `run`, `step`, `resume` and `local`.
+  # mode. Ignored by `run`, `step` and `resume`.
   max_parallel: 2           # live workers at once, 1-4
   poll_interval_seconds: 60 # least time between two EPIC snapshots, 15-3600
   stop_grace_seconds: 30    # a stop or first Ctrl-C waits this long, 10-600
@@ -463,22 +463,20 @@ sandbox:
   # The outer sandbox (ADR 0005, #168, #169): an OS-enforced filesystem,
   # process and IPC boundary around what AutoForge launches, on top of the
   # logical isolation of `execution.env_allowlist` (docs/configuration.md,
-  # "Outer sandbox"; docs/usage.md, "Outer sandbox"). `autoforge doctor` /
-  # `autoforge local doctor` show whether this host can enforce it.
+  # "Outer sandbox"; docs/usage.md, "Outer sandbox"). `autoforge doctor`
+  # shows whether this host can enforce it.
   #   disabled  -- (the default) logical isolation only: launches run as your
   #                UID without the outer sandbox; doctor reports it as a risk.
   #   required  -- every agent launch (Pi's auth preflight included), every
-  #                `local.validation_commands` and `validation.commands` entry
-  #                and every `merge.verification_commands` entry runs inside
+  #                `validation.commands` entry and every
+  #                `merge.verification_commands` entry runs inside
   #                the sandbox, never without it. Linux only: `bwrap` on PATH,
   #                unprivileged user, PID and IPC namespaces, overlay mounts,
   #                Landlock ABI 6. A host that cannot enforce is refused at the
   #                start of the step, before anything is saved, charged or
   #                launched (exit 2, naming what the host lacks).
-  #   preferred -- `required` where the host can enforce. Where it cannot, a
-  #                LOCAL launch runs with logical isolation only and says so
-  #                (stderr at the launch, `enforced: false` in its record); a
-  #                REMOTE run refuses exactly as under `required`.
+  #   preferred -- an alias of `required`: enforced where the host can
+  #                enforce, refused where it cannot, never a fallback.
   # Launches see the system runtime, a private home and /tmp, their workspace
   # and what their provider declares; a toolchain under your home or in /opt
   # is not visible unless listed in `read_only_paths`. A Claude subscription
@@ -494,8 +492,8 @@ sandbox:
   # of a command without --config included) is refused unless repeated with
   # --accept-config-change.
   mode: disabled
-  # `isolated`: validation commands (LOCAL and REMOTE) / pre-merge verification commands
-  # run in a network namespace of their own (no host loopback service, no
+  # `isolated`: `validation.commands` / `merge.verification_commands` run in
+  # a network namespace of their own (no host loopback service, no
   # download). Agents always share the host network. Read only when the
   # sandbox is enabled.
   validation_network: host    # host | isolated
@@ -506,97 +504,3 @@ sandbox:
   # the gh and git configuration, keyrings, /run, /proc, /dev, /sys. A token
   # in a listed file (~/.npmrc) is readable by every tool in the sandbox.
   read_only_paths: []         # e.g. ["/opt/toolchain", "/home/me/.npmrc"]
-
-# ---------------------------------------------------------------------------
-# LOCAL mode (`autoforge local init|run|doctor`).
-#
-# A separate, GitHub-free workflow over a feature Markdown file and the local
-# working tree:
-#
-#   features/<slug>.md -> ANALYZE_EXECUTE -> REVIEW -> FIX -> REVIEW -> DONE
-#
-# A local run makes zero `gh` invocations, needs no GitHub authentication,
-# creates no PR, pushes nothing and commits nothing: the implementation stays
-# in the working tree. It uses the analyze_execute / fix / review_round_1 /
-# review_round_2_5 profiles above; there is no replan and no EPIC update.
-#
-# What binds a local review is a *workspace fingerprint*: the controller walks
-# the working tree itself and hashes every entry it finds -- tracked, ignored,
-# untracked, symbolic links, file modes and empty directories alike -- rather
-# than asking `git status` which files are interesting. Git decides what is
-# committed; it does not decide what a reviewer read. Run state lives outside
-# that tree, under `<git dir>/autoforge/`, so the controller's own files are
-# not part of what it reviews.
-local:
-  # Where `autoforge local init <slug>` writes features/<slug>.md. This is
-  # project content you may commit -- never runtime state.
-  # `local init` refuses to overwrite an existing file without --force.
-  feature_dir: features
-
-  # Review/fix bound. The default is: REVIEW -> at most one FIX -> REVIEW,
-  # then DONE if clean, BLOCKED if findings remain (two review passes, one fix
-  # pass). 0 means a single review pass, where any finding blocks. This is
-  # deliberately not the 20-round remote loop.
-  #
-  # Local review rounds are routed to profiles exactly like remote ones, so a
-  # bound of 5 or more also makes `review_round_6_plus` reachable and therefore
-  # required (checked by `local doctor` and at the start of `local run`).
-  max_fix_rounds: 1
-
-  # Controller-owned validation, run by AutoForge (not by an agent) after
-  # ANALYZE_EXECUTE and after FIX. Each entry is an argv ARRAY, never a shell
-  # string: no shell is involved, so quoting, globs, pipes and `&&` do not
-  # work by design. A non-zero exit or a timeout (`execution.command_timeout_seconds`)
-  # means the phase is not
-  # verified and the run stops with the phase unchanged for `resume`.
-  # `--dry-run` lists them and runs none of them. Nothing is auto-detected;
-  # if this list is empty, the controller runs no checks of its own. Each
-  # command that runs leaves a ValidationRecord in the state file (#172), and
-  # the same bounds as `validation.commands` apply.
-  validation_commands: []
-    # - ["uv", "run", "pytest", "-q"]
-    # - ["./gradlew", "test"]
-    # - ["npm", "--prefix", "frontend", "run", "build"]
-
-  # The only way to leave part of the working tree out of the fingerprint.
-  #
-  # Everything else is hashed, ignored files included, because a .gitignore
-  # edit must not be able to decide which bytes a review covers. The cost of
-  # that completeness is paid here, explicitly: build output, virtual
-  # environments and caches are rewritten by the very validation commands
-  # above, so they have to be *declared* unreviewed rather than silently
-  # tolerated.
-  #
-  # Patterns match component-wise against repository-relative paths: `*` and
-  # `?` match within one component, `**` spans any number. The list is hashed
-  # into the fingerprint and named to the review agent in its prompt, so "what
-  # was not reviewed" is part of the review's identity.
-  #
-  # This whole block -- `exclude` plus the two bounds below -- is *frozen with
-  # the run*, together with `validation_commands`, `max_fix_rounds`, the
-  # prompt version and the repository and state-directory paths: they are
-  # the run's contract, recorded in its state at `local run`. A fingerprint
-  # means "the tree as these rules classify it", so comparing fingerprints
-  # cannot detect a rule change: a re-snapshot computes both sides under the
-  # new rules and they agree, about a tree whose newly excluded region no
-  # reviewer saw. Resuming with any contract field changed (or the checkout
-  # moved) is refused, naming each field that moved, e.g.
-  # `local.exclude: run: [] current: ["src"]`. Restore it to resume, or
-  # start a new run under the new definition.
-  #
-  # A symbolic link *into* an excluded region is refused rather than followed:
-  # its bytes are not bound, so the reviewer could read something the
-  # fingerprint would not notice changing.
-  exclude: []
-    # - node_modules
-    # - .venv
-    # - "**/__pycache__"
-    # - target
-
-  # Fail-closed bounds on the walk, not sampling thresholds. A tree bigger
-  # than these is refused with the largest subtrees named -- the run never
-  # falls back to hashing less, because a fingerprint built from metadata
-  # would accept an equal-sized replacement with a restored mtime. Raise them,
-  # or exclude what is large, and re-run.
-  max_workspace_entries: 50000
-  max_workspace_bytes: 536870912   # 512 MiB

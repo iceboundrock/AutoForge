@@ -886,9 +886,9 @@ def test_a_logs_symlink_never_redirects_controller_writes(tmp_path):
     """A `logs` symlink put every artifact of the run outside the checkout.
 
     `RunLogger` created the run directory with `mkdir(parents=True)` and then
-    wrote through whatever that resolved to. A LOCAL run promises to touch
-    nothing outside the working tree, so the link has to fail the write
-    rather than silently relocate it.
+    wrote through whatever that resolved to. The controller writes only
+    where its state directory is, so the link has to fail the write rather
+    than silently relocate it.
     """
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -1351,7 +1351,7 @@ def test_a_progress_log_replaced_while_the_agent_ran_receives_nothing(tmp_path):
     assert progress.read_text(encoding="utf-8") == "operator data\n"
 
 
-# -- ADR 0009 A.2.4 (#386): the journal cases of the LOCAL recovery matrix -----
+# -- ADR 0009 A.2.4 (#386): the journal cases of the former LOCAL recovery matrix
 def test_a_foreign_file_renamed_over_the_journal_during_a_remote_launch_receives_nothing(
     tmp_state_dir, tmp_path_factory
 ):

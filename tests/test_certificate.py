@@ -27,29 +27,33 @@ from autoforge.certificate import (
     certificate_problem,
     configuration_drift,
     describe,
-    local_certificate,
     remote_certificate,
 )
-from autoforge.evidence import LocalCandidate, PrHeadProvenance, RemoteCandidate, set_digest
-from autoforge.run_contract import LocalRunContract
+from autoforge.evidence import (
+    Definition,
+    PrHeadProvenance,
+    RemoteCandidate,
+    set_digest,
+)
 from autoforge.sandbox import SandboxFacts
 from autoforge.state import AutoForgeState
-from autoforge.transitions import Phase, WorkflowMode
+from autoforge.transitions import Phase
 
-from .conftest import sample_contract
 from .test_evidence import (
     COMMIT,
     DEF0,
     DEF1,
-    FINGERPRINT,
     FINISHED,
     PR,
     REPO,
     RUN,
     TREE,
+    local_candidate,
+    local_certificate,
     policy,
     record,
     result,
+    workspace_record,
 )
 
 MERGE_BASE = "f" * 40
@@ -101,7 +105,6 @@ def issue(records, bound=None, **over) -> dict:
     """The REMOTE certificate of ``remote_state(records)``'s round, from ``bound``."""
     kw = dict(
         repository=REPO,
-        run_id=RUN,
         review_round=2,
         needs_fix_round=False,
         actionable_findings=0,
@@ -276,7 +279,6 @@ def test_issuance_is_refused_when_a_named_record_is_missing():
             binding(records),
             views(records[:1]),
             repository=REPO,
-            run_id=RUN,
             review_round=2,
             needs_fix_round=False,
             actionable_findings=0,
@@ -304,9 +306,10 @@ def test_issuance_is_refused_for_a_record_of_another_candidate_or_policy():
         issue([timeout], binding([timeout]))
 
 
-def test_issuance_is_refused_for_a_binding_of_the_other_kind():
-    local_binding = binding([], cand=LocalCandidate(FINGERPRINT, "d" * 64, RUN))
-    with pytest.raises(CertificateIssuanceError, match="LOCAL candidate"):
+def test_issuance_is_refused_for_a_binding_of_a_local_candidate():
+    """ADR 0009 D6: a ``local`` candidate is an unknown kind, never certified."""
+    local_binding = {**binding([]), "candidate": local_candidate()}
+    with pytest.raises(CertificateIssuanceError, match="must be 'remote', got 'local'"):
         issue([], local_binding)
 
 
@@ -336,12 +339,15 @@ def test_the_digest_must_verify(held):
     assert "digest does not verify" in certificate_problem(edited, state, configured(DEF0, DEF1))
 
 
-def test_the_kind_must_be_the_run_mode(held):
+def test_the_kind_must_be_remote(held):
+    """ADR 0009 D6: a ``local`` certificate, or a REMOTE one relabelled
+    ``local`` and sealed again, never applies, before anything else of it is read."""
     _, cert, state = held
-    state.mode = WorkflowMode.LOCAL
-    assert "'remote' certificate in a local run" in certificate_problem(
-        cert, state, configured(DEF0, DEF1)
+    expected = "it is a 'local' certificate in a remote run"
+    assert certificate_problem(resealed(cert, kind="local"), state, configured(DEF0, DEF1)) == (
+        expected
     )
+    assert certificate_problem({**cert, "kind": "local"}, state, configured(DEF0)) == expected
 
 
 def test_every_named_record_must_exist(held):
@@ -531,107 +537,51 @@ def test_applicability_performs_no_io(held, monkeypatch):
     assert certificate_problem(cert, state, configured(DEF0)) != ""
 
 
-# -- LOCAL (D12.5) ---------------------------------------------------------------------
-
-LOCAL_CONTRACT = sample_contract(validation_commands=(("make", "test"),))
-WORKSPACE_POLICY = LocalRunContract.from_dict(LOCAL_CONTRACT).workspace_policy.digest()
+# -- the removed LOCAL kind (ADR 0009 D6, D8) -------------------------------------------
 
 
-def local_candidate(fingerprint: str = FINGERPRINT) -> LocalCandidate:
-    return LocalCandidate(fingerprint, WORKSPACE_POLICY, RUN)
-
-
-def local_state(records, **over) -> AutoForgeState:
-    fields = dict(
-        run_id=RUN,
-        mode=WorkflowMode.LOCAL,
-        phase=Phase.DONE,
-        local_run_contract=LOCAL_CONTRACT,
-        review_round=1,
-        last_review_result="clean",
-        workspace_fingerprint=FINGERPRINT,
-        reviewed_workspace_fingerprint=FINGERPRINT,
-        validation_records=list(records),
-    )
-    fields.update(over)
-    return AutoForgeState(**fields)
-
-
-def issue_local(records, bound=None, fingerprint: str = FINGERPRINT) -> dict:
-    return local_certificate(
-        binding(records, review_round=1, cand=local_candidate()) if bound is None else bound,
-        views(records),
-        run_id=RUN,
-        review_round=1,
-        needs_fix_round=False,
-        actionable_findings=0,
-        reviewed_workspace_fingerprint=fingerprint,
-        issued_at=ISSUED,
-    )
-
-
-def test_a_local_certificate_names_the_reviewed_workspace():
-    records = [record(1, candidate=local_candidate())]
-    cert = issue_local(records)
-    assert cert["kind"] == "local"
-    assert cert["reviewed_workspace_fingerprint"] == FINGERPRINT
-    assert cert["candidate"] == local_candidate().to_dict()
-    assert "comment" not in cert and "reviewed_pr_url" not in cert
-    state = local_state(records, review_certificate=cert)
-    assert certificate_problem(cert, state, configured(DEF0)) == ""
-
-
-def test_a_new_fingerprint_makes_the_old_evidence_inapplicable_before_issuance():
-    """A FIX round's workspace F1: a binding still naming F0 issues nothing."""
-    old = [record(1, candidate=local_candidate())]
-    with pytest.raises(CertificateIssuanceError, match="not the reviewed workspace"):
-        issue_local(old, fingerprint="e" * 64)
-
-
-def test_a_local_certificate_must_name_the_states_reviewed_workspace():
-    records = [record(1, candidate=local_candidate())]
-    cert = issue_local(records)
-    state = local_state(records, reviewed_workspace_fingerprint="e" * 64)
-    assert "not the state's reviewed workspace" in certificate_problem(
-        cert, state, configured(DEF0)
-    )
-
-
-def test_a_local_certificate_must_be_under_this_runs_contract():
-    foreign = LocalCandidate(FINGERPRINT, "d" * 64, RUN)
-    records = [record(1, candidate=foreign)]
-    cert = issue_local(records, binding(records, review_round=1, cand=foreign))
-    state = local_state(records)
-    assert "not the reviewed workspace under this run's contract" in certificate_problem(
-        cert, state, configured(DEF0)
-    )
-
-
-def test_a_local_pass_that_left_another_workspace_is_not_evidence():
-    """D7.2: a PASS whose run ended on another tree stands for nothing."""
-    moved = record(1, candidate=local_candidate())
-    moved["end_fingerprint"] = "e" * 64
-    moved["digest"] = ev.record_digest(moved)
-    cert = issue_local([moved])
-    state = local_state([moved])
-    assert "not evidence for definition [0]" in certificate_problem(cert, state, configured(DEF0))
-
-
-def test_a_local_certificate_has_no_live_revision():
-    records = [record(1, candidate=local_candidate())]
-    cert = issue_local(records)
-    with pytest.raises(ValueError, match="no live GitHub revision"):
-        certificate_problem(cert, local_state(records), configured(DEF0), REVIEWED)
-
-
-def test_a_remote_certificate_in_a_local_run_and_back_is_never_applicable():
-    records = [record(1, candidate=local_candidate())]
-    cert = issue_local(records)
-    assert "'local' certificate in a remote run" in certificate_problem(
-        cert, remote_state(), configured(DEF0)
-    )
+def test_a_local_certificate_is_never_applicable_in_a_run():
+    """The certificate LOCAL issued, with its workspace record retained beside it:
+    refused by its kind, with or without the live revision."""
+    rec = workspace_record()
+    cert = local_certificate(rec)
+    state = remote_state([rec], review_certificate=cert)
+    expected = "it is a 'local' certificate in a remote run"
+    assert certificate_problem(cert, state, configured(DEF0)) == expected
+    assert certificate_problem(cert, state, configured(DEF0), REVIEWED) == expected
+    assert certificate_problem(cert, remote_state(), configured(DEF0)) == expected
 
 
 def test_the_wording_says_it_is_no_merge_permission():
     assert "not a GitHub approval" in NOT_A_PERMISSION
     assert "permission to merge" in NOT_A_PERMISSION
+
+
+# -- a narrower set never certifies the full one (ADR 0010, #342) ----------------------
+
+
+def test_a_certificate_for_a_narrower_set_never_applies_under_the_full_set_and_back():
+    """ADR 0010 D4. A review presented a FAST-sized set certifies that set and
+    nothing wider: under the full set it is refused as a set change, not
+    taken as partial evidence (no promotion). A certificate for the full set
+    is refused the same way once the set in force is narrowed to a FAST-sized
+    one (no downgrade), so narrowing the configuration can never let an
+    earlier review stand for less than it was presented."""
+    narrow_def = Definition(0, ("uv", "run", "pytest", "tests/test_evidence.py"))
+    narrow = [record(1, candidate=candidate(), definition=narrow_def)]
+    narrow_cert = issue(narrow)
+    narrow_state = remote_state(narrow, review_certificate=narrow_cert)
+    assert certificate_problem(narrow_cert, narrow_state, configured(narrow_def)) == ""
+    for wider in (configured(narrow_def, DEF1), configured(DEF0, DEF1)):
+        assert certificate_problem(narrow_cert, narrow_state, wider).startswith(
+            "the validation set changed"
+        )
+
+    full = remote_records()
+    full_cert = issue(full)
+    full_state = remote_state(full, review_certificate=full_cert)
+    assert certificate_problem(full_cert, full_state, configured(DEF0, DEF1)) == ""
+    for narrower in (configured(DEF0), configured(narrow_def)):
+        assert certificate_problem(full_cert, full_state, narrower).startswith(
+            "the validation set changed"
+        )

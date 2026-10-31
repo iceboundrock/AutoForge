@@ -27,15 +27,14 @@ High-priority coverage includes:
 - corrupt-state handling
 - idempotent merge counting
 - effect state (ADR 0004): records round-trip in every stage; a corrupt or
-  incomplete record fails loudly; LOCAL state carrying effect state is
-  refused; a previous-protocol file loads with no effect state, and one
-  that carries effect fields is refused
+  incomplete record fails loudly; a previous-protocol file loads with no
+  effect state, and one that carries effect fields is refused
 - acceptance-action state (#211, `tests/test_state.py`): it round-trips
   under protocol 8; a protocol-7 file loads migrated and is relabelled; a
   protocol-7 or older file carrying outcomes, an `acceptance_comment_url`,
   an unblock `action`, a K9 record or an `acceptance_source` is refused,
-  unchanged; each malformed outcome and recorded URL is refused; a LOCAL
-  run carries none; a new issue resets the outcomes
+  unchanged; each malformed outcome and recorded URL is refused; a new
+  issue resets the outcomes
 - operator-action state (#243, `tests/test_state.py`): every outcome
   round-trips under the current protocol; a protocol-10 file, a `FIX`
   plan included, loads in every phase migrated and is relabelled; an older
@@ -44,9 +43,8 @@ High-priority coverage includes:
   protocol-11 file missing the outcomes is refused; each malformed outcome
   is refused, and a `verified` one is unique per action and comment; the
   outcome bound fits one round and drops the oldest entries, never the
-  round being fixed; declines of a round count K9's and K10's together; a
-  LOCAL run carries none; the outcomes belong to the issue they were
-  recorded for
+  round being fixed; declines of a round count K9's and K10's together;
+  the outcomes belong to the issue they were recorded for
 - recorded configuration (#219, `tests/test_config_fingerprint.py`,
   `tests/test_state.py`, `tests/test_cli.py`): every fingerprinted profile
   key and the worktree root is compared and named, and no other key is; a
@@ -59,7 +57,7 @@ High-priority coverage includes:
   `--accept-config-change` logs the change before recording it; a dry run
   writes nothing; a protocol-8 file loads, resumes and records one; a
   protocol-8 or older file carrying the field, or a protocol-9 file missing
-  it, is refused; a LOCAL run carries none; a configuration the record could
+  it, is refused; a configuration the record could
   not hold (a model or effort over 512 characters, an `update_epic` provider
   or limit out of bounds, a path over 4096 characters) is refused by `run`,
   its dry run and `doctor` before any state is written, and by an upgrade or
@@ -97,11 +95,9 @@ High-priority coverage includes:
   `required` leaves the state byte-identical and is not retried as a
   materialization failure; an interrupt leaves the marker, `status` and
   the dry run report it without writing, and the next step records it;
-  LOCAL validation records start and end fingerprints and a contract
-  beyond the bounds blocks before the agent; protocol-9 and older files
-  load in every phase with none of the six fields, an older file carrying
-  one, or a protocol-10 file missing one, is refused; `validation.commands`
-  and `local.validation_commands` beyond the bounds, a scope other than
+  protocol-9 and older files load in every phase with none of the six
+  fields, an older file carrying one, or a protocol-10 file missing one, is
+  refused; `validation.commands` beyond the bounds, a scope other than
   `candidate-tree` and an unknown key are load errors; `doctor` lists the
   set and runs nothing
 - candidate validation gates (#173, `tests/test_validation_gates.py`,
@@ -128,21 +124,14 @@ High-priority coverage includes:
   opener, a `CONTROL_RESULT`, a fence breaker) inert, and the empty-set
   wording; an evidence key in a result is ignored, and a clean result over
   a failure is corrected, then at the bound refused with nothing
-  published; LOCAL converges (an excluded writer without a rerun, an
-  idempotent generator with one confirming run), a non-idempotent validator
-  is not verified and then blocks, a failure is final only for the tree it
-  ran on, REVIEW needs evidence for the bound fingerprint itself and blocks
-  a legacy state without validating, a changed contract is refused before
-  anything runs, and no path calls GitHub; an applied unblock alone sets
-  the watermark, and the same candidate is validated again; Claude Code,
-  OpenCode and Pi behave alike
+  published; an applied unblock alone sets the watermark, and the same
+  candidate is validated again; Claude Code, OpenCode and Pi behave alike
 - review certificates (#174, `tests/test_certificate.py`,
   `tests/test_review_certificate.py`): a clean round's write issues the
   certificate of the exact candidate, records, set and review binding, an
   empty set included, in the save that enters `READY_FOR_MERGE` (a failed
   save leaves neither; #162's journal completes the round and issues it
-  from the observed comment) or LOCAL `DONE` (no `gh` call; a fix round
-  certifies the new workspace only); a needs-fix round issues none; a
+  from the observed comment); a needs-fix round issues none; a
   binding of another round, a non-`PASS` record, another head or PR, a
   comment URL that does not parse, or no binding issues none and blocks; a
   set or policy changed after presentation (timeout, sandbox mode,
@@ -150,9 +139,8 @@ High-priority coverage includes:
   binding and blocks, after which `unblock` decides `REVIEW` under the new
   configuration and `READY_FOR_MERGE` under the restored one;
   `certificate_problem` refuses each field that stops matching (kind,
-  digest, round, PR, HEAD, base, merge base, comment, candidate, LOCAL
-  fingerprint and contract, set, policy, a record no longer eligible, the
-  live revision) and does no I/O; an edited certificate fails the load;
+  digest, round, PR, HEAD, base, merge base, comment, candidate, set,
+  policy, a record no longer eligible, the live revision) and does no I/O; an edited certificate fails the load;
   `unblock` of an open PR at its clean-reviewed revision re-enters
   `READY_FOR_MERGE` only with an applicable certificate and otherwise
   `REVIEW` under the cap, a merged uncounted PR needing none; `status` and
@@ -202,8 +190,7 @@ High-priority coverage includes:
   rewritten base or a retarget reuses the records and certifies the new
   base, an edited or doubled comment is refused by the #94 re-read, a
   certificate of an earlier round stays as history while a producer
-  validates a new set, a replan replacement inherits nothing, and LOCAL
-  fingerprint drift certifies nothing, with no GitHub call; the crash
+  validates a new set, and a replan replacement inherits nothing; the crash
   windows: a saved gate pass reruns the whole gate in `MERGE`, a crash
   after the merge call is counted once with or without a certificate, a
   crash during a verification command reruns it after the certificate
@@ -232,12 +219,12 @@ High-priority coverage includes:
   keeps logs, binding, claim and worktree, reports nothing to archive the
   second time, and completes after a crash between link and unlink; the
   engine binding refuses another repository's namespace; legacy standalone
-  and LOCAL states are never touched; `run`, `step`, `resume` and
-  `local run` refuse a state dir inside the scheduler root, also through a
-  relative path, a link or `state_dir`, before the lock (`step` and
-  `resume` also before a LOCAL run's state is looked for), while `status`
-  reads it, `unblock` acts on it, a dry run writes nothing and a sibling
-  directory is not refused
+  states, and a LOCAL state an earlier release left at
+  `<git dir>/autoforge/state`, are never touched; `run`, `step` and `resume` refuse a
+  state dir inside the scheduler root, also through a relative path, a
+  link or `state_dir`, before the lock (`step` and `resume` also before any
+  state is read), while `status` reads it, `unblock` acts on it, a dry run
+  writes nothing and a sibling directory is not refused
 - lock domains (#180, ADR 0008 D9.2, D10–D12, D17.2,
   `tests/test_lock_domains.py`, `tests/test_shared_git.py`,
   `tests/test_ownership.py`, `tests/test_cli.py`): real child processes
@@ -325,36 +312,36 @@ High-priority coverage includes:
   file with LOCAL's twelve fields at their empty values and without them,
   a protocol-1 file in `READY_FOR_MERGE` or `MERGE` included; a `mode`
   other than absent or `"REMOTE"` is refused under every label, unknown
-  ones and none included. On an unknown mode, an unknown label and invalid
-  JSON, `status`, `step`, `resume` and `unblock` exit 2 and leave the
+  ones and none included. On an unknown mode, an unknown label, invalid
+  JSON and, since #387, a LOCAL state, `status`, `step`, `resume` and `unblock` exit 2 and leave the
   state directory and its logs as they were; `run` refuses, and
   `run --force` moves the file aside byte for byte, beside an archive of
   the same name it does not replace, prints the move and starts a run with
   nothing of it. Such a file at `config.state_dir` holds no issue and is
   reported by the scheduler's pass and by `epic status`, a namespace state
   of any mode but REMOTE holds its issue as uncertain, and no `epic`
-  command touches `<git dir>/autoforge/state`. #387 and #388 keep these
-  passing, apart from the expected protocol label and any row that names
-  LOCAL
+  command touches `<git dir>/autoforge/state`. They keep passing after the
+  removal, with only the expected protocol label moved to 13 (#388)
 - the shared coverage LOCAL's removal must not lose (ADR 0009 A.2.3,
   A.2.4, D12 S1a; #386): each shared invariant a LOCAL test was the only
   test of has a REMOTE or mode-neutral test, written while LOCAL still
-  works, whose docstring names the LOCAL test it replaces. #387 and #388
-  delete no LOCAL test whose replacement is not on `main`:
+  worked, whose docstring names the LOCAL test it replaced; the LOCAL
+  originals went with LOCAL's code (#387, #388):
   - A, the git reader REMOTE uses (`tests/test_git_workspace.py`): no read
     takes the optional index lock or refreshes a stale index, runs the
     repository's fsmonitor, holds a credential or follows the operator's
     `GIT_DIR`; `uncommitted_paths` is one hardened `git status`; a rename
     or a copy is one record; a truncated or timed-out read, and a failed
-    HEAD or branch read, are refused. `engine.workspace()`,
-    `config_file_placement_problem` and a whole REMOTE `ANALYZE_EXECUTE`
-    read no field of `config.local` (ADR 0009 C1)
+    HEAD or branch read, are refused
   - B, the state loader (`tests/test_state_fuzz.py`): a REMOTE file with
     an unknown field is refused, with and without LOCAL's fields, a newer
     protocol named as such; seeded random corruption of a REMOTE file
     either fails or loads as a legal REMOTE state holding exactly what the
     file says; truncated JSON and every non-object root are corruption,
-    never "no state", for `load_state`, `load` and `existing_run`
+    never "no state", for `load_state`, `load` and `existing_run`; a
+    REMOTE file that loads, given a complete LOCAL pending checkpoint
+    consistent with its phase, is refused, named, by all three, with
+    nothing written
   - C, the state root under a running REMOTE engine
     (`tests/test_state_root.py`): a state directory replaced while the
     agent runs (a link, a FIFO, a prepared directory, a rename aside, the
@@ -369,7 +356,7 @@ High-priority coverage includes:
     inside one fence, its one-line fields escaped
   - E and F, the outer sandbox (`tests/test_doctor_sandbox.py`,
     `tests/test_sandbox_routing.py`, `tests/test_sandbox_policy.py`):
-    every `doctor` sandbox row with `local=False` (REMOTE's classes and
+    every `doctor` sandbox row (REMOTE's classes and
     profiles, the issue worktrees, the per-issue sandbox directories, the
     denied roots with the checkout among them); each provider's
     `--version` through the real backend; a declaration's writable items
@@ -386,12 +373,55 @@ High-priority coverage includes:
     `~/.profile` exporting `GITHUB_TOKEN` are refused before the command
     runs: no record, `BLOCKED` naming the source and never the value,
     nothing pushed or published
-  - crash recovery: the four journal cases of
-    `tests/test_local_recovery_matrix.py` are covered by
-    `tests/test_runlog.py` and REMOTE `tests/test_engine.py`, a foreign
-    file renamed over the journal during a REMOTE launch and a journal
-    refused before the launch, which charges no attempt, among them; its
-    other twenty tests are of LOCAL-only mechanisms
+  - crash recovery: the four journal cases of LOCAL's recovery matrix are
+    covered by `tests/test_runlog.py` and REMOTE `tests/test_engine.py`, a
+    foreign file renamed over the journal during a REMOTE launch and a
+    journal refused before the launch, which charges no attempt, among
+    them; its other twenty tests were of LOCAL-only mechanisms
+- LOCAL's ways in, closed (ADR 0009 D3 to D5, D12 S2; #387;
+  `tests/test_cli.py`, `tests/test_config.py`, `tests/test_state.py`,
+  `tests/test_ownership.py`, `tests/test_epic_commands.py`):
+  `autoforge local`, with each former
+  subcommand and its flags, is argparse's invalid choice (exit 2) that
+  reads, writes and locks nothing, also during a scheduler pass, which
+  runs on, and `--help` lists no `local`; a `local:` key of any shape is
+  the loader's unknown top-level key for every command that loads the
+  configuration, the `epic` commands included (`epic archive` before it
+  takes the repository lock, in a process of its own too), with no GitHub
+  or provider call and nothing written (`doctor` fails its `config` row,
+  skips its state-directory probe, so an absent directory stays absent,
+  and exits 1);
+  a `mode: "LOCAL"` state is the loader's unknown mode under every label
+  (1 to 13, an unknown one and none), as LOCAL saved it and with garbage beside it,
+  and `status`, `status --json`, `step`, `resume` and `unblock` exit 2
+  with its directory byte for byte, while `run` refuses and `run --force`
+  moves it aside (the S1b pins above); in the lock's own directory
+  (`--state-dir <git common dir>/autoforge`), with a lock file there or
+  none, `step`, `resume`, `unblock` and `run` refuse it without taking
+  the lock, the whole directory as it was, and a state that loads before
+  the lock and is LOCAL under it is refused under it; nothing reads
+  `<git dir>/autoforge/state`: with a LOCAL state there, every command
+  says there is no state at the configured location and `run` starts a
+  REMOTE run beside it; and a LOCAL state at `config.state_dir` is the
+  scheduler hold's problem, holds nothing, and the pass admits as before
+- protocol 13, which removed LOCAL's twelve fields (ADR 0009 D6, D8, D12
+  S3; #388; `tests/test_state.py`): protocol-12 REMOTE files that
+  `main`'s own controller saved in every phase, each with the state that
+  phase persists (`tests/fixtures/state_protocol_12`, captured byte for
+  byte from 7df9917 by the script beside them and never rebuilt by this
+  tree's serializer), load without a write, keep every other field, and
+  their next save writes label 13 and none of the twelve; so do built
+  protocol-12 files with the fields present or absent, a file under each
+  older label that loads, a protocol-1 file from before LOCAL with none
+  of the fields and one with some of them; a file
+  labelled 12 or older with any one of the twelve non-empty is refused,
+  one case per field, and a protocol-13 or unlabelled file carrying any
+  of them, even empty, is refused, each left byte for byte with no
+  `.corrupt-*` file and no relabel; a workspace-variant validation record
+  and a `local` review certificate in a REMOTE state are refused as
+  unknown kinds; and, structurally, `LOCAL_LEGAL_EDGES`, a LOCAL launch
+  class and `WorkflowMode.LOCAL` do not exist, no module imports a
+  deleted one, and the wheel carries no `local_*.md` template
 
 ### Transitions
 
@@ -420,8 +450,7 @@ High-priority coverage includes:
 - the `acceptance_action` resolution (#211, `tests/test_result_parser.py`):
   its closed shape, every target key refused by name, an unknown key or
   kind, the body bounds and the published-content policy, the rationale
-  rule, no commit or follow-up beside it, at most one per result, and the
-  LOCAL refusal
+  rule, no commit or follow-up beside it, and at most one per result
 - the `operator_acceptance` resolution (#243, `tests/test_result_parser.py`):
   the documented bounds, inclusive; its closed shape at both levels, every
   target key refused by name, an unknown key or kind; `issue` a JSON
@@ -429,8 +458,8 @@ High-priority coverage includes:
   the body bounds, the published-content policy and no image or raw HTML
   outside code; the link rule (only into the run's repository, also once
   decoded, in any link form) applied only with a repository; at most four
-  actions per result, never beside an `acceptance_action`; the rationale
-  rule; and the LOCAL refusal
+  actions per result, never beside an `acceptance_action`; and the
+  rationale rule
 
 ### Execution
 
@@ -449,16 +478,16 @@ High-priority coverage includes:
   whatever the message says); the engine relaunches
   it after the phase-entry reconciliation, which may resolve or block the
   phase instead, at most `MAX_TRANSIENT_RETRIES` times per step however it
-  interleaves with corrections, never in LOCAL mode or while a process the
+  interleaves with corrections, never while a process the
   launch started may still be running, and the exhausted failure keeps its
   stderr tail and leaves the phase unchanged
 - a malformed result from a launch that may have left a process running
   (each of `group_survived_kill`, `capture_abandoned`,
-  `orphan_survived_kill`) is not corrected, in REMOTE and LOCAL mode, and
+  `orphan_survived_kill`) is not corrected, and
   the error names the leftover; `orphans_unchecked` alone is still corrected
   (#209)
 - a correction quotes the end of the refused launch's final reply (#393),
-  in REMOTE and LOCAL mode, for a reply without markers, markers around
+  for a reply without markers, markers around
   invalid JSON, a YAML-like section, a commit made without a block (the
   correction's block still checked against the worktree, another
   `head_sha` refused), a reply saying a task is still running (corrected
@@ -476,20 +505,13 @@ High-priority coverage includes:
   result not corrected, with or without a survivor) says `State unchanged`
   and names the worktree with its uncommitted count, the step's log
   directory and a `resume` command with the `--config` / `--state-dir`
-  given, in REMOTE and LOCAL mode (no worktree line there); the count is
+  given; the count is
   left out when the status read fails, a token-shaped value in the
   configuration never reaches the text, and the CLI prints the command,
   which then resumes the run (#189)
-- a LOCAL launch that moved the git anchor (a commit in a write phase, a
-  branch switch in `REVIEW`) and returned a malformed result is not
-  corrected: the step blocks with the anchor reason, which names the run
-  log of the attempt that ended, the checkout and the `local run` command
-  that continues with the `--config` / `--state-dir` given, which the CLI
-  prints and which then starts the next run while `resume` and `unblock`
-  refuse (#189), and the refused correction is not charged to
-  `local_pending_attempts` (#209); a REMOTE checkout that moved blocks
-  with the checkout and the `unblock` and `resume` commands with those
-  flags, and `unblock` prints the `resume` command with them (#189)
+- a checkout that a launch moved blocks with the checkout and the
+  `unblock` and `resume` commands with the `--config` / `--state-dir`
+  given, and `unblock` prints the `resume` command with them (#189)
 - timeout, including a same-group descendant that closed its stdio and
   ignores SIGTERM (escalated to SIGKILL, gone before `execute()` returns),
   a writer outside the group via `setsid` (the capture abandoned after the
@@ -733,9 +755,8 @@ Four more files, the same split by what they need from the host:
   - the §2.5 mapping per launch class: a REMOTE agent's writable worktree,
     read-only `.git`, writable admin dir, read-only common dir, the masks
     and the overlay over the shared object store; no persistent cache for
-    a REVIEW; a LOCAL launch's read-only git dir with its state masked; a
-    LOCAL validation command that may run without a network and an agent
-    that never does; an export command that sees only its tree;
+    a REVIEW; an agent that never runs without a network; an export
+    command that sees only its tree;
   - the D8.2 rewrite: a path-valued name passes only when what it names is
     visible; a value, a `PATH` entry or an auth item's variable reached
     through a link the sandbox does not show (in the private home or
@@ -816,37 +837,28 @@ Four more files, the same split by what they need from the host:
   candidate and every relaunch until the operator puts it back (#223); a
   refusal on the spawn path; and the dry-run note.
 - `tests/test_sandbox_gate.py` (#169, D12.2, D12.4) drives the engine with
-  the probe's stand-in. It covers: under `required` and REMOTE's
-  `preferred`, a host that cannot enforce refusing the step with a
+  the probe's stand-in. It covers: under `required` and `preferred`, a host that cannot enforce refusing the step with a
   `SandboxCapabilityError` that names the capability and the
   alternatives, the state and run-log directories byte-identical and
   nothing launched; INITIALIZING not gated; the probe asked once per
   engine and again by a new one; a capable host launching inside;
   `disabled` never probing and saying "logical isolation only"; an
   operator read-only path over the state directory refused before
-  anything; in LOCAL, the gate checking operator paths against the LOCAL
-  launch's own denied roots, so `.git/config` (in the checkout's read-only
-  git projection) runs to DONE dropped as covered while `.git/autoforge`
-  or another registered worktree is still refused; the dry run's policy by launch class with no probe; `status`
-  without a probe; LOCAL `required` refused before the launch is charged;
-  LOCAL `preferred` falling back visibly (the plan, `status`, a stderr
-  line at every agent and validation launch, every execution record's
-  `sandbox` facts) and enforced on a capable host; and a setup failure
-  after the gate never re-run without the sandbox.
+  anything; the dry run's policy by launch class with no probe; `status`
+  without a probe; and a setup failure after the gate never re-run
+  without the sandbox.
 - `tests/test_doctor_sandbox.py` (#169) runs `doctor`'s sandbox rows with
   real `git` in a temporary repository and a runner that answers every
-  sandboxed launch: the capability and mode rows for every mode, host and
-  workflow; the policy by class; each provider's declaration (paths and
+  sandboxed launch: the capability and mode rows for every mode and host;
+  the policy by class; each provider's declaration (paths and
   credential classes, never a value) and its `--version` launched inside
   by its resolved path; a `dir-rw` login in the provider's own root and a
   keyring login refused with the alternatives (D7.3); hard links in the
-  workspace (D4.4), the walk reading a crowded directory an entry at a
+  issue worktrees (D4.4), the walk reading a crowded directory an entry at a
   time and no further than its bound; the sandbox directories and their sizes (D8.5);
   loopback and wildcard TCP listeners from a fake `/proc/net`, X11 flagged
-  (D9.3); operator paths over a denied root (D15.4); and no `gh` call in
-  LOCAL. Its denied roots are the run's own (PR #231 R2-F1): for the
-  default LOCAL state, a relative `--state-dir` and a relative
-  `state_dir`, they equal the gate's. Its operator-path row fails exactly
+  (D9.3); operator paths over a denied root (D15.4); and no `gh` call. Its
+  denied roots are the run's own (PR #231 R2-F1): they equal the gate's. Its operator-path row fails exactly
   where the gate refuses the step, and an `OPENCODE_DB` in the state
   directory refuses OpenCode's row with nothing launched. A provider's
   `--version` gets a launch's environment (R2-F2): an operator's
@@ -867,10 +879,9 @@ Four more files, the same split by what they need from the host:
   the configuration, a hook, its `.git` or `commondir`, leaves no process
   behind, and commits through the overlay into the private directory,
   where the candidate names no commit until the strict import ran; an
-  alternates file written through the overlay as tampering; a
-  LOCAL validation command that gets `EROFS` on the git directory; an
+  alternates file written through the overlay as tampering; an
   export command that sees its tree and no network when isolated; a
-  `required` LOCAL run that reaches `DONE`; a `required` pre-merge command
+  `required` pre-merge command
   that sees only the export; an all-Pi run sandboxed in every child,
   the auth preflight included, under a home of its own so that a `TMPDIR`
   under `~/.cache` does not put its Pi paths under the cache (#301); a
@@ -902,7 +913,7 @@ Four more files, the same split by what they need from the host:
   as the other two do. One probe runs in every launch path: Claude Code
   text and `stream-json`, OpenCode, Pi's RPC child and its `auth check`
   preflight, a provider-neutral adapter (the base class's launch and
-  declaration alone), a LOCAL validation command and an export command.
+  declaration alone) and an export command.
   Every path must report the same: the operator's SSH key and `gh`
   configuration, the state directory, a neighbouring worktree and the
   controller's directory absent; its workspace, `/tmp` and private home
@@ -914,12 +925,12 @@ Four more files, the same split by what they need from the host:
 `test_integration.py`'s full loops and `test_replan.py`'s hard-threshold
 replan run in both modes, and every launch under `required` carries a
 description. `test_config.py` pins the section (`disabled` by default,
-both formats read, `preferred` falling back in LOCAL only, any other mode
+both formats read, `preferred` read as `required` (ADR 0009 D7), any other mode
 refused, `read_only_paths` read and each forbidden source, the home or an
 ancestor, a kernel root, a link to a forbidden source and an overlap
 refused at load) and the example file; `test_evidence.py` pins which
-modes require enforced evidence; `test_prompts.py` pins the narrowed-view wording both common
-prompts carry in every mode.
+modes require enforced evidence; `test_prompts.py` pins the narrowed-view wording `common.md`
+carries in every mode.
 
 ### Agent isolation (REMOTE)
 
@@ -939,7 +950,7 @@ prompts carry in every mode.
   (and no other) require the variable, so a missing value fails rendering,
   and the instruction is in `worktree_state.md` (`test_engine.py`,
   `test_replan.py`, `test_prompts.py`; the parsed status codes, renames and
-  copies: `test_local.py`) (#187)
+  copies: `test_git_workspace.py`) (#187)
 - a path that exists but is not a worktree root of this repository, or a
   location inside the operator's working tree, is refused, not adopted
 - a dry run creates no worktree and runs no git
@@ -1000,25 +1011,23 @@ a stated reason it has none. The coverage that must keep working:
   a route, never its value, tolerates an SSH agent or session bus alone,
   ignores zsh files in the home, and refuses a probe without an answer;
   an agent, validation or pre-merge launch and `doctor` refuse on it
-  (`test_child_env.py`, `test_engine.py`, `test_local.py`,
+  (`test_child_env.py`, `test_engine.py`, `test_validation_evidence.py`,
   `test_doctor.py`)
 - an agent preflight refusal, the credential preflight's or the
   adapter's own (`integration_preflight`), leaves the state file byte for
   byte; a
-  validation-command refusal leaves the phase unverified; a pre-merge
-  refusal blocks the merge (`test_engine.py`, `test_local.py`)
+  candidate validation command's refusal is checked again once and then
+  blocks with no record; a pre-merge refusal blocks the merge
+  (`test_engine.py`, `test_validation_evidence.py`)
 - every launch of a full REMOTE lifecycle, for scripted providers and for
   an all-Pi run (the RPC child and its auth preflight), runs with the
-  isolation in force and its phase's read context; a LOCAL run's launches
-  get the same isolation and no read context (`test_integration.py`,
-  `test_local.py`)
+  isolation in force and its phase's read context (`test_integration.py`)
 - a write through a credential that slipped through anyway is not
   journaled and blocks (`test_engine.py`)
 - `doctor` refuses a token-bearing origin without printing it, refuses
   the configuration routes, a netrc entry and an OpenCode organization,
   lists the launch environment
-  by name only, gives Pi's probes the same overrides, and `local doctor`
-  keeps the environment rows with zero `gh` calls (`test_doctor.py`)
+  by name only, and gives Pi's probes the same overrides (`test_doctor.py`)
 - Claude Code launches with `--safe-mode`, `--strict-mcp-config` and
   `--setting-sources=user`, and a profile whose `extra_args` would load an
   integration or settings is refused without its value
@@ -1126,6 +1135,28 @@ a stated reason it has none. The coverage that must keep working:
   `safety.allow_merge: true` and `SKIP` with it closed, while a hidden
   bypass list with `current_user_can_bypass: never` is `SKIP` either way
 - follow-up issue verification
+- the next issue's EPIC membership (#287, `tests/test_engine.py`,
+  `tests/test_read_context.py`): `UPDATE_EPIC` switches to a native
+  sub-issue of the EPIC (its parent compared by identity, a casing variant
+  of the EPIC's URL included) and refuses, through the bounded
+  re-selection and then `BLOCKED`, an open issue with no parent, another
+  parent or the just-finished issue as parent, even when a task list of the
+  EPIC body names it, and a sub-issue with sub-issues of its own; on the
+  parent read a not-found is a bad selection, a transient failure a
+  bounded rejection and a malformed answer `BLOCKED` at once, nothing
+  switched, and an issue that read reports closed is refused though the
+  issue read before it said `OPEN`; the first issue is not held to the
+  rule; a `null` is refused, then `BLOCKED`, while a sub-issue the
+  controller would accept remains, and holds when only the issue just
+  finished, a nested EPIC, another repository's sub-issue or a
+  namespace-owned one is left; a listing short of the EPIC's count, with
+  or without open rows, and a conclusively failed listing block at once,
+  a transient failure is a bounded rejection, and none of them writes the
+  roadmap section; the read context lists the EPIC's sub-issues by number
+  with their state and title (none of them named in the EPIC body), the
+  EPIC's count and whether the listing is incomplete, or says they could
+  not be read; `list_titled_sub_issues` is the `.../sub_issues` read with
+  each title, which a malformed title refuses (`tests/test_github.py`)
 - typed effect writes are never retried on an ambiguous outcome, while reads
   keep their transient retry (`tests/test_github.py`)
 - every Wave 1 effect kind at the operation level, against `FakeGitHub` and
@@ -1516,8 +1547,10 @@ the in-memory GitHub and scripted agents. It must keep covering:
   child completed or given a dependency between snapshot and claim, a
   child removed or re-parented, the EPIC closed, a human push to an active
   PR;
-- standalone guards both ways, LOCAL unaffected, and no worker merging or
-  writing the EPIC with the merge gate open.
+- standalone guards both ways, `autoforge local` refused during a pass
+  that runs on, a `local:` key refused by every `epic` command that loads
+  the configuration, and no worker merging or writing the EPIC with the
+  merge gate open.
 
 ### Live progress (#192)
 
@@ -1592,10 +1625,6 @@ is scripted with the same handlers `ScriptedProvider` takes. Keep covered:
   `HEAD` does not back is refused identically
 - a Pi claim the fake GitHub does not back fails with the same error and
   state as the same claim from `ScriptedProvider`
-- LOCAL on Pi: cwd is the repository root, no GitHub access, LOCAL prompts
-  over RPC, every write-capable launch (corrections included) charged to
-  the durable checkpoint, and a Pi process writing into the tree during
-  REVIEW refused by the existing drift check
 - a correction is a second, separate Pi process with identical argv and no
   session reuse, its RPC prompt carries the parse error, the entry
   reconciliation runs before it, and `max_correction_attempts` bounds it
@@ -1624,20 +1653,19 @@ is scripted with the same handlers `ScriptedProvider` takes. Keep covered:
 `tests/test_live_pi.py` runs one REVIEW through the operator's real Pi
 and credential, on the auth route `AUTOFORGE_LIVE_PI_AUTH` names: `api_key`
 (DeepSeek first, `require_oauth: false`) or `oauth` (the ChatGPT sign-in,
-optional). It has two tests, one model call each: a LOCAL REVIEW, and a
-REMOTE REVIEW (ADR 0009 A.2.3 G, #386), the one that stays once LOCAL is
-removed. Both are marked `live`: `pyproject.toml`'s `-m 'not live'`
-deselects them from every default run, and selected with `-m live` they
-skip unless `AUTOFORGE_LIVE_PI=1`. Their flows and checks live in
-`tests/live_pi.py`. The REMOTE flow runs the real `autoforge doctor`,
+optional). It has one test, one model call: a REMOTE REVIEW (ADR 0009
+A.2.3 G, #386; its LOCAL form went with LOCAL, #387). It is marked `live`:
+`pyproject.toml`'s `-m 'not live'` deselects it from every default run,
+and selected with `-m live` it skips unless `AUTOFORGE_LIVE_PI=1`. Its
+flow and checks live in `tests/live_pi.py`. The flow runs the real
+`autoforge doctor`,
 decided by its Pi rows alone (its GitHub rows fail against the stand-in's
 `gh` by construction and are reported apart), then one REMOTE REVIEW of a
 PR the controller opened on `FakeGitHub` over a bare `file://` origin in
 the run's directory: nothing reaches GitHub. `tests/test_live_pi_support.py`
-keeps covered, offline, each check below for the LOCAL flow and its
-REMOTE counterpart, whose step 5 also scans every request sent to the
-stand-in and whose step 6 checks the checkout, the issue worktree and its
-HEAD:
+keeps covered, offline, each check below for that flow, whose step 5 also
+scans every request sent to the stand-in and whose step 6 checks the
+checkout, the issue worktree and its HEAD:
 
 - the deselection: a default pytest process deselects it and runs nothing,
   and `-m live` without the variable skips with its reason
@@ -1672,7 +1700,7 @@ HEAD:
   comes by, none runs; and the whole REMOTE flow passes with `GIT_DIR` and
   those sentinels in `~/.gitconfig`
 - the whole flow against the fake `pi`, through the real
-  `autoforge local doctor` in a process of its own and the real engine and
+  `autoforge doctor` in a process of its own and the real engine and
   `PiProvider`: it passes on the `api_key` route (no key in any launch,
   two read-only auth checks, the report naming the commit, the route and
   the `authType`, nothing in it redacted) and on the `oauth` route; a key
@@ -1774,8 +1802,7 @@ boundary (`tests/test_sdk_policy.py`). Keep covered:
   them, gets its own credential, and leaves `os.environ` unchanged. A `*`
   prefix is expanded and never carries a foreign name, and #165's
   refusals still apply;
-- the roots: writing every root leaves a LOCAL fingerprint unchanged, and
-  REMOTE roots lie outside the worktree;
+- the roots: REMOTE roots lie outside the worktree;
 - interaction data: an oversized, escape-carrying or credential-shaped
   input, option, answer or modified input is refused, never clipped. Two
   options shown alike are refused, and a permission ask shows only
@@ -1856,8 +1883,7 @@ their own boundaries (`tests/test_interaction.py`). Keep covered:
 - the engine: `InteractionRequiredError` with the phase unchanged, one
   launch despite corrections and a transient report, a resolver asked
   under the repository lock, a broker per launch, a claimed pause with
-  nothing persisted, a LOCAL launch charge kept, and a dry run that asks
-  no one.
+  nothing persisted, and a dry run that asks no one.
 
 ### Requests a CLI refused (#258)
 

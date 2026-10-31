@@ -13,8 +13,9 @@ state to check for later. These tests try to manufacture a counter-example:
 a field the controller does not know, a root that is not an object, and
 random mutations of a valid file.
 
-They are the REMOTE forms of the LOCAL tests in ``tests/test_local.py`` and
-``tests/test_local_state_fuzz.py`` that LOCAL's removal retires.
+They are the REMOTE forms of the LOCAL tests that LOCAL's removal retired
+(``tests/test_local.py`` and ``tests/test_local_state_fuzz.py``, deleted by
+#388).
 """
 
 import json
@@ -281,12 +282,15 @@ def holds_every_remote_invariant(s: AutoForgeState) -> None:
         except ConfigurationError as exc:  # pragma: no cover - the assertion's message
             raise AssertionError(f"reviewed_pr_url does not parse: {exc}") from None
         assert reviewed.same_repository(s.repository)
-    # A REMOTE run carries no LOCAL checkpoint and no LOCAL contract (read
-    # with a default: the fields leave the state when LOCAL does, #388).
-    assert getattr(s, "local_run_contract", {}) == {}
-    assert getattr(s, "local_pending_phase", "") == ""
-    assert getattr(s, "local_pending_fingerprint", "") == ""
-    assert getattr(s, "local_pending_attempts", 0) == 0
+    # A REMOTE run carries no LOCAL checkpoint and no LOCAL contract: protocol
+    # 13 has no such field at all (#388, ADR 0009 D8).
+    for name in (
+        "local_run_contract",
+        "local_pending_phase",
+        "local_pending_fingerprint",
+        "local_pending_attempts",
+    ):
+        assert not hasattr(s, name), name
     # The checks that run on the parsed evidence and effect state still pass.
     s.validation_evidence()
     s.phase_effects()
@@ -381,3 +385,80 @@ def test_random_corruption_of_a_remote_state_either_fails_or_is_legal(tmp_path, 
     # mutation here labels an older protocol, so nothing is migrated.
     loaded = state.to_dict()
     assert {k: loaded.get(k, "(dropped)") for k in payload} == payload
+
+
+# =============================================================================
+# A LOCAL checkpoint on a REMOTE state
+# =============================================================================
+
+# Every checkpoint LOCAL's loader accepted on a LOCAL run: a write phase's,
+# under that phase or kept as evidence by BLOCKED or FAILED.
+WELL_FORMED_CHECKPOINTS = (
+    (Phase.FIX, Phase.FIX),
+    (Phase.ANALYZE_EXECUTE, Phase.ANALYZE_EXECUTE),
+    (Phase.FIX, Phase.BLOCKED),
+    (Phase.ANALYZE_EXECUTE, Phase.FAILED),
+)
+
+
+_CHECKPOINT_REFUSALS = {
+    # Protocol 13 has no such field: each is unknown (ADR 0009 D8 step 4).
+    "13": (
+        "state file has unknown field(s) 'local_pending_attempts', "
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '13'"
+    ),
+    # An older label's LOCAL fields are dropped only when empty (D8 step 3).
+    "12": (
+        "state file is labelled protocol_version '12' and carries LOCAL mode's "
+        "'local_pending_attempts', 'local_pending_fingerprint', 'local_pending_phase' "
+        "with a value"
+    ),
+}
+
+
+@pytest.mark.parametrize("label", sorted(_CHECKPOINT_REFUSALS))
+@pytest.mark.parametrize(
+    ("pending", "phase"), WELL_FORMED_CHECKPOINTS, ids=lambda p: p.value.lower()
+)
+def test_a_remote_state_carrying_a_well_formed_local_checkpoint_is_refused(
+    tmp_path, pending, phase, label
+):
+    """A REMOTE run has no working-tree checkpoint, so one on its file is corruption.
+
+    The file is :func:`good_remote` in ``phase``, which loads under either
+    label, with a checkpoint that is complete and consistent with that phase:
+    under protocol 13 its three fields are unknown, and under protocol 12
+    they hold what only LOCAL code wrote (ADR 0009 D8, #388). The refusal
+    names them; ``load_state``, an engine's ``load`` and ``existing_run``
+    all refuse it, and none of them writes the file. The random mutations
+    above never build such a checkpoint, so without this test they pass
+    with the refusal gone.
+
+    #387 (R2-F2): the REMOTE row of the deleted
+    tests/test_local.py::test_a_state_file_with_a_malformed_pending_checkpoint_is_refused
+    """
+    payload = dict(good_remote(), phase=phase.value, protocol_version=label)
+    if phase is Phase.BLOCKED or phase is Phase.FAILED:
+        payload["block_reason"] = "the run stopped on an unverified launch"
+    state_dir = tmp_path / ".autoforge"
+    state_dir.mkdir()
+    path = write(state_dir / "state.json", payload)
+    holds_every_remote_invariant(load_state(path))
+    payload.update(
+        local_pending_phase=pending.value,
+        local_pending_fingerprint="a" * 64,
+        local_pending_attempts=1,
+    )
+    path = write(path, payload)
+    raw = path.read_bytes()
+    refusal = re.escape(_CHECKPOINT_REFUSALS[label])
+    with pytest.raises(StateError, match=refusal):
+        load_state(path)
+    engine = ControllerEngine(default_config(), state_dir=state_dir)
+    with pytest.raises(StateError, match=refusal):
+        engine.load()
+    assert engine.state is None
+    with pytest.raises(StateError, match=refusal):
+        engine.existing_run()
+    engine.close()
+    assert path.read_bytes() == raw

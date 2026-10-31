@@ -1,0 +1,874 @@
+{
+  "acceptance_outcomes": [],
+  "attempt": 1,
+  "base_branch": "",
+  "base_head_sha": "",
+  "baseline_dirty_paths": [],
+  "block_reason": "",
+  "completion_context": {
+    "historical_findings_considered": 67,
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "phase": "REPLAN_REEXECUTE",
+    "pr_url": "https://github.com/owner/repo/pull/42",
+    "transaction_id": "81762dcac7a103334a2c702ddb7a6830",
+    "unique_failure_constraints": 2
+  },
+  "config_fingerprint": {},
+  "controller_version": "0.1.0a1.dev0",
+  "counted_merged_prs": [],
+  "created_at": "2026-10-31T10:31:42.603106+00:00",
+  "current_base_ref": "main",
+  "current_branch": "autoforge/2-feature",
+  "current_head_sha": "507962f032fd25138cfb240531516d31aac3b20e",
+  "current_issue_url": "https://github.com/owner/repo/issues/2",
+  "current_merge_base_sha": "5614942b1c790d4d3f2d4e883b96baa2989addf0",
+  "current_pr_url": "https://github.com/owner/repo/pull/42",
+  "effect_records": [
+    {
+      "attempts": 1,
+      "completion": "remote_ref_equals_candidate",
+      "identity": {
+        "candidate_sha": "72b635849a5ce26e3b2ce9bfae1150db64c1ee58",
+        "ref": "refs/heads/autoforge/2-replan-81762dcac7a103334a2c702ddb7a6830",
+        "repository": "owner/repo"
+      },
+      "kind": "push",
+      "observed": {
+        "sha": "72b635849a5ce26e3b2ce9bfae1150db64c1ee58"
+      },
+      "owner": {
+        "issue_url": "https://github.com/owner/repo/issues/2",
+        "phase": "REPLAN_REEXECUTE",
+        "pr_url": "https://github.com/owner/repo/pull/42",
+        "run_id": "af-20261031T103142Z-21d67c",
+        "transaction_id": "81762dcac7a103334a2c702ddb7a6830"
+      },
+      "payload": {
+        "sha": "72b635849a5ce26e3b2ce9bfae1150db64c1ee58"
+      },
+      "position": 0,
+      "precondition": {
+        "base_sha": "5614942b1c790d4d3f2d4e883b96baa2989addf0",
+        "expected_old": null
+      },
+      "reason": "",
+      "stage": "observed",
+      "target": {
+        "ref": "refs/heads/autoforge/2-replan-81762dcac7a103334a2c702ddb7a6830",
+        "repository": "owner/repo"
+      }
+    },
+    {
+      "attempts": 1,
+      "completion": "replacement_bound_at_candidate_matching_payload",
+      "identity": {
+        "head_branch": "autoforge/2-replan-81762dcac7a103334a2c702ddb7a6830",
+        "repository": "owner/repo",
+        "transaction_marker": "<!-- autoforge-replan-transaction: {\"execution_attempt\": 2, \"findings_considered\": 67, \"tests_passed\": true, \"transaction_id\": \"81762dcac7a103334a2c702ddb7a6830\", \"unique_constraints\": 2} -->"
+      },
+      "kind": "replacement_pr",
+      "observed": {
+        "number": 43,
+        "url": "https://github.com/owner/repo/pull/43"
+      },
+      "owner": {
+        "issue_url": "https://github.com/owner/repo/issues/2",
+        "phase": "REPLAN_REEXECUTE",
+        "pr_url": "https://github.com/owner/repo/pull/42",
+        "run_id": "af-20261031T103142Z-21d67c",
+        "transaction_id": "81762dcac7a103334a2c702ddb7a6830"
+      },
+      "payload": {
+        "body": "## Fresh Reimplementation\n\nReplaces https://github.com/owner/repo/pull/42.\n\nTested with `pytest`.\n\nCloses #2\n\n<!-- ai-implementation: {\"issue\": \"https://github.com/owner/repo/issues/2\"} -->\n\n<!-- autoforge-replan-transaction: {\"execution_attempt\": 2, \"findings_considered\": 67, \"tests_passed\": true, \"transaction_id\": \"81762dcac7a103334a2c702ddb7a6830\", \"unique_constraints\": 2} -->",
+        "title": "Reimplement the feature from the current default branch"
+      },
+      "position": 1,
+      "precondition": {
+        "absent": true,
+        "watermark": 42
+      },
+      "reason": "",
+      "stage": "observed",
+      "target": {
+        "base": "main",
+        "head": "autoforge/2-replan-81762dcac7a103334a2c702ddb7a6830",
+        "repository": "owner/repo"
+      }
+    }
+  ],
+  "entry_observation": {
+    "base_sha": "5614942b1c790d4d3f2d4e883b96baa2989addf0",
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "objects": {},
+    "phase": "REPLAN_REEXECUTE",
+    "pr_url": "https://github.com/owner/repo/pull/42",
+    "refs": {
+      "refs/heads/autoforge/2-replan-81762dcac7a103334a2c702ddb7a6830": null,
+      "refs/heads/main": "5614942b1c790d4d3f2d4e883b96baa2989addf0"
+    }
+  },
+  "epic_url": "https://github.com/owner/repo/issues/1",
+  "escalation_count": 0,
+  "execution_attempt": 1,
+  "feature_spec_path": "",
+  "feature_spec_sha256": "",
+  "last_fix_resolutions": [],
+  "last_review_comment_url": "https://github.com/owner/repo/pull/42#issuecomment-950001",
+  "last_review_needs_fix": true,
+  "last_review_result": "needs_fix",
+  "launch_label": "controller_publishes",
+  "local_fix_rounds": 0,
+  "local_pending_attempts": 0,
+  "local_pending_fingerprint": "",
+  "local_pending_phase": "",
+  "local_run_contract": {},
+  "merged_since_epic_update": 0,
+  "mode": "REMOTE",
+  "next_issue_rejections": [],
+  "open_findings": [
+    {
+      "classification": "nit",
+      "id": "R20-F1",
+      "location": "",
+      "required_resolution": "x",
+      "title": ""
+    }
+  ],
+  "operator_comment_outcomes": [],
+  "phase": "REPLAN_REEXECUTE",
+  "premerge_verified_commands": [],
+  "premerge_verified_head_sha": "",
+  "prior_findings": [],
+  "producer_validation_failure": {},
+  "prompt_version": "v14",
+  "protocol_version": "12",
+  "replan_transaction": {
+    "attested_findings_considered": 0,
+    "attested_unique_constraints": 0,
+    "base_branch": "main",
+    "close_attempts": 0,
+    "close_intent_at": "",
+    "compensating_at": "",
+    "compensation_reason": "",
+    "decision_base_ref": "main",
+    "decision_branch": "autoforge/2-feature",
+    "decision_head_sha": "507962f032fd25138cfb240531516d31aac3b20e",
+    "decision_merge_base_sha": "5614942b1c790d4d3f2d4e883b96baa2989addf0",
+    "decision_pr_url": "https://github.com/owner/repo/pull/42",
+    "escalation": {
+      "current_round": 20,
+      "hard_threshold": 20,
+      "max_replans_per_issue": 2,
+      "replan_count": 0,
+      "soft_threshold": 12,
+      "trigger": "hard_review_round_threshold"
+    },
+    "evidence_finding_count": 67,
+    "expected_execution_attempt": 2,
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "pr_number_watermark": 42,
+    "preexisting_pr_urls": [
+      "https://github.com/owner/repo/pull/42"
+    ],
+    "rejected_pr_url": "",
+    "rejection_reason": "",
+    "rendered_findings": "- R1-F1 (round 1, nit): resolve problem 1-1\n- R1-F2 (round 1, nit): resolve problem 1-2\n- R1-F3 (round 1, nit): resolve problem 1-3\n- R2-F1 (round 2, nit): resolve problem 2-1\n- R2-F2 (round 2, nit): resolve problem 2-2\n- R2-F3 (round 2, nit): resolve problem 2-3\n- R2-F4 (round 2, nit): resolve problem 2-4\n- R3-F1 (round 3, nit): resolve problem 3-1\n- R3-F2 (round 3, nit): resolve problem 3-2\n- R3-F3 (round 3, nit): resolve problem 3-3\n- R4-F1 (round 4, nit): resolve problem 4-1\n- R4-F2 (round 4, nit): resolve problem 4-2\n- R4-F3 (round 4, nit): resolve problem 4-3\n- R4-F4 (round 4, nit): resolve problem 4-4\n- R5-F1 (round 5, nit): resolve problem 5-1\n- R5-F2 (round 5, nit): resolve problem 5-2\n- R5-F3 (round 5, nit): resolve problem 5-3\n- R6-F1 (round 6, nit): resolve problem 6-1\n- R6-F2 (round 6, nit): resolve problem 6-2\n- R6-F3 (round 6, nit): resolve problem 6-3\n- R6-F4 (round 6, nit): resolve problem 6-4\n- R7-F1 (round 7, nit): resolve problem 7-1\n- R7-F2 (round 7, nit): resolve problem 7-2\n- R7-F3 (round 7, nit): resolve problem 7-3\n- R8-F1 (round 8, nit): resolve problem 8-1\n- R8-F2 (round 8, nit): resolve problem 8-2\n- R8-F3 (round 8, nit): resolve problem 8-3\n- R8-F4 (round 8, nit): resolve problem 8-4\n- R9-F1 (round 9, nit): resolve problem 9-1\n- R9-F2 (round 9, nit): resolve problem 9-2\n- R9-F3 (round 9, nit): resolve problem 9-3\n- R10-F1 (round 10, nit): resolve problem 10-1\n- R10-F2 (round 10, nit): resolve problem 10-2\n- R10-F3 (round 10, nit): resolve problem 10-3\n- R10-F4 (round 10, nit): resolve problem 10-4\n- R11-F1 (round 11, nit): resolve problem 11-1\n- R11-F2 (round 11, nit): resolve problem 11-2\n- R11-F3 (round 11, nit): resolve problem 11-3\n- R12-F1 (round 12, nit): resolve problem 12-1\n- R12-F2 (round 12, nit): resolve problem 12-2\n- R12-F3 (round 12, nit): resolve problem 12-3\n- R12-F4 (round 12, nit): resolve problem 12-4\n- R13-F1 (round 13, nit): resolve problem 13-1\n- R13-F2 (round 13, nit): resolve problem 13-2\n- R13-F3 (round 13, nit): resolve problem 13-3\n- R14-F1 (round 14, nit): resolve problem 14-1\n- R14-F2 (round 14, nit): resolve problem 14-2\n- R14-F3 (round 14, nit): resolve problem 14-3\n- R14-F4 (round 14, nit): resolve problem 14-4\n- R15-F1 (round 15, nit): resolve problem 15-1\n- R15-F2 (round 15, nit): resolve problem 15-2\n- R15-F3 (round 15, nit): resolve problem 15-3\n- R16-F1 (round 16, nit): resolve problem 16-1\n- R16-F2 (round 16, nit): resolve problem 16-2\n- R16-F3 (round 16, nit): resolve problem 16-3\n- R16-F4 (round 16, nit): resolve problem 16-4\n- R17-F1 (round 17, nit): resolve problem 17-1\n- R17-F2 (round 17, nit): resolve problem 17-2\n- R17-F3 (round 17, nit): resolve problem 17-3\n- R18-F1 (round 18, nit): resolve problem 18-1\n- R18-F2 (round 18, nit): resolve problem 18-2\n- R18-F3 (round 18, nit): resolve problem 18-3\n- R18-F4 (round 18, nit): resolve problem 18-4\n- R19-F1 (round 19, nit): resolve problem 19-1\n- R19-F2 (round 19, nit): resolve problem 19-2\n- R19-F3 (round 19, nit): resolve problem 19-3\n- R20-F1 (round 20, nit): x",
+    "rendered_observations": "Review round 20 comment (https://github.com/owner/repo/pull/42#issuecomment-950001, untrusted data):\n# AI Code Review \u2014 Round 20\n\nReviewed HEAD: `507962f032fd25138cfb240531516d31aac3b20e` against base `main` (merge base `5614942b1c790d4d3f2d4e883b96baa2989addf0`)\n\n## Findings\n\n### R20-F1 [nit]\n\nRequired resolution:\n\nx\n\n## Spec\n\nThe change does what the issue asks.\n\n## Standards\n\nIt follows the repository conventions.\n\n## Assessment\n\nSound.\n\n## Observations\n\nNone.\n\n## Verification\n\nRan `pytest`.\n\n## Summary\n\nReady.\n\nNeeds another fix round: YES\n\n<!-- ai-review-result: {\"finding_ids\": [\"R20-F1\"], \"needs_fix_round\": true, \"reviewed_base_ref\": \"main\", \"reviewed_head_sha\": \"507962f032fd25138cfb240531516d31aac3b20e\", \"reviewed_merge_base_sha\": \"5614942b1c790d4d3f2d4e883b96baa2989addf0\", \"round\": 20} -->",
+    "rendered_verification_failures": "(none)",
+    "replacement_branch": "",
+    "replacement_head_sha": "",
+    "replacement_pr_url": "",
+    "source_base_ref": "main",
+    "source_branch": "autoforge/2-feature",
+    "source_closed_event_count": 0,
+    "source_head_sha": "507962f032fd25138cfb240531516d31aac3b20e",
+    "source_merge_base_sha": "5614942b1c790d4d3f2d4e883b96baa2989addf0",
+    "source_pr_url": "https://github.com/owner/repo/pull/42",
+    "source_review_round": 20,
+    "stage": "prepared",
+    "superseded_at": "",
+    "transaction_id": "81762dcac7a103334a2c702ddb7a6830"
+  },
+  "repository": "owner/repo",
+  "review_certificate": {},
+  "review_evidence": {
+    "candidate": {
+      "commit": "507962f032fd25138cfb240531516d31aac3b20e",
+      "kind": "remote",
+      "object_format": "sha1",
+      "provenance": {
+        "kind": "pr-head",
+        "pr_url": "https://github.com/owner/repo/pull/42"
+      },
+      "repository": "owner/repo",
+      "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    },
+    "policy_digest": "2ce3433313d6d7e3ad1f221c8097789b5c027aba182ab86debeea78f647be382",
+    "records": [],
+    "review_round": 20,
+    "validation_set_digest": "8b355b8348e6b4ff81940eb87fad98a8cf126c67aa7cd785b28f9be771e29e82"
+  },
+  "review_history": [
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R1-F1",
+          "required_resolution": "resolve problem 1-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R1-F2",
+          "required_resolution": "resolve problem 1-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R1-F3",
+          "required_resolution": "resolve problem 1-3"
+        }
+      ],
+      "fingerprint": "168c00ab748f6f42",
+      "resolutions": [
+        "a62360a1888b2c5a",
+        "e537f5cf3b90d81a",
+        "e8ab2d0894bd515b"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 1
+    },
+    {
+      "finding_count": 4,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R2-F1",
+          "required_resolution": "resolve problem 2-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R2-F2",
+          "required_resolution": "resolve problem 2-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R2-F3",
+          "required_resolution": "resolve problem 2-3"
+        },
+        {
+          "classification": "nit",
+          "id": "R2-F4",
+          "required_resolution": "resolve problem 2-4"
+        }
+      ],
+      "fingerprint": "91c02e86463f7c6f",
+      "resolutions": [
+        "137285d10cdb0e7d",
+        "242dd947cd3c8a08",
+        "40a6378d877e096a",
+        "b01e74fc2fd4a13b"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 2
+    },
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R3-F1",
+          "required_resolution": "resolve problem 3-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R3-F2",
+          "required_resolution": "resolve problem 3-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R3-F3",
+          "required_resolution": "resolve problem 3-3"
+        }
+      ],
+      "fingerprint": "362d7d74b0090d27",
+      "resolutions": [
+        "32b2bb5dad3f0bd6",
+        "5265a2c26510ed55",
+        "aa1a7820b396d5fe"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 3
+    },
+    {
+      "finding_count": 4,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R4-F1",
+          "required_resolution": "resolve problem 4-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R4-F2",
+          "required_resolution": "resolve problem 4-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R4-F3",
+          "required_resolution": "resolve problem 4-3"
+        },
+        {
+          "classification": "nit",
+          "id": "R4-F4",
+          "required_resolution": "resolve problem 4-4"
+        }
+      ],
+      "fingerprint": "cad18df794b840e8",
+      "resolutions": [
+        "0107b621340bde57",
+        "5196278bb4a92ac9",
+        "da87b9ee7b261292",
+        "f74454d881aff9ec"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 4
+    },
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R5-F1",
+          "required_resolution": "resolve problem 5-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R5-F2",
+          "required_resolution": "resolve problem 5-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R5-F3",
+          "required_resolution": "resolve problem 5-3"
+        }
+      ],
+      "fingerprint": "f9c8bbfdc42ea108",
+      "resolutions": [
+        "2758cd06ac5c5b61",
+        "2a9261bd2240c5f8",
+        "eac2f411f2fef805"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 5
+    },
+    {
+      "finding_count": 4,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R6-F1",
+          "required_resolution": "resolve problem 6-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R6-F2",
+          "required_resolution": "resolve problem 6-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R6-F3",
+          "required_resolution": "resolve problem 6-3"
+        },
+        {
+          "classification": "nit",
+          "id": "R6-F4",
+          "required_resolution": "resolve problem 6-4"
+        }
+      ],
+      "fingerprint": "ddae45153bd1851b",
+      "resolutions": [
+        "195fb6451f52f44b",
+        "2fcff7d1186cdf93",
+        "45f8254c0dad2f90",
+        "71843473503f2992"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 6
+    },
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R7-F1",
+          "required_resolution": "resolve problem 7-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R7-F2",
+          "required_resolution": "resolve problem 7-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R7-F3",
+          "required_resolution": "resolve problem 7-3"
+        }
+      ],
+      "fingerprint": "15e69013de9665bb",
+      "resolutions": [
+        "4c4c22909e8d1150",
+        "ab6aa6c3883c4f77",
+        "c6a51695fa9c8961"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 7
+    },
+    {
+      "finding_count": 4,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R8-F1",
+          "required_resolution": "resolve problem 8-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R8-F2",
+          "required_resolution": "resolve problem 8-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R8-F3",
+          "required_resolution": "resolve problem 8-3"
+        },
+        {
+          "classification": "nit",
+          "id": "R8-F4",
+          "required_resolution": "resolve problem 8-4"
+        }
+      ],
+      "fingerprint": "e6862c9002c07556",
+      "resolutions": [
+        "7e1e9d52946271dc",
+        "8c36ea00155fd347",
+        "bec404eb2516438d",
+        "f85ffcb4f523de65"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 8
+    },
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R9-F1",
+          "required_resolution": "resolve problem 9-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R9-F2",
+          "required_resolution": "resolve problem 9-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R9-F3",
+          "required_resolution": "resolve problem 9-3"
+        }
+      ],
+      "fingerprint": "45b04e6c7e576205",
+      "resolutions": [
+        "60b7e85469bbab90",
+        "69a3f411e8109d51",
+        "ab81b4a493865cc5"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 9
+    },
+    {
+      "finding_count": 4,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R10-F1",
+          "required_resolution": "resolve problem 10-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R10-F2",
+          "required_resolution": "resolve problem 10-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R10-F3",
+          "required_resolution": "resolve problem 10-3"
+        },
+        {
+          "classification": "nit",
+          "id": "R10-F4",
+          "required_resolution": "resolve problem 10-4"
+        }
+      ],
+      "fingerprint": "0f44edd3c9b00fe1",
+      "resolutions": [
+        "02932f6ec14c0dfb",
+        "a6ec03374d2f3692",
+        "b595bc05c2826b8c",
+        "d526448c38e834de"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 10
+    },
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R11-F1",
+          "required_resolution": "resolve problem 11-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R11-F2",
+          "required_resolution": "resolve problem 11-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R11-F3",
+          "required_resolution": "resolve problem 11-3"
+        }
+      ],
+      "fingerprint": "ecea763c77499bd6",
+      "resolutions": [
+        "3d965ba720483c3d",
+        "7940556c0ea60e29",
+        "adfb35947043eb19"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 11
+    },
+    {
+      "finding_count": 4,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R12-F1",
+          "required_resolution": "resolve problem 12-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R12-F2",
+          "required_resolution": "resolve problem 12-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R12-F3",
+          "required_resolution": "resolve problem 12-3"
+        },
+        {
+          "classification": "nit",
+          "id": "R12-F4",
+          "required_resolution": "resolve problem 12-4"
+        }
+      ],
+      "fingerprint": "596f029654f992ea",
+      "resolutions": [
+        "32ed6729cccb53e5",
+        "8840a05ad7cb8121",
+        "a8ee81af4d8ef184",
+        "ce832cdbe3bcd1d9"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 12
+    },
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R13-F1",
+          "required_resolution": "resolve problem 13-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R13-F2",
+          "required_resolution": "resolve problem 13-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R13-F3",
+          "required_resolution": "resolve problem 13-3"
+        }
+      ],
+      "fingerprint": "3c6c8337940e2b08",
+      "resolutions": [
+        "16cf5f562a2a38a3",
+        "c3a335c1178e833c",
+        "da2311dd3370eb2a"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 13
+    },
+    {
+      "finding_count": 4,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R14-F1",
+          "required_resolution": "resolve problem 14-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R14-F2",
+          "required_resolution": "resolve problem 14-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R14-F3",
+          "required_resolution": "resolve problem 14-3"
+        },
+        {
+          "classification": "nit",
+          "id": "R14-F4",
+          "required_resolution": "resolve problem 14-4"
+        }
+      ],
+      "fingerprint": "06788bfa616509bd",
+      "resolutions": [
+        "18caf4fc4a619bd4",
+        "2d4171edd7d2a49f",
+        "95fd3d977265c78b",
+        "f499c8984dc14b2d"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 14
+    },
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R15-F1",
+          "required_resolution": "resolve problem 15-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R15-F2",
+          "required_resolution": "resolve problem 15-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R15-F3",
+          "required_resolution": "resolve problem 15-3"
+        }
+      ],
+      "fingerprint": "74a5011dc51a2d0d",
+      "resolutions": [
+        "0a32c0bb98477e29",
+        "ce7c15b23853fc1e",
+        "ee3f6a648b4650cf"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 15
+    },
+    {
+      "finding_count": 4,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R16-F1",
+          "required_resolution": "resolve problem 16-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R16-F2",
+          "required_resolution": "resolve problem 16-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R16-F3",
+          "required_resolution": "resolve problem 16-3"
+        },
+        {
+          "classification": "nit",
+          "id": "R16-F4",
+          "required_resolution": "resolve problem 16-4"
+        }
+      ],
+      "fingerprint": "d2dcd711211878f5",
+      "resolutions": [
+        "3d11ff6ffb6da640",
+        "504956f7cf2358e8",
+        "632e5b925a9e774a",
+        "756960b36903cbf3"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 16
+    },
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R17-F1",
+          "required_resolution": "resolve problem 17-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R17-F2",
+          "required_resolution": "resolve problem 17-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R17-F3",
+          "required_resolution": "resolve problem 17-3"
+        }
+      ],
+      "fingerprint": "63d487093eb85664",
+      "resolutions": [
+        "64a84b30ba7e54ba",
+        "949e36a4682b95cc",
+        "b2df3f14a08d60a6"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 17
+    },
+    {
+      "finding_count": 4,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R18-F1",
+          "required_resolution": "resolve problem 18-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R18-F2",
+          "required_resolution": "resolve problem 18-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R18-F3",
+          "required_resolution": "resolve problem 18-3"
+        },
+        {
+          "classification": "nit",
+          "id": "R18-F4",
+          "required_resolution": "resolve problem 18-4"
+        }
+      ],
+      "fingerprint": "d4a76fc692f71685",
+      "resolutions": [
+        "6dc28e6dddb66597",
+        "959b000c5de81f0a",
+        "a647a25702b285f9",
+        "dc04e13c25ae16da"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 18
+    },
+    {
+      "finding_count": 3,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R19-F1",
+          "required_resolution": "resolve problem 19-1"
+        },
+        {
+          "classification": "nit",
+          "id": "R19-F2",
+          "required_resolution": "resolve problem 19-2"
+        },
+        {
+          "classification": "nit",
+          "id": "R19-F3",
+          "required_resolution": "resolve problem 19-3"
+        }
+      ],
+      "fingerprint": "e488f6d90097120a",
+      "resolutions": [
+        "23d11c06ce57ca86",
+        "63b43dcfed990fca",
+        "979b652ece72bfb9"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "round": 19
+    },
+    {
+      "finding_count": 1,
+      "findings": [
+        {
+          "classification": "nit",
+          "id": "R20-F1",
+          "required_resolution": "x"
+        }
+      ],
+      "fingerprint": "2d711642b726b044",
+      "resolutions": [
+        "2d711642b726b044"
+      ],
+      "resolutions_truncated": false,
+      "result": "needs_fix",
+      "review_comment_url": "https://github.com/owner/repo/pull/42#issuecomment-950001",
+      "reviewed_head_sha": "507962f032fd25138cfb240531516d31aac3b20e",
+      "round": 20,
+      "timestamp": "2026-10-31T10:31:42.739360+00:00"
+    }
+  ],
+  "review_round": 20,
+  "reviewed_base_ref": "main",
+  "reviewed_head_sha": "507962f032fd25138cfb240531516d31aac3b20e",
+  "reviewed_merge_base_sha": "5614942b1c790d4d3f2d4e883b96baa2989addf0",
+  "reviewed_pr_url": "https://github.com/owner/repo/pull/42",
+  "reviewed_workspace_fingerprint": "",
+  "run_id": "af-20261031T103142Z-21d67c",
+  "sandbox_pin": {},
+  "step_count": 2,
+  "superseded_prs": [],
+  "unblock_history": [],
+  "updated_at": "2026-10-31T10:31:42.886972+00:00",
+  "validation_attempt": {},
+  "validation_override_seq": null,
+  "validation_records": [],
+  "verification_failures": [],
+  "workspace_fingerprint": ""
+}

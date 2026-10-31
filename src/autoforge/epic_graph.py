@@ -19,6 +19,9 @@ never traversed (D3.1, D3.2).
   de-duplicated by issue ``id`` (D3.6). A child whose summary reports no
   blocker is not queried, nor is a closed child, whose blockers decide
   nothing.
+* :func:`read_children` is the child listing alone, complete or refused
+  by the same rules; a sequential run's UPDATE_EPIC reads it before it
+  takes the EPIC as complete (#287).
 * :func:`evaluate` is pure (D4.1, D4.2, D2.5): a snapshot and the local
   facts give one :class:`ChildVerdict` per child, from the closed
   vocabulary ``ready``, ``closed``, ``blocked``, ``unsupported:<shape>``,
@@ -303,6 +306,57 @@ def _blocker_order(blocker: BlockerNode) -> tuple[int, str, int, int]:
     return (1, "", 0, blocker.id)
 
 
+def read_children(
+    client: GraphReader, epic_ref: GitHubIssueRef, epic: IssueNode
+) -> tuple[IssueNode, ...]:
+    """The EPIC's direct sub-issues, complete or refused (D3.3, D3.4, D3.6), by number.
+
+    ``epic`` is the EPIC's node as just read for ``epic_ref``. The listing
+    must hold exactly the ``sub_issues_summary.total`` the node reports,
+    within GitHub's bound, de-duplicated by ``id``, each row naming the EPIC
+    as its parent: :func:`~autoforge.github.GitHubClient.list_sub_issues`
+    leaves out a child the token may not read, and only this comparison
+    says one is missing. Anything less raises
+    :class:`~autoforge.errors.SnapshotRefused` (``read-failed``,
+    ``children-bound``, ``children-count`` or ``inconsistent``). The
+    snapshot reads its children through this, and so does a sequential
+    run's UPDATE_EPIC before it takes the EPIC as complete (#287).
+    """
+    if epic.sub_issues_total > MAX_SUB_ISSUES:
+        raise _refuse(
+            epic_ref,
+            "children-bound",
+            f"the EPIC reports {epic.sub_issues_total} sub-issues, over the bound of "
+            f"{MAX_SUB_ISSUES}",
+        )
+    rows = _read(epic_ref, "the sub-issue listing", lambda: client.list_sub_issues(epic.url))
+    children = _distinct(rows, epic_ref, "the sub-issue listing")
+    if len(children) > MAX_SUB_ISSUES:
+        raise _refuse(
+            epic_ref,
+            "children-bound",
+            f"the sub-issue listing holds {len(children)} issues, over the bound of "
+            f"{MAX_SUB_ISSUES}",
+        )
+    if len(children) != epic.sub_issues_total:
+        raise _refuse(
+            epic_ref,
+            "children-count",
+            f"the sub-issue listing holds {len(children)} distinct issues but the EPIC reports "
+            f"{epic.sub_issues_total}",
+        )
+    for child in children:
+        if child.id == epic.id or child.parent is None or not child.parent.same_target(epic.ref):
+            label = _issue_label(child.repository, child.number, epic.repository)
+            parent = child.parent.canonical if child.parent is not None else "none"
+            raise _refuse(
+                epic_ref,
+                "inconsistent",
+                f"the sub-issue listing holds {label}, whose parent is {parent}",
+            )
+    return tuple(sorted(children, key=_child_order))
+
+
 def build_epic_snapshot(
     client: GraphReader,
     epic_url: str,
@@ -343,39 +397,7 @@ def build_epic_snapshot(
             f"the EPIC is {epic.state} ({epic.state_reason or 'no reason'})",
         )
 
-    if epic.sub_issues_total > MAX_SUB_ISSUES:
-        raise _refuse(
-            epic_ref,
-            "children-bound",
-            f"the EPIC reports {epic.sub_issues_total} sub-issues, over the bound of "
-            f"{MAX_SUB_ISSUES}",
-        )
-    rows = _read(epic_ref, "the sub-issue listing", lambda: client.list_sub_issues(epic.url))
-    children = _distinct(rows, epic_ref, "the sub-issue listing")
-    if len(children) > MAX_SUB_ISSUES:
-        raise _refuse(
-            epic_ref,
-            "children-bound",
-            f"the sub-issue listing holds {len(children)} issues, over the bound of "
-            f"{MAX_SUB_ISSUES}",
-        )
-    if len(children) != epic.sub_issues_total:
-        raise _refuse(
-            epic_ref,
-            "children-count",
-            f"the sub-issue listing holds {len(children)} distinct issues but the EPIC reports "
-            f"{epic.sub_issues_total}",
-        )
-    for child in children:
-        if child.id == epic.id or child.parent is None or not child.parent.same_target(epic.ref):
-            label = _issue_label(child.repository, child.number, epic.repository)
-            parent = child.parent.canonical if child.parent is not None else "none"
-            raise _refuse(
-                epic_ref,
-                "inconsistent",
-                f"the sub-issue listing holds {label}, whose parent is {parent}",
-            )
-    children = tuple(sorted(children, key=_child_order))
+    children = read_children(client, epic_ref, epic)
 
     edges: list[Edge] = []
     for child in children:

@@ -54,7 +54,6 @@ from autoforge.interaction import (
     InteractionOutcome,
     InteractionRequest,
     Lifecycle,
-    LocalBinding,
     Pause,
     Question,
     QuestionOption,
@@ -81,7 +80,7 @@ from autoforge.sdk_policy import (
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 
-from .conftest import commit_all, git_repo, implement, make_engine, make_local_engine, write_feature
+from .conftest import implement, make_engine
 
 TOKEN = "ghp_" + "a1B2" * 9
 DIGEST = input_digest({"command": "make test"}, "a test input")
@@ -431,7 +430,6 @@ def test_a_session_identity_is_equal_only_to_one_that_binds_the_same_session():
         {"policy_digest": "c" * 64},
         {"session_root": "/state/sdk/b"},
         {"workflow": RemoteBinding("owner/repo", 134, "ANALYZE_EXECUTE", 2, 0)},
-        {"workflow": LocalBinding("/repo/.git/autoforge/state", "ANALYZE_EXECUTE", 1)},
     ):
         assert _identity(**change) != _identity()
 
@@ -445,8 +443,6 @@ def test_a_session_identity_is_equal_only_to_one_that_binds_the_same_session():
         (lambda: _identity(workflow={"issue": 1}), "no known mode"),
         (lambda: RemoteBinding("owner/repo", 0, "FIX", 1, 0), "at least 1"),
         (lambda: RemoteBinding("o/r", 1, "FIX", 1, 0, head_sha="abc"), "full commit id"),
-        (lambda: LocalBinding("/state", "FIX", True), "at least 1"),
-        (lambda: LocalBinding("state", "FIX", 1), "absolute path"),
     ],
 )
 def test_a_session_identity_that_could_not_be_compared_exactly_is_refused(build, rule):
@@ -1989,23 +1985,6 @@ def test_an_interrupted_turn_is_a_failed_launch_and_not_relaunched(tmp_state_dir
         eng.step()
     assert not isinstance(excinfo.value, InteractionRequiredError)
     assert len(provider.calls) == 1
-
-
-def test_a_local_interaction_failure_keeps_the_launch_charge(tmp_path):
-    root = git_repo(tmp_path)
-    (root / "src").mkdir(exist_ok=True)
-    (root / "src" / "app.py").write_text("def main():\n    pass\n", encoding="utf-8")
-    write_feature(root)
-    commit_all(root, "initial")
-    eng = make_local_engine(root, "features/add-filter.md")
-    eng.step()  # INITIALIZING -> ANALYZE_EXECUTE
-    provider = _Asking("", FAIL)
-    _install(eng, provider)
-    with pytest.raises(InteractionRequiredError, match="interaction_policy is fail"):
-        eng.step()
-    assert len(provider.calls) == 1
-    persisted = load_state(eng.paths.state_file)
-    assert persisted.phase == Phase.ANALYZE_EXECUTE and persisted.local_pending_attempts == 1
 
 
 def test_a_dry_run_creates_no_broker_and_asks_no_one(tmp_state_dir, fake_github):

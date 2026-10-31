@@ -351,6 +351,33 @@ def test_the_dist_check_fails_a_wheel_without_a_template(tmp_path: Path):
         dist_check.check_wheel(_wheel(tmp_path, drop="autoforge/prompts/review.md"), STEM, DATA)
 
 
+def test_no_artifact_carries_a_local_prompt_template(tmp_path: Path):
+    """ADR 0009 D12 S3 (#388): the wheel and the sdist carry no ``local_*.md``.
+
+    What the package declares holds none, so the wheel built from this
+    commit, which ``check_wheel`` holds to exactly that set, holds none; and
+    the dist check refuses a wheel or an sdist that carries one anyway, as
+    a stray file would be refused, but naming LOCAL.
+    """
+    assert dist_check.local_templates(dist_check.wheel_package_files()) == []
+    assert not list(prompts.prompts_dir().glob("local_*.md"))
+    assert [name for name in prompts.TEMPLATE_FILES if name.startswith("local_")] == []
+    wheel = _wheel(tmp_path)
+    with zipfile.ZipFile(wheel) as archive:
+        assert dist_check.local_templates(archive.namelist()) == []
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr("autoforge/prompts/local_common.md", "# LOCAL\n")
+    with pytest.raises(
+        CheckFailed, match=r"LOCAL prompt templates: \['autoforge/prompts/local_common.md'\]"
+    ):
+        dist_check.check_wheel(wheel, STEM, DATA)
+    sdist = _sdist(tmp_path, extra="src/autoforge/prompts/local_review.md")
+    with pytest.raises(
+        CheckFailed, match=r"LOCAL prompt templates: \['src/autoforge/prompts/local_review.md'\]"
+    ):
+        dist_check.check_sdist(sdist, STEM, DATA)
+
+
 def test_the_dist_check_fails_an_sdist_without_a_template_or_with_a_stray_file(tmp_path: Path):
     with pytest.raises(CheckFailed, match=r"missing \['src/autoforge/prompts/fix.md'\]"):
         dist_check.check_sdist(_sdist(tmp_path, drop="autoforge/prompts/fix.md"), STEM, DATA)

@@ -28,16 +28,15 @@ or under the outer sandbox.
 ## What AutoForge protects
 
 - **No GitHub credential reaches an agent or a repository command through
-  anything AutoForge controls.** Agents, LOCAL validation commands
-  (`local.validation_commands`), REMOTE candidate validation commands
+  anything AutoForge controls.** Agents, candidate validation commands
   (`validation.commands`) and pre-merge commands
   (`merge.verification_commands`) start from an allow-listed environment
   in which no variable `gh` or git reads a credential from can be listed,
-  an empty
-  `gh` configuration, a placeholder `GH_TOKEN`, a git configuration that
-  switches off credential helpers, askpass, the SSH agent and SSH keys, an
-  empty curl and wget configuration, and shells that read none of your
-  startup files; the provider CLIs load no MCP server, plugin or hook. A
+  an empty `gh` configuration, a placeholder `GH_TOKEN`, a git
+  configuration that switches off credential helpers, askpass, the SSH
+  agent and SSH keys, an empty curl and wget configuration, and shells
+  that read none of your startup files; the provider CLIs load no MCP
+  server, plugin or hook. A
   launch is refused, before anything is saved or charged, while a
   repository git setting, `~/.netrc`, a login shell's startup file, a
   Claude Code settings file or an organization connected to OpenCode would
@@ -152,10 +151,13 @@ machine and to reading your model keys, SSH keys or `gh` credential file
 credential the redaction baseline recognises, forge a controller marker,
 close an issue or merge. Two choices are an agent's and so can be
 steered: whether a review has findings, and, in a sequential EPIC run,
-which open issue of the repository `UPDATE_EPIC` picks next (any open
-issue, not only one the EPIC lists, so on a public repository possibly one
-a stranger opened). `autoforge epic run` admits only the EPIC's own
-sub-issues.
+which of the EPIC's open sub-issues `UPDATE_EPIC` picks next. The
+controller refuses a next issue that GitHub does not list as a native
+sub-issue of the EPIC, or that has sub-issues of its own, which is the
+rule `autoforge epic run` admits by. A stranger's issue becomes a
+candidate only once someone allowed to change the EPIC's sub-issues adds
+it; mentioning it in the EPIC body is not enough. The run's first issue
+is the one you name.
 
 ### The outer sandbox is opt-in and Linux-only
 
@@ -169,9 +171,8 @@ enforced, an agent still runs as your UID, keeps the host network (loopback
 services included) and can read the model credential its provider is
 given. There is no sandbox on macOS.
 
-Every enforced launch writes a tree of the repository: the repository root
-in LOCAL mode, the issue's agent worktree in REMOTE mode, and the
-repository's sandbox directories in both. A launch also writes the
+Every enforced launch writes a tree of the repository: the issue's agent
+worktree, and the repository's sandbox directories. A launch also writes the
 directory its provider is given read-write, which lies wherever you put
 it and outlives the launch: a dedicated `CLAUDE_CONFIG_DIR`,
 `PI_CODING_AGENT_DIR` or OpenCode database directory (`OPENCODE_DB`'s).
@@ -203,9 +204,8 @@ run, and `doctor`, from the same environment.
 
 A run is also pinned to the `sandbox.mode` it was created under. A later
 `step`, `resume` or `unblock` under a weaker mode is refused before
-anything runs: `required` to `preferred` or `disabled` in LOCAL mode, and
-`required` or `preferred` to `disabled` in REMOTE mode, where `preferred`
-is `required`. That includes a command run without the run's `--config`,
+anything runs: `required` or `preferred` (an alias of `required`) to
+`disabled`. That includes a command run without the run's `--config`,
 which falls back to the built-in `disabled`. To continue under the weaker
 mode anyway, repeat the command with `--accept-config-change`: the change
 is written to the run log first, and the run is pinned to the new mode.
@@ -258,11 +258,10 @@ repository's default `GITHUB_TOKEN` permissions to read-only.
   and `CLAUDE_*` for Claude Code; `OPENCODE_*`, `OPENAI_*`, `ANTHROPIC_*`,
   `GEMINI_*` and `GOOGLE_*` for OpenCode.
   ([Configuration: agent environment](configuration.md#agent-environment))
-- **Repository commands are the PR's code.** `validation.commands`,
-  `local.validation_commands` and `merge.verification_commands` come from
-  your configuration, but what they run (tests, build scripts) is the
-  candidate's own code, with your user, the allow-listed environment and,
-  by default, the host network.
+- **Repository commands are the PR's code.** `validation.commands` and
+  `merge.verification_commands` come from your configuration, but what
+  they run (tests, build scripts) is the candidate's own code, with your
+  user, the allow-listed environment and, by default, the host network.
 - **The committed tree is not filtered.** Only commit messages are checked;
   review and you own what a PR changes.
 - **Same-user state.** An agent under `disabled` can change the
@@ -305,7 +304,9 @@ The Critical and High ones block the Public Alpha release until they are
 fixed ([#255](https://github.com/iceboundrock/AutoForge/issues/255)); until
 then, apply the mitigation in the last column. A row marked *Fixed in
 `0.1.0a0`* describes `main` after its fix, which every release from
-`0.1.0a0` on carries; its last column says what still applies.
+`0.1.0a0` on carries; its last column says what still applies. A row
+marked *Fixed after `0.1.0a0`* describes `main` after a fix that no
+release carries yet.
 
 | Issue | Severity | What happens today | Until it is fixed |
 |---|---|---|---|
@@ -316,7 +317,7 @@ then, apply the mitigation in the last column. A row marked *Fixed in
 | [#284](https://github.com/iceboundrock/AutoForge/issues/284) | High | *Fixed in `0.1.0a0`.* A recognised token directly after an ANSI escape sequence (`ESC[0m`, which OpenCode's saved `stderr.log` carries), a backslash escape written out (`\n`, `\t`, `\uXXXX`) or any other character that cannot be part of it is redacted in the run logs, state and the CLI's output, and refused in published text | Redaction is still a baseline ([why](#redaction-is-a-baseline)): treat run logs as sensitive and never commit or share them ([how](#keep-autoforges-files-out-of-git)) |
 | [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | Other credential shapes are not recognised: AWS access keys, private-key blocks, `gsk_`, `xai-`, `npm_`, `glpat-`, `hf_`, and a key of no known shape under a prefixed name such as `GEMINI_API_KEY` | As for #282 |
 | [#286](https://github.com/iceboundrock/AutoForge/issues/286) | Medium | One allow-list serves every launch, and it refuses only the names `gh` and git read a credential from ([why](#other-limits)) | List no variable you would not give to the agents and to the code under review alike |
-| [#287](https://github.com/iceboundrock/AutoForge/issues/287) | Medium | In a sequential EPIC run, `UPDATE_EPIC` may pick any open issue of the repository next, on a public repository possibly one a stranger opened | Prefer `autoforge epic run`, which admits only the EPIC's sub-issues |
+| [#287](https://github.com/iceboundrock/AutoForge/issues/287) | Medium | *Fixed after `0.1.0a0`.* In a sequential EPIC run, `UPDATE_EPIC`'s next issue must be a native sub-issue of the EPIC with no sub-issues of its own, as `autoforge epic run` admits; any other selection, an issue the EPIC body only mentions included, is refused and asked again once, then `BLOCKED`. In `0.1.0a0` it could be any open issue of the repository, on a public repository possibly one a stranger opened | On `0.1.0a0`, prefer `autoforge epic run`. On `main`, an issue becomes selectable once someone adds it as a sub-issue of the EPIC: add only issues you would hand to an agent ([why](#prompt-injection-and-public-repositories-in-particular)) |
 | [#289](https://github.com/iceboundrock/AutoForge/issues/289) | Medium | *Fixed in `0.1.0a0`.* The merge gate refuses an empty check rollup, and one in which no check succeeded, under every configuration, `safety.verify_check_definition: false` and an empty `safety.required_checks` included; `doctor` names a GitHub Free plan restriction as the plan, never as a token permission, and its required-check row fails while `safety.allow_merge: true` and the requirement cannot be verified (the plan, a token without access, not found, a transient failure, or a hidden bypass list with no word on this token) | A branch rule is still what makes a check *required*: with the gate open, keep both settings at their defaults and a CI check required ([why](#check-runs-on-a-private-repository)) |
 | [#291](https://github.com/iceboundrock/AutoForge/issues/291) | Medium | *Fixed in `0.1.0a0`.* With a fine-grained token on a private repository whose pull requests have checks, REVIEW and FIX now run without the check results (the reviewer is told they are unknown), the merge gate blocks with a reason naming the credential and its remedy, and `doctor`'s "pull request check runs readable" row reports it | With the merge gate open, use `gh auth login` or a classic token with `repo` there ([why](#check-runs-on-a-private-repository)) |
 

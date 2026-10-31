@@ -7,7 +7,7 @@ routing, the REVIEW/FIX loop bounds, stagnation detection, replan *policy*
 [replan-transaction.md](replan-transaction.md).
 
 Owning code: `src/autoforge/transitions.py` (phases, `LEGAL_EDGES`,
-`LOCAL_LEGAL_EDGES`, `decide_next_phase`), `src/autoforge/engine.py` (phase
+`decide_next_phase`), `src/autoforge/engine.py` (phase
 orchestration), `src/autoforge/profiles.py` (routing), `src/autoforge/loop_guard.py`
 (loop bounds and stagnation), `src/autoforge/replan.py` (replan policy). The
 edge tables in `transitions.py` are the authoritative list of legal edges,
@@ -64,7 +64,7 @@ REVIEW -> READY_FOR_MERGE     when needs_fix_round == false
 phase where the controller closes an open PR, so a second edge in or out would
 be a second way into that destructive step.
 
-`REVIEW -> READY_FOR_MERGE` (and LOCAL `REVIEW -> DONE`) is taken only in the
+`REVIEW -> READY_FOR_MERGE` is taken only in the
 write that issues the round's review certificate (**Candidate validation
 gates** below); a clean round that gets none blocks instead.
 
@@ -76,8 +76,8 @@ READY_FOR_MERGE -> MERGE      after controller-side pre-merge verification
 READY_FOR_MERGE -> REVIEW     reviewed revision drifted
 MERGE -> UPDATE_EPIC          only after gh reports the PR as MERGED
 MERGE -> REVIEW               reviewed revision drifted
-UPDATE_EPIC -> ANALYZE_EXECUTE  next issue verified
-UPDATE_EPIC -> DONE           agent reports no next issue (null)
+UPDATE_EPIC -> ANALYZE_EXECUTE  next issue verified, a sub-issue of the EPIC
+UPDATE_EPIC -> DONE           agent reports no next issue (null), and none remains on GitHub
 ```
 
 `MERGE -> ANALYZE_EXECUTE` and `MERGE -> DONE` are declared in `LEGAL_EDGES`
@@ -93,8 +93,8 @@ BLOCKED -> ANALYZE_EXECUTE | REVIEW | FIX | READY_FOR_MERGE | UPDATE_EPIC
 ```
 
 `BLOCKED -> REPLAN_REEXECUTE` is deliberately absent (see the edge rule
-above); `DONE` and `FAILED` have no outgoing edges; the LOCAL table has no
-unblock edge. See **Leaving BLOCKED** below.
+above); `DONE` and `FAILED` have no outgoing edges. See **Leaving BLOCKED**
+below.
 
 Illegal transitions must fail explicitly. Do not silently coerce an invalid state into a valid one.
 
@@ -220,13 +220,11 @@ transition:
 ## Candidate validation gates
 
 ADR 0006 §2.5 (#173): the controller's own validation commands
-(`validation.commands` in REMOTE, `local.validation_commands` in LOCAL) gate
-the existing transitions; they add no phase and no edge. Every gate decides
+(`validation.commands`) gate the existing transitions; they add no phase and no edge. Every gate decides
 from one eligibility rule (`evidence.eligible`): a record is evidence for a
 definition of a candidate when it is applicable (the candidate's identity,
 the definition's digest at its index, policy P's digest, enforcement where P
-requires it) and is a `PASS` (in LOCAL, one that ended on the tree it
-started on), or a `FAIL` or `TIMEOUT` above the override watermark, which is
+requires it) and is a `PASS`, or a `FAIL` or `TIMEOUT` above the override watermark, which is
 terminal and reused rather than run again. `INTERRUPTED` never is. A set
 stops at its first non-`PASS`.
 
@@ -273,44 +271,31 @@ stops at its first non-`PASS`.
   `needs_fix_round: false` while a presented record is not `PASS` is refused
   in the correction loop, before anything is published; at the correction
   bound it is the usual `ControlResultValidationError` and the phase stays.
-- **LOCAL** (D7.2, D5.7). The write phases run the set in place and must
-  converge: a passing command that changed covered bytes (F0 -> F1) causes
-  one confirming run of the set from F1, reusing what already ran on F1 and
-  stayed there; anything but ending on F1 with every command passing is
-  "not verified" naming `local.exclude` as the remedy. A tree with a
-  terminal `FAIL` is not run again while it is unchanged. LOCAL `REVIEW`
-  runs nothing: it binds the evidence the write phase recorded for the
-  bound fingerprint, and a run with none (state from before the records
-  existed) blocks: "no validation evidence for this LOCAL run; start a new
-  local run".
-- **The override watermark** is the operator's: only an applied REMOTE
+- **The override watermark** is the operator's: only an applied
   unblock sets it (**Leaving BLOCKED** below).
 - **The review certificate** (ADR 0006 §2.12, #174; `certificate.py`). A
   clean round's write issues a `review_certificate` in the same save that
-  enters `READY_FOR_MERGE` (REMOTE, the #162 journal completion included)
-  or `DONE` (LOCAL, with no `gh` call). Issuance is a pure function of
-  persisted inputs (D12.2): the candidate, the records, and the set and
-  policy digests are copied from the round's `review_evidence` binding, the
-  REMOTE review binding (PR, HEAD, base, merge base) and comment (URL, id,
-  marker key) from the round just recorded, and the LOCAL reviewed
-  fingerprint from the binding the round was judged on. A binding of
-  another round, a named record that is not `PASS`, a candidate that is not
-  the reviewed HEAD's commit (REMOTE) or workspace (LOCAL), or a
-  certificate that would not load issues nothing and blocks: these are
-  invariant violations, never a reason to enter `READY_FOR_MERGE` or
-  `DONE`. A set or policy that changed after the reviewer was presented its
-  evidence (D12.6) still issues the certificate from the binding, so it
-  states what the review was presented under, and blocks naming the
-  change; a REMOTE `unblock` decides from it (below), and a LOCAL run,
-  which has no unblock, starts again. `certificate.certificate_problem`
-  decides applicability from the state, the configured set and policy and,
-  for REMOTE, an optional live revision, with no I/O: the kind of the run's
-  mode, its digest, the load checks, the state's round and that its last
-  review result is still `clean` (an observed push, retarget or rewritten
-  base marks the round `stale` without moving its binding, #175), review
-  binding, comment and candidate (LOCAL, the reviewed fingerprint under
-  this run's contract), the set and policy in force, every named record
-  still eligible, and the live PR, HEAD, base and merge base. A certificate
+  enters `READY_FOR_MERGE` (the #162 journal completion included).
+  Issuance is a pure function of persisted inputs (D12.2): the candidate,
+  the records, and the set and policy digests are copied from the round's
+  `review_evidence` binding, and the review binding (PR, HEAD, base, merge
+  base) and comment (URL, id, marker key) from the round just recorded. A
+  binding of another round, a named record that is not `PASS`, a candidate
+  that is not the reviewed HEAD's commit, or a certificate that would not
+  load issues nothing and blocks: these are invariant violations, never a
+  reason to enter `READY_FOR_MERGE`. A set or policy that changed after
+  the reviewer was presented its evidence (D12.6) still issues the
+  certificate from the binding, so it states what the review was presented
+  under, and blocks naming the change; `unblock` decides from it (below).
+  `certificate.certificate_problem` decides applicability from the state,
+  the configured set and policy and an optional live revision, with no
+  I/O: the certificate's kind (`remote`; any other kind is refused as
+  unknown, ADR 0009 D6), its digest, the load checks, the state's round
+  and that its last review result is still `clean` (an observed push,
+  retarget or rewritten base marks the round `stale` without moving its
+  binding, #175), review binding, comment and candidate, the set and
+  policy in force, every named record still eligible, and the live PR,
+  HEAD, base and merge base. A certificate
   is never shown to an agent or published (D1.3), and it is not a merge
   permission (D1.2): the merge gate re-reads every fact it decides on from
   GitHub, and the certificate is one more prerequisite of it (below). A
@@ -495,7 +480,7 @@ its profile routing and its agent worktree root (#219,
 re-entry under another model or in another, empty worktree is not the same
 phase continued, so a difference refuses before anything runs, unless the
 operator accepts it with `--accept-config-change`, which the run log
-records. Every run, LOCAL included, is also held to the `sandbox.mode` it
+records. Every run is also held to the `sandbox.mode` it
 is pinned to: a weaker one is refused the same way, with the same opt-in
 (#280). The engine cannot tell a first entry from a re-entry after an
 interrupted step (timeout, non-zero exit, malformed result, verification
@@ -518,7 +503,7 @@ provider (`transient_failure`, #164; today an OpenCode `openai/*` run whose
 run-level errors are all `WebSocket closed with code 1000` or `1008` or
 OpenAI's generic `server_error` message, #226, and a Claude Code run whose
 turn ended on a model API error with status 408 or 5xx, #395) is relaunched
-inside the current REMOTE step, at most `MAX_TRANSIENT_RETRIES` (2) times.
+inside the current step, at most `MAX_TRANSIENT_RETRIES` (2) times.
 That budget belongs to the step: it is counted apart from the CONTROL_RESULT
 corrections and is not refilled by them, so one step launches at most
 `1 + execution.max_correction_attempts + 2` agents. Each relaunch is a
@@ -526,8 +511,7 @@ re-entry like a correction: the checkout check and then the phase-entry
 reconciliation run first, and either may block (or the reconciliation
 resolve) the phase instead. A launch that may have left a process running is
 not relaunched. Exhausting the budget fails the step like any other failed
-exit, with the phase unchanged for `resume`. LOCAL runs never relaunch a
-transient failure.
+exit, with the phase unchanged for `resume`.
 
 The reconciliation covers GitHub, not the agent worktree, which every launch
 of the issue reuses as the last one left it (#187). So before each launch of
@@ -662,10 +646,18 @@ next entry could not find again.
   comment its agent posted (D13.7). It also reads the EPIC body and locates
   the managed roadmap section (ambiguous markers, or a conclusive failure
   to read the body, block without launching; an unavailable GitHub
-  propagates). The bounded re-selection after a rejected `next_issue_url`
-  is a re-request for the selection alone, against the comment already
-  posted; the roadmap section is written by the controller when due
-  (github-safety.md, "Before UPDATE_EPIC" and "EPIC updates").
+  propagates). A `next_issue_url` is rejected unless it passes the first
+  issue's checks and is a native sub-issue of the EPIC with no sub-issues
+  of its own, the rule `autoforge epic run` admits by (#287); an issue the
+  EPIC body only mentions is not one. A `null` is rejected too while the
+  EPIC's complete sub-issue listing holds an issue the controller would
+  accept, and `BLOCKED` when the listing is not complete (the EPIC counts
+  a sub-issue the token may not read) or cannot be read conclusively: the
+  run never ends as `DONE` on membership it could not determine. The
+  bounded re-selection after a rejected `next_issue_url` is a re-request
+  for the selection alone, against the comment already posted; the
+  roadmap section is written by the controller when due (github-safety.md,
+  "Before UPDATE_EPIC", "After UPDATE_EPIC" and "EPIC updates").
 
 No probe consumes a review round, a `review_history` entry, or an attempt.
 
@@ -680,14 +672,8 @@ evidence (#393; [control-result-protocol.md](control-result-protocol.md),
 like `resume`: the same GitHub reconciliation above runs before the
 relaunch, so an agent that created the PR, pushed the fix, or posted the
 comment before losing its result block is reconciled with (the PR adopted, the pushed HEAD reviewed,
-the comment handed over) rather than relaunched. In LOCAL mode a correction
-is one more write-capable launch, so it is charged against and checkpointed
-in the same durable per-phase bound (three launches per phase entry) as the
-launch before it; the setting can never multiply that bound. Before it is
-charged, the git anchor is read again (#209): a launch that committed,
-reset or switched branches and then returned a malformed result blocks the
-step with the anchor reason, and the correction is neither launched nor
-charged. In both modes a malformed result is not corrected when the launch
+the comment handed over) rather than relaunched. A malformed result is not
+corrected when the launch
 may have left a process running (`group_survived_kill`, `capture_abandoned`
 or `orphan_survived_kill`; never `orphans_unchecked`, a fact of the
 platform): the correction would race it in the same working directory, so
@@ -717,7 +703,7 @@ the operator supplies the reason, the controller chooses the phase, and it
 chooses from live GitHub, never from the operator's claim of what was fixed.
 
 - **Precondition.** The run must be `BLOCKED` (any other phase is a
-  `StateTransitionError`) and REMOTE; a LOCAL run has no unblock edge. The
+  `StateTransitionError`). The
   reason is required, non-empty and bounded (`MAX_UNBLOCK_REASON_CHARS`).
 - **Inspection.** Before GitHub is asked, a persisted replan journal (in
   flight or `REJECTED`) refuses, because `REVIEW` is `REPLAN_REEXECUTE`'s

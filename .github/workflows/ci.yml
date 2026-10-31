@@ -113,8 +113,12 @@ jobs:
     # both), installs the wheel non-editably into a fresh environment outside
     # the checkout, and from there runs `autoforge --version` and `--help`,
     # renders every prompt template from the installed package and makes a
-    # LOCAL dry run (tests/dist_check.py). It runs on every interpreter the
-    # `test` matrix runs, which are the ones docs/compatibility.md claims.
+    # REMOTE dry run (`autoforge run --dry-run --full-prompt`) in a scratch
+    # repository with a `gh` on PATH that records and fails any call, which
+    # must render the ANALYZE_EXECUTE prompt, call no `gh` and leave the
+    # repository byte-identical (tests/dist_check.py). It runs on every
+    # interpreter the `test` matrix runs, which are the ones
+    # docs/compatibility.md claims.
     # There is no `uv sync`: the check runs on the bare interpreter and
     # imports only the installed package. Like every job here it calls no
     # provider and needs no credential; its one download is the build

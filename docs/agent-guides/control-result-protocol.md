@@ -59,7 +59,7 @@ through a Bash tool can read as a command's output. Three Claude launches
 in one operator's logs, the runs on #160, #149 and #340, ended a phase with
 a reply that held no block: one said it was waiting on a running task, one
 ended in a YAML-like `CONTROL_RESULT` section without markers, and one had
-printed the block from a Bash command. `common.md`, `local_common.md`, `correction.md` and
+printed the block from a Bash command. `common.md`, `correction.md` and
 every phase template's schema line now say the final reply, and the common
 prompts say that command output, tool results and files are never read for
 it. The rule that an unfinished phase still ends with a `failure` or
@@ -185,8 +185,7 @@ comment as a whole must pass the credential rule, pass the mention rule
 before its marker (`published_markdown_problem`: one field's unclosed fence
 or raw HTML can leave another field's mention outside code), and fit
 GitHub's comment limit (ADR 0004 D8.2, D8.3, D8.6); a refusal is a
-correction with nothing posted. A LOCAL `REVIEW` is unchanged: it carries no prose sections and
-publishes nothing.
+correction with nothing posted.
 
 ### Review invariant
 
@@ -217,15 +216,15 @@ the reviewer to is the comparison of its verdict with what it presented:
 needs_fix_round == false  and  a presented record is not PASS   -> refused
 ```
 
-The refusal is a correction in `_invoke_phase`, in REMOTE and LOCAL alike,
-before anything is planned or posted. Its text names each failing
+The refusal is a correction in `_invoke_phase`, before anything is planned
+or posted. Its text names each failing
 definition by its index and asks for an actionable finding that names it.
 At the correction bound it is the usual `ControlResultValidationError`:
 the phase stays `REVIEW` and nothing is published. A result with findings
 over a failure, and a clean result over all-`PASS` records or an empty set,
 are accepted as before. A clean result accepted here is what the round's
 review certificate records: if the round completes, the write that enters
-`READY_FOR_MERGE` (LOCAL: `DONE`) issues it from the records this check
+`READY_FOR_MERGE` issues it from the records this check
 compared the verdict with (ADR 0006 D12; [workflow.md](workflow.md),
 "Candidate validation gates").
 
@@ -306,7 +305,7 @@ that index is always into a value of accepted size. `escape_inline` and the
 resolution indentation stay in the renderer unchanged, as the defence for
 state persisted by a controller without this rule or edited by hand. Fields
 that are not rendered on one line of a prompt (`summary`, `message`,
-`tests_attempted`, LOCAL `observations`) keep their existing rules; the
+`tests_attempted`) keep their existing rules; the
 one-line `ANALYZE_EXECUTE` fields are under the rule ("ANALYZE_EXECUTE
 fields" below).
 
@@ -314,12 +313,7 @@ fields" below).
 
 A `FIX` result is untrusted in the same way and is persisted the same way:
 every accepted resolution is stored whole (after redaction) in
-`state.last_fix_resolutions`, and in LOCAL mode an `unresolved` rationale is
-echoed into the persisted `block_reason` that `status` shows the operator
-(the echo of every unresolved rationale together is bounded again at the
-sink, by `state.MAX_BLOCK_REASON_CHARS`, since the parser bounds each
-rationale but not their join; `last_fix_resolutions` keeps them whole).
-The parser therefore bounds the `FIX` payload with the same policy
+`state.last_fix_resolutions`. The parser therefore bounds the `FIX` payload with the same policy
 (rejection, never clipping; the message states the size and the limit,
 never the text; the count is checked before any element is parsed):
 
@@ -441,10 +435,7 @@ no other external change: work that needs a secret, a repository setting,
 hardware or a manual check stays `"status": "blocked"`. The recorded
 resolution carries the verified comment's URL as `acceptance_comment_url`
 (`""` for every other resolution), and the next reviewer receives it as
-data. LOCAL `FIX` is unchanged: it has no follow-ups and no acceptance
-actions, and its own resolutions (`LOCAL_FIX_RESOLUTIONS`); a LOCAL
-`acceptance_action` is refused with "LOCAL runs perform no external
-writes".
+data.
 
 An `operator_acceptance` (#243, ADR 0004 K10) asks the operator to post a
 comment on another issue of the run's repository, one the run's issue
@@ -467,8 +458,7 @@ reading a target blocks instead ([github-safety.md](github-safety.md),
 claims no other external change. The recorded resolution carries the
 round's verified comments as `operator_evidence` (`[]` for every other
 resolution), and the next reviewer receives them as data
-(`operator-evidence.md`). A LOCAL `operator_acceptance` is refused: a LOCAL
-run has no GitHub and no operator actions.
+(`operator-evidence.md`).
 
 ### REPLAN_REEXECUTE fields
 

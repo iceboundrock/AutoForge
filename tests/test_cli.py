@@ -20,7 +20,7 @@ from autoforge.redaction import redact, redact_obj
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
 from autoforge.scheduler_state import Admission, ClaimKind, StateRef, open_claim
 from autoforge.state import AutoForgeState, load_state, quarantine_state_file, save_state
-from autoforge.transitions import Phase, WorkflowMode
+from autoforge.transitions import Phase
 from tests.conftest import (
     BRANCH,
     DOTDOT_SPELLINGS,
@@ -30,6 +30,7 @@ from tests.conftest import (
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     ISSUE,
+    LOCAL_STATE_FIELDS,
     PR,
     SHA_A,
     UNLOADABLE_STATES,
@@ -50,7 +51,6 @@ from tests.conftest import (
     make_engine,
     publish_pr_head,
     review_result,
-    sample_contract,
     state_tree,
     unloadable_state,
 )
@@ -256,6 +256,38 @@ def test_run_then_status_json(tmp_path, capsys, monkeypatch, fakes):
     assert data["repository"] == "owner/repo" and data["step_count"] == 1
     assert cli.main(["--state-dir", sd, "status"]) == 0
     assert "ANALYZE_EXECUTE" in capsys.readouterr().out
+
+
+def test_status_json_carries_none_of_the_local_fields_under_protocol_13(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#388 (ADR 0009 D8, D10): protocol 13 removed LOCAL's twelve fields from
+    the state file, so ``status --json`` prints none of them, for a run this
+    controller created and for a protocol-12 file that still carries them
+    empty, which loads with them dropped and is not rewritten by the read."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert (
+        cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"])
+        == 0
+    )
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["protocol_version"] == "13" and printed["mode"] == "REMOTE"
+    assert not set(LOCAL_STATE_FIELDS) & set(printed)
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    assert not set(LOCAL_STATE_FIELDS) & set(data)
+    data["protocol_version"] = "12"
+    data.update({name: type(empty)() for name, empty in LOCAL_STATE_FIELDS.items()})
+    state_file.write_text(json.dumps(data))
+    before = state_file.read_bytes()
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert not set(LOCAL_STATE_FIELDS) & set(printed)
+    assert printed["protocol_version"] == "13"
+    assert state_file.read_bytes() == before
 
 
 def test_status_describes_a_corrupt_replan_transaction_instead_of_crashing(
@@ -1443,8 +1475,9 @@ def test_run_force_moves_invalid_utf8_state_aside(tmp_path, capsys, monkeypatch,
 
 # -- a state that does not load (ADR 0009 D4; #385) -------------------------------------
 # What the removal of LOCAL leaves a LOCAL state to: the paths every state the
-# loader refuses takes. Pinned on today's code for an unknown mode, an unknown
-# label and invalid JSON, in a state directory that holds a run's logs.
+# loader refuses takes. Pinned for an unknown mode, an unknown label and
+# invalid JSON before LOCAL went (#385), and for a LOCAL state since (#387), in
+# a state directory that holds a run's logs.
 
 # What the refused file carries and the new run must not: its identity, its
 # counters and its text.
@@ -1574,6 +1607,342 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
     assert "planted" not in (sd / "state.json").read_text(encoding="utf-8")
     assert "pull/4241" not in (sd / "state.json").read_text(encoding="utf-8")
     assert load_state(sd / "state.json").run_id == fresh["run_id"]
+
+
+# -- LOCAL's ways in, closed (ADR 0009 D3 to D5, step S2; #387) --------------------------
+# Every way a LOCAL run was started, configured, continued or shown now meets
+# a path every other input takes: argparse's choices, the unknown-key check,
+# the loader's mode check, and only the state directory the command names.
+
+# Each former `autoforge local` command line, with the flags it had.
+_FORMER_LOCAL_COMMANDS = (
+    ["local"],
+    ["local", "init", "add-filter"],
+    ["local", "init", "add-filter", "--feature-dir", "specs", "--force"],
+    ["local", "run", "features/add-filter.md"],
+    ["local", "run", "features/add-filter.md", "--dry-run", "--full-prompt"],
+    ["local", "run", "features/add-filter.md", "--force", "--allow-dirty", "--max-steps", "1"],
+    ["local", "doctor"],
+    ["local", "doctor", "--json", "--feature", "features/add-filter.md"],
+)
+
+
+@pytest.mark.parametrize("words", _FORMER_LOCAL_COMMANDS, ids=" ".join)
+def test_autoforge_local_is_an_invalid_choice_that_reads_writes_and_locks_nothing(
+    tmp_path, capsys, monkeypatch, words
+):
+    """ADR 0009 D5: there is no stub. argparse refuses ``local`` before any
+    command runs: a configuration that does not exist is not reported, no
+    lock file is created under the git directory and no entry of the
+    checkout, its git directory included, is created or changed."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "features").mkdir()
+    (tmp_path / "features" / "add-filter.md").write_text("# Feature: add filter\n")
+    before = state_tree(tmp_path)
+    for config in ([], ["--config", str(tmp_path / "missing.yaml")]):
+        with pytest.raises(SystemExit) as exc:
+            cli.main([*config, *words])
+        assert exc.value.code == 2
+        captured = capsys.readouterr()
+        assert "invalid choice: 'local'" in captured.err and captured.out == ""
+        assert "missing.yaml" not in captured.err
+        assert state_tree(tmp_path) == before
+    assert not (tmp_path / ".git" / "autoforge").exists()
+
+
+def test_help_lists_no_local_command(capsys):
+    """ADR 0009 D5: ``--help`` and the parser's choices name no ``local``."""
+    import argparse
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--help"])
+    assert exc.value.code == 0
+    assert "local" not in capsys.readouterr().out.lower()
+    (commands,) = [
+        a for a in cli.build_parser()._actions if isinstance(a, argparse._SubParsersAction)
+    ]
+    assert "local" not in commands.choices
+    assert set(commands.choices) == {"doctor", "run", "step", "resume", "unblock", "status", "epic"}
+
+
+# Every standalone command that loads the configuration, each spelling that
+# reaches a different branch of it.
+_LOADING_CONFIGURATION = (
+    ["status"],
+    ["status", "--json"],
+    ["status", "--action", "A-1"],
+    ["step"],
+    ["step", "--dry-run"],
+    ["resume"],
+    ["resume", "--dry-run"],
+    ["unblock", "--reason", "the operator looked"],
+    ["unblock", "--reason", "the operator looked", "--dry-run"],
+    ["run", "--epic", EPIC, "--issue", ISSUE],
+    ["run", "--epic", EPIC, "--issue", ISSUE, "--dry-run"],
+    ["run", "--epic", EPIC, "--issue", ISSUE, "--force"],
+)
+
+
+def test_a_local_block_is_refused_as_an_unknown_key_by_every_command(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """ADR 0009 D5: ``local`` is not a known top-level key, so a file that
+    still has the block is refused by the ordinary unknown-key check, with no
+    removed-key message; exit 2, nothing written, no GitHub call and no
+    launch. ``doctor`` reports the same text as its failing ``config`` row
+    (exit 1). The ``epic`` commands are in ``tests/test_epic_commands.py``."""
+    monkeypatch.chdir(tmp_path)
+    config = tmp_path / "autoforge.json"
+    config.write_text(json.dumps({"version": 1, "local": {"max_fix_rounds": 1}}))
+    refusal = f"{config}: unknown key(s) under 'the top level': local (known: version, "
+    calls = (len(fakes["gh"].calls), len(fakes["provider"].calls))
+    before = state_tree(tmp_path)
+    for words in _LOADING_CONFIGURATION:
+        assert cli.main(["--config", str(config), *words]) == 2, words
+        captured = capsys.readouterr()
+        assert refusal in captured.err and captured.out == "", words
+        assert "removed" not in captured.err and "LOCAL" not in captured.err, words
+        assert state_tree(tmp_path) == before, words
+    assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
+
+    def runner(req):
+        return ExecutionResult(req.command, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    assert cli.main(["--config", str(config), "doctor"]) == 1
+    assert f"[FAIL] config: {refusal}" in capsys.readouterr().out
+    assert cli.main(["--config", str(config), "doctor", "--json"]) == 1
+    row = next(c for c in json.loads(capsys.readouterr().out)["checks"] if c["name"] == "config")
+    assert not row["ok"] and row["detail"].startswith(refusal)
+    assert state_tree(tmp_path) == before
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["absent", "existing"])
+@pytest.mark.parametrize("where", ["default", "relative", "absolute"])
+def test_doctor_writes_no_state_directory_for_a_configuration_it_refused(
+    tmp_path, capsys, monkeypatch, where, existing
+):
+    """ADR 0009's S2 exit tests: nothing is written for a ``local:`` key,
+    by ``doctor`` too. Its state-directory row creates the directory and
+    writes a probe in it, so for a refused configuration it is skipped:
+    ``.autoforge`` or the ``--state-dir`` given, absent or already there,
+    is left as it was, and so is everything else in the checkout."""
+    monkeypatch.chdir(tmp_path)
+    config = tmp_path / "autoforge.json"
+    config.write_text(json.dumps({"version": 1, "local": {"max_fix_rounds": 1}}))
+    state_dir = {
+        "default": None,
+        "relative": "custom-state",
+        "absolute": str(tmp_path / "elsewhere" / "state"),
+    }[where]
+    target = tmp_path / (state_dir or ".autoforge")
+    if existing:
+        (target / "logs").mkdir(parents=True)
+        (target / "state.json").write_text('{"phase": "REVIEW"}\n')
+    flags = ["--state-dir", state_dir] if state_dir else []
+
+    def runner(req):
+        return ExecutionResult(req.command, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    before = state_tree(tmp_path)
+    assert cli.main(["--config", str(config), *flags, "doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] config: " in out and "unknown key(s) under 'the top level': local" in out
+    assert "[SKIP] state dir writable: (config check failed)" in out
+    assert state_tree(tmp_path) == before
+    assert cli.main(["--config", str(config), *flags, "doctor", "--json"]) == 1
+    rows = {c["name"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+    assert rows["state dir writable"]["skipped"] and not rows["config"]["ok"]
+    assert state_tree(tmp_path) == before
+    assert target.exists() == existing
+
+
+# Every label a state file has had (1 to the current one), the next one, and none.
+_EVERY_LABEL = (*(str(n) for n in range(1, 15)), None)
+# What a hand-built LOCAL state carries beside its mode when it is garbage: a
+# field no protocol knows, a field of the wrong type, and LOCAL's fields not
+# empty. The phase stays one LOCAL had: the loader reads it before the mode.
+_GARBAGE = {
+    "satellite_uplink": [1, 2, 3],
+    "review_round": "four",
+    "local_run_contract": {"schema": 99, "workspace_policy": "everything"},
+    "workspace_fingerprint": 42,
+    "local_pending_phase": "nonsense",
+}
+
+
+def _write_local_state(sd: Path, label: str | None, garbage: bool) -> bytes:
+    """A ``mode: "LOCAL"`` state written by hand at ``sd``, beside a run log.
+
+    Its shape is a REMOTE state this controller saved, carrying a run's
+    identity and counters, with ``mode`` and ``protocol_version`` replaced
+    (``None``: no label) and, with ``garbage``, :data:`_GARBAGE` beside them.
+    No released controller wrote it. Returns its bytes.
+    """
+    sd.mkdir(parents=True)
+    save_state(
+        AutoForgeState(
+            repository="owner/repo",
+            epic_url=EPIC,
+            current_issue_url=ISSUE,
+            phase=Phase.REVIEW,
+            **_PLANTED,
+        ),
+        sd / "state.json",
+    )
+    data = json.loads((sd / "state.json").read_text(encoding="utf-8"))
+    data["mode"] = "LOCAL"
+    data.pop("protocol_version")
+    if label is not None:
+        data["protocol_version"] = label
+    if garbage:
+        data.update(_GARBAGE)
+    raw = json.dumps(data).encode("utf-8")
+    (sd / "state.json").write_bytes(raw)
+    (sd / "logs" / "local-run").mkdir(parents=True)
+    (sd / "logs" / "local-run" / "run.log").write_text("a LOCAL run's log\n")
+    return raw
+
+
+@pytest.mark.parametrize("garbage", [False, True], ids=["remote-shape", "garbage"])
+@pytest.mark.parametrize("label", _EVERY_LABEL, ids=lambda label: f"label-{label}")
+def test_a_local_state_is_refused_under_every_label_and_left_alone(
+    tmp_path, capsys, monkeypatch, fakes, label, garbage
+):
+    """ADR 0009 D4: the loader refuses ``mode: "LOCAL"`` like any unknown
+    mode, before it reads the label, so every command that loads it exits 2
+    naming the mode, from ``--state-dir`` and from the configured location,
+    and the directory, its log included, is as it was; ``run`` refuses it as
+    an unreadable state. ``run --force`` over it is S1b's audit, on its
+    ``local-mode`` row."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    _write_local_state(sd, label, garbage)
+    refusal = "state file has unknown mode 'LOCAL'"
+    before = state_tree(sd)
+    calls = (len(fakes["gh"].calls), len(fakes["provider"].calls))
+    commands = (
+        ["status"],
+        ["status", "--json"],
+        ["step"],
+        ["resume"],
+        ["unblock", "--reason", "the operator looked"],
+    )
+    for where in (["--state-dir", str(sd)], []):
+        for words in commands:
+            assert cli.main([*where, *words]) == 2, words
+            captured = capsys.readouterr()
+            assert f"autoforge: error: {refusal}" in captured.err, words
+            assert captured.out == "", words
+            assert state_tree(sd) == before, words
+        assert cli.main([*where, *_run_argv_of(1)]) == 2
+        err = capsys.readouterr().err
+        assert refusal in err and "refusing to start a new run over an unreadable" in err
+        assert state_tree(sd) == before
+    assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
+
+
+# The commands that take the controller lock to act on a state, without --force.
+_LOCKING_COMMANDS = (
+    ["step"],
+    ["resume"],
+    ["unblock", "--reason", "the operator looked"],
+    _run_argv_of(1),
+)
+
+
+@pytest.mark.parametrize("lock_file", ["absent", "existing"])
+@pytest.mark.parametrize("label", ["12", "13", "14", None], ids=lambda label: f"label-{label}")
+def test_a_local_state_in_the_locks_directory_is_refused_without_taking_the_lock(
+    tmp_path, capsys, monkeypatch, fakes, label, lock_file
+):
+    """ADR 0009's S2 exit tests (#387, R2-F1): with ``--state-dir`` at the
+    lock's own directory, ``<git common dir>/autoforge``, ``controller.lock``
+    lies in the state directory, and taking the lock creates it or rewrites
+    its PID record. A LOCAL state there is refused before the lock is taken,
+    so the whole directory, a lock file a controller left in it included, is
+    as it was, and no lock is held afterwards."""
+    monkeypatch.chdir(tmp_path)
+    lock = repository_lock_path(tmp_path)
+    sd = lock.parent
+    _write_local_state(sd, label, False)
+    if lock_file == "existing":
+        # The PID record of a controller that has exited.
+        lock.write_text(f"{os.getpid() + 1}\n", encoding="ascii")
+    refusal = "state file has unknown mode 'LOCAL'"
+    before = state_tree(sd)
+    calls = (len(fakes["gh"].calls), len(fakes["provider"].calls))
+    acquired = _count_lock_acquisitions(monkeypatch)
+    for spelling in (str(sd), os.path.relpath(sd, tmp_path)):
+        for words in _LOCKING_COMMANDS:
+            assert cli.main(["--state-dir", spelling, *words]) == 2, words
+            assert refusal in capsys.readouterr().err, words
+            assert state_tree(sd) == before, words
+    assert acquired == []
+    assert lock.exists() == (lock_file == "existing")
+    assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
+    assert _second_controller_can_lock(lock)
+
+
+@pytest.mark.parametrize("words", _LOCKING_COMMANDS, ids=lambda words: words[0])
+def test_a_state_that_loads_before_the_lock_is_read_again_under_it(
+    tmp_path, capsys, monkeypatch, fakes, words
+):
+    """#387, R2-F1: what a command reads before the lock may only refuse. A
+    state that loads then, and that another controller replaces with a
+    LOCAL one before the lock is taken, is read again under the lock and
+    refused there: nothing is launched and the LOCAL file is left as it is.
+    For ``run`` the state appears in the window, where none was."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sf = sd / "state.json"
+    sd.mkdir()
+    if words[0] == "unblock":
+        save_state(_other_controller_state("af-stale", Phase.BLOCKED, "human needed"), sf)
+    elif words[0] != "run":
+        save_state(_other_controller_state("af-stale"), sf)
+    other = tmp_path / "other"
+    raw = _write_local_state(other, "12", False)
+    fakes["handler"] = implement
+    fired = _interleave_before_first_lock(monkeypatch, lambda: os.replace(other / "state.json", sf))
+    assert cli.main(["--state-dir", str(sd), *words]) == 2 and fired
+    assert "state file has unknown mode 'LOCAL'" in capsys.readouterr().err
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+    assert sf.read_bytes() == raw and sorted(p.name for p in sd.iterdir()) == ["state.json"]
+
+
+def test_a_local_state_at_the_git_dirs_default_location_is_not_looked_for(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """ADR 0009 D3: nothing probes ``<git dir>/autoforge/state``, where a LOCAL
+    run kept its state by default. Without ``--state-dir`` each command reads
+    the configured location only and says no run is there; the LOCAL state is
+    not named, read or touched. A REMOTE run at the configured location is
+    then the only run, with no "two runs" refusal."""
+    monkeypatch.chdir(tmp_path)
+    legacy = tmp_path / ".git" / "autoforge" / "state"
+    _write_local_state(legacy, "12", False)
+    before = state_tree(legacy)
+    commands = (
+        ["status"],
+        ["status", "--json"],
+        ["step"],
+        ["resume"],
+        ["unblock", "--reason", "the operator looked"],
+    )
+    for words in commands:
+        assert cli.main(words) == 2, words
+        err = capsys.readouterr().err
+        assert f"autoforge: error: no state file at {Path('.autoforge', 'state.json')}" in err
+        assert "LOCAL" not in err and str(legacy) not in err, words
+        assert state_tree(legacy) == before, words
+    assert cli.main(_run_argv_of(1)) == 0
+    capsys.readouterr()
+    assert cli.main(["status", "--json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["mode"] == "REMOTE" and shown["run_id"] != _PLANTED["run_id"]
+    assert state_tree(legacy) == before
 
 
 def test_run_refuses_dangling_symlink_state_without_force(tmp_path, capsys, monkeypatch, fakes):
@@ -2322,32 +2691,14 @@ def test_the_refusal_is_decided_on_the_resolved_path(
 def test_a_configured_scheduler_state_dir_is_refused_before_the_run_is_looked_for(
     tmp_path, capsys, monkeypatch, fakes, command
 ):
-    """R1-F1: `config.state_dir` in the scheduler root, a LOCAL run's state in
-    LOCAL's location. Looking for the run first would find no `state.json` in
-    the namespace, bind the LOCAL one and continue it; the configured directory
-    is refused before either is read, whether it is missing, empty or holds a
-    state (no "two runs exist" either)."""
+    """R1-F1: `config.state_dir` in the scheduler root, beside the state a
+    LOCAL run left in LOCAL's location. The configured directory is refused
+    before any state is read, whether it is missing, empty or holds a state;
+    the LOCAL file, which nothing looks for since LOCAL was removed (ADR 0009
+    D4, #387), is left as it was."""
     monkeypatch.chdir(tmp_path)
     local = tmp_path / ".git" / "autoforge" / "state"
-    local.mkdir(parents=True)
-    save_state(
-        AutoForgeState(
-            run_id="af-local",
-            mode=WorkflowMode.LOCAL,
-            phase=Phase.REVIEW,
-            feature_spec_path="features/add-filter.md",
-            feature_spec_sha256="a" * 64,
-            local_run_contract=sample_contract(
-                repository_root=str(tmp_path), state_root=str(local)
-            ),
-            workspace_fingerprint="b" * 64,
-            base_head_sha="c" * 40,
-            base_branch="main",
-            created_at="2026-09-06T00:00:00+00:00",
-            updated_at="2026-09-06T00:00:00+00:00",
-        ),
-        local / "state.json",
-    )
+    _write_local_state(local, "12", True)
     sd = _namespace_state_dir(tmp_path)
     cfg = _config(tmp_path / "autoforge.json", state_dir=".git/autoforge/scheduler/issues/1/state")
     local_before = _files(local)
@@ -2363,20 +2714,6 @@ def test_a_configured_scheduler_state_dir_is_refused_before_the_run_is_looked_fo
         assert _files(local) == local_before
         assert (_files(sd) if sd.exists() else None) == namespace_before
         assert not (tmp_path / ".git" / "autoforge" / "controller.lock").exists()
-    assert load_state(local / "state.json").phase == Phase.REVIEW
-
-
-def test_local_run_refuses_a_state_dir_inside_the_scheduler_root(
-    tmp_path, capsys, monkeypatch, fakes
-):
-    monkeypatch.chdir(tmp_path)
-    feature = tmp_path / "features" / "add-filter.md"
-    feature.parent.mkdir()
-    feature.write_text("# Feature: Add a filter\n", encoding="utf-8")
-    sd = _namespace_state_dir(tmp_path)
-    assert cli.main(["--state-dir", str(sd), "local", "run", str(feature)]) == 2
-    _assert_refused(capsys, fakes, "local run")
-    assert not (tmp_path / ".git" / "autoforge" / "scheduler").exists()
 
 
 def test_status_reads_and_unblock_acts_on_a_namespace_state_dir(
@@ -3540,7 +3877,7 @@ def test_an_old_state_file_without_a_recorded_configuration_loads_and_resumes(
     assert f"--config {cfg} is recorded as the run's" in out.err
     assert "ANALYZE_EXECUTE -> REVIEW" in out.out
     saved = load_state(state_file)
-    assert saved.protocol_version == "12"
+    assert saved.protocol_version == "13"
     assert saved.config_fingerprint["source"] == "upgraded"
     assert saved.sandbox_pin["mode"] == "disabled" and saved.sandbox_pin["source"] == "upgraded"
     assert saved.config_fingerprint["profiles"]["analyze_execute"]["model"] == "opus"
@@ -3710,13 +4047,7 @@ def test_an_enforced_run_refuses_a_config_file_in_a_providers_writable_directory
     label, provider = _PROVIDER_DIRS[variable]
     sd = str(tmp_path / ".autoforge")
     run = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
-    commands = (
-        run,
-        [*run, "--dry-run"],
-        ["--state-dir", sd, "status"],
-        ["local", "run", "features/add-filter.md"],
-    )
-    for argv in commands:
+    for argv in (run, [*run, "--dry-run"], ["--state-dir", sd, "status"]):
         assert cli.main(["--config", cfg, *argv]) == 2, argv
         err = capsys.readouterr().err
         assert f"error: the configuration file {cfg} lies in {directory}, {label}, " in err
@@ -3724,7 +4055,6 @@ def test_an_enforced_run_refuses_a_config_file_in_a_providers_writable_directory
         assert "(sandbox.mode is required): a sandboxed agent could rewrite it" in err
         assert "Nothing was run, launched or written." in err
     assert _files(sd) == {}
-    assert not (tmp_path / ".git" / "autoforge" / "state").exists()
     assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
 
     monkeypatch.delenv(variable)

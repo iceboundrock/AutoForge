@@ -16,6 +16,7 @@ import os
 import pickle
 import shlex
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from autoforge.errors import ExecutionError
 from autoforge.executor_supervised import spawn_supervised
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, write_binding
-from autoforge.scheduler import EpicScheduler
+from autoforge.scheduler import DEFAULT_WORKER_COMMAND, EpicScheduler
 from autoforge.scheduler_state import (
     ClaimClassification,
     ClaimKind,
@@ -42,11 +43,9 @@ from autoforge.transitions import Phase
 from .conftest import (
     GIT_IDENT,
     UNLOADABLE_STATES,
-    commit_all,
     git_out,
     state_tree,
     unloadable_state,
-    write_feature,
 )
 from .test_scheduler import (
     BOOTSTRAP,
@@ -1243,7 +1242,7 @@ def test_an_unloadable_standalone_state_holds_nothing_is_reported_and_is_left_al
     assert state_tree(standalone) == before
 
 
-@pytest.mark.parametrize("mode", ["SATELLITE", None])
+@pytest.mark.parametrize("mode", ["SATELLITE", None, "LOCAL"])
 def test_a_namespace_state_whose_mode_is_not_remote_is_held_as_uncertain(epic, mode):
     """ADR 0009 D4 (#385): the scheduler only creates REMOTE states; a
     namespace state of any other mode cannot be read, so the issue is held
@@ -1290,28 +1289,98 @@ def test_namespace_work_leaves_the_git_dirs_autoforge_state_alone(epic):
     assert state_tree(legacy) == before
 
 
-def test_local_mode_is_unaffected_by_scheduler_namespaces(epic):
+def test_autoforge_local_during_a_pass_is_an_invalid_choice_and_the_pass_runs_on(epic):
+    """ADR 0009 D5 (#387): a ``local run`` that L0 used to exclude while a
+    scheduler held it is now refused by argparse, with or without
+    ``--dry-run``, before it reads anything or takes a lock; the pass admits
+    and finishes as it would without it."""
     e = epic()
     b = e.b
     b.issue(2, ({**IMPLEMENT, "started": b.marker("s2"), "gate": b.marker("g2")}, REVIEW))
-    write_feature(b.repo)
-    commit_all(b.repo, "feature")
-    during: list[tuple[int, str]] = []
+    during: list[tuple[object, str]] = []
 
     def tick(s: EpicScheduler) -> None:
         if b.has("s2") and not during:
-            # A LOCAL run is excluded by L0 in time only, and a dry run takes no lock.
-            during.append(e.cli("local", "run", "features/add-filter.md")[::2])
-            during.append(e.cli("local", "run", "features/add-filter.md", "--dry-run")[:2])
+            for dry in ((), ("--dry-run",)):
+                with pytest.raises(SystemExit) as exc:
+                    cli.main(["--config", str(b.config_path), "local", "run", "f.md", *dry])
+                during.append((exc.value.code, e.capsys.readouterr().err))
             b.open_gate("g2")
 
     e.on_tick = tick
-    assert e.run()[0] == 0
-    (locked, locked_err), (dry, dry_out) = during
-    assert locked == 2 and "lock" in locked_err.lower()
-    assert dry == 0 and "mode: LOCAL" in dry_out
-    code, out = e.cli("local", "run", "features/add-filter.md", "--dry-run")[:2]
-    assert code == 0 and "mode: LOCAL" in out
+    assert e.run()[0] == 0 and b.admitted() == [2], e.said
+    assert [code for code, _ in during] == [2, 2]
+    assert all("invalid choice: 'local'" in err for _, err in during)
+    assert b.state(2).phase is Phase.READY_FOR_MERGE
+
+
+def test_a_local_block_is_refused_by_every_epic_command_that_loads_the_configuration(epic):
+    """ADR 0009 D5 (#387): the ``epic`` commands load the configuration
+    through the same strict check, so a ``local:`` block is an unknown
+    top-level key there too: exit 2, nothing written under the coordination
+    root, the lock file included. ``epic stop`` loads it once it finds a
+    scheduler record to compare, which the first pass leaves; ``epic
+    archive`` before it takes L0 (see the next test)."""
+    e = epic()
+    b = e.b
+    b.issue(2)
+    assert e.run()[0] == 0 and b.admitted() == [2], e.said
+    b.config_path.write_text(json.dumps({"local": {"max_fix_rounds": 1}}), encoding="utf-8")
+    refusal = f"{b.config_path}: unknown key(s) under 'the top level': local (known: version, "
+    before = state_tree(b.root)
+    for words in (
+        ("run", EPIC),
+        ("run", EPIC, "--dry-run"),
+        ("run", EPIC, "--force"),
+        ("resume", EPIC),
+        ("status", EPIC),
+        ("status", EPIC, "--json"),
+        ("stop", EPIC),
+        ("stop", EPIC, "--now"),
+        ("archive", EPIC, "2"),
+    ):
+        code, out, err = e.cli("epic", *words)
+        assert code == 2 and refusal in err and out == "", words
+        assert "LOCAL" not in err and "removed" not in err, words
+        assert state_tree(b.root) == before, words
+
+
+@pytest.mark.parametrize("first_pass", [False, True], ids=["fresh", "after-a-pass"])
+def test_epic_archive_refuses_a_local_block_before_it_takes_the_repository_lock(epic, first_pass):
+    """ADR 0009 D5 (#387): ``epic archive`` loads the configuration before
+    it takes L0, since taking L0 truncates and rewrites the lock file's
+    holder record, whose bytes are another process's PID. In this process
+    and in a CLI process of its own, a ``local:`` block is refused (exit 2)
+    with the whole checkout, its git directory included, as it was: on a
+    fresh checkout no lock file is made, and after a pass with a bound
+    namespace the lock file keeps its bytes, inode and modification time."""
+    e = epic()
+    b = e.b
+    b.issue(2)
+    if first_pass:
+        assert e.run()[0] == 0 and b.admitted() == [2], e.said
+    lock = b.root / "autoforge" / "controller.lock"
+    assert lock.exists() is first_pass
+    b.config_path.write_text(json.dumps({"local": {"max_fix_rounds": 1}}), encoding="utf-8")
+    refusal = f"{b.config_path}: unknown key(s) under 'the top level': local (known: version, "
+    words = ("--config", str(b.config_path), "epic", "archive", EPIC, "2")
+    before = state_tree(b.repo)
+
+    code, out, err = e.cli(*words[2:])
+    assert code == 2 and refusal in err and out == "", err
+    assert state_tree(b.repo) == before
+
+    done = subprocess.run(
+        [*DEFAULT_WORKER_COMMAND, *words],
+        cwd=b.repo,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 2 and refusal in done.stderr and done.stdout == "", done.stderr
+    assert state_tree(b.repo) == before
+    assert lock.exists() is first_pass
 
 
 # -- structure ---------------------------------------------------------------------------
