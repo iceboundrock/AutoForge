@@ -1947,3 +1947,65 @@ def test_errno_constants_used_by_the_walk_exist(tmp_path):
     """A typo'd errno name would silently turn a refusal into a generic error."""
     for name in ("ELOOP", "ENOTDIR", "EACCES", "EPERM", "EISDIR", "ENXIO", "EEXIST"):
         assert isinstance(getattr(errno, name), int)
+
+
+# -- the other modules' fsync ---------------------------------------------------
+
+
+def _fsync_outcome(fsync, fd) -> str:
+    try:
+        fsync(fd)
+    except OSError as exc:
+        return errno.errorcode[exc.errno]
+    return "ok"
+
+
+def test_this_module_writes_through_the_real_fsync():
+    """The durable writes tested here are flushed for real: conftest's
+    stand-in (#341) leaves the modules of ``REAL_FSYNC_MODULES`` alone."""
+    import posix
+
+    from tests.conftest import REAL_FSYNC_MODULES
+
+    assert os.path.basename(__file__) in REAL_FSYNC_MODULES
+    assert os.fsync is posix.fsync
+
+
+def test_the_fsync_stand_in_refuses_exactly_what_fsync_refuses(tmp_path):
+    """Where the other modules' writes skip the flush (#341), each call is still
+    refused or accepted as ``fsync(2)`` answers it, on this host: a closed or
+    ``O_PATH`` descriptor, a pipe, a socket and a character device are refused,
+    a file of either access mode and a directory are not."""
+    import socket
+
+    from tests.conftest import fsync_without_the_disk
+
+    regular = tmp_path / "file"
+    regular.write_text("x")
+    opened: dict[str, int] = {
+        "read-write file": os.open(regular, os.O_RDWR),
+        "read-only file": os.open(regular, os.O_RDONLY),
+        "directory": os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY),
+        "character device": os.open(os.devnull, os.O_WRONLY),
+    }
+    if hasattr(os, "O_PATH"):
+        opened["O_PATH file"] = os.open(regular, os.O_PATH)
+        opened["O_PATH directory"] = os.open(tmp_path, os.O_PATH)
+    opened["pipe read end"], opened["pipe write end"] = os.pipe()
+    opened["socket"] = socket.socket().detach()
+    closed = os.open(regular, os.O_RDONLY)
+    os.close(closed)
+    try:
+        with regular.open("a") as fh:
+            assert _fsync_outcome(fsync_without_the_disk, fh) == _fsync_outcome(os.fsync, fh)
+        answers = {
+            kind: (_fsync_outcome(os.fsync, fd), _fsync_outcome(fsync_without_the_disk, fd))
+            for kind, fd in [*opened.items(), ("closed descriptor", closed)]
+        }
+    finally:
+        for fd in opened.values():
+            os.close(fd)
+    assert {kind: real for kind, (real, _) in answers.items()} == {
+        kind: stand_in for kind, (_, stand_in) in answers.items()
+    }
+    assert answers["read-write file"][0] == "ok" and answers["closed descriptor"][0] == "EBADF"

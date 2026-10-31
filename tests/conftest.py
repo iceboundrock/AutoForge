@@ -1555,6 +1555,10 @@ def git_out(*args: str) -> str:
     return res.stdout.strip()
 
 
+# A full object id, SHA-1 or SHA-256, as a loose ref file holds one.
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
 class Origin:
     """A bare repository standing in for GitHub's copy of the repository (#161).
 
@@ -1588,6 +1592,20 @@ class Origin:
         return f"file://{self.bare}"
 
     def head(self, branch: str) -> str | None:
+        """What ``refs/heads/<branch>`` names, or None when there is no such branch.
+
+        The fake reads it on every PR read (``_follow_origin``), about 10,000
+        times a run, so the loose ref a push wrote is read as a file rather
+        than through a git process (#341). Anything else (a packed or
+        symbolic ref, the reftable format, a ref being replaced) is git's to
+        resolve.
+        """
+        try:
+            loose = (self.bare / "refs" / "heads" / branch).read_text().strip()
+        except OSError:
+            loose = ""
+        if _OBJECT_ID.fullmatch(loose):
+            return loose
         res = subprocess.run(
             ["git", f"--git-dir={self.bare}", "rev-parse", "-q", "--verify"]
             + [f"refs/heads/{branch}"],
@@ -2327,6 +2345,64 @@ def sandbox_probe(monkeypatch) -> SandboxProbe:
     probe = SandboxProbe()
     monkeypatch.setattr(engine_module, "probe_sandbox", probe)
     return probe
+
+
+# The modules that test durability itself, and so write through the real
+# ``os.fsync`` (see ``_fsync_without_the_disk``).
+REAL_FSYNC_MODULES = frozenset(
+    {
+        "test_durable_run_contract.py",
+        "test_run_namespace.py",
+        "test_runlog.py",
+        "test_safefs.py",
+        "test_scheduler_state.py",
+        "test_state.py",
+    }
+)
+
+
+def fsync_without_the_disk(fd) -> None:
+    """``os.fsync`` without the wait for the disk: it refuses what fsync refuses.
+
+    An open descriptor of a regular file, a directory or a block device is
+    accepted and nothing is written back; a closed descriptor or an
+    ``O_PATH`` one raises ``EBADF``, and a pipe, a socket or a character
+    device ``EINVAL``, as ``fsync(2)`` does (``tests/test_safefs.py`` pins
+    each answer to the real call's).
+    """
+    import errno
+    import fcntl
+    import stat
+
+    fd = fd if isinstance(fd, int) else fd.fileno()
+    if fcntl.fcntl(fd, fcntl.F_GETFL) & getattr(os, "O_PATH", 0):
+        raise OSError(errno.EBADF, os.strerror(errno.EBADF))
+    mode = os.fstat(fd).st_mode
+    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISBLK(mode)):
+        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+
+
+@pytest.fixture(autouse=True)
+def _fsync_without_the_disk(request, monkeypatch):
+    """The controller's ``fsync`` calls do not wait for the disk (#341).
+
+    A state save, a run log entry and every safe write fsync a file and its
+    directory, about 40 calls for an engine test: where the temporary
+    directory is on a disk, waiting for them took about half the wall time
+    of the ``tests/test_engine.py`` tests measured. No test can observe what
+    they buy, which is the bytes surviving a power loss: a process a test
+    kills, or a crash it raises, leaves the same files whether they were
+    flushed or not. So ``os.fsync`` here refuses what the real call refuses
+    and flushes nothing (:func:`fsync_without_the_disk`), except in the
+    modules of :data:`REAL_FSYNC_MODULES`, which test the durable writes
+    themselves and keep it. A test that patches ``os.fsync`` (to fail it,
+    or to hook a step after it) patches over this one. Only this process is
+    affected: git, a scheduler worker and any other child fsync as they
+    always do.
+    """
+    if request.path.name in REAL_FSYNC_MODULES:
+        return
+    monkeypatch.setattr(os, "fsync", fsync_without_the_disk)
 
 
 @pytest.fixture

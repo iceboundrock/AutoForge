@@ -3383,6 +3383,43 @@ def _fake():
     return fake
 
 
+def test_the_fakes_origin_reads_a_branch_head_as_git_does(tmp_path):
+    """The origin's branch heads, read from the loose ref without git (#341),
+    are what git resolves, and a ref in any other shape is git's: packed, or
+    deleted, or a loose file that holds no object id."""
+    import subprocess
+
+    from tests.conftest import Origin, commit_in
+
+    checkout = git_repo(tmp_path / "checkout")
+    origin = Origin.seeded(tmp_path, checkout)
+    tip = origin.publish(checkout, "HEAD", "autoforge/2-feature")
+    later = commit_in(checkout)
+    origin.publish(checkout, "HEAD", "main")
+
+    def git_head(branch: str) -> str | None:
+        found = subprocess.run(
+            ["git", f"--git-dir={origin.bare}", "rev-parse", "-q", "--verify"]
+            + [f"refs/heads/{branch}"],
+            capture_output=True,
+            text=True,
+        )
+        return found.stdout.strip() or None
+
+    loose = origin.bare / "refs" / "heads"
+    assert (loose / "main").is_file() and (loose / "autoforge" / "2-feature").is_file()
+    assert origin.head("main") == git_head("main") == later
+    assert origin.head("autoforge/2-feature") == git_head("autoforge/2-feature") == tip
+    assert origin.head("missing") is None
+    git_out(f"--git-dir={origin.bare}", "pack-refs", "--all")
+    assert not (loose / "main").exists()
+    assert origin.head("main") == later and origin.head("autoforge/2-feature") == tip
+    (loose / "main").write_text("ref: refs/heads/autoforge/2-feature\n")
+    assert origin.head("main") == git_head("main") == tip
+    origin.delete("autoforge/2-feature")
+    assert origin.head("autoforge/2-feature") is None
+
+
 def test_fake_effect_writes_mutate_the_stores_and_are_recorded():
     from tests.conftest import BRANCH, ISSUE
 

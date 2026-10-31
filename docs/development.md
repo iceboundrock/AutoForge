@@ -351,6 +351,87 @@ The recommendation that follows:
   `--dist=load`. A parallel job replaces the serial one only while its runs
   reconcile clean, and goes back to serial if it flakes.
 
+## Where the serial suite's time goes
+
+#341 measured where a serial run spends its time and removed what the
+measurement showed was waiting rather than testing. The profile ran the
+default suite at a86b729 serially on a 4-CPU, 8 GB Fedora 44 workstation
+(an Intel i5-4300U, Linux 7.2, Git 2.56), with Python 3.14.8 and `TMPDIR`
+on an xfs disk, through a measuring plugin that is not in the
+repository: per test, the wall and CPU time of setup, call and teardown,
+the CPU time of its child processes, each fixture's own setup time and
+every subprocess started, by program and caller. A second pass over 251
+tests of `tests/test_engine.py` timed `Popen.wait`, `time.sleep`,
+`os.fsync`, `subprocess.run` and the executor.
+
+The 11,883 tests took 1,453 seconds of test phases. Setup was 39 of them,
+so after #345 the fixtures are no longer the cost; the call phase was
+1,409, against 307 seconds of CPU in the test process and 445 in its
+children. Ranked by what each cost there:
+
+| cost | measured | change |
+|---|---|---|
+| `os.fsync` in the test process | 9,728 calls in the engine sample, 49.8 of its 97.3 s (5.1 ms each on the disk; next to nothing on a tmpfs) | a stand-in that flushes nothing outside the durability modules ([tests/AGENTS.md](../tests/AGENTS.md#fixtures-and-fakes-testsconftestpy)) |
+| `Popen.wait(timeout)` polling `waitpid` | 37,981 launches through `execute`; 14.0 s of sleeps in the sample's 3,824 waits; `git rev-parse` through `execute` 4.45 ms, 2.42 without the poll | the executor waits on the child's pidfd |
+| the tests' own `git` processes | 32,480, about 3.7 ms each in the sample; 10,763 are the fake GitHub's reads of a branch head | the fake reads a loose ref as a file |
+| real login shells behind a fake runner | 286 launch probes (859 shells), 227 in `tests/test_doctor.py`, about 0.19 s each | none |
+| `git_repo` | 2,508 repositories, about 7.5 ms each | none |
+| `tmp_path` numbering | 0.48 ms per use at the start of a session, 1.67 after 3,700, still growing | numbered without listing the basetemp |
+| what tests wait for on purpose | timeouts, exit graces and real kills: `test_providers.py` 56 s, `test_executor.py` 41 s, `test_executor_duplex.py` 36 s, `test_scheduler.py` 52 s, `test_epic_recovery.py` 56 s | none: that is what they test |
+
+Two costs stay. A fake runner hands the launch preflight's shell probe to
+the real executor on purpose (it may observe the probe), so caching its
+answer, as `_one_shell_probe_per_answer` does for a launch without one,
+needs a rule for what the answer depends on when the runner is a test's;
+and a repository copied from a template would save about 2 ms of 7.5 while
+giving every test the same initial commit. Neither is worth its risk yet.
+
+Then the default suite ran serially on the same host and `TMPDIR`, twice
+at a86b729 and twice at 3259116, which has the four changes, alternating
+(the commit after it waits on the pidfd with `poll` rather than a
+selector, and measured the same).
+Every run passed, and test by test the outcomes at 3259116 are those at
+a86b729 plus the ten tests the changes add:
+
+| commit | runs, wall seconds | median | user CPU | system CPU |
+|---|---|---|---|---|
+| a86b729 | 1,465.9, 1,462.7 | 1,464.3 | 553, 551 | 262, 262 |
+| 3259116 | 932.2, 953.6 | 942.9 | 485, 495 | 224, 229 |
+
+That is 36% less wall time; each run's resident size still peaked at
+about 0.5 GB. The modules that launch processes and save state gained most
+(median seconds: `test_engine.py` 322 to 138, `test_replan.py` 99 to 38,
+`test_merge_certificate.py` 71 to 27, `test_local.py` 55 to 25), and those
+that wait on purpose least (`test_providers.py` 56.5 to 55.8,
+`test_executor.py` 41.8 to 41.4).
+
+How much the stand-in saves depends on the disk under `TMPDIR`. On this
+host `fsync` took 4.2 ms on the xfs disk and 0.001 ms on its tmpfs `/tmp`.
+With `TMPDIR` on the tmpfs, `tests/test_engine.py` alone, twice before and
+twice after, alternating, took a median of 154 seconds of tests before and
+121 after: 21% less, against 57% on the disk, all of it from the other
+three changes.
+
+On a host and `TMPDIR` like this one, a serial run that takes more than
+about 1,040 seconds, 10% above the median at 3259116, has lost some of
+this, and is worth profiling the same way before it is accepted. Tests pin what
+each change does, not its time: the executor's
+`test_the_exit_wait_reaps_the_child_once_it_has_exited_without_polling`
+(one `wait(0)` once the child has exited, on a host that opens and polls
+a pidfd; `test_without_a_pidfd_the_exit_wait_is_proc_wait` covers the
+fallback on every host),
+`test_the_engine_tests_save_state_without_waiting_for_the_disk` (the
+stand-in is in place there), `tests/test_tmp_path_retention.py`'s
+`test_a_tmp_path_is_numbered_without_listing_the_basetemp_and_never_reused`
+and `test_a_directory_another_name_numbered_into_is_not_reused_once_removed`,
+and `tests/test_github.py`'s
+`test_the_fakes_origin_reads_a_branch_head_as_git_does` (the fake's read
+agrees with git's). `tests/test_safefs.py`'s
+`test_the_fsync_stand_in_refuses_exactly_what_fsync_refuses` keeps the
+stand-in from hiding an error a real flush would raise. Each change reverts
+on its own; the stand-in is the one to revert if a defect turns up that
+only a real flush in the test process would have caught.
+
 ## Continuous integration
 
 The same checks run hosted on every pull request and every push to
@@ -453,6 +534,13 @@ Directories a fixture makes with `tmp_path_factory.mktemp` last the whole
 session; pytest removes the basetemp after a green run unless `--basetemp`
 named it. To keep every test's directory while debugging, run
 `uv run pytest -o tmp_path_retention_policy=all ...`.
+
+Outside the modules that test the durable writes themselves
+(`REAL_FSYNC_MODULES` in `tests/conftest.py`), the test process's
+`os.fsync` refuses what `fsync(2)` refuses and flushes nothing, since no
+test can observe a flush ([Where the serial suite's time
+goes](#where-the-serial-suites-time-goes)). A test of what a write survives
+belongs in one of those modules.
 
 - [testing.md](agent-guides/testing.md): the coverage contract, including
   the high-priority areas every behavioural change there must test.

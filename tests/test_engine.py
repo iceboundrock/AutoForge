@@ -202,6 +202,20 @@ def test_initializing_verifies_issue_then_advances(tmp_state_dir, fake_github):
     assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
 
 
+def test_the_engine_tests_save_state_without_waiting_for_the_disk(tmp_state_dir, fake_github):
+    """Outside conftest's ``REAL_FSYNC_MODULES``, ``os.fsync`` is the stand-in
+    that flushes nothing (#341): a step's saves are still written and read
+    back, without the waits for the disk that took about half this module's
+    time where the temporary directory is on a disk."""
+    from tests.conftest import REAL_FSYNC_MODULES, fsync_without_the_disk
+
+    assert Path(__file__).name not in REAL_FSYNC_MODULES
+    assert os.fsync is fsync_without_the_disk
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    eng.step()
+    assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
+
+
 def test_initializing_rejects_closed_issue(tmp_state_dir, fake_github):
     fake_github.add_issue(ISSUE, state="CLOSED")
     eng = make_engine(tmp_state_dir, [], github=fake_github)
