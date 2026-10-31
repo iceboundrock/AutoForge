@@ -2,7 +2,8 @@
 
 A procedure for checking that the published documentation alone gets a
 newcomer from nothing to a first AutoForge run: install, configure,
-`doctor`, a dry run and a real run on a throwaway repository. It is the
+`doctor`, a dry run and a real run on a GitHub repository the tester
+controls ([The target repository](#the-target-repository)). It is the
 check behind two gates of the Public Alpha
 ([#255](https://github.com/iceboundrock/AutoForge/issues/255)): Gate 1
 (fresh installation) and Gate 2 (first successful run). It is repeated at
@@ -54,6 +55,40 @@ of the run: install them as the guide's
 own instructions, and sign in to each. Say in the report which ones were
 already there.
 
+## The target repository
+
+The rules above make the execution environment fresh; the repository the
+run works on need not be new. It is one of:
+
+- **a new private repository,** made as the guide's
+  [step 3](getting-started.md#3-choose-and-prepare-a-repository) shows: the
+  recommended choice, and the one the guide's example follows;
+- **an existing repository,** private or public, that you control or are
+  authorized to change.
+
+With an existing repository, write in the report, before the real run:
+
+- that you are authorized to change it, and that you accept the run's
+  scope there: the issue you name, its branch `autoforge/<issue>`, its
+  pull request and the reviews on it, and any follow-up issues the run
+  opens;
+- on a public repository, that you accept its further risks: anyone who
+  can comment on the issue or the pull request can inject instructions
+  into agents that run as you, with your files and model keys within
+  reach; the code and the text go to the model vendors and, through the
+  pull request, to everyone; and an agent may change more than the issue
+  asks, which the repository's CI then runs with its workflows' secrets.
+  The guide's [step 3](getting-started.md#3-choose-and-prepare-a-repository)
+  says how to keep each small.
+
+Nothing else changes with the choice. The environment is still fresh; the
+installation, the documents and the starter still come from one
+[revision under test](#the-revision-under-test); the merge gate stays
+closed; and AutoForge's authority boundaries, credential protections and
+merge safeguards are the same in every repository. At a release candidate,
+Gate 2 still needs a run by someone other than the maintainer, whichever
+repository it uses.
+
 ## The revision under test
 
 Everything of AutoForge the run uses comes from one revision, its `ref`:
@@ -86,13 +121,30 @@ Number the steps in your notes as below, and note the time at each.
    install and sign in to each tool.
 2. **Install AutoForge** ([section 2](getting-started.md#2-install-autoforge))
    from `ref`, by the method [above](#the-revision-under-test) for this
-   kind of run. Run `autoforge --version` and `autoforge --help` from a
-   directory that is not a repository; on a pull request the version is
-   `main`'s `.devM` one, at a release candidate the candidate's.
-3. **Prepare the throwaway repository**
-   ([section 3](getting-started.md#3-prepare-a-throwaway-repository)),
-   with the guide's EPIC and issue, or your own and their text in the
-   report.
+   kind of run, and keep `uv`'s output. Run `autoforge --version` and
+   `autoforge --help` from a directory that is not a repository; on a pull
+   request the version is `main`'s `.devM` one, at a release candidate the
+   candidate's. The version alone does not say which commit is installed;
+   record that, with the Python AutoForge runs on and `uv`'s own version:
+
+   ```bash
+   uv --version
+   uv tool list --show-version-specifiers --show-python
+   ```
+
+   The `autoforge-cli` line names what was installed and the Python it
+   runs on. On a pull request it reads, for example,
+   `autoforge-cli v0.1.0a1.dev0 [required:  git+https://github.com/iceboundrock/AutoForge@<ref>] [CPython 3.12.14]`,
+   with `ref`'s 40 digits after the `@`; at a release candidate,
+   `[required: ==<version>]` with the candidate's version. Anything else
+   means the run is not of the revision under test: stop, and record it
+   as a friction point.
+3. **Choose and prepare the repository**
+   ([section 3](getting-started.md#3-choose-and-prepare-a-repository)): a
+   new private one, or an existing one with what
+   [The target repository](#the-target-repository) asks written in the
+   report. Use the guide's EPIC and issue, or your own and their text in
+   the report.
 4. **Write the configuration**
    ([section 4](getting-started.md#4-write-a-configuration)), with the
    starter downloaded at `ref`: name the starter, the URL you downloaded it
@@ -108,14 +160,22 @@ Number the steps in your notes as below, and note the time at each.
    many review rounds it made. If it is `BLOCKED`, follow the guide to
    leave it, and record whether the guide explained the reason.
 7. **Finish as the guide says:** merge or close the pull request yourself.
-   Then `uv tool uninstall autoforge-cli`; delete the repository if you do
-   not keep it for the record.
+   Then `uv tool uninstall autoforge-cli`. A repository made for the run
+   can be deleted, unless you keep it for the record. An existing
+   repository stays: close any follow-up issue the run opened that you do
+   not want, and delete the branch `autoforge/<issue>` if you closed its
+   pull request without merging.
 
 ## What to capture
 
 Keep these, **redacted** (below):
 
-- the environment of step 0, and the versions file of step 5;
+- the environment of step 0, the installation record of step 2 (`uv`'s
+  output, `uv --version` and the `uv tool list` line), and the versions
+  file of step 5;
+- the configuration of step 4: the starter's name, the URL it was
+  downloaded from, and every change made to it (a `diff` against a fresh
+  download shows them);
 - `doctor`'s text output;
 - the first lines of the dry run, to the `Command:` line;
 - the run's terminal output, from the command to the `READY_FOR_MERGE`
@@ -123,6 +183,8 @@ Keep these, **redacted** (below):
 - `autoforge status` at the end;
 - the URLs of the repository, the EPIC, the issue and the pull request, if
   the repository is public or you make it so; otherwise say it was private;
+- for an existing repository, what [The target repository](#the-target-repository)
+  asks you to write;
 - the friction log.
 
 **Redact before you post.** AutoForge redacts what it prints and logs, but
@@ -145,9 +207,10 @@ One header, then one row per friction point, in the order they happened:
 
 ```markdown
 **Clean-room run** · <date, UTC> · <who> · <OS and version, architecture> ·
-AutoForge <version or commit> · Python <version> · git <version> ·
+AutoForge <version and ref> · Python <version> · uv <version> · git <version> ·
 gh <version> · Claude Code <version> · OpenCode <version, or "not used"> ·
-starter <file> · result: READY_FOR_MERGE | BLOCKED (<reason>) after
+starter <file> · repository: new private | existing private | existing
+public · result: READY_FOR_MERGE | BLOCKED (<reason>) after
 <n> review round(s) · time: <prerequisites> + <install to doctor> + <run>
 
 | # | Step | What I did | What I expected | What happened (exact message) | Workaround | Cost | Severity |
@@ -165,4 +228,5 @@ starter <file> · result: READY_FOR_MERGE | BLOCKED (<reason>) after
 
 Post the log, with what you captured, as a comment on the issue that asked
 for the run. Each friction point is then either fixed or documented, and
-the issue says which.
+the issue says which, by row number: fixed, with the pull request or
+commit, or documented, with the page and section.

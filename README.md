@@ -306,9 +306,10 @@ with `--config` before the subcommand; see [Configuration](https://github.com/ic
 
 New to AutoForge? [Getting started](https://github.com/iceboundrock/AutoForge/blob/main/docs/getting-started.md)
 walks through a first run on a repository of your own: prerequisites,
-installing, a throwaway repository with an EPIC and an issue, a starter
-configuration, what each `doctor` row means, a dry run, a real run, and the
-common first-run failures with their fixes. The commands in brief:
+installing, a repository (a new private one, or an existing one you may
+change) with an EPIC and an issue, a starter configuration, what each
+`doctor` row means, a dry run, a real run, and the common first-run
+failures with their fixes. The commands in brief:
 
 Run these from a checkout of the repository the issues belong to. URLs must
 be HTTPS GitHub issue URLs, and the EPIC and the issue must be in that same

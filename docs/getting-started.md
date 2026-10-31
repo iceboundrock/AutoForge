@@ -1,10 +1,11 @@
 # Getting started
 
 This guide takes you from nothing to a first AutoForge run on a
-repository of your own: install the command, prepare a throwaway
-repository, write a configuration, check the environment with `doctor`,
-preview a run, run it, and read where it stopped. It assumes you know git
-and GitHub, and nothing about AutoForge.
+repository of your own: install the command, choose and prepare a
+repository (a new private one is recommended), write a configuration,
+check the environment with `doctor`, preview a run, run it, and read where
+it stopped. It assumes you know git and GitHub, and nothing about
+AutoForge.
 
 AutoForge drives coding agents: Claude Code implements an issue, a reviewer
 reads the pull request, and the controller checks every claim against
@@ -22,7 +23,7 @@ your logins are recorded by the [clean-room procedure](clean-room.md).
 
 1. [Prerequisites](#1-prerequisites)
 2. [Install AutoForge](#2-install-autoforge)
-3. [Prepare a throwaway repository](#3-prepare-a-throwaway-repository)
+3. [Choose and prepare a repository](#3-choose-and-prepare-a-repository)
 4. [Write a configuration](#4-write-a-configuration)
 5. [Check the environment: `doctor`](#5-check-the-environment-doctor)
 6. [Preview, run, and read where it stopped](#6-preview-run-and-read-where-it-stopped)
@@ -81,14 +82,20 @@ warning: `/home/you/.local/bin` is not on your PATH. To use installed tools, run
 Run `uv tool update-shell` and open a new shell. `autoforge` then runs from
 any directory; it always works on the git checkout you run it in.
 
-## 3. Prepare a throwaway repository
+## 3. Choose and prepare a repository
 
-Make the first run on a new repository **you control**, not on a project
-you care about and not on a public repository where strangers comment.
-Agents read the issue, its comments and the pull request, and anyone who
-can write there can address them; an injected instruction runs as you
+A run works in the repository of its issue, on GitHub, as you: it pushes a
+branch `autoforge/<issue>`, opens a pull request, posts each review as a
+comment on it, and may open follow-up issues for review findings it leaves
+for later; with the starters of step 4 it comments on the issue only after
+you approve the comment (`unblock --approve-action`). Agents read the
+issue, its comments and the pull request, and anyone who can write there
+can address them; an injected instruction runs as you
 ([Prompt injection, and public repositories in particular](security.md#prompt-injection-and-public-repositories-in-particular)).
-A private repository keeps strangers out.
+
+**Recommended: a new private repository.** Nothing in it matters, and
+being private keeps strangers out. The rest of this guide uses it
+(`you/first-run`):
 
 ```bash
 gh repo create first-run --private --add-readme --clone
@@ -97,6 +104,31 @@ cd first-run
 
 `--add-readme` gives the default branch a first commit, which a run starts
 from.
+
+**Or an existing repository** that you own or are authorized to change,
+private or public. Clone it, and run every command of this guide from
+that clone. Before the first run, decide that you accept:
+
+- **the scope:** the one issue you name, its branch, its pull request and
+  the reviews on it, and any follow-up issues. With the merge gate closed,
+  as here, nothing reaches the default branch until you merge;
+- **injection,** on a public repository above all: anyone who can comment
+  on the issue or the pull request can steer agents that run as you, with
+  your files and model keys within reach. Pick an issue whose comments you
+  control, and consider GitHub's interaction limits while the run is
+  active;
+- **disclosure:** the code, the issue and the pull request go to the model
+  vendors ([Your content goes to model vendors](security.md#your-content-goes-to-model-vendors)),
+  and on a public repository the pull request and its reviews are public;
+- **unintended changes:** an agent may change more than the issue asks,
+  and your CI runs the pushed branch with the secrets its workflows have
+  ([Pushed code runs in your CI](security.md#pushed-code-runs-in-your-ci)).
+  Read the diff before you merge.
+
+[Recommended settings for a repository you care about](security.md#recommended-settings-for-a-repository-you-care-about)
+says what to set first. The choice changes nothing AutoForge enforces: the
+merge gate and its checks, and the boundaries around your credentials, are
+the same in every repository.
 
 **Keep AutoForge's files out of git.** A run writes its state, prompts and
 agent logs under `.autoforge/` in the checkout, and your configuration
@@ -174,6 +206,10 @@ epic='https://github.com/you/first-run/issues/1'    # replace with your EPIC's U
 issue='https://github.com/you/first-run/issues/2'   # replace with your issue's URL
 ```
 
+In an existing repository, the issue can be one already open there, or one
+you write about that project, of the same size as the example; the EPIC
+any other issue of it. Set `epic` and `issue` to their URLs the same way.
+
 **Required checks.** AutoForge's merge gate (closed by default) trusts a
 pull request whose checks all passed, and relies on a branch rule of the
 default branch to say which check had to exist. `doctor` reads that rule
@@ -181,8 +217,11 @@ default branch to say which check had to exist. `doctor` reads that rule
 no rule, and that is fine for a first run: with the gate closed the row is
 a `WARN` (or a `SKIP` on a private repository of GitHub Free, which offers
 no branch rules), the run stops at `READY_FOR_MERGE`, and you read the pull
-request and its checks yourself before you merge. The row matters once you
-want AutoForge to merge; then:
+request and its checks yourself before you merge. An existing repository
+may have a rule already: the row is `OK` when an active rule that nobody
+can bypass requires every check `safety.required_checks` names, and
+otherwise the same `WARN` or `SKIP` says what is missing. The row matters
+once you want AutoForge to merge; then:
 
 1. have CI report a status check on every pull request, and put its name in
    `safety.required_checks` (the starters say `ci`, AutoForge's own check);
@@ -265,7 +304,7 @@ On a first run, expect these rows:
 | `agent 'claude' available (...)`, `agent 'opencode' available (...)` | `FAIL ... executable not found: claude` | the CLI is not installed, or not on `PATH`. The row lists the profiles that use it: install it, or route those profiles to a CLI you have (the Claude-only starter) |
 | `agent 'claude' keeps integrations off (...)` | `FAIL` | this Claude Code does not list `--safe-mode`, `--strict-mcp-config` and `--setting-sources` in `claude --help`: update it, since every launch passes them |
 | | `SKIP ... stopped mid-line after 8192 bytes` | Claude Code wrote only part of its help to `doctor` (2.1.314 does when its output is a pipe), so the flags could not be looked up. A launch refuses a Claude Code without them anyway; to check by hand, run `claude --help > claude-help.txt` and look for the three flags in the file |
-| `default branch requires checks` | `WARN ... no rule requires a status check` (with the merge gate closed) | expected on a new repository, see [Required checks](#3-prepare-a-throwaway-repository). It becomes a `FAIL` if you open the merge gate |
+| `default branch requires checks` | `WARN ... no rule requires a status check` (with the merge gate closed) | expected on a new repository, and on an existing one whose rules do not require the checks `safety.required_checks` names; see [Required checks](#3-choose-and-prepare-a-repository). It becomes a `FAIL` if you open the merge gate |
 | | `SKIP` | the rules could not be read: the plan offers none (a private repository on GitHub Free), or the token cannot read them. The row names which, and the way out |
 | `pull request check runs readable` | `SKIP ... UNKNOWN: no recently updated open pull request ... has a check result` | nothing to try it on yet. It matters only with the merge gate open |
 | `outer sandbox: mode (disabled)` | `WARN` | agents run as you, without the outer sandbox. That is the default; [Security boundaries](security.md#the-outer-sandbox-is-opt-in-and-linux-only) explains the choice |
@@ -294,7 +333,7 @@ autoforge --config autoforge.yaml run --epic "$epic" --issue "$issue" --dry-run
 ```
 
 `$epic` and `$issue` are the two URLs of
-[step 3](#3-prepare-a-throwaway-repository). Typed by hand, each is the
+[step 3](#3-choose-and-prepare-a-repository). Typed by hand, each is the
 issue's complete `https://github.com/...` URL, quoted.
 
 It starts with:
@@ -369,7 +408,9 @@ Read the pull request and the review comment, and merge it on GitHub if you
 agree, or close it. The run stays at `READY_FOR_MERGE`; for the next issue,
 `autoforge run --force --epic ... --issue ...` replaces it. Each issue keeps
 its agent worktree under `.git/autoforge/worktrees/<number>`; `git worktree
-list` shows them, and deleting the throwaway checkout removes everything.
+list` shows them. Deleting the clone of a repository made for the first run
+removes everything; in a clone you keep, remove a finished issue's
+worktree with `git worktree remove` (AutoForge never deletes one).
 
 **`BLOCKED`.** The controller found something it will not decide alone: a
 check that failed, a claim it could not verify, a bound reached. The run
