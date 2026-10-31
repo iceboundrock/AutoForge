@@ -1652,6 +1652,48 @@ def test_a_local_block_is_refused_as_an_unknown_key_by_every_command(
     assert cli.main(["--config", str(config), "doctor", "--json"]) == 1
     row = next(c for c in json.loads(capsys.readouterr().out)["checks"] if c["name"] == "config")
     assert not row["ok"] and row["detail"].startswith(refusal)
+    assert state_tree(tmp_path) == before
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["absent", "existing"])
+@pytest.mark.parametrize("where", ["default", "relative", "absolute"])
+def test_doctor_writes_no_state_directory_for_a_configuration_it_refused(
+    tmp_path, capsys, monkeypatch, where, existing
+):
+    """ADR 0009's S2 exit tests: nothing is written for a ``local:`` key,
+    by ``doctor`` too. Its state-directory row creates the directory and
+    writes a probe in it, so for a refused configuration it is skipped:
+    ``.autoforge`` or the ``--state-dir`` given, absent or already there,
+    is left as it was, and so is everything else in the checkout."""
+    monkeypatch.chdir(tmp_path)
+    config = tmp_path / "autoforge.json"
+    config.write_text(json.dumps({"version": 1, "local": {"max_fix_rounds": 1}}))
+    state_dir = {
+        "default": None,
+        "relative": "custom-state",
+        "absolute": str(tmp_path / "elsewhere" / "state"),
+    }[where]
+    target = tmp_path / (state_dir or ".autoforge")
+    if existing:
+        (target / "logs").mkdir(parents=True)
+        (target / "state.json").write_text('{"phase": "REVIEW"}\n')
+    flags = ["--state-dir", state_dir] if state_dir else []
+
+    def runner(req):
+        return ExecutionResult(req.command, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    before = state_tree(tmp_path)
+    assert cli.main(["--config", str(config), *flags, "doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] config: " in out and "unknown key(s) under 'the top level': local" in out
+    assert "[SKIP] state dir writable: (config check failed)" in out
+    assert state_tree(tmp_path) == before
+    assert cli.main(["--config", str(config), *flags, "doctor", "--json"]) == 1
+    rows = {c["name"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+    assert rows["state dir writable"]["skipped"] and not rows["config"]["ok"]
+    assert state_tree(tmp_path) == before
+    assert target.exists() == existing
 
 
 # Every label a state file has had (1 to the current one), the next one, and none.
