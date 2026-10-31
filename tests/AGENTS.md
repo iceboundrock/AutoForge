@@ -281,8 +281,9 @@ the state pins of LOCAL's removal     test_state.py, test_replan.py (the refusal
                                       load: every command, run --force), test_scheduler_state.py,
                                       test_epic_commands.py (the scheduler's passes)
 LOCAL's ways in, closed (ADR 0009     test_cli.py (autoforge local, --help, a local: key,
-S2, #387)                             a LOCAL state under every label, no read of
-                                      <git dir>/autoforge/state), test_config.py (the key),
+S2, #387)                             a LOCAL state under every label and in the lock's
+                                      directory, no read of <git dir>/autoforge/state),
+                                      test_config.py (the key),
                                       test_state.py, test_local.py (the loader),
                                       test_ownership.py, test_epic_commands.py (the scheduler,
                                       the epic commands' refusal of the key)

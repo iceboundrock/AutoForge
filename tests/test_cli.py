@@ -1781,6 +1781,75 @@ def test_a_local_state_is_refused_under_every_label_and_left_alone(
     assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
 
 
+# The commands that take the controller lock to act on a state, without --force.
+_LOCKING_COMMANDS = (
+    ["step"],
+    ["resume"],
+    ["unblock", "--reason", "the operator looked"],
+    _run_argv_of(1),
+)
+
+
+@pytest.mark.parametrize("lock_file", ["absent", "existing"])
+@pytest.mark.parametrize("label", ["12", "13", None], ids=lambda label: f"label-{label}")
+def test_a_local_state_in_the_locks_directory_is_refused_without_taking_the_lock(
+    tmp_path, capsys, monkeypatch, fakes, label, lock_file
+):
+    """ADR 0009's S2 exit tests (#387, R2-F1): with ``--state-dir`` at the
+    lock's own directory, ``<git common dir>/autoforge``, ``controller.lock``
+    lies in the state directory, and taking the lock creates it or rewrites
+    its PID record. A LOCAL state there is refused before the lock is taken,
+    so the whole directory, a lock file a controller left in it included, is
+    as it was, and no lock is held afterwards."""
+    monkeypatch.chdir(tmp_path)
+    lock = repository_lock_path(tmp_path)
+    sd = lock.parent
+    _write_local_state(sd, label, False)
+    if lock_file == "existing":
+        # The PID record of a controller that has exited.
+        lock.write_text(f"{os.getpid() + 1}\n", encoding="ascii")
+    refusal = "state file has unknown mode 'LOCAL'"
+    before = state_tree(sd)
+    calls = (len(fakes["gh"].calls), len(fakes["provider"].calls))
+    acquired = _count_lock_acquisitions(monkeypatch)
+    for spelling in (str(sd), os.path.relpath(sd, tmp_path)):
+        for words in _LOCKING_COMMANDS:
+            assert cli.main(["--state-dir", spelling, *words]) == 2, words
+            assert refusal in capsys.readouterr().err, words
+            assert state_tree(sd) == before, words
+    assert acquired == []
+    assert lock.exists() == (lock_file == "existing")
+    assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
+    assert _second_controller_can_lock(lock)
+
+
+@pytest.mark.parametrize("words", _LOCKING_COMMANDS, ids=lambda words: words[0])
+def test_a_state_that_loads_before_the_lock_is_read_again_under_it(
+    tmp_path, capsys, monkeypatch, fakes, words
+):
+    """#387, R2-F1: what a command reads before the lock may only refuse. A
+    state that loads then, and that another controller replaces with a
+    LOCAL one before the lock is taken, is read again under the lock and
+    refused there: nothing is launched and the LOCAL file is left as it is.
+    For ``run`` the state appears in the window, where none was."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    sf = sd / "state.json"
+    sd.mkdir()
+    if words[0] == "unblock":
+        save_state(_other_controller_state("af-stale", Phase.BLOCKED, "human needed"), sf)
+    elif words[0] != "run":
+        save_state(_other_controller_state("af-stale"), sf)
+    other = tmp_path / "other"
+    raw = _write_local_state(other, "12", False)
+    fakes["handler"] = implement
+    fired = _interleave_before_first_lock(monkeypatch, lambda: os.replace(other / "state.json", sf))
+    assert cli.main(["--state-dir", str(sd), *words]) == 2 and fired
+    assert "state file has unknown mode 'LOCAL'" in capsys.readouterr().err
+    assert fakes["provider"].calls == [] and fakes["gh"].effect_writes == []
+    assert sf.read_bytes() == raw and sorted(p.name for p in sd.iterdir()) == ["state.json"]
+
+
 def test_a_local_state_at_the_git_dirs_default_location_is_not_looked_for(
     tmp_path, capsys, monkeypatch, fakes
 ):

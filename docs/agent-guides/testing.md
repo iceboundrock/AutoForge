@@ -399,7 +399,11 @@ High-priority coverage includes:
   (1 to 12, 13 and none), as LOCAL saved it and with garbage beside it,
   and `status`, `status --json`, `step`, `resume` and `unblock` exit 2
   with its directory byte for byte, while `run` refuses and `run --force`
-  moves it aside (the S1b pins above); nothing reads
+  moves it aside (the S1b pins above); in the lock's own directory
+  (`--state-dir <git common dir>/autoforge`), with a lock file there or
+  none, `step`, `resume`, `unblock` and `run` refuse it without taking
+  the lock, the whole directory as it was, and a state that loads before
+  the lock and is LOCAL under it is refused under it; nothing reads
   `<git dir>/autoforge/state`: with a LOCAL state there, every command
   says there is no state at the configured location and `run` starts a
   REMOTE run beside it; and a LOCAL state at `config.state_dir` is the

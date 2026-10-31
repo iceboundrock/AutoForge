@@ -580,6 +580,21 @@ def _refuse_scheduler_state_dir(engine: ControllerEngine, args, command: str) ->
         engine.refuse_scheduler_state_dir(command)
 
 
+def _refuse_unloadable_state_before_the_lock(engine: ControllerEngine) -> None:
+    """Load the state once before the lock, only to refuse one that does not load.
+
+    Taking the controller lock creates ``controller.lock`` or rewrites its
+    PID record, and that file lies in the state directory when the state
+    directory is the lock's own (``--state-dir <git common dir>/autoforge``).
+    A refusal needs no lock and writes nothing, so a missing state and one
+    that does not load, a LOCAL one among them (ADR 0009 D4, #387), are
+    refused before the lock is taken and leave the directory as it was. The
+    snapshot decides nothing else: ``step``, ``resume`` and ``unblock`` read
+    the state again under the lock and act on that one alone.
+    """
+    engine.load()
+
+
 def _doctor_runner():
     """Command runner used by `doctor` (indirection so tests can inject a fake)."""
     return None
@@ -1346,8 +1361,10 @@ def _existing_run_guard(
 ) -> tuple[int | None, bool]:
     """Decide whether a fresh run may overwrite the run at ``engine.paths``.
 
-    Returns ``(exit_code_or_None, corrupt)``. Must be called with the
-    controller lock held: a verdict taken before the lock could go stale.
+    Returns ``(exit_code_or_None, corrupt)``. A verdict that lets the run
+    go ahead must be taken with the controller lock held: one taken before
+    the lock could go stale. A refusal writes nothing, so ``run`` also asks
+    once before it takes the lock, and returns at once when refused (#387).
     The inspection goes through the engine's held state root -- the same
     capability the first save and every later write will use -- so the
     directory that is inspected is the directory that is written.
@@ -1428,6 +1445,12 @@ def cmd_run(args) -> int:
     # A state directory inside the scheduler root is a namespace's, never a
     # standalone run's (ADR 0008 D17.3); refused before the lock is taken.
     engine.refuse_scheduler_state_dir("run")
+    # A run the state already there refuses is refused before the lock too:
+    # the refusal writes nothing, and taking the lock would write its PID
+    # record in the state directory when that is the lock's own (#387).
+    rc, _ = _existing_run_guard(engine, args.force)
+    if rc is not None:
+        return rc
     # Inspect, decide, quarantine, write the first state AND execute under
     # one continuous lock: a verdict taken before the lock could go stale
     # (another controller may have repaired, replaced or created state.json
@@ -1472,6 +1495,7 @@ def cmd_step(args) -> int:
         if outcome.plan is not None:
             print_plan(outcome.plan, full_prompt=args.full_prompt)
         return 0
+    _refuse_unloadable_state_before_the_lock(engine)
     # Load and execute under one lock: a snapshot loaded before the lock
     # could already have been replaced by another controller.
     with engine.locked():
@@ -1499,6 +1523,7 @@ def cmd_resume(args) -> int:
             assert o.plan is not None
             print_plan(o.plan, full_prompt=args.full_prompt)
         return 0
+    _refuse_unloadable_state_before_the_lock(engine)
     # Load, decide and execute under one lock: a snapshot loaded before the
     # lock could already have been replaced by another controller.
     with engine.locked():
@@ -1547,6 +1572,7 @@ def cmd_unblock(args) -> int:
         )
         print_unblock_outcome(outcome)
         return 0
+    _refuse_unloadable_state_before_the_lock(engine)
     # Load, decide and write under one lock, like `step`. An accepted
     # configuration change is its own recorded write, made before the
     # decision: a refused unblock leaves it in place.
