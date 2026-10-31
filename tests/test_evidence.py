@@ -1220,3 +1220,80 @@ def test_the_failure_counter_names_a_remote_failure_only():
     for view in (passed, local_fail):
         with pytest.raises(ValueError, match="REMOTE FAIL or TIMEOUT"):
             ev.failure_counter("FIX", {}, view)
+
+
+# -- a narrower run never stands for the full one (ADR 0010, #342) ---------------------
+
+# A FAST-sized selection and the full suite, as an operator could configure
+# either at the same index of `validation.commands`.
+NARROW = Definition(0, ("uv", "run", "pytest", "tests/test_evidence.py"))
+WHOLE = Definition(0, ("uv", "run", "pytest"))
+
+
+def test_a_narrower_selections_pass_never_stands_for_the_full_definition():
+    """ADR 0010 D2, D4 (no promotion): a PASS of a narrower selection is a
+    record of that selection only. On the same candidate, under the same
+    policy, at the same index, it is no evidence for the full suite's
+    definition; and a record stands for its own argv at its own index, so a
+    set that lists the same command elsewhere does not reuse it either."""
+    (narrow,) = _views(record(1, definition=NARROW))
+    assert ev.eligible(narrow, remote(), NARROW, policy(), None)
+    assert not ev.eligible(narrow, remote(), WHOLE, policy(), None)
+    assert not ev.eligible(narrow, remote(), Definition(1, NARROW.argv), policy(), None)
+    assert ev.find_evidence([narrow], remote(), (WHOLE,), policy(), None).records == ()
+
+
+def test_complete_evidence_for_a_narrower_set_is_not_evidence_for_the_full_set():
+    """ADR 0010 D4: a set's evidence and its binding are for that set only.
+
+    Every definition of a narrower set passing leaves the full set
+    undecided, under another set digest, and a binding naming the narrower
+    set's evidence is not reused for a review under the full set (no
+    promotion). The other way, complete evidence for the full set bound for
+    a review is not reused once the set in force is narrowed (no downgrade):
+    the next entry binds again, under the narrower set's own digest.
+    """
+    narrow_set, full_set = (DEF0,), (DEF0, DEF1)
+    one = _views(record(1))
+    narrow = ev.find_evidence(one, remote(), narrow_set, policy(), None)
+    full = ev.find_evidence(one, remote(), full_set, policy(), None)
+    assert narrow.complete and not full.decided
+    assert narrow.validation_set_digest != full.validation_set_digest
+
+    def reusable(raw, records, defs) -> bool:
+        return ev.binding_reusable(
+            raw,
+            records,
+            review_round=2,
+            candidate=remote(),
+            validation_set_digest=ev.validation_set_digest(defs),
+            policy_digest=policy().digest,
+            watermark=None,
+        )
+
+    assert reusable(ev.binding(2, narrow), one, narrow_set)
+    assert not reusable(ev.binding(2, narrow), one, full_set)
+
+    both = _views(record(1), record(2, definition=DEF1))
+    whole = ev.find_evidence(both, remote(), full_set, policy(), None)
+    assert whole.complete
+    assert reusable(ev.binding(2, whole), both, full_set)
+    assert not reusable(ev.binding(2, whole), both, narrow_set)
+
+
+def test_a_full_failure_stays_terminal_whatever_passes_beside_it():
+    """ADR 0010 D1, D13.5 (no downgrade): a FAIL of the full suite on a
+    candidate stays the set's verdict for that candidate. A later PASS of a
+    narrower selection on it, or of the full suite on another commit with
+    the same tree, does not clear it or make it historical; only the
+    operator's override does (ADR 0006 D14.2), and the definition then runs
+    again rather than taking the other PASS."""
+    records = _views(
+        record(1, definition=WHOLE, exit_code=1),
+        record(2, definition=NARROW),
+        record(3, definition=WHOLE, candidate=remote(commit="e" * 40)),
+    )
+    found = ev.find_evidence(records, remote(), (WHOLE,), policy(), None)
+    assert found.failed is not None and found.failed.seq == 1 and not found.complete
+    overridden = ev.find_evidence(records, remote(), (WHOLE,), policy(), 1)
+    assert overridden.records == () and not overridden.decided

@@ -327,6 +327,28 @@ def test_an_empty_set_gates_nothing(tmp_state_dir):
     assert saved(eng).validation_records == []
 
 
+def test_an_implementers_fast_pass_is_a_claim_that_neither_skips_nor_satisfies_the_set(
+    tmp_state_dir,
+):
+    """ADR 0010 D1, D3: the implementer reports that the fast target and the
+    full suite both passed. The controller runs the set in force on the exact
+    candidate all the same; its failure is recorded and counted and nothing
+    is published, and the claim is in no record and nowhere in the state."""
+    claim = ["make test-fast: passed (FAST, 3 of 88 test modules)", "make check: passed"]
+    gh = FakeGitHub()
+    eng = producing(
+        tmp_state_dir, gh, scripted(lambda req: implement(req, tests=claim)), PASSES, FAILS
+    )
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE" and "did not pass" in out.message
+    s = saved(eng)
+    assert outcomes(s) == ["PASS", "FAIL"]
+    assert s.producer_validation_failure["count"] == 1
+    nothing_published(eng, gh)
+    state_text = eng.paths.state_file.read_text(encoding="utf-8")
+    assert "test-fast" not in state_text and "make check" not in state_text
+
+
 # -- candidate identity: what the producer gate validates (D2.4, D6.3, D6.5) -----------
 
 
