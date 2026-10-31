@@ -375,10 +375,16 @@ High-priority coverage includes:
     `tests/test_engine.py`): a `credential.helper` in the common dir's
     `config` and the worktree's `config.worktree` never reaches the
     validation command, which runs in an export git reads neither from,
-    and the next agent launch refuses it; a GitHub `~/.netrc` entry and a
-    `~/.profile` exporting `GITHUB_TOKEN` are refused before the command
-    runs: no record, `BLOCKED` naming the source and never the value,
-    nothing pushed or published
+    and the next agent launch refuses it. That command, with every route
+    of the operator's set and the operator's global git configuration,
+    `ZDOTDIR` and fish `SHELL` in place, sees none of the operator's
+    credential variables, the empty `gh` configuration, exactly the
+    command-scope git resets, a global configuration holding only the
+    operator's identity, `GIT_TERMINAL_PROMPT=0`, empty curl and wget
+    configuration, an empty `ZDOTDIR` and a POSIX `SHELL` (#241 R1-F1).
+    A GitHub `~/.netrc` entry and a `~/.profile` exporting `GITHUB_TOKEN`
+    are refused before the command runs: no record, `BLOCKED` naming the
+    source and never the value, nothing pushed or published
   - crash recovery: the four journal cases of
     `tests/test_local_recovery_matrix.py` are covered by
     `tests/test_runlog.py` and REMOTE `tests/test_engine.py`, a foreign
