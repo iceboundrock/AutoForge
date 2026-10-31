@@ -190,6 +190,50 @@ WHOLE_VALUES_285_R3_REDACTED = {
     "yaml-folded-block": "Partner_Api_Key: >-\n  ***REDACTED***",
     "yaml-block-in-sequence": "- name: app\n  client_secret: |+\n    ***REDACTED***",
 }
+# Values the fourth review of #285 found kept in part or whole, each valid
+# shell or YAML: a value below its key after a blank line or a comment line,
+# a plain scalar with a blank line among its lines or that starts on its
+# key's line and goes on below it (R4-F1); a quoted value whose opening quote
+# ends its line, on the name's line and below a YAML key (R4-F2); a literal
+# or folded block that starts with a bracket or a number, and a plain scalar
+# of several lines that starts with a number (R4-F3). Each with its id, the
+# text and what must not appear once it is redacted or refused.
+WHOLE_VALUES_285_R4 = [
+    ("yaml-blank-before", "client_secret:\n\n  FAKEafterblank", "FAKEafterblank"),
+    ("yaml-comment-before", "x_api_key:\n  # rotated\n  FAKEaftercomment", "FAKEaftercomment"),
+    (
+        "yaml-blank-and-comment-before",
+        "Db_Password:\n\n# set by ops\n\n  FAKEaftermixed",
+        "FAKEaftermixed",
+    ),
+    ("yaml-blank-inside", "api_token:\n  FAKEfirst\n\n  FAKEafterblank", "FAKEafterblank"),
+    ("yaml-continued", "db_password: FAKEfirst\n  FAKEcontinued", "FAKEcontinued"),
+    ("shell-leading-break", 'export DB_PASSWORD="\nFAKEafterbreak"', "FAKEafterbreak"),
+    ("yaml-leading-break", "client_secret: '\n  FAKEafterbreak'", "FAKEafterbreak"),
+    ("yaml-below-leading-break", 'Partner_Api_Key:\n  "\n  FAKEafterbreak"', "FAKEafterbreak"),
+    ("yaml-literal-bracket", "client_secret: |\n  [FAKE]bracketed", "bracketed"),
+    ("yaml-literal-number", "db_password: |\n  12345\n  FAKEafternumber", "FAKEafternumber"),
+    ("yaml-folded-number", "x_api_key: >-\n  12345\n  FAKEafternumber", "FAKEafternumber"),
+    ("yaml-plain-number", "api_token:\n  12345\n  FAKEafternumber", "FAKEafternumber"),
+]
+# What ``redact`` makes of each of them: the name, the quotes, a block's
+# header, the blank and comment lines before a value and its indentation
+# stay; a value that starts on its key's line, or whose quote ends its line,
+# is replaced on that line.
+WHOLE_VALUES_285_R4_REDACTED = {
+    "yaml-blank-before": "client_secret:\n\n  ***REDACTED***",
+    "yaml-comment-before": "x_api_key:\n  # rotated\n  ***REDACTED***",
+    "yaml-blank-and-comment-before": "Db_Password:\n\n# set by ops\n\n  ***REDACTED***",
+    "yaml-blank-inside": "api_token:\n  ***REDACTED***",
+    "yaml-continued": "db_password: ***REDACTED***",
+    "shell-leading-break": 'export DB_PASSWORD="***REDACTED***"',
+    "yaml-leading-break": "client_secret: '***REDACTED***'",
+    "yaml-below-leading-break": 'Partner_Api_Key:\n  "***REDACTED***"',
+    "yaml-literal-bracket": "client_secret: |\n  ***REDACTED***",
+    "yaml-literal-number": "db_password: |\n  ***REDACTED***",
+    "yaml-folded-number": "x_api_key: >-\n  ***REDACTED***",
+    "yaml-plain-number": "api_token:\n  ***REDACTED***",
+}
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)
 # and the base branch's `push` run at its tip (the reference definition).

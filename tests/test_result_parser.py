@@ -88,6 +88,7 @@ from tests.conftest import (
     SHORT_WRAPPED_KEY_LINE,
     WHOLE_VALUES_285,
     WHOLE_VALUES_285_R3,
+    WHOLE_VALUES_285_R4,
     block,
     comment_url,
 )
@@ -2647,6 +2648,11 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
         # Round 3: a quoted value whose lines hold a blank line, the other
         # quote or a backtick, and a value on the lines below its key.
         *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285_R3),
+        # Round 4: a YAML value past blank or comment lines, a plain scalar
+        # with a blank line or that starts on its key's line, a quoted value
+        # whose quote ends its line, and a block or a plain scalar that
+        # starts with a bracket or a number.
+        *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285_R4),
     ],
     ids=[
         "short-wrapped-key",
@@ -2655,6 +2661,7 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
         "mixed-case",
         *(f"round-2-{name}" for name, _, _ in WHOLE_VALUES_285),
         *(f"round-3-{name}" for name, _, _ in WHOLE_VALUES_285_R3),
+        *(f"round-4-{name}" for name, _, _ in WHOLE_VALUES_285_R4),
     ],
 )
 def test_a_shape_the_285_review_found_is_refused_by_every_published_content_check(cls, text, body):

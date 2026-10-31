@@ -37,19 +37,28 @@ so.
   rest in the clear. The quote may be escaped, as JSON writes it, doubled
   inside the value (`'it''s'`, as YAML writes one), and the value may span
   lines, as a shell or YAML string does, whatever they hold: blank lines,
-  the other quote character and backticks too. A quote in code or prose
+  the other quote character and backticks too, and it may start with a line
+  break (`GH_TOKEN="` on one line, the value on the next) where its name
+  stands outside every string its line opens. A quote in code or prose
   that opens no value does not take the lines after it: one that a word
-  follows, one that ends its line, and one after a name that starts a
+  follows, one that ends its line inside a string literal
+  (`help = "Set GITHUB_TOKEN="`), and one after a name that starts a
   string literal or a code span. An unquoted value ends at a line break
   written out (`\n` in JSON text), so a `NAME: value` line after it is
   redacted in turn.
 - A value on the lines below a YAML key named so (an indented plain or
-  quoted scalar, a literal `|` or folded `>` block, an Ansible `!vault |`)
-  is redacted whole, under a lower-case name too, where only a value on the
-  key's line was before; a statement that ends in a colon
+  quoted scalar, also past blank and comment lines and with blank lines
+  among its lines, a literal `|` or folded `>` block, an Ansible
+  `!vault |`), and a plain scalar that starts on the key's line and goes on
+  below it, are redacted whole, under a lower-case name too, where only a
+  value on the key's line was before; a statement that ends in a colon
   (`if api_token:`), a nested mapping and, under a lower-case name, a value
-  that reads as code (`${{ secrets.X }}`) are left. The key, a block's
-  header and the value's indentation stay.
+  that reads as code (`${{ secrets.X }}`, `process.env.X`) are left. A
+  block is a string whatever its lines hold, so one that starts with a
+  bracket or a number is redacted; one whose every line is a placeholder or
+  a reference (`${{ secrets.X }}`, `{{ vault_secret }}`, `$X`) is left. The
+  key, a block's header, the blank and comment lines before the value and
+  its indentation stay.
 - `redact` repeats its patterns until a round changes nothing, so redacting
   its output again changes nothing and finds no credential in it, also
   where one pattern redacted a part of the text another value's extent

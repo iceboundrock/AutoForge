@@ -14,12 +14,16 @@ after a character that cannot be part of it, or directly after an escape
 sequence (``ESC[0m``, ``\\n``, ``\\u00e9``; see ``_ESCAPE``). An assignment's
 quoted value is recognised behind an escaped quote too
 (``GH_TOKEN=\\"...\\"``, as JSON writes it; see ``_QUOTE``) and replaced
-whole, to its closing quote, a later line's too (``_QUOTED_VALUE``), and a
-named assignment or header under a quoted key (``"GITHUB_TOKEN": "..."``,
-``"Authorization": "Bearer ..."``). A credential name's value on the lines
-below it, as YAML writes one (an indented scalar, a ``|`` or ``>`` block),
-is recognised too (``_yaml_value``). :func:`redact_obj` knows a credential's
-name as a mapping's key too (``{"GEMINI_API_KEY": "..."}``).
+whole, to its closing quote, a later line's too (``_QUOTED_VALUE``), also
+one whose opening quote ends its line where the name stands outside every
+string (``_quoted_from_next_line``), and a named assignment or header under
+a quoted key (``"GITHUB_TOKEN": "..."``, ``"Authorization": "Bearer ..."``).
+A credential name's value on the lines below it, as YAML writes one (an
+indented scalar past blank and comment lines, a ``|`` or ``>`` block), is
+recognised too (``_yaml_value``), and a plain scalar that starts on the
+key's line and goes on below it (``_yaml_continued``). :func:`redact_obj`
+knows a credential's name as a mapping's key too
+(``{"GEMINI_API_KEY": "..."}``).
 A line that starts a code fence is never a value (``_SPACE_TO_VALUE``).
 :func:`redact` applies the patterns in rounds until one changes nothing
 (``_MAX_ROUNDS``), so what it returns is what redacting it again returns.
@@ -181,8 +185,10 @@ _UNQUOTED_VALUE = (
 #   same): a quote that a word follows opens the next string, as a quote in
 #   code or prose after a cut value does (``say "this"``, ``log('done')``);
 # - the value's first line holds something: a quote that ends its line closes
-#   a string literal (``field = "Set GITHUB_TOKEN="``) more often than it
-#   opens a value that starts with a line break;
+#   a string literal (``field = "Set GITHUB_TOKEN="``) as often as it opens a
+#   value that starts with a line break, so such a value is recognised only
+#   where its name stands outside every string its line opens before it
+#   (``_quoted_from_next_line``, #285 review, round 4);
 # - the name does not stand right after a quote or a backtick, unless it is a
 #   quoted key (``_IN_STRING``): there it starts a string literal or a code
 #   span (``print('GH_TOKEN=' + read("f"))``, a Markdown code span opened
@@ -208,10 +214,13 @@ _QUOTED_ESCAPE = (
 # closing quote, an escape and the other quote (behind any backslashes) included.
 _QUOTED_CHAR = rf"(?:[^\\\"'\r\n]|{_QUOTED_ESCAPE}|\\*+(?!(?P=vq))[\"'])"
 _QUOTED_LINE = rf"{_QUOTED_CHAR}++"
-_QUOTED_SPAN = (
-    rf"(?![\r\n])(?:{_QUOTED_CHAR}|(?:\r\n?|\n)(?![^\S\r\n]*+(?:`{{3}}|~{{3}})))++"
+# A value's lines to its closing quote, its first line empty or not; a value
+# on a name's line holds something on its first (``_QUOTED_SPAN``).
+_QUOTED_LINES = (
+    rf"(?:{_QUOTED_CHAR}|(?:\r\n?|\n)(?![^\S\r\n]*+(?:`{{3}}|~{{3}})))++"
     r"(?=(?P=vbs)(?P=vq)(?![\w*]))"
 )
+_QUOTED_SPAN = rf"(?![\r\n]){_QUOTED_LINES}"
 _QUOTED_VALUE = rf"(?:{_QUOTED_SPAN}|{_QUOTED_LINE})"
 # Whether the name stands right after a quote or a backtick (group ``inq``),
 # and the closing quote of a quoted key (group ``kq``, escaped as ``_QUOTE``
@@ -304,7 +313,13 @@ _PATH = rf"(?:{_IDENT}(?:\.|::))*+"
 # (``db_password=password``, ``db_password: hello.world``, a numeric PIN),
 # and a variable that names no credential is taken for a literal
 # (``api_token=tok``).
-_CODE_VALUE = (
+#
+# A number reads as code only as a whole value (``_CODE_NUMBER``): a YAML
+# plain scalar that goes on to a later line (``client_secret:``, then
+# ``12345`` and ``FAKEopaque`` below it) is one string, whose first word is
+# no constant (#285 review, round 4). Every other shape (``_CODE_WORD``) is
+# code whatever follows it, there too.
+_CODE_WORD = (
     rf"{_PATH}[A-Za-z0-9_]*?(?i:token|secret|password|passwd|api_?key){_WORD_END}"
     rf"|[A-Za-z_]++(?:(?:\.|::)[A-Za-z_]++)++{_WORD_END}"
     rf"|{_PATH}{_IDENT}[(\[<]"
@@ -314,9 +329,10 @@ _CODE_VALUE = (
     rf"|\$[({{]|\$[A-Za-z0-9_]++{_WORD_END}|%{_IDENT}%{_WORD_END}"
     rf"|%(?:\([A-Za-z0-9_]*+\))?[-#0+.0-9]*+[A-Za-z]{_WORD_END}"
     r"|[(\[{<]"
-    rf"|[-+]?[0-9]++(?:\.[0-9]++)?{_WORD_END}"
     r"|[^\s\w\"'`;&\\]*+(?!\w)"
 )
+_CODE_NUMBER = rf"[-+]?[0-9]++(?:\.[0-9]++)?{_WORD_END}"
+_CODE_VALUE = rf"{_CODE_WORD}|{_CODE_NUMBER}"
 # What follows the ``&`` that starts a form body's next field: its name and
 # ``=`` (``&grant_type=``), as ``urlencode`` writes one; ``urlencode`` writes
 # an ``&`` inside a value as ``%26``. Any other ``&`` is the value's.
@@ -376,15 +392,33 @@ _OAUTH_VALUE = (
 #
 # - a block scalar's lines, blank lines among them, to the first line that is
 #   not, replaced by one marker on its first line's indentation;
-# - a quoted scalar, taken as on the key's line (``_QUOTED_VALUE``);
+# - a quoted scalar, taken as on the key's line (``_QUOTED_VALUE``), its
+#   first line empty too (round 4: ``"`` alone on its line, the value below);
 # - a plain scalar: lines that start with no indicator of another node (a
 #   sequence's dash, a flow collection, a comment, an anchor or a tag) and
-#   hold no mapping's ``: ``, to a comment (`` #``); a line that does is the
-#   next node, never the value.
+#   hold no mapping's ``: ``, blank lines among them (round 4), to a comment
+#   (`` #``); a line that does is the next node, never the value.
 #
-# A lower-case name's value must not read as code (``_CODE_VALUE``) here too
-# (``${{ secrets.X }}``, ``{{ vault_secret }}``, ``process.env.API_TOKEN,``);
-# an upper-case or a well-known name's is anything. A line break is the one
+# Blank lines and comment lines may stand between the key and a quoted or a
+# plain scalar (round 4: ``client_secret:``, a blank line or ``# rotated``,
+# then the value), as YAML allows; between a block's header and its first
+# line only blank lines may, a ``#`` line there being the block's text.
+#
+# A lower-case name's value must not read as code here too, but what that
+# means depends on the node (#285 review, round 4):
+#
+# - a plain scalar of one line must not read as code (``_CODE_VALUE``):
+#   ``${{ secrets.X }}``, ``process.env.API_TOKEN,``, ``None``, ``4096``;
+# - a plain scalar of several lines is one string, so its first word is no
+#   constant: only ``_CODE_WORD`` refuses it (``12345``, then ``FAKEopaque``
+#   on the next line, is a value);
+# - a block's lines are a string whatever they hold, so a block is refused
+#   only when each of its lines is a placeholder or a reference and nothing
+#   else (``_YAML_PLACEHOLDERS``: ``{{ vault_secret }}``,
+#   ``${{ secrets.X }}``, ``$API_TOKEN``, ``<value>``); one that starts with
+#   a bracket or a number (``[FAKE]opaque``, ``12345``) is a value.
+#
+# An upper-case or a well-known name's value is anything. A line break is the one
 # the key's line ends in, as written or written out behind up to seven
 # backslashes (group ``ybs``, as JSON, JSON in JSON and three deep write it);
 # written out, a line also ends where the string does, at a quote behind
@@ -409,6 +443,33 @@ _YAML_LINE_END = rf"(?=(?:[^\S\r\n]++#{_YAML_UNIT}*+)?[^\S\r\n]*+{_YAML_EOL})"
 # What a plain scalar cannot start with: another node's indicator, a quote
 # (a quoted scalar is matched as one), a code fence.
 _YAML_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_YAML_EOL})|[\[\]{{}},#&!|>%@`\"']|\\++[\"']|~{{3}}"
+# Blank lines (a block's, before its first line), and blank lines and
+# comment lines (before a quoted or a plain scalar), each with its break.
+_YAML_BLANKS = rf"(?:[^\S\r\n]*+{_YAML_BREAK})*+"
+_YAML_SKIPPED = rf"(?:[^\S\r\n]*+(?:#{_YAML_UNIT}*+)?{_YAML_BREAK})*+"
+# The break to the next line of a value, over blank lines, and that line's
+# indentation, more than the key's.
+_YAML_NEXT = rf"(?:{_YAML_BREAK}[^\S\r\n]*+(?={_YAML_BREAK}))*+{_YAML_BREAK}(?P=ind)[^\S\r\n]++"
+# A plain scalar's line after its indentation, and a line after its first.
+_YAML_PLAIN_LINE = rf"(?!#){_YAML_WORDS}{_YAML_LINE_END}"
+_YAML_PLAIN_MORE = rf"(?:{_YAML_NEXT}{_YAML_PLAIN_LINE})"
+_YAML_BLOCK_LINES = rf"{_YAML_UNIT}++(?:{_YAML_NEXT}{_YAML_UNIT}++)*+"
+# A block line that is a placeholder or a reference and nothing else: a
+# template's (``{{ x }}``, ``${{ secrets.X }}``), a shell's (``${X}``,
+# ``$(cmd)``, ``$X``), a batch file's (``%X%``) or a document's (``<value>``);
+# and a block whose every line is one (round 4). Each reads its line once.
+_YAML_PLACEHOLDER = (
+    rf"(?:\$?\{{\{{(?:(?!\}}\}}){_YAML_UNIT})*+\}}\}}"
+    rf"|\$\{{(?:(?![{{}}]){_YAML_UNIT})*+\}}"
+    rf"|\$\((?:(?![()]){_YAML_UNIT})*+\)"
+    r"|\$[A-Za-z_][A-Za-z0-9_]*+"
+    r"|%[A-Za-z_][A-Za-z0-9_]*+%"
+    rf"|<(?:(?![<>]){_YAML_UNIT})*+>"
+    rf")[^\S\r\n]*+{_YAML_EOL}"
+)
+_YAML_PLACEHOLDERS = (
+    rf"{_YAML_PLACEHOLDER}(?:{_YAML_NEXT}{_YAML_PLACEHOLDER})*+(?!{_YAML_NEXT}{_YAML_UNIT})"
+)
 
 
 # What every key with a value below it holds: its colon, then a block's
@@ -416,35 +477,141 @@ _YAML_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_YAML_EOL})|[\[\]{{}},#&!|>%@`\"']|\\++[
 _YAML_HINT = re.compile(r":[^\S\r\n]*+[|>!#\r\n\\]")
 
 
-def _yaml_value(name: str, names: str, code_check: str, name_hint: str) -> _Pattern:
+def _literal_checks(literal_only: bool) -> tuple[str, str, str]:
+    """What a lower-case name's YAML value must not be, as three lookaheads.
+
+    For a plain scalar of one line, one of several lines and a block (see
+    above), each applied only where the name is not upper case (group
+    ``upper`` of ``_SUFFIX_NAME``); all empty for a name whose value is
+    anything (``literal_only`` false).
+    """
+    if not literal_only:
+        return "", "", ""
+    return (
+        rf"(?(upper)|(?!{_CODE_VALUE}))",
+        rf"(?(upper)|(?!{_CODE_WORD}))",
+        rf"(?(upper)|(?!{_YAML_PLACEHOLDERS}))",
+    )
+
+
+def _yaml_value(name: str, names: str, name_hint: str, *, literal_only: bool) -> _Pattern:
     """The pattern for a credential name's value on the lines below it.
 
-    ``names`` is the name's regex, ``code_check`` what a value must not start
-    with (empty for a name whose value is anything), ``name_hint`` what every
-    name holds (``_Pattern.hint``). The key, its separator, a block's header,
-    the line break and the value's indentation stay; the value is replaced.
+    ``names`` is the name's regex, ``name_hint`` what every name holds
+    (``_Pattern.hint``), ``literal_only`` whether a lower-case name's value
+    must not read as code (``_literal_checks``). The key, its separator, a
+    block's header, the line break, the blank and comment lines before the
+    value and its indentation stay; the value is replaced.
     """
+    one_line, lines, block = _literal_checks(literal_only)
     regex = (
         rf"(?m){_YAML_LEAD}(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:)"
         rf"(?P<hdr>(?P<blk>[^\S\r\n]++{_BLOCK_HEADER}))?"
         rf"(?P<gap>{_YAML_COMMENT}[^\S\r\n]*+(?:\r?\n|(?P<ybs>\\{{1,7}})(?:r(?P=ybs))?n))"
-        rf"(?P<blank>(?(blk)(?:[^\S\r\n]*+{_YAML_BREAK})*+))"
+        rf"(?P<blank>(?(blk){_YAML_BLANKS}|{_YAML_SKIPPED}))"
         r"(?P<vind>(?P=ind)[^\S\r\n]++)"
-        r"(?(blk)"
-        rf"{code_check}{_YAML_UNIT}++"
-        rf"(?:(?:{_YAML_BREAK}[^\S\r\n]*+(?={_YAML_BREAK}))*+"
-        rf"{_YAML_BREAK}(?P=ind)[^\S\r\n]++{_YAML_UNIT}++)*+"
-        rf"|(?:{_VALUE_QUOTE}{_QUOTED_VALUE}"
+        rf"(?(blk){block}{_YAML_BLOCK_LINES}"
+        rf"|(?:{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
         r"(?P<close>(?:(?P=vbs)(?P=vq))?)"
-        rf"|(?!{_YAML_NOT_PLAIN}){code_check}{_YAML_WORDS}{_YAML_LINE_END}"
-        rf"(?:{_YAML_BREAK}(?P=ind)[^\S\r\n]++(?!#){_YAML_WORDS}{_YAML_LINE_END})*+"
-        r"))"
+        rf"|(?!{_YAML_NOT_PLAIN})"
+        rf"(?:{lines}{_YAML_PLAIN_LINE}{_YAML_PLAIN_MORE}++|{one_line}{_YAML_PLAIN_LINE})))"
     )
     return _Pattern(
         name,
         re.compile(regex),
         r"\g<lead>\g<name>\g<sep>\g<hdr>\g<gap>\g<blank>\g<vind>\g<open>***REDACTED***\g<close>",
         hint=_YAML_HINT,
+        name_hint=re.compile(name_hint),
+    )
+
+
+# A plain scalar that starts on its key's line and goes on below it (#285
+# review, round 4): ``client_secret: FAKEfirst``, then ``FAKEcont`` on a
+# more indented line, blank lines between them or not, is one string. The
+# name's rule on its line took its first word and kept the lines below in
+# the clear. The value's first line holds no quote and no backslash before
+# an ``n``, ``r`` or a quote, so that its line break, as written or written
+# out behind up to seven backslashes (group ``ybs``), is found where it ends
+# and the lines after it are read as ``_yaml_value`` reads them. Its first
+# word must not read as code under a lower-case name, as for a plain scalar
+# of several lines below its key (``_CODE_WORD``: ``api_token: str =
+# Field(`` stays). The key, its separator and the space after it stay, and
+# one marker replaces the value on the key's line.
+_YAML_FIRST_UNIT = r"(?:[^\\\"\r\n]|\\++(?![nr\"]))"
+_YAML_FIRST_CHAR = rf"(?:(?![^\S\r\n]|:(?:[^\S\r\n]|(?!{_YAML_FIRST_UNIT}))){_YAML_FIRST_UNIT})"
+_YAML_FIRST_WORDS = rf"{_YAML_FIRST_CHAR}++(?:[^\S\r\n]++(?!#){_YAML_FIRST_CHAR}++)*+"
+# ``_YAML_NOT_PLAIN`` read before the line break says how lines are written.
+_YAML_FIRST_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|(?!{_YAML_FIRST_UNIT}))|[\[\]{{}},#&!|>%@`\"']|~{{3}}"
+# What every such value holds: a line break, as written or written out,
+# before a line's indentation.
+_YAML_CONTINUED_HINT = re.compile(r"\n[^\S\r\n]|\\n[^\S\r\n]")
+
+
+def _yaml_continued(name: str, names: str, name_hint: str, *, literal_only: bool) -> _Pattern:
+    """The pattern for a plain scalar that starts on its key's line and goes
+    on below it, the arguments as for :func:`_yaml_value`."""
+    lines = _literal_checks(literal_only)[1]
+    regex = (
+        rf"(?m){_YAML_LEAD}(?P<name>{names})"
+        rf"(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:[^\S\r\n]++)"
+        rf"(?!{_YAML_FIRST_NOT_PLAIN}){lines}{_YAML_FIRST_WORDS}[^\S\r\n]*+"
+        rf"(?:\r?\n|(?P<ybs>\\{{1,7}})(?:r(?P=ybs))?n){_YAML_BLANKS}"
+        rf"(?P=ind)[^\S\r\n]++{_YAML_PLAIN_LINE}{_YAML_PLAIN_MORE}*+"
+    )
+    return _Pattern(
+        name,
+        re.compile(regex),
+        r"\g<lead>\g<name>\g<sep>***REDACTED***",
+        hint=_YAML_CONTINUED_HINT,
+        name_hint=re.compile(name_hint),
+    )
+
+
+# A quoted value whose opening quote ends its line (#285 review, round 4): a
+# shell string and a YAML flow scalar may start with a line break
+# (``GH_TOKEN="``, then ``FAKE"`` on the next line), and the name's rule,
+# which takes a value only when its first line holds something
+# (``_QUOTED_SPAN``), kept the whole value in the clear. A quote that ends its
+# line closes a string literal as often (``field = "Set GITHUB_TOKEN="``), so
+# what tells them apart is where the name stands: outside every string its
+# line opens before it (``_OUTSIDE_STRINGS``). The name starts its line, or
+# stands after text whose quotes and backticks each close on the line (a
+# shell's ``export``, ``declare -x``, a log line's prefix, a YAML key's
+# indentation and dashes, a quoted key), at a token's start or right after an
+# escape (``_ESCAPE``); a name inside a string literal or a code span is
+# none. The value is the lines after the quote to the quote that closes it,
+# as ``_QUOTED_LINES`` reads a value that spans lines; it holds something
+# but space; one whose closing quote never comes is its next line, up to the
+# line's end, as an unterminated value on its name's line is that line. The
+# name, the separator and the quotes stay, and one marker replaces the value
+# with its first line break.
+#
+# Each candidate starts at a line's start and reads the line once to the
+# name (each character is a string's or not, one way only), and the value
+# once; a line break written out is no line break here, since the value's
+# quotes then stand behind backslashes, where the name's rule already finds
+# it whole.
+_LINE_STRING = r"\"(?:[^\"\\\r\n]|\\[^\r\n])*+\"|'[^'\r\n]*+'|`[^`\r\n]*+`"
+_OUTSIDE_STRINGS = rf"(?:[^\"'`\\\r\n]|\\[^\r\n]|{_LINE_STRING})*?"
+# What every such value holds: a separator, a quote and a line break.
+_QUOTE_BREAK_HINT = re.compile(r"[:=][^\S\r\n]*+[\"'][\r\n]")
+
+
+def _quoted_from_next_line(name: str, names: str, name_hint: str) -> _Pattern:
+    """The pattern for a quoted value whose opening quote ends its line,
+    the arguments as for :func:`_yaml_value`."""
+    regex = (
+        rf"(?m)(?P<lead>^{_OUTSIDE_STRINGS}(?:{_ESCAPE}|(?<![A-Za-z0-9_]))(?P<kq>[\"'])?)"
+        rf"(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+[:=][^\S\r\n]*+)"
+        r"(?P<open>(?P<vbs>)(?P<vq>[\"']))(?=[\r\n])(?=\s*+(?!(?P=vq))\S)"
+        rf"(?:{_QUOTED_LINES}(?P<close>(?P=vq))"
+        rf"|(?:\r\n?|\n)(?![^\S\r\n]*+(?:`{{3}}|~{{3}})){_QUOTED_LINE}(?!(?P=vq)))"
+    )
+    return _Pattern(
+        name,
+        re.compile(regex),
+        r"\g<lead>\g<name>\g<sep>\g<open>***REDACTED***\g<close>",
+        hint=_QUOTE_BREAK_HINT,
         name_hint=re.compile(name_hint),
     )
 
@@ -526,10 +693,13 @@ _OAUTH_FIELD_NAMES = r"refresh|access|(?:refresh|access|id)_token|chatgpt[-_]acc
 # ``after_escape`` pass right after its ``regex``, in rounds until one
 # changes nothing (``_MAX_ROUNDS``); the order is part of :func:`redact`'s
 # output and of the class :func:`credential_classes` reports. Two classes
-# have two patterns each: a name's value on its line, and on the lines below
-# it (``_yaml_value``, last). An ``sk-ant-`` key with at least eight
-# characters after ``sk-`` is replaced by ``openai-key`` before
-# ``anthropic-key`` sees it, so it is reported under that class.
+# have four patterns each: a name's value on its line, a quoted value whose
+# quote ends that line (``_quoted_from_next_line``), a value on the lines
+# below it (``_yaml_value``) and a plain scalar that starts on the line and
+# goes on below it (``_yaml_continued``), the last three last of all. An
+# ``sk-ant-`` key with at least eight characters after ``sk-`` is replaced
+# by ``openai-key`` before ``anthropic-key`` sees it, so it is reported
+# under that class.
 _PATTERNS: tuple[_Pattern, ...] = (
     # A private-key block (#285), replaced whole: BEGIN line, body and END
     # line. Without an END line before the next run of five dashes, the BEGIN
@@ -794,13 +964,18 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # well-known or upper-case name's word on the next line by the name's
     # pattern, which this one completes. No pattern before takes a block's
     # header for a value (``_BLOCK_AHEAD``).
-    _yaml_value("env-assignment", rf"(?i:{_ENV_NAMES})", "", _ENV_HINT),
-    _yaml_value(
-        "credential-suffix-assignment",
-        _SUFFIX_NAME,
-        rf"(?(upper)|(?!{_CODE_VALUE}))",
-        _SUFFIX_HINT,
-    ),
+    #
+    # Before them, a quoted value whose opening quote ends its line, under
+    # either kind of name (#285 review, round 4; ``_quoted_from_next_line``),
+    # which the name's rule on its line leaves whole; and after them, a plain
+    # scalar that starts on its key's line and goes on below it
+    # (``_yaml_continued``), whose first word the name's rule took.
+    _quoted_from_next_line("env-assignment", rf"(?i:{_ENV_NAMES})", _ENV_HINT),
+    _quoted_from_next_line("credential-suffix-assignment", _SUFFIX_NAME, _SUFFIX_HINT),
+    _yaml_value("env-assignment", rf"(?i:{_ENV_NAMES})", _ENV_HINT, literal_only=False),
+    _yaml_value("credential-suffix-assignment", _SUFFIX_NAME, _SUFFIX_HINT, literal_only=True),
+    _yaml_continued("env-assignment", rf"(?i:{_ENV_NAMES})", _ENV_HINT, literal_only=False),
+    _yaml_continued("credential-suffix-assignment", _SUFFIX_NAME, _SUFFIX_HINT, literal_only=True),
 )
 
 _REDACTED = "***REDACTED***"
@@ -838,9 +1013,15 @@ _CREDENTIAL_KEY = re.compile(
 # break at least (round 3). A value on the lines below its key (round 3,
 # ``_yaml_value``) has the key's colon, a line break and an indentation
 # besides: ``a_token:\n x\n``, 12 to 25, a factor of 2.08, at one
-# character, and a block's header makes it longer. The rounds of
-# :func:`redact` (``_MAX_ROUNDS``) are more patterns in that order, and
-# compound nothing either, by the argument below.
+# character, and a block's header makes it longer; the blank and comment
+# lines before it (round 4) stay and make it longer still
+# (``a_token:\n\n x\n``, 13 to 26). A quoted value whose quote ends its
+# line (round 4) holds that line break and a character (``a_token="\nx"``,
+# 12 to 24, the break replaced with the value), and a plain scalar that
+# starts on its key's line and goes on (round 4) a character, a line break,
+# an indentation and a character (``a_token: x\n y``, 13 to 23). The
+# rounds of :func:`redact` (``_MAX_ROUNDS``) are more patterns in that
+# order, and compound nothing either, by the argument below.
 # Growth does not compound across patterns: a later pattern can only lengthen
 # the text by matching a run *shorter* than the marker, and a marker is never
 # part of such a run. The value classes that admit ``*`` (the named-assignment

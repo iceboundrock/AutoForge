@@ -224,19 +224,24 @@ GitLab, Groq, xAI, npm and Hugging Face tokens, and a value assigned to a
 name that ends in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD`, as text
 or as a mapping's key: any value under an upper-case name
 (`GEMINI_API_KEY=...`), and under a lower-case one (`client_secret: ...`) a
-quoted value, also one that spans lines whatever they hold, or an unquoted
-word of any characters that does not read as code, on the name's line or,
-under a YAML key, on the lines below it (an indented scalar, a `|` or `>`
-block)
+quoted value, also one that spans lines whatever they hold or starts with
+a line break, or an unquoted word of any characters that does not read as
+code, on the name's line or, under a YAML key, on the lines below it (an
+indented scalar past blank and comment lines, a `|` or `>` block whatever
+its lines hold, unless each is a placeholder such as `${{ secrets.X }}`, a
+plain scalar that goes on below the key's line)
 ([#285](https://github.com/iceboundrock/AutoForge/issues/285)). Among what
 is still not recognised: an unquoted value under a lower-case name that
 reads as code (a password that is a credential's name, a dotted name or a
-number, `db_password=password`, a YAML block that starts with a bracket),
-the words after the first of an unquoted value with spaces on the name's
-line (`DB_PASSWORD: two words`; quoted, or below a YAML key, it is taken
-whole), the lines after the first of a quoted value whose name stands
-right after a quote or a backtick (inside a string literal or a Markdown
-code span), a name those suffixes do not cover (`SSH_KEY`, `clientSecret`), an AWS
+number, `db_password=password`, a YAML plain scalar of several lines that
+starts with a keyword such as `true`), the words after the first of an
+unquoted value with spaces on the name's line (`DB_PASSWORD: two words`;
+quoted, below a YAML key or going on below it, it is taken whole), the
+lines after the first of a quoted value whose name stands right after a
+quote or a backtick (inside a string literal or a Markdown code span), a
+quoted value that starts with a line break where its name stands inside a
+string its line opens, a name those suffixes do not cover (`SSH_KEY`,
+`clientSecret`), an AWS
 secret access key printed without its name, and the end of a private key
 whose first line was cut off. Code that passes a credential on in a
 variable named otherwise (`client_secret=cs`) reads as a password and is

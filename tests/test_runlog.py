@@ -22,6 +22,8 @@ from tests.conftest import (
     WHOLE_VALUES_285,
     WHOLE_VALUES_285_R3,
     WHOLE_VALUES_285_R3_REDACTED,
+    WHOLE_VALUES_285_R4,
+    WHOLE_VALUES_285_R4_REDACTED,
 )
 
 
@@ -1385,6 +1387,55 @@ def test_a_whole_value_the_third_285_review_found_never_reaches_the_logs(tmp_pat
         for _, _, body in WHOLE_VALUES_285_R3:
             assert body not in content, (path, body)
     redacted = [WHOLE_VALUES_285_R3_REDACTED[name] for name, _, _ in WHOLE_VALUES_285_R3]
+    assert (step / "stdout.log").read_text(encoding="utf-8") == "".join(
+        f"{text}\nnext line\n" for text in redacted
+    )
+    assert (step / "stderr.log").read_text(encoding="utf-8") == "".join(
+        f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in redacted
+    )
+    result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
+    assert result["tests"] == redacted
+    assert result["message"] == "\n".join(redacted)
+
+
+def test_a_whole_value_the_fourth_285_review_found_never_reaches_the_logs(tmp_path):
+    """#285 review, round 4: a YAML value after a blank or a comment line,
+    a plain scalar with a blank line among its lines or that starts on its
+    key's line, a quoted value whose opening quote ends its line, and a block
+    or a plain scalar of several lines that starts with a bracket or a number
+    were kept, whole or in part, in ``stdout.log``, ``stderr.log`` and
+    ``control-result.json``. Each goes whole from every file, after
+    OpenCode's ANSI escapes too, and the line after it stays."""
+    texts = [text for _, text, _ in WHOLE_VALUES_285_R4]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", *texts],
+            error="agent exited 1:\n" + "\n".join(texts),
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": "\n".join(texts),
+                "tests": texts,
+            },
+        ),
+        prompt="p",
+        stdout="".join(f"{text}\nnext line\n" for text in texts),
+        stderr="".join(f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in texts),
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"stdout.log", "stderr.log", "control-result.json"}
+    for path in [*files, log.events_path]:
+        content = path.read_text(encoding="utf-8")
+        assert "FAKE" not in content, path
+        for _, _, body in WHOLE_VALUES_285_R4:
+            assert body not in content, (path, body)
+    redacted = [WHOLE_VALUES_285_R4_REDACTED[name] for name, _, _ in WHOLE_VALUES_285_R4]
     assert (step / "stdout.log").read_text(encoding="utf-8") == "".join(
         f"{text}\nnext line\n" for text in redacted
     )
