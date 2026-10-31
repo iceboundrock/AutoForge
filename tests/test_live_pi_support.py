@@ -14,7 +14,9 @@ engine and ``PiProvider`` on a LOCAL run; the REMOTE flow (ADR 0009
 Appendix A.2.3 G) the real ``autoforge doctor`` and a REMOTE run against
 the GitHub stand-in, with one rehearsal for each LOCAL one, and that its
 stand-in origin is the only repository its seeding writes to, whatever URL
-rewrite git's configuration holds (#386 R1-F1).
+rewrite git's configuration holds (#386 R1-F1). The git that flow runs
+itself writes to no repository a ``GIT_*`` variable names and runs no hook,
+file-system monitor or signing program of the operator's (#386 R2-F1).
 """
 
 from __future__ import annotations
@@ -29,13 +31,27 @@ from pathlib import Path
 
 import pytest
 
+from autoforge.config import ProfileConfig
+from autoforge.git_transport import NO_AUTO_MAINTENANCE
+from autoforge.providers import AgentRequest
 from autoforge.redaction import redact
-from tests.conftest import Origin, block, commit_in, git_out, git_repo, review_result
+from tests.conftest import (
+    GIT_IDENT,
+    Origin,
+    block,
+    commit_in,
+    git_out,
+    git_repo,
+    github_origin,
+    review_result,
+    state_tree,
+)
 from tests.live_pi import (
     AUTH_VARIABLE,
     CREDENTIAL_PATTERNS,
     DEFAULT_MODELS,
     FORWARD_VARIABLE,
+    IMPLEMENTATION,
     LIVE_VARIABLE,
     MODEL_VARIABLE,
     PROVIDER_KEY_NAMES,
@@ -45,9 +61,11 @@ from tests.live_pi import (
     SmokeReport,
     SmokeSettings,
     StepFailed,
+    autoforge_commit,
     classify_failure,
     credential_hits,
     entry_names,
+    implement_in_worktree,
     processes_under,
     remote_trees,
     run_remote_smoke,
@@ -55,6 +73,8 @@ from tests.live_pi import (
     scan_for_credentials,
     settings_from_environment,
     tree_snapshot,
+    worktree_head,
+    write_repository,
 )
 from tests.pi_fake import PiFake, PiTurn
 
@@ -1016,11 +1036,12 @@ class Planted:
         return self.log.read_text().splitlines() if self.log.exists() else []
 
 
-def _sentinel(path: Path, log: Path, label: str) -> Path:
-    """A program that logs it ran and fails at once, reading nothing (an SSH
-    command that waited for its stdin would hang the git that started it)."""
+def _sentinel(path: Path, log: Path, label: str, status: int = 1) -> Path:
+    """A program that logs it ran and exits ``status`` at once (failing by
+    default), reading nothing (an SSH command that waited for its stdin would
+    hang the git that started it)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f'#!/bin/sh\necho "{label} $*" >> "{log}"\nexit 1\n')
+    path.write_text(f'#!/bin/sh\necho "{label} $*" >> "{log}"\nexit {status}\n')
     path.chmod(0o755)
     return path
 
@@ -1055,6 +1076,17 @@ def _plant_rewrites(
     monkeypatch.setenv("GIT_SSH_COMMAND", str(_sentinel(planted / "ssh-env", log, "GIT_SSH")))
     monkeypatch.setenv("GIT_ASKPASS", str(_sentinel(planted / "askpass-env", log, "GIT_ASKPASS")))
     monkeypatch.setenv("SSH_ASKPASS", str(_sentinel(planted / "ssh-askpass", log, "SSH_ASKPASS")))
+    _plant_config(route, entries, checkout, planted, monkeypatch)
+    return Planted(decoy=decoy, log=log)
+
+
+def _plant_config(
+    route: str, entries: dict[str, str], checkout: Path | None, planted: Path, monkeypatch
+) -> None:
+    """Make every git that reads ``route`` read ``entries`` (``checkout`` is
+    the repository of the checkout's route). Whatever the route, ``HOME`` and
+    ``XDG_CONFIG_HOME`` are a home in ``planted``, and no ``GIT_CONFIG*``
+    variable this process's own environment set stays."""
     for name in [n for n in os.environ if n.startswith("GIT_CONFIG")]:
         monkeypatch.delenv(name)  # what this process's own environment set
     home = planted / "home"
@@ -1087,8 +1119,8 @@ def _plant_rewrites(
             "GIT_CONFIG_PARAMETERS", " ".join(f"'{k}'='{v}'" for k, v in entries.items())
         )
     else:
+        assert checkout is not None, route
         write(checkout / ".git" / "config")
-    return Planted(decoy=decoy, log=log)
 
 
 @pytest.mark.parametrize("destination", REWRITE_DESTINATIONS)
@@ -1156,6 +1188,199 @@ def test_the_remote_flow_seeds_its_own_origin_whatever_the_operators_gitconfig_r
     assert git_out("--git-dir", str(origin), "rev-parse", "refs/heads/main") == main
     [launch] = rehearsal.fake.launches()
     head = git_out("-C", launch["cwd"], "rev-parse", "HEAD")
+    pushed = git_out(
+        "--git-dir", str(origin), "for-each-ref", "--format=%(objectname)", "refs/heads/autoforge"
+    )
+    assert pushed == head
+
+
+# -- the REMOTE flow's own git, isolated from the operator's (#386 R2-F1) --------------
+# Besides seeding its origin, the REMOTE flow runs git itself: it gives its
+# checkout an `origin`, its scripted implementer stages and commits in the
+# per-issue worktree, and it reads that worktree's HEAD and the AutoForge
+# commit. The operator's shell may name another repository, or a part of one,
+# for every git to use (`GIT_DIR`, ...), and their git configuration a hooks
+# directory, a file-system monitor or a signing program. The flow's writes are
+# the suite's isolated git and its reads the controller's own reader, so none
+# of that reaches another checkout or runs.
+REPOSITORY_SELECTIONS = (
+    "GIT_DIR",
+    "GIT_DIR and GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+)
+# The routes the operator's own configuration comes by: REWRITE_ROUTES but
+# the checkout's, which the flow makes itself.
+OPERATOR_ROUTES = tuple(route for route in REWRITE_ROUTES if route.startswith(("G", "~", "X")))
+# Every hook staging a path, committing or the ref update of a commit can run.
+COMMIT_HOOKS = (
+    "pre-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "reference-transaction",
+    "post-index-change",
+    "pre-auto-gc",
+)
+GITHUB_URL = "https://github.com/owner/repo.git"
+
+
+def _select(selection: str, other: Path) -> dict[str, str]:
+    """The variables that name ``other``'s repository, or a part of it, as
+    ``selection`` says."""
+    git = str(other / ".git")
+    return {
+        "GIT_DIR": {"GIT_DIR": git},
+        "GIT_DIR and GIT_WORK_TREE": {"GIT_DIR": git, "GIT_WORK_TREE": str(other)},
+        "GIT_COMMON_DIR": {"GIT_COMMON_DIR": git},
+        "GIT_INDEX_FILE": {"GIT_INDEX_FILE": str(other / ".git" / "index")},
+        "GIT_OBJECT_DIRECTORY": {"GIT_OBJECT_DIRECTORY": str(other / ".git" / "objects")},
+    }[selection]
+
+
+def _other_checkout(path: Path) -> Path:
+    """A checkout with a tracked file: a configuration, an index, refs and
+    objects of its own."""
+    other = git_repo(path)
+    (other / "other.txt").write_text("other\n", encoding="utf-8")
+    git_out("-C", str(other), "add", "other.txt")
+    git_out("-C", str(other), *NO_AUTO_MAINTENANCE, *GIT_IDENT, "commit", "-qm", "other")
+    return other
+
+
+def _plant_hooks(route: str, planted: Path, monkeypatch) -> Path:
+    """Make every git that reads ``route`` run a sentinel for each of
+    :data:`COMMIT_HOOKS` (exiting 0, so that git goes on), a file-system
+    monitor and a signing program for every commit; the log of what ran."""
+    log = planted / "ran.log"
+    hooks = planted / "hooks"
+    for name in COMMIT_HOOKS:
+        _sentinel(hooks / name, log, f"hook {name}", status=0)
+    entries = {
+        "core.hooksPath": str(hooks),
+        "core.fsmonitor": str(_sentinel(planted / "fsmonitor", log, "core.fsmonitor")),
+        "commit.gpgSign": "true",
+        "gpg.program": str(_sentinel(planted / "gpg", log, "gpg.program")),
+    }
+    _plant_config(route, entries, None, planted, monkeypatch)
+    return log
+
+
+def _ran(log: Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _smoke_checkout(tmp_path: Path) -> tuple[Path, Path]:
+    """The REMOTE flow's checkout as :func:`write_repository` makes it, and a
+    worktree of it detached at its ``main``, as the controller adds one."""
+    repo = write_repository(tmp_path / "smoke" / "repo")
+    worktree = tmp_path / "smoke" / "worktree"
+    git_out("-C", str(repo), "worktree", "add", "-q", "--detach", str(worktree))
+    return repo, worktree
+
+
+def _flows_own_git(repo: Path, worktree: Path) -> tuple[str, str, str]:
+    """What the REMOTE flow runs git for itself, in its order: the checkout's
+    ``origin``, the scripted implementation's commit (its answer), the
+    worktree's HEAD, the AutoForge commit."""
+    github_origin(repo)
+    request = AgentRequest(
+        phase="ANALYZE_EXECUTE",
+        prompt="",
+        cwd=str(worktree),
+        profile=ProfileConfig(name="analyze_execute", provider="scripted"),
+        idle_timeout_seconds=None,
+        max_runtime_seconds=None,
+    )
+    answer = implement_in_worktree(request)
+    return answer, worktree_head(worktree), autoforge_commit()
+
+
+def _assert_landed_in_the_smoke_checkout(
+    repo: Path, worktree: Path, answer: str, head: str, commit: str
+) -> None:
+    """The flow's own git did its work where it should: the checkout's origin
+    is GitHub's, and the worktree's HEAD, the HEAD read and reported, is the
+    implementation alone on ``main``, nothing left staged."""
+    assert git_out("-C", str(repo), "remote", "get-url", "origin") == GITHUB_URL
+    assert head == git_out("-C", str(worktree), "rev-parse", "HEAD") and head in answer
+    assert git_out("-C", str(worktree), "rev-parse", "HEAD^") == git_out(
+        "-C", str(repo), "rev-parse", "main"
+    )
+    assert git_out("-C", str(worktree), "show", "--format=", "--name-only", head) == IMPLEMENTATION
+    assert git_out("-C", str(worktree), "status", "--porcelain") == ""
+    assert re.fullmatch(r"[0-9a-f]{40}( with uncommitted changes)?", commit), commit
+
+
+@pytest.mark.parametrize("selection", REPOSITORY_SELECTIONS)
+def test_the_remote_flows_own_git_never_writes_to_a_repository_the_environment_selects(
+    tmp_path, monkeypatch, selection
+):
+    """ADR 0009 A.2.3 G (#386 R2-F1): this process's environment names another
+    checkout's repository, or a part of it, as ``selection`` says. The git the
+    REMOTE flow runs itself still gives the smoke checkout its ``origin``,
+    commits the scripted implementation on the worktree's detached HEAD, and
+    reads that HEAD and the AutoForge commit, while nothing under the other
+    checkout is written: its configuration, index, refs and objects are as
+    they were. The flow's ordinary git before this fix wrote there on every
+    selection."""
+    other = _other_checkout(tmp_path / "other")
+    repo, worktree = _smoke_checkout(tmp_path)
+    before = state_tree(other)
+    with monkeypatch.context() as selecting:
+        for name, value in _select(selection, other).items():
+            selecting.setenv(name, value)
+        answer, head, commit = _flows_own_git(repo, worktree)
+    assert state_tree(other) == before
+    _assert_landed_in_the_smoke_checkout(repo, worktree, answer, head, commit)
+
+
+@pytest.mark.parametrize("route", OPERATOR_ROUTES)
+def test_the_remote_flows_own_git_runs_no_hook_monitor_or_signer_the_operator_configured(
+    tmp_path, monkeypatch, route
+):
+    """ADR 0009 A.2.3 G (#386 R2-F1): the operator's git configuration, on
+    each route it comes by, names a hooks directory holding every hook that
+    staging and committing run, a file-system monitor, and a signing program
+    for every commit, all sentinels. The git the REMOTE flow runs itself
+    still sets the checkout's ``origin``, commits the implementation and
+    reads the HEADs, and no sentinel ran. The flow's ordinary git before
+    this fix ran the hooks and the monitor, and could not commit unsigned."""
+    repo, worktree = _smoke_checkout(tmp_path)
+    with monkeypatch.context() as planting:
+        log = _plant_hooks(route, tmp_path / "planted", planting)
+        answer, head, commit = _flows_own_git(repo, worktree)
+    assert _ran(log) == []
+    _assert_landed_in_the_smoke_checkout(repo, worktree, answer, head, commit)
+
+
+def test_the_remote_flow_passes_beside_the_checkout_git_dir_names_and_runs_no_planted_hook(
+    tmp_path, rehearsal, monkeypatch
+):
+    """ADR 0009 A.2.3 G (#386 R2-F1): the review's two reproductions on the
+    whole REMOTE flow. ``GIT_DIR`` names another checkout's repository and the
+    operator's ``~/.gitconfig`` the sentinels of the test above. The flow
+    still passes; its checkout's ``origin`` is GitHub's and the PR head the
+    controller pushed is the implementer's commit; nothing under the other
+    checkout was written, and no sentinel ran."""
+    other = _other_checkout(tmp_path / "other")
+    before = state_tree(other)
+    settings = rehearsal.settings("api_key")
+    with monkeypatch.context() as planting:
+        log = _plant_hooks("~/.gitconfig", tmp_path / "planted", planting)
+        planting.setenv("GIT_DIR", str(other / ".git"))
+        report = _remote(tmp_path, settings, _arm_remote_review(rehearsal.fake))
+
+    assert report.ok, report.render()
+    assert state_tree(other) == before
+    assert _ran(log) == []
+    repo = tmp_path / "smoke" / "repo"
+    assert git_out("-C", str(repo), "remote", "get-url", "origin") == GITHUB_URL
+    [launch] = rehearsal.fake.launches()
+    head = git_out("-C", launch["cwd"], "rev-parse", "HEAD")
+    assert git_out("-C", launch["cwd"], "show", "--format=", "--name-only", head) == IMPLEMENTATION
+    origin = tmp_path / "smoke" / "origin.git"
     pushed = git_out(
         "--git-dir", str(origin), "for-each-ref", "--format=%(objectname)", "refs/heads/autoforge"
     )

@@ -1661,6 +1661,16 @@ HEAD:
   hooks that are sentinels. Seeding and a forced publish still leave the
   other repository with no ref and no object and run no sentinel, and the
   whole REMOTE flow passes with the rewrite in `~/.gitconfig`
+- the git the REMOTE flow runs itself (the checkout's `origin`, the
+  scripted implementer's staging and commit, the worktree's HEAD and the
+  AutoForge commit it reads) writes to no other checkout and runs nothing
+  of the operator's (#386 R2-F1). With `GIT_DIR`, `GIT_DIR` and
+  `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE` or
+  `GIT_OBJECT_DIRECTORY` naming another checkout, nothing under that
+  checkout is written; with a hooks directory, a file-system monitor and a
+  signing program of sentinels on each route the operator's configuration
+  comes by, none runs; and the whole REMOTE flow passes with `GIT_DIR` and
+  those sentinels in `~/.gitconfig`
 - the whole flow against the fake `pi`, through the real
   `autoforge local doctor` in a process of its own and the real engine and
   `PiProvider`: it passes on the `api_key` route (no key in any launch,

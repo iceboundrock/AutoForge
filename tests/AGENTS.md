@@ -87,7 +87,10 @@ read it before adding tests for a listed area.
   heads, PR heads and ancestry reads. Its own git (`isolated_git`) reads
   none of the operator's git configuration or `GIT_*` variables and seeds
   and publishes over no transport (#386 R1-F1), so no URL rewrite can send
-  a test's push anywhere else. `implement` is the implementation
+  a test's push anywhere else. `github_origin` and the live smoke test's
+  own writes use the same git (#386 R2-F1), so a `GIT_DIR` of the
+  operator's shell cannot make them write to another checkout, and no hook
+  of the operator's runs. `implement` is the implementation
   agent (one commit on the worktree's detached `HEAD`, reported by
   `analyze_payload`), and `scripted(...)` answers successive calls of one
   agent. An autouse fixture fails any test whose engine would reach the

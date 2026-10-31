@@ -1459,16 +1459,19 @@ def github_origin(repo, repository: str = "owner/repo") -> Path:
     ``origin`` that already names ``repository`` is left alone, so engines
     built on one checkout at once (``tests/test_shared_git.py``) read it
     without racing each other for ``.git/config``.
+
+    Its git is :func:`isolated_git`, so the ``origin`` is ``repo``'s: no
+    ``GIT_DIR`` or ``GIT_COMMON_DIR`` of the test's environment can name
+    another repository's configuration to write it into, and no hook of the
+    operator's runs (#386 R2-F1).
     """
     root = Path(repo)
     url = f"https://github.com/{repository}.git"
-    has = subprocess.run(
-        ["git", "-C", str(root), "remote", "get-url", "origin"], capture_output=True, text=True
-    )
-    if has.returncode == 0 and has.stdout.strip() == url:
+    has = isolated_git_run("-C", str(root), "remote", "get-url", "origin")
+    if has.returncode == 0 and has.stdout.decode().strip() == url:
         return root
     verb = "set-url" if has.returncode == 0 else "add"
-    subprocess.run(["git", "-C", str(root), "remote", verb, "origin", url], check=True)
+    isolated_git("-C", str(root), "remote", verb, "origin", url)
     return root
 
 
@@ -1555,14 +1558,15 @@ def git_out(*args: str) -> str:
     return res.stdout.strip()
 
 
-# The git of an :class:`Origin` and of the live smoke test's repository
-# (#386 R1-F1). It starts from this allow-list of the environment: no
-# ``GIT_*`` variable of the operator's shell (``GIT_DIR``,
+# The git of an :class:`Origin`, of :func:`github_origin` and of the live
+# smoke test's own writes (#386 R1-F1, R2-F1). It starts from this
+# allow-list of the environment: no ``GIT_*`` variable of the operator's
+# shell (``GIT_DIR``, ``GIT_COMMON_DIR``, ``GIT_INDEX_FILE``,
 # ``GIT_OBJECT_DIRECTORY``, ``GIT_CONFIG_*``, ``GIT_SSH_COMMAND``,
 # ``GIT_ASKPASS``), no ``HOME``, no token, no SSH agent. It reads no system
 # or global configuration, so no ``url.*.insteadOf``, ``pushInsteadOf``,
-# credential helper or hook of the operator's applies, and fetches no
-# missing object lazily. The switches turn off every transport, the
+# credential helper, hook or signing program of the operator's applies, and
+# fetches no missing object lazily. The switches turn off every transport, the
 # credential helpers, hooks, the file-system monitor and replacement objects
 # again at command-line precedence, over the repository's own configuration.
 ISOLATED_GIT_ENV_ALLOWLIST = ("PATH", "LANG", "LANGUAGE", "LC_*", "TMPDIR")

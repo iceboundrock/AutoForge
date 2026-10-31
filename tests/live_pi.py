@@ -71,7 +71,12 @@ transport pushes to over ``file://``, as the engine tests' ``origin=True``
 does. The test seeds that origin with the suite's isolated git, over no
 transport: it writes into the bare repository alone, whatever URL rewrite,
 credential helper or SSH command the operator's git configuration or
-environment holds (#386 R1-F1). A scratch repository on github.com was the
+environment holds (#386 R1-F1). The flow's other git is isolated the same
+way: the scripted implementer and the checkout's ``origin`` use that git,
+and the HEADs the flow reports are read by the controller's own reader, so a
+``GIT_DIR`` (or ``GIT_COMMON_DIR``, ``GIT_INDEX_FILE``, ...) of the
+operator's shell names no repository the run writes to, and no hook of the
+operator's runs (#386 R2-F1). A scratch repository on github.com was the
 alternative. It was rejected because it would need the operator's ``gh``
 login and the network, leave a branch, a PR and a comment to clean up, and
 break the promise that the live test writes nothing to GitHub
@@ -103,7 +108,9 @@ import autoforge
 from autoforge.config import ProfileConfig, load_config_file
 from autoforge.doctor import CHECKS_READ_ROW, REQUIRED_CHECKS_ROW
 from autoforge.engine import ControllerEngine
+from autoforge.errors import VerificationError
 from autoforge.git_transport import NO_AUTO_MAINTENANCE
+from autoforge.git_workspace import GitWorkspace
 from autoforge.providers import (
     PI_DEFAULT_AGENT_DIR,
     PI_MIN_VERSION,
@@ -464,23 +471,25 @@ def forwarded_values(settings: SmokeSettings) -> dict[str, str]:
 
 def autoforge_commit() -> str:
     """The AutoForge commit under test, from the checkout ``autoforge`` is
-    imported from, and whether its tracked files differ from it."""
+    imported from, and whether its tracked files differ from it.
+
+    Read by the controller's own reader (:class:`GitWorkspace`): no ``GIT_*``
+    variable of this process can name another repository to read, or an
+    index to refresh, and no hook or file-system monitor of the operator's
+    runs (#386 R2-F1)."""
     package = Path(autoforge.__file__).resolve().parent
-
-    def git(*argv: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(package), *argv],
-            capture_output=True,
-            text=True,
-            timeout=PROBE_TIMEOUT_SECONDS,
-        )
-
-    found = git("rev-parse", "--show-toplevel", "HEAD")
-    lines = found.stdout.split()
-    if found.returncode != 0 or len(lines) != 2 or Path(lines[0]) / "src" / "autoforge" != package:
-        return "unknown (autoforge is not imported from a git checkout)"
-    dirty = git("status", "--porcelain", "--untracked-files=no").stdout.strip()
-    return lines[1] + (" with uncommitted changes" if dirty else "")
+    unknown = "unknown (autoforge is not imported from a git checkout)"
+    workspace = GitWorkspace(package, timeout_seconds=PROBE_TIMEOUT_SECONDS)
+    try:
+        if workspace.root() / "src" / "autoforge" != package:
+            return unknown
+        head = workspace.head_sha()
+        dirty = any(entry.code != "??" for entry in workspace.status_entries())
+    except VerificationError:
+        return unknown
+    if not head:
+        return unknown
+    return head + (" with uncommitted changes" if dirty else "")
 
 
 class RecordingPi(PiProvider):
@@ -586,17 +595,22 @@ def write_remote_config(path: Path, settings: SmokeSettings, gh: Path, state_dir
 
 def implement_in_worktree(req: AgentRequest) -> str:
     """The scripted REMOTE ANALYZE_EXECUTE: commits the feature in its
-    worktree (the controller pushes it and opens the PR) and reports it."""
-    from tests.conftest import GIT_IDENT, analyze_payload, block, git_out
+    worktree (the controller pushes it and opens the PR) and reports it.
+
+    Its git is the suite's isolated git, so it stages and commits in that
+    worktree alone: no ``GIT_*`` variable of this process can name another
+    repository, index or object store to write to, and no hook, file-system
+    monitor or signing program of the operator's runs (#386 R2-F1)."""
+    from tests.conftest import GIT_IDENT, analyze_payload, block, isolated_git
 
     worktree = str(req.cwd)
     (Path(worktree) / IMPLEMENTATION).write_text(IMPLEMENTATION_PY, encoding="utf-8")
-    git_out("-C", worktree, "add", IMPLEMENTATION)
-    git_out(
+    isolated_git("-C", worktree, "add", IMPLEMENTATION)
+    isolated_git(
         "-C", worktree, *NO_AUTO_MAINTENANCE, *GIT_IDENT, "commit", "-qm", "Add greet(name) (#2)"
     )
     payload = analyze_payload(
-        git_out("-C", worktree, "rev-parse", "HEAD"),
+        isolated_git("-C", worktree, "rev-parse", "HEAD").decode().strip(),
         pr_title="Add greet(name)",
         pr_body="Adds `greet(name)` in `greet.py`.",
         tests=[],
@@ -885,14 +899,16 @@ def _launch_side_effects(
 
 # -- the REMOTE flow (ADR 0009 Appendix A.2.3 G) --------------------------------------
 def worktree_head(worktree: Path) -> str:
-    """The HEAD of the per-issue worktree, or '' when it cannot be read."""
-    found = subprocess.run(
-        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        timeout=PROBE_TIMEOUT_SECONDS,
-    )
-    return found.stdout.strip() if found.returncode == 0 else ""
+    """The HEAD of the per-issue worktree, or '' when it cannot be read.
+
+    Read by the controller's own reader (:class:`GitWorkspace`), so it is
+    that worktree's: a ``GIT_DIR`` of this process naming another repository
+    would make step 6 compare that repository's HEAD with itself (#386
+    R2-F1)."""
+    try:
+        return GitWorkspace(worktree, timeout_seconds=PROBE_TIMEOUT_SECONDS).head_sha()
+    except VerificationError:
+        return ""
 
 
 def remote_trees(checkout: Path, worktree: Path) -> dict[str, object]:

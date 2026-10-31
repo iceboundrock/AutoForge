@@ -469,6 +469,10 @@ over `file://`. Nothing reaches GitHub, and the run needs no `gh` login.
 The test seeds that repository itself, over no git transport and with
 none of your git configuration or `GIT_*` variables, so a URL rewrite
 (`insteadOf`) in your `~/.gitconfig` cannot send the seed anywhere else.
+Its other git (the checkout's `origin`, the scripted implementation's
+commit, the HEADs it reports) ignores your `GIT_*` variables too, so a
+`GIT_DIR` set in your shell cannot make it write to another checkout, and
+it runs none of your git hooks.
 A throwaway repository on github.com would exercise GitHub too, but it
 would need your login and the network, and leave a branch, a PR and a
 comment to clean up, while what this test proves is Pi on a REMOTE review.
