@@ -724,6 +724,10 @@ class Doctor:
         for url, _count in candidates[:CHECKS_READ_TRIES]:
             try:
                 pr = client.get_pr_with_checks(url)
+            except ExecutionError as exc:
+                # The listing started `gh`, and this read may still fail to
+                # (#259 R1-F2): the read was not made, the same unread SKIP.
+                return _gh_not_started(name, exc)
             except GitHubChecksAccessError as exc:
                 return self._checks_read_denied(
                     f"GitHub refused this gh login the check results of {url}: "
@@ -1424,7 +1428,8 @@ def _gh_not_started(name: str, exc: ExecutionError) -> CheckResult:
     A first `doctor` before `gh` is installed showed one line, `executable
     not found: gh`, and no row at all. The row is skipped and the run goes on:
     for the rows that use this, an unread answer is a SKIP whatever the merge
-    gate, and the 'gh available' row normally fails and says why. The
+    gate, and the 'gh available' row normally fails and says why (it passes
+    when `gh` started for an earlier read and not for this one). The
     required-check row, which fails an unread answer with the gate open,
     goes through :meth:`Doctor._required_checks_unverifiable` instead.
     """

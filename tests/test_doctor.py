@@ -1370,6 +1370,37 @@ def test_checks_read_that_cannot_answer_is_unknown(tmp_path, monkeypatch, where,
     assert "token permissions" not in row.detail and "Checks: read" not in row.detail
 
 
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_checks_read_that_cannot_start_gh_after_the_listing_is_unread(tmp_path, gate_open):
+    """#259 R1-F2: the candidate listing started `gh`, and the first PR's checks
+    read cannot. The read was not made: the row is the unread SKIP the listing's
+    own spawn failure gives, never a PASS or a refusal, whatever the merge gate,
+    and the rows after it are still printed."""
+    calls: list = []
+    healthy = _runner_factory(calls=calls)
+
+    def runner(req):
+        if req.command[:3] == ["gh", "pr", "view"]:
+            raise ExecutionError("failed to spawn gh pr view: [Errno 24] Too many open files")
+        return healthy(req)
+
+    config = _gate_config(tmp_path, gate_open)
+    results = Doctor(config_path=config, cwd=str(tmp_path), runner=runner).run_all()
+    rows = {r.name: r for r in results}
+    assert rows["gh available"].ok
+    row = rows[CHECKS_READ_ROW]
+    assert row.skipped and row.label == "SKIP" and not row.required
+    assert row.detail == (
+        "gh could not be started (failed to spawn gh pr view: [Errno 24] Too many open "
+        "files); see the 'gh available' row"
+    )
+    assert any(argv[:3] == ["gh", "api", "graphql"] for argv in calls)
+    # run_all went on past the row: the state directory and the sandbox rows follow it.
+    names = [r.name for r in results]
+    assert names.index(CHECKS_READ_ROW) < names.index("state dir writable")
+    assert "outer sandbox: mode (disabled)" in names[names.index(CHECKS_READ_ROW) :]
+
+
 def test_checks_read_refused_the_pr_itself_is_denied(tmp_path):
     row, _ = _checks_read(tmp_path, pr_views={PROBE_PR: (1, "HTTP 401: Bad credentials")})
     assert not row.ok and row.label == "WARN" and row.detail.startswith("DENIED: ")

@@ -35,7 +35,8 @@ so.
   found: gh` and no row. It now prints every row: `gh available` fails, and
   the rows that read GitHub are skipped, except that "default branch
   requires checks" fails with the merge gate open, as it does whenever it
-  cannot read the branch rules.
+  cannot read the branch rules. A `gh` that starts for one read and not for
+  a later one gets the same rows.
 - `doctor` no longer fails `agent 'claude' keeps integrations off` when
   Claude Code cut its `--help` short: 2.1.314 writes only part of it to a
   pipe, before the flags the row looks for. A help that ends mid-line is a
