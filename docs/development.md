@@ -202,7 +202,9 @@ credential:
    as its `Generator`;
 3. checks both: the exact set of files each ships (every module and every
    prompt template, `LICENSE`, and nothing else; `MANIFEST.in` keeps the
-   tests out of the sdist), `LICENSE` byte for byte, and the core metadata
+   tests out of the sdist; none of LOCAL mode's files, its `local_*.md`
+   templates, `local_workspace.py` or `run_contract.py`, whatever the tree
+   declares), `LICENSE` byte for byte, and the core metadata
    (Metadata-Version 2.4 or later, `Name: autoforge-cli`, the version,
    `License-Expression: MIT`, `License-File: LICENSE`, `Requires-Python`, the
    classifiers, no dependency outside an extra, and the `autoforge` console
@@ -218,7 +220,14 @@ credential:
    --dry-run --full-prompt`) in a scratch repository, with a fake `gh`
    first on `PATH` that records and fails any call, and checks it rendered
    the ANALYZE_EXECUTE prompt, called no `gh` and left the repository
-   byte-identical;
+   byte-identical; then meets LOCAL mode's ways in with the installed
+   command (ADR 0009 D3 to D5, #389): `--help` names no `local`, and in a
+   scratch repository holding a `mode: "LOCAL"` state and beside a
+   configuration with a `local:` block, `autoforge local`, `status`,
+   `status --json`, `--state-dir … status`, `step --dry-run`,
+   `resume --dry-run` and `unblock --dry-run` each exit 2 with argparse's
+   invalid choice, the unknown key or the unknown mode, call no `gh`, and
+   leave the repository and the configuration file byte-identical;
 7. prints the SHA-256 of both files (and, with `--sha256sums FILE`, writes
    them in `sha256sum` format).
 

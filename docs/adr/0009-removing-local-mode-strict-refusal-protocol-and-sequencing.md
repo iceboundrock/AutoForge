@@ -1,7 +1,8 @@
 # ADR 0009. Removing LOCAL mode: no compatibility, strict refusal, the state protocol, sequencing and the baseline
 
-- **Status:** policy accepted, and implemented by #386 (S1a), #385 (S1b),
-  #387 (S2) and #388 (S3, state protocol 13); #389 (S4) remains.
+- **Status:** policy accepted, implemented by #386 (S1a), #385 (S1b),
+  #387 (S2) and #388 (S3, state protocol 13), and measured and audited by
+  #389 (S4, Appendix C).
   - *Decision:* LOCAL mode is removed completely, as a breaking change with
     no backward compatibility. The maintainer approved this on 2026-10-30
     in the
@@ -18,9 +19,10 @@
   - *Not decided here:* the state protocol's number (#23, when #388's PR
     is ready to merge, D8) and the order of EPIC #383 against the Public
     Alpha's release candidate (§5.2).
-  - *Implementation:* S1a (#386), S1b (#385), S2 (#387) and S3 (#388); S4
-    (#389), the measurement and the documentation audit, remains (D12,
-    §5.3).
+  - *Implementation:* S1a (#386), S1b (#385), S2 (#387) and S3 (#388). S4
+    (#389) recorded the measurement, the regression, the installed
+    package's checks, the attestation of A.2.4 and the documentation audit
+    in Appendix C (D12, §5.3).
   - *Release:* nothing is authorized. D10 says what the release that
     carries the removal must say; it is not a Go/No-Go, a tag or a
     publication.
@@ -1790,3 +1792,279 @@ LOCAL-only modules' 5.5 to 6.4% of test time, 10.9% of `git` processes and
 and S2 add REMOTE and refusal tests in their place, and B.4 shows the
 host's load alone moving a run by 54 s. Whatever S4 measures is reported
 against these numbers as measured, with its own spread.
+
+## Appendix C. After the removal (S4, #389)
+
+S4's record, on 2026-10-31: the suite measured again at `4b03151`
+(Appendix B's commit, before any of the removal) and at `3eb68ac`, S3's
+last commit and `main` when S4 began, back to back on one host (C.1 to
+C.4); the regression on the final candidate (C.5); the tests that hold
+each invariant of A.2.4 (C.6); the installed wheel and sdist (C.7); and the
+documentation audit (C.8). C.9 says what this appendix does not show. It
+authorizes no release and is not a Go/No-Go.
+
+### C.1 Host and conditions
+
+A laptop, not Appendix B's host, so no absolute number below compares with
+B's: an Intel i5-4300U (2 cores, 4 threads at 1.9 GHz, the `schedutil`
+governor), 7.6 GiB of memory, Fedora Linux 44 Server, Linux 7.2.13, Git
+2.56.0, uv 0.13.6, bubblewrap 0.12.0, zsh 5.9. Python 3.14.8 is the
+interpreter `.python-version` gives; 3.12.13 and 3.11.17 are CI's. pytest
+9.1.1, pytest-xdist 3.8.0. `TMPDIR` was a directory of the tmpfs `/tmp`,
+as in B.1, for every run of both commits. Each commit ran from a clone of
+its own outside the issue worktree, with a venv `uv sync --locked` made.
+Nothing else ran on the host but the agent session that drove the runs.
+It edited documents throughout, and during the first baseline run it also
+ran under `nice` about half a minute of the tests and checks this step
+adds; the load average around each run is in C.3.
+
+### C.2 Commands
+
+B.2's commands, on both commits, with these differences. `make check`'s
+pytest is measured by the benchmark instead, which runs the same pytest
+with the repository's options, `-p no:cacheprovider` and its own JUnit
+report; its other steps are timed apart. The instrumented run of B.4 ran
+on four pytest-xdist workers, with the plugin writing one file per worker
+(its counts do not depend on the order of the tests; its run is no
+timing). `UV_OFFLINE=1` kept uv off the network after the benchmark.
+
+```bash
+# alternating: before, after, before, after, before, after (R = 1, 2, 3)
+uv run python -m tests.parallel_bench --config serial --repeats R --out <dir of the commit>
+uv run pytest --collect-only -q
+uv run pytest --collect-only -q -m live
+make lock-check; make lint; make fmt-check; make typecheck   # each twice: cold, then warm
+uv run --isolated --locked --python 3.12 pytest --junitxml=junit-312.xml --durations=0 --durations-min=0.5
+PYTHONPATH=<plugin dir> uv run pytest -p af384_instrument -n 4 --dist=load
+```
+
+The benchmark resumes a session on the same `--out`, so `--repeats 2`
+keeps run 0 and adds run 1: the three rounds alternate the two commits,
+and a drift in the host's load lands on both.
+
+### C.3 Results
+
+TBD-C3
+
+### C.4 Fixtures, subprocesses and files
+
+TBD-C4
+
+### C.5 The regression on the final candidate
+
+TBD-C5
+
+### C.6 A.2.4's invariants and the tests that hold them on `main`
+
+Each invariant of A.2.4, in its words, with the tests that hold it at
+`3eb68ac`. Every test named here ran and passed in C.5's regression,
+except where a line says it skips on a host, or is opt-in.
+`tests/test_removal_attestation.py` fails when this list and A.2.4's table
+disagree on the invariants, or when a test named here no longer exists.
+
+- **A credential helper never reaches a validation command** (H-A, #386):
+  `tests/test_validation_evidence.py::test_a_helper_planted_by_the_producer_never_reaches_its_validation_command`,
+  `tests/test_validation_evidence.py::test_a_netrc_entry_planted_by_the_producer_refuses_its_validation_and_blocks`,
+  `tests/test_engine.py::test_a_credential_helper_planted_before_candidate_validation_never_reaches_the_command`
+  and
+  `tests/test_engine.py::test_a_netrc_entry_planted_before_candidate_validation_blocks_the_producer`.
+  #386 recorded their mutation run: each fails without the preflight call
+  in `_run_remote_validator`, or with the export inside the repository.
+- **A login-shell startup file never changes a validation command's isolation** (H-B, #386):
+  `tests/test_validation_evidence.py::test_a_startup_file_planted_by_the_producer_refuses_its_validation_and_blocks`
+  and
+  `tests/test_engine.py::test_a_startup_file_planted_before_candidate_validation_blocks_the_producer`.
+- **Git reads take no optional lock, no fsmonitor and no credential** (A, #386):
+  `tests/test_git_workspace.py::test_no_read_takes_the_optional_index_lock_or_refreshes_the_index`,
+  `tests/test_git_workspace.py::test_reads_run_no_fsmonitor_hold_no_credential_and_ignore_the_operators_git_dir`,
+  `tests/test_git_workspace.py::test_uncommitted_paths_is_one_hardened_status_read_and_never_guesses`,
+  `tests/test_git_workspace.py::test_status_entries_keep_each_code_and_read_a_rename_or_a_copy_as_one_record`,
+  `tests/test_git_workspace.py::test_a_truncated_or_timed_out_read_is_refused_never_parsed`
+  and, for C1,
+  `tests/test_git_workspace.py::test_engine_workspace_reads_no_configuration`.
+- **The state loader refuses unknown fields and non-object roots, and survives fuzzing** (B, #386):
+  `tests/test_state_fuzz.py::test_a_remote_state_file_with_an_unknown_field_is_corruption`,
+  `tests/test_state_fuzz.py::test_a_remote_state_file_that_is_not_a_json_object_is_corruption_not_a_fresh_run`,
+  `tests/test_state_fuzz.py::test_random_corruption_of_a_remote_state_either_fails_or_is_legal`,
+  `tests/test_state_fuzz.py::test_the_remote_baseline_state_loads_and_round_trips`
+  and
+  `tests/test_state_fuzz.py::test_a_remote_state_carrying_a_well_formed_local_checkpoint_is_refused`.
+- **The state root holds under a running engine (replaced directory, links, bootstrap)** (C, #386):
+  `tests/test_state_root.py::test_a_remote_state_directory_replaced_mid_run_is_refused_and_reaches_nothing`,
+  `tests/test_state_root.py::test_a_remote_state_json_replaced_by_a_symlink_is_replaced_back_not_written_through`,
+  `tests/test_state_root.py::test_a_remote_state_json_hard_linked_elsewhere_keeps_the_old_bytes_at_the_other_link`,
+  `tests/test_state_root.py::test_bootstrap_does_not_follow_a_link_at_the_remote_state_directory`,
+  `tests/test_state_root.py::test_bootstrap_of_an_anchored_remote_state_directory_does_not_follow_a_link_below_the_anchor`
+  and the documented limit,
+  `tests/test_state_root.py::test_documented_limit_a_remote_state_directory_replaced_in_place_by_a_copy_is_not_detectable`.
+- **Finding text cannot break out of its block** (D, #386):
+  `tests/test_findings_fence.py::test_finding_text_cannot_break_out_of_the_findings_block_of_a_remote_prompt`
+  and
+  `tests/test_findings_fence.py::test_a_correction_diagnostic_cannot_break_out_of_its_block`.
+- **`doctor`'s sandbox rows are right** (E, #386): the twelve REMOTE rows of
+  `tests/test_doctor_sandbox.py`,
+  `tests/test_doctor_sandbox.py::test_remote_doctor_shows_every_sandbox_row_and_never_calls_github`,
+  `tests/test_doctor_sandbox.py::test_outside_a_repository_the_remote_layout_rows_are_skipped`,
+  `tests/test_doctor_sandbox.py::test_a_token_across_the_version_clip_leaves_no_fragment_in_remote`,
+  `tests/test_doctor_sandbox.py::test_an_unsupported_capability_is_named_for_a_remote_run`,
+  `tests/test_doctor_sandbox.py::test_a_dir_rw_login_the_policy_refuses_is_named_with_the_alternatives_in_remote`,
+  `tests/test_doctor_sandbox.py::test_an_operator_opencode_config_dir_is_replaced_as_at_every_remote_launch`,
+  `tests/test_doctor_sandbox.py::test_a_linked_claude_config_dir_is_spelled_where_it_leads_inside_in_remote`,
+  `tests/test_doctor_sandbox.py::test_a_shebang_through_a_link_is_reached_as_written_in_remote`,
+  `tests/test_doctor_sandbox.py::test_hard_links_in_the_remote_issue_worktrees_are_listed_by_path`,
+  `tests/test_doctor_sandbox.py::test_the_remote_sandbox_directories_and_their_sizes_are_listed`,
+  `tests/test_doctor_sandbox.py::test_remote_operator_paths_over_a_denied_root_are_named`
+  and
+  `tests/test_doctor_sandbox.py::test_a_provider_declaration_over_a_remote_denied_root_is_refused_before_its_launch`;
+  and each provider's `--version` through the real backend,
+  `tests/test_sandbox_routing.py::test_remote_doctor_launches_each_providers_version_as_a_launch_would`,
+  which skips on a host that cannot enforce (C.5).
+- **Launch-class declarations stay read-only, and a provider cannot rewrite its `--config`** (F, #386):
+  `tests/test_sandbox_policy.py::test_a_remote_agent_declaration_makes_its_state_and_dir_rw_items_writable_only`
+  on every host, and through the real backend
+  `tests/test_sandbox_routing.py::test_a_remote_launch_rewrites_a_config_file_in_its_providers_directory_so_it_is_refused`,
+  which skips on a host that cannot enforce (C.5).
+- **A live model run through the real CLI** (G, #386): the offline
+  rehearsals of the REMOTE flow,
+  `tests/test_live_pi_support.py::test_the_remote_flow_passes_beside_the_checkout_git_dir_names_and_runs_no_planted_hook`,
+  `tests/test_live_pi_support.py::test_the_remote_flow_seeds_its_own_origin_whatever_the_operators_gitconfig_rewrites`,
+  `tests/test_live_pi_support.py::test_the_origin_is_seeded_and_published_to_alone_whatever_rewrites_the_url`,
+  `tests/test_live_pi_support.py::test_the_remote_flows_own_git_never_writes_to_a_repository_the_environment_selects`
+  and
+  `tests/test_live_pi_support.py::test_the_remote_flows_own_git_runs_no_hook_monitor_or_signer_the_operator_configured`.
+  The live run itself,
+  `tests/test_live_pi.py::test_one_remote_review_runs_on_the_operators_real_pi`,
+  is opt-in and makes a model call, so S4 did not run it; no live REMOTE
+  run of it is recorded yet (README, "Current maturity").
+- **Sandbox pinning and enforcement** (PRESERVE): the REMOTE rows of
+  `tests/test_sandbox_pin.py` and `tests/test_sandbox_gate.py`, among them
+  `tests/test_sandbox_pin.py::test_strength_is_what_a_launch_of_the_run_gets`,
+  `tests/test_sandbox_pin.py::test_a_remote_run_refuses_disabled_with_nothing_written`,
+  `tests/test_sandbox_pin.py::test_a_remote_run_moves_between_required_and_preferred_freely`,
+  `tests/test_sandbox_gate.py::test_a_remote_step_on_an_incapable_host_is_refused_with_state_unchanged`
+  and
+  `tests/test_sandbox_gate.py::test_a_setup_failure_after_the_gate_never_runs_unenforced`;
+  and `preferred` as `required` (D7),
+  `tests/test_config.py::test_preferred_refuses_unenforced_exactly_as_required_does`.
+- **Candidate validation, evidence and certificate binding** (PRESERVE, and
+  S3's refusal of the LOCAL kinds): the REMOTE sections of
+  `tests/test_evidence.py`, `tests/test_certificate.py` and
+  `tests/test_validation_evidence.py`, and
+  `tests/test_evidence.py::test_a_local_candidate_is_refused_as_an_unknown_kind`,
+  `tests/test_evidence.py::test_a_workspace_variant_record_is_refused`,
+  `tests/test_evidence.py::test_a_workspace_variant_marker_is_refused`,
+  `tests/test_evidence.py::test_evidence_naming_a_workspace_record_is_refused_whole`,
+  `tests/test_evidence.py::test_a_local_certificate_is_refused_as_an_unknown_kind`,
+  `tests/test_evidence.py::test_a_binding_naming_a_local_candidate_is_refused`,
+  `tests/test_certificate.py::test_issuance_is_refused_for_a_binding_of_a_local_candidate`
+  and
+  `tests/test_certificate.py::test_a_local_certificate_is_never_applicable_in_a_run`.
+- **Crash recovery** (PRESERVE; the four journal cases #386 confirmed):
+  `tests/test_runlog.py::test_a_foreign_file_renamed_over_the_journal_during_a_remote_launch_receives_nothing`,
+  `tests/test_engine.py::test_a_journal_refused_before_the_launch_charges_no_attempt`
+  and
+  `tests/test_engine.py::test_post_agent_journal_refusal_names_the_outcome_and_keeps_the_attempt`,
+  with the rest of `tests/test_runlog.py` and REMOTE `tests/test_engine.py`.
+- **Provider interaction and launch accounting** (nothing shared; REMOTE's
+  own bounds):
+  `tests/test_engine.py::test_a_journal_refused_before_the_launch_charges_no_attempt`,
+  `tests/test_engine.py::test_correction_is_bounded`,
+  `tests/test_engine.py::test_k8_the_attempt_bound_exhausted_blocks_naming_the_effect`
+  and
+  `tests/test_engine.py::test_review_round_cap_blocks_with_findings_and_never_starts_the_last_fix`.
+- **Scheduler state ownership** (#385, D4):
+  `tests/test_epic_commands.py::test_an_unloadable_standalone_state_holds_nothing_is_reported_and_is_left_alone`,
+  `tests/test_epic_commands.py::test_a_namespace_state_whose_mode_is_not_remote_is_held_as_uncertain`,
+  `tests/test_epic_commands.py::test_namespace_work_leaves_the_git_dirs_autoforge_state_alone`
+  and
+  `tests/test_ownership.py::test_an_unreadable_standalone_state_is_reported_and_holds_nothing`.
+- **REMOTE state refusals under the drop step** (#385 pinned them, #388
+  kept them): the 31 tests that take `tests/conftest.py`'s `local_fields`
+  fixture, each run on its file once with LOCAL's twelve fields at their
+  empty values and once without, among them
+  `tests/test_state.py::test_protocol_1_is_refused_in_the_merge_phases`,
+  `tests/test_state.py::test_protocol_3_is_refused_with_a_replan_in_flight`,
+  `tests/test_state.py::test_a_mode_other_than_remote_is_refused_under_every_label_and_left_unchanged`,
+  `tests/test_state.py::test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged`
+  and
+  `tests/test_replan.py::test_an_in_flight_protocol_4_journal_past_the_write_is_refused_at_the_state_boundary`;
+  and the drop step's own refusals,
+  `tests/test_state.py::test_an_older_file_with_a_local_field_holding_a_value_is_refused_and_left_unchanged`
+  and
+  `tests/test_state.py::test_a_protocol_13_or_unlabelled_file_carrying_a_local_field_is_refused`.
+- **The release gate's packaging check** (#387, #388, #389):
+  `tests/test_packaging.py::test_no_artifact_carries_a_file_of_local_mode`,
+  `tests/test_prompts.py::test_no_local_template_is_shipped`, and the
+  installed command's refusals that `make dist-check` now runs (C.7),
+  checked offline by
+  `tests/test_packaging.py::test_the_local_refusal_check_holds_every_way_in_to_its_refusal`
+  and
+  `tests/test_packaging.py::test_the_local_refusal_check_covers_each_way_in_adr_0009_names`.
+
+### C.7 The installed wheel and sdist
+
+TBD-C7
+
+### C.8 The documentation audit
+
+Every current document was searched at `3eb68ac` for LOCAL's vocabulary
+(`LOCAL`, local mode, `autoforge local`, `local:`, the feature
+specification and `features/`, the workspace fingerprint and walk, the run
+contract, `sandbox/local`) and for links into ADR 0001's superseded parts:
+`README.md`, `SECURITY.md`, the three `AGENTS.md` and `CLAUDE.md`, every
+document under `docs/` but the ADRs, `autoforge.example.yaml`, the CI
+workflows, `pyproject.toml`, `MANIFEST.in` and the comments under `src/`.
+What described LOCAL as current, or pointed at what is gone, was corrected
+in #389:
+
+- `docs/agent-guides/secrets-and-logging.md` said the block reason for a
+  moved checkout names the feature specification's path;
+  `_moved_checkout_recovery` names the checkout and two commands only.
+- `src/autoforge/prompts/__init__.py` gave a feature specification as the
+  untrusted value a template variable may carry; it now names the ones
+  REMOTE has.
+- `docs/pi.md` and `docs/pi-policy.md` cited ADR 0001 §2 and §2.2, parts
+  this record superseded, for "an agent runs as your UID"; they cite
+  `docs/security.md` ("Agents run as you") instead.
+- `docs/non-code-rules.md` gave a `features/` spec as its example of a file
+  committed in a PR.
+- `README.md` listed ADR 0001 among the design records without saying it is
+  superseded; ADR 0009's status, the `AGENTS.md` map and `docs/README.md`
+  said S4 remained.
+
+Kept, because each is accurate: the refusals of a LOCAL artifact and where
+an earlier release's LOCAL run kept its files (`state-and-recovery.md`,
+`testing.md`, `usage.md`, the changelog's #387 entry with D10's manual
+clean-up); README's note that Pi's one live run was in a mode that is gone;
+`docs/compatibility.md`'s Pi row, which says the same; the protocol
+history of `state-and-recovery.md`; `docs/development.md`'s measurement of
+#341, which names `test_local.py` at `a86b729`; `CHANGELOG.md`'s past
+entries and the ADRs, which are history (D10, D11).
+
+### C.9 What S4 does not show
+
+- **The GitHub side of #384 and of the EPIC.** S4 was to read back the
+  native sub-issue and `blocked_by` links of §5.3 and the two comments of
+  §5 (#155's amendment note and #255's proposal). The agent that wrote this
+  appendix holds no GitHub credential and was given #389 alone to read
+  (ADR 0004 D10), so none of that is verified here: it is the controller's
+  and the maintainer's to read back, and until then §5's evidence stays as
+  §5 describes it. Nothing here edits #155, #255 or C7.
+- **An independent review.** The security of the removal, the state
+  migration and its crash windows are for the review of #389's PR and the
+  maintainer's; this appendix records tests and measurements, and is
+  evidence for that review, not the review.
+- **A live model run.** G's live test was not run (C.6).
+- **The removal's own effect on the suite's time.** Between `4b03151` and
+  `3eb68ac` lie eleven commits. Besides S1a to S3 and this record they
+  carry #341 (`acebe52`), which cut the serial suite's wall time by 36% on
+  a 4-CPU host with `TMPDIR` on a disk, and by less with it on a tmpfs
+  (`docs/development.md`, "Where the serial suite's time goes"), four other
+  changes with tests of their own (#393, #343, #349, #287) and ADR 0010's
+  tooling (#342). C.3's difference is all of
+  theirs together; C.3 and C.4 split it only by module, which says where
+  time and processes moved, not why.
+- **A release.** Nothing is tagged, published or declared ready. The next
+  `0.1.0aN` needs the maintainer's approval, its own Go/No-Go and
+  `docs/releasing.md`'s procedure; whether it is the Public Alpha is §5.2's
+  open question.

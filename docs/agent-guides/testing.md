@@ -422,6 +422,13 @@ High-priority coverage includes:
   unknown kinds; and, structurally, `LOCAL_LEGAL_EDGES`, a LOCAL launch
   class and `WorkflowMode.LOCAL` do not exist, no module imports a
   deleted one, and the wheel carries no `local_*.md` template
+- the removal's closure (ADR 0009 D12 S4; #389;
+  `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
+  Appendix C.6 attests every invariant of A.2.4 in its words, each with
+  the tests that hold it, and each test it names exists; the built wheel
+  and sdist carry none of LOCAL mode's files, and the installed command
+  meets each of LOCAL's ways in with its generic refusal and writes
+  nothing (`make dist-check`)
 
 ### Transitions
 
@@ -1748,6 +1755,13 @@ without building:
 - its REMOTE dry-run check, run on a stand-in for the installed command
   with real git and a recording fake `gh`, refuses a `gh` call, any write
   to the scratch repository (`.git` included) and an unrendered variable
+- the wheel and the sdist carry none of LOCAL mode's files (its
+  `local_*.md` templates and its two modules), and the dist check refuses
+  an artifact that carries one; its check of LOCAL mode's ways in (ADR 0009
+  D3 to D5, #389), run on a stand-in for the installed command, refuses a
+  way in accepted or refused for another reason, a `--help` naming
+  `local`, a `gh` call, and any write to the scratch repository, its state
+  directory, its run log or `.git`, or to the configuration file
 
 `make dist-check` (CI's `dist` job, on every CI Python) builds the real
 artifacts and runs the installed wheel outside the checkout

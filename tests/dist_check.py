@@ -25,8 +25,10 @@ imports the ``autoforge`` of the source tree:
    ``pyproject.toml``, ``PKG-INFO``, ``setup.cfg``, the egg-info, the modules and the
    resources ``[tool.setuptools.package-data]`` declares. The wheel holds
    exactly those modules and resources and its dist-info. Neither carries a
-   LOCAL prompt template (``autoforge/prompts/local_*.md``), which LOCAL's
-   removal deleted (ADR 0009 D12 S3, #388), whatever the tree declares. Both carry the
+   file of LOCAL mode's, which its removal deleted (ADR 0009 D12 S3, #388),
+   whatever the tree declares: a prompt template
+   ``autoforge/prompts/local_*.md``, ``autoforge/local_workspace.py`` or
+   ``autoforge/run_contract.py``. Both carry the
    metadata ``pyproject.toml`` declares (``Name: autoforge-cli``, the
    version, ``License-Expression: MIT``, ``License-File: LICENSE``, the
    classifiers, ``Requires-Python``) and ``LICENSE`` byte for byte. A file
@@ -41,7 +43,14 @@ imports the ``autoforge`` of the source tree:
    a scratch git repository, with a ``gh`` on ``PATH`` that records any
    call and fails it, which must render the ANALYZE_EXECUTE prompt through
    the installed engine, call no ``gh`` and leave the repository
-   byte-identical.
+   byte-identical. Then LOCAL mode's ways in, each met by a generic refusal
+   of the installed command (ADR 0009 D3 to D5, #389): ``--help`` names no
+   ``local``; ``autoforge local`` is argparse's invalid choice; a
+   configuration with a ``local:`` block is an unknown key; a
+   ``mode: "LOCAL"`` state is an unknown mode to every command that loads
+   it (``step``, ``resume`` and ``unblock`` as dry runs). Each exits 2,
+   calls no ``gh`` and leaves the repository, its state directory and
+   ``.git`` included, byte-identical.
 5. The SHA-256 of each artifact is printed, appended to the job summary
    (``$GITHUB_STEP_SUMMARY``) when that is set, and written to
    ``--sha256sums`` in ``sha256sum -c`` format when asked. When
@@ -102,9 +111,13 @@ _HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
 REMOTE_EPIC = "https://github.com/example/dist-check/issues/1"
 REMOTE_ISSUE = "https://github.com/example/dist-check/issues/2"
 _PLACEHOLDER = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
-# LOCAL mode's prompt templates, deleted with it (ADR 0009 D12 S3, #388): no
-# artifact and no installed package may carry one again.
-_LOCAL_TEMPLATE = re.compile(r"(?:^|/)autoforge/prompts/local_[^/]*\.md$")
+# LOCAL mode's packaged files, deleted with it (ADR 0009 D12 S3, #388): its four
+# prompt templates and its two modules of its own. No artifact and no installed
+# package may carry one again.
+_LOCAL_FILE = re.compile(
+    r"(?:^|/)autoforge/(?:prompts/local_[^/]*\.md|local_workspace\.py|run_contract\.py)$"
+)
+LOCAL_MODULES = ("autoforge.local_workspace", "autoforge.run_contract")
 _CONTROL_RESULT = "<<<CONTROL_RESULT>>>"
 
 
@@ -149,9 +162,9 @@ def wheel_package_files(root: Path = REPO_ROOT) -> set[str]:
     return package_modules(root) | declared_resources(root)
 
 
-def local_templates(names) -> list[str]:
-    """The LOCAL prompt templates (``autoforge/prompts/local_*.md``) among ``names``."""
-    return sorted(name for name in names if _LOCAL_TEMPLATE.search(name))
+def local_files(names) -> list[str]:
+    """LOCAL mode's files among ``names``: a ``prompts/local_*.md``, or one of its modules."""
+    return sorted(name for name in names if _LOCAL_FILE.search(name))
 
 
 def distribution_stem(name: str, version: str) -> str:
@@ -270,8 +283,8 @@ def check_sdist(path: Path, stem: str, data: dict, root: Path = REPO_ROOT) -> No
         egg_info = f"src/{stem.split('-', 1)[0]}.egg-info/"
         expected = SDIST_TOP_FILES | {f"src/{name}" for name in wheel_package_files(root)}
         found = {name for name in names if not name.startswith(egg_info)}
-        local = local_templates(found)
-        _check(not local, f"{path.name} carries LOCAL prompt templates: {local}")
+        local = local_files(found)
+        _check(not local, f"{path.name} carries LOCAL mode's files: {local}")
         missing, extra = sorted(expected - found), sorted(found - expected)
         _check(not missing, f"{path.name} is missing {missing}")
         _check(not extra, f"{path.name} carries files it should not: {extra}")
@@ -295,8 +308,8 @@ def check_wheel(path: Path, stem: str, data: dict, root: Path = REPO_ROOT) -> st
     with zipfile.ZipFile(path) as archive:
         names = {name for name in archive.namelist() if not name.endswith("/")}
         package = {name for name in names if not name.startswith(dist_info)}
-        local = local_templates(package)
-        _check(not local, f"{path.name} carries LOCAL prompt templates: {local}")
+        local = local_files(package)
+        _check(not local, f"{path.name} carries LOCAL mode's files: {local}")
         expected = wheel_package_files(root)
         missing, extra = sorted(expected - package), sorted(package - expected)
         _check(not missing, f"{path.name} is missing {missing}")
@@ -470,6 +483,7 @@ def smoke(bin_dir: Path, work: Path, version: str) -> None:
     _check(git is not None, "git is not on PATH")
     assert git is not None
     remote_dry_run(autoforge, git, work, env)
+    local_refusals(autoforge, git, work, env)
 
 
 def _scratch_repository(git: str, repo: Path, env: dict[str, str]) -> Path:
@@ -558,6 +572,88 @@ def remote_dry_run(autoforge: str, git: str, work: Path, env: dict[str, str]) ->
     _check(not changed, f"the REMOTE dry run changed the scratch repository: {changed}")
     _say(
         "ok: autoforge run --dry-run --full-prompt rendered the ANALYZE_EXECUTE prompt, no gh call"
+    )
+
+
+# LOCAL mode's ways in, and the generic refusal each meets in the installed
+# command (ADR 0009 D3 to D5): the words after `autoforge`, the exit status, and
+# what its stderr must say. `doctor`'s refusal of a `local:` key, its failing
+# `config` row, is tests/test_cli.py's: doctor runs `gh` and the agent CLIs.
+_LOCAL_WAYS_IN: tuple[tuple[tuple[str, ...], int, str], ...] = (
+    (("local",), 2, "invalid choice: 'local'"),
+    (("local", "run", "features/add-filter.md"), 2, "invalid choice: 'local'"),
+    (("local", "doctor"), 2, "invalid choice: 'local'"),
+    (("--config", "{config}", "status"), 2, "unknown key(s) under 'the top level': local"),
+    (("status",), 2, "state file has unknown mode 'LOCAL'"),
+    (("status", "--json"), 2, "state file has unknown mode 'LOCAL'"),
+    (("--state-dir", "{state_dir}", "status"), 2, "state file has unknown mode 'LOCAL'"),
+    (("step", "--dry-run"), 2, "state file has unknown mode 'LOCAL'"),
+    (("resume", "--dry-run"), 2, "state file has unknown mode 'LOCAL'"),
+    (("unblock", "--reason", "looked", "--dry-run"), 2, "state file has unknown mode 'LOCAL'"),
+)
+
+
+def local_refusals(autoforge: str, git: str, work: Path, env: dict[str, str]) -> None:
+    """LOCAL mode's ways in meet the installed command's generic refusals (ADR 0009, #389).
+
+    A scratch repository holds what an operator upgrading from a release
+    with LOCAL mode may have: a LOCAL state, with a run log, at the default
+    ``state_dir``, a feature file, and a configuration file beside it that
+    still has a ``local:`` block. ``--help`` names no ``local``; each way in
+    of :data:`_LOCAL_WAYS_IN` exits as its row says, naming its refusal; the
+    ``step``, ``resume`` and ``unblock`` rows are dry runs, so a refusal
+    that regressed launches no agent. The ``gh`` first on ``PATH`` records
+    any call and fails it, and the repository, its state directory and
+    ``.git`` included, and the configuration file are byte-identical
+    afterwards.
+    """
+    fake_bin = work / "fake-gh-local"
+    fake_bin.mkdir()
+    calls = work / "gh-calls-local.log"
+    fake = fake_bin / "gh"
+    fake.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {shlex.quote(str(calls))}\nexit 1\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    local_env = dict(env, PATH=f"{fake_bin}{os.pathsep}{env.get('PATH', '')}")
+    help_text = _run([autoforge, "--help"], cwd=work, env=local_env).stdout
+    _check("local" not in help_text.lower(), "`autoforge --help` names `local`")
+    repo = _scratch_repository(git, work / "local-repo", local_env)
+    state_dir = repo / ".autoforge"
+    (state_dir / "logs" / "local-run").mkdir(parents=True)
+    (state_dir / "state.json").write_text(
+        json.dumps({"mode": "LOCAL", "protocol_version": "12", "phase": "REVIEW"}),
+        encoding="utf-8",
+    )
+    (state_dir / "logs" / "local-run" / "run.log").write_text("a LOCAL run's log\n")
+    (repo / "features").mkdir()
+    (repo / "features" / "add-filter.md").write_text("# Feature: add filter\n")
+    config = work / "local-config.json"
+    config.write_text(json.dumps({"version": 1, "local": {"max_fix_rounds": 1}}))
+    before, config_before = _tree(repo), config.read_bytes()
+    for words, status, refusal in _LOCAL_WAYS_IN:
+        argv = [
+            autoforge,
+            *(word.format(config=config, state_dir=state_dir) for word in words),
+        ]
+        _say("$ " + shlex.join(argv))
+        result = subprocess.run(
+            argv, cwd=repo, env=local_env, capture_output=True, text=True, check=False, timeout=300
+        )
+        _check(
+            result.returncode == status and refusal in result.stderr,
+            f"`{shlex.join(argv)}` exited {result.returncode}, not {status} naming {refusal!r}:\n"
+            + "\n".join((result.stdout + result.stderr).splitlines()[-20:]),
+        )
+        if calls.exists():
+            raise CheckFailed(f"`{shlex.join(argv)}` called gh: {calls.read_text('utf-8')!r}")
+        changed = sorted({path for path, _ in set(before.items()) ^ set(_tree(repo).items())})
+        _check(not changed, f"`{shlex.join(argv)}` changed the scratch repository: {changed}")
+        _check(config.read_bytes() == config_before, f"`{shlex.join(argv)}` changed {config}")
+    _say(
+        f"ok: LOCAL mode's {len(_LOCAL_WAYS_IN)} ways in met their generic refusals, "
+        "no gh call, nothing written"
     )
 
 
@@ -650,6 +746,7 @@ def check_distributions(
 def check_installed(expect_version: str, source_root: Path) -> None:
     """Run by the environment's own interpreter: the package it imports is the installed one."""
     import importlib.metadata
+    import importlib.util
 
     import autoforge
     from autoforge import engine, prompts
@@ -677,8 +774,17 @@ def check_installed(expect_version: str, source_root: Path) -> None:
     on_disk = sorted(path.name for path in directory.glob("*.md"))
     registered = sorted(prompts.TEMPLATE_FILES)
     _check(on_disk == registered, f"installed templates {on_disk}, registered {registered}")
-    local = local_templates(f"autoforge/prompts/{name}" for name in {*on_disk, *registered})
-    _check(not local, f"the installed package carries LOCAL prompt templates: {local}")
+    installed = {
+        path.relative_to(location.parent.parent).as_posix()
+        for path in location.parent.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+    local = local_files(
+        installed | {f"autoforge/prompts/{name}" for name in {*on_disk, *registered}}
+    )
+    _check(not local, f"the installed package carries LOCAL mode's files: {local}")
+    importable = [name for name in LOCAL_MODULES if importlib.util.find_spec(name) is not None]
+    _check(not importable, f"LOCAL mode's modules import from the installed package: {importable}")
     _check(engine.check_template_files() == [], f"missing: {engine.check_template_files()}")
 
     def variables(*names: str) -> dict[str, str | int | None]:

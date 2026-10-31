@@ -279,7 +279,7 @@ The [Pi policy](pi-policy.md) is authoritative. In short:
   layer: a Pi profile is like Claude Code under `bypassPermissions`. Under
   the default `sandbox.mode: disabled` its tools run with your UID and your
   files, as every provider's do
-  ([ADR 0001](adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md) §2.2):
+  ([Security boundaries: agents run as you](security.md#agents-run-as-you)):
   run unattended phases in a container, a VM or under a dedicated user, or
   set `sandbox.mode: required` on Linux
   ([Configuration: outer sandbox](configuration.md#outer-sandbox)). A tool

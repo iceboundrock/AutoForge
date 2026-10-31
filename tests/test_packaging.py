@@ -351,30 +351,42 @@ def test_the_dist_check_fails_a_wheel_without_a_template(tmp_path: Path):
         dist_check.check_wheel(_wheel(tmp_path, drop="autoforge/prompts/review.md"), STEM, DATA)
 
 
-def test_no_artifact_carries_a_local_prompt_template(tmp_path: Path):
-    """ADR 0009 D12 S3 (#388): the wheel and the sdist carry no ``local_*.md``.
+@pytest.mark.parametrize(
+    "wheel_file, sdist_file",
+    [
+        ("autoforge/prompts/local_common.md", "src/autoforge/prompts/local_review.md"),
+        ("autoforge/run_contract.py", "src/autoforge/local_workspace.py"),
+    ],
+    ids=["template", "module"],
+)
+def test_no_artifact_carries_a_file_of_local_mode(tmp_path: Path, wheel_file, sdist_file):
+    """ADR 0009 D12 S3 (#388), checked again by S4 (#389): the wheel and the
+    sdist carry none of LOCAL mode's files, its ``local_*.md`` prompt
+    templates or its two modules, ``local_workspace.py`` and
+    ``run_contract.py``.
 
     What the package declares holds none, so the wheel built from this
     commit, which ``check_wheel`` holds to exactly that set, holds none; and
     the dist check refuses a wheel or an sdist that carries one anyway, as
     a stray file would be refused, but naming LOCAL.
     """
-    assert dist_check.local_templates(dist_check.wheel_package_files()) == []
+    assert dist_check.local_files(dist_check.wheel_package_files()) == []
     assert not list(prompts.prompts_dir().glob("local_*.md"))
     assert [name for name in prompts.TEMPLATE_FILES if name.startswith("local_")] == []
+    assert not [
+        m
+        for m in dist_check.LOCAL_MODULES
+        if (REPO_ROOT / "src").joinpath(*m.split(".")).with_suffix(".py").exists()
+    ]
     wheel = _wheel(tmp_path)
     with zipfile.ZipFile(wheel) as archive:
-        assert dist_check.local_templates(archive.namelist()) == []
+        assert dist_check.local_files(archive.namelist()) == []
     with zipfile.ZipFile(wheel, "a") as archive:
-        archive.writestr("autoforge/prompts/local_common.md", "# LOCAL\n")
-    with pytest.raises(
-        CheckFailed, match=r"LOCAL prompt templates: \['autoforge/prompts/local_common.md'\]"
-    ):
+        archive.writestr(wheel_file, "# LOCAL\n")
+    with pytest.raises(CheckFailed, match=rf"LOCAL mode's files: \['{re.escape(wheel_file)}'\]"):
         dist_check.check_wheel(wheel, STEM, DATA)
-    sdist = _sdist(tmp_path, extra="src/autoforge/prompts/local_review.md")
-    with pytest.raises(
-        CheckFailed, match=r"LOCAL prompt templates: \['src/autoforge/prompts/local_review.md'\]"
-    ):
+    sdist = _sdist(tmp_path, extra=sdist_file)
+    with pytest.raises(CheckFailed, match=rf"LOCAL mode's files: \['{re.escape(sdist_file)}'\]"):
         dist_check.check_sdist(sdist, STEM, DATA)
 
 
@@ -530,6 +542,98 @@ def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
         return
     with pytest.raises(CheckFailed, match=refusal):
         dist_check.remote_dry_run(str(command), git, tmp_path, dist_check._child_env())
+
+
+# What the installed command answers LOCAL mode's ways in with, as far as the
+# dist check looks (ADR 0009 D3 to D5); the stand-ins below answer so and then
+# misbehave in one way each, before the answer.
+_LOCAL_ANSWERS = """
+case "$*" in
+  --help) echo "usage: autoforge {doctor,run,step,resume,unblock,status,epic}";;
+  local*) echo "autoforge: error: argument command: invalid choice: 'local'" >&2; exit 2;;
+  --config*) echo "autoforge: error: c: unknown key(s) under 'the top level': local" >&2; exit 2;;
+  *) echo "autoforge: error: state file has unknown mode 'LOCAL'" >&2; exit 2;;
+esac
+"""
+
+
+@pytest.mark.parametrize(
+    "first, refusal",
+    [
+        ("", None),
+        (
+            '[ "$1" = --help ] && echo "usage: autoforge {local,run}" && exit 0',
+            "`autoforge --help` names `local`",
+        ),
+        ('[ "$1" = local ] && [ "$2" = doctor ] && exit 0', r"local doctor` exited 0, not 2"),
+        ('[ "$2" = --json ] && echo "{}" && exit 0', r"status --json` exited 0, not 2"),
+        (
+            '[ "$1" = --config ] && echo "autoforge: error: unreadable" >&2 && exit 2',
+            r"exited 2, not 2 naming \"unknown key\(s\) under 'the top level': local\"",
+        ),
+        (
+            '[ "$1" = step ] && mv .autoforge/state.json .autoforge/state.json.corrupt-1',
+            r"step --dry-run` changed the scratch repository: "
+            r"\['\.autoforge/state\.json', '\.autoforge/state\.json\.corrupt-1'\]",
+        ),
+        (
+            '[ "$1" = unblock ] && echo x >> .autoforge/logs/local-run/run.log',
+            r"changed the scratch repository: \['\.autoforge/logs/local-run/run\.log'\]",
+        ),
+        ('[ "$1" = resume ] && : > .git/index.lock', r"\['\.git/index\.lock'\]"),
+        ('[ "$1" = status ] && { gh api user || true; }', r"status` called gh: 'api user\\n'"),
+        ('[ "$1" = --config ] && echo "# edited" >> "$2"', r"status` changed .*local-config\.json"),
+    ],
+    ids=[
+        "refused",
+        "help-names-local",
+        "local-accepted",
+        "status-json-accepted",
+        "config-wrong-refusal",
+        "state-moved-aside",
+        "log-written",
+        "git-dir-written",
+        "gh-called",
+        "config-written",
+    ],
+)
+def test_the_local_refusal_check_holds_every_way_in_to_its_refusal(
+    tmp_path: Path, first: str, refusal: str | None
+):
+    """``local_refusals`` (#389) on a stand-in for the installed command
+    (real git, fake gh): it passes a command that answers each of LOCAL
+    mode's ways in with its generic refusal and touches nothing, and fails
+    one that accepts a way in, refuses it for another reason, writes to the
+    state directory, its log or ``.git``, edits the configuration file or
+    calls ``gh``."""
+    command = tmp_path / "autoforge"
+    command.write_text(f"#!/bin/sh\n{first}\n{_LOCAL_ANSWERS}", encoding="utf-8")
+    command.chmod(0o755)
+    git = dist_check.shutil.which("git")
+    assert git is not None
+    if refusal is None:
+        dist_check.local_refusals(str(command), git, tmp_path, dist_check._child_env())
+        return
+    with pytest.raises(CheckFailed, match=refusal):
+        dist_check.local_refusals(str(command), git, tmp_path, dist_check._child_env())
+
+
+def test_the_local_refusal_check_covers_each_way_in_adr_0009_names():
+    """ADR 0009 D3 to D5: the refusal check covers ``autoforge local``, a
+    ``local:`` key and a ``mode: "LOCAL"`` state under each command that
+    loads one; the commands that could launch an agent only as dry runs."""
+    ways = {words: (status, refusal) for words, status, refusal in dist_check._LOCAL_WAYS_IN}
+    assert {w for w in ways if w[0] == "local"} >= {("local",), ("local", "doctor")}
+    assert ways[("--config", "{config}", "status")][1].endswith("'the top level': local")
+    loading = {w for w, (_, refusal) in ways.items() if "unknown mode 'LOCAL'" in refusal}
+    assert {w[0] if w[0] != "--state-dir" else w[2] for w in loading} == {
+        "status",
+        "step",
+        "resume",
+        "unblock",
+    }
+    assert all("--dry-run" in w for w in loading if w[0] in ("step", "resume", "unblock"))
+    assert {status for status, _ in ways.values()} == {2}
 
 
 def test_the_scratch_repository_starts_no_detached_maintenance(tmp_path: Path):
