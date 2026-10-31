@@ -33,7 +33,8 @@ Authorization: Bearer ... / Token ... / Basic ...
 
 the value of any name that ends in `_API_KEY`, `_TOKEN`, `_SECRET` or
 `_PASSWORD` behind a prefix (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, any
-value; `client_secret`, a quoted value or a literal), also as a mapping's
+value; `client_secret`, a quoted value or a word that does not read as
+code), also as a mapping's
 key, the well-known token shapes on their own (`ghp_*` and
 the other classic GitHub prefixes, `github_pat_*`, `sk-*`, `sk-ant-*`,
 Google API keys `AIza...`, three-segment `eyJ...` JWTs, AWS access key ids
@@ -165,7 +166,7 @@ checks refuse it by name, never rewriting it.
 | `xai-api-key` | `xai-` and at least 20 characters of `[A-Za-z0-9_]` |
 | `npm-token` | `npm_` and at least 20 characters of `[A-Za-z0-9]` |
 | `huggingface-token` | `hf_` and at least 20 characters of `[A-Za-z0-9]` |
-| `credential-suffix-assignment` | a name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a prefix: in upper case with any value, in lower or mixed case with a quoted value or a literal |
+| `credential-suffix-assignment` | a name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a prefix: in upper case with any value, in lower or mixed case with a quoted value or a word that does not read as code |
 
 **The token shapes** are case-sensitive. A floor of 20 characters is below
 the length of every real token of each kind (52 for Groq, 80 for xAI, 36
@@ -238,19 +239,42 @@ What its value must be depends on the name's case:
   (`client_secret=...&grant_type=...`), a query and Google's OAuth client
   JSON hold, but code as often (`def f(api_token: str)`,
   `api_token=api_token`): its value, on the same line, is a quoted one (a
-  string literal, a JSON or YAML string) or an unquoted literal, a run of 8
-  characters or more of a token's alphabet (`[A-Za-z0-9_.+/~-]`, `=`
-  padding at its end) that holds a digit and a letter and that a space, a
-  quote, `,`, `;`, `&`, `#`, a closing bracket or the end of the text ends.
-  An identifier, a dotted name, a type and a reference have no digit
-  (`client_secret=self.client_secret`, `api_token: str`,
-  `client_secret: ${CLIENT_SECRET}`), a call or a subscript goes on past
-  the run (`x_token = sha256(data)`, `os.environ["X"]`), and a value on the
-  next line is a statement, not the name's (`if api_token:`), so quoted code
-  stays publishable. The cost: an unquoted password of words alone
-  (`db_password=changeme`) and one with punctuation the alphabet lacks
-  (`db_password=Sup3r$ecret!`) are not recognised under a lower-case name,
-  as they are under an upper-case one.
+  string literal, a JSON or YAML string) or an unquoted word that does not
+  read as code. The word is of any characters, so letters alone
+  (`client_secret: changeme`), punctuation (`db_password=Sup3r$ecret!`, a
+  `#` or an `&` inside it) and a form body `urlencode` wrote
+  (`client_secret=a%2Fb%2Bc&grant_type=...`) are each taken whole. It ends
+  at a space, a quote, a backtick, a semicolon, the `&` that starts a form's
+  next field (`&name=`, as `urlencode` writes an `&` inside a value as
+  `%26`) and the end of the text; a run of `,`, `.`, `:` and closing
+  brackets right before one of those is the punctuation after the word
+  (`f(x_token=v),`, a sentence's full stop), and part of it anywhere else.
+  Until the second review of #285 the word had to be 8 characters of a
+  token's alphabet with a digit and a letter, so a word of letters, one with
+  `$` or `!`, and a `%` escape were kept whole, in every sink, and passed
+  every published-content and commit-message check.
+
+  A word that reads as code is no value, so the code an agent quotes stays
+  publishable. That is an identifier that names a credential itself, alone
+  or the last of a dotted name (`api_token=api_token`,
+  `client_secret=self.client_secret`, `api_token=accessToken`); a dotted name
+  with no digit (`api_token=args.tok`); a call, a subscript or a generic
+  (`x_token = sha256(data)`, `os.environ["X"]`, `Optional[str]`,
+  `Option<String>`); a type, a constant or a keyword a statement starts with
+  (`api_token: str`, `client_secret: SecretStr`, `page_token=None`,
+  `use_token: true`, `if not api_token: return`); a reference or a
+  placeholder (`$API_TOKEN`, `${X}`, `$(cat f)`, `%API_TOKEN%`, `%s`, a word
+  that opens a bracket: `{token}`, `{{ vault_secret }}`, `<value>`,
+  `[REDACTED]`); a number (`max_token: 4096`); and a word with no letter or
+  digit before it ends (`...`, `|`, the second character of `:=` and `==`).
+  A value on the next line is a statement, not the name's (`if api_token:`).
+  The costs, both deliberate: a literal of one of those shapes is not
+  recognised under a lower-case name (`db_password=password`,
+  `db_password: hello.world`, a PIN of digits alone), as it is under an
+  upper-case one; and a variable that names no credential is taken for a
+  literal, redacted in a log and refused in published text
+  (`client_secret=cs`, `{"client_secret": value}`), since it reads exactly
+  as a password of letters does.
 
 **A quoted value is replaced whole**, for this rule and `env-assignment`:
 it runs to the quote that closes it, its spaces, semicolons and the other
@@ -261,9 +285,36 @@ many backslashes; the same quote behind more is escaped inside the value
 (`"a\"b"` as a shell writes it, `\"a\\\"b\"` as JSON writes that), so
 the value is found whole as text and as JSON, JSON in JSON and three deep
 write it, and the escaped closing quote stays, so the JSON still decodes.
-A value whose closing quote is missing runs to the end of its line, or to
-the same quote behind fewer backslashes, which closes the string it stands
-in (`"X_TOKEN=\"cut"`), and no further.
+The opening quote doubled is one inside the value (`'it''s'`, as YAML and
+SQL escape a single quote and a shell joins two strings). A value runs
+across line breaks to its closing quote, as a shell string and a YAML flow
+scalar do (`DB_PASSWORD="first` on one line, `second"` on the next). The
+second review of #285 found both kept in the clear: the value stopped at the
+line break, or at the doubled quote, and what followed reached
+`stdout.log` and `stderr.log`.
+
+A value spans lines only while what it spans reads as one string: no blank
+line, no line that starts a code fence, no backtick, no unescaped quote of
+the other kind, and a closing quote that no letter, digit or `_` follows.
+A quote that opens no value would otherwise take the lines up to the next
+quote of its kind: the end of a string literal in code
+(`print('GH_TOKEN=' + read("f"))`), or a quote in a Markdown code span
+(`` `DEPLOY_SECRET="-----BEGIN ...` ``), in a log, a prompt or the read
+context the controller redacts for an agent. A value that does not span
+lines, or whose closing quote never comes (the end of the text, or the same
+quote behind fewer backslashes, which closes the string it stands in:
+`"X_TOKEN=\"cut"`), runs to its closing quote on its line, or to the end
+of its line or string, and no further, as before.
+
+**An unquoted value ends at a line break written out** (`\n`, `\r` and
+`\t`, as JSON writes them), for this rule, `env-assignment` and
+`oauth-assignment`, as it ends at one written as such; a value that starts
+with one is the next line's. It used to run on into the next line, and
+where that line was `NAME: value` in JSON text (an agent's result quoting a
+YAML file: `"A_TOKEN: x\nB_TOKEN: y"`), it took the name and left the value
+in the clear. The name now starts a token after the escape
+([above](#where-a-recognised-credential-starts-284)), and its value is
+replaced in turn.
 
 The rule runs last, after every other pattern, so a value one of them knows
 is reported by that pattern's class (`GEMINI_API_KEY=AIza...` stays
@@ -272,9 +323,13 @@ still `env-assignment`'s, and an OAuth name (`access_token`,
 `oauth_refresh_token`) an OAuth pattern's; what such a pattern left of a
 quoted value, after a space, is replaced here and reported as this class
 too. Not recognised: a suffix the rule does not take (`SSH_KEY`,
-`*_CREDENTIALS`), a camelCase name (`clientSecret`), and a bare generic
-name (`password=`), which stays `secret-assignment`'s, with its value of 12
-token characters.
+`*_CREDENTIALS`), a camelCase name (`clientSecret`), a bare generic name
+(`password=`), which stays `secret-assignment`'s, with its value of 12
+token characters, and, for this rule and `env-assignment` alike, the words
+after the first of an unquoted value that holds spaces: an unquoted value
+is one word, as a shell reads one, so a YAML plain scalar or an INI value of
+several words (`DB_PASSWORD: two words`) keeps all but its first. Quoted,
+such a value is taken whole.
 
 **As a mapping's key.** `redact_obj` redacts a mapping's key and its value
 apart, and neither `GEMINI_API_KEY` nor an opaque value is a credential on
@@ -291,9 +346,9 @@ left, and a bare generic key (`token`, `password`) is not recognised.
 
 `MAX_GROWTH_FACTOR` is unchanged. The shortest recognised name is now a
 one-letter prefix and a suffix: `A_TOKEN=x`, 9 to 22 characters (2.44),
-below the URL shape's 2.86; a lower-case one needs a quoted value
-(`a_token="x"`, 11 to 24) or a literal of 8 characters, which shrinks, and
-a quoted value taken whole is still at least one character. Every token
+below the URL shape's 2.86, and `a_token=x` in lower case as well; a quoted
+value taken whole, across lines and doubled quotes too, is still at least
+one character (`a_token="x"`, 11 to 24). Every token
 shape is longer than the marker and only shrinks, a private-key block (43
 characters or more) included, and what a block holds between its BEGIN and
 END lines, like a quoted value, can take a marker only whole. A mapping's
@@ -301,13 +356,19 @@ value under a credential key grows from one character to the marker's 14,
 but its key comes with it, the shortest (`access`) six characters, so an
 entry grows 7 to 20 at worst; no parser-bounded field (a finding, a
 resolution) has such a key, so the per-string bounds that depend on the
-factor hold. Every pattern stays linear: a token shape scans one run of its
-alphabet, the name rule one identifier and its value (a quoted value once
-to its close or its line's end, a literal's run holds no `:` or `=`, so no
-other candidate's separator), and a private-key candidate scans to the next
-run of five dashes, where the next candidate starts, at most three times
-(its key-material lookahead steps over a run shorter than 16 whole, line
-breaks included). `tests/test_redaction.py` pins
+factor hold.
+
+Every pattern stays linear. A token shape scans one run of its alphabet,
+and the name rule one identifier and its value. A quoted value is read once
+to its close, and once more to its line's end when it spans lines and never
+closes; a later candidate's quote closes it, unless more backslashes escape
+that quote, which no more than eight candidates in a row can do. A
+lower-case name's unquoted word is read once: one that holds the next
+candidate's name is taken whole and not read again, and the code rule reads
+no further than the first word of a value it refuses. A private-key
+candidate scans to the next run of five dashes, where the next candidate
+starts, at most three times (its key-material lookahead steps over a run
+shorter than 16 whole, line breaks included). `tests/test_redaction.py` pins
 each shape, its near-misses, the order, the growth units and the linear
 bounds, and `test_result_parser.py`, `test_runlog.py`, `test_engine.py` and
 `test_cli.py` each class in every check and sink.

@@ -86,6 +86,7 @@ from tests.conftest import (
     SHAPES_285,
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
+    WHOLE_VALUES_285,
     block,
     comment_url,
 )
@@ -2581,6 +2582,12 @@ def test_a_285_shape_is_refused_by_every_published_content_check(cls, text, body
         "`self.client_secret = client_secret` and `api_token=api_token` pass it on.",
         "`x_token = sha256(data)`, then `client_secret: ${CLIENT_SECRET}` in YAML.",
         "`if not api_token:` raises `ConfigError2` on the next line.",
+        # Round 2: a lower-case name's unquoted word is any word that does not
+        # read as code, so the code shapes stay publishable.
+        "`f(api_token=accessToken)` passes `client_secret: SecretStr` on.",
+        "`if not api_token: return None`, then `api_token := os.Getenv(name)`.",
+        "Template `db_password: {{ vault_db_password }}`, or `client_secret: <value>`.",
+        "`max_token: 4096` and `use_token: true` are settings, `api_token=None` a default.",
         # A BEGIN line and a placeholder on the lines after it.
         f"Paste it as\n\n```\n{PEM_BEGIN}\n<your key>\n...\n{PEM_END}\n```",
     ],
@@ -2594,6 +2601,10 @@ def test_a_285_shape_is_refused_by_every_published_content_check(cls, text, body
         "lower-case-code",
         "lower-case-calls",
         "lower-case-condition",
+        "lower-case-variables-and-types",
+        "lower-case-statements",
+        "lower-case-placeholders",
+        "lower-case-settings",
         "pem-placeholder",
     ],
 )
@@ -2614,8 +2625,18 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
         ("credential-suffix-assignment", "client_secret=FAKE0opaque0value", "FAKE0opaque0value"),
         ("credential-suffix-assignment", 'db_password = "FAKE spaced; value"', "spaced"),
         ("credential-suffix-assignment", "my_GITHUB_TOKEN: abc123XYZ", "abc123XYZ"),
+        # Round 2: a lower-case name's unquoted word of letters alone, of
+        # punctuation or form-encoded, and a quoted value that spans lines
+        # or holds a doubled quote.
+        *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285),
     ],
-    ids=["short-wrapped-key", "lower-case-literal", "lower-case-quoted", "mixed-case"],
+    ids=[
+        "short-wrapped-key",
+        "lower-case-literal",
+        "lower-case-quoted",
+        "mixed-case",
+        *(f"round-2-{name}" for name, _, _ in WHOLE_VALUES_285),
+    ],
 )
 def test_a_shape_the_285_review_found_is_refused_by_every_published_content_check(cls, text, body):
     """#285 review: a private key wrapped at fewer than 16 characters a line

@@ -2,9 +2,9 @@
 
 Baseline protection only — no detector claims to catch every secret shape.
 Covers common env-var assignments and a name ending in a credential suffix
-(``GEMINI_API_KEY=``, ``DB_PASSWORD:``, ``client_secret=`` with a literal
-value), ``Authorization`` headers, private-key blocks (also wrapped in short
-lines), well-known token shapes (GitHub PATs, OpenAI /
+(``GEMINI_API_KEY=``, ``DB_PASSWORD:``, ``client_secret=`` with a value
+that does not read as code), ``Authorization`` headers, private-key blocks
+(also wrapped in short lines), well-known token shapes (GitHub PATs, OpenAI /
 Anthropic keys, Google API keys, JWTs, AWS access key ids, GitLab, Groq,
 xAI, npm and Hugging Face tokens), OAuth credential fields (``refresh`` /
 ``access`` / ``id_token`` / ``chatgpt-account-id``) and credentials embedded
@@ -14,8 +14,8 @@ after a character that cannot be part of it, or directly after an escape
 sequence (``ESC[0m``, ``\\n``, ``\\u00e9``; see ``_ESCAPE``). An assignment's
 quoted value is recognised behind an escaped quote too
 (``GH_TOKEN=\\"...\\"``, as JSON writes it; see ``_QUOTE``) and replaced
-whole, to its closing quote (``_QUOTED_VALUE``), and a named assignment or
-header under a quoted key (``"GITHUB_TOKEN": "..."``,
+whole, to its closing quote, a later line's too (``_QUOTED_VALUE``), and a
+named assignment or header under a quoted key (``"GITHUB_TOKEN": "..."``,
 ``"Authorization": "Bearer ..."``). :func:`redact_obj` knows a credential's
 name as a mapping's key too (``{"GEMINI_API_KEY": "..."}``).
 A line that starts a code fence is never a value (``_SPACE_TO_VALUE``).
@@ -103,6 +103,16 @@ _QUOTE = r"(?:\\{0,7}[\"'])?"
 # it: the replacement leaves ``\"`` whole and the JSON around it intact. The
 # lookahead is bounded like ``_QUOTE``.
 _VALUE_BACKSLASH = r"\\(?!\\{0,6}[\"'])"
+# The same after a named or OAuth assignment's first character, unless it
+# starts a line break or a tab written out (``\n``, ``\r``, ``\t``, as JSON
+# writes one): an unquoted value ends there, as it ends at one written as
+# such (#285 review, round 2). It used to take the next line's start with
+# it, and where that line was ``NAME: value`` in JSON text
+# (``"A_TOKEN: x\nB_TOKEN: y"``), its name went and its value stayed in the
+# clear; the name now starts a token after the escape (#284), and its value
+# is replaced in turn. A value that starts with one is the next line's, as
+# ``_SPACE_TO_VALUE`` takes it from the next line written as such.
+_WORD_BACKSLASH = r"\\(?!\\{0,6}[\"'nrt])"
 # The space between an assignment's separator and its value (#393): a run on
 # the same line, or one across a line break, but never onto a line that
 # starts a code fence (three backticks or tildes, indented or not). A prompt
@@ -116,29 +126,52 @@ _SPACE_TO_VALUE = r"(?:[^\S\r\n]*|\s*[\r\n][^\S\r\n]*(?!`{3}|~{3}))"
 # A named assignment's value, its opening quote (``vbs``, the backslashes
 # before it, up to seven as ``_QUOTE`` takes, and ``vq``, the quote) optional.
 _VALUE_OPEN = r"((?P<vbs>\\{0,7})(?P<vq>[\"']))?"
-# A value no quote opens ends at a space, a quote, a semicolon or a backslash
-# that starts an escaped closing quote.
-_UNQUOTED_VALUE = rf"(?:[^\s\"';\\]|{_VALUE_BACKSLASH})+"
+# A value no quote opens ends at a space, a quote, a semicolon, a backslash
+# that starts an escaped closing quote and, after its first character, a line
+# break or a tab written out.
+_UNQUOTED_VALUE = rf"(?:[^\s\"';\\]|{_VALUE_BACKSLASH})(?:[^\s\"';\\]|{_WORD_BACKSLASH})*"
 # A value a quote opens is taken whole (#285): it runs to the quote that
 # closes it, spaces, semicolons and the other quote character included, so
 # ``DB_PASSWORD="correct horse; battery"`` is replaced entire where the value
 # used to stop at the first space and leave the rest in the clear. The
 # closing quote is the opening one behind exactly as many backslashes; the
 # same quote behind more is escaped inside the value (``"a\"b"`` as a shell
-# writes it, ``\"a\\\"b\"`` as JSON writes that in a string). The value also
-# ends at a line break, at the end of the text, and at the same quote behind
-# fewer backslashes, which closes the string an escaped value stands in
-# (``"GH_TOKEN=\"abc"``): an unterminated value goes as far as its line or
-# its string and no further. A run of backslashes is taken whole and every
-# alternative is possessive, so each character is read once and a candidate
-# that fails does so at its first character.
-_QUOTED_VALUE = (
-    r"(?:[^\\\"'\r\n]"
-    r"|\\++(?![\"'])"
+# writes it, ``\"a\\\"b\"`` as JSON writes that in a string), and so is the
+# opening quote doubled (``'it''s'``, as YAML and SQL escape a single quote
+# and a shell joins two strings; #285 review).
+#
+# A value runs across line breaks to its closing quote (``_QUOTED_SPAN``,
+# #285 review), as a shell string and a YAML flow scalar do, as long as what
+# it spans reads as one string: no blank line, no line that starts a code
+# fence (which ``_SPACE_TO_VALUE`` never takes either), no backtick, no
+# unescaped quote of the other kind, and a closing quote that no letter,
+# digit or ``_`` follows. A quote that opens no value does not take the lines
+# after it: the end of a string literal in code
+# (``print('GH_TOKEN=' + read("f"))``), one in a Markdown code span
+# (``DEPLOY_SECRET="-----BEGIN ...``), each meets one of those before a quote
+# of its kind closes it, and so does the code a prompt, a log or an agent's
+# read context quotes. A value that does not span lines, or whose closing
+# quote never comes (the end of the text, or the same quote behind fewer
+# backslashes, which closes the string an escaped value stands in:
+# ``"GH_TOKEN=\"abc"``), is the rest of its line up to that quote
+# (``_QUOTED_LINE``), the other quote and a backtick included, as before: an
+# unterminated value goes as far as its line or its string and no further.
+# A run of backslashes is taken whole and every alternative is possessive,
+# so each of the two reads a character once, and a candidate that fails does
+# so at its first character.
+_QUOTED_ESCAPE = (
+    r"\\++(?![\"'])"
     r"|(?P=vbs)\\+[\"']"
-    r"|\\*+(?!(?P=vq))[\"']"
-    r")++"
+    r"|(?P=vbs)(?P=vq)(?P=vbs)(?P=vq)"
 )
+_QUOTED_SPAN = (
+    r"(?:[^\\\"'`\r\n]"
+    r"|(?:\r\n?|\n)(?![^\S\r\n]*+(?:[\r\n]|`{3}|~{3}))"
+    rf"|{_QUOTED_ESCAPE}"
+    r")++(?=(?P=vbs)(?P=vq)(?!\w))"
+)
+_QUOTED_LINE = rf"(?:[^\\\"'\r\n]|{_QUOTED_ESCAPE}|\\*+(?!(?P=vq))[\"'])++"
+_QUOTED_VALUE = rf"(?:{_QUOTED_SPAN}|{_QUOTED_LINE})"
 # The closing quote of a value a quote opened, absent when the value was cut
 # short; ``_QUOTE``, as before, after one no quote opened.
 _VALUE_CLOSE = rf"((?(vq)(?:(?P=vbs)(?P=vq))?|{_QUOTE}))"
@@ -162,28 +195,87 @@ _ENV_NAMES = (
 # ``upper``) is an environment variable's, whose value is anything, as a
 # well-known name's is. Lower or mixed case (``client_secret``,
 # ``my_GITHUB_TOKEN``, ``Db_Password``) is a code identifier's as often as a
-# configuration key's, so its value must read as a literal
+# configuration key's, so its value must not read as code
 # (``_LITERAL_VALUE``). Both stop where the identifier does, so a candidate
 # reads one identifier.
 _SUFFIX_NAME = (
     r"((?P<upper>[A-Z][A-Z0-9_]*_(?:API_KEY|TOKEN|SECRET|PASSWORD))"
     r"|[A-Za-z][A-Za-z0-9_]*_(?i:api_key|token|secret|password))"
 )
-# The unquoted value a lower- or mixed-case prefixed name needs: a run of 8
-# characters or more of a token's alphabet (base64, base64url, hex and the
-# ``.`` and ``~`` of a client secret, ``=`` padding at its end), holding a
-# digit and a letter, that the end of the text, a space, a quote, a comma, a
-# semicolon, an ``&``, a ``#``, a closing bracket or a backslash ends. A code
-# expression is none: an identifier or a dotted name has no digit
-# (``api_token=api_token``, ``client_secret=self.client_secret``), a type no
-# digit either (``api_token: str``), and a call or a subscript goes on past
-# the run (``x_token=sha256(data)``, ``os.environ["X"]``). Neither ``:`` nor
-# ``=`` is in the run, so a run never holds the next candidate's separator
-# and is read by one candidate only; the lookaheads read it once more each.
-_LITERAL_CHAR = r"[A-Za-z0-9_\-.+/~]"
+# Where a lower- or mixed-case name's unquoted value ends (#285 review): at a
+# space, a quote, a backtick, a semicolon, the ``&`` that starts a form
+# body's next field (``_FIELD_NAME``) and the end of the text. A run of
+# commas, full stops, colons and closing brackets right before one of those
+# is the punctuation after a word, not part of it (``f(x_token=v),``,
+# ``api_token: str):``, a sentence's full stop); anywhere else it is the
+# value's (``p,ss)w.rd``). ``_WORD_END`` is that end, read after a word.
+_TRAIL = r"[,.:)\]}]"
+_WORD_END = rf"{_TRAIL}*+(?![^\s\"'`;&])"
+# An identifier, and the identifiers joined by ``.`` or ``::`` before the
+# last one of a dotted name.
+_IDENT = r"[A-Za-z_][A-Za-z0-9_]*+"
+_PATH = rf"(?:{_IDENT}(?:\.|::))*+"
+# An unquoted value that reads as code, not as a literal (#285 review), so
+# that the code an agent quotes stays publishable. Each alternative reads no
+# further than the value's first word:
+#
+# - an identifier that names a credential itself, alone or the last of a
+#   dotted name: the variable or attribute that holds it
+#   (``api_token=api_token``, ``client_secret=self.client_secret``,
+#   ``api_token=accessToken``, ``client_secret: CLIENT_SECRET``);
+# - a dotted name with no digit (``api_token=args.tok``);
+# - a call, a subscript or a generic type (``x_token=sha256(data)``,
+#   ``os.environ["X"]``, ``Optional[str]``, ``Option<String>``);
+# - a type, a constant, or a keyword a statement starts with (``api_token:
+#   str``, ``page_token=None``, ``use_token: true``, ``if not api_token:
+#   return``);
+# - a reference or a placeholder: a shell, batch or ``%`` format variable
+#   (``$API_TOKEN``, ``${X}``, ``$(cat f)``, ``%API_TOKEN%``, ``%s``), or a
+#   word that opens a bracket (``{token}``, ``{{ vault_secret }}``,
+#   ``<value>``, ``[REDACTED]``);
+# - a number (``max_token=4096``), and a word with no letter or digit before
+#   it ends (``...``, ``|``, ``~``, the second character of ``:=`` and
+#   ``==``).
+#
+# What this costs: a literal of one of these shapes is not recognised
+# (``db_password=password``, ``db_password: hello.world``, a numeric PIN),
+# and a variable that names no credential is taken for a literal
+# (``api_token=tok``).
+_CODE_VALUE = (
+    rf"{_PATH}[A-Za-z0-9_]*?(?i:token|secret|password|passwd|api_?key){_WORD_END}"
+    rf"|[A-Za-z_]++(?:(?:\.|::)[A-Za-z_]++)++{_WORD_END}"
+    rf"|{_PATH}{_IDENT}[(\[<]"
+    r"|(?i:str|string|bytes|int|float|bool|boolean|number|dict|list|tuple|object|any"
+    r"|unknown|char|text|secretstr|secretbytes|none|null|nil|true|false|undefined"
+    rf"|yes|no|on|off|return|raise|pass|continue|break|await|yield|lambda|not|new){_WORD_END}"
+    rf"|\$[({{]|\$[A-Za-z0-9_]++{_WORD_END}|%{_IDENT}%{_WORD_END}"
+    rf"|%(?:\([A-Za-z0-9_]*+\))?[-#0+.0-9]*+[A-Za-z]{_WORD_END}"
+    r"|[(\[{<]"
+    rf"|[-+]?[0-9]++(?:\.[0-9]++)?{_WORD_END}"
+    r"|[^\s\w\"'`;&\\]*+(?!\w)"
+)
+# What follows the ``&`` that starts a form body's next field: its name and
+# ``=`` (``&grant_type=``), as ``urlencode`` writes one; ``urlencode`` writes
+# an ``&`` inside a value as ``%26``. Any other ``&`` is the value's.
+_FIELD_NAME = r"[A-Za-z0-9_.~%+\[\]-]*+="
+# The unquoted value a lower- or mixed-case prefixed name takes (#285
+# review): one word on the name's line, of any character but what ends it,
+# so that a word of letters alone (``client_secret: changeme``), one with
+# punctuation (``db_password=Sup3r$ecret!``) and a form-encoded one
+# (``client_secret=a%2Fb%2Bc&grant_type=...``) are each taken whole, unless
+# it reads as code (``_CODE_VALUE``). A backslash is the word's unless it
+# starts an escaped quote or a line break written out (``_WORD_BACKSLASH``),
+# as for an upper-case name. The word can hold the next candidate's name and
+# separator, when no space parts them, and is then taken whole and never read
+# again; only a candidate the code rule refuses fails, at the first word of
+# its value, so the pass stays linear.
 _LITERAL_VALUE = (
-    rf"(?={_LITERAL_CHAR}*?[0-9])(?={_LITERAL_CHAR}*?[A-Za-z]){_LITERAL_CHAR}{{8,}}+=*+"
-    r"(?![^\s\"'`,;&#)\]}>|\\])"
+    rf"(?!{_CODE_VALUE})"
+    r"(?:[^\s\"'`;&\\,.:)\]}]"
+    rf"|&(?!{_FIELD_NAME})"
+    rf"|{_TRAIL}++(?=[^\s\"'`;&])"
+    rf"|{_WORD_BACKSLASH}"
+    r")++"
 )
 
 # A private-key block (#285), as PEM (RFC 7468) writes one and OpenSSH and
@@ -440,7 +532,8 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token(
         "oauth-assignment",
         r"((?:refresh|access|id)_token|chatgpt[-_]account[-_]id)"
-        rf"(\s*[:=]{_SPACE_TO_VALUE})({_QUOTE})(?:[^\s\"';,&\\]|{_VALUE_BACKSLASH})+",
+        rf"(\s*[:=]{_SPACE_TO_VALUE})({_QUOTE})(?:[^\s\"';,&\\]|{_VALUE_BACKSLASH})"
+        rf"(?:[^\s\"';,&\\]|{_WORD_BACKSLASH})*",
         r"\1\2\3***REDACTED***",
         flags="(?i)",
         token_chars="A-Za-z0-9",
@@ -467,7 +560,8 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # - A lower- or mixed-case name is a code identifier's as often
     #   (``def f(api_token: str)``, ``api_token=api_token``), so its value,
     #   on the same line, is a quoted one (a string literal, a JSON or YAML
-    #   string) or an unquoted literal (``_LITERAL_VALUE``).
+    #   string) or an unquoted word that does not read as code
+    #   (``_LITERAL_VALUE``), whatever its characters.
     #
     # A quoted value is replaced whole (``_QUOTED_VALUE``) either way. Last,
     # so a value of a known shape is reported by its own class, a well-known
@@ -479,7 +573,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token(
         "credential-suffix-assignment",
         rf"{_SUFFIX_NAME}"
-        rf"({_QUOTE}(?(upper)\s*[:=]{_SPACE_TO_VALUE}|[^\S\r\n]*[:=][^\S\r\n]*))"
+        rf"({_QUOTE}(?(upper)\s*[:=]{_SPACE_TO_VALUE}|[^\S\r\n]*+[:=][^\S\r\n]*+))"
         rf"{_VALUE_OPEN}"
         rf"((?(vq){_QUOTED_VALUE}|(?(upper){_UNQUOTED_VALUE}|{_LITERAL_VALUE})))"
         rf"{_VALUE_CLOSE}",
@@ -512,22 +606,26 @@ _CREDENTIAL_KEY = re.compile(
 # the ratio and no text exceeds it. The next worst is a one character secret
 # behind the shortest recognised name, a one-letter prefix and a credential
 # suffix (#285): ``A_TOKEN=x``, 9 to 22, a factor of 2.44 (``HF_TOKEN=x`` and
-# ``id_token=x``, 10 to 23, follow); a lower-case one needs a quoted value
-# (``a_token="x"``, 11 to 24) or a literal of 8 characters, which shrinks.
-# Every token shape #285 adds is longer than the marker and only shrinks, a
-# private-key block (43 characters or more) included. A quoted value is taken
-# whole (#285), so a quoted value of one character is still the worst it does.
+# ``id_token=x``, 10 to 23, follow), and ``a_token=x`` in lower case as well
+# (#285 review: a lower-case name's unquoted value is any word that does not
+# read as code). Every token shape #285 adds is longer than the marker and
+# only shrinks, a private-key block (43 characters or more) included. A
+# quoted value is taken whole (#285), across line breaks and doubled quotes
+# too, so a quoted value of one character (``A_TOKEN="x"``, 11 to 24) is
+# still the worst it does.
 # Growth does not compound across patterns: a later pattern can only lengthen
 # the text by matching a run *shorter* than the marker, and a marker is never
 # part of such a run. The value classes that admit ``*`` (the named-assignment
-# values, quoted or not, the header, URL-userinfo and OAuth-field values, and
-# what a private-key block holds between its BEGIN and END lines) can only take
-# a marker in whole, since none of the characters that end such a run (a
-# quote, a line break, a space) occurs in the marker, so a match containing
-# one is already at least as long as its replacement and shrinks or keeps the
-# length; every other value class excludes ``*``, so a marker is never part of
-# those matches at all. The characters
-# around a replaced run are untouched, so no new short match appears beside it.
+# values, quoted or not, a lower-case name's unquoted word among them, the
+# header, URL-userinfo and OAuth-field values, and what a private-key block
+# holds between its BEGIN and END lines) can only take a marker in whole,
+# since none of the characters that end such a run (a quote, a line break, a
+# space) occurs in the marker, nor does the separator such a run starts
+# after, so a match containing one is already at least as long as its
+# replacement and shrinks or keeps the length; every other value class
+# excludes ``*``, so a marker is never part of those matches at all. The
+# characters around a replaced run are untouched, so no new short match
+# appears beside it.
 # An ``after_escape`` pass is one more pattern in that order, and the escape
 # sequence it starts at (#284) is put back unchanged, no part of the replaced
 # run; at two characters or more it separates repeated matches no tighter

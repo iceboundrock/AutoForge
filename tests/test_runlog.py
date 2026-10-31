@@ -14,7 +14,13 @@ from autoforge.errors import StateError
 from autoforge.providers import _OPENCODE_ERROR_LINE_RE, _OPENCODE_TOOL_FAILED_LINE_RE
 from autoforge.runlog import ExecutionRecord, RunLogger, validate_run_id
 from autoforge.sandbox import SandboxFacts
-from tests.conftest import GOOGLE_API_KEY, GOOGLE_KEY_BODY, PRIVATE_KEY, SHAPES_285
+from tests.conftest import (
+    GOOGLE_API_KEY,
+    GOOGLE_KEY_BODY,
+    PRIVATE_KEY,
+    SHAPES_285,
+    WHOLE_VALUES_285,
+)
 
 
 def test_runlog_layout_and_redaction(tmp_path):
@@ -1284,6 +1290,58 @@ def test_a_285_credential_an_agent_prints_never_reaches_the_logs(tmp_path):
     assert (step / "stderr.log").read_text(encoding="utf-8") == "".join(
         f"\x1b[91m\x1b[1mError: \x1b[0m{text}\n"
         for text in ["***REDACTED***"] * 7 + ["DEEPSEEK_API_KEY=***REDACTED***"]
+    )
+
+
+def test_a_whole_value_the_second_285_review_found_never_reaches_the_logs(tmp_path):
+    """#285 review, round 2: a value under a lower-case credential name of
+    letters alone (``client_secret: ...``), of punctuation, or form-encoded
+    (``urlencode``'s), was written to ``stdout.log`` and ``stderr.log`` whole,
+    and a quoted value that spans lines or holds a doubled quote kept what
+    followed its line break or that quote. Each value goes whole from every
+    file, after OpenCode's ANSI escapes too, and the line after it stays."""
+    texts = [text for _, text, _ in WHOLE_VALUES_285]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", *texts],
+            error="agent exited 1: " + " ".join(texts),
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": "\n".join(texts),
+                "tests": texts,
+            },
+        ),
+        prompt="p",
+        stdout="".join(f"{text}\nnext line\n" for text in texts),
+        stderr="".join(f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in texts),
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"stdout.log", "stderr.log", "control-result.json"}
+    for path in [*files, log.events_path]:
+        content = path.read_text(encoding="utf-8")
+        assert "FAKE" not in content, path
+        for _, _, body in WHOLE_VALUES_285:
+            assert body not in content, (path, body)
+    redacted = [
+        "client_secret: ***REDACTED***",
+        "db_password: ***REDACTED***",
+        "grant_type=client_credentials&client_secret=***REDACTED***",
+        'export DB_PASSWORD="***REDACTED***"',
+        'client_secret: "***REDACTED***"',
+        "db_password: '***REDACTED***'",
+    ]
+    assert (step / "stdout.log").read_text(encoding="utf-8") == "".join(
+        f"{text}\nnext line\n" for text in redacted
+    )
+    assert (step / "stderr.log").read_text(encoding="utf-8") == "".join(
+        f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in redacted
     )
 
 

@@ -3,6 +3,7 @@
 import ast
 import json
 import time
+from urllib.parse import urlencode
 
 import pytest
 
@@ -16,6 +17,7 @@ from autoforge.redaction import (
 from tests.conftest import (
     AWS_ACCESS_KEY_ID,
     AWS_KEY_BODY,
+    FORM_SECRET,
     GITLAB_PAT,
     GITLAB_PAT_BODY,
     GOOGLE_API_KEY,
@@ -30,12 +32,14 @@ from tests.conftest import (
     PEM_END,
     PRIVATE_KEY,
     PRIVATE_KEY_BODY,
+    PUNCTUATION_SECRET,
     SHAPES_285,
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
     SHORT_WRAPPED_KEY_LINES,
     SUFFIX_ASSIGNMENT,
     SUFFIX_SECRET,
+    WHOLE_VALUES_285,
     XAI_API_KEY,
     XAI_KEY_BODY,
 )
@@ -866,8 +870,8 @@ _SUFFIX_TEXT_IDS = [
     "after-written-out-newline",
 ]
 # A lower- or mixed-case name (#285 review): a quoted value, or an unquoted
-# literal of 8 characters or more holding a digit and a letter, as a
-# configuration file, a form body, a query or a log line holds one.
+# word that does not read as code, as a configuration file, a form body, a
+# query or a log line holds one.
 _LOWER_SUFFIX_TEXTS = [
     (f"client_secret={SUFFIX_SECRET}", "client_secret=***REDACTED***"),
     (f"client_secret: {SUFFIX_SECRET}", "client_secret: ***REDACTED***"),
@@ -878,8 +882,8 @@ _LOWER_SUFFIX_TEXTS = [
         "grant_type=client_credentials&client_secret=***REDACTED***&scope=read",
     ),
     (
-        f"https://h.example/cb?api_token={SUFFIX_SECRET}#x",
-        "https://h.example/cb?api_token=***REDACTED***#x",
+        f"https://h.example/cb?api_token={SUFFIX_SECRET}&next=1",
+        "https://h.example/cb?api_token=***REDACTED***&next=1",
     ),
     (f"db_password = '{SUFFIX_SECRET}'", "db_password = '***REDACTED***'"),
     ('client_secret = "correct horse; battery"', 'client_secret = "***REDACTED***"'),
@@ -895,6 +899,31 @@ _LOWER_SUFFIX_TEXTS = [
     ),
     (f"\x1b[0mclient_secret={SUFFIX_SECRET}", "\x1b[0mclient_secret=***REDACTED***"),
     (f"line\\nclient_secret={SUFFIX_SECRET}", "line\\nclient_secret=***REDACTED***"),
+    # Any word that does not read as code (#285 review, round 2): letters
+    # alone, at any length, punctuation of every kind, a ``#`` and an ``&``
+    # among it, and a form body ``urlencode`` wrote, its ``%`` escapes and
+    # ``+`` spaces in the value. What ends the word stays: a space and what
+    # follows it, the form's next field, the punctuation after a word.
+    ("client_secret: FAKEalphaword", "client_secret: ***REDACTED***"),
+    ("db_password: FAKEwords  # rotated", "db_password: ***REDACTED***  # rotated"),
+    ("Gemini_API_KEY=abc", "Gemini_API_KEY=***REDACTED***"),
+    ("x_token = v2_1", "x_token = ***REDACTED***"),
+    ("x_token=abcdefgh", "x_token=***REDACTED***"),
+    (f"db_password: {PUNCTUATION_SECRET}", "db_password: ***REDACTED***"),
+    (f"db_password={PUNCTUATION_SECRET}\nnext=1", "db_password=***REDACTED***\nnext=1"),
+    ("db_password=Sup3r$ecret!", "db_password=***REDACTED***"),
+    ("db_password: p,ss)w.rd:x", "db_password: ***REDACTED***"),
+    ("db_password: FAKE&words", "db_password: ***REDACTED***"),
+    (
+        urlencode({"grant_type": "client_credentials", "client_secret": FORM_SECRET, "x": "1"}),
+        "grant_type=client_credentials&client_secret=***REDACTED***&x=1",
+    ),
+    ("client_secret=%2FFAKE%3D%3D&scope=read", "client_secret=***REDACTED***&scope=read"),
+    ("Then db_password: FAKEword.", "Then db_password: ***REDACTED***."),
+    ("connect(db_password=pw), retry", "connect(db_password=***REDACTED***), retry"),
+    ("`db_password=FAKEword` in .env", "`db_password=***REDACTED***` in .env"),
+    ("x_token=x", "x_token=***REDACTED***"),
+    ("\x1b[0mdb_password=FAKEword", "\x1b[0mdb_password=***REDACTED***"),
 ]
 _LOWER_SUFFIX_TEXT_IDS = [
     "ini",
@@ -911,6 +940,23 @@ _LOWER_SUFFIX_TEXT_IDS = [
     "comment-after",
     "after-ansi",
     "after-written-out-newline",
+    "yaml-letters",
+    "yaml-comment-after",
+    "short-letters",
+    "identifier",
+    "letters",
+    "yaml-punctuation",
+    "env-file-punctuation",
+    "dollar-and-bang",
+    "trailing-punctuation-inside",
+    "ampersand-inside",
+    "urlencode",
+    "percent-escapes",
+    "full-stop-after",
+    "argument",
+    "code-span",
+    "one-character",
+    "punctuation-after-ansi",
 ]
 
 
@@ -927,10 +973,33 @@ def test_a_value_under_a_prefixed_credential_name_is_redacted(text, expected):
     A name ending in ``_API_KEY``, ``_TOKEN``, ``_SECRET`` or ``_PASSWORD``
     is recognised: in upper case as a well-known one is, any value, in any
     quoting the named patterns take; in lower or mixed case (#285 review,
-    ``client_secret``) with a quoted value or an unquoted literal."""
+    ``client_secret``) with a quoted value or an unquoted word that does not
+    read as code."""
     assert redact(text) == expected
     assert credential_classes(text) == ("credential-suffix-assignment",)
     assert redact(expected) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "body"), [c[1:] for c in WHOLE_VALUES_285], ids=[c[0] for c in WHOLE_VALUES_285]
+)
+def test_a_value_the_second_285_review_found_is_redacted_whole_as_text_and_as_json(text, body):
+    """#285 review, round 2: a lower-case name's unquoted word of letters
+    alone, of punctuation or form-encoded was kept whole, and a quoted value
+    that spans lines or holds a doubled quote kept what followed the line
+    break or the quote. Each value goes whole, as text and as JSON writes it
+    (an agent's result on stdout, a record), and the JSON still decodes."""
+    for depth in (0, 1, 2):
+        escaped = _json_string(text, depth)
+        out = redact(escaped)
+        assert body not in out and "FAKE" not in out, out
+        assert credential_classes(escaped) == ("credential-suffix-assignment",)
+        assert redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert "***REDACTED***" in decoded and "FAKE" not in decoded
+    assert redact_obj({"env": {"text": text}}) == {"env": {"text": redact(text)}}
 
 
 @pytest.mark.parametrize(
@@ -976,14 +1045,12 @@ _SUFFIX_NEAR_MISSES = [
     "_TOKEN=x",
 ]
 # A lower- or mixed-case name in code (#285 review): its unquoted value is
-# an expression, not a literal. An identifier, a dotted name, a type, a
-# constant and a reference have no digit; a call or a subscript goes on past
-# its run; a literal of fewer than 8 characters, or of no letter, is none
-# either; and a value on the next line is a statement, not the name's.
+# an expression, not a literal: the same name, a dotted name, a type, a
+# constant, a reference, a call, a subscript, a number; and a value on the
+# next line is a statement, not the name's.
 _LOWER_SUFFIX_NEAR_MISSES = [
     "max_token=5",
     "def fetch(api_token: str, page_token=None):",
-    "Gemini_API_KEY=abc",
     "api_token=api_token",
     "self.api_token = api_token",
     "client_secret=self.client_secret,",
@@ -997,11 +1064,37 @@ _LOWER_SUFFIX_NEAR_MISSES = [
     "if api_token:\n    headers2 = build(1)",
     "if not client_secret:\n    raise ConfigError2",
     "num_token = 12345678",
-    "x_token = v2_1",
-    "x_token=abcdefgh",
     '{"page_token": null, "client_secret": ""}',
     "api_token=<value>",
     "client_secret = '' if x else None",
+    # A word that reads as code (#285 review, round 2), now that a word of
+    # any characters is a literal: a name that names a credential, alone,
+    # dotted or in another case, a dotted name, a call, a subscript, a
+    # generic, a type, a constant, a keyword, a reference, a placeholder, a
+    # number and a word of no letter or digit; and the marker itself.
+    "f(api_token=api_token), g(client_secret=CLIENT_SECRET)",
+    "api_token=accessToken",
+    "api_token = self.v2_token",
+    "x_token=args.tok",
+    "x_token: config.auth.tok,",
+    "api_token = await fetch_token()",
+    "api_token: Option<String>,",
+    "api_token = Token::new(x)",
+    "api_token: str | None = None",
+    "client_secret: SecretStr",
+    "use_token: true",
+    "if not api_token: return None",
+    "api_token := os.Getenv(name)",
+    "if api_token == expected:",
+    "url = f'https://h.example/?api_token={api_token}'",
+    'body = "api_token=%s" % tok',
+    "db_password: {{ vault_db_password }}",
+    "client_secret: [REDACTED]",
+    "set db_password=%DB_PASSWORD%",
+    "client_secret: |",
+    "x_token = -1.5",
+    "api_token: ...",
+    "client_secret=***REDACTED***",
 ]
 
 
@@ -1034,13 +1127,78 @@ _WHOLE_QUOTED_VALUES = [
     # it stands in, and no further.
     ('X_TOKEN="cut short here\nnext line', 'X_TOKEN="***REDACTED***\nnext line'),
     ('{"cmd": "X_TOKEN=\\"cut short"}', '{"cmd": "X_TOKEN=\\"***REDACTED***"}'),
+    # Across line breaks to the closing quote (#285 review, round 2), as a
+    # shell string and a YAML flow scalar span lines, a CRLF one too, and
+    # the line after it stays.
+    ('export DB_PASSWORD="FAKEfirst\nFAKEsecond"\nrun', 'export DB_PASSWORD="***REDACTED***"\nrun'),
+    (
+        'client_secret: "FAKEfirst\n  FAKEsecond\n  FAKEthird"\nnext: 1',
+        'client_secret: "***REDACTED***"\nnext: 1',
+    ),
+    ("db_password: 'FAKEfirst\n  FAKEsecond'\n", "db_password: '***REDACTED***'\n"),
+    ('X_TOKEN="FAKEfirst\r\nFAKEsecond" tail', 'X_TOKEN="***REDACTED***" tail'),
+    ('GITHUB_TOKEN="FAKEfirst\nFAKE \\"second\\""', 'GITHUB_TOKEN="***REDACTED***"'),
+    # A doubled quote is one inside the value, as YAML and SQL escape it and
+    # a shell joins two strings, on one line or across lines.
+    ("db_password: 'FAKE''FAKEafter'", "db_password: '***REDACTED***'"),
+    ("X_TOKEN='FAKE''FAKEafter' next", "X_TOKEN='***REDACTED***' next"),
+    ("db_password: 'it''s\n  FAKEafter'", "db_password: '***REDACTED***'"),
+    ('X_TOKEN="FAKE""FAKEafter"', 'X_TOKEN="***REDACTED***"'),
+    ("X_TOKEN='FAKE'''", "X_TOKEN='***REDACTED***'"),
 ]
 
 
 @pytest.mark.parametrize(("text", "expected"), _WHOLE_QUOTED_VALUES)
 def test_a_quoted_value_is_redacted_whole(text, expected):
     """#285 review: a quoted value stopped at its first space or semicolon,
-    and the rest of it stayed in the clear. It runs to its closing quote."""
+    and the rest of it stayed in the clear; round 2: and at a line break and
+    a doubled quote, both of which a valid shell or YAML string holds. It
+    runs to its closing quote."""
+    assert redact(text) == expected
+    assert redact(expected) == expected
+    assert credential_classes(text) != ()
+    assert credential_classes(expected) == ()
+    assert len(expected) <= MAX_GROWTH_FACTOR * len(text)
+
+
+# A quote that opens no value, or a value that does not read as one string
+# across its lines (#285 review, round 2), each with what ``redact`` makes of
+# it: the value is the rest of its line, as an unterminated one's was, and
+# the lines after it stay. A quote of the kind closes it on a later line only
+# after a blank line, a code fence, a backtick or the other quote, or is
+# followed by a word (it opens the next string).
+_QUOTES_THAT_SPAN_NO_LINES = [
+    (
+        'X_TOKEN="FAKEcut\n\nA paragraph says "this".',
+        'X_TOKEN="***REDACTED***\n\nA paragraph says "this".',
+    ),
+    (
+        'X_TOKEN="FAKEcut\n```\nsay "x"\n```',
+        'X_TOKEN="***REDACTED***\n```\nsay "x"\n```',
+    ),
+    (
+        'Set `DEPLOY_SECRET="...` first;\nthen "run" it.',
+        'Set `DEPLOY_SECRET="***REDACTED***\nthen "run" it.',
+    ),
+    (
+        "print('GH_TOKEN=' + read(\"f\"))\nlog('done')",
+        "print('GH_TOKEN='***REDACTED***\nlog('done')",
+    ),
+    # Nothing on its own line: no value at all.
+    (
+        'field = "Set GITHUB_TOKEN="\nassert check("body", field)',
+        'field = "Set GITHUB_TOKEN="\nassert check("body", field)',
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _QUOTES_THAT_SPAN_NO_LINES)
+def test_a_quote_that_opens_no_value_takes_no_later_line(text, expected):
+    """A quoted value runs across lines only while what it spans reads as one
+    string, so the end of a string literal in code, or a quote in a Markdown
+    code span, is no value that takes the lines after it from a log, a
+    prompt or an agent's read context. What it takes is its own line, as an
+    unterminated value did."""
     assert redact(text) == expected
     assert redact(expected) == expected
 
@@ -1081,6 +1239,43 @@ def test_a_quoted_value_with_spaces_is_redacted_whole_at_any_escaping(name, temp
     assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
 
 
+# Quoted values the second review of #285 found cut short: one that spans
+# lines, one that holds the quote doubled, and both, ``{q}`` the quote.
+_SPANNING_VALUES = {
+    "lines": "FAKEfirst\nFAKE second",
+    "doubled": "FAKE{q}{q}FAKEafter",
+    "doubled-on-lines": "FAKE{q}{q}s\n  FAKEafter",
+}
+
+
+@pytest.mark.parametrize("value", sorted(_SPANNING_VALUES), ids=str)
+@pytest.mark.parametrize("quote", ['"', "'"], ids=["double", "single"])
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(
+    ("name", "template"), _SPACED_ASSIGNMENTS, ids=[t for _, t in _SPACED_ASSIGNMENTS]
+)
+def test_a_quoted_value_across_lines_or_a_doubled_quote_is_redacted_whole_at_any_escaping(
+    name, template, depth, quote, value
+):
+    """#285 review, round 2: a quoted value stopped at a line break and at a
+    doubled quote, and what followed it stayed in the clear. It is taken
+    whole as text and as JSON, JSON in JSON and three deep write it, where
+    the line break is written out and the doubled quote escaped, and the
+    redacted text decodes to what redacting the text itself gives."""
+    text = template.format(q=quote, v=_SPANNING_VALUES[value].format(q=quote))
+    assert redact(text) == template.format(q=quote, v="***REDACTED***")
+    escaped = _json_string(text, depth)
+    out = redact(escaped)
+    assert "FAKE" not in out
+    decoded = out
+    for _ in range(depth):
+        decoded = json.loads(decoded)
+    assert decoded == redact(text)
+    assert credential_classes(escaped) == (name,)
+    assert redact(out) == out
+    assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+
+
 def test_a_quoted_value_is_redacted_whole_in_a_python_repr():
     """A Python repr writes ``'`` as ``\\'`` in a string that holds both
     quotes: the escaped quote opens and closes the value and stays."""
@@ -1102,16 +1297,26 @@ def test_a_quoted_value_is_redacted_whole_in_a_python_repr():
         "A_TOKEN" * 140_000,
         "ABC_DEF_TOKEN " * 70_000,
         ("\\nA_TOKEN" + "_X" * 10) * 20_000,
-        # Lower case (#285 review): an identifier, and literals that fail
-        # each of the value's conditions, a candidate after the other.
+        # Lower case (#285 review): an identifier, and values the code rule
+        # refuses, each of its alternatives, a candidate after the other
+        # (round 2), and the separator's spaces.
         "a" * 1_000_000,
-        "a_token=" * 125_000,
-        ("a_token=" + "abcdefgh" * 10 + " ") * 10_000,
         ("a_token=" + "12345678" * 10 + " ") * 10_000,
         ("a_token=" + "abcdefg1" * 10 + "(") * 10_000,
-        "a_token=" + "a-" * 500_000,
-        ("a_token:" + "a." * 50) * 10_000,
-        ('a_token="' + '"' * 3) * 80_000,
+        ("a_token=a_token ") * 70_000,
+        ("a_token=" + "a." * 50 + "a_token ") * 10_000,
+        ("a_token=" + "a" * 100 + "_token ") * 10_000,
+        ("a_token=" + "a." * 50 + "b ") * 10_000,
+        "a_token=" + "a." * 500_000 + "a(",
+        ("a_token=" + "a::" * 30 + "b<") * 10_000,
+        ("a_token=None, ") * 70_000,
+        ("a_token=$" + "A" * 100 + " ") * 10_000,
+        ("a_token=%(" + "a" * 100 + ")s ") * 10_000,
+        ("a_token=" + "." * 100 + " ") * 10_000,
+        ("a_token={" + "a" * 100 + " ") * 10_000,
+        "a_token" + ":" * 1_000_000,
+        "a_token=" + " " * 1_000_000,
+        ("a_token " + " " * 100 + ":") * 10_000,
     ],
     ids=[
         "one-identifier",
@@ -1120,22 +1325,68 @@ def test_a_quoted_value_is_redacted_whole_in_a_python_repr():
         "names-no-separator",
         "after-escapes",
         "lower-identifier",
-        "lower-names-no-value",
-        "no-digit",
+        "number",
+        "call",
+        "same-name",
+        "dotted-credential-name",
+        "long-credential-name",
+        "dotted-name",
+        "long-dotted-call",
+        "generic-path",
+        "constant",
+        "shell-variable",
+        "format-field",
         "no-letter",
-        "calls",
-        "long-run",
-        "dotted-names",
-        "empty-quotes",
+        "bracket",
+        "separators",
+        "spaces-after-separator",
+        "spaces-before-separator",
     ],
 )
 def test_the_credential_suffix_pattern_stays_linear(text):
     """A candidate starts only where an identifier does and scans it to its
-    end and the value after it, which holds no next candidate's separator,
-    so a megabyte of identifiers and near-miss values is redacted well inside
-    the budget."""
+    end and the first word of the value after it, so a megabyte of
+    identifiers and values the code rule refuses is redacted well inside the
+    budget."""
     started = time.process_time()
     assert redact(text) == text
+    assert time.process_time() - started < 3.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a_token=" * 125_000,
+        ("a_token=" + "abcdefgh" * 10 + " ") * 10_000,
+        "a_token=" + "a-" * 500_000,
+        ("a_token:" + "a." * 50) * 10_000,
+        "a_token=x" + "&a" * 500_000,
+        "a_token=x&" + "a" * 1_000_000,
+        "a_token=x" + ")" * 1_000_000 + "x",
+        ("a_token=x" + ")" * 100 + " ") * 10_000,
+        ("a_token=x&b_token=" + "%2F" * 30) * 10_000,
+        ('a_token="' + '"' * 3) * 80_000,
+    ],
+    ids=[
+        "names-no-space",
+        "letters",
+        "long-word",
+        "dotted-then-name",
+        "form-fields",
+        "one-long-ampersand-run",
+        "trailing-run-inside",
+        "trailing-runs",
+        "form-bodies",
+        "doubled-quotes",
+    ],
+)
+def test_a_lower_case_word_of_any_characters_stays_linear(text):
+    """#285 review, round 2: a lower-case name's unquoted word is now any
+    characters, so it can hold the next candidate's name and separator. It
+    is then taken whole, never read again, and a ``&`` or a run of trailing
+    punctuation is read once more at most."""
+    started = time.process_time()
+    assert "***REDACTED***" in redact(text)
     assert time.process_time() - started < 3.0
 
 
@@ -1148,12 +1399,41 @@ def test_the_credential_suffix_pattern_stays_linear(text):
         ('A_TOKEN=\\"' + 'a\\\\\\"' * 10 + '\\"') * 20_000,
         ('a_token="' + "\\" * 1_000 + "\n") * 300,
         'A_TOKEN="' + "\\" * 500_000,
+        # Across lines (#285 review, round 2): a value that never closes, and
+        # one that a quote of the other kind, a word after its quote or a
+        # blank line stops, many lines on, a candidate after the other;
+        # doubled quotes; and a candidate at every escaping level, whose
+        # quotes each level below it reads as its value's.
+        'A_TOKEN="' + "x\n" * 500_000,
+        ('A_TOKEN="' + "x\n" * 10 + "'") * 50_000,
+        ('A_TOKEN="' + "x\n" * 10 + '"a') * 50_000,
+        ('a_token="' + "x\n" * 10 + "\n") * 50_000,
+        'A_TOKEN="' + '""' * 500_000,
+        'A_TOKEN="' + '""\n' * 300_000,
+        "".join("A_TOKEN=" + "\\" * level + '"' + "x\n" * 1_000 for level in range(8)) * 50,
     ],
-    ids=["one-long-value", "other-quotes", "escaped-levels", "backslash-runs", "backslashes"],
+    ids=[
+        "one-long-value",
+        "other-quotes",
+        "escaped-levels",
+        "backslash-runs",
+        "backslashes",
+        "lines-never-closed",
+        "lines-other-quote",
+        "lines-word-after-quote",
+        "lines-blank-line",
+        "doubled-quotes",
+        "doubled-quotes-on-lines",
+        "lines-at-every-level",
+    ],
 )
 def test_a_quoted_value_stays_linear(text):
     """A quoted value is read once to its close, its line's end or its
-    string's: a backslash run whole, every alternative possessive."""
+    string's: a backslash run whole, every alternative possessive. A value
+    that spans lines and does not close (#285 review, round 2) is read once
+    more to its line's end; the next candidate's quote closes it, unless
+    more backslashes escape that quote, which no more than eight levels of
+    candidates in a row can do."""
     started = time.process_time()
     redact(text)
     assert time.process_time() - started < 3.0
@@ -2061,11 +2341,15 @@ _WORST_CASE_UNITS = {
     "credential_suffix_assignment_quoted_key": '"A_TOKEN":"x"',
     # A quoted value is taken whole (#285 review): at one character it is
     # the worst, 11 to 24, whatever the quote; a lower-case name with a
-    # quoted value is as long, and its unquoted literal (8 characters at
-    # least) only shrinks.
+    # quoted value is as long. Its unquoted word is any word that does not
+    # read as code (round 2), one character too: 10 to 23, as for an
+    # upper-case name. A quoted value that is one line break, or a doubled
+    # quote, is no shorter.
     "credential_suffix_assignment_quoted_lower": 'a_token="x"',
     "credential_suffix_assignment_escaped_lower": "a_token=\\'x\\'",
-    "credential_suffix_assignment_literal_lower": "a_token=abcdefg1 ",
+    "credential_suffix_assignment_word_lower": "a_token=x;",
+    "credential_suffix_assignment_quoted_line_break": 'A_TOKEN="\n" ',
+    "credential_suffix_assignment_doubled_quote": "a_token='''' ",
     # The BEGIN line and 16 characters of key material, its floor: 44 to 15.
     "private_key": "-----BEGIN" + " PRIVATE KEY-----" + "a" * 16 + " ",
     "gitlab_pat": "gl" + "pat-" + "a" * 20 + " ",
@@ -2221,6 +2505,11 @@ _CREDENTIAL_CORPUS = [
     *_PEM_NEAR_MISSES,
     *(text for text, _ in _SUFFIX_TEXTS),
     *_SUFFIX_NEAR_MISSES,
+    *(text for text, _ in _LOWER_SUFFIX_TEXTS),
+    *_LOWER_SUFFIX_NEAR_MISSES,
+    *(text for text, _ in _WHOLE_QUOTED_VALUES),
+    *(text for text, _ in _QUOTES_THAT_SPAN_NO_LINES),
+    *(text for _, text, _ in WHOLE_VALUES_285),
     *(text for text, _ in _URL_CREDENTIAL_CASES),
     *_URLS_WITHOUT_USERINFO,
     _NORMAL_TEXT,

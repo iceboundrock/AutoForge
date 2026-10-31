@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 
@@ -129,6 +130,26 @@ SHAPES_285 = [
     ("npm-token", NPM_TOKEN, NPM_TOKEN_BODY),
     ("huggingface-token", HUGGINGFACE_TOKEN, HF_TOKEN_BODY),
     ("credential-suffix-assignment", SUFFIX_ASSIGNMENT, SUFFIX_SECRET),
+]
+# Values under a lower-case prefixed name that the review of #285 (round 2)
+# found kept in the clear, each valid YAML, shell or form syntax: an unquoted
+# word of letters alone, one with punctuation, a form body ``urlencode``
+# wrote, and quoted values that span lines or hold a doubled quote. Each with
+# its id, the text and what must not appear once it is redacted or refused:
+# the part of the value a partial redaction left.
+PUNCTUATION_SECRET = "FAKE$p&ss!w#rd%^*(x)-+=[]{}|<>?/~,.:FAKEtail"
+FORM_SECRET = "FAKE form/value+with=signs&FAKEtail"
+WHOLE_VALUES_285 = [
+    ("alphabetic", "client_secret: FAKEalphaword", "FAKEalphaword"),
+    ("punctuation", f"db_password: {PUNCTUATION_SECRET}", "FAKEtail"),
+    (
+        "form-encoded",
+        urlencode({"grant_type": "client_credentials", "client_secret": FORM_SECRET}),
+        "FAKEtail",
+    ),
+    ("multi-line-shell", 'export DB_PASSWORD="FAKEfirst\nFAKEsecond"', "FAKEsecond"),
+    ("multi-line-yaml", 'client_secret: "FAKEfirst\n  FAKEsecond"', "FAKEsecond"),
+    ("yaml-doubled-quote", "db_password: 'FAKE''FAKEafter'", "FAKEafter"),
 ]
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)
