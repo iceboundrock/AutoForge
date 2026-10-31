@@ -19,9 +19,12 @@ documentation as a reader meets it.
 ## The rules
 
 - **Only the published documents.** Follow [Getting started](getting-started.md)
-  and what it links to, at the commit or version under test. No source
-  code, no issue history, no help from the maintainer. A question you had
-  to ask, or an answer you found anywhere else, is a friction point.
+  and what it links to, at the commit or version under test (the
+  [revision under test](#the-revision-under-test)): read them at
+  `https://github.com/iceboundrock/AutoForge/blob/<ref>/docs/getting-started.md`,
+  never `main`'s copy. No source code, no issue history, no help from the
+  maintainer. A question you had to ask, or an answer you found anywhere
+  else, is a friction point.
 - **Write down every friction point as it happens**, in the
   [format below](#the-friction-log), including the ones you worked around.
 - **Do not fix anything on the way.** Record it, work around it if you can,
@@ -51,27 +54,49 @@ of the run: install them as the guide's
 own instructions, and sign in to each. Say in the report which ones were
 already there.
 
+## The revision under test
+
+Everything of AutoForge the run uses comes from one revision, its `ref`:
+the command, the documents and the starter configuration. A starter of
+another revision may name a key or a model the installed controller does
+not know, and the guide of another revision describes another program.
+
+| Run | `ref` | Install (step 2) | Starter (step 4) |
+|---|---|---|---|
+| on a pull request | its head commit, all 40 hexadecimal digits (the copy button of the last commit in the pull request's **Commits** tab gives them) | `uv tool install --python 3.12 "git+https://github.com/iceboundrock/AutoForge@$ref"` | the guide's `curl` with that `ref`, the starter at the head commit |
+| at a release candidate | `v<version>`, the candidate's tag ([Releasing](releasing.md#version-scheme)), for example `v0.1.0a1` | the guide's PyPI command with the exact version, `autoforge-cli==<version>` in place of `autoforge-cli` | the guide's `curl` with that tag |
+
+The head commit of a pull request whose branch is in this repository, as
+AutoForge's own are, is served by `raw.githubusercontent.com` before the
+pull request is merged, so the starter is read from the commit under test.
+`main`'s copy is never the right one: before that pull request is merged
+`main` may hold no starter at all, and after it a newer one. Record `ref`
+in step 0, and check in step 4 that the starter's URL names it.
+`make dist-check` copies each starter from its own checkout and never
+downloads one, so the download is checked only here.
+
 ## The steps
 
 Number the steps in your notes as below, and note the time at each.
 
 0. **Record the environment:** the date (UTC), `cat /etc/os-release`,
-   `uname -srm`, and the commit or version under test.
+   `uname -srm`, and the `ref` under test
+   ([above](#the-revision-under-test)).
 1. **Prerequisites** ([section 1](getting-started.md#1-prerequisites)):
    install and sign in to each tool.
 2. **Install AutoForge** ([section 2](getting-started.md#2-install-autoforge))
-   by the method under test: at a release candidate, the candidate's
-   published version; on a pull request, its head commit,
-   `uv tool install --python 3.12 'git+https://github.com/iceboundrock/AutoForge@<commit>'`.
-   Run `autoforge --version` and `autoforge --help` from a directory that
-   is not a repository.
+   from `ref`, by the method [above](#the-revision-under-test) for this
+   kind of run. Run `autoforge --version` and `autoforge --help` from a
+   directory that is not a repository; on a pull request the version is
+   `main`'s `.devM` one, at a release candidate the candidate's.
 3. **Prepare the throwaway repository**
    ([section 3](getting-started.md#3-prepare-a-throwaway-repository)),
    with the guide's EPIC and issue, or your own and their text in the
    report.
 4. **Write the configuration**
-   ([section 4](getting-started.md#4-write-a-configuration)): name the
-   starter and every change you made to it.
+   ([section 4](getting-started.md#4-write-a-configuration)), with the
+   starter downloaded at `ref`: name the starter, the URL you downloaded it
+   from, and every change you made to it.
 5. **Run `doctor`**
    ([section 5](getting-started.md#5-check-the-environment-doctor)): keep
    its output, and the versions file the guide writes. Every row that is not

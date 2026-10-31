@@ -65,7 +65,9 @@ autoforge --help
 
 `--prerelease allow` is needed while every published version is a
 prerelease. To try a commit instead, `uv tool install --python 3.12
-'git+https://github.com/iceboundrock/AutoForge@<commit>'`; the README's
+'git+https://github.com/iceboundrock/AutoForge@<commit>'`, with the
+commit's full 40-digit hash in place of `<commit>` (keep it: step 4 takes
+the starter from the same commit); the README's
 [Installation](../README.md#installation) has every method, upgrading and
 removing.
 
@@ -150,16 +152,27 @@ Add `greet.sh`, a POSIX shell script that prints a greeting.
 Anything else in the repository.
 ```
 
-and create the issues, EPIC first:
+and create the issues, EPIC first, keeping the URL each command prints in
+a shell variable:
 
 ```bash
-gh issue create --title "Try AutoForge" --body-file epic.md
-gh issue create --title "Add a greeting script" --body-file issue.md
+epic=$(gh issue create --title "Try AutoForge" --body-file epic.md)
+issue=$(gh issue create --title "Add a greeting script" --body-file issue.md)
+printf 'EPIC:  %s\nissue: %s\n' "$epic" "$issue"
 rm epic.md issue.md
 ```
 
-Each command prints the new issue's URL; in a new repository they are
-`https://github.com/<you>/first-run/issues/1` and `.../issues/2`.
+`gh issue create` prints the new issue's complete URL, and the `printf`
+shows the two: in a new repository of the account `you`,
+`https://github.com/you/first-run/issues/1` and `.../issues/2`. Keep them:
+the commands of [step 6](#6-preview-run-and-read-where-it-stopped) read
+`"$epic"` and `"$issue"`. In a new shell, set both again before you run
+them, each to the complete URL the `printf` showed, in single quotes:
+
+```bash
+epic='https://github.com/you/first-run/issues/1'    # replace with your EPIC's URL
+issue='https://github.com/you/first-run/issues/2'   # replace with your issue's URL
+```
 
 **Required checks.** AutoForge's merge gate (closed by default) trusts a
 pull request whose checks all passed, and relies on a branch rule of the
@@ -192,16 +205,29 @@ and change them. Two are under [`examples/`](../examples):
 | [`starter-claude-only.yaml`](../examples/starter-claude-only.yaml) | Claude Code for every phase | `claude` only, one vendor | **not cross-vendor**: the model that wrote the change also reviews it |
 
 Save one as `autoforge.yaml` in the checkout (excluded from git in
-step 3):
+step 3), taken from **the same revision of AutoForge as the command you
+installed**, so that the starter names only keys and models that version
+knows. Set `ref` to that revision:
+
+- installed from PyPI: `v` and the version `autoforge --version` prints,
+  for example `ref=v0.1.0a1` for `autoforge 0.1.0a1`;
+- installed from a commit (step 2): the full commit you gave `uv tool
+  install`, `ref=` and its 40 hexadecimal digits.
 
 ```bash
+ref=v0.1.0a1   # your revision, as above
 curl -fsSL -o autoforge.yaml \
-  https://raw.githubusercontent.com/iceboundrock/AutoForge/main/examples/starter-two-providers.yaml
+  "https://raw.githubusercontent.com/iceboundrock/AutoForge/$ref/examples/starter-two-providers.yaml"
 ```
 
-That is `main`'s copy; once the version you installed (`autoforge
---version`) has a tag with an `examples/` directory, `v<version>` in place
-of `main` gives the copy that matches it.
+`starter-claude-only.yaml` in place of `starter-two-providers.yaml` gives
+the other starter. A `.devM` version (`autoforge 0.1.0a1.dev0`) is no
+release and has no tag: it was installed from a commit, and `ref` is that
+commit. `curl: (22) The requested URL returned error: 404` means the
+revision has no such file: a misspelt `ref`, or a version older than the
+starters (`0.1.0a0`, the first published version, has none). Install a
+later version, or a commit of `main` (step 2), and take the starter from
+the same revision.
 
 Change a model if your account cannot use the one written there: `claude
 --model` takes an alias (`fable`, `opus`, `sonnet`) or a full model name,
@@ -264,10 +290,12 @@ command and its limits, and the prompt; it starts no process, calls no
 `gh`, and writes no state:
 
 ```bash
-autoforge --config autoforge.yaml run \
-  --epic https://github.com/<you>/first-run/issues/1 \
-  --issue https://github.com/<you>/first-run/issues/2 --dry-run
+autoforge --config autoforge.yaml run --epic "$epic" --issue "$issue" --dry-run
 ```
+
+`$epic` and `$issue` are the two URLs of
+[step 3](#3-prepare-a-throwaway-repository). Typed by hand, each is the
+issue's complete `https://github.com/...` URL, quoted.
 
 It starts with:
 
@@ -293,9 +321,7 @@ has findings fixed, until the run stops. Progress lines go to the
 terminal. A run can take a while, and every model call costs money.
 
 ```bash
-autoforge --config autoforge.yaml run \
-  --epic https://github.com/<you>/first-run/issues/1 \
-  --issue https://github.com/<you>/first-run/issues/2
+autoforge --config autoforge.yaml run --epic "$epic" --issue "$issue"
 ```
 
 While it runs, do not commit or switch branches in this checkout: the
@@ -329,8 +355,8 @@ Phase:      INITIALIZING
 ```text
 ========================================================================
 AutoForge workflow reached READY_FOR_MERGE.
-  Issue:         https://github.com/<you>/first-run/issues/2
-  PR:            https://github.com/<you>/first-run/pull/3
+  Issue:         https://github.com/you/first-run/issues/2
+  PR:            https://github.com/you/first-run/pull/3
   Review round:  1
   Reviewed HEAD: <commit>
   ...
