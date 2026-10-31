@@ -39,10 +39,37 @@ short:
 | Linux on x86_64 | | the platform the first prerelease claims; macOS is untested and Windows does not work |
 | Python | 3.11 or 3.12 | the interpreters CI tests; `uv` can install one (`uv python install 3.12`) |
 | [`uv`](https://docs.astral.sh/uv/) | | installs AutoForge into an environment of its own |
-| git | | any recent version; `doctor` checks that `git --version` runs |
+| git, with your name and e-mail address set | | any recent version; `doctor` checks that `git --version` runs. The implementer commits as you: see the identity below |
 | [GitHub CLI](https://cli.github.com/) (`gh`), signed in | 2.48.0 or later | the controller works on GitHub with your `gh` login (`gh auth login`); [GitHub token permissions](security.md#github-token-permissions) lists what the token needs |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`), signed in | any release whose `claude --help` lists `--safe-mode`, `--strict-mcp-config` and `--setting-sources` | implements the issue and fixes review findings |
 | [OpenCode](https://opencode.ai/) (`opencode`), with an OpenAI credential | 2.0.0 or later | reviews every round, and replans. Not needed with the Claude-only starter ([step 4](#4-write-a-configuration)) |
+
+**A git identity.** The implementer commits as you, with the name and
+e-mail address of your **global** git configuration: of that configuration,
+AutoForge gives each agent only the `user.*`, `author.*` and `committer.*`
+settings, and of your shell the `GIT_AUTHOR_*` and `GIT_COMMITTER_*`
+variables. A new user account has no identity, and git then refuses the
+implementer's commit ([section 7](#7-common-first-run-failures)); `doctor`
+names what it found ([step 5](#5-check-the-environment-doctor)) but does
+not fail without one. Check both:
+
+```bash
+git config --global user.name    # prints your name
+git config --global user.email   # prints your address
+```
+
+If either prints nothing, set it, even when `git commit` seems to work on
+this machine: on a host whose name has a domain, git guesses
+`<user>@<host>` instead of refusing, and the commits carry the guess.
+
+```bash
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+```
+
+The pull request's commits carry that address, so use one you are willing
+to publish: GitHub's `noreply` address (**Settings → Emails**) keeps your
+own private.
 
 **Who pays.** AutoForge has no account and stores no model credential.
 Each agent CLI uses your own login or key, and each vendor bills you:
@@ -304,6 +331,7 @@ On a first run, expect these rows:
 | `agent 'claude' available (...)`, `agent 'opencode' available (...)` | `FAIL ... executable not found: claude` | the CLI is not installed, or not on `PATH`. The row lists the profiles that use it: install it, or route those profiles to a CLI you have (the Claude-only starter) |
 | `agent 'claude' keeps integrations off (...)` | `FAIL` | this Claude Code does not list `--safe-mode`, `--strict-mcp-config` and `--setting-sources` in `claude --help`: update it, since every launch passes them |
 | | `SKIP ... stopped mid-line after 8192 bytes` | Claude Code wrote only part of its help to `doctor` (2.1.314 does when its output is a pipe), so the flags could not be looked up. A launch refuses a Claude Code without them anyway; to check by hand, run `claude --help > claude-help.txt` and look for the three flags in the file |
+| `no credential reaches a launch` | `OK ... author identity supplied: none in the operator's global git configuration` | the row is `OK`, since it checks that no credential reaches an agent, but this ending means the implementer's commit has no identity of yours: set `user.name` and `user.email` as [step 1](#1-prerequisites) says, then run `doctor` again. With both set, the row ends `author identity supplied: user.name, user.email` |
 | `default branch requires checks` | `WARN ... no rule requires a status check` (with the merge gate closed) | expected on a new repository, and on an existing one whose rules do not require the checks `safety.required_checks` names; see [Required checks](#3-choose-and-prepare-a-repository). It becomes a `FAIL` if you open the merge gate |
 | | `SKIP` | the rules could not be read: the plan offers none (a private repository on GitHub Free), or the token cannot read them. The row names which, and the way out |
 | `pull request check runs readable` | `SKIP ... UNKNOWN: no recently updated open pull request ... has a check result` | nothing to try it on yet. It matters only with the merge gate open |
@@ -463,6 +491,38 @@ has a phase, see [Troubleshooting and recovery](usage.md#troubleshooting-and-rec
 | ``autoforge: error: `gh repo view <repo> --json nameWithOwner,defaultBranchRef` failed (exit 1): HTTP 401: Requires authentication ...`` | `run` was started before `gh auth login`. The run exists, at `INITIALIZING`: sign in, then `autoforge resume` |
 | `[FAIL] agent 'claude' available (analyze_execute, fix): ExecutionError: executable not found: claude (...)` | install Claude Code, or move those profiles to a CLI you have; `opencode` the same way |
 | a step fails at its first agent launch: the run prints the failure, then `State unchanged.`, the step's `logs:` directory and the `resume:` command | the agent CLI refused the launch, for example a model your account cannot use or a CLI not signed in. The CLI's own message is in that `logs:` directory. Sign in, or fix the model in `autoforge.yaml` (`resume` then asks for `--accept-config-change`: [The configuration a run was recorded under](usage.md#the-configuration-a-run-was-recorded-under)), then `resume` |
+
+**An implementer that cannot commit.** Without a git identity
+([step 1](#1-prerequisites)), git refuses the implementer's commit and the
+run stops in its first agent phase, `ANALYZE_EXECUTE`. The implementer
+writes the reason, so the line varies: `run <id> is FAILED: <its message>`,
+or `BLOCKED`, saying the commit was refused. The step's log, the `log`
+directory its `launching analyze_execute` line printed, holds git's own
+message:
+
+```text
+Author identity unknown
+
+*** Please tell me who you are.
+...
+fatal: unable to auto-detect email address (got '<user>@<host>.(none)')
+```
+
+Nothing reached GitHub: the controller pushes only a commit the implementer
+made. Set the identity as step 1 says, check that `doctor`'s
+`no credential reaches a launch` row ends `author identity supplied:
+user.name, user.email`, and start the issue again; `run --force` replaces
+the stopped run, and a `FAILED` one takes no `resume`:
+
+```bash
+autoforge --config autoforge.yaml run --force --epic "$epic" --issue "$issue"
+```
+
+The issue's worktree keeps what the first implementer left uncommitted,
+and the next one's prompt says so. An implementer may instead work around
+the refusal and commit under a name and address it made up: the run then
+goes on, and the pull request's commits show that identity. Look at the
+commits' author before you merge.
 
 **A run that already exists, or another controller.**
 

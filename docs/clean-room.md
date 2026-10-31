@@ -53,7 +53,7 @@ The prerequisites (`uv`, Python, git, `gh`, Claude Code, OpenCode) are part
 of the run: install them as the guide's
 [prerequisites](getting-started.md#1-prerequisites) say, from each tool's
 own instructions, and sign in to each. Say in the report which ones were
-already there.
+already there, and whether git already had your name and e-mail address.
 
 ## The target repository
 
@@ -118,7 +118,8 @@ Number the steps in your notes as below, and note the time at each.
    `uname -srm`, and the `ref` under test
    ([above](#the-revision-under-test)).
 1. **Prerequisites** ([section 1](getting-started.md#1-prerequisites)):
-   install and sign in to each tool.
+   install and sign in to each tool, and give git your identity as the
+   section says.
 2. **Install AutoForge** ([section 2](getting-started.md#2-install-autoforge))
    from `ref`, by the method [above](#the-revision-under-test) for this
    kind of run, and keep the exact command you ran and `uv`'s output.
