@@ -2813,8 +2813,9 @@ def print_ready_banner(
         ]
     else:
         lines += [
-            "Automatic merge is disabled in this milestone.",
-            "A human must review and merge the PR.",
+            "The merge gate is closed: a human must review and merge the PR.",
+            "(AutoForge merges only with 'safety.allow_merge: true' in the config and "
+            "--allow-merge.)",
         ]
     lines.append("=" * 72)
     # State-derived like the status output: the same redaction boundary.

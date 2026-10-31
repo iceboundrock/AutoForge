@@ -228,7 +228,25 @@ credential:
    `gh` first on `PATH` that records any call, and checks it rendered the
    ANALYZE_EXECUTE prompt, called no `gh` and left the repository
    byte-identical;
-7. prints the SHA-256 of both files (and, with `--sha256sums FILE`, writes
+7. runs the offline half of [Getting started](getting-started.md) (#259):
+   `uv tool install` of the wheel alone (`--offline --no-index`), into tool
+   directories and a home of its own, then, in an environment of `HOME`,
+   `PATH` and git's configuration switched off, whose `PATH` is a fake
+   `gh` that fails every call, the installed `autoforge`, git's directory
+   and `/bin:/usr/bin` (no credential, and no agent CLI on the CI runner):
+   `autoforge --version` and `--help` outside
+   any repository, and, in a repository whose `origin` is on GitHub and
+   which keeps `.autoforge/` and `autoforge.yaml` out of git the way the
+   guide does, `autoforge doctor --json` with the built-in routing and
+   with each starter of [`examples/`](../examples) saved as
+   `autoforge.yaml`. Every row that needs no credential (`config`, `merge
+   gate` closed, `git available`, `GitHub remote`, `launch environment`,
+   `state dir writable` and the rest of `CREDENTIAL_FREE_ROWS`) must be
+   `OK`, and the agent rows must name exactly the CLIs the configuration
+   routes to. With each starter it also makes a REMOTE dry run, checked as
+   in step 6, and the repository's `git status` must stay empty. The rows
+   that need `gh`, a sign-in or an agent CLI are not checked;
+8. prints the SHA-256 of both files (and, with `--sha256sums FILE`, writes
    them in `sha256sum` format).
 
 It runs on one interpreter, `DIST_PYTHON` (default 3.12):
@@ -239,8 +257,9 @@ its scratch directory when it passes and keeps it, naming it, when it fails.
 is the cheap half: it fails when a non-Python file under
 `src/autoforge/` is neither declared as package data nor deliberately left
 out, when code reads a package resource from a module it does not know,
-when the two version strings differ, or when the classifiers drift from
-the Python versions CI runs.
+when the two version strings differ, when the classifiers drift from
+the Python versions CI runs, or when the starters of `examples/` and the
+CLIs they route to drift from what step 7 expects.
 
 ## The suite on several workers
 

@@ -113,8 +113,8 @@ execution:
 
 safety:
   # Controller invariant: no real merge unless this is true AND the CLI is
-  # invoked with --allow-merge. Automatic merge is disabled in this milestone.
-  # This is the only key that opens the gate. Like every section in this
+  # invoked with --allow-merge. With it false a run stops at READY_FOR_MERGE
+  # and a human merges the PR. This is the only key that opens the gate. Like every section in this
   # file, `safety` accepts only the keys the controller reads: a typo such as
   # `allow_merges` is a configuration error rather than a silent no-op.
   # `autoforge doctor` prints the effective gate state and the file/key it
@@ -140,8 +140,10 @@ safety:
   # decided by a branch rule in repository settings, outside version control,
   # and nothing else notices when that rule is disabled, renamed or given a
   # bypass actor. `autoforge doctor` reads the effective rules of the default
-  # branch and FAILs when one of these contexts is not required, the ruleset
-  # is not `active`, or it has bypass actors. Rules it cannot verify (a
+  # branch and reports when one of these contexts is not required, the
+  # ruleset is not `active`, or it has bypass actors: a FAIL with
+  # `allow_merge: true`, a WARN with `allow_merge: false`, since only the
+  # merge gate relies on the rule (#259). Rules it cannot verify (a
   # token without access, GitHub Free, whose private repositories have no
   # rulesets, a transient failure, or a bypass list GitHub shows only with
   # write access to the ruleset and no word on whether this token may bypass
@@ -247,8 +249,10 @@ merge:
 # allow-listed environment, `execution.command_timeout_seconds` and, with
 # `sandbox.mode: required`, the outer sandbox; the set stops at the first
 # command that does not exit 0. Each run leaves a ValidationRecord in the
-# state file. No REMOTE phase runs these yet (#173); `doctor` and the dry run
-# list them and run none of them. Separate from `merge.verification_commands`.
+# state file. ANALYZE_EXECUTE, FIX and REPLAN_REEXECUTE validate a candidate
+# before it is pushed, and REVIEW requires that evidence for the PR head
+# (#173); `doctor` and the dry run list them and run none of them. Separate
+# from `merge.verification_commands`.
 validation:
   # The only scope there is: what is validated is the candidate's own tree.
   scope: candidate-tree

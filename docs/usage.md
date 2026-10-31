@@ -151,7 +151,7 @@ exact triggers are in [Workflow: loop bounds](agent-guides/workflow.md#loop-boun
 
 When the loop reaches `READY_FOR_MERGE` with the merge gate closed (the
 default) the CLI prints a banner with the issue, PR, review round and reviewed
-HEAD, and states that automatic merge is disabled: a human merges the PR.
+HEAD, and states that the merge gate is closed: a human merges the PR.
 `resume` without the gate open re-prints the banner and runs nothing. The
 banner's `Review certificate:` line says whether the round's certificate
 applies, checked against the state and the configuration in force (GitHub

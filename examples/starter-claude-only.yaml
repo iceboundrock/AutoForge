@@ -1,0 +1,78 @@
+# AutoForge starter configuration: Claude Code for every phase.
+#
+# One CLI to install and sign in to, and one vendor's bill. The price: the
+# review is not cross-vendor. The model that wrote a change also reviews it,
+# and can miss in the review what it missed in the change. The built-in
+# routing (starter-two-providers.yaml) has OpenCode review what Claude Code
+# wrote.
+#
+# Evidence: tests load and validate this file, and the install smoke runs
+# `doctor` and a dry run with it. No real run has used it yet.
+#
+# A profile that changes a built-in profile's provider (OpenCode to Claude
+# Code here) starts from nothing: the options below are the Claude Code
+# defaults, written out. bypassPermissions lets the agent run commands
+# without asking, which a run with nobody to answer needs; read
+# docs/security.md before a first run. Replace `fable` with any model
+# `claude --model` accepts (an alias such as opus or sonnet, or a full
+# model name).
+#
+# Save it as autoforge.yaml in your checkout, keep it out of git, and pass
+# it before the subcommand (docs/getting-started.md):
+#   autoforge --config autoforge.yaml doctor
+
+version: 1
+
+safety:
+  # Closed: a run stops at READY_FOR_MERGE and you merge the pull request.
+  allow_merge: false
+  # The status check your CI reports on a pull request. Only the merge gate
+  # relies on it; `doctor` checks that the default branch requires it, and
+  # shows a WARN while the gate is closed and no rule requires it.
+  required_checks:
+    - "ci"
+
+profiles:
+  analyze_execute:
+    provider: claude
+    model: fable
+    effort: high
+  fix:
+    provider: claude
+    model: fable
+    effort: high
+  review_round_1:
+    provider: claude
+    model: fable
+    effort: high
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json
+  review_round_2_5:
+    provider: claude
+    model: fable
+    effort: high
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json
+  review_round_6_plus:
+    provider: claude
+    model: fable
+    effort: medium
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json
+  replan_reexecute:
+    provider: claude
+    model: fable
+    effort: high
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json
+  update_epic:
+    provider: claude
+    model: fable
+    effort: high
+    options:
+      permission_mode: bypassPermissions
+      output_format: stream-json

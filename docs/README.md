@@ -10,7 +10,7 @@ description of how AutoForge behaves.
 
 | Document | Read it for |
 |---|---|
-| [Getting started](../README.md#quick-start) | prerequisites, installation, `doctor`, a dry run, a first run, `resume` |
+| [Getting started](getting-started.md) | a first run on a repository of your own, step by step: prerequisites, installing, a throwaway repository with an EPIC and an issue, a starter configuration ([`examples/`](../examples)), what each `doctor` row means, a dry run, a real run, `READY_FOR_MERGE` and `BLOCKED`, and the common first-run failures with their fixes |
 | [Compatibility](compatibility.md) | what AutoForge runs on and the evidence for each claim: OS and architecture, Python, git, `gh` and its token, each agent CLI's minimum and verified versions, the outer sandbox's host requirements, the filesystem, provider authentication and billing |
 | [Running the remote workflow](usage.md) | every command, where a run stops (`READY_FOR_MERGE`, `BLOCKED`), opt-in merge, `unblock`, how agents are separated from your checkout (not sandboxed unless `sandbox.mode: required`), troubleshooting and recovery |
 | [Local mode](local-mode.md) | the GitHub-free workflow over a feature Markdown file: the workspace fingerprint, dirty trees, the review/fix bound, validation commands, dry run and resume |
@@ -45,6 +45,7 @@ description of how AutoForge behaves.
 |---|---|
 | [Development](development.md) | `make` targets, CI, the built-distribution check, and what a green `ci` does and does not prove |
 | [Releasing](releasing.md) | the distribution name, the version and tag scheme, the changelog, and the maintainer's procedure for building, tagging, publishing and verifying a release; the `pypi-publish` workflow, Trusted Publishing's one-time PyPI and GitHub setup, troubleshooting, and why the first upload is not the Public Alpha's Go |
+| [Clean-room first run](clean-room.md) | checking that the published documents alone get a newcomer from nothing to a first run (Gates 1 and 2 of #255): the environment to start from, the steps, what to capture and redact, and the friction log |
 | [Testing](agent-guides/testing.md) | the coverage contract and high-priority test areas |
 | [Test scope](../tests/AGENTS.md) | fixtures and fakes, and what a test may never do |
 | [AGENTS.md](../AGENTS.md) | the repository contract: precedence, safety invariants, routing rules for which guide to read before a change |

@@ -139,7 +139,12 @@ version number, `doctor` checks what the adapter depends on: `claude
 `--strict-mcp-config` and `--setting-sources`, the flags every launch passes
 so that no hook, plugin, MCP server or repository setting runs
 (`agent 'claude' keeps integrations off`). A launch is refused without
-them as well. A version floor would refuse nothing this check lets through
+them as well. Claude Code 2.1.314 writes only the first 8 or 16 KiB of its
+22 KiB `--help` when its output is a pipe, as `doctor`'s is, and stops
+mid-line before those flags (written to a file, the help is whole and
+lists all three; #259). A help that ends mid-line without them is
+therefore a `SKIP` that says so, not a `FAIL`; one that ends with a whole
+line and lacks a flag is still a `FAIL`. A version floor would refuse nothing this check lets through
 on the evidence there is (every release with the three flags that has been
 run is listed above), and Claude Code's release cadence would make a floor
 stale within days. The provider's argv is unchanged. Releases outside the
