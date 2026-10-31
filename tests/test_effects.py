@@ -2386,6 +2386,108 @@ def test_an_append_is_not_rebased_onto_a_body_holding_a_credential(case):
     assert fake.effect_writes == []
 
 
+# ADR 0004 §6.1's K3 and K6 rows (#241): the crash windows around a rebase.
+FIRST_EDIT = "A human clarified the description."
+SECOND_EDIT = "A human rewrote the description again."
+
+
+def _dies_after_the_rebase_save(saved: EffectRecord) -> None:
+    """A ``Saves`` hook: the process dies once the rebased attempt is durable, before the write."""
+    if saved.stage is Stage.ATTEMPTED:
+        raise Crash("after the rebase save")
+
+
+# Each window as the ``Saves`` that dies in it, and how many writes it leaves on GitHub.
+REBASE_CRASHES = {
+    "before-the-write": (lambda fake: saves_for(fake, hook=_dies_after_the_rebase_save), 0),
+    "after-the-write": (lambda fake: saves_for(fake, crash_on=Stage.OBSERVED), 1),
+}
+
+
+def _crashed_after_a_rebase(case: Case, window: str) -> tuple[FakeGitHub, EffectRecord]:
+    """A human edits the body, the rebase is saved, and the process dies in ``window``.
+
+    Returns the world and the record as the next process loads it: the rebased payload,
+    ``attempted`` once, over the edited body's digest.
+    """
+    fake, record = world_of(case)
+    case.edit_target(fake, FIRST_EDIT)
+    build, landed = REBASE_CRASHES[window]
+    crashing = build(fake)
+    with pytest.raises(Crash):
+        drive(record, operation_for(record, fake), crashing)
+    rebased = crashing.last
+    assert crashing.stages == [(Stage.ATTEMPTED, 1, 0)]
+    assert rebased.precondition["base_sha256"] == sha256_text(FIRST_EDIT)
+    assert rebased.body == compose_append(FIRST_EDIT, record.payload["block"])
+    assert [(name, body) for name, _, body in fake.effect_writes] == [
+        (case.write, rebased.body)
+    ] * landed
+    return fake, rebased
+
+
+@pytest.mark.parametrize("case", APPEND_CASES, ids=repr)
+def test_a_crash_after_the_rebase_save_before_the_write_issues_the_rebased_payload_once(case):
+    """ADR 0004 §6.1 (#241): a human edited the body, the rebased payload was saved as
+    attempted, and the process died before the write. Driving the persisted record
+    writes once, with the saved base and the composed body, never the payload planned
+    before the edit. The rebase spent the first attempt, so this write is the second."""
+    fake, rebased = _crashed_after_a_rebase(case, "before-the-write")
+    planned = world_of(case)[1]
+
+    saves = saves_for(fake)
+    driven = drive(rebased, operation_for(rebased, fake), saves)
+    assert saves.stages == [(Stage.ATTEMPTED, 2, 0), (Stage.OBSERVED, 2, 1)]
+    assert driven.issued
+    assert [(name, body) for name, _, body in fake.effect_writes] == [(case.write, rebased.body)]
+    assert driven.record.body == rebased.body != planned.body
+    assert driven.record.precondition == rebased.precondition
+    assert case.landed(fake, driven.record) == [driven.record.observed["url"]]
+
+
+@pytest.mark.parametrize("case", APPEND_CASES, ids=repr)
+def test_a_crash_after_the_rebased_write_before_the_save_observes_it_without_a_second_write(case):
+    """ADR 0004 §6.1 (#241): a human edited the body, the rebased payload was saved and
+    written, and the process died before the observed save. Driving the persisted
+    record observes the rebased payload on GitHub; nothing is sent again."""
+    fake, rebased = _crashed_after_a_rebase(case, "after-the-write")
+
+    saves = saves_for(fake)
+    driven = drive(rebased, operation_for(rebased, fake), saves)
+    assert saves.stages == [(Stage.OBSERVED, 1, 1)]
+    assert not driven.issued and len(fake.effect_writes) == 1
+    assert driven.record.body == rebased.body
+    assert driven.record.precondition == rebased.precondition
+    assert case.landed(fake, driven.record) == [driven.record.observed["url"]]
+
+
+@pytest.mark.parametrize("window", sorted(REBASE_CRASHES))
+@pytest.mark.parametrize("case", APPEND_CASES, ids=repr)
+def test_a_second_edit_after_a_crash_past_the_rebase_save_is_a_conflict_not_a_second_rebase(
+    case, window
+):
+    """ADR 0004 §6.1 (#241): after a crash past the rebase save, a human edits the body
+    again. The record was attempted, so a write may have landed under the edit: the
+    "edited after an issue, payload not present" rule makes it a conflict. Nothing is
+    rebased over the second edit and nothing is sent."""
+    fake, rebased = _crashed_after_a_rebase(case, window)
+    case.edit_target(fake, SECOND_EDIT)
+    writes = list(fake.effect_writes)
+
+    saves = saves_for(fake)
+    driven = drive(rebased, operation_for(rebased, fake), saves)
+    assert saves.stages == [(Stage.CONFLICT, 1, len(writes))]
+    assert not driven.issued and fake.effect_writes == writes
+    assert "after an issue the body equals neither the payload nor its base" in (
+        driven.record.reason
+    )
+    assert rebased.describe() in driven.record.reason
+    assert driven.record.body == rebased.body
+    assert driven.record.precondition == rebased.precondition
+    with pytest.raises(EffectConflictError, match="cannot be told from one that never landed"):
+        raise_conflict(driven.record)
+
+
 # -- closed-object identity reads of the create kinds ----------------------------------
 
 

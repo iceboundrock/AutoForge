@@ -1206,6 +1206,89 @@ def test_analyze_crash_after_the_plan_save_completes_from_the_journal(
     assert fake_github.prs[PR].body == f"Adds the feature.\n\nTested with `pytest`.\n\n{CLOSING}"
 
 
+def _adopting(tmp_state_dir, fake_github):
+    """The K1 + K3 plan's run: an open unmarked PR on ``autoforge/2``; (engine, earlier head)."""
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body="Started by hand.")
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    return eng, earlier
+
+
+def _adopted_once(eng2, out, fake_github, candidate: str) -> None:
+    """The resumed step adopted PR41 at ``candidate`` with one body edit, and launched nothing."""
+    assert out.next_phase == "REVIEW", out.message
+    assert eng2.provider.calls == []
+    assert eng2.origin.head("autoforge/2") == candidate == fake_github.prs[PR41].head_sha
+    s = load_state(eng2.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.current_head_sha, s.current_branch) == (
+        Phase.REVIEW,
+        PR41,
+        candidate,
+        "autoforge/2",
+    )
+    assert s.effect_records == []
+    assert fake_github.prs[PR41].body == f"Started by hand.\n\n{CLOSING}"
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
+    assert PR not in fake_github.prs
+
+
+def test_analyze_adoption_crash_after_the_plan_save_completes_from_the_journal(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """#241: the K1 + K3 plan (adopting the open unmarked PR on the branch) is
+    saved, and the process dies before anything is sent. The next process
+    pushes and adopts from the journal: no agent, one push, one body edit,
+    REVIEW."""
+    from autoforge.engine import ControllerEngine
+
+    eng, earlier = _adopting(tmp_state_dir, fake_github)
+    pushes = _logs_pushes(eng.origin)
+    monkeypatch.setattr(ControllerEngine, "_complete_analyze", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.ANALYZE_EXECUTE
+    assert [(r["kind"], r["stage"]) for r in s.effect_records] == [
+        ("push", "intended"),
+        ("adopt_pr", "intended"),
+    ]
+    assert eng.origin.head("autoforge/2") == earlier and fake_github.effect_writes == []
+    assert fake_github.prs[PR41].body == "Started by hand." and _pushes(pushes) == []
+    candidate = _worktree_head(eng.provider.calls[0])
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    _adopted_once(eng2, eng2.step(), fake_github, candidate)
+    assert _pushes(pushes) == [f"refs/heads/autoforge/2 {candidate}"]
+
+
+def test_analyze_adoption_crash_after_the_write_before_its_save_is_reconciled_without_a_second_edit(
+    tmp_state_dir, fake_github
+):
+    """#241: the push is observed, the adoption's body edit lands, and the
+    process dies before the observed save. The next process reads the body
+    back as the payload and completes the phase: no agent, no second push,
+    no second edit."""
+    eng, _ = _adopting(tmp_state_dir, fake_github)
+    pushes = _logs_pushes(eng.origin)
+    _power_loss_at(eng, EffectKind.ADOPT_PR, Stage.OBSERVED, saved=False)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    candidate = _worktree_head(eng.provider.calls[0])
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    assert [(r["kind"], r["stage"], r["attempts"]) for r in data["effect_records"]] == [
+        ("push", "observed", 1),
+        ("adopt_pr", "attempted", 1),
+    ]
+    assert fake_github.prs[PR41].body == f"Started by hand.\n\n{CLOSING}"
+    assert _pushes(pushes) == [f"refs/heads/autoforge/2 {candidate}"]
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    _adopted_once(eng2, eng2.step(), fake_github, candidate)
+    assert _pushes(pushes) == [f"refs/heads/autoforge/2 {candidate}"]
+
+
 @pytest.mark.parametrize(
     ("key", "edit", "rule"),
     [

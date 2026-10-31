@@ -7,7 +7,8 @@ validation command cannot write the git directory; a LOCAL agent reaches a
 configuration file in its root, which is why one there is refused (#280),
 and none outside it, and redirects a path that passes through its root
 before a ``..``; an export command sees only its tree, without a network
-when asked. The module skips with the
+when asked, and a REMOTE validation command the engine launches sees only
+its export, where ``make`` builds (#241). The module skips with the
 probe's reason on a host that cannot enforce a launch, as
 ``test_sandbox_bwrap.py`` does.
 """
@@ -1249,6 +1250,89 @@ def test_a_required_premerge_command_runs_in_the_export_alone(
     assert request["metadata"]["sandbox_mode"] == "required"
     assert execution["sandbox"]["enforced"] is True
     assert execution["sandbox"]["network"] == "isolated"
+
+
+def test_a_required_remote_validation_runs_in_the_export_alone(backend, tmp_path):
+    """#241: ``validate_remote_candidate`` routes ``validation.commands`` through
+    the backend under ``required``. Its record says ``enforced: true``, and the
+    command sees the export command's boundary (ADR 0005 D3.1): the candidate's
+    tree, writable and without a git dir, and neither the controller's
+    checkout, its object store nor its state. The control run, under
+    ``disabled``, sees all three, so the probe can tell."""
+    from .test_validation_evidence import PROVENANCE, remote_engine
+
+    base = Path(os.path.realpath(tmp_path))
+    repo, state = base / "repo", base / "state"  # where remote_engine puts them
+    code = (
+        _PROBE
+        + "report = {\n"
+        + "  'tree': open('app.txt').read(),\n"
+        + "  'export': attempt(lambda: write('out.txt')),\n"
+        + "  'git': os.path.lexists('.git'),\n"
+        + f"  'checkout': attempt(lambda: read({str(repo / 'app.txt')!r})),\n"
+        + f"  'objects': attempt(lambda: os.listdir({str(repo / '.git' / 'objects')!r})),\n"
+        + f"  'state': os.path.lexists({str(state)!r}),\n"
+        + "}\n"
+        + "print(json.dumps(report, sort_keys=True))\n"
+    )
+    eng, commit = remote_engine(base, [[PY, "-c", code]])
+    assert eng.paths.state_dir == state and Path(eng.workdir) == repo
+
+    def validated(mode: str) -> tuple[dict, dict]:
+        eng.config.sandbox.mode = mode
+        run = eng.validate_remote_candidate(commit, PROVENANCE)
+        assert run.passed, run.records
+        (record,) = run.records
+        return record, json.loads(record["output"]["stdout_tail"])
+
+    control, seen = validated("disabled")
+    assert control["enforcement"]["enforced"] is False
+    assert (seen["checkout"], seen["objects"], seen["state"]) == ("ok", "ok", True)
+
+    record, seen = validated("required")
+    assert seen == {
+        "tree": "pristine\n",
+        "export": "ok",
+        "git": False,
+        "checkout": "ENOENT",
+        "objects": "ENOENT",
+        "state": False,
+    }
+    assert record["enforcement"]["enforced"] is True
+    assert record["enforcement"]["backend"] == sandbox_bwrap.BACKEND
+    assert record["enforcement"]["backend_version"] == backend
+    assert record["enforcement"]["network"] == "host"
+    assert record["policy"]["mode"] == "required" != control["policy"]["mode"]
+    assert [r["seq"] for r in eng.state.validation_records] == [control["seq"], record["seq"]]
+    step = eng.paths.logs_dir / record["run_log"]
+    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
+    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
+    assert request["metadata"]["sandbox_mode"] == "required"
+    assert execution["sandbox"]["enforced"] is True
+
+
+@pytest.mark.skipif(not os.access("/usr/bin/make", os.X_OK), reason="no /usr/bin/make on this host")
+def test_a_required_remote_validation_runs_an_ordinary_toolchain_step(backend, tmp_path):
+    """#241 (EPIC #158 Wave 2A, "can run tests and builds"): a validation command
+    that is a real build tool, ``make`` on the candidate's own Makefile, runs
+    inside the backend, builds in the export and passes on its exit status. A
+    target that fails is a ``FAIL`` with make's own exit code, and ends the set."""
+    from .test_validation_evidence import PROVENANCE, remote_engine
+
+    makefile = "check:\n\techo built > built.txt && grep -qx built built.txt\nbroken:\n\tfalse\n"
+    eng, commit = remote_engine(
+        Path(os.path.realpath(tmp_path)),
+        [["make", "check"], ["make", "broken"], ["make", "check"]],
+        Makefile=makefile,
+    )
+    eng.config.sandbox.mode = "required"
+    run = eng.validate_remote_candidate(commit, PROVENANCE)
+    built, broken = run.records
+    assert (built["outcome"], built["exit_code"]) == ("PASS", 0), built["output"]
+    assert "echo built > built.txt" in built["output"]["stdout_tail"]
+    assert (broken["outcome"], broken["exit_code"]) == ("FAIL", 2), broken["output"]
+    assert all(r["enforcement"]["enforced"] for r in run.records)
+    assert not run.passed
 
 
 def test_an_all_pi_run_is_sandboxed_in_every_child(
