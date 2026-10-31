@@ -31,11 +31,16 @@ OPENCODE_SERVER_PASSWORD
 Authorization: Bearer ... / Token ... / Basic ...
 ```
 
-and the well-known token shapes on their own (`ghp_*` and the other classic
-GitHub prefixes, `github_pat_*`, `sk-*`, `sk-ant-*`, Google API keys
-`AIza...`, three-segment `eyJ...` JWTs) and the whole userinfo of a URL
+the value of any upper-case name that ends in `_API_KEY`, `_TOKEN`,
+`_SECRET` or `_PASSWORD` behind a prefix (`GEMINI_API_KEY`,
+`DEEPSEEK_API_KEY`), the well-known token shapes on their own (`ghp_*` and
+the other classic GitHub prefixes, `github_pat_*`, `sk-*`, `sk-ant-*`,
+Google API keys `AIza...`, three-segment `eyJ...` JWTs, AWS access key ids
+`AKIA...` / `ASIA...`, `glpat-*`, `gsk_*`, `xai-*`, `npm_*`, `hf_*`), a
+private-key block whole, and the whole userinfo of a URL
 (`https://x-access-token:...@github.com/...`), each where it starts a token
-([below](#where-a-recognised-credential-starts-284)).
+([below](#where-a-recognised-credential-starts-284); the shapes #285 added
+are [further below](#the-remaining-credential-shapes-285)).
 
 Redaction is defense in depth; do not claim it detects every possible secret.
 
@@ -63,9 +68,10 @@ shape, which a quote starts, needs none). A credential starts:
 - at the start of the text;
 - after any character that cannot be part of it: anything but an ASCII
   letter, a digit or `_`. A JWT and a Google API key exclude `-` as well,
-  which base64url admits; the OAuth assignment names (`refresh_token=`,
-  `id_token:`) do not exclude `_`, so a prefixed `oauth_refresh_token=` is
-  caught;
+  which base64url admits, and so do a GitLab token and an xAI key (#285);
+  the OAuth assignment names (`refresh_token=`, `id_token:`) do not exclude
+  `_`, so a prefixed `oauth_refresh_token=` is caught; a private-key block
+  excludes only `-`, since no identifier holds one (#285);
 - directly after an escape sequence: an ANSI / VT sequence (a CSI, after
   `ESC[` or the C1 byte, or a two-character escape such as `ESC(B`), its
   ESC also as JSON, C, a shell and caret notation write it (`\u001b[0m`,
@@ -88,11 +94,13 @@ What changed against `\b`, beyond the escapes, each pinned in
   redacting.
 
 Unchanged: a shape right after an ASCII letter, a digit or `_` is still no
-token (`xghp_...`, `MY_GITHUB_TOKEN=`), nor is one after an escape that
-more of an identifier follows (`ESC[0mxghp_...`). A known name behind a
-prefix (`GEMINI_API_KEY=`) is #285's to recognise; a new pattern is built
+token (`xghp_...`, `my_GITHUB_TOKEN=`), nor is one after an escape that
+more of an identifier follows (`ESC[0mxghp_...`). A name behind a prefix
+(`GEMINI_API_KEY=`, `MY_GITHUB_TOKEN=`) is recognised since #285 when it is
+upper case and ends in a credential suffix
+([below](#the-remaining-credential-shapes-285)). A new pattern is built
 with `_token`, never on `\b`, as the Google API key class
-([below](#google-api-keys-282)) is.
+([below](#google-api-keys-282)) and the classes #285 added are.
 
 A pattern that starts a token runs as two passes, the second, which takes
 the escape in and puts it back, only at an ESC, a backslash, a caret or the
@@ -129,8 +137,117 @@ Like every class it reaches each redacting sink (the run log, its
 checks refuse a text carrying one by name, never rewriting it. The body is
 fixed, so the pattern stays linear, and a key shrinks under redaction (39
 characters to the 14 of the marker), so `MAX_GROWTH_FACTOR` is unchanged.
-Not recognised still: a value of no known shape under a prefixed name
-(`GEMINI_API_KEY=<anything else>`) and the other shapes #285 lists.
+A value of no known shape under a prefixed name
+(`GEMINI_API_KEY=<anything else>`) is recognised by the name since #285
+([below](#the-remaining-credential-shapes-285)); a Google key under one is
+still reported as `google-api-key`, the shape running first.
+
+## The remaining credential shapes (#285)
+
+The #257 audit (finding M4) listed the shapes no pattern knew after #282:
+AWS access key ids, private-key blocks, GitLab, Groq, xAI, npm and Hugging
+Face tokens, and a value of no known shape under a prefixed name such as
+`GEMINI_API_KEY` or `DEEPSEEK_API_KEY`, which an OpenCode launch inherits
+and an agent printing its environment prints. Any of them reached a run log
+in the clear and passed the published-content checks. Each is now a class
+of `redaction.py`, so it reaches every redacting sink (the run log, its
+`stdout.log` and `stderr.log`, state, the CLI's output) and
+`credential_classes`, whose published-content, payload and commit-message
+checks refuse it by name, never rewriting it.
+
+| Class | What it recognises |
+|---|---|
+| `private-key` | a PEM block whose label names a private key, replaced whole |
+| `gitlab-pat` | `glpat-` and at least 20 characters of `[A-Za-z0-9_-]` |
+| `aws-access-key-id` | `AKIA` or `ASIA` and 16 characters of `[A-Z0-9]`, the whole token |
+| `groq-api-key` | `gsk_` and at least 20 characters of `[A-Za-z0-9]` |
+| `xai-api-key` | `xai-` and at least 20 characters of `[A-Za-z0-9_]` |
+| `npm-token` | `npm_` and at least 20 characters of `[A-Za-z0-9]` |
+| `huggingface-token` | `hf_` and at least 20 characters of `[A-Za-z0-9]` |
+| `credential-suffix-assignment` | an upper-case name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a prefix, with any value |
+
+**The token shapes** are case-sensitive. A floor of 20 characters is below
+the length of every real token of each kind (52 for Groq, 80 for xAI, 36
+for npm, 34 for Hugging Face, 20 for GitLab's), so a token cut short is
+still taken. The short prefixes' alphabets have no `_` (xAI's excepted), so
+the snake_case names npm and Hugging Face tools print (`npm_config_registry`,
+`npm_lifecycle_event`, `hf_hub_download`) are none. An AWS key id is the
+whole 20-character token: a run that goes on is none, nor is an IAM unique
+id (`AIDA...`), and the secret key that goes with an id has no shape of its
+own (`AWS_SECRET_ACCESS_KEY` names it). The GitLab and xAI shapes take `-`
+as a token character before them, so a kebab-case word holding `-glpat-` or
+`-xai-` is none. Order matters where `-` is in an alphabet: the GitLab
+token runs right after the Google key, before the GitHub, `sk-`, AWS and
+prefixed shapes, any of which could start after a `-` inside it and leave
+its head in the clear; the shapes without a `-` run after the `sk-` keys
+for the same reason, so an `sk-` key whose tail reads like one stays an
+`openai-key`.
+
+**A private-key block** is a `-----BEGIN <label>-----` line, the key's body
+and an `-----END <label>-----` line, as PEM (RFC 7468) writes one and
+OpenSSH and OpenPGP armour borrow. The label names a private key: up to
+three upper-case words before `PRIVATE KEY` (`RSA`, `EC`, `DSA`, `OPENSSH`,
+`ENCRYPTED`, `SSH2 ENCRYPTED`) or none, or OpenPGP's `PGP PRIVATE KEY
+BLOCK`; a public key, a certificate and a label in lower case are left. The
+block is replaced whole, its BEGIN and END lines with it, whatever stands
+between them (RFC 1421's `Proc-Type:` and `DEK-Info:` headers, OpenPGP's
+`Version:` and `Comment:`, a log line's prefix, line breaks written out in
+JSON), so a key in a JSON key file keeps the JSON around it intact. It
+needs key material, 16 base64 characters in a row: a BEGIN line alone, one
+quoted by code (`startswith("-----BEGIN ...")`) or prose, an empty block and
+a placeholder (`...`) are no credential, so text about the format can be
+published. It starts anywhere but after a dash, a letter included (no
+identifier holds a BEGIN line), and it runs first, before every other
+pattern: a named assignment's value stops at the space in the BEGIN line
+(`DEPLOY_SECRET="-----BEGIN RSA`), which would leave the label and the key
+behind it unrecognised.
+
+A block with no END line before the next run of five dashes (the first
+lines of a key file, a capture whose bound cut the key) loses its BEGIN line
+and the body after it: runs of base64 parted by spaces, line breaks (also
+written out behind up to seven backslashes, as JSON and JSON in JSON write
+them) and its headers' colons, commas and single dashes. The line break
+after the last run is kept, so escaped JSON still decodes and the escape a
+next BEGIN line stands after is not taken. That body runs on to the first
+character no key body holds, so a line of words right after a cut key (an
+`Error: ...` line) goes with it: the rule errs on redacting. A capture that
+kept both ends of a key, the omission marker between them, is one block.
+Not recognised: the end of a key whose BEGIN line is not in the text (a
+capture that kept only the key's tail, `tail` of a key file).
+
+**A prefixed credential name** (`credential-suffix-assignment`) is an
+upper-case name, letters, digits and `_`, starting with a letter and ending
+in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` after a prefix
+(`GEMINI_API_KEY`, `MY_GITHUB_TOKEN`, `CI_JOB_TOKEN`, `DB_PASSWORD`). Its
+value is taken as a well-known name's is (`env-assignment`): any value,
+quoted or not, behind an escaped quote, under a quoted key, on the next
+line, and directly after an escape. The rule is case-sensitive: an
+environment variable's name is upper case, and a lower-case `api_token` or
+`page_token` is as often a code identifier (`def f(api_token: str)`) as a
+credential, which would make review findings that quote code
+unpublishable. It runs after every token shape, so a value one of them
+knows is reported by that shape's class (`GEMINI_API_KEY=AIza...` stays
+`google-api-key`, `NPM_TOKEN=npm_...` `npm-token`), and a well-known name is
+still `env-assignment`'s. Not recognised: a prefixed name in lower or mixed
+case (`client_secret=`, which `secret-assignment` does not take either:
+`_` before its name is a token character), a suffix the rule does not take
+(`SSH_KEY`, `*_CREDENTIALS`), and, as for every name, a structure's key and
+value that `redact_obj` redacts apart (`{"GEMINI_API_KEY": "..."}` as a
+mapping, not as text).
+
+`MAX_GROWTH_FACTOR` is unchanged. The shortest recognised name is now a
+one-letter prefix and a suffix: `A_TOKEN=x`, 9 to 22 characters (2.44),
+below the URL shape's 2.86; every token shape is longer than the marker and
+only shrinks, a private-key block (43 characters or more) included, and
+what a block holds between its BEGIN and END lines can take a marker only
+whole, as the named values do. Every pattern stays linear: a token shape
+scans one run of its alphabet, the name rule one identifier and its value,
+and a private-key candidate scans to the next run of five dashes, where the
+next candidate starts, at most three times (its key-material lookahead
+steps over a run shorter than 16 whole). `tests/test_redaction.py` pins
+each shape, its near-misses, the order, the growth units and the linear
+bounds, and `test_result_parser.py`, `test_runlog.py`, `test_engine.py` and
+`test_cli.py` each class in every check and sink.
 
 ## Escaped text: redact the structure first (#281)
 
@@ -200,9 +317,11 @@ That quote exposed two gaps in the named patterns. Both are closed in
   quote after the name, escaped as `_QUOTE` takes one, and keep it with
   the separator. The header's value keeps an escaped closing quote whole,
   as an assignment's does. The OAuth names already had `oauth-field` for
-  this shape. Unchanged: a prefixed name (`"MY_GITHUB_TOKEN"`) is still
-  #285's, an empty value is left, and `redact_obj`, which redacts a key and
-  its value apart, still recognises only the OAuth keys by name.
+  this shape. Unchanged: an empty value is left, and `redact_obj`, which
+  redacts a key and its value apart, still recognises only the OAuth keys
+  by name. A prefixed upper-case name (`"MY_GITHUB_TOKEN"`) is recognised
+  under a quoted key too since #285
+  ([above](#the-remaining-credential-shapes-285)).
 - **A code fence on a later line is never a value.** The space after an
   assignment's separator may cross a line break, so that a YAML value on
   the next line is still caught. A prompt quotes untrusted text in a fence,

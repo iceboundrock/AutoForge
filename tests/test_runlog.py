@@ -14,7 +14,7 @@ from autoforge.errors import StateError
 from autoforge.providers import _OPENCODE_ERROR_LINE_RE, _OPENCODE_TOOL_FAILED_LINE_RE
 from autoforge.runlog import ExecutionRecord, RunLogger, validate_run_id
 from autoforge.sandbox import SandboxFacts
-from tests.conftest import GOOGLE_API_KEY, GOOGLE_KEY_BODY
+from tests.conftest import GOOGLE_API_KEY, GOOGLE_KEY_BODY, PRIVATE_KEY, SHAPES_285
 
 
 def test_runlog_layout_and_redaction(tmp_path):
@@ -1197,6 +1197,51 @@ def test_a_google_api_key_an_opencode_agent_prints_never_reaches_the_logs(tmp_pa
     result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
     assert result["message"] == "the run needs GEMINI_API_KEY, set to ***REDACTED***"
     assert result["tests"] == ["curl 'https://example.test/v1?key=***REDACTED***': 403"]
+
+
+def test_a_285_credential_an_agent_prints_never_reaches_the_logs(tmp_path):
+    """#285: an AWS access key id, a private-key block, a GitLab, Groq, xAI,
+    npm or Hugging Face token, and a value under a prefixed credential name
+    (``GEMINI_API_KEY``, an OpenCode launch's) were no recognised shape, so an
+    agent that printed one saved it to ``stdout.log`` and ``stderr.log`` in
+    the clear, and a result or a command line quoting one to the step's
+    records. Each is redacted in every file, after OpenCode's ANSI escapes as
+    well, and the escapes are kept."""
+    texts = [text for _, text, _ in SHAPES_285]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", *(f"--key={text}" for text in texts)],
+            error="agent exited 1: " + " ".join(texts),
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": "the run needs " + " and ".join(texts),
+                "tests": [f"deploy with {PRIVATE_KEY}"],
+            },
+        ),
+        prompt="p",
+        stdout="".join(f"{text}\n" for text in texts),
+        stderr="".join(f"\x1b[91m\x1b[1mError: \x1b[0m{text}\n" for text in texts),
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"stdout.log", "stderr.log", "control-result.json"}
+    for path in files:
+        content = path.read_text(encoding="utf-8")
+        for _, _, body in SHAPES_285:
+            assert body not in content, (path, body)
+    assert (step / "stdout.log").read_text(encoding="utf-8") == (
+        "***REDACTED***\n" * 7 + "DEEPSEEK_API_KEY=***REDACTED***\n"
+    )
+    assert (step / "stderr.log").read_text(encoding="utf-8") == "".join(
+        f"\x1b[91m\x1b[1mError: \x1b[0m{text}\n"
+        for text in ["***REDACTED***"] * 7 + ["DEEPSEEK_API_KEY=***REDACTED***"]
+    )
 
 
 def test_an_oauth_credential_field_in_a_parsed_result_is_still_redacted(tmp_path):

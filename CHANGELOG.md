@@ -5,6 +5,34 @@ so.
 
 ## Unreleased
 
+### More credential shapes are redacted and refused (#285)
+
+- AWS access key ids (`AKIA...`, `ASIA...`), private-key blocks, GitLab
+  (`glpat-`), Groq (`gsk_`), xAI (`xai-`), npm (`npm_`) and Hugging Face
+  (`hf_`) tokens are recognised by their shape, and any value assigned to
+  an upper-case name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or
+  `_PASSWORD` behind a prefix (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`,
+  `DB_PASSWORD`) by its name. Each is redacted in every run log
+  (`stdout.log` and `stderr.log` included), in state and in the CLI's
+  output, and published agent text or a commit message carrying one is
+  refused under its class (`aws-access-key-id`, `private-key`,
+  `gitlab-pat`, `groq-api-key`, `xai-api-key`, `npm-token`,
+  `huggingface-token`, `credential-suffix-assignment`). Before, an agent
+  that printed one saved it in the clear, and agent text carrying one could
+  be published under your identity
+  ([Secrets and logging](docs/agent-guides/secrets-and-logging.md#the-remaining-credential-shapes-285)).
+- A private-key block is replaced whole, its BEGIN and END lines with it.
+  One whose END line is missing (a capture cut inside the key) loses its
+  BEGIN line and the body after it, and may take a line of words that
+  follows the body. A BEGIN line with no key material after it, a public
+  key and a certificate are left, so text about the format stays
+  publishable.
+- **Behaviour change:** agent text that assigns a value to such a name
+  (`MY_SERVICE_TOKEN=...`) is now refused where it was published before.
+  The name rule is case-sensitive, so a lower-case `api_token=` in quoted
+  code is still accepted. A value of a known shape under such a name is
+  reported by the shape's class, as before.
+
 ### A sequential run's next issue must be a sub-issue of the EPIC (#287)
 
 **Behaviour change:** `UPDATE_EPIC` switches only to a native sub-issue of

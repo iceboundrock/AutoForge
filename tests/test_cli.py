@@ -32,6 +32,7 @@ from tests.conftest import (
     ISSUE,
     PR,
     SHA_A,
+    SHAPES_285,
     UNLOADABLE_STATES,
     FakeGitHub,
     Origin,
@@ -655,6 +656,47 @@ def test_cli_output_redacts_a_google_api_key(tmp_path, capsys, monkeypatch, fake
     printed_text = capsys.readouterr().out
     assert GOOGLE_KEY_BODY not in printed_text
     assert json.loads(printed_text)["block_reason"] == "agent said: GEMINI_API_KEY=***REDACTED***"
+
+
+def test_cli_output_redacts_every_285_shape(tmp_path, capsys, monkeypatch, fakes):
+    """#285: each shape #285 adds, in an agent's result, in the step
+    outcome's message and in a block reason that state holds, is printed
+    redacted by the step-outcome lines and by ``status`` and
+    ``status --json``."""
+    quoted = " ".join(text for _, text, _ in SHAPES_285)
+    result = {
+        "phase": "ANALYZE_EXECUTE",
+        "status": "blocked",
+        "message": f"{quoted} is refused",
+        "tests": [text for _, text, _ in SHAPES_285],
+    }
+    outcome = StepOutcome(
+        "run-285", "ANALYZE_EXECUTE", "BLOCKED", False, result=result, message=quoted
+    )
+    cli.print_step_outcome(outcome)
+    printed = [capsys.readouterr().out]
+
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main(argv) == 0
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    data = json.loads(state_file.read_text())
+    data["phase"] = "BLOCKED"
+    data["block_reason"] = f"agent said: {quoted}"
+    state_file.write_text(json.dumps(data))
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    printed.append(capsys.readouterr().out)
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    printed.append(capsys.readouterr().out)
+    for out in printed:
+        assert "***REDACTED***" in out
+        for _, _, body in SHAPES_285:
+            assert body not in out
+    reason = json.loads(printed[-1])["block_reason"]
+    assert reason.startswith("agent said: ***REDACTED*** ")
+    assert reason.endswith(" DEEPSEEK_API_KEY=***REDACTED***")
 
 
 def test_status_and_dry_run_redact_the_replan_escalation_before_serializing_it(

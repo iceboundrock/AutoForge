@@ -85,6 +85,42 @@ BRANCH = "autoforge/2-feature"
 # refused.
 GOOGLE_KEY_BODY = "SyFAKE-dummy_" + "0" * 22
 GOOGLE_API_KEY = "AIza" + GOOGLE_KEY_BODY
+# Dummies of the shapes #285 adds, each at its real length and built in
+# pieces as the Google key is; each ``*_BODY`` is what must not appear where
+# its credential was redacted or refused.
+AWS_KEY_BODY = "FAKE0DUMMY000000"
+AWS_ACCESS_KEY_ID = "AKI" + "A" + AWS_KEY_BODY
+GROQ_KEY_BODY = "FAKEdummy" + "0" * 43
+GROQ_API_KEY = "gs" + "k_" + GROQ_KEY_BODY
+XAI_KEY_BODY = "FAKE_dummy" + "0" * 70
+XAI_API_KEY = "xa" + "i-" + XAI_KEY_BODY
+NPM_TOKEN_BODY = "FAKEdummy" + "0" * 27
+NPM_TOKEN = "np" + "m_" + NPM_TOKEN_BODY
+GITLAB_PAT_BODY = "FAKE-dummy_" + "0" * 9
+GITLAB_PAT = "gl" + "pat-" + GITLAB_PAT_BODY
+HF_TOKEN_BODY = "FAKEdummy" + "x" * 25
+HUGGINGFACE_TOKEN = "h" + "f_" + HF_TOKEN_BODY
+# A dummy RSA private key in PEM: two 64-character base64 lines and a short
+# last one. It decodes to no key.
+PRIVATE_KEY_BODY = "MIIEFAKEdummy0private0key0body0" + "A" * 33
+PEM_BEGIN = "-----BEGIN" + " RSA PRIVATE KEY-----"
+PEM_END = "-----END" + " RSA PRIVATE KEY-----"
+PRIVATE_KEY = f"{PEM_BEGIN}\n{PRIVATE_KEY_BODY}\n{PRIVATE_KEY_BODY}\nFAKE+/==\n{PEM_END}"
+# A value of no known shape under a prefixed name (#285).
+SUFFIX_SECRET = "FAKE0opaque0value"
+SUFFIX_ASSIGNMENT = f"DEEPSEEK_API_KEY={SUFFIX_SECRET}"
+# Every #285 dummy: the class ``credential_classes`` names it under, the
+# text, and what must not appear once it is redacted or refused.
+SHAPES_285 = [
+    ("private-key", PRIVATE_KEY, PRIVATE_KEY_BODY),
+    ("gitlab-pat", GITLAB_PAT, GITLAB_PAT_BODY),
+    ("aws-access-key-id", AWS_ACCESS_KEY_ID, AWS_KEY_BODY),
+    ("groq-api-key", GROQ_API_KEY, GROQ_KEY_BODY),
+    ("xai-api-key", XAI_API_KEY, XAI_KEY_BODY),
+    ("npm-token", NPM_TOKEN, NPM_TOKEN_BODY),
+    ("huggingface-token", HUGGINGFACE_TOKEN, HF_TOKEN_BODY),
+    ("credential-suffix-assignment", SUFFIX_ASSIGNMENT, SUFFIX_SECRET),
+]
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)
 # and the base branch's `push` run at its tip (the reference definition).

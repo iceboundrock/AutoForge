@@ -75,6 +75,7 @@ from autoforge.validation import parse_pr_url
 from tests.conftest import (
     ACCEPTANCE_RATIONALE,
     ACCEPTANCE_TEXT,
+    AWS_ACCESS_KEY_ID,
     BASE_RUN_ID,
     BRANCH,
     CHECKS_REFUSAL,
@@ -93,9 +94,12 @@ from tests.conftest import (
     MERGE_BASE_B,
     NO_CHANGE_RATIONALE,
     PR,
+    PRIVATE_KEY,
     SHA_A,
     SHA_B,
     SHA_C,
+    SHAPES_285,
+    SUFFIX_ASSIGNMENT,
     FakeGitHub,
     acceptance,
     analyze_payload,
@@ -540,6 +544,28 @@ _FAKE_TOKEN = "gh" + "p_" + "FAKE0000000000000000000000000000000000"
             _reports_head,
             "credential-shaped string (pattern class: google-api-key)",
             id="body-carries-a-google-api-key",
+        ),
+        pytest.param(
+            lambda req: (
+                implement(req) if commit_in(req.cwd, f"Add the deploy key\n\n{PRIVATE_KEY}") else ""
+            ),
+            _from_start,
+            "commit message contains a credential-shaped string (pattern class: private-key)",
+            id="commit-carries-a-private-key",
+        ),
+        pytest.param(
+            lambda req: (
+                implement(req) if commit_in(req.cwd, f"Sign with {AWS_ACCESS_KEY_ID}") else ""
+            ),
+            _from_start,
+            "commit message contains a credential-shaped string (pattern class: aws-access-key-id)",
+            id="commit-carries-an-aws-access-key-id",
+        ),
+        pytest.param(
+            lambda req: implement(req, pr_body=f"Adds it.\n\nRun with {SUFFIX_ASSIGNMENT}"),
+            _reports_head,
+            "credential-shaped string (pattern class: credential-suffix-assignment)",
+            id="body-carries-a-prefixed-credential-name",
         ),
         pytest.param(
             lambda req: implement(req, pr_body="Adds it. Fixes #2"),
@@ -7560,6 +7586,39 @@ def test_a_google_api_key_an_agent_prints_never_reaches_state_or_the_logs(
     assert {"stdout.log", "stderr.log"} <= {path.name for path in logs}
     for path in logs:
         assert GOOGLE_KEY_BODY not in path.read_text(), path
+    assert fake_github.effect_writes == []
+
+
+def test_a_285_credential_an_agent_prints_never_reaches_state_or_the_logs(
+    tmp_state_dir, fake_github
+):
+    """#285: an AWS access key id, a private key, a GitLab, Groq, xAI, npm or
+    Hugging Face token, or a value under a prefixed credential name, that an
+    agent printed and quoted when it blocked, reached ``stdout.log``,
+    ``stderr.log``, the block reason in ``state.json`` and the step outcome
+    in the clear; each is redacted at every sink, and nothing is written to
+    GitHub."""
+    one_line = [text for name, text, _ in SHAPES_285 if name != "private-key"]
+    message = "refused: " + " ".join(one_line)
+    payload = {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": message}
+    env_dump = "".join(f"VALUE_{i}={text}\n" for i, text in enumerate(one_line))
+    reply = env_dump + PRIVATE_KEY + "\n" + block(payload)
+    eng = make_engine(tmp_state_dir, [reply], github=fake_github, origin=True)
+    eng.provider.stderr = (
+        "".join(f"\x1b[91m\x1b[1mError: \x1b[0m{text}\n" for text in one_line) + PRIVATE_KEY
+    )
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.block_reason.startswith("refused: ***REDACTED*** ")
+    assert out.message == f"agent reported blocked: {s.block_reason}"
+    logs = [path for path in (eng.paths.logs_dir / s.run_id).rglob("*") if path.is_file()]
+    assert {"stdout.log", "stderr.log"} <= {path.name for path in logs}
+    texts = [eng.paths.state_file.read_text(), out.message, *(path.read_text() for path in logs)]
+    for _, _, body in SHAPES_285:
+        for text in texts:
+            assert body not in text
     assert fake_github.effect_writes == []
 
 
