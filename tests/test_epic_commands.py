@@ -16,6 +16,7 @@ import os
 import pickle
 import shlex
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from autoforge.errors import ExecutionError
 from autoforge.executor_supervised import spawn_supervised
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, write_binding
-from autoforge.scheduler import EpicScheduler
+from autoforge.scheduler import DEFAULT_WORKER_COMMAND, EpicScheduler
 from autoforge.scheduler_state import (
     ClaimClassification,
     ClaimKind,
@@ -1317,10 +1318,9 @@ def test_a_local_block_is_refused_by_every_epic_command_that_loads_the_configura
     """ADR 0009 D5 (#387): the ``epic`` commands load the configuration
     through the same strict check, so a ``local:`` block is an unknown
     top-level key there too: exit 2, nothing written under the coordination
-    root. ``epic stop`` and ``epic archive`` load it once they find a
-    scheduler record or a binding to compare, which the first pass leaves.
-    ``epic archive`` takes L0 first, which rewrites the lock file's holder
-    record (same bytes, a new modification time) and nothing else."""
+    root, the lock file included. ``epic stop`` loads it once it finds a
+    scheduler record to compare, which the first pass leaves; ``epic
+    archive`` before it takes L0 (see the next test)."""
     e = epic()
     b = e.b
     b.issue(2)
@@ -1342,12 +1342,45 @@ def test_a_local_block_is_refused_by_every_epic_command_that_loads_the_configura
         code, out, err = e.cli("epic", *words)
         assert code == 2 and refusal in err and out == "", words
         assert "LOCAL" not in err and "removed" not in err, words
-        after = state_tree(b.root)
-        if words[0] == "archive":
-            lock = str(Path("autoforge") / "controller.lock")
-            assert after[lock][:2] == before[lock][:2] and after[lock][3] == before[lock][3]
-            after[lock] = before[lock]
-        assert after == before, words
+        assert state_tree(b.root) == before, words
+
+
+@pytest.mark.parametrize("first_pass", [False, True], ids=["fresh", "after-a-pass"])
+def test_epic_archive_refuses_a_local_block_before_it_takes_the_repository_lock(epic, first_pass):
+    """ADR 0009 D5 (#387): ``epic archive`` loads the configuration before
+    it takes L0, since taking L0 truncates and rewrites the lock file's
+    holder record, whose bytes are another process's PID. In this process
+    and in a CLI process of its own, a ``local:`` block is refused (exit 2)
+    with the whole checkout, its git directory included, as it was: on a
+    fresh checkout no lock file is made, and after a pass with a bound
+    namespace the lock file keeps its bytes, inode and modification time."""
+    e = epic()
+    b = e.b
+    b.issue(2)
+    if first_pass:
+        assert e.run()[0] == 0 and b.admitted() == [2], e.said
+    lock = b.root / "autoforge" / "controller.lock"
+    assert lock.exists() is first_pass
+    b.config_path.write_text(json.dumps({"local": {"max_fix_rounds": 1}}), encoding="utf-8")
+    refusal = f"{b.config_path}: unknown key(s) under 'the top level': local (known: version, "
+    words = ("--config", str(b.config_path), "epic", "archive", EPIC, "2")
+    before = state_tree(b.repo)
+
+    code, out, err = e.cli(*words[2:])
+    assert code == 2 and refusal in err and out == "", err
+    assert state_tree(b.repo) == before
+
+    done = subprocess.run(
+        [*DEFAULT_WORKER_COMMAND, *words],
+        cwd=b.repo,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 2 and refusal in done.stderr and done.stdout == "", done.stderr
+    assert state_tree(b.repo) == before
+    assert lock.exists() is first_pass
 
 
 # -- structure ---------------------------------------------------------------------------

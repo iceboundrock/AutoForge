@@ -1765,10 +1765,11 @@ def cmd_epic_status(args) -> int:
 
 
 def _epic_repository_id(args) -> Callable[[str], int]:
-    """GitHub's numeric id of a repository, as ``epic stop`` and ``epic archive`` read it.
+    """GitHub's numeric id of a repository, as ``epic stop`` reads it.
 
-    Called once a ``scheduler.json`` or a binding is found to compare with,
-    so the configuration is loaded then.
+    Called once a ``scheduler.json`` is found to compare with, so the
+    configuration is loaded then; ``epic stop`` writes nothing before.
+    ``epic archive`` loads it before it takes L0 (:func:`cmd_epic_archive`).
     """
 
     def read(repository: str) -> int:
@@ -1790,12 +1791,22 @@ def cmd_epic_stop(args) -> int:
 
 
 def cmd_epic_archive(args) -> int:
-    """``epic archive``: under L0 (a held one is exit 2); GitHub is read for the binding's id."""
+    """``epic archive``: under L0 (a held one is exit 2); GitHub is read for the binding's id.
+
+    The configuration is loaded before L0 is taken, since taking it writes
+    the lock file's holder record: a refused configuration leaves the lock
+    file as it was, or absent. GitHub is still read only once a binding is
+    found to compare with.
+    """
     epic = parse_issue_url(args.epic)
+    cfg = _load_cfg(args)
     lock_path = repository_lock_path(os.getcwd())
     with ControllerLock(lock_path):
         report = archive_issue(
-            lock_path.parent.parent, epic.canonical, args.issue, _epic_repository_id(args)
+            lock_path.parent.parent,
+            epic.canonical,
+            args.issue,
+            lambda repository: _epic_graph(cfg).get_repository_id(repository),
         )
     for line in report.lines():
         print(line)

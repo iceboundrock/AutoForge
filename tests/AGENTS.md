@@ -274,7 +274,8 @@ LOCAL's ways in, closed (ADR 0009     test_cli.py (autoforge local, --help, a lo
 S2, #387)                             a LOCAL state under every label, no read of
                                       <git dir>/autoforge/state), test_config.py (the key),
                                       test_state.py, test_local.py (the loader),
-                                      test_ownership.py, test_epic_commands.py (the scheduler)
+                                      test_ownership.py, test_epic_commands.py (the scheduler,
+                                      the epic commands' refusal of the key)
 scheduler namespaces (#178)           test_run_namespace.py (RunKey, layout, binding, lookup,
                                       listing, archive, engine binding); the standalone
                                       state-dir refusal: test_cli.py

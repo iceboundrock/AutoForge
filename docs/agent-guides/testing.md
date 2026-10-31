@@ -387,9 +387,11 @@ High-priority coverage includes:
   reads, writes and locks nothing, also during a scheduler pass, which
   runs on, and `--help` lists no `local`; a `local:` key of any shape is
   the loader's unknown top-level key for every command that loads the
-  configuration, the `epic` commands included, with no GitHub or provider
-  call and nothing written (`doctor` fails its `config` row, skips its
-  state-directory probe, so an absent directory stays absent, and exits 1);
+  configuration, the `epic` commands included (`epic archive` before it
+  takes the repository lock, in a process of its own too), with no GitHub
+  or provider call and nothing written (`doctor` fails its `config` row,
+  skips its state-directory probe, so an absent directory stays absent,
+  and exits 1);
   a `mode: "LOCAL"` state is the loader's unknown mode under every label
   (1 to 12, 13 and none), as LOCAL saved it and with garbage beside it,
   and `status`, `status --json`, `step`, `resume` and `unblock` exit 2
