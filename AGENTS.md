@@ -214,6 +214,9 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        the controller selects FULL, the coverage mapping)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
+docs/getting-started.md                operator guide: a first run from nothing, step by step, and the
+                                       common first-run failures
+docs/clean-room.md                     the clean-room first-run procedure (Gates 1 and 2 of #255)
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
 docs/pi.md                             operator guide: Pi on a DeepSeek API key or a ChatGPT
                                        subscription, doctor's Pi rows, unattended use, the
@@ -233,6 +236,8 @@ docs/security.md                       operator guide: security boundaries, what
                                        does not protect, GitHub token permissions, recommended settings
 README.md                              operator-facing landing page: overview, key properties,
                                        install, quick start, maturity
+examples/                              starter configurations; tests load each one, and the
+                                       install smoke runs doctor and a dry run with each
 SECURITY.md                            security policy: supported versions, private reporting, scope
 ```
 

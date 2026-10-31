@@ -42,7 +42,16 @@ imports the ``autoforge`` of the source tree:
    call and fails it, which must render the ANALYZE_EXECUTE prompt through
    the installed engine, call no ``gh`` and leave the repository
    byte-identical.
-5. The SHA-256 of each artifact is printed, appended to the job summary
+5. The offline half of a stranger's first run (#259, docs/getting-started.md):
+   ``uv tool install`` of the wheel alone, into tool directories and a home
+   of their own; then, with no credential and no agent CLI on ``PATH``,
+   ``autoforge --version`` and ``--help``, and ``autoforge doctor --json``
+   in a repository whose ``origin`` is on GitHub, with the built-in
+   routing and with each starter configuration of ``examples/``: every row
+   that needs no credential is OK, the merge gate is closed, and the agent
+   rows name the CLIs the configuration routes to. A REMOTE dry run with
+   each starter, and the repository's ``git status`` stays empty.
+6. The SHA-256 of each artifact is printed, appended to the job summary
    (``$GITHUB_STEP_SUMMARY``) when that is set, and written to
    ``--sha256sums`` in ``sha256sum -c`` format when asked. When
    ``$GITHUB_OUTPUT`` is set, the version and those lines become the step's
@@ -106,6 +115,34 @@ _PLACEHOLDER = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
 # artifact and no installed package may carry one again.
 _LOCAL_TEMPLATE = re.compile(r"(?:^|/)autoforge/prompts/local_[^/]*\.md$")
 _CONTROL_RESULT = "<<<CONTROL_RESULT>>>"
+# The first run (#259, docs/getting-started.md). Its repository's origin is the
+# repository of the REMOTE URLs.
+FIRST_RUN_ORIGIN = "https://github.com/example/dist-check.git"
+# What the guide keeps out of git (docs/security.md).
+FIRST_RUN_EXCLUDES = (".autoforge/", "autoforge.yaml", "autoforge.local.*")
+# The starter configurations under examples/, each with the agent CLIs it
+# routes a profile to, and the CLIs of the built-in routing (no --config).
+STARTER_AGENTS = {
+    "starter-claude-only.yaml": frozenset({"claude"}),
+    "starter-two-providers.yaml": frozenset({"claude", "opencode"}),
+}
+BUILT_IN_AGENTS = frozenset({"claude", "opencode"})
+# The doctor rows that need no credential, no agent CLI and no network: OK on
+# a first run before anything is signed in.
+CREDENTIAL_FREE_ROWS = (
+    "config",
+    "merge gate",
+    "git available",
+    "cwd is a git repository",
+    "GitHub remote",
+    "launch environment",
+    "no credential reaches a launch",
+    "profile limits",
+    "loop detection",
+    "state dir writable",
+    "scheduler settings",
+)
+_AGENT_ROW = re.compile(r"agent '([^']+)' available \(.*\)")
 
 
 class CheckFailed(Exception):
@@ -170,16 +207,21 @@ def _check(condition: bool, message: str) -> None:
 
 
 def _run(
-    argv: list[str], *, cwd: Path, env: dict[str, str] | None = None, show: bool = False
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    show: bool = False,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one command; a non-zero exit fails the check with its output's tail."""
+    """Run one command; a non-zero exit fails the check with its output's tail (if ``check``)."""
     _say("$ " + shlex.join(argv))
     result = subprocess.run(
         argv, cwd=cwd, env=env, capture_output=True, text=True, check=False, timeout=900
     )
     if show and result.stdout.strip():
         print(result.stdout.rstrip(), flush=True)
-    if result.returncode != 0:
+    if check and result.returncode != 0:
         tail = "\n".join((result.stdout + result.stderr).splitlines()[-40:])
         raise CheckFailed(f"`{shlex.join(argv)}` exited {result.returncode}:\n{tail}")
     return result
@@ -515,6 +557,21 @@ def _tree(root: Path) -> dict[str, bytes | None]:
     }
 
 
+def _fake_gh(fake_bin: Path, calls: Path) -> None:
+    """A ``gh`` in ``fake_bin`` that records its arguments in ``calls`` and fails."""
+    fake_bin.mkdir()
+    fake = fake_bin / "gh"
+    fake.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {shlex.quote(str(calls))}\nexit 1\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+
+def _gh_calls(calls: Path) -> str:
+    return calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
 def remote_dry_run(autoforge: str, git: str, work: Path, env: dict[str, str]) -> None:
     """A REMOTE ``run --dry-run`` renders a prompt, calls no ``gh`` and writes nothing.
 
@@ -522,43 +579,139 @@ def remote_dry_run(autoforge: str, git: str, work: Path, env: dict[str, str]) ->
     repository: a dry run plans from in-memory state alone. The ``gh``
     first on ``PATH`` records its arguments and fails, so any call shows.
     """
-    fake_bin = work / "fake-gh-bin"
-    fake_bin.mkdir()
     calls = work / "gh-calls.log"
-    fake = fake_bin / "gh"
-    fake.write_text(
-        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {shlex.quote(str(calls))}\nexit 1\n',
-        encoding="utf-8",
-    )
-    fake.chmod(0o755)
-    remote_env = dict(env, PATH=f"{fake_bin}{os.pathsep}{env.get('PATH', '')}")
+    _fake_gh(work / "fake-gh-bin", calls)
+    remote_env = dict(env, PATH=f"{work / 'fake-gh-bin'}{os.pathsep}{env.get('PATH', '')}")
     repo = _scratch_repository(git, work / "remote-repo", remote_env)
-    before = _tree(repo)
-    plan = _run(
-        [
-            autoforge,
-            "run",
-            "--epic",
-            REMOTE_EPIC,
-            "--issue",
-            REMOTE_ISSUE,
-            "--dry-run",
-            "--full-prompt",
-        ],
-        cwd=repo,
-        env=remote_env,
-    ).stdout
-    for needle in ("Template: analyze_execute.md", "--- prompt preview ---", _CONTROL_RESULT):
-        _check(needle in plan, f"the REMOTE dry run printed no {needle!r}")
-    _check(not _PLACEHOLDER.search(plan), "the REMOTE dry run's prompt has an unrendered variable")
-    if calls.exists():
-        raise CheckFailed(f"the REMOTE dry run called gh: {calls.read_text(encoding='utf-8')!r}")
-    after = _tree(repo)
-    changed = sorted({path for path, _ in set(before.items()) ^ set(after.items())})
-    _check(not changed, f"the REMOTE dry run changed the scratch repository: {changed}")
+    _dry_run(autoforge, repo, remote_env, calls)
     _say(
         "ok: autoforge run --dry-run --full-prompt rendered the ANALYZE_EXECUTE prompt, no gh call"
     )
+
+
+def _dry_run(
+    autoforge: str, repo: Path, env: dict[str, str], calls: Path, options: tuple[str, ...] = ()
+) -> None:
+    """``run --dry-run --full-prompt`` in ``repo``: the prompt, no new ``gh`` call, no write."""
+    before, called = _tree(repo), _gh_calls(calls)
+    argv = [autoforge, *options, "run", "--epic", REMOTE_EPIC, "--issue", REMOTE_ISSUE]
+    plan = _run([*argv, "--dry-run", "--full-prompt"], cwd=repo, env=env).stdout
+    for needle in ("Template: analyze_execute.md", "--- prompt preview ---", _CONTROL_RESULT):
+        _check(needle in plan, f"the REMOTE dry run printed no {needle!r}")
+    _check(not _PLACEHOLDER.search(plan), "the REMOTE dry run's prompt has an unrendered variable")
+    if _gh_calls(calls) != called:
+        raise CheckFailed(f"the REMOTE dry run called gh: {_gh_calls(calls)[len(called) :]!r}")
+    after = _tree(repo)
+    changed = sorted({path for path, _ in set(before.items()) ^ set(after.items())})
+    _check(not changed, f"the REMOTE dry run changed the scratch repository: {changed}")
+
+
+def check_first_run_doctor(report: dict, agents: frozenset[str], what: str) -> None:
+    """``doctor --json`` before anything is signed in: what needs no credential is OK.
+
+    Every row of :data:`CREDENTIAL_FREE_ROWS` is there and OK, the merge gate
+    is closed, and the agent rows name exactly the CLIs of ``agents``: the
+    ones the configuration routes a profile to. The rows that need ``gh``,
+    a sign-in or an agent CLI may say anything.
+    """
+    rows = {check["name"]: check for check in report.get("checks", [])}
+    for name in CREDENTIAL_FREE_ROWS:
+        row = rows.get(name)
+        _check(row is not None, f"doctor with {what} printed no {name!r} row")
+        assert row is not None
+        _check(
+            row["ok"] and not row["skipped"],
+            f"doctor with {what}: {name!r} is not OK: {row['detail']}",
+        )
+    gate = rows["merge gate"]["detail"]
+    _check(gate.startswith("CLOSED"), f"doctor with {what}: the merge gate is not closed: {gate}")
+    named = {match.group(1) for name in rows if (match := _AGENT_ROW.fullmatch(name))}
+    _check(
+        named == agents,
+        f"doctor with {what} checked the agent CLIs {sorted(named)}, expected {sorted(agents)}",
+    )
+
+
+def first_run(wheel: Path, examples: Path, work: Path, version: str) -> None:
+    """The offline half of the first run docs/getting-started.md walks through (#259).
+
+    ``uv tool install`` puts the wheel's ``autoforge`` on ``PATH``, as the
+    guide installs it but from the file alone, with a home and tool
+    directories of its own. Then, with only that home, git, the installed
+    command and a ``gh`` that records and fails every call on ``PATH`` (no
+    credential, no agent CLI): ``autoforge --version`` and ``--help`` outside
+    any repository; and, in a repository whose ``origin`` is on GitHub and
+    which keeps AutoForge's files out of git as the guide says, ``doctor
+    --json`` with the built-in routing and with each starter of
+    ``examples/`` saved as ``autoforge.yaml`` (see
+    :func:`check_first_run_doctor`), and a REMOTE dry run with each starter.
+    The repository's ``git status`` stays empty.
+    """
+    uv = os.environ.get("UV") or shutil.which("uv")
+    git = shutil.which("git")
+    assert uv is not None and git is not None
+    _check(
+        sorted(p.name for p in examples.glob("*.yaml")) == sorted(STARTER_AGENTS),
+        f"examples/ holds {sorted(p.name for p in examples.glob('*.yaml'))}, "
+        f"STARTER_AGENTS names {sorted(STARTER_AGENTS)}",
+    )
+    home, tool_bin = work / "first-run-home", work / "first-run-bin"
+    home.mkdir()
+    uv_env = {
+        key: value for key, value in _child_env().items() if not key.startswith(("UV_", "XDG_"))
+    }
+    uv_env.update(HOME=str(home), UV_TOOL_DIR=str(work / "uv-tools"), UV_TOOL_BIN_DIR=str(tool_bin))
+    install_argv = ["tool", "install", "--no-config", "--no-cache", "--no-index", "--offline"]
+    _run([uv, *install_argv, "--python", sys.executable, str(wheel)], cwd=home, env=uv_env)
+
+    calls = work / "first-run-gh-calls.log"
+    _fake_gh(work / "first-run-gh-bin", calls)
+    path = [str(work / "first-run-gh-bin"), str(tool_bin), str(Path(git).parent), os.defpath]
+    env = {
+        "HOME": str(home),
+        "PATH": os.pathsep.join(path),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    if os.environ.get("TMPDIR"):
+        env["TMPDIR"] = os.environ["TMPDIR"]
+    found = shutil.which("autoforge", path=env["PATH"])
+    _check(found == str(tool_bin / "autoforge"), f"`autoforge` on PATH is {found}")
+    out = _run(["autoforge", "--version"], cwd=home, env=env).stdout.strip()
+    _check(out == f"autoforge {version}", f"`autoforge --version` printed {out!r}")
+    help_text = _run(["autoforge", "--help"], cwd=home, env=env).stdout
+    _check(help_text.startswith("usage: autoforge"), "`autoforge --help` printed no usage")
+    _say(f"ok: uv tool install put {out} on PATH")
+
+    repo = _scratch_repository(git, work / "first-run-repo", env)
+    _run([git, "remote", "add", "origin", FIRST_RUN_ORIGIN], cwd=repo, env=env)
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as handle:
+        handle.write("".join(f"{entry}\n" for entry in FIRST_RUN_EXCLUDES))
+    for name, agents in [(None, BUILT_IN_AGENTS), *sorted(STARTER_AGENTS.items())]:
+        what = name or "the built-in routing"
+        options: tuple[str, ...] = ()
+        if name is not None:
+            shutil.copyfile(examples / name, repo / "autoforge.yaml")
+            options = ("--config", "autoforge.yaml")
+        doctor = _run(["autoforge", *options, "doctor", "--json"], cwd=repo, env=env, check=False)
+        _check(
+            doctor.returncode in (0, 1),
+            f"doctor with {what} exited {doctor.returncode}: {doctor.stderr[-2000:]}",
+        )
+        try:
+            report = json.loads(doctor.stdout)
+        except ValueError as exc:
+            raise CheckFailed(f"doctor --json with {what} printed no JSON: {exc}") from None
+        check_first_run_doctor(report, agents, what)
+        _say(f"ok: doctor with {what}: every row that needs no credential is OK")
+        if name is not None:
+            _dry_run("autoforge", repo, env, calls, options)
+            _say(f"ok: autoforge run --dry-run with {name} rendered the ANALYZE_EXECUTE prompt")
+    status = _run([git, "status", "--porcelain", "--untracked-files=all"], cwd=repo, env=env)
+    _check(not status.stdout.strip(), f"the first run left files git sees: {status.stdout!r}")
+    _say("ok: the first run's files stay out of git")
 
 
 def check_release_tag(tag: str, version: str) -> None:
@@ -638,6 +791,7 @@ def check_distributions(
         bin_dir = install(wheel, work)
         _check(not bin_dir.is_relative_to(REPO_ROOT), "the environment is inside the source tree")
         smoke(bin_dir, work, version)
+        first_run(wheel, source / "examples", work, version)
         record_digests([sdist, wheel], sha256sums, version)
     except CheckFailed:
         _say(f"FAILED; the scratch directory {work} is kept")

@@ -2170,12 +2170,21 @@ the effective rules of the default branch
 (`gh api repos/{owner}/{repo}/rules/branches/{branch}`, every page) and
 reports which contexts a `required_status_checks` rule names, whether each of
 `safety.required_checks` (default `ci`) is among them, whether the ruleset's
-enforcement is `active`, and whether it has bypass actors. Any of those
-missing is a `FAIL` with the settings URL and the rule to add. A repository
+enforcement is `active`, and whether it has bypass actors. A repository
 still on classic branch protection is checked through that instead
-(`enforce_admins` standing in for "no bypass actors"). Rules it cannot verify
-are not shown to require anything (#289), and how that is reported depends
-on the merge gate:
+(`enforce_admins` standing in for "no bypass actors"). Any of those
+missing, a gap the answer shows, names the settings URL and the rule to
+add, and is a `FAIL` while the configuration's half of the merge gate is
+open (`safety.allow_merge: true`). With the gate closed it is a `WARN`
+(#259): only the merge gate relies on the rule, a run with it closed stops
+at `READY_FOR_MERGE` for a human to merge, and a fresh repository without
+CI yet would otherwise fail its first `doctor` on a row its first run does
+not need. The warning says so and asks for the rule before the gate is
+opened; opening it turns the row back into a `FAIL`, and the gate's own
+checks are the same either way. GitHub reporting no default branch at all
+is a `FAIL` whatever the gate. Rules it cannot verify are not shown to
+require anything (#289), and how that is reported depends on the merge
+gate:
 
 - GitHub's plan offers no rulesets or branch protection on the repository
   (GitHub Free's private repositories: `HTTP 403 "Upgrade to GitHub Pro or
@@ -2190,6 +2199,9 @@ on the merge gate:
   reading classic protection, not found).
 - GitHub could not be read at all (a transient failure): nothing was
   verified; running doctor again answers it.
+- `gh` itself could not be started for the read (#259), even when the
+  earlier `gh available` row passed: nothing was read, so with the gate
+  open this is the same `FAIL`, never a `SKIP` that lets doctor pass.
 - GitHub returns a ruleset's `bypass_actors` only to a token with write
   access to it, and this answer withholds them *and* omits
   `current_user_can_bypass`: whether the controller's own login may skip
@@ -2203,8 +2215,9 @@ token permission), or closing the gate. With the gate closed it is a `SKIP`
 that says why. A hidden bypass list is a `SKIP` either way when GitHub does
 say `current_user_can_bypass: never`: the required checks were read and the
 controller's login cannot bypass them, though "no bypass actors" is
-unverified (a token that GitHub says may itself bypass the rule is a `FAIL`
-either way). The row is never an unverified `OK`.
+unverified (a token that GitHub says may itself bypass the rule is a gap
+the answer shows: a `FAIL` with the gate open, a `WARN` with it closed).
+The row is never an unverified `OK`.
 `doctor --json` carries a skip as `"skipped": true`. The check is read-only
 and runs in `doctor` only: the `READY_FOR_MERGE` gate itself does not yet
 consult branch rules.
