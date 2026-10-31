@@ -906,10 +906,11 @@ def test_prompt_version_is_rendered_and_was_bumped_for_the_prompt_changes(engine
     review), so the version every prompt and run log carries moved past v1;
     #85 (nothing an agent starts outlives its invocation) moved it past v2;
     #393 (the block is read from the final reply only, and a correction
-    quotes the reply it corrects) moved it past v12."""
+    quotes the reply it corrects) moved it past v12; #287 (UPDATE_EPIC
+    selects only a native sub-issue of the EPIC) moved it past v13."""
     from autoforge import __prompt_version__
 
-    assert __prompt_version__ not in ("v1", "v2", "v12")
+    assert __prompt_version__ not in ("v1", "v2", "v12", "v13")
     engine.state.phase = Phase.ANALYZE_EXECUTE
     rendered = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
     header = f"# AutoForge controller instructions (trusted): {__prompt_version__}"
@@ -994,8 +995,8 @@ def test_common_prompt_names_the_read_context_and_says_no_credential():
             ],
         ),
         ("fix.md", ["review-comment.md", "issue.md", "follow-up-issues.md"]),
-        ("update_epic.md", ["epic.md", "epic-issues.md"]),
-        ("update_epic_rerequest.md", ["epic.md", "epic-issues.md"]),
+        ("update_epic.md", ["epic.md", "epic-issues.md", "epic-sub-issues.md"]),
+        ("update_epic_rerequest.md", ["epic.md", "epic-issues.md", "epic-sub-issues.md"]),
         ("replan_reexecute.md", ["issue.md", "epic.md", "pull-request.md"]),
     ],
 )

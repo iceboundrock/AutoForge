@@ -53,13 +53,18 @@ agent claim against GitHub** before acting on it:
   the PR as ``MERGED`` at that HEAD into the reviewed base. If that call
   left auto-merge armed, the controller disarms it. No prompt is rendered
   and no provider is invoked.
-- UPDATE_EPIC: ``next_issue_url`` is verified exactly like the first issue
-  in INITIALIZING before the controller switches issues: it parses as an
+- UPDATE_EPIC: ``next_issue_url`` is verified like the first issue in
+  INITIALIZING before the controller switches issues: it parses as an
   issue URL of this repository, is neither the EPIC nor the issue just
-  finished, exists on GitHub and is OPEN. A rejected selection keeps the
-  phase (the agent is asked again once, with the controller's reason); a
-  second rejection enters BLOCKED. Only a verified issue reaches
-  ANALYZE_EXECUTE.
+  finished, exists on GitHub and is OPEN. It must also be one of the EPIC's
+  own issues, by the rule ``autoforge epic run`` admits by (#287): GitHub
+  names the EPIC as its parent, and it has no sub-issues of its own. A
+  ``null`` is held to GitHub too: the EPIC's sub-issue listing, complete
+  against the EPIC's own count, must hold no issue the controller would
+  accept. A rejected selection keeps the phase (the agent is asked again
+  once, with the controller's reason); a second rejection enters BLOCKED,
+  and so does a listing that is not complete. Only a verified issue
+  reaches ANALYZE_EXECUTE, and only a confirmed ``null`` reaches DONE.
 
 Loop bounds (``workflow:`` config, enforced from persisted state so
 ``resume`` never resets them; see ``loop_guard.py``):
@@ -247,6 +252,7 @@ from .effects import (
     review_comment_problem,
     sha256_text,
 )
+from .epic_graph import read_children
 from .errors import (
     AutoForgeError,
     CandidateNotMaterializableError,
@@ -273,6 +279,7 @@ from .errors import (
     SandboxCapabilityError,
     SandboxLaunchRefusedError,
     SandboxTamperError,
+    SnapshotRefused,
     StateError,
     StateTransitionError,
     ValidationDefinitionError,
@@ -404,6 +411,7 @@ from .read_context import (
     render_issue_states,
     render_operator_evidence,
     render_pr,
+    render_sub_issues,
     unreadable,
 )
 from .redaction import redact, redact_argv, redact_dict, redact_obj
@@ -685,8 +693,11 @@ MERGE_GATE_MESSAGE = (
 # How many times UPDATE_EPIC may select a next issue the controller rejects
 # (does not exist, CLOSED, other repository, the EPIC or the current issue)
 # before the run is BLOCKED: the first rejection is retried once with the
-# reason rendered into the prompt, the second one is final.
+# reason rendered into the prompt, the second one is final. A `null` the
+# controller refuses (an issue of the EPIC remains, #287) counts the same.
 MAX_NEXT_ISSUE_SELECTIONS = 2
+# How many of the issues that remain a refused `null` names (#287).
+_MAX_REMAINING_SHOWN = 10
 
 # `mergeStateStatus` values under which the controller is willing to call
 # `gh pr merge`. Everything else is a conclusive "not now" (BLOCKED) except
@@ -3977,6 +3988,11 @@ class ControllerEngine:
                     "the state and title of each issue the EPIC references",
                     self._read_epic_issues(epic_body),
                 )
+                context.add(
+                    "epic-sub-issues.md",
+                    "the EPIC's native sub-issues, the only issues it may select next",
+                    self._read_epic_sub_issues(s.epic_url),
+                )
         return context
 
     def _read_operator_evidence(self) -> str:
@@ -4115,6 +4131,27 @@ class ControllerEngine:
             except GitHubError:
                 entries.append(url)
         return render_issue_states(entries, "Issues the EPIC references", len(numbers))
+
+    def _read_epic_sub_issues(self, url: str) -> str:
+        """The EPIC's direct native sub-issues (#287): the issues a selection
+        may name, checked again by :meth:`_verify_epic_sub_issue`.
+
+        Each with its title, from the listing read that carries them
+        (:meth:`~autoforge.github.GitHubClient.list_titled_sub_issues`), so
+        an EPIC that names its tasks only as native sub-issues still tells
+        the agent what they are; and with the EPIC's own count, so a listing
+        that leaves out a sub-issue the token may not read says so.
+        """
+        title = "Sub-issues of the EPIC"
+        try:
+            reported = self.github.get_issue_node(url).sub_issues_total
+            rows = self.github.list_titled_sub_issues(url)
+        except GitHubError as exc:
+            return unreadable(title, f"the sub-issues of {url}", exc)
+        titles = {node.ref.canonical.lower(): name for node, name in rows}
+        return render_sub_issues(
+            [node for node, _ in rows], title, reported=reported, titles=titles
+        )
 
     def _replan_publication_variables(self, txn: ReplanTransaction) -> dict[str, str | int | None]:
         """The replacement's base, branch and PR text bounds (#164).
@@ -6795,12 +6832,13 @@ class ControllerEngine:
         ``next_issue_url``, untrusted). The issue must parse as a GitHub issue
         URL, belong to the run's repository, not be the EPIC itself, not be the
         current issue when ``switching`` (UPDATE_EPIC must not loop back onto the
-        issue just finished), exist on GitHub and be OPEN. Any of those failing
-        raises :class:`VerificationError` — a problem with the *selection*. No
-        GitHub read is made for a URL that already fails the local checks (a
-        foreign repository is never queried). A standalone engine's
-        :attr:`issue_ownership` predicate is one of those local checks (ADR
-        0008 D17.2): an issue a scheduler namespace owns is refused, so an
+        issue just finished), exist on GitHub and be OPEN, and when ``switching``
+        be one of the EPIC's own issues (:meth:`_verify_epic_sub_issue`, #287).
+        Any of those failing raises :class:`VerificationError` — a problem with
+        the *selection*. No GitHub read is made for a URL that already fails
+        the local checks (a foreign repository is never queried). A standalone
+        engine's :attr:`issue_ownership` predicate is one of those local checks
+        (ADR 0008 D17.2): an issue a scheduler namespace owns is refused, so an
         UPDATE_EPIC selection of one goes through the bounded rejection path.
 
         Identity (EPIC / current issue) is compared with
@@ -6851,7 +6889,53 @@ class ControllerEngine:
             raise VerificationError(
                 f"{what} {ref.canonical} is {issue.state}; only OPEN issues can be run"
             )
+        if switching:
+            self._verify_epic_sub_issue(ref)
         return issue
+
+    def _verify_epic_sub_issue(self, ref: GitHubIssueRef) -> None:
+        """Verify on GitHub that UPDATE_EPIC's selection is one of the EPIC's own issues (#287).
+
+        The rule ``autoforge epic run`` admits by (ADR 0008 D3.1, D3.6): a
+        direct native sub-issue of the EPIC (the parent GitHub names for it
+        is the EPIC) that has no sub-issues of its own. A task-list line or
+        a ``#n`` in the EPIC body is not a membership: prose is never
+        authority, and on a public repository anyone may open the issue it
+        names. The first issue is the operator's choice and is not held to
+        this. The issue must still be open in this read: it is the later of
+        the two, and an issue closed since :meth:`_verify_issue_selectable`
+        read it is refused rather than switched to on the earlier answer.
+        Failures are a :class:`VerificationError`, the selection's problem,
+        except as :meth:`_verify_issue_selectable` says.
+        """
+        state = self._require_state()
+        epic = parse_issue_url(state.epic_url)
+        try:
+            node = self.github.get_issue_node(ref.canonical)
+        except GitHubNotFoundError as exc:
+            raise VerificationError(
+                f"next issue {ref.canonical} does not exist on GitHub "
+                f"(or is not visible to this token): {exc}"
+            ) from exc
+        if node.parent is None or not node.parent.same_target(epic):
+            parent = node.parent.canonical if node.parent is not None else "none"
+            raise VerificationError(
+                f"next issue {ref.canonical} is not a sub-issue of the EPIC {epic.canonical} "
+                f"(its parent issue on GitHub: {parent}); a sequential run switches only to "
+                "one of the EPIC's native sub-issues, the issues 'autoforge epic run' admits"
+            )
+        if node.sub_issues_total > 0:
+            raise VerificationError(
+                f"next issue {ref.canonical} has {node.sub_issues_total} sub-issue(s) of its "
+                "own: it is an EPIC in its own right, which a sequential run never selects "
+                "(run it as its own EPIC)"
+            )
+        if not node.is_open:
+            raise VerificationError(
+                f"next issue {ref.canonical} is {node.state} "
+                f"({node.state_reason or 'no reason'}) on GitHub as its sub-issue read reports "
+                "it; only OPEN issues can be run"
+            )
 
     def _recover_pr(self, pr: PRInfo, plan: StepPlan | None) -> StepOutcome:
         """Bind the issue's open implementation PR and enter REVIEW without an agent.
@@ -16766,11 +16850,14 @@ class ControllerEngine:
 
         The same code for the step that saved the context and for every
         later entry (journal first, §2.10): the K8 record is reconciled and
-        issued at most once; the roadmap section is spliced when one is
-        stored and merges are pending, and the merge counter is reset only
-        after the read-back; then the selection is verified before the issue
-        switches. A rejected input is voided in the context and raised for
-        'resume' to re-request (D4.7); a conclusive GitHub failure blocks.
+        issued at most once; a ``null`` selection is confirmed on GitHub
+        before anything reports the EPIC complete
+        (:meth:`_confirm_epic_complete`, #287); the roadmap section is
+        spliced when one is stored and merges are pending, and the merge
+        counter is reset only after the read-back; then a selected issue is
+        verified before the issue switches. A rejected input is voided in the
+        context and raised for 'resume' to re-request (D4.7); a conclusive
+        GitHub failure blocks.
         """
         state = self._require_state()
         reason = self._drive_progress_records()
@@ -16789,6 +16876,11 @@ class ControllerEngine:
                 "progress comment posted or adopted; the roadmap section was not written and "
                 "the issue was not switched"
             )
+        selection = context.next_issue_url
+        if selection is None:
+            refused = self._confirm_epic_complete(context)
+            if refused is not None:
+                return refused
         try:
             roadmap_note = self._splice_roadmap_section(context)
         except GitHubUnavailableError:
@@ -16802,7 +16894,6 @@ class ControllerEngine:
                 "then 'resume'."
             )
         done = f"progress comment {published} on the EPIC; {roadmap_note}"
-        selection = context.next_issue_url
         if selection is None:
             state.next_issue_rejections = []
             nxt = self._next_phase(Phase.UPDATE_EPIC, {"next_issue_url": None})
@@ -16832,6 +16923,100 @@ class ControllerEngine:
             f"{done}; verified next issue #{issue.number} ({issue.state}); "
             f"UPDATE_EPIC -> {nxt.value}"
         )
+
+    def _confirm_epic_complete(self, context: UpdateEpicContext) -> tuple[Phase, str] | None:
+        """Hold a ``null`` selection to GitHub before the run ends as complete (#287).
+
+        ``None`` when :meth:`_verify_epic_complete` confirms that nothing
+        remains. A remaining issue is a rejected selection, and so is a
+        transient failure while reading (the same read may well succeed next
+        time): both take the bounded re-selection, the selection voided. A
+        listing that is not complete, or a conclusive GitHub failure, blocks:
+        asking the agent again would not make GitHub list what it left out.
+        Nothing here writes; the roadmap section that reports the EPIC
+        complete is written only after this.
+        """
+        state = self._require_state()
+        try:
+            self._verify_epic_complete()
+        except VerificationError as exc:
+            self._void_selection(context)
+            return self._reject_next_issue(str(exc), cause=exc)
+        except SnapshotRefused as exc:
+            if exc.transient:
+                self._void_selection(context)
+                return self._reject_next_issue(
+                    f"next_issue_url null: the EPIC {state.epic_url} could not be confirmed "
+                    f"complete (GitHub unavailable: {exc})",
+                    cause=exc,
+                )
+            return Phase.BLOCKED, (
+                f"next_issue_url null reports the EPIC {state.epic_url} complete, but its "
+                f"native sub-issues could not be read completely: {exc}. GitHub leaves a "
+                "sub-issue the token may not read out of the listing, so the controller "
+                "does not end the run on one that may miss an open issue. The progress "
+                f"comment stays published; the run stays on issue {state.current_issue_url}, "
+                "nothing was switched. Make every sub-issue of the EPIC readable to the "
+                "token, or remove the ones it may not read from the EPIC, then 'unblock'"
+            )
+        except GitHubUnavailableError as exc:
+            self._void_selection(context)
+            return self._reject_next_issue(
+                f"next_issue_url null: the EPIC {state.epic_url} could not be confirmed "
+                f"complete (GitHub unavailable: {exc})",
+                cause=exc,
+            )
+        except GitHubError as exc:
+            return Phase.BLOCKED, (
+                f"next_issue_url null reports the EPIC {state.epic_url} complete, but the "
+                f"EPIC could not be read on GitHub to confirm it: {exc}. This is not a "
+                "transient GitHub failure (authentication, permissions, or malformed data), "
+                "so asking the agent again would not help. The progress comment stays "
+                f"published; the run stays on issue {state.current_issue_url}, nothing was "
+                "switched. Fix the cause, then 'unblock'"
+            )
+        return None
+
+    def _verify_epic_complete(self) -> None:
+        """Verify on GitHub that no issue of the EPIC remains for a sequential run (#287).
+
+        ``next_issue_url`` null is the agent's claim that none remains, made
+        from a read context that may have shown the listing unreadable or
+        short. The controller reads the EPIC's native sub-issues itself,
+        complete by the rules the scheduler's snapshot applies
+        (:func:`~autoforge.epic_graph.read_children`: the listing holds every
+        sub-issue the EPIC counts, so one the token may not read is never
+        taken as absent). A sub-issue remains when this run would accept it
+        as a selection: in the run's repository, open, without sub-issues of
+        its own, not the issue just finished, and not owned by a scheduler
+        namespace. A remaining one raises :class:`VerificationError`; an
+        incomplete listing raises :class:`SnapshotRefused` and a failed read
+        of the EPIC its :class:`GitHubError`, for
+        :meth:`_confirm_epic_complete` to apply its policy.
+        """
+        state = self._require_state()
+        epic_ref = parse_issue_url(state.epic_url)
+        current = parse_issue_url(state.current_issue_url)
+        epic = self.github.get_issue_node(epic_ref.canonical)
+        remaining = [
+            child
+            for child in read_children(self.github, epic_ref, epic)
+            if child.is_open
+            and child.sub_issues_total == 0
+            and child.ref.same_repository(state.repository)
+            and not child.ref.same_target(current)
+            and not (self.issue_ownership is not None and self.issue_ownership(child.number))
+        ]
+        if remaining:
+            shown = ", ".join(f"#{child.number}" for child in remaining[:_MAX_REMAINING_SHOWN])
+            if len(remaining) > _MAX_REMAINING_SHOWN:
+                shown += f" and {len(remaining) - _MAX_REMAINING_SHOWN} more"
+            raise VerificationError(
+                f"next_issue_url null reports the EPIC {epic_ref.canonical} complete, but "
+                f"GitHub lists {len(remaining)} open sub-issue(s) of it that this run may "
+                f"select: {shown}. A sequential run ends only when none remains; select one "
+                "of them"
+            )
 
     def _void_selection(self, context: UpdateEpicContext) -> None:
         """D4.7: the rejected selection leaves the context; the rest stays published."""

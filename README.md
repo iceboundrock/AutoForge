@@ -88,7 +88,8 @@ Each line is a summary; the linked document is the precise statement.
   round and SHA; the fix commit is the fixer's own HEAD, descends from the
   reviewed HEAD and is the PR's head once the controller has pushed it; the
   follow-up issues the controller created or recorded a deferral in are the
-  one open issue per finding; the EPIC update and the next issue exist.
+  one open issue per finding; the EPIC update exists, and the next issue
+  is open and a native sub-issue of the EPIC.
   ([GitHub safety](docs/agent-guides/github-safety.md))
 - **Agents never merge.** Every agent prompt carries the rule "never merge a
   pull request". The merge is performed by the controller itself

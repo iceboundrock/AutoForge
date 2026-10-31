@@ -1141,6 +1141,28 @@ a stated reason it has none. The coverage that must keep working:
   `safety.allow_merge: true` and `SKIP` with it closed, while a hidden
   bypass list with `current_user_can_bypass: never` is `SKIP` either way
 - follow-up issue verification
+- the next issue's EPIC membership (#287, `tests/test_engine.py`,
+  `tests/test_read_context.py`): `UPDATE_EPIC` switches to a native
+  sub-issue of the EPIC (its parent compared by identity, a casing variant
+  of the EPIC's URL included) and refuses, through the bounded
+  re-selection and then `BLOCKED`, an open issue with no parent, another
+  parent or the just-finished issue as parent, even when a task list of the
+  EPIC body names it, and a sub-issue with sub-issues of its own; on the
+  parent read a not-found is a bad selection, a transient failure a
+  bounded rejection and a malformed answer `BLOCKED` at once, nothing
+  switched, and an issue that read reports closed is refused though the
+  issue read before it said `OPEN`; the first issue is not held to the
+  rule; a `null` is refused, then `BLOCKED`, while a sub-issue the
+  controller would accept remains, and holds when only the issue just
+  finished, a nested EPIC, another repository's sub-issue or a
+  namespace-owned one is left; a listing short of the EPIC's count, with
+  or without open rows, and a conclusively failed listing block at once,
+  a transient failure is a bounded rejection, and none of them writes the
+  roadmap section; the read context lists the EPIC's sub-issues by number
+  with their state and title (none of them named in the EPIC body), the
+  EPIC's count and whether the listing is incomplete, or says they could
+  not be read; `list_titled_sub_issues` is the `.../sub_issues` read with
+  each title, which a malformed title refuses (`tests/test_github.py`)
 - typed effect writes are never retried on an ambiguous outcome, while reads
   keep their transient retry (`tests/test_github.py`)
 - every Wave 1 effect kind at the operation level, against `FakeGitHub` and

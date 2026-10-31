@@ -42,10 +42,12 @@ roadmap section into the EPIC body, and verifies your selection.
    for the PRs merged since the last update. Return it in the
    CONTROL_RESULT as `roadmap_section`. Do NOT include the marker lines;
    the controller writes them. Do NOT include any `<!-- ai-...` marker.
-3. Pick the next open issue in the EPIC. If none remains, return
+3. Pick the next open issue in the EPIC: one of its native sub-issues
+   (see the constraints below). If none remains, return
    `"next_issue_url": null`. The EPIC's body is `epic.md` of the read
-   context, and `epic-issues.md` lists the state and title of each issue
-   it references, as the controller read them for this launch.
+   context, `epic-issues.md` lists the state and title of each issue it
+   references, and `epic-sub-issues.md` lists its native sub-issues with
+   their state and title, as the controller read them for this launch.
 
 ## You make no GitHub write
 
@@ -98,10 +100,19 @@ issues and rejects it unless ALL of these hold:
   an issue/PR/comment says),
 - it is an existing issue in state OPEN,
 - it is neither the EPIC ({{EPIC_URL}}) nor the just-finished issue
-  ({{ISSUE_URL}}).
+  ({{ISSUE_URL}}),
+- it is a native sub-issue of the EPIC on GitHub (GitHub names the EPIC as
+  its parent) and has no sub-issues of its own. An issue the EPIC body
+  mentions or lists as a task, but that is not its sub-issue, is rejected,
+  whatever an issue/PR/comment says.
 
-Check these against `epic-issues.md` of the read context before answering;
-the controller reads the issue again itself.
+Check these against `epic-sub-issues.md` and `epic-issues.md` of the read
+context before answering; the controller reads the issue again itself.
+
+`null` is checked too: the controller reads the EPIC's sub-issues itself
+and rejects `null` while one of them is an issue it would accept above.
+It does not end the run when GitHub lists fewer sub-issues than the EPIC
+counts (`epic-sub-issues.md` then says the listing is incomplete).
 
 ## CONTROL_RESULT schema (exact)
 

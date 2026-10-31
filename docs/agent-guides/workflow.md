@@ -76,8 +76,8 @@ READY_FOR_MERGE -> MERGE      after controller-side pre-merge verification
 READY_FOR_MERGE -> REVIEW     reviewed revision drifted
 MERGE -> UPDATE_EPIC          only after gh reports the PR as MERGED
 MERGE -> REVIEW               reviewed revision drifted
-UPDATE_EPIC -> ANALYZE_EXECUTE  next issue verified
-UPDATE_EPIC -> DONE           agent reports no next issue (null)
+UPDATE_EPIC -> ANALYZE_EXECUTE  next issue verified, a sub-issue of the EPIC
+UPDATE_EPIC -> DONE           agent reports no next issue (null), and none remains on GitHub
 ```
 
 `MERGE -> ANALYZE_EXECUTE` and `MERGE -> DONE` are declared in `LEGAL_EDGES`
@@ -662,10 +662,18 @@ next entry could not find again.
   comment its agent posted (D13.7). It also reads the EPIC body and locates
   the managed roadmap section (ambiguous markers, or a conclusive failure
   to read the body, block without launching; an unavailable GitHub
-  propagates). The bounded re-selection after a rejected `next_issue_url`
-  is a re-request for the selection alone, against the comment already
-  posted; the roadmap section is written by the controller when due
-  (github-safety.md, "Before UPDATE_EPIC" and "EPIC updates").
+  propagates). A `next_issue_url` is rejected unless it passes the first
+  issue's checks and is a native sub-issue of the EPIC with no sub-issues
+  of its own, the rule `autoforge epic run` admits by (#287); an issue the
+  EPIC body only mentions is not one. A `null` is rejected too while the
+  EPIC's complete sub-issue listing holds an issue the controller would
+  accept, and `BLOCKED` when the listing is not complete (the EPIC counts
+  a sub-issue the token may not read) or cannot be read conclusively: the
+  run never ends as `DONE` on membership it could not determine. The
+  bounded re-selection after a rejected `next_issue_url` is a re-request
+  for the selection alone, against the comment already posted; the
+  roadmap section is written by the controller when due (github-safety.md,
+  "Before UPDATE_EPIC", "After UPDATE_EPIC" and "EPIC updates").
 
 No probe consumes a review round, a `review_history` entry, or an attempt.
 
