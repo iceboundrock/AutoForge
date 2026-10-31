@@ -96,7 +96,7 @@ install the extra.
 ## Validation: every key must be one the controller reads
 
 An unknown key, whether at the top level, in any section (`execution`,
-`safety`, `github`, `merge`, `review`, `review.replan`, `workflow`, `local`,
+`safety`, `github`, `merge`, `review`, `review.replan`, `workflow`,
 `sandbox`, `scheduler`) or in a profile mapping, is a configuration error naming the section, the
 offending key and the keys that section knows, e.g.
 `unknown key(s) under 'workflow': max_review_round (known: max_review_rounds, ...)`.
@@ -162,34 +162,28 @@ the file valid.
   prompt templates, and the key may only repeat the controller's built-in
   label for them. Any other value is refused at load, naming that label,
   because a new run would then record a version whose templates were not
-  rendered, and a LOCAL run's contract would not notice a template change
-  across an upgrade. The refusal quotes the configured value only when it
+  rendered. The refusal quotes the configured value only when it
   is shaped like a label (`v` and a number); anything else is named by its
   type, since a mis-indented line can put a password under the key. Leave
   it unset, as the example file does (#302).
 
   The check covers the configuration a command loads, and so the version a
-  run records when it is created: in its state file, its run logs, the
-  header of every prompt and a LOCAL run's contract. A run keeps that
-  label for its whole life. A LOCAL run's contract holds it, and a
-  controller with another label refuses to resume the run, so a LOCAL
-  run's label always names the templates its prompts were rendered from. A
-  REMOTE run has no such check: resumed by an upgraded controller, it
-  renders the new templates while its state, its run logs and every prompt
-  header go on naming the label it was created with. A REMOTE run's
-  recorded prompt version therefore says which templates the run started
-  on, not which ones a later step was sent; the step's own `prompt.md` in
-  the run log is what it was sent.
+  run records when it is created: in its state file, its run logs and the
+  header of every prompt. A run keeps that label for its whole life, and
+  nothing compares it with the controller's: resumed by an upgraded
+  controller, it renders the new templates while its state, its run logs
+  and every prompt header go on naming the label it was created with. A run's recorded prompt version
+  therefore says which templates the run started on, not which ones a
+  later step was sent; the step's own `prompt.md` in the run log is what
+  it was sent.
 
   A config copied from the example before #302 carries
   `prompt_version: v1`: delete the line. A run created under it keeps `v1`
-  as its recorded version. A REMOTE one resumes and goes on saying `v1`; a
-  LOCAL one refuses to resume once the line is gone (its contract recorded
-  `v1`), so start it again.
+  as its recorded version, resumes and goes on saying `v1`.
 
-`autoforge doctor` (and `autoforge local doctor`) reports whether the file
-loads and validates. Doctor is read-only apart from creating the state
-directory if it is missing and a probe file it creates and removes there.
+`autoforge doctor` reports whether the file loads and validates. Doctor is
+read-only apart from creating the state directory if it is missing and a
+probe file it creates and removes there.
 
 ## Sections at a glance
 
@@ -204,7 +198,6 @@ directory if it is missing and a probe file it creates and removes there.
 | `profiles` | provider, model, effort, command, idle timeout, maximum runtime and provider options per logical profile | [Profiles](#profiles) below |
 | `github` | the `gh` binary (a relative path, and a relative `PATH` entry a bare name is found through, is resolved against the directory AutoForge starts in: every `gh` runs in an empty directory of its own) and its timeout | [GitHub safety](agent-guides/github-safety.md#controller-owned-effects) |
 | `validation` | REMOTE candidate validation (#172): `commands` (argv lists, empty by default), `scope` (`candidate-tree`, the only value) | [Candidate validation](#candidate-validation) below, [State and recovery](agent-guides/state-and-recovery.md#validation-evidence) |
-| `local` | Local Mode: `feature_dir`, `max_fix_rounds`, `validation_commands`, `exclude`, `max_workspace_entries`, `max_workspace_bytes` | [Local mode configuration](#local-mode-configuration) below |
 | `scheduler` | the parallel EPIC scheduler (#182, `autoforge epic`): `max_parallel` (1-4, default 2; `epic run --max-parallel` overrides it), `poll_interval_seconds` (15-3600, default 60), `stop_grace_seconds` (10-600, default 30) | [Parallel EPIC scheduler](#parallel-epic-scheduler) below, [Workflow](agent-guides/workflow.md#scheduler-execution-policy) |
 | `sandbox` | the outer sandbox (#168, #169): `mode` (`disabled`, the default, `preferred` or `required`), `validation_network` and `premerge_network` (`host`, the default, or `isolated`), `read_only_paths` | [Outer sandbox](#outer-sandbox) below, [Architecture](agent-guides/architecture.md#launch-routing-adr-0005-168) |
 
@@ -239,8 +232,8 @@ command that restores the recorded one. `--accept-config-change` makes the
 new values the run's, and the change is recorded in the run log. Every
 other key (a profile's `command`, `extra_args` and `options`, the loop
 bounds, the merge gate, the agent environment) may change between
-commands, except that `sandbox.mode` may not weaken: every run, LOCAL and
-REMOTE, is pinned to the mode it was created under, and the same commands
+commands, except that `sandbox.mode` may not weaken: every run is pinned
+to the mode it was created under, and the same commands
 refuse a weaker one with the same opt-in (#280,
 [Outer sandbox](#outer-sandbox)). A run refuses, before any state is written, a
 configuration the record could not hold: a `provider`, `model` or `effort`
@@ -305,9 +298,8 @@ one-week backstop is the only wall-clock bound.
   run refuses to start when a profile it requires has none, `autoforge
   doctor` fails any profile the run can reach (including `update_epic`),
   and the controller never launches it.
-- **Not agents.** `merge.verification_commands`, `local.validation_commands`,
-  `validation.commands` and the controller's own `git` plumbing keep a
-  wall-clock limit,
+- **Not agents.** `merge.verification_commands`, `validation.commands` and
+  the controller's own `git` plumbing keep a wall-clock limit,
   `execution.command_timeout_seconds` (default 1800); `gh` calls use
   `github.timeout_seconds`.
 
@@ -660,8 +652,8 @@ below with its evidence.
   person, and needs `prompt`.
 - `options.interaction_policy`:
   - `fail` (default): any ask fails the invocation.
-  - `prompt`: ask the operator live, at the terminal of `run`, `step`,
-    `resume` or `local run`. With no terminal on stdin, when the input
+  - `prompt`: ask the operator live, at the terminal of `run`, `step` or
+    `resume`. With no terminal on stdin, when the input
     ends or the wait expires, the ask fails the invocation, and so does a
     decision the provider cannot carry: it is never offered.
   - `pause`: refused until #126 lands.
@@ -688,8 +680,8 @@ forwarded for another provider therefore never reaches it.
 
 ## Agent environment
 
-Agents, LOCAL `local.validation_commands` and `merge.verification_commands`
-get no GitHub or git credential (#165): the controller makes every GitHub
+Agents, `validation.commands` and `merge.verification_commands` get no
+GitHub or git credential (#165): the controller makes every GitHub
 write itself and hands each agent the GitHub data its phase needs as files.
 Each launch's environment is the allow-list in force
 (`execution.env_allowlist` plus `execution.env_allowlist_extra`, plus the
@@ -831,10 +823,9 @@ An `export GH_TOKEN=...` in `~/.bash_profile` refuses the launch, naming
 A zsh startup file is never a problem: a launch's zsh reads none of yours.
 For an agent the run stops before anything is recorded, so it
 can simply be run again once the setting is removed; for a validation or
-pre-merge command it counts as that command failing. `autoforge doctor` and
-`autoforge local doctor` run the same check (row "no credential reaches a
-launch") and list the launch environment by name (row "launch
-environment"), never a value.
+pre-merge command it counts as that command failing. `autoforge doctor`
+runs the same check (row "no credential reaches a launch") and lists the
+launch environment by name (row "launch environment"), never a value.
 
 **What an agent no longer gets.** Your global git configuration beyond the
 identity: no commit signing (agent commits are unsigned), no global Git LFS
@@ -872,9 +863,9 @@ validation:
   discarded. The commands get the allow-listed environment
   (`execution.env_allowlist`), no GitHub or git credential, the wall-clock
   limit `execution.command_timeout_seconds`, and orphan containment; under
-  `sandbox.mode: required` or `preferred` (which a REMOTE run treats as
-  `required`) they run inside the outer sandbox as the pre-merge export
-  does (`sandbox.validation_network` sets their network), or are refused.
+  `sandbox.mode: required` or its alias `preferred` they run inside the
+  outer sandbox as the pre-merge export does (`sandbox.validation_network`
+  sets their network), or are refused.
 - **What it records.** Every command that runs leaves a `ValidationRecord`
   in `state.json`: the candidate, the definition, policy P, the outcome
   (`PASS` for exit 0, `FAIL` for any other exit, exit 127 included,
@@ -895,8 +886,7 @@ validation:
 - **Bounds.** At most 16 commands; each at most 32 non-blank argv elements,
   each at most 1,024 characters and 4,096 in all. A configuration beyond
   them is a load error naming the command's index and the bound, never
-  its argv. `local.validation_commands` has the same bounds, since its
-  commands leave the same records. `scope` other than `candidate-tree`
+  its argv. `scope` other than `candidate-tree`
   (a base- or merge-result-bound validation) is a load error.
 - **No secrets in argv.** A command's argv is stored, logged and shown
   redacted, but its digest is over the argv as configured, and redaction
@@ -917,9 +907,8 @@ validation:
   ([Running the remote workflow](usage.md#candidate-validation-evidence)).
   Under `disabled` every validator runs
   unsandboxed as your UID and its record says `enforced: false`. Under
-  `required`, and under REMOTE's `preferred`, a record applies only when
-  its launch was enforced; LOCAL's `preferred` may fall back, and a record
-  made that way says `enforced: false`.
+  `required` or `preferred`, a record applies only when its launch was
+  enforced.
 
 ## Outer sandbox
 
@@ -932,7 +921,7 @@ above:
 ```yaml
 sandbox:
   mode: disabled              # disabled | preferred | required
-  validation_network: host    # host | isolated: LOCAL and REMOTE validation commands
+  validation_network: host    # host | isolated: validation.commands
   premerge_network: host      # host | isolated: merge.verification_commands
   read_only_paths: []         # absolute paths every launch sees read-only (#169)
 ```
@@ -953,32 +942,26 @@ the **outer sandbox** (the OS-enforced boundary ADR 0005 describes), and
   D6.3–D6.5) applies in this mode too
   ([GitHub safety](agent-guides/github-safety.md#threat-model)).
 - **`mode: required`** runs every agent launch of every provider (Pi's
-  per-launch auth preflight included), every `local.validation_commands`
-  and `validation.commands` entry and every `merge.verification_commands`
-  entry inside the outer sandbox, or refuses it; nothing falls back to
-  running without one (D12.1). It needs Linux, `bwrap` on `PATH`,
-  unprivileged user, PID and IPC namespaces, a new procfs, unprivileged
-  overlay mounts, and Landlock ABI 6 (Linux 6.12 or later).
-- **`mode: preferred`** (D12.2) is `required` where the host can enforce.
-  Where it cannot, a **LOCAL** launch falls back to logical isolation only,
-  visibly: the dry-run plan and `status` say that it may, the launch prints
-  "runs with logical isolation only, NOT inside the outer sandbox" on
-  stderr, and its execution record says `sandbox: {"enforced": false,
-  "mode": "preferred", "isolation": "logical isolation only", "fallback":
-  "<the probe's reason>"}`. It is never called sandboxed. A **REMOTE** run
-  treats `preferred` exactly as `required`: its launches are unattended, and
-  a fallback nobody watches would be a silent downgrade.
+  per-launch auth preflight included), every `validation.commands` entry
+  and every `merge.verification_commands` entry inside the outer sandbox,
+  or refuses it; nothing falls back to running without one (D12.1). It
+  needs Linux, `bwrap` on `PATH`, unprivileged user, PID and IPC
+  namespaces, a new procfs, unprivileged overlay mounts, and Landlock ABI 6
+  (Linux 6.12 or later).
+- **`mode: preferred`** is an alias of `required`: enforced where the host
+  can enforce, refused where it cannot, never falling back to logical
+  isolation.
 
-**The pre-launch gate.** Under `required`, and under `preferred` in
-REMOTE, the first step that may launch an agent or a repository-defined
-command establishes whether this host can enforce, with one real minimal
+**The pre-launch gate.** Under `required` or `preferred`, the first step
+that may launch an agent or a repository-defined command establishes
+whether this host can enforce, with one real minimal
 launch (the capability probe, D14.1), before anything of the step is
 saved, charged or spawned. A host that cannot is refused there with a
 configuration error (`SandboxCapabilityError`, exit 2) that names the
 missing capability (`bwrap` missing, the user, PID or IPC namespace, the
-new procfs, a bind mount, the overlay, Landlock) and the alternatives
-(`sandbox.mode: disabled`, or in LOCAL `preferred`); the run's state is
-byte-identical and nothing needs recovery. The answer is kept for the
+new procfs, a bind mount, the overlay, Landlock) and the alternative
+(`sandbox.mode: disabled`); the run's state is byte-identical and nothing
+needs recovery. The answer is kept for the
 controller process, never across processes, so a host made capable is seen
 by the next `resume`. A step that launches nothing (INITIALIZING, a
 READY_FOR_MERGE without pre-merge commands) is not gated. `disabled` runs
@@ -988,13 +971,10 @@ spawn failure, as before (the attempt is charged; D10.8):
   - an agent: `SandboxLaunchRefusedError`, an `ExecutionError` handled like
     an executable that cannot be spawned. Nothing ran, the phase is
     unchanged and `resume` launches it again;
-  - a LOCAL validation command: not run, so the phase is not verified and
-    the run stays in it, as for a failing command;
+  - a validation command: not run and no record made, so the candidate is
+    not validated and nothing is pushed or published;
   - a pre-merge verification command: not run, so the merge gate blocks
     (`BLOCKED`, "Nothing was merged or counted"), as for a failing command.
-
-  Under `preferred`, the fallback is decided at the gate only: a launch that
-  was meant to be enforced and failed is never re-run without the sandbox.
 
 - **`validation_network` and `premerge_network: isolated`** run that kind
   of command in a network namespace of its own: the host's loopback
@@ -1013,30 +993,28 @@ spawn failure, as before (the attempt is charged; D10.8):
   one, lies under `/proc`, `/dev` or `/sys`, is neither a directory nor a
   regular file, or overlaps another entry. One that overlaps what no launch
   may see (the state directory, the lock, `<git common dir>/autoforge`,
-  another worktree, the operator's checkout in REMOTE) is refused before the
-  first launch, and `doctor` names it. There are no operator-declared
+  another worktree, the operator's checkout) is refused before the first
+  launch, and `doctor` names it. There are no operator-declared
   writable paths. **A token in a projected file (a registry token in
   `~/.npmrc`) is readable by every tool in the sandbox**, agent and
   repository command alike.
 
 Any other `mode` value is a load error. The dry-run plan shows the mode and
 what it does, then the compiled policy for each launch class the run can
-make (REMOTE agent and export command, or LOCAL agent and LOCAL validation
-command), by role, with your `read_only_paths`; a dry run runs no probe,
-so its plan is the same on every host. `status` shows the mode and what it
-means, without probing. `doctor` and `local doctor` show the capability
-result and what the mode will do on this host
-([Usage: outer sandbox](usage.md#outer-sandbox)).
-The mode is not part of a LOCAL run's contract (D12.3). Every run is
-pinned to the mode it was created under instead (#280, D15.3 as amended):
+make (the REMOTE agent and the export command), by role, with your
+`read_only_paths`; a dry run runs no probe, so its plan is the same on
+every host. `status` shows the mode and what it means, without probing.
+`doctor` shows the capability result and what the mode will do on this
+host ([Usage: outer sandbox](usage.md#outer-sandbox)).
+Every run is pinned to the mode it was created under (#280, D15.3 as
+amended):
 
 - a later `step`, `resume` or `unblock` under a **weaker** mode is refused
   before any phase executes, with nothing written, naming the pinned mode,
   this command's and the two ways on. Weaker is what a launch gets:
-  `disabled` is weaker than LOCAL's `preferred`, which is weaker than
-  `required`; in a REMOTE run `preferred` is `required`, so only
-  `disabled` is weaker. A command run without the run's `--config` falls
-  back to the built-in `disabled`, and is refused like any other;
+  `preferred` is `required`, so only `disabled` is weaker. A command run
+  without the run's `--config` falls back to the built-in `disabled`, and
+  is refused like any other;
 - repeated with `--accept-config-change`, the command writes the change to
   the run log (a `<PHASE>-config-change` record naming the pin it
   replaces) before anything else, pins the run to the weaker mode, and
@@ -1094,15 +1072,13 @@ worktrees and, from a REMOTE agent, your checkout.
   existing objects) is read-only, and its commits land in the issue's
   private object directory, which the controller imports
   ([State and recovery](agent-guides/state-and-recovery.md#runtime-artifacts)).
-  A LOCAL agent and a LOCAL validation command write the repository root
-  with the git directory read-only, so a commit, stash or branch fails
-  outright. A pre-merge command sees the exported tree and nothing else of
-  the repository.
+  A validation or pre-merge command sees the exported tree and nothing else
+  of the repository.
 - **Caches.** `~/.cache` inside is a persistent, controller-owned cache for
   the launches that produce a change (`ANALYZE_EXECUTE`, `FIX`,
-  `REPLAN_REEXECUTE`, REMOTE per issue, LOCAL per checkout) and for LOCAL
-  validation commands. Every other agent launch (`REVIEW`, `UPDATE_EPIC`)
-  and a pre-merge command get only the one in their private home, so a
+  `REPLAN_REEXECUTE`), one per issue. Every other agent launch (`REVIEW`,
+  `UPDATE_EPIC`) and a validation or pre-merge command get only the one in
+  their private home, so a
   reviewer never loads what an implementer left there. Your own `~/.cache`
   is never visible. So a launch that gets the persistent cache refuses a
   provider CLI or a provider's directory (`PI_CODING_AGENT_DIR`, say) that
@@ -1199,8 +1175,8 @@ configuration error: there is no unbounded mode. `poll_interval_seconds` is
 the least time between two snapshots of the EPIC's native graph while new
 issues may still be admitted. `stop_grace_seconds` is how long a stop, or
 a first Ctrl-C, waits for the interrupted workers to return; a second
-Ctrl-C does not wait. The section is ignored by `run`, `step`, `resume` and
-`local`.
+Ctrl-C does not wait. The section is ignored by `run`, `step` and
+`resume`.
 
 `autoforge epic run --max-parallel N` (and `epic resume --max-parallel N`)
 overrides `max_parallel` for that one invocation, within the same bounds 1-4;
@@ -1216,25 +1192,3 @@ scheduler before editing the file. Workers stop at `READY_FOR_MERGE`
 whatever `safety.allow_merge` says; with `allow_merge: true` the scheduler
 says so once at startup and leaves the file as it is
 ([Workflow](agent-guides/workflow.md#scheduler-execution-policy)).
-
-## Local mode configuration
-
-The `local:` block configures [Local mode](local-mode.md): `feature_dir`,
-`max_fix_rounds` and the argv-array `validation_commands`, plus the
-workspace policy (`exclude`, `max_workspace_entries`, `max_workspace_bytes`)
-that decides what the workspace fingerprint covers and when a tree is too
-large to bind.
-
-A local run needs only the profiles its configured bound can reach: with the
-default `max_fix_rounds: 1` that is `analyze_execute`, `fix`,
-`review_round_1` and `review_round_2_5`. Local review rounds are routed
-exactly like remote ones, so `max_fix_rounds: 5` or more also requires
-`review_round_6_plus`. `local doctor` and the start of a `local run` check
-that, rather than leaving it to fail five fix rounds in. `replan_reexecute`
-and `update_epic` belong to the remote lifecycle only.
-
-A local run freezes part of its configuration as its run contract when it
-starts (`local.exclude`, both cost bounds, `local.validation_commands`,
-`local.max_fix_rounds`, `workflow.max_total_steps`, the prompt version); a
-resumed run refuses a changed value rather than adopting it. See
-[Local mode](local-mode.md#the-run-contract).

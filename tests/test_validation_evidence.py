@@ -3,10 +3,10 @@
 ADR 0006 Wave 2B end to end, offline: real git repositories under
 ``tmp_path``, real local Python validators, the in-memory GitHub and
 scripted agents. REMOTE validation is the engine's
-``validate_remote_candidate`` entry point, which no phase calls yet (#173);
-LOCAL validation is the existing ``local.validation_commands`` path, which
-now leaves a record for every command it runs. The pure value checks are in
-``tests/test_evidence.py``.
+``validate_remote_candidate`` entry point, which no phase calls yet (#173).
+LOCAL's in-place validation went with its way in (ADR 0009 D5, #387); what
+is left of it is the refusal of the REMOTE entry point on a LOCAL run, in
+memory. The pure value checks are in ``tests/test_evidence.py``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import dataclasses
 import errno
 import hashlib
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -35,7 +34,6 @@ from autoforge.errors import (
     SandboxLaunchRefusedError,
     StateError,
     ValidationInconclusiveError,
-    VerificationError,
 )
 from autoforge.evidence import (
     PrHeadProvenance,
@@ -62,7 +60,7 @@ from .conftest import (
     make_local_engine,
     pollute_operator_environment,
 )
-from .local_helpers import impl_result, local_repo, review_result, scripted, touch_impl
+from .local_helpers import local_repo
 
 PY = sys.executable
 PROVENANCE = WorktreeProvenance(2, "2", True)
@@ -927,231 +925,3 @@ def test_the_dry_run_plan_lists_the_set_and_runs_nothing(tmp_path):
     assert "validation.commands gate every REMOTE candidate" in notes
     assert "before anything is pushed or published" in notes
     assert not ran.exists()
-
-
-# -- LOCAL: records of the in-place validation (D2.6, D7.1, D7.2) ----------------------
-
-
-def test_a_local_validation_leaves_records_with_start_and_end_fingerprints(tmp_path):
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.local.validation_commands = [
-        py("import pathlib; pathlib.Path('generated.txt').write_text('made by the validator')"),
-        ["true"],
-    ]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = scripted(
-        eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
-    )
-    eng.run(max_steps=2)
-    state = saved(eng)
-    assert state.phase == Phase.REVIEW
-    first, second, confirming = state.validation_records
-    assert first["candidate"]["kind"] == "local" and first["outcome"] == "PASS"
-    assert first["start_fingerprint"] != first["end_fingerprint"]  # the validator wrote a file
-    assert second["start_fingerprint"] == first["end_fingerprint"]
-    assert second["end_fingerprint"] == state.workspace_fingerprint
-    # D7.2 (#173): the first command changed covered bytes, so the set ran once
-    # more from the tree it left. The second command started and ended there,
-    # so its record is reused; the generator runs again and stays there too.
-    assert confirming["definition"]["index"] == 0 and confirming["outcome"] == "PASS"
-    assert confirming["start_fingerprint"] == confirming["end_fingerprint"]
-    assert confirming["end_fingerprint"] == state.workspace_fingerprint
-    assert first["candidate"]["run_id"] == state.run_id
-    assert first["candidate"]["workspace_policy_digest"] == (
-        eng.local_contract().workspace_policy.digest()
-    )
-    assert first["enforcement"]["enforced"] is False
-    assert state.validation_attempt == {}
-
-
-def test_a_failing_local_validation_is_a_fail_record_and_the_message_is_unchanged(tmp_path):
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.local.validation_commands = [["false"]]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = scripted(
-        eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
-    )
-    with pytest.raises(VerificationError, match="validation command 'false' failed with exit 1"):
-        eng.run(max_steps=3)
-    [record] = saved(eng).validation_records
-    assert record["outcome"] == "FAIL" and record["exit_code"] == 1
-
-
-def test_a_local_contract_beyond_the_bounds_blocks_before_the_agent(tmp_path):
-    """A contract persisted before the bounds existed (the loader refuses such
-    a configuration now): BLOCKED, with no agent and no validator launched."""
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.local.validation_commands = [["true"]] * 17
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    outcomes = eng.run(max_steps=3)
-    assert outcomes[-1].next_phase == "BLOCKED"
-    state = saved(eng)
-    assert "17 definitions, over the bound of 16" in state.block_reason
-    assert eng.provider.calls == [] and state.validation_records == []
-
-
-def test_an_interrupted_local_validation_is_recorded_on_resume_and_rerun(tmp_path, monkeypatch):
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.local.validation_commands = [py("pass", TAG)]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-            (None, lambda e: impl_result(changed=False)),
-        ],
-    )
-    interrupting(monkeypatch)
-    with pytest.raises(KeyboardInterrupt):
-        eng.run(max_steps=2)
-    marker = saved(eng).validation_attempt
-    assert marker["candidate"]["kind"] == "local" and marker["start_fingerprint"]
-    monkeypatch.undo()
-    eng.load()
-    eng.step()
-    state = saved(eng)
-    assert [r["outcome"] for r in state.validation_records] == ["INTERRUPTED", "PASS"]
-    assert state.validation_attempt == {} and state.phase == Phase.REVIEW
-    assert "end_fingerprint" not in state.validation_records[0]
-
-
-def _leave_fifo(root: Path) -> None:
-    os.mkfifo(root / "leftover.pipe")
-
-
-def _leave_too_many_entries(root: Path) -> None:
-    junk = root / "junk"
-    junk.mkdir()
-    for i in range(100):
-        (junk / str(i)).write_text("x", encoding="utf-8")
-
-
-@pytest.mark.parametrize(
-    ("leave", "refusal"),
-    [
-        (_leave_fifo, "leftover.pipe"),
-        (_leave_too_many_entries, "refusing to fingerprint the working tree"),
-    ],
-    ids=["fifo", "over-budget"],
-)
-def test_a_marker_is_recorded_before_a_plan_that_refuses_the_working_tree(
-    tmp_path, monkeypatch, leave, refusal
-):
-    """R2-F1: the interrupted validator left a tree the LOCAL plan's snapshot
-    refuses. The dry run stays read-only and leaves the marker pending; the
-    real step records it INTERRUPTED under the lock before it plans, so the
-    refusal is persisted with the record, and a second resume appends nothing."""
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.local.max_workspace_entries = 40
-    cfg.local.validation_commands = [py("pass", TAG)]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-            (None, lambda e: impl_result(changed=False)),
-        ],
-    )
-    interrupting(monkeypatch)
-    with pytest.raises(KeyboardInterrupt):
-        eng.run(max_steps=2)
-    monkeypatch.undo()
-    marker = saved(eng).validation_attempt
-    assert marker
-    leave(root)
-    calls = len(eng.provider.calls)
-
-    eng.load()
-    before = eng.paths.state_file.read_bytes()
-    with pytest.raises(VerificationError, match=refusal):
-        eng.step(dry_run=True)
-    assert eng.paths.state_file.read_bytes() == before
-
-    with pytest.raises(VerificationError, match=refusal):
-        eng.step()
-    state = saved(eng)
-    assert state.validation_attempt == {} and state.phase == Phase.ANALYZE_EXECUTE
-    [interrupted] = state.validation_records
-    assert interrupted["outcome"] == "INTERRUPTED"
-    assert interrupted["marked_at"] == marker["marked_at"]
-    after = eng.paths.state_file.read_bytes()
-
-    eng.load()
-    with pytest.raises(VerificationError, match=refusal):
-        eng.step()
-    assert eng.paths.state_file.read_bytes() == after
-    assert len(eng.provider.calls) == calls
-
-
-def test_a_changed_local_validation_command_is_refused_before_anything_runs(tmp_path):
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.local.validation_commands = [["true"]]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.run(max_steps=1)
-    before = eng.paths.state_file.read_bytes()
-    cfg2 = default_config()
-    cfg2.local.validation_commands = [["true", "--changed"]]
-    again = make_local_engine(root, "features/add-filter.md", cfg=cfg2, start=False)
-    with pytest.raises(VerificationError, match="validation_commands"):
-        again.load()
-        again.step()
-    assert again.provider.calls == []
-    assert eng.paths.state_file.read_bytes() == before
-
-
-def test_the_local_review_binding_passes_with_validation_records(tmp_path):
-    """The records ride along with the existing LOCAL loop unchanged."""
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.local.validation_commands = [["true"]]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = scripted(
-        eng,
-        root,
-        [
-            (lambda r: touch_impl(r, "v1\n"), lambda e: impl_result()),
-            (None, lambda e: review_result(e.state.workspace_fingerprint)),
-        ],
-    )
-    eng.run(max_steps=5)
-    state = saved(eng)
-    assert state.phase == Phase.DONE
-    assert [r["outcome"] for r in state.validation_records] == ["PASS"]
-    assert os.path.basename(state.validation_records[0]["run_log"]).endswith("-1")
-
-
-def test_a_failing_local_validation_whose_tree_cannot_be_walked_keeps_its_message(tmp_path):
-    """A command that failed and left a tree the walk refuses: no record (no
-    end fingerprint to give it), the launch still logged, and the failure
-    reported as before, not the walk's refusal."""
-    root = local_repo(tmp_path)
-    cfg = default_config()
-    cfg.local.max_workspace_entries = 40
-    cfg.local.validation_commands = [
-        py(
-            "import pathlib, sys; d = pathlib.Path('junk'); d.mkdir(); "
-            "[(d / str(i)).write_text('x') for i in range(100)]; "
-            "print('lint failed'); sys.exit(3)"
-        )
-    ]
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = scripted(
-        eng, root, [(lambda r: touch_impl(r, "v1\n"), lambda e: impl_result())]
-    )
-    with pytest.raises(VerificationError, match="failed with exit 3.*Output tail: lint failed"):
-        eng.run(max_steps=3)
-    state = saved(eng)
-    assert state.validation_records == [] and state.validation_attempt == {}
-    step = next(p for p in (eng.paths.logs_dir / state.run_id).iterdir() if "validation" in p.name)
-    execution = json.loads((step / "execution.json").read_text(encoding="utf-8"))
-    assert execution["exit_code"] == 3
-    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
-    assert request["metadata"]["validation_record_seq"] is None

@@ -12,7 +12,6 @@ GitHub, and scripted agents (the Pi fake for parity). What is gated:
   are written before the reviewer launches, the reviewer is shown them
   (D5.5, D9.1, D9.2), and it cannot return a clean result over a failure
   (D9.4);
-- LOCAL: the convergence rule (D7.2) and the REVIEW entry (D5.7);
 - the operator's override watermark (D14.2).
 
 The pure eligibility and binding rules are in ``tests/test_evidence.py``;
@@ -33,8 +32,7 @@ import pytest
 
 from autoforge import cli
 from autoforge.config import _claude_profile, _opencode_profile, default_config
-from autoforge.engine import MAX_LOCAL_PHASE_ATTEMPTS
-from autoforge.errors import ControlResultValidationError, VerificationError
+from autoforge.errors import ControlResultValidationError
 from autoforge.evidence import (
     MAX_FAILURE_COUNT,
     MAX_RECORDS,
@@ -65,18 +63,12 @@ from .conftest import (
     git_out,
     implement,
     make_engine,
-    make_local_engine,
     no_change,
     publish_pr_head,
     review_result,
     reviewed_head_in,
     scripted,
 )
-from .local_helpers import finding as local_finding
-from .local_helpers import fix_result as local_fix_result
-from .local_helpers import impl_result, local_repo, touch_impl
-from .local_helpers import review_result as local_review_result
-from .local_helpers import scripted as local_scripted
 
 PY = sys.executable
 # The branch ANALYZE_EXECUTE pushes issue #2's implementation to.
@@ -1073,206 +1065,6 @@ def test_unblock_sets_the_watermark_and_the_same_candidate_is_validated_again(
     assert outcomes(s) == ["FAIL", "PASS"]
     assert s.validation_records[1]["candidate"]["commit"] == commit
     assert eng.origin.head(IMPLEMENTATION_BRANCH) == commit
-
-
-# -- LOCAL (D5.7, D7.2) ----------------------------------------------------------------
-
-
-def local_run(tmp_path, steps, *commands, exclude=None):
-    root = local_repo(tmp_path / "repo")
-    cfg = default_config()
-    cfg.local.validation_commands = [list(c) for c in commands]
-    if exclude is not None:
-        cfg.local.exclude = exclude
-    eng = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    eng.provider._handler = local_scripted(eng, root, steps)
-    return eng, root
-
-
-def implemented(text: str = "v1\n"):
-    return (lambda r: touch_impl(r, text), lambda e: impl_result())
-
-
-def reviewed(findings=None, round: int = 1):
-    return (None, lambda e: local_review_result(e.state.workspace_fingerprint, round, findings))
-
-
-def test_local_a_validator_writing_an_excluded_path_converges_without_a_rerun(tmp_path):
-    writes = [
-        PY,
-        "-c",
-        "import os; os.makedirs('build', exist_ok=True); open('build/out', 'a').write('x')",
-    ]
-
-    # The excluded directory exists already, as a build output does: an
-    # excluded entry's path and rule are part of the fingerprint, so only
-    # what is written inside it is not.
-    def implemented_with_build_dir(root):
-        touch_impl(root, "v1\n")
-        (root / "build").mkdir()
-
-    steps = [(implemented_with_build_dir, lambda e: impl_result()), reviewed()]
-    eng, root = local_run(tmp_path, steps, writes, exclude=["build"])
-    assert [o.next_phase for o in eng.run(max_steps=5)] == ["ANALYZE_EXECUTE", "REVIEW", "DONE"]
-    s = saved(eng)
-    (record,) = s.validation_records
-    assert record["start_fingerprint"] == record["end_fingerprint"] == s.workspace_fingerprint
-    assert (root / "build" / "out").read_text(encoding="utf-8") == "x"
-    assert s.review_evidence["records"] == [{"seq": record["seq"], "digest": record["digest"]}]
-    assert s.review_evidence["candidate"]["kind"] == "local"
-    prompt = eng.provider.calls[-1].prompt
-    assert EVIDENCE_HEADER in prompt
-    assert "`local.validation_commands`" in prompt and "**PASS** (exit 0)" in prompt
-    assert "validated in place in the working tree" in prompt
-
-
-def test_local_an_idempotent_generator_converges_with_one_confirming_run(tmp_path):
-    generates = [PY, "-c", "open('generated.txt', 'w').write('generated\\n')"]
-    eng, root = local_run(tmp_path, [implemented(), reviewed()], generates, PASSES)
-    eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    s = saved(eng)
-    first, second, confirming = s.validation_records
-    moved = first["end_fingerprint"]
-    assert first["start_fingerprint"] != moved, "the generator wrote"
-    # The second definition ran on the generated tree and left it alone, so
-    # the confirming run reran only the generator, which then stayed there.
-    assert second["start_fingerprint"] == second["end_fingerprint"] == moved
-    assert confirming["definition"]["index"] == 0
-    assert confirming["start_fingerprint"] == confirming["end_fingerprint"] == moved
-    assert s.workspace_fingerprint == moved
-    assert eng.step().next_phase == "DONE"
-    assert [r["seq"] for r in saved(eng).review_evidence["records"]] == [
-        confirming["seq"],
-        second["seq"],
-    ]
-
-
-def test_local_a_non_idempotent_validator_is_not_verified_then_blocks(tmp_path):
-    grows = [PY, "-c", "open('grows.txt', 'a').write('x')"]
-    steps = [implemented(f"v{i}\n") for i in range(MAX_LOCAL_PHASE_ATTEMPTS)]
-    eng, root = local_run(tmp_path, steps, grows)
-    eng.step()
-    for _ in range(MAX_LOCAL_PHASE_ATTEMPTS):
-        with pytest.raises(VerificationError, match="validation does not converge"):
-            eng.step()
-    assert "local.exclude" in saved(eng).verification_failures[-1]
-    assert eng.step().next_phase == "BLOCKED"
-    assert "without ever producing a verified result" in eng.state.block_reason
-    assert len(eng.provider.calls) == MAX_LOCAL_PHASE_ATTEMPTS
-
-
-def test_local_an_unchanged_tree_with_a_failure_is_not_validated_again(tmp_path):
-    steps = [implemented(), (None, lambda e: impl_result(changed=False))]
-    eng, root = local_run(tmp_path, steps, FAILS)
-    eng.step()
-    with pytest.raises(VerificationError, match="exit 3"):
-        eng.step()
-    assert outcomes(saved(eng)) == ["FAIL"]
-    # The relaunched agent leaves the tree as it was: the FAIL is final for it.
-    with pytest.raises(VerificationError, match="so it was not run again"):
-        eng.step()
-    assert outcomes(saved(eng)) == ["FAIL"]
-
-
-def test_local_a_failure_is_final_only_for_the_tree_it_ran_on(tmp_path):
-    """A relaunch that changes the tree is a new candidate: the FAIL recorded for
-    the old fingerprint is not applied to it, and the command runs again."""
-
-    def adds_fixed(root):
-        (root / "fixed.txt").write_text("ok\n", encoding="utf-8")
-
-    steps = [implemented(), (adds_fixed, lambda e: impl_result())]
-    eng, root = local_run(tmp_path, steps, NEEDS_FIX)
-    eng.step()
-    with pytest.raises(VerificationError, match="exit 1"):
-        eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    s = saved(eng)
-    failed, passed = s.validation_records
-    assert (failed["outcome"], passed["outcome"]) == ("FAIL", "PASS")
-    assert failed["start_fingerprint"] != passed["start_fingerprint"]
-    assert passed["start_fingerprint"] == passed["end_fingerprint"] == s.workspace_fingerprint
-
-
-def test_local_review_needs_evidence_for_the_bound_fingerprint_itself(tmp_path):
-    """A record for another fingerprint never stands for the bound one: a state
-    whose bound workspace has none of its own blocks before the reviewer."""
-    eng, root = local_run(tmp_path, [implemented()], PASSES)
-    eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    (record,) = saved(eng).validation_records
-    touch_impl(root, "v2\n")
-    eng.state.workspace_fingerprint = eng.local_workspace().snapshot().fingerprint
-    assert eng.state.workspace_fingerprint != record["start_fingerprint"]
-    eng.save()
-    assert eng.step().next_phase == "BLOCKED"
-    assert "no validation evidence for this LOCAL run" in eng.state.block_reason
-    assert len(eng.provider.calls) == 1, "no reviewer was launched"
-    assert saved(eng).validation_records == [record], "LOCAL REVIEW runs no validation"
-
-
-def test_local_a_changed_contract_at_review_entry_is_refused_before_anything_runs(tmp_path):
-    eng, root = local_run(tmp_path, [implemented()], PASSES)
-    eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    before = eng.paths.state_file.read_bytes()
-    eng.close()
-    cfg = default_config()
-    cfg.local.validation_commands = [FAILS]
-    again = make_local_engine(root, "features/add-filter.md", cfg=cfg, start=False)
-    with pytest.raises(VerificationError, match="validation_commands"):
-        again.load()
-        again.step()
-    assert again.provider.calls == []
-    assert eng.paths.state_file.read_bytes() == before
-
-
-def test_local_a_fix_binds_the_next_review_to_new_evidence(tmp_path):
-    steps = [
-        implemented(),
-        reviewed([local_finding()]),
-        (lambda r: touch_impl(r, "v2\n"), lambda e: local_fix_result(["R1-F1"])),
-        reviewed(round=2),
-    ]
-    eng, root = local_run(tmp_path, steps, PASSES)
-    eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    assert eng.step().next_phase == "FIX"
-    first = saved(eng).review_evidence
-    assert eng.step().next_phase == "REVIEW"
-    assert eng.step().next_phase == "DONE"
-    s = saved(eng)
-    second = s.review_evidence
-    assert (first["review_round"], second["review_round"]) == (1, 2)
-    assert first["candidate"]["fingerprint"] != second["candidate"]["fingerprint"]
-    assert second["candidate"]["fingerprint"] == s.workspace_fingerprint
-    assert second["records"] != first["records"]
-    assert outcomes(s) == ["PASS", "PASS"]
-
-
-def test_local_a_legacy_review_with_no_evidence_blocks_without_validating(tmp_path):
-    eng, root = local_run(tmp_path, [implemented()], PASSES)
-    eng.step()
-    assert eng.step().next_phase == "REVIEW"
-    # As a state persisted before validation records existed holds it.
-    eng.state.validation_records = []
-    eng.state.review_evidence = {}
-    eng.save()
-    out = eng.step()
-    assert out.next_phase == "BLOCKED"
-    assert "no validation evidence for this LOCAL run; start a new local run" in (
-        eng.state.block_reason
-    )
-    assert len(eng.provider.calls) == 1, "no reviewer was launched"
-    assert saved(eng).validation_records == [], "LOCAL REVIEW runs no validation"
-
-
-def test_local_runs_make_no_github_call(tmp_path):
-    """The gates run in LOCAL behind the exploding GitHub: any call would raise."""
-    eng, root = local_run(tmp_path, [implemented(), reviewed()], PASSES)
-    assert [o.next_phase for o in eng.run(max_steps=5)] == ["ANALYZE_EXECUTE", "REVIEW", "DONE"]
-    assert outcomes(saved(eng)) == ["PASS"]
 
 
 # -- provider parity (D17.2) -----------------------------------------------------------

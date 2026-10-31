@@ -3270,42 +3270,6 @@ def test_effect_state_over_the_total_character_bound_is_refused(tmp_path):
 # -- LOCAL mode carries no effect state ----------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("effect_records", [{}]),
-        ("effect_records", "UPDATE_EPIC"),
-        ("entry_observation", _observation(Phase.REVIEW)),
-        ("completion_context", {"phase": "REVIEW"}),
-        ("launch_label", LABEL_AGENT_PUBLISHES),
-        ("launch_label", LABEL_CONTROLLER_PUBLISHES),
-    ],
-)
-def test_a_local_run_carrying_any_effect_state_is_refused(tmp_path, field, value):
-    """D13.2: LOCAL performs no external effects, so a LOCAL state carrying any
-    effect field (or a launch label) is corruption, not a run to resume."""
-    d = _local_state().to_dict()
-    d[field] = value
-    p = _write(tmp_path / "state.json", d)
-    with pytest.raises(StateError) as exc:
-        load_state(p)
-    assert f"state field(s) '{field}' are set on a LOCAL run" in str(exc.value)
-
-
-def test_a_local_run_with_empty_effect_fields_loads(tmp_path):
-    """D13.2: the empty values are what every protocol-7 LOCAL save writes."""
-    p = tmp_path / "state.json"
-    save_state(_local_state(attempt=1), p)
-    loaded = load_state(p)
-    assert _effect_fields(loaded) == {
-        "effect_records": [],
-        "entry_observation": {},
-        "completion_context": {},
-        "launch_label": LABEL_NONE,
-    }
-    assert loaded.phase_effects().empty
-
-
 # -- protocol migration (D13.1, D13.2) ---------------------------------------------------
 
 
@@ -3402,27 +3366,6 @@ def test_a_legacy_remote_resume_is_labelled_by_the_contract_it_launched_under(
     assert load_state(p).launch_label == label
 
 
-def test_a_legacy_local_state_gets_no_launch_label(tmp_path):
-    """D13.2: the label is a REMOTE concept; a protocol-5 LOCAL file mid-launch
-    loads with no label, so its protocol-7 save stays loadable as LOCAL."""
-    d = _local_state(attempt=1).to_dict()
-    d["protocol_version"] = "5"
-    for key in (
-        *_EFFECT_KEYS,
-        "acceptance_outcomes",
-        "config_fingerprint",
-        *_VALIDATION_KEYS,
-        *_OPERATOR_KEYS,
-        *_PIN_KEYS,
-    ):
-        del d[key]
-    p = _write(tmp_path / "state.json", d)
-    loaded = load_state(p)
-    assert loaded.launch_label == LABEL_NONE
-    save_state(loaded, p)
-    assert load_state(p).launch_label == LABEL_NONE
-
-
 @pytest.mark.parametrize("protocol", ["4", "5"])
 @pytest.mark.parametrize(
     ("field", "value"),
@@ -3496,18 +3439,6 @@ def test_an_unlabelled_file_missing_an_effect_field_is_refused(tmp_path, local_f
     assert "is missing required field(s) 'effect_records'" in str(exc.value)
 
 
-@pytest.mark.parametrize("missing", _EFFECT_KEYS)
-def test_a_protocol_7_local_file_missing_an_effect_field_is_refused(tmp_path, missing):
-    """LOCAL carries no effect state, but every protocol-7 LOCAL save still writes
-    the four fields at their empty values; one that is absent is not that save."""
-    d = _local_state().to_dict()
-    del d[missing]
-    p = _write(tmp_path / "state.json", d)
-    with pytest.raises(StateError) as exc:
-        load_state(p)
-    assert f"is missing required field(s) {missing!r}" in str(exc.value)
-
-
 def test_a_legacy_file_with_effect_fields_at_their_empty_values_loads(tmp_path):
     """D13.2: the label decides, not the shape -- empty values are no effect state."""
     d = _legacy("5", phase=Phase.UPDATE_EPIC, attempt=1, current_pr_url=PR42)
@@ -3541,7 +3472,9 @@ _EVERY_LABEL = [*(str(n) for n in range(1, 14)), None]
 
 
 @pytest.mark.parametrize("label", _EVERY_LABEL, ids=lambda label: f"label-{label}")
-@pytest.mark.parametrize("mode", ["SATELLITE", "remote", "", None, 1, ["REMOTE"]], ids=repr)
+@pytest.mark.parametrize(
+    "mode", ["SATELLITE", "LOCAL", "remote", "", None, 1, ["REMOTE"]], ids=repr
+)
 def test_a_mode_other_than_remote_is_refused_under_every_label_and_left_unchanged(
     tmp_path, mode, label, local_fields
 ):
@@ -3562,6 +3495,30 @@ def test_a_mode_other_than_remote_is_refused_under_every_label_and_left_unchange
         load_state(p)
     assert str(exc.value) == f"state file has unknown mode {mode!r}"
     assert p.read_bytes() == before
+
+
+@pytest.mark.parametrize("label", _EVERY_LABEL, ids=lambda label: f"label-{label}")
+def test_a_local_runs_own_state_is_refused_under_every_label_and_left_unchanged(tmp_path, label):
+    """ADR 0009 D4 (#387): LOCAL is removed, so the state a LOCAL run saved,
+    its contract, specification and fingerprint included, is an unknown mode
+    like any other, under every label LOCAL wrote, one it never wrote and
+    none. Nothing of it is read past the mode, nor is the file touched."""
+    d = _local_state().to_dict()
+    assert d["mode"] == "LOCAL" and d["local_run_contract"]
+    if label is None:
+        del d["protocol_version"]
+    else:
+        d["protocol_version"] = label
+    p = _write(tmp_path / "state.json", d)
+    before = (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+    with pytest.raises(StateError) as exc:
+        load_state(p)
+    assert str(exc.value) == "state file has unknown mode 'LOCAL'"
+    assert (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns) == before
+    # The member stays for the code #388 deletes, and the loader takes a
+    # member as it is: handed one, it refuses it all the same.
+    with pytest.raises(StateError, match="^state file has unknown mode 'LOCAL'$"):
+        AutoForgeState.from_dict({**d, "mode": WorkflowMode.LOCAL})
 
 
 def test_the_local_fields_are_the_twelve_every_remote_save_writes_empty():
@@ -4006,21 +3963,6 @@ def test_a_recorded_resolution_names_a_verified_comment_exactly_for_an_acceptanc
         load_state(_write(tmp_path / "state.json", d))
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "match"),
-    [
-        ("acceptance_outcomes", [_outcome()], "'acceptance_outcomes' is set on a LOCAL run"),
-        ("unblock_history", [UNBLOCK_ENTRY], "acceptance 'action' on a LOCAL run"),
-    ],
-)
-def test_a_local_run_carries_no_acceptance_state(tmp_path, field, value, match):
-    """LOCAL runs perform no external writes, so they have no acceptance actions."""
-    d = _local_state().to_dict()
-    d[field] = value
-    with pytest.raises(StateError, match=match):
-        load_state(_write(tmp_path / "state.json", d))
-
-
 def test_acceptance_outcomes_belong_to_the_issue_they_were_recorded_for():
     state = _after_fix()
     state.reset_for_new_issue("https://github.com/owner/repo/issues/3")
@@ -4147,14 +4089,6 @@ def test_a_malformed_recorded_configuration_is_refused(tmp_path, value, needle):
     with pytest.raises(StateError) as exc:
         load_state(p)
     assert needle in str(exc.value)
-
-
-def test_a_local_run_carrying_a_recorded_configuration_is_refused(tmp_path):
-    d = _local_state().to_dict()
-    d["config_fingerprint"] = _recorded_config()
-    p = _write(tmp_path / "state.json", d)
-    with pytest.raises(StateError, match="'config_fingerprint' is set on a LOCAL run"):
-        load_state(p)
 
 
 def test_a_new_issue_keeps_the_recorded_configuration():
@@ -4335,13 +4269,6 @@ def test_a_record_of_another_run_is_refused(tmp_path):
     d = make_state(run_id="af-test-2").to_dict()
     d["validation_records"] = [record]
     with pytest.raises(StateError, match="this run's log directory"):
-        load_state(_write(tmp_path / "state.json", d))
-
-
-def test_a_local_run_refuses_a_remote_record(tmp_path):
-    d = _local_state().to_dict()
-    d["validation_records"] = [_validation_record()]
-    with pytest.raises(StateError, match="remote candidate in a LOCAL run"):
         load_state(_write(tmp_path / "state.json", d))
 
 
@@ -4526,20 +4453,6 @@ def test_a_protocol_10_fix_plan_loads_migrated_and_is_relabelled_on_save(tmp_pat
     raw = json.loads(p.read_text(encoding="utf-8"))
     assert raw["protocol_version"] == "12" and raw["operator_comment_outcomes"] == []
     assert raw["last_fix_resolutions"][0]["operator_evidence"] == []
-    assert load_state(p) == loaded
-
-
-def test_a_protocol_10_local_file_loads_and_is_relabelled(tmp_path):
-    """LOCAL has no operator actions: a protocol-10 LOCAL file loads with no
-    outcome, its resolutions gain no evidence, and the next save loads."""
-    resolutions = [{"finding_id": "R1-F1", "resolution": "fixed"}]
-    d = _as_protocol(_local_state(last_fix_resolutions=resolutions).to_dict(), "10")
-    p = _write(tmp_path / "state.json", d)
-    loaded = load_state(p)
-    assert loaded.protocol_version == "12" and loaded.operator_comment_outcomes == []
-    assert loaded.last_fix_resolutions == resolutions
-    save_state(loaded, p)
-    assert json.loads(p.read_text(encoding="utf-8"))["operator_comment_outcomes"] == []
     assert load_state(p) == loaded
 
 
@@ -4948,31 +4861,6 @@ def test_a_recorded_resolution_carries_well_formed_operator_evidence(tmp_path, e
         load_state(_write(tmp_path / "state.json", d))
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "match"),
-    [
-        (
-            "operator_comment_outcomes",
-            [_operator_outcome()],
-            "'operator_comment_outcomes' is set on a LOCAL run",
-        ),
-        (
-            "last_fix_resolutions",
-            [{"finding_id": "R1-F1", "resolution": "fixed", "operator_evidence": []}],
-            "carries 'operator_evidence' on a LOCAL run",
-        ),
-    ],
-)
-def test_a_local_run_carries_no_operator_state(tmp_path, field, value, match):
-    """LOCAL runs have no GitHub, so they have no operator actions: neither an
-    outcome nor a resolution's evidence list, even empty."""
-    d = _local_state().to_dict()
-    assert d["operator_comment_outcomes"] == []
-    d[field] = value
-    with pytest.raises(StateError, match=match):
-        load_state(_write(tmp_path / "state.json", d))
-
-
 def test_operator_outcomes_belong_to_the_issue_they_were_recorded_for():
     state = _after_operator_fix()
     state.reset_for_new_issue("https://github.com/owner/repo/issues/3")
@@ -4989,10 +4877,9 @@ PIN = {
 }
 
 
-@pytest.mark.parametrize("local", [False, True], ids=["remote", "local"])
-def test_a_sandbox_pin_round_trips_under_the_current_protocol(tmp_path, local):
-    """Both modes pin: the field is beside LOCAL's contract and REMOTE's recorded configuration."""
-    state = _local_state(sandbox_pin=dict(PIN)) if local else make_state(sandbox_pin=dict(PIN))
+def test_a_sandbox_pin_round_trips_under_the_current_protocol(tmp_path):
+    """The field is beside the run's recorded configuration."""
+    state = make_state(sandbox_pin=dict(PIN))
     p = tmp_path / "state.json"
     save_state(state, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
@@ -5000,12 +4887,11 @@ def test_a_sandbox_pin_round_trips_under_the_current_protocol(tmp_path, local):
     assert load_state(p).sandbox_pin == PIN
 
 
-@pytest.mark.parametrize("local", [False, True], ids=["remote", "local"])
-def test_a_protocol_11_file_loads_unpinned_and_is_relabelled(tmp_path, local):
+def test_a_protocol_11_file_loads_unpinned_and_is_relabelled(tmp_path):
     """A protocol-11 file is this protocol's shape without the pin: it loads
     with ``{}`` (not checked; the next step, resume or unblock pins it), and
     the next save writes the current protocol."""
-    d = (_local_state() if local else make_state(phase=Phase.REVIEW)).to_dict()
+    d = make_state(phase=Phase.REVIEW).to_dict()
     d["protocol_version"] = "11"
     _drop_pin(d)
     p = _write(tmp_path / "state.json", d)
@@ -5069,9 +4955,8 @@ def test_a_protocol_12_file_missing_its_sandbox_pin_is_refused(tmp_path, local_f
         ({"mode": "required"}, "'sandbox_pin': schema None is not 1"),
     ],
 )
-@pytest.mark.parametrize("local", [False, True], ids=["remote", "local"])
-def test_a_malformed_sandbox_pin_is_refused_never_read_as_unpinned(tmp_path, pin, match, local):
-    d = (_local_state() if local else make_state()).to_dict()
+def test_a_malformed_sandbox_pin_is_refused_never_read_as_unpinned(tmp_path, pin, match):
+    d = make_state().to_dict()
     d["sandbox_pin"] = pin
     with pytest.raises(StateError, match=match):
         load_state(_write(tmp_path / "state.json", d))

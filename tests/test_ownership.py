@@ -275,7 +275,7 @@ def test_a_standalone_state_before_done_holds_its_issue(tmp_path, phase):
     assert hold.holds
 
 
-@pytest.mark.parametrize("state", ["absent dir", "absent file", "done", "no issue", "local"])
+@pytest.mark.parametrize("state", ["absent dir", "absent file", "done", "no issue"])
 def test_what_holds_nothing(tmp_path, state):
     sd = tmp_path / ".autoforge"
     if state == "absent file":
@@ -284,7 +284,21 @@ def test_what_holds_nothing(tmp_path, state):
         _save_standalone(sd, _state(7, Phase.DONE))
     elif state == "no issue":
         _save_standalone(sd, _state(None, Phase.UPDATE_EPIC))
-    elif state == "local":
+    hold = standalone_hold(sd)
+    assert not hold.holds and hold.problem == ""
+    assert not os.path.lexists(sd) or state != "absent dir"
+
+
+@pytest.mark.parametrize("damage", ["garbage", "symlink", "local"])
+def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, damage):
+    """A LOCAL run's state among them: the pass no longer skips it as LOCAL's
+    own (ADR 0009 D4, #387), so it is the hold's problem like any state that
+    does not load, and the pass still admits (``test_epic_commands``)."""
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    if damage == "garbage":
+        (sd / "state.json").write_text("{ not json " + "ghp_" + "b" * 36)
+    elif damage == "local":
         _save_standalone(
             sd,
             AutoForgeState(
@@ -303,17 +317,6 @@ def test_what_holds_nothing(tmp_path, state):
                 updated_at="2026-10-18T00:00:00+00:00",
             ),
         )
-    hold = standalone_hold(sd)
-    assert not hold.holds and hold.problem == ""
-    assert not os.path.lexists(sd) or state != "absent dir"
-
-
-@pytest.mark.parametrize("damage", ["garbage", "symlink"])
-def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, damage):
-    sd = tmp_path / ".autoforge"
-    sd.mkdir()
-    if damage == "garbage":
-        (sd / "state.json").write_text("{ not json " + "ghp_" + "b" * 36)
     else:
         target = tmp_path / "elsewhere.json"
         save_state(_state(7), target)
@@ -323,4 +326,6 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     assert not hold.holds and hold.problem
     assert "ghp_" + "b" * 36 not in hold.problem
     assert len(hold.problem) <= MAX_REASON_CHARS
+    if damage == "local":
+        assert "state file has unknown mode 'LOCAL'" in hold.problem
     assert _tree(sd) == before, "never quarantined, created or written"

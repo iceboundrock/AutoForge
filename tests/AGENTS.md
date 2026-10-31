@@ -18,9 +18,8 @@ read it before adding tests for a listed area.
   `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`). Such a probe uses a temporary home
   and synthetic credentials, and calls no model: the Claude probe answers
   from a loopback stand-in. The other is the live Pi smoke test
-  (`tests/test_live_pi.py`, #135), whose two tests (a LOCAL and a REMOTE
-  REVIEW, one model call each) are the only ones that make a model call:
-  marked `live`, deselected by default (`pyproject.toml` adds
+  (`tests/test_live_pi.py`, #135), whose one test (a REMOTE REVIEW, one
+  model call) is the only one that makes a model call: marked `live`, deselected by default (`pyproject.toml` adds
   `-m 'not live'`), and skipped unless `AUTOFORGE_LIVE_PI=1`. It uses the
   credential the operator gave Pi (a DeepSeek API key, or the ChatGPT
   sign-in: `AUTOFORGE_LIVE_PI_AUTH` names the route), which it never
@@ -208,7 +207,8 @@ read it before adding tests for a listed area.
   modification time and bytes), so two equal snapshots mean nothing there
   was written, replaced or created and removed again.
   `unloadable_state(kind, saved)` makes a state file that loads into one of
-  `UNLOADABLE_STATES`: an unknown mode, an unknown label, invalid JSON.
+  `UNLOADABLE_STATES`: an unknown mode, an unknown label, invalid JSON and,
+  since LOCAL was removed (#387), a LOCAL state.
   #387 and #388 keep these tests passing unchanged, apart from the expected
   protocol label and any row that names LOCAL.
 - The shared coverage LOCAL's removal must not lose (ADR 0009 A.2.3, A.2.4,
@@ -270,6 +270,11 @@ the state pins of LOCAL's removal     test_state.py, test_replan.py (the refusal
 (ADR 0009 S1b, #385)                  without LOCAL's fields), test_cli.py (a state that does not
                                       load: every command, run --force), test_scheduler_state.py,
                                       test_epic_commands.py (the scheduler's passes)
+LOCAL's ways in, closed (ADR 0009     test_cli.py (autoforge local, --help, a local: key,
+S2, #387)                             a LOCAL state under every label, no read of
+                                      <git dir>/autoforge/state), test_config.py (the key),
+                                      test_state.py, test_local.py (the loader),
+                                      test_ownership.py, test_epic_commands.py (the scheduler)
 scheduler namespaces (#178)           test_run_namespace.py (RunKey, layout, binding, lookup,
                                       listing, archive, engine binding); the standalone
                                       state-dir refusal: test_cli.py
@@ -302,7 +307,7 @@ workers (#182)                        BLOCKED, failing and READY_FOR_MERGE worke
                                       test_config.py
 `epic` commands and end-to-end        test_epic_commands.py (run, resume, status categories and
 recovery (#183)                       JSON keys, stop, archive, dry run, --force, exit codes, GitHub
-                                      changes between ticks, standalone guards, LOCAL, no merge;
+                                      changes between ticks, standalone guards, no merge;
                                       the scheduler in process), test_epic_recovery.py (every
                                       D14.5 crash window by SIGKILL of a real scheduler, worker or
                                       archive; tests/epic_cli.py); doctor --epic: test_doctor.py
@@ -318,12 +323,12 @@ sandbox pin and config placement      test_sandbox_pin.py (strength, the record,
                                       doctor share: conftest.dotdot_config_paths
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py
                                       (engine, REMOTE and LOCAL; load and protocol: test_state.py)
-candidate validation gates (#173)     test_validation_gates.py (producers, REVIEW entry, LOCAL
-                                      convergence, override, provider parity; REPLAN
-                                      rejection: test_replan.py)
+candidate validation gates (#173)     test_validation_gates.py (producers, REVIEW entry,
+                                      override, provider parity; REPLAN rejection:
+                                      test_replan.py)
 review certificates (#174)            test_certificate.py (pure: issuance, applicability,
                                       wording), test_review_certificate.py (engine: the
-                                      READY_FOR_MERGE and LOCAL DONE writes, the #162 journal,
+                                      READY_FOR_MERGE write, the #162 journal,
                                       drift, unblock, status, provider parity); hand-built
                                       clean reviews hold one through conftest.certify_review
 merge gate certificate check (#175)   test_merge_certificate.py (each requirement, set and
@@ -339,10 +344,10 @@ directory (#283)                      refusal, no deletion before a verified mer
                                       test_engine.py
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
-live Pi smoke test (#135)             test_live_pi.py (opt-in: -m live, AUTOFORGE_LIVE_PI=1; a LOCAL
-                                      and a REMOTE flow, their checks in tests/live_pi.py),
+live Pi smoke test (#135)             test_live_pi.py (opt-in: -m live, AUTOFORGE_LIVE_PI=1; a
+                                      REMOTE flow, its checks in tests/live_pi.py),
                                       test_live_pi_support.py (offline: deselection, the
-                                      credential scan, the checks, both flows rehearsed on the
+                                      credential scan, the checks, the flow rehearsed on the
                                       fake pi)
 Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)
 SDK policy (#149): options, tools,    test_sdk_policy.py (opt-in probes of an installed Claude

@@ -179,9 +179,10 @@ def state_tree(root: Path) -> dict[str, tuple]:
     return out
 
 
-# The three states that do not load whose handling ADR 0009 D4 audits: an
-# unknown mode, an unknown protocol label and invalid JSON.
-UNLOADABLE_STATES = ("unknown-mode", "unknown-label", "invalid-json")
+# The states that do not load whose handling ADR 0009 D4 audits: an unknown
+# mode, an unknown protocol label and invalid JSON (#385), and a LOCAL state,
+# which the loader refuses as an unknown mode since LOCAL was removed (#387).
+UNLOADABLE_STATES = ("unknown-mode", "unknown-label", "invalid-json", "local-mode")
 
 
 def unloadable_state(kind: str, saved: bytes) -> tuple[bytes, str]:
@@ -199,6 +200,9 @@ def unloadable_state(kind: str, saved: bytes) -> tuple[bytes, str]:
     if kind == "unknown-mode":
         data["mode"] = "SATELLITE"
         return json.dumps(data).encode("utf-8"), "state file has unknown mode 'SATELLITE'"
+    if kind == "local-mode":
+        data["mode"] = "LOCAL"
+        return json.dumps(data).encode("utf-8"), "state file has unknown mode 'LOCAL'"
     assert kind == "unknown-label", kind
     data["protocol_version"] = "99"
     return json.dumps(data).encode("utf-8"), "unsupported protocol_version '99'"

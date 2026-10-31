@@ -10,7 +10,7 @@ Read the module docstring before changing a module; this map only says where
 a concern lives so the routing rules can be applied.
 
 ```text
-cli.py              subcommands run / step / resume / unblock / status / doctor / local, dry-run flags;
+cli.py              subcommands run / step / resume / unblock / status / doctor, dry-run flags;
                     the `epic` group (run / resume / status / stop / archive, #183) and the
                     hidden `epic _worker` entry point of a scheduler's worker (#182)
 config.py           configuration loading and validation; owns config defaults and keys

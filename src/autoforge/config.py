@@ -49,11 +49,7 @@ from .child_env import refuse_forbidden_env
 from .errors import ConfigurationError, SandboxPolicyError, ValidationDefinitionError
 from .evidence import SCOPE, check_definitions, check_scope
 from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
-from .local_workspace import (
-    DEFAULT_MAX_BYTES,
-    DEFAULT_MAX_ENTRIES,
-    normalize_exclude_pattern,
-)
+from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .sandbox import check_declared_path
 
 CONFIG_VERSION = 1
@@ -618,19 +614,13 @@ class WorkflowConfig:
     epic_update_every: int = 1
 
 
-LOCAL_KEYS = (
-    "feature_dir",
-    "validation_commands",
-    "max_fix_rounds",
-    "exclude",
-    "max_workspace_entries",
-    "max_workspace_bytes",
-)
-
-
 @dataclass
 class LocalConfig:
-    """LOCAL-mode settings (``local:`` in the config file).
+    """LOCAL-mode settings, read from no configuration file.
+
+    The ``local:`` key is gone (ADR 0009 D5, #387): a file that still has it
+    is refused as an unknown top-level key. The type stays, at its defaults,
+    for the LOCAL code no command reaches any more, and goes with it (#388).
 
     ``validation_commands`` are **controller-owned** checks: argv arrays, run
     through :mod:`autoforge.executor` with no shell, after every local
@@ -761,7 +751,6 @@ TOP_LEVEL_KEYS = (
     "merge",
     "review",
     "workflow",
-    "local",
     "sandbox",
     "validation",
     "scheduler",
@@ -1509,46 +1498,6 @@ def _merge_config(base: AutoForgeConfig, data: dict, source: str) -> AutoForgeCo
         raise ConfigurationError(
             f"{source}: 'review.replan.hard_threshold' must be <= 'workflow.max_review_rounds'"
         )
-    local = _section(data, "local", source, LOCAL_KEYS)
-    if "feature_dir" in local:
-        feature_dir = str(local["feature_dir"]).strip()
-        if not feature_dir:
-            raise ConfigurationError(f"{source}: 'local.feature_dir' must not be empty")
-        base.local.feature_dir = feature_dir
-    if "validation_commands" in local:
-        base.local.validation_commands = _as_definitions(
-            local["validation_commands"], source, "local.validation_commands"
-        )
-    if "max_fix_rounds" in local:
-        value = _as_int(local["max_fix_rounds"], source, "local.max_fix_rounds")
-        if value < 0:
-            raise ConfigurationError(f"{source}: 'local.max_fix_rounds' must be >= 0, got {value}")
-        base.local.max_fix_rounds = value
-    if "exclude" in local:
-        raw = local["exclude"]
-        if isinstance(raw, str) or not isinstance(raw, list):
-            raise ConfigurationError(
-                f"{source}: 'local.exclude' must be a list of path patterns, e.g. "
-                "['.venv', '**/__pycache__']"
-            )
-        patterns: list[str] = []
-        for item in raw:
-            try:
-                patterns.append(normalize_exclude_pattern(item))
-            except ConfigurationError as exc:
-                raise ConfigurationError(f"{source}: {exc}") from None
-        base.local.exclude = sorted(dict.fromkeys(patterns))
-    for name, attr, minimum in (
-        ("max_workspace_entries", "max_workspace_entries", 1),
-        ("max_workspace_bytes", "max_workspace_bytes", 1),
-    ):
-        if name in local:
-            value = _as_int(local[name], source, f"local.{name}")
-            if value < minimum:
-                raise ConfigurationError(
-                    f"{source}: 'local.{name}' must be >= {minimum}, got {value}"
-                )
-            setattr(base.local, attr, value)
     sandbox = _section(data, "sandbox", source, SANDBOX_KEYS)
     for key, allowed in (
         ("mode", SANDBOX_MODES),

@@ -1948,8 +1948,8 @@ class ControllerEngine:
     def record_run_configuration(self, source: str = SOURCE_CREATED) -> None:
         """Record this invocation's configuration as the run's, in memory.
 
-        ``run``, ``local run`` and a scheduler's worker call it on the run
-        they create, before its first save. Every run pins the sandbox mode
+        ``run`` and a scheduler's worker call it on the run they create,
+        before its first save. Every run pins the sandbox mode
         it is created under (#280, :mod:`autoforge.sandbox_pin`); a REMOTE
         run also records its profile routing and agent worktree root (#219),
         which a LOCAL run's contract defines instead. A configuration the
@@ -3163,11 +3163,10 @@ class ControllerEngine:
         """Refuse a standalone ``command`` whose state dir lies in the scheduler root.
 
         ADR 0008 D17.3 (:func:`autoforge.run_namespace.check_standalone_state_dir`):
-        ``run``, ``step``, ``resume`` and ``local run`` call it before they
-        take the lock, ``step`` and ``resume`` also before they look for
-        their run (``cli._bind_standalone_run``); ``status`` and ``unblock``
-        do not. A dry run is not checked: it runs no git, so it has no
-        coordination root, and it writes nothing.
+        ``run``, ``step`` and ``resume`` call it before they take the lock
+        and before they read any state; ``status`` and ``unblock`` do not. A
+        dry run is not checked: it runs no git, so it has no coordination
+        root, and it writes nothing.
         """
         check_standalone_state_dir(self.paths.state_dir, self.coordination_root(), command)
 

@@ -5,18 +5,17 @@ and a real credential, so they never run here. What is tested instead: that
 the default options deselect them, the settings that choose the auth route,
 that the credential scan finds each pattern (and a forwarded key's value)
 and names it without the match, the other checks and failure reasons, and
-both flows rehearsed against the fake ``pi`` of ``tests/pi_fake.py`` on
-both routes, passing and failing: on the API-key route an auth check that
-is not ready, of the other type, unreadable, or for a model Pi does not
-resolve, and a review answer AutoForge cannot parse. The LOCAL flow runs
-the real ``autoforge local doctor`` in a process of its own and the real
-engine and ``PiProvider`` on a LOCAL run; the REMOTE flow (ADR 0009
-Appendix A.2.3 G) the real ``autoforge doctor`` and a REMOTE run against
-the GitHub stand-in, with one rehearsal for each LOCAL one, and that its
-stand-in origin is the only repository its seeding writes to, whatever URL
-rewrite git's configuration holds (#386 R1-F1). The git that flow runs
-itself writes to no repository a ``GIT_*`` variable names and runs no hook,
-file-system monitor or signing program of the operator's (#386 R2-F1).
+the flow rehearsed against the fake ``pi`` of ``tests/pi_fake.py`` on both
+routes, passing and failing: on the API-key route an auth check that is
+not ready, of the other type, unreadable, or for a model Pi does not
+resolve, and a review answer AutoForge cannot parse. The flow (ADR 0009
+Appendix A.2.3 G) runs the real ``autoforge doctor`` in a process of its
+own and the real engine and ``PiProvider`` on a REMOTE run against the
+GitHub stand-in; its stand-in origin is the only repository its seeding
+writes to, whatever URL rewrite git's configuration holds (#386 R1-F1).
+The git that flow runs itself writes to no repository a ``GIT_*`` variable
+names and runs no hook, file-system monitor or signing program of the
+operator's (#386 R2-F1).
 """
 
 from __future__ import annotations
@@ -69,7 +68,6 @@ from tests.live_pi import (
     processes_under,
     remote_trees,
     run_remote_smoke,
-    run_smoke,
     scan_for_credentials,
     settings_from_environment,
     tree_snapshot,
@@ -95,17 +93,13 @@ def _pytest(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-LIVE_TESTS = (
-    "test_one_local_review_runs_on_the_operators_real_pi",
-    "test_one_remote_review_runs_on_the_operators_real_pi",
-)
+LIVE_TESTS = ("test_one_remote_review_runs_on_the_operators_real_pi",)
 
 
 def test_the_live_test_is_deselected_by_default_and_skips_without_its_variable():
-    """The default options leave the live tests, LOCAL and REMOTE, out of
-    collection (so `make check` and CI never run them); `-m live` selects
-    them, and without AUTOFORGE_LIVE_PI=1 each skips with its reason and
-    launches nothing."""
+    """The default options leave the live test out of collection (so `make
+    check` and CI never run it); `-m live` selects it, and without
+    AUTOFORGE_LIVE_PI=1 it skips with its reason and launches nothing."""
     default = _pytest("--collect-only")
     assert default.returncode == 5, default.stdout  # nothing collected
     assert f"{len(LIVE_TESTS)} deselected" in default.stdout
@@ -349,20 +343,7 @@ def test_a_process_running_in_or_naming_the_directory_is_found(tmp_path):
     assert processes_under(tmp_path / "work") == []
 
 
-# -- the whole flow, rehearsed against the fake `pi` ---------------------------------
-def _review_block(fingerprint: str, observation: str) -> str:
-    payload = {
-        "phase": "REVIEW",
-        "status": "success",
-        "round": 1,
-        "reviewed_workspace_fingerprint": fingerprint,
-        "needs_fix_round": False,
-        "findings": [],
-        "observations": [observation],
-    }
-    return block(payload)
-
-
+# -- the flow, rehearsed against the fake `pi` (ADR 0009 A.2.3 G) --------------------
 def _ready(model: str, auth_type: str) -> dict:
     return {"status": "ready", "provider": model.split("/", 1)[0], "authType": auth_type}
 
@@ -402,283 +383,13 @@ def rehearsal(tmp_path, monkeypatch):
     return Rehearsal(fake, str(wrapper))
 
 
-def _arm_review(
-    fake: PiFake,
-    observation: str = "greet() does what the feature asks.",
-    text: str | None = None,
-    **turn,
-):
-    """Arm the review: a clean result carrying ``observation``, or ``text`` as it is."""
-
-    def arm(engine):
-        if text is None:
-            answer = _review_block(engine.state.workspace_fingerprint, observation)
-        else:
-            answer = text
-        fake.arm(PiTurn(text=answer, **turn), call=1)
-
-    return arm
-
-
 def _config(tmp_path) -> dict:
     return json.loads((tmp_path / "smoke" / "autoforge.json").read_text())
 
 
-def test_the_smoke_flow_passes_on_the_api_key_route_against_a_fake_pi(tmp_path, rehearsal):
-    """The acceptance route: DeepSeek on a key in Pi's own store, with
-    require_oauth false, so no per-launch preflight; no key in any launch's
-    environment, and the report names the route, the authType and the
-    commit."""
-    settings = rehearsal.settings("api_key")
-    report = SmokeReport()
-    run_smoke(tmp_path / "smoke", settings, report, before_review=_arm_review(rehearsal.fake))
-    text = report.render()
-    assert report.ok, text
-    assert all(f"[PASS] {name}" in text for name in STEPS)
-    assert "REDACTED" not in text  # nothing in it is, or reads as, a credential
-    facts = report.facts
-    assert facts["auth route"] == "api_key (require_oauth: false)"
-    assert facts["auth"] == "Pi resolved authType api_key for provider 'deepseek'"
-    assert facts["credential"] == "Pi's own credential store (no provider key forwarded)"
-    assert facts["model"] == "deepseek/deepseek-flash" and facts["thinking"] == "low"
-    assert re.fullmatch(r"[0-9a-f]{40}( with uncommitted changes)?", facts["AutoForge commit"])
-    assert "authType api_key" in facts["doctor, auth ready"]
-    assert "Pi resolved deepseek/deepseek-flash at thinking low" in facts["review"]
-    assert facts["review outcome"] == "clean, the run is DONE"
-    config = _config(tmp_path)
-    assert config["profiles"]["review_round_1"]["options"] == {"require_oauth": False}
-    assert "env_allowlist_extra" not in config["execution"]
-    [launch] = rehearsal.fake.launches()
-    assert "--no-session" in launch["argv"]
-    assert not set(PROVIDER_KEY_NAMES) & set(launch["env"])
-    auth = rehearsal.fake.auth_checks()
-    assert len(auth) == 2 and all("--no-refresh" in e["argv"] for e in auth)  # step 1, doctor
-    assert all("--credentials" not in e["argv"] for e in rehearsal.fake.entries() if "argv" in e)
-
-
-def test_the_smoke_flow_passes_on_the_optional_oauth_route_against_a_fake_pi(tmp_path, rehearsal):
-    settings = rehearsal.settings("oauth")
-    report = SmokeReport()
-    run_smoke(tmp_path / "smoke", settings, report, before_review=_arm_review(rehearsal.fake))
-    assert report.ok, report.render()
-    assert report.facts["pi"] == "1.0.1"
-    assert report.facts["auth route"] == "oauth (require_oauth: true)"
-    assert report.facts["auth"] == "Pi resolved authType oauth for provider 'openai'"
-    assert "Pi resolved openai/gpt-5.6-terra at thinking low" in report.facts["review"]
-    assert _config(tmp_path)["profiles"]["review_round_1"]["options"] == {"require_oauth": True}
-    [launch] = rehearsal.fake.launches()
-    assert "--no-session" in launch["argv"] and "OPENAI_API_KEY" not in launch["env"]
-    auth = [e for e in rehearsal.fake.auth_checks() if "--no-refresh" in e["argv"]]
-    assert len(auth) == 3  # step 1, doctor, and the launch's own preflight
-
-
-def test_a_key_forwarded_on_purpose_is_named_reaches_the_launch_and_is_scanned_for(
-    tmp_path, rehearsal, monkeypatch
-):
-    """The exception step 2 allows: the report names the route, never the
-    value, and step 5 finds the value wherever AutoForge wrote it, whatever
-    its shape."""
-    value = "dsk" + _SECRET
-    monkeypatch.setenv("DEEPSEEK_API_KEY", value)
-    settings = rehearsal.settings("api_key", forward_key="DEEPSEEK_API_KEY")
-    report = SmokeReport()
-    arm = _arm_review(rehearsal.fake, observation=f"the key is {value}")
-    run_smoke(tmp_path / "smoke", settings, report, before_review=arm)
-    text = report.render()
-    assert report.passed(STEPS[1]) and report.passed(STEPS[3])
-    assert report.facts["credential"].startswith(
-        "DEEPSEEK_API_KEY forwarded on purpose by execution.env_allowlist_extra"
-    )
-    assert _config(tmp_path)["execution"]["env_allowlist_extra"] == ["DEEPSEEK_API_KEY"]
-    [launch] = rehearsal.fake.launches()
-    assert "DEEPSEEK_API_KEY" in launch["env"] and "OPENAI_API_KEY" not in launch["env"]
-    ok, message = report.outcomes[STEPS[4]]
-    assert not ok and "the value of DEEPSEEK_API_KEY" in message
-    assert value not in text and _SECRET not in text
-
-
-def test_a_forward_naming_an_unset_key_fails_step_2(tmp_path, rehearsal):
-    settings = rehearsal.settings("api_key", forward_key="DEEPSEEK_API_KEY")
-    report = SmokeReport()
-    run_smoke(tmp_path / "smoke", settings, report)
-    assert report.outcomes[STEPS[1]] == (
-        False,
-        f"{FORWARD_VARIABLE} names DEEPSEEK_API_KEY, which is not set",
-    )
-    assert rehearsal.fake.launches() == []
-
-
-def test_a_provider_refusal_is_named_and_the_later_checks_still_run(tmp_path, rehearsal):
-    """A usage limit is reported as the provider's refusal by its category;
-    Pi's error text (which may name the plan) never reaches the report."""
-    settings = rehearsal.settings("oauth")
-    error = "subscription_sharing_usage_limit_exceeded: your ChatGPT Plus plan, " + _SECRET
-    report = SmokeReport()
-    arm = _arm_review(rehearsal.fake, outcome="stop_error", error=error)
-    run_smoke(tmp_path / "smoke", settings, report, before_review=arm)
-    text = report.render()
-    assert not report.ok
-    assert f"[FAIL] {STEPS[3]}: provider refused (subscription usage limit reached)" in text
-    assert f"[PASS] {STEPS[4]}" in text and f"[PASS] {STEPS[5]}" in text
-    assert "Plus" not in text and _SECRET not in text
-
-
-def test_a_model_error_on_the_api_key_route_is_the_providers_refusal(tmp_path, rehearsal):
-    settings = rehearsal.settings("api_key")
-    report = SmokeReport()
-    arm = _arm_review(rehearsal.fake, outcome="stop_error", error="Insufficient Balance " + _SECRET)
-    run_smoke(tmp_path / "smoke", settings, report, before_review=arm)
-    assert report.outcomes[STEPS[3]] == (False, "provider refused (model error after acceptance)")
-    assert _SECRET not in report.render()
-
-
-@pytest.mark.parametrize(
-    "check, exit_code, expected",
-    [
-        (
-            {"status": "not_ready", "provider": "deepseek", "reason": "credentials_not_configured"},
-            1,
-            "status not_ready, provider 'deepseek', reason credentials_not_configured: "
-            "Pi has no credential for 'deepseek'",
-        ),
-        (
-            {"status": "ready", "provider": "openai", "authType": "api_key"},
-            0,
-            "Pi resolved model 'deepseek/deepseek-flash' to provider 'openai', "
-            "not the configured 'deepseek'",
-        ),
-        (
-            {"status": "ready", "provider": "deepseek", "authType": "api_key", "plan": "x"},
-            0,
-            "without a result AutoForge can read (1 unexpected field(s))",
-        ),
-    ],
-    ids=["not-ready", "another-provider", "unreadable"],
-)
-def test_an_auth_check_that_does_not_allow_the_api_key_route_stops_before_any_launch(
-    tmp_path, rehearsal, check, exit_code, expected
-):
-    """Not ready, misconfigured or unreadable: step 1 and doctor fail with
-    the check's fields alone, and no review is started."""
-    settings = rehearsal.settings("api_key", check=check, check_exit=exit_code)
-    report = SmokeReport()
-    run_smoke(tmp_path / "smoke", settings, report)
-    ok, message = report.outcomes[STEPS[0]]
-    assert not ok and message.startswith("no usable credential for deepseek/deepseek-flash: ")
-    assert expected in message
-    assert not report.passed(STEPS[2])
-    assert all(name not in report.outcomes for name in STEPS[3:])
-    assert rehearsal.fake.launches() == []
-    assert "plan" not in report.render()
-
-
-def test_a_model_pi_does_not_resolve_fails_the_preconditions(tmp_path, rehearsal):
-    """Pi 1.3.0 answers a retired id (`deepseek-v4-flash`) with `invalid`."""
-    model = "deepseek/deepseek-v4-flash"
-    invalid = {"status": "invalid", "provider": model, "reason": "invalid_state"}
-    settings = rehearsal.settings("api_key", model=model, check=invalid, check_exit=2)
-    report = SmokeReport()
-    run_smoke(tmp_path / "smoke", settings, report)
-    ok, message = report.outcomes[STEPS[0]]
-    assert not ok
-    assert f"status invalid, provider '{model}', reason invalid_state" in message
-    assert "Pi's model or credential configuration is invalid" in message
-    assert rehearsal.fake.launches() == []
-
-
-@pytest.mark.parametrize(
-    "auth, resolved, expected",
-    [
-        (
-            "api_key",
-            "oauth",
-            "Pi resolved authType oauth for deepseek/deepseek-flash, not the api_key route's",
-        ),
-        ("oauth", "api_key", "this profile requires Pi's ChatGPT sign-in; Pi resolved an API key"),
-    ],
-)
-def test_a_credential_of_the_other_type_fails_its_route(
-    tmp_path, rehearsal, auth, resolved, expected
-):
-    """An API-key run is no evidence for the sign-in, nor the reverse."""
-    settings = rehearsal.settings(auth, check=_ready(DEFAULT_MODELS[auth], resolved))
-    report = SmokeReport()
-    run_smoke(tmp_path / "smoke", settings, report)
-    assert expected in report.outcomes[STEPS[0]][1]
-    assert not report.passed(STEPS[2])
-    assert rehearsal.fake.launches() == []
-
-
-def test_a_review_answer_without_a_valid_control_result_fails_step_4(tmp_path, rehearsal):
-    """Output parsing on the API-key route: with no correction relaunch, an
-    answer AutoForge cannot parse fails the review as AutoForge's failure,
-    and the model's text is not shown."""
-    settings = rehearsal.settings("api_key")
-    report = SmokeReport()
-    arm = _arm_review(rehearsal.fake, text="Looks fine to me. " + _SECRET)
-    run_smoke(tmp_path / "smoke", settings, report, before_review=arm)
-    ok, message = report.outcomes[STEPS[3]]
-    assert not ok and message.startswith("AutoForge failure (")
-    assert len(rehearsal.fake.launches()) == 1
-    assert _SECRET not in report.render()
-
-
-def test_a_review_that_writes_into_the_tree_fails_twice_over(tmp_path, rehearsal):
-    settings = rehearsal.settings("api_key")
-    report = SmokeReport()
-    arm = _arm_review(rehearsal.fake, writes={"greet.py": "def greet(name):\n    return 'hi'\n"})
-    run_smoke(tmp_path / "smoke", settings, report, before_review=arm)
-    assert report.outcomes[STEPS[3]][1].startswith("AutoForge failure (VerificationError: ")
-    assert report.outcomes[STEPS[5]] == (False, "the review changed the working tree")
-
-
-def test_a_new_session_entry_fails_the_side_effect_step(tmp_path, rehearsal):
-    settings = rehearsal.settings("api_key")
-
-    def arm(engine):
-        _arm_review(rehearsal.fake)(engine)
-        (tmp_path / "agent" / "sessions" / "--x--").mkdir(parents=True)
-
-    report = SmokeReport()
-    run_smoke(tmp_path / "smoke", settings, report, before_review=arm)
-    assert report.passed(STEPS[3])
-    assert (
-        report.outcomes[STEPS[5]][1] == f"1 new entr(ies) under {tmp_path / 'agent' / 'sessions'}"
-    )
-
-
-@pytest.mark.parametrize("auth", ["api_key", "oauth"])
-@pytest.mark.parametrize("name", PROVIDER_KEY_NAMES)
-def test_a_provider_key_fails_step_2_is_not_unset_and_stops_before_any_launch(
-    tmp_path, rehearsal, monkeypatch, auth, name
-):
-    settings = rehearsal.settings(auth)
-    monkeypatch.setenv(name, _SECRET)
-    report = SmokeReport()
-    run_smoke(tmp_path / "smoke", settings, report, before_review=_arm_review(rehearsal.fake))
-    text = report.render()
-    assert f"[FAIL] {STEPS[1]}: {name} is set: unset it for this test" in text
-    assert all(f"[NOT RUN] {step}" in text for step in STEPS[3:])
-    assert os.environ[name] == _SECRET and _SECRET not in text
-    assert rehearsal.fake.launches() == []
-    # Step 1 ran without it, as the launch would.
-    assert all(name not in e["env"] for e in rehearsal.fake.auth_checks())
-
-
-def test_a_missing_pi_fails_the_preconditions_and_launches_nothing(tmp_path, rehearsal):
-    report = SmokeReport()
-    missing = SmokeSettings(command=str(tmp_path / "nowhere" / "pi"))
-    run_smoke(tmp_path / "smoke", missing, report)
-    assert report.outcomes[STEPS[0]][1].endswith("is not on PATH: install Pi yourself (docs/pi.md)")
-    assert not report.passed(STEPS[2])
-    assert all(name not in report.outcomes for name in STEPS[3:])
-
-
-# -- the REMOTE flow, rehearsed against the fake `pi` (ADR 0009 A.2.3 G) ---------------
-# One counterpart of each LOCAL rehearsal above, on `run_remote_smoke`: the
-# real `autoforge doctor` in a process of its own, the real engine and
-# `PiProvider` on a REMOTE run, and the GitHub stand-in (FakeGitHub and a bare
-# origin under the run's directory). S2 retires the LOCAL ones (ADR 0009 D12).
+# On `run_remote_smoke`: the real `autoforge doctor` in a process of its own,
+# the real engine and `PiProvider` on a REMOTE run, and the GitHub stand-in
+# (FakeGitHub and a bare origin under the run's directory).
 def _arm_remote_review(
     fake: PiFake,
     observation: str = "greet() does what the issue asks.",
@@ -938,11 +649,10 @@ def test_a_remote_review_answer_without_a_valid_control_result_fails_step_4(tmp_
 def test_a_remote_review_that_writes_into_its_worktree_fails_the_side_effect_step(
     tmp_path, rehearsal
 ):
-    """The LOCAL rehearsal fails twice over; this one fails once, and that
-    difference is the controller's, documented here rather than fixed. A
-    REMOTE review is bound to the PR HEAD commit, which a write into the
+    """A REMOTE review is bound to the PR HEAD commit, which a write into the
     worktree does not change, so the controller accepts the review and posts
-    its comment (step 4 passes); only step 6 sees the write."""
+    its comment (step 4 passes); only step 6 sees the write. That is the
+    controller's behaviour, documented here rather than fixed."""
     settings = rehearsal.settings("api_key")
     writes = {"greet.py": "def greet(name):\n    return 'hi'\n"}
     report = _remote(tmp_path, settings, _arm_remote_review(rehearsal.fake, writes=writes))

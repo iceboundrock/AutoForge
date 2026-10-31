@@ -294,43 +294,9 @@ def _local(tmp_path, mode: str):
     return repo, eng
 
 
-def _local_invocation(repo, eng: ControllerEngine, mode: str) -> ControllerEngine:
-    later = make_local_engine(
-        repo, None, cfg=_cfg(mode), state_dir=eng.paths.state_dir, start=False
-    )
-    later.load()
-    return later
-
-
 def test_a_local_run_pins_but_records_no_fingerprint(tmp_path):
     """A LOCAL run's contract defines its routing; the pin is the only record."""
     _, eng = _local(tmp_path, SANDBOX_PREFERRED)
     assert eng.state.config_fingerprint == {}
     pin = SandboxPin.from_dict(eng.state.sandbox_pin)
     assert (pin.mode, pin.source) == (SANDBOX_PREFERRED, SOURCE_CREATED)
-
-
-@pytest.mark.parametrize(
-    ("pinned", "mode"),
-    [
-        (SANDBOX_REQUIRED, SANDBOX_DISABLED),
-        (SANDBOX_PREFERRED, SANDBOX_DISABLED),
-        (SANDBOX_REQUIRED, SANDBOX_PREFERRED),
-    ],
-)
-def test_a_local_run_refuses_a_weaker_mode_unless_accepted(tmp_path, pinned, mode):
-    repo, eng = _local(tmp_path, pinned)
-    before = eng.paths.state_file.read_bytes()
-    with pytest.raises(ConfigurationDriftError) as exc:
-        _local_invocation(repo, eng, mode).check_run_configuration(("step",))
-    assert f'\n  sandbox.mode: "{pinned}" -> "{mode}"\n' in str(exc.value)
-    assert "Changed (recorded -> this command)" not in str(exc.value)
-    assert eng.paths.state_file.read_bytes() == before
-    later = _local_invocation(repo, eng, mode)
-    later.check_run_configuration(("step",), accept_change=True)
-    saved = load_state(eng.paths.state_file)
-    assert saved.sandbox_pin["mode"] == mode and saved.sandbox_pin["source"] == SOURCE_ACCEPTED
-    assert saved.config_fingerprint == {}
-    [event] = _events(later)
-    assert event["metadata"]["recorded_sandbox_pin"]["mode"] == pinned
-    assert "recorded_config_file" not in event["metadata"]

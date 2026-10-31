@@ -79,7 +79,7 @@ Expected state includes data such as:
   characters, an `update_epic` limit of 0) is a configuration error at
   `run`, `doctor`, an upgrade or an accepted change, so no state file is
   written that could not load again. It is `{}` for a LOCAL run, whose run contract
-  defines it ([The run contract](../local-mode.md#the-run-contract)), and
+  defines it, and
   for a run loaded from a protocol-8 file until its next command records it
 - the sandbox pin of every run, LOCAL and REMOTE (`sandbox_pin`, #280): the
   `sandbox.mode` the run is held to, with its `source` (`created` by `run`
@@ -549,11 +549,10 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
   state snapshot loaded before the lock is never executed and no second
   controller can take over the repository mid-command. Dry-run takes no lock
   and writes nothing. A REMOTE `run --dry-run` runs no `git`. `step`,
-  `resume`, `unblock` and `status` without `--state-dir`, dry runs
-  included, first run two read-only `git rev-parse` calls (`--git-dir`,
-  `--git-common-dir`) to find which run is meant (`cli._bind_existing_run`:
-  a remote one under `state_dir` or a local one in the git directory);
-  `--state-dir` skips that lookup. A LOCAL dry run needs a git repository
+  `resume`, `unblock` and `status` look for a run in the configured state
+  directory alone (`--state-dir` or `state_dir`): the probe of
+  `<git dir>/autoforge/state`, LOCAL's location, went with LOCAL's public
+  surface (ADR 0009 D3, #387). A LOCAL dry run needs a git repository
   and reads it: `local run --dry-run` reads HEAD, branch and the workspace
   walk to build its plan, and a dry run of an existing local run reads the
   repository to check its run contract and current fingerprint.

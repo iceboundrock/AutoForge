@@ -762,6 +762,12 @@ class AutoForgeState:
                 mode = WorkflowMode(raw_mode)
             except ValueError:
                 raise StateError(f"state file has unknown mode {raw_mode!r}") from None
+        # LOCAL mode is removed (ADR 0009 D4, #387): a LOCAL file is refused
+        # like any other unknown mode, under every label, before anything
+        # else of it is read. The member stays for the code nothing reaches
+        # until #388 deletes it, and the enum lookup above refuses it then.
+        if mode is not WorkflowMode.REMOTE:
+            raise StateError(f"state file has unknown mode {mode.value!r}")
         # The protocol version decides what "unknown field" even means, so it
         # is checked before the fields are: a file written by a newer
         # controller must be reported as an unsupported protocol, not as a
