@@ -456,9 +456,10 @@ only a real flush in the test process would have caught.
 so a change gets feedback in seconds to a minute or two rather than after
 the whole suite (535 seconds serially at a4bc60c on Python 3.14 and host
 B of [The suite on several workers](#the-suite-on-several-workers)). The
-changed paths are your worktree's differences from its merge base with
-`FAST_BASE` (`main` by default; committed, staged, unstaged and untracked),
-and `FAST_PYTEST_ARGS` reach pytest:
+changed paths are what your commits, your index and your worktree changed
+since the merge base with `FAST_BASE` (`main` by default), each compared
+on its own so that one undoing another's change hides neither, and your
+untracked files; `FAST_PYTEST_ARGS` reach pytest:
 
 ```bash
 make test-fast
@@ -466,13 +467,18 @@ make test-fast FAST_BASE=origin/main FAST_PYTEST_ARGS="-n 4 -x"
 uv run python -m tests.fast_targets src/autoforge/evidence.py   # what it would select, and why
 ```
 
-`tests/fast_targets.py` holds the mapping. A test module selects itself; a
-path with an entry selects the entry's test modules and every test module
-that imports its module; a module almost every test runs through
-(`engine.py`, `state.py`, `config.py`, the prompt templates, conftest and a
-few more) selects the whole suite, and so does any path without an entry
-(`pyproject.toml`, a document, a new module). On the same host and
-commit, a change to `tests/test_evidence.py` ran in 3 seconds, one to
+`tests/fast_targets.py` holds the mapping. A test module selects itself
+and every test module that imports it; a path with an entry selects the
+entry's test modules and every test module that imports its module; a
+module almost every test runs through (`engine.py`, `state.py`,
+`config.py`, the prompt templates, conftest and a few more) selects the
+whole suite, and so does any path without an entry (`pyproject.toml`, a
+document, a new module). A selection holding the live tests
+(`tests/test_live_pi.py`), which the default options deselect, holds
+their offline tests too, and never runs the live ones. On the same host
+and commit, a change to `tests/test_evidence.py` ran in 3 seconds when it
+selected itself alone (it now selects `test_certificate.py` too, which
+imports its helpers), one to
 `src/autoforge/scheduler.py` in 72 (four modules that wait on purpose),
 and one to `src/autoforge/evidence.py` in 125 (ten modules,
 `test_engine.py` among them). `tests/test_fast_targets.py` fails when a

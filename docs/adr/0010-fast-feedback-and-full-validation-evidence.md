@@ -203,18 +203,27 @@ created here.
 `make test-fast` runs it against `FAST_BASE` (default `main`).
 
 - **Per changed path:** a test module selects itself (a removed one
-  nothing); a path with an entry selects the entry's test modules and
-  every test module that imports its module directly; an entry marked
-  `FULL` selects the full suite; any other path selects the full suite.
-  The run is the union, and the full suite as soon as one path selects it.
-- **Changed paths** are the worktree's differences from its merge base with
-  `FAST_BASE` (committed, staged and unstaged, both sides of a rename) and
-  the untracked files git does not ignore.
+  nothing of its own) and every test module that imports it directly; a
+  path with an entry selects the entry's test modules and every test module
+  that imports its module directly; an entry marked `FULL` selects the full
+  suite; any other path selects the full suite. The run is the union, and
+  the full suite as soon as one path selects it.
+- **Never only deselected tests:** a selection holding a test module whose
+  tests the default options all deselect (`test_live_pi.py`) holds that
+  module's offline tests too (`test_live_pi_support.py`). pytest handed
+  only deselected tests collects none and exits 5, which would read as a
+  failure though nothing failed. FAST never adds `-m live` to make the live
+  tests run.
+- **Changed paths** are those whose commit (`HEAD`), staged version or
+  worktree version differs from the merge base with `FAST_BASE`, each
+  compared on its own so that one undoing another's change hides neither,
+  both sides of a rename, and the untracked files git does not ignore.
 - **Explicit:** every file under `src/autoforge/` and every helper module
   under `tests/` has an entry, an exact path or a directory prefix.
   `tests/test_fast_targets.py` fails when a file has none, when an entry
   names a path or test module that does not exist (or one whose tests are
-  all deselected by default), or when an entry selects nothing.
+  all deselected by default), when an entry selects nothing, or when a
+  module marked `live` as a whole names no offline tests.
 - **Three kinds of entry.** A module almost every test runs through is
   `FULL`: `engine.py`, `state.py`, `transitions.py`, `config.py`,
   `errors.py`, `executor.py`, `providers.py`, `github.py`, the prompt
@@ -242,6 +251,12 @@ seconds including pytest's start-up; the full suite took 535):
 | `src/autoforge/sandbox_policy.py` | 11 of 89 modules | 108 |
 | `src/autoforge/evidence.py` | 10 of 89 modules, `test_engine.py` among them | 125 |
 | `src/autoforge/engine.py` (or any unmapped path) | the full suite | 535 |
+
+The first row predates the rule that a test module selects the test
+modules that import it: `tests/test_evidence.py` now selects
+`test_certificate.py` too. Through the tool on an 8-CPU host under
+Python 3.14.10, that took 3.5 seconds, against 3.4 for `test_evidence.py`
+alone.
 
 **D10. A change-based selection is base-bound.** A selection computed from
 a diff depends on the candidate and on a base revision. In ADR 0006's terms
@@ -395,9 +410,14 @@ These land with this record:
   entry, every entry names what exists and selects something; a module
   selects its listed tests and its importers, read from every spelling of
   an import; an unmapped path and a `FULL` entry select the full suite; a
-  test module selects itself; the change is read from the merge base with
-  untracked files and both sides of a rename, and not from what the base
-  did since; `--run` hands pytest exactly the selection and returns its
+  test module selects itself and the test modules that import it (a
+  removed one its importers only); a change to the live tests alone hands
+  pytest their offline tests, which a real pytest collects under the
+  default options while the live ones stay deselected; the change is read
+  from the merge base with untracked files and both sides of a rename,
+  from the commit, the index and the worktree each (a change one of them
+  undoes still counts), and not from what the base did since; `--run`
+  hands pytest exactly the selection and returns its
   status; `make test-fast` is in no gate and in no CI job, and CI's `test`
   runs the whole suite; the default suite deselects only `live`, with no
   other pytest option and no collection hook.

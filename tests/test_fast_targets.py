@@ -11,6 +11,8 @@ collects every test but the opt-in live ones.
 
 from __future__ import annotations
 
+import ast
+import os
 import shlex
 import subprocess
 import sys
@@ -70,11 +72,32 @@ def test_every_entry_names_an_existing_path_and_existing_test_modules():
 
 
 def test_every_entry_that_does_not_select_the_full_suite_selects_something():
+    """Something the default options run, not only live tests."""
     files = [k for k, v in ft.COVERAGE.items() if v is not ft.FULL and not k.endswith("/")]
     selection = ft.select(files)
     assert not selection.full
-    empty = [c.path for c in selection.choices if not c.modules]
+    empty = [c.path for c in selection.choices if not c.modules - ft.LIVE_ONLY.keys()]
     assert empty == [], f"these entries select no test module: {empty}"
+
+
+def _marked_live(path: Path) -> bool:
+    """Whether ``path``'s module-level ``pytestmark`` marks every test ``live``."""
+    for node in ast.parse(path.read_bytes(), filename=str(path)).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets
+        ):
+            return any(isinstance(n, ast.Attribute) and n.attr == "live" for n in ast.walk(node))
+    return False
+
+
+def test_live_only_names_every_module_marked_live_whole_and_its_offline_tests():
+    """A module the default options deselect whole has an entry naming offline
+    tests that run, so that a selection holding it collects something."""
+    marked = {p.stem for p in (ROOT / "tests").glob("test_*.py") if _marked_live(p)}
+    assert set(ft.LIVE_ONLY) == marked
+    for module, offline in ft.LIVE_ONLY.items():
+        assert offline, f"{module} names no offline tests"
+        assert all(o in ft.suite_modules() and o not in ft.LIVE_ONLY for o in offline)
 
 
 def test_the_suite_is_every_test_module_under_the_testpath():
@@ -158,11 +181,71 @@ def test_a_full_entry_selects_the_full_suite(path):
 
 
 def test_a_test_module_selects_itself_and_a_removed_one_nothing():
-    selection = _selected("tests/test_evidence.py", "tests/test_removed_long_ago.py")
+    """Of a test module nothing imports, and of one nothing imports any more."""
+    selection = _selected("tests/test_unblock.py", "tests/test_removed_long_ago.py")
     assert not selection.full
-    assert selection.modules == ("test_evidence",)
-    assert selection.targets() == ["tests/test_evidence.py"]
-    assert _selected("tests/test_removed_long_ago.py").targets() == []
+    assert selection.modules == ("test_unblock",)
+    assert selection.targets() == ["tests/test_unblock.py"]
+    reasons = {c.path: (c.reason, c.modules) for c in selection.choices}
+    assert reasons == {
+        "tests/test_unblock.py": ("a test module: itself", {"test_unblock"}),
+        "tests/test_removed_long_ago.py": ("a removed test module: nothing to run", frozenset()),
+    }
+
+
+def test_a_test_module_selects_the_test_modules_that_import_it():
+    """``tests/test_certificate.py`` imports helpers from ``tests/test_evidence.py``:
+    a change to them can break it at collection (#342 R1-F3)."""
+    (choice,) = _selected("tests/test_evidence.py").choices
+    assert {"test_evidence", "test_certificate"} <= choice.modules
+    assert "more importing tests.test_evidence" in choice.reason
+
+
+def test_a_test_module_and_a_removed_one_select_their_direct_importers(tmp_path):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_a.py").write_text("def helper(): ...\n", encoding="utf-8")
+    (tests / "test_b.py").write_text("from .test_a import helper\n", encoding="utf-8")
+    (tests / "test_c.py").write_text("from tests.test_b import helper\n", encoding="utf-8")
+    (tests / "test_d.py").write_text("from tests import test_gone\n", encoding="utf-8")
+    (a, gone) = ft.select(["tests/test_a.py", "tests/test_gone.py"], root=tmp_path).choices
+    assert (a.modules, a.reason) == (
+        {"test_a", "test_b"},
+        "a test module: itself, 1 more importing tests.test_a",
+    )
+    # A removed module's importers now fail to collect: that is the feedback.
+    assert (gone.modules, gone.reason) == (
+        {"test_d"},
+        "a removed test module, 1 importing tests.test_gone",
+    )
+
+
+def test_a_selection_holding_the_live_tests_holds_their_offline_tests():
+    """pytest handed only the live tests deselects them all and exits 5: a FAST
+    failure though nothing failed (#342 R1-F2)."""
+    helper, live = _selected("tests/live_pi.py", "tests/test_live_pi.py").choices
+    assert {"test_live_pi", "test_live_pi_support"} <= helper.modules
+    assert live.modules == {"test_live_pi", "test_live_pi_support"}
+    assert live.reason == "a test module: itself, 1 offline for the live-only test_live_pi"
+
+
+def test_a_live_only_change_collects_its_offline_tests_under_the_default_options(capfd):
+    """What ``make test-fast`` hands pytest for a change to the live tests
+    alone, collected by a real pytest under the repository's own options:
+    the offline tests, never the live ones (#342 R1-F2)."""
+
+    def collect(argv, **kwargs):
+        env = {k: v for k, v in os.environ.items() if k != "PYTEST_ADDOPTS"}
+        return subprocess.run(argv, env=env, timeout=120, **kwargs)
+
+    argv = ["--run", "tests/test_live_pi.py", "--", "--collect-only", "-p", "no:cacheprovider"]
+    code = ft.main(argv, run=collect)
+    out, err = capfd.readouterr()
+    assert code == 0, out + err
+    assert "tests/test_live_pi_support.py::" in out
+    assert "tests/test_live_pi.py::" not in out
+    assert " deselected" in out
+    assert "pytest exited 0" in err
 
 
 def test_the_selection_is_the_union_of_its_paths():
@@ -232,6 +315,30 @@ def test_the_change_is_read_from_the_merge_base_with_the_base(tmp_path):
     merge_base, paths = ft.changed_paths("main", repo)
     assert merge_base == _git(repo, "merge-base", "main", "HEAD")
     assert paths == ["a.py", "b.py", "c.py", "d.py", "f.py", "g.py"]
+
+
+def test_a_change_one_version_undoes_still_counts(tmp_path):
+    """The commit, the index and the worktree are each compared with the merge
+    base: a change staged and then undone in the worktree (``MM``), and one
+    committed and then undone in the index and the worktree (``M ``), are
+    changes still (#342 R1-F1)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    for name in ("a.py", "b.py", "c.py"):
+        (repo / name).write_text(f"{name}\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / "b.py").write_text("committed\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "work")
+    _git(repo, "checkout", "-q", "main", "--", "b.py")
+    (repo / "a.py").write_text("staged\n", encoding="utf-8")
+    _git(repo, "add", "a.py")
+    (repo / "a.py").write_text("a.py\n", encoding="utf-8")
+    assert _git(repo, "status", "--porcelain").splitlines() == ["MM a.py", "M  b.py"]
+
+    assert ft.changed_paths("main", repo)[1] == ["a.py", "b.py"]
 
 
 def test_an_unreadable_base_stops_the_tool(tmp_path):

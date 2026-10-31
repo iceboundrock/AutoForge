@@ -18,20 +18,26 @@ relays a claim.
 
 **The selection**, for each changed path:
 
-- a test module (``tests/test_*.py``) selects itself, and a removed one
-  selects nothing;
+- a test module (``tests/test_*.py``) selects itself, a removed one
+  nothing of its own, and either selects every test module that imports it
+  directly (``tests/test_certificate.py`` imports helpers from
+  ``tests/test_evidence.py``);
 - a path with an entry in :data:`COVERAGE` (its own, or else the longest
   directory prefix that holds it) selects the entry's test modules and
   every test module that imports the path's module directly; an entry of
   :data:`FULL` selects the full suite;
 - any other path selects the full suite: the mapping never narrows what it
-  does not know.
+  does not know;
+- a selection that holds a test module of :data:`LIVE_ONLY`, whose tests
+  the default options deselect, holds that module's offline tests too, so
+  pytest is never handed only tests it does not run. FAST never selects
+  the live tests themselves (``-m live``).
 
 The run's selection is the union of the paths' selections, and the full
 suite as soon as one path selects it. Without paths on the command line,
-the changed paths are the worktree's differences from its merge base with
-``--base`` (committed, staged and unstaged, both sides of a rename) and
-the untracked files git does not ignore.
+the changed paths are those whose commit, staged version or worktree
+version differs from the merge base with ``--base`` (each compared on its
+own, both sides of a rename) and the untracked files git does not ignore.
 
 **The mapping** is explicit: every file under ``src/autoforge/`` and every
 helper module under ``tests/`` has an entry, and ``tests/test_fast_targets.py``
@@ -76,8 +82,11 @@ Entry = tuple[str, ...] | Literal[Full.FULL]
 LOOP = ("test_engine", "test_integration")
 
 # Test modules whose every test is deselected by the default options
-# (``-m 'not live'``): an entry naming one would select nothing that runs.
-LIVE_ONLY = frozenset({"test_live_pi"})
+# (``-m 'not live'``), each with the offline tests of its machinery. An entry
+# naming one would select nothing that runs, and a selection that holds one
+# holds its offline tests too: pytest handed only deselected tests collects
+# none and exits 5, a FAST failure though nothing failed.
+LIVE_ONLY: Mapping[str, tuple[str, ...]] = {"test_live_pi": ("test_live_pi_support",)}
 
 # Each entry lists the test modules a change to its path is checked by
 # besides those that import its module, which the selection adds itself.
@@ -278,21 +287,30 @@ def choose(
     p = PurePosixPath(path)
     if p.parent == PurePosixPath("tests") and p.name.startswith("test_") and p.suffix == ".py":
         if p.stem in suite:
-            return Choice(path, frozenset({p.stem}), False, "a test module: itself")
-        return Choice(path, frozenset(), False, "a removed test module: nothing to run")
-    key = entry_key(path, coverage)
-    if key is None:
-        return Choice(path, frozenset(), True, "no entry: the full suite")
-    entry = coverage[key]
-    if entry is FULL:
-        return Choice(path, frozenset(), True, f"{key} is FULL: the full suite")
+            listed, reason = frozenset({p.stem}), "a test module: itself"
+        else:
+            listed, reason = frozenset(), "a removed test module"
+    else:
+        key = entry_key(path, coverage)
+        if key is None:
+            return Choice(path, frozenset(), True, "no entry: the full suite")
+        entry = coverage[key]
+        if entry is FULL:
+            return Choice(path, frozenset(), True, f"{key} is FULL: the full suite")
+        listed = frozenset(entry)
+        reason = f"{len(listed)} listed for {key}"
     module = module_name(path)
     direct = imported_by.get(module, frozenset()) if module else frozenset()
-    listed = frozenset(entry)
-    reason = f"{len(listed)} listed for {key}"
     if direct - listed:
-        reason += f", {len(direct - listed)} more importing {module}"
-    return Choice(path, listed | direct, False, reason)
+        reason += f", {len(direct - listed)} {'more ' if listed else ''}importing {module}"
+    selected = listed | direct
+    live = sorted(selected & LIVE_ONLY.keys())
+    offline = frozenset().union(*(LIVE_ONLY[m] for m in live)) - selected
+    if offline:
+        reason += f", {len(offline)} offline for the live-only {' '.join(live)}"
+    if not selected:
+        reason += ": nothing to run"
+    return Choice(path, selected | offline, False, reason)
 
 
 def select(
@@ -321,14 +339,20 @@ def _git(root: Path, *args: str) -> str:
 def changed_paths(base: str, root: Path = REPO_ROOT) -> tuple[str, list[str]]:
     """The merge base of ``HEAD`` with ``base``, and every path changed since it.
 
-    Committed, staged and unstaged changes to tracked files (``git diff``
-    against the merge base compares the worktree), both sides of a rename,
-    and the untracked files git does not ignore.
+    A tracked path whose commit (``HEAD``), staged version (the index) or
+    worktree version differs from the merge base's, each compared on its
+    own: a change staged and then undone in the worktree, or committed and
+    then undone in both, still counts. Both sides of a rename, and the
+    untracked files git does not ignore.
     """
     merge_base = _git(root, "merge-base", base, "HEAD").strip()
-    tracked = _git(root, "diff", "--name-only", "--no-renames", "-z", merge_base, "--")
+    diff = ("diff", "--name-only", "--no-renames", "-z")
+    committed = _git(root, *diff, merge_base, "HEAD", "--")
+    staged = _git(root, *diff, "--cached", merge_base, "--")
+    worktree = _git(root, *diff, merge_base, "--")
     untracked = _git(root, "ls-files", "--others", "--exclude-standard", "-z")
-    return merge_base, sorted({p for p in (tracked + untracked).split("\0") if p})
+    found = "\0".join((committed, staged, worktree, untracked)).split("\0")
+    return merge_base, sorted({p for p in found if p})
 
 
 def _normalized(path: str, root: Path) -> str:

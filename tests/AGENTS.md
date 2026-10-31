@@ -201,8 +201,10 @@ read it before adding tests for a listed area.
   an entry for every file under `src/autoforge/` and every helper module
   here, so a new module or helper gets one: the test modules that check it
   beyond those importing it, which the tool adds itself, or `FULL` when
-  almost every test runs through it. `tests/test_fast_targets.py` fails
-  without it. A FAST run is never evidence and never a gate.
+  almost every test runs through it. A test module whose tests are all
+  `live` needs a `LIVE_ONLY` entry naming its offline tests, so a change
+  to it alone still runs something. `tests/test_fast_targets.py` fails
+  without either. A FAST run is never evidence and never a gate.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
