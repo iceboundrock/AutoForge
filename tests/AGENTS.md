@@ -224,17 +224,27 @@ read it before adding tests for a listed area.
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.
+- `os.fsync` waits for no disk outside the modules of
+  `REAL_FSYNC_MODULES`, the tests of the durable writes themselves (#341):
+  the autouse `_fsync_without_the_disk` puts `fsync_without_the_disk` in
+  its place, which refuses what `fsync(2)` refuses (`tests/test_safefs.py`
+  pins each answer to the real call's) and flushes nothing. No test can
+  tell a flushed file from one that was not, a crash-recovery test
+  included: what a killed process wrote is there either way, and only a
+  power loss would differ. A test of what a write survives belongs in one
+  of those modules; a test that patches `os.fsync` patches over the
+  stand-in. Child processes (git, a scheduler worker) flush as always.
 - A passed test's `tmp_path` is deleted when the test ends, and one that
   failed or errored in setup, call or teardown keeps it
   (`tmp_path_retention_policy = "failed"` in `pyproject.toml`, decided by
-  `tests/tmp_path_retention.py` once the teardown report is made). Once a
-  passed test's directory is gone, a later test with the same first 30
-  characters of name gets the same path. A directory a test needs outside
-  its `tmp_path` (outside the repository `git_repo(tmp_path)` makes, for
-  instance) comes from `tmp_path_factory.mktemp(...)`, whose names are never
-  reused in a session, never from `tmp_path.parent`: a sibling named after
-  `tmp_path.name` outlives its test and is found again by the next one to
-  get that name.
+  `tests/tmp_path_retention.py` once the teardown report is made). That
+  module also numbers each `tmp_path` without listing the basetemp, and
+  never hands out a name twice in a session (#341). A directory a test
+  needs outside its `tmp_path` (outside the repository `git_repo(tmp_path)`
+  makes, for instance) comes from `tmp_path_factory.mktemp(...)`, whose
+  names are never reused in a session either, never from `tmp_path.parent`:
+  a sibling named after `tmp_path.name` outlives its test, since only
+  `tmp_path` itself is removed.
 
 ## Where a behaviour is tested
 

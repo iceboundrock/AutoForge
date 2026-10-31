@@ -80,6 +80,7 @@ import ctypes
 import math
 import os
 import re
+import select
 import selectors
 import signal
 import subprocess
@@ -603,7 +604,7 @@ def _wait_within(
         if stop is not None:
             timeout = _STOP_POLL_SECONDS if timeout is None else min(timeout, _STOP_POLL_SECONDS)
         try:
-            proc.wait(timeout=timeout)
+            _wait_exit(proc, timeout)
         except subprocess.TimeoutExpired:
             if limits.expired():
                 return limits.limit()
@@ -867,9 +868,54 @@ def _signal_group(pgid: int, sig: signal.Signals) -> bool:
     return True
 
 
+def _wait_exit(proc: subprocess.Popen, timeout: float | None) -> int:
+    """``proc.wait(timeout)``, ended by the child's exit rather than by a poll.
+
+    With a timeout, CPython (3.11 to 3.14) polls ``waitpid`` 1, 3, 7, 15,
+    31, 63 and 113 ms into the wait and every 50 ms after, so a child is
+    reaped up to twice as late as it exits, or 50 ms late: one that exits
+    after 64 ms is reaped after 113. :func:`execute` waits so for a request
+    with a time limit, and a ``git rev-parse`` took it 4.5 ms instead of 2.4
+    (#341). On Linux a pidfd (``pidfd_open(2)``) becomes readable when the
+    child exits, so the wait ends then, and ``proc.wait(timeout=0)`` decides
+    at once: it reaps the child, or raises ``subprocess.TimeoutExpired`` when
+    the timeout ran out first. Without a pidfd (another system, a kernel
+    before 5.3, a call the host refuses), for a child already reaped, whose
+    pid may name another process by now, without a timeout, which blocks in
+    ``waitpid`` and polls nothing, and past :data:`MAX_DEADLINE_SECONDS`,
+    it is ``proc.wait(timeout)`` itself.
+    """
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if (
+        timeout is not None
+        # poll(2) takes an int of milliseconds; a week is far inside it.
+        and timeout <= MAX_DEADLINE_SECONDS
+        and proc.returncode is None
+        and pidfd_open is not None
+    ):
+        try:
+            pidfd = pidfd_open(proc.pid)
+        except OSError:
+            return proc.wait(timeout=timeout)
+        try:
+            # poll(2) takes no descriptor of its own, so it cannot fail for
+            # want of one; a poll that fails all the same leaves the wait
+            # to proc.wait, as without a pidfd. A negative timeout is no
+            # time left, as for proc.wait, not poll's wait without end.
+            exited = select.poll()
+            exited.register(pidfd, select.POLLIN)
+            exited.poll(max(0, math.ceil(timeout * 1000)))
+            timeout = 0
+        except OSError:
+            pass
+        finally:
+            os.close(pidfd)
+    return proc.wait(timeout=timeout)
+
+
 def _reaped(proc: subprocess.Popen, deadline: float) -> bool:
     try:
-        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        _wait_exit(proc, max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         return False
     return True
