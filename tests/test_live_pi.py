@@ -14,13 +14,17 @@ explicitly, never defaulted:
   ``require_oauth: true``, ``openai/gpt-5.6-terra`` by default. An optional
   regression run.
 
-Give Pi its credential yourself first, leave ``OPENAI_API_KEY`` and
-``DEEPSEEK_API_KEY`` unset (unless forwarding one), and from the repository
-root::
+Two tests, one model call each: a LOCAL REVIEW, and a REMOTE REVIEW against
+a GitHub stand-in that never reaches GitHub (ADR 0009 Appendix A.2.3 G: the
+REMOTE flow stays once LOCAL mode is removed). Select one by name, so that a
+run spends one call. Give Pi its credential yourself first, leave
+``OPENAI_API_KEY`` and ``DEEPSEEK_API_KEY`` unset (unless forwarding one),
+and from the repository root::
 
-    AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live tests/test_live_pi.py
+    AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live \\
+        tests/test_live_pi.py::test_one_remote_review_runs_on_the_operators_real_pi
 
-It spends one small REVIEW of the account's quota.
+Each spends one small REVIEW of the account's quota.
 ``AUTOFORGE_LIVE_PI_MODEL`` and ``AUTOFORGE_LIVE_PI_EFFORT`` (default
 ``low``) choose the model. The report it prints at the end carries no key
 or account detail and is the evidence to post on #135. The steps are in
@@ -36,7 +40,13 @@ import pytest
 
 import autoforge.child_env as child_env_module
 import autoforge.engine as engine_module
-from tests.live_pi import LIVE_VARIABLE, SmokeReport, run_smoke, settings_from_environment
+from tests.live_pi import (
+    LIVE_VARIABLE,
+    SmokeReport,
+    run_remote_smoke,
+    run_smoke,
+    settings_from_environment,
+)
 
 pytestmark = pytest.mark.live
 
@@ -46,8 +56,9 @@ _OPERATOR_HOME = child_env_module.operator_home
 _PROBE_SANDBOX = engine_module.probe_sandbox
 
 
-def test_one_local_review_runs_on_the_operators_real_pi(tmp_path, monkeypatch, capsys):
-    """Steps 1 to 7 of #135 against the operator's own Pi and credential."""
+def _run_live(flow, tmp_path, monkeypatch, capsys) -> None:
+    """Skip without ``AUTOFORGE_LIVE_PI=1``; otherwise run ``flow`` on the
+    operator's settings, print its report and require every step to pass."""
     selected = os.environ.get(LIVE_VARIABLE, "")
     if not selected:
         pytest.skip(f"set {LIVE_VARIABLE}=1 to run the live Pi smoke test (one model call)")
@@ -62,8 +73,20 @@ def test_one_local_review_runs_on_the_operators_real_pi(tmp_path, monkeypatch, c
 
     report = SmokeReport()
     try:
-        run_smoke(tmp_path, settings, report)
+        flow(tmp_path, settings, report)
     finally:
         with capsys.disabled():
             print("\n" + report.render())
     assert report.ok, report.render()
+
+
+def test_one_local_review_runs_on_the_operators_real_pi(tmp_path, monkeypatch, capsys):
+    """Steps 1 to 7 of #135 against the operator's own Pi and credential."""
+    _run_live(run_smoke, tmp_path, monkeypatch, capsys)
+
+
+def test_one_remote_review_runs_on_the_operators_real_pi(tmp_path, monkeypatch, capsys):
+    """The same seven steps on a REMOTE run (ADR 0009 Appendix A.2.3 G): the
+    real ``autoforge doctor``'s Pi rows, then one REMOTE REVIEW on Pi of a PR
+    the controller opened on the GitHub stand-in."""
+    _run_live(run_remote_smoke, tmp_path, monkeypatch, capsys)

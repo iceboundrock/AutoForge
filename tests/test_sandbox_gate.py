@@ -21,7 +21,7 @@ from autoforge.sandbox_bwrap import Capability
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import implement, make_engine, make_local_engine
-from tests.test_local import impl_result, local_repo, review_result, scripted, touch_impl
+from tests.local_helpers import impl_result, local_repo, review_result, scripted, touch_impl
 
 
 def _cfg(mode: str):

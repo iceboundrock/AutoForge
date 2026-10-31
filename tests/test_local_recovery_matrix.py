@@ -37,7 +37,7 @@ from autoforge.state import load_state
 from autoforge.transitions import Phase
 
 from .conftest import make_local_engine
-from .test_local import (
+from .local_helpers import (
     IMPL_FILE,
     finding,
     fix_result,

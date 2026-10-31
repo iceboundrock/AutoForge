@@ -43,8 +43,8 @@ from autoforge.errors import (
 )
 from autoforge.executor import ExecutionRequest, execute
 from autoforge.git_transport import NETWORK_TIMEOUT_SECONDS
+from autoforge.git_workspace import GIT_TIMEOUT_SECONDS
 from autoforge.github import GitHubClient
-from autoforge.local_workspace import GIT_TIMEOUT_SECONDS
 from autoforge.locking import (
     SHARED_GIT_LOCK_WAIT_SECONDS,
     ControllerLock,

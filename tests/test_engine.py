@@ -5264,6 +5264,38 @@ def test_launch_is_persisted_before_the_agent_runs(tmp_state_dir):
     assert seen == [1] and load_state(eng.paths.state_file).attempt == 0
 
 
+def test_a_journal_refused_before_the_launch_charges_no_attempt(tmp_state_dir):
+    """#57 in REMOTE: the event journal is opened before the launch is
+    charged, so a journal that cannot be appended to (here, larger than
+    any controller journal can be) refuses the step with no agent started
+    and no attempt counted. A charge before the open would persist a
+    launch that never happened.
+
+    ADR 0009 A.2.4 (#386): the REMOTE form of the launch-accounting half
+    of tests/test_local.py::test_a_journal_refused_before_the_launch_is_not_charged_as_a_launch.
+    """
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    gh = FakeGitHub()
+
+    def never_launched(req):
+        pytest.fail("the reviewer was launched over a journal that cannot be appended to")
+
+    eng = _in_review(tmp_state_dir, gh, never_launched)
+    eng.save()
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.touch()
+    os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+    with pytest.raises(StateError, match="corrupted event journal.*larger than"):
+        eng.step()
+    assert eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.attempt == 0
+    assert gh.effect_writes == [] and gh.comments.get(PR, []) == []
+    assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES
+
+
 # -- agent-reported failure / blocked ----------------------------------------------------------
 def test_agent_failure_moves_to_failed(tmp_state_dir, fake_github):
     payload = {"phase": "ANALYZE_EXECUTE", "status": "failure", "message": "tests red"}
@@ -10272,7 +10304,7 @@ def test_the_branch_is_quoted_in_a_code_span_no_backtick_in_it_can_close(branch,
     longer than any backtick run in the name, and a name that starts or ends
     with a backtick is padded so the run does not join the delimiter."""
     from autoforge.engine import render_worktree_state
-    from autoforge.local_workspace import StatusEntry
+    from autoforge.git_workspace import StatusEntry
 
     assert git_out("check-ref-format", "--branch", branch) == branch
     text = render_worktree_state([StatusEntry("??", "a.py")], SHA_A, branch)
@@ -10322,7 +10354,7 @@ def test_the_hint_is_bounded_and_quotes_each_path_as_data():
         MAX_WORKTREE_STATE_PATH_CHARS,
         render_worktree_state,
     )
-    from autoforge.local_workspace import StatusEntry
+    from autoforge.git_workspace import StatusEntry
 
     assert render_worktree_state([], SHA_A, "") == ""
     long = "deep/" + "x" * 400 + ".py"
@@ -14053,6 +14085,175 @@ def test_a_netrc_entry_for_github_blocks_the_premerge_verification(
     assert "pre-merge verification command not run" in eng.state.block_reason
     assert "~/.netrc" in eng.state.block_reason
     assert not record.exists()
+
+
+# ADR 0009 A.2.3 H (#386): a credential source the implementation agent plants
+# during its own launch, after that launch's preflight passed and before the
+# controller validates the candidate it produced. No token shape, so only the
+# preflight's own care keeps the value out of a message, never the redaction.
+_PLANTED = "planted-credential-value-7f3a"
+
+# A validation command that records, from inside its export, every
+# ``credential.helper`` git reads there and the scope of everything git reads
+# there (``--show-scope``: system, global, local, worktree, command).
+_GIT_CONFIG_PROBE = (
+    "import json, subprocess, sys; "
+    "git = lambda *a: subprocess.run(['git', 'config', '--show-scope', '--show-origin', *a], "
+    "capture_output=True, text=True).stdout.splitlines(); "
+    "open(sys.argv[1], 'a').write(json.dumps({'helpers': git('--get-all', 'credential.helper'), "
+    "'listing': git('--list')}) + chr(10))"
+)
+
+
+def _planting_producer(tmp_state_dir, gh, plant, *commands):
+    """A REMOTE run at ANALYZE_EXECUTE, on a local origin, with ``commands`` as
+    ``validation.commands``, whose implementer runs ``plant(req)`` and commits."""
+
+    def agent(req):
+        plant(req)
+        return implement(req)
+
+    cfg = default_config()
+    cfg.validation.commands = [list(c) for c in commands]
+    eng = make_engine(tmp_state_dir, agent, github=gh, cfg=cfg, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    return eng
+
+
+def _blocked_before_validation(eng, gh, out, record, *named: str) -> None:
+    """The validation command was refused before it ran: ``BLOCKED`` naming each
+    of ``named`` and no value, no record, nothing pushed or written to GitHub."""
+    assert not record.exists()
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED
+    assert "could not validate the candidate" in s.block_reason
+    assert "the launch was refused" in s.block_reason
+    for name in named:
+        assert name in s.block_reason
+    assert _PLANTED not in eng.paths.state_file.read_text(encoding="utf-8")
+    assert "Nothing was pushed or published" in s.block_reason
+    assert s.validation_records == [] and s.validation_attempt == {}
+    assert eng.origin.head("autoforge/2") is None
+    assert gh.effect_writes == [] and gh.prs == {}
+
+
+def test_a_credential_helper_planted_before_candidate_validation_never_reaches_the_command(
+    tmp_state_dir, fake_github, tmp_path_factory, monkeypatch
+):
+    """The implementer can write its repository's configuration (the common
+    dir's ``config``, its worktree's ``config.worktree``) once its launch's
+    preflight passed. The producer's validation command runs in a fresh
+    export outside the repository, where git reads neither helper and the
+    command gets no credential variable; the candidate is published, and the
+    reviewer's launch in that worktree refuses the helpers before it starts.
+
+    ADR 0009 A.2.3 H-A (#386): the REMOTE replacement of
+    tests/test_local.py::test_a_credential_helper_planted_before_validation_leaves_the_phase_unverified
+    (case i, the helper).
+    """
+    from tests.conftest import (
+        assert_isolated_names,
+        env_probe_command,
+        env_probe_records,
+        pollute_operator_environment,
+    )
+
+    def plant(req):
+        git_out("-C", req.cwd, "config", "--local", "extensions.worktreeConfig", "true")
+        git_out("-C", req.cwd, "config", "--local", "credential.helper", "store")
+        git_out("-C", req.cwd, "config", "--worktree", "credential.helper", f"!echo {_PLANTED}")
+
+    scratch = tmp_path_factory.mktemp("probe")
+    pollute_operator_environment(monkeypatch, scratch)
+    git_record, env_record = scratch / "git.jsonl", scratch / "env.jsonl"
+    probe = [sys.executable, "-c", _GIT_CONFIG_PROBE, str(git_record)]
+    eng = _planting_producer(
+        tmp_state_dir, fake_github, plant, probe, env_probe_command(env_record)
+    )
+    assert eng.step().next_phase == "REVIEW"
+    [launch] = eng.provider.calls
+    s = load_state(eng.paths.state_file)
+    assert [r["outcome"] for r in s.validation_records] == ["PASS", "PASS"]
+    head = git_out("-C", launch.cwd, "rev-parse", "HEAD")
+    assert {r["candidate"]["commit"] for r in s.validation_records} == {head}
+    # Every credential.helper git reads in the export is the controller's
+    # command-scope reset (the host's /etc/gitconfig, which no agent writes,
+    # aside), and git reads no repository scope there at all.
+    [seen] = env_probe_records(git_record)
+    helpers = [line.split("\t") for line in seen["helpers"]]
+    assert [h for h in helpers if h[0] != "system"] == [["command", "command line:", ""]]
+    assert not [line for line in seen["listing"] if line.split("\t")[0] in ("local", "worktree")]
+    assert _PLANTED not in json.dumps(seen)
+    [env] = env_probe_records(env_record)
+    assert_isolated_names(env["names"])
+    assert env["gh_token_placeholder"] and env["gh_config_dir_empty"]
+    # The helpers are in force in the worktree: the next launch there refuses
+    # both, before the reviewer is launched.
+    with pytest.raises(ConfigurationError) as refused:
+        eng.step()
+    message = str(refused.value)
+    assert "credential helper in local-scope git configuration" in message
+    assert "credential helper in worktree-scope git configuration" in message
+    assert _PLANTED not in message
+    assert eng.provider.calls == [launch]
+    assert load_state(eng.paths.state_file).phase == Phase.REVIEW
+
+
+def test_a_netrc_entry_planted_before_candidate_validation_blocks_the_producer(
+    tmp_state_dir, fake_github, tmp_path_factory
+):
+    """``~/.netrc`` is a git credential source the export does reach: the
+    preflight before the producer's validation command refuses it, and the
+    candidate is neither validated nor published.
+
+    ADR 0009 A.2.3 H-A (#386): the REMOTE replacement of
+    tests/test_local.py::test_a_credential_helper_planted_before_validation_leaves_the_phase_unverified
+    (case ii, ``~/.netrc``).
+    """
+    import autoforge.child_env as child_env_module
+    from tests.conftest import env_probe_command
+
+    netrc = Path(child_env_module.operator_home()) / ".netrc"
+    record = tmp_path_factory.mktemp("probe") / "env.jsonl"
+    eng = _planting_producer(
+        tmp_state_dir,
+        fake_github,
+        lambda req: netrc.write_text(f"machine github.com login x password {_PLANTED}\n"),
+        env_probe_command(record),
+    )
+    out = eng.step()
+    _blocked_before_validation(
+        eng, fake_github, out, record, "an entry for GitHub (or a default entry) in ~/.netrc"
+    )
+
+
+def test_a_startup_file_planted_before_candidate_validation_blocks_the_producer(
+    tmp_state_dir, fake_github, tmp_path_factory
+):
+    """R3-F1 in REMOTE: the login-shell probe reads ``HOME``, not the export,
+    so a ``~/.profile`` the implementer wrote that exports a token is refused
+    by the preflight before its validation command, naming the shell and the
+    variable, never the value.
+
+    ADR 0009 A.2.3 H-B (#386): the REMOTE replacement of
+    tests/test_local.py::test_a_startup_file_planted_before_validation_leaves_the_phase_unverified
+    """
+    import autoforge.child_env as child_env_module
+    from tests.conftest import env_probe_command
+
+    profile = Path(child_env_module.operator_home()) / ".profile"
+    record = tmp_path_factory.mktemp("probe") / "env.jsonl"
+    eng = _planting_producer(
+        tmp_state_dir,
+        fake_github,
+        lambda req: profile.write_text(f"export GITHUB_TOKEN={_PLANTED}\n"),
+        env_probe_command(record),
+    )
+    out = eng.step()
+    _blocked_before_validation(
+        eng, fake_github, out, record, "the startup files of a login sh ", "change GITHUB_TOKEN"
+    )
 
 
 def test_a_plan_names_no_read_context_and_writes_none(tmp_state_dir, fake_github):

@@ -360,11 +360,17 @@ ADR 0002 §4b and the [Pi policy](pi-policy.md) §10 record:
 
 ## Prove it on your machine: the live smoke test
 
-`tests/test_live_pi.py` is an opt-in test that runs one real phase through
-your Pi and your credential. It never runs in `make check` or CI: the `live`
-marker deselects it unless you pass `-m live`, and it then skips unless
-`AUTOFORGE_LIVE_PI=1`. You name the auth route, which has no default, so a
-report always says which route it proves:
+`tests/test_live_pi.py` holds two opt-in tests, each running one real
+phase through your Pi and your credential:
+`test_one_local_review_runs_on_the_operators_real_pi` runs a LOCAL REVIEW,
+and `test_one_remote_review_runs_on_the_operators_real_pi` a REMOTE REVIEW
+against a GitHub stand-in that never reaches GitHub
+([The REMOTE test](#the-remote-test)). LOCAL mode is being removed
+(EPIC #383); the REMOTE test is the one that stays. Neither runs in
+`make check` or CI: the `live` marker deselects them unless you pass
+`-m live`, and they then skip unless `AUTOFORGE_LIVE_PI=1`. You name the
+auth route, which has no default, so a report always says which route it
+proves:
 
 - `AUTOFORGE_LIVE_PI_AUTH=api_key`: an API key, with
   `require_oauth: false`; the model defaults to `deepseek/deepseek-flash`.
@@ -378,12 +384,21 @@ report always says which route it proves:
 ```bash
 unset OPENAI_API_KEY DEEPSEEK_API_KEY  # the test fails, and does not unset them for you
 
-# DeepSeek, its key in Pi's own credential store
-AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live tests/test_live_pi.py
+# DeepSeek, its key in Pi's own credential store, on a REMOTE run
+AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live \
+  tests/test_live_pi.py::test_one_remote_review_runs_on_the_operators_real_pi
+
+# the same route on a LOCAL run
+AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=api_key uv run pytest -m live \
+  tests/test_live_pi.py::test_one_local_review_runs_on_the_operators_real_pi
 
 # the ChatGPT sign-in (once before: `pi`, then /login openai)
-AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=oauth uv run pytest -m live tests/test_live_pi.py
+AUTOFORGE_LIVE_PI=1 AUTOFORGE_LIVE_PI_AUTH=oauth uv run pytest -m live \
+  tests/test_live_pi.py::test_one_remote_review_runs_on_the_operators_real_pi
 ```
+
+Name the test: `tests/test_live_pi.py` alone runs both, which spends two
+REVIEWs.
 
 To forward the key instead of keeping it in Pi's store, export it and add
 `AUTOFORGE_LIVE_PI_FORWARD_KEY=DEEPSEEK_API_KEY` (the `api_key` route
@@ -391,10 +406,10 @@ only): the test's configuration then lists that name in
 `execution.env_allowlist_extra`, and the report names the route, never the
 value.
 
-It costs one small REVIEW of the account's quota (a few-line diff, at
+Each test costs one small REVIEW of the account's quota (a few-line diff, at
 thinking level `low`). `AUTOFORGE_LIVE_PI_MODEL` and
 `AUTOFORGE_LIVE_PI_EFFORT` (default `low`) choose another model. In a
-temporary directory it:
+temporary directory the LOCAL test:
 
 1. checks, and never performs, the preconditions: `pi` on `PATH`, at least
    1.0.0, and Pi's read-only `pi auth check --model M --json --no-refresh`
@@ -443,3 +458,50 @@ the one reviewed.
 spends several model calls. Check that the run reaches `DONE` or a
 review's findings, that each step's `execution.json` shows the model Pi
 resolved, and that `git status` shows only the implementation.
+
+### The REMOTE test
+
+`test_one_remote_review_runs_on_the_operators_real_pi` runs the same seven
+steps on a REMOTE run, against a GitHub stand-in: the test suite's
+in-memory fake of GitHub, its git data in a bare repository in the test's
+temporary directory, which the controller's own git transport pushes to
+over `file://`. Nothing reaches GitHub, and the run needs no `gh` login.
+The test seeds that repository itself, over no git transport and with
+none of your git configuration or `GIT_*` variables, so a URL rewrite
+(`insteadOf`) in your `~/.gitconfig` cannot send the seed anywhere else.
+Its other git (the checkout's `origin`, the scripted implementation's
+commit, the HEADs it reports) ignores your `GIT_*` variables too, so a
+`GIT_DIR` set in your shell cannot make it write to another checkout, and
+it runs none of your git hooks.
+A throwaway repository on github.com would exercise GitHub too, but it
+would need your login and the network, and leave a branch, a PR and a
+comment to clean up, while what this test proves is Pi on a REMOTE review.
+The cost: the run proves nothing about `gh` or GitHub's API, and what the
+controller sends to GitHub is checked against the fake's model of it.
+
+Steps 1 and 2 are the LOCAL test's, and so is step 7, whose report also
+names the mode and what the controller wrote to the stand-in. The others
+differ:
+
+3. It runs `autoforge doctor`. Its rows that need GitHub (`gh available`,
+   `gh authenticated`, the default branch's required checks, the check runs
+   read) fail or are skipped, as they must without your login: the
+   configuration's `github.command` is the stand-in's `gh`, which answers
+   nothing. The report lists them apart from any other failure, and only
+   the Pi rows decide the step, as for `local doctor`.
+4. The scripted stand-in commits the feature in the issue's worktree, the
+   controller pushes it and opens the PR on the stand-in, and **one REVIEW
+   runs on Pi** in that worktree, of the PR's HEAD. The controller posts the
+   review comment itself. A clean review leaves the run at
+   `READY_FOR_MERGE`, and nothing is merged: the merge gate stays closed.
+5. The scan also covers every request the controller sent to the stand-in
+   (the PR's title and body and the review comment among them), the git
+   directory's `autoforge/` (the lock and the issue's worktree), and the
+   run's state directory, which this test keeps outside the checkout.
+6. The review must leave the checkout, the issue's worktree and the
+   worktree's HEAD unchanged.
+
+A REMOTE review is bound to the PR's HEAD commit, not to the files in its
+worktree, so the controller accepts a review whose reviewer wrote into the
+worktree without committing: step 4 passes, and step 6 is what reports it.
+A LOCAL review that writes is refused by the controller itself.

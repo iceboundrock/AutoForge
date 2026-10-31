@@ -38,7 +38,7 @@ from autoforge.sandbox_pin import (
 from autoforge.state import load_state
 
 from .conftest import FakeGitHub, make_engine, make_local_engine, write_feature
-from .test_local import local_repo
+from .local_helpers import local_repo
 
 AT = "2026-10-24T00:00:00+00:00"
 

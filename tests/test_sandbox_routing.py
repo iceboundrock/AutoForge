@@ -765,6 +765,71 @@ def test_doctor_launches_each_providers_version_as_a_launch_would(backend, tmp_p
     assert sorted(os.listdir(operator_config)) == ["opencode.json"]
 
 
+def test_remote_doctor_launches_each_providers_version_as_a_launch_would(
+    backend, tmp_path, monkeypatch
+):
+    """ADR 0009 A.2.3 E (#386): the REMOTE replacement of
+    test_sandbox_routing.py::test_doctor_launches_each_providers_version_as_a_launch_would.
+
+    ``autoforge doctor``'s rows (``local=False``), run from the checkout,
+    for the same fakes: a ``claude`` whose ``--version`` needs its linked
+    ``$CLAUDE_CONFIG_DIR`` to lead to a directory inside, an ``opencode``
+    whose ``--version`` needs an empty ``$OPENCODE_CONFIG_DIR`` it can
+    write, though the operator's names their configuration root. Each
+    probe compiles with the REMOTE run's denied roots, the checkout among
+    them; through the real backend both rows pass, as both CLIs' REMOTE
+    launches do, and the operator's directory is left unwritten.
+    """
+    base = Path(os.path.realpath(tmp_path))
+    home = base / "home"
+    real = base / "claude-autoforge"
+    real.mkdir()
+    alias = _linked(home / ".claude-autoforge", real)
+    operator_config = _sentinel(home / ".config" / "opencode" / "opencode.json", "{}\n").parent
+    claude = _sentinel(
+        base / "tools" / "claude" / "bin" / "claude",
+        f"#!{PY}\nimport os, sys\n"
+        "if not os.path.isdir(os.environ.get('CLAUDE_CONFIG_DIR', '')):\n"
+        "    sys.exit(3)\n"
+        "print('fake-claude 9.9.9')\n",
+    )
+    opencode = _sentinel(
+        base / "tools" / "opencode" / "bin" / "opencode",
+        f"#!{PY}\nimport os, sys\n"
+        "config = os.environ.get('OPENCODE_CONFIG_DIR', '')\n"
+        "if not os.path.isdir(config) or os.listdir(config):\n"
+        "    sys.exit(3)\n"
+        "open(os.path.join(config, 'written'), 'w').close()\n"
+        "print('fake-opencode 9.9.9')\n",
+    )
+    for tool in (claude, opencode):
+        tool.chmod(0o755)
+    for name in list(os.environ):
+        if name.startswith(("CLAUDE_", "ANTHROPIC_", "OPENCODE_", "PI_")):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", f"{claude.parent}:{opencode.parent}:/usr/bin:/bin")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alias))
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(operator_config))
+    repo = git_repo(base / "repo")
+    monkeypatch.chdir(repo)  # REMOTE's state directory is relative to it
+    doctor = Doctor(cwd=str(repo))
+    doctor.config = default_config()
+    doctor.config.sandbox.mode = "required"
+    rows = {r.name: r for r in doctor.sandbox_checks(local=False)}
+    assert "outer sandbox: policy, REMOTE agent" in rows
+    shown = {
+        name.split("'")[1]: row for name, row in rows.items() if "outer sandbox: provider" in name
+    }
+    assert set(shown) == {"claude", "opencode"}
+    assert shown["claude"].ok, shown["claude"].detail
+    assert "inside the sandbox: fake-claude 9.9.9" in shown["claude"].detail
+    assert shown["opencode"].ok, shown["opencode"].detail
+    assert "inside the sandbox: fake-opencode 9.9.9" in shown["opencode"].detail
+    # The operator's configuration root was not the one given, nor written.
+    assert sorted(os.listdir(operator_config)) == ["opencode.json"]
+
+
 def _local_facts(paths, network=NetworkPosition.HOST) -> LaunchFacts:
     git_dir = paths["common"]
     cache = git_dir / "autoforge" / "sandbox" / "local" / "cache"
@@ -946,7 +1011,7 @@ def test_a_required_local_run_with_its_config_file_in_the_root_launches_nothing(
     ever writes it and it is byte-identical."""
     from autoforge import cli
 
-    from .test_local import local_repo
+    from .local_helpers import local_repo
 
     root = local_repo(tmp_path / "work")
     inside = _sentinel(root / "autoforge.json", _CONFIG_TEXT)
@@ -1023,6 +1088,65 @@ def test_a_launch_rewrites_a_config_file_in_its_providers_directory_which_is_why
     assert config_file_placement_problem(cfg, str(elsewhere), repo) == ""
 
 
+@pytest.mark.parametrize("variable", sorted(_PROVIDERS_BY_DIR))
+def test_a_remote_launch_rewrites_a_config_file_in_its_providers_directory_so_it_is_refused(
+    backend, layout, monkeypatch, variable
+):
+    """ADR 0009 A.2.3 F (#386): the REMOTE replacement of
+    test_sandbox_routing.py::test_a_launch_rewrites_a_config_file_in_its_providers_directory_which_is_why_it_is_refused.
+
+    #280 (R3-F1) through the real backend, on a REMOTE agent launch in its
+    issue worktree: with its provider's own declaration for a dedicated
+    directory outside the repository (``CLAUDE_CONFIG_DIR``,
+    ``PI_CODING_AGENT_DIR``, the directory of ``OPENCODE_DB``) it rewrites
+    a configuration file there, keeping ``sandbox.mode`` and changing
+    ``github.command``, which a REMOTE controller runs with the GitHub
+    credential. That is why every command refuses such a file
+    (:func:`autoforge.engine.config_file_placement_problem`) before any
+    launch; the operator's file elsewhere is out of the launch's reach,
+    byte-identical, and passes.
+    """
+    from autoforge.engine import config_file_placement_problem
+
+    paths = layout
+    repo, base, home = paths["repo"], paths["base"], paths["home"]
+    directory = base / "provider-dir"
+    planted = _sentinel(directory / "autoforge.json", _CONFIG_TEXT)
+    elsewhere = _sentinel(base / "operator" / "autoforge.json", _CONFIG_TEXT)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    value = f"{directory}/af.db" if variable == "OPENCODE_DB" else str(directory)
+    monkeypatch.setenv(variable, value)
+    provider = _PROVIDERS_BY_DIR[variable]()
+    cfg = default_config()
+    cfg.sandbox.mode = "required"
+    profile = ProfileConfig(name="analyze_execute", provider=provider.name, command=PY)
+    env = provider.launch_environment(cfg.execution.environment_names())
+    needs = provider.sandbox_requirements(profile, [PY], env, str(home))
+    payload = '{"version": 1, "sandbox": {"mode": "required"}, "github": {"command": "/x/gh"}}\n'
+    code = (
+        f"payload = {payload!r}\n"
+        "def rewrite(path):\n"
+        "    with open(path + '.new', 'w') as fh:\n"
+        "        fh.write(payload)\n"
+        "    os.replace(path + '.new', path)\n"
+        "report = {\n"
+        f"  'provider_dir': attempt(lambda: rewrite({str(planted)!r})),\n"
+        f"  'elsewhere': attempt(lambda: write({str(elsewhere)!r}, payload)),\n"
+        "}\n"
+        "print(json.dumps(report))\n"
+    )
+    description = describe_launch(_remote_facts(paths), needs, env)
+    report = _probe(description, paths["worktree"], code)
+    assert report == {"provider_dir": "ok", "elsewhere": "ENOENT"}, report
+    assert planted.read_text() == payload  # the hazard the placement rule refuses
+    assert elsewhere.read_bytes() == _CONFIG_TEXT.encode()
+    problem = config_file_placement_problem(cfg, str(planted), repo)
+    assert problem.startswith(f"the configuration file {planted} lies in {directory}, "), problem
+    assert f"(${variable}), which every sandboxed launch of {provider.name} " in problem
+    assert config_file_placement_problem(cfg, str(elsewhere), repo) == ""
+
+
 def test_a_required_local_run_with_its_config_file_in_claudes_directory_launches_nothing(
     backend, tmp_path, monkeypatch, capsys
 ):
@@ -1032,7 +1156,7 @@ def test_a_required_local_run_with_its_config_file_in_claudes_directory_launches
     it and it is byte-identical."""
     from autoforge import cli
 
-    from .test_local import local_repo
+    from .local_helpers import local_repo
 
     root = local_repo(tmp_path / "work")
     directory = Path(os.path.realpath(tmp_path)) / "claude-autoforge"
@@ -1112,7 +1236,7 @@ def test_a_required_local_run_validates_inside_the_sandbox(backend, tmp_path):
     """The engine routes a LOCAL validation command through the backend: it
     cannot create a file in the git directory (outside, it could), and the
     run still advances on its exit status."""
-    from .test_local import impl_result, local_repo, review_result, scripted, touch_impl
+    from .local_helpers import impl_result, local_repo, review_result, scripted, touch_impl
 
     root = local_repo(tmp_path)
     code = (

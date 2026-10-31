@@ -18,7 +18,8 @@ read it before adding tests for a listed area.
   `AUTOFORGE_OPENCODE_SDK_PROBE_SERVER`). Such a probe uses a temporary home
   and synthetic credentials, and calls no model: the Claude probe answers
   from a loopback stand-in. The other is the live Pi smoke test
-  (`tests/test_live_pi.py`, #135), the only test that makes a model call:
+  (`tests/test_live_pi.py`, #135), whose two tests (a LOCAL and a REMOTE
+  REVIEW, one model call each) are the only ones that make a model call:
   marked `live`, deselected by default (`pyproject.toml` adds
   `-m 'not live'`), and skipped unless `AUTOFORGE_LIVE_PI=1`. It uses the
   credential the operator gave Pi (a DeepSeek API key, or the ChatGPT
@@ -83,7 +84,13 @@ read it before adding tests for a listed area.
   with `make_engine(..., origin=True)`: an `Origin` is a seeded bare
   repository under `tmp_path` that the controller's git transport fetches
   from and pushes to over `file://`, and that backs `FakeGitHub`'s branch
-  heads, PR heads and ancestry reads. `implement` is the implementation
+  heads, PR heads and ancestry reads. Its own git (`isolated_git`) reads
+  none of the operator's git configuration or `GIT_*` variables and seeds
+  and publishes over no transport (#386 R1-F1), so no URL rewrite can send
+  a test's push anywhere else. `github_origin` and the live smoke test's
+  own writes use the same git (#386 R2-F1), so a `GIT_DIR` of the
+  operator's shell cannot make them write to another checkout, and no hook
+  of the operator's runs. `implement` is the implementation
   agent (one commit on the worktree's detached `HEAD`, reported by
   `analyze_payload`), and `scripted(...)` answers successive calls of one
   agent. An autouse fixture fails any test whose engine would reach the
@@ -204,6 +211,16 @@ read it before adding tests for a listed area.
   `UNLOADABLE_STATES`: an unknown mode, an unknown label, invalid JSON.
   #387 and #388 keep these tests passing unchanged, apart from the expected
   protocol label and any row that names LOCAL.
+- The shared coverage LOCAL's removal must not lose (ADR 0009 A.2.3, A.2.4,
+  D12 S1a; #386) is REMOTE or mode-neutral tests, each beside a LOCAL test
+  that stays until #387 or #388. Each docstring carries `ADR 0009 A.2.3
+  <row> (#386)` (or A.2.4) and the node id of the LOCAL test it replaces,
+  so that a grep for that id finds its replacement before the LOCAL test is
+  deleted. `tests/local_helpers.py` holds the scripted-run helpers other
+  modules imported from `tests/test_local.py` (`local_repo`,
+  `impl_result`, `review_result`, `finding`, `fix_result`, `scripted`,
+  `touch_impl`, `IMPL_FILE`); like `make_local_engine`, they build LOCAL
+  runs and go with LOCAL's code.
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.
@@ -240,6 +257,15 @@ byte-exact export and its proof       test_materialize.py (the merge gate's: tes
                                       test_engine.py)
 effect operations, git transport      test_effects.py, test_git_transport.py
 state, contract, filesystem boundary  test_state.py, test_durable_run_contract.py, test_safefs.py
+the controller's git reader           test_git_workspace.py (hardened reads; no config.local read
+                                      by engine.workspace() or a REMOTE run, ADR 0009 C1)
+the shared coverage of LOCAL's        test_git_workspace.py (A), test_state_fuzz.py (B),
+removal (ADR 0009 S1a, #386)          test_state_root.py (C), test_findings_fence.py (D),
+                                      test_doctor_sandbox.py, test_sandbox_routing.py,
+                                      test_sandbox_policy.py (E, F), test_live_pi_support.py (G),
+                                      test_validation_evidence.py, test_engine.py (H),
+                                      test_runlog.py, test_engine.py (the recovery matrix's
+                                      journal cases)
 the state pins of LOCAL's removal     test_state.py, test_replan.py (the refusals D8 keeps, with and
 (ADR 0009 S1b, #385)                  without LOCAL's fields), test_cli.py (a state that does not
                                       load: every command, run --force), test_scheduler_state.py,
@@ -313,10 +339,11 @@ directory (#283)                      refusal, no deletion before a verified mer
                                       test_engine.py
 CONTROL_RESULT, prompts, providers    test_result_parser.py, test_prompts.py, test_providers.py
 Pi RPC reducer and adapter (fake pi)  test_pi_rpc.py
-live Pi smoke test (#135)             test_live_pi.py (opt-in: -m live, AUTOFORGE_LIVE_PI=1; its
-                                      flow and checks in tests/live_pi.py), test_live_pi_support.py
-                                      (offline: deselection, the credential scan, the checks, the
-                                      flow rehearsed on the fake pi)
+live Pi smoke test (#135)             test_live_pi.py (opt-in: -m live, AUTOFORGE_LIVE_PI=1; a LOCAL
+                                      and a REMOTE flow, their checks in tests/live_pi.py),
+                                      test_live_pi_support.py (offline: deselection, the
+                                      credential scan, the checks, both flows rehearsed on the
+                                      fake pi)
 Claude stream-json reducer            test_claude_stream.py (adapter on the fake: test_providers.py)
 SDK policy (#149): options, tools,    test_sdk_policy.py (opt-in probes of an installed Claude
 roots, credentials, environment,      Code CLI or OpenCode runtime against sentinel

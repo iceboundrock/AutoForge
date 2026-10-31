@@ -72,11 +72,11 @@ from .conftest import (
     reviewed_head_in,
     scripted,
 )
-from .test_local import finding as local_finding
-from .test_local import fix_result as local_fix_result
-from .test_local import impl_result, local_repo, touch_impl
-from .test_local import review_result as local_review_result
-from .test_local import scripted as local_scripted
+from .local_helpers import finding as local_finding
+from .local_helpers import fix_result as local_fix_result
+from .local_helpers import impl_result, local_repo, touch_impl
+from .local_helpers import review_result as local_review_result
+from .local_helpers import scripted as local_scripted
 
 PY = sys.executable
 # The branch ANALYZE_EXECUTE pushes issue #2's implementation to.
@@ -1203,7 +1203,7 @@ def test_local_review_needs_evidence_for_the_bound_fingerprint_itself(tmp_path):
     assert eng.step().next_phase == "REVIEW"
     (record,) = saved(eng).validation_records
     touch_impl(root, "v2\n")
-    eng.state.workspace_fingerprint = eng.workspace().snapshot().fingerprint
+    eng.state.workspace_fingerprint = eng.local_workspace().snapshot().fingerprint
     assert eng.state.workspace_fingerprint != record["start_fingerprint"]
     eng.save()
     assert eng.step().next_phase == "BLOCKED"
