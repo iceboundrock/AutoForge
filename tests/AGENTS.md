@@ -194,6 +194,16 @@ read it before adding tests for a listed area.
   statistics and resume on synthetic reports and stand-in runs, and runs a
   three-test suite serially and on two workers, and with worker options
   that override the configuration's.
+- `tests/fast_targets.py` is no test either: the tool behind
+  `make test-fast` (#342, ADR 0010), which selects the test modules a
+  change's paths map to, for feedback while working. Its `COVERAGE` needs
+  an entry for every file under `src/autoforge/` and every helper module
+  here, so a new module or helper gets one: the test modules that check it
+  beyond those importing it, which the tool adds itself, or `FULL` when
+  almost every test runs through it. A test module whose tests are all
+  `live` needs a `LIVE_ONLY` entry naming its offline tests, so a change
+  to it alone still runs something. `tests/test_fast_targets.py` fails
+  without either. A FAST run is never evidence and never a gate.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
@@ -368,6 +378,10 @@ doctor's rows                         instead), test_engine_sandbox.py,
                                       test_sandbox_host.py (the host measurement)
 LOCAL mode                            test_local*.py
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
+fast feedback targets and what keeps  test_fast_targets.py (the mapping, the selection, never a
+them from evidence (#342, ADR 0010)   gate, the default suite's options); test_evidence.py,
+                                      test_certificate.py, test_validation_gates.py (a narrower
+                                      run or an agent's claim is no FULL evidence)
 tmp_path retention (#396)             test_tmp_path_retention.py (a synthetic suite in a pytest
                                       process of its own, wired as conftest.py wires this one)
 packaging, built artifacts (#256)     test_packaging.py (metadata, license, version, declared package
@@ -385,9 +399,10 @@ agent read context                    test_read_context.py (collection: test_eng
 
 Add a new test next to the behaviour's existing file; create a new file only
 for a new subsystem. Run `make test` (or `uv run pytest tests/<file>`) and
-`make lint`; `make check` runs the same commands as CI (including the
-lockfile check) on one local interpreter, and `make check-matrix` runs
-`pytest` on every CI Python. `test_ci_workflow.py` keeps the Makefile and
+`make lint`; `make test-fast` runs the modules your changed paths map to,
+for feedback while working, and replaces neither. `make check` runs the
+same commands as CI (including the lockfile check) on one local
+interpreter, and `make check-matrix` runs `pytest` on every CI Python. `test_ci_workflow.py` keeps the Makefile and
 `.github/workflows/ci.yml` matching in both directions, and pins the
 `sandbox` job to `make test-sandbox-measured` and the `dist` job to
 `make dist-check` on every CI Python. `make test-sandbox` runs the

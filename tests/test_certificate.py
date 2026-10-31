@@ -30,7 +30,13 @@ from autoforge.certificate import (
     local_certificate,
     remote_certificate,
 )
-from autoforge.evidence import LocalCandidate, PrHeadProvenance, RemoteCandidate, set_digest
+from autoforge.evidence import (
+    Definition,
+    LocalCandidate,
+    PrHeadProvenance,
+    RemoteCandidate,
+    set_digest,
+)
 from autoforge.run_contract import LocalRunContract
 from autoforge.sandbox import SandboxFacts
 from autoforge.state import AutoForgeState
@@ -635,3 +641,33 @@ def test_a_remote_certificate_in_a_local_run_and_back_is_never_applicable():
 def test_the_wording_says_it_is_no_merge_permission():
     assert "not a GitHub approval" in NOT_A_PERMISSION
     assert "permission to merge" in NOT_A_PERMISSION
+
+
+# -- a narrower set never certifies the full one (ADR 0010, #342) ----------------------
+
+
+def test_a_certificate_for_a_narrower_set_never_applies_under_the_full_set_and_back():
+    """ADR 0010 D4. A review presented a FAST-sized set certifies that set and
+    nothing wider: under the full set it is refused as a set change, not
+    taken as partial evidence (no promotion). A certificate for the full set
+    is refused the same way once the set in force is narrowed to a FAST-sized
+    one (no downgrade), so narrowing the configuration can never let an
+    earlier review stand for less than it was presented."""
+    narrow_def = Definition(0, ("uv", "run", "pytest", "tests/test_evidence.py"))
+    narrow = [record(1, candidate=candidate(), definition=narrow_def)]
+    narrow_cert = issue(narrow)
+    narrow_state = remote_state(narrow, review_certificate=narrow_cert)
+    assert certificate_problem(narrow_cert, narrow_state, configured(narrow_def)) == ""
+    for wider in (configured(narrow_def, DEF1), configured(DEF0, DEF1)):
+        assert certificate_problem(narrow_cert, narrow_state, wider).startswith(
+            "the validation set changed"
+        )
+
+    full = remote_records()
+    full_cert = issue(full)
+    full_state = remote_state(full, review_certificate=full_cert)
+    assert certificate_problem(full_cert, full_state, configured(DEF0, DEF1)) == ""
+    for narrower in (configured(DEF0), configured(narrow_def)):
+        assert certificate_problem(full_cert, full_state, narrower).startswith(
+            "the validation set changed"
+        )

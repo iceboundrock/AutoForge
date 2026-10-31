@@ -209,7 +209,9 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        SDK providers: isolated helpers, interaction contract,
                                        parallel EPIC scheduler: authority, run identity, claims, locks;
                                        removing LOCAL mode (policy accepted, not implemented):
-                                       no compatibility, strict refusal, the protocol, sequencing)
+                                       no compatibility, strict refusal, the protocol, sequencing;
+                                       fast feedback and full validation: FAST is never evidence,
+                                       the controller selects FULL, the coverage mapping)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
@@ -313,8 +315,10 @@ every Python in its matrix (`.github/workflows/ci.yml`), which
 interpreter-sensitive. CI's `sandbox` job also measures its runner and runs
 the outer sandbox's real-backend tests (`make test-sandbox-measured`),
 required wherever the runner can enforce; on a capable host
-`make test-sandbox` requires them outright. See `Makefile` and `docs/development.md`. Also inspect
-`git status --short` and `git diff --stat`. Do not claim tests, lint, type
+`make test-sandbox` requires them outright. See `Makefile` and `docs/development.md`.
+`make test-fast` runs the tests your changed paths map to, for feedback
+while working; it is never evidence and replaces none of these (ADR 0010).
+Also inspect `git status --short` and `git diff --stat`. Do not claim tests, lint, type
 checking, GitHub operations, or agent invocations succeeded unless they were
 actually executed and verified.
 
