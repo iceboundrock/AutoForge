@@ -4,6 +4,7 @@ import gc
 import hashlib
 import os
 import random
+import select
 import signal
 import sys
 import threading
@@ -769,7 +770,31 @@ def _spy_on_waits(monkeypatch) -> list[float | None]:
     return waits
 
 
-needs_pidfd = pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="no pidfd_open here")
+def _pidfd_works() -> bool:
+    """Whether this host opens a pidfd and polls it, as ``_wait_exit`` does.
+
+    ``os.pidfd_open`` is there on any Linux build of Python, though a kernel
+    before 5.3 or a seccomp policy refuses the call; ``_wait_exit`` then
+    waits as without one, which ``test_without_a_pidfd_the_exit_wait_is_proc_wait``
+    tests on every host (PR #411 review)."""
+    try:
+        pidfd = os.pidfd_open(os.getpid())
+    except (AttributeError, OSError):
+        return False
+    try:
+        exited = select.poll()
+        exited.register(pidfd, select.POLLIN)
+        exited.poll(0)
+    except OSError:
+        return False
+    finally:
+        os.close(pidfd)
+    return True
+
+
+needs_pidfd = pytest.mark.skipif(
+    not _pidfd_works(), reason="this host does not open or poll a pidfd"
+)
 
 
 @needs_pidfd
@@ -812,7 +837,8 @@ def test_the_exit_wait_raises_the_timeout_proc_wait_raises(monkeypatch, timeout)
 def test_without_a_pidfd_the_exit_wait_is_proc_wait(monkeypatch, pidfd):
     """Where ``pidfd_open`` is missing (another system) or refused (a kernel
     before 5.3, a seccomp policy), or ``poll`` fails on the pidfd, the wait
-    is ``Popen.wait(timeout)`` itself."""
+    is ``Popen.wait(timeout)`` itself, on any host: what stands for the
+    pidfd here is a descriptor that is never polled."""
     import errno
     import subprocess
 
@@ -823,9 +849,10 @@ def test_without_a_pidfd_the_exit_wait_is_proc_wait(monkeypatch, pidfd):
         monkeypatch.delattr(os, "pidfd_open", raising=False)
     elif pidfd == "refused":
         monkeypatch.setattr(os, "pidfd_open", refused, raising=False)
-    elif not hasattr(os, "pidfd_open"):
-        pytest.skip("no pidfd_open here")
     else:
+        monkeypatch.setattr(
+            os, "pidfd_open", lambda pid, flags=0: os.open(os.devnull, os.O_RDONLY), raising=False
+        )
         monkeypatch.setattr(executor.select, "poll", refused)
     proc = subprocess.Popen([PY, "-c", "raise SystemExit(4)"])
     waits = _spy_on_waits(monkeypatch)

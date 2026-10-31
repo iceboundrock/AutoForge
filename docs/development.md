@@ -417,10 +417,13 @@ about 1,040 seconds, 10% above the median at 3259116, has lost some of
 this, and is worth profiling the same way before it is accepted. Tests pin what
 each change does, not its time: the executor's
 `test_the_exit_wait_reaps_the_child_once_it_has_exited_without_polling`
-(one `wait(0)` once the child has exited),
+(one `wait(0)` once the child has exited, on a host that opens and polls
+a pidfd; `test_without_a_pidfd_the_exit_wait_is_proc_wait` covers the
+fallback on every host),
 `test_the_engine_tests_save_state_without_waiting_for_the_disk` (the
 stand-in is in place there), `tests/test_tmp_path_retention.py`'s
 `test_a_tmp_path_is_numbered_without_listing_the_basetemp_and_never_reused`
+and `test_a_directory_another_name_numbered_into_is_not_reused_once_removed`,
 and `tests/test_github.py`'s
 `test_the_fakes_origin_reads_a_branch_head_as_git_does` (the fake's read
 agrees with git's). `tests/test_safefs.py`'s
