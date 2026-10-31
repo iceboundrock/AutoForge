@@ -98,6 +98,7 @@ from .scheduler_state import (
     NamespaceRead,
     OpenClaim,
     SchedulerState,
+    UncertainReason,
     archive_claim,
     classify_for_epic,
     load_scheduler_state,
@@ -482,6 +483,21 @@ def categorize(
         return row(Category.RUNNING, detail)
     if facts.unidentified:
         return row(Category.UNCERTAIN, facts.unidentified, problem=facts.unidentified)
+    newer = facts.lookup.state.newer_protocol if facts.lookup is not None else ""
+    if (
+        classification is not None
+        and classification.uncertain is UncertainReason.STATE_CORRUPT
+        and newer
+    ):
+        # A newer controller's state (#265): it continues the run, so neither
+        # setting the state aside nor repairing it is advice here.
+        return row(
+            Category.UNCERTAIN,
+            f"{classification}: {classification.detail}; a controller that speaks protocol "
+            f"{newer} reads and continues it ('epic status' and 'epic resume' with that "
+            "controller, from this checkout); leave the namespace as it is",
+            problem=f"{classification}: {classification.detail}",
+        )
     if classification is not None and classification.kind is ClassificationKind.UNCERTAIN:
         return row(
             Category.UNCERTAIN,

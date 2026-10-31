@@ -59,7 +59,13 @@ from enum import Enum
 from pathlib import Path
 from typing import NoReturn
 
-from .errors import NamespaceError, NamespaceMismatch, SchedulerStateDirError, StateError
+from .errors import (
+    NamespaceError,
+    NamespaceMismatch,
+    SchedulerStateDirError,
+    StateError,
+    StateProtocolError,
+)
 from .redaction import redact
 from .safefs import ReadLimitExceeded, SafeRoot, WalkBudgetExceeded, entry_kind
 from .state import (
@@ -497,11 +503,15 @@ class NamespaceState:
     ``state`` is set when :attr:`status` is ``LOADED``; ``reason`` (redacted
     and bounded) when it is ``CORRUPT``: unreadable, unparseable, of an
     unknown protocol, not a regular file, or reached through a link.
+    ``newer_protocol`` is the label of a ``CORRUPT`` state a newer
+    controller wrote (#265), ``""`` otherwise: still corrupt to this
+    controller, and continued by that one.
     """
 
     status: StateStatus
     state: AutoForgeState | None = None
     reason: str = ""
+    newer_protocol: str = ""
 
 
 @dataclass(frozen=True)
@@ -639,6 +649,10 @@ def _read_state(issue_root: SafeRoot, namespace: IssueNamespace) -> NamespaceSta
     except FileNotFoundError:
         # The state directory went away between the lstat and the open.
         return NamespaceState(StateStatus.ABSENT)
+    except StateProtocolError as exc:
+        return NamespaceState(
+            StateStatus.CORRUPT, reason=_bounded_reason(str(exc)), newer_protocol=exc.newer
+        )
     except StateError as exc:
         return NamespaceState(StateStatus.CORRUPT, reason=_bounded_reason(str(exc)))
     return NamespaceState(StateStatus.LOADED, state=state)

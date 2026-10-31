@@ -1,5 +1,10 @@
 """`autoforge doctor`: read-only environment checks.
 
+The first row, ``controller``, names the AutoForge code this command line
+runs: the imported package's file, the interpreter, and the state
+protocols it reads (#265, :mod:`autoforge.provenance`). It never fails and
+reads no state.
+
 Every check is non-destructive: version queries, `gh auth status`,
 `git rev-parse`, `pi auth check --no-refresh`, reading the config, and
 creating/removing one temp file in the state directory to prove it is
@@ -110,6 +115,7 @@ from .github import (
 )
 from .locking import check_local_lock_filesystem, repository_lock_path
 from .profiles import REQUIRED_PROFILES
+from .provenance import ControllerIdentity, protocol_ranges
 from .providers import (
     CLAUDE_ISOLATION_FLAGS,
     OPENCODE_MIN_VERSION,
@@ -128,6 +134,7 @@ from .redaction import redact, redact_argv
 from .run_namespace import AUTOFORGE_DIRNAME, SCHEDULER_DIRNAME
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
 from .sdk_policy import SDK_PROVIDERS
+from .state import SUPPORTED_PROTOCOLS
 from .validation import parse_issue_url, parse_remote_repository
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -356,6 +363,22 @@ class Doctor:
         listed = "; ".join(" ".join(redact_argv(list(argv))) for argv in commands)
         return CheckResult(
             name, True, f"{len(commands)} definition(s): {listed}; {mode}", required=False
+        )
+
+    def check_controller(self) -> CheckResult:
+        """The controller this ``doctor`` runs as (#265): informational, never a failure.
+
+        The ``autoforge`` package actually imported, by its ``__file__``, and
+        the interpreter running it, with the state protocols it reads: what
+        a ``status`` or ``resume`` from this same command line would run as.
+        Reads no state, so a checkout without a run passes it.
+        """
+        identity = ControllerIdentity.current()
+        return CheckResult(
+            "controller",
+            True,
+            f"{identity.summary()}; reads state protocols {protocol_ranges(SUPPORTED_PROTOCOLS)}",
+            required=False,
         )
 
     def check_state_dir(self) -> CheckResult:
@@ -1393,6 +1416,7 @@ class Doctor:
 
     def run_all(self) -> list[CheckResult]:
         results = [
+            self.check_controller(),
             self.check_config(),
             self.check_merge_gate(),
             self.check_premerge_verification(),

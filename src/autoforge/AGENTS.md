@@ -94,7 +94,11 @@ certificate.py      review certificates: issuance from the review binding, appli
                     (certificate_problem, also against the live PR the merge gate reads, #175)
                     and the not-a-merge-permission wording; pure (ADR 0006 D12, D13, #174)
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
-state.py            persisted controller state, atomic writes, schema/protocol checks
+state.py            persisted controller state, atomic writes, schema/protocol checks; the
+                    protocol label's classification (protocol_support, #265)
+provenance.py       the running controller's identity (imported package file, interpreter,
+                    version, protocol) and the protocol-mismatch diagnostic the CLI prints;
+                    reads and writes nothing (#265)
 run_namespace.py    the parallel EPIC scheduler's per-issue run identities (RunKey) and
                     namespaces under <common>/autoforge/scheduler/issues/<n>: layout,
                     binding.json, read-only lookup and listing, the state archive, the
@@ -212,8 +216,8 @@ verification, merge gate, dry-run, read context),
 prompts/update_epic*.md                           -> docs/agent-guides/github-safety.md
                                                      (+ docs/adr/0004-authority-boundary-and-
                                                      typed-external-effects.md for effects)
-state.py, effects.py, evidence.py, certificate.py,
-safefs.py, config_fingerprint.py,
+state.py, provenance.py, effects.py, evidence.py,
+certificate.py, safefs.py, config_fingerprint.py,
 sandbox_pin.py, locking.py, errors.py,
 engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
 run_namespace.py, ownership.py, locking.py (lock

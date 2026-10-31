@@ -1267,6 +1267,41 @@ def test_a_namespace_state_whose_mode_is_not_remote_is_held_as_uncertain(epic, m
     assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
 
 
+def test_a_namespace_state_a_newer_controller_wrote_is_held_with_this_controller_named(epic):
+    """#265 R3: a namespace state labelled with a newer protocol is held as
+    uncertain like any state that does not load, and never admitted. The
+    scheduler's report and ``epic status`` name the controller that refused
+    it, and the row's advice is a controller that speaks that protocol, not
+    ``epic archive`` or a repair by hand. Nothing of the namespace changes."""
+    import autoforge
+
+    e = epic()
+    b = e.b
+    b.issue(2)
+    _bind(b, 2, issue_id=b.graph.issue(2, R).id)
+    standalone_state(b.ns(2).state_dir, 2, Phase.REVIEW)
+    data = json.loads(b.ns(2).state_file.read_text(encoding="utf-8"))
+    data.update(protocol_version="14", phase="A_PHASE_OF_PROTOCOL_14")
+    b.ns(2).state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes())
+    code, _, _ = e.run()
+    assert code == 0 and b.admitted() == [] and b.claims(2) is None, e.said
+    headline = (
+        "unsupported protocol_version '14' (controller speaks '13'): a newer AutoForge wrote it"
+    )
+    imported = os.path.abspath(autoforge.__file__)
+    assert "issue #2 is uncertain: state file " in e.said and headline in e.said
+    assert f"imported from {imported}" in e.said
+    row = e.rows()[2]
+    assert row["category"] == "uncertain"
+    assert row["classification"] == "uncertain(state-corrupt)"
+    assert headline in row["detail"] and f"imported from {imported}" in row["detail"]
+    assert "a controller that speaks protocol 14 reads and continues it" in row["detail"]
+    assert "epic archive" not in row["detail"] and "by hand" not in row["detail"]
+    assert row["next"] == []
+    assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
+
+
 def test_namespace_work_leaves_the_git_dirs_autoforge_state_alone(epic):
     """ADR 0009 D3 and D4 (#385): ``<git dir>/autoforge/state``, where LOCAL
     kept its runs, is no state any ``epic`` command reads. A state there that

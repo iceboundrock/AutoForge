@@ -305,6 +305,27 @@ High-priority coverage includes:
   settlement and a durable pause comes first; an open claim without a
   state owns its issue for `run`, a claim file of closed claims owns
   nothing, and an unreadable one owns its issue
+- the protocol preflight (#265; `tests/test_protocol_compat.py`,
+  `tests/test_cli.py`, `tests/test_epic_commands.py`, `tests/test_worker.py`,
+  `tests/test_ownership.py`, `tests/test_doctor.py`): every label is
+  classified by itself (current, each legacy one, newer, and unknown ones:
+  6, 0, a leading zero, a decimal point, whitespace, a non-string); a newer
+  label is refused before its phase and fields are read, an unknown phase
+  or field under a supported label is still refused as such, and the mode
+  still decides first; the refusal names the imported package's file and
+  the interpreter, also for a package imported from elsewhere, and an older
+  copy of the package run in a process of its own names itself and not the
+  checkout; the label, run id and writer are bounded and shown only in a
+  controller's shape, and a secret-shaped one is redacted. `status`,
+  `status --json`, `step`, `resume`, `unblock` (with and without
+  `--dry-run`) and `run` exit 2 with the diagnostic and leave the state
+  directory, its logs and the lock as they were; a newer run that replaces
+  the file once the lock is taken is refused by the load under it; `run`
+  does not suggest `--force`, and `--force` still moves the file aside
+  whole. A namespace state of a newer protocol is held as uncertain with
+  the controller named and no `epic archive` advice, a worker refuses one
+  unchanged, a standalone one is the reverse guard's problem, and
+  `doctor`'s `controller` row reads no state
 - the state pins of LOCAL's removal (ADR 0009 D4, D8, D12 S1b; #385;
   `tests/test_state.py`, `tests/test_replan.py`, `tests/test_cli.py`,
   `tests/test_scheduler_state.py`, `tests/test_epic_commands.py`), written

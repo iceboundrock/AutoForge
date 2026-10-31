@@ -130,6 +130,7 @@ BUILT_IN_AGENTS = frozenset({"claude", "opencode"})
 # The doctor rows that need no credential, no agent CLI and no network: OK on
 # a first run before anything is signed in.
 CREDENTIAL_FREE_ROWS = (
+    "controller",
     "config",
     "merge gate",
     "git available",
@@ -625,6 +626,14 @@ def check_first_run_doctor(report: dict, agents: frozenset[str], what: str) -> N
         )
     gate = rows["merge gate"]["detail"]
     _check(gate.startswith("CLOSED"), f"doctor with {what}: the merge gate is not closed: {gate}")
+    # The installed command runs the installed package, never this checkout's
+    # source tree (#265: the controller row names what was imported).
+    source = str(REPO_ROOT / "src" / "autoforge")
+    controller = rows["controller"]["detail"]
+    _check(
+        source not in controller,
+        f"doctor with {what}: the installed autoforge imports the source tree: {controller}",
+    )
     named = {match.group(1) for name in rows if (match := _AGENT_ROW.fullmatch(name))}
     _check(
         named == agents,

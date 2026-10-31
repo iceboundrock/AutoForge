@@ -5,6 +5,35 @@ so.
 
 ## Unreleased
 
+### A run a newer controller wrote names the controller that refused it (#265)
+
+- A command that meets a `state.json` labelled with a newer protocol still
+  refuses it with exit 2 and writes nothing, and now says which code
+  refused it: the state file, the label and what the file records (run id,
+  writer), then the controller's version and protocol, the file Python
+  imported it from, the interpreter and the working directory, and a
+  `status` command with this command's `--config` and `--state-dir` for a
+  controller that speaks the run's protocol. It suggests no edit of the
+  file and no `run --force`. `status`, `step`, `resume`, `unblock`, their
+  dry runs and `run` all print it; the exit status is unchanged.
+- A newer label is now refused before the file's phase is read, so a run
+  of a newer controller with a phase this one lacks is reported as a newer
+  protocol, no longer as `state file has unknown phase`. The mode is still
+  read first, so a LOCAL file is still an unknown mode.
+- `run` over a newer controller's run no longer advises `repair it, or use
+  'run --force'`; `run --force` still moves it aside as
+  `state.json.corrupt-<timestamp>`.
+- `epic status` shows a namespace state of a newer protocol as
+  `uncertain(state-corrupt)` as before, but points at a controller that
+  speaks it instead of `epic archive`; the scheduler's and a worker's
+  messages name the refusing controller.
+- `doctor` has a first row, `controller`: the code a command line runs and
+  the state protocols it reads. It never fails.
+- [Running the remote workflow](docs/usage.md#a-run-a-newer-controller-wrote)
+  walks through the case that motivated it (#243, PR #254: a protocol-11
+  run resumed by protocol-10 code) and choosing the code with
+  `uv run --project` while keeping the working directory and flags.
+
 ### A first run, from nothing: the guide, starter configurations, and a `doctor` that a new repository can pass (#259)
 
 - [Getting started](docs/getting-started.md) takes a newcomer from nothing

@@ -1333,6 +1333,13 @@ ownership or discard uncommitted user changes.
   exit 2 and never overwrite it. `run --force` moves it aside as
   `state.json.corrupt-<timestamp>` (never deletes it) and starts a new run;
   see [State and recovery](agent-guides/state-and-recovery.md#persistent-state).
+  A file whose only problem is a newer controller's label is not
+  corrupt: see the next entry.
+- **"unsupported protocol_version '14' (controller speaks '13'): a newer
+  AutoForge wrote it"** (exit 2), followed by an `AutoForge
+  controller/state protocol mismatch` block: the command imported a
+  controller older than the one that wrote the run. Nothing was written.
+  See [A run a newer controller wrote](#a-run-a-newer-controller-wrote).
 - **`LockError`:** another controller holds the repository lock (a
   standalone command, or a parallel EPIC scheduler or one of its surviving
   workers), or a lock entry under `.git/autoforge/` is not a regular file
@@ -1357,6 +1364,115 @@ ownership or discard uncommitted user changes.
   Its `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
   `ai-implementation` marker and blocks on two, so close the PR you do not
   keep. See [Replan transaction](agent-guides/replan-transaction.md).
+
+### A run a newer controller wrote
+
+Every `state.json` records the protocol of the controller that saved it
+(`protocol_version`). A controller reads its own protocol and every older
+one it has a rule for, and refuses a newer one: it cannot know what the
+newer fields and phases mean, and guessing could act on a run it
+misunderstands. The refusal is correct. What it cannot know is which
+controller you meant to run, so it says which one it is:
+
+```text
+autoforge: error: state file /home/me/code/AutoForge/.autoforge/AutoForge-issue-243/state.json: unsupported protocol_version '11' (controller speaks '10'): a newer AutoForge wrote it
+AutoForge controller/state protocol mismatch
+  state:      /home/me/code/AutoForge/.autoforge/AutoForge-issue-243/state.json (protocol_version '11')
+  recorded:   run af-20261021T164241Z-60c7a5, written by autoforge 0.1.0 (as the file says; it was not loaded)
+  controller: autoforge 0.1.0, protocol 10 (reads 1-5 and 7-10), prompt v11
+  import:     /home/me/code/AutoForge/src/autoforge/__init__.py
+  python:     /home/me/code/AutoForge/.venv/bin/python
+  cwd:        /home/me/code/AutoForge
+  result:     refused before anything was written: the state file, its run logs and the agent worktree are unchanged; no agent was launched and nothing was written to GitHub
+  next:       a newer controller wrote this run. With one that speaks protocol 11, from the cwd above and with this command's --config and --state-dir, start with:
+                <an autoforge that speaks protocol 11> --config /home/me/autoforge.yaml --state-dir .autoforge/AutoForge-issue-243 status
+              What an interpreter imports: <its python> -c 'import autoforge as a; print(a.__protocol_version__, a.__file__)'
+              Leave the state file as it is: no edit of it, and no older controller, continues this run.
+```
+
+This is what a protocol-10 controller with this diagnostic would print in
+the case described below; the paths are illustrative. Each line is read
+from the running process, not assumed: `import` is the `__file__` of the
+`autoforge` package Python actually imported, `python` is
+`sys.executable`, and the protocol is what that package declares. Package metadata, the branch of
+a checkout and the `uv` project you think you selected are not consulted.
+`recorded` is what the refused file says about itself, shown only when
+it has the shape a controller writes; nothing else of the file is
+vouched for. The `next` command names the flags this command was given,
+as typed, and a placeholder for the controller: AutoForge does not know
+where a compatible one is.
+
+**Exit status.** 2, as for any state that does not load; stdout is empty
+(`status --json` prints no document) and the diagnostic is on stderr.
+`status`, `step`, `resume` and `unblock` (the last three with `--dry-run`
+too), and `run` without `--force`, all refuse this way before they take
+the lock, open a run log, record a configuration or read GitHub. `step`, `resume`
+and `unblock` load the state again once they hold the lock, and only
+that load is acted on: a newer run that replaced the file in between is
+refused there, the same way. `run` adds `refusing to start a new run over
+run <id>, which this controller cannot read` and does not suggest
+`--force`: `run --force` would move the newer run aside as
+`state.json.corrupt-<timestamp>` (as it does any state that does not load)
+and start another, which does not continue it. A label no AutoForge
+protocol has (`'6'`, `'14.0'`, a number instead of a string) is the same
+refusal with "no AutoForge protocol has that label": the file was edited
+or is not AutoForge's, and the entry above applies.
+
+**In a scheduler namespace**, the same state is held: `epic run` and
+`epic resume` report `issue #<n> is uncertain: ...` with the refusal and
+the controller's import path, admit nothing for it and continue with the
+other issues; `epic status` shows the row as
+`uncertain(state-corrupt)` (exit 1), says that a controller speaking the
+newer protocol reads and continues it, and offers no `epic archive`. A
+worker that finds one exits 2 before its first step.
+
+**What led to it, and how to recover.** In the case that motivated this
+diagnostic (#243, PR #254), a run was written by PR #254's code, which
+declared protocol 11 (prompt v12), and resumed on 2026-10-21 with
+`uv run autoforge --config "$CONFIG" --state-dir "$STATE" resume`, which
+imported code at protocol 10, as `main` then was. The controller of the
+time printed only `unsupported protocol_version '11' (controller speaks
+'10')`. With several checkouts, agent worktrees and editable installs of
+AutoForge on one machine, which code runs depends on how the command is
+started:
+
+- `uv run autoforge` runs the project uv discovers from the current
+  directory, upward, or the one `--project` names. That project's `.venv`
+  holds an editable install, so it imports that checkout's
+  `src/autoforge`, whatever branch is checked out there now.
+- An `autoforge` on `PATH` (`uv tool install`, a virtual environment's
+  `bin/`) imports the copy it was installed with.
+- The run itself is bound to the working directory and the state
+  directory: the controller locks and verifies the checkout it is run
+  from, and `--state-dir` (or `config.state_dir`) names the run.
+
+So choose the code and keep the rest:
+
+1. Read the `import` and `python` lines: that is the controller that
+   refused. `autoforge doctor`'s `controller` row shows the same for any
+   command line, with no run needed.
+2. Find a controller that speaks the run's protocol. Usually it is the
+   checkout or worktree holding the branch that wrote the run, or `main`
+   once that branch merged. Check it without running anything:
+   `uv run --project <that checkout> python -c 'import autoforge as a; print(a.__protocol_version__, a.__file__)'`.
+3. From the same working directory as the refused command, with the same
+   `--config` and `--state-dir`, read the run with it, then continue:
+
+   ```bash
+   uv run --project <that checkout> autoforge --config "$CONFIG" --state-dir "$STATE" status
+   uv run --project <that checkout> autoforge --config "$CONFIG" --state-dir "$STATE" resume
+   ```
+
+   `--project` selects the code and leaves the working directory as it
+   is. Do not `cd` into the agent worktree to run the command there: the
+   controller would take that worktree as its checkout.
+
+Do not edit `state.json` (a relabelled file would be read by a controller
+that does not know its newer fields), do not use `run --force` (it sets
+the run aside rather than continuing it), and do not check out another
+branch in the checkout the controller runs from or reinstall over the
+environment that refused: AutoForge changes none of these itself, and the
+run is fine where it is.
 
 ### An agent asked for permission or input
 

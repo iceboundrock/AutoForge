@@ -290,14 +290,19 @@ def test_what_holds_nothing(tmp_path, state):
     assert not os.path.lexists(sd) or state != "absent dir"
 
 
-@pytest.mark.parametrize("damage", ["garbage", "symlink", "local"])
+@pytest.mark.parametrize("damage", ["garbage", "symlink", "local", "newer"])
 def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, damage):
     """A LOCAL run's state among them: the pass no longer skips it as LOCAL's
     own (ADR 0009 D4, #387), so it is the hold's problem like any state that
-    does not load, and the pass still admits (``test_epic_commands``)."""
+    does not load, and the pass still admits (``test_epic_commands``). So is
+    a newer controller's state, whose problem names this controller (#265)."""
     sd = tmp_path / ".autoforge"
     sd.mkdir()
-    if damage == "garbage":
+    if damage == "newer":
+        newer = _state(7, Phase.REVIEW).to_dict()
+        newer.update(protocol_version="14")
+        (sd / "state.json").write_text(json.dumps(newer), encoding="utf-8")
+    elif damage == "garbage":
         (sd / "state.json").write_text("{ not json " + "ghp_" + "b" * 36)
     elif damage == "local":
         # Written by hand, as a protocol-12 LOCAL run saved it: no code that
@@ -326,4 +331,9 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     assert len(hold.problem) <= MAX_REASON_CHARS
     if damage == "local":
         assert "state file has unknown mode 'LOCAL'" in hold.problem
+    if damage == "newer":
+        import autoforge
+
+        assert "unsupported protocol_version '14' (controller speaks '13')" in hold.problem
+        assert f"imported from {os.path.abspath(autoforge.__file__)}" in hold.problem
     assert _tree(sd) == before, "never quarantined, created or written"

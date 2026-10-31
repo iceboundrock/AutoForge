@@ -1557,7 +1557,12 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
     ``state.json.corrupt-<timestamp>``, beside an earlier archive of that very
     name, which it does not replace; the run logs stay; the move is printed;
     and the new run is built from the command alone, with nothing of the
-    moved file in it."""
+    moved file in it.
+
+    The unknown label is a newer one ('99'): since #265 its refusal names the
+    controller that refused it and advises neither repairing the file nor
+    ``run --force``, since a newer controller continues that run; what
+    ``--force`` does with it is unchanged."""
     import stat
     from datetime import datetime
 
@@ -1575,7 +1580,12 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
     before = state_tree(sd)
     assert cli.main(["--state-dir", str(sd), *_run_argv_of(1)]) == 2
     err = capsys.readouterr().err
-    assert reason in err and "'run --force'" in err
+    if kind == "unknown-label":
+        assert reason in err and "AutoForge controller/state protocol mismatch" in err
+        assert "--force" not in err and "repair" not in err
+        assert "refusing to start a new run over run af-planted-run" in err
+    else:
+        assert reason in err and "'run --force'" in err
     assert state_tree(sd) == before
 
     monkeypatch.setattr(state_mod, "datetime", FrozenDatetime)
@@ -1607,6 +1617,146 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
     assert "planted" not in (sd / "state.json").read_text(encoding="utf-8")
     assert "pull/4241" not in (sd / "state.json").read_text(encoding="utf-8")
     assert load_state(sd / "state.json").run_id == fresh["run_id"]
+
+
+# -- a state a newer controller wrote (#265) -------------------------------------------------
+# The #243/#254 incident: an older controller meets a newer controller's
+# run. Every command refuses before it writes, names the code it imported,
+# and points at a compatible controller without suggesting a repair.
+
+
+def _newer_controllers_run(tmp_path, capsys) -> tuple[Path, bytes]:
+    """A run started in ``tmp_path/.autoforge``, then relabelled as protocol 14 wrote it.
+
+    Its phase is one this controller does not have, so a refusal that read
+    the phase before the label would misreport it. The run's logs stay.
+    """
+    sd = tmp_path / ".autoforge"
+    cli.main(["--state-dir", str(sd), *_run_argv_of(2)])
+    capsys.readouterr()
+    assert any((sd / "logs").iterdir())
+    state_file = sd / "state.json"
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    data.update(
+        protocol_version="14",
+        phase="A_PHASE_OF_PROTOCOL_14",
+        controller_version="0.2.0",
+        run_id="af-written-by-protocol-14",
+    )
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    return sd, state_file.read_bytes()
+
+
+def _assert_the_newer_run_is_named(err: str, state_file: Path, flags: str) -> None:
+    import autoforge
+
+    assert (
+        f"autoforge: error: state file {state_file}: unsupported protocol_version '14' "
+        "(controller speaks '13'): a newer AutoForge wrote it\n"
+    ) in err
+    assert "AutoForge controller/state protocol mismatch" in err
+    assert f"  state:      {state_file} (protocol_version '14')" in err
+    assert "  recorded:   run af-written-by-protocol-14, written by autoforge 0.2.0" in err
+    assert f"  import:     {os.path.abspath(autoforge.__file__)}\n" in err
+    assert f"  python:     {sys.executable}\n" in err
+    assert f"  cwd:        {os.getcwd()}\n" in err
+    assert f"<an autoforge that speaks protocol 14> {flags}status\n" in err
+    assert "unknown phase" not in err and "--force" not in err and "repair" not in err
+
+
+_NEWER_RUN_COMMANDS = (
+    ["status"],
+    ["status", "--json"],
+    ["step"],
+    ["step", "--dry-run"],
+    ["resume"],
+    ["resume", "--dry-run"],
+    ["unblock", "--reason", "the operator looked"],
+    ["unblock", "--reason", "the operator looked", "--dry-run"],
+    _run_argv_of(1),
+)
+
+
+@pytest.mark.parametrize("words", _NEWER_RUN_COMMANDS, ids=" ".join)
+def test_a_newer_controllers_run_is_refused_before_anything_is_written(
+    tmp_path, capsys, monkeypatch, fakes, words
+):
+    """#265 R1-R3: exit 2 (a StateError's, unchanged), nothing on stdout, the
+    diagnostic on stderr with this command's flags as typed, and the state
+    directory, its logs and the lock under the git directory exactly as they
+    were: the refusal comes before the lock is taken, under every command and
+    its dry run. No GitHub call and no agent launch."""
+    monkeypatch.chdir(tmp_path)
+    sd, _ = _newer_controllers_run(tmp_path, capsys)
+    (tmp_path / "cfg.json").write_text('{"version": 1}', encoding="utf-8")
+    lock_dir = repository_lock_path(tmp_path).parent
+    before = (state_tree(sd), state_tree(lock_dir))
+    calls = (len(fakes["gh"].calls), len(fakes["provider"].calls))
+    flags = ["--config", "cfg.json", "--state-dir", ".autoforge"]
+    for _ in range(2):
+        assert cli.main([*flags, *words]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        _assert_the_newer_run_is_named(
+            captured.err, sd / "state.json", "--config cfg.json --state-dir .autoforge "
+        )
+        assert (state_tree(sd), state_tree(lock_dir)) == before
+    assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
+
+
+def test_run_force_still_moves_a_newer_controllers_run_aside_whole(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#265 changes no ``--force`` semantics (ADR 0009 D4's audit): the newer
+    run is moved aside byte for byte and a fresh run starts. The refusal
+    without it no longer suggests that, since the newer controller continues
+    the run (above)."""
+    monkeypatch.chdir(tmp_path)
+    sd, raw = _newer_controllers_run(tmp_path, capsys)
+    assert cli.main(["--state-dir", str(sd), *_run_argv_of(1), "--force"]) == 0
+    err = capsys.readouterr().err
+    moved = [p for p in sd.glob("state.json.corrupt-*")]
+    assert len(moved) == 1 and moved[0].read_bytes() == raw
+    assert f"autoforge: moved unreadable state file aside: {moved[0]}" in err
+    assert load_state(sd / "state.json").run_id != "af-written-by-protocol-14"
+
+
+@pytest.mark.parametrize(
+    "words", (["step"], ["resume"], ["unblock", "--reason", "looked"]), ids=" ".join
+)
+def test_a_state_a_newer_controller_replaced_after_the_first_load_is_refused_under_the_lock(
+    tmp_path, capsys, monkeypatch, fakes, words
+):
+    """#265 R1, no window between the preflight and the mutation path: the
+    load before the lock passes, a newer controller's run replaces the file
+    as the lock is taken, and the load under the lock, the one every write
+    acts on, refuses it with the same diagnostic. The replacement is left as
+    it was written, the logs are untouched and no agent is launched."""
+    monkeypatch.chdir(tmp_path)
+    sd, newer = _newer_controllers_run(tmp_path, capsys)
+    state_file = sd / "state.json"
+    data = json.loads(newer)
+    data.update(protocol_version="13", phase="ANALYZE_EXECUTE")
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    assert load_state(state_file).phase is Phase.ANALYZE_EXECUTE
+    real = ControllerEngine.locked
+    swaps = []
+
+    def locked(self, *args, **kwargs):
+        state_file.write_bytes(newer)
+        swaps.append(1)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(ControllerEngine, "locked", locked)
+    logs = state_tree(sd / "logs")
+    calls = len(fakes["provider"].calls)
+    assert cli.main(["--state-dir", ".autoforge", *words]) == 2
+    captured = capsys.readouterr()
+    assert swaps == [1] and captured.out == ""
+    _assert_the_newer_run_is_named(captured.err, state_file, "--state-dir .autoforge ")
+    assert state_file.read_bytes() == newer
+    assert state_tree(sd / "logs") == logs
+    assert len(fakes["provider"].calls) == calls
 
 
 # -- LOCAL's ways in, closed (ADR 0009 D3 to D5, step S2; #387) --------------------------

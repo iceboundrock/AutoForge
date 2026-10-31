@@ -48,6 +48,66 @@ class StateError(AutoForgeError):
     """
 
 
+class StateProtocolError(StateError):
+    """The state file's ``protocol_version`` is one this controller does not read (#265).
+
+    Raised by :meth:`autoforge.state.AutoForgeState.from_dict` right after
+    the mode check and before anything else of the file is interpreted, so
+    a newer controller's file is reported by its label, never as an unknown
+    phase or a pile of unknown fields; :func:`autoforge.state.load_state`
+    re-raises it with the file's path (:meth:`at`). It is a
+    :class:`StateError` and takes every path one takes (exit 2, nothing
+    written, a scheduler namespace held ``uncertain``); the CLI adds the
+    provenance diagnostic of :mod:`autoforge.provenance`.
+
+    Every attribute is already bounded and safe to print: ``label`` is the
+    persisted label's bounded ``repr``; ``support`` is
+    :class:`autoforge.state.ProtocolSupport`'s value
+    (``unsupported-newer`` or ``unsupported-unknown``); ``newer`` is the
+    label as a number when it is a newer one, else ``""``; ``run_id`` and
+    ``written_by`` are what the file records, kept only when they have the
+    shape the controller writes, else ``""``; ``path`` is the state file,
+    ``""`` until :meth:`at` sets it. ``headline`` is the reason's first
+    clause, without the controller's identity, for a diagnostic that shows
+    the identity on lines of its own.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        headline: str,
+        label: str,
+        support: str,
+        newer: str = "",
+        run_id: str = "",
+        written_by: str = "",
+        path: str = "",
+    ) -> None:
+        super().__init__(f"state file {path}: {reason}" if path else reason)
+        self.reason = reason
+        self.headline = headline
+        self.label = label
+        self.support = support
+        self.newer = newer
+        self.run_id = run_id
+        self.written_by = written_by
+        self.path = path
+
+    def at(self, path: str) -> "StateProtocolError":
+        """The same refusal, naming the state file at ``path``."""
+        return StateProtocolError(
+            self.reason,
+            headline=self.headline,
+            label=self.label,
+            support=self.support,
+            newer=self.newer,
+            run_id=self.run_id,
+            written_by=self.written_by,
+            path=path,
+        )
+
+
 class NamespaceError(StateError):
     """A per-issue scheduler namespace cannot be used as asked (ADR 0008 D5, #178).
 

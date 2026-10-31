@@ -263,6 +263,11 @@ describes how a version is built and published.
 
 Whichever way it was installed, run `autoforge` from a checkout of the
 repository whose issues it drives; `autoforge doctor` checks the rest.
+Continue a run with the controller that created it, or a newer one: a
+controller refuses a run a newer one wrote (exit 2, nothing written) and
+names the code it imported, and `doctor`'s `controller` row shows which
+code a command line runs
+([A run a newer controller wrote](https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md#a-run-a-newer-controller-wrote)).
 
 **For development** on AutoForge itself, from a clone of this repository:
 

@@ -444,6 +444,36 @@ and `status` all exit 2 on an unreadable or foreign-protocol `state.json`
 entry such as a FIFO, socket, device or directory; the entry is inspected
 and opened non-blocking, so a FIFO never hangs the command).
 
+**The protocol preflight (#265).** `AutoForgeState.from_dict` reads a
+file in this order: a JSON object, then the `mode` (ADR 0009 D4: anything
+but absent or `"REMOTE"` is an unknown mode under every label), then the
+label, and only then the phase and every field. The label is classified
+by `state.protocol_support` against `SUPPORTED_PROTOCOLS`, the labels the
+loader has a rule for (1 to 5 and 7 to 13): `supported-current` (13, or
+none), `supported-legacy` (an older label, which still meets its own
+migration and refusal rules below), `unsupported-newer` (a decimal label
+above 13, written without a sign or a leading zero) and
+`unsupported-unknown` (6, 0, `"14.0"`, a non-string, anything else). An
+unsupported label raises `StateProtocolError`, a `StateError`, before the
+phase is read, so a newer controller's file is never reported as an
+unknown phase or unknown fields, and it is never reinterpreted. The
+refusal keeps the loader's words (`unsupported protocol_version '14'
+(controller speaks '13')`), adds the running controller's identity
+(`provenance.ControllerIdentity`: the imported package's `__file__`,
+`sys.executable`, its version and protocol), and `load_state` adds the
+file's path. The label is quoted as a bounded `repr`; the file's `run_id`
+and `controller_version` are carried only in the shape a controller
+writes them. The classification and the refusal are the loader itself,
+not a second decoder: every path that loads a state (the CLI before and
+under the lock, `engine.existing_run`, a worker, the scheduler's namespace
+read, the reverse guard's standalone read) refuses the same file the same
+way, and the load under the lock is the one acted on. The CLI prints the
+headline and the `AutoForge controller/state protocol mismatch` block on
+stderr and exits 2; `run`'s refusal of a newer controller's run suggests
+neither a repair nor `--force`, which still moves it aside unchanged.
+Recovery is the operator's: [usage.md](../usage.md#a-run-a-newer-controller-wrote).
+No field and no protocol number came with this.
+
 `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
 instead of deleting it (a symlink is archived as a link; its target is never
 touched; a directory cannot be archived and is refused). The archive name is
@@ -902,7 +932,10 @@ workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
   read-only load of `state/state.json` (absent, loaded, or corrupt with a
   redacted, bounded reason: unparseable or past the decoder's limits
   (`load_state` reports both as corruption), an unknown protocol, not a
-  regular file, reached through a link) and whether `claim.json` exists. A corrupt
+  regular file, reached through a link) and whether `claim.json` exists. A
+  corrupt state of a newer controller's protocol also carries that label
+  (`NamespaceState.newer_protocol`, #265), so `epic status` points at a
+  controller that speaks it instead of `epic archive`. A corrupt
   state is reported for its own namespace only; a corrupt binding raises,
   for that namespace only.
 - **Enumeration** (`list_issue_namespaces`) lists the issue directories
@@ -1304,6 +1337,13 @@ validation command writes no marker and no record (ADR 0006 D8.5); a refused pre
 verification command blocks the merge gate (`BLOCKED`). `SandboxTamperError`
 is a `VerificationError` for a private object directory that holds what no
 object store does (above); the step enters `BLOCKED`.
+
+`StateProtocolError` (#265) is a `StateError` for a state file whose
+`protocol_version` this controller has no rule for (newer, or no
+protocol's), raised by the loader before the file's phase or fields are
+read and never retried; its attributes (the bounded label, the class,
+the newer label, the recorded run id and writer, the path) are what the
+CLI's diagnostic shows. Every handler of `StateError` treats it as one.
 
 The per-issue scheduler namespaces (#178, above) add three, none of them
 retried. `NamespaceError` is a `StateError`: a `binding.json` that is not a

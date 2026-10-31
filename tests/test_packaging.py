@@ -611,6 +611,16 @@ def test_the_first_run_doctor_check_refuses_a_credential_free_row_that_is_not_ok
         dist_check.check_first_run_doctor(report, frozenset({"claude"}), "x.yaml")
 
 
+def test_the_first_run_doctor_check_refuses_an_install_that_imports_the_source_tree():
+    """#265: the installed command's controller row must name the installed
+    package; one naming this checkout's ``src/autoforge`` ran the tree."""
+    source = dist_check.REPO_ROOT / "src" / "autoforge" / "__init__.py"
+    row = _row("controller", detail=f"autoforge 0.1.0 (protocol 13) imported from {source}")
+    report = _first_run_report("claude", controller=row)
+    with pytest.raises(CheckFailed, match="imports the source tree"):
+        dist_check.check_first_run_doctor(report, frozenset({"claude"}), "x.yaml")
+
+
 def test_the_first_run_doctor_check_refuses_agent_rows_the_configuration_does_not_route_to():
     report = _first_run_report("claude", "opencode")
     with pytest.raises(
