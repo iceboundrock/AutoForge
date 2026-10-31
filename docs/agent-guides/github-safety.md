@@ -724,17 +724,23 @@ Then, in order, all from one persisted completion context (D4.6):
    markers) and the planned record are saved in one save.
 2. The record is driven: posted once, then read back by its marker as the
    one comment carrying it, with exactly the planned body.
-3. The roadmap section is written when one is stored and merges are
+3. A `next_issue_url` of `null` is confirmed on GitHub before anything
+   reports the EPIC complete ("A `null` selection" below, #287).
+4. The roadmap section is written when one is stored and merges are
    pending (EPIC updates, below).
-4. `next_issue_url` is verified like the first issue in `INITIALIZING`,
-   and as one of the EPIC's own issues, before switching issues:
+5. A selected `next_issue_url` is verified like the first issue in
+   `INITIALIZING`, and as one of the EPIC's own issues, before switching
+   issues:
 
 - it parses as an issue URL of the configured repository
 - it is neither the EPIC nor the issue just finished
 - the issue exists and is `OPEN`
 - it is a native sub-issue of the EPIC with none of its own (#287): its
   issue object (`get_issue_node`, `GET .../issues/{n}`) names the EPIC as
-  `parent_issue_url`, and its `sub_issues_summary.total` is 0
+  `parent_issue_url`, its `sub_issues_summary.total` is 0, and its state
+  in that read is `open`. The issue read and this one are two reads, and
+  the later one decides: an issue closed between them is refused, never
+  switched to on the earlier answer
 
 Identity checks (EPIC, just-finished issue, parent) compare repository
 case-insensitively plus issue number, never URL strings: GitHub owner and
@@ -751,9 +757,13 @@ not read: the order of a sequential run stays the agent's choice. On the
 parent read, a not-found is a bad selection, a transient failure takes the
 bounded retry below, and any other failure (an answer without the
 sub-issue summaries included) is conclusive. The agent is shown the EPIC's
-sub-issues and their state as `epic-sub-issues.md` of its read context,
-read with `list_sub_issues`; that file is a convenience, and the
-controller decides from its own read of the selected issue.
+sub-issues, each with its state and title, and the EPIC's own count of
+them as `epic-sub-issues.md` of its read context, read with
+`get_issue_node` and `list_titled_sub_issues` (the listing read with each
+row's title kept, since a sub-issue the EPIC body never names would
+otherwise reach the agent as a bare URL). A listing that holds another
+number of issues than the EPIC counts says it is incomplete. That file is
+a convenience; the controller decides from its own reads.
 
 A `next_issue_url` that is not an issue URL at all, or is longer than
 `MAX_URL_CHARS`, is refused by the parser as a malformed `UPDATE_EPIC`
@@ -773,10 +783,44 @@ that carries any other key, `progress` included, is refused. A transient
 GitHub failure while checking the selection takes the same bounded retry.
 Any other GitHub failure (authentication, permissions, malformed data) is
 conclusive and enters `BLOCKED` immediately without invoking the agent
-again. Never switch to an unverified issue. A rejected selection has no
-effect the controller did not already verify: the progress comment is
-posted once and never again, a roadmap section already written was read
-back and closed its batch, and no issue was switched.
+again. Never switch to an unverified issue, and never end the run on an
+unverified `null`. A rejected selection has no effect the controller did
+not already verify: the progress comment is posted once and never again, a
+roadmap section already written was read back and closed its batch, and no
+issue was switched.
+
+#### A `null` selection
+
+`null` is the agent's claim that none of the EPIC's issues remains, and it
+may rest on a read context that showed the listing unreadable or short.
+The controller reads the EPIC's node and its sub-issue listing itself,
+complete by the rules the scheduler's snapshot applies
+(`epic_graph.read_children`: within the bound of 100, de-duplicated by
+id, each row naming the EPIC as its parent, and exactly as many distinct
+issues as the EPIC's `sub_issues_summary.total`). The count matters:
+GitHub leaves a sub-issue the token may not read out of the listing, so
+only the comparison says one is missing, and a missing one may still be
+open. A sub-issue remains when the controller would accept it as a
+selection: in the run's repository, open, without sub-issues of its own,
+not the issue just finished, and not owned by a scheduler namespace. So
+an open nested EPIC, or a sub-issue in another repository, does not keep
+the run going.
+
+- Nothing remains: the roadmap section is written when due and the run
+  enters `DONE`.
+- One remains: the `null` is a rejected selection, naming the issues that
+  remain (at most ten), and takes the bounded retry above. A second
+  rejection enters `BLOCKED`: the run does not end as complete while the
+  EPIC lists work it could still do.
+- A transient failure of either read takes the same bounded retry.
+- A listing that is not complete (the count differs, a bound is exceeded,
+  a row is inconsistent), or a conclusive failure of either read, enters
+  `BLOCKED` at once, without invoking the agent again: asking again would
+  not make GitHub list what it left out.
+
+This check comes before the roadmap splice, so a refused `null` writes no
+section reporting the EPIC complete and leaves the merge counter as it
+was; the progress comment stays posted.
 
 ### Before MERGE
 
@@ -2270,7 +2314,11 @@ engine's, under the same effect records and gates as a standalone run, and
 no worker writes another issue's objects. Sequential `UPDATE_EPIC`
 selection (`_verify_issue_selectable`) takes no snapshot: it reads the
 selected issue's node with `get_issue_node` and holds it to the same
-membership rule ("After UPDATE_EPIC" above, #287).
+membership rule, and a `null` reads the EPIC's children through the
+snapshot's own `read_children` ("After UPDATE_EPIC" above, #287). Its read
+context also uses `list_titled_sub_issues`, the `.../sub_issues` listing
+with each row's title kept; a title is never an eligibility fact and never
+reaches a node, a snapshot or a digest.
 
 - **The reads.** Four typed, read-only `GitHubClient` methods, each a plain
   `gh api` GET with the transient retry of every read:

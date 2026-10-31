@@ -47,7 +47,7 @@ roadmap section into the EPIC body, and verifies your selection.
    `"next_issue_url": null`. The EPIC's body is `epic.md` of the read
    context, `epic-issues.md` lists the state and title of each issue it
    references, and `epic-sub-issues.md` lists its native sub-issues with
-   their state, as the controller read them for this launch.
+   their state and title, as the controller read them for this launch.
 
 ## You make no GitHub write
 
@@ -108,6 +108,11 @@ issues and rejects it unless ALL of these hold:
 
 Check these against `epic-sub-issues.md` and `epic-issues.md` of the read
 context before answering; the controller reads the issue again itself.
+
+`null` is checked too: the controller reads the EPIC's sub-issues itself
+and rejects `null` while one of them is an issue it would accept above.
+It does not end the run when GitHub lists fewer sub-issues than the EPIC
+counts (`epic-sub-issues.md` then says the listing is incomplete).
 
 ## CONTROL_RESULT schema (exact)
 

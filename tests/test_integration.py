@@ -675,7 +675,8 @@ def test_every_remote_launch_gets_no_credential_route_and_its_read_context(
     gh = FakeGitHub()
     gh.issues[ISSUE].body = "Implement the feature. Token: ghp_" + "Q" * 36
     gh.issues[EPIC].body = "Roadmap: #2 then #3 then https://github.com/owner/repo/issues/9"
-    gh.add_issue("https://github.com/owner/repo/issues/3", "Next thing")
+    # #3 is named in the body but is not a sub-issue: the run's `null` holds (#287).
+    gh.add_issue("https://github.com/owner/repo/issues/3", "Next thing", parent=None)
     inner = _full_lifecycle_agent(gh)
     seen: list[tuple[str, set[str]]] = []
 
@@ -703,7 +704,7 @@ def test_every_remote_launch_gets_no_credential_route_and_its_read_context(
             assert "issues/2: OPEN: Feature" in states and "issues/3: OPEN: Next thing" in states
             assert "issues/9: (could not be read)" in states
             children = (context / "epic-sub-issues.md").read_text()
-            assert "issues/2: open\n" in children and "issues/3: open\n" in children
+            assert "issues/2: open: Feature\n" in children and "issues/3" not in children
         return inner(req)
 
     eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)

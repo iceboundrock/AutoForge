@@ -23,11 +23,24 @@ stranger's issue the next task (finding M6 of the #257 audit).
   start each with `autoforge run`.
 - The check is one more read of the selected issue
   (`GET /repos/{owner}/{repo}/issues/{n}`). An answer without the
-  sub-issue summaries blocks the run as a conclusive GitHub failure.
+  sub-issue summaries blocks the run as a conclusive GitHub failure. An
+  issue that read reports closed is refused, even when the issue read
+  just before said `OPEN`.
+- `null` (the EPIC is complete) is no longer taken on the agent's word.
+  The controller reads the EPIC's sub-issue listing, which must hold as
+  many issues as the EPIC counts, as for `autoforge epic run`. While an
+  open sub-issue it would accept remains, `null` is refused and asked
+  again once, then the run is `BLOCKED`. A listing short of the EPIC's
+  count (GitHub leaves out a sub-issue the token may not read), or one
+  that cannot be read, blocks the run instead of ending it as `DONE`. The
+  check comes before the roadmap section that reports the EPIC complete
+  is written.
 - The first issue, the one `run --issue` names, is not held to the rule.
-- The agent's read context gains `epic-sub-issues.md`, the EPIC's native
-  sub-issues with their state, and both `UPDATE_EPIC` prompts state the
-  rule. The prompt version is `v14`; a REMOTE run resumed by this version
+- The agent's read context gains `epic-sub-issues.md`: the EPIC's native
+  sub-issues with their state and title, and the EPIC's own count of them,
+  so a sub-issue the EPIC body never names is still identified and an
+  incomplete listing says so. Both `UPDATE_EPIC` prompts state the rule.
+  The prompt version is `v14`; a REMOTE run resumed by this version
   renders the new templates and keeps its recorded label.
 - Blockers are not read: the order of a sequential run stays the agent's
   choice. No default or configuration key changes.

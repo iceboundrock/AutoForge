@@ -577,9 +577,14 @@ class FakeGitHub:
         # (#287), by the canonical URL ``add_issue`` registered: an issue a test
         # adds is a sub-issue of EPIC unless ``parent`` says otherwise; the EPIC
         # and an issue the controller creates (a follow-up) have none.
-        # ``graph_error`` makes get_issue_node and list_sub_issues raise.
+        # ``graph_error`` makes get_issue_node and both sub-issue listings
+        # raise; ``sub_issues_error`` the listings alone. ``hidden_sub_issues``
+        # are sub-issues GitHub counts for an issue (by canonical URL) but
+        # leaves out of its listing, as it does one the token may not read.
         self.parents: dict[str, str | None] = {}
         self.graph_error: GitHubError | None = None
+        self.sub_issues_error: GitHubError | None = None
+        self.hidden_sub_issues: dict[str, int] = {}
         # Controller-owned EPIC body write (edit_issue_body): every write is
         # recorded as (canonical url, body). ``edit_issue_error`` raises like
         # close_error; ``edit_issue_race`` is called before the write lands (a
@@ -807,9 +812,17 @@ class FakeGitHub:
 
     def list_sub_issues(self, url: str) -> tuple[IssueNode, ...]:
         self.calls.append(("list_sub_issues", url))
-        if self.graph_error is not None:
-            raise self.graph_error
+        if (error := self.graph_error or self.sub_issues_error) is not None:
+            raise error
         return tuple(self._issue_node(known) for known in self._children(url))
+
+    def list_titled_sub_issues(self, url: str) -> tuple[tuple[IssueNode, str], ...]:
+        self.calls.append(("list_titled_sub_issues", url))
+        if (error := self.graph_error or self.sub_issues_error) is not None:
+            raise error
+        return tuple(
+            (self._issue_node(known), self.issues[known].title) for known in self._children(url)
+        )
 
     def _children(self, url: str) -> list[str]:
         ref = parse_issue_url(url)
@@ -831,7 +844,7 @@ class FakeGitHub:
             state="open" if info.is_open else "closed",
             state_reason=None if info.is_open else "completed",
             parent=parse_issue_url(parent) if parent else None,
-            sub_issues_total=len(self._children(known)),
+            sub_issues_total=len(self._children(known)) + self.hidden_sub_issues.get(known, 0),
             blocked_by_total=0,
             blocked_by_open=0,
         )

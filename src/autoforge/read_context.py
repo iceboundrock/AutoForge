@@ -22,7 +22,7 @@ the agent, not evidence.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from .github import MAX_SUB_ISSUES, CommentInfo, IssueInfo, IssueNode, PRInfo
@@ -335,14 +335,36 @@ def render_operator_evidence(entries: Iterable[OperatorEvidence]) -> str:
     return "\n".join(lines)
 
 
-def render_sub_issues(nodes: Iterable[IssueNode], title: str) -> str:
-    """One line per native sub-issue, by number: URL, state, and whether it is a parent itself.
+def render_sub_issues(
+    nodes: Iterable[IssueNode],
+    title: str,
+    *,
+    reported: int | None = None,
+    titles: Mapping[str, str | None] | None = None,
+) -> str:
+    """One line per native sub-issue, by number: URL, state, whether it is a parent itself, title.
 
-    A sub-issue row carries no title (:class:`~autoforge.github.IssueNode`),
-    so none is shown; a closed one shows GitHub's reason.
+    A sub-issue row carries no title (:class:`~autoforge.github.IssueNode`);
+    ``titles`` maps a lower-cased canonical URL to the title the controller
+    read for it (``None``: the read failed). An open sub-issue without one
+    says its title could not be read; a closed one shows GitHub's reason,
+    and a title only when one is given. ``reported`` is the EPIC's own
+    ``sub_issues_summary.total``: a listing that holds a different number
+    says it is incomplete, since GitHub leaves out a sub-issue the token
+    may not read.
     """
     entries = sorted(nodes, key=lambda node: (node.repository.lower(), node.number))
+    known = titles or {}
     lines = [f"# {title}", "", _HEADER, ""]
+    if reported is not None:
+        lines += [f"The EPIC reports {reported} sub-issue(s); GitHub listed {len(entries)}.", ""]
+        if reported != len(entries):
+            lines += [
+                "This listing is incomplete: GitHub leaves out a sub-issue the token may not "
+                "read. The controller does not take the EPIC as complete until every one is "
+                "listed.",
+                "",
+            ]
     if len(entries) > MAX_SUB_ISSUES:
         lines += [omission(title.lower(), MAX_SUB_ISSUES, len(entries), "issues"), ""]
     if not entries:
@@ -350,11 +372,17 @@ def render_sub_issues(nodes: Iterable[IssueNode], title: str) -> str:
     for node in entries[:MAX_SUB_ISSUES]:
         state = node.state if node.is_open else f"{node.state} ({node.state_reason or 'no reason'})"
         nested = (
-            f": has {node.sub_issues_total} sub-issue(s) of its own"
+            f", has {node.sub_issues_total} sub-issue(s) of its own"
             if node.sub_issues_total
             else ""
         )
-        lines.append(f"- {escape_inline(redact(node.url))}: {escape_inline(state)}{nested}")
+        line = f"- {escape_inline(redact(node.url))}: {escape_inline(state)}{nested}"
+        name = known.get(node.ref.canonical.lower())
+        if name is not None:
+            line += f": {escape_inline(redact(name))}"
+        elif node.is_open:
+            line += ": (title could not be read)"
+        lines.append(line)
     return "\n".join([*lines, ""])
 
 

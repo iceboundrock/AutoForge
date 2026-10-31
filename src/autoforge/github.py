@@ -1708,6 +1708,14 @@ def _decode_issue_node(row: object, what: str) -> IssueNode:
     )
 
 
+def _rest_title(row: object, what: str) -> str:
+    """A REST issue row's ``title`` (decoded by :func:`_decode_issue_node` first)."""
+    title = _row_object(row, what).get("title")
+    if not isinstance(title, str):
+        raise GitHubError(f"{what}: title {title!r:.40} is not a string")
+    return title
+
+
 def _decode_blocker(row: object, what: str) -> BlockerNode:
     """One ``blocked_by`` row as a :class:`BlockerNode`, strictly.
 
@@ -2279,14 +2287,30 @@ class GitHubClient:
         Not recursive (ADR 0008 D3.1). The caller checks the length against
         the parent's ``sub_issues_summary.total`` and de-duplicates by ``id``.
         """
+        what = f"sub-issues of {parse_issue_url(url).canonical}"
+        return tuple(_decode_issue_node(row, what) for row in self._sub_issue_rows(url, what))
+
+    def list_titled_sub_issues(self, url: str) -> tuple[tuple[IssueNode, str], ...]:
+        """:meth:`list_sub_issues` with each sub-issue's title, from the same read (#287).
+
+        For the agent's read context only: a title is untrusted text, never
+        an eligibility fact (D3.5), so it stays out of the node and out of
+        every snapshot and digest. A row whose ``title`` is not a string is a
+        conclusive GitHubError, as any malformed row is.
+        """
+        what = f"sub-issues of {parse_issue_url(url).canonical}"
+        return tuple(
+            (_decode_issue_node(row, what), _rest_title(row, what))
+            for row in self._sub_issue_rows(url, what)
+        )
+
+    def _sub_issue_rows(self, url: str, what: str) -> list:
         ref = parse_issue_url(url)
-        what = f"sub-issues of {ref.canonical}"
         endpoint = (
             f"repos/{_repository_path(ref.repository)}/issues/{ref.number}/sub_issues"
             f"?per_page={_GRAPH_PAGE_SIZE}"
         )
-        rows = self._api_full_pages(endpoint, _GRAPH_PAGE_SIZE, what)
-        return tuple(_decode_issue_node(row, what) for row in rows)
+        return self._api_full_pages(endpoint, _GRAPH_PAGE_SIZE, what)
 
     def list_blocked_by(self, url: str) -> tuple[BlockerNode, ...]:
         """Every native ``blocked_by`` dependency of an issue, every page read, in API order.
