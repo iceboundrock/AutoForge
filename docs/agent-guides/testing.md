@@ -1652,6 +1652,15 @@ HEAD:
 - a Pi failure is reported by its category as the provider's refusal or
   AutoForge's failure, never with its text
 - the session-directory, tree and process checks
+- the REMOTE flow's stand-in origin is the only repository its seeding
+  writes to (#386 R1-F1). A rewrite of its URL is planted on each route git
+  reads one from (`GIT_CONFIG_GLOBAL`, `~/.gitconfig`, `XDG_CONFIG_HOME`,
+  `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, the
+  checkout's own configuration), pointing at another repository or at an
+  SSH remote, beside a credential helper, an SSH command, an askpass and
+  hooks that are sentinels. Seeding and a forced publish still leave the
+  other repository with no ref and no object and run no sentinel, and the
+  whole REMOTE flow passes with the rewrite in `~/.gitconfig`
 - the whole flow against the fake `pi`, through the real
   `autoforge local doctor` in a process of its own and the real engine and
   `PiProvider`: it passes on the `api_key` route (no key in any launch,

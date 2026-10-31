@@ -84,7 +84,10 @@ read it before adding tests for a listed area.
   with `make_engine(..., origin=True)`: an `Origin` is a seeded bare
   repository under `tmp_path` that the controller's git transport fetches
   from and pushes to over `file://`, and that backs `FakeGitHub`'s branch
-  heads, PR heads and ancestry reads. `implement` is the implementation
+  heads, PR heads and ancestry reads. Its own git (`isolated_git`) reads
+  none of the operator's git configuration or `GIT_*` variables and seeds
+  and publishes over no transport (#386 R1-F1), so no URL rewrite can send
+  a test's push anywhere else. `implement` is the implementation
   agent (one commit on the worktree's detached `HEAD`, reported by
   `analyze_payload`), and `scripted(...)` answers successive calls of one
   agent. An autouse fixture fails any test whose engine would reach the

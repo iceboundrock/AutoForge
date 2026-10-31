@@ -12,7 +12,9 @@ resolve, and a review answer AutoForge cannot parse. The LOCAL flow runs
 the real ``autoforge local doctor`` in a process of its own and the real
 engine and ``PiProvider`` on a LOCAL run; the REMOTE flow (ADR 0009
 Appendix A.2.3 G) the real ``autoforge doctor`` and a REMOTE run against
-the GitHub stand-in, with one rehearsal for each LOCAL one.
+the GitHub stand-in, with one rehearsal for each LOCAL one, and that its
+stand-in origin is the only repository its seeding writes to, whatever URL
+rewrite git's configuration holds (#386 R1-F1).
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from pathlib import Path
 import pytest
 
 from autoforge.redaction import redact
-from tests.conftest import block, commit_in, git_out, git_repo, review_result
+from tests.conftest import Origin, block, commit_in, git_out, git_repo, review_result
 from tests.live_pi import (
     AUTH_VARIABLE,
     CREDENTIAL_PATTERNS,
@@ -970,3 +972,191 @@ def test_a_missing_pi_fails_the_remote_preconditions_and_launches_nothing(tmp_pa
     assert report.outcomes[STEPS[0]][1].endswith("is not on PATH: install Pi yourself (docs/pi.md)")
     assert not report.passed(STEPS[2])
     assert all(name not in report.outcomes for name in STEPS[3:])
+
+
+# -- the REMOTE flow's origin, seeded inside the run's directory (#386 R1-F1) ----------
+# An operator's git configuration or environment may rewrite a URL
+# (`url.<other>.insteadOf`, `pushInsteadOf`), name a credential helper, an SSH
+# command, an askpass program or a hooks directory. The stand-in origin is
+# seeded and published to by `Origin`, whose git reads none of that and uses
+# no transport, so none of it can send the seed to another repository,
+# reach a network remote, or run.
+REWRITE_ROUTES = (
+    "GIT_CONFIG_GLOBAL",
+    "~/.gitconfig",
+    "XDG_CONFIG_HOME",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "the checkout's .git/config",
+)
+# Where the rewrite sends the seed: another repository on this machine, or a
+# network remote whose SSH command is the sentinel (so nothing reaches it).
+REWRITE_DESTINATIONS = ("another file:// repository", "an ssh:// remote")
+# The hooks a push, a ref update or a commit could run from a planted directory.
+PLANTED_HOOKS = ("pre-push", "reference-transaction", "post-commit", "pre-receive", "update")
+
+
+def holds_nothing(bare: Path) -> bool:
+    """``bare`` holds no ref and no object, read by the test's own git."""
+    objects = set(git_out("--git-dir", str(bare), "count-objects", "-v").splitlines())
+    refs = git_out("--git-dir", str(bare), "for-each-ref")
+    return refs == "" and {"count: 0", "in-pack: 0"} <= objects
+
+
+@dataclass
+class Planted:
+    """The repository a planted configuration redirects to, and the log of
+    every sentinel it would run."""
+
+    decoy: Path
+    log: Path
+
+    def ran(self) -> list[str]:
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+
+def _sentinel(path: Path, log: Path, label: str) -> Path:
+    """A program that logs it ran and fails at once, reading nothing (an SSH
+    command that waited for its stdin would hang the git that started it)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'#!/bin/sh\necho "{label} $*" >> "{log}"\nexit 1\n')
+    path.chmod(0o755)
+    return path
+
+
+def _plant_rewrites(
+    route: str, destination: str, url: str, checkout: Path, tmp_path: Path, monkeypatch
+) -> Planted:
+    """Make every git that reads ``route`` rewrite ``url`` to ``destination``,
+    with a credential helper, an SSH command, an askpass program and a
+    hooks directory of sentinels; the environment routes (``GIT_SSH_COMMAND``,
+    ``GIT_ASKPASS``, ``SSH_ASKPASS``) are planted whatever the route."""
+    planted = tmp_path / "planted"
+    log = planted / "ran.log"
+    decoy = planted / "decoy.git"
+    git_out("init", "-q", "--bare", "-b", "main", str(decoy))
+    target = (
+        f"file://{decoy}"
+        if destination.startswith("another")
+        else "ssh://git@example.invalid/owner/repo.git"
+    )
+    hooks = planted / "hooks"
+    for name in PLANTED_HOOKS:
+        _sentinel(hooks / name, log, f"hook {name}")
+    entries = {
+        f"url.{target}.insteadOf": url,
+        f"url.{target}.pushInsteadOf": url,
+        "credential.helper": f"!{_sentinel(planted / 'credential', log, 'credential')}",
+        "core.sshCommand": str(_sentinel(planted / "ssh", log, "core.sshCommand")),
+        "core.askPass": str(_sentinel(planted / "askpass", log, "core.askPass")),
+        "core.hooksPath": str(hooks),
+    }
+    monkeypatch.setenv("GIT_SSH_COMMAND", str(_sentinel(planted / "ssh-env", log, "GIT_SSH")))
+    monkeypatch.setenv("GIT_ASKPASS", str(_sentinel(planted / "askpass-env", log, "GIT_ASKPASS")))
+    monkeypatch.setenv("SSH_ASKPASS", str(_sentinel(planted / "ssh-askpass", log, "SSH_ASKPASS")))
+    for name in [n for n in os.environ if n.startswith("GIT_CONFIG")]:
+        monkeypatch.delenv(name)  # what this process's own environment set
+    home = planted / "home"
+    (home / ".config").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+
+    def write(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for key, value in entries.items():
+            git_out("config", "--file", str(path), key, value)
+
+    if route == "GIT_CONFIG_GLOBAL":
+        write(planted / "global.gitconfig")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(planted / "global.gitconfig"))
+    elif route == "~/.gitconfig":
+        write(home / ".gitconfig")
+    elif route == "XDG_CONFIG_HOME":
+        write(home / ".config" / "git" / "config")
+    elif route == "GIT_CONFIG_SYSTEM":
+        write(planted / "system.gitconfig")
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(planted / "system.gitconfig"))
+    elif route == "GIT_CONFIG_COUNT":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", str(len(entries)))
+        for i, (key, value) in enumerate(entries.items()):
+            monkeypatch.setenv(f"GIT_CONFIG_KEY_{i}", key)
+            monkeypatch.setenv(f"GIT_CONFIG_VALUE_{i}", value)
+    elif route == "GIT_CONFIG_PARAMETERS":
+        monkeypatch.setenv(
+            "GIT_CONFIG_PARAMETERS", " ".join(f"'{k}'='{v}'" for k, v in entries.items())
+        )
+    else:
+        write(checkout / ".git" / "config")
+    return Planted(decoy=decoy, log=log)
+
+
+@pytest.mark.parametrize("destination", REWRITE_DESTINATIONS)
+@pytest.mark.parametrize("route", REWRITE_ROUTES)
+def test_the_origin_is_seeded_and_published_to_alone_whatever_rewrites_the_url(
+    tmp_path, monkeypatch, route, destination
+):
+    """ADR 0009 A.2.3 G (#386 R1-F1): with a rewrite of the stand-in origin's
+    URL planted on each route git reads one from (to another repository, or
+    to an SSH remote whose command is a sentinel), and a credential helper,
+    SSH command, askpass and hooks of sentinels beside it, the seeding and a
+    forced publish write into the origin alone: the other repository holds no
+    ref and no object, and no sentinel ran. A plain `git push -f` to the
+    origin's `file://` URL, the seeding before this fix, fails every case."""
+    checkout = git_repo(tmp_path / "checkout")
+    first = git_out("-C", str(checkout), "rev-parse", "HEAD")
+    second = commit_in(checkout, "second")
+    where = tmp_path / "stand-in"
+    url = f"file://{where / 'origin.git'}"
+    with monkeypatch.context() as planting:
+        planted = _plant_rewrites(route, destination, url, checkout, tmp_path, planting)
+        origin = Origin.seeded(where, checkout)
+        assert origin.url == url
+        origin.publish(checkout, first, "feature")
+        origin.publish(checkout, second, "feature")
+        origin.publish(checkout, first, "feature")  # forced: not a fast-forward
+        origin.delete("main")
+        origin.publish(checkout, second, "main")
+    assert planted.ran() == []
+    assert holds_nothing(planted.decoy)
+    refs = git_out(
+        "--git-dir", str(where / "origin.git"), "for-each-ref", "--format=%(refname) %(objectname)"
+    )
+    assert refs.splitlines() == [f"refs/heads/feature {first}", f"refs/heads/main {second}"]
+
+
+def test_the_remote_flow_seeds_its_own_origin_whatever_the_operators_gitconfig_rewrites(
+    tmp_path, rehearsal, monkeypatch
+):
+    """ADR 0009 A.2.3 G (#386 R1-F1): the operator's `~/.gitconfig` rewrites
+    the URL of the run's stand-in origin, for fetches and pushes, to another
+    repository. The REMOTE flow still passes: its origin is seeded with the
+    checkout's `main`, the controller pushes the PR's head there, and the
+    other repository holds no ref and no object."""
+    where = tmp_path / "smoke"
+    url = f"file://{where / 'origin.git'}"
+    decoy = tmp_path / "decoy.git"
+    git_out("init", "-q", "--bare", "-b", "main", str(decoy))
+    home = tmp_path / "home"
+    home.mkdir()
+    for key in ("insteadOf", "pushInsteadOf"):
+        git_out("config", "--file", str(home / ".gitconfig"), f"url.file://{decoy}.{key}", url)
+    settings = rehearsal.settings("api_key")
+    with monkeypatch.context() as planting:
+        for name in [n for n in os.environ if n.startswith("GIT_CONFIG")]:
+            planting.delenv(name)
+        planting.setenv("HOME", str(home))
+        planting.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+        report = _remote(tmp_path, settings, _arm_remote_review(rehearsal.fake))
+
+    assert report.ok, report.render()
+    assert holds_nothing(decoy)
+    origin = where / "origin.git"
+    main = git_out("-C", str(where / "repo"), "rev-parse", "main")
+    assert git_out("--git-dir", str(origin), "rev-parse", "refs/heads/main") == main
+    [launch] = rehearsal.fake.launches()
+    head = git_out("-C", launch["cwd"], "rev-parse", "HEAD")
+    pushed = git_out(
+        "--git-dir", str(origin), "for-each-ref", "--format=%(objectname)", "refs/heads/autoforge"
+    )
+    assert pushed == head

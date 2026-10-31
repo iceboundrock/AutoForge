@@ -68,14 +68,18 @@ The others:
 suite's in-memory ``FakeGitHub`` (``tests/conftest.py``), its git data in a
 bare repository under the run's directory that the controller's own git
 transport pushes to over ``file://``, as the engine tests' ``origin=True``
-does. A scratch repository on github.com was the alternative. It was
-rejected because it would need the operator's ``gh`` login and the network,
-leave a branch, a PR and a comment to clean up, and break the promise that
-the live test writes nothing to GitHub (``tests/AGENTS.md``), all to prove
-what this test is not about: the test proves Pi on a REMOTE REVIEW, and the
-GitHub side of REMOTE is covered offline by the suite against the same fake.
-The cost: what the controller sent to GitHub is checked against the fake's
-model of GitHub, not GitHub's, and the run says nothing about ``gh``.
+does. The test seeds that origin with the suite's isolated git, over no
+transport: it writes into the bare repository alone, whatever URL rewrite,
+credential helper or SSH command the operator's git configuration or
+environment holds (#386 R1-F1). A scratch repository on github.com was the
+alternative. It was rejected because it would need the operator's ``gh``
+login and the network, leave a branch, a PR and a comment to clean up, and
+break the promise that the live test writes nothing to GitHub
+(``tests/AGENTS.md``), all to prove what this test is not about: the test
+proves Pi on a REMOTE REVIEW, and the GitHub side of REMOTE is covered
+offline by the suite against the same fake. The cost: what the controller
+sent to GitHub is checked against the fake's model of GitHub, not GitHub's,
+and the run says nothing about ``gh``.
 """
 
 from __future__ import annotations
@@ -493,14 +497,18 @@ class RecordingPi(PiProvider):
 
 
 def write_repository(root: Path) -> Path:
-    """A git repository holding the feature specification, committed."""
+    """A git repository holding the feature specification, committed by
+    the suite's isolated git: none of the operator's git configuration,
+    hooks or ``GIT_*`` variables apply (#386 R1-F1)."""
+    from tests.conftest import isolated_git
+
     root.mkdir(parents=True)
     (root / FEATURE).parent.mkdir()
     (root / FEATURE).write_text(FEATURE_MD, encoding="utf-8")
     (root / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
     identity = ["-c", "user.name=AutoForge smoke", "-c", "user.email=smoke@example.invalid"]
     for argv in (["init", "-q", "-b", "main"], ["add", "-A"], [*identity, "commit", "-qm", "x"]):
-        subprocess.run(["git", "-C", str(root), *argv], check=True, capture_output=True)
+        isolated_git("-C", str(root), *argv)
     return root
 
 

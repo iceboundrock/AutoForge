@@ -466,6 +466,9 @@ steps on a REMOTE run, against a GitHub stand-in: the test suite's
 in-memory fake of GitHub, its git data in a bare repository in the test's
 temporary directory, which the controller's own git transport pushes to
 over `file://`. Nothing reaches GitHub, and the run needs no `gh` login.
+The test seeds that repository itself, over no git transport and with
+none of your git configuration or `GIT_*` variables, so a URL rewrite
+(`insteadOf`) in your `~/.gitconfig` cannot send the seed anywhere else.
 A throwaway repository on github.com would exercise GitHub too, but it
 would need your login and the network, and leave a branch, a PR and a
 comment to clean up, while what this test proves is Pi on a REMOTE review.
