@@ -121,11 +121,12 @@ Number the steps in your notes as below, and note the time at each.
    install and sign in to each tool.
 2. **Install AutoForge** ([section 2](getting-started.md#2-install-autoforge))
    from `ref`, by the method [above](#the-revision-under-test) for this
-   kind of run, and keep `uv`'s output. Run `autoforge --version` and
-   `autoforge --help` from a directory that is not a repository; on a pull
-   request the version is `main`'s `.devM` one, at a release candidate the
-   candidate's. The version alone does not say which commit is installed;
-   record that, with the Python AutoForge runs on and `uv`'s own version:
+   kind of run, and keep the exact command you ran and `uv`'s output.
+   Run `autoforge --version` and `autoforge --help` from a directory that
+   is not a repository; on a pull request the version is `main`'s `.devM`
+   one, at a release candidate the candidate's. The version alone does
+   not say which commit is installed; record that, with the Python
+   AutoForge runs on and `uv`'s own version:
 
    ```bash
    uv --version
@@ -150,10 +151,10 @@ Number the steps in your notes as below, and note the time at each.
    starter downloaded at `ref`: name the starter, the URL you downloaded it
    from, and every change you made to it.
 5. **Run `doctor`**
-   ([section 5](getting-started.md#5-check-the-environment-doctor)): keep
-   its output, and the versions file the guide writes. Every row that is not
-   `OK` must be one the guide told you to expect; any other is a friction
-   point.
+   ([section 5](getting-started.md#5-check-the-environment-doctor)),
+   signed in, before the dry run and the real run: keep its output, and
+   the versions file the guide writes. Every row that is not `OK` must be
+   one the guide told you to expect; any other is a friction point.
 6. **Dry run**, then **the real run**, then **`status`**
    ([section 6](getting-started.md#6-preview-run-and-read-where-it-stopped)),
    until `READY_FOR_MERGE` or `BLOCKED`. Note how long the run took and how
@@ -170,9 +171,9 @@ Number the steps in your notes as below, and note the time at each.
 
 Keep these, **redacted** (below):
 
-- the environment of step 0, the installation record of step 2 (`uv`'s
-  output, `uv --version` and the `uv tool list` line), and the versions
-  file of step 5;
+- the environment of step 0, the installation record of step 2 (the
+  exact install command, `uv`'s output, `uv --version` and the
+  `uv tool list` line), and the versions file of step 5;
 - the configuration of step 4: the starter's name, the URL it was
   downloaded from, and every change made to it (a `diff` against a fresh
   download shows them);

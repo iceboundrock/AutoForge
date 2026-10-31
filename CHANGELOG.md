@@ -8,13 +8,16 @@ so.
 ### A first run, from nothing: the guide, starter configurations, and a `doctor` that a new repository can pass (#259)
 
 - [Getting started](docs/getting-started.md) takes a newcomer from nothing
-  to a first run on a throwaway repository: prerequisites, installing,
-  the EPIC and the issue to write, keeping `.autoforge/` and
-  `autoforge.yaml` out of git, a configuration, what each `doctor` row
-  means, a dry run, a real run, `READY_FOR_MERGE` and `BLOCKED`, and the
-  common first-run failures with their exact messages.
-  [Clean-room first run](docs/clean-room.md) is the procedure that checks
-  it at each release candidate.
+  to a first run on a repository of their own, a new private one
+  (recommended) or an existing one they may change once they accept the
+  run's scope and risks: prerequisites, installing, the EPIC and the issue
+  to write, keeping `.autoforge/` and `autoforge.yaml` out of git, a
+  configuration, what each `doctor` row means, a dry run, a real run,
+  `READY_FOR_MERGE` and `BLOCKED`, and the common first-run failures with
+  their exact messages. [Clean-room first run](docs/clean-room.md) is the
+  procedure that checks it at each release candidate, in a fresh
+  environment, with the installed revision, the documents and the starter
+  all from the candidate under test.
 - Two starter configurations under `examples/`:
   `starter-two-providers.yaml`, the built-in routing written out, and
   `starter-claude-only.yaml`, Claude Code for every phase, whose review is
