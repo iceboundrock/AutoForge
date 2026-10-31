@@ -5250,6 +5250,38 @@ def test_launch_is_persisted_before_the_agent_runs(tmp_state_dir):
     assert seen == [1] and load_state(eng.paths.state_file).attempt == 0
 
 
+def test_a_journal_refused_before_the_launch_charges_no_attempt(tmp_state_dir):
+    """#57 in REMOTE: the event journal is opened before the launch is
+    charged, so a journal that cannot be appended to (here, larger than
+    any controller journal can be) refuses the step with no agent started
+    and no attempt counted. A charge before the open would persist a
+    launch that never happened.
+
+    ADR 0009 A.2.4 (#386): the REMOTE form of the launch-accounting half
+    of tests/test_local.py::test_a_journal_refused_before_the_launch_is_not_charged_as_a_launch.
+    """
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    gh = FakeGitHub()
+
+    def never_launched(req):
+        pytest.fail("the reviewer was launched over a journal that cannot be appended to")
+
+    eng = _in_review(tmp_state_dir, gh, never_launched)
+    eng.save()
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.touch()
+    os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+    with pytest.raises(StateError, match="corrupted event journal.*larger than"):
+        eng.step()
+    assert eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.review_round == 0 and s.attempt == 0
+    assert gh.effect_writes == [] and gh.comments.get(PR, []) == []
+    assert journal.stat().st_size == 2 * MAX_EVENT_JOURNAL_BYTES
+
+
 # -- agent-reported failure / blocked ----------------------------------------------------------
 def test_agent_failure_moves_to_failed(tmp_state_dir, fake_github):
     payload = {"phase": "ANALYZE_EXECUTE", "status": "failure", "message": "tests red"}

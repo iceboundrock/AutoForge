@@ -1349,3 +1349,93 @@ def test_a_progress_log_replaced_while_the_agent_ran_receives_nothing(tmp_path):
         step.append("after")
     step.close()
     assert progress.read_text(encoding="utf-8") == "operator data\n"
+
+
+# -- ADR 0009 A.2.4 (#386): the journal cases of the LOCAL recovery matrix -----
+def test_a_foreign_file_renamed_over_the_journal_during_a_remote_launch_receives_nothing(
+    tmp_state_dir, tmp_path_factory
+):
+    """PR #91 review, fifth round, through a REMOTE step rather than the
+    logger alone: the reviewer renames a small single-link regular file of
+    the operator's over ``events.jsonl`` while it runs. The engine records
+    the invocation through the logger it opened before the launch, so the
+    append finds another inode at the name and refuses. The refusal keeps
+    its filesystem type (``UnsafePathError``, not a bare ``StateError``)
+    and gains what it interrupted and what ``resume`` does
+    (``ControllerEngine._record_invocation``). The operator's file is byte
+    for byte what it was, the invocation's artifacts are published, the
+    launch is persisted as attempt 1 and nothing reached GitHub. Once the
+    operator moves the file out, a resume in a new process relaunches the
+    reviewer, and a fresh journal gets exactly one line.
+
+    ADR 0009 A.2.4 (#386): covers the journal case of
+    tests/test_local_recovery_matrix.py::test_a_foreign_file_the_agent_renamed_over_the_journal_receives_nothing
+    """
+    from pathlib import Path
+
+    from autoforge.safefs import UnsafePathError
+    from autoforge.state import load_state
+    from autoforge.transitions import Phase
+    from tests.conftest import (
+        BRANCH,
+        MERGE_BASE,
+        PR,
+        SHA_A,
+        FakeGitHub,
+        block,
+        make_engine,
+        review_result,
+    )
+
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, None, github=gh)
+    gh.add_pr(head_sha=SHA_A)
+    eng.state.phase = Phase.REVIEW
+    eng.state.current_pr_url = PR
+    eng.state.current_branch = BRANCH
+    eng.state.current_head_sha = SHA_A
+    eng.state.current_base_ref = "main"
+    eng.state.current_merge_base_sha = MERGE_BASE
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+    # Outside the state directory, as the operator's own file would be.
+    foreign = tmp_path_factory.mktemp("outside") / "operator-notes.txt"
+    foreign.write_text("operator data\n", encoding="utf-8")
+    foreign_ino = foreign.stat().st_ino
+
+    def reviews_and_replaces_the_journal(req):
+        assert journal.is_file(), "the journal is opened, and so exists, before the launch"
+        os.rename(foreign, journal)
+        return block(review_result(1, SHA_A))
+
+    eng.provider._handler = reviews_and_replaces_the_journal
+    with pytest.raises(UnsafePathError, match="refusing to append to .*events.jsonl") as exc:
+        eng.step()
+    message = str(exc.value)
+    assert "different regular file now" in message
+    assert "journal line was not written" in message
+    assert (
+        "interrupted attempt 1 of REVIEW after the agent had returned with: a CONTROL_RESULT "
+        "the controller accepted" in message
+    )
+    assert "Repair the log directory, then 'resume': it re-enters REVIEW" in message
+    assert journal.stat().st_ino == foreign_ino, "the operator's file keeps the name"
+    assert journal.read_text(encoding="utf-8") == "operator data\n", "and its content"
+    steps = sorted(p.name for p in journal.parent.iterdir() if p.is_dir())
+    assert steps == ["001-review-1"], "the invocation's artifacts were published"
+    assert (journal.parent / steps[0] / "control-result.json").exists()
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase == Phase.REVIEW and saved.review_round == 0 and saved.attempt == 1
+    assert gh.effect_writes == [] and gh.comments.get(PR, []) == []
+    eng.close()
+
+    # The operator moves their file out and resumes in a new process: a
+    # fresh journal is created and records the relaunch alone.
+    journal.rename(foreign)
+    eng2 = make_engine(tmp_state_dir, [block(review_result(1, SHA_A))], github=gh)
+    eng2.load()
+    assert eng2.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng2.provider.calls) == 1
+    assert journal.stat().st_ino != foreign_ino
+    assert journal.read_bytes().count(b"\n") == 1, "one line: the relaunch"
+    assert foreign.read_text(encoding="utf-8") == "operator data\n"
+    eng2.close()
