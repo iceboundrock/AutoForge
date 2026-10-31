@@ -36,10 +36,27 @@ so.
   where it stopped at the first space or semicolon before and left the
   rest in the clear. The quote may be escaped, as JSON writes it, doubled
   inside the value (`'it''s'`, as YAML writes one), and the value may span
-  lines, as a shell or YAML string does; a quote in code or prose that opens
-  no value does not take the lines after it. An unquoted value ends at a
-  line break written out (`\n` in JSON text), so a `NAME: value` line after
-  it is redacted in turn.
+  lines, as a shell or YAML string does, whatever they hold: blank lines,
+  the other quote character and backticks too. A quote in code or prose
+  that opens no value does not take the lines after it: one that a word
+  follows, one that ends its line, and one after a name that starts a
+  string literal or a code span. An unquoted value ends at a line break
+  written out (`\n` in JSON text), so a `NAME: value` line after it is
+  redacted in turn.
+- A value on the lines below a YAML key named so (an indented plain or
+  quoted scalar, a literal `|` or folded `>` block, an Ansible `!vault |`)
+  is redacted whole, under a lower-case name too, where only a value on the
+  key's line was before; a statement that ends in a colon
+  (`if api_token:`), a nested mapping and, under a lower-case name, a value
+  that reads as code (`${{ secrets.X }}`) are left. The key, a block's
+  header and the value's indentation stay.
+- `redact` repeats its patterns until a round changes nothing, so redacting
+  its output again changes nothing and finds no credential in it, also
+  where one pattern redacted a part of the text another value's extent
+  depended on; an OAuth assignment's value (`refresh_token=...`) now ends
+  where a prefixed name's does, at a backtick and before the punctuation
+  after a word. A text with nothing to redact still takes one round, and
+  the patterns that start with a literal skip a text without it.
 - A value under such a name as a mapping's key (`{"GEMINI_API_KEY": ...}`,
   `{"client_secret": ...}`, `{"GITHUB_TOKEN": ...}`) is redacted in the
   structures the run log, state and the CLI print, at any depth, where only

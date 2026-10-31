@@ -20,6 +20,8 @@ from tests.conftest import (
     PRIVATE_KEY,
     SHAPES_285,
     WHOLE_VALUES_285,
+    WHOLE_VALUES_285_R3,
+    WHOLE_VALUES_285_R3_REDACTED,
 )
 
 
@@ -1343,6 +1345,55 @@ def test_a_whole_value_the_second_285_review_found_never_reaches_the_logs(tmp_pa
     assert (step / "stderr.log").read_text(encoding="utf-8") == "".join(
         f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in redacted
     )
+
+
+def test_a_whole_value_the_third_285_review_found_never_reaches_the_logs(tmp_path):
+    """#285 review, round 3: a quoted value whose lines held a blank line,
+    the other quote or a backtick was redacted to the end of its first line,
+    and a value under a lower-case credential name on the lines below it (a
+    YAML plain or quoted scalar, a literal or a folded block) not at all, so
+    ``stdout.log``, ``stderr.log`` and the step's records kept them. Each goes
+    whole from every file, after OpenCode's ANSI escapes too, and the line
+    after it stays."""
+    texts = [text for _, text, _ in WHOLE_VALUES_285_R3]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", *texts],
+            error="agent exited 1:\n" + "\n".join(texts),
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": "\n".join(texts),
+                "tests": texts,
+            },
+        ),
+        prompt="p",
+        stdout="".join(f"{text}\nnext line\n" for text in texts),
+        stderr="".join(f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in texts),
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"stdout.log", "stderr.log", "control-result.json"}
+    for path in [*files, log.events_path]:
+        content = path.read_text(encoding="utf-8")
+        assert "FAKE" not in content, path
+        for _, _, body in WHOLE_VALUES_285_R3:
+            assert body not in content, (path, body)
+    redacted = [WHOLE_VALUES_285_R3_REDACTED[name] for name, _, _ in WHOLE_VALUES_285_R3]
+    assert (step / "stdout.log").read_text(encoding="utf-8") == "".join(
+        f"{text}\nnext line\n" for text in redacted
+    )
+    assert (step / "stderr.log").read_text(encoding="utf-8") == "".join(
+        f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in redacted
+    )
+    result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
+    assert result["tests"] == redacted
+    assert result["message"] == "\n".join(redacted)
 
 
 def test_an_oauth_credential_field_in_a_parsed_result_is_still_redacted(tmp_path):

@@ -1,15 +1,19 @@
 """Redaction: common token patterns are masked, normal text untouched."""
 
 import ast
+import itertools
 import json
+import random
 import time
 from urllib.parse import urlencode
 
 import pytest
 
 from autoforge.redaction import (
+    _ENV_NAMES,
     _PATTERNS,
     MAX_GROWTH_FACTOR,
+    _redact_once,
     credential_classes,
     redact,
     redact_obj,
@@ -40,6 +44,8 @@ from tests.conftest import (
     SUFFIX_ASSIGNMENT,
     SUFFIX_SECRET,
     WHOLE_VALUES_285,
+    WHOLE_VALUES_285_R3,
+    WHOLE_VALUES_285_R3_REDACTED,
     XAI_API_KEY,
     XAI_KEY_BODY,
 )
@@ -1164,9 +1170,11 @@ def test_a_quoted_value_is_redacted_whole(text, expected):
 # A quote that opens no value, or a value that does not read as one string
 # across its lines (#285 review, round 2), each with what ``redact`` makes of
 # it: the value is the rest of its line, as an unterminated one's was, and
-# the lines after it stay. A quote of the kind closes it on a later line only
-# after a blank line, a code fence, a backtick or the other quote, or is
-# followed by a word (it opens the next string).
+# the lines after it stay. The next quote of the kind is followed by a word
+# or a ``*`` (it opens the next string), or comes after a code fence; or the
+# quote opens no value at all (round 3): the name stands right after a quote
+# or a backtick, which starts a string literal or a code span that the quote
+# after its separator closes, or the quote ends its line.
 _QUOTES_THAT_SPAN_NO_LINES = [
     (
         'X_TOKEN="FAKEcut\n\nA paragraph says "this".',
@@ -1188,6 +1196,29 @@ _QUOTES_THAT_SPAN_NO_LINES = [
     (
         'field = "Set GITHUB_TOKEN="\nassert check("body", field)',
         'field = "Set GITHUB_TOKEN="\nassert check("body", field)',
+    ),
+    # Round 3: a blank line, the other quote and a backtick no longer stop a
+    # value, so each of these reaches a quote of its kind that could close
+    # it; what tells the quote that opens no value is where it stands.
+    (
+        "print('GH_TOKEN=' + read(\"f\"))\nsep = ', '",
+        "print('GH_TOKEN='***REDACTED***\nsep = ', '",
+    ),
+    (
+        "msg = 'X_TOKEN=' + v\n\nlog('%s done', name)",
+        "msg = 'X_TOKEN='***REDACTED***\n\nlog('%s done', name)",
+    ),
+    (
+        'Set `DEPLOY_SECRET="...` first;\n\nthen run "$HOME/x".',
+        'Set `DEPLOY_SECRET="***REDACTED***\n\nthen run "$HOME/x".',
+    ),
+    (
+        'field = "Set GITHUB_TOKEN="\nx = \'a\'\n\ny = "/tmp"',
+        'field = "Set GITHUB_TOKEN="\nx = \'a\'\n\ny = "/tmp"',
+    ),
+    (
+        'X_TOKEN="FAKEcut\nand `x` said "*bold*" here',
+        'X_TOKEN="***REDACTED***\nand `x` said "*bold*" here',
     ),
 ]
 
@@ -1274,6 +1305,390 @@ def test_a_quoted_value_across_lines_or_a_doubled_quote_is_redacted_whole_at_any
     assert credential_classes(escaped) == (name,)
     assert redact(out) == out
     assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+
+
+# Quoted values the third review of #285 found cut short at their first line
+# (R3-F1), ``{q}`` the quote and ``{o}`` the other one: lines that hold a
+# blank line, the other quote, a backtick, and all three. Each is valid in a
+# shell string and a YAML flow scalar.
+_SPANNING_VALUES_R3 = {
+    "blank-line": "FAKEfirst\n\nFAKE second",
+    "other-quote": "FAKE it{o}s\nFAKE {o}x{o} second",
+    "backtick": "FAKE `cmd`\nFAKE second",
+    "all": "FAKE{o}\n\n  `FAKE`\n  FAKE second",
+}
+
+
+@pytest.mark.parametrize("value", sorted(_SPANNING_VALUES_R3), ids=str)
+@pytest.mark.parametrize("quote", ['"', "'"], ids=["double", "single"])
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(
+    ("name", "template"), _SPACED_ASSIGNMENTS, ids=[t for _, t in _SPACED_ASSIGNMENTS]
+)
+def test_a_quoted_value_whose_lines_hold_anything_is_redacted_whole_at_any_escaping(
+    name, template, depth, quote, value
+):
+    """#285 review, round 3: a value that spanned lines was taken only while
+    its lines held no blank line, no quote of the other kind and no
+    backtick, all of which a valid shell or YAML string holds; it then
+    stopped at its first line and the rest stayed in the clear. It is taken
+    to its closing quote as text and as JSON, JSON in JSON and three deep
+    write it, and the redacted text decodes to what redacting the text
+    itself gives."""
+    other = "'" if quote == '"' else '"'
+    text = template.format(q=quote, v=_SPANNING_VALUES_R3[value].format(q=quote, o=other))
+    assert redact(text) == template.format(q=quote, v="***REDACTED***")
+    escaped = _json_string(text, depth)
+    out = redact(escaped)
+    assert "FAKE" not in out and "second" not in out
+    decoded = out
+    for _ in range(depth):
+        decoded = json.loads(decoded)
+    assert decoded == redact(text)
+    assert credential_classes(escaped) == (name,)
+    assert redact(out) == out
+    assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+
+
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [c[1:] for c in WHOLE_VALUES_285_R3],
+    ids=[c[0] for c in WHOLE_VALUES_285_R3],
+)
+def test_a_value_the_third_285_review_found_is_redacted_whole_as_text_and_as_json(text, body):
+    """#285 review, round 3: a quoted value whose lines held a blank line,
+    the other quote or a backtick kept every line after its first, and a
+    value under a lower-case credential name on the lines below it (a YAML
+    plain or quoted scalar, a literal or a folded block) was kept whole. Each
+    goes whole, as text and as JSON, JSON in JSON and three deep write it,
+    and the JSON still decodes to what redacting the text gives."""
+    name = next(name for name, case, _ in WHOLE_VALUES_285_R3 if case == text)
+    assert redact(text) == WHOLE_VALUES_285_R3_REDACTED[name]
+    for depth in (0, 1, 2, 3):
+        escaped = _json_string(text, depth)
+        out = redact(escaped)
+        assert body not in out and "FAKE" not in out, out
+        assert credential_classes(escaped) == ("credential-suffix-assignment",)
+        assert redact(out) == out and credential_classes(out) == ()
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == WHOLE_VALUES_285_R3_REDACTED[name]
+    assert redact_obj({"env": {"text": text}}) == {"env": {"text": redact(text)}}
+
+
+# A credential name's value on the lines below it (#285 review, round 3),
+# each with what ``redact`` makes of it, beyond the shared cases: a CRLF
+# file, a comment after the key and after the value, the line after the
+# value, a sequence entry, a quoted key, a block's indicators, an Ansible
+# vault's tag, blank lines inside a block and after it, a deeper line in a
+# block, an upper-case and a well-known name whose next line holds several
+# words or a block, after OpenCode's ANSI escape and after a line break
+# written out.
+_YAML_VALUES = [
+    ("client_secret:\r\n  FAKEcrlf\r\nnext: 1", "client_secret:\r\n  ***REDACTED***\r\nnext: 1"),
+    (
+        "client_secret: # rotated\n  FAKEvalue # old\nnext: 1",
+        "client_secret: # rotated\n  ***REDACTED*** # old\nnext: 1",
+    ),
+    (
+        "app:\n  api_token:\n    FAKEnested\n  next: 1",
+        "app:\n  api_token:\n    ***REDACTED***\n  next: 1",
+    ),
+    ('"client_secret":\n  "FAKE"', '"client_secret":\n  "***REDACTED***"'),
+    (
+        "db_password: |-\n  FAKE1\n  FAKE2\n\nnext: 1",
+        "db_password: |-\n  ***REDACTED***\n\nnext: 1",
+    ),
+    ("db_password: >2\n   FAKE1\n    FAKEdeeper\n", "db_password: >2\n   ***REDACTED***\n"),
+    ("db_password: |\n\n  FAKEafterblank\n", "db_password: |\n\n  ***REDACTED***\n"),
+    (
+        "db_password: !vault |\n  FAKEcipher0\n  FAKEcipher1",
+        "db_password: !vault |\n  ***REDACTED***",
+    ),
+    ("db_password: | # pinned\n  FAKE", "db_password: | # pinned\n  ***REDACTED***"),
+    ("GEMINI_API_KEY:\n  FAKE two words", "GEMINI_API_KEY:\n  ***REDACTED***"),
+    ("GEMINI_API_KEY: >\n  FAKE1\n  FAKE2", "GEMINI_API_KEY: >\n  ***REDACTED***"),
+    ("GITHUB_TOKEN: |\n  FAKE1\n  FAKE2\nx: 1", "GITHUB_TOKEN: |\n  ***REDACTED***\nx: 1"),
+    ("AWS_SECRET_ACCESS_KEY: |\n  FAKE1", "AWS_SECRET_ACCESS_KEY: |\n  ***REDACTED***"),
+    ("refresh_token: |\n  FAKE1\n  FAKE2", "refresh_token: |\n  ***REDACTED***"),
+    ("\x1b[0mclient_secret: |\n  FAKE", "\x1b[0mclient_secret: |\n  ***REDACTED***"),
+    ("x\\nclient_secret:\\n  FAKE\\nnext: 1", "x\\nclient_secret:\\n  ***REDACTED***\\nnext: 1"),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _YAML_VALUES, ids=[t for t, _ in _YAML_VALUES])
+def test_a_credential_names_value_on_the_lines_below_it_is_redacted(text, expected):
+    """#285 review, round 3: a value on the lines below its key, as YAML
+    writes one, is replaced whole; the key, its comment, a block's header,
+    the value's indentation and the lines after it stay."""
+    assert redact(text) == expected
+    assert credential_classes(text) != ()
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    assert "FAKE" not in redact(text)
+
+
+# What stays (#285 review, round 3): a key with no value below it, or one
+# that is no YAML key, and a value that reads as code. A statement that ends
+# in a colon (``if api_token:``) is no key, since a key starts its line; a
+# more indented line that is a mapping, a sequence, a comment or a fence is
+# another node, never the value; and a lower-case name's value that reads as
+# code (a reference, a placeholder, a dotted name, a call, a type, a
+# constant) is none, as on the key's line.
+_YAML_NEAR_MISSES = [
+    "elif client_secret:\n    use_it(1)",
+    "while api_token:\n    api_token = refresh()",
+    "for x_token in tokens:\n    use(x_token)",
+    "class Config:\n    api_token: str\n    db_password: SecretStr",
+    "def f(\n    api_token:\n        str,\n):",
+    "const cfg = {\n  client_secret:\n    process.env.CLIENT_SECRET,\n"
+    "  api_token:\n    getToken(),\n};",
+    "client_secret:\n  valueFrom:\n    secretKeyRef:\n      name: app",
+    "client_secret:\n  - a\n  - b",
+    "client_secret:\n  # set by CI\nnext: 1",
+    "client_secret:\nnext: 1",
+    "client_secret: |\nnext: 1",
+    "client_secret:\n  ${{ secrets.CLIENT_SECRET }}",
+    "db_password: |\n  {{ vault_db_password }}",
+    "env:\n  api_token:\n    $API_TOKEN",
+    "- `client_secret`:\n  the client's secret",
+    "Set client_secret:\n  see below",
+    "api_token:\n  None",
+    "api_token:\n  ~",
+    "client_secret:\n  [REDACTED]",
+    "client_secret:\n  ```\n  x\n  ```",
+    "client_secret:\n  &anchor x",
+    "client_secret:\n  ***REDACTED***",
+    "client_secret: |\n  ***REDACTED***",
+]
+
+
+@pytest.mark.parametrize("text", _YAML_NEAR_MISSES)
+def test_a_line_below_a_credential_name_that_is_no_value_is_left(text):
+    assert redact(text) == text
+    assert credential_classes(text) == ()
+
+
+# An OAuth name is a prefixed name too (#285 review, round 3, R3-F3):
+# ``oauth-assignment`` takes its value first and ``credential-suffix-
+# assignment`` what it left. The OAuth value ran on over a full stop, a
+# closing bracket or a backtick that the prefixed-name rule leaves after its
+# marker as the punctuation after a word, so a second redaction took it and
+# ``credential_classes`` found a credential in the first one's output. Each
+# with what ``redact`` makes of it.
+_OAUTH_AND_SUFFIX_VALUES = [
+    ("refresh_token=,FAKEdummy.", "refresh_token=***REDACTED***."),
+    ("refresh_token=FAKE,dummy.", "refresh_token=***REDACTED***."),
+    ("Then access_token=,FAKE. ok", "Then access_token=***REDACTED***. ok"),
+    ("`access_token=,FAKE` in .env", "`access_token=***REDACTED***` in .env"),
+    ("id_token=FAKE)", "id_token=***REDACTED***)"),
+    ("refresh_token=FAKE.)", "refresh_token=***REDACTED***.)"),
+    ("oauth_refresh_token=FAKE:x,y.", "oauth_refresh_token=***REDACTED***."),
+    ("refresh_token=FAKE.\\nnext", "refresh_token=***REDACTED***\\nnext"),
+    ("REFRESH_TOKEN=,FAKE.", "REFRESH_TOKEN=***REDACTED***"),
+    ("REFRESH_TOKEN=FAKE`", "REFRESH_TOKEN=***REDACTED***"),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _OAUTH_AND_SUFFIX_VALUES, ids=str)
+def test_an_oauth_value_ends_where_the_prefixed_name_rule_ends_it(text, expected):
+    """One round of the patterns already gives text that a second round
+    leaves: the OAuth and prefixed-name values end at the same characters, so
+    neither takes what the other left after its marker."""
+    once = _redact_once(text)
+    assert once == expected == redact(text)
+    assert _redact_once(once) == once
+    assert credential_classes(once) == ()
+
+
+# Every OAuth name, a prefixed and a well-known one with each separator and
+# a value that starts, ends or is cut by a character one rule ends a value
+# at and the other does not, alone, in a sentence, in a code span, before a
+# line and in a quoted string (#285 review, round 3).
+_CROSS_NAMES = [
+    "refresh_token",
+    "access_token",
+    "id_token",
+    "oauth_refresh_token",
+    "REFRESH_TOKEN",
+    "Refresh_Token",
+    "client_secret",
+    "Db_Password",
+    "GH_TOKEN",
+    "chatgpt-account-id",
+]
+_CROSS_SEPARATORS = ["=", ": ", " = ", ":\n  "]
+_CROSS_VALUES = [
+    ",FAKE.",
+    "FAKE.",
+    "FAKE,x.",
+    "&FAKE)",
+    "FAKE`",
+    ",FAKE`x",
+    "FAKE:x.",
+    "FAKE]}",
+    "FAKE.,",
+    "FAKE\\n",
+    'FAKE\\"',
+    "FAKE;x",
+    "FAKE&a=1.",
+    "%2FFAKE.",
+    "(FAKE).",
+    ",.FAKE",
+    '"FAKE x".',
+    "FAKE.`x`",
+]
+_CROSS_CONTEXTS = ["{}", "Then {} ok", "`{}` in .env", "{}\nnext", '"{}"']
+
+
+def test_one_round_of_the_patterns_is_stable_across_the_oauth_and_name_rules():
+    """#285 review, round 3 (R3-F3): one round left text that a second one
+    changed, for 240 of these at the reviewed head. None does now, and
+    ``redact``'s output carries no credential class."""
+    unstable = []
+    for name, separator, value, context in itertools.product(
+        _CROSS_NAMES, _CROSS_SEPARATORS, _CROSS_VALUES, _CROSS_CONTEXTS
+    ):
+        text = context.format(name + separator + value)
+        once = _redact_once(text)
+        if _redact_once(once) != once or credential_classes(redact(text)):
+            unstable.append(text)
+        assert len(redact(text)) <= MAX_GROWTH_FACTOR * len(text)
+    assert unstable == []
+
+
+# A seeded generator of text where the patterns meet (#285 review, round 3):
+# names of every kind, separators that span lines, quotes, blocks, escapes
+# and leads, and values of the characters one rule ends a value at and
+# another does not. A value's extent depends on the text around it, which a
+# later pattern can redact; ``redact`` repeats its round until nothing
+# changes, so its output is stable whatever met.
+_MEET_NAMES = [
+    "refresh_token",
+    "access_token",
+    "client_secret",
+    "db_password",
+    "x_api_key",
+    "REFRESH_TOKEN",
+    "A_TOKEN",
+    "GH_TOKEN",
+    "my_GITHUB_TOKEN",
+    "token",
+    "password",
+    "Authorization",
+    "chatgpt-account-id",
+    "refresh",
+    "access",
+    '"refresh_token"',
+    "'client_secret'",
+    '"GH_TOKEN"',
+    "AWS_SECRET_ACCESS_KEY",
+    "Db_Password",
+]
+_MEET_SEPARATORS = [
+    "=",
+    ": ",
+    ":",
+    " = ",
+    ":\n  ",
+    "=\n",
+    ": |\n  ",
+    "=\\n",
+    ": >-\n  ",
+    ":\n",
+    ":\\n  ",
+    ": |\\n  ",
+    ':\n  "',
+    ": !vault |\n  ",
+]
+_MEET_PIECES = [
+    *"aZ09,.:)]}`&;\\\"' \n#=%$!*-_/+|>{[",
+    "\\n",
+    '\\"',
+    "FAKE",
+    "&x=",
+    "Bearer ",
+    "\n\n",
+    "```",
+    "ghp_" + "a" * 11,
+    "\n  ",
+    "\n    ",
+    ": ",
+    " #",
+    "\\n  ",
+    GOOGLE_API_KEY,
+]
+_MEET_LEADS = [
+    "",
+    "x ",
+    "\x1b[0m",
+    "\\n",
+    "- ",
+    "  ",
+    "print('",
+    "`",
+    "\n",
+    "\n  ",
+    '"',
+    "if ",
+    "  - ",
+]
+
+
+def _meeting_text(rng):
+    parts = []
+    for _ in range(rng.randint(1, 3)):
+        parts += [
+            rng.choice(_MEET_LEADS),
+            rng.choice(_MEET_NAMES),
+            rng.choice(_MEET_SEPARATORS),
+            rng.choice(["", "", '"', "'", '\\"']),
+            "".join(rng.choice(_MEET_PIECES) for _ in range(rng.randint(0, 10))),
+        ]
+    text = "".join(parts)
+    return json.dumps(text) if rng.random() < 0.2 else text
+
+
+def test_redact_is_stable_where_the_patterns_meet():
+    rng = random.Random(285)
+    unstable = []
+    for _ in range(3_000):
+        text = _meeting_text(rng)
+        out = redact(text)
+        if redact(out) != out or credential_classes(out):
+            unstable.append(text)
+        assert len(out) <= MAX_GROWTH_FACTOR * len(text)
+    assert unstable == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # A later pattern redacted the quote of another value's kind that
+        # had kept a cut value from spanning to the next one, so a second
+        # redaction spanned it (found by the generator above).
+        (
+            'GH_TOKEN="FAKEcut\nA_TOKEN: \'FAKE "x" y\' more" tail',
+            'GH_TOKEN="***REDACTED***" tail',
+        ),
+        # A YAML block, redacted last, held the quote behind fewer
+        # backslashes that had ended an escaped value's string.
+        (
+            'x_token=\\"FAKEcut\nGITHUB_TOKEN: |\n  "FAKEquoted\n\\" tail',
+            'x_token=\\"***REDACTED***\\" tail',
+        ),
+    ],
+    ids=["quote-in-a-later-value", "quote-in-a-later-block"],
+)
+def test_a_value_whose_extent_a_later_pattern_changes_is_redacted_to_its_end(text, expected):
+    """#285 review, round 3: where a pattern redacts part of the text that
+    decides another value's extent, the round after it reads the text as a
+    second call would, and ``redact`` returns what that call returns. One
+    round alone does not."""
+    once = _redact_once(text)
+    assert _redact_once(once) != once
+    assert redact(text) == expected
+    assert redact(expected) == expected and credential_classes(expected) == ()
 
 
 def test_a_quoted_value_is_redacted_whole_in_a_python_repr():
@@ -1411,6 +1826,13 @@ def test_a_lower_case_word_of_any_characters_stays_linear(text):
         'A_TOKEN="' + '""' * 500_000,
         'A_TOKEN="' + '""\n' * 300_000,
         "".join("A_TOKEN=" + "\\" * level + '"' + "x\n" * 1_000 for level in range(8)) * 50,
+        # Round 3: lines that hold blank lines, the other quote and
+        # backticks, which no longer stop a value, a candidate after the
+        # other and of each quote in turn, so that each reads the other's.
+        ('A_TOKEN="x' + "\n'`" * 10 + "\n\n") * 12_500,
+        ('A_TOKEN="x' + "\n\n" * 10 + '"a') * 25_000,
+        ("A_TOKEN=\"x\nB_TOKEN='y\n") * 25_000,
+        ("'A_TOKEN=\"x\n\n" + "a\n" * 10) * 25_000,
     ],
     ids=[
         "one-long-value",
@@ -1425,6 +1847,10 @@ def test_a_lower_case_word_of_any_characters_stays_linear(text):
         "doubled-quotes",
         "doubled-quotes-on-lines",
         "lines-at-every-level",
+        "lines-anything",
+        "lines-blank-lines",
+        "lines-both-quotes",
+        "lines-in-a-string",
     ],
 )
 def test_a_quoted_value_stays_linear(text):
@@ -1436,6 +1862,70 @@ def test_a_quoted_value_stays_linear(text):
     candidates in a row can do."""
     started = time.process_time()
     redact(text)
+    assert time.process_time() - started < 3.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a_token:\n" * 200_000,
+        "a_token: |\n" + "\n" * 1_000_000,
+        ("a_token: |\n" + "  \n" * 100 + "x\n") * 5_000,
+        "a_token:\n  " + "a " * 500_000 + ": x",
+        ("a_token:\n  " + "a" * 100 + ":\n") * 10_000,
+        "- " * 500_000 + "a_token:\n  ${X}",
+        ('"' + " " * 100) * 10_000,
+        ('"' + "- " * 50 + "a_token") * 10_000,
+        "\\n" * 500_000,
+        ("x_token:\\n  " + "\\\\" * 50 + '"') * 10_000,
+        ("a_token:\n" + " " * 100 + "\n") * 10_000,
+        "a_token:\n" + " " * 1_000_000 + "{",
+        ("\x1b[0mapi_token:\n  $X\n") * 50_000,
+    ],
+    ids=[
+        "keys-without-values",
+        "header-then-blank-lines",
+        "blank-lines-then-a-key",
+        "words-then-a-mapping",
+        "mapping-lines",
+        "sequence-dashes",
+        "quotes-then-spaces",
+        "quotes-then-dashes",
+        "written-out-line-breaks",
+        "written-out-backslash-runs",
+        "blank-indented-lines",
+        "long-indentation",
+        "references-after-escapes",
+    ],
+)
+def test_a_value_on_the_lines_below_a_key_stays_linear(text):
+    """#285 review, round 3: a candidate starts at a line's start, an escape
+    or a quote, and reads its key, one line break and its value's lines, each
+    once, so a megabyte of keys, blank lines, mappings and indentation that
+    hold no value is redacted well inside the budget."""
+    started = time.process_time()
+    assert redact(text) == text
+    assert time.process_time() - started < 3.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        ("a_token:\n  " + "x " * 50 + "\n") * 5_000,
+        ("a_token: |\n" + "  x\n" * 50) * 2_500,
+        ("A_TOKEN=x\n") * 50_000,
+        ('GH_TOKEN="x\nA_TOKEN: \'a "b" c\' d" e\n') * 10_000,
+    ],
+    ids=["plain-scalars", "blocks", "assignments", "cascades"],
+)
+def test_a_text_whose_values_are_redacted_stays_linear(text):
+    """#285 review, round 3: a text with something to redact takes a second
+    round, which reads it as a second call would; the rounds are bounded, so
+    half a megabyte of values, each a cascade among them, stays inside the
+    budget."""
+    started = time.process_time()
+    out = redact(text)
+    assert "***REDACTED***" in out and redact(out) == out
     assert time.process_time() - started < 3.0
 
 
@@ -2030,6 +2520,9 @@ _QUOTED_ASSIGNMENTS = [
 ]
 
 
+_ENV_NAME_LIST = _ENV_NAMES.split("|")
+
+
 def _json_string(text, depth):
     for _ in range(depth):
         text = json.dumps(text)
@@ -2268,8 +2761,16 @@ def test_redact_obj_redacts_a_token_after_an_ansi_escape_at_any_depth():
 
 def test_every_pattern_but_the_quoted_oauth_field_starts_a_token_after_an_escape():
     """A new pattern is built with ``_token``, never anchored on ``\\b``: only
-    ``oauth-field``, which a quote starts, has no ``after_escape`` pass."""
-    assert [entry.name for entry in _PATTERNS if entry.after_escape is None] == ["oauth-field"]
+    ``oauth-field``, which a quote starts, and the two YAML value patterns
+    (#285 review, round 3), whose key starts a line and which take an
+    escape before it as a line's start, have no ``after_escape`` pass."""
+    assert [
+        (index, entry.name) for index, entry in enumerate(_PATTERNS) if entry.after_escape is None
+    ] == [
+        (17, "oauth-field"),
+        (len(_PATTERNS) - 2, "env-assignment"),
+        (len(_PATTERNS) - 1, "credential-suffix-assignment"),
+    ]
     assert not [entry.name for entry in _PATTERNS if r"\b" in entry.regex.pattern]
 
 
@@ -2348,7 +2849,17 @@ _WORST_CASE_UNITS = {
     "credential_suffix_assignment_quoted_lower": 'a_token="x"',
     "credential_suffix_assignment_escaped_lower": "a_token=\\'x\\'",
     "credential_suffix_assignment_word_lower": "a_token=x;",
-    "credential_suffix_assignment_quoted_line_break": 'A_TOKEN="\n" ',
+    # A value spans lines whatever they hold (round 3), but its first line
+    # holds something: one character and a line break, 13 to 25.
+    "credential_suffix_assignment_quoted_line_break": 'A_TOKEN="x\n" ',
+    "credential_suffix_assignment_quoted_blank_line": "a_token='x\n\n' ",
+    # A value on the lines below its key (round 3): a plain scalar of one
+    # character, 12 to 25, a quoted one, 14 to 27, a block's one line, 14 to
+    # 27, and a well-known name's plain scalar, longer still.
+    "yaml_value": "a_token:\n x\n",
+    "yaml_value_quoted": 'a_token:\n "x"\n',
+    "yaml_value_block": "A_TOKEN: |\n x\n",
+    "yaml_value_well_known_name": "HF_TOKEN:\n x y\n",
     "credential_suffix_assignment_doubled_quote": "a_token='''' ",
     # The BEGIN line and 16 characters of key material, its floor: 44 to 15.
     "private_key": "-----BEGIN" + " PRIVATE KEY-----" + "a" * 16 + " ",
@@ -2476,6 +2987,10 @@ def test_every_redaction_pattern_has_its_stable_class_name():
         "oauth-assignment",
         "oauth-bare-assignment",
         "credential-suffix-assignment",
+        # A credential name's value on the lines below it (#285 review, round
+        # 3), under the class of the name's own pattern.
+        "env-assignment",
+        "credential-suffix-assignment",
     ]
 
 
@@ -2510,6 +3025,10 @@ _CREDENTIAL_CORPUS = [
     *(text for text, _ in _WHOLE_QUOTED_VALUES),
     *(text for text, _ in _QUOTES_THAT_SPAN_NO_LINES),
     *(text for _, text, _ in WHOLE_VALUES_285),
+    *(text for _, text, _ in WHOLE_VALUES_285_R3),
+    *(text for text, _ in _YAML_VALUES),
+    *_YAML_NEAR_MISSES,
+    *(text for text, _ in _OAUTH_AND_SUFFIX_VALUES),
     *(text for text, _ in _URL_CREDENTIAL_CASES),
     *_URLS_WITHOUT_USERINFO,
     _NORMAL_TEXT,
@@ -2538,6 +3057,49 @@ _CREDENTIAL_CORPUS = [
 def test_credential_classes_is_empty_exactly_when_redact_changes_nothing(text):
     classes = credential_classes(text)
     assert (classes == ()) == (redact(text) == text)
+
+
+@pytest.mark.parametrize("text", _CREDENTIAL_CORPUS)
+def test_a_pattern_with_a_hint_matches_no_text_without_it(text):
+    """A hint lets ``redact`` skip a pattern on a text that lacks it (#285
+    review, round 3), so it must be what every match holds: no pass of a
+    pattern finds anything in a text, its JSON or its escaped repeats where
+    the hint is not found."""
+    for variant in (text, json.dumps(text), f"x\\n{text}\x1b[0m{text}"):
+        for entry in _PATTERNS:
+            for hint in (entry.hint, entry.name_hint):
+                if hint is None or hint.search(variant):
+                    continue
+                assert entry.regex.search(variant) is None, (entry.name, variant)
+                assert entry.after_escape is None or entry.after_escape.search(variant) is None
+
+
+def test_every_hint_is_a_literal_a_match_must_hold():
+    """The hints are the literals the patterns start with, and a YAML key's
+    colon before what ends its line: each one is in every unit that pins the
+    pattern's growth, so none could hide a pattern from the growth bound."""
+    units = [*_WORST_CASE_UNITS.values(), *_ESCAPED_UNITS.values()]
+    for entry in _PATTERNS:
+        for hint in (entry.hint, entry.name_hint):
+            if hint is None:
+                continue
+            for unit in units:
+                found = entry.regex.search(unit) or (
+                    entry.after_escape and entry.after_escape.search(unit)
+                )
+                if found:
+                    assert hint.search(unit), (entry.name, unit)
+
+
+def test_the_well_known_names_hint_holds_for_every_name_in_any_case():
+    """``env-assignment``'s hint is derived from the names it knows, so it
+    holds for each of them, as written, in lower case and mixed, on the
+    name's line and as the YAML pattern's second hint."""
+    line, yaml = [entry for entry in _PATTERNS if entry.name == "env-assignment"]
+    assert line.hint is not None and yaml.name_hint is not None
+    for name in _ENV_NAME_LIST:
+        for variant in (name, name.lower(), name.title()):
+            assert line.hint.search(variant) and yaml.name_hint.search(variant), variant
 
 
 def test_credential_classes_corpus_has_both_sides():

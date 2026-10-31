@@ -34,8 +34,8 @@ Authorization: Bearer ... / Token ... / Basic ...
 the value of any name that ends in `_API_KEY`, `_TOKEN`, `_SECRET` or
 `_PASSWORD` behind a prefix (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, any
 value; `client_secret`, a quoted value or a word that does not read as
-code), also as a mapping's
-key, the well-known token shapes on their own (`ghp_*` and
+code), on its line or on the lines below it as a YAML key, also as a
+mapping's key, the well-known token shapes on their own (`ghp_*` and
 the other classic GitHub prefixes, `github_pat_*`, `sk-*`, `sk-ant-*`,
 Google API keys `AIza...`, three-segment `eyJ...` JWTs, AWS access key ids
 `AKIA...` / `ASIA...`, `glpat-*`, `gsk_*`, `xai-*`, `npm_*`, `hf_*`), a
@@ -65,7 +65,9 @@ two characters: a token right after one was kept in the clear, and
 OpenCode's `stderr.log` carries such sequences
 (`ESC[91mESC[1mError: ESC[0m<message>`, `providers.py`). Every pattern of
 `redaction.py` is now built on one rule (`_token`; the quoted `oauth-field`
-shape, which a quote starts, needs none). A credential starts:
+shape, which a quote starts, needs none, nor do the two that find a value
+on the lines below a YAML key, whose key starts its line and which take an
+escape before it as a line's start, #285). A credential starts:
 
 - at the start of the text;
 - after any character that cannot be part of it: anything but an ASCII
@@ -166,7 +168,7 @@ checks refuse it by name, never rewriting it.
 | `xai-api-key` | `xai-` and at least 20 characters of `[A-Za-z0-9_]` |
 | `npm-token` | `npm_` and at least 20 characters of `[A-Za-z0-9]` |
 | `huggingface-token` | `hf_` and at least 20 characters of `[A-Za-z0-9]` |
-| `credential-suffix-assignment` | a name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a prefix: in upper case with any value, in lower or mixed case with a quoted value or a word that does not read as code |
+| `credential-suffix-assignment` | a name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a prefix: in upper case with any value, in lower or mixed case with a quoted value or a word that does not read as code; on its line, or on the lines below it as a YAML key |
 
 **The token shapes** are case-sensitive. A floor of 20 characters is below
 the length of every real token of each kind (52 for Groq, 80 for xAI, 36
@@ -267,7 +269,9 @@ What its value must be depends on the name's case:
   that opens a bracket: `{token}`, `{{ vault_secret }}`, `<value>`,
   `[REDACTED]`); a number (`max_token: 4096`); and a word with no letter or
   digit before it ends (`...`, `|`, the second character of `:=` and `==`).
-  A value on the next line is a statement, not the name's (`if api_token:`).
+  On the lines below the name, a value is the name's only under a YAML key
+  ([below](#a-value-on-the-lines-below-a-yaml-key)): a statement that ends
+  in a colon is none (`if api_token:`).
   The costs, both deliberate: a literal of one of those shapes is not
   recognised under a lower-case name (`db_password=password`,
   `db_password: hello.world`, a PIN of digits alone), as it is under an
@@ -293,18 +297,40 @@ second review of #285 found both kept in the clear: the value stopped at the
 line break, or at the doubled quote, and what followed reached
 `stdout.log` and `stderr.log`.
 
-A value spans lines only while what it spans reads as one string: no blank
-line, no line that starts a code fence, no backtick, no unescaped quote of
-the other kind, and a closing quote that no letter, digit or `_` follows.
-A quote that opens no value would otherwise take the lines up to the next
-quote of its kind: the end of a string literal in code
-(`print('GH_TOKEN=' + read("f"))`), or a quote in a Markdown code span
-(`` `DEPLOY_SECRET="-----BEGIN ...` ``), in a log, a prompt or the read
-context the controller redacts for an agent. A value that does not span
-lines, or whose closing quote never comes (the end of the text, or the same
-quote behind fewer backslashes, which closes the string it stands in:
-`"X_TOKEN=\"cut"`), runs to its closing quote on its line, or to the end
-of its line or string, and no further, as before.
+A value spans its lines whatever they hold: blank lines, the other quote
+character and backticks included (a single-quoted shell string holds a
+literal backtick). Until the third review of #285 a value spanned lines
+only while they held none of those, so a valid shell or YAML value holding
+one was redacted to the end of its first line and its other lines reached
+`stdout.log`, `stderr.log` and `control-result.json`. Its closing quote is
+the first quote of its kind that nothing escapes. What tells a quote that
+opens no value (the end of a string literal in code, a quote in a Markdown
+code span, in a log, a prompt or the read context the controller redacts
+for an agent) from one that opens a value is where the quotes stand, not
+what lies between them:
+
+- the closing quote is followed by no letter, digit, `_` or `*`: a quote
+  that a word follows opens the next string (`say "this"`,
+  `log('done')`), and `*`, the marker's first character, is one so that a
+  value redacted after the quote reads the same;
+- the value's first line holds something: a quote that ends its line
+  (`field = "Set GITHUB_TOKEN="`) closes a string literal more often than
+  it opens a value that starts with a line break, which is not recognised;
+- the name does not stand right after a quote or a backtick, unless it is a
+  quoted key (`"GITHUB_TOKEN": "..."`): there it starts a string literal or
+  a code span (`print('GH_TOKEN=' + read("f"))`, a code span opened right
+  before `DEPLOY_SECRET="...`), and the quote after its separator closes
+  that string;
+- no line it spans starts a code fence.
+
+A value that does not span lines, or whose closing quote never comes (the
+end of the text, or the same quote behind fewer backslashes, which closes
+the string it stands in: `"X_TOKEN=\"cut"`), runs to its closing quote on
+its line, or to the end of its line or string, and no further, as before.
+Not recognised: the lines after the first of a value in a Markdown code
+span opened right before its name, of one whose closing quote a word
+follows (a shell joins `'a'b` into one word), and of one that starts with a
+line break.
 
 **An unquoted value ends at a line break written out** (`\n`, `\r` and
 `\t`, as JSON writes them), for this rule, `env-assignment` and
@@ -316,6 +342,21 @@ in the clear. The name now starts a token after the escape
 ([above](#where-a-recognised-credential-starts-284)), and its value is
 replaced in turn.
 
+**An OAuth value ends where a lower-case name's word does.** Every OAuth
+name but `chatgpt-account-id` is a prefixed name too (`refresh_token`,
+`oauth_refresh_token`): `oauth-assignment` takes its value first, and this
+rule what it left. Until the third review of #285 the OAuth value ran on
+over a backtick and over a run of `.`, `:` and closing brackets before the
+value's end, which this rule leaves after its marker as the punctuation
+after a word, so a second redaction removed it: `refresh_token=,word.`
+lost its full stop to the second call, and `credential_classes` found a
+credential in the first call's output. The OAuth value now also ends at a
+backtick and before such a run (and, as before, at a comma and any `&`),
+so one round of the patterns gives text that a second leaves, over every
+OAuth, prefixed and well-known name, separator and value of the characters
+one rule ends a value at and the other does not
+(`tests/test_redaction.py`).
+
 The rule runs last, after every other pattern, so a value one of them knows
 is reported by that pattern's class (`GEMINI_API_KEY=AIza...` stays
 `google-api-key`, `NPM_TOKEN=npm_...` `npm-token`), a well-known name is
@@ -326,9 +367,10 @@ too. Not recognised: a suffix the rule does not take (`SSH_KEY`,
 `*_CREDENTIALS`), a camelCase name (`clientSecret`), a bare generic name
 (`password=`), which stays `secret-assignment`'s, with its value of 12
 token characters, and, for this rule and `env-assignment` alike, the words
-after the first of an unquoted value that holds spaces: an unquoted value
-is one word, as a shell reads one, so a YAML plain scalar or an INI value of
-several words (`DB_PASSWORD: two words`) keeps all but its first. Quoted,
+after the first of an unquoted value on the name's line that holds spaces:
+an unquoted value is one word, as a shell reads one, so a YAML plain scalar
+or an INI value of several words on the key's line (`DB_PASSWORD: two
+words`) keeps all but its first. Quoted, or on the lines below a YAML key,
 such a value is taken whole.
 
 **As a mapping's key.** `redact_obj` redacts a mapping's key and its value
@@ -348,7 +390,10 @@ left, and a bare generic key (`token`, `password`) is not recognised.
 one-letter prefix and a suffix: `A_TOKEN=x`, 9 to 22 characters (2.44),
 below the URL shape's 2.86, and `a_token=x` in lower case as well; a quoted
 value taken whole, across lines and doubled quotes too, is still at least
-one character (`a_token="x"`, 11 to 24). Every token
+one character (`a_token="x"`, 11 to 24), and one that spans lines a
+character and a line break. A value on the lines below a YAML key has the
+key's colon, a line break and an indentation besides (`a_token:\n x\n`, 12
+to 25, 2.08), and a block's header makes it longer. Every token
 shape is longer than the marker and only shrinks, a private-key block (43
 characters or more) included, and what a block holds between its BEGIN and
 END lines, like a quoted value, can take a marker only whole. A mapping's
@@ -362,16 +407,117 @@ Every pattern stays linear. A token shape scans one run of its alphabet,
 and the name rule one identifier and its value. A quoted value is read once
 to its close, and once more to its line's end when it spans lines and never
 closes; a later candidate's quote closes it, unless more backslashes escape
-that quote, which no more than eight candidates in a row can do. A
-lower-case name's unquoted word is read once: one that holds the next
-candidate's name is taken whole and not read again, and the code rule reads
-no further than the first word of a value it refuses. A private-key
+that quote, which no more than eight candidates in a row can do; a blank
+line, the other quote and a backtick no longer stop it, so a candidate of
+one quote reads the lines of a candidate of the other, each line twice at
+most. A lower-case name's unquoted word is read once: one that holds the
+next candidate's name is taken whole and not read again, and the code rule
+reads no further than the first word of a value it refuses. A private-key
 candidate scans to the next run of five dashes, where the next candidate
 starts, at most three times (its key-material lookahead steps over a run
-shorter than 16 whole, line breaks included). `tests/test_redaction.py` pins
-each shape, its near-misses, the order, the growth units and the linear
-bounds, and `test_result_parser.py`, `test_runlog.py`, `test_engine.py` and
+shorter than 16 whole, line breaks included). A YAML key's candidate reads
+its key, one line break and its value's lines once
+([below](#a-value-on-the-lines-below-a-yaml-key)), and the rounds are four
+at most ([below](#redaction-in-rounds-and-the-patterns-hints)).
+`tests/test_redaction.py` pins each shape, its near-misses, the order, the
+growth units and the linear bounds, and `test_result_parser.py`, `test_runlog.py`, `test_engine.py` and
 `test_cli.py` each class in every check and sink.
+
+### A value on the lines below a YAML key
+
+Until the third review of #285 a lower-case name's value had to be on the
+name's line, so a value on the lines below a YAML key (an indented scalar,
+a literal `|` or a folded `>` block) was never recognised, under any of the
+four suffixes: it reached every sink and passed every published-content and
+commit-message check. Two patterns now find one, the last two of all: under a well-known name, reported as
+`env-assignment`, any value; under a prefixed name, reported as
+`credential-suffix-assignment`, any value in upper case, and in lower case
+one that does not read as code.
+
+```yaml
+client_secret:          db_password: |          x_api_key: >-
+  <value>                 <line>                  <line>
+                          <line>                  <line>
+```
+
+- **The key starts its line**: after its indentation, a YAML sequence's
+  dashes (`- client_secret:`), as a quoted key (`"client_secret":`), or
+  right after an escape sequence (OpenCode's `ESC[0m`, a `\n` written out)
+  or a quote that starts a string (YAML in JSON). A statement that ends in
+  a colon does not (`if api_token:`, `while client_secret:`), so code
+  stays publishable. Nothing but a block's header, a tag (Ansible's
+  `!vault |`) and a comment follows its colon on its line.
+- **The value is on the lines indented more than the key**: a block's
+  lines, blank lines among them, to the first line that is not; a quoted
+  scalar, taken as on the key's line; a plain scalar's lines, each with no
+  mapping's `: ` in it, to a comment (` #`). A more indented line that is
+  a mapping (`valueFrom:`), a sequence, a comment, an anchor, a tag or a
+  code fence is another node, never the value.
+- **Under a lower-case name it does not read as code**, as on the key's
+  line: `${{ secrets.X }}`, `{{ vault_secret }}`, `$API_TOKEN`,
+  `process.env.API_TOKEN,`, `getToken(),`, `str,`, `None` stay. A block
+  that starts with a bracket (a JSON document) is not recognised under a
+  lower-case name either; under an upper-case one it is.
+- **What stays**: the key, its comment, a block's header, the line break
+  and the value's indentation; one marker replaces the value
+  (`db_password: |` then `  ***REDACTED***`), so the text still reads as
+  YAML, and the lines after the value stay.
+- **Written out**, as JSON, JSON in JSON and three deep write a YAML text,
+  a line break is the one the key's line ends in, behind as many
+  backslashes, and a line also ends where the string does, at a quote
+  behind fewer backslashes, so the JSON still decodes.
+
+They run last, after every pattern that can redact a part of such a
+value's lines: whether a line is a plain scalar depends on all of it, so a
+later pattern could leave a line that a second redaction would take whole.
+A value of a known shape on the next line is therefore reported by its own
+class, and a well-known or upper-case name's first word on the next line by
+the name's own pattern, which these complete: an unquoted value of several
+words is taken whole below a YAML key, where it is still one word on the
+key's line. No pattern before them takes a block's header for a value
+(`_BLOCK_AHEAD`), which left the block's lines in the clear. Each
+candidate starts at a line's start, an escape or a quote and reads its key,
+one line break and its value's lines once, so the pass is linear.
+
+### Redaction in rounds, and the patterns' hints
+
+A value's extent depends on the text around it: a quoted value spans lines
+to the first quote of its kind that closes it, and a YAML plain scalar is a
+line with no mapping's `: ` in it. A later pattern can redact a part of
+that text (a quote inside another value, a block that held one, a line a
+YAML value is on), and a second redaction then read differently what the
+first one left and changed it again, so `credential_classes` found a
+credential in text `redact` had already redacted; a generator of text where
+the patterns meet found such cases until the third review of #285, rare,
+and each a different meeting. `redact` now applies its patterns in rounds:
+a round that changed the text is followed by another, until one changes
+nothing (`_MAX_ROUNDS`, four at most), and `credential_classes` runs the
+same rounds, so what `redact` returns is what redacting it again returns. A
+text with nothing to redact takes one round, as before, and one with a
+credential takes a second, which changes nothing unless such a meeting
+occurred; no text met in testing needed more than two. The rounds compound
+no growth: each replaces a run of text that is no marker, beside text it
+keeps, as one round does, so `MAX_GROWTH_FACTOR` holds over them. The
+generator (`test_redact_is_stable_where_the_patterns_meet`) and the cases
+it found are pinned, and the OAuth and prefixed-name values agree within
+one round already ([above](#the-remaining-credential-shapes-285)).
+
+So that a second round costs no more than the patterns used to, a pattern
+may name a hint (`_Pattern.hint`, and `name_hint` for a second one): what
+every match of its passes holds, a token shape's literal prefix
+(`-----BEGIN `, `eyJ`, `AIza`, `glpat-`, `gh[pousr]_`, `sk-`, `A[KS]IA`,
+...), a URL's `://`, `Authorization`, a prefixed name's suffix
+(`_token`, in any case), a well-known name's last `_` with the character
+before it and the segment after it (derived from the names), and a YAML
+key's colon before what ends its line. A text without it has no match, and
+the pattern's passes are skipped; a search led by a literal runs far faster
+than a pattern that starts with a lookbehind, so a log with no credential
+is redacted in a fraction of the time it took, and one with a credential,
+two rounds and all, in about the time one round took. Every hint is checked against the
+test corpus, its JSON and its escaped repeats, and against every growth
+unit: no pass of a pattern finds anything where its hint is not found. A
+new pattern needs no hint; one it names must be what each of its matches
+holds.
 
 ## Escaped text: redact the structure first (#281)
 

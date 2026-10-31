@@ -87,6 +87,7 @@ from tests.conftest import (
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
     WHOLE_VALUES_285,
+    WHOLE_VALUES_285_R3,
     block,
     comment_url,
 )
@@ -2590,6 +2591,15 @@ def test_a_285_shape_is_refused_by_every_published_content_check(cls, text, body
         "`max_token: 4096` and `use_token: true` are settings, `api_token=None` a default.",
         # A BEGIN line and a placeholder on the lines after it.
         f"Paste it as\n\n```\n{PEM_BEGIN}\n<your key>\n...\n{PEM_END}\n```",
+        # Round 3: a statement that ends in a colon is no YAML key, and a
+        # line under a key that is a mapping, a reference or a placeholder
+        # is no value; a quote that closes a string literal opens none.
+        "```python\nif api_token:\n    headers2 = build(1)\nwhile client_secret:\n    x = 1\n```",
+        "```yaml\nclient_secret:\n  valueFrom:\n    secretKeyRef:\n      name: app\n```",
+        "```yaml\nclient_secret:\n  ${{ secrets.CLIENT_SECRET }}\n"
+        "db_password: |\n  {{ vault }}\n```",
+        "```js\nconst cfg = {\n  api_token:\n    process.env.API_TOKEN,\n};\n```",
+        '```python\nfield = "Set GITHUB_TOKEN="\nx = \'a\'\n\ny = "/tmp"\n```',
     ],
     ids=[
         "pem-header",
@@ -2606,6 +2616,11 @@ def test_a_285_shape_is_refused_by_every_published_content_check(cls, text, body
         "lower-case-placeholders",
         "lower-case-settings",
         "pem-placeholder",
+        "round-3-statements",
+        "round-3-nested-mapping",
+        "round-3-references",
+        "round-3-code-values",
+        "round-3-string-literals",
     ],
 )
 def test_text_about_the_285_shapes_is_still_publishable(text):
@@ -2629,6 +2644,9 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
         # punctuation or form-encoded, and a quoted value that spans lines
         # or holds a doubled quote.
         *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285),
+        # Round 3: a quoted value whose lines hold a blank line, the other
+        # quote or a backtick, and a value on the lines below its key.
+        *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285_R3),
     ],
     ids=[
         "short-wrapped-key",
@@ -2636,6 +2654,7 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
         "lower-case-quoted",
         "mixed-case",
         *(f"round-2-{name}" for name, _, _ in WHOLE_VALUES_285),
+        *(f"round-3-{name}" for name, _, _ in WHOLE_VALUES_285_R3),
     ],
 )
 def test_a_shape_the_285_review_found_is_refused_by_every_published_content_check(cls, text, body):

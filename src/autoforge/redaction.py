@@ -16,9 +16,13 @@ quoted value is recognised behind an escaped quote too
 (``GH_TOKEN=\\"...\\"``, as JSON writes it; see ``_QUOTE``) and replaced
 whole, to its closing quote, a later line's too (``_QUOTED_VALUE``), and a
 named assignment or header under a quoted key (``"GITHUB_TOKEN": "..."``,
-``"Authorization": "Bearer ..."``). :func:`redact_obj` knows a credential's
+``"Authorization": "Bearer ..."``). A credential name's value on the lines
+below it, as YAML writes one (an indented scalar, a ``|`` or ``>`` block),
+is recognised too (``_yaml_value``). :func:`redact_obj` knows a credential's
 name as a mapping's key too (``{"GEMINI_API_KEY": "..."}``).
 A line that starts a code fence is never a value (``_SPACE_TO_VALUE``).
+:func:`redact` applies the patterns in rounds until one changes nothing
+(``_MAX_ROUNDS``), so what it returns is what redacting it again returns.
 
 Every pattern has a stable class name. :func:`credential_classes` reports
 which classes a text carries without saying where, so a refusal of agent
@@ -38,7 +42,15 @@ class _Pattern(NamedTuple):
     ``regex`` finds the shape and ``replacement`` rewrites it. A shape that
     starts a token (:func:`_token`) has a second pass, ``after_escape``,
     which finds it directly after an escape sequence and keeps that sequence
-    through ``escape_replacement``; the others have none.
+    through ``escape_replacement``; the others have none. ``hint``, when
+    set, finds what every match of either pass holds (a token's literal
+    prefix, a YAML key's colon before a line break): a text without it has
+    no match, and the pattern's passes are skipped (#285 review, round 3);
+    ``name_hint``, when set, is a second such hint that a match holds too
+    (a YAML key's name).
+    A hint is a literal search, which the regex engine runs far faster than
+    a pattern that starts with a lookbehind, so a round costs less, and a
+    text with something to redact takes a second round (``_MAX_ROUNDS``).
     """
 
     name: str
@@ -46,6 +58,8 @@ class _Pattern(NamedTuple):
     replacement: str
     after_escape: re.Pattern[str] | None = None
     escape_replacement: str = ""
+    hint: re.Pattern[str] | None = None
+    name_hint: re.Pattern[str] | None = None
 
 
 # Where a recognised credential may start (#284). There is no regex word
@@ -124,12 +138,26 @@ _WORD_BACKSLASH = r"\\(?!\\{0,6}[\"'nrt])"
 # Each line break is tried once, so the scan stays linear.
 _SPACE_TO_VALUE = r"(?:[^\S\r\n]*|\s*[\r\n][^\S\r\n]*(?!`{3}|~{3}))"
 # A named assignment's value, its opening quote (``vbs``, the backslashes
-# before it, up to seven as ``_QUOTE`` takes, and ``vq``, the quote) optional.
-_VALUE_OPEN = r"((?P<vbs>\\{0,7})(?P<vq>[\"']))?"
+# before it, up to seven as ``_QUOTE`` takes, and ``vq``, the quote) optional:
+# group ``open``.
+_VALUE_QUOTE = r"(?P<open>(?P<vbs>\\{0,7})(?P<vq>[\"']))"
+_VALUE_OPEN = rf"{_VALUE_QUOTE}?"
+# A YAML block scalar's header (#285 review, round 3): ``|`` (literal) or
+# ``>`` (folded), its chomping and indentation indicators (``|-``, ``>+2``),
+# after an optional tag (Ansible's ``!vault |``), and a comment. Its value is
+# the more indented lines below it (``_yaml_value``), so an unquoted value
+# never starts with a header that ends its line (``_BLOCK_AHEAD``): it took
+# the ``|`` for the value and left the block's lines, the secret, in the clear.
+_BLOCK_HEADER = r"(?:![^\s\\]*+[^\S\r\n]++)?[|>](?:[1-9][-+]?|[-+][1-9]?)?+"
+_YAML_COMMENT = r"(?:[^\S\r\n]++#(?:[^\r\n\\]|\\(?!\\{0,6}[rn]))*+)?"
+_BLOCK_AHEAD = rf"{_BLOCK_HEADER}{_YAML_COMMENT}[^\S\r\n]*+(?:[\r\n]|\\{{1,7}}[rn]|\Z)"
 # A value no quote opens ends at a space, a quote, a semicolon, a backslash
 # that starts an escaped closing quote and, after its first character, a line
 # break or a tab written out.
-_UNQUOTED_VALUE = rf"(?:[^\s\"';\\]|{_VALUE_BACKSLASH})(?:[^\s\"';\\]|{_WORD_BACKSLASH})*"
+_UNQUOTED_VALUE = (
+    rf"(?!{_BLOCK_AHEAD})"
+    rf"(?:[^\s\"';\\]|{_VALUE_BACKSLASH})(?:[^\s\"';\\]|{_WORD_BACKSLASH})*"
+)
 # A value a quote opens is taken whole (#285): it runs to the quote that
 # closes it, spaces, semicolons and the other quote character included, so
 # ``DB_PASSWORD="correct horse; battery"`` is replaced entire where the value
@@ -141,21 +169,33 @@ _UNQUOTED_VALUE = rf"(?:[^\s\"';\\]|{_VALUE_BACKSLASH})(?:[^\s\"';\\]|{_WORD_BAC
 # and a shell joins two strings; #285 review).
 #
 # A value runs across line breaks to its closing quote (``_QUOTED_SPAN``,
-# #285 review), as a shell string and a YAML flow scalar do, as long as what
-# it spans reads as one string: no blank line, no line that starts a code
-# fence (which ``_SPACE_TO_VALUE`` never takes either), no backtick, no
-# unescaped quote of the other kind, and a closing quote that no letter,
-# digit or ``_`` follows. A quote that opens no value does not take the lines
-# after it: the end of a string literal in code
-# (``print('GH_TOKEN=' + read("f"))``), one in a Markdown code span
-# (``DEPLOY_SECRET="-----BEGIN ...``), each meets one of those before a quote
-# of its kind closes it, and so does the code a prompt, a log or an agent's
-# read context quotes. A value that does not span lines, or whose closing
-# quote never comes (the end of the text, or the same quote behind fewer
-# backslashes, which closes the string an escaped value stands in:
-# ``"GH_TOKEN=\"abc"``), is the rest of its line up to that quote
-# (``_QUOTED_LINE``), the other quote and a backtick included, as before: an
-# unterminated value goes as far as its line or its string and no further.
+# #285 review), as a shell string and a YAML flow scalar do, whatever its
+# lines hold: blank lines, the other quote character and backticks included
+# (#285 review, round 3: a valid value holding one of those kept every line
+# after its first in the clear). Its closing quote is the first quote of its
+# kind that nothing escapes; what tells it from a quote that opens no value is
+# where the quotes stand:
+#
+# - the closing quote is followed by no letter, digit, ``_`` or ``*`` (the
+#   marker's first character, so that a value redacted after it reads the
+#   same): a quote that a word follows opens the next string, as a quote in
+#   code or prose after a cut value does (``say "this"``, ``log('done')``);
+# - the value's first line holds something: a quote that ends its line closes
+#   a string literal (``field = "Set GITHUB_TOKEN="``) more often than it
+#   opens a value that starts with a line break;
+# - the name does not stand right after a quote or a backtick, unless it is a
+#   quoted key (``_IN_STRING``): there it starts a string literal or a code
+#   span (``print('GH_TOKEN=' + read("f"))``, a Markdown code span opened
+#   right before ``DEPLOY_SECRET="...``), and the quote after its separator
+#   closes that string, not a value;
+# - no line it spans starts a code fence, which ``_SPACE_TO_VALUE`` never
+#   takes either.
+#
+# A value that does not span lines, or whose closing quote never comes (the
+# end of the text, or the same quote behind fewer backslashes, which closes
+# the string an escaped value stands in: ``"GH_TOKEN=\"abc"``), is the rest of
+# its line up to that quote (``_QUOTED_LINE``), as before: an unterminated
+# value goes as far as its line or its string and no further.
 # A run of backslashes is taken whole and every alternative is possessive,
 # so each of the two reads a character once, and a candidate that fails does
 # so at its first character.
@@ -164,25 +204,37 @@ _QUOTED_ESCAPE = (
     r"|(?P=vbs)\\+[\"']"
     r"|(?P=vbs)(?P=vq)(?P=vbs)(?P=vq)"
 )
+# One character of a quoted value on its line: any but a line break and the
+# closing quote, an escape and the other quote (behind any backslashes) included.
+_QUOTED_CHAR = rf"(?:[^\\\"'\r\n]|{_QUOTED_ESCAPE}|\\*+(?!(?P=vq))[\"'])"
+_QUOTED_LINE = rf"{_QUOTED_CHAR}++"
 _QUOTED_SPAN = (
-    r"(?:[^\\\"'`\r\n]"
-    r"|(?:\r\n?|\n)(?![^\S\r\n]*+(?:[\r\n]|`{3}|~{3}))"
-    rf"|{_QUOTED_ESCAPE}"
-    r")++(?=(?P=vbs)(?P=vq)(?!\w))"
+    rf"(?![\r\n])(?:{_QUOTED_CHAR}|(?:\r\n?|\n)(?![^\S\r\n]*+(?:`{{3}}|~{{3}})))++"
+    r"(?=(?P=vbs)(?P=vq)(?![\w*]))"
 )
-_QUOTED_LINE = rf"(?:[^\\\"'\r\n]|{_QUOTED_ESCAPE}|\\*+(?!(?P=vq))[\"'])++"
 _QUOTED_VALUE = rf"(?:{_QUOTED_SPAN}|{_QUOTED_LINE})"
+# Whether the name stands right after a quote or a backtick (group ``inq``),
+# and the closing quote of a quoted key (group ``kq``, escaped as ``_QUOTE``
+# takes one). A name right after a quote that is no quoted key's starts a
+# string literal, and its quoted value is its line only (``_QUOTED_VALUE``).
+_IN_STRING = r"(?:(?<=[\"'`])(?P<inq>))?"
+_KEY_QUOTE = r"(?P<kq>\\{0,7}[\"'])?"
+_GUARDED_QUOTED_VALUE = rf"(?(inq)(?(kq){_QUOTED_VALUE}|{_QUOTED_LINE})|{_QUOTED_VALUE})"
 # The closing quote of a value a quote opened, absent when the value was cut
-# short; ``_QUOTE``, as before, after one no quote opened.
-_VALUE_CLOSE = rf"((?(vq)(?:(?P=vbs)(?P=vq))?|{_QUOTE}))"
+# short; ``_QUOTE``, as before, after one no quote opened: group ``close``.
+_VALUE_CLOSE = rf"(?P<close>(?(vq)(?:(?P=vbs)(?P=vq))?|{_QUOTE}))"
 # A named assignment after its name: the separator (the name's closing quote,
 # when it is a quoted key, kept with it), the value's optional opening quote
 # (its backslashes and quote are groups of their own), the value and its
-# closing quote: groups 2, 3, 6 and 7 of a pattern whose name is group 1.
+# closing quote: groups ``sep``, ``open``, ``val`` and ``close`` of a pattern
+# whose name is group ``name`` and that starts with ``_IN_STRING``.
 _NAMED_VALUE = (
-    rf"({_QUOTE}\s*[:=]{_SPACE_TO_VALUE}){_VALUE_OPEN}"
-    rf"((?(vq){_QUOTED_VALUE}|{_UNQUOTED_VALUE})){_VALUE_CLOSE}"
+    rf"(?P<sep>{_KEY_QUOTE}\s*[:=]{_SPACE_TO_VALUE}){_VALUE_OPEN}"
+    rf"(?P<val>(?(vq){_GUARDED_QUOTED_VALUE}|{_UNQUOTED_VALUE})){_VALUE_CLOSE}"
 )
+# What replaces a named assignment's value: the name, the separator and the
+# quotes stay.
+_NAMED_REPLACEMENT = r"\g<name>\g<sep>\g<open>***REDACTED***\g<close>"
 # The well-known credential variable names ``env-assignment`` recognises, in
 # any case; :func:`redact_obj` knows them as a mapping's keys too.
 _ENV_NAMES = (
@@ -190,7 +242,16 @@ _ENV_NAMES = (
     r"OPENCODE_API_KEY|GITLAB_TOKEN|HF_TOKEN|SLACK_TOKEN|AWS_SECRET_ACCESS_KEY|"
     r"ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENCODE_SERVER_PASSWORD"
 )
-# A name with a credential suffix behind a prefix (#285), group 1 of
+# What every well-known name holds (``_Pattern.hint``): the last ``_``, the
+# character before it and the segment after it (``B_TOKEN`` of
+# ``GITHUB_TOKEN``), led by the literal ``_``, which the regex engine scans for
+# far faster than for the names themselves; derived from the names, so it
+# holds for every one of them.
+_ENV_HINT = "(?i)_(?<=[{}]_)(?:{})".format(
+    "".join(sorted({name.rsplit("_", 1)[0][-1].lower() for name in _ENV_NAMES.split("|")})),
+    "|".join(sorted({name.rsplit("_", 1)[1].lower() for name in _ENV_NAMES.split("|")})),
+)
+# A name with a credential suffix behind a prefix (#285), the name of
 # ``credential-suffix-assignment``. Upper case (``GEMINI_API_KEY``, group
 # ``upper``) is an environment variable's, whose value is anything, as a
 # well-known name's is. Lower or mixed case (``client_secret``,
@@ -199,9 +260,11 @@ _ENV_NAMES = (
 # (``_LITERAL_VALUE``). Both stop where the identifier does, so a candidate
 # reads one identifier.
 _SUFFIX_NAME = (
-    r"((?P<upper>[A-Z][A-Z0-9_]*_(?:API_KEY|TOKEN|SECRET|PASSWORD))"
+    r"(?:(?P<upper>[A-Z][A-Z0-9_]*_(?:API_KEY|TOKEN|SECRET|PASSWORD))"
     r"|[A-Za-z][A-Za-z0-9_]*_(?i:api_key|token|secret|password))"
 )
+# What every such name holds (``_Pattern.hint``): its suffix.
+_SUFFIX_HINT = "(?i)_(?:api_key|token|secret|password)"
 # Where a lower- or mixed-case name's unquoted value ends (#285 review): at a
 # space, a quote, a backtick, a semicolon, the ``&`` that starts a form
 # body's next field (``_FIELD_NAME``) and the end of the text. A run of
@@ -270,13 +333,121 @@ _FIELD_NAME = r"[A-Za-z0-9_.~%+\[\]-]*+="
 # again; only a candidate the code rule refuses fails, at the first word of
 # its value, so the pass stays linear.
 _LITERAL_VALUE = (
-    rf"(?!{_CODE_VALUE})"
+    rf"(?!{_CODE_VALUE}|{_BLOCK_AHEAD})"
     r"(?:[^\s\"'`;&\\,.:)\]}]"
     rf"|&(?!{_FIELD_NAME})"
     rf"|{_TRAIL}++(?=[^\s\"'`;&])"
     rf"|{_WORD_BACKSLASH}"
     r")++"
 )
+
+# The unquoted value of an OAuth assignment (``oauth-assignment``), which
+# ends where a lower-case prefixed name's word does (#285 review, round 3):
+# also at a backtick, and before a run of full stops, colons and closing
+# brackets that one of its ends follows; and, as before, at a comma and any
+# ``&``. Every OAuth name but ``chatgpt-account-id`` is also a prefixed name
+# (``refresh_token``), whose rule runs after it and replaces a value this one
+# leaves; the value it took used to run on over what that rule leaves after
+# the marker (``refresh_token=,word.`` lost its full stop), so a second
+# redaction changed the first one's output.
+_OAUTH_TRAIL = r"[.:)\]}]++(?=[^\s\"'`;,&])"
+_OAUTH_VALUE = (
+    rf"(?!{_BLOCK_AHEAD})"
+    rf"(?:[^\s\"'`;,&\\.:)\]}}]|{_VALUE_BACKSLASH}|{_OAUTH_TRAIL})"
+    rf"(?:[^\s\"'`;,&\\.:)\]}}]|{_WORD_BACKSLASH}|{_OAUTH_TRAIL})*+"
+)
+
+# A credential name's value on the lines below it, as YAML writes one (#285
+# review, round 3): a key at the start of its line, alone on it, with an
+# indented scalar under it, or a block scalar after its ``|`` or ``>``. A
+# lower-case name's value on the same line had to be there, so a value on the
+# next line, the opaque scalars and blocks a configuration file holds, was
+# never recognised, in any sink or check:
+#
+#     client_secret:          db_password: |          x_api_key: >-
+#       <value>                 <line>                  <line>
+#                               <line>                  <line>
+#
+# The key starts its line (``ind`` is its indentation), after a YAML
+# sequence's dashes and as a quoted key too, or right after an escape
+# sequence (ANSI's, a ``\n`` written out) or a quote that starts a string (a
+# YAML text in JSON); a statement does not (``if api_token:``), so code stays
+# publishable. Its value is on the lines indented more than the key:
+#
+# - a block scalar's lines, blank lines among them, to the first line that is
+#   not, replaced by one marker on its first line's indentation;
+# - a quoted scalar, taken as on the key's line (``_QUOTED_VALUE``);
+# - a plain scalar: lines that start with no indicator of another node (a
+#   sequence's dash, a flow collection, a comment, an anchor or a tag) and
+#   hold no mapping's ``: ``, to a comment (`` #``); a line that does is the
+#   next node, never the value.
+#
+# A lower-case name's value must not read as code (``_CODE_VALUE``) here too
+# (``${{ secrets.X }}``, ``{{ vault_secret }}``, ``process.env.API_TOKEN,``);
+# an upper-case or a well-known name's is anything. A line break is the one
+# the key's line ends in, as written or written out behind up to seven
+# backslashes (group ``ybs``, as JSON, JSON in JSON and three deep write it);
+# written out, a line also ends where the string does, at a quote behind
+# fewer backslashes. Each candidate starts at a line's start, an escape or a
+# quote and reads its key, one line break and the lines of its value, each
+# once: every loop is possessive, so a candidate that fails does so at the
+# start of its value.
+_YAML_LEAD = (
+    rf"(?P<lead>(?:^|{_ESCAPE}|(?<=[\"']))"
+    r"(?P<ind>[^\S\r\n]*+)(?:-[^\S\r\n]++)*+(?P<kq>\\{0,7}[\"'])?)"
+)
+_YAML_BREAK = r"(?(ybs)(?P=ybs)(?:r(?P=ybs))?n|\r?\n)"
+# A character of a line written out (``ybs``): any but a backslash and a
+# quote, a quote behind ``ybs`` backslashes or more, and a run of backslashes
+# that is neither the line break nor the start of the string's closing quote.
+_YAML_WRITTEN = r"(?:[^\\\"\r\n]|(?P=ybs)\\*+\"|(?!(?P=ybs)[nr])\\++(?!\"))"
+_YAML_UNIT = rf"(?(ybs){_YAML_WRITTEN}|[^\r\n])"
+_YAML_EOL = rf"(?!{_YAML_UNIT})"
+_YAML_CHAR = rf"(?:(?![^\S\r\n]|:(?:[^\S\r\n]|{_YAML_EOL})){_YAML_UNIT})"
+_YAML_WORDS = rf"{_YAML_CHAR}++(?:[^\S\r\n]++(?!#){_YAML_CHAR}++)*+"
+_YAML_LINE_END = rf"(?=(?:[^\S\r\n]++#{_YAML_UNIT}*+)?[^\S\r\n]*+{_YAML_EOL})"
+# What a plain scalar cannot start with: another node's indicator, a quote
+# (a quoted scalar is matched as one), a code fence.
+_YAML_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_YAML_EOL})|[\[\]{{}},#&!|>%@`\"']|\\++[\"']|~{{3}}"
+
+
+# What every key with a value below it holds: its colon, then a block's
+# header, a tag, a comment or the line break, as written or written out.
+_YAML_HINT = re.compile(r":[^\S\r\n]*+[|>!#\r\n\\]")
+
+
+def _yaml_value(name: str, names: str, code_check: str, name_hint: str) -> _Pattern:
+    """The pattern for a credential name's value on the lines below it.
+
+    ``names`` is the name's regex, ``code_check`` what a value must not start
+    with (empty for a name whose value is anything), ``name_hint`` what every
+    name holds (``_Pattern.hint``). The key, its separator, a block's header,
+    the line break and the value's indentation stay; the value is replaced.
+    """
+    regex = (
+        rf"(?m){_YAML_LEAD}(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:)"
+        rf"(?P<hdr>(?P<blk>[^\S\r\n]++{_BLOCK_HEADER}))?"
+        rf"(?P<gap>{_YAML_COMMENT}[^\S\r\n]*+(?:\r?\n|(?P<ybs>\\{{1,7}})(?:r(?P=ybs))?n))"
+        rf"(?P<blank>(?(blk)(?:[^\S\r\n]*+{_YAML_BREAK})*+))"
+        r"(?P<vind>(?P=ind)[^\S\r\n]++)"
+        r"(?(blk)"
+        rf"{code_check}{_YAML_UNIT}++"
+        rf"(?:(?:{_YAML_BREAK}[^\S\r\n]*+(?={_YAML_BREAK}))*+"
+        rf"{_YAML_BREAK}(?P=ind)[^\S\r\n]++{_YAML_UNIT}++)*+"
+        rf"|(?:{_VALUE_QUOTE}{_QUOTED_VALUE}"
+        r"(?P<close>(?:(?P=vbs)(?P=vq))?)"
+        rf"|(?!{_YAML_NOT_PLAIN}){code_check}{_YAML_WORDS}{_YAML_LINE_END}"
+        rf"(?:{_YAML_BREAK}(?P=ind)[^\S\r\n]++(?!#){_YAML_WORDS}{_YAML_LINE_END})*+"
+        r"))"
+    )
+    return _Pattern(
+        name,
+        re.compile(regex),
+        r"\g<lead>\g<name>\g<sep>\g<hdr>\g<gap>\g<blank>\g<vind>\g<open>***REDACTED***\g<close>",
+        hint=_YAML_HINT,
+        name_hint=re.compile(name_hint),
+    )
+
 
 # A private-key block (#285), as PEM (RFC 7468) writes one and OpenSSH and
 # OpenPGP's armour borrow: a ``-----BEGIN <label>-----`` line, the key's
@@ -319,7 +490,13 @@ _PEM_SHORT_RUN = rf"(?:{_PEM_B64}(?:{_PEM_WRAP})?+){{1,15}}+(?!{_PEM_B64})"
 
 
 def _token(
-    name: str, body: str, replacement: str, *, flags: str = "", token_chars: str = "A-Za-z0-9_"
+    name: str,
+    body: str,
+    replacement: str,
+    *,
+    flags: str = "",
+    token_chars: str = "A-Za-z0-9_",
+    hint: str | None = None,
 ) -> _Pattern:
     """The pattern for a shape that starts a token, by the rule above.
 
@@ -328,6 +505,8 @@ def _token(
     sequence, taken in as the ``lead`` group, and ``escape_replacement``
     puts that back before ``replacement``, whose ``\\N`` references move one
     group on past it. A new pattern is built here, never on ``\\b``.
+    ``hint`` is a regex for what ``body`` always holds, matched with the
+    same case as ``body`` (``_Pattern``).
     """
     return _Pattern(
         name,
@@ -335,6 +514,7 @@ def _token(
         replacement,
         re.compile(rf"{flags}(?P<lead>{_ESCAPE}){body}"),
         r"\g<lead>" + re.sub(r"\\(\d+)", lambda m: rf"\g<{int(m[1]) + 1}>", replacement),
+        None if hint is None else re.compile(hint),
     )
 
 
@@ -343,11 +523,13 @@ def _token(
 _OAUTH_FIELD_NAMES = r"refresh|access|(?:refresh|access|id)_token|chatgpt[-_]account[-_]id"
 
 # Applied in this order, each to the previous one's output, a pattern's
-# ``after_escape`` pass right after its ``regex``; the order is part of
-# :func:`redact`'s output and of the class :func:`credential_classes`
-# reports. An ``sk-ant-`` key with at least eight characters after ``sk-`` is
-# replaced by ``openai-key`` before ``anthropic-key`` sees it, so it is
-# reported under that class.
+# ``after_escape`` pass right after its ``regex``, in rounds until one
+# changes nothing (``_MAX_ROUNDS``); the order is part of :func:`redact`'s
+# output and of the class :func:`credential_classes` reports. Two classes
+# have two patterns each: a name's value on its line, and on the lines below
+# it (``_yaml_value``, last). An ``sk-ant-`` key with at least eight
+# characters after ``sk-`` is replaced by ``openai-key`` before
+# ``anthropic-key`` sees it, so it is reported under that class.
 _PATTERNS: tuple[_Pattern, ...] = (
     # A private-key block (#285), replaced whole: BEGIN line, body and END
     # line. Without an END line before the next run of five dashes, the BEGIN
@@ -371,6 +553,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
         rf"|(?=(?:{_PEM_GAP}|=|{_PEM_SHORT_RUN})*+{_PEM_KEY}){_PEM_BODY})",
         "***REDACTED***",
         token_chars="-",
+        hint="-----BEGIN ",
     ),
     # VAR=secret / VAR: secret assignments for well-known names. The name may
     # be a quoted key (#393): JSON, a Python mapping's repr and a TOML quoted
@@ -381,9 +564,10 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # (#285, ``_QUOTED_VALUE``).
     _token(
         "env-assignment",
-        rf"({_ENV_NAMES}){_NAMED_VALUE}",
-        r"\1\2\3***REDACTED***\7",
+        rf"{_IN_STRING}(?P<name>{_ENV_NAMES}){_NAMED_VALUE}",
+        _NAMED_REPLACEMENT,
         flags="(?i)",
+        hint=_ENV_HINT,
     ),
     # Authorization: Bearer <token> / Token <token> / Basic <base64>, also as
     # a quoted key and value (``"Authorization": "Bearer ..."``, a headers
@@ -395,6 +579,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
         rf"((?:[^\s\"';\\]|{_VALUE_BACKSLASH})+)",
         r"\1***REDACTED***",
         flags="(?i)",
+        hint="(?i)authorization",
     ),
     # Credentials embedded in a URL: everything between ``scheme://`` and
     # ``@`` (``https://x-access-token:<token>@github.com/...``,
@@ -412,6 +597,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
         r"([a-z][a-z0-9+.-]{1,31}://)[^\s/?#@]+@",
         r"\1***REDACTED***@",
         flags="(?i)",
+        hint="://",
     ),
     # JWTs: three base64url segments, the first a ``{"`` JSON header. Only
     # the header has a floor: ``eyJ`` is ``{"`` plus the first key character,
@@ -430,6 +616,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
         r"eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*",
         "***REDACTED***",
         token_chars="A-Za-z0-9_-",
+        hint="eyJ",
     ),
     # Google API keys (#282): ``AIza`` and 35 base64url characters, 39 in all,
     # the key OpenCode launches inherit under ``GEMINI_*`` and ``GOOGLE_*``
@@ -447,6 +634,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
         r"AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])",
         "***REDACTED***",
         token_chars="A-Za-z0-9_-",
+        hint="AIza",
     ),
     # GitLab personal, project and group access tokens (#285): ``glpat-`` and
     # at least 20 characters of ``[A-Za-z0-9_-]``, the length of the legacy
@@ -460,15 +648,21 @@ _PATTERNS: tuple[_Pattern, ...] = (
         r"glpat-[A-Za-z0-9_-]{20,}",
         "***REDACTED***",
         token_chars="A-Za-z0-9_-",
+        hint="glpat-",
     ),
     # GitHub fine-grained PATs
-    _token("github-fine-grained-pat", r"github_pat_[A-Za-z0-9_]{8,}", "***REDACTED***"),
+    _token(
+        "github-fine-grained-pat",
+        r"github_pat_[A-Za-z0-9_]{8,}",
+        "***REDACTED***",
+        hint="github_pat_",
+    ),
     # GitHub classic PATs and app / OAuth tokens
-    _token("github-token", r"gh[pousr]_[A-Za-z0-9_]{8,}", "***REDACTED***"),
+    _token("github-token", r"gh[pousr]_[A-Za-z0-9_]{8,}", "***REDACTED***", hint="gh[pousr]_"),
     # OpenAI-style sk- keys (incl. project variant sk-proj-...)
-    _token("openai-key", r"sk-(?:proj-)?[A-Za-z0-9_-]{8,}", "***REDACTED***"),
+    _token("openai-key", r"sk-(?:proj-)?[A-Za-z0-9_-]{8,}", "***REDACTED***", hint="sk-"),
     # Anthropic keys
-    _token("anthropic-key", r"sk-ant-[A-Za-z0-9_-]{8,}", "***REDACTED***"),
+    _token("anthropic-key", r"sk-ant-[A-Za-z0-9_-]{8,}", "***REDACTED***", hint="sk-ant-"),
     # The shapes below (#285) run after the ``sk-`` ones, whose alphabet holds
     # ``-``: a shape that may start after a ``-`` would otherwise replace a
     # slice of such a key. Each is case-sensitive. A prefixed one takes at
@@ -480,9 +674,14 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # one) and 16 characters of ``[A-Z0-9]``, 20 in all, the whole token: a
     # run that goes on is no key id. The secret key that goes with one has no
     # shape of its own; ``AWS_SECRET_ACCESS_KEY`` names it.
-    _token("aws-access-key-id", r"A[KS]IA[A-Z0-9]{16}(?![A-Za-z0-9_])", "***REDACTED***"),
+    _token(
+        "aws-access-key-id",
+        r"A[KS]IA[A-Z0-9]{16}(?![A-Za-z0-9_])",
+        "***REDACTED***",
+        hint="A[KS]IA",
+    ),
     # Groq API keys: ``gsk_`` and 52 characters of ``[A-Za-z0-9]``.
-    _token("groq-api-key", r"gsk_[A-Za-z0-9]{20,}", "***REDACTED***"),
+    _token("groq-api-key", r"gsk_[A-Za-z0-9]{20,}", "***REDACTED***", hint="gsk_"),
     # xAI API keys: ``xai-`` and 80 characters of ``[A-Za-z0-9_]``. ``-`` is a
     # token character before it, as for a GitLab token, so that a kebab-case
     # word (``grok-xai-...``) holds none.
@@ -491,11 +690,12 @@ _PATTERNS: tuple[_Pattern, ...] = (
         r"xai-[A-Za-z0-9_]{20,}",
         "***REDACTED***",
         token_chars="A-Za-z0-9_-",
+        hint="xai-",
     ),
     # npm access tokens: ``npm_`` and 36 characters of ``[A-Za-z0-9]``.
-    _token("npm-token", r"npm_[A-Za-z0-9]{20,}", "***REDACTED***"),
+    _token("npm-token", r"npm_[A-Za-z0-9]{20,}", "***REDACTED***", hint="npm_"),
     # Hugging Face access tokens: ``hf_`` and 34 letters.
-    _token("huggingface-token", r"hf_[A-Za-z0-9]{20,}", "***REDACTED***"),
+    _token("huggingface-token", r"hf_[A-Za-z0-9]{20,}", "***REDACTED***", hint="hf_"),
     # Generic long bearer-ish assignments: token/password/secret = <value>,
     # the name also as a quoted key (``"api_key": "..."``, #393).
     # ``_`` is a token character before the name, so a prefixed one
@@ -532,18 +732,18 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token(
         "oauth-assignment",
         r"((?:refresh|access|id)_token|chatgpt[-_]account[-_]id)"
-        rf"(\s*[:=]{_SPACE_TO_VALUE})({_QUOTE})(?:[^\s\"';,&\\]|{_VALUE_BACKSLASH})"
-        rf"(?:[^\s\"';,&\\]|{_WORD_BACKSLASH})*",
+        rf"(\s*[:=]{_SPACE_TO_VALUE})({_QUOTE}){_OAUTH_VALUE}",
         r"\1\2\3***REDACTED***",
         flags="(?i)",
         token_chars="A-Za-z0-9",
+        hint="(?i)_token|chatgpt",
     ),
     # Bare ``refresh=`` / ``access=`` with a token-length value. Those words
     # are ordinary prose, so only an ``=`` assignment of at least 16
     # characters counts; ``access: denied`` and ``refresh=true`` stay.
     _token(
         "oauth-bare-assignment",
-        rf"(refresh|access)(=)({_QUOTE})(?:[^\s\"';,&\\]|{_VALUE_BACKSLASH}){{16,}}",
+        rf"(refresh|access)(=)({_QUOTE})(?:[^\s\"';,&\\*]|{_VALUE_BACKSLASH}){{16,}}",
         r"\1\2\3***REDACTED***",
         flags="(?i)",
     ),
@@ -561,23 +761,45 @@ _PATTERNS: tuple[_Pattern, ...] = (
     #   (``def f(api_token: str)``, ``api_token=api_token``), so its value,
     #   on the same line, is a quoted one (a string literal, a JSON or YAML
     #   string) or an unquoted word that does not read as code
-    #   (``_LITERAL_VALUE``), whatever its characters.
+    #   (``_LITERAL_VALUE``), whatever its characters. Its value on the lines
+    #   below a YAML key is the last pattern's (``_yaml_value``).
     #
-    # A quoted value is replaced whole (``_QUOTED_VALUE``) either way. Last,
-    # so a value of a known shape is reported by its own class, a well-known
-    # name is ``env-assignment``'s and an OAuth name (``access_token``,
-    # ``oauth_refresh_token``) an OAuth pattern's; what such a pattern left of
-    # a quoted value (the part after a space) is replaced here. A candidate
+    # A quoted value is replaced whole (``_QUOTED_VALUE``) either way. After
+    # every pattern but the YAML ones, so a value of a known shape is
+    # reported by its own class, a well-known name is ``env-assignment``'s
+    # and an OAuth name (``access_token``, ``oauth_refresh_token``) an OAuth
+    # pattern's; what such a pattern left of a quoted value (the part after a
+    # space, or after its first line) is replaced here. A candidate
     # starts only where an identifier does and scans no further than its end
     # and the value after it, so the pass is linear.
     _token(
         "credential-suffix-assignment",
-        rf"{_SUFFIX_NAME}"
-        rf"({_QUOTE}(?(upper)\s*[:=]{_SPACE_TO_VALUE}|[^\S\r\n]*+[:=][^\S\r\n]*+))"
+        rf"{_IN_STRING}(?P<name>{_SUFFIX_NAME})"
+        rf"(?P<sep>{_KEY_QUOTE}(?(upper)\s*[:=]{_SPACE_TO_VALUE}|[^\S\r\n]*+[:=][^\S\r\n]*+))"
         rf"{_VALUE_OPEN}"
-        rf"((?(vq){_QUOTED_VALUE}|(?(upper){_UNQUOTED_VALUE}|{_LITERAL_VALUE})))"
+        rf"(?P<val>(?(vq){_GUARDED_QUOTED_VALUE}|(?(upper){_UNQUOTED_VALUE}|{_LITERAL_VALUE})))"
         rf"{_VALUE_CLOSE}",
-        r"\1\3\4***REDACTED***\8",
+        _NAMED_REPLACEMENT,
+        hint=_SUFFIX_HINT,
+    ),
+    # A credential name's value on the lines below it, as YAML writes one
+    # (#285 review, round 3; ``_yaml_value``): a well-known name's under its
+    # class, any value, and a prefixed name's under
+    # ``credential-suffix-assignment``'s, a lower-case one's when it does not
+    # read as code. Last, after every pattern that can replace a part of such
+    # a value's lines: whether a line is a plain scalar depends on all of it
+    # (a mapping's ``: `` in it makes it none), so a pattern after these could
+    # leave a line that a second redaction would take whole. A value of a
+    # known shape on the next line is therefore reported by its own class, a
+    # well-known or upper-case name's word on the next line by the name's
+    # pattern, which this one completes. No pattern before takes a block's
+    # header for a value (``_BLOCK_AHEAD``).
+    _yaml_value("env-assignment", rf"(?i:{_ENV_NAMES})", "", _ENV_HINT),
+    _yaml_value(
+        "credential-suffix-assignment",
+        _SUFFIX_NAME,
+        rf"(?(upper)|(?!{_CODE_VALUE}))",
+        _SUFFIX_HINT,
     ),
 )
 
@@ -612,7 +834,13 @@ _CREDENTIAL_KEY = re.compile(
 # only shrinks, a private-key block (43 characters or more) included. A
 # quoted value is taken whole (#285), across line breaks and doubled quotes
 # too, so a quoted value of one character (``A_TOKEN="x"``, 11 to 24) is
-# still the worst it does.
+# still the worst it does; one that spans lines holds a character and a line
+# break at least (round 3). A value on the lines below its key (round 3,
+# ``_yaml_value``) has the key's colon, a line break and an indentation
+# besides: ``a_token:\n x\n``, 12 to 25, a factor of 2.08, at one
+# character, and a block's header makes it longer. The rounds of
+# :func:`redact` (``_MAX_ROUNDS``) are more patterns in that order, and
+# compound nothing either, by the argument below.
 # Growth does not compound across patterns: a later pattern can only lengthen
 # the text by matching a run *shorter* than the marker, and a marker is never
 # part of such a run. The value classes that admit ``*`` (the named-assignment
@@ -639,12 +867,42 @@ _CREDENTIAL_KEY = re.compile(
 MAX_GROWTH_FACTOR = 3
 
 
+# How many rounds of the patterns :func:`redact` applies at most (#285
+# review, round 3). One round applies every pattern in order; a round that
+# changed the text is followed by another, until one changes nothing. A
+# value's extent depends on the text around it (a quoted value spans lines
+# to the first quote of its kind that closes it, a YAML plain scalar is a
+# line with no mapping's ``: `` in it), and a later pattern can redact a part
+# of that text: a quote inside another value, the line a YAML value is on. A
+# second redaction then read differently what the first one left and changed
+# it again, and ``credential_classes`` found a credential in text ``redact``
+# had already redacted. The round after such a change reads the text as a
+# second call would, so :func:`redact` returns what redacting it again
+# returns. A text with nothing to redact takes one round, as before; one with
+# a credential takes a second, which changes nothing unless such a value was
+# found. The rounds compound no growth: each replaces a run of text that is
+# no marker, beside text it keeps, as one round does (``MAX_GROWTH_FACTOR``).
+# The bound keeps the work linear for a text built so that every round
+# enables the next; no text met in testing needed more than two.
+_MAX_ROUNDS = 4
+
+
 def redact(text: str | None) -> str:
     """Redact known secret shapes. Never raises; non-str input -> str()."""
     if text is None:
         return ""
     if not isinstance(text, str):
         text = str(text)
+    for _ in range(_MAX_ROUNDS):
+        redacted = _redact_once(text)
+        if redacted == text:
+            break
+        text = redacted
+    return text
+
+
+def _redact_once(text: str) -> str:
+    """``text`` after one round of every pattern, in order."""
     for entry in _PATTERNS:
         text = _apply(entry, text)
     return text
@@ -652,6 +910,10 @@ def redact(text: str | None) -> str:
 
 def _apply(entry: _Pattern, text: str) -> str:
     """``text`` with one pattern's passes applied, ``after_escape`` second."""
+    if entry.hint is not None and entry.hint.search(text) is None:
+        return text
+    if entry.name_hint is not None and entry.name_hint.search(text) is None:
+        return text
     text = entry.regex.sub(entry.replacement, text)
     if entry.after_escape is not None:
         text = entry.after_escape.sub(entry.escape_replacement, text)
@@ -661,18 +923,24 @@ def _apply(entry: _Pattern, text: str) -> str:
 def credential_classes(text: str) -> tuple[str, ...]:
     """The class names of the patterns :func:`redact` would apply to ``text``.
 
-    Runs the same sequential substitution as :func:`redact` and records each
-    pattern that changed the text, in pattern order and each name once. The
-    result is empty exactly when ``redact(text) == text``: a text with a
-    credential shape is refused by name, never redacted and published.
+    Runs the same rounds of sequential substitution as :func:`redact` and
+    records each pattern that changed the text, in the order in which a
+    pattern of each class first did (pattern order, round by round) and each
+    name once. The result is empty exactly when ``redact(text) == text``: a
+    text with a credential shape is refused by name, never redacted and
+    published.
     """
     found: list[str] = []
     redacted = text
-    for entry in _PATTERNS:
-        replaced = _apply(entry, redacted)
-        if replaced != redacted:
-            found.append(entry.name)
-        redacted = replaced
+    for _ in range(_MAX_ROUNDS):
+        start = redacted
+        for entry in _PATTERNS:
+            replaced = _apply(entry, redacted)
+            if replaced != redacted and entry.name not in found:
+                found.append(entry.name)
+            redacted = replaced
+        if redacted == start:
+            break
     # Exact by construction: should a later pattern ever restore what an
     # earlier one changed, the text is still what ``redact`` returns.
     return tuple(found) if redacted != text else ()

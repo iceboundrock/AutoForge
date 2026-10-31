@@ -102,6 +102,8 @@ from tests.conftest import (
     SHORT_WRAPPED_KEY,
     SUFFIX_ASSIGNMENT,
     WHOLE_VALUES_285,
+    WHOLE_VALUES_285_R3,
+    WHOLE_VALUES_285_R3_REDACTED,
     FakeGitHub,
     acceptance,
     analyze_payload,
@@ -609,6 +611,30 @@ _FAKE_TOKEN = "gh" + "p_" + "FAKE0000000000000000000000000000000000"
                 id=f"body-carries-a-lower-case-{name}-value",
             )
             for name, text, _ in WHOLE_VALUES_285[:3]
+        ),
+        # Round 3: a quoted value whose lines hold a blank line, the other
+        # quote or a backtick, and a value on the lines below its key, in a
+        # commit message and the body.
+        *(
+            pytest.param(
+                lambda req, text=text: (
+                    implement(req) if commit_in(req.cwd, f"Configure it (#2)\n\n{text}") else ""
+                ),
+                _from_start,
+                "commit message contains a credential-shaped string"
+                " (pattern class: credential-suffix-assignment)",
+                id=f"commit-carries-a-round-3-{name}-value",
+            )
+            for name, text, _ in WHOLE_VALUES_285_R3
+        ),
+        *(
+            pytest.param(
+                lambda req, text=text: implement(req, pr_body=f"Adds it.\n\n{text}"),
+                _reports_head,
+                "credential-shaped string (pattern class: credential-suffix-assignment)",
+                id=f"body-carries-a-round-3-{name}-value",
+            )
+            for name, text, _ in WHOLE_VALUES_285_R3
         ),
         pytest.param(
             lambda req: implement(req, pr_body="Adds it. Fixes #2"),
@@ -7693,6 +7719,39 @@ def test_a_whole_value_the_second_285_review_found_never_reaches_state_or_the_lo
     for text in texts:
         assert "FAKE" not in text
         for _, _, body in WHOLE_VALUES_285:
+            assert body not in text
+    assert fake_github.effect_writes == []
+
+
+def test_a_whole_value_the_third_285_review_found_never_reaches_state_or_the_logs(
+    tmp_state_dir, fake_github
+):
+    """#285 review, round 3: a quoted value whose lines held a blank line,
+    the other quote or a backtick kept every line after its first, and a
+    value under a lower-case credential name on the lines below it (a YAML
+    plain or quoted scalar, a literal or a folded block) was kept whole, in
+    ``stdout.log``, ``stderr.log``, the block reason in ``state.json`` and the
+    step outcome. Each is redacted whole at every sink, and nothing is
+    written to GitHub."""
+    texts = [text for _, text, _ in WHOLE_VALUES_285_R3]
+    message = "refused:\n" + "\n".join(texts)
+    payload = {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": message}
+    reply = "".join(f"{text}\n" for text in texts) + block(payload)
+    eng = make_engine(tmp_state_dir, [reply], github=fake_github, origin=True)
+    eng.provider.stderr = "".join(f"\x1b[91m\x1b[1mError: \x1b[0m{text}\n" for text in texts)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    redacted = [WHOLE_VALUES_285_R3_REDACTED[name] for name, _, _ in WHOLE_VALUES_285_R3]
+    assert s.block_reason == "refused:\n" + "\n".join(redacted)
+    assert out.message == f"agent reported blocked: {s.block_reason}"
+    logs = [path for path in (eng.paths.logs_dir / s.run_id).rglob("*") if path.is_file()]
+    assert {"stdout.log", "stderr.log"} <= {path.name for path in logs}
+    texts = [eng.paths.state_file.read_text(), out.message, *(path.read_text() for path in logs)]
+    for text in texts:
+        assert "FAKE" not in text
+        for _, _, body in WHOLE_VALUES_285_R3:
             assert body not in text
     assert fake_github.effect_writes == []
 

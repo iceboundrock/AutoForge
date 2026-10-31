@@ -151,6 +151,45 @@ WHOLE_VALUES_285 = [
     ("multi-line-yaml", 'client_secret: "FAKEfirst\n  FAKEsecond"', "FAKEsecond"),
     ("yaml-doubled-quote", "db_password: 'FAKE''FAKEafter'", "FAKEafter"),
 ]
+# Values the third review of #285 found kept in part or whole, each valid
+# shell or YAML: a quoted value whose lines hold a blank line, the other quote
+# character or a backtick (R3-F1), and a credential name's value on the
+# lines below it, a plain scalar, a quoted one, a literal and a folded block,
+# under each of the four suffixes (R3-F2). Each with its id, the text and
+# what must not appear once it is redacted or refused: the part of the value
+# a partial redaction left.
+WHOLE_VALUES_285_R3 = [
+    ("shell-blank-line", 'export DB_PASSWORD="FAKEfirst\n\nFAKEafterblank"', "FAKEafterblank"),
+    ("yaml-blank-line", 'client_secret: "FAKEfirst\n\n  FAKEafterblank"', "FAKEafterblank"),
+    ("shell-other-quote", 'DB_PASSWORD="FAKE it\'s\nFAKEafterquote"', "FAKEafterquote"),
+    ("yaml-other-quote", "db_password: 'FAKE say \"hi\"\n  FAKEafterquote'", "FAKEafterquote"),
+    ("shell-backtick", "x_api_key='FAKE`tick\nFAKEaftertick'", "FAKEaftertick"),
+    ("yaml-next-line", "client_secret:\n  FAKEnextline", "FAKEnextline"),
+    ("yaml-next-lines", "api_token:\n  FAKE next line\n  FAKEcontinued", "FAKEcontinued"),
+    ("yaml-next-line-quoted", 'x_api_key:\n  "FAKE quoted; FAKEquoted"', "FAKEquoted"),
+    ("yaml-literal-block", "db_password: |\n  FAKEliteral1\n\n  FAKEliteral2", "FAKEliteral2"),
+    ("yaml-folded-block", "Partner_Api_Key: >-\n  FAKEfolded1\n  FAKEfolded2", "FAKEfolded2"),
+    (
+        "yaml-block-in-sequence",
+        "- name: app\n  client_secret: |+\n    FAKEseq1\n    FAKEseq2",
+        "FAKEseq2",
+    ),
+]
+# What ``redact`` makes of each of them: the name, the quotes, a block's
+# header and the value's indentation stay.
+WHOLE_VALUES_285_R3_REDACTED = {
+    "shell-blank-line": 'export DB_PASSWORD="***REDACTED***"',
+    "yaml-blank-line": 'client_secret: "***REDACTED***"',
+    "shell-other-quote": 'DB_PASSWORD="***REDACTED***"',
+    "yaml-other-quote": "db_password: '***REDACTED***'",
+    "shell-backtick": "x_api_key='***REDACTED***'",
+    "yaml-next-line": "client_secret:\n  ***REDACTED***",
+    "yaml-next-lines": "api_token:\n  ***REDACTED***",
+    "yaml-next-line-quoted": 'x_api_key:\n  "***REDACTED***"',
+    "yaml-literal-block": "db_password: |\n  ***REDACTED***",
+    "yaml-folded-block": "Partner_Api_Key: >-\n  ***REDACTED***",
+    "yaml-block-in-sequence": "- name: app\n  client_secret: |+\n    ***REDACTED***",
+}
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)
 # and the base branch's `push` run at its tip (the reference definition).
