@@ -171,7 +171,7 @@ recognised from the CLI's own output by the one layer that knows that
 output, and it never replaces the exit status or `provider_failure`: the
 launch is logged and reported as the failed exit it was. Whether to relaunch
 is the engine's policy, keyed on that field alone (no provider name, no
-error text): in REMOTE mode at most `MAX_TRANSIENT_RETRIES` (2) relaunches
+error text): at most `MAX_TRANSIENT_RETRIES` (2) relaunches
 per step, counted apart from the CONTROL_RESULT corrections, each after the
 checkout check and the phase-entry reconciliation, and none while a process
 the failed launch started may still be running. Today there are two
@@ -228,7 +228,7 @@ are planned. ADR 0007 decides how an SDK provider fits these boundaries:
   the degradation of a live wait and the capability check; the adapter
   never sees the policy, and the engine never sees an SDK type. Who
   decides is the engine's `interaction_resolver`: the terminal resolver
-  of `cli.py` for `run`, `step`, `resume` and `local run`, and
+  of `cli.py` for `run`, `step` and `resume`, and
   `Unattended` (no one to ask) for a library caller or a scheduler's
   worker. The resolver runs inside the launch, so under the repository
   lock the command holds (D7.2). A failed or paused interaction ends the
@@ -268,7 +268,7 @@ The process executor owns:
 It should remain independent of workflow semantics. Which names are
 allowed is policy: the engine reads it from `execution.env_allowlist` (plus
 `env_allowlist_extra`) and applies it to every agent launch,
-`merge.verification_commands` entry and `local.validation_commands` entry;
+`validation.commands` entry and `merge.verification_commands` entry;
 the controller's own `git` / `gh` plumbing inherits the full environment.
 A request's `env` mapping is layered over the selected variables; the
 executor sets it without interpreting it. What goes into it is
@@ -294,7 +294,7 @@ refused by `AgentProvider.integration_preflight`, which the engine calls
 with the credential preflight (OpenCode's connected organization, Claude
 Code settings whose `env` would undo the launch's isolation); `doctor`
 calls the same module and hook.
-The engine also owns *where* an agent runs: in REMOTE mode a per-issue
+The engine also owns *where* an agent runs: a per-issue
 `git worktree` it creates under `<git common dir>/autoforge/worktrees/<n>`
 (or `execution.worktree_dir`) at the first launch and never deletes, and it
 reads HEAD and branch of its own checkout before and after each invocation,
@@ -580,11 +580,11 @@ controller never reads them (D16.1).
 #### Launch routing (ADR 0005, #168)
 
 When the outer sandbox is enforced (`sandbox.mode: required`, or
-`preferred` on a host that can enforce) every launch AutoForge makes
-outside itself carries a description (D3.1): every process of every agent provider
-(Claude Code one-shot and stream-json, OpenCode, Pi RPC and Pi's
-per-launch auth preflight), every LOCAL validation command and every
-pre-merge verification command. The controller's own `git` and `gh`
+`preferred`, which means `required`, ADR 0009 D7) every launch AutoForge
+makes outside itself carries a description (D3.1): every process of every
+agent provider (Claude Code one-shot and stream-json, OpenCode, Pi RPC and
+Pi's per-launch auth preflight), every candidate validation command and
+every pre-merge verification command. The controller's own `git` and `gh`
 plumbing stays outside. Under `disabled` no request carries one, and every
 launch takes the path it took before #167. Each party contributes what it
 alone knows, as data (D13.1, D13.2):
@@ -594,8 +594,8 @@ alone knows, as data (D13.1, D13.2):
   common dir, the issue's private object directory and overlay work
   directory, the cache, the read context, the directory the #165 overrides
   live in (`child_env.overrides_directory`), the network position and the
-  denied roots. `ControllerEngine._remote_facts` and `_local_facts` derive
-  them from the git directories, `_denied_roots` lists what no launch may
+  denied roots. `ControllerEngine._remote_facts` derives them from the
+  git directories, `_denied_roots` lists what no launch may
   see, and `_sandbox_dirs` creates the controller-owned directories through
   `SafeRoot` at the first enforced launch that needs them (a link in their
   path refuses the launch, D8.4). For an agent, `_agent_sandbox` wraps the
@@ -643,19 +643,16 @@ The launch classes (D5.1, D6.1, D6.6; ADR 0005 §2.5 is the full table):
 | Launch class | Writable | Read-only | Masked |
 |---|---|---|---|
 | REMOTE agent | the issue worktree; its admin dir `<common>/worktrees/<id>`; an overlay at `<common>/objects` whose upper layer is the issue's private object directory | the worktree's `.git` file and the admin dir's `commondir` and `gitdir` (pinned); the git common dir; the phase's read context | `<common>/autoforge`, `<common>/worktrees`, `<common>/modules`, with the worktree (at its default location) and its admin dir carved out |
-| LOCAL agent, LOCAL validation command | the repository root | the root's `.git`, the git dir (a linked checkout's admin dir) and the common dir | `<git dir>/autoforge`, `<common>/autoforge`, `<common>/worktrees` |
-| export command (pre-merge) | the exported tree | | |
+| export command (candidate validation, pre-merge) | the exported tree | | |
 
 Every class also gets the system runtime, a private home and `/tmp`, the
 #165 overrides directory read-only, and the engine's denied roots (D13.2):
 the state directory and its run logs wherever they resolve, the lock,
-`<common>/autoforge`, every other registered worktree, for REMOTE the
-controller's checkout, and for LOCAL `<git dir>/autoforge` and the default
-REMOTE state directory `<root>/.autoforge`. A persistent cache is mounted
-at `~/.cache` only for the launches that produce a change
-(`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`: per issue in REMOTE, per
-checkout in LOCAL) and for LOCAL validation; every other agent launch and
-an export command get the one in their private home. An agent always
+`<common>/autoforge`, every other registered worktree and the
+controller's checkout. A persistent cache, per issue, is mounted at
+`~/.cache` only for the launches that produce a change (`ANALYZE_EXECUTE`,
+`FIX`, `REPLAN_REEXECUTE`); every other agent launch and an export command
+get the one in their private home. An agent always
 shares the host network; a repository command gets
 `sandbox.validation_network` or `sandbox.premerge_network` (D9.2).
 `sandbox.read_only_paths` (D15.4) is read-only in every class, declared
@@ -671,19 +668,16 @@ or IPC namespace, procfs, bind, overlay, Landlock, the session keyring;
 namespace). `ControllerEngine.sandbox_capability()` keeps its answer for
 the engine's process. `_sandbox_gate()` runs at the start of
 `_step_once`, before validation recovery, planning, the step budget and
-anything saved, for a step that may launch (`_step_may_launch` in REMOTE;
-ANALYZE_EXECUTE, REVIEW and FIX in LOCAL): an operator path over a denied
-root, or a host that cannot enforce under `required` or REMOTE's
-`preferred`, raises (`ConfigurationError`, `SandboxCapabilityError`) with
-the state byte-identical. `_sandbox_enforced()` is what every launch site
-asks (`_agent_sandbox`, `_command_sandbox`): `False` under `disabled`
-without a probe; `True` on a capable host; under LOCAL's `preferred` on an
-incapable one `False`, and `_fallback_facts()` / `_fallback_notice()` then
-put `{"enforced": false, "mode": "preferred", "isolation": "logical
-isolation only", "fallback": <reason>}` in the execution record and a line
-on stderr (`progress_output`). The fallback is decided from the probe
-alone: a launch the backend refuses after the gate stays a spawn failure
-and is never re-run unenforced. The dry-run plan (`_sandbox_plan_notes`)
+anything saved, for a step that may launch (`_step_may_launch`): an
+operator path over a denied root, or a host that cannot enforce under
+`required` or `preferred`, raises (`ConfigurationError`,
+`SandboxCapabilityError`) with the state byte-identical.
+`_sandbox_enforced()` is what every launch site asks (`_agent_sandbox`,
+`_command_sandbox`): `False` under `disabled` without a probe, `True`
+otherwise, since the gate has already refused a host that cannot enforce.
+There is no fallback to logical isolation (ADR 0009 D7 deleted LOCAL's): a
+launch the backend refuses after the gate stays a spawn failure and is
+never re-run unenforced. The dry-run plan (`_sandbox_plan_notes`)
 and `status` (`sandbox_mode_summary`) never probe; the plan shows
 `sandbox_policy.class_summary` over `summary_facts` (role paths, nothing
 created) for each class the run can make. `doctor_sandbox.py` holds
@@ -811,8 +805,8 @@ the mode. Every git process is the controller's own `local_git_request`
   prepared or a backend setup failure is `SandboxLaunchRefusedError`, an
   `ExecutionError` on the failure-to-spawn path: recorded, then raised with
   the phase unchanged and #189's "State unchanged." text;
-- a LOCAL validation command: the refusal is logged and raised as a
-  `VerificationError`; the phase is not verified;
+- a candidate validation command: the refusal is logged and raised
+  before anything runs, with no marker and no record (ADR 0006 D8.5);
 - a pre-merge verification command: the refusal is logged and returned as
   the gate's problem, so the step enters `BLOCKED`;
 - tampering with the private object directory: `SandboxTamperError`, a
@@ -825,8 +819,7 @@ that carried a description, and of a refused one whose error carries them
 (`enforced: false` and the redacted reason). The prompts say what a
 narrowed view means (prompt version `v10`): `common.md` that the
 operator's checkout, other worktrees, the controller's state and the home's
-files may be absent and the shared git metadata read-only, and
-`local_common.md` that the git directory may be read-only.
+files may be absent and the shared git metadata read-only.
 
 ### Parallel EPIC scheduler, workers and supervision (ADR 0008, #182)
 
@@ -972,6 +965,4 @@ the phase templates name the files in it. The three REMOTE write templates
 agent worktree, otherwise `prompts/worktree_state.md` rendered with the
 worktree's branch, `HEAD` and a bounded list of status codes and paths
 (#187). The instruction on what to do with those changes is in that
-template; the engine supplies only the facts. LOCAL mode uses `local_common.md` and the `local_*` phase templates, which
-tell the agent the run has no Issue, PR or remote branch and not to use
-GitHub.
+template; the engine supplies only the facts.

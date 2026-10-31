@@ -49,7 +49,6 @@ from .child_env import refuse_forbidden_env
 from .errors import ConfigurationError, SandboxPolicyError, ValidationDefinitionError
 from .evidence import SCOPE, check_definitions, check_scope
 from .executor import MAX_DEADLINE_SECONDS, is_env_pattern
-from .local_workspace import DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES
 from .sandbox import check_declared_path
 
 CONFIG_VERSION = 1
@@ -59,16 +58,13 @@ CONFIG_VERSION = 1
 # call that prints nothing until it returns (a long test run).
 DEFAULT_IDLE_TIMEOUT_SECONDS = 900
 # The wall-clock limit of each repository-defined command the controller
-# runs itself (pre-merge verification, LOCAL validation).
+# runs itself (pre-merge verification).
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 1800
 
 KNOWN_PROVIDERS = ("claude", "opencode", "pi", "scripted", "claude-sdk", "opencode-sdk")
 
 
-# Where a REMOTE run keeps its state, relative to the invocation directory.
-# A LOCAL run defaults elsewhere -- see
-# :meth:`autoforge.engine.ControllerEngine.bind_local_state_dir` -- because its
-# fingerprint covers the whole working tree and runtime state must not be in it.
+# Where a run keeps its state, relative to the invocation directory.
 DEFAULT_STATE_DIR = ".autoforge"
 
 
@@ -170,8 +166,8 @@ LOOP_DETECTION_KEYS = (
 MAX_LOOP_CYCLE_PERIOD = 16
 MAX_LOOP_REPEATS = 100_000
 
-# The environment an agent, a pre-merge verification command and a LOCAL
-# validation command start from: these variables of the operator's
+# The environment an agent, a validation command and a pre-merge
+# verification command start from: these variables of the operator's
 # environment and nothing else (see ``autoforge.executor.select_environment``).
 # What a coding agent needs to find its tools, its home configuration, its
 # locale and its temporary directory; what ``git`` needs to identify the
@@ -289,8 +285,8 @@ class ExecutionConfig:
     # long whatever it writes. ``None``: no wall-clock ceiling.
     default_idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS
     default_max_runtime_seconds: int | None = None
-    # The wall-clock limit of a pre-merge verification command and of a
-    # LOCAL validation command; agents never use it.
+    # The wall-clock limit of a pre-merge verification command; agents never
+    # use it.
     command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS
     # How many times a *malformed CONTROL_RESULT* (exit 0) triggers a
     # correction prompt before the step fails. 0 disables correction.
@@ -614,56 +610,6 @@ class WorkflowConfig:
     epic_update_every: int = 1
 
 
-@dataclass
-class LocalConfig:
-    """LOCAL-mode settings, read from no configuration file.
-
-    The ``local:`` key is gone (ADR 0009 D5, #387): a file that still has it
-    is refused as an unknown top-level key. The type stays, at its defaults,
-    for the LOCAL code no command reaches any more, and goes with it (#388).
-
-    ``validation_commands`` are **controller-owned** checks: argv arrays, run
-    through :mod:`autoforge.executor` with no shell, after every local
-    implementation and fix phase. A non-zero exit means the phase is not
-    successfully verified. There is no automatic build-system detection: what
-    is not configured here is not run.
-
-    ``exclude`` is the *only* way to remove anything from the workspace
-    snapshot that binds a LOCAL review (the repository's own git directory
-    aside, which is identified by inode). A LOCAL run hashes every entry of
-    the working tree, ignored files included, because the alternative is
-    letting a ``.gitignore`` edit decide which bytes a review covers. That
-    completeness has a cost the operator has to pay explicitly: build output,
-    virtual environments and caches are rewritten by the very validation
-    commands the controller runs, so they must be declared unreviewed rather
-    than silently tolerated. Each pattern is matched component-wise against
-    repository-relative paths; ``*`` and ``?`` match within one component and
-    ``**`` spans any number of them. The patterns are hashed into the
-    fingerprint and named to the review agent in its prompt, so "what was not
-    reviewed" is part of the review's identity rather than a local detail.
-
-    ``max_workspace_entries`` / ``max_workspace_bytes`` bound the walk. They
-    are refusal thresholds, not sampling thresholds: exceeding one fails the
-    run with the largest subtrees named, because a fingerprint that fell back
-    to metadata for the rest would accept an equal-sized replacement with a
-    restored mtime.
-    """
-
-    validation_commands: list[list[str]] = field(default_factory=list)
-    # Local review/fix bound: the initial REVIEW, at most this many FIX
-    # rounds, then a final REVIEW. 0 disables FIX entirely (one review pass).
-    max_fix_rounds: int = 1
-    # Declared-unreviewed regions of the working tree (see the class docstring).
-    exclude: list[str] = field(default_factory=list)
-    max_workspace_entries: int = DEFAULT_MAX_ENTRIES
-    max_workspace_bytes: int = DEFAULT_MAX_BYTES
-
-    @property
-    def max_review_rounds(self) -> int:
-        """Review passes a local run may complete (fix rounds + the first)."""
-        return self.max_fix_rounds + 1
-
-
 SANDBOX_DISABLED = "disabled"
 SANDBOX_PREFERRED = "preferred"
 SANDBOX_REQUIRED = "required"
@@ -680,18 +626,16 @@ class SandboxConfig:
 
     - ``disabled`` (the default): logical isolation only (#165); no launch
       is sandboxed, and ``doctor``, the plan and ``status`` say so;
-    - ``required``: every agent launch, LOCAL validation command and
-      pre-merge verification command runs inside the outer sandbox, or is
-      refused; it never runs without it. A host that cannot enforce is
-      refused by the pre-launch gate, before anything is saved or charged;
-    - ``preferred``: in a LOCAL run, enforced when the host can, else run
-      with logical isolation only, visibly (the plan, ``status``, stderr at
-      the launch, every execution record); in a REMOTE run, exactly
-      ``required``, since nobody watches an unattended fallback (D12.2).
+    - ``required``: every agent launch, validation command and pre-merge
+      verification command runs inside the outer sandbox, or is refused; it
+      never runs without it. A host that cannot enforce is refused by the
+      pre-launch gate, before anything is saved or charged;
+    - ``preferred``: exactly ``required``, since nobody watches an
+      unattended fallback (ADR 0005 D12.2). It stays an accepted value with
+      that meaning (ADR 0009 D7).
 
-    Not part of LOCAL's run contract (D12.3): it decides how a launch is
-    contained, not what the run is. A run is pinned to the mode it is created
-    under instead (#280, :mod:`autoforge.sandbox_pin`): a later command under
+    A run is pinned to the mode it is created under (#280,
+    :mod:`autoforge.sandbox_pin`): a later command under
     a stronger mode moves the pin up, and one under a weaker mode is refused
     unless the operator accepts it with ``--accept-config-change``. Under
     ``required`` or ``preferred`` the ``--config`` file must lie outside every
@@ -702,8 +646,8 @@ class SandboxConfig:
     apply in every mode.
 
     ``validation_network`` and ``premerge_network`` are ``host`` (the
-    default) or ``isolated``: a validation command (LOCAL, or REMOTE
-    ``validation.commands`` in a candidate's export), or a pre-merge
+    default) or ``isolated``: a validation command
+    (``validation.commands`` in a candidate's export), or a pre-merge
     verification command, then runs with no network at all (no loopback, no
     abstract socket, no download). Agents always share the host network.
 
@@ -727,12 +671,13 @@ class SandboxConfig:
         """A sandbox is wanted: ``required`` or ``preferred``."""
         return self.mode != SANDBOX_DISABLED
 
-    def refuses_unenforced(self, local: bool) -> bool:
+    def refuses_unenforced(self) -> bool:
         """Whether a launch the host cannot enforce is refused rather than run.
 
-        ``required`` everywhere, ``preferred`` in REMOTE (ADR 0005 D12.2).
+        ``required``, and ``preferred``, which means ``required`` (ADR 0005
+        D12.2, ADR 0009 D7).
         """
-        return self.mode == SANDBOX_REQUIRED or (self.mode == SANDBOX_PREFERRED and not local)
+        return self.mode in (SANDBOX_REQUIRED, SANDBOX_PREFERRED)
 
 
 # The keys a config file may contain at top level: the scalars read directly
@@ -791,7 +736,6 @@ class AutoForgeConfig:
     merge: MergeConfig = field(default_factory=MergeConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
-    local: LocalConfig = field(default_factory=LocalConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     scheduler: EpicSchedulerConfig = field(default_factory=EpicSchedulerConfig)
@@ -1222,8 +1166,8 @@ REMOVED_EXECUTION_KEYS = {
         "'execution.default_timeout_seconds' is no longer supported. Agents now run "
         "under 'execution.default_idle_timeout_seconds' (killed only after making no "
         "progress for that long; default 900) and an optional wall-clock ceiling "
-        "'execution.default_max_runtime_seconds'; pre-merge verification and LOCAL "
-        "validation commands run under 'execution.command_timeout_seconds' (default "
+        "'execution.default_max_runtime_seconds'; pre-merge verification "
+        "commands run under 'execution.command_timeout_seconds' (default "
         "1800). Replace the key with the ones you need"
     ),
 }
@@ -1280,10 +1224,8 @@ def _prompt_version(raw: object, source: str) -> str:
 
     The key selects nothing. The controller renders its own templates
     whatever it says, and records it as the run's prompt version in the
-    state file, the run logs, every prompt header and a LOCAL run's
-    contract. Another value would make all of those name templates that
-    were not rendered, and would hide a template change across an upgrade
-    from the LOCAL contract gate, which compares this label (#302).
+    state file, the run logs and every prompt header. Another value would
+    make all of those name templates that were not rendered (#302).
 
     The refusal quotes a value only when it is shaped like a label. Any
     other string, and every other type, is named and never repeated: a

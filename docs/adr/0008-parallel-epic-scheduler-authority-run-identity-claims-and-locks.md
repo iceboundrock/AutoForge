@@ -8,6 +8,10 @@
   end-to-end recovery tests). The number is assigned when the record
   merges: if another ADR merges first, this record takes the next free
   number, and its index entries move with it.
+- **Note:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) removed LOCAL mode (#388). D17.5 (LOCAL
+  excluded from scheduler runs by L0) and the LOCAL mentions in §1.1, §2.5,
+  §2.12, §3 and §4 no longer apply; ADR 0009 D4's rule for a standalone
+  state that does not load keeps D17.5's effect.
 - **Decides:** #177, for EPIC #176 (Wave 1).
 - **Amends:** no ADR. It generalizes #16's invariant (at most one controller
   acts on a repository at a time) without removing it (D10, D11), and

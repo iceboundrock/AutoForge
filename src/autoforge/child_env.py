@@ -1,6 +1,6 @@
 """What AutoForge hands a process it launches outside itself (#165).
 
-Agents, LOCAL validation commands and pre-merge verification commands are
+Agents, validation commands and pre-merge verification commands are
 untrusted: an agent follows whatever a prompt injection in project data
 tells it, and a repository-defined command is the PR's own code. Every
 externally visible write of a run is the controller's (ADR 0004), so none

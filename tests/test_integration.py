@@ -397,8 +397,8 @@ def test_every_lifecycle_transition_is_decided_by_decide_next_phase(tmp_state_di
     """
     decisions: list[tuple[Phase, dict, Phase]] = []
 
-    def recording(current, result, mode):
-        nxt = decide_next_phase(current, result, mode)
+    def recording(current, result):
+        nxt = decide_next_phase(current, result)
         decisions.append((current, dict(result), nxt))
         return nxt
 
@@ -443,10 +443,10 @@ def test_a_decision_outside_the_topology_is_refused_before_it_is_applied(
     """The decision is still validated where it is applied: an edge the
     topology does not declare raises and leaves the persisted phase alone."""
 
-    def rogue(current, result, mode):
+    def rogue(current, result):
         if current is Phase.REVIEW:
-            return Phase.DONE  # legal LOCAL edge, illegal REMOTE edge
-        return decide_next_phase(current, result, mode)
+            return Phase.DONE  # an edge the topology does not declare
+        return decide_next_phase(current, result)
 
     monkeypatch.setattr(engine_mod, "decide_next_phase", rogue)
     gh = FakeGitHub()

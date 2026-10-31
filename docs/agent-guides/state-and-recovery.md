@@ -1,7 +1,7 @@
 # State, persistence, locking, recovery, and error classification
 
 Read this before changing the persisted state file or its schema
-(`src/autoforge/state.py`, `src/autoforge/run_contract.py`), atomic writes and
+(`src/autoforge/state.py`), atomic writes and
 the runtime filesystem boundary (`src/autoforge/safefs.py`), `resume` or any
 other crash-recovery path, merge counting, the repository lock
 (`src/autoforge/locking.py`), the error taxonomy (`src/autoforge/errors.py`),
@@ -43,13 +43,12 @@ Expected state includes data such as:
 - attempt number
 - block reason (redacted and then bounded to `state.MAX_BLOCK_REASON_CHARS`
   (8000 characters) by every engine writer, through `state.bound_block_reason`: `_block` and
-  the two agent-message writers; a longer reason keeps its head, an
+  the agent-message writer; a longer reason keeps its head, an
   omission marker naming the count dropped, and its last
   `BLOCK_REASON_TAIL_CHARS` (1000), so what happened and what the operator must do
   both survive. It is operator diagnostics, not work a later phase acts on,
   which is why it may be clipped where a finding or resolution is rejected
-  instead; what is clipped is still whole in `last_fix_resolutions` (a
-  LOCAL fix round's unresolved rationales) or the run log (an agent's
+  instead; what is clipped is still whole in the run log (an agent's
   `message`). The bound is a writer's rule, not a loader's: a longer value in a
   file, written by an older controller, loads and is not rewritten), and the
   operator unblock history (one entry per applied
@@ -78,12 +77,11 @@ Expected state includes data such as:
   is written: a configuration it would refuse (a model over 512
   characters, an `update_epic` limit of 0) is a configuration error at
   `run`, `doctor`, an upgrade or an accepted change, so no state file is
-  written that could not load again. It is `{}` for a LOCAL run, whose run contract
-  defines it, and
-  for a run loaded from a protocol-8 file until its next command records it
-- the sandbox pin of every run, LOCAL and REMOTE (`sandbox_pin`, #280): the
-  `sandbox.mode` the run is held to, with its `source` (`created` by `run`
-  or `local run`, `upgraded` from a file without one, `strengthened` by a
+  written that could not load again. It is `{}` for a run loaded from a
+  protocol-8 file until its next command records it
+- the sandbox pin of every run (`sandbox_pin`, #280): the
+  `sandbox.mode` the run is held to, with its `source` (`created` by `run`,
+  `upgraded` from a file without one, `strengthened` by a
   command under a stronger mode, `accepted` by `--accept-config-change`
   under a weaker one) and `recorded_at`, under `schema` 1. `step`, `resume`
   and `unblock` refuse a weaker mode before any phase executes, writing
@@ -143,8 +141,7 @@ declined id, or a (finding, target) already verified in the round, is a
 correction) and by REVIEW's `operator-evidence.md`. The round's `declined`
 entries of both histories count together toward `MAX_DECLINES_PER_ROUND`;
 a `withdrawn` one does not. A
-LOCAL run carries none of this. A
-REMOTE run also records its replan history: `execution_attempt` (initial
+run also records its replan history: `execution_attempt` (initial
 implementation is 1),
 `escalation_count` (completed replans), `superseded_prs` (each entry naming
 the transaction that superseded it), and the durable `replan_transaction`
@@ -307,22 +304,20 @@ whole, so no text in it, and no composition of its fields, escaped the
 parser. The
 existing body an `adopt_pr` appends to is a human's text and keeps only
 the append checks. A stored value the result path would have refused is a
-`StateError`, never rewritten. LOCAL
-state carrying any of them is refused as corrupt: a LOCAL run performs no
-external effect.
+`StateError`, never rewritten.
 
 ### Validation evidence
 
 Candidate validation (#172, ADR 0006; `src/autoforge/evidence.py`) adds
-six fields, in REMOTE and LOCAL state alike:
+six fields:
 
 - `validation_records`: one `ValidationRecord` per validator the
   controller launched, oldest first, each with a `seq` that increases
-  strictly and is never reused. A record holds the candidate (REMOTE:
-  `kind: remote`, repository, object format, commit and the tree read
+  strictly and is never reused. A record holds the candidate
+  (`kind: remote`, repository, object format, commit and the tree read
   from the commit's authenticated bytes, plus a provenance that is
-  displayed and never compared; LOCAL: `kind: local`, the workspace
-  fingerprint, the workspace-policy digest and the run id), the
+  displayed and never compared; any other kind, LOCAL's `local` among
+  them, is refused as unknown, ADR 0009 D6), the
   definition (its index, its argv redacted, its `definition_digest` over
   the argv as configured, its scope), policy P (`policy_digest`, mode,
   timeout), the outcome and the `run_log` step directory. An observed
@@ -334,9 +329,7 @@ six fields, in REMOTE and LOCAL state alike:
   over the whole capture before it is cut (a secret straddling the cut is
   not half-kept), every control character but newline and tab escaped
   (`\x1b`, `\u2028`), cut on whole escapes, with the stream's byte count
-  and whether the capture or the cut dropped anything. A LOCAL record adds
-  `start_fingerprint` (its candidate's) and `end_fingerprint` (the walk
-  after the command; the next command's start). An `INTERRUPTED` record
+  and whether the capture or the cut dropped anything. An `INTERRUPTED` record
   is built from a marker alone: the marker's fields and `recovered_at`,
   no enforcement, exit code or output. It claims no launch and is never
   evidence. A launch, setup or materialization failure leaves no record.
@@ -351,7 +344,7 @@ six fields, in REMOTE and LOCAL state alike:
   watermark. #172 validates them on load and keeps the records they name;
   #174 issues the certificate (`certificate.py`;
   [workflow.md](workflow.md#candidate-validation-gates)) in the save that
-  enters `READY_FOR_MERGE` or LOCAL `DONE`, copying the candidate, the
+  enters `READY_FOR_MERGE`, copying the candidate, the
   records and the set and policy digests from the round's binding, and a
   clean round it cannot certify exactly blocks in that save instead. The
   merge gate requires it to apply to the live PR revision on every pass
@@ -362,10 +355,10 @@ six fields, in REMOTE and LOCAL state alike:
   or cleared. #173 writes the other three
   ([workflow.md](workflow.md#candidate-validation-gates)): the `REVIEW`
   entry saves the binding with the reviewer's launch (a relaunch for the
-  same round, head, set and policy reuses it); a REMOTE producer's failure
+  same round, head, set and policy reuses it); a producer's failure
   saves the counter with the failing record in one write, and every save
   in another phase clears it, so it counts one phase entry; an applied
-  REMOTE `unblock` sets the watermark to the highest retained seq (0 for
+  `unblock` sets the watermark to the highest retained seq (0 for
   none) in its own write, and nothing else sets it.
 - Recovery: a crash after a failing record's save resumes with the count
   it saved, and one after the save that reached the bound blocks at the
@@ -389,8 +382,9 @@ so no value is written that would not load.
 each record's exact key set for its outcome and kind, every field against
 its bound and format, and its `digest` (SHA-256 over the canonical JSON of
 every other field), so a record edited by hand fails the load. A record
-of the other mode's kind, another repository, another run, or a run log
-outside this run's directory is refused, as are a mixed candidate and a
+or certificate of any kind but `remote` (LOCAL's workspace record and
+`local` certificate included), another repository, another run, or a run
+log outside this run's directory is refused, as are a mixed candidate and a
 seq out of order. The binding and the certificate name records by
 `(seq, digest)`: each must be retained, under that digest, not
 `INTERRUPTED`, for the same candidate identity and policy, and at its
@@ -400,7 +394,7 @@ for an empty set) carries their set digest; a certificate's records must
 be `PASS`, its set digest theirs, its comment canonical, on the reviewed PR and keyed by the
 certificate's own round, head, base and merge base, and its own digest
 must match. The counter names a retained `FAIL` or `TIMEOUT` of its
-commit. The watermark lies in `[0, highest seq]`; LOCAL has none. Anything
+commit. The watermark lies in `[0, highest seq]`. Anything
 else is a `StateError`: never clipped, defaulted or repaired.
 
 **Retention** (D11.4): a record past the 64th evicts the oldest one no
@@ -414,7 +408,7 @@ binding or counter it writes next never names an evicted record (at most
 (`status` shows it as "Pending attempt", the dry-run plan as a note) and
 converts nothing, so `status` and `--dry-run` leave the file byte-identical.
 A real step converts it under the lock before it plans anything: a plan can
-refuse (a LOCAL working tree the interrupted validator left a FIFO in), and
+refuse, and
 a refusal must not leave the marker pending for every resume after it.
 
 State keeps compact finding summaries and review comment URLs, rather than
@@ -481,6 +475,8 @@ Protocol 10 → 11 (#243, ADR 0004 D13.10) added the operator-action state: `ope
 
 Protocol 11 → 12 (#280, ADR 0005 D17.1 as amended) added the sandbox pin (`sandbox_pin`) above, for LOCAL and REMOTE runs alike. Every protocol-12 save writes it, `{}` included, so a protocol-12 file missing it is refused: read as absent, it would switch the check off. A protocol-11 file, and every older file its own rules load, loads in every phase with `{}` and is relabelled on its next save. It is not checked once: the first `step`, `resume` or `unblock` pins the mode it runs under as `upgraded`, saved with that command's next save, and later commands are checked against it. A protocol-11 (or older) file that carries the field, `{}` included, is a hand edit or a foreign file and is refused, unchanged. The pin has its own `schema` (1), and unlike #219's record it is never refused for a new fact: a sandbox fact added later (the backend of a REMOTE run, #273) takes a new schema whose parser still reads schema 1 with that fact absent, and the next command pins it, so a run created before it stays loadable. The number is the implementation's; it is settled on #23 before the change merges.
 
+Protocol 12 → 13 (#388, ADR 0009 D8) removed LOCAL mode's twelve fields from the schema: `feature_spec_path`, `feature_spec_sha256`, `base_head_sha`, `base_branch`, `local_run_contract`, `workspace_fingerprint`, `reviewed_workspace_fingerprint`, `local_fix_rounds`, `local_pending_phase`, `local_pending_fingerprint`, `local_pending_attempts` and `baseline_dirty_paths`. It adds no field, and it migrates no LOCAL run: the rule is the loader above with one more step. First the mode: a file whose `mode` is anything but absent or `"REMOTE"` is refused as an unknown mode under every label, 13 included, so a LOCAL file never reaches the steps after it. Then every per-protocol rule above runs unchanged, its migrations and refusals alike. Then the LOCAL fields: in a file labelled 12 or older, each is dropped when it is absent or holds the empty value every REMOTE save wrote (`""`, `0`, `{}`, `[]`), and the file is refused, unchanged, when any holds anything else. Only LOCAL code ever wrote a non-empty one, so in a file that passed the mode check it is a hand edit or a foreign file, and dropping it would discard what the label cannot explain. That is stricter than protocol 12, which refused only a non-empty `local_run_contract` or `local_pending_*` and type-checked the other eight. The fields arrived under protocol 1, so a protocol-1 file may carry none, some or all of them. Last, the unknown-field check: a protocol-13 save writes none of the twelve, so a protocol-13 file carrying one, even at its empty value, is refused as an unknown field, and so is an unlabelled file carrying one, since an unlabelled file is read as the current protocol. A file that loads is relabelled 13 on its next save; a load writes nothing, and a refused file is left byte for byte as it was. `mode` stays, always `"REMOTE"`, and `status --json` of a run loses the twelve empty keys. The validation records' and certificates' own `schema` stays 1: their parser only narrows, refusing a workspace-variant record or a `local` certificate as an unknown kind (ADR 0009 D6). The number is the implementation's; it is settled on #23 before the change merges.
+
 Protocol 5 → 7 (#160) added the effect state above (`effect_records`, `entry_observation`, `completion_context`, `launch_label`). Protocol 6 is skipped, and stays skipped for good: #23 once reserved it for #126, which now takes the next number like every other bump (see "Numbering a new protocol" below). The number this bump took was settled on #23 before it merged. State persisted under protocol 5, or under any older protocol that its own rules load, carries no effect state and loads as none; a legacy file that does carry one of these fields is a hand edit or a foreign file and is refused. A legacy REMOTE file with `attempt >= 1` gets the launch label `agent_publishes` for a phase whose agent published under the previous contract, so that the first entry of this version knows an agent may already have published (D13.3). `UPDATE_EPIC` is the one such phase whose publication this version performs itself: its one-shot legacy re-entry adopts the progress comment that agent posted, with no record, and asks for the selection only (D13.7; [github-safety.md](github-safety.md), "Before UPDATE_EPIC"). LOCAL state, whatever its protocol, carries no effect state.
 
 **Numbering a new protocol.** A change that adds or changes persisted state takes N + 1, where N is `__protocol_version__` on `main` when its PR is ready to merge, and it makes that bump alone: two independent persisted changes never share one. Before the PR merges, its issue announces N → N + 1, the new fields and the migration rule on #23, the home of protocol numbering. If `main` moves past N first, the PR rebases, takes the new N + 1 and says so there; after the merge, #23 records the squash commit. No number is reserved ahead of time. Label 6 stays skipped: never written, and refused as unknown like a future label (`tests/test_state.py`, `test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged`). Each bump states its migration rule in this section, in the form above: what a file of the previous protocol loads as, what an older-labelled file carrying the new state is refused as, and which new field a file of the new protocol must carry.
@@ -504,7 +500,7 @@ A controller effect (ADR 0004) is resumed from its record and never re-sent blin
 
 A validator (#172, ADR 0006 D10.7, §2.16) has its own windows. A crash before the attempt marker is saved recorded nothing, and the caller runs the definition again. A crash with the marker saved, the validator running or already exited, leaves the marker: the next `step` or `resume`, under the lock and before anything else of the step, appends an `INTERRUPTED` record built from the marker alone and clears the marker in the same save, and the definition runs again when its phase does. An exit 0 the controller did not record is therefore never a `PASS`. The record and the marker clear are one save, so a crash between them is impossible; a marker whose record exists (only a hand edit makes one) is cleared and nothing is appended, which also makes a duplicate resume idempotent. More than two `INTERRUPTED` records for one candidate, definition and policy (those at or below the operator's override watermark not counted) enters `BLOCKED` in the save that writes the third, naming the candidate and the definition. A launch or setup failure clears the marker in the next save and writes no record.
 
-The review certificate (#174, ADR 0006 §2.16) has two windows. A crash after a clean round's comment was published and before the state was saved is #162's: the journal completes the round from the observed comment, with no relaunch and no new comment, and the certificate is issued from the comment the journal observed and from the binding the plan was saved under, empty set included, in the same save that enters `READY_FOR_MERGE`; a set or policy that changed in between makes that save `BLOCKED` instead, still holding the certificate (D12.6). A crash before that save (or before the LOCAL `DONE` save) wrote neither the certificate nor the transition, so the next step completes the round again. The certificate and its transition are one write, so a crash between them is impossible.
+The review certificate (#174, ADR 0006 §2.16) has two windows. A crash after a clean round's comment was published and before the state was saved is #162's: the journal completes the round from the observed comment, with no relaunch and no new comment, and the certificate is issued from the comment the journal observed and from the binding the plan was saved under, empty set included, in the same save that enters `READY_FOR_MERGE`; a set or policy that changed in between makes that save `BLOCKED` instead, still holding the certificate (D12.6). A crash before that save wrote neither the certificate nor the transition, so the next step completes the round again. The certificate and its transition are one write, so a crash between them is impossible.
 
 The merge gate (#175, ADR 0006 D12.4, D13, §2.16) holds no state of its own across a crash: each `_verify_pr_for_merge` pass reads the PR again and checks the certificate against what it read. A crash after the `READY_FOR_MERGE -> MERGE` save runs the whole gate again in `MERGE`, certificate included, so a configuration edited before the restart is refused there exactly as at the gate pass. A crash while a `merge.verification_commands` command runs, or after it ran and before its result was saved, caches nothing (`premerge_verified_*` records an observed pass only): the next pass checks the certificate again and runs the command again. A crash after the merge call and before its save finds the PR MERGED at the next `MERGE` step, which reconciles and counts it once, with no second merge and no certificate issued, rewritten or required: counting a merge already made is not a merge decision. A restart with an applicable certificate and an unchanged PR merges as if nothing had happened. A push that lands while the `REVIEW` entry validates the head leaves records that stay true for the commit they ran on; the reviewer reviews that commit, the re-read after the review finds the push, and the round is stale with no certificate, so the next round validates and certifies the new head.
 
@@ -560,10 +556,7 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
   `resume`, `unblock` and `status` look for a run in the configured state
   directory alone (`--state-dir` or `state_dir`): the probe of
   `<git dir>/autoforge/state`, LOCAL's location, went with LOCAL's public
-  surface (ADR 0009 D3, #387). A LOCAL dry run needs a git repository
-  and reads it: `local run --dry-run` reads HEAD, branch and the workspace
-  walk to build its plan, and a dry run of an existing local run reads the
-  repository to check its run contract and current fingerprint.
+  surface (ADR 0009 D3, #387).
 - Below the git common dir no path component is followed through a symlink:
   the `autoforge` directory is created with `mkdir` and opened relative to
   the git directory's descriptor with `O_DIRECTORY | O_NOFOLLOW`, so a
@@ -640,8 +633,7 @@ takes L1:
   operation reports as its own failure (the fetch's `GitTransportError`, the
   import's failure, the worktree creation's "Nothing was launched; 'resume'
   tries again", the sandbox directories' `SandboxLaunchRefusedError`). Reads
-  take no lock. LOCAL's sandbox cache in its own git directory takes no L1;
-  the PID record is covered by L0.
+  take no lock. The PID record is covered by L0.
 - **Order L0 → L2 → L1.** L0 and L2 are only ever taken non-blocking, and
   the holder of L1 takes nothing while holding it, so no wait-for cycle can
   form; a standalone command takes L0 then L1 and never L2. A debug
@@ -698,17 +690,15 @@ __pycache__/
 
 Do not commit generated controller state, logs, lock files, credentials, or local virtual environments.
 
-The state directory defaults to `.autoforge/` in the working directory for
-a REMOTE run (overridable via `--state-dir` or `state_dir` in config) and to
-`<git dir>/autoforge/state` for a LOCAL run, outside the tree it
-fingerprints, since its own writes would otherwise keep invalidating its own
-review. Either way it must be on a filesystem with hard links:
+The state directory defaults to `.autoforge/` in the working directory
+(overridable via `--state-dir` or `state_dir` in config). It must be on a
+filesystem with hard links:
 `SafeRoot.create_exclusive` publishes a complete, fsynced temporary by
 `link(2)` and deliberately has no fallback that writes the final name
 directly (ADR 0001, known limitation 8), so on vfat/exFAT and some FUSE,
 SMB/CIFS and overlay mounts it raises `HardLinksUnavailable`, and the
 run-log probe (before every launch) and `doctor` refuse with the
-requirement named (#120). Same layout either way:
+requirement named (#120). Its layout:
 
 ```text
 <state dir>/
@@ -737,7 +727,7 @@ requirement named (#120). Same layout either way:
                                            # refused one included (enforced: false, the reason)
             stdout.log / stderr.log        # redacted; head + marker + tail past the capture bound
             control-result.json            # parsed CONTROL_RESULT (when valid)
-    read-context/<run-id>/                 # REMOTE only (#165)
+    read-context/<run-id>/                 # #165
         <phase>-<attempt>-<token>/         # one per launch, written before it: the GitHub data its
             README.md                      # prompt names (index), issue.md, pull-request.md, ...
                                            # (redacted, bounded); never read back by the controller
@@ -748,11 +738,11 @@ GitHub for one launch (ADR 0004 D10; [GitHub safety](github-safety.md#the-agent-
 It is written through the state directory's capability like a run log, is
 not state (nothing in `state.json` points at it and recovery never reads
 it), and is kept, as logs are, so an operator can see what an agent was
-handed. A dry run and a LOCAL run write none.
+handed. A dry run writes none.
 
 The controller also keeps runtime artifacts inside the repository's git
 directories, which git never tracks: in the git common dir the controller
-lock (`.git/autoforge/controller.lock`) and, in REMOTE mode, one detached
+lock (`.git/autoforge/controller.lock`) and one detached
 agent worktree per issue (`.git/autoforge/worktrees/<issue-number>`, unless
 `execution.worktree_dir` points elsewhere; a configured location must lie
 outside the checkout's working tree). A worktree is created detached at the
@@ -787,14 +777,16 @@ Under `sandbox.mode: required` the controller keeps the outer sandbox's
 directories beside them (ADR 0005 D8.4):
 
 ```text
-<git common dir>/autoforge/sandbox/<key>/     # REMOTE; <key> is the worktree's name (<n>, epic-<n>)
+<git common dir>/autoforge/sandbox/<key>/     # <key> is the worktree's name (<n>, epic-<n>)
     objects/          # the issue's private object directory: the upper layer of the agent's
                       # overlay over <common>/objects, where the objects it writes land
     overlay-work/     # the overlay's work directory; never read
     cache/            # ~/.cache of ANALYZE_EXECUTE, FIX and REPLAN_REEXECUTE launches
-<git dir>/autoforge/sandbox/local/
-    cache/            # ~/.cache of LOCAL launches that produce a change, and of validation
 ```
+
+A LOCAL run of an earlier release may have left `<git dir>/autoforge/state`
+and `<git dir>/autoforge/sandbox/local/`. Nothing reads, moves or deletes
+them (ADR 0009 D3, D10); the operator removes them by hand.
 
 They are created through `SafeRoot` at the first enforced launch that needs
 them (a link anywhere in their path refuses that launch), lie there
@@ -870,7 +862,7 @@ workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
   ```
 
   The **anchor** is the git common dir: `StatePaths` for `state/` is
-  anchored there, as a LOCAL run's state is anchored at the git dir, and
+  anchored there, and
   every component from `autoforge` down is opened descriptor-relative with
   `O_NOFOLLOW`. A symbolic link planted at `autoforge`, `scheduler`,
   `issues`, `<n>` or `state` refuses every write, archive and engine save
@@ -930,32 +922,30 @@ workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
   the claim first (D17.4, `archive_claim`, below).
 - **Engine binding.** `ControllerEngine.bind_issue_namespace(namespace)`
   points an engine's `paths` at the namespace's anchored state directory
-  before the run starts, as `bind_local_state_dir` does for LOCAL, so a
+  before the run starts, so a
   worker (#182) runs the unchanged engine there. A namespace of another
   repository than the engine's is refused; an engine never given one is
   unchanged.
 - **Standalone commands refuse the scheduler root** (D17.3). `run`,
-  `step`, `resume` and `local run` refuse (`SchedulerStateDirError`, exit
+  `step` and `resume` refuse (`SchedulerStateDirError`, exit
   2) a `--state-dir` or `config.state_dir` that resolves inside
   `<git common dir>/autoforge/scheduler/` (decided on the resolved path, so
   a relative path or a link is judged by where it leads), before the lock
   is taken and before any state is read or written; the error names
   `autoforge epic resume`, `epic status` and `epic archive` instead.
-  `step` and `resume` judge the directory they were given before they look
-  for their run in it or in LOCAL's location, so one in the scheduler root
-  that holds no `state.json` is refused rather than giving way to a LOCAL
-  run's state, and judge the directory they bind again.
+  The configured directory is the only one `step` and `resume` read, so
+  one in the scheduler root is refused before any state in it is read,
+  whether or not it holds a `state.json`.
   `status` reads such a state directory; `unblock` acts on it under the
   controller lock, as today, and then names `epic resume` rather than a
   standalone `resume`; the forward guard (Locking, above) exempts that
   namespace's own issue, and refuses an issue another namespace owns. A dry run is not refused: it takes no lock and runs
-  no git, so it has no coordination root, and it writes nothing. LOCAL's
-  default state directory (`<git dir>/autoforge/state`) is not inside the
-  scheduler root and is unaffected.
+  no git, so it has no coordination root, and it writes nothing.
 
 No per-issue state field, protocol number or state migration comes with
 any of this: the state inside a namespace is an ordinary `AutoForgeState`,
-and an existing standalone `.autoforge/` or LOCAL state is never read,
+and an existing standalone `.autoforge/`, or a directory an earlier
+release's LOCAL run left at `<git dir>/autoforge/state`, is never read,
 moved or rewritten by a namespace function.
 
 ### Scheduler claims, scheduler state and restart reconciliation
@@ -1287,8 +1277,7 @@ known and the retry path is bounded. Current cases include:
   `FIX`, the default branch in `ANALYZE_EXECUTE`) is read again after it
   (PR #404)
 - malformed CONTROL_RESULT correction attempt, none while a process the
-  launch started may still be running, and in LOCAL mode none after a
-  launch that moved the git anchor
+  launch started may still be running
 
 Do not blindly retry semantic or safety failures such as:
 
@@ -1309,9 +1298,9 @@ rule, a sandbox directory that cannot be prepared, a backend setup failure,
 a host that cannot enforce) never ran, is never retried without the
 sandbox and is never attributed to the agent. For an agent the phase is
 unchanged and `resume` tries again; until #169's pre-launch gate exists the
-attempt counter (and a LOCAL write phase's launch charge) is already saved
-by then, as for an executable that cannot be spawned. A refused LOCAL
-validation command leaves the phase unverified; a refused pre-merge
+attempt counter is already saved
+by then, as for an executable that cannot be spawned. A refused candidate
+validation command writes no marker and no record (ADR 0006 D8.5); a refused pre-merge
 verification command blocks the merge gate (`BLOCKED`). `SandboxTamperError`
 is a `VerificationError` for a private object directory that holds what no
 object store does (above); the step enters `BLOCKED`.

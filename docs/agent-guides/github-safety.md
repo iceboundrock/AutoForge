@@ -1312,7 +1312,7 @@ GitHub would close that issue once the commit reaches the default branch.
 
 ADR 0004 moved every externally visible write to the controller; #165
 removes the authority to make one from everything else AutoForge launches.
-Agents and repository-defined commands (LOCAL `local.validation_commands`,
+Agents and repository-defined commands (`validation.commands`,
 `merge.verification_commands`) receive no GitHub or git credential through
 anything AutoForge controls, so a prompt-injected agent that tries a write
 fails for lack of a credential, not for lack of an instruction. The
@@ -1324,8 +1324,7 @@ policy (docs/pi-policy.md).
 
 The classification of ADR 0004 D1.2 names operations, not tools; #148 and
 #149 cite it. Every mutation the workflow makes and every `gh` and `git`
-operation the REMOTE prompts used to name is in one class. LOCAL prompts
-make no GitHub call and are out of scope.
+operation the prompts used to name is in one class.
 
 | Operation | Class | Who performs it |
 |---|---|---|
@@ -1447,11 +1446,12 @@ never the boundary.
   a password, a comment or a macro body refuses the file too. For an agent
   the refusal is a
   `ConfigurationError` raised before anything is charged, saved or launched,
-  so state is untouched; for a validation command it leaves the phase
-  unverified, and for a pre-merge command it blocks the merge, as a failing
-  command does. It names the scope and the key's shape, never a value or a
-  URL. `autoforge doctor` and `autoforge local doctor` run the same check
-  and report the launch environment by name only.
+  so state is untouched; for a candidate validation command it is checked
+  again once and then blocks the run with no record and nothing pushed or
+  published (`ValidationInconclusiveError`), and for a pre-merge command it
+  blocks the merge, as a failing command does. It names the scope and the key's shape, never a value or a
+  URL. `autoforge doctor` runs the same check
+  and reports the launch environment by name only.
 - **The login-shell probe.** `bash -l` reads `/etc/profile` and the first
   of `~/.bash_profile`, `~/.bash_login` and `~/.profile`, and `sh -l`
   `/etc/profile` and `~/.profile`, all through `HOME`, which every child
@@ -1603,8 +1603,8 @@ named otherwise), or why it has none.
 | zsh startup files (`.zshenv` on every start, `.zprofile`, `.zshrc`, `.zlogin`), found through `ZDOTDIR` or `HOME` | `ZDOTDIR` names an empty directory of the launch's; `ZDOTDIR` refused at load | the real zsh, `-c`, `-l -c`, `-i -c` and a zsh shebang, with the operator's files exporting a token: `test_a_launchs_zsh_reads_no_startup_file_of_the_operators` (the same launch without `ZDOTDIR` merges); R3-F1's report through the real OpenCode adapter and executor, a fake `opencode` choosing its shell as 2.0.26 does: `test_an_opencode_shell_tool_merges_nothing_through_the_operators_zshenv`; `test_zsh_startup_files_in_the_home_are_no_problem` |
 | `BASH_ENV` (every non-interactive bash) and `ENV` (an interactive sh) | refused at load, never inherited | the real bash and sh: `test_a_launchs_bash_and_sh_run_no_startup_file_of_the_operators_for_a_command` (with the operator's `BASH_ENV`, `bash -c` merges) |
 | the shell an agent CLI starts (`SHELL`): fish and the csh family read their configuration on every start | `SHELL` set to the operator's POSIX shell, else `bash` or `/bin/sh` | `test_a_launchs_shell_is_one_that_reads_no_startup_file`; construction test (a fish `SHELL` becomes `bash`) |
-| login-shell startup files (`/etc/profile`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`, read through `HOME`) | the login-shell probe refuses a launch whose shells' startup files change a probed variable | the real bash and sh: `test_a_login_startup_file_that_restores_a_route_is_named_never_its_value`, `test_what_is_withheld_as_defence_in_depth_alone_is_no_startup_problem`, `test_a_startup_file_that_ends_the_shell_could_not_be_checked`, `test_a_probe_without_an_answer_could_not_be_checked`; `test_engine.py::test_a_login_shell_startup_file_that_exports_a_credential_refuses_the_launch`, `test_a_shell_startup_file_that_exports_a_credential_blocks_the_premerge_verification`; `test_local.py::test_a_startup_file_planted_before_validation_leaves_the_phase_unverified`; `test_doctor.py::test_doctor_refuses_a_login_shell_startup_file_that_exports_a_credential` |
-| validation and pre-merge commands | the same variables and preflight, the login-shell probe included | `test_local.py::test_local_launches_get_the_same_isolation_and_no_read_context`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
+| login-shell startup files (`/etc/profile`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`, read through `HOME`) | the login-shell probe refuses a launch whose shells' startup files change a probed variable | the real bash and sh: `test_a_login_startup_file_that_restores_a_route_is_named_never_its_value`, `test_what_is_withheld_as_defence_in_depth_alone_is_no_startup_problem`, `test_a_startup_file_that_ends_the_shell_could_not_be_checked`, `test_a_probe_without_an_answer_could_not_be_checked`; `test_engine.py::test_a_login_shell_startup_file_that_exports_a_credential_refuses_the_launch`, `test_a_shell_startup_file_that_exports_a_credential_blocks_the_premerge_verification`; `test_validation_evidence.py::test_a_startup_file_planted_by_the_producer_refuses_its_validation_and_blocks`, `test_engine.py::test_a_startup_file_planted_before_candidate_validation_blocks_the_producer`; `test_doctor.py::test_doctor_refuses_a_login_shell_startup_file_that_exports_a_credential` |
+| validation and pre-merge commands | the same variables and preflight, the login-shell probe included | `test_validation_evidence.py::test_a_helper_planted_by_the_producer_never_reaches_its_validation_command`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
 
 End to end, `tests/test_integration.py` runs the whole REMOTE lifecycle with
 an operator shell holding every route above and checks each launch while it
@@ -1797,11 +1797,11 @@ can write, so they hold under `sandbox.mode: disabled` too:
   every commit a decision reads stays required in both modes.
 
 **Guaranteed for an enforced launch** (`sandbox.mode: required`: every
-agent process, LOCAL validation command and pre-merge command runs inside
-the sandbox or is refused):
+agent process, candidate validation command and pre-merge command runs
+inside the sandbox or is refused):
 
 1. **G1. Nothing of the controller is reachable.** The state directory,
-   the run logs, the lock, the REMOTE controller checkout and every other
+   the run logs, the lock, the controller's checkout and every other
    registered worktree are absent; the read context is read-only.
 2. **G2. No credential the boundary hides is reachable by path or by local
    IPC.** The operator's home is a private, empty one, so the gh and git
@@ -1815,11 +1815,11 @@ the sandbox or is refused):
    launch's own outer `bwrap`.
 4. **G4. Writes land only in the launch's writable projections and private
    mounts:** the issue worktree, its admin dir, the private object
-   directory and the cache; the LOCAL repository root; the exported tree.
+   directory and the cache; the exported tree.
 5. **G5. Shared repository state is read-only.** No shared ref,
    configuration, hook, alternates file or shared object can be written; a
-   REMOTE agent's new objects reach the shared store only through the
-   strict import, and a LOCAL agent's git directory is read-only.
+   agent's new objects reach the shared store only through the
+   strict import.
 6. **G6. Nothing outlives the invocation,** inside the namespace included.
 
 **Not protected by an enforced launch:**
@@ -1846,11 +1846,11 @@ the sandbox or is refused):
 **Out of scope:** kernel or `bwrap` exploits, a malicious operator, network
 egress, resource exhaustion beyond ADR 0002 and the tmpfs bounds, side
 channels, credentials the operator deliberately projects, the operator's
-own unsandboxed tools, and every launch under `disabled`, or one that
-`preferred` let fall back to logical isolation (LOCAL only, said at each
-launch; #169 added `preferred`, the capability gate before anything is
-saved, and `doctor`'s capability, hard-link, sandbox-directory and
-loopback-listener reports: [Usage: outer sandbox](../usage.md#outer-sandbox)).
+own unsandboxed tools, and every launch under `disabled` (#169 added the
+capability gate before anything is saved, and `doctor`'s capability,
+hard-link, sandbox-directory and loopback-listener reports:
+[Usage: outer sandbox](../usage.md#outer-sandbox)). `preferred` means
+`required` (ADR 0009 D7): no launch falls back to logical isolation.
 
 ## Merge safety
 

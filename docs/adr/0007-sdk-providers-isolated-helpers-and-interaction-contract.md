@@ -18,6 +18,10 @@
   server it owns and its adapter). The number is assigned when the record
   merges: if another ADR merges first, this record takes the next free
   number, and its index entries move with it.
+- **Note:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) removed LOCAL mode (#388). The LOCAL
+  obligations of §1.1, §2.5 (the LOCAL interaction identity), §2.7, D8.2
+  and D8.5 are unimplemented, and the child issue that implements them
+  drops them.
 - **Decides:** #148, for EPIC #147 (Workstream A). #148 expected the number
   0004; ADRs 0004 to 0006 merged first.
 - **Amends:** ADR 0003 §2.9, with a dated note: the shared session and

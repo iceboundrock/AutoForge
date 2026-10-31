@@ -1,0 +1,170 @@
+{
+  "acceptance_outcomes": [
+    {
+      "action_id": "A-4c4b2a6abd3bf569",
+      "at": "2026-10-31T10:31:39.180465+00:00",
+      "comment_url": "",
+      "finding_id": "R1-F1",
+      "outcome": "declined",
+      "reason": "the comment overstates the test coverage",
+      "round": 1
+    }
+  ],
+  "attempt": 2,
+  "base_branch": "",
+  "base_head_sha": "",
+  "baseline_dirty_paths": [],
+  "block_reason": "",
+  "completion_context": {
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "phase": "FIX",
+    "pr_url": "https://github.com/owner/repo/pull/42",
+    "resolutions": [
+      {
+        "acceptance_source": null,
+        "commit_sha": "",
+        "finding_id": "R1-F1",
+        "follow_up_source": null,
+        "operator_sources": null,
+        "rationale": "The loader already validates this path in `load_config`, and the test `test_config_rejects_unknown_keys` covers it; no change is needed.",
+        "resolution": "no_change_with_rationale"
+      }
+    ],
+    "round": 1
+  },
+  "config_fingerprint": {},
+  "controller_version": "0.1.0a1.dev0",
+  "counted_merged_prs": [],
+  "created_at": "2026-10-31T10:31:39.033848+00:00",
+  "current_base_ref": "main",
+  "current_branch": "autoforge/2-feature",
+  "current_head_sha": "0718a951623d0b83ad18d155a5d2d32be5322cab",
+  "current_issue_url": "https://github.com/owner/repo/issues/2",
+  "current_merge_base_sha": "",
+  "current_pr_url": "https://github.com/owner/repo/pull/42",
+  "effect_records": [
+    {
+      "attempts": 1,
+      "completion": "remote_ref_equals_candidate",
+      "identity": {
+        "candidate_sha": "a68d499e953d0bfb51f306c23e4ea0b68c1c2f0a",
+        "ref": "refs/heads/autoforge/2-feature",
+        "repository": "owner/repo"
+      },
+      "kind": "push",
+      "observed": {
+        "sha": "a68d499e953d0bfb51f306c23e4ea0b68c1c2f0a"
+      },
+      "owner": {
+        "issue_url": "https://github.com/owner/repo/issues/2",
+        "phase": "FIX",
+        "pr_url": "https://github.com/owner/repo/pull/42",
+        "run_id": "af-20261031T103139Z-93abfc",
+        "transaction_id": ""
+      },
+      "payload": {
+        "sha": "a68d499e953d0bfb51f306c23e4ea0b68c1c2f0a"
+      },
+      "position": 0,
+      "precondition": {
+        "base_sha": "0718a951623d0b83ad18d155a5d2d32be5322cab",
+        "expected_old": "0718a951623d0b83ad18d155a5d2d32be5322cab"
+      },
+      "reason": "",
+      "stage": "observed",
+      "target": {
+        "ref": "refs/heads/autoforge/2-feature",
+        "repository": "owner/repo"
+      }
+    }
+  ],
+  "entry_observation": {
+    "base_sha": "0718a951623d0b83ad18d155a5d2d32be5322cab",
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "objects": {
+      "<!-- ai-follow-up: {\"finding_id\": \"R1-F1\", \"pr\": \"https://github.com/owner/repo/pull/42\"} -->": null
+    },
+    "operator_targets": {
+      "allowed_by": {
+        "1": [
+          "epic"
+        ]
+      },
+      "issue_body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "numbers": [
+        1
+      ]
+    },
+    "phase": "FIX",
+    "pr_url": "https://github.com/owner/repo/pull/42",
+    "refs": {
+      "refs/heads/autoforge/2-feature": "0718a951623d0b83ad18d155a5d2d32be5322cab"
+    }
+  },
+  "epic_url": "https://github.com/owner/repo/issues/1",
+  "escalation_count": 0,
+  "execution_attempt": 1,
+  "feature_spec_path": "",
+  "feature_spec_sha256": "",
+  "last_fix_resolutions": [],
+  "last_review_comment_url": "https://github.com/owner/repo/pull/42#issuecomment-100",
+  "last_review_needs_fix": null,
+  "last_review_result": "",
+  "launch_label": "controller_publishes",
+  "local_fix_rounds": 0,
+  "local_pending_attempts": 0,
+  "local_pending_fingerprint": "",
+  "local_pending_phase": "",
+  "local_run_contract": {},
+  "merged_since_epic_update": 0,
+  "mode": "REMOTE",
+  "next_issue_rejections": [],
+  "open_findings": [
+    {
+      "classification": "nit",
+      "id": "R1-F1",
+      "location": "src/x.py:1",
+      "required_resolution": "fix the typo",
+      "title": "typo"
+    }
+  ],
+  "operator_comment_outcomes": [],
+  "phase": "FIX",
+  "premerge_verified_commands": [],
+  "premerge_verified_head_sha": "",
+  "prior_findings": [],
+  "producer_validation_failure": {},
+  "prompt_version": "v14",
+  "protocol_version": "12",
+  "replan_transaction": {},
+  "repository": "owner/repo",
+  "review_certificate": {},
+  "review_evidence": {},
+  "review_history": [],
+  "review_round": 1,
+  "reviewed_base_ref": "",
+  "reviewed_head_sha": "0718a951623d0b83ad18d155a5d2d32be5322cab",
+  "reviewed_merge_base_sha": "",
+  "reviewed_pr_url": "",
+  "reviewed_workspace_fingerprint": "",
+  "run_id": "af-20261031T103139Z-93abfc",
+  "sandbox_pin": {},
+  "step_count": 2,
+  "superseded_prs": [],
+  "unblock_history": [
+    {
+      "action": "declined A-4c4b2a6abd3bf569",
+      "at": "2026-10-31T10:31:39.180465+00:00",
+      "block_reason": "FIX of review round 1 awaits operator action A-4c4b2a6abd3bf569 (acceptance_comment effect 0 on https://github.com/owner/repo/issues/2: action A-4c4b2a6abd3bf569 awaits the operator's approval; nothing was sent). The fixer resolved finding R1-F1 ('typo') by asking the controller to publish an acceptance comment on issue https://github.com/owner/repo/issues/2 for PR https://github.com/owner/repo/pull/42; nothing of the FIX plan was sent. The comment's payload is 481 characters, sha256 d87cf5c6186b6b3f71448e03e09e6abda0c5a06c81edbb5e331dbc77cd0916ea; print it with autoforge status --action A-4c4b2a6abd3bf569. Meanwhile the push of a68d499e953d to 'autoforge/2-feature' is held back until the comment is verified, and that unpushed candidate lives only in the agent worktree /tmp/autoforge-protocol-12-capture/test_fix_acceptance_action_dec0/.git/autoforge/worktrees/2: do not reset or remove it. Next: approve it: autoforge unblock --approve-action A-4c4b2a6abd3bf569 --reason '<why>', then autoforge resume; or post exactly that payload on https://github.com/owner/repo/issues/2 yourself (marker included), then autoforge unblock --reason '<why>' and autoforge resume; or decline it: autoforge unblock --decline-action A-4c4b2a6abd3bf569 --reason '<why>' (FIX runs the fixer again, with the decline in its prompt)",
+      "detail": "PR https://github.com/owner/repo/pull/42 is OPEN at the reviewed HEAD, base and merge base and action A-4c4b2a6abd3bf569 is declined; nothing of the FIX plan was sent, so it is dropped and FIX launches the fixer afresh with the decline in its prompt (the worktree and its commits are kept)",
+      "phase": "FIX",
+      "reason": "the comment overstates the test coverage"
+    }
+  ],
+  "updated_at": "2026-10-31T10:31:39.382279+00:00",
+  "validation_attempt": {},
+  "validation_override_seq": 0,
+  "validation_records": [],
+  "verification_failures": [],
+  "workspace_fingerprint": ""
+}

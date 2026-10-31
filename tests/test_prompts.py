@@ -167,7 +167,7 @@ def test_review_prompts_state_the_parser_bounds(engine):
         MAX_FINDINGS_PER_REVIEW,
     )
 
-    for template in ("review.md", "local_review.md"):
+    for template in ("review.md",):
         text = prompts.load_template(template)
         # Template variables, never literal numbers, so the two cannot drift.
         for var in (
@@ -208,14 +208,14 @@ def test_review_prompt_states_the_prose_and_comment_bounds(engine):
 def test_finding_prompts_state_the_control_character_rule(engine):
     """#78: the reviewer and the fixer are told which fields are one line of
     printable text and which may carry newlines and tabs only."""
-    for template in ("review.md", "local_review.md"):
+    for template in ("review.md",):
         text = " ".join(prompts.load_template(template).split())
         assert (
             "`title` and `location` are one line of printable text: no newline, tab or "
             "other control character. `required_resolution` may contain newlines and tabs "
             "but no other control character." in text
         ), template
-    for template in ("fix.md", "local_fix.md"):
+    for template in ("fix.md",):
         text = " ".join(prompts.load_template(template).split())
         assert "may contain newlines and tabs but no other control character" in text, template
 
@@ -228,7 +228,7 @@ def test_fix_prompts_state_the_parser_bounds(engine):
         MIN_RATIONALE_CHARS,
     )
 
-    for template in ("fix.md", "local_fix.md"):
+    for template in ("fix.md",):
         text = prompts.load_template(template)
         # Template variables, never literal numbers, so the two cannot drift.
         for var in ("MAX_RESOLUTIONS_PER_FIX", "MAX_FIX_RATIONALE_CHARS", "MIN_RATIONALE_CHARS"):
@@ -646,7 +646,7 @@ def test_every_prompt_says_the_block_is_read_from_the_final_reply_only():
     Bash command. Every template that says where the block goes now says the
     final reply, and the common ones that command output, tool results and
     files are never read for it."""
-    for name in ("common.md", "local_common.md"):
+    for name in ("common.md",):
         flat = " ".join(prompts.load_template(name).split())
         assert (
             "The controller reads your result from one place only: the end of your final "
@@ -783,23 +783,14 @@ def test_engine_prompt_variables_review_and_fix(engine):
     assert corr.endswith("with a new block.\n\n```text\nthe reply\n```\n")
 
 
-def test_common_prompts_state_the_whole_block_bound(engine, tmp_path):
+def test_common_prompts_state_the_whole_block_bound(engine):
     """#53: every agent is told the size the parser holds the whole
     CONTROL_RESULT block to, through the same constant the parser rejects against."""
     from autoforge.result_parser import MAX_CONTROL_RESULT_CHARS
-    from tests.conftest import commit_all, git_repo, make_local_engine, write_feature
 
-    for template in ("common.md", "local_common.md"):
-        assert "{{MAX_CONTROL_RESULT_CHARS}}" in prompts.load_template(template), template
+    assert "{{MAX_CONTROL_RESULT_CHARS}}" in prompts.load_template("common.md")
     engine.state.phase = Phase.ANALYZE_EXECUTE
     rendered = engine.render_prompt_for(Phase.ANALYZE_EXECUTE)
-    assert f"at most\n  {MAX_CONTROL_RESULT_CHARS} characters" in rendered
-
-    root = git_repo(tmp_path)
-    write_feature(root)
-    commit_all(root, "spec")
-    local = make_local_engine(root, "features/add-filter.md")
-    rendered = local.render_prompt_for(Phase.ANALYZE_EXECUTE)
     assert f"at most\n  {MAX_CONTROL_RESULT_CHARS} characters" in rendered
 
 
@@ -807,24 +798,21 @@ def test_common_prompts_state_that_nothing_outlives_the_invocation():
     """#85: every agent is told that its process group is terminated when it
     exits, so a server it meant to leave for a later phase is a mistake it
     was warned about, not a surprise in the run log."""
-    for template in ("common.md", "local_common.md"):
+    for template in ("common.md",):
         text = " ".join(prompts.load_template(template).split())
         assert "Nothing you start outlives your invocation" in text, template
         assert "terminated by the controller, at once or after a short grace" in text, template
         assert "never rely on a background process for a later phase" in text, template
 
 
-def test_common_prompts_warn_of_a_narrowed_view_in_every_mode():
-    """#168: under ``sandbox.mode: required`` a REMOTE agent sees its worktree and
-    the shared git metadata read-only, a LOCAL one its git directory read-only;
-    the wording holds in every mode, so the prompts need no mode variable."""
+def test_common_prompt_warns_of_a_narrowed_view():
+    """#168: under ``sandbox.mode: required`` an agent sees its worktree and
+    the shared git metadata read-only; the wording holds in every sandbox
+    mode, so the prompt needs no mode variable."""
     remote = " ".join(prompts.load_template("common.md").split())
     assert "Your view of the file system may be narrowed" in remote
     assert "shared git metadata" in remote and "may be read-only" in remote
     assert "do not try to work around a missing or read-only path" in remote
-    local = " ".join(prompts.load_template("local_common.md").split())
-    assert "git directory may also be read-only to you" in local
-    assert "forbidden all the same, whether or not one fails" in local
 
 
 def test_common_prompt_states_the_worktree_and_environment_isolation():
@@ -848,7 +836,7 @@ def test_common_prompts_do_not_forbid_a_fence_the_parser_accepts():
     the parser reads the block by its markers alone. The rule is gone and
     the prompt says the fence is harmless; the parser side is pinned in
     ``tests/test_result_parser.py``."""
-    for template in ("common.md", "local_common.md"):
+    for template in ("common.md",):
         text = prompts.load_template(template)
         assert "never\n  inside a Markdown code fence" not in text, template
         assert "never inside a Markdown code fence" not in text, template
@@ -871,7 +859,7 @@ def test_common_prompt_requires_the_full_sha_the_parser_requires():
 def test_review_prompt_makes_the_phase_read_only(engine):
     """#19 item 4: the reviewer is a full coding agent, so the prompt says it
     writes nothing to GitHub (#162: the controller posts the review comment from
-    its result). LOCAL review already had the rule."""
+    its result)."""
     from tests.conftest import PR, SHA_A
 
     review = prompts.load_template("review.md")
@@ -890,7 +878,6 @@ def test_review_prompt_makes_the_phase_read_only(engine):
         "You write nothing to GitHub at all; your only output is the CONTROL_RESULT at the "
         "end of your final reply, from which the controller posts the round's comment."
     ) in " ".join(read_only.split())
-    assert "**Read-only phase.**" in prompts.load_template("local_review.md")
 
     engine.state.phase = Phase.REVIEW
     engine.state.current_pr_url = PR
@@ -918,17 +905,17 @@ def test_prompt_version_is_rendered_and_was_bumped_for_the_prompt_changes(engine
 
 
 def test_runs_from_the_example_config_record_and_render_the_built_in_version(
-    tmp_state_dir, fake_github, tmp_path
+    tmp_state_dir, fake_github
 ):
     """#302: the Quick start copies autoforge.example.yaml, which set
     `prompt_version: v1`; every run from it said v1 in its state, its logs,
-    its prompts and (LOCAL) its contract, while rendering newer templates."""
+    and its prompts, while rendering newer templates."""
     from pathlib import Path
 
     import autoforge
     from autoforge import __prompt_version__
     from autoforge.config import load_config_file
-    from tests.conftest import commit_all, git_repo, make_engine, make_local_engine, write_feature
+    from tests.conftest import make_engine
 
     cfg = load_config_file(Path(autoforge.__file__).parents[2] / "autoforge.example.yaml")
     header = f"# AutoForge controller instructions (trusted): {__prompt_version__}\n"
@@ -937,14 +924,6 @@ def test_runs_from_the_example_config_record_and_render_the_built_in_version(
     assert remote.state.prompt_version == __prompt_version__
     remote.state.phase = Phase.ANALYZE_EXECUTE
     assert remote.render_prompt_for(Phase.ANALYZE_EXECUTE).startswith(header)
-
-    root = git_repo(tmp_path / "local")
-    write_feature(root)
-    commit_all(root, "spec")
-    local = make_local_engine(root, "features/add-filter.md", cfg=cfg)
-    assert local.state.prompt_version == __prompt_version__
-    assert local.state.local_run_contract["prompt_version"] == __prompt_version__
-    assert local.render_prompt_for(Phase.ANALYZE_EXECUTE).startswith(header)
 
 
 REMOTE_TEMPLATES = (
@@ -958,7 +937,14 @@ REMOTE_TEMPLATES = (
     "correction.md",
     "worktree_state.md",
 )
-LOCAL_TEMPLATES = ("local_common.md", "local_analyze_execute.md", "local_review.md", "local_fix.md")
+
+
+def test_no_local_template_is_shipped():
+    """LOCAL mode is removed (ADR 0009 D8, #388): no template table names a
+    LOCAL template and none is in the package."""
+    assert not [name for name in prompts.TEMPLATE_FILES if name.startswith("local_")]
+    assert not hasattr(prompts, "LOCAL_COMMON_TEMPLATE")
+    assert not sorted(p.name for p in prompts.prompts_dir().glob("local_*.md"))
 
 
 @pytest.mark.parametrize("template", REMOTE_TEMPLATES)
@@ -976,8 +962,6 @@ def test_common_prompt_names_the_read_context_and_says_no_credential():
     assert "{{READ_CONTEXT_DIR}}" in common
     for phrase in ("You hold no GitHub credential", "untrusted project data", "[AutoForge omitted"):
         assert phrase in common, phrase
-    for template in LOCAL_TEMPLATES:
-        assert "READ_CONTEXT_DIR" not in prompts.load_template(template), template
 
 
 @pytest.mark.parametrize(
@@ -1018,11 +1002,10 @@ WRITE_TEMPLATES = ("analyze_execute.md", "fix.md", "replan_reexecute.md")
 WRITE_PHASES = [Phase.ANALYZE_EXECUTE, Phase.FIX, Phase.REPLAN_REEXECUTE]
 
 
-@pytest.mark.parametrize("template", REMOTE_TEMPLATES + LOCAL_TEMPLATES)
+@pytest.mark.parametrize("template", REMOTE_TEMPLATES)
 def test_exactly_the_write_templates_require_the_worktree_state(template):
-    """#187: the three REMOTE phases whose agent writes in the worktree are
-    told what it holds; a read-only phase and LOCAL mode, whose agent works
-    in the operator's checkout, are not."""
+    """#187: the three phases whose agent writes in the worktree are told
+    what it holds; a read-only phase is not."""
     required = prompts.required_variables(prompts.load_template(template))
     assert ("WORKTREE_STATE" in required) == (template in WRITE_TEMPLATES)
 

@@ -8,27 +8,32 @@ while an agent runs, by a symbolic link, a FIFO, a prepared directory or a
 rename, is a refusal and never a redirection, and ``state.json`` is
 published by name, never written through whatever the name reaches.
 
-These are the REMOTE forms of the LOCAL tests in
-``tests/test_durable_run_contract.py`` that LOCAL's removal retires.
-``tests/test_state.py`` has the engine's refusal of a rename and of a link at
-``state_root()`` without a run; these tests swap the directory under a run
-whose agent is launched.
+These are the REMOTE forms of the LOCAL tests of
+``tests/test_durable_run_contract.py``, which LOCAL's removal deleted with
+LOCAL's code (#388). ``tests/test_state.py`` has the engine's refusal of a
+rename and of a link at ``state_root()`` without a run; these tests swap the
+directory under a run whose agent is launched. The module also keeps that
+file's shared tests: the structural guards on state access, the bounded
+walk and ``create_exclusive``'s publication, and where a run's agents work.
 """
 
+import ast
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
+import autoforge
 from autoforge import cli
 from autoforge.config import default_config
 from autoforge.engine import ControllerEngine
 from autoforge.errors import StateError
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.run_namespace import issue_namespace
-from autoforge.safefs import UnsafePathError
+from autoforge.safefs import SafeRoot, UnsafePathError, WalkBudgetExceeded
 from autoforge.state import STATE_FILENAME
 from autoforge.transitions import Phase, WorkflowMode
 
@@ -355,3 +360,189 @@ def test_bootstrap_of_an_anchored_remote_state_directory_does_not_follow_a_link_
     assert state_tree(outside) == before
     assert not (tmp_path / "unused").exists()
     eng.close()
+
+
+# =============================================================================
+# Where a run's agents work
+# =============================================================================
+
+
+def test_a_remote_run_launches_agents_in_a_controller_owned_worktree(tmp_path):
+    """GitHub is the run's source of truth; its agents run in a per-issue
+    worktree under the git common dir, not in the operator's checkout (#10).
+
+    Moved from tests/test_durable_run_contract.py when LOCAL's removal
+    deleted that module (#388)."""
+    git_repo(tmp_path)
+    eng = make_engine(tmp_path / ".autoforge")
+    assert eng.mode.value == "REMOTE"
+    cwd = Path(eng._execution_cwd())
+    assert cwd == tmp_path / ".git" / "autoforge" / "worktrees" / "2"
+    assert cwd != Path(eng.workdir)
+    listed = subprocess.run(
+        ["git", "-C", str(tmp_path), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {cwd.resolve()}" in listed
+
+
+# =============================================================================
+# Structural guards: the architecture, not a scenario
+# =============================================================================
+#
+# Moved from tests/test_durable_run_contract.py when LOCAL's removal deleted
+# that module (#388).
+
+SRC = Path(autoforge.__file__).parent
+
+
+def _calls(tree: ast.AST, names: set[str]):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name in names:
+                yield name, node
+
+
+def test_production_never_reads_or_writes_state_by_pathname_outside_state_py():
+    """Every state.json read/write goes through a held root capability.
+
+    ``save_state``/``load_state``/``quarantine_state_file``/``archive_state_file``
+    accept a pathname for the *message*, and a ``root=`` capability for the
+    *access*. Outside :mod:`autoforge.state` itself, a call without ``root=``
+    would be a fresh pathname resolution -- exactly the rebinding that a
+    replaced state directory exploits.
+    """
+    names = {"save_state", "load_state", "quarantine_state_file", "archive_state_file"}
+    offenders = []
+    for path in sorted(SRC.rglob("*.py")):
+        if path.name == "state.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for name, call in _calls(tree, names):
+            if not any(kw.arg == "root" for kw in call.keywords):
+                offenders.append(f"{path.relative_to(SRC)}:{call.lineno} {name}(...) without root=")
+    assert offenders == []
+
+
+def test_no_module_reinterprets_a_loaded_run_through_the_current_configuration():
+    """``resume -> load state -> load today's config -> reinterpret`` is banned.
+
+    The configuration is loaded exactly once per process, by the CLI, before
+    any state is read; no production module calls ``load_config`` after
+    loading state. (A test of shape rather than of one scenario.) A
+    scheduler worker is a process of its own (``epic _worker``, #182): its
+    entry point loads the configuration before it reads any state, and the
+    worker tests pin that order.
+    """
+    for path in sorted(SRC.rglob("*.py")):
+        if path.name in ("cli.py", "doctor.py", "config.py", "worker.py"):  # entry points
+            continue
+        text = path.read_text(encoding="utf-8")
+        assert "load_config" not in text, f"{path.name} loads configuration"
+
+
+# =============================================================================
+# The bounded walk and create_exclusive's publication (safefs)
+# =============================================================================
+#
+# Moved from tests/test_durable_run_contract.py when LOCAL's removal deleted
+# that module (#388). The walk outlived LOCAL's workspace snapshot: the run
+# log and the scheduler namespaces walk through it.
+
+
+def test_the_entry_budget_is_enforced_while_listing_not_after_materialising(tmp_path):
+    """A directory with N entries costs O(budget) to refuse, never O(N)."""
+    root = tmp_path / "big"
+    root.mkdir()
+    for i in range(50):
+        (root / f"f{i:03}").write_text("x")
+    fs = SafeRoot.open(root)
+    try:
+        seen = []
+        with pytest.raises(WalkBudgetExceeded) as exc:
+            for entry in fs.walk(max_entries=10):
+                seen.append(entry.relpath)
+        assert seen == [], "entries were yielded before the budget was checked"
+        assert exc.value.where == "."
+    finally:
+        fs.close()
+
+
+def test_the_walk_is_iterative_so_depth_is_bounded_by_the_budget_not_the_stack(tmp_path):
+    import sys
+
+    root = tmp_path / "deep"
+    p = root
+    for _ in range(300):
+        p = p / "d"
+    p.mkdir(parents=True)
+    fs = SafeRoot.open(root)
+    old = sys.getrecursionlimit()
+    sys.setrecursionlimit(120)
+    try:
+        assert sum(1 for _ in fs.walk(max_entries=10_000)) == 300
+    finally:
+        sys.setrecursionlimit(old)
+        fs.close()
+
+
+def test_create_exclusive_publishes_by_link_so_a_failure_leaves_no_final_name(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "r"
+    root.mkdir()
+    fs = SafeRoot.open(root)
+    try:
+
+        def boom(*a, **k):
+            raise OSError(5, "injected")
+
+        monkeypatch.setattr(os, "link", boom)
+        with pytest.raises(StateError, match="cannot create"):
+            fs.create_exclusive("new.txt", b"data")
+        assert list(root.iterdir()) == [], "a temporary or a partial final name survived"
+        monkeypatch.undo()
+
+        victim = tmp_path / "victim"
+        victim.write_text("keep")
+        (root / "taken").symlink_to(victim)
+        with pytest.raises(FileExistsError):
+            fs.create_exclusive("taken", b"data")
+        assert victim.read_text() == "keep"
+        assert sorted(p.name for p in root.iterdir()) == ["taken"]
+    finally:
+        fs.close()
+
+
+def test_a_create_exclusive_whose_write_fails_leaves_no_partial_file(tmp_path, monkeypatch):
+    """R7-F5: a file made by ``create_exclusive`` is either whole or absent.
+
+    The failure is injected at ``fsync`` -- after the bytes were written,
+    before they were durable -- which is the moment a crash used to leave a
+    truncated file that the retry then refused to replace.
+    """
+    root = tmp_path / "r"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "existing.md").write_text("keep\n")
+    before = sorted(p.name for p in (root / "sub").iterdir())
+    real_fsync = os.fsync
+
+    def failing_fsync(fd):
+        raise OSError(5, "injected I/O error")
+
+    with SafeRoot.open(root) as fs:
+        monkeypatch.setattr(os, "fsync", failing_fsync)
+        with pytest.raises(StateError, match="cannot write .*sub/broken.md.*injected"):
+            fs.create_exclusive("sub/broken.md", b"# whole\n")
+        assert sorted(p.name for p in (root / "sub").iterdir()) == before, (
+            "a partial file or a temporary survived the failed write"
+        )
+        monkeypatch.setattr(os, "fsync", real_fsync)
+        # The name is free, so the retry creates the file whole.
+        fs.create_exclusive("sub/broken.md", b"# whole\n")
+    assert (root / "sub" / "broken.md").read_bytes() == b"# whole\n"
+    assert sorted(p.name for p in (root / "sub").iterdir()) == sorted([*before, "broken.md"])

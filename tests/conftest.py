@@ -110,12 +110,13 @@ DECODER_LIMIT_RECORDS = {
     "deep-nesting": b'{"type": "x", "n": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
 }
 
-# -- the state pins of LOCAL's removal (ADR 0009 D8, D12 S1b; #385) ---------------------
+# -- the state pins of LOCAL's removal (ADR 0009 D8, D12 S1b and S3; #385, #388) --------
 # The twelve state fields LOCAL mode added (ADR 0009 §1.1), at the empty value
-# every REMOTE save writes them with. A protocol-1 file carries none, some or
-# all of them, every later save all twelve. Each refusal the removal keeps is
+# every REMOTE save wrote them with. A protocol-1 file carries none, some or
+# all of them, every save under labels 2 to 12 all twelve; protocol 13 drops
+# them (#388, ADR 0009 D8) and writes none. Each refusal the removal keeps is
 # pinned on a file with all twelve at these values and on one with none of
-# them, so that dropping the fields (#388) cannot turn either into a file that
+# them, so that dropping the fields cannot turn either into a file that
 # loads, or refuse it for another reason.
 LOCAL_STATE_FIELDS = {
     "feature_spec_path": "",
@@ -2164,7 +2165,6 @@ def certify_review(eng: ControllerEngine, tree: str = "e" * 40) -> dict:
         state.review_evidence,
         records,
         repository=state.repository,
-        run_id=state.run_id,
         review_round=state.review_round,
         needs_fix_round=False,
         actionable_findings=0,
@@ -2492,7 +2492,6 @@ def sandbox_probe(monkeypatch) -> SandboxProbe:
 # ``os.fsync`` (see ``_fsync_without_the_disk``).
 REAL_FSYNC_MODULES = frozenset(
     {
-        "test_durable_run_contract.py",
         "test_run_namespace.py",
         "test_runlog.py",
         "test_safefs.py",
@@ -2588,82 +2587,6 @@ def engine(tmp_state_dir, fake_github):
     return make_engine(tmp_state_dir, [], github=fake_github)
 
 
-# -- LOCAL mode -----------------------------------------------------------------
-class ExplodingGitHub:
-    """A GitHub client that fails the test on any use.
-
-    A LOCAL run must make zero GitHub calls, so the strongest available
-    assertion is to hand the engine a client that cannot be touched at all.
-    """
-
-    def __getattr__(self, name: str):
-        raise AssertionError(f"LOCAL mode touched GitHub: {name!r}")
-
-
-FEATURE_MD = """# Feature: Add Transaction Filter
-
-## Problem
-
-Users cannot filter transactions.
-
-## Requirements
-
-- [ ] Add a `--since` filter.
-
-## Acceptance Criteria
-
-- [ ] Filtering by date returns only later transactions.
-
-## Non-goals
-
-- Pagination.
-
-## Notes / Decisions
-
-None.
-"""
-
-
-def sample_contract(
-    *,
-    repository_root: str = "/repo",
-    state_root: str = "/repo/.git/autoforge/state",
-    exclude: tuple[str, ...] = (),
-    max_entries: int = 50_000,
-    max_bytes: int = 512 * 1024 * 1024,
-    validation_commands: tuple[tuple[str, ...], ...] = (),
-    max_fix_rounds: int = 1,
-    max_total_steps: int = 300,
-    prompt_version: str = "v1",
-) -> dict:
-    """A well-formed persisted LOCAL run contract (see ``autoforge.run_contract``)."""
-    from autoforge.local_workspace import SNAPSHOT_TAG
-    from autoforge.run_contract import LocalRunContract, WorkspacePolicy
-
-    return LocalRunContract(
-        repository_root=repository_root,
-        state_root=state_root,
-        workspace_policy=WorkspacePolicy(
-            exclude=exclude,
-            max_entries=max_entries,
-            max_bytes=max_bytes,
-            snapshot_tag=SNAPSHOT_TAG,
-        ),
-        validation_commands=validation_commands,
-        max_fix_rounds=max_fix_rounds,
-        max_total_steps=max_total_steps,
-        prompt_version=prompt_version,
-    ).to_dict()
-
-
-def write_feature(repo, name: str = "add-filter", body: str = FEATURE_MD) -> Path:
-    """Write ``features/<name>.md`` inside ``repo`` and return the path."""
-    path = Path(repo) / "features" / f"{name}.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    return path
-
-
 def commit_all(repo, message: str = "wip") -> None:
     """Commit everything in ``repo`` (tests need a clean baseline tree).
 
@@ -2688,45 +2611,6 @@ def commit_all(repo, message: str = "wip") -> None:
         ],
         check=True,
     )
-
-
-def make_local_engine(
-    workdir,
-    feature,
-    script=None,
-    cfg=None,
-    exit_code: int = 0,
-    state_dir=None,
-    allow_dirty: bool = False,
-    start: bool = True,
-):
-    """Engine wired for a LOCAL run: scripted agents, exploding GitHub.
-
-    No ``runner`` is injected: ``LocalWorkspace`` must run real ``git`` against
-    the real temporary repository, which is the whole point of the local trust
-    boundary.
-
-    ``state_dir`` is left unset by default so the engine resolves it the way
-    the CLI does -- ``<git dir>/autoforge/state``, outside the reviewed tree.
-    Tests that exercise state-dir placement pass one explicitly.
-    """
-    cfg = cfg or default_config()
-    provider = ScriptedProvider(script, exit_code=exit_code)
-    registry = ProviderRegistry(
-        overrides={"claude": provider, "opencode": provider, "scripted": provider}
-    )
-    eng = ControllerEngine(
-        config=cfg,
-        state_dir=state_dir,
-        workdir=workdir,
-        github=ExplodingGitHub(),  # type: ignore[arg-type]
-        providers=registry,
-    )
-    eng.bind_local_state_dir(state_dir)
-    if start:
-        eng.new_local_run(feature, allow_dirty=allow_dirty)
-    eng.provider = provider  # type: ignore[attr-defined]
-    return eng
 
 
 # -- what a launched process sees (#165) ----------------------------------------

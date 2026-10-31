@@ -5,10 +5,11 @@ REMOTE reads the checkout it runs in, and an agent worktree, through
 and creation, the sandbox's facts, the candidate read, the checkout anchor
 around an invocation and the uncommitted-work note. Until #386 those reads
 were LOCAL's reader, built from ``config.local``, and their hardening was
-tested only through it (``tests/test_local.py``). ADR 0009 C1 moved the
-reader out; the tests of its hardening moved with it (A.2.3 A), and the last
-section fails if ``engine.workspace()``, or any read of a REMOTE run, reads
-``config.local`` again.
+tested only through it (``tests/test_local.py``, deleted with LOCAL, #388).
+ADR 0009 C1 moved the reader out; the tests of its hardening moved with it
+(A.2.3 A), and the last section fails if ``engine.workspace()`` reads any
+configuration, or a REMOTE read asks the configuration for a key it does
+not declare, ``local`` first among them.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from autoforge.config import LocalConfig, default_config
+from autoforge.config import AutoForgeConfig, default_config
 from autoforge.engine import ControllerEngine, config_file_placement_problem
 from autoforge.errors import VerificationError
 from autoforge.executor import ExecutionResult, execute
@@ -318,65 +319,71 @@ def test_a_failed_anchor_read_is_refused_and_only_exit_1_is_a_fact(tmp_path):
 
 
 # =============================================================================
-# ADR 0009 C1: no REMOTE read reads `config.local`
+# ADR 0009 C1: `engine.workspace()` reads no configuration; no REMOTE read
+# asks for a key the configuration does not declare
 # =============================================================================
 
-_LOCAL_FIELDS = frozenset(f.name for f in dataclasses.fields(LocalConfig)) | {"max_review_rounds"}
+_CONFIG_KEYS = frozenset(f.name for f in dataclasses.fields(AutoForgeConfig))
 
 
-def _watch_local(cfg) -> list[str]:
-    """Replace ``cfg.local`` by a copy that records every field read of it; return the record."""
+def _watched(cfg: AutoForgeConfig) -> tuple[AutoForgeConfig, list[str]]:
+    """A copy of ``cfg`` that records every key read of it, and every public
+    name it does not declare (``getattr(cfg, "local", None)`` among them),
+    which it refuses as the plain configuration would."""
     reads: list[str] = []
 
-    class WatchedLocal(LocalConfig):
+    class Watched(AutoForgeConfig):
         def __getattribute__(self, name: str):
-            if name in _LOCAL_FIELDS:
+            if name in _CONFIG_KEYS:
                 reads.append(name)
             return object.__getattribute__(self, name)
 
-    watched = WatchedLocal.__new__(WatchedLocal)
-    watched.__dict__.update(vars(cfg.local))
-    cfg.local = watched
+        def __getattr__(self, name: str):
+            if not name.startswith("_"):
+                reads.append(name)
+            raise AttributeError(name)
+
+    watched = Watched.__new__(Watched)
+    watched.__dict__.update(vars(cfg))
     assert reads == []
-    watched.exclude  # noqa: B018 - the watch itself is checked to record
-    assert reads == ["exclude"]
+    watched.sandbox  # noqa: B018 - the watch itself is checked to record
+    assert getattr(watched, "local", None) is None
+    assert reads == ["sandbox", "local"]
     reads.clear()
-    return reads
+    return watched, reads
 
 
-def test_engine_workspace_reads_no_local_configuration(tmp_path):
-    """`engine.workspace()` is REMOTE's git reader and reads no `local:` key.
+def test_engine_workspace_reads_no_configuration(tmp_path):
+    """`engine.workspace()` is REMOTE's git reader and reads no configuration.
 
     Before #386 it built LOCAL's reader from `config.local.exclude` and the
     two walk bounds for every run, so the `local:` key could not be removed
-    while REMOTE still needed the reader (ADR 0009 C1). LOCAL's reader is
-    `engine.local_workspace()`, which does read them.
+    while REMOTE still needed the reader (ADR 0009 C1). Every read the
+    reader makes, and the checkout anchor read through it, reads no key.
     """
     root = _committed_repo(tmp_path)
-    cfg = default_config()
-    cfg.local.exclude = ["vendor"]
-    reads = _watch_local(cfg)
-    eng = ControllerEngine(config=cfg, state_dir=tmp_path / "state", workdir=root)
+    eng = ControllerEngine(config=default_config(), state_dir=tmp_path / "state", workdir=root)
+    eng.config, reads = _watched(eng.config)
     ws = eng.workspace()
     assert type(ws) is GitWorkspace
     _every_read(ws)
     assert eng._checkout_anchor() == (_git(root, "rev-parse", "HEAD"), "main")
+    assert reads == [], f"engine.workspace() read the configuration: {reads}"
+    # The control: the worktree root, read through the reader, reads its key.
     assert eng.agent_worktree_root() == Path(os.path.realpath(root / ".git")) / (
         "autoforge/worktrees"
     )
-    assert reads == [], f"engine.workspace() read config.local: {reads}"
-    # The control: LOCAL's reader is the one that reads them.
-    eng.local_workspace()
-    assert set(reads) >= {"exclude", "max_workspace_entries", "max_workspace_bytes"}
+    assert reads == ["execution"]
 
 
-def test_the_config_file_placement_check_reads_no_local_configuration(tmp_path):
+def test_the_config_file_placement_check_asks_for_no_undeclared_key(tmp_path):
     """`config_file_placement_problem` asks the git reader where the working
-    trees are, and reads no `local:` key to build it (ADR 0009 C1)."""
+    trees are, and reads only keys the configuration declares to build it
+    (ADR 0009 C1)."""
     root = _committed_repo(tmp_path)
     cfg = default_config()
     cfg.sandbox.mode = "required"
-    reads = _watch_local(cfg)
+    cfg, reads = _watched(cfg)
     inside = root / "autoforge.yaml"
     inside.write_text("{}\n", encoding="utf-8")
     problem = config_file_placement_problem(cfg, str(inside), workdir=root)
@@ -385,21 +392,22 @@ def test_the_config_file_placement_check_reads_no_local_configuration(tmp_path):
     outside.parent.mkdir()
     outside.write_text("{}\n", encoding="utf-8")
     assert config_file_placement_problem(cfg, str(outside), workdir=root) == ""
-    assert reads == [], f"the placement check read config.local: {reads}"
+    assert "sandbox" in reads
+    assert set(reads) <= _CONFIG_KEYS, f"the placement check asked for: {set(reads) - _CONFIG_KEYS}"
 
 
-def test_a_remote_implementation_phase_reads_no_local_configuration(tmp_state_dir, fake_github):
+def test_a_remote_implementation_phase_asks_for_no_undeclared_key(tmp_state_dir, fake_github):
     """A whole REMOTE ANALYZE_EXECUTE (the agent worktree's root and
     creation, the checkout anchor around the launch, the worktree-state
-    read for the prompt, the candidate read, the push and the PR) reads no
-    `local:` key, so removing the key cannot change a REMOTE run
-    (ADR 0009 C1, D12 S1a)."""
-    cfg = default_config()
-    reads = _watch_local(cfg)
+    read for the prompt, the candidate read, the push and the PR) reads
+    only keys the configuration declares: no `local:` key, which is gone
+    (ADR 0009 C1, D12 S1a, S3)."""
+    cfg, reads = _watched(default_config())
     eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=cfg, origin=True)
     assert eng.step().next_phase == "ANALYZE_EXECUTE"
     assert eng.step().next_phase == "REVIEW"
     assert eng.state.phase == Phase.REVIEW and eng.state.current_pr_url
     (req,) = eng.provider.calls
     assert Path(req.cwd).parent == eng.agent_worktree_root()
-    assert reads == [], f"a REMOTE run read config.local: {reads}"
+    assert "local" not in _CONFIG_KEYS and reads
+    assert set(reads) <= _CONFIG_KEYS, f"a REMOTE run asked for: {set(reads) - _CONFIG_KEYS}"

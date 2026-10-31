@@ -57,7 +57,7 @@ from autoforge.result_parser import (
     parse_control_result,
 )
 from autoforge.state import load_state
-from autoforge.transitions import Phase, WorkflowMode, edges_for
+from autoforge.transitions import Phase, edges_for
 from tests.conftest import (
     BRANCH,
     GIT_IDENT,
@@ -6123,12 +6123,12 @@ def test_a_protocol_4_journal_before_the_write_loads_and_relabels(tmp_state_dir,
     eng.save()
     _protocol_1_state_file(eng, _protocol_4_journal(stage), protocol="4")
     loaded = eng.load()
-    assert loaded.protocol_version == "12"
+    assert loaded.protocol_version == "13"
     txn = _txn(eng)
     assert txn.stage is stage and not txn.journal_defects
     assert txn.source_closed_event_count == 0 and txn.close_attempts == 0
     eng.save()
-    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "12"
+    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "13"
     if stage is ReplanStage.VERIFIED:
         # The write proceeds from the relabelled journal and records the
         # watermark the protocol-4 controller never did.
@@ -6171,7 +6171,7 @@ def test_the_legacy_journal_refusal_knows_only_the_legacy_protocols():
 
     assert LEGACY_JOURNAL_PROTOCOLS == frozenset({"1", "2", "3", "4"})
     journal = _seed_dict(ReplanStage.PREPARED)
-    for protocol in ("5", "7", "8", "9", "10", "11", "12", "0", ""):
+    for protocol in ("5", "7", "8", "9", "10", "11", "12", "13", "0", ""):
         with pytest.raises(ValueError, match="not a legacy journal protocol"):
             legacy_journal_refusal(journal, protocol=protocol, written_by="0.1.0")
     for protocol in ("1", "2", "3"):
@@ -6202,10 +6202,10 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
-        assert loaded.protocol_version == "12"
+        assert loaded.protocol_version == "13"
         assert loaded.replan_transaction == journal
         eng.save()
-        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "12"
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "13"
     # A legacy file that predates the journal field altogether is the same
     # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
@@ -6255,7 +6255,7 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     # this controller wrote the journal, so a missing field is a missing
     # field, whichever protocol step introduced it.
     data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "12"
+    data["protocol_version"] = "13"
     data["acceptance_outcomes"] = []
     data["config_fingerprint"] = {}
     data["operator_comment_outcomes"] = []
@@ -6750,9 +6750,7 @@ def _assert_plan_metadata_follows(plan, may_launch: bool) -> None:
     assert plan.provider == plan.model == plan.effort == "(none)", plan
     assert plan.variables == {}, plan.variables
     assert "no agent" in plan.routing and plan.routing.startswith("REPLAN_REEXECUTE"), plan.routing
-    assert plan.legal_next == sorted(
-        p.value for p in edges_for(WorkflowMode.REMOTE)[Phase.REPLAN_REEXECUTE]
-    )
+    assert plan.legal_next == sorted(p.value for p in edges_for()[Phase.REPLAN_REEXECUTE])
 
 
 def test_the_replan_agent_may_be_launched_only_before_a_replacement_is_bound():

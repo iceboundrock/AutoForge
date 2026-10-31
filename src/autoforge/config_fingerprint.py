@@ -8,9 +8,7 @@ The CLI has no configuration discovery. A REMOTE run started with
 model and effort, other limits, and an agent worktree under
 ``<git common dir>/autoforge/worktrees`` instead of the configured
 ``execution.worktree_dir`` -- a different agent in a different, empty
-worktree. A LOCAL run has its contract for what defines it
-(:mod:`autoforge.run_contract`); this is the REMOTE counterpart for what
-decides *who* works on the run and *where*.
+worktree. This record is what decides *who* works on the run and *where*.
 
 A REMOTE run records a :class:`RecordedConfiguration` when it is created
 (``state.config_fingerprint``), and ``resume``, ``step`` and ``unblock``
@@ -54,8 +52,7 @@ or its worktree, and each is read at the step that uses it.
 
 ``sandbox.mode`` is not in the fingerprint either, but it may not weaken
 between steps (#280, ADR 0005 D15.3 as amended): the run is pinned to the
-mode it was created under (:mod:`autoforge.sandbox_pin`), in LOCAL and
-REMOTE runs alike, and the same comparison
+mode it was created under (:mod:`autoforge.sandbox_pin`), and the same comparison
 (:meth:`~autoforge.engine.ControllerEngine.check_run_configuration`) refuses
 a weaker one beside any change here, with the same opt-in. It is kept out
 of this record because the record refuses any drift and any schema but its
