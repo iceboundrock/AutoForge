@@ -968,6 +968,40 @@ def test_a_declaration_makes_its_state_and_dir_rw_items_writable_and_nothing_els
     assert projected == [path for path, _ in declared_writable(needs)]
 
 
+@pytest.mark.parametrize("cache", [True, False], ids=["agent", "review"])
+def test_a_remote_agent_declaration_makes_its_state_and_dir_rw_items_writable_only(tmp_path, cache):
+    """ADR 0009 A.2.3 F (#386): the REMOTE replacement of
+    test_sandbox_policy.py::test_a_declaration_makes_its_state_and_dir_rw_items_writable_and_nothing_else.
+
+    The same on a REMOTE agent launch, with its cache and without it (a
+    REVIEW): what :func:`declared_writable` names is what
+    :func:`sandbox_request` projects read-write from the declaration, never
+    a read-only file, an ``env`` item or a keyring login.
+    """
+    needs = ProviderRequirements(
+        config=("/opt/tool/conf",),
+        home_config=("/home/u/.tool/settings.json",),
+        state=("/srv/tool-state",),
+        auth=(
+            AuthItem(AuthMode.ENV, "TOOL_API_KEY"),
+            AuthItem(AuthMode.FILE_RO, "the tool login", "/home/u/.tool/login.json"),
+            AuthItem(AuthMode.DIR_RW, "the tool directory ($TOOL_DIR)", "/srv/tool"),
+            AuthItem(AuthMode.KEYRING, "the tool keyring login", "tool"),
+        ),
+    )
+    assert declared_writable(needs) == (
+        ("/srv/tool-state", "a state directory its provider declares (/srv/tool-state)"),
+        ("/srv/tool", "the tool directory ($TOOL_DIR)"),
+    )
+    request = sandbox_request(_remote(_layout(tmp_path), cache=cache), needs)
+    projected = [
+        p.source
+        for p in request.projections
+        if p.origin is Origin.DECLARED and p.access is Access.WRITABLE
+    ]
+    assert projected == [path for path, _ in declared_writable(needs)]
+
+
 def test_each_provider_names_the_directories_its_launches_write(tmp_path, monkeypatch):
     """Each adapter's own declaration, over the environment a launch
     inherits: ``CLAUDE_CONFIG_DIR``, ``PI_CODING_AGENT_DIR`` and the directory
