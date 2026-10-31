@@ -19,18 +19,21 @@ make lock-check   # uv lock --check (what CI's `uv sync --locked` enforces)
 make check        # lock-check + the four CI commands, on the local interpreter
 make check-matrix # pytest on every CI Python (3.11, 3.12), opt-in
 make test-parallel # pytest on 4 pytest-xdist workers, opt-in, not a gate
+make test-fast    # the tests the changed paths map to, feedback only, not a gate
 make test-sandbox # the real-backend sandbox tests; fail (not skip) without a backend
 make test-sandbox-measured # what CI's `sandbox` job runs: measure, then require where capable
 make dist-check   # what CI's `dist` job runs: build, check, install and run the artifacts
 ```
 
 Run `make check` before declaring a change complete, and `make check-matrix`
-when a change could be interpreter-sensitive. Run `make test-sandbox` too
-when a change touches the outer sandbox (`sandbox*.py`, the executor, a
-provider's declaration, the engine's launch routing), and `make dist-check`
-when a change touches packaging, a resource the package reads at runtime
-(a prompt template), or the command line's entry point
-([The built distributions](#the-built-distributions)).
+when a change could be interpreter-sensitive. `make test-fast` is for
+feedback while working and replaces neither
+([Fast feedback while working](#fast-feedback-while-working)). Run
+`make test-sandbox` too when a change touches the outer sandbox
+(`sandbox*.py`, the executor, a provider's declaration, the engine's launch
+routing), and `make dist-check` when a change touches packaging, a resource
+the package reads at runtime (a prompt template), or the command line's
+entry point ([The built distributions](#the-built-distributions)).
 
 The distribution is named `autoforge-cli`; the import package and the
 command are `autoforge`. A `.venv` made before the rename still lists the
@@ -446,6 +449,50 @@ agrees with git's). `tests/test_safefs.py`'s
 stand-in from hiding an error a real flush would raise. Each change reverts
 on its own; the stand-in is the one to revert if a defect turns up that
 only a real flush in the test process would have caught.
+
+## Fast feedback while working
+
+`make test-fast` runs the test modules that the paths you changed map to,
+so a change gets feedback in seconds to a minute or two rather than after
+the whole suite (535 seconds serially at a4bc60c on Python 3.14 and host
+B of [The suite on several workers](#the-suite-on-several-workers)). The
+changed paths are what your commits, your index and your worktree changed
+since the merge base with `FAST_BASE` (`main` by default), each compared
+on its own so that one undoing another's change hides neither, and your
+untracked files; `FAST_PYTEST_ARGS` reach pytest:
+
+```bash
+make test-fast
+make test-fast FAST_BASE=origin/main FAST_PYTEST_ARGS="-n 4 -x"
+uv run python -m tests.fast_targets src/autoforge/evidence.py   # what it would select, and why
+```
+
+`tests/fast_targets.py` holds the mapping. A test module selects itself
+and every test module that imports it; a path with an entry selects the
+entry's test modules and every test module that imports its module; a
+module almost every test runs through (`engine.py`, `state.py`,
+`config.py`, the prompt templates, conftest and a few more) selects the
+whole suite, and so does any path without an entry (`pyproject.toml`, a
+document, a new module). A selection holding the live tests
+(`tests/test_live_pi.py`), which the default options deselect, holds
+their offline tests too, and never runs the live ones. On the same host
+and commit, a change to `tests/test_evidence.py` ran in 3 seconds when it
+selected itself alone (it now selects `test_certificate.py` too, which
+imports its helpers), one to
+`src/autoforge/scheduler.py` in 72 (four modules that wait on purpose),
+and one to `src/autoforge/evidence.py` in 125 (ten modules,
+`test_engine.py` among them). `tests/test_fast_targets.py` fails when a
+file under `src/autoforge/` or a helper module under `tests/` has no
+entry, so a new module needs one.
+
+A FAST run is feedback, never evidence
+([ADR 0010](adr/0010-fast-feedback-and-full-validation-evidence.md)). It
+selects where a regression is likely to show first, not every test that
+can observe a module: a test that reaches a module through the engine does
+not import it, so a change can pass `make test-fast` and fail the full
+suite. `make check`, `make check-matrix` and CI never run it, and the
+controller neither runs nor reads it: its `validation.commands`, the merge
+gate and the required `ci` check decide as before.
 
 ## Continuous integration
 
