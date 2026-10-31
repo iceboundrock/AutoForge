@@ -55,6 +55,7 @@ from autoforge.github import (  # noqa: E402
     CommentInfo,
     CreatedObject,
     IssueInfo,
+    IssueNode,
     MergeQueueStatus,
     PRInfo,
     RepoInfo,
@@ -572,6 +573,13 @@ class FakeGitHub:
         self.get_issue_error: GitHubError | None = None  # every get_issue call raises this
         # get_issue calls for these URLs (canonical) raise; others answer.
         self.get_issue_errors: dict[str, GitHubError] = {}
+        # Each issue's native parent, as GitHub's ``parent_issue_url`` names it
+        # (#287), by the canonical URL ``add_issue`` registered: an issue a test
+        # adds is a sub-issue of EPIC unless ``parent`` says otherwise; the EPIC
+        # and an issue the controller creates (a follow-up) have none.
+        # ``graph_error`` makes get_issue_node and list_sub_issues raise.
+        self.parents: dict[str, str | None] = {}
+        self.graph_error: GitHubError | None = None
         # Controller-owned EPIC body write (edit_issue_body): every write is
         # recorded as (canonical url, body). ``edit_issue_error`` raises like
         # close_error; ``edit_issue_race`` is called before the write lands (a
@@ -651,7 +659,7 @@ class FakeGitHub:
         # Issues and PRs up to this number exist beyond the fake's listings
         # (GitHub's one shared sequence): a created PR or issue gets the next.
         self.last_number: int = 0
-        self.add_issue(EPIC, "EPIC")
+        self.add_issue(EPIC, "EPIC", parent=None)
         self.add_issue(ISSUE, "Feature")
 
     # -- test helpers ---------------------------------------------------------
@@ -692,7 +700,12 @@ class FakeGitHub:
                 self.set_head(sha, url)
 
     def add_issue(
-        self, url: str, title: str = "t", state: str = "OPEN", body: str = ""
+        self,
+        url: str,
+        title: str = "t",
+        state: str = "OPEN",
+        body: str = "",
+        parent: str | None = EPIC,
     ) -> IssueInfo:
         ref = parse_issue_url(url)
         info = IssueInfo(
@@ -704,6 +717,7 @@ class FakeGitHub:
             repository=ref.repository,
         )
         self.issues[ref.canonical] = info
+        self.parents[ref.canonical] = parse_issue_url(parent).canonical if parent else None
         return info
 
     def add_pr(
@@ -780,6 +794,47 @@ class FakeGitHub:
 
     def get_issue_state(self, url: str) -> str:
         return self.get_issue(url).state
+
+    def get_issue_node(self, url: str) -> IssueNode:
+        self.calls.append(("get_issue_node", url))
+        if self.graph_error is not None:
+            raise self.graph_error
+        ref = parse_issue_url(url)
+        for known in self.issues:
+            if parse_issue_url(known).same_target(ref):
+                return self._issue_node(known)
+        raise GitHubNotFoundError(f"issue not found: {url}")
+
+    def list_sub_issues(self, url: str) -> tuple[IssueNode, ...]:
+        self.calls.append(("list_sub_issues", url))
+        if self.graph_error is not None:
+            raise self.graph_error
+        return tuple(self._issue_node(known) for known in self._children(url))
+
+    def _children(self, url: str) -> list[str]:
+        ref = parse_issue_url(url)
+        return [
+            known
+            for known, parent in self.parents.items()
+            if parent is not None and parse_issue_url(parent).same_target(ref)
+        ]
+
+    def _issue_node(self, known: str) -> IssueNode:
+        """The graph facts of a stored issue: no blockers, a closed one ``completed``."""
+        info = self.issues[known]
+        parent = self.parents.get(known)
+        return IssueNode(
+            id=100_000 + info.number,
+            number=info.number,
+            url=info.url,
+            repository=parse_issue_url(known).repository,
+            state="open" if info.is_open else "closed",
+            state_reason=None if info.is_open else "completed",
+            parent=parse_issue_url(parent) if parent else None,
+            sub_issues_total=len(self._children(known)),
+            blocked_by_total=0,
+            blocked_by_open=0,
+        )
 
     def edit_issue_body(self, url: str, body: str) -> None:
         canonical = parse_issue_url(url).canonical
@@ -1380,7 +1435,10 @@ class FakeGitHub:
         def perform() -> CreatedObject:
             number = self._next_number(repository)
             info = self.add_issue(
-                f"https://github.com/{repository}/issues/{number}", title=title, body=body
+                f"https://github.com/{repository}/issues/{number}",
+                title=title,
+                body=body,
+                parent=None,
             )
             return CreatedObject(url=info.url, number=number)
 

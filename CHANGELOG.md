@@ -5,6 +5,33 @@ so.
 
 ## Unreleased
 
+### A sequential run's next issue must be a sub-issue of the EPIC (#287)
+
+**Behaviour change:** `UPDATE_EPIC` switches only to a native sub-issue of
+the EPIC, the rule `autoforge epic run` admits by. Until now the controller
+accepted any open issue of the repository other than the EPIC and the
+issue just finished, so on a public repository injected text could make a
+stranger's issue the next task (finding M6 of the #257 audit).
+
+- The selected issue must name the EPIC as its parent on GitHub and have
+  no sub-issues of its own. An issue the EPIC body only mentions, in a task
+  list or as `#n`, is refused, and so is a nested EPIC. A refusal takes the
+  bounded re-selection as before: the agent is asked once more with the
+  reason, then the run is `BLOCKED` on the issue it just finished, with
+  nothing switched. A sequential run over an EPIC that lists its issues
+  only in its body now stops there: add them as sub-issues of the EPIC, or
+  start each with `autoforge run`.
+- The check is one more read of the selected issue
+  (`GET /repos/{owner}/{repo}/issues/{n}`). An answer without the
+  sub-issue summaries blocks the run as a conclusive GitHub failure.
+- The first issue, the one `run --issue` names, is not held to the rule.
+- The agent's read context gains `epic-sub-issues.md`, the EPIC's native
+  sub-issues with their state, and both `UPDATE_EPIC` prompts state the
+  rule. The prompt version is `v14`; a REMOTE run resumed by this version
+  renders the new templates and keeps its recorded label.
+- Blockers are not read: the order of a sequential run stays the agent's
+  choice. No default or configuration key changes.
+
 ### LOCAL mode is removed (#387)
 
 **Behaviour change:** LOCAL mode, the GitHub-free workflow, is removed

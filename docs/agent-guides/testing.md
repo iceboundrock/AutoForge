@@ -1141,6 +1141,18 @@ a stated reason it has none. The coverage that must keep working:
   `safety.allow_merge: true` and `SKIP` with it closed, while a hidden
   bypass list with `current_user_can_bypass: never` is `SKIP` either way
 - follow-up issue verification
+- the next issue's EPIC membership (#287, `tests/test_engine.py`,
+  `tests/test_read_context.py`): `UPDATE_EPIC` switches to a native
+  sub-issue of the EPIC (its parent compared by identity, a casing variant
+  of the EPIC's URL included) and refuses, through the bounded
+  re-selection and then `BLOCKED`, an open issue with no parent, another
+  parent or the just-finished issue as parent, even when a task list of the
+  EPIC body names it, and a sub-issue with sub-issues of its own; on the
+  parent read a not-found is a bad selection, a transient failure a
+  bounded rejection and a malformed answer `BLOCKED` at once, nothing
+  switched; the first issue is not held to the rule; the read context
+  lists the EPIC's sub-issues by number with their state, or says they
+  could not be read
 - typed effect writes are never retried on an ambiguous outcome, while reads
   keep their transient retry (`tests/test_github.py`)
 - every Wave 1 effect kind at the operation level, against `FakeGitHub` and

@@ -726,16 +726,34 @@ Then, in order, all from one persisted completion context (D4.6):
    one comment carrying it, with exactly the planned body.
 3. The roadmap section is written when one is stored and merges are
    pending (EPIC updates, below).
-4. `next_issue_url` is verified exactly like the first issue in
-   `INITIALIZING` before switching issues:
+4. `next_issue_url` is verified like the first issue in `INITIALIZING`,
+   and as one of the EPIC's own issues, before switching issues:
 
 - it parses as an issue URL of the configured repository
 - it is neither the EPIC nor the issue just finished
 - the issue exists and is `OPEN`
+- it is a native sub-issue of the EPIC with none of its own (#287): its
+  issue object (`get_issue_node`, `GET .../issues/{n}`) names the EPIC as
+  `parent_issue_url`, and its `sub_issues_summary.total` is 0
 
-Identity checks (EPIC, just-finished issue) compare repository
+Identity checks (EPIC, just-finished issue, parent) compare repository
 case-insensitively plus issue number, never URL strings: GitHub owner and
 repository names are case-insensitive.
+
+The last rule is the one `autoforge epic run` admits by ("EPIC dependency
+graph" below; ADR 0008 D3.1, D3.6). Before it, any open issue of the
+repository was accepted, so on a public repository an issue a stranger
+opened could be chosen as the next task by injected text. An issue the
+EPIC body mentions or lists in a task list, but that GitHub does not name
+as the EPIC's sub-issue, is refused: prose is never authority. The first
+issue is the operator's choice and is not held to the rule. Blockers are
+not read: the order of a sequential run stays the agent's choice. On the
+parent read, a not-found is a bad selection, a transient failure takes the
+bounded retry below, and any other failure (an answer without the
+sub-issue summaries included) is conclusive. The agent is shown the EPIC's
+sub-issues and their state as `epic-sub-issues.md` of its read context,
+read with `list_sub_issues`; that file is a convenience, and the
+controller decides from its own read of the selected issue.
 
 A `next_issue_url` that is not an issue URL at all, or is longer than
 `MAX_URL_CHARS`, is refused by the parser as a malformed `UPDATE_EPIC`
@@ -2250,7 +2268,9 @@ claim. These four reads are all the GitHub the scheduler itself uses: every
 write of an issue (its branch, PR and comments) is that issue's worker
 engine's, under the same effect records and gates as a standalone run, and
 no worker writes another issue's objects. Sequential `UPDATE_EPIC`
-selection (`_verify_issue_selectable`) is unchanged and does not read it.
+selection (`_verify_issue_selectable`) takes no snapshot: it reads the
+selected issue's node with `get_issue_node` and holds it to the same
+membership rule ("After UPDATE_EPIC" above, #287).
 
 - **The reads.** Four typed, read-only `GitHubClient` methods, each a plain
   `gh api` GET with the transient retry of every read:

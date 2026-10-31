@@ -10,7 +10,7 @@ import hashlib
 
 import pytest
 
-from autoforge.github import CheckInfo, CommentInfo, IssueInfo, PRInfo
+from autoforge.github import MAX_SUB_ISSUES, CheckInfo, CommentInfo, IssueInfo, IssueNode, PRInfo
 from autoforge.read_context import (
     INDEX_FILE,
     MAX_BODY_CHARS,
@@ -28,8 +28,10 @@ from autoforge.read_context import (
     render_issue_states,
     render_operator_evidence,
     render_pr,
+    render_sub_issues,
     unreadable,
 )
+from autoforge.validation import parse_issue_url
 
 TOKEN = "ghp_" + "K" * 36
 ISSUE = "https://github.com/owner/repo/issues/2"
@@ -111,6 +113,43 @@ def test_issue_states_list_unreadable_references_and_the_cut():
     assert f"- {ISSUE}: OPEN: Feature" in text
     assert "issues/9: (could not be read)" in text
     assert "[AutoForge omitted 3 of 5 issues of issues the epic references]" in text
+
+
+def _node(n: int, state: str = "open", reason: str | None = None, children: int = 0):
+    return IssueNode(
+        id=1000 + n,
+        number=n,
+        url=f"https://github.com/owner/repo/issues/{n}",
+        repository="owner/repo",
+        state=state,
+        state_reason=reason,
+        parent=parse_issue_url("https://github.com/owner/repo/issues/1"),
+        sub_issues_total=children,
+        blocked_by_total=0,
+        blocked_by_open=0,
+    )
+
+
+def test_sub_issues_are_listed_by_number_with_state_and_nesting():
+    text = render_sub_issues(
+        [_node(7, children=2), _node(3, "closed", "not_planned"), _node(5, "closed")], "Sub"
+    )
+    lines = [line for line in text.splitlines() if line.startswith("- ")]
+    assert lines == [
+        "- https://github.com/owner/repo/issues/3: closed (not_planned)",
+        "- https://github.com/owner/repo/issues/5: closed (no reason)",
+        "- https://github.com/owner/repo/issues/7: open: has 2 sub-issue(s) of its own",
+    ]
+    assert "untrusted project data" in text
+
+
+def test_no_sub_issues_says_none_and_an_oversized_listing_says_what_it_cut():
+    assert "(none)" in render_sub_issues([], "Sub-issues of the EPIC")
+    text = render_sub_issues(
+        [_node(n) for n in range(2, MAX_SUB_ISSUES + 4)], "Sub-issues of the EPIC"
+    )
+    assert f"[AutoForge omitted 2 of {MAX_SUB_ISSUES + 2} issues of sub-issues of the epic]" in text
+    assert len([line for line in text.splitlines() if line.startswith("- ")]) == MAX_SUB_ISSUES
 
 
 def test_an_unreadable_item_names_the_error_type_only():

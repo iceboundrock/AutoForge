@@ -102,6 +102,13 @@ read it before adding tests for a listed area.
   real `GitHubClient` takes its HTTPS transport as `https=`; the autouse
   `_no_network_exact_read` fixture fails a test whose client would reach
   `api.github.com`, so give it `https=...` or use the fake.
+- `FakeGitHub` answers the native graph reads `UPDATE_EPIC` makes (#287):
+  `get_issue_node` and `list_sub_issues`, from `parents`, each issue's
+  parent. An issue a test adds is a sub-issue of `EPIC` unless
+  `add_issue(..., parent=...)` names another parent or `None`; the EPIC and
+  an issue the controller creates have none. `graph_error` makes both
+  reads raise. The scheduler's tests serve the graph from their own fake
+  `gh` instead (`tests/test_epic_graph.py`).
 - The controller publishes `REPLAN_REEXECUTE` too (#164): the replan agent
   commits on the base its prompt names and the controller pushes it to the
   derived replacement branch and creates the replacement PR. In

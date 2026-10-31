@@ -53,13 +53,15 @@ agent claim against GitHub** before acting on it:
   the PR as ``MERGED`` at that HEAD into the reviewed base. If that call
   left auto-merge armed, the controller disarms it. No prompt is rendered
   and no provider is invoked.
-- UPDATE_EPIC: ``next_issue_url`` is verified exactly like the first issue
-  in INITIALIZING before the controller switches issues: it parses as an
+- UPDATE_EPIC: ``next_issue_url`` is verified like the first issue in
+  INITIALIZING before the controller switches issues: it parses as an
   issue URL of this repository, is neither the EPIC nor the issue just
-  finished, exists on GitHub and is OPEN. A rejected selection keeps the
-  phase (the agent is asked again once, with the controller's reason); a
-  second rejection enters BLOCKED. Only a verified issue reaches
-  ANALYZE_EXECUTE.
+  finished, exists on GitHub and is OPEN. It must also be one of the EPIC's
+  own issues, by the rule ``autoforge epic run`` admits by (#287): GitHub
+  names the EPIC as its parent, and it has no sub-issues of its own. A
+  rejected selection keeps the phase (the agent is asked again once, with
+  the controller's reason); a second rejection enters BLOCKED. Only a
+  verified issue reaches ANALYZE_EXECUTE.
 
 Loop bounds (``workflow:`` config, enforced from persisted state so
 ``resume`` never resets them; see ``loop_guard.py``):
@@ -404,6 +406,7 @@ from .read_context import (
     render_issue_states,
     render_operator_evidence,
     render_pr,
+    render_sub_issues,
     unreadable,
 )
 from .redaction import redact, redact_argv, redact_dict, redact_obj
@@ -3977,6 +3980,11 @@ class ControllerEngine:
                     "the state and title of each issue the EPIC references",
                     self._read_epic_issues(epic_body),
                 )
+                context.add(
+                    "epic-sub-issues.md",
+                    "the EPIC's native sub-issues, the only issues it may select next",
+                    self._read_epic_sub_issues(s.epic_url),
+                )
         return context
 
     def _read_operator_evidence(self) -> str:
@@ -4115,6 +4123,16 @@ class ControllerEngine:
             except GitHubError:
                 entries.append(url)
         return render_issue_states(entries, "Issues the EPIC references", len(numbers))
+
+    def _read_epic_sub_issues(self, url: str) -> str:
+        """The EPIC's direct native sub-issues (#287): the issues a selection
+        may name, checked again by :meth:`_verify_epic_sub_issue`."""
+        title = "Sub-issues of the EPIC"
+        try:
+            nodes = self.github.list_sub_issues(url)
+        except GitHubError as exc:
+            return unreadable(title, f"the sub-issues of {url}", exc)
+        return render_sub_issues(nodes, title)
 
     def _replan_publication_variables(self, txn: ReplanTransaction) -> dict[str, str | int | None]:
         """The replacement's base, branch and PR text bounds (#164).
@@ -6795,12 +6813,13 @@ class ControllerEngine:
         ``next_issue_url``, untrusted). The issue must parse as a GitHub issue
         URL, belong to the run's repository, not be the EPIC itself, not be the
         current issue when ``switching`` (UPDATE_EPIC must not loop back onto the
-        issue just finished), exist on GitHub and be OPEN. Any of those failing
-        raises :class:`VerificationError` — a problem with the *selection*. No
-        GitHub read is made for a URL that already fails the local checks (a
-        foreign repository is never queried). A standalone engine's
-        :attr:`issue_ownership` predicate is one of those local checks (ADR
-        0008 D17.2): an issue a scheduler namespace owns is refused, so an
+        issue just finished), exist on GitHub and be OPEN, and when ``switching``
+        be one of the EPIC's own issues (:meth:`_verify_epic_sub_issue`, #287).
+        Any of those failing raises :class:`VerificationError` — a problem with
+        the *selection*. No GitHub read is made for a URL that already fails
+        the local checks (a foreign repository is never queried). A standalone
+        engine's :attr:`issue_ownership` predicate is one of those local checks
+        (ADR 0008 D17.2): an issue a scheduler namespace owns is refused, so an
         UPDATE_EPIC selection of one goes through the bounded rejection path.
 
         Identity (EPIC / current issue) is compared with
@@ -6851,7 +6870,44 @@ class ControllerEngine:
             raise VerificationError(
                 f"{what} {ref.canonical} is {issue.state}; only OPEN issues can be run"
             )
+        if switching:
+            self._verify_epic_sub_issue(ref)
         return issue
+
+    def _verify_epic_sub_issue(self, ref: GitHubIssueRef) -> None:
+        """Verify on GitHub that UPDATE_EPIC's selection is one of the EPIC's own issues (#287).
+
+        The rule ``autoforge epic run`` admits by (ADR 0008 D3.1, D3.6): a
+        direct native sub-issue of the EPIC (the parent GitHub names for it
+        is the EPIC) that has no sub-issues of its own. A task-list line or
+        a ``#n`` in the EPIC body is not a membership: prose is never
+        authority, and on a public repository anyone may open the issue it
+        names. The first issue is the operator's choice and is not held to
+        this. Failures are a :class:`VerificationError`, the selection's
+        problem, except as :meth:`_verify_issue_selectable` says.
+        """
+        state = self._require_state()
+        epic = parse_issue_url(state.epic_url)
+        try:
+            node = self.github.get_issue_node(ref.canonical)
+        except GitHubNotFoundError as exc:
+            raise VerificationError(
+                f"next issue {ref.canonical} does not exist on GitHub "
+                f"(or is not visible to this token): {exc}"
+            ) from exc
+        if node.parent is None or not node.parent.same_target(epic):
+            parent = node.parent.canonical if node.parent is not None else "none"
+            raise VerificationError(
+                f"next issue {ref.canonical} is not a sub-issue of the EPIC {epic.canonical} "
+                f"(its parent issue on GitHub: {parent}); a sequential run switches only to "
+                "one of the EPIC's native sub-issues, the issues 'autoforge epic run' admits"
+            )
+        if node.sub_issues_total > 0:
+            raise VerificationError(
+                f"next issue {ref.canonical} has {node.sub_issues_total} sub-issue(s) of its "
+                "own: it is an EPIC in its own right, which a sequential run never selects "
+                "(run it as its own EPIC)"
+            )
 
     def _recover_pr(self, pr: PRInfo, plan: StepPlan | None) -> StepOutcome:
         """Bind the issue's open implementation PR and enter REVIEW without an agent.

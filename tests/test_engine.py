@@ -346,6 +346,17 @@ def test_initializing_rejects_the_epic_as_the_issue(tmp_state_dir, fake_github):
     assert ("get_issue", EPIC) not in fake_github.calls  # rejected before any GitHub read
 
 
+def test_initializing_does_not_hold_the_first_issue_to_the_sub_issue_rule(
+    tmp_state_dir, fake_github
+):
+    """#287 restricts the agent's selection, not the operator's: the first issue
+    is the one `run --issue` names, a sub-issue of the EPIC or not."""
+    fake_github.parents[ISSUE] = None
+    eng = make_engine(tmp_state_dir, [], github=fake_github)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    assert not any(c[0] == "get_issue_node" for c in fake_github.calls)
+
+
 # -- ANALYZE_EXECUTE ---------------------------------------------------------------
 MARKER = render_implementation_marker(ISSUE)
 CLOSING = f"Closes #2\n\n{MARKER}"
@@ -8191,6 +8202,170 @@ def test_update_epic_conclusive_github_failure_blocks_without_reinvoking_agent(
     assert s.merged_since_epic_update == 0  # the roadmap write verified before the selection
     with pytest.raises(StateTransitionError):
         eng.step()  # BLOCKED is terminal for `step`; nothing else runs
+
+
+# -- UPDATE_EPIC: the next issue is one of the EPIC's own sub-issues (#287) ---------------------
+OTHER_EPIC = "https://github.com/owner/repo/issues/50"
+
+
+def test_update_epic_accepts_a_native_sub_issue_of_the_epic(tmp_state_dir, fake_github):
+    """The parent GitHub names for the selection is the EPIC, compared by identity:
+    a casing variant of the EPIC's URL is still the EPIC."""
+    fake_github.add_issue(ISSUE3, "Next", parent="https://github.com/Owner/Repo/issues/1")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE" and "verified next issue #3" in out.message
+    assert ("get_issue_node", ISSUE3) in fake_github.calls
+    assert load_state(eng.paths.state_file).current_issue_url == ISSUE3
+
+
+@pytest.mark.parametrize(
+    ("parent", "named"),
+    [(None, "none"), (OTHER_EPIC, OTHER_EPIC), (ISSUE, ISSUE)],
+    ids=["no-parent", "another-epic", "the-finished-issue"],
+)
+def test_update_epic_rejects_an_open_issue_that_is_not_a_sub_issue_of_the_epic(
+    tmp_state_dir, fake_github, parent, named
+):
+    """An open issue of the repository is not enough, and neither is a task-list
+    line of the EPIC body naming it: on a public repository anyone may open it."""
+    fake_github.issues[EPIC].body = "- [ ] #3 next"
+    fake_github.add_issue(OTHER_EPIC, "Another EPIC", parent=None)
+    fake_github.add_issue(ISSUE3, "Opened by anyone", parent=parent)
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    with pytest.raises(
+        VerificationError,
+        match=rf"next issue {ISSUE3} is not a sub-issue of the EPIC {EPIC} \(its parent "
+        rf"issue on GitHub: {named}\); .*'autoforge epic run' admits.*selection 1/2",
+    ):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.UPDATE_EPIC and s.current_issue_url == ISSUE
+    assert s.current_pr_url == PR and len(s.next_issue_rejections) == 1
+    assert ("get_issue_node", ISSUE3) in fake_github.calls
+
+
+def test_update_epic_rejects_a_sub_issue_with_sub_issues_of_its_own(tmp_state_dir, fake_github):
+    """A nested EPIC is `unsupported:nested-parent` to `epic run`; a sequential run
+    does not select it either."""
+    fake_github.add_issue(ISSUE3, "A nested EPIC")
+    fake_github.add_issue("https://github.com/owner/repo/issues/4", "Its child", parent=ISSUE3)
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    with pytest.raises(
+        VerificationError, match=r"issues/3 has 1 sub-issue\(s\) of its own.*selection 1/2"
+    ):
+        eng.step()
+    _assert_not_switched(eng, fake_github, ISSUE3)
+
+
+def test_update_epic_not_a_sub_issue_twice_is_blocked_with_the_reason(tmp_state_dir, fake_github):
+    """The bounded re-selection applies: the re-request quotes the reason and
+    names the sub-issue listing; a second refusal blocks, nothing switched."""
+    fake_github.add_issue(ISSUE3, "Not the EPIC's", parent=None)
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_reselect(ISSUE3)]
+    )
+    with pytest.raises(VerificationError, match="selection 1/2"):
+        eng.step()
+    out = eng.step()
+    retry_prompt = eng.provider.calls[1].prompt
+    assert "is not a sub-issue of the EPIC" in retry_prompt
+    assert "`epic-sub-issues.md`" in retry_prompt
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and "2 time(s)" in s.block_reason
+    assert f"{ISSUE3} is not a sub-issue of the EPIC" in s.block_reason
+    assert s.current_issue_url == ISSUE
+
+
+def test_update_epic_retry_with_a_sub_issue_switches(tmp_state_dir, fake_github):
+    fake_github.add_issue(ISSUE3, "Not the EPIC's", parent=None)
+    fake_github.add_issue(ISSUE43, "The EPIC's")
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_reselect(ISSUE43)]
+    )
+    with pytest.raises(VerificationError, match="not a sub-issue of the EPIC"):
+        eng.step()
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    s = load_state(eng.paths.state_file)
+    assert s.current_issue_url == ISSUE43 and s.next_issue_rejections == []
+
+
+def test_update_epic_sub_issue_read_transient_failure_is_a_rejection(tmp_state_dir, fake_github):
+    """The parent read follows the selection's error policy (the next two tests
+    too): a transient failure takes the bounded re-selection."""
+    fake_github.add_issue(ISSUE3, "Next")
+    fake_github.graph_error = GitHubUnavailableError("gh: HTTP 502")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    with pytest.raises(VerificationError, match="GitHub unavailable: gh: HTTP 502.*selection 1/2"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, ISSUE3)
+
+
+def test_update_epic_sub_issue_read_not_found_is_a_bad_selection(tmp_state_dir, fake_github):
+    fake_github.add_issue(ISSUE3, "Next")
+    fake_github.graph_error = GitHubNotFoundError("HTTP 404")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    with pytest.raises(VerificationError, match="issues/3 does not exist on GitHub.*selection 1/2"):
+        eng.step()
+    _assert_not_switched(eng, fake_github, ISSUE3)
+
+
+def test_update_epic_sub_issue_read_conclusive_failure_blocks(tmp_state_dir, fake_github):
+    """An answer without the sub-issue fields (a GitHub without native
+    sub-issues) is conclusive: blocked at once, the agent not asked again."""
+    fake_github.add_issue(ISSUE3, "Next")
+    error = GitHubError(f"issue {ISSUE3}: sub_issues_summary is not an object")
+    eng = _in_update_epic(
+        tmp_state_dir, fake_github, [_epic_result(ISSUE3), _epic_reselect(ISSUE3)]
+    )
+    fake_github.graph_error = error
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert str(error) in s.block_reason and "not a transient GitHub failure" in s.block_reason
+    assert s.next_issue_rejections == [] and s.current_issue_url == ISSUE
+
+
+def test_update_epic_read_context_lists_the_epic_sub_issues(tmp_state_dir, fake_github):
+    """The agent is shown what the controller will hold it to: the EPIC's native
+    sub-issues by number, a closed one with its reason, a parent marked."""
+    fake_github.add_issue(ISSUE43, "Later")
+    fake_github.add_issue(ISSUE3, "Done", state="CLOSED")
+    fake_github.add_issue("https://github.com/owner/repo/issues/4", "Nested", parent=ISSUE43)
+    fake_github.add_issue(OTHER_EPIC, "Not the EPIC's", parent=None)
+    seen: list[str] = []
+
+    def agent(req):
+        seen.append((read_context_of(req.prompt) / "epic-sub-issues.md").read_text())
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, agent)
+    assert eng.step().next_phase == "DONE"
+    (listing,) = seen
+    lines = [line for line in listing.splitlines() if line.startswith("- ")]
+    assert lines == [
+        f"- {ISSUE}: open",
+        f"- {ISSUE3}: closed (completed)",
+        f"- {ISSUE43}: open: has 1 sub-issue(s) of its own",
+    ]
+    assert "untrusted project data" in listing
+    assert ("list_sub_issues", EPIC) in fake_github.calls
+
+
+def test_update_epic_read_context_says_when_the_sub_issues_are_unreadable(
+    tmp_state_dir, fake_github
+):
+    fake_github.graph_error = GitHubError("HTTP 403: Resource not accessible")
+    seen: list[str] = []
+
+    def agent(req):
+        seen.append((read_context_of(req.prompt) / "epic-sub-issues.md").read_text())
+        return _epic_result(None)
+
+    eng = _in_update_epic(tmp_state_dir, fake_github, agent)
+    assert eng.step().next_phase == "DONE"
+    assert f"could not read the sub-issues of {EPIC} for this launch (GitHubError)" in seen[0]
 
 
 # -- UPDATE_EPIC: controller-owned roadmap splice and merge batching (#13, #4) -----------------

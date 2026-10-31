@@ -649,7 +649,7 @@ EXPECTED_READ_CONTEXT = {
         "operator-evidence.md",
     },
     "FIX": {"README.md", "issue.md", "review-comment.md", "follow-up-issues.md"},
-    "UPDATE_EPIC": {"README.md", "epic.md", "epic-issues.md"},
+    "UPDATE_EPIC": {"README.md", "epic.md", "epic-issues.md", "epic-sub-issues.md"},
 }
 
 
@@ -702,6 +702,8 @@ def test_every_remote_launch_gets_no_credential_route_and_its_read_context(
             states = (context / "epic-issues.md").read_text()
             assert "issues/2: OPEN: Feature" in states and "issues/3: OPEN: Next thing" in states
             assert "issues/9: (could not be read)" in states
+            children = (context / "epic-sub-issues.md").read_text()
+            assert "issues/2: open\n" in children and "issues/3: open\n" in children
         return inner(req)
 
     eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)

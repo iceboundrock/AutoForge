@@ -3,11 +3,11 @@
 ADR 0004 D10: an agent holds no GitHub credential, so everything a phase
 prompt used to tell it to read with ``gh`` (the issue and its comments, the
 PR and its comments, the check summary, the review comment it acts on, the
-follow-up issues, the EPIC and the issues it references, a replan's source
-PR) is read by the controller through its typed client and written, before
-the launch, into a per-launch directory under the state directory that the
-prompt names by absolute path. The engine collects (D12.6); this module only
-renders and bounds, with no I/O:
+follow-up issues, the EPIC, the issues it references and its sub-issues, a
+replan's source PR) is read by the controller through its typed client and
+written, before the launch, into a per-launch directory under the state
+directory that the prompt names by absolute path. The engine collects
+(D12.6); this module only renders and bounds, with no I/O:
 
 - every text is redacted with the run-log redactor;
 - every item is bounded (a body, a comment, the number of comments, a file)
@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from .github import CommentInfo, IssueInfo, PRInfo
+from .github import MAX_SUB_ISSUES, CommentInfo, IssueInfo, IssueNode, PRInfo
 from .prompts import escape_inline, fenced_untrusted_block
 from .redaction import redact
 
@@ -333,6 +333,29 @@ def render_operator_evidence(entries: Iterable[OperatorEvidence]) -> str:
             "",
         ]
     return "\n".join(lines)
+
+
+def render_sub_issues(nodes: Iterable[IssueNode], title: str) -> str:
+    """One line per native sub-issue, by number: URL, state, and whether it is a parent itself.
+
+    A sub-issue row carries no title (:class:`~autoforge.github.IssueNode`),
+    so none is shown; a closed one shows GitHub's reason.
+    """
+    entries = sorted(nodes, key=lambda node: (node.repository.lower(), node.number))
+    lines = [f"# {title}", "", _HEADER, ""]
+    if len(entries) > MAX_SUB_ISSUES:
+        lines += [omission(title.lower(), MAX_SUB_ISSUES, len(entries), "issues"), ""]
+    if not entries:
+        lines += ["(none)", ""]
+    for node in entries[:MAX_SUB_ISSUES]:
+        state = node.state if node.is_open else f"{node.state} ({node.state_reason or 'no reason'})"
+        nested = (
+            f": has {node.sub_issues_total} sub-issue(s) of its own"
+            if node.sub_issues_total
+            else ""
+        )
+        lines.append(f"- {escape_inline(redact(node.url))}: {escape_inline(state)}{nested}")
+    return "\n".join([*lines, ""])
 
 
 def unreadable(title: str, reference: str, error: Exception) -> str:

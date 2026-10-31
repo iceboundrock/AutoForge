@@ -151,10 +151,13 @@ machine and to reading your model keys, SSH keys or `gh` credential file
 credential the redaction baseline recognises, forge a controller marker,
 close an issue or merge. Two choices are an agent's and so can be
 steered: whether a review has findings, and, in a sequential EPIC run,
-which open issue of the repository `UPDATE_EPIC` picks next (any open
-issue, not only one the EPIC lists, so on a public repository possibly one
-a stranger opened). `autoforge epic run` admits only the EPIC's own
-sub-issues.
+which of the EPIC's open sub-issues `UPDATE_EPIC` picks next. The
+controller refuses a next issue that GitHub does not list as a native
+sub-issue of the EPIC, or that has sub-issues of its own, which is the
+rule `autoforge epic run` admits by. A stranger's issue becomes a
+candidate only once someone allowed to change the EPIC's sub-issues adds
+it; mentioning it in the EPIC body is not enough. The run's first issue
+is the one you name.
 
 ### The outer sandbox is opt-in and Linux-only
 
@@ -301,7 +304,9 @@ The Critical and High ones block the Public Alpha release until they are
 fixed ([#255](https://github.com/iceboundrock/AutoForge/issues/255)); until
 then, apply the mitigation in the last column. A row marked *Fixed in
 `0.1.0a0`* describes `main` after its fix, which every release from
-`0.1.0a0` on carries; its last column says what still applies.
+`0.1.0a0` on carries; its last column says what still applies. A row
+marked *Fixed after `0.1.0a0`* describes `main` after a fix that no
+release carries yet.
 
 | Issue | Severity | What happens today | Until it is fixed |
 |---|---|---|---|
@@ -312,7 +317,7 @@ then, apply the mitigation in the last column. A row marked *Fixed in
 | [#284](https://github.com/iceboundrock/AutoForge/issues/284) | High | *Fixed in `0.1.0a0`.* A recognised token directly after an ANSI escape sequence (`ESC[0m`, which OpenCode's saved `stderr.log` carries), a backslash escape written out (`\n`, `\t`, `\uXXXX`) or any other character that cannot be part of it is redacted in the run logs, state and the CLI's output, and refused in published text | Redaction is still a baseline ([why](#redaction-is-a-baseline)): treat run logs as sensitive and never commit or share them ([how](#keep-autoforges-files-out-of-git)) |
 | [#285](https://github.com/iceboundrock/AutoForge/issues/285) | Medium | Other credential shapes are not recognised: AWS access keys, private-key blocks, `gsk_`, `xai-`, `npm_`, `glpat-`, `hf_`, and a key of no known shape under a prefixed name such as `GEMINI_API_KEY` | As for #282 |
 | [#286](https://github.com/iceboundrock/AutoForge/issues/286) | Medium | One allow-list serves every launch, and it refuses only the names `gh` and git read a credential from ([why](#other-limits)) | List no variable you would not give to the agents and to the code under review alike |
-| [#287](https://github.com/iceboundrock/AutoForge/issues/287) | Medium | In a sequential EPIC run, `UPDATE_EPIC` may pick any open issue of the repository next, on a public repository possibly one a stranger opened | Prefer `autoforge epic run`, which admits only the EPIC's sub-issues |
+| [#287](https://github.com/iceboundrock/AutoForge/issues/287) | Medium | *Fixed after `0.1.0a0`.* In a sequential EPIC run, `UPDATE_EPIC`'s next issue must be a native sub-issue of the EPIC with no sub-issues of its own, as `autoforge epic run` admits; any other selection, an issue the EPIC body only mentions included, is refused and asked again once, then `BLOCKED`. In `0.1.0a0` it could be any open issue of the repository, on a public repository possibly one a stranger opened | On `0.1.0a0`, prefer `autoforge epic run`. On `main`, an issue becomes selectable once someone adds it as a sub-issue of the EPIC: add only issues you would hand to an agent ([why](#prompt-injection-and-public-repositories-in-particular)) |
 | [#289](https://github.com/iceboundrock/AutoForge/issues/289) | Medium | *Fixed in `0.1.0a0`.* The merge gate refuses an empty check rollup, and one in which no check succeeded, under every configuration, `safety.verify_check_definition: false` and an empty `safety.required_checks` included; `doctor` names a GitHub Free plan restriction as the plan, never as a token permission, and its required-check row fails while `safety.allow_merge: true` and the requirement cannot be verified (the plan, a token without access, not found, a transient failure, or a hidden bypass list with no word on this token) | A branch rule is still what makes a check *required*: with the gate open, keep both settings at their defaults and a CI check required ([why](#check-runs-on-a-private-repository)) |
 | [#291](https://github.com/iceboundrock/AutoForge/issues/291) | Medium | *Fixed in `0.1.0a0`.* With a fine-grained token on a private repository whose pull requests have checks, REVIEW and FIX now run without the check results (the reviewer is told they are unknown), the merge gate blocks with a reason naming the credential and its remedy, and `doctor`'s "pull request check runs readable" row reports it | With the merge gate open, use `gh auth login` or a classic token with `repo` there ([why](#check-runs-on-a-private-repository)) |
 
