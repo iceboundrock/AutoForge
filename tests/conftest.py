@@ -442,7 +442,14 @@ WHOLE_VALUES_285_R8_REDACTED = {
 # ``:`` below the key; in a block mapping with the ``:`` on the line below
 # the key, the value on it, below it, quoted, going on below it and in a
 # block; and an upper-case or a well-known name's flow scalar going on at the
-# line's start, and before a next key that holds a space (R9-F2). Each with
+# line's start, and before a next key that holds a space (R9-F2). Then the
+# neighbouring shapes the fix of those findings covers: an
+# explicit key with comments in a flow collection, its own anchor or tag,
+# alone below its ``?`` (after a comment too), and after an explicit key with
+# no value, whose line break JSON writes out; a key's own anchor in a block
+# and its tag in a flow collection; an upper-case name with a comment after
+# its ``:`` and the value below comment lines or going on at a line's start;
+# and a flow key after a comment that follows the ``,`` before it. Each with
 # its id, its class and the part that must never be shown.
 WHOLE_VALUES_285_R9 = [
     (
@@ -529,6 +536,78 @@ WHOLE_VALUES_285_R9 = [
         "{CLIENT_SECRET:\n  FAKEspacedfirst\n  FAKEspacedcont, two words: x}",
         "FAKEspacedcont",
     ),
+    (
+        "flow-explicit-comment",
+        "credential-suffix-assignment",
+        "{? client_secret # rotated\n: FAKEflowxcomment}",
+        "FAKEflowxcomment",
+    ),
+    (
+        "flow-explicit-comment-lines",
+        "credential-suffix-assignment",
+        "{? client_secret\n# rotated\n:\n# old\n  'FAKEflow xlines'}",
+        "flow xlines",
+    ),
+    (
+        "explicit-key-anchor",
+        "credential-suffix-assignment",
+        "? &k client_secret\n: FAKExkeyanchor",
+        "FAKExkeyanchor",
+    ),
+    (
+        "explicit-key-tag",
+        "credential-suffix-assignment",
+        "- ? !!str db_password\n  : FAKExkeytag",
+        "FAKExkeytag",
+    ),
+    (
+        "explicit-key-below",
+        "credential-suffix-assignment",
+        "?\n  client_secret\n: FAKExkeybelow",
+        "FAKExkeybelow",
+    ),
+    (
+        "explicit-key-below-comment",
+        "env-assignment",
+        "? # the key\n  GH_TOKEN\n: FAKExkeybelowgh",
+        "FAKExkeybelowgh",
+    ),
+    (
+        "explicit-after-no-value",
+        "credential-suffix-assignment",
+        "? x_token\n? client_secret\n: FAKExnovalue",
+        "FAKExnovalue",
+    ),
+    (
+        "key-anchor-below",
+        "credential-suffix-assignment",
+        "&k client_secret:\n  FAKEkeyanchor",
+        "FAKEkeyanchor",
+    ),
+    (
+        "flow-key-tag",
+        "credential-suffix-assignment",
+        "{!!str CLIENT_SECRET: FAKEflowtag1\nFAKEflowtag2}",
+        "FAKEflowtag2",
+    ),
+    (
+        "upper-comment-lines",
+        "credential-suffix-assignment",
+        "CLIENT_SECRET: # rotated\n# old\n  FAKEuppercomment",
+        "FAKEuppercomment",
+    ),
+    (
+        "flow-upper-comment",
+        "credential-suffix-assignment",
+        "{DB_PASSWORD: # rotated\nFAKEflowupper1\nFAKEflowupper2}",
+        "FAKEflowupper2",
+    ),
+    (
+        "flow-lead-comment",
+        "credential-suffix-assignment",
+        "{a: 1, # rotated\n client_secret:\n  FAKEflowlead}",
+        "FAKEflowlead",
+    ),
 ]
 # What ``redact`` makes of each of them: the key, its ``?``, the ``:``, the
 # properties, the quotes, the next entry and the indentation stay; under an
@@ -549,6 +628,18 @@ WHOLE_VALUES_285_R9_REDACTED = {
     "flow-underscore-at-line-start": "{_SERVICE_API_KEY:\n  ***REDACTED***",
     "flow-gh-token-at-line-start": "{GH_TOKEN:\n***REDACTED***",
     "flow-next-key-with-a-space": "{CLIENT_SECRET:\n  ***REDACTED*** two words: x}",
+    "flow-explicit-comment": "{? client_secret # rotated\n: ***REDACTED***}",
+    "flow-explicit-comment-lines": "{? client_secret\n# rotated\n:\n# old\n  '***REDACTED***'}",
+    "explicit-key-anchor": "? &k client_secret\n: ***REDACTED***",
+    "explicit-key-tag": "- ? !!str db_password\n  : ***REDACTED***",
+    "explicit-key-below": "?\n  client_secret\n: ***REDACTED***",
+    "explicit-key-below-comment": "? # the key\n  GH_TOKEN\n: ***REDACTED***",
+    "explicit-after-no-value": "? x_token\n? client_secret\n: ***REDACTED***",
+    "key-anchor-below": "&k client_secret:\n  ***REDACTED***",
+    "flow-key-tag": "{!!str CLIENT_SECRET: ***REDACTED***",
+    "upper-comment-lines": "CLIENT_SECRET: # rotated\n# old\n  ***REDACTED***",
+    "flow-upper-comment": "{DB_PASSWORD: # rotated\n***REDACTED***",
+    "flow-lead-comment": "{a: 1, # rotated\n client_secret:\n  ***REDACTED***",
 }
 # Values under names whose prefix starts with underscores, as a mapping's
 # keys (R8-F3): ``redact_obj`` replaces each, and keeps every entry.

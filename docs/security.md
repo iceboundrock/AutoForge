@@ -241,8 +241,11 @@ next entry stays, whether a line feed, CRLF or a bare carriage return ends
 its lines, below a key in a YAML flow collection (`{client_secret:`,
 then the value), where the collection's `}` and next entry stay under a
 lower-case name, at any indentation up to the indicator that closes it,
-and under an explicit YAML key (`? client_secret`, then `: value` on the
-next line, or `{? client_secret:` in a flow collection); written out in
+under an explicit YAML key (`? client_secret`, then `: value` on the
+next line, or `{? client_secret:` in a flow collection, the key on its
+`?`'s line or below it), and after a key's own anchor or tag and the
+comments YAML allows around a key (after it, its `:`, its `?` or a flow
+collection's `,`, and comment lines before its value); written out in
 JSON text as well
 ([#285](https://github.com/iceboundrock/AutoForge/issues/285)). Among what
 is still not recognised: an unquoted value under a lower-case name that

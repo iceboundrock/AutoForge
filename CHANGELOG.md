@@ -76,7 +76,13 @@ so.
   space; under a lower-case name the collection's `}` and next entry stay.
   A value under an explicit YAML key (`? client_secret`, then `: FAKE` on
   the next line, in a sequence entry too, or `{? client_secret:` in a flow
-  collection) is redacted as under the key's own `:`. A statement that
+  collection) is redacted as under the key's own `:`, also with the key on
+  a line below its `?`. A key's own anchor or tag (`&k client_secret:`) and
+  comments around a key (after it, its `:`, its `?` or a flow collection's
+  `,`, and comment lines before its value) no longer hide its value, and a
+  `#` alone after an upper-case name's `:` is a comment, not the value. A
+  comment read once by a key's candidate is not read again by one inside
+  it, so a text full of commented keys stays linear. A statement that
   ends in a colon (`if api_token:`), a nested mapping and, under a
   lower-case name, a value
   that reads as code (`${{ secrets.X }}`, `process.env.X`) are left. A

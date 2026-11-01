@@ -1957,10 +1957,11 @@ def test_a_value_the_fourth_285_review_found_is_redacted_whole_as_text_and_as_js
 # under a word the name's rule took in part; blocks that start with a JSON
 # document, a bracket, a number, a word the code rule refuses on a line of
 # its own, or a placeholder followed by more. An upper-case name's rule on
-# its line takes any word across a line break, a comment's ``#`` too, as
-# before, so under one the comment goes with the value.
+# its line takes any word across a line break, but a ``#`` alone is none
+# (round 9: it starts a comment), so the comment stays under such a name as
+# under any other.
 _YAML_VALUES_R4 = [
-    ("GEMINI_API_KEY:\n  # c\n  FAKE", "GEMINI_API_KEY:\n  ***REDACTED***"),
+    ("GEMINI_API_KEY:\n  # c\n  FAKE", "GEMINI_API_KEY:\n  # c\n  ***REDACTED***"),
     ("GITHUB_TOKEN:\n\n  FAKE two\n\n  FAKE", "GITHUB_TOKEN:\n\n  ***REDACTED***"),
     ("Client_Secret:\n# c\n  FAKE", "Client_Secret:\n# c\n  ***REDACTED***"),
     (
@@ -3139,7 +3140,11 @@ def test_a_value_the_ninth_285_review_found_is_redacted_whole_as_text_and_as_jso
 # mapping itself; in a flow collection, the value on the key's line, below
 # it, on the ``:``'s line below the key with the next entry after it, quoted
 # below the ``:``, in a flow sequence, after a ``,``, the ``?`` alone on its
-# line, and under a well-known name.
+# line, and under a well-known name. Then the shapes around them: the key's
+# own anchor and tag, the key on a line below its ``?`` (after a comment and
+# a blank line too, in a sequence's entry), comments between the key, its
+# ``:`` and its value in a flow collection, and an explicit key after one
+# with no value, whose line break JSON writes out.
 _YAML_EXPLICIT_VALUES = [
     ("? client_secret\n: FAKE", "? client_secret\n: ***REDACTED***"),
     ("? client_secret\n:   FAKE", "? client_secret\n:   ***REDACTED***"),
@@ -3180,6 +3185,29 @@ _YAML_EXPLICIT_VALUES = [
     ("{a: 1, ? client_secret:\n FAKE}", "{a: 1, ? client_secret:\n ***REDACTED***}"),
     ("{?\n client_secret:\n FAKE}", "{?\n client_secret:\n ***REDACTED***}"),
     ("{? GH_TOKEN\n: FAKE}", "{? GH_TOKEN\n: ***REDACTED***"),
+    ("? &k client_secret\n: FAKE", "? &k client_secret\n: ***REDACTED***"),
+    ("? !!str 'client_secret'\n:\n  FAKE", "? !!str 'client_secret'\n:\n  ***REDACTED***"),
+    ("?\n  client_secret\n: FAKE", "?\n  client_secret\n: ***REDACTED***"),
+    (
+        "? # the key\n\n  db_password # rotated\n: 'FAKE x'",
+        "? # the key\n\n  db_password # rotated\n: '***REDACTED***'",
+    ),
+    ("- ?\n    x_api_key\n  : FAKE", "- ?\n    x_api_key\n  : ***REDACTED***"),
+    ("{? client_secret # rotated\n: FAKE}", "{? client_secret # rotated\n: ***REDACTED***}"),
+    (
+        "{? client_secret\n# rotated\n: FAKE, b: c}",
+        "{? client_secret\n# rotated\n: ***REDACTED***, b: c}",
+    ),
+    (
+        "{? client_secret\n: # rotated\n# by ops\n  FAKE}",
+        "{? client_secret\n: # rotated\n# by ops\n  ***REDACTED***}",
+    ),
+    ("{? &k client_secret\n: FAKE}", "{? &k client_secret\n: ***REDACTED***}"),
+    ("? x_token\n? client_secret\n: FAKE", "? x_token\n? client_secret\n: ***REDACTED***"),
+    (
+        "? x_token # c\n# d\n? client_secret\n: FAKE",
+        "? x_token # c\n# d\n? client_secret\n: ***REDACTED***",
+    ),
 ]
 
 
@@ -3233,6 +3261,21 @@ _R9_NEAR_MISSES = [
     "why? client_secret\n: FAKE",
     "client_secret\n: The secret issued by the provider.",
     "? __TOKEN\n: FAKE",
+    # The shapes around them: a key below its ``?`` at the ``?``'s column,
+    # and its ``:`` at the key's; a lower-case name's code after the key's
+    # own properties; a key in a comment; a ``#`` alone after a name, which
+    # starts a comment, under an upper-case and a well-known name too.
+    "?\nclient_secret\n: FAKE",
+    "?\n  client_secret\n  : FAKE",
+    "&k api_token:\n  str",
+    "? &k client_secret\n: None",
+    "{client_secret: # c\n  str}",
+    "? # client_secret\n: FAKE",
+    "{a: 1, # client_secret\n b: FAKE}",
+    "{? client_secret # c\n}",
+    "GH_TOKEN: #",
+    "DB_PASSWORD=#",
+    "CLIENT_SECRET: # set below",
 ]
 
 
@@ -3240,6 +3283,79 @@ _R9_NEAR_MISSES = [
 def test_a_value_the_ninth_review_rules_leave_is_left(text):
     assert redact(text) == text
     assert credential_classes(text) == ()
+
+
+# A key's own properties and the comments around a key (#285 review, round
+# 9), each with what ``redact`` makes of it: a key's anchor and tag in a
+# block mapping, a sequence and a flow collection, its value below it or
+# going on below its line; a comment after an upper-case or a well-known
+# name's ``:`` with the value below comment lines, in a block mapping and in
+# a flow collection going on at a line's start; a flow key after a comment
+# that follows the ``,`` or the ``{`` before it; and a credential key after a
+# key whose candidate read a comment and found no value, whose line break
+# JSON writes out.
+_R9_COMMENTED_KEYS = [
+    ("&k client_secret:\n  FAKE", "&k client_secret:\n  ***REDACTED***"),
+    ("- !!str db_password:\n    FAKE", "- !!str db_password:\n    ***REDACTED***"),
+    ("&k CLIENT_SECRET: FAKE1\n  FAKE2", "&k CLIENT_SECRET: ***REDACTED***"),
+    ("{&k client_secret:\n  FAKE}", "{&k client_secret:\n  ***REDACTED***}"),
+    ("{a: 1, !!str x_api_key:\nFAKE1\nFAKE2}", "{a: 1, !!str x_api_key:\n***REDACTED***}"),
+    (
+        "CLIENT_SECRET: # rotated\n# by ops\n  FAKE",
+        "CLIENT_SECRET: # rotated\n# by ops\n  ***REDACTED***",
+    ),
+    ("GH_TOKEN:\n# rotated\n  FAKE", "GH_TOKEN:\n# rotated\n  ***REDACTED***"),
+    ("{CLIENT_SECRET: # rotated\nFAKE1\nFAKE2}", "{CLIENT_SECRET: # rotated\n***REDACTED***"),
+    (
+        "{GH_TOKEN:\n# rotated\nFAKE1\nFAKE2, b: c}",
+        "{GH_TOKEN:\n# rotated\n***REDACTED*** b: c}",
+    ),
+    (
+        "{a: 1, # rotated\n client_secret:\n  FAKE}",
+        "{a: 1, # rotated\n client_secret:\n  ***REDACTED***",
+    ),
+    (
+        "{# rotated\n# by ops\n client_secret: FAKE1\n  FAKE2}",
+        "{# rotated\n# by ops\n client_secret: ***REDACTED***",
+    ),
+    ("x_token: # c\nclient_secret:\n  FAKE", "x_token: # c\nclient_secret:\n  ***REDACTED***"),
+    ("x_token:\n# c\nclient_secret:\n  FAKE", "x_token:\n# c\nclient_secret:\n  ***REDACTED***"),
+    (
+        "{x_token: # c\n, client_secret:\n  FAKE}",
+        "{x_token: # c\n, client_secret:\n  ***REDACTED***}",
+    ),
+    (
+        "- x_token: # c\n- client_secret:\n    FAKE",
+        "- x_token: # c\n- client_secret:\n    ***REDACTED***",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _R9_COMMENTED_KEYS, ids=[t for t, _ in _R9_COMMENTED_KEYS]
+)
+def test_a_value_under_a_key_with_properties_or_comments_is_redacted_whole(text, expected):
+    """#285 review, round 9: a key's own anchor or tag made it no key to the
+    rules that read a value below it; an upper-case name's rule took the
+    ``#`` of a comment after its ``:`` for the value and left the value
+    below comment lines; a comment between a flow collection's entries hid
+    the next key; and a candidate that matched a key with no value took the
+    line break, written out, that the next key's candidate starts after.
+    A YAML parser reads each value under its key. It goes, as text and
+    written out one, two and three deep; the key, its properties, the
+    comments and the next entry stay, and the output is stable."""
+    yaml = pytest.importorskip("yaml")
+    yaml.safe_load(text)
+    assert redact(text) == expected
+    assert credential_classes(text) != ()
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        assert "FAKE" not in out and redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
 
 
 def _explicit_entry(rng, tag, name, col):
@@ -3308,6 +3424,104 @@ def test_every_value_under_a_generated_explicit_yaml_key_is_redacted():
 
 _FLOW_LOWER_NAMES = ["client_secret", "db_password", "x_api_key", "_db_password", "Db_Password"]
 _FLOW_UPPER_NAMES = ["CLIENT_SECRET", "_SERVICE_API_KEY", "GH_TOKEN", "gh_token"]
+
+
+def _credential_words(node, names):
+    """The words of every string a parsed YAML document holds under one of
+    ``names``, at any depth."""
+    words = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in names and isinstance(value, str):
+                words += value.split()
+            words += _credential_words(value, names)
+    elif isinstance(node, list):
+        for item in node:
+            words += _credential_words(item, names)
+    return words
+
+
+def _commented_block_entry(rng, tag, name):
+    """A block mapping's entry under ``name`` (#285 review, round 9): the
+    key's own property, an explicit key on its ``?``'s line or below it,
+    comments after the key, its ``:`` and the ``?``, comment and blank lines
+    before the value; the value plain, going on below, or quoted."""
+    words = [f"FAKE{tag}w{i}" for i in range(rng.randint(1, 2))]
+    prop = rng.choice(["", "", "&k ", "!!str "])
+    comment = rng.choice(["", " # c", ' # "a_token: x'])
+    lines = rng.choice(["", "\n# c", "\n\n# d\n"])
+    value = rng.choice(
+        [
+            f"\n  {words[0]}" + "".join(f"\n  {w}" for w in words[1:]),
+            "\n  '" + " ".join(words) + "'",
+        ]
+    )
+    if rng.random() < 0.4:
+        key = rng.choice([f"? {prop}{name}", f"?{comment}\n  {prop}{name}"])
+        return f"{key}{comment}{lines}\n:{value}", words
+    return f"{prop}{name}:{comment}{lines}{value}", words
+
+
+def _commented_flow_entry(rng, tag, name):
+    """A flow mapping's entry under ``name`` (#285 review, round 9): the
+    key's own property, an explicit key, comments after the key and its
+    ``:``, comment lines before the value; the value below, going on at a
+    line's start or quoted."""
+    words = [f"FAKE{tag}w{i}" for i in range(rng.randint(1, 2))]
+    prop = rng.choice(["", "", "&k ", "!!str "])
+    comment = rng.choice(["", " # c"])
+    lines = rng.choice(["", "\n# c"])
+    value = rng.choice(
+        [
+            "\n" + "\n".join(words),
+            "\n  '" + " ".join(words) + "'",
+        ]
+    )
+    if rng.random() < 0.4:
+        return f"? {prop}{name}{comment}{lines}\n:{value}", words
+    return f"{prop}{name}:{comment}{lines}{value}", words
+
+
+def test_every_value_under_a_generated_commented_yaml_key_is_redacted():
+    """#285 review, round 9: block and flow mappings that a YAML parser
+    reads, their keys with their own anchor or tag, explicit keys on their
+    ``?``'s line or below it, comments after a key, its ``:``, its ``?`` and
+    a flow collection's ``,``, comment and blank lines before a value, among
+    other entries. Every word a parser reads under a credential key goes,
+    as text and as JSON one, two and three deep, the output is stable and
+    within the growth bound, and a progress line shows none of it."""
+    yaml = pytest.importorskip("yaml")
+    names = _FLOW_UPPER_NAMES + _FLOW_LOWER_NAMES
+    rng = random.Random(28510)
+    checked = 0
+    while checked < 300:
+        flow = rng.random() < 0.5
+        entries = []
+        for j in range(rng.randint(1, 3)):
+            if rng.random() < 0.25:
+                entries.append("endpoint: e")
+                continue
+            make = _commented_flow_entry if flow else _commented_block_entry
+            entries.append(make(rng, f"{checked}x{j}", rng.choice(names))[0])
+        if flow:
+            text = "{" + rng.choice([", ", ",\n", ", # c\n", ",\n# c\n"]).join(entries) + "}"
+        else:
+            text = "\n".join(entries)
+        text = text.replace("\n", rng.choice(["\n", "\n", "\r\n"]))
+        try:
+            secrets = [w for w in _credential_words(yaml.safe_load(text), names) if "FAKE" in w]
+        except yaml.YAMLError:
+            continue
+        if not secrets:
+            continue
+        checked += 1
+        assert [w for w in secrets if w in clean(text, 100_000)] == [], text
+        for depth in (0, 1, 2, 3):
+            written = _json_string(text, depth)
+            out = redact(written)
+            assert [w for w in secrets if w in out] == [], text
+            assert redact(out) == out and credential_classes(out) == (), text
+            assert len(out) <= MAX_GROWTH_FACTOR * len(written)
 
 
 def _flow_value(rng, tag):
@@ -4293,6 +4507,26 @@ def test_the_eighth_review_patterns_stay_linear(text):
         "{a_token:" + "\n" * 1_000_000 + "x\ny}",
         "{GH_TOKEN:\n  x\n  " + "y, " * 300_000,
         "{GH_TOKEN:\n  x\n  y, " + "a " * 400_000 + ":",
+        # Comments that hold candidates of their own: on a key's line after
+        # its ``:``, as one line, behind a quote, an escape and a flow
+        # indicator; comment lines below a key and an explicit key's ``:``;
+        # after a ``?`` alone, a key below it, a flow collection's ``,`` and
+        # a marker; and comment lines between a flow indicator and a key.
+        '"a_token: # ' * 80_000,
+        "\x1b[0ma_token: # " * 70_000,
+        "{a_token: # " * 80_000,
+        "{GH_TOKEN: # " * 70_000,
+        '"a_token:\n# ' * 80_000,
+        "{a_token:\n# " * 80_000,
+        "{a_token:\n\n# " * 70_000,
+        "{? a_token\n: # " * 70_000,
+        "{? a_token # " * 70_000,
+        "{? a_token\n# {? a_token\n" * 60_000,
+        '"? # ' * 150_000,
+        '"?\n  a_token # ' * 60_000,
+        ", # " * 300_000,
+        ",\n# , " * 150_000,
+        "***REDACTED*** # " * 60_000,
     ],
     ids=[
         "explicit-keys-no-colon",
@@ -4309,6 +4543,21 @@ def test_the_eighth_review_patterns_stay_linear(text):
         "closed-value-blank-lines",
         "next-key-commas",
         "next-key-words",
+        "comments-behind-quotes",
+        "comments-behind-escapes",
+        "comments-behind-braces",
+        "upper-comments-behind-braces",
+        "comment-lines-behind-quotes",
+        "comment-lines-behind-braces",
+        "blank-then-comment-lines",
+        "comments-after-a-colon-below",
+        "explicit-flow-comments",
+        "explicit-flow-comment-lines",
+        "comments-after-a-lone-question-mark",
+        "comments-after-a-key-below",
+        "comments-after-commas",
+        "comment-lines-after-commas",
+        "comments-after-markers",
     ],
 )
 def test_the_ninth_review_patterns_stay_linear(text):
@@ -4317,7 +4566,9 @@ def test_the_ninth_review_patterns_stay_linear(text):
     unchanged where no ``:`` and value follow, so a comment's own explicit
     keys are never read again; a flow collection's closed value reads its
     key's line to its first line break and its lines once, which hold no
-    flow indicator; a next key's words end at the next ``,``. A megabyte of
+    flow indicator; a next key's words end at the next ``,``; a candidate
+    that read a comment and found no value matches what it read, so that no
+    candidate in the comment reads it again (``_SKIP_LINES``). A megabyte of
     each is redacted well inside the budget, and the output is stable."""
     started = time.process_time()
     out = redact(text)
@@ -5409,10 +5660,16 @@ def test_every_redaction_pattern_has_a_growth_pin():
     against a new pattern is that it cannot be added without a unit that it
     matches on its own. ``sk-ant-`` is matched through ``redact`` by the
     ``sk-`` pattern first, so each pattern is checked directly, not via the
-    marker ``redact`` leaves.
+    marker ``redact`` leaves. A unit pins a pattern only where the pattern
+    changes it: a match that changes nothing (round 9's ``_SKIP_LINES``)
+    grows nothing.
     """
     units = list(_WORST_CASE_UNITS.values())
-    unpinned = [entry.name for entry in _PATTERNS if not any(entry.regex.search(u) for u in units)]
+    unpinned = [
+        entry.name
+        for entry in _PATTERNS
+        if not any(entry.regex.sub(entry.replacement, u) != u for u in units)
+    ]
     assert unpinned == []
 
 
@@ -5589,15 +5846,20 @@ def test_credential_classes_is_empty_exactly_when_redact_changes_nothing(text):
 @pytest.mark.parametrize("text", _CREDENTIAL_CORPUS)
 def test_a_pattern_with_a_hint_matches_no_text_without_it(text):
     """A hint lets ``redact`` skip a pattern on a text that lacks it (#285
-    review, round 3), so it must be what every match holds: no pass of a
-    pattern finds anything in a text, its JSON or its escaped repeats where
-    the hint is not found."""
+    review, round 3), so it must be what every match that changes a text
+    holds: no pass of a pattern changes a text, its JSON or its escaped
+    repeats where the hint is not found. A match that changes nothing (a
+    candidate that found no value, round 9's ``_SKIP_LINES``) may stand
+    anywhere; skipping the pattern skips nothing then."""
     for variant in (text, json.dumps(text), f"x\\n{text}\x1b[0m{text}"):
         for entry in _PATTERNS:
             for hint in (entry.hint, entry.name_hint):
                 if hint is None or hint.search(variant):
                     continue
-                assert entry.regex.search(variant) is None, (entry.name, variant)
+                assert entry.regex.sub(entry.replacement, variant) == variant, (
+                    entry.name,
+                    variant,
+                )
                 assert entry.after_escape is None or entry.after_escape.search(variant) is None
 
 
@@ -5611,7 +5873,7 @@ def test_every_hint_is_a_literal_a_match_must_hold():
             if hint is None:
                 continue
             for unit in units:
-                found = entry.regex.search(unit) or (
+                found = entry.regex.sub(entry.replacement, unit) != unit or (
                     entry.after_escape and entry.after_escape.search(unit)
                 )
                 if found:

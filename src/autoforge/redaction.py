@@ -38,7 +38,11 @@ indentation to the indicator that closes it (``_yaml_flow_closed``). An
 explicit key's value, after a ``:`` on a line below its ``? key``, is read
 as after the key's own ``:`` (``_explicit_key``), in a block mapping and in a
 flow collection, and a key after a ``?`` or a ``:`` of compact notation as
-after a sequence's ``-``.
+after a sequence's ``-``. A key's own anchor and tag may stand before it, an
+explicit key on a line below its ``?``, and comments where YAML allows them
+around a key, between a flow collection's entries too; a candidate that read
+a comment and found no value matches unchanged, so that no comment is read
+again by a candidate inside it (``_SKIP_LINES``).
 :func:`redact_obj` knows a credential's name as a mapping's key too
 (``{"GEMINI_API_KEY": "..."}``).
 A line that starts a code fence is never a value, and a line break written
@@ -228,8 +232,13 @@ _BLOCK_AHEAD = rf"{_BLOCK_HEADER}{_YAML_COMMENT}[^\S\r\n]*+(?:[\r\n]|\\{{1,7}}[r
 # A value no quote opens ends at a space, a quote, a semicolon, a backslash
 # that starts an escaped closing quote and, after its first character, a line
 # break or a tab written out; it never starts with a line break written out.
+# A ``#`` alone is no value (#285 review, round 9): after a ``:`` and a space
+# it starts a YAML comment (``CLIENT_SECRET: # rotated``, the value on a line
+# below, comment lines between), and taken for the value it hid the key's
+# line from the rules that read the value below it; it holds no secret.
+_LONE_HASH = rf"#(?![^\s\"';\\]|{_WORD_BACKSLASH})"
 _UNQUOTED_VALUE = (
-    rf"(?!{_BLOCK_AHEAD})"
+    rf"(?!{_BLOCK_AHEAD}|{_LONE_HASH})"
     rf"(?:[^\s\"';\\]|{_FIRST_BACKSLASH})(?:[^\s\"';\\]|{_WORD_BACKSLASH})*"
 )
 # A value a quote opens is taken whole (#285): it runs to the quote that
@@ -626,15 +635,20 @@ _YAML_DASHES = _yaml_dashes("-?:")
 # A line's start, in a ``(?m)`` pattern: the text's, or after a line feed or
 # a carriage return (round 7).
 _LINE_START = r"(?:^|(?<=\r))"
+#
+# A key's own properties (an anchor, a tag) may stand before it (#285
+# review, round 9): ``&k client_secret:``, then the value below, is the key
+# ``client_secret`` to a YAML parser, and was no key here. They stay with the
+# lead, and the key's column is still where its node starts, before them.
 _YAML_LEAD = (
     rf"(?P<lead>(?:{_LINE_START}|{_ESCAPE}|(?<=(?P<yq>[\"'])))"
-    rf"(?P<ind>[^\S\r\n]*+){_YAML_DASHES}(?P<kq>\\{{0,7}}[\"'])?)"
+    rf"(?P<ind>[^\S\r\n]*+){_YAML_DASHES}(?:{_YAML_PROPS})?(?P<kq>\\{{0,7}}[\"'])?)"
 )
-# An explicit key (#285 review, round 9): a ``? `` before the key, behind
-# the indentation and a sequence's dashes, its column the ``?``'s.
-_YAML_XLEAD = (
+# An explicit key (#285 review, round 9): a ``?`` behind the indentation and
+# a sequence's dashes, its column the ``?``'s (``_explicit_key``).
+_YAML_XSTART = (
     rf"(?P<lead>(?:{_LINE_START}|{_ESCAPE}|(?<=(?P<yq>[\"'])))"
-    rf"(?P<ind>[^\S\r\n]*+){_yaml_dashes('-')}\?[^\S\r\n]++(?P<kq>\\{{0,7}}[\"'])?)"
+    rf"(?P<ind>[^\S\r\n]*+){_yaml_dashes('-')}\?)"
 )
 # A value line's indentation: past the key's column.
 _YAML_IND = _yaml_ind()
@@ -713,6 +727,64 @@ _YAML_NODE_PROPS = rf"(?:{_YAML_PROPERTY}(?:{_YAML_PROPS_TO_NODE}|[^\S\r\n]++)){
 _YAML_BELOW_HEADER = rf"{_BLOCK_INDICATOR}{_YAML_HEADER_TO_BLOCK}"
 
 
+# What a candidate that finds no value matches still (#285 review, round 9),
+# where it read a comment: the rest of its key's line (a comment, and the
+# properties or a block's header before it) and the blank and comment lines
+# below, to the line break before the first line that is neither, which it
+# leaves; a comment on the key's line or on one of those lines, at least.
+# That match changes nothing (``_unless_skipped``). A comment holds anything,
+# another candidate behind a quote, an escape or a flow indicator too: had
+# the candidate failed, each of those would read the comment and the comment
+# lines below it again, a run of them once for each, which made a megabyte of
+# ``"a_token: # `` or of ``{a_token:`` above ``# `` lines take minutes.
+# Matched, they are read once, and a YAML parser reads no key in a comment
+# either. Blank lines hold no candidate, so a candidate that read no comment
+# fails as before, and costs no replacement call. The break before the next
+# line is left, since a key on that line may be led by it written out (``\n``
+# in JSON text, an escape): as round 9 first matched an explicit key with no
+# value, it took that break, and the next explicit key's value was kept
+# whole. A break here is any, as written or written out, so this part sets
+# no group.
+_ANY_BREAK = rf"(?:{_LINE_BREAK}|\\{{1,7}}(?:r(?:\\{{1,7}}n)?+|n))"
+_ANY_COMMENT = r"#(?:[^\r\n\\]|\\(?!\\{0,6}[rn]))*+"
+_SKIP_LINE = (
+    rf"[^\S\r\n]*+{_ANY_BREAK}[^\S\r\n]*+(?:{_ANY_COMMENT})?"
+    rf"(?=[^\S\r\n]*+(?:{_ANY_BREAK}|\Z))"
+)
+_SKIP_LINES = (
+    rf"(?:[^\S\r\n]++|(?:[^\S\r\n]*+{_ANY_BREAK})++[^\S\r\n]*+){_ANY_COMMENT}"
+    rf"(?:{_SKIP_LINE})*+"
+)
+# The properties a value's candidate reads on its key's line, and a block's
+# header, before the part above.
+_SKIP_PROPS = rf"(?:[^\S\r\n]++{_YAML_PROPERTY}(?:[^\S\r\n]++{_YAML_PROPERTY})?)?"
+_SKIP_HEADER = rf"(?:[^\S\r\n]++{_BLOCK_HEADER}|{_SKIP_PROPS})"
+
+
+# A flow rule's candidate reads its value's blank and comment lines once:
+# where it finds no value after them it matches what it read, its line breaks
+# too (a flow key's lead starts at an indicator, never at one), where it read
+# a comment (group ``skip``, after ``_flow_read_comment``). Where it fails
+# before them it matches the comment on its key's line, and an explicit key's
+# blank and comment lines above its ``:`` (group ``kskip``).
+def _comment_seen(group: str) -> str:
+    """A comment that sets ``group``, after the space before it, optional."""
+    return rf"(?:[^\S\r\n]++(?P<{group}>#)(?:[^\r\n\\]|\\(?!\\{{0,6}}[rn]))*+)?"
+
+
+def _lines_seen(group: str) -> str:
+    """Blank and comment lines (``_YAML_SKIPPED``), a comment setting ``group``."""
+    return rf"(?:[^\S\r\n]*+(?:(?P<{group}>#){_YAML_UNIT}*+)?{_YAML_BREAK})*+"
+
+
+def _flow_read_comment(*groups: str) -> str:
+    """Passes where one of ``groups`` took part, fails otherwise."""
+    test = "(?!)"
+    for group in reversed(groups):
+        test = rf"(?({group})|{test})"
+    return test
+
+
 # What every key with a value below it holds: its colon, then a block's
 # header, a property, a comment or the line break, as written or written out.
 _YAML_HINT = re.compile(r":[^\S\r\n]*+[|>!&#\r\n\\]")
@@ -733,38 +805,80 @@ _YAML_HINT = re.compile(r":[^\S\r\n]*+[|>!&#\r\n\\]")
 # the ``:``'s line is also its name's rule's, whose space before a ``:``
 # crosses a line break, as written or written out (``_TO_SEPARATOR``).
 #
+# The key follows its ``?`` on the ``?``'s line, after a space, or on a line
+# below it (round 9: ``?`` alone, or with a comment, then the key indented
+# past the ``?``'s column, blank and comment lines between them), the key's
+# own properties (``? &k client_secret``) before it, all of them the lead's
+# (group ``klead``). A line break there is any (``_ANY_BREAK``): the key's
+# line's own sets group ``ybs``.
+#
 # A candidate that finds no ``:`` and no value after it is matched still, to
-# the end of what it read (group ``skip``: the key, its comment, the blank
-# and comment lines below it), and that match changes nothing
+# the end of what it read (``_SKIP_LINES``: the key's comment and the blank
+# and comment lines below it; group ``skip``), as is a ``?`` whose key below
+# is none (group ``xskip``), and that match changes nothing
 # (``_unless_skipped``). A comment holds anything, another explicit key
 # behind a quote or an escape too, which is a candidate of its own: had the
 # first candidate failed, each of those would read the comment lines below
 # it again, a run of such lines once for each. Matched, they are read once,
-# and a YAML parser reads no key in a comment either.
+# and a YAML parser reads no key in a comment either. The line break after
+# them is left to the next line's key, which it may lead written out: in
+# round 9 an explicit key with no value took it (``? x_token``, then
+# ``? client_secret`` and ``: FAKE``, in JSON text), and the next key's value
+# was kept whole.
+_YAML_XKEY = (
+    rf"(?P<klead>(?:[^\S\r\n]++|{_YAML_COMMENT}[^\S\r\n]*+{_ANY_BREAK}"
+    rf"(?:[^\S\r\n]*+(?:{_ANY_COMMENT})?{_ANY_BREAK})*+{_YAML_IND})"
+    rf"(?:{_YAML_PROPS})?(?P<kq>\\{{0,7}}[\"'])?)"
+)
+
+
 def _explicit_key(names: str, rest: str) -> str:
-    """An explicit key's lead, name and the lines down to its ``:`` (group
-    ``sep``), the ``:`` (group ``col``) and ``rest``; or, where those are not
-    there, only what the candidate read (group ``skip``)."""
+    """An explicit key's lead (groups ``lead`` and ``klead``), name, the
+    lines down to its ``:`` (group ``sep``), the ``:`` (group ``col``) and
+    ``rest``; or, where those are not there, only what the candidate read
+    (group ``skip`` or ``xskip``)."""
     return (
-        rf"(?m){_YAML_XLEAD}(?P<name>{names})"
-        rf"(?P<sep>(?(kq)(?P=kq)){_YAML_COMMENT}[^\S\r\n]*+"
-        rf"(?P<brk>{_YAML_OPENING_BREAK}{_YAML_SKIPPED})?+)"
-        rf"(?:(?(brk)(?P<col>{_YAML_COL}:){rest}|(?!))|(?P<skip>))"
+        rf"(?m){_YAML_XSTART}(?:{_YAML_XKEY}(?P<name>{names})"
+        rf"(?:(?P<sep>(?(kq)(?P=kq)){_YAML_COMMENT}[^\S\r\n]*+{_YAML_OPENING_BREAK}"
+        rf"{_YAML_SKIPPED})(?P<col>{_YAML_COL}:){rest}"
+        rf"|(?P<skip>(?(kq)(?P=kq)?){_SKIP_LINES}))"
+        rf"|(?P<xskip>{_SKIP_LINES}))"
     )
 
 
-def _unless_skipped(template: str) -> Callable[[re.Match[str]], str]:
+_TEMPLATE_GROUP = re.compile(r"\\g<(\w+)>")
+
+
+def _unless_skipped(template: str, *skips: str) -> Callable[[re.Match[str]], str]:
     """A replacement that expands ``template``, or keeps a match whose group
-    ``skip`` took part (``_explicit_key``) as it is."""
+    among ``skips`` took part (``_SKIP_LINES``) as it is.
+
+    ``template`` holds group references (``\\g<name>``) and literal text
+    only. It is split once, here: ``Match.expand`` looks a template up in a
+    cache keyed by the pattern, whose hash covers its compiled code, and for
+    these patterns that cost more per match than the match itself."""
+    parts = _TEMPLATE_GROUP.split(template)
+    literals, names = parts[0::2], tuple(parts[1::2])
+    if len(names) < 2 or any("\\" in literal for literal in literals):
+        raise ValueError(f"unsupported template: {template!r}")
 
     def replace(match: re.Match[str]) -> str:
-        return match[0] if match["skip"] is not None else match.expand(template)
+        for group in skips:
+            if match[group] is not None:
+                return match[0]
+        out = [literals[0]]
+        for value, literal in zip(match.group(*names), literals[1:], strict=True):
+            if value:
+                out.append(value)
+            out.append(literal)
+        return "".join(out)
 
     return replace
 
 
-# What every explicit key holds: its ``?`` and the space after it.
-_EXPLICIT_HINT = re.compile(r"\?[^\S\r\n]")
+# What every explicit key holds: its ``?`` and the space or the line break
+# after it, as written or written out.
+_EXPLICIT_HINT = re.compile(r"\?(?:\s|\\{1,7}[nr])")
 
 
 def _literal_checks(literal_only: bool) -> tuple[str, str, str]:
@@ -818,14 +932,20 @@ def _yaml_value(
         return _Pattern(
             name,
             re.compile(_explicit_key(names, rest)),
-            _unless_skipped(r"\g<lead>\g<name>\g<sep>\g<col>" + template),
+            _unless_skipped(r"\g<lead>\g<klead>\g<name>\g<sep>\g<col>" + template, "skip", "xskip"),
             hint=_EXPLICIT_HINT,
             name_hint=re.compile(name_hint),
         )
+    # A key with no value below it matches still, to the end of its comment
+    # and the blank and comment lines below it (``_SKIP_LINES``, round 9).
+    regex = (
+        rf"(?m){_YAML_LEAD}(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:)"
+        rf"(?:{rest}|(?P<skip>{_SKIP_HEADER}{_SKIP_LINES}))"
+    )
     return _Pattern(
         name,
-        re.compile(rf"(?m){_YAML_LEAD}(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:){rest}"),
-        r"\g<lead>\g<name>\g<sep>" + template,
+        re.compile(regex),
+        _unless_skipped(r"\g<lead>\g<name>\g<sep>" + template, "skip"),
         hint=_YAML_HINT,
         name_hint=re.compile(name_hint),
     )
@@ -912,7 +1032,11 @@ def _yaml_explicit_line(name: str, names: str, name_hint: str, *, literal_only: 
     return _Pattern(
         name,
         re.compile(_explicit_key(names, rest)),
-        _unless_skipped(r"\g<lead>\g<name>\g<sep>\g<col>\g<sp>\g<open>***REDACTED***\g<close>"),
+        _unless_skipped(
+            r"\g<lead>\g<klead>\g<name>\g<sep>\g<col>\g<sp>\g<open>***REDACTED***\g<close>",
+            "skip",
+            "xskip",
+        ),
         hint=_EXPLICIT_HINT,
         name_hint=re.compile(name_hint),
     )
@@ -1063,13 +1187,45 @@ _FLOW_INDICATOR = r"[,\[\]{}]"
 _FLOW_EXPLICIT = r"(?P<xk>\?(?:[^\S\r\n]|\r\n?|\n|\\{1,7}[nr])++)?"
 
 
-def _flow_lead(after_marker: str) -> str:
-    """A flow key's lead (above): after a marker, ``after_marker`` follows."""
+# A comment may stand between the indicator and the key (#285 review, round
+# 9): on the indicator's line after a space (``{a: 1, # rotated``, then the
+# key below) and on lines of their own, as YAML allows between a flow
+# collection's entries; such a key's value was kept whole. The comment lines
+# are the lead's, ``find`` the key's line's indentation. A candidate that
+# reads a comment there and finds no key after it matches still, to the end
+# of the comment and of the blank and comment lines below it, and changes
+# nothing (group ``xskip``, ``_flow_xskip``), so that a comment's own
+# indicators are not read again, as ``_SKIP_LINES`` keeps a key's comment.
+_FLOW_LEAD_COMMENT = rf"(?:(?<=[^\S\r\n]){_ANY_COMMENT})?"
+_FLOW_LEAD_LINES = rf"(?:(?:\r\n?|\n|\\{{1,7}}[nr])(?P<find>[^\S\r\n]*+)(?:{_ANY_COMMENT})?)*+"
+# A flow rule starts with its lead's first character alone, in a group of
+# its own (``_FLOW_START``), and asks after it what stands before it, so that
+# the regex engine scans for that set of characters alone between candidates:
+# a rule that starts with an alternative, or with a lookbehind, is tried at
+# every position, several times slower over a text with no candidate.
+# A ``*`` is a lead only as a marker's last (group ``mk``), asked once here.
+_FLOW_START = r"(?P<li>[{\[,*])(?:(?<=[{\[,])|(?<=\*\*\*REDACTED\*\*\*)(?P<mk>))"
+_FLOW_CLOSED_START = r"(?P<li>[{\[,])"
+
+
+def _flow_xskip() -> str:
+    """What a flow key's candidate that read a comment in its lead and found
+    no key matches (above), after the lead's first character."""
     return (
-        rf"(?P<lead>[{{\[,*](?:(?<=[{{\[,])|(?<=\*\*\*REDACTED\*\*\*)(?={after_marker}))"
-        r"[^\S\r\n]*+"
-        r"(?:(?:\r\n?|\n|\\{1,7}[nr])(?P<find>[^\S\r\n]*+))*+"
-        rf"{_FLOW_EXPLICIT}"
+        r"(?P<xskip>"
+        rf"(?=[^\S\r\n]*+(?:(?<=[^\S\r\n])#|(?:{_ANY_BREAK}[^\S\r\n]*+)++#))"
+        rf"[^\S\r\n]*+{_FLOW_LEAD_COMMENT}"
+        rf"(?:[^\S\r\n]*+{_ANY_BREAK}[^\S\r\n]*+(?:{_ANY_COMMENT})?(?=[^\S\r\n]*+{_ANY_BREAK}))*+)"
+    )
+
+
+def _flow_lead(after_marker: str) -> str:
+    """A flow key's lead (above), after its first character (group ``li``,
+    ``_FLOW_START``): after a marker, ``after_marker`` follows."""
+    return (
+        rf"(?P<lead>(?(mk)(?={after_marker}))"
+        rf"[^\S\r\n]*+{_FLOW_LEAD_COMMENT}{_FLOW_LEAD_LINES}"
+        rf"{_FLOW_EXPLICIT}(?:{_YAML_PROPS})?"
         r"(?P<kq>\\{0,7}[\"'])?)"
     )
 
@@ -1169,21 +1325,31 @@ def _yaml_flow_value(name: str, names: str, name_hint: str, *, literal_only: boo
     indentation and the quotes stay; the value is replaced."""
     one_line, lines, _ = _literal_checks(literal_only)
     lower = rf"(?:{lines}{_FLOW_LINE}{_FLOW_MORE}++|{one_line}{_FLOW_LINE})"
+    # A key with no value below it matches still where it read a comment
+    # (round 9): what it read (group ``skip``), the comment on its line where
+    # no line break follows (``kskip``), a comment in its lead (``xskip``).
     regex = (
-        rf"{_FLOW_LEAD}(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:)"
-        rf"(?P<hdr>[^\S\r\n]++{_YAML_PROPERTY}(?:[^\S\r\n]++{_YAML_PROPERTY})?)?"
-        rf"(?P<gap>{_YAML_COMMENT}[^\S\r\n]*+{_YAML_OPENING_BREAK})"
-        rf"(?P<blank>{_YAML_SKIPPED}){_FLOW_NOT_BLOCK}"
-        rf"(?P<vind>[^\S\r\n]*+)(?P<vprops>{_FLOW_NODE_PROPS})?"
+        rf"{_FLOW_START}(?:{_FLOW_LEAD}(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:)"
+        rf"(?:(?P<hdr>[^\S\r\n]++{_YAML_PROPERTY}(?:[^\S\r\n]++{_YAML_PROPERTY})?)?"
+        rf"(?P<gap>{_comment_seen('gcm')}[^\S\r\n]*+{_YAML_OPENING_BREAK})"
+        rf"(?P<blank>{_lines_seen('bcm')})"
+        rf"(?:{_FLOW_NOT_BLOCK}(?P<vind>[^\S\r\n]*+)(?P<vprops>{_FLOW_NODE_PROPS})?"
         rf"(?:{_YAML_QUOTE_GUARD}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
         r"(?P<close>(?:(?P=vbs)(?P=vq))?)"
         rf"|(?!{_YAML_NOT_PLAIN}){_flow_plain(lower, literal_only)})"
+        rf"|{_flow_read_comment('gcm', 'bcm')}(?P<skip>))"
+        rf"|(?P<kskip>{_SKIP_PROPS}[^\S\r\n]++{_ANY_COMMENT}))|{_flow_xskip()})"
     )
     return _Pattern(
         name,
         re.compile(regex),
-        r"\g<lead>\g<name>\g<sep>\g<hdr>\g<gap>\g<blank>\g<vind>\g<vprops>\g<open>"
-        r"***REDACTED***\g<close>",
+        _unless_skipped(
+            r"\g<li>\g<lead>\g<name>\g<sep>\g<hdr>\g<gap>\g<blank>\g<vind>\g<vprops>\g<open>"
+            r"***REDACTED***\g<close>",
+            "skip",
+            "kskip",
+            "xskip",
+        ),
         hint=_YAML_HINT,
         name_hint=re.compile(name_hint),
     )
@@ -1207,14 +1373,14 @@ def _yaml_flow_continued(name: str, names: str, name_hint: str, *, literal_only:
     )
     plain = rf"(?(upper){anything}|{lower})" if literal_only else anything
     regex = (
-        rf"{_FLOW_LINE_LEAD}(?P<name>{names})"
+        rf"{_FLOW_START}(?:{_FLOW_LINE_LEAD}(?P<name>{names})"
         rf"(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:[^\S\r\n]++(?:{_YAML_PROPS})?)"
-        rf"{_YAML_FIRST_BREAK}(?!{_YAML_NOT_PLAIN}){plain}"
+        rf"{_YAML_FIRST_BREAK}(?!{_YAML_NOT_PLAIN}){plain}|{_flow_xskip()})"
     )
     return _Pattern(
         name,
         re.compile(regex),
-        r"\g<lead>\g<name>\g<sep>***REDACTED***",
+        _unless_skipped(r"\g<li>\g<lead>\g<name>\g<sep>***REDACTED***", "xskip"),
         hint=_FLOW_CONTINUED_HINT,
         name_hint=re.compile(name_hint),
     )
@@ -1260,21 +1426,29 @@ def _yaml_flow_continued(name: str, names: str, name_hint: str, *, literal_only:
 # value's lines once, which hold no flow indicator, and the blank and
 # comment lines after them.
 _FLOW_CLOSED_LEAD = (
-    r"(?P<lead>[{\[,][^\S\r\n]*+(?:(?:\r\n?|\n|\\{1,7}[nr])[^\S\r\n]*+)*+"
-    rf"{_FLOW_EXPLICIT}(?P<kq>\\{{0,7}}[\"'])?)"
+    rf"(?P<lead>[^\S\r\n]*+{_FLOW_LEAD_COMMENT}{_FLOW_LEAD_LINES}"
+    rf"{_FLOW_EXPLICIT}(?:{_YAML_PROPS})?(?P<kq>\\{{0,7}}[\"'])?)"
 )
+# The key's line to its first line break: a comment may end it (round 9),
+# after the key (an explicit key's: ``{? client_secret # rotated``) or after
+# its ``:`` (``{CLIENT_SECRET: # rotated``), the value below.
 _FLOW_CLOSED_BREAK = (
     r"(?=(?:\\{0,7}[\"'])?[^\S\r\n]*+(?::(?=[\s\\]))?"
     r"(?:[^\\:\s,\[\]{}]++|:(?![\s,\[\]{}])|[^\S\r\n]++(?![#\s])|\\++(?![nr]))*+"
-    rf"[^\S\r\n]*+{_YAML_OPENING_BREAK})"
+    rf"(?:[^\S\r\n]++{_ANY_COMMENT})?[^\S\r\n]*+{_YAML_OPENING_BREAK})"
 )
-# The blank lines below the ``:`` and the indentation, then the value's
-# properties, or the space after the ``:`` on its line; properties on the
-# ``:``'s line before either.
+# An explicit key's comment, and the blank and comment lines between it and
+# its ``:`` (round 9).
+_FLOW_CLOSED_TO_COLON = (
+    rf"{_comment_seen('xcm')}(?:[^\S\r\n]*+{_YAML_BREAK}{_lines_seen('xbcm')})?+"
+)
+# The comment on the ``:``'s line and the blank and comment lines below it
+# (round 9), and the indentation, then the value's properties, or the space
+# after the ``:`` on its line; properties on the ``:``'s line before either.
 _FLOW_CLOSED_HDR = (
     rf"(?P<hdr>(?:[^\S\r\n]++{_YAML_PROPERTY}(?:[^\S\r\n]++{_YAML_PROPERTY})?)?"
-    rf"(?:(?:[^\S\r\n]*+{_YAML_BREAK})++(?P<below>)[^\S\r\n]*+(?:{_FLOW_NODE_PROPS})?"
-    r"|[^\S\r\n]++))"
+    rf"(?:{_comment_seen('gcm')}[^\S\r\n]*+{_YAML_BREAK}{_lines_seen('bcm')}(?P<below>)[^\S\r\n]*+"
+    rf"(?:{_FLOW_NODE_PROPS})?|[^\S\r\n]++))"
 )
 _FLOW_CLOSED_MORE = rf"{_FLOW_BREAKS}[^\S\r\n]*+{_FLOW_FENCE}{_FLOW_LINE}"
 _FLOW_CLOSED_END = (
@@ -1297,15 +1471,29 @@ def _yaml_flow_closed(name: str, names: str, name_hint: str, *, literal_only: bo
         rf"(?(xk){_YAML_QUOTE_GUARD}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
         r"(?P<close>(?:(?P=vbs)(?P=vq))?)|(?!))"
     )
+    # A key with no value matches still where it read a comment (round 9):
+    # what it read (group ``skip``), its comment and an explicit key's lines
+    # above its ``:`` where it fails before its value (``kskip``,
+    # ``_SKIP_LINES``), a comment in its lead (``xskip``).
     regex = (
-        rf"{_FLOW_CLOSED_LEAD}(?P<name>{names}){_FLOW_CLOSED_BREAK}"
-        rf"(?P<sep>(?(kq)(?P=kq))(?(xk)(?:[^\S\r\n]*+{_YAML_BREAK})*+)[^\S\r\n]*+:)"
-        rf"{_FLOW_CLOSED_HDR}(?:{quoted}|(?!{_YAML_NOT_PLAIN}){plain})"
+        rf"{_FLOW_CLOSED_START}(?:{_FLOW_CLOSED_LEAD}(?P<name>{names})(?:{_FLOW_CLOSED_BREAK}"
+        rf"(?P<sep>(?(kq)(?P=kq))(?(xk){_FLOW_CLOSED_TO_COLON})[^\S\r\n]*+:)"
+        rf"{_FLOW_CLOSED_HDR}(?:{quoted}|(?!{_YAML_NOT_PLAIN}){plain}"
+        rf"|{_flow_read_comment('xcm', 'xbcm', 'gcm', 'bcm')}(?P<skip>))"
+        rf"|(?P<kskip>(?(kq)(?P=kq)?)(?:[^\S\r\n]*+:)?{_SKIP_PROPS}"
+        rf"(?:[^\S\r\n]++|(?(xk)(?:[^\S\r\n]*+{_ANY_BREAK})++[^\S\r\n]*+|(?!)))"
+        rf"{_ANY_COMMENT}(?:{_SKIP_LINE})*+))"
+        rf"|{_flow_xskip()})"
     )
     return _Pattern(
         name,
         re.compile(regex),
-        r"\g<lead>\g<name>\g<sep>\g<hdr>\g<open>***REDACTED***\g<close>",
+        _unless_skipped(
+            r"\g<li>\g<lead>\g<name>\g<sep>\g<hdr>\g<open>***REDACTED***\g<close>",
+            "skip",
+            "kskip",
+            "xskip",
+        ),
         hint=_FLOW_CONTINUED_HINT,
         name_hint=re.compile(name_hint),
     )
@@ -1853,9 +2041,12 @@ _CREDENTIAL_KEY = re.compile(
 # (``? a_token\n: x``, 14 to 27; below the ``:``, 16 to 29), and a flow
 # collection's value closed by its indicator holds a character and the
 # indicator at least, which stays (``{? a_token\n: x}``, 15 to 28; going on at
-# the line's start, ``{A_TOKEN: x\ny}``, 14 to 24, the ``}`` taken). The rounds of
-# :func:`redact` (``_MAX_ROUNDS``) are more patterns in that order, and
-# compound nothing either, by the argument below.
+# the line's start, ``{A_TOKEN: x\ny}``, 14 to 24, the ``}`` taken). A key's
+# own properties, an explicit key on a line below its ``?`` (``?\n a_token\n:
+# x``, 14 to 27) and the comments around a key stay, and only make a text
+# longer; a match that changes nothing (``_SKIP_LINES``) grows nothing. The
+# rounds of :func:`redact` (``_MAX_ROUNDS``) are more patterns in that order,
+# and compound nothing either, by the argument below.
 # Growth does not compound across patterns: a later pattern can only lengthen
 # the text by matching a run *shorter* than the marker, and a marker is never
 # part of such a run. The value classes that admit ``*`` (the named-assignment

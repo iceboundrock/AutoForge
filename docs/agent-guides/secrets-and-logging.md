@@ -648,7 +648,8 @@ api_token:              Db_Password:            client_secret: <word>
 - **The key starts its line**: after its indentation, a YAML sequence's
   dashes (`- client_secret:`), or the `?` and `:` of compact notation that
   stand where they do (`? client_secret:`, an explicit key that is itself a
-  mapping, ninth review of #285), as a quoted key (`"client_secret":`), or
+  mapping, ninth review of #285), after its own anchor or tag (`&k
+  client_secret:`, ninth review), as a quoted key (`"client_secret":`), or
   right after an escape sequence (OpenCode's `ESC[0m`, a `\n` written out)
   or a quote that starts a string (YAML in JSON). A statement that ends in
   a colon does not (`if api_token:`, `while client_secret:`), so code
@@ -888,11 +889,42 @@ api_token:              Db_Password:            client_secret: <word>
   value). An upper-case or a well-known name's `\s*` before a `:` crossed a
   line break as written already, and crosses one written out now too
   (`_TO_SEPARATOR`), so a text reads alike as written and as JSON writes it.
-  A candidate that finds no `:` and value matches what it read, its key, its
-  comment and the blank and comment lines below it, and changes nothing:
-  another explicit key written in such a comment is a candidate of its
-  own, and had the first failed each would read the comment lines below it
-  again, a run of such lines once for each.
+  The key may also stand on a line below its `?`, indented past the `?`'s
+  column, after a comment and blank lines (`?`, then `  client_secret`,
+  then `: FAKE`), and have its own anchor or tag (`? &k client_secret`).
+  In a flow collection comments may stand after the key, on lines between
+  it and its `:`, after the `:` and on lines before the value
+  (`{? client_secret # rotated`, then `: FAKE}`).
+- **A key's own properties and the comments around it** (ninth review of
+  #285): a key may carry an anchor or a tag of its own (`&k
+  client_secret:`, then the value below; `{!!str CLIENT_SECRET: FAKE1`, then
+  `FAKE2}`), which no rule that reads a value below a key took, and a
+  comment may stand after a flow collection's `,` or `{`, on lines of its
+  own before the next key (`{a: 1, # rotated`, then `client_secret:` and
+  the value), and after an upper-case name's `:` above comment lines before
+  the value (`CLIENT_SECRET: # rotated`, `# by ops`, then the value). A
+  parser reads each value under its key; each was kept whole. The
+  properties stay with the key's lead, and the key's column is where its
+  node starts, before them. An upper-case or a well-known name's rule on its
+  line took the `#` of such a comment for the value and hid the line from
+  the rules below; a `#` alone is no value now (`_LONE_HASH`): it starts a
+  comment and holds no secret, so `GH_TOKEN: #` stays as it is.
+- **A candidate that read a comment and found no value** matches what it
+  read, its key's comment and the blank and comment lines below it, and
+  changes nothing (`_SKIP_LINES`; a flow key's, which never starts at a
+  line break, the lines it read before its value, and the comment in its
+  lead). A comment holds anything, another candidate behind a quote, an
+  escape or a flow indicator too, and had the first failed each would read
+  the comment and the comment lines below it again, a run of them once for
+  each: a megabyte of `"a_token: # `, or of `{a_token:` above `# ` lines,
+  took minutes until the ninth review, and is redacted in well under a
+  second now. A block key's match leaves the line break before the next
+  line that is no blank or comment line, which may lead the next key
+  written out (`\n` in JSON text): the ninth review's first fix matched an
+  explicit key with no value with that break, so in JSON text the next
+  explicit key's value (`? x_token`, then `? client_secret` and `: FAKE`)
+  was kept whole. A candidate that read no comment fails as before, since a
+  blank line holds no candidate, and costs no replacement call.
 
 They run last (but the rule for a flow collection's value closed by its
 indicator, above, which runs first and reads a value as written), after
@@ -910,7 +942,11 @@ set of characters the regex engine scans for fast) and reads its key,
 one line break, the blank and comment lines before its value and its
 value's lines once (a block's once more, to tell whether each is a
 placeholder), and a candidate that fails does so at the start of its value
-or at the first line that is none of its, so the pass is linear.
+or at the first line that is none of its, or matches what it read where it
+read a comment ([above](#a-value-on-the-lines-below-a-yaml-key)), so the
+pass is linear. A flow rule starts with its lead's first character alone,
+so that the regex engine still scans for that set of characters between
+candidates.
 
 ### Redaction in rounds, and the patterns' hints
 
@@ -949,9 +985,10 @@ than a pattern that starts with a lookbehind, so a log with no credential
 is redacted in a fraction of the time it took, and one with a credential,
 two rounds and all, in about the time one round took. Every hint is checked against the
 test corpus, its JSON and its escaped repeats, and against every growth
-unit: no pass of a pattern finds anything where its hint is not found. A
-new pattern needs no hint; one it names must be what each of its matches
-holds.
+unit: no pass of a pattern changes anything where its hint is not found (a
+match that changes nothing, a candidate that read a comment and found no
+value, may stand anywhere). A new pattern needs no hint; one it names must
+be what each of its matches that changes a text holds.
 
 ## Escaped text: redact the structure first (#281)
 
