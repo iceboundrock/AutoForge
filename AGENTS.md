@@ -208,7 +208,8 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        candidate validation evidence and review certificates,
                                        SDK providers: isolated helpers, interaction contract,
                                        parallel EPIC scheduler: authority, run identity, claims, locks;
-                                       removing LOCAL mode (implemented; measured in #389):
+                                       removing LOCAL mode (implemented; measured in #389;
+                                       EPIC #383's exit audit in Appendix D):
                                        no compatibility, strict refusal, the protocol, sequencing;
                                        fast feedback and full validation: FAST is never evidence,
                                        the controller selects FULL, the coverage mapping)

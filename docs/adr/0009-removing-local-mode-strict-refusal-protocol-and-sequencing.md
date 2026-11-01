@@ -27,6 +27,10 @@
     (#389) recorded the measurement, the regression, the installed
     package's checks, the attestation of A.2.4 and the documentation audit
     in Appendix C (D12, §5.3).
+  - *Exit audit:* Appendix D takes each exit criterion of EPIC #383 on
+    `main` at `312983a`, with its verdict and evidence, and says what only
+    GitHub can show. It closes nothing: the EPIC's closure is the
+    maintainer's.
   - *Release:* nothing is authorized. D10 says what the release that
     carries the removal must say; it is not a Go/No-Go, a tag or a
     publication.
@@ -2412,3 +2416,311 @@ entries and the ADRs, which are history (D10, D11).
   `docs/releasing.md`'s procedure. Under option 1 the Public Alpha's release
   candidate carries the removal; whether the next `0.1.0aN` is the Public
   Alpha is #255's decision, not this record's.
+
+## Appendix D. EPIC #383's exit audit
+
+Written on 2026-11-01, after S4 (#389) merged as `feb4364`, against
+`main` at `312983a`. EPIC #383's body ends with twelve exit criteria. D.1
+takes each in the body's order, numbered E1 to E12 here, with a verdict
+and the evidence on `main` that holds it. D.2 runs C.8's documentation
+audit again on what `main` gained after it, D.3 runs the regression on
+`main` as merged, and D.4 says what the repository cannot show.
+
+Like C.9's, the agent that wrote this appendix holds no GitHub
+credential. It was handed #383's body and comments and nothing else of
+GitHub, so what follows says of an issue, a link or a comment only what
+those comments say, and of a tag only what the local object store holds.
+None of it was read back from GitHub. A verdict says what the repository
+holds, not that the EPIC may close: closing #383 is the maintainer's
+decision. This appendix authorizes no release.
+
+The verdicts:
+
+- *Met*: what the criterion asks is on `main`, and the tests named hold
+  it;
+- *Met in part*: the repository's part is met, and the rest is GitHub's or
+  the maintainer's (D.4);
+- *Open*: nothing in the repository can show it (D.4).
+
+`tests/test_removal_attestation.py` holds D.1 as it holds C.6. It fails
+when D.1 does not take twelve criteria once each, in order, when a
+criterion has no verdict, when one met wholly or in part names no test, or
+when a test named here no longer exists.
+
+### D.1 The exit criteria
+
+- **E1. `autoforge local` does not exist, not even as a stub: argparse rejects it. A `local:` key fails ordinary strict configuration validation. No fresh LOCAL run can be started.** *Met.*
+  The parser refuses `local` before it reads a configuration, takes a
+  lock or touches a file, and `--help` lists none:
+  `tests/test_cli.py::test_autoforge_local_is_an_invalid_choice_that_reads_writes_and_locks_nothing`,
+  `tests/test_cli.py::test_help_lists_no_local_command`, and, while a
+  scheduler's pass runs,
+  `tests/test_epic_commands.py::test_autoforge_local_during_a_pass_is_an_invalid_choice_and_the_pass_runs_on`.
+  The key is the unknown-key error of every command that loads a
+  configuration:
+  `tests/test_config.py::test_a_local_block_of_any_shape_is_an_unknown_top_level_key`,
+  `tests/test_config.py::test_the_configuration_has_no_local_section`,
+  `tests/test_cli.py::test_a_local_block_is_refused_as_an_unknown_key_by_every_command`
+  and
+  `tests/test_epic_commands.py::test_a_local_block_is_refused_by_every_epic_command_that_loads_the_configuration`.
+  `WorkflowMode` holds only `REMOTE`
+  (`tests/test_local_removal.py::test_workflow_mode_has_only_remote_and_refuses_local`),
+  so `run` starts an issue's REMOTE run and nothing else. The installed
+  command meets the same ways in (C.7,
+  `tests/test_packaging.py::test_the_local_refusal_check_covers_each_way_in_adr_0009_names`).
+- **E2. A `mode: "LOCAL"` state fails ordinary strict loading under every protocol label, with nothing written. No LOCAL state-directory discovery remains. `run --force` and the scheduler handle such a state through their generic paths, audited and tested (ADR 0009 D3, D4).** *Met.*
+  The loader reads the mode before the label, so it refuses a LOCAL
+  state under labels 1 to 14 and with none, and leaves the file
+  byte-identical:
+  `tests/test_state.py::test_a_local_runs_own_state_is_refused_under_every_label_and_left_unchanged`
+  and
+  `tests/test_protocol_compat.py::test_the_mode_is_still_read_before_the_label`.
+  `status`, `status --json`, `step`, `resume`, `unblock` and `run` refuse
+  it from `--state-dir` and from the configured location, and leave the
+  directory as it was, the lock's directory included:
+  `tests/test_cli.py::test_a_local_state_is_refused_under_every_label_and_left_alone`
+  and
+  `tests/test_cli.py::test_a_local_state_in_the_locks_directory_is_refused_without_taking_the_lock`.
+  Nothing looks at `<git dir>/autoforge/state`:
+  `tests/test_cli.py::test_a_local_state_at_the_git_dirs_default_location_is_not_looked_for`,
+  `tests/test_epic_commands.py::test_namespace_work_leaves_the_git_dirs_autoforge_state_alone`
+  and
+  `tests/test_run_namespace.py::test_legacy_standalone_state_is_never_read_moved_or_modified`.
+  A LOCAL state is one of `tests/conftest.py`'s `UNLOADABLE_STATES`, so
+  #385's audits of the generic paths run on it:
+  `tests/test_cli.py::test_status_step_resume_and_unblock_refuse_a_state_that_does_not_load`,
+  `tests/test_cli.py::test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole`
+  and
+  `tests/test_epic_commands.py::test_an_unloadable_standalone_state_holds_nothing_is_reported_and_is_left_alone`;
+  in a scheduler namespace,
+  `tests/test_epic_commands.py::test_a_namespace_state_whose_mode_is_not_remote_is_held_as_uncertain`.
+- **E3. What is gone: any LOCAL compatibility subsystem, inspector, stub, fallback documentation or legacy guide; any LOCAL execution, evidence or identity code, reachable or not; any packaged LOCAL prompt or template.** *Met.*
+  - *No subsystem.* A LOCAL artifact meets only the refusals of E1 and E2:
+    argparse's, the configuration's unknown key and the loader's unknown
+    mode, the last the same for any mode but REMOTE
+    (`tests/test_state.py::test_unknown_mode_fails_loudly`). The package's
+    exception classes at `4b03151` and at `312983a` differ by
+    `StateProtocolError` alone, #265's refusal of a newer protocol's state:
+    no error type was added for a legacy run.
+  - *No code.* `tests/test_local_removal.py` holds the package to it by
+    shape:
+    `tests/test_local_removal.py::test_a_deleted_module_cannot_be_imported`,
+    `tests/test_local_removal.py::test_no_module_imports_a_deleted_module`,
+    `tests/test_local_removal.py::test_no_module_defines_imports_or_refers_to_a_deleted_name`,
+    `tests/test_local_removal.py::test_the_local_topology_is_gone`,
+    `tests/test_local_removal.py::test_no_launch_class_is_local`
+    and
+    `tests/test_local_removal.py::test_no_module_refers_to_workflow_mode_local`.
+    LOCAL's evidence is refused as an unknown kind:
+    `tests/test_evidence.py::test_a_local_candidate_is_refused_as_an_unknown_kind`,
+    `tests/test_evidence.py::test_a_local_certificate_is_refused_as_an_unknown_kind`
+    and
+    `tests/test_review_certificate.py::test_a_remote_state_carrying_a_local_record_or_certificate_is_refused_unchanged`.
+    What `src/` still says of LOCAL mode, searched again at `312983a`, is
+    D8's drop step (`state._LOCAL_FIELDS`), the refusals' messages, and
+    docstrings and comments that cite this record.
+  - *No template.*
+    `tests/test_local_removal.py::test_no_local_prompt_template_is_shipped_or_registered`
+    and, in the built artifacts,
+    `tests/test_packaging.py::test_no_artifact_carries_a_file_of_local_mode`
+    (C.7).
+  - *No guide.* `docs/local-mode.md` went in S2.
+    `tests/test_removal_attestation.py::test_the_legacy_guide_is_gone_and_no_current_document_points_at_it`,
+    added by this audit, keeps it gone and keeps current documents from
+    linking to it. D.2 found no current document that describes LOCAL as
+    available.
+- **E4. Shared safety and security coverage was preserved before deletion, the credential-helper and login-shell preflight protections included (ADR 0009 A.2.3, A.2.4).** *Met.*
+  C.6 names, for each of A.2.4's sixteen invariants, the tests that hold it
+  on `main`, H-A's credential helper and H-B's login-shell startup file
+  first, among them
+  `tests/test_validation_evidence.py::test_a_helper_planted_by_the_producer_never_reaches_its_validation_command`
+  and
+  `tests/test_engine.py::test_a_startup_file_planted_before_candidate_validation_blocks_the_producer`.
+  `tests/test_removal_attestation.py::test_every_invariant_a_2_4_lists_is_attested_and_nothing_else`
+  and
+  `tests/test_removal_attestation.py::test_every_test_an_attestation_names_exists`
+  keep C.6 and the suite together. *Before deletion* is the order of
+  `main`'s history: S1a's replacements (#386, `a4bc60c`) landed before S2
+  (`aee704e`) and S3 (`3eb68ac`) retired the LOCAL originals, and #386
+  recorded H's mutation run (C.6).
+- **E5. State protocol N + 1 was announced on #23. It keeps every historical REMOTE refusal and migrates no LOCAL run (ADR 0009 D8).** *Met in part.*
+  The controller speaks protocol 13
+  (`tests/test_state.py::test_the_controller_speaks_protocol_13`) and loads
+  `main`'s own protocol-12 saves, relabelled on their next save
+  (`tests/test_state.py::test_a_protocol_12_file_main_saved_loads_without_a_write_and_its_next_save_is_protocol_13`).
+  Every refusal S1b pinned still passes, each run with LOCAL's twelve
+  fields present and absent (C.6, "REMOTE state refusals under the drop
+  step"), among them
+  `tests/test_state.py::test_protocol_1_is_refused_in_the_merge_phases`
+  and
+  `tests/test_state.py::test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged`.
+  No LOCAL run migrates: its state is refused by its mode (E2), and an
+  older file holding a LOCAL value is refused and left as it was
+  (`tests/test_state.py::test_an_older_file_with_a_local_field_holding_a_value_is_refused_and_left_unchanged`).
+  Open: the announcement on #23 (D.4).
+- **E6. One supported issue-driven workflow. No accidental use of LOCAL's permissive sandbox policy; `preferred` means `required`.** *Met.*
+  The one mode is REMOTE
+  (`tests/test_transitions.py::test_the_one_workflow_mode_is_remote`), and
+  the LOCAL launch classes, the only ones under which `preferred` fell back
+  to logical isolation, are gone
+  (`tests/test_local_removal.py::test_no_launch_class_is_local`, D7).
+  `preferred` refuses a host that cannot enforce as `required` does, in
+  the configuration, the evidence policy and a run's pin:
+  `tests/test_config.py::test_preferred_refuses_unenforced_exactly_as_required_does`,
+  `tests/test_evidence.py::test_preferred_requires_enforcement_as_required_does`
+  and
+  `tests/test_sandbox_pin.py::test_a_remote_run_moves_between_required_and_preferred_freely`.
+- **E7. Deterministic REMOTE conformance regression tests pass for the engine, effects, recovery, EPIC, agent providers and sandbox. No real agent or model, GitHub mutation or merge in CI.** *Met.*
+  D.3: the suite passed at `312983a`, every one of those modules in it,
+  the scripted end-to-end loops of `tests/test_integration.py` included.
+  Agents are scripted and GitHub is the in-memory fake (`tests/AGENTS.md`).
+  The `live` test is deselected by default and skips without its variable
+  (`tests/test_live_pi_support.py::test_the_live_test_is_deselected_by_default_and_skips_without_its_variable`).
+  `tests/conftest.py`'s autouse fixtures keep the suite off GitHub:
+  `_no_network_git_remote` turns an engine's fetch from GitHub into a
+  recorded no-op and fails a test that would push there, and
+  `_no_network_exact_read` fails one whose client would reach
+  `api.github.com`. CI runs what `make check` runs, with no write
+  permission:
+  `tests/test_ci_workflow.py::test_ci_runs_the_same_commands_as_the_local_make_targets`
+  and
+  `tests/test_ci_workflow.py::test_workflow_is_granted_no_write_permissions`.
+- **E8. `make check`, the relevant `make check-matrix`, sandbox backend tests where enforceable, and `make dist-check` have recorded results. Before/after performance numbers show measured change, not estimated claims.** *Met.*
+  C.5 records every one of them on S4's candidate, `ccd1910`, and D.3 on
+  `main` at `312983a`. C.3 measured `4b03151` and `3eb68ac` three times
+  each, alternating on one host, and reports the difference as measured,
+  attributed to the eleven commits between them together, not to the
+  removal alone (C.9). The targets stay what CI runs:
+  `tests/test_ci_workflow.py::test_make_check_runs_exactly_what_ci_runs`,
+  `tests/test_ci_workflow.py::test_make_check_matrix_runs_pytest_on_every_ci_python`,
+  `tests/test_ci_workflow.py::test_the_sandbox_job_measures_the_runner_and_requires_the_backend_where_it_can`
+  and
+  `tests/test_ci_workflow.py::test_the_dist_job_checks_the_installed_artifacts_on_every_ci_python`.
+- **E9. #155 and #255 are reconciled without weakening REMOTE coverage or Public Alpha gates.** *Open.*
+  The reconciliation is two notes on GitHub and the maintainer's reading
+  of them (D.4). The repository holds only this record's account: §5.1,
+  §5.2 and C.9.
+- **E10. Historical ADR 0001 is retained, and marked superseded only when the removal is complete on `main`.** *Met.*
+  ADR 0001 is on `main` with its body whole, and its header names ADR 0009
+  and the parts it keeps
+  (`tests/test_removal_attestation.py::test_adr_0001_is_kept_and_says_adr_0009_supersedes_it`,
+  added by this audit). When it was marked is history:
+  `git log -S'Superseded by:'` on its file finds one commit, `3eb68ac`,
+  S3's merge (#388), the PR that completed the removal on `main` (D11).
+- **E11. The breaking change is recorded in `CHANGELOG.md`, with manual clean-up guidance.** *Met.*
+  Under Unreleased, "LOCAL mode is removed (#387)" says what an operator
+  with LOCAL files meets, what a LOCAL run left that may be archived or
+  removed by hand, the steps to do it in and the directory never to remove
+  whole; "The state file is protocol 13, without LOCAL's twelve fields
+  (#388)" says what the bump changes.
+  `tests/test_removal_attestation.py::test_the_changelog_records_the_breaking_removal_and_its_manual_clean_up`,
+  added by this audit, holds both.
+- **E12. No tagging, PyPI upload or production merge without independent maintainer approval.** *Met in part.*
+  What the repository can show holds. `main` carries the development
+  version `0.1.0a1.dev0`, which builds but is never released
+  (`tests/test_packaging.py::test_a_development_version_builds_but_is_never_released`).
+  The publish workflow starts only on a version tag or by hand, builds
+  from a version tag alone, and mints its upload token only in its
+  protected environment:
+  `tests/test_publish_workflow.py::test_only_a_version_tag_or_a_manual_dispatch_starts_it`,
+  `tests/test_publish_workflow.py::test_build_refuses_any_ref_but_a_version_tag_before_anything_else`
+  and
+  `tests/test_publish_workflow.py::test_publish_alone_mints_a_token_in_the_protected_environment`.
+  The controller's merge gate stays closed unless a configuration opens it
+  (`tests/test_config.py::test_safety_gate_opens_from_safety_allow_merge_only`).
+  The local object store holds one tag, `v0.1.0a0` (`6e9495a`, #379,
+  2026-10-27), which predates the EPIC. Open: GitHub's and PyPI's record
+  of tags, uploads and merges, and the approval of each merge (D.4).
+
+### D.2 `main` after S4's record
+
+C.8's search ran at `3eb68ac`, and C.5's regression on `ccd1910`, five
+commits of S4 on `3eb68ac`. `main` holds four commits after `3eb68ac`:
+#259's first-run guide, starter configurations and `doctor` changes
+(`a2fd256`), #265's refusal that names a newer protocol's controller
+(`fcc1878`), S4 itself (`feb4364`) and #260's troubleshooting guide
+(`312983a`). The first two merged after S4's first commit (`ae0761c`)
+and are not in `ccd1910`, so C.5's results are for S4 without them, and no
+run this record holds before D.3 is of `main` as merged.
+
+C.8's search, run again at `312983a` over the same files and the ones
+those commits added (`docs/getting-started.md`, `docs/clean-room.md`,
+`docs/troubleshooting.md`, `examples/starter-claude-only.yaml` and
+`examples/starter-two-providers.yaml`), found no document that describes
+LOCAL as available or points at what is gone. The one new mention of
+LOCAL is `docs/troubleshooting.md`'s note that `autoforge local …` no
+longer exists and is argparse's `invalid choice: 'local'`, exit 2. Every
+other hit is of a kind C.8 kept (a refusal of a LOCAL artifact, the
+protocol history, Pi's one live run), or *local* in another sense: a
+local branch, `~/.local`, `autoforge.local.*`.
+`docs/agent-guides/state-and-recovery.md`'s "ADR
+0001, known limitation 8" cites §8.8, a part ADR 0001 keeps. The starter
+configurations have no `local:` key, and `tests/test_config.py` loads
+both.
+
+### D.3 The regression at `312983a`
+
+On 2026-11-01 between 08:51 and 09:35 UTC, on C.1's host, from a clone
+of `312983a` of its own outside the issue worktree, its environment made
+by `uv sync --locked` with `UV_OFFLINE=1`. Every run shared the host
+with another full suite: `make check` with the 3.11 leg for all but its
+first seven minutes, and the 3.12 leg with the 3.11 leg and then with a
+`make check` of this appendix's own commit. So no time below is a
+measurement (C.3 is the measurement).
+
+| Check | Interpreter | Outcome |
+|---|---|---|
+| `make check` | 3.14.8 | Passed in 1,137 s. `lock-check`, `lint`, `fmt-check` (177 files) and `typecheck` (58 source files) clean; pytest: 12,491 passed, 5 skipped, 1 deselected, in 1,124 s |
+| `make test-py3.11` (`check-matrix`) | 3.11.17 | Passed: 12,491 passed, 5 skipped, 1 deselected, in 1,443 s |
+| `make test-py3.12` (`check-matrix`) | uv's 3.12.13 | Passed: 12,388 passed, 108 skipped, 1 deselected, in 1,415 s |
+| `make test-sandbox-measured` | 3.14.8 | Passed: the host can enforce, as in C.5 (its Python has `os.memfd_create`; bubblewrap 0.12.0 with `--overlay`; unprivileged user, PID and IPC namespaces and a new procfs granted; Landlock ABI 10), so the real-backend tests were required, and all 54 passed |
+| `make dist-check DIST_PYTHON=3.12` | uv's 3.12.13 | Passed |
+| `make dist-check DIST_PYTHON=3.11` | 3.11.17 | Passed |
+
+- **164 tests more than C.5's candidate** on 3.14.8, 12,491 against
+  12,327: the net of what #259, #265 and #260 added and changed, the
+  three commits on `main` that `ccd1910` lacks besides S4's own merge.
+  Every one passed.
+- **The skips are C.5's.** On 3.14.8 and 3.11.17, the five opt-in
+  probes alone. On uv's 3.12.13, the same 108 as in C.5, each for C.5's
+  reason: those five, the 54 real-backend tests, 45 of
+  `tests/test_sandbox.py`'s tests against a fake `bwrap`, and four of
+  `tests/test_executor.py`'s pidfd waits.
+- **The installed package.** Each `dist-check` built an sdist of 83 files
+  and a wheel of 71 package files, one more each than C.7's: #265's
+  `provenance.py`. Neither carries a file of LOCAL mode, and the installed
+  command met LOCAL's fourteen ways in with their generic refusals, with
+  no `gh` or agent CLI called and nothing written. Since #259 the check
+  also runs `doctor` and a dry run with each starter configuration, and
+  each passed.
+
+### D.4 What this audit cannot show
+
+- **#23's announcement of protocol 13** (E5). D8 asks for a comment on
+  #23 naming #388 and N → N + 1 before #388's merge, and for the squash
+  commit to be recorded there after it. No document on `main` records
+  either, and #383's comment of 2026-11-01 03:38 UTC lists the
+  announcement among what the exit audit still has to confirm.
+- **#155 and #255** (E9). That comment says the notes on #155
+  ([#155#issuecomment-6552134735](https://github.com/iceboundrock/AutoForge/issues/155#issuecomment-6552134735))
+  and #255
+  ([#255#issuecomment-6552491512](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6552491512))
+  were posted during PR #425's fix round, and C.9 says the controller
+  verifies each such note before that round's commits are pushed. This
+  audit read neither note. Whether they reconcile the two issues without
+  weakening REMOTE coverage or a Public Alpha gate is a judgment on their
+  text and on #155's and #255's, for the maintainer.
+- **The native links and the children's states.** The operator's note on
+  #383
+  ([#383#issuecomment-6552134554](https://github.com/iceboundrock/AutoForge/issues/383#issuecomment-6552134554))
+  records #384 to #389 as sub-issues of #383, with §5.3's `blocked_by`
+  links, and all closed but #389, then under review in PR #425. #383's
+  next comment says #425 merged and closed #389. Nothing here read either
+  back.
+- **Tags, uploads and merges** (E12). The object store holds the tags the
+  controller fetched, which may not be all of GitHub's, and nothing of
+  PyPI. Who approved each merge of the EPIC's PRs is GitHub's record.
+- **A live model run.** G's live test was not run (C.6).
+- **The EPIC's closure and a release.** This appendix is evidence for the
+  maintainer's exit decision, not the decision. Nothing is tagged,
+  published or declared ready (C.9).
