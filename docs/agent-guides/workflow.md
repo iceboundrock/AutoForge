@@ -566,10 +566,11 @@ next entry could not find again.
   it reads the PR comments for the `ai-review-result` marker of the
   upcoming round at the bound HEAD, base *and merge base* (all re-read
   from GitHub by this entry). Any such comment is one the controller did
-  not journal (a human's, or one a reviewer of the previous contract
-  posted), so the entry enters `BLOCKED` without invoking anyone and names
-  it; it is never adopted, edited or duplicated (ADR 0004 D9.6, D13.5),
-  and two or more are named together. A comment for the same round at
+  not journal (a human's, one a reviewer of the previous contract posted,
+  or another AutoForge controller's own review under the same login), so
+  the entry enters `BLOCKED` without invoking anyone and names it; it is
+  never adopted, edited or duplicated (ADR 0004 D9.6, D13.5), and two or
+  more are named together. A comment for the same round at
   another HEAD, against another base, from another merge base, or whose
   marker names no base or no merge base (written before the marker
   recorded one), is not this round's and is ignored: a review of the diff

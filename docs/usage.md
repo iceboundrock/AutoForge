@@ -230,13 +230,34 @@ that text as `\^[`, so the read-back saw another body) needs only
 binds it, with nothing written again
 ([GitHub safety](agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)).
 `REVIEW` blocks on a comment carrying the round's review marker that it did
-not post, whether it was there before the reviewer ran (a human's, or one a
-reviewer of an earlier AutoForge version posted) or appeared while it ran:
-the controller never adopts, edits or duplicates it. Delete the comment or
-its marker, then `unblock`, and the round runs (or, when the reviewer's
-result was already accepted, its comment is posted from the plan without
-running the reviewer again). `FIX` blocks on follow-up issues it did not
-write: two open issues carrying one finding's follow-up marker, or an
+not post, whether it was there before the reviewer ran or appeared while it
+ran: the controller never adopts, edits or duplicates it, whoever wrote it.
+Found before the launch, the reason says nothing was launched or posted.
+Found after the reviewer returned, it says a reviewer ran and names the file
+that holds its result, `control-result.json` in that launch's directory of
+the run log: nothing was planned or posted, so that file is the only record
+of the result. The controller cannot tell who posted the comment, and the
+remedy depends on it, so check first:
+
+- **A stray or foreign comment** (a human's, an agent's that still held a
+  credential, or one a reviewer of an earlier AutoForge version posted):
+  delete the comment or its marker, then `unblock`, and the round runs. If
+  the block came after the reviewer, the reviewer runs again and the result
+  in the run log is not reused.
+- **Another AutoForge controller's run** under the same GitHub login, on
+  another machine or in another clone or state directory: the comment is
+  that run's own journaled review, and its `FIX` may already be working from
+  it. Do not delete the comment and do not `unblock`: `unblock` re-binds the
+  PR's HEAD, so once the other run has pushed, this one would post a
+  competing review. Stop one of the two runs.
+
+A comment carrying the marker that appears after the reviewer's result was
+accepted and its comment planned blocks as a conflict instead: once it is
+removed, `unblock` posts the comment from the plan without running the
+reviewer again.
+
+`FIX` blocks on follow-up issues it did not write: two open issues
+carrying one finding's follow-up marker, or an
 unreadable follow-up marker on any open issue (close or repair the extra
 or unreadable issue, then `unblock`); a follow-up issue that appeared or
 disappeared while the fixer ran (if it is the finding's follow-up,

@@ -5,6 +5,23 @@ so.
 
 ## Unreleased
 
+### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
+
+`REVIEW` still blocks on a comment carrying the round's review marker that
+the controller did not post, and still never adopts or duplicates it. The
+reason changed:
+
+- found after the reviewer returned, it no longer says nothing was
+  launched: it says a reviewer ran, nothing was planned or posted, and
+  names the run log's `control-result.json` that holds the result;
+- it names another AutoForge controller using the same GitHub login, on
+  another machine or in another clone or state directory, as a possible
+  author, beside a human and an agent;
+- it no longer tells you only to delete the comment. Delete a stray or
+  foreign comment (or its marker), then `unblock`. If the comment is
+  another controller's review, do not delete it and do not `unblock`:
+  stop one of the two runs.
+
 ### A Python without `os.memfd_create` cannot enforce the outer sandbox, and says so (#389)
 
 On a Python built without `os.memfd_create` (uv's CPython 3.12.13 build
