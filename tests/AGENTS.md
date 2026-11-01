@@ -420,6 +420,15 @@ fast feedback targets and what keeps  test_fast_targets.py (the mapping, the sel
 them from evidence (#342, ADR 0010)   gate, the default suite's options); test_evidence.py,
                                       test_certificate.py, test_validation_gates.py (a narrower
                                       run or an agent's claim is no FULL evidence)
+the test suite's performance EPIC     test_suite_performance_audit.py (the exit audit,
+audited (EPIC #338)                   docs/test-suite-performance-audit.md, takes the EPIC's six
+                                      exit criteria and seven invariants once each, each with a
+                                      verdict and a test for each met or held, and every test it
+                                      names exists; its section 1 is what suite_comparison.py
+                                      computes from the runs' records in
+                                      fixtures/suite_performance_audit/; workers stay opt-in and
+                                      every gate serial, whatever PYTEST_WORKERS make inherits;
+                                      the published regression policy is the report's)
 tmp_path retention (#396)             test_tmp_path_retention.py (a synthetic suite in a pytest
                                       process of its own, wired as conftest.py wires this one)
 packaging, built artifacts (#256)     test_packaging.py (metadata, license, version, declared package
