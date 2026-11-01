@@ -234,6 +234,9 @@ docs/compatibility.md                  what AutoForge runs on (OS, Python, git, 
 docs/development.md                    make targets, CI, the CI duration report and its regression
                                        policy, the built-distribution check, what a green `ci` does
                                        and does not prove
+docs/test-suite-performance-audit.md   EPIC #338's exit audit: the suite at the EPIC's baseline and on
+                                       main, measured on one host; each exit criterion and invariant
+                                       with its verdict and tests; what only GitHub holds
 docs/releasing.md                      distribution name, version and tag scheme, changelog, the
                                        maintainer's release procedure, PyPI Trusted Publishing
                                        (`pypi-publish.yml`) and its one-time setup

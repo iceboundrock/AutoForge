@@ -1,6 +1,7 @@
 # ADR 0010. Fast feedback and full validation: two tiers, one kind of evidence
 
-- **Status:** proposed with #342's pull request; its review decides it.
+- **Status:** accepted: #342's pull request, PR #412, merged as `cdb9ac0`
+  on 2026-10-31.
   - *Implemented with it:* the repository tooling of D5 and D9
     (`make test-fast`, `tests/fast_targets.py`) and the tests of §5. Neither
     changes what the controller, the state file, a `CONTROL_RESULT`, a
