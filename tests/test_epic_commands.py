@@ -28,7 +28,7 @@ from autoforge.errors import ExecutionError
 from autoforge.executor_supervised import spawn_supervised
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.ownership import MAX_REASON_CHARS
-from autoforge.provenance import MAX_PATH_CHARS, shown_path
+from autoforge.provenance import MAX_PATH_CHARS, MAX_REFUSAL_CHARS, shown_path
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, write_binding
 from autoforge.scheduler import DEFAULT_WORKER_COMMAND, EpicScheduler
 from autoforge.scheduler_state import (
@@ -45,6 +45,7 @@ from autoforge.transitions import Phase
 from .conftest import (
     GIT_IDENT,
     UNLOADABLE_STATES,
+    deep_dir,
     git_out,
     state_tree,
     unloadable_state,
@@ -131,8 +132,9 @@ class Epic:
 def epic(tmp_path, monkeypatch, capsys):
     made: list[Bench] = []
 
-    def make(config: dict | None = None) -> Epic:
-        b = Bench(tmp_path, config)
+    def make(config: dict | None = None, *, base: Path | None = None) -> Epic:
+        # ``base``: a directory to build the checkout and its files in, other than tmp_path.
+        b = Bench(tmp_path if base is None else base, config)
         made.append(b)
         return Epic(b, monkeypatch, capsys)
 
@@ -1354,7 +1356,7 @@ def test_a_credential_in_a_refused_label_is_redacted_before_it_is_cut(epic, tmp_
     _a_standalone_state_labelled(standalone, 3, label)
     code, out, err = e.run()
     assert code == 1 and b.admitted() == []
-    assert "issue #2 is uncertain: state file " in e.said
+    assert "issue #2 is uncertain: unsupported protocol_version '14 " in e.said
     assert "the standalone state " in e.said and "unsupported protocol_version '14 " in e.said
     for text in (e.said, out, err):
         assert "AIza" not in text and "SyFAKE" not in text
@@ -1393,7 +1395,14 @@ def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
     protocol this controller does not read (nothing is admitted), cannot be
     read for another reason (the loader's message names the path too), or
     holds #2. No newline forges a line, no escape reaches the terminal, and
-    nothing of the standalone state changes."""
+    nothing of the standalone state changes.
+
+    #265 R3-F1: a path that long took the refusal and the controller that
+    refused it out of the problem's 1,000 characters. Every one of these
+    reports of a protocol-14 state now keeps the refusal, this controller's
+    protocol and the import path and interpreter it runs from."""
+    import autoforge
+
     standalone = _an_odd_standalone_dir(tmp_path, odd)
     e = epic({"state_dir": str(standalone)})
     b = e.b
@@ -1414,6 +1423,19 @@ def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
         assert shown.endswith(" [... cut]") and len(shown) == MAX_PATH_CHARS
     unreadable = f"the standalone state {shown} cannot be read: "
     held = f"the standalone state {shown} runs it (phase REVIEW)"
+    # The refusal and the controller, right after the path the report names.
+    refused = (
+        f"{unreadable}unsupported protocol_version '14' (controller speaks '13'): a newer "
+        "AutoForge wrote it, and this controller, autoforge "
+    )
+    provenance = (
+        f"(protocol 13) imported from {os.path.abspath(autoforge.__file__)}, "
+        f"python {sys.executable}, reads protocols "
+    )
+
+    def keeps_the_provenance(text: str) -> None:
+        (line,) = [line for line in text.splitlines() if refused in line]
+        assert provenance in line, line
 
     def one_line_each(text: str) -> None:
         for raw in ("\x1b", "\x07", str(standalone)):
@@ -1432,6 +1454,7 @@ def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
         if content == "protocol-14":
             assert code == 1 and b.admitted() == [], said
             assert unreadable in said
+            keeps_the_provenance(said)
             assert f"nothing is admitted: the standalone state {shown} is of a protocol" in said
         elif content == "invalid-json":
             assert code == 0 and unreadable in said, said
@@ -1446,6 +1469,8 @@ def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
         assert "#2" in out and "admitted now" not in out
     else:
         assert unreadable in out
+    if content == "protocol-14":
+        keeps_the_provenance(out)
     code, out, err = e.cli("epic", "status", EPIC)
     assert code == (0 if content == "held" else 1)
     for text in (out, err):
@@ -1463,6 +1488,8 @@ def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
     if content == "protocol-14":
         refusal = f"'epic run' and 'epic resume' admit nothing: the standalone state {shown} is of"
         assert refusal in out and any(p.startswith(refusal) for p in doc["problems"])
+        keeps_the_provenance(out)
+        keeps_the_provenance("\n".join(doc["problems"]))
     assert state_tree(standalone) == before
 
 
@@ -1514,7 +1541,8 @@ def test_a_namespace_state_a_newer_controller_wrote_is_held_with_this_controller
         "unsupported protocol_version '14' (controller speaks '13'): a newer AutoForge wrote it"
     )
     imported = os.path.abspath(autoforge.__file__)
-    assert "issue #2 is uncertain: state file " in e.said and headline in e.said
+    named = f"; state file {shown_path(str(b.ns(2).state_file))}"
+    assert f"issue #2 is uncertain: {headline}" in e.said and named in e.said
     assert f"imported from {imported}" in e.said
     row = e.rows()[2]
     assert row["category"] == "uncertain"
@@ -1554,7 +1582,8 @@ def test_a_namespace_state_of_a_label_no_protocol_has_offers_no_repair_or_archiv
         "protocol has that label"
     )
     imported = f"imported from {os.path.abspath(autoforge.__file__)}"
-    assert "issue #2 is uncertain: state file " in e.said and headline in e.said
+    named = f"; state file {shown_path(str(b.ns(2).state_file))}"
+    assert f"issue #2 is uncertain: {headline}" in e.said and named in e.said
     assert imported in e.said
     diagnosis = (
         "no AutoForge protocol has its label, so no controller reads it as it is and this one "
@@ -1581,10 +1610,83 @@ def test_a_namespace_state_of_a_label_no_protocol_has_offers_no_repair_or_archiv
     code, out, _ = e.cli("epic", "status", EPIC)
     assert code == 1
     (line,) = [line for line in out.splitlines() if line.startswith("  #2 ")]
-    assert line.startswith("  #2 uncertain: uncertain(state-corrupt): state file ")
+    assert line.startswith(f"  #2 uncertain: uncertain(state-corrupt): {headline}")
     assert headline in line and diagnosis in line and leave in line
     assert all(advice not in line for advice in unsafe)
     assert "next:" not in out
+    assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
+
+
+@pytest.mark.parametrize("length", [900, 1169], ids=["whole", "cut"])
+def test_every_report_of_a_refused_namespace_state_keeps_the_controller_however_long_its_path(
+    epic, tmp_path, length
+):
+    """#265 R3-F1: a checkout this deep puts the namespace's state file at 900
+    characters (shown whole) or 1,169 (shown cut to MAX_PATH_CHARS), and the
+    loader's path-first message, cut to the classification's 1,000
+    characters, lost the refusal and the controller that refused it. Every
+    report of a protocol-14 namespace state, ``epic run`` and ``epic
+    resume`` (the scheduler's lines), ``epic run --dry-run`` and ``epic
+    status``, human and JSON, now keeps the refusal, this controller's
+    protocol and the import path and interpreter it runs from, and names
+    the state file last. #2 is never admitted and nothing of its namespace
+    changes."""
+    import autoforge
+
+    suffix = len("/repo/.git/autoforge/scheduler/issues/2/state/state.json")
+    base = deep_dir(tmp_path, length - suffix)
+    base.mkdir(parents=True)
+    e = epic(base=base)
+    b = e.b
+    b.issue(2)
+    assert len(str(b.ns(2).state_file)) == length
+    _bind(b, 2, issue_id=b.graph.issue(2, R).id)
+    standalone_state(b.ns(2).state_dir, 2, Phase.REVIEW)
+    data = json.loads(b.ns(2).state_file.read_text(encoding="utf-8"))
+    data.update(protocol_version="14", phase="A_PHASE_OF_PROTOCOL_14")
+    b.ns(2).state_file.write_text(json.dumps(data), encoding="utf-8")
+    before = (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes())
+    shown = shown_path(str(b.ns(2).state_file))
+    assert (shown == str(b.ns(2).state_file)) == (length <= MAX_PATH_CHARS)
+    refused = (
+        "unsupported protocol_version '14' (controller speaks '13'): a newer AutoForge wrote "
+        "it, and this controller, autoforge "
+    )
+    provenance = (
+        f"(protocol 13) imported from {os.path.abspath(autoforge.__file__)}, "
+        f"python {sys.executable}, reads protocols "
+    )
+    named = f"; state file {shown}"
+    corrupt = "uncertain(state-corrupt): "
+
+    def keeps_the_provenance(text: str, prefix: str) -> str:
+        """The one line of ``text`` reporting #2's refusal, after ``prefix``."""
+        (line,) = [line for line in text.splitlines() if f"{prefix}{refused}" in line]
+        assert provenance in line and named in line, line
+        assert line.index(provenance) < line.index(named)
+        assert len(line) <= MAX_REFUSAL_CHARS + 1200, len(line)
+        return line
+
+    for go in (e.run, e.resume):
+        code, _, _ = go()
+        assert code == 0 and b.admitted() == [] and b.claims(2) is None, e.said
+        line = keeps_the_provenance(e.said, "autoforge epic: issue #2 is uncertain: ")
+        assert line.endswith(named), line
+    code, out, _ = e.cli("epic", "run", EPIC, "--dry-run")
+    assert code == 0 and "admitted now" not in out
+    assert keeps_the_provenance(out, f"issue #2 is {corrupt}").endswith(named)
+    code, out, _ = e.cli("epic", "status", EPIC)
+    assert code == 1
+    row = keeps_the_provenance(out, f"  #2 uncertain: {corrupt}")
+    assert "a controller that speaks protocol 14 reads and continues it" in row
+    keeps_the_provenance(out, f"problem: issue #2: {corrupt}")
+    code, doc = e.status()
+    assert code == 1
+    (child,) = [row for row in doc["children"] if row["number"] == 2]
+    assert child["detail"].startswith(f"{corrupt}{refused}")
+    keeps_the_provenance(child["detail"], corrupt)
+    assert "a controller that speaks protocol 14 reads and continues it" in child["detail"]
+    keeps_the_provenance("\n".join(doc["problems"]), f"issue #2: {corrupt}")
     assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
 
 

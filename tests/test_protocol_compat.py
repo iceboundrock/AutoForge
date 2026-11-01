@@ -24,11 +24,13 @@ from autoforge import __protocol_version__
 from autoforge.errors import StateError, StateProtocolError
 from autoforge.provenance import (
     MAX_PATH_CHARS,
+    MAX_REFUSAL_CHARS,
     ControllerIdentity,
     command_words,
     mismatch_lines,
     protocol_ranges,
     refusal_headline,
+    refusal_report,
     shown,
     shown_path,
 )
@@ -323,6 +325,34 @@ def test_the_headline_names_the_state_file_on_one_bounded_line(tmp_path):
         assert shown_path(path) in headline
         assert headline.endswith(exc.headline)
         assert shown_path(path) in str(exc.at(path, shown=shown_path(path)))
+
+
+@pytest.mark.parametrize("label", ["14", "14" + "9" * 10_000], ids=["newer", "longest"])
+def test_a_scheduler_report_keeps_the_controller_however_long_every_path(
+    tmp_path, monkeypatch, label
+):
+    """#265 R3-F1: :func:`refusal_report` is what every scheduler report keeps
+    of a refusal. With every part at its longest (the label cut to 64
+    characters, and an import path, an interpreter and a state file each
+    cut to MAX_PATH_CHARS), the refusal and the controller that refused it
+    come first and whole, the state file last on a budget of its own, and
+    the line is under MAX_REFUSAL_CHARS, so that bound never cuts it."""
+    module = "/opt/" + "m" * (2 * MAX_PATH_CHARS) + "/autoforge/__init__.py"
+    python = "/opt/" + "p" * (2 * MAX_PATH_CHARS) + "/bin/python3"
+    monkeypatch.setattr(sys.modules["autoforge"], "__file__", module)
+    monkeypatch.setattr(sys, "executable", python)
+    exc = _refusal(tmp_path, protocol_version=label)
+    state = "/srv/" + "s" * (3 * MAX_PATH_CHARS) + "/state.json"
+    report = refusal_report(exc.at(state, shown=shown_path(state)))
+    provenance = f"imported from {shown_path(module)}, python {shown_path(python)}"
+    assert report == f"{exc.reason}; state file {shown_path(state)}"
+    assert report.startswith(f"{exc.headline}, and this controller, autoforge ")
+    assert "(protocol 13)" in report and provenance in report
+    assert f"reads protocols {protocol_ranges(SUPPORTED_PROTOCOLS)}" in report
+    assert report.index(provenance) < report.index("; state file ")
+    assert len(report) < MAX_REFUSAL_CHARS - 500, len(report)
+    # The standalone state's form: its report names the file itself.
+    assert refusal_report(exc.at(state), name_state=False) == exc.reason
 
 
 def test_a_flag_value_not_safe_to_repeat_is_a_labelled_placeholder():

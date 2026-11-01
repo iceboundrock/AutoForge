@@ -30,6 +30,12 @@ each flag value as typed only when it can be shown faithfully and safely,
 else a labelled placeholder, and a labelled placeholder for the controller
 to use. It never suggests editing the state, ``run --force``, a downgrade,
 a checkout or an installation.
+
+:func:`refusal_report` is the same refusal as one line of a scheduler
+report (``epic run``, ``epic resume``, ``epic run --dry-run`` and ``epic
+status``, human and JSON): the refusal and the controller that refused it
+first, the state file last, each part bounded on its own, so no path
+crowds the controller's provenance out of the line (#265 R3-F1).
 """
 
 from __future__ import annotations
@@ -48,6 +54,13 @@ from .redaction import redact
 # on Linux, and no operator reads more of one in a diagnostic line. A flag
 # value longer than this is not repeated in a recovery command at all.
 MAX_PATH_CHARS = 1024
+# A protocol refusal as a scheduler report keeps it whole
+# (:func:`refusal_report`): the loader's headline (its label cut to 64
+# characters), the refusing controller's version and protocol, its import
+# path and its interpreter, and the state file, each path bounded on its own
+# to MAX_PATH_CHARS. Those parts are at most about 3,400 characters together
+# (tests/test_protocol_compat.py pins it), so a report is never cut here.
+MAX_REFUSAL_CHARS = 4 * MAX_PATH_CHARS
 _CUT = " [... cut]"
 UNKNOWN = "(unknown)"
 
@@ -133,6 +146,29 @@ def refusal_headline(exc: StateProtocolError) -> str:
     """The diagnostic's first line: the loader's refusal, naming the state file shown safely."""
     where = f"state file {shown_path(exc.path)}: " if exc.path else ""
     return redact(f"autoforge: error: {where}{exc.headline}")
+
+
+def refusal_report(exc: StateProtocolError, *, name_state: bool = True) -> str:
+    """``exc`` as one line a scheduler report keeps whole: what was refused and by whom first.
+
+    The refusal's reason (the persisted label and this controller's
+    protocol, then the refusing controller's version, import path and
+    interpreter: :meth:`ControllerIdentity.summary`), and then, with
+    ``name_state``, the state file it refused (#265 R3-F1). Every part was
+    shown on its own budget (:func:`shown_path`, the label's 64
+    characters) before it was put in the line, so a long state path never
+    crowds out the provenance: the state file comes last and has a
+    :data:`MAX_PATH_CHARS` budget of its own, and the whole is under
+    :data:`MAX_REFUSAL_CHARS`, which every scheduler report of it keeps
+    (the bound here only guards that by construction). A report that
+    already names the state file (the standalone state's, by
+    :attr:`~autoforge.ownership.StandaloneHold.shown_state_file`) leaves
+    ``name_state`` false.
+    """
+    text = exc.reason
+    if name_state and exc.path:
+        text += f"; state file {shown_path(exc.path)}"
+    return shown(text, MAX_REFUSAL_CHARS)
 
 
 @dataclass(frozen=True)

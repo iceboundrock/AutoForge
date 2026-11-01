@@ -307,7 +307,8 @@ High-priority coverage includes:
   nothing, and an unreadable one owns its issue
 - the protocol preflight (#265; `tests/test_protocol_compat.py`,
   `tests/test_cli.py`, `tests/test_epic_commands.py`, `tests/test_worker.py`,
-  `tests/test_ownership.py`, `tests/test_doctor.py`): every label is
+  `tests/test_ownership.py`, `tests/test_scheduler_state.py`,
+  `tests/test_doctor.py`): every label is
   classified by itself (current, each legacy one, newer, and unknown ones:
   6, 0, a leading zero, a decimal point, whitespace, a non-string); a newer
   label is refused before its phase and fields are read, an unknown phase
@@ -340,7 +341,13 @@ High-priority coverage includes:
   a configured standalone directory holding a newline and an escape, or
   longer than 1024 characters, is one printable, bounded line in the
   scheduler's output, `epic status` (human and JSON) and the dry run;
-  `doctor`'s `controller` row reads no state
+  and a state file path of 900 characters or past 1024, standalone or in a
+  namespace, still leaves the refusal and the refusing controller's
+  protocol, import path and interpreter whole in every one of those
+  reports (`epic run`, `epic resume`, the dry run, `epic status` human and
+  JSON) and in the classification and reconciliation detail, the state
+  file named last, with every part at its longest under
+  `provenance.MAX_REFUSAL_CHARS`; `doctor`'s `controller` row reads no state
 - the state pins of LOCAL's removal (ADR 0009 D4, D8, D12 S1b; #385;
   `tests/test_state.py`, `tests/test_replan.py`, `tests/test_cli.py`,
   `tests/test_scheduler_state.py`, `tests/test_epic_commands.py`), written

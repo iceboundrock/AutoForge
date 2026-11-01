@@ -1440,9 +1440,12 @@ own file was replaced, restore it from your backup; AutoForge suggests no
 edit of it, and does not set it aside for you.
 
 **In a scheduler namespace**, the same state is held: `epic run` and
-`epic resume` report `issue #<n> is uncertain: ...` with the refusal and
-the controller's import path, admit nothing for it and continue with the
-other issues; `epic status` shows the row as
+`epic resume` report `issue #<n> is uncertain: ...` with the refusal, the
+controller's version, protocol, import path and interpreter, and last the
+state file, admit nothing for it and continue with the other issues;
+`epic run --dry-run` reports the same as `issue #<n> is
+uncertain(state-corrupt): ...`. However long the path of the state file,
+it never pushes the controller out of these lines. `epic status` shows the row as
 `uncertain(state-corrupt)` (exit 1), says that a controller speaking the
 newer protocol reads and continues it, and offers no `epic archive`. For
 a label no protocol has, the row says so instead, asks you to check that

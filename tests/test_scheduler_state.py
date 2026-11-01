@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+import autoforge
 from autoforge import scheduler_state as ss
 from autoforge.errors import (
     ClaimConflict,
@@ -31,6 +32,7 @@ from autoforge.errors import (
     SchedulerStateError,
 )
 from autoforge.locking import ControllerLock, IssueRunLock, SharedGitLock
+from autoforge.provenance import MAX_PATH_CHARS, MAX_REFUSAL_CHARS, shown_path
 from autoforge.run_namespace import (
     EpicRef,
     IssueNamespace,
@@ -86,6 +88,8 @@ from autoforge.scheduler_state import (
 )
 from autoforge.state import AutoForgeState, save_state
 from autoforge.transitions import Phase, Settlement
+
+from .conftest import deep_dir
 
 TS = "2026-10-18T00:00:00+00:00"
 REPO_ID = 700_001
@@ -1087,6 +1091,48 @@ def test_each_uncertain_trigger_keeps_its_claim_open_and_holds_the_issue(common,
     assert _without(_tree(ns.directory), "run.lock") == _without(before, "run.lock")
     assert report.admissible is (reason != "repository-mismatch")
     assert _item(_reconcile(common), 7).classification == item.classification
+
+
+@pytest.mark.parametrize("length", [900, 1169], ids=["whole", "cut"])
+def test_a_namespace_state_refused_for_its_protocol_keeps_the_controller_however_long_its_path(
+    tmp_path, length
+):
+    """#265 R3-F1: a namespace state file path of 900 characters (shown
+    whole) or of 1,169 (shown cut to MAX_PATH_CHARS) took the loader's
+    path-first message past the classification's 1,000 characters: the
+    refusal itself, the controller's import path and its interpreter were
+    cut away. The classification's detail, as reconciliation reports it
+    too, now starts with the refusal and the controller and names the state
+    file last, each on a budget of its own, and keeps all of it. The claim
+    stays open and nothing of the namespace is written."""
+    suffix = len("/autoforge/scheduler/issues/7/state/state.json")
+    common = deep_dir(tmp_path, length - suffix)
+    common.mkdir(parents=True)
+    ns = _bind(common, 7)
+    _save(ns, Phase.REVIEW)
+    _open(ns)
+    raw = json.loads(ns.state_file.read_text())
+    raw["protocol_version"] = "14"
+    ns.state_file.write_text(json.dumps(raw))
+    assert len(str(ns.state_file)) == length
+    before = _tree(ns.directory)
+    headline = (
+        "unsupported protocol_version '14' (controller speaks '13'): a newer AutoForge wrote it"
+    )
+    provenance = f"imported from {os.path.abspath(autoforge.__file__)}, python {sys.executable}"
+    shown = shown_path(str(ns.state_file))
+    assert (shown == str(ns.state_file)) == (length <= MAX_PATH_CHARS)
+    found = _classify(ns)
+    item = _item(_reconcile(common), 7)
+    assert item.classification == found and item.detail == found.detail
+    for detail in (found.detail, item.detail):
+        assert detail.startswith(f"{headline}, and this controller, autoforge ")
+        assert provenance in detail
+        assert detail.endswith(f"; state file {shown}")
+        assert len(detail) <= MAX_REFUSAL_CHARS
+    assert str(found) == "uncertain(state-corrupt)" and found.open_claim is not None
+    assert item.fact is LocalFact.HELD_UNCERTAIN and item.closed is None
+    assert _without(_tree(ns.directory), "run.lock") == _without(before, "run.lock")
 
 
 def test_a_state_absent_while_no_claim_is_open_is_never_uncertain(common):

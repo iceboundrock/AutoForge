@@ -722,7 +722,16 @@ takes L1:
   `StandaloneHold.shown_state_file` (`provenance.shown_path`), and the
   hold's `problem` is the loader's message through `provenance.shown`, so
   each is one printable, bounded line whatever the configured directory
-  holds (#265 R2-F1).
+  holds (#265 R2-F1). A refusal of a state's label reaches the scheduler's
+  reports as `provenance.refusal_report`, not as the loader's path-first
+  message cut to a reason's 1,000 characters, which a long state path
+  filled before the refusal or the controller was reached: the refusal
+  and the refusing controller's protocol, import path and interpreter
+  come first, the state file last, each part bounded on its own and the
+  whole under `provenance.MAX_REFUSAL_CHARS`. The namespace state's
+  `reason`, its `uncertain(state-corrupt)` detail and `epic status`'s
+  row keep it whole; the standalone hold's `problem` is the same without
+  the path, which its report names beside it (#265 R3-F1).
 
 ---
 

@@ -26,7 +26,9 @@ from autoforge.ownership import (
     scheduler_ownership,
     standalone_hold,
     standalone_ownership_predicate,
+    unreadable_report,
 )
+from autoforge.provenance import MAX_PATH_CHARS, MAX_REFUSAL_CHARS, shown_path
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
 from autoforge.scheduler_state import (
     Admission,
@@ -39,7 +41,7 @@ from autoforge.scheduler_state import (
 from autoforge.state import AutoForgeState, save_state
 from autoforge.transitions import Phase
 
-from .conftest import EPIC, git_repo
+from .conftest import EPIC, deep_dir, git_repo
 
 
 def _issue_url(n: int) -> str:
@@ -334,7 +336,9 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     hold = standalone_hold(sd)
     assert not hold.holds and hold.problem
     assert "ghp_" + "b" * 36 not in hold.problem
-    assert len(hold.problem) <= MAX_REASON_CHARS
+    # A protocol refusal has a budget of its own, whole (#265 R3-F1).
+    refused = damage in ("newer", "unknown")
+    assert len(hold.problem) <= (MAX_REFUSAL_CHARS if refused else MAX_REASON_CHARS)
     if damage == "local":
         assert "state file has unknown mode 'LOCAL'" in hold.problem
     if damage in ("newer", "unknown"):
@@ -361,6 +365,42 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     else:
         assert not hold.blocks_admission and admission_refusal(hold) == ""
     assert _tree(sd) == before, "never quarantined, created or written"
+
+
+@pytest.mark.parametrize("length", [900, 1135], ids=["whole", "cut"])
+def test_a_refused_standalone_state_keeps_the_controller_however_long_its_path(tmp_path, length):
+    """#265 R3-F1: a state file path of 900 characters (shown whole) or of
+    1,135 (shown cut to MAX_PATH_CHARS) took the loader's path-first message
+    past the problem's 1,000 characters, and the refusal, the controller's
+    import path and its interpreter with it. The problem is now the refusal
+    without the path, which the report names beside it on a budget of its
+    own, and it keeps every one of them whole. Nothing is written."""
+    import sys
+
+    import autoforge
+
+    sd = deep_dir(tmp_path, length - len("/state.json"))
+    sd.mkdir(parents=True)
+    newer = _state(7, Phase.REVIEW).to_dict()
+    newer.update(protocol_version="14")
+    (sd / "state.json").write_text(json.dumps(newer), encoding="utf-8")
+    assert len(str(sd / "state.json")) == length
+    before = _tree(sd)
+    hold = standalone_hold(sd)
+    headline = (
+        "unsupported protocol_version '14' (controller speaks '13'): a newer AutoForge wrote it"
+    )
+    provenance = f"imported from {os.path.abspath(autoforge.__file__)}, python {sys.executable}"
+    assert hold.problem.startswith(f"{headline}, and this controller, autoforge ")
+    assert provenance in hold.problem and "reads protocols " in hold.problem
+    assert "state file" not in hold.problem and str(sd) not in hold.problem
+    shown = shown_path(str(sd / "state.json"))
+    assert (shown == str(sd / "state.json")) == (length <= MAX_PATH_CHARS)
+    report = unreadable_report(hold)
+    assert report == f"the standalone state {shown} cannot be read: {hold.problem}"
+    assert headline in report and provenance in report
+    assert hold.blocks_admission and hold.newer_protocol == "14"
+    assert _tree(sd) == before
 
 
 def test_an_admission_refusal_shows_its_path_on_one_bounded_line(tmp_path):

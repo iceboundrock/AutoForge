@@ -77,6 +77,7 @@ from .ownership import (
     standalone_hold,
     unreadable_report,
 )
+from .provenance import MAX_REFUSAL_CHARS
 from .redaction import redact, redact_dict
 from .run_namespace import (
     EpicRef,
@@ -96,6 +97,7 @@ from .scheduler_state import (
     Claim,
     ClaimArchive,
     ClaimClassification,
+    Classification,
     ClassificationKind,
     ClosedClaim,
     EpicClassification,
@@ -125,6 +127,11 @@ EXIT_OPEN_CLAIMS = 3
 # A BLOCKED state's reason, as status quotes it, and a whole row's detail.
 MAX_BLOCK_REASON_CHARS = 500
 MAX_DETAIL_CHARS = 2000
+# The row of a namespace state refused for its protocol label: the refusal
+# whole (provenance.MAX_REFUSAL_CHARS: the refusing controller's protocol,
+# import path and interpreter, then the state file) and its advice, which is
+# under 600 characters (#265 R3-F1).
+MAX_REFUSED_DETAIL_CHARS = MAX_REFUSAL_CHARS + 1000
 # What the operator's ``unblock --reason`` is shown as in a printed command.
 REASON_PLACEHOLDER = "<why>"
 
@@ -445,11 +452,12 @@ def categorize(
         blockers: tuple[str, ...] = (),
         steps: tuple[str, ...] = (),
         problem: str = "",
+        limit: int = MAX_DETAIL_CHARS,
     ) -> IssueStatus:
         return IssueStatus(
             number=facts.number,
             category=category,
-            detail=_bounded(detail, MAX_DETAIL_CHARS),
+            detail=_bounded(detail, limit),
             hold_reason=hold_reason,
             verdict=None if verdict is None else verdict.reason,
             blockers=blockers,
@@ -466,7 +474,7 @@ def categorize(
             orphaned=orphaned,
             claim=claim,
             next=steps,
-            problem=_bounded(problem, MAX_DETAIL_CHARS),
+            problem=_bounded(problem, limit),
         )
 
     if facts.probe_problem:
@@ -514,10 +522,13 @@ def categorize(
                 "state aside continues the run (see 'A run a newer controller wrote' in "
                 "docs/usage.md)"
             )
+        # The refusal is kept whole, the controller's provenance with it,
+        # however long the namespace's path (#265 R3-F1).
         return row(
             Category.UNCERTAIN,
             f"{classification}: {classification.detail}; {then}",
             problem=f"{classification}: {classification.detail}",
+            limit=MAX_REFUSED_DETAIL_CHARS,
         )
     if classification is not None and classification.kind is ClassificationKind.UNCERTAIN:
         return row(
@@ -1136,6 +1147,17 @@ class DryRunPlan:
     exit_code: int
 
 
+def _refused_for_its_protocol(read: NamespaceRead, classification: Classification | None) -> bool:
+    """Whether ``classification`` holds the namespace for its state's protocol label (#265)."""
+    state = read.lookup.state if isinstance(read.lookup, NamespaceLookup) else None
+    return (
+        classification is not None
+        and classification.uncertain is UncertainReason.STATE_CORRUPT
+        and state is not None
+        and bool(state.refused_protocol)
+    )
+
+
 def dry_run_plan(
     graph: GraphReader,
     *,
@@ -1206,11 +1228,17 @@ def dry_run_plan(
         if problem:
             facts[number] = LocalFact.HELD_UNCERTAIN
             continue
-        found = classify_for_epic(read_namespace(namespace), identity.epic, expected=expected)
+        read = read_namespace(namespace)
+        found = classify_for_epic(read, identity.epic, expected=expected)
         if found is None:
             continue
         if found.repository_mismatch and found.classification is not None:
             blocked.append(f"issue #{number}: {found.classification.detail}")
+        elif _refused_for_its_protocol(read, found.classification):
+            # What 'epic run' would hold it for, as its scheduler says it:
+            # the refusal and the controller that refused it (#265 R3-F1).
+            assert found.classification is not None
+            out.append(f"issue #{number} is {found.classification}: {found.classification.detail}")
         if found.fact is not None:
             facts[number] = found.fact
         if (

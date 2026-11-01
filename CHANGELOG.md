@@ -42,6 +42,12 @@ so.
 - The scheduler's lines, `epic status` and `epic run --dry-run` name the
   configured standalone state file redacted, on one printable line and
   bounded, as the CLI's diagnostic does.
+- Those reports keep the refusal of a state of a newer protocol, or of no
+  protocol's label, and the refusing controller's protocol, import path
+  and interpreter whole however long the state file's path, and name the
+  file last; a path of several hundred characters used to push them past
+  the reports' 1,000-character bound. `epic run --dry-run` now reports
+  such a namespace state as the scheduler does.
 - `doctor` has a first row, `controller`: the code a command line runs and
   the state protocols it reads. It never fails.
 - [Running the remote workflow](docs/usage.md#a-run-a-newer-controller-wrote)

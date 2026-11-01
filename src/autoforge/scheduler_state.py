@@ -76,6 +76,7 @@ from .errors import (
     StateError,
 )
 from .locking import IssueRunLock, assert_shared_git_lock_free
+from .provenance import MAX_REFUSAL_CHARS
 from .redaction import redact
 from .run_namespace import (
     AUTOFORGE_DIRNAME,
@@ -90,6 +91,7 @@ from .run_namespace import (
     IssueNamespace,
     NamespaceKind,
     NamespaceLookup,
+    NamespaceState,
     RejectedEntry,
     RunBinding,
     RunKey,
@@ -114,7 +116,8 @@ MAX_HISTORY = 16
 #: A closed claim's ``detail``, after redaction (D7.1).
 MAX_DETAIL_CHARS = 500
 # A classification's or a report's explanation quotes a loader's message:
-# redacted, then bounded. Never persisted.
+# redacted, then bounded. Never persisted. A namespace state refused for its
+# protocol label is kept whole instead (_state_reason_limit, #265 R3-F1).
 MAX_REASON_CHARS = 1000
 # A claim file holds at most 17 claims of a few kilobytes each, its worst
 # case JSON escaping of a PATH_MAX log path included; a larger file is
@@ -367,7 +370,7 @@ class StateRef:
             return cls.absent()
         raise SchedulerStateError(
             f"the state of {lookup.namespace.directory} cannot be read, so nothing is admitted "
-            f"for it ({_bounded(lookup.state.reason)})"
+            f"for it ({_bounded(lookup.state.reason, _state_reason_limit(lookup.state))})"
         )
 
     def to_dict(self) -> dict:
@@ -1282,10 +1285,32 @@ class Classification:
         return self.kind.value
 
 
-def _uncertain(reason: UncertainReason, detail: str, claim: Claim | None = None) -> Classification:
+def _uncertain(
+    reason: UncertainReason,
+    detail: str,
+    claim: Claim | None = None,
+    *,
+    limit: int = MAX_REASON_CHARS,
+) -> Classification:
     return Classification(
-        ClassificationKind.UNCERTAIN, uncertain=reason, open_claim=claim, detail=_bounded(detail)
+        ClassificationKind.UNCERTAIN,
+        uncertain=reason,
+        open_claim=claim,
+        detail=_bounded(detail, limit),
     )
+
+
+def _state_reason_limit(state: NamespaceState) -> int:
+    """How much of a corrupt namespace state's ``reason`` a classification or refusal keeps.
+
+    :data:`MAX_REASON_CHARS`, unless the state was refused for its protocol
+    label alone: that reason is :func:`~autoforge.provenance.refusal_report`'s,
+    each part bounded on its own and the whole under
+    :data:`~autoforge.provenance.MAX_REFUSAL_CHARS`, and it is kept whole, so
+    the refusing controller's protocol, import path and interpreter reach
+    every report of it however long the state's path is (#265 R3-F1).
+    """
+    return MAX_REFUSAL_CHARS if state.refused_protocol else MAX_REASON_CHARS
 
 
 class ClaimFileStatus(Enum):
@@ -1536,7 +1561,12 @@ def classify(
         if mismatch is not None:
             return _uncertain(mismatch[0], mismatch[1], open_claim)
     if lookup.state.status is StateStatus.CORRUPT:
-        return _uncertain(UncertainReason.STATE_CORRUPT, lookup.state.reason, open_claim)
+        return _uncertain(
+            UncertainReason.STATE_CORRUPT,
+            lookup.state.reason,
+            open_claim,
+            limit=_state_reason_limit(lookup.state),
+        )
     if claim_file.status is ClaimFileStatus.CORRUPT:
         return _uncertain(UncertainReason.CLAIM_CORRUPT, claim_file.reason)
     if claim_file.claim_file is not None:

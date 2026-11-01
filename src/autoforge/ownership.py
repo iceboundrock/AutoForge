@@ -54,7 +54,7 @@ from .errors import (
     StateProtocolError,
 )
 from .locking import issue_run_lock_live
-from .provenance import shown, shown_path
+from .provenance import refusal_report, shown, shown_path
 from .redaction import redact
 from .run_namespace import StateStatus, issue_namespace, load_issue_namespace
 from .safefs import SafeRoot
@@ -211,7 +211,13 @@ class StandaloneHold:
     what refused it is its ``protocol_version`` (#265): the
     :class:`~autoforge.state.ProtocolSupport` value, ``unsupported-newer``
     or ``unsupported-unknown``, with ``newer_protocol`` the newer label, a
-    decimal number, or ``""``. Nothing else of that file is kept.
+    decimal number, or ``""``. Nothing else of that file is kept. That
+    ``problem`` is the refusal without the state file, which every report
+    names beside it (:func:`unreadable_report`), and with the refusing
+    controller's protocol, import path and interpreter whole
+    (:func:`~autoforge.provenance.refusal_report`, under
+    :data:`~autoforge.provenance.MAX_REFUSAL_CHARS`): a long state path can
+    no longer crowd them out of :data:`MAX_REASON_CHARS` (#265 R3-F1).
     """
 
     state_file: Path
@@ -329,9 +335,11 @@ def standalone_hold(state_dir: str | Path) -> StandaloneHold:
             if gone:
                 return StandaloneHold(state_file)
             if isinstance(exc, StateProtocolError):
+                # Its own budget, not MAX_REASON_CHARS of a path-first message,
+                # so the controller that refused it survives (#265 R3-F1).
                 return StandaloneHold(
                     state_file,
-                    problem=_shown_reason(str(exc)),
+                    problem=refusal_report(exc, name_state=False),
                     refused_protocol=exc.support,
                     newer_protocol=exc.newer,
                 )
