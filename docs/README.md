@@ -43,7 +43,7 @@ description of how AutoForge behaves.
 
 | Document | Read it for |
 |---|---|
-| [Development](development.md) | `make` targets, fast feedback while working, CI, the built-distribution check, and what a green `ci` does and does not prove |
+| [Development](development.md) | `make` targets, fast feedback while working, CI, the CI duration report and its regression policy, the built-distribution check, and what a green `ci` does and does not prove |
 | [Releasing](releasing.md) | the distribution name, the version and tag scheme, the changelog, and the maintainer's procedure for building, tagging, publishing and verifying a release; the `pypi-publish` workflow, Trusted Publishing's one-time PyPI and GitHub setup, troubleshooting, and why the first upload is not the Public Alpha's Go |
 | [Clean-room first run](clean-room.md) | checking that the published documents alone get a newcomer from nothing to a first run (Gates 1 and 2 of #255): the environment to start from, the target repository (new or existing, and what an existing one requires), the steps, what to capture and redact, and the friction log |
 | [Testing](agent-guides/testing.md) | the coverage contract and high-priority test areas |

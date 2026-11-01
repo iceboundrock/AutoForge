@@ -205,6 +205,13 @@ read it before adding tests for a listed area.
   statistics and resume on synthetic reports and stand-in runs, and runs a
   three-test suite serially and on two workers, and with worker options
   that override the configuration's.
+- `tests/ci_durations.py` is no test either: the duration report of CI's
+  `test` job (#344; `docs/development.md`, "Test durations in CI"), which
+  summarizes the job's JUnit report, compares it with main's recent runs and
+  keeps main's history, and which a maintainer runs by hand on downloaded
+  artifacts. Standard library only. `tests/test_ci_durations.py` tests it
+  on synthetic reports and one real pytest run; `tests/test_ci_workflow.py`
+  pins the steps that keep it report only.
 - `tests/fast_targets.py` is no test either: the tool behind
   `make test-fast` (#342, ADR 0010), which selects the test modules a
   change's paths map to, for feedback while working. Its `COVERAGE` needs
@@ -401,6 +408,10 @@ doctor's rows                         instead), test_engine_sandbox.py,
                                       test_sandbox_gate.py, test_doctor_sandbox.py,
                                       test_sandbox_host.py (the host measurement)
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
+CI duration report and its regression test_ci_durations.py (counts, the window, the verdicts, the
+policy (#344)                         history, nothing of a failure written, exit 0),
+                                      test_ci_workflow.py (report only: after pytest, never
+                                      deciding the job; the paths, key and retention)
 fast feedback targets and what keeps  test_fast_targets.py (the mapping, the selection, never a
 them from evidence (#342, ADR 0010)   gate, the default suite's options); test_evidence.py,
                                       test_certificate.py, test_validation_gates.py (a narrower

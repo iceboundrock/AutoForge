@@ -24,7 +24,7 @@ import pytest
 from tests import fast_targets as ft
 
 from .conftest import GIT_IDENT, NO_AUTO_MAINTENANCE, git_out
-from .test_ci_workflow import _code, _job, _make_dry_run, _make_rules
+from .test_ci_workflow import JUNIT_OPTION, _code, _job, _make_dry_run, _make_rules
 
 ROOT = ft.REPO_ROOT
 
@@ -443,8 +443,9 @@ def test_the_fast_target_runs_the_tool_and_is_never_a_gate():
     assert all("fast_targets" not in line for line in rules["test"].recipe)
     code = _code()
     assert "test-fast" not in code and "fast_targets" not in code
-    # The suite CI runs on each interpreter is the whole default suite.
-    assert "      - run: uv run pytest\n" in _job(code, "test") + "\n"
+    # The suite CI runs on each interpreter is the whole default suite; the one
+    # option it adds writes the JUnit report of the duration report (#344).
+    assert f"        run: uv run pytest {JUNIT_OPTION}\n" in _job(code, "test") + "\n"
 
 
 def test_the_default_suite_deselects_nothing_but_the_live_tests():

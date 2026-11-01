@@ -21,6 +21,15 @@ runs exactly ``make dist-check`` with that interpreter, and
 ``test_the_dist_job_checks_the_installed_artifacts_on_every_ci_python`` pins
 both sides.
 
+The ``test`` job also writes the duration report (#344): ``make test``'s
+command with a JUnit report added, then steps that summarize it, compare it
+with main's recent runs and upload it. Those steps are report only, and
+``test_the_duration_report_never_decides_the_job_or_the_required_check`` pins
+what keeps them so: each runs only after pytest, whether it passed or failed,
+with ``continue-on-error`` and a timeout of its own, and only a push to main
+saves the history. ``test_the_test_job_runs_make_test_with_only_a_junit_report_added``
+pins the commands.
+
 These are text guards, not a YAML parser (the project has no YAML dependency
 outside the optional `yaml` extra). They read the workflow with whole-line
 comments removed and address individual blocks, so prose in a comment cannot
@@ -32,6 +41,7 @@ exception is the Makefile's matrix target, whose expansion is read from
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -48,6 +58,7 @@ if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from autoforge.config import default_config  # noqa: E402
+from tests import ci_durations  # noqa: E402
 
 # Local recipes whose command lines must also run in CI. Together with
 # `lock-check` (the local form of CI's `uv sync --locked`) they are exactly
@@ -74,6 +85,23 @@ DIST_JOB = "dist"
 DIST_TARGET = "dist-check"
 DIST_JOB_COMMANDS = ["make dist-check DIST_PYTHON=${{ matrix.python-version }}"]
 DIST_EXPANSION = "uv run --no-project --python {version} python -I tests/dist_check.py"
+# The `test` job (#344): `make test`'s command with this JUnit report added, and
+# the duration report's one command, which reads it (tests/ci_durations.py).
+TEST_JOB = "test"
+DURATIONS_DIR = "${RUNNER_TEMP}/durations"
+JUNIT_OPTION = '--junitxml="${RUNNER_TEMP}/durations/junit.xml"'
+DURATIONS_REPORT_COMMAND = (
+    'uv run --no-project python -I tests/ci_durations.py report --dir "${RUNNER_TEMP}/durations" '
+    '--python "${DURATIONS_PYTHON}" --cache-hit "${DURATIONS_CACHE_HIT}" '
+    '--pytest-outcome "${DURATIONS_PYTEST_OUTCOME}" --check-run "test (py${DURATIONS_PYTHON})"'
+)
+# Each report step's condition: after pytest, passed or failed, never cancelled.
+REPORT_CONDITION = "success() || failure()"
+SAVE_CONDITION = (
+    "(success() || failure()) && github.event_name == 'push' && github.ref == 'refs/heads/main'"
+)
+REPORT_STEP_TIMEOUT_MINUTES = 5
+_PINNED_ACTION = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$")
 _RUN_LINE = re.compile(r"^\s*(?:-\s*)?run:\s*(.+?)\s*$", flags=re.MULTILINE)
 
 
@@ -111,6 +139,27 @@ def _job(text: str, name: str) -> str:
 
 def _sandbox_job(text: str) -> str:
     return _job(text, SANDBOX_JOB)
+
+
+def _steps(job: str) -> list[str]:
+    """The text of each step of a job's ``steps:`` list, in order."""
+    steps: list[list[str]] = []
+    for line in _block(job, "steps", indent=4).splitlines()[1:]:
+        if line.startswith("      - "):
+            steps.append([line])
+        elif steps:
+            steps[-1].append(line)
+    return ["\n".join(step) for step in steps]
+
+
+def _field(step: str, key: str, indent: int = 8) -> str | None:
+    """A step's ``key:`` at ``indent`` (8: the step's own, 10: under ``with:`` or ``env:``)."""
+    lead = rf"(?: {{{indent}}}|      - )" if indent == 8 else f" {{{indent}}}"
+    for line in step.splitlines():
+        match = re.match(rf"^{lead}{re.escape(key)}:\s*(.*?)\s*$", line)
+        if match:
+            return match.group(1)
+    return None
 
 
 def _job_names(text: str) -> list[str]:
@@ -255,6 +304,11 @@ def test_make_check_runs_exactly_what_ci_runs():
     for command in _RUN_LINE.findall(code):
         if command in ("|", ">"):
             continue  # a block scalar: the aggregate job's `exit 1`, not a check command
+        if command == DURATIONS_REPORT_COMMAND:
+            continue  # report only (#344): test_the_duration_report_never_decides_the_job_...
+        # The JUnit report the duration report reads, added to `make test`'s command
+        # alone: test_the_test_job_runs_make_test_with_only_a_junit_report_added.
+        command = command.removesuffix(f" {JUNIT_OPTION}")
         assert command.startswith("uv sync --locked") or command in mirrored, (
             f"CI runs {command!r} but no target of `make check` does"
         )
@@ -338,6 +392,107 @@ def test_the_dist_job_checks_the_installed_artifacts_on_every_ci_python():
         f"`make {DIST_TARGET}` without DIST_PYTHON must use a CI interpreter: {default!r}"
     )
     assert DIST_TARGET not in _make_rules()["check"].prerequisites
+
+
+def test_the_test_job_runs_make_test_with_only_a_junit_report_added():
+    """CI's pytest is `make test`'s, with one option that changes no outcome (#344).
+
+    The `test` job runs the locked install, `make test`'s one command with a
+    `--junitxml` option and nothing else (no `-k`, `-m`, `-x`, `--deselect`
+    or plugin switch), and the duration report's command. The report reads
+    the JUnit file from the directory its `--dir` names, and its command line
+    is one the tool accepts.
+    """
+    (pytest_command,) = _make_recipes()["test"]
+    assert _RUN_LINE.findall(_job(_code(), TEST_JOB)) == [
+        "uv sync --locked --group dev",
+        f"{pytest_command} {JUNIT_OPTION}",
+        DURATIONS_REPORT_COMMAND,
+    ]
+    assert shlex.split(JUNIT_OPTION) == [f"--junitxml={DURATIONS_DIR}/{ci_durations.JUNIT_NAME}"]
+    words = shlex.split(DURATIONS_REPORT_COMMAND)
+    assert words[:6] == ["uv", "run", "--no-project", "python", "-I", "tests/ci_durations.py"]
+    args = ci_durations.parser().parse_args(words[6:])
+    assert (args.command, args.dir) == ("report", DURATIONS_DIR)
+
+
+def test_the_duration_report_never_decides_the_job_or_the_required_check():
+    """The duration report is report only (#344): `ci` means what it meant before it.
+
+    Every step after pytest's is a report step: it runs whether pytest passed
+    or failed and never when the run was cancelled (`success() ||
+    failure()`, not `always()`), and `continue-on-error` with a timeout of its
+    own keep a broken or hung report from failing the job. No other step of
+    the workflow is allowed to continue on error, and nothing before pytest
+    is conditional. Only a push to main saves the history; the report's
+    actions are pinned to a commit, and the job asks for no permission.
+    """
+    code = _code()
+    steps = _steps(_job(code, TEST_JOB))
+    (index,) = [i for i, step in enumerate(steps) if _field(step, "id") == "pytest"]
+    before, report = steps[: index + 1], steps[index + 1 :]
+    assert report, "the test job has no duration report"
+    for step in before:
+        assert _field(step, "if") is None and _field(step, "continue-on-error") is None, step
+    for step in report:
+        condition = _field(step, "if") or ""
+        assert condition in (REPORT_CONDITION, SAVE_CONDITION), step
+        assert _field(step, "continue-on-error") == "true", step
+        assert _field(step, "timeout-minutes") == str(REPORT_STEP_TIMEOUT_MINUTES), step
+        uses = _field(step, "uses")
+        assert uses is None or _PINNED_ACTION.match(uses), f"unpinned report action: {uses}"
+    assert code.count("continue-on-error:") == len(report), (
+        "only the duration report's steps may continue on error"
+    )
+    assert "always()" not in "\n".join(report)
+    saves = [
+        step for step in report if (_field(step, "uses") or "").startswith("actions/cache/save@")
+    ]
+    (save,) = saves
+    assert _field(save, "if") == SAVE_CONDITION
+    assert code.count("actions/cache/save@") == 1, "only main's duration history may be saved"
+    assert [step for step in report if _field(step, "if") == SAVE_CONDITION] == [save]
+    assert "permissions:" not in _job(code, TEST_JOB)
+
+
+def test_the_duration_report_steps_hand_the_tool_what_it_reads():
+    """The report steps' paths, key, inputs and retention agree with tests/ci_durations.py (#344).
+
+    The history is restored and saved at the one path the tool reads, under a
+    key whose version is the history schema's, so a new schema starts a new
+    history; the artifact is the tool's report directory, kept as long as the
+    oldest run a baseline window may hold; the report gets the interpreter,
+    setup-uv's cache state and pytest's outcome from the steps that know them,
+    and names the check run as the job is named.
+    """
+    code = _code()
+    job = _job(code, TEST_JOB)
+    report = {_field(step, "name"): step for step in _steps(job) if _field(step, "name")}
+    restore = report["Restore main's duration history"]
+    save = report["Save main's duration history"]
+    upload = report["Upload the duration report"]
+    run = report["Report the suite's durations"]
+    temp = "${{ runner.temp }}/durations"
+    history_dir = ci_durations.HISTORY_FILE.rsplit("/", 1)[0]
+    version = ci_durations.HISTORY_SCHEMA.rsplit("/", 1)[1]
+    prefix = f"ci-durations-v{version}-py${{{{ matrix.python-version }}}}-"
+    key = f"{prefix}${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}"
+    for step in (restore, save):
+        assert _field(step, "path", indent=10) == f"{temp}/{history_dir}"
+        assert _field(step, "key", indent=10) == key
+    assert _field(restore, "restore-keys", indent=10) == prefix
+    assert (_field(restore, "uses") or "").startswith("actions/cache/restore@")
+    assert (_field(upload, "uses") or "").startswith("actions/upload-artifact@")
+    assert _field(upload, "path", indent=10) == f"{temp}/{ci_durations.REPORT_DIR}/"
+    assert _field(upload, "retention-days", indent=10) == str(ci_durations.ARTIFACT_RETENTION_DAYS)
+    assert "${{ github.run_attempt }}" in (_field(upload, "name", indent=10) or "")
+    assert _field(run, "DURATIONS_PYTHON", indent=10) == "${{ matrix.python-version }}"
+    assert _field(run, "DURATIONS_CACHE_HIT", indent=10) == "${{ steps.uv.outputs.cache-hit }}"
+    assert _field(run, "DURATIONS_PYTEST_OUTCOME", indent=10) == "${{ steps.pytest.outcome }}"
+    (setup,) = [step for step in _steps(job) if _field(step, "id") == "uv"]
+    assert (_field(setup, "uses") or "").startswith("astral-sh/setup-uv@")
+    assert "name: test (py${{ matrix.python-version }})" in job.splitlines()[1]
+    assert '--check-run "test (py${DURATIONS_PYTHON})"' in DURATIONS_REPORT_COMMAND
 
 
 def test_ci_installs_from_the_lockfile():

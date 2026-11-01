@@ -172,6 +172,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/__init__.py": FULL,
     "tests/conftest.py": FULL,
     "tests/tmp_path_retention.py": FULL,  # every test's tmp_path
+    "tests/ci_durations.py": (),
     "tests/claude_fake.py": (),
     "tests/dist_check.py": (),
     "tests/epic_cli.py": ("test_epic_recovery",),
