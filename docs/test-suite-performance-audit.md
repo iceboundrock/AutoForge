@@ -71,8 +71,9 @@ Before the first timed run, one `--collect-only` run per commit compiled
 the bytecode. `-p no:cacheprovider` keeps pytest from writing into the
 clone; it selects and orders nothing. `tests/parallel_bench.py` could not
 take these runs: it measures the commit it is part of, and `1f6abad`
-predates it. A script outside the repository reconciled the runs' JUnit
-reports, test by test, as that tool does.
+predates it. `tests/suite_comparison.py` reconciles the runs' JUnit
+reports test by test, reading each as that tool does, and the runs'
+records are in the repository (§1.4).
 
 `1f6abad` needed one change to finish on this host. Its
 `tests/test_interaction.py` helper `_pipe` writes all of a test's typed
@@ -93,8 +94,8 @@ resident size:
 
 | commit | runs, wall seconds | median | user CPU | system CPU | memory | passed, skipped, deselected |
 |---|---|---|---|---|---|---|
-| `1f6abad` | 872.6, 869.5, 873.9 | 872.6 | 395.6 | 276.6 | 442 to 446 MB | 11,407, 18, 1 |
-| `d0948fb` | 545.0, 545.1, 544.7 | 545.0 | 241.1 | 130.2 | 464 to 466 MB | 12,594, 21, 1 |
+| `1f6abad` | 872.6, 869.5, 873.9 | 872.6 | 395.6 | 276.6 | 442 to 446 MiB | 11,407, 18, 1 |
+| `d0948fb` | 545.0, 545.1, 544.7 | 545.0 | 241.1 | 130.2 | 464 to 466 MiB | 12,594, 21, 1 |
 
 The CPU columns are medians. The suite at `main` takes 37.5% less wall
 time than at the baseline while running 10.4% more tests: 12,615 test ids
@@ -135,20 +136,62 @@ teardown, from the JUnit reports) fell from a median of 779.5 s to 419.6 s,
   parametrizations of test functions that are still there, with other
   parameters: 162 in `tests/test_state.py` and 83 in
   `tests/test_result_parser.py`. The other 754 belong to 346 test functions
-  that went. LOCAL's removal deleted 751 of the 754, 458 with #387
-  (`aee704e`) and 293 with #388 (`3eb68ac`). Three went where #283
-  (`9a7d8f9`) and #349 (`a86b729`) changed the behaviour they pinned and
-  tests of the new behaviour replaced them. No commit of this EPIC removed
-  one (I1).
+  that left their module. LOCAL's removal took 751 of the 754 from theirs,
+  458 with #387 (`aee704e`) and 293 with #388 (`3eb68ac`). Of those 751, 14
+  ids, in 12 functions, have a namesake in another module on `main`: the
+  same two commits moved or rewrote them there, as #388 did with
+  `tests/test_durable_run_contract.py`'s tests of the state root. Three
+  went where #283 (`9a7d8f9`) and #349 (`a86b729`) changed the behaviour
+  they pinned and tests of the new behaviour replaced them. No commit of
+  this EPIC removed one (I1).
 - **A tmpfs `TMPDIR`.** `fsync` costs next to nothing on a tmpfs, so #341's
   stand-in saves little here. With `TMPDIR` on a disk, as on a hosted
   runner, the stand-in saves more. On host A, #341's changes took 57% off
   `tests/test_engine.py`'s time with `TMPDIR` on its disk, and 21% on its
   tmpfs, none of that 21% from the stand-in.
 - **One host, three runs each, alternating.** The three runs of each
-  commit lie within 4.4 s of each other at the baseline and 0.4 s on
+  commit lie within 4.45 s of each other at the baseline and 0.40 s on
   `main`, so the noise is small next to the difference. A hosted runner is
   another machine (§4).
+
+### 1.4 The runs' records
+
+[`tests/fixtures/suite_performance_audit/runs.tar.xz`](../tests/fixtures/suite_performance_audit/runs.tar.xz)
+holds what the six runs left, as the runner script in it, `bench.sh`,
+wrote it: each run's JUnit report, GNU time's figures and pytest's output;
+each commit's `--collect-only` output; every run's start, end, exit status
+and load average, in the order they ran (`events.log`); and the change
+`1f6abad` ran with (`pre-259.patch`). One thing differs from what the runs
+wrote: the host name pytest puts into a JUnit report is removed, since
+`tests/parallel_bench.py` records none either. Nothing in the archive
+records §1.1's description of the host, which is this audit's, and the
+clones and their virtual environments are gone.
+
+`tests/suite_comparison.py` reads the archive without extracting it and
+prints this section's numbers: the results table, each run against the
+first of its commit, the test ids in common and their own time, the tests
+that left, the load average and the modules' table.
+
+```bash
+uv run python -m tests.suite_comparison
+uv run python -m tests.suite_comparison --git .   # in a clone holding 1f6abad..d0948fb
+```
+
+Which commit removed each test function that went needs the history
+between the two commits, which a shallow clone lacks.
+[`removals.tsv`](../tests/fixtures/suite_performance_audit/removals.tsv)
+records it, function by function. `--git` derives it again from
+`git log -p` and fails when the two differ. A function is its JUnit class
+name and its name, so one moved to another module counts as gone from its
+old one (§1.3).
+
+`tests/test_suite_performance_audit.py` holds this section to the archive
+and to `removals.tsv`: every number above is the one the tool computes from
+them, so neither can change without the other
+(`test_section_1_is_what_the_runs_records_say` and
+`test_the_removals_name_each_function_that_went_and_section_1s_tallies`),
+and what §1.1 says of how the runs were made is what their records say
+(`test_the_records_say_how_the_runs_were_made`).
 
 ## 2. The exit checklist
 
@@ -167,7 +210,8 @@ teardown, from the JUnit reports) fell from a median of 779.5 s to 419.6 s,
     #341 profiled a serial run per test phase (setup, call and teardown,
     the children's CPU, each fixture and every subprocess), and its A/B
     ran two runs of each commit, alternating. §1 adds the EPIC's own
-    before and after.
+    before and after, three more serial runs of `1f6abad` among them, and
+    every run's records are in the repository (§1.4).
   - *The tool that makes a baseline auditable.* `tests/parallel_bench.py`
     records the host's provenance, reconciles every test's outcome, times
     only clean runs and refuses a worktree with changes:
@@ -187,8 +231,10 @@ teardown, from the JUnit reports) fell from a median of 779.5 s to 419.6 s,
     ([Compatibility](compatibility.md)).
 
   "Reviewed" is GitHub's to show. The plan comment links the maintainer's
-  assessment of M0 on #339; whether #339 is closed, this audit cannot see
-  (§5).
+  assessment of M0 on #339; whether #339 is closed, this audit cannot see.
+  Whether that report, its gaps and what closed them make E1's completed
+  and reviewed baseline is the maintainer's decision, which PR #432's note
+  on #339 records before the EPIC can close (§5).
 - **E2. Parallel test selection and isolation correctness demonstrated.** *Met.*
   #340 (`b14f959`) ran the suite serially and on 2, 4 and 8 workers under
   `load`, `loadfile` and `worksteal`. It reconciled every run test by test
@@ -329,8 +375,8 @@ teardown, from the JUnit reports) fell from a median of 779.5 s to 419.6 s,
   `tests/test_ci_workflow.py::test_the_test_job_runs_make_test_with_only_a_junit_report_added`.
   Of the 1,073 test ids the baseline ran and `main` does not, 319 are
   other parametrizations of functions still there, and every test
-  function that went was removed by LOCAL's removal or replaced by #283's
-  or #349's change of behaviour (§1.3).
+  function that left its module was removed or moved by LOCAL's removal or
+  replaced by #283's or #349's change of behaviour (§1.3).
 - **I2. Preserve the full-suite Linux CPython 3.11 and 3.12 required CI, the independent measured real-backend sandbox job, the distribution checks, lint, format, types, and the aggregate `ci` check with its skip and failure semantics.** *Held.*
   Between `1f6abad` and `d0948fb` the workflow changed once, by #344's
   report-only steps (E6):
@@ -399,10 +445,28 @@ teardown, from the JUnit reports) fell from a median of 779.5 s to 419.6 s,
   `tests/test_live_pi_support.py::test_the_live_test_is_deselected_by_default_and_skips_without_its_variable`
   and
   `tests/test_ci_workflow.py::test_workflow_is_granted_no_write_permissions`.
-  `tests/conftest.py`'s autouse fixtures `_no_network_git_remote` and
-  `_no_network_exact_read` keep every test off GitHub. Each measurement in
-  the EPIC ran pytest on a workstation or a hosted runner, and neither
-  `tests/parallel_bench.py` nor `tests/ci_durations.py` calls a service.
+  Two autouse fixtures of `tests/conftest.py` guard two of the
+  controller's own routes to GitHub, not the network.
+  `_no_network_git_remote` gives an engine built without a local origin a
+  GitHub remote whose fetch is recorded and does nothing, and whose push
+  fails the test. `_no_network_exact_read` fails a test whose
+  `GitHubClient`, built without `https=`, would read `api.github.com`.
+  Neither stops a test that starts `gh`, opens a socket or uses another
+  client. Otherwise the suite stays off GitHub because its tests use
+  `FakeGitHub`, fake `gh` executables and loopback servers instead, as
+  `tests/AGENTS.md` requires and review checks, not because anything
+  stops them.
+
+  That is what the tests do, not how the EPIC's measurements were run.
+  For §1's six runs, the records show it (§1.4): in each, pytest deselected
+  the live test, the suite's one model call, and skipped the five opt-in
+  probes, and `bench.sh`, which ran them, calls none of `gh`, `git`, `uv`,
+  `curl` and `wget`:
+  `tests/test_suite_performance_audit.py::test_the_records_say_how_the_runs_were_made`.
+  `tests/parallel_bench.py` starts pytest, git and version probes, and
+  `tests/ci_durations.py` reads the files it is given; neither imports a
+  network client. Of the other measurements, on hosts A and B and on CI's
+  runners, this audit has only what their documents say.
 
 ## 4. The provisional target
 
@@ -448,11 +512,29 @@ Follow-up work this audit found and did not create:
   windows. The same windows tell whether the report's bounds need
   widening.
 
-**Closing the EPIC.** The controller appends its closing line for #338 to
-the body of the pull request that carries this audit, as it does for every
-implementation PR, so merging that PR closes the EPIC. The merge is the
-maintainer's: with `safety.allow_merge` off, the default, a run stops at
-`READY_FOR_MERGE` and a human merges. If the maintainer means #338 to stay
-open, for the target or for #339, the closing line has to leave the PR's
-body before the merge, and only someone with GitHub access can remove it.
+**Closing the EPIC.** PR #432, which carries this audit, ends its body with
+the controller's closing line for #338, as the body of every
+implementation PR does (`effects.implementation_closing_block`). A FIX
+round reports no body and cannot change it, so merging PR #432 closes the
+EPIC. E1 is met only in part, and PR #432's first review asked that the
+EPIC not close before E1's baseline is shown completed and reviewed or the
+maintainer has accepted what is outstanding. Two things keep the merge from
+coming first:
+
+- **The maintainer's decision is recorded before anything of the round is
+  pushed.** The operator posts PR #432's note on #339 only if it is the
+  maintainer's decision to accept M0's report, with the gaps it stated and
+  what E1 lists as closing them, as the EPIC's completed and reviewed
+  baseline, and to close the EPIC with PR #432's merge. The controller pushes
+  none of the round's commits until it has verified that note. If the
+  maintainer means #338 to stay open, for #339 or for the target (§4), the
+  note is declined, and the closing line has to leave PR #432's body
+  before the PR is merged. Only someone with GitHub access can remove it.
+- **The merge is the maintainer's.** With `safety.allow_merge` off, the
+  default, a run stops at `READY_FOR_MERGE` and a human merges the PR. The
+  controller merges only when the configuration opens the gate and the
+  command carries `--allow-merge`
+  (`tests/test_config.py::test_safety_gate_opens_from_safety_allow_merge_only`),
+  and even then only after its own pre-merge verification.
+
 This audit is evidence for that decision, not the decision.

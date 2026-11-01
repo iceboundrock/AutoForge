@@ -15,21 +15,30 @@ leaving it citing coverage the suite no longer has. Whether each named test
 passes is the suite's own business: they run in it. The audit's links, and
 every link into it, must reach a file and a heading that exist.
 
+Section 1's measurement is held to its runs' records
+(``tests/fixtures/suite_performance_audit/``): every number it gives is the
+one ``tests/suite_comparison.py`` computes from the six JUnit reports and
+``removals.tsv``, and the records say what the audit says of how the runs
+were made.
+
 Two things the audit relies on were held by documents alone, and the last
 tests here hold them: that workers stay opt-in, so every gate runs the suite
-serially (E2), and that the regression policy `docs/development.md`
-publishes is the one `tests/ci_durations.py` applies (E6).
+serially, whatever worker count make inherits (E2), and that the regression
+policy `docs/development.md` publishes is the one `tests/ci_durations.py`
+applies (E6).
 """
 
 from __future__ import annotations
 
 import re
+import statistics
+from collections import Counter
 from functools import cache
 from pathlib import Path
 
 import pytest
 
-from tests import ci_durations
+from tests import ci_durations, suite_comparison
 
 from .test_ci_workflow import _code, _job, _make_dry_run, _make_rules
 from .test_removal_attestation import _bullets, _section, _test_functions
@@ -161,20 +170,273 @@ def test_the_reader_takes_a_verdict_only_in_italics_after_the_item():
         items(f"{INVARIANTS}\n- **I1. A.** *Held.*\n- **I1. A.** *Held.*\n", INVARIANTS)
 
 
+# -- section 1 and its runs' records (R1-F3, R1-F4 of PR #432's review) --------
+
+SECTION_1 = "## 1. The suite before and after, on one host"
+# The commits that carry the EPIC's work items and the two fixes its
+# measurements relied on (I1).
+EPIC_COMMITS = (
+    "6fddbc9",
+    "1a9424e",
+    "7fa0786",
+    "b14f959",
+    "3d836ee",
+    "acebe52",
+    "cdb9ac0",
+    "40385a8",
+)
+# A program a runner script could reach GitHub, a git remote or a package index with.
+_NETWORK_TOOL = re.compile(r"(?<![\w./-])(?:gh|git|uv|curl|wget)(?![\w.-])")
+
+
+@cache
+def _runs() -> tuple[dict[str, list[suite_comparison.Run]], list[suite_comparison.Event]]:
+    return suite_comparison.read_archive()
+
+
+def _section_1() -> str:
+    """Section 1 of the audit, up to the next heading of its level outside a
+    code fence: its code holds lines that open with ``#``, which
+    ``_section`` would take for a heading."""
+    lines = _audit().splitlines()
+    body, fenced = [], False
+    for line in lines[lines.index(SECTION_1) + 1 :]:
+        if line.startswith("```"):
+            fenced = not fenced
+        elif not fenced and line.startswith("## "):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _prose(text: str) -> str:
+    """``text`` with every run of whitespace one space, as a sentence reads across lines."""
+    return " ".join(text.split())
+
+
+def test_section_1_is_what_the_runs_records_say():
+    """Every number section 1 gives is the one ``tests/suite_comparison.py``
+    computes from the six JUnit reports, GNU time's figures and pytest's
+    summaries in the archive: the results table, the shares, the tests in
+    common and their time, the modules' table, the spread of each commit's
+    runs and the tests that left. A run whose outcomes differ from the first
+    of its commit, or that failed a test, is no measurement."""
+    runs, _ = _runs()
+    before, after = runs["pre"], runs["post"]
+    section = _section_1()
+    lines, prose = section.splitlines(), _prose(section)
+    for side in suite_comparison.SIDES:
+        assert suite_comparison.results_row(side, runs[side]) in lines
+        for name, found in suite_comparison.differences(runs[side]).items():
+            assert found == {"missing": [], "extra": [], "changed": []}, name
+        for run in runs[side]:
+            assert set(run.outcomes().values()) <= {"passed", "skipped"}, run.name
+            assert set(run.counts) == {"passed", "skipped", "deselected"}, run.name
+    # The baseline's counts are those of the CI run the EPIC's body cites.
+    assert before[0].counts == {"passed": 11407, "skipped": 18, "deselected": 1}
+
+    ids_before, ids_after = set(before[0].tests), set(after[0].tests)
+    common = ids_before & ids_after
+    wall_before = statistics.median(run.wall for run in before)
+    wall_after = statistics.median(run.wall for run in after)
+    own_before = statistics.median(run.seconds(common) for run in before)
+    own_after = statistics.median(run.seconds(common) for run in after)
+    spread = [max(r.wall for r in runs[s]) - min(r.wall for r in runs[s]) for s in ("pre", "post")]
+    for words in (
+        f"takes {(1 - wall_after / wall_before) * 100:.1f}% less wall time",
+        f"running {(len(ids_after) / len(ids_before) - 1) * 100:.1f}% more tests",
+        f"{len(ids_after):,} test ids against {len(ids_before):,}",
+        f"{wall_after / len(ids_after) * 1000:.0f} ms a test against "
+        f"{wall_before / len(ids_before) * 1000:.0f}",
+        f"{len(common):,} test ids are in both suites",
+        f"from a median of {own_before:.1f} s to {own_after:.1f} s, "
+        f"{(1 - own_after / own_before) * 100:.0f}% less",
+        f"within {spread[0]:.2f} s of each other at the baseline and {spread[1]:.2f} s on `main`",
+    ):
+        assert words in prose, words
+    gains = suite_comparison.module_gains(before, after, common)[: suite_comparison.TOP_MODULES]
+    assert [line for line in lines if line.startswith("| `tests/")] == (
+        suite_comparison.module_rows(gains)
+    )
+
+    kept, went = suite_comparison.split_gone(before[0], after[0])
+    assert {before[0].tests[t][0] for t in kept + went} == {"passed"}
+    by_module = Counter(suite_comparison.module_of(t) for t in kept).most_common(2)
+    (first, in_first), (second, in_second) = by_module
+    for words in (
+        f"{len(kept) + len(went):,} test ids of `1f6abad` are not in `d0948fb`'s suite",
+        f"{len(kept)} are parametrizations of test functions that are still there",
+        f"{in_first} in `{first}` and {in_second} in `{second}`",
+        f"The other {len(went)} belong to "
+        f"{len({suite_comparison.function_of(t) for t in went})} test functions that left their "
+        "module",
+    ):
+        assert words in prose, words
+
+
+def test_the_removals_name_each_function_that_went_and_section_1s_tallies():
+    """``removals.tsv`` names exactly the test functions the baseline ran and
+    ``main`` does not have, each with a commit between the two, and the
+    commits' tallies are section 1's: LOCAL's removal (#387, #388) and the two
+    changes of behaviour, and no commit of the EPIC. ``python -m
+    tests.suite_comparison --git .`` checks the file against the history."""
+    runs, _ = _runs()
+    _, went = suite_comparison.split_gone(runs["pre"][0], runs["post"][0])
+    removals = suite_comparison.read_removals()
+    assert set(removals) == {suite_comparison.function_of(t) for t in went}
+    assert all(re.fullmatch(r"[0-9a-f]{40}", commit) for commit in removals.values())
+    tally = Counter(removals[suite_comparison.function_of(t)][:7] for t in went)
+    assert set(tally) == {"aee704e", "3eb68ac", "9a7d8f9", "a86b729"}
+    assert not set(tally) & set(EPIC_COMMITS)
+    prose = _prose(_section_1())
+    local = tally["aee704e"] + tally["3eb68ac"]
+    assert tally["9a7d8f9"] + tally["a86b729"] == len(went) - local == 3
+    # Of LOCAL's, those whose function has a namesake in another module on
+    # main: moved or rewritten there by the same commits.
+    names = {suite_comparison.function_of(t).split("::")[1] for t in runs["post"][0].tests}
+    moved = [t for t in went if suite_comparison.function_of(t).split("::")[1] in names]
+    assert {removals[suite_comparison.function_of(t)][:7] for t in moved} <= {"aee704e", "3eb68ac"}
+    for words in (
+        f"LOCAL's removal took {local} of the {len(went)} from theirs, {tally['aee704e']} with "
+        f"#387 (`aee704e`) and {tally['3eb68ac']} with #388 (`3eb68ac`)",
+        f"Of those {local}, {len(moved)} ids, in "
+        f"{len({suite_comparison.function_of(t) for t in moved})} functions, have a namesake "
+        "in another module on `main`",
+        "Three went where #283 (`9a7d8f9`) and #349 (`a86b729`)",
+        "No commit of this EPIC removed one (I1)",
+    ):
+        assert words in prose, words
+    invariants = _prose(_section(_audit(), INVARIANTS))
+    assert all(f"`{commit}`" in invariants for commit in EPIC_COMMITS)
+
+
+def test_the_records_say_how_the_runs_were_made():
+    """What section 1 and I7 say of how the six runs were made is in their
+    records: alternating before and after, every one exiting 0, at the times
+    and load averages section 1.1 gives; the live test, the suite's one model
+    call, deselected and the five opt-in probes skipped in each, with only
+    the tests that need the missing zsh skipped besides and every sandbox
+    test run; the baseline changed in one test helper alone; and a runner
+    script that starts pytest and no tool that reaches the network."""
+    runs, events = _runs()
+    section = _section_1()
+    prose = _prose(section)
+    starts = [(e.side, e.run) for e in events if e.edge == "start"]
+    assert starts == [(side, n) for n in suite_comparison.RUNS for side in ("pre", "post")]
+    assert [(e.side, e.run, e.exit_status) for e in events if e.edge == "end"] == [
+        (side, n, 0) for side, n in starts
+    ]
+    first, last = events[0].at, events[-1].at
+    assert f"On {first[:10]} between {first[11:16]} and {last[11:16]} UTC" in prose
+    assert f"at most {max(e.load for e in events):.2f} at the start or end of a run" in prose
+
+    zsh: dict[str, set[int]] = {}
+    for side in suite_comparison.SIDES:
+        for run in runs[side]:
+            assert run.counts["deselected"] == 1, run.name
+            assert not [t for t in run.tests if t.startswith("tests.test_live_pi::")], run.name
+            reasons = run.skips.values()
+            probes = [r for r in reasons if "zsh" not in r]
+            assert len(probes) == 5 and all("AUTOFORGE_" in r for r in probes), run.name
+            assert not [t for t in run.skips if "sandbox" in t.split("::")[0]], run.name
+            zsh.setdefault(side, set()).add(len(reasons) - len(probes))
+    (before,), (after,) = zsh["pre"], zsh["post"]
+    assert f"({before} at the baseline, {after} on `main`)" in prose
+    assert "the five opt-in probes" in prose
+
+    patch = suite_comparison.read_member("pre-259.patch")
+    assert [line for line in patch.splitlines() if line.startswith("diff --git ")] == [
+        "diff --git a/tests/test_interaction.py b/tests/test_interaction.py"
+    ]
+    bench = suite_comparison.read_member("bench.sh")
+    assert "-m pytest -p no:cacheprovider --junitxml=" in bench
+    assert "-m pytest -p no:cacheprovider --junitxml=<run>.xml" in section
+    assert not _NETWORK_TOOL.findall(bench)
+    for tool in ("bench.sh -- uv run pytest", "git fetch", "curl -s", "x=$(gh pr view)"):
+        assert _NETWORK_TOOL.search(tool), tool
+
+
+def test_removals_reads_the_last_commit_that_removed_a_function_from_its_module():
+    """The attribution itself, on a ``git log -p`` of three commits: a
+    function's removal is its last commit's, a ``def`` moved within its
+    module is no removal, and one deleted with its module is."""
+    log = "\n".join(
+        [
+            "commit " + "a" * 40,
+            "",
+            "diff --git a/tests/test_x.py b/tests/test_x.py",
+            "--- a/tests/test_x.py",
+            "+++ b/tests/test_x.py",
+            "-def test_gone():",
+            "-def test_moved(tmp_path):",
+            "+def test_moved(tmp_path):",
+            "-    def test_in_a_class(self):",
+            "+def test_back():",
+            "commit " + "b" * 40,
+            "",
+            "diff --git a/tests/test_x.py b/tests/test_x.py",
+            "-def test_back():",
+            "diff --git a/tests/test_y.py b/tests/test_y.py",
+            "deleted file mode 100644",
+            "--- a/tests/test_y.py",
+            "+++ /dev/null",
+            "-async def test_with_its_module():",
+            "-def helper():",
+        ]
+    )
+    removed = suite_comparison.removals(log)
+    assert removed == {
+        ("tests/test_x.py", "test_gone"): "a" * 40,
+        ("tests/test_x.py", "test_in_a_class"): "a" * 40,
+        ("tests/test_x.py", "test_back"): "b" * 40,
+        ("tests/test_y.py", "test_with_its_module"): "b" * 40,
+    }
+    functions = ["tests.test_x.TestC::test_in_a_class", "tests.test_x::test_moved"]
+    assert suite_comparison.attribute(functions, removed) == {functions[0]: "a" * 40}
+
+
 # -- what only documents held (E2, E6) -----------------------------------------
 
 # Options that put pytest on pytest-xdist's workers, or load xdist explicitly.
 _WORKER_OPTION = re.compile(r"(?:^|\s)(?:-n\s*\S|--numprocesses\b|--dist\b|-p\s*xdist\b)")
+# Every gate that runs the suite.
+_GATES = ("test", "check-matrix", "test-sandbox", "test-sandbox-measured")
+# Where a make started under this suite reads a worker count or variables
+# from besides its own command line: the environment, and the command-line
+# assignments and flags a make running the suite hands its recipe
+# (`make test-parallel PYTEST_WORKERS=2` passes `PYTEST_WORKERS=2` both ways).
+_INHERITED_BY_MAKE = (
+    "PYTEST_WORKERS",
+    "MAKEFLAGS",
+    "MFLAGS",
+    "GNUMAKEFLAGS",
+    "MAKEOVERRIDES",
+    "MAKELEVEL",
+)
 
 
-def test_workers_stay_opt_in_and_every_gate_runs_the_suite_serially():
+def _inherit_from_make(monkeypatch: pytest.MonkeyPatch, **variables: str) -> None:
+    """The ``make`` that ``_make_dry_run`` starts inherits ``variables`` alone of
+    :data:`_INHERITED_BY_MAKE`, whatever this run of the suite was started with."""
+    for name in _INHERITED_BY_MAKE:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in variables.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_workers_stay_opt_in_and_every_gate_runs_the_suite_serially(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """E2: M1 adopted workers for local use only (``docs/development.md``,
     "The suite on several workers"): ``make test-parallel`` runs the suite on
     ``PYTEST_WORKERS`` workers with ``--dist=load``, and ``make test``,
     ``make check``, ``make check-matrix`` and every CI job stay serial until
     the preconditions recorded there are met. Running CI on workers changes
     this test, a protected workflow and that page together, under a human's
-    review."""
+    review. The default of 4 is read with no worker count inherited, so
+    the suite run with ``PYTEST_WORKERS`` set passes too (PR #432 review
+    R1-F1)."""
+    _inherit_from_make(monkeypatch)
     assert _make_dry_run("test-parallel") == ["uv run pytest -n 4 --dist=load"]
     assert _make_dry_run("test-parallel", assignments=("PYTEST_WORKERS=8",)) == [
         "uv run pytest -n 8 --dist=load"
@@ -182,7 +444,7 @@ def test_workers_stay_opt_in_and_every_gate_runs_the_suite_serially():
     rules = _make_rules()
     for target, rule in rules.items():
         assert "test-parallel" not in rule.prerequisites, f"`make {target}` runs the workers"
-    for gate in ("test", "check-matrix", "test-sandbox", "test-sandbox-measured"):
+    for gate in _GATES:
         for command in _make_dry_run(gate):
             assert not _WORKER_OPTION.search(command), f"`make {gate}` runs {command!r}"
     code = _code()
@@ -195,6 +457,33 @@ def test_workers_stay_opt_in_and_every_gate_runs_the_suite_serially():
     assert _WORKER_OPTION.search("uv run pytest -nauto")
     assert _WORKER_OPTION.search("uv run pytest -p xdist")
     assert not _WORKER_OPTION.search("uv run pytest -rs --junitxml=x.xml")
+
+
+@pytest.mark.parametrize(
+    "inherited",
+    [
+        {"PYTEST_WORKERS": "2"},
+        {"MAKEFLAGS": " -- PYTEST_WORKERS=2"},
+        {"PYTEST_WORKERS": "2", "MAKEFLAGS": "s -- PYTEST_WORKERS=2"},
+    ],
+    ids=["environment", "makeflags", "under-make-test-parallel"],
+)
+def test_an_inherited_worker_count_reaches_test_parallel_and_no_gate(
+    monkeypatch: pytest.MonkeyPatch, inherited: dict[str, str]
+):
+    """``PYTEST_WORKERS`` is the documented override (``docs/development.md``).
+    Inherited from the environment, or from the ``MAKEFLAGS`` a make running
+    this suite hands it (``make test-parallel PYTEST_WORKERS=2`` passes both),
+    it sets ``make test-parallel``'s workers; make's own command line still
+    beats it, and every gate stays serial with it set (PR #432 review R1-F1)."""
+    _inherit_from_make(monkeypatch, **inherited)
+    assert _make_dry_run("test-parallel") == ["uv run pytest -n 2 --dist=load"]
+    assert _make_dry_run("test-parallel", assignments=("PYTEST_WORKERS=8",)) == [
+        "uv run pytest -n 8 --dist=load"
+    ]
+    for gate in _GATES:
+        for command in _make_dry_run(gate):
+            assert not _WORKER_OPTION.search(command), f"`make {gate}` runs {command!r}"
 
 
 def test_the_documented_regression_policy_is_the_one_the_report_applies():

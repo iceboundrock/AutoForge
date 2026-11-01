@@ -488,7 +488,9 @@ only a real flush in the test process would have caught.
 [EPIC #338's exit audit](test-suite-performance-audit.md#1-the-suite-before-and-after-on-one-host)
 measures the whole EPIC: the suite at its baseline, `1f6abad`, against
 `main` at `d0948fb`, serially and alternating on one host, with the tests
-the two have in common timed apart.
+the two have in common timed apart. The runs' reports are in the
+repository, and `python -m tests.suite_comparison` reproduces its numbers
+from them.
 
 ## Fast feedback while working
 

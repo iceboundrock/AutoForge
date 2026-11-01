@@ -179,10 +179,13 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/fast_targets.py": (),
     "tests/live_pi.py": (),
     "tests/operator_comment_fidelity.py": (),
-    "tests/parallel_bench.py": (),
+    "tests/parallel_bench.py": ("test_suite_performance_audit",),  # via suite_comparison
     "tests/pi_fake.py": (),
     "tests/sandbox_host.py": (),
     "tests/scheduler_worker.py": ("test_scheduler", "test_epic_commands", "test_epic_recovery"),
+    "tests/suite_comparison.py": (),
+    # EPIC #338's exit audit: its runs' records, which its section 1 is held to
+    "tests/fixtures/suite_performance_audit/": ("test_suite_performance_audit",),
 }
 
 NOT_EVIDENCE = (

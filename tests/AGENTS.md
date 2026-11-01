@@ -424,7 +424,10 @@ the test suite's performance EPIC     test_suite_performance_audit.py (the exit 
 audited (EPIC #338)                   docs/test-suite-performance-audit.md, takes the EPIC's six
                                       exit criteria and seven invariants once each, each with a
                                       verdict and a test for each met or held, and every test it
-                                      names exists; workers stay opt-in and every gate serial;
+                                      names exists; its section 1 is what suite_comparison.py
+                                      computes from the runs' records in
+                                      fixtures/suite_performance_audit/; workers stay opt-in and
+                                      every gate serial, whatever PYTEST_WORKERS make inherits;
                                       the published regression policy is the report's)
 tmp_path retention (#396)             test_tmp_path_retention.py (a synthetic suite in a pytest
                                       process of its own, wired as conftest.py wires this one)
