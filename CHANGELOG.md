@@ -29,6 +29,25 @@ reason changed:
   remedies, before the reviewer runs and after it returns, instead of
   "remove them, then unblock".
 
+### One troubleshooting guide, indexed by symptom (#260)
+
+[docs/troubleshooting.md](docs/troubleshooting.md) collects what
+`docs/usage.md`, `docs/getting-started.md` and the agent guides each said
+about a run that stopped: it starts from the message or state you see
+(BLOCKED, FAILED, "State unchanged", a killed agent, a provider error, an
+interrupted process, a held lock, a change made on GitHub) and says what
+the controller did and which command continues. It also has:
+
+- one exit-code table for `run`, `step`, `resume`, `unblock`, `status`,
+  `doctor` and the removed `local`;
+- a recovery-scenario table in which every row names the tests that hold
+  its behaviour, checked by `tests/test_troubleshooting_guide.py`;
+- the cases no test covers yet, listed as known limitations rather than
+  as recoveries.
+
+No behaviour changes. `docs/usage.md` keeps the sections that AutoForge's
+own messages point to by name.
+
 ### A Python without `os.memfd_create` cannot enforce the outer sandbox, and says so (#389)
 
 On a Python built without `os.memfd_create` (uv's CPython 3.12.13 build

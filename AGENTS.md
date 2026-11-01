@@ -218,6 +218,9 @@ docs/getting-started.md                operator guide: a first run from nothing,
                                        common first-run failures
 docs/clean-room.md                     the clean-room first-run procedure (Gates 1 and 2 of #255)
 docs/usage.md                          operator guide: remote commands, stop phases, unblock, recovery
+docs/troubleshooting.md                operator guide: a stopped, failed or refused run by symptom,
+                                       resume / unblock / a new run, safe stops, lock contention,
+                                       exit codes, the recovery scenarios and the tests that hold them
 docs/pi.md                             operator guide: Pi on a DeepSeek API key or a ChatGPT
                                        subscription, doctor's Pi rows, unattended use, the
                                        opt-in live smoke test

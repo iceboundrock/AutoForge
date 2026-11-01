@@ -356,7 +356,7 @@ most common entry points:
 |---|---|
 | make a first run on a repository of my own, step by step | [Getting started](docs/getting-started.md), starter configurations in [`examples/`](examples) |
 | know which OS, Python, git, `gh`, agent CLI and sandbox host it runs on | [Compatibility](docs/compatibility.md) |
-| run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/usage.md#troubleshooting-and-recovery) |
+| run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/troubleshooting.md) |
 | run phases through Pi on a DeepSeek API key or a ChatGPT subscription | [Pi operator guide](docs/pi.md) |
 | configure profiles, bounds and the merge gate | [Configuration](docs/configuration.md), [`autoforge.example.yaml`](autoforge.example.yaml) |
 | know what AutoForge protects, which GitHub token it needs, or report a vulnerability | [Security boundaries](docs/security.md), [SECURITY.md](SECURITY.md) |
