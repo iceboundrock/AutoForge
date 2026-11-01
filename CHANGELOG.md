@@ -116,9 +116,19 @@ so.
   follows with no space between them ends a value
   (`{client_secret: two words,region: r}`), so the whole value goes and the
   next entry stays, also under an upper-case name, whose value took the rest
-  of the collection before. A scalar that starts with a literal backslash
-  before a quote (`client_secret: \"a \"b`) is still taken for a quoted
-  value and keeps what follows its second quote.
+  of the collection before.
+- A YAML plain scalar that starts with a literal backslash before a quote
+  (`client_secret: \"a \"b`, single quotes too) is redacted whole, on its
+  key's line, in a flow collection, below its key and under an explicit
+  key, as text and as JSON writes it one, two and three deep, where it was
+  taken for a quoted value that ends at its second quote and kept what
+  follows, or, three deep, read as code and kept whole. A quote that JSON
+  writes (`"client_secret: \"x\" # c"`) still opens a quoted value, whose
+  quotes and what follows them stay. An assignment whose value starts so
+  (`GH_TOKEN=\"a`) is redacted three deep too, where it was kept whole. A
+  value that ends in a literal backslash (`client_secret: two words\`), or
+  that `\'` opens, no longer takes the closing quote of the JSON string it is
+  written in, so the JSON still decodes.
 - `redact` repeats its patterns until a round changes nothing, so redacting
   its output again changes nothing and finds no credential in it, also
   where one pattern redacted a part of the text another value's extent

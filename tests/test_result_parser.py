@@ -104,6 +104,7 @@ from tests.conftest import (
     WHOLE_VALUES_285_R9,
     WHOLE_VALUES_285_R10,
     WHOLE_VALUES_285_R11,
+    WHOLE_VALUES_285_R12,
     block,
     comment_url,
 )
@@ -3024,6 +3025,48 @@ def test_an_eleventh_285_review_shape_is_refused_by_every_check(cls, text, body,
     JSON writes it one, two and three deep. Each check refuses it by class
     now, and none quotes it; so does each for a flow scalar whose ``,`` the
     next entry's key follows at once."""
+    written = text
+    for _ in range(depth):
+        written = json.dumps(written)
+    body_text = f"Configured the client:\n\n{written}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body_text),
+        published_payload_problem("PR body", f"{body_text}\n\nCloses #2"),
+        acceptance_comment_problem(body_text, "R1-F1"),
+        operator_comment_problem(body_text, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{written}", repository="owner/repo", issue_number=2
+        ),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert f"credential-shaped string (pattern class: {cls})" in msg
+        assert body not in msg and "FAKE" not in msg
+    for refusal in (
+        _refusal(lambda: _full(progress=body_text)),
+        _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
+    ):
+        assert f"credential-shaped string (pattern class: {cls})" in refusal
+        assert body not in refusal and "FAKE" not in refusal
+
+
+# What the twelfth review of #285 found the checks accepted: a plain scalar
+# that starts with a literal backslash before a quote (R12-F1), each with its
+# class and what must never be quoted.
+_R12_SHAPES = [(cls, text, body) for _, cls, text, body in WHOLE_VALUES_285_R12]
+_R12_IDS = [n for n, _, _, _ in WHOLE_VALUES_285_R12]
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(("cls", "text", "body"), _R12_SHAPES, ids=_R12_IDS)
+def test_a_twelfth_285_review_shape_is_refused_by_every_check(cls, text, body, depth):
+    """#285 review, round 12: a plain scalar that starts with a literal
+    backslash before a quote (``client_secret: \\"FAKEfirst \\"FAKEtail``)
+    lost only its first part to the marker, and written out three deep
+    reported no class, so the publication, payload, commit-message and
+    composed-comment checks and ``pr_body`` and ``progress`` validation
+    accepted it, as text and as JSON writes it one, two and three deep. Each
+    check refuses it by class now, and none quotes it."""
     written = text
     for _ in range(depth):
         written = json.dumps(written)

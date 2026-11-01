@@ -76,6 +76,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R10_REDACTED,
     WHOLE_VALUES_285_R11,
     WHOLE_VALUES_285_R11_REDACTED,
+    WHOLE_VALUES_285_R12,
+    WHOLE_VALUES_285_R12_REDACTED,
     XAI_API_KEY,
     XAI_KEY_BODY,
 )
@@ -5238,6 +5240,350 @@ def test_the_eleventh_review_patterns_stay_linear(text):
     quote that no structure follows is looked for within the scalar alone.
     A megabyte of each is redacted well inside the budget, and the output
     is stable."""
+    started = time.process_time()
+    out = redact(text)
+    assert time.process_time() - started < 3.0
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(
+    ("name", "cls", "text", "body"),
+    WHOLE_VALUES_285_R12,
+    ids=[c[0] for c in WHOLE_VALUES_285_R12],
+)
+def test_a_value_the_twelfth_285_review_found_is_redacted_whole_as_text_and_as_json(
+    name, cls, text, body
+):
+    """#285 review, round 12: a plain scalar that starts with a literal
+    backslash before a quote (``client_secret: \\"FAKEfirst \\"FAKEtail``,
+    valid YAML, also with single quotes) was taken for a quoted value that
+    ends at its second such quote, and what follows it was kept, in every
+    sink; written out three deep it read as code and was kept whole, and
+    reported no class. Each goes whole now, on its key's line, in a flow
+    collection, below its key and under an explicit key, as text and as
+    JSON, JSON in JSON and three deep write it, is reported under its class,
+    the JSON still decodes to what redacting the text gives, the next entry
+    stays, and the output is stable and within the growth bound; ``clean``
+    shows none of it on a progress line."""
+    yaml = pytest.importorskip("yaml")
+    assert body in str(yaml.safe_load(text))
+    assert redact(text) == WHOLE_VALUES_285_R12_REDACTED[name]
+    for depth in (0, 1, 2, 3):
+        escaped = _json_string(text, depth)
+        out = redact(escaped)
+        assert body not in out and "FAKE" not in out, out
+        assert credential_classes(escaped) == (cls,)
+        assert redact(out) == out and credential_classes(out) == ()
+        assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == WHOLE_VALUES_285_R12_REDACTED[name]
+    assert redact_obj({"env": {"text": text}}) == {"env": {"text": redact(text)}}
+    assert "FAKE" not in clean(text, 10_000)
+
+
+# A quote that JSON writes, which a YAML text holds (#285 review, round 12):
+# a backslash before a quote is a literal one only where the text is not
+# written out, or where the run is longer than the one JSON writes a quote
+# with at the depth the line is written out at. A quoted scalar's quote
+# written out still opens a quoted value, which is replaced whole, its
+# quotes, a comment after it and what follows its closing quote kept, at
+# every depth, also where words follow that quote.
+_SERIALIZED_QUOTES = [
+    ('client_secret: "FAKE0quoted" # rotated', 'client_secret: "***REDACTED***" # rotated'),
+    ("client_secret: 'FAKE0single'", "client_secret: '***REDACTED***'"),
+    ('{client_secret: "FAKE0flow", region: r}', '{client_secret: "***REDACTED***", region: r}'),
+    ('client_secret:\n  "FAKE0below"\nregion: r', 'client_secret:\n  "***REDACTED***"\nregion: r'),
+    ("? client_secret\n: 'FAKE0explicit'", "? client_secret\n: '***REDACTED***'"),
+    (
+        '{"client_secret": "FAKE0json", "region": "r"}',
+        '{"client_secret": "***REDACTED***", "region": "r"}',
+    ),
+    ('GH_TOKEN: "FAKE0gh" and more', 'GH_TOKEN: "***REDACTED***" and more'),
+    ("CLIENT_SECRET: 'FAKE0upper' # c", "CLIENT_SECRET: '***REDACTED***' # c"),
+    ('- db_password: "FAKE0seq"\n  region: r', '- db_password: "***REDACTED***"\n  region: r'),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _SERIALIZED_QUOTES, ids=[t for t, _ in _SERIALIZED_QUOTES]
+)
+def test_a_quote_json_writes_still_opens_a_quoted_value_at_every_depth(text, expected):
+    """#285 review, round 12: a backslash before a quote at a plain
+    scalar's start is a literal one now, but only where the run is longer
+    than the one the line's depth writes a quote with: a YAML quoted scalar
+    written out one, two and three deep (``\\"FAKE\\"`` in JSON) is still a
+    quoted value, replaced whole, and its quotes and what follows them stay,
+    so the JSON decodes to what redacting the text gives."""
+    assert redact(text) == expected
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        assert "FAKE" not in out and redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('client_secret:\n  \\"FAKE: x\\"', "client_secret:\n  ***REDACTED***"),
+        ('? client_secret\n: \\"FAKE1: FAKE2', "? client_secret\n: ***REDACTED***"),
+        ("{client_secret:\n  \\'FAKE: x}", "{client_secret:\n  ***REDACTED***"),
+        ('? db_password\n:\n  \\"FAKE: y\\"', "? db_password\n:\n  ***REDACTED***"),
+    ],
+    ids=str,
+)
+def test_a_value_behind_a_literal_backslash_that_is_no_plain_scalar_is_read_as_quoted(
+    text, expected
+):
+    """#285 review, round 12: below a key, a value that starts with a
+    literal backslash before a quote is a plain scalar where it is one; one
+    that holds a mapping's ``: `` is none (a YAML parser reads a nested
+    mapping), and is read as a quoted value, as before, so no value loses
+    less than it did; the round after reads the plain scalar the marker
+    leaves. As text and written out one, two and three deep, stable."""
+    assert redact(text) == expected
+    assert redact(expected) == expected
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        assert "FAKE" not in out and redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GH_TOKEN=\\'FAKE0shell",
+        'GH_TOKEN=\\"FAKE0shell',
+        "client_secret=\\'FAKE0form",
+        'export CLIENT_SECRET=\\"FAKE0export more',
+        "GH_TOKEN=\\'FAKE0a\\FAKE0b",
+    ],
+    ids=str,
+)
+def test_an_assignment_behind_a_literal_backslash_is_read_alike_at_every_depth(text):
+    """#285 review, round 12: an assignment's value that starts with a
+    literal backslash before a quote is read as a quoted value, as text and
+    one and two deep, but three deep the run is fifteen backslashes, or
+    eight before a single quote, more than a quoted value was opened behind,
+    and a value no quote opens never starts with such a run, so it was kept
+    whole and reported no class. It is read alike at every depth now, and
+    the JSON decodes to what redacting the text gives."""
+    expected = redact(text)
+    assert "FAKE" not in expected and credential_classes(text) != ()
+    for depth in (1, 2, 3):
+        written = _json_string(text, depth)
+        out = redact(written)
+        assert "FAKE" not in out and credential_classes(written) != ()
+        assert redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "client_secret: FAKE1 FAKE2\\",
+        "client_secret:\n  FAKE1 FAKE2\\",
+        "? client_secret\n: FAKE1 FAKE2\\",
+        "client_secret: FAKE1\n  FAKE2\\",
+        "{client_secret: FAKE1 FAKE2\\, region: r}",
+        "GH_TOKEN: FAKE1\\\\",
+        "client_secret: \\'FAKE1",
+        "db_password:\n  \\'FAKE1 FAKE2\\",
+        'GH_TOKEN="FAKE1 FAKE2\\',
+        'export DB_PASSWORD="FAKE1\\\\"',
+    ],
+    ids=str,
+)
+def test_a_literal_backslash_before_a_strings_closing_quote_keeps_the_json_whole(text):
+    """#285 review, round 12: a value that ends in a literal backslash ends
+    in ``\\\\"`` in JSON, a literal backslash and the string's closing quote,
+    and a line written out took the run for a quote of the scalar's, so the
+    value took the closing quote and the JSON no longer decoded; a value
+    that ``\\'`` opens (``\\\\'`` in JSON) ran past it the same way, and so
+    did a quoted value that ends in one, written out, whose run was taken for
+    an escaped quote inside it. The literal backslashes are the value's, the
+    quote ends the string, and the JSON one, two and three deep decodes to
+    what redacting the text gives."""
+    expected = redact(text)
+    assert "FAKE" not in expected
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected and redact(out) == out
+
+
+def test_a_quoted_value_an_even_run_of_backslashes_opens_ends_at_the_strings_quote():
+    """#285 review, round 12: a value that a quote behind two literal
+    backslashes opens (``GH_TOKEN=\\\\'...`` in a JSON string, a backslash and
+    a quote) ran past the closing quote of the string it is written in, to
+    its line's end, and took the next entries of the document with it. A
+    double quote behind fewer backslashes than half the run closes that
+    string now, and the document still parses."""
+    text = '{"a": "GH_TOKEN=\\\\\'FAKE0even", "b": "x"}'
+    out = redact(text)
+    assert out == '{"a": "GH_TOKEN=\\\\\'***REDACTED***", "b": "x"}'
+    assert json.loads(out) == {"a": "GH_TOKEN=\\'***REDACTED***", "b": "x"}
+    assert redact(out) == out and credential_classes(out) == ()
+
+
+def _leading_quote_word(rng, tag, i):
+    """A word of a plain scalar (#285 review, round 12): one or two literal
+    backslashes before a double or a single quote, first; and another such
+    quote inside it or after it, or none."""
+    quote = rng.choice(['"', "'"])
+    lead = "\\" * rng.choice([1, 1, 2])
+    word = f"FAKE{tag}w{i}"
+    kind = rng.random()
+    if kind < 0.3:
+        return lead + quote + word[:5] + "\\" + quote + word[5:]
+    if kind < 0.5:
+        return lead + quote + word + "\\" + quote
+    return lead + quote + word
+
+
+def _leading_quote_entry(rng, tag, flow):
+    """An entry under a credential name whose plain scalar starts with a
+    literal backslash before a quote: on the key's line, after a property,
+    with a comment, below the key, going on below its line, under an
+    explicit key in a block, on its ``:``'s line and below it."""
+    name = rng.choice(_FLOW_UPPER_NAMES + _FLOW_LOWER_NAMES)
+    words = [_leading_quote_word(rng, tag, 0)] + [
+        rng.choice([_leading_quote_word(rng, tag, i), f"FAKE{tag}p{i}"])
+        for i in range(1, rng.randint(1, 3))
+    ]
+    sep = rng.choice([" ", " ", "  "])
+    prop = rng.choice(["", "", "", "&a ", "!!str "])
+    kind = rng.random()
+    if kind < 0.35:
+        return f"{name}: {prop}{sep.join(words)}" + rng.choice(["", "", " # c"])
+    if kind < 0.55:
+        return f"{name}:\n  {prop}{sep.join(words)}"
+    if kind < 0.7:
+        return f"{name}: {prop}{words[0]}" + "".join(f"\n  {w}" for w in words[1:])
+    if kind < 0.8 and not flow:
+        return f"? {name}\n: {prop}{sep.join(words)}"
+    if kind < 0.9 and not flow:
+        return f"? {name}\n:\n  {prop}{sep.join(words)}"
+    return f"{name}: {prop}{sep.join(words)}"
+
+
+def test_every_value_that_starts_with_a_literal_backslash_before_a_quote_is_redacted():
+    """#285 review, round 12: block and flow mappings that a YAML parser
+    reads, their values plain scalars that start with one or two literal
+    backslashes before a double or a single quote, another such quote inside
+    or after a word or none, among other entries, a flow collection's
+    entries parted by a ``,`` with no space after it too, a block in a
+    sequence's entry, its lines ended by CRLF too. Every word a parser reads
+    under a credential key goes, as text and as JSON one, two and three
+    deep, the JSON still decodes, the output is stable and within the growth
+    bound, and a progress line shows none of it."""
+    yaml = pytest.importorskip("yaml")
+    names = _FLOW_UPPER_NAMES + _FLOW_LOWER_NAMES
+    rng = random.Random(28512)
+    checked = 0
+    while checked < 400:
+        flow = rng.random() < 0.4
+        entries = []
+        for j in range(rng.randint(1, 3)):
+            if rng.random() < 0.25:
+                entries.append(rng.choice(["region: r", "a: 1", "two words: x"]))
+            else:
+                entries.append(_leading_quote_entry(rng, f"{checked}x{j}", flow))
+        if flow:
+            text = "{" + rng.choice([",", ", ", ",\n", ",\n  "]).join(entries) + "}"
+        else:
+            if rng.random() < 0.3:
+                entries = [
+                    ("- " if i == 0 else "  ") + e.replace("\n", "\n  ")
+                    for i, e in enumerate(entries)
+                ]
+            text = "\n".join(entries)
+        if rng.random() < 0.2:
+            text = text.replace("\n", "\r\n")
+        try:
+            values = [w for w in _credential_words(yaml.safe_load(text), names) if "FAKE" in w]
+        except yaml.YAMLError:
+            continue
+        if not values:
+            continue
+        checked += 1
+        assert "FAKE" not in clean(text, 100_000), text
+        for depth in (0, 1, 2, 3):
+            written = _json_string(text, depth)
+            out = redact(written)
+            assert "FAKE" not in out, (depth, text)
+            assert credential_classes(written) != (), (depth, text)
+            assert redact(out) == out and credential_classes(out) == (), text
+            assert len(out) <= MAX_GROWTH_FACTOR * len(written)
+            decoded = out
+            for _ in range(depth):
+                decoded = json.loads(decoded)
+            assert "FAKE" not in decoded
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A plain scalar that starts with a literal backslash before a quote,
+        # on its key's line, below it, in a flow collection, as JSON three deep.
+        'client_secret: \\"x \\"y\n' * 20_000,
+        'client_secret:\n  \\"x\n' * 15_000,
+        '{client_secret: \\"x \\"y}' * 12_000,
+        json.dumps(json.dumps(json.dumps('client_secret: \\"a \\"b\n'))) * 6_000,
+        # One that is no plain scalar, read as a quoted value as before, and
+        # read again as a plain one the round after.
+        '? client_secret\n: \\"x: y\n' * 10_000,
+        'client_secret:\n  \\"x: y\n' * 10_000,
+        # Runs of backslashes before a quote: a megabyte after a key, below
+        # it, written out, before a string's closing quote, and quoted
+        # values that an even run opens, before runs of escaped quotes.
+        "client_secret: " + "\\" * 1_000_000 + '"',
+        "client_secret:\n  " + "\\" * 1_000_000 + "'x",
+        json.dumps("client_secret: " + "\\" * 500_000 + '"x'),
+        '"client_secret: x' + "\\" * 1_000_000 + '"',
+        '"client_secret:\\n  ' + "\\" * 500_000 + '"x"',
+        "GH_TOKEN=\\\\'" + "x" * 300_000 + '\\"' * 200_000,
+        ("GH_TOKEN=\\\\'x" + '\\"' * 10) * 20_000,
+        ('"x_token: a' + "\\" * 6 + '" ') * 20_000,
+    ],
+    ids=[
+        "key-line",
+        "below-the-key",
+        "flow-collection",
+        "three-deep",
+        "explicit-no-plain-scalar",
+        "below-no-plain-scalar",
+        "backslashes-before-a-quote",
+        "backslashes-before-a-single-quote",
+        "backslashes-written-out",
+        "backslashes-before-the-closing-quote",
+        "backslashes-below-a-written-key",
+        "even-run-before-escaped-quotes",
+        "even-runs",
+        "literal-pairs-before-closing-quotes",
+    ],
+)
+def test_the_twelfth_review_patterns_stay_linear(text):
+    """#285 review, round 12: whether a value starts with a literal
+    backslash before a quote is read once at the value's start, a run of
+    backslashes whole; a value below a key whose plain scalar it is not is
+    read a second time as a quoted one; a quoted value that an even run
+    opens reads each double quote's backslashes once; and a line written out
+    reads the literal backslashes before a closing quote once. Each is
+    redacted well inside the budget, and the output is stable."""
     started = time.process_time()
     out = redact(text)
     assert time.process_time() - started < 3.0

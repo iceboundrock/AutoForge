@@ -1145,15 +1145,103 @@ next line), a line break as written is one too (`_YAML_BREAK`): a line
 written out reaches one only past its string's closing quote, which is
 none of its characters.
 
-Not recognised still, as before the eleventh review: a plain scalar that
-starts with a literal backslash before a quote (`client_secret: \"FAKE1
-\"FAKE2`). A backslash before a quote is how JSON writes a quote, and the
-quoted-value rules read `\"` as one that opens the value, so such a scalar
-is taken to its second `\"` and what follows is kept. Under a lower-case
-name such a value written out three deep is kept whole (a run of
-backslashes before a quote reads as code), and one that `\'` opens runs
-past the closing quote of the JSON string it is written in, one and two
-deep, which then no longer decodes.
+### A literal backslash before a quote
+
+A plain scalar that starts with a literal backslash before a quote
+(`client_secret: \"FAKEfirst \"FAKEtail`, also with single quotes, valid
+YAML) was kept in part until the twelfth review of #285, in every sink, and
+the checks accepted it. A backslash before a quote is how JSON writes a
+quote, so every rule read `\"` as the opening quote of a quoted scalar:
+the name's rule took the value to its second `\"` and kept what follows, the
+rules below a key took it for a quoted scalar too, and the plain-scalar
+rules took none (`_YAML_NOT_PLAIN` refused any quote behind backslashes).
+Written out three deep, the run of fifteen backslashes was longer than any
+quoted value was opened behind, and under a lower-case name it read as code
+(a run of backslashes before a quote ends a word), so the value was kept
+whole and reported no class. A value that `\'` opens (`\\'` in JSON) also ran
+past the closing quote of the JSON string it is written in, one and two deep,
+and the JSON no longer decoded.
+
+What tells the two apart is the depth a line is written out at, which each
+rule already reads: as written, no quote is written out, so a backslash
+before a quote is a literal one, a run of them too; written out, a quote the
+YAML text holds stands behind one backslash fewer than a literal backslash
+is written with, and a literal backslash before it behind that many more
+(`\\\"` in JSON is a backslash and a quote, `\"` is a quote). So a run of
+literal backslashes, then a quote behind as many backslashes as the depth
+writes one with, starts a plain scalar (`_YAML_LITERAL_QUOTE`, after the
+line break written out that sets `ybs`; `_LINE_LITERAL_QUOTE`, after the
+lead that sets `cbs`; any run, as written and on a line read as is), and
+such a scalar:
+
+- is plain to every rule that reads one (the key's line, in a block and in a
+  flow collection, below the key, going on below its line, below a key in a
+  flow collection, under an explicit key on its `:`'s line and below it),
+  and taken whole;
+- reads as no code under a lower-case name (`_literal_checks`, the line
+  rules' `code` and `as_is_code`);
+- is no quoted scalar below a key (`_quote_guard`), where it is a plain one.
+  A value that is no plain scalar (it holds a mapping's `: `, a nested
+  mapping's key to a YAML parser) is read as a quoted value, as before, so
+  that no value loses less than it did; the round after reads the plain
+  scalar the marker leaves.
+
+A quote that the line's depth writes a quote with still opens a quoted
+value (`"client_secret: \"FAKE\" # c"` in JSON keeps its quotes and its
+comment), and a run that is a literal backslash before the string's closing
+quote (`\\"` in JSON) opens none.
+
+Four rules that a scalar of this kind meets read a quote's backslashes as
+JSON writes them now:
+
+- In a flow collection with no line break written out after the scalar,
+  the depth is unknown, and a quote that JSON's structure follows was taken
+  for the closing quote of the string the collection stands in
+  (`_FLOW_STRING_END`). Such a string's closing quote stands behind fewer
+  than half as many backslashes as any quote it holds: a double quote behind
+  none, one, three or seven, a single quote, which JSON does not escape,
+  behind none. After a scalar's first run of backslashes (group `lq`), a
+  quote closes the string only behind none, or behind one, three or seven
+  where that run is at least three, seven or fifteen long
+  (`_FLOW_LQ_STRING_END`), so `{CLIENT_SECRET: \"FAKE\", region: r}` three
+  deep is the scalar whole and the `,` and the next entry stay. A scalar
+  that is its quotes and a marker alone (`\"***REDACTED***\"`, a quoted
+  value the name's rule replaced) is no match (`_FLOW_LITERAL_LONE`), so a
+  quoted value JSON writes keeps its quotes.
+- A value that ends in a literal backslash ends in `\\"` in JSON, a literal
+  backslash and the string's closing quote, and a line written out took the
+  run for a quote of the scalar's, so the value took the closing quote and
+  the JSON no longer decoded, also where the value starts with no backslash
+  (`client_secret: FAKE1 FAKE2\`). A run before the string's quote holds
+  literal backslashes first, pairs as long as the depth writes one with, and
+  where the rest is shorter than a quote the text holds, the quote closes the
+  string and ends the line (`_YAML_WRITTEN`, `_LINE_WRITTEN`), as before a
+  line break written out.
+- A name's quoted value opens behind up to fifteen backslashes
+  (`_VALUE_QUOTE`), where it opened behind seven: seven are a quote JSON
+  three deep writes, and fifteen a literal backslash before a quote three
+  deep, which a value no quote opens never starts with, so an assignment
+  such as `GH_TOKEN=\"FAKE` written out three deep was kept whole, where as
+  text, one and two deep it is a quoted value. The YAML rules read the plain
+  scalar after it as at the other depths, and a value below a key that is
+  no plain scalar is read as a quoted one three deep too.
+- A quoted value that a single quote behind an even run of backslashes
+  opens (`\\'` in JSON, a literal backslash and a quote, or a quote a Python
+  repr escapes, in JSON; group `hbs`, half of the run, read one way only)
+  ends at a double quote behind fewer than half as many backslashes, the
+  closing quote of the JSON string it stands in, after literal backslashes
+  (runs as long as the opening one) or not (`_QUOTED_CHAR`), where it took
+  that quote as its other quote and ran on past the string. A value that a
+  double quote behind backslashes opens ends where its quote stands behind
+  literal backslashes (runs one longer than the opening one) and then fewer
+  than it opened behind, the closing quote of that string, where the run was
+  taken for an escaped quote inside the value; one that a quote behind no
+  backslash opens is read as before, a backslash escaping the quote after
+  it, as a shell's.
+
+Each lookahead reads a run of backslashes whole, once per candidate; the
+plain scalar below a key is read a second time only where its value starts
+with a literal backslash before a quote, so every pass stays linear.
 
 ### Redaction in rounds, and the patterns' hints
 

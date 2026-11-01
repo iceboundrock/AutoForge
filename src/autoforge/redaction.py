@@ -211,9 +211,29 @@ _SPACE_TO_VALUE = (
     rf"|[^\S\r\n]*+(?:{_WRITTEN_BREAK}[^\S\r\n]*+)++(?!`{{3}}|~{{3}}|\\*+[\"']))"
 )
 # A named assignment's value, its opening quote (``vbs``, the backslashes
-# before it, up to seven as ``_QUOTE`` takes, and ``vq``, the quote) optional:
-# group ``open``.
-_VALUE_QUOTE = r"(?P<open>(?P<vbs>\\{0,7})(?P<vq>[\"']))"
+# before it, and ``vq``, the quote) optional: group ``open``. Up to fifteen
+# backslashes (#285 review, round 12): seven are a quote JSON three deep
+# writes, as ``_QUOTE`` takes one, and fifteen a literal backslash and a
+# quote three deep (``\"`` as text, three backslashes and the quote in JSON,
+# seven in JSON in JSON), which a value no quote opens never starts with
+# (``_FIRST_BACKSLASH``), so such a value was kept whole three deep, where as
+# text, one and two deep it is read as a quoted value; the YAML rules read
+# the plain scalar it may start (``_YAML_LITERAL_QUOTE``). The run is
+# bounded, so it is never rescanned.
+#
+# Where a single quote opens it behind an even run (group ``hbs``, half of
+# it, round 12), the quote stands behind literal backslashes as JSON writes
+# them, two, four, eight or more (``\\'`` in JSON is a backslash and a
+# quote, which JSON does not escape), or behind a quote that a Python repr
+# escapes, in JSON; either way the run is one literal backslash written out,
+# and a double quote behind fewer than ``hbs`` backslashes, after literal
+# backslashes or not, is the closing quote of a JSON string the value stands
+# in, and ends the value (``_QUOTED_CHAR``). It was taken for the other
+# quote of the value's, so ``"client_secret: \\'FAKE"`` lost the string's
+# closing quote to the marker, and the JSON no longer decoded. The run is
+# read one way only (an atomic group): an even one before a single quote is
+# never read again without ``hbs``.
+_VALUE_QUOTE = r"(?P<open>(?P<vbs>(?>(?P<hbs>\\{1,7})(?P=hbs)(?=')|\\{0,15}))(?P<vq>[\"']))"
 _VALUE_OPEN = rf"{_VALUE_QUOTE}?"
 # A YAML node's properties (#285 review, round 5): an anchor (``&name``)
 # and a tag (``!!str``, ``!local``, ``!<tag:yaml.org,2002:str>``), either or
@@ -348,8 +368,26 @@ _QUOTED_ESCAPE = (
     r"|(?P=vbs)(?P=vq)(?P=vbs)(?P=vq)"
 )
 # One character of a quoted value on its line: any but a line break and the
-# closing quote, an escape and the other quote (behind any backslashes) included.
-_QUOTED_CHAR = rf"(?:[^\\\"'\r\n]|{_QUOTED_ESCAPE}|\\*+(?!(?P=vq))[\"'])"
+# closing quote, an escape and the other quote (behind any backslashes) included,
+# but a double quote behind fewer than ``hbs`` backslashes (round 12, above),
+# whose literal backslashes before it, runs as long as the opening one, are
+# the value's.
+#
+# The same holds where a double quote behind backslashes opens the value
+# (round 12), as JSON writes one: a literal backslash is written one
+# backslash longer than that quote is behind, and a double quote behind such
+# runs and then fewer backslashes than ``vbs`` closes the string the value
+# stands in, as one behind fewer alone does. The run was taken for an
+# escaped quote inside the value, so a value that ends in a literal
+# backslash before that string's closing quote took the quote, and the JSON
+# no longer decoded. The literal runs are the value's, and the quote ends
+# it. A value a quote behind no backslash opens is read as before, where a
+# backslash escapes the quote after it, as a shell's.
+_QUOTED_CHAR = (
+    r"(?:[^\\\"'\r\n]|(?(hbs)(?:(?P=vbs))++(?=(?!(?P=hbs))\\*+\")"
+    r"|(?:(?P=vbs)\\)++(?=(?!(?P=vbs))\\*+(?P=vq)(?<=\")))"
+    rf"|{_QUOTED_ESCAPE}|(?(hbs)(?!(?!(?P=hbs))\\*+\"))\\*+(?!(?P=vq))[\"'])"
+)
 _QUOTED_LINE = rf"{_QUOTED_CHAR}++"
 # A value's lines to its closing quote, its first line empty or not; a value
 # on a name's line holds something on its first (``_QUOTED_SPAN``).
@@ -497,7 +535,10 @@ _PATH = rf"(?:{_IDENT}(?:\.|::))*+"
 # (a line continuation, as written and written out, ``\\`` before a space in
 # JSON) or before a quote (an escaped quote, or the string's closing quote
 # after a literal backslash) still ends the word there; the run is read
-# whole, so a depth of writing out reads as the text it writes.
+# whole, so a depth of writing out reads as the text it writes. A YAML plain
+# scalar that starts with a literal backslash before a quote is no code
+# (round 12, ``_YAML_LITERAL_QUOTE``): the YAML rules, which know the depth
+# a line is written out at, ask that before this rule.
 # Where a text may be written out, a run before an ``n`` or an ``r`` is a
 # literal backslash and a letter only where the run is as long as one
 # literal backslash written out, one, two, four or eight backslashes; a run
@@ -772,8 +813,18 @@ _YAML_OPENING_BREAK = rf"(?:{_LINE_BREAK}|{_BREAK_PAIRS}(?P<ybs>\\{{1,7}})(?:r(?
 # quote, a quote behind ``ybs`` backslashes or more, the literal backslashes
 # before a line break (round 11, above), and a run of backslashes that is
 # neither the line break nor the start of the string's closing quote.
+#
+# The literal backslashes before the string's closing quote are the line's
+# too, and the quote ends it (#285 review, round 12): a value that ends in a
+# literal backslash ends in ``\\"`` in JSON, a literal backslash and the
+# closing quote, and the run was taken for a quote behind ``ybs``
+# backslashes, so the value took the closing quote and the JSON no longer
+# decoded. A run before a double quote holds literal backslashes first,
+# pairs of ``ybs``, and where the rest is fewer than ``ybs``, the quote
+# closes the string, as before a line break.
 _YAML_WRITTEN = (
-    r"(?:[^\\\"\r\n]|(?P=ybs)\\*+\"|(?:(?P=ybs)(?P=ybs))++(?=(?P=ybs)[nr])"
+    r"(?:[^\\\"\r\n]|(?:(?P=ybs)(?P=ybs))++(?=(?!(?P=ybs))\\*+\")"
+    r"|(?P=ybs)\\*+\"|(?:(?P=ybs)(?P=ybs))++(?=(?P=ybs)[nr])"
     r"|(?!(?P=ybs)[nr])\\++(?!\"))"
 )
 _YAML_UNIT = rf"(?(ybs){_YAML_WRITTEN}|[^\r\n])"
@@ -781,11 +832,33 @@ _YAML_EOL = rf"(?!{_YAML_UNIT})"
 _YAML_CHAR = rf"(?:(?![^\S\r\n]|:(?:[^\S\r\n]|{_YAML_EOL})){_YAML_UNIT})"
 _YAML_WORDS = rf"{_YAML_CHAR}++(?:[^\S\r\n]++(?!#){_YAML_CHAR}++)*+"
 _YAML_LINE_END = rf"(?=(?:[^\S\r\n]++#{_YAML_UNIT}*+)?[^\S\r\n]*+{_YAML_EOL})"
+# A plain scalar that starts with a literal backslash before a quote (#285
+# review, round 12): YAML reads no escape in a plain scalar, so
+# ``client_secret: \"FAKEfirst \"FAKEtail`` is one string that starts with a
+# backslash and a quote, but a quote behind backslashes was taken for one a
+# text written out writes, so for a quoted scalar's opening quote: the
+# scalar was no plain one, a quoted value was taken to the second ``\"``
+# and what follows it kept, in every sink, and a value written out three
+# deep read as code and was kept whole. Where the lines are written out
+# (``ybs``), the quote a YAML text holds stands behind one backslash fewer
+# than a literal backslash is written with (twice ``ybs``), and a literal
+# backslash before it behind that many more: a run of literal backslashes
+# (pairs of ``ybs``), then a double quote behind ``ybs`` backslashes or more
+# or a single quote, which JSON does not escape, behind any. A run that is
+# no such thing (``\"`` in JSON, a quote the text holds, or ``\\"``, a
+# literal backslash before the string's closing quote) is no literal one.
+# As written, a backslash before a quote is a literal one, a run of them too.
+# Such a scalar is plain, under a lower-case name no code (``_literal_checks``),
+# and no quoted scalar (``_YAML_QUOTE_GUARD``).
+_YAML_LITERAL_QUOTE = r"(?(ybs)(?:(?P=ybs)(?P=ybs))++(?:(?P=ybs)\\*+\"|\\*+')|\\++[\"'])"
 # What a plain scalar cannot start with, after its properties: another
 # node's indicator (a sequence's dash, a flow collection, a comment, a
 # block's header, an alias is none), a property its properties did not
 # take, a quote (a quoted scalar is matched as one), a code fence.
-_YAML_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_YAML_EOL})|[\[\]{{}},#&!|>%@`\"']|\\{{1,7}}+[\"']|~{{3}}"
+_YAML_NOT_PLAIN = (
+    rf"[-?:](?:[^\S\r\n]|{_YAML_EOL})|[\[\]{{}},#&!|>%@`\"']"
+    rf"|(?!{_YAML_LITERAL_QUOTE})\\{{1,7}}+[\"']|~{{3}}"
+)
 # Where a value's quote may open below its key in a text written out
 # (#285 review, round 8): a double quote behind at least as many backslashes
 # as the line break, as ``_YAML_WRITTEN`` reads one, or a single quote, which
@@ -794,6 +867,19 @@ _YAML_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_YAML_EOL})|[\[\]{{}},#&!|>%@`\"']|\\{{1
 # taken for a value's opening quote, so the text between that string and the
 # next was replaced and the JSON no longer parsed. As written, any quote.
 _YAML_QUOTE_GUARD = r"(?(ybs)(?=(?P=ybs)\\*+\"|\\*+'))"
+
+
+def _quote_guard(plain: str) -> str:
+    """Where a value below a key may open with a quote: as
+    ``_YAML_QUOTE_GUARD`` says, and, behind a literal backslash (round 12,
+    ``_YAML_LITERAL_QUOTE``), only where ``plain``, the rule's plain scalar,
+    is not there. Such a scalar is plain, and read as one; one that is no
+    plain scalar (it holds a mapping's ``: ``, a nested mapping's key to a
+    YAML parser) is read as a quoted value, as before, so that no value
+    loses less than it did."""
+    return rf"(?:(?!{_YAML_LITERAL_QUOTE})|(?!{plain})){_YAML_QUOTE_GUARD}"
+
+
 # Blank lines (a block's, before its first line), and blank lines and
 # comment lines (before a quoted or a plain scalar), each with its break.
 _YAML_BLANKS = rf"(?:[^\S\r\n]*+{_YAML_BREAK})*+"
@@ -1030,9 +1116,12 @@ def _literal_checks(literal_only: bool) -> tuple[str, str, str]:
     """
     if not literal_only:
         return "", "", ""
+    # A scalar that starts with a literal backslash before a quote is a
+    # literal (round 12, ``_YAML_LITERAL_QUOTE``), never code.
+    literal = rf"(?={_YAML_LITERAL_QUOTE})"
     return (
-        rf"(?(upper)|(?!{_CODE_VALUE}))",
-        rf"(?(upper)|(?!{_CODE_WORD}))",
+        rf"(?(upper)|(?:{literal}|(?!{_CODE_VALUE})))",
+        rf"(?(upper)|(?:{literal}|(?!{_CODE_WORD})))",
         rf"(?(upper)|(?!{_YAML_PLACEHOLDERS}))",
     )
 
@@ -1052,6 +1141,10 @@ def _yaml_value(
     """
     one_line, lines, block = _literal_checks(literal_only)
     first_break = _YAML_BREAK if explicit else _YAML_OPENING_BREAK
+    plain = (
+        rf"(?!{_YAML_NOT_PLAIN})"
+        rf"(?:{lines}{_YAML_PLAIN_LINE}{_YAML_PLAIN_MORE}++|{one_line}{_YAML_PLAIN_LINE})"
+    )
     rest = (
         rf"(?P<hdr>(?P<blk>[^\S\r\n]++{_BLOCK_HEADER})"
         rf"|[^\S\r\n]++{_YAML_PROPERTY}(?:[^\S\r\n]++{_YAML_PROPERTY})?)?"
@@ -1061,10 +1154,8 @@ def _yaml_value(
         rf"(?(blk){block}{_YAML_BLOCK_LINES}"
         rf"|(?P<vprops>{_YAML_NODE_PROPS})?"
         rf"(?:(?P<bhdr>{_YAML_BELOW_HEADER}){block}{_YAML_BLOCK_LINES}"
-        rf"|{_YAML_QUOTE_GUARD}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
-        r"(?P<close>(?:(?P=vbs)(?P=vq))?)"
-        rf"|(?!{_YAML_NOT_PLAIN})"
-        rf"(?:{lines}{_YAML_PLAIN_LINE}{_YAML_PLAIN_MORE}++|{one_line}{_YAML_PLAIN_LINE})))"
+        rf"|{_quote_guard(plain)}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
+        rf"(?P<close>(?:(?P=vbs)(?P=vq))?)|{plain}))"
     )
     template = r"\g<hdr>\g<gap>\g<blank>\g<vind>\g<vprops>\g<bhdr>\g<open>***REDACTED***\g<close>"
     if explicit:
@@ -1161,12 +1252,14 @@ def _yaml_explicit_line(name: str, names: str, name_hint: str, *, literal_only: 
     the separator, the space, the properties and the quotes stay."""
     one_line, lines, _ = _literal_checks(literal_only)
     more = rf"[^\S\r\n]*+{_YAML_BREAK}{_YAML_BLANKS}{_YAML_IND}{_YAML_PLAIN_LINE}"
+    plain = (
+        rf"(?!{_YAML_NOT_PLAIN})(?:{lines}{_YAML_FIRST_WORDS}{more}{_YAML_PLAIN_MORE}*+"
+        rf"|{one_line}{_YAML_FIRST_WORDS}{_YAML_FIRST_END})"
+    )
     rest = (
         rf"(?P<sp>[^\S\r\n]++(?:{_YAML_PROPS})?)"
-        rf"(?:{_YAML_QUOTE_GUARD}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
-        r"(?P<close>(?:(?P=vbs)(?P=vq))?)"
-        rf"|(?!{_YAML_NOT_PLAIN})(?:{lines}{_YAML_FIRST_WORDS}{more}{_YAML_PLAIN_MORE}*+"
-        rf"|{one_line}{_YAML_FIRST_WORDS}{_YAML_FIRST_END}))"
+        rf"(?:{_quote_guard(plain)}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
+        rf"(?P<close>(?:(?P=vbs)(?P=vq))?)|{plain})"
     )
     return _Pattern(
         name,
@@ -1226,7 +1319,7 @@ def _quoted_from_next_line(name: str, names: str, name_hint: str) -> _Pattern:
         rf"(?:{_ESCAPE}|(?<![A-Za-z0-9_]))(?P<kq>[\"'])?)"
         rf"(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+"
         rf"(?::[^\S\r\n]*+(?:{_YAML_PROPS})?|=[^\S\r\n]*+))"
-        r"(?P<open>(?P<vbs>)(?P<vq>[\"']))(?=[\r\n])"
+        r"(?P<open>(?:(?P<hbs>)(?!))?(?P<vbs>)(?P<vq>[\"']))(?=[\r\n])"
         r"(?=\s*+(?:(?P=vq)(?P=vq)|(?!(?P=vq))\S))"
         rf"(?:{_QUOTED_LINES}(?P<close>(?P=vq))"
         rf"|(?:\r\n?|\n)(?![^\S\r\n]*+(?:`{{3}}|~{{3}})){_QUOTED_LINE}(?!(?P=vq)))"
@@ -1488,6 +1581,7 @@ def _yaml_flow_value(name: str, names: str, name_hint: str, *, literal_only: boo
     indentation and the quotes stay; the value is replaced."""
     one_line, lines, _ = _literal_checks(literal_only)
     lower = rf"(?:{lines}{_FLOW_LINE}{_FLOW_MORE}++|{one_line}{_FLOW_LINE})"
+    plain = rf"(?!{_YAML_NOT_PLAIN}){_flow_plain(lower, literal_only)}"
     # A key with no value below it matches still where it read a comment
     # (round 9): what it read (group ``skip``), the comment on its line where
     # no line break follows (``kskip``), a comment in its lead (``xskip``).
@@ -1497,9 +1591,8 @@ def _yaml_flow_value(name: str, names: str, name_hint: str, *, literal_only: boo
         rf"(?P<gap>{_comment_seen('gcm')}[^\S\r\n]*+{_YAML_OPENING_BREAK})"
         rf"(?P<blank>{_lines_seen('bcm')})"
         rf"(?:{_FLOW_NOT_BLOCK}(?P<vind>[^\S\r\n]*+)(?P<vprops>{_FLOW_NODE_PROPS})?"
-        rf"(?:{_YAML_QUOTE_GUARD}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
-        r"(?P<close>(?:(?P=vbs)(?P=vq))?)"
-        rf"|(?!{_YAML_NOT_PLAIN}){_flow_plain(lower, literal_only)})"
+        rf"(?:{_quote_guard(plain)}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
+        rf"(?P<close>(?:(?P=vbs)(?P=vq))?)|{plain})"
         rf"|{_flow_read_comment('gcm', 'bcm')}(?P<skip>))"
         rf"|(?P<kskip>{_SKIP_PROPS}[^\S\r\n]++{_ANY_COMMENT}))|{_flow_xskip()})"
     )
@@ -1628,8 +1721,8 @@ def _yaml_flow_closed(name: str, names: str, name_hint: str, *, literal_only: bo
         rf"|(?(xk)|(?(below)|(?!))){one_line}{_FLOW_LINE}){_FLOW_CLOSED_END}"
     )
     quoted = (
-        rf"(?(xk){_YAML_QUOTE_GUARD}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
-        r"(?P<close>(?:(?P=vbs)(?P=vq))?)|(?!))"
+        rf"(?(xk){_quote_guard(rf'(?!{_YAML_NOT_PLAIN}){plain}')}{_VALUE_QUOTE}"
+        rf"(?:{_QUOTED_LINES}|{_QUOTED_LINE})(?P<close>(?:(?P=vbs)(?P=vq))?)|(?!))"
     )
     # A key with no value matches still where it read a comment (round 9):
     # what it read (group ``skip``), its comment and an explicit key's lines
@@ -1741,8 +1834,14 @@ _YAML_LINE_START_LEAD = (
     rf"{_LINE_KEY_LEAD})"
 )
 _LINE_K = r"(?(yqb)\\)(?P=cbs)"
+# The literal backslashes before the string's closing quote are the line's,
+# and the quote ends it (#285 review, round 12), as in ``_YAML_WRITTEN``: a
+# run before the string's quote holds literal backslashes first, pairs of one
+# more than ``_LINE_K``, and where the rest is no more than ``_LINE_K``, the
+# quote closes the string.
 _LINE_WRITTEN = (
     r"(?:[^\\\"'\r\n]"
+    rf"|(?:{_LINE_K}\\{_LINE_K}\\)++(?=(?!{_LINE_K}\\)\\*+(?(yq)(?P=yq)|\"))"
     rf"|{_LINE_K}\\\\*+[\"']"
     r"|\\*+(?(yq)(?!(?P=yq))|(?!\"))[\"']"
     rf"|(?:{_LINE_K}\\{_LINE_K}\\)++(?={_LINE_K}\\[nr])"
@@ -1754,7 +1853,21 @@ _LINE_EOL = rf"(?!{_LINE_UNIT})"
 _LINE_CHAR = rf"(?:(?![^\S\r\n]|:(?:[^\S\r\n]|{_LINE_EOL})){_LINE_UNIT})"
 _LINE_WORDS = rf"{_LINE_CHAR}++(?:[^\S\r\n]++(?!#){_LINE_CHAR}++)*+"
 _LINE_END = rf"(?=(?:[^\S\r\n]++#{_LINE_UNIT}*+)?[^\S\r\n]*+{_LINE_EOL})"
-_LINE_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_LINE_EOL})|[\[\]{{}},#&!|>%@`\"']|\\{{1,7}}+[\"']|~{{3}}"
+# A literal backslash before a quote at the scalar's start (#285 review,
+# round 12, ``_YAML_LITERAL_QUOTE``), on a line written out: a run of
+# literal backslashes, each written as twice the string's closing quote's
+# backslashes and two more, then a quote of the string's kind behind more
+# backslashes than its closing quote, as ``_LINE_WRITTEN`` reads one, or the
+# other quote behind any. As written, a backslash before a quote is a
+# literal one. Such a scalar is plain, and no code under a lower-case name.
+_LINE_LITERAL_QUOTE = (
+    rf"(?(cbs)(?:{_LINE_K}\\{_LINE_K}\\)++"
+    rf"(?:{_LINE_K}\\\\*+[\"']|\\*+(?(yq)(?!(?P=yq))|(?!\"))[\"'])|\\++[\"'])"
+)
+_LINE_NOT_PLAIN = (
+    rf"[-?:](?:[^\S\r\n]|{_LINE_EOL})|[\[\]{{}},#&!|>%@`\"']"
+    rf"|(?!{_LINE_LITERAL_QUOTE})\\{{1,7}}+[\"']|~{{3}}"
+)
 # More than the name's rule takes: a second word, or a character that ends
 # its word, after the first, each read as the scalar's characters are, so a
 # quote that closes the string and a line break written out are none
@@ -1811,14 +1924,15 @@ _LINE_HINT_TAIL = _line_hint_tail(_LINE_MORE_CHARS)
 # where its backslashes are counted. A lower-case name's scalar must not read
 # as code, a word ending where no backslash goes on (``_AS_IS_CODE``), and
 # the hint holds any backslash after the first word. Each candidate reads its
-# line at most twice.
+# line at most twice. A backslash before a quote is the scalar's too, at its
+# start as well (round 12, ``_YAML_LITERAL_QUOTE``): read as is, no quote is
+# written out, so such a scalar is plain and no code (``_AS_IS_LITERAL_QUOTE``).
 _LINE_AS_IS_EOL = r"(?![^\r\n])"
 _LINE_AS_IS_CHAR = rf"(?:(?![^\S\r\n]|:(?:[^\S\r\n]|{_LINE_AS_IS_EOL}))[^\r\n])"
 _LINE_AS_IS_WORDS = rf"{_LINE_AS_IS_CHAR}++(?:[^\S\r\n]++(?!#){_LINE_AS_IS_CHAR}++)*+"
 _LINE_AS_IS_END = rf"(?=(?:[^\S\r\n]++#[^\r\n]*+)?[^\S\r\n]*+{_LINE_AS_IS_EOL})"
-_LINE_AS_IS_NOT_PLAIN = (
-    rf"[-?:](?:[^\S\r\n]|{_LINE_AS_IS_EOL})|[\[\]{{}},#&!|>%@`\"']|\\{{1,7}}+[\"']|~{{3}}"
-)
+_LINE_AS_IS_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_LINE_AS_IS_EOL})|[\[\]{{}},#&!|>%@`\"']|~{{3}}"
+_AS_IS_LITERAL_QUOTE = r"(?=\\++[\"'])"
 _LINE_AS_IS_MORE_CHARS = r"[^\s\"'`;&\\]*+(?:[^\S\r\n]++[^\s#]|[\"'`;&\\])"
 _AS_IS_WORD_END = rf"{_TRAIL}*+(?![^\s\"'`;&])"
 _AS_IS_CODE_WORD = _code_word(_AS_IS_WORD_END, _AS_IS_LITERAL_RUN)
@@ -1830,8 +1944,12 @@ def _yaml_line(name: str, names: str, name_hint: str, *, literal_only: bool) -> 
     :func:`_yaml_value`. The lead, the key, its separator, the space and the
     properties stay, and one marker replaces the scalar; a comment after it
     stays. A line as written is read as is first (above)."""
-    code = rf"(?(upper)|(?!{_CODE_WORD}|{_CODE_NUMBER}{_LINE_END}))" if literal_only else ""
-    as_is_code = rf"(?(upper)|{_AS_IS_CODE})" if literal_only else ""
+    code = (
+        rf"(?(upper)|(?:(?={_LINE_LITERAL_QUOTE})|(?!{_CODE_WORD}|{_CODE_NUMBER}{_LINE_END})))"
+        if literal_only
+        else ""
+    )
+    as_is_code = rf"(?(upper)|(?:{_AS_IS_LITERAL_QUOTE}|{_AS_IS_CODE}))" if literal_only else ""
     as_is = (
         rf"(?(cbs)(?!)|(?={_LINE_AS_IS_MORE_CHARS}){_line_more(_LINE_AS_IS_CHAR)}"
         rf"(?!{_LINE_AS_IS_NOT_PLAIN}){as_is_code}{_LINE_AS_IS_WORDS}{_LINE_AS_IS_END})"
@@ -1862,12 +1980,37 @@ def _yaml_line(name: str, names: str, name_hint: str, *, literal_only: bool) -> 
 # collection whose ``}`` an upper-case name's value took): taken with the
 # value, it left the JSON undecodable (``_FLOW_LINE_CHAR``). A quote that a
 # word follows is the scalar's (``{CLIENT_SECRET: FAKE"tail}``).
+#
+# A scalar that starts with a literal backslash before a quote (#285 review,
+# round 12, ``_YAML_LITERAL_QUOTE``; group ``lq``) is in such a string, if
+# it is in one, and its first quote is one the string holds: JSON writes the
+# string's closing quote behind fewer than half as many backslashes as any
+# quote it holds, a double quote behind none, one, three or seven, and a
+# single quote, which it does not escape, behind none. So a quote closes the
+# string only behind none, or behind one, three or seven where the scalar's
+# first run is at least three, seven or fifteen long (groups ``lq3``,
+# ``lq7`` and ``lq15``), at the start of its run; any other is the scalar's,
+# whatever follows it. ``{CLIENT_SECRET: \"FAKE\", region: r}`` written out
+# three deep, where no name's rule reads the run of fifteen backslashes,
+# ended its scalar at the first backslash of its last run, before the
+# ``,``, and the rule failed. A scalar that is its quotes and a marker alone
+# (``\"***REDACTED***\"``, a quoted value the name's rule replaced, which
+# JSON writes so too) is no match (``_FLOW_LITERAL_LONE``).
 _FLOW_LINE_CLOSE = (
     rf"(?=[^\S\r\n]*+(?:{_FLOW_INDICATOR}|[\r\n]|(?(ybs)(?P=ybs)[nr]|(?!))|(?<![\"'])\Z)"
     r"|[^\S\r\n]++#)"
 )
 _FLOW_STRING_END = r"\\*+[\"'](?=[^\S\r\n]*+(?:[,\]}:\r\n]|\Z))"
-_FLOW_LINE_CHAR = rf"(?:(?(ybs)|(?!{_FLOW_STRING_END})){_FLOW_WORD_CHAR})"
+_FLOW_LITERAL_LEAD = (
+    r"(?:(?=\\++[\"'])(?P<lq>)(?P<lq3>(?=\\{3})(?P<lq7>(?=\\{7})(?P<lq15>(?=\\{15}))?)?)?)?"
+)
+_FLOW_LQ_STRING_END = (
+    r"(?<!\\)(?:(?:(?(lq15)\\{7}|(?!))|(?(lq7)\\{3}|(?!))|(?(lq3)\\|(?!)))\"|[\"'])"
+    r"(?=[^\S\r\n]*+(?:[,\]}:\r\n]|\Z))"
+)
+_FLOW_SCALAR_STRING_END = rf"(?(lq){_FLOW_LQ_STRING_END}|{_FLOW_STRING_END})"
+_FLOW_LITERAL_LONE = rf"(?(ybs)|(?(lq)(?!\\++[\"']{_MARKER}\\++[\"']{_FLOW_LINE_CLOSE})))"
+_FLOW_LINE_CHAR = rf"(?:(?(ybs)|(?!{_FLOW_SCALAR_STRING_END})){_FLOW_WORD_CHAR})"
 _FLOW_LINE_WORDS = rf"{_FLOW_LINE_CHAR}++(?:[^\S\r\n]++(?!#){_FLOW_LINE_CHAR}++)*+"
 # The same line read as is (#285 review, round 11), where it is not read as
 # above: a line break written out after the scalar's first word sets
@@ -1883,7 +2026,7 @@ _FLOW_LINE_WORDS = rf"{_FLOW_LINE_CHAR}++(?:[^\S\r\n]++(?!#){_FLOW_LINE_CHAR}++)
 _FLOW_SHALLOW_QUOTE = r"(?<!\\)(?!(?P=ybs))\\*+\"(?![^\S\r\n]*+(?:[,\]}:\r\n]|\Z))"
 _FLOW_AS_IS_CHAR = (
     rf"(?:(?![^\S\r\n]|{_FLOW_WORD_STOP}|:(?:[^\S\r\n]|{_FLOW_INDICATOR}|{_LINE_AS_IS_EOL})"
-    rf"|{_FLOW_STRING_END})[^\r\n])"
+    rf"|{_FLOW_SCALAR_STRING_END})[^\r\n])"
 )
 _FLOW_AS_IS_WORDS = rf"{_FLOW_AS_IS_CHAR}++(?:[^\S\r\n]++(?!#){_FLOW_AS_IS_CHAR}++)*+"
 _FLOW_AS_IS_END = rf"(?=[^\S\r\n]*+(?:{_FLOW_INDICATOR}|#|{_LINE_AS_IS_EOL}))"
@@ -1913,14 +2056,20 @@ def _yaml_flow_line(name: str, names: str, name_hint: str, *, literal_only: bool
     indicator bounds the scalar where none follows. The lead, the key, its
     separator, the space and the properties stay, and so do the indicator
     and what follows it."""
-    code = rf"(?(upper)|(?!{_CODE_WORD}|{_NUMBER}{_FLOW_LINE_END}))" if literal_only else ""
+    code = (
+        rf"(?(upper)|(?:(?={_YAML_LITERAL_QUOTE})|(?!{_CODE_WORD}|{_NUMBER}{_FLOW_LINE_END})))"
+        if literal_only
+        else ""
+    )
     as_is_code = (
-        rf"(?(upper)|(?!{_AS_IS_CODE_WORD}|{_NUMBER}{_FLOW_AS_IS_END}))" if literal_only else ""
+        rf"(?(upper)|(?:{_AS_IS_LITERAL_QUOTE}|(?!{_AS_IS_CODE_WORD}|{_NUMBER}{_FLOW_AS_IS_END})))"
+        if literal_only
+        else ""
     )
     regex = (
         rf"{_FLOW_START}(?:{_FLOW_LEAD}(?P<name>{names})"
         rf"(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:[^\S\r\n]++(?:{_YAML_PROPS})?)"
-        rf"(?>(?:{_YAML_FIRST_BREAK})?)"
+        rf"(?>(?:{_YAML_FIRST_BREAK})?){_FLOW_LITERAL_LEAD}{_FLOW_LITERAL_LONE}"
         rf"(?:(?={_LINE_MORE_CHARS}){_line_more(_FLOW_LINE_CHAR)}"
         rf"(?!{_YAML_NOT_PLAIN}){code}"
         rf"{_FLOW_LINE_WORDS}{_FLOW_LINE_CLOSE}"

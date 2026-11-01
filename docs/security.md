@@ -233,7 +233,8 @@ quoted value, also one that spans lines whatever they hold or starts with
 a line break, or an unquoted word of any characters that does not read as
 code, on the name's line (under a YAML key the plain scalar on its line
 whole, its words, quotes, semicolons and literal backslashes with it, a
-backslash before an `n` or an `r` too, to the line's end or a comment, in a
+backslash before an `n` or an `r` too, one before a quote at its start too
+(`client_secret: \"a \"b`), to the line's end or a comment, in a
 flow collection to the indicator that ends it, a `,` that the next entry
 follows with no space included, where the next entry stays) or, under a
 YAML key, on the lines below it (an indented scalar past blank and comment
@@ -263,10 +264,8 @@ unquoted value with spaces on the name's line where the name stands as no
 YAML key (a log line's `Error: client_secret: two words`, an INI file's
 `DB_PASSWORD = two words`) and what follows a quote inside one (as a YAML
 key's plain scalar, quoted, below the key or going on below it, it is taken
-whole), a YAML plain scalar that starts with a literal backslash before a
-quote (`client_secret: \"a \"b`, which reads as a value JSON quotes), the
-lines after the first of a quoted value whose name stands right after a
-quote or a backtick (inside a string literal or a Markdown code span), a
+whole), the lines after the first of a quoted value whose name stands right
+after a quote or a backtick (inside a string literal or a Markdown code span), a
 quoted value that starts with a line break where its name stands inside a
 string its line opens, a quoted value on the line below an `=` in JSON
 text (`"DB_PASSWORD=\n  'x'"`), a YAML block whose lines a NEL, LS or PS

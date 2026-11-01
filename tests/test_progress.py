@@ -49,6 +49,7 @@ from tests.conftest import (
     WHOLE_VALUES_285_R9,
     WHOLE_VALUES_285_R10,
     WHOLE_VALUES_285_R11,
+    WHOLE_VALUES_285_R12,
     analyze_payload,
     block,
     commit_in,
@@ -269,6 +270,26 @@ def test_an_event_whose_input_holds_an_eleventh_285_review_value_shows_none_of_i
     an ``n``, an ``r`` or a letter, reached a live progress line, as text and
     as JSON one, two and three deep. ``clean`` and an event's detail show
     none of it now."""
+    written = text
+    for _ in range(depth):
+        written = json.dumps(written)
+    shown = clean(written, MAX_LINE_CHARS)
+    assert body not in shown and "FAKE" not in shown
+    event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Write", detail=written)
+    assert body not in event.detail and "FAKE" not in event.detail
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [(text, body) for _, _, text, body in WHOLE_VALUES_285_R12],
+    ids=[name for name, _, _, _ in WHOLE_VALUES_285_R12],
+)
+def test_an_event_whose_input_holds_a_twelfth_285_review_value_shows_none_of_it(text, body, depth):
+    """#285 review, round 12: a plain scalar that starts with a literal
+    backslash before a quote reached a live progress line after its second
+    such quote, as text and as JSON one and two deep, and whole three deep.
+    ``clean`` and an event's detail show none of it now."""
     written = text
     for _ in range(depth):
         written = json.dumps(written)
