@@ -330,10 +330,16 @@ High-priority coverage includes:
   characters gives one printable, bounded line each, with a labelled
   placeholder in the recovery command. A namespace state of a newer
   protocol is held as uncertain with the controller named and no `epic
-  archive` advice, a worker refuses one unchanged, and a standalone one,
+  archive` advice, one of a label no protocol has (`'6'`, `'14.0'`, the
+  number 14) says no controller reads it, with neither `epic archive` nor
+  a repair by hand, in `epic status` and `epic status --json` alike, a
+  worker refuses one unchanged, and a standalone one,
   newer or of no protocol, makes `epic run` and `epic resume` admit
   nothing at all (exit 1, no namespace, claim or worker), which the dry
   run and `epic status` report, until it is a state this controller reads;
+  a configured standalone directory holding a newline and an escape, or
+  longer than 1024 characters, is one printable, bounded line in the
+  scheduler's output, `epic status` (human and JSON) and the dry run;
   `doctor`'s `controller` row reads no state
 - the state pins of LOCAL's removal (ADR 0009 D4, D8, D12 S1b; #385;
   `tests/test_state.py`, `tests/test_replan.py`, `tests/test_cli.py`,

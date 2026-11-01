@@ -716,7 +716,13 @@ takes L1:
   reads it may be continuing it, so `StandaloneHold.blocks_admission` makes
   the scheduler admit nothing at all: global uncertainty (D14.3), admission
   `degraded`, exit 1, before the first snapshot, with no claim, namespace
-  or worker; `epic run --dry-run` and `epic status` say so.
+  or worker; `epic run --dry-run` and `epic status` say so. Every report of
+  the standalone state (the scheduler's lines, `epic status`'s problems
+  and held row, the dry run's plan) names its file by
+  `StandaloneHold.shown_state_file` (`provenance.shown_path`), and the
+  hold's `problem` is the loader's message through `provenance.shown`, so
+  each is one printable, bounded line whatever the configured directory
+  holds (#265 R2-F1).
 
 ---
 
@@ -952,9 +958,13 @@ workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
   redacted, bounded reason: unparseable or past the decoder's limits
   (`load_state` reports both as corruption), an unknown protocol, not a
   regular file, reached through a link) and whether `claim.json` exists. A
-  corrupt state of a newer controller's protocol also carries that label
+  corrupt state refused for its protocol label carries the label's class
+  (`NamespaceState.refused_protocol`, `unsupported-newer` or
+  `unsupported-unknown`) and, for a newer one, the label
   (`NamespaceState.newer_protocol`, #265), so `epic status` points at a
-  controller that speaks it instead of `epic archive`. A corrupt
+  controller that speaks a newer label, says that no controller reads a
+  label no protocol has, and offers neither `epic archive` nor a repair by
+  hand for either (#265 R2-F2). A corrupt
   state is reported for its own namespace only; a corrupt binding raises,
   for that namespace only.
 - **Enumeration** (`list_issue_namespaces`) lists the issue directories

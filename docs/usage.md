@@ -1444,8 +1444,13 @@ edit of it, and does not set it aside for you.
 the controller's import path, admit nothing for it and continue with the
 other issues; `epic status` shows the row as
 `uncertain(state-corrupt)` (exit 1), says that a controller speaking the
-newer protocol reads and continues it, and offers no `epic archive`. A
-worker that finds one exits 2 before its first step.
+newer protocol reads and continues it, and offers no `epic archive`. For
+a label no protocol has, the row says so instead, asks you to check that
+the controller it names, the checkout and the `--config` are the ones
+you meant, and offers no `epic archive` or repair either: as for a
+standalone state, neither an edit nor setting the state aside continues
+the run (the paragraph above). A worker that finds one exits 2 before its
+first step.
 
 **As the configured standalone state** (`config.state_dir`), it stops
 the scheduler from admitting anything. A standalone state this controller
@@ -1457,7 +1462,11 @@ the standalone state <path> is of a protocol this controller does not
 read, ...` and exit 1 (`degraded`) before the first snapshot: no issue is
 admitted, claimed or started, the issue that run names or any other.
 `epic run --dry-run` says `'epic run' would admit nothing`, and `epic
-status` reports it as a problem (exit 1). For a newer label, use a
+status` reports it as a problem (exit 1). Each of these names the state
+file as the diagnostic above does: redacted, escaped when it holds a
+character that is not printable and cut at 1024 characters, so a
+configured `state_dir` holding a newline or an escape sequence gives one
+visibly odd line, never a forged or coloured one. For a newer label, use a
 controller that speaks that protocol for the `epic` commands, from the
 same checkout and with the same `--config`: it reads the standalone state
 and holds only its issue. For a label no protocol has, see the paragraph

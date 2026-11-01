@@ -107,7 +107,7 @@ from .locking import (
     check_local_lock_filesystem,
     repository_lock_path,
 )
-from .ownership import admission_refusal, standalone_hold
+from .ownership import admission_refusal, standalone_hold, unreadable_report
 from .redaction import redact
 from .run_namespace import (
     WORKERS_DIRNAME,
@@ -552,7 +552,8 @@ class EpicScheduler:
         state_dir = self.inputs.standalone_state_dir or os.path.abspath(self.config.state_dir)
         hold = standalone_hold(state_dir)
         if hold.problem:
-            self.say(f"the standalone state {hold.state_file} cannot be read: {hold.problem}")
+            # The path as every report shows it, never as configured (#265 R2-F1).
+            self.say(unreadable_report(hold))
         refusal = admission_refusal(hold)
         if refusal:
             self.say(
@@ -573,8 +574,8 @@ class EpicScheduler:
         if same:
             self._held.setdefault(hold.issue_number, LocalFact.HELD_STANDALONE_STATE)
             self.say(
-                f"issue #{hold.issue_number} is held: the standalone state {hold.state_file} "
-                f"runs it (phase {hold.phase})"
+                f"issue #{hold.issue_number} is held: the standalone state "
+                f"{hold.shown_state_file} runs it (phase {hold.phase})"
             )
         return True
 

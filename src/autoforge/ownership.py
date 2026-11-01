@@ -54,7 +54,7 @@ from .errors import (
     StateProtocolError,
 )
 from .locking import issue_run_lock_live
-from .provenance import shown_path
+from .provenance import shown, shown_path
 from .redaction import redact
 from .run_namespace import StateStatus, issue_namespace, load_issue_namespace
 from .safefs import SafeRoot
@@ -73,6 +73,18 @@ def _bounded(text: str) -> str:
         return text
     marker = " [... truncated]"
     return text[: MAX_REASON_CHARS - len(marker)] + marker
+
+
+def _shown_reason(text: str) -> str:
+    """A loader's message about the standalone state, as :attr:`StandaloneHold.problem` keeps it.
+
+    Redacted, then escaped as one printable line when it holds a character
+    that is not printable, then bounded (:func:`~autoforge.provenance.shown`):
+    a loader's message names the state file as the process has it, and the
+    configured directory may hold a newline or an escape sequence (#265
+    R2-F1).
+    """
+    return shown(text, MAX_REASON_CHARS)
 
 
 def scheduler_ownership(coordination_root: str | Path, issue_number: int) -> str:
@@ -190,9 +202,12 @@ class StandaloneHold:
     """What the configured standalone state holds against a scheduler admission.
 
     ``issue_number`` (with ``issue_url`` and ``phase``) is set when the state
-    names an issue in a phase other than ``DONE``; ``problem`` (redacted and
-    bounded) when the state exists but cannot be read, which holds nothing
-    and is reported. ``refused_protocol`` is set, besides ``problem``, when
+    names an issue in a phase other than ``DONE``; ``problem`` (redacted, one
+    printable line and bounded: :func:`~autoforge.provenance.shown`) when
+    the state exists but cannot be read, which holds nothing and is
+    reported. ``state_file`` is the path as the process has it, a fact that
+    is not safe to print as it is: every report names it by
+    :attr:`shown_state_file` (#265 R2-F1). ``refused_protocol`` is set, besides ``problem``, when
     what refused it is its ``protocol_version`` (#265): the
     :class:`~autoforge.state.ProtocolSupport` value, ``unsupported-newer``
     or ``unsupported-unknown``, with ``newer_protocol`` the newer label, a
@@ -212,6 +227,19 @@ class StandaloneHold:
         return self.issue_number is not None
 
     @property
+    def shown_state_file(self) -> str:
+        """``state_file`` as a report shows it (#265 R2-F1).
+
+        Redacted, escaped as one printable line when it holds a character
+        that is not printable (a newline, an escape sequence), and cut past
+        :data:`~autoforge.provenance.MAX_PATH_CHARS`, in that order
+        (:func:`~autoforge.provenance.shown_path`): the directory is the
+        operator's configuration, and no character of it may forge or
+        colour a line of the scheduler's output.
+        """
+        return shown_path(str(self.state_file))
+
+    @property
     def blocks_admission(self) -> bool:
         """Whether no issue may be admitted while this state is there (#265 R1-F1).
 
@@ -222,6 +250,19 @@ class StandaloneHold:
         that was refused, so every admission is refused instead.
         """
         return bool(self.refused_protocol)
+
+
+def unreadable_report(hold: StandaloneHold) -> str:
+    """The line reporting that ``hold``'s state cannot be read; ``""`` when nothing is wrong.
+
+    The one rendering of the problem every scheduler report prints (``epic
+    run`` and ``epic resume``, ``epic status`` and ``epic run --dry-run``):
+    the path is :attr:`StandaloneHold.shown_state_file` and the problem is
+    already one printable line, so the whole line is (#265 R2-F1).
+    """
+    if not hold.problem:
+        return ""
+    return f"the standalone state {hold.shown_state_file} cannot be read: {hold.problem}"
 
 
 def admission_refusal(hold: StandaloneHold) -> str:
@@ -248,7 +289,7 @@ def admission_refusal(hold: StandaloneHold) -> str:
             "'A run a newer controller wrote' in docs/usage.md"
         )
     return (
-        f"the standalone state {shown_path(str(hold.state_file))} is of a protocol this "
+        f"the standalone state {hold.shown_state_file} is of a protocol this "
         "controller does not read, so the issue its run holds is unknown and no issue is "
         f"admitted while it is there; {then}"
     )
@@ -274,7 +315,7 @@ def standalone_hold(state_dir: str | Path) -> StandaloneHold:
     except FileNotFoundError:
         return StandaloneHold(state_file)
     except (StateError, OSError) as exc:
-        return StandaloneHold(state_file, problem=_bounded(str(exc)))
+        return StandaloneHold(state_file, problem=_shown_reason(str(exc)))
     with root:
         try:
             if root.lstat(STATE_FILENAME) is None:
@@ -290,11 +331,11 @@ def standalone_hold(state_dir: str | Path) -> StandaloneHold:
             if isinstance(exc, StateProtocolError):
                 return StandaloneHold(
                     state_file,
-                    problem=_bounded(str(exc)),
+                    problem=_shown_reason(str(exc)),
                     refused_protocol=exc.support,
                     newer_protocol=exc.newer,
                 )
-            return StandaloneHold(state_file, problem=_bounded(str(exc)))
+            return StandaloneHold(state_file, problem=_shown_reason(str(exc)))
     if state.phase is Phase.DONE:
         return StandaloneHold(state_file, phase=state.phase.value)
     if not state.current_issue_url:
@@ -302,7 +343,7 @@ def standalone_hold(state_dir: str | Path) -> StandaloneHold:
     try:
         ref = parse_issue_url(state.current_issue_url)
     except ConfigurationError as exc:
-        return StandaloneHold(state_file, phase=state.phase.value, problem=_bounded(str(exc)))
+        return StandaloneHold(state_file, phase=state.phase.value, problem=_shown_reason(str(exc)))
     return StandaloneHold(
         state_file,
         issue_number=ref.number,

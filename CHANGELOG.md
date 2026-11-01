@@ -35,8 +35,13 @@ so.
   reason still holds nothing and is reported.
 - `epic status` shows a namespace state of a newer protocol as
   `uncertain(state-corrupt)` as before, but points at a controller that
-  speaks it instead of `epic archive`; the scheduler's and a worker's
-  messages name the refusing controller.
+  speaks it instead of `epic archive`, and one of a label no protocol has
+  says that no controller reads it, with neither `epic archive` nor a
+  repair by hand; the scheduler's and a worker's messages name the
+  refusing controller.
+- The scheduler's lines, `epic status` and `epic run --dry-run` name the
+  configured standalone state file redacted, on one printable line and
+  bounded, as the CLI's diagnostic does.
 - `doctor` has a first row, `controller`: the code a command line runs and
   the state protocols it reads. It never fails.
 - [Running the remote workflow](docs/usage.md#a-run-a-newer-controller-wrote)

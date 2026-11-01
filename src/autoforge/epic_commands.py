@@ -71,7 +71,12 @@ from .errors import (
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .git_transport import local_git_request
 from .locking import IssueRunLock, issue_run_lock_live, repository_lock_path
-from .ownership import StandaloneHold, admission_refusal, standalone_hold
+from .ownership import (
+    StandaloneHold,
+    admission_refusal,
+    standalone_hold,
+    unreadable_report,
+)
 from .redaction import redact, redact_dict
 from .run_namespace import (
     EpicRef,
@@ -483,19 +488,35 @@ def categorize(
         return row(Category.RUNNING, detail)
     if facts.unidentified:
         return row(Category.UNCERTAIN, facts.unidentified, problem=facts.unidentified)
-    newer = facts.lookup.state.newer_protocol if facts.lookup is not None else ""
+    refused = facts.lookup.state if facts.lookup is not None else None
     if (
         classification is not None
         and classification.uncertain is UncertainReason.STATE_CORRUPT
-        and newer
+        and refused is not None
+        and refused.refused_protocol
     ):
-        # A newer controller's state (#265): it continues the run, so neither
-        # setting the state aside nor repairing it is advice here.
+        # A state refused for its protocol label alone (#265) is not damage:
+        # neither setting it aside nor repairing it continues the run, so
+        # neither is advice here, and no next step is offered.
+        if refused.newer_protocol:
+            then = (
+                f"a controller that speaks protocol {refused.newer_protocol} reads and "
+                "continues it ('epic status' and 'epic resume' with that controller, from "
+                "this checkout); leave the namespace as it is"
+            )
+        else:
+            # R2-F2: a label no protocol has names no controller to use.
+            then = (
+                "no AutoForge protocol has its label, so no controller reads it as it is and "
+                "this one cannot tell which wrote it: check that the controller named above "
+                "is the one you meant, and this checkout and --config the ones the run was "
+                "started with. Leave the namespace as it is: neither an edit nor setting the "
+                "state aside continues the run (see 'A run a newer controller wrote' in "
+                "docs/usage.md)"
+            )
         return row(
             Category.UNCERTAIN,
-            f"{classification}: {classification.detail}; a controller that speaks protocol "
-            f"{newer} reads and continues it ('epic status' and 'epic resume' with that "
-            "controller, from this checkout); leave the namespace as it is",
+            f"{classification}: {classification.detail}; {then}",
             problem=f"{classification}: {classification.detail}",
         )
     if classification is not None and classification.kind is ClassificationKind.UNCERTAIN:
@@ -580,7 +601,7 @@ def categorize(
         hold = facts.standalone
         return row(
             Category.HELD,
-            f"the standalone state {hold.state_file} runs it (phase {hold.phase}): finish it "
+            f"the standalone state {hold.shown_state_file} runs it (phase {hold.phase}): finish it "
             "with the standalone commands; the scheduler admits the issue once that run is DONE",
             hold_reason=HoldReason.STANDALONE_STATE,
         )
@@ -946,11 +967,8 @@ def _standalone(state_dir: str | Path, repository: str) -> tuple[StandaloneHold 
     """
     hold = standalone_hold(state_dir)
     if hold.problem:
-        return (
-            None,
-            f"the standalone state {hold.state_file} cannot be read: {hold.problem}",
-            admission_refusal(hold),
-        )
+        # The path as every report shows it, never as configured (#265 R2-F1).
+        return None, unreadable_report(hold), admission_refusal(hold)
     if hold.holds and _same_repository(hold.issue_url, repository):
         return hold, "", ""
     return None, "", ""

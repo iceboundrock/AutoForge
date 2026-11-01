@@ -503,14 +503,20 @@ class NamespaceState:
     ``state`` is set when :attr:`status` is ``LOADED``; ``reason`` (redacted
     and bounded) when it is ``CORRUPT``: unreadable, unparseable, of an
     unknown protocol, not a regular file, or reached through a link.
-    ``newer_protocol`` is the label of a ``CORRUPT`` state a newer
-    controller wrote (#265), ``""`` otherwise: still corrupt to this
-    controller, and continued by that one.
+    ``refused_protocol`` is set on a ``CORRUPT`` state refused for its
+    ``protocol_version`` alone (#265): the
+    :class:`~autoforge.state.ProtocolSupport` value, ``unsupported-newer``
+    or ``unsupported-unknown``, ``""`` for any other reason. Such a state is
+    still corrupt to this controller, but it is not damage to repair or set
+    aside: ``newer_protocol`` is the label of one a newer controller wrote,
+    which that controller continues, ``""`` otherwise; one of a label no
+    protocol has is read by no controller as it is (#265 R2-F2).
     """
 
     status: StateStatus
     state: AutoForgeState | None = None
     reason: str = ""
+    refused_protocol: str = ""
     newer_protocol: str = ""
 
 
@@ -651,7 +657,10 @@ def _read_state(issue_root: SafeRoot, namespace: IssueNamespace) -> NamespaceSta
         return NamespaceState(StateStatus.ABSENT)
     except StateProtocolError as exc:
         return NamespaceState(
-            StateStatus.CORRUPT, reason=_bounded_reason(str(exc)), newer_protocol=exc.newer
+            StateStatus.CORRUPT,
+            reason=_bounded_reason(str(exc)),
+            refused_protocol=exc.support,
+            newer_protocol=exc.newer,
         )
     except StateError as exc:
         return NamespaceState(StateStatus.CORRUPT, reason=_bounded_reason(str(exc)))
