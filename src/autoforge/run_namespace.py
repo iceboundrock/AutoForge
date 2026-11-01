@@ -59,7 +59,14 @@ from enum import Enum
 from pathlib import Path
 from typing import NoReturn
 
-from .errors import NamespaceError, NamespaceMismatch, SchedulerStateDirError, StateError
+from .errors import (
+    NamespaceError,
+    NamespaceMismatch,
+    SchedulerStateDirError,
+    StateError,
+    StateProtocolError,
+)
+from .provenance import refusal_report
 from .redaction import redact
 from .safefs import ReadLimitExceeded, SafeRoot, WalkBudgetExceeded, entry_kind
 from .state import (
@@ -98,7 +105,8 @@ MAX_REPOSITORY_NAME_CHARS = 100  # GitHub's limit on a repository name
 MAX_WORKTREE_PATH_CHARS = 4096  # PATH_MAX
 MAX_TIMESTAMP_CHARS = 32  # utcnow_iso(): 2026-01-01T00:00:00.000000+00:00
 # The reason a namespace's state could not be loaded, as reported: redacted,
-# then bounded, because it quotes the state loader's message.
+# then bounded, because it quotes the state loader's message. A refusal of
+# its protocol label has a budget of its own (provenance.MAX_REFUSAL_CHARS).
 MAX_STATE_REASON_CHARS = 2000
 # A binding's refusal quotes the file only this far: at most this many
 # unknown field names (each cut to 80 characters), and an out-of-range id
@@ -497,11 +505,26 @@ class NamespaceState:
     ``state`` is set when :attr:`status` is ``LOADED``; ``reason`` (redacted
     and bounded) when it is ``CORRUPT``: unreadable, unparseable, of an
     unknown protocol, not a regular file, or reached through a link.
+    ``refused_protocol`` is set on a ``CORRUPT`` state refused for its
+    ``protocol_version`` alone (#265): the
+    :class:`~autoforge.state.ProtocolSupport` value, ``unsupported-newer``
+    or ``unsupported-unknown``, ``""`` for any other reason. Such a state is
+    still corrupt to this controller, but it is not damage to repair or set
+    aside: ``newer_protocol`` is the label of one a newer controller wrote,
+    which that controller continues, ``""`` otherwise; one of a label no
+    protocol has is read by no controller as it is (#265 R2-F2). Its
+    ``reason`` is :func:`~autoforge.provenance.refusal_report`'s: the
+    refusal and the refusing controller's protocol, import path and
+    interpreter first, the state file last, each bounded on its own and the
+    whole under :data:`~autoforge.provenance.MAX_REFUSAL_CHARS`, never cut
+    to :data:`MAX_STATE_REASON_CHARS` (#265 R3-F1).
     """
 
     status: StateStatus
     state: AutoForgeState | None = None
     reason: str = ""
+    refused_protocol: str = ""
+    newer_protocol: str = ""
 
 
 @dataclass(frozen=True)
@@ -639,6 +662,15 @@ def _read_state(issue_root: SafeRoot, namespace: IssueNamespace) -> NamespaceSta
     except FileNotFoundError:
         # The state directory went away between the lstat and the open.
         return NamespaceState(StateStatus.ABSENT)
+    except StateProtocolError as exc:
+        # Not the path-first message cut to MAX_STATE_REASON_CHARS: a long
+        # coordination root would crowd the controller out of it (#265 R3-F1).
+        return NamespaceState(
+            StateStatus.CORRUPT,
+            reason=refusal_report(exc),
+            refused_protocol=exc.support,
+            newer_protocol=exc.newer,
+        )
     except StateError as exc:
         return NamespaceState(StateStatus.CORRUPT, reason=_bounded_reason(str(exc)))
     return NamespaceState(StateStatus.LOADED, state=state)

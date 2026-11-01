@@ -12,9 +12,10 @@ import pytest
 
 from autoforge import cli
 from autoforge.engine import ControllerEngine, StepOutcome
-from autoforge.errors import GitHubError, LockError
+from autoforge.errors import ExecutionError, GitHubError, LockError
 from autoforge.executor import ExecutionResult, execute
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
+from autoforge.provenance import MAX_PATH_CHARS
 from autoforge.providers import ProviderRegistry, ScriptedProvider
 from autoforge.redaction import redact, redact_obj
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
@@ -876,7 +877,7 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     out = capsys.readouterr().out
     assert rc == 0
     assert "AutoForge workflow reached READY_FOR_MERGE." in out
-    assert "Automatic merge is disabled in this milestone." in out
+    assert "The merge gate is closed: a human must review and merge the PR." in out
     head = fakes["origin"].head("autoforge/2")  # the commit the controller published
     assert head is not None
     assert load_state(tmp_path / ".autoforge" / "state.json").current_head_sha == head
@@ -956,7 +957,7 @@ def test_resume_with_gate_open_rechecks_inconclusive_ready_for_merge_then_blocks
     assert (
         cli.main(["--config", cfg, "--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
     )
-    assert "Automatic merge is disabled" in capsys.readouterr().out  # no --allow-merge: holds
+    assert "The merge gate is closed" in capsys.readouterr().out  # no --allow-merge: holds
     gh.prs[PR].mergeable = "UNKNOWN"
 
     # gate closed (flag missing): resume is a no-op banner, GitHub is not read
@@ -965,7 +966,7 @@ def test_resume_with_gate_open_rechecks_inconclusive_ready_for_merge_then_blocks
 
     n_reads = pr_reads()
     assert cli.main(["--config", cfg, "--state-dir", sd, "resume"]) == 0
-    assert "A human must review and merge the PR." in capsys.readouterr().out
+    assert "a human must review and merge the PR." in capsys.readouterr().out
     assert pr_reads() == n_reads
 
     # gate open: each resume performs one verification attempt and keeps the phase
@@ -1012,7 +1013,7 @@ def test_resume_with_gate_open_merges_via_controller_to_done(tmp_path, capsys, m
     )
     out = capsys.readouterr().out
     assert "READY_FOR_MERGE -> MERGE" in out or "MERGE" in out
-    assert "Automatic merge is disabled" not in out
+    assert "The merge gate is closed" not in out
     assert gh.merges == []
 
     assert cli.main(["--config", cfg, "--state-dir", sd, "resume", "--allow-merge"]) == 0
@@ -1054,7 +1055,7 @@ def test_ready_banner_with_gate_open_and_exhausted_budget(tmp_path, capsys, monk
     out = capsys.readouterr().out
     assert rc == 0 and "AutoForge workflow reached READY_FOR_MERGE." in out
     assert "step budget (--max-steps) ran out before MERGE" in out
-    assert "Automatic merge is disabled" not in out
+    assert "The merge gate is closed" not in out
     assert fakes["gh"].merges == []
 
 
@@ -1151,6 +1152,36 @@ def test_doctor_with_fake_runner(tmp_path, capsys, monkeypatch):
     # `gh api` answers "ok 1.0" here, not JSON: a conclusive read failure is a FAIL.
     rules = next(c for c in data["checks"] if c["name"] == "default branch requires checks")
     assert not rules["ok"] and rules["required"] and not rules["skipped"]
+
+
+def test_doctor_without_gh_reports_every_row(tmp_path, capsys, monkeypatch):
+    """#259: before `gh` was installed, doctor printed `autoforge: error:
+    executable not found: gh` and no row, since the rows that read GitHub
+    let the spawn failure escape. They are skipped now; 'gh available'
+    fails and says why."""
+    monkeypatch.chdir(tmp_path)
+
+    def runner(req):
+        argv = req.command
+        if argv[0] == "gh":
+            raise ExecutionError("executable not found: gh ([Errno 2] No such file or directory)")
+        if argv[:3] == ["git", "remote", "get-url"]:
+            return ExecutionResult(argv, req.cwd, 0, "https://github.com/o/r.git\n", "", "t", "t")
+        return ExecutionResult(argv, req.cwd, 0, "ok 1.0\n", "", "t", "t")
+
+    monkeypatch.setattr(cli, "_doctor_runner", lambda: runner)
+    epic = ["--epic", "https://github.com/o/r/issues/1"]
+    rc = cli.main(["--state-dir", str(tmp_path / ".autoforge"), "doctor", *epic])
+    out = capsys.readouterr().out
+    assert rc == 1 and "autoforge: error" not in out
+    assert "[FAIL] gh available: ExecutionError: executable not found: gh" in out
+    for row in (
+        "default branch requires checks",
+        "pull request check runs readable",
+        "EPIC sub-issues and dependencies readable",
+    ):
+        assert f"[SKIP] {row}: gh could not be started (executable not found: gh" in out
+    assert "[OK  ] state dir writable" in out
 
 
 def test_a_refused_prompt_version_prints_nothing_written_under_it(
@@ -1527,7 +1558,12 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
     ``state.json.corrupt-<timestamp>``, beside an earlier archive of that very
     name, which it does not replace; the run logs stay; the move is printed;
     and the new run is built from the command alone, with nothing of the
-    moved file in it."""
+    moved file in it.
+
+    The unknown label is a newer one ('99'): since #265 its refusal names the
+    controller that refused it and advises neither repairing the file nor
+    ``run --force``, since a newer controller continues that run; what
+    ``--force`` does with it is unchanged."""
     import stat
     from datetime import datetime
 
@@ -1545,7 +1581,12 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
     before = state_tree(sd)
     assert cli.main(["--state-dir", str(sd), *_run_argv_of(1)]) == 2
     err = capsys.readouterr().err
-    assert reason in err and "'run --force'" in err
+    if kind == "unknown-label":
+        assert reason in err and "AutoForge controller/state protocol mismatch" in err
+        assert "--force" not in err and "repair" not in err
+        assert "refusing to start a new run over run af-planted-run" in err
+    else:
+        assert reason in err and "'run --force'" in err
     assert state_tree(sd) == before
 
     monkeypatch.setattr(state_mod, "datetime", FrozenDatetime)
@@ -1577,6 +1618,326 @@ def test_run_refuses_a_state_that_does_not_load_and_force_moves_it_aside_whole(
     assert "planted" not in (sd / "state.json").read_text(encoding="utf-8")
     assert "pull/4241" not in (sd / "state.json").read_text(encoding="utf-8")
     assert load_state(sd / "state.json").run_id == fresh["run_id"]
+
+
+# -- a state a newer controller wrote (#265) -------------------------------------------------
+# The #243/#254 incident: an older controller meets a newer controller's
+# run. Every command refuses before it writes, names the code it imported,
+# and points at a compatible controller without suggesting a repair.
+
+
+def _newer_controllers_run(tmp_path, capsys) -> tuple[Path, bytes]:
+    """A run started in ``tmp_path/.autoforge``, then relabelled as protocol 14 wrote it.
+
+    Its phase is one this controller does not have, so a refusal that read
+    the phase before the label would misreport it. The run's logs stay.
+    """
+    sd = tmp_path / ".autoforge"
+    cli.main(["--state-dir", str(sd), *_run_argv_of(2)])
+    capsys.readouterr()
+    assert any((sd / "logs").iterdir())
+    state_file = sd / "state.json"
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    data.update(
+        protocol_version="14",
+        phase="A_PHASE_OF_PROTOCOL_14",
+        controller_version="0.2.0",
+        run_id="af-written-by-protocol-14",
+    )
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    return sd, state_file.read_bytes()
+
+
+def _assert_the_newer_run_is_named(err: str, state_file: Path, flags: str) -> None:
+    import autoforge
+
+    assert (
+        f"autoforge: error: state file {state_file}: unsupported protocol_version '14' "
+        "(controller speaks '13'): a newer AutoForge wrote it\n"
+    ) in err
+    assert "AutoForge controller/state protocol mismatch" in err
+    assert f"  state:      {state_file} (protocol_version '14')" in err
+    assert "  recorded:   run af-written-by-protocol-14, written by autoforge 0.2.0" in err
+    assert f"  import:     {os.path.abspath(autoforge.__file__)}\n" in err
+    assert f"  python:     {sys.executable}\n" in err
+    assert f"  cwd:        {os.getcwd()}\n" in err
+    assert f"<an autoforge that speaks protocol 14> {flags}status\n" in err
+    assert "unknown phase" not in err and "--force" not in err and "repair" not in err
+    _assert_the_result_claims_only_what_holds(err)
+
+
+_RESULT = (
+    "  result:     refused: the state file and its run logs were not rewritten, the agent "
+    "worktree was not touched, no agent was launched and nothing was written to GitHub\n"
+)
+
+
+def _assert_the_result_claims_only_what_holds(err: str) -> None:
+    """#265 R1-F5: one result line for a refusal before the lock and under it."""
+    assert _RESULT in err
+    assert "before anything was written" not in err and "refused before" not in err
+
+
+_NEWER_RUN_COMMANDS = (
+    ["status"],
+    ["status", "--json"],
+    ["step"],
+    ["step", "--dry-run"],
+    ["resume"],
+    ["resume", "--dry-run"],
+    ["unblock", "--reason", "the operator looked"],
+    ["unblock", "--reason", "the operator looked", "--dry-run"],
+    _run_argv_of(1),
+)
+
+
+@pytest.mark.parametrize("words", _NEWER_RUN_COMMANDS, ids=" ".join)
+def test_a_newer_controllers_run_is_refused_before_anything_is_written(
+    tmp_path, capsys, monkeypatch, fakes, words
+):
+    """#265 R1-R3: exit 2 (a StateError's, unchanged), nothing on stdout, the
+    diagnostic on stderr with this command's flags as typed, and the state
+    directory, its logs and the lock under the git directory exactly as they
+    were: the refusal comes before the lock is taken, under every command and
+    its dry run. No GitHub call and no agent launch."""
+    monkeypatch.chdir(tmp_path)
+    sd, _ = _newer_controllers_run(tmp_path, capsys)
+    (tmp_path / "cfg.json").write_text('{"version": 1}', encoding="utf-8")
+    lock_dir = repository_lock_path(tmp_path).parent
+    before = (state_tree(sd), state_tree(lock_dir))
+    calls = (len(fakes["gh"].calls), len(fakes["provider"].calls))
+    flags = ["--config", "cfg.json", "--state-dir", ".autoforge"]
+    for _ in range(2):
+        assert cli.main([*flags, *words]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        _assert_the_newer_run_is_named(
+            captured.err, sd / "state.json", "--config cfg.json --state-dir .autoforge "
+        )
+        assert (state_tree(sd), state_tree(lock_dir)) == before
+    assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
+
+
+def test_run_force_still_moves_a_newer_controllers_run_aside_whole(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#265 changes no ``--force`` semantics (ADR 0009 D4's audit): the newer
+    run is moved aside byte for byte and a fresh run starts. The refusal
+    without it no longer suggests that, since the newer controller continues
+    the run (above)."""
+    monkeypatch.chdir(tmp_path)
+    sd, raw = _newer_controllers_run(tmp_path, capsys)
+    assert cli.main(["--state-dir", str(sd), *_run_argv_of(1), "--force"]) == 0
+    err = capsys.readouterr().err
+    moved = [p for p in sd.glob("state.json.corrupt-*")]
+    assert len(moved) == 1 and moved[0].read_bytes() == raw
+    assert f"autoforge: moved unreadable state file aside: {moved[0]}" in err
+    assert load_state(sd / "state.json").run_id != "af-written-by-protocol-14"
+
+
+@pytest.mark.parametrize(
+    "words", (["step"], ["resume"], ["unblock", "--reason", "looked"]), ids=" ".join
+)
+def test_a_state_a_newer_controller_replaced_after_the_first_load_is_refused_under_the_lock(
+    tmp_path, capsys, monkeypatch, fakes, words
+):
+    """#265 R1, no window between the preflight and the mutation path: the
+    load before the lock passes, a newer controller's run replaces the file
+    as the lock is taken, and the load under the lock, the one every write
+    acts on, refuses it with the same diagnostic. The replacement is left as
+    it was written, the logs are untouched and no agent is launched."""
+    monkeypatch.chdir(tmp_path)
+    sd, newer = _newer_controllers_run(tmp_path, capsys)
+    state_file = sd / "state.json"
+    data = json.loads(newer)
+    data.update(protocol_version="13", phase="ANALYZE_EXECUTE")
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    assert load_state(state_file).phase is Phase.ANALYZE_EXECUTE
+    real = ControllerEngine.locked
+    swaps = []
+
+    def locked(self, *args, **kwargs):
+        state_file.write_bytes(newer)
+        swaps.append(1)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(ControllerEngine, "locked", locked)
+    logs = state_tree(sd / "logs")
+    calls = len(fakes["provider"].calls)
+    assert cli.main(["--state-dir", ".autoforge", *words]) == 2
+    captured = capsys.readouterr()
+    assert swaps == [1] and captured.out == ""
+    _assert_the_newer_run_is_named(captured.err, state_file, "--state-dir .autoforge ")
+    assert state_file.read_bytes() == newer
+    assert state_tree(sd / "logs") == logs
+    assert len(fakes["provider"].calls) == calls
+
+
+def test_the_refusal_under_the_lock_claims_no_more_than_it_established(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#265 R1-F5: under the lock, taking it has already rewritten the lock's
+    PID record, so the diagnostic does not say that nothing was written. What
+    it does say holds: the replacement state and the run logs are as they
+    were, no agent was launched and GitHub was not written."""
+    monkeypatch.chdir(tmp_path)
+    sd, newer = _newer_controllers_run(tmp_path, capsys)
+    state_file = sd / "state.json"
+    data = json.loads(newer)
+    data.update(protocol_version="13", phase="ANALYZE_EXECUTE")
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    lock_file = repository_lock_path(tmp_path)
+    real = ControllerEngine.locked
+
+    def locked(self, *args, **kwargs):
+        state_file.write_bytes(newer)
+        lock_file.unlink(missing_ok=True)  # so that taking it is seen to write it
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(ControllerEngine, "locked", locked)
+    logs = state_tree(sd / "logs")
+    calls = (len(fakes["gh"].calls), len(fakes["provider"].calls))
+    assert cli.main(["--state-dir", ".autoforge", "resume"]) == 2
+    err = capsys.readouterr().err
+    assert lock_file.exists(), "the lock was taken, and wrote its record, before the refusal"
+    _assert_the_newer_run_is_named(err, state_file, "--state-dir .autoforge ")
+    assert state_file.read_bytes() == newer and state_tree(sd / "logs") == logs
+    assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
+
+
+@pytest.mark.parametrize("label", ["6", "0", "14.0", 14, None], ids=repr)
+def test_run_over_a_label_no_protocol_has_suggests_no_force(
+    tmp_path, capsys, monkeypatch, fakes, label
+):
+    """#265 R1-F4: a label no AutoForge protocol has is refused like a newer
+    one: ``run`` names the controller and the run it will not start over, and
+    advises neither ``run --force``, which would set the run aside, nor a
+    repair. Nothing is written, the lock included."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    cli.main(["--state-dir", str(sd), *_run_argv_of(2)])
+    capsys.readouterr()
+    state_file = sd / "state.json"
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    data.update(_PLANTED, protocol_version=label)
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    lock_dir = repository_lock_path(tmp_path).parent
+    before = (state_tree(sd), state_tree(lock_dir))
+    calls = (len(fakes["gh"].calls), len(fakes["provider"].calls))
+    for _ in range(2):
+        assert cli.main(["--state-dir", ".autoforge", *_run_argv_of(1)]) == 2
+        captured = capsys.readouterr()
+        err = captured.err
+        assert captured.out == ""
+        assert (
+            f"unsupported protocol_version {label!r} (controller speaks '13'): no AutoForge "
+            "protocol has that label\n"
+        ) in err
+        assert "AutoForge controller/state protocol mismatch" in err
+        assert "no AutoForge protocol has this label" in err
+        assert (
+            "autoforge: error: refusing to start a new run over run af-planted-run, which this "
+            "controller cannot read\n"
+        ) in err
+        for advice in ("--force", "repair", "corrupt-", "start over", "unreadable"):
+            assert advice not in err, advice
+        _assert_the_result_claims_only_what_holds(err)
+        assert (state_tree(sd), state_tree(lock_dir)) == before
+    assert (len(fakes["gh"].calls), len(fakes["provider"].calls)) == calls
+
+
+def _a_newer_state_at(sd: Path) -> None:
+    """A protocol-14 state at ``sd``, saved by this controller and relabelled."""
+    sd.mkdir(parents=True, exist_ok=True)
+    state = AutoForgeState(
+        run_id="af-written-by-protocol-14",
+        repository="owner/repo",
+        epic_url=EPIC,
+        current_issue_url=ISSUE,
+        phase=Phase.REVIEW,
+        created_at="2026-10-31T00:00:00+00:00",
+        updated_at="2026-10-31T00:00:00+00:00",
+    )
+    save_state(state, sd / "state.json")
+    data = json.loads((sd / "state.json").read_text(encoding="utf-8"))
+    data.update(protocol_version="14")
+    (sd / "state.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+def _long_dir(base: Path, length: int) -> str:
+    """Components under ``base`` (none longer than 200) making ``base/<them>/`` ``length`` long."""
+    left = length - len(str(base)) - 2  # the separators after base and after the last component
+    parts = []
+    while left > 0:
+        take = min(200, left)
+        if 0 < left - take < 2:  # no empty component, and room for its separator
+            take -= 2
+        parts.append("d" * take)
+        left -= take + 1
+    return "/".join(parts)
+
+
+@pytest.mark.parametrize("case", ["newline", "escape", "long"])
+def test_an_odd_state_dir_or_config_never_reaches_the_diagnostic_raw(
+    tmp_path, capsys, monkeypatch, fakes, case
+):
+    """#265 R1-F3, end to end: the headline, the state line and the recovery
+    command are each one printable line, bounded, whatever the ``--state-dir``
+    and ``--config`` values hold. A newline cannot start a forged line, an
+    escape cannot reach the terminal, and a value that cannot be repeated
+    faithfully is a labelled placeholder rather than a quoted copy."""
+    monkeypatch.chdir(tmp_path)
+    if case == "newline":
+        state_dir, config = "sd\nautoforge: error: forged", "cfg\nautoforge: error: forged.json"
+    elif case == "escape":
+        state_dir, config = "sd\x1b]0;owned\x07\x1b[2J", "cfg\x1b[31m.json"
+    else:
+        state_dir = _long_dir(tmp_path, 2 * MAX_PATH_CHARS)
+        config = state_dir + "/cfg.json"
+    _a_newer_state_at(tmp_path / state_dir)
+    (tmp_path / config).write_text('{"version": 1}', encoding="utf-8")
+    before = state_tree(tmp_path / state_dir)
+    assert cli.main(["--config", config, "--state-dir", state_dir, "status"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    err = captured.err
+    assert "\x1b" not in err and "\x07" not in err
+    lines = err.splitlines()
+    assert lines[0].startswith("autoforge: error: state file ")
+    assert "AutoForge controller/state protocol mismatch" in lines
+    for line in lines:
+        assert line.isprintable(), line
+        assert len(line) <= 2 * MAX_PATH_CHARS + 300, len(line)
+        assert not line.startswith("autoforge: error: forged")
+    (command,) = [line for line in lines if "<an autoforge that speaks protocol 14>" in line]
+    assert command.strip() == (
+        "<an autoforge that speaks protocol 14> --config <the --config value this command was "
+        "given> --state-dir <the --state-dir value this command was given> status"
+    )
+    assert "put back the value you typed" in err
+    if case == "long":
+        assert lines[0].count("[... cut]") == 1
+    assert state_tree(tmp_path / state_dir) == before
+
+
+def test_a_credential_crossing_a_path_cut_never_reaches_the_diagnostic(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#265 R1-F2, the CLI's rendering: a state directory whose path holds a
+    credential that crosses the 1024-character cut of the state line and the
+    headline is redacted whole before it is cut, and is not repeated in the
+    recovery command."""
+    monkeypatch.chdir(tmp_path)
+    filler = _long_dir(tmp_path, MAX_PATH_CHARS - len(" [... cut]") - 12)
+    sd = tmp_path / filler / GOOGLE_API_KEY
+    start = str(sd / "state.json").index("AIza")
+    assert start < MAX_PATH_CHARS - len(" [... cut]") < start + len(GOOGLE_API_KEY)
+    _a_newer_state_at(sd)
+    assert cli.main(["--state-dir", str(sd), "status"]) == 2
+    err = capsys.readouterr().err
+    assert "AutoForge controller/state protocol mismatch" in err
+    assert "AIza" not in err and "SyFAKE" not in err
+    assert "--state-dir <the --state-dir value this command was given> status" in err
 
 
 # -- LOCAL's ways in, closed (ADR 0009 D3 to D5, step S2; #387) --------------------------

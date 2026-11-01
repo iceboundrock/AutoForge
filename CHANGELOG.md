@@ -22,6 +22,99 @@ hand `bwrap` a launch's options, so it now cannot enforce:
 
 Use another build of the interpreter to enforce the outer sandbox.
 
+### A run a newer controller wrote names the controller that refused it (#265)
+
+- A command that meets a `state.json` labelled with a newer protocol still
+  refuses it with exit 2 and writes nothing, and now says which code
+  refused it: the state file, the label and what the file records (run id,
+  writer), then the controller's version and protocol, the file Python
+  imported it from, the interpreter and the working directory, and a
+  `status` command with this command's `--config` and `--state-dir` for a
+  controller that speaks the run's protocol. It suggests no edit of the
+  file and no `run --force`. `status`, `step`, `resume`, `unblock`, their
+  dry runs and `run` all print it; the exit status is unchanged.
+- A newer label is now refused before the file's phase is read, so a run
+  of a newer controller with a phase this one lacks is reported as a newer
+  protocol, no longer as `state file has unknown phase`. The mode is still
+  read first, so a LOCAL file is still an unknown mode.
+- `run` over a newer controller's run, or over a state whose label no
+  protocol has, no longer advises `repair it, or use 'run --force'`;
+  `run --force` still moves it aside as `state.json.corrupt-<timestamp>`.
+- The diagnostic's paths and the `--config` and `--state-dir` values it
+  repeats are redacted before they are cut, kept to one printable line
+  each and bounded; a value that cannot be repeated exactly as typed is a
+  labelled placeholder.
+- **Behaviour change:** a standalone state at `config.state_dir` of a
+  protocol the controller does not read (newer, or no protocol's) no
+  longer holds nothing: `epic run` and `epic resume` admit no issue at all
+  while it is there and exit 1 (`degraded`), since the issue that run
+  holds is unknown. A standalone state that does not load for any other
+  reason still holds nothing and is reported.
+- `epic status` shows a namespace state of a newer protocol as
+  `uncertain(state-corrupt)` as before, but points at a controller that
+  speaks it instead of `epic archive`, and one of a label no protocol has
+  says that no controller reads it, with neither `epic archive` nor a
+  repair by hand; the scheduler's and a worker's messages name the
+  refusing controller.
+- The scheduler's lines, `epic status` and `epic run --dry-run` name the
+  configured standalone state file redacted, on one printable line and
+  bounded, as the CLI's diagnostic does.
+- Those reports keep the refusal of a state of a newer protocol, or of no
+  protocol's label, and the refusing controller's protocol, import path
+  and interpreter whole however long the state file's path, and name the
+  file last; a path of several hundred characters used to push them past
+  the reports' 1,000-character bound. `epic run --dry-run` now reports
+  such a namespace state as the scheduler does.
+- `doctor` has a first row, `controller`: the code a command line runs and
+  the state protocols it reads. It never fails.
+- [Running the remote workflow](docs/usage.md#a-run-a-newer-controller-wrote)
+  walks through the case that motivated it (#243, PR #254: a protocol-11
+  run resumed by protocol-10 code) and choosing the code with
+  `uv run --project` while keeping the working directory and flags.
+
+### A first run, from nothing: the guide, starter configurations, and a `doctor` that a new repository can pass (#259)
+
+- [Getting started](docs/getting-started.md) takes a newcomer from nothing
+  to a first run on a repository of their own, a new private one
+  (recommended) or an existing one they may change once they accept the
+  run's scope and risks: prerequisites, installing, the EPIC and the issue
+  to write, keeping `.autoforge/` and `autoforge.yaml` out of git, a
+  configuration, what each `doctor` row means, a dry run, a real run,
+  `READY_FOR_MERGE` and `BLOCKED`, and the common first-run failures with
+  their exact messages. [Clean-room first run](docs/clean-room.md) is the
+  procedure that checks it at each release candidate, in a fresh
+  environment, with the installed revision, the documents and the starter
+  all from the candidate under test.
+- Two starter configurations under `examples/`:
+  `starter-two-providers.yaml`, the built-in routing written out, and
+  `starter-claude-only.yaml`, Claude Code for every phase, whose review is
+  therefore not cross-vendor. Tests load and validate both, and the built-in
+  defaults do not change.
+- **`doctor`'s "default branch requires checks" row is a `WARN`, not a
+  `FAIL`, while the merge gate is closed** and the default branch visibly
+  does not require the check (no rule, a missing context, an inactive
+  ruleset, a bypass actor). Only the merge gate relies on that rule, and a
+  run with the gate closed stops at `READY_FOR_MERGE` for a human, so a
+  new repository without CI no longer fails its first `doctor`. With
+  `safety.allow_merge: true` it is a `FAIL` as before, and the merge gate's
+  own checks do not change.
+- `doctor` without `gh` installed printed `autoforge: error: executable not
+  found: gh` and no row. It now prints every row: `gh available` fails, and
+  the rows that read GitHub are skipped, except that "default branch
+  requires checks" fails with the merge gate open, as it does whenever it
+  cannot read the branch rules. A `gh` that starts for one read and not for
+  a later one gets the same rows.
+- `doctor` no longer fails `agent 'claude' keeps integrations off` when
+  Claude Code cut its `--help` short: 2.1.314 writes only part of it to a
+  pipe, before the flags the row looks for. A help that ends mid-line is a
+  `SKIP` that says so and how to check by hand.
+- The `READY_FOR_MERGE` banner said "Automatic merge is disabled in this
+  milestone"; it now says the merge gate is closed and what opens it.
+- `make dist-check` also installs the wheel with `uv tool install`, and,
+  with no credential and no agent CLI, checks `doctor`'s rows that need
+  neither, with the built-in routing and with each starter, and a dry run
+  with each starter.
+
 ### A sequential run's next issue must be a sub-issue of the EPIC (#287)
 
 **Behaviour change:** `UPDATE_EPIC` switches only to a native sub-issue of

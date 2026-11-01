@@ -263,6 +263,11 @@ describes how a version is built and published.
 
 Whichever way it was installed, run `autoforge` from a checkout of the
 repository whose issues it drives; `autoforge doctor` checks the rest.
+Continue a run with the controller that created it, or a newer one: a
+controller refuses a run a newer one wrote (exit 2, nothing written) and
+names the code it imported, and `doctor`'s `controller` row shows which
+code a command line runs
+([A run a newer controller wrote](https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md#a-run-a-newer-controller-wrote)).
 
 **For development** on AutoForge itself, from a clone of this repository:
 
@@ -275,11 +280,19 @@ uv run autoforge --help
 `uv run autoforge` is the same command, run from that clone's `.venv`.
 [Development](https://github.com/iceboundrock/AutoForge/blob/main/docs/development.md) has the checks CI runs.
 
-To configure profiles, bounds or the merge gate, copy
-`autoforge.example.yaml` to `autoforge.yaml` and pass it with `--config`
-before the subcommand; see [Configuration](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md).
+To configure profiles, bounds or the merge gate, copy a starter
+configuration from [`examples/`](https://github.com/iceboundrock/AutoForge/tree/main/examples),
+or `autoforge.example.yaml` (every key), to `autoforge.yaml` and pass it
+with `--config` before the subcommand; see [Configuration](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md).
 
 ## Quick start
+
+New to AutoForge? [Getting started](https://github.com/iceboundrock/AutoForge/blob/main/docs/getting-started.md)
+walks through a first run on a repository of your own: prerequisites,
+installing, a repository (a new private one, or an existing one you may
+change) with an EPIC and an issue, a starter configuration, what each
+`doctor` row means, a dry run, a real run, and the common first-run
+failures with their fixes. The commands in brief:
 
 Run these from a checkout of the repository the issues belong to. URLs must
 be HTTPS GitHub issue URLs, and the EPIC and the issue must be in that same
@@ -341,6 +354,7 @@ most common entry points:
 
 | I want to… | Read |
 |---|---|
+| make a first run on a repository of my own, step by step | [Getting started](docs/getting-started.md), starter configurations in [`examples/`](examples) |
 | know which OS, Python, git, `gh`, agent CLI and sandbox host it runs on | [Compatibility](docs/compatibility.md) |
 | run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/usage.md#troubleshooting-and-recovery) |
 | run phases through Pi on a DeepSeek API key or a ChatGPT subscription | [Pi operator guide](docs/pi.md) |

@@ -1,5 +1,10 @@
 """`autoforge doctor`: read-only environment checks.
 
+The first row, ``controller``, names the AutoForge code this command line
+runs: the imported package's file, the interpreter, and the state
+protocols it reads (#265, :mod:`autoforge.provenance`). It never fails and
+reads no state.
+
 Every check is non-destructive: version queries, `gh auth status`,
 `git rev-parse`, `pi auth check --no-refresh`, reading the config, and
 creating/removing one temp file in the state directory to prove it is
@@ -110,6 +115,7 @@ from .github import (
 )
 from .locking import check_local_lock_filesystem, repository_lock_path
 from .profiles import REQUIRED_PROFILES
+from .provenance import ControllerIdentity, protocol_ranges
 from .providers import (
     CLAUDE_ISOLATION_FLAGS,
     OPENCODE_MIN_VERSION,
@@ -128,6 +134,7 @@ from .redaction import redact, redact_argv
 from .run_namespace import AUTOFORGE_DIRNAME, SCHEDULER_DIRNAME
 from .safefs import STATE_DIR_NEEDS_HARD_LINKS, HardLinksUnavailable, SafeRoot
 from .sdk_policy import SDK_PROVIDERS
+from .state import SUPPORTED_PROTOCOLS
 from .validation import parse_issue_url, parse_remote_repository
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -358,6 +365,22 @@ class Doctor:
             name, True, f"{len(commands)} definition(s): {listed}; {mode}", required=False
         )
 
+    def check_controller(self) -> CheckResult:
+        """The controller this ``doctor`` runs as (#265): informational, never a failure.
+
+        The ``autoforge`` package actually imported, by its ``__file__``, and
+        the interpreter running it, with the state protocols it reads: what
+        a ``status`` or ``resume`` from this same command line would run as.
+        Reads no state, so a checkout without a run passes it.
+        """
+        identity = ControllerIdentity.current()
+        return CheckResult(
+            "controller",
+            True,
+            f"{identity.summary()}; reads state protocols {protocol_ranges(SUPPORTED_PROTOCOLS)}",
+            required=False,
+        )
+
     def check_state_dir(self) -> CheckResult:
         d = self.state_dir or (self.config.state_dir if self.config else ".autoforge")
         path = Path(self.cwd) / d if not Path(d).is_absolute() else Path(d)
@@ -433,24 +456,24 @@ class Doctor:
         runs vacuously green. The requirement lives in repository settings,
         outside version control, so this is the only place drift is caught.
 
-        Read-only. When the branch rules cannot be verified -- GitHub's
-        plan offers none on this repository (#289), the token may not read
-        them, GitHub reports the repository not found, or GitHub could not
-        be read at all (transient) -- nothing shows that the merge gate's
-        "every check succeeded" has a required check behind it. With the
-        configuration's half of the merge gate open (``safety.allow_merge:
-        true``) that is a FAIL; with it closed a SKIP that says why. A plan
-        limitation is named as one and never sent to the token's
-        permissions: no permission changes it. The same holds for a rule
-        whose bypass actors GitHub withholds (it returns them only with
-        write access to the ruleset) when it also does not say whether this
-        token may bypass it: whether the controller's own login can skip the
-        rule is then unverified. When GitHub does say that this token may
-        never bypass it, the hidden list is a SKIP either way: the required
-        checks were read and the controller cannot bypass them. A problem
-        that *is* visible (a missing context, a non-active ruleset, a bypass
-        actor) is a FAIL regardless of what stayed hidden. Never an
-        unverified OK.
+        Read-only. When the branch rules cannot be verified -- GitHub's plan
+        offers none on this repository (#289), the token may not read them,
+        GitHub reports the repository not found, GitHub could not be read at all
+        (transient), or `gh` itself could not be started -- nothing shows that
+        the merge gate's "every check succeeded" has a required check behind it.
+        With the configuration's half of the merge gate open
+        (``safety.allow_merge: true``) that is a FAIL; with it closed a SKIP
+        that says why. A plan limitation is named as one and never sent to the
+        token's permissions: no permission changes it. The same holds for a rule
+        whose bypass actors GitHub withholds (it returns them only with write
+        access to the ruleset) when it also does not say whether this token may
+        bypass it: whether the controller's own login can skip the rule is then
+        unverified. When GitHub does say that this token may never bypass it,
+        the hidden list is a SKIP either way: the required checks were read and
+        the controller cannot bypass them. A problem that *is* visible (no rule,
+        a missing context, a non-active ruleset, a bypass actor) decides the row
+        whatever stayed hidden: a FAIL with the gate open and a WARN with it
+        closed (#259, :meth:`_required_checks_missing`). Never an unverified OK.
         """
         name = REQUIRED_CHECKS_ROW
         cfg = self.config
@@ -461,6 +484,13 @@ class Doctor:
         client = GitHubClient(gh_command=gh, timeout_seconds=self.timeout, runner=self._runner)
         try:
             return self._required_checks(client, self.repo, cfg.safety.required_checks)
+        except ExecutionError as exc:
+            # Unverified like any other unread rule, whatever 'gh available'
+            # said: a `gh` that answered --version may still fail to start
+            # here, and an open gate must not pass on a SKIP (#259).
+            return self._required_checks_unverifiable(
+                _gh_not_started_text(exc), "make gh runnable (see the 'gh available' row)"
+            )
         except GitHubUnavailableError as exc:
             return self._required_checks_unverifiable(
                 f"GitHub could not be read (transient; run doctor again): {exc}",
@@ -503,6 +533,28 @@ class Doctor:
         return CheckResult.skip(
             name,
             redact(f"{why} (the merge gate is closed, so no unattended merge relies on it)"),
+        )
+
+    def _required_checks_missing(self, detail: str) -> CheckResult:
+        """A visible gap in what the default branch requires (#259).
+
+        Only the merge gate relies on a required check: the run itself never
+        reads branch rules, and with the configuration's half of the gate
+        closed it stops at READY_FOR_MERGE for a human to merge. So a gap is
+        a FAIL while ``safety.allow_merge: true`` and a WARN with the gate
+        closed, as a refused checks read is (#291): a fresh repository
+        without CI passes ``doctor`` and still sees what to fix before it
+        opens the gate. Never an OK, and the merge gate's own checks are
+        unchanged.
+        """
+        if self.config is not None and self.config.merge_allowed_by_config:
+            return CheckResult(REQUIRED_CHECKS_ROW, False, detail)
+        return CheckResult(
+            REQUIRED_CHECKS_ROW,
+            False,
+            f"{detail} (only the merge gate relies on this, and it is closed: a run stops at "
+            "READY_FOR_MERGE for you to merge; fix it before you set safety.allow_merge: true)",
+            required=False,
         )
 
     def _required_checks(self, client: GitHubClient, repo: str, expected: list[str]) -> CheckResult:
@@ -562,7 +614,7 @@ class Doctor:
         if problems:
             # A visible problem is conclusive whatever else stayed hidden;
             # the hidden part is still named so the remedy is known to be partial.
-            return CheckResult(name, False, "; ".join([summary, *problems, *hidden]))
+            return self._required_checks_missing("; ".join([summary, *problems, *hidden]))
         if unverified:
             return self._required_checks_unverifiable(
                 "; ".join([summary, *hidden]),
@@ -612,7 +664,7 @@ class Doctor:
                 "via classic branch protection"
             )
             if problems:
-                return CheckResult(name, False, f"{summary}; {'; '.join(problems)}")
+                return self._required_checks_missing(f"{summary}; {'; '.join(problems)}")
             return CheckResult(name, True, summary)
         # A disabled ruleset is invisible to the effective-rules read, so the
         # listing is consulted to make the remedy concrete. It is a hint only:
@@ -635,7 +687,7 @@ class Doctor:
         detail = f"no rule requires a status check on '{branch}'"
         if classic is not None:
             detail += " (classic branch protection exists but requires no status check)"
-        return CheckResult(name, False, "; ".join([detail, *hints, remedy]))
+        return self._required_checks_missing("; ".join([detail, *hints, remedy]))
 
     def check_checks_read(self, gh: str) -> CheckResult:
         """Whether this `gh` login may read a pull request's check runs (#291).
@@ -671,6 +723,8 @@ class Doctor:
         client = GitHubClient(gh_command=gh, timeout_seconds=self.timeout, runner=self._runner)
         try:
             candidates = client.list_checks_probe_candidates(repo)
+        except ExecutionError as exc:
+            return _gh_not_started(name, exc)
         except GitHubChecksAccessError as exc:
             # Even the count was refused: that is the refusal itself.
             return self._checks_read_denied(
@@ -693,6 +747,10 @@ class Doctor:
         for url, _count in candidates[:CHECKS_READ_TRIES]:
             try:
                 pr = client.get_pr_with_checks(url)
+            except ExecutionError as exc:
+                # The listing started `gh`, and this read may still fail to
+                # (#259 R1-F2): the read was not made, the same unread SKIP.
+                return _gh_not_started(name, exc)
             except GitHubChecksAccessError as exc:
                 return self._checks_read_denied(
                     f"GitHub refused this gh login the check results of {url}: "
@@ -1025,6 +1083,9 @@ class Doctor:
         no hook, plugin or MCP server of the operator's or the repository's
         configuration runs and no project or local settings apply; a CLI
         without one would refuse every launch. The help text is never quoted.
+        A help that ends mid-line was cut short by the CLI and proves nothing
+        about the flags past the cut: a SKIP that says how to check, never an
+        OK (#259).
         """
         name = f"agent '{command}' keeps integrations off ({', '.join(p.name for p in profiles)})"
         argv = [command, "--help"]
@@ -1042,10 +1103,26 @@ class Doctor:
                 False,
                 f"`{' '.join(argv)}` exited {res.exit_code} (output not shown; run it yourself)",
             )
-        listed = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", res.stdout or ""))
+        help_text = res.stdout or ""
+        listed = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", help_text))
         # A flag is offered by its name; its value (``=user``) is the launch's.
         flags = [flag.partition("=")[0] for flag in CLAUDE_ISOLATION_FLAGS]
         missing = [flag for flag in flags if flag not in listed]
+        if missing and help_text and not help_text.endswith("\n"):
+            # Claude Code 2.1.314 writes 8 or 16 KiB of its 22 KiB help to a
+            # pipe and exits, mid-line; to a file it writes all of it (#259).
+            # Such a help says nothing about the flags past the cut. A launch
+            # does not depend on this row: it passes the flags, and a CLI
+            # that lacks one exits with "error: unknown option" first.
+            return CheckResult.skip(
+                name,
+                f"`{' '.join(argv)}` stopped mid-line after {len(help_text.encode())} bytes, "
+                f"before it listed {', '.join(missing)}: Claude Code cut its help short "
+                "(2.1.314 does when its output is a pipe), so whether it offers them is "
+                "unknown. Every launch passes them, and a Claude Code without one refuses "
+                "the launch ('error: unknown option'). To check yourself, look for them in "
+                f"the file `{' '.join(argv)} > claude-help.txt` writes",
+            )
         if missing:
             return CheckResult(
                 name,
@@ -1310,6 +1387,8 @@ class Doctor:
         try:
             repository_id = client.get_repository_id(epic.repository)
             snapshot = build_epic_snapshot(client, epic.canonical, repository_id=repository_id)
+        except ExecutionError as exc:
+            return _gh_not_started(name, exc)
         except GitHubUnavailableError as exc:
             return CheckResult.skip(name, f"GitHub could not be read (transient): {exc}")
         except SnapshotRefused as exc:
@@ -1337,6 +1416,7 @@ class Doctor:
 
     def run_all(self) -> list[CheckResult]:
         results = [
+            self.check_controller(),
             self.check_config(),
             self.check_merge_gate(),
             self.check_premerge_verification(),
@@ -1364,6 +1444,24 @@ class Doctor:
         results.extend(self.scheduler_checks(gh))
         results.extend(self.sandbox_checks())
         return results
+
+
+def _gh_not_started(name: str, exc: ExecutionError) -> CheckResult:
+    """A row that reads GitHub when `gh` itself could not be started (#259).
+
+    A first `doctor` before `gh` is installed showed one line, `executable
+    not found: gh`, and no row at all. The row is skipped and the run goes on:
+    for the rows that use this, an unread answer is a SKIP whatever the merge
+    gate, and the 'gh available' row normally fails and says why (it passes
+    when `gh` started for an earlier read and not for this one). The
+    required-check row, which fails an unread answer with the gate open,
+    goes through :meth:`Doctor._required_checks_unverifiable` instead.
+    """
+    return CheckResult.skip(name, _gh_not_started_text(exc))
+
+
+def _gh_not_started_text(exc: ExecutionError) -> str:
+    return f"gh could not be started ({exc}); see the 'gh available' row"
 
 
 # The way out of an unverifiable required-check row, by cause (#289). A plan

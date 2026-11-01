@@ -148,6 +148,14 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/ownership.py": ("test_cli", "test_engine"),
     "src/autoforge/pi_rpc.py": ("test_providers", "test_live_pi_support"),
     "src/autoforge/premerge.py": ("test_engine", "test_merge_certificate"),
+    # every protocol refusal's text, and doctor's controller row (#265)
+    "src/autoforge/provenance.py": (
+        "test_state",
+        "test_cli",
+        "test_epic_commands",
+        "test_ownership",
+        "test_doctor",
+    ),
     "src/autoforge/replan_txn.py": ("test_cli",),
     "src/autoforge/roadmap.py": ("test_engine",),
     "src/autoforge/run_namespace.py": ("test_engine",),

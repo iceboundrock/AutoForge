@@ -305,6 +305,49 @@ High-priority coverage includes:
   settlement and a durable pause comes first; an open claim without a
   state owns its issue for `run`, a claim file of closed claims owns
   nothing, and an unreadable one owns its issue
+- the protocol preflight (#265; `tests/test_protocol_compat.py`,
+  `tests/test_cli.py`, `tests/test_epic_commands.py`, `tests/test_worker.py`,
+  `tests/test_ownership.py`, `tests/test_scheduler_state.py`,
+  `tests/test_doctor.py`): every label is
+  classified by itself (current, each legacy one, newer, and unknown ones:
+  6, 0, a leading zero, a decimal point, whitespace, a non-string); a newer
+  label is refused before its phase and fields are read, an unknown phase
+  or field under a supported label is still refused as such, and the mode
+  still decides first; the refusal names the imported package's file and
+  the interpreter, also for a package imported from elsewhere, and an older
+  copy of the package run in a process of its own names itself and not the
+  checkout; the label, run id and writer are bounded and shown only in a
+  controller's shape, and a secret-shaped one is redacted. `status`,
+  `status --json`, `step`, `resume`, `unblock` (with and without
+  `--dry-run`) and `run` exit 2 with the diagnostic and leave the state
+  directory, its logs and the lock as they were; a newer run that replaces
+  the file once the lock is taken is refused by the load under it, with a
+  `result` line that claims nothing the lock's own record contradicts;
+  `run` does not suggest `--force` for a newer label or for one no protocol
+  has, and `--force` still moves the file aside whole. Every value is
+  redacted before it is cut (a credential crossing the cut of a label, a
+  path, the CLI's lines and the scheduler's), and a state directory or
+  configuration path holding a newline, an escape or more than 1024
+  characters gives one printable, bounded line each, with a labelled
+  placeholder in the recovery command. A namespace state of a newer
+  protocol is held as uncertain with the controller named and no `epic
+  archive` advice, one of a label no protocol has (`'6'`, `'14.0'`, the
+  number 14) says no controller reads it, with neither `epic archive` nor
+  a repair by hand, in `epic status` and `epic status --json` alike, a
+  worker refuses one unchanged, and a standalone one,
+  newer or of no protocol, makes `epic run` and `epic resume` admit
+  nothing at all (exit 1, no namespace, claim or worker), which the dry
+  run and `epic status` report, until it is a state this controller reads;
+  a configured standalone directory holding a newline and an escape, or
+  longer than 1024 characters, is one printable, bounded line in the
+  scheduler's output, `epic status` (human and JSON) and the dry run;
+  and a state file path of 900 characters or past 1024, standalone or in a
+  namespace, still leaves the refusal and the refusing controller's
+  protocol, import path and interpreter whole in every one of those
+  reports (`epic run`, `epic resume`, the dry run, `epic status` human and
+  JSON) and in the classification and reconciliation detail, the state
+  file named last, with every part at its longest under
+  `provenance.MAX_REFUSAL_CHARS`; `doctor`'s `controller` row reads no state
 - the state pins of LOCAL's removal (ADR 0009 D4, D8, D12 S1b; #385;
   `tests/test_state.py`, `tests/test_replan.py`, `tests/test_cli.py`,
   `tests/test_scheduler_state.py`, `tests/test_epic_commands.py`), written
@@ -318,7 +361,8 @@ High-priority coverage includes:
   `run --force` moves the file aside byte for byte, beside an archive of
   the same name it does not replace, prints the move and starts a run with
   nothing of it. Such a file at `config.state_dir` holds no issue and is
-  reported by the scheduler's pass and by `epic status`, a namespace state
+  reported by the scheduler's pass and by `epic status` (one refused for
+  its label admits nothing at all since #265), a namespace state
   of any mode but REMOTE holds its issue as uncertain, and no `epic`
   command touches `<git dir>/autoforge/state`. They keep passing after the
   removal, with only the expected protocol label moved to 13 (#388)

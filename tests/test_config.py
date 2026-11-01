@@ -13,6 +13,7 @@ import pytest
 from autoforge import __prompt_version__, config
 from autoforge.child_env import FORBIDDEN_ENV_NAMES, FORBIDDEN_ENV_PREFIXES, forbidden_env_entry
 from autoforge.config import default_config, load_config_file, validate_required_profiles
+from autoforge.config_fingerprint import fingerprint_routing
 from autoforge.errors import ConfigurationError
 from autoforge.profiles import REQUIRED_PROFILES
 from autoforge.validation import parse_github_url, validate_epic_and_issue
@@ -212,6 +213,80 @@ def test_a_prompt_version_repeating_the_built_in_label_loads(tmp_path):
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps({"version": 1, "prompt_version": __prompt_version__}), encoding="utf-8")
     assert load_config_file(p).prompt_version == __prompt_version__
+
+
+# -- #259: the starter configurations under examples/ ---------------------------
+EXAMPLES = Path(__file__).parents[1] / "examples"
+STARTERS = sorted(EXAMPLES.glob("*.yaml"))
+
+
+def _launch(profile: config.ProfileConfig) -> tuple:
+    """What a profile launches: the fields a starter must get right."""
+    return (
+        profile.provider,
+        profile.model,
+        profile.effort,
+        profile.command,
+        profile.options,
+        profile.extra_args,
+    )
+
+
+def test_the_examples_directory_holds_the_two_starters():
+    assert [p.name for p in STARTERS] == [
+        "starter-claude-only.yaml",
+        "starter-two-providers.yaml",
+    ]
+
+
+@pytest.mark.parametrize("path", STARTERS, ids=lambda p: p.stem)
+def test_a_starter_loads_and_validates_on_both_yaml_backends(path, yaml_backend):
+    """A starter goes through what `run` checks before it creates a run: the
+    loader's key checks, every profile a REMOTE run can reach (update_epic
+    included) and the routing the run records. A starter that rots fails here."""
+    cfg = load_config_file(path)
+    validate_required_profiles(cfg, [*REQUIRED_PROFILES, "update_epic"])
+    fingerprint_routing(cfg)
+    assert set(cfg.profiles) == set(default_config().profiles)
+    # A first run stops at READY_FOR_MERGE, outside a sandbox the operator never set up.
+    assert cfg.merge_allowed_by_config is False
+    assert cfg.safety.required_checks == ["ci"]
+    assert not cfg.sandbox.enabled
+
+
+@pytest.mark.parametrize("path", STARTERS, ids=lambda p: p.stem)
+def test_both_yaml_backends_read_a_starter_alike(path):
+    """`uv tool install autoforge-cli` comes without PyYAML, so the subset
+    parser is what a first run reads a starter with."""
+    yaml = pytest.importorskip("yaml")
+    text = path.read_text(encoding="utf-8")
+    assert config._minimal_yaml_parse(text) == yaml.safe_load(text)
+
+
+def test_the_two_provider_starter_is_the_built_in_routing():
+    """Written out, not changed: a run started with it records what a run
+    without --config records."""
+    cfg = load_config_file(EXAMPLES / "starter-two-providers.yaml")
+    built_in = default_config()
+    assert {name: _launch(p) for name, p in cfg.profiles.items()} == {
+        name: _launch(p) for name, p in built_in.profiles.items()
+    }
+    assert fingerprint_routing(cfg) == fingerprint_routing(built_in)
+
+
+def test_the_claude_only_starter_launches_every_profile_like_the_built_in_claude_ones():
+    """A profile that switches provider starts from nothing (#259), so the
+    starter writes the Claude Code options out; each profile launches what
+    the built-in analyze_execute launches, with its own effort."""
+    cfg = load_config_file(EXAMPLES / "starter-claude-only.yaml")
+    implementer = default_config().profile("analyze_execute")
+    for name, profile in cfg.profiles.items():
+        assert profile.provider == "claude", name
+        assert profile.options == implementer.options, name
+        argv = profile.build_command("prompt")
+        assert argv[0] == "claude", name
+        assert "--permission-mode" in argv and "bypassPermissions" in argv, name
+    assert cfg.profile("review_round_6_plus").effort == "medium"
 
 
 def test_json_config_overrides_model(tmp_path):
