@@ -473,6 +473,15 @@ High-priority coverage includes:
   and sdist carry none of LOCAL mode's files, and the installed command
   meets each of LOCAL's ways in with its generic refusal and writes
   nothing (`make dist-check`)
+- EPIC #383's exit audit (ADR 0009 Appendix D;
+  `tests/test_removal_attestation.py`): D.1 takes the EPIC's twelve exit
+  criteria once each, in order, each with a verdict, and one met wholly
+  or in part names a test, each of which exists; and the three criteria
+  only documents hold stay held: LOCAL's guide stays deleted and no
+  current document links to it or to README's LOCAL section, ADR 0001
+  keeps its body and a header that names ADR 0009 and the parts it keeps,
+  and `CHANGELOG.md` keeps the removal's entry with its manual clean-up
+  and the protocol-13 entry
 
 ### Transitions
 

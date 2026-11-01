@@ -313,8 +313,12 @@ S3, #388)                             and on built files; one refusal per field,
                                       topology, launch class, mode or deleted module),
                                       test_packaging.py (no local_*.md packaged)
 LOCAL's removal closed and measured   test_removal_attestation.py (ADR 0009 Appendix C.6
-(ADR 0009 S4, #389)                   names a test for every A.2.4 invariant, and every
-                                      test it names exists), test_packaging.py (the
+(ADR 0009 S4, #389) and audited       names a test for every A.2.4 invariant, Appendix D a
+(EPIC #383)                           verdict for each of the EPIC's twelve exit criteria
+                                      and a test for each it calls met, and every test
+                                      either names exists; the legacy guide stays gone,
+                                      ADR 0001 stays marked superseded, the changelog keeps
+                                      the removal's clean-up), test_packaging.py (the
                                       dist check's LOCAL files and the installed
                                       command's refusals of LOCAL's ways in)
 scheduler namespaces (#178)           test_run_namespace.py (RunKey, layout, binding, lookup,
