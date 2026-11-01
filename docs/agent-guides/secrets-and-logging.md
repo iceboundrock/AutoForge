@@ -394,8 +394,8 @@ it. `tests/test_engine.py` puts token-shaped values in the worktree path,
 a flag and a profile's model and checks that none reaches the text. A block
 reason for a checkout that moved
 (`ControllerEngine._moved_checkout_recovery`) adds the same kind of values
-only: the checkout path, the feature specification's path and commands
-with those flags. `_block` redacts it like every block reason.
+only: the checkout path and commands with those flags. `_block` redacts it
+like every block reason.
 
 A write phase's prompt describes what the agent worktree holds uncommitted
 (#187): its branch, `HEAD` and each entry's status code and path, escaped

@@ -57,7 +57,7 @@ Reread once as a reader who was not in the session. Can they tell why this exist
 
 Every artifact must end up on GitHub; a copy on disk doesn't count. Issues, PR descriptions, comments, and reviews are written in English. Documents committed under `docs/` must have an English `.md` version; an optional Chinese translation uses a `.cn.md` suffix (for example, `docs/x.cn.md` alongside `docs/x.md`). The English file is the source of truth if the versions diverge. This also applies to `docs/agent-guides/` and `docs/adr/`; routing and instruction-map references continue to name the English files.
 
-- An artifact that already lives on GitHub isn't repeated in a comment: an issue or PR description is the body of that issue or PR, and a file committed in the PR (such as a `features/` spec) is in the diff.
+- An artifact that already lives on GitHub isn't repeated in a comment: an issue or PR description is the body of that issue or PR, and a file committed in the PR (such as an ADR) is in the diff.
 - Post any other artifact in full, not as a summary or file path, as a comment on the relevant PR if the work is under review, otherwise on the relevant issue (create one if none exists).
 - Say in the comment which artifact it is (plan, spec, review, …) so a later reader knows what they are looking at.
 - A gitignored local working copy is fine, but don't force-add it to share it. If one exists, give its path in the comment.

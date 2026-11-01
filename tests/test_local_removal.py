@@ -6,8 +6,9 @@ certificate and result models, its prompt templates and its configuration.
 These tests hold the package to that by shape rather than by scenario. They
 fail when a LOCAL topology, launch class or mode comes back, when a deleted
 module can be imported again, or when a module of the package defines,
-imports or refers to one of the deleted names. The wheel's half is
-``tests/test_packaging.py::test_no_artifact_carries_a_local_prompt_template``.
+imports or refers to one of the deleted names. The half of the wheel and
+the sdist is
+``tests/test_packaging.py::test_no_artifact_carries_a_file_of_local_mode``.
 """
 
 from __future__ import annotations

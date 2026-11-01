@@ -184,8 +184,9 @@ declared `read, bash`.
 Pi has no approval layer. A Pi profile is therefore equivalent to Claude
 Code under `--permission-mode bypassPermissions`. Under the default
 `sandbox.mode: disabled`, run unattended Pi phases in a container, a VM or
-under a dedicated UID (ADR 0001 §2; Pi's `docs/containerization.md` calls a
-container "usually the strongest practical option"). #132 implemented no
+under a dedicated UID ([security.md](security.md#agents-run-as-you); Pi's
+`docs/containerization.md` calls a container "usually the strongest
+practical option"). #132 implemented no
 sandbox; `sandbox.mode: required` (#168,
 [ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md))
 now runs Pi's RPC child and its per-launch auth preflight inside the outer

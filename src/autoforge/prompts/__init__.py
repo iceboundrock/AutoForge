@@ -18,8 +18,9 @@ PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Z][A-Z0-9_]*)\s*\}\}")
 # Placeholders are first replaced by this NUL-delimited marker, which no
 # template or value can contain in practice, and only then by the real
 # value. That keeps substitution strictly single-pass: a value carrying
-# "{{...}}" text (a feature specification is untrusted project data and may
-# well quote one) is inserted verbatim instead of being re-expanded or
+# "{{...}}" text (the EPIC's roadmap section, a validation command's output
+# or an agent's reply quoted back in a correction is untrusted project data
+# and may well quote one) is inserted verbatim instead of being re-expanded or
 # tripping the "unresolved placeholder" guard below.
 _MARKER_RE = re.compile(r"\x00AF:([A-Z][A-Z0-9_]*)\x00")
 

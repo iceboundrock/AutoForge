@@ -466,6 +466,13 @@ High-priority coverage includes:
   unknown kinds; and, structurally, `LOCAL_LEGAL_EDGES`, a LOCAL launch
   class and `WorkflowMode.LOCAL` do not exist, no module imports a
   deleted one, and the wheel carries no `local_*.md` template
+- the removal's closure (ADR 0009 D12 S4; #389;
+  `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
+  Appendix C.6 attests every invariant of A.2.4 in its words, each with
+  the tests that hold it, and each test it names exists; the built wheel
+  and sdist carry none of LOCAL mode's files, and the installed command
+  meets each of LOCAL's ways in with its generic refusal and writes
+  nothing (`make dist-check`)
 
 ### Transitions
 
@@ -693,7 +700,9 @@ exactly when `tests/sandbox_host.py` measures the host capable
   each lack named; a kernel that gives no Landlock ABI is recorded with its
   answer (`EOPNOTSUPP` or `ENOSYS`, each recorded as possibly a seccomp
   filter's, or another errno; #349); a
-  capable one is measured capable; no `bwrap` is named;
+  capable one is measured capable; no `bwrap` is named; a Python without
+  `os.memfd_create` is measured incapable, and `auto` skips the
+  real-backend tests it runs, naming it (#389);
   the measurement is printed and appended to the CI job summary. It also
   covers what each value of the variable makes of a probe that says
   "unsupported": unset skips, `1` fails, `auto` fails on a host measured
@@ -728,8 +737,12 @@ exactly when `tests/sandbox_host.py` measures the host capable
     status records, or fails its setup. Here a setup failure is a typed
     refusal and exit 1 is not; no environment value is on a command line;
     the facts are recorded; and a refusal leaves no descriptor and no held
-    containment. Also refused: the platforms without a backend, a missing
-    `bwrap`, a backend without overlays, a kernel without Landlock ABI 6,
+    containment. Also refused: the platforms without a backend, a Python
+    without `os.memfd_create` (#389: before anything is spawned, typed as
+    the `interpreter` capability by the launch, the probe, the engine's
+    gate and `doctor`, on every interpreter, the call removed for the
+    test; the tests that need the call skip on a Python without it), a
+    missing `bwrap`, a backend without overlays, a kernel without Landlock ABI 6,
     an unknown architecture and a failing process scope. The Landlock
     refusal, launched and probed, is tested on each answer of a scripted
     `landlock_create_ruleset`, errno included: an ABI below 6, Landlock
@@ -1791,7 +1804,22 @@ without building:
   version, `Requires-Python`, a dependency outside an extra)
 - its REMOTE dry-run check, run on a stand-in for the installed command
   with real git and a recording fake `gh`, refuses a `gh` call, any write
-  to the scratch repository (`.git` included) and an unrendered variable
+  to the scratch repository (`.git` included), the same bytes written over
+  a file among them, and an unrendered variable
+- the wheel and the sdist carry none of LOCAL mode's files (its
+  `local_*.md` templates and its two modules), and the dist check refuses
+  an artifact that carries one; its check of LOCAL mode's ways in (ADR 0009
+  D3 to D5, #389), run on a stand-in for the installed command, refuses a
+  way in accepted or refused for another reason, a `--help` naming
+  `local`, a call of the fake `gh`, `claude`, `opencode` or `pi`, and any
+  write to the scratch repository, its state directory, its run log or
+  `.git`, to the configuration file, or to the scratch `HOME` or `TMPDIR`;
+  among them an ordinary `step`, `resume`, `unblock` or `run` that takes
+  a lock or launches an agent CLI before it refuses while its dry run
+  behaves, and a write that leaves every byte and path as it was (a file
+  rewritten in place, replaced by a copy of itself, its times put back,
+  or a lock file taken and removed; PR #425 R1-F3, R1-F4). It hands the
+  command none of the caller's environment but `PATH`
 
 `make dist-check` (CI's `dist` job, on every CI Python) builds the real
 artifacts and runs the installed wheel outside the checkout
