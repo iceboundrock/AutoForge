@@ -20,9 +20,19 @@ so.
   of a newer controller with a phase this one lacks is reported as a newer
   protocol, no longer as `state file has unknown phase`. The mode is still
   read first, so a LOCAL file is still an unknown mode.
-- `run` over a newer controller's run no longer advises `repair it, or use
-  'run --force'`; `run --force` still moves it aside as
-  `state.json.corrupt-<timestamp>`.
+- `run` over a newer controller's run, or over a state whose label no
+  protocol has, no longer advises `repair it, or use 'run --force'`;
+  `run --force` still moves it aside as `state.json.corrupt-<timestamp>`.
+- The diagnostic's paths and the `--config` and `--state-dir` values it
+  repeats are redacted before they are cut, kept to one printable line
+  each and bounded; a value that cannot be repeated exactly as typed is a
+  labelled placeholder.
+- **Behaviour change:** a standalone state at `config.state_dir` of a
+  protocol the controller does not read (newer, or no protocol's) no
+  longer holds nothing: `epic run` and `epic resume` admit no issue at all
+  while it is there and exit 1 (`degraded`), since the issue that run
+  holds is unknown. A standalone state that does not load for any other
+  reason still holds nothing and is reported.
 - `epic status` shows a namespace state of a newer protocol as
   `uncertain(state-corrupt)` as before, but points at a controller that
   speaks it instead of `epic archive`; the scheduler's and a worker's

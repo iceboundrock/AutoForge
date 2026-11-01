@@ -117,7 +117,8 @@ locking.py          the lock domains of ADR 0008 (#180): L0 (ControllerLock, key
                     the order assertion and the scheduler's filesystem refusal
 ownership.py        who may act on an issue (ADR 0008 D17.2, #180): the forward guard's
                     ownership predicate (an open scheduler claim included, #181) and the
-                    reverse guard's standalone-state read
+                    reverse guard's standalone-state read (a state of a protocol this
+                    controller does not read admits nothing, #265)
 scheduler_state.py  the scheduler's durable bookkeeping (ADR 0008 D6, D7, D14, #181):
                     claim.json (claims, generations, the closing rule, compare-and-write
                     under L2), scheduler.json, the pure restart classification,

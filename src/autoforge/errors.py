@@ -60,14 +60,17 @@ class StateProtocolError(StateError):
     written, a scheduler namespace held ``uncertain``); the CLI adds the
     provenance diagnostic of :mod:`autoforge.provenance`.
 
-    Every attribute is already bounded and safe to print: ``label`` is the
-    persisted label's bounded ``repr``; ``support`` is
-    :class:`autoforge.state.ProtocolSupport`'s value
+    Every attribute but ``path`` is already bounded and safe to print:
+    ``label`` is the persisted label's ``repr``, redacted whole and then
+    bounded; ``support`` is :class:`autoforge.state.ProtocolSupport`'s value
     (``unsupported-newer`` or ``unsupported-unknown``); ``newer`` is the
     label as a number when it is a newer one, else ``""``; ``run_id`` and
     ``written_by`` are what the file records, kept only when they have the
-    shape the controller writes, else ``""``; ``path`` is the state file,
-    ``""`` until :meth:`at` sets it. ``headline`` is the reason's first
+    shape the controller writes, else ``""``. ``path`` is the state file,
+    ``""`` until :meth:`at` sets it, as the process has it: a fact, not
+    safe to print as it is, so a diagnostic shows it through
+    :func:`autoforge.provenance.shown_path`, and the message names it by
+    ``shown``, that function's result. ``headline`` is the reason's first
     clause, without the controller's identity, for a diagnostic that shows
     the identity on lines of its own.
     """
@@ -83,8 +86,9 @@ class StateProtocolError(StateError):
         run_id: str = "",
         written_by: str = "",
         path: str = "",
+        shown: str = "",
     ) -> None:
-        super().__init__(f"state file {path}: {reason}" if path else reason)
+        super().__init__(f"state file {shown or path}: {reason}" if path else reason)
         self.reason = reason
         self.headline = headline
         self.label = label
@@ -94,8 +98,8 @@ class StateProtocolError(StateError):
         self.written_by = written_by
         self.path = path
 
-    def at(self, path: str) -> "StateProtocolError":
-        """The same refusal, naming the state file at ``path``."""
+    def at(self, path: str, *, shown: str = "") -> "StateProtocolError":
+        """The same refusal, naming the state file at ``path``, shown as ``shown``."""
         return StateProtocolError(
             self.reason,
             headline=self.headline,
@@ -105,6 +109,7 @@ class StateProtocolError(StateError):
             run_id=self.run_id,
             written_by=self.written_by,
             path=path,
+            shown=shown,
         )
 
 

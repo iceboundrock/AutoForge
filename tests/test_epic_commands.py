@@ -1208,14 +1208,18 @@ def test_a_done_standalone_state_holds_nothing_and_a_scheduler_issue_refuses_run
     assert not (other / "state.json").exists()
 
 
-@pytest.mark.parametrize("kind", UNLOADABLE_STATES)
+@pytest.mark.parametrize("kind", [k for k in UNLOADABLE_STATES if k != "unknown-label"])
 def test_an_unloadable_standalone_state_holds_nothing_is_reported_and_is_left_alone(
     epic, tmp_path, kind
 ):
     """ADR 0009 D4 (#385): a state at ``config.state_dir`` that does not load
     holds no issue, so the pass admits as it would with none and says why;
     ``epic status`` reports it as a problem. Neither moves, rewrites or
-    creates anything there. The file would hold #2 if it loaded."""
+    creates anything there. The file would hold #2 if it loaded.
+
+    A state refused for its protocol label, the fixture's ``unknown-label``
+    ('99', a newer one) among them, is the exception and admits nothing at
+    all (#265 R1-F1; the test after this one)."""
     standalone = tmp_path / "standalone"
     e = epic({"state_dir": str(standalone)})
     b = e.b
@@ -1240,6 +1244,121 @@ def test_an_unloadable_standalone_state_holds_nothing_is_reported_and_is_left_al
     assert reason in problem
     assert doc["children"][0]["category"] == "ready-for-merge"
     assert state_tree(standalone) == before
+
+
+def _a_standalone_state_labelled(standalone: Path, issue: int, label: object) -> Path:
+    """A standalone run of ``issue`` in REVIEW, relabelled ``label`` with a phase of its own.
+
+    A newer controller may add phases; a field of the file must never be
+    read once its label is refused, so the issue it names is never held by
+    it alone. Its logs stay beside it.
+    """
+    standalone_state(standalone, issue, Phase.REVIEW)
+    state_file = standalone / "state.json"
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    data.update(protocol_version=label, phase="A_PHASE_OF_PROTOCOL_14")
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    (standalone / "logs" / "standalone").mkdir(parents=True)
+    (standalone / "logs" / "standalone" / "run.log").write_text("a run log\n", encoding="utf-8")
+    return state_file
+
+
+@pytest.mark.parametrize("label", ["14", "99", "6", "14.0", 14], ids=repr)
+def test_a_standalone_state_of_a_protocol_this_controller_does_not_read_admits_nothing(
+    epic, tmp_path, label
+):
+    """#265 R1-F1: the standalone run a newer controller (or no protocol)
+    wrote names #2, but this controller did not load it, so it cannot know
+    which issue that run holds and trusts no field of it. ``epic run`` and
+    ``epic resume`` admit nothing at all, neither #2 nor the ready #3, as
+    global uncertainty (exit 1, ``degraded``): no namespace, binding, claim
+    or worker, no PR. ``epic run --dry-run`` says it would admit nothing and
+    ``epic status`` reports why (exit 1). Nothing of the standalone state
+    changes. Once the state is one this controller reads, as it is when a
+    controller that speaks its protocol is the one used, the guard is the
+    ordinary one: #2 is held and #3 admitted."""
+    import autoforge
+
+    standalone = tmp_path / "standalone"
+    e = epic({"state_dir": str(standalone)})
+    b = e.b
+    b.issue(2)
+    b.issue(3)
+    state_file = _a_standalone_state_labelled(standalone, 2, label)
+    before = state_tree(standalone)
+    newer = isinstance(label, str) and label.isdigit() and label != "6"
+    hint = (
+        f"a controller that speaks protocol {label} reads it and holds only the issue it runs"
+        if newer
+        else "no AutoForge protocol has its label"
+    )
+    for go in (e.run, e.resume):
+        code, _, _ = go()
+        assert code == 1 and b.admitted() == [], e.said
+        assert "global uncertainty, nothing is admitted: the standalone state " in e.said
+        assert "the issue its run holds is unknown and no issue is admitted" in e.said
+        assert hint in e.said
+        assert f"imported from {os.path.abspath(autoforge.__file__)}" in e.said
+        assert "is held" not in e.said and "done (degraded)" in e.said
+        assert all(not s.children for s in b.schedulers)
+        for n in (2, 3):
+            assert b.claims(n) is None and not b.ns(n).directory.exists()
+            assert not world(b, n).exists()
+        assert load_scheduler_state(b.root, 1).invocation.end_reason is EndReason.DEGRADED
+        assert state_tree(standalone) == before
+    code, out, _ = e.cli("epic", "run", EPIC, "--dry-run")
+    assert code == 0 and "'epic run' would admit nothing:" in out and hint in out
+    assert "admitted now" not in out
+    code, doc = e.status()
+    assert code == 1
+    assert any(
+        p.startswith(f"the standalone state {state_file} cannot be read: ") for p in doc["problems"]
+    )
+    assert any(
+        p.startswith("'epic run' and 'epic resume' admit nothing: ") and hint in p
+        for p in doc["problems"]
+    )
+    assert state_tree(standalone) == before
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    data.update(protocol_version="13", phase="REVIEW")
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    code, _, _ = e.run()
+    assert code == 0 and b.admitted() == [3], e.said
+    assert "issue #2 is held: the standalone state" in e.said
+    assert "global uncertainty" not in e.said
+    assert b.claims(2) is None
+
+
+def test_a_credential_in_a_refused_label_is_redacted_before_it_is_cut(epic, tmp_path):
+    """#265 R1-F2, the scheduler's rendering: a label holding a credential
+    that crosses the refusal's 64-character cut is redacted whole before it
+    is cut, in a namespace state's report and its ``epic status`` row and in
+    the standalone state's problem, so no part of the key is printed."""
+    from .conftest import GOOGLE_API_KEY
+
+    label = "14 " + "a" * 36 + " " + GOOGLE_API_KEY
+    start = repr(label).index("AIza")
+    assert start < 64 - len(" [... cut]") < start + len(GOOGLE_API_KEY)  # it crosses the cut
+    standalone = tmp_path / "standalone"
+    e = epic({"state_dir": str(standalone)})
+    b = e.b
+    b.issue(2)
+    _bind(b, 2, issue_id=b.graph.issue(2, R).id)
+    standalone_state(b.ns(2).state_dir, 2, Phase.REVIEW)
+    data = json.loads(b.ns(2).state_file.read_text(encoding="utf-8"))
+    data.update(protocol_version=label)
+    b.ns(2).state_file.write_text(json.dumps(data), encoding="utf-8")
+    _a_standalone_state_labelled(standalone, 3, label)
+    code, out, err = e.run()
+    assert code == 1 and b.admitted() == []
+    assert "issue #2 is uncertain: state file " in e.said
+    assert "the standalone state " in e.said and "unsupported protocol_version '14 " in e.said
+    for text in (e.said, out, err):
+        assert "AIza" not in text and "SyFAKE" not in text
+    code, doc = e.status()
+    assert code == 1 and "unsupported protocol_version '14 " in e.rows()[2]["detail"]
+    assert "AIza" not in json.dumps(doc) and "SyFAKE" not in json.dumps(doc)
 
 
 @pytest.mark.parametrize("mode", ["SATELLITE", None, "LOCAL"])

@@ -19,6 +19,8 @@
   generalization.
 - **Amended by #243:** D9.4 (operator actions, ADR 0004 K10, at worker
   entry and in `epic status`).
+- **Amended by #265:** D17.2's reverse guard (a standalone state of a
+  protocol the controller does not read admits nothing at all).
 - **Where:** placement is decided per decision and collected in §5.
   Existing code this record builds on: `src/autoforge/locking.py`,
   `engine.py`, `state.py`, `transitions.py`, `cli.py`, `executor.py`,
@@ -1494,6 +1496,15 @@ migrated. **Exclusion in time** is L0 (D10).
     a standalone run's loop bounds or bypass its `unblock`.
   - An unreadable standalone state holds nothing by itself, but is
     reported. Admission does not depend on parsing it.
+  - **Amended by #265.** One exception: a standalone state refused for its
+    `protocol_version` (a newer protocol's, or a label no protocol has) may
+    be a live run that another controller continues, and the issue it
+    holds is a field of a file that was not loaded. No field of it is
+    trusted, so it is global uncertainty (D14.3): the scheduler admits
+    nothing at all, neither the issue it names nor any other, and exits
+    `degraded` before its first snapshot. `epic run --dry-run` and `epic
+    status` report it. A controller that reads the state holds its one
+    issue as above.
   - Other `--state-dir` locations are unknowable, so the scheduler may admit
     an issue such a state names. The forward guard then refuses to continue
     that state. That residual is today's (two sequential runs with

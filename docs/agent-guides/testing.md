@@ -320,11 +320,20 @@ High-priority coverage includes:
   `status --json`, `step`, `resume`, `unblock` (with and without
   `--dry-run`) and `run` exit 2 with the diagnostic and leave the state
   directory, its logs and the lock as they were; a newer run that replaces
-  the file once the lock is taken is refused by the load under it; `run`
-  does not suggest `--force`, and `--force` still moves the file aside
-  whole. A namespace state of a newer protocol is held as uncertain with
-  the controller named and no `epic archive` advice, a worker refuses one
-  unchanged, a standalone one is the reverse guard's problem, and
+  the file once the lock is taken is refused by the load under it, with a
+  `result` line that claims nothing the lock's own record contradicts;
+  `run` does not suggest `--force` for a newer label or for one no protocol
+  has, and `--force` still moves the file aside whole. Every value is
+  redacted before it is cut (a credential crossing the cut of a label, a
+  path, the CLI's lines and the scheduler's), and a state directory or
+  configuration path holding a newline, an escape or more than 1024
+  characters gives one printable, bounded line each, with a labelled
+  placeholder in the recovery command. A namespace state of a newer
+  protocol is held as uncertain with the controller named and no `epic
+  archive` advice, a worker refuses one unchanged, and a standalone one,
+  newer or of no protocol, makes `epic run` and `epic resume` admit
+  nothing at all (exit 1, no namespace, claim or worker), which the dry
+  run and `epic status` report, until it is a state this controller reads;
   `doctor`'s `controller` row reads no state
 - the state pins of LOCAL's removal (ADR 0009 D4, D8, D12 S1b; #385;
   `tests/test_state.py`, `tests/test_replan.py`, `tests/test_cli.py`,
@@ -339,7 +348,8 @@ High-priority coverage includes:
   `run --force` moves the file aside byte for byte, beside an archive of
   the same name it does not replace, prints the move and starts a run with
   nothing of it. Such a file at `config.state_dir` holds no issue and is
-  reported by the scheduler's pass and by `epic status`, a namespace state
+  reported by the scheduler's pass and by `epic status` (one refused for
+  its label admits nothing at all since #265), a namespace state
   of any mode but REMOTE holds its issue as uncertain, and no `epic`
   command touches `<git dir>/autoforge/state`. They keep passing after the
   removal, with only the expected protocol label moved to 13 (#388)

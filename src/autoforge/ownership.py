@@ -28,7 +28,13 @@ continue it.
   scheduler namespace never launders a standalone run's loop bounds or
   bypasses its ``unblock``; #182's admission holds it as
   ``held:standalone-state``. An unreadable standalone state is reported and
-  holds nothing.
+  holds nothing, with one exception: one whose ``protocol_version`` this
+  controller does not read (a newer protocol's, or a label no protocol has;
+  :class:`~autoforge.errors.StateProtocolError`) may be a live run another
+  controller continues, and which issue it holds is a field of the unloaded
+  file, which nothing here trusts. It therefore blocks every admission
+  (:attr:`StandaloneHold.blocks_admission`, :func:`admission_refusal`), as
+  global uncertainty does, until a controller that reads it is used (#265).
 
 Everything here only reads: nothing is created, written, quarantined or
 locked, and no GitHub or git process runs.
@@ -40,8 +46,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import ConfigurationError, LockError, SchedulerOwnedIssueError, StateError
+from .errors import (
+    ConfigurationError,
+    LockError,
+    SchedulerOwnedIssueError,
+    StateError,
+    StateProtocolError,
+)
 from .locking import issue_run_lock_live
+from .provenance import shown_path
 from .redaction import redact
 from .run_namespace import StateStatus, issue_namespace, load_issue_namespace
 from .safefs import SafeRoot
@@ -179,7 +192,11 @@ class StandaloneHold:
     ``issue_number`` (with ``issue_url`` and ``phase``) is set when the state
     names an issue in a phase other than ``DONE``; ``problem`` (redacted and
     bounded) when the state exists but cannot be read, which holds nothing
-    and is reported.
+    and is reported. ``refused_protocol`` is set, besides ``problem``, when
+    what refused it is its ``protocol_version`` (#265): the
+    :class:`~autoforge.state.ProtocolSupport` value, ``unsupported-newer``
+    or ``unsupported-unknown``, with ``newer_protocol`` the newer label, a
+    decimal number, or ``""``. Nothing else of that file is kept.
     """
 
     state_file: Path
@@ -187,10 +204,54 @@ class StandaloneHold:
     issue_url: str = ""
     phase: str = ""
     problem: str = ""
+    refused_protocol: str = ""
+    newer_protocol: str = ""
 
     @property
     def holds(self) -> bool:
         return self.issue_number is not None
+
+    @property
+    def blocks_admission(self) -> bool:
+        """Whether no issue may be admitted while this state is there (#265 R1-F1).
+
+        A state of a protocol this controller does not read was not loaded,
+        so the issue it holds is unknown: it could be any issue of the EPIC,
+        and a controller that reads it may be continuing it. Holding the one
+        issue its ``current_issue_url`` names would trust a field of a file
+        that was refused, so every admission is refused instead.
+        """
+        return bool(self.refused_protocol)
+
+
+def admission_refusal(hold: StandaloneHold) -> str:
+    """Why a scheduler admits nothing while ``hold``'s state is there; ``""`` when it may.
+
+    One line, its path shown safely (:func:`~autoforge.provenance.shown_path`),
+    naming no field of the refused file but its newer label, a decimal
+    number. A newer state points at a controller that speaks that protocol,
+    which reads the standalone state and holds the one issue it names; a
+    label no protocol has points at the operator's recovery in
+    ``docs/usage.md``. Neither moves, edits or archives anything.
+    """
+    if not hold.blocks_admission:
+        return ""
+    if hold.newer_protocol:
+        then = (
+            f"a controller that speaks protocol {hold.newer_protocol} reads it and holds only "
+            "the issue it runs: use that controller for 'epic run' and 'epic resume', from "
+            "this checkout and with this --config"
+        )
+    else:
+        then = (
+            "no AutoForge protocol has its label, so no controller reads it as it is; see "
+            "'A run a newer controller wrote' in docs/usage.md"
+        )
+    return (
+        f"the standalone state {shown_path(str(hold.state_file))} is of a protocol this "
+        "controller does not read, so the issue its run holds is unknown and no issue is "
+        f"admitted while it is there; {then}"
+    )
 
 
 def standalone_hold(state_dir: str | Path) -> StandaloneHold:
@@ -201,7 +262,9 @@ def standalone_hold(state_dir: str | Path) -> StandaloneHold:
     to continue them instead. An absent state, a ``DONE`` state and a state
     naming no issue hold nothing; one that does not load, a LOCAL one among
     them (ADR 0009 D4), holds nothing either and is the hold's ``problem``.
-    Nothing is created, quarantined or written.
+    One refused for its ``protocol_version`` is a ``problem`` too, and
+    :attr:`StandaloneHold.blocks_admission` (#265). Nothing is created,
+    quarantined or written.
     """
     state_file = Path(state_dir) / STATE_FILENAME
     try:
@@ -224,6 +287,13 @@ def standalone_hold(state_dir: str | Path) -> StandaloneHold:
                 gone = False
             if gone:
                 return StandaloneHold(state_file)
+            if isinstance(exc, StateProtocolError):
+                return StandaloneHold(
+                    state_file,
+                    problem=_bounded(str(exc)),
+                    refused_protocol=exc.support,
+                    newer_protocol=exc.newer,
+                )
             return StandaloneHold(state_file, problem=_bounded(str(exc)))
     if state.phase is Phase.DONE:
         return StandaloneHold(state_file, phase=state.phase.value)

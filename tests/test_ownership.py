@@ -21,6 +21,7 @@ from autoforge.locking import IssueRunLock
 from autoforge.ownership import (
     MAX_REASON_CHARS,
     StandaloneHold,
+    admission_refusal,
     refuse_scheduler_owned_issue,
     scheduler_ownership,
     standalone_hold,
@@ -290,17 +291,22 @@ def test_what_holds_nothing(tmp_path, state):
     assert not os.path.lexists(sd) or state != "absent dir"
 
 
-@pytest.mark.parametrize("damage", ["garbage", "symlink", "local", "newer"])
+@pytest.mark.parametrize("damage", ["garbage", "symlink", "local", "newer", "unknown"])
 def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, damage):
     """A LOCAL run's state among them: the pass no longer skips it as LOCAL's
     own (ADR 0009 D4, #387), so it is the hold's problem like any state that
-    does not load, and the pass still admits (``test_epic_commands``). So is
-    a newer controller's state, whose problem names this controller (#265)."""
+    does not load, and the pass still admits (``test_epic_commands``).
+
+    A state refused for its protocol label, a newer controller's or one no
+    protocol has, holds no issue by itself either, since nothing of the
+    unloaded file is trusted, the issue it names included; but it blocks
+    every admission instead (#265 R1-F1, ``blocks_admission``), and its
+    problem names this controller."""
     sd = tmp_path / ".autoforge"
     sd.mkdir()
-    if damage == "newer":
+    if damage in ("newer", "unknown"):
         newer = _state(7, Phase.REVIEW).to_dict()
-        newer.update(protocol_version="14")
+        newer.update(protocol_version="14" if damage == "newer" else "6")
         (sd / "state.json").write_text(json.dumps(newer), encoding="utf-8")
     elif damage == "garbage":
         (sd / "state.json").write_text("{ not json " + "ghp_" + "b" * 36)
@@ -331,9 +337,39 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     assert len(hold.problem) <= MAX_REASON_CHARS
     if damage == "local":
         assert "state file has unknown mode 'LOCAL'" in hold.problem
-    if damage == "newer":
+    if damage in ("newer", "unknown"):
         import autoforge
 
-        assert "unsupported protocol_version '14' (controller speaks '13')" in hold.problem
+        label = "14" if damage == "newer" else "6"
+        assert f"unsupported protocol_version '{label}' (controller speaks '13')" in hold.problem
         assert f"imported from {os.path.abspath(autoforge.__file__)}" in hold.problem
+        assert hold.blocks_admission and hold.issue_number is None and hold.issue_url == ""
+        assert (hold.refused_protocol, hold.newer_protocol) == (
+            ("unsupported-newer", "14") if damage == "newer" else ("unsupported-unknown", "")
+        )
+        refusal = admission_refusal(hold)
+        assert refusal.startswith(
+            f"the standalone state {sd / 'state.json'} is of a protocol this controller does "
+            "not read, so the issue its run holds is unknown and no issue is admitted"
+        )
+        assert "#7" not in refusal and "issues/7" not in refusal  # no field of the file
+        if damage == "newer":
+            assert "a controller that speaks protocol 14 reads it" in refusal
+        else:
+            assert "no AutoForge protocol has its label" in refusal
+        assert "--force" not in refusal and "archive" not in refusal
+    else:
+        assert not hold.blocks_admission and admission_refusal(hold) == ""
     assert _tree(sd) == before, "never quarantined, created or written"
+
+
+def test_an_admission_refusal_shows_its_path_on_one_bounded_line(tmp_path):
+    """#265 R1-F3: the configured state directory is the operator's, and its
+    name may hold a newline or an escape; the refusal shows it as one
+    printable, bounded line."""
+    for name in ("a\nautoforge epic: forged", "b\x1b[2J", "c" * 2000):
+        hold = StandaloneHold(
+            tmp_path / name / "state.json", problem="x", refused_protocol="unsupported-unknown"
+        )
+        refusal = admission_refusal(hold)
+        assert refusal.isprintable() and len(refusal) < 1024 + 400

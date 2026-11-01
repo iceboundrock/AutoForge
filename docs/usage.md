@@ -654,7 +654,7 @@ scheduler keeps the repository lock until it exits, so wait for it (or
 | Exit | `epic run` / `epic resume` |
 |---|---|
 | 0 | nothing more is admissible and no claim is left open, or a drain finished |
-| 1 | global uncertainty: admission degraded (the snapshot, `scheduler.json` or a namespace could not be trusted); see `epic status` |
+| 1 | global uncertainty: admission degraded (the snapshot, `scheduler.json`, a namespace, or a standalone state of a protocol this controller does not read could not be trusted; [A run a newer controller wrote](#a-run-a-newer-controller-wrote)); see `epic status` |
 | 2 | refused before anything ran: the repository lock is held (a scheduler, a standalone command or a surviving worker), open claims (`epic run`), `--state-dir`, an EPIC of another repository than the checkout's `origin` |
 | 3 | it ended with claims of the EPIC still open (each is listed with its next command): `epic status`, then `epic resume` or `epic archive` |
 | 130 | interrupted: Ctrl-C, a signal, or `epic stop --now` |
@@ -1333,13 +1333,15 @@ ownership or discard uncommitted user changes.
   exit 2 and never overwrite it. `run --force` moves it aside as
   `state.json.corrupt-<timestamp>` (never deletes it) and starts a new run;
   see [State and recovery](agent-guides/state-and-recovery.md#persistent-state).
-  A file whose only problem is a newer controller's label is not
-  corrupt: see the next entry.
+  A file refused for its protocol label alone is not this entry's: see
+  the next one.
 - **"unsupported protocol_version '14' (controller speaks '13'): a newer
-  AutoForge wrote it"** (exit 2), followed by an `AutoForge
-  controller/state protocol mismatch` block: the command imported a
-  controller older than the one that wrote the run. Nothing was written.
-  See [A run a newer controller wrote](#a-run-a-newer-controller-wrote).
+  AutoForge wrote it"** or **"... no AutoForge protocol has that label"**
+  (exit 2), followed by an `AutoForge controller/state protocol mismatch`
+  block: the command imported a controller older than the one that wrote
+  the run, or the label is none a controller writes. The state file and
+  its run logs were not rewritten. See
+  [A run a newer controller wrote](#a-run-a-newer-controller-wrote).
 - **`LockError`:** another controller holds the repository lock (a
   standalone command, or a parallel EPIC scheduler or one of its surviving
   workers), or a lock entry under `.git/autoforge/` is not a regular file
@@ -1383,7 +1385,7 @@ AutoForge controller/state protocol mismatch
   import:     /home/me/code/AutoForge/src/autoforge/__init__.py
   python:     /home/me/code/AutoForge/.venv/bin/python
   cwd:        /home/me/code/AutoForge
-  result:     refused before anything was written: the state file, its run logs and the agent worktree are unchanged; no agent was launched and nothing was written to GitHub
+  result:     refused: the state file and its run logs were not rewritten, the agent worktree was not touched, no agent was launched and nothing was written to GitHub
   next:       a newer controller wrote this run. With one that speaks protocol 11, from the cwd above and with this command's --config and --state-dir, start with:
                 <an autoforge that speaks protocol 11> --config /home/me/autoforge.yaml --state-dir .autoforge/AutoForge-issue-243 status
               What an interpreter imports: <its python> -c 'import autoforge as a; print(a.__protocol_version__, a.__file__)'
@@ -1400,7 +1402,15 @@ a checkout and the `uv` project you think you selected are not consulted.
 it has the shape a controller writes; nothing else of the file is
 vouched for. The `next` command names the flags this command was given,
 as typed, and a placeholder for the controller: AutoForge does not know
-where a compatible one is.
+where a compatible one is. A flag value is repeated only when it can be
+shown exactly as typed: one holding a character that is not printable (a
+newline, an escape sequence), longer than 1024 characters or shaped like
+a credential is replaced by a labelled placeholder (`<the --state-dir
+value this command was given>`), and a line under the command says so;
+put back the value you typed. Every path in the block, the first line's
+included, is redacted, escaped as a Python string when it holds a
+character that is not printable, and cut at 1024 characters, in that
+order.
 
 **Exit status.** 2, as for any state that does not load; stdout is empty
 (`status --json` prints no document) and the diagnostic is on stderr.
@@ -1409,14 +1419,25 @@ too), and `run` without `--force`, all refuse this way before they take
 the lock, open a run log, record a configuration or read GitHub. `step`, `resume`
 and `unblock` load the state again once they hold the lock, and only
 that load is acted on: a newer run that replaced the file in between is
-refused there, the same way. `run` adds `refusing to start a new run over
-run <id>, which this controller cannot read` and does not suggest
-`--force`: `run --force` would move the newer run aside as
+refused there, the same way, with the same block. Its `result` line says
+only what holds in both: taking the lock may already have created or
+rewritten the lock's own PID record, so it does not say that nothing was
+written. `run` adds `refusing to start a new run over run <id>, which
+this controller cannot read` and does not suggest `--force`:
+`run --force` would move the run aside as
 `state.json.corrupt-<timestamp>` (as it does any state that does not load)
-and start another, which does not continue it. A label no AutoForge
-protocol has (`'6'`, `'14.0'`, a number instead of a string) is the same
-refusal with "no AutoForge protocol has that label": the file was edited
-or is not AutoForge's, and the entry above applies.
+and start another, which does not continue it.
+
+**A label no protocol has.** A label no AutoForge protocol has (`'6'`,
+`'14.0'`, a number instead of a string) is the same refusal with "no
+AutoForge protocol has that label", and the same `run` refusal without
+`--force`. No controller reads the file as it is, and this one cannot
+tell which wrote it: a hand edit, a copy from somewhere else, a file that
+is not AutoForge's, or a controller you did not mean to run. Check the
+`import` and `python` lines and that `state` is the run's file (the
+working directory, `--config` and `--state-dir` you meant). If the run's
+own file was replaced, restore it from your backup; AutoForge suggests no
+edit of it, and does not set it aside for you.
 
 **In a scheduler namespace**, the same state is held: `epic run` and
 `epic resume` report `issue #<n> is uncertain: ...` with the refusal and
@@ -1425,6 +1446,22 @@ other issues; `epic status` shows the row as
 `uncertain(state-corrupt)` (exit 1), says that a controller speaking the
 newer protocol reads and continues it, and offers no `epic archive`. A
 worker that finds one exits 2 before its first step.
+
+**As the configured standalone state** (`config.state_dir`), it stops
+the scheduler from admitting anything. A standalone state this controller
+reads holds the one issue it runs (`held:standalone-state`), but one of a
+protocol it does not read was not loaded, so the issue it holds is
+unknown, and a newer controller may be continuing it. `epic run` and
+`epic resume` therefore report `global uncertainty, nothing is admitted:
+the standalone state <path> is of a protocol this controller does not
+read, ...` and exit 1 (`degraded`) before the first snapshot: no issue is
+admitted, claimed or started, the issue that run names or any other.
+`epic run --dry-run` says `'epic run' would admit nothing`, and `epic
+status` reports it as a problem (exit 1). For a newer label, use a
+controller that speaks that protocol for the `epic` commands, from the
+same checkout and with the same `--config`: it reads the standalone state
+and holds only its issue. For a label no protocol has, see the paragraph
+above. Nothing moves, edits or archives the standalone state for you.
 
 **What led to it, and how to recover.** In the case that motivated this
 diagnostic (#243, PR #254), a run was written by PR #254's code, which

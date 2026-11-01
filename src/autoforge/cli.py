@@ -114,7 +114,7 @@ from .interaction import (
 )
 from .locking import ControllerLock, repository_lock_path
 from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
-from .provenance import ControllerIdentity, mismatch_lines, protocol_ranges
+from .provenance import ControllerIdentity, mismatch_lines, protocol_ranges, refusal_headline
 from .redaction import redact, redact_argv, redact_dict, redact_obj
 from .replan_txn import ReplanTransaction
 from .run_namespace import namespace_issue_of_state_dir
@@ -517,10 +517,12 @@ def _print_protocol_mismatch(exc: StateProtocolError, flags: tuple[str, ...]) ->
     refusal (its headline; the identity follows on lines of its own), then
     the running controller (:class:`~autoforge.provenance.ControllerIdentity`),
     the state file and this command's working directory and flags. The exit
-    status stays the StateError's 2.
+    status stays the StateError's 2. Every path and flag value in it is
+    redacted, kept to one line and bounded, the headline's state file
+    included (:func:`~autoforge.provenance.refusal_headline`); a flag value
+    that cannot be repeated faithfully is a labelled placeholder (#265 R1-F3).
     """
-    where = f"state file {exc.path}: " if exc.path else ""
-    print(redact(f"autoforge: error: {where}{exc.headline}"), file=sys.stderr)
+    print(refusal_headline(exc), file=sys.stderr)
     try:
         cwd = os.getcwd()
     except OSError:
@@ -1408,10 +1410,13 @@ def _existing_run_guard(
     except StateError as exc:
         # Unreadable / foreign-protocol state is fatal: a fresh run must
         # never silently replace it (merge counters etc. would be lost).
-        if not force and isinstance(exc, StateProtocolError) and exc.newer:
-            # A newer controller's run, which that controller continues:
-            # neither repairing the file nor setting it aside is advice
-            # for it (#265). `--force` still moves it aside, unchanged.
+        if not force and isinstance(exc, StateProtocolError):
+            # A label this controller does not read, newer or no protocol's
+            # at all: the run may be one a newer controller continues, or
+            # one only the operator can account for, and neither repairing
+            # the file nor setting it aside continues it, so neither is
+            # advice for it (#265, R1-F4). `--force` still moves it aside,
+            # unchanged.
             _print_protocol_mismatch(exc, engine.cli_global_flags)
             print(
                 redact(
@@ -1428,12 +1433,6 @@ def _existing_run_guard(
                 f"state file — repair it, or use '{command} --force' to move it "
                 f"aside as {paths.state_file.name}.corrupt-<timestamp> and start over"
             )
-            if isinstance(exc, StateProtocolError):
-                # A label no controller writes: corrupt, and named by the
-                # controller that refused it (#265).
-                _print_protocol_mismatch(exc, engine.cli_global_flags)
-                print(redact(refusal), file=sys.stderr)
-                return 2, False
             # The error quotes the field it could not read (an unknown phase
             # is echoed verbatim), so the refusal is state-derived output
             # like the terminal lines and crosses the boundary assembled.

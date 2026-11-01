@@ -461,18 +461,31 @@ refusal keeps the loader's words (`unsupported protocol_version '14'
 (controller speaks '13')`), adds the running controller's identity
 (`provenance.ControllerIdentity`: the imported package's `__file__`,
 `sys.executable`, its version and protocol), and `load_state` adds the
-file's path. The label is quoted as a bounded `repr`; the file's `run_id`
-and `controller_version` are carried only in the shape a controller
-writes them. The classification and the refusal are the loader itself,
-not a second decoder: every path that loads a state (the CLI before and
-under the lock, `engine.existing_run`, a worker, the scheduler's namespace
-read, the reverse guard's standalone read) refuses the same file the same
-way, and the load under the lock is the one acted on. The CLI prints the
+file's path. The label is quoted as its `repr`, redacted whole and only
+then bounded (`provenance.shown`), so a credential that crosses the cut is
+still recognised; the file's `run_id` and `controller_version` are
+carried only in the shape a controller writes them. The classification
+and the refusal are the loader itself, not a second decoder: every path
+that loads a state (the CLI before and under the lock,
+`engine.existing_run`, a worker, the scheduler's namespace read, the
+reverse guard's standalone read) refuses the same file the same way, and
+the load under the lock is the one acted on. The CLI prints the
 headline and the `AutoForge controller/state protocol mismatch` block on
-stderr and exits 2; `run`'s refusal of a newer controller's run suggests
-neither a repair nor `--force`, which still moves it aside unchanged.
-Recovery is the operator's: [usage.md](../usage.md#a-run-a-newer-controller-wrote).
-No field and no protocol number came with this.
+stderr and exits 2. Every path in it, the headline's state file included,
+goes through `provenance.shown_path` (redacted, then `repr`-escaped when
+it holds a character that is not printable, then bounded), and the
+recovery command repeats a `--config` or `--state-dir` value only when it
+is printable, at most 1024 characters and nothing the redaction changes,
+else a labelled placeholder (`<the --state-dir value this command was
+given>`). Its `result` line states what holds both before the lock and
+under it, where taking the lock may already have written the lock's PID
+record: the state file and its run logs were not rewritten, the agent
+worktree was not touched, no agent was launched and nothing was written to
+GitHub. `run`'s refusal of a file whose label is refused, newer or no
+protocol's, suggests neither a repair nor `--force` (which still moves it
+aside unchanged when given). Recovery is the operator's:
+[usage.md](../usage.md#a-run-a-newer-controller-wrote). No field and no
+protocol number came with this.
 
 `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
 instead of deleting it (a symlink is archived as a link; its target is never
@@ -697,7 +710,13 @@ takes L1:
   the configured standalone state names as `current_issue_url` while its
   phase is anything but `DONE` (`BLOCKED` and `FAILED` included), which
   the scheduler holds as `held:standalone-state` (#182); an unreadable
-  standalone state is reported and holds nothing.
+  standalone state is reported and holds nothing, except one refused for
+  its `protocol_version` (newer, or no protocol's; #265). Which issue that
+  run holds is a field of a file that was not loaded, and a controller that
+  reads it may be continuing it, so `StandaloneHold.blocks_admission` makes
+  the scheduler admit nothing at all: global uncertainty (D14.3), admission
+  `degraded`, exit 1, before the first snapshot, with no claim, namespace
+  or worker; `epic run --dry-run` and `epic status` say so.
 
 ---
 

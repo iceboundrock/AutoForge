@@ -71,7 +71,7 @@ from .errors import (
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .git_transport import local_git_request
 from .locking import IssueRunLock, issue_run_lock_live, repository_lock_path
-from .ownership import StandaloneHold, standalone_hold
+from .ownership import StandaloneHold, admission_refusal, standalone_hold
 from .redaction import redact, redact_dict
 from .run_namespace import (
     EpicRef,
@@ -937,13 +937,23 @@ def _expected(
     return ExpectedIdentity(identity.repository_id, issue_ids, repository=repository)
 
 
-def _standalone(state_dir: str | Path, repository: str) -> tuple[StandaloneHold | None, str]:
+def _standalone(state_dir: str | Path, repository: str) -> tuple[StandaloneHold | None, str, str]:
+    """The standalone hold of this repository, the read's problem, and the admission refusal.
+
+    The refusal is ``""`` unless the standalone state is of a protocol this
+    controller does not read (:func:`~autoforge.ownership.admission_refusal`,
+    #265): then ``epic run`` and ``epic resume`` admit nothing at all.
+    """
     hold = standalone_hold(state_dir)
     if hold.problem:
-        return None, f"the standalone state {hold.state_file} cannot be read: {hold.problem}"
+        return (
+            None,
+            f"the standalone state {hold.state_file} cannot be read: {hold.problem}",
+            admission_refusal(hold),
+        )
     if hold.holds and _same_repository(hold.issue_url, repository):
-        return hold, ""
-    return None, ""
+        return hold, "", ""
+    return None, "", ""
 
 
 def collect_status(
@@ -981,8 +991,11 @@ def collect_status(
         else "not classified: neither GitHub nor scheduler.json identifies the EPIC and its "
         "repository"
     )
-    hold, hold_problem = _standalone(standalone_state_dir, repository)
+    hold, hold_problem, refusal = _standalone(standalone_state_dir, repository)
     problems: list[str] = [hold_problem] if hold_problem else []
+    if refusal:
+        # 'epic run' and 'epic resume' admit nothing while it is there (#265).
+        problems.append(f"'epic run' and 'epic resume' admit nothing: {refusal}")
     if not github_problem:
         problems.extend(_foreign_scheduler(scheduler, identity, repository))
     try:
@@ -1187,9 +1200,11 @@ def dry_run_plan(
             and found.classification.kind is ClassificationKind.RESUMABLE
         ):
             resumable.add(number)
-    hold, hold_problem = _standalone(standalone_state_dir, epic.repository)
+    hold, hold_problem, refusal = _standalone(standalone_state_dir, epic.repository)
     if hold_problem:
         out.append(hold_problem)
+    if refusal:
+        blocked.append(refusal)
     if hold is not None and hold.issue_number is not None:
         facts.setdefault(hold.issue_number, LocalFact.HELD_STANDALONE_STATE)
     verdicts = evaluate(snapshot, facts)

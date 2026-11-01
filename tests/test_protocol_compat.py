@@ -25,8 +25,11 @@ from autoforge.errors import StateError, StateProtocolError
 from autoforge.provenance import (
     MAX_PATH_CHARS,
     ControllerIdentity,
+    command_words,
     mismatch_lines,
     protocol_ranges,
+    refusal_headline,
+    shown,
     shown_path,
 )
 from autoforge.state import (
@@ -267,6 +270,119 @@ def test_shown_path_is_one_bounded_redacted_line():
     assert GOOGLE_KEY_BODY not in shown_path(f"/home/{GOOGLE_API_KEY}/autoforge")
 
 
+_CUT = " [... cut]"
+
+
+def _crossing(limit: int, *, before: str = "", quoted: bool = False) -> str:
+    """A text whose credential starts before ``limit``'s cut and ends after it."""
+    lead = len(before) + (1 if quoted else 0)
+    pad = (limit - len(_CUT)) - lead - 12  # the key's first 12 characters fall before the cut
+    text = before + "x" * (pad - 1) + "/" + GOOGLE_API_KEY + "/state.json"
+    shown_form = repr(text) if quoted else text
+    start = shown_form.index("AIza")
+    assert start < limit - len(_CUT) < start + len(GOOGLE_API_KEY)
+    return text
+
+
+def test_a_credential_crossing_the_cut_is_redacted_whole_before_it(tmp_path):
+    """#265 R1-F2: a value is redacted whole, then cut. Cutting first would
+    leave the key's first characters, no longer a shape the redaction knows,
+    on the line: a path, a protocol label and a refusal's message alike."""
+    path = _crossing(MAX_PATH_CHARS, before="/home/")
+    for text in (shown_path(path), shown(path, MAX_PATH_CHARS)):
+        assert len(text) <= MAX_PATH_CHARS and text.endswith("[... cut]")
+        assert "AIza" not in text and "SyFAKE" not in text
+    label = _crossing(64, before="14 ", quoted=True)
+    exc = _refusal(tmp_path, protocol_version=label)
+    assert len(exc.label) <= 64 and exc.label.endswith("[... cut]")
+    assert exc.label.startswith("'14 xxx")
+    for text in (exc.label, exc.headline, exc.reason, str(exc)):
+        assert "AIza" not in text and "SyFAKE" not in text
+    lines = mismatch_lines(
+        exc, identity=ControllerIdentity.current(), reads="1-5 and 7-13", cwd=path, flags=()
+    )
+    text = "\n".join([refusal_headline(exc), *lines])
+    assert "AIza" not in text and "SyFAKE" not in text
+
+
+def test_the_headline_names_the_state_file_on_one_bounded_line(tmp_path):
+    """#265 R1-F3: the headline is the diagnostic's first line, and the state
+    file's path in it, newline, escape or length and all, is shown like every
+    other path (``shown_path``): it cannot start a forged line, emit a
+    terminal control sequence or run on."""
+    exc = _refusal(tmp_path, protocol_version="14")
+    for path in (
+        "/srv/state\nautoforge: error: forged/state.json",
+        "/srv/\x1b]0;title\x07\x1b[2J/state.json",
+        "/srv/" + "p" * (3 * MAX_PATH_CHARS) + "/state.json",
+    ):
+        headline = refusal_headline(exc.at(path))
+        assert headline.startswith("autoforge: error: state file ")
+        assert headline.isprintable() and "\x1b" not in headline and "\n" not in headline
+        assert len(headline) <= MAX_PATH_CHARS + 200
+        assert shown_path(path) in headline
+        assert headline.endswith(exc.headline)
+        assert shown_path(path) in str(exc.at(path, shown=shown_path(path)))
+
+
+def test_a_flag_value_not_safe_to_repeat_is_a_labelled_placeholder():
+    """#265 R1-F3: a recovery command repeats a flag value only when it is
+    the value typed, printable, bounded and nothing the redaction changes;
+    shell quoting alone keeps a word one argument, not one safe line."""
+    words, held = command_words(("--config", "my config.yaml", "--state-dir", ".autoforge/x"))
+    assert (words, held) == (["--config", "'my config.yaml'", "--state-dir", ".autoforge/x"], False)
+    for bad in (
+        "cfg\nautoforge: error: forged",
+        "cfg\x1b[31m.yaml",
+        "cfg\u202e.yaml",
+        "c" * (MAX_PATH_CHARS + 1),
+        f"/home/{GOOGLE_API_KEY}.yaml",
+    ):
+        words, held = command_words(("--config", bad, "--state-dir", "sd"))
+        assert held
+        assert words == [
+            "--config",
+            "<the --config value this command was given>",
+            "--state-dir",
+            "sd",
+        ]
+        words, held = command_words(("--config", "c.yaml", "--state-dir", bad))
+        assert held and words[-1] == "<the --state-dir value this command was given>"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "sd\nautoforge: error: forged",
+        "sd\x1b[2J\x1b[31m",
+        "s" * (4 * MAX_PATH_CHARS),
+        f"/home/{GOOGLE_API_KEY}",
+    ],
+    ids=["newline", "escape", "long", "credential"],
+)
+def test_the_recovery_guidance_is_bounded_and_escaped_line_by_line(tmp_path, value):
+    exc = _refusal(tmp_path, protocol_version="14")
+    identity = ControllerIdentity("0.1.0", "13", "v14", "/src/autoforge/__init__.py", "/py")
+    lines = mismatch_lines(
+        exc.at(value),
+        identity=identity,
+        reads="1-5 and 7-13",
+        cwd=value,
+        flags=("--config", value, "--state-dir", value),
+    )
+    for line in lines:
+        assert line.isprintable() and "\x1b" not in line, line
+        assert len(line) <= 2 * MAX_PATH_CHARS + 300, len(line)
+        assert not line.startswith("autoforge: error: forged")
+        assert "AIza" not in line and GOOGLE_KEY_BODY not in line
+    command = next(line for line in lines if "<an autoforge that speaks protocol 14>" in line)
+    assert command.strip() == (
+        "<an autoforge that speaks protocol 14> --config <the --config value this command was "
+        "given> --state-dir <the --state-dir value this command was given> status"
+    )
+    assert any("put back the value you typed" in line for line in lines)
+
+
 def _refusal(tmp_path: Path, **changes: object) -> StateProtocolError:
     with pytest.raises(StateProtocolError) as refused:
         load_state(_saved(tmp_path, **changes))
@@ -301,9 +417,12 @@ def test_the_diagnostic_of_a_newer_label_names_a_controller_to_use_by_placeholde
     for advice in ("--force", "edit the", "downgrade", "install", "checkout", "PYTHONPATH"):
         assert advice not in text, advice
     assert "Leave the state file as it is" in text
+    assert "<the --" not in text and "put back" not in text  # every flag was shown as typed
 
 
 def test_the_diagnostic_of_an_unknown_label_names_no_controller_to_use(tmp_path):
+    """#265 R1-F4: nor any way to set the file aside: no ``run --force``, no
+    repair and no edit, for a label no protocol has either."""
     exc = _refusal(tmp_path, protocol_version="6")
     lines = mismatch_lines(
         exc, identity=ControllerIdentity.current(), reads="1-5 and 7-13", cwd="/w", flags=()
@@ -312,6 +431,25 @@ def test_the_diagnostic_of_an_unknown_label_names_no_controller_to_use(tmp_path)
     assert "speaks protocol" not in text and "<an autoforge" not in text
     assert "no AutoForge protocol has this label" in text
     assert "recorded:" in text  # the run id has a controller's shape
+    for advice in ("--force", "repair", "edit the", "unreadable", "downgrade", "install"):
+        assert advice not in text, advice
+    assert "Leave the state file as it is" in text
+
+
+@pytest.mark.parametrize("label", ["14", "6"])
+def test_the_result_line_claims_only_what_holds_before_and_under_the_lock(tmp_path, label):
+    """#265 R1-F5: the same diagnostic is printed for a refusal before the
+    lock and for one under it, where taking the lock may already have
+    written its PID record, so it claims no more than both established."""
+    exc = _refusal(tmp_path, protocol_version=label)
+    lines = mismatch_lines(
+        exc, identity=ControllerIdentity.current(), reads="1-5 and 7-13", cwd="/w", flags=()
+    )
+    assert (
+        "  result:     refused: the state file and its run logs were not rewritten, the agent "
+        "worktree was not touched, no agent was launched and nothing was written to GitHub"
+    ) in lines
+    assert "before anything was written" not in "\n".join(lines)
 
 
 def test_a_secret_shaped_run_id_or_flag_never_reaches_the_diagnostic(tmp_path):

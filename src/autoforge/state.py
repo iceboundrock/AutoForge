@@ -59,7 +59,7 @@ from .effects import (
 from .errors import ConfigurationError, StateError, StateProtocolError
 from .evidence import EvidenceFields, RecordView, check_evidence
 from .loop_guard import validate_review_history
-from .provenance import ControllerIdentity, protocol_ranges
+from .provenance import ControllerIdentity, protocol_ranges, shown, shown_path
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS, MAX_OPERATOR_ACTIONS_PER_FIX
 from .runlog import RUN_ID_RE, validate_run_id
@@ -446,12 +446,13 @@ def protocol_support(label: object) -> ProtocolSupport:
 
 
 def _shown_label(label: object) -> str:
-    """The persisted label as a protocol refusal quotes it: its ``repr``, bounded."""
-    text = repr(label)
-    if len(text) > _MAX_SHOWN_LABEL_CHARS:
-        cut = " [... cut]"
-        text = text[: _MAX_SHOWN_LABEL_CHARS - len(cut)] + cut
-    return text
+    """The persisted label as a protocol refusal quotes it: its ``repr``, redacted, bounded.
+
+    Redacted whole before it is cut (:func:`autoforge.provenance.shown`), so
+    a credential that crosses the cut is still recognised and none of it is
+    quoted (#265 R1-F2).
+    """
+    return shown(repr(label), _MAX_SHOWN_LABEL_CHARS)
 
 
 def _recorded(value: object, pattern: re.Pattern[str]) -> str:
@@ -2207,8 +2208,11 @@ def load_state(path: str | Path, *, root: SafeRoot | None = None) -> AutoForgeSt
         return AutoForgeState.from_dict(data)
     except StateProtocolError as exc:
         # The same refusal, naming the file: what the CLI's diagnostic and
-        # every text-only report of it show the operator (#265).
-        raise exc.at(os.path.abspath(p)) from None
+        # every text-only report of it show the operator (#265). The text
+        # names it as shown_path shows it, one redacted and bounded line,
+        # since a scheduler's or a worker's report prints that text as is.
+        where = os.path.abspath(p)
+        raise exc.at(where, shown=shown_path(where)) from None
 
 
 _QUARANTINE_MAX_ATTEMPTS = 1000
