@@ -47,7 +47,13 @@ is read again by a candidate inside it (``_SKIP_LINES``). A plain scalar on
 its key's line is the value whole, its words, quotes and other characters,
 to the line's end or a comment, in a flow collection to the indicator that
 ends it (``_yaml_line``, ``_yaml_flow_line``), where the key stands as a YAML
-key; elsewhere a name's value on its line is a word.
+key; elsewhere a name's value on its line is a word. A flow scalar ends at a
+``,`` that the next entry's key follows with no space between them, and so
+does a name's word after a ``:`` (``_ENTRY_COMMA``). A backslash in a plain
+scalar is a literal one where the line is not written out, before an ``n``
+or an ``r`` too (``_LINE_AS_IS_CHAR``), a value that starts with one is no
+code (``_LITERAL_RUN``), and a run of backslashes before a line break written
+out holds literal backslashes before the break's own (``_BREAK_PAIRS``).
 :func:`redact_obj` knows a credential's name as a mapping's key too
 (``{"GEMINI_API_KEY": "..."}``).
 A line that starts a code fence is never a value, and a line break written
@@ -163,7 +169,15 @@ _VALUE_BACKSLASH = r"\\(?!\\{0,6}[\"'])"
 # (``"A_TOKEN: x\nB_TOKEN: y"``), its name went and its value stayed in the
 # clear; the name now starts a token after the escape (#284), and its value
 # is replaced in turn.
-_WORD_BACKSLASH = r"\\(?!\\{0,6}[\"'nrt])"
+#
+# A run of backslashes is read whole (#285 review, round 11): it is the
+# word's unless the character after it makes it an escaped quote, a line
+# break or a tab written out. Each backslash was asked on its own, up to
+# seven ahead, so a run of eight before an ``n`` (a literal backslash and an
+# ``n`` written out three deep, ``\\\\\\\\n``) gave its first backslash to the
+# word, and the seven left were taken for a line break written out, which
+# ended the value there and kept the rest of it whole. A run is read once.
+_WORD_BACKSLASH = r"\\++(?![\"'nrt])"
 # The first character's backslash: one that starts a line break written out
 # starts no value (#285 review, round 6). A value that started with one was
 # taken to be that break and the rest of its line, so in JSON text a value
@@ -171,7 +185,7 @@ _WORD_BACKSLASH = r"\\(?!\\{0,6}[\"'nrt])"
 # the break to the marker and kept the line below in the clear, and a YAML
 # value's pattern no longer found the line it is told by. The break is
 # crossed instead, as one written as such is (``_SPACE_TO_VALUE``).
-_FIRST_BACKSLASH = r"\\(?!\\{0,6}[\"'nr])"
+_FIRST_BACKSLASH = r"\\++(?![\"'nr])"
 # A line break written out, behind up to seven backslashes, as JSON, JSON in
 # JSON and three deep write one: ``\n``, ``\r\n`` and a carriage return alone,
 # ``\r`` (#285 review, round 7), which YAML and a classic Mac OS file break a
@@ -248,9 +262,42 @@ _BLOCK_AHEAD = rf"{_BLOCK_HEADER}{_YAML_COMMENT}[^\S\r\n]*+(?:[\r\n]|\\{{1,7}}[r
 # below, comment lines between), and taken for the value it hid the key's
 # line from the rules that read the value below it; it holds no secret.
 _LONE_HASH = rf"#(?![^\s\"';\\]|{_WORD_BACKSLASH})"
+# The marker that replaces a value.
+_MARKER = r"\*\*\*REDACTED\*\*\*"
+# A ``,`` that the next entry of a YAML flow collection follows at once
+# (#285 review, round 11): ``{client_secret: FAKE,region: r}``, the next
+# entry's key and its ``:`` right after the ``,``, no space between them. A
+# YAML parser ends a flow scalar at any ``,``, but a value ended at a ``,``
+# only where a space or an end followed it, so a name's word took the next
+# key with it (an upper-case name's value ran on to the next space and took
+# ``,client_secret:``, and the value under that key was nobody's), and a
+# plain scalar of several words on its key's line held the next key and its
+# ``: `` and was no scalar at all: ``{client_secret: FAKE1 FAKE2,region:
+# r}`` kept ``FAKE2``.
+#
+# The key is a run of characters that are no space, quote, backslash,
+# backtick or flow indicator, a ``#`` first (a comment) and a ``:`` before an
+# end aside; its ``:`` is followed by a space, a flow indicator, the text's
+# end or a line break, a tab or a quote written out (``_ENTRY_DELIM``). A
+# name's word (``_UNQUOTED_VALUE``, ``_LITERAL_VALUE``) ends at a ``,`` that
+# such a key of one word follows, where its separator is a ``:``
+# (``_ENTRY_COMMA``, group ``ycol``): after an ``=`` a value is a shell's or
+# a form's, and its commas are its own. A flow scalar on its key's line ends
+# also where a key of several words follows (``_FLOW_ENTRY_COMMA``,
+# ``{client_secret: FAKE1 FAKE2,two words: x}``), and a name's word never
+# starts with a marker that such a ``,`` follows, so that the round after it
+# leaves the next entry where the flow rule stopped. Each lookahead reads no
+# further than the next ``,``, quote or flow indicator, so a run of commas
+# is read once.
+_ENTRY_DELIM = r"(?:[\s,\[\]{}]|\\{1,7}[nrt\"']|\Z)"
+_KEY_WORD = rf"(?!#)(?:[^\s\\\"'`,\[\]{{}}:]|:(?!{_ENTRY_DELIM}))++"
+_ENTRY_COMMA = rf",(?={_KEY_WORD}:{_ENTRY_DELIM})"
+_FLOW_ENTRY_COMMA = rf",(?={_KEY_WORD}(?:[^\S\r\n]++{_KEY_WORD})*+[^\S\r\n]*+:{_ENTRY_DELIM})"
+_ENTRY_STOP = rf"(?(ycol)(?!{_ENTRY_COMMA}))"
 _UNQUOTED_VALUE = (
-    rf"(?!{_BLOCK_AHEAD}|{_LONE_HASH})"
-    rf"(?:[^\s\"';\\]|{_FIRST_BACKSLASH})(?:[^\s\"';\\]|{_WORD_BACKSLASH})*"
+    rf"(?!{_BLOCK_AHEAD}|{_LONE_HASH}|{_MARKER}{_FLOW_ENTRY_COMMA})"
+    rf"(?:[^\s\"';\\,]|{_ENTRY_STOP},|{_FIRST_BACKSLASH})"
+    rf"(?:[^\s\"';\\,]|{_ENTRY_STOP},|{_WORD_BACKSLASH})*"
 )
 # A value a quote opens is taken whole (#285): it runs to the quote that
 # closes it, spaces, semicolons and the other quote character included, so
@@ -327,7 +374,8 @@ _VALUE_CLOSE = rf"(?P<close>(?(vq)(?:(?P=vbs)(?P=vq))?|{_QUOTE}))"
 # properties, ``_COLON_TO_VALUE``), the value's optional opening quote (its
 # backslashes and quote are groups of their own), the value and its closing
 # quote: groups ``sep``, ``open``, ``val`` and ``close`` of a pattern whose
-# name is group ``name`` and that starts with ``_IN_STRING``.
+# name is group ``name`` and that starts with ``_IN_STRING``; group ``ycol``
+# is set where the separator is a ``:`` (``_ENTRY_STOP``, round 11).
 #
 # The space before the separator may hold line breaks (``_TO_SEPARATOR``),
 # as an explicit YAML key's ``:`` stands on the line below its key
@@ -337,7 +385,8 @@ _VALUE_CLOSE = rf"(?P<close>(?(vq)(?:(?P=vbs)(?P=vq))?|{_QUOTE}))"
 # after the value went with it in one and stayed in the other.
 _TO_SEPARATOR = r"(?:\s|\\{1,7}[nrt])*+"
 _NAMED_VALUE = (
-    rf"(?P<sep>{_KEY_QUOTE}{_TO_SEPARATOR}(?::{_COLON_TO_VALUE}|={_SPACE_TO_VALUE})){_VALUE_OPEN}"
+    rf"(?P<sep>{_KEY_QUOTE}{_TO_SEPARATOR}(?::(?P<ycol>){_COLON_TO_VALUE}|={_SPACE_TO_VALUE}))"
+    rf"{_VALUE_OPEN}"
     rf"(?P<val>(?(vq){_GUARDED_QUOTED_VALUE}|{_UNQUOTED_VALUE})){_VALUE_CLOSE}"
 )
 # What replaces a named assignment's value: the name, the separator and the
@@ -438,18 +487,45 @@ _PATH = rf"(?:{_IDENT}(?:\.|::))*+"
 # ``12345`` and ``FAKEopaque`` below it) is one string, whose first word is
 # no constant (#285 review, round 4). Every other shape (``_CODE_WORD``) is
 # code whatever follows it, there too.
-_CODE_WORD = (
-    rf"{_PATH}[A-Za-z0-9_]*?(?i:token|secret|password|passwd|api_?key){_WORD_END}"
-    rf"|[A-Za-z_]++(?:(?:\.|::)[A-Za-z_]++)++{_WORD_END}"
-    rf"|{_PATH}{_IDENT}[(\[<]"
-    r"|(?i:str|string|bytes|int|float|bool|boolean|number|dict|list|tuple|object|any"
-    r"|unknown|char|text|secretstr|secretbytes|none|null|nil|true|false|undefined"
-    rf"|yes|no|on|off|return|raise|pass|continue|break|await|yield|lambda|not|new){_WORD_END}"
-    rf"|\$[({{]|\$[A-Za-z0-9_]++{_WORD_END}|%{_IDENT}%{_WORD_END}"
-    rf"|%(?:\([A-Za-z0-9_]*+\))?[-#0+.0-9]*+[A-Za-z]{_WORD_END}"
-    r"|[(\[{<]"
-    r"|[^\s\w\"'`;&\\]*+(?!\w)"
-)
+#
+# A word with no letter or digit is one that a backslash does not go on
+# (#285 review, round 11): a value that starts with a backslash before a
+# letter, a digit or another backslash (``\nextFAKE``, ``\FAKE``,
+# ``\\server``) is a literal, a YAML plain scalar's or a shell's, but the
+# empty run before it read as code, and such a value was kept whole, in every
+# sink and check. A run of backslashes before a space or the end of its line
+# (a line continuation, as written and written out, ``\\`` before a space in
+# JSON) or before a quote (an escaped quote, or the string's closing quote
+# after a literal backslash) still ends the word there; the run is read
+# whole, so a depth of writing out reads as the text it writes.
+# Where a text may be written out, a run before an ``n`` or an ``r`` is a
+# literal backslash and a letter only where the run is as long as one
+# literal backslash written out, one, two, four or eight backslashes; a run
+# of any other length holds a line break written out after literal
+# backslashes (``\\\n`` in JSON, a line continuation), which ends the word.
+_LITERAL_RUN = r"\\++(?![\s\"'nr]|\Z)|(?:\\{8}|\\{4}|\\{2}|\\)[nr]"
+# Read as is, a run is literal before any character but a space and a quote.
+_AS_IS_LITERAL_RUN = r"\\++(?![\s\"']|\Z)"
+
+
+def _code_word(word_end: str, literal_run: str = _LITERAL_RUN) -> str:
+    """``_CODE_WORD`` with ``word_end`` for where its words end and
+    ``literal_run`` for a run of backslashes that goes on with a word."""
+    return (
+        rf"{_PATH}[A-Za-z0-9_]*?(?i:token|secret|password|passwd|api_?key){word_end}"
+        rf"|[A-Za-z_]++(?:(?:\.|::)[A-Za-z_]++)++{word_end}"
+        rf"|{_PATH}{_IDENT}[(\[<]"
+        r"|(?i:str|string|bytes|int|float|bool|boolean|number|dict|list|tuple|object|any"
+        r"|unknown|char|text|secretstr|secretbytes|none|null|nil|true|false|undefined"
+        rf"|yes|no|on|off|return|raise|pass|continue|break|await|yield|lambda|not|new){word_end}"
+        rf"|\$[({{]|\$[A-Za-z0-9_]++{word_end}|%{_IDENT}%{word_end}"
+        rf"|%(?:\([A-Za-z0-9_]*+\))?[-#0+.0-9]*+[A-Za-z]{word_end}"
+        r"|[(\[{<]"
+        rf"|[^\s\w\"'`;&\\]*+(?!\w|{literal_run})"
+    )
+
+
+_CODE_WORD = _code_word(_WORD_END)
 _CODE_NUMBER = rf"[-+]?[0-9]++(?:\.[0-9]++)?{_WORD_END}"
 _CODE_VALUE = rf"{_CODE_WORD}|{_CODE_NUMBER}"
 # What follows the ``&`` that starts a form body's next field: its name and
@@ -466,12 +542,14 @@ _FIELD_NAME = r"[A-Za-z0-9_.~%+\[\]-]*+="
 # as for an upper-case name. The word can hold the next candidate's name and
 # separator, when no space parts them, and is then taken whole and never read
 # again; only a candidate the code rule refuses fails, at the first word of
-# its value, so the pass stays linear.
+# its value, so the pass stays linear. After a ``:`` the word ends at a ``,``
+# that the next entry of a YAML flow collection follows (``_ENTRY_STOP``,
+# round 11), as an upper-case name's does.
 _LITERAL_VALUE = (
-    rf"(?!{_CODE_VALUE}|{_BLOCK_AHEAD})"
+    rf"(?!{_CODE_VALUE}|{_BLOCK_AHEAD}|{_MARKER}{_FLOW_ENTRY_COMMA})"
     r"(?:[^\s\"'`;&\\,.:)\]}]"
     rf"|&(?!{_FIELD_NAME})"
-    rf"|{_TRAIL}++(?={_WORD_GOES_ON})"
+    rf"|(?:{_ENTRY_STOP}{_TRAIL})++(?={_WORD_GOES_ON})"
     rf"|{_WORD_BACKSLASH}"
     r")++"
 )
@@ -667,15 +745,37 @@ _YAML_IND = _yaml_ind()
 _YAML_COL = _yaml_ind("")
 # A line break, as written (``\n``, ``\r\n``, ``\r``) or written out behind
 # ``ybs`` backslashes (round 7: a carriage return alone too), CRLF read whole.
+# Where the lines are written out, a line break as written is one too (#285
+# review, round 11): a line written out reaches one only past the closing
+# quote of the string it is written in, which is none of its characters, so
+# where a value's line meets one, the line was no line written out, and a
+# backslash and an ``n`` on it, which set ``ybs``, a literal backslash and a
+# letter (``{gh_token: FAKE1\n``, then ``  FAKE2`` and ``  FAKE3}`` on lines of
+# their own). Such a value's lines after the first were no lines, and kept.
 _LINE_BREAK = r"(?:\r\n?+|\n)"
-_YAML_BREAK = rf"(?(ybs)(?P=ybs)(?:r(?:(?P=ybs)n)?+|n)|{_LINE_BREAK})"
+_YAML_BREAK = rf"(?(ybs)(?:(?P=ybs)(?:r(?:(?P=ybs)n)?+|n)|{_LINE_BREAK})|{_LINE_BREAK})"
 # The first line break of a value's candidate, which sets ``ybs`` when it is
 # written out.
-_YAML_OPENING_BREAK = rf"(?:{_LINE_BREAK}|(?P<ybs>\\{{1,7}})(?:r(?:(?P=ybs)n)?+|n))"
+#
+# A run of backslashes before it holds literal backslashes first, each
+# written as many times over as the break is deep, two, four or eight
+# backslashes, and the break's own last (#285 review, round 11): a line that
+# ends in a literal backslash (``C:\\``) ends in ``\\\\\n`` in JSON. The
+# break's own are as many as the run's lowest power of two (``_BREAK_PAIRS``
+# leaves the literal ones before them, atomically); the whole run was taken
+# for the break's, so the value's lines were read as written out more deeply
+# than they are and none was found, and a run of literal backslashes before
+# a break inside a line went with the next line (``_YAML_WRITTEN``).
+_BREAK_PAIRS = r"(?>(?:(?:\\{8})*+(?=\\{4}[rn])|(?:\\{4})*+(?=\\{2}[rn])|(?:\\{2})*+(?=\\[rn]))?)"
+_YAML_OPENING_BREAK = rf"(?:{_LINE_BREAK}|{_BREAK_PAIRS}(?P<ybs>\\{{1,7}})(?:r(?:(?P=ybs)n)?+|n))"
 # A character of a line written out (``ybs``): any but a backslash and a
-# quote, a quote behind ``ybs`` backslashes or more, and a run of backslashes
-# that is neither the line break nor the start of the string's closing quote.
-_YAML_WRITTEN = r"(?:[^\\\"\r\n]|(?P=ybs)\\*+\"|(?!(?P=ybs)[nr])\\++(?!\"))"
+# quote, a quote behind ``ybs`` backslashes or more, the literal backslashes
+# before a line break (round 11, above), and a run of backslashes that is
+# neither the line break nor the start of the string's closing quote.
+_YAML_WRITTEN = (
+    r"(?:[^\\\"\r\n]|(?P=ybs)\\*+\"|(?:(?P=ybs)(?P=ybs))++(?=(?P=ybs)[nr])"
+    r"|(?!(?P=ybs)[nr])\\++(?!\"))"
+)
 _YAML_UNIT = rf"(?(ybs){_YAML_WRITTEN}|[^\r\n])"
 _YAML_EOL = rf"(?!{_YAML_UNIT})"
 _YAML_CHAR = rf"(?:(?![^\S\r\n]|:(?:[^\S\r\n]|{_YAML_EOL})){_YAML_UNIT})"
@@ -685,7 +785,7 @@ _YAML_LINE_END = rf"(?=(?:[^\S\r\n]++#{_YAML_UNIT}*+)?[^\S\r\n]*+{_YAML_EOL})"
 # node's indicator (a sequence's dash, a flow collection, a comment, a
 # block's header, an alias is none), a property its properties did not
 # take, a quote (a quoted scalar is matched as one), a code fence.
-_YAML_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_YAML_EOL})|[\[\]{{}},#&!|>%@`\"']|\\++[\"']|~{{3}}"
+_YAML_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_YAML_EOL})|[\[\]{{}},#&!|>%@`\"']|\\{{1,7}}+[\"']|~{{3}}"
 # Where a value's quote may open below its key in a text written out
 # (#285 review, round 8): a double quote behind at least as many backslashes
 # as the line break, as ``_YAML_WRITTEN`` reads one, or a single quote, which
@@ -1310,7 +1410,7 @@ _FLOW_BREAKS = rf"(?:[^\S\r\n]*+{_YAML_BREAK})++"
 _FLOW_MORE = rf"(?:{_FLOW_BREAKS}[^\S\r\n]*+{_FLOW_FENCE}{_FLOW_LINE})"
 # A lower-case name's value from its key's line: the same, but a ``,``, a
 # ``]`` or a ``}`` ends it only where the name's rule ends its word.
-_FLOW_WORD_STOP = rf"[,\]}}](?={_TRAIL}*+(?!{_WORD_GOES_ON}))"
+_FLOW_WORD_STOP = rf"[,\]}}](?={_TRAIL}*+(?!{_WORD_GOES_ON}))|{_FLOW_ENTRY_COMMA}"
 _FLOW_WORD_CHAR = (
     rf"(?:(?![^\S\r\n]|{_FLOW_WORD_STOP}|:(?:[^\S\r\n]|{_FLOW_INDICATOR}|{_YAML_EOL}))"
     rf"{_YAML_UNIT})"
@@ -1337,15 +1437,20 @@ _FLOW_NEXT_KEY = (
     rf"[^\S\r\n]++(?:\?[^\S\r\n]++)?{_FLOW_CHAR}++(?:[^\S\r\n]++(?!#){_FLOW_CHAR}++)*+"
     rf"[^\S\r\n]*+:(?:[^\S\r\n]|{_YAML_EOL})"
 )
-_FLOW_ANY_WORDS = rf"{_YAML_CHAR}++(?:(?!(?<=,){_FLOW_NEXT_KEY})[^\S\r\n]++(?!#){_YAML_CHAR}++)*+"
-_FLOW_ANY_LINE = rf"(?!#){_FLOW_ANY_WORDS}(?:{_YAML_LINE_END}|(?<=,)(?={_FLOW_NEXT_KEY}))"
+_FLOW_ANY_CHAR = rf"(?:(?!{_FLOW_ENTRY_COMMA}){_YAML_CHAR})"
+_FLOW_ANY_WORDS = (
+    rf"{_FLOW_ANY_CHAR}++(?:(?!(?<=,){_FLOW_NEXT_KEY})[^\S\r\n]++(?!#){_FLOW_ANY_CHAR}++)*+"
+)
+_FLOW_ANY_LINE = (
+    rf"(?!#){_FLOW_ANY_WORDS}"
+    rf"(?:{_YAML_LINE_END}|(?<=,)(?={_FLOW_NEXT_KEY})|(?={_FLOW_ENTRY_COMMA}))"
+)
 _FLOW_ANY_MORE = rf"(?:{_FLOW_BREAKS}[^\S\r\n]++{_FLOW_FENCE}{_FLOW_ANY_LINE})"
 # A value that is a marker alone, nothing after it on its lines: already
 # redacted, and no match. A match is never read again in its pass, so one
 # that took a marker took with it the lead of a key after it (the marker's
 # ``*``, the ``,`` its entry ends in), whose value then stayed for good;
 # refused, it leaves the lead to the round after the one that wrote it.
-_MARKER = r"\*\*\*REDACTED\*\*\*"
 _FLOW_LONE = rf"{_MARKER}{_FLOW_LINE_END}(?!{_FLOW_MORE})"
 _FLOW_ANY_LONE = rf"{_MARKER}{_YAML_LINE_END}(?!{_FLOW_ANY_MORE})"
 # A value's properties below its key, as ``_YAML_NODE_PROPS`` reads them, at
@@ -1606,10 +1711,25 @@ def _yaml_flow_closed(name: str, names: str, name_hint: str, *, literal_only: bo
 # stands behind as many backslashes as that quote, or one fewer than the
 # escape (``_LINE_K``); a quote behind more is the scalar's.
 _LINE_FIRST = r"[\r\n\x1b^\x9b\\\"']"
+# A run of backslashes before an escape written out holds the escape's own
+# backslashes last, and before them literal backslashes, each written as
+# many times over as the escape is deep (#285 review, round 11): ``\\\\\n``
+# in JSON is two literal backslashes and a line break, a line that ended in
+# ``C:\\`` and the next. The escape's own are as many as the run's lowest
+# power of two, one, two or four, and the literal pairs before them are the
+# lead's (``_ESCAPE_PAIRS``); the whole run was taken for the escape's, so
+# the key's line was read as written out more deeply than it is, its line
+# breaks were none, and a scalar of several words whose line was followed
+# by another was no scalar, and kept after its first word. Before a quote a
+# run is read as before.
+_ESCAPE_PAIRS = (
+    r"(?>(?:(?<=\\)(?:(?:\\{8})*+(?=\\{3}[^\\\"'])|(?:\\{4})*+(?=\\[^\\\"'])"
+    r"|(?:\\\\)*+(?=[^\\\"'])))?)"
+)
 _LINE_LEAD_REST = (
     r"(?-i:(?<=[\r\n])"
     rf"|(?<=\x1b){_ESCAPE_TAIL}|(?<=\^)\[{_ESCAPE_TAIL}|(?<=\x9b)[0-?]*[ -/]*[@-~]"
-    rf"|(?<=(?<!\\)[\\\"'])(?P<cbs>(?<=\\)\\{{0,7}}|)"
+    rf"|(?<=(?<!\\)[\\\"']){_ESCAPE_PAIRS}(?P<cbs>(?<=\\)\\{{0,7}}|)"
     rf"(?:(?<=\\)(?:{_BACKSLASH_ESCAPE}|(?P<yqb>)[\"'])|(?<=[\"'])))"
     r"(?>(?:(?<=(?P<yq>[\"'])))?)"
 )
@@ -1625,6 +1745,7 @@ _LINE_WRITTEN = (
     r"(?:[^\\\"'\r\n]"
     rf"|{_LINE_K}\\\\*+[\"']"
     r"|\\*+(?(yq)(?!(?P=yq))|(?!\"))[\"']"
+    rf"|(?:{_LINE_K}\\{_LINE_K}\\)++(?={_LINE_K}\\[nr])"
     rf"|(?!{_LINE_K}\\[nr])\\++(?![\"']))"
 )
 _LINE_RAW = r"(?:[^\\\r\n]|\\++(?![nr]))"
@@ -1633,7 +1754,7 @@ _LINE_EOL = rf"(?!{_LINE_UNIT})"
 _LINE_CHAR = rf"(?:(?![^\S\r\n]|:(?:[^\S\r\n]|{_LINE_EOL})){_LINE_UNIT})"
 _LINE_WORDS = rf"{_LINE_CHAR}++(?:[^\S\r\n]++(?!#){_LINE_CHAR}++)*+"
 _LINE_END = rf"(?=(?:[^\S\r\n]++#{_LINE_UNIT}*+)?[^\S\r\n]*+{_LINE_EOL})"
-_LINE_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_LINE_EOL})|[\[\]{{}},#&!|>%@`\"']|\\++[\"']|~{{3}}"
+_LINE_NOT_PLAIN = rf"[-?:](?:[^\S\r\n]|{_LINE_EOL})|[\[\]{{}},#&!|>%@`\"']|\\{{1,7}}+[\"']|~{{3}}"
 # More than the name's rule takes: a second word, or a character that ends
 # its word, after the first, each read as the scalar's characters are, so a
 # quote that closes the string and a line break written out are none
@@ -1662,31 +1783,70 @@ _LINE_MORE_FIRST = (
 # the scalar's end after it (``_CODE_NUMBER`` without the punctuation after a
 # word, since a flow indicator ends the scalar).
 _NUMBER = r"[-+]?[0-9]++(?:\.[0-9]++)?"
+
+
 # What every such value holds after its name: the key's closing quote, if
-# any, the ``:``, a space, the value's properties, and more than a word.
-_LINE_HINT_TAIL = (
-    r"(?:\\{0,7}[\"'])?[^\S\r\n]*+:[^\S\r\n]++(?:[&!]\S*+[^\S\r\n]++){0,2}"
-    rf"{_LINE_MORE_CHARS}"
+# any, the ``:``, a space, the value's properties, and more than a word
+# (``more``, how the rule's lookahead reads it).
+def _line_hint_tail(more: str) -> str:
+    """The hint's part after the name, ``more`` what follows the space."""
+    return rf"(?:\\{{0,7}}[\"'])?[^\S\r\n]*+:[^\S\r\n]++(?:[&!]\S*+[^\S\r\n]++){{0,2}}{more}"
+
+
+_LINE_HINT_TAIL = _line_hint_tail(_LINE_MORE_CHARS)
+
+
+# A key's line as written, where it is not written out, read as is (#285
+# review, round 11): a backslash there is a character of the scalar, before
+# an ``n`` or an ``r`` too. YAML reads no escape in a plain scalar, so
+# ``client_secret: \nextFAKE`` and ``db_password: abc\rFAKE`` hold a
+# backslash and a letter, but a line as written ended at a line break
+# written out (``_LINE_RAW``), as a YAML text that a log writes out on one
+# line ends a line there, so the first value was no scalar and the rest of
+# the second was kept, in every sink, and the checks accepted both. Such a
+# line is now read as is first, its characters any but a line break, to its
+# end or a comment, and only where that is no scalar (it holds a mapping's
+# ``: `` after the break, ``client_secret: FAKE1 FAKE2\nregion: r``) as
+# written out, as before; a line written out (``cbs``) is read as before,
+# where its backslashes are counted. A lower-case name's scalar must not read
+# as code, a word ending where no backslash goes on (``_AS_IS_CODE``), and
+# the hint holds any backslash after the first word. Each candidate reads its
+# line at most twice.
+_LINE_AS_IS_EOL = r"(?![^\r\n])"
+_LINE_AS_IS_CHAR = rf"(?:(?![^\S\r\n]|:(?:[^\S\r\n]|{_LINE_AS_IS_EOL}))[^\r\n])"
+_LINE_AS_IS_WORDS = rf"{_LINE_AS_IS_CHAR}++(?:[^\S\r\n]++(?!#){_LINE_AS_IS_CHAR}++)*+"
+_LINE_AS_IS_END = rf"(?=(?:[^\S\r\n]++#[^\r\n]*+)?[^\S\r\n]*+{_LINE_AS_IS_EOL})"
+_LINE_AS_IS_NOT_PLAIN = (
+    rf"[-?:](?:[^\S\r\n]|{_LINE_AS_IS_EOL})|[\[\]{{}},#&!|>%@`\"']|\\{{1,7}}+[\"']|~{{3}}"
 )
+_LINE_AS_IS_MORE_CHARS = r"[^\s\"'`;&\\]*+(?:[^\S\r\n]++[^\s#]|[\"'`;&\\])"
+_AS_IS_WORD_END = rf"{_TRAIL}*+(?![^\s\"'`;&])"
+_AS_IS_CODE_WORD = _code_word(_AS_IS_WORD_END, _AS_IS_LITERAL_RUN)
+_AS_IS_CODE = rf"(?!{_AS_IS_CODE_WORD}|{_CODE_NUMBER}{_LINE_AS_IS_END})"
 
 
 def _yaml_line(name: str, names: str, name_hint: str, *, literal_only: bool) -> _Pattern:
     """The pattern for a plain scalar on its key's line, the arguments as for
     :func:`_yaml_value`. The lead, the key, its separator, the space and the
     properties stay, and one marker replaces the scalar; a comment after it
-    stays."""
+    stays. A line as written is read as is first (above)."""
     code = rf"(?(upper)|(?!{_CODE_WORD}|{_CODE_NUMBER}{_LINE_END}))" if literal_only else ""
+    as_is_code = rf"(?(upper)|{_AS_IS_CODE})" if literal_only else ""
+    as_is = (
+        rf"(?(cbs)(?!)|(?={_LINE_AS_IS_MORE_CHARS}){_line_more(_LINE_AS_IS_CHAR)}"
+        rf"(?!{_LINE_AS_IS_NOT_PLAIN}){as_is_code}{_LINE_AS_IS_WORDS}{_LINE_AS_IS_END})"
+    )
     rest = (
         rf"(?P<name>{names})"
         rf"(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:[^\S\r\n]++(?:{_YAML_PROPS})?)"
-        rf"{_LINE_MORE_FIRST}{_line_more(_LINE_CHAR)}(?!{_LINE_NOT_PLAIN}){code}"
-        rf"{_LINE_WORDS}{_LINE_END}"
+        rf"(?:{as_is}|{_LINE_MORE_FIRST}{_line_more(_LINE_CHAR)}(?!{_LINE_NOT_PLAIN}){code}"
+        rf"{_LINE_WORDS}{_LINE_END})"
     )
     return _Pattern(
         name,
         re.compile(_YAML_LINE_LEAD + rest),
         _unless_skipped(r"\g<lead>\g<name>\g<sep>***REDACTED***"),
-        hint=re.compile(name_hint + _LINE_HINT_TAIL),
+        hint=re.compile(name_hint + _line_hint_tail(_LINE_AS_IS_MORE_CHARS)),
         name_hint=re.compile(name_hint),
         at_start=re.compile(_YAML_LINE_START_LEAD + rest),
     )
@@ -1709,6 +1869,37 @@ _FLOW_LINE_CLOSE = (
 _FLOW_STRING_END = r"\\*+[\"'](?=[^\S\r\n]*+(?:[,\]}:\r\n]|\Z))"
 _FLOW_LINE_CHAR = rf"(?:(?(ybs)|(?!{_FLOW_STRING_END})){_FLOW_WORD_CHAR})"
 _FLOW_LINE_WORDS = rf"{_FLOW_LINE_CHAR}++(?:[^\S\r\n]++(?!#){_FLOW_LINE_CHAR}++)*+"
+# The same line read as is (#285 review, round 11), where it is not read as
+# above: a line break written out after the scalar's first word sets
+# ``ybs`` there, and in a text that is not written out (``{client_secret:
+# FAKE"x\rFAKE}``, a backslash and an ``r`` of the scalar's) a quote behind
+# fewer backslashes than that break was taken to close a string, which ended
+# the scalar at it and failed the rule, and the rest was kept. Read as is, a
+# backslash is a character of the scalar, before an ``n`` or an ``r`` too, as
+# on a block key's line (``_LINE_AS_IS_CHAR``), and the scalar ends where a
+# flow scalar ends, at a quote that closes a string written out too
+# (``_FLOW_STRING_END``) or at its line's end; a lower-case name's scalar
+# must not read as code, its word ending where no backslash goes on.
+_FLOW_SHALLOW_QUOTE = r"(?<!\\)(?!(?P=ybs))\\*+\"(?![^\S\r\n]*+(?:[,\]}:\r\n]|\Z))"
+_FLOW_AS_IS_CHAR = (
+    rf"(?:(?![^\S\r\n]|{_FLOW_WORD_STOP}|:(?:[^\S\r\n]|{_FLOW_INDICATOR}|{_LINE_AS_IS_EOL})"
+    rf"|{_FLOW_STRING_END})[^\r\n])"
+)
+_FLOW_AS_IS_WORDS = rf"{_FLOW_AS_IS_CHAR}++(?:[^\S\r\n]++(?!#){_FLOW_AS_IS_CHAR}++)*+"
+_FLOW_AS_IS_END = rf"(?=[^\S\r\n]*+(?:{_FLOW_INDICATOR}|#|{_LINE_AS_IS_EOL}))"
+# Where that is: a line break written out after the first word (group
+# ``ybs``), and a quote on the line behind fewer
+# backslashes than that break, so one that would close a string written out
+# at a lesser depth, that no JSON structure follows (a ``,``, a ``]``, a
+# ``}``, a ``:``, a line break or the end, ``_FLOW_STRING_END``); a quote
+# that closes a string is followed by one. Only then is the line no line
+# written out at that depth, and the break a backslash and a letter of the
+# scalar; a line that holds none is read as written only.
+_FLOW_NOT_WRITTEN = (
+    rf"(?(ybs)(?=(?:(?!{_FLOW_SHALLOW_QUOTE})(?:{_FLOW_AS_IS_CHAR}|[^\S\r\n]++(?!#)))*+"
+    rf"{_FLOW_SHALLOW_QUOTE})|(?!))"
+)
+_FLOW_AS_IS_CLOSE = rf"(?=[^\S\r\n]*+(?:{_FLOW_INDICATOR}|[\r\n]|(?<![\"'])\Z)|[^\S\r\n]++#)"
 
 
 def _yaml_flow_line(name: str, names: str, name_hint: str, *, literal_only: bool) -> _Pattern:
@@ -1723,19 +1914,25 @@ def _yaml_flow_line(name: str, names: str, name_hint: str, *, literal_only: bool
     separator, the space and the properties stay, and so do the indicator
     and what follows it."""
     code = rf"(?(upper)|(?!{_CODE_WORD}|{_NUMBER}{_FLOW_LINE_END}))" if literal_only else ""
+    as_is_code = (
+        rf"(?(upper)|(?!{_AS_IS_CODE_WORD}|{_NUMBER}{_FLOW_AS_IS_END}))" if literal_only else ""
+    )
     regex = (
         rf"{_FLOW_START}(?:{_FLOW_LEAD}(?P<name>{names})"
         rf"(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:[^\S\r\n]++(?:{_YAML_PROPS})?)"
-        rf"(?={_LINE_MORE_CHARS})(?>(?:{_YAML_FIRST_BREAK})?){_line_more(_FLOW_LINE_CHAR)}"
+        rf"(?>(?:{_YAML_FIRST_BREAK})?)"
+        rf"(?:(?={_LINE_MORE_CHARS}){_line_more(_FLOW_LINE_CHAR)}"
         rf"(?!{_YAML_NOT_PLAIN}){code}"
         rf"{_FLOW_LINE_WORDS}{_FLOW_LINE_CLOSE}"
+        rf"|{_FLOW_NOT_WRITTEN}(?={_LINE_AS_IS_MORE_CHARS}){_line_more(_FLOW_AS_IS_CHAR)}"
+        rf"(?!{_LINE_AS_IS_NOT_PLAIN}){as_is_code}{_FLOW_AS_IS_WORDS}{_FLOW_AS_IS_CLOSE})"
         rf"|{_flow_xskip()})"
     )
     return _Pattern(
         name,
         re.compile(regex),
         _unless_skipped(r"\g<li>\g<lead>\g<name>\g<sep>***REDACTED***", "xskip"),
-        hint=re.compile(name_hint + _LINE_HINT_TAIL),
+        hint=re.compile(name_hint + _line_hint_tail(_LINE_AS_IS_MORE_CHARS)),
         name_hint=re.compile(name_hint),
     )
 
@@ -2175,8 +2372,9 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token(
         "credential-suffix-assignment",
         rf"{_IN_STRING}(?P<name>{_SUFFIX_NAME})"
-        rf"(?P<sep>{_KEY_QUOTE}(?(upper){_TO_SEPARATOR}(?::{_COLON_TO_VALUE}|={_SPACE_TO_VALUE})"
-        rf"|[^\S\r\n]*+(?::{_COLON_TO_WORD}|=[^\S\r\n]*+)))"
+        rf"(?P<sep>{_KEY_QUOTE}(?(upper){_TO_SEPARATOR}|[^\S\r\n]*+)"
+        rf"(?::(?P<ycol>)(?(upper){_COLON_TO_VALUE}|{_COLON_TO_WORD})"
+        rf"|=(?(upper){_SPACE_TO_VALUE}|[^\S\r\n]*+)))"
         rf"{_VALUE_OPEN}"
         rf"(?P<val>(?(vq){_GUARDED_QUOTED_VALUE}|(?(upper){_UNQUOTED_VALUE}|{_LITERAL_VALUE})))"
         rf"{_VALUE_CLOSE}",
@@ -2319,7 +2517,14 @@ _CREDENTIAL_KEY = re.compile(
 # word, a character and a quote at the least (``a_token: x"``, 11 to 23,
 # which the name's rule took to 24 first), in a flow collection a character
 # and a semicolon, its indicator kept (``{a_token: x;}``, 13 to 25), and the
-# controls among a private key's line breaks only make the block longer. The
+# controls among a private key's line breaks only make the block longer.
+# Round 11's are no worse: a plain scalar on its key's line read as is holds
+# a literal backslash and a character at the least (``a_token: \\x``, 11 to
+# 23), a flow scalar whose ``,`` the next entry's key follows at once keeps
+# that ``,`` and the entry and holds two words at the least (``{a_token: x
+# y,b:}``, 17 to 28), and one read as is past a quote holds the quote and a
+# line break written out besides (``{a_token: x"y\\nz}``, 17 to 25); a value
+# that ends at such a ``,`` replaces less than before and grows nothing. The
 # rounds of :func:`redact` (``_MAX_ROUNDS``) are more patterns in that order,
 # and compound nothing either, by the argument below.
 # Growth does not compound across patterns: a later pattern can only lengthen

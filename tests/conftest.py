@@ -786,6 +786,142 @@ WHOLE_VALUES_285_R10_REDACTED = {
     "line-anchor": "client_secret: &cs ***REDACTED***",
     "flow-line-words": "{client_secret: ***REDACTED***, region: r}",
 }
+# Credential values that the eleventh review of #285 found kept whole or in
+# part, as YAML parses them: a flow scalar of several words or with a quote
+# whose ``,`` the next entry's key follows with no space between them, under
+# a lower-case, an upper-case and a well-known name and before a key of
+# several words (R11-F1); and a plain scalar that holds a literal backslash,
+# before an ``n``, an ``r``, a ``t`` or a letter, first or inside it, on its
+# key's line, below it, after a tag, in a sequence's entry, under an
+# explicit key, going on below its line and in a flow collection with a
+# quote (R11-F2). Each with its id, its class and the part that must never
+# be shown.
+WHOLE_VALUES_285_R11 = [
+    (
+        "flow-compact-comma",
+        "credential-suffix-assignment",
+        "{client_secret: FAKEfirst FAKEtail,region: r}",
+        "FAKEtail",
+    ),
+    (
+        "flow-compact-comma-quote",
+        "credential-suffix-assignment",
+        '{client_secret: FAKEfirst"FAKEquotetail,region: r}',
+        "FAKEquotetail",
+    ),
+    (
+        "flow-compact-comma-upper",
+        "credential-suffix-assignment",
+        "{CLIENT_SECRET: FAKEupper FAKEuppertail,region: r}",
+        "FAKEuppertail",
+    ),
+    (
+        "flow-compact-comma-well-known",
+        "env-assignment",
+        "[GH_TOKEN: FAKEgh FAKEghtail,region: r]",
+        "FAKEghtail",
+    ),
+    (
+        "flow-compact-comma-key-of-words",
+        "credential-suffix-assignment",
+        "{db_password: FAKEtwo FAKEtwotail,two words: x}",
+        "FAKEtwotail",
+    ),
+    (
+        "literal-backslash-n",
+        "credential-suffix-assignment",
+        "client_secret: \\nextFAKEtail",
+        "nextFAKEtail",
+    ),
+    (
+        "literal-backslash-r",
+        "credential-suffix-assignment",
+        "db_password: \\randomFAKEtail",
+        "randomFAKEtail",
+    ),
+    (
+        "literal-backslash-inside",
+        "credential-suffix-assignment",
+        "client_secret: FAKEinner\\nFAKEinnertail",
+        "FAKEinnertail",
+    ),
+    (
+        "literal-backslash-r-words",
+        "credential-suffix-assignment",
+        "x_api_key: FAKEr1 FAKEr2\\rFAKErtail",
+        "FAKErtail",
+    ),
+    (
+        "literal-backslash-letter",
+        "credential-suffix-assignment",
+        "client_secret: \\FAKEslashtail",
+        "FAKEslashtail",
+    ),
+    (
+        "literal-backslash-upper-tag",
+        "credential-suffix-assignment",
+        "CLIENT_SECRET: !!str \\nFAKEupperslash",
+        "FAKEupperslash",
+    ),
+    (
+        "literal-backslash-well-known",
+        "env-assignment",
+        "GH_TOKEN: \\rFAKEghslash",
+        "FAKEghslash",
+    ),
+    (
+        "literal-backslash-tab-sequence",
+        "credential-suffix-assignment",
+        "- db_password: \\tFAKEtabtail # rotated",
+        "FAKEtabtail",
+    ),
+    (
+        "literal-backslash-below",
+        "credential-suffix-assignment",
+        "client_secret:\n  \\nFAKEbelowtail",
+        "FAKEbelowtail",
+    ),
+    (
+        "literal-backslash-explicit",
+        "credential-suffix-assignment",
+        "? client_secret\n: \\rFAKExtail",
+        "FAKExtail",
+    ),
+    (
+        "literal-backslash-flow-quote",
+        "credential-suffix-assignment",
+        '{db_password: FAKEf"x\\rFAKEflowtail}',
+        "FAKEflowtail",
+    ),
+    (
+        "literal-backslash-going-on",
+        "credential-suffix-assignment",
+        "client_secret: FAKEcont\\n\n  FAKEconttail",
+        "FAKEconttail",
+    ),
+]
+# What ``redact`` makes of each of them: the key, the value's properties, a
+# comment after the value, the collection's indicators and the next entry,
+# its ``,`` included, stay.
+WHOLE_VALUES_285_R11_REDACTED = {
+    "flow-compact-comma": "{client_secret: ***REDACTED***,region: r}",
+    "flow-compact-comma-quote": "{client_secret: ***REDACTED***,region: r}",
+    "flow-compact-comma-upper": "{CLIENT_SECRET: ***REDACTED***,region: r}",
+    "flow-compact-comma-well-known": "[GH_TOKEN: ***REDACTED***,region: r]",
+    "flow-compact-comma-key-of-words": "{db_password: ***REDACTED***,two words: x}",
+    "literal-backslash-n": "client_secret: ***REDACTED***",
+    "literal-backslash-r": "db_password: ***REDACTED***",
+    "literal-backslash-inside": "client_secret: ***REDACTED***",
+    "literal-backslash-r-words": "x_api_key: ***REDACTED***",
+    "literal-backslash-letter": "client_secret: ***REDACTED***",
+    "literal-backslash-upper-tag": "CLIENT_SECRET: !!str ***REDACTED***",
+    "literal-backslash-well-known": "GH_TOKEN: ***REDACTED***",
+    "literal-backslash-tab-sequence": "- db_password: ***REDACTED*** # rotated",
+    "literal-backslash-below": "client_secret:\n  ***REDACTED***",
+    "literal-backslash-explicit": "? client_secret\n: ***REDACTED***",
+    "literal-backslash-flow-quote": "{db_password: ***REDACTED***}",
+    "literal-backslash-going-on": "client_secret: ***REDACTED***",
+}
 # Values under names whose prefix starts with underscores, as a mapping's
 # keys (R8-F3): ``redact_obj`` replaces each, and keeps every entry.
 UNDERSCORE_KEYED_SECRETS_285 = {

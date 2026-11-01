@@ -74,6 +74,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R9_REDACTED,
     WHOLE_VALUES_285_R10,
     WHOLE_VALUES_285_R10_REDACTED,
+    WHOLE_VALUES_285_R11,
+    WHOLE_VALUES_285_R11_REDACTED,
     XAI_API_KEY,
     XAI_KEY_BODY,
 )
@@ -4920,6 +4922,329 @@ def test_the_tenth_review_patterns_stay_linear(text):
 
 
 @pytest.mark.parametrize(
+    ("name", "cls", "text", "body"),
+    WHOLE_VALUES_285_R11,
+    ids=[c[0] for c in WHOLE_VALUES_285_R11],
+)
+def test_a_value_the_eleventh_285_review_found_is_redacted_whole_as_text_and_as_json(
+    name, cls, text, body
+):
+    """#285 review, round 11: a flow scalar whose ``,`` the next entry's key
+    follows with no space between them kept its words after the first, and
+    a plain scalar that holds a literal backslash before an ``n``, an ``r``
+    or a letter (``client_secret: \nextFAKE``, valid YAML) was kept whole or
+    after its first word, in every sink, and reported no class. Each goes
+    whole, as text and as JSON, JSON in JSON and three deep write it, is
+    reported under its class, the JSON still decodes to what redacting the
+    text gives, the next entry stays, and the output is stable and within
+    the growth bound; ``clean`` shows none of it on a progress line."""
+    yaml = pytest.importorskip("yaml")
+    yaml.safe_load(text)
+    assert redact(text) == WHOLE_VALUES_285_R11_REDACTED[name]
+    for depth in (0, 1, 2, 3):
+        escaped = _json_string(text, depth)
+        out = redact(escaped)
+        assert body not in out and "FAKE" not in out, out
+        assert credential_classes(escaped) == (cls,)
+        assert redact(out) == out and credential_classes(out) == ()
+        assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == WHOLE_VALUES_285_R11_REDACTED[name]
+    assert redact_obj({"env": {"text": text}}) == {"env": {"text": redact(text)}}
+    assert "FAKE" not in clean(text, 10_000)
+
+
+# A ``,`` that the next entry's key follows at once (#285 review, round 11,
+# R11-F1), each with what ``redact`` makes of it: a name's word ends there
+# after a ``:``, under a lower-case and an upper-case name, before trailing
+# punctuation too, so the next entry stays and a credential key after it is
+# read as a key; the next key after a ``?``, on the line below its ``:`` and
+# in a flow sequence. After an ``=`` the commas are the value's, as a form's
+# and a shell's are (``f(...)``, ``GH_TOKEN=...``), and taken with it.
+_COMPACT_COMMAS = [
+    ("{client_secret: FAKE,region: r}", "{client_secret: ***REDACTED***,region: r}"),
+    ("{CLIENT_SECRET: FAKE,region: r}", "{CLIENT_SECRET: ***REDACTED***,region: r}"),
+    ("{client_secret: FAKE1).,region: r}", "{client_secret: ***REDACTED***,region: r}"),
+    (
+        "{GH_TOKEN: FAKE1,client_secret: FAKE2\nFAKE3}",
+        "{GH_TOKEN: ***REDACTED***,client_secret: ***REDACTED***}",
+    ),
+    (
+        "{a: 1,client_secret: FAKE1 FAKE2,? region: r}",
+        "{a: 1,client_secret: ***REDACTED***,? region: r}",
+    ),
+    (
+        "{client_secret: FAKE1 FAKE2,region:\n  r}",
+        "{client_secret: ***REDACTED***,region:\n  r}",
+    ),
+    (
+        "[db_password: FAKE1 FAKE2,x_api_key: FAKE3]",
+        "[db_password: ***REDACTED***,x_api_key: ***REDACTED***]",
+    ),
+    ("f(client_secret=FAKE,region=r)", "f(client_secret=***REDACTED***)"),
+    ("GH_TOKEN=FAKE,region: r", "GH_TOKEN=***REDACTED*** r"),
+    ("DB_PASSWORD=FAKE,ss: x", "DB_PASSWORD=***REDACTED*** x"),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _COMPACT_COMMAS, ids=[t for t, _ in _COMPACT_COMMAS])
+def test_a_comma_the_next_entry_follows_at_once_ends_a_value(text, expected):
+    """#285 review, round 11: YAML ends a flow scalar at any ``,``, but a
+    value ended at one only where a space or an end followed it, so a word
+    took the next key with it (an upper-case name's took the rest of the
+    collection) and a scalar of several words was none. After a ``:`` a
+    ``,`` that the next entry's key follows at once ends the value now, and
+    the next entry stays; after an ``=`` it does not. As text and written
+    out, stable."""
+    assert redact(text) == expected
+    assert "FAKE" not in expected and credential_classes(expected) == ()
+    assert redact(expected) == expected
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        assert "FAKE" not in out and redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+
+
+# What the rules of round 11 leave (#285 review, round 11): code a backslash
+# ends, a line continuation (Python's, after a key's ``:`` too, and one
+# before a comment) and a lone backslash, as written and as JSON writes
+# each, where a literal backslash before a line break is a run of three,
+# six or twelve backslashes; a line that ends in a literal backslash, and
+# the key's line after it, read at the depth it is written out at; and
+# what a line break that ends a value leaves.
+_LITERAL_BACKSLASH_LEFT = [
+    ('client_secret = \\\n    os.environ["X"]', 'client_secret = \\\n    os.environ["X"]'),
+    ("api_token: \\\n    str = Field(None)", "api_token: \\\n    str = Field(None)"),
+    ("api_token: \\", "api_token: \\"),
+    ("client_secret: \\ # continued", "client_secret: \\ # continued"),
+    ("path: C:\\\\\nGH_TOKEN: FAKE1 FAKE2\nb: 2", "path: C:\\\\\nGH_TOKEN: ***REDACTED***\nb: 2"),
+    ("a: x\\\nclient_secret: FAKE1 FAKE2\nb: 2", "a: x\\\nclient_secret: ***REDACTED***\nb: 2"),
+    ("client_secret: FAKE1 FAKE2\nregion: r", "client_secret: ***REDACTED***\nregion: r"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _LITERAL_BACKSLASH_LEFT, ids=[t for t, _ in _LITERAL_BACKSLASH_LEFT]
+)
+def test_what_the_eleventh_review_rules_leave_stays(text, expected):
+    """#285 review, round 11: a value's backslash before a letter is a
+    literal now, but one before a space, a quote or the end of its line is
+    code's (a line continuation) as before, and a line break written out
+    still ends a value where the next entry stands after it, so that entry
+    stays; as text and written out one, two and three deep."""
+    assert redact(text) == expected
+    assert redact(expected) == expected
+    assert (credential_classes(text) == ()) == (expected == text)
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected and redact(out) == out
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("client_secret: FAKE1 FAKE2\\nregion: r", "client_secret: ***REDACTED***\\nregion: r"),
+        ("client_secret: FAKE\\nregion: r", "client_secret: ***REDACTED***\\nregion: r"),
+        ("GH_TOKEN: FAKE1 FAKE2\\r\\nregion: r", "GH_TOKEN: ***REDACTED***\\r\\nregion: r"),
+        ("\x1b[0mx_api_key: FAKE1 FAKE2\\nb: 2", "\x1b[0mx_api_key: ***REDACTED***\\nb: 2"),
+    ],
+    ids=str,
+)
+def test_a_line_break_written_out_still_ends_a_line_as_written(text, expected):
+    """#285 review, round 11: a key's line as written is read as is first,
+    a backslash before an ``n`` a character of its scalar; where that is no
+    scalar (it holds the next entry's ``: `` after the backslash), the line
+    is a YAML text written out on one line, and the break ends the value as
+    before, so the next entry stays. Stable, and the next entry is no
+    credential."""
+    assert redact(text) == expected
+    assert redact(expected) == expected and credential_classes(expected) == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{db_password: \\nFAKEflowslash}",
+        "{gh_token: FAKE1\\n\n  FAKE2\n  FAKE3}",
+        "{client_secret: FAKE1 FAKE2\\n}",
+        "GH_TOKEN: \\rFAKE1 \\FFAKE2",
+        "{gh_token: \\rFAKE1 \\FFAKE2}",
+        'GH_TOKEN: \\"FAKE1 FAKE2',
+        "client_secret: \\\\FAKE1\\nFAKE2",
+    ],
+    ids=str,
+)
+def test_a_literal_backslash_leaves_nothing_of_its_value_at_any_depth(text):
+    """#285 review, round 11: a value that starts with a literal backslash
+    in a flow collection, below its key at any indentation, a literal line
+    break before real ones, and a run of literal backslashes that JSON three
+    deep writes as eight or more, which a name's rule took one of and left
+    seven for a line break written out. No word of it stays at any depth,
+    and the output is stable and within the growth bound. In a flow
+    collection a line break written out right after the ``:`` may stay
+    before the marker, as the value below it in JSON text keeps it."""
+    yaml = pytest.importorskip("yaml")
+    assert "FAKE" in str(yaml.safe_load(text))
+    for depth in (0, 1, 2, 3):
+        written = _json_string(text, depth)
+        out = redact(written)
+        assert "FAKE" not in out, (depth, out)
+        assert credential_classes(written) != ()
+        assert redact(out) == out and credential_classes(out) == ()
+        assert len(out) <= MAX_GROWTH_FACTOR * len(written)
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert "FAKE" not in decoded
+
+
+def _literal_word(rng, tag, i):
+    """A word of a plain scalar (#285 review, round 11): a literal backslash
+    before an ``n``, an ``r``, a ``t``, a letter or another backslash,
+    first, inside or last, or none."""
+    word = f"FAKE{tag}w{i}"
+    escape = "\\" + rng.choice(["n", "r", "t", "x", "F", "\\", "b", "u0041"])
+    kind = rng.random()
+    if kind < 0.3:
+        return escape + word
+    if kind < 0.6:
+        return word[:5] + escape + word[5:]
+    if kind < 0.7:
+        return word + escape
+    return word
+
+
+def _literal_entry(rng, tag, flow):
+    """An entry under a credential name whose words hold literal
+    backslashes: on the key's line, after a property, with a comment, below
+    the key, going on below its line, under an explicit key in a block."""
+    name = rng.choice(_FLOW_UPPER_NAMES + _FLOW_LOWER_NAMES)
+    words = [_literal_word(rng, tag, i) for i in range(rng.randint(1, 3))]
+    sep = rng.choice([" ", " ", "  ", '"'])
+    prop = rng.choice(["", "", "", "&a ", "!!str "])
+    kind = rng.random()
+    if kind < 0.35:
+        return f"{name}: {prop}{sep.join(words)}" + rng.choice(["", "", " # c"])
+    if kind < 0.55:
+        return f"{name}:\n  {prop}{sep.join(words)}"
+    if kind < 0.7:
+        return f"{name}: {prop}{words[0]}" + "".join(f"\n  {w}" for w in words[1:])
+    if kind < 0.85 and not flow:
+        return f"? {name}\n: {prop}{sep.join(words)}"
+    return f"{name}: {prop}{sep.join(words)}"
+
+
+def test_every_value_with_a_literal_backslash_or_a_compact_comma_is_redacted():
+    """#285 review, round 11: block and flow mappings that a YAML parser
+    reads, their values plain scalars that hold literal backslashes before
+    an ``n``, an ``r``, a ``t``, a letter or another backslash, first, inside
+    or last, among other entries, a flow collection's entries parted by a
+    ``,`` with no space after it too, a block in a sequence's entry, its
+    lines ended by CRLF too. Every word a parser reads under a credential
+    key goes, as text and as JSON one, two and three deep, the output is
+    stable and within the growth bound, and a progress line shows none of
+    it."""
+    yaml = pytest.importorskip("yaml")
+    names = _FLOW_UPPER_NAMES + _FLOW_LOWER_NAMES
+    rng = random.Random(28511)
+    checked = 0
+    while checked < 400:
+        flow = rng.random() < 0.4
+        entries = []
+        for j in range(rng.randint(1, 3)):
+            if rng.random() < 0.25:
+                entries.append(rng.choice(["region: r", "a: 1", "two words: x"]))
+            else:
+                entries.append(_literal_entry(rng, f"{checked}x{j}", flow))
+        if flow:
+            text = "{" + rng.choice([",", ", ", ",\n", ",\n  "]).join(entries) + "}"
+        else:
+            if rng.random() < 0.3:
+                entries = [
+                    ("- " if i == 0 else "  ") + e.replace("\n", "\n  ")
+                    for i, e in enumerate(entries)
+                ]
+            text = "\n".join(entries)
+        if rng.random() < 0.2:
+            text = text.replace("\n", "\r\n")
+        try:
+            values = [w for w in _credential_words(yaml.safe_load(text), names) if "FAKE" in w]
+        except yaml.YAMLError:
+            continue
+        if not values:
+            continue
+        checked += 1
+        assert "FAKE" not in clean(text, 100_000), text
+        for depth in (0, 1, 2, 3):
+            written = _json_string(text, depth)
+            out = redact(written)
+            assert "FAKE" not in out, (depth, text)
+            assert redact(out) == out and credential_classes(out) == (), text
+            assert len(out) <= MAX_GROWTH_FACTOR * len(written)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A ``,`` that a key follows at once: runs of commas after a word, a
+        # key of words with no ``:`` after it, a value's commas before keys
+        # after an ``=``, under each kind of name.
+        "{a_token: x" + ",b" * 500_000,
+        "A_TOKEN: x" + ",b" * 500_000,
+        "{a_token: x y" + ",b c d" * 200_000,
+        "a_token=x" + ",b: " * 250_000,
+        ("{a_token: x y,b: c}" + " " * 10) * 40_000,
+        # A literal backslash: a key's line read as is and then as written
+        # out, runs of backslashes before an ``n``, a megabyte of them, and
+        # a flow scalar whose quote no structure follows, read as is.
+        "\na_token: x\\ny: z" * 80_000,
+        "a_token: x" + "\\n" * 500_000,
+        "a_token: x" + "\\" * 1_000_000 + "n",
+        "A_TOKEN=" + "\\" * 1_000_000,
+        "\\" * 1_000_000 + "\na_token: \\nx",
+        '{a_token: x"y\\n' + " z" * 400_000,
+        ('{a_token: x"y\\nz, ' * 50_000) + "}",
+        "{a_token: x\\n" + "\n  y" * 300_000 + "}",
+    ],
+    ids=[
+        "commas-after-a-word",
+        "commas-after-an-upper-case-word",
+        "commas-before-keys-of-words",
+        "commas-after-an-equals-sign",
+        "compact-entries",
+        "as-is-then-written",
+        "written-breaks-after-a-word",
+        "backslashes-before-an-n",
+        "backslashes-after-an-equals-sign",
+        "backslashes-before-a-key",
+        "flow-quote-no-structure",
+        "flow-quotes-repeated",
+        "literal-break-before-real-ones",
+    ],
+)
+def test_the_eleventh_review_patterns_stay_linear(text):
+    """#285 review, round 11: a ``,`` that the next entry's key follows is
+    told by a lookahead that reads no further than the next ``,``, quote or
+    indicator; a key's line as written is read at most twice, as is and as
+    written out; a run of backslashes is read whole; and a flow scalar's
+    quote that no structure follows is looked for within the scalar alone.
+    A megabyte of each is redacted well inside the budget, and the output
+    is stable."""
+    started = time.process_time()
+    out = redact(text)
+    assert time.process_time() - started < 3.0
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("{client_secret: FAKE}", "{client_secret: ***REDACTED***}"),
@@ -5957,6 +6282,18 @@ _WORST_CASE_UNITS = {
     "yaml_line_at_start_well_known_name": 'HF_TOKEN: x"',
     "yaml_flow_line": "{a_token: x;}",
     "yaml_flow_line_well_known_name": "{HF_TOKEN: x;}",
+    # Round 11: a plain scalar on its key's line read as is, a literal
+    # backslash and a letter, 11 to 23 at the text's start and 13 to 24 after
+    # a line break before a letter more, 13 to 24 under a well-known name; a
+    # flow scalar of two words whose ``,`` the next entry's key follows at
+    # once, which stay, 17 to 28; and one read as is past a quote that no
+    # structure follows, 17 to 25.
+    "yaml_line_literal_backslash": "a_token: \\x",
+    "yaml_line_literal_break": "\na_token: \\nx",
+    "yaml_line_literal_tab_well_known_name": "HF_TOKEN: \\tx",
+    "yaml_flow_line_compact_comma": "{a_token: x y,b:}",
+    "yaml_flow_line_compact_comma_upper_case_name": "{A_TOKEN: x y,b:}",
+    "yaml_flow_line_as_is": '{a_token: x"y\\nz}',
     # The BEGIN line and 16 characters of key material, its floor: 44 to 15.
     "private_key": "-----BEGIN" + " PRIVATE KEY-----" + "a" * 16 + " ",
     # Its material parted by spaces (round 5), longer still: 48 to 16.

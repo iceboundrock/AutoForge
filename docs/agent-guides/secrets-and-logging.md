@@ -1038,8 +1038,10 @@ none (`client_secret: FAKE: b`, invalid YAML, keeps its word's rule).
   fewer than the escape, and ends the line where no line break written out
   does; a quote behind more is the scalar's (`\"` in JSON, `\\\"` two
   deep), and a line break behind one more ends the line (`_LINE_WRITTEN`).
-  A key at a line's start as written is read as written, its line ending at
-  a line break, written out or not (`_LINE_RAW`). In a flow collection a
+  A key at a line's start as written is read as is first (eleventh review,
+  [below](#a-literal-backslash-and-a--the-next-entry-follows)), and as
+  written, its line ending at a line break written out or not
+  (`_LINE_RAW`), only where that is no scalar. In a flow collection a
   line break written out after the scalar tells the depth
   (`_YAML_FIRST_BREAK`); where none does, a quote that JSON's structure
   follows (`,`, `]`, `}`, `:`, a line break, the end) closes the string the
@@ -1058,6 +1060,100 @@ none (`client_secret: FAKE: b`, invalid YAML, keeps its word's rule).
   knows a string's closing quote), and every loop is possessive, so each
   candidate reads its key and its line once, and fails at the end of its
   first word where the value is a word.
+
+### A literal backslash, and a `,` the next entry follows
+
+Two more of a plain scalar's shapes were kept until the eleventh review of
+#285, in every sink, as text, three JSON levels deep and on a live progress
+line.
+
+**A `,` that the next entry's key follows at once.** YAML ends a flow
+scalar at any `,`, but a value ended at one only where a space or an end
+followed it, so in `{client_secret: FAKEfirst FAKEtail,region: r}` the
+name's rule took the first word and the flow rule, reading `,region` as the
+scalar's, met the next entry's `: ` and read no scalar at all: `FAKEtail`
+was kept, and a quote in place of the space kept the same. An upper-case
+name's value, which runs to a space, took `,client_secret:` with it, and
+the value under that key was nobody's. A `,` that the next entry's key and
+its `:` follow with no space between them (`_ENTRY_COMMA`: a run of
+characters that are no space, quote, backslash, backtick or flow
+indicator, then a `:` before a space, a flow indicator, the end or a line
+break, a tab or a quote written out) now ends:
+
+- a flow scalar on its key's line (`_FLOW_WORD_STOP`, `_FLOW_ANY_CHAR`),
+  also before a key of several words (`_FLOW_ENTRY_COMMA`,
+  `{db_password: a b,two words: x}`);
+- a name's word, under a lower-case and an upper-case name alike, where its
+  separator is a `:` (`_ENTRY_STOP`, group `ycol`): `{CLIENT_SECRET:
+  FAKE,region: r}` keeps `,region: r}` now, where it lost all of it. After
+  an `=` the commas are the value's, as a form's and a shell's are
+  (`f(client_secret=a,b)`, `GH_TOKEN=a,b: c`).
+
+The `,` and the next entry stay, and a name's word never starts with a
+marker that such a `,` follows, so the round after the flow rule leaves the
+entry where that rule stopped. Each lookahead reads no further than the next
+`,`, quote or flow indicator, so a run of commas is read once.
+
+**A literal backslash.** YAML reads no escape in a plain scalar, so
+`client_secret: \nextFAKEtail` holds a backslash and the letter `n`, and
+`db_password: abc\rFAKE` a backslash and an `r`. Three rules read it
+otherwise:
+
+- A value that starts with a backslash read as code: the code rule's
+  "a word with no letter or digit" matched the empty run before it, so
+  `client_secret: \FAKE` and `\nextFAKE` were kept and reported no class.
+  A run of backslashes is a literal one now where a letter, a digit or
+  other punctuation follows it (`_LITERAL_RUN`); before a space, a quote or
+  the end of its line (a line continuation, `client_secret = \`) it is
+  still code. Where a text may be written out, a run before an `n` or an
+  `r` is a literal backslash and a letter only where it is as long as one
+  literal backslash written out (one, two, four or eight backslashes): a
+  run of three, six or twelve is a literal backslash and a line break
+  written out, `\` and a line break in JSON one, two and three deep, a
+  continuation still.
+- A key's line as written ended at a backslash before an `n` or an `r`, as
+  a YAML text a log writes out on one line ends a line there
+  (`_LINE_RAW`), so the first value above was no scalar and the rest of
+  the second was kept. Such a line is read as is first (`_LINE_AS_IS_CHAR`):
+  a backslash is a character of the scalar, before an `n` or an `r` too,
+  to the line's end or a comment. Only where that is no scalar, because it
+  holds the next entry's `: ` after the backslash (`client_secret: FAKE1
+  FAKE2\nregion: r`), is the line read as written out, as before, so the
+  next entry stays. A line written out, whose lead tells its depth, is read
+  as before; a lower-case name's scalar must not read as code, its word
+  ending where no backslash goes on (`_AS_IS_CODE`). A flow scalar on its
+  key's line is read as is where a quote on it would close a string written
+  out at a lesser depth than the line break written out after its first
+  word, and no JSON structure follows that quote
+  (`{db_password: FAKE"x\rFAKEtail}`, `_FLOW_NOT_WRITTEN`).
+- A run of backslashes before a line break written out was taken whole for
+  the break's: a line that ends in a literal backslash (`C:\`) ends in
+  `\\\n` in JSON, two backslashes of the literal one and the break's, and
+  the run was read as one break behind three backslashes, so the next key's
+  line was read as written out more deeply than it is, its line breaks were
+  none, and its scalar of several words was kept after the first. The break's own
+  backslashes are the run's lowest power of two, and the literal ones
+  before them are read apart: in the line rule's lead (`_ESCAPE_PAIRS`), in
+  the line break that sets `ybs` (`_BREAK_PAIRS`) and inside a line written
+  out (`_YAML_WRITTEN`, `_LINE_WRITTEN`). A run of backslashes in a word is
+  read whole (`_WORD_BACKSLASH`, `_FIRST_BACKSLASH`), so a name's rule no
+  longer takes the first of eight and leaves seven that read as a break.
+
+Where a literal backslash and an `n` set `ybs` and the value's lines go on
+past line breaks as written (`{gh_token: FAKE1\n`, then `  FAKE2` on the
+next line), a line break as written is one too (`_YAML_BREAK`): a line
+written out reaches one only past its string's closing quote, which is
+none of its characters.
+
+Not recognised still, as before the eleventh review: a plain scalar that
+starts with a literal backslash before a quote (`client_secret: \"FAKE1
+\"FAKE2`). A backslash before a quote is how JSON writes a quote, and the
+quoted-value rules read `\"` as one that opens the value, so such a scalar
+is taken to its second `\"` and what follows is kept. Under a lower-case
+name such a value written out three deep is kept whole (a run of
+backslashes before a quote reads as code), and one that `\'` opens runs
+past the closing quote of the JSON string it is written in, one and two
+deep, which then no longer decodes.
 
 ### Redaction in rounds, and the patterns' hints
 

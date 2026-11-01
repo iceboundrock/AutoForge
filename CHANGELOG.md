@@ -105,6 +105,20 @@ so.
   it stays; under a lower-case name a scalar whose first word reads as code
   (`api_token: str = Field(None)`, `client_secret: ${{ secrets.X }}`) and a
   number alone (`max_token: 4096`) are left.
+- A YAML plain scalar that holds a literal backslash is redacted whole: one
+  that starts with it (`client_secret: \nextvalue`, `db_password: \Xvalue`),
+  which read as code and was kept whole, and one with a backslash before an
+  `n` or an `r` inside it (`client_secret: abc\rest`), which kept what
+  follows; also after a line that ends in a literal backslash (`C:\`), as
+  JSON writes it. A line break written out still ends a value where the
+  next entry follows it, and a line continuation (`client_secret = \`) is
+  still code. In a YAML flow collection a `,` that the next entry's key
+  follows with no space between them ends a value
+  (`{client_secret: two words,region: r}`), so the whole value goes and the
+  next entry stays, also under an upper-case name, whose value took the rest
+  of the collection before. A scalar that starts with a literal backslash
+  before a quote (`client_secret: \"a \"b`) is still taken for a quoted
+  value and keeps what follows its second quote.
 - `redact` repeats its patterns until a round changes nothing, so redacting
   its output again changes nothing and finds no credential in it, also
   where one pattern redacted a part of the text another value's extent

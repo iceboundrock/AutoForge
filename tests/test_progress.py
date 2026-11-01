@@ -48,6 +48,7 @@ from tests.conftest import (
     SPACED_KEY,
     WHOLE_VALUES_285_R9,
     WHOLE_VALUES_285_R10,
+    WHOLE_VALUES_285_R11,
     analyze_payload,
     block,
     commit_in,
@@ -250,6 +251,29 @@ def test_an_event_whose_input_holds_a_tenth_285_review_value_shows_none_of_it(te
         written = json.dumps(written)
     shown = clean(written, MAX_LINE_CHARS)
     assert body not in shown and "FAKE" not in shown and "BEGIN" not in shown
+    event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Write", detail=written)
+    assert body not in event.detail and "FAKE" not in event.detail
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [(text, body) for _, _, text, body in WHOLE_VALUES_285_R11],
+    ids=[name for name, _, _, _ in WHOLE_VALUES_285_R11],
+)
+def test_an_event_whose_input_holds_an_eleventh_285_review_value_shows_none_of_it(
+    text, body, depth
+):
+    """#285 review, round 11: a flow scalar whose ``,`` the next entry's key
+    follows at once, and a plain scalar that holds a literal backslash before
+    an ``n``, an ``r`` or a letter, reached a live progress line, as text and
+    as JSON one, two and three deep. ``clean`` and an event's detail show
+    none of it now."""
+    written = text
+    for _ in range(depth):
+        written = json.dumps(written)
+    shown = clean(written, MAX_LINE_CHARS)
+    assert body not in shown and "FAKE" not in shown
     event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Write", detail=written)
     assert body not in event.detail and "FAKE" not in event.detail
 
