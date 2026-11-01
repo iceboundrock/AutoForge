@@ -29,8 +29,10 @@
     in Appendix C (D12, §5.3).
   - *Exit audit:* Appendix D takes each exit criterion of EPIC #383 on
     `main` at `312983a`, with its verdict and evidence, and says what only
-    GitHub can show. It closes nothing: the EPIC's closure is the
-    maintainer's.
+    GitHub holds and which operator note evidences it (D.4). It decides
+    nothing: the EPIC's closure is the maintainer's, taken by merging the
+    PR that carries this appendix, and only with the operator's note
+    saying that is the maintainer's decision (D.5).
   - *Release:* nothing is authorized. D10 says what the release that
     carries the removal must say; it is not a Go/No-Go, a tag or a
     publication.
@@ -2424,23 +2426,43 @@ Written on 2026-11-01, after S4 (#389) merged as `feb4364`, against
 takes each in the body's order, numbered E1 to E12 here, with a verdict
 and the evidence on `main` that holds it. D.2 runs C.8's documentation
 audit again on what `main` gained after it, D.3 runs the regression on
-`main` as merged, and D.4 says what the repository cannot show.
+`main` as merged, D.4 says what only GitHub holds and the notes that
+evidence it, and D.5 how the EPIC closes.
 
 Like C.9's, the agent that wrote this appendix holds no GitHub
 credential. It was handed #383's body and comments and nothing else of
 GitHub, so what follows says of an issue, a link or a comment only what
 those comments say, and of a tag only what the local object store holds.
-None of it was read back from GitHub. A verdict says what the repository
-holds, not that the EPIC may close: closing #383 is the maintainer's
-decision. This appendix authorizes no release.
+It read nothing back from GitHub itself. This appendix authorizes no
+release.
+
+**What GitHub holds is evidenced by operator notes.** The appendix's
+first revision left three criteria to GitHub: E5 (the announcement on
+#23) and E12 (GitHub's and PyPI's record of tags, uploads and merges) met
+in part, and E9 (#155 and #255) open. PR #429's first review asked for
+that evidence, and for the EPIC not to close on the PR's merge before it
+and the maintainer's decision. That round's fix asked the operator for
+four notes (D.4): on #23 (E5), on #155 and on #255 (E9), and on #389 (E12
+and the closure, D.5). The operator reads each one's facts back from
+GitHub, and from PyPI for E12, before posting it, or binds an existing
+comment that shows the same, and declines a note whose facts differ. The
+controller verifies every note on its issue before it pushes that
+round's commit, and the next review judges the notes. So this revision
+reaches `main` only with all four verified. A declined note sends the
+round back with the difference, and the verdict that note supports comes
+back here.
 
 The verdicts:
 
 - *Met*: what the criterion asks is on `main`, and the tests named hold
-  it;
+  it, together with, where the criterion asks for something on GitHub,
+  the operator's note the controller verified for PR #429 (D.4);
 - *Met in part*: the repository's part is met, and the rest is GitHub's or
   the maintainer's (D.4);
 - *Open*: nothing in the repository can show it (D.4).
+
+No criterion is met in part or open in this revision. The two lesser
+verdicts stay for a note that is declined.
 
 `tests/test_removal_attestation.py` holds D.1 as it holds C.6. It fails
 when D.1 does not take twelve criteria once each, in order, when a
@@ -2543,7 +2565,7 @@ when a test named here no longer exists.
   `main`'s history: S1a's replacements (#386, `a4bc60c`) landed before S2
   (`aee704e`) and S3 (`3eb68ac`) retired the LOCAL originals, and #386
   recorded H's mutation run (C.6).
-- **E5. State protocol N + 1 was announced on #23. It keeps every historical REMOTE refusal and migrates no LOCAL run (ADR 0009 D8).** *Met in part.*
+- **E5. State protocol N + 1 was announced on #23. It keeps every historical REMOTE refusal and migrates no LOCAL run (ADR 0009 D8).** *Met.*
   The controller speaks protocol 13
   (`tests/test_state.py::test_the_controller_speaks_protocol_13`) and loads
   `main`'s own protocol-12 saves, relabelled on their next save
@@ -2557,7 +2579,11 @@ when a test named here no longer exists.
   No LOCAL run migrates: its state is refused by its mode (E2), and an
   older file holding a LOCAL value is refused and left as it was
   (`tests/test_state.py::test_an_older_file_with_a_local_field_holding_a_value_is_refused_and_left_unchanged`).
-  Open: the announcement on #23 (D.4).
+  The announcement is #23's. The operator's note there records what D8
+  asks for after the merge: PR #421's squash commit `3eb68ac`, 12 → 13,
+  the twelve fields and the rule. The operator posts it only after finding
+  #388's announcement of 12 → 13 on #23, made and confirmed before that
+  merge (D.4).
 - **E6. One supported issue-driven workflow. No accidental use of LOCAL's permissive sandbox policy; `preferred` means `required`.** *Met.*
   The one mode is REMOTE
   (`tests/test_transitions.py::test_the_one_workflow_mode_is_remote`), and
@@ -2596,10 +2622,26 @@ when a test named here no longer exists.
   `tests/test_ci_workflow.py::test_the_sandbox_job_measures_the_runner_and_requires_the_backend_where_it_can`
   and
   `tests/test_ci_workflow.py::test_the_dist_job_checks_the_installed_artifacts_on_every_ci_python`.
-- **E9. #155 and #255 are reconciled without weakening REMOTE coverage or Public Alpha gates.** *Open.*
-  The reconciliation is two notes on GitHub and the maintainer's reading
-  of them (D.4). The repository holds only this record's account: §5.1,
-  §5.2 and C.9.
+- **E9. #155 and #255 are reconciled without weakening REMOTE coverage or Public Alpha gates.** *Met.*
+  The reconciliation is one note on each issue (D.4). The note on #155
+  gives each LOCAL line its REMOTE form or marks it superseded, as §5.1
+  does, and keeps every other requirement as written. The note on #255
+  sets what `main` holds against the maintainer's two decisions of
+  2026-10-30, option 1 and C7 (§5.2's closing note). It adds, waives or
+  satisfies no gate, and reopens neither decision. What the notes say of
+  `main` is held here. REMOTE's coverage is C.6's attestation, whose
+  tests fail when an invariant A.2.4 lists has no named test, or a named
+  test is gone:
+  `tests/test_removal_attestation.py::test_every_invariant_a_2_4_lists_is_attested_and_nothing_else`
+  and
+  `tests/test_removal_attestation.py::test_every_test_an_attestation_names_exists`.
+  For C7's "not advertised", no current document points at the deleted
+  guide
+  (`tests/test_removal_attestation.py::test_the_legacy_guide_is_gone_and_no_current_document_points_at_it`,
+  and D.2's search). For "not supported", the installed package refuses
+  each way in
+  (`tests/test_packaging.py::test_the_local_refusal_check_covers_each_way_in_adr_0009_names`,
+  C.7, D.3).
 - **E10. Historical ADR 0001 is retained, and marked superseded only when the removal is complete on `main`.** *Met.*
   ADR 0001 is on `main` with its body whole, and its header names ADR 0009
   and the parts it keeps
@@ -2615,7 +2657,7 @@ when a test named here no longer exists.
   (#388)" says what the bump changes.
   `tests/test_removal_attestation.py::test_the_changelog_records_the_breaking_removal_and_its_manual_clean_up`,
   added by this audit, holds both.
-- **E12. No tagging, PyPI upload or production merge without independent maintainer approval.** *Met in part.*
+- **E12. No tagging, PyPI upload or production merge without independent maintainer approval.** *Met.*
   What the repository can show holds. `main` carries the development
   version `0.1.0a1.dev0`, which builds but is never released
   (`tests/test_packaging.py::test_a_development_version_builds_but_is_never_released`).
@@ -2629,8 +2671,11 @@ when a test named here no longer exists.
   The controller's merge gate stays closed unless a configuration opens it
   (`tests/test_config.py::test_safety_gate_opens_from_safety_allow_merge_only`).
   The local object store holds one tag, `v0.1.0a0` (`6e9495a`, #379,
-  2026-10-27), which predates the EPIC. Open: GitHub's and PyPI's record
-  of tags, uploads and merges, and the approval of each merge (D.4).
+  2026-10-27), which predates the EPIC. GitHub's and PyPI's record is the
+  operator's note on #389, read back from both. It says the repository's
+  one tag is `v0.1.0a0`, PyPI's `autoforge-cli` holds `0.1.0a0` alone, and
+  each of the EPIC's six merges had the maintainer's approval (D.4). The
+  merge that would close the EPIC is D.5's.
 
 ### D.2 `main` after S4's record
 
@@ -2694,33 +2739,78 @@ measurement (C.3 is the measurement).
   also runs `doctor` and a dry run with each starter configuration, and
   each passed.
 
-### D.4 What this audit cannot show
+### D.4 What only GitHub holds, and the notes that evidence it
 
 - **#23's announcement of protocol 13** (E5). D8 asks for a comment on
-  #23 naming #388 and N → N + 1 before #388's merge, and for the squash
-  commit to be recorded there after it. No document on `main` records
-  either, and #383's comment of 2026-11-01 03:38 UTC lists the
-  announcement among what the exit audit still has to confirm.
-- **#155 and #255** (E9). That comment says the notes on #155
+  #23 naming #388 and N → N + 1, confirmed there before #388's merge, and
+  for the squash commit to be recorded there after it. No document on
+  `main` records either, and #383's comment of 2026-11-01 03:38 UTC lists
+  the announcement among what the exit audit still has to confirm. PR
+  #429's note on #23 is the record after the merge. It says PR #421 merged
+  on 2026-10-31 at 19:38 UTC as `3eb68ac` and took protocol 12 → 13, with
+  no field added and the twelve LOCAL fields removed under D8's rule. It
+  also says `main` still speaks 13 at `312983a`. The operator posts it only
+  after finding #388's announcement there, made and confirmed before that
+  time. If the announcement is not there, the note is declined. The missing
+  announcement then goes to the maintainer as an exception to E5, which
+  this record does not decide, and E5 comes back as met in part.
+- **#155 and #255** (E9). #383's comment of 03:38 UTC says PR #425's fix
+  round posted a note on each, on #155
   ([#155#issuecomment-6552134735](https://github.com/iceboundrock/AutoForge/issues/155#issuecomment-6552134735))
-  and #255
-  ([#255#issuecomment-6552491512](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6552491512))
-  were posted during PR #425's fix round, and C.9 says the controller
-  verifies each such note before that round's commits are pushed. This
-  audit read neither note. Whether they reconcile the two issues without
-  weakening REMOTE coverage or a Public Alpha gate is a judgment on their
-  text and on #155's and #255's, for the maintainer.
+  and on #255
+  ([#255#issuecomment-6552491512](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6552491512)).
+  This audit read neither. PR #429's notes are written from §5.1, from
+  §5.2's closing note and from this appendix at `312983a`, so they cover
+  the documents #259 and #260 added (D.2). The operator posts them, or
+  binds an earlier note that says the same. The note on #155 sets each
+  LOCAL line beside its REMOTE form or marks it superseded. It keeps every
+  other requirement as written, says that C.6 holds REMOTE's coverage, and
+  adds no edge to #383. The note on #255 says option 1's prerequisite is on
+  `main`, and that LOCAL is not advertised (D.2) and not supported (C.7,
+  D.3), as C7 reads. It adds, waives or satisfies no gate. After the
+  controller has verified the notes, whether they reconcile the two issues
+  is for the next review and the maintainer to judge.
 - **The native links and the children's states.** The operator's note on
   #383
   ([#383#issuecomment-6552134554](https://github.com/iceboundrock/AutoForge/issues/383#issuecomment-6552134554))
   records #384 to #389 as sub-issues of #383, with §5.3's `blocked_by`
-  links, and all closed but #389, then under review in PR #425. #383's
-  next comment says #425 merged and closed #389. Nothing here read either
-  back.
+  links, and all closed but #389, then under review in PR #425. C.9 says
+  the controller verified that note for PR #425, and #383's next comment
+  says #425 merged and closed #389. PR #429 asks nothing more of them.
 - **Tags, uploads and merges** (E12). The object store holds the tags the
   controller fetched, which may not be all of GitHub's, and nothing of
-  PyPI. Who approved each merge of the EPIC's PRs is GitHub's record.
-- **A live model run.** G's live test was not run (C.6).
-- **The EPIC's closure and a release.** This appendix is evidence for the
-  maintainer's exit decision, not the decision. Nothing is tagged,
-  published or declared ready (C.9).
+  PyPI. PR #429's note on #389 is the operator's read-back of both. The
+  repository's one tag is `v0.1.0a0`, which predates the EPIC, and PyPI's
+  `autoforge-cli` holds `0.1.0a0` alone. PRs #406, #409, #410, #413, #421
+  and #425 each merged with the maintainer's approval. If the operator
+  reads any line otherwise, the note is declined.
+- **A live model run.** G's live test was not run (C.6). E7 does not ask
+  for one.
+- **A release.** Nothing is tagged, published or declared ready (C.9).
+
+### D.5 Closing the EPIC
+
+PR #429's body ends with the controller's closing line for #383, as the
+body of every implementation PR does. The agent's text comes first, and
+the controller appends the line and its marker
+(`effects.implementation_closing_block`). A FIX round reports no body and
+cannot change it. So merging PR #429 closes #383. PR #429's first review
+asked that this not happen before the outstanding criteria are settled
+and the maintainer has decided. Two things keep the merge from coming
+first:
+
+- **The merge is the maintainer's.** With `safety.allow_merge` off, the
+  default, a run stops at `READY_FOR_MERGE` and a human merges the PR. The
+  controller merges only when the configuration opens the gate and the
+  command carries `--allow-merge`
+  (`tests/test_config.py::test_safety_gate_opens_from_safety_allow_merge_only`),
+  and even then only after its own pre-merge verification.
+- **The maintainer's decision is recorded before anything of the round is
+  pushed.** The operator posts PR #429's note on #389 only if closing #383
+  with PR #429's merge is the maintainer's decision. The controller pushes
+  none of the round's commits until it has verified that note. If the
+  maintainer means #383 to stay open, the note is declined, and the
+  closing line has to leave PR #429's body before the PR is merged. Only
+  someone with GitHub access can remove it.
+
+This appendix is evidence for that decision, not the decision.
