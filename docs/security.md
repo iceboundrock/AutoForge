@@ -220,9 +220,10 @@ carries one can be published. The state directory is stored in the clear.
 Google API keys (`AIza...`) are recognised by their shape, under any name
 ([#282](https://github.com/iceboundrock/AutoForge/issues/282)), and so are
 AWS access key ids, private-key blocks (also wrapped in short lines at
-any line break, a bare carriage return or a run of them included, spaces
-and tabs among them too, or with spaces and tabs between the runs of their
-body),
+any line break, a bare carriage return or a run of them included, spaces,
+tabs, form feeds, vertical tabs and the other control characters a PEM
+reader strips among them too, or with spaces and tabs between the runs of
+their body),
 GitLab, Groq, xAI, npm and Hugging Face tokens, and a value assigned to a
 name that ends in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD`, its
 prefix also behind underscores (`_SERVICE_API_KEY`), as text
@@ -230,8 +231,11 @@ or as a mapping's key: any value under an upper-case name
 (`GEMINI_API_KEY=...`), and under a lower-case one (`client_secret: ...`) a
 quoted value, also one that spans lines whatever they hold or starts with
 a line break, or an unquoted word of any characters that does not read as
-code, on the name's line or, under a YAML key, on the lines below it (an
-indented scalar past blank and comment lines, a `|` or `>` block whatever
+code, on the name's line (under a YAML key the plain scalar on its line
+whole, its words, quotes and semicolons with it, to the line's end or a
+comment, in a flow collection to the indicator that ends it) or, under a
+YAML key, on the lines below it (an indented scalar past blank and comment
+lines, a `|` or `>` block whatever
 its lines hold, unless each is a placeholder such as `${{ secrets.X }}`, a
 plain scalar that goes on below the key's line, quotes in its first line
 too), also after the value's YAML anchor or tag (`&cs`, `!!str`), which stay,
@@ -243,18 +247,21 @@ then the value), where the collection's `}` and next entry stay under a
 lower-case name, at any indentation up to the indicator that closes it,
 under an explicit YAML key (`? client_secret`, then `: value` on the
 next line, or `{? client_secret:` in a flow collection, the key on its
-`?`'s line or below it), and after a key's own anchor or tag and the
-comments YAML allows around a key (after it, its `:`, its `?` or a flow
-collection's `,`, and comment lines before its value); written out in
+`?`'s line or below it, also as a block scalar, `? |-`), and after a key's
+own anchor or tag, on its line or on lines of their own, and the comments
+YAML allows around a key (after it, its `:`, its `?`, its properties or a
+flow collection's `,`, and comment lines before its value); written out in
 JSON text as well
 ([#285](https://github.com/iceboundrock/AutoForge/issues/285)). Among what
 is still not recognised: an unquoted value under a lower-case name that
 reads as code (a password that is a credential's name, a dotted name or a
 number, `db_password=password`, a YAML plain scalar of several lines that
 starts with a keyword such as `true`), the words after the first of an
-unquoted value with spaces on the name's line (`DB_PASSWORD: two words`)
-and what follows a quote inside one (`client_secret: FAKE"rest`; quoted,
-below a YAML key or going on below it, it is taken whole), the
+unquoted value with spaces on the name's line where the name stands as no
+YAML key (a log line's `Error: client_secret: two words`, an INI file's
+`DB_PASSWORD = two words`) and what follows a quote inside one (as a YAML
+key's plain scalar, quoted, below the key or going on below it, it is taken
+whole), the
 lines after the first of a quoted value whose name stands right after a
 quote or a backtick (inside a string literal or a Markdown code span), a
 quoted value that starts with a line break where its name stands inside a

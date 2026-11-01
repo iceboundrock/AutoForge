@@ -29,7 +29,9 @@ so.
   also when its body is wrapped in lines shorter than 16 characters (a key
   rewrapped with `fold -w 8` is still a valid key; its lines may end in a
   bare carriage return or a run of them, as a terminal's capture of a CRLF
-  file writes them, with spaces and tabs among them), or has spaces and tabs
+  file writes them, with spaces, tabs, form feeds, vertical tabs and the
+  other control characters OpenSSL strips from a line's end among them, as
+  written and as JSON writes them), or has spaces and tabs
   between short runs, which a base64 decoder skips (16 characters parted so
   must mix case and hold a digit, a `+` or a `/`, so the words of a
   placeholder stay). One whose END line is
@@ -77,8 +79,10 @@ so.
   A value under an explicit YAML key (`? client_secret`, then `: FAKE` on
   the next line, in a sequence entry too, or `{? client_secret:` in a flow
   collection) is redacted as under the key's own `:`, also with the key on
-  a line below its `?`. A key's own anchor or tag (`&k client_secret:`) and
-  comments around a key (after it, its `:`, its `?` or a flow collection's
+  a line below its `?`, and as a block scalar (`? |-`, then the key below).
+  A key's own anchor or tag (`&k client_secret:`, also
+  on a line of its own below an explicit key's `?`) and comments around a
+  key (after it, its `:`, its `?`, its properties or a flow collection's
   `,`, and comment lines before its value) no longer hide its value, and a
   `#` alone after an upper-case name's `:` is a comment, not the value. A
   comment read once by a key's candidate is not read again by one inside
@@ -91,13 +95,26 @@ so.
   a reference (`${{ secrets.X }}`, `{{ vault_secret }}`, `$X`) is left. The
   key, a block's header, the blank and comment lines before the value and
   its indentation stay.
+- A plain scalar on a YAML key's line is redacted whole, its words and the
+  quotes, semicolons, backticks and backslashes in it
+  (`client_secret: two words`, `DB_PASSWORD: FAKE"rest`), to the line's end
+  or a comment, which stays, and in a flow collection to the `,`, `]` or `}`
+  that ends it, where only its first word was before. A name's word where
+  the name stands as no YAML key (a log line's `Error: client_secret: x
+  is invalid`, `export GH_TOKEN=x && make`) is still a word, so what follows
+  it stays; under a lower-case name a scalar whose first word reads as code
+  (`api_token: str = Field(None)`, `client_secret: ${{ secrets.X }}`) and a
+  number alone (`max_token: 4096`) are left.
 - `redact` repeats its patterns until a round changes nothing, so redacting
   its output again changes nothing and finds no credential in it, also
   where one pattern redacted a part of the text another value's extent
   depended on; an OAuth assignment's value (`refresh_token=...`) now ends
   where a prefixed name's does, at a backtick and before the punctuation
   after a word. A text with nothing to redact still takes one round, and
-  the patterns that start with a literal skip a text without it.
+  the patterns that start with a literal skip a text without it; a pattern
+  that reads in a round the text it read in the round before is not run
+  again, so the second round costs about what the patterns up to the last
+  change cost.
 - A value under such a name as a mapping's key (`{"GEMINI_API_KEY": ...}`,
   `{"client_secret": ...}`, `{"GITHUB_TOKEN": ...}`) is redacted in the
   structures the run log, state and the CLI print, at any depth, where only

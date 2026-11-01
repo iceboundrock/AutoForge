@@ -152,6 +152,15 @@ CR_SPACE_LF_KEY = "\n".join(
 CR_SPACE_CR_KEY = "\n".join(
     [PEM_BEGIN, "\r \r".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="]), PEM_END]
 )
+# The same runs parted by a form feed and a line feed, and by a carriage
+# return, a vertical tab and a line feed (#285 review, round 10): OpenSSL
+# strips every control character from a line's end, so it reads either key,
+# to the same public key, but a form feed or a vertical tab parted two runs
+# of material.
+FF_LF_KEY = "\n".join([PEM_BEGIN, "\f\n".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="]), PEM_END])
+CR_VT_LF_KEY = "\n".join(
+    [PEM_BEGIN, "\r\v\n".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="]), PEM_END]
+)
 # A value of no known shape under a prefixed name (#285).
 SUFFIX_SECRET = "FAKE0opaque0value"
 SUFFIX_ASSIGNMENT = f"DEEPSEEK_API_KEY={SUFFIX_SECRET}"
@@ -640,6 +649,142 @@ WHOLE_VALUES_285_R9_REDACTED = {
     "upper-comment-lines": "CLIENT_SECRET: # rotated\n# old\n  ***REDACTED***",
     "flow-upper-comment": "{DB_PASSWORD: # rotated\n***REDACTED***",
     "flow-lead-comment": "{a: 1, # rotated\n client_secret:\n  ***REDACTED***",
+}
+# Credential values that the tenth review of #285 found kept whole or in
+# part, as YAML parses them: under an explicit key whose ``?`` line carries a
+# comment, the key below it, in a flow collection, and whose own anchor or
+# tag stands on a line of its own, in a block and in a flow collection, in a
+# sequence entry, with a comment after the key under an upper-case and a
+# well-known name (R10-F1), and a key that is a block scalar, its header on
+# the ``?``'s line; and a plain scalar on its key's line that holds
+# more than a word, its words, a quote, a semicolon before a comment, a
+# number first, after an anchor and in a flow collection (R10-F3). Each with
+# its id, its class and the part that must never be shown.
+WHOLE_VALUES_285_R10 = [
+    (
+        "flow-explicit-comment-below",
+        "credential-suffix-assignment",
+        "{? # rotated\n  client_secret\n: FAKEflowxbelow}",
+        "FAKEflowxbelow",
+    ),
+    (
+        "explicit-anchor-line",
+        "credential-suffix-assignment",
+        "? &k\n  client_secret\n: FAKExanchorline",
+        "FAKExanchorline",
+    ),
+    (
+        "flow-explicit-tag-line",
+        "credential-suffix-assignment",
+        "{? !!str\n  db_password\n: FAKExtagline}",
+        "FAKExtagline",
+    ),
+    (
+        "explicit-properties-below",
+        "credential-suffix-assignment",
+        "?\n  &k\n  !!str\n  client_secret\n: FAKExpropsbelow",
+        "FAKExpropsbelow",
+    ),
+    (
+        "sequence-explicit-anchor-comment",
+        "credential-suffix-assignment",
+        "- ? &k # rotated\n    x_api_key\n  : FAKExseqanchor",
+        "FAKExseqanchor",
+    ),
+    (
+        "flow-explicit-upper-comment",
+        "credential-suffix-assignment",
+        "{? # rotated\n  CLIENT_SECRET # old\n: FAKExuppercomment}",
+        "FAKExuppercomment",
+    ),
+    (
+        "flow-explicit-well-known-comment",
+        "env-assignment",
+        "[? # rotated\n  GH_TOKEN # old\n: FAKExghcomment]",
+        "FAKExghcomment",
+    ),
+    (
+        "explicit-block-scalar-key",
+        "credential-suffix-assignment",
+        "? >-\n  client_secret\n: FAKExblockkey",
+        "FAKExblockkey",
+    ),
+    (
+        "flow-explicit-after-comma",
+        "credential-suffix-assignment",
+        "{a: 1, ? &k\n  client_secret\n  : FAKEflowxcomma}",
+        "FAKEflowxcomma",
+    ),
+    (
+        "line-words",
+        "credential-suffix-assignment",
+        "client_secret: FAKEfirst FAKEtail",
+        "FAKEtail",
+    ),
+    (
+        "line-quote",
+        "credential-suffix-assignment",
+        'client_secret: FAKE"FAKEquotetail',
+        "FAKEquotetail",
+    ),
+    (
+        "line-upper-words",
+        "credential-suffix-assignment",
+        "DB_PASSWORD: FAKEupper FAKEuppertail",
+        "FAKEuppertail",
+    ),
+    (
+        "line-well-known-words",
+        "env-assignment",
+        "GH_TOKEN: FAKEgh FAKEghtail",
+        "FAKEghtail",
+    ),
+    (
+        "line-semicolon-comment",
+        "credential-suffix-assignment",
+        "- db_password: FAKE;FAKEsemitail # rotated",
+        "FAKEsemitail",
+    ),
+    (
+        "line-number-first",
+        "credential-suffix-assignment",
+        "x_api_key: 12345 FAKEnumbertail",
+        "FAKEnumbertail",
+    ),
+    (
+        "line-anchor",
+        "credential-suffix-assignment",
+        "client_secret: &cs FAKEanchor FAKEanchortail",
+        "FAKEanchortail",
+    ),
+    (
+        "flow-line-words",
+        "credential-suffix-assignment",
+        "{client_secret: FAKEflow FAKEflowtail, region: r}",
+        "FAKEflowtail",
+    ),
+]
+# What ``redact`` makes of each of them: the ``?``, the key, its properties
+# and comments, the ``:``, the value's properties, a comment after the value
+# and the collection's indicators and next entry stay.
+WHOLE_VALUES_285_R10_REDACTED = {
+    "flow-explicit-comment-below": "{? # rotated\n  client_secret\n: ***REDACTED***}",
+    "explicit-anchor-line": "? &k\n  client_secret\n: ***REDACTED***",
+    "flow-explicit-tag-line": "{? !!str\n  db_password\n: ***REDACTED***}",
+    "explicit-properties-below": "?\n  &k\n  !!str\n  client_secret\n: ***REDACTED***",
+    "sequence-explicit-anchor-comment": "- ? &k # rotated\n    x_api_key\n  : ***REDACTED***",
+    "flow-explicit-upper-comment": "{? # rotated\n  CLIENT_SECRET # old\n: ***REDACTED***}",
+    "flow-explicit-well-known-comment": "[? # rotated\n  GH_TOKEN # old\n: ***REDACTED***]",
+    "explicit-block-scalar-key": "? >-\n  client_secret\n: ***REDACTED***",
+    "flow-explicit-after-comma": "{a: 1, ? &k\n  client_secret\n  : ***REDACTED***}",
+    "line-words": "client_secret: ***REDACTED***",
+    "line-quote": "client_secret: ***REDACTED***",
+    "line-upper-words": "DB_PASSWORD: ***REDACTED***",
+    "line-well-known-words": "GH_TOKEN: ***REDACTED***",
+    "line-semicolon-comment": "- db_password: ***REDACTED*** # rotated",
+    "line-number-first": "x_api_key: ***REDACTED***",
+    "line-anchor": "client_secret: &cs ***REDACTED***",
+    "flow-line-words": "{client_secret: ***REDACTED***, region: r}",
 }
 # Values under names whose prefix starts with underscores, as a mapping's
 # keys (R8-F3): ``redact_obj`` replaces each, and keeps every entry.

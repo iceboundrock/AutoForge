@@ -76,6 +76,8 @@ from tests.conftest import (
     CR_RUN_KEY,
     CR_SPACE_CR_KEY,
     CR_SPACE_LF_KEY,
+    CR_VT_LF_KEY,
+    FF_LF_KEY,
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     ISSUE,
@@ -100,6 +102,7 @@ from tests.conftest import (
     WHOLE_VALUES_285_R7,
     WHOLE_VALUES_285_R8,
     WHOLE_VALUES_285_R9,
+    WHOLE_VALUES_285_R10,
     block,
     comment_url,
 )
@@ -2949,6 +2952,57 @@ def test_a_ninth_285_review_shape_is_refused_by_every_check(cls, text, body, dep
         assert msg is not None
         assert f"credential-shaped string (pattern class: {cls})" in msg
         assert body not in msg and "FAKE" not in msg
+
+
+# What the tenth review of #285 found every check accepted: keys whose
+# breaks hold a form feed or a vertical tab (R10-F2), values under an
+# explicit YAML key whose properties or comments stand on lines of their own
+# (R10-F1) and plain scalars on their key's line that hold more than a word
+# (R10-F3), each with its class and what must never be quoted.
+_R10_SHAPES = [
+    ("private-key", FF_LF_KEY, SHORT_WRAPPED_KEY_LINE),
+    ("private-key", CR_VT_LF_KEY, SHORT_WRAPPED_KEY_LINE),
+    *((cls, text, body) for _, cls, text, body in WHOLE_VALUES_285_R10),
+]
+_R10_IDS = ["form-feed-key", "vertical-tab-key", *(n for n, _, _, _ in WHOLE_VALUES_285_R10)]
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(("cls", "text", "body"), _R10_SHAPES, ids=_R10_IDS)
+def test_a_tenth_285_review_shape_is_refused_by_every_check(cls, text, body, depth):
+    """#285 review, round 10: the publication, payload, commit-message and
+    composed-comment checks accepted each of these, and ``pr_body`` and
+    ``progress`` validation with them, as text and as JSON writes it one,
+    two and three deep. Each check refuses it by class now, and none quotes
+    it; as written, a result field refuses a key's control character itself
+    first, unquoted too."""
+    written = text
+    for _ in range(depth):
+        written = json.dumps(written)
+    body_text = f"Configured the client:\n\n{written}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body_text),
+        published_payload_problem("PR body", f"{body_text}\n\nCloses #2"),
+        acceptance_comment_problem(body_text, "R1-F1"),
+        operator_comment_problem(body_text, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{written}", repository="owner/repo", issue_number=2
+        ),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert f"credential-shaped string (pattern class: {cls})" in msg
+        assert body not in msg and "FAKE" not in msg
+    control = next((ch for ch in written if ch < " " and ch not in "\n\t"), None)
+    for refusal in (
+        _refusal(lambda: _full(progress=body_text)),
+        _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
+    ):
+        if control is not None:
+            assert f"control character (U+{ord(control):04X}" in refusal
+        else:
+            assert f"credential-shaped string (pattern class: {cls})" in refusal
+        assert body not in refusal and "FAKE" not in refusal
 
 
 def test_a_private_key_block_in_a_commit_message_is_refused_whole():

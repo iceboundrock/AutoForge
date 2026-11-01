@@ -40,11 +40,14 @@ from tests.conftest import (
     CR_RUN_KEY,
     CR_SPACE_CR_KEY,
     CR_SPACE_LF_KEY,
+    CR_VT_LF_KEY,
+    FF_LF_KEY,
     PR,
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
     SPACED_KEY,
     WHOLE_VALUES_285_R9,
+    WHOLE_VALUES_285_R10,
     analyze_payload,
     block,
     commit_in,
@@ -185,6 +188,8 @@ def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
         CR_CRLF_KEY,
         CR_SPACE_LF_KEY,
         CR_SPACE_CR_KEY,
+        FF_LF_KEY,
+        CR_VT_LF_KEY,
     ],
     ids=[
         "short-wrapped",
@@ -194,6 +199,8 @@ def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
         "terminal-capture",
         "cr-space-lf",
         "cr-space-cr",
+        "form-feed-lf",
+        "cr-vertical-tab-lf",
     ],
 )
 def test_an_event_whose_input_holds_a_wrapped_or_spaced_key_shows_none_of_it(key):
@@ -217,6 +224,32 @@ def test_an_event_whose_input_holds_a_ninth_285_review_value_shows_none_of_it(te
         written = json.dumps(written)
     shown = clean(written, MAX_LINE_CHARS)
     assert body not in shown and "FAKE" not in shown
+    event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Write", detail=written)
+    assert body not in event.detail and "FAKE" not in event.detail
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [
+        (FF_LF_KEY, SHORT_WRAPPED_KEY_LINE),
+        (CR_VT_LF_KEY, SHORT_WRAPPED_KEY_LINE),
+        *((text, body) for _, _, text, body in WHOLE_VALUES_285_R10),
+    ],
+    ids=["form-feed-key", "vertical-tab-key", *(name for name, _, _, _ in WHOLE_VALUES_285_R10)],
+)
+def test_an_event_whose_input_holds_a_tenth_285_review_value_shows_none_of_it(text, body, depth):
+    """#285 review, round 10: a value under an explicit YAML key whose
+    properties or comments stand on lines of their own, a plain scalar on
+    its key's line that holds more than a word, and a key whose breaks hold
+    a form feed or a vertical tab, reached a live progress line, as text and
+    as JSON one, two and three deep. ``clean`` and an event's detail show
+    none of it now."""
+    written = text
+    for _ in range(depth):
+        written = json.dumps(written)
+    shown = clean(written, MAX_LINE_CHARS)
+    assert body not in shown and "FAKE" not in shown and "BEGIN" not in shown
     event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Write", detail=written)
     assert body not in event.detail and "FAKE" not in event.detail
 
