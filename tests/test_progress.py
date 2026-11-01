@@ -44,6 +44,7 @@ from tests.conftest import (
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
     SPACED_KEY,
+    WHOLE_VALUES_285_R9,
     analyze_payload,
     block,
     commit_in,
@@ -198,6 +199,26 @@ def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
 def test_an_event_whose_input_holds_a_wrapped_or_spaced_key_shows_none_of_it(key):
     event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Bash", detail=f"echo '{key}' > k")
     assert event.detail == f"echo '{REDACTED}' > k"
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [(text, body) for _, _, text, body in WHOLE_VALUES_285_R9],
+    ids=[name for name, _, _, _ in WHOLE_VALUES_285_R9],
+)
+def test_an_event_whose_input_holds_a_ninth_285_review_value_shows_none_of_it(text, body, depth):
+    """#285 review, round 9: a value under an explicit YAML key, and an
+    upper-case or a well-known name's flow scalar going on at a line's
+    start, reached a live progress line, as text and as JSON one, two and
+    three deep. ``clean`` and an event's detail show none of it now."""
+    written = text
+    for _ in range(depth):
+        written = json.dumps(written)
+    shown = clean(written, MAX_LINE_CHARS)
+    assert body not in shown and "FAKE" not in shown
+    event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Write", detail=written)
+    assert body not in event.detail and "FAKE" not in event.detail
 
 
 def test_clean_redacts_before_it_clips():

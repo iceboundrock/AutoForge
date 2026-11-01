@@ -436,6 +436,120 @@ WHOLE_VALUES_285_R8_REDACTED = {
     "underscore-lower": "_db_password=***REDACTED***",
     "underscore-yaml-below": "_SERVICE_API_KEY:\n  ***REDACTED***",
 }
+# Credential values that the ninth review of #285 found kept whole, as YAML
+# parses them: under an explicit key (R9-F1), its ``?`` in a flow collection
+# with the value below the ``:``, plain, quoted and after an anchor, and the
+# ``:`` below the key; in a block mapping with the ``:`` on the line below
+# the key, the value on it, below it, quoted, going on below it and in a
+# block; and an upper-case or a well-known name's flow scalar going on at the
+# line's start, and before a next key that holds a space (R9-F2). Each with
+# its id, its class and the part that must never be shown.
+WHOLE_VALUES_285_R9 = [
+    (
+        "flow-explicit-below",
+        "credential-suffix-assignment",
+        "{? client_secret:\n  FAKEexplicitflow}",
+        "FAKEexplicitflow",
+    ),
+    (
+        "flow-explicit-quoted",
+        "credential-suffix-assignment",
+        "{? client_secret:\n  'FAKEexplicitquoted'}",
+        "FAKEexplicitquoted",
+    ),
+    (
+        "flow-explicit-anchor",
+        "credential-suffix-assignment",
+        "{? client_secret:\n  &cs FAKEexplicitanchor}",
+        "FAKEexplicitanchor",
+    ),
+    (
+        "flow-explicit-colon-below",
+        "credential-suffix-assignment",
+        "{? client_secret\n: FAKEexplicitcolon}",
+        "FAKEexplicitcolon",
+    ),
+    (
+        "block-explicit",
+        "credential-suffix-assignment",
+        "? client_secret\n: FAKEexplicitblock",
+        "FAKEexplicitblock",
+    ),
+    (
+        "block-explicit-below",
+        "credential-suffix-assignment",
+        "? db_password\n:\n  FAKEexplicitbelow",
+        "FAKEexplicitbelow",
+    ),
+    (
+        "block-explicit-quoted",
+        "credential-suffix-assignment",
+        "- ? \"x_api_key\"\n  : 'FAKE explicit; quoted'",
+        "explicit; quoted",
+    ),
+    (
+        "block-explicit-continued",
+        "credential-suffix-assignment",
+        "? client_secret # rotated\n: FAKEexplicitfirst\n  FAKEexplicitcont",
+        "FAKEexplicitcont",
+    ),
+    (
+        "block-explicit-block",
+        "credential-suffix-assignment",
+        "? Db_Password\n: |\n  FAKEexplicitscalar",
+        "FAKEexplicitscalar",
+    ),
+    (
+        "flow-upper-at-line-start",
+        "credential-suffix-assignment",
+        "{CLIENT_SECRET: FAKEupperfirst\nFAKEuppercol0}",
+        "FAKEuppercol0",
+    ),
+    (
+        "flow-db-password-at-line-start",
+        "credential-suffix-assignment",
+        "{DB_PASSWORD: FAKEdbfirst\nFAKEdbcol0}",
+        "FAKEdbcol0",
+    ),
+    (
+        "flow-underscore-at-line-start",
+        "credential-suffix-assignment",
+        "{_SERVICE_API_KEY:\n  FAKEservicefirst\nFAKEservicecol0}",
+        "FAKEservicecol0",
+    ),
+    (
+        "flow-gh-token-at-line-start",
+        "env-assignment",
+        "{GH_TOKEN:\nFAKEghfirst\nFAKEghcol0}",
+        "FAKEghcol0",
+    ),
+    (
+        "flow-next-key-with-a-space",
+        "credential-suffix-assignment",
+        "{CLIENT_SECRET:\n  FAKEspacedfirst\n  FAKEspacedcont, two words: x}",
+        "FAKEspacedcont",
+    ),
+]
+# What ``redact`` makes of each of them: the key, its ``?``, the ``:``, the
+# properties, the quotes, the next entry and the indentation stay; under an
+# upper-case or a well-known name the ``}`` goes with the value, as on the
+# key's line (``{GH_TOKEN: FAKE}``).
+WHOLE_VALUES_285_R9_REDACTED = {
+    "flow-explicit-below": "{? client_secret:\n  ***REDACTED***}",
+    "flow-explicit-quoted": "{? client_secret:\n  '***REDACTED***'}",
+    "flow-explicit-anchor": "{? client_secret:\n  &cs ***REDACTED***}",
+    "flow-explicit-colon-below": "{? client_secret\n: ***REDACTED***}",
+    "block-explicit": "? client_secret\n: ***REDACTED***",
+    "block-explicit-below": "? db_password\n:\n  ***REDACTED***",
+    "block-explicit-quoted": "- ? \"x_api_key\"\n  : '***REDACTED***'",
+    "block-explicit-continued": "? client_secret # rotated\n: ***REDACTED***",
+    "block-explicit-block": "? Db_Password\n: |\n  ***REDACTED***",
+    "flow-upper-at-line-start": "{CLIENT_SECRET: ***REDACTED***",
+    "flow-db-password-at-line-start": "{DB_PASSWORD: ***REDACTED***",
+    "flow-underscore-at-line-start": "{_SERVICE_API_KEY:\n  ***REDACTED***",
+    "flow-gh-token-at-line-start": "{GH_TOKEN:\n***REDACTED***",
+    "flow-next-key-with-a-space": "{CLIENT_SECRET:\n  ***REDACTED*** two words: x}",
+}
 # Values under names whose prefix starts with underscores, as a mapping's
 # keys (R8-F3): ``redact_obj`` replaces each, and keeps every entry.
 UNDERSCORE_KEYED_SECRETS_285 = {

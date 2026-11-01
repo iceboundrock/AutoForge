@@ -70,9 +70,15 @@ so.
   key. A bare carriage return ends a line as YAML reads it, as a line feed
   and CRLF do, as written and written out. A key in a YAML flow collection,
   after its `{`, `[` or a `,`, has its value below it, or a plain scalar
-  going on below its line, redacted too; under a lower-case name the
-  collection's `}` and next entry stay. A statement that ends in a colon
-  (`if api_token:`), a nested mapping and, under a lower-case name, a value
+  going on below its line, redacted too, at any indentation and under any
+  name up to the `,`, `]` or `}` that closes it (`{CLIENT_SECRET: FAKE1`,
+  then `FAKE2}` at the line's start), also before a next key that holds a
+  space; under a lower-case name the collection's `}` and next entry stay.
+  A value under an explicit YAML key (`? client_secret`, then `: FAKE` on
+  the next line, in a sequence entry too, or `{? client_secret:` in a flow
+  collection) is redacted as under the key's own `:`. A statement that
+  ends in a colon (`if api_token:`), a nested mapping and, under a
+  lower-case name, a value
   that reads as code (`${{ secrets.X }}`, `process.env.X`) are left. A
   block is a string whatever its lines hold, so one that starts with a
   bracket or a number is redacted; one whose every line is a placeholder or

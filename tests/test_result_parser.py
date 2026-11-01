@@ -99,6 +99,7 @@ from tests.conftest import (
     WHOLE_VALUES_285_R6,
     WHOLE_VALUES_285_R7,
     WHOLE_VALUES_285_R8,
+    WHOLE_VALUES_285_R9,
     block,
     comment_url,
 )
@@ -2892,6 +2893,43 @@ def test_an_eighth_285_review_shape_written_out_is_refused_by_every_check(cls, t
     three deep, every check accepted it, ``pr_body`` and ``progress``
     validation included. Each check refuses it by class now, and none
     quotes it."""
+    written = text
+    for _ in range(depth):
+        written = json.dumps(written)
+    body_text = f"Configured the client:\n\n{written}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body_text),
+        published_payload_problem("PR body", f"{body_text}\n\nCloses #2"),
+        acceptance_comment_problem(body_text, "R1-F1"),
+        operator_comment_problem(body_text, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{written}", repository="owner/repo", issue_number=2
+        ),
+        _refusal(lambda: _full(progress=body_text)),
+        _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert f"credential-shaped string (pattern class: {cls})" in msg
+        assert body not in msg and "FAKE" not in msg
+
+
+# What the ninth review of #285 found every check accepted: values under
+# an explicit YAML key (R9-F1) and an upper-case or a well-known name's flow
+# scalar going on at a line's start or before a next key that holds a space
+# (R9-F2), each with its class and what must never be quoted.
+_R9_SHAPES = [(cls, text, body) for _, cls, text, body in WHOLE_VALUES_285_R9]
+_R9_IDS = [name for name, _, _, _ in WHOLE_VALUES_285_R9]
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2, 3], ids=["text", "json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(("cls", "text", "body"), _R9_SHAPES, ids=_R9_IDS)
+def test_a_ninth_285_review_shape_is_refused_by_every_check(cls, text, body, depth):
+    """#285 review, round 9: the publication, payload, commit-message and
+    composed-comment checks accepted each of these, and ``pr_body`` and
+    ``progress`` validation with them, as text and as JSON writes it one,
+    two and three deep. Each check refuses it by class now, and none quotes
+    it."""
     written = text
     for _ in range(depth):
         written = json.dumps(written)

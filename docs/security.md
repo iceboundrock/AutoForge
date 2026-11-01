@@ -238,9 +238,12 @@ too), also after the value's YAML anchor or tag (`&cs`, `!!str`), which stay,
 on the key's line or lines of their own, as a block's header below the key
 does, and in a sequence entry however wide its dashes, where the mapping's
 next entry stays, whether a line feed, CRLF or a bare carriage return ends
-its lines, and below a key in a YAML flow collection (`{client_secret:`,
+its lines, below a key in a YAML flow collection (`{client_secret:`,
 then the value), where the collection's `}` and next entry stay under a
-lower-case name; written out in JSON text as well
+lower-case name, at any indentation up to the indicator that closes it,
+and under an explicit YAML key (`? client_secret`, then `: value` on the
+next line, or `{? client_secret:` in a flow collection); written out in
+JSON text as well
 ([#285](https://github.com/iceboundrock/AutoForge/issues/285)). Among what
 is still not recognised: an unquoted value under a lower-case name that
 reads as code (a password that is a credential's name, a dotted name or a
@@ -256,10 +259,8 @@ string its line opens, a quoted value on the line below an `=` in JSON
 text (`"DB_PASSWORD=\n  'x'"`), a YAML block whose lines a NEL, LS or PS
 character ends (YAML 1.1 parsers such as PyYAML read those as line breaks,
 YAML 1.2 does not; on the key's line such a scalar is redacted, a `|` or
-`>` block below the key is not), under an upper-case name in a YAML flow
-collection the lines of a plain scalar below its first that are not
-indented, a name those suffixes do not cover (`SSH_KEY`,
-`clientSecret`), an AWS
+`>` block below the key is not), a name those suffixes do not cover
+(`SSH_KEY`, `clientSecret`), an AWS
 secret access key printed without its name, the end of a private key
 whose first line was cut off, and a key whose runs spaces part where no
 16 of its characters in a row mix case and hold a digit, a `+` or a `/`,

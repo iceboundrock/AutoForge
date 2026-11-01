@@ -33,7 +33,12 @@ key behind a YAML sequence's dashes is measured exactly (``_yaml_dashes``).
 A key in a YAML flow collection, after its ``{``, ``[`` or a ``,``, has its
 value below it read too, and a plain scalar going on below its line
 (``_yaml_flow_value``, ``_yaml_flow_continued``), the collection's
-indicators and next entry kept.
+indicators and next entry kept, and a plain scalar of several lines at any
+indentation to the indicator that closes it (``_yaml_flow_closed``). An
+explicit key's value, after a ``:`` on a line below its ``? key``, is read
+as after the key's own ``:`` (``_explicit_key``), in a block mapping and in a
+flow collection, and a key after a ``?`` or a ``:`` of compact notation as
+after a sequence's ``-``.
 :func:`redact_obj` knows a credential's name as a mapping's key too
 (``{"GEMINI_API_KEY": "..."}``).
 A line that starts a code fence is never a value, and a line break written
@@ -50,6 +55,7 @@ what to remove without quoting the secret.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import NamedTuple
 
 
@@ -72,7 +78,7 @@ class _Pattern(NamedTuple):
 
     name: str
     regex: re.Pattern[str]
-    replacement: str
+    replacement: str | Callable[[re.Match[str]], str]
     after_escape: re.Pattern[str] | None = None
     escape_replacement: str = ""
     hint: re.Pattern[str] | None = None
@@ -302,8 +308,16 @@ _VALUE_CLOSE = rf"(?P<close>(?(vq)(?:(?P=vbs)(?P=vq))?|{_QUOTE}))"
 # backslashes and quote are groups of their own), the value and its closing
 # quote: groups ``sep``, ``open``, ``val`` and ``close`` of a pattern whose
 # name is group ``name`` and that starts with ``_IN_STRING``.
+#
+# The space before the separator may hold line breaks (``_TO_SEPARATOR``),
+# as an explicit YAML key's ``:`` stands on the line below its key
+# (``? GH_TOKEN``, then ``: FAKE``), written out too (#285 review, round 9):
+# only a line break as written was crossed, so the same text read one way
+# as written and another as JSON writes it, and a flow collection's ``}``
+# after the value went with it in one and stayed in the other.
+_TO_SEPARATOR = r"(?:\s|\\{1,7}[nrt])*+"
 _NAMED_VALUE = (
-    rf"(?P<sep>{_KEY_QUOTE}\s*(?::{_COLON_TO_VALUE}|={_SPACE_TO_VALUE})){_VALUE_OPEN}"
+    rf"(?P<sep>{_KEY_QUOTE}{_TO_SEPARATOR}(?::{_COLON_TO_VALUE}|={_SPACE_TO_VALUE})){_VALUE_OPEN}"
     rf"(?P<val>(?(vq){_GUARDED_QUOTED_VALUE}|{_UNQUOTED_VALUE})){_VALUE_CLOSE}"
 )
 # What replaces a named assignment's value: the name, the separator and the
@@ -564,36 +578,51 @@ _OAUTH_VALUE = (
 # space but a line break (``[^\S\r\n]``), written as one class, which the
 # regex engine repeats far faster than the two alternatives. The lead
 # quote, when a quote leads, is group ``yq``.
-_YAML_DASH_CHAR = (
-    r"[-\t\x0b\x0c\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]"
-)
+#
+# The indicators of YAML's compact notation are the dashes' kin (#285
+# review, round 9): a key after a ``? `` (an explicit key that is itself a
+# mapping, ``? client_secret:``, then its value below) or a ``: `` (an
+# explicit value that is one) stands at the column past them as it does past
+# a sequence's ``- ``, and its value's lines are indented past that column,
+# so a run of these three indicators is measured as the dashes are. A key
+# alone after its ``?`` with its value after a ``:`` on a later line is read
+# by its own patterns (``_YAML_XLEAD``), whose run holds dashes only: there
+# the ``:`` stands at the ``?``'s column.
+_YAML_SPACE_CHARS = r"\t\x0b\x0c\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"
+
+
+def _yaml_dash_char(indicators: str) -> str:
+    """A dashes' character: one of ``indicators`` or a space but a line break."""
+    return rf"[{indicators}{_YAML_SPACE_CHARS}]"
+
+
+_YAML_DASH_CHAR = _yaml_dash_char("-?:")
 # The runs of bits, high first: each run's lowest bit, and its highest.
 _YAML_DASH_RUNS = ((20, 31), (10, 19), (5, 9), (0, 4))
 
 
-def _yaml_dashes() -> str:
-    """The dashes before a YAML key, their width set in binary (above)."""
+def _yaml_dashes(indicators: str) -> str:
+    """The dashes before a YAML key, their width set in binary (above);
+    ``indicators`` is the set of indicator characters a run is made of."""
+    char = _yaml_dash_char(indicators)
     body = ""
     for low, high in _YAML_DASH_RUNS:
-        bits = "".join(
-            rf"(?:{_YAML_DASH_CHAR}{{{1 << k}}}(?P<dw{k}>))?" for k in range(high, low - 1, -1)
-        )
-        body += (
-            bits if low == 0 else rf"(?:(?={_YAML_DASH_CHAR}{{{1 << low}}})(?P<dwg{low}>){bits})?"
-        )
-    return rf"(?:(?=(?:-[^\S\r\n]++)++(?!-))(?>{body}(?!{_YAML_DASH_CHAR})))?"
+        bits = "".join(rf"(?:{char}{{{1 << k}}}(?P<dw{k}>))?" for k in range(high, low - 1, -1))
+        body += bits if low == 0 else rf"(?:(?={char}{{{1 << low}}})(?P<dwg{low}>){bits})?"
+    return rf"(?:(?=(?:[{indicators}][^\S\r\n]++)++(?![{indicators}]))(?>{body}(?!{char})))?"
 
 
-def _yaml_ind() -> str:
-    """A value line's indentation: past the key's column (above)."""
+def _yaml_ind(more: str = r"[^\S\r\n]++") -> str:
+    """A value line's indentation: past the key's column (above); with
+    ``more`` empty, the key's column itself."""
     ind = r"(?P=ind)"
     for low, high in _YAML_DASH_RUNS:
         bits = "".join(rf"(?(dw{k})[^\S\r\n]{{{1 << k}}})" for k in range(high, low - 1, -1))
         ind += bits if low == 0 else rf"(?(dwg{low}){bits})"
-    return ind + r"[^\S\r\n]++"
+    return ind + more
 
 
-_YAML_DASHES = _yaml_dashes()
+_YAML_DASHES = _yaml_dashes("-?:")
 # A line's start, in a ``(?m)`` pattern: the text's, or after a line feed or
 # a carriage return (round 7).
 _LINE_START = r"(?:^|(?<=\r))"
@@ -601,8 +630,16 @@ _YAML_LEAD = (
     rf"(?P<lead>(?:{_LINE_START}|{_ESCAPE}|(?<=(?P<yq>[\"'])))"
     rf"(?P<ind>[^\S\r\n]*+){_YAML_DASHES}(?P<kq>\\{{0,7}}[\"'])?)"
 )
+# An explicit key (#285 review, round 9): a ``? `` before the key, behind
+# the indentation and a sequence's dashes, its column the ``?``'s.
+_YAML_XLEAD = (
+    rf"(?P<lead>(?:{_LINE_START}|{_ESCAPE}|(?<=(?P<yq>[\"'])))"
+    rf"(?P<ind>[^\S\r\n]*+){_yaml_dashes('-')}\?[^\S\r\n]++(?P<kq>\\{{0,7}}[\"'])?)"
+)
 # A value line's indentation: past the key's column.
 _YAML_IND = _yaml_ind()
+# The key's column itself, where an explicit key's ``:`` stands.
+_YAML_COL = _yaml_ind("")
 # A line break, as written (``\n``, ``\r\n``, ``\r``) or written out behind
 # ``ybs`` backslashes (round 7: a carriage return alone too), CRLF read whole.
 _LINE_BREAK = r"(?:\r\n?+|\n)"
@@ -681,6 +718,55 @@ _YAML_BELOW_HEADER = rf"{_BLOCK_INDICATOR}{_YAML_HEADER_TO_BLOCK}"
 _YAML_HINT = re.compile(r":[^\S\r\n]*+[|>!&#\r\n\\]")
 
 
+# An explicit key (#285 review, round 9): YAML writes a key after a ``?``
+# and its value after a ``:`` that stands on a later line, at the ``?``'s
+# column (``? client_secret``, then ``: FAKE``), blank and comment lines
+# between them, the key quoted or not, in a sequence's entry too. A YAML
+# parser reads such a key as it reads ``client_secret: FAKE``, but every
+# pattern wanted the key's ``:`` on the key's line, so the value was kept
+# whole, in every sink and check. The key, its line's comment, the lines
+# down to the ``:`` and the ``:`` are the separator here (group ``sep``),
+# and the value after it is read as after a key's ``:`` on its line: below
+# it by ``_yaml_value`` (``explicit``), on its line by ``_yaml_explicit_line``.
+# A line break, as written or written out, ends the key's line, which sets
+# group ``ybs`` as below a key; an upper-case or a well-known name's value on
+# the ``:``'s line is also its name's rule's, whose space before a ``:``
+# crosses a line break, as written or written out (``_TO_SEPARATOR``).
+#
+# A candidate that finds no ``:`` and no value after it is matched still, to
+# the end of what it read (group ``skip``: the key, its comment, the blank
+# and comment lines below it), and that match changes nothing
+# (``_unless_skipped``). A comment holds anything, another explicit key
+# behind a quote or an escape too, which is a candidate of its own: had the
+# first candidate failed, each of those would read the comment lines below
+# it again, a run of such lines once for each. Matched, they are read once,
+# and a YAML parser reads no key in a comment either.
+def _explicit_key(names: str, rest: str) -> str:
+    """An explicit key's lead, name and the lines down to its ``:`` (group
+    ``sep``), the ``:`` (group ``col``) and ``rest``; or, where those are not
+    there, only what the candidate read (group ``skip``)."""
+    return (
+        rf"(?m){_YAML_XLEAD}(?P<name>{names})"
+        rf"(?P<sep>(?(kq)(?P=kq)){_YAML_COMMENT}[^\S\r\n]*+"
+        rf"(?P<brk>{_YAML_OPENING_BREAK}{_YAML_SKIPPED})?+)"
+        rf"(?:(?(brk)(?P<col>{_YAML_COL}:){rest}|(?!))|(?P<skip>))"
+    )
+
+
+def _unless_skipped(template: str) -> Callable[[re.Match[str]], str]:
+    """A replacement that expands ``template``, or keeps a match whose group
+    ``skip`` took part (``_explicit_key``) as it is."""
+
+    def replace(match: re.Match[str]) -> str:
+        return match[0] if match["skip"] is not None else match.expand(template)
+
+    return replace
+
+
+# What every explicit key holds: its ``?`` and the space after it.
+_EXPLICIT_HINT = re.compile(r"\?[^\S\r\n]")
+
+
 def _literal_checks(literal_only: bool) -> tuple[str, str, str]:
     """What a lower-case name's YAML value must not be, as three lookaheads.
 
@@ -698,7 +784,9 @@ def _literal_checks(literal_only: bool) -> tuple[str, str, str]:
     )
 
 
-def _yaml_value(name: str, names: str, name_hint: str, *, literal_only: bool) -> _Pattern:
+def _yaml_value(
+    name: str, names: str, name_hint: str, *, literal_only: bool, explicit: bool = False
+) -> _Pattern:
     """The pattern for a credential name's value on the lines below it.
 
     ``names`` is the name's regex, ``name_hint`` what every name holds
@@ -706,13 +794,15 @@ def _yaml_value(name: str, names: str, name_hint: str, *, literal_only: bool) ->
     must not read as code (``_literal_checks``). The key, its separator, a
     block's header, the line break, the blank and comment lines before the
     value, its properties and its indentation stay; the value is replaced.
+    ``explicit`` reads an explicit key instead (``_explicit_key``), whose
+    ``:`` stands on a line below it.
     """
     one_line, lines, block = _literal_checks(literal_only)
-    regex = (
-        rf"(?m){_YAML_LEAD}(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:)"
+    first_break = _YAML_BREAK if explicit else _YAML_OPENING_BREAK
+    rest = (
         rf"(?P<hdr>(?P<blk>[^\S\r\n]++{_BLOCK_HEADER})"
         rf"|[^\S\r\n]++{_YAML_PROPERTY}(?:[^\S\r\n]++{_YAML_PROPERTY})?)?"
-        rf"(?P<gap>{_YAML_COMMENT}[^\S\r\n]*+{_YAML_OPENING_BREAK})"
+        rf"(?P<gap>{_YAML_COMMENT}[^\S\r\n]*+{first_break})"
         rf"(?P<blank>(?(blk){_YAML_BLANKS}|{_YAML_SKIPPED}))"
         rf"(?P<vind>{_YAML_IND})"
         rf"(?(blk){block}{_YAML_BLOCK_LINES}"
@@ -723,11 +813,19 @@ def _yaml_value(name: str, names: str, name_hint: str, *, literal_only: bool) ->
         rf"|(?!{_YAML_NOT_PLAIN})"
         rf"(?:{lines}{_YAML_PLAIN_LINE}{_YAML_PLAIN_MORE}++|{one_line}{_YAML_PLAIN_LINE})))"
     )
+    template = r"\g<hdr>\g<gap>\g<blank>\g<vind>\g<vprops>\g<bhdr>\g<open>***REDACTED***\g<close>"
+    if explicit:
+        return _Pattern(
+            name,
+            re.compile(_explicit_key(names, rest)),
+            _unless_skipped(r"\g<lead>\g<name>\g<sep>\g<col>" + template),
+            hint=_EXPLICIT_HINT,
+            name_hint=re.compile(name_hint),
+        )
     return _Pattern(
         name,
-        re.compile(regex),
-        r"\g<lead>\g<name>\g<sep>\g<hdr>\g<gap>\g<blank>\g<vind>\g<vprops>\g<bhdr>\g<open>"
-        r"***REDACTED***\g<close>",
+        re.compile(rf"(?m){_YAML_LEAD}(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:){rest}"),
+        r"\g<lead>\g<name>\g<sep>" + template,
         hint=_YAML_HINT,
         name_hint=re.compile(name_hint),
     )
@@ -785,6 +883,37 @@ def _yaml_continued(name: str, names: str, name_hint: str, *, literal_only: bool
         re.compile(regex),
         r"\g<lead>\g<name>\g<sep>***REDACTED***",
         hint=_YAML_CONTINUED_HINT,
+        name_hint=re.compile(name_hint),
+    )
+
+
+# The end of a plain scalar's first line, read as ``_YAML_FIRST_WORDS``
+# reads it: a comment, the space before the line break and the break.
+_YAML_FIRST_END = rf"(?=(?:[^\S\r\n]++#{_YAML_FIRST_UNIT}*+)?[^\S\r\n]*+(?!{_YAML_FIRST_UNIT}))"
+
+
+def _yaml_explicit_line(name: str, names: str, name_hint: str, *, literal_only: bool) -> _Pattern:
+    """The pattern for an explicit key's value on its ``:``'s line (#285
+    review, round 9; ``_explicit_key``), the arguments as for
+    :func:`_yaml_value`: a quoted scalar, taken whole as below a key, or a
+    plain scalar, which may go on to the lines below indented past the
+    ``:``, after the value's properties. A lower-case name's plain scalar
+    must not read as code, as below a key (``_literal_checks``). The key,
+    the separator, the space, the properties and the quotes stay."""
+    one_line, lines, _ = _literal_checks(literal_only)
+    more = rf"[^\S\r\n]*+{_YAML_BREAK}{_YAML_BLANKS}{_YAML_IND}{_YAML_PLAIN_LINE}"
+    rest = (
+        rf"(?P<sp>[^\S\r\n]++(?:{_YAML_PROPS})?)"
+        rf"(?:{_YAML_QUOTE_GUARD}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
+        r"(?P<close>(?:(?P=vbs)(?P=vq))?)"
+        rf"|(?!{_YAML_NOT_PLAIN})(?:{lines}{_YAML_FIRST_WORDS}{more}{_YAML_PLAIN_MORE}*+"
+        rf"|{one_line}{_YAML_FIRST_WORDS}{_YAML_FIRST_END}))"
+    )
+    return _Pattern(
+        name,
+        re.compile(_explicit_key(names, rest)),
+        _unless_skipped(r"\g<lead>\g<name>\g<sep>\g<col>\g<sp>\g<open>***REDACTED***\g<close>"),
+        hint=_EXPLICIT_HINT,
         name_hint=re.compile(name_hint),
     )
 
@@ -882,7 +1011,9 @@ def _quoted_from_next_line(name: str, names: str, name_hint: str) -> _Pattern:
 #   included, as ``{GH_TOKEN: FAKE}`` loses its ``}`` to the marker; it goes on
 #   to the lines below that are indented and hold no mapping's ``: ``, and
 #   to the ``,`` on such a line that the next entry's key and ``:`` follow
-#   (``FAKE2, region: r``), which stay.
+#   (``FAKE2, region: r``, also ``FAKE2, two words: x``), which stay. A value
+#   whose lines go on at a line's start, which these rules leave, is the
+#   closed value's (``_yaml_flow_closed``, round 9), read before them.
 #
 # Such a value takes the ``,`` that ends its entry, on the key's line as
 # below it, and so does a block rule that takes a line whole, so the next
@@ -921,12 +1052,24 @@ def _quoted_from_next_line(name: str, names: str, name_hint: str) -> _Pattern:
 _FLOW_INDICATOR = r"[,\[\]{}]"
 
 
+# An explicit key's ``?`` (#285 review, round 9): ``{? client_secret:``,
+# then its value below, is the key ``client_secret`` as ``{client_secret:``
+# is, and was no key here. The ``?`` and the space or the line breaks after
+# it (group ``xk``) are the lead's, as written or written out. A block rule
+# reads a key after a ``?`` at the column past the ``?`` and its space, which
+# ``find`` does not measure, so such a key's value is these rules' at any
+# indentation (``_FLOW_NOT_BLOCK``); where a block rule took its lines first,
+# these read the marker it left, as below any key.
+_FLOW_EXPLICIT = r"(?P<xk>\?(?:[^\S\r\n]|\r\n?|\n|\\{1,7}[nr])++)?"
+
+
 def _flow_lead(after_marker: str) -> str:
     """A flow key's lead (above): after a marker, ``after_marker`` follows."""
     return (
         rf"(?P<lead>[{{\[,*](?:(?<=[{{\[,])|(?<=\*\*\*REDACTED\*\*\*)(?={after_marker}))"
         r"[^\S\r\n]*+"
         r"(?:(?:\r\n?|\n|\\{1,7}[nr])(?P<find>[^\S\r\n]*+))*+"
+        rf"{_FLOW_EXPLICIT}"
         r"(?P<kq>\\{0,7}[\"'])?)"
     )
 
@@ -939,7 +1082,7 @@ def _flow_lead(after_marker: str) -> str:
 # taken for its flow scalar's.
 _FLOW_LEAD = _flow_lead(r"\s|\\{1,7}[nr]")
 _FLOW_LINE_LEAD = _flow_lead(r"[^\S\r\n]|(?:\r\n?|\n|\\{1,7}[nr])++[^\S\r\n]")
-_FLOW_NOT_BLOCK = r"(?(find)(?!(?P=find)[^\S\r\n]))"
+_FLOW_NOT_BLOCK = r"(?(xk)|(?(find)(?!(?P=find)[^\S\r\n])))"
 _FLOW_FENCE = r"(?!#|`{3}|~{3})"
 # A lower-case name's value below its key: a flow scalar's lines.
 _FLOW_CHAR = (
@@ -970,10 +1113,16 @@ _FLOW_WORD_MORE = (
 )
 # An upper-case or a well-known name's value: a block scalar's lines
 # (``_YAML_PLAIN_LINE``), the lines after its first indented, each also
-# ended by a ``,`` that a key of one word and its ``:`` follow; a line so
-# ended is the value's last. The key is one word, so the lookahead reads a
-# word once more.
-_FLOW_NEXT_KEY = rf"[^\S\r\n]++{_YAML_CHAR}++[^\S\r\n]*+:(?:[^\S\r\n]|{_YAML_EOL})"
+# ended by a ``,`` that the next entry's key and its ``:`` follow; a line so
+# ended is the value's last. The key may hold spaces, be quoted or follow a
+# ``?`` (#285 review, round 9: ``FAKE2, two words: x`` kept ``FAKE2``, since
+# only a key of one word told the ``,``), and its words are a flow scalar's,
+# which no ``,`` holds, so the lookahead reads no further than the next
+# ``,`` and each character is read at most twice.
+_FLOW_NEXT_KEY = (
+    rf"[^\S\r\n]++(?:\?[^\S\r\n]++)?{_FLOW_CHAR}++(?:[^\S\r\n]++(?!#){_FLOW_CHAR}++)*+"
+    rf"[^\S\r\n]*+:(?:[^\S\r\n]|{_YAML_EOL})"
+)
 _FLOW_ANY_WORDS = rf"{_YAML_CHAR}++(?:(?!(?<=,){_FLOW_NEXT_KEY})[^\S\r\n]++(?!#){_YAML_CHAR}++)*+"
 _FLOW_ANY_LINE = rf"(?!#){_FLOW_ANY_WORDS}(?:{_YAML_LINE_END}|(?<=,)(?={_FLOW_NEXT_KEY}))"
 _FLOW_ANY_MORE = rf"(?:{_FLOW_BREAKS}[^\S\r\n]++{_FLOW_FENCE}{_FLOW_ANY_LINE})"
@@ -1066,6 +1215,97 @@ def _yaml_flow_continued(name: str, names: str, name_hint: str, *, literal_only:
         name,
         re.compile(regex),
         r"\g<lead>\g<name>\g<sep>***REDACTED***",
+        hint=_FLOW_CONTINUED_HINT,
+        name_hint=re.compile(name_hint),
+    )
+
+
+# A flow collection's value closed by its indicator (#285 review, round 9):
+# a plain scalar of several lines, on the key's line and below it or below
+# the key alone, at any indentation, to the ``,``, ``]`` or ``}`` that ends
+# it, on its last line or after blank and comment lines. Inside a flow
+# collection a scalar's lines need no indentation, and a YAML parser reads
+# each such line as the value's, but an upper-case or a well-known name's
+# value went on only to indented lines (it is anything, flow indicators
+# included, so only indentation told its lines from what follows the
+# collection), and below a key that starts its line only a line indented no
+# more than the key was a flow rule's: ``{CLIENT_SECRET: FAKE1``, then
+# ``FAKE2}`` at the line's start, kept ``FAKE2``, and so did ``{a: 1,``,
+# ``client_secret:``, ``  FAKE1``, then ``FAKE2}``. The indicator that closes
+# the value tells its lines here: the value is a flow scalar's lines under
+# any name, which hold no flow indicator, a lower-case name's when its first
+# word does not read as code (``_CODE_WORD``), and it is replaced whole with
+# its line breaks, the indicator and what follows it kept.
+#
+# A value of one line is read here too where it stands below the ``:``
+# (``{a: 1,``, ``client_secret:``, then ``  FAKE}, {b: 2}``: below a key that
+# starts its line, a line indented past the key was the block rules', which
+# take a line whole and so took no line that a flow collection's next entry
+# follows), and an explicit key's (``{? client_secret``, then ``: FAKE}`` on
+# the next line, its ``:`` below the key), a lower-case name's when it does
+# not read as code (``_CODE_VALUE``), and quoted; no other rule reads a value
+# after a ``:`` on a line below its key.
+#
+# This rule runs before every rule but the private key's, so that what it
+# reads is the value as written: a value that starts with a marker is none
+# (``(?!_MARKER)``). A token of a known shape in such a value is therefore
+# reported under the name's class, as the value is. The rules that run after
+# it read the marker it leaves, and some take the indicator after it with
+# it, as a name's rule on its line takes ``FAKE}`` from ``{GH_TOKEN: FAKE}``;
+# the marker then stands alone on its line, and this rule never reads the
+# lines after it, so no round goes on where another stopped. Each candidate
+# starts at a ``{``, a ``[`` or a ``,``, reads one identifier and its line
+# once to its first line break (``_FLOW_CLOSED_BREAK``, which sets ``ybs``
+# and stops at a flow indicator, a second ``: `` and a comment), then the
+# value's lines once, which hold no flow indicator, and the blank and
+# comment lines after them.
+_FLOW_CLOSED_LEAD = (
+    r"(?P<lead>[{\[,][^\S\r\n]*+(?:(?:\r\n?|\n|\\{1,7}[nr])[^\S\r\n]*+)*+"
+    rf"{_FLOW_EXPLICIT}(?P<kq>\\{{0,7}}[\"'])?)"
+)
+_FLOW_CLOSED_BREAK = (
+    r"(?=(?:\\{0,7}[\"'])?[^\S\r\n]*+(?::(?=[\s\\]))?"
+    r"(?:[^\\:\s,\[\]{}]++|:(?![\s,\[\]{}])|[^\S\r\n]++(?![#\s])|\\++(?![nr]))*+"
+    rf"[^\S\r\n]*+{_YAML_OPENING_BREAK})"
+)
+# The blank lines below the ``:`` and the indentation, then the value's
+# properties, or the space after the ``:`` on its line; properties on the
+# ``:``'s line before either.
+_FLOW_CLOSED_HDR = (
+    rf"(?P<hdr>(?:[^\S\r\n]++{_YAML_PROPERTY}(?:[^\S\r\n]++{_YAML_PROPERTY})?)?"
+    rf"(?:(?:[^\S\r\n]*+{_YAML_BREAK})++(?P<below>)[^\S\r\n]*+(?:{_FLOW_NODE_PROPS})?"
+    r"|[^\S\r\n]++))"
+)
+_FLOW_CLOSED_MORE = rf"{_FLOW_BREAKS}[^\S\r\n]*+{_FLOW_FENCE}{_FLOW_LINE}"
+_FLOW_CLOSED_END = (
+    rf"(?=(?:[^\S\r\n]++#{_YAML_UNIT}*+)?(?:{_FLOW_BREAKS}{_YAML_SKIPPED})?"
+    r"[^\S\r\n]*+[,\]}])"
+)
+
+
+def _yaml_flow_closed(name: str, names: str, name_hint: str, *, literal_only: bool) -> _Pattern:
+    """The pattern for a flow collection's value closed by its indicator,
+    the arguments as for :func:`_yaml_value`. The lead, the key, its
+    separator, the properties, the line breaks, the indentation and the
+    quotes stay; the value is replaced."""
+    one_line, lines, _ = _literal_checks(literal_only)
+    plain = (
+        rf"(?!{_MARKER})(?:{lines}{_FLOW_LINE}(?:{_FLOW_CLOSED_MORE})++"
+        rf"|(?(xk)|(?(below)|(?!))){one_line}{_FLOW_LINE}){_FLOW_CLOSED_END}"
+    )
+    quoted = (
+        rf"(?(xk){_YAML_QUOTE_GUARD}{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
+        r"(?P<close>(?:(?P=vbs)(?P=vq))?)|(?!))"
+    )
+    regex = (
+        rf"{_FLOW_CLOSED_LEAD}(?P<name>{names}){_FLOW_CLOSED_BREAK}"
+        rf"(?P<sep>(?(kq)(?P=kq))(?(xk)(?:[^\S\r\n]*+{_YAML_BREAK})*+)[^\S\r\n]*+:)"
+        rf"{_FLOW_CLOSED_HDR}(?:{quoted}|(?!{_YAML_NOT_PLAIN}){plain})"
+    )
+    return _Pattern(
+        name,
+        re.compile(regex),
+        r"\g<lead>\g<name>\g<sep>\g<hdr>\g<open>***REDACTED***\g<close>",
         hint=_FLOW_CONTINUED_HINT,
         name_hint=re.compile(name_hint),
     )
@@ -1220,13 +1460,16 @@ _OAUTH_FIELD_NAMES = r"refresh|access|(?:refresh|access|id)_token|chatgpt[-_]acc
 # ``after_escape`` pass right after its ``regex``, in rounds until one
 # changes nothing (``_MAX_ROUNDS``); the order is part of :func:`redact`'s
 # output and of the class :func:`credential_classes` reports. Two classes
-# have six patterns each: a name's value on its line, a quoted value whose
-# quote ends that line (``_quoted_from_next_line``), a value on the lines
-# below it (``_yaml_value``), a value below a key in a YAML flow collection
-# and a plain scalar that goes on below such a key's line
-# (``_yaml_flow_value``, ``_yaml_flow_continued``, #285 review, round 8),
-# and a plain scalar that starts on the line and goes on below it
-# (``_yaml_continued``), the last five last of all. An
+# have nine patterns each: a YAML flow collection's value closed by its
+# indicator (``_yaml_flow_closed``, #285 review, round 9), first but for the
+# private key's, a name's value on its line, a quoted value whose quote ends
+# that line (``_quoted_from_next_line``), a value on the lines below it
+# (``_yaml_value``), an explicit key's value below its ``:`` and on the
+# ``:``'s line (``_yaml_value``, ``_yaml_explicit_line``, round 9), a value
+# below a key in a YAML flow collection and a plain scalar that goes on below
+# such a key's line (``_yaml_flow_value``, ``_yaml_flow_continued``, round
+# 8), and a plain scalar that starts on the line and goes on below it
+# (``_yaml_continued``), the last seven last of all. An
 # ``sk-ant-`` key with at least eight characters after ``sk-`` is replaced
 # by ``openai-key`` before ``anthropic-key`` sees it, so it is reported
 # under that class.
@@ -1254,6 +1497,14 @@ _PATTERNS: tuple[_Pattern, ...] = (
         "***REDACTED***",
         token_chars="-",
         hint="-----BEGIN ",
+    ),
+    # A flow collection's value closed by its indicator (#285 review, round
+    # 9; ``_yaml_flow_closed``), before every rule that reads a part of it
+    # and leaves the marker on its first line, so that it reads the value as
+    # written.
+    _yaml_flow_closed("env-assignment", rf"(?i:{_ENV_NAMES})", _ENV_HINT, literal_only=False),
+    _yaml_flow_closed(
+        "credential-suffix-assignment", _FLOW_SUFFIX_NAME, _SUFFIX_HINT, literal_only=True
     ),
     # VAR=secret / VAR: secret assignments for well-known names. The name may
     # be a quoted key (#393): JSON, a Python mapping's repr and a TOML quoted
@@ -1476,7 +1727,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _token(
         "credential-suffix-assignment",
         rf"{_IN_STRING}(?P<name>{_SUFFIX_NAME})"
-        rf"(?P<sep>{_KEY_QUOTE}(?(upper)\s*(?::{_COLON_TO_VALUE}|={_SPACE_TO_VALUE})"
+        rf"(?P<sep>{_KEY_QUOTE}(?(upper){_TO_SEPARATOR}(?::{_COLON_TO_VALUE}|={_SPACE_TO_VALUE})"
         rf"|[^\S\r\n]*+(?::{_COLON_TO_WORD}|=[^\S\r\n]*+)))"
         rf"{_VALUE_OPEN}"
         rf"(?P<val>(?(vq){_GUARDED_QUOTED_VALUE}|(?(upper){_UNQUOTED_VALUE}|{_LITERAL_VALUE})))"
@@ -1499,8 +1750,10 @@ _PATTERNS: tuple[_Pattern, ...] = (
     #
     # Before them, a quoted value whose opening quote ends its line, under
     # either kind of name (#285 review, round 4; ``_quoted_from_next_line``),
-    # which the name's rule on its line leaves whole; after them, the same
-    # two for a key in a YAML flow collection (round 8; ``_yaml_flow_value``,
+    # which the name's rule on its line leaves whole; after them, an
+    # explicit key's value below its ``:`` and on the ``:``'s line (round 9;
+    # ``_yaml_value``, ``_yaml_explicit_line``), the same two for a key in a
+    # YAML flow collection (round 8; ``_yaml_flow_value``,
     # ``_yaml_flow_continued``), which read no line a block key's rules read;
     # and last, a plain scalar that starts on its key's line and goes on
     # below it (``_yaml_continued``), whose first word the name's rule took.
@@ -1508,6 +1761,20 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _quoted_from_next_line("credential-suffix-assignment", _SUFFIX_NAME, _SUFFIX_HINT),
     _yaml_value("env-assignment", rf"(?i:{_ENV_NAMES})", _ENV_HINT, literal_only=False),
     _yaml_value("credential-suffix-assignment", _SUFFIX_NAME, _SUFFIX_HINT, literal_only=True),
+    _yaml_value(
+        "env-assignment", rf"(?i:{_ENV_NAMES})", _ENV_HINT, literal_only=False, explicit=True
+    ),
+    _yaml_value(
+        "credential-suffix-assignment",
+        _SUFFIX_NAME,
+        _SUFFIX_HINT,
+        literal_only=True,
+        explicit=True,
+    ),
+    _yaml_explicit_line("env-assignment", rf"(?i:{_ENV_NAMES})", _ENV_HINT, literal_only=False),
+    _yaml_explicit_line(
+        "credential-suffix-assignment", _SUFFIX_NAME, _SUFFIX_HINT, literal_only=True
+    ),
     _yaml_flow_value("env-assignment", rf"(?i:{_ENV_NAMES})", _ENV_HINT, literal_only=False),
     _yaml_flow_value(
         "credential-suffix-assignment", _FLOW_SUFFIX_NAME, _SUFFIX_HINT, literal_only=True
@@ -1581,7 +1848,12 @@ _CREDENTIAL_KEY = re.compile(
 # an underscore is a character longer than the shortest (``_A_TOKEN=x``, 10
 # to 23), and spaces among a private key's line breaks only make the block
 # longer. A flow key's lead may hold the last ``*`` of an earlier marker,
-# which it keeps: the marker is no part of the replaced run. The rounds of
+# which it keeps: the marker is no part of the replaced run. Round 9's are no
+# worse: an explicit key's ``? `` and its ``:`` on a line of its own stay
+# (``? a_token\n: x``, 14 to 27; below the ``:``, 16 to 29), and a flow
+# collection's value closed by its indicator holds a character and the
+# indicator at least, which stays (``{? a_token\n: x}``, 15 to 28; going on at
+# the line's start, ``{A_TOKEN: x\ny}``, 14 to 24, the ``}`` taken). The rounds of
 # :func:`redact` (``_MAX_ROUNDS``) are more patterns in that order, and
 # compound nothing either, by the argument below.
 # Growth does not compound across patterns: a later pattern can only lengthen

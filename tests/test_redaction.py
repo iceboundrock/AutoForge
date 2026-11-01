@@ -11,12 +11,14 @@ from urllib.parse import urlencode
 
 import pytest
 
+from autoforge.progress import clean
 from autoforge.redaction import (
     _ENV_NAMES,
     _PATTERNS,
     _YAML_DASH_CHAR,
     MAX_GROWTH_FACTOR,
     _redact_once,
+    _yaml_dash_char,
     credential_classes,
     redact,
     redact_obj,
@@ -66,6 +68,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R7_REDACTED,
     WHOLE_VALUES_285_R8,
     WHOLE_VALUES_285_R8_REDACTED,
+    WHOLE_VALUES_285_R9,
+    WHOLE_VALUES_285_R9_REDACTED,
     XAI_API_KEY,
     XAI_KEY_BODY,
 )
@@ -2541,15 +2545,21 @@ def test_a_value_the_sixth_review_rules_leave_is_left(text):
     assert credential_classes(text) == ()
 
 
-def test_a_dashes_character_is_a_dash_or_a_space_but_a_line_break():
+def test_a_dashes_character_is_an_indicator_or_a_space_but_a_line_break():
     """``_YAML_DASH_CHAR`` is written as one class, which the regex engine
-    repeats far faster than ``-|[^\\S\\r\\n]``; it must match the same
-    characters, every code point checked."""
+    repeats far faster than ``[-?:]|[^\\S\\r\\n]``; it must match the same
+    characters, every code point checked: a compact notation's indicator (a
+    sequence's ``-``, an explicit key's ``?`` and its value's ``:``, #285
+    review, round 9) or a space but a line break. An explicit key's own
+    run (``_yaml_dash_char("-")``) holds dashes only."""
     dash = re.compile(_YAML_DASH_CHAR)
+    only_dash = re.compile(_yaml_dash_char("-"))
     space = re.compile(r"[^\S\r\n]")
     for point in range(sys.maxunicode + 1):
         char = chr(point)
-        assert bool(dash.fullmatch(char)) == (char == "-" or bool(space.fullmatch(char))), point
+        is_space = bool(space.fullmatch(char))
+        assert bool(dash.fullmatch(char)) == (char in "-?:" or is_space), point
+        assert bool(only_dash.fullmatch(char)) == (char == "-" or is_space), point
 
 
 def _wide_entry(width, value, sibling="endpoint: e"):
@@ -3007,38 +3017,306 @@ def test_the_flow_rules_and_the_name_rules_agree_where_they_meet(text, expected)
         assert decoded == expected and redact(out) == out
 
 
-def test_a_flow_value_line_below_an_upper_case_name_that_is_not_indented_is_left():
-    """#285 review, round 8, a deliberately unfixed edge: under an
-    upper-case or a well-known name a flow collection's value is anything,
-    flow indicators included, as on the key's line, so only indentation
-    tells its lines below from what follows the collection, and a line that
-    is not indented stays (the first line is the name's own rule's), and so
-    does one whose next entry's key holds a space. Going on
-    at no indentation, or ending at the collection's ``}``, either took the
-    lines after the collection or let the key's-line rule take the ``}`` and
-    the next round go on, a line a round."""
-    text = "{GH_TOKEN: FAKE1\nFAKEleft}"
-    assert redact(text) == "{GH_TOKEN: ***REDACTED***\nFAKEleft}"
-    assert redact(redact(text)) == redact(text)
-    text = "{GH_TOKEN:\n  FAKE1\nFAKEleft,\nnext}"
-    assert redact(text) == "{GH_TOKEN:\n  ***REDACTED***\nFAKEleft,\nnext}"
-    # Nor is a line whose next entry's key holds a space: the ``,`` that
-    # ends the value is told by a key of one word.
-    text = "{CLIENT_SECRET:\n  FAKE1\n  FAKEleft, two words: x}"
-    assert redact(text) == "{CLIENT_SECRET:\n  ***REDACTED***\n  FAKEleft, two words: x}"
+# A flow scalar under an upper-case or a well-known name that goes on at a
+# line's start or before a next key that holds a space (#285 review, round
+# 9, R9-F2), each with what ``redact`` makes of it: from the key's line and
+# below the key, at the line's start and indented by turns, the ``}`` on a
+# line of its own after it and after a comment, the next entry's key with a
+# space, quoted and after a ``?``, in a block mapping's entry and in a flow
+# sequence, and below a key that starts its line after a ``,``, under a
+# lower-case name as well. The value goes whole; the next entry and what
+# follows the collection stay, and so does the indicator that closes the
+# value, but the ``,`` or ``}`` that an upper-case or a well-known name's
+# value takes after its marker, as on the key's line (``{GH_TOKEN: FAKE}``).
+_FLOW_VALUES_AT_ANY_INDENTATION = [
+    ("{GH_TOKEN: FAKE1\nFAKE2}", "{GH_TOKEN: ***REDACTED***"),
+    (
+        "outer: {CLIENT_SECRET: FAKE1\nFAKE2}\nnext: 1",
+        "outer: {CLIENT_SECRET: ***REDACTED***\nnext: 1",
+    ),
+    ("{GH_TOKEN:\n  FAKE1\nFAKE2,\nnext}", "{GH_TOKEN:\n  ***REDACTED***\nnext}"),
+    ("{GH_TOKEN:\nFAKE1\nFAKE2 FAKE3\nFAKE4}", "{GH_TOKEN:\n***REDACTED***"),
+    ("{GH_TOKEN: FAKE1\n  FAKE2\nFAKE3\n    FAKE4}", "{GH_TOKEN: ***REDACTED***"),
+    ("{GH_TOKEN: FAKE1\nFAKE2\n}", "{GH_TOKEN: ***REDACTED***\n}"),
+    ("{GH_TOKEN: FAKE1\nFAKE2 # c\n}", "{GH_TOKEN: ***REDACTED*** # c\n}"),
+    (
+        "{DB_PASSWORD: FAKE1\nFAKE2, region: r}",
+        "{DB_PASSWORD: ***REDACTED*** region: r}",
+    ),
+    (
+        "{CLIENT_SECRET:\n  FAKE1\n  FAKE2, two words: x}",
+        "{CLIENT_SECRET:\n  ***REDACTED*** two words: x}",
+    ),
+    ('{CLIENT_SECRET:\n  FAKE1\n  FAKE2, "q k": x}', '{CLIENT_SECRET:\n  ***REDACTED*** "q k": x}'),
+    ("{CLIENT_SECRET:\n  FAKE1\n  FAKE2, ? k: x}", "{CLIENT_SECRET:\n  ***REDACTED*** ? k: x}"),
+    ("x:\n  {GH_TOKEN: FAKE1\nFAKE2}\ny: 2", "x:\n  {GH_TOKEN: ***REDACTED***\ny: 2"),
+    ("[{_SERVICE_API_KEY: FAKE1\nFAKE2}, {a: 1}]", "[{_SERVICE_API_KEY: ***REDACTED*** {a: 1}]"),
+    ("{a: 1,\nGH_TOKEN:\n  FAKE1\nFAKE2}", "{a: 1,\nGH_TOKEN:\n  ***REDACTED***"),
+    (
+        "{a: 1,\n  CLIENT_SECRET:\n    FAKE1\n  FAKE2}",
+        "{a: 1,\n  CLIENT_SECRET:\n    ***REDACTED***",
+    ),
+    ("{a: 1,\nclient_secret:\n  FAKE1\nFAKE2}", "{a: 1,\nclient_secret:\n  ***REDACTED***"),
+    (
+        "{a: 1,\nclient_secret: FAKE1\n  FAKE2, b: c}",
+        "{a: 1,\nclient_secret: ***REDACTED***, b: c}",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    _FLOW_VALUES_AT_ANY_INDENTATION,
+    ids=[t for t, _ in _FLOW_VALUES_AT_ANY_INDENTATION],
+)
+def test_a_flow_value_goes_on_at_any_indentation_under_any_name(text, expected):
+    """#285 review, round 9: inside a flow collection a scalar's lines need
+    no indentation, and a YAML parser reads each line here as the value's.
+    Under an upper-case or a well-known name a line that was not indented
+    was left (round 8 documented it as a deliberate edge), and so was the
+    line before a next key holding a space; below a key that starts its
+    line, a line indented no more than the key after one indented past it.
+    The value goes whole now, as text and written out one, two and three
+    deep, the output is stable, and the next entry and what follows the
+    collection stay."""
+    yaml = pytest.importorskip("yaml")
+    yaml.safe_load(text)
+    assert redact(text) == expected
+    assert "FAKE" not in expected and credential_classes(expected) == ()
+    assert redact(expected) == expected
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        assert "FAKE" not in out and redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "cls", "text", "body"),
+    WHOLE_VALUES_285_R9,
+    ids=[c[0] for c in WHOLE_VALUES_285_R9],
+)
+def test_a_value_the_ninth_285_review_found_is_redacted_whole_as_text_and_as_json(
+    name, cls, text, body
+):
+    """#285 review, round 9: a value under an explicit key, in a flow
+    collection and in a block mapping, and an upper-case or a well-known
+    name's flow scalar going on at a line's start or before a next key that
+    holds a space, which a YAML parser reads, were kept whole or in part.
+    Each goes whole, as text and as JSON, JSON in JSON and three deep write
+    it, is reported under its class, the JSON still decodes to what
+    redacting the text gives, and the output is stable and within the
+    growth bound; ``clean`` shows none of it on a progress line."""
+    yaml = pytest.importorskip("yaml")
+    yaml.safe_load(text)
+    assert redact(text) == WHOLE_VALUES_285_R9_REDACTED[name]
+    for depth in (0, 1, 2, 3):
+        escaped = _json_string(text, depth)
+        out = redact(escaped)
+        assert body not in out and "FAKE" not in out, out
+        assert credential_classes(escaped) == (cls,)
+        assert redact(out) == out and credential_classes(out) == ()
+        assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == WHOLE_VALUES_285_R9_REDACTED[name]
+    assert redact_obj({"env": {"text": text}}) == {"env": {"text": redact(text)}}
+    assert "FAKE" not in clean(text, 10_000)
+
+
+# A value under an explicit key (#285 review, round 9, R9-F1), each with
+# what ``redact`` makes of it: in a block mapping, the value on the ``:``'s
+# line after more space, quoted (of several lines too), after an anchor and
+# a tag, a block and a folded block with the next entry after it, below the
+# ``:``, after properties on a line of their own, going on below its line,
+# past a comment, a blank line and a comment line between the key and the
+# ``:``, the key quoted, in a sequence's entry and a nested mapping with the
+# next entry after it, under an upper-case and a well-known name, after CRLF,
+# a bare carriage return and OpenCode's ANSI escape, and a key that is a
+# mapping itself; in a flow collection, the value on the key's line, below
+# it, on the ``:``'s line below the key with the next entry after it, quoted
+# below the ``:``, in a flow sequence, after a ``,``, the ``?`` alone on its
+# line, and under a well-known name.
+_YAML_EXPLICIT_VALUES = [
+    ("? client_secret\n: FAKE", "? client_secret\n: ***REDACTED***"),
+    ("? client_secret\n:   FAKE", "? client_secret\n:   ***REDACTED***"),
+    ("? client_secret\n: 'FAKE x; y'", "? client_secret\n: '***REDACTED***'"),
+    ('? client_secret\n: "FAKE\n  more"', '? client_secret\n: "***REDACTED***"'),
+    ("? client_secret\n: &cs FAKE", "? client_secret\n: &cs ***REDACTED***"),
+    ("? client_secret\n: !!str FAKE", "? client_secret\n: !!str ***REDACTED***"),
+    (
+        "? client_secret\n: |\n  FAKE1\n  FAKE2\nnext: 1",
+        "? client_secret\n: |\n  ***REDACTED***\nnext: 1",
+    ),
+    ("? client_secret\n: >-\n  FAKE", "? client_secret\n: >-\n  ***REDACTED***"),
+    ("? client_secret\n:\n  FAKE", "? client_secret\n:\n  ***REDACTED***"),
+    ("? client_secret\n:\n  &cs\n  FAKE", "? client_secret\n:\n  &cs\n  ***REDACTED***"),
+    ("? client_secret\n: FAKE1\n  FAKE2\nnext: 1", "? client_secret\n: ***REDACTED***\nnext: 1"),
+    (
+        "? client_secret # rotated\n\n# by ops\n: FAKE",
+        "? client_secret # rotated\n\n# by ops\n: ***REDACTED***",
+    ),
+    ("? 'client_secret'\n: FAKE", "? 'client_secret'\n: ***REDACTED***"),
+    ("- ? db_password\n  : FAKE\n- a: 1", "- ? db_password\n  : ***REDACTED***\n- a: 1"),
+    (
+        "x:\n  ? x_api_key\n  : FAKE\n  endpoint: e",
+        "x:\n  ? x_api_key\n  : ***REDACTED***\n  endpoint: e",
+    ),
+    ("? CLIENT_SECRET\n: FAKE", "? CLIENT_SECRET\n: ***REDACTED***"),
+    ("? GH_TOKEN\n:\n  FAKE", "? GH_TOKEN\n:\n  ***REDACTED***"),
+    ("? client_secret\r\n: FAKE", "? client_secret\r\n: ***REDACTED***"),
+    ("? client_secret\r: FAKE", "? client_secret\r: ***REDACTED***"),
+    ("\x1b[0m? client_secret\n: FAKE", "\x1b[0m? client_secret\n: ***REDACTED***"),
+    ("? client_secret:\n    FAKE\n: v", "? client_secret:\n    ***REDACTED***\n: v"),
+    ("? client_secret: FAKE1\n    FAKE2\n: v", "? client_secret: ***REDACTED***\n: v"),
+    ("{? client_secret: FAKE}", "{? client_secret: ***REDACTED***}"),
+    ("{? client_secret:\n  FAKE}", "{? client_secret:\n  ***REDACTED***}"),
+    ("{? client_secret\n: FAKE, b: c}", "{? client_secret\n: ***REDACTED***, b: c}"),
+    ("{? client_secret\n:\n  'FAKE'}", "{? client_secret\n:\n  '***REDACTED***'}"),
+    ("[? client_secret\n: FAKE]", "[? client_secret\n: ***REDACTED***]"),
+    ("{a: 1, ? client_secret:\n FAKE}", "{a: 1, ? client_secret:\n ***REDACTED***}"),
+    ("{?\n client_secret:\n FAKE}", "{?\n client_secret:\n ***REDACTED***}"),
+    ("{? GH_TOKEN\n: FAKE}", "{? GH_TOKEN\n: ***REDACTED***"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _YAML_EXPLICIT_VALUES, ids=[t for t, _ in _YAML_EXPLICIT_VALUES]
+)
+def test_a_value_under_an_explicit_yaml_key_is_redacted_whole(text, expected):
+    """#285 review, round 9: YAML writes a key after a ``?`` and its value
+    after a ``:``, on the key's line or a later one, and a parser reads it
+    as ``key: value``, but every pattern wanted the key's ``:`` on its own
+    line, so such a value was kept whole in every sink and check. The value
+    goes, as text and written out one, two and three deep; the ``?``, the
+    key, the comments, the ``:``, the properties and the next entry stay,
+    and the output is stable."""
+    assert redact(text) == expected
+    assert credential_classes(text) != ()
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        assert "FAKE" not in out and redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+
+
+# What the explicit-key rules leave (#285 review, round 9): under a
+# lower-case name a value that reads as code (a type, a constant, a
+# template, a reference after a tag, a dotted name, a number) and a block of
+# placeholders; a sequence, a mapping below the ``:`` and on its line; a
+# ``:`` that is not at the ``?``'s column, one with no space after it, a
+# line that is no ``:`` (the key's next line, a code fence), a plural name, a
+# suffix behind underscores alone, a ``?`` inside a word, and a Markdown
+# definition list's term with no ``?``.
+_R9_NEAR_MISSES = [
+    "? api_token\n: str",
+    "? client_secret\n: None",
+    "? client_secret\n: ${{ secrets.X }}",
+    "? client_secret\n: !secret app_secret",
+    "? client_secret\n:\n  - a",
+    "? client_secret\n:\n  key: value",
+    "? client_secret\n: key: value",
+    "? client_secret\n: |\n  {{ vault_secret }}",
+    "? client_secret\n  : FAKE",
+    "? client_secrets\n: FAKE",
+    "? client_secret\n:FAKE",
+    "? client_secret\n\nnext: FAKE",
+    "? client_secret\n```\n: FAKE\n```",
+    "{? client_secret\n: 12345}",
+    "{? client_secret\n: process.env.CLIENT_SECRET}",
+    "why? client_secret\n: FAKE",
+    "client_secret\n: The secret issued by the provider.",
+    "? __TOKEN\n: FAKE",
+]
+
+
+@pytest.mark.parametrize("text", _R9_NEAR_MISSES)
+def test_a_value_the_ninth_review_rules_leave_is_left(text):
+    assert redact(text) == text
+    assert credential_classes(text) == ()
+
+
+def _explicit_entry(rng, tag, name, col):
+    """An explicit key's entry in a block mapping at column ``col``, and the
+    words of its value: on the ``:``'s line, below it, quoted, in a block,
+    going on below, after a property; comments and blank lines between the
+    key and the ``:``."""
+    words = [f"FAKE{tag}w{i}" for i in range(rng.randint(1, 3))]
+    pad, deeper = " " * col, " " * (col + rng.choice([1, 2, 4]))
+    prop = rng.choice(["", "", "&a ", "!!str "])
+    kind = rng.random()
+    if kind < 0.2:
+        quote = rng.choice(["'", '"'])
+        value = rng.choice([" ", "\n" + deeper]) + prop + quote + " ".join(words) + quote
+    elif kind < 0.35:
+        value = " " + rng.choice(["|", ">", "|-"]) + "".join(f"\n{deeper}{w}" for w in words)
+    elif kind < 0.65:
+        value = f"\n{deeper}{prop}" + f"\n{deeper}".join(words)
+    else:
+        value = f" {prop}{words[0]}" + "".join(f"\n{deeper}{w}" for w in words[1:])
+    key = rng.choice(["{}", "'{}'", '"{}"']).format(name)
+    between = rng.choice(["", "", f"\n{pad}# c", "\n", f'\n{pad}# "? x_token'])
+    return f"? {key}{rng.choice(['', ' # k'])}{between}\n{pad}:{value}", words
+
+
+def test_every_value_under_a_generated_explicit_yaml_key_is_redacted():
+    """#285 review, round 9: block mappings and sequences of explicit keys
+    that a YAML parser reads, their keys lower-, mixed-, upper-case,
+    well-known and underscore-led, plain or quoted, comments and blank lines
+    between a key and its ``:``, their values on the ``:``'s line or below
+    it, plain, quoted, in a block or after a property, among other entries,
+    after CRLF and bare carriage returns. Every word of every credential
+    value goes, as text and as JSON one, two and three deep, the output is
+    stable and within the growth bound, and a progress line shows none."""
+    yaml = pytest.importorskip("yaml")
+    rng = random.Random(2859)
+    checked = 0
+    while checked < 300:
+        seq = rng.random() < 0.3
+        lead = "- " if seq else ""
+        lines, secrets = [], []
+        for j in range(rng.randint(1, 3)):
+            if rng.random() < 0.25:
+                lines.append(lead + "endpoint: e")
+                continue
+            name = rng.choice(_FLOW_UPPER_NAMES + _FLOW_LOWER_NAMES)
+            entry, words = _explicit_entry(rng, f"{checked}x{j}", name, len(lead))
+            lines.append(lead + entry)
+            secrets += words
+        text = "\n".join(lines).replace("\n", rng.choice(["\n", "\n", "\r\n", "\r"]))
+        try:
+            yaml.safe_load(text)
+        except yaml.YAMLError:
+            continue
+        if not secrets:
+            continue
+        checked += 1
+        assert [w for w in secrets if w in clean(text, 100_000)] == [], text
+        for depth in (0, 1, 2, 3):
+            written = _json_string(text, depth)
+            out = redact(written)
+            assert [w for w in secrets if w in out] == [], text
+            assert redact(out) == out and credential_classes(out) == (), text
+            assert len(out) <= MAX_GROWTH_FACTOR * len(written)
 
 
 _FLOW_LOWER_NAMES = ["client_secret", "db_password", "x_api_key", "_db_password", "Db_Password"]
 _FLOW_UPPER_NAMES = ["CLIENT_SECRET", "_SERVICE_API_KEY", "GH_TOKEN", "gh_token"]
 
 
-def _flow_value(rng, tag, upper):
+def _flow_value(rng, tag):
     """A value for a flow collection's entry, its words and where they are:
     quoted on the key's line or below it, after a property, below the key
-    on lines of their own, or going on below the key's line. Under an
-    upper-case name the lines below are indented (the edge above)."""
+    on lines of their own, or going on below the key's line, at any
+    indentation under any name (#285 review, round 9)."""
     words = [f"FAKE{tag}w{i}" for i in range(rng.randint(1, 3))]
-    ind = " " * (rng.choice([1, 2, 4]) if upper else rng.choice([0, 1, 2, 4]))
+    ind = " " * rng.choice([0, 1, 2, 4])
     kind = rng.random()
     if kind < 0.2:
         q = rng.choice(["'", '"'])
@@ -3058,12 +3336,14 @@ def _flow_collection(rng, it):
     for j in range(rng.randint(1, 4)):
         r = rng.random()
         if r < 0.3:
-            entries.append(rng.choice(["endpoint: e", "region: r", "a: 1"]))
+            entries.append(rng.choice(["endpoint: e", "region: r", "a: 1", "two words: x"]))
             continue
-        upper = r >= 0.7
-        name = rng.choice(_FLOW_UPPER_NAMES if upper else _FLOW_LOWER_NAMES)
-        value, words = _flow_value(rng, f"{it}x{j}", upper)
-        entries.append(f"{name}:{value}")
+        name = rng.choice(_FLOW_UPPER_NAMES if r >= 0.7 else _FLOW_LOWER_NAMES)
+        value, words = _flow_value(rng, f"{it}x{j}")
+        # An explicit key (#285 review, round 9), its ``:`` on its line or
+        # on the next.
+        explicit = rng.choice(["", "", "? ", "? "]) + name + rng.choice(["", "\n"])
+        entries.append(f"{explicit if explicit.startswith('?') else name}:{value}")
         secrets += words
     text = "{" + rng.choice([", ", ",\n  ", ",\n"]).join(entries) + "}"
     return (f"outer: {text}\nnext: 1" if rng.random() < 0.3 else text), secrets
@@ -3988,6 +4268,64 @@ def test_the_eighth_review_patterns_stay_linear(text):
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        # Explicit keys: keys with no ``:`` below them, comment lines that
+        # each hold another explicit key behind a quote, below a key and
+        # below its ``:``, one line of comments that do, and keys whose
+        # ``:`` stands at another column.
+        "? a_token\n" * 100_000,
+        "? a_token\n" + '# "? a_token\n' * 80_000,
+        "? a_token\n:\n" + '# "? a_token\n' * 80_000,
+        '"? a_token # ' * 80_000,
+        "? a_token\n  : x\n" * 60_000,
+        # In a flow collection: a ``?`` with no key, keys with no ``:``,
+        # their ``:`` below them after blank lines.
+        "{? " * 300_000,
+        "{? a_token\n" * 80_000,
+        "{? a_token" + "\n" * 1_000_000 + ": x}",
+        # A closed value: lines with no indicator after them, one long line
+        # of commas, keys with values in a row, blank lines before a value,
+        # and a next key's words after a ``,``, with no ``:`` after them.
+        ("{a_token: x\n" + "y\n" * 100) * 2_000,
+        "{a_token: x\n" + "y, " * 300_000,
+        "{a_token: x\ny, b_token: z\nw, " * 30_000,
+        "{a_token:" + "\n" * 1_000_000 + "x\ny}",
+        "{GH_TOKEN:\n  x\n  " + "y, " * 300_000,
+        "{GH_TOKEN:\n  x\n  y, " + "a " * 400_000 + ":",
+    ],
+    ids=[
+        "explicit-keys-no-colon",
+        "comment-lines-with-explicit-keys",
+        "comment-lines-below-a-colon",
+        "one-line-of-commented-keys",
+        "colons-at-another-column",
+        "flow-question-marks",
+        "flow-explicit-keys-no-colon",
+        "flow-explicit-blank-lines",
+        "closed-values-no-indicator",
+        "closed-value-commas",
+        "closed-values-in-a-row",
+        "closed-value-blank-lines",
+        "next-key-commas",
+        "next-key-words",
+    ],
+)
+def test_the_ninth_review_patterns_stay_linear(text):
+    """#285 review, round 9: an explicit key's candidate reads its key, its
+    comments and the blank and comment lines below it once, and matches them
+    unchanged where no ``:`` and value follow, so a comment's own explicit
+    keys are never read again; a flow collection's closed value reads its
+    key's line to its first line break and its lines once, which hold no
+    flow indicator; a next key's words end at the next ``,``. A megabyte of
+    each is redacted well inside the budget, and the output is stable."""
+    started = time.process_time()
+    out = redact(text)
+    assert time.process_time() - started < 3.0
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("{client_secret: FAKE}", "{client_secret: ***REDACTED***}"),
@@ -4521,7 +4859,11 @@ def test_a_credential_is_recognised_after_an_escape_or_any_non_token_character(
     assert redact(text) == _after(lead, expected)
     assert credential_classes(text) == (reported,)
     assert redact(redact(text)) == redact(text)
-    entry = next(entry for entry in _PATTERNS if entry.name == name)
+    # The class's own pattern, the one that starts a token where the class
+    # has one (#285 review, round 9: a flow collection's closed value runs
+    # before it, under the same class).
+    own = [e for e in _PATTERNS if e.name == name]
+    entry = next((e for e in own if e.after_escape is not None), own[0])
     alone = entry.regex.sub(entry.replacement, text)
     if entry.after_escape is not None:
         alone = entry.after_escape.sub(entry.escape_replacement, alone)
@@ -4852,18 +5194,21 @@ def test_redact_obj_redacts_a_token_after_an_ansi_escape_at_any_depth():
 
 def test_every_pattern_but_the_quoted_oauth_field_starts_a_token_after_an_escape():
     """A new pattern is built with ``_token``, never anchored on ``\\b``: only
-    ``oauth-field``, which a quote starts, the six patterns that start at a
+    ``oauth-field``, which a quote starts, the patterns that start at a
     line's start, the two YAML value patterns (#285 review, round 3) and the
     two of round 4 on each side of them, which take an escape before a name
-    as a line's start or a token's, and the four that start at a YAML flow
-    collection's ``{``, ``[`` or ``,`` (round 8), which no escape ends, have
-    no ``after_escape`` pass."""
-    line_patterns = ["env-assignment", "credential-suffix-assignment"] * 5
+    as a line's start or a token's, the four of an explicit key (round 9),
+    which do the same, and the six that start at a YAML flow collection's
+    ``{``, ``[`` or ``,`` (rounds 8 and 9), which no escape ends, have no
+    ``after_escape`` pass."""
+    pair = ["env-assignment", "credential-suffix-assignment"]
     assert [
         (index, entry.name) for index, entry in enumerate(_PATTERNS) if entry.after_escape is None
     ] == [
-        (17, "oauth-field"),
-        *((len(_PATTERNS) - 10 + i, name) for i, name in enumerate(line_patterns)),
+        (1, "env-assignment"),
+        (2, "credential-suffix-assignment"),
+        (19, "oauth-field"),
+        *((len(_PATTERNS) - 14 + i, name) for i, name in enumerate(pair * 7)),
     ]
     assert not [entry.name for entry in _PATTERNS if r"\b" in entry.regex.pattern]
 
@@ -4995,6 +5340,17 @@ _WORST_CASE_UNITS = {
     "yaml_flow_continued": "{a_token: x\ny}",
     "yaml_flow_continued_well_known_name": "{HF_TOKEN: x\n y z}",
     "credential_suffix_assignment_underscore": "_A_TOKEN=x;",
+    # Round 9: an explicit key's value below its ``:``, 16 to 29, and on the
+    # ``:``'s line, 14 to 27, under a lower-case and a well-known name; a flow
+    # collection's value closed by its indicator, its next line at the line's
+    # start, 14 to 24 under an upper-case name (the ``}`` goes with it), and
+    # an explicit key in a flow collection, its ``:`` below it, 15 to 28.
+    "yaml_explicit_value": "? a_token\n:\n x\n",
+    "yaml_explicit_value_well_known_name": "? HF_TOKEN\n:\n x\n",
+    "yaml_explicit_line": "? a_token\n: x\n",
+    "yaml_explicit_line_well_known_name": "? HF_TOKEN\n: x\n y\n",
+    "yaml_flow_closed_upper_case_name": "{A_TOKEN: x\ny}",
+    "yaml_flow_explicit_key": "{? a_token\n: x}",
     # The BEGIN line and 16 characters of key material, its floor: 44 to 15.
     "private_key": "-----BEGIN" + " PRIVATE KEY-----" + "a" * 16 + " ",
     # Its material parted by spaces (round 5), longer still: 48 to 16.
@@ -5109,6 +5465,10 @@ def test_every_redaction_pattern_has_its_stable_class_name():
     the class, so a rename changes what an agent is told to remove."""
     assert [entry.name for entry in _PATTERNS] == [
         "private-key",
+        # A flow collection's value closed by its indicator (#285 review,
+        # round 9), before the rules that read a part of it.
+        "env-assignment",
+        "credential-suffix-assignment",
         "env-assignment",
         "authorization-header",
         "url-userinfo",
@@ -5130,21 +5490,13 @@ def test_every_redaction_pattern_has_its_stable_class_name():
         "oauth-bare-assignment",
         "credential-suffix-assignment",
         # A quoted value whose quote ends its line (#285 review, round 4), a
-        # credential name's value on the lines below it (round 3), a value
-        # below a YAML flow collection's key and a plain scalar that goes on
-        # below such a key's line (round 8), and a plain scalar that starts
-        # on its key's line and goes on below it (round 4), each under the
-        # class of the name's own pattern.
-        "env-assignment",
-        "credential-suffix-assignment",
-        "env-assignment",
-        "credential-suffix-assignment",
-        "env-assignment",
-        "credential-suffix-assignment",
-        "env-assignment",
-        "credential-suffix-assignment",
-        "env-assignment",
-        "credential-suffix-assignment",
+        # credential name's value on the lines below it (round 3), an
+        # explicit key's value below its ``:`` and on its line (round 9), a
+        # value below a YAML flow collection's key and a plain scalar that
+        # goes on below such a key's line (round 8), and a plain scalar that
+        # starts on its key's line and goes on below it (round 4), each under
+        # the class of the name's own pattern.
+        *["env-assignment", "credential-suffix-assignment"] * 7,
     ]
 
 
@@ -5272,8 +5624,10 @@ def test_the_well_known_names_hint_holds_for_every_name_in_any_case():
     name's line and as the second hint of each pattern that starts at a
     line's start (#285 review, rounds 3 and 4) or at a flow collection's
     indicator (round 8)."""
-    line, *starts = [entry for entry in _PATTERNS if entry.name == "env-assignment"]
-    assert line.hint is not None and len(starts) == 5
+    entries = [entry for entry in _PATTERNS if entry.name == "env-assignment"]
+    (line,) = [entry for entry in entries if entry.after_escape is not None]
+    starts = [entry for entry in entries if entry is not line]
+    assert line.hint is not None and len(starts) == 8
     for name in _ENV_NAME_LIST:
         for variant in (name, name.lower(), name.title()):
             assert line.hint.search(variant), variant

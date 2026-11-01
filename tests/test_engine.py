@@ -121,6 +121,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R7_REDACTED,
     WHOLE_VALUES_285_R8,
     WHOLE_VALUES_285_R8_REDACTED,
+    WHOLE_VALUES_285_R9,
+    WHOLE_VALUES_285_R9_REDACTED,
     FakeGitHub,
     acceptance,
     analyze_payload,
@@ -519,6 +521,9 @@ _R8_SHAPES = [
     ("cr-space-cr-key", "private-key", CR_SPACE_CR_KEY),
     *((name, "credential-suffix-assignment", text) for name, text, _ in WHOLE_VALUES_285_R8),
 ]
+# What the ninth review of #285 found every check accepted (R9-F1, R9-F2):
+# each id, its class and its text.
+_R9_SHAPES = [(name, cls, text) for name, cls, text, _ in WHOLE_VALUES_285_R9]
 
 
 @pytest.mark.parametrize(
@@ -847,6 +852,38 @@ _R8_SHAPES = [
                 id=f"body-carries-a-round-8-{name}-as-json",
             )
             for name, cls, text in _R8_SHAPES
+        ),
+        # Round 9: a value under an explicit YAML key and an upper-case or a
+        # well-known name's flow scalar going on at a line's start, in the
+        # commit message, in the body and in the body as JSON writes it.
+        *(
+            pytest.param(
+                lambda req, text=text: (
+                    implement(req) if commit_in(req.cwd, f"Configure it (#2)\n\n{text}") else ""
+                ),
+                _from_start,
+                f"commit message contains a credential-shaped string (pattern class: {cls})",
+                id=f"commit-carries-a-round-9-{name}",
+            )
+            for name, cls, text in _R9_SHAPES
+        ),
+        *(
+            pytest.param(
+                lambda req, text=text: implement(req, pr_body=f"Adds it.\n\n{text}"),
+                _reports_head,
+                f"credential-shaped string (pattern class: {cls})",
+                id=f"body-carries-a-round-9-{name}",
+            )
+            for name, cls, text in _R9_SHAPES
+        ),
+        *(
+            pytest.param(
+                lambda req, text=text: implement(req, pr_body=f"Adds it:\n\n{json.dumps(text)}"),
+                _reports_head,
+                f"credential-shaped string (pattern class: {cls})",
+                id=f"body-carries-a-round-9-{name}-as-json",
+            )
+            for name, cls, text in _R9_SHAPES
         ),
         pytest.param(
             lambda req: implement(req, pr_body="Adds it. Fixes #2"),
@@ -8149,6 +8186,45 @@ def test_a_whole_value_the_eighth_285_review_found_never_reaches_state_or_the_lo
         for line in SHORT_WRAPPED_KEY_LINES:
             assert line not in text
         for _, _, body in WHOLE_VALUES_285_R8:
+            assert body not in text
+    assert fake_github.effect_writes == []
+
+
+def test_a_whole_value_the_ninth_285_review_found_never_reaches_state_or_the_logs(
+    tmp_state_dir, fake_github
+):
+    """#285 review, round 9: values under an explicit YAML key, and an
+    upper-case or a well-known name's flow scalar going on at a line's start
+    or before a next key that holds a space, were kept whole or in part in
+    ``stdout.log``, ``stderr.log``, the block reason in ``state.json`` and
+    the step outcome, as text and as JSON three deep. Each is redacted whole
+    at every sink, and nothing is written to GitHub."""
+    texts = [text for _, _, text, _ in WHOLE_VALUES_285_R9]
+    deep = json.dumps(json.dumps(json.dumps(texts)))
+    message = "refused:\n" + "\n".join(texts)
+    payload = {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": message}
+    reply = "".join(f"{text}\n" for text in [*texts, deep]) + block(payload)
+    eng = make_engine(tmp_state_dir, [reply], github=fake_github, origin=True)
+    eng.provider.stderr = "".join(
+        f"\x1b[91m\x1b[1mError: \x1b[0m{text}\n" for text in [*texts, deep]
+    )
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    redacted = [WHOLE_VALUES_285_R9_REDACTED[name] for name, _, _, _ in WHOLE_VALUES_285_R9]
+    assert s.block_reason == "refused:\n" + "\n".join(redacted)
+    assert out.message == f"agent reported blocked: {s.block_reason}"
+    logs = [path for path in (eng.paths.logs_dir / s.run_id).rglob("*") if path.is_file()]
+    assert {"stdout.log", "stderr.log"} <= {path.name for path in logs}
+    texts = [
+        eng.paths.state_file.read_bytes().decode("utf-8"),
+        out.message,
+        *(path.read_bytes().decode("utf-8") for path in logs),
+    ]
+    for text in texts:
+        assert "FAKE" not in text
+        for _, _, _, body in WHOLE_VALUES_285_R9:
             assert body not in text
     assert fake_github.effect_writes == []
 

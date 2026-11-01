@@ -73,7 +73,10 @@ line, whose name stands outside every string its line opens; a line starts
 after a line feed or a carriage return, and each takes an escape before the
 name as a line's start or a token's, #285; nor do the four that find a
 value below a key in a YAML flow collection, whose key stands after the
-collection's `{`, `[` or a `,`, eighth review of #285). A credential
+collection's `{`, `[` or a `,`, eighth review of #285, nor the six of
+the ninth review: the four that find an explicit key's value, whose `?`
+starts its line as a key does, and the two that find a flow collection's
+value closed by its indicator). A credential
 starts:
 
 - at the start of the text;
@@ -643,7 +646,9 @@ api_token:              Db_Password:            client_secret: <word>
 ```
 
 - **The key starts its line**: after its indentation, a YAML sequence's
-  dashes (`- client_secret:`), as a quoted key (`"client_secret":`), or
+  dashes (`- client_secret:`), or the `?` and `:` of compact notation that
+  stand where they do (`? client_secret:`, an explicit key that is itself a
+  mapping, ninth review of #285), as a quoted key (`"client_secret":`), or
   right after an escape sequence (OpenCode's `ESC[0m`, a `\n` written out)
   or a quote that starts a string (YAML in JSON). A statement that ends in
   a colon does not (`if api_token:`, `while client_secret:`), so code
@@ -834,13 +839,64 @@ api_token:              Db_Password:            client_secret: <word>
   a value that reads as code stays, as below a block key (`string`, `None`,
   `12345` alone, `process.env.X`, `!secret app_secret`, `${{ secrets.X }}`),
   and so do a nested mapping, a sequence, an empty value and a code fence.
-  Not recognised: under an upper-case or a well-known name, a plain
-  scalar's line below that is not indented (`{GH_TOKEN: FAKE1`, then
-  `FAKE2}`), or whose next entry's key holds a space (`FAKE2, two words:
-  x`); its first line is still that name's rule's.
+  The key may follow a `?` (`{? client_secret:`, then the value, ninth
+  review of #285), and the next entry's key that tells a `,` may hold
+  spaces, be quoted or follow a `?` (`FAKE2, two words: x`, which kept
+  `FAKE2` until the ninth review); its words end at the next `,`, so a
+  candidate reads them once.
+- **A flow collection's value closed by its indicator** (ninth review of
+  #285): a plain scalar of several lines in a flow collection, on the key's
+  line and below it or below the key alone, at any indentation, up to the
+  `,`, `]` or `}` that ends it, on its last line or after blank and comment
+  lines. Inside a flow collection a scalar's lines need no indentation and
+  a YAML parser reads each as the value's, but under an upper-case or a
+  well-known name the rule above went on to indented lines only (its value
+  is anything, flow indicators included, so only indentation told its lines
+  from what follows the collection), and below a key that starts its line a
+  line indented no more than the key, after one indented past it, was no
+  rule's: `{CLIENT_SECRET: FAKE1`, then `FAKE2}` at the line's start, kept
+  `FAKE2` in every sink and check, as text, written out and on a live
+  progress line, and the eighth review's documentation called it a
+  deliberate edge. The indicator that closes the value tells its lines
+  here: under any name the value is a flow scalar's lines, which hold no
+  flow indicator, under a lower-case name when its first word does not read
+  as code (`_CODE_WORD`), and it is replaced whole, the indicator and what
+  follows it kept; a value of one line is read so too where it stands below
+  its `:`, under a lower-case name when it does not read as code. The rule
+  runs before every other but the private key's, so it reads the value as
+  written, and a value that starts with a marker is none: the rules after
+  it may take the `}` after its marker, as `{GH_TOKEN: FAKE}` loses its `}`
+  on the key's line, and the marker then stands alone, so no round goes on
+  where another stopped. A token of a known shape in such a value is
+  reported under the name's class. Each candidate starts at a `{`, a `[` or
+  a `,`, reads its key's line once to its first line break (stopping at a
+  flow indicator, a second `: ` and a comment) and the value's lines once.
+- **An explicit key** (ninth review of #285): YAML writes a key after a `?`
+  and its value after a `:` that stands on a later line at the `?`'s
+  column (`? client_secret`, then `: FAKE`), blank and comment lines between
+  them, the key quoted or not, in a sequence's entry too, and in a flow
+  collection the `:` on the line below the key or on its line
+  (`{? client_secret:`, then the value). A parser reads it as
+  `client_secret: FAKE`, but every rule wanted the key's `:` on the key's
+  line, so the value was kept whole in every sink and check. The key, its
+  comment, the lines down to the `:` and the `:` are now the separator, and
+  the value after it is read as after a key's own `:`: on the `:`'s line
+  (plain, going on below it, quoted, after its properties) and below it (a
+  scalar, a block, after properties on lines of their own), with the same
+  code and placeholder exclusions under a lower-case name and the same node
+  boundaries (a `:` at another column, a nested mapping or a sequence is no
+  value). An upper-case or a well-known name's `\s*` before a `:` crossed a
+  line break as written already, and crosses one written out now too
+  (`_TO_SEPARATOR`), so a text reads alike as written and as JSON writes it.
+  A candidate that finds no `:` and value matches what it read, its key, its
+  comment and the blank and comment lines below it, and changes nothing:
+  another explicit key written in such a comment is a candidate of its
+  own, and had the first failed each would read the comment lines below it
+  again, a run of such lines once for each.
 
-They run last, after every pattern that can redact a part of such a
-value's lines: whether a line is a plain scalar depends on all of it, so a
+They run last (but the rule for a flow collection's value closed by its
+indicator, above, which runs first and reads a value as written), after
+every pattern that can redact a part of such a value's lines: whether a line is a plain scalar depends on all of it, so a
 later pattern could leave a line that a second redaction would take whole.
 A value of a known shape on the next line is therefore reported by its own
 class, and a well-known or upper-case name's first word on the next line by

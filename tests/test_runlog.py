@@ -42,6 +42,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R7_REDACTED,
     WHOLE_VALUES_285_R8,
     WHOLE_VALUES_285_R8_REDACTED,
+    WHOLE_VALUES_285_R9,
+    WHOLE_VALUES_285_R9_REDACTED,
 )
 
 
@@ -1856,6 +1858,64 @@ def test_a_whole_value_the_eighth_285_review_found_never_reaches_the_logs(tmp_pa
         for _, _, body in WHOLE_VALUES_285_R8:
             assert body not in content, (path, body)
     redacted = [WHOLE_VALUES_285_R8_REDACTED[name] for name, _, _ in WHOLE_VALUES_285_R8]
+    deep_redacted = [_json_deep(redacted, depth) for depth in (1, 2, 3)]
+    assert (step / "stdout.log").read_text(encoding="utf-8") == (
+        "".join(f"{text}\nnext line\n" for text in redacted) + "\n".join(deep_redacted) + "\n"
+    )
+    assert (step / "stderr.log").read_text(encoding="utf-8") == "".join(
+        f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in redacted
+    )
+    result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
+    assert result["tests"] == [*redacted, *deep_redacted]
+    assert result["message"] == "\n".join(redacted)
+    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
+    assert request["command"] == ["opencode", "run", *redacted]
+
+
+def test_a_whole_value_the_ninth_285_review_found_never_reaches_the_logs(tmp_path):
+    """#285 review, round 9: a value under an explicit YAML key, and an
+    upper-case or a well-known name's flow scalar going on at a line's start
+    or before a next key that holds a space, was kept whole or in part in
+    ``stdout.log``, ``stderr.log``, ``control-result.json`` and the command
+    in ``request.json``, as text and as JSON one, two and three deep. Each
+    goes whole from every file, after OpenCode's ANSI escapes too; the key,
+    the next entry and the line after it stay."""
+    texts = [text for _, _, text, _ in WHOLE_VALUES_285_R9]
+    deep = [_json_deep(texts, depth) for depth in (1, 2, 3)]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", *texts],
+            error="agent exited 1:\n" + "\n".join(texts),
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": "\n".join(texts),
+                "tests": [*texts, *deep],
+            },
+        ),
+        prompt="p",
+        stdout="".join(f"{text}\nnext line\n" for text in texts) + "\n".join(deep) + "\n",
+        stderr="".join(f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in texts),
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {
+        "stdout.log",
+        "stderr.log",
+        "control-result.json",
+        "request.json",
+    }
+    for path in [*files, log.events_path]:
+        content = path.read_text(encoding="utf-8")
+        assert "FAKE" not in content, path
+        for _, _, _, body in WHOLE_VALUES_285_R9:
+            assert body not in content, (path, body)
+    redacted = [WHOLE_VALUES_285_R9_REDACTED[name] for name, _, _, _ in WHOLE_VALUES_285_R9]
     deep_redacted = [_json_deep(redacted, depth) for depth in (1, 2, 3)]
     assert (step / "stdout.log").read_text(encoding="utf-8") == (
         "".join(f"{text}\nnext line\n" for text in redacted) + "\n".join(deep_redacted) + "\n"
