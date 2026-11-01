@@ -22,9 +22,11 @@ a quoted key (``"GITHUB_TOKEN": "..."``, ``"Authorization": "Bearer ..."``).
 A credential name's value on the lines below it, as YAML writes one (an
 indented scalar past blank and comment lines, a ``|`` or ``>`` block), is
 recognised too (``_yaml_value``), and a plain scalar that starts on the
-key's line and goes on below it (``_yaml_continued``); a value's YAML anchor
-and tag stay before it (``_YAML_PROPS``), also on lines of their own, as a
-block's header below its key does (``_YAML_NODE_PROPS``). The column of a
+key's line and goes on below it (``_yaml_continued``), whether a line
+feed, CRLF or a bare carriage return ends its lines (``_YAML_BREAK``); a
+value's YAML anchor and tag stay before it (``_YAML_PROPS``), also on lines
+of their own, as a block's header below its key does
+(``_YAML_NODE_PROPS``). The column of a
 key behind a YAML sequence's dashes is measured exactly (``_yaml_dashes``).
 :func:`redact_obj` knows a credential's name as a mapping's key too
 (``{"GEMINI_API_KEY": "..."}``).
@@ -144,8 +146,10 @@ _WORD_BACKSLASH = r"\\(?!\\{0,6}[\"'nrt])"
 # crossed instead, as one written as such is (``_SPACE_TO_VALUE``).
 _FIRST_BACKSLASH = r"\\(?!\\{0,6}[\"'nr])"
 # A line break written out, behind up to seven backslashes, as JSON, JSON in
-# JSON and three deep write one.
-_WRITTEN_BREAK = r"\\{1,7}(?:r\\{1,7})?n"
+# JSON and three deep write one: ``\n``, ``\r\n`` and a carriage return alone,
+# ``\r`` (#285 review, round 7), which YAML and a classic Mac OS file break a
+# line at as well.
+_WRITTEN_BREAK = r"\\{1,7}(?:r(?:\\{1,7}n)?+|n)"
 # The space between an assignment's separator and its value (#393): a run on
 # the same line, or one across a line break, but never onto a line that
 # starts a code fence (three backticks or tildes, indented or not). A prompt
@@ -489,10 +493,22 @@ _OAUTH_VALUE = (
 # the key's line ends in, as written or written out behind up to seven
 # backslashes (group ``ybs``, as JSON, JSON in JSON and three deep write it);
 # written out, a line also ends where the string does, at a quote behind
-# fewer backslashes. Each candidate starts at a line's start, an escape or a
-# quote and reads its key, one line break and the lines of its value, each
-# once: every loop is possessive, so a candidate that fails does so at the
-# start of its value.
+# fewer backslashes.
+#
+# A line break is ``\n``, ``\r\n`` or a carriage return alone, ``\r``, as YAML
+# reads a line break (#285 review, round 7): only the first two were read
+# until then, so a key whose line a bare carriage return ended (a classic
+# Mac OS file, one line of an LF file with it), a block whose lines it ended
+# and a value's properties or a block's header on a line it ended were no
+# key's value, though a YAML parser reads each, and the value was kept whole,
+# as written and written out. A line therefore starts after a carriage return
+# as well (``_LINE_START``; ``^`` starts one after a line feed only), and a
+# line's characters exclude it, as they did. ``\r\n`` is one break, read
+# whole, so it is never two with a blank line between them.
+#
+# Each candidate starts at a line's start, an escape or a quote and reads
+# its key, one line break and the lines of its value, each once: every loop
+# is possessive, so a candidate that fails does so at the start of its value.
 #
 # The key's column is its indentation (``ind``) and the width of a YAML
 # sequence's dashes before it (#285 review, round 5): in ``- x_token: |``
@@ -552,13 +568,22 @@ def _yaml_ind() -> str:
 
 
 _YAML_DASHES = _yaml_dashes()
+# A line's start, in a ``(?m)`` pattern: the text's, or after a line feed or
+# a carriage return (round 7).
+_LINE_START = r"(?:^|(?<=\r))"
 _YAML_LEAD = (
-    rf"(?P<lead>(?:^|{_ESCAPE}|(?<=(?P<yq>[\"'])))"
+    rf"(?P<lead>(?:{_LINE_START}|{_ESCAPE}|(?<=(?P<yq>[\"'])))"
     rf"(?P<ind>[^\S\r\n]*+){_YAML_DASHES}(?P<kq>\\{{0,7}}[\"'])?)"
 )
 # A value line's indentation: past the key's column.
 _YAML_IND = _yaml_ind()
-_YAML_BREAK = r"(?(ybs)(?P=ybs)(?:r(?P=ybs))?n|\r?\n)"
+# A line break, as written (``\n``, ``\r\n``, ``\r``) or written out behind
+# ``ybs`` backslashes (round 7: a carriage return alone too), CRLF read whole.
+_LINE_BREAK = r"(?:\r\n?+|\n)"
+_YAML_BREAK = rf"(?(ybs)(?P=ybs)(?:r(?:(?P=ybs)n)?+|n)|{_LINE_BREAK})"
+# The first line break of a value's candidate, which sets ``ybs`` when it is
+# written out.
+_YAML_OPENING_BREAK = rf"(?:{_LINE_BREAK}|(?P<ybs>\\{{1,7}})(?:r(?:(?P=ybs)n)?+|n))"
 # A character of a line written out (``ybs``): any but a backslash and a
 # quote, a quote behind ``ybs`` backslashes or more, and a run of backslashes
 # that is neither the line break nor the start of the string's closing quote.
@@ -653,7 +678,7 @@ def _yaml_value(name: str, names: str, name_hint: str, *, literal_only: bool) ->
         rf"(?m){_YAML_LEAD}(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+:)"
         rf"(?P<hdr>(?P<blk>[^\S\r\n]++{_BLOCK_HEADER})"
         rf"|[^\S\r\n]++{_YAML_PROPERTY}(?:[^\S\r\n]++{_YAML_PROPERTY})?)?"
-        rf"(?P<gap>{_YAML_COMMENT}[^\S\r\n]*+(?:\r?\n|(?P<ybs>\\{{1,7}})(?:r(?P=ybs))?n))"
+        rf"(?P<gap>{_YAML_COMMENT}[^\S\r\n]*+{_YAML_OPENING_BREAK})"
         rf"(?P<blank>(?(blk){_YAML_BLANKS}|{_YAML_SKIPPED}))"
         rf"(?P<vind>{_YAML_IND})"
         rf"(?(blk){block}{_YAML_BLOCK_LINES}"
@@ -701,14 +726,14 @@ def _yaml_value(name: str, names: str, name_hint: str, *, literal_only: bool) ->
 # that string.
 _YAML_FIRST_BREAK = (
     r"(?=(?:[^\\:\s]++|:(?!\s)|[^\S\r\n]++(?!#)|\\++(?![nr]))*+"
-    r"(?:\r?\n|(?P<ybs>\\{1,7})(?:r(?P=ybs))?n))"
+    rf"{_YAML_OPENING_BREAK})"
 )
 _YAML_FIRST_UNIT = rf"(?(ybs){_YAML_WRITTEN}|(?(yq)(?!(?P=yq)))[^\r\n])"
 _YAML_FIRST_CHAR = rf"(?:(?![^\S\r\n]|:(?:[^\S\r\n]|(?!{_YAML_FIRST_UNIT}))){_YAML_FIRST_UNIT})"
 _YAML_FIRST_WORDS = rf"{_YAML_FIRST_CHAR}++(?:[^\S\r\n]++(?!#){_YAML_FIRST_CHAR}++)*+"
 # What every such value holds: a line break, as written or written out,
 # before a line's indentation.
-_YAML_CONTINUED_HINT = re.compile(r"\n[^\S\r\n]|\\n[^\S\r\n]")
+_YAML_CONTINUED_HINT = re.compile(r"[\r\n][^\S\r\n]|\\[nr][^\S\r\n]")
 
 
 def _yaml_continued(name: str, names: str, name_hint: str, *, literal_only: bool) -> _Pattern:
@@ -771,7 +796,8 @@ def _quoted_from_next_line(name: str, names: str, name_hint: str) -> _Pattern:
     """The pattern for a quoted value whose opening quote ends its line,
     the arguments as for :func:`_yaml_value`."""
     regex = (
-        rf"(?m)(?P<lead>^{_OUTSIDE_STRINGS}(?:{_ESCAPE}|(?<![A-Za-z0-9_]))(?P<kq>[\"'])?)"
+        rf"(?m)(?P<lead>{_LINE_START}{_OUTSIDE_STRINGS}"
+        rf"(?:{_ESCAPE}|(?<![A-Za-z0-9_]))(?P<kq>[\"'])?)"
         rf"(?P<name>{names})(?P<sep>(?(kq)(?P=kq))[^\S\r\n]*+"
         rf"(?::[^\S\r\n]*+(?:{_YAML_PROPS})?|=[^\S\r\n]*+))"
         r"(?P<open>(?P<vbs>)(?P<vq>[\"']))(?=[\r\n])"
@@ -841,9 +867,23 @@ _PEM_BODY = rf"(?:{_PEM_GAP}*+[A-Za-z0-9+/=]++)*+"
 # it skips a line feed, so a key whose body's runs bare carriage returns part
 # (a classic Mac OS file, a terminal's capture) is a valid key, but only
 # ``\n`` and ``\r\n`` parted two runs of material, and such a key was kept
-# whole. ``\r\n`` is one break, so a blank line still parts two runs.
+# whole.
+#
+# A run of carriage returns is one break too, alone or around a line feed
+# (round 7): a carriage return goes back to the start of a line and advances
+# none, so a key whose runs two of them part (``\r\r``), or a terminal's
+# capture of a CRLF file (``\r\r\n``, its line feeds made CRLF once more), is
+# a valid key, OpenSSL reading it to the same public key, but the second
+# carriage return parted two runs and the whole block was kept. Only a line
+# feed advances a line, so what parts two runs is a blank line of two line
+# feeds, carriage returns among them or not (``\n\n``, ``\r\n\r\n``,
+# ``\r\r\n\r\r\n``). Each run of carriage returns is taken whole, so it is
+# read once.
 _PEM_B64 = r"[A-Za-z0-9+/]"
-_PEM_BREAK = r"(?:\r\n?|\n|\\{1,7}r(?:\\{1,7}n)?|\\{1,7}n)"
+_PEM_BREAK = (
+    r"(?:\r*+\n\r*+|\r++"
+    r"|(?:\\{1,7}r)*+\\{1,7}n(?:\\{1,7}r)*+|(?:\\{1,7}r)++)"
+)
 _PEM_WRAP = rf"{_PEM_BREAK}[ \t]*"
 _PEM_KEY = rf"(?:{_PEM_B64}(?:{_PEM_WRAP})?+){{15}}{_PEM_B64}"
 # The space between two of its characters: spaces and tabs, a line break
@@ -1235,9 +1275,11 @@ _CREDENTIAL_KEY = re.compile(
 # block's header on lines of their own stay (``a_token:\n &a\n x\n``, 15 to
 # 28), and so does a line break written out before a value
 # (``A_TOKEN=\nx`` in JSON, 11 to 24, where the break went with the value,
-# 11 to 22). The
-# rounds of :func:`redact` (``_MAX_ROUNDS``) are more patterns in that
-# order, and compound nothing either, by the argument below.
+# 11 to 22). Round 7's carriage return alone is a line break as long as a
+# line feed (``a_token:\r x\r``, 12 to 25; ``A_TOKEN=\rx`` in JSON, 11 to
+# 24), and a run of carriage returns in a private key only makes the block
+# longer. The rounds of :func:`redact` (``_MAX_ROUNDS``) are more patterns in
+# that order, and compound nothing either, by the argument below.
 # Growth does not compound across patterns: a later pattern can only lengthen
 # the text by matching a run *shorter* than the marker, and a marker is never
 # part of such a run. The value classes that admit ``*`` (the named-assignment

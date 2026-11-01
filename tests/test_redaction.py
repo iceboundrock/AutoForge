@@ -24,7 +24,9 @@ from autoforge.redaction import (
 from tests.conftest import (
     AWS_ACCESS_KEY_ID,
     AWS_KEY_BODY,
+    CR_CRLF_KEY,
     CR_KEY,
+    CR_RUN_KEY,
     FORM_SECRET,
     GITLAB_PAT,
     GITLAB_PAT_BODY,
@@ -57,6 +59,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R5_REDACTED,
     WHOLE_VALUES_285_R6,
     WHOLE_VALUES_285_R6_REDACTED,
+    WHOLE_VALUES_285_R7,
+    WHOLE_VALUES_285_R7_REDACTED,
     XAI_API_KEY,
     XAI_KEY_BODY,
 )
@@ -900,18 +904,31 @@ def test_a_private_key_whose_runs_bare_carriage_returns_part_is_redacted_whole(t
     assert len(out) <= MAX_GROWTH_FACTOR * len(text)
 
 
+def _cr_lines(text):
+    """``text`` with each line feed a carriage return, but for a blank line,
+    whose two line feeds stay, each after a carriage return: a run of
+    carriage returns is one line break (#285 review, round 7), and only a
+    blank line of two line feeds parts two runs of key material."""
+    return "\r\n\r\n".join(part.replace("\n", "\r") for part in text.split("\n\n"))
+
+
 # Not key material though carriage returns part its lines (#285 review,
-# round 6): the near-misses above with each line feed a carriage return, a
-# blank line as two carriage returns and as two CRLFs, which still part two
-# runs, and the same written out.
+# rounds 6 and 7): the near-misses above with each line feed a carriage
+# return and a blank line as two CRLFs; 16 characters a blank line parts,
+# its two line feeds after a carriage return, after two (a terminal's capture
+# of a CRLF file) and before one; 15 characters a run of carriage returns
+# parts; and the same written out.
 _CR_PEM_NEAR_MISSES = [
-    *(text.replace("\n", "\r") for text in _SPACED_PEM_NEAR_MISSES),
-    f"{PEM_BEGIN}\rMIIEFAKE\r\rAAAAAAA\r{PEM_END}",
-    f"{PEM_BEGIN}\r\nMIIEFAKE\r\n\r\nAAAAAAA\r\n{PEM_END}",
+    *(_cr_lines(text) for text in _SPACED_PEM_NEAR_MISSES),
+    f"{PEM_BEGIN}\rMIIEFAKE\r\n\r\nAAAAAAAA\r{PEM_END}",
+    f"{PEM_BEGIN}\rMIIEFAKE\r\r\n\r\r\nAAAAAAAA\r{PEM_END}",
+    f"{PEM_BEGIN}\rMIIEFAKE\n\r\nAAAAAAAA\r{PEM_END}",
+    f"{PEM_BEGIN}\rMIIEFAKE\r\r\rAAAAAAA\r{PEM_END}",
+    f"{PEM_BEGIN}\r\nMIIEFAKE\r\n\r\nAAAAAAAA\r\n{PEM_END}",
     f"{PEM_BEGIN}\rMIIE\r...\r{PEM_END}",
     f"{PEM_BEGIN}\r<your key here>\r{PEM_END}",
     f"{PEM_BEGIN}\r{PEM_END}",
-    f"{PEM_BEGIN}\\rMIIEFAKE\\r\\rAAAAAAA\\r{PEM_END}",
+    f"{PEM_BEGIN}\\r\\nMIIEFAKE\\r\\n\\r\\nAAAAAAAA\\r\\n{PEM_END}",
 ]
 
 
@@ -919,6 +936,88 @@ _CR_PEM_NEAR_MISSES = [
 def test_a_near_miss_of_a_key_parted_by_carriage_returns_is_left(text):
     assert redact(text) == text
     assert credential_classes(text) == ()
+
+
+def _one_line_key(width, sep):
+    """The shortest key body a private key has, 64 characters, in runs of
+    ``width`` parted by ``sep``, between its BEGIN and END lines."""
+    runs = (PRIVATE_KEY_BODY[i : i + width] for i in range(0, len(PRIVATE_KEY_BODY), width))
+    return f"{PEM_BEGIN}\n{sep.join(runs)}\n{PEM_END}"
+
+
+# A key whose runs a run of carriage returns parts, alone or around a line
+# feed (#285 review, round 7), each with what ``redact`` makes of it: two
+# carriage returns between runs of eight, three, two between runs of four
+# and of one, a carriage return before each CRLF of every line (a terminal's
+# capture of a CRLF key file) and after it too, one after each line feed, an
+# indentation after them, spaces beside them, the shortest body, written out
+# as JSON three deep, its first lines alone, under a quoted assignment.
+_CR_RUN_KEY_TEXTS = [
+    (CR_RUN_KEY, "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 8, "\r\r\r"), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 4, "\r\r"), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 1, "\r\r"), "***REDACTED***"),
+    (CR_CRLF_KEY + "\r\r\n", "***REDACTED***\r\r\n"),
+    (_respace(PRIVATE_KEY, 8, "\r\n\r"), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 8, "\n\r"), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 8, "\r\r  "), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 8, " \r\r "), "***REDACTED***"),
+    (_one_line_key(8, "\r\r"), "***REDACTED***"),
+    (json.dumps({"key": CR_RUN_KEY}), json.dumps({"key": "***REDACTED***"})),
+    (
+        json.dumps(json.dumps({"key": CR_CRLF_KEY})),
+        json.dumps(json.dumps({"key": "***REDACTED***"})),
+    ),
+    (
+        json.dumps(json.dumps(json.dumps({"key": CR_RUN_KEY}))),
+        json.dumps(json.dumps(json.dumps({"key": "***REDACTED***"}))),
+    ),
+    (
+        json.dumps(json.dumps(json.dumps({"key": _one_line_key(8, "\r\r\r")}))),
+        json.dumps(json.dumps(json.dumps({"key": "***REDACTED***"}))),
+    ),
+    ("\r\r".join(CR_RUN_KEY.split("\r\r")[:3]) + "\n$ ", "***REDACTED***\n$ "),
+    (f'DEPLOY_SECRET="{CR_RUN_KEY}" next', 'DEPLOY_SECRET="***REDACTED***" next'),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    _CR_RUN_KEY_TEXTS,
+    ids=[
+        "two",
+        "three",
+        "four-wide",
+        "one-wide",
+        "terminal-capture",
+        "around-a-line-feed",
+        "after-a-line-feed",
+        "indented",
+        "spaced",
+        "shortest-body",
+        "json",
+        "json-in-json",
+        "three-deep",
+        "three-deep-shortest",
+        "head",
+        "quoted-env",
+    ],
+)
+def test_a_private_key_whose_runs_repeated_carriage_returns_part_is_redacted_whole(text, expected):
+    """#285 review, round 7: a carriage return advances no line, and a
+    base64 decoder skips any number of them, so a key whose body's runs two
+    carriage returns part, or a terminal's capture of a CRLF key file
+    (``\\r\\r\\n``), is a valid key, OpenSSL reading it to the same public
+    key; but both material matchers allowed one line break between two runs,
+    and a second carriage return was a second, so the whole block reached
+    every sink and passed every check, as text and written out. A run of
+    carriage returns, alone or around a line feed, is one break now."""
+    out = redact(text)
+    assert out == expected
+    assert SHORT_WRAPPED_KEY_LINE not in out and "MIIE" not in out and "BEGIN" not in out
+    assert credential_classes(text) == ("private-key",)
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    assert len(out) <= MAX_GROWTH_FACTOR * len(text)
 
 
 # Not a private key: a public key, a certificate, a label in lower case or
@@ -1002,6 +1101,15 @@ def test_a_private_key_block_is_replaced_before_any_pattern_takes_a_slice():
         PEM_BEGIN + ("aB1\r" * 3 + "!") * 50_000,
         PEM_BEGIN + "\\r" * 500_000,
         (PEM_BEGIN + "\r" + "aaaa\r" * 4 + "-" * 4) * 20_000,
+        # Round 7: runs of carriage returns, alone and around line feeds, as
+        # written and written out, short of 16, each a candidate's start, and
+        # long runs of them between characters and after a BEGIN line.
+        PEM_BEGIN + ("aB1\r\r" * 3 + "!") * 40_000,
+        PEM_BEGIN + ("aB1 \r\r\n\r" * 3 + "!") * 25_000,
+        PEM_BEGIN + "\r" * 1_000_000,
+        PEM_BEGIN + "\\r\\r\\n" * 150_000,
+        (PEM_BEGIN + "\r\r" + "aaaa\r\r\n" * 3 + "-" * 4) * 20_000,
+        PEM_BEGIN + ("a" + "\r" * 1_000) * 1_000,
     ],
     ids=[
         "begin-lines",
@@ -1027,6 +1135,12 @@ def test_a_private_key_block_is_replaced_before_any_pattern_takes_a_slice():
         "carriage-returns-short-of-16",
         "written-out-carriage-returns",
         "carriage-return-near-end-lines",
+        "carriage-return-runs-short-of-16",
+        "spaced-carriage-return-runs-short-of-16",
+        "a-megabyte-of-carriage-returns",
+        "written-out-carriage-return-runs",
+        "carriage-return-runs-near-end-lines",
+        "long-runs-between-characters",
     ],
 )
 def test_the_private_key_pattern_stays_linear(text):
@@ -2417,6 +2531,137 @@ def test_a_placeholder_behind_wide_dashes_with_its_sibling_is_left(text):
     assert credential_classes(text) == ()
 
 
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [c[1:] for c in WHOLE_VALUES_285_R7],
+    ids=[c[0] for c in WHOLE_VALUES_285_R7],
+)
+def test_a_value_the_seventh_285_review_found_is_redacted_whole_as_text_and_as_json(text, body):
+    """#285 review, round 7: YAML breaks a line at a carriage return alone,
+    but only ``\\n`` and ``\\r\\n`` ended a key's line, a value's or a
+    block's, and a line started after a line feed only, so a value whose
+    lines bare carriage returns end, valid YAML, was kept whole, as text and
+    written out. Each goes whole, as text and as JSON, JSON in JSON and
+    three deep write it, the JSON still decodes to what redacting the text
+    gives, and the output is stable and within the growth bound."""
+    name = next(name for name, case, _ in WHOLE_VALUES_285_R7 if case == text)
+    assert redact(text) == WHOLE_VALUES_285_R7_REDACTED[name]
+    for depth in (0, 1, 2, 3):
+        escaped = _json_string(text, depth)
+        out = redact(escaped)
+        assert body not in out and "FAKE" not in out, out
+        assert credential_classes(escaped) == ("credential-suffix-assignment",)
+        assert redact(out) == out and credential_classes(out) == ()
+        assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == WHOLE_VALUES_285_R7_REDACTED[name]
+    assert redact_obj({"env": {"text": text}}) == {"env": {"text": redact(text)}}
+
+
+# A value whose lines bare carriage returns end (#285 review, round 7,
+# R7-F2), each with what ``redact`` makes of it: a scalar below its key with
+# the next entry after it, a literal block with a blank line in it and a
+# kept one, past a comment line and a blank line, properties on lines of
+# their own (an anchor, then a quoted scalar; a tag and an anchor), on the
+# key's line, a header below them, a quoted scalar below the key and one
+# whose quote ends its line, a quote that ends the key's line, after a key
+# on an earlier line, a plain scalar that goes on below the key's line, in
+# sequence entries with their siblings, after OpenCode's ANSI escape, as a
+# quoted key, a CRLF line and a CR line in one value, Ansible's ``!vault``,
+# and under well-known and upper-case names.
+_YAML_CR_LINES = [
+    ("client_secret:\r  FAKE\rnext: 1\r", "client_secret:\r  ***REDACTED***\rnext: 1\r"),
+    (
+        "client_secret: |\r  FAKE1\r\r  FAKE2\rnext: 1",
+        "client_secret: |\r  ***REDACTED***\rnext: 1",
+    ),
+    ("client_secret: |+\r  FAKE\r\r", "client_secret: |+\r  ***REDACTED***\r\r"),
+    ("client_secret:\r  # rotated\r  FAKE", "client_secret:\r  # rotated\r  ***REDACTED***"),
+    ("client_secret:\r\r  FAKE", "client_secret:\r\r  ***REDACTED***"),
+    ("client_secret:\r  &cs\r  'FAKE'", "client_secret:\r  &cs\r  '***REDACTED***'"),
+    ("client_secret:\r  !!str\r  &a\r  FAKE", "client_secret:\r  !!str\r  &a\r  ***REDACTED***"),
+    ("client_secret: &cs\r  FAKE", "client_secret: &cs\r  ***REDACTED***"),
+    ("client_secret:\r  &cs\r  |\r  FAKE", "client_secret:\r  &cs\r  |\r  ***REDACTED***"),
+    ('client_secret:\r  "FAKE"', 'client_secret:\r  "***REDACTED***"'),
+    ('client_secret:\r  "\r  FAKE"', 'client_secret:\r  "***REDACTED***"'),
+    ("client_secret: '\r  FAKE'", "client_secret: '***REDACTED***'"),
+    ("endpoint: e\rclient_secret: '\r  FAKE'", "endpoint: e\rclient_secret: '***REDACTED***'"),
+    ("client_secret: FAKE1\r  FAKE2\r", "client_secret: ***REDACTED***\r"),
+    ("- x_token: |\r    FAKE\r  endpoint: e", "- x_token: |\r    ***REDACTED***\r  endpoint: e"),
+    (
+        "- - x_token:\r      FAKE\r    endpoint: e",
+        "- - x_token:\r      ***REDACTED***\r    endpoint: e",
+    ),
+    ("\x1b[0mclient_secret:\r  FAKE", "\x1b[0mclient_secret:\r  ***REDACTED***"),
+    ('"client_secret":\r  "FAKE"', '"client_secret":\r  "***REDACTED***"'),
+    ("client_secret:\r\n  FAKE1\r  FAKE2\n", "client_secret:\r\n  ***REDACTED***\n"),
+    (
+        "client_secret: !vault |\r  $ANSIBLE_VAULT;1.1;AES256\r  FAKE",
+        "client_secret: !vault |\r  ***REDACTED***",
+    ),
+    ("GH_TOKEN:\r  |\r  FAKE", "GH_TOKEN:\r  |\r  ***REDACTED***"),
+    ("GH_TOKEN:\r  &t\r  'FAKE'", "GH_TOKEN:\r  ***REDACTED***"),
+    ("DEPLOY_SECRET:\r  FAKE", "DEPLOY_SECRET:\r  ***REDACTED***"),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _YAML_CR_LINES, ids=[t for t, _ in _YAML_CR_LINES])
+def test_a_yaml_value_whose_lines_carriage_returns_end_is_redacted_whole(text, expected):
+    """#285 review, round 7: a key, a value's lines, its properties and a
+    block's header end their lines at a bare carriage return as YAML reads
+    one, and a key starts a line after it. The key, the properties, the
+    header, the carriage returns and the lines after the value stay, and the
+    value goes, as text and written out."""
+    assert redact(text) == expected
+    assert credential_classes(text) != ()
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    assert "FAKE" not in redact(text)
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        assert "FAKE" not in out and redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+
+
+# What stays though carriage returns end its lines (#285 review, round 7):
+# a statement that ends in a colon, a nested mapping, a sequence, a block
+# and a scalar of placeholders, properties before a mapping, a reference
+# after a tag, a constant, a placeholder block in a sequence entry with its
+# sibling, a key with no value before the next entry, a function's typed
+# parameter, a string literal that ends in an assignment, a progress line
+# and a code fence; and an empty assignment in JSON, whose carriage return
+# written out is no value and whose string's closing quote opens none.
+_R7_NEAR_MISSES = [
+    "if api_token:\r    return api_token\r",
+    "client_secret:\r  key: value\r",
+    "client_secret:\r  - a\r  - b",
+    "client_secret: |\r  ${{ secrets.X }}\r",
+    "client_secret: |\r  {{ a }}\r  <b>\rnext: 1",
+    "client_secret:\r  {{ vault_secret }}\r",
+    "client_secret:\r  &cs\r  key: value",
+    "client_secret:\r  !secret\r  app_client_secret",
+    "api_token:\r  None\r",
+    "- x_token: |\r    ${{ secrets.X }}\r  endpoint: e",
+    "client_secret:\rnext: 1",
+    "def f(\r    api_token: str,\r):",
+    'help = "Set GITHUB_TOKEN="\r    "and more"',
+    "Downloading 10%\rDownloading 20%\r",
+    "```yaml\rclient_secret:\r```",
+    '{"a": "GH_TOKEN=\\r", "b": "x"}',
+    '{"a": "GH_TOKEN:\\r", "b": "x"}',
+]
+
+
+@pytest.mark.parametrize("text", _R7_NEAR_MISSES)
+def test_a_value_the_seventh_review_rules_leave_is_left(text):
+    assert redact(text) == text
+    assert credential_classes(text) == ()
+
+
 # An OAuth name is a prefixed name too (#285 review, round 3, R3-F3):
 # ``oauth-assignment`` takes its value first and ``credential-suffix-
 # assignment`` what it left. The OAuth value ran on over a full stop, a
@@ -2574,6 +2819,16 @@ _MEET_SEPARATORS = [
     ":\\n  &a\\n  ",
     ":\\n  |\\n  ",
     "=\\n  ",
+    # Round 7: a key's line, a property's and a header's ended by a bare
+    # carriage return, as written and written out, and a carriage return
+    # written out before a value after ``=``.
+    ":\r  ",
+    ": |\r  ",
+    ":\n  &a\r  ",
+    ":\r  |\r  ",
+    ":\\r  ",
+    ": |\\r  ",
+    "=\\r",
 ]
 _MEET_PIECES = [
     *"aZ09,.:)]}`&;\\\"' \n#=%$!*-_/+|>{[",
@@ -2606,6 +2861,12 @@ _MEET_PIECES = [
     "\\r",
     "&a\n  ",
     "|\n  ",
+    # Round 7: carriage returns ending a line before an indentation, two of
+    # them, and before a line feed.
+    "\r  ",
+    "\r\r",
+    "\r\r\n",
+    "\\r  ",
 ]
 _MEET_LEADS = [
     "",
@@ -2625,6 +2886,9 @@ _MEET_LEADS = [
     # Round 6: dashes past 16 columns.
     "- " * 9,
     "-" + " " * 17,
+    # Round 7: a key on a line a carriage return starts.
+    "\r",
+    "x: 1\r  ",
 ]
 
 
@@ -3085,6 +3349,59 @@ def test_the_sixth_review_patterns_stay_linear(text):
     for their bits, and a separator crosses each line break written out
     once. A megabyte of each is redacted well inside the budget, and the
     output is stable."""
+    started = time.process_time()
+    out = redact(text)
+    assert time.process_time() - started < 3.0
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A line starts after each carriage return: a megabyte of them with
+        # no key, after a key with no value, keys with values, blocks of
+        # values and of placeholders, a plain scalar going on below its key.
+        "x\r" * 500_000,
+        "a_token:\r" + "\r" * 1_000_000,
+        "a_token:\r  x\r" * 40_000,
+        ("a_token: |\r" + "  x\r" * 100) * 2_500,
+        ("a_token: |\r" + "  $X\r" * 100) * 2_000,
+        "a_token: x\r" + "  y\r" * 250_000,
+        # Properties and comment lines ended by carriage returns, a quote
+        # that ends its line, a key behind wide dashes, CRLF and CR mixed.
+        ("a_token:\r  &a\r" + "  # c\r" * 100) * 2_000,
+        "a_token: '\r" * 100_000,
+        "- " * (1 << 19) + "a_token: |\r x",
+        "a_token:\r\n  x\r  y\n" * 30_000,
+        # Written out: a carriage return crossed after a separator, many
+        # with no value, and a YAML text's lines ended by them.
+        "GH_TOKEN=" + "\\r" * 500_000,
+        ("GH_TOKEN=\\r" + " " * 100) * 10_000,
+        "a_token:\\r  x\\r" * 35_000,
+    ],
+    ids=[
+        "line-starts",
+        "blank-lines-after-a-key",
+        "keys-with-values",
+        "blocks-of-values",
+        "blocks-of-placeholders",
+        "plain-scalar-going-on",
+        "comments-after-a-property",
+        "quotes-that-end-their-lines",
+        "wide-dashes",
+        "crlf-and-cr-mixed",
+        "written-out-carriage-returns",
+        "written-out-indentation",
+        "written-out-yaml",
+    ],
+)
+def test_the_seventh_review_patterns_stay_linear(text):
+    """#285 review, round 7: a carriage return alone breaks a line, and a
+    line starts after one, but each candidate still reads its key, one line
+    break and its value's lines once, and a separator crosses each line
+    break written out once. A megabyte of each (half of one where every
+    line holds a value) is redacted well inside the budget, and the output
+    is stable."""
     started = time.process_time()
     out = redact(text)
     assert time.process_time() - started < 3.0
@@ -4049,12 +4366,21 @@ _WORST_CASE_UNITS = {
     "yaml_property_line": "a_token:\n &a\n x\n",
     "yaml_header_below": "a_token:\n |\n x\n",
     "named_assignment_written_out_break": "A_TOKEN=\\nx;",
+    # Round 7: a value whose lines bare carriage returns end, below its key
+    # and below a block's header, as long as the same with line feeds, 12 to
+    # 25 and 15 to 28; a carriage return written out before a value, 12 to
+    # 25.
+    "yaml_value_carriage_return": "a_token:\r x\r",
+    "yaml_header_below_carriage_return": "a_token:\r |\r x\r",
+    "named_assignment_written_out_carriage_return": "A_TOKEN=\\rx;",
     # The BEGIN line and 16 characters of key material, its floor: 44 to 15.
     "private_key": "-----BEGIN" + " PRIVATE KEY-----" + "a" * 16 + " ",
     # Its material parted by spaces (round 5), longer still: 48 to 16.
     "private_key_spaced": "-----BEGIN" + " PRIVATE KEY-----" + "aB1a " * 4 + " ",
     # Parted by bare carriage returns (round 6): 59 to 15.
     "private_key_carriage_returns": "-----BEGIN" + " PRIVATE KEY-----" + "a\r" * 15 + "a ",
+    # Parted by runs of carriage returns (round 7): 74 to 15.
+    "private_key_carriage_return_runs": "-----BEGIN" + " PRIVATE KEY-----" + "a\r\r" * 15 + "a ",
     "gitlab_pat": "gl" + "pat-" + "a" * 20 + " ",
     "aws_access_key_id": "AKI" + "A" * 17 + " ",
     "groq_api_key": "gs" + "k_" + "a" * 20 + " ",

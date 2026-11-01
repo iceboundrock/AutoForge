@@ -35,7 +35,9 @@ from autoforge.runlog import StepLog
 from autoforge.state import load_state
 from tests import claude_fake
 from tests.conftest import (
+    CR_CRLF_KEY,
     CR_KEY,
+    CR_RUN_KEY,
     PR,
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
@@ -101,6 +103,16 @@ def test_clean_rejoins_a_token_split_by_an_escape_before_redacting():
         ("client_secret:\n  |\n  FAKEheaderbelow\nnext: 1", f"client_secret: | {REDACTED} next: 1"),
         ("x_api_key:\n  &k\n  >-\n    FAKE1\n    FAKE2", f"x_api_key: &k >- {REDACTED}"),
         ("client_secret:\n  &cs\n  'FAKEanchorline'", f"client_secret: &cs '{REDACTED}'"),
+        # Round 7: keys whose runs repeated carriage returns part, and YAML
+        # values whose lines bare carriage returns end, as written and as
+        # JSON writes them (a tool's input, a serialized result).
+        (CR_RUN_KEY, REDACTED),
+        (CR_CRLF_KEY, REDACTED),
+        ("client_secret:\r  FAKEcrbelow\rnext: 1", f"client_secret: {REDACTED} next: 1"),
+        ("db_password: |\r  FAKE1\r  FAKE2\rnext: 1", f"db_password: | {REDACTED} next: 1"),
+        ("client_secret:\n  &cs\r  FAKEcrprops\n", f"client_secret: &cs {REDACTED}"),
+        (json.dumps("client_secret:\r  FAKEcrbelow\r"), f'"client_secret:\\r {REDACTED}\\r"'),
+        (json.dumps({"key": CR_RUN_KEY}), f'{{"key": "{REDACTED}"}}'),
     ],
     ids=[
         "short-wrapped-key",
@@ -115,6 +127,13 @@ def test_clean_rejoins_a_token_split_by_an_escape_before_redacting():
         "yaml-header-below",
         "yaml-folded-header-below-anchor",
         "yaml-anchor-line",
+        "carriage-return-run-key",
+        "terminal-capture-key",
+        "yaml-carriage-return-below",
+        "yaml-carriage-return-block",
+        "yaml-carriage-return-property-line",
+        "yaml-carriage-return-as-json",
+        "carriage-return-run-key-as-json",
     ],
 )
 def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
@@ -130,8 +149,8 @@ def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
 
 @pytest.mark.parametrize(
     "key",
-    [SHORT_WRAPPED_KEY, SPACED_KEY, CR_KEY],
-    ids=["short-wrapped", "spaced", "carriage-returns"],
+    [SHORT_WRAPPED_KEY, SPACED_KEY, CR_KEY, CR_RUN_KEY, CR_CRLF_KEY],
+    ids=["short-wrapped", "spaced", "carriage-returns", "carriage-return-runs", "terminal-capture"],
 )
 def test_an_event_whose_input_holds_a_wrapped_or_spaced_key_shows_none_of_it(key):
     event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Bash", detail=f"echo '{key}' > k")

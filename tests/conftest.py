@@ -134,6 +134,13 @@ SPACED_KEY = "\n".join(
 # carriage return as it skips a line feed, so OpenSSL reads such a key, but
 # a bare carriage return was no line break between two runs of material.
 CR_KEY = "\n".join([PEM_BEGIN, "\r".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="]), PEM_END])
+# The same runs parted by two bare carriage returns, and by a carriage
+# return before each CRLF, as a terminal's capture of a CRLF key file writes
+# it (#285 review, round 7): a carriage return advances no line, so OpenSSL
+# reads either key, but a second carriage return parted two runs of
+# material.
+CR_RUN_KEY = "\n".join([PEM_BEGIN, "\r\r".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="]), PEM_END])
+CR_CRLF_KEY = "\r\r\n".join([PEM_BEGIN, *SHORT_WRAPPED_KEY_LINES, "FAKE+/==", PEM_END])
 # A value of no known shape under a prefixed name (#285).
 SUFFIX_SECRET = "FAKE0opaque0value"
 SUFFIX_ASSIGNMENT = f"DEEPSEEK_API_KEY={SUFFIX_SECRET}"
@@ -335,6 +342,38 @@ WHOLE_VALUES_285_R6_REDACTED = {
     "yaml-folded-header-below-anchor": "x_api_key:\n  &k\n  >-\n    ***REDACTED***",
     "yaml-header-after-tag-below": "Partner_Api_Key:\n  !!str |\n  ***REDACTED***",
     "yaml-header-below-upper": "DEPLOY_SECRET:\n  |\n    ***REDACTED***",
+}
+# Values the seventh review of #285 found kept whole, each valid YAML whose
+# lines a bare carriage return ends, as YAML reads a line break: a scalar
+# below its key, a literal and a folded block, a property line in an
+# otherwise LF document, a header below the key, a quoted scalar below it, a
+# plain scalar that goes on below its key's line, a key on a line after a
+# carriage return, under a lower-, a mixed- and an upper-case name (R7-F2).
+# Each with its id, the text and what must not appear once it is redacted or
+# refused.
+WHOLE_VALUES_285_R7 = [
+    ("yaml-cr-scalar-below", "client_secret:\r  FAKEcrbelow\r", "FAKEcrbelow"),
+    ("yaml-cr-literal-block", "db_password: |\r  FAKEcrblock1\r  FAKEcrblock2\r", "FAKEcrblock2"),
+    ("yaml-cr-folded-block", "Db_Password: >-\r  FAKEcrfold1\r  FAKEcrfold2", "FAKEcrfold1"),
+    ("yaml-cr-property-line", "client_secret:\n  &cs\r  FAKEcrprops\n", "FAKEcrprops"),
+    ("yaml-cr-header-below", "x_api_key:\r  |\r    FAKEcrheader", "FAKEcrheader"),
+    ("yaml-cr-quoted-below", "api_token:\r  'FAKEcrquoted'\r", "FAKEcrquoted"),
+    ("yaml-cr-continued", "client_secret: FAKEcrfirst\r  FAKEcrcont", "FAKEcrcont"),
+    ("yaml-cr-second-key", "endpoint: e\rclient_secret:\r  FAKEcrsecond", "FAKEcrsecond"),
+    ("yaml-cr-upper-block", "DEPLOY_SECRET: |\r  FAKEcrupper", "FAKEcrupper"),
+]
+# What ``redact`` makes of each of them: the key, the properties, the
+# header, the carriage returns and the value's indentation stay.
+WHOLE_VALUES_285_R7_REDACTED = {
+    "yaml-cr-scalar-below": "client_secret:\r  ***REDACTED***\r",
+    "yaml-cr-literal-block": "db_password: |\r  ***REDACTED***\r",
+    "yaml-cr-folded-block": "Db_Password: >-\r  ***REDACTED***",
+    "yaml-cr-property-line": "client_secret:\n  &cs\r  ***REDACTED***\n",
+    "yaml-cr-header-below": "x_api_key:\r  |\r    ***REDACTED***",
+    "yaml-cr-quoted-below": "api_token:\r  '***REDACTED***'\r",
+    "yaml-cr-continued": "client_secret: ***REDACTED***",
+    "yaml-cr-second-key": "endpoint: e\rclient_secret:\r  ***REDACTED***",
+    "yaml-cr-upper-block": "DEPLOY_SECRET: |\r  ***REDACTED***",
 }
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)

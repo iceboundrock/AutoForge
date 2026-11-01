@@ -69,8 +69,9 @@ shape, which a quote starts, needs none, nor do the six that start at a
 line's start: the two that find a value on the lines below a YAML key and
 the two that find a plain scalar going on below its key's line, whose key
 starts its line, and the two that find a quoted value whose quote ends its
-line, whose name stands outside every string its line opens; each takes an
-escape before the name as a line's start or a token's, #285). A credential
+line, whose name stands outside every string its line opens; a line starts
+after a line feed or a carriage return, and each takes an escape before the
+name as a line's start or a token's, #285). A credential
 starts:
 
 - at the start of the text;
@@ -205,8 +206,9 @@ needs key material, 16 base64 characters in a row: a BEGIN line alone, one
 quoted by code (`startswith("-----BEGIN ...")`) or prose, an empty block and
 a placeholder (`...`) are no credential, so text about the format can be
 published. A line break and the indentation after it may stand between any
-two of the 16, as written or written out (`\n`, `\r\n` and a carriage
-return alone, `\r`, behind up to seven backslashes): a valid key rewrapped
+two of the 16, as written or written out (`\n`, `\r\n`, a carriage return
+alone, `\r`, and a run of carriage returns alone or around a line feed,
+each behind up to seven backslashes): a valid key rewrapped
 at fewer than 16 characters a line (`fold -w 8`, which OpenSSL still reads)
 has no run of 16 on any line, and was missed until the review of #285. A
 bare carriage return counted as no line break until the sixth review: a
@@ -214,8 +216,19 @@ base64 decoder skips it as it skips a line feed, so an Ed25519 key whose
 body's runs of one, four or eight characters bare carriage returns part
 (a classic Mac OS file, a terminal's capture) is one OpenSSL reads, to the
 same public key, but the whole block reached every sink and passed every
-check, as text and in JSON three deep. `\r\n` is one line break, so a
-blank line (`\r\r`, `\r\n\r\n`) still parts two runs. Spaces and tabs may part the runs too
+check, as text and in JSON three deep. A run of carriage returns is one
+line break too, alone or around a line feed (seventh review): a carriage
+return goes back to the start of a line and advances none, so a key whose
+runs two carriage returns part (`\r\r`), or a terminal's capture of a CRLF
+key file (`\r\r\n`, each line feed made CRLF once more), is one OpenSSL
+reads, to the same public key, but the sixth review's rule took the second
+carriage return for a second line break, so that, like a blank line, it
+parted two runs, and the whole block reached every sink and passed every
+check, as text and in JSON three deep. Only a line feed advances a line, so
+what still parts two runs is a blank line of two line feeds, carriage
+returns among them or not (`\n\n`, `\r\n\r\n`, `\r\r\n\r\r\n`); two
+carriage returns alone, a classic Mac OS file's blank line, no longer do.
+Spaces and tabs may part the runs too
 (fifth review of #285): a base64 decoder skips them, so a key with a space
 after every eight characters of its body is one OpenSSL reads, to the same
 public key, and so is a short-wrapped key whose line breaks a progress line
@@ -232,8 +245,8 @@ characters did not, in testing), a longer one fewer still. A
 placeholder's words seldom do (`Paste Your Private Key Here`, `your
 ed25519 key goes here` and a hex dump in either case stay). The cost: 16
 letters of prose between the BEGIN and END lines that mix case and hold a
-digit (`Put the RSA 2048 key here`) read as a key. A blank line
-still parts two runs, and a short placeholder on lines of its own (`put`,
+digit (`Put the RSA 2048 key here`) read as a key. A blank line of two
+line feeds still parts two runs, and a short placeholder on lines of its own (`put`,
 `your`, `key`, `here`: 14 joined) is no material either. It starts anywhere but after a dash, a letter included (no
 identifier holds a BEGIN line), and it runs first, before every other
 pattern: a named assignment's value stops at the space in the BEGIN line,
@@ -424,7 +437,12 @@ longer found the line it is told by (a block's header below an upper-case
 key, `"GH_TOKEN:\n  |\n  FAKE"`, kept its block). The separator now crosses
 a line break written out, behind up to seven backslashes, with the blank
 lines and the indentation after it, as it crosses one written as such:
-`GH_TOKEN=\nabc` in JSON text is `GH_TOKEN=\n***REDACTED***`. It crosses
+`GH_TOKEN=\nabc` in JSON text is `GH_TOKEN=\n***REDACTED***`. A carriage
+return written out alone (`\r`) is such a line break too (seventh review):
+only `\n` and `\r\n` were crossed until then, and a value never starts with
+`\r` either, so in JSON text a value below its name after a bare carriage
+return (`"GH_TOKEN:\r  FAKE"`, `"DEPLOY_SECRET:\r  FAKE"`) was kept whole,
+though the same text, as written, was redacted. It crosses
 to an unquoted value only: a quote right after the break may close the
 string the text is written in (`"GH_TOKEN=\n"`, then the document's next
 string), so a quoted value below its name in JSON text is the YAML
@@ -500,7 +518,10 @@ x"\n y`, 14 to 23), and a sequence's dashes stay with the key. The sixth
 review's keep more and replace no less: properties or a block's header on
 lines of their own stay (`a_token:\n &a\n x\n`, 15 to 28), and so does a
 line break written out before a value (`A_TOKEN=\nx` in JSON text, 11 to
-24, where the break went with the value, 11 to 22). Every token
+24, where the break went with the value, 11 to 22). The seventh review's
+are as long as the same with line feeds: a value whose lines bare carriage
+returns end (`a_token:\r x\r`, 12 to 25) and a carriage return written out
+before a value (`A_TOKEN=\rx`, 11 to 24). Every token
 shape is longer than the marker and only shrinks, a private-key block (43
 characters or more) included, and what a block holds between its BEGIN and
 END lines, like a quoted value, can take a marker only whole. A mapping's
@@ -701,6 +722,26 @@ api_token:              Db_Password:            client_secret: <word>
   a line break is the one the key's line ends in, behind as many
   backslashes, and a line also ends where the string does, at a quote
   behind fewer backslashes, so the JSON still decodes.
+- **A line breaks where YAML breaks it**: at `\n`, `\r\n` and a carriage
+  return alone, `\r` (seventh review of #285), as written and written out,
+  and a key starts a line after any of them. Only `\n` and `\r\n` ended a
+  line until then, and a key's line started after a line feed only, so a
+  value whose lines bare carriage returns end (a classic Mac OS file, a
+  terminal's capture) was no key's: a scalar below `client_secret:`, a
+  literal or folded block, a property line or a block's header that ends in
+  one, even in an otherwise LF document (`&cs`, then a carriage return,
+  then the scalar), and the key on a line after one. A YAML parser reads
+  each, and each was kept whole in every sink and passed every check, as
+  text and in JSON three deep, on a live progress line too. `\r\n` is read
+  whole, one break; two carriage returns are two, a blank line, which
+  YAML allows where the rules above allow one. The node boundaries hold as
+  they do for a line feed: a line no more indented than the key is the
+  mapping's next entry and stays, and a statement, a nested mapping and a
+  block of placeholders are still no value. NEL, LS and PS (`\x85`,
+  `\u2028`, `\u2029`) are no line break here, as YAML 1.2 reads them, and
+  count as spaces: a scalar after one on the key's line is that line's
+  value and redacted, but a `|` or `>` block whose lines they end, which a
+  YAML 1.1 parser such as PyYAML reads, is not recognised.
 
 They run last, after every pattern that can redact a part of such a
 value's lines: whether a line is a plain scalar depends on all of it, so a

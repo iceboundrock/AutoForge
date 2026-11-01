@@ -27,7 +27,8 @@ so.
 - A private-key block is replaced whole, its BEGIN and END lines with it,
   also when its body is wrapped in lines shorter than 16 characters (a key
   rewrapped with `fold -w 8` is still a valid key; its lines may end in a
-  bare carriage return), or has spaces and tabs
+  bare carriage return or a run of them, as a terminal's capture of a CRLF
+  file writes them), or has spaces and tabs
   between short runs, which a base64 decoder skips (16 characters parted so
   must mix case and hold a digit, a `+` or a `/`, so the words of a
   placeholder stay). One whose END line is
@@ -65,7 +66,8 @@ so.
   key, as a block's header may (`client_secret:`, then `  |`, then the
   block), and in a sequence entry (`- x_token: |`) the value stops at the
   mapping's next entry, which stays, however wide the dashes before the
-  key; a statement that ends in a colon
+  key. A bare carriage return ends a line as YAML reads it, as a line feed
+  and CRLF do, as written and written out; a statement that ends in a colon
   (`if api_token:`), a nested mapping and, under a lower-case name, a value
   that reads as code (`${{ secrets.X }}`, `process.env.X`) are left. A
   block is a string whatever its lines hold, so one that starts with a

@@ -71,7 +71,9 @@ from autoforge.result_parser import (
 from autoforge.transitions import Phase, WorkflowMode
 from tests.conftest import (
     BRANCH,
+    CR_CRLF_KEY,
     CR_KEY,
+    CR_RUN_KEY,
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     ISSUE,
@@ -93,6 +95,7 @@ from tests.conftest import (
     WHOLE_VALUES_285_R4,
     WHOLE_VALUES_285_R5,
     WHOLE_VALUES_285_R6,
+    WHOLE_VALUES_285_R7,
     block,
     comment_url,
 )
@@ -2759,6 +2762,77 @@ def test_a_private_key_parted_by_carriage_returns_is_refused_by_every_published_
         _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
     ):
         assert refusal is not None and SHORT_WRAPPED_KEY_LINE not in refusal
+
+
+# What the seventh review of #285 found every check accepted: a key whose
+# runs two carriage returns part, a terminal's capture of a CRLF key file
+# (R7-F1), and YAML values whose lines bare carriage returns end (R7-F2),
+# each with its class and what must never be quoted.
+_R7_SHAPES = [
+    ("private-key", CR_RUN_KEY, SHORT_WRAPPED_KEY_LINE),
+    ("private-key", CR_CRLF_KEY, SHORT_WRAPPED_KEY_LINE),
+    *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285_R7),
+]
+_R7_IDS = ["two-crs-key", "terminal-capture-key", *(n for n, _, _ in WHOLE_VALUES_285_R7)]
+
+
+@pytest.mark.parametrize(("cls", "text", "body"), _R7_SHAPES, ids=_R7_IDS)
+def test_a_shape_the_seventh_285_review_found_is_refused_by_every_published_content_check(
+    cls, text, body
+):
+    """#285 review, round 7: the publication, payload, commit-message and
+    composed-comment checks accepted each of these. Each refuses it by class
+    now and never quotes it; a result field refuses the carriage return
+    itself first, unquoted too."""
+    body_text = f"Configured the client.\n\n{text}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body_text),
+        published_payload_problem("PR body", f"{body_text}\n\nCloses #2"),
+        acceptance_comment_problem(body_text, "R1-F1"),
+        operator_comment_problem(body_text, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{text}", repository="owner/repo", issue_number=2
+        ),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert f"credential-shaped string (pattern class: {cls})" in msg
+        assert body not in msg and "FAKE" not in msg
+    for refusal in (
+        _refusal(lambda: _full(progress=body_text)),
+        _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
+    ):
+        assert "control character (U+000D" in refusal and body not in refusal
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3], ids=["json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(("cls", "text", "body"), _R7_SHAPES, ids=_R7_IDS)
+def test_a_seventh_285_review_shape_written_out_is_refused_by_every_check(cls, text, body, depth):
+    """#285 review, round 7: as JSON writes each of these, one, two and
+    three deep, a carriage return is ``\\r`` and no control character, so
+    the result fields' control-character rule let it through and
+    ``pr_body`` and ``progress`` validation accepted it with every other
+    check. Each check, the result fields' included, refuses it by class now,
+    and none quotes it."""
+    written = text
+    for _ in range(depth):
+        written = json.dumps(written)
+    body_text = f"Configured the client:\n\n{written}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body_text),
+        published_payload_problem("PR body", f"{body_text}\n\nCloses #2"),
+        acceptance_comment_problem(body_text, "R1-F1"),
+        operator_comment_problem(body_text, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{written}", repository="owner/repo", issue_number=2
+        ),
+        _refusal(lambda: _full(progress=body_text)),
+        _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert f"credential-shaped string (pattern class: {cls})" in msg
+        assert body not in msg and "FAKE" not in msg
 
 
 def test_a_private_key_block_in_a_commit_message_is_refused_whole():
