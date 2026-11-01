@@ -4,18 +4,21 @@
 into a summary, compares it with main's recent runs of the same category and
 keeps main's history. These tests drive it on synthetic reports and one real
 pytest run of a three-file suite, and pin what the policy promises: a
-missing, unreadable or failing run never gets ``ok``; a window holds only
-clean runs of a push to main in the same category, recent and one per
-commit; the verdicts follow the median and p95 thresholds; a cold uv cache
-is compared with cold runs only; nothing written holds a failure's message or
-captured output; and ``report`` exits 0 whatever it finds. What keeps the
-report from deciding the job is in ``tests/test_ci_workflow.py``.
+missing, unreadable or failing run, or one without the suite's wall time,
+never gets ``ok``; a window holds only clean runs of a push to main in the
+same category, recent and one per commit; the verdicts follow the median and
+p95 thresholds; a cold uv cache is compared with cold runs only; nothing
+written holds a failure's message or captured output; and ``report`` exits 0
+whatever it finds. What keeps the report from deciding the job is in
+``tests/test_ci_workflow.py``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -284,6 +287,73 @@ def test_only_a_clean_run_is_compared(tmp_path: Path, outcome: str, cases, clean
 
 
 @pytest.mark.parametrize(
+    "suites",
+    [
+        "<testsuite name='pytest'>{cases}</testsuite>",
+        # every suite needs its time: one without leaves the whole report without
+        "<testsuites><testsuite time='5'>{cases}</testsuite><testsuite/></testsuites>",
+    ],
+    ids=["one-suite", "one-of-two-suites"],
+)
+def test_a_report_without_the_suites_wall_time_is_not_compared_and_never_recorded(
+    tmp_path: Path, suites: str
+):
+    """The tests' own time is shown, never put in the wall time's place (#344, R1-F1)."""
+    cases = (
+        "<testcase classname='tests.test_a' name='t1' time='40'/>"
+        "<testcase classname='tests.test_b' name='t2' time='2.5'/>"
+    )
+    path = tmp_path / "junit.xml"
+    path.write_text(suites.format(cases=cases), encoding="utf-8")
+    ctx = ci_durations.context_from(github_env(), NOW, python="3.11", pytest_outcome="success")
+    summary, tests = summarize(path, ctx)
+    assert (summary["status"], summary["clean"]) == ("complete", False)
+    assert (summary["suite_seconds"], summary["test_seconds"]) == (None, 42.5)
+    assert summary["problem"] == "the report gives no wall time for the suite"
+    assert summary["counts"]["passed"] == 2 and len(tests) == 2
+    # A summary the tool wrote: `compare --current` reads it.
+    assert ci_durations.valid_sample(summary)
+    history = main_history(tmp_path, [40.0] * 10)
+    comparison = compare(summary, history)
+    assert comparison["verdict"] == "not-comparable"
+    assert (comparison["current_seconds"], comparison["ratio"]) == (None, None)
+    text = ci_durations.render(summary, comparison)
+    assert "| suite | no wall time in the report (the tests' own time 42.5 s) |" in text
+    assert "**Verdict: not-comparable**: the report gives no wall time for the suite." in text
+    kept, note = record(history, summary)
+    assert summary["run"]["sha"] not in {s["run"]["sha"] for s in kept}
+    assert note == (
+        "this run was not added to main's history: the report gives no wall time for the suite"
+    )
+
+
+def test_a_baseline_of_zero_seconds_has_no_ratio_and_its_report_is_still_written(
+    tmp_path: Path,
+):
+    """Five runs of main at 0 s: the median divides nothing, and the report says so (R1-F2)."""
+    cases = [("tests.test_a", "test_one", "passed", 0.0)]
+    for n in range(1, ci_durations.MIN_SAMPLES + 1):
+        env = github_env(GITHUB_SHA=f"{n:040x}", GITHUB_RUN_ID=str(n))
+        assert _report(tmp_path, env, junit(cases, 0.0))[0] == 0
+    pr = github_env(
+        GITHUB_SHA="f" * 40,
+        GITHUB_RUN_ID="77",
+        GITHUB_EVENT_NAME="pull_request",
+        GITHUB_REF="refs/pull/7/merge",
+    )
+    for seconds, verdict in ((0.0, "ok"), (0.5, "regression")):
+        code, directory = _report(tmp_path, pr, junit(cases, seconds))
+        assert code == 0
+        out = directory / ci_durations.REPORT_DIR
+        comparison = json.loads((out / "comparison.json").read_text(encoding="utf-8"))
+        assert (comparison["verdict"], comparison["samples"]) == (verdict, 5)
+        assert (comparison["median"], comparison["ratio"]) == (0.0, None)
+        markdown = (out / "summary.md").read_text(encoding="utf-8")
+        assert f"**Verdict: {verdict}**" in markdown
+        assert "No ratio to the median, which is 0 s. Slower above 0.0 s" in markdown
+
+
+@pytest.mark.parametrize(
     ("seconds", "verdict"),
     [
         (110.0, "ok"),
@@ -331,6 +401,7 @@ def test_the_window_holds_only_clean_main_pushes_of_the_category_recent_and_one_
         make_summary(tmp_path, 1.0, days_ago=1, n=999),  # the current run's own commit
         make_summary(tmp_path, 1.0, days_ago=1, n=9, cases=[]),  # no test: not clean
         {**make_summary(tmp_path, 1.0, n=10), "suite_seconds": "fast"},  # hand-edited
+        {**make_summary(tmp_path, 1.0, n=12), "suite_seconds": None},  # clean, no wall time
     ]
     # Two runs of one commit: the newer one stands for it.
     older = make_summary(tmp_path, 1.0, days_ago=3, n=11)
@@ -607,3 +678,40 @@ def test_the_cache_state_and_the_runner_are_read_as_the_category_says():
     assert local.runner.startswith("local ") and local.run_url == "" and local.job == "local"
     hosted = ci_durations.context_from(github_env(RUNNER_ENVIRONMENT="self-hosted"), NOW)
     assert hosted.runner == "self-hosted Linux X64"
+
+
+def _documented_commands(heading: str) -> list[list[str]]:
+    """The commands of the ``bash`` blocks under ``heading`` in docs/development.md, as argv."""
+    text = (REPO_ROOT / "docs" / "development.md").read_text(encoding="utf-8")
+    section = text.split(f"\n{heading}\n", 1)[1].split("\n## ", 1)[0]
+    blocks = re.findall(r"```bash\n(.*?)```", section, flags=re.DOTALL)
+    assert blocks, f"no bash block under {heading!r}"
+    commands = []
+    for block in blocks:
+        # The shell reads `<...>` as a redirection: a placeholder never runs.
+        assert "<" not in block and ">" not in block, block
+        commands += [shlex.split(line) for line in block.replace("\\\n", " ").splitlines()]
+    return commands
+
+
+def test_the_documented_reproduction_compares_the_local_run_and_a_downloaded_one():
+    """docs/development.md, "Reproducing a report": each ``compare`` reads a report made before it.
+
+    The first compares what ``summarize`` wrote for the local run; the second
+    the artifact ``gh run download --name`` put straight into its ``--dir``.
+    Every tool command parses with the tool's own options.
+    """
+    commands = _documented_commands("### Reproducing a report")
+    tool = [
+        ci_durations.parser().parse_args(words[3:])
+        for words in commands
+        if words[:3] == ["python3", "-I", "tests/ci_durations.py"]
+    ]
+    assert [args.command for args in tool] == ["summarize", "compare", "compare"]
+    summarize_args, local, downloaded = tool
+    assert local.current == f"{summarize_args.out}/summary.json"
+    (download,) = [
+        words for words in commands if words[:3] == ["gh", "run", "download"] and "--name" in words
+    ]
+    assert downloaded.current == f"{download[download.index('--dir') + 1]}/summary.json"
+    assert local.baseline == downloaded.baseline == ["/tmp/artifacts"]

@@ -29,11 +29,11 @@ It reads ``DIR/junit.xml`` (pytest's ``--junitxml``) and ``DIR/history/history.j
 **Report only.** ``report`` exits 0 whatever it finds, and the workflow runs
 it with ``continue-on-error``: the job's result is pytest's, and the required
 ``ci`` check means what it meant. A missing or unreadable JUnit report, a run
-with failures and a category without enough history each get a verdict that
-says so (``no-data``, ``not-comparable``, ``insufficient-baseline``), never
-``ok``. Nothing it writes holds a failure's message or anything a test
-printed: only test ids, outcomes, times and skip reasons, which pytest's
-``-rs`` prints in the job's log anyway.
+with failures or without the suite's wall time and a category without enough
+history each get a verdict that says so (``no-data``, ``not-comparable``,
+``insufficient-baseline``), never ``ok``. Nothing it writes holds a failure's
+message or anything a test printed: only test ids, outcomes, times and skip
+reasons, which pytest's ``-rs`` prints in the job's log anyway.
 
 **The policy** (docs/development.md, "Test durations in CI"): a run is
 compared with the last :data:`WINDOW` clean runs of a push to main in its
@@ -282,8 +282,11 @@ def summarize(junit: Path, ctx: Context) -> tuple[dict, list[dict]]:
 
     A report that is missing or does not read gives a summary whose
     ``status`` says so, with no counts and ``clean`` false. A run is clean
-    when its report holds at least one test and no failure or error, and the
-    pytest step succeeded (when its outcome is given).
+    when its report holds at least one test and no failure or error, gives
+    the suite's wall time, and the pytest step succeeded (when its outcome is
+    given). A report without that wall time leaves ``suite_seconds`` null:
+    the tests' own time measures something else (it leaves out collection
+    and whatever the session does between tests) and never takes its place.
     """
     summary: dict = {
         "schema": SCHEMA,
@@ -330,13 +333,15 @@ def summarize(junit: Path, ctx: Context) -> tuple[dict, list[dict]]:
         problems.append("the report holds no test")
     if counts["failed"] or counts["errors"]:
         problems.append(f"{counts['failed']} failed and {counts['errors']} errors")
+    if suite_seconds is None:
+        problems.append("the report gives no wall time for the suite")
     if ctx.pytest_outcome and ctx.pytest_outcome != "success":
         problems.append(step)
     summary.update(
         problem="; ".join(problems),
         clean=not problems,
         counts=counts,
-        suite_seconds=round(test_seconds if suite_seconds is None else suite_seconds, 3),
+        suite_seconds=None if suite_seconds is None else round(suite_seconds, 3),
         test_seconds=round(test_seconds, 3),
         modules={name: round(modules[name], 3) for name in sorted(modules)},
         slowest=[
@@ -397,7 +402,12 @@ def valid_sample(sample: object) -> bool:
         return False
     if any(not isinstance(counts.get(key), int) for key in (*OUTCOMES, "tests")):
         return False
-    if not _number(sample.get("suite_seconds")) or not _number(sample.get("test_seconds")):
+    if not _number(sample.get("test_seconds")):
+        return False
+    # A report without the suite's wall time is never clean (summarize), so no
+    # window ever holds a sample without one.
+    suite_seconds = sample.get("suite_seconds")
+    if not _number(suite_seconds) and not (suite_seconds is None and not sample["clean"]):
         return False
     return all(isinstance(name, str) and _number(value) for name, value in modules.items())
 
@@ -750,10 +760,11 @@ def render(summary: dict, comparison: dict | None) -> str:
             f"failed, {counts['errors']} errors, {counts['skipped']} skipped, "
             f"{counts['xfailed']} xfailed |"
         )
-        lines.append(
-            f"| suite | {summary['suite_seconds']:.1f} s wall (the tests' own time "
-            f"{summary['test_seconds']:.1f} s) |"
-        )
+        own = f"the tests' own time {summary['test_seconds']:.1f} s"
+        if summary["suite_seconds"] is None:
+            lines.append(f"| suite | no wall time in the report ({own}) |")
+        else:
+            lines.append(f"| suite | {summary['suite_seconds']:.1f} s wall ({own}) |")
         if summary["problem"]:
             lines.append(f"| not clean | {_cell(summary['problem'])} |")
     if comparison is not None:
@@ -772,11 +783,16 @@ def render(summary: dict, comparison: dict | None) -> str:
 
 def _render_comparison(comparison: dict) -> list[str]:
     lines = [f"**Verdict: {comparison['verdict']}**: {_cell(comparison['reason'])}."]
-    thresholds = comparison["thresholds"]
+    thresholds, ratio = comparison["thresholds"], comparison["ratio"]
     if thresholds:
+        # compare() gives no ratio when the median is 0 s: nothing divides by it.
+        if ratio is None:
+            ratio_text = "No ratio to the median, which is 0 s."
+        else:
+            ratio_text = f"Ratio to the median {ratio:.2f}x."
         lines += [
             "",
-            f"Ratio to the median {comparison['ratio']:.2f}x. Slower above "
+            f"{ratio_text} Slower above "
             f"{thresholds['slower']:.1f} s ({SLOWER:.2f}x the median), regression above "
             f"{thresholds['regression']:.1f} s ({REGRESSION:.2f}x the p95), faster below "
             f"{thresholds['faster']:.1f} s ({FASTER:.2f}x the median).",

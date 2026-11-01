@@ -637,8 +637,9 @@ the report notes when it differs from the newest baseline run's.
 The **baseline window** is the last 20 runs of a push to main in that
 category, recorded in the 30 days before the run, one per commit (the newest
 attempt), and clean: a complete report, at least one test, no failure or
-error, and a pytest step that succeeded. A run of a pull request, a failed
-run, a cancelled run and a run without a report are never baseline runs.
+error, the suite's wall time, and a pytest step that succeeded. A run of a
+pull request, a failed run, a cancelled run and a run without a report are
+never baseline runs.
 The window's median and p95 (nearest rank, as `tests/parallel_bench.py`
 takes it: with 20 runs, the second slowest) of the suite's wall time decide:
 
@@ -649,7 +650,7 @@ takes it: with 20 runs, the second slowest) of the suite's wall time decide:
 | `ok` | within those bounds | nothing |
 | `faster` | below 0.90 × the median | read the notes: fewer tests or more skips than main's newest run means less was tested, not that the suite got faster |
 | `insufficient-baseline` | fewer than 5 runs in the window | nothing to compare with yet |
-| `not-comparable` | the run has failures or errors, no test, or a pytest step that did not succeed | its times are shown, without a verdict, and it never becomes a baseline run |
+| `not-comparable` | the run has failures or errors, no test, no wall time for the suite, or a pytest step that did not succeed | its times are shown, without a verdict, and it never becomes a baseline run |
 | `no-data` | no JUnit report, or one that does not read | the report claims nothing; the job's own result says whether the suite passed |
 
 The `slower` bound is #341's rule that a serial run more than 10% above the
@@ -663,10 +664,13 @@ it is more than rarely.
 
 **Missing metrics** never read as `ok`: a run without a report is
 `no-data`, one that failed is `not-comparable`, and a category without five
-baseline runs is `insufficient-baseline`. A history that was never saved,
-has expired or does not read is ignored with a note, and so is each sample
-in it that the tool did not write, counted; the window then starts again
-from the next pushes to main.
+baseline runs is `insufficient-baseline`. A report without the suite's wall
+time is `not-comparable` too, and its wall time stays empty: the tests' own
+time leaves out collection and whatever the session does between tests, so
+it is shown beside it but never takes its place. A history that was never
+saved, has expired or does not read is ignored with a note, and so is each
+sample in it that the tool did not write, counted; the window then starts
+again from the next pushes to main.
 
 **A cold uv cache** is compared with cold runs only. The cache mostly
 speeds up `uv sync`, which the report does not time (its step's duration
@@ -722,15 +726,32 @@ for id in $(gh run list --workflow ci.yml --branch main --event push --limit 20 
         --json databaseId --jq '.[].databaseId'); do
     gh run download "$id" --pattern 'durations-py3.11-*' --dir "/tmp/artifacts/$id"
 done
-python3 -I tests/ci_durations.py compare --baseline /tmp/artifacts \
-    --current /tmp/artifacts/<run-id>/summary.json
+python3 -I tests/ci_durations.py compare --current /tmp/durations/report/summary.json \
+    --baseline /tmp/artifacts
 ```
 
-`compare` reads summaries and history files, or directories holding them,
-and prints the same Markdown; `--window`, `--min-samples` and
-`--max-age-days` try another policy on the same runs. A download of each
-run into a directory of its own keeps the runs apart: `gh run download`
-extracts a single artifact straight into its directory.
+A run of CI is compared the same way, from its own artifact: here the
+newest pull-request run of the branch checked out, against the main runs
+downloaded above (its first attempt's report; `attempt2` names its first
+re-run's):
+
+```bash
+run=$(gh run list --workflow ci.yml --branch "$(git branch --show-current)" \
+    --event pull_request --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run download "$run" --name durations-py3.11-attempt1 --dir "/tmp/current/$run"
+python3 -I tests/ci_durations.py compare --current "/tmp/current/$run/summary.json" \
+    --baseline /tmp/artifacts
+```
+
+`compare` reads summaries and history files, or directories holding them at
+any depth, and prints the same Markdown; `--window`, `--min-samples` and
+`--max-age-days` try another policy on the same runs. Every run names its
+artifacts alike (`durations-py3.11-attempt1`), so each run is downloaded
+into a directory of its own. `gh run download` extracts an artifact chosen
+by `--name` straight into `--dir`, which is where the second `compare`
+looks for `summary.json`. One of main's downloaded runs can be compared
+with the others the same way: it is left out of its own window, and so is
+every other run of its commit.
 
 ## What a green `ci` does and does not prove
 
