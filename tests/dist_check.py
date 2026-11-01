@@ -42,15 +42,20 @@ imports the ``autoforge`` of the source tree:
    interpreter); and a REMOTE ``autoforge run --dry-run --full-prompt`` in
    a scratch git repository, with a ``gh`` on ``PATH`` that records any
    call and fails it, which must render the ANALYZE_EXECUTE prompt through
-   the installed engine, call no ``gh`` and leave the repository
-   byte-identical. Then LOCAL mode's ways in, each met by a generic refusal
-   of the installed command (ADR 0009 D3 to D5, #389): ``--help`` names no
-   ``local``; ``autoforge local`` is argparse's invalid choice; a
-   configuration with a ``local:`` block is an unknown key; a
-   ``mode: "LOCAL"`` state is an unknown mode to every command that loads
-   it (``step``, ``resume`` and ``unblock`` as dry runs). Each exits 2,
-   calls no ``gh`` and leaves the repository, its state directory and
-   ``.git`` included, byte-identical.
+   the installed engine, call no ``gh`` and leave the repository unchanged
+   (:func:`_tree`: every path's bytes, identity and metadata). Then LOCAL
+   mode's ways in, each met by a generic refusal of the installed command
+   (ADR 0009 D3 to D5, #389): ``--help`` names no ``local``; ``autoforge
+   local`` is argparse's invalid choice; a configuration with a ``local:``
+   block is an unknown key; a ``mode: "LOCAL"`` state is an unknown mode to
+   every command that loads it, ``step``, ``resume`` and ``unblock`` both
+   as dry runs and as the ordinary invocations that would take the lock and
+   launch, and ``run`` over it. Each exits 2, in an environment of its own
+   (a scratch ``HOME`` and ``TMPDIR``, and recording fakes of ``gh``,
+   ``claude``, ``opencode`` and ``pi`` first on ``PATH``, so that a
+   regression reaches no service and no model), runs none of the fakes,
+   and leaves unchanged the repository, its state directory and ``.git``
+   included, the configuration file, the scratch ``HOME`` and ``TMPDIR``.
 5. The SHA-256 of each artifact is printed, appended to the job summary
    (``$GITHUB_STEP_SUMMARY``) when that is set, and written to
    ``--sha256sums`` in ``sha256sum -c`` format when asked. When
@@ -75,6 +80,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -84,6 +90,7 @@ import zipfile
 from email.message import Message
 from email.parser import HeaderParser
 from pathlib import Path
+from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = "autoforge"
@@ -521,12 +528,86 @@ def _scratch_repository(git: str, repo: Path, env: dict[str, str]) -> Path:
     return repo
 
 
-def _tree(root: Path) -> dict[str, bytes | None]:
-    """Every path under ``root`` (``.git`` included), with each file's bytes."""
+class _Entry(NamedTuple):
+    """One path as a snapshot holds it: what it holds, which file it is, and its metadata."""
+
+    kind: str  # "file", "dir", "link" or "other"
+    content: bytes | str | None  # a file's bytes, a link's target
+    device: int
+    inode: int
+    mode: int
+    links: int
+    owner: tuple[int, int]
+    size: int
+    mtime: int  # nanoseconds
+    ctime: int  # nanoseconds
+
+
+def _entry(path: Path) -> _Entry:
+    """``path`` itself (``lstat``: a link is not followed), its content and its metadata."""
+    st = path.lstat()
+    content: bytes | str | None = None
+    if stat.S_ISREG(st.st_mode):
+        kind, content = "file", path.read_bytes()
+    elif stat.S_ISLNK(st.st_mode):
+        kind, content = "link", os.readlink(path)
+    else:
+        kind = "dir" if stat.S_ISDIR(st.st_mode) else "other"
+    return _Entry(
+        kind,
+        content,
+        st.st_dev,
+        st.st_ino,
+        st.st_mode,
+        st.st_nlink,
+        (st.st_uid, st.st_gid),
+        st.st_size,
+        st.st_mtime_ns,
+        st.st_ctime_ns,
+    )
+
+
+def _tree(root: Path) -> dict[str, _Entry]:
+    """``root`` (as ``.``) and every path under it, ``.git`` included, as :func:`_entry` reads it.
+
+    What a write changes, besides a path's bytes (PR #425 R1-F4): a file
+    rewritten in place with its own bytes has a new ``mtime`` and
+    ``ctime``; one replaced by a copy (a rename over it) is another inode,
+    and its directory has a new ``mtime``; a ``chmod``, a ``chown`` or a
+    ``touch`` that puts the old times back still sets ``ctime``, which no
+    unprivileged call sets back; a file created and removed again, a lock
+    file among them, leaves its directory a new ``mtime``. ``atime`` is left
+    out, since reading a file may set it.
+
+    What it cannot see: a change outside ``root``; a lock taken with
+    ``flock`` or ``fcntl`` on a file that already exists, which changes no
+    metadata (no lock file exists before a refusal check runs, so taking
+    the controller lock would create one); a write within one tick of the
+    kernel's timestamp clock of the snapshot before it, which a command's
+    own start-up outlasts; and a write made after the snapshot after it, by
+    a process the command left running.
+    """
     return {
-        str(path.relative_to(root)): path.read_bytes() if path.is_file() else None
-        for path in sorted(root.rglob("*"))
+        ".": _entry(root),
+        **{str(path.relative_to(root)): _entry(path) for path in sorted(root.rglob("*"))},
     }
+
+
+def _changes(before: dict[str, _Entry], after: dict[str, _Entry]) -> list[str]:
+    """Each path that differs between two snapshots, with what differs about it."""
+    found: list[str] = []
+    for path in sorted(before.keys() | after.keys()):
+        old, new = before.get(path), after.get(path)
+        if old == new:
+            continue
+        if old is None:
+            found.append(f"{path} (created)")
+        elif new is None:
+            found.append(f"{path} (removed)")
+        else:
+            fields = [name for name, a, b in zip(_Entry._fields, old, new, strict=True) if a != b]
+            found.append(f"{path} ({', '.join(fields)})")
+    return found
 
 
 def remote_dry_run(autoforge: str, git: str, work: Path, env: dict[str, str]) -> None:
@@ -567,8 +648,7 @@ def remote_dry_run(autoforge: str, git: str, work: Path, env: dict[str, str]) ->
     _check(not _PLACEHOLDER.search(plan), "the REMOTE dry run's prompt has an unrendered variable")
     if calls.exists():
         raise CheckFailed(f"the REMOTE dry run called gh: {calls.read_text(encoding='utf-8')!r}")
-    after = _tree(repo)
-    changed = sorted({path for path, _ in set(before.items()) ^ set(after.items())})
+    changed = _changes(before, _tree(repo))
     _check(not changed, f"the REMOTE dry run changed the scratch repository: {changed}")
     _say(
         "ok: autoforge run --dry-run --full-prompt rendered the ANALYZE_EXECUTE prompt, no gh call"
@@ -579,6 +659,10 @@ def remote_dry_run(autoforge: str, git: str, work: Path, env: dict[str, str]) ->
 # command (ADR 0009 D3 to D5): the words after `autoforge`, the exit status, and
 # what its stderr must say. `doctor`'s refusal of a `local:` key, its failing
 # `config` row, is tests/test_cli.py's: doctor runs `gh` and the agent CLIs.
+# `step`, `resume` and `unblock` come twice: as dry runs, which load the state
+# without the lock, and as the ordinary invocations, which refuse it before
+# the lock and would otherwise take the lock, write and launch (PR #425
+# R1-F3); `run` over the state is refused before the lock as well.
 _LOCAL_WAYS_IN: tuple[tuple[tuple[str, ...], int, str], ...] = (
     (("local",), 2, "invalid choice: 'local'"),
     (("local", "run", "features/add-filter.md"), 2, "invalid choice: 'local'"),
@@ -590,7 +674,42 @@ _LOCAL_WAYS_IN: tuple[tuple[tuple[str, ...], int, str], ...] = (
     (("step", "--dry-run"), 2, "state file has unknown mode 'LOCAL'"),
     (("resume", "--dry-run"), 2, "state file has unknown mode 'LOCAL'"),
     (("unblock", "--reason", "looked", "--dry-run"), 2, "state file has unknown mode 'LOCAL'"),
+    (("step",), 2, "state file has unknown mode 'LOCAL'"),
+    (("resume",), 2, "state file has unknown mode 'LOCAL'"),
+    (("unblock", "--reason", "looked"), 2, "state file has unknown mode 'LOCAL'"),
+    (
+        ("run", "--epic", REMOTE_EPIC, "--issue", REMOTE_ISSUE),
+        2,
+        "state file has unknown mode 'LOCAL'",
+    ),
 )
+# What a regression could reach instead of refusing: GitHub through `gh`, a
+# model through an agent CLI. Each is a fake first on PATH that records its
+# call and fails it.
+_RECORDED_EXECUTABLES = ("gh", "claude", "opencode", "pi")
+
+
+def _isolated_env(env: dict[str, str], fake_bin: Path, home: Path, tmp: Path) -> dict[str, str]:
+    """An environment of the refusal check's own: only what the installed command needs.
+
+    ``PATH`` with ``fake_bin`` first, so ``git`` is the host's and every
+    executable of :data:`_RECORDED_EXECUTABLES` a recording fake; a scratch
+    ``HOME``, XDG directories inside it and ``TMPDIR``; no git configuration
+    of the operator's. No variable of the caller's environment but ``PATH``
+    reaches it, so no credential, provider key or ``gh`` configuration does.
+    """
+    return {
+        "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', os.defpath)}",
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_DATA_HOME": str(home / ".local" / "share"),
+        "XDG_STATE_HOME": str(home / ".local" / "state"),
+        "TMPDIR": str(tmp),
+        "LANG": "C.UTF-8",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
 
 
 def local_refusals(autoforge: str, git: str, work: Path, env: dict[str, str]) -> None:
@@ -600,23 +719,29 @@ def local_refusals(autoforge: str, git: str, work: Path, env: dict[str, str]) ->
     with LOCAL mode may have: a LOCAL state, with a run log, at the default
     ``state_dir``, a feature file, and a configuration file beside it that
     still has a ``local:`` block. ``--help`` names no ``local``; each way in
-    of :data:`_LOCAL_WAYS_IN` exits as its row says, naming its refusal; the
-    ``step``, ``resume`` and ``unblock`` rows are dry runs, so a refusal
-    that regressed launches no agent. The ``gh`` first on ``PATH`` records
-    any call and fails it, and the repository, its state directory and
-    ``.git`` included, and the configuration file are byte-identical
-    afterwards.
+    of :data:`_LOCAL_WAYS_IN` exits as its row says, naming its refusal.
+    Every command runs in :func:`_isolated_env`: a regression that took the
+    lock and stepped would meet a fake ``gh`` or agent CLI, never GitHub or
+    a model. Afterwards no fake has been called, and the repository (its
+    state directory and ``.git`` included), the configuration file, the
+    scratch ``HOME`` and ``TMPDIR`` are as they were, bytes, identity and
+    metadata (:func:`_tree`, which says what that cannot see).
     """
-    fake_bin = work / "fake-gh-local"
+    fake_bin = work / "fake-bin-local"
     fake_bin.mkdir()
-    calls = work / "gh-calls-local.log"
-    fake = fake_bin / "gh"
-    fake.write_text(
-        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {shlex.quote(str(calls))}\nexit 1\n',
-        encoding="utf-8",
-    )
-    fake.chmod(0o755)
-    local_env = dict(env, PATH=f"{fake_bin}{os.pathsep}{env.get('PATH', '')}")
+    calls = work / "calls-local.log"
+    for name in _RECORDED_EXECUTABLES:
+        fake = fake_bin / name
+        fake.write_text(
+            f'#!/bin/sh\nprintf "%s %s\\n" {name} "$*" >> {shlex.quote(str(calls))}\nexit 1\n',
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+    home, tmp = work / "local-home", work / "local-tmp"
+    for directory in (".config", ".cache", ".local/share", ".local/state"):
+        (home / directory).mkdir(parents=True)
+    tmp.mkdir()
+    local_env = _isolated_env(env, fake_bin, home, tmp)
     help_text = _run([autoforge, "--help"], cwd=work, env=local_env).stdout
     _check("local" not in help_text.lower(), "`autoforge --help` names `local`")
     repo = _scratch_repository(git, work / "local-repo", local_env)
@@ -631,7 +756,15 @@ def local_refusals(autoforge: str, git: str, work: Path, env: dict[str, str]) ->
     (repo / "features" / "add-filter.md").write_text("# Feature: add filter\n")
     config = work / "local-config.json"
     config.write_text(json.dumps({"version": 1, "local": {"max_fix_rounds": 1}}))
-    before, config_before = _tree(repo), config.read_bytes()
+    roots = {"the scratch repository": repo, "the scratch HOME": home, "the scratch TMPDIR": tmp}
+
+    def snapshot() -> dict[str, dict[str, _Entry]]:
+        return {
+            **{name: _tree(root) for name, root in roots.items()},
+            f"the configuration file {config}": {config.name: _entry(config)},
+        }
+
+    before = snapshot()
     for words, status, refusal in _LOCAL_WAYS_IN:
         argv = [
             autoforge,
@@ -647,13 +780,14 @@ def local_refusals(autoforge: str, git: str, work: Path, env: dict[str, str]) ->
             + "\n".join((result.stdout + result.stderr).splitlines()[-20:]),
         )
         if calls.exists():
-            raise CheckFailed(f"`{shlex.join(argv)}` called gh: {calls.read_text('utf-8')!r}")
-        changed = sorted({path for path, _ in set(before.items()) ^ set(_tree(repo).items())})
-        _check(not changed, f"`{shlex.join(argv)}` changed the scratch repository: {changed}")
-        _check(config.read_bytes() == config_before, f"`{shlex.join(argv)}` changed {config}")
+            raise CheckFailed(f"`{shlex.join(argv)}` called {calls.read_text('utf-8')!r}")
+        after = snapshot()
+        for name, entries in before.items():
+            changed = _changes(entries, after[name])
+            _check(not changed, f"`{shlex.join(argv)}` changed {name}: {changed}")
     _say(
         f"ok: LOCAL mode's {len(_LOCAL_WAYS_IN)} ways in met their generic refusals, "
-        "no gh call, nothing written"
+        "no gh or agent CLI called, nothing written"
     )
 
 

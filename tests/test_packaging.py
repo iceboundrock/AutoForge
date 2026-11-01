@@ -522,16 +522,28 @@ _REMOTE_PLAN = (
     [
         ("", None),
         ("gh api user || true", r"called gh: 'api user\\n'"),
-        ("mkdir .autoforge", r"changed the scratch repository: \['\.autoforge'\]"),
-        (": > .git/index.lock", r"changed the scratch repository: \['\.git/index\.lock'\]"),
-        ("echo x >> .git/HEAD", r"changed the scratch repository: \['\.git/HEAD'\]"),
+        ("mkdir .autoforge", r"changed the scratch repository: \[.*'\.autoforge \(created\)'\]"),
+        (": > .git/index.lock", r"repository: \[.*'\.git/index\.lock \(created\)'\]"),
+        ("echo x >> .git/HEAD", r"\['\.git/HEAD \(content, size, mtime, ctime\)'\]"),
+        # The same bytes written over themselves, in place (PR #425 R1-F4).
+        ("head -c 1 .git/HEAD 1<> .git/HEAD", r"\['\.git/HEAD \(mtime, ctime\)'\]"),
         ('echo "{{ISSUE_URL}}"', "unrendered variable"),
+    ],
+    ids=[
+        "clean",
+        "gh-called",
+        "dir-created",
+        "lock-created",
+        "appended",
+        "same-bytes",
+        "unrendered",
     ],
 )
 def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
     tmp_path: Path, then: str, refusal: str | None
 ):
-    """``remote_dry_run`` on a stand-in for the installed command (real git, fake gh)."""
+    """``remote_dry_run`` on a stand-in for the installed command (real git, fake gh):
+    any write shows, the bytes a file already held written over it again included."""
     command = tmp_path / "autoforge"
     command.write_text(f"#!/bin/sh\n{_REMOTE_PLAN}\n{then}\n", encoding="utf-8")
     command.chmod(0o755)
@@ -557,6 +569,17 @@ esac
 """
 
 
+# How a misbehaving stand-in tells an ordinary invocation from its dry run:
+# `step`, `resume` and `unblock --reason looked` without `--dry-run`.
+_ORDINARY = {
+    "step": '[ "$1" = step ] && [ $# -eq 1 ]',
+    "resume": '[ "$1" = resume ] && [ $# -eq 1 ]',
+    "unblock": '[ "$1" = unblock ] && [ $# -eq 3 ]',
+    "run": '[ "$1" = run ]',
+}
+_STATE = ".autoforge/state.json"
+
+
 @pytest.mark.parametrize(
     "first, refusal",
     [
@@ -572,17 +595,77 @@ esac
             r"exited 2, not 2 naming \"unknown key\(s\) under 'the top level': local\"",
         ),
         (
-            '[ "$1" = step ] && mv .autoforge/state.json .autoforge/state.json.corrupt-1',
-            r"step --dry-run` changed the scratch repository: "
-            r"\['\.autoforge/state\.json', '\.autoforge/state\.json\.corrupt-1'\]",
+            f'[ "$1" = step ] && mv {_STATE} {_STATE}.corrupt-1',
+            r"step --dry-run` changed the scratch repository: \['\.autoforge \(.*?\)', "
+            r"'\.autoforge/state\.json \(removed\)', '\.autoforge/state\.json\.corrupt-1 "
+            r"\(created\)'\]",
         ),
         (
             '[ "$1" = unblock ] && echo x >> .autoforge/logs/local-run/run.log',
-            r"changed the scratch repository: \['\.autoforge/logs/local-run/run\.log'\]",
+            r"changed the scratch repository: \['\.autoforge/logs/local-run/run\.log "
+            r"\(content, size, mtime, ctime\)'\]",
         ),
-        ('[ "$1" = resume ] && : > .git/index.lock', r"\['\.git/index\.lock'\]"),
-        ('[ "$1" = status ] && { gh api user || true; }', r"status` called gh: 'api user\\n'"),
-        ('[ "$1" = --config ] && echo "# edited" >> "$2"', r"status` changed .*local-config\.json"),
+        ('[ "$1" = resume ] && : > .git/index.lock', r"'\.git/index\.lock \(created\)'\]"),
+        ('[ "$1" = status ] && { gh api user || true; }', r"status` called 'gh api user\\n'"),
+        (
+            '[ "$1" = --config ] && echo "# edited" >> "$2"',
+            r"status` changed the configuration file .*local-config\.json: "
+            r"\['local-config\.json \(content, size, mtime, ctime\)'\]",
+        ),
+        # PR #425 R1-F3: what only an ordinary invocation does, each of its
+        # dry run refused as it should be. It takes the controller lock, or
+        # launches an agent, before it refuses.
+        (
+            f"{_ORDINARY['step']} && mkdir -p .git/autoforge && echo $$ > "
+            ".git/autoforge/controller.lock",
+            r"`\S*autoforge step` changed the scratch repository: .*"
+            r"'\.git/autoforge/controller\.lock \(created\)'\]",
+        ),
+        (
+            f"{_ORDINARY['step']} && : > .git/autoforge.lock && rm .git/autoforge.lock",
+            r"`\S*autoforge step` changed the scratch repository: \['\.git \(.*?mtime, ctime\)'\]",
+        ),
+        (
+            f"{_ORDINARY['resume']} && {{ claude -p 'review the PR' || true; }}",
+            r"`\S*autoforge resume` called 'claude -p review the PR\\n'",
+        ),
+        (
+            f"{_ORDINARY['unblock']} && {{ opencode run --standalone x || true; }}",
+            r"`\S*autoforge unblock --reason looked` called 'opencode run --standalone x\\n'",
+        ),
+        (
+            f"{_ORDINARY['run']} && {{ pi --mode rpc || true; }}",
+            r"autoforge run --epic \S+ --issue \S+` called 'pi --mode rpc\\n'",
+        ),
+        # PR #425 R1-F4: writes that leave every path and every byte as it was.
+        (
+            f"{_ORDINARY['unblock']} && head -c 1 {_STATE} 1<> {_STATE}",
+            r"unblock --reason looked` changed the scratch repository: "
+            r"\['\.autoforge/state\.json \(mtime, ctime\)'\]",
+        ),
+        (
+            f"{_ORDINARY['run']} && cp -p {_STATE} {_STATE}.new && mv {_STATE}.new {_STATE}",
+            r"changed the scratch repository: \['\.autoforge \(.*?\)', "
+            r"'\.autoforge/state\.json \(inode, ctime\)'\]",
+        ),
+        (
+            f'[ "$1" = step ] && [ "$2" = --dry-run ] && touch -r {_STATE} {_STATE}',
+            r"step --dry-run` changed the scratch repository: "
+            r"\['\.autoforge/state\.json \(ctime\)'\]",
+        ),
+        (
+            '[ "$1" = --config ] && touch -r "$2" "$2"',
+            r"status` changed the configuration file .*: \['local-config\.json \(ctime\)'\]",
+        ),
+        (
+            f'{_ORDINARY["resume"]} && : > "$HOME/.config/autoforge-was-here"',
+            r"resume` changed the scratch HOME: \['\.config \(.*?\)', "
+            r"'\.config/autoforge-was-here \(created\)'\]",
+        ),
+        (
+            f'{_ORDINARY["step"]} && : > "$TMPDIR/x" && rm "$TMPDIR/x"',
+            r"step` changed the scratch TMPDIR: \['\. \(.*?mtime, ctime\)'\]",
+        ),
     ],
     ids=[
         "refused",
@@ -595,17 +678,34 @@ esac
         "git-dir-written",
         "gh-called",
         "config-written",
+        "step-takes-the-lock",
+        "step-takes-and-drops-a-lock",
+        "resume-launches-claude",
+        "unblock-launches-opencode",
+        "run-launches-pi",
+        "state-rewritten-same-bytes",
+        "state-replaced-by-a-copy",
+        "state-times-put-back",
+        "config-times-put-back",
+        "home-written",
+        "tmpdir-used",
     ],
 )
 def test_the_local_refusal_check_holds_every_way_in_to_its_refusal(
     tmp_path: Path, first: str, refusal: str | None
 ):
     """``local_refusals`` (#389) on a stand-in for the installed command
-    (real git, fake gh): it passes a command that answers each of LOCAL
-    mode's ways in with its generic refusal and touches nothing, and fails
-    one that accepts a way in, refuses it for another reason, writes to the
-    state directory, its log or ``.git``, edits the configuration file or
-    calls ``gh``."""
+    (real git, recording fakes of gh and the agent CLIs): it passes a
+    command that answers each of LOCAL mode's ways in with its generic
+    refusal and touches nothing, and fails one that accepts a way in,
+    refuses it for another reason, writes to the state directory, its log
+    or ``.git``, edits the configuration file or calls ``gh``. Also one
+    whose ordinary ``step``, ``resume``, ``unblock`` or ``run`` takes a
+    lock or launches an agent CLI before it refuses, while its dry run
+    behaves (PR #425 R1-F3), and one that writes without changing a byte
+    or a path: a file rewritten in place, replaced by a copy of itself, or
+    with its times put back, a file created and removed in the scratch
+    ``HOME`` or ``TMPDIR`` (R1-F4)."""
     command = tmp_path / "autoforge"
     command.write_text(f"#!/bin/sh\n{first}\n{_LOCAL_ANSWERS}", encoding="utf-8")
     command.chmod(0o755)
@@ -618,10 +718,43 @@ def test_the_local_refusal_check_holds_every_way_in_to_its_refusal(
         dist_check.local_refusals(str(command), git, tmp_path, dist_check._child_env())
 
 
+def test_the_local_refusal_check_runs_in_an_environment_of_its_own(tmp_path: Path, monkeypatch):
+    """PR #425 R1-F3: what reaches the installed command is the isolated
+    environment alone. No credential or provider key of the caller's, its
+    ``HOME`` and ``TMPDIR`` scratch directories, and every executable a
+    regression could reach a service or a model through a recording fake
+    first on ``PATH``."""
+    monkeypatch.setenv("GH_TOKEN", "not-a-real-token-but-must-not-pass")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-a-real-key-but-must-not-pass")
+    seen = tmp_path / "seen.env"
+    command = tmp_path / "autoforge"
+    command.write_text(
+        f'#!/bin/sh\n[ "$1" = local ] && [ $# -eq 1 ] && env > {seen}\n{_LOCAL_ANSWERS}',
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    git = dist_check.shutil.which("git")
+    assert git is not None
+    dist_check.local_refusals(str(command), git, tmp_path, dist_check._child_env())
+    names = {line.split("=", 1)[0] for line in seen.read_text().splitlines() if "=" in line}
+    assert "GH_TOKEN" not in names and "ANTHROPIC_API_KEY" not in names
+    env = dict(line.split("=", 1) for line in seen.read_text().splitlines() if "=" in line)
+    assert env["HOME"] == str(tmp_path / "local-home")
+    assert env["TMPDIR"] == str(tmp_path / "local-tmp")
+    fake_bin = env["PATH"].split(":")[0]
+    assert fake_bin == str(tmp_path / "fake-bin-local")
+    assert sorted(p.name for p in Path(fake_bin).iterdir()) == sorted(
+        dist_check._RECORDED_EXECUTABLES
+    )
+    assert {"gh", "claude", "opencode", "pi"} <= set(dist_check._RECORDED_EXECUTABLES)
+
+
 def test_the_local_refusal_check_covers_each_way_in_adr_0009_names():
     """ADR 0009 D3 to D5: the refusal check covers ``autoforge local``, a
     ``local:`` key and a ``mode: "LOCAL"`` state under each command that
-    loads one; the commands that could launch an agent only as dry runs."""
+    loads one; ``step``, ``resume`` and ``unblock`` both as dry runs and as
+    the ordinary invocations that take the lock and launch, and ``run``
+    over the state (PR #425 R1-F3)."""
     ways = {words: (status, refusal) for words, status, refusal in dist_check._LOCAL_WAYS_IN}
     assert {w for w in ways if w[0] == "local"} >= {("local",), ("local", "doctor")}
     assert ways[("--config", "{config}", "status")][1].endswith("'the top level': local")
@@ -631,8 +764,14 @@ def test_the_local_refusal_check_covers_each_way_in_adr_0009_names():
         "step",
         "resume",
         "unblock",
+        "run",
     }
-    assert all("--dry-run" in w for w in loading if w[0] in ("step", "resume", "unblock"))
+    # Each command that could take the lock and launch, as a dry run and as
+    # the ordinary invocation that would (PR #425 R1-F3), and `run` over it.
+    for command in ("step", "resume", "unblock"):
+        forms = {"--dry-run" in w for w in loading if w[0] == command}
+        assert forms == {True, False}, command
+    assert any(w[0] == "run" and "--dry-run" not in w for w in loading)
     assert {status for status, _ in ways.values()} == {2}
 
 
