@@ -5,6 +5,30 @@ so.
 
 ## Unreleased
 
+### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
+
+`REVIEW` still blocks on a comment carrying the round's review marker that
+the controller did not post, and still never adopts or duplicates it. The
+reason changed:
+
+- it says "nothing was launched" only when no reviewer was launched since
+  the phase was entered. Found after the reviewer returned, it says a
+  reviewer ran, nothing was planned or posted, and names the run log's
+  `control-result.json` that holds the result. Found before a correction
+  or a transient retry, it says the launch before ended without a usable
+  result and names its run-log directory. Found when a run is resumed
+  after an earlier launch of the round, it says that reviewer ran or may
+  have run and where its step directory is, and claims no result;
+- it names another AutoForge controller using the same GitHub login, on
+  another machine or in another clone or state directory, as a possible
+  author, beside a human and an agent;
+- it no longer tells you only to delete the comment. Delete a stray or
+  foreign comment (or its marker), then `unblock`. If the comment is
+  another controller's review, do not delete it and do not `unblock`:
+  stop one of the two runs. Two or more such comments get the same
+  remedies, before the reviewer runs and after it returns, instead of
+  "remove them, then unblock".
+
 ### One troubleshooting guide, indexed by symptom (#260)
 
 [docs/troubleshooting.md](docs/troubleshooting.md) collects what

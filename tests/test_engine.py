@@ -22,7 +22,14 @@ from autoforge.claims import (
     scan,
 )
 from autoforge.config import default_config
-from autoforge.effects import EffectKind, Stage, acceptance_comment_body, compose_append
+from autoforge.effects import (
+    LABEL_AGENT_PUBLISHES,
+    LABEL_CONTROLLER_PUBLISHES,
+    EffectKind,
+    Stage,
+    acceptance_comment_body,
+    compose_append,
+)
 from autoforge.effects import follow_up_issue_body as controller_follow_up_body
 from autoforge.effects import review_comment_body as render_review_comment
 from autoforge.engine import MAX_TRANSIENT_RETRIES, PUSHED_HEAD_WAIT_SECONDS
@@ -2000,8 +2007,79 @@ def test_review_entry_blocks_on_a_round_comment_it_did_not_journal(tmp_state_dir
     assert "that the controller did not post" in s.block_reason
     assert comment_url(PR, 100) in s.block_reason
     assert "never adopts or duplicates one it did not journal (ADR 0004 D9.6)" in s.block_reason
+    # #415: before the launch, nothing was launched, and no result file exists.
+    assert "Nothing was launched or posted." in s.block_reason
+    assert "A reviewer ran" not in s.block_reason and "control-result" not in s.block_reason
+    assert "then 'unblock': the reviewer is launched for this round." in s.block_reason
+    _assert_unjournaled_review_remedies(s.block_reason)
+    assert "ADR 0004 D13.5" not in s.block_reason, "not a legacy re-entry"
     assert s.review_round == 0 and s.effect_records == []
     assert gh.effect_writes == [] and len(gh.comments[PR]) == 1
+
+
+def _assert_unjournaled_review_remedies(reason: str, *, many: bool = False) -> None:
+    """#415: the reason names every possible author, another controller under the
+    same login included, and a remedy for each case; never only 'delete it'.
+    ``many``: the same for the comments a conflict names (two or more, never
+    chosen between, or an unreadable marker)."""
+    if many:
+        assert "The controller cannot tell who posted the comments named (ADR 0004 D9.3)" in reason
+        author = "whose own journaled review one of them then is."
+        assert "never chooses between comments it did not post" in reason
+        assert "Check who posted each comment named." in reason
+        stray = "If each is a stray or foreign comment, delete it or its marker, then"
+        owner = "If one belongs"
+        assert "Remove the comments or their markers" not in reason
+    else:
+        assert "The controller cannot tell who did (ADR 0004 D9.3)" in reason
+        author = "whose own journaled review it then is."
+        assert "Check who posted the comment." in reason
+        stray = "If it is a stray or foreign comment, delete it or its marker, then"
+        owner = "If it belongs"
+    assert (
+        "a human, an agent that still held a credential, or another AutoForge controller "
+        "using the same GitHub login, on another machine or in another clone or state "
+        f"directory, {author}" in reason
+    )
+    assert "never adopts or duplicates one it did not journal (ADR 0004 D9.6)" in reason
+    assert f"{stray} 'unblock'" in reason
+    assert (
+        f"{owner} to another controller's run, do not delete it and do not 'unblock': "
+        "it is that run's review record, its FIX may already be working from it, and after "
+        "an 'unblock' this run can post a competing review. Stop one of the two runs"
+    ) in reason
+    assert reason.endswith("Stop one of the two runs")
+
+
+@pytest.mark.parametrize(
+    ("label", "legacy"),
+    [(LABEL_AGENT_PUBLISHES, True), (LABEL_CONTROLLER_PUBLISHES, False)],
+    ids=["previous-contract", "controller-publishes"],
+)
+def test_review_entry_names_the_previous_contract_only_on_a_legacy_reentry(
+    tmp_state_dir, label, legacy
+):
+    """D13.5: a run upgraded while a reviewer of the previous contract (which
+    posted its own comment) was out re-enters REVIEW with that comment on the
+    PR. The reason says that is the likely author, and still names the others
+    and both remedies (#415); a re-entry of this contract's launch does not.
+    Either way it is a resumed entry: an earlier launch ran or may have run,
+    so the reason never says nothing was launched (R1-F1)."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+    eng = _in_review(tmp_state_dir, gh, ["never"])
+    eng.state.attempt = 1
+    eng.state.launch_label = label
+    assert eng.step().next_phase == "BLOCKED" and eng.provider.calls == []
+    reason = load_state(eng.paths.state_file).block_reason
+    sentence = (
+        "It was most likely posted by a reviewer of the previous contract, which published "
+        "its own comment before this run was upgraded (ADR 0004 D13.5)."
+    )
+    assert (sentence in reason) is legacy
+    assert "An earlier launch of the reviewer for this round (attempt 1) did not" in reason
+    assert "Nothing was launched" not in reason
+    _assert_unjournaled_review_remedies(reason)
 
 
 def test_review_entry_ignores_a_comment_for_the_round_at_another_head(tmp_state_dir):
@@ -2034,6 +2112,12 @@ def test_review_entry_blocks_on_two_comments_for_the_round_without_invoking(tmp_
     assert "2 comments carry the ai-review-result marker for round 1" in reason
     assert comment_url(PR, 100) in reason and comment_url(PR, 101) in reason
     assert "never chooses between comments it did not post" in reason
+    # R1-F2 (#415): one of them may be another controller's journaled review, so
+    # the reason gives both remedies, never only "remove them, then unblock".
+    assert "Nothing was launched or posted." in reason
+    assert "then 'unblock': the reviewer is launched for this round." in reason
+    _assert_unjournaled_review_remedies(reason, many=True)
+    assert "D13.5" not in reason, "not a legacy re-entry"
     assert gh.effect_writes == []
 
 
@@ -2060,6 +2144,83 @@ def test_a_round_comment_posted_during_the_review_blocks_before_the_controller_p
     assert "that the controller did not post" in s.block_reason
     assert comment_url(PR, 101) in s.block_reason
     assert s.effect_records == [] and gh.effect_writes == [] and len(gh.comments[PR]) == 1
+    # #415: a reviewer did run. The reason says so and names the one file that
+    # holds its result; it never says nothing was launched.
+    result_file = eng.paths.logs_dir / s.run_id / "001-review-1" / "control-result.json"
+    assert json.loads(result_file.read_text())["findings"][0]["id"] == "R1-F1"
+    assert (
+        "A reviewer ran for this round and returned a result, which is kept only in the run "
+        f"log, at {result_file}. Nothing was planned or posted, and no round was recorded."
+    ) in s.block_reason
+    assert "Nothing was launched" not in s.block_reason
+    assert (
+        "then 'unblock': the reviewer runs again, and that result is not reused." in s.block_reason
+    )
+    _assert_unjournaled_review_remedies(s.block_reason)
+    assert "ADR 0004 D13.5" not in s.block_reason
+
+
+def test_two_round_comments_posted_during_the_review_block_naming_the_result(tmp_state_dir):
+    """R1-F2 (#415): two comments carrying the round's marker appeared while the
+    reviewer ran. The read after the accepted result never chooses between them
+    and plans nothing; the reason says the reviewer ran, names the run-log file
+    that alone holds its result, and gives both remedies, since one of them may
+    be another controller's journaled review."""
+    gh = FakeGitHub()
+
+    def two_appear(req):
+        gh.add_comment(PR, 101, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+        gh.add_comment(PR, 102, review_comment_body(1, SHA_A, False))
+        return block(review_payload(1, SHA_A, [_finding(1)]))
+
+    eng = _in_review(tmp_state_dir, gh, two_appear)
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 0 and s.open_findings == [] and s.last_review_comment_url == ""
+    assert s.effect_records == [] and gh.effect_writes == [] and len(gh.comments[PR]) == 2
+    reason = s.block_reason
+    assert "2 comments carry the ai-review-result marker for round 1" in reason
+    assert comment_url(PR, 101) in reason and comment_url(PR, 102) in reason
+    result_file = eng.paths.logs_dir / s.run_id / "001-review-1" / "control-result.json"
+    assert json.loads(result_file.read_text())["findings"][0]["id"] == "R1-F1"
+    assert (
+        "A reviewer ran for this round and returned a result, which is kept only in the run "
+        f"log, at {result_file}. Nothing was planned or posted, and no round was recorded."
+    ) in reason
+    assert "Nothing was launched" not in reason
+    assert "then 'unblock': the reviewer runs again, and that result is not reused." in reason
+    _assert_unjournaled_review_remedies(reason, many=True)
+
+
+def test_unblock_after_a_round_comment_posted_during_the_review_runs_the_reviewer_again(
+    tmp_state_dir,
+):
+    """#415: the remedy the reason gives for a stray comment found after the
+    reviewer returned. Nothing was planned, so once the operator deletes the
+    comment, 'unblock' re-enters REVIEW and the next step launches the reviewer
+    again; the result the run log kept is not reused, and the controller posts
+    the round's one comment from the new result."""
+    gh = FakeGitHub()
+    results = iter([[_finding(1)], []])
+
+    def reviews(req):
+        findings = next(results)
+        if findings:
+            gh.add_comment(PR, 101, review_comment_body(1, SHA_A, True, ["R1-F1"]))
+        return block(review_payload(1, SHA_A, findings))
+
+    eng = _in_review(tmp_state_dir, gh, reviews)
+    assert eng.step().next_phase == "BLOCKED"
+    gh.comments[PR] = []  # the operator deletes the stray comment
+    unblocked = eng.unblock("deleted the stray review comment")
+    assert unblocked.unblocked and unblocked.phase == "REVIEW"
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng.provider.calls) == 2
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 1 and s.open_findings == []
+    assert len(gh.comments[PR]) == 1
+    assert s.last_review_comment_url == controller_review_comment(eng, 1).url
 
 
 def _review_body_with_marker(marker_json: str) -> str:
@@ -2168,7 +2329,13 @@ def test_a_malformed_marker_posted_during_the_review_blocks_before_the_controlle
     assert eng.step().next_phase == "BLOCKED"
     s = load_state(eng.paths.state_file)
     assert "cannot establish which comment carries the ai-review-result marker" in s.block_reason
-    assert comment_url(PR, 100) in s.block_reason and "nothing was posted" in s.block_reason
+    assert comment_url(PR, 100) in s.block_reason
+    # #415: the reviewer ran, and the reason says so; a marker it cannot read may
+    # be another controller's (a newer one's), so it gives both remedies.
+    assert "A reviewer ran for this round" in s.block_reason
+    assert "Nothing was planned or posted" in s.block_reason
+    assert "Nothing was launched" not in s.block_reason
+    _assert_unjournaled_review_remedies(s.block_reason, many=True)
     assert s.review_round == 0 and s.last_review_comment_url == ""
     assert s.effect_records == [] and gh.effect_writes == [] and len(gh.comments[PR]) == 1
 
@@ -2189,6 +2356,8 @@ def test_review_entry_blocks_on_a_malformed_marker_without_invoking(tmp_state_di
     reason = load_state(eng.paths.state_file).block_reason
     assert "cannot establish which comment carries the ai-review-result marker" in reason
     assert comment_url(PR, 90) in reason and eng.state.review_round == 0
+    assert "Nothing was launched or posted." in reason
+    _assert_unjournaled_review_remedies(reason, many=True)
 
 
 def test_review_head_changes_during_review_re_reviews(tmp_state_dir):
@@ -5077,6 +5246,91 @@ def test_correction_after_the_reviewer_posted_a_round_comment_blocks(tmp_state_d
     reason = load_state(eng.paths.state_file).block_reason
     assert "that the controller did not post" in reason and "D9.6" in reason
     assert comment_url(PR, 100) in reason and gh.effect_writes == []
+    # R1-F1 (#415): a reviewer was launched before this entry. The reason says
+    # so, names its step directory, and claims no accepted result: there is none.
+    _, step = _step_dir(eng)
+    assert not (step / "control-result.json").exists()
+    assert (
+        "A reviewer was launched for this round (attempt 1) and ended without a usable "
+        f"result: its run log, {step}/, says why. It was not launched again, and nothing was "
+        "planned or posted."
+    ) in reason
+    assert "Nothing was launched" not in reason and "control-result" not in reason
+    assert "then 'unblock': the reviewer is launched again for this round." in reason
+    _assert_unjournaled_review_remedies(reason)
+
+
+def test_a_transient_retry_after_the_reviewer_posted_a_round_comment_blocks(tmp_state_dir):
+    """R1-F1 (#415): the reviewer posted a round comment, then its run failed on
+    an error the adapter retries. The retry is a relaunch, preceded by the entry
+    read: it blocks on the comment, launches nothing more, and says a reviewer
+    was launched and ended without a usable result, never that nothing was."""
+    gh = FakeGitHub()
+    eng = _in_review(tmp_state_dir, gh, [])
+    calls = []
+
+    def posts_then_fails_transiently(req):
+        calls.append(req)
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        return ExecutionResult(req.command, req.cwd, 1, "", WS_CLOSED, "t", "t")
+
+    eng.providers._overrides["opencode"] = OpenCodeProvider(runner=posts_then_fails_transiently)
+    assert eng.step().next_phase == "BLOCKED"
+    assert len(calls) == 1 and len(gh.comments[PR]) == 1 and gh.effect_writes == []
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 0 and s.attempt == 1 and s.effect_records == []
+    _, step = _step_dir(eng)
+    assert not (step / "control-result.json").exists()
+    assert comment_url(PR, 100) in s.block_reason
+    assert (
+        "A reviewer was launched for this round (attempt 1) and ended without a usable "
+        f"result: its run log, {step}/, says why. It was not launched again, and nothing was "
+        "planned or posted."
+    ) in s.block_reason
+    assert "Nothing was launched" not in s.block_reason
+    assert "control-result" not in s.block_reason
+    _assert_unjournaled_review_remedies(s.block_reason)
+
+
+def test_a_resumed_review_entry_says_the_earlier_launch_ran_or_may_have_run(tmp_state_dir):
+    """R1-F1 (#415): the reviewer posted a round comment, then failed, and the
+    step ended with the phase unchanged (attempt 1 saved). The next process's
+    entry finds the comment: the reason says an earlier launch of the round
+    ran or may have run and where its step directory is, claims no result, and
+    never says nothing was launched."""
+    gh = FakeGitHub()
+    eng = _in_review(tmp_state_dir, gh, [])
+
+    def posts_then_fails(req):
+        gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False))
+        return ExecutionResult(req.command, req.cwd, 1, "", "boom", "t", "t")
+
+    eng.providers._overrides["opencode"] = OpenCodeProvider(runner=posts_then_fails)
+    with pytest.raises(ExecutionError, match="State unchanged"):
+        eng.step()
+    assert load_state(eng.paths.state_file).attempt == 1
+    run_dir, step = _step_dir(eng)
+    assert step.name == "001-review-1" and not (step / "control-result.json").exists()
+    eng.close()
+
+    eng2 = make_engine(tmp_state_dir, ["never"], github=gh)
+    eng2.load()
+    assert eng2.step().next_phase == "BLOCKED" and eng2.provider.calls == []
+    s = load_state(eng2.paths.state_file)
+    assert s.review_round == 0 and s.effect_records == [] and gh.effect_writes == []
+    assert comment_url(PR, 100) in s.block_reason
+    assert (
+        "An earlier launch of the reviewer for this round (attempt 1) did not complete it: "
+        "the reviewer ran or may have run, and was interrupted, failed, or returned a result "
+        f"that was not recorded. Its step directory under the run log, {run_dir}/ (the one "
+        "ending in '-review-1'), says which, if the launch got that far. Nothing was planned "
+        "or posted."
+    ) in s.block_reason
+    assert "Nothing was launched" not in s.block_reason
+    assert "control-result" not in s.block_reason
+    assert "then 'unblock': the reviewer is launched again for this round." in s.block_reason
+    assert "D13.5" not in s.block_reason, "this contract's launch, not a legacy one"
+    _assert_unjournaled_review_remedies(s.block_reason)
 
 
 def test_correction_after_the_fix_was_pushed_goes_to_review_without_relaunching(tmp_state_dir):
@@ -10835,18 +11089,21 @@ def test_a_transient_openai_failure_is_relaunched_after_reconciling(
     )
     original_entry = eng._remote_entry
     reconciliations = []
+    relaunches = []
 
-    def counted_entry(previous, plan):
+    def counted_entry(previous, plan, **kwargs):
         reconciliations.append(previous)
-        return original_entry(previous, plan)
+        relaunches.append(kwargs.get("relaunch", False))
+        return original_entry(previous, plan, **kwargs)
 
     eng._remote_entry = counted_entry
     out = eng.step()
 
     assert out.next_phase == "READY_FOR_MERGE"
     assert len(calls) == 3
-    # The step's own entry, then one before each relaunch.
+    # The step's own entry, then one before each relaunch, which it is told is one.
     assert reconciliations == [Phase.REVIEW, Phase.REVIEW, Phase.REVIEW]
+    assert relaunches == [False, True, True]
     run_dir, _ = _step_dir(eng)
     steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
     assert len(steps) == 3
@@ -11012,10 +11269,12 @@ def test_a_claude_turn_a_server_error_ended_is_relaunched_after_reconciling(
     )
     original_entry = eng._remote_entry
     reconciliations = []
+    relaunches = []
 
-    def counted_entry(previous, plan):
+    def counted_entry(previous, plan, **kwargs):
         reconciliations.append(previous)
-        return original_entry(previous, plan)
+        relaunches.append(kwargs.get("relaunch", False))
+        return original_entry(previous, plan, **kwargs)
 
     eng._remote_entry = counted_entry
     out = eng.step()
@@ -11023,6 +11282,7 @@ def test_a_claude_turn_a_server_error_ended_is_relaunched_after_reconciling(
     assert out.next_phase == "READY_FOR_MERGE", out.message
     assert claude_fake.launches(home) == 3
     assert reconciliations == [Phase.REVIEW, Phase.REVIEW, Phase.REVIEW]
+    assert relaunches == [False, True, True]
     run_dir, _ = _step_dir(eng)
     steps = sorted(p for p in run_dir.iterdir() if p.is_dir())
     executions = [json.loads((p / "execution.json").read_text(encoding="utf-8")) for p in steps]
@@ -13365,9 +13625,9 @@ def test_drift_left_by_a_launch_blocks_before_any_relaunch(tmp_state_dir, fake_g
     original_entry = eng._remote_entry
     entries = []
 
-    def counted_entry(previous, plan):
+    def counted_entry(previous, plan, **kwargs):
         entries.append(previous)
-        return original_entry(previous, plan)
+        return original_entry(previous, plan, **kwargs)
 
     eng._remote_entry = counted_entry
     assert eng.step().next_phase == "BLOCKED"

@@ -231,13 +231,51 @@ that text as `\^[`, so the read-back saw another body) needs only
 binds it, with nothing written again
 ([GitHub safety](agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)).
 `REVIEW` blocks on a comment carrying the round's review marker that it did
-not post, whether it was there before the reviewer ran (a human's, or one a
-reviewer of an earlier AutoForge version posted) or appeared while it ran:
-the controller never adopts, edits or duplicates it. Delete the comment or
-its marker, then `unblock`, and the round runs (or, when the reviewer's
-result was already accepted, its comment is posted from the plan without
-running the reviewer again). `FIX` blocks on follow-up issues it did not
-write: two open issues carrying one finding's follow-up marker, or an
+not post, whether it was there before the reviewer ran or appeared while it
+ran: the controller never adopts, edits or duplicates it, whoever wrote it.
+Two or more such comments block the same way and are named together; the
+controller never chooses between them. The reason says what this run did
+before the block:
+
+- found on entering the phase, before any reviewer was launched: nothing
+  was launched or posted;
+- found before a relaunch (the correction of a result the controller could
+  not use, or the retry of a transient failure): a reviewer was launched
+  and ended without a usable result, and the reason names that launch's
+  directory in the run log;
+- found when the run is resumed after a launch of the round that did not
+  complete it (a crash, a kill, a failure, a result that did not verify):
+  that reviewer ran or may have run, and the reason names the run log, in
+  which its step directory (ending in `-review-<attempt>`) says which, if
+  the launch got that far. It claims no result;
+- found after the reviewer returned a result the controller accepted: a
+  reviewer ran, and the reason names the file that holds its result,
+  `control-result.json` in that launch's directory of the run log. Nothing
+  was planned or posted, so that file is the only record of the result.
+
+The controller cannot tell who posted the comment, and the remedy depends
+on it, so check first:
+
+- **A stray or foreign comment** (a human's, an agent's that still held a
+  credential, or one a reviewer of an earlier AutoForge version posted):
+  delete the comment or its marker (every one of them, when the reason
+  names several), then `unblock`, and the round runs. If a reviewer was
+  launched before the block, the reviewer runs again and nothing in the run
+  log is reused.
+- **Another AutoForge controller's run** under the same GitHub login, on
+  another machine or in another clone or state directory: the comment (or
+  one of those named) is that run's own journaled review, and its `FIX` may
+  already be working from it. Do not delete it and do not `unblock`:
+  `unblock` re-binds the PR's HEAD, so once the other run has pushed, this
+  one would post a competing review. Stop one of the two runs.
+
+A comment carrying the marker that appears after the reviewer's result was
+accepted and its comment planned blocks as a conflict instead: once it is
+removed, `unblock` posts the comment from the plan without running the
+reviewer again.
+
+`FIX` blocks on follow-up issues it did not write: two open issues
+carrying one finding's follow-up marker, or an
 unreadable follow-up marker on any open issue (close or repair the extra
 or unreadable issue, then `unblock`); a follow-up issue that appeared or
 disappeared while the fixer ran (if it is the finding's follow-up,

@@ -236,12 +236,30 @@ the upcoming round at the bound HEAD, base and merge base:
 
 - one or more: `BLOCKED` without launching the reviewer, naming the
   comment. The controller journals the round's comment before it posts
-  it, so one it finds with no plan is not its own: a human's, or one a
-  reviewer of the previous contract posted (D13.5). It is never adopted,
-  edited or duplicated (D9.6): adopting it would let any author define the
-  round's findings, and the validated result it would need does not exist.
-  `unblock` does not change that; the operator deletes the comment or its
-  marker, then unblocks, and the round runs.
+  it, so one it finds with no plan is not its own: a human's, one a
+  reviewer of the previous contract posted (D13.5), or the journaled
+  review of another AutoForge controller using the same login, from
+  another machine, clone or state directory, which authorship cannot tell
+  apart from the others (D9.3). It is never adopted, edited or duplicated
+  (D9.6): adopting it would let any author define the round's findings,
+  and the validated result it would need does not exist. `unblock` does
+  not change that. The reason asks the operator to check who posted it
+  (#415): a stray or foreign comment is deleted, or its marker removed,
+  then `unblock` runs the round; another controller's comment is that
+  run's review record, so it is not deleted, this run is not unblocked,
+  and one of the two runs is stopped. Two or more are named together with
+  the same check and remedies: the controller never chooses between them,
+  and one of them may be another controller's. The entry's reason says
+  what came before it, from the persisted attempt counter and whether the
+  read precedes a relaunch: nothing launched on a first entry; before a
+  relaunch (a correction or a transient retry), the launch just before,
+  which ended without a usable result, and its run-log directory; on a
+  resumed entry, an earlier launch of the round that ran or may have run,
+  with no claim of a result. The same read after the reviewer returned
+  (before anything is planned) blocks the same way, on one comment or
+  several; its reason says a reviewer ran and names the run-log
+  `control-result.json` that alone holds its result, never that nothing
+  was launched.
 - a comment for the same round at another HEAD, against another base, or
   from another merge base is not this round's: the round's identity is the
   diff it decided on, and a review posted before the PR was retargeted, or

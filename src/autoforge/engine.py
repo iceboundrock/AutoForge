@@ -4299,7 +4299,7 @@ class ControllerEngine:
 
         try:
             invoked = self._invoke_phase_anchored(
-                previous, lambda: self._remote_entry(previous, plan)
+                previous, lambda: self._remote_entry(previous, plan, relaunch=True)
             )
         except CheckoutDriftError as exc:
             # The operator's checkout moved under the agent (the prompts
@@ -4370,7 +4370,9 @@ class ControllerEngine:
         self._save()
         return self._outcome(previous, plan=plan, result=payload, message=message)
 
-    def _remote_entry(self, previous: Phase, plan: StepPlan) -> StepOutcome | None:
+    def _remote_entry(
+        self, previous: Phase, plan: StepPlan, *, relaunch: bool = False
+    ) -> StepOutcome | None:
         """Reconcile a REMOTE phase entry with GitHub before its agent is launched.
 
         The controller cannot tell a first entry from a re-entry after an
@@ -4390,7 +4392,9 @@ class ControllerEngine:
         returned, and the correction prompt is advice to the agent, not a
         controller check. The probes are pure reads plus the persisted HEAD
         binding; none consumes a review round, a ``review_history`` entry or
-        an attempt.
+        an attempt. ``relaunch`` says which of the two calls this is; only
+        REVIEW's block reason uses it, to say what the launch before did
+        (#415).
         """
         if previous == Phase.ANALYZE_EXECUTE:
             return self._reconcile_analyze_entry(plan)
@@ -4401,7 +4405,7 @@ class ControllerEngine:
             if isinstance(self._require_state().phase_effects().context, ReviewContext):
                 return self._finish_review_entry(plan)
             self._bind_review_head()
-            return self._reconcile_review_entry(plan)
+            return self._reconcile_review_entry(plan, relaunch=relaunch)
         if previous == Phase.FIX:
             return self._prepare_fix(plan)
         if previous == Phase.REPLAN_REEXECUTE:
@@ -9768,22 +9772,34 @@ class ControllerEngine:
         state.current_branch = pr.head_ref or state.current_branch
         self._save()
 
-    def _reconcile_review_entry(self, plan: StepPlan) -> StepOutcome | None:
+    def _reconcile_review_entry(
+        self, plan: StepPlan, *, relaunch: bool = False
+    ) -> StepOutcome | None:
         """Read the PR for this round's comment, and fetch the diff, before the reviewer runs.
 
         The controller posts the round's review comment itself (K4, #162),
         after it has planned and saved it, and the reviewer publishes
         nothing. So a comment carrying the ``ai-review-result`` marker for
         the upcoming round at the bound HEAD, base and merge base, found
-        before any plan was saved, is one the controller did not journal: a
-        human's, an agent's that still held a credential, or one posted by
-        an older version of the controller's reviewer. It is never adopted
-        and never duplicated; the entry blocks naming it (ADR 0004 D9.6,
-        D13.5), and only removing the comment or its marker lets the round
-        be reviewed. Comments for the same round at another HEAD, against
-        another base or from another merge base (an earlier run, a stale
-        re-review, a round posted before the PR was retargeted or before its
-        base was rewritten) are not this round's and are ignored.
+        before any plan was saved, is one this controller did not journal: a
+        human's, an agent's that still held a credential, one posted by an
+        older version of the controller's reviewer, or the journaled review
+        of another AutoForge controller using the same login, from another
+        machine, clone or state directory. Authorship is not proof (D9.3), so
+        the controller cannot tell these apart. It is never adopted and never
+        duplicated; the entry blocks naming it (ADR 0004 D9.6, D13.5), and
+        only removing the comment or its marker lets the round be reviewed.
+        That is the remedy for a stray comment, never for another
+        controller's: the reason tells the operator to check which it is
+        (:meth:`_unjournaled_review_text`), and so does the reason for two or
+        more such comments, which the controller never chooses between. The
+        reason also says what this entry follows: nothing launched yet, the
+        launch just before a relaunch (``relaunch``), or an earlier launch of
+        the round that a resumed entry finds. Comments for the same round at
+        another HEAD, against another base or from another merge base (an
+        earlier run, a stale re-review, a round posted before the PR was
+        retargeted or before its base was rewritten) are not this round's
+        and are ignored.
 
         The reviewer is also told which problems earlier rounds already
         deferred: the open issues carrying this PR's ``ai-follow-up`` marker
@@ -9823,12 +9839,18 @@ class ControllerEngine:
             return self._block(
                 Phase.REVIEW,
                 plan,
-                f"{exc}. The controller posts this round's comment itself and never chooses "
-                "between comments it did not post; nothing was launched. Remove the comments or "
-                "their markers, then 'unblock'",
+                self._unjournaled_review_text(
+                    conflict=str(exc), after_reviewer=False, relaunch=relaunch
+                ),
             )
         if holder is not None:
-            return self._block(Phase.REVIEW, plan, self._unjournaled_review_text(holder.obj.url))
+            return self._block(
+                Phase.REVIEW,
+                plan,
+                self._unjournaled_review_text(
+                    url=holder.obj.url, after_reviewer=False, relaunch=relaunch
+                ),
+            )
         try:
             deferred = self._follow_up_issues(pr_ref).grouped(
                 lambda c: True, f"PR {pr_ref.canonical}"
@@ -9857,24 +9879,138 @@ class ControllerEngine:
         # reviewer's prompt is rendered from, before the reviewer launches.
         return self._require_review_evidence(plan)
 
-    def _unjournaled_review_text(self, url: str) -> str:
-        """Why a round comment the controller did not journal stops the round (D9.6, D13.5)."""
+    def _unjournaled_review_text(
+        self,
+        *,
+        url: str = "",
+        conflict: str = "",
+        after_reviewer: bool,
+        relaunch: bool = False,
+    ) -> str:
+        """Why round comments the controller did not journal stop the round (D9.6, D13.5).
+
+        ``url`` is the one such comment; ``conflict`` the text of the
+        :class:`ClaimConflictError` for two or more of them, which the
+        controller never chooses between, or for a marker it could not read
+        (one a newer controller wrote may be one). Exactly one is given, and
+        the rest of the text says the same for both.
+
+        Two reads find them, and the text says what is true of each (#415).
+        :meth:`_apply_review`'s read (``after_reviewer``) runs after a
+        reviewer returned a result the controller accepted, and before
+        anything is planned. That result is then only in the run log
+        (``control-result.json`` of the launch's step directory), and the
+        reason names the file, since state points to nothing that holds it.
+        The REVIEW entry's read (:meth:`_reconcile_review_entry`) runs before
+        a launch, and what came before it is one of three:
+
+        - nothing: the phase was entered and no reviewer launched since
+          (``state.attempt`` is 0, which every phase change and 'unblock'
+          resets), so nothing was launched or posted;
+        - a relaunch (``relaunch``): the launch just before it, in this
+          step, ended without a usable result (a result that is to be
+          corrected, or a failure that is retried) and its step directory is
+          known; no result of it was accepted;
+        - a resumed entry (``state.attempt`` above 0, not a relaunch): an
+          earlier launch of this round was saved and did not complete it.
+          It may have been interrupted before the reviewer started, or have
+          returned a result that was accepted or not; only its step
+          directory in the run log says which, so the text names where that
+          is and claims no result.
+
+        The controller cannot tell who posted the comment (D9.3). One
+        possible author is another AutoForge controller running under the
+        same login, from another machine, clone or state directory, whose
+        own journaled review this is. Deleting that comment would remove
+        the other run's review record, which its FIX may already be working
+        from. An 'unblock' re-binds HEAD, so once that run pushed, this run
+        would post a competing review (#414). So the remedy depends on the
+        author, and only the operator can tell which applies. D9.6 itself
+        is the same for every author: the comment is never adopted or
+        duplicated.
+        """
+        if bool(url) == bool(conflict):
+            raise StateError("an unjournaled review reason names one comment or one conflict")
         state = self._require_state()
         upcoming = state.review_round + 1
-        legacy = (
-            " It was most likely posted by a reviewer of the previous contract, which "
-            "published its own comment before this run was upgraded (ADR 0004 D13.5)."
-            if is_legacy_reentry(Phase.REVIEW, state.attempt, state.launch_label)
-            else ""
+        attempt = state.attempt
+        if after_reviewer:
+            where = (
+                f"at {self._launch_log / 'control-result.json'}"
+                if self._launch_log is not None
+                else "in this run's log directory"
+            )
+            happened = (
+                f"A reviewer ran for this round and returned a result, which is kept only in "
+                f"the run log, {where}. Nothing was planned or posted, and no round was "
+                "recorded."
+            )
+            rerun = "the reviewer runs again, and that result is not reused"
+        elif relaunch:
+            happened = (
+                f"A reviewer was launched for this round (attempt {attempt}) and ended without "
+                f"a usable result: {self._launch_log_says_why()}. It was not launched again, "
+                "and nothing was planned or posted."
+            )
+            rerun = "the reviewer is launched again for this round"
+        elif attempt:
+            run_log = self.paths.logs_dir / state.run_id
+            happened = (
+                f"An earlier launch of the reviewer for this round (attempt {attempt}) did not "
+                "complete it: the reviewer ran or may have run, and was interrupted, failed, or "
+                "returned a result that was not recorded. Its step directory under the run "
+                f"log, {run_log}/ (the one ending in '-review-{attempt}'), says which, if the "
+                "launch got that far. Nothing was planned or posted."
+            )
+            rerun = "the reviewer is launched again for this round"
+        else:
+            happened = "Nothing was launched or posted."
+            rerun = "the reviewer is launched for this round"
+        legacy = is_legacy_reentry(Phase.REVIEW, attempt, state.launch_label)
+        remedy = (
+            f"If {'it' if url else 'one'} belongs to another controller's run, do not delete it "
+            "and do not 'unblock': it is that run's review record, its FIX may already be "
+            "working from it, and after an 'unblock' this run can post a competing review. Stop "
+            "one of the two runs"
         )
+        if url:
+            return (
+                f"PR {state.current_pr_url} carries a review comment for round {upcoming} at "
+                f"HEAD {state.current_head_sha.lower()[:12]} on base "
+                f"{state.current_base_ref!r} from merge base "
+                f"{state.current_merge_base_sha[:12]} that the controller did not post: {url}."
+                + (
+                    " It was most likely posted by a reviewer of the previous contract, which "
+                    "published its own comment before this run was upgraded (ADR 0004 D13.5)."
+                    if legacy
+                    else ""
+                )
+                + " The controller cannot tell who did (ADR 0004 D9.3): a human, an agent that "
+                "still held a credential, or another AutoForge controller using the same GitHub "
+                "login, on another machine or in another clone or state directory, whose own "
+                "journaled review it then is. The controller posts this round's comment itself "
+                "and journals it before it is sent; it never adopts or duplicates one it did not "
+                "journal (ADR 0004 D9.6), and 'unblock' does not change that. "
+                f"{happened} Check who posted the comment. If it is a stray or foreign comment, "
+                f"delete it or its marker, then 'unblock': {rerun}. {remedy}"
+            )
         return (
-            f"PR {state.current_pr_url} carries a review comment for round {upcoming} at HEAD "
-            f"{state.current_head_sha.lower()[:12]} on base {state.current_base_ref!r} from "
-            f"merge base {state.current_merge_base_sha[:12]} that the controller did not "
-            f"post: {url}.{legacy} The controller posts this round's comment itself and "
-            "journals it before it is sent; it never adopts or duplicates one it did not "
-            "journal (ADR 0004 D9.6), and 'unblock' does not change that. Nothing was "
-            "launched or posted. Delete that comment or its marker, then 'unblock'"
+            f"{conflict}."
+            + (
+                " One of them was most likely posted by a reviewer of the previous contract, "
+                "which published its own comment before this run was upgraded (ADR 0004 D13.5)."
+                if legacy
+                else ""
+            )
+            + " The controller cannot tell who posted the comments named (ADR 0004 D9.3): a "
+            "human, an agent that still held a credential, or another AutoForge controller using "
+            "the same GitHub login, on another machine or in another clone or state directory, "
+            "whose own journaled review one of them then is. The controller posts this round's "
+            "comment itself and journals it before it is sent; it never chooses between comments "
+            "it did not post and never adopts or duplicates one it did not journal (ADR 0004 "
+            f"D9.6), and 'unblock' does not change that. {happened} Check who posted each "
+            "comment named. If each is a stray or foreign comment, delete it or its marker, then "
+            f"'unblock': {rerun}. {remedy}"
         )
 
     def _prepare_fix(self, plan: StepPlan) -> StepOutcome | None:
@@ -12817,7 +12953,10 @@ class ControllerEngine:
         HEAD, and its comment renders within the limit and the policy. A
         precondition read then finds no comment carrying the round's marker
         at the bound revision; one would be a comment the controller did not
-        journal, and blocks with nothing planned or posted (ADR 0004 D9.6).
+        journal, and blocks with nothing planned or posted (ADR 0004 D9.6);
+        two or more block the same way, and the controller never chooses
+        between them. The reviewer did run, so either reason names the
+        run-log file that holds its result, the one place it is kept (#415).
         The comment (K4) is planned and saved with the completion context
         (the round's verdict and findings) in one save, and
         :meth:`_complete_review` does the rest from what was saved, as a
@@ -12851,13 +12990,13 @@ class ControllerEngine:
                 "GitHub failure; nothing was posted. Fix the cause, then 'unblock'"
             )
         except ClaimConflictError as exc:
-            return Phase.BLOCKED, (
-                f"{exc}. The controller posts this round's comment itself and never chooses "
-                "between comments it did not post; nothing was posted. Remove the comments "
-                "or their markers, then 'unblock'"
+            return Phase.BLOCKED, self._unjournaled_review_text(
+                conflict=str(exc), after_reviewer=True
             )
         if holder is not None:
-            return Phase.BLOCKED, self._unjournaled_review_text(holder.obj.url)
+            return Phase.BLOCKED, self._unjournaled_review_text(
+                url=holder.obj.url, after_reviewer=True
+            )
         canonical = pr_ref.canonical
         marker = render_review_marker(
             res.round, head, base, merge_base, res.needs_fix_round, [f.id for f in res.findings]
