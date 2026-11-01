@@ -8,10 +8,13 @@ reaches a backend; the scripted provider records what the engine asked for.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
 
+import autoforge.engine as engine_module
 from autoforge.cli import _render_outer_sandbox
 from autoforge.config import default_config
 from autoforge.errors import ConfigurationError, SandboxCapabilityError, SandboxLaunchRefusedError
@@ -19,6 +22,9 @@ from autoforge.sandbox_bwrap import Capability
 from autoforge.state import load_state
 from autoforge.transitions import Phase
 from tests.conftest import implement, make_engine
+
+# The real probe, taken before the conftest's stand-in replaces it for each test.
+REAL_PROBE_SANDBOX = engine_module.probe_sandbox
 
 
 def _cfg(mode: str):
@@ -72,6 +78,34 @@ def test_a_remote_step_on_an_incapable_host_is_refused_with_state_unchanged(
     if mode == "preferred":
         assert "REMOTE run treats as required" in message
     # Byte-identical: no attempt saved, no step charged, no run-log step, no launch.
+    assert _snapshot(eng) == before
+    assert eng.provider.calls == []
+    assert fake_github.effect_writes == []
+    assert load_state(eng.paths.state_file).phase is Phase.ANALYZE_EXECUTE
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the backend is Linux-only")
+@pytest.mark.parametrize("mode", ["required", "preferred"])
+def test_a_python_without_memfd_create_is_refused_by_the_real_probe_with_state_unchanged(
+    tmp_state_dir, fake_github, monkeypatch, mode
+):
+    """PR #425 R1-F2 (#389): on a Python built without ``os.memfd_create``
+    (uv's CPython 3.12.13 build), the real probe, not a stand-in, refuses
+    the step before anything of it is saved or launched, naming the
+    interpreter as what the host cannot provide, where it used to raise
+    ``AttributeError`` from inside the launch. Holds on every interpreter:
+    the call is removed for the test."""
+    monkeypatch.setattr(engine_module, "probe_sandbox", REAL_PROBE_SANDBOX)
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, cfg=_cfg(mode), origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    before = _snapshot(eng)
+    with pytest.raises(SandboxCapabilityError) as caught:
+        eng.step()
+    assert caught.value.capability == "interpreter"
+    message = str(caught.value)
+    assert "cannot provide a Python with os.memfd_create" in message
+    assert "has no os.memfd_create" in message and "sandbox.mode: disabled" in message
     assert _snapshot(eng) == before
     assert eng.provider.calls == []
     assert fake_github.effect_writes == []

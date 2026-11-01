@@ -6,6 +6,11 @@ test-sandbox-measured``, which the ``sandbox`` job of
 ``.github/workflows/ci.yml`` runs) records
 
 - the platform, the kernel and the distribution;
+- the Python running the measurement, and whether it has ``os.memfd_create``,
+  the memory file through which the backend hands ``bwrap`` a launch's
+  options: a Python built without it cannot launch at all (uv's CPython
+  3.12.13 build has none, #389), so the real-backend tests run by that
+  Python skip under ``auto`` rather than fail;
 - which ``bwrap`` is on ``PATH``, its version, and whether it can mount an
   overlay (``--overlay``, bubblewrap 0.11 or later), which the backend needs;
 - the user-namespace policy: the sysctls that restrict unprivileged user
@@ -88,6 +93,10 @@ class HostReport:
     landlock_abi: int
     # "" when the kernel gave an ABI, else what it answered instead.
     landlock_error: str = ""
+    # The Python that measured (version and executable), and whether it has
+    # os.memfd_create.
+    python: str = ""
+    memfd: bool = True
 
     @property
     def missing(self) -> list[str]:
@@ -95,6 +104,8 @@ class HostReport:
         if not self.platform.startswith("linux"):
             return ["a Linux kernel"]
         found: list[str] = []
+        if not self.memfd:
+            found.append(f"a Python with os.memfd_create (this one, {self.python}, has none)")
         if not self.bwrap:
             found.append("bwrap on PATH")
         else:
@@ -143,6 +154,7 @@ class HostReport:
             namespaces = "granted"
         return [
             ("platform", f"{self.platform}, kernel {self.kernel}, {self.distribution}"),
+            ("Python", f"{self.python}, os.memfd_create {'yes' if self.memfd else 'no'}"),
             ("bwrap", bwrap),
             *((f"sysctl {name.replace('/', '.')}", value) for name, value in self.sysctls),
             ("unprivileged bwrap: user, PID and IPC namespaces, new procfs", namespaces),
@@ -279,6 +291,8 @@ def measure() -> HostReport:
         namespaces=namespaces,
         landlock_abi=abi,
         landlock_error=refusal,
+        python=f"{platform.python_version()} at {sys.executable}",
+        memfd=getattr(os, "memfd_create", None) is not None,
     )
 
 

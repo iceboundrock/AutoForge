@@ -5,6 +5,23 @@ so.
 
 ## Unreleased
 
+### A Python without `os.memfd_create` cannot enforce the outer sandbox, and says so (#389)
+
+On a Python built without `os.memfd_create` (uv's CPython 3.12.13 build
+is one), every sandboxed launch raised `AttributeError`, and so did
+`autoforge doctor`, which exited without its report. Such a Python cannot
+hand `bwrap` a launch's options, so it now cannot enforce:
+
+- `doctor`'s capability row says `unsupported: this host cannot provide a
+  Python with os.memfd_create, ...`, naming the interpreter, and the mode
+  row says what the configured mode does about it;
+- under `sandbox.mode: required` (or `preferred`), a step that launches is
+  refused before anything of it is saved or launched, as on any host that
+  cannot enforce;
+- the default, `disabled`, is unaffected.
+
+Use another build of the interpreter to enforce the outer sandbox.
+
 ### A sequential run's next issue must be a sub-issue of the EPIC (#287)
 
 **Behaviour change:** `UPDATE_EPIC` switches only to a native sub-issue of

@@ -8,10 +8,12 @@ temporary repository; nothing reaches GitHub.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
 
+import autoforge.engine as engine_module
 from autoforge import cli, doctor_sandbox
 from autoforge.config import default_config
 from autoforge.doctor import Doctor
@@ -23,6 +25,8 @@ from autoforge.sandbox_policy import AuthItem, AuthMode, ProviderRequirements, p
 from tests.conftest import git_out, git_repo
 
 SECRET = "sk-ant-doctor-test-value-0123456789"
+# The real probe, taken before the conftest's stand-in replaces it for each test.
+REAL_PROBE_SANDBOX = engine_module.probe_sandbox
 
 
 class Runner:
@@ -342,6 +346,30 @@ def test_an_unsupported_capability_is_named_for_a_remote_run(
     providers = [r for n, r in rows.items() if n.startswith("provider")]
     assert len(providers) == 2
     assert all("the declaration compiles" in r.detail for r in providers)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the backend is Linux-only")
+def test_a_python_without_memfd_create_is_reported_not_raised(tmp_path, host, monkeypatch):
+    """PR #425 R1-F2 (#389): on a Python built without ``os.memfd_create``
+    (uv's CPython 3.12.13 build), ``doctor``'s real probe used to raise
+    ``AttributeError`` and ``doctor`` exited without its report. It reports
+    instead: the capability row names the interpreter as what this host
+    cannot provide, the mode row says ``required`` refuses every step that
+    launches, and no sandboxed launch is attempted. Holds on every
+    interpreter: the call is removed for the test."""
+    monkeypatch.setattr(engine_module, "probe_sandbox", REAL_PROBE_SANDBOX)
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    repo = git_repo(tmp_path / "repo")
+    runner = Runner()
+    rows = _rows(_remote_doctor(repo, host, monkeypatch, runner=runner).sandbox_checks())
+    capability = rows["capability (one minimal sandboxed launch)"]
+    assert capability.label == "WARN"
+    assert "cannot provide a Python with os.memfd_create" in capability.detail
+    assert "has no os.memfd_create" in capability.detail
+    mode = rows["mode (required)"]
+    assert mode.label == "FAIL" and "a Python with os.memfd_create" in mode.detail
+    assert "sandbox.mode: disabled" in mode.detail
+    assert runner.sandboxed == []
 
 
 def test_a_dir_rw_login_the_policy_refuses_is_named_with_the_alternatives_in_remote(
