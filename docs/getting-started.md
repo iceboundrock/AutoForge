@@ -453,14 +453,13 @@ autoforge --config autoforge.yaml resume
 
 `unblock` re-reads GitHub and re-enters the one phase that supports, or
 refuses and stays `BLOCKED`. What each block means and how to leave it is
-in [Running the remote workflow: BLOCKED](usage.md#blocked-fix-the-cause-then-unblock)
-and [Troubleshooting and recovery](usage.md#troubleshooting-and-recovery).
+in [Troubleshooting and recovery](troubleshooting.md#blocked-the-controller-will-not-decide-alone).
 
 ## 7. Common first-run failures
 
 The messages below are AutoForge's own, as it prints them; `<...>` stands
 for your values. They cover everything up to a run that exists; once a run
-has a phase, see [Troubleshooting and recovery](usage.md#troubleshooting-and-recovery).
+has a phase, see [Troubleshooting and recovery](troubleshooting.md).
 
 **`autoforge: command not found`.** `uv`'s tool directory is not on `PATH`:
 `uv tool update-shell`, then a new shell ([step 2](#2-install-autoforge)).
@@ -491,7 +490,7 @@ has a phase, see [Troubleshooting and recovery](usage.md#troubleshooting-and-rec
 | `[FAIL] gh authenticated: You are not logged into any GitHub hosts. To log in, run: gh auth login` | `gh auth login` |
 | ``autoforge: error: `gh repo view <repo> --json nameWithOwner,defaultBranchRef` failed (exit 1): HTTP 401: Requires authentication ...`` | `run` was started before `gh auth login`. The run exists, at `INITIALIZING`: sign in, then `autoforge resume` |
 | `[FAIL] agent 'claude' available (analyze_execute, fix): ExecutionError: executable not found: claude (...)` | install Claude Code, or move those profiles to a CLI you have; `opencode` the same way |
-| a step fails at its first agent launch: the run prints the failure, then `State unchanged.`, the step's `logs:` directory and the `resume:` command | the agent CLI refused the launch, for example a model your account cannot use or a CLI not signed in. The CLI's own message is in that `logs:` directory. Sign in, or fix the model in `autoforge.yaml` (`resume` then asks for `--accept-config-change`: [The configuration a run was recorded under](usage.md#the-configuration-a-run-was-recorded-under)), then `resume` |
+| a step fails at its first agent launch: the run prints the failure, then `State unchanged.`, the step's `logs:` directory and the `resume:` command | the agent CLI refused the launch, for example a model your account cannot use or a CLI not signed in. The CLI's own message is in that `logs:` directory. Sign in, or fix the model in `autoforge.yaml` (`resume` then asks for `--accept-config-change`: [The configuration a run was recorded under](usage.md#the-configuration-a-run-was-recorded-under)), then `resume` ([Provider errors](troubleshooting.md#provider-authentication-model-and-api-errors)) |
 
 **An implementer that cannot commit.** Without a git identity
 ([step 1](#1-prerequisites)), git refuses the implementer's commit and the
