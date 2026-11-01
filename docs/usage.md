@@ -3,7 +3,8 @@
 How to drive an EPIC and its issues through AutoForge's GitHub workflow:
 the commands, where a run stops and what to do there, and how to recover.
 For the config file see [Configuration](configuration.md). Installation and
-prerequisites are in the [README](../README.md#prerequisites).
+prerequisites are in the [README](../README.md#prerequisites); a stopped or
+failed run, by symptom, in [Troubleshooting and recovery](troubleshooting.md).
 
 The commands are written `uv run autoforge ...`, the form inside a
 development clone of AutoForge. With the command installed
@@ -77,7 +78,7 @@ uv run autoforge unblock --decline-action X-0123456789abcdef \
 Pass a config file with the global option, before the subcommand:
 `uv run autoforge --config autoforge.yaml run ...`. `run --force` discards an
 existing non-terminal run (an unreadable state file is moved aside rather
-than deleted; see [Troubleshooting](#troubleshooting-and-recovery)).
+than deleted; see [Troubleshooting: the state file](troubleshooting.md#the-state-file)).
 `--full-prompt` prints the whole rendered prompt in a dry run.
 
 To run several issues of an EPIC at once, see
@@ -748,7 +749,7 @@ set by execution.default_idle_timeout_seconds`, or `... reached its 7200s
 maximum runtime and was killed. The limit is set by
 profiles.analyze_execute.max_runtime_seconds`. The state is unchanged,
 nothing is retried automatically, the error says where to look and how to
-resume ([Troubleshooting](#troubleshooting-and-recovery)), and the step's
+resume ([Troubleshooting](troubleshooting.md#state-unchanged-an-agent-launch-failed)), and the step's
 `execution.json` records `timeout_limit` (`idle` or `max_runtime`), both
 configured values and `last_activity_at`: when the executor last saw
 output on the agent's stdout or stderr before it decided to end the run.
@@ -918,7 +919,7 @@ the step's `execution.json` records it (`loop`, `loop_warnings`).
   exactly as on a timeout: its whole process group is ended, the state is
   unchanged and nothing is retried automatically. The error names the
   pattern, followed by where to look and how to resume
-  ([Troubleshooting](#troubleshooting-and-recovery)):
+  ([Troubleshooting](troubleshooting.md#an-agent-was-killed-idle-timeout-maximum-runtime-loop)):
 
   ```text
   agent 'fix' was killed: the same 2-step action cycle (Bash, Read) repeated 8 times over 9m14s with no new action
@@ -1140,232 +1141,13 @@ ownership or discard uncommitted user changes.
 
 ## Troubleshooting and recovery
 
-- **The process was interrupted** (`Ctrl-C`, a killed process, a reboot):
-  run `autoforge resume`. State is written atomically, and every phase that
-  launches an agent reads its journal and GitHub first, so work already
-  done (an open PR, a review comment the controller posted, a pushed fix)
-  is adopted or completed rather than repeated. See
-  [Workflow: re-entering a phase](agent-guides/workflow.md#re-entering-a-phase).
-- **An agent failed, timed out or returned a malformed result:** a malformed
-  `CONTROL_RESULT` from an agent that exited 0 is retried with a correction
-  prompt (`execution.max_correction_attempts`, default once). The controller
-  reads the block only from the end of the agent's final reply, never from
-  a command's output or a file, and the correction prompt quotes the end of
-  the refused reply (its last 4,000 characters, redacted, fenced as
-  untrusted data) after the controller's diagnosis, so the new session can
-  see what the previous one said it had done; it still checks that against
-  the worktree. The correction's `request.json` records the quote's sizes
-  (`metadata.correction_reply`), its `prompt.md` the quote as sent. A
-  `resume` after a crash or a spent correction budget quotes nothing. No
-  correction is launched when the refused launch may have left a process
-  running: then the error says so
-  (`Not re-invoked: a process the launch started may still be running`,
-  followed by which one); stop it before `resume`. The one failed
-  exit relaunched automatically is a launch its adapter reports as transient
-  (today an OpenCode `openai/*` run whose errors are all `WebSocket closed
-  with code 1000`, `WebSocket closed with code 1008` or OpenAI's generic
-  `server_error: An error occurred while processing your request. ...`,
-  even when the session recovered from it and printed a result: OpenCode
-  exits 1 once it has printed one, and a result from a failed exit is not
-  read; and a Claude Code `stream-json` run whose turn ended on a model API
-  error with status 408 or 5xx once the CLI's own retries were spent, 529
-  overloaded among them, but never another 4xx such as a 429): a REMOTE run
-  relaunches it at most twice per step, after
-  re-reading GitHub, and when it stops the error says why ("not relaunched:
-  ..."). Any other non-zero exit, a timeout or a verification failure is not
-  retried automatically and leaves the phase unchanged for `resume`. Inspect
-  each invocation under `<state dir>/logs/<run-id>/`; a transient failure's
-  `error.txt` says `(transient: ...)`. A timeout says which limit fired and
-  the key that set it; see [Reading an idle timeout](#reading-an-idle-timeout)
-  before raising one.
-
-  Every agent failure that leaves the phase unchanged (a timeout or loop
-  kill, a failed exit or provider failure, an agent that could not be
-  started, a malformed result that is not corrected) ends the same way:
-
-  ```text
-  autoforge: error: agent 'analyze_execute' made no progress for 1800s (last activity 08:31:02 UTC) and was killed. The limit is set by profiles.analyze_execute.idle_timeout_seconds
-  State unchanged.
-    worktree:  /home/me/code/.worktree/159   (3 uncommitted paths)
-    logs:      .autoforge/AutoForge-issue-159/logs/af-20261006T101500Z-3f2a9c/001-analyze_execute-1/
-    resume:    autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 resume
-  Inspect the real Git/GitHub state first; 'resume --dry-run --max-steps 1' with the same flags shows the profile, limits and worktree it will use.
-  ```
-
-  - `worktree` is the issue's agent worktree, with the number of paths
-    `git status` reports there as changed or untracked: what the attempt
-    left behind. The count is left out when that read fails. AutoForge
-    leaves those changes where they are, and the next launch of a phase
-    that writes (`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`) is told
-    about them: its prompt names the worktree's branch and `HEAD` and lists
-    each change's status code and path (at most 50, never file content),
-    and asks the agent to inspect them and then continue from them or
-    discard them deliberately, saying which. The invocation's
-    `request.json` records what was found (`metadata.worktree_state`), or
-    why the read failed, in which case the prompt describes nothing.
-  - `logs` is the failed launch's step directory (its progress, output and
-    error).
-  - `resume` repeats the `--config` and `--state-dir` this command was
-    started with, as you typed them; run it from the same directory. The
-    CLI does not look for a configuration file, so a bare `resume` after a
-    run started with them finds no run (no `--state-dir`) or would run on
-    the built-in defaults (no `--config`): another model, other limits and
-    another worktree. A REMOTE run refuses that: see
-    [the configuration a run was recorded under](#the-configuration-a-run-was-recorded-under).
-- **"the agent asked for permission (...)" or "an answer to a question"**
-  in a failure: see
-  [An agent asked for permission or input](#an-agent-asked-for-permission-or-input).
-- **"run ... was recorded under ..., and this command's configuration
-  differs from it"** (exit 2): see
-  [the configuration a run was recorded under](#the-configuration-a-run-was-recorded-under).
-- **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
-  `autoforge unblock --reason "..."` and `autoforge resume` (see above),
-  with the `--config` / `--state-dir` the run was started with; `unblock`
-  prints that `resume` command. A run blocked because the checkout the
-  controller is run from moved (an agent committed, reset or switched
-  branches) ends with where to look and what to run, already carrying
-  those flags:
-
-  ```text
-    checkout:  /home/me/code/AutoForge
-    unblock:   autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 unblock --reason '<what you found>'
-    resume:    autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 resume
-  Inspect the checkout and the agent's GitHub work first: 'unblock' re-inspects GitHub and re-enters a phase, and only then does 'resume' continue the run.
-  ```
-
-- **"refusing to launch: a process AutoForge launches would be handed a
-  GitHub or git credential":** the message names the setting (for example
-  a credential helper in the repository's git configuration, a remote URL
-  with a token, a GitHub entry in `~/.netrc`, or the startup files of a
-  login shell that change a variable such as `GH_TOKEN`). Nothing was recorded:
-  remove the setting (`autoforge doctor` lists it too) and run the same
-  command again. A config that fails to load because `env_allowlist` names
-  a variable `gh` or git reads a credential from: delete that entry
-  ([Configuration: agent environment](configuration.md#agent-environment)).
-- **"refusing to launch opencode: it would load the configuration of an
-  organization connected to it":** OpenCode would load an organization's
-  configuration, which may name an MCP server with a GitHub credential of
-  its own, and nothing turns it off. Nothing was recorded: give AutoForge's
-  OpenCode launches a database of their own (`OPENCODE_DB`, see
-  [Configuration: agent environment](configuration.md#agent-environment))
-  and run the same command again.
-- **"this host cannot enforce the outer sandbox: it cannot provide ..."**
-  (`SandboxCapabilityError`, exit 2; `sandbox.mode: required` or
-  `preferred`): the pre-launch gate refused the step. Nothing was launched,
-  saved or charged. `autoforge doctor` shows the same capability row; make
-  the host capable (install `bwrap`, allow unprivileged user namespaces, a
-  kernel with Landlock ABI 6 that booted with Landlock enabled; the row's
-  reason says which of the two a kernel lacks, see
-  [Compatibility](compatibility.md#outer-sandbox)), or set
-  `sandbox.mode: disabled` (logical isolation only), and run the same
-  command again.
-- **"the configuration file ... lies in ..., a tree that launches inside
-  the outer sandbox write"** (exit 2; also "is reached through ...", "has
-  N hard links" or "opens another file than its lookup walk was followed
-  to"; "the sandbox declaration of profile ... cannot be read" when a
-  provider's declaration could not be asked): under `required` or
-  `preferred` the `--config` file is where an enforced launch could
-  rewrite it, or is not shown not to be (#280). Nothing was run, launched or
-  written. "Is reached through" names a directory of such a tree the path
-  looks a name up in: a symbolic link leads there, or the path passes
-  through it before a `..`, which is followed as the command opens it,
-  never tidied. When the directory is a provider's (the message names
-  `$CLAUDE_CONFIG_DIR`, `$PI_CODING_AGENT_DIR` or `$OPENCODE_DB` and the
-  profiles whose launches write it), every enforced launch of that
-  provider writes it, wherever it lies. Move the file outside the
-  checkout, every worktree of the repository and every such directory,
-  for example to `~/.config/autoforge/`, and pass its own path; or give
-  the provider another directory; or set `sandbox.mode: disabled`.
-  `doctor` reports the same in its config row and runs none of the
-  commands the file names.
-- **"run ... is pinned to sandbox.mode ..., and this command's
-  sandbox.mode, ..., contains its launches less"** (exit 2): the command
-  runs under a weaker mode than the run was created under, often because
-  it was run without the run's `--config`. Nothing was written. Run it with
-  a configuration that sets the pinned mode, or repeat it with
-  `--accept-config-change` to continue under the weaker one (recorded in
-  the run log).
-- **"sandbox.read_only_paths[N] ... overlaps ..., which no launch may see":**
-  an operator read-only path names, contains or lies inside the state
-  directory, the lock, `<git common dir>/autoforge`, another worktree or
-  your checkout. Nothing was launched; narrow or remove the entry.
-- **"the sandbox cannot be established ..."** (`SandboxLaunchRefusedError`,
-  the sandbox enforced): the launch did not run, and nothing ran
-  without the sandbox. The message names the cause: a backend that failed
-  to set the sandbox up after the gate passed, a sandbox directory that is a link, or a path and the
-  policy rule it breaks ("sandbox policy refuses <path>: <rule>"), such as
-  a `CLAUDE_CONFIG_DIR`, `OPENCODE_DB` directory or `PI_CODING_AGENT_DIR`
-  inside the provider's own configuration directory
-  ([Configuration: provider credentials](configuration.md#provider-credentials-under-required)).
-  For an agent the phase is unchanged: fix the cause, or set
-  `sandbox.mode: disabled`, and `resume`. A refused validation command
-  leaves the phase unverified; a refused pre-merge command blocks the merge
-  like a failing one. "the agent was not launched: the strict import ...
-  failed" is the same refusal, in either mode, for objects an earlier
-  enforced launch left in the issue's private object directory that the
-  controller cannot import; inspect the directory before resuming.
-- **"the agent worktree ... is not bound to the repository":** the
-  worktree's `.git` file and the repository's worktree registry disagree
-  (the worktree or the repository was moved, or something rewrote the
-  pointer). The controller reads a worktree only through the registry entry
-  that names it, so nothing was launched. Run `git worktree repair` in the
-  repository (or `git worktree repair <worktree>`), then `resume`.
-- **`BLOCKED`: "the private object directory ... has been tampered with":**
-  an `info/alternates` file, a link or another entry no object store holds
-  appeared in `<repo>/.git/autoforge/sandbox/<n>/objects`, or that
-  directory, or one above it up to `<repo>/.git`, is not a real directory
-  (a link, say) or cannot be checked. Nothing was read
-  from it and nothing was published. Inspect it, remove what does not
-  belong there, then `unblock` and `resume`. To look at an agent's commits
-  while they are still only in that directory, read them through it
-  without writing anything:
-  `GIT_ALTERNATE_OBJECT_DIRECTORIES='"<repo>/.git/autoforge/sandbox/<n>/objects"' git -C <worktree> log`.
-  The inner double quotes keep git from splitting a path that contains a
-  `:`; inside them, write a `"` or a `\` of the path as `\"` or `\\`. The
-  outer single quotes are the shell's, and end at a `'`: write a `'` of the
-  path as `'\''` (close the quotes, an escaped `'`, reopen them), after
-  git's escapes.
-- **Merge verification keeps saying "inconclusive":** checks still running,
-  mergeability unknown or a transient GitHub failure; re-run
-  `autoforge resume --allow-merge`. After `merge.max_verification_attempts`
-  attempts the run is `BLOCKED`.
-- **The state file is unreadable:** `run`, `resume`, `step` and `status`
-  exit 2 and never overwrite it. `run --force` moves it aside as
-  `state.json.corrupt-<timestamp>` (never deletes it) and starts a new run;
-  see [State and recovery](agent-guides/state-and-recovery.md#persistent-state).
-  A file refused for its protocol label alone is not this entry's: see
-  the next one.
-- **"unsupported protocol_version '14' (controller speaks '13'): a newer
-  AutoForge wrote it"** or **"... no AutoForge protocol has that label"**
-  (exit 2), followed by an `AutoForge controller/state protocol mismatch`
-  block: the command imported a controller older than the one that wrote
-  the run, or the label is none a controller writes. The state file and
-  its run logs were not rewritten. See
-  [A run a newer controller wrote](#a-run-a-newer-controller-wrote).
-- **`LockError`:** another controller holds the repository lock (a
-  standalone command, or a parallel EPIC scheduler or one of its surviving
-  workers), or a lock entry under `.git/autoforge/` is not a regular file
-  with a single name; see
-  [State and recovery: locking](agent-guides/state-and-recovery.md#locking).
-- **A replan was interrupted:** the phase is still `REPLAN_REEXECUTE`.
-  `autoforge status` prints the transaction id, stage and both PRs, and
-  `resume` continues the transaction from its persisted stage. Once the
-  replacement's push and PR are journaled, `resume` completes them without
-  running the agent again; before that it runs the agent again on the same
-  base. A transient GitHub failure inside the transaction leaves it
-  resumable the same way.
-- **The run is `BLOCKED` with a replan transaction on record** (a rejected
-  replacement or source, or a journal the controller could not read): this
-  run is over. `resume` exits 1 as for any `BLOCKED` run, `unblock` refuses
-  while the journal exists, and repairing the replacement PR does not reopen
-  a rejection. `autoforge status` shows the block reason and the journal's
-  stage and both PRs; a rejection's reason also says what the transaction
-  did to the source PR. Inspect those PRs on GitHub and decide by hand
-  which one, if either, carries the issue forward. To continue, start a new
-  run; it replaces `state.json`, journal included, so read `status` first.
-  Its `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
-  `ai-implementation` marker and blocks on two, so close the PR you do not
-  keep. See [Replan transaction](agent-guides/replan-transaction.md).
+What to do when a run stops, fails or refuses, indexed by what you see, is
+in [Troubleshooting and recovery](troubleshooting.md): `BLOCKED`, `FAILED`
+and "State unchanged", agent failures and kills, provider errors, an
+interrupted process, `resume` versus `unblock`, stopping a run safely, lock
+contention, what a change on GitHub does to a run, the exit codes, and the
+recovery scenarios with the tests that hold them. The sections below are
+the reference it links to for four mechanisms.
 
 ### A run a newer controller wrote
 

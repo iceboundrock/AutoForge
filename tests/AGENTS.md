@@ -419,6 +419,9 @@ launch environment, no credential     test_child_env.py (engine and doctor: test
                                       test_doctor.py)
 agent read context                    test_read_context.py (collection: test_engine.py,
                                       test_integration.py)
+troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
+                                      a test that exists; the guide's links and the links
+                                      into it resolve)
 ```
 
 Add a new test next to the behaviour's existing file; create a new file only
