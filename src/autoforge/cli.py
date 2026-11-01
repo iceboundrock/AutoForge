@@ -87,6 +87,7 @@ from .errors import (
     InteractionDataError,
     LockError,
     StateError,
+    StateProtocolError,
     StateTransitionError,
 )
 from .evidence import (
@@ -113,6 +114,7 @@ from .interaction import (
 )
 from .locking import ControllerLock, repository_lock_path
 from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
+from .provenance import ControllerIdentity, mismatch_lines, protocol_ranges, refusal_headline
 from .redaction import redact, redact_argv, redact_dict, redact_obj
 from .replan_txn import ReplanTransaction
 from .run_namespace import namespace_issue_of_state_dir
@@ -121,7 +123,7 @@ from .sandbox_policy import absolute_spelling
 from .scheduler import EpicScheduler, SchedulerInputs
 from .scheduler_stop import StopMode
 from .sdk_policy import MAX_ANSWER_CHARS
-from .state import AutoForgeState
+from .state import SUPPORTED_PROTOCOLS, AutoForgeState
 from .transitions import TERMINAL_PHASES, Phase
 from .validation import parse_issue_url
 
@@ -494,12 +496,46 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_epic(args)
         parser.error(f"unknown command {args.command}")
         return 2
+    except StateProtocolError as exc:
+        # A StateError like any other (exit 2, nothing written), with the
+        # provenance diagnostic after the loader's reason (#265).
+        _print_protocol_mismatch(exc, _global_flags(args))
+        return 2
     except (ConfigurationError, StateError, StateTransitionError, LockError) as exc:
         print(f"autoforge: error: {redact(str(exc))}", file=sys.stderr)
         return 2
     except AutoForgeError as exc:
         print(f"autoforge: error: {redact(str(exc))}", file=sys.stderr)
         return 1
+
+
+def _print_protocol_mismatch(exc: StateProtocolError, flags: tuple[str, ...]) -> None:
+    """The controller/state protocol diagnostic on stderr (#265), redacted line by line.
+
+    Printed for every command whose state load refused the file's label,
+    under the lock or before it, its dry run included: the loader's
+    refusal (its headline; the identity follows on lines of its own), then
+    the running controller (:class:`~autoforge.provenance.ControllerIdentity`),
+    the state file and this command's working directory and flags. The exit
+    status stays the StateError's 2. Every path and flag value in it is
+    redacted, kept to one line and bounded, the headline's state file
+    included (:func:`~autoforge.provenance.refusal_headline`); a flag value
+    that cannot be repeated faithfully is a labelled placeholder (#265 R1-F3).
+    """
+    print(refusal_headline(exc), file=sys.stderr)
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    lines = mismatch_lines(
+        exc,
+        identity=ControllerIdentity.current(),
+        reads=protocol_ranges(SUPPORTED_PROTOCOLS),
+        cwd=cwd,
+        flags=flags,
+    )
+    for line in lines:
+        print(redact(line), file=sys.stderr)
 
 
 # -- commands ---------------------------------------------------------------
@@ -1374,19 +1410,33 @@ def _existing_run_guard(
     except StateError as exc:
         # Unreadable / foreign-protocol state is fatal: a fresh run must
         # never silently replace it (merge counters etc. would be lost).
-        if not force:
-            # The error quotes the field it could not read (an unknown phase
-            # is echoed verbatim), so the refusal is state-derived output
-            # like the terminal lines and crosses the boundary assembled.
+        if not force and isinstance(exc, StateProtocolError):
+            # A label this controller does not read, newer or no protocol's
+            # at all: the run may be one a newer controller continues, or
+            # one only the operator can account for, and neither repairing
+            # the file nor setting it aside continues it, so neither is
+            # advice for it (#265, R1-F4). `--force` still moves it aside,
+            # unchanged.
+            _print_protocol_mismatch(exc, engine.cli_global_flags)
             print(
                 redact(
-                    f"autoforge: error: {exc}\n"
-                    "autoforge: error: refusing to start a new run over an unreadable "
-                    f"state file — repair it, or use '{command} --force' to move it "
-                    f"aside as {paths.state_file.name}.corrupt-<timestamp> and start over"
+                    "autoforge: error: refusing to start a new run over "
+                    + (f"run {exc.run_id}" if exc.run_id else "the run recorded there")
+                    + ", which this controller cannot read"
                 ),
                 file=sys.stderr,
             )
+            return 2, False
+        if not force:
+            refusal = (
+                "autoforge: error: refusing to start a new run over an unreadable "
+                f"state file — repair it, or use '{command} --force' to move it "
+                f"aside as {paths.state_file.name}.corrupt-<timestamp> and start over"
+            )
+            # The error quotes the field it could not read (an unknown phase
+            # is echoed verbatim), so the refusal is state-derived output
+            # like the terminal lines and crosses the boundary assembled.
+            print(redact(f"autoforge: error: {exc}\n{refusal}"), file=sys.stderr)
             return 2, False
         return None, True
     if existing is None:

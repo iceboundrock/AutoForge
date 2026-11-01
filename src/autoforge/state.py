@@ -37,6 +37,7 @@ import re
 import stat
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 
 from . import __prompt_version__, __protocol_version__, __version__
@@ -55,12 +56,13 @@ from .effects import (
     PhaseEffects,
     load_phase_effects,
 )
-from .errors import ConfigurationError, StateError
+from .errors import ConfigurationError, StateError, StateProtocolError
 from .evidence import EvidenceFields, RecordView, check_evidence
 from .loop_guard import validate_review_history
+from .provenance import ControllerIdentity, protocol_ranges, shown, shown_path
 from .replan_txn import LEGACY_JOURNAL_PROTOCOLS, legacy_journal_refusal
 from .result_parser import FINDING_ID_RE, MAX_FINDING_ID_CHARS, MAX_OPERATOR_ACTIONS_PER_FIX
-from .runlog import validate_run_id
+from .runlog import RUN_ID_RE, validate_run_id
 from .safefs import HardLinksUnavailable, ReadLimitExceeded, SafeRoot, entry_kind
 from .sandbox_pin import SandboxPin
 from .transitions import Phase, WorkflowMode
@@ -211,6 +213,30 @@ _PRE_PIN_PROTOCOL = "11"
 # :data:`_LOCAL_FIELDS` beside it, each at its empty value in every REMOTE
 # save: it is loaded in every phase with them dropped, and relabelled.
 _PREVIOUS_PROTOCOL = "12"
+# Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
+# one and each older one it migrates or refuses by its own rule. Any other
+# label is refused by :func:`protocol_support`'s classification before the
+# file's phase or fields are read (#265).
+SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
+    _LEGACY_PROTOCOLS
+    | {
+        _PRE_ACCEPTANCE_PROTOCOL,
+        _PRE_CONFIG_PROTOCOL,
+        _PRE_VALIDATION_PROTOCOL,
+        _PRE_OPERATOR_PROTOCOL,
+        _PRE_PIN_PROTOCOL,
+        _PREVIOUS_PROTOCOL,
+        __protocol_version__,
+    }
+)
+# A label as every controller writes it: a decimal number without a sign or
+# a leading zero. Nine digits bound the conversion; a longer one is no label
+# the numbering rule (#23) will reach, and is unknown.
+_CANONICAL_LABEL_RE = re.compile(r"[1-9][0-9]{0,8}")
+# The persisted label, its writer's version and its run id are shown in a
+# protocol refusal only this far, and only in the shape a controller writes.
+_MAX_SHOWN_LABEL_CHARS = 64
+_WRITER_VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+!_-]{0,63}")
 # The fields protocol 7 added (#160): the effect records, the entry
 # observation and the completion context of the current phase entry, and the
 # launch label. A legacy file never carries one; one that does is a hand edit
@@ -378,6 +404,99 @@ def _legacy_review_binding_refusal(
         "it is already MERGED the issue is done and the run should continue from the next "
         "issue; if it is OPEN, start a new run for the issue, which adopts the PR and "
         "reviews it again. The state file was left unchanged"
+    )
+
+
+class ProtocolSupport(Enum):
+    """How this controller stands to a state file's ``protocol_version`` (#265).
+
+    Decided by the label alone (:func:`protocol_support`), before anything
+    else of the file but its mode is read. A supported label is only
+    admission to the loader's own rules: a ``CURRENT`` file is still held to
+    every field check, and a ``LEGACY`` one to its label's migration and
+    refusals. An unsupported label is refused, never reinterpreted.
+    """
+
+    #: The protocol this controller writes (an unlabelled file is read as it).
+    CURRENT = "supported-current"
+    #: An older label the loader migrates, or refuses by its own rule.
+    LEGACY = "supported-legacy"
+    #: A decimal label above this controller's: a newer controller's file.
+    NEWER = "unsupported-newer"
+    #: Any other label (6, which is skipped for good, 0, a non-decimal or
+    #: non-string one): no controller writes it.
+    UNKNOWN = "unsupported-unknown"
+
+    @property
+    def supported(self) -> bool:
+        return self in (ProtocolSupport.CURRENT, ProtocolSupport.LEGACY)
+
+
+def protocol_support(label: object) -> ProtocolSupport:
+    """Classify a persisted ``protocol_version`` against this controller; pure."""
+    if not isinstance(label, str):
+        return ProtocolSupport.UNKNOWN
+    if label == __protocol_version__:
+        return ProtocolSupport.CURRENT
+    if label in SUPPORTED_PROTOCOLS:
+        return ProtocolSupport.LEGACY
+    if _CANONICAL_LABEL_RE.fullmatch(label) and int(label) > int(__protocol_version__):
+        return ProtocolSupport.NEWER
+    return ProtocolSupport.UNKNOWN
+
+
+def _shown_label(label: object) -> str:
+    """The persisted label as a protocol refusal quotes it: its ``repr``, redacted, bounded.
+
+    Redacted whole before it is cut (:func:`autoforge.provenance.shown`), so
+    a credential that crosses the cut is still recognised and none of it is
+    quoted (#265 R1-F2).
+    """
+    return shown(repr(label), _MAX_SHOWN_LABEL_CHARS)
+
+
+def _recorded(value: object, pattern: re.Pattern[str]) -> str:
+    """A field of an unloaded file, kept only in the shape a controller writes, else ``""``."""
+    return value if isinstance(value, str) and pattern.fullmatch(value) else ""
+
+
+def _protocol_refusal(data: dict, label: object) -> StateProtocolError:
+    """Why ``data``'s label is refused, naming this controller (#265).
+
+    The message keeps the loader's first words, ``unsupported
+    protocol_version <label> (controller speaks <protocol>)``, and adds the
+    running controller's identity
+    (:meth:`autoforge.provenance.ControllerIdentity.summary`), so every path
+    that shows a state refusal by its text alone (a scheduler namespace's
+    ``uncertain`` detail, the reverse guard's problem, a worker's error)
+    names the code that refused it. The run id and the writer's version are
+    carried only in the shape a controller writes them: the file was not
+    loaded, so nothing else of it is vouched for.
+    """
+    support = protocol_support(label)
+    assert not support.supported, label
+    shown = _shown_label(label)
+    identity = ControllerIdentity.current()
+    reads = protocol_ranges(SUPPORTED_PROTOCOLS)
+    if support is ProtocolSupport.NEWER:
+        why = "a newer AutoForge wrote it"
+    else:
+        why = "no AutoForge protocol has that label"
+    headline = (
+        f"unsupported protocol_version {shown} (controller speaks {__protocol_version__!r}): {why}"
+    )
+    reason = (
+        f"{headline}, and this controller, {identity.summary()}, reads protocols {reads}; "
+        "it is refused and left unchanged"
+    )
+    return StateProtocolError(
+        reason,
+        headline=headline,
+        label=shown,
+        support=support.value,
+        newer=label if support is ProtocolSupport.NEWER and isinstance(label, str) else "",
+        run_id=_recorded(data.get("run_id"), RUN_ID_RE),
+        written_by=_recorded(data.get("controller_version"), _WRITER_VERSION_RE),
     )
 
 
@@ -643,12 +762,6 @@ class AutoForgeState:
     def from_dict(cls, data: dict) -> AutoForgeState:
         if not isinstance(data, dict):
             raise StateError("state file must contain a JSON object")
-        try:
-            phase = Phase(data["phase"])
-        except KeyError:
-            raise StateError("state file missing required field 'phase'") from None
-        except ValueError:
-            raise StateError(f"state file has unknown phase {data.get('phase')!r}") from None
         # A state file written before LOCAL mode existed carries no 'mode'
         # key; it is a REMOTE run and must keep loading unchanged. Every
         # other value but "REMOTE" is refused here, "LOCAL" included (ADR
@@ -662,6 +775,22 @@ class AutoForgeState:
                 mode = WorkflowMode(raw_mode)
             except ValueError:
                 raise StateError(f"state file has unknown mode {raw_mode!r}") from None
+        # Then the label, before the phase and every field (#265): a newer
+        # controller may have added a phase or a field, and its file must be
+        # reported as a newer protocol, naming the controller that refused
+        # it, never as an unknown phase or a pile of unknown fields. A label
+        # this controller has no rule for is refused here, unchanged and
+        # never reinterpreted (:func:`protocol_support`); a supported one
+        # only reaches the per-label rules below.
+        raw_protocol = data.get("protocol_version", __protocol_version__)
+        if not protocol_support(raw_protocol).supported:
+            raise _protocol_refusal(data, raw_protocol)
+        try:
+            phase = Phase(data["phase"])
+        except KeyError:
+            raise StateError("state file missing required field 'phase'") from None
+        except ValueError:
+            raise StateError(f"state file has unknown phase {data.get('phase')!r}") from None
         # The protocol version decides what "unknown field" even means, so it
         # is checked before the fields are: a file written by a newer
         # controller must be reported as an unsupported protocol, not as a
@@ -777,7 +906,6 @@ class AutoForgeState:
         #   refused, unchanged, when one holds anything else
         #   (:func:`_drop_local_fields`). A protocol-13 or unlabelled file
         #   carrying one, even empty, is refused by the unknown-field check.
-        raw_protocol = data.get("protocol_version", __protocol_version__)
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
         if legacy:
@@ -894,8 +1022,12 @@ class AutoForgeState:
             )
             _refuse_sandbox_pin(data, raw_protocol)
         elif raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+            # Unreachable while SUPPORTED_PROTOCOLS names exactly the labels
+            # of the branches above (pinned in tests/test_protocol_compat.py); kept so
+            # a label added to the set and to no branch is still refused
+            # rather than loaded as the current protocol.
             raise StateError(
-                f"unsupported protocol_version {raw_protocol!r} "
+                f"unsupported protocol_version {_shown_label(raw_protocol)} "
                 f"(controller speaks {__protocol_version__!r})"
             )
         else:
@@ -2072,7 +2204,15 @@ def load_state(path: str | Path, *, root: SafeRoot | None = None) -> AutoForgeSt
             f"limit ({type(exc).__name__}); "
             "refusing to overwrite — restore from backup or re-run"
         ) from exc
-    return AutoForgeState.from_dict(data)
+    try:
+        return AutoForgeState.from_dict(data)
+    except StateProtocolError as exc:
+        # The same refusal, naming the file: what the CLI's diagnostic and
+        # every text-only report of it show the operator (#265). The text
+        # names it as shown_path shows it, one redacted and bounded line,
+        # since a scheduler's or a worker's report prints that text as is.
+        where = os.path.abspath(p)
+        raise exc.at(where, shown=shown_path(where)) from None
 
 
 _QUARANTINE_MAX_ATTEMPTS = 1000

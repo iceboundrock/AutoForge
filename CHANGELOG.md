@@ -5,6 +5,56 @@ so.
 
 ## Unreleased
 
+### A run a newer controller wrote names the controller that refused it (#265)
+
+- A command that meets a `state.json` labelled with a newer protocol still
+  refuses it with exit 2 and writes nothing, and now says which code
+  refused it: the state file, the label and what the file records (run id,
+  writer), then the controller's version and protocol, the file Python
+  imported it from, the interpreter and the working directory, and a
+  `status` command with this command's `--config` and `--state-dir` for a
+  controller that speaks the run's protocol. It suggests no edit of the
+  file and no `run --force`. `status`, `step`, `resume`, `unblock`, their
+  dry runs and `run` all print it; the exit status is unchanged.
+- A newer label is now refused before the file's phase is read, so a run
+  of a newer controller with a phase this one lacks is reported as a newer
+  protocol, no longer as `state file has unknown phase`. The mode is still
+  read first, so a LOCAL file is still an unknown mode.
+- `run` over a newer controller's run, or over a state whose label no
+  protocol has, no longer advises `repair it, or use 'run --force'`;
+  `run --force` still moves it aside as `state.json.corrupt-<timestamp>`.
+- The diagnostic's paths and the `--config` and `--state-dir` values it
+  repeats are redacted before they are cut, kept to one printable line
+  each and bounded; a value that cannot be repeated exactly as typed is a
+  labelled placeholder.
+- **Behaviour change:** a standalone state at `config.state_dir` of a
+  protocol the controller does not read (newer, or no protocol's) no
+  longer holds nothing: `epic run` and `epic resume` admit no issue at all
+  while it is there and exit 1 (`degraded`), since the issue that run
+  holds is unknown. A standalone state that does not load for any other
+  reason still holds nothing and is reported.
+- `epic status` shows a namespace state of a newer protocol as
+  `uncertain(state-corrupt)` as before, but points at a controller that
+  speaks it instead of `epic archive`, and one of a label no protocol has
+  says that no controller reads it, with neither `epic archive` nor a
+  repair by hand; the scheduler's and a worker's messages name the
+  refusing controller.
+- The scheduler's lines, `epic status` and `epic run --dry-run` name the
+  configured standalone state file redacted, on one printable line and
+  bounded, as the CLI's diagnostic does.
+- Those reports keep the refusal of a state of a newer protocol, or of no
+  protocol's label, and the refusing controller's protocol, import path
+  and interpreter whole however long the state file's path, and name the
+  file last; a path of several hundred characters used to push them past
+  the reports' 1,000-character bound. `epic run --dry-run` now reports
+  such a namespace state as the scheduler does.
+- `doctor` has a first row, `controller`: the code a command line runs and
+  the state protocols it reads. It never fails.
+- [Running the remote workflow](docs/usage.md#a-run-a-newer-controller-wrote)
+  walks through the case that motivated it (#243, PR #254: a protocol-11
+  run resumed by protocol-10 code) and choosing the code with
+  `uv run --project` while keeping the working directory and flags.
+
 ### A first run, from nothing: the guide, starter configurations, and a `doctor` that a new repository can pass (#259)
 
 - [Getting started](docs/getting-started.md) takes a newcomer from nothing

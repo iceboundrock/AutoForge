@@ -181,6 +181,24 @@ def state_tree(root: Path) -> dict[str, tuple]:
     return out
 
 
+def deep_dir(base: Path, length: int) -> Path:
+    """A directory under ``base`` whose absolute path is ``length`` characters long.
+
+    In components of at most 200 characters, so any file system on the
+    host takes it; nothing under it is created. A ``length`` that leaves no
+    room for one more component is refused rather than missed.
+    """
+    path = Path(os.path.abspath(base))
+    assert len(str(path)) + 2 <= length, (path, length)
+    while len(str(path)) < length:
+        room = length - len(str(path)) - 1  # a separator, then the component
+        if room > 200:
+            room = min(200, room - 2)  # so the next component has a character at least
+        path = path / ("d" * room)
+    assert len(str(path)) == length
+    return path
+
+
 # The states that do not load whose handling ADR 0009 D4 audits: an unknown
 # mode, an unknown protocol label and invalid JSON (#385), and a LOCAL state,
 # which the loader refuses as an unknown mode since LOCAL was removed (#387).

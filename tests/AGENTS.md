@@ -229,7 +229,10 @@ read it before adding tests for a listed area.
   was written, replaced or created and removed again.
   `unloadable_state(kind, saved)` makes a state file that loads into one of
   `UNLOADABLE_STATES`: an unknown mode, an unknown label, invalid JSON and,
-  since LOCAL was removed (#387), a LOCAL state.
+  since LOCAL was removed (#387), a LOCAL state. Its unknown label is `'99'`,
+  which #265 classifies as a newer protocol's: a test of what a refused
+  label does differently (no `--force` advice, a standalone state that
+  admits nothing) says so where it takes that kind.
   They keep passing unchanged after the removal, with only the expected
   protocol label moved to 13 (#388).
 - The shared coverage LOCAL's removal must not lose (ADR 0009 A.2.3, A.2.4,

@@ -22,7 +22,8 @@ configuration enables merging (the configuration is not changed); install
 the SIGINT, SIGTERM and SIGHUP handlers, which only set a flag; run #181's
 reconciliation, whose global problems admit nothing; apply the reverse
 guard (the configured standalone state's issue is ``held:standalone-state``
-in any phase but ``DONE``).
+in any phase but ``DONE``; a standalone state of a protocol this controller
+does not read is global uncertainty and admits nothing at all, #265).
 
 **Each tick** (D9.7): reap exited workers and finalize their claims under a
 re-acquired L2 (#181's ``finalize_worker``); handle signals and the stop
@@ -106,7 +107,7 @@ from .locking import (
     check_local_lock_filesystem,
     repository_lock_path,
 )
-from .ownership import standalone_hold
+from .ownership import admission_refusal, standalone_hold, unreadable_report
 from .redaction import redact
 from .run_namespace import (
     WORKERS_DIRNAME,
@@ -494,7 +495,10 @@ class EpicScheduler:
             self.end_reason = EndReason.DEGRADED
             self._finish()
             return False
-        self._apply_reverse_guard()
+        if not self._apply_reverse_guard():
+            self.end_reason = EndReason.DEGRADED
+            self._finish()
+            return False
         return True
 
     def _take_reconciliation(self, report: ReconcileReport, *, again: bool = False) -> bool:
@@ -535,14 +539,33 @@ class EpicScheduler:
         )
         return False
 
-    def _apply_reverse_guard(self) -> None:
-        """D17.2: the configured standalone state's issue is not admitted."""
+    def _apply_reverse_guard(self) -> bool:
+        """D17.2: the configured standalone state's issue is not admitted; ``False``: no issue is.
+
+        A standalone state whose ``protocol_version`` this controller does
+        not read holds an issue nobody here can name, and may be a run a
+        newer controller continues (#265 R1-F1): that is global uncertainty
+        (D14.3), so admission is degraded before the first snapshot and no
+        claim is written, no worker started and nothing read from GitHub
+        beyond the startup's reads. No field of that file is trusted.
+        """
         state_dir = self.inputs.standalone_state_dir or os.path.abspath(self.config.state_dir)
         hold = standalone_hold(state_dir)
         if hold.problem:
-            self.say(f"the standalone state {hold.state_file} cannot be read: {hold.problem}")
+            # The path as every report shows it, never as configured (#265 R2-F1).
+            self.say(unreadable_report(hold))
+        refusal = admission_refusal(hold)
+        if refusal:
+            self.say(
+                f"global uncertainty, nothing is admitted: {refusal}. No claim was written "
+                "and no worker started"
+            )
+            self.admission = AdmissionState(
+                AdmissionStatus.DEGRADED, AdmissionReason.EPIC_NOT_ADMISSIBLE
+            )
+            return False
         if not hold.holds:
-            return
+            return True
         assert hold.issue_number is not None
         try:
             same = parse_issue_url(hold.issue_url).repository.lower() == self.repository.lower()
@@ -551,9 +574,10 @@ class EpicScheduler:
         if same:
             self._held.setdefault(hold.issue_number, LocalFact.HELD_STANDALONE_STATE)
             self.say(
-                f"issue #{hold.issue_number} is held: the standalone state {hold.state_file} "
-                f"runs it (phase {hold.phase})"
+                f"issue #{hold.issue_number} is held: the standalone state "
+                f"{hold.shown_state_file} runs it (phase {hold.phase})"
             )
+        return True
 
     def _loop(self) -> None:
         while True:

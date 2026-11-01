@@ -94,7 +94,11 @@ certificate.py      review certificates: issuance from the review binding, appli
                     (certificate_problem, also against the live PR the merge gate reads, #175)
                     and the not-a-merge-permission wording; pure (ADR 0006 D12, D13, #174)
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
-state.py            persisted controller state, atomic writes, schema/protocol checks
+state.py            persisted controller state, atomic writes, schema/protocol checks; the
+                    protocol label's classification (protocol_support, #265)
+provenance.py       the running controller's identity (imported package file, interpreter,
+                    version, protocol) and the protocol-mismatch diagnostic the CLI prints;
+                    reads and writes nothing (#265)
 run_namespace.py    the parallel EPIC scheduler's per-issue run identities (RunKey) and
                     namespaces under <common>/autoforge/scheduler/issues/<n>: layout,
                     binding.json, read-only lookup and listing, the state archive, the
@@ -113,7 +117,8 @@ locking.py          the lock domains of ADR 0008 (#180): L0 (ControllerLock, key
                     the order assertion and the scheduler's filesystem refusal
 ownership.py        who may act on an issue (ADR 0008 D17.2, #180): the forward guard's
                     ownership predicate (an open scheduler claim included, #181) and the
-                    reverse guard's standalone-state read
+                    reverse guard's standalone-state read (a state of a protocol this
+                    controller does not read admits nothing, #265)
 scheduler_state.py  the scheduler's durable bookkeeping (ADR 0008 D6, D7, D14, #181):
                     claim.json (claims, generations, the closing rule, compare-and-write
                     under L2), scheduler.json, the pure restart classification,
@@ -212,8 +217,8 @@ verification, merge gate, dry-run, read context),
 prompts/update_epic*.md                           -> docs/agent-guides/github-safety.md
                                                      (+ docs/adr/0004-authority-boundary-and-
                                                      typed-external-effects.md for effects)
-state.py, effects.py, evidence.py, certificate.py,
-safefs.py, config_fingerprint.py,
+state.py, provenance.py, effects.py, evidence.py,
+certificate.py, safefs.py, config_fingerprint.py,
 sandbox_pin.py, locking.py, errors.py,
 engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
 run_namespace.py, ownership.py, locking.py (lock

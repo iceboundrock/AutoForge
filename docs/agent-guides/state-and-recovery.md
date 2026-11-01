@@ -444,6 +444,49 @@ and `status` all exit 2 on an unreadable or foreign-protocol `state.json`
 entry such as a FIFO, socket, device or directory; the entry is inspected
 and opened non-blocking, so a FIFO never hangs the command).
 
+**The protocol preflight (#265).** `AutoForgeState.from_dict` reads a
+file in this order: a JSON object, then the `mode` (ADR 0009 D4: anything
+but absent or `"REMOTE"` is an unknown mode under every label), then the
+label, and only then the phase and every field. The label is classified
+by `state.protocol_support` against `SUPPORTED_PROTOCOLS`, the labels the
+loader has a rule for (1 to 5 and 7 to 13): `supported-current` (13, or
+none), `supported-legacy` (an older label, which still meets its own
+migration and refusal rules below), `unsupported-newer` (a decimal label
+above 13, written without a sign or a leading zero) and
+`unsupported-unknown` (6, 0, `"14.0"`, a non-string, anything else). An
+unsupported label raises `StateProtocolError`, a `StateError`, before the
+phase is read, so a newer controller's file is never reported as an
+unknown phase or unknown fields, and it is never reinterpreted. The
+refusal keeps the loader's words (`unsupported protocol_version '14'
+(controller speaks '13')`), adds the running controller's identity
+(`provenance.ControllerIdentity`: the imported package's `__file__`,
+`sys.executable`, its version and protocol), and `load_state` adds the
+file's path. The label is quoted as its `repr`, redacted whole and only
+then bounded (`provenance.shown`), so a credential that crosses the cut is
+still recognised; the file's `run_id` and `controller_version` are
+carried only in the shape a controller writes them. The classification
+and the refusal are the loader itself, not a second decoder: every path
+that loads a state (the CLI before and under the lock,
+`engine.existing_run`, a worker, the scheduler's namespace read, the
+reverse guard's standalone read) refuses the same file the same way, and
+the load under the lock is the one acted on. The CLI prints the
+headline and the `AutoForge controller/state protocol mismatch` block on
+stderr and exits 2. Every path in it, the headline's state file included,
+goes through `provenance.shown_path` (redacted, then `repr`-escaped when
+it holds a character that is not printable, then bounded), and the
+recovery command repeats a `--config` or `--state-dir` value only when it
+is printable, at most 1024 characters and nothing the redaction changes,
+else a labelled placeholder (`<the --state-dir value this command was
+given>`). Its `result` line states what holds both before the lock and
+under it, where taking the lock may already have written the lock's PID
+record: the state file and its run logs were not rewritten, the agent
+worktree was not touched, no agent was launched and nothing was written to
+GitHub. `run`'s refusal of a file whose label is refused, newer or no
+protocol's, suggests neither a repair nor `--force` (which still moves it
+aside unchanged when given). Recovery is the operator's:
+[usage.md](../usage.md#a-run-a-newer-controller-wrote). No field and no
+protocol number came with this.
+
 `run --force` moves the entry aside as `state.json.corrupt-<timestamp>`
 instead of deleting it (a symlink is archived as a link; its target is never
 touched; a directory cannot be archived and is refused). The archive name is
@@ -667,7 +710,28 @@ takes L1:
   the configured standalone state names as `current_issue_url` while its
   phase is anything but `DONE` (`BLOCKED` and `FAILED` included), which
   the scheduler holds as `held:standalone-state` (#182); an unreadable
-  standalone state is reported and holds nothing.
+  standalone state is reported and holds nothing, except one refused for
+  its `protocol_version` (newer, or no protocol's; #265). Which issue that
+  run holds is a field of a file that was not loaded, and a controller that
+  reads it may be continuing it, so `StandaloneHold.blocks_admission` makes
+  the scheduler admit nothing at all: global uncertainty (D14.3), admission
+  `degraded`, exit 1, before the first snapshot, with no claim, namespace
+  or worker; `epic run --dry-run` and `epic status` say so. Every report of
+  the standalone state (the scheduler's lines, `epic status`'s problems
+  and held row, the dry run's plan) names its file by
+  `StandaloneHold.shown_state_file` (`provenance.shown_path`), and the
+  hold's `problem` is the loader's message through `provenance.shown`, so
+  each is one printable, bounded line whatever the configured directory
+  holds (#265 R2-F1). A refusal of a state's label reaches the scheduler's
+  reports as `provenance.refusal_report`, not as the loader's path-first
+  message cut to a reason's 1,000 characters, which a long state path
+  filled before the refusal or the controller was reached: the refusal
+  and the refusing controller's protocol, import path and interpreter
+  come first, the state file last, each part bounded on its own and the
+  whole under `provenance.MAX_REFUSAL_CHARS`. The namespace state's
+  `reason`, its `uncertain(state-corrupt)` detail and `epic status`'s
+  row keep it whole; the standalone hold's `problem` is the same without
+  the path, which its report names beside it (#265 R3-F1).
 
 ---
 
@@ -902,7 +966,14 @@ workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
   read-only load of `state/state.json` (absent, loaded, or corrupt with a
   redacted, bounded reason: unparseable or past the decoder's limits
   (`load_state` reports both as corruption), an unknown protocol, not a
-  regular file, reached through a link) and whether `claim.json` exists. A corrupt
+  regular file, reached through a link) and whether `claim.json` exists. A
+  corrupt state refused for its protocol label carries the label's class
+  (`NamespaceState.refused_protocol`, `unsupported-newer` or
+  `unsupported-unknown`) and, for a newer one, the label
+  (`NamespaceState.newer_protocol`, #265), so `epic status` points at a
+  controller that speaks a newer label, says that no controller reads a
+  label no protocol has, and offers neither `epic archive` nor a repair by
+  hand for either (#265 R2-F2). A corrupt
   state is reported for its own namespace only; a corrupt binding raises,
   for that namespace only.
 - **Enumeration** (`list_issue_namespaces`) lists the issue directories
@@ -1304,6 +1375,13 @@ validation command writes no marker and no record (ADR 0006 D8.5); a refused pre
 verification command blocks the merge gate (`BLOCKED`). `SandboxTamperError`
 is a `VerificationError` for a private object directory that holds what no
 object store does (above); the step enters `BLOCKED`.
+
+`StateProtocolError` (#265) is a `StateError` for a state file whose
+`protocol_version` this controller has no rule for (newer, or no
+protocol's), raised by the loader before the file's phase or fields are
+read and never retried; its attributes (the bounded label, the class,
+the newer label, the recorded run id and writer, the path) are what the
+CLI's diagnostic shows. Every handler of `StateError` treats it as one.
 
 The per-issue scheduler namespaces (#178, above) add three, none of them
 retried. `NamespaceError` is a `StateError`: a `binding.json` that is not a

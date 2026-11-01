@@ -244,11 +244,39 @@ def _required_checks(tmp_path, gate_open=False, **kwargs):
     return {r.name: r for r in d.run_all()}["default branch requires checks"]
 
 
+def test_the_controller_row_names_the_imported_package_and_reads_no_state(tmp_path):
+    """#265: ``doctor`` says which controller a command from this command line
+    runs as, by the package actually imported and the interpreter, with the
+    state protocols it reads. It is information, never a failure, and needs
+    no state: a newer controller's ``state.json`` in the state directory is
+    neither read nor touched."""
+    import sys
+
+    import autoforge
+
+    sd = tmp_path / ".autoforge"
+    sd.mkdir()
+    (sd / "state.json").write_text('{"protocol_version": "14"}', encoding="utf-8")
+    before = (sd / "state.json").read_bytes(), (sd / "state.json").stat().st_mtime_ns
+    d = Doctor(cwd=str(tmp_path), state_dir=str(sd), runner=_runner_factory())
+    results = d.run_all()
+    assert results[0].name == "controller"
+    row = results[0]
+    assert row.ok and not row.required and not row.skipped
+    assert row.detail == (
+        f"autoforge {autoforge.__version__} (protocol 13) imported from "
+        f"{os.path.abspath(autoforge.__file__)}, python {sys.executable}; "
+        "reads state protocols 1-5 and 7-13"
+    )
+    assert ((sd / "state.json").read_bytes(), (sd / "state.json").stat().st_mtime_ns) == before
+
+
 def test_all_checks_pass(tmp_path):
     d = Doctor(cwd=str(tmp_path), runner=_runner_factory())
     results = d.run_all()
     names = [r.name for r in results]
     for expected in (
+        "controller",
         "config",
         "merge gate",
         "git available",
