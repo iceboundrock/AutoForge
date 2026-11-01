@@ -21,6 +21,10 @@
 - **Amended by #283:** the merge's mechanism (D5.4) deletes the merged
   head branch itself, on GitHub only, and every `gh` the controller starts
   runs where no git it starts finds a repository.
+- **Note:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) removed LOCAL mode (#388): §2.1's LOCAL
+  prompts and K10's LOCAL refusal no longer apply, and §2.13's refusal of a
+  LOCAL state carrying effect state is replaced by ADR 0009 D4's refusal of
+  any LOCAL state by its mode.
 - **Decides:** #159, for EPIC #158 (Wave 1).
 - **Where:** placement is decided in §2.12. Existing code this record
   builds on: `src/autoforge/github.py`, `claims.py`, `result_parser.py`,

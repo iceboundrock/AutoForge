@@ -397,8 +397,8 @@ def test_every_lifecycle_transition_is_decided_by_decide_next_phase(tmp_state_di
     """
     decisions: list[tuple[Phase, dict, Phase]] = []
 
-    def recording(current, result, mode):
-        nxt = decide_next_phase(current, result, mode)
+    def recording(current, result):
+        nxt = decide_next_phase(current, result)
         decisions.append((current, dict(result), nxt))
         return nxt
 
@@ -443,10 +443,10 @@ def test_a_decision_outside_the_topology_is_refused_before_it_is_applied(
     """The decision is still validated where it is applied: an edge the
     topology does not declare raises and leaves the persisted phase alone."""
 
-    def rogue(current, result, mode):
+    def rogue(current, result):
         if current is Phase.REVIEW:
-            return Phase.DONE  # legal LOCAL edge, illegal REMOTE edge
-        return decide_next_phase(current, result, mode)
+            return Phase.DONE  # an edge the topology does not declare
+        return decide_next_phase(current, result)
 
     monkeypatch.setattr(engine_mod, "decide_next_phase", rogue)
     gh = FakeGitHub()
@@ -649,7 +649,7 @@ EXPECTED_READ_CONTEXT = {
         "operator-evidence.md",
     },
     "FIX": {"README.md", "issue.md", "review-comment.md", "follow-up-issues.md"},
-    "UPDATE_EPIC": {"README.md", "epic.md", "epic-issues.md"},
+    "UPDATE_EPIC": {"README.md", "epic.md", "epic-issues.md", "epic-sub-issues.md"},
 }
 
 
@@ -675,7 +675,8 @@ def test_every_remote_launch_gets_no_credential_route_and_its_read_context(
     gh = FakeGitHub()
     gh.issues[ISSUE].body = "Implement the feature. Token: ghp_" + "Q" * 36
     gh.issues[EPIC].body = "Roadmap: #2 then #3 then https://github.com/owner/repo/issues/9"
-    gh.add_issue("https://github.com/owner/repo/issues/3", "Next thing")
+    # #3 is named in the body but is not a sub-issue: the run's `null` holds (#287).
+    gh.add_issue("https://github.com/owner/repo/issues/3", "Next thing", parent=None)
     inner = _full_lifecycle_agent(gh)
     seen: list[tuple[str, set[str]]] = []
 
@@ -702,6 +703,8 @@ def test_every_remote_launch_gets_no_credential_route_and_its_read_context(
             states = (context / "epic-issues.md").read_text()
             assert "issues/2: OPEN: Feature" in states and "issues/3: OPEN: Next thing" in states
             assert "issues/9: (could not be read)" in states
+            children = (context / "epic-sub-issues.md").read_text()
+            assert "issues/2: open: Feature\n" in children and "issues/3" not in children
         return inner(req)
 
     eng = make_engine(tmp_state_dir, agent, github=gh, origin=True)

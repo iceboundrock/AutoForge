@@ -88,7 +88,8 @@ Each line is a summary; the linked document is the precise statement.
   round and SHA; the fix commit is the fixer's own HEAD, descends from the
   reviewed HEAD and is the PR's head once the controller has pushed it; the
   follow-up issues the controller created or recorded a deferral in are the
-  one open issue per finding; the EPIC update and the next issue exist.
+  one open issue per finding; the EPIC update exists, and the next issue
+  is open and a native sub-issue of the EPIC.
   ([GitHub safety](docs/agent-guides/github-safety.md))
 - **Agents never merge.** Every agent prompt carries the rule "never merge a
   pull request". The merge is performed by the controller itself
@@ -262,6 +263,11 @@ describes how a version is built and published.
 
 Whichever way it was installed, run `autoforge` from a checkout of the
 repository whose issues it drives; `autoforge doctor` checks the rest.
+Continue a run with the controller that created it, or a newer one: a
+controller refuses a run a newer one wrote (exit 2, nothing written) and
+names the code it imported, and `doctor`'s `controller` row shows which
+code a command line runs
+([A run a newer controller wrote](https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md#a-run-a-newer-controller-wrote)).
 
 **For development** on AutoForge itself, from a clone of this repository:
 
@@ -274,11 +280,19 @@ uv run autoforge --help
 `uv run autoforge` is the same command, run from that clone's `.venv`.
 [Development](https://github.com/iceboundrock/AutoForge/blob/main/docs/development.md) has the checks CI runs.
 
-To configure profiles, bounds or the merge gate, copy
-`autoforge.example.yaml` to `autoforge.yaml` and pass it with `--config`
-before the subcommand; see [Configuration](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md).
+To configure profiles, bounds or the merge gate, copy a starter
+configuration from [`examples/`](https://github.com/iceboundrock/AutoForge/tree/main/examples),
+or `autoforge.example.yaml` (every key), to `autoforge.yaml` and pass it
+with `--config` before the subcommand; see [Configuration](https://github.com/iceboundrock/AutoForge/blob/main/docs/configuration.md).
 
 ## Quick start
+
+New to AutoForge? [Getting started](https://github.com/iceboundrock/AutoForge/blob/main/docs/getting-started.md)
+walks through a first run on a repository of your own: prerequisites,
+installing, a repository (a new private one, or an existing one you may
+change) with an EPIC and an issue, a starter configuration, what each
+`doctor` row means, a dry run, a real run, and the common first-run
+failures with their fixes. The commands in brief:
 
 Run these from a checkout of the repository the issues belong to. URLs must
 be HTTPS GitHub issue URLs, and the EPIC and the issue must be in that same
@@ -340,8 +354,9 @@ most common entry points:
 
 | I want to… | Read |
 |---|---|
+| make a first run on a repository of my own, step by step | [Getting started](docs/getting-started.md), starter configurations in [`examples/`](examples) |
 | know which OS, Python, git, `gh`, agent CLI and sandbox host it runs on | [Compatibility](docs/compatibility.md) |
-| run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/usage.md#troubleshooting-and-recovery) |
+| run the remote workflow, merge, unblock, troubleshoot or recover a run | [Running the remote workflow](docs/usage.md), [troubleshooting and recovery](docs/troubleshooting.md) |
 | run phases through Pi on a DeepSeek API key or a ChatGPT subscription | [Pi operator guide](docs/pi.md) |
 | configure profiles, bounds and the merge gate | [Configuration](docs/configuration.md), [`autoforge.example.yaml`](autoforge.example.yaml) |
 | know what AutoForge protects, which GitHub token it needs, or report a vulnerability | [Security boundaries](docs/security.md), [SECURITY.md](SECURITY.md) |
@@ -351,7 +366,7 @@ most common entry points:
 | see how the code is divided | [Architecture](docs/agent-guides/architecture.md), [module map](src/autoforge/AGENTS.md) |
 | contribute, run the checks, write tests | [Development](docs/development.md), [Testing](docs/agent-guides/testing.md) |
 | cut or publish a release | [Releasing](docs/releasing.md) |
-| read the design records | [ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md), [ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md), [ADR 0003](docs/adr/0003-pi-agent-provider.md), [ADR 0004](docs/adr/0004-authority-boundary-and-typed-external-effects.md), [ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md), [ADR 0006](docs/adr/0006-candidate-validation-evidence-and-review-certificates.md), [ADR 0007](docs/adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md) (partly implemented) |
+| read the design records | [the index](docs/README.md#architecture-decisions); [ADR 0001](docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md) (superseded by ADR 0009 but for what it says of `safefs.py`), [ADR 0002](docs/adr/0002-executor-nothing-outlives-the-invocation.md), [ADR 0003](docs/adr/0003-pi-agent-provider.md), [ADR 0004](docs/adr/0004-authority-boundary-and-typed-external-effects.md), [ADR 0005](docs/adr/0005-outer-sandbox-and-host-resource-capability-model.md), [ADR 0006](docs/adr/0006-candidate-validation-evidence-and-review-certificates.md), [ADR 0007](docs/adr/0007-sdk-providers-isolated-helpers-and-interaction-contract.md) (partly implemented), [ADR 0008](docs/adr/0008-parallel-epic-scheduler-authority-run-identity-claims-and-locks.md), [ADR 0009](docs/adr/0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) |
 
 Coding agents working on this repository start at [AGENTS.md](AGENTS.md).
 

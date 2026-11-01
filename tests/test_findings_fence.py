@@ -112,8 +112,9 @@ def test_finding_text_cannot_break_out_of_the_findings_block_of_a_remote_prompt(
     block, the prompt is the one a harmless finding renders, byte for byte:
     nothing of the finding's text reached the prompt the controller wrote.
 
-    ADR 0009 A.2.3 D (#386): the REMOTE replacement of
-    tests/test_durable_run_contract.py::test_finding_text_cannot_break_out_of_the_findings_block
+    ADR 0009 A.2.3 D (#386): the REMOTE replacement of the LOCAL test
+    ``test_finding_text_cannot_break_out_of_the_findings_block``, whose file
+    (tests/test_durable_run_contract.py) #388 deleted.
     """
     eng, gh = _at_fix(tmp_path)
     harmless = _render(tmp_path, eng, gh, phase, FINDING)
@@ -146,7 +147,7 @@ def test_a_correction_diagnostic_cannot_break_out_of_its_block(tmp_path):
     other untrusted block: every hostile line sits inside the one ````text``
     fence of the correction prompt.
 
-    The REMOTE half of the test of that name in
+    The REMOTE half of the test of that name in the former
     tests/test_durable_run_contract.py, moved here when its LOCAL half was
     retired with the LOCAL state it loaded (ADR 0009 A.2.1, #387).
     """

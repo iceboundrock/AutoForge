@@ -1,0 +1,128 @@
+{
+  "acceptance_outcomes": [],
+  "attempt": 0,
+  "base_branch": "",
+  "base_head_sha": "",
+  "baseline_dirty_paths": [],
+  "block_reason": "",
+  "completion_context": {},
+  "config_fingerprint": {},
+  "controller_version": "0.1.0a1.dev0",
+  "counted_merged_prs": [],
+  "created_at": "2026-10-31T10:31:40.554842+00:00",
+  "current_base_ref": "main",
+  "current_branch": "",
+  "current_head_sha": "5aa9d0f9a5eef9a1962bba195c04957086258d94",
+  "current_issue_url": "https://github.com/owner/repo/issues/2",
+  "current_merge_base_sha": "dddddddddddddddddddddddddddddddddddddddd",
+  "current_pr_url": "https://github.com/owner/repo/pull/42",
+  "effect_records": [],
+  "entry_observation": {},
+  "epic_url": "https://github.com/owner/repo/issues/1",
+  "escalation_count": 0,
+  "execution_attempt": 1,
+  "feature_spec_path": "",
+  "feature_spec_sha256": "",
+  "last_fix_resolutions": [],
+  "last_review_comment_url": "https://github.com/owner/repo/pull/42#issuecomment-100",
+  "last_review_needs_fix": null,
+  "last_review_result": "clean",
+  "launch_label": "",
+  "local_fix_rounds": 0,
+  "local_pending_attempts": 0,
+  "local_pending_fingerprint": "",
+  "local_pending_phase": "",
+  "local_run_contract": {},
+  "merged_since_epic_update": 0,
+  "mode": "REMOTE",
+  "next_issue_rejections": [],
+  "open_findings": [],
+  "operator_comment_outcomes": [],
+  "phase": "MERGE",
+  "premerge_verified_commands": [
+    [
+      "true"
+    ]
+  ],
+  "premerge_verified_head_sha": "5aa9d0f9a5eef9a1962bba195c04957086258d94",
+  "prior_findings": [],
+  "producer_validation_failure": {},
+  "prompt_version": "v14",
+  "protocol_version": "12",
+  "replan_transaction": {},
+  "repository": "owner/repo",
+  "review_certificate": {
+    "candidate": {
+      "commit": "5aa9d0f9a5eef9a1962bba195c04957086258d94",
+      "kind": "remote",
+      "object_format": "sha1",
+      "provenance": {
+        "kind": "pr-head",
+        "pr_url": "https://github.com/owner/repo/pull/42"
+      },
+      "repository": "owner/repo",
+      "tree": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "clean": {
+      "actionable_findings": 0,
+      "needs_fix_round": false
+    },
+    "comment": {
+      "id": 100,
+      "marker_key": {
+        "review_round": 2,
+        "reviewed_base_ref": "main",
+        "reviewed_head_sha": "5aa9d0f9a5eef9a1962bba195c04957086258d94",
+        "reviewed_merge_base_sha": "dddddddddddddddddddddddddddddddddddddddd"
+      },
+      "url": "https://github.com/owner/repo/pull/42#issuecomment-100"
+    },
+    "digest": "051f1048e96b95401e42eae881d2180e31d1b80af2a849eddb822b7c5bf73121",
+    "issued_at": "2026-10-31T10:31:40.557219+00:00",
+    "kind": "remote",
+    "policy_digest": "1802bd0e9edd543a75e6ddedcb1fd2d33ca2f63cc3af961cb005f04b0c2ea22d",
+    "records": [],
+    "review_round": 2,
+    "reviewed_base_ref": "main",
+    "reviewed_head_sha": "5aa9d0f9a5eef9a1962bba195c04957086258d94",
+    "reviewed_merge_base_sha": "dddddddddddddddddddddddddddddddddddddddd",
+    "reviewed_pr_url": "https://github.com/owner/repo/pull/42",
+    "schema": 1,
+    "validation_set_digest": "8b355b8348e6b4ff81940eb87fad98a8cf126c67aa7cd785b28f9be771e29e82"
+  },
+  "review_evidence": {
+    "candidate": {
+      "commit": "5aa9d0f9a5eef9a1962bba195c04957086258d94",
+      "kind": "remote",
+      "object_format": "sha1",
+      "provenance": {
+        "kind": "pr-head",
+        "pr_url": "https://github.com/owner/repo/pull/42"
+      },
+      "repository": "owner/repo",
+      "tree": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "policy_digest": "1802bd0e9edd543a75e6ddedcb1fd2d33ca2f63cc3af961cb005f04b0c2ea22d",
+    "records": [],
+    "review_round": 2,
+    "validation_set_digest": "8b355b8348e6b4ff81940eb87fad98a8cf126c67aa7cd785b28f9be771e29e82"
+  },
+  "review_history": [],
+  "review_round": 2,
+  "reviewed_base_ref": "main",
+  "reviewed_head_sha": "5aa9d0f9a5eef9a1962bba195c04957086258d94",
+  "reviewed_merge_base_sha": "dddddddddddddddddddddddddddddddddddddddd",
+  "reviewed_pr_url": "https://github.com/owner/repo/pull/42",
+  "reviewed_workspace_fingerprint": "",
+  "run_id": "af-20261031T103140Z-911dec",
+  "sandbox_pin": {},
+  "step_count": 1,
+  "superseded_prs": [],
+  "unblock_history": [],
+  "updated_at": "2026-10-31T10:31:40.758108+00:00",
+  "validation_attempt": {},
+  "validation_override_seq": null,
+  "validation_records": [],
+  "verification_failures": [],
+  "workspace_fingerprint": ""
+}

@@ -37,11 +37,12 @@ What every launch gets, whatever the description says:
 
 A launch that cannot be established is a
 :class:`~autoforge.errors.SandboxLaunchRefusedError`, never a run without
-the sandbox: a platform that is not Linux, no ``bwrap`` on the controller's
-``PATH``, a kernel without the Landlock scope, an architecture whose
-keyring call is unknown (D14.2), and, after the spawn, a setup failure that
-``bwrap`` reported (a bind source gone, an executable the sandbox cannot
-run, a namespace refused).
+the sandbox: a platform that is not Linux, a Python without
+``os.memfd_create`` (some builds have none, uv's CPython 3.12.13 among
+them; #389), no ``bwrap`` on the controller's ``PATH``, a kernel without
+the Landlock scope, an architecture whose keyring call is unknown (D14.2),
+and, after the spawn, a setup failure that ``bwrap`` reported (a bind
+source gone, an executable the sandbox cannot run, a namespace refused).
 
 Teardown inside the namespace is the kernel's: when the command exits, or
 ``bwrap`` is killed, everything still inside is SIGKILLed at once, so inner
@@ -144,6 +145,29 @@ class _LandlockAttr(ctypes.Structure):
 
 def _refused(reason: str, facts: SandboxFacts | None = None) -> SandboxLaunchRefusedError:
     return SandboxLaunchRefusedError(f"the sandbox cannot be established: {reason}", facts)
+
+
+def _no_memfd() -> str:
+    """The refusal's reason on a Python without ``os.memfd_create``; "" with one.
+
+    A launch's options, its environment among them, reach ``bwrap`` only
+    through a memory file (``--args``), never a command line or a file on
+    disk, so a Python built without the call cannot launch at all (#389).
+    """
+    if getattr(os, "memfd_create", None) is not None:
+        return ""
+    return (
+        f"this Python ({platform.python_version()}, {sys.executable}) has no "
+        "os.memfd_create, the memory file through which a launch's options reach bwrap"
+    )
+
+
+def _options_file() -> int:
+    """A new close-on-exec memory file for a launch's options, or the refusal (#389)."""
+    reason = _no_memfd()
+    if reason:
+        raise _refused(reason)
+    return os.memfd_create("autoforge-bwrap-args", os.MFD_CLOEXEC)
 
 
 @dataclass(frozen=True)
@@ -476,7 +500,7 @@ class BwrapLaunch:
                 env=_environment(description, env),
             )
             data = b"".join(os.fsencode(option) + b"\0" for option in options)
-            self._args_fd = os.memfd_create("autoforge-bwrap-args", os.MFD_CLOEXEC)
+            self._args_fd = _options_file()
             view = memoryview(data)
             while view:
                 view = view[os.write(self._args_fd, view) :]
@@ -620,10 +644,14 @@ def prepare(
     ``env`` is the environment the executor selected for the command; the
     description's overrides are applied over it and ``bwrap`` hands exactly
     that to the command. Nothing is spawned except ``bwrap --version`` and
-    ``bwrap --help``, once per binary per controller process.
+    ``bwrap --help``, once per binary per controller process, and not even
+    those on a Python that cannot hand ``bwrap`` its options (:func:`_no_memfd`).
     """
     if not sys.platform.startswith("linux"):
         raise _refused(f"the outer sandbox has no backend on {sys.platform}; only Linux has one")
+    no_memfd = _no_memfd()
+    if no_memfd:
+        raise _refused(no_memfd)
     executable = shutil.which(EXECUTABLE)
     if executable is None:
         raise _refused(f"{EXECUTABLE} was not found on the controller's PATH")
@@ -644,6 +672,7 @@ class Capability(enum.Enum):
     """
 
     PLATFORM = "a Linux kernel (the only platform with a backend)"
+    INTERPRETER = "a Python with os.memfd_create, through which bwrap gets a launch's options"
     BACKEND = "bwrap (bubblewrap) on the controller's PATH"
     LANDLOCK = "the Landlock abstract-socket scope (Landlock ABI 6, Linux 6.12 or later)"
     SESSION_KEYRING = "a new session keyring"
@@ -669,6 +698,7 @@ class Capability(enum.Enum):
 # no call and is ``UNKNOWN``.
 _CLASSIFIERS: tuple[tuple[Capability, tuple[str, ...]], ...] = (
     (Capability.PLATFORM, ("has no backend on",)),
+    (Capability.INTERPRETER, ("has no os.memfd_create",)),
     (
         Capability.BACKEND,
         (

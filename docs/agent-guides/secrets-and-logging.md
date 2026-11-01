@@ -333,9 +333,9 @@ has to remember to. The writers that redact before persistence are:
   the `StepOutcome.message` it returns. Its call sites embed `GitHubError`
   messages (`gh` stderr), PR bodies and command output; they pass the raw
   text and `_block` redacts it at the sink.
-- the two agent-message writers (`status: failure` / `blocked` in the
-  REMOTE and LOCAL step paths): `block_reason` from the agent's `message`.
-  These three writers also bound the reason to `state.MAX_BLOCK_REASON_CHARS`
+- the agent-message writer (`status: failure` / `blocked` in the step
+  path): `block_reason` from the agent's `message`.
+  These two writers also bound the reason to `state.MAX_BLOCK_REASON_CHARS`
   (`state.bound_block_reason`, #88), *after* redacting it: the bound clips
   by character count and knows nothing about secrets, so a secret cut by
   the clip would no longer match its pattern if the order were reversed.
@@ -346,11 +346,11 @@ has to remember to. The writers that redact before persistence are:
   prompt inherits the redaction.
 - `_reject_next_issue`: each `next_issue_rejections` entry (rendered into
   the correction prompt and, once the bound is hit, into `block_reason`).
-- the REVIEW and FIX appliers (REMOTE and LOCAL): each agent finding and
+- the REVIEW and FIX appliers: each agent finding and
   resolution crosses `redact_dict` before it reaches `open_findings`,
   `review_history` or `last_fix_resolutions`.
-- the LOCAL validation and pre-merge verification paths: the output tail of
-  a command they quote.
+- the pre-merge verification path: the output tail of a command it
+  quotes.
 - the validation-record writers (`evidence.py`, #172): a record's or a
   marker's argv (element by element, `redact_argv`) and each stream's
   output tail. The tail is redacted over the whole captured stream before
@@ -394,8 +394,8 @@ it. `tests/test_engine.py` puts token-shaped values in the worktree path,
 a flag and a profile's model and checks that none reaches the text. A block
 reason for a checkout that moved
 (`ControllerEngine._moved_checkout_recovery`) adds the same kind of values
-only: the checkout path, the feature specification's path and commands
-with those flags. `_block` redacts it like every block reason.
+only: the checkout path and commands with those flags. `_block` redacts it
+like every block reason.
 
 A write phase's prompt describes what the agent worktree holds uncommitted
 (#187): its branch, `HEAD` and each entry's status code and path, escaped

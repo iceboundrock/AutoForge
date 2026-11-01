@@ -54,7 +54,6 @@ from autoforge.interaction import (
     InteractionOutcome,
     InteractionRequest,
     Lifecycle,
-    LocalBinding,
     Pause,
     Question,
     QuestionOption,
@@ -431,7 +430,6 @@ def test_a_session_identity_is_equal_only_to_one_that_binds_the_same_session():
         {"policy_digest": "c" * 64},
         {"session_root": "/state/sdk/b"},
         {"workflow": RemoteBinding("owner/repo", 134, "ANALYZE_EXECUTE", 2, 0)},
-        {"workflow": LocalBinding("/repo/.git/autoforge/state", "ANALYZE_EXECUTE", 1)},
     ):
         assert _identity(**change) != _identity()
 
@@ -445,8 +443,6 @@ def test_a_session_identity_is_equal_only_to_one_that_binds_the_same_session():
         (lambda: _identity(workflow={"issue": 1}), "no known mode"),
         (lambda: RemoteBinding("owner/repo", 0, "FIX", 1, 0), "at least 1"),
         (lambda: RemoteBinding("o/r", 1, "FIX", 1, 0, head_sha="abc"), "full commit id"),
-        (lambda: LocalBinding("/state", "FIX", True), "at least 1"),
-        (lambda: LocalBinding("state", "FIX", 1), "absolute path"),
     ],
 )
 def test_a_session_identity_that_could_not_be_compared_exactly_is_refused(build, rule):
@@ -973,18 +969,74 @@ def _tty(fd: int) -> bool:
 @contextmanager
 def _pipe(data: bytes, *, close: bool = True):
     """A pipe holding ``data`` (then its end, unless ``close`` is false) and a
-    text output; yields the read end and the output."""
+    text output; yields the read end and the output.
+
+    What the pipe's buffer takes is written before the yield, the rest by a
+    thread as the pipe is read. A new pipe's buffer is 64 KiB, but only 8 KiB
+    once the user's pipes hold more than ``fs.pipe-user-pages-soft``, and
+    writing more than it takes before anything reads blocked for ever (#259).
+    """
     r, w = os.pipe()
+    feeder = None
     try:
-        os.write(w, data)
-        if close:
+        os.set_blocking(w, False)
+        try:
+            sent = os.write(w, data) if data else 0
+        except BlockingIOError:
+            sent = 0
+        os.set_blocking(w, True)
+        if sent < len(data):
+            feeder = threading.Thread(target=_feed, args=(w, data[sent:], close))
+            feeder.start()
+            if close:
+                w = -1  # the feeder closes it once everything is written
+        elif close:
             os.close(w)
             w = -1
         yield r, io.StringIO()
     finally:
-        os.close(r)
+        os.close(r)  # a feeder still writing then stops: the read end is gone
+        if feeder is not None:
+            feeder.join()
         if w != -1:
             os.close(w)
+
+
+def _feed(w: int, rest: bytes, close: bool) -> None:
+    """Write ``rest`` to ``w`` as the pipe is read, then close it if ``close``."""
+    try:
+        while rest:
+            rest = rest[os.write(w, rest) :]
+    except BrokenPipeError:
+        pass  # read no further: the resolver was done
+    finally:
+        if close:
+            os.close(w)
+
+
+def test_the_input_pipe_takes_more_than_the_pipe_buffer_holds(monkeypatch):
+    """#259: a pipe of 4 KiB, as a host over ``fs.pipe-user-pages-soft`` makes
+    them, still yields all of a test's typed input, then its end."""
+    real_pipe = os.pipe
+
+    def small_pipe():
+        r, w = real_pipe()
+        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)  # shrinking is always permitted
+        return r, w
+
+    monkeypatch.setattr(os, "pipe", small_pipe)
+    data = b"x" * 20000 + b"\nc\n"
+    got: list[bytes] = []
+
+    def read_all():
+        with _pipe(data) as (fd, _):
+            got.append(_drained(fd))
+
+    reader = threading.Thread(target=read_all, daemon=True)
+    reader.start()
+    reader.join(30)
+    assert not reader.is_alive(), "_pipe blocked on a pipe its input does not fit"
+    assert got == [data]
 
 
 def _resolve(request, data: bytes, *, close: bool = True, deadline: float | None = None):

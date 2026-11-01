@@ -13,6 +13,7 @@ import pytest
 from autoforge import __prompt_version__, config
 from autoforge.child_env import FORBIDDEN_ENV_NAMES, FORBIDDEN_ENV_PREFIXES, forbidden_env_entry
 from autoforge.config import default_config, load_config_file, validate_required_profiles
+from autoforge.config_fingerprint import fingerprint_routing
 from autoforge.errors import ConfigurationError
 from autoforge.profiles import REQUIRED_PROFILES
 from autoforge.validation import parse_github_url, validate_epic_and_issue
@@ -214,6 +215,80 @@ def test_a_prompt_version_repeating_the_built_in_label_loads(tmp_path):
     assert load_config_file(p).prompt_version == __prompt_version__
 
 
+# -- #259: the starter configurations under examples/ ---------------------------
+EXAMPLES = Path(__file__).parents[1] / "examples"
+STARTERS = sorted(EXAMPLES.glob("*.yaml"))
+
+
+def _launch(profile: config.ProfileConfig) -> tuple:
+    """What a profile launches: the fields a starter must get right."""
+    return (
+        profile.provider,
+        profile.model,
+        profile.effort,
+        profile.command,
+        profile.options,
+        profile.extra_args,
+    )
+
+
+def test_the_examples_directory_holds_the_two_starters():
+    assert [p.name for p in STARTERS] == [
+        "starter-claude-only.yaml",
+        "starter-two-providers.yaml",
+    ]
+
+
+@pytest.mark.parametrize("path", STARTERS, ids=lambda p: p.stem)
+def test_a_starter_loads_and_validates_on_both_yaml_backends(path, yaml_backend):
+    """A starter goes through what `run` checks before it creates a run: the
+    loader's key checks, every profile a REMOTE run can reach (update_epic
+    included) and the routing the run records. A starter that rots fails here."""
+    cfg = load_config_file(path)
+    validate_required_profiles(cfg, [*REQUIRED_PROFILES, "update_epic"])
+    fingerprint_routing(cfg)
+    assert set(cfg.profiles) == set(default_config().profiles)
+    # A first run stops at READY_FOR_MERGE, outside a sandbox the operator never set up.
+    assert cfg.merge_allowed_by_config is False
+    assert cfg.safety.required_checks == ["ci"]
+    assert not cfg.sandbox.enabled
+
+
+@pytest.mark.parametrize("path", STARTERS, ids=lambda p: p.stem)
+def test_both_yaml_backends_read_a_starter_alike(path):
+    """`uv tool install autoforge-cli` comes without PyYAML, so the subset
+    parser is what a first run reads a starter with."""
+    yaml = pytest.importorskip("yaml")
+    text = path.read_text(encoding="utf-8")
+    assert config._minimal_yaml_parse(text) == yaml.safe_load(text)
+
+
+def test_the_two_provider_starter_is_the_built_in_routing():
+    """Written out, not changed: a run started with it records what a run
+    without --config records."""
+    cfg = load_config_file(EXAMPLES / "starter-two-providers.yaml")
+    built_in = default_config()
+    assert {name: _launch(p) for name, p in cfg.profiles.items()} == {
+        name: _launch(p) for name, p in built_in.profiles.items()
+    }
+    assert fingerprint_routing(cfg) == fingerprint_routing(built_in)
+
+
+def test_the_claude_only_starter_launches_every_profile_like_the_built_in_claude_ones():
+    """A profile that switches provider starts from nothing (#259), so the
+    starter writes the Claude Code options out; each profile launches what
+    the built-in analyze_execute launches, with its own effort."""
+    cfg = load_config_file(EXAMPLES / "starter-claude-only.yaml")
+    implementer = default_config().profile("analyze_execute")
+    for name, profile in cfg.profiles.items():
+        assert profile.provider == "claude", name
+        assert profile.options == implementer.options, name
+        argv = profile.build_command("prompt")
+        assert argv[0] == "claude", name
+        assert "--permission-mode" in argv and "bypassPermissions" in argv, name
+    assert cfg.profile("review_round_6_plus").effort == "medium"
+
+
 def test_json_config_overrides_model(tmp_path):
     p = tmp_path / "cfg.json"
     p.write_text(
@@ -285,7 +360,7 @@ def test_the_sandbox_is_disabled_by_default(tmp_path):
     cfg = default_config().sandbox
     assert (cfg.mode, cfg.validation_network, cfg.premerge_network) == ("disabled", "host", "host")
     assert not cfg.enabled and cfg.read_only_paths == []
-    assert not cfg.refuses_unenforced(local=True) and not cfg.refuses_unenforced(local=False)
+    assert not cfg.refuses_unenforced()
 
 
 @pytest.mark.parametrize(
@@ -308,18 +383,18 @@ def test_the_sandbox_section_is_read(tmp_path, name, text):
     p.write_text(text, encoding="utf-8")
     cfg = load_config_file(p).sandbox
     assert cfg.mode == "required" and cfg.enabled
-    assert cfg.refuses_unenforced(local=True) and cfg.refuses_unenforced(local=False)
+    assert cfg.refuses_unenforced()
     assert (cfg.validation_network, cfg.premerge_network) == ("isolated", "isolated")
 
 
-def test_preferred_falls_back_in_local_only(tmp_path):
-    """ADR 0005 D12.2: REMOTE's ``preferred`` refuses exactly as ``required`` does."""
+def test_preferred_refuses_unenforced_exactly_as_required_does(tmp_path):
+    """ADR 0005 D12.2, ADR 0009 D7: ``preferred`` refuses exactly as
+    ``required`` does; its fallback was LOCAL's alone and went with it."""
     p = tmp_path / "cfg.yaml"
     p.write_text("version: 1\nsandbox:\n  mode: preferred\n", encoding="utf-8")
     cfg = load_config_file(p).sandbox
     assert cfg.mode == "preferred" and cfg.enabled
-    assert not cfg.refuses_unenforced(local=True)
-    assert cfg.refuses_unenforced(local=False)
+    assert cfg.refuses_unenforced()
 
 
 def _read_only_paths(tmp_path, monkeypatch, paths, **env):
@@ -793,10 +868,9 @@ def test_known_key_tables_name_real_fields(keys, config_cls):
 
     names = {f.name for f in fields(config_cls)}
     assert set(keys) <= names, set(keys) - names
-    # Fields the loader deliberately does not read from the file. `local` is
-    # LocalConfig at its defaults, which no file sets since its key went
-    # (ADR 0009 D5, #387) and which goes with the LOCAL code (#388).
-    derived = {"allow_merge_source", "name", "local"}
+    # Fields the loader deliberately does not read from the file. `local`
+    # is not one: LocalConfig went with the LOCAL code (ADR 0009, #388).
+    derived = {"allow_merge_source", "name"}
     assert names - set(keys) <= derived, names - set(keys) - derived
 
 
@@ -1507,13 +1581,15 @@ def test_a_local_block_of_any_shape_is_an_unknown_top_level_key(tmp_path, name, 
     assert "must be a mapping" not in message
 
 
-def test_local_defaults_are_the_documented_ones():
-    local = default_config().local
-    assert local.max_fix_rounds == 1
-    assert local.validation_commands == []
-    assert local.exclude == []
-    assert local.max_workspace_entries == 50_000
-    assert local.max_workspace_bytes == 512 * 1024 * 1024
+def test_the_configuration_has_no_local_section():
+    """LocalConfig is gone with the LOCAL code (ADR 0009 A.1, #388): the
+    configuration has no ``local`` attribute for any code to read."""
+    from dataclasses import fields
+
+    cfg = default_config()
+    assert "local" not in {f.name for f in fields(type(cfg))}
+    assert not hasattr(cfg, "local")
+    assert not hasattr(config, "LocalConfig")
 
 
 # -- safety.required_checks (issue #41) -------------------------------------------------

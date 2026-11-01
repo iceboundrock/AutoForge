@@ -71,6 +71,21 @@ _linux_only = pytest.mark.skipif(
 )
 
 
+def _needs_memfd() -> None:
+    """Skip a test that hands options to a backend, on a Python without ``os.memfd_create``.
+
+    Such a Python (uv's CPython 3.12.13 build has none, #389) cannot launch
+    at all: the backend refuses every launch before anything is spawned,
+    which :func:`test_a_python_without_memfd_create_refuses_every_launch`
+    and the tests beside it hold on every interpreter.
+    """
+    if getattr(os, "memfd_create", None) is None:
+        pytest.skip(
+            "this Python has no os.memfd_create, so the backend refuses every launch "
+            "(test_a_python_without_memfd_create_refuses_every_launch)"
+        )
+
+
 # ------------------------------------------------------------------ helpers
 
 
@@ -1160,6 +1175,7 @@ class FakeBwrap:
 
 @pytest.fixture
 def fake_bwrap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeBwrap:
+    _needs_memfd()
     root = tmp_path / "fakebin"
     root.mkdir()
     script = root / "bwrap"
@@ -1356,6 +1372,9 @@ def test_a_host_without_the_backend_refuses(
     empty = tmp_path / "empty-bin"
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty))
+    if getattr(os, "memfd_create", None) is None:
+        # A Python without it is refused first (#389); never called here.
+        monkeypatch.setattr(os, "memfd_create", lambda *_args: -1, raising=False)
     description = _description(tmp_path)
     with pytest.raises(SandboxLaunchRefusedError, match="bwrap was not found"):
         if duplex:
@@ -1660,6 +1679,7 @@ def test_the_probe_tells_a_keyring_failure_from_a_landlock_one(
 
 
 def _launch(tmp_path: Path) -> sandbox_bwrap.BwrapLaunch:
+    _needs_memfd()
     return sandbox_bwrap.BwrapLaunch(
         _description(tmp_path), _FULL, "/usr/bin/bwrap", ["/bin/true"], cwd=None, env={}
     )
@@ -1706,6 +1726,7 @@ def test_an_end_is_a_setup_failure_only_without_an_exit_record(
 def test_the_options_travel_in_a_descriptor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _needs_memfd()
     monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _NoScope)
     launch = sandbox_bwrap.BwrapLaunch(
         _description(tmp_path),
@@ -1736,6 +1757,12 @@ def test_the_options_travel_in_a_descriptor(
     ("reason", "capability"),
     [
         ("the outer sandbox has no backend on darwin; only Linux has one", "platform"),
+        (
+            "the sandbox cannot be established: this Python (3.12.13, /opt/py/bin/python3.12) "
+            "has no os.memfd_create, the memory file through which a launch's options reach "
+            "bwrap",
+            "interpreter",
+        ),
         ("bwrap was not found on the controller's PATH", "backend"),
         ("/usr/bin/bwrap --version failed (exit 1)", "backend"),
         (
@@ -1890,3 +1917,63 @@ def test_the_probe_writes_nothing_it_leaves_behind(
     monkeypatch.setattr(tempfile, "tempdir", None)
     assert sandbox_bwrap.probe(home=str(tmp_path), environ={}).supported
     assert list(scratch.iterdir()) == []
+
+
+# ------------------------- a Python without os.memfd_create (#389, PR #425 R1-F2)
+#
+# A launch's options, its environment among them, reach bwrap only through a
+# memory file, so a Python built without os.memfd_create (uv's CPython 3.12.13
+# build has none) cannot launch. Each test removes the call, so it holds on
+# every interpreter, the ones without it included.
+
+
+def _without_memfd(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    monkeypatch.delattr(os, "MFD_CLOEXEC", raising=False)
+
+
+@_linux_only
+def test_a_python_without_memfd_create_refuses_every_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_spawn: None
+) -> None:
+    """Fail-closed and typed: a refusal that names the call, before anything is
+    spawned (not even ``bwrap --version``; ``no_spawn`` fails the test on a
+    spawn), never an ``AttributeError`` and never a launch without the
+    sandbox. The executor's containment stays free, and no descriptor stays
+    open, a backend launch made directly included."""
+    _without_memfd(monkeypatch)
+    description = _description(tmp_path)
+    with pytest.raises(SandboxLaunchRefusedError, match="has no os.memfd_create") as prepared:
+        sandbox_bwrap.prepare(description, ["/bin/true"], cwd=None, env={})
+    assert sandbox_bwrap.classify(str(prepared.value)) is sandbox_bwrap.Capability.INTERPRETER
+    before = sorted(os.listdir("/proc/self/fd"))
+    with pytest.raises(SandboxLaunchRefusedError, match="has no os.memfd_create"):
+        execute(
+            ExecutionRequest(
+                command=["/bin/true"], timeout_seconds=30, sandbox=description, contain_orphans=True
+            )
+        )
+    assert not executor._CONTAINMENT_LOCK.locked()
+    monkeypatch.setattr(sandbox_bwrap, "_ProcessScope", _NoScope)
+    with pytest.raises(SandboxLaunchRefusedError, match="has no os.memfd_create"):
+        sandbox_bwrap.BwrapLaunch(
+            description, _FULL, "/usr/bin/bwrap", ["/bin/true"], cwd=None, env={}
+        )
+    assert sorted(os.listdir("/proc/self/fd")) == before
+
+
+@_linux_only
+def test_the_probe_says_a_python_without_memfd_create_cannot_enforce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_spawn: None
+) -> None:
+    """What ``doctor`` and the pre-launch gate are told: unsupported, the
+    interpreter named as what this host cannot provide, nothing spawned."""
+    _without_memfd(monkeypatch)
+    result = sandbox_bwrap.probe(home=str(tmp_path), environ={})
+    assert not result.supported
+    assert result.capability is sandbox_bwrap.Capability.INTERPRETER
+    assert result.capability.key == "interpreter"
+    assert "has no os.memfd_create" in result.reason
+    assert result.describe().startswith(
+        "unsupported: this host cannot provide a Python with os.memfd_create"
+    )

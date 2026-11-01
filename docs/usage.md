@@ -3,7 +3,8 @@
 How to drive an EPIC and its issues through AutoForge's GitHub workflow:
 the commands, where a run stops and what to do there, and how to recover.
 For the config file see [Configuration](configuration.md). Installation and
-prerequisites are in the [README](../README.md#prerequisites).
+prerequisites are in the [README](../README.md#prerequisites); a stopped or
+failed run, by symptom, in [Troubleshooting and recovery](troubleshooting.md).
 
 The commands are written `uv run autoforge ...`, the form inside a
 development clone of AutoForge. With the command installed
@@ -77,7 +78,7 @@ uv run autoforge unblock --decline-action X-0123456789abcdef \
 Pass a config file with the global option, before the subcommand:
 `uv run autoforge --config autoforge.yaml run ...`. `run --force` discards an
 existing non-terminal run (an unreadable state file is moved aside rather
-than deleted; see [Troubleshooting](#troubleshooting-and-recovery)).
+than deleted; see [Troubleshooting: the state file](troubleshooting.md#the-state-file)).
 `--full-prompt` prints the whole rendered prompt in a dry run.
 
 To run several issues of an EPIC at once, see
@@ -112,7 +113,7 @@ never advances the state machine. In brief:
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`), which makes no GitHub write | one durable transaction; the agent commits on its worktree's detached HEAD at the default branch head the controller recorded, and the controller checks that HEAD itself (the reported SHA, descent from that base, every commit message), pushes it to `autoforge/<n>-replan-<transaction id>`, creates the replacement PR with the agent's title and body followed by the controller's markers, journalling each write before it is sent, and binds the PR only at exactly the pushed HEAD, so a crash or `resume` never pushes or creates twice; a replacement branch or a marker PR it did not write rejects the transaction; the old PR is closed by the controller only while both PRs still match their checkpoints |
 | `READY_FOR_MERGE` | nobody | holding state; with the merge gate open, the full pre-merge verification runs before `MERGE` is entered |
 | `MERGE` (gated) | controller, never an agent | `gh pr merge --match-head-commit <reviewed HEAD>`, counted only once GitHub reports `MERGED` at that HEAD into the reviewed base |
-| `UPDATE_EPIC` | OpenCode (`update_epic`), which makes no GitHub write | the controller (not the agent) posts the progress comment and writes the roadmap section, journals each write before performing it and reads it back, so a crash or `resume` never posts a second comment; a marker comment it did not post blocks; the next issue gets the `INITIALIZING` checks; `null` -> `DONE` |
+| `UPDATE_EPIC` | OpenCode (`update_epic`), which makes no GitHub write | the controller (not the agent) posts the progress comment and writes the roadmap section, journals each write before performing it and reads it back, so a crash or `resume` never posts a second comment; a marker comment it did not post blocks; the next issue gets the `INITIALIZING` checks and must be a native sub-issue of the EPIC with no sub-issues of its own, as `epic run` admits (#287); `null` -> `DONE` only when GitHub's complete listing of the EPIC's sub-issues holds none the run could still select (a listing short of the EPIC's count is `BLOCKED`) |
 
 The complete per-phase verification, including what each phase reads
 *before* it launches an agent so a re-entry never duplicates work, is in
@@ -150,7 +151,7 @@ exact triggers are in [Workflow: loop bounds](agent-guides/workflow.md#loop-boun
 
 When the loop reaches `READY_FOR_MERGE` with the merge gate closed (the
 default) the CLI prints a banner with the issue, PR, review round and reviewed
-HEAD, and states that automatic merge is disabled: a human merges the PR.
+HEAD, and states that the merge gate is closed: a human merges the PR.
 `resume` without the gate open re-prints the banner and runs nothing. The
 banner's `Review certificate:` line says whether the round's certificate
 applies, checked against the state and the configuration in force (GitHub
@@ -230,13 +231,51 @@ that text as `\^[`, so the read-back saw another body) needs only
 binds it, with nothing written again
 ([GitHub safety](agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)).
 `REVIEW` blocks on a comment carrying the round's review marker that it did
-not post, whether it was there before the reviewer ran (a human's, or one a
-reviewer of an earlier AutoForge version posted) or appeared while it ran:
-the controller never adopts, edits or duplicates it. Delete the comment or
-its marker, then `unblock`, and the round runs (or, when the reviewer's
-result was already accepted, its comment is posted from the plan without
-running the reviewer again). `FIX` blocks on follow-up issues it did not
-write: two open issues carrying one finding's follow-up marker, or an
+not post, whether it was there before the reviewer ran or appeared while it
+ran: the controller never adopts, edits or duplicates it, whoever wrote it.
+Two or more such comments block the same way and are named together; the
+controller never chooses between them. The reason says what this run did
+before the block:
+
+- found on entering the phase, before any reviewer was launched: nothing
+  was launched or posted;
+- found before a relaunch (the correction of a result the controller could
+  not use, or the retry of a transient failure): a reviewer was launched
+  and ended without a usable result, and the reason names that launch's
+  directory in the run log;
+- found when the run is resumed after a launch of the round that did not
+  complete it (a crash, a kill, a failure, a result that did not verify):
+  that reviewer ran or may have run, and the reason names the run log, in
+  which its step directory (ending in `-review-<attempt>`) says which, if
+  the launch got that far. It claims no result;
+- found after the reviewer returned a result the controller accepted: a
+  reviewer ran, and the reason names the file that holds its result,
+  `control-result.json` in that launch's directory of the run log. Nothing
+  was planned or posted, so that file is the only record of the result.
+
+The controller cannot tell who posted the comment, and the remedy depends
+on it, so check first:
+
+- **A stray or foreign comment** (a human's, an agent's that still held a
+  credential, or one a reviewer of an earlier AutoForge version posted):
+  delete the comment or its marker (every one of them, when the reason
+  names several), then `unblock`, and the round runs. If a reviewer was
+  launched before the block, the reviewer runs again and nothing in the run
+  log is reused.
+- **Another AutoForge controller's run** under the same GitHub login, on
+  another machine or in another clone or state directory: the comment (or
+  one of those named) is that run's own journaled review, and its `FIX` may
+  already be working from it. Do not delete it and do not `unblock`:
+  `unblock` re-binds the PR's HEAD, so once the other run has pushed, this
+  one would post a competing review. Stop one of the two runs.
+
+A comment carrying the marker that appears after the reviewer's result was
+accepted and its comment planned blocks as a conflict instead: once it is
+removed, `unblock` posts the comment from the plan without running the
+reviewer again.
+
+`FIX` blocks on follow-up issues it did not write: two open issues
+carrying one finding's follow-up marker, or an
 unreadable follow-up marker on any open issue (close or repair the extra
 or unreadable issue, then `unblock`); a follow-up issue that appeared or
 disappeared while the fixer ran (if it is the finding's follow-up,
@@ -654,7 +693,7 @@ scheduler keeps the repository lock until it exits, so wait for it (or
 | Exit | `epic run` / `epic resume` |
 |---|---|
 | 0 | nothing more is admissible and no claim is left open, or a drain finished |
-| 1 | global uncertainty: admission degraded (the snapshot, `scheduler.json` or a namespace could not be trusted); see `epic status` |
+| 1 | global uncertainty: admission degraded (the snapshot, `scheduler.json`, a namespace, or a standalone state of a protocol this controller does not read could not be trusted; [A run a newer controller wrote](#a-run-a-newer-controller-wrote)); see `epic status` |
 | 2 | refused before anything ran: the repository lock is held (a scheduler, a standalone command or a surviving worker), open claims (`epic run`), `--state-dir`, an EPIC of another repository than the checkout's `origin` |
 | 3 | it ended with claims of the EPIC still open (each is listed with its next command): `epic status`, then `epic resume` or `epic archive` |
 | 130 | interrupted: Ctrl-C, a signal, or `epic stop --now` |
@@ -748,7 +787,7 @@ set by execution.default_idle_timeout_seconds`, or `... reached its 7200s
 maximum runtime and was killed. The limit is set by
 profiles.analyze_execute.max_runtime_seconds`. The state is unchanged,
 nothing is retried automatically, the error says where to look and how to
-resume ([Troubleshooting](#troubleshooting-and-recovery)), and the step's
+resume ([Troubleshooting](troubleshooting.md#state-unchanged-an-agent-launch-failed)), and the step's
 `execution.json` records `timeout_limit` (`idle` or `max_runtime`), both
 configured values and `last_activity_at`: when the executor last saw
 output on the agent's stdout or stderr before it decided to end the run.
@@ -918,7 +957,7 @@ the step's `execution.json` records it (`loop`, `loop_warnings`).
   exactly as on a timeout: its whole process group is ended, the state is
   unchanged and nothing is retried automatically. The error names the
   pattern, followed by where to look and how to resume
-  ([Troubleshooting](#troubleshooting-and-recovery)):
+  ([Troubleshooting](troubleshooting.md#an-agent-was-killed-idle-timeout-maximum-runtime-loop)):
 
   ```text
   agent 'fix' was killed: the same 2-step action cycle (Bash, Read) repeated 8 times over 9m14s with no new action
@@ -1140,223 +1179,169 @@ ownership or discard uncommitted user changes.
 
 ## Troubleshooting and recovery
 
-- **The process was interrupted** (`Ctrl-C`, a killed process, a reboot):
-  run `autoforge resume`. State is written atomically, and every phase that
-  launches an agent reads its journal and GitHub first, so work already
-  done (an open PR, a review comment the controller posted, a pushed fix)
-  is adopted or completed rather than repeated. See
-  [Workflow: re-entering a phase](agent-guides/workflow.md#re-entering-a-phase).
-- **An agent failed, timed out or returned a malformed result:** a malformed
-  `CONTROL_RESULT` from an agent that exited 0 is retried with a correction
-  prompt (`execution.max_correction_attempts`, default once). The controller
-  reads the block only from the end of the agent's final reply, never from
-  a command's output or a file, and the correction prompt quotes the end of
-  the refused reply (its last 4,000 characters, redacted, fenced as
-  untrusted data) after the controller's diagnosis, so the new session can
-  see what the previous one said it had done; it still checks that against
-  the worktree. The correction's `request.json` records the quote's sizes
-  (`metadata.correction_reply`), its `prompt.md` the quote as sent. A
-  `resume` after a crash or a spent correction budget quotes nothing. No
-  correction is launched when the refused launch may have left a process
-  running: then the error says so
-  (`Not re-invoked: a process the launch started may still be running`,
-  followed by which one); stop it before `resume`. The one failed
-  exit relaunched automatically is a launch its adapter reports as transient
-  (today an OpenCode `openai/*` run whose errors are all `WebSocket closed
-  with code 1000`, `WebSocket closed with code 1008` or OpenAI's generic
-  `server_error: An error occurred while processing your request. ...`,
-  even when the session recovered from it and printed a result: OpenCode
-  exits 1 once it has printed one, and a result from a failed exit is not
-  read; and a Claude Code `stream-json` run whose turn ended on a model API
-  error with status 408 or 5xx once the CLI's own retries were spent, 529
-  overloaded among them, but never another 4xx such as a 429): a REMOTE run
-  relaunches it at most twice per step, after
-  re-reading GitHub, and when it stops the error says why ("not relaunched:
-  ..."). Any other non-zero exit, a timeout or a verification failure is not
-  retried automatically and leaves the phase unchanged for `resume`. Inspect
-  each invocation under `<state dir>/logs/<run-id>/`; a transient failure's
-  `error.txt` says `(transient: ...)`. A timeout says which limit fired and
-  the key that set it; see [Reading an idle timeout](#reading-an-idle-timeout)
-  before raising one.
+What to do when a run stops, fails or refuses, indexed by what you see, is
+in [Troubleshooting and recovery](troubleshooting.md): `BLOCKED`, `FAILED`
+and "State unchanged", agent failures and kills, provider errors, an
+interrupted process, `resume` versus `unblock`, stopping a run safely, lock
+contention, what a change on GitHub does to a run, the exit codes, and the
+recovery scenarios with the tests that hold them. The sections below are
+the reference it links to for four mechanisms.
 
-  Every agent failure that leaves the phase unchanged (a timeout or loop
-  kill, a failed exit or provider failure, an agent that could not be
-  started, a malformed result that is not corrected) ends the same way:
+### A run a newer controller wrote
 
-  ```text
-  autoforge: error: agent 'analyze_execute' made no progress for 1800s (last activity 08:31:02 UTC) and was killed. The limit is set by profiles.analyze_execute.idle_timeout_seconds
-  State unchanged.
-    worktree:  /home/me/code/.worktree/159   (3 uncommitted paths)
-    logs:      .autoforge/AutoForge-issue-159/logs/af-20261006T101500Z-3f2a9c/001-analyze_execute-1/
-    resume:    autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 resume
-  Inspect the real Git/GitHub state first; 'resume --dry-run --max-steps 1' with the same flags shows the profile, limits and worktree it will use.
-  ```
+Every `state.json` records the protocol of the controller that saved it
+(`protocol_version`). A controller reads its own protocol and every older
+one it has a rule for, and refuses a newer one: it cannot know what the
+newer fields and phases mean, and guessing could act on a run it
+misunderstands. The refusal is correct. What it cannot know is which
+controller you meant to run, so it says which one it is:
 
-  - `worktree` is the issue's agent worktree, with the number of paths
-    `git status` reports there as changed or untracked: what the attempt
-    left behind. The count is left out when that read fails. AutoForge
-    leaves those changes where they are, and the next launch of a phase
-    that writes (`ANALYZE_EXECUTE`, `FIX`, `REPLAN_REEXECUTE`) is told
-    about them: its prompt names the worktree's branch and `HEAD` and lists
-    each change's status code and path (at most 50, never file content),
-    and asks the agent to inspect them and then continue from them or
-    discard them deliberately, saying which. The invocation's
-    `request.json` records what was found (`metadata.worktree_state`), or
-    why the read failed, in which case the prompt describes nothing.
-  - `logs` is the failed launch's step directory (its progress, output and
-    error).
-  - `resume` repeats the `--config` and `--state-dir` this command was
-    started with, as you typed them; run it from the same directory. The
-    CLI does not look for a configuration file, so a bare `resume` after a
-    run started with them finds no run (no `--state-dir`) or would run on
-    the built-in defaults (no `--config`): another model, other limits and
-    another worktree. A REMOTE run refuses that: see
-    [the configuration a run was recorded under](#the-configuration-a-run-was-recorded-under).
-- **"the agent asked for permission (...)" or "an answer to a question"**
-  in a failure: see
-  [An agent asked for permission or input](#an-agent-asked-for-permission-or-input).
-- **"run ... was recorded under ..., and this command's configuration
-  differs from it"** (exit 2): see
-  [the configuration a run was recorded under](#the-configuration-a-run-was-recorded-under).
-- **The run is `BLOCKED`:** read `autoforge status`, fix the cause, then
-  `autoforge unblock --reason "..."` and `autoforge resume` (see above),
-  with the `--config` / `--state-dir` the run was started with; `unblock`
-  prints that `resume` command. A run blocked because the checkout the
-  controller is run from moved (an agent committed, reset or switched
-  branches) ends with where to look and what to run, already carrying
-  those flags:
+```text
+autoforge: error: state file /home/me/code/AutoForge/.autoforge/AutoForge-issue-243/state.json: unsupported protocol_version '11' (controller speaks '10'): a newer AutoForge wrote it
+AutoForge controller/state protocol mismatch
+  state:      /home/me/code/AutoForge/.autoforge/AutoForge-issue-243/state.json (protocol_version '11')
+  recorded:   run af-20261021T164241Z-60c7a5, written by autoforge 0.1.0 (as the file says; it was not loaded)
+  controller: autoforge 0.1.0, protocol 10 (reads 1-5 and 7-10), prompt v11
+  import:     /home/me/code/AutoForge/src/autoforge/__init__.py
+  python:     /home/me/code/AutoForge/.venv/bin/python
+  cwd:        /home/me/code/AutoForge
+  result:     refused: the state file and its run logs were not rewritten, the agent worktree was not touched, no agent was launched and nothing was written to GitHub
+  next:       a newer controller wrote this run. With one that speaks protocol 11, from the cwd above and with this command's --config and --state-dir, start with:
+                <an autoforge that speaks protocol 11> --config /home/me/autoforge.yaml --state-dir .autoforge/AutoForge-issue-243 status
+              What an interpreter imports: <its python> -c 'import autoforge as a; print(a.__protocol_version__, a.__file__)'
+              Leave the state file as it is: no edit of it, and no older controller, continues this run.
+```
 
-  ```text
-    checkout:  /home/me/code/AutoForge
-    unblock:   autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 unblock --reason '<what you found>'
-    resume:    autoforge --config autoforge.yaml --state-dir .autoforge/AutoForge-issue-159 resume
-  Inspect the checkout and the agent's GitHub work first: 'unblock' re-inspects GitHub and re-enters a phase, and only then does 'resume' continue the run.
-  ```
+This is what a protocol-10 controller with this diagnostic would print in
+the case described below; the paths are illustrative. Each line is read
+from the running process, not assumed: `import` is the `__file__` of the
+`autoforge` package Python actually imported, `python` is
+`sys.executable`, and the protocol is what that package declares. Package metadata, the branch of
+a checkout and the `uv` project you think you selected are not consulted.
+`recorded` is what the refused file says about itself, shown only when
+it has the shape a controller writes; nothing else of the file is
+vouched for. The `next` command names the flags this command was given,
+as typed, and a placeholder for the controller: AutoForge does not know
+where a compatible one is. A flag value is repeated only when it can be
+shown exactly as typed: one holding a character that is not printable (a
+newline, an escape sequence), longer than 1024 characters or shaped like
+a credential is replaced by a labelled placeholder (`<the --state-dir
+value this command was given>`), and a line under the command says so;
+put back the value you typed. Every path in the block, the first line's
+included, is redacted, escaped as a Python string when it holds a
+character that is not printable, and cut at 1024 characters, in that
+order.
 
-- **"refusing to launch: a process AutoForge launches would be handed a
-  GitHub or git credential":** the message names the setting (for example
-  a credential helper in the repository's git configuration, a remote URL
-  with a token, a GitHub entry in `~/.netrc`, or the startup files of a
-  login shell that change a variable such as `GH_TOKEN`). Nothing was recorded:
-  remove the setting (`autoforge doctor` lists it too) and run the same
-  command again. A config that fails to load because `env_allowlist` names
-  a variable `gh` or git reads a credential from: delete that entry
-  ([Configuration: agent environment](configuration.md#agent-environment)).
-- **"refusing to launch opencode: it would load the configuration of an
-  organization connected to it":** OpenCode would load an organization's
-  configuration, which may name an MCP server with a GitHub credential of
-  its own, and nothing turns it off. Nothing was recorded: give AutoForge's
-  OpenCode launches a database of their own (`OPENCODE_DB`, see
-  [Configuration: agent environment](configuration.md#agent-environment))
-  and run the same command again.
-- **"this host cannot enforce the outer sandbox: it cannot provide ..."**
-  (`SandboxCapabilityError`, exit 2; `sandbox.mode: required` or
-  `preferred`): the pre-launch gate refused the step. Nothing was launched,
-  saved or charged. `autoforge doctor` shows the same capability row; make
-  the host capable (install `bwrap`, allow unprivileged user namespaces, a
-  kernel with Landlock ABI 6 that booted with Landlock enabled; the row's
-  reason says which of the two a kernel lacks, see
-  [Compatibility](compatibility.md#outer-sandbox)), or set
-  `sandbox.mode: disabled` (logical isolation only), and run the same
-  command again.
-- **"the configuration file ... lies in ..., a tree that launches inside
-  the outer sandbox write"** (exit 2; also "is reached through ...", "has
-  N hard links" or "opens another file than its lookup walk was followed
-  to"; "the sandbox declaration of profile ... cannot be read" when a
-  provider's declaration could not be asked): under `required` or
-  `preferred` the `--config` file is where an enforced launch could
-  rewrite it, or is not shown not to be (#280). Nothing was run, launched or
-  written. "Is reached through" names a directory of such a tree the path
-  looks a name up in: a symbolic link leads there, or the path passes
-  through it before a `..`, which is followed as the command opens it,
-  never tidied. When the directory is a provider's (the message names
-  `$CLAUDE_CONFIG_DIR`, `$PI_CODING_AGENT_DIR` or `$OPENCODE_DB` and the
-  profiles whose launches write it), every enforced launch of that
-  provider writes it, wherever it lies. Move the file outside the
-  checkout, every worktree of the repository and every such directory,
-  for example to `~/.config/autoforge/`, and pass its own path; or give
-  the provider another directory; or set `sandbox.mode: disabled`.
-  `doctor` reports the same in its config row and runs none of the
-  commands the file names.
-- **"run ... is pinned to sandbox.mode ..., and this command's
-  sandbox.mode, ..., contains its launches less"** (exit 2): the command
-  runs under a weaker mode than the run was created under, often because
-  it was run without the run's `--config`. Nothing was written. Run it with
-  a configuration that sets the pinned mode, or repeat it with
-  `--accept-config-change` to continue under the weaker one (recorded in
-  the run log).
-- **"sandbox.read_only_paths[N] ... overlaps ..., which no launch may see":**
-  an operator read-only path names, contains or lies inside the state
-  directory, the lock, `<git common dir>/autoforge`, another worktree or
-  your checkout. Nothing was launched; narrow or remove the entry.
-- **"the sandbox cannot be established ..."** (`SandboxLaunchRefusedError`,
-  the sandbox enforced): the launch did not run, and nothing ran
-  without the sandbox. The message names the cause: a backend that failed
-  to set the sandbox up after the gate passed, a sandbox directory that is a link, or a path and the
-  policy rule it breaks ("sandbox policy refuses <path>: <rule>"), such as
-  a `CLAUDE_CONFIG_DIR`, `OPENCODE_DB` directory or `PI_CODING_AGENT_DIR`
-  inside the provider's own configuration directory
-  ([Configuration: provider credentials](configuration.md#provider-credentials-under-required)).
-  For an agent the phase is unchanged: fix the cause, or set
-  `sandbox.mode: disabled`, and `resume`. A refused validation command
-  leaves the phase unverified; a refused pre-merge command blocks the merge
-  like a failing one. "the agent was not launched: the strict import ...
-  failed" is the same refusal, in either mode, for objects an earlier
-  enforced launch left in the issue's private object directory that the
-  controller cannot import; inspect the directory before resuming.
-- **"the agent worktree ... is not bound to the repository":** the
-  worktree's `.git` file and the repository's worktree registry disagree
-  (the worktree or the repository was moved, or something rewrote the
-  pointer). The controller reads a worktree only through the registry entry
-  that names it, so nothing was launched. Run `git worktree repair` in the
-  repository (or `git worktree repair <worktree>`), then `resume`.
-- **`BLOCKED`: "the private object directory ... has been tampered with":**
-  an `info/alternates` file, a link or another entry no object store holds
-  appeared in `<repo>/.git/autoforge/sandbox/<n>/objects`, or that
-  directory, or one above it up to `<repo>/.git`, is not a real directory
-  (a link, say) or cannot be checked. Nothing was read
-  from it and nothing was published. Inspect it, remove what does not
-  belong there, then `unblock` and `resume`. To look at an agent's commits
-  while they are still only in that directory, read them through it
-  without writing anything:
-  `GIT_ALTERNATE_OBJECT_DIRECTORIES='"<repo>/.git/autoforge/sandbox/<n>/objects"' git -C <worktree> log`.
-  The inner double quotes keep git from splitting a path that contains a
-  `:`; inside them, write a `"` or a `\` of the path as `\"` or `\\`. The
-  outer single quotes are the shell's, and end at a `'`: write a `'` of the
-  path as `'\''` (close the quotes, an escaped `'`, reopen them), after
-  git's escapes.
-- **Merge verification keeps saying "inconclusive":** checks still running,
-  mergeability unknown or a transient GitHub failure; re-run
-  `autoforge resume --allow-merge`. After `merge.max_verification_attempts`
-  attempts the run is `BLOCKED`.
-- **The state file is unreadable:** `run`, `resume`, `step` and `status`
-  exit 2 and never overwrite it. `run --force` moves it aside as
-  `state.json.corrupt-<timestamp>` (never deletes it) and starts a new run;
-  see [State and recovery](agent-guides/state-and-recovery.md#persistent-state).
-- **`LockError`:** another controller holds the repository lock (a
-  standalone command, or a parallel EPIC scheduler or one of its surviving
-  workers), or a lock entry under `.git/autoforge/` is not a regular file
-  with a single name; see
-  [State and recovery: locking](agent-guides/state-and-recovery.md#locking).
-- **A replan was interrupted:** the phase is still `REPLAN_REEXECUTE`.
-  `autoforge status` prints the transaction id, stage and both PRs, and
-  `resume` continues the transaction from its persisted stage. Once the
-  replacement's push and PR are journaled, `resume` completes them without
-  running the agent again; before that it runs the agent again on the same
-  base. A transient GitHub failure inside the transaction leaves it
-  resumable the same way.
-- **The run is `BLOCKED` with a replan transaction on record** (a rejected
-  replacement or source, or a journal the controller could not read): this
-  run is over. `resume` exits 1 as for any `BLOCKED` run, `unblock` refuses
-  while the journal exists, and repairing the replacement PR does not reopen
-  a rejection. `autoforge status` shows the block reason and the journal's
-  stage and both PRs; a rejection's reason also says what the transaction
-  did to the source PR. Inspect those PRs on GitHub and decide by hand
-  which one, if either, carries the issue forward. To continue, start a new
-  run; it replaces `state.json`, journal included, so read `status` first.
-  Its `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
-  `ai-implementation` marker and blocks on two, so close the PR you do not
-  keep. See [Replan transaction](agent-guides/replan-transaction.md).
+**Exit status.** 2, as for any state that does not load; stdout is empty
+(`status --json` prints no document) and the diagnostic is on stderr.
+`status`, `step`, `resume` and `unblock` (the last three with `--dry-run`
+too), and `run` without `--force`, all refuse this way before they take
+the lock, open a run log, record a configuration or read GitHub. `step`, `resume`
+and `unblock` load the state again once they hold the lock, and only
+that load is acted on: a newer run that replaced the file in between is
+refused there, the same way, with the same block. Its `result` line says
+only what holds in both: taking the lock may already have created or
+rewritten the lock's own PID record, so it does not say that nothing was
+written. `run` adds `refusing to start a new run over run <id>, which
+this controller cannot read` and does not suggest `--force`:
+`run --force` would move the run aside as
+`state.json.corrupt-<timestamp>` (as it does any state that does not load)
+and start another, which does not continue it.
+
+**A label no protocol has.** A label no AutoForge protocol has (`'6'`,
+`'14.0'`, a number instead of a string) is the same refusal with "no
+AutoForge protocol has that label", and the same `run` refusal without
+`--force`. No controller reads the file as it is, and this one cannot
+tell which wrote it: a hand edit, a copy from somewhere else, a file that
+is not AutoForge's, or a controller you did not mean to run. Check the
+`import` and `python` lines and that `state` is the run's file (the
+working directory, `--config` and `--state-dir` you meant). If the run's
+own file was replaced, restore it from your backup; AutoForge suggests no
+edit of it, and does not set it aside for you.
+
+**In a scheduler namespace**, the same state is held: `epic run` and
+`epic resume` report `issue #<n> is uncertain: ...` with the refusal, the
+controller's version, protocol, import path and interpreter, and last the
+state file, admit nothing for it and continue with the other issues;
+`epic run --dry-run` reports the same as `issue #<n> is
+uncertain(state-corrupt): ...`. However long the path of the state file,
+it never pushes the controller out of these lines. `epic status` shows the row as
+`uncertain(state-corrupt)` (exit 1), says that a controller speaking the
+newer protocol reads and continues it, and offers no `epic archive`. For
+a label no protocol has, the row says so instead, asks you to check that
+the controller it names, the checkout and the `--config` are the ones
+you meant, and offers no `epic archive` or repair either: as for a
+standalone state, neither an edit nor setting the state aside continues
+the run (the paragraph above). A worker that finds one exits 2 before its
+first step.
+
+**As the configured standalone state** (`config.state_dir`), it stops
+the scheduler from admitting anything. A standalone state this controller
+reads holds the one issue it runs (`held:standalone-state`), but one of a
+protocol it does not read was not loaded, so the issue it holds is
+unknown, and a newer controller may be continuing it. `epic run` and
+`epic resume` therefore report `global uncertainty, nothing is admitted:
+the standalone state <path> is of a protocol this controller does not
+read, ...` and exit 1 (`degraded`) before the first snapshot: no issue is
+admitted, claimed or started, the issue that run names or any other.
+`epic run --dry-run` says `'epic run' would admit nothing`, and `epic
+status` reports it as a problem (exit 1). Each of these names the state
+file as the diagnostic above does: redacted, escaped when it holds a
+character that is not printable and cut at 1024 characters, so a
+configured `state_dir` holding a newline or an escape sequence gives one
+visibly odd line, never a forged or coloured one. For a newer label, use a
+controller that speaks that protocol for the `epic` commands, from the
+same checkout and with the same `--config`: it reads the standalone state
+and holds only its issue. For a label no protocol has, see the paragraph
+above. Nothing moves, edits or archives the standalone state for you.
+
+**What led to it, and how to recover.** In the case that motivated this
+diagnostic (#243, PR #254), a run was written by PR #254's code, which
+declared protocol 11 (prompt v12), and resumed on 2026-10-21 with
+`uv run autoforge --config "$CONFIG" --state-dir "$STATE" resume`, which
+imported code at protocol 10, as `main` then was. The controller of the
+time printed only `unsupported protocol_version '11' (controller speaks
+'10')`. With several checkouts, agent worktrees and editable installs of
+AutoForge on one machine, which code runs depends on how the command is
+started:
+
+- `uv run autoforge` runs the project uv discovers from the current
+  directory, upward, or the one `--project` names. That project's `.venv`
+  holds an editable install, so it imports that checkout's
+  `src/autoforge`, whatever branch is checked out there now.
+- An `autoforge` on `PATH` (`uv tool install`, a virtual environment's
+  `bin/`) imports the copy it was installed with.
+- The run itself is bound to the working directory and the state
+  directory: the controller locks and verifies the checkout it is run
+  from, and `--state-dir` (or `config.state_dir`) names the run.
+
+So choose the code and keep the rest:
+
+1. Read the `import` and `python` lines: that is the controller that
+   refused. `autoforge doctor`'s `controller` row shows the same for any
+   command line, with no run needed.
+2. Find a controller that speaks the run's protocol. Usually it is the
+   checkout or worktree holding the branch that wrote the run, or `main`
+   once that branch merged. Check it without running anything:
+   `uv run --project <that checkout> python -c 'import autoforge as a; print(a.__protocol_version__, a.__file__)'`.
+3. From the same working directory as the refused command, with the same
+   `--config` and `--state-dir`, read the run with it, then continue:
+
+   ```bash
+   uv run --project <that checkout> autoforge --config "$CONFIG" --state-dir "$STATE" status
+   uv run --project <that checkout> autoforge --config "$CONFIG" --state-dir "$STATE" resume
+   ```
+
+   `--project` selects the code and leaves the working directory as it
+   is. Do not `cd` into the agent worktree to run the command there: the
+   controller would take that worktree as its checkout.
+
+Do not edit `state.json` (a relabelled file would be read by a controller
+that does not know its newer fields), do not use `run --force` (it sets
+the run aside rather than continuing it), and do not check out another
+branch in the checkout the controller runs from or reinstall over the
+environment that refused: AutoForge changes none of these itself, and the
+run is fine where it is.
 
 ### An agent asked for permission or input
 

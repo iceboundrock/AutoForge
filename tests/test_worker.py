@@ -537,6 +537,37 @@ def test_a_start_claim_over_an_existing_state_is_refused(world, capsys):
     assert w.ns.state_file.read_bytes() == before and w.provider.calls == []
 
 
+def test_a_state_a_newer_controller_wrote_since_the_admission_is_refused_unchanged(world, capsys):
+    """#265 R3: the worker's own load under L0 is authoritative. A namespace
+    state replaced by a newer controller's after the claim was opened is
+    refused (exit 2) with the controller that refused it named, before any
+    step: no agent is launched and nothing under the coordination root's
+    ``autoforge`` directory is written."""
+    import autoforge
+
+    w = world({})
+    _requesting(w, lambda: request_stop(w.root, 1, StopMode.DRAIN))
+    assert w.run(w.admit()) == 0
+    assert w.state().phase is Phase.REVIEW
+    w.end_worker()
+    os.unlink(stop_request_path(w.root, 1))
+    to_ready(w)
+    args = w.admit()
+    data = json.loads(w.ns.state_file.read_text(encoding="utf-8"))
+    data.update(protocol_version="14", phase="A_PHASE_OF_PROTOCOL_14")
+    w.ns.state_file.write_text(json.dumps(data), encoding="utf-8")
+    capsys.readouterr()
+    before = w.tree()
+    calls = len(w.provider.calls)
+    assert w.run(args) == 2
+    err = capsys.readouterr().err
+    assert (
+        "unsupported protocol_version '14' (controller speaks '13'): a newer AutoForge wrote it"
+    ) in err
+    assert f"imported from {os.path.abspath(autoforge.__file__)}" in err
+    assert w.tree() == before and len(w.provider.calls) == calls
+
+
 # -- the step boundary (D13.3, D16.4) -------------------------------------------------------
 
 

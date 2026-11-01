@@ -5,6 +5,199 @@ so.
 
 ## Unreleased
 
+### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
+
+`REVIEW` still blocks on a comment carrying the round's review marker that
+the controller did not post, and still never adopts or duplicates it. The
+reason changed:
+
+- it says "nothing was launched" only when no reviewer was launched since
+  the phase was entered. Found after the reviewer returned, it says a
+  reviewer ran, nothing was planned or posted, and names the run log's
+  `control-result.json` that holds the result. Found before a correction
+  or a transient retry, it says the launch before ended without a usable
+  result and names its run-log directory. Found when a run is resumed
+  after an earlier launch of the round, it says that reviewer ran or may
+  have run and where its step directory is, and claims no result;
+- it names another AutoForge controller using the same GitHub login, on
+  another machine or in another clone or state directory, as a possible
+  author, beside a human and an agent;
+- it no longer tells you only to delete the comment. Delete a stray or
+  foreign comment (or its marker), then `unblock`. If the comment is
+  another controller's review, do not delete it and do not `unblock`:
+  stop one of the two runs. Two or more such comments get the same
+  remedies, before the reviewer runs and after it returns, instead of
+  "remove them, then unblock".
+
+### One troubleshooting guide, indexed by symptom (#260)
+
+[docs/troubleshooting.md](docs/troubleshooting.md) collects what
+`docs/usage.md`, `docs/getting-started.md` and the agent guides each said
+about a run that stopped: it starts from the message or state you see
+(BLOCKED, FAILED, "State unchanged", a killed agent, a provider error, an
+interrupted process, a held lock, a change made on GitHub) and says what
+the controller did and which command continues. It also has:
+
+- one exit-code table for `run`, `step`, `resume`, `unblock`, `status`,
+  `doctor` and the removed `local`;
+- a recovery-scenario table in which every row names the tests that hold
+  its behaviour, checked by `tests/test_troubleshooting_guide.py`;
+- the cases no test covers yet, listed as known limitations rather than
+  as recoveries.
+
+No behaviour changes. `docs/usage.md` keeps the sections that AutoForge's
+own messages point to by name.
+
+### A Python without `os.memfd_create` cannot enforce the outer sandbox, and says so (#389)
+
+On a Python built without `os.memfd_create` (uv's CPython 3.12.13 build
+is one), every sandboxed launch raised `AttributeError`, and so did
+`autoforge doctor`, which exited without its report. Such a Python cannot
+hand `bwrap` a launch's options, so it now cannot enforce:
+
+- `doctor`'s capability row says `unsupported: this host cannot provide a
+  Python with os.memfd_create, ...`, naming the interpreter, and the mode
+  row says what the configured mode does about it;
+- under `sandbox.mode: required` (or `preferred`), a step that launches is
+  refused before anything of it is saved or launched, as on any host that
+  cannot enforce;
+- the default, `disabled`, is unaffected.
+
+Use another build of the interpreter to enforce the outer sandbox.
+
+### A run a newer controller wrote names the controller that refused it (#265)
+
+- A command that meets a `state.json` labelled with a newer protocol still
+  refuses it with exit 2 and writes nothing, and now says which code
+  refused it: the state file, the label and what the file records (run id,
+  writer), then the controller's version and protocol, the file Python
+  imported it from, the interpreter and the working directory, and a
+  `status` command with this command's `--config` and `--state-dir` for a
+  controller that speaks the run's protocol. It suggests no edit of the
+  file and no `run --force`. `status`, `step`, `resume`, `unblock`, their
+  dry runs and `run` all print it; the exit status is unchanged.
+- A newer label is now refused before the file's phase is read, so a run
+  of a newer controller with a phase this one lacks is reported as a newer
+  protocol, no longer as `state file has unknown phase`. The mode is still
+  read first, so a LOCAL file is still an unknown mode.
+- `run` over a newer controller's run, or over a state whose label no
+  protocol has, no longer advises `repair it, or use 'run --force'`;
+  `run --force` still moves it aside as `state.json.corrupt-<timestamp>`.
+- The diagnostic's paths and the `--config` and `--state-dir` values it
+  repeats are redacted before they are cut, kept to one printable line
+  each and bounded; a value that cannot be repeated exactly as typed is a
+  labelled placeholder.
+- **Behaviour change:** a standalone state at `config.state_dir` of a
+  protocol the controller does not read (newer, or no protocol's) no
+  longer holds nothing: `epic run` and `epic resume` admit no issue at all
+  while it is there and exit 1 (`degraded`), since the issue that run
+  holds is unknown. A standalone state that does not load for any other
+  reason still holds nothing and is reported.
+- `epic status` shows a namespace state of a newer protocol as
+  `uncertain(state-corrupt)` as before, but points at a controller that
+  speaks it instead of `epic archive`, and one of a label no protocol has
+  says that no controller reads it, with neither `epic archive` nor a
+  repair by hand; the scheduler's and a worker's messages name the
+  refusing controller.
+- The scheduler's lines, `epic status` and `epic run --dry-run` name the
+  configured standalone state file redacted, on one printable line and
+  bounded, as the CLI's diagnostic does.
+- Those reports keep the refusal of a state of a newer protocol, or of no
+  protocol's label, and the refusing controller's protocol, import path
+  and interpreter whole however long the state file's path, and name the
+  file last; a path of several hundred characters used to push them past
+  the reports' 1,000-character bound. `epic run --dry-run` now reports
+  such a namespace state as the scheduler does.
+- `doctor` has a first row, `controller`: the code a command line runs and
+  the state protocols it reads. It never fails.
+- [Running the remote workflow](docs/usage.md#a-run-a-newer-controller-wrote)
+  walks through the case that motivated it (#243, PR #254: a protocol-11
+  run resumed by protocol-10 code) and choosing the code with
+  `uv run --project` while keeping the working directory and flags.
+
+### A first run, from nothing: the guide, starter configurations, and a `doctor` that a new repository can pass (#259)
+
+- [Getting started](docs/getting-started.md) takes a newcomer from nothing
+  to a first run on a repository of their own, a new private one
+  (recommended) or an existing one they may change once they accept the
+  run's scope and risks: prerequisites, installing, the EPIC and the issue
+  to write, keeping `.autoforge/` and `autoforge.yaml` out of git, a
+  configuration, what each `doctor` row means, a dry run, a real run,
+  `READY_FOR_MERGE` and `BLOCKED`, and the common first-run failures with
+  their exact messages. [Clean-room first run](docs/clean-room.md) is the
+  procedure that checks it at each release candidate, in a fresh
+  environment, with the installed revision, the documents and the starter
+  all from the candidate under test.
+- Two starter configurations under `examples/`:
+  `starter-two-providers.yaml`, the built-in routing written out, and
+  `starter-claude-only.yaml`, Claude Code for every phase, whose review is
+  therefore not cross-vendor. Tests load and validate both, and the built-in
+  defaults do not change.
+- **`doctor`'s "default branch requires checks" row is a `WARN`, not a
+  `FAIL`, while the merge gate is closed** and the default branch visibly
+  does not require the check (no rule, a missing context, an inactive
+  ruleset, a bypass actor). Only the merge gate relies on that rule, and a
+  run with the gate closed stops at `READY_FOR_MERGE` for a human, so a
+  new repository without CI no longer fails its first `doctor`. With
+  `safety.allow_merge: true` it is a `FAIL` as before, and the merge gate's
+  own checks do not change.
+- `doctor` without `gh` installed printed `autoforge: error: executable not
+  found: gh` and no row. It now prints every row: `gh available` fails, and
+  the rows that read GitHub are skipped, except that "default branch
+  requires checks" fails with the merge gate open, as it does whenever it
+  cannot read the branch rules. A `gh` that starts for one read and not for
+  a later one gets the same rows.
+- `doctor` no longer fails `agent 'claude' keeps integrations off` when
+  Claude Code cut its `--help` short: 2.1.314 writes only part of it to a
+  pipe, before the flags the row looks for. A help that ends mid-line is a
+  `SKIP` that says so and how to check by hand.
+- The `READY_FOR_MERGE` banner said "Automatic merge is disabled in this
+  milestone"; it now says the merge gate is closed and what opens it.
+- `make dist-check` also installs the wheel with `uv tool install`, and,
+  with no credential and no agent CLI, checks `doctor`'s rows that need
+  neither, with the built-in routing and with each starter, and a dry run
+  with each starter.
+
+### A sequential run's next issue must be a sub-issue of the EPIC (#287)
+
+**Behaviour change:** `UPDATE_EPIC` switches only to a native sub-issue of
+the EPIC, the rule `autoforge epic run` admits by. Until now the controller
+accepted any open issue of the repository other than the EPIC and the
+issue just finished, so on a public repository injected text could make a
+stranger's issue the next task (finding M6 of the #257 audit).
+
+- The selected issue must name the EPIC as its parent on GitHub and have
+  no sub-issues of its own. An issue the EPIC body only mentions, in a task
+  list or as `#n`, is refused, and so is a nested EPIC. A refusal takes the
+  bounded re-selection as before: the agent is asked once more with the
+  reason, then the run is `BLOCKED` on the issue it just finished, with
+  nothing switched. A sequential run over an EPIC that lists its issues
+  only in its body now stops there: add them as sub-issues of the EPIC, or
+  start each with `autoforge run`.
+- The check is one more read of the selected issue
+  (`GET /repos/{owner}/{repo}/issues/{n}`). An answer without the
+  sub-issue summaries blocks the run as a conclusive GitHub failure. An
+  issue that read reports closed is refused, even when the issue read
+  just before said `OPEN`.
+- `null` (the EPIC is complete) is no longer taken on the agent's word.
+  The controller reads the EPIC's sub-issue listing, which must hold as
+  many issues as the EPIC counts, as for `autoforge epic run`. While an
+  open sub-issue it would accept remains, `null` is refused and asked
+  again once, then the run is `BLOCKED`. A listing short of the EPIC's
+  count (GitHub leaves out a sub-issue the token may not read), or one
+  that cannot be read, blocks the run instead of ending it as `DONE`. The
+  check comes before the roadmap section that reports the EPIC complete
+  is written.
+- The first issue, the one `run --issue` names, is not held to the rule.
+- The agent's read context gains `epic-sub-issues.md`: the EPIC's native
+  sub-issues with their state and title, and the EPIC's own count of them,
+  so a sub-issue the EPIC body never names is still identified and an
+  incomplete listing says so. Both `UPDATE_EPIC` prompts state the rule.
+  The prompt version is `v14`; a REMOTE run resumed by this version
+  renders the new templates and keeps its recorded label.
+- Blockers are not read: the order of a sequential run stays the agent's
+  choice. No default or configuration key changes.
+
 ### LOCAL mode is removed (#387)
 
 **Behaviour change:** LOCAL mode, the GitHub-free workflow, is removed
@@ -100,6 +293,32 @@ directory `.autoforge`; a clean-up of the working tree must keep both.
 everywhere: its fallback to logical isolation existed only in LOCAL. No
 REMOTE launch changes, and a REMOTE run pinned to `preferred` compares as
 before.
+
+### The state file is protocol 13, without LOCAL's twelve fields (#388)
+
+**Behaviour change:** with LOCAL's code gone (ADR 0009), the state file
+is protocol 13 and `status --json` loses twelve keys:
+`feature_spec_path`, `feature_spec_sha256`, `base_head_sha`,
+`base_branch`, `local_run_contract`, `workspace_fingerprint`,
+`reviewed_workspace_fingerprint`, `local_fix_rounds`,
+`local_pending_phase`, `local_pending_fingerprint`,
+`local_pending_attempts` and `baseline_dirty_paths`. They were LOCAL
+mode's, and a REMOTE run always held them empty. `mode` stays, always
+`"REMOTE"`. Nothing else in the file changes.
+
+- A REMOTE state file of an earlier protocol loads as before when each of
+  the twelve is absent or empty (`""`, `0`, `{}` or `[]`), as every REMOTE
+  run saved them. Loading it writes nothing; its next save writes
+  protocol 13 without them.
+- A file of an earlier protocol with any of the twelve not empty is
+  refused and left as it was. Only LOCAL wrote such a value, so the file
+  is hand-edited or foreign. Protocol 12 refused only a non-empty
+  `local_run_contract` or `local_pending_*`.
+- A protocol-13 or unlabelled file carrying any of the twelve, even
+  empty, is refused as carrying an unknown field.
+- A LOCAL state is refused by its mode under every protocol, 13 included,
+  before any of this (#387).
+- An older AutoForge refuses a protocol-13 file.
 
 ### The outer sandbox says why a kernel lacks the Landlock scope, not only that it does (#349)
 

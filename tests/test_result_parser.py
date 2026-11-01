@@ -45,8 +45,6 @@ from autoforge.result_parser import (
     AnalyzeExecuteResult,
     Finding,
     FixResult,
-    LocalFixResult,
-    LocalReviewResult,
     OperatorAction,
     ReplanReexecuteResult,
     ReviewResult,
@@ -68,7 +66,7 @@ from autoforge.result_parser import (
     validate_progress_text,
     validate_roadmap_section,
 )
-from autoforge.transitions import Phase, WorkflowMode
+from autoforge.transitions import Phase
 from tests.conftest import (
     BRANCH,
     GOOGLE_API_KEY,
@@ -638,23 +636,6 @@ def test_fix_result_carries_at_most_one_acceptance_action():
         FixResult.from_payload(payload)
 
 
-def test_local_fix_refuses_an_acceptance_action():
-    """LOCAL runs perform no external writes: the resolution is not offered."""
-    text, mode = _fix_with(
-        [
-            {
-                "finding_id": "R1-F1",
-                "resolution": "acceptance_action",
-                "rationale": ACCEPTANCE_RATIONALE,
-                "acceptance_action": {"kind": "issue_comment", "body": "evidence"},
-            }
-        ],
-        "LOCAL",
-    )
-    with pytest.raises(ControlResultValidationError, match="LOCAL runs perform no external"):
-        parse_control_result(text, Phase.FIX, mode)
-
-
 # -- operator_acceptance (#243): comments the operator posts on other issues ----------------
 OPERATOR_RATIONALE = "The finding asks for a note on the issues this change affects, not code."
 OPERATOR_NOTE = "This change alters the retry budget.\n\nThe new default is `3`, see the PR."
@@ -1045,17 +1026,9 @@ def test_fix_result_never_mixes_acceptance_action_and_operator_acceptance():
     ) in msg
 
 
-def test_local_fix_refuses_an_operator_acceptance():
-    """LOCAL runs have no GitHub, so no operator action is offered either."""
-    text, mode = _fix_with(_operator({"actions": [_op()]})["resolutions"], "LOCAL")
-    msg = _refusal(lambda: parse_control_result(text, Phase.FIX, mode))
-    assert "LOCAL runs have no GitHub and no operator actions" in msg
-    assert "resolve as `unresolved` with a rationale instead" in msg
-
-
 def test_remote_parse_control_result_accepts_an_operator_acceptance():
-    text, mode = _fix_with(_operator({"actions": [_op()]})["resolutions"], "REMOTE")
-    payload = parse_control_result(text, Phase.FIX, mode)
+    text = _fix_with(_operator({"actions": [_op()]})["resolutions"])
+    payload = parse_control_result(text, Phase.FIX)
     assert payload["resolutions"][0]["resolution"] == "operator_acceptance"
 
 
@@ -1251,16 +1224,6 @@ def test_remote_fix_optional_text_fields_reject_non_strings(key, bad):
         FixResult.from_payload(dict(base, resolutions=[resolution]))
 
 
-@pytest.mark.parametrize("bad", [1, ["x"], {"a": 1}])
-def test_local_fix_rationale_rejects_non_strings(bad):
-    from autoforge.result_parser import LocalFixResult
-
-    with pytest.raises(ControlResultValidationError, match="rationale"):
-        LocalFixResult.from_payload(
-            {"resolutions": [{"finding_id": "R1-F1", "resolution": "fixed", "rationale": bad}]}
-        )
-
-
 # -- Every optional string field, every non-string JSON type ------------------
 # One table, so a new optional string field has to be added here to be
 # covered and a decoder that quietly coerces is caught by the same rows that
@@ -1279,82 +1242,26 @@ def _remote_fix(resolution_extra: dict, **top) -> str:
     )
 
 
-def _local_fix(resolution_extra: dict, **top) -> str:
-    return block(
-        {
-            "phase": "FIX",
-            "status": "success",
-            "changed_workspace": True,
-            "resolutions": [{"finding_id": "R1-F1", "resolution": "fixed", **resolution_extra}],
-            **top,
-        }
-    )
-
-
 def _remote_review(finding_extra: dict) -> str:
     return block(
         dict(GOOD_REVIEW, needs_fix_round=True, findings=[dict(_finding(1, 1), **finding_extra)])
     )
 
 
-def _local_review(finding_extra: dict) -> str:
-    return block(
-        {
-            "phase": "REVIEW",
-            "status": "success",
-            "round": 1,
-            "reviewed_workspace_fingerprint": "a" * 64,
-            "needs_fix_round": True,
-            "findings": [dict(_finding(1, 1), **finding_extra)],
-        }
-    )
-
-
 OPTIONAL_STRING_FIELDS = [
-    # (label, phase, mode, builder)
-    ("REVIEW.findings[].title", Phase.REVIEW, "REMOTE", lambda v: _remote_review({"title": v})),
-    (
-        "REVIEW.findings[].location",
-        Phase.REVIEW,
-        "REMOTE",
-        lambda v: _remote_review({"location": v}),
-    ),
-    (
-        "LOCAL REVIEW.findings[].title",
-        Phase.REVIEW,
-        "LOCAL",
-        lambda v: _local_review({"title": v}),
-    ),
-    (
-        "LOCAL REVIEW.findings[].location",
-        Phase.REVIEW,
-        "LOCAL",
-        lambda v: _local_review({"location": v}),
-    ),
-    ("FIX.resolutions[].rationale", Phase.FIX, "REMOTE", lambda v: _remote_fix({"rationale": v})),
-    (
-        "FIX.resolutions[].commit_sha",
-        Phase.FIX,
-        "REMOTE",
-        lambda v: _remote_fix({"commit_sha": v}),
-    ),
+    # (label, phase, builder)
+    ("REVIEW.findings[].title", Phase.REVIEW, lambda v: _remote_review({"title": v})),
+    ("REVIEW.findings[].location", Phase.REVIEW, lambda v: _remote_review({"location": v})),
+    ("FIX.resolutions[].rationale", Phase.FIX, lambda v: _remote_fix({"rationale": v})),
+    ("FIX.resolutions[].commit_sha", Phase.FIX, lambda v: _remote_fix({"commit_sha": v})),
     (
         "FIX.resolutions[].follow_up_issue_url",
         Phase.FIX,
-        "REMOTE",
         lambda v: _remote_fix({"follow_up_issue_url": v}),
     ),
     (
-        "LOCAL FIX.resolutions[].rationale",
-        Phase.FIX,
-        "LOCAL",
-        lambda v: _local_fix({"rationale": v}),
-    ),
-    ("LOCAL FIX.blocked_reason", Phase.FIX, "LOCAL", lambda v: _local_fix({}, blocked_reason=v)),
-    (
         "UPDATE_EPIC.next_issue_url",
         Phase.UPDATE_EPIC,
-        "REMOTE",
         lambda v: block(
             {
                 "phase": "UPDATE_EPIC",
@@ -1367,7 +1274,6 @@ OPTIONAL_STRING_FIELDS = [
     (
         "<any>.message (status blocked)",
         Phase.FIX,
-        "REMOTE",
         lambda v: block({"phase": "FIX", "status": "blocked", "message": v}),
     ),
 ]
@@ -1375,17 +1281,11 @@ OPTIONAL_STRING_FIELDS = [
 NON_STRING_JSON_VALUES = [0, 1, 1.5, True, False, [], ["x"], {}, {"a": 1}]
 
 
-def _mode(name):
-    return WorkflowMode[name]
-
-
 @pytest.mark.parametrize("bad", NON_STRING_JSON_VALUES, ids=repr)
 @pytest.mark.parametrize(
-    "label,phase,mode,build", OPTIONAL_STRING_FIELDS, ids=[r[0] for r in OPTIONAL_STRING_FIELDS]
+    "label,phase,build", OPTIONAL_STRING_FIELDS, ids=[r[0] for r in OPTIONAL_STRING_FIELDS]
 )
-def test_every_optional_string_field_rejects_every_non_string_json_type(
-    label, phase, mode, build, bad
-):
+def test_every_optional_string_field_rejects_every_non_string_json_type(label, phase, build, bad):
     """A schema violation is a rejection, never content.
 
     ``str(1)``, ``str(True)``, ``str([])`` all produce text the controller
@@ -1394,41 +1294,35 @@ def test_every_optional_string_field_rejects_every_non_string_json_type(
     absent -- or the result is refused and the state machine does not move.
     """
     with pytest.raises(ControlResultValidationError):
-        parse_control_result(build(bad), phase, _mode(mode))
+        parse_control_result(build(bad), phase)
 
 
 @pytest.mark.parametrize(
-    "label,phase,mode,build", OPTIONAL_STRING_FIELDS, ids=[r[0] for r in OPTIONAL_STRING_FIELDS]
+    "label,phase,build", OPTIONAL_STRING_FIELDS, ids=[r[0] for r in OPTIONAL_STRING_FIELDS]
 )
-def test_every_optional_string_field_accepts_a_string(label, phase, mode, build):
+def test_every_optional_string_field_accepts_a_string(label, phase, build):
     text = "some text here ok"
     if "url" in label:
         text = "https://github.com/owner/repo/issues/9"
     elif "sha" in label:
         text = SHA_B  # #77: a present commit_sha must be a SHA, not any string
     if label == "<any>.message (status blocked)":
-        parse_control_result(build(text), phase, _mode(mode))
-        return
-    if label == "LOCAL FIX.blocked_reason":
-        # A non-empty blocker beside status "success" is a contradiction (its
-        # own rule); the type check is what this table is about.
-        with pytest.raises(ControlResultValidationError, match="not both true"):
-            parse_control_result(build(text), phase, _mode(mode))
+        parse_control_result(build(text), phase)
         return
     if label == "FIX.resolutions[].follow_up_issue_url":
         with pytest.raises(ControlResultValidationError, match="resolution is 'fixed'"):
-            parse_control_result(build(text), phase, _mode(mode))
+            parse_control_result(build(text), phase)
         return
-    parse_control_result(build(text), phase, _mode(mode))
+    parse_control_result(build(text), phase)
 
 
 @pytest.mark.parametrize(
-    "label,phase,mode,build",
+    "label,phase,build",
     [r for r in OPTIONAL_STRING_FIELDS if not r[0].startswith("<any>")],
     ids=[r[0] for r in OPTIONAL_STRING_FIELDS if not r[0].startswith("<any>")],
 )
-def test_every_optional_string_field_treats_null_as_absent(label, phase, mode, build):
-    parse_control_result(build(None), phase, _mode(mode))
+def test_every_optional_string_field_treats_null_as_absent(label, phase, build):
+    parse_control_result(build(None), phase)
 
 
 # -- REVIEW payload bounds (#34) -------------------------------------------------
@@ -1439,55 +1333,36 @@ def test_every_optional_string_field_treats_null_as_absent(label, phase, mode, b
 # FIX round has to act on).
 
 
-def _review_with(findings: list[dict], mode: str) -> tuple[str, WorkflowMode]:
-    if mode == "REMOTE":
-        return block(
-            dict(GOOD_REVIEW, needs_fix_round=True, findings=findings)
-        ), WorkflowMode.REMOTE
-    return _local_review_block(findings), WorkflowMode.LOCAL
+def _review_with(findings: list[dict]) -> str:
+    return block(dict(GOOD_REVIEW, needs_fix_round=True, findings=findings))
 
 
-def _local_review_block(findings: list[dict]) -> str:
-    return block(
-        {
-            "phase": "REVIEW",
-            "status": "success",
-            "round": 1,
-            "reviewed_workspace_fingerprint": "a" * 64,
-            "needs_fix_round": True,
-            "findings": findings,
-        }
-    )
-
-
-@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
-def test_finding_count_is_bounded_and_rejected_whole(mode):
+def test_finding_count_is_bounded_and_rejected_whole():
     at_bound = [_finding(1, n) for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)]
-    stdout, wf_mode = _review_with(at_bound, mode)
-    payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    stdout = _review_with(at_bound)
+    payload = parse_control_result(stdout, Phase.REVIEW)
     assert len(payload["findings"]) == MAX_FINDINGS_PER_REVIEW
 
     over = at_bound + [_finding(1, MAX_FINDINGS_PER_REVIEW + 1)]
-    stdout, wf_mode = _review_with(over, mode)
+    stdout = _review_with(over)
     with pytest.raises(ControlResultValidationError) as excinfo:
-        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+        parse_control_result(stdout, Phase.REVIEW)
     msg = str(excinfo.value)
     assert f"{MAX_FINDINGS_PER_REVIEW + 1} findings" in msg
     assert f"at most {MAX_FINDINGS_PER_REVIEW}" in msg
     assert "re-emit" in msg
 
 
-@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
-def test_finding_count_is_checked_before_any_element_is_parsed(mode):
+def test_finding_count_is_checked_before_any_element_is_parsed():
     """An oversized list is refused as a list, not element by element."""
     junk: list = list(range(MAX_FINDINGS_PER_REVIEW + 1))  # not even objects
-    stdout, wf_mode = _review_with(junk, mode)
+    stdout = _review_with(junk)
     with pytest.raises(ControlResultValidationError, match="findings reported"):
-        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+        parse_control_result(stdout, Phase.REVIEW)
     # One fewer element and the per-element validation is what speaks.
-    stdout, wf_mode = _review_with(junk[:-1], mode)
+    stdout = _review_with(junk[:-1])
     with pytest.raises(ControlResultValidationError, match=r"findings\[0\] must be an object"):
-        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+        parse_control_result(stdout, Phase.REVIEW)
 
 
 @pytest.mark.parametrize(
@@ -1498,21 +1373,20 @@ def test_finding_count_is_checked_before_any_element_is_parsed(mode):
         ("location", MAX_FINDING_LOCATION_CHARS),
     ],
 )
-@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
-def test_finding_text_fields_are_bounded(key, limit, mode):
+def test_finding_text_fields_are_bounded(key, limit):
     exact = "x" * limit
-    stdout, wf_mode = _review_with([dict(_finding(1, 1), **{key: exact})], mode)
-    payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    stdout = _review_with([dict(_finding(1, 1), **{key: exact})])
+    payload = parse_control_result(stdout, Phase.REVIEW)
     assert payload["findings"][0][key] == exact
     # The bound applies to the stripped value the controller persists, so
     # surrounding whitespace does not count against it.
-    stdout, wf_mode = _review_with([dict(_finding(1, 1), **{key: f"\n  {exact}  \n"})], mode)
-    parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    stdout = _review_with([dict(_finding(1, 1), **{key: f"\n  {exact}  \n"})])
+    parse_control_result(stdout, Phase.REVIEW)
 
     over = "y" * (limit + 1)
-    stdout, wf_mode = _review_with([dict(_finding(1, 1), **{key: over})], mode)
+    stdout = _review_with([dict(_finding(1, 1), **{key: over})])
     with pytest.raises(ControlResultValidationError) as excinfo:
-        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+        parse_control_result(stdout, Phase.REVIEW)
     msg = str(excinfo.value)
     assert f"R1-F1 field {key!r} is {limit + 1} characters" in msg
     assert f"at most {limit}" in msg
@@ -1530,18 +1404,17 @@ def _id_of_length(length: int, round: int = 1, n: int = 1) -> str:
     return fid
 
 
-@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
-def test_finding_id_is_bounded(mode):
+def test_finding_id_is_bounded():
     """The id's shape does not bound its length; the parser does (PR #76 review)."""
     exact = _id_of_length(MAX_FINDING_ID_CHARS)
-    stdout, wf_mode = _review_with([dict(_finding(1, 1), id=exact)], mode)
-    payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    stdout = _review_with([dict(_finding(1, 1), id=exact)])
+    payload = parse_control_result(stdout, Phase.REVIEW)
     assert payload["findings"][0]["id"] == exact
 
     over = _id_of_length(MAX_FINDING_ID_CHARS + 1)
-    stdout, wf_mode = _review_with([dict(_finding(1, 1), id=over)], mode)
+    stdout = _review_with([dict(_finding(1, 1), id=over)])
     with pytest.raises(ControlResultValidationError) as excinfo:
-        parse_control_result(stdout, Phase.REVIEW, wf_mode)
+        parse_control_result(stdout, Phase.REVIEW)
     msg = str(excinfo.value)
     assert f"'id' is {MAX_FINDING_ID_CHARS + 1} characters" in msg
     assert f"at most {MAX_FINDING_ID_CHARS}" in msg
@@ -1605,18 +1478,6 @@ def test_fix_finding_id_is_bounded_at_parse_time():
     assert f"FIX: field 'finding_id' is {MAX_FINDING_ID_CHARS + 1} characters" in str(excinfo.value)
     assert "9999" not in str(excinfo.value)
 
-    ok_local = LocalFixResult.from_payload(
-        {"resolutions": [{"finding_id": exact, "resolution": "fixed"}], "changed_workspace": True}
-    )
-    assert ok_local.resolutions[0].finding_id == exact
-    with pytest.raises(ControlResultValidationError, match="at most"):
-        LocalFixResult.from_payload(
-            {
-                "resolutions": [{"finding_id": over, "resolution": "fixed"}],
-                "changed_workspace": True,
-            }
-        )
-
 
 def test_oversized_finding_is_rejected_not_clipped():
     over = "z" * (MAX_FINDING_RESOLUTION_CHARS + 1)
@@ -1663,20 +1524,13 @@ def test_parser_bounds_never_exceed_the_persisted_evidence_bounds():
         )
         for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
     ]
-    # A REMOTE finding is published in the controller's review comment, so a
-    # credential shape is refused at parse (#162); a LOCAL one is published
-    # nowhere and still reaches the redaction this bound has to absorb.
+    # A finding is published in the controller's review comment, so a
+    # credential shape is refused at parse (#162); each finding the field
+    # bounds accept still reaches the redaction this bound has to absorb.
     with pytest.raises(ControlResultValidationError, match="credential-shaped"):
         ReviewResult.from_payload(dict(GOOD_REVIEW, needs_fix_round=True, findings=findings))
-    res = LocalReviewResult.from_payload(
-        {
-            "round": 1,
-            "reviewed_workspace_fingerprint": "a" * 64,
-            "needs_fix_round": True,
-            "findings": findings,
-        }
-    )
-    persisted = [redact_dict(f.to_dict()) for f in res.findings]  # the engine's own path
+    parsed = [Finding.from_payload(f, 1, i) for i, f in enumerate(findings)]
+    persisted = [redact_dict(f.to_dict()) for f in parsed]  # the engine's own path
     assert len(persisted[0]["required_resolution"]) > MAX_FINDING_RESOLUTION_CHARS
     assert "HF_TOKEN=x" not in persisted[0]["required_resolution"]
     record = loop_guard.review_record(1, SHA_A, loop_guard.RESULT_NEEDS_FIX, persisted)
@@ -1689,43 +1543,30 @@ def test_parser_bounds_never_exceed_the_persisted_evidence_bounds():
 
 # -- FIX payload bounds (#77) --------------------------------------------------------
 # A FIX resolution is persisted whole in ``state.last_fix_resolutions`` (after
-# redaction) and, in LOCAL mode, an ``unresolved`` rationale is echoed into the
-# persisted block reason that ``status`` shows. Same policy as the REVIEW
+# redaction). Same policy as the REVIEW
 # bounds: rejected whole, never clipped; the message names the size and the
 # limit, never the text; the count is checked before any element is parsed.
 _FIX_TOP = {"phase": "FIX", "status": "success", "previous_head_sha": SHA_A, "head_sha": SHA_B}
-_LOCAL_FIX_TOP = {"phase": "FIX", "status": "success", "changed_workspace": True}
 
 
-def _fix_with(resolutions: list, mode: str) -> tuple[str, WorkflowMode]:
-    if mode == "REMOTE":
-        return block(dict(_FIX_TOP, resolutions=resolutions)), WorkflowMode.REMOTE
-    return block(dict(_LOCAL_FIX_TOP, resolutions=resolutions)), WorkflowMode.LOCAL
+def _fix_with(resolutions: list) -> str:
+    return block(dict(_FIX_TOP, resolutions=resolutions))
 
 
-@pytest.mark.parametrize(
-    "mode,resolution",
-    [
-        ("REMOTE", "fixed"),
-        ("REMOTE", "no_change_with_rationale"),
-        ("LOCAL", "fixed"),
-        ("LOCAL", "no_change_with_rationale"),
-        ("LOCAL", "unresolved"),
-    ],
-)
-def test_fix_rationale_is_bounded_whatever_the_resolution(mode, resolution):
+@pytest.mark.parametrize("resolution", ["fixed", "no_change_with_rationale"])
+def test_fix_rationale_is_bounded_whatever_the_resolution(resolution):
     exact = "r" * MAX_FIX_RATIONALE_CHARS
     res = {"finding_id": "R1-F1", "resolution": resolution, "rationale": exact}
-    stdout, wf_mode = _fix_with([res], mode)
-    assert parse_control_result(stdout, Phase.FIX, wf_mode)["resolutions"][0]["rationale"] == exact
+    stdout = _fix_with([res])
+    assert parse_control_result(stdout, Phase.FIX)["resolutions"][0]["rationale"] == exact
     # The bound applies to the stripped value the controller persists.
-    stdout, wf_mode = _fix_with([dict(res, rationale=f"\n  {exact}  \n")], mode)
-    parse_control_result(stdout, Phase.FIX, wf_mode)
+    stdout = _fix_with([dict(res, rationale=f"\n  {exact}  \n")])
+    parse_control_result(stdout, Phase.FIX)
 
     over = "r" * (MAX_FIX_RATIONALE_CHARS + 1)
-    stdout, wf_mode = _fix_with([dict(res, rationale=over)], mode)
+    stdout = _fix_with([dict(res, rationale=over)])
     with pytest.raises(ControlResultValidationError) as excinfo:
-        parse_control_result(stdout, Phase.FIX, wf_mode)
+        parse_control_result(stdout, Phase.FIX)
     msg = str(excinfo.value)
     assert (
         f"FIX: resolution for R1-F1 field 'rationale' is {MAX_FIX_RATIONALE_CHARS + 1} characters"
@@ -1735,27 +1576,26 @@ def test_fix_rationale_is_bounded_whatever_the_resolution(mode, resolution):
     assert "rrr" not in msg  # size, never the text
 
 
-@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
-def test_fix_resolution_count_is_bounded_and_checked_before_any_element_is_parsed(mode):
+def test_fix_resolution_count_is_bounded_and_checked_before_any_element_is_parsed():
     at_bound = [
         {"finding_id": f"R1-F{n}", "resolution": "fixed"}
         for n in range(1, MAX_RESOLUTIONS_PER_FIX + 1)
     ]
-    stdout, wf_mode = _fix_with(at_bound, mode)
-    payload = parse_control_result(stdout, Phase.FIX, wf_mode)
+    stdout = _fix_with(at_bound)
+    payload = parse_control_result(stdout, Phase.FIX)
     assert len(payload["resolutions"]) == MAX_RESOLUTIONS_PER_FIX
 
     junk: list = list(range(MAX_RESOLUTIONS_PER_FIX + 1))  # not even objects
-    stdout, wf_mode = _fix_with(junk, mode)
+    stdout = _fix_with(junk)
     with pytest.raises(ControlResultValidationError) as excinfo:
-        parse_control_result(stdout, Phase.FIX, wf_mode)
+        parse_control_result(stdout, Phase.FIX)
     msg = str(excinfo.value)
     assert f"FIX: {MAX_RESOLUTIONS_PER_FIX + 1} resolutions reported" in msg
     assert f"at most {MAX_RESOLUTIONS_PER_FIX}" in msg
     # One fewer element and the per-element validation is what speaks.
-    stdout, wf_mode = _fix_with(junk[:-1], mode)
+    stdout = _fix_with(junk[:-1])
     with pytest.raises(ControlResultValidationError, match=r"resolutions\[0\] must be an object"):
-        parse_control_result(stdout, Phase.FIX, wf_mode)
+        parse_control_result(stdout, Phase.FIX)
 
 
 def _remote_fix_result(**resolution) -> FixResult:
@@ -1791,42 +1631,36 @@ _REPLAN_REST = {
 _SHA_FIELDS = [
     pytest.param(
         Phase.ANALYZE_EXECUTE,
-        WorkflowMode.REMOTE,
         {"issue_url": ISSUE, "pr_title": "Add it", "pr_body": "Adds it."},
         "head_sha",
         id="ANALYZE_EXECUTE.head_sha",
     ),
     pytest.param(
         Phase.REVIEW,
-        WorkflowMode.REMOTE,
         {"round": 1, "needs_fix_round": False, "findings": [], **REVIEW_PROSE},
         "reviewed_head_sha",
         id="REVIEW.reviewed_head_sha",
     ),
     pytest.param(
         Phase.FIX,
-        WorkflowMode.REMOTE,
         {"head_sha": SHA_B, "resolutions": []},
         "previous_head_sha",
         id="FIX.previous_head_sha",
     ),
     pytest.param(
         Phase.FIX,
-        WorkflowMode.REMOTE,
         {"previous_head_sha": SHA_A, "resolutions": []},
         "head_sha",
         id="FIX.head_sha",
     ),
     pytest.param(
         Phase.REPLAN_REEXECUTE,
-        WorkflowMode.REMOTE,
         dict(_REPLAN_REST, head_sha=SHA_B),
         "previous_head_sha",
         id="REPLAN_REEXECUTE.previous_head_sha",
     ),
     pytest.param(
         Phase.REPLAN_REEXECUTE,
-        WorkflowMode.REMOTE,
         dict(_REPLAN_REST, previous_head_sha=SHA_B),
         "head_sha",
         id="REPLAN_REEXECUTE.head_sha",
@@ -1834,7 +1668,7 @@ _SHA_FIELDS = [
 ]
 
 
-@pytest.mark.parametrize("phase,mode,rest,key", _SHA_FIELDS)
+@pytest.mark.parametrize("phase,rest,key", _SHA_FIELDS)
 @pytest.mark.parametrize(
     "value",
     [
@@ -1845,7 +1679,7 @@ _SHA_FIELDS = [
         pytest.param("g" * 40, id="not-hex"),
     ],
 )
-def test_every_sha_field_requires_the_full_40_character_sha(phase, mode, rest, key, value):
+def test_every_sha_field_requires_the_full_40_character_sha(phase, rest, key, value):
     """#19: the prompts require the full SHA `git rev-parse HEAD` / `gh pr view
     --json headRefOid` report, and the engine compares every accepted SHA by
     equality with one read from GitHub. An abbreviated SHA must therefore be
@@ -1855,9 +1689,9 @@ def test_every_sha_field_requires_the_full_40_character_sha(phase, mode, rest, k
     with pytest.raises(
         ControlResultValidationError, match=rf"{key!r} must be a full git SHA \(exactly 40"
     ):
-        parse_control_result(block(payload), phase, mode)
+        parse_control_result(block(payload), phase)
     # The same payload with the full SHA is the accepted shape.
-    parse_control_result(block(dict(payload, **{key: SHA_A})), phase, mode)
+    parse_control_result(block(dict(payload, **{key: SHA_A})), phase)
 
 
 def test_sha_rejection_quotes_a_short_value_and_measures_a_long_one():
@@ -2171,19 +2005,18 @@ def test_required_resolution_keeps_newlines_and_tabs_and_nothing_else(name):
     assert "first" not in msg and "second" not in msg
 
 
-@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
 @pytest.mark.parametrize("name", sorted(_CONTROL_SAMPLES), ids=str)
-def test_fix_rationale_keeps_newlines_and_tabs_and_nothing_else(mode, name):
+def test_fix_rationale_keeps_newlines_and_tabs_and_nothing_else(name):
     ch = _CONTROL_SAMPLES[name]
     text = f"The change is already covered by the existing suite;{ch}nothing to do."
     res = {"finding_id": "R1-F1", "resolution": "no_change_with_rationale", "rationale": text}
-    stdout, wf_mode = _fix_with([res], mode)
+    stdout = _fix_with([res])
     if ch in ("\n", "\t"):
-        payload = parse_control_result(stdout, Phase.FIX, wf_mode)
+        payload = parse_control_result(stdout, Phase.FIX)
         assert payload["resolutions"][0]["rationale"] == text
         return
     with pytest.raises(ControlResultValidationError) as excinfo:
-        parse_control_result(stdout, Phase.FIX, wf_mode)
+        parse_control_result(stdout, Phase.FIX)
     msg = str(excinfo.value)
     assert "FIX: resolution for R1-F1 field 'rationale' contains a control character" in msg
     assert f"(U+{ord(ch):04X} at index" in msg
@@ -2205,20 +2038,10 @@ def test_the_length_bound_speaks_before_the_control_character_rule():
 
 def test_control_characters_are_refused_where_the_renderer_would_escape_them_only():
     """Fields outside findings keep their existing rules: a REVIEW ``message``
-    or a LOCAL ``observations`` entry is quoted as a block or not rendered at
-    all, and is out of scope for #78. A REMOTE prose section is published in
-    the controller's review comment (#162), so it is multi-line text."""
+    is quoted as a block, and is out of scope for #78. A prose section is
+    published in the controller's review comment (#162), so it is multi-line
+    text."""
     ReviewResult.from_payload(dict(GOOD_REVIEW, message="a\rb"))
-    local = LocalReviewResult.from_payload(
-        {
-            "round": 1,
-            "reviewed_workspace_fingerprint": "a" * 64,
-            "needs_fix_round": False,
-            "findings": [],
-            "observations": ["line one\x1bline two"],
-        }
-    )
-    assert local.observations == ["line one\x1bline two"]
     with pytest.raises(ControlResultValidationError) as excinfo:
         ReviewResult.from_payload(dict(GOOD_REVIEW, summary="line one\x1bline two"))
     msg = str(excinfo.value)
@@ -2250,14 +2073,13 @@ def test_block_bound_is_checked_before_json_is_decoded():
         parse_control_result(stdout, Phase.REVIEW)
 
 
-@pytest.mark.parametrize("mode", ["REMOTE", "LOCAL"])
-def test_largest_review_the_field_bounds_accept_fits_the_block_bound(mode):
+def test_largest_review_the_field_bounds_accept_fits_the_block_bound():
     """Pins the relation between the bounds: a REVIEW at every field bound,
     in the worst-case JSON encoding (non-ASCII text escaped as \\uXXXX, six
     characters per character), is still under the whole-block bound, so the
     field bounds -- not the block bound -- are what a reviewer is held to.
-    A REMOTE review carries its prose sections too (#162), each at its own
-    bound in the same encoding."""
+    A review carries its prose sections too (#162), each at its own bound in
+    the same encoding."""
     findings = [
         {
             "id": f"R1-F{n}",
@@ -2268,20 +2090,15 @@ def test_largest_review_the_field_bounds_accept_fits_the_block_bound(mode):
         }
         for n in range(1, MAX_FINDINGS_PER_REVIEW + 1)
     ]
-    if mode == "REMOTE":
-        prose = {key: "汉" * limit for key, limit in REVIEW_PROSE_SECTIONS}
-        stdout = block(dict(GOOD_REVIEW, needs_fix_round=True, findings=findings, **prose))
-        wf_mode = WorkflowMode.REMOTE
-    else:
-        stdout, wf_mode = _review_with(findings, mode)
+    prose = {key: "汉" * limit for key, limit in REVIEW_PROSE_SECTIONS}
+    stdout = block(dict(GOOD_REVIEW, needs_fix_round=True, findings=findings, **prose))
     assert "\\u6c49" in stdout  # json.dumps escaped the text: the worst case
     raw = stdout.split(BEGIN, 1)[1].split(END, 1)[0].strip()
     assert len(raw) <= MAX_CONTROL_RESULT_CHARS
-    payload = parse_control_result(stdout, Phase.REVIEW, wf_mode)
+    payload = parse_control_result(stdout, Phase.REVIEW)
     assert len(payload["findings"]) == MAX_FINDINGS_PER_REVIEW
-    if mode == "REMOTE":
-        sections = ReviewResult.from_payload(payload).sections
-        assert {key: len(text) for key, text in sections.items()} == dict(REVIEW_PROSE_SECTIONS)
+    sections = ReviewResult.from_payload(payload).sections
+    assert {key: len(text) for key, text in sections.items()} == dict(REVIEW_PROSE_SECTIONS)
 
 
 # -- published-content policy (ADR 0004 D8.2, D8.3, D8.5) -------------------
@@ -2833,14 +2650,12 @@ def test_a_location_is_judged_as_the_comment_renders_it_in_a_code_span():
         assert "FAKEtoken123" not in msg and "#3" not in msg
 
 
-def test_local_review_reports_no_prose_sections():
-    """LOCAL mode is unchanged by #162: a local review is published nowhere and
-    carries no prose sections, while a REMOTE review without them is refused."""
-    payload = parse_control_result(_local_review({}), Phase.REVIEW, WorkflowMode.LOCAL)
-    assert not set(payload) & set(_PROSE_KEYS)
+def test_a_review_without_its_prose_sections_is_refused():
+    """A review is published in the controller's comment (#162), so one that
+    reports no prose sections is refused."""
     remote = {k: v for k, v in GOOD_REVIEW.items() if k not in _PROSE_KEYS}
     with pytest.raises(ControlResultValidationError, match="missing required field 'spec'"):
-        parse_control_result(block(remote), Phase.REVIEW, WorkflowMode.REMOTE)
+        parse_control_result(block(remote), Phase.REVIEW)
 
 
 # -- UPDATE_EPIC request schemas (ADR 0004 D4.7, D8.1) -----------------------

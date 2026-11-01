@@ -28,10 +28,9 @@ class ConfigurationDriftError(ConfigurationError):
 class SandboxCapabilityError(ConfigurationError):
     """This host cannot enforce the outer sandbox, and the mode refuses (ADR 0005 D12.2).
 
-    Raised by the engine's pre-launch gate under ``sandbox.mode: required``,
-    and under ``preferred`` in a REMOTE run, before anything is spawned,
-    before the attempt counter is saved and before a LOCAL launch is
-    charged: state is unchanged and nothing needs recovery. A configuration
+    Raised by the engine's pre-launch gate under ``sandbox.mode: required``
+    and ``preferred``, before anything is spawned and before the attempt
+    counter is saved: state is unchanged and nothing needs recovery. A configuration
     or capability error, never a phase failure. ``capability`` names what
     the host lacks (``autoforge.sandbox_bwrap.Capability``'s value).
     """
@@ -47,6 +46,71 @@ class StateError(AutoForgeError):
     Raised on read of a corrupted state; the controller must never silently
     re-initialize a fresh state over existing data.
     """
+
+
+class StateProtocolError(StateError):
+    """The state file's ``protocol_version`` is one this controller does not read (#265).
+
+    Raised by :meth:`autoforge.state.AutoForgeState.from_dict` right after
+    the mode check and before anything else of the file is interpreted, so
+    a newer controller's file is reported by its label, never as an unknown
+    phase or a pile of unknown fields; :func:`autoforge.state.load_state`
+    re-raises it with the file's path (:meth:`at`). It is a
+    :class:`StateError` and takes every path one takes (exit 2, nothing
+    written, a scheduler namespace held ``uncertain``); the CLI adds the
+    provenance diagnostic of :mod:`autoforge.provenance`.
+
+    Every attribute but ``path`` is already bounded and safe to print:
+    ``label`` is the persisted label's ``repr``, redacted whole and then
+    bounded; ``support`` is :class:`autoforge.state.ProtocolSupport`'s value
+    (``unsupported-newer`` or ``unsupported-unknown``); ``newer`` is the
+    label as a number when it is a newer one, else ``""``; ``run_id`` and
+    ``written_by`` are what the file records, kept only when they have the
+    shape the controller writes, else ``""``. ``path`` is the state file,
+    ``""`` until :meth:`at` sets it, as the process has it: a fact, not
+    safe to print as it is, so a diagnostic shows it through
+    :func:`autoforge.provenance.shown_path`, and the message names it by
+    ``shown``, that function's result. ``headline`` is the reason's first
+    clause, without the controller's identity, for a diagnostic that shows
+    the identity on lines of its own.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        headline: str,
+        label: str,
+        support: str,
+        newer: str = "",
+        run_id: str = "",
+        written_by: str = "",
+        path: str = "",
+        shown: str = "",
+    ) -> None:
+        super().__init__(f"state file {shown or path}: {reason}" if path else reason)
+        self.reason = reason
+        self.headline = headline
+        self.label = label
+        self.support = support
+        self.newer = newer
+        self.run_id = run_id
+        self.written_by = written_by
+        self.path = path
+
+    def at(self, path: str, *, shown: str = "") -> "StateProtocolError":
+        """The same refusal, naming the state file at ``path``, shown as ``shown``."""
+        return StateProtocolError(
+            self.reason,
+            headline=self.headline,
+            label=self.label,
+            support=self.support,
+            newer=self.newer,
+            run_id=self.run_id,
+            written_by=self.written_by,
+            path=path,
+            shown=shown,
+        )
 
 
 class NamespaceError(StateError):
@@ -227,7 +291,7 @@ class InteractionRequiredError(ExecutionError):
     record exists to pause into (#126): nothing is pending. Never corrected
     and never relaunched as transient, since a relaunch would ask again; the
     phase is unchanged, and what was saved before the launch (the attempt
-    counter, a LOCAL launch charge) stands.
+    counter) stands.
     """
 
 
@@ -480,9 +544,8 @@ class ValidationDefinitionError(AutoForgeError):
     More than 16 definitions in a set, more than 32 elements in an argv, a
     blank element, an element over 1,024 characters or an argv over 4,096
     in all. The configuration loader turns it into a
-    :class:`ConfigurationError`; a LOCAL run contract persisted before the
-    bounds existed that holds one enters ``BLOCKED`` before any validator is
-    launched. The message names the definition and the bound, never the argv.
+    :class:`ConfigurationError`. The message names the definition and the
+    bound, never the argv.
     """
 
 

@@ -125,8 +125,9 @@ bytes, so update it to what the new one shows, never the fixture.
 first runs the backend's own capability probe
 (`autoforge.sandbox_bwrap.probe`, ADR 0005 D14.1) and, on a host that
 cannot enforce, skips with the probe's typed reason: which capability is
-missing (`bwrap` itself, an unprivileged user, PID or IPC namespace, a new
-procfs, a bind mount, an overlay mount, Landlock ABI 6). `pytest` is
+missing (a Python with `os.memfd_create`, `bwrap` itself, an unprivileged
+user, PID or IPC namespace, a new procfs, a bind mount, an overlay mount,
+Landlock ABI 6). `pytest` is
 configured with `-rs`, so every run, CI's included, prints each skip and
 its reason; a silent pass of zero tests cannot hide one.
 `AUTOFORGE_REQUIRE_SANDBOX_BACKEND` decides what such a host does instead:
@@ -144,6 +145,11 @@ its reason; a silent pass of zero tests cannot hide one.
 The measurement records what a host provides for the backend:
 
 - the platform, the kernel and the distribution;
+- the Python that measures, and whether it has `os.memfd_create`, the
+  memory file through which the backend hands `bwrap` a launch's options:
+  a build without it cannot launch at all (uv's CPython 3.12.13 build has
+  none; #389), so the real-backend tests that build runs skip under `auto`
+  instead of failing on a host that is otherwise capable;
 - which `bwrap` is on `PATH`, its version, and whether it has `--overlay`;
 - the user-namespace policy: `kernel.unprivileged_userns_clone`, Ubuntu's
   AppArmor `kernel.apparmor_restrict_unprivileged_userns` and
@@ -153,8 +159,9 @@ The measurement records what a host provides for the backend:
   `EOPNOTSUPP` (Landlock disabled at boot), `ENOSYS` (no Landlock call),
   either of which a seccomp filter can also return, or another errno.
 
-It calls the host capable when it is Linux, its `bwrap` can mount an
-overlay, the namespace launch succeeds and the Landlock ABI is at least 6.
+It calls the host capable when it is Linux, its Python has
+`os.memfd_create`, its `bwrap` can mount an overlay, the namespace launch
+succeeds and the Landlock ABI is at least 6.
 `uv run python -m tests.sandbox_host` prints it on its own.
 
 **Hosted CI measures its runner on every run.** The `sandbox` job of
@@ -202,7 +209,9 @@ credential:
    as its `Generator`;
 3. checks both: the exact set of files each ships (every module and every
    prompt template, `LICENSE`, and nothing else; `MANIFEST.in` keeps the
-   tests out of the sdist), `LICENSE` byte for byte, and the core metadata
+   tests out of the sdist; none of LOCAL mode's files, its `local_*.md`
+   templates, `local_workspace.py` or `run_contract.py`, whatever the tree
+   declares), `LICENSE` byte for byte, and the core metadata
    (Metadata-Version 2.4 or later, `Name: autoforge-cli`, the version,
    `License-Expression: MIT`, `License-File: LICENSE`, `Requires-Python`, the
    classifiers, no dependency outside an extra, and the `autoforge` console
@@ -218,8 +227,45 @@ credential:
    --dry-run --full-prompt`) in a scratch repository, with a fake `gh`
    first on `PATH` that records and fails any call, and checks it rendered
    the ANALYZE_EXECUTE prompt, called no `gh` and left the repository
-   byte-identical;
-7. prints the SHA-256 of both files (and, with `--sha256sums FILE`, writes
+   unchanged; then meets LOCAL mode's ways in with the installed
+   command (ADR 0009 D3 to D5, #389): `--help` names no `local`, and in a
+   scratch repository holding a `mode: "LOCAL"` state and beside a
+   configuration with a `local:` block, `autoforge local`, `status`,
+   `status --json`, `--state-dir … status`, `step`, `resume` and
+   `unblock`, each both as a dry run and as the ordinary invocation that
+   would take the lock and launch, and `run` over that state each exit 2
+   with argparse's invalid choice, the unknown key or the unknown mode.
+   They run with a scratch `HOME` and `TMPDIR`, no variable of the
+   caller's but `PATH`, and recording fakes of `gh`, `claude`, `opencode`
+   and `pi` first on `PATH`, so that a regression reaches no service and
+   no model; none may be called, and the repository, the configuration
+   file, the scratch `HOME` and `TMPDIR` must be unchanged. "Unchanged"
+   compares each path's bytes, inode, mode, owner, link count, size,
+   `mtime` and `ctime` (not `atime`, which a read sets): a file rewritten
+   with its own bytes, replaced by a copy of itself, or with its times put
+   back shows, and so does a lock file taken and removed, by its
+   directory's `mtime`. It cannot see a write outside those directories,
+   an advisory lock on a file that already existed, or a write by a
+   process left running after the command exits;
+7. runs the offline half of [Getting started](getting-started.md) (#259):
+   `uv tool install` of the wheel alone (`--offline --no-index`), into tool
+   directories and a home of its own, then, in an environment of `HOME`,
+   `PATH` and git's configuration switched off, whose `PATH` is a fake
+   `gh` that fails every call, the installed `autoforge`, git's directory
+   and `/bin:/usr/bin` (no credential, and no agent CLI on the CI runner):
+   `autoforge --version` and `--help` outside
+   any repository, and, in a repository whose `origin` is on GitHub and
+   which keeps `.autoforge/` and `autoforge.yaml` out of git the way the
+   guide does, `autoforge doctor --json` with the built-in routing and
+   with each starter of [`examples/`](../examples) saved as
+   `autoforge.yaml`. Every row that needs no credential (`config`, `merge
+   gate` closed, `git available`, `GitHub remote`, `launch environment`,
+   `state dir writable` and the rest of `CREDENTIAL_FREE_ROWS`) must be
+   `OK`, and the agent rows must name exactly the CLIs the configuration
+   routes to. With each starter it also makes a REMOTE dry run, checked as
+   in step 6, and the repository's `git status` must stay empty. The rows
+   that need `gh`, a sign-in or an agent CLI are not checked;
+8. prints the SHA-256 of both files (and, with `--sha256sums FILE`, writes
    them in `sha256sum` format).
 
 It runs on one interpreter, `DIST_PYTHON` (default 3.12):
@@ -230,8 +276,9 @@ its scratch directory when it passes and keeps it, naming it, when it fails.
 is the cheap half: it fails when a non-Python file under
 `src/autoforge/` is neither declared as package data nor deliberately left
 out, when code reads a package resource from a module it does not know,
-when the two version strings differ, or when the classifiers drift from
-the Python versions CI runs.
+when the two version strings differ, when the classifiers drift from
+the Python versions CI runs, or when the starters of `examples/` and the
+CLIs they route to drift from what step 7 expects.
 
 ## The suite on several workers
 
@@ -529,6 +576,182 @@ repository configuration rather than code, `autoforge doctor` re-reads it
 (see [GitHub safety: doctor's branch-rule check](agent-guides/github-safety.md#doctors-branch-rule-check))
 so that disabling it, renaming the context or adding a bypass actor is
 noticed before an unattended run relies on it.
+
+Each `test` job also writes a duration report, which decides nothing
+([Test durations in CI](#test-durations-in-ci)).
+
+## Test durations in CI
+
+The suite's time has so far been measured by hand on two workstations
+([The suite on several workers](#the-suite-on-several-workers),
+[Where the serial suite's time goes](#where-the-serial-suites-time-goes)).
+Nothing kept what CI's own runners take: a job's duration shows in the
+Actions UI, but not its counts, its skips, or whether it is slower than
+main. Since #344 every `test` job keeps that and compares it with main's
+recent runs. The report is report only: it never changes a job's result or
+the required `ci` check.
+
+### The pipeline
+
+In the `test` job of `.github/workflows/ci.yml`, on each interpreter:
+
+1. pytest runs as `make test` does, with one more option,
+   `--junitxml="${RUNNER_TEMP}/durations/junit.xml"`, which selects,
+   deselects and changes nothing;
+2. `actions/cache/restore` brings back main's duration history for that
+   interpreter, the newest one saved under `ci-durations-v1-py<version>-`;
+3. `tests/ci_durations.py report` (standard library only, on the bare
+   interpreter) reads the JUnit report and the history, writes the report
+   into `${RUNNER_TEMP}/durations/report/` and appends its Markdown to the
+   job's summary;
+4. `actions/upload-artifact` uploads that directory as
+   `durations-py<version>-attempt<n>`, kept 30 days;
+5. on a push to main only, `report` adds the run to the history when it is
+   clean, and `actions/cache/save` saves the history under a new key.
+
+The report holds, per run:
+
+- **counts**: tests, passed, failed, errors, skipped and xfailed, from the
+  JUnit report (a test reported twice, for an error in teardown, counts
+  once, as an error), and the skips grouped by reason. The live test, which
+  the default options deselect, is not in the report;
+- **durations**: the suite's wall time (pytest's session), the tests' own
+  time, each module's, the 20 slowest tests, and every test's in
+  `tests.json`;
+- **linkage**: the commit, ref and event, the run and attempt with their
+  URL, the check run (`test (py3.11)`), which the required check `ci`
+  aggregates, the pytest step's outcome and the runner image.
+
+`summary.json` is the run, `tests.json` its tests, `comparison.json` the
+verdict below and `summary.md` what the job summary shows.
+
+### The regression policy
+
+A run is compared only with runs of its own **category**: the job, the
+interpreter, the test selection (`default`: the default options, serially),
+the uv cache state (`warm` or `cold`, setup-uv's `cache-hit`; `unknown` when
+it gave none) and the runner (`github-hosted Linux X64`). The runner image
+is recorded but is no category, since GitHub replaces it every week or so;
+the report notes when it differs from the newest baseline run's.
+
+The **baseline window** is the last 20 runs of a push to main in that
+category, recorded in the 30 days before the run, one per commit (the newest
+attempt), and clean: a complete report, at least one test, no failure or
+error, the suite's wall time, and a pytest step that succeeded. A run of a
+pull request, a failed run, a cancelled run and a run without a report are
+never baseline runs.
+The window's median and p95 (nearest rank, as `tests/parallel_bench.py`
+takes it: with 20 runs, the second slowest) of the suite's wall time decide:
+
+| verdict | when | what to do |
+|---|---|---|
+| `regression` | above 1.10 × the window's p95 | look at the modules that grew most (the report lists them); rerun the job once to rule out the runner; if it stays, profile as in [Where the serial suite's time goes](#where-the-serial-suites-time-goes) before merging, or open an issue when main shows it |
+| `slower` | above 1.10 × the median | nothing by itself; a trend of `slower` runs on main is worth a look |
+| `ok` | within those bounds | nothing |
+| `faster` | below 0.90 × the median | read the notes: fewer tests or more skips than main's newest run means less was tested, not that the suite got faster |
+| `insufficient-baseline` | fewer than 5 runs in the window | nothing to compare with yet |
+| `not-comparable` | the run has failures or errors, no test, no wall time for the suite, or a pytest step that did not succeed | its times are shown, without a verdict, and it never becomes a baseline run |
+| `no-data` | no JUnit report, or one that does not read | the report claims nothing; the job's own result says whether the suite passed |
+
+The `slower` bound is #341's rule that a serial run more than 10% above the
+median is worth profiling. The `regression` bound sits beyond the spread the
+window itself shows, so a noisy runner raises it and a steady one lowers it.
+These values are a starting point, not a measurement of GitHub's runners,
+whose times no run kept before this report: once the history holds full
+windows, compare how often an unchanged main gets `slower` or `regression`,
+and widen the bounds in `tests/ci_durations.py` (`SLOWER`, `REGRESSION`) if
+it is more than rarely.
+
+**Missing metrics** never read as `ok`: a run without a report is
+`no-data`, one that failed is `not-comparable`, and a category without five
+baseline runs is `insufficient-baseline`. A report without the suite's wall
+time is `not-comparable` too, and its wall time stays empty: the tests' own
+time leaves out collection and whatever the session does between tests, so
+it is shown beside it but never takes its place. A history that was never
+saved, has expired or does not read is ignored with a note, and so is each
+sample in it that the tool did not write, counted; the window then starts
+again from the next pushes to main.
+
+**A cold uv cache** is compared with cold runs only. The cache mostly
+speeds up `uv sync`, which the report does not time (its step's duration
+is in the run's UI). The report shows the window of the other cache state
+beside the verdict, for reference and never as one, so a difference between
+the two shows instead of being averaged away.
+
+### What it never does
+
+- **Decide a job.** Each report step runs after pytest whether it passed or
+  failed, never when the run was cancelled (`if: success() || failure()`),
+  with `continue-on-error` and a 5-minute timeout of its own, and `report`
+  exits 0 whatever it finds. The job's result is pytest's, and `ci` still
+  needs every job and fails on a skipped or cancelled one. A duration gate
+  would make the required check depend on how busy a shared runner is.
+  `tests/test_ci_workflow.py` pins all of this, and that no other step may
+  continue on error. `compare --fail-on-regression` exists for a
+  maintainer's own use and is never passed in CI.
+- **Upload what a test printed.** The artifact holds test ids, outcomes,
+  times and skip reasons, which pytest's `-rs` prints in the job's log
+  anyway. A failure's message, captured output and the raw JUnit report stay
+  on the runner.
+- **Need a secret or a permission.** The cache and artifact actions use the
+  runner's own token for those services, not `GITHUB_TOKEN`, and the
+  workflow keeps `contents: read`. They are pinned to a commit, as in
+  `pypi-publish.yml`. Nothing outside GitHub Actions is involved.
+- **Trust a pull request's history.** Only a push to main saves it; a pull
+  request restores main's and cannot write it. The history decides nothing
+  but the report.
+
+GitHub evicts a cache entry unused for seven days, and the oldest ones once
+a repository's caches pass their size limit; each push to main saves a new
+entry and every run reads the newest, so the history is lost only when no
+run reads it for a week. Two pushes to main whose runs overlap
+restore the same history and the later save wins, losing one sample;
+`concurrency` cancels the older run on main, so that is rare.
+
+The `sandbox` and `dist` jobs have no report yet. `--selection` names the
+category a `sandbox` report would take.
+
+### Reproducing a report
+
+The tool runs on any interpreter without the project installed. A local
+run, summarized and compared with main's recent artifacts (a local runner
+is its own category, so expect `insufficient-baseline` against CI's runs;
+`--python` names the interpreter the suite ran on):
+
+```bash
+uv run pytest --junitxml=/tmp/durations/junit.xml
+python3 -I tests/ci_durations.py summarize --python 3.14 \
+    --junit /tmp/durations/junit.xml --out /tmp/durations/report
+for id in $(gh run list --workflow ci.yml --branch main --event push --limit 20 \
+        --json databaseId --jq '.[].databaseId'); do
+    gh run download "$id" --pattern 'durations-py3.11-*' --dir "/tmp/artifacts/$id"
+done
+python3 -I tests/ci_durations.py compare --current /tmp/durations/report/summary.json \
+    --baseline /tmp/artifacts
+```
+
+A run of CI is compared the same way, from its own artifact: here the
+newest pull-request run of the branch checked out, against the main runs
+downloaded above (its first attempt's report; `attempt2` names its first
+re-run's):
+
+```bash
+run=$(gh run list --workflow ci.yml --branch "$(git branch --show-current)" \
+    --event pull_request --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run download "$run" --name durations-py3.11-attempt1 --dir "/tmp/current/$run"
+python3 -I tests/ci_durations.py compare --current "/tmp/current/$run/summary.json" \
+    --baseline /tmp/artifacts
+```
+
+`compare` reads summaries and history files, or directories holding them at
+any depth, and prints the same Markdown; `--window`, `--min-samples` and
+`--max-age-days` try another policy on the same runs. Every run names its
+artifacts alike (`durations-py3.11-attempt1`), so each run is downloaded
+into a directory of its own. `gh run download` extracts an artifact chosen
+by `--name` straight into `--dir`, which is where the second `compare`
+looks for `summary.json`. One of main's downloaded runs can be compared
+with the others the same way: it is left out of its own window, and so is
+every other run of its commit.
 
 ## What a green `ci` does and does not prove
 

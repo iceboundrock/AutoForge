@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import os
 import sys
 from pathlib import Path
 
@@ -38,6 +39,15 @@ case "$1" in
   *) exit 0 ;;
 esac
 """
+
+
+@pytest.fixture(autouse=True)
+def _a_python_with_memfd(monkeypatch) -> None:
+    """Every measurement here is of a Python with ``os.memfd_create``, whichever
+    runs the test, but :func:`test_a_python_without_memfd_create_is_measured_incapable`'s
+    (#389). Never called: the measurement only looks."""
+    if getattr(os, "memfd_create", None) is None:
+        monkeypatch.setattr(os, "memfd_create", lambda *_args: -1, raising=False)
 
 
 def _path_with(tmp_path: Path, monkeypatch, script: str | None) -> Path:
@@ -103,6 +113,45 @@ def test_a_capable_host_is_measured_capable_and_the_tests_said_required(tmp_path
     assert "| unprivileged bwrap: user, PID and IPC namespaces, new procfs | granted |" in text
     assert "This host can enforce the outer sandbox" in text
     assert "AUTOFORGE_REQUIRE_SANDBOX_BACKEND=auto" in text
+
+
+def test_a_python_without_memfd_create_is_measured_incapable(tmp_path, monkeypatch):
+    """PR #425 R1-F2 (#389): a capable kernel and ``bwrap`` do not make a host
+    capable for a Python that has no ``os.memfd_create`` (uv's CPython 3.12.13
+    build): the backend cannot hand ``bwrap`` a launch's options, so that
+    Python cannot launch, and the measurement says so, independently of the
+    backend's probe."""
+    _path_with(tmp_path, monkeypatch, CAPABLE_BWRAP)
+    monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: (6, ""))
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    report = sandbox_host.measure()
+    assert not report.memfd and not report.capable
+    (missing,) = report.missing
+    assert missing.startswith("a Python with os.memfd_create (this one, ")
+    assert sys.executable in missing and missing.endswith(", has none)")
+    text = report.markdown()
+    assert f"at {sys.executable}, os.memfd_create no |" in text
+    assert "This host cannot enforce the outer sandbox: it lacks a Python with" in text
+    assert _report().memfd and "os.memfd_create yes" in _report(python="3.14.8").markdown()
+
+
+def test_auto_skips_on_a_python_without_memfd_create(tmp_path, tmp_path_factory, monkeypatch):
+    """PR #425 R1-F2 (#389): under ``AUTOFORGE_REQUIRE_SANDBOX_BACKEND=auto``,
+    the real-backend tests that such a Python runs skip, naming the
+    interpreter twice, once by the backend's real probe and once by the
+    measurement, instead of failing on a host that is otherwise capable."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("the backend is Linux-only")
+    monkeypatch.setattr(conftest, "SYSTEM_PYTHON", sys.executable)
+    _path_with(tmp_path, monkeypatch, CAPABLE_BWRAP)
+    monkeypatch.setattr(sandbox_host, "landlock_abi", lambda: (6, ""))
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    monkeypatch.setenv(REQUIRE_SANDBOX_BACKEND, "auto")
+    with pytest.raises(pytest.skip.Exception) as caught:
+        real_sandbox_backend(tmp_path_factory)
+    text = str(caught.value)
+    assert "cannot provide a Python with os.memfd_create" in text
+    assert "measured: this host cannot enforce the outer sandbox: it lacks a Python with" in text
 
 
 def test_a_host_without_bwrap_is_measured_and_named(tmp_path, monkeypatch):

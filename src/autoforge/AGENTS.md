@@ -20,7 +20,7 @@ doctor_sandbox.py   doctor's outer-sandbox rows: capability and mode outcome, po
                     class, provider declarations and sandboxed --version, operator paths,
                     hard links, sandbox directories, TCP listeners; read-only (#169)
 engine.py           ControllerEngine: phase orchestration, verification calls, recovery
-transitions.py      Phase enum, LEGAL_EDGES / LOCAL_LEGAL_EDGES / UNBLOCK_TARGETS, decide_next_phase
+transitions.py      Phase enum, LEGAL_EDGES / UNBLOCK_TARGETS, decide_next_phase
 profiles.py         execution-profile routing (which provider/model/effort per phase/round)
 loop_guard.py       REVIEW/FIX loop bounds and stagnation (pure logic)
 replan.py           replan policy and review-history collection (pure logic)
@@ -94,21 +94,22 @@ certificate.py      review certificates: issuance from the review binding, appli
                     (certificate_problem, also against the live PR the merge gate reads, #175)
                     and the not-a-merge-permission wording; pure (ADR 0006 D12, D13, #174)
 result_parser.py    CONTROL_RESULT extraction and strict per-phase validation
-state.py            persisted controller state, atomic writes, schema/protocol checks
+state.py            persisted controller state, atomic writes, schema/protocol checks; the
+                    protocol label's classification (protocol_support, #265)
+provenance.py       the running controller's identity (imported package file, interpreter,
+                    version, protocol) and the protocol-mismatch diagnostic the CLI prints;
+                    reads and writes nothing (#265)
 run_namespace.py    the parallel EPIC scheduler's per-issue run identities (RunKey) and
                     namespaces under <common>/autoforge/scheduler/issues/<n>: layout,
                     binding.json, read-only lookup and listing, the state archive, the
                     standalone state-dir refusal; no lock, claim or GitHub read (#178)
-run_contract.py     the durable contract of a LOCAL run
 config_fingerprint.py  the recorded configuration of a REMOTE run (profile routing,
                     agent worktree root) that step/resume/unblock compare (#219)
 sandbox_pin.py      the sandbox.mode every run is pinned to; step/resume/unblock refuse
                     a weaker one unless --accept-config-change (#280)
-git_workspace.py    the controller's git reader of a working tree in every mode: root,
-                    git dirs, HEAD, branch, status; hardened, no optional lock, reads
-                    no configuration (ADR 0009 C1, #386)
-local_workspace.py  LOCAL mode working-tree verification: the walk, snapshot and
-                    fingerprint over git_workspace's reads
+git_workspace.py    the controller's git reader of a working tree: root, git dirs, HEAD,
+                    branch, status; hardened, no optional lock, reads no configuration
+                    (ADR 0009 C1, #386)
 safefs.py           filesystem capability boundary for every controller write
 locking.py          the lock domains of ADR 0008 (#180): L0 (ControllerLock, keyed by the git
                     common dir; shared and adopted close-only), L2 (IssueRunLock and its
@@ -116,7 +117,8 @@ locking.py          the lock domains of ADR 0008 (#180): L0 (ControllerLock, key
                     the order assertion and the scheduler's filesystem refusal
 ownership.py        who may act on an issue (ADR 0008 D17.2, #180): the forward guard's
                     ownership predicate (an open scheduler claim included, #181) and the
-                    reverse guard's standalone-state read
+                    reverse guard's standalone-state read (a state of a protocol this
+                    controller does not read admits nothing, #265)
 scheduler_state.py  the scheduler's durable bookkeeping (ADR 0008 D6, D7, D14, #181):
                     claim.json (claims, generations, the closing rule, compare-and-write
                     under L2), scheduler.json, the pure restart classification,
@@ -153,7 +155,7 @@ redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
 prompts/            file-based templates ({{VAR}}): common.md (trust boundary), phase
-                    templates, update_epic_rerequest.md, local_*.md, correction.md,
+                    templates, update_epic_rerequest.md, correction.md,
                     worktree_state.md (#187); renderer in prompts/__init__.py
 ```
 
@@ -185,14 +187,17 @@ prompts/            file-based templates ({{VAR}}): common.md (trust boundary), 
   checkpointed in persisted state before it is performed. Persisted state is
   validated on load and corruption fails loudly; a new persisted field
   follows the same rule. The routed references specify both.
-- LOCAL mode (`autoforge local`) makes zero `gh` invocations and has its own
-  prompt templates (`prompts/local_*.md`) and transition table; do not let a
-  GitHub-only concern leak into it. Its workspace and filesystem boundary is
-  recorded in `docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md`;
-  read that ADR before changing `local_workspace.py`, `run_contract.py` or
-  `safefs.py`. LOCAL is being removed: ADR 0009
-  (`docs/adr/0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md`)
-  classifies every LOCAL reference and says what a change to it may still do.
+- `safefs.py` is the capability boundary of the controller's writes to a
+  state directory, its run logs and read context, and of the scheduler's
+  namespaces. Its design is recorded in §5.4 of
+  `docs/adr/0001-local-mode-workspace-identity-and-filesystem-boundary.md`,
+  the part of that record ADR 0009 keeps; read it before changing
+  `safefs.py`. LOCAL mode is removed
+  (`docs/adr/0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md`):
+  a LOCAL artifact meets only the generic refusals (argparse's subcommand
+  choices, the unknown configuration key, the state loader's mode and
+  field checks, the evidence parsers' kind checks). Do not add code that
+  recognises, shows or converts one.
 
 ## Routing by module
 
@@ -212,8 +217,8 @@ verification, merge gate, dry-run, read context),
 prompts/update_epic*.md                           -> docs/agent-guides/github-safety.md
                                                      (+ docs/adr/0004-authority-boundary-and-
                                                      typed-external-effects.md for effects)
-state.py, effects.py, evidence.py, certificate.py,
-run_contract.py, safefs.py, config_fingerprint.py,
+state.py, provenance.py, effects.py, evidence.py,
+certificate.py, safefs.py, config_fingerprint.py,
 sandbox_pin.py, locking.py, errors.py,
 engine.py (recovery, retry)                       -> docs/agent-guides/state-and-recovery.md
 run_namespace.py, ownership.py, locking.py (lock

@@ -67,6 +67,17 @@ the `sandbox` job's summary on every run.
 | PyPy and other implementations | untested | Not in the CI matrix. |
 | CPython 3.10 and older | **unsupported** | Below `requires-python`; the code uses 3.11's standard library (`tomllib`, among others). |
 
+A build of a supported interpreter can still lack a call the outer
+sandbox needs. uv's CPython 3.12.13 build (as installed in June 2026) has
+no `os.memfd_create`: AutoForge runs on it, but cannot enforce the outer
+sandbox there, so `doctor` names that Python as what the host lacks and
+`sandbox.mode: required` refuses every step that launches (#389). The
+default `disabled` is unaffected. It also has no `os.pidfd_open`, so the
+executor waits for a child by polling. uv's 3.11.17, 3.12.16 and 3.13.16
+builds and Fedora's 3.14.8, measured on the same host, have both
+([ADR 0009 C.5](adr/0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md#c5-the-regression-on-the-final-candidate));
+`doctor`'s capability row shows whether a given Python can enforce.
+
 The supported interpreters are the CI matrix: the Makefile's
 `CI_PYTHON_VERSIONS`, which `tests/test_ci_workflow.py` keeps equal to the
 workflow's `test` and `dist` matrices, and `tests/test_packaging.py` to the
@@ -138,7 +149,12 @@ version number, `doctor` checks what the adapter depends on: `claude
 `--strict-mcp-config` and `--setting-sources`, the flags every launch passes
 so that no hook, plugin, MCP server or repository setting runs
 (`agent 'claude' keeps integrations off`). A launch is refused without
-them as well. A version floor would refuse nothing this check lets through
+them as well. Claude Code 2.1.314 writes only the first 8 or 16 KiB of its
+22 KiB `--help` when its output is a pipe, as `doctor`'s is, and stops
+mid-line before those flags (written to a file, the help is whole and
+lists all three; #259). A help that ends mid-line without them is
+therefore a `SKIP` that says so, not a `FAIL`; one that ends with a whole
+line and lacks a flag is still a `FAIL`. A version floor would refuse nothing this check lets through
 on the evidence there is (every release with the three flags that has been
 run is listed above), and Claude Code's release cadence would make a floor
 stale within days. The provider's argv is unchanged. Releases outside the
@@ -172,6 +188,7 @@ launched.
 | Requirement | How `doctor` names it when missing |
 |---|---|
 | Linux | `a Linux kernel (the only platform with a backend)` |
+| a Python with `os.memfd_create`, through which the backend hands `bwrap` a launch's options; uv's CPython 3.12.13 build has none ([Python](#python)) | `a Python with os.memfd_create, through which bwrap gets a launch's options` |
 | `bwrap` (bubblewrap) on the controller's `PATH` | `bwrap (bubblewrap) on the controller's PATH` |
 | unprivileged user namespaces; refused, for example, by Ubuntu 23.10 and later's `kernel.apparmor_restrict_unprivileged_userns` or Debian's `kernel.unprivileged_userns_clone=0` | `an unprivileged user namespace` |
 | PID namespaces | `a PID namespace` |

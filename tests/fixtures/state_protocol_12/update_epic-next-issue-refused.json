@@ -1,0 +1,125 @@
+{
+  "acceptance_outcomes": [],
+  "attempt": 2,
+  "base_branch": "",
+  "base_head_sha": "",
+  "baseline_dirty_paths": [],
+  "block_reason": "",
+  "completion_context": {
+    "entry_outside_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "next_issue_url": "https://github.com/owner/repo/issues/3",
+    "phase": "UPDATE_EPIC",
+    "pr_url": "https://github.com/owner/repo/pull/42",
+    "roadmap_section": "## Roadmap\n- [x] #1 (PR #42)\n- [ ] #3",
+    "section_void": false,
+    "selection_void": false,
+    "spliced_outside_sha256": "003489a5dcf084732d772616f5424d9d55a52db4ce172bad45fd7216d5ad0e3d"
+  },
+  "config_fingerprint": {},
+  "controller_version": "0.1.0a1.dev0",
+  "counted_merged_prs": [
+    "https://github.com/owner/repo/pull/42"
+  ],
+  "created_at": "2026-10-31T10:31:40.262505+00:00",
+  "current_base_ref": "",
+  "current_branch": "autoforge/2-feature",
+  "current_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "current_issue_url": "https://github.com/owner/repo/issues/2",
+  "current_merge_base_sha": "",
+  "current_pr_url": "https://github.com/owner/repo/pull/42",
+  "effect_records": [
+    {
+      "attempts": 1,
+      "completion": "progress_comment_exactly_one_body_equals_payload",
+      "identity": {
+        "epic_url": "https://github.com/owner/repo/issues/1",
+        "marker": "<!-- ai-epic-progress: {\"issue\": \"https://github.com/owner/repo/issues/2\", \"pr\": \"https://github.com/owner/repo/pull/42\"} -->"
+      },
+      "kind": "progress_comment",
+      "observed": {
+        "url": "https://github.com/owner/repo/issues/1#issuecomment-950001"
+      },
+      "owner": {
+        "issue_url": "https://github.com/owner/repo/issues/2",
+        "phase": "UPDATE_EPIC",
+        "pr_url": "https://github.com/owner/repo/pull/42",
+        "run_id": "af-20261031T103140Z-e7e174",
+        "transaction_id": ""
+      },
+      "payload": {
+        "body": "Implemented issue 2 in PR 42; the test suite passes.\n\n<!-- ai-epic-progress: {\"issue\": \"https://github.com/owner/repo/issues/2\", \"pr\": \"https://github.com/owner/repo/pull/42\"} -->"
+      },
+      "position": 0,
+      "precondition": {
+        "absent": true
+      },
+      "reason": "",
+      "stage": "observed",
+      "target": {
+        "epic_url": "https://github.com/owner/repo/issues/1"
+      }
+    }
+  ],
+  "entry_observation": {
+    "base_sha": null,
+    "issue_url": "https://github.com/owner/repo/issues/2",
+    "objects": {
+      "<!-- ai-epic-progress: {\"issue\": \"https://github.com/owner/repo/issues/2\", \"pr\": \"https://github.com/owner/repo/pull/42\"} -->": null
+    },
+    "phase": "UPDATE_EPIC",
+    "pr_url": "https://github.com/owner/repo/pull/42",
+    "refs": {}
+  },
+  "epic_url": "https://github.com/owner/repo/issues/1",
+  "escalation_count": 0,
+  "execution_attempt": 1,
+  "feature_spec_path": "",
+  "feature_spec_sha256": "",
+  "last_fix_resolutions": [],
+  "last_review_comment_url": "",
+  "last_review_needs_fix": null,
+  "last_review_result": "clean",
+  "launch_label": "controller_publishes",
+  "local_fix_rounds": 0,
+  "local_pending_attempts": 0,
+  "local_pending_fingerprint": "",
+  "local_pending_phase": "",
+  "local_run_contract": {},
+  "merged_since_epic_update": 1,
+  "mode": "REMOTE",
+  "next_issue_rejections": [
+    "next_issue_url null reports the EPIC https://github.com/owner/repo/issues/1 complete, but GitHub lists 1 open sub-issue(s) of it that this run may select: #3. A sequential run ends only when none remains; select one of them"
+  ],
+  "open_findings": [],
+  "operator_comment_outcomes": [],
+  "phase": "UPDATE_EPIC",
+  "premerge_verified_commands": [],
+  "premerge_verified_head_sha": "",
+  "prior_findings": [],
+  "producer_validation_failure": {},
+  "prompt_version": "v14",
+  "protocol_version": "12",
+  "replan_transaction": {},
+  "repository": "owner/repo",
+  "review_certificate": {},
+  "review_evidence": {},
+  "review_history": [],
+  "review_round": 2,
+  "reviewed_base_ref": "",
+  "reviewed_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "reviewed_merge_base_sha": "",
+  "reviewed_pr_url": "",
+  "reviewed_workspace_fingerprint": "",
+  "run_id": "af-20261031T103140Z-e7e174",
+  "sandbox_pin": {},
+  "step_count": 2,
+  "superseded_prs": [],
+  "unblock_history": [],
+  "updated_at": "2026-10-31T10:31:40.380658+00:00",
+  "validation_attempt": {},
+  "validation_override_seq": null,
+  "validation_records": [],
+  "verification_failures": [],
+  "workspace_fingerprint": ""
+}

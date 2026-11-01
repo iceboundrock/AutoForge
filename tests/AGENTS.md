@@ -45,10 +45,9 @@ read it before adding tests for a listed area.
 
 - `ScriptedProvider` (`src/autoforge/providers.py`) handlers stand in for
   every agent call and do what the real agent would (commit, push a fix,
-  answer with a result); `ExplodingGitHub` fails a test if LOCAL mode
-  reaches for GitHub.
-- `engine`, `fake_github`, `tmp_state_dir`, `repo` and `make_engine` /
-  `make_local_engine` build a controller against those fakes; `block(...)`
+  answer with a result).
+- `engine`, `fake_github`, `tmp_state_dir`, `repo` and `make_engine`
+  build a controller against those fakes; `block(...)`
   builds a well-formed `CONTROL_RESULT` block. A `make_engine` engine never
   sleeps: a read-back waiting for GitHub to move a PR head after the
   controller's push (#403) records each pause in `eng.sleeps`, and
@@ -102,6 +101,18 @@ read it before adding tests for a listed area.
   real `GitHubClient` takes its HTTPS transport as `https=`; the autouse
   `_no_network_exact_read` fixture fails a test whose client would reach
   `api.github.com`, so give it `https=...` or use the fake.
+- `FakeGitHub` answers the native graph reads `UPDATE_EPIC` makes (#287):
+  `get_issue_node`, `list_sub_issues` and `list_titled_sub_issues`, from
+  `parents`, each issue's parent. An issue a test adds is a sub-issue of
+  `EPIC` unless `add_issue(..., parent=...)` names another parent or
+  `None`; the EPIC and an issue the controller creates have none.
+  `graph_error` makes all three reads raise, `sub_issues_error` the two
+  listings alone, and `hidden_sub_issues` counts sub-issues an issue's
+  summary reports but its listing leaves out, as GitHub does for one the
+  token may not read. A `null` selection is held to the listing, so a test
+  that ends a run with `null` leaves no other open sub-issue of `EPIC`.
+  The scheduler's tests serve the graph from their own fake `gh` instead
+  (`tests/test_epic_graph.py`).
 - The controller publishes `REPLAN_REEXECUTE` too (#164): the replan agent
   commits on the base its prompt names and the controller pushes it to the
   derived replacement branch and creates the replacement PR. In
@@ -194,6 +205,13 @@ read it before adding tests for a listed area.
   statistics and resume on synthetic reports and stand-in runs, and runs a
   three-test suite serially and on two workers, and with worker options
   that override the configuration's.
+- `tests/ci_durations.py` is no test either: the duration report of CI's
+  `test` job (#344; `docs/development.md`, "Test durations in CI"), which
+  summarizes the job's JUnit report, compares it with main's recent runs and
+  keeps main's history, and which a maintainer runs by hand on downloaded
+  artifacts. Standard library only. `tests/test_ci_durations.py` tests it
+  on synthetic reports and one real pytest run; `tests/test_ci_workflow.py`
+  pins the steps that keep it report only.
 - `tests/fast_targets.py` is no test either: the tool behind
   `make test-fast` (#342, ADR 0010), which selects the test modules a
   change's paths map to, for feedback while working. Its `COVERAGE` needs
@@ -218,19 +236,17 @@ read it before adding tests for a listed area.
   was written, replaced or created and removed again.
   `unloadable_state(kind, saved)` makes a state file that loads into one of
   `UNLOADABLE_STATES`: an unknown mode, an unknown label, invalid JSON and,
-  since LOCAL was removed (#387), a LOCAL state.
-  #387 and #388 keep these tests passing unchanged, apart from the expected
-  protocol label and any row that names LOCAL.
+  since LOCAL was removed (#387), a LOCAL state. Its unknown label is `'99'`,
+  which #265 classifies as a newer protocol's: a test of what a refused
+  label does differently (no `--force` advice, a standalone state that
+  admits nothing) says so where it takes that kind.
+  They keep passing unchanged after the removal, with only the expected
+  protocol label moved to 13 (#388).
 - The shared coverage LOCAL's removal must not lose (ADR 0009 A.2.3, A.2.4,
-  D12 S1a; #386) is REMOTE or mode-neutral tests, each beside a LOCAL test
-  that stays until #387 or #388. Each docstring carries `ADR 0009 A.2.3
-  <row> (#386)` (or A.2.4) and the node id of the LOCAL test it replaces,
-  so that a grep for that id finds its replacement before the LOCAL test is
-  deleted. `tests/local_helpers.py` holds the scripted-run helpers other
-  modules imported from `tests/test_local.py` (`local_repo`,
-  `impl_result`, `review_result`, `finding`, `fix_result`, `scripted`,
-  `touch_impl`, `IMPL_FILE`); like `make_local_engine`, they build LOCAL
-  runs and go with LOCAL's code.
+  D12 S1a; #386) is REMOTE or mode-neutral tests. Each docstring carries
+  `ADR 0009 A.2.3 <row> (#386)` (or A.2.4) and the node id of the LOCAL
+  test it replaced. The LOCAL tests, their helpers and LOCAL's fixtures
+  went with LOCAL's code (#387, #388).
 - Recovery tests reload state from disk after each step; a crash-recovery
   test performs the external side effect first and only then interrupts,
   because that is the window the controller must survive.
@@ -266,9 +282,8 @@ GitHub client, pre-merge evidence     test_github.py, test_premerge.py
 byte-exact export and its proof       test_materialize.py (the merge gate's: test_premerge.py,
                                       test_engine.py)
 effect operations, git transport      test_effects.py, test_git_transport.py
-state, contract, filesystem boundary  test_state.py, test_durable_run_contract.py, test_safefs.py
-the controller's git reader           test_git_workspace.py (hardened reads; no config.local read
-                                      by engine.workspace() or a REMOTE run, ADR 0009 C1)
+state, filesystem boundary            test_state.py, test_state_root.py, test_safefs.py
+the controller's git reader           test_git_workspace.py (hardened reads)
 the shared coverage of LOCAL's        test_git_workspace.py (A), test_state_fuzz.py (B),
 removal (ADR 0009 S1a, #386)          test_state_root.py (C), test_findings_fence.py (D),
                                       test_doctor_sandbox.py, test_sandbox_routing.py,
@@ -284,9 +299,28 @@ LOCAL's ways in, closed (ADR 0009     test_cli.py (autoforge local, --help, a lo
 S2, #387)                             a LOCAL state under every label and in the lock's
                                       directory, no read of <git dir>/autoforge/state),
                                       test_config.py (the key),
-                                      test_state.py, test_local.py (the loader),
+                                      test_state.py (the loader),
                                       test_ownership.py, test_epic_commands.py (the scheduler,
                                       the epic commands' refusal of the key)
+protocol 13: LOCAL's state fields     test_state.py (the drop step on main's own protocol-12
+and evidence kinds removed (ADR 0009  saves in every phase, tests/fixtures/state_protocol_12,
+S3, #388)                             and on built files; one refusal per field, a
+                                      protocol-13 or unlabelled file carrying one),
+                                      test_cli.py (status --json carries none of them),
+                                      test_evidence.py, test_certificate.py,
+                                      test_review_certificate.py (LOCAL kinds refused as
+                                      unknown), test_local_removal.py (structural: no LOCAL
+                                      topology, launch class, mode or deleted module),
+                                      test_packaging.py (no local_*.md packaged)
+LOCAL's removal closed and measured   test_removal_attestation.py (ADR 0009 Appendix C.6
+(ADR 0009 S4, #389) and audited       names a test for every A.2.4 invariant, Appendix D a
+(EPIC #383)                           verdict for each of the EPIC's twelve exit criteria
+                                      and a test for each it calls met, and every test
+                                      either names exists; the legacy guide stays gone,
+                                      ADR 0001 stays marked superseded, the changelog keeps
+                                      the removal's clean-up), test_packaging.py (the
+                                      dist check's LOCAL files and the installed
+                                      command's refusals of LOCAL's ways in)
 scheduler namespaces (#178)           test_run_namespace.py (RunKey, layout, binding, lookup,
                                       listing, archive, engine binding); the standalone
                                       state-dir refusal: test_cli.py
@@ -326,15 +360,15 @@ recovery (#183)                       JSON keys, stop, archive, dry run, --force
 REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.py; load and
                                       protocol: test_state.py)
 sandbox pin and config placement      test_sandbox_pin.py (strength, the record, the engine's
-(#280)                                refusal, opt-in log, strengthen and upgrade, REMOTE and
-                                      LOCAL; CLI: test_cli.py; load and protocol: test_state.py);
+(#280)                                refusal, opt-in log, strengthen and upgrade; CLI:
+                                      test_cli.py; load and protocol: test_state.py);
                                       the placement rule (the providers' writable
                                       directories included): test_sandbox_policy.py, doctor:
                                       test_doctor.py, worker: test_worker.py, real backend:
                                       test_sandbox_routing.py; the `..` spellings CLI and
                                       doctor share: conftest.dotdot_config_paths
 candidate validation evidence         test_evidence.py (pure), test_validation_evidence.py
-                                      (engine, REMOTE and LOCAL; load and protocol: test_state.py)
+                                      (engine; load and protocol: test_state.py)
 candidate validation gates (#173)     test_validation_gates.py (producers, REVIEW entry,
                                       override, provider parity; REPLAN rejection:
                                       test_replan.py)
@@ -377,8 +411,11 @@ boundary alike; the gate and modes;   test_sandbox_parity.py; `make test-sandbox
 doctor's rows                         instead), test_engine_sandbox.py,
                                       test_sandbox_gate.py, test_doctor_sandbox.py,
                                       test_sandbox_host.py (the host measurement)
-LOCAL mode                            test_local*.py
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
+CI duration report and its regression test_ci_durations.py (counts, the window, the verdicts, the
+policy (#344)                         history, nothing of a failure written, exit 0),
+                                      test_ci_workflow.py (report only: after pytest, never
+                                      deciding the job; the paths, key and retention)
 fast feedback targets and what keeps  test_fast_targets.py (the mapping, the selection, never a
 them from evidence (#342, ADR 0010)   gate, the default suite's options); test_evidence.py,
                                       test_certificate.py, test_validation_gates.py (a narrower
@@ -393,9 +430,13 @@ packaging, built artifacts (#256)     test_packaging.py (metadata, license, vers
                                       `make dist-check`, CI's `dist` job and the release build
                                       run); the PyPI workflow (#295): test_publish_workflow.py
 launch environment, no credential     test_child_env.py (engine and doctor: test_engine.py,
-                                      test_integration.py, test_local.py, test_doctor.py)
+                                      test_integration.py, test_validation_evidence.py,
+                                      test_doctor.py)
 agent read context                    test_read_context.py (collection: test_engine.py,
                                       test_integration.py)
+troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
+                                      a test that exists; the guide's links and the links
+                                      into it resolve)
 ```
 
 Add a new test next to the behaviour's existing file; create a new file only

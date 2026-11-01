@@ -24,7 +24,7 @@ import pytest
 from tests import fast_targets as ft
 
 from .conftest import GIT_IDENT, NO_AUTO_MAINTENANCE, git_out
-from .test_ci_workflow import _code, _job, _make_dry_run, _make_rules
+from .test_ci_workflow import JUNIT_OPTION, _code, _job, _make_dry_run, _make_rules
 
 ROOT = ft.REPO_ROOT
 
@@ -128,7 +128,7 @@ def test_the_import_scan_reads_every_spelling_of_an_import(tmp_path):
     (tests / "test_a.py").write_text(
         "from autoforge import evidence as ev\n"
         "import autoforge.state\n"
-        "from .local_helpers import thing\n"
+        "from .epic_cli import thing\n"
         "from tests.pi_fake import PiFake\n"
         "import os\n"
         "def test_x():\n"
@@ -139,7 +139,7 @@ def test_the_import_scan_reads_every_spelling_of_an_import(tmp_path):
     found = ft.importers(tmp_path)
     assert found["autoforge.evidence"] == {"test_a", "test_b"}
     assert found["autoforge.state"] == found["autoforge.config"] == {"test_a"}
-    assert found["tests.local_helpers"] == found["tests.pi_fake"] == {"test_a"}
+    assert found["tests.epic_cli"] == found["tests.pi_fake"] == {"test_a"}
     assert "os" not in found
 
 
@@ -443,8 +443,9 @@ def test_the_fast_target_runs_the_tool_and_is_never_a_gate():
     assert all("fast_targets" not in line for line in rules["test"].recipe)
     code = _code()
     assert "test-fast" not in code and "fast_targets" not in code
-    # The suite CI runs on each interpreter is the whole default suite.
-    assert "      - run: uv run pytest\n" in _job(code, "test") + "\n"
+    # The suite CI runs on each interpreter is the whole default suite; the one
+    # option it adds writes the JUnit report of the duration report (#344).
+    assert f"        run: uv run pytest {JUNIT_OPTION}\n" in _job(code, "test") + "\n"
 
 
 def test_the_default_suite_deselects_nothing_but_the_live_tests():

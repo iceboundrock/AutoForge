@@ -47,7 +47,8 @@ jobs:
       - uses: actions/checkout@v7
       # Pinned to a full version on purpose: setup-uv stopped publishing
       # floating major tags after v7, so `@v10` does not resolve.
-      - uses: astral-sh/setup-uv@v10.0.1
+      - id: uv
+        uses: astral-sh/setup-uv@v10.0.1
         with:
           # Sets UV_PYTHON, which takes precedence over the repo's
           # .python-version pin.
@@ -56,7 +57,58 @@ jobs:
       # --locked: install exactly uv.lock and fail if it is stale relative
       # to pyproject.toml, rather than silently re-resolving in CI.
       - run: uv sync --locked --group dev
-      - run: uv run pytest
+      # `make test`'s command, plus the JUnit report the duration report
+      # reads. That option selects, deselects and changes nothing.
+      - id: pytest
+        run: uv run pytest --junitxml="${RUNNER_TEMP}/durations/junit.xml"
+      # The duration report (#344): the run's counts, skips and times in the
+      # job summary and an artifact, compared with main's recent runs of the
+      # same interpreter and uv cache state (tests/ci_durations.py;
+      # docs/development.md, "Test durations in CI"). Report only: each step
+      # below runs whether pytest passed or failed, never when the run was
+      # cancelled, and cannot change this job's result (continue-on-error,
+      # a timeout of its own), so the required `ci` check means what it meant.
+      # Only a push to main saves the history; a pull request reads main's.
+      # The cache and artifact actions use the runner's own token for those
+      # services, not GITHUB_TOKEN, and need no permission.
+      - name: Restore main's duration history
+        if: success() || failure()
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/durations/history
+          key: ci-durations-v1-py${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ci-durations-v1-py${{ matrix.python-version }}-
+      - name: Report the suite's durations
+        if: success() || failure()
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          DURATIONS_PYTHON: ${{ matrix.python-version }}
+          DURATIONS_CACHE_HIT: ${{ steps.uv.outputs.cache-hit }}
+          DURATIONS_PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
+        run: uv run --no-project python -I tests/ci_durations.py report --dir "${RUNNER_TEMP}/durations" --python "${DURATIONS_PYTHON}" --cache-hit "${DURATIONS_CACHE_HIT}" --pytest-outcome "${DURATIONS_PYTEST_OUTCOME}" --check-run "test (py${DURATIONS_PYTHON})"
+      - name: Upload the duration report
+        if: success() || failure()
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # One per attempt: an artifact's name is unique in a run.
+          name: durations-py${{ matrix.python-version }}-attempt${{ github.run_attempt }}
+          path: ${{ runner.temp }}/durations/report/
+          if-no-files-found: warn
+          # As long as the oldest run a baseline window may hold.
+          retention-days: 30
+      - name: Save main's duration history
+        if: (success() || failure()) && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/durations/history
+          key: ci-durations-v1-py${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   static:
     # Lint, format and type checks are interpreter-independent (mypy is

@@ -78,18 +78,16 @@ def test_a_pi_profile_routes_its_own_model_and_thinking_level(
     tmp_path, phase, completed_rounds, expected
 ):
     """#133: with every profile on ``provider: pi`` the routing is unchanged,
-    the config validates for REMOTE and LOCAL, and the argv the adapter
+    the config validates, and the argv the adapter
     renders for the routed profile carries that profile's ``--model`` and
     ``--thinking`` and never the prompt (Pi receives it over RPC)."""
     from autoforge.config import validate_required_profiles
-    from autoforge.profiles import local_required_profiles
     from autoforge.providers import PiProvider, provider_for
     from tests.pi_fake import PI_PROFILES, PiFake, flag, route_to_pi
 
     cfg = default_config()
     route_to_pi(cfg, PiFake(tmp_path / "pi"))
     validate_required_profiles(cfg, REQUIRED_PROFILES)
-    validate_required_profiles(cfg, local_required_profiles(cfg))
 
     profile = profile_for_phase(cfg, phase, completed_rounds)
     assert profile.name == expected and profile.provider == "pi"

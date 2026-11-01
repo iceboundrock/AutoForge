@@ -10,6 +10,7 @@ CLI's use of the forward guard is tested in ``test_cli.py``, the engine's in
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -20,11 +21,14 @@ from autoforge.locking import IssueRunLock
 from autoforge.ownership import (
     MAX_REASON_CHARS,
     StandaloneHold,
+    admission_refusal,
     refuse_scheduler_owned_issue,
     scheduler_ownership,
     standalone_hold,
     standalone_ownership_predicate,
+    unreadable_report,
 )
+from autoforge.provenance import MAX_PATH_CHARS, MAX_REFUSAL_CHARS, shown_path
 from autoforge.run_namespace import EpicRef, RunBinding, RunKey, issue_namespace, write_binding
 from autoforge.scheduler_state import (
     Admission,
@@ -35,9 +39,9 @@ from autoforge.scheduler_state import (
     open_claim,
 )
 from autoforge.state import AutoForgeState, save_state
-from autoforge.transitions import Phase, WorkflowMode
+from autoforge.transitions import Phase
 
-from .conftest import EPIC, git_repo, sample_contract
+from .conftest import EPIC, deep_dir, git_repo
 
 
 def _issue_url(n: int) -> str:
@@ -289,34 +293,41 @@ def test_what_holds_nothing(tmp_path, state):
     assert not os.path.lexists(sd) or state != "absent dir"
 
 
-@pytest.mark.parametrize("damage", ["garbage", "symlink", "local"])
+@pytest.mark.parametrize("damage", ["garbage", "symlink", "local", "newer", "unknown"])
 def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, damage):
     """A LOCAL run's state among them: the pass no longer skips it as LOCAL's
     own (ADR 0009 D4, #387), so it is the hold's problem like any state that
-    does not load, and the pass still admits (``test_epic_commands``)."""
+    does not load, and the pass still admits (``test_epic_commands``).
+
+    A state refused for its protocol label, a newer controller's or one no
+    protocol has, holds no issue by itself either, since nothing of the
+    unloaded file is trusted, the issue it names included; but it blocks
+    every admission instead (#265 R1-F1, ``blocks_admission``), and its
+    problem names this controller."""
     sd = tmp_path / ".autoforge"
     sd.mkdir()
-    if damage == "garbage":
+    if damage in ("newer", "unknown"):
+        newer = _state(7, Phase.REVIEW).to_dict()
+        newer.update(protocol_version="14" if damage == "newer" else "6")
+        (sd / "state.json").write_text(json.dumps(newer), encoding="utf-8")
+    elif damage == "garbage":
         (sd / "state.json").write_text("{ not json " + "ghp_" + "b" * 36)
     elif damage == "local":
-        _save_standalone(
-            sd,
-            AutoForgeState(
-                run_id="af-local",
-                mode=WorkflowMode.LOCAL,
-                phase=Phase.REVIEW,
-                feature_spec_path="features/x.md",
-                feature_spec_sha256="a" * 64,
-                local_run_contract=sample_contract(
-                    repository_root=str(tmp_path), state_root=str(sd)
-                ),
-                workspace_fingerprint="b" * 64,
-                base_head_sha="c" * 40,
-                base_branch="main",
-                created_at="2026-10-18T00:00:00+00:00",
-                updated_at="2026-10-18T00:00:00+00:00",
-            ),
+        # Written by hand, as a protocol-12 LOCAL run saved it: no code that
+        # writes one is left (#388).
+        local = _state(None, Phase.REVIEW, run_id="af-local", epic_url="").to_dict()
+        local.update(
+            mode="LOCAL",
+            protocol_version="12",
+            repository="",
+            feature_spec_path="features/x.md",
+            feature_spec_sha256="a" * 64,
+            local_run_contract={"schema": 2, "repository_root": str(tmp_path)},
+            workspace_fingerprint="b" * 64,
+            base_head_sha="c" * 40,
+            base_branch="main",
         )
+        (sd / "state.json").write_text(json.dumps(local), encoding="utf-8")
     else:
         target = tmp_path / "elsewhere.json"
         save_state(_state(7), target)
@@ -325,7 +336,80 @@ def test_an_unreadable_standalone_state_is_reported_and_holds_nothing(tmp_path, 
     hold = standalone_hold(sd)
     assert not hold.holds and hold.problem
     assert "ghp_" + "b" * 36 not in hold.problem
-    assert len(hold.problem) <= MAX_REASON_CHARS
+    # A protocol refusal has a budget of its own, whole (#265 R3-F1).
+    refused = damage in ("newer", "unknown")
+    assert len(hold.problem) <= (MAX_REFUSAL_CHARS if refused else MAX_REASON_CHARS)
     if damage == "local":
         assert "state file has unknown mode 'LOCAL'" in hold.problem
+    if damage in ("newer", "unknown"):
+        import autoforge
+
+        label = "14" if damage == "newer" else "6"
+        assert f"unsupported protocol_version '{label}' (controller speaks '13')" in hold.problem
+        assert f"imported from {os.path.abspath(autoforge.__file__)}" in hold.problem
+        assert hold.blocks_admission and hold.issue_number is None and hold.issue_url == ""
+        assert (hold.refused_protocol, hold.newer_protocol) == (
+            ("unsupported-newer", "14") if damage == "newer" else ("unsupported-unknown", "")
+        )
+        refusal = admission_refusal(hold)
+        assert refusal.startswith(
+            f"the standalone state {sd / 'state.json'} is of a protocol this controller does "
+            "not read, so the issue its run holds is unknown and no issue is admitted"
+        )
+        assert "#7" not in refusal and "issues/7" not in refusal  # no field of the file
+        if damage == "newer":
+            assert "a controller that speaks protocol 14 reads it" in refusal
+        else:
+            assert "no AutoForge protocol has its label" in refusal
+        assert "--force" not in refusal and "archive" not in refusal
+    else:
+        assert not hold.blocks_admission and admission_refusal(hold) == ""
     assert _tree(sd) == before, "never quarantined, created or written"
+
+
+@pytest.mark.parametrize("length", [900, 1135], ids=["whole", "cut"])
+def test_a_refused_standalone_state_keeps_the_controller_however_long_its_path(tmp_path, length):
+    """#265 R3-F1: a state file path of 900 characters (shown whole) or of
+    1,135 (shown cut to MAX_PATH_CHARS) took the loader's path-first message
+    past the problem's 1,000 characters, and the refusal, the controller's
+    import path and its interpreter with it. The problem is now the refusal
+    without the path, which the report names beside it on a budget of its
+    own, and it keeps every one of them whole. Nothing is written."""
+    import sys
+
+    import autoforge
+
+    sd = deep_dir(tmp_path, length - len("/state.json"))
+    sd.mkdir(parents=True)
+    newer = _state(7, Phase.REVIEW).to_dict()
+    newer.update(protocol_version="14")
+    (sd / "state.json").write_text(json.dumps(newer), encoding="utf-8")
+    assert len(str(sd / "state.json")) == length
+    before = _tree(sd)
+    hold = standalone_hold(sd)
+    headline = (
+        "unsupported protocol_version '14' (controller speaks '13'): a newer AutoForge wrote it"
+    )
+    provenance = f"imported from {os.path.abspath(autoforge.__file__)}, python {sys.executable}"
+    assert hold.problem.startswith(f"{headline}, and this controller, autoforge ")
+    assert provenance in hold.problem and "reads protocols " in hold.problem
+    assert "state file" not in hold.problem and str(sd) not in hold.problem
+    shown = shown_path(str(sd / "state.json"))
+    assert (shown == str(sd / "state.json")) == (length <= MAX_PATH_CHARS)
+    report = unreadable_report(hold)
+    assert report == f"the standalone state {shown} cannot be read: {hold.problem}"
+    assert headline in report and provenance in report
+    assert hold.blocks_admission and hold.newer_protocol == "14"
+    assert _tree(sd) == before
+
+
+def test_an_admission_refusal_shows_its_path_on_one_bounded_line(tmp_path):
+    """#265 R1-F3: the configured state directory is the operator's, and its
+    name may hold a newline or an escape; the refusal shows it as one
+    printable, bounded line."""
+    for name in ("a\nautoforge epic: forged", "b\x1b[2J", "c" * 2000):
+        hold = StandaloneHold(
+            tmp_path / name / "state.json", problem="x", refused_protocol="unsupported-unknown"
+        )
+        refusal = admission_refusal(hold)
+        assert refusal.isprintable() and len(refusal) < 1024 + 400

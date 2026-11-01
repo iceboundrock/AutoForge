@@ -977,7 +977,6 @@ def test_a_record_the_entry_reuses_is_never_evicted_by_its_own_append(tmp_state_
             policy=eng._validation_policy(LaunchClass.EXPORT_COMMAND),
             result=finished,
             run_log=oldest["run_log"],
-            end_fingerprint="",
         )
         for seq in range(oldest["seq"] + 1, oldest["seq"] + MAX_RECORDS)
     ]

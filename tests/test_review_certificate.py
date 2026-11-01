@@ -41,10 +41,12 @@ from autoforge.config import default_config
 from autoforge.errors import StateError
 from autoforge.evidence import (
     Definition,
+    certificate_digest,
     definitions,
     eligible_record,
     observed_record,
     parse_candidate,
+    record_digest,
     set_digest,
 )
 from autoforge.executor import ExecutionResult
@@ -54,6 +56,7 @@ from autoforge.transitions import Phase
 
 from .conftest import (
     BRANCH,
+    LOCAL_STATE_FIELDS,
     PR,
     FakeGitHub,
     analyze_payload,
@@ -408,6 +411,98 @@ def test_an_edited_certificate_is_refused_at_load_never_reissued(tmp_state_dir):
     eng.paths.state_file.write_text(json.dumps(data))
     with pytest.raises(StateError, match="review_certificate"):
         load_state(eng.paths.state_file)
+
+
+# -- the removed LOCAL kinds in a REMOTE state file (ADR 0009 D6, D8) ------------------
+
+
+def _workspace_variant(raw: dict, seq: int, run_id: str) -> dict:
+    """``raw``, a REMOTE record, as LOCAL wrote one: a ``local`` candidate and the
+    fingerprints of the walks before and after the run, digested again."""
+    fingerprint = "c" * 64
+    rec = json.loads(json.dumps(raw))
+    rec["seq"] = seq
+    rec["candidate"] = {
+        "kind": "local",
+        "fingerprint": fingerprint,
+        "workspace_policy_digest": "d" * 64,
+        "run_id": run_id,
+    }
+    rec["start_fingerprint"] = rec["end_fingerprint"] = fingerprint
+    rec["digest"] = record_digest(rec)
+    return rec
+
+
+def _local_certificate(rec: dict) -> dict:
+    """The certificate the removed ``local_certificate`` issued for ``rec``'s workspace."""
+    cert = {
+        "schema": 1,
+        "kind": "local",
+        "candidate": rec["candidate"],
+        "review_round": 1,
+        "records": [{"seq": rec["seq"], "digest": rec["digest"]}],
+        "validation_set_digest": set_digest([rec["definition"]["definition_digest"]]),
+        "policy_digest": rec["policy"]["policy_digest"],
+        "clean": {"needs_fix_round": False, "actionable_findings": 0},
+        "issued_at": rec["finished_at"],
+        "reviewed_workspace_fingerprint": rec["candidate"]["fingerprint"],
+    }
+    cert["digest"] = certificate_digest(cert)
+    return cert
+
+
+def _with_record(data: dict) -> dict:
+    records = data["validation_records"]
+    rec = _workspace_variant(records[-1], records[-1]["seq"] + 1, data["run_id"])
+    return {**data, "validation_records": [*records, rec]}
+
+
+def _with_certificate(data: dict) -> dict:
+    """A ``local`` certificate naming the state's own last (REMOTE) record: the
+    records load, so the certificate's kind is what refuses."""
+    records = data["validation_records"]
+    workspace = _workspace_variant(records[-1], records[-1]["seq"], data["run_id"])
+    cert = _local_certificate(workspace)
+    cert["records"] = [{"seq": records[-1]["seq"], "digest": records[-1]["digest"]}]
+    cert["digest"] = certificate_digest(cert)
+    return {**data, "review_certificate": cert}
+
+
+def _relabelled(data: dict, label: str) -> dict:
+    """``data`` under ``label``: a protocol-12 file carries LOCAL's twelve fields empty."""
+    if label == "12":
+        return {**data, **LOCAL_STATE_FIELDS, "protocol_version": "12"}
+    return {**data, "protocol_version": label}
+
+
+@pytest.mark.parametrize("label", ["13", "12"])
+@pytest.mark.parametrize(
+    ("plant", "needle"),
+    [(_with_record, "end_fingerprint"), (_with_certificate, "review_certificate'.kind")],
+    ids=["workspace-record", "local-certificate"],
+)
+def test_a_remote_state_carrying_a_local_record_or_certificate_is_refused_unchanged(
+    tmp_state_dir, label, plant, needle
+):
+    """A workspace-variant record, or a ``local`` certificate beside its record, in
+    the state a certified REMOTE run saved: refused at load, under the current
+    label and under 12, whose file loads without them. Nothing is written: no
+    relabel, no ``.corrupt-*`` file."""
+    gh = FakeGitHub()
+    eng, _ = certified(tmp_state_dir, gh, PASSES)
+    eng.close()
+    path = eng.paths.state_file
+    data = _relabelled(json.loads(path.read_text()), label)
+    path.write_text(json.dumps(data))
+    assert load_state(path).review_certificate == data["review_certificate"]
+    path.write_text(json.dumps(plant(data)))
+    before = path.read_bytes()
+    listing = sorted(p.name for p in path.parent.iterdir())
+    with pytest.raises(StateError, match=re.escape(needle)):
+        load_state(path)
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in path.parent.iterdir()) == listing
+    assert not any(".corrupt-" in name for name in listing)
 
 
 def test_a_restart_in_ready_for_merge_holds_an_applicable_certificate(tmp_state_dir):

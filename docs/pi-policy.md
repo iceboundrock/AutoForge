@@ -184,8 +184,9 @@ declared `read, bash`.
 Pi has no approval layer. A Pi profile is therefore equivalent to Claude
 Code under `--permission-mode bypassPermissions`. Under the default
 `sandbox.mode: disabled`, run unattended Pi phases in a container, a VM or
-under a dedicated UID (ADR 0001 §2; Pi's `docs/containerization.md` calls a
-container "usually the strongest practical option"). #132 implemented no
+under a dedicated UID ([security.md](security.md#agents-run-as-you); Pi's
+`docs/containerization.md` calls a container "usually the strongest
+practical option"). #132 implemented no
 sandbox; `sandbox.mode: required` (#168,
 [ADR 0005](adr/0005-outer-sandbox-and-host-resource-capability-model.md))
 now runs Pi's RPC child and its per-launch auth preflight inside the outer
@@ -323,7 +324,7 @@ and left no process behind.
 **Gate for #135.** On a platform without a child subreaper (anything but
 Linux), every agent result carries `orphans_unchecked`, and its leftovers
 sentence says a process may still be running. The prompt rule in
-`common.md` / `local_common.md` is the only mitigation there. #135 gates
+`common.md` is the only mitigation there. #135 gates
 unattended Pi use on it: the [Pi operator guide](pi.md#unattended-use)
 states that Pi is attended only on such a platform, and `doctor` adds a
 row for the Pi profiles, `pi's detached tool processes are contained`,

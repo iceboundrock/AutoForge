@@ -3671,6 +3671,44 @@ def test_list_sub_issues_reads_every_page_and_includes_closed_children():
     assert all(c.parent is not None and c.parent.canonical == _RECORDED_EPIC for c in children)
 
 
+def test_list_titled_sub_issues_is_the_same_read_with_each_title():
+    """#287: the agent's read context names each sub-issue by its title, from
+    the one listing read; the node stays without one (ADR 0008 D3.5)."""
+    calls = []
+    rows = _graph_fixture("issue_176_sub_issues.json")
+
+    def handler(req):
+        calls.append(req.command)
+        return _paged(rows)
+
+    titled = _client(handler).list_titled_sub_issues(_RECORDED_EPIC)
+    assert calls == [
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{_RECORDED_REPO}/issues/176/sub_issues?per_page=100",
+        ]
+    ]
+    assert [node for node, _ in titled] == list(_client(handler).list_sub_issues(_RECORDED_EPIC))
+    assert [title for _, title in titled] == [row["title"] for row in rows]
+    assert titled[0][1].startswith("ADR: define parallel scheduler authority")
+
+
+@pytest.mark.parametrize("title", [None, 7, ["t"]], ids=["null", "number", "list"])
+def test_list_titled_sub_issues_refuses_a_row_without_a_string_title(title):
+    with pytest.raises(GitHubError, match="title .* is not a string"):
+        _client(lambda req: _paged([_graph_row(12, title=title)])).list_titled_sub_issues(
+            _GRAPH_EPIC
+        )
+    # The eligibility read never looks at it.
+    (node,) = _client(lambda req: _paged([_graph_row(12, title=title)])).list_sub_issues(
+        _GRAPH_EPIC
+    )
+    assert node.number == 12
+
+
 def test_list_blocked_by_reads_every_page_and_includes_closed_blockers():
     calls = []
 
@@ -3732,7 +3770,7 @@ def test_list_blocked_by_refuses_a_malformed_row(row):
         _client(lambda req: _paged([row])).list_blocked_by(_GRAPH_EPIC)
 
 
-@pytest.mark.parametrize("read", ["list_sub_issues", "list_blocked_by"])
+@pytest.mark.parametrize("read", ["list_sub_issues", "list_titled_sub_issues", "list_blocked_by"])
 def test_graph_listings_refuse_a_page_short_of_the_page_size_before_the_last(read):
     rows = [_graph_row(n) for n in range(2, 102)]
     # Full pages and a short last page: complete.
@@ -3748,7 +3786,14 @@ def test_graph_listings_refuse_a_page_short_of_the_page_size_before_the_last(rea
 
 
 @pytest.mark.parametrize(
-    "read", ["get_issue_node", "list_sub_issues", "list_blocked_by", "get_repository_id"]
+    "read",
+    [
+        "get_issue_node",
+        "list_sub_issues",
+        "list_titled_sub_issues",
+        "list_blocked_by",
+        "get_repository_id",
+    ],
 )
 def test_graph_reads_keep_the_transient_retry_of_reads(read):
     attempts = []

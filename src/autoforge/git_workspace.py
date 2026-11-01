@@ -5,9 +5,7 @@ worktree: the working tree's root, its git directories, ``HEAD``, the
 checked-out branch and ``git status``'s records. The engine uses them for
 the agent worktree's root and its creation, the sandbox's facts and denied
 roots, the candidate read, the checkout anchor around an invocation and the
-uncommitted-work note; LOCAL's workspace reader
-(:class:`~autoforge.local_workspace.LocalWorkspace`) builds its walk on
-them. Nothing here reads the configuration (ADR 0009 C1).
+uncommitted-work note. Nothing here reads the configuration (ADR 0009 C1).
 
 Everything here is a *read*: nothing is committed, staged, reset, checked
 out, stashed or discarded. Every read is the controller's own hardened git
@@ -214,8 +212,8 @@ class GitWorkspace:
     def dirty_paths(self) -> list[str]:
         """Every path :meth:`status_entries` names, a rename's or copy's source included, sorted.
 
-        The operator's notion of uncommitted work (LOCAL's start-up
-        dirty-tree policy, :func:`uncommitted_paths`), never an identity.
+        The operator's notion of uncommitted work (:func:`uncommitted_paths`),
+        never an identity.
         """
         paths: list[str] = []
         for entry in self.status_entries():

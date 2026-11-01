@@ -351,6 +351,45 @@ def test_the_dist_check_fails_a_wheel_without_a_template(tmp_path: Path):
         dist_check.check_wheel(_wheel(tmp_path, drop="autoforge/prompts/review.md"), STEM, DATA)
 
 
+@pytest.mark.parametrize(
+    "wheel_file, sdist_file",
+    [
+        ("autoforge/prompts/local_common.md", "src/autoforge/prompts/local_review.md"),
+        ("autoforge/run_contract.py", "src/autoforge/local_workspace.py"),
+    ],
+    ids=["template", "module"],
+)
+def test_no_artifact_carries_a_file_of_local_mode(tmp_path: Path, wheel_file, sdist_file):
+    """ADR 0009 D12 S3 (#388), checked again by S4 (#389): the wheel and the
+    sdist carry none of LOCAL mode's files, its ``local_*.md`` prompt
+    templates or its two modules, ``local_workspace.py`` and
+    ``run_contract.py``.
+
+    What the package declares holds none, so the wheel built from this
+    commit, which ``check_wheel`` holds to exactly that set, holds none; and
+    the dist check refuses a wheel or an sdist that carries one anyway, as
+    a stray file would be refused, but naming LOCAL.
+    """
+    assert dist_check.local_files(dist_check.wheel_package_files()) == []
+    assert not list(prompts.prompts_dir().glob("local_*.md"))
+    assert [name for name in prompts.TEMPLATE_FILES if name.startswith("local_")] == []
+    assert not [
+        m
+        for m in dist_check.LOCAL_MODULES
+        if (REPO_ROOT / "src").joinpath(*m.split(".")).with_suffix(".py").exists()
+    ]
+    wheel = _wheel(tmp_path)
+    with zipfile.ZipFile(wheel) as archive:
+        assert dist_check.local_files(archive.namelist()) == []
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr(wheel_file, "# LOCAL\n")
+    with pytest.raises(CheckFailed, match=rf"LOCAL mode's files: \['{re.escape(wheel_file)}'\]"):
+        dist_check.check_wheel(wheel, STEM, DATA)
+    sdist = _sdist(tmp_path, extra=sdist_file)
+    with pytest.raises(CheckFailed, match=rf"LOCAL mode's files: \['{re.escape(sdist_file)}'\]"):
+        dist_check.check_sdist(sdist, STEM, DATA)
+
+
 def test_the_dist_check_fails_an_sdist_without_a_template_or_with_a_stray_file(tmp_path: Path):
     with pytest.raises(CheckFailed, match=r"missing \['src/autoforge/prompts/fix.md'\]"):
         dist_check.check_sdist(_sdist(tmp_path, drop="autoforge/prompts/fix.md"), STEM, DATA)
@@ -483,16 +522,28 @@ _REMOTE_PLAN = (
     [
         ("", None),
         ("gh api user || true", r"called gh: 'api user\\n'"),
-        ("mkdir .autoforge", r"changed the scratch repository: \['\.autoforge'\]"),
-        (": > .git/index.lock", r"changed the scratch repository: \['\.git/index\.lock'\]"),
-        ("echo x >> .git/HEAD", r"changed the scratch repository: \['\.git/HEAD'\]"),
+        ("mkdir .autoforge", r"changed the scratch repository: \[.*'\.autoforge \(created\)'\]"),
+        (": > .git/index.lock", r"repository: \[.*'\.git/index\.lock \(created\)'\]"),
+        ("echo x >> .git/HEAD", r"\['\.git/HEAD \(content, size, mtime, ctime\)'\]"),
+        # The same bytes written over themselves, in place (PR #425 R1-F4).
+        ("head -c 1 .git/HEAD 1<> .git/HEAD", r"\['\.git/HEAD \(mtime, ctime\)'\]"),
         ('echo "{{ISSUE_URL}}"', "unrendered variable"),
+    ],
+    ids=[
+        "clean",
+        "gh-called",
+        "dir-created",
+        "lock-created",
+        "appended",
+        "same-bytes",
+        "unrendered",
     ],
 )
 def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
     tmp_path: Path, then: str, refusal: str | None
 ):
-    """``remote_dry_run`` on a stand-in for the installed command (real git, fake gh)."""
+    """``remote_dry_run`` on a stand-in for the installed command (real git, fake gh):
+    any write shows, the bytes a file already held written over it again included."""
     command = tmp_path / "autoforge"
     command.write_text(f"#!/bin/sh\n{_REMOTE_PLAN}\n{then}\n", encoding="utf-8")
     command.chmod(0o755)
@@ -503,6 +554,225 @@ def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
         return
     with pytest.raises(CheckFailed, match=refusal):
         dist_check.remote_dry_run(str(command), git, tmp_path, dist_check._child_env())
+
+
+# What the installed command answers LOCAL mode's ways in with, as far as the
+# dist check looks (ADR 0009 D3 to D5); the stand-ins below answer so and then
+# misbehave in one way each, before the answer.
+_LOCAL_ANSWERS = """
+case "$*" in
+  --help) echo "usage: autoforge {doctor,run,step,resume,unblock,status,epic}";;
+  local*) echo "autoforge: error: argument command: invalid choice: 'local'" >&2; exit 2;;
+  --config*) echo "autoforge: error: c: unknown key(s) under 'the top level': local" >&2; exit 2;;
+  *) echo "autoforge: error: state file has unknown mode 'LOCAL'" >&2; exit 2;;
+esac
+"""
+
+
+# How a misbehaving stand-in tells an ordinary invocation from its dry run:
+# `step`, `resume` and `unblock --reason looked` without `--dry-run`.
+_ORDINARY = {
+    "step": '[ "$1" = step ] && [ $# -eq 1 ]',
+    "resume": '[ "$1" = resume ] && [ $# -eq 1 ]',
+    "unblock": '[ "$1" = unblock ] && [ $# -eq 3 ]',
+    "run": '[ "$1" = run ]',
+}
+_STATE = ".autoforge/state.json"
+
+
+@pytest.mark.parametrize(
+    "first, refusal",
+    [
+        ("", None),
+        (
+            '[ "$1" = --help ] && echo "usage: autoforge {local,run}" && exit 0',
+            "`autoforge --help` names `local`",
+        ),
+        ('[ "$1" = local ] && [ "$2" = doctor ] && exit 0', r"local doctor` exited 0, not 2"),
+        ('[ "$2" = --json ] && echo "{}" && exit 0', r"status --json` exited 0, not 2"),
+        (
+            '[ "$1" = --config ] && echo "autoforge: error: unreadable" >&2 && exit 2',
+            r"exited 2, not 2 naming \"unknown key\(s\) under 'the top level': local\"",
+        ),
+        (
+            f'[ "$1" = step ] && mv {_STATE} {_STATE}.corrupt-1',
+            r"step --dry-run` changed the scratch repository: \['\.autoforge \(.*?\)', "
+            r"'\.autoforge/state\.json \(removed\)', '\.autoforge/state\.json\.corrupt-1 "
+            r"\(created\)'\]",
+        ),
+        (
+            '[ "$1" = unblock ] && echo x >> .autoforge/logs/local-run/run.log',
+            r"changed the scratch repository: \['\.autoforge/logs/local-run/run\.log "
+            r"\(content, size, mtime, ctime\)'\]",
+        ),
+        ('[ "$1" = resume ] && : > .git/index.lock', r"'\.git/index\.lock \(created\)'\]"),
+        ('[ "$1" = status ] && { gh api user || true; }', r"status` called 'gh api user\\n'"),
+        (
+            '[ "$1" = --config ] && echo "# edited" >> "$2"',
+            r"status` changed the configuration file .*local-config\.json: "
+            r"\['local-config\.json \(content, size, mtime, ctime\)'\]",
+        ),
+        # PR #425 R1-F3: what only an ordinary invocation does, each of its
+        # dry run refused as it should be. It takes the controller lock, or
+        # launches an agent, before it refuses.
+        (
+            f"{_ORDINARY['step']} && mkdir -p .git/autoforge && echo $$ > "
+            ".git/autoforge/controller.lock",
+            r"`\S*autoforge step` changed the scratch repository: .*"
+            r"'\.git/autoforge/controller\.lock \(created\)'\]",
+        ),
+        (
+            f"{_ORDINARY['step']} && : > .git/autoforge.lock && rm .git/autoforge.lock",
+            r"`\S*autoforge step` changed the scratch repository: \['\.git \(.*?mtime, ctime\)'\]",
+        ),
+        (
+            f"{_ORDINARY['resume']} && {{ claude -p 'review the PR' || true; }}",
+            r"`\S*autoforge resume` called 'claude -p review the PR\\n'",
+        ),
+        (
+            f"{_ORDINARY['unblock']} && {{ opencode run --standalone x || true; }}",
+            r"`\S*autoforge unblock --reason looked` called 'opencode run --standalone x\\n'",
+        ),
+        (
+            f"{_ORDINARY['run']} && {{ pi --mode rpc || true; }}",
+            r"autoforge run --epic \S+ --issue \S+` called 'pi --mode rpc\\n'",
+        ),
+        # PR #425 R1-F4: writes that leave every path and every byte as it was.
+        (
+            f"{_ORDINARY['unblock']} && head -c 1 {_STATE} 1<> {_STATE}",
+            r"unblock --reason looked` changed the scratch repository: "
+            r"\['\.autoforge/state\.json \(mtime, ctime\)'\]",
+        ),
+        (
+            f"{_ORDINARY['run']} && cp -p {_STATE} {_STATE}.new && mv {_STATE}.new {_STATE}",
+            r"changed the scratch repository: \['\.autoforge \(.*?\)', "
+            r"'\.autoforge/state\.json \(inode, ctime\)'\]",
+        ),
+        (
+            f'[ "$1" = step ] && [ "$2" = --dry-run ] && touch -r {_STATE} {_STATE}',
+            r"step --dry-run` changed the scratch repository: "
+            r"\['\.autoforge/state\.json \(ctime\)'\]",
+        ),
+        (
+            '[ "$1" = --config ] && touch -r "$2" "$2"',
+            r"status` changed the configuration file .*: \['local-config\.json \(ctime\)'\]",
+        ),
+        (
+            f'{_ORDINARY["resume"]} && : > "$HOME/.config/autoforge-was-here"',
+            r"resume` changed the scratch HOME: \['\.config \(.*?\)', "
+            r"'\.config/autoforge-was-here \(created\)'\]",
+        ),
+        (
+            f'{_ORDINARY["step"]} && : > "$TMPDIR/x" && rm "$TMPDIR/x"',
+            r"step` changed the scratch TMPDIR: \['\. \(.*?mtime, ctime\)'\]",
+        ),
+    ],
+    ids=[
+        "refused",
+        "help-names-local",
+        "local-accepted",
+        "status-json-accepted",
+        "config-wrong-refusal",
+        "state-moved-aside",
+        "log-written",
+        "git-dir-written",
+        "gh-called",
+        "config-written",
+        "step-takes-the-lock",
+        "step-takes-and-drops-a-lock",
+        "resume-launches-claude",
+        "unblock-launches-opencode",
+        "run-launches-pi",
+        "state-rewritten-same-bytes",
+        "state-replaced-by-a-copy",
+        "state-times-put-back",
+        "config-times-put-back",
+        "home-written",
+        "tmpdir-used",
+    ],
+)
+def test_the_local_refusal_check_holds_every_way_in_to_its_refusal(
+    tmp_path: Path, first: str, refusal: str | None
+):
+    """``local_refusals`` (#389) on a stand-in for the installed command
+    (real git, recording fakes of gh and the agent CLIs): it passes a
+    command that answers each of LOCAL mode's ways in with its generic
+    refusal and touches nothing, and fails one that accepts a way in,
+    refuses it for another reason, writes to the state directory, its log
+    or ``.git``, edits the configuration file or calls ``gh``. Also one
+    whose ordinary ``step``, ``resume``, ``unblock`` or ``run`` takes a
+    lock or launches an agent CLI before it refuses, while its dry run
+    behaves (PR #425 R1-F3), and one that writes without changing a byte
+    or a path: a file rewritten in place, replaced by a copy of itself, or
+    with its times put back, a file created and removed in the scratch
+    ``HOME`` or ``TMPDIR`` (R1-F4)."""
+    command = tmp_path / "autoforge"
+    command.write_text(f"#!/bin/sh\n{first}\n{_LOCAL_ANSWERS}", encoding="utf-8")
+    command.chmod(0o755)
+    git = dist_check.shutil.which("git")
+    assert git is not None
+    if refusal is None:
+        dist_check.local_refusals(str(command), git, tmp_path, dist_check._child_env())
+        return
+    with pytest.raises(CheckFailed, match=refusal):
+        dist_check.local_refusals(str(command), git, tmp_path, dist_check._child_env())
+
+
+def test_the_local_refusal_check_runs_in_an_environment_of_its_own(tmp_path: Path, monkeypatch):
+    """PR #425 R1-F3: what reaches the installed command is the isolated
+    environment alone. No credential or provider key of the caller's, its
+    ``HOME`` and ``TMPDIR`` scratch directories, and every executable a
+    regression could reach a service or a model through a recording fake
+    first on ``PATH``."""
+    monkeypatch.setenv("GH_TOKEN", "not-a-real-token-but-must-not-pass")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-a-real-key-but-must-not-pass")
+    seen = tmp_path / "seen.env"
+    command = tmp_path / "autoforge"
+    command.write_text(
+        f'#!/bin/sh\n[ "$1" = local ] && [ $# -eq 1 ] && env > {seen}\n{_LOCAL_ANSWERS}',
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    git = dist_check.shutil.which("git")
+    assert git is not None
+    dist_check.local_refusals(str(command), git, tmp_path, dist_check._child_env())
+    names = {line.split("=", 1)[0] for line in seen.read_text().splitlines() if "=" in line}
+    assert "GH_TOKEN" not in names and "ANTHROPIC_API_KEY" not in names
+    env = dict(line.split("=", 1) for line in seen.read_text().splitlines() if "=" in line)
+    assert env["HOME"] == str(tmp_path / "local-home")
+    assert env["TMPDIR"] == str(tmp_path / "local-tmp")
+    fake_bin = env["PATH"].split(":")[0]
+    assert fake_bin == str(tmp_path / "fake-bin-local")
+    assert sorted(p.name for p in Path(fake_bin).iterdir()) == sorted(
+        dist_check._RECORDED_EXECUTABLES
+    )
+    assert {"gh", "claude", "opencode", "pi"} <= set(dist_check._RECORDED_EXECUTABLES)
+
+
+def test_the_local_refusal_check_covers_each_way_in_adr_0009_names():
+    """ADR 0009 D3 to D5: the refusal check covers ``autoforge local``, a
+    ``local:`` key and a ``mode: "LOCAL"`` state under each command that
+    loads one; ``step``, ``resume`` and ``unblock`` both as dry runs and as
+    the ordinary invocations that take the lock and launch, and ``run``
+    over the state (PR #425 R1-F3)."""
+    ways = {words: (status, refusal) for words, status, refusal in dist_check._LOCAL_WAYS_IN}
+    assert {w for w in ways if w[0] == "local"} >= {("local",), ("local", "doctor")}
+    assert ways[("--config", "{config}", "status")][1].endswith("'the top level': local")
+    loading = {w for w, (_, refusal) in ways.items() if "unknown mode 'LOCAL'" in refusal}
+    assert {w[0] if w[0] != "--state-dir" else w[2] for w in loading} == {
+        "status",
+        "step",
+        "resume",
+        "unblock",
+        "run",
+    }
+    # Each command that could take the lock and launch, as a dry run and as
+    # the ordinary invocation that would (PR #425 R1-F3), and `run` over it.
+    for command in ("step", "resume", "unblock"):
+        forms = {"--dry-run" in w for w in loading if w[0] == command}
+        assert forms == {True, False}, command
+    assert any(w[0] == "run" and "--dry-run" not in w for w in loading)
+    assert {status for status, _ in ways.values()} == {2}
 
 
 def test_the_scratch_repository_starts_no_detached_maintenance(tmp_path: Path):
@@ -520,3 +790,83 @@ def test_the_scratch_repository_starts_no_detached_maintenance(tmp_path: Path):
     text = trace.read_text(encoding="utf-8")
     assert "trace: built-in: git commit" in text
     assert "maintenance" not in text
+
+
+# -- the first run's checks (#259) ------------------------------------------------
+def test_the_first_run_knows_each_starter_and_the_clis_it_routes_to():
+    """``STARTER_AGENTS`` is the starters of examples/ and what each routes a
+    profile to, and ``BUILT_IN_AGENTS`` is the built-in routing's, so the
+    install smoke's agent rows are checked against the configurations."""
+    from autoforge.config import default_config, load_config_file
+
+    examples = sorted((REPO_ROOT / "examples").glob("*.yaml"))
+    assert [path.name for path in examples] == sorted(dist_check.STARTER_AGENTS)
+    for path in examples:
+        providers = {p.provider for p in load_config_file(path).profiles.values()}
+        assert providers == dist_check.STARTER_AGENTS[path.name], path.name
+    providers = {p.provider for p in default_config().profiles.values()}
+    assert providers == dist_check.BUILT_IN_AGENTS
+
+
+def _row(name: str, ok: bool = True, detail: str = "detail", **flags: bool) -> dict:
+    return {
+        "name": name,
+        "ok": ok,
+        "required": flags.get("required", True),
+        "skipped": flags.get("skipped", False),
+        "detail": detail,
+    }
+
+
+def _first_run_report(*agents: str, **replace: dict) -> dict:
+    """A doctor --json report without a sign-in: the credential-free rows OK, the rest failing."""
+    rows = [_row(name) for name in dist_check.CREDENTIAL_FREE_ROWS]
+    rows[[r["name"] for r in rows].index("merge gate")]["detail"] = "CLOSED: safety.allow_merge"
+    rows += [_row("gh authenticated", ok=False), _row("default branch requires checks", ok=False)]
+    rows += [_row(f"agent '{cli}' available (analyze_execute)", ok=False) for cli in agents]
+    rows += [_row(f"agent '{cli}' keeps integrations off (fix)", ok=False) for cli in agents]
+    rows = [replace.get(row["name"], row) for row in rows]
+    return {"ok": False, "checks": [row for row in rows if row]}
+
+
+def test_the_first_run_doctor_check_accepts_rows_that_need_a_sign_in_failing():
+    report = _first_run_report("claude", "opencode")
+    dist_check.check_first_run_doctor(report, frozenset({"claude", "opencode"}), "x.yaml")
+
+
+@pytest.mark.parametrize(
+    "replace, refusal",
+    [
+        ({"loop detection": {}}, "printed no 'loop detection' row"),
+        ({"config": _row("config", ok=False)}, "'config' is not OK"),
+        ({"GitHub remote": _row("GitHub remote", skipped=True)}, "'GitHub remote' is not OK"),
+        (
+            {"merge gate": _row("merge gate", detail="OPEN: both halves")},
+            "merge gate is not closed",
+        ),
+    ],
+)
+def test_the_first_run_doctor_check_refuses_a_credential_free_row_that_is_not_ok(
+    replace: dict, refusal: str
+):
+    report = _first_run_report("claude", **replace)
+    with pytest.raises(CheckFailed, match=refusal):
+        dist_check.check_first_run_doctor(report, frozenset({"claude"}), "x.yaml")
+
+
+def test_the_first_run_doctor_check_refuses_an_install_that_imports_the_source_tree():
+    """#265: the installed command's controller row must name the installed
+    package; one naming this checkout's ``src/autoforge`` ran the tree."""
+    source = dist_check.REPO_ROOT / "src" / "autoforge" / "__init__.py"
+    row = _row("controller", detail=f"autoforge 0.1.0 (protocol 13) imported from {source}")
+    report = _first_run_report("claude", controller=row)
+    with pytest.raises(CheckFailed, match="imports the source tree"):
+        dist_check.check_first_run_doctor(report, frozenset({"claude"}), "x.yaml")
+
+
+def test_the_first_run_doctor_check_refuses_agent_rows_the_configuration_does_not_route_to():
+    report = _first_run_report("claude", "opencode")
+    with pytest.raises(
+        CheckFailed, match=r"agent CLIs \['claude', 'opencode'\], expected \['claude'\]"
+    ):
+        dist_check.check_first_run_doctor(report, frozenset({"claude"}), "x.yaml")

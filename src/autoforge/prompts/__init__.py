@@ -18,8 +18,9 @@ PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Z][A-Z0-9_]*)\s*\}\}")
 # Placeholders are first replaced by this NUL-delimited marker, which no
 # template or value can contain in practice, and only then by the real
 # value. That keeps substitution strictly single-pass: a value carrying
-# "{{...}}" text (a feature specification is untrusted project data and may
-# well quote one) is inserted verbatim instead of being re-expanded or
+# "{{...}}" text (the EPIC's roadmap section, a validation command's output
+# or an agent's reply quoted back in a correction is untrusted project data
+# and may well quote one) is inserted verbatim instead of being re-expanded or
 # tripping the "unresolved placeholder" guard below.
 _MARKER_RE = re.compile(r"\x00AF:([A-Z][A-Z0-9_]*)\x00")
 
@@ -44,22 +45,15 @@ TEMPLATE_FILES = (
     # fix.md's {{OPERATOR_ACTIONS}} when the entry recorded allowed targets.
     "operator_acceptance.md",
     # The controller's REVIEW evidence section (ADR 0006 D9.1), rendered into
-    # review.md's and local_review.md's {{VALIDATION_EVIDENCE}}, and a REMOTE
+    # review.md's {{VALIDATION_EVIDENCE}}, and a REMOTE
     # producer's validation failure (D5.4), rendered into analyze_execute.md's
     # and fix.md's {{VALIDATION_FAILURE}} on the relaunch after one.
     "validation_evidence.md",
     "validation_failure.md",
-    # LOCAL mode: separate templates rather than the GitHub ones fed fake
-    # Issue/PR values. Nothing here may mention gh, PRs or merging.
-    "local_common.md",
-    "local_analyze_execute.md",
-    "local_review.md",
-    "local_fix.md",
 )
 
-# The trusted header each mode prepends to its phase template.
+# The trusted header prepended to every phase template.
 COMMON_TEMPLATE = "common.md"
-LOCAL_COMMON_TEMPLATE = "local_common.md"
 
 
 _BACKTICK_RUN_RE = re.compile(r"`+")
@@ -163,8 +157,8 @@ def render_phase(
 ) -> str:
     """Render the trusted common header + phase template with one variable set.
 
-    ``common_template`` selects the header: ``common.md`` for REMOTE runs,
-    ``local_common.md`` for LOCAL ones.
+    ``common_template`` names the header, :data:`COMMON_TEMPLATE` unless a
+    caller renders another one.
     """
     parts = []
     if include_common:

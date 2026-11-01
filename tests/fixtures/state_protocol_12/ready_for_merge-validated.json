@@ -1,0 +1,212 @@
+{
+  "acceptance_outcomes": [],
+  "attempt": 0,
+  "base_branch": "",
+  "base_head_sha": "",
+  "baseline_dirty_paths": [],
+  "block_reason": "",
+  "completion_context": {},
+  "config_fingerprint": {},
+  "controller_version": "0.1.0a1.dev0",
+  "counted_merged_prs": [],
+  "created_at": "2026-10-31T10:31:41.349522+00:00",
+  "current_base_ref": "main",
+  "current_branch": "autoforge/2-feature",
+  "current_head_sha": "251acac568ed6776ca10df82e61600f8b048ddbd",
+  "current_issue_url": "https://github.com/owner/repo/issues/2",
+  "current_merge_base_sha": "c51b52d55b8c667a74e749ace4c492c154e8e3cc",
+  "current_pr_url": "https://github.com/owner/repo/pull/42",
+  "effect_records": [],
+  "entry_observation": {},
+  "epic_url": "https://github.com/owner/repo/issues/1",
+  "escalation_count": 0,
+  "execution_attempt": 1,
+  "feature_spec_path": "",
+  "feature_spec_sha256": "",
+  "last_fix_resolutions": [],
+  "last_review_comment_url": "https://github.com/owner/repo/pull/42#issuecomment-950001",
+  "last_review_needs_fix": false,
+  "last_review_result": "clean",
+  "launch_label": "",
+  "local_fix_rounds": 0,
+  "local_pending_attempts": 0,
+  "local_pending_fingerprint": "",
+  "local_pending_phase": "",
+  "local_run_contract": {},
+  "merged_since_epic_update": 0,
+  "mode": "REMOTE",
+  "next_issue_rejections": [],
+  "open_findings": [],
+  "operator_comment_outcomes": [],
+  "phase": "READY_FOR_MERGE",
+  "premerge_verified_commands": [
+    [
+      "/tmp/autoforge-protocol-12-python/bin/python",
+      "-c",
+      "import pathlib, sys; pathlib.Path(sys.argv[1]).open('a').write('ran\\n')",
+      "/tmp/autoforge-protocol-12-capture/test_a_certificate_and_every_l0/premerge.txt"
+    ]
+  ],
+  "premerge_verified_head_sha": "251acac568ed6776ca10df82e61600f8b048ddbd",
+  "prior_findings": [],
+  "producer_validation_failure": {},
+  "prompt_version": "v14",
+  "protocol_version": "12",
+  "replan_transaction": {},
+  "repository": "owner/repo",
+  "review_certificate": {
+    "candidate": {
+      "commit": "251acac568ed6776ca10df82e61600f8b048ddbd",
+      "kind": "remote",
+      "object_format": "sha1",
+      "provenance": {
+        "kind": "pr-head",
+        "pr_url": "https://github.com/owner/repo/pull/42"
+      },
+      "repository": "owner/repo",
+      "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    },
+    "clean": {
+      "actionable_findings": 0,
+      "needs_fix_round": false
+    },
+    "comment": {
+      "id": 950001,
+      "marker_key": {
+        "review_round": 1,
+        "reviewed_base_ref": "main",
+        "reviewed_head_sha": "251acac568ed6776ca10df82e61600f8b048ddbd",
+        "reviewed_merge_base_sha": "c51b52d55b8c667a74e749ace4c492c154e8e3cc"
+      },
+      "url": "https://github.com/owner/repo/pull/42#issuecomment-950001"
+    },
+    "digest": "9a0affa7a99b023bc36cb4aba3714e97086987e155b100f8d1b207782cd26182",
+    "issued_at": "2026-10-31T10:31:41.522160+00:00",
+    "kind": "remote",
+    "policy_digest": "2ce3433313d6d7e3ad1f221c8097789b5c027aba182ab86debeea78f647be382",
+    "records": [
+      {
+        "digest": "7b993175281f11f5c1ca9c8f7b30e76c3e42eed3fefeb72d3e29551f8bc60147",
+        "seq": 1
+      }
+    ],
+    "review_round": 1,
+    "reviewed_base_ref": "main",
+    "reviewed_head_sha": "251acac568ed6776ca10df82e61600f8b048ddbd",
+    "reviewed_merge_base_sha": "c51b52d55b8c667a74e749ace4c492c154e8e3cc",
+    "reviewed_pr_url": "https://github.com/owner/repo/pull/42",
+    "schema": 1,
+    "validation_set_digest": "3d4eed834ffe608f29a3666b1a6770c0277bbea4b7aebf96ffe357266e4a242d"
+  },
+  "review_evidence": {
+    "candidate": {
+      "commit": "251acac568ed6776ca10df82e61600f8b048ddbd",
+      "kind": "remote",
+      "object_format": "sha1",
+      "provenance": {
+        "kind": "pr-head",
+        "pr_url": "https://github.com/owner/repo/pull/42"
+      },
+      "repository": "owner/repo",
+      "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    },
+    "policy_digest": "2ce3433313d6d7e3ad1f221c8097789b5c027aba182ab86debeea78f647be382",
+    "records": [
+      {
+        "digest": "7b993175281f11f5c1ca9c8f7b30e76c3e42eed3fefeb72d3e29551f8bc60147",
+        "seq": 1
+      }
+    ],
+    "review_round": 1,
+    "validation_set_digest": "3d4eed834ffe608f29a3666b1a6770c0277bbea4b7aebf96ffe357266e4a242d"
+  },
+  "review_history": [
+    {
+      "finding_count": 0,
+      "fingerprint": "e3b0c44298fc1c14",
+      "resolutions": [],
+      "resolutions_truncated": false,
+      "result": "clean",
+      "review_comment_url": "https://github.com/owner/repo/pull/42#issuecomment-950001",
+      "reviewed_head_sha": "251acac568ed6776ca10df82e61600f8b048ddbd",
+      "round": 1,
+      "timestamp": "2026-10-31T10:31:41.521794+00:00"
+    }
+  ],
+  "review_round": 1,
+  "reviewed_base_ref": "main",
+  "reviewed_head_sha": "251acac568ed6776ca10df82e61600f8b048ddbd",
+  "reviewed_merge_base_sha": "c51b52d55b8c667a74e749ace4c492c154e8e3cc",
+  "reviewed_pr_url": "https://github.com/owner/repo/pull/42",
+  "reviewed_workspace_fingerprint": "",
+  "run_id": "af-20261031T103141Z-b11c16",
+  "sandbox_pin": {},
+  "step_count": 2,
+  "superseded_prs": [],
+  "unblock_history": [],
+  "updated_at": "2026-10-31T10:31:41.583646+00:00",
+  "validation_attempt": {},
+  "validation_override_seq": null,
+  "validation_records": [
+    {
+      "candidate": {
+        "commit": "251acac568ed6776ca10df82e61600f8b048ddbd",
+        "kind": "remote",
+        "object_format": "sha1",
+        "provenance": {
+          "kind": "pr-head",
+          "pr_url": "https://github.com/owner/repo/pull/42"
+        },
+        "repository": "owner/repo",
+        "tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+      },
+      "definition": {
+        "argv": [
+          "/tmp/autoforge-protocol-12-python/bin/python",
+          "-c",
+          "pass"
+        ],
+        "definition_digest": "262652fa1339239e168471f81d37d4c769ca6bbdb4bd958d9a7dd5bb69e60a11",
+        "index": 0,
+        "scope": "candidate-tree"
+      },
+      "digest": "7b993175281f11f5c1ca9c8f7b30e76c3e42eed3fefeb72d3e29551f8bc60147",
+      "enforcement": {
+        "backend": "",
+        "backend_version": "",
+        "enforced": false,
+        "network": "",
+        "teardown": ""
+      },
+      "exit_code": 0,
+      "finished_at": "2026-10-31T10:31:41.440358+00:00",
+      "leftovers": {
+        "descendants_killed": false,
+        "group_survived_kill": false,
+        "orphan_survived_kill": false,
+        "orphans_killed": false,
+        "orphans_unchecked": false
+      },
+      "outcome": "PASS",
+      "output": {
+        "stderr_bytes": 0,
+        "stderr_tail": "",
+        "stderr_tail_truncated": false,
+        "stdout_bytes": 0,
+        "stdout_tail": "",
+        "stdout_tail_truncated": false
+      },
+      "policy": {
+        "mode": "disabled",
+        "policy_digest": "2ce3433313d6d7e3ad1f221c8097789b5c027aba182ab86debeea78f647be382",
+        "timeout_seconds": 1800
+      },
+      "run_log": "af-20261031T103141Z-b11c16/001-review-candidate-validation-0",
+      "schema": 1,
+      "seq": 1,
+      "started_at": "2026-10-31T10:31:41.421670+00:00"
+    }
+  ],
+  "verification_failures": [],
+  "workspace_fingerprint": ""
+}

@@ -236,12 +236,30 @@ the upcoming round at the bound HEAD, base and merge base:
 
 - one or more: `BLOCKED` without launching the reviewer, naming the
   comment. The controller journals the round's comment before it posts
-  it, so one it finds with no plan is not its own: a human's, or one a
-  reviewer of the previous contract posted (D13.5). It is never adopted,
-  edited or duplicated (D9.6): adopting it would let any author define the
-  round's findings, and the validated result it would need does not exist.
-  `unblock` does not change that; the operator deletes the comment or its
-  marker, then unblocks, and the round runs.
+  it, so one it finds with no plan is not its own: a human's, one a
+  reviewer of the previous contract posted (D13.5), or the journaled
+  review of another AutoForge controller using the same login, from
+  another machine, clone or state directory, which authorship cannot tell
+  apart from the others (D9.3). It is never adopted, edited or duplicated
+  (D9.6): adopting it would let any author define the round's findings,
+  and the validated result it would need does not exist. `unblock` does
+  not change that. The reason asks the operator to check who posted it
+  (#415): a stray or foreign comment is deleted, or its marker removed,
+  then `unblock` runs the round; another controller's comment is that
+  run's review record, so it is not deleted, this run is not unblocked,
+  and one of the two runs is stopped. Two or more are named together with
+  the same check and remedies: the controller never chooses between them,
+  and one of them may be another controller's. The entry's reason says
+  what came before it, from the persisted attempt counter and whether the
+  read precedes a relaunch: nothing launched on a first entry; before a
+  relaunch (a correction or a transient retry), the launch just before,
+  which ended without a usable result, and its run-log directory; on a
+  resumed entry, an earlier launch of the round that ran or may have run,
+  with no claim of a result. The same read after the reviewer returned
+  (before anything is planned) blocks the same way, on one comment or
+  several; its reason says a reviewer ran and names the run-log
+  `control-result.json` that alone holds its result, never that nothing
+  was launched.
 - a comment for the same round at another HEAD, against another base, or
   from another merge base is not this round's: the round's identity is the
   diff it decided on, and a review posted before the PR was retargeted, or
@@ -724,18 +742,46 @@ Then, in order, all from one persisted completion context (D4.6):
    markers) and the planned record are saved in one save.
 2. The record is driven: posted once, then read back by its marker as the
    one comment carrying it, with exactly the planned body.
-3. The roadmap section is written when one is stored and merges are
+3. A `next_issue_url` of `null` is confirmed on GitHub before anything
+   reports the EPIC complete ("A `null` selection" below, #287).
+4. The roadmap section is written when one is stored and merges are
    pending (EPIC updates, below).
-4. `next_issue_url` is verified exactly like the first issue in
-   `INITIALIZING` before switching issues:
+5. A selected `next_issue_url` is verified like the first issue in
+   `INITIALIZING`, and as one of the EPIC's own issues, before switching
+   issues:
 
 - it parses as an issue URL of the configured repository
 - it is neither the EPIC nor the issue just finished
 - the issue exists and is `OPEN`
+- it is a native sub-issue of the EPIC with none of its own (#287): its
+  issue object (`get_issue_node`, `GET .../issues/{n}`) names the EPIC as
+  `parent_issue_url`, its `sub_issues_summary.total` is 0, and its state
+  in that read is `open`. The issue read and this one are two reads, and
+  the later one decides: an issue closed between them is refused, never
+  switched to on the earlier answer
 
-Identity checks (EPIC, just-finished issue) compare repository
+Identity checks (EPIC, just-finished issue, parent) compare repository
 case-insensitively plus issue number, never URL strings: GitHub owner and
 repository names are case-insensitive.
+
+The last rule is the one `autoforge epic run` admits by ("EPIC dependency
+graph" below; ADR 0008 D3.1, D3.6). Before it, any open issue of the
+repository was accepted, so on a public repository an issue a stranger
+opened could be chosen as the next task by injected text. An issue the
+EPIC body mentions or lists in a task list, but that GitHub does not name
+as the EPIC's sub-issue, is refused: prose is never authority. The first
+issue is the operator's choice and is not held to the rule. Blockers are
+not read: the order of a sequential run stays the agent's choice. On the
+parent read, a not-found is a bad selection, a transient failure takes the
+bounded retry below, and any other failure (an answer without the
+sub-issue summaries included) is conclusive. The agent is shown the EPIC's
+sub-issues, each with its state and title, and the EPIC's own count of
+them as `epic-sub-issues.md` of its read context, read with
+`get_issue_node` and `list_titled_sub_issues` (the listing read with each
+row's title kept, since a sub-issue the EPIC body never names would
+otherwise reach the agent as a bare URL). A listing that holds another
+number of issues than the EPIC counts says it is incomplete. That file is
+a convenience; the controller decides from its own reads.
 
 A `next_issue_url` that is not an issue URL at all, or is longer than
 `MAX_URL_CHARS`, is refused by the parser as a malformed `UPDATE_EPIC`
@@ -755,10 +801,44 @@ that carries any other key, `progress` included, is refused. A transient
 GitHub failure while checking the selection takes the same bounded retry.
 Any other GitHub failure (authentication, permissions, malformed data) is
 conclusive and enters `BLOCKED` immediately without invoking the agent
-again. Never switch to an unverified issue. A rejected selection has no
-effect the controller did not already verify: the progress comment is
-posted once and never again, a roadmap section already written was read
-back and closed its batch, and no issue was switched.
+again. Never switch to an unverified issue, and never end the run on an
+unverified `null`. A rejected selection has no effect the controller did
+not already verify: the progress comment is posted once and never again, a
+roadmap section already written was read back and closed its batch, and no
+issue was switched.
+
+#### A `null` selection
+
+`null` is the agent's claim that none of the EPIC's issues remains, and it
+may rest on a read context that showed the listing unreadable or short.
+The controller reads the EPIC's node and its sub-issue listing itself,
+complete by the rules the scheduler's snapshot applies
+(`epic_graph.read_children`: within the bound of 100, de-duplicated by
+id, each row naming the EPIC as its parent, and exactly as many distinct
+issues as the EPIC's `sub_issues_summary.total`). The count matters:
+GitHub leaves a sub-issue the token may not read out of the listing, so
+only the comparison says one is missing, and a missing one may still be
+open. A sub-issue remains when the controller would accept it as a
+selection: in the run's repository, open, without sub-issues of its own,
+not the issue just finished, and not owned by a scheduler namespace. So
+an open nested EPIC, or a sub-issue in another repository, does not keep
+the run going.
+
+- Nothing remains: the roadmap section is written when due and the run
+  enters `DONE`.
+- One remains: the `null` is a rejected selection, naming the issues that
+  remain (at most ten), and takes the bounded retry above. A second
+  rejection enters `BLOCKED`: the run does not end as complete while the
+  EPIC lists work it could still do.
+- A transient failure of either read takes the same bounded retry.
+- A listing that is not complete (the count differs, a bound is exceeded,
+  a row is inconsistent), or a conclusive failure of either read, enters
+  `BLOCKED` at once, without invoking the agent again: asking again would
+  not make GitHub list what it left out.
+
+This check comes before the roadmap splice, so a refused `null` writes no
+section reporting the EPIC complete and leaves the merge counter as it
+was; the progress comment stays posted.
 
 ### Before MERGE
 
@@ -1250,7 +1330,7 @@ GitHub would close that issue once the commit reaches the default branch.
 
 ADR 0004 moved every externally visible write to the controller; #165
 removes the authority to make one from everything else AutoForge launches.
-Agents and repository-defined commands (LOCAL `local.validation_commands`,
+Agents and repository-defined commands (`validation.commands`,
 `merge.verification_commands`) receive no GitHub or git credential through
 anything AutoForge controls, so a prompt-injected agent that tries a write
 fails for lack of a credential, not for lack of an instruction. The
@@ -1262,8 +1342,7 @@ policy (docs/pi-policy.md).
 
 The classification of ADR 0004 D1.2 names operations, not tools; #148 and
 #149 cite it. Every mutation the workflow makes and every `gh` and `git`
-operation the REMOTE prompts used to name is in one class. LOCAL prompts
-make no GitHub call and are out of scope.
+operation the prompts used to name is in one class.
 
 | Operation | Class | Who performs it |
 |---|---|---|
@@ -1385,11 +1464,12 @@ never the boundary.
   a password, a comment or a macro body refuses the file too. For an agent
   the refusal is a
   `ConfigurationError` raised before anything is charged, saved or launched,
-  so state is untouched; for a validation command it leaves the phase
-  unverified, and for a pre-merge command it blocks the merge, as a failing
-  command does. It names the scope and the key's shape, never a value or a
-  URL. `autoforge doctor` and `autoforge local doctor` run the same check
-  and report the launch environment by name only.
+  so state is untouched; for a candidate validation command it is checked
+  again once and then blocks the run with no record and nothing pushed or
+  published (`ValidationInconclusiveError`), and for a pre-merge command it
+  blocks the merge, as a failing command does. It names the scope and the key's shape, never a value or a
+  URL. `autoforge doctor` runs the same check
+  and reports the launch environment by name only.
 - **The login-shell probe.** `bash -l` reads `/etc/profile` and the first
   of `~/.bash_profile`, `~/.bash_login` and `~/.profile`, and `sh -l`
   `/etc/profile` and `~/.profile`, all through `HOME`, which every child
@@ -1541,8 +1621,8 @@ named otherwise), or why it has none.
 | zsh startup files (`.zshenv` on every start, `.zprofile`, `.zshrc`, `.zlogin`), found through `ZDOTDIR` or `HOME` | `ZDOTDIR` names an empty directory of the launch's; `ZDOTDIR` refused at load | the real zsh, `-c`, `-l -c`, `-i -c` and a zsh shebang, with the operator's files exporting a token: `test_a_launchs_zsh_reads_no_startup_file_of_the_operators` (the same launch without `ZDOTDIR` merges); R3-F1's report through the real OpenCode adapter and executor, a fake `opencode` choosing its shell as 2.0.26 does: `test_an_opencode_shell_tool_merges_nothing_through_the_operators_zshenv`; `test_zsh_startup_files_in_the_home_are_no_problem` |
 | `BASH_ENV` (every non-interactive bash) and `ENV` (an interactive sh) | refused at load, never inherited | the real bash and sh: `test_a_launchs_bash_and_sh_run_no_startup_file_of_the_operators_for_a_command` (with the operator's `BASH_ENV`, `bash -c` merges) |
 | the shell an agent CLI starts (`SHELL`): fish and the csh family read their configuration on every start | `SHELL` set to the operator's POSIX shell, else `bash` or `/bin/sh` | `test_a_launchs_shell_is_one_that_reads_no_startup_file`; construction test (a fish `SHELL` becomes `bash`) |
-| login-shell startup files (`/etc/profile`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`, read through `HOME`) | the login-shell probe refuses a launch whose shells' startup files change a probed variable | the real bash and sh: `test_a_login_startup_file_that_restores_a_route_is_named_never_its_value`, `test_what_is_withheld_as_defence_in_depth_alone_is_no_startup_problem`, `test_a_startup_file_that_ends_the_shell_could_not_be_checked`, `test_a_probe_without_an_answer_could_not_be_checked`; `test_engine.py::test_a_login_shell_startup_file_that_exports_a_credential_refuses_the_launch`, `test_a_shell_startup_file_that_exports_a_credential_blocks_the_premerge_verification`; `test_local.py::test_a_startup_file_planted_before_validation_leaves_the_phase_unverified`; `test_doctor.py::test_doctor_refuses_a_login_shell_startup_file_that_exports_a_credential` |
-| validation and pre-merge commands | the same variables and preflight, the login-shell probe included | `test_local.py::test_local_launches_get_the_same_isolation_and_no_read_context`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
+| login-shell startup files (`/etc/profile`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`, read through `HOME`) | the login-shell probe refuses a launch whose shells' startup files change a probed variable | the real bash and sh: `test_a_login_startup_file_that_restores_a_route_is_named_never_its_value`, `test_what_is_withheld_as_defence_in_depth_alone_is_no_startup_problem`, `test_a_startup_file_that_ends_the_shell_could_not_be_checked`, `test_a_probe_without_an_answer_could_not_be_checked`; `test_engine.py::test_a_login_shell_startup_file_that_exports_a_credential_refuses_the_launch`, `test_a_shell_startup_file_that_exports_a_credential_blocks_the_premerge_verification`; `test_validation_evidence.py::test_a_startup_file_planted_by_the_producer_refuses_its_validation_and_blocks`, `test_engine.py::test_a_startup_file_planted_before_candidate_validation_blocks_the_producer`; `test_doctor.py::test_doctor_refuses_a_login_shell_startup_file_that_exports_a_credential` |
+| validation and pre-merge commands | the same variables and preflight, the login-shell probe included | `test_validation_evidence.py::test_a_helper_planted_by_the_producer_never_reaches_its_validation_command`, `test_engine.py::test_verification_commands_get_the_launch_isolation` |
 
 End to end, `tests/test_integration.py` runs the whole REMOTE lifecycle with
 an operator shell holding every route above and checks each launch while it
@@ -1735,11 +1815,11 @@ can write, so they hold under `sandbox.mode: disabled` too:
   every commit a decision reads stays required in both modes.
 
 **Guaranteed for an enforced launch** (`sandbox.mode: required`: every
-agent process, LOCAL validation command and pre-merge command runs inside
-the sandbox or is refused):
+agent process, candidate validation command and pre-merge command runs
+inside the sandbox or is refused):
 
 1. **G1. Nothing of the controller is reachable.** The state directory,
-   the run logs, the lock, the REMOTE controller checkout and every other
+   the run logs, the lock, the controller's checkout and every other
    registered worktree are absent; the read context is read-only.
 2. **G2. No credential the boundary hides is reachable by path or by local
    IPC.** The operator's home is a private, empty one, so the gh and git
@@ -1753,11 +1833,11 @@ the sandbox or is refused):
    launch's own outer `bwrap`.
 4. **G4. Writes land only in the launch's writable projections and private
    mounts:** the issue worktree, its admin dir, the private object
-   directory and the cache; the LOCAL repository root; the exported tree.
+   directory and the cache; the exported tree.
 5. **G5. Shared repository state is read-only.** No shared ref,
    configuration, hook, alternates file or shared object can be written; a
-   REMOTE agent's new objects reach the shared store only through the
-   strict import, and a LOCAL agent's git directory is read-only.
+   agent's new objects reach the shared store only through the
+   strict import.
 6. **G6. Nothing outlives the invocation,** inside the namespace included.
 
 **Not protected by an enforced launch:**
@@ -1784,11 +1864,11 @@ the sandbox or is refused):
 **Out of scope:** kernel or `bwrap` exploits, a malicious operator, network
 egress, resource exhaustion beyond ADR 0002 and the tmpfs bounds, side
 channels, credentials the operator deliberately projects, the operator's
-own unsandboxed tools, and every launch under `disabled`, or one that
-`preferred` let fall back to logical isolation (LOCAL only, said at each
-launch; #169 added `preferred`, the capability gate before anything is
-saved, and `doctor`'s capability, hard-link, sandbox-directory and
-loopback-listener reports: [Usage: outer sandbox](../usage.md#outer-sandbox)).
+own unsandboxed tools, and every launch under `disabled` (#169 added the
+capability gate before anything is saved, and `doctor`'s capability,
+hard-link, sandbox-directory and loopback-listener reports:
+[Usage: outer sandbox](../usage.md#outer-sandbox)). `preferred` means
+`required` (ADR 0009 D7): no launch falls back to logical isolation.
 
 ## Merge safety
 
@@ -2108,12 +2188,21 @@ the effective rules of the default branch
 (`gh api repos/{owner}/{repo}/rules/branches/{branch}`, every page) and
 reports which contexts a `required_status_checks` rule names, whether each of
 `safety.required_checks` (default `ci`) is among them, whether the ruleset's
-enforcement is `active`, and whether it has bypass actors. Any of those
-missing is a `FAIL` with the settings URL and the rule to add. A repository
+enforcement is `active`, and whether it has bypass actors. A repository
 still on classic branch protection is checked through that instead
-(`enforce_admins` standing in for "no bypass actors"). Rules it cannot verify
-are not shown to require anything (#289), and how that is reported depends
-on the merge gate:
+(`enforce_admins` standing in for "no bypass actors"). Any of those
+missing, a gap the answer shows, names the settings URL and the rule to
+add, and is a `FAIL` while the configuration's half of the merge gate is
+open (`safety.allow_merge: true`). With the gate closed it is a `WARN`
+(#259): only the merge gate relies on the rule, a run with it closed stops
+at `READY_FOR_MERGE` for a human to merge, and a fresh repository without
+CI yet would otherwise fail its first `doctor` on a row its first run does
+not need. The warning says so and asks for the rule before the gate is
+opened; opening it turns the row back into a `FAIL`, and the gate's own
+checks are the same either way. GitHub reporting no default branch at all
+is a `FAIL` whatever the gate. Rules it cannot verify are not shown to
+require anything (#289), and how that is reported depends on the merge
+gate:
 
 - GitHub's plan offers no rulesets or branch protection on the repository
   (GitHub Free's private repositories: `HTTP 403 "Upgrade to GitHub Pro or
@@ -2128,6 +2217,9 @@ on the merge gate:
   reading classic protection, not found).
 - GitHub could not be read at all (a transient failure): nothing was
   verified; running doctor again answers it.
+- `gh` itself could not be started for the read (#259), even when the
+  earlier `gh available` row passed: nothing was read, so with the gate
+  open this is the same `FAIL`, never a `SKIP` that lets doctor pass.
 - GitHub returns a ruleset's `bypass_actors` only to a token with write
   access to it, and this answer withholds them *and* omits
   `current_user_can_bypass`: whether the controller's own login may skip
@@ -2141,8 +2233,9 @@ token permission), or closing the gate. With the gate closed it is a `SKIP`
 that says why. A hidden bypass list is a `SKIP` either way when GitHub does
 say `current_user_can_bypass: never`: the required checks were read and the
 controller's login cannot bypass them, though "no bypass actors" is
-unverified (a token that GitHub says may itself bypass the rule is a `FAIL`
-either way). The row is never an unverified `OK`.
+unverified (a token that GitHub says may itself bypass the rule is a gap
+the answer shows: a `FAIL` with the gate open, a `WARN` with it closed).
+The row is never an unverified `OK`.
 `doctor --json` carries a skip as `"skipped": true`. The check is read-only
 and runs in `doctor` only: the `READY_FOR_MERGE` gate itself does not yet
 consult branch rules.
@@ -2250,7 +2343,13 @@ claim. These four reads are all the GitHub the scheduler itself uses: every
 write of an issue (its branch, PR and comments) is that issue's worker
 engine's, under the same effect records and gates as a standalone run, and
 no worker writes another issue's objects. Sequential `UPDATE_EPIC`
-selection (`_verify_issue_selectable`) is unchanged and does not read it.
+selection (`_verify_issue_selectable`) takes no snapshot: it reads the
+selected issue's node with `get_issue_node` and holds it to the same
+membership rule, and a `null` reads the EPIC's children through the
+snapshot's own `read_children` ("After UPDATE_EPIC" above, #287). Its read
+context also uses `list_titled_sub_issues`, the `.../sub_issues` listing
+with each row's title kept; a title is never an eligibility fact and never
+reaches a node, a snapshot or a digest.
 
 - **The reads.** Four typed, read-only `GitHubClient` methods, each a plain
   `gh api` GET with the transient retry of every read:

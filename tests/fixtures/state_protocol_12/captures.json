@@ -1,0 +1,375 @@
+{
+  "source_commit": "7df991782f8d8b918b3d8119baa342d617f783b9",
+  "protocol_version": "12",
+  "files": [
+    {
+      "file": "initializing.json",
+      "test": "tests/test_cli.py::test_resume_with_gate_open_merges_via_controller_to_done",
+      "phase": "INITIALIZING",
+      "requires": [
+        "config_fingerprint",
+        "sandbox_pin"
+      ],
+      "sha256": "d0fe19fae6ff9c5f67ba4c3e8c3438003b7d4ae08885ec5b5bdbcc961a01e047"
+    },
+    {
+      "file": "analyze_execute.json",
+      "test": "tests/test_cli.py::test_resume_with_gate_open_merges_via_controller_to_done",
+      "phase": "ANALYZE_EXECUTE",
+      "requires": [
+        "effect_records",
+        "entry_observation",
+        "completion_context",
+        "launch_label"
+      ],
+      "sha256": "ca2a374f0a21e4de77baf44029a17cc6c41b190886f68c8e5e0031bef29f70ba"
+    },
+    {
+      "file": "review.json",
+      "test": "tests/test_cli.py::test_resume_with_gate_open_merges_via_controller_to_done",
+      "phase": "REVIEW",
+      "requires": [
+        "review_evidence",
+        "effect_records",
+        "completion_context"
+      ],
+      "sha256": "82ebc2a0d3cea0e54ebc50852d6409a5a12aba045fcdda0872ddc941d558c213"
+    },
+    {
+      "file": "ready_for_merge.json",
+      "test": "tests/test_cli.py::test_resume_with_gate_open_merges_via_controller_to_done",
+      "phase": "READY_FOR_MERGE",
+      "requires": [
+        "review_certificate",
+        "review_history"
+      ],
+      "sha256": "1aa1d5a155d8d3411fe135d72084436e17066c60e6bb59240da789b75c90b720"
+    },
+    {
+      "file": "merge.json",
+      "test": "tests/test_cli.py::test_resume_with_gate_open_merges_via_controller_to_done",
+      "phase": "MERGE",
+      "requires": [
+        "review_certificate"
+      ],
+      "sha256": "57a6ce26a9a96f6cf2098241e5bc106826a04a1a5ff962ffa0ffa1e60cb9c232"
+    },
+    {
+      "file": "update_epic.json",
+      "test": "tests/test_cli.py::test_resume_with_gate_open_merges_via_controller_to_done",
+      "phase": "UPDATE_EPIC",
+      "requires": [
+        "counted_merged_prs",
+        "effect_records",
+        "entry_observation",
+        "completion_context"
+      ],
+      "sha256": "a07092b6776bf9d1bdae5ebc215b3d7eeba9d68b2403a149ceff6615a243a4e9"
+    },
+    {
+      "file": "done.json",
+      "test": "tests/test_cli.py::test_resume_with_gate_open_merges_via_controller_to_done",
+      "phase": "DONE",
+      "requires": [
+        "counted_merged_prs",
+        "review_certificate"
+      ],
+      "sha256": "ddff43dc315cd6036372fde6936897c59481deedddb635f55551e81443e42ce2"
+    },
+    {
+      "file": "review-validated.json",
+      "test": "tests/test_merge_certificate.py::test_a_certificate_and_every_live_gate_continue_to_the_existing_merge",
+      "phase": "REVIEW",
+      "requires": [
+        "validation_records",
+        "review_evidence"
+      ],
+      "sha256": "09434810ab150ae4bebd5e5cbd3c0551f91b61e6f4923aaa2f18c4bf511f669c"
+    },
+    {
+      "file": "ready_for_merge-validated.json",
+      "test": "tests/test_merge_certificate.py::test_a_certificate_and_every_live_gate_continue_to_the_existing_merge",
+      "phase": "READY_FOR_MERGE",
+      "requires": [
+        "validation_records",
+        "review_certificate"
+      ],
+      "sha256": "e1b6b06d17a618178135369a5a5a2175a4d1ab6629d7dba6e2cd19e7c571c9f3"
+    },
+    {
+      "file": "merge-validated.json",
+      "test": "tests/test_merge_certificate.py::test_a_certificate_and_every_live_gate_continue_to_the_existing_merge",
+      "phase": "MERGE",
+      "requires": [
+        "validation_records",
+        "review_certificate"
+      ],
+      "sha256": "8bf674fe9041dda2d7a33019291068904b4762624b0e69104df9214a941887a0"
+    },
+    {
+      "file": "update_epic-validated.json",
+      "test": "tests/test_merge_certificate.py::test_a_certificate_and_every_live_gate_continue_to_the_existing_merge",
+      "phase": "UPDATE_EPIC",
+      "requires": [
+        "validation_records"
+      ],
+      "sha256": "5b7e383764e8199d11795a7075986ade28fe2e31d02db580ab1824848e78b601"
+    },
+    {
+      "file": "analyze_execute-validation-failed.json",
+      "test": "tests/test_validation_gates.py::test_a_failing_implementation_is_not_published_and_its_relaunch_sees_the_failure",
+      "phase": "ANALYZE_EXECUTE",
+      "requires": [
+        "producer_validation_failure",
+        "validation_records"
+      ],
+      "sha256": "cdf7d17429561ff061b2f0208da2e2f1778ee60cda680dd5733a7a7f1177db84"
+    },
+    {
+      "file": "analyze_execute-unblocked.json",
+      "test": "tests/test_validation_gates.py::test_unblock_sets_the_watermark_and_the_same_candidate_is_validated_again",
+      "phase": "ANALYZE_EXECUTE",
+      "requires": [
+        "validation_override_seq",
+        "unblock_history"
+      ],
+      "sha256": "113f611e9b2bc0928529b36817fe148b2e67d665d9d6bc0c6b4508fda04a61c3"
+    },
+    {
+      "file": "review-operator-notes.json",
+      "test": "tests/test_integration.py::test_operator_notes_on_related_issues_end_to_end",
+      "phase": "REVIEW",
+      "requires": [
+        "operator_comment_outcomes",
+        "last_fix_resolutions",
+        "review_history",
+        "effect_records"
+      ],
+      "sha256": "cf313c6457057b64ac27485b14cd78a93884143bfa665e5cd7461156f5171b7c"
+    },
+    {
+      "file": "review-after-replan.json",
+      "test": "tests/test_replan.py::test_a_crash_after_the_plan_is_saved_publishes_on_resume_without_the_agent",
+      "phase": "REVIEW",
+      "requires": [
+        "superseded_prs",
+        "escalation_count"
+      ],
+      "sha256": "6947d244a3807e845334efc9e5055dd52cc4cd2c96e41e6d6a50861afba764bd"
+    },
+    {
+      "file": "review-prior-findings.json",
+      "test": "tests/test_engine.py::test_correction_after_the_fix_was_pushed_goes_to_review_without_relaunching",
+      "phase": "REVIEW",
+      "requires": [
+        "prior_findings"
+      ],
+      "sha256": "0711f18fffa7489e1efceae957033c9f6f72bba188323f226f2d750d1b9a8fea"
+    },
+    {
+      "file": "fix.json",
+      "test": "tests/test_integration.py::test_operator_notes_on_related_issues_end_to_end",
+      "phase": "FIX",
+      "requires": [
+        "open_findings",
+        "entry_observation",
+        "effect_records",
+        "review_evidence"
+      ],
+      "sha256": "30f5493cd5cf1c86f674dbcf82131484a1f2c3fec1a84aef91c101f6ff32763f"
+    },
+    {
+      "file": "fix-acceptance-declined.json",
+      "test": "tests/test_engine.py::test_fix_acceptance_action_declined_reruns_the_fixer_with_the_decline",
+      "phase": "FIX",
+      "requires": [
+        "acceptance_outcomes",
+        "open_findings"
+      ],
+      "sha256": "cc8de2e02ed92ae07c2dacc5b6d9c89b6928963d7a5b56d0a64e0c82b0a5a7d2"
+    },
+    {
+      "file": "fix-validation-failed.json",
+      "test": "tests/test_validation_gates.py::test_a_failing_fix_is_not_pushed_and_starts_no_review",
+      "phase": "FIX",
+      "requires": [
+        "producer_validation_failure",
+        "validation_records",
+        "open_findings"
+      ],
+      "sha256": "75a9e0706f1d895587a12dd59f572595e2471fea7b8779c5df9565ccf841945f"
+    },
+    {
+      "file": "fix-verification-failed.json",
+      "test": "tests/test_engine.py::test_fix_pr_closed_while_the_fixer_ran_is_refused",
+      "phase": "FIX",
+      "requires": [
+        "verification_failures",
+        "open_findings"
+      ],
+      "sha256": "7ed089c70a7d922b3839478d161db7e363f7e6f18feb1210dc6137b6ad57d756"
+    },
+    {
+      "file": "replan_reexecute-pending.json",
+      "test": "tests/test_replan.py::test_r5f1_every_journal_the_controller_writes_loads_complete",
+      "phase": "REPLAN_REEXECUTE",
+      "requires": [
+        "replan_transaction.stage=pending",
+        "open_findings"
+      ],
+      "sha256": "e9cb38e09c35a6aa8e9ebf9a918ba56190910e7fac2cfcbf3e5937d5d2410635"
+    },
+    {
+      "file": "replan_reexecute-prepared.json",
+      "test": "tests/test_replan.py::test_r5f1_every_journal_the_controller_writes_loads_complete",
+      "phase": "REPLAN_REEXECUTE",
+      "requires": [
+        "replan_transaction.stage=prepared",
+        "open_findings"
+      ],
+      "sha256": "c751eba4778333e4899cdaa44cc37ce86f62f28e4703c6e9db9cdf6af38f1f60"
+    },
+    {
+      "file": "replan_reexecute-verified.json",
+      "test": "tests/test_replan.py::test_r5f1_every_journal_the_controller_writes_loads_complete",
+      "phase": "REPLAN_REEXECUTE",
+      "requires": [
+        "replan_transaction.stage=verified",
+        "open_findings"
+      ],
+      "sha256": "619c2658860b6841c64213d2b3d8e3ea110cda022afeba28f7129f8c6d28209b"
+    },
+    {
+      "file": "replan_reexecute-supersede_intent.json",
+      "test": "tests/test_replan.py::test_r5f1_every_journal_the_controller_writes_loads_complete",
+      "phase": "REPLAN_REEXECUTE",
+      "requires": [
+        "replan_transaction.stage=supersede_intent",
+        "open_findings"
+      ],
+      "sha256": "9fecc6073f255b3d9b5c2cfeb8a1ced4fed26ee1061c52a841e8610a6061c7c9"
+    },
+    {
+      "file": "replan_reexecute-superseded.json",
+      "test": "tests/test_replan.py::test_r5f1_every_journal_the_controller_writes_loads_complete",
+      "phase": "REPLAN_REEXECUTE",
+      "requires": [
+        "replan_transaction.stage=superseded",
+        "open_findings"
+      ],
+      "sha256": "741f84d37ad85e53302069359046aa6815c7d7493506e4260077da5be96e7124"
+    },
+    {
+      "file": "replan_reexecute-compensating.json",
+      "test": "tests/test_replan.py::test_a_base_rewritten_inside_the_close_window_is_undone[close]",
+      "phase": "REPLAN_REEXECUTE",
+      "requires": [
+        "replan_transaction.stage=compensating"
+      ],
+      "sha256": "b352933f5a36a9df73185b1f2fa7fbd590cf513e509008474dd90e684fae510d"
+    },
+    {
+      "file": "replan_reexecute-validating.json",
+      "test": "tests/test_replan.py::test_a_replacement_that_fails_validation_is_rejected_before_any_effect",
+      "phase": "REPLAN_REEXECUTE",
+      "requires": [
+        "replan_transaction.stage=prepared",
+        "validation_attempt",
+        "validation_records"
+      ],
+      "sha256": "f24a364d4d9549b3e05da62b1eeb48270c6b064e5a1798678259e1d7cafb5fc8"
+    },
+    {
+      "file": "replan_reexecute-rejected.json",
+      "test": "tests/test_replan.py::test_a_replacement_that_fails_validation_is_rejected_before_any_effect",
+      "phase": "REPLAN_REEXECUTE",
+      "requires": [
+        "replan_transaction.stage=rejected",
+        "validation_records"
+      ],
+      "sha256": "4fbab0f320aa6d5921fa93dbb8b8f6e46e58ea61cbe6b5f91da9b6cc36cbdaef"
+    },
+    {
+      "file": "ready_for_merge-acceptance.json",
+      "test": "tests/test_engine.py::test_fix_acceptance_action_approved_is_published_then_the_fix_pushed",
+      "phase": "READY_FOR_MERGE",
+      "requires": [
+        "acceptance_outcomes",
+        "unblock_history",
+        "review_certificate"
+      ],
+      "sha256": "67a6c708ae6de2a5d8e76b7bdd066999042d285a2e2e916a1913bd478ea8b60f"
+    },
+    {
+      "file": "merge-premerge-verified.json",
+      "test": "tests/test_engine.py::test_validation_and_premerge_commands_run_under_the_allowlist",
+      "phase": "MERGE",
+      "requires": [
+        "premerge_verified_head_sha",
+        "premerge_verified_commands"
+      ],
+      "sha256": "132d95cc80572a14c5ba9db383221b937ca732be7435a6a5c50c8958ef022ac1"
+    },
+    {
+      "file": "update_epic-next-issue-refused.json",
+      "test": "tests/test_engine.py::test_update_epic_null_refused_then_a_remaining_sub_issue_selected_switches",
+      "phase": "UPDATE_EPIC",
+      "requires": [
+        "next_issue_rejections",
+        "effect_records"
+      ],
+      "sha256": "a0e6f85fdd59116cae759ce9013ccbd62cef610359c78658c81eef3ecad1e13f"
+    },
+    {
+      "file": "blocked-review-round-cap.json",
+      "test": "tests/test_engine.py::test_review_round_cap_blocks_with_findings_and_never_starts_the_last_fix",
+      "phase": "BLOCKED",
+      "requires": [
+        "block_reason",
+        "open_findings",
+        "review_history"
+      ],
+      "sha256": "d97af67ee68a02df30dc57c08d2514d64ba411137694b404ee54b10c53c78f8c"
+    },
+    {
+      "file": "blocked-replan-rejected.json",
+      "test": "tests/test_replan.py::test_a_candidate_that_does_not_descend_from_the_base_is_rejected_before_any_effect",
+      "phase": "BLOCKED",
+      "requires": [
+        "block_reason",
+        "replan_transaction.stage=rejected"
+      ],
+      "sha256": "cc7bdee14aeece398d2014c789e0d8982068a8009001aafb36b6a5c2ad9e45e9"
+    },
+    {
+      "file": "blocked-update-epic.json",
+      "test": "tests/test_engine.py::test_update_epic_rejection_is_retried_once_with_the_reason_then_blocked",
+      "phase": "BLOCKED",
+      "requires": [
+        "block_reason",
+        "next_issue_rejections"
+      ],
+      "sha256": "808198af545c0a6eb484e1f924a033ccac15f54b0795b63a97300ab4a3930253"
+    },
+    {
+      "file": "failed.json",
+      "test": "tests/test_engine.py::test_agent_failure_moves_to_failed",
+      "phase": "FAILED",
+      "requires": [
+        "block_reason"
+      ],
+      "sha256": "c5d091e23096b80eace181649d414ab9829b59a0c52d59c7671123491010c8f9"
+    },
+    {
+      "file": "failed-replan.json",
+      "test": "tests/test_replan.py::test_t2_a_failed_replan_leaves_the_review_accounting_untouched[agent_failure]",
+      "phase": "FAILED",
+      "requires": [
+        "block_reason",
+        "replan_transaction",
+        "open_findings"
+      ],
+      "sha256": "9147d64e285c074b8bcef2724da2efb72657fa9bce00c04487a0be2f79db4faa"
+    }
+  ]
+}
