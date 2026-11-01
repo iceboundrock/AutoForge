@@ -588,8 +588,13 @@ def test_a_helper_planted_by_the_producer_never_reaches_its_validation_command(
     refusing it: each command runs in a fresh export outside the repository,
     so a helper the agent planted in the common dir's ``config`` and its
     worktree's ``config.worktree`` is not among what git reads there, and
-    the command gets no credential variable of the operator's. The next
-    agent launch in that worktree refuses the helper before it starts.
+    the command gets no credential variable of the operator's. It gets the
+    rest of what ``child_env`` documents too (#241 R1-F1): the git resets at
+    command scope, a global configuration holding the identity only, never
+    the operator's, ``GIT_TERMINAL_PROMPT=0``, empty curl and wget
+    configuration, an empty zsh startup directory and a shell that reads no
+    startup file. The next agent launch in that worktree refuses the helper
+    before it starts.
 
     ADR 0009 A.2.3 H-A (#386): the REMOTE replacement of
     ``test_local.py::test_a_credential_helper_planted_before_validation_leaves_the_phase_unverified``,
@@ -598,6 +603,21 @@ def test_a_helper_planted_by_the_producer_never_reaches_its_validation_command(
     """
     scratch = tmp_path_factory.mktemp("probe")
     pollute_operator_environment(monkeypatch, scratch)
+    # The operator's own global configuration: an identity, which the
+    # command's global configuration copies, and what it must never read
+    # (a helper, an askpass program, an ssh command, an extra header).
+    operator_gitconfig = scratch / "operator-gitconfig"
+    operator_gitconfig.write_text(
+        "[user]\n\tname = Operator Name\n\temail = operator@example.invalid\n"
+        f"[credential]\n\thelper = !echo {PLANTED}\n"
+        "[core]\n\taskPass = /operator/askpass\n\tsshCommand = ssh -i /operator/key\n"
+        f"[http]\n\textraHeader = X-Operator: {PLANTED}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(operator_gitconfig))
+    # The operator's zsh startup directory, which holds a startup file.
+    (scratch / "operator-zsh").mkdir()
+    (scratch / "operator-zsh" / ".zshenv").write_text(f"export GITHUB_TOKEN={PLANTED}\n")
     git_record, env_record = scratch / "git.jsonl", scratch / "env.jsonl"
     gh = FakeGitHub()
     eng = producing(
@@ -623,9 +643,32 @@ def test_a_helper_planted_by_the_producer_never_reaches_its_validation_command(
     assert [h for h in helpers if h[0] != "system"] == [["command", "command line:", ""]]
     assert not [line for line in seen["listing"] if line.split("\t")[0] in ("local", "worktree")]
     assert PLANTED not in json.dumps(seen)
+    listed = [line.split("\t") for line in seen["listing"]]
+    # The command scope is exactly the controller's resets (no helper, no
+    # askpass, the hardened ssh, no extra header), which no file overrides.
+    assert [entry for scope, _, entry in listed if scope == "command"] == [
+        "credential.helper=",
+        "core.askpass=",
+        f"core.sshcommand={child_env.SSH_COMMAND}",
+        "http.extraheader=",
+    ]
+    # The global scope is the controller's file for this launch, holding the
+    # operator's identity and nothing else of the operator's configuration.
+    global_scope = [(origin, entry) for scope, origin, entry in listed if scope == "global"]
+    assert [entry for _, entry in global_scope] == [
+        "user.name=Operator Name",
+        "user.email=operator@example.invalid",
+    ]
+    assert f"file:{operator_gitconfig}" not in {origin for origin, _ in global_scope}
     [env] = env_probe_records(env_record)
     assert_isolated_names(env["names"])
     assert env["gh_token_placeholder"] and env["gh_config_dir_empty"]
+    assert env["http_client_config_empty"]
+    assert env["git_terminal_prompt"] == "0"
+    # The operator's shell is fish and its ZDOTDIR a directory of its own:
+    # the command's shell is one that reads no startup file, and zsh's
+    # startup directory is the controller's empty one.
+    assert env["zdotdir_empty"] and env["shell"] in child_env.POSIX_SHELLS
     # The helpers are in force in the worktree: the next launch there refuses
     # both, before the reviewer is launched.
     with pytest.raises(ConfigurationError) as refused:

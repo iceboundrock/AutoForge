@@ -146,7 +146,10 @@ High-priority coverage includes:
   `REVIEW` under the cap, a merged uncounted PR needing none; `status` and
   `status --json` show it, its applicability and the not-a-permission
   note; no prompt, read context or published payload carries it; Claude
-  Code, OpenCode and Pi issue the same certificate
+  Code, OpenCode and Pi issue the same certificate; deleting the run's
+  `logs/` directory, or rewriting every file in it to claim a failure,
+  leaves `status` in either output mode, every definition's eligible
+  record and the certificate's applicability unchanged (#241)
 - `merge.delete_branch` and `gh`'s working directory (#283,
   `tests/test_merge_branch.py`, `tests/test_github.py`): every `gh` the
   client and `doctor` start runs in a fresh empty directory of its own with
@@ -413,10 +416,16 @@ High-priority coverage includes:
     `tests/test_engine.py`): a `credential.helper` in the common dir's
     `config` and the worktree's `config.worktree` never reaches the
     validation command, which runs in an export git reads neither from,
-    and the next agent launch refuses it; a GitHub `~/.netrc` entry and a
-    `~/.profile` exporting `GITHUB_TOKEN` are refused before the command
-    runs: no record, `BLOCKED` naming the source and never the value,
-    nothing pushed or published
+    and the next agent launch refuses it. That command, with every route
+    of the operator's set and the operator's global git configuration,
+    `ZDOTDIR` and fish `SHELL` in place, sees none of the operator's
+    credential variables, the empty `gh` configuration, exactly the
+    command-scope git resets, a global configuration holding only the
+    operator's identity, `GIT_TERMINAL_PROMPT=0`, empty curl and wget
+    configuration, an empty `ZDOTDIR` and a POSIX `SHELL` (#241 R1-F1).
+    A GitHub `~/.netrc` entry and a `~/.profile` exporting `GITHUB_TOKEN`
+    are refused before the command runs: no record, `BLOCKED` naming the
+    source and never the value, nothing pushed or published
   - crash recovery: the four journal cases of LOCAL's recovery matrix are
     covered by `tests/test_runlog.py` and REMOTE `tests/test_engine.py`, a
     foreign file renamed over the journal during a REMOTE launch and a
@@ -948,9 +957,15 @@ Four more files, the same split by what they need from the host:
   alternates file written through the overlay as tampering; an
   export command that sees its tree and no network when isolated; a
   `required` pre-merge command
-  that sees only the export; an all-Pi run sandboxed in every child,
-  the auth preflight included, under a home of its own so that a `TMPDIR`
-  under `~/.cache` does not put its Pi paths under the cache (#301); a
+  that sees only the export; a `required` REMOTE validation command
+  (`validate_remote_candidate`) whose record says `enforced: true` and
+  that sees the export, writable and without a git dir, and neither the
+  checkout, its object store nor the state (its control run under
+  `disabled` sees all three), and `make` building in that export, a failing
+  target a `FAIL` with make's exit code (#241); an all-Pi run sandboxed
+  in every child, the auth preflight included, under a home of its own so
+  that a `TMPDIR` under `~/.cache` does not put its Pi paths under the
+  cache (#301); a
   `HEAD` an agent replaced with a link to a file invisible inside, which
   the import refuses before git reads it,
   leaving the commit out of the shared store; such a `HEAD` link, or a
@@ -1230,7 +1245,10 @@ a stated reason it has none. The coverage that must keep working:
   exists, conflicting identity, duplicate markers, a precondition violated
   between intent and write, a write lost or landed with its reply lost, a
   crash after the write before the save, a duplicate invocation after
-  restart, and the attempt bound
+  restart, and the attempt bound; for K3 and K6, a crash after the rebase
+  save, before the write or after it, ends with the rebased payload written
+  once, and a second human edit after either crash is a conflict, never a
+  second rebase (#241)
 - the controller git transport (`tests/test_git_transport.py`): the default
   branch, a non-fast-forward and a lease mismatch are refused, and a
   `pushurl`, `insteadOf`, `core.sshCommand`, `core.hooksPath` or `pre-push`
@@ -1481,7 +1499,10 @@ a stated reason it has none. The coverage that must keep working:
 - dry-run executing no effect: the `UPDATE_EPIC` plan is built with a
   GitHub client that fails the test on any use
 - `ANALYZE_EXECUTE` across its crash windows: a crash after the plan was
-  saved completes from the journal without the agent; a PR create whose
+  saved completes from the journal without the agent, for the K1 + K2 plan
+  and for the K1 + K3 adoption of the open unmarked PR on the branch, whose
+  body is edited once, and a crash after that edit landed and before its
+  save is reconciled with no second edit (#241); a PR create whose
   reply was lost is read back, not resent, and one that never landed is
   sent again by the next process; a branch moved after the plan conflicts
   and `unblock` completes the plan; a dry run plans the publication and

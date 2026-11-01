@@ -14,6 +14,9 @@ agents (the Pi fake for parity). What is covered:
   ``READY_FOR_MERGE`` (D12.3), and the MERGED one, which does not (D12.4);
 - ``status``, and that no prompt or published payload carries a certificate
   (D1.3);
+- that the run logs are no authority: deleting or rewriting them leaves
+  ``status``, the records' eligibility and the certificate's applicability
+  unchanged (#241);
 - the same certificate behind every provider (D17.2).
 
 The pure issuance and applicability rules are in ``tests/test_certificate.py``.
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
 
 import pytest
@@ -38,6 +42,8 @@ from autoforge.errors import StateError
 from autoforge.evidence import (
     Definition,
     certificate_digest,
+    definitions,
+    eligible_record,
     observed_record,
     parse_candidate,
     record_digest,
@@ -654,6 +660,78 @@ def test_no_prompt_and_no_published_payload_carries_the_certificate(tmp_state_di
         assert "review_certificate" not in text
         assert cert["digest"] not in text
         assert cert["issued_at"] not in text
+
+
+# -- the run logs are no authority (#241) ----------------------------------------------
+
+
+def _what_the_controller_concludes(eng, gh, tmp_state_dir, monkeypatch, capsys) -> dict:
+    """``status`` in both output modes, each definition's eligible record, and whether
+    the held certificate applies, against the configuration and the live PR."""
+    monkeypatch.setattr(cli, "_engine_for", lambda args, cfg=None: eng)
+    assert cli.main(["--state-dir", str(tmp_state_dir), "status"]) == 0
+    text = capsys.readouterr().out
+    assert cli.main(["--state-dir", str(tmp_state_dir), "status", "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    s = eng.state
+    candidate = parse_candidate(s.review_certificate["candidate"])
+    policy = eng._validation_policy(LaunchClass.EXPORT_COMMAND)
+    eligible = [
+        eligible_record(s.validation_evidence(), candidate, d, policy, s.validation_override_seq)
+        for d in definitions(eng.config.validation.commands)
+    ]
+    pr = gh.get_pr(PR)
+    live = Revision(pr.url, pr.head_sha, pr.base_ref, s.reviewed_merge_base_sha)
+    return {
+        "status": text,
+        "status --json": document,
+        "eligible": [None if view is None else view.seq for view in eligible],
+        "certificate": eng.review_certificate_problem(),
+        "certificate, live": eng.review_certificate_problem(live),
+    }
+
+
+def _forge(path) -> None:
+    """Rewrite a run-log file to claim the validator failed, unsandboxed."""
+    path.write_text(
+        json.dumps({"outcome": "FAIL", "exit_code": 1, "sandbox": {"enforced": False}}) + "\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("damage", ["deleted", "altered"])
+def test_deleting_or_altering_the_run_logs_changes_no_evidence_or_certificate(
+    tmp_state_dir, monkeypatch, capsys, damage
+):
+    """#241 (EPIC #158 Wave 2B, "evidence authority is never the run logs"): the
+    records and the certificate live in the state file, and ``runlog.py`` has no
+    reader. Deleting the run's ``logs/`` directory, or rewriting every file in it
+    to claim the validator failed, leaves what a new process concludes as it was:
+    ``status`` in both output modes, each definition's eligible record, and the
+    certificate's applicability."""
+    gh = FakeGitHub()
+    eng, _ = certified(tmp_state_dir, gh, PASSES, ALSO_PASSES)
+    before = _what_the_controller_concludes(eng, gh, tmp_state_dir, monkeypatch, capsys)
+    assert before["eligible"] == [r["seq"] for r in saved(eng).review_certificate["records"]]
+    assert before["certificate"] == before["certificate, live"] == ""
+    assert before["status --json"]["review_certificate_status"]["applicable"] is True
+    run_logs = eng.paths.logs_dir / eng.state.run_id
+    for record in eng.state.validation_records:
+        assert (eng.paths.logs_dir / record["run_log"] / "execution.json").is_file()
+    state_bytes = eng.paths.state_file.read_bytes()
+
+    if damage == "deleted":
+        shutil.rmtree(eng.paths.logs_dir)
+    else:
+        files = [p for p in run_logs.rglob("*") if p.is_file()]
+        assert any(p.name == "events.jsonl" for p in files)
+        for path in files:
+            _forge(path)
+
+    eng2 = resumed(eng, tmp_state_dir, gh)
+    after = _what_the_controller_concludes(eng2, gh, tmp_state_dir, monkeypatch, capsys)
+    assert after == before
+    assert eng.paths.state_file.read_bytes() == state_bytes
 
 
 # -- provider parity (D17.2) -----------------------------------------------------------
