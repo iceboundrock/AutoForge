@@ -232,24 +232,41 @@ binds it, with nothing written again
 `REVIEW` blocks on a comment carrying the round's review marker that it did
 not post, whether it was there before the reviewer ran or appeared while it
 ran: the controller never adopts, edits or duplicates it, whoever wrote it.
-Found before the launch, the reason says nothing was launched or posted.
-Found after the reviewer returned, it says a reviewer ran and names the file
-that holds its result, `control-result.json` in that launch's directory of
-the run log: nothing was planned or posted, so that file is the only record
-of the result. The controller cannot tell who posted the comment, and the
-remedy depends on it, so check first:
+Two or more such comments block the same way and are named together; the
+controller never chooses between them. The reason says what this run did
+before the block:
+
+- found on entering the phase, before any reviewer was launched: nothing
+  was launched or posted;
+- found before a relaunch (the correction of a result the controller could
+  not use, or the retry of a transient failure): a reviewer was launched
+  and ended without a usable result, and the reason names that launch's
+  directory in the run log;
+- found when the run is resumed after a launch of the round that did not
+  complete it (a crash, a kill, a failure, a result that did not verify):
+  that reviewer ran or may have run, and the reason names the run log, in
+  which its step directory (ending in `-review-<attempt>`) says which, if
+  the launch got that far. It claims no result;
+- found after the reviewer returned a result the controller accepted: a
+  reviewer ran, and the reason names the file that holds its result,
+  `control-result.json` in that launch's directory of the run log. Nothing
+  was planned or posted, so that file is the only record of the result.
+
+The controller cannot tell who posted the comment, and the remedy depends
+on it, so check first:
 
 - **A stray or foreign comment** (a human's, an agent's that still held a
   credential, or one a reviewer of an earlier AutoForge version posted):
-  delete the comment or its marker, then `unblock`, and the round runs. If
-  the block came after the reviewer, the reviewer runs again and the result
-  in the run log is not reused.
+  delete the comment or its marker (every one of them, when the reason
+  names several), then `unblock`, and the round runs. If a reviewer was
+  launched before the block, the reviewer runs again and nothing in the run
+  log is reused.
 - **Another AutoForge controller's run** under the same GitHub login, on
-  another machine or in another clone or state directory: the comment is
-  that run's own journaled review, and its `FIX` may already be working from
-  it. Do not delete the comment and do not `unblock`: `unblock` re-binds the
-  PR's HEAD, so once the other run has pushed, this one would post a
-  competing review. Stop one of the two runs.
+  another machine or in another clone or state directory: the comment (or
+  one of those named) is that run's own journaled review, and its `FIX` may
+  already be working from it. Do not delete it and do not `unblock`:
+  `unblock` re-binds the PR's HEAD, so once the other run has pushed, this
+  one would post a competing review. Stop one of the two runs.
 
 A comment carrying the marker that appears after the reviewer's result was
 accepted and its comment planned blocks as a conflict instead: once it is
