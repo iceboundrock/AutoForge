@@ -35,6 +35,7 @@ from autoforge.runlog import StepLog
 from autoforge.state import load_state
 from tests import claude_fake
 from tests.conftest import (
+    CR_KEY,
     PR,
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
@@ -93,6 +94,13 @@ def test_clean_rejoins_a_token_split_by_an_escape_before_redacting():
         ),
         ("api_token:\n  # rotated\n  FAKEbelow", f"api_token: # rotated {REDACTED}"),
         ("client_secret: &cs\n  'FAKEanchored'", f"client_secret: &cs '{REDACTED}'"),
+        # Round 6: a key whose runs bare carriage returns part, and a block
+        # whose header, or a scalar whose anchor, stands on a line of its
+        # own below the key.
+        (CR_KEY, REDACTED),
+        ("client_secret:\n  |\n  FAKEheaderbelow\nnext: 1", f"client_secret: | {REDACTED} next: 1"),
+        ("x_api_key:\n  &k\n  >-\n    FAKE1\n    FAKE2", f"x_api_key: &k >- {REDACTED}"),
+        ("client_secret:\n  &cs\n  'FAKEanchorline'", f"client_secret: &cs '{REDACTED}'"),
     ],
     ids=[
         "short-wrapped-key",
@@ -103,6 +111,10 @@ def test_clean_rejoins_a_token_split_by_an_escape_before_redacting():
         "yaml-block",
         "yaml-below-a-comment",
         "yaml-anchored-below",
+        "carriage-return-key",
+        "yaml-header-below",
+        "yaml-folded-header-below-anchor",
+        "yaml-anchor-line",
     ],
 )
 def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
@@ -116,7 +128,11 @@ def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
     assert SHORT_WRAPPED_KEY_LINE not in clean(raw, MAX_LINE_CHARS)
 
 
-@pytest.mark.parametrize("key", [SHORT_WRAPPED_KEY, SPACED_KEY], ids=["short-wrapped", "spaced"])
+@pytest.mark.parametrize(
+    "key",
+    [SHORT_WRAPPED_KEY, SPACED_KEY, CR_KEY],
+    ids=["short-wrapped", "spaced", "carriage-returns"],
+)
 def test_an_event_whose_input_holds_a_wrapped_or_spaced_key_shows_none_of_it(key):
     event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Bash", detail=f"echo '{key}' > k")
     assert event.detail == f"echo '{REDACTED}' > k"

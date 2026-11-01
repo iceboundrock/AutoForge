@@ -4,9 +4,10 @@ Baseline protection only — no detector claims to catch every secret shape.
 Covers common env-var assignments and a name ending in a credential suffix
 (``GEMINI_API_KEY=``, ``DB_PASSWORD:``, ``client_secret=`` with a value
 that does not read as code), ``Authorization`` headers, private-key blocks
-(also wrapped in short lines, or spaced), well-known token shapes (GitHub PATs, OpenAI /
-Anthropic keys, Google API keys, JWTs, AWS access key ids, GitLab, Groq,
-xAI, npm and Hugging Face tokens), OAuth credential fields (``refresh`` /
+(also wrapped in short lines at any line break, or spaced), well-known
+token shapes (GitHub PATs, OpenAI / Anthropic keys, Google API keys, JWTs,
+AWS access key ids, GitLab, Groq, xAI, npm and Hugging Face tokens), OAuth
+credential fields (``refresh`` /
 ``access`` / ``id_token`` / ``chatgpt-account-id``) and credentials embedded
 in URLs before stdout / stderr / commands are persisted by the run logger.
 A shape is recognised where it starts a token: at the start of the text,
@@ -22,10 +23,13 @@ A credential name's value on the lines below it, as YAML writes one (an
 indented scalar past blank and comment lines, a ``|`` or ``>`` block), is
 recognised too (``_yaml_value``), and a plain scalar that starts on the
 key's line and goes on below it (``_yaml_continued``); a value's YAML anchor
-and tag stay before it (``_YAML_PROPS``). :func:`redact_obj`
-knows a credential's name as a mapping's key too
+and tag stay before it (``_YAML_PROPS``), also on lines of their own, as a
+block's header below its key does (``_YAML_NODE_PROPS``). The column of a
+key behind a YAML sequence's dashes is measured exactly (``_yaml_dashes``).
+:func:`redact_obj` knows a credential's name as a mapping's key too
 (``{"GEMINI_API_KEY": "..."}``).
-A line that starts a code fence is never a value (``_SPACE_TO_VALUE``).
+A line that starts a code fence is never a value, and a line break written
+out never starts one (``_SPACE_TO_VALUE``).
 :func:`redact` applies the patterns in rounds until one changes nothing
 (``_MAX_ROUNDS``), so what it returns is what redacting it again returns.
 
@@ -129,9 +133,19 @@ _VALUE_BACKSLASH = r"\\(?!\\{0,6}[\"'])"
 # it, and where that line was ``NAME: value`` in JSON text
 # (``"A_TOKEN: x\nB_TOKEN: y"``), its name went and its value stayed in the
 # clear; the name now starts a token after the escape (#284), and its value
-# is replaced in turn. A value that starts with one is the next line's, as
-# ``_SPACE_TO_VALUE`` takes it from the next line written as such.
+# is replaced in turn.
 _WORD_BACKSLASH = r"\\(?!\\{0,6}[\"'nrt])"
+# The first character's backslash: one that starts a line break written out
+# starts no value (#285 review, round 6). A value that started with one was
+# taken to be that break and the rest of its line, so in JSON text a value
+# below its name (``"GH_TOKEN:\n  FAKE"``, a block's header below it) lost
+# the break to the marker and kept the line below in the clear, and a YAML
+# value's pattern no longer found the line it is told by. The break is
+# crossed instead, as one written as such is (``_SPACE_TO_VALUE``).
+_FIRST_BACKSLASH = r"\\(?!\\{0,6}[\"'nr])"
+# A line break written out, behind up to seven backslashes, as JSON, JSON in
+# JSON and three deep write one.
+_WRITTEN_BREAK = r"\\{1,7}(?:r\\{1,7})?n"
 # The space between an assignment's separator and its value (#393): a run on
 # the same line, or one across a line break, but never onto a line that
 # starts a code fence (three backticks or tildes, indented or not). A prompt
@@ -141,7 +155,16 @@ _WORD_BACKSLASH = r"\\(?!\\{0,6}[\"'nrt])"
 # as sent. A fence on a later line is never the value: a secret written in a
 # code block under the name was never the replaced run, only the fence was.
 # Each line break is tried once, so the scan stays linear.
-_SPACE_TO_VALUE = r"(?:[^\S\r\n]*|\s*[\r\n][^\S\r\n]*(?!`{3}|~{3}))"
+#
+# A line break written out is crossed too (round 6), with the blank lines and
+# the indentation after it, to an unquoted value: a quote right after it may
+# close the string the text is written in (``"GH_TOKEN=\n"``, then the next
+# string of the document), so a quoted value there is left to the YAML
+# patterns, which tell the string's closing quote by its backslashes.
+_SPACE_TO_VALUE = (
+    r"(?:[^\S\r\n]*|\s*[\r\n][^\S\r\n]*(?!`{3}|~{3})"
+    rf"|[^\S\r\n]*+(?:{_WRITTEN_BREAK}[^\S\r\n]*+)++(?!`{{3}}|~{{3}}|\\*+[\"']))"
+)
 # A named assignment's value, its opening quote (``vbs``, the backslashes
 # before it, up to seven as ``_QUOTE`` takes, and ``vq``, the quote) optional:
 # group ``open``.
@@ -165,8 +188,11 @@ _YAML_PROPS = rf"(?:{_YAML_PROPERTY}[^\S\r\n]++){{1,2}}"
 # property, and a lower-case name's code rule reads what follows them
 # (``client_secret: !secret app_secret``, a reference to another file's
 # entry, stays). A property needs the space before it, on the separator's
-# line or across a line break.
-_SPACE_TO_PROPS = r"(?:[^\S\r\n]++|\s*[\r\n][^\S\r\n]*(?!`{3}|~{3}))"
+# line or across a line break, as written or written out.
+_SPACE_TO_PROPS = (
+    r"(?:[^\S\r\n]++|\s*[\r\n][^\S\r\n]*(?!`{3}|~{3})"
+    rf"|[^\S\r\n]*+(?:{_WRITTEN_BREAK}[^\S\r\n]*+)++)"
+)
 _COLON_PROPS = rf"{_SPACE_TO_PROPS}{_YAML_PROPS}"
 _COLON_TO_VALUE = rf"(?:(?>{_COLON_PROPS})|(?!{_COLON_PROPS}){_SPACE_TO_VALUE})"
 # The same on the separator's line only, a lower-case name's.
@@ -179,15 +205,16 @@ _COLON_TO_WORD = rf"(?:(?>{_LINE_PROPS})|(?!{_LINE_PROPS})[^\S\r\n]*+)"
 # so an unquoted value never starts with a header that ends its line
 # (``_BLOCK_AHEAD``): it took the ``|`` for the value and left the block's
 # lines, the secret, in the clear.
-_BLOCK_HEADER = rf"(?:{_YAML_PROPS})?[|>](?:[1-9][-+]?|[-+][1-9]?)?+"
+_BLOCK_INDICATOR = r"[|>](?:[1-9][-+]?|[-+][1-9]?)?+"
+_BLOCK_HEADER = rf"(?:{_YAML_PROPS})?{_BLOCK_INDICATOR}"
 _YAML_COMMENT = r"(?:[^\S\r\n]++#(?:[^\r\n\\]|\\(?!\\{0,6}[rn]))*+)?"
 _BLOCK_AHEAD = rf"{_BLOCK_HEADER}{_YAML_COMMENT}[^\S\r\n]*+(?:[\r\n]|\\{{1,7}}[rn]|\Z)"
 # A value no quote opens ends at a space, a quote, a semicolon, a backslash
 # that starts an escaped closing quote and, after its first character, a line
-# break or a tab written out.
+# break or a tab written out; it never starts with a line break written out.
 _UNQUOTED_VALUE = (
     rf"(?!{_BLOCK_AHEAD})"
-    rf"(?:[^\s\"';\\]|{_VALUE_BACKSLASH})(?:[^\s\"';\\]|{_WORD_BACKSLASH})*"
+    rf"(?:[^\s\"';\\]|{_FIRST_BACKSLASH})(?:[^\s\"';\\]|{_WORD_BACKSLASH})*"
 )
 # A value a quote opens is taken whole (#285): it runs to the quote that
 # closes it, spaces, semicolons and the other quote character included, so
@@ -397,7 +424,7 @@ _LITERAL_VALUE = (
 _OAUTH_TRAIL = r"[.:)\]}]++(?=[^\s\"'`;,&])"
 _OAUTH_VALUE = (
     rf"(?!{_BLOCK_AHEAD})"
-    rf"(?:[^\s\"'`;,&\\.:)\]}}]|{_VALUE_BACKSLASH}|{_OAUTH_TRAIL})"
+    rf"(?:[^\s\"'`;,&\\.:)\]}}]|{_FIRST_BACKSLASH}|{_OAUTH_TRAIL})"
     rf"(?:[^\s\"'`;,&\\.:)\]}}]|{_WORD_BACKSLASH}|{_OAUTH_TRAIL})*+"
 )
 
@@ -432,6 +459,18 @@ _OAUTH_VALUE = (
 # then the value), as YAML allows; between a block's header and its first
 # line only blank lines may, a ``#`` line there being the block's text.
 #
+# The value's properties (an anchor, a tag) and a block's header may each
+# end their line too (round 6), as YAML allows wherever a node may be
+# separated from what precedes it: below the key, the properties alone on a
+# line or split over two (``&cs``, then ``!!str``, then the scalar), and the
+# header on a line of its own below the key or below the properties
+# (``client_secret:``, then ``|``, then the block). Only the properties on
+# the key's line and a header beside the colon were read until round 6, so
+# such a value was kept whole. The properties, the header and the lines
+# between them stay; what follows is the value, read as above, so a nested
+# mapping or sequence after them (``&anchor``, then ``key: value``) is still
+# none.
+#
 # A lower-case name's value must not read as code here too, but what that
 # means depends on the node (#285 review, round 4):
 #
@@ -461,23 +500,55 @@ _OAUTH_VALUE = (
 # past it. Only ``ind`` counted until round 5, so a sibling entry of the
 # same mapping (``  endpoint: ...`` below the block) was indented more and
 # went with the block, a diagnostic lost, and under a placeholder block it
-# made the block a value. A regex cannot measure a run, so the dashes'
-# width is told by which of the empty groups ``dw2`` to ``dw16`` is set
-# (``dwx`` past 16, where a line must be indented 17 more at least), and
-# ``_YAML_IND`` asks for as many spaces again on each value line. The dashes
-# are read one character at a time, each step asking whether they end
-# there, so a key's dashes are read once. The lead quote, when a quote
-# leads, is group ``yq``.
-_YAML_DASH_MAX = 16
-_YAML_DASH_CHAR = r"(?:-|[^\S\r\n])"
+# made the block a value.
+#
+# A regex cannot compare the lengths of two runs, so the dashes' width is
+# written in binary (round 6): the empty group ``dw<k>`` is set when the
+# width holds ``2**k``, and ``_YAML_IND`` asks for that many spaces again on
+# each value line, for every bit set, before the one more that puts it past
+# the key. Round 5 told the widths apart one by one up to 16 and asked for
+# 17 spaces past that, so nine nested dashes (a key at column 18) took the
+# entry at the key's own column with the block. The bits go up to ``2**31``,
+# so a width is exact up to ``2**32 - 1`` columns, the most a regex repeat
+# counts and more than any text holds in a line; a wider run of dashes is
+# no key's, and its value is not read below it. The dashes are read high bit
+# first, each bit a run of ``2**k`` characters or none, which only the binary
+# writing of the width completes, and atomically, so they are never read
+# another way. A run of bits is tried only where a lookahead finds the
+# dashes as wide as its lowest (``2**20``, ``2**10``, ``2**5``), and sets
+# group ``dwg<k>`` when it is, which ``_YAML_IND`` asks before it asks the
+# run's bits: a key behind a dash or two reads its dashes a few times and a
+# value line asks nine groups, not 32. A dashes' character is a dash or a
+# space but a line break (``[^\S\r\n]``), written as one class, which the
+# regex engine repeats far faster than the two alternatives. The lead
+# quote, when a quote leads, is group ``yq``.
+_YAML_DASH_CHAR = (
+    r"[-\t\x0b\x0c\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]"
+)
+# The runs of bits, high first: each run's lowest bit, and its highest.
+_YAML_DASH_RUNS = ((20, 31), (10, 19), (5, 9), (0, 4))
 
 
 def _yaml_dashes() -> str:
-    """The dashes before a YAML key, their width set as a group (above)."""
-    tail = rf"(?P<dwx>){_YAML_DASH_CHAR}*+"
-    for n in range(_YAML_DASH_MAX, 1, -1):
-        tail = rf"(?:(?P<dw{n}>)(?!{_YAML_DASH_CHAR})|{_YAML_DASH_CHAR}{tail})"
-    return rf"(?:(?=(?:-[^\S\r\n]++)++(?!-)){_YAML_DASH_CHAR}{{2}}{tail})?"
+    """The dashes before a YAML key, their width set in binary (above)."""
+    body = ""
+    for low, high in _YAML_DASH_RUNS:
+        bits = "".join(
+            rf"(?:{_YAML_DASH_CHAR}{{{1 << k}}}(?P<dw{k}>))?" for k in range(high, low - 1, -1)
+        )
+        body += (
+            bits if low == 0 else rf"(?:(?={_YAML_DASH_CHAR}{{{1 << low}}})(?P<dwg{low}>){bits})?"
+        )
+    return rf"(?:(?=(?:-[^\S\r\n]++)++(?!-))(?>{body}(?!{_YAML_DASH_CHAR})))?"
+
+
+def _yaml_ind() -> str:
+    """A value line's indentation: past the key's column (above)."""
+    ind = r"(?P=ind)"
+    for low, high in _YAML_DASH_RUNS:
+        bits = "".join(rf"(?(dw{k})[^\S\r\n]{{{1 << k}}})" for k in range(high, low - 1, -1))
+        ind += bits if low == 0 else rf"(?(dwg{low}){bits})"
+    return ind + r"[^\S\r\n]++"
 
 
 _YAML_DASHES = _yaml_dashes()
@@ -486,11 +557,7 @@ _YAML_LEAD = (
     rf"(?P<ind>[^\S\r\n]*+){_YAML_DASHES}(?P<kq>\\{{0,7}}[\"'])?)"
 )
 # A value line's indentation: past the key's column.
-_YAML_IND = (
-    r"(?P=ind)"
-    + "".join(rf"(?(dw{n})[^\S\r\n]{{{n}}})" for n in range(2, _YAML_DASH_MAX + 1))
-    + rf"(?(dwx)[^\S\r\n]{{{_YAML_DASH_MAX + 1}}})[^\S\r\n]++"
-)
+_YAML_IND = _yaml_ind()
 _YAML_BREAK = r"(?(ybs)(?P=ybs)(?:r(?P=ybs))?n|\r?\n)"
 # A character of a line written out (``ybs``): any but a backslash and a
 # quote, a quote behind ``ybs`` backslashes or more, and a run of backslashes
@@ -533,6 +600,21 @@ _YAML_PLACEHOLDER = (
 _YAML_PLACEHOLDERS = (
     rf"{_YAML_PLACEHOLDER}(?:{_YAML_NEXT}{_YAML_PLACEHOLDER})*+(?!{_YAML_NEXT}{_YAML_UNIT})"
 )
+# The rest of a line that ends a value's properties or its block's header: a
+# comment and the line break. Then, after properties, the blank and comment
+# lines YAML allows before the node and the next line's indentation; after
+# a header, the blank lines before the block's first line and its
+# indentation (round 6).
+_YAML_REST = rf"(?:[^\S\r\n]++#{_YAML_UNIT}*+)?[^\S\r\n]*+{_YAML_BREAK}"
+_YAML_PROPS_TO_NODE = rf"{_YAML_REST}{_YAML_SKIPPED}{_YAML_IND}"
+_YAML_HEADER_TO_BLOCK = rf"{_YAML_REST}{_YAML_BLANKS}{_YAML_IND}"
+# A value's properties below its key (round 6): one or two, each followed by
+# a space on its line or by the end of its line, the node on a later one.
+_YAML_NODE_PROPS = rf"(?:{_YAML_PROPERTY}(?:{_YAML_PROPS_TO_NODE}|[^\S\r\n]++)){{1,2}}"
+# A block's header below its key (round 6), after the value's properties
+# when it has any: the indicator alone (``_BLOCK_INDICATOR``), then the
+# block's lines.
+_YAML_BELOW_HEADER = rf"{_BLOCK_INDICATOR}{_YAML_HEADER_TO_BLOCK}"
 
 
 # What every key with a value below it holds: its colon, then a block's
@@ -564,7 +646,7 @@ def _yaml_value(name: str, names: str, name_hint: str, *, literal_only: bool) ->
     (``_Pattern.hint``), ``literal_only`` whether a lower-case name's value
     must not read as code (``_literal_checks``). The key, its separator, a
     block's header, the line break, the blank and comment lines before the
-    value and its indentation stay; the value is replaced.
+    value, its properties and its indentation stay; the value is replaced.
     """
     one_line, lines, block = _literal_checks(literal_only)
     regex = (
@@ -575,7 +657,9 @@ def _yaml_value(name: str, names: str, name_hint: str, *, literal_only: bool) ->
         rf"(?P<blank>(?(blk){_YAML_BLANKS}|{_YAML_SKIPPED}))"
         rf"(?P<vind>{_YAML_IND})"
         rf"(?(blk){block}{_YAML_BLOCK_LINES}"
-        rf"|(?P<vprops>{_YAML_PROPS})?(?:{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
+        rf"|(?P<vprops>{_YAML_NODE_PROPS})?"
+        rf"(?:(?P<bhdr>{_YAML_BELOW_HEADER}){block}{_YAML_BLOCK_LINES}"
+        rf"|{_VALUE_QUOTE}(?:{_QUOTED_LINES}|{_QUOTED_LINE})"
         r"(?P<close>(?:(?P=vbs)(?P=vq))?)"
         rf"|(?!{_YAML_NOT_PLAIN})"
         rf"(?:{lines}{_YAML_PLAIN_LINE}{_YAML_PLAIN_MORE}++|{one_line}{_YAML_PLAIN_LINE})))"
@@ -583,7 +667,7 @@ def _yaml_value(name: str, names: str, name_hint: str, *, literal_only: bool) ->
     return _Pattern(
         name,
         re.compile(regex),
-        r"\g<lead>\g<name>\g<sep>\g<hdr>\g<gap>\g<blank>\g<vind>\g<vprops>\g<open>"
+        r"\g<lead>\g<name>\g<sep>\g<hdr>\g<gap>\g<blank>\g<vind>\g<vprops>\g<bhdr>\g<open>"
         r"***REDACTED***\g<close>",
         hint=_YAML_HINT,
         name_hint=re.compile(name_hint),
@@ -751,8 +835,16 @@ _PEM_BODY = rf"(?:{_PEM_GAP}*+[A-Za-z0-9+/=]++)*+"
 # characters, the shortest a key has, and words seldom do. Each
 # candidate of it reads 16 characters, four times at most (three lookaheads,
 # one for each kind, and the run), and is tried where a short run starts.
+#
+# A line break is a carriage return alone too (#285 review, round 6,
+# ``_PEM_BREAK``), as written and written out: a base64 decoder skips it as
+# it skips a line feed, so a key whose body's runs bare carriage returns part
+# (a classic Mac OS file, a terminal's capture) is a valid key, but only
+# ``\n`` and ``\r\n`` parted two runs of material, and such a key was kept
+# whole. ``\r\n`` is one break, so a blank line still parts two runs.
 _PEM_B64 = r"[A-Za-z0-9+/]"
-_PEM_WRAP = r"(?:\r?\n|\\{1,7}r\\{1,7}n|\\{1,7}n)[ \t]*"
+_PEM_BREAK = r"(?:\r\n?|\n|\\{1,7}r(?:\\{1,7}n)?|\\{1,7}n)"
+_PEM_WRAP = rf"{_PEM_BREAK}[ \t]*"
 _PEM_KEY = rf"(?:{_PEM_B64}(?:{_PEM_WRAP})?+){{15}}{_PEM_B64}"
 # The space between two of its characters: spaces and tabs, a line break
 # among them. Where neither a space nor a backslash follows a character the
@@ -761,7 +853,7 @@ _PEM_KEY = rf"(?:{_PEM_B64}(?:{_PEM_WRAP})?+){{15}}{_PEM_B64}"
 _PEM_HSPACE = r"(?:[ \t]|\\{1,7}t)"
 _PEM_SPACE = (
     rf"(?:(?=[\s\\]){_PEM_HSPACE}*+"
-    rf"(?:(?:\r?\n|\\{{1,7}}r\\{{1,7}}n|\\{{1,7}}n){_PEM_HSPACE}*+)?+)?+"
+    rf"(?:{_PEM_BREAK}{_PEM_HSPACE}*+)?+)?+"
 )
 _PEM_SPACED_KEY = (
     rf"(?=(?:[A-Za-z]{_PEM_SPACE}){{0,15}}+[0-9+/])"
@@ -1138,7 +1230,12 @@ _CREDENTIAL_KEY = re.compile(
 # line (round 4) holds that line break and a character (``a_token="\nx"``,
 # 12 to 24, the break replaced with the value), and a plain scalar that
 # starts on its key's line and goes on (round 4) a character, a line break,
-# an indentation and a character (``a_token: x\n y``, 13 to 23). The
+# an indentation and a character (``a_token: x\n y``, 13 to 23). Round 6
+# keeps more of a text and replaces no less: a value's properties or a
+# block's header on lines of their own stay (``a_token:\n &a\n x\n``, 15 to
+# 28), and so does a line break written out before a value
+# (``A_TOKEN=\nx`` in JSON, 11 to 24, where the break went with the value,
+# 11 to 22). The
 # rounds of :func:`redact` (``_MAX_ROUNDS``) are more patterns in that
 # order, and compound nothing either, by the argument below.
 # Growth does not compound across patterns: a later pattern can only lengthen

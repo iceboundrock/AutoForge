@@ -71,6 +71,7 @@ from autoforge.result_parser import (
 from autoforge.transitions import Phase, WorkflowMode
 from tests.conftest import (
     BRANCH,
+    CR_KEY,
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     ISSUE,
@@ -91,6 +92,7 @@ from tests.conftest import (
     WHOLE_VALUES_285_R3,
     WHOLE_VALUES_285_R4,
     WHOLE_VALUES_285_R5,
+    WHOLE_VALUES_285_R6,
     block,
     comment_url,
 )
@@ -2612,6 +2614,19 @@ def test_a_285_shape_is_refused_by_every_published_content_check(cls, text, body
         "```yaml\nclient_secret: !secret app_client_secret\n"
         "defaults: &defaults\n  api_token: &tok\n    key: value\n```",
         "```rust\nfn connect(api_token: &str, client_secret: &'a str) -> bool\n```",
+        # Round 6: a placeholder block in an entry behind nine nested
+        # sequences with its sibling after it, and one below a header on its
+        # own line; a nested mapping and a reference after properties on
+        # their own line.
+        "```yaml\n"
+        + "- " * 9
+        + "x_token: |\n"
+        + " " * 20
+        + "${{ secrets.X_TOKEN }}\n"
+        + " " * 18
+        + "endpoint: https://example.test\n```",
+        "```yaml\nclient_secret:\n  |\n  {{ vault_client_secret }}\n```",
+        "```yaml\nclient_secret:\n  &cs\n  key: value\napi_token:\n  !secret\n  app_api_token\n```",
     ],
     ids=[
         "pem-header",
@@ -2637,6 +2652,9 @@ def test_a_285_shape_is_refused_by_every_published_content_check(cls, text, body
         "round-5-sequence-placeholder",
         "round-5-properties",
         "round-5-rust-references",
+        "round-6-wide-sequence-placeholder",
+        "round-6-header-below-placeholder",
+        "round-6-properties-on-their-own-line",
     ],
 )
 def test_text_about_the_285_shapes_is_still_publishable(text):
@@ -2675,6 +2693,9 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
         ("private-key", SPACED_KEY, SHORT_WRAPPED_KEY_LINE),
         ("private-key", " ".join(SHORT_WRAPPED_KEY.split("\n")), SHORT_WRAPPED_KEY_LINE),
         *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285_R5),
+        # Round 6: a value whose properties or block header stand on lines
+        # of their own below its key.
+        *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285_R6),
     ],
     ids=[
         "short-wrapped-key",
@@ -2687,6 +2708,7 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
         "round-5-spaced-key",
         "round-5-key-on-one-line",
         *(f"round-5-{name}" for name, _, _ in WHOLE_VALUES_285_R5),
+        *(f"round-6-{name}" for name, _, _ in WHOLE_VALUES_285_R6),
     ],
 )
 def test_a_shape_the_285_review_found_is_refused_by_every_published_content_check(cls, text, body):
@@ -2710,6 +2732,33 @@ def test_a_shape_the_285_review_found_is_refused_by_every_published_content_chec
         assert msg is not None
         assert f"credential-shaped string (pattern class: {cls})" in msg
         assert body not in msg
+
+
+def test_a_private_key_parted_by_carriage_returns_is_refused_by_every_published_content_check():
+    """#285 review, round 6: a key whose body's runs bare carriage returns
+    part, which OpenSSL reads, was no key material, so the publication,
+    payload, commit-message and composed-comment checks accepted it. Each
+    refuses it by class now, and never quotes it; a result field refuses
+    the carriage return itself first, unquoted too."""
+    body_text = f"Configured the client.\n\n{CR_KEY}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body_text),
+        published_payload_problem("PR body", f"{body_text}\n\nCloses #2"),
+        acceptance_comment_problem(body_text, "R1-F1"),
+        operator_comment_problem(body_text, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{CR_KEY}", repository="owner/repo", issue_number=2
+        ),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert "credential-shaped string (pattern class: private-key)" in msg
+        assert SHORT_WRAPPED_KEY_LINE not in msg and "BEGIN" not in msg
+    for refusal in (
+        _refusal(lambda: _full(progress=body_text)),
+        _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
+    ):
+        assert refusal is not None and SHORT_WRAPPED_KEY_LINE not in refusal
 
 
 def test_a_private_key_block_in_a_commit_message_is_refused_whole():

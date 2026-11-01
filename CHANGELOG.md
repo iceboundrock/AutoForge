@@ -26,7 +26,8 @@ so.
   ([Secrets and logging](docs/agent-guides/secrets-and-logging.md#the-remaining-credential-shapes-285)).
 - A private-key block is replaced whole, its BEGIN and END lines with it,
   also when its body is wrapped in lines shorter than 16 characters (a key
-  rewrapped with `fold -w 8` is still a valid key), or has spaces and tabs
+  rewrapped with `fold -w 8` is still a valid key; its lines may end in a
+  bare carriage return), or has spaces and tabs
   between short runs, which a base64 decoder skips (16 characters parted so
   must mix case and hold a digit, a `+` or a `/`, so the words of a
   placeholder stay). One whose END line is
@@ -51,7 +52,8 @@ so.
   (`help = "Set GITHUB_TOKEN="`), and one after a name that starts a
   string literal or a code span. An unquoted value ends at a line break
   written out (`\n` in JSON text), so a `NAME: value` line after it is
-  redacted in turn.
+  redacted in turn, and never starts with one: the value on the line below
+  its name in JSON text is redacted, the line break kept.
 - A value on the lines below a YAML key named so (an indented plain or
   quoted scalar, also past blank and comment lines and with blank lines
   among its lines, a literal `|` or folded `>` block, an Ansible
@@ -59,8 +61,11 @@ so.
   below it, quotes in its first line too, are redacted whole, under a
   lower-case name too, where only a value on the key's line was before. A
   YAML anchor or tag before a value (`&cs`, `!!str`) is kept and the scalar
-  after it replaced, and in a sequence entry (`- x_token: |`) the value
-  stops at the mapping's next entry, which stays; a statement that ends in a colon
+  after it replaced, also when they stand on lines of their own below the
+  key, as a block's header may (`client_secret:`, then `  |`, then the
+  block), and in a sequence entry (`- x_token: |`) the value stops at the
+  mapping's next entry, which stays, however wide the dashes before the
+  key; a statement that ends in a colon
   (`if api_token:`), a nested mapping and, under a lower-case name, a value
   that reads as code (`${{ secrets.X }}`, `process.env.X`) are left. A
   block is a string whatever its lines hold, so one that starts with a

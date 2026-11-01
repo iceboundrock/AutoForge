@@ -129,6 +129,11 @@ SPACED_KEY = "\n".join(
         PEM_END,
     ]
 )
+# The same runs of eight parted by bare carriage returns, the BEGIN and END
+# lines by line feeds (#285 review, round 6): a base64 decoder skips a
+# carriage return as it skips a line feed, so OpenSSL reads such a key, but
+# a bare carriage return was no line break between two runs of material.
+CR_KEY = "\n".join([PEM_BEGIN, "\r".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="]), PEM_END])
 # A value of no known shape under a prefixed name (#285).
 SUFFIX_SECRET = "FAKE0opaque0value"
 SUFFIX_ASSIGNMENT = f"DEEPSEEK_API_KEY={SUFFIX_SECRET}"
@@ -295,6 +300,41 @@ WHOLE_VALUES_285_R5_REDACTED = {
     "yaml-tagged-below": "api_token:\n  !!str ***REDACTED***",
     "yaml-tagged-inline": "db_password: !!str ***REDACTED***",
     "yaml-anchored-block": "Db_Password: &pw |\n  ***REDACTED***",
+}
+# Values the sixth review of #285 found kept whole, each valid YAML: a
+# value's properties on lines of their own below the key, an anchor alone
+# and then a quoted scalar, an anchor and a tag split over two lines, a tag
+# below an anchor on the key's line; and a block's header on a line of its
+# own below the key, alone, below properties and after them, under a
+# lower-, a mixed- and an upper-case name (R6-F1). Each with its id, the
+# text and what must not appear once it is redacted or refused.
+WHOLE_VALUES_285_R6 = [
+    ("yaml-anchor-line-then-quoted", "client_secret:\n  &cs\n  'FAKEanchorline'", "FAKEanchorline"),
+    (
+        "yaml-anchor-and-tag-lines",
+        "api_token:\n  &tok\n  !!str\n  FAKEsplitprops",
+        "FAKEsplitprops",
+    ),
+    ("yaml-tag-below-key-anchor", "Db_Password: &pw\n  !!str\n  'FAKEtagbelow'", "FAKEtagbelow"),
+    ("yaml-literal-header-below", "client_secret:\n  |\n  FAKEheaderbelow", "FAKEheaderbelow"),
+    (
+        "yaml-folded-header-below-anchor",
+        "x_api_key:\n  &k\n  >-\n    FAKEfolded1\n    FAKEfolded2",
+        "FAKEfolded1",
+    ),
+    ("yaml-header-after-tag-below", "Partner_Api_Key:\n  !!str |\n  FAKEtagged", "FAKEtagged"),
+    ("yaml-header-below-upper", "DEPLOY_SECRET:\n  |\n    FAKEheaderupper", "FAKEheaderupper"),
+]
+# What ``redact`` makes of each of them: the key, the properties, the
+# header, the lines between them and the value's indentation stay.
+WHOLE_VALUES_285_R6_REDACTED = {
+    "yaml-anchor-line-then-quoted": "client_secret:\n  &cs\n  '***REDACTED***'",
+    "yaml-anchor-and-tag-lines": "api_token:\n  &tok\n  !!str\n  ***REDACTED***",
+    "yaml-tag-below-key-anchor": "Db_Password: &pw\n  !!str\n  '***REDACTED***'",
+    "yaml-literal-header-below": "client_secret:\n  |\n  ***REDACTED***",
+    "yaml-folded-header-below-anchor": "x_api_key:\n  &k\n  >-\n    ***REDACTED***",
+    "yaml-header-after-tag-below": "Partner_Api_Key:\n  !!str |\n  ***REDACTED***",
+    "yaml-header-below-upper": "DEPLOY_SECRET:\n  |\n    ***REDACTED***",
 }
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)

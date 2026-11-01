@@ -205,10 +205,17 @@ needs key material, 16 base64 characters in a row: a BEGIN line alone, one
 quoted by code (`startswith("-----BEGIN ...")`) or prose, an empty block and
 a placeholder (`...`) are no credential, so text about the format can be
 published. A line break and the indentation after it may stand between any
-two of the 16, as written or written out (`\n`, `\r\n`, behind up to seven
-backslashes): a valid key rewrapped at fewer than 16 characters a line
-(`fold -w 8`, which OpenSSL still reads) has no run of 16 on any line, and
-was missed until the review of #285. Spaces and tabs may part the runs too
+two of the 16, as written or written out (`\n`, `\r\n` and a carriage
+return alone, `\r`, behind up to seven backslashes): a valid key rewrapped
+at fewer than 16 characters a line (`fold -w 8`, which OpenSSL still reads)
+has no run of 16 on any line, and was missed until the review of #285. A
+bare carriage return counted as no line break until the sixth review: a
+base64 decoder skips it as it skips a line feed, so an Ed25519 key whose
+body's runs of one, four or eight characters bare carriage returns part
+(a classic Mac OS file, a terminal's capture) is one OpenSSL reads, to the
+same public key, but the whole block reached every sink and passed every
+check, as text and in JSON three deep. `\r\n` is one line break, so a
+blank line (`\r\r`, `\r\n\r\n`) still parts two runs. Spaces and tabs may part the runs too
 (fifth review of #285): a base64 decoder skips them, so a key with a space
 after every eight characters of its body is one OpenSSL reads, to the same
 public key, and so is a short-wrapped key whose line breaks a progress line
@@ -401,13 +408,29 @@ not one way only, and the value once.
 
 **An unquoted value ends at a line break written out** (`\n`, `\r` and
 `\t`, as JSON writes them), for this rule, `env-assignment` and
-`oauth-assignment`, as it ends at one written as such; a value that starts
-with one is the next line's. It used to run on into the next line, and
-where that line was `NAME: value` in JSON text (an agent's result quoting a
-YAML file: `"A_TOKEN: x\nB_TOKEN: y"`), it took the name and left the value
-in the clear. The name now starts a token after the escape
-([above](#where-a-recognised-credential-starts-284)), and its value is
-replaced in turn.
+`oauth-assignment`, as it ends at one written as such. It used to run on
+into the next line, and where that line was `NAME: value` in JSON text (an
+agent's result quoting a YAML file: `"A_TOKEN: x\nB_TOKEN: y"`), it took
+the name and left the value in the clear. The name now starts a token after
+the escape ([above](#where-a-recognised-credential-starts-284)), and its
+value is replaced in turn.
+
+**A line break written out starts no value; it is crossed** (sixth review
+of #285). A value that started with one was taken to be that break and the
+rest of its line, so in JSON text a value below its name lost the break to
+the marker and kept the line below in the clear (`"GH_TOKEN:\n  FAKE"`
+became `"GH_TOKEN:***REDACTED***  FAKE"`), and a YAML value's pattern no
+longer found the line it is told by (a block's header below an upper-case
+key, `"GH_TOKEN:\n  |\n  FAKE"`, kept its block). The separator now crosses
+a line break written out, behind up to seven backslashes, with the blank
+lines and the indentation after it, as it crosses one written as such:
+`GH_TOKEN=\nabc` in JSON text is `GH_TOKEN=\n***REDACTED***`. It crosses
+to an unquoted value only: a quote right after the break may close the
+string the text is written in (`"GH_TOKEN=\n"`, then the document's next
+string), so a quoted value below its name in JSON text is the YAML
+patterns', which tell that quote by its backslashes
+([below](#a-value-on-the-lines-below-a-yaml-key)), and after `=` it is not
+recognised.
 
 **An OAuth value ends where a lower-case name's word does.** Every OAuth
 name but `chatgpt-account-id` is a prefixed name too (`refresh_token`,
@@ -473,7 +496,11 @@ line a line break and an indentation besides its first character
 an anchor before a value stays (`a_token: &a x`, 13 to 26), a doubled quote
 after a quote's line break is two characters of the value (`a_token='\n'''`,
 13 to 24), a quote in a plain scalar's first line one more (`a_token:
-x"\n y`, 14 to 23), and a sequence's dashes stay with the key. Every token
+x"\n y`, 14 to 23), and a sequence's dashes stay with the key. The sixth
+review's keep more and replace no less: properties or a block's header on
+lines of their own stay (`a_token:\n &a\n x\n`, 15 to 28), and so does a
+line break written out before a value (`A_TOKEN=\nx` in JSON text, 11 to
+24, where the break went with the value, 11 to 22). Every token
 shape is longer than the marker and only shrinks, a private-key block (43
 characters or more) included, and what a block holds between its BEGIN and
 END lines, like a quoted value, can take a marker only whole. A mapping's
@@ -498,9 +525,12 @@ starts, at most three times (its key-material lookahead steps over a run
 shorter than 16 whole, line breaks included), and where a short run starts
 it reads the 16 characters that spaces may part four times at most, once
 for each kind of character they must hold and once for the run. A YAML
-key's candidate reads its key, the dashes before it once (a step at a time,
-each asking whether they end there), one line break, the blank and comment
-lines before its value and its value's lines once, a block's lines once
+key's candidate reads its key, the dashes before it a few times (a
+lookahead for each run of bits whose lowest the width reaches, one chunk
+for each bit, the larger ones failing at the dashes' end; a dash or two are
+read about 20 times, a megabyte of them about three), one line break, the
+properties and headers on lines of their own, the blank and comment lines
+before its value and its value's lines once, a block's lines once
 more for its placeholder check, and a plain scalar's first line once more
 to its break, which a mapping's `: ` stops, so the next candidate's key
 ends it ([below](#a-value-on-the-lines-below-a-yaml-key)); a quoted value whose
@@ -532,7 +562,15 @@ another node (`client_secret: &cs 'FAKE'`, `api_token:` then
 `  !!str FAKE`), and a plain scalar whose first line holds a quote
 (`client_secret: FAKE"first` then `  FAKEcontinued`) kept their values,
 and a value in a sequence entry (`- x_token: |`) took the mapping's next
-entry with it. Each is now taken whole, and the next entry stays.
+entry with it. Each is now taken whole, and the next entry stays. The
+sixth review found the rest of those: the properties alone on a line below
+the key, or split over two (`client_secret:`, then `  &cs`, then
+`  'FAKE'`), and a block's header on a line of its own below the key (`  |`
+under `client_secret:`, under `GH_TOKEN:` in JSON text too) kept their
+values whole, live progress lines included; and past 16 columns of dashes
+(nine nested sequences, or a dash and 17 spaces) the next entry still went
+with the value. Each is now taken whole, and the next entry stays at any
+width.
 
 ```yaml
 client_secret:          db_password: |          x_api_key: >-
@@ -560,9 +598,16 @@ api_token:              Db_Password:            client_secret: <word>
   counted, so the mapping's next entry (`  endpoint: ...` below the block)
   was indented more and went with the value, the diagnostic lost, and
   after a block of placeholders it made the block a value and the YAML was
-  refused. The dashes' width is told apart up to 16 columns (eight nested
-  sequences); past that a value's line must be indented 17 more at least,
-  so a next entry indented exactly past such dashes still goes with it.
+  refused. The fifth review's fix told the dashes' width apart up to 16
+  columns and asked for 17 spaces past that, so nine nested sequences (a
+  key at column 18) still lost their next entry. A regex cannot compare
+  the lengths of two runs, so the width is now written in binary (sixth
+  review): one empty group for each bit the width holds, read high bit
+  first, each bit a run of its many characters or none, and a value's line
+  is asked for that many spaces again, for every bit set, and one more.
+  It is exact up to `2**32 - 1` columns, the most a regex repeat counts and
+  more than any text holds in a line; a wider run of dashes is no key's,
+  and its value is not read below it.
 - **The value is on the lines indented more than the key**, past blank
   lines and, before a quoted or a plain scalar, comment lines at any
   indentation, as YAML allows (between a block's header and its first line
@@ -574,6 +619,25 @@ api_token:              Db_Password:            client_secret: <word>
   (` #`). A more indented line that is a mapping (`valueFrom:`), a
   sequence, a comment or a code fence is another node, never the value,
   and a key with nothing below its blank and comment lines has none.
+- **The properties and a block's header may end their line** (sixth review
+  of #285), as YAML allows wherever a node may stand apart from what comes
+  before it: below the key, the properties alone on a line, or split over
+  two (`&cs`, then `!!str`, then the scalar), a comment after them and
+  blank and comment lines below them; and a block's header (`|`, `>-`,
+  `|2`) on a line of its own below the key, below the properties or after
+  them on their line (`&cs |`), then the block's lines, blank lines before
+  them. Only the properties on the key's line or right before the value,
+  and a header beside the colon, were read until then, so such a value was
+  kept whole, live progress lines included. The properties, the header and
+  the lines between them stay. What follows them is the value as above, so
+  a nested mapping, a sequence or a flow collection after properties on
+  their own line (`&cs`, then `key: value`) is still none, a reference
+  after a tag on its own line (`!secret`, then `app_client_secret`) still
+  reads as code, and a block of placeholders below a header on its own
+  line still stays. An upper-case or a well-known name's rule on its line
+  may take a property alone on its line for the value, as it takes any
+  word there, and the value below it goes with it: the property is lost,
+  never the value.
 - **An anchor and a tag are the scalar's properties**, not another node
   (fifth review of #285): `&cs` names the node after it and `!!str` types
   it, so `client_secret: &cs 'FAKE'`, `client_secret: !!str FAKE`, and the
