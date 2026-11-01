@@ -125,8 +125,9 @@ bytes, so update it to what the new one shows, never the fixture.
 first runs the backend's own capability probe
 (`autoforge.sandbox_bwrap.probe`, ADR 0005 D14.1) and, on a host that
 cannot enforce, skips with the probe's typed reason: which capability is
-missing (`bwrap` itself, an unprivileged user, PID or IPC namespace, a new
-procfs, a bind mount, an overlay mount, Landlock ABI 6). `pytest` is
+missing (a Python with `os.memfd_create`, `bwrap` itself, an unprivileged
+user, PID or IPC namespace, a new procfs, a bind mount, an overlay mount,
+Landlock ABI 6). `pytest` is
 configured with `-rs`, so every run, CI's included, prints each skip and
 its reason; a silent pass of zero tests cannot hide one.
 `AUTOFORGE_REQUIRE_SANDBOX_BACKEND` decides what such a host does instead:
@@ -144,6 +145,11 @@ its reason; a silent pass of zero tests cannot hide one.
 The measurement records what a host provides for the backend:
 
 - the platform, the kernel and the distribution;
+- the Python that measures, and whether it has `os.memfd_create`, the
+  memory file through which the backend hands `bwrap` a launch's options:
+  a build without it cannot launch at all (uv's CPython 3.12.13 build has
+  none; #389), so the real-backend tests that build runs skip under `auto`
+  instead of failing on a host that is otherwise capable;
 - which `bwrap` is on `PATH`, its version, and whether it has `--overlay`;
 - the user-namespace policy: `kernel.unprivileged_userns_clone`, Ubuntu's
   AppArmor `kernel.apparmor_restrict_unprivileged_userns` and
@@ -153,8 +159,9 @@ The measurement records what a host provides for the backend:
   `EOPNOTSUPP` (Landlock disabled at boot), `ENOSYS` (no Landlock call),
   either of which a seccomp filter can also return, or another errno.
 
-It calls the host capable when it is Linux, its `bwrap` can mount an
-overlay, the namespace launch succeeds and the Landlock ABI is at least 6.
+It calls the host capable when it is Linux, its Python has
+`os.memfd_create`, its `bwrap` can mount an overlay, the namespace launch
+succeeds and the Landlock ABI is at least 6.
 `uv run python -m tests.sandbox_host` prints it on its own.
 
 **Hosted CI measures its runner on every run.** The `sandbox` job of
@@ -220,14 +227,26 @@ credential:
    --dry-run --full-prompt`) in a scratch repository, with a fake `gh`
    first on `PATH` that records and fails any call, and checks it rendered
    the ANALYZE_EXECUTE prompt, called no `gh` and left the repository
-   byte-identical; then meets LOCAL mode's ways in with the installed
+   unchanged; then meets LOCAL mode's ways in with the installed
    command (ADR 0009 D3 to D5, #389): `--help` names no `local`, and in a
    scratch repository holding a `mode: "LOCAL"` state and beside a
    configuration with a `local:` block, `autoforge local`, `status`,
-   `status --json`, `--state-dir … status`, `step --dry-run`,
-   `resume --dry-run` and `unblock --dry-run` each exit 2 with argparse's
-   invalid choice, the unknown key or the unknown mode, call no `gh`, and
-   leave the repository and the configuration file byte-identical;
+   `status --json`, `--state-dir … status`, `step`, `resume` and
+   `unblock`, each both as a dry run and as the ordinary invocation that
+   would take the lock and launch, and `run` over that state each exit 2
+   with argparse's invalid choice, the unknown key or the unknown mode.
+   They run with a scratch `HOME` and `TMPDIR`, no variable of the
+   caller's but `PATH`, and recording fakes of `gh`, `claude`, `opencode`
+   and `pi` first on `PATH`, so that a regression reaches no service and
+   no model; none may be called, and the repository, the configuration
+   file, the scratch `HOME` and `TMPDIR` must be unchanged. "Unchanged"
+   compares each path's bytes, inode, mode, owner, link count, size,
+   `mtime` and `ctime` (not `atime`, which a read sets): a file rewritten
+   with its own bytes, replaced by a copy of itself, or with its times put
+   back shows, and so does a lock file taken and removed, by its
+   directory's `mtime`. It cannot see a write outside those directories,
+   an advisory lock on a file that already existed, or a write by a
+   process left running after the command exits;
 7. prints the SHA-256 of both files (and, with `--sha256sums FILE`, writes
    them in `sha256sum` format).
 
