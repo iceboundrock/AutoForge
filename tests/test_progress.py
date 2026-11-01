@@ -36,6 +36,9 @@ from autoforge.state import load_state
 from tests import claude_fake
 from tests.conftest import (
     PR,
+    SHORT_WRAPPED_KEY,
+    SHORT_WRAPPED_KEY_LINE,
+    SPACED_KEY,
     analyze_payload,
     block,
     commit_in,
@@ -74,6 +77,49 @@ def test_clean_strips_escapes_and_controls(raw, shown):
 
 def test_clean_rejoins_a_token_split_by_an_escape_before_redacting():
     assert clean(SPLIT, 100) == REDACTED
+
+
+@pytest.mark.parametrize(
+    ("raw", "shown"),
+    [
+        (SHORT_WRAPPED_KEY, REDACTED),
+        (SPACED_KEY, REDACTED),
+        (SHORT_WRAPPED_KEY.replace("\n", "\r\n"), REDACTED),
+        (SHORT_WRAPPED_KEY.replace("\n", "\u2028"), REDACTED),
+        (f"$ cat key.pem\n{SHORT_WRAPPED_KEY}\n$ next", f"$ cat key.pem {REDACTED} $ next"),
+        (
+            "client_secret: |\n  FAKEline1\n  FAKEline2\nnext: 1",
+            f"client_secret: | {REDACTED} next: 1",
+        ),
+        ("api_token:\n  # rotated\n  FAKEbelow", f"api_token: # rotated {REDACTED}"),
+        ("client_secret: &cs\n  'FAKEanchored'", f"client_secret: &cs '{REDACTED}'"),
+    ],
+    ids=[
+        "short-wrapped-key",
+        "spaced-key",
+        "crlf-key",
+        "line-separator-key",
+        "key-between-lines",
+        "yaml-block",
+        "yaml-below-a-comment",
+        "yaml-anchored-below",
+    ],
+)
+def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
+    """#285 review, round 5: ``clean`` made every line break a space before
+    it redacted, so a key wrapped in short lines became words of prose and a
+    YAML value below its key or in a block lost the lines it is told by, and
+    a progress line showed them. It redacts the text with its lines, then
+    the joined line again."""
+    assert clean(raw, MAX_LINE_CHARS) == shown
+    assert "FAKE" not in clean(raw, MAX_LINE_CHARS)
+    assert SHORT_WRAPPED_KEY_LINE not in clean(raw, MAX_LINE_CHARS)
+
+
+@pytest.mark.parametrize("key", [SHORT_WRAPPED_KEY, SPACED_KEY], ids=["short-wrapped", "spaced"])
+def test_an_event_whose_input_holds_a_wrapped_or_spaced_key_shows_none_of_it(key):
+    event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Bash", detail=f"echo '{key}' > k")
+    assert event.detail == f"echo '{REDACTED}' > k"
 
 
 def test_clean_redacts_before_it_clips():

@@ -219,7 +219,8 @@ prints, or that a command echoes, can reach a run log, and agent text that
 carries one can be published. The state directory is stored in the clear.
 Google API keys (`AIza...`) are recognised by their shape, under any name
 ([#282](https://github.com/iceboundrock/AutoForge/issues/282)), and so are
-AWS access key ids, private-key blocks (also wrapped in short lines),
+AWS access key ids, private-key blocks (also wrapped in short lines, or
+with spaces and tabs between the runs of their body),
 GitLab, Groq, xAI, npm and Hugging Face tokens, and a value assigned to a
 name that ends in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD`, as text
 or as a mapping's key: any value under an upper-case name
@@ -229,21 +230,26 @@ a line break, or an unquoted word of any characters that does not read as
 code, on the name's line or, under a YAML key, on the lines below it (an
 indented scalar past blank and comment lines, a `|` or `>` block whatever
 its lines hold, unless each is a placeholder such as `${{ secrets.X }}`, a
-plain scalar that goes on below the key's line)
+plain scalar that goes on below the key's line, quotes in its first line
+too), also after the value's YAML anchor or tag (`&cs`, `!!str`), which stay
 ([#285](https://github.com/iceboundrock/AutoForge/issues/285)). Among what
 is still not recognised: an unquoted value under a lower-case name that
 reads as code (a password that is a credential's name, a dotted name or a
 number, `db_password=password`, a YAML plain scalar of several lines that
 starts with a keyword such as `true`), the words after the first of an
-unquoted value with spaces on the name's line (`DB_PASSWORD: two words`;
-quoted, below a YAML key or going on below it, it is taken whole), the
+unquoted value with spaces on the name's line (`DB_PASSWORD: two words`)
+and what follows a quote inside one (`client_secret: FAKE"rest`; quoted,
+below a YAML key or going on below it, it is taken whole), the
 lines after the first of a quoted value whose name stands right after a
 quote or a backtick (inside a string literal or a Markdown code span), a
 quoted value that starts with a line break where its name stands inside a
 string its line opens, a name those suffixes do not cover (`SSH_KEY`,
 `clientSecret`), an AWS
-secret access key printed without its name, and the end of a private key
-whose first line was cut off. Code that passes a credential on in a
+secret access key printed without its name, the end of a private key
+whose first line was cut off, and a key whose runs spaces part where no
+16 of its characters in a row mix case and hold a digit, a `+` or a `/`,
+which reads as the words of a placeholder (a few in a million keys of
+64 characters). Code that passes a credential on in a
 variable named otherwise (`client_secret=cs`) reads as a password and is
 refused in published text. An OpenCode launch receives every `GEMINI_*` and
 `GOOGLE_*` variable your shell sets. Keep such variables out of the shell

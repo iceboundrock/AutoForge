@@ -19,11 +19,16 @@ from tests.conftest import (
     GOOGLE_KEY_BODY,
     PRIVATE_KEY,
     SHAPES_285,
+    SHORT_WRAPPED_KEY,
+    SHORT_WRAPPED_KEY_LINE,
+    SPACED_KEY,
     WHOLE_VALUES_285,
     WHOLE_VALUES_285_R3,
     WHOLE_VALUES_285_R3_REDACTED,
     WHOLE_VALUES_285_R4,
     WHOLE_VALUES_285_R4_REDACTED,
+    WHOLE_VALUES_285_R5,
+    WHOLE_VALUES_285_R5_REDACTED,
 )
 
 
@@ -1445,6 +1450,100 @@ def test_a_whole_value_the_fourth_285_review_found_never_reaches_the_logs(tmp_pa
     result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
     assert result["tests"] == redacted
     assert result["message"] == "\n".join(redacted)
+
+
+def test_a_whole_value_the_fifth_285_review_found_never_reaches_the_logs(tmp_path):
+    """#285 review, round 5: a quoted value whose next line starts with the
+    quote doubled, a plain scalar whose first line holds a quote and that
+    goes on below its key's line, and a scalar after an anchor or a tag were
+    kept, whole or in part, in ``stdout.log``, ``stderr.log`` and
+    ``control-result.json``. Each goes whole from every file, after
+    OpenCode's ANSI escapes too, and the line after it stays."""
+    texts = [text for _, text, _ in WHOLE_VALUES_285_R5]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", *texts],
+            error="agent exited 1:\n" + "\n".join(texts),
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": "\n".join(texts),
+                "tests": texts,
+            },
+        ),
+        prompt="p",
+        stdout="".join(f"{text}\nnext line\n" for text in texts),
+        stderr="".join(f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in texts),
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"stdout.log", "stderr.log", "control-result.json"}
+    for path in [*files, log.events_path]:
+        content = path.read_text(encoding="utf-8")
+        assert "FAKE" not in content, path
+        for _, _, body in WHOLE_VALUES_285_R5:
+            assert body not in content, (path, body)
+    redacted = [WHOLE_VALUES_285_R5_REDACTED[name] for name, _, _ in WHOLE_VALUES_285_R5]
+    assert (step / "stdout.log").read_text(encoding="utf-8") == "".join(
+        f"{text}\nnext line\n" for text in redacted
+    )
+    assert (step / "stderr.log").read_text(encoding="utf-8") == "".join(
+        f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in redacted
+    )
+    result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
+    assert result["tests"] == redacted
+    assert result["message"] == "\n".join(redacted)
+
+
+def test_a_private_key_with_spaces_between_its_runs_never_reaches_the_logs(tmp_path):
+    """#285 review, round 5: a key whose body has spaces and tabs between
+    short runs, which OpenSSL reads, was no key material, so the whole block
+    reached ``stdout.log``, ``stderr.log`` and ``control-result.json``. It is
+    replaced whole in every file, its BEGIN and END lines with it, and the
+    lines around it stay; one a line made of a short-wrapped key's lines
+    shows is too."""
+    one_line = " ".join(SHORT_WRAPPED_KEY.split("\n"))
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", SPACED_KEY],
+            error=f"agent exited 1:\n{SPACED_KEY}",
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": f"deploy with\n{SPACED_KEY}",
+                "tests": [one_line],
+            },
+        ),
+        prompt="p",
+        stdout=f"$ cat key.pem\n{SPACED_KEY}\n$ next\n",
+        stderr=f"\x1b[91mError: \x1b[0m{one_line}\n",
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"stdout.log", "stderr.log", "control-result.json"}
+    for path in [*files, log.events_path]:
+        content = path.read_text(encoding="utf-8")
+        assert SHORT_WRAPPED_KEY_LINE not in content and "MIIEFAKE" not in content, path
+        assert "BEGIN" not in content, path
+    assert (step / "stdout.log").read_text(encoding="utf-8") == (
+        "$ cat key.pem\n***REDACTED***\n$ next\n"
+    )
+    assert (step / "stderr.log").read_text(encoding="utf-8") == (
+        "\x1b[91mError: \x1b[0m***REDACTED***\n"
+    )
+    result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
+    assert result["message"] == "deploy with\n***REDACTED***"
+    assert result["tests"] == ["***REDACTED***"]
 
 
 def test_an_oauth_credential_field_in_a_parsed_result_is_still_redacted(tmp_path):

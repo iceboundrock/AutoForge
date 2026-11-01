@@ -116,6 +116,19 @@ SHORT_WRAPPED_KEY_LINES = [
 ]
 SHORT_WRAPPED_KEY_LINE = SHORT_WRAPPED_KEY_LINES[1]
 SHORT_WRAPPED_KEY = "\n".join([PEM_BEGIN, *SHORT_WRAPPED_KEY_LINES, "FAKE+/==", PEM_END])
+# The same runs of eight parted by spaces on one line and by tabs on the next
+# (#285 review, round 5): a base64 decoder skips both, so OpenSSL reads such a
+# key, but a space parted two runs of key material. ``SHORT_WRAPPED_KEY_LINE``
+# is one of its runs, what must not appear once it is redacted or refused.
+SPACED_KEY = "\n".join(
+    [
+        PEM_BEGIN,
+        " ".join(SHORT_WRAPPED_KEY_LINES[:8]),
+        "\t".join(SHORT_WRAPPED_KEY_LINES[8:]),
+        "FAKE+/==",
+        PEM_END,
+    ]
+)
 # A value of no known shape under a prefixed name (#285).
 SUFFIX_SECRET = "FAKE0opaque0value"
 SUFFIX_ASSIGNMENT = f"DEEPSEEK_API_KEY={SUFFIX_SECRET}"
@@ -233,6 +246,55 @@ WHOLE_VALUES_285_R4_REDACTED = {
     "yaml-literal-number": "db_password: |\n  ***REDACTED***",
     "yaml-folded-number": "x_api_key: >-\n  ***REDACTED***",
     "yaml-plain-number": "api_token:\n  ***REDACTED***",
+}
+# Values the fifth review of #285 found kept in part or whole, each valid
+# shell or YAML: a quoted value whose opening quote ends its line and whose
+# next line starts with the quote doubled, on the name's line and below a
+# YAML key (R5-F1); a plain scalar whose first line holds a double quote and
+# that goes on below its key's line (R5-F2); and a scalar after an anchor or
+# a tag, on the key's line, below it and as a block (R5-F5). Each with its
+# id, the text and what must not appear once it is redacted or refused.
+WHOLE_VALUES_285_R5 = [
+    ("yaml-doubled-quote-after-break", "client_secret: '\n''FAKEafterdoubled'", "FAKEafterdoubled"),
+    (
+        "shell-doubled-quote-after-break",
+        "export DB_PASSWORD='\n''FAKEafterdoubled'",
+        "FAKEafterdoubled",
+    ),
+    (
+        "yaml-below-doubled-quote-after-break",
+        "Partner_Api_Key:\n  '\n  ''FAKEafterdoubled'",
+        "FAKEafterdoubled",
+    ),
+    (
+        "yaml-quote-in-first-line",
+        'client_secret: FAKE"FAKEafterquote\n  FAKEcontinued',
+        "FAKEcontinued",
+    ),
+    (
+        "yaml-quotes-in-first-line-upper",
+        'DB_PASSWORD: FAKE"x" FAKEafterquote\n  FAKEcontinued',
+        "FAKEcontinued",
+    ),
+    ("yaml-anchored-quoted", "client_secret: &cs 'FAKEanchored'", "FAKEanchored"),
+    ("yaml-anchored-below", 'x_api_key:\n  &key "FAKEanchored"', "FAKEanchored"),
+    ("yaml-tagged-below", "api_token:\n  !!str FAKEtagged", "FAKEtagged"),
+    ("yaml-tagged-inline", "db_password: !!str FAKEtagged", "FAKEtagged"),
+    ("yaml-anchored-block", "Db_Password: &pw |\n  FAKEanchoredblock", "FAKEanchoredblock"),
+]
+# What ``redact`` makes of each of them: the name, the quotes, the anchor and
+# the tag, a block's header and the value's indentation stay.
+WHOLE_VALUES_285_R5_REDACTED = {
+    "yaml-doubled-quote-after-break": "client_secret: '***REDACTED***'",
+    "shell-doubled-quote-after-break": "export DB_PASSWORD='***REDACTED***'",
+    "yaml-below-doubled-quote-after-break": "Partner_Api_Key:\n  '***REDACTED***'",
+    "yaml-quote-in-first-line": "client_secret: ***REDACTED***",
+    "yaml-quotes-in-first-line-upper": "DB_PASSWORD: ***REDACTED***",
+    "yaml-anchored-quoted": "client_secret: &cs '***REDACTED***'",
+    "yaml-anchored-below": 'x_api_key:\n  &key "***REDACTED***"',
+    "yaml-tagged-below": "api_token:\n  !!str ***REDACTED***",
+    "yaml-tagged-inline": "db_password: !!str ***REDACTED***",
+    "yaml-anchored-block": "Db_Password: &pw |\n  ***REDACTED***",
 }
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)

@@ -86,9 +86,11 @@ from tests.conftest import (
     SHAPES_285,
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
+    SPACED_KEY,
     WHOLE_VALUES_285,
     WHOLE_VALUES_285_R3,
     WHOLE_VALUES_285_R4,
+    WHOLE_VALUES_285_R5,
     block,
     comment_url,
 )
@@ -2601,6 +2603,15 @@ def test_a_285_shape_is_refused_by_every_published_content_check(cls, text, body
         "db_password: |\n  {{ vault }}\n```",
         "```js\nconst cfg = {\n  api_token:\n    process.env.API_TOKEN,\n};\n```",
         '```python\nfield = "Set GITHUB_TOKEN="\nx = \'a\'\n\ny = "/tmp"\n```',
+        # Round 5: a placeholder between BEGIN and END lines, its words
+        # parted by spaces; a placeholder block in a sequence entry with a
+        # sibling after it; a reference after a tag, a nested mapping after
+        # an anchor, and a Rust reference type.
+        f"{PEM_BEGIN}\nPaste Your Private Key Here\n{PEM_END}",
+        "```yaml\n- x_token: |\n    ${{ secrets.X_TOKEN }}\n  endpoint: https://example.test\n```",
+        "```yaml\nclient_secret: !secret app_client_secret\n"
+        "defaults: &defaults\n  api_token: &tok\n    key: value\n```",
+        "```rust\nfn connect(api_token: &str, client_secret: &'a str) -> bool\n```",
     ],
     ids=[
         "pem-header",
@@ -2622,6 +2633,10 @@ def test_a_285_shape_is_refused_by_every_published_content_check(cls, text, body
         "round-3-references",
         "round-3-code-values",
         "round-3-string-literals",
+        "round-5-pem-placeholder",
+        "round-5-sequence-placeholder",
+        "round-5-properties",
+        "round-5-rust-references",
     ],
 )
 def test_text_about_the_285_shapes_is_still_publishable(text):
@@ -2653,6 +2668,13 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
         # whose quote ends its line, and a block or a plain scalar that
         # starts with a bracket or a number.
         *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285_R4),
+        # Round 5: a key whose runs spaces and tabs part, and one a line made
+        # of a short-wrapped key's lines shows; a quoted value whose next line
+        # starts with the quote doubled, a plain scalar whose first line holds
+        # a quote, and a scalar after an anchor or a tag.
+        ("private-key", SPACED_KEY, SHORT_WRAPPED_KEY_LINE),
+        ("private-key", " ".join(SHORT_WRAPPED_KEY.split("\n")), SHORT_WRAPPED_KEY_LINE),
+        *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285_R5),
     ],
     ids=[
         "short-wrapped-key",
@@ -2662,6 +2684,9 @@ def test_text_about_the_285_shapes_is_still_publishable(text):
         *(f"round-2-{name}" for name, _, _ in WHOLE_VALUES_285),
         *(f"round-3-{name}" for name, _, _ in WHOLE_VALUES_285_R3),
         *(f"round-4-{name}" for name, _, _ in WHOLE_VALUES_285_R4),
+        "round-5-spaced-key",
+        "round-5-key-on-one-line",
+        *(f"round-5-{name}" for name, _, _ in WHOLE_VALUES_285_R5),
     ],
 )
 def test_a_shape_the_285_review_found_is_refused_by_every_published_content_check(cls, text, body):

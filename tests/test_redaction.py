@@ -41,6 +41,7 @@ from tests.conftest import (
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
     SHORT_WRAPPED_KEY_LINES,
+    SPACED_KEY,
     SUFFIX_ASSIGNMENT,
     SUFFIX_SECRET,
     WHOLE_VALUES_285,
@@ -48,6 +49,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R3_REDACTED,
     WHOLE_VALUES_285_R4,
     WHOLE_VALUES_285_R4_REDACTED,
+    WHOLE_VALUES_285_R5,
+    WHOLE_VALUES_285_R5_REDACTED,
     XAI_API_KEY,
     XAI_KEY_BODY,
 )
@@ -737,6 +740,99 @@ def test_a_normally_wrapped_key_is_still_one_block():
         assert credential_classes(text) == ("private-key",)
 
 
+def _respace(key, width, sep):
+    """``key`` with its body in runs of ``width`` characters parted by
+    ``sep``, on one line: a key a base64 decoder, OpenSSL's, still reads."""
+    begin, *body, end = key.split("\n")
+    joined = "".join(body)
+    runs = (joined[i : i + width] for i in range(0, len(joined), width))
+    return "\n".join([begin, sep.join(runs), end])
+
+
+# A key whose body has spaces or tabs between short runs (#285 review, round
+# 5), each with what ``redact`` makes of it: runs of eight, four, two and one
+# character, spaces, tabs and both, several spaces, a space at a line's end,
+# the whole block on one line (as a progress line shows a short-wrapped key),
+# in a YAML block, as JSON and JSON in JSON (a tab written out as ``\t``), its
+# first lines alone, and under a quoted assignment.
+_SPACED_KEY_TEXTS = [
+    (SPACED_KEY, "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 8, " "), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 4, "\t"), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 2, " \t"), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 1, " "), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 8, "   "), "***REDACTED***"),
+    (_rewrap(PRIVATE_KEY, 8).replace("\n", " \n"), "***REDACTED***"),
+    (" ".join(SHORT_WRAPPED_KEY.split("\n")), "***REDACTED***"),
+    (
+        "ssh_key: |\n" + "".join(f"  {line}\n" for line in SPACED_KEY.split("\n")) + "x: 1",
+        "ssh_key: |\n  ***REDACTED***\nx: 1",
+    ),
+    (json.dumps({"key": SPACED_KEY + "\n"}), json.dumps({"key": "***REDACTED***\n"})),
+    (
+        json.dumps(json.dumps({"key": SPACED_KEY})),
+        json.dumps(json.dumps({"key": "***REDACTED***"})),
+    ),
+    ("\n".join(SPACED_KEY.split("\n")[:2]) + "\n$ ", "***REDACTED***\n$ "),
+    (f'DEPLOY_SECRET="{SPACED_KEY}" next', 'DEPLOY_SECRET="***REDACTED***" next'),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    _SPACED_KEY_TEXTS,
+    ids=[
+        "spaces-and-tabs",
+        "eight",
+        "four-tabs",
+        "two-space-and-tab",
+        "one",
+        "several-spaces",
+        "space-before-line-break",
+        "one-line",
+        "yaml-block",
+        "json",
+        "json-in-json",
+        "head",
+        "quoted-env",
+    ],
+)
+def test_a_private_key_with_spaces_between_short_runs_is_redacted_whole(text, expected):
+    """#285 review, round 5: a base64 decoder skips spaces and tabs, so a
+    key whose body has one after every eight characters is a valid key, and
+    one a progress line joined into one line is one still, but a space
+    parted two runs of key material: the block reached the run log whole and
+    passed every published-content and commit-message check. Sixteen
+    characters parted by spaces and tabs are material where they mix case
+    and hold a digit, a ``+`` or a ``/``."""
+    out = redact(text)
+    assert out == expected
+    assert "MIIEFAKE" not in out and SHORT_WRAPPED_KEY_LINE not in out
+    assert credential_classes(text) == ("private-key",)
+    assert redact(expected) == expected
+
+
+# Not key material though spaces part it (#285 review, round 5): the words of
+# a placeholder, 16 letters and more, in lower case, in title case and with a
+# digit but no upper-case letter, a hex dump in either case, and a key's
+# runs parted by a blank line.
+_SPACED_PEM_NEAR_MISSES = [
+    f"{PEM_BEGIN}\npaste your key here\n{PEM_END}",
+    f"{PEM_BEGIN}\nPaste Your Private Key Here\n{PEM_END}",
+    f"{PEM_BEGIN}\nyour ed25519 key goes here\n{PEM_END}",
+    f"{PEM_BEGIN}\n00 1a 2b 3c 4d 5e 6f 70 81 92 a3 b4\n{PEM_END}",
+    f"{PEM_BEGIN}\n00 1A 2B 3C 4D 5E 6F 70 81 92 A3 B4\n{PEM_END}",
+    f"{PEM_BEGIN} the key's lines go here, then the END line {PEM_END}",
+    f"{PEM_BEGIN}\nMIIE FAKE\n\ndumm y0pr\n{PEM_END}",
+]
+
+
+@pytest.mark.parametrize("text", _SPACED_PEM_NEAR_MISSES)
+def test_a_near_miss_of_a_spaced_private_key_is_left(text):
+    assert redact(text) == text
+    assert credential_classes(text) == ()
+
+
 # Not a private key: a public key, a certificate, a label in lower case or
 # behind four dashes, and a BEGIN line with no key material after it (alone,
 # quoted by code or prose, an empty block, a placeholder). Material joined
@@ -804,6 +900,15 @@ def test_a_private_key_block_is_replaced_before_any_pattern_takes_a_slice():
         PEM_BEGIN + "a\n" * 500_000,
         PEM_BEGIN + ("\\n" * 7 + "a") * 100_000,
         (PEM_BEGIN + "\n" + "aaaa\n" * 4 + "-" * 4) * 20_000,
+        # Round 5: runs parted by spaces and tabs that are no material, each
+        # failing at its third kind, the last of its 16, or a non-base64
+        # character; and every run a candidate's start.
+        PEM_BEGIN + "a1 " * 333_333,
+        PEM_BEGIN + "aB\t" * 333_333,
+        PEM_BEGIN + ("aB1 " * 3 + "aB1.") * 60_000,
+        (PEM_BEGIN + " aB1" * 3 + "-" * 4) * 30_000,
+        PEM_BEGIN + ("a" * 15 + "1 ") * 60_000,
+        PEM_BEGIN + ("aB1\\t" * 3 + "!") * 50_000,
     ],
     ids=[
         "begin-lines",
@@ -820,6 +925,12 @@ def test_a_private_key_block_is_replaced_before_any_pattern_takes_a_slice():
         "one-character-lines",
         "written-out-breaks",
         "short-wrapped-near-end-lines",
+        "spaced-no-upper-case",
+        "tabbed-no-digit",
+        "spaced-short-of-16",
+        "spaced-near-end-lines",
+        "spaced-digit-at-the-end",
+        "written-out-tabs",
     ],
 )
 def test_the_private_key_pattern_stays_linear(text):
@@ -1459,7 +1570,6 @@ _YAML_NEAR_MISSES = [
     "api_token:\n  ~",
     "client_secret:\n  [REDACTED]",
     "client_secret:\n  ```\n  x\n  ```",
-    "client_secret:\n  &anchor x",
     "client_secret:\n  ***REDACTED***",
     "client_secret: |\n  ***REDACTED***",
 ]
@@ -1644,6 +1754,261 @@ def test_a_value_the_fourth_review_rules_leave_is_left(text):
     assert credential_classes(text) == ()
 
 
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [c[1:] for c in WHOLE_VALUES_285_R5],
+    ids=[c[0] for c in WHOLE_VALUES_285_R5],
+)
+def test_a_value_the_fifth_285_review_found_is_redacted_whole_as_text_and_as_json(text, body):
+    """#285 review, round 5: a quoted value whose opening quote ends its line
+    and whose next line starts with the quote doubled (R5-F1), a plain
+    scalar whose first line holds a double quote and that goes on below its
+    key's line (R5-F2), and a scalar after an anchor or a tag (R5-F5) were
+    kept whole or in part. Each goes whole, as text and as JSON, JSON in JSON
+    and three deep write it, the JSON still decodes to what redacting the
+    text gives, and the output is stable and within the growth bound."""
+    name = next(name for name, case, _ in WHOLE_VALUES_285_R5 if case == text)
+    assert redact(text) == WHOLE_VALUES_285_R5_REDACTED[name]
+    for depth in (0, 1, 2, 3):
+        escaped = _json_string(text, depth)
+        out = redact(escaped)
+        assert body not in out and "FAKE" not in out, out
+        assert credential_classes(escaped) == ("credential-suffix-assignment",)
+        assert redact(out) == out and credential_classes(out) == ()
+        assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == WHOLE_VALUES_285_R5_REDACTED[name]
+    assert redact_obj({"env": {"text": text}}) == {"env": {"text": redact(text)}}
+
+
+# A quoted value whose opening quote ends its line and whose next line
+# starts with that quote doubled (#285 review, round 5, R5-F1), each with
+# what ``redact`` makes of it: under a well-known, an upper-case, a lower-case
+# and a mixed-case name, each quote (a doubled double quote is a shell's two
+# strings joined), indented, a doubled quote alone, going on to more lines,
+# below a YAML key, after an anchor, a quote escaped with a backslash, and in
+# a CRLF file.
+_DOUBLED_QUOTE_AFTER_BREAK = [
+    ("GH_TOKEN='\n''FAKE'", "GH_TOKEN='***REDACTED***'"),
+    ('GITHUB_TOKEN="\n""FAKE"', 'GITHUB_TOKEN="***REDACTED***"'),
+    ("GEMINI_API_KEY: '\n  ''FAKE'", "GEMINI_API_KEY: '***REDACTED***'"),
+    ("client_secret: '\n''FAKE'", "client_secret: '***REDACTED***'"),
+    ("Db_Password = '\n''FAKE it''s'", "Db_Password = '***REDACTED***'"),
+    ("x_token: '\n  '''", "x_token: '***REDACTED***'"),
+    ("x_token: '\n''FAKE\n  FAKE'\nnext: 1", "x_token: '***REDACTED***'\nnext: 1"),
+    ("client_secret:\n  '\n  ''FAKE'", "client_secret:\n  '***REDACTED***'"),
+    ("GH_TOKEN:\n  '\n  ''FAKE'", "GH_TOKEN:\n  '***REDACTED***'"),
+    ("client_secret: &cs '\n''FAKE'", "client_secret: &cs '***REDACTED***'"),
+    ('x_token="\n\\"FAKE"', 'x_token="***REDACTED***"'),
+    ("X_SECRET='\r\n''FAKE'\r\nnext", "X_SECRET='***REDACTED***'\r\nnext"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _DOUBLED_QUOTE_AFTER_BREAK, ids=[t for t, _ in _DOUBLED_QUOTE_AFTER_BREAK]
+)
+def test_a_value_whose_next_line_starts_with_a_doubled_quote_is_redacted_whole(text, expected):
+    """#285 review, round 5: the doubled quote that starts the line after a
+    value's opening quote was taken for the value's close, so the value held
+    nothing and the whole of it passed every check. A doubled quote is an
+    escaped one, so the value holds it and is replaced whole."""
+    assert redact(text) == expected
+    assert credential_classes(text) != ()
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    assert "FAKE" not in redact(text)
+
+
+# A plain scalar whose first line holds a quote and that goes on below its
+# key's line (#285 review, round 5, R5-F2), each with what ``redact`` makes
+# of it: a double and a single quote, under a well-known, an upper-case and a
+# mixed-case name, quotes and a backtick and a blank line, in a sequence
+# entry, after OpenCode's ANSI escape, written out, after an anchor and in a
+# CRLF file. A YAML text in a string that a quote opens before its key is
+# read as before: that quote closes the string, so a line after it is no
+# continuation, and the text around the value stays.
+_QUOTE_IN_FIRST_LINE = [
+    ('client_secret: FAKE"first\n  FAKE', "client_secret: ***REDACTED***"),
+    ("client_secret: FAKE'first\n  FAKE", "client_secret: ***REDACTED***"),
+    ('GH_TOKEN: FAKE"first\n  FAKE', "GH_TOKEN: ***REDACTED***"),
+    ('GEMINI_API_KEY: FAKE"a"b\n  FAKE', "GEMINI_API_KEY: ***REDACTED***"),
+    ('Db_Password: FAKE `x` "y"\n\n  FAKE\nnext: 1', "Db_Password: ***REDACTED***\nnext: 1"),
+    ('- x_token: FAKE"first\n    FAKE\n  next: 1', "- x_token: ***REDACTED***\n  next: 1"),
+    ('\x1b[0mx_token: FAKE"first\n  FAKE', "\x1b[0mx_token: ***REDACTED***"),
+    ('x\\nx_token: FAKE\\"first\\n  FAKE\\nnext: 1', "x\\nx_token: ***REDACTED***\\nnext: 1"),
+    ('client_secret: &a FAKE"first\n  FAKE', "client_secret: &a ***REDACTED***"),
+    ('x_token: FAKE"first\r\n  FAKE\r\nnext: 1', "x_token: ***REDACTED***\r\nnext: 1"),
+    ('[\n  "x_token: FAKE",\n  "other"\n]', '[\n  "x_token: ***REDACTED***",\n  "other"\n]'),
+    ('{"a": "x_token: FAKE", "b": 1}\n  next', '{"a": "x_token: ***REDACTED***", "b": 1}\n  next'),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _QUOTE_IN_FIRST_LINE, ids=[t for t, _ in _QUOTE_IN_FIRST_LINE]
+)
+def test_a_plain_scalar_whose_first_line_holds_a_quote_is_redacted_whole(text, expected):
+    """#285 review, round 5: a quote in a plain scalar is a character like
+    any other, but its first line held none, so the name's rule took the
+    word before the quote and the rest of the line and the lines below stayed
+    in the clear. The first line's break is found first and the line read as
+    the lines after it are, so the value goes whole."""
+    assert redact(text) == expected
+    assert credential_classes(text) != ()
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    assert "FAKE" not in redact(text)
+
+
+# A block or a plain scalar below a key in a YAML sequence entry (#285
+# review, round 5, R5-F4), each with what ``redact`` makes of it: a literal
+# and a folded block, nested dashes, a dash with several spaces after it, an
+# indented sequence, a plain scalar below the key and one that starts on its
+# line, under a well-known name, as a quoted key, a block indented one more
+# than the key, a next entry of the outer sequence, and written out. The
+# sibling entry at the key's column stays.
+_SEQUENCE_SIBLINGS = [
+    (
+        "- x_token: |\n    FAKE\n  endpoint: https://example.test\n",
+        "- x_token: |\n    ***REDACTED***\n  endpoint: https://example.test\n",
+    ),
+    (
+        "- x_token: >-\n    FAKE1\n    FAKE2\n  endpoint: e",
+        "- x_token: >-\n    ***REDACTED***\n  endpoint: e",
+    ),
+    (
+        "- - x_token: |\n      FAKE\n    endpoint: e",
+        "- - x_token: |\n      ***REDACTED***\n    endpoint: e",
+    ),
+    (
+        "-   x_token: |\n      FAKE\n    endpoint: e",
+        "-   x_token: |\n      ***REDACTED***\n    endpoint: e",
+    ),
+    (
+        "  - x_token: |\n      FAKE\n    endpoint: e",
+        "  - x_token: |\n      ***REDACTED***\n    endpoint: e",
+    ),
+    ("- x_token:\n    FAKE\n  endpoint: e", "- x_token:\n    ***REDACTED***\n  endpoint: e"),
+    ("- x_token: FAKE1\n    FAKE2\n  endpoint: e", "- x_token: ***REDACTED***\n  endpoint: e"),
+    ("- GH_TOKEN: |\n    FAKE\n  endpoint: e", "- GH_TOKEN: |\n    ***REDACTED***\n  endpoint: e"),
+    (
+        '- "x_token": |\n    FAKE\n  endpoint: e',
+        '- "x_token": |\n    ***REDACTED***\n  endpoint: e',
+    ),
+    ("- x_token: |\n   FAKE\n  endpoint: e", "- x_token: |\n   ***REDACTED***\n  endpoint: e"),
+    (
+        "- - x_token: |\n      FAKE\n  - endpoint: e",
+        "- - x_token: |\n      ***REDACTED***\n  - endpoint: e",
+    ),
+    (
+        json.dumps("- x_token: |\n    FAKE\n  endpoint: e"),
+        json.dumps("- x_token: |\n    ***REDACTED***\n  endpoint: e"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _SEQUENCE_SIBLINGS, ids=[t for t, _ in _SEQUENCE_SIBLINGS]
+)
+def test_a_value_in_a_sequence_entry_stops_at_its_siblings(text, expected):
+    """#285 review, round 5: a value's lines had to be indented more than
+    the whitespace before a sequence's dashes, not more than the key after
+    them, so the next entry of the same mapping went with a block, the
+    diagnostic lost. The key's column counts the dashes now."""
+    assert redact(text) == expected
+    assert credential_classes(text) != ()
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    assert "FAKE" not in redact(text)
+
+
+# A scalar after an anchor or a tag (#285 review, round 5, R5-F5), each with
+# what ``redact`` makes of it: quoted and plain on the key's line, a tag, a
+# quoted value after one, both properties, a verbatim and a non-specific
+# tag, under a well-known, an upper-case, an OAuth and a generic name; below
+# the key, quoted and plain, a single character; properties alone on the
+# key's line before a value below it, before a block, a plain scalar that
+# goes on and a quote that ends its line; under a well-known name below the
+# key, as a quoted key, after OpenCode's ANSI escape and in a sequence entry.
+# The properties stay.
+_YAML_PROPERTY_VALUES = [
+    ("client_secret: &cs 'FAKE'", "client_secret: &cs '***REDACTED***'"),
+    ("client_secret: &cs FAKE", "client_secret: &cs ***REDACTED***"),
+    ("client_secret: !!str FAKE", "client_secret: !!str ***REDACTED***"),
+    ("client_secret: !!str 'FAKE two'", "client_secret: !!str '***REDACTED***'"),
+    ("client_secret: &a !!str FAKE", "client_secret: &a !!str ***REDACTED***"),
+    (
+        "client_secret: !<tag:yaml.org,2002:str> FAKE",
+        "client_secret: !<tag:yaml.org,2002:str> ***REDACTED***",
+    ),
+    ("client_secret: ! FAKE", "client_secret: ! ***REDACTED***"),
+    ("GH_TOKEN: &t 'FAKE'", "GH_TOKEN: &t '***REDACTED***'"),
+    ("GEMINI_API_KEY: !!str FAKE", "GEMINI_API_KEY: !!str ***REDACTED***"),
+    ("refresh_token: !!str FAKE", "refresh_token: !!str ***REDACTED***"),
+    ("password: &p FAKE0opaque0value", "password: &p ***REDACTED***"),
+    ("client_secret:\n  &cs 'FAKE'", "client_secret:\n  &cs '***REDACTED***'"),
+    ("client_secret:\n  !!str FAKE", "client_secret:\n  !!str ***REDACTED***"),
+    ("client_secret:\n  &anchor x", "client_secret:\n  &anchor ***REDACTED***"),
+    ("client_secret: &a\n  FAKE", "client_secret: &a\n  ***REDACTED***"),
+    ("client_secret: &a |\n  FAKE", "client_secret: &a |\n  ***REDACTED***"),
+    ("client_secret: !!binary |\n  FAKE", "client_secret: !!binary |\n  ***REDACTED***"),
+    ("client_secret: &a FAKE1\n  FAKE2", "client_secret: &a ***REDACTED***"),
+    ("client_secret: &a '\n  FAKE'", "client_secret: &a '***REDACTED***'"),
+    ("GH_TOKEN:\n  &t 'FAKE'", "GH_TOKEN:\n  &t '***REDACTED***'"),
+    ('"client_secret": &cs "FAKE"', '"client_secret": &cs "***REDACTED***"'),
+    ("\x1b[0mclient_secret: !!str FAKE", "\x1b[0mclient_secret: !!str ***REDACTED***"),
+    ("- api_token: &t FAKE", "- api_token: &t ***REDACTED***"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _YAML_PROPERTY_VALUES, ids=[t for t, _ in _YAML_PROPERTY_VALUES]
+)
+def test_a_scalar_after_an_anchor_or_a_tag_is_redacted_whole(text, expected):
+    """#285 review, round 5: an anchor and a tag are properties of the
+    scalar after them, but they were taken for another node, so the value
+    after them passed every check, or, the tag taken for the value, stayed
+    after its marker. The properties stay and the scalar is replaced."""
+    assert redact(text) == expected
+    assert credential_classes(text) != ()
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    assert "FAKE" not in redact(text)
+
+
+# What stays (#285 review, round 5): a doubled quote that starts no value (a
+# string that closes its line, then code on the next), a quote alone after
+# the break; a placeholder block or scalar in a sequence entry with a sibling
+# after it; a plain scalar of several lines whose first word is code, a quote
+# after it; and after an anchor or a tag, a nested mapping or sequence, a
+# reference to another file's entry or to the environment (Home Assistant's
+# ``!secret``, a loader's ``!ENV``), a placeholder, and a Rust reference type,
+# whose ``&`` is no anchor.
+_R5_NEAR_MISSES = [
+    "msg = 'export DB_PASSWORD='\n''.join(parts)",
+    "x_token = '\n'",
+    "GH_TOKEN='\n'\n'next'",
+    "- x_token: |\n    ${{ secrets.X }}\n  endpoint: e",
+    "- - x_token: >-\n      <x-token>\n    endpoint: e",
+    "- x_token:\n    $X_TOKEN\n  endpoint: e",
+    'api_token: str = f"{x}"\n  more',
+    "client_secret: &defaults\n  key: value",
+    "client_secret:\n  &a key: value",
+    "client_secret: &cs\n  - a\n  - b",
+    "client_secret: !secret app_client_secret",
+    "client_secret:\n  !secret app_client_secret",
+    "db_password: !env_var DB_PASSWORD",
+    "api_token: !ENV ${API_TOKEN}",
+    "client_secret: !!str ${{ secrets.X }}",
+    "fn f(api_token: &str) -> bool",
+    "fn f(api_token: &'a str, x: i32)",
+    "fn f(api_token: &mut String)",
+]
+
+
+@pytest.mark.parametrize("text", _R5_NEAR_MISSES)
+def test_a_value_the_fifth_review_rules_leave_is_left(text):
+    assert redact(text) == text
+    assert credential_classes(text) == ()
+
+
 # An OAuth name is a prefixed name too (#285 review, round 3, R3-F3):
 # ``oauth-assignment`` takes its value first and ``credential-suffix-
 # assignment`` what it left. The OAuth value ran on over a full stop, a
@@ -1783,6 +2148,14 @@ _MEET_SEPARATORS = [
     ":\n  # c\n  ",
     ": x\n  ",
     ": |\n  12\n  ",
+    # Round 5: properties, a doubled quote after a quote's line break, a
+    # quote in a plain scalar's first line.
+    ": &a ",
+    ": !!str ",
+    ":\n  &a ",
+    ": &a |\n  ",
+    ": '\n''",
+    ': x"y\n  ',
 ]
 _MEET_PIECES = [
     *"aZ09,.:)]}`&;\\\"' \n#=%$!*-_/+|>{[",
@@ -1804,6 +2177,11 @@ _MEET_PIECES = [
     "\n\n  ",
     "12345\n  ",
     "${{ s }}",
+    "''",
+    "&a ",
+    "!!str ",
+    "\t",
+    "\n    ",
 ]
 _MEET_LEADS = [
     "",
@@ -1819,6 +2197,7 @@ _MEET_LEADS = [
     '"',
     "if ",
     "  - ",
+    "- - ",
 ]
 
 
@@ -2171,6 +2550,57 @@ def test_the_fourth_review_patterns_stay_linear(text):
     YAML key's candidate reads the blank and comment lines before its value
     and the blank lines among its lines once, and a block's placeholder
     check its lines once more. A megabyte of each is redacted well inside
+    the budget, and the output is stable."""
+    started = time.process_time()
+    out = redact(text)
+    assert time.process_time() - started < 3.0
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A plain scalar's first line holding quotes: the break's scan from
+        # every quote-led key to the next one's ``: `` on one line, a line of
+        # quotes that goes on and one that does not, a quote-led key whose
+        # string closes, and a line written out behind many backslashes.
+        ('"a_token: x' * 1_000 + "\n") * 100,
+        ("a_token: " + 'x"' * 50 + "\n  y\n") * 10_000,
+        ("a_token: " + 'x"' * 100 + "\n") * 5_000,
+        ('"a_token: ' + "x" * 100 + '"\n  y\n') * 10_000,
+        ("a_token: x" + "\\" * 100 + '"\\n  y\n') * 10_000,
+        # Properties: many on a line, an anchor before nothing, a long tag
+        # below a key, and a doubled quote after a quote's line break.
+        ("a_token: &a !b " * 1_000 + "\n") * 100,
+        ("a_token: &" + "a" * 100 + "\n") * 10_000,
+        ("a_token:\n  !" + "x" * 100 + " y\n") * 10_000,
+        ("a_token='\n''" + "\n") * 100_000,
+        # Sequence dashes past the widths told apart, every width, and one
+        # long line of dashes.
+        ("- " * 20 + "a_token: |\n" + " " * 50 + "x\n") * 10_000,
+        "".join("- " * n + "a_token: |\n" + "  " * (n + 1) + "x\n" for n in range(1, 20)) * 1_000,
+        "- " * 500_000 + "a_token: |\n x",
+    ],
+    ids=[
+        "quote-led-keys-on-a-line",
+        "quotes-then-a-line",
+        "quotes-and-no-line",
+        "quote-led-closed-string",
+        "written-out-backslash-runs",
+        "properties-on-a-line",
+        "anchor-before-nothing",
+        "long-tag-below",
+        "doubled-quote-after-break",
+        "wide-dashes",
+        "every-width",
+        "a-line-of-dashes",
+    ],
+)
+def test_the_fifth_review_patterns_stay_linear(text):
+    """#285 review, round 5: a plain scalar's first line is scanned once to
+    its break, which a mapping's ``: `` stops, so the next candidate's key
+    ends it; a property is read once; the dashes before a key are told
+    apart by their width once. A megabyte of each is redacted well inside
     the budget, and the output is stable."""
     started = time.process_time()
     out = redact(text)
@@ -3120,8 +3550,18 @@ _WORST_CASE_UNITS = {
     "yaml_value_continued": "a_token: x\n y\n",
     "yaml_value_continued_well_known_name": "HF_TOKEN: x\n y\n",
     "credential_suffix_assignment_doubled_quote": "a_token='''' ",
+    # Round 5: a scalar after an anchor, which stays, 14 to 27; a quoted
+    # value whose next line starts with the quote doubled, 14 to 25; a plain
+    # scalar whose first line holds a quote, 15 to 24; a value in a sequence
+    # entry, its dashes and indentation making it longer, 16 to 29.
+    "yaml_property_value": "a_token: &a x\n",
+    "quoted_from_next_line_doubled_quote": "a_token='\n'''\n",
+    "yaml_value_continued_quote": 'a_token: x"\n y\n',
+    "yaml_value_in_a_sequence": "- a_token:\n   x\n",
     # The BEGIN line and 16 characters of key material, its floor: 44 to 15.
     "private_key": "-----BEGIN" + " PRIVATE KEY-----" + "a" * 16 + " ",
+    # Its material parted by spaces (round 5), longer still: 48 to 16.
+    "private_key_spaced": "-----BEGIN" + " PRIVATE KEY-----" + "aB1a " * 4 + " ",
     "gitlab_pat": "gl" + "pat-" + "a" * 20 + " ",
     "aws_access_key_id": "AKI" + "A" * 17 + " ",
     "groq_api_key": "gs" + "k_" + "a" * 20 + " ",
@@ -3297,6 +3737,14 @@ _CREDENTIAL_CORPUS = [
     *(text for text, _ in _YAML_VALUES_R4),
     *(text for text, _ in _QUOTED_FROM_NEXT_LINE),
     *_R4_NEAR_MISSES,
+    *(text for _, text, _ in WHOLE_VALUES_285_R5),
+    *(text for text, _ in _DOUBLED_QUOTE_AFTER_BREAK),
+    *(text for text, _ in _QUOTE_IN_FIRST_LINE),
+    *(text for text, _ in _SEQUENCE_SIBLINGS),
+    *(text for text, _ in _YAML_PROPERTY_VALUES),
+    *_R5_NEAR_MISSES,
+    *(text for text, _ in _SPACED_KEY_TEXTS),
+    *_SPACED_PEM_NEAR_MISSES,
     *(text for text, _ in _OAUTH_AND_SUFFIX_VALUES),
     *(text for text, _ in _URL_CREDENTIAL_CASES),
     *_URLS_WITHOUT_USERINFO,

@@ -96,10 +96,19 @@ def clean(value: object, limit: int) -> str:
     """``value`` as one safe, bounded line: stripped, redacted, then clipped.
 
     A non-string is empty; a string longer than :data:`MAX_RAW_CHARS` is an
-    ellipsis. Escape sequences go first, then every control (C0, C1, DEL),
-    format (bidirectional overrides, zero-width characters) and line or
-    paragraph separator character; whitespace controls become spaces. The
-    result is redacted and only then clipped to ``limit`` characters.
+    ellipsis. Escape sequences go first, then every control (C0, C1, DEL)
+    but the whitespace ones and every format character (bidirectional
+    overrides, zero-width characters); a line or paragraph separator becomes
+    a line break. The text is redacted with its line breaks and tabs, then
+    each run of whitespace becomes one space and the line is redacted again,
+    and only then clipped to ``limit`` characters.
+
+    Redaction reads a value's lines (#285 review, round 5): a private key
+    wrapped in short lines, a YAML value below its key or a block scalar is
+    recognised by where its lines break, and the line made of them before
+    redaction kept some of them whole (a short-wrapped key's lines became
+    words of prose). The second redaction finds what only the joined line
+    shows, as the one redaction used to.
     """
     if not isinstance(value, str) or limit <= 0:
         return ""
@@ -111,14 +120,15 @@ def clean(value: object, limit: int) -> str:
         category = unicodedata.category(ch)
         if category == "Cc":
             if ch in "\t\n\r\v\f":
-                kept.append(" ")
+                kept.append(ch)
         elif category in ("Zl", "Zp"):
-            kept.append(" ")
+            kept.append("\n")
         elif category == "Cs":
             kept.append("�")
         elif category != "Cf":
             kept.append(ch)
-    text = _SPACES.sub(" ", redact("".join(kept))).strip()
+    text = redact(_SPACES.sub(" ", redact("".join(kept))))
+    text = _SPACES.sub(" ", text).strip()
     if len(text) > limit:
         text = text[: limit - 1].rstrip() + ELLIPSIS
     return text

@@ -26,11 +26,16 @@ so.
   ([Secrets and logging](docs/agent-guides/secrets-and-logging.md#the-remaining-credential-shapes-285)).
 - A private-key block is replaced whole, its BEGIN and END lines with it,
   also when its body is wrapped in lines shorter than 16 characters (a key
-  rewrapped with `fold -w 8` is still a valid key). One whose END line is
+  rewrapped with `fold -w 8` is still a valid key), or has spaces and tabs
+  between short runs, which a base64 decoder skips (16 characters parted so
+  must mix case and hold a digit, a `+` or a `/`, so the words of a
+  placeholder stay). One whose END line is
   missing (a capture cut inside the key) loses its BEGIN line and the body
   after it, and may take a line of words that follows the body. A BEGIN
   line with no key material after it, a public key and a certificate are
-  left, so text about the format stays publishable.
+  left, so text about the format stays publishable. A live progress line
+  now redacts its text before it joins its lines, so a key wrapped in short
+  lines, or a YAML value told by its lines, no longer shows in it.
 - A quoted value under a credential name, well-known or prefixed, is
   redacted whole, up to its closing quote (`DB_PASSWORD="two words; more"`),
   where it stopped at the first space or semicolon before and left the
@@ -39,7 +44,8 @@ so.
   lines, as a shell or YAML string does, whatever they hold: blank lines,
   the other quote character and backticks too, and it may start with a line
   break (`GH_TOKEN="` on one line, the value on the next) where its name
-  stands outside every string its line opens. A quote in code or prose
+  stands outside every string its line opens, and that next line may start
+  with the quote doubled. A quote in code or prose
   that opens no value does not take the lines after it: one that a word
   follows, one that ends its line inside a string literal
   (`help = "Set GITHUB_TOKEN="`), and one after a name that starts a
@@ -50,8 +56,11 @@ so.
   quoted scalar, also past blank and comment lines and with blank lines
   among its lines, a literal `|` or folded `>` block, an Ansible
   `!vault |`), and a plain scalar that starts on the key's line and goes on
-  below it, are redacted whole, under a lower-case name too, where only a
-  value on the key's line was before; a statement that ends in a colon
+  below it, quotes in its first line too, are redacted whole, under a
+  lower-case name too, where only a value on the key's line was before. A
+  YAML anchor or tag before a value (`&cs`, `!!str`) is kept and the scalar
+  after it replaced, and in a sequence entry (`- x_token: |`) the value
+  stops at the mapping's next entry, which stays; a statement that ends in a colon
   (`if api_token:`), a nested mapping and, under a lower-case name, a value
   that reads as code (`${{ secrets.X }}`, `process.env.X`) are left. A
   block is a string whatever its lines hold, so one that starts with a
