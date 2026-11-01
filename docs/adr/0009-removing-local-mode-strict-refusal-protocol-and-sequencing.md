@@ -18,7 +18,11 @@
     D12's steps and exit tests, and the proposals of §5.
   - *Not decided here:* the state protocol's number (#23, when #388's PR
     is ready to merge, D8) and the order of EPIC #383 against the Public
-    Alpha's release candidate (§5.2).
+    Alpha's release candidate (§5.2). The maintainer decided that order on
+    #255 on 2026-10-30, after §5.2 was written: option 1, the removal
+    before the release candidate, with C7 reading "LOCAL mode: Removed.
+    Not advertised or supported in Public Alpha." (§5.2's closing note,
+    C.9).
   - *Implementation:* S1a (#386), S1b (#385), S2 (#387) and S3 (#388). S4
     (#389) recorded the measurement, the regression, the installed
     package's checks, the attestation of A.2.4 and the documentation audit
@@ -846,7 +850,8 @@ content is the warning, for the users of one pre-Alpha upload.
 - **The protocol bump meets another persisted change.** The numbering rule
   already settles it: whichever merges second takes the next number.
 - **The order against the Public Alpha is undecided** (§5.2). Until it is
-  decided, whichever lands first must leave #255's C7 wording true.
+  decided, whichever lands first must leave #255's C7 wording true. (The
+  maintainer decided it on 2026-10-30: option 1, §5.2's closing note.)
 - **The inventory is a snapshot of `02ce244`.** A LOCAL reference added
   after it is not in Appendix A. Each step re-greps before it merges, and
   S3's structural test catches what is left.
@@ -982,6 +987,16 @@ proposal for that decision is
 [a comment on #255](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6531809299).
 It counts as made once the controller has verified that comment on #255
 (§5), and it is not posted again.
+
+**Decided on 2026-10-30, after this section was written.** The maintainer
+chose [option 1](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6533695132),
+the removal before the release candidate, not the option recommended
+above, and decided
+[C7](https://github.com/iceboundrock/AutoForge/issues/255#issuecomment-6533713412)
+as "LOCAL mode: Removed. Not advertised or supported in Public Alpha.",
+which #255's C7 row now records. That wording, not the proposed one
+above, is C7. The text above stays as what was proposed; C.9 says what S4
+found on `main` against the decision.
 
 ### 5.3 EPIC #383: steps, workstreams and dependencies
 
@@ -1995,7 +2010,7 @@ On `ccd1910`, this step's code, tests and documents after the first
 review of PR #425 (R1-F2 to R1-F4), with C.5, C.7 and C.9 still to be
 written. It ran on 2026-11-01 between 00:34 and 01:03 UTC, from a clone of
 its own on C.1's host, with `UV_OFFLINE=1`. The commit that lands differs
-from it in this appendix's text only;
+from it in this record's text only;
 `tests/test_removal_attestation.py`, which reads that text,
 `tests/test_packaging.py` and the linters ran again on it. The three
 pytest runs ran at the same time, two serial suites to a core, so their
@@ -2330,25 +2345,54 @@ entries and the ADRs, which are history (D10, D11).
   §5.3 and the coordination comments of §5: #155's amendment note and
   #255's proposal. The agent that wrote this appendix holds no GitHub
   credential and reads only what the controller hands it, #389 alone
-  (ADR 0004 D10), so it verified none of them. `main`'s history shows
-  that the PRs of the decision and of S1a to S3 merged: #406 for #384
-  (`d6c4838`), #409 for #385 (`06ea254`), #410 for #386 (`a4bc60c`),
-  #413 for #387 (`aee704e`) and #421 for #388 (`3eb68ac`). For the rest,
-  PR #425's first fix round
-  asks the operator for three notes. The controller verifies each on its
-  issue before that round's commits are pushed, and the next review
-  judges them:
-  - on #383, the native parent, `blocked_by` links and states of #384 to
-    #389, as the operator read them back before posting;
-  - on #155, §5.1's amendment with S2 and S3 on `main`, which supersedes
-    or gives the REMOTE form of each LOCAL line;
-  - on #255, how C7 reads with LOCAL removed from `main`, beside §5.2's
-    proposal, which stays the maintainer's decision.
+  (ADR 0004 D10), so it verified none of them itself. `main`'s history
+  shows that the PRs of the decision and of S1a to S3 merged: #406 for
+  #384 (`d6c4838`), #409 for #385 (`06ea254`), #410 for #386 (`a4bc60c`),
+  #413 for #387 (`aee704e`) and #421 for #388 (`3eb68ac`). The rest is
+  evidenced by three notes PR #425's first fix round asked the operator
+  for. The controller verifies each on its issue before that round's
+  commits are pushed, and the next review judges them:
+  - on #383,
+    [a note](https://github.com/iceboundrock/AutoForge/issues/383#issuecomment-6552134554)
+    with the native parent, `blocked_by` links and states of #384 to #389,
+    as the operator read them back before posting it. The controller
+    verified it as posted exactly as prepared;
+  - on #155,
+    [a note](https://github.com/iceboundrock/AutoForge/issues/155#issuecomment-6552134735)
+    with §5.1's amendment now that S2 and S3 are on `main`, which
+    supersedes or gives the REMOTE form of each LOCAL line. Verified the
+    same way;
+  - on #255, a note that cites the maintainer's two decisions of
+    2026-10-30 (§5.2's closing note) and says what S4 found on `main`
+    against them, below. It does not reopen the order.
 
   An operator who finds a link, a state or a comment other than a note
   says declines that note, and the difference comes back to this record.
-  Until the controller has verified all three, this part of S4 is not
-  done. Nothing here edits C7 or any gate.
+  That happened once. The round's first note on #255 was written before
+  this record knew of the decisions: it applied option 3, quoted §5.2's
+  proposed C7 and said C7 was undecided. The operator declined it, since
+  posting it would have misstated a recorded decision, and named the two
+  decision comments. This record took them from that reason, with their
+  links, and was brought into line (the header, §4, §5.2's closing note
+  and this section); the second note replaces the first.
+
+  What S4 found on `main` against the decisions:
+  - **Option 1's prerequisite has landed.** S2 (#387, `aee704e`) and S3
+    (#388, `3eb68ac`) are on `main`, so a release candidate cut from it
+    carries the removal and protocol 13.
+  - **"Not advertised."** C.8's audit found no current document that
+    describes LOCAL as available: `docs/local-mode.md` is gone (S2), and
+    README's "Current maturity", the levels the Public Alpha claims,
+    names LOCAL only as the gone mode of Pi's one live run.
+  - **"Not supported."** The installed wheel and sdist carry no file of
+    LOCAL mode, reject `autoforge local`, refuse a `local:` key, and
+    refuse a `mode: "LOCAL"` state with nothing written (C.7).
+
+  What this record cannot read, and the notes ask nothing of: whether
+  #255 or #383 now carries a link for option 1's order, and what #255's
+  children (#259, #260, #262) say of LOCAL. Nothing here edits C7 or any
+  gate. Until the controller has verified the #255 note, this part of S4
+  is not done.
 - **An independent review.** The security of the removal, the state
   migration and its crash windows are for the review of #389's PR and the
   maintainer's; this appendix records tests and measurements, and is
@@ -2365,5 +2409,6 @@ entries and the ADRs, which are history (D10, D11).
   moved, not which commit moved them.
 - **A release.** Nothing is tagged, published or declared ready. The next
   `0.1.0aN` needs the maintainer's approval, its own Go/No-Go and
-  `docs/releasing.md`'s procedure; whether it is the Public Alpha is §5.2's
-  open question.
+  `docs/releasing.md`'s procedure. Under option 1 the Public Alpha's release
+  candidate carries the removal; whether the next `0.1.0aN` is the Public
+  Alpha is #255's decision, not this record's.
