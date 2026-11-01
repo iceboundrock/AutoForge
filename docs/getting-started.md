@@ -395,8 +395,10 @@ autoforge --config autoforge.yaml run --epic "$epic" --issue "$issue"
 While it runs, do not commit or switch branches in this checkout: the
 controller compares its HEAD and branch around every agent launch, and a
 change stops the run at `BLOCKED`. Uncommitted edits are not part of what
-the agents start from. `Ctrl-C` is safe: `autoforge --config autoforge.yaml
-resume` continues where it stopped.
+the agents start from. `Ctrl-C` leaves the run resumable:
+`autoforge --config autoforge.yaml resume` continues where it stopped, once
+nothing the agent started is still running in its worktree
+([The process was interrupted](troubleshooting.md#the-process-was-interrupted)).
 
 **Status.** From the checkout, at any time:
 
