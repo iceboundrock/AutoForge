@@ -230,8 +230,9 @@ docs/sdk-policy.md                     SDK providers: what a launch may load, to
 docs/configuration.md                  config files, formats, strict key validation, profiles
 docs/compatibility.md                  what AutoForge runs on (OS, Python, git, gh, agent CLIs, sandbox
                                        host, filesystem, provider auth), each claim with its evidence
-docs/development.md                    make targets, CI, the built-distribution check, what a green
-                                       `ci` does and does not prove
+docs/development.md                    make targets, CI, the CI duration report and its regression
+                                       policy, the built-distribution check, what a green `ci` does
+                                       and does not prove
 docs/releasing.md                      distribution name, version and tag scheme, changelog, the
                                        maintainer's release procedure, PyPI Trusted Publishing
                                        (`pypi-publish.yml`) and its one-time setup
