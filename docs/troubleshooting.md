@@ -146,20 +146,35 @@ run blocks before anything of the `FIX` plan is published: the follow-up
 issues and the push of the fixer's commit wait for the comment. The agent
 worktree holds the unpushed commit, so do not reset or remove it.
 
+Each way out is one `unblock`, which needs `--reason`, followed by
+`resume`. An `unblock` with `--approve-action`, `--decline-action` or
+`--bind-evidence` that succeeds has already left `BLOCKED`: run `resume`
+next. Another `unblock` would exit 2, since the run is no longer `BLOCKED`.
+
 - **An acceptance action** (`A-…`, a comment on the run's own issue that
   the controller posts once you approve it). Read the exact bytes with
-  `autoforge status --action A-…`, then `unblock --approve-action A-…`
-  (the next `resume` posts it and pushes), post exactly those bytes
-  yourself and run a plain `unblock`, or `unblock --decline-action A-…`
-  (the fixer runs again with your reason). See
-  [BLOCKED on an acceptance action](usage.md#blocked-on-an-acceptance-action).
+  `autoforge status --action A-…`, then do one of:
+  - approve it: `unblock --approve-action A-… --reason "..."`, then
+    `resume`, which posts it, reads it back and pushes;
+  - post exactly those bytes on the issue yourself, then
+    `unblock --reason "..."` and `resume`, which adopts your comment;
+  - decline it: `unblock --decline-action A-… --reason "..."`, then
+    `resume`, which runs the fixer again with your reason in its prompt.
+
+  See [BLOCKED on an acceptance action](usage.md#blocked-on-an-acceptance-action).
 - **Operator actions** (`X-…`, comments on another issue, which the
-  controller never posts). For each one, post it with
+  controller never posts). Each action needs a comment on its target:
+  post its exact payload with
   `autoforge status --action X-… | gh issue comment <target> --body-file -`,
-  bind a comment already there with `unblock --bind-evidence X-… <comment URL>`,
-  or withdraw them with `unblock --decline-action X-…` (repeatable). Then
-  `unblock` and `resume`. See
-  [BLOCKED on operator actions](usage.md#blocked-on-operator-actions).
+  or bind a comment already there. Then do one of:
+  - when you posted every one: `unblock --reason "..."`, then `resume`;
+  - when you bind any:
+    `unblock --bind-evidence X-… <comment URL> --reason "..."` (one pair
+    per bound action, repeatable), then `resume`;
+  - to withdraw them instead: `unblock --decline-action X-… --reason "..."`
+    (repeatable), then `resume`, which runs the fixer again.
+
+  See [BLOCKED on operator actions](usage.md#blocked-on-operator-actions).
 
 ## State unchanged: an agent launch failed
 
@@ -295,29 +310,45 @@ that `resume` needs `--accept-config-change`.
 
 What happens depends on how the controller was stopped:
 
-- **`Ctrl-C`** in the terminal running `run`, `step` or `resume`: the
-  controller ends the agent's whole process group (SIGTERM, then SIGKILL)
-  before it exits, and Python prints a traceback ending in
-  `KeyboardInterrupt` (exit 130).
+- **`Ctrl-C`** in the terminal running `run`, `step` or `resume`: before
+  it exits, the controller tries to end the agent's process group and, on
+  Linux, the processes the launch orphaned (SIGTERM, then SIGKILL, each
+  with a short grace), and Python prints a traceback ending in
+  `KeyboardInterrupt` (exit 130). That attempt is bounded, and it can leave
+  work running
+  ([ADR 0002 §4b](adr/0002-executor-nothing-outlives-the-invocation.md#4b-amendment-processes-that-leave-the-group-132)):
+  a process stuck in the kernel can outlast the SIGKILL; a descendant that made
+  itself a subreaper, and anything handed to a service manager or another
+  session's process (`systemd-run`, `at`, a container runtime, an SSH
+  host), is out of its reach; off Linux, so is a process that left the
+  group (`setsid`); and a second `Ctrl-C` cuts the teardown short. The
+  interrupted launch's records do not say whether anything survived.
 - **`kill` (SIGTERM), a closed terminal (SIGHUP) or `kill -9`**: the
   controller ends at once and does not stop the agent. Under the default
   `sandbox.mode: disabled` the agent runs in a session of its own, so it,
   or what it started (a test suite, a server), can keep running in the
   issue's worktree: it holds no GitHub credential, so it pushes nothing,
   but it can go on changing the worktree. Under an enforced outer sandbox
-  (`sandbox.mode: required`) it dies with the controller. Look for it
-  before you resume: an agent CLI process (`claude`, `opencode`, `pi`), or
-  a child of one, whose working directory is the issue's worktree (on
-  Linux, `ls -l /proc/<pid>/cwd`). Stop it, or let it finish.
+  (`sandbox.mode: required`) what runs inside the sandbox dies with the
+  controller.
 - **A reboot** ends both.
 - **A closed laptop** suspends both. What follows when it wakes is not
   verified ([Known limitations](#known-limitations)); if the run stopped,
   it stopped in one of the ways this guide describes, and recovers the
   same way.
 
-In every case the lock is released by the kernel when the controller's
-process ends, so there is no lock file to remove. Then run
-`autoforge status` (with the run's flags) to see the phase, and `resume`.
+Whatever stopped the controller, look for what is still running before
+you `resume` or remove the worktree: an agent CLI process (`claude`,
+`opencode`, `pi`), or any process whose working directory is the issue's
+worktree or lies under it (on Linux, `ls -l /proc/<pid>/cwd`), such as a
+test suite or a server the agent started. Stop it, or let it finish. Work
+the agent handed to a service manager or another host does not show up
+this way; if its task could have started some, check there too. A
+`resume` next to a survivor runs a second agent in the same worktree.
+
+The lock is released by the kernel when the controller's process ends, so
+there is no lock file to remove. Then run `autoforge status` (with the
+run's flags) to see the phase, and `resume`.
 The state is written atomically, a launch is recorded before the agent
 starts, and every phase that launches an agent reads its journal and
 GitHub first, so work already done (an open PR, a review comment the
@@ -371,9 +402,13 @@ open to continue it.
 ## Stopping a run safely
 
 A standalone run has no stop command (`epic stop` is the scheduler's).
-Press `Ctrl-C` in its terminal: the agent is stopped with the controller,
-and the phase stays where it was for `resume`. To stop at a step boundary
-instead, run it a step at a time (`step`, or `resume --max-steps N`).
+Press `Ctrl-C` once in its terminal: the controller tries to end the agent
+and what it started before it exits, and the phase stays where it was for
+`resume`. That attempt can leave a process running, so look for one and
+stop it before you `resume` or remove the worktree
+([The process was interrupted](#the-process-was-interrupted)). To stop at
+a step boundary instead, run it a step at a time (`step`, or
+`resume --max-steps N`).
 
 Whatever stopped it, this is what is left, and AutoForge removes none of
 it:
@@ -382,13 +417,14 @@ it:
 |---|---|---|
 | the run | `<state dir>/state.json` | stays in its phase; `resume` continues it, a new `run` replaces it |
 | logs and read context | `<state dir>/logs/`, `<state dir>/read-context/` | kept |
-| the agent worktree | `<repo>/.git/autoforge/worktrees/<n>` | as the last agent left it, uncommitted work included; never deleted, moved or pruned: `git worktree remove` it once the issue is done |
+| the agent worktree | `<repo>/.git/autoforge/worktrees/<n>` | as the last agent left it, uncommitted work included; never deleted, moved or pruned: `git worktree remove` it once the issue is done and nothing still runs in it |
 | sandbox directories | `<repo>/.git/autoforge/sandbox/<n>/` (enforced launches only) | kept; remove them with the worktree |
 | the branch and the PR | GitHub: `autoforge/<n>` and its PR, review comments, follow-up issues | stay open. The controller closes a PR only when a replan replaces it, and deletes a head branch only after merging it itself with `merge.delete_branch` |
 | local branches | none | the controller creates none (agents commit on a detached `HEAD`; the controller pushes to the remote branch) and deletes none |
 
 To abandon an issue: close its PR on GitHub (and delete its branch if you
-like), remove its worktree, and start the next issue with `run` (`--force`
+like), stop anything still running in its worktree, remove the worktree,
+and start the next issue with `run` (`--force`
 when the stopped run is in a working phase).
 
 ## Another controller holds the lock
@@ -627,11 +663,11 @@ have [their own table](usage.md#recovery-and-exit-codes).
 
 | Command | 0 | 1 | 2 |
 |---|---|---|---|
-| `run` | stopped at `READY_FOR_MERGE` or `DONE`, or `--max-steps` spent in a working phase; a dry run | the run ended `BLOCKED` or `FAILED`; an error that left the phase unchanged (an agent failure, a GitHub or verification failure) | a configuration error (the sandbox's capability and the config file's placement included); an existing run it does not replace without `--force`; a state that does not load; the lock held; an issue a scheduler owns |
-| `step` | the step ran and the phase is not `BLOCKED` or `FAILED`; the run is `DONE`; a dry run | the step ended `BLOCKED` or `FAILED`; an error that left the phase unchanged; `READY_FOR_MERGE` with the merge gate closed | the run is `BLOCKED` or `FAILED` (`cannot step from terminal phase`); a configuration that differs from the recorded one, or a weaker `sandbox.mode`, without `--accept-config-change`; no state, or one that does not load; the lock held; an issue a scheduler owns |
-| `resume` | stopped at `READY_FOR_MERGE` (the banner) or `DONE`, or `--max-steps` spent; a dry run | the run is or ends `BLOCKED` or `FAILED`; an error that left the phase unchanged | as `step` |
-| `unblock` | a phase was re-entered (then `resume`); a dry run, whatever it would decide | refused: the run stays `BLOCKED`; an action id that names no waiting action; a GitHub failure | the run is not `BLOCKED`; a malformed action id; a configuration that differs, without `--accept-config-change`; no state, or one that does not load; the lock held; an issue a scheduler owns |
-| `status` | printed | `--action` names no saved action | no state, or one that does not load |
+| `run` | stopped at `READY_FOR_MERGE` or `DONE`, or `--max-steps` spent in a working phase; a dry run | the run ended `BLOCKED` or `FAILED`; an error that left the phase unchanged (an agent failure, a GitHub or verification failure) | a configuration error (the sandbox's capability and the config file's placement included); an existing run it does not replace without `--force`; a state that does not load; the lock held; an issue a scheduler owns, or a `--state-dir` inside the scheduler's root |
+| `step` | the step ran and the phase is not `BLOCKED` or `FAILED`; the run is `DONE`; a dry run | the step ended `BLOCKED` or `FAILED`; an error that left the phase unchanged; `READY_FOR_MERGE` with the merge gate closed | the run is `BLOCKED` or `FAILED` (`cannot step from terminal phase`); a configuration error (the sandbox's capability and the config file's placement included); a configuration that differs from the recorded one, or a weaker `sandbox.mode`, without `--accept-config-change`; no state, or one that does not load; the lock held; an issue a scheduler owns, or a `--state-dir` inside the scheduler's root |
+| `resume` | stopped at `READY_FOR_MERGE` (the banner) or `DONE`, or `--max-steps` spent; a dry run | the run is or ends `BLOCKED` or `FAILED` (a run already `BLOCKED` or `FAILED` is refused with 1, never 2); an error that left the phase unchanged | a configuration error (the sandbox's capability and the config file's placement included); a configuration that differs from the recorded one, or a weaker `sandbox.mode`, without `--accept-config-change`; no state, or one that does not load; the lock held; an issue a scheduler owns, or a `--state-dir` inside the scheduler's root |
+| `unblock` | a phase was re-entered (then `resume`); a dry run, whatever it would decide | refused: the run stays `BLOCKED`; an action id that names no waiting action; a GitHub failure | the run is not `BLOCKED`; a malformed action id; a configuration error; a configuration that differs, without `--accept-config-change`; no state, or one that does not load; the lock held; an issue a scheduler owns |
+| `status` | printed | `--action` names no saved action | a configuration error; no state, or one that does not load |
 | `doctor` | every required check passed (a `WARN` or a skipped check does not fail) | a required check failed | a usage error only |
 
 `Ctrl-C` ends any of them with Python's status for an interrupt, 130. The
@@ -651,17 +687,17 @@ parameters list. Where the tests leave part of a scenario uncovered,
 <!-- recovery-scenarios -->
 | # | Scenario | What AutoForge does | How to recover | Evidence |
 |---|---|---|---|---|
-| S1 | `Ctrl-C` while an agent runs | ends the agent's process group before it exits; the launch was recorded before it started, and the phase is unchanged | `resume`: the re-entry reads the journal and GitHub first | `tests/test_executor_duplex.py::test_exception_inside_the_with_leaves_no_process_in_the_group`; `tests/test_executor.py::test_a_setup_failure_after_the_spawn_kills_the_child`; `tests/test_engine.py::test_launch_is_persisted_before_the_agent_runs`; `tests/test_engine.py::test_fix_crash_window_resumes_from_the_journal_and_writes_each_effect_once` |
+| S1 | `Ctrl-C` while an agent runs | tries to end the agent's process group, and on Linux the processes the launch orphaned, before it exits; a survivor or an escaped descendant is possible and is not reported; the launch was recorded before it started, and the phase is unchanged | stop whatever still runs in the worktree, then `resume`: the re-entry reads the journal and GitHub first | `tests/test_executor_duplex.py::test_exception_inside_the_with_leaves_no_process_in_the_group`; `tests/test_executor.py::test_a_setup_failure_after_the_spawn_kills_the_child`; `tests/test_engine.py::test_launch_is_persisted_before_the_agent_runs`; `tests/test_engine.py::test_fix_crash_window_resumes_from_the_journal_and_writes_each_effect_once` |
 | S2 | the controller killed mid-phase (`kill -9`, a crash, power loss) | nothing to clean up: the kernel releases the lock; state saved atomically; a write that landed before its save is adopted, not repeated | stop a surviving unsandboxed agent, then `resume` | `tests/test_engine.py::test_analyze_crash_after_the_plan_save_completes_from_the_journal`; `tests/test_engine.py::test_analyze_a_crash_after_a_landed_pr_gh_prints_otherwise_resumes_without_side_effects`; `tests/test_engine.py::test_k8_crash_after_the_write_before_the_save_is_observed_without_a_second_post`; `tests/test_epic_recovery.py::test_a_worker_killed_after_opening_its_pr_adopts_it_on_resume`; `tests/test_lock_domains.py::test_sigkill_of_the_last_holder_releases_every_lock_and_leaves_nothing_to_clean` |
-| S3 | the agent exits non-zero | `State unchanged.` with the worktree, logs and `resume` lines, exit 1; no correction, no relaunch | inspect, then the printed `resume` | `tests/test_cli.py::test_an_agent_failure_prints_a_resume_command_with_the_flags_given`; `tests/test_engine.py::test_an_agent_failure_names_its_worktree_its_log_and_the_resume_command`; `tests/test_engine.py::test_fix_provider_failure_changes_nothing_and_the_relaunch_is_pushed` |
-| S4 | a malformed `CONTROL_RESULT` | one correction launch by default; then the step fails with the phase unchanged; no correction while a process of the launch may still run | inspect, then `resume` | `tests/test_engine.py::test_malformed_result_triggers_one_correction`; `tests/test_engine.py::test_correction_is_bounded`; `tests/test_engine.py::test_a_malformed_result_is_not_corrected_while_a_process_its_launch_started_may_run` |
+| S3 | the agent exits non-zero | a failure its adapter classifies as transient is relaunched inside the step (S7); any other non-zero exit is neither corrected nor relaunched: `State unchanged.` with the worktree, logs and `resume` lines, exit 1 | inspect, then the printed `resume` | `tests/test_engine.py::test_nonzero_exit_is_not_corrected`; `tests/test_cli.py::test_an_agent_failure_prints_a_resume_command_with_the_flags_given`; `tests/test_engine.py::test_an_agent_failure_names_its_worktree_its_log_and_the_resume_command`; `tests/test_engine.py::test_fix_provider_failure_changes_nothing_and_the_relaunch_is_pushed` |
+| S4 | a malformed `CONTROL_RESULT` from an agent that exited 0 | a correction launch (`execution.max_correction_attempts`, default 1); a valid corrected result advances the phase like any other. The step fails with the phase unchanged only when the corrections are spent, or when none is run because a process of the launch may still be running; the correction's re-entry reads GitHub first and can block instead | after a failure, inspect, then `resume`; nothing after a corrected result | `tests/test_engine.py::test_malformed_result_triggers_one_correction`; `tests/test_engine.py::test_correction_is_bounded`; `tests/test_engine.py::test_a_malformed_result_is_not_corrected_while_a_process_its_launch_started_may_run`; `tests/test_engine.py::test_correction_after_the_reviewer_posted_a_round_comment_blocks` |
 | S5 | an idle timeout or the maximum runtime | the agent killed; the error names the limit and its key; `execution.json` records `timeout_limit`; the phase unchanged; not retried | read the records, raise the limit if that is the cause, `resume --accept-config-change` | `tests/test_engine.py::test_an_idle_timeout_names_the_limit_and_the_last_activity`; `tests/test_engine.py::test_a_pi_deadline_is_a_timeout_naming_what_it_left_behind`; `tests/test_engine.py::test_a_maximum_runtime_timeout_names_the_ceiling`; `tests/test_executor.py::test_an_idle_timeout_kills_the_whole_group`; `tests/test_cli.py::test_accept_config_change_records_the_change_in_the_run_log_and_continues` |
 | S6 | a loop kill | the agent killed at the threshold; `ended_by: loop`; the phase unchanged | fix what the agent repeats, then `resume` | `tests/test_loop_detect.py::test_e2e_the_default_kills_a_looping_agent_and_leaves_the_phase_unchanged` |
 | S7 | a transient provider failure | relaunched inside the step at most twice, after re-reading GitHub; a 429 or another failure is not relaunched | `resume` once the provider is back | `tests/test_engine.py::test_a_transient_openai_failure_is_relaunched_after_reconciling`; `tests/test_engine.py::test_openai_websocket_disconnect_is_relaunched_at_most_twice_per_step`; `tests/test_engine.py::test_a_claude_api_error_that_persists_or_is_not_transient_fails_the_step` |
-| S8 | `BLOCKED` | `resume` exits 1 and runs nothing; `unblock` re-enters a phase (exit 0) or refuses and changes nothing (exit 1); `--dry-run` writes nothing | fix the cause, `unblock`, `resume` | `tests/test_cli.py::test_unblock_reenters_a_phase_and_resume_continues`; `tests/test_cli.py::test_unblock_refusal_leaves_the_run_blocked_and_exits_1`; `tests/test_cli.py::test_unblock_dry_run_previews_and_writes_nothing` |
-| S9 | an acceptance action approved | `status --action` prints the exact payload; after `unblock --approve-action`, `resume` posts exactly it once and reads it back | `status --action A-…`, `unblock --approve-action A-…`, `resume` | `tests/test_cli.py::test_status_action_prints_the_exact_payload_bytes`; `tests/test_cli.py::test_unblock_approve_action_publishes_on_resume` |
-| S10 | an acceptance action declined | the unsent plan dropped; the fixer launched again with the decline in its prompt; an id that names no action refused | `unblock --decline-action A-…`, `resume` | `tests/test_engine.py::test_fix_acceptance_action_declined_reruns_the_fixer_with_the_decline`; `tests/test_cli.py::test_unblock_acceptance_flags_exit_codes` |
-| S11 | operator actions | the controller posts nothing; it verifies a comment posted with the exact payload, or one bound to the action, and drops the plan on a decline | post through the `status --action` pipe, or `unblock --bind-evidence`, or `unblock --decline-action`; then `unblock` and `resume` | `tests/test_operator_actions.py::test_operator_actions_complete_from_exact_payloads_without_relaunching`; `tests/test_cli.py::test_status_action_prints_an_operator_payload_and_a_bound_state`; `tests/test_operator_actions.py::test_bound_comments_are_verified_as_operator_bound_evidence`; `tests/test_cli.py::test_unblock_declines_several_operator_actions_at_once`; `tests/test_operator_comment_fidelity.py::test_the_documented_pipe_round_trips_the_payload_byte_for_byte` |
+| S8 | `BLOCKED` | `resume` exits 1 and runs nothing; `unblock` re-enters a phase (exit 0) or refuses and changes nothing (exit 1); `--dry-run` writes nothing | fix the cause, `unblock --reason "..."`, `resume` | `tests/test_cli.py::test_unblock_reenters_a_phase_and_resume_continues`; `tests/test_cli.py::test_unblock_refusal_leaves_the_run_blocked_and_exits_1`; `tests/test_cli.py::test_unblock_dry_run_previews_and_writes_nothing` |
+| S9 | an acceptance action approved | `status --action` prints the exact payload; after `unblock --approve-action`, `resume` posts exactly it once and reads it back | `status --action A-…`, `unblock --approve-action A-… --reason "..."`, then `resume` | `tests/test_cli.py::test_status_action_prints_the_exact_payload_bytes`; `tests/test_cli.py::test_unblock_approve_action_publishes_on_resume` |
+| S10 | an acceptance action declined | the unsent plan dropped; the fixer launched again with the decline in its prompt; an id that names no action refused | `unblock --decline-action A-… --reason "..."`, then `resume` | `tests/test_engine.py::test_fix_acceptance_action_declined_reruns_the_fixer_with_the_decline`; `tests/test_cli.py::test_unblock_acceptance_flags_exit_codes` |
+| S11 | operator actions | the controller posts nothing; it verifies a comment posted with the exact payload, or one bound to the action, and drops the plan on a decline | one of: post through the `status --action` pipe, then `unblock --reason "..."`; `unblock --bind-evidence X-… <comment URL> --reason "..."`; `unblock --decline-action X-… --reason "..."`. Then `resume`, never a second `unblock` | `tests/test_operator_actions.py::test_operator_actions_complete_from_exact_payloads_without_relaunching`; `tests/test_cli.py::test_status_action_prints_an_operator_payload_and_a_bound_state`; `tests/test_operator_actions.py::test_bound_comments_are_verified_as_operator_bound_evidence`; `tests/test_cli.py::test_unblock_declines_several_operator_actions_at_once`; `tests/test_operator_comment_fidelity.py::test_the_documented_pipe_round_trips_the_payload_byte_for_byte` |
 | S12 | the configuration changed between commands | `step`, `resume` and `unblock` refuse (exit 2), name each change and write nothing; `--accept-config-change` writes it to the run log first | run the printed command, or repeat with `--accept-config-change` | `tests/test_cli.py::test_resume_without_the_config_a_run_started_with_refuses_before_anything_runs`; `tests/test_cli.py::test_accept_config_change_records_the_change_in_the_run_log_and_continues`; `tests/test_cli.py::test_unblock_refuses_another_configuration_and_records_an_accepted_one`; `tests/test_cli.py::test_a_resume_without_the_runs_sandbox_mode_refuses_until_accepted` |
 | S13 | a second process while the lock is held | refused with exit 2, no agent launched, nothing written; the message names the scheduler and its surviving workers | wait for the holder, or stop it | `tests/test_cli.py::test_second_controller_with_another_state_dir_is_refused_while_the_first_runs`; `tests/test_cli.py::test_a_scheduler_holding_the_controller_lock_excludes_a_standalone_command`; `tests/test_scheduler.py::test_a_scheduler_exit_with_a_live_worker_keeps_standalone_commands_out` |
 | S14 | the agent asks for a permission or a question | the CLI refuses it; a run that goes on is left to its result; a refusal that alone failed the run is named and neither corrected nor relaunched | change the issue, or the permission rules, then `resume` | `tests/test_engine.py::test_a_refused_request_that_failed_the_run_is_named_and_neither_corrected_nor_relaunched`; `tests/test_providers.py::test_a_refused_request_the_agent_went_on_without_changes_nothing`; `tests/test_engine.py::test_a_claude_refusal_the_agent_went_on_without_leaves_the_outcome_to_its_result` |
@@ -691,12 +727,15 @@ not by a test, and no recorded manual run covers them yet:
   the same engine (S2's `test_epic_recovery.py` test).
 - **The exit status of `Ctrl-C`.** 130 is Python's status for an uncaught
   `KeyboardInterrupt`, which the CLI does not catch; no test checks it.
-- **An agent outliving a killed controller.** That an unsandboxed agent
-  keeps running after the controller is killed with SIGTERM, SIGHUP or
-  SIGKILL, and that an enforced sandbox's agent dies with it, follows from
-  the executor's design
+- **An agent outliving a killed or interrupted controller.** That an
+  unsandboxed agent keeps running after the controller is killed with
+  SIGTERM, SIGHUP or SIGKILL, and that an enforced sandbox's agent dies
+  with it, follows from the executor's design
   ([ADR 0002 §4e](adr/0002-executor-nothing-outlives-the-invocation.md#4e-amendment-sandboxed-launches-167-2026-10-12));
-  no test kills a standalone controller to show either.
+  no test kills a standalone controller to show either. S1's tests show the
+  teardown an interrupt triggers ending a group that obeys it; what it
+  cannot reach or kill is ADR 0002's documented limit, not a tested
+  outcome of `Ctrl-C`.
 - **A suspended machine.** No test or recorded run covers a closed laptop.
 - **The permission and question rows through the CLI.** S14 is tested at
   the engine and adapter level; no test drives it through
