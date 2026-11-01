@@ -141,6 +141,17 @@ CR_KEY = "\n".join([PEM_BEGIN, "\r".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="])
 # material.
 CR_RUN_KEY = "\n".join([PEM_BEGIN, "\r\r".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="]), PEM_END])
 CR_CRLF_KEY = "\r\r\n".join([PEM_BEGIN, *SHORT_WRAPPED_KEY_LINES, "FAKE+/==", PEM_END])
+# The same runs parted by a carriage return, a space and a line feed, and by
+# a carriage return, a space and a carriage return (#285 review, round 8): a
+# base64 decoder skips each of them, so OpenSSL reads either key, to the
+# same public key, but a space inside a line break parted two runs of
+# material.
+CR_SPACE_LF_KEY = "\n".join(
+    [PEM_BEGIN, "\r \n".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="]), PEM_END]
+)
+CR_SPACE_CR_KEY = "\n".join(
+    [PEM_BEGIN, "\r \r".join([*SHORT_WRAPPED_KEY_LINES, "FAKE+/=="]), PEM_END]
+)
 # A value of no known shape under a prefixed name (#285).
 SUFFIX_SECRET = "FAKE0opaque0value"
 SUFFIX_ASSIGNMENT = f"DEEPSEEK_API_KEY={SUFFIX_SECRET}"
@@ -374,6 +385,65 @@ WHOLE_VALUES_285_R7_REDACTED = {
     "yaml-cr-continued": "client_secret: ***REDACTED***",
     "yaml-cr-second-key": "endpoint: e\rclient_secret:\r  ***REDACTED***",
     "yaml-cr-upper-block": "DEPLOY_SECRET: |\r  ***REDACTED***",
+}
+# Values the eighth review of #285 found kept whole, each valid YAML or a
+# valid shell assignment: a value below a YAML flow mapping's key right after
+# its ``{``, plain, quoted, after an anchor below the key or on its line, at
+# no indentation, a plain scalar that goes on below the key's line, a key
+# after a ``,``, in a flow sequence and as a quoted key (R8-F2); and a name
+# whose prefix starts with underscores, as an assignment, after ``export``,
+# as a YAML key, with a quoted value and with a value below it (R8-F3). Each
+# with its id, the text and what must not appear once it is redacted or
+# refused.
+WHOLE_VALUES_285_R8 = [
+    ("flow-plain-below", "{client_secret:\n  FAKEflowplain}", "FAKEflowplain"),
+    ("flow-quoted-below", "{client_secret:\n  'FAKEflowquoted'}", "FAKEflowquoted"),
+    ("flow-anchor-below", "{client_secret:\n  &cs FAKEflowanchor}", "FAKEflowanchor"),
+    ("flow-anchor-on-key-line", "{client_secret: &cs\n  FAKEflowprops}", "FAKEflowprops"),
+    ("flow-unindented", "{db_password:\nFAKEflowcol0}", "FAKEflowcol0"),
+    ("flow-continued", "{client_secret: FAKEflowfirst\n  FAKEflowcont}", "FAKEflowcont"),
+    (
+        "flow-after-comma",
+        "{endpoint: e, x_api_key:\n  FAKEflowsibling, region: r}",
+        "FAKEflowsibling",
+    ),
+    ("flow-sequence", "[Db_Password:\n  FAKEflowseq]", "FAKEflowseq"),
+    ("flow-quoted-key", '{"client_secret":\n  "FAKEflowjson"}', "FAKEflowjson"),
+    ("underscore-upper", "_SERVICE_API_KEY=FAKEunderupper", "FAKEunderupper"),
+    ("underscore-export", "export _AUTH_TOKEN=FAKEundertoken", "FAKEundertoken"),
+    ("underscore-double", "__CLIENT_SECRET: FAKEunderdouble", "FAKEunderdouble"),
+    ("underscore-quoted", "_DB_PASSWORD='FAKE under; quoted'", "under; quoted"),
+    ("underscore-lower", "_db_password=FAKEunderlower", "FAKEunderlower"),
+    ("underscore-yaml-below", "_SERVICE_API_KEY:\n  FAKEunderbelow", "FAKEunderbelow"),
+]
+# What ``redact`` makes of each of them: the flow indicators, the next
+# entry, the key, the properties, the quotes and the value's indentation
+# stay.
+WHOLE_VALUES_285_R8_REDACTED = {
+    "flow-plain-below": "{client_secret:\n  ***REDACTED***}",
+    "flow-quoted-below": "{client_secret:\n  '***REDACTED***'}",
+    "flow-anchor-below": "{client_secret:\n  &cs ***REDACTED***}",
+    "flow-anchor-on-key-line": "{client_secret: &cs\n  ***REDACTED***}",
+    "flow-unindented": "{db_password:\n***REDACTED***}",
+    "flow-continued": "{client_secret: ***REDACTED***}",
+    "flow-after-comma": "{endpoint: e, x_api_key:\n  ***REDACTED***, region: r}",
+    "flow-sequence": "[Db_Password:\n  ***REDACTED***]",
+    "flow-quoted-key": '{"client_secret":\n  "***REDACTED***"}',
+    "underscore-upper": "_SERVICE_API_KEY=***REDACTED***",
+    "underscore-export": "export _AUTH_TOKEN=***REDACTED***",
+    "underscore-double": "__CLIENT_SECRET: ***REDACTED***",
+    "underscore-quoted": "_DB_PASSWORD='***REDACTED***'",
+    "underscore-lower": "_db_password=***REDACTED***",
+    "underscore-yaml-below": "_SERVICE_API_KEY:\n  ***REDACTED***",
+}
+# Values under names whose prefix starts with underscores, as a mapping's
+# keys (R8-F3): ``redact_obj`` replaces each, and keeps every entry.
+UNDERSCORE_KEYED_SECRETS_285 = {
+    "_SERVICE_API_KEY": "FAKE0keyed0service",
+    "_AUTH_TOKEN": "FAKE keyed; auth",
+    "__CLIENT_SECRET": "FAKE0keyed0client",
+    "_DB_PASSWORD": "FAKE0keyed0db",
+    "_db_password": "FAKE0keyed0lower",
 }
 # The base branch's tip and the two GitHub Actions runs the check-definition
 # gate reads: the PR's own `pull_request` run (the one its `ci` check names)

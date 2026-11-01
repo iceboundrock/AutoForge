@@ -84,6 +84,8 @@ from tests.conftest import (
     CR_CRLF_KEY,
     CR_KEY,
     CR_RUN_KEY,
+    CR_SPACE_CR_KEY,
+    CR_SPACE_LF_KEY,
     EPIC,
     FOLLOW_UP_TEXT,
     FOLLOW_UP_TITLE,
@@ -117,6 +119,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R6_REDACTED,
     WHOLE_VALUES_285_R7,
     WHOLE_VALUES_285_R7_REDACTED,
+    WHOLE_VALUES_285_R8,
+    WHOLE_VALUES_285_R8_REDACTED,
     FakeGitHub,
     acceptance,
     analyze_payload,
@@ -508,6 +512,13 @@ _R7_SHAPES = [
     ("terminal-capture-key", "private-key", CR_CRLF_KEY),
     *((name, "credential-suffix-assignment", text) for name, text, _ in WHOLE_VALUES_285_R7),
 ]
+# What the eighth review of #285 found every check accepted (R8-F1, R8-F2,
+# R8-F3): each id, its class and its text.
+_R8_SHAPES = [
+    ("cr-space-lf-key", "private-key", CR_SPACE_LF_KEY),
+    ("cr-space-cr-key", "private-key", CR_SPACE_CR_KEY),
+    *((name, "credential-suffix-assignment", text) for name, text, _ in WHOLE_VALUES_285_R8),
+]
 
 
 @pytest.mark.parametrize(
@@ -793,6 +804,49 @@ _R7_SHAPES = [
                 id=f"body-carries-a-round-7-{name}-as-json",
             )
             for name, cls, text in _R7_SHAPES
+        ),
+        # Round 8: keys whose breaks hold a space, values below a YAML flow
+        # collection's key and values under names behind underscores, in a
+        # commit message and in the body; there a result field refuses a
+        # key's carriage return first, unquoted, and as JSON writes each the
+        # body is refused by class.
+        *(
+            pytest.param(
+                lambda req, text=text: (
+                    implement(req) if commit_in(req.cwd, f"Configure it (#2)\n\n{text}") else ""
+                ),
+                _from_start,
+                f"commit message contains a credential-shaped string (pattern class: {cls})",
+                id=f"commit-carries-a-round-8-{name}",
+            )
+            for name, cls, text in _R8_SHAPES
+        ),
+        *(
+            pytest.param(
+                lambda req, text=text: implement(req, pr_body=f"Adds it.\n\n{text}"),
+                _reports_head,
+                "'pr_body' contains a control character (U+000D",
+                id=f"body-carries-a-round-8-{name}",
+            )
+            for name, _, text in _R8_SHAPES[:2]
+        ),
+        *(
+            pytest.param(
+                lambda req, text=text: implement(req, pr_body=f"Adds it.\n\n{text}"),
+                _reports_head,
+                f"credential-shaped string (pattern class: {cls})",
+                id=f"body-carries-a-round-8-{name}",
+            )
+            for name, cls, text in _R8_SHAPES[2:]
+        ),
+        *(
+            pytest.param(
+                lambda req, text=text: implement(req, pr_body=f"Adds it:\n\n{json.dumps(text)}"),
+                _reports_head,
+                f"credential-shaped string (pattern class: {cls})",
+                id=f"body-carries-a-round-8-{name}-as-json",
+            )
+            for name, cls, text in _R8_SHAPES
         ),
         pytest.param(
             lambda req: implement(req, pr_body="Adds it. Fixes #2"),
@@ -8052,6 +8106,49 @@ def test_a_whole_value_the_seventh_285_review_found_never_reaches_state_or_the_l
         for line in SHORT_WRAPPED_KEY_LINES:
             assert line not in text
         for _, _, body in WHOLE_VALUES_285_R7:
+            assert body not in text
+    assert fake_github.effect_writes == []
+
+
+def test_a_whole_value_the_eighth_285_review_found_never_reaches_state_or_the_logs(
+    tmp_state_dir, fake_github
+):
+    """#285 review, round 8: values below a YAML flow collection's key,
+    values under names whose prefix starts with underscores, and private
+    keys whose breaks hold a space, were kept whole in ``stdout.log``,
+    ``stderr.log``, the block reason in ``state.json`` and the step outcome,
+    as text and as JSON three deep. Each is redacted whole at every sink, and
+    nothing is written to GitHub."""
+    texts = [text for _, text, _ in WHOLE_VALUES_285_R8]
+    keys = [CR_SPACE_LF_KEY, CR_SPACE_CR_KEY]
+    deep = json.dumps(json.dumps(json.dumps([*texts, *keys])))
+    message = "refused:\n" + "\n".join(texts)
+    payload = {"phase": "ANALYZE_EXECUTE", "status": "blocked", "message": message}
+    reply = "".join(f"{text}\n" for text in [*texts, *keys, deep]) + block(payload)
+    eng = make_engine(tmp_state_dir, [reply], github=fake_github, origin=True)
+    eng.provider.stderr = "".join(
+        f"\x1b[91m\x1b[1mError: \x1b[0m{text}\n" for text in [*texts, *keys, deep]
+    )
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    out = eng.step()
+    assert out.next_phase == "BLOCKED"
+    s = load_state(eng.paths.state_file)
+    redacted = [WHOLE_VALUES_285_R8_REDACTED[name] for name, _, _ in WHOLE_VALUES_285_R8]
+    assert s.block_reason == "refused:\n" + "\n".join(redacted)
+    assert out.message == f"agent reported blocked: {s.block_reason}"
+    logs = [path for path in (eng.paths.logs_dir / s.run_id).rglob("*") if path.is_file()]
+    assert {"stdout.log", "stderr.log"} <= {path.name for path in logs}
+    # Read as bytes, so that a carriage return is read as written.
+    texts = [
+        eng.paths.state_file.read_bytes().decode("utf-8"),
+        out.message,
+        *(path.read_bytes().decode("utf-8") for path in logs),
+    ]
+    for text in texts:
+        assert "FAKE" not in text and "BEGIN" not in text
+        for line in SHORT_WRAPPED_KEY_LINES:
+            assert line not in text
+        for _, _, body in WHOLE_VALUES_285_R8:
             assert body not in text
     assert fake_github.effect_writes == []
 

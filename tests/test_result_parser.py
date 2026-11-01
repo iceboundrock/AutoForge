@@ -74,6 +74,8 @@ from tests.conftest import (
     CR_CRLF_KEY,
     CR_KEY,
     CR_RUN_KEY,
+    CR_SPACE_CR_KEY,
+    CR_SPACE_LF_KEY,
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     ISSUE,
@@ -96,6 +98,7 @@ from tests.conftest import (
     WHOLE_VALUES_285_R5,
     WHOLE_VALUES_285_R6,
     WHOLE_VALUES_285_R7,
+    WHOLE_VALUES_285_R8,
     block,
     comment_url,
 )
@@ -2814,6 +2817,81 @@ def test_a_seventh_285_review_shape_written_out_is_refused_by_every_check(cls, t
     ``pr_body`` and ``progress`` validation accepted it with every other
     check. Each check, the result fields' included, refuses it by class now,
     and none quotes it."""
+    written = text
+    for _ in range(depth):
+        written = json.dumps(written)
+    body_text = f"Configured the client:\n\n{written}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body_text),
+        published_payload_problem("PR body", f"{body_text}\n\nCloses #2"),
+        acceptance_comment_problem(body_text, "R1-F1"),
+        operator_comment_problem(body_text, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{written}", repository="owner/repo", issue_number=2
+        ),
+        _refusal(lambda: _full(progress=body_text)),
+        _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert f"credential-shaped string (pattern class: {cls})" in msg
+        assert body not in msg and "FAKE" not in msg
+
+
+# What the eighth review of #285 found every check accepted: keys whose
+# breaks hold a space among their carriage returns and line feed (R8-F1),
+# values below a YAML flow collection's key (R8-F2) and values under names
+# whose prefix starts with underscores (R8-F3), each with its class and what
+# must never be quoted.
+_R8_SHAPES = [
+    ("private-key", CR_SPACE_LF_KEY, SHORT_WRAPPED_KEY_LINE),
+    ("private-key", CR_SPACE_CR_KEY, SHORT_WRAPPED_KEY_LINE),
+    *(("credential-suffix-assignment", text, body) for _, text, body in WHOLE_VALUES_285_R8),
+]
+_R8_IDS = ["cr-space-lf-key", "cr-space-cr-key", *(n for n, _, _ in WHOLE_VALUES_285_R8)]
+
+
+@pytest.mark.parametrize(("cls", "text", "body"), _R8_SHAPES, ids=_R8_IDS)
+def test_a_shape_the_eighth_285_review_found_is_refused_by_every_published_content_check(
+    cls, text, body
+):
+    """#285 review, round 8: the publication, payload, commit-message and
+    composed-comment checks accepted each of these, and ``pr_body`` and
+    ``progress`` validation with them. Each refuses it by class now and
+    never quotes it; a result field refuses a key's carriage return itself
+    first, unquoted too."""
+    body_text = f"Configured the client.\n\n{text}\n\nTested with `pytest`."
+    messages = [
+        published_text_problem("pr_body", body_text),
+        published_payload_problem("PR body", f"{body_text}\n\nCloses #2"),
+        acceptance_comment_problem(body_text, "R1-F1"),
+        operator_comment_problem(body_text, "R1-F1", ISSUE),
+        commit_message_problem(
+            f"Add the client (#2)\n\n{text}", repository="owner/repo", issue_number=2
+        ),
+    ]
+    for msg in messages:
+        assert msg is not None
+        assert f"credential-shaped string (pattern class: {cls})" in msg
+        assert body not in msg and "FAKE" not in msg
+    for refusal in (
+        _refusal(lambda: _full(progress=body_text)),
+        _refusal(lambda: AnalyzeExecuteResult.from_payload(dict(_ANALYZE, pr_body=body_text))),
+    ):
+        if "\r" in text:
+            assert "control character (U+000D" in refusal
+        else:
+            assert f"credential-shaped string (pattern class: {cls})" in refusal
+        assert body not in refusal and "FAKE" not in refusal
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3], ids=["json", "json-in-json", "three-deep"])
+@pytest.mark.parametrize(("cls", "text", "body"), _R8_SHAPES, ids=_R8_IDS)
+def test_an_eighth_285_review_shape_written_out_is_refused_by_every_check(cls, text, body, depth):
+    """#285 review, round 8: as JSON writes each of these, one, two and
+    three deep, every check accepted it, ``pr_body`` and ``progress``
+    validation included. Each check refuses it by class now, and none
+    quotes it."""
     written = text
     for _ in range(depth):
         written = json.dumps(written)

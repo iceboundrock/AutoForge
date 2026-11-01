@@ -71,7 +71,9 @@ the two that find a plain scalar going on below its key's line, whose key
 starts its line, and the two that find a quoted value whose quote ends its
 line, whose name stands outside every string its line opens; a line starts
 after a line feed or a carriage return, and each takes an escape before the
-name as a line's start or a token's, #285). A credential
+name as a line's start or a token's, #285; nor do the four that find a
+value below a key in a YAML flow collection, whose key stands after the
+collection's `{`, `[` or a `,`, eighth review of #285). A credential
 starts:
 
 - at the start of the text;
@@ -228,6 +230,20 @@ check, as text and in JSON three deep. Only a line feed advances a line, so
 what still parts two runs is a blank line of two line feeds, carriage
 returns among them or not (`\n\n`, `\r\n\r\n`, `\r\r\n\r\r\n`); two
 carriage returns alone, a classic Mac OS file's blank line, no longer do.
+Spaces and tabs may stand among a line break's carriage returns and line
+feed too (eighth review): a base64 decoder skips each of them in any order,
+so a key whose runs a carriage return, a space and a line feed part
+(`\r \n`), or a carriage return, a space and a carriage return (`\r \r`),
+is one OpenSSL reads, to the same public key, but only an indentation after
+the break was read, so the space parted two runs and the whole block
+reached every sink and passed every check, as text and in JSON three deep.
+A line break is now any run of spaces, tabs and carriage returns that holds
+a carriage return or a line feed, and one line feed at most, as written and
+written out (a tab also as `\t`): a space before a CRLF or after a line
+feed, a tab among them. What parts two runs is still a blank line, two line
+feeds whatever stands between them (`\n \n`, `\r \r\n \r\n`), which
+OpenSSL refuses in a key's body as it refuses `\n\n`. The run is read in
+one order by possessive loops, so it is read once.
 Spaces and tabs may part the runs too
 (fifth review of #285): a base64 decoder skips them, so a key with a space
 after every eight characters of its body is one OpenSSL reads, to the same
@@ -267,9 +283,18 @@ Not recognised: the end of a key whose BEGIN line is not in the text (a
 capture that kept only the key's tail, `tail` of a key file).
 
 **A prefixed credential name** (`credential-suffix-assignment`) is a name
-of letters, digits and `_`, starting with a letter and ending in `_API_KEY`,
-`_TOKEN`, `_SECRET` or `_PASSWORD` after a prefix, the suffix in any case.
-What its value must be depends on the name's case:
+of letters, digits and `_`, starting with a letter, or with underscores and
+then a letter or a digit, and ending in `_API_KEY`, `_TOKEN`, `_SECRET` or
+`_PASSWORD` after a prefix, the suffix in any case. A shell identifier may
+start with underscores (`_SERVICE_API_KEY`, `_AUTH_TOKEN`,
+`__CLIENT_SECRET`, `_DB_PASSWORD`), and so may a private attribute or a
+variable a script keeps to itself, but the name had to start with a letter
+until the eighth review of #285, so a value under such a name, as text and
+as a mapping's key, was kept in every sink and passed every check. A suffix
+behind underscores alone (`_TOKEN`, `__API_KEY`) is still no prefixed name,
+and the name still stops where the identifier does. What its value must be
+depends on the name's case (an upper-case name's underscores before its
+first letter change nothing):
 
 - **Upper case** (`GEMINI_API_KEY`, `MY_GITHUB_TOKEN`, `CI_JOB_TOKEN`,
   `DB_PASSWORD`), an environment variable's: its value is taken as a
@@ -291,6 +316,12 @@ What its value must be depends on the name's case:
   `%26`) and the end of the text; a run of `,`, `.`, `:` and closing
   brackets right before one of those is the punctuation after the word
   (`f(x_token=v),`, a sentence's full stop), and part of it anywhere else.
+  A backslash that starts an escaped quote or a line break or tab written
+  out is such an end too, as it ends the word itself (eighth review): in
+  JSON in JSON a string's closing quote is `\"`, and the punctuation before
+  it was the word's, so a flow mapping written out two deep lost its `}` to
+  the marker, and code before it (`client_secret: None,`) was redacted,
+  where one deep left each.
   Until the second review of #285 the word had to be 8 characters of a
   token's alphabet with a digit and a letter, so a word of letters, one with
   `$` or `!`, and a `%` escape were kept whole, in every sink, and passed
@@ -492,7 +523,8 @@ metadata, a free-form `escalation`, a CLI document) kept the value in the
 clear until the review of #285. A key that names a credential, whole and in
 any case, now has its non-empty string value replaced whole, at any depth:
 a prefixed name with a credential suffix (`GEMINI_API_KEY`,
-`client_secret`), a well-known name (`GITHUB_TOKEN`) and, as before, an
+`client_secret`, `_SERVICE_API_KEY` and `__CLIENT_SECRET` since the eighth
+review), a well-known name (`GITHUB_TOKEN`) and, as before, an
 OAuth field (`refresh`, `id_token`). A mapping's string value is a literal,
 as a quoted value is in a text, so a lower-case key needs no more than an
 upper-case one. The entry and its key stay, a non-string or empty value is
@@ -521,7 +553,12 @@ line break written out before a value (`A_TOKEN=\nx` in JSON text, 11 to
 24, where the break went with the value, 11 to 22). The seventh review's
 are as long as the same with line feeds: a value whose lines bare carriage
 returns end (`a_token:\r x\r`, 12 to 25) and a carriage return written out
-before a value (`A_TOKEN=\rx`, 11 to 24). Every token
+before a value (`A_TOKEN=\rx`, 11 to 24). The eighth review's are no
+worse: a value below a key in a YAML flow collection (`{a_token:\nx}`, 12
+to 25; `,a_token:\nx`, 11 to 24), a plain scalar going on below such a
+key's line (`{a_token: x\ny}`, 14 to 25) and a name behind an underscore
+(`_A_TOKEN=x`, 10 to 23); a flow key's lead may hold an earlier marker's
+last `*`, which it keeps. Every token
 shape is longer than the marker and only shrinks, a private-key block (43
 characters or more) included, and what a block holds between its BEGIN and
 END lines, like a quoted value, can take a marker only whole. A mapping's
@@ -721,7 +758,13 @@ api_token:              Db_Password:            client_secret: <word>
 - **Written out**, as JSON, JSON in JSON and three deep write a YAML text,
   a line break is the one the key's line ends in, behind as many
   backslashes, and a line also ends where the string does, at a quote
-  behind fewer backslashes, so the JSON still decodes.
+  behind fewer backslashes, so the JSON still decodes. A value's opening
+  double quote below its key needs as many backslashes too (eighth review):
+  one behind fewer closes the string the text is written in
+  (`{"a": "client_secret:\n  ", "b": "x"}`), and was taken for a value's,
+  so the text between that string and the next was replaced and the JSON
+  no longer parsed. A single quote, which JSON does not escape, opens a
+  value behind any.
 - **A line breaks where YAML breaks it**: at `\n`, `\r\n` and a carriage
   return alone, `\r` (seventh review of #285), as written and written out,
   and a key starts a line after any of them. Only `\n` and `\r\n` ended a
@@ -742,6 +785,59 @@ api_token:              Db_Password:            client_secret: <word>
   count as spaces: a scalar after one on the key's line is that line's
   value and redacted, but a `|` or `>` block whose lines they end, which a
   YAML 1.1 parser such as PyYAML reads, is not recognised.
+- **A key in a flow collection** (eighth review of #285): a flow mapping's
+  key right after its `{`, after the `,` that ends the entry before it, or
+  a single-pair mapping's after a flow sequence's `[`, with its value on the
+  line below (`{client_secret:`, then `  FAKE}`), plain, quoted or after its
+  properties, or a plain scalar that starts on the key's line and goes on
+  below it (`{client_secret: FAKE1`, then `  FAKE2}`). A YAML parser reads
+  each, but such a key starts no line, the rules above want one that does,
+  and a lower-case name's rule on its line takes a word on that line only,
+  so the value was kept whole, or its lines after the first, in every sink
+  and check, as text and written out. The key may follow the indicator
+  after spaces and line breaks, as written or written out, and be quoted.
+  Inside a flow collection a node's lines need no indentation past its key,
+  so the value is the first line below it that is no blank or comment line,
+  at any indentation. Under a lower-case name a plain scalar ends where a
+  flow scalar does: at a flow indicator (`,`, `[`, `]`, `{`, `}`), a
+  mapping's `: ` and a comment, and the indicator and what follows it stay
+  (`{client_secret:\n  ***REDACTED***, region: r}`); it goes on to the
+  lines below while each holds one, and only from a line that it ends. On
+  the key's line the name's own rule ends a word only before punctuation
+  that an end follows, so a scalar that starts there ends at a `,`, a `]`
+  or a `}` only where that rule would end its word too. Under an upper-case
+  or a well-known name the value is anything, as on the key's line, where
+  `{GH_TOKEN: FAKE}` loses its `}` to the marker: the `}` goes with it, and
+  the scalar goes on to indented lines below that hold no mapping's `: `,
+  and to the `,` on such a line that the next entry's key and `:` follow
+  (`FAKE2, region: r`), which stay. Such a name is read whole, so an
+  upper-case one never falls back to a lower-case name's value where its
+  own is refused, and a well-known name in lower case (`gh_token`) is read
+  as an upper-case one. Such a value takes the `,` that ends its entry, and
+  so does a block rule that takes a line whole, so the next entry's key is
+  also read after a marker and a space or a line break; after a line break
+  a key whose value goes on from its line is read so only where it is
+  indented, since at a line's start the line after `key: value` lines that
+  redaction left (`db_password: ***REDACTED***`, then `PATH=/usr/bin`) would
+  be taken for its scalar's. Each rule thus
+  takes, on every line it reads, at least what any other rule could take
+  there after its marker: a rule that took a `}` the flow rule stopped at
+  would let it go on to the next line in the next round, a line a round. A
+  value that is a marker alone is already redacted and no match: a match
+  is never read again in its pass, so one that took a marker took the lead
+  of the key after it with it, and that key's value stayed for good.
+  Where the key starts its line, a value line indented past it is the
+  rules above's, which take a line whole, so these read only a value whose
+  first line is indented no more than the key, as a flow collection allows
+  and a block mapping does not, and read a later line indented past the
+  key whole, as those rules do. Under a lower-case name
+  a value that reads as code stays, as below a block key (`string`, `None`,
+  `12345` alone, `process.env.X`, `!secret app_secret`, `${{ secrets.X }}`),
+  and so do a nested mapping, a sequence, an empty value and a code fence.
+  Not recognised: under an upper-case or a well-known name, a plain
+  scalar's line below that is not indented (`{GH_TOKEN: FAKE1`, then
+  `FAKE2}`), or whose next entry's key holds a space (`FAKE2, two words:
+  x`); its first line is still that name's rule's.
 
 They run last, after every pattern that can redact a part of such a
 value's lines: whether a line is a plain scalar depends on all of it, so a
@@ -752,7 +848,9 @@ the name's own pattern, which these complete: an unquoted value of several
 words is taken whole below a YAML key, where it is still one word on the
 key's line. No pattern before them takes a block's header for a value
 (`_BLOCK_AHEAD`), which left the block's lines in the clear. Each
-candidate starts at a line's start, an escape or a quote and reads its key,
+candidate starts at a line's start, an escape or a quote (a flow
+collection's at its `{`, `[` or `,`, or an earlier marker's last `*`, one
+set of characters the regex engine scans for fast) and reads its key,
 one line break, the blank and comment lines before its value and its
 value's lines once (a block's once more, to tell whether each is a
 placeholder), and a candidate that fails does so at the start of its value
@@ -787,8 +885,9 @@ every match of its passes holds, a token shape's literal prefix
 (`-----BEGIN `, `eyJ`, `AIza`, `glpat-`, `gh[pousr]_`, `sk-`, `A[KS]IA`,
 ...), a URL's `://`, `Authorization`, a prefixed name's suffix
 (`_token`, in any case), a well-known name's last `_` with the character
-before it and the segment after it (derived from the names), and a YAML
-key's colon before what ends its line. A text without it has no match, and
+before it and the segment after it (derived from the names), a YAML
+key's colon before what ends its line, and a line break, as written or
+written out, for a plain scalar going on below a flow key's line. A text without it has no match, and
 the pattern's passes are skipped; a search led by a literal runs far faster
 than a pattern that starts with a lookbehind, so a log with no credential
 is redacted in a fraction of the time it took, and one with a credential,

@@ -11,7 +11,8 @@ so.
   (`glpat-`), Groq (`gsk_`), xAI (`xai-`), npm (`npm_`) and Hugging Face
   (`hf_`) tokens are recognised by their shape, and a value assigned to a
   name ending in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` behind a
-  prefix by its name: any value under an upper-case name (`GEMINI_API_KEY`,
+  prefix by its name, the prefix also behind underscores (`_SERVICE_API_KEY`,
+  `__CLIENT_SECRET`): any value under an upper-case name (`GEMINI_API_KEY`,
   `DEEPSEEK_API_KEY`, `DB_PASSWORD`), and under a lower- or mixed-case one
   (`client_secret`, `db_password`) a quoted value or an unquoted word of any
   characters that does not read as code: letters alone, punctuation, a
@@ -28,7 +29,7 @@ so.
   also when its body is wrapped in lines shorter than 16 characters (a key
   rewrapped with `fold -w 8` is still a valid key; its lines may end in a
   bare carriage return or a run of them, as a terminal's capture of a CRLF
-  file writes them), or has spaces and tabs
+  file writes them, with spaces and tabs among them), or has spaces and tabs
   between short runs, which a base64 decoder skips (16 characters parted so
   must mix case and hold a digit, a `+` or a `/`, so the words of a
   placeholder stay). One whose END line is
@@ -67,7 +68,10 @@ so.
   block), and in a sequence entry (`- x_token: |`) the value stops at the
   mapping's next entry, which stays, however wide the dashes before the
   key. A bare carriage return ends a line as YAML reads it, as a line feed
-  and CRLF do, as written and written out; a statement that ends in a colon
+  and CRLF do, as written and written out. A key in a YAML flow collection,
+  after its `{`, `[` or a `,`, has its value below it, or a plain scalar
+  going on below its line, redacted too; under a lower-case name the
+  collection's `}` and next entry stay. A statement that ends in a colon
   (`if api_token:`), a nested mapping and, under a lower-case name, a value
   that reads as code (`${{ secrets.X }}`, `process.env.X`) are left. A
   block is a string whatever its lines hold, so one that starts with a

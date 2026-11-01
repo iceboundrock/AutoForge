@@ -18,6 +18,8 @@ from tests.conftest import (
     CR_CRLF_KEY,
     CR_KEY,
     CR_RUN_KEY,
+    CR_SPACE_CR_KEY,
+    CR_SPACE_LF_KEY,
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     PRIVATE_KEY,
@@ -26,6 +28,7 @@ from tests.conftest import (
     SHORT_WRAPPED_KEY_LINE,
     SHORT_WRAPPED_KEY_LINES,
     SPACED_KEY,
+    UNDERSCORE_KEYED_SECRETS_285,
     WHOLE_VALUES_285,
     WHOLE_VALUES_285_R3,
     WHOLE_VALUES_285_R3_REDACTED,
@@ -37,6 +40,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R6_REDACTED,
     WHOLE_VALUES_285_R7,
     WHOLE_VALUES_285_R7_REDACTED,
+    WHOLE_VALUES_285_R8,
+    WHOLE_VALUES_285_R8_REDACTED,
 )
 
 
@@ -1754,6 +1759,176 @@ def test_a_whole_value_the_seventh_285_review_found_never_reaches_the_logs(tmp_p
     result = json.loads((step / "control-result.json").read_bytes().decode("utf-8"))
     assert result["tests"] == [*redacted, *deep_redacted]
     assert result["message"] == "\n".join(redacted)
+
+
+@pytest.mark.parametrize(
+    "key", [CR_SPACE_LF_KEY, CR_SPACE_CR_KEY], ids=["cr-space-lf", "cr-space-cr"]
+)
+def test_a_private_key_whose_breaks_hold_horizontal_space_never_reaches_the_logs(tmp_path, key):
+    """#285 review, round 8: a key whose runs a carriage return, a space and
+    a line feed part, or a carriage return, a space and a carriage return,
+    which OpenSSL reads to the same public key, kept every line of its
+    material in ``stdout.log``, ``stderr.log`` and ``control-result.json``,
+    as text and as JSON one, two and three deep. It is replaced whole in
+    every file, its BEGIN and END lines with it, and the lines around it
+    stay."""
+    deep = [_json_deep({"key": key}, depth) for depth in (1, 2, 3)]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", key],
+            error=f"agent exited 1:\n{key}",
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": f"deploy with\n{key}",
+                "tests": [key, *deep],
+            },
+        ),
+        prompt="p",
+        stdout="$ cat key.pem\n" + "\n".join([key, *deep]) + "\n$ next\n",
+        stderr="".join(f"\x1b[91mError: \x1b[0m{text}\n" for text in [key, *deep]),
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {"stdout.log", "stderr.log", "control-result.json"}
+    for path in [*files, log.events_path]:
+        content = path.read_bytes().decode("utf-8")
+        for line in SHORT_WRAPPED_KEY_LINES:
+            assert line not in content, (path, line)
+        assert "BEGIN" not in content and "FAKE+/" not in content, path
+    redacted = ["***REDACTED***", *(_json_deep({"key": "***REDACTED***"}, d) for d in (1, 2, 3))]
+    assert (step / "stdout.log").read_bytes().decode("utf-8") == (
+        "$ cat key.pem\n" + "\n".join(redacted) + "\n$ next\n"
+    )
+    assert (step / "stderr.log").read_bytes().decode("utf-8") == "".join(
+        f"\x1b[91mError: \x1b[0m{text}\n" for text in redacted
+    )
+    result = json.loads((step / "control-result.json").read_bytes().decode("utf-8"))
+    assert result["message"] == "deploy with\n***REDACTED***"
+    assert result["tests"] == redacted
+
+
+def test_a_whole_value_the_eighth_285_review_found_never_reaches_the_logs(tmp_path):
+    """#285 review, round 8: a value below a YAML flow collection's key, and
+    a value under a name whose prefix starts with underscores, was kept
+    whole in ``stdout.log``, ``stderr.log``, ``control-result.json`` and the
+    command in ``request.json``, as text and as JSON one, two and three
+    deep. Each goes whole from every file, after OpenCode's ANSI escapes
+    too; the flow indicators, the next entry and the line after it stay."""
+    texts = [text for _, text, _ in WHOLE_VALUES_285_R8]
+    deep = [_json_deep(texts, depth) for depth in (1, 2, 3)]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            attempt=1,
+            provider="opencode",
+            command=["opencode", "run", *texts],
+            error="agent exited 1:\n" + "\n".join(texts),
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": "\n".join(texts),
+                "tests": [*texts, *deep],
+            },
+        ),
+        prompt="p",
+        stdout="".join(f"{text}\nnext line\n" for text in texts) + "\n".join(deep) + "\n",
+        stderr="".join(f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in texts),
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {
+        "stdout.log",
+        "stderr.log",
+        "control-result.json",
+        "request.json",
+    }
+    for path in [*files, log.events_path]:
+        content = path.read_text(encoding="utf-8")
+        assert "FAKE" not in content, path
+        for _, _, body in WHOLE_VALUES_285_R8:
+            assert body not in content, (path, body)
+    redacted = [WHOLE_VALUES_285_R8_REDACTED[name] for name, _, _ in WHOLE_VALUES_285_R8]
+    deep_redacted = [_json_deep(redacted, depth) for depth in (1, 2, 3)]
+    assert (step / "stdout.log").read_text(encoding="utf-8") == (
+        "".join(f"{text}\nnext line\n" for text in redacted) + "\n".join(deep_redacted) + "\n"
+    )
+    assert (step / "stderr.log").read_text(encoding="utf-8") == "".join(
+        f"\x1b[91m\x1b[1mError: \x1b[0m{text}\nnext line\n" for text in redacted
+    )
+    result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
+    assert result["tests"] == [*redacted, *deep_redacted]
+    assert result["message"] == "\n".join(redacted)
+    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
+    assert request["command"] == ["opencode", "run", *redacted]
+
+
+def test_a_value_under_a_name_whose_prefix_starts_with_underscores_never_reaches_the_records(
+    tmp_path,
+):
+    """#285 review, round 8: a key whose name's prefix starts with
+    underscores (``_SERVICE_API_KEY``, ``__CLIENT_SECRET``, ``_db_password``)
+    named no credential, so its opaque value in the metadata, the provider
+    summary or the parsed result was written to ``request.json``,
+    ``execution.json``, ``control-result.json`` and the journal in the clear,
+    and so was the same assignment in the command and on stdout and stderr.
+    Each is redacted, at any depth, and every entry stays."""
+    secrets = dict(UNDERSCORE_KEYED_SECRETS_285)
+    assignments = [f"{name}={value!r}" for name, value in secrets.items()]
+    log = RunLogger(tmp_path / "logs", "run-1")
+    step = log.log_execution(
+        ExecutionRecord(
+            run_id="run-1",
+            seq=0,
+            phase="ANALYZE_EXECUTE",
+            command=["env", *assignments, "make", "test"],
+            metadata={"validation": {"env": dict(secrets, PATH="/usr/bin")}},
+            provider_summary={"settings": [{"env": dict(secrets)}]},
+            parsed_result={
+                "phase": "ANALYZE_EXECUTE",
+                "status": "blocked",
+                "message": "\n".join(assignments),
+                "env": dict(secrets),
+            },
+        ),
+        prompt="p",
+        stdout="".join(f"{a}\n" for a in assignments),
+        stderr="".join(f"\x1b[91mError: \x1b[0m{a}\n" for a in assignments),
+    )
+    files = [path for path in log.run_dir.rglob("*") if path.is_file()]
+    assert {path.name for path in files} >= {
+        "request.json",
+        "execution.json",
+        "control-result.json",
+        "stdout.log",
+        "stderr.log",
+    }
+    for path in [*files, log.events_path]:
+        content = path.read_text(encoding="utf-8")
+        for value in secrets.values():
+            assert value not in content, (path, value)
+            assert repr(value) not in content, (path, value)
+    redacted = dict.fromkeys(secrets, "***REDACTED***")
+    request = json.loads((step / "request.json").read_text(encoding="utf-8"))
+    assert request["metadata"] == {"validation": {"env": redacted | {"PATH": "/usr/bin"}}}
+    assert request["command"] == [
+        "env",
+        *(f"{name}='***REDACTED***'" for name in secrets),
+        "make",
+        "test",
+    ]
+    result = json.loads((step / "control-result.json").read_text(encoding="utf-8"))
+    assert result["env"] == redacted
+    assert (step / "stdout.log").read_text(encoding="utf-8") == "".join(
+        f"{name}='***REDACTED***'\n" for name in secrets
+    )
 
 
 def test_a_sibling_behind_wide_sequence_dashes_stays_in_the_logs(tmp_path):

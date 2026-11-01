@@ -220,10 +220,12 @@ carries one can be published. The state directory is stored in the clear.
 Google API keys (`AIza...`) are recognised by their shape, under any name
 ([#282](https://github.com/iceboundrock/AutoForge/issues/282)), and so are
 AWS access key ids, private-key blocks (also wrapped in short lines at
-any line break, a bare carriage return or a run of them included, or with
-spaces and tabs between the runs of their body),
+any line break, a bare carriage return or a run of them included, spaces
+and tabs among them too, or with spaces and tabs between the runs of their
+body),
 GitLab, Groq, xAI, npm and Hugging Face tokens, and a value assigned to a
-name that ends in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD`, as text
+name that ends in `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD`, its
+prefix also behind underscores (`_SERVICE_API_KEY`), as text
 or as a mapping's key: any value under an upper-case name
 (`GEMINI_API_KEY=...`), and under a lower-case one (`client_secret: ...`) a
 quoted value, also one that spans lines whatever they hold or starts with
@@ -236,7 +238,9 @@ too), also after the value's YAML anchor or tag (`&cs`, `!!str`), which stay,
 on the key's line or lines of their own, as a block's header below the key
 does, and in a sequence entry however wide its dashes, where the mapping's
 next entry stays, whether a line feed, CRLF or a bare carriage return ends
-its lines; written out in JSON text as well
+its lines, and below a key in a YAML flow collection (`{client_secret:`,
+then the value), where the collection's `}` and next entry stay under a
+lower-case name; written out in JSON text as well
 ([#285](https://github.com/iceboundrock/AutoForge/issues/285)). Among what
 is still not recognised: an unquoted value under a lower-case name that
 reads as code (a password that is a credential's name, a dotted name or a
@@ -252,7 +256,9 @@ string its line opens, a quoted value on the line below an `=` in JSON
 text (`"DB_PASSWORD=\n  'x'"`), a YAML block whose lines a NEL, LS or PS
 character ends (YAML 1.1 parsers such as PyYAML read those as line breaks,
 YAML 1.2 does not; on the key's line such a scalar is redacted, a `|` or
-`>` block below the key is not), a name those suffixes do not cover (`SSH_KEY`,
+`>` block below the key is not), under an upper-case name in a YAML flow
+collection the lines of a plain scalar below its first that are not
+indented, a name those suffixes do not cover (`SSH_KEY`,
 `clientSecret`), an AWS
 secret access key printed without its name, the end of a private key
 whose first line was cut off, and a key whose runs spaces part where no

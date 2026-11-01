@@ -751,6 +751,9 @@ _KEYED_SECRETS = {
     "db_password": "FAKE0keyed0db",
     "Client_Secret": "FAKE0keyed0mixed",
     "GITHUB_TOKEN": "FAKE0keyed0github",
+    # A name whose prefix starts with underscores (#285 review, round 8).
+    "_SERVICE_API_KEY": "FAKE0keyed0service",
+    "__client_secret": "FAKE0keyed0dunder",
 }
 
 

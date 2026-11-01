@@ -38,6 +38,8 @@ from tests.conftest import (
     CR_CRLF_KEY,
     CR_KEY,
     CR_RUN_KEY,
+    CR_SPACE_CR_KEY,
+    CR_SPACE_LF_KEY,
     PR,
     SHORT_WRAPPED_KEY,
     SHORT_WRAPPED_KEY_LINE,
@@ -113,6 +115,22 @@ def test_clean_rejoins_a_token_split_by_an_escape_before_redacting():
         ("client_secret:\n  &cs\r  FAKEcrprops\n", f"client_secret: &cs {REDACTED}"),
         (json.dumps("client_secret:\r  FAKEcrbelow\r"), f'"client_secret:\\r {REDACTED}\\r"'),
         (json.dumps({"key": CR_RUN_KEY}), f'{{"key": "{REDACTED}"}}'),
+        # Round 8: keys whose breaks hold a space, a value below a YAML flow
+        # collection's key and one that goes on below its key's line, the
+        # collection's indicators and next entry kept, and names behind
+        # underscores, as written and as JSON writes them.
+        (CR_SPACE_LF_KEY, REDACTED),
+        (CR_SPACE_CR_KEY, REDACTED),
+        ("{client_secret:\n  FAKEflow}\nnext: 1", f"{{client_secret: {REDACTED}}} next: 1"),
+        ("{client_secret: FAKE1\n  FAKE2}", f"{{client_secret: {REDACTED}}}"),
+        (
+            "x: {db_password:\n  &a FAKE, region: r}",
+            f"x: {{db_password: &a {REDACTED}, region: r}}",
+        ),
+        ("_SERVICE_API_KEY=FAKE", f"_SERVICE_API_KEY={REDACTED}"),
+        ("__client_secret: FAKE", f"__client_secret: {REDACTED}"),
+        (json.dumps("{client_secret:\n  FAKEflow}"), f'"{{client_secret:\\n {REDACTED}}}"'),
+        (json.dumps({"key": CR_SPACE_CR_KEY}), f'{{"key": "{REDACTED}"}}'),
     ],
     ids=[
         "short-wrapped-key",
@@ -134,6 +152,15 @@ def test_clean_rejoins_a_token_split_by_an_escape_before_redacting():
         "yaml-carriage-return-property-line",
         "yaml-carriage-return-as-json",
         "carriage-return-run-key-as-json",
+        "cr-space-lf-key",
+        "cr-space-cr-key",
+        "yaml-flow-value-below",
+        "yaml-flow-value-continued",
+        "yaml-flow-value-after-anchor",
+        "underscore-upper",
+        "underscore-lower",
+        "yaml-flow-value-as-json",
+        "cr-space-cr-key-as-json",
     ],
 )
 def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
@@ -149,8 +176,24 @@ def test_clean_redacts_a_value_by_its_lines_before_it_joins_them(raw, shown):
 
 @pytest.mark.parametrize(
     "key",
-    [SHORT_WRAPPED_KEY, SPACED_KEY, CR_KEY, CR_RUN_KEY, CR_CRLF_KEY],
-    ids=["short-wrapped", "spaced", "carriage-returns", "carriage-return-runs", "terminal-capture"],
+    [
+        SHORT_WRAPPED_KEY,
+        SPACED_KEY,
+        CR_KEY,
+        CR_RUN_KEY,
+        CR_CRLF_KEY,
+        CR_SPACE_LF_KEY,
+        CR_SPACE_CR_KEY,
+    ],
+    ids=[
+        "short-wrapped",
+        "spaced",
+        "carriage-returns",
+        "carriage-return-runs",
+        "terminal-capture",
+        "cr-space-lf",
+        "cr-space-cr",
+    ],
 )
 def test_an_event_whose_input_holds_a_wrapped_or_spaced_key_shows_none_of_it(key):
     event = ProgressEvent(ProgressKind.TOOL_STARTED, tool="Bash", detail=f"echo '{key}' > k")

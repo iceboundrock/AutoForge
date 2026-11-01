@@ -27,6 +27,8 @@ from tests.conftest import (
     CR_CRLF_KEY,
     CR_KEY,
     CR_RUN_KEY,
+    CR_SPACE_CR_KEY,
+    CR_SPACE_LF_KEY,
     FORM_SECRET,
     GITLAB_PAT,
     GITLAB_PAT_BODY,
@@ -50,6 +52,7 @@ from tests.conftest import (
     SPACED_KEY,
     SUFFIX_ASSIGNMENT,
     SUFFIX_SECRET,
+    UNDERSCORE_KEYED_SECRETS_285,
     WHOLE_VALUES_285,
     WHOLE_VALUES_285_R3,
     WHOLE_VALUES_285_R3_REDACTED,
@@ -61,6 +64,8 @@ from tests.conftest import (
     WHOLE_VALUES_285_R6_REDACTED,
     WHOLE_VALUES_285_R7,
     WHOLE_VALUES_285_R7_REDACTED,
+    WHOLE_VALUES_285_R8,
+    WHOLE_VALUES_285_R8_REDACTED,
     XAI_API_KEY,
     XAI_KEY_BODY,
 )
@@ -1020,6 +1025,105 @@ def test_a_private_key_whose_runs_repeated_carriage_returns_part_is_redacted_who
     assert len(out) <= MAX_GROWTH_FACTOR * len(text)
 
 
+# A key whose runs horizontal space among a break's carriage returns and line
+# feed parts (#285 review, round 8), each with what ``redact`` makes of it: a
+# carriage return, a space and a line feed, and a carriage return, a space and
+# a carriage return, between runs of eight; a space before a CRLF, after a
+# line feed and before a carriage return, a tab among them; runs of four and
+# of one; the shortest body; written out as JSON three deep; its first lines
+# alone; under a quoted assignment.
+_CR_SPACE_KEY_TEXTS = [
+    (CR_SPACE_LF_KEY, "***REDACTED***"),
+    (CR_SPACE_CR_KEY, "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 8, " \r\n"), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 8, "\n \r"), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 8, "\t\r\t\n\t"), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 4, "\r \r \n "), "***REDACTED***"),
+    (_respace(PRIVATE_KEY, 1, "\r \n"), "***REDACTED***"),
+    (_one_line_key(8, "\r \n"), "***REDACTED***"),
+    (_one_line_key(8, "\r \r"), "***REDACTED***"),
+    (json.dumps({"key": CR_SPACE_LF_KEY}), json.dumps({"key": "***REDACTED***"})),
+    (
+        json.dumps(json.dumps({"key": CR_SPACE_CR_KEY})),
+        json.dumps(json.dumps({"key": "***REDACTED***"})),
+    ),
+    (
+        json.dumps(json.dumps(json.dumps({"key": CR_SPACE_LF_KEY}))),
+        json.dumps(json.dumps(json.dumps({"key": "***REDACTED***"}))),
+    ),
+    (
+        json.dumps(json.dumps(json.dumps({"key": _one_line_key(8, "\t\r \n")}))),
+        json.dumps(json.dumps(json.dumps({"key": "***REDACTED***"}))),
+    ),
+    ("\r \n".join(CR_SPACE_LF_KEY.split("\r \n")[:3]) + "\n$ ", "***REDACTED***\n$ "),
+    (f'DEPLOY_SECRET="{CR_SPACE_CR_KEY}" next', 'DEPLOY_SECRET="***REDACTED***" next'),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    _CR_SPACE_KEY_TEXTS,
+    ids=[
+        "cr-space-lf",
+        "cr-space-cr",
+        "space-before-crlf",
+        "space-after-lf",
+        "tabs-among-them",
+        "four-wide",
+        "one-wide",
+        "shortest-body-cr-space-lf",
+        "shortest-body-cr-space-cr",
+        "json",
+        "json-in-json",
+        "three-deep",
+        "three-deep-shortest",
+        "head",
+        "quoted-env",
+    ],
+)
+def test_a_private_key_whose_breaks_hold_horizontal_space_is_redacted_whole(text, expected):
+    """#285 review, round 8: a base64 decoder skips spaces, tabs and
+    carriage returns in any order, so a key whose runs ``\\r \\n`` or
+    ``\\r \\r`` part is one OpenSSL reads, to the same public key; but a line
+    break was a run of carriage returns around one line feed, with an
+    indentation after it only, so a space inside it parted two runs and the
+    whole block reached every sink and passed every check, as text and
+    written out. A break is any run of spaces, tabs and carriage returns
+    holding a carriage return or a line feed, and one line feed at most."""
+    out = redact(text)
+    assert out == expected
+    assert SHORT_WRAPPED_KEY_LINE not in out and "MIIE" not in out and "BEGIN" not in out
+    assert credential_classes(text) == ("private-key",)
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    assert len(out) <= MAX_GROWTH_FACTOR * len(text)
+
+
+# Not key material though horizontal space stands in its breaks (#285
+# review, round 8): 16 characters a blank line parts, with a space, with a
+# tab and a carriage return, with carriage returns and spaces around both
+# line feeds, as written and written out (OpenSSL refuses a blank line in a
+# key's body); 15 characters such breaks part; a placeholder and short words
+# whose lines end in a space before a CRLF (14 letters joined); and a hex
+# dump in either case whose lines do.
+_R8_PEM_NEAR_MISSES = [
+    f"{PEM_BEGIN}\nMIIEFAKE\n \nAAAAAAAA\n{PEM_END}",
+    f"{PEM_BEGIN}\nMIIEFAKE\n\t\r\nAAAAAAAA\n{PEM_END}",
+    f"{PEM_BEGIN}\nMIIEFAKE\r \r\n \r\nAAAAAAAA\n{PEM_END}",
+    f"{PEM_BEGIN}\\nMIIEFAKE\\r \\n \\r\\nAAAAAAAA\\n{PEM_END}",
+    f"{PEM_BEGIN}\rMIIEFAKE\r \rAAAAAAA\r \n{PEM_END}",
+    f"{PEM_BEGIN}\r\n<your key here> \r\n{PEM_END}",
+    f"{PEM_BEGIN} \r\nput \r\nyour \r\nkey \r\nhere \r\n{PEM_END}",
+    f"{PEM_BEGIN}\n00 1a 2b 3c \r\n4d 5e 6f 70 \r\n81 92 a3 b4\n{PEM_END}",
+    f"{PEM_BEGIN}\n00 1A 2B 3C\r \r4D 5E 6F 70\r \r81 92 A3 B4\n{PEM_END}",
+]
+
+
+@pytest.mark.parametrize("text", _R8_PEM_NEAR_MISSES)
+def test_a_near_miss_of_a_key_whose_breaks_hold_horizontal_space_is_left(text):
+    assert redact(text) == text
+    assert credential_classes(text) == ()
+
+
 # Not a private key: a public key, a certificate, a label in lower case or
 # behind four dashes, and a BEGIN line with no key material after it (alone,
 # quoted by code or prose, an empty block, a placeholder). Material joined
@@ -1110,6 +1214,17 @@ def test_a_private_key_block_is_replaced_before_any_pattern_takes_a_slice():
         PEM_BEGIN + "\\r\\r\\n" * 150_000,
         (PEM_BEGIN + "\r\r" + "aaaa\r\r\n" * 3 + "-" * 4) * 20_000,
         PEM_BEGIN + ("a" + "\r" * 1_000) * 1_000,
+        # Round 8: spaces and tabs among a break's carriage returns and line
+        # feed, as written and written out, short of 16, each a candidate's
+        # start, long runs of them between characters and with no character,
+        # and spaces before the break of every line.
+        PEM_BEGIN + ("aB1\r \r \n" * 3 + "!") * 25_000,
+        PEM_BEGIN + ("aB1 \t\r\n \r" * 3 + "!") * 20_000,
+        (PEM_BEGIN + "\r \r" + "aaaa \r\n \r" * 3 + "-" * 4) * 15_000,
+        PEM_BEGIN + ("a" + " \r" * 500) * 1_000,
+        PEM_BEGIN + " \r\t" * 330_000,
+        PEM_BEGIN + "\\r \\t\\n " * 100_000,
+        PEM_BEGIN + ("aB1" + " " * 1_000 + "\r") * 1_000,
     ],
     ids=[
         "begin-lines",
@@ -1141,6 +1256,13 @@ def test_a_private_key_block_is_replaced_before_any_pattern_takes_a_slice():
         "written-out-carriage-return-runs",
         "carriage-return-runs-near-end-lines",
         "long-runs-between-characters",
+        "spaced-breaks-short-of-16",
+        "tabbed-breaks-short-of-16",
+        "spaced-breaks-near-end-lines",
+        "long-spaced-breaks-between-characters",
+        "a-megabyte-of-spaced-breaks",
+        "written-out-spaced-breaks",
+        "spaces-before-each-break",
     ],
 )
 def test_the_private_key_pattern_stays_linear(text):
@@ -2662,6 +2784,380 @@ def test_a_value_the_seventh_review_rules_leave_is_left(text):
     assert credential_classes(text) == ()
 
 
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [c[1:] for c in WHOLE_VALUES_285_R8],
+    ids=[c[0] for c in WHOLE_VALUES_285_R8],
+)
+def test_a_value_the_eighth_285_review_found_is_redacted_whole_as_text_and_as_json(text, body):
+    """#285 review, round 8: a value below a YAML flow mapping's key, which
+    a YAML parser reads, and a value under a name whose prefix starts with
+    underscores, a valid shell identifier, were kept whole, as text and
+    written out. Each goes whole, as text and as JSON, JSON in JSON and three
+    deep write it, the JSON still decodes to what redacting the text gives
+    (the flow indicators and the next entry included), and the output is
+    stable and within the growth bound."""
+    name = next(name for name, case, _ in WHOLE_VALUES_285_R8 if case == text)
+    assert redact(text) == WHOLE_VALUES_285_R8_REDACTED[name]
+    for depth in (0, 1, 2, 3):
+        escaped = _json_string(text, depth)
+        out = redact(escaped)
+        assert body not in out and "FAKE" not in out, out
+        assert credential_classes(escaped) == ("credential-suffix-assignment",)
+        assert redact(out) == out and credential_classes(out) == ()
+        assert len(out) <= MAX_GROWTH_FACTOR * len(escaped)
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == WHOLE_VALUES_285_R8_REDACTED[name]
+    assert redact_obj({"env": {"text": text}}) == {"env": {"text": redact(text)}}
+
+
+# A value below a YAML flow collection's key (#285 review, round 8, R8-F2),
+# each with what ``redact`` makes of it: spaces around the key and before the
+# ``}``, a plain scalar of several lines and of several words with the next
+# entry after it, past a blank line and a comment line, a comment after it,
+# its anchor and its tag below the key, a quoted scalar holding flow
+# indicators and one of several lines, a plain scalar that goes on below the
+# key's line with the next entry after it and after an anchor, a key after a
+# ``,`` and a line break whose value is no more indented than it, a flow
+# mapping in a block mapping with the block's next entry after it, two in a
+# flow sequence, after OpenCode's ANSI escape, CRLF and a bare carriage
+# return, and under a well-known and an upper-case name, the next line
+# indented, the next entry after it on its line and the next key after the
+# marker.
+_YAML_FLOW_VALUES = [
+    ("{ client_secret :\n  FAKE }", "{ client_secret :\n  ***REDACTED*** }"),
+    (
+        "{client_secret:\n  FAKE1\n  FAKE2,\n  endpoint: e}",
+        "{client_secret:\n  ***REDACTED***,\n  endpoint: e}",
+    ),
+    ("{client_secret:\n  FAKE1 FAKE2, next: 1}", "{client_secret:\n  ***REDACTED***, next: 1}"),
+    (
+        "{client_secret:\n\n  # rotated\n  FAKE}",
+        "{client_secret:\n\n  # rotated\n  ***REDACTED***}",
+    ),
+    ("{client_secret:\n  FAKE # c\n}", "{client_secret:\n  ***REDACTED*** # c\n}"),
+    ("{client_secret:\n  &cs\n  FAKE}", "{client_secret:\n  &cs\n  ***REDACTED***}"),
+    ("{client_secret:\n  !!str FAKE}", "{client_secret:\n  !!str ***REDACTED***}"),
+    ('{client_secret:\n  "FAKE, [still]"}', '{client_secret:\n  "***REDACTED***"}'),
+    ("{client_secret:\n  'FAKE\n  more'}", "{client_secret:\n  '***REDACTED***'}"),
+    (
+        "{client_secret: FAKE1\n  FAKE2\n  FAKE3, b: c}",
+        "{client_secret: ***REDACTED***, b: c}",
+    ),
+    ("{client_secret: &cs FAKE1\n  FAKE2}", "{client_secret: &cs ***REDACTED***}"),
+    ("{a: 1,\n   client_secret:\n  FAKE}", "{a: 1,\n   client_secret:\n  ***REDACTED***}"),
+    ("x: {client_secret:\n  FAKE}\ny: 2", "x: {client_secret:\n  ***REDACTED***}\ny: 2"),
+    (
+        "[{client_secret:\n  FAKE1}, {db_password:\n  FAKE2}]",
+        "[{client_secret:\n  ***REDACTED***}, {db_password:\n  ***REDACTED***}]",
+    ),
+    ("\x1b[0m{client_secret:\n  FAKE}", "\x1b[0m{client_secret:\n  ***REDACTED***}"),
+    ("{client_secret:\r\n  FAKE}", "{client_secret:\r\n  ***REDACTED***}"),
+    ("{client_secret:\r  FAKE1\r  FAKE2}", "{client_secret:\r  ***REDACTED***}"),
+    # An upper-case or a well-known name's value is anything, as on the
+    # key's line, where ``{GH_TOKEN: FAKE}`` loses its ``}`` to the marker:
+    # the ``}`` goes with it, and the next block entry stays.
+    ("{GH_TOKEN:\n  FAKE1\n  FAKE2}", "{GH_TOKEN:\n  ***REDACTED***"),
+    ("{DEPLOY_SECRET: FAKE1\n  FAKE2}\nnext: 1", "{DEPLOY_SECRET: ***REDACTED***\nnext: 1"),
+    # Its value takes the ``,`` its next line ends at where the next entry's
+    # key follows, which stays; and a key after such a value, whose ``,`` it
+    # took, is read after the marker.
+    ("{GH_TOKEN:\n  FAKE1\n  FAKE2, region: r}", "{GH_TOKEN:\n  ***REDACTED*** region: r}"),
+    (
+        "{GH_TOKEN: FAKE1, client_secret:\n  FAKEnext}",
+        "{GH_TOKEN: ***REDACTED*** client_secret:\n  ***REDACTED***}",
+    ),
+    (
+        "{DEPLOY_SECRET: FAKE1\n  FAKE2, client_secret: FAKE3\n  FAKE4}",
+        "{DEPLOY_SECRET: ***REDACTED*** client_secret: ***REDACTED***}",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _YAML_FLOW_VALUES, ids=[t for t, _ in _YAML_FLOW_VALUES]
+)
+def test_a_value_below_a_yaml_flow_key_is_redacted_whole(text, expected):
+    """#285 review, round 8: inside a flow collection a node's lines need no
+    indentation past its key, and a key there starts no line, so the value
+    below a key right after a ``{``, a ``[`` or a ``,`` was kept whole, or
+    its lines after the first. The value goes, as text and written out; the
+    flow indicators, the next entry, the key, its properties and the comment
+    and blank lines stay."""
+    assert redact(text) == expected
+    assert credential_classes(text) != ()
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    assert "FAKE" not in redact(text)
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        assert "FAKE" not in out and redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+
+
+# What the flow rules leave (#285 review, round 8): under a lower-case name
+# a value that reads as code (a type, a constant, a number, a dotted name,
+# the same name, a reference after a tag, a template, a call), a nested
+# mapping, a sequence and a flow collection, no value before the ``}`` or
+# the next entry, a code fence, a plural name, a call's closing bracket on
+# the next line; in JSON text a key whose line break ends its string, the next
+# string's quote no value's; the line after ``key: value`` lines that
+# redaction left, at a line's start; and a suffix behind underscores alone.
+_R8_NEAR_MISSES = [
+    "{client_secret:\n  string}",
+    "type T = {client_secret:\n  string;\n}",
+    "{client_secret:\n  None}",
+    "{client_secret:\n  12345}",
+    "{client_secret:\n  process.env.CLIENT_SECRET,\n  b: 1}",
+    "x = {api_token:\n  api_token}",
+    "{client_secret:\n  !secret app_secret}",
+    "{client_secret:\n  ${{ secrets.X }}}",
+    "{client_secret:\n  {{ vault_secret }}}",
+    "{client_secret:\n  get_secret(name)}",
+    "{client_secret:\n  key: value}",
+    "{client_secret:\n  - a}",
+    "{client_secret:\n  [a, b]}",
+    "{client_secret:\n}",
+    "{client_secret:\n  , b: c}",
+    "{client_secret:\n  ```\n  x\n  ```}",
+    "{client_secrets:\n  value}",
+    "foo({client_secret: secret\n  })",
+    '{"a": "x, client_secret:\\n", "b": "y"}',
+    '{"a": "{client_secret:\\n", "b": "y"}',
+    '{"a": "client_secret:\\n  ", "b": "y"}',
+    '["x,client_secret:\\r", "y"]',
+    "api_token: ***REDACTED***\ndb_password: ***REDACTED***\nPATH=/usr/bin",
+    "GH_TOKEN=***REDACTED***\nclient_secret: ***REDACTED***\nLoaded 3 modules, 2 plugins",
+    "_TOKEN=x",
+    "__TOKEN=x",
+    "__API_KEY: x",
+    "{_SECRET:\n  value}",
+    "self._api_token = api_token",
+    "_client_secret: Optional[str] = None",
+]
+
+
+@pytest.mark.parametrize("text", _R8_NEAR_MISSES)
+def test_a_value_the_eighth_review_rules_leave_is_left(text):
+    assert redact(text) == text
+    assert credential_classes(text) == ()
+
+
+# Values whose redaction the rules for a YAML flow collection must agree on
+# (#285 review, round 8), each with what ``redact`` makes of it: a value
+# that a well-known or upper-case name's value took the ``,`` before, on the
+# key's line, below it and through a block rule that takes a line whole, so
+# the next key stands after the marker; values in a row, each of which
+# takes the ``,`` the next one stands after; and lines that end in ``,``
+# below such a name, which a lower-case name's value, ending at the ``,``,
+# would have left for that name's rule to take, a line a round; and lines
+# below a key that starts its line, indented past it and not by turns.
+_YAML_FLOW_MEETINGS = [
+    (
+        "{a: 1,\n  _SERVICE_API_KEY:\n FAKE1,\n  __client_secret:\n &cs FAKE2}",
+        "{a: 1,\n  _SERVICE_API_KEY:\n ***REDACTED***\n  __client_secret:\n &cs ***REDACTED***}",
+    ),
+    (
+        "{\n  x_api_key:\n    FAKE1,\n  client_secret:\n  FAKE2}",
+        "{\n  x_api_key:\n    ***REDACTED***\n  client_secret:\n  ***REDACTED***}",
+    ),
+    (
+        "{DEPLOY_SECRET: !!str FAKE1,\n  db_password:\n &cs FAKE2,\n  name: n}",
+        "{DEPLOY_SECRET: !!str ***REDACTED***\n  db_password:\n &cs ***REDACTED***,\n  name: n}",
+    ),
+    (
+        "{A_TOKEN:\n  F1\n  F2,\n  B_TOKEN:\n  F3\n  F4,\n  C_TOKEN:\n  F5\n  F6}",
+        "{A_TOKEN:\n  ***REDACTED***\n  B_TOKEN:\n  ***REDACTED***\n  C_TOKEN:\n  ***REDACTED***",
+    ),
+    ("{GH_TOKEN:\n  F1\n  F2,\n  F3,\n  F4,\n  F5}", "{GH_TOKEN:\n  ***REDACTED***"),
+    ("{gh_token:\n  F1\n  F2,\n  F3,\n  F4,\n  F5}", "{gh_token:\n  ***REDACTED***"),
+    # A key that starts its line, its value's lines below it indented past
+    # the key and not, by turns: the block rule takes an indented line, and
+    # a flow scalar that stopped at the ``,`` on one let each go on where
+    # the other stopped, a line a round.
+    (
+        "{a: 1,\nk_token: FAKE1\nFAKE2\n  , FAKE3\nFAKE4\n  , FAKE5\nFAKE6}",
+        "{a: 1,\nk_token: ***REDACTED***}",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _YAML_FLOW_MEETINGS, ids=[t for t, _ in _YAML_FLOW_MEETINGS]
+)
+def test_the_flow_rules_and_the_name_rules_agree_where_they_meet(text, expected):
+    """#285 review, round 8: a rule that took a ``,`` or a ``}`` a flow
+    collection's value stopped at let that value go on to the next line in
+    the next round, a line a round, and a match that took a marker took the
+    lead of the key after it, whose value then stayed. Each value goes
+    within the rounds, the output is stable, and each depth written out
+    decodes to it."""
+    assert redact(text) == expected
+    assert "FAKE" not in expected and "F2" not in expected
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected and redact(out) == out
+
+
+def test_a_flow_value_line_below_an_upper_case_name_that_is_not_indented_is_left():
+    """#285 review, round 8, a deliberately unfixed edge: under an
+    upper-case or a well-known name a flow collection's value is anything,
+    flow indicators included, as on the key's line, so only indentation
+    tells its lines below from what follows the collection, and a line that
+    is not indented stays (the first line is the name's own rule's), and so
+    does one whose next entry's key holds a space. Going on
+    at no indentation, or ending at the collection's ``}``, either took the
+    lines after the collection or let the key's-line rule take the ``}`` and
+    the next round go on, a line a round."""
+    text = "{GH_TOKEN: FAKE1\nFAKEleft}"
+    assert redact(text) == "{GH_TOKEN: ***REDACTED***\nFAKEleft}"
+    assert redact(redact(text)) == redact(text)
+    text = "{GH_TOKEN:\n  FAKE1\nFAKEleft,\nnext}"
+    assert redact(text) == "{GH_TOKEN:\n  ***REDACTED***\nFAKEleft,\nnext}"
+    # Nor is a line whose next entry's key holds a space: the ``,`` that
+    # ends the value is told by a key of one word.
+    text = "{CLIENT_SECRET:\n  FAKE1\n  FAKEleft, two words: x}"
+    assert redact(text) == "{CLIENT_SECRET:\n  ***REDACTED***\n  FAKEleft, two words: x}"
+
+
+_FLOW_LOWER_NAMES = ["client_secret", "db_password", "x_api_key", "_db_password", "Db_Password"]
+_FLOW_UPPER_NAMES = ["CLIENT_SECRET", "_SERVICE_API_KEY", "GH_TOKEN", "gh_token"]
+
+
+def _flow_value(rng, tag, upper):
+    """A value for a flow collection's entry, its words and where they are:
+    quoted on the key's line or below it, after a property, below the key
+    on lines of their own, or going on below the key's line. Under an
+    upper-case name the lines below are indented (the edge above)."""
+    words = [f"FAKE{tag}w{i}" for i in range(rng.randint(1, 3))]
+    ind = " " * (rng.choice([1, 2, 4]) if upper else rng.choice([0, 1, 2, 4]))
+    kind = rng.random()
+    if kind < 0.2:
+        q = rng.choice(["'", '"'])
+        return f"{rng.choice([' ', chr(10) + ind])}{q}{' '.join(words)}{q}", words
+    if kind < 0.35:
+        prop = rng.choice(["&a ", "!!str "])
+        return f" {prop}{words[0]}" + "".join(f"\n{ind} {w}" for w in words[1:]), words
+    if kind < 0.6:
+        return "\n" + ind + f"\n{ind}".join(words), words
+    if kind < 0.8:
+        return f" {words[0]}" + "".join(f"\n{ind} {w}" for w in words[1:]), words
+    return f"\n{ind}&cs {words[0]}", words[:1]
+
+
+def _flow_collection(rng, it):
+    entries, secrets = [], []
+    for j in range(rng.randint(1, 4)):
+        r = rng.random()
+        if r < 0.3:
+            entries.append(rng.choice(["endpoint: e", "region: r", "a: 1"]))
+            continue
+        upper = r >= 0.7
+        name = rng.choice(_FLOW_UPPER_NAMES if upper else _FLOW_LOWER_NAMES)
+        value, words = _flow_value(rng, f"{it}x{j}", upper)
+        entries.append(f"{name}:{value}")
+        secrets += words
+    text = "{" + rng.choice([", ", ",\n  ", ",\n"]).join(entries) + "}"
+    return (f"outer: {text}\nnext: 1" if rng.random() < 0.3 else text), secrets
+
+
+def test_every_value_in_a_generated_yaml_flow_collection_is_redacted():
+    """#285 review, round 8: flow collections that a YAML parser reads,
+    their keys mixing lower-, mixed- and upper-case, well-known and
+    underscore-led names with other entries, their values plain, quoted,
+    after a property, below the key or going on below its line, entries on
+    one line or on lines of their own. Every word of every credential value
+    goes, as text and as JSON one, two and three deep, the output is
+    stable, and within the growth bound."""
+    yaml = pytest.importorskip("yaml")
+    rng = random.Random(2858)
+    checked = 0
+    while checked < 400:
+        text, secrets = _flow_collection(rng, checked)
+        try:
+            yaml.safe_load(text)
+        except yaml.YAMLError:
+            continue
+        checked += 1
+        for depth in (0, 1, 2, 3):
+            written = _json_string(text, depth)
+            out = redact(written)
+            assert [w for w in secrets if w in out] == [], text
+            assert redact(out) == out and credential_classes(out) == (), text
+            assert len(out) <= MAX_GROWTH_FACTOR * len(written)
+
+
+# A name whose prefix starts with underscores (#285 review, round 8,
+# R8-F3), each with what ``redact`` makes of it: in upper, lower and mixed
+# case, behind one underscore and two, a digit after them, with ``=`` and
+# ``:``, a quoted value, after ``export`` and in a sentence, after OpenCode's
+# ANSI escape, as a quoted key, as a YAML key with a value below it and a
+# block, and with a quoted value whose quote ends its line.
+_UNDERSCORE_NAMES = [
+    ("_SERVICE_API_KEY=FAKE", "_SERVICE_API_KEY=***REDACTED***"),
+    ("_AUTH_TOKEN: FAKE", "_AUTH_TOKEN: ***REDACTED***"),
+    ("__CLIENT_SECRET=FAKE", "__CLIENT_SECRET=***REDACTED***"),
+    ("_DB_PASSWORD=FAKE", "_DB_PASSWORD=***REDACTED***"),
+    ("_db_password=FAKE", "_db_password=***REDACTED***"),
+    ("__Client_Secret: FAKE", "__Client_Secret: ***REDACTED***"),
+    ("_1_TOKEN=FAKE", "_1_TOKEN=***REDACTED***"),
+    ('_AUTH_TOKEN="FAKE spaced; value"', '_AUTH_TOKEN="***REDACTED***"'),
+    ("export _SERVICE_API_KEY=FAKE", "export _SERVICE_API_KEY=***REDACTED***"),
+    ("set _AUTH_TOKEN=FAKE then run", "set _AUTH_TOKEN=***REDACTED*** then run"),
+    ("\x1b[0m_AUTH_TOKEN=FAKE", "\x1b[0m_AUTH_TOKEN=***REDACTED***"),
+    ('{"_SERVICE_API_KEY": "FAKE"}', '{"_SERVICE_API_KEY": "***REDACTED***"}'),
+    ("_AUTH_TOKEN:\n  FAKE", "_AUTH_TOKEN:\n  ***REDACTED***"),
+    ("__client_secret: |\n  FAKE", "__client_secret: |\n  ***REDACTED***"),
+    ("_auth_token: FAKE1\n  FAKE2", "_auth_token: ***REDACTED***"),
+    ('_DB_PASSWORD="\nFAKE"', '_DB_PASSWORD="***REDACTED***"'),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), _UNDERSCORE_NAMES, ids=[t for t, _ in _UNDERSCORE_NAMES]
+)
+def test_a_name_whose_prefix_starts_with_underscores_is_recognised(text, expected):
+    """#285 review, round 8: a shell identifier may start with underscores,
+    but a prefixed name had to start with a letter, so a value under
+    ``_SERVICE_API_KEY``, ``_AUTH_TOKEN`` or ``__CLIENT_SECRET`` was kept
+    whole by every rule that reads such a name, as text and written out.
+    Each is replaced; the name stops where the identifier does."""
+    assert redact(text) == expected
+    assert credential_classes(text) == ("credential-suffix-assignment",)
+    assert redact(expected) == expected and credential_classes(expected) == ()
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        assert "FAKE" not in out and redact(out) == out
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+
+
+def test_redact_obj_redacts_a_value_under_a_name_whose_prefix_starts_with_underscores():
+    """#285 review, round 8: a mapping's key that names a credential behind
+    underscores (``_SERVICE_API_KEY``, ``__CLIENT_SECRET``, ``_db_password``)
+    was no credential's key, so its opaque value was kept at every depth. It
+    is replaced and the entry kept; a suffix behind underscores alone
+    (``_TOKEN``, ``__API_KEY``) still names none."""
+    secrets = dict(UNDERSCORE_KEYED_SECRETS_285)
+    value = {"env": dict(secrets, _TOKEN="x", __API_KEY="y"), "steps": [secrets]}
+    out = redact_obj(value)
+    redacted = dict.fromkeys(secrets, _R)
+    assert out == {"env": redacted | {"_TOKEN": "x", "__API_KEY": "y"}, "steps": [redacted]}
+    for secret in secrets.values():
+        assert secret not in repr(out)
+    assert redact_obj(out) == out
+
+
 # An OAuth name is a prefixed name too (#285 review, round 3, R3-F3):
 # ``oauth-assignment`` takes its value first and ``credential-suffix-
 # assignment`` what it left. The OAuth value ran on over a full stop, a
@@ -2677,7 +3173,9 @@ _OAUTH_AND_SUFFIX_VALUES = [
     ("id_token=FAKE)", "id_token=***REDACTED***)"),
     ("refresh_token=FAKE.)", "refresh_token=***REDACTED***.)"),
     ("oauth_refresh_token=FAKE:x,y.", "oauth_refresh_token=***REDACTED***."),
-    ("refresh_token=FAKE.\\nnext", "refresh_token=***REDACTED***\\nnext"),
+    # A line break written out ends the word as one written as such does
+    # (round 8): the full stop before it is the punctuation after it.
+    ("refresh_token=FAKE.\\nnext", "refresh_token=***REDACTED***.\\nnext"),
     ("REFRESH_TOKEN=,FAKE.", "REFRESH_TOKEN=***REDACTED***"),
     ("REFRESH_TOKEN=FAKE`", "REFRESH_TOKEN=***REDACTED***"),
 ]
@@ -2777,6 +3275,9 @@ _MEET_NAMES = [
     '"GH_TOKEN"',
     "AWS_SECRET_ACCESS_KEY",
     "Db_Password",
+    # Round 8: names whose prefix starts with underscores.
+    "_SERVICE_API_KEY",
+    "__client_secret",
 ]
 _MEET_SEPARATORS = [
     "=",
@@ -2867,6 +3368,11 @@ _MEET_PIECES = [
     "\r\r",
     "\r\r\n",
     "\\r  ",
+    # Round 8: a flow collection's next entry and its end, on the value's
+    # line and below it.
+    ", b: 1}",
+    "}\n",
+    "\n  , ",
 ]
 _MEET_LEADS = [
     "",
@@ -2889,6 +3395,14 @@ _MEET_LEADS = [
     # Round 7: a key on a line a carriage return starts.
     "\r",
     "x: 1\r  ",
+    # Round 8: a key in a flow collection, after its ``{``, a ``,``, a
+    # ``[`` and a line break.
+    "{",
+    "x: {",
+    "{a: 1, ",
+    "[",
+    "{\n  ",
+    "a,\n",
 ]
 
 
@@ -3406,6 +3920,101 @@ def test_the_seventh_review_patterns_stay_linear(text):
     out = redact(text)
     assert time.process_time() - started < 3.0
     assert redact(out) == out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A flow collection's indicators with no name after them, names with
+        # no colon, keys with no value below them, blank lines, comment
+        # lines and indentation alone below one, and space before a key.
+        "," * 1_000_000,
+        ", a_token" * 100_000,
+        "{a_token:\n" * 100_000,
+        "{a_token:\n" + "\n" * 1_000_000,
+        "{a_token:\n" + "  # c\n" * 150_000,
+        (", a_token:\n" + " " * 100) * 10_000,
+        "{" + " " * 1_000_000 + "a_token:\n x}",
+        "[" + "\n" * 400_000 + "a_token:\n x]",
+        # Values: plain scalars of many lines, of many words, words then
+        # blank lines with no line after them, one long line with no break,
+        # quoted ones that never close, and the same written out.
+        ("{a_token:\n  x\n" + "  y\n" * 100 + "}") * 3_000,
+        ("{a_token: x\n" + "  y\n" * 100 + "}") * 3_000,
+        ("{a_token: " + "a " * 100 + "\n" + "\n" * 100) * 3_000,
+        "{a_token: x" + " y" * 500_000,
+        "{a_token:\n  '" + "x\n" * 500_000,
+        "{a_token:\\n  x\\n" * 60_000,
+        ("{a_token:\\n" + "\\n" * 100 + "  x}") * 3_000,
+        # Names behind underscores: a megabyte of underscores, runs of them
+        # before a letter, each after a space, and long names of them.
+        "_" * 1_000_000,
+        ("_" * 100 + "A") * 10_000,
+        " _" * 500_000,
+        ("__A" * 100 + "_TOKEN=x ") * 3_000,
+    ],
+    ids=[
+        "commas",
+        "names-no-colon",
+        "keys-no-value",
+        "blank-lines-below-a-key",
+        "comment-lines-below-a-key",
+        "indentation-alone",
+        "spaces-before-a-key",
+        "line-breaks-before-a-key",
+        "plain-scalars-of-many-lines",
+        "continued-scalars",
+        "words-then-blank-lines",
+        "one-long-line",
+        "quoted-never-closed",
+        "written-out-values",
+        "written-out-blank-lines",
+        "underscores",
+        "underscore-runs-before-a-letter",
+        "spaced-underscores",
+        "long-underscore-names",
+    ],
+)
+def test_the_eighth_review_patterns_stay_linear(text):
+    """#285 review, round 8: a flow collection's candidate starts at a
+    ``{``, a ``[`` or a ``,``, reads the space after it and one identifier,
+    then one line break and its value's lines, each once; a name's run of
+    underscores is read once. A megabyte of each is redacted well inside the
+    budget, and the output is stable."""
+    started = time.process_time()
+    out = redact(text)
+    assert time.process_time() - started < 3.0
+    assert redact(out) == out
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("{client_secret: FAKE}", "{client_secret: ***REDACTED***}"),
+        ("f(x_token=FAKE),", "f(x_token=***REDACTED***),"),
+        ("refresh_token=FAKE}", "refresh_token=***REDACTED***}"),
+        ("client_secret: None,", "client_secret: None,"),
+        ("x_token: config.auth.tok,", "x_token: config.auth.tok,"),
+        ("api_token: str):", "api_token: str):"),
+    ],
+    ids=str,
+)
+def test_punctuation_before_an_escaped_quote_ends_a_word_at_every_depth(text, expected):
+    """#285 review, round 8: in JSON in JSON a string's closing quote is
+    ``\\"``, and the punctuation before it (``}``, ``,``, ``)``) was read as
+    a word's, since a backslash went on with it: a flow mapping's ``}`` went
+    with the value, and code (``None,``) no longer read as code and was
+    redacted. A backslash that starts an escaped quote or a line break
+    written out ends the word, so each depth decodes to what redacting the
+    text gives."""
+    assert redact(text) == expected
+    for depth in (1, 2, 3):
+        out = redact(_json_string(text, depth))
+        decoded = out
+        for _ in range(depth):
+            decoded = json.loads(decoded)
+        assert decoded == expected
+        assert redact(out) == out
 
 
 def test_redact_obj_redacts_a_285_shape_at_any_depth():
@@ -4243,16 +4852,18 @@ def test_redact_obj_redacts_a_token_after_an_ansi_escape_at_any_depth():
 
 def test_every_pattern_but_the_quoted_oauth_field_starts_a_token_after_an_escape():
     """A new pattern is built with ``_token``, never anchored on ``\\b``: only
-    ``oauth-field``, which a quote starts, and the six patterns that start
-    at a line's start, the two YAML value patterns (#285 review, round 3)
-    and the two of round 4 on each side of them, which take an escape before
-    a name as a line's start or a token's, have no ``after_escape`` pass."""
-    line_patterns = ["env-assignment", "credential-suffix-assignment"] * 3
+    ``oauth-field``, which a quote starts, the six patterns that start at a
+    line's start, the two YAML value patterns (#285 review, round 3) and the
+    two of round 4 on each side of them, which take an escape before a name
+    as a line's start or a token's, and the four that start at a YAML flow
+    collection's ``{``, ``[`` or ``,`` (round 8), which no escape ends, have
+    no ``after_escape`` pass."""
+    line_patterns = ["env-assignment", "credential-suffix-assignment"] * 5
     assert [
         (index, entry.name) for index, entry in enumerate(_PATTERNS) if entry.after_escape is None
     ] == [
         (17, "oauth-field"),
-        *((len(_PATTERNS) - 6 + i, name) for i, name in enumerate(line_patterns)),
+        *((len(_PATTERNS) - 10 + i, name) for i, name in enumerate(line_patterns)),
     ]
     assert not [entry.name for entry in _PATTERNS if r"\b" in entry.regex.pattern]
 
@@ -4373,6 +4984,17 @@ _WORST_CASE_UNITS = {
     "yaml_value_carriage_return": "a_token:\r x\r",
     "yaml_header_below_carriage_return": "a_token:\r |\r x\r",
     "named_assignment_written_out_carriage_return": "A_TOKEN=\\rx;",
+    # Round 8: a value below a YAML flow collection's key, 12 to 25 after a
+    # ``{`` and 11 to 24 after a ``,``, the shortest; a plain scalar that
+    # goes on below such a key's line, 14 to 25; and under a well-known
+    # name, its next line indented, longer still. A name behind an underscore, 11 to 24, is one
+    # character longer than the shortest name.
+    "yaml_flow_value": "{a_token:\nx}",
+    "yaml_flow_value_after_comma": ",a_token:\nx",
+    "yaml_flow_value_well_known_name": "{HF_TOKEN:\nx y}",
+    "yaml_flow_continued": "{a_token: x\ny}",
+    "yaml_flow_continued_well_known_name": "{HF_TOKEN: x\n y z}",
+    "credential_suffix_assignment_underscore": "_A_TOKEN=x;",
     # The BEGIN line and 16 characters of key material, its floor: 44 to 15.
     "private_key": "-----BEGIN" + " PRIVATE KEY-----" + "a" * 16 + " ",
     # Its material parted by spaces (round 5), longer still: 48 to 16.
@@ -4381,6 +5003,8 @@ _WORST_CASE_UNITS = {
     "private_key_carriage_returns": "-----BEGIN" + " PRIVATE KEY-----" + "a\r" * 15 + "a ",
     # Parted by runs of carriage returns (round 7): 74 to 15.
     "private_key_carriage_return_runs": "-----BEGIN" + " PRIVATE KEY-----" + "a\r\r" * 15 + "a ",
+    # Parted by a carriage return, a space and a line feed (round 8): 89 to 15.
+    "private_key_spaced_breaks": "-----BEGIN" + " PRIVATE KEY-----" + "a\r \n" * 15 + "a ",
     "gitlab_pat": "gl" + "pat-" + "a" * 20 + " ",
     "aws_access_key_id": "AKI" + "A" * 17 + " ",
     "groq_api_key": "gs" + "k_" + "a" * 20 + " ",
@@ -4506,9 +5130,15 @@ def test_every_redaction_pattern_has_its_stable_class_name():
         "oauth-bare-assignment",
         "credential-suffix-assignment",
         # A quoted value whose quote ends its line (#285 review, round 4), a
-        # credential name's value on the lines below it (round 3), and a
-        # plain scalar that starts on its key's line and goes on below it
-        # (round 4), each under the class of the name's own pattern.
+        # credential name's value on the lines below it (round 3), a value
+        # below a YAML flow collection's key and a plain scalar that goes on
+        # below such a key's line (round 8), and a plain scalar that starts
+        # on its key's line and goes on below it (round 4), each under the
+        # class of the name's own pattern.
+        "env-assignment",
+        "credential-suffix-assignment",
+        "env-assignment",
+        "credential-suffix-assignment",
         "env-assignment",
         "credential-suffix-assignment",
         "env-assignment",
@@ -4640,9 +5270,10 @@ def test_the_well_known_names_hint_holds_for_every_name_in_any_case():
     """``env-assignment``'s hint is derived from the names it knows, so it
     holds for each of them, as written, in lower case and mixed, on the
     name's line and as the second hint of each pattern that starts at a
-    line's start (#285 review, rounds 3 and 4)."""
+    line's start (#285 review, rounds 3 and 4) or at a flow collection's
+    indicator (round 8)."""
     line, *starts = [entry for entry in _PATTERNS if entry.name == "env-assignment"]
-    assert line.hint is not None and len(starts) == 3
+    assert line.hint is not None and len(starts) == 5
     for name in _ENV_NAME_LIST:
         for variant in (name, name.lower(), name.title()):
             assert line.hint.search(variant), variant
