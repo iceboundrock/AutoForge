@@ -117,26 +117,32 @@ def problems(workflows: Mapping[str, str]) -> list[str]:
         # YAML counts the same line breaks as splitlines in any text it parses.
         text_lines = text.splitlines()
         located = _uses_lines(text)
-        lines: list[tuple[int, re.Match[str]]] = []
-        for index in located:
+        # A step repeated by an alias (`- *checkout`) is its anchor's step,
+        # so its `uses` is on the anchor's line: each line is read once, and
+        # what is wrong with it is reported once.
+        lines: dict[int, re.Match[str]] = {}
+        for index in dict.fromkeys(located):
             if match := USES_LINE.match(text_lines[index]):
-                lines.append((index + 1, match))
+                lines[index] = match
             else:
                 found.append(
                     f"{name}:{index + 1}: write each `uses:` on a line of its own as "
                     f"`uses: owner/repo@<sha> # vX.Y.Z`, not {text_lines[index].strip()!r}"
                 )
-        scanned = [match["ref"] for _, match in lines]
         read = _yaml_references(text)
-        # A line found unreadable above already fails; otherwise the lines
-        # must hold exactly what YAML reads (a quoted value, an alias, a
-        # reference merged in from another mapping all differ).
-        if len(lines) == len(located) and scanned != read:
-            found.append(
-                f"{name}: write each `uses:` on a line of its own as "
-                f"`uses: owner/repo@<sha> # vX.Y.Z`; YAML reads {read}, the line scan {scanned}"
-            )
-        for number, match in lines:
+        # A line found unreadable above already fails; otherwise the lines,
+        # one per reference, must hold exactly what YAML reads (a quoted
+        # value, an alias for the value, a reference merged in from another
+        # mapping all differ).
+        if all(index in lines for index in located):
+            scanned = [lines[index]["ref"] for index in located]
+            if scanned != read:
+                found.append(
+                    f"{name}: write each `uses:` on a line of its own as "
+                    f"`uses: owner/repo@<sha> # vX.Y.Z`; YAML reads {read}, the line scan {scanned}"
+                )
+        for index, match in lines.items():
+            number = index + 1
             ref, comment = match["ref"], match["comment"]
             pinned = PINNED.fullmatch(ref)
             if not pinned:
@@ -169,11 +175,12 @@ def _each_pin_undone(name: str, text: str) -> list[tuple[str, str]]:
 
     Each comes with the one problem the check must then report. The pins are
     the lines :func:`_uses_lines` locates, never a script line that only
-    reads like one.
+    reads like one, and each line once: a step repeated by an alias reads
+    its anchor's line, so undoing that one pin undoes every reference to it.
     """
     lines = text.splitlines(keepends=True)
     undone: list[tuple[str, str]] = []
-    for index in _uses_lines(text):
+    for index in dict.fromkeys(_uses_lines(text)):
         match = USES_LINE.match(lines[index])
         assert match, f"{name}:{index + 1} is not a `uses:` line the check reads"
         release = match["comment"]
@@ -183,6 +190,20 @@ def _each_pin_undone(name: str, text: str) -> list[tuple[str, str]]:
         tagged = [*lines[:index], f"{line[: match.start('ref')]}{tag}\n", *lines[index + 1 :]]
         problem = f"{name}:{index + 1}: {tag} is not pinned to a full commit SHA"
         undone.append(("".join(tagged), problem))
+    return undone
+
+
+def _undo_each_pin(workflows: Mapping[str, str]) -> int:
+    """Undo each pin of ``workflows`` in turn; each must fail with its one problem.
+
+    The pinned workflows pass as they are. Returns how many pins were undone.
+    """
+    assert problems(workflows) == []
+    undone = 0
+    for name, text in workflows.items():
+        for tagged, problem in _each_pin_undone(name, text):
+            assert problems({name: tagged}) == [problem]
+            undone += 1
     return undone
 
 
@@ -237,12 +258,28 @@ def test_a_tag_in_place_of_any_real_pin_fails_the_check():
     release's major tag (``@v7`` for ``# v7.0.1``), so a pin updated as
     docs/development.md says leaves this test meaning what it meant.
     """
-    undone = 0
-    for name, text in _real().items():
-        for tagged, problem in _each_pin_undone(name, text):
-            assert problems({name: tagged}) == [problem]
-            undone += 1
-    assert undone, "no workflow pins an action, so there is no real pin to undo"
+    assert _undo_each_pin(_real()), "no workflow pins an action, so there is no real pin to undo"
+
+
+def test_undoing_a_pin_that_aliases_repeat_undoes_it_once_and_fails_once():
+    """A step repeated by an alias reads its anchor's pin: one line, one undo, one problem.
+
+    The pinned workflow passes, in the mutation test too, and the shared pin
+    turned into a tag is refused once, at the anchor's line, however many
+    references read it.
+    """
+    anchored = f"- &checkout\n        uses: {CHECKOUT} # v7.0.1"
+    python = f"actions/setup-python@{OTHER_SHA}"
+    other_job = "  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - *checkout\n"
+    text = _workflow(anchored, "- *checkout", f"- uses: {python} # v6.0.0", jobs=other_job)
+    assert _yaml_references(text) == [CHECKOUT, CHECKOUT, python, CHECKOUT]
+    assert _uses_lines(text) == [6, 6, 8, 6]
+    assert _undo_each_pin({"x.yml": text}) == 2
+    (tagged, problem), _ = _each_pin_undone("x.yml", text)
+    tag = "actions/checkout@v7"
+    assert _yaml_references(tagged) == [tag, tag, python, tag]
+    assert problem == f"x.yml:7: {tag} is not pinned to a full commit SHA"
+    assert problems({"x.yml": tagged}) == [problem]
 
 
 @pytest.mark.parametrize("script", SCRIPTS)
