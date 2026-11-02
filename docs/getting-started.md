@@ -177,11 +177,15 @@ both in this repository:
   judge, with the acceptance criteria in its body. The controller hands its
   body and comments to the implementer, which gets no GitHub credential of
   its own;
-- the **EPIC** is the issue the work belongs to. A run checks only that it
-  is another issue of the same repository. AutoForge writes to it only
-  after a merge it made itself, to post progress and pick the next issue
-  (`UPDATE_EPIC`); with the merge gate closed, as here, the first run never
-  writes to it.
+- the **EPIC** is the issue the work belongs to. When the issue is a
+  sub-issue of another issue on GitHub (its native parent), the run records
+  that parent as its EPIC, whatever `--epic` says; when it has none, as the
+  two issues below, the run records `--epic`
+  ([Which EPIC a run records](usage.md#which-epic-a-run-records)). Either
+  way the EPIC is an open issue of the same repository. AutoForge writes to
+  it only after a merge it made itself, to post progress and pick the next
+  issue (`UPDATE_EPIC`); with the merge gate closed, as here, the first run
+  never writes to it.
 
 Write the two bodies to files, for example `epic.md`:
 
@@ -353,9 +357,11 @@ what you ran. `doctor` prints the versions it checks (`git available`,
 
 ## 6. Preview, run, and read where it stopped
 
-**Preview.** A dry run prints the plan of the first phases, the agent
-command and its limits, and the prompt; it starts no process, calls no
-`gh`, and writes no state:
+**Preview.** A dry run prints which EPIC the run would record, the plan of
+the first phases, the agent command and its limits, and the prompt. It
+checks that the checkout's `origin` is the issues' repository and reads the
+issue and the EPIC through `gh` (so run it in the checkout, with `gh`
+signed in), starts no agent, writes nothing to git, and writes no state:
 
 ```bash
 autoforge --config autoforge.yaml run --epic "$epic" --issue "$issue" --dry-run
@@ -368,6 +374,11 @@ issue's complete `https://github.com/...` URL, quoted.
 It starts with:
 
 ```text
+EPIC binding for issue #2:
+  --epic:        #1 https://github.com/you/first-run/issues/1
+  native parent: none (GitHub names no parent for #2)
+  used:          #1 https://github.com/you/first-run/issues/1 (--epic, since the issue has no native parent)
+
 Phase:    INITIALIZING
 Profile:  (none — deterministic transition) (provider=(none), model=(none), effort=(none))
 Routing:  INITIALIZING -> ANALYZE_EXECUTE (verify repository + issue; no agent)
@@ -483,6 +494,10 @@ has a phase, see [Troubleshooting and recovery](troubleshooting.md).
 | `repository mismatch: this checkout's 'origin' is <repo> but the issue/epic belong to <repo>` | the checkout's `origin` is another repository: run from a clone of the issues' repository |
 | `autoforge: error: GitHub URL must use https, got http scheme: '<url>'` | pass `https://github.com/...` URLs |
 | `autoforge: error: expected a GitHub issue URL, got pr: '<url>'` | `--epic` and `--issue` take issues, not pull requests |
+| `autoforge: error: issue <url> has no native parent on GitHub and no --epic was given: ...` | pass `--epic "$epic"`, or make the issue a sub-issue of its EPIC on GitHub |
+| `autoforge: error: the EPIC --epic names <url> is closed on GitHub; a run records only an open EPIC ...` | reopen the EPIC, or name an open one |
+| `autoforge: error: issue <url> changed on GitHub while the run's EPIC was being bound: ...` | the issue was moved, attached, detached or closed while `run` read it; nothing was written: run the command again |
+| ``autoforge: error: cannot bind the run's EPIC: reading the issue <url> failed (`gh api repos/<repo>/issues/<n>` failed (exit 1): ...). Nothing was written, ...`` | `gh` cannot read the issue: sign in (`gh auth login`), check the URL, and that your token may read the repository |
 
 **`gh` and the agent CLIs.**
 

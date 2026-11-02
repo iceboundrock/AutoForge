@@ -341,6 +341,7 @@ from .github import (
     GitHubClient,
     IssueInfo,
     PRInfo,
+    RepoInfo,
     WorkflowRunJobs,
     build_merge_argv,
     checks_access_remedy,
@@ -469,6 +470,7 @@ from .roadmap import (
     splice_roadmap,
     split_roadmap,
 )
+from .run_binding import EpicBinding, bind_run_epic, check_run_urls
 from .run_namespace import IssueNamespace, check_standalone_state_dir, inside_scheduler_root
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
@@ -2742,7 +2744,7 @@ class ControllerEngine:
     def _isolation_plan_notes(self) -> list[str]:
         """What a REMOTE agent step's isolation would be, for the plan / dry run.
 
-        No git runs here: a dry run may be planned outside any repository.
+        No git runs here: a plan may be made outside any repository.
         """
         names = self.config.execution.environment_names()
         return [
@@ -2826,8 +2828,9 @@ class ControllerEngine:
         ADR 0008 D17.3 (:func:`autoforge.run_namespace.check_standalone_state_dir`):
         ``run``, ``step`` and ``resume`` call it before they take the lock
         and before they read any state; ``status`` and ``unblock`` do not. A
-        dry run is not checked: it runs no git, so it has no coordination
-        root, and it writes nothing.
+        dry run is not checked: it takes no lock and derives no coordination
+        root (``run --dry-run``'s one git read is the checkout's ``origin``,
+        #293), and it writes nothing.
         """
         check_standalone_state_dir(self.paths.state_dir, self.coordination_root(), command)
 
@@ -2856,6 +2859,49 @@ class ControllerEngine:
         )
         self._state_from_disk = False
         return self.state
+
+    def bind_new_run(self, epic_url: str | None, issue_url: str) -> EpicBinding:
+        """The EPIC a new run of ``issue_url`` records, read from GitHub (#293).
+
+        The issue's native parent, else ``--epic`` (``epic_url``, None when
+        not given); refused with nothing written otherwise
+        (:func:`autoforge.run_binding.bind_run_epic`). Before any of the
+        binding's reads, and after the URLs' local checks, this checkout
+        must be the issue's repository (:meth:`verify_checkout_repository`):
+        a checkout of another repository, or one whose repository cannot be
+        read, is refused before anything is saved, replaced or moved aside
+        (PR #437 R1-F2). ``run`` calls it under the controller lock
+        immediately before :meth:`new_run` and the first save, its dry run
+        without the lock, so the two refuse alike; a scheduler's worker does
+        not, since its EPIC is the one whose snapshot admitted the issue as
+        a direct child.
+        """
+        issue, _ = check_run_urls(issue_url, epic_url)
+        self.verify_checkout_repository(issue.repository)
+        return bind_run_epic(self.github, issue_url, epic_url)
+
+    def log_epic_binding(self, binding: EpicBinding) -> None:
+        """One controller-only run-log record of the EPIC a new run records and why (#293).
+
+        Written once, after the run's first save: the issue, the EPIC, its
+        source (the native parent or ``--epic``), ``--epic`` as given and the
+        native parent GitHub named.
+        """
+        state = self._require_state()
+        now = utcnow_iso()
+        record = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase=f"{state.phase.value}-epic-binding",
+            attempt=1,
+            issue_url=state.current_issue_url,
+            profile="(EPIC binding at run creation; no agent)",
+            prompt_version=state.prompt_version,
+            started_at=now,
+            finished_at=now,
+            metadata=binding.record(),
+        )
+        self._logger().log_execution(record)
 
     def load(self) -> AutoForgeState:
         """Read the run at :attr:`paths` through the held state root."""
@@ -5181,15 +5227,7 @@ class ControllerEngine:
         """Preflight: repository/issue verification, then -> ANALYZE_EXECUTE."""
         state = self._require_state()
         self.validate_config()
-        home = self._checkout_repository()
-        # GitHub's name for it: a renamed repository answers with its new one.
-        repo = self.github.get_repo(home)
-        if repo.name_with_owner.lower() != state.repository.lower():
-            raise VerificationError(
-                f"repository mismatch: this checkout's 'origin' is {home!r} "
-                f"({repo.name_with_owner!r} on GitHub), but the issue/epic belong to "
-                f"{state.repository!r}"
-            )
+        self.verify_checkout_repository(state.repository)
         issue = self._verify_issue_selectable(state.current_issue_url, switching=False)
         nxt = self._next_phase(Phase.INITIALIZING, {})
         validate_transition(Phase.INITIALIZING, nxt)
@@ -5203,6 +5241,27 @@ class ControllerEngine:
                 f"verified issue #{issue.number} ({issue.state}); INITIALIZING -> {nxt.value}"
             ),
         )
+
+    def verify_checkout_repository(self, repository: str) -> RepoInfo:
+        """This checkout's repository as GitHub names it; VerificationError unless ``repository``.
+
+        The checkout's ``origin`` (:meth:`_checkout_repository`, read locally),
+        then GitHub's name for it (``get_repo``): a renamed repository
+        answers with its new name, which is what is compared, owner and name
+        case-insensitively. ``run`` checks it before the new run's first
+        save (:meth:`bind_new_run`) and INITIALIZING again on every entry.
+        An ``origin`` that cannot be read or names no GitHub repository is a
+        VerificationError; a GitHub read that fails propagates unchanged.
+        """
+        home = self._checkout_repository()
+        repo = self.github.get_repo(home)
+        if repo.name_with_owner.lower() != repository.lower():
+            raise VerificationError(
+                f"repository mismatch: this checkout's 'origin' is {home!r} "
+                f"({repo.name_with_owner!r} on GitHub), but the issue/epic belong to "
+                f"{repository!r}"
+            )
+        return repo
 
     def _checkout_repository(self) -> str:
         """``owner/repo`` of this checkout's ``origin`` remote, read by the controller's git.

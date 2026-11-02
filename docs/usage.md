@@ -16,13 +16,18 @@ development clone of AutoForge. With the command installed
 uv run autoforge doctor                 # environment checks (writes nothing but a state-dir probe)
 uv run autoforge doctor --json
 
-# preview without touching anything (no subprocess, no gh call, no state file)
+# preview: reads the checkout's origin, the repository, the issue and its EPIC,
+# writes nothing (no agent, no git write, no state file)
 uv run autoforge run --epic https://github.com/owner/repo/issues/1 \
                --issue https://github.com/owner/repo/issues/2 --dry-run
 
-# create a run and drive it until READY_FOR_MERGE / BLOCKED / FAILED
+# create a run and drive it until READY_FOR_MERGE / BLOCKED / FAILED; the run
+# records the issue's native parent as its EPIC, --epic only when it has none
 uv run autoforge run --epic https://github.com/owner/repo/issues/1 \
                --issue https://github.com/owner/repo/issues/2
+
+# an issue that is a native sub-issue of its EPIC needs no --epic
+uv run autoforge run --issue https://github.com/owner/repo/issues/2
 
 uv run autoforge status            # human summary
 uv run autoforge status --json     # machine-readable; `replan_journal` says whether the
@@ -86,9 +91,90 @@ To run several issues of an EPIC at once, see
 
 URLs must be HTTPS GitHub issue URLs, and EPIC + issue must be in the same
 repository as the current working directory (cross-repo runs are rejected).
+Which EPIC a new run records is decided from GitHub, not only from `--epic`:
+see [Which EPIC a run records](#which-epic-a-run-records).
 `run`, `step` and `resume` must be run inside a git checkout of that
-repository, because the repository lock lives in its git directory (dry-run
-does not need one).
+repository, because the repository lock lives in its git directory, and
+`run` refuses a checkout whose `origin` is another repository before it
+writes anything. `run --dry-run` makes the same check of the checkout's
+`origin`; `step --dry-run` and `resume --dry-run` need no checkout.
+
+## Which EPIC a run records
+
+A run records one EPIC when it is created (`epic_url` in its state), and
+acts on that record until it ends: `UPDATE_EPIC` posts its progress
+comment and writes its roadmap section there, and takes the next issue only
+among that EPIC's native sub-issues. `run` decides it from GitHub's native
+parent link of the issue (#293):
+
+- **The issue has a native parent** (it is a sub-issue of that issue on
+  GitHub): the run records that parent. `--epic` is not needed, and an
+  `--epic` naming another issue is printed and not used. A nested issue
+  records its direct parent, never an ancestor.
+- **The issue has no native parent:** the run records `--epic`, as `run`
+  always did.
+- **Neither:** `run` refuses (exit 2) and writes nothing.
+
+A parent named in the issue's body, a task list, the EPIC's roadmap or a
+title never counts; `run` does not read them. Issue text is untrusted, and
+anyone who can edit an issue could otherwise point `UPDATE_EPIC`'s writes
+at another issue. Attach the issue to its EPIC on GitHub instead.
+
+`run` and `run --dry-run` print what they decided before anything else.
+For an issue #257 whose native parent is #255, started with `--epic` #158:
+
+```text
+EPIC binding for issue #257:
+  --epic:        #158 https://github.com/owner/repo/issues/158
+  native parent: #255 https://github.com/owner/repo/issues/255
+  used:          #255 https://github.com/owner/repo/issues/255 (the issue's native parent; --epic names #158, which is not used)
+```
+
+The run log records the same (`<state dir>/logs/<run id>/events.jsonl`,
+the record whose `phase` is `INITIALIZING-epic-binding`, with
+`epic_source` `native-parent` or `epic-option`, `--epic` as given and the
+parent GitHub named).
+
+**What is checked, and when it refuses.** `run` first checks that the
+checkout is the issue's repository: its `origin`, as GitHub names it
+(`gh repo view`, which follows a rename). Another repository, or an
+`origin` or repository that cannot be read, exits 1 and writes nothing.
+So does an answer that does not name the repository: AutoForge never
+assumes the name it asked for.
+Then it reads the issue, the EPIC it would record and the issue again
+through `gh` (`GET /repos/<owner>/<repo>/issues/<n>` each; nothing else).
+The issue and that EPIC must both be open, and the EPIC in the issue's
+repository: a native parent in another repository is
+refused, and `--epic` does not override it. Each of these refusals exits 2
+and says what to change on GitHub or in the command. A read that fails
+(GitHub unavailable, a token that may not read the issue or its parent,
+`404`, an answer that is malformed or truncated, or an API without native
+sub-issues) exits 1 and records nothing. It is never taken for "no
+parent", so it never falls back to `--epic`: only an issue GitHub returned
+whole, without a parent, does.
+
+`run` reads the binding under the controller lock, after the
+existing-run and scheduler-ownership checks, before `--force` replaces a
+run or moves an unreadable state aside, and immediately before it saves
+the new state, so the state records what GitHub answered at that moment.
+The issue is read last, after its EPIC: if its parent or its state changed
+on GitHub between its two reads (someone moved it while `run` read the
+EPIC), `run` refuses (exit 2, `issue <url> changed on GitHub while the
+run's EPIC was being bound`) and records nothing; run it again to bind what
+the issue says then. The dry run reads and prints it the same way, without
+the lock, and saves nothing.
+
+**Three different things.** GitHub's *native parent* of an issue is a fact
+on GitHub that anyone with access can change. A run's *recorded EPIC*
+(`epic_url`, `EPIC:` in `status`) is what the run was created with and
+never changes. *Scheduler ownership* is whether an `autoforge epic`
+namespace holds the issue ([Running an EPIC in parallel](#running-an-epic-in-parallel));
+a standalone `run` refuses an issue a scheduler owns before it reads
+anything from GitHub. Changing an issue's parent on GitHub after its run
+started changes nothing in that run: `resume`, `step`, `unblock` and
+`status` read the recorded EPIC, never the issue's current parent.
+Rebinding an existing run is not supported yet (#435); `run --force`
+discards a run, it does not migrate one.
 
 ## What a run does
 
@@ -1000,8 +1086,12 @@ model/effort, agent limits, loop detection, round, template, variables,
 command, expected transition),
 redacted. What it reads depends on the command:
 
-- `run --dry-run` previews a new run and launches no subprocess: no `git`,
-  no `gh`.
+- `run --dry-run` previews a new run. It reads the checkout's `origin`
+  (one read-only `git remote get-url`) and the repository it names, then
+  the issue, the EPIC it would record and the issue again through `gh`:
+  the same reads `run` makes before its first save ([Which EPIC a run
+  records](#which-epic-a-run-records)). It refuses as `run` would, runs no
+  other `git` and makes no other `gh` call.
 - `step --dry-run` and `resume --dry-run` preview the existing run and make
   no `gh` call.
 - `unblock --dry-run` reads GitHub to report the decision it would make

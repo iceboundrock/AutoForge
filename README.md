@@ -296,13 +296,16 @@ failures with their fixes. The commands in brief:
 
 Run these from a checkout of the repository the issues belong to. URLs must
 be HTTPS GitHub issue URLs, and the EPIC and the issue must be in that same
-repository (cross-repo runs are rejected).
+repository (cross-repo runs are rejected). The run records the issue's
+native parent on GitHub as its EPIC; `--epic` is used only for an issue
+with no parent ([Which EPIC a run records](https://github.com/iceboundrock/AutoForge/blob/main/docs/usage.md#which-epic-a-run-records)).
 
 ```bash
 # 1. check the environment (writes nothing but a state-dir probe)
 autoforge doctor
 
-# 2. preview without touching anything (no subprocess, no gh call, no state file)
+# 2. preview, in the checkout: reads its repository, the issue and its EPIC
+#    through gh, writes nothing
 autoforge run --epic https://github.com/owner/repo/issues/1 \
               --issue https://github.com/owner/repo/issues/2 --dry-run
 

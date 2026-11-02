@@ -1034,7 +1034,8 @@ carries in every mode.
   copies: `test_git_workspace.py`) (#187)
 - a path that exists but is not a worktree root of this repository, or a
   location inside the operator's working tree, is refused, not adopted
-- a dry run creates no worktree and runs no git
+- a dry run creates no worktree and runs no worktree git (`run --dry-run`'s
+  one git is the read-only check of the checkout's `origin`, #293)
 - worktree creation, its identity read, and the workspace
   reader are hardened (the registry is read without git, #223) (ADR 0004 D7.3): a planted `post-checkout` or
   `reference-transaction` hook (in `hooks/` or a configured `core.hooksPath`)
