@@ -1882,15 +1882,18 @@ step outputs it hands on. `tests/test_publish_workflow.py` reads
 
 `tests/test_workflow_pins.py` reads every workflow under
 `.github/workflows/` (#288) and fails when a `uses:`, a step's or a
-reusable workflow's, is not `owner/repo[/path]@<full SHA> # vX.Y.Z`: a tag
-(`actions/checkout@v7` in the real `ci.yml` included), a branch, a short or
-uppercase SHA, a missing or partial release comment, a Docker image or a
-local action. Each workflow is read with PyYAML and line by line, and the
-two must find the same references, so a flow-style or quoted `uses:` fails
-rather than going unread; a commented-out step or a `run` script that
-names an action is no reference. One action repository must have one
-commit and one release in every workflow
-([Development](../development.md#pinned-actions)).
+reusable workflow's, is not `owner/repo[/path]@<full SHA> # vX.Y.Z`: a tag,
+a branch, a short or uppercase SHA, a missing or partial release comment, a
+Docker image or a local action. Each real pin in turn, read from the
+workflow as it stands, is replaced by its release's major tag and must be
+the one problem reported, so updating a pin changes no test. Each workflow
+is read with PyYAML and line by line, and the two must find the same
+references, so a flow-style or quoted `uses:` fails rather than going
+unread; a commented-out step or a `run` script that names an action is no
+reference, and a workflow of `run` steps alone has nothing to pin and
+passes (that every real workflow is found and parses to its jobs is a test
+of its own). One action repository must have one commit and one release in
+every workflow ([Development](../development.md#pinned-actions)).
 
 ### SDK policy (#149, docs/sdk-policy.md)
 

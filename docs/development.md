@@ -604,7 +604,8 @@ short SHA, a Docker image or a local action, when its comment is not a full
 release `vX.Y.Z`, when it is spelled in a form the check's line scan cannot
 read (flow style, a quoted key or value), and when two references to one
 action repository, in any of the workflows, name different commits or
-releases. No test can tell offline whether a SHA really is the release its
+releases. A workflow whose steps are all `run` has nothing to pin and
+passes. No test can tell offline whether a SHA really is the release its
 comment names; that is what the update procedure is for.
 
 To update a pin:

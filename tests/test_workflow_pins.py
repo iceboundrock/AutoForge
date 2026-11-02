@@ -53,6 +53,8 @@ RELEASE = re.compile(r"v\d+\.\d+\.\d+")
 # YAML starts a comment only after whitespace, so the reference runs to it.
 USES_LINE = re.compile(r"^\s*(?:-\s+)?uses:\s*(?P<ref>\S+)(?:\s+#\s*(?P<comment>.*?))?\s*$")
 
+# For the synthetic workflows below only: no test requires a real workflow
+# to pin this commit, so updating a pin never touches this file.
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 CHECKOUT = f"actions/checkout@{CHECKOUT_SHA}"
 OTHER_SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -122,25 +124,55 @@ def _workflow(*steps: str, jobs: str = "") -> str:
 
 
 def test_the_check_reads_every_workflow_github_runs():
+    """Discovery and parsing, whether or not a workflow uses an action at all."""
     names = [p.name for p in workflow_files()]
     assert {"ci.yml", "pypi-publish.yml"} <= set(names), names
+    for name, text in _real().items():
+        data: Any = yaml.safe_load(text)
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        assert isinstance(jobs, dict) and jobs, f"{name} does not read as a workflow with jobs"
+
+
+def test_discovery_takes_both_workflow_extensions_and_nothing_else(tmp_path: Path):
+    for name in ("b.yaml", "a.yml", "notes.md", "c.yml.bak", "README"):
+        (tmp_path / name).write_text("", encoding="utf-8")
+    assert [p.name for p in workflow_files(tmp_path)] == ["a.yml", "b.yaml"]
 
 
 def test_every_action_of_every_workflow_is_pinned_to_one_commit_with_its_release():
-    workflows = _real()
-    assert problems(workflows) == []
-    for name, text in workflows.items():
-        assert _yaml_references(text), f"{name} uses no action: is the check reading it?"
+    assert problems(_real()) == []
 
 
-def test_a_tag_in_the_real_ci_workflow_fails_the_check():
-    """The acceptance criterion on the file it is about: undo one pin and the check fails."""
-    text = (WORKFLOWS_DIR / "ci.yml").read_text(encoding="utf-8")
-    pinned = f"uses: {CHECKOUT} # v7.0.1\n"
-    assert pinned in text
-    found = problems({"ci.yml": text.replace(pinned, "uses: actions/checkout@v7\n", 1)})
-    assert len(found) == 1, found
-    assert "actions/checkout@v7 is not pinned to a full commit SHA" in found[0]
+def test_a_workflow_that_uses_no_action_has_nothing_to_pin():
+    """`run` steps alone pass, in a workflow of their own and beside the real ones."""
+    lint = "  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruff check .\n"
+    action_free = _workflow("- run: make check", "- run: echo actions/checkout@v7", jobs=lint)
+    assert _yaml_references(action_free) == []
+    assert problems({"x.yml": action_free}) == []
+    assert problems({**_real(), "x.yml": action_free}) == []
+
+
+def test_a_tag_in_place_of_any_real_pin_fails_the_check():
+    """The acceptance criterion on the files it is about: undo any one pin and the check fails.
+
+    Each pin is read from the workflow as it stands and replaced by its
+    release's major tag (``@v7`` for ``# v7.0.1``), so a pin updated as
+    docs/development.md says leaves this test meaning what it meant.
+    """
+    undone = 0
+    for name, text in _real().items():
+        lines = text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if not (match := USES_LINE.match(line)):
+                continue
+            release = match["comment"]
+            assert release, f"{name}:{index + 1} has no release comment"
+            tag = f"{match['ref'].rsplit('@', 1)[0]}@{release.split('.')[0]}"
+            tagged = [*lines[:index], f"{line[: match.start('ref')]}{tag}\n", *lines[index + 1 :]]
+            found = problems({name: "".join(tagged)})
+            assert found == [f"{name}:{index + 1}: {tag} is not pinned to a full commit SHA"]
+            undone += 1
+    assert undone, "no workflow pins an action, so there is no real pin to undo"
 
 
 @pytest.mark.parametrize(
