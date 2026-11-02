@@ -587,6 +587,67 @@ noticed before an unattended run relies on it.
 Each `test` job also writes a duration report, which decides nothing
 ([Test durations in CI](#test-durations-in-ci)).
 
+## Pinned actions
+
+Every `uses:` in `.github/workflows/` names its action by a full commit
+SHA, with the release that commit is as a comment:
+
+```yaml
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+```
+
+A tag such as `v7` is a name the action's owners can move to other code,
+which would then run under the `ci` check the merge gate reads, or in the
+release build; a commit SHA names one tree (#288).
+`tests/test_workflow_pins.py` fails when a `uses:` names a tag, a branch, a
+short SHA, a Docker image or a local action, when its comment is not a full
+release `vX.Y.Z`, when it is spelled in a form the check's line scan cannot
+read (flow style, a quoted key or value, the value on the next line, an
+anchor or an alias for the value, a reference merged in by `<<`), and when
+two references to one action repository, in any of the workflows, name
+different commits or releases. YAML's own parse locates each job's and
+step's `uses` key, and only those lines are scanned, so a line of a
+multi-line `run: |` script that reads like a `uses:` (one writing a
+composite action, say) is no reference. A whole step repeated by an alias
+(`- *checkout`) is its anchor's step: its pin is the anchor's line, checked
+and reported once. A workflow whose steps are all `run` has nothing to pin and
+passes. No test can tell offline whether a SHA really is the release its
+comment names; that is what the update procedure is for.
+
+To update a pin:
+
+1. Resolve the release's commit from the action's own repository, not a
+   fork, a mirror or a Marketplace page, naming the tag and its peeled
+   commit exactly:
+   `git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<release>' 'refs/tags/<release>^{}'`.
+   Use the line whose ref is exactly `refs/tags/<release>^{}` when there
+   is one (an annotated tag: the other line is the tag object, not a
+   commit), and otherwise the one that is exactly `refs/tags/<release>`
+   (a lightweight tag). Never a wildcard such as `'refs/tags/<release>*'`:
+   it also lists every release whose name starts with `<release>`
+   (`v7.0.1` matches `v7.0.10` and `v7.0.1-rc.1`), each another commit.
+2. Read what changed between the old commit and the new one, release notes
+   included: the pin moves trust to that review.
+3. Replace the SHA and the comment at every occurrence in every workflow in
+   one change: the check requires one commit per action repository. uv's
+   own `version` and `checksum`, in CI's `dist` job and the release build,
+   are a separate pin, which `tests/test_publish_workflow.py` keeps equal.
+
+Such a PR touches `.github/workflows/`, one of the
+`safety.protected_merge_paths`, so the controller blocks before merging it,
+for a human to review and merge
+([What a green `ci` does and does not prove](#what-a-green-ci-does-and-does-not-prove)).
+Dependabot's `github-actions` ecosystem can propose these updates, SHA and
+comment together, but is not enabled: it would open pull requests on its own
+schedule, which is the maintainer's decision, and each would still be one
+for a human to merge.
+
+A pin fixes an action's code, not what that code fetches when it runs. In
+`test`, `static` and `sandbox`, setup-uv installs the uv it resolves at run
+time (no `version` is given there; only `dist` and the release build pin uv
+by version and checksum), and the publish action pulls a container image by
+a tag ([Releasing](releasing.md#the-workflow)).
+
 ## Test durations in CI
 
 The suite's time has so far been measured by hand on two workstations

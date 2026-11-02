@@ -169,8 +169,9 @@ def test_build_uses_the_uv_of_ci_dist_job_pinned_by_version_and_checksum():
     ]
     pin = {key: setup[key] for key in ("version", "checksum")}
     assert {key: ci_step["with"].get(key) for key in pin} == pin
-    (release,) = re.findall(r"astral-sh/setup-uv@[0-9a-f]{40} # (v[\d.]+)", TEXT)
-    assert ci_step["uses"] == f"astral-sh/setup-uv@{release}"
+    # The same setup-uv commit too (YAML drops the release comment beside it).
+    (pinned,) = re.findall(r"astral-sh/setup-uv@[0-9a-f]{40}", TEXT)
+    assert ci_step["uses"] == pinned
 
 
 def test_publish_reverifies_exactly_the_recorded_files_and_uploads_them_with_attestations():

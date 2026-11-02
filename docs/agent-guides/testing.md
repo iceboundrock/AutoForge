@@ -1880,6 +1880,25 @@ step outputs it hands on. `tests/test_publish_workflow.py` reads
   a changed file, an extra file, another version, a different
   `SHA256SUMS` or no recorded digests
 
+`tests/test_workflow_pins.py` reads every workflow under
+`.github/workflows/` (#288) and fails when a `uses:`, a step's or a
+reusable workflow's, is not `owner/repo[/path]@<full SHA> # vX.Y.Z`: a tag,
+a branch, a short or uppercase SHA, a missing or partial release comment, a
+Docker image or a local action. Each real pin in turn, read from the
+workflow as it stands, is replaced by its release's major tag and must be
+the one problem reported, so updating a pin changes no test. PyYAML's
+parse locates each job's and step's `uses` key; only those lines are
+scanned, for the release comment YAML drops, and they must hold what
+YAML reads, so a flow-style, quoted, anchored, next-line or merged-in
+`uses:` fails rather than going unread. A commented-out step, an input
+named `uses` and a `run` script are no reference, even a multi-line
+`run: |` script whose lines read `uses: actions/checkout@v7`, alone or
+beside real references, and the tag-for-a-pin mutation above undoes the
+located lines only. A workflow of `run` steps alone has nothing to pin and
+passes (that every real workflow is found and parses to its jobs is a test
+of its own). One action repository must have one commit and one release in
+every workflow ([Development](../development.md#pinned-actions)).
+
 ### SDK policy (#149, docs/sdk-policy.md)
 
 The SDK providers cannot launch yet, so their policy is held at its own

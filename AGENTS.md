@@ -231,9 +231,10 @@ docs/sdk-policy.md                     SDK providers: what a launch may load, to
 docs/configuration.md                  config files, formats, strict key validation, profiles
 docs/compatibility.md                  what AutoForge runs on (OS, Python, git, gh, agent CLIs, sandbox
                                        host, filesystem, provider auth), each claim with its evidence
-docs/development.md                    make targets, CI, the CI duration report and its regression
-                                       policy, the built-distribution check, what a green `ci` does
-                                       and does not prove
+docs/development.md                    make targets, CI, its pinned actions and how to update a pin,
+                                       the CI duration report and its regression policy, the
+                                       built-distribution check, what a green `ci` does and does
+                                       not prove
 docs/test-suite-performance-audit.md   EPIC #338's exit audit: the suite at the EPIC's baseline and on
                                        main, measured on one host; each exit criterion and invariant
                                        with its verdict and tests; what only GitHub holds

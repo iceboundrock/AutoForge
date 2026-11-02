@@ -412,6 +412,12 @@ doctor's rows                         instead), test_engine_sandbox.py,
                                       test_sandbox_gate.py, test_doctor_sandbox.py,
                                       test_sandbox_host.py (the host measurement)
 config, CLI, doctor, CI drift guards  test_config.py, test_cli.py, test_doctor.py, test_ci_workflow.py, test_gitignore.py
+every workflow's actions pinned to a  test_workflow_pins.py (a tag, branch, short SHA, Docker
+commit with its release (#288)        image, local action or missing release fails, a tag in
+                                      place of any real pin included; YAML locates each `uses`
+                                      key and its line must hold what YAML reads; a `run: |`
+                                      script's `uses:` line is none; one commit per action
+                                      repository; `run` steps alone pass)
 CI duration report and its regression test_ci_durations.py (counts, the window, the verdicts, the
 policy (#344)                         history, nothing of a failure written, exit 0),
                                       test_ci_workflow.py (report only: after pytest, never

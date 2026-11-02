@@ -322,11 +322,12 @@ release carries yet.
 | [#291](https://github.com/iceboundrock/AutoForge/issues/291) | Medium | *Fixed in `0.1.0a0`.* With a fine-grained token on a private repository whose pull requests have checks, REVIEW and FIX now run without the check results (the reviewer is told they are unknown), the merge gate blocks with a reason naming the credential and its remedy, and `doctor`'s "pull request check runs readable" row reports it | With the merge gate open, use `gh auth login` or a classic token with `repo` there ([why](#check-runs-on-a-private-repository)) |
 
 Also disclosed: pushed code runs in your CI before any review
-([above](#pushed-code-runs-in-your-ci)); AutoForge's own CI pins its GitHub
-Actions by tag, not by commit SHA
-([#288](https://github.com/iceboundrock/AutoForge/issues/288)), while its
-publishing workflow pins every action by commit SHA
-([Releasing](releasing.md#publishing-to-pypi)); and the
+([above](#pushed-code-runs-in-your-ci)); AutoForge's own CI pinned its two
+GitHub Actions by tag, not by commit SHA, in `0.1.0a0`, and on `main`
+every workflow of the repository, CI and the publishing workflow alike,
+pins every action by commit SHA
+([#288](https://github.com/iceboundrock/AutoForge/issues/288),
+[Development](development.md#pinned-actions)); and the
 `autoforge` distribution on PyPI is an unrelated project: AutoForge's is
 `autoforge-cli`
 ([#256](https://github.com/iceboundrock/AutoForge/issues/256)), published
