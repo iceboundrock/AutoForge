@@ -663,14 +663,21 @@ commit was never pushed or reviewed, and a fresh round would leave it
 behind. It is refused too while the agent worktree holds uncommitted
 changes (the message names the worktree): the new round's reviewer works
 there, and would read and test them instead of the reviewed commit.
-AutoForge compares every tracked file with the reviewed commit itself, so
-an edit is found even when the worktree's index marks the file
-assume-unchanged or skip-worktree and `git -C <worktree> status` therefore
-does not list it; the message says how many such files there are, and
-`git -C <worktree> ls-files -v` shows the marks (a lower-case letter or an
-`S`). Unblock without the flag to let `FIX` continue from the work (its
-prompt lists what `git status` lists), or move the work out of the
-worktree yourself and unblock again; AutoForge never discards it. The flag also checks that the base branch was not rewritten
+AutoForge compares every tracked file's bytes with the reviewed commit
+itself, with no git process reading the worktree, so an edit is found
+even when `git -C <worktree> status` does not list it: when the
+worktree's index marks the file
+assume-unchanged or skip-worktree (`git -C <worktree> ls-files -v` shows
+the mark as a lower-case letter or an `S`), or when a conversion the
+file's attributes name, a clean filter say, maps it back to the committed
+content (`git -C <worktree> check-attr -a -- <file>` names it). The
+message says how many such files there are. A repository whose checkout
+itself writes other bytes than the committed ones (Git LFS, `eol=crlf`,
+`ident`, `working-tree-encoding`) is refused for the same reason. Unblock
+without the flag to let `FIX` continue from the work (its prompt lists
+what `git status` lists), or move the work out of the worktree yourself
+and unblock again; AutoForge never discards it. The flag also checks that
+the base branch was not rewritten
 under the PR since the review (its merge base moved): if it was, unblock
 without the flag, and `FIX` sends the PR to a fresh review of the actual
 revision without launching the fixer. Where a plain `unblock` would not

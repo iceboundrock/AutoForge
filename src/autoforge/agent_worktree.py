@@ -34,8 +34,14 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   status against a fresh index of the reviewed revision that the
   controller writes into a temporary directory of its own: an
   assume-unchanged or skip-worktree mark hides no edit there (PR #444
-  R2-F1). ``unblock --rereview`` refuses a worktree either lists anything
-  in, since the next round's reviewer works there.
+  R2-F1). Both statuses compare what git makes of a file, after the
+  conversions its attributes and configuration name (a clean filter, an
+  end-of-line, ``ident`` or ``working-tree-encoding`` conversion), so
+  :func:`byte_changes_from_revision` also compares every blob of the
+  reviewed tree with the worktree's bytes with no git process reading the
+  worktree (:func:`~autoforge.materialize.tree_differences`, R3-F1).
+  ``unblock --rereview`` refuses a worktree any of the three lists
+  anything in, since the next round's reviewer works there.
 - **Strict import (D6.5).** :func:`import_private_objects` copies the
   objects reachable from that ``HEAD`` which the shared store lacks out of
   the issue's private object directory (an enforced launch's overlay upper
@@ -78,6 +84,7 @@ from .executor import ExecutionRequest, ExecutionResult, execute
 from .git_transport import NO_AUTO_MAINTENANCE, local_git_request
 from .git_workspace import STATUS_ARGS, StatusEntry, parse_status
 from .locking import SharedGitLock
+from .materialize import read_object_format, tree_differences
 from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -494,6 +501,49 @@ def changes_from_revision(
             f"{failed} (its temporary index directory: {exc.strerror or exc})"
         ) from exc
     return parse_status(res.stdout or "")
+
+
+# How a byte comparison's difference reads as a ``git status`` code.
+_DIFFERENCE_CODES = {"modified": " M", "deleted": " D", "retyped": " T"}
+
+
+def byte_changes_from_revision(
+    common: Path, worktree: str, revision: str, runner: Runner | None
+) -> list[StatusEntry]:
+    """The tracked files of ``revision`` whose bytes the bound ``worktree`` does not hold.
+
+    Both :func:`uncommitted_entries` and :func:`changes_from_revision`
+    compare what git makes of a file: before it compares, git converts the
+    file as the attributes name (the worktree's ``.gitattributes`` files,
+    ``info/attributes``, ``core.attributesFile``) with what the
+    configuration defines (a filter driver's clean program, an end-of-line,
+    ``ident`` or ``working-tree-encoding`` conversion). A clean filter can
+    map an edited file back to the reviewed blob, so neither lists an edit
+    the next round's reviewer would read and test (PR #444 R3-F1). Here no
+    git process reads the worktree: ``revision``'s tree is listed from the
+    shared store (git runs in ``common``) and each of its blobs is
+    compared with the worktree's bytes, its mode and its file type
+    (:func:`~autoforge.materialize.tree_differences`). A modified, deleted
+    or retyped file reads as ``" M"``, ``" D"`` or ``" T"``; a file that is
+    not in ``revision`` and a gitlink's path are not looked at
+    (:func:`changes_from_revision` lists them). A worktree whose checkout
+    converts content itself (Git LFS, ``eol=crlf``) reads as changed: no
+    conversion is trusted to say which bytes are the commit's. An
+    inconclusive read is a :class:`VerificationError`, never a guess.
+    """
+    run = runner or execute
+    try:
+        object_format = read_object_format(run, str(common))
+        differences = tree_differences(run, str(common), revision, object_format, Path(worktree))
+    except VerificationError as exc:
+        raise VerificationError(
+            f"cannot compare the bytes of the agent worktree {worktree} with the revision "
+            f"{revision[:12]} ({exc})"
+        ) from exc
+    return [
+        StatusEntry(_DIFFERENCE_CODES[d.kind], d.path.decode("utf-8", "replace"))
+        for d in differences
+    ]
 
 
 def _root_problem(common: Path, directory: Path) -> str | None:

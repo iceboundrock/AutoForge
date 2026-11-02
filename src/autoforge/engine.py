@@ -134,6 +134,7 @@ from .agent_worktree import (
     Candidate,
     ObjectImportError,
     bound_admin_dir,
+    byte_changes_from_revision,
     changes_from_revision,
     holds_objects,
     import_private_objects,
@@ -7528,7 +7529,8 @@ class ControllerEngine:
         nothing the reviewed HEAD does not: it does not exist, or its HEAD
         is detached at the reviewed HEAD and ``git status`` lists nothing,
         neither against the worktree's own index nor against a fresh index
-        of the reviewed tree. Any other HEAD (a fixer's unpushed commit, a
+        of the reviewed tree, and every file of that tree holds its bytes.
+        Any other HEAD (a fixer's unpushed commit, a
         local branch, a commit the shared store does not hold) may be work
         a fresh round would leave behind. An uncommitted change (a blocked
         fixer's half-made edit, an untracked file) is what that reviewer
@@ -7540,10 +7542,14 @@ class ControllerEngine:
         compared with the reviewed tree through a fresh index
         (:func:`changes_from_revision`); the first read still lists what
         only that index holds (a staged change since reverted in the file).
-        ``HEAD`` is read as a candidate is (ADR 0005 D6.3) and both
-        statuses through the bound admin dir (:func:`uncommitted_entries`),
-        never through the worktree's ``.git`` file; nothing is imported or
-        written.
+        Both statuses compare a file after the conversions its attributes
+        name, and a clean filter can map an edit back to the reviewed blob
+        (R3-F1), so every blob of the reviewed tree is also compared with
+        the worktree's bytes, with no git process reading the worktree
+        (:func:`byte_changes_from_revision`). ``HEAD`` is read as a
+        candidate is (ADR 0005 D6.3) and both statuses through the bound
+        admin dir (:func:`uncommitted_entries`), never through the
+        worktree's ``.git`` file; nothing is imported or written.
         """
         path = self.agent_worktree_path()
         if not os.path.lexists(path):
@@ -7579,34 +7585,49 @@ class ControllerEngine:
             )
         try:
             entries = uncommitted_entries(common, admin, str(path), self._runner)
-            listed = {entry.path for entry in entries}
-            hidden = [
-                entry
-                for entry in changes_from_revision(common, admin, str(path), reviewed, self._runner)
-                if entry.path not in listed
-            ]
+            fresh = changes_from_revision(common, admin, str(path), reviewed, self._runner)
+            raw = byte_changes_from_revision(common, str(path), reviewed, self._runner)
         except VerificationError as exc:
             return (
                 f"{exc}, so whether the next round's reviewer would judge changes the reviewed "
                 f"HEAD {reviewed[:12]} does not hold is not knowable. Fix the cause, then "
                 "unblock again, or unblock without --rereview"
             )
-        if not entries and not hidden:
+        listed = {entry.path for entry in entries}
+        marked = [entry for entry in fresh if entry.path not in listed]
+        known = listed | {entry.path for entry in marked}
+        converted = [entry for entry in raw if entry.path not in known]
+        if not entries and not marked and not converted:
             return ""
         listing, prompt = f"`git -C {path} status` lists them", "its prompt lists them"
-        if hidden:
+        if marked or converted:
+            causes = []
+            if marked:
+                causes.append(
+                    f"{len(marked)} the worktree's index records as unchanged although they "
+                    "differ from the reviewed commit, as an assume-unchanged or skip-worktree "
+                    f"mark does, which `git -C {path} ls-files -v` shows as a lower-case letter "
+                    "or an S"
+                )
+            if converted:
+                causes.append(
+                    f"{len(converted)} whose bytes or execute bit differ from the reviewed "
+                    "commit's although git reads them as its content, as a filter driver (a "
+                    "clean filter, Git LFS), an end-of-line, ident or working-tree-encoding "
+                    "conversion or core.fileMode=false does; "
+                    f"`git -C {path} check-attr -a -- <file>` names a file's conversions"
+                )
             listing = (
-                f"`git -C {path} status` does not list {len(hidden)} of them: the worktree's "
-                "index records those files as unchanged although they differ from the reviewed "
-                "commit, as an assume-unchanged or skip-worktree mark does, which "
-                f"`git -C {path} ls-files -v` shows as a lower-case letter or an S"
+                f"`git -C {path} status` does not list {len(marked) + len(converted)} of "
+                f"them: {'; '.join(causes)}"
             )
             prompt = "its prompt lists only what `git status` lists"
         return (
-            f"the agent worktree {path} holds {len(entries) + len(hidden)} uncommitted "
-            f"change(s) on the reviewed HEAD {reviewed[:12]} ({listing}), and the next round's "
-            "reviewer works in that worktree: what it reads and tests there would be those "
-            "changes, not the reviewed commit. The controller neither discards nor moves them. "
+            f"the agent worktree {path} holds {len(entries) + len(marked) + len(converted)} "
+            f"uncommitted change(s) on the reviewed HEAD {reviewed[:12]} ({listing}), and the "
+            "next round's reviewer works in that worktree: what it reads and tests there would "
+            "be those changes, not the reviewed commit. The controller neither discards nor "
+            "moves them. "
             f"Unblock without --rereview to let FIX continue from them ({prompt}), or move "
             "them out of the worktree yourself and unblock again"
         )

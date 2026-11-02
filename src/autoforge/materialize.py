@@ -39,6 +39,12 @@ uses it, and candidate validation (#172) will.
   the listing names for it and the root to the commit's tree, with no entry
   extra or missing. A mismatch is a
   :class:`~autoforge.errors.MaterializationError` naming the entry.
+- **Comparison (PR #444 R3-F1).** :func:`tree_differences` compares a
+  working tree the controller did not write (an agent worktree) with a
+  commit's tree the same way, blob by blob, and lists what differs instead
+  of raising: what the directory holds besides the tree's blobs is not
+  looked at, and no git process reads it, so no attribute, filter or
+  index can make other bytes read as the commit's.
 
 Every git process is the hardened local request
 (:func:`~autoforge.git_transport.local_git_request`, ADR 0004 D7.3, D7.5):
@@ -50,6 +56,7 @@ again.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
@@ -127,13 +134,18 @@ class MaterializedTree:
 
 @dataclass(frozen=True)
 class _Entry:
-    """One ``ls-tree`` record: ``path`` is ``parent`` and ``name`` joined by ``/``."""
+    """One ``ls-tree`` record: ``path`` is ``parent`` and ``name`` joined by ``/``.
+
+    ``size``: a blob's size in bytes when the listing was read with sizes,
+    else -1.
+    """
 
     path: bytes
     parent: bytes
     name: bytes
     mode: bytes
     oid: str
+    size: int = -1
 
 
 @dataclass(frozen=True)
@@ -247,9 +259,15 @@ def _check_name(name: bytes, path: bytes, commit: str) -> None:
         )
 
 
-def _list_tree(runner: Runner, repo: str, commit: str, tree: str, object_format: str) -> _Listing:
-    """Every entry of ``tree``, validated before anything is written."""
-    args = ["ls-tree", "-r", "-t", "-z", "--full-tree", tree]
+def _list_tree(
+    runner: Runner, repo: str, commit: str, tree: str, object_format: str, *, sizes: bool = False
+) -> _Listing:
+    """Every entry of ``tree``, validated before anything is written.
+
+    ``sizes``: read each blob's size too (``ls-tree -l``), which reads the
+    header of every blob from the store.
+    """
+    args = ["ls-tree", "-r", "-t", *(["-l"] if sizes else []), "-z", "--full-tree", tree]
     collector = _Collector()
     req = _request(repo, args)
     req.on_chunk = collector
@@ -265,7 +283,16 @@ def _list_tree(runner: Runner, repo: str, commit: str, tree: str, object_format:
     seen: set[bytes] = set()
     for record in raw.split(b"\0")[:-1]:
         meta, tab, path = record.partition(b"\t")
-        fields = meta.split(b" ")
+        # ``-l`` right-aligns the size after one or more spaces: "-" for a
+        # tree or a gitlink, a decimal for a blob.
+        fields = meta.split(b" ", 3) if sizes else meta.split(b" ")
+        size = -1
+        if sizes:
+            shown_size = fields.pop().lstrip(b" ") if len(fields) == 4 else b""
+            if shown_size.isdigit() and fields[1] == b"blob":
+                size = int(shown_size)
+            elif shown_size != b"-" or fields[1] == b"blob":
+                fields = []
         if not tab or len(fields) != 3:
             raise MaterializationError(
                 f"commit {commit}: unreadable listing record {_shown(record)}"
@@ -293,7 +320,7 @@ def _list_tree(runner: Runner, repo: str, commit: str, tree: str, object_format:
         seen.add(path)
         if mode == _TREE:
             trees.add(path)
-        entries.append(_Entry(path, parent, name, mode, oid.decode("ascii")))
+        entries.append(_Entry(path, parent, name, mode, oid.decode("ascii"), size))
     return _Listing(tree=tree, entries=tuple(entries))
 
 
@@ -685,6 +712,126 @@ def _prove(root: Path, listing: _Listing, commit: str, object_format: str) -> No
     finally:
         for open_frame in frames:
             os.close(open_frame.fd)
+
+
+@dataclass(frozen=True)
+class TreeDifference:
+    """A blob of a commit's tree that a directory does not hold as the commit does.
+
+    ``kind`` is ``"deleted"`` (nothing at the path, or a directory above it
+    that is not a real one), ``"retyped"`` (anything but a regular file
+    where the tree lists one, anything but a symlink where it lists a
+    symlink) or ``"modified"`` (other bytes, or the owner's execute bit
+    other than the mode says).
+    """
+
+    path: bytes
+    kind: str
+
+
+# What opening a directory along a listed path finds when it is not a real
+# directory there: nothing, a file, or a symlink (``O_NOFOLLOW``: ELOOP on
+# Linux, ENOTDIR on some other systems).
+_NOT_A_DIRECTORY = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
+
+
+def _open_listed_dir(parent: int | None, name: bytes) -> int | None:
+    """The real directory ``name`` in ``parent``, opened without following a link, or ``None``."""
+    if parent is None:
+        return None
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent)
+    except OSError as exc:
+        if exc.errno in _NOT_A_DIRECTORY:
+            return None
+        raise
+
+
+def _blob_difference(object_format: str, parent: int | None, entry: _Entry) -> str:
+    """How the blob ``entry`` differs in the directory ``parent``, or "" when it does not."""
+    if parent is None:
+        return "deleted"
+    try:
+        st = os.lstat(entry.name, dir_fd=parent)
+    except FileNotFoundError:
+        return "deleted"
+    if entry.mode == _SYMLINK:
+        if not stat.S_ISLNK(st.st_mode):
+            return "retyped"
+        target = os.readlink(entry.name, dir_fd=parent)
+        return "" if _blob_id(object_format, target) == entry.oid else "modified"
+    if not stat.S_ISREG(st.st_mode):
+        return "retyped"
+    mode = _EXECUTABLE if st.st_mode & stat.S_IXUSR else _FILE
+    if mode != entry.mode or st.st_size != entry.size:
+        return "modified"
+    _, oid = _file_id(object_format, parent, entry.name, st)
+    return "" if oid == entry.oid else "modified"
+
+
+def tree_differences(
+    runner: Runner, repo: str, commit: str, object_format: str, root: Path
+) -> list[TreeDifference]:
+    """The blobs of ``commit``'s tree that ``root`` does not hold byte for byte (PR #444 R3-F1).
+
+    ``root`` is a working tree someone else wrote (an agent worktree), not
+    an export: what it holds besides the tree's blobs (an untracked or
+    ignored file, a ``.git``) is not looked at, nor is what is at a
+    gitlink's path. The tree is listed, sizes included, from ``repo``'s
+    store as :func:`materialize` lists it, every name refused that it
+    refuses; no git process reads ``root``. Each blob is then compared as
+    the proof (D6.3) compares an export: ``lstat``-ed relative to the
+    descriptor of its directory, every directory on its path opened
+    without following a link (a directory that is a link, a file or
+    missing makes everything below it ``deleted``), a regular file's
+    execute bit and size compared with the listing before its bytes are
+    read and hashed, a symlink's link text hashed. So no attribute, filter
+    driver, end-of-line, ``ident`` or ``working-tree-encoding`` conversion,
+    and no index, takes part: a file reads as the commit's only when its
+    bytes are the blob's. ``object_format`` names the store's format
+    (:func:`read_object_format`). In listing order.
+
+    Raises :class:`~autoforge.errors.CandidateNotMaterializableError` when
+    ``commit`` is not a commit of the store, and
+    :class:`~autoforge.errors.MaterializationError` when the tree cannot be
+    listed or a file cannot be read (a directory without permission, a file
+    replaced during the read): never taken as no difference.
+    """
+    tree = _commit_tree(runner, repo, commit, object_format)
+    listing = _list_tree(runner, repo, commit, tree, object_format, sizes=True)
+    found: list[TreeDifference] = []
+    stack: list[tuple[bytes, int | None]] = []
+    path = b""
+    try:
+        stack.append((b"", os.open(root, _DIR_FLAGS)))
+        for entry in listing.entries:
+            path = entry.path
+            while stack and stack[-1][0] != entry.parent:
+                fd = stack.pop()[1]
+                if fd is not None:
+                    os.close(fd)
+            if not stack:
+                raise MaterializationError(
+                    f"commit {commit}: the entry {_shown(path)} is listed after its parent tree "
+                    "was complete"
+                )
+            parent = stack[-1][1]
+            if entry.mode == _TREE:
+                stack.append((entry.path, _open_listed_dir(parent, entry.name)))
+            elif entry.mode != _GITLINK:
+                kind = _blob_difference(object_format, parent, entry)
+                if kind:
+                    found.append(TreeDifference(entry.path, kind))
+    except OSError as exc:
+        raise MaterializationError(
+            f"commit {commit}: {_shown(path)} of {root} could not be compared with its tree "
+            f"{listing.tree}: {exc.strerror or exc}"
+        ) from exc
+    finally:
+        for _, fd in stack:
+            if fd is not None:
+                os.close(fd)
+    return found
 
 
 @contextmanager

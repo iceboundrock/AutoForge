@@ -73,9 +73,13 @@ commit of the fixer's, say); when the agent worktree holds uncommitted
 changes, which the new round's reviewer would read and test instead of the
 reviewed commit (move them out, or unblock without the flag to let `FIX`
 continue from them), including an edit to a file the worktree's index
-marks assume-unchanged or skip-worktree, which `git status` does not list:
-every tracked file is compared with the reviewed commit; and wherever a plain `unblock` would not re-enter
-`FIX` with open findings. It excludes `--approve-action`,
+marks assume-unchanged or skip-worktree, or one that a clean filter or
+another conversion its attributes name maps back to the committed content,
+which `git status` does not list: AutoForge compares every tracked file's
+bytes with the reviewed commit itself, with no git process reading the
+worktree, so a worktree whose checkout converts content (Git LFS,
+`eol=crlf`) is refused too; and wherever a plain `unblock` would not
+re-enter `FIX` with open findings. It excludes `--approve-action`,
 `--decline-action` and `--bind-evidence`.
 
 The history entry records the abandoned finding ids (`action`), the run

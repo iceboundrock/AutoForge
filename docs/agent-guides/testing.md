@@ -1591,13 +1591,26 @@ a stated reason it has none. The coverage that must keep working:
   reads the reviewed commit and raises it again (R1-F1); the same with
   the edit marked assume-unchanged or skip-worktree in the worktree's
   index, which `git status` does not list, the edit and its mark left as
-  they were (R2-F1); an ignored file does not refuse it; the uncommitted
-  read follows neither the `.git` file nor `commondir` and reads no blob,
+  they were (R2-F1); the same with the marked edit also mapped back to the
+  committed content by a clean filter in the repository's configuration
+  and `info/attributes`, which no `git status` lists, the edit, its mark
+  and the filter left as they were (R3-F1); an ignored file does not
+  refuse it; the uncommitted read follows neither the `.git` file nor
+  `commondir` and reads no blob,
   and the read against a fresh index of the revision lists a marked
   edit, deletion or type change, takes a rewrite with the revision's
   content as no change, writes nothing of the worktree, its admin dir or
   the shared store, keeps sparse patterns and `core.ignoreStat` from
-  marking its entries, and refuses a revision the shared store cannot read
+  marking its entries, and refuses a revision the shared store cannot read;
+  the byte comparison lists an edit a clean filter or an end-of-line
+  conversion hides from both statuses, a deletion, a file replaced by a
+  link, a retargeted link and an execute bit flipped under
+  `core.fileMode=false`, reads files below a directory replaced by a link
+  as deleted without following it, a FIFO as retyped without opening it,
+  and a file of another size without reading it; it runs no git process
+  naming the worktree, ignores untracked and ignored files and a gitlink's
+  path, takes a rewrite with the committed bytes as no change, and refuses
+  a revision the store cannot read or a directory it cannot read
   (`tests/test_agent_worktree.py`); a
   push between the unblock and the `REVIEW` entry is named in the prompt,
   which keeps the provenance and never says the HEAD is the same (R1-F3);

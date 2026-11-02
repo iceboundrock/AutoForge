@@ -7,6 +7,7 @@ action in state and in the run log. No agent runs and no step is charged.
 """
 
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -1137,15 +1138,75 @@ def test_unblock_rereview_refuses_an_edit_the_worktree_index_hides(
     assert not out.unblocked
     assert (
         f"the agent worktree {worktree} holds 1 uncommitted change(s) on the reviewed HEAD "
-        f"{head[:12]} (`git -C {worktree} status` does not list 1 of them: the worktree's "
-        "index records those files as unchanged although they differ from the reviewed commit"
-        in out.message
+        f"{head[:12]} (`git -C {worktree} status` does not list 1 of them: 1 the worktree's "
+        "index records as unchanged although they differ from the reviewed commit" in out.message
     )
     assert f"`git -C {worktree} ls-files -v` shows as a lower-case letter" in out.message
     assert "its prompt lists only what `git status` lists" in out.message
     _assert_untouched(eng, raw)
     assert (worktree / "cache.py").read_text("utf-8") == FIXED
     assert git_out("-C", str(worktree), "ls-files", "-v") == marks
+    assert eng.unblock(REASON).phase == "FIX"
+
+
+def _clean_filter_to(worktree: Path, path: str, committed: str) -> None:
+    """A clean filter mapping whatever ``worktree``'s ``path`` holds back to ``committed``.
+
+    Configured in the repository's own configuration and ``info/attributes``,
+    which an agent without an enforced sandbox can write (PR #444 R3-F1): git
+    then reads the file as ``committed``, whatever its bytes.
+    """
+    common = Path(
+        git_out("-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+    source = common / f"committed-{path}"
+    source.write_text(committed, "utf-8")
+    clean = f"cat >/dev/null; cat {shlex.quote(str(source))}"
+    git_out("-C", str(worktree), "config", "filter.revert.clean", clean)
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "attributes").write_text(f"{path} filter=revert\n", "utf-8")
+
+
+def _drop_clean_filter(worktree: Path) -> None:
+    common = Path(
+        git_out("-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+    git_out("-C", str(worktree), "config", "--unset", "filter.revert.clean")
+    (common / "info" / "attributes").unlink()
+
+
+def test_unblock_rereview_refuses_an_edit_a_clean_filter_hides(tmp_state_dir, fake_github):
+    """PR #444 R3-F1: git converts a file as its attributes say before it
+    compares it, against any index, so a clean filter mapping the fixer's
+    edit back to the reviewed blob hides it from both statuses, with the
+    file also marked assume-unchanged as in the reviewer's reproduction.
+    The controller compares the worktree's bytes with the reviewed tree
+    itself and refuses the flag; nothing is written, and the edit, its mark
+    and the filter are left as they were."""
+    eng, worktree, head = _worktree_at_reviewed_head(
+        tmp_state_dir, fake_github, tracked={"cache.py": BUGGY}
+    )
+    (worktree / "cache.py").write_text(FIXED, "utf-8")
+    git_out("-C", str(worktree), "update-index", "--assume-unchanged", "cache.py")
+    _clean_filter_to(worktree, "cache.py", BUGGY)
+    assert git_out("-C", str(worktree), "status", "--porcelain") == ""
+    assert git_out("-C", str(worktree), "diff", "--no-ext-diff", head) == ""
+    marks = git_out("-C", str(worktree), "ls-files", "-v")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked
+    assert (
+        f"the agent worktree {worktree} holds 1 uncommitted change(s) on the reviewed HEAD "
+        f"{head[:12]} (`git -C {worktree} status` does not list 1 of them: 1 whose bytes or "
+        "execute bit differ from the reviewed commit's although git reads them as its content"
+        in out.message
+    )
+    assert f"`git -C {worktree} check-attr -a -- <file>` names" in out.message
+    assert "its prompt lists only what `git status` lists" in out.message
+    _assert_untouched(eng, raw)
+    assert (worktree / "cache.py").read_text("utf-8") == FIXED
+    assert git_out("-C", str(worktree), "ls-files", "-v") == marks
+    assert git_out("-C", str(worktree), "config", "filter.revert.clean")
     assert eng.unblock(REASON).phase == "FIX"
 
 
@@ -1312,19 +1373,29 @@ CARRIED = {
 }
 
 
-@pytest.mark.parametrize("mark", [None, "--assume-unchanged", "--skip-worktree"])
+@pytest.mark.parametrize(
+    ("mark", "clean_filter"),
+    [
+        (None, False),
+        ("--assume-unchanged", False),
+        ("--skip-worktree", False),
+        ("--assume-unchanged", True),
+    ],
+)
 def test_a_rereview_judges_the_bound_commit_not_a_blocked_fixers_uncommitted_edit(
-    tmp_state_dir, mark
+    tmp_state_dir, mark, clean_filter
 ):
-    """PR #444 R1-F1 and R2-F1 end to end. The PR head's cache.py holds the
-    bug; the fixer fixes it in the worktree, does not commit, and blocks,
-    with or without marking the file in its index so that `git status`
-    lists nothing. A re-review then would have its reviewer, which reads and
-    tests the worktree, clear code the PR does not hold: `unblock
-    --rereview` is refused, nothing written and no reviewer launched, and
-    the edit is left as it was. Once the operator has moved the edit out,
-    the re-review's reviewer reads the reviewed commit's cache.py and raises
-    the bug again."""
+    """PR #444 R1-F1, R2-F1 and R3-F1 end to end. The PR head's cache.py
+    holds the bug; the fixer fixes it in the worktree, does not commit, and
+    blocks, with or without marking the file in its index so that `git
+    status` lists nothing, and, as the R3-F1 reproduction did, with a clean
+    filter that maps the fix back to the committed bytes, so that `git
+    status` against any index lists nothing either. A re-review then would
+    have its reviewer, which reads and tests the worktree, clear code the
+    PR does not hold: `unblock --rereview` is refused, nothing written and
+    no reviewer launched, and the edit is left as it was. Once the operator
+    has moved the edit out, the re-review's reviewer reads the reviewed
+    commit's cache.py and raises the bug again."""
     seen: list[str] = []
 
     def reviewer(req):
@@ -1336,6 +1407,8 @@ def test_a_rereview_judges_the_bound_commit_not_a_blocked_fixers_uncommitted_edi
         (worktree / "cache.py").write_text(FIXED, "utf-8")
         if mark:
             git_out("-C", str(worktree), "update-index", mark, "cache.py")
+        if clean_filter:
+            _clean_filter_to(worktree, "cache.py", BUGGY)
 
     eng, gh, head = _in_fix_of_round_two(
         tmp_state_dir, _blocked_fixer(half_fix), reviewer, files={"cache.py": BUGGY}
@@ -1355,6 +1428,8 @@ def test_a_rereview_judges_the_bound_commit_not_a_blocked_fixers_uncommitted_edi
     assert (worktree / "cache.py").read_text("utf-8") == FIXED
 
     # The operator moves the edit out of the worktree (here: drops it).
+    if clean_filter:
+        _drop_clean_filter(worktree)
     if mark:
         git_out("-C", str(worktree), "update-index", mark.replace("--", "--no-"), "cache.py")
     git_out("-C", str(worktree), "checkout", "-q", "--", "cache.py")

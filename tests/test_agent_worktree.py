@@ -12,18 +12,20 @@ import contextlib
 import errno
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from autoforge import agent_worktree
+from autoforge import agent_worktree, materialize
 from autoforge.agent_worktree import (
     Candidate,
     ObjectImportError,
     alternate_entry,
     bound_admin_dir,
+    byte_changes_from_revision,
     changes_from_revision,
     holds_objects,
     import_private_objects,
@@ -593,6 +595,166 @@ def test_a_temporary_index_that_cannot_be_made_is_refused_never_taken_as_clean(r
     monkeypatch.setattr(agent_worktree.tempfile, "TemporaryDirectory", no_space)
     with pytest.raises(VerificationError, match="temporary index directory: No space left"):
         _against(repo, revision="0" * 40)
+
+
+# ---------------------------------------------- the worktree's bytes (PR #444 R3-F1)
+
+
+def _bytes_against(repo, runner=None, revision=None) -> list[StatusEntry]:
+    worktree = str(repo["worktree"])
+    revision = revision or _git("-C", worktree, "rev-parse", "HEAD")
+    return byte_changes_from_revision(repo["common"], worktree, revision, runner)
+
+
+def _converting(repo, conversion: str) -> None:
+    """``a.txt`` (committed ``a``) edited in the worktree, and a conversion git applies to it
+    before it compares, which maps the edit back to the committed bytes. The repository's
+    configuration and ``info/attributes`` hold it, as the reviewer's reproduction had it."""
+    worktree, common = repo["worktree"], repo["common"]
+    (common / "info").mkdir(exist_ok=True)
+    if conversion == "clean filter":
+        committed = repo["base"] / "committed-a.txt"
+        committed.write_text("a\n")
+        clean = f"cat >/dev/null; cat {shlex.quote(str(committed))}"
+        _git("-C", str(repo["root"]), "config", "filter.revert.clean", clean)
+        (common / "info" / "attributes").write_text("a.txt filter=revert\n")
+        (worktree / "a.txt").write_text("TTL_SECONDS = 300\n")
+    else:  # an end-of-line conversion: CRLF in the file, LF in the blob
+        (common / "info" / "attributes").write_text("a.txt text eol=crlf\n")
+        (worktree / "a.txt").write_bytes(b"a\r\n")
+
+
+@pytest.mark.parametrize("conversion", ["clean filter", "eol"])
+def test_a_conversion_hides_an_edit_from_both_statuses_never_from_the_bytes(repo, conversion):
+    """Git converts a file as its attributes say before it compares it, so a
+    clean filter maps an edit back to the reviewed blob: neither status
+    lists it, with or without a mark in the worktree's index. The bytes do
+    not match the blob's, and the byte comparison lists it."""
+    _converting(repo, conversion)
+    _git("-C", str(repo["worktree"]), "update-index", "--assume-unchanged", "a.txt")
+    assert _uncommitted(repo) == []
+    assert _against(repo) == []
+    assert _bytes_against(repo) == [StatusEntry(" M", "a.txt")]
+
+
+def test_the_byte_comparison_runs_no_git_in_the_worktree_and_reads_only_tracked_files(repo):
+    """The tree is listed from the shared store, with git run in the common
+    dir: no git process names the worktree, so no attribute, filter or
+    index of the worktree takes part. A rewrite with the committed bytes
+    and a new mtime is no change; an untracked or ignored file, and the
+    `.git` file pointed at a decoy, are not looked at."""
+    worktree, common = repo["worktree"], repo["common"]
+    (worktree / "a.txt").write_text("a\n")
+    os.utime(worktree / "a.txt", (1, 1))
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "exclude").write_text("*.log\n")
+    (worktree / "run.log").write_text("ignored\n")
+    (worktree / "draft.txt").write_text("untracked\n")
+    head = _git("-C", str(worktree), "rev-parse", "HEAD")
+    decoy = repo["base"] / "decoy"
+    _git("init", "-q", "-b", "main", str(decoy))
+    (worktree / ".git").write_text(f"gitdir: {decoy / '.git'}\n")
+    (repo["admin"] / "commondir").write_text(f"{decoy / '.git'}\n")
+    seen: list[ExecutionRequest] = []
+    assert _bytes_against(repo, _recording(seen), head) == []
+    assert seen
+    for request in seen:
+        argv = request.command
+        assert argv[argv.index("-C") + 1] == str(common)
+        assert not any(str(worktree) in arg for arg in argv) and request.cwd is None
+    assert any("ls-tree" in request.command for request in seen)
+
+
+def test_each_tracked_file_the_worktree_does_not_hold_as_committed_is_listed(repo):
+    """A deletion, a file replaced by a link, a retargeted link and a flipped
+    execute bit, the last with core.fileMode off, which hides it from both
+    statuses."""
+    worktree = repo["worktree"]
+    os.symlink("a.txt", worktree / "link")
+    _commit_in_worktree(repo, {"b.txt": "b\n", "c.txt": "c\n"})
+    _git("-C", str(worktree), "add", "link")
+    _git("-C", str(worktree), *GIT_IDENT, "commit", "-q", "-m", "link")
+    _git("-C", str(repo["root"]), "config", "core.fileMode", "false")
+    (worktree / "a.txt").chmod(0o755)
+    (worktree / "b.txt").unlink()
+    (worktree / "c.txt").unlink()
+    os.symlink("b.txt", worktree / "c.txt")
+    (worktree / "link").unlink()
+    os.symlink("c.txt", worktree / "link")
+    assert _bytes_against(repo) == [
+        StatusEntry(" M", "a.txt"),
+        StatusEntry(" D", "b.txt"),
+        StatusEntry(" T", "c.txt"),
+        StatusEntry(" M", "link"),
+    ]
+    assert StatusEntry(" M", "a.txt") not in _against(repo)
+
+
+def test_a_directory_replaced_by_a_link_is_not_followed(repo):
+    """A tracked directory replaced by a link to a copy holding the same
+    bytes: nothing is read through the link, and the files below it read as
+    deleted, as `git status` lists them."""
+    worktree = repo["worktree"]
+    (worktree / "sub").mkdir()
+    _commit_in_worktree(repo, {"sub/x.txt": "x\n"})
+    copy = repo["base"] / "copy"
+    shutil.copytree(worktree / "sub", copy)
+    shutil.rmtree(worktree / "sub")
+    os.symlink(copy, worktree / "sub")
+    assert _bytes_against(repo) == [StatusEntry(" D", "sub/x.txt")]
+
+
+def test_a_fifo_at_a_tracked_path_is_retyped_never_opened(repo):
+    (repo["worktree"] / "a.txt").unlink()
+    with watched_fifo(repo["worktree"] / "a.txt") as opened:
+        assert _bytes_against(repo) == [StatusEntry(" T", "a.txt")]
+    assert opened == []
+
+
+def test_a_file_of_another_size_is_listed_without_reading_it(repo, monkeypatch):
+    """The listing holds each blob's size, so a file of another size (a
+    planted sparse file, say) is modified before any of its bytes is read;
+    a file of the same size is read and hashed."""
+    read: list[bytes] = []
+    file_id = materialize._file_id
+
+    def recording(algorithm, dir_fd, name, seen):
+        read.append(name)
+        return file_id(algorithm, dir_fd, name, seen)
+
+    monkeypatch.setattr(materialize, "_file_id", recording)
+    with open(repo["worktree"] / "a.txt", "wb") as handle:
+        handle.truncate(1 << 32)
+    assert _bytes_against(repo) == [StatusEntry(" M", "a.txt")] and read == []
+    (repo["worktree"] / "a.txt").write_text("b\n")
+    assert _bytes_against(repo) == [StatusEntry(" M", "a.txt")] and read == [b"a.txt"]
+
+
+def test_a_gitlink_path_is_not_compared(repo):
+    """What a submodule's path holds is its own repository's, not the
+    tree's bytes: the byte comparison leaves it to `git status`."""
+    worktree = repo["worktree"]
+    head = _git("-C", str(worktree), "rev-parse", "HEAD")
+    _git("-C", str(worktree), "update-index", "--add", "--cacheinfo", f"160000,{head},mod")
+    _git("-C", str(worktree), *GIT_IDENT, "commit", "-q", "-m", "a submodule")
+    (worktree / "mod").mkdir(exist_ok=True)
+    (worktree / "mod" / "anything.txt").write_text("not the tree's\n")
+    assert _bytes_against(repo) == []
+
+
+def test_an_unreadable_byte_comparison_is_refused_never_taken_as_clean(repo):
+    with pytest.raises(VerificationError, match="cannot compare the bytes of the agent worktree"):
+        _bytes_against(repo, revision="0" * 40)
+    if os.geteuid() == 0:
+        return  # root reads a directory whatever its mode
+    (repo["worktree"] / "sub").mkdir()
+    _commit_in_worktree(repo, {"sub/x.txt": "x\n"})
+    (repo["worktree"] / "sub").chmod(0)
+    try:
+        with pytest.raises(VerificationError, match="could not be compared with its tree"):
+            _bytes_against(repo)
+    finally:
+        (repo["worktree"] / "sub").chmod(0o755)
 
 
 # ------------------------------------------------------------ strict import

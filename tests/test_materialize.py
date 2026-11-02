@@ -28,7 +28,14 @@ from autoforge.errors import (
     VerificationError,
 )
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
-from autoforge.materialize import METHOD, MaterializedTree, materialize, read_object_format
+from autoforge.materialize import (
+    METHOD,
+    MaterializedTree,
+    TreeDifference,
+    materialize,
+    read_object_format,
+    tree_differences,
+)
 
 from .conftest import GIT_IDENT
 
@@ -537,6 +544,58 @@ def test_a_failing_git_process_is_a_materialization_failure(tmp_path, exports):
         with _export(repo, commit, runner=runner):
             pytest.fail("the body must not run")
     assert not _leftovers(exports)
+
+
+# -- comparison (PR #444 R3-F1) ------------------------------------------------------------
+@pytest.mark.parametrize("object_format", FORMATS)
+def test_a_directory_is_compared_with_the_tree_blob_by_blob(tmp_path, exports, object_format):
+    """A proven export holds every blob as committed: no difference, and an
+    added file or a gitlink's content is not looked at. A changed byte, a
+    flipped execute bit, a retargeted link, a deletion and a file replaced
+    by a directory are listed by their raw paths, in listing order."""
+    repo = _init(tmp_path / "repo", object_format)
+    absent = "e" * (40 if object_format == "sha1" else 64)
+    latin = b"caf\xe9-\xff.bin"
+    commit = _commit(
+        repo,
+        _tree(
+            repo,
+            {
+                "run.sh": Exe(b"#!/bin/sh\necho hi\n"),
+                "plain.txt": b"plain\n",
+                "empty.txt": b"",
+                "relative": Link(b"plain.txt"),
+                latin: b"a name that is not UTF-8\n",
+                "vendor": {"lib": Gitlink(absent)},
+                "a": {"x": b"x\n"},
+            },
+        ),
+    )
+    with _export(repo, commit) as tree:
+        root = tree.root
+
+        def differences() -> list[TreeDifference]:
+            return tree_differences(execute, str(repo), commit, object_format, root)
+
+        assert differences() == []
+        (root / "untracked.txt").write_text("not in the tree\n")
+        (root / "vendor" / "lib" / "module.txt").write_text("the submodule's\n")
+        assert differences() == []
+        (root / "run.sh").chmod(0o644)
+        with open(os.path.join(os.fsencode(root), latin), "r+b") as handle:
+            handle.write(b"A")
+        (root / "relative").unlink()
+        os.symlink("empty.txt", root / "relative")
+        (root / "plain.txt").unlink()
+        (root / "empty.txt").unlink()
+        (root / "empty.txt").mkdir()
+        assert differences() == [
+            TreeDifference(latin, "modified"),
+            TreeDifference(b"empty.txt", "retyped"),
+            TreeDifference(b"plain.txt", "deleted"),
+            TreeDifference(b"relative", "modified"),
+            TreeDifference(b"run.sh", "modified"),
+        ]
 
 
 # -- identity ------------------------------------------------------------------------------

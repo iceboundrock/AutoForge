@@ -846,8 +846,16 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   the same status is read a second time against a fresh index of the
   reviewed tree, written into a temporary directory of the controller's
   own: every tracked file is read and compared with the reviewed commit,
-  whatever the worktree's index records (R2-F1). Ignored files are not
-  listed by either.
+  whatever the worktree's index records (R2-F1). Both statuses compare
+  what git makes of a file, after the conversions the attributes and the
+  configuration name, and a clean filter can map an edit back to the
+  reviewed blob, so every blob of the reviewed tree is also compared with
+  the worktree's bytes, mode and file type by the controller itself, with
+  no git process reading the worktree and no link followed
+  (`materialize.tree_differences`, R3-F1): a worktree whose checkout
+  converts content (Git LFS, `eol=crlf`) refuses the flag too, since no
+  conversion is trusted to say which bytes are the commit's. Ignored files
+  are not listed by any of the three.
   Anywhere else (a moved PR, a clean review, no PR, no open findings) the
   flag refuses, quoting the plain decision; it excludes the action flags.
   A `FIX` agent that reports `blocked` names the flag in the step's
