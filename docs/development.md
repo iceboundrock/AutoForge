@@ -610,10 +610,15 @@ comment names; that is what the update procedure is for.
 To update a pin:
 
 1. Resolve the release's commit from the action's own repository, not a
-   fork, a mirror or a Marketplace page:
-   `git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<release>*'`.
-   For an annotated tag it lists two lines; the commit is the one ending in
-   `^{}`.
+   fork, a mirror or a Marketplace page, naming the tag and its peeled
+   commit exactly:
+   `git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<release>' 'refs/tags/<release>^{}'`.
+   Use the line whose ref is exactly `refs/tags/<release>^{}` when there
+   is one (an annotated tag: the other line is the tag object, not a
+   commit), and otherwise the one that is exactly `refs/tags/<release>`
+   (a lightweight tag). Never a wildcard such as `'refs/tags/<release>*'`:
+   it also lists every release whose name starts with `<release>`
+   (`v7.0.1` matches `v7.0.10` and `v7.0.1-rc.1`), each another commit.
 2. Read what changed between the old commit and the new one, release notes
    included: the pin moves trust to that review.
 3. Replace the SHA and the comment at every occurrence in every workflow in
