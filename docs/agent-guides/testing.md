@@ -1588,9 +1588,17 @@ a stated reason it has none. The coverage that must keep working:
   that cannot be read, the change left as it was, and end to end a blocked
   fixer's uncommitted edit that would have cleared the bug refuses the
   flag until the operator moves it out, after which the round's reviewer
-  reads the reviewed commit and raises it again (R1-F1); an ignored file
-  does not refuse it; the uncommitted read follows neither the `.git` file
-  nor `commondir` and reads no blob (`tests/test_agent_worktree.py`); a
+  reads the reviewed commit and raises it again (R1-F1); the same with
+  the edit marked assume-unchanged or skip-worktree in the worktree's
+  index, which `git status` does not list, the edit and its mark left as
+  they were (R2-F1); an ignored file does not refuse it; the uncommitted
+  read follows neither the `.git` file nor `commondir` and reads no blob,
+  and the read against a fresh index of the revision lists a marked
+  edit, deletion or type change, takes a rewrite with the revision's
+  content as no change, writes nothing of the worktree, its admin dir or
+  the shared store, keeps sparse patterns and `core.ignoreStat` from
+  marking its entries, and refuses a revision the shared store cannot read
+  (`tests/test_agent_worktree.py`); a
   push between the unblock and the `REVIEW` entry is named in the prompt,
   which keeps the provenance and never says the HEAD is the same (R1-F3);
   it excludes the action flags; a dry run writes nothing

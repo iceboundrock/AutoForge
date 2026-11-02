@@ -29,8 +29,13 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   status`` of the bound worktree with its admin dir, the common dir and
   the working tree named explicitly (``--git-dir``, ``GIT_COMMON_DIR``,
   ``--work-tree``): never through the worktree's ``.git`` file or the
-  admin dir's ``commondir``. ``unblock --rereview`` refuses a worktree it
-  lists anything in, since the next round's reviewer works there.
+  admin dir's ``commondir``. That status trusts the worktree's own index,
+  which the agent writes, so :func:`changes_from_revision` reads the same
+  status against a fresh index of the reviewed revision that the
+  controller writes into a temporary directory of its own: an
+  assume-unchanged or skip-worktree mark hides no edit there (PR #444
+  R2-F1). ``unblock --rereview`` refuses a worktree either lists anything
+  in, since the next round's reviewer works there.
 - **Strict import (D6.5).** :func:`import_private_objects` copies the
   objects reachable from that ``HEAD`` which the shared store lacks out of
   the issue's private object directory (an enforced launch's overlay upper
@@ -415,6 +420,79 @@ def uncommitted_entries(
             f"cannot read the uncommitted changes of the agent worktree {worktree} "
             f"(`git {' '.join(args)}` {_ended(res)}{_detail(res)})"
         )
+    return parse_status(res.stdout or "")
+
+
+# What a fresh index takes from no configuration (PR #444 R2-F1): no sparse
+# patterns, which would mark its entries skip-worktree; no entry marked
+# assume-unchanged; no shared split index, which git would write into the
+# git dir rather than beside the index.
+_FRESH_INDEX_SWITCHES: tuple[str, ...] = (
+    "-c",
+    "core.sparseCheckout=false",
+    "-c",
+    "core.ignoreStat=false",
+    "-c",
+    "core.splitIndex=false",
+)
+
+
+def changes_from_revision(
+    common: Path, admin: Path, worktree: str, revision: str, runner: Runner | None
+) -> list[StatusEntry]:
+    """What the bound ``worktree`` holds that ``revision`` does not, whatever its index says.
+
+    :func:`uncommitted_entries` compares the files with the worktree's own
+    index, which the agent writes: git takes an entry marked
+    assume-unchanged or skip-worktree, or one whose recorded stat data
+    matches an edited file, as unchanged without reading the file, so such
+    an edit is listed nowhere (PR #444 R2-F1). Here ``git read-tree``,
+    with the common dir as its git dir, writes a fresh index of
+    ``revision``'s tree into a temporary directory of the controller's
+    own, and ``git status`` reads the worktree against it, with the admin
+    dir, the common dir and the working tree named as
+    :func:`uncommitted_entries` names them. The fresh index records no
+    flag and no stat data, so every tracked file is read and compared with
+    ``revision``'s blob. ``revision`` is the candidate's ``HEAD``
+    (:func:`read_candidate`), so nothing reads as staged: a change is a
+    modified, deleted or retyped file, or an untracked one. Rename
+    detection stays off, so only trees of ``revision`` are read from the
+    shared store. Ignored files are not listed. Nothing of the worktree,
+    its admin dir or the shared store is written. An inconclusive read is
+    a :class:`VerificationError`, never a guess.
+    """
+    failed = f"cannot compare the agent worktree {worktree} with the revision {revision[:12]}"
+    read_tree = ["read-tree", revision]
+    status = ["status", *STATUS_ARGS, "--no-renames"]
+    try:
+        with tempfile.TemporaryDirectory(prefix="autoforge-index-") as scratch:
+            env = {"GIT_COMMON_DIR": str(common), "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+            for git_dir, args in ((common, read_tree), (admin, status)):
+                res = _run(
+                    runner,
+                    local_git_request(
+                        [
+                            *_FRESH_INDEX_SWITCHES,
+                            "--no-optional-locks",
+                            "--git-dir",
+                            str(git_dir),
+                            "--work-tree",
+                            worktree,
+                            *args,
+                        ],
+                        env=env,
+                        timeout_seconds=GIT_TIMEOUT_SECONDS,
+                    ),
+                )
+                if res.timed_out or res.truncated or res.exit_code != 0:
+                    raise VerificationError(
+                        f"{failed} (`git {' '.join(args)}` on a fresh index {_ended(res)}"
+                        f"{_detail(res)})"
+                    )
+    except OSError as exc:
+        raise VerificationError(
+            f"{failed} (its temporary index directory: {exc.strerror or exc})"
+        ) from exc
     return parse_status(res.stdout or "")
 
 

@@ -661,12 +661,16 @@ without it), and when the agent worktree's `HEAD` is anything but the
 reviewed HEAD, for example a commit the fixer made before it blocked: that
 commit was never pushed or reviewed, and a fresh round would leave it
 behind. It is refused too while the agent worktree holds uncommitted
-changes (`git -C <worktree> status` lists them; the message names the
-worktree): the new round's reviewer works there, and would read and test
-them instead of the reviewed commit. Unblock without the flag to let `FIX`
-continue from the work (its prompt lists uncommitted changes), or move the
-work out of the worktree yourself and unblock again; AutoForge never
-discards it. The flag also checks that the base branch was not rewritten
+changes (the message names the worktree): the new round's reviewer works
+there, and would read and test them instead of the reviewed commit.
+AutoForge compares every tracked file with the reviewed commit itself, so
+an edit is found even when the worktree's index marks the file
+assume-unchanged or skip-worktree and `git -C <worktree> status` therefore
+does not list it; the message says how many such files there are, and
+`git -C <worktree> ls-files -v` shows the marks (a lower-case letter or an
+`S`). Unblock without the flag to let `FIX` continue from the work (its
+prompt lists what `git status` lists), or move the work out of the
+worktree yourself and unblock again; AutoForge never discards it. The flag also checks that the base branch was not rewritten
 under the PR since the review (its merge base moved): if it was, unblock
 without the flag, and `FIX` sends the PR to a fresh review of the actual
 revision without launching the fixer. Where a plain `unblock` would not

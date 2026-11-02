@@ -9,6 +9,7 @@ into the shared store.
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import re
 import shutil
@@ -23,6 +24,7 @@ from autoforge.agent_worktree import (
     ObjectImportError,
     alternate_entry,
     bound_admin_dir,
+    changes_from_revision,
     holds_objects,
     import_private_objects,
     private_objects_problem,
@@ -471,6 +473,126 @@ def test_an_unreadable_status_is_refused_never_taken_as_clean(repo):
     (repo["admin"] / "index").write_bytes(b"not an index")
     with pytest.raises(VerificationError, match="cannot read the uncommitted changes"):
         _uncommitted(repo)
+
+
+# ------------------------------------- changes from the revision (PR #444 R2-F1)
+
+
+def _against(repo, runner=None, revision=None) -> list[StatusEntry]:
+    worktree = str(repo["worktree"])
+    revision = revision or _git("-C", worktree, "rev-parse", "HEAD")
+    return changes_from_revision(repo["common"], repo["admin"], worktree, revision, runner)
+
+
+def _commit_in_worktree(repo, files: dict[str, str]) -> None:
+    worktree = str(repo["worktree"])
+    for name, text in files.items():
+        (repo["worktree"] / name).write_text(text)
+    _git("-C", worktree, "add", *files)
+    _git("-C", worktree, *GIT_IDENT, "commit", "-q", "-m", "more")
+
+
+@pytest.mark.parametrize("mark", ["--assume-unchanged", "--skip-worktree"])
+def test_an_edit_the_index_marks_unchanged_is_listed_against_the_revision(repo, mark):
+    """The worktree's index is the agent's to write: with the mark, its own
+    status lists nothing, but against a fresh index of the revision the
+    file is read and compared, and listed."""
+    worktree = repo["worktree"]
+    (worktree / "a.txt").write_text("changed\n")
+    _git("-C", str(worktree), "update-index", mark, "a.txt")
+    assert _git("-C", str(worktree), "status", "--porcelain") == ""
+    assert _uncommitted(repo) == []
+    assert _against(repo) == [StatusEntry(" M", "a.txt")]
+
+
+def test_a_file_deleted_or_retyped_under_a_mark_is_listed_against_the_revision(repo):
+    _commit_in_worktree(repo, {"b.txt": "b\n", "c.txt": "c\n"})
+    worktree = repo["worktree"]
+    (worktree / "b.txt").unlink()
+    _git("-C", str(worktree), "update-index", "--skip-worktree", "b.txt")
+    (worktree / "c.txt").unlink()
+    os.symlink("a.txt", worktree / "c.txt")
+    _git("-C", str(worktree), "update-index", "--assume-unchanged", "c.txt")
+    assert _uncommitted(repo) == []
+    assert _against(repo) == [StatusEntry(" D", "b.txt"), StatusEntry(" T", "c.txt")]
+
+
+def test_the_comparison_reads_content_and_writes_nothing_of_the_repository(repo):
+    """A file rewritten with the revision's content, a new mtime and a mark
+    is no change, and an ignored file is not listed. The fresh index lives
+    in a temporary directory of the controller's, removed after the read;
+    the worktree's index and admin dir are left exactly as they were, and
+    neither the `.git` file nor `commondir`, pointed at a decoy, is read."""
+    worktree, admin, common = repo["worktree"], repo["admin"], repo["common"]
+    head = _git("-C", str(worktree), "rev-parse", "HEAD")
+    (worktree / "a.txt").write_text("a\n")
+    os.utime(worktree / "a.txt", (1, 1))
+    _git("-C", str(worktree), "update-index", "--assume-unchanged", "a.txt")
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "exclude").write_text("*.log\n")
+    (worktree / "run.log").write_text("ignored\n")
+    decoy = repo["base"] / "decoy"
+    _git("init", "-q", "-b", "main", str(decoy))
+    (worktree / ".git").write_text(f"gitdir: {decoy / '.git'}\n")
+    (admin / "commondir").write_text(f"{decoy / '.git'}\n")
+    index = (admin / "index").read_bytes()
+    entries = sorted(p.name for p in admin.iterdir())
+    seen: list[ExecutionRequest] = []
+    assert _against(repo, _recording(seen), head) == []
+    (worktree / "b.txt").write_text("new\n")
+    assert _against(repo, revision=head) == [StatusEntry("??", "b.txt")]
+    assert (admin / "index").read_bytes() == index
+    assert sorted(p.name for p in admin.iterdir()) == entries
+    read_tree, status = seen
+    fresh = Path(read_tree.env["GIT_INDEX_FILE"])
+    assert status.env["GIT_INDEX_FILE"] == str(fresh) and not fresh.parent.exists()
+    assert common not in fresh.parents and worktree not in fresh.parents
+    for request, git_dir in ((read_tree, common), (status, admin)):
+        argv = request.command
+        assert argv[argv.index("--git-dir") + 1] == str(git_dir)
+        assert argv[argv.index("--work-tree") + 1] == str(worktree)
+        assert request.env["GIT_COMMON_DIR"] == str(common)
+        for switch in ("core.sparseCheckout=false", "core.ignoreStat=false"):
+            assert switch in argv
+    assert "read-tree" in read_tree.command and "--no-renames" in status.command
+
+
+def test_sparse_patterns_and_ignore_stat_mark_nothing_in_the_fresh_index(repo):
+    """Configuration that marks index entries (sparse patterns, which the
+    admin dir holds, and core.ignoreStat) is off for the fresh index."""
+    _git("-C", str(repo["root"]), "config", "core.sparseCheckout", "true")
+    _git("-C", str(repo["root"]), "config", "core.ignoreStat", "true")
+    (repo["admin"] / "info").mkdir(exist_ok=True)
+    (repo["admin"] / "info" / "sparse-checkout").write_text("/nothing\n")
+    (repo["worktree"] / "a.txt").write_text("changed\n")
+    assert _against(repo) == [StatusEntry(" M", "a.txt")]
+
+
+def test_a_change_staged_into_the_private_directory_reads_as_untracked(repo):
+    """The fresh index holds the revision's tree alone, so an enforced
+    agent's staged new file is untracked there; no blob is read."""
+    env = {
+        "GIT_OBJECT_DIRECTORY": str(repo["private"]),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": f'"{repo["common"] / "objects"}"',
+    }
+    (repo["worktree"] / "b.txt").write_text("b\n")
+    _git("-C", str(repo["worktree"]), "add", "b.txt", env=env)
+    assert _against(repo) == [StatusEntry("??", "b.txt")]
+
+
+def test_a_revision_the_shared_store_cannot_read_is_refused_never_taken_as_clean(repo):
+    with pytest.raises(VerificationError, match="cannot compare the agent worktree") as exc:
+        _against(repo, revision="0" * 40)
+    assert "`git read-tree 000000000000" in str(exc.value)
+
+
+def test_a_temporary_index_that_cannot_be_made_is_refused_never_taken_as_clean(repo, monkeypatch):
+    def no_space(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(agent_worktree.tempfile, "TemporaryDirectory", no_space)
+    with pytest.raises(VerificationError, match="temporary index directory: No space left"):
+        _against(repo, revision="0" * 40)
 
 
 # ------------------------------------------------------------ strict import

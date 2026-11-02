@@ -1116,6 +1116,39 @@ def test_unblock_rereview_refuses_uncommitted_changes_in_the_worktree(
     assert eng.unblock(REASON).phase == "FIX"
 
 
+@pytest.mark.parametrize("mark", ["--assume-unchanged", "--skip-worktree"])
+def test_unblock_rereview_refuses_an_edit_the_worktree_index_hides(
+    tmp_state_dir, fake_github, mark
+):
+    """PR #444 R2-F1: the worktree's index is the fixer's to write, and a
+    mark there hides an edit from `git status`. The files are compared with
+    the reviewed tree through a fresh index, so the edit refuses the flag
+    all the same; nothing is written, and the edit and its mark are left
+    exactly as they were."""
+    eng, worktree, head = _worktree_at_reviewed_head(
+        tmp_state_dir, fake_github, tracked={"cache.py": BUGGY}
+    )
+    (worktree / "cache.py").write_text(FIXED, "utf-8")
+    git_out("-C", str(worktree), "update-index", mark, "cache.py")
+    assert git_out("-C", str(worktree), "status", "--porcelain") == ""
+    marks = git_out("-C", str(worktree), "ls-files", "-v")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked
+    assert (
+        f"the agent worktree {worktree} holds 1 uncommitted change(s) on the reviewed HEAD "
+        f"{head[:12]} (`git -C {worktree} status` does not list 1 of them: the worktree's "
+        "index records those files as unchanged although they differ from the reviewed commit"
+        in out.message
+    )
+    assert f"`git -C {worktree} ls-files -v` shows as a lower-case letter" in out.message
+    assert "its prompt lists only what `git status` lists" in out.message
+    _assert_untouched(eng, raw)
+    assert (worktree / "cache.py").read_text("utf-8") == FIXED
+    assert git_out("-C", str(worktree), "ls-files", "-v") == marks
+    assert eng.unblock(REASON).phase == "FIX"
+
+
 def test_unblock_rereview_refuses_a_worktree_whose_status_cannot_be_read(
     tmp_state_dir, fake_github
 ):
@@ -1279,16 +1312,19 @@ CARRIED = {
 }
 
 
+@pytest.mark.parametrize("mark", [None, "--assume-unchanged", "--skip-worktree"])
 def test_a_rereview_judges_the_bound_commit_not_a_blocked_fixers_uncommitted_edit(
-    tmp_state_dir,
+    tmp_state_dir, mark
 ):
-    """PR #444 R1-F1 end to end. The PR head's cache.py holds the bug; the
-    fixer fixes it in the worktree, does not commit, and blocks. A re-review
-    then would have its reviewer, which reads and tests the worktree, clear
-    code the PR does not hold: `unblock --rereview` is refused, nothing
-    written and no reviewer launched, and the edit is left as it was. Once
-    the operator has moved the edit out, the re-review's reviewer reads the
-    reviewed commit's cache.py and raises the bug again."""
+    """PR #444 R1-F1 and R2-F1 end to end. The PR head's cache.py holds the
+    bug; the fixer fixes it in the worktree, does not commit, and blocks,
+    with or without marking the file in its index so that `git status`
+    lists nothing. A re-review then would have its reviewer, which reads and
+    tests the worktree, clear code the PR does not hold: `unblock
+    --rereview` is refused, nothing written and no reviewer launched, and
+    the edit is left as it was. Once the operator has moved the edit out,
+    the re-review's reviewer reads the reviewed commit's cache.py and raises
+    the bug again."""
     seen: list[str] = []
 
     def reviewer(req):
@@ -1298,6 +1334,8 @@ def test_a_rereview_judges_the_bound_commit_not_a_blocked_fixers_uncommitted_edi
 
     def half_fix(worktree):
         (worktree / "cache.py").write_text(FIXED, "utf-8")
+        if mark:
+            git_out("-C", str(worktree), "update-index", mark, "cache.py")
 
     eng, gh, head = _in_fix_of_round_two(
         tmp_state_dir, _blocked_fixer(half_fix), reviewer, files={"cache.py": BUGGY}
@@ -1305,7 +1343,8 @@ def test_a_rereview_judges_the_bound_commit_not_a_blocked_fixers_uncommitted_edi
     out = eng.step()
     assert out.next_phase == "BLOCKED", out.message
     worktree = eng.agent_worktree_path()
-    assert git_out("-C", str(worktree), "status", "--porcelain") == "M cache.py"
+    status = git_out("-C", str(worktree), "status", "--porcelain")
+    assert status == ("" if mark else "M cache.py")
 
     raw = eng.paths.state_file.read_text()
     out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
@@ -1316,6 +1355,8 @@ def test_a_rereview_judges_the_bound_commit_not_a_blocked_fixers_uncommitted_edi
     assert (worktree / "cache.py").read_text("utf-8") == FIXED
 
     # The operator moves the edit out of the worktree (here: drops it).
+    if mark:
+        git_out("-C", str(worktree), "update-index", mark.replace("--", "--no-"), "cache.py")
     git_out("-C", str(worktree), "checkout", "-q", "--", "cache.py")
     out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
     assert out.unblocked and out.phase == "REVIEW", out.message

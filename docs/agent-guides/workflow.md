@@ -840,7 +840,14 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   uncommitted change (a blocked fixer's half-made edit, an untracked
   file) is what that reviewer would read and test in place of the
   reviewed commit, and the controller neither discards nor moves it; a
-  status that cannot be read refuses too. Ignored files are not listed.
+  status that cannot be read refuses too. That status compares the files
+  with the worktree's own index, which the agent writes, and an
+  assume-unchanged or skip-worktree mark there hides an edit from it, so
+  the same status is read a second time against a fresh index of the
+  reviewed tree, written into a temporary directory of the controller's
+  own: every tracked file is read and compared with the reviewed commit,
+  whatever the worktree's index records (R2-F1). Ignored files are not
+  listed by either.
   Anywhere else (a moved PR, a clean review, no PR, no open findings) the
   flag refuses, quoting the plain decision; it excludes the action flags.
   A `FIX` agent that reports `blocked` names the flag in the step's

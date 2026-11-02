@@ -72,7 +72,9 @@ agent worktree's `HEAD` is anything but the reviewed HEAD (an unpushed
 commit of the fixer's, say); when the agent worktree holds uncommitted
 changes, which the new round's reviewer would read and test instead of the
 reviewed commit (move them out, or unblock without the flag to let `FIX`
-continue from them); and wherever a plain `unblock` would not re-enter
+continue from them), including an edit to a file the worktree's index
+marks assume-unchanged or skip-worktree, which `git status` does not list:
+every tracked file is compared with the reviewed commit; and wherever a plain `unblock` would not re-enter
 `FIX` with open findings. It excludes `--approve-action`,
 `--decline-action` and `--bind-evidence`.
 

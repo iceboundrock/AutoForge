@@ -134,6 +134,7 @@ from .agent_worktree import (
     Candidate,
     ObjectImportError,
     bound_admin_dir,
+    changes_from_revision,
     holds_objects,
     import_private_objects,
     read_candidate,
@@ -7525,15 +7526,22 @@ class ControllerEngine:
 
         The next round's reviewer works in this worktree, so it may hold
         nothing the reviewed HEAD does not: it does not exist, or its HEAD
-        is detached at the reviewed HEAD and ``git status`` lists nothing.
-        Any other HEAD (a fixer's unpushed commit, a local branch, a commit
-        the shared store does not hold) may be work a fresh round would
-        leave behind. An uncommitted change (a blocked fixer's half-made
-        edit, an untracked file) is what that reviewer would read and test
-        in place of the reviewed commit, and could clear code the PR does
-        not hold (PR #444 R1-F1); the controller neither discards nor moves
-        it. ``HEAD`` is read as a candidate is (ADR 0005 D6.3) and the
-        status through the bound admin dir (:func:`uncommitted_entries`),
+        is detached at the reviewed HEAD and ``git status`` lists nothing,
+        neither against the worktree's own index nor against a fresh index
+        of the reviewed tree. Any other HEAD (a fixer's unpushed commit, a
+        local branch, a commit the shared store does not hold) may be work
+        a fresh round would leave behind. An uncommitted change (a blocked
+        fixer's half-made edit, an untracked file) is what that reviewer
+        would read and test in place of the reviewed commit, and could
+        clear code the PR does not hold (PR #444 R1-F1); the controller
+        neither discards nor moves it. The worktree's own index is the
+        agent's to write, and an assume-unchanged or skip-worktree mark
+        there hides an edit from its status (R2-F1), so the files are also
+        compared with the reviewed tree through a fresh index
+        (:func:`changes_from_revision`); the first read still lists what
+        only that index holds (a staged change since reverted in the file).
+        ``HEAD`` is read as a candidate is (ADR 0005 D6.3) and both
+        statuses through the bound admin dir (:func:`uncommitted_entries`),
         never through the worktree's ``.git`` file; nothing is imported or
         written.
         """
@@ -7571,23 +7579,37 @@ class ControllerEngine:
             )
         try:
             entries = uncommitted_entries(common, admin, str(path), self._runner)
+            listed = {entry.path for entry in entries}
+            hidden = [
+                entry
+                for entry in changes_from_revision(common, admin, str(path), reviewed, self._runner)
+                if entry.path not in listed
+            ]
         except VerificationError as exc:
             return (
                 f"{exc}, so whether the next round's reviewer would judge changes the reviewed "
                 f"HEAD {reviewed[:12]} does not hold is not knowable. Fix the cause, then "
                 "unblock again, or unblock without --rereview"
             )
-        if entries:
-            return (
-                f"the agent worktree {path} holds {len(entries)} uncommitted change(s) on the "
-                f"reviewed HEAD {reviewed[:12]} (`git -C {path} status` lists them), and the "
-                "next round's reviewer works in that worktree: what it reads and tests there "
-                "would be those changes, not the reviewed commit. The controller neither "
-                "discards nor moves them. Unblock without --rereview to let FIX continue from "
-                "them (its prompt lists them), or move them out of the worktree yourself and "
-                "unblock again"
+        if not entries and not hidden:
+            return ""
+        listing, prompt = f"`git -C {path} status` lists them", "its prompt lists them"
+        if hidden:
+            listing = (
+                f"`git -C {path} status` does not list {len(hidden)} of them: the worktree's "
+                "index records those files as unchanged although they differ from the reviewed "
+                "commit, as an assume-unchanged or skip-worktree mark does, which "
+                f"`git -C {path} ls-files -v` shows as a lower-case letter or an S"
             )
-        return ""
+            prompt = "its prompt lists only what `git status` lists"
+        return (
+            f"the agent worktree {path} holds {len(entries) + len(hidden)} uncommitted "
+            f"change(s) on the reviewed HEAD {reviewed[:12]} ({listing}), and the next round's "
+            "reviewer works in that worktree: what it reads and tests there would be those "
+            "changes, not the reviewed commit. The controller neither discards nor moves them. "
+            f"Unblock without --rereview to let FIX continue from them ({prompt}), or move "
+            "them out of the worktree yourself and unblock again"
+        )
 
     @staticmethod
     def _awaiting_acceptance(records: Sequence[EffectRecord]) -> EffectRecord | None:
