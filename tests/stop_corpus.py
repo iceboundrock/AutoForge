@@ -5,7 +5,7 @@ hand over the state directories of past runs. It finds every run a state
 directory still holds evidence of, classifies each one once with
 :mod:`autoforge.stop_classification`, counts its run log's launches and
 operator actions from typed fields only, and prints a summary (``--json``:
-the ``autoforge.stop-corpus/2`` document)::
+the ``autoforge.stop-corpus/3`` document)::
 
     uv run python -m tests.stop_corpus ~/code/AutoForge/.autoforge
     uv run python -m tests.stop_corpus --json RUN_DIR [RUN_DIR ...] > corpus.json
@@ -58,7 +58,9 @@ classifies ``unknown`` and the free text of ``block_reason`` and of a
 launch's ``error`` is never read; a run whose state is gone or does not
 load, and a run log that was moved, deleted, torn or holds a line of an
 unexpected type, leave that run's history incomplete (each such run is
-flagged, and each bad line counted, never parsed around); and the corpus is
+flagged, and each bad line counted, never parsed around); a path given or
+found on the way down that cannot be read is reported with the stage that
+failed, and the summary says its input is incomplete; and the corpus is
 the directories given, nothing else: whatever selected them is its bias.
 """
 
@@ -103,7 +105,7 @@ from autoforge.stop_classification import (
     classify_state,
 )
 
-SCHEMA = "autoforge.stop-corpus/2"
+SCHEMA = "autoforge.stop-corpus/3"
 # How deep below a given path a state directory is looked for.
 MAX_DEPTH = 4
 JOURNAL_NAME = "events.jsonl"
@@ -154,6 +156,9 @@ LIMITATIONS = (
     "binding.json or claim.json) is 'unknown', and a MERGE or UPDATE_EPIC there is "
     "'undecidable'; a namespace's state directory copied elsewhere under another name with "
     "nothing of its namespace beside it reads as a standalone run's",
+    "a path given, or a directory found on the way down, that cannot be listed or read is "
+    "reported with the stage that failed, and what it holds is in no denominator: the "
+    "summary says the input is incomplete",
     "the corpus is the directories given and nothing else: what selected them is its "
     "selection bias, and no denominator reaches past them",
 )
@@ -180,11 +185,33 @@ def _run_id_name(name: str) -> bool:
 # -- discovery ------------------------------------------------------------------------------
 
 
-def _is_state_dir(directory: Path) -> bool:
-    """Whether ``directory`` holds a state file or a run log; nothing in it is opened."""
+# A path that could not be read, the stage that failed and why: never dropped.
+Unreadable = tuple[str, str, str]
+
+
+@dataclass
+class Discovery:
+    """The state directories found, and every path on the way that could not be read."""
+
+    state_dirs: list[Path] = field(default_factory=list)
+    #: ``(path, error)``: a path given, or found on the way down, that could
+    #: not be listed or looked at, so what it holds is in no denominator.
+    errors: dict[str, str] = field(default_factory=dict)
+
+    def failed(self, path: Path | str, why: str) -> None:
+        self.errors.setdefault(str(path), why)
+
+
+def _is_state_dir(directory: Path, discovery: Discovery) -> bool:
+    """Whether ``directory`` holds a state file or a run log; nothing in it is opened.
+
+    What cannot be listed or looked at (the directory, its ``logs``, a run's
+    log directory) is reported on ``discovery``, never taken for an absence.
+    """
     try:
         names = os.listdir(directory)
-    except OSError:
+    except OSError as exc:
+        discovery.failed(directory, type(exc).__name__)
         return False
     if any(state_file_kind(name) for name in names):
         return True
@@ -194,33 +221,73 @@ def _is_state_dir(directory: Path) -> bool:
     try:
         if not stat.S_ISDIR(os.lstat(logs).st_mode):
             return False
-        return any(
-            _run_id_name(name) and os.path.lexists(logs / name / JOURNAL_NAME)
-            for name in os.listdir(logs)
-        )
-    except OSError:
+        runs = sorted(name for name in os.listdir(logs) if _run_id_name(name))
+    except OSError as exc:
+        discovery.failed(logs, type(exc).__name__)
         return False
+    problems: list[tuple[Path, str]] = []
+    for name in runs:
+        try:
+            os.lstat(logs / name / JOURNAL_NAME)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            problems.append((logs / name, type(exc).__name__))
+            continue
+        # A state directory: the scan reads, or flags, each of its run logs.
+        return True
+    for path, why in problems:
+        discovery.failed(path, why)
+    return False
+
+
+def discover(paths: Iterable[Path], max_depth: int = MAX_DEPTH) -> Discovery:
+    """Every state directory at or below each path, links unfollowed, each once, sorted.
+
+    A path given that does not exist, is a link (never followed) or is no
+    directory, and a directory on the way down that cannot be listed, is
+    reported with why; every other path is still searched.
+    """
+    discovery = Discovery()
+    found: set[Path] = set()
+    for given in paths:
+        try:
+            mode = os.lstat(given).st_mode
+        except OSError as exc:
+            discovery.failed(given, type(exc).__name__)
+            continue
+        if stat.S_ISLNK(mode):
+            discovery.failed(given, "a symbolic link, not followed")
+            continue
+        if not stat.S_ISDIR(mode):
+            discovery.failed(given, "not a directory")
+            continue
+        level = [given]
+        for depth in range(max_depth + 1):
+            below: list[Path] = []
+            for directory in level:
+                if _is_state_dir(directory, discovery):
+                    found.add(directory.resolve())
+                    continue
+                if depth == max_depth or str(directory) in discovery.errors:
+                    continue
+                try:
+                    with os.scandir(directory) as entries:
+                        children = sorted(
+                            e.path for e in entries if e.is_dir(follow_symlinks=False)
+                        )
+                except OSError as exc:
+                    discovery.failed(directory, type(exc).__name__)
+                    continue
+                below += [Path(child) for child in children]
+            level = below
+    discovery.state_dirs = sorted(found)
+    return discovery
 
 
 def find_state_dirs(paths: Iterable[Path], max_depth: int = MAX_DEPTH) -> list[Path]:
-    """Every state directory at or below each path, links unfollowed, each once, sorted."""
-    found: set[Path] = set()
-    for root in paths:
-        level = [root]
-        for _ in range(max_depth + 1):
-            below: list[Path] = []
-            for directory in level:
-                if directory.is_symlink() or not directory.is_dir():
-                    continue
-                if _is_state_dir(directory):
-                    found.add(directory.resolve())
-                    continue
-                try:
-                    below += sorted(p for p in directory.iterdir() if p.is_dir())
-                except OSError:
-                    continue
-            level = below
-    return sorted(found)
+    """Every state directory at or below each path (:func:`discover`, its errors dropped)."""
+    return discover(paths, max_depth).state_dirs
 
 
 # -- whose routes a state directory's runs take ----------------------------------------------
@@ -603,7 +670,10 @@ class RunReport:
 class Corpus:
     runs: list[RunReport]
     unidentified_states: list[StateSource]
-    unreadable_dirs: list[tuple[str, str]]
+    #: ``(path, stage, error)``: ``discovery`` for a path given or on the way
+    #: down that could not be listed, ``scan`` for a state directory found
+    #: whose reading failed. Its runs are in no denominator.
+    unreadable: list[Unreadable] = field(default_factory=list)
 
 
 def _pick_state(sources: list[StateSource]) -> StateSource:
@@ -613,7 +683,7 @@ def _pick_state(sources: list[StateSource]) -> StateSource:
     return min(newest_first, key=StateSource.rank)
 
 
-def build_corpus(scans: Sequence[DirScan]) -> Corpus:
+def build_corpus(scans: Sequence[DirScan], discovery: Discovery | None = None) -> Corpus:
     """Each run id once, however many directories hold its evidence."""
     states: dict[str, list[StateSource]] = {}
     journals: dict[str, list[JournalCounts]] = {}
@@ -659,12 +729,16 @@ def build_corpus(scans: Sequence[DirScan]) -> Corpus:
         # A run whose outcome depends on a view nothing establishes is undecided.
         report.eligibility = "undecidable" if view_decides else ELIGIBILITY[report.final.outcome]
         runs.append(report)
-    unreadable = [(s.state_dir, s.error) for s in scans if s.error]
-    return Corpus(runs=runs, unidentified_states=unidentified, unreadable_dirs=unreadable)
+    unreadable: list[Unreadable] = [
+        (path, "discovery", why) for path, why in (discovery.errors if discovery else {}).items()
+    ]
+    unreadable += [(s.state_dir, "scan", s.error) for s in scans if s.error]
+    return Corpus(runs=runs, unidentified_states=unidentified, unreadable=sorted(unreadable))
 
 
 def read_corpus(paths: Iterable[Path]) -> Corpus:
-    return build_corpus([scan_state_dir(d) for d in find_state_dirs(paths)])
+    discovery = discover(paths)
+    return build_corpus([scan_state_dir(d) for d in discovery.state_dirs], discovery)
 
 
 def summarize(corpus: Corpus) -> dict[str, object]:
@@ -730,7 +804,13 @@ def summarize(corpus: Corpus) -> dict[str, object]:
             "still_blocked": blocked_now,
         },
         "journal_lines": {name: lines.get(name, 0) for name in ("torn", "foreign", "malformed")},
-        "unreadable_directories": [{"state_dir": d, "error": e} for d, e in corpus.unreadable_dirs],
+        # A path that could not be read leaves the corpus incomplete: what it
+        # holds is in no denominator above.
+        "input_incomplete": bool(corpus.unreadable),
+        "unreadable_directories": [
+            {"path": path, "stage": stage, "error": error}
+            for path, stage, error in corpus.unreadable
+        ],
         "limitations": list(LIMITATIONS),
         "run_reports": [r.as_dict() for r in runs],
     }
@@ -757,9 +837,14 @@ def render(summary: dict) -> str:
         f"({operator['unblocks_in_state_histories']} unblocks in the states' histories)",
         f"BLOCKED episodes (each needed a human): {summary['blocked_episodes']}",
         f"bad journal lines: {summary['journal_lines']}",
-        f"directories that could not be read: {len(summary['unreadable_directories'])}",
+        f"paths that could not be read: {len(summary['unreadable_directories'])}"
+        + (
+            " (the corpus is incomplete: what they hold is counted nowhere)"
+            if summary["input_incomplete"]
+            else ""
+        ),
         *(
-            f"  {entry['state_dir']}: {entry['error']}"
+            f"  {entry['path']} ({entry['stage']}): {entry['error']}"
             for entry in summary["unreadable_directories"]
         ),
         "limitations:",

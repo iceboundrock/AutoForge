@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
@@ -357,7 +358,7 @@ def test_the_corpus_counts_each_unit_once_and_reads_nothing_it_should_not(tmp_pa
     }
     assert summary["blocked_episodes"] == {"ended_by_unblock": 3, "still_blocked": 2}
     assert summary["journal_lines"] == {"torn": 1, "foreign": 1, "malformed": 1}
-    assert summary["unreadable_directories"] == []
+    assert summary["unreadable_directories"] == [] and summary["input_incomplete"] is False
 
     incomplete = {r["run_id"] for r in summary["run_reports"] if r["incomplete"]}
     assert incomplete == {_id(n) for n in ("running", "failed", "local", "torn", "replaced-old")}
@@ -702,14 +703,92 @@ def test_one_unreadable_run_or_directory_never_stops_the_corpus(tmp_path, monkey
     monkeypatch.setattr(stop_corpus, "load_state", load)
     summary = _summary(root)
     assert summary["unreadable_directories"] == [
-        {"state_dir": str(dirs["ready"].resolve()), "error": "PermissionError"}
+        {"path": str(dirs["ready"].resolve()), "stage": "scan", "error": "PermissionError"}
     ]
+    assert summary["input_incomplete"] is True
     blocked = _report(summary, "blocked")
     # Not a StateError: classified unknown, and still the blocked run, by the
     # run id its file names, with its run log counted.
     assert blocked["final"]["outcome"] == "unknown" and blocked["state"] == "refused"
     assert blocked["launches"] == {"agent": 4, "command": 1}
     assert summary["runs"]["total"] == 8  # every run but the unreadable directory's
+
+
+@contextmanager
+def _denied(*paths: Path):
+    """``chmod 000`` each path for the block, and back, so the tmp tree can be removed."""
+    modes = [p.stat().st_mode for p in paths]
+    try:
+        for path in paths:
+            path.chmod(0)
+        yield
+    finally:
+        for path, mode in zip(paths, modes, strict=True):
+            path.chmod(mode)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_a_state_dir_given_that_cannot_be_listed_is_reported_never_dropped(tmp_path, capsys):
+    """R2-F4: a state directory given by name that cannot be listed (a real
+    mode-000 directory) is reported at discovery, and the input is said to be
+    incomplete, instead of a corpus of zero runs with nothing unreadable; a
+    readable directory given beside it is still counted."""
+    locked, _ = _run(tmp_path, "locked", Phase.REVIEW)
+    readable, _ = _run(tmp_path, "readable", Phase.DONE)
+    with _denied(locked):
+        summary = _summary(locked, readable)
+        assert stop_corpus.main([str(locked)]) == 0
+    assert summary["runs"]["total"] == 1 and _report(summary, "readable")
+    assert summary["input_incomplete"] is True
+    assert summary["unreadable_directories"] == [
+        {"path": str(locked), "stage": "discovery", "error": "PermissionError"}
+    ]
+    text = capsys.readouterr().out
+    assert text.startswith("runs: 0 ")
+    assert "paths that could not be read: 1 (the corpus is incomplete" in text
+    assert f"  {locked} (discovery): PermissionError" in text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permissions")
+def test_a_subtree_or_a_run_log_directory_that_cannot_be_read_is_reported(tmp_path):
+    """R2-F4: on the way down, a directory that cannot be listed, and a run's
+    log directory that cannot be looked into (the run log is all a state
+    directory may hold), are each reported; every readable sibling is still
+    counted, and nothing is reported twice."""
+    root = tmp_path / "corpus"
+    _run(root, "readable", Phase.DONE)
+    _run(root / "hidden", "inside", Phase.REVIEW)
+    logs_only = root / "logs-only" / ".autoforge"
+    run_dir = _journal(logs_only, _id("orphan"), [_agent(_id("orphan"))]).parent
+    with _denied(root / "hidden", run_dir):
+        summary = _summary(root)
+    assert {r["run_id"] for r in summary["run_reports"]} == {_id("readable")}
+    assert summary["input_incomplete"] is True
+    assert summary["unreadable_directories"] == [
+        {"path": str(root / "hidden"), "stage": "discovery", "error": "PermissionError"},
+        {"path": str(run_dir), "stage": "discovery", "error": "PermissionError"},
+    ]
+
+
+def test_a_path_given_that_is_missing_a_link_or_no_directory_is_reported(tmp_path):
+    """R2-F4: a path given is never silently worth zero runs: one that does not
+    exist, a link (never followed) and a file are each reported."""
+    real, _ = _run(tmp_path, "real", Phase.DONE)
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    file = tmp_path / "file"
+    file.write_text("x", encoding="utf-8")
+    missing = tmp_path / "missing"
+    summary = _summary(missing, link, file, real)
+    assert summary["runs"]["total"] == 1
+    assert summary["unreadable_directories"] == sorted(
+        [
+            {"path": str(missing), "stage": "discovery", "error": "FileNotFoundError"},
+            {"path": str(link), "stage": "discovery", "error": "a symbolic link, not followed"},
+            {"path": str(file), "stage": "discovery", "error": "not a directory"},
+        ],
+        key=lambda e: e["path"],
+    )
 
 
 def test_every_outcome_has_one_eligibility():

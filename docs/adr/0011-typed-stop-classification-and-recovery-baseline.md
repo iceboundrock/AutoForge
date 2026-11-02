@@ -238,7 +238,11 @@ uv run python -m tests.stop_corpus [--json] PATH [PATH ...]
    launched, sent or written (`tests/test_stop_corpus.py` snapshots the
    tree). No model is called. A state directory that cannot be read, a
    state file the loader refuses and a run log that cannot be read are each
-   reported, and every other run is still counted.
+   reported, and every other run is still counted; so is a path given that
+   is missing, a link or no directory, and a directory on the way down that
+   cannot be listed, at discovery, with the summary saying its input is
+   incomplete
+   (`test_a_state_dir_given_that_cannot_be_listed_is_reported_never_dropped`).
 2. **Which runs.** A state directory keeps evidence of more runs than its
    current `state.json`: a state `epic archive` moved aside
    (`state.json.archived-*`), one `run --force` quarantined
@@ -285,7 +289,8 @@ uv run python -m tests.stop_corpus [--json] PATH [PATH ...]
    a launch whose line names no producer it recognizes is kind `unknown`;
    a state directory's view is read from its path, so a namespace copied
    out of its layout is `unknown` and one renamed with nothing of its
-   namespace beside it reads as a standalone run's;
+   namespace beside it reads as a standalone run's; a path that cannot be
+   read is reported and counted nowhere;
    a run with no state that loads is `undecidable`; a state that names no
    run is counted apart; a moved, deleted, torn, oversized or irregular run
    log, or one with a foreign or malformed line, leaves its run flagged

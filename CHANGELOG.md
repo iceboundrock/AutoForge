@@ -53,7 +53,11 @@ command's by the producer its line names, so an agent's line from before
 scheduler namespace's state is classified in the scheduler's view (a
 `MERGE` or `UPDATE_EPIC` there is a hand-off, and its routes are the
 scheduler's), and a state directory whose view nothing establishes leaves
-such a phase `undecidable`.
+such a phase `undecidable`. A path given that is missing, a link or no
+directory, and a directory on the way down that cannot be listed, is
+reported with the stage that failed, and the summary
+(`autoforge.stop-corpus/3`) says its input is incomplete instead of
+counting fewer runs.
 
 ### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
 
