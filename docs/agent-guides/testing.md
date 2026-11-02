@@ -1272,7 +1272,13 @@ a stated reason it has none. The coverage that must keep working:
   directory before the strict import (it exports after it), and anything
   but a full commit id are not materializable; a replacement object changes
   nothing; the directory is removed after a pass, a failure and an
-  exception. The merge gate's commands see the committed bytes, and an
+  exception. Its comparison of a working tree with a commit
+  (`tree_differences`, PR #444 R3-F1) lists a changed byte, a flipped
+  execute bit, a retargeted link, a deletion and a retyped file by raw
+  path, and takes a gitlink as the commit's only as an empty real
+  directory: a repository, a file or a subdirectory in it, a link to it or
+  above it, a regular file, a FIFO (never opened) or nothing at its path
+  is a difference (R4-F1). The merge gate's commands see the committed bytes, and an
   unexportable reviewed HEAD stays inconclusive (`tests/test_engine.py`)
 - `ANALYZE_EXECUTE`'s publication (#161, `tests/test_engine.py`, engine
   built with `origin=True`): the controller pushes the agent's commit and
@@ -1594,8 +1600,13 @@ a stated reason it has none. The coverage that must keep working:
   they were (R2-F1); the same with the marked edit also mapped back to the
   committed content by a clean filter in the repository's configuration
   and `info/attributes`, which no `git status` lists, the edit, its mark
-  and the filter left as they were (R3-F1); an ignored file does not
-  refuse it; the uncommitted read follows neither the `.git` file nor
+  and the filter left as they were (R3-F1); the same with the fix made in
+  a submodule whose `.gitmodules` entry says `ignore = all`, left
+  uncommitted, committed in the submodule only, or written into the
+  unpopulated submodule's directory without a repository, which no plain
+  `git status` lists, the fix left as it was, until the operator empties
+  the submodule, after which the reviewer finds it unpopulated (R4-F1); an
+  ignored file does not refuse it; the uncommitted read follows neither the `.git` file nor
   `commondir` and reads no blob,
   and the read against a fresh index of the revision lists a marked
   edit, deletion or type change, takes a rewrite with the revision's
@@ -1608,10 +1619,17 @@ a stated reason it has none. The coverage that must keep working:
   `core.fileMode=false`, reads files below a directory replaced by a link
   as deleted without following it, a FIFO as retyped without opening it,
   and a file of another size without reading it; it runs no git process
-  naming the worktree, ignores untracked and ignored files and a gitlink's
-  path, takes a rewrite with the committed bytes as no change, and refuses
-  a revision the store cannot read or a directory it cannot read
-  (`tests/test_agent_worktree.py`); a
+  naming the worktree, ignores untracked and ignored files, takes a
+  rewrite with the committed bytes as no change, and refuses a revision
+  the store cannot read or a directory it cannot read; it lists a
+  populated submodule's path whose edit `ignore = all` hides from both
+  statuses, and files put into an unpopulated one, which no status lists,
+  and takes a deinitialized submodule's empty directory as no change; both
+  statuses list a submodule whose commit moved with `ignore = all` set in
+  `.gitmodules`, `submodule.<name>.ignore`, `diff.ignoreSubmodules` or the
+  worktree's own configuration, and none of the three reads runs a clean
+  filter the submodule's configuration defines, which
+  `--ignore-submodules=none` runs (`tests/test_agent_worktree.py`); a
   push between the unblock and the `REVIEW` entry is named in the prompt,
   which keeps the provenance and never says the HEAD is the same (R1-F3);
   it excludes the action flags; a dry run writes nothing

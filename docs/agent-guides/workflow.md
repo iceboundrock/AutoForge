@@ -854,8 +854,20 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   no git process reading the worktree and no link followed
   (`materialize.tree_differences`, R3-F1): a worktree whose checkout
   converts content (Git LFS, `eol=crlf`) refuses the flag too, since no
-  conversion is trusted to say which bytes are the commit's. Ignored files
-  are not listed by any of the three.
+  conversion is trusted to say which bytes are the commit's. A submodule's
+  ignore setting (`.gitmodules`, `submodule.<name>.ignore`,
+  `diff.ignoreSubmodules`) hides what its checkout holds from a status,
+  and files put at a submodule's path without a repository are listed by
+  no status at all (R4-F1). So both statuses run with
+  `--ignore-submodules=dirty`, which overrides every setting, lists a
+  gitlink whose commit moved, and runs no git in a submodule (its
+  repository and configuration, a filter driver say, are the agent's),
+  and the byte comparison refuses every submodule path that is not the
+  empty directory a checkout leaves an unpopulated submodule: what a
+  populated one holds is never proven the reviewed commit's.
+  `git submodule deinit` empties a submodule that holds no change, keeping
+  its repository, and refuses one that does. Ignored files are not listed
+  by any of the three.
   Anywhere else (a moved PR, a clean review, no PR, no open findings) the
   flag refuses, quoting the plain decision; it excludes the action flags.
   A `FIX` agent that reports `blocked` names the flag in the step's

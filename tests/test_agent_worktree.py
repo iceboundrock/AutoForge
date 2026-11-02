@@ -21,6 +21,7 @@ import pytest
 
 from autoforge import agent_worktree, materialize
 from autoforge.agent_worktree import (
+    ByteChanges,
     Candidate,
     ObjectImportError,
     alternate_entry,
@@ -600,10 +601,16 @@ def test_a_temporary_index_that_cannot_be_made_is_refused_never_taken_as_clean(r
 # ---------------------------------------------- the worktree's bytes (PR #444 R3-F1)
 
 
-def _bytes_against(repo, runner=None, revision=None) -> list[StatusEntry]:
+def _byte_changes(repo, runner=None, revision=None) -> ByteChanges:
     worktree = str(repo["worktree"])
     revision = revision or _git("-C", worktree, "rev-parse", "HEAD")
     return byte_changes_from_revision(repo["common"], worktree, revision, runner)
+
+
+def _bytes_against(repo, runner=None, revision=None) -> list[StatusEntry]:
+    """The tracked files and the submodule paths the byte comparison lists, in that order."""
+    changes = _byte_changes(repo, runner, revision)
+    return [*changes.files, *changes.submodules]
 
 
 def _converting(repo, conversion: str) -> None:
@@ -730,16 +737,129 @@ def test_a_file_of_another_size_is_listed_without_reading_it(repo, monkeypatch):
     assert _bytes_against(repo) == [StatusEntry(" M", "a.txt")] and read == [b"a.txt"]
 
 
-def test_a_gitlink_path_is_not_compared(repo):
-    """What a submodule's path holds is its own repository's, not the
-    tree's bytes: the byte comparison leaves it to `git status`."""
+def test_files_at_an_unpopulated_gitlink_are_listed_by_the_bytes_alone(repo):
+    """Files put at a submodule's path without a repository there are listed
+    by no `git status`, whatever its submodule settings: only the byte
+    comparison sees them, as a submodule path that is not the empty
+    directory a checkout leaves (PR #444 R4-F1)."""
     worktree = repo["worktree"]
     head = _git("-C", str(worktree), "rev-parse", "HEAD")
     _git("-C", str(worktree), "update-index", "--add", "--cacheinfo", f"160000,{head},mod")
     _git("-C", str(worktree), *GIT_IDENT, "commit", "-q", "-m", "a submodule")
     (worktree / "mod").mkdir(exist_ok=True)
-    (worktree / "mod" / "anything.txt").write_text("not the tree's\n")
     assert _bytes_against(repo) == []
+    (worktree / "mod" / "anything.txt").write_text("not the tree's\n")
+    plain = ["-C", str(worktree), "status", "--porcelain", "--untracked-files=all"]
+    assert _git(*plain, "--ignore-submodules=none") == ""
+    assert _uncommitted(repo) == [] and _against(repo) == []
+    changes = _byte_changes(repo)
+    assert changes.files == () and changes.submodules == (StatusEntry(" M", "mod"),)
+
+
+# ----------------------------------------- submodules and their ignore settings (R4-F1)
+
+
+def _with_submodule(repo) -> Path:
+    """``vendor``, a submodule holding ``cache.py``, committed in the worktree with
+    ``ignore = all`` in ``.gitmodules`` as the reviewer's reproduction had it, and
+    populated, as a fixer's `git submodule update --init` leaves it; its path."""
+    sub = repo["base"] / "sub"
+    _git("init", "-q", "-b", "main", str(sub))
+    (sub / "cache.py").write_text("TTL_SECONDS = 0\n")
+    _git("-C", str(sub), "add", "cache.py")
+    _git("-C", str(sub), *GIT_IDENT, "commit", "-q", "-m", "the cache")
+    worktree = str(repo["worktree"])
+    _git(
+        "-C",
+        worktree,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(sub),
+        "vendor",
+    )
+    _git("-C", worktree, "config", "-f", ".gitmodules", "submodule.vendor.ignore", "all")
+    _git("-C", worktree, "add", ".gitmodules")
+    _git("-C", worktree, *GIT_IDENT, "commit", "-q", "-m", "vendor the cache")
+    return repo["worktree"] / "vendor"
+
+
+def test_a_populated_submodule_is_listed_whatever_its_ignore_setting_hides(repo):
+    """PR #444 R4-F1: with `ignore = all`, `git status` lists nothing of an
+    edit in the submodule. Both statuses compare it by its gitlink alone,
+    and its commit is the reviewed one; the byte comparison lists its path,
+    since what a populated submodule holds is never proven the commit's.
+    Once the operator deinitializes it, the empty directory is no change."""
+    vendor = _with_submodule(repo)
+    worktree = repo["worktree"]
+    assert _bytes_against(repo) == [StatusEntry(" M", "vendor")]
+    (vendor / "cache.py").write_text("TTL_SECONDS = 300\n")
+    assert _git("-C", str(worktree), "status", "--porcelain") == ""
+    assert _uncommitted(repo) == [] and _against(repo) == []
+    changes = _byte_changes(repo)
+    assert changes.files == () and changes.submodules == (StatusEntry(" M", "vendor"),)
+    _git("-C", str(vendor), "checkout", "-q", "--", "cache.py")
+    _git("-C", str(worktree), "submodule", "deinit", "-q", "--", "vendor")
+    assert vendor.is_dir() and not any(vendor.iterdir())
+    assert _uncommitted(repo) == [] and _against(repo) == [] and _bytes_against(repo) == []
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [".gitmodules", "submodule.vendor.ignore", "diff.ignoreSubmodules", "worktree config"],
+)
+def test_both_statuses_list_a_moved_submodule_whatever_its_ignore_setting(repo, setting):
+    """A commit in the submodule moves its HEAD off the gitlink: both
+    statuses list it, with every place an ignore setting can come from set
+    to `all` (the worktree's own configuration among them), which hides it
+    from a plain `git status`."""
+    vendor = _with_submodule(repo)
+    worktree, root = str(repo["worktree"]), str(repo["root"])
+    if setting != ".gitmodules":
+        _git("-C", worktree, "config", "-f", ".gitmodules", "--unset", "submodule.vendor.ignore")
+        _git("-C", worktree, "update-index", "--assume-unchanged", ".gitmodules")
+    if setting == "worktree config":
+        _git("-C", root, "config", "extensions.worktreeConfig", "true")
+        _git("-C", worktree, "config", "--worktree", "diff.ignoreSubmodules", "all")
+    elif setting != ".gitmodules":
+        _git("-C", root, "config", setting, "all")
+    (vendor / "cache.py").write_text("TTL_SECONDS = 300\n")
+    _git("-C", str(vendor), *GIT_IDENT, "commit", "-q", "-am", "a fix, committed in the submodule")
+    assert _git("-C", worktree, "status", "--porcelain", "--", "vendor") == ""
+    assert _uncommitted(repo) == [StatusEntry(" M", "vendor")]
+    assert StatusEntry(" M", "vendor") in _against(repo)
+
+
+def test_no_git_runs_in_a_submodule(repo):
+    """The submodule's repository and configuration are the agent's: a clean
+    filter defined there runs when `git status` looks into the submodule
+    (`--ignore-submodules=none`, the default without a setting), as the
+    controller. None of the three reads does: both statuses run with
+    `--ignore-submodules=dirty`, and the byte comparison runs no git in the
+    worktree at all."""
+    vendor = _with_submodule(repo)
+    worktree = repo["worktree"]
+    _git("-C", str(worktree), "config", "-f", ".gitmodules", "--unset", "submodule.vendor.ignore")
+    _git("-C", str(worktree), *GIT_IDENT, "commit", "-q", "-am", "no ignore setting")
+    marker = repo["base"] / "ran"
+    module = Path(_git("-C", str(vendor), "rev-parse", "--path-format=absolute", "--git-dir"))
+    assert module == repo["admin"] / "modules" / "vendor"  # in the agent's admin dir
+    _git("-C", str(vendor), "config", "filter.spy.clean", f"touch {shlex.quote(str(marker))}; cat")
+    (module / "info").mkdir(exist_ok=True)
+    (module / "info" / "attributes").write_text("* filter=spy\n")
+    (vendor / "cache.py").write_text("TTL_SECONDS = 9\n")  # the committed size: content is read
+    seen: list[ExecutionRequest] = []
+    assert _uncommitted(repo, _recording(seen)) == []
+    assert _against(repo, _recording(seen)) == []
+    assert _bytes_against(repo, _recording(seen)) == [StatusEntry(" M", "vendor")]
+    assert not marker.exists()
+    statuses = [request.command for request in seen if "status" in request.command]
+    assert len(statuses) == 2
+    assert all("--ignore-submodules=dirty" in argv for argv in statuses)
+    _git("-C", str(worktree), "status", "--porcelain", "--ignore-submodules=none")
+    assert marker.exists()
 
 
 def test_an_unreadable_byte_comparison_is_refused_never_taken_as_clean(repo):

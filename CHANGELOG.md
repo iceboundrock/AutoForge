@@ -78,8 +78,14 @@ another conversion its attributes name maps back to the committed content,
 which `git status` does not list: AutoForge compares every tracked file's
 bytes with the reviewed commit itself, with no git process reading the
 worktree, so a worktree whose checkout converts content (Git LFS,
-`eol=crlf`) is refused too; and wherever a plain `unblock` would not
-re-enter `FIX` with open findings. It excludes `--approve-action`,
+`eol=crlf`) is refused too; when a submodule's path in the agent worktree
+holds anything but the empty directory a checkout leaves an unpopulated
+submodule (a populated submodule, or files put there), whose content
+AutoForge cannot prove the reviewed commit's and which `git status` lists
+only as far as the submodule's `ignore` setting lets it, or not at all
+(`git submodule deinit` empties a submodule that holds no change and
+refuses one that does); and wherever a plain `unblock` would not re-enter
+`FIX` with open findings. It excludes `--approve-action`,
 `--decline-action` and `--bind-evidence`.
 
 The history entry records the abandoned finding ids (`action`), the run

@@ -1266,12 +1266,13 @@ def test_unblock_rereview_refuses_a_worktree_path_it_cannot_bind(tmp_state_dir, 
     _assert_untouched(eng, raw)
 
 
-def _publish_with(eng, path: str, text: str) -> str:
+def _publish_with(eng, path: str, text: str, *, gitlinks: dict[str, str] | None = None) -> str:
     """A PR head on the checkout's HEAD whose tree holds ``path`` with ``text``; its SHA.
 
-    Written with plumbing into the checkout's object store, so the
-    checkout's HEAD, index and working tree are not moved, and published
-    to the PR branch on the engine's origin.
+    ``gitlinks`` (path: commit) adds a gitlink per entry. Written with
+    plumbing into the checkout's object store, so the checkout's HEAD,
+    index and working tree are not moved, and published to the PR branch on
+    the engine's origin.
     """
     workdir = str(eng.workdir)
 
@@ -1282,7 +1283,8 @@ def _publish_with(eng, path: str, text: str) -> str:
         return res.stdout.strip()
 
     blob = plumbing("hash-object", "-w", "--stdin", data=text)
-    tree = plumbing("mktree", data=f"100644 blob {blob}\t{path}\n")
+    links = "".join(f"160000 commit {sha}\t{name}\n" for name, sha in (gitlinks or {}).items())
+    tree = plumbing("mktree", data=f"100644 blob {blob}\t{path}\n{links}")
     sha = git_out(
         "-C", workdir, *GIT_IDENT, "commit-tree", tree, "-p", "HEAD", "-m", "Add the cache (#2)"
     )
@@ -1290,15 +1292,20 @@ def _publish_with(eng, path: str, text: str) -> str:
     return sha
 
 
-def _in_fix_of_round_two(tmp_state_dir, *handlers, files=None):
+def _in_fix_of_round_two(tmp_state_dir, *handlers, files=None, gitlinks=None):
     """A REMOTE run entering FIX for round 2's R2-F1 on an origin-backed PR; ``(eng, gh, head)``.
 
-    The PR head holds ``files`` (one path: text) when given.
+    The PR head holds ``files`` (one path: text) when given, and ``gitlinks``
+    (path: commit) with it.
     """
     gh = FakeGitHub()
     gh.add_issue(ISSUE, "Ship the feature")
     eng = make_engine(tmp_state_dir, scripted(*handlers), github=gh, origin=True)
-    head = _publish_with(eng, *next(iter(files.items()))) if files else publish_pr_head(eng)
+    head = (
+        _publish_with(eng, *next(iter(files.items())), gitlinks=gitlinks)
+        if files
+        else publish_pr_head(eng)
+    )
     gh.add_pr(head_sha=head, body="Adds the feature with the old cache design.")
     merge_base = git_out("-C", str(eng.workdir), "rev-parse", "HEAD")
     for name, value in (
@@ -1438,6 +1445,109 @@ def test_a_rereview_judges_the_bound_commit_not_a_blocked_fixers_uncommitted_edi
     out = eng.step()
     assert out.next_phase == "FIX", out.message
     assert seen == [BUGGY]
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 3 and s.reviewed_head_sha == head
+    assert [f["id"] for f in s.open_findings] == ["R3-F1"] and s.prior_findings == []
+
+
+def _vendored_cache(tmp_state_dir) -> tuple[dict[str, str], dict[str, str]]:
+    """``(files, gitlinks)`` of a PR head vendoring ``cache.py`` (holding the bug) as a submodule.
+
+    ``vendor`` is a gitlink to a commit of a repository beside the state
+    directory, and the PR head's ``.gitmodules`` names it with ``ignore =
+    all``, as the reviewer's reproduction of PR #444 R4-F1 had it.
+    """
+    sub = Path(tmp_state_dir).parent / "vendored-cache"
+    git_out("init", "-q", "-b", "main", str(sub))
+    (sub / "cache.py").write_text(BUGGY, "utf-8")
+    git_out("-C", str(sub), "add", "cache.py")
+    git_out("-C", str(sub), *GIT_IDENT, "commit", "-q", "-m", "The cache")
+    gitmodules = f'[submodule "vendor"]\n\tpath = vendor\n\turl = {sub}\n\tignore = all\n'
+    return {".gitmodules": gitmodules}, {"vendor": git_out("-C", str(sub), "rev-parse", "HEAD")}
+
+
+def _populate_vendor(worktree: Path) -> Path:
+    """The fixer's `git submodule update --init` in ``worktree``; the submodule's path."""
+    git_out(
+        "-C",
+        str(worktree),
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "-q",
+        "--init",
+    )
+    return worktree / "vendor"
+
+
+@pytest.mark.parametrize("how", ["edited", "committed", "without a repository"])
+def test_a_rereview_judges_the_bound_commit_not_a_fix_a_submodule_setting_hides(tmp_state_dir, how):
+    """PR #444 R4-F1 end to end. The PR head vendors cache.py, holding the
+    bug, as a submodule whose `.gitmodules` entry says `ignore = all`. The
+    fixer populates the submodule, fixes cache.py there and blocks: the fix
+    is left uncommitted, or committed in the submodule only, or written
+    into the unpopulated submodule's directory with no repository. `git
+    status` lists none of it, so a re-review's reviewer would read and test
+    a fix the bound gitlink does not hold: `unblock --rereview` is refused
+    before any reviewer launches, naming the submodule and the remedy,
+    nothing written and the fix left as it was. Once the operator has moved
+    it out, the re-review's reviewer finds the submodule as the bound
+    commit's checkout leaves it, unpopulated, and raises the bug again."""
+    seen: list[list[str]] = []
+
+    def reviewer(req):
+        vendor = Path(req.cwd) / "vendor"
+        seen.append(sorted(p.name for p in vendor.iterdir()))
+        return block(review_result(3, head, [] if seen[-1] else [CARRIED]))
+
+    def half_fix(worktree):
+        if how == "without a repository":
+            (worktree / "vendor" / "cache.py").write_text(FIXED, "utf-8")
+            return
+        vendor = _populate_vendor(worktree)
+        (vendor / "cache.py").write_text(FIXED, "utf-8")
+        if how == "committed":
+            git_out("-C", str(vendor), *GIT_IDENT, "commit", "-q", "-am", "Fix the TTL")
+
+    files, gitlinks = _vendored_cache(tmp_state_dir)
+    eng, gh, head = _in_fix_of_round_two(
+        tmp_state_dir, _blocked_fixer(half_fix), reviewer, files=files, gitlinks=gitlinks
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    worktree = eng.agent_worktree_path()
+    vendor = worktree / "vendor"
+    assert git_out("-C", str(worktree), "status", "--porcelain", "--untracked-files=all") == ""
+    assert (vendor / "cache.py").read_text("utf-8") == FIXED
+
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert not out.unblocked
+    assert (
+        f"the agent worktree {worktree} holds 1 uncommitted change(s) on the reviewed HEAD "
+        f"{head[:12]} (1 at the path of a submodule (vendor) that is not the empty directory "
+        "the reviewed commit's checkout leaves there" in out.message
+    )
+    assert f"`git -C {worktree} submodule deinit -- <path>` empties a submodule" in out.message
+    assert "its prompt lists only what `git status` lists" in out.message
+    _assert_untouched(eng, raw)
+    assert len(eng.provider.calls) == 1  # the blocked fixer only
+    assert (vendor / "cache.py").read_text("utf-8") == FIXED
+
+    # The operator moves the fix out of the worktree (here: drops it).
+    if how == "without a repository":
+        (vendor / "cache.py").unlink()
+    else:
+        if how == "committed":
+            git_out("-C", str(worktree), "submodule", "update", "-q")
+        git_out("-C", str(vendor), "checkout", "-q", "--", "cache.py")
+        git_out("-C", str(worktree), "submodule", "deinit", "-q", "--", "vendor")
+    out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    out = eng.step()
+    assert out.next_phase == "FIX", out.message
+    assert seen == [[]]
     s = load_state(eng.paths.state_file)
     assert s.review_round == 3 and s.reviewed_head_sha == head
     assert [f["id"] for f in s.open_findings] == ["R3-F1"] and s.prior_findings == []

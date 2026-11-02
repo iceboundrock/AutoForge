@@ -98,7 +98,8 @@ epic_rebind.py      rebind-epic's decision for an existing standalone run: reque
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
 materialize.py      byte-exact export of a candidate commit from the shared object store
                     and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171);
-                    a working tree's blob-by-blob comparison with a commit (tree_differences)
+                    a working tree's blob-by-blob comparison with a commit, a gitlink
+                    matching only as an empty directory (tree_differences)
 evidence.py         candidate validation evidence: definitions, policy P, ValidationRecords,
                     the attempt marker, their bounds and integrity checks; pure (ADR 0006, #172)
 certificate.py      review certificates: issuance from the review binding, applicability

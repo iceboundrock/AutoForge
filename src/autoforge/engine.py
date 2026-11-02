@@ -7546,10 +7546,18 @@ class ControllerEngine:
         name, and a clean filter can map an edit back to the reviewed blob
         (R3-F1), so every blob of the reviewed tree is also compared with
         the worktree's bytes, with no git process reading the worktree
-        (:func:`byte_changes_from_revision`). ``HEAD`` is read as a
-        candidate is (ADR 0005 D6.3) and both statuses through the bound
-        admin dir (:func:`uncommitted_entries`), never through the
-        worktree's ``.git`` file; nothing is imported or written.
+        (:func:`byte_changes_from_revision`). A submodule's ignore
+        setting hides what its checkout holds from a status, and files put
+        at a submodule's path without a repository are listed by none
+        (R4-F1): both statuses compare a submodule by its gitlink alone,
+        whatever that setting says, and run no git in it, and the byte
+        comparison refuses every submodule path that is not the empty
+        directory a checkout leaves an unpopulated one, since what a
+        populated submodule holds is never proven the reviewed commit's.
+        ``HEAD`` is read as a candidate is (ADR 0005 D6.3) and both
+        statuses through the bound admin dir (:func:`uncommitted_entries`),
+        never through the worktree's ``.git`` file; nothing is imported or
+        written.
         """
         path = self.agent_worktree_path()
         if not os.path.lexists(path):
@@ -7593,13 +7601,19 @@ class ControllerEngine:
                 f"HEAD {reviewed[:12]} does not hold is not knowable. Fix the cause, then "
                 "unblock again, or unblock without --rereview"
             )
-        listed = {entry.path for entry in entries}
+        # A submodule's path is told as such, whichever read lists it: a
+        # plain `git status` lists it only as its ignore setting lets it.
+        populated = list(raw.submodules)
+        submodules = {entry.path for entry in populated}
+        entries = [entry for entry in entries if entry.path not in submodules]
+        listed = {entry.path for entry in entries} | submodules
         marked = [entry for entry in fresh if entry.path not in listed]
         known = listed | {entry.path for entry in marked}
-        converted = [entry for entry in raw if entry.path not in known]
-        if not entries and not marked and not converted:
+        converted = [entry for entry in raw.files if entry.path not in known]
+        if not entries and not marked and not converted and not populated:
             return ""
         listing, prompt = f"`git -C {path} status` lists them", "its prompt lists them"
+        notes: list[str] = []
         if marked or converted:
             causes = []
             if marked:
@@ -7617,13 +7631,28 @@ class ControllerEngine:
                     "conversion or core.fileMode=false does; "
                     f"`git -C {path} check-attr -a -- <file>` names a file's conversions"
                 )
-            listing = (
+            notes.append(
                 f"`git -C {path} status` does not list {len(marked) + len(converted)} of "
                 f"them: {'; '.join(causes)}"
             )
-            prompt = "its prompt lists only what `git status` lists"
+        if populated:
+            shown = ", ".join(entry.path for entry in populated[:3])
+            shown += ", ..." if len(populated) > 3 else ""
+            notes.append(
+                f"{len(populated)} at the path of a submodule ({shown}) that is not the empty "
+                "directory the reviewed commit's checkout leaves there: a populated submodule "
+                "is a repository of its own, whose content the controller cannot prove the "
+                "reviewed commit's and `git status` lists only as far as the submodule's "
+                "ignore setting (in `.gitmodules` or the configuration) lets it, and files put "
+                "there without a repository are listed by no `git status`; "
+                f"`git -C {path} submodule deinit -- <path>` empties a submodule that holds no "
+                "change, keeping its repository, and refuses one that does"
+            )
+        if notes:
+            listing, prompt = "; ".join(notes), "its prompt lists only what `git status` lists"
+        total = len(entries) + len(marked) + len(converted) + len(populated)
         return (
-            f"the agent worktree {path} holds {len(entries) + len(marked) + len(converted)} "
+            f"the agent worktree {path} holds {total} "
             f"uncommitted change(s) on the reviewed HEAD {reviewed[:12]} ({listing}), and the "
             "next round's reviewer works in that worktree: what it reads and tests there would "
             "be those changes, not the reviewed commit. The controller neither discards nor "

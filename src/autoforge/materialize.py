@@ -39,12 +39,15 @@ uses it, and candidate validation (#172) will.
   the listing names for it and the root to the commit's tree, with no entry
   extra or missing. A mismatch is a
   :class:`~autoforge.errors.MaterializationError` naming the entry.
-- **Comparison (PR #444 R3-F1).** :func:`tree_differences` compares a
-  working tree the controller did not write (an agent worktree) with a
-  commit's tree the same way, blob by blob, and lists what differs instead
-  of raising: what the directory holds besides the tree's blobs is not
-  looked at, and no git process reads it, so no attribute, filter or
-  index can make other bytes read as the commit's.
+- **Comparison (PR #444 R3-F1, R4-F1).** :func:`tree_differences`
+  compares a working tree the controller did not write (an agent worktree)
+  with a commit's tree the same way, blob by blob, and lists what differs
+  instead of raising: what the directory holds besides the tree's entries
+  is not looked at, and no git process reads it, so no attribute, filter
+  or index can make other bytes read as the commit's. A gitlink's path
+  matches only as the empty directory a checkout leaves a submodule it
+  does not populate: a populated submodule's content is a repository of
+  its own, never proven the commit's.
 
 Every git process is the hardened local request
 (:func:`~autoforge.git_transport.local_git_request`, ADR 0004 D7.3, D7.5):
@@ -716,17 +719,21 @@ def _prove(root: Path, listing: _Listing, commit: str, object_format: str) -> No
 
 @dataclass(frozen=True)
 class TreeDifference:
-    """A blob of a commit's tree that a directory does not hold as the commit does.
+    """An entry of a commit's tree that a directory does not hold as the commit does.
 
-    ``kind`` is ``"deleted"`` (nothing at the path, or a directory above it
-    that is not a real one), ``"retyped"`` (anything but a regular file
-    where the tree lists one, anything but a symlink where it lists a
-    symlink) or ``"modified"`` (other bytes, or the owner's execute bit
-    other than the mode says).
+    For a blob, ``kind`` is ``"deleted"`` (nothing at the path, or a
+    directory above it that is not a real one), ``"retyped"`` (anything but
+    a regular file where the tree lists one, anything but a symlink where it
+    lists a symlink) or ``"modified"`` (other bytes, or the owner's execute
+    bit other than the mode says). For a gitlink (``submodule`` true), it is
+    ``"deleted"`` as for a blob, ``"retyped"`` (anything but a real
+    directory) or ``"populated"`` (a real directory holding any entry,
+    a submodule's checkout or anything else).
     """
 
     path: bytes
     kind: str
+    submodule: bool = False
 
 
 # What opening a directory along a listed path finds when it is not a real
@@ -769,27 +776,58 @@ def _blob_difference(object_format: str, parent: int | None, entry: _Entry) -> s
     return "" if oid == entry.oid else "modified"
 
 
+def _gitlink_difference(parent: int | None, entry: _Entry) -> str:
+    """How the gitlink ``entry`` differs in the directory ``parent``, or "" when it does not.
+
+    Only an empty real directory matches: what a checkout leaves at a
+    submodule's path when it does not populate it. Nothing inside is read
+    beyond its first name, and no repository there is opened.
+    """
+    if parent is None:
+        return "deleted"
+    try:
+        st = os.lstat(entry.name, dir_fd=parent)
+    except FileNotFoundError:
+        return "deleted"
+    if not stat.S_ISDIR(st.st_mode):
+        return "retyped"
+    fd = _open_listed_dir(parent, entry.name)
+    if fd is None:
+        return "deleted"
+    try:
+        with os.scandir(fd) as names:
+            return "populated" if next(names, None) is not None else ""
+    finally:
+        os.close(fd)
+
+
 def tree_differences(
     runner: Runner, repo: str, commit: str, object_format: str, root: Path
 ) -> list[TreeDifference]:
-    """The blobs of ``commit``'s tree that ``root`` does not hold byte for byte (PR #444 R3-F1).
+    """The entries of ``commit``'s tree that ``root`` does not hold as committed (PR #444 R3-F1).
 
     ``root`` is a working tree someone else wrote (an agent worktree), not
-    an export: what it holds besides the tree's blobs (an untracked or
-    ignored file, a ``.git``) is not looked at, nor is what is at a
-    gitlink's path. The tree is listed, sizes included, from ``repo``'s
-    store as :func:`materialize` lists it, every name refused that it
-    refuses; no git process reads ``root``. Each blob is then compared as
-    the proof (D6.3) compares an export: ``lstat``-ed relative to the
-    descriptor of its directory, every directory on its path opened
-    without following a link (a directory that is a link, a file or
-    missing makes everything below it ``deleted``), a regular file's
-    execute bit and size compared with the listing before its bytes are
-    read and hashed, a symlink's link text hashed. So no attribute, filter
-    driver, end-of-line, ``ident`` or ``working-tree-encoding`` conversion,
-    and no index, takes part: a file reads as the commit's only when its
-    bytes are the blob's. ``object_format`` names the store's format
-    (:func:`read_object_format`). In listing order.
+    an export: what it holds besides the tree's entries (an untracked or
+    ignored file, a ``.git``) is not looked at. The tree is listed, sizes
+    included, from ``repo``'s store as :func:`materialize` lists it, every
+    name refused that it refuses; no git process reads ``root``. Each blob
+    is then compared as the proof (D6.3) compares an export: ``lstat``-ed
+    relative to the descriptor of its directory, every directory on its
+    path opened without following a link (a directory that is a link, a
+    file or missing makes everything below it ``deleted``), a regular
+    file's execute bit and size compared with the listing before its bytes
+    are read and hashed, a symlink's link text hashed. So no attribute,
+    filter driver, end-of-line, ``ident`` or ``working-tree-encoding``
+    conversion, and no index, takes part: a file reads as the commit's only
+    when its bytes are the blob's. A gitlink's path reads as the commit's
+    only as an empty real directory, which is what a checkout leaves when
+    it does not populate the submodule (PR #444 R4-F1): a populated
+    submodule's content is the commit of a repository of its own, whose
+    store and configuration are the worktree's writer's, so it is never
+    proven the gitlink's, and anything else there (files without a
+    repository, which ``git status`` does not list whatever its
+    submodule settings) is not the commit's either. ``object_format`` names
+    the store's format (:func:`read_object_format`). In listing order.
 
     Raises :class:`~autoforge.errors.CandidateNotMaterializableError` when
     ``commit`` is not a commit of the store, and
@@ -818,7 +856,11 @@ def tree_differences(
             parent = stack[-1][1]
             if entry.mode == _TREE:
                 stack.append((entry.path, _open_listed_dir(parent, entry.name)))
-            elif entry.mode != _GITLINK:
+            elif entry.mode == _GITLINK:
+                kind = _gitlink_difference(parent, entry)
+                if kind:
+                    found.append(TreeDifference(entry.path, kind, submodule=True))
+            else:
                 kind = _blob_difference(object_format, parent, entry)
                 if kind:
                     found.append(TreeDifference(entry.path, kind))

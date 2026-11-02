@@ -673,8 +673,16 @@ file's attributes name, a clean filter say, maps it back to the committed
 content (`git -C <worktree> check-attr -a -- <file>` names it). The
 message says how many such files there are. A repository whose checkout
 itself writes other bytes than the committed ones (Git LFS, `eol=crlf`,
-`ident`, `working-tree-encoding`) is refused for the same reason. Unblock
-without the flag to let `FIX` continue from the work (its prompt lists
+`ident`, `working-tree-encoding`) is refused for the same reason. So is a
+submodule's path that holds anything but the empty directory a checkout
+leaves an unpopulated submodule: a populated submodule is a repository of
+its own whose content AutoForge cannot prove the reviewed commit's, and
+`git status` lists a change there only as far as the submodule's `ignore`
+setting (in `.gitmodules` or the configuration) lets it, and files put
+there without a repository not at all.
+`git -C <worktree> submodule deinit -- <path>` empties a submodule that
+holds no change and keeps its repository, and refuses one that does.
+Unblock without the flag to let `FIX` continue from the work (its prompt lists
 what `git status` lists), or move the work out of the worktree yourself
 and unblock again; AutoForge never discards it. The flag also checks that
 the base branch was not rewritten

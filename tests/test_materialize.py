@@ -12,6 +12,7 @@ from __future__ import annotations
 import errno
 import os
 import random
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -37,7 +38,7 @@ from autoforge.materialize import (
     tree_differences,
 )
 
-from .conftest import GIT_IDENT
+from .conftest import GIT_IDENT, watched_fifo
 
 FORMATS = ["sha1", "sha256"]
 
@@ -549,10 +550,12 @@ def test_a_failing_git_process_is_a_materialization_failure(tmp_path, exports):
 # -- comparison (PR #444 R3-F1) ------------------------------------------------------------
 @pytest.mark.parametrize("object_format", FORMATS)
 def test_a_directory_is_compared_with_the_tree_blob_by_blob(tmp_path, exports, object_format):
-    """A proven export holds every blob as committed: no difference, and an
-    added file or a gitlink's content is not looked at. A changed byte, a
-    flipped execute bit, a retargeted link, a deletion and a file replaced
-    by a directory are listed by their raw paths, in listing order."""
+    """A proven export holds every blob as committed, and the empty directory
+    of an unpopulated submodule at its gitlink: no difference, and an added
+    file is not looked at. A file at the gitlink's path populates it (PR
+    #444 R4-F1). A changed byte, a flipped execute bit, a retargeted link, a
+    deletion and a file replaced by a directory are listed by their raw
+    paths, in listing order."""
     repo = _init(tmp_path / "repo", object_format)
     absent = "e" * (40 if object_format == "sha1" else 64)
     latin = b"caf\xe9-\xff.bin"
@@ -579,8 +582,10 @@ def test_a_directory_is_compared_with_the_tree_blob_by_blob(tmp_path, exports, o
 
         assert differences() == []
         (root / "untracked.txt").write_text("not in the tree\n")
-        (root / "vendor" / "lib" / "module.txt").write_text("the submodule's\n")
         assert differences() == []
+        (root / "vendor" / "lib" / "module.txt").write_text("the submodule's\n")
+        assert differences() == [TreeDifference(b"vendor/lib", "populated", submodule=True)]
+        (root / "vendor" / "lib" / "module.txt").unlink()
         (root / "run.sh").chmod(0o644)
         with open(os.path.join(os.fsencode(root), latin), "r+b") as handle:
             handle.write(b"A")
@@ -596,6 +601,65 @@ def test_a_directory_is_compared_with_the_tree_blob_by_blob(tmp_path, exports, o
             TreeDifference(b"relative", "modified"),
             TreeDifference(b"run.sh", "modified"),
         ]
+
+
+@pytest.mark.parametrize(
+    ("what", "kind"),
+    [
+        ("empty", ""),
+        ("a repository", "populated"),
+        ("a file", "populated"),
+        ("an empty subdirectory", "populated"),
+        ("absent", "deleted"),
+        ("a link to an empty directory", "retyped"),
+        ("a regular file", "retyped"),
+        ("a fifo", "retyped"),
+        ("a link above it", "deleted"),
+    ],
+)
+def test_a_gitlink_matches_only_as_an_empty_real_directory(tmp_path, exports, what, kind):
+    """PR #444 R4-F1: a checkout leaves an empty directory at a submodule it
+    does not populate. Anything in it, a repository or not, is content the
+    commit's tree does not prove; anything but a real directory there, or
+    a link on the way to it, is not the commit's either. Nothing at the
+    path is opened but the directory itself, nothing through a link."""
+    repo = _init(tmp_path / "repo")
+    commit = _commit(
+        repo,
+        _tree(repo, {"third_party": {"vendor": Gitlink("e" * 40)}, "a.txt": b"a\n"}),
+    )
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "vendor").mkdir(parents=True)
+    with _export(repo, commit) as tree:
+        root = tree.root
+        gitlink = root / "third_party" / "vendor"
+        assert gitlink.is_dir() and not any(gitlink.iterdir())
+        opened: list[str] = []
+        if what == "a repository":
+            subprocess.run(["git", "init", "-q", str(gitlink)], check=True)
+        elif what == "a file":
+            (gitlink / "cache.py").write_text("TTL_SECONDS = 300\n")
+        elif what == "an empty subdirectory":
+            (gitlink / "pkg").mkdir()
+        elif what == "absent":
+            gitlink.rmdir()
+        elif what == "a link to an empty directory":
+            gitlink.rmdir()
+            os.symlink(elsewhere / "vendor", gitlink)
+        elif what == "a regular file":
+            gitlink.rmdir()
+            gitlink.write_text("not a directory\n")
+        elif what == "a link above it":
+            shutil.rmtree(root / "third_party")
+            os.symlink(elsewhere, root / "third_party")
+        expected = [TreeDifference(b"third_party/vendor", kind, submodule=True)] if kind else []
+        if what == "a fifo":
+            gitlink.rmdir()
+            with watched_fifo(gitlink) as opened:
+                assert tree_differences(execute, str(repo), commit, "sha1", root) == expected
+        else:
+            assert tree_differences(execute, str(repo), commit, "sha1", root) == expected
+        assert opened == []
 
 
 # -- identity ------------------------------------------------------------------------------
