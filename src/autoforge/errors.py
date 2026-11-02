@@ -45,7 +45,21 @@ class StateError(AutoForgeError):
 
     Raised on read of a corrupted state; the controller must never silently
     re-initialize a fresh state over existing data.
+
+    ``interrupted_attempt`` is typed context, never derived from the
+    message: ``True`` only on a refusal of the run log that the engine
+    re-raised after it had persisted an agent launch's attempt
+    (``ControllerEngine._begin_step`` before the launch,
+    ``_record_invocation`` after the agent returned). The command acted on
+    the run, the phase is left unchanged and ``resume`` re-enters it once the
+    log directory is repaired, so the stop classification reads it as a
+    resumable error, not a refusal (#369, ADR 0011 D2). The error keeps its
+    class (the filesystem cause, which callers distinguish on) and its exit
+    status; every other ``StateError``, a loader's refusal of an unreadable
+    state file among them, leaves it ``False``.
     """
+
+    interrupted_attempt: bool = False
 
 
 class StateProtocolError(StateError):

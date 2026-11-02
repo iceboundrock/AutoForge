@@ -127,6 +127,12 @@ from .scheduler import EpicScheduler, SchedulerInputs
 from .scheduler_stop import StopMode
 from .sdk_policy import MAX_ANSWER_CHARS
 from .state import SUPPORTED_PROTOCOLS, AutoForgeState
+from .stop_classification import (
+    StopClassification,
+    StopOutcome,
+    classify_exception,
+    classify_state,
+)
 from .transitions import TERMINAL_PHASES, Phase
 from .validation import parse_issue_url
 
@@ -522,13 +528,32 @@ def main(argv: list[str] | None = None) -> int:
         # A StateError like any other (exit 2, nothing written), with the
         # provenance diagnostic after the loader's reason (#265).
         _print_protocol_mismatch(exc, _global_flags(args))
+        _print_error_stop(args, exc)
         return 2
     except (ConfigurationError, StateError, StateTransitionError, LockError) as exc:
         print(f"autoforge: error: {redact(str(exc))}", file=sys.stderr)
+        _print_error_stop(args, exc)
         return 2
     except AutoForgeError as exc:
         print(f"autoforge: error: {redact(str(exc))}", file=sys.stderr)
+        _print_error_stop(args, exc)
         return 1
+
+
+# The commands whose error is a stop of the run they act on (#369): an error
+# of ``unblock`` leaves the run BLOCKED, which ``resume`` refuses, and
+# ``status``, ``doctor`` and ``epic`` stop no run.
+_LIFECYCLE_COMMANDS = frozenset({"run", "step", "resume"})
+
+
+def _print_error_stop(args, exc: AutoForgeError) -> None:
+    """The typed stop an error of ``run``, ``step`` or ``resume`` is, on stderr (#369).
+
+    Classified by the error's class alone (ADR 0011): advice, never a
+    grant, and its message is never read for it.
+    """
+    if args.command in _LIFECYCLE_COMMANDS:
+        print(redact(f"autoforge: {classify_exception(exc).line()}"), file=sys.stderr)
 
 
 def _print_protocol_mismatch(exc: StateProtocolError, flags: tuple[str, ...]) -> None:
@@ -1403,8 +1428,44 @@ def _finish(
         # component, not a checked-for-secrets value), so the line crosses
         # the redaction boundary assembled, not field by field.
         print(redact(f"\nrun {state.run_id} is {state.phase.value}: {state.block_reason or '-'}"))
+        print(redact(_final_stop(engine, outcomes).line()))
         return 1
     return 0
+
+
+def _final_stop(engine: ControllerEngine, outcomes: list[StepOutcome]) -> StopClassification:
+    """How the run that ended BLOCKED or FAILED stopped (#369, ADR 0011).
+
+    The step that entered it says why (its sink's code); when no step of
+    this command did (``step`` on a run already stopped), the persisted
+    phase alone classifies it, with an ``UNKNOWN`` code. Advice, never a
+    grant: ``unblock`` re-reads GitHub whatever the code.
+    """
+    state = engine.state
+    assert state is not None
+    last = outcomes[-1].stop if outcomes else None
+    expected = {Phase.BLOCKED: StopOutcome.BLOCKED, Phase.FAILED: StopOutcome.FAILED}
+    if last is not None and last.outcome is expected.get(state.phase):
+        return last
+    return classify_state(state, scheduler=_scheduler_view(engine))
+
+
+def _scheduler_view(engine: ControllerEngine, *, dry_run: bool = False) -> bool | None:
+    """Whether a stop line takes the scheduler's view of the run's state dir (#369).
+
+    ``None`` when that cannot be known, and the line then gives only the
+    routes both views share (ADR 0011 D6): a dry run runs no git, so it has
+    no coordination root (as :func:`_refuse_scheduler_state_dir` says), and
+    outside a git repository there is none to find. Read-only commands that
+    worked there before the stop line keep working; the commands that need
+    the repository still refuse without it, where they always did.
+    """
+    if dry_run:
+        return None
+    try:
+        return engine.state_dir_in_scheduler_root()
+    except LockError:
+        return None
 
 
 def _existing_run_guard(
@@ -1617,7 +1678,7 @@ def cmd_resume(args) -> int:
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
-        rc = _resume_holding_state(engine, state, args.allow_merge)
+        rc = _resume_holding_state(engine, state, args.allow_merge, dry_run=True)
         if rc is not None:
             return rc
         _check_configuration(engine, args, "resume", dry_run=True)
@@ -1710,9 +1771,13 @@ def print_unblock_outcome(o: UnblockOutcome) -> None:
 
 
 def _resume_holding_state(
-    engine: ControllerEngine, state: AutoForgeState, allow_merge: bool
+    engine: ControllerEngine, state: AutoForgeState, allow_merge: bool, *, dry_run: bool = False
 ) -> int | None:
-    """Exit code when ``resume`` has nothing to execute; None when it does."""
+    """Exit code when ``resume`` has nothing to execute; None when it does.
+
+    ``dry_run`` runs no git: the stop line of a terminal phase then cannot
+    tell a scheduler namespace's state dir from a standalone one.
+    """
     if state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(allow_merge):
         # Holding state: nothing runs unless the merge gate is open. With the
         # gate open, engine.run() performs the controller-side pre-merge
@@ -1738,6 +1803,8 @@ def _resume_holding_state(
                 f"{state.block_reason or '-'} — inspect {engine.paths.logs_dir}/ {how}"
             )
         )
+        stop = classify_state(state, scheduler=_scheduler_view(engine, dry_run=dry_run))
+        print(redact(stop.line()))
         return 1
     return None
 
@@ -1954,6 +2021,10 @@ def cmd_status(args) -> int:
     # agents controlled (`block_reason`, findings, a hand-edited journal), so
     # both output modes cross the same redaction boundary as the run log.
     certificate = _review_certificate_check(engine, state)
+    # From the persisted phase alone (#369, ADR 0011): no reason code is
+    # persisted, so a BLOCKED or FAILED run's is UNKNOWN; `Reason:` is the text.
+    # Outside a git repository the view is unknown, and `--json` still works.
+    stop = classify_state(state, scheduler=_scheduler_view(engine))
     if args.as_json:
         # to_dict() carries "mode" and every persisted field; protocol 13
         # removed LOCAL's twelve fields from it (#388, ADR 0009 D8, D10).
@@ -1965,6 +2036,7 @@ def cmd_status(args) -> int:
             "acceptance_actions": _acceptance_actions(state),
             "operator_actions": _operator_actions(state),
             "review_certificate_status": _review_certificate_status(state, certificate),
+            "stop": stop.as_dict(),
             "outer_sandbox": {
                 "mode": engine.config.sandbox.mode,
                 "summary": sandbox_mode_summary(engine.config.sandbox),
@@ -1981,7 +2053,7 @@ def cmd_status(args) -> int:
         config = ("--config", args.config) if args.config else ()
         engine.continue_command = (*config, "epic", "resume", state.epic_url)
     actions = _render_acceptance_actions(state, engine) + _render_operator_actions(state, engine)
-    print(redact(_render_status(state, txn, actions, evidence)))
+    print(redact(_render_status(state, txn, actions, evidence, stop)))
     return 0
 
 
@@ -2539,6 +2611,7 @@ def _render_status(
     txn: ReplanTransaction | None,
     acceptance: list[str] | None = None,
     evidence: list[str] | None = None,
+    stop: StopClassification | None = None,
 ) -> str:
     """Human status for a GitHub run (unredacted; the caller redacts)."""
 
@@ -2581,6 +2654,8 @@ def _render_status(
     lines += _render_replan_journal(txn)
     if state.block_reason:
         lines.append(f"Reason:     {state.block_reason}")
+    if stop is not None and stop.outcome in (StopOutcome.BLOCKED, StopOutcome.FAILED):
+        lines.append(f"Stop:       {stop.line().removeprefix('stop: ')}")
     lines += acceptance or []
     if state.unblock_history:
         last = state.unblock_history[-1]

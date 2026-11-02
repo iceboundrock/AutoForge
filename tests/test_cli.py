@@ -4989,3 +4989,216 @@ def test_the_scheduler_worker_entry_point_is_hidden_and_routed(monkeypatch, caps
     with pytest.raises(SystemExit):
         cli.main(["--help"])
     assert "_worker" not in capsys.readouterr().out
+
+
+# -- typed stop lines (#369, ADR 0011) ---------------------------------------------------
+
+
+def _stopping(status: str, message: str) -> str:
+    return block({"phase": "ANALYZE_EXECUTE", "status": status, "message": message})
+
+
+def test_a_blocked_run_names_its_typed_stop_and_never_advises_resume(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """The step that entered BLOCKED says why (its sink's code and source); a
+    later 'resume' or 'status' classifies the persisted phase alone, with an
+    UNKNOWN code, since none is persisted. Every route is unblock's or a new
+    run's: 'resume' refuses a BLOCKED run, so it is never the advice."""
+    monkeypatch.chdir(tmp_path)
+    fakes["handler"] = lambda req: _stopping("blocked", "need a decision")
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    out = capsys.readouterr().out
+    assert "is BLOCKED: need a decision" in out
+    line = next(x for x in out.splitlines() if x.startswith("stop: "))
+    assert line.startswith(
+        "stop: blocked (reason agent-blocked, from agent: "
+        "the ANALYZE_EXECUTE agent's status 'blocked'); next: fix the cause, then 'unblock"
+    )
+    assert "need a decision" not in line and "next: 'resume'" not in line
+
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    out = capsys.readouterr().out
+    assert "stop: blocked (reason unknown, from state: phase BLOCKED, settlement terminal)" in out
+    assert "next: 'resume'" not in out and "'unblock --reason" in out
+
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    assert "Stop:       blocked (reason unknown, from state" in capsys.readouterr().out
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    stop = json.loads(capsys.readouterr().out)["stop"]
+    assert stop == {
+        "outcome": "blocked",
+        "code": "unknown",
+        "family": "unknown",
+        "source": "state",
+        "evidence": "phase BLOCKED, settlement terminal",
+        "view": "standalone",
+        "routes": ["unblock", "new_run"],
+        "live_facts_required": True,
+    }
+
+
+def test_a_failed_run_routes_to_a_new_run_only(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    fakes["handler"] = lambda req: _stopping("failure", "tests red")
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    out = capsys.readouterr().out
+    line = next(x for x in out.splitlines() if x.startswith("stop: "))
+    assert line.startswith("stop: failed (reason agent-failure, from agent: ")
+    assert "'resume'" not in line and "'unblock" not in line and "a new run" in line
+
+
+def test_a_lifecycle_error_names_its_typed_stop_on_stderr(tmp_path, capsys, monkeypatch, fakes):
+    """An error that leaves the phase unchanged routes to 'resume'; a refusal
+    (exit 2) to the same command once fixed, with stdout left empty; and an
+    error of 'unblock', after which the run is still BLOCKED, gets no line."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "resume"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        "autoforge: stop: refused (reason state-invalid, from exception: StateError raised)"
+        in captured.err
+    )
+
+    fakes["handler"] = lambda req: "no result block at all"
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    err = capsys.readouterr().err
+    assert "State unchanged." in err
+    assert (
+        "autoforge: stop: resumable_error (reason control-result-invalid, from exception: "
+        "ControlResultValidationError raised); next: 'resume'"
+    ) in err
+    assert load_state(Path(sd) / "state.json").phase == Phase.ANALYZE_EXECUTE
+
+    assert cli.main(["--state-dir", sd, "unblock", "--reason", "x"]) == 2
+    captured = capsys.readouterr()
+    assert "autoforge: error:" in captured.err and "stop:" not in captured.err
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "timeout", "exit", "malformed"])
+def test_a_post_agent_run_log_refusal_is_a_resumable_stop_not_a_refusal(
+    tmp_path, capsys, monkeypatch, fakes, outcome
+):
+    """R2-F1, through the CLI: the post-agent journal refusals of
+    ``test_post_agent_journal_refusal_names_the_outcome_and_keeps_the_attempt``
+    and ``test_review_post_agent_journal_refusal_keeps_the_phase_for_resume``
+    (the agent returned with an accepted result, timed out, exited non-zero or
+    returned none, then the journal append was refused). The command still
+    exits 2 with the error that says to repair the log directory and
+    'resume'; its stop line agrees with it, a resumable error with the phase
+    and the persisted attempt kept, never a refusal routed to a new run. A
+    state file that cannot be read is still a refusal."""
+    import dataclasses
+
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+
+    def enlarges_the_journal() -> None:
+        (journal,) = (sd / "logs").glob("*/events.jsonl")
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+
+    def handler(req):
+        out = implement(req) if outcome in ("accepted", "timeout", "exit") else "no result"
+        enlarges_the_journal()
+        return out
+
+    fakes["handler"] = handler
+    provider = fakes["provider"]
+    if outcome == "exit":
+        provider.exit_code = 3
+    if outcome == "timeout":
+        execute = provider.execute
+
+        def times_out(req):
+            return dataclasses.replace(execute(req), exit_code=-1, timed_out=True)
+
+        monkeypatch.setattr(provider, "execute", times_out)
+    assert cli.main(["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE]) == 2
+    captured = capsys.readouterr()
+    assert "after the agent had returned with:" in captured.err
+    assert "Repair the log directory, then 'resume'" in captured.err
+    line = next(x for x in captured.err.splitlines() if x.startswith("autoforge: stop: "))
+    assert line.startswith(
+        "autoforge: stop: resumable_error (reason run-log-refused, from exception: "
+    )
+    assert "raised by the run log after the launch's attempt was saved); next: 'resume'" in line
+    assert "refused" not in line.split("(")[0] and "a new run" not in line
+    saved = load_state(sd / "state.json")
+    assert (saved.phase, saved.attempt) == (Phase.ANALYZE_EXECUTE, 1)
+    assert len(provider.calls) == 1
+
+    # The unreadable state file is still the refusal it always was.
+    (sd / "state.json").write_bytes(b"{torn")
+    assert cli.main(["--state-dir", str(sd), "resume"]) == 2
+    assert "stop: refused (reason state-invalid" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("phase", [Phase.BLOCKED, Phase.FAILED])
+def test_read_only_stop_lines_need_no_repository(
+    tmp_path_factory, capsys, monkeypatch, fakes, phase
+):
+    """Outside a git repository 'status --json' and 'resume --dry-run' work as
+    they did before the stop line, and a dry run still runs no git: whether
+    the state dir is a scheduler namespace's is unknown there, so only the
+    routes both views share are given."""
+    import autoforge.engine as engine_mod
+
+    outside = tmp_path_factory.mktemp("not-a-repo")
+    monkeypatch.chdir(outside)
+    sd = outside / ".autoforge"
+    sd.mkdir()
+    save_state(_other_controller_state("af-stopped", phase, "a reason"), sd / "state.json")
+    outcome = phase.value.lower()
+    routes = ["unblock"] if phase is Phase.BLOCKED else ["investigate"]
+
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    stop = json.loads(captured.out)["stop"]
+    assert (stop["outcome"], stop["view"], stop["routes"]) == (outcome, "unknown", routes)
+
+    def never(*a, **k):
+        raise AssertionError("dry-run must not resolve the repository lock")
+
+    monkeypatch.setattr(engine_mod, "repository_lock_path", never)
+    assert cli.main(["--state-dir", str(sd), "resume", "--dry-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert f"is in terminal phase {phase.value}: a reason" in captured.out
+    line = next(x for x in captured.out.splitlines() if x.startswith("stop: "))
+    assert line.startswith(f"stop: {outcome} (reason unknown, from state: phase {phase.value}")
+    assert "a new run" not in line and "epic archive" not in line
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
+
+
+def test_status_of_a_namespace_at_ready_for_merge_advises_a_merge_by_hand(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """A scheduler worker never merges and keeps the merge gate closed whatever
+    the configuration (ADR 0008 D15.3), and a standalone 'resume' refuses its
+    state dir: status names a merge by hand, never the gate and 'resume'."""
+    monkeypatch.chdir(tmp_path)
+    ready = _other_controller_state("af-ready", Phase.READY_FOR_MERGE)
+    sd = _namespace_state_dir(tmp_path, 2)
+    sd.mkdir(parents=True)
+    save_state(ready, sd / "state.json")
+    standalone = tmp_path / ".autoforge"
+    standalone.mkdir()
+    save_state(ready, standalone / "state.json")
+
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    stop = json.loads(capsys.readouterr().out)["stop"]
+    assert (stop["outcome"], stop["view"], stop["routes"]) == (
+        "ready_for_merge",
+        "scheduler",
+        ["merge"],
+    )
+    assert cli.main(["--state-dir", str(standalone), "status", "--json"]) == 0
+    stop = json.loads(capsys.readouterr().out)["stop"]
+    assert (stop["view"], stop["routes"]) == ("standalone", ["merge", "merge_gate"])

@@ -72,8 +72,8 @@ that sets `state_dir`), or run from another directory.
   commands, the outer sandbox and its pin, and the validation evidence.
 - **`autoforge status --json`** prints the same state as one JSON document,
   with derived fields beside the raw ones: `replan_journal`,
-  `acceptance_actions`, `operator_actions`, `review_certificate_status` and
-  `outer_sandbox`. Both outputs are redacted.
+  `acceptance_actions`, `operator_actions`, `review_certificate_status`,
+  `stop` and `outer_sandbox`. Both outputs are redacted.
 - **`<state dir>/logs/<run-id>/`** holds one directory per agent launch,
   `<seq>-<phase>-<attempt>/`, and `events.jsonl`, one line per launch and
   per operator action (an `unblock`, an accepted configuration change). In
@@ -114,6 +114,23 @@ different next:
 
 `FAILED` has no outgoing edge, and `BLOCKED` is left only by `unblock`
 ([Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock)).
+
+Each of the three also ends with a `stop:` line: the outcome (`blocked`,
+`failed`, `resumable_error`, or `refused` for an exit-2 refusal of `run`,
+`step` or `resume`), a reason code, where the code came from and the
+routes that apply. One exit 2 is no refusal: a run log refused after a
+launch's attempt was saved (`... after the agent had returned with: ...
+Repair the log directory, then 'resume'`) is `resumable_error`, reason
+`run-log-refused`, since the phase was kept for that `resume`. For example
+
+```text
+stop: blocked (reason review-round-cap, from controller: the controller entered BLOCKED from REVIEW); next: fix the cause, then 'unblock --reason "..."' (it re-reads GitHub and may refuse), then 'resume' ('epic resume' for a scheduler's issue); or a new run ('run --force' replaces this one)
+```
+
+The code is advice and grants nothing: `unblock` re-reads GitHub whatever
+it says. It is not saved, so `resume` and `status` on a stopped run show
+`reason unknown, from state`, and `Reason:` keeps the text
+([ADR 0011](adr/0011-typed-stop-classification-and-recovery-baseline.md)).
 
 ## BLOCKED: the controller will not decide alone
 

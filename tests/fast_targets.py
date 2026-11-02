@@ -168,6 +168,8 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/scheduler_state.py": (),
     "src/autoforge/scheduler_stop.py": (),
     "src/autoforge/sdk_policy.py": ("test_cli",),
+    # the engine's sinks and the CLI's stop lines import it (#369)
+    "src/autoforge/stop_classification.py": ("test_cli", "test_engine"),
     "src/autoforge/worker.py": ("test_scheduler", "test_epic_commands", "test_epic_recovery"),
     # -- the tests' own helpers -----------------------------------------------
     "tests/__init__.py": FULL,
@@ -178,6 +180,7 @@ COVERAGE: Mapping[str, Entry] = {
     "tests/dist_check.py": (),
     "tests/epic_cli.py": ("test_epic_recovery",),
     "tests/fast_targets.py": (),
+    "tests/stop_corpus.py": (),
     "tests/live_pi.py": (),
     "tests/operator_comment_fidelity.py": (),
     "tests/parallel_bench.py": ("test_suite_performance_audit",),  # via suite_comparison
