@@ -423,6 +423,63 @@ def test_get_repo():
     assert repo.name_with_owner == "o/r" and repo.default_branch == "main"
 
 
+def test_get_repo_names_the_repository_github_answered_with():
+    """A renamed repository answers with its new name, which is what a caller compares;
+    a repository without a commit has a null ``defaultBranchRef``, read as no branch."""
+    seen = []
+
+    def handler(req):
+        seen.append(req.command[1:])
+        return _res({"nameWithOwner": "new-owner/new-name", "defaultBranchRef": None})
+
+    repo = _client(handler).get_repo("o/r")
+    assert repo.name_with_owner == "new-owner/new-name" and repo.default_branch == ""
+    assert seen == [["repo", "view", "o/r", "--json", "nameWithOwner,defaultBranchRef"]]
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    [
+        ({}, "its nameWithOwner is missing"),
+        ({"defaultBranchRef": {"name": "main"}}, "its nameWithOwner is missing"),
+        ({"nameWithOwner": None, "defaultBranchRef": {"name": "main"}}, "is None"),
+        ({"nameWithOwner": 42, "defaultBranchRef": {"name": "main"}}, "is 42"),
+        ({"nameWithOwner": ["o/r"], "defaultBranchRef": {"name": "main"}}, r"is \['o/r'\]"),
+        ({"nameWithOwner": {"name": "o/r"}, "defaultBranchRef": None}, "is {'name': 'o/r'}"),
+        ({"nameWithOwner": "", "defaultBranchRef": {"name": "main"}}, "is ''"),
+        ({"nameWithOwner": "o", "defaultBranchRef": {"name": "main"}}, "is 'o'"),
+        ({"nameWithOwner": "o/r/x", "defaultBranchRef": {"name": "main"}}, "is 'o/r/x'"),
+        ({"nameWithOwner": "../r", "defaultBranchRef": {"name": "main"}}, r"is '\.\./r'"),
+        ({"nameWithOwner": "o/r ", "defaultBranchRef": {"name": "main"}}, "is 'o/r '"),
+    ],
+)
+def test_get_repo_refuses_a_reply_that_names_no_repository(reply, error):
+    """PR #437 R2-F1: the repository's identity is the reply's own ``nameWithOwner``. One
+    missing, null, of another type or not ``owner/name`` is a GitHubError, never the
+    repository asked for and never an AttributeError."""
+    with pytest.raises(
+        GitHubError, match=f"gh repo view o/r: the reply names no repository.*{error}"
+    ):
+        _client(lambda req: _res(reply)).get_repo("o/r")
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    [
+        ({"nameWithOwner": "o/r"}, "has no defaultBranchRef"),
+        ({"nameWithOwner": "o/r", "defaultBranchRef": "main"}, "'main' names no default branch"),
+        ({"nameWithOwner": "o/r", "defaultBranchRef": []}, r"\[\] names no default branch"),
+        ({"nameWithOwner": "o/r", "defaultBranchRef": {}}, "{} names no default branch"),
+        ({"nameWithOwner": "o/r", "defaultBranchRef": {"name": None}}, "names no default"),
+        ({"nameWithOwner": "o/r", "defaultBranchRef": {"name": 7}}, "names no default"),
+    ],
+)
+def test_get_repo_refuses_a_reply_with_a_malformed_default_branch(reply, error):
+    """A ``defaultBranchRef`` of another shape is a GitHubError, not an AttributeError."""
+    with pytest.raises(GitHubError, match=f"gh repo view o/r: the reply.*{error}"):
+        _client(lambda req: _res(reply)).get_repo("o/r")
+
+
 def test_get_pr_comments_and_get_comment():
     seen = []
 

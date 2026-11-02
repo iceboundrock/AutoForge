@@ -595,7 +595,8 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
   refuse: a missing state, one that does not load (a LOCAL one among
   them) or, for `run`, a run it does not replace. Whatever lets a command
   go ahead is read again under the lock (#387). Dry-run takes no lock
-  and writes nothing. A REMOTE `run --dry-run` runs no `git`. `step`,
+  and writes nothing. A REMOTE `run --dry-run` runs one `git`, the
+  read-only `remote get-url origin` of its checkout check (#293). `step`,
   `resume`, `unblock` and `status` look for a run in the configured state
   directory alone (`--state-dir` or `state_dir`): the probe of
   `<git dir>/autoforge/state`, LOCAL's location, went with LOCAL's public
@@ -1010,8 +1011,9 @@ workers (`src/autoforge/scheduler.py`, `src/autoforge/worker.py`, below);
   `status` reads such a state directory; `unblock` acts on it under the
   controller lock, as today, and then names `epic resume` rather than a
   standalone `resume`; the forward guard (Locking, above) exempts that
-  namespace's own issue, and refuses an issue another namespace owns. A dry run is not refused: it takes no lock and runs
-  no git, so it has no coordination root, and it writes nothing.
+  namespace's own issue, and refuses an issue another namespace owns. A dry run is not refused: it takes no lock and derives
+  no coordination root (`run --dry-run`'s one git read is the checkout's
+  `origin`), and it writes nothing.
 
 No per-issue state field, protocol number or state migration comes with
 any of this: the state inside a namespace is an ordinary `AutoForgeState`,
