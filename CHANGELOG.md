@@ -47,7 +47,13 @@ run log of a run a new run replaced. A run whose state does not load or is
 gone is `undecidable` with its run log still counted, and operator actions
 are counted apart from launches. It never opens a FIFO, a link or an
 oversized run log, and counts a line with a field of an unexpected type as
-malformed instead of failing.
+malformed instead of failing. A launch is an agent's or a controller
+command's by the producer its line names, so an agent's line from before
+#193, which carried its limit in `timeout_seconds`, is still an agent's. A
+scheduler namespace's state is classified in the scheduler's view (a
+`MERGE` or `UPDATE_EPIC` there is a hand-off, and its routes are the
+scheduler's), and a state directory whose view nothing establishes leaves
+such a phase `undecidable`.
 
 ### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
 

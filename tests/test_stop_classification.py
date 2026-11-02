@@ -368,6 +368,26 @@ def test_an_unknown_view_gives_only_the_routes_both_views_share(phase):
     assert unknown.routes == expected.get(phase, (R.INVESTIGATE,))
 
 
+@pytest.mark.parametrize("code", list(REFUSAL_ROUTES), ids=lambda c: c.value)
+def test_a_refusal_takes_the_view_it_is_given(code):
+    """The CLI classifies a refusal in no view (it refuses a namespace's state
+    dir before it loads one); the corpus reads a namespace's refused state in
+    the scheduler's view, where 'run --force' is refused and the scheduler's
+    commands release the issue, and in an unknown view only the routes both
+    views share are given."""
+    standalone = StopClassification(Out.REFUSED, code, ReasonSource.EXCEPTION, "x")
+    assert standalone.routes == REFUSAL_ROUTES[code]
+    scheduled = StopClassification(Out.REFUSED, code, ReasonSource.EXCEPTION, "x", scheduler=True)
+    unknown = StopClassification(Out.REFUSED, code, ReasonSource.EXCEPTION, "x", scheduler=None)
+    assert R.NEW_RUN not in scheduled.routes and R.RESUME not in scheduled.routes
+    assert set(unknown.routes) <= {R.INVESTIGATE} | (set(standalone.routes) & set(scheduled.routes))
+    if code is C.STATE_INVALID:
+        assert scheduled.routes == (R.INVESTIGATE, R.SCHEDULER)
+        assert unknown.routes == (R.INVESTIGATE,)
+    else:
+        assert scheduled.routes == unknown.routes == standalone.routes
+
+
 @pytest.mark.parametrize(
     "text",
     [

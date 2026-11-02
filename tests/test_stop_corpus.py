@@ -409,6 +409,119 @@ def test_a_scheduler_namespace_is_reached_from_the_common_dir(tmp_path):
     assert stop_corpus.find_state_dirs([common]) == [namespace.resolve()]
 
 
+def _namespace(common: Path, n: int) -> Path:
+    """``<common>/autoforge/scheduler/issues/<n>/state``, with the namespace's binding beside."""
+    state_dir = common / "autoforge" / "scheduler" / "issues" / str(n) / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir.parent / "binding.json").write_text("{}\n", encoding="utf-8")
+    return state_dir
+
+
+# Each phase, as a namespace's and as a standalone run's: outcome, routes, eligibility.
+_VIEWS = {
+    Phase.UPDATE_EPIC: (
+        ("handoff", ["scheduler"], "intentional"),
+        ("in_progress", ["resume"], "deterministic"),
+    ),
+    Phase.MERGE: (
+        ("handoff", ["scheduler"], "intentional"),
+        ("in_progress", ["resume"], "deterministic"),
+    ),
+    Phase.READY_FOR_MERGE: (
+        ("ready_for_merge", ["merge"], "intentional"),
+        ("ready_for_merge", ["merge", "merge_gate"], "intentional"),
+    ),
+    Phase.REVIEW: (
+        ("in_progress", ["scheduler"], "deterministic"),
+        ("in_progress", ["resume"], "deterministic"),
+    ),
+    Phase.BLOCKED: (
+        ("blocked", ["unblock", "scheduler"], "needs_human"),
+        ("blocked", ["unblock", "new_run"], "needs_human"),
+    ),
+}
+
+
+@pytest.mark.parametrize("phase", list(_VIEWS), ids=lambda p: p.value)
+def test_a_namespace_is_classified_in_the_schedulers_view(tmp_path, phase):
+    """R2-F3: a scheduler worker never executes MERGE or UPDATE_EPIC (its
+    settlement is a hand-off), never opens the merge gate at READY_FOR_MERGE,
+    and a standalone 'resume' or 'run' refuses a namespace's state dir. The
+    corpus reads which view a state dir takes from where it lies, so a
+    namespace's run is never counted as a standalone run's."""
+    scheduled, standalone = _VIEWS[phase]
+    namespace = _namespace(tmp_path / ".git", 7)
+    save_state(_state("ns", phase), namespace / "state.json")
+    _journal(namespace, _id("ns"), [_agent(_id("ns"))])
+    alone, _ = _run(tmp_path, "alone", phase)
+    summary = _summary(tmp_path / ".git" / "autoforge", alone)
+    for name, (outcome, routes, eligibility), view in (
+        ("ns", scheduled, "scheduler"),
+        ("alone", standalone, "standalone"),
+    ):
+        report = _report(summary, name)
+        final = report["final"]
+        assert (final["outcome"], final["routes"], final["view"]) == (outcome, routes, view), name
+        assert report["eligibility"] == eligibility, name
+    assert summary["runs"]["by_view"] == {"standalone": 1, "scheduler": 1, "unknown": 0}
+
+
+@pytest.mark.parametrize(
+    "where", ["copied-namespace", "named-state", "under-a-scheduler-root", "beside-a-claim"]
+)
+def test_a_view_nothing_establishes_is_unknown_and_a_hand_off_undecidable(tmp_path, where):
+    """R2-F3: namespace evidence without a namespace's layout (a namespace copied
+    elsewhere, a directory named 'state', one under a scheduler root that is no
+    namespace's state dir) leaves the view unknown: only the routes both views
+    share, and a MERGE, which one view hands off and the other resumes, is
+    undecidable, never deterministic."""
+    if where == "copied-namespace":
+        state_dir = tmp_path / "backup" / "issue-7"
+        state_dir.mkdir(parents=True)
+        (tmp_path / "backup" / "binding.json").write_text("{}\n", encoding="utf-8")
+    elif where == "named-state":
+        state_dir = tmp_path / "backup" / "state"
+    elif where == "under-a-scheduler-root":
+        state_dir = tmp_path / ".git" / "autoforge" / "scheduler" / "elsewhere"
+    else:
+        state_dir = tmp_path / "backup" / "issue-7"
+        state_dir.mkdir(parents=True)
+        (tmp_path / "backup" / "claim.json").write_text("{}\n", encoding="utf-8")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    save_state(_state("merging", Phase.MERGE), state_dir / "state.json")
+    save_state(_state("reviewing", Phase.REVIEW), state_dir / "state.json.archived-20261101")
+    summary = _summary(tmp_path)
+    merging, reviewing = _report(summary, "merging"), _report(summary, "reviewing")
+    assert merging["final"]["view"] == reviewing["final"]["view"] == "unknown"
+    assert (merging["eligibility"], merging["final"]["routes"]) == ("undecidable", ["investigate"])
+    # Both views resume REVIEW, each with its own command: decided, and the
+    # route is to investigate which command applies.
+    assert (reviewing["eligibility"], reviewing["final"]["routes"]) == (
+        "deterministic",
+        ["investigate"],
+    )
+    assert summary["runs"]["by_view"] == {"standalone": 0, "scheduler": 0, "unknown": 2}
+
+
+def test_a_namespace_without_a_state_or_with_one_refused_takes_its_view(tmp_path):
+    """A namespace's run whose state is gone, or refused, is still the
+    scheduler's: a refused state's 'new run' is the scheduler's command there,
+    since 'run --force' refuses a namespace's state dir."""
+    namespace = _namespace(tmp_path / ".git", 8)
+    _journal(namespace, _id("gone"), [_agent(_id("gone"))])
+    refused = _namespace(tmp_path / ".git", 9)
+    save_state(_state("refused", Phase.REVIEW), refused / "state.json")
+    path = refused / "state.json"
+    path.write_bytes(unloadable_state("local-mode", path.read_bytes())[0])
+    summary = _summary(tmp_path / ".git" / "autoforge")
+    gone = _report(summary, "gone")
+    assert (gone["final"]["outcome"], gone["final"]["view"]) == ("unknown", "scheduler")
+    assert gone["final"]["routes"] == ["investigate"]
+    report = _report(summary, "refused")
+    assert (report["final"]["outcome"], report["final"]["view"]) == ("refused", "scheduler")
+    assert report["final"]["routes"] == ["investigate", "scheduler"]
+
+
 def test_a_fifo_is_refused_without_being_opened(tmp_path):
     """A FIFO at a run log, or at a state file, is never opened (a reader would
     block, and a waiting writer would be released): the run is flagged, and

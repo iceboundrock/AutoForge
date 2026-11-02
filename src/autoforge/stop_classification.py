@@ -383,8 +383,11 @@ class StopClassification:
     @property
     def routes(self) -> tuple[OperatorRoute, ...]:
         if self.outcome is StopOutcome.REFUSED:
-            return REFUSAL_ROUTES.get(self.code, (OperatorRoute.INVESTIGATE,))
-        standalone = OUTCOME_ROUTES[self.outcome]
+            # A refusal's routes depend on its code; a namespace's state, read
+            # by the corpus, takes the scheduler's view of them like any other.
+            standalone = REFUSAL_ROUTES.get(self.code, (OperatorRoute.INVESTIGATE,))
+        else:
+            standalone = OUTCOME_ROUTES[self.outcome]
         if self.scheduler is False:
             return standalone
         scheduled = _as_scheduler_routes(standalone)

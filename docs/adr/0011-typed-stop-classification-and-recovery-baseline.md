@@ -202,7 +202,10 @@ scheduler's view: its outcome agrees with `issue_settlement` for every
 phase, and where a standalone run's route would be `resume` or a new run, a
 namespace's is the scheduler's (`epic resume`, `epic archive`), since both
 refuse a namespace's state directory (ADR 0008 D17.3;
-`test_a_loaded_state_classifies_by_its_phase_and_settlement`). A
+`test_a_loaded_state_classifies_by_its_phase_and_settlement`); so is a
+refusal's, which only the corpus (D7) classifies in a view, since the CLI
+refuses a namespace's state directory before it loads one
+(`test_a_refusal_takes_the_view_it_is_given`). A
 namespace's `ready_for_merge` has no merge-gate route: its worker stops
 there whatever the configuration says (ADR 0008 D15.3), so a human merges
 (`test_a_namespace_ready_for_merge_is_merged_by_hand_never_resumed`).
@@ -245,7 +248,17 @@ uv run python -m tests.stop_corpus [--json] PATH [PATH ...]
    twice or copied elsewhere is still one run, classified by one state file
    (one that loads before one that does not, the current one before one
    moved aside, the newest of those first) and counted from one run log; the
-   copies are reported, never added.
+   copies are reported, never added. Each state is classified in the view
+   of the directory that holds it, read from where it lies: a namespace's
+   own `.../autoforge/scheduler/issues/<n>/state`, by the controller's
+   predicate (`namespace_issue_of_state_dir`), is the scheduler's, so a
+   `MERGE` or `UPDATE_EPIC` there is a `handoff` and every route the
+   scheduler's (a refusal's too); namespace evidence without that layout (a
+   directory named `state`, one under a scheduler root, one beside a
+   `binding.json` or `claim.json`) is an unknown view, where a phase the two
+   views classify apart is `undecidable`; any other directory is a
+   standalone run's (`test_a_namespace_is_classified_in_the_schedulers_view`,
+   `test_a_view_nothing_establishes_is_unknown_and_a_hand_off_undecidable`).
 3. **Units and denominators.** Each *run* has one eligibility:
    `intentional`, `deterministic` (a phase `resume` re-enters),
    `needs_human` (`blocked`, `failed`, a pause) or `undecidable`: a run
@@ -270,6 +283,9 @@ uv run python -m tests.stop_corpus [--json] PATH [PATH ...]
    (D5), so a saved `BLOCKED` or `FAILED` is `unknown`; a failed launch that
    exited 0 (a malformed result, a failed verification) has no typed cause;
    a launch whose line names no producer it recognizes is kind `unknown`;
+   a state directory's view is read from its path, so a namespace copied
+   out of its layout is `unknown` and one renamed with nothing of its
+   namespace beside it reads as a standalone run's;
    a run with no state that loads is `undecidable`; a state that names no
    run is counted apart; a moved, deleted, torn, oversized or irregular run
    log, or one with a foreign or malformed line, leaves its run flagged

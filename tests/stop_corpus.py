@@ -32,7 +32,11 @@ descriptor-relative, links unfollowed, within its size bound
   (:data:`ELIGIBILITY`): ``intentional`` (DONE, READY_FOR_MERGE, a
   scheduler's hand-off), ``deterministic`` (a phase ``resume`` re-enters),
   ``needs_human`` (BLOCKED, FAILED, a pause) or ``undecidable`` (no state of
-  it loads, or its outcome is UNKNOWN);
+  it loads, its outcome is UNKNOWN, or it depends on a view nothing
+  establishes). Each state is classified in its directory's view
+  (:func:`state_dir_view`): a scheduler namespace's, where MERGE and
+  UPDATE_EPIC are hand-offs and every route is the scheduler's, a
+  standalone run's, or unknown;
 - a state file that does not load and names no run id that can be read (a
   torn file) is counted apart, never as a run: it may be one of the runs, or
   another;
@@ -67,10 +71,18 @@ import stat
 import sys
 from collections import Counter
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from autoforge.errors import StateError
+from autoforge.run_namespace import (
+    AUTOFORGE_DIRNAME,
+    BINDING_FILENAME,
+    CLAIM_FILENAME,
+    SCHEDULER_DIRNAME,
+    STATE_DIRNAME,
+    namespace_issue_of_state_dir,
+)
 from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES, RUN_ID_RE
 from autoforge.safefs import ReadLimitExceeded, SafeRoot, UnsafePathError, entry_kind
 from autoforge.state import (
@@ -136,6 +148,12 @@ LIMITATIONS = (
     "a run log that was moved, deleted, torn, too large or not a regular file, or that holds "
     "a line of another run or of an unexpected type, leaves its run's history incomplete; "
     "such runs are flagged and each bad line counted, never parsed around",
+    "whose routes a run takes, a standalone run's or the scheduler's, is read from where its "
+    "state directory lies (a namespace's .../autoforge/scheduler/issues/<n>/state): one with "
+    "namespace evidence but not that layout (named 'state', under a scheduler root, beside a "
+    "binding.json or claim.json) is 'unknown', and a MERGE or UPDATE_EPIC there is "
+    "'undecidable'; a namespace's state directory copied elsewhere under another name with "
+    "nothing of its namespace beside it reads as a standalone run's",
     "the corpus is the directories given and nothing else: what selected them is its "
     "selection bias, and no denominator reaches past them",
 )
@@ -205,6 +223,50 @@ def find_state_dirs(paths: Iterable[Path], max_depth: int = MAX_DEPTH) -> list[P
     return sorted(found)
 
 
+# -- whose routes a state directory's runs take ----------------------------------------------
+
+VIEWS = ("standalone", "scheduler", "unknown")
+
+
+def state_dir_view(state_dir: Path) -> bool | None:
+    """The view a state directory's runs are classified in (ADR 0008 D17.3, ADR 0011 D6).
+
+    ``True``, the scheduler's, for a namespace's own state directory,
+    ``<...>/autoforge/scheduler/issues/<n>/state``, by the controller's own
+    predicate (:func:`autoforge.run_namespace.namespace_issue_of_state_dir`,
+    with the directory four levels up as the coordination root): its workers
+    never execute ``MERGE`` or ``UPDATE_EPIC``, and ``resume`` and ``run``
+    refuse it. ``None``, not known, where there is namespace evidence
+    without that layout (a directory named ``state``, one below an
+    ``autoforge/scheduler`` directory, one beside a namespace's
+    ``binding.json`` or ``claim.json``: a namespace copied elsewhere) or the
+    evidence cannot be read. ``False``, a standalone run's, otherwise. Reads
+    nothing but the path and whether two names exist beside it.
+    """
+    parents = state_dir.parents
+    if len(parents) > 4 and namespace_issue_of_state_dir(state_dir, parents[4]) is not None:
+        return True
+    parts = state_dir.parts
+    if state_dir.name == STATE_DIRNAME or any(
+        a == AUTOFORGE_DIRNAME and b == SCHEDULER_DIRNAME
+        for a, b in zip(parts, parts[1:], strict=False)
+    ):
+        return None
+    for name in (BINDING_FILENAME, CLAIM_FILENAME):
+        try:
+            os.lstat(state_dir.parent / name)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        return None
+    return False
+
+
+def view_name(scheduler: bool | None) -> str:
+    return "unknown" if scheduler is None else ("scheduler" if scheduler else "standalone")
+
+
 # -- one state directory, read only ----------------------------------------------------------
 
 
@@ -218,6 +280,9 @@ class StateSource:
     run_id: str = ""
     state: AutoForgeState | None = None
     final: StopClassification = NO_STATE
+    #: The view is not known and the two views classify the state apart (a
+    #: hand-off phase: a standalone run's ``resume``, a scheduler's hand-off).
+    view_decides: bool = False
 
     def rank(self) -> tuple[int, int]:
         return (0 if self.state is not None else 1, _STATE_KIND_RANK[self.kind])
@@ -241,6 +306,7 @@ class JournalCounts:
 @dataclass
 class DirScan:
     state_dir: str
+    scheduler: bool | None = False
     states: list[StateSource] = field(default_factory=list)
     journals: list[JournalCounts] = field(default_factory=list)
     error: str = ""
@@ -271,17 +337,23 @@ def _identity_of(root: SafeRoot, name: str) -> str:
     return run_id if isinstance(run_id, str) and _run_id_name(run_id) else ""
 
 
-def _read_state(root: SafeRoot, state_dir: Path, name: str, kind: str) -> StateSource:
+def _read_state(
+    root: SafeRoot, state_dir: Path, name: str, kind: str, scheduler: bool | None
+) -> StateSource:
+    """One state file, classified in the view of the directory that holds it."""
     source = StateSource(state_dir=str(state_dir), name=name, kind=kind)
     try:
         state = load_state(state_dir / name, root=root)
     except Exception as exc:  # noqa: BLE001 - every refusal is a classification
         # StateError for every refusal; anything else classifies 'unknown'.
-        source.final = classify_exception(exc)
+        source.final = replace(classify_exception(exc), scheduler=scheduler)
         source.run_id = _identity_of(root, name)
         return source
     source.state, source.run_id = state, state.run_id
-    source.final = classify_state(state)
+    source.final = classify_state(state, scheduler=scheduler)
+    if scheduler is None:
+        views = {classify_state(state, scheduler=view).outcome for view in (False, True)}
+        source.view_decides = len(views) > 1
     return source
 
 
@@ -456,13 +528,13 @@ def scan_state_dir(state_dir: Path) -> DirScan:
     One that cannot be read is classified or flagged, never fatal: the
     directory's other runs, and every other directory, are still counted.
     """
-    scan = DirScan(state_dir=str(state_dir))
+    scan = DirScan(state_dir=str(state_dir), scheduler=state_dir_view(state_dir))
     try:
         with _open_dir(state_dir) as root:
             for name in sorted(os.listdir(root.fd)):
                 kind = state_file_kind(name)
                 if kind is not None:
-                    scan.states.append(_read_state(root, state_dir, name, kind))
+                    scan.states.append(_read_state(root, state_dir, name, kind, scan.scheduler))
             logged = set(_logged_run_ids(root))
             named = {s.run_id for s in scan.states if s.run_id}
             for run_id in sorted(logged | named):
@@ -546,6 +618,7 @@ def build_corpus(scans: Sequence[DirScan]) -> Corpus:
     states: dict[str, list[StateSource]] = {}
     journals: dict[str, list[JournalCounts]] = {}
     dirs: dict[str, list[str]] = {}
+    views = {scan.state_dir: scan.scheduler for scan in scans}
     unidentified: list[StateSource] = []
     for scan in scans:
         for source in scan.states:
@@ -562,6 +635,7 @@ def build_corpus(scans: Sequence[DirScan]) -> Corpus:
         report = RunReport(run_id=run_id, state_dirs=sorted(set(dirs[run_id])))
         sources = states.get(run_id, [])
         home = ""
+        view_decides = False
         if sources:
             chosen = _pick_state(sources)
             home = chosen.state_dir
@@ -569,15 +643,21 @@ def build_corpus(scans: Sequence[DirScan]) -> Corpus:
             report.state_file = str(Path(chosen.state_dir) / chosen.name)
             report.state_copies = len(sources) - 1
             report.final = chosen.final
+            view_decides = chosen.view_decides
             if chosen.state is not None:
                 report.unblock_history = len(chosen.state.unblock_history)
-        report.eligibility = ELIGIBILITY[report.final.outcome]
         logs = [j for j in journals.get(run_id, []) if j.status != "absent"]
         if logs:
             # The run log beside the state that classified it, else the first.
             beside = [j for j in logs if j.state_dir == home]
             report.journal = (beside or logs)[0]
             report.journal_copies = len(logs) - 1
+        if not sources:
+            # No state: 'unknown' in every view, named in its run log's.
+            where = report.journal.state_dir if report.journal else report.state_dirs[0]
+            report.final = replace(NO_STATE, scheduler=views.get(where, None))
+        # A run whose outcome depends on a view nothing establishes is undecided.
+        report.eligibility = "undecidable" if view_decides else ELIGIBILITY[report.final.outcome]
         runs.append(report)
     unreadable = [(s.state_dir, s.error) for s in scans if s.error]
     return Corpus(runs=runs, unidentified_states=unidentified, unreadable_dirs=unreadable)
@@ -594,6 +674,7 @@ def summarize(corpus: Corpus) -> dict[str, object]:
     outcomes = Counter(r.final.outcome.value for r in runs)
     codes = Counter(f"{r.final.outcome.value}:{r.final.code.value}" for r in runs)
     by_state = Counter(r.state for r in runs)
+    by_view = Counter(r.final.view for r in runs)
     launches: Counter[str] = Counter()
     failures: Counter[str] = Counter()
     operator: Counter[str] = Counter()
@@ -618,6 +699,7 @@ def summarize(corpus: Corpus) -> dict[str, object]:
         "runs": {
             "total": len(runs),
             "by_state": {name: by_state.get(name, 0) for name in ("loaded", "refused", "absent")},
+            "by_view": {name: by_view.get(name, 0) for name in VIEWS},
             "by_eligibility": {name: eligibility.get(name, 0) for name in ELIGIBILITIES},
             "by_outcome": dict(sorted(outcomes.items())),
             "by_outcome_and_code": dict(sorted(codes.items())),
@@ -660,6 +742,7 @@ def render(summary: dict) -> str:
     lines = [
         f"runs: {runs['total']} (each run id counted once, by one state file)",
         f"  by state: {runs['by_state']}",
+        f"  by view (whose routes): {runs['by_view']}",
         *(f"  {name}: {count}" for name, count in runs["by_eligibility"].items()),
         "  by outcome and code:",
         *(f"    {key}: {count}" for key, count in runs["by_outcome_and_code"].items()),
