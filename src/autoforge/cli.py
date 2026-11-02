@@ -3,7 +3,9 @@
 Commands:
   doctor  read-only environment checks (git, gh, auth, claude, opencode, repo, config,
           default-branch required checks)
-  run     create a run (Issue -> ...) and advance it until READY_FOR_MERGE/DONE/BLOCKED/FAILED
+  run     create a run (Issue -> ...) and advance it until READY_FOR_MERGE/DONE/BLOCKED/FAILED;
+          the run records the issue's native parent as its EPIC, --epic only when the
+          issue has none (#293), and its dry run reads and prints the same binding
   step    execute exactly one phase step from persisted state
   resume  continue a persisted run until a stop phase / max-steps; step, resume and
           unblock refuse a REMOTE run whose recorded configuration (profile
@@ -117,6 +119,7 @@ from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predic
 from .provenance import ControllerIdentity, mismatch_lines, protocol_ranges, refusal_headline
 from .redaction import redact, redact_argv, redact_dict, redact_obj
 from .replan_txn import ReplanTransaction
+from .run_binding import EpicBinding
 from .run_namespace import namespace_issue_of_state_dir
 from .sandbox_pin import SandboxPin
 from .sandbox_policy import absolute_spelling
@@ -188,9 +191,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    r = sub.add_parser("run", help="create a run and advance it")
-    r.add_argument("--epic", required=True, help="EPIC issue URL")
-    r.add_argument("--issue", required=True, help="first issue URL")
+    r = sub.add_parser(
+        "run",
+        help="create a run and advance it",
+        description=(
+            "Create a run of an issue and advance it. The run records the issue's native "
+            "parent on GitHub as its EPIC; --epic is used only when GitHub names no parent "
+            "for the issue, and with neither the run is refused. A parent named in the "
+            "issue's text never counts. The dry run reads the same and prints the same "
+            "binding (#293)."
+        ),
+    )
+    r.add_argument(
+        "--epic",
+        default=None,
+        metavar="EPIC_URL",
+        help=(
+            "the EPIC to record when the issue has no native parent on GitHub; an issue with "
+            "a native parent always records that parent, and an --epic naming another issue "
+            "is printed and not used"
+        ),
+    )
+    r.add_argument("--issue", required=True, metavar="ISSUE_URL", help="the issue to work on")
     r.add_argument("--dry-run", action="store_true", help="plan only; no side effects")
     r.add_argument(
         "--force",
@@ -578,23 +600,21 @@ def _check_configuration(engine: ControllerEngine, args, *words: str, dry_run: b
         print(redact(f"autoforge: {notice}"), file=sys.stderr)
 
 
-def _guard_scheduler_ownership(
-    engine: ControllerEngine, state: AutoForgeState, command: str
-) -> None:
+def _guard_scheduler_ownership(engine: ControllerEngine, issue_url: str, command: str) -> None:
     """ADR 0008 D17.2's forward guard, under L0 and before anything is written.
 
     Refuses (``SchedulerOwnedIssueError``, exit 2) when a scheduler
-    namespace owns the issue ``command`` would act on, the run's
-    ``current_issue_url``, then hands the engine the same predicate, which
-    ``_verify_issue_selectable`` applies to every issue it is asked about
-    (``next_issue_url`` included). ``unblock`` of a namespace's own state
-    directory exempts that namespace.
+    namespace owns the issue ``command`` would act on (``run``'s argument,
+    or the loaded run's ``current_issue_url``), then hands the engine the
+    same predicate, which ``_verify_issue_selectable`` applies to every
+    issue it is asked about (``next_issue_url`` included). ``unblock`` of a
+    namespace's own state directory exempts that namespace.
     """
     root = engine.coordination_root()
     exempt = (
         namespace_issue_of_state_dir(engine.paths.state_dir, root) if command == "unblock" else None
     )
-    refuse_scheduler_owned_issue(root, state.current_issue_url, command, exempt_issue=exempt)
+    refuse_scheduler_owned_issue(root, issue_url, command, exempt_issue=exempt)
     engine.issue_ownership = standalone_ownership_predicate(root, exempt_issue=exempt)
 
 
@@ -1479,8 +1499,11 @@ def cmd_run(args) -> int:
     engine.validate_config()
 
     if args.dry_run:
-        # Fully side-effect-free: in-memory state, plan printed, nothing written.
-        engine.new_run(args.epic, args.issue)
+        # Side-effect-free: the binding's GitHub reads (#293), in-memory state,
+        # plan printed, nothing written.
+        binding = engine.bind_new_run(args.epic, args.issue)
+        _print_binding(binding)
+        engine.new_run(binding.epic_url, binding.issue_url)
         outcomes = engine.run(max_steps=args.max_steps, dry_run=True, allow_merge=args.allow_merge)
         for o in outcomes:
             assert o.plan is not None
@@ -1507,17 +1530,25 @@ def cmd_run(args) -> int:
         rc, corrupt = _existing_run_guard(engine, args.force)
         if rc is not None:
             return rc
-        engine.new_run(args.epic, args.issue)
+        # A scheduler-owned issue is refused before anything is read from
+        # GitHub or written (ADR 0008 D17.2): no quarantine, no state, no
+        # run log.
+        _guard_scheduler_ownership(engine, args.issue, "run")
+        _refuse_an_unusable_state_directory(engine)
+        # The EPIC the run records (#293): the issue's native parent, else
+        # --epic, read under the lock immediately before the first save, so
+        # the state holds what GitHub answered then and no earlier answer.
+        binding = engine.bind_new_run(args.epic, args.issue)
+        _print_binding(binding)
+        engine.new_run(binding.epic_url, binding.issue_url)
         assert engine.state is not None
-        # A scheduler-owned issue is refused before anything is written
-        # (ADR 0008 D17.2): no quarantine, no state, no run log.
-        _guard_scheduler_ownership(engine, engine.state, "run")
         # What later commands of the run are checked against (#219).
         engine.record_run_configuration()
         if corrupt:
             moved = engine.quarantine_state()
             print(f"autoforge: moved unreadable state file aside: {moved}", file=sys.stderr)
         engine.save()
+        engine.log_epic_binding(binding)
         _attach_terminal(engine)
         outcomes = engine.run(
             max_steps=args.max_steps,
@@ -1526,6 +1557,29 @@ def cmd_run(args) -> int:
             on_outcome=_print_outcome_now,
         )
     return _finish(engine, outcomes, args.allow_merge, printed=True)
+
+
+def _refuse_an_unusable_state_directory(engine: ControllerEngine) -> None:
+    """Open ``run``'s state directory, when it exists, before the EPIC binding reads GitHub.
+
+    ``run --force`` takes a state directory it cannot open for an unreadable
+    state to move aside, and finds out that it cannot only when it moves it:
+    a symbolic link there is refused by the state root then. Opening it
+    here, under the lock and before the binding (#293), refuses such a
+    directory before any GitHub read; a missing one is created by the first
+    save, as before.
+    """
+    try:
+        engine.state_root(create=False)
+    except FileNotFoundError:
+        pass
+
+
+def _print_binding(binding: EpicBinding) -> None:
+    """``--epic``, the issue's native parent and the EPIC the run records (#293), on stdout."""
+    for line in binding.lines():
+        print(redact(line))
+    print()
 
 
 def cmd_step(args) -> int:
@@ -1545,7 +1599,7 @@ def cmd_step(args) -> int:
     # could already have been replaced by another controller.
     with engine.locked():
         state = engine.load()
-        _guard_scheduler_ownership(engine, state, "step")
+        _guard_scheduler_ownership(engine, state.current_issue_url, "step")
         if state.phase not in TERMINAL_PHASES:
             _check_configuration(engine, args, "step", dry_run=False)
         _attach_terminal(engine)
@@ -1573,7 +1627,7 @@ def cmd_resume(args) -> int:
     # lock could already have been replaced by another controller.
     with engine.locked():
         state = engine.load()
-        _guard_scheduler_ownership(engine, state, "resume")
+        _guard_scheduler_ownership(engine, state.current_issue_url, "resume")
         rc = _resume_holding_state(engine, state, args.allow_merge)
         if rc is not None:
             return rc
@@ -1623,7 +1677,7 @@ def cmd_unblock(args) -> int:
     # decision: a refused unblock leaves it in place.
     with engine.locked():
         state = engine.load()
-        _guard_scheduler_ownership(engine, state, "unblock")
+        _guard_scheduler_ownership(engine, state.current_issue_url, "unblock")
         if state.phase == Phase.BLOCKED:
             _check_configuration(engine, args, *words, dry_run=False)
         outcome = engine.unblock(
@@ -2492,7 +2546,9 @@ def _render_status(
         "",
         f"Run:        {state.run_id}",
         f"Repository: {state.repository}",
-        f"EPIC:       #{_num(state.epic_url)} {state.epic_url}",
+        # The persisted EPIC, never the issue's current parent on GitHub (#293, #435).
+        f"EPIC:       #{_num(state.epic_url)} {state.epic_url} "
+        "(recorded when the run was created; not re-read from the issue's parent)",
         f"Issue:      #{_num(state.current_issue_url)} {state.current_issue_url or '-'}",
         f"PR:         #{_num(state.current_pr_url)} {state.current_pr_url or '-'}",
         f"Branch:     {state.current_branch or '-'}",

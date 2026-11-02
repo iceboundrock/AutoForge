@@ -225,9 +225,10 @@ credential:
    the way the engine does, each phase template with its common template;
 6. runs a REMOTE dry run (`autoforge run --epic ... --issue ...
    --dry-run --full-prompt`) in a scratch repository, with a fake `gh`
-   first on `PATH` that records and fails any call, and checks it rendered
-   the ANALYZE_EXECUTE prompt, called no `gh` and left the repository
-   unchanged; then meets LOCAL mode's ways in with the installed
+   first on `PATH` that records every call, answers the EPIC binding's two
+   issue reads (#293) and fails any other call, and checks it printed the
+   binding, rendered the ANALYZE_EXECUTE prompt, called `gh` for those two
+   reads alone and left the repository unchanged; then meets LOCAL mode's ways in with the installed
    command (ADR 0009 D3 to D5, #389): `--help` names no `local`, and in a
    scratch repository holding a `mode: "LOCAL"` state and beside a
    configuration with a `local:` block, `autoforge local`, `status`,

@@ -509,9 +509,16 @@ def test_the_digests_become_the_steps_outputs_and_sha256sums(tmp_path: Path, mon
     assert all(line in summary.read_text(encoding="utf-8") for line in lines)
 
 
-# What the installed command prints on a REMOTE dry run, as far as the dist check
-# looks; the stand-ins below print it and then misbehave in one way each.
+# What the installed command does on a REMOTE dry run, as far as the dist check
+# looks: the EPIC binding's two reads through `gh` (#293) and its line, then the
+# plan; the stand-ins below do it and then misbehave in one way each.
+_BINDING_READS = (
+    "gh api repos/example/dist-check/issues/2 > /dev/null; "
+    "gh api repos/example/dist-check/issues/1 > /dev/null; "
+)
 _REMOTE_PLAN = (
+    'echo "  used:          #1 https://github.com/example/dist-check/issues/1 '
+    "(the issue's native parent, which --epic names too)\"; "
     'echo "Template: analyze_execute.md"; echo "--- prompt preview ---"; '
     'echo "<<<CONTROL_RESULT>>>"'
 )
@@ -521,7 +528,12 @@ _REMOTE_PLAN = (
     "then, refusal",
     [
         ("", None),
-        ("gh api user || true", r"called gh: 'api user\\n'"),
+        (
+            "gh api user || true",
+            r"called gh for \['api repos/example/dist-check/issues/2', "
+            r"'api repos/example/dist-check/issues/1', 'api user'\], not for the EPIC "
+            r"binding's two reads",
+        ),
         ("mkdir .autoforge", r"changed the scratch repository: \[.*'\.autoforge \(created\)'\]"),
         (": > .git/index.lock", r"repository: \[.*'\.git/index\.lock \(created\)'\]"),
         ("echo x >> .git/HEAD", r"\['\.git/HEAD \(content, size, mtime, ctime\)'\]"),
@@ -531,7 +543,7 @@ _REMOTE_PLAN = (
     ],
     ids=[
         "clean",
-        "gh-called",
+        "gh-called-beyond-the-binding",
         "dir-created",
         "lock-created",
         "appended",
@@ -543,9 +555,10 @@ def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
     tmp_path: Path, then: str, refusal: str | None
 ):
     """``remote_dry_run`` on a stand-in for the installed command (real git, fake gh):
-    any write shows, the bytes a file already held written over it again included."""
+    a ``gh`` call beyond the EPIC binding's two reads shows, and so does any write,
+    the bytes a file already held written over it again included."""
     command = tmp_path / "autoforge"
-    command.write_text(f"#!/bin/sh\n{_REMOTE_PLAN}\n{then}\n", encoding="utf-8")
+    command.write_text(f"#!/bin/sh\n{_BINDING_READS}{_REMOTE_PLAN}\n{then}\n", encoding="utf-8")
     command.chmod(0o755)
     git = dist_check.shutil.which("git")
     assert git is not None
@@ -553,6 +566,43 @@ def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
         dist_check.remote_dry_run(str(command), git, tmp_path, dist_check._child_env())
         return
     with pytest.raises(CheckFailed, match=refusal):
+        dist_check.remote_dry_run(str(command), git, tmp_path, dist_check._child_env())
+
+
+@pytest.mark.parametrize(
+    "reads, refusal",
+    [
+        ("", r"called gh for \[\], not for the EPIC binding's two reads"),
+        (
+            "gh api repos/example/dist-check/issues/1 > /dev/null; "
+            "gh api repos/example/dist-check/issues/2 > /dev/null; ",
+            r"called gh for \['api repos/example/dist-check/issues/1', "
+            r"'api repos/example/dist-check/issues/2'\]",
+        ),
+    ],
+    ids=["no-binding-read", "reads-out-of-order"],
+)
+def test_the_remote_dry_run_check_requires_the_binding_reads(
+    tmp_path: Path, reads: str, refusal: str
+):
+    """A dry run binds the run's EPIC as the run does (#293): the issue, then its EPIC."""
+    command = tmp_path / "autoforge"
+    command.write_text(f"#!/bin/sh\n{reads}{_REMOTE_PLAN}\n", encoding="utf-8")
+    command.chmod(0o755)
+    git = dist_check.shutil.which("git")
+    assert git is not None
+    with pytest.raises(CheckFailed, match=refusal):
+        dist_check.remote_dry_run(str(command), git, tmp_path, dist_check._child_env())
+
+
+def test_the_remote_dry_run_check_requires_the_binding_line(tmp_path: Path):
+    command = tmp_path / "autoforge"
+    plan = _REMOTE_PLAN.split("; ", 1)[1]  # every line but the binding's
+    command.write_text(f"#!/bin/sh\n{_BINDING_READS}{plan}\n", encoding="utf-8")
+    command.chmod(0o755)
+    git = dist_check.shutil.which("git")
+    assert git is not None
+    with pytest.raises(CheckFailed, match=r"printed no \"  used: +#1 "):
         dist_check.remote_dry_run(str(command), git, tmp_path, dist_check._child_env())
 
 

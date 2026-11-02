@@ -187,7 +187,10 @@ transition:
   not changed." and changes nothing. A run also stops at the worker's step
   limit (50, as a standalone `run`), its claim then classified `resumable`.
 - **The same run as a standalone one.** A fresh issue starts exactly as
-  `autoforge run` starts it (INITIALIZING); a namespace holding a state
+  `autoforge run` starts it (INITIALIZING), with one difference: the worker
+  records the EPIC whose snapshot admitted the issue as its direct child,
+  and makes none of the standalone `run`'s EPIC binding reads (#293); a
+  namespace holding a state
   passes #219's recorded-configuration gate first, as `resume` does, and a
   changed configuration is refused unless the scheduler forwards
   `--accept-config-change`. Every validation and certificate gate of #158

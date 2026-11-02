@@ -5,6 +5,31 @@ so.
 
 ## Unreleased
 
+### A new run records the issue's native parent as its EPIC, and `--epic` is the fallback (#293)
+
+`run` used to record whatever `--epic` named, so a run of #257 started with
+`--epic` #158 recorded #158 although #257's parent on GitHub is #255, and
+its `UPDATE_EPIC` would have written to the wrong issue. Now:
+
+- a new run's EPIC is the issue's GitHub-native parent (its direct one, for
+  a nested issue). A `--epic` naming another issue is shown and not used;
+- `--epic` is optional, and is the EPIC only for an issue GitHub reports
+  with no native parent. With neither, `run` refuses (exit 2). A parent
+  named in the issue's body, a task list, a roadmap or a title never
+  counts;
+- `run` refuses (exit 2) a parent in another repository, a closed issue
+  and a closed EPIC, and refuses (exit 1) when reading the issue or its
+  EPIC fails, is denied or is cut off. A failed read never falls back to
+  `--epic`, and a refusal writes nothing;
+- `run` and `run --dry-run` print `--epic`, the native parent and the EPIC
+  used, and the run log records which source was used. The dry run now
+  makes those two read-only `gh` reads;
+- `status` labels the EPIC as the one recorded when the run was created.
+  An existing run keeps its EPIC whatever happens to the issue's parent
+  on GitHub; rebinding a run is #435.
+
+See [Which EPIC a run records](docs/usage.md#which-epic-a-run-records).
+
 ### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
 
 `REVIEW` still blocks on a comment carrying the round's review marker that

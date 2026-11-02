@@ -469,6 +469,7 @@ from .roadmap import (
     splice_roadmap,
     split_roadmap,
 )
+from .run_binding import EpicBinding, bind_run_epic
 from .run_namespace import IssueNamespace, check_standalone_state_dir, inside_scheduler_root
 from .runlog import ExecutionRecord, RunLogger, StepLog
 from .safefs import SafeRoot
@@ -2856,6 +2857,42 @@ class ControllerEngine:
         )
         self._state_from_disk = False
         return self.state
+
+    def bind_new_run(self, epic_url: str | None, issue_url: str) -> EpicBinding:
+        """The EPIC a new run of ``issue_url`` records, read from GitHub (#293).
+
+        The issue's native parent, else ``--epic`` (``epic_url``, None when
+        not given); refused with nothing written otherwise
+        (:func:`autoforge.run_binding.bind_run_epic`). ``run`` calls it under
+        the controller lock immediately before :meth:`new_run` and the first
+        save, its dry run without the lock; a scheduler's worker does not,
+        since its EPIC is the one whose snapshot admitted the issue as a
+        direct child.
+        """
+        return bind_run_epic(self.github, issue_url, epic_url)
+
+    def log_epic_binding(self, binding: EpicBinding) -> None:
+        """One controller-only run-log record of the EPIC a new run records and why (#293).
+
+        Written once, after the run's first save: the issue, the EPIC, its
+        source (the native parent or ``--epic``), ``--epic`` as given and the
+        native parent GitHub named.
+        """
+        state = self._require_state()
+        now = utcnow_iso()
+        record = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase=f"{state.phase.value}-epic-binding",
+            attempt=1,
+            issue_url=state.current_issue_url,
+            profile="(EPIC binding at run creation; no agent)",
+            prompt_version=state.prompt_version,
+            started_at=now,
+            finished_at=now,
+            metadata=binding.record(),
+        )
+        self._logger().log_execution(record)
 
     def load(self) -> AutoForgeState:
         """Read the run at :attr:`paths` through the held state root."""

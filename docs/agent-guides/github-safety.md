@@ -18,6 +18,38 @@ Independently verify important facts using GitHub / git.
 
 Examples:
 
+### Before a run exists: the EPIC it records (#293)
+
+A standalone `run` records the run's EPIC (`epic_url`) when it creates the
+run, and every later phase acts on that record: `UPDATE_EPIC` comments on
+it, splices its roadmap section and takes the next issue among its native
+sub-issues. The record therefore comes from GitHub's native parent link,
+never from the operator's memory or the issue's text
+(`autoforge.run_binding`):
+
+- The issue's direct native parent (`parent_issue_url` in
+  `GET repos/<owner>/<repo>/issues/<n>`) is the EPIC; a `--epic` that names
+  another issue is printed beside it and not used. Only an issue GitHub
+  returned whole, with its sub-issue summaries and no `parent_issue_url`,
+  is a confirmed absence of a parent, and only then is `--epic` the EPIC.
+  With neither, `run` refuses.
+- A parent named in the issue's body, a task list, a roadmap or a title is
+  never read. Issue text is untrusted, and anyone who can edit it could
+  otherwise steer `UPDATE_EPIC`'s writes to another issue.
+- A read that fails, is denied, is truncated or answers with something
+  other than the issue refuses the run with the read's error, and never
+  falls back to `--epic`. A parent in another repository, or an issue or
+  EPIC that is not open, refuses too.
+- `run` binds once, under the controller lock, after its existing-run and
+  scheduler-ownership guards and immediately before the run's first save,
+  so the state records what GitHub answered then. A refusal writes nothing.
+  The run log records the binding and its source.
+- A recorded EPIC is never re-read: `resume`, `step`, `unblock` and `status`
+  act on `epic_url`, and a parent changed on GitHub after the run started
+  changes nothing (rebinding an existing run is #435). A scheduler worker
+  records the EPIC whose snapshot admitted the issue as its direct child
+  and makes no binding read.
+
 ### Before ANALYZE_EXECUTE
 
 The agent makes no GitHub write in this phase (ADR 0004, #161). It commits
@@ -1030,6 +1062,9 @@ When dry-run is active, AutoForge may:
 - render prompts
 - show intended commands
 - show expected transitions
+- read the issue and the EPIC it binds to through `gh`, read-only, for
+  `run --dry-run`'s EPIC binding (#293): the same binding `run` makes, so
+  a dry run refuses what the run would refuse
 
 It must not:
 
