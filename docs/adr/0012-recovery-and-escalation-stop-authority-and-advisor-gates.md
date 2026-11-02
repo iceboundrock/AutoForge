@@ -114,18 +114,30 @@ reorders an edge.
 
 | Outcome | Persisted as | Who leaves it, and how: standalone | Who leaves it, and how: namespace | Permitted while stopped | Denied |
 |---|---|---|---|---|---|
-| `blocked` | phase `BLOCKED` | the operator: `unblock --reason`, where the controller chooses among `UNBLOCK_TARGETS` from live GitHub or refuses and stays `BLOCKED`; then `resume`. Or a new run (`run --force` when the run holds operator actions) | the operator: `unblock` against that issue's own namespace state directory, after the scheduler exits (ADR 0008 D9.4), then `epic resume`; or `epic archive` and a fresh admission | read-only inspection (`status`, `status --json`, `unblock --dry-run`, `doctor`); the operator's own GitHub actions; `unblock`'s K9 and K10 flags (D3) | `resume` and `step` (terminal for them); any agent launch; an automatic `unblock`; `BLOCKED -> REPLAN_REEXECUTE`; an `unblock` that takes a classification, a code or a recommendation |
-| `failed` | phase `FAILED` | the operator: a new run | `epic archive`, then a fresh admission | read-only inspection | `unblock` (it refuses every phase but `BLOCKED`), `resume`, any edge |
-| `resumable_error` | the phase as last saved, with the attempt counter the step saved | the operator: `resume`, which reconciles the phase entry with GitHub before any launch | `epic resume` | read-only inspection | treating it as `BLOCKED` or `FAILED`; a relaunch beyond the step's bound; retrying a failure no adapter typed as transient |
-| `refused` | nothing: the command acted on no run | the operator, by code (`REFUSAL_ROUTES`): the recorded configuration, or `--accept-config-change` (written to the run log first); a fixed configuration or host; a state repaired or moved aside (`run --force` quarantines an unreadable one); waiting for the lock holder | the same; `epic resume --accept-config-change` forwards the acceptance to its workers (ADR 0008 D9.4) | read-only inspection | `resume` or `unblock` as a remedy (no refusal route is either); accepting a weaker `sandbox.mode` without the flag |
-| `awaiting_input` | #126's pending record (not implemented) | nobody until #126 lands; then #126's decision commands | settled (ADR 0008 D15.1) | read-only inspection | producing it for anything but a human's pending answer (D6) |
-| `unknown` | whatever was saved | the operator, after investigating; acting needs live facts re-read | the same | read-only inspection | any route a known outcome would grant |
+| `blocked` | phase `BLOCKED` | the operator: `unblock --reason`, where the controller chooses among `UNBLOCK_TARGETS` from live GitHub or refuses and stays `BLOCKED`; then `resume`. Or a new run (`run --force` when the run holds operator actions) | the operator: `unblock` against that issue's own namespace state directory, after the scheduler exits (ADR 0008 D9.4), then `epic resume`; or `epic archive` and a fresh admission | inspection: `status`, `status --json` and `unblock --dry-run`, which write nothing, and `doctor`, whose one write is its state-directory probe (D3); the operator's own GitHub actions; `unblock`'s K9 and K10 flags (D3) | `resume` and `step` (terminal for them); any agent launch; an automatic `unblock`; `BLOCKED -> REPLAN_REEXECUTE`; an `unblock` that takes a classification, a code or a recommendation |
+| `failed` | phase `FAILED` | the operator: a new run | `epic archive`, then a fresh admission | the same inspection | `unblock` (it refuses every phase but `BLOCKED`), `resume`, any edge |
+| `resumable_error` | the phase as last saved, with the attempt counter the step saved | the operator: `resume`, which reconciles the phase entry with GitHub before any launch | `epic resume` | the same inspection | treating it as `BLOCKED` or `FAILED`; a relaunch beyond the step's bound; retrying a failure no adapter typed as transient |
+| `refused` | nothing: the command acted on no run | the operator, by code (`REFUSAL_ROUTES`). Its `repeat` route is the refused command itself, `resume` and `unblock` included, once the cause is fixed: the recorded configuration restored, or the change accepted with `--accept-config-change` (written to the run log first); a fixed configuration or host; the lock holder gone. Otherwise a state repaired or moved aside (`run --force` quarantines an unreadable one) | the same; `epic resume --accept-config-change` forwards the acceptance to its workers (ADR 0008 D9.4) | the same inspection | a repeat that skips any check of the refused command (below); reading the refusal as a change of the run, which it did not save; a configuration change taken without `--accept-config-change`, a weaker `sandbox.mode` included |
+| `awaiting_input` | #126's pending record (not implemented) | nobody until #126 lands; then #126's decision commands | settled (ADR 0008 D15.1) | the same inspection | producing it for anything but a human's pending answer (D6) |
+| `unknown` | whatever was saved | the operator, after investigating; acting needs live facts re-read | the same | the same inspection | any route a known outcome would grant |
 | LOCAL state (removed mode) | a `mode: "LOCAL"` file | nobody: the loader refuses it (`refused` / `state-invalid`), and a REMOTE run starts fresh | not applicable: a namespace's state is REMOTE | none on the file | `unblock`, `resume`, or a migration of it into a REMOTE state |
 
 The stops by design (`ready_for_merge`, `handoff`, `done`, `in_progress`)
 are not recovery cases. ADR 0011 D1's routes for them stand unchanged; a
 namespace's `ready_for_merge` is merged by hand
 (`test_a_namespace_ready_for_merge_is_merged_by_hand_never_resumed`).
+
+**A refusal's route names the refused command and grants it nothing.**
+`refused`'s `repeat` route is the command that was refused, whichever it
+was. A `resume` or an `unblock` refused for configuration drift is repeated
+with the recorded configuration restored, or with `--accept-config-change`
+(`test_accept_config_change_records_the_change_in_the_run_log_and_continues`,
+`test_unblock_refuses_another_configuration_and_records_an_accepted_one`).
+The repeat runs every check that command has. `unblock` still refuses a run
+that is not `BLOCKED` (`test_unblock_requires_a_blocked_run`) and still
+chooses the phase from live GitHub. `resume` still stops at a run that is
+`BLOCKED` or `FAILED`, and still reconciles its phase entry before any
+launch.
 
 **Crash windows.** Each has one outcome:
 
@@ -172,7 +184,8 @@ classification (`test_unblock_takes_no_classification`).
 |---|---|---|---|
 | reconciliation the controller already does (phase entry, effect records, plan completion) | the controller, automatically | ADR 0004 D4; `resume` | conflict or ambiguity: `BLOCKED`; transient: state unchanged, for `resume` |
 | bounded transient reads and relaunches | the controller, automatically, within a typed bound | an adapter's `transient_failure` (at most `MAX_TRANSIENT_RETRIES`, 2, per step); the pushed-head wait (#403); `merge.max_verification_attempts`; `GitHubUnavailableError` for `resume` | bound exhausted: `BLOCKED`, or the error for `resume`. An untyped failure is not transient |
-| dry-run inspection and read-only status | anyone | `--dry-run` of `run`, `step`, `resume`, `unblock` and `rebind-epic`; `status`; `doctor` | writes nothing, whatever it finds (`test_run_dry_run_writes_nothing`, `test_unblock_dry_run_reads_github_and_writes_nothing`) |
+| dry-run inspection and read-only status | anyone | `--dry-run` of `run`, `step`, `resume`, `unblock` and `rebind-epic`; `status` | writes nothing, whatever it finds (`test_run_dry_run_writes_nothing`, `test_unblock_dry_run_reads_github_and_writes_nothing`) |
+| environment checks | anyone | `doctor` | is not write-free, and changes no run whatever it finds. Its one write is its state-directory probe: it creates the state directory when it is absent, then creates and removes one probe file in it, through the same boundary as a run's writes, and leaves none behind (`test_state_dir_on_a_filesystem_without_hard_links_names_the_requirement`). It neither reads nor touches the run's `state.json` (`test_the_controller_row_names_the_imported_package_and_reads_no_state`), and skips the probe for a configuration it refused (`test_doctor_writes_no_state_directory_for_a_configuration_it_refused`) |
 | leaving `BLOCKED` | the operator asks; the controller chooses the phase from live GitHub | `unblock` | refuses, and the run stays `BLOCKED` |
 | K9, the acceptance comment on the run's issue | the operator per action id (`safety.acceptance_actions: approve`, the default), or the operator's configuration (`auto`); under `off` nobody, and the resolution is refused. The value is recorded with the plan, so a later change never widens it | `unblock --approve-action` / `--decline-action` | nothing is sent while unapproved (`test_an_acceptance_comment_awaiting_the_operator_is_held_with_nothing_sent`) |
 | K10, a comment on another issue | the operator performs it; the controller only verifies | `unblock`'s operator-action flags | never sent by the controller (`test_operator_actions_block_with_the_plan_saved_and_nothing_sent`) |
@@ -242,10 +255,11 @@ actions that are (i) permitted by D3 to something other than the operator,
 (ii) verifiable afterwards from facts the controller reads itself, and
 (iii) not already decided deterministically. #373 is not referenced in the
 repository at `0ba238e`. On #369's evidence, ADR 0011 D6's inventory of
-every stop sink, each family of reason codes (`ReasonFamily`) fails at
-least one condition. The `intentional` family (the stops by design, and
-#126's reserved pause) is no recovery case. Every other family is below,
-with every code it holds:
+every stop sink, each family of reason codes (`ReasonFamily`) but
+`intentional` fails at least one condition. Every family is below, with
+every code it holds. The `intentional` family (the stops by design, and
+#126's reserved pause) is no recovery case; its row is there so that a code
+added to it is decided like any other:
 
 | Family | Codes | What would resolve it | Fails |
 |---|---|---|---|
@@ -260,6 +274,7 @@ with every code it holds:
 | `configuration` | `configuration-invalid`, `configuration-drift`, `sandbox-capability`, `scheduler-owned` | another configuration, an accepted drift, a capable host, the scheduler's own commands | (i) |
 | `state` | `state-invalid`, `state-protocol`, `state-transition`, `lock-held` | a repaired or moved-aside state file, a newer controller, the right command, another process ending | (i) |
 | `unknown` | `unknown` | — | (ii): nothing typed says what happened |
+| `intentional` | `ready-for-merge`, `handoff`, `done`, `in-progress`, `awaiting-input` | nothing: a stop by design keeps ADR 0011 D1's routes (D2), and a pause is answered by its human through #126 (D6) | none applies: not a recovery case |
 
 The class is empty, so A is no-go. Nothing is built only to satisfy #354.
 A later record may reopen A only by naming a concrete action class that
@@ -267,7 +282,8 @@ meets (i) to (iii), with the corpus evidence (D4 item 1) that it occurs.
 Three things could make one appear: a new stop family or code, a new effect
 kind approved under D10 that turns a remedy into a controller write with a
 verifiable identity, or #373's findings. The first cannot pass unnoticed: a
-family or code added to `stop_classification.py` without a row here fails
+family or code added to `stop_classification.py`, in any family,
+`intentional` included, without its row here fails
 `test_adr_0012_gate_a_takes_every_reason_family_and_code`. An action that
 meets the three conditions is still a typed controller operation behind D3,
 never an advisor's.

@@ -874,10 +874,13 @@ def test_adr_0012_stop_matrix_takes_every_outcome_that_needs_recovery():
 def test_adr_0012_gate_a_takes_every_reason_family_and_code():
     """ADR 0012 D5's no-go for autonomous recovery rests on every family of
     stop codes failing one of its three conditions. A family or a code added
-    later has no row there until someone decides whether it reopens gate A."""
+    later has no row there until someone decides whether it reopens gate A,
+    the ``intentional`` family's included: its row says it is no recovery
+    case, and a code added to it is a decision like any other (PR #446
+    R1-F4)."""
     rows = _adr_0012_table("D5")
-    recoverable = set(ReasonFamily) - {ReasonFamily.INTENTIONAL}
-    assert set(rows) == {family.value for family in recoverable}
-    for family in recoverable:
+    assert set(rows) == {family.value for family in ReasonFamily}
+    for family in ReasonFamily:
         codes = {code.value for code, of in REASON_FAMILY.items() if of is family}
+        assert codes, family
         assert set(re.findall(r"`([a-z0-9-]+)`", rows[family.value][1])) == codes, family
