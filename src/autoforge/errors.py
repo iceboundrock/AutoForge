@@ -213,6 +213,20 @@ class EpicBindingError(ConfigurationError):
     """
 
 
+class EpicRebindError(ConfigurationError):
+    """``rebind-epic`` refuses to move an existing run to another EPIC (#435).
+
+    Raised by :mod:`autoforge.epic_rebind` and the engine's rebind when the
+    operator's request, the run's state or GitHub's answer decides against
+    it: an expected EPIC, issue or run that is not the run's, a phase or
+    persisted effect, journal or batch a rebind would cross, a ``--to`` that
+    is not the issue's native parent or not open, an issue that changed on
+    GitHub between its reads. Nothing was changed: no state write, and no
+    write to GitHub. A read that failed is never this error: it stays the
+    client's :class:`GitHubError` (exit 1).
+    """
+
+
 class StateTransitionError(AutoForgeError):
     """Illegal phase transition or step on a terminal phase."""
 

@@ -565,27 +565,51 @@ def test_a_checkout_of_a_renamed_repository_starts_the_run(
     assert sd.exists() is not dry_run
 
 
-def test_status_shows_the_recorded_epic_and_never_the_current_parent(
+def test_status_shows_the_recorded_epic_and_warns_of_another_parent_without_changing_it(
     tmp_path, capsys, monkeypatch, fakes
 ):
-    """Re-parenting the issue on GitHub after the run started changes nothing (#435)."""
+    """Re-parenting the issue on GitHub after the run started changes nothing (#293), and
+    ``status`` says so: the recorded EPIC stays the one shown, and a warning names the
+    issue's native parent and the read-only preview of a rebind (#435)."""
     monkeypatch.chdir(tmp_path)
     gh = fakes["gh"]
     sd = tmp_path / ".autoforge"
     assert cli.main(["--state-dir", str(sd), "run", "--issue", ISSUE, "--max-steps", "1"]) == 0
     capsys.readouterr()
+    assert cli.main(["--state-dir", str(sd), "status"]) == 0
+    assert "WARNING" not in capsys.readouterr().out  # the parent is the recorded EPIC
     gh.add_issue(ISSUE3, "another EPIC", parent=None)
     gh.parents[ISSUE] = ISSUE3
     gh.calls.clear()
+    before = state_tree(sd)
     assert cli.main(["--state-dir", str(sd), "status"]) == 0
     out = capsys.readouterr().out
+    assert f"EPIC:       #1 {EPIC} (the run's recorded EPIC; status never changes it)" in out
+    [warning] = [line for line in out.splitlines() if line.startswith("WARNING:")]
+    assert f"GitHub names #3 {ISSUE3} as the native parent of #2, not the recorded EPIC" in warning
+    assert "Nothing was changed" in warning
     assert (
-        f"EPIC:       #1 {EPIC} (recorded when the run was created; not re-read from the "
-        "issue's parent)"
-    ) in out
-    assert ISSUE3 not in out
-    assert ("get_issue_node", ISSUE) not in gh.calls
+        f"rebind-epic --issue {ISSUE} --from {EPIC} --to {ISSUE3} --reason '<why>' --dry-run"
+        in warning
+    )
+    assert gh.calls == [("get_issue_node", ISSUE)]
+    assert state_tree(sd) == before
     assert load_state(sd / "state.json").epic_url == EPIC
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["epic_parent_check"] == {
+        "recorded_epic_url": EPIC,
+        "issue_url": ISSUE,
+        "native_parent_url": ISSUE3,
+        "differs": True,
+        "problem": "",
+    }
+    gh.graph_error = GitHubUnavailableError("gh: connection reset")
+    assert cli.main(["--state-dir", str(sd), "status"]) == 0
+    out = capsys.readouterr().out
+    assert "Parent:     not read (gh: connection reset); the recorded EPIC is shown unchecked" in (
+        out
+    )
+    assert state_tree(sd) == before
 
 
 def test_run_help_says_epic_is_the_fallback(capsys):
@@ -1988,6 +2012,12 @@ def _a_run_left_unloadable(tmp_path, capsys, kind: str) -> tuple[Path, bytes, st
     return sd, raw, reason
 
 
+# A rebind of the run of ISSUE to ISSUE3 (#435): refused, like every command, on a state
+# that does not load.
+_REBIND_ARGV = ["rebind-epic", "--issue", ISSUE, "--from", EPIC, "--to", ISSUE3]
+_REBIND_ARGV += ["--reason", "the operator looked"]
+
+
 @pytest.mark.parametrize("kind", UNLOADABLE_STATES)
 def test_status_step_resume_and_unblock_refuse_a_state_that_does_not_load(
     tmp_path, capsys, monkeypatch, fakes, kind
@@ -2007,6 +2037,8 @@ def test_status_step_resume_and_unblock_refuse_a_state_that_does_not_load(
         ["step"],
         ["resume"],
         ["unblock", "--reason", "the operator looked"],
+        [*_REBIND_ARGV, "--dry-run"],
+        _REBIND_ARGV,
     )
     for where in (["--state-dir", str(sd)], []):
         for words in commands:
@@ -2462,7 +2494,16 @@ def test_help_lists_no_local_command(capsys):
         a for a in cli.build_parser()._actions if isinstance(a, argparse._SubParsersAction)
     ]
     assert "local" not in commands.choices
-    assert set(commands.choices) == {"doctor", "run", "step", "resume", "unblock", "status", "epic"}
+    assert set(commands.choices) == {
+        "doctor",
+        "run",
+        "step",
+        "resume",
+        "unblock",
+        "rebind-epic",
+        "status",
+        "epic",
+    }
 
 
 # Every standalone command that loads the configuration, each spelling that

@@ -50,10 +50,11 @@ first save: the state records what GitHub answered then, with no earlier
 answer that could have gone stale, and a refusal leaves no state,
 quarantine or run log. Its dry run binds through the same function,
 without the lock, and persists nothing. A recorded run
-is never bound again: ``resume``, ``step``, ``unblock`` and ``status`` read
-``epic_url`` from the state, never the issue's current parent (rebinding an
-existing run is #435), and a scheduler worker records the EPIC whose
-snapshot admitted the issue as its direct child (ADR 0008 D3.1).
+is never bound again implicitly: ``resume``, ``step`` and ``unblock`` read
+``epic_url`` from the state, never the issue's current parent; ``status``
+only compares the two; only the operator's ``rebind-epic`` replaces it
+(:mod:`autoforge.epic_rebind`, #435). A scheduler worker records the EPIC
+whose snapshot admitted the issue as its direct child (ADR 0008 D3.1).
 """
 
 from __future__ import annotations

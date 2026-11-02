@@ -136,6 +136,7 @@ COVERAGE: Mapping[str, Entry] = {
     "src/autoforge/doctor_sandbox.py": ("test_doctor",),
     "src/autoforge/epic_commands.py": ("test_epic_recovery", "test_cli"),
     "src/autoforge/epic_graph.py": ("test_epic_commands", "test_epic_recovery"),
+    "src/autoforge/epic_rebind.py": ("test_cli",),  # an existing run's EPIC (#435)
     "src/autoforge/executor_duplex.py": ("test_providers",),
     "src/autoforge/executor_supervised.py": ("test_scheduler", "test_worker"),
     "src/autoforge/loop_detect.py": ("test_claude_stream", "test_engine"),

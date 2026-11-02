@@ -491,6 +491,7 @@ EXCEPTION_CLASSES: dict[type[errors.AutoForgeError], tuple[StopOutcome, StopReas
     errors.ConfigurationError: (_O.REFUSED, _C.CONFIGURATION_INVALID),
     errors.ConfigurationDriftError: (_O.REFUSED, _C.CONFIGURATION_DRIFT),
     errors.EpicBindingError: (_O.REFUSED, _C.CONFIGURATION_INVALID),
+    errors.EpicRebindError: (_O.REFUSED, _C.CONFIGURATION_INVALID),
     errors.SandboxCapabilityError: (_O.REFUSED, _C.SANDBOX_CAPABILITY),
     errors.SchedulerStateDirError: (_O.REFUSED, _C.SCHEDULER_OWNED),
     errors.SchedulerOwnedIssueError: (_O.REFUSED, _C.SCHEDULER_OWNED),

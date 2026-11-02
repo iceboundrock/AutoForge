@@ -62,11 +62,34 @@ never from the operator's memory or the issue's text
   then. A refusal writes nothing. The run log records the binding and its
   source. `run --dry-run` makes the same checks and reads, without the
   lock, so it refuses what the run would refuse.
-- A recorded EPIC is never re-read: `resume`, `step`, `unblock` and `status`
-  act on `epic_url`, and a parent changed on GitHub after the run started
-  changes nothing (rebinding an existing run is #435). A scheduler worker
-  records the EPIC whose snapshot admitted the issue as its direct child
-  and makes no binding read.
+- A recorded EPIC is never re-bound implicitly: `resume`, `step` and
+  `unblock` act on `epic_url`, and a parent changed on GitHub after the run
+  started changes nothing. `status` reads the issue's native parent and
+  warns when it is not the recorded EPIC, writing nothing. A scheduler
+  worker records the EPIC whose snapshot admitted the issue as its direct
+  child and makes no binding read.
+- Only the operator's `rebind-epic` (#435) replaces a recorded EPIC, and
+  only with the issue's current native parent: the issue, `--to` and the
+  issue again are read (`GET /repos/<owner>/<repo>/issues/<n>` each), and
+  `--to` must be the issue's open direct parent in the same repository.
+  Then the recorded EPIC's complete comment listing is read (the listing
+  `UPDATE_EPIC` reads), and a progress comment for the issue on it, for
+  any PR, or a progress marker that cannot be read, refuses: whatever
+  posted it (an earlier entry, an agent of the previous contract, a
+  human), a rebind would leave it there beside the one `UPDATE_EPIC` then
+  posts on `--to`. A listing that cannot be read to its end changes
+  nothing (exit 1). It never writes to GitHub, never runs an agent and
+  never touches the merge gate. It is refused for a scheduler's issue, a
+  state directory of another repository, outside `READY_FOR_MERGE` and
+  `BLOCKED`, once the run's own PR is counted (an `UPDATE_EPIC` that
+  blocked before journaling anything keeps no record of what it found or
+  wrote on the recorded EPIC), and whenever the run holds an effect record,
+  entry observation, completion context, replan journal, rejected
+  `UPDATE_EPIC` selection or another issue's counted merge: no sent,
+  planned or uncertain write is migrated, relabelled or erased. Its
+  decision goes to the run log and its transition to the state directory's
+  journal before the state's atomic save
+  ([Rebinding a run to its issue's parent](../usage.md#rebinding-a-run-to-its-issues-parent)).
 
 ### Before ANALYZE_EXECUTE
 

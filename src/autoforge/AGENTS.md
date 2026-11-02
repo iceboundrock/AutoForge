@@ -88,6 +88,12 @@ validation.py       typed GitHub URL parsing and run-argument validation
 run_binding.py      the EPIC a new standalone run records: the issue's native parent, else
                     `run --epic`; get_issue_node reads only (the issue again last), fails
                     closed, no write (#293)
+epic_rebind.py      rebind-epic's decision for an existing standalone run: request,
+                    safe phases (READY_FOR_MERGE, a quiescent BLOCKED), refusals of
+                    EPIC-tied persisted state and of the run's own counted merge, the
+                    parent reads and the recorded EPIC's progress comments, the journal
+                    of applied rebinds and what a repeat is, the report and its run-log
+                    record, status's parent warning; no I/O of its own (#435)
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
 materialize.py      byte-exact export of a candidate commit from the shared object store
                     and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171)
@@ -115,8 +121,9 @@ git_workspace.py    the controller's git reader of a working tree: root, git dir
                     (ADR 0009 C1, #386)
 safefs.py           filesystem capability boundary for every controller write
 locking.py          the lock domains of ADR 0008 (#180): L0 (ControllerLock, keyed by the git
-                    common dir; shared and adopted close-only), L2 (IssueRunLock and its
-                    lock-free probe), L1 (SharedGitLock around each common-dir git write),
+                    common dir; shared and adopted close-only; its lock-free probe for a
+                    preview, #435), L2 (IssueRunLock and its lock-free probe), L1
+                    (SharedGitLock around each common-dir git write),
                     the order assertion and the scheduler's filesystem refusal
 ownership.py        who may act on an issue (ADR 0008 D17.2, #180): the forward guard's
                     ownership predicate (an open scheduler claim included, #181) and the
@@ -218,8 +225,8 @@ engine.py (phase sequencing, resume)             -> docs/agent-guides/workflow.m
 replan_txn.py, engine.py (REPLAN_REEXECUTE),
 prompts/replan_reexecute.md                       -> docs/agent-guides/replan-transaction.md (+ workflow.md)
 github.py, claims.py, validation.py, run_binding.py,
-premerge.py, materialize.py, effect_ops.py, git_transport.py,
-child_env.py, read_context.py, engine.py (post-phase
+epic_rebind.py, premerge.py, materialize.py, effect_ops.py,
+git_transport.py, child_env.py, read_context.py, engine.py (post-phase
 verification, merge gate, dry-run, read context),
 prompts/update_epic*.md                           -> docs/agent-guides/github-safety.md
                                                      (+ docs/adr/0004-authority-boundary-and-

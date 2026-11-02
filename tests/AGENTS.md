@@ -368,6 +368,14 @@ recovery (#183)                       JSON keys, stop, archive, dry run, --force
                                       the scheduler in process), test_epic_recovery.py (every
                                       D14.5 crash window by SIGKILL of a real scheduler, worker or
                                       archive; tests/epic_cli.py); doctor --epic: test_doctor.py
+an existing run's EPIC rebound         test_epic_rebind.py (pure: request, phases, EPIC-tied
+(rebind-epic, #435)                   state, the counted merge, the reads, the old EPIC's
+                                      comments, the journal and repeats; CLI: dry run, apply,
+                                      conflicting repeats, each persistence boundary, the lock
+                                      and its probe, scheduler namespaces, another clone's
+                                      state and namespace; engine: real BLOCKED and UPDATE_EPIC
+                                      runs; a resumed run's UPDATE_EPIC); status's parent
+                                      warning: test_cli.py
 REMOTE run's recorded configuration   test_config_fingerprint.py (CLI: test_cli.py; load and
                                       protocol: test_state.py)
 sandbox pin and config placement      test_sandbox_pin.py (strength, the record, the engine's

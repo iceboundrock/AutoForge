@@ -467,6 +467,13 @@ def test_secret_shaped_argv_and_output_are_redacted_in_state_status_and_logs(
     assert SECRET not in eng.paths.state_file.read_text(encoding="utf-8")
     assert SECRET not in run_logs(eng)
     monkeypatch.chdir(eng.workdir)
+    real_init = engine_module.ControllerEngine.__init__
+
+    def on_the_fake(self, *a, **k):  # status reads the issue's parent (#435): never the real gh
+        k.setdefault("github", eng.github)
+        real_init(self, *a, **k)
+
+    monkeypatch.setattr(engine_module.ControllerEngine, "__init__", on_the_fake)
     capsys.readouterr()
     assert cli.main(["--state-dir", str(eng.paths.state_dir), "status"]) == 0
     out = capsys.readouterr().out

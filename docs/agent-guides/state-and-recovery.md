@@ -20,7 +20,13 @@ Expected state includes data such as:
 - prompt version
 - run ID
 - repository
-- EPIC URL
+- EPIC URL (`epic_url`): recorded by `run` (#293) and replaced only by the
+  operator's `rebind-epic` (#435), which changes it and `updated_at` alone,
+  writes its decision to the run log first (`<PHASE>-epic-rebind`, with the
+  old URL and `prior_updated_at`) and then the transition to its journal
+  (`epic-rebinds.json`, below), and refuses outside `READY_FOR_MERGE` and
+  `BLOCKED`, once the run's own PR is counted, or while any persisted record
+  depends on the recorded EPIC
 - current issue URL
 - current PR URL and its branch
 - phase
@@ -583,14 +589,27 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
 - A working directory outside a git repository has no lock to take and is
   refused (exit 2, nothing written), so `run`, `step` and `resume` require
   one (a REMOTE dry-run does not).
+- The lock is the working directory's, whatever `--state-dir` names, so
+  `rebind-epic` (#435) also binds its state directory to it: `git rev-parse
+  --git-common-dir` run from the state directory must name the same git
+  common dir (`ControllerEngine.state_dir_repository_problem`). A state
+  directory of another repository (another clone of the same GitHub
+  repository, or a scheduler namespace in another one's git directory) or
+  of none is refused before the lock is taken, and in its dry run, with
+  nothing written there. Its dry run also asks whether L0 is held now
+  (`locking.controller_lock_live`: `LOCK_SH | LOCK_NB` on a descriptor of
+  the common dir opened read-only and never created, closed at once; it
+  writes no lock file or PID, and a collision fails only the simultaneous
+  acquisition), and reports a held lock as the refusal the applied command
+  would make under it.
 - `run`, `step` and `resume` take the lock **before** the `state.json` they
   act on is read or created and keep it until their last step has been
   persisted, so a state snapshot loaded before the lock is never executed
   and no second controller can take over the repository mid-command. A
   refusal needs no lock, and taking the lock writes its PID record, which
   lies in the state directory when that directory is the lock's own
-  (`--state-dir <git common dir>/autoforge`). So `step`, `resume` and
-  `unblock` first load the state once without the lock, and `run` first
+  (`--state-dir <git common dir>/autoforge`). So `step`, `resume`,
+  `unblock` and `rebind-epic` first load the state once without the lock, and `run` first
   asks once whether it may replace the state there. That read can only
   refuse: a missing state, one that does not load (a LOCAL one among
   them) or, for `run`, a run it does not replace. Whatever lets a command
@@ -695,7 +714,7 @@ takes L1:
   and nothing ever removes a lock file.
 - **Ownership (D17.2).** L0 excludes a standalone command and a scheduler
   in time; the guards exclude them in ownership. **Forward:** `run`,
-  `step`, `resume` and `unblock` refuse (exit 2, `SchedulerOwnedIssueError`
+  `step`, `resume`, `unblock` and `rebind-epic` refuse (exit 2, `SchedulerOwnedIssueError`
   naming `autoforge epic archive`) an issue a scheduler namespace owns,
   checked under L0 before anything is written: the namespace holds any
   `state/state.json` (loaded or not), its `claim.json` holds an open claim
@@ -769,6 +788,11 @@ requirement named (#120). Its layout:
 <state dir>/
     state.json          # persisted run state (atomic writes)
     state.json.corrupt-<timestamp>   # unreadable state moved aside by 'run --force'
+    epic-rebinds.json   # rebind-epic's journal of applied rebinds (#435): {schema: 1,
+                        # transitions: [run_id, issue_url, from_epic_url, to_epic_url,
+                        # prior_updated_at, at]}, the newest 32, atomic replace, written
+                        # after the run-log record and before the state save; parsed
+                        # strictly, and one that does not parse refuses every rebind
     logs/<run-id>/
         events.jsonl                       # one line per agent invocation, append-only
         <seq>-<phase>-<attempt>/
