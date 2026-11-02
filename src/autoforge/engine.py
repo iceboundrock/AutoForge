@@ -250,16 +250,24 @@ from .effects import (
     sha256_text,
 )
 from .epic_graph import read_children
+from .epic_rebind import COMMAND as REBIND_COMMAND
+from .epic_rebind import JOURNAL_NAME as REBIND_JOURNAL
+from .epic_rebind import MAX_JOURNAL_BYTES as MAX_REBIND_JOURNAL_BYTES
 from .epic_rebind import (
     RebindReport,
     RebindRequest,
+    RebindTransition,
     apply_words,
     identity_problems,
     informational_notes,
     is_already_bound,
     observe_parent,
+    observe_recorded_epic,
     parent_problems,
+    parse_journal,
+    recorded_epic_problems,
     refusal_message,
+    render_journal,
     state_problems,
 )
 from .errors import (
@@ -2847,6 +2855,51 @@ class ControllerEngine:
         """
         check_standalone_state_dir(self.paths.state_dir, self.coordination_root(), command)
 
+    def state_dir_repository_problem(self) -> str:
+        """Why the state directory is not guarded by this engine's L0 ("" when it is).
+
+        :meth:`lock_path` and :meth:`coordination_root` are derived from
+        ``workdir``, while ``--state-dir`` may name the state of another
+        checkout: another clone of the same GitHub repository included, or a
+        scheduler namespace inside another repository's git common dir. A
+        command run from checkout B on checkout A's state would take B's
+        L0, judge ownership by B's scheduler root, and write A's state while
+        A's own controller holds A's lock. So this asks git which repository
+        contains the state directory (``git rev-parse --git-common-dir`` from
+        it, as :func:`~autoforge.locking.repository_lock_path` asks from
+        ``workdir``) and requires the same git common dir, symlinks
+        resolved. A linked worktree of the same repository shares it; a
+        state directory in no repository, or whose repository cannot be
+        read, has no identity to establish and is a problem too. Two git
+        reads, no write; a missing state directory is left to the state
+        load, which refuses it. ``rebind-epic`` refuses on it (#435); no
+        other command calls this.
+        """
+        state_dir = self.paths.state_dir
+        if not os.path.lexists(state_dir):
+            return ""
+        try:
+            own = Path(os.path.realpath(self.coordination_root()))
+        except LockError as exc:
+            return f"the working directory's repository cannot be established: {exc}"
+        try:
+            theirs = Path(os.path.realpath(repository_lock_path(state_dir).parent.parent))
+        except LockError as exc:
+            return (
+                f"the repository of the state directory {state_dir} cannot be established "
+                f"({exc}), so the controller lock that guards its run is unknown; run the "
+                "command from the checkout the run belongs to, on a state directory inside it"
+            )
+        if own != theirs:
+            return (
+                f"the state directory {state_dir} belongs to the repository whose git common "
+                f"dir is {theirs}, and this command runs in the one whose git common dir is "
+                f"{own}: its controller lock and scheduler root are not this checkout's (two "
+                "clones of one GitHub repository are two repositories to the lock); run the "
+                f"command from a checkout of {theirs.parent if theirs.name == '.git' else theirs}"
+            )
+        return ""
+
     def state_dir_in_scheduler_root(self) -> bool:
         """Whether this engine's state dir lies in the scheduler root (ADR 0008 D17.3).
 
@@ -2921,37 +2974,55 @@ class ControllerEngine:
         request: RebindRequest,
         *,
         dry_run: bool = False,
-        scheduler_problems: Sequence[str] = (),
+        preflight_problems: Sequence[str] = (),
     ) -> RebindReport:
         """Bind the loaded run to the issue's native parent ``request.new`` (#435).
 
         The operator's explicit, audited replacement of ``epic_url`` and of
-        nothing else (:mod:`autoforge.epic_rebind`). In order: the request
-        must name this run's issue (and run, with ``--run-id``); a run that
-        already records ``--to`` is reported ``already-bound`` and nothing is
-        read or written (a repeat of an applied rebind). Then the state must
-        allow it (``--from`` is the recorded EPIC, the phase is one of
+        nothing else (:mod:`autoforge.epic_rebind`). In order: the state
+        directory must lie in this engine's repository
+        (:meth:`state_dir_repository_problem`), so the lock held is the
+        run's own; ``preflight_problems`` (the CLI's scheduler-ownership
+        and, for a dry run, held-lock findings) must be empty; and the
+        request must name this run's issue (and run, with ``--run-id``).
+        Only then may a run that already records ``--to`` be reported
+        ``already-bound``, with nothing read or written, and only when the
+        journal of applied rebinds holds that very transition
+        (:func:`~autoforge.epic_rebind.repeat_problem`); a request that
+        merely names the recorded EPIC refuses. Then the state must allow it
+        (``--from`` is the recorded EPIC, the phase is one of
         :data:`~autoforge.epic_rebind.REBIND_PHASES`, no effect state,
-        replan journal, rejected selection or foreign merge batch) and
-        ``scheduler_problems`` (the CLI's ownership findings for a dry run)
-        must be empty; only then is GitHub read: the issue, ``--to`` and the
-        issue again, and ``--to`` must be its open native parent.
+        replan journal, rejected selection, foreign merge batch or counted
+        merge of its own PR); only then is GitHub read: the issue, ``--to``
+        and the issue again, and ``--to`` must be its open native parent;
+        then the recorded EPIC's comments, which must hold no progress
+        comment for the issue and no progress marker that cannot be read.
 
         Applied (``dry_run`` False, under the controller lock the caller
-        holds): the decision is written to the run log *before* the state
-        save, as an applied unblock is, so a rebind is never on disk without
-        its record; a crash between the two leaves the old binding, and the
-        same command applies it again. The save is the state's atomic
-        replace: a reader sees the old binding or the new one. A refusal is
-        recorded in the run log and raised as :class:`EpicRebindError`
-        (exit 2), a failed read is recorded and re-raised (exit 1); the
-        state is untouched either way. ``dry_run`` makes the same checks and
-        reads, writes nothing (no state, no run log) and reports every
-        reason at once.
+        holds): the decision is written to the run log, then the transition
+        to the journal, *before* the state save, so a rebind is never on
+        disk without its record and its journal entry; a crash before the
+        save leaves the old binding, and the same command applies it again.
+        The save is the state's atomic replace: a reader sees the old
+        binding or the new one. A refusal is recorded in the run log and
+        raised as :class:`EpicRebindError` (exit 2), a failed read is
+        recorded and re-raised (exit 1); the state and the journal are
+        untouched either way. A state directory of another repository is
+        refused before anything is written there, its run log included.
+        ``dry_run`` makes the same checks and reads, writes nothing (no
+        state, no run log, no journal) and reports every reason at once.
         """
         state = self._require_state()
         if not dry_run and not self.lock_held:
             raise LockError("rebind-epic changes a run only under the controller lock")
+        foreign = self.state_dir_repository_problem()
+        if foreign and not dry_run:
+            # Nothing is written to a state directory this engine's lock does
+            # not guard, a refusal record in its run log included.
+            raise EpicRebindError(
+                f"{REBIND_COMMAND} refused for run {state.run_id}: {foreign}. Nothing was "
+                "changed: no state write, and nothing written to GitHub."
+            )
         try:
             worktree = self.agent_worktree_description()
         except ConfigurationError:
@@ -2969,15 +3040,31 @@ class ControllerEngine:
             prior_updated_at=state.updated_at,
             dry_run=dry_run,
         )
-        if not identity_problems(state, request) and is_already_bound(state, request):
+        preflight = [*([foreign] if foreign else []), *preflight_problems]
+        try:
+            transitions = parse_journal(self._read_rebind_journal())
+        except (EpicRebindError, StateError) as exc:
+            transitions = []
+            preflight.append(" ".join(str(exc).split()))
+        if (
+            not preflight
+            and not identity_problems(state, request)
+            and is_already_bound(state, request, transitions)
+        ):
             report.decision = "already-bound"
             return report
-        report.problems = [*scheduler_problems, *state_problems(state, request)]
+        report.problems = [*preflight, *state_problems(state, request, transitions)]
         report.notes = informational_notes(state, request)
+        if dry_run:
+            report.notes.append(
+                "a preview reads without the controller lock; the applied command takes it "
+                "and checks all of this again under it"
+            )
         if report.problems and not dry_run:
             return self._refuse_rebind(report)
         try:
             report.observation = observe_parent(self.github, request)
+            report.recorded_epic = observe_recorded_epic(self.github, state)
         except EpicRebindError as exc:
             report.problems.append(str(exc))
         except GitHubError as exc:
@@ -2988,6 +3075,8 @@ class ControllerEngine:
                 raise
         if report.observation is not None:
             report.problems += parent_problems(request, report.observation)
+        if report.recorded_epic is not None:
+            report.problems += recorded_epic_problems(report.recorded_epic)
         if dry_run:
             if report.problems:
                 report.decision = "would-refuse"
@@ -3006,11 +3095,29 @@ class ControllerEngine:
         self._log_rebind(report)
         recorded = parse_issue_url(state.epic_url)
         # The run's own spelling of its repository, as every URL it records.
-        state.epic_url = GitHubIssueRef(
-            owner=recorded.owner, repo=recorded.repo, number=request.new.number
-        ).canonical
+        new = GitHubIssueRef(owner=recorded.owner, repo=recorded.repo, number=request.new.number)
+        # Then the journal, still before the save: a binding never changes
+        # without the entry that makes its repeat recognisable.
+        transition = RebindTransition(
+            run_id=state.run_id,
+            issue=parse_issue_url(state.current_issue_url),
+            old=recorded,
+            new=new,
+            prior_updated_at=state.updated_at,
+            at=utcnow_iso(),
+        )
+        self.state_root().write_bytes(
+            REBIND_JOURNAL, render_journal([*transitions, transition]), mode=0o600
+        )
+        state.epic_url = new.canonical
         self.save()
         return report
+
+    def _read_rebind_journal(self) -> bytes | None:
+        """The journal of applied rebinds in the state directory, bounded; None when absent."""
+        return self.state_root(create=False).read_bytes(
+            REBIND_JOURNAL, limit=MAX_REBIND_JOURNAL_BYTES
+        )
 
     def _refuse_rebind(self, report: RebindReport) -> NoReturn:
         report.decision = "refused"

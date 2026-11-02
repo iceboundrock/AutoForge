@@ -14,6 +14,7 @@ only.
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import json
 import os
@@ -67,6 +68,7 @@ from tests.conftest import (
     github_origin,
     implement,
     make_engine,
+    post_progress_comment,
     progress_comment_body,
     publish_pr_head,
     read_context_of,
@@ -206,17 +208,33 @@ def test_a_blocked_run_keeping_epic_scoped_context_is_refused(fields, shown):
     assert shown in problem
 
 
-def test_a_merge_batch_of_another_issue_is_refused_and_the_issues_own_is_not():
-    own = _state(Phase.BLOCKED, merged_since_epic_update=1, counted_merged_prs=[OTHER_PR, PR])
-    assert state_problems(own, _request()) == []
-    notes = epic_rebind.informational_notes(own, _request())
-    assert any("this issue's merged PR is counted" in n for n in notes)
+@pytest.mark.parametrize("since", [1, 0], ids=["roadmap-pending", "roadmap-written"])
+def test_a_counted_merge_of_the_runs_own_pr_is_refused(since):
+    """MERGE counts the PR in the save that enters UPDATE_EPIC: a counted one is an
+    UPDATE_EPIC of this issue on the recorded EPIC, next or already run (R1-F2)."""
+    own = _state(Phase.BLOCKED, merged_since_epic_update=since, counted_merged_prs=[OTHER_PR, PR])
+    [problem] = state_problems(own, _request())
+    assert f"the run's PR {PR} is merged and counted" in problem
+    assert "a write to the recorded EPIC cannot be ruled out" in problem
+    assert "manual fallback in docs/usage.md" in problem
+    assert not any(
+        "merged PR is counted" in n for n in epic_rebind.informational_notes(own, _request())
+    )
+    # Not counted yet (merged by hand, MERGE not run): nothing of UPDATE_EPIC happened.
+    assert (
+        state_problems(_state(Phase.READY_FOR_MERGE, counted_merged_prs=[OTHER_PR]), _request())
+        == []
+    )
+
+
+def test_a_merge_batch_of_another_issue_is_refused():
     for batch in ([OTHER_PR], [OTHER_PR, PR]):
         state = _state(
             Phase.READY_FOR_MERGE, merged_since_epic_update=len(batch), counted_merged_prs=batch
         )
-        [problem] = state_problems(state, _request())
-        assert f"another issue's PR ({OTHER_PR})" in problem
+        problems = state_problems(state, _request())
+        assert any(f"another issue's PR ({OTHER_PR})" in p for p in problems)
+        assert any("is merged and counted" in p for p in problems) is (PR in batch)
 
 
 def test_the_identity_and_the_expected_epic_must_be_the_runs():
@@ -257,7 +275,7 @@ def test_the_parent_is_read_twice_around_the_epic_and_only_with_get_issue_node()
     assert parent_problems(_request(), observed) == []
 
 
-def test_the_module_reads_github_through_get_issue_node_alone():
+def test_the_module_reads_github_through_rebind_reads_alone():
     """Structural: every attribute the module takes of a reader is in REBIND_READS."""
     tree = ast.parse(inspect.getsource(epic_rebind))
     used = {
@@ -268,7 +286,7 @@ def test_the_module_reads_github_through_get_issue_node_alone():
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "reader"
     }
-    assert used == REBIND_READS == {"get_issue_node"}
+    assert used == REBIND_READS == {"get_issue_node", "get_issue_comments"}
 
 
 @pytest.mark.parametrize(
@@ -334,6 +352,118 @@ def test_status_lines_warn_only_of_another_parent():
     assert note.startswith("Parent:") and "names no native parent for #2" in note
     [note] = status_lines(parent=None, **{**common, "read_error": "HTTP 502"})
     assert note == "Parent:     not read (HTTP 502); the recorded EPIC is shown unchecked"
+
+
+def test_the_recorded_epics_comments_refuse_a_progress_comment_of_the_issue_for_any_pr():
+    """R1-F2: a progress comment for the issue on the EPIC the run leaves would stay there
+    while UPDATE_EPIC posts another on --to; another issue's is the EPIC's normal history."""
+    gh = _graph()
+    gh.add_comment(EPIC, 301, progress_comment_body(f"{REPO}/issues/7", OTHER_PR))
+    observed = epic_rebind.observe_recorded_epic(gh, _state())
+    assert observed is not None and observed.comments == 1 and observed.progress_urls == ()
+    assert epic_rebind.recorded_epic_problems(observed) == []
+    assert gh.calls == [("get_issue_comments", EPIC)]
+    gh.add_comment(EPIC, 302, progress_comment_body(ISSUE, f"{REPO}/pull/99"))  # another PR
+    observed = epic_rebind.observe_recorded_epic(gh, _state())
+    [problem] = epic_rebind.recorded_epic_problems(observed)
+    assert f"already carries 1 progress comment(s) for issue #2 ({comment_url(EPIC, 302)})" in (
+        problem
+    )
+    assert "let UPDATE_EPIC post another on --to" in problem
+
+
+def test_an_unreadable_progress_marker_on_the_recorded_epic_is_refused():
+    gh = _graph()
+    gh.add_comment(EPIC, 303, "Progress\n\n<!-- ai-epic-progress: {not json -->\n")
+    observed = epic_rebind.observe_recorded_epic(gh, _state())
+    [problem] = epic_rebind.recorded_epic_problems(observed)
+    assert "already carries a progress comment for issue #2 cannot be established" in problem
+
+
+@pytest.mark.parametrize(
+    "error, kind",
+    [
+        (GitHubUnavailableError("HTTP 502"), GitHubUnavailableError),
+        (GitHubError("HTTP 403"), GitHubError),
+        (ExecutionError("gh: not found"), GitHubError),
+    ],
+)
+def test_a_failed_read_of_the_recorded_epics_comments_is_never_an_empty_listing(error, kind):
+    gh = _graph()
+    gh.comments_error = error
+    with pytest.raises(kind, match="reading the comments of the recorded EPIC") as raised:
+        epic_rebind.observe_recorded_epic(gh, _state())
+    assert not isinstance(raised.value, EpicRebindError)
+
+
+def _transition(**over) -> epic_rebind.RebindTransition:
+    fields = {
+        "run_id": "af-20261101T000000Z-abcdef",
+        "issue": parse_issue_url(ISSUE),
+        "old": parse_issue_url(EPIC),
+        "new": parse_issue_url(NEW_EPIC),
+        "prior_updated_at": "2026-11-01T00:00:00+00:00",
+        "at": "2026-11-01T01:00:00+00:00",
+    }
+    fields.update(over)
+    return epic_rebind.RebindTransition(**fields)
+
+
+def test_a_repeat_is_the_journaled_transition_in_effect_and_nothing_else():
+    """R1-F3: --to recorded is ``already-bound`` only for the rebind that bound it."""
+    bound = _state(epic_url=NEW_EPIC)
+    journal = [_transition()]
+    assert epic_rebind.is_already_bound(bound, _request(), journal)
+    assert state_problems(bound, _request(), journal) == []
+    # Another --from with the same --to: no repeat of the rebind that happened.
+    other = _request(from_url=OTHER)
+    assert not epic_rebind.is_already_bound(bound, other, journal)
+    [problem] = state_problems(bound, other, journal)
+    assert f"since its rebind from {EPIC} for issue {ISSUE}" in problem
+    assert f"names --from {OTHER}" in problem and "not a repeat of that rebind" in problem
+    # A run bound to --to since it was created: nothing in the journal.
+    for empty in ([], [_transition(run_id="af-20261101T000000Z-000000")]):
+        [problem] = state_problems(bound, _request(), empty)
+        assert "no rebind of run af-20261101T000000Z-abcdef to it is in its journal" in problem
+    # The latest entry to the recorded EPIC decides: EPIC -> 255, 255 -> 300, 300 -> 255.
+    back = [
+        _transition(),
+        _transition(old=parse_issue_url(NEW_EPIC), new=parse_issue_url(OTHER)),
+        _transition(old=parse_issue_url(OTHER), new=parse_issue_url(NEW_EPIC)),
+    ]
+    assert epic_rebind.is_already_bound(bound, other, back)
+    assert not epic_rebind.is_already_bound(bound, _request(), back)
+    # An entry whose save never happened (255 -> 300 while the run still records 255).
+    unsaved = [
+        _transition(),
+        _transition(old=parse_issue_url(NEW_EPIC), new=parse_issue_url(OTHER)),
+    ]
+    assert epic_rebind.is_already_bound(bound, _request(), unsaved)
+
+
+def test_the_journal_is_strict_and_bounded():
+    many = [_transition(at=f"2026-11-01T00:00:{i:02d}+00:00") for i in range(40)]
+    data = epic_rebind.render_journal(many)
+    kept = epic_rebind.parse_journal(data)
+    assert len(kept) == epic_rebind.MAX_JOURNAL_TRANSITIONS and kept == many[-32:]
+    assert epic_rebind.parse_journal(None) == []
+    good = json.loads(data)
+    bad = [
+        b"\xff",
+        b"[]",
+        json.dumps({**good, "extra": 1}).encode(),
+        json.dumps({**good, "schema": 2}).encode(),
+        json.dumps({**good, "schema": True}).encode(),
+        json.dumps({**good, "transitions": good["transitions"] * 2}).encode(),
+        json.dumps({**good, "transitions": [{**good["transitions"][0], "x": ""}]}).encode(),
+        json.dumps({**good, "transitions": [{**good["transitions"][0], "run_id": 1}]}).encode(),
+        json.dumps(
+            {**good, "transitions": [{**good["transitions"][0], "to_epic_url": "x"}]}
+        ).encode(),
+    ]
+    for raw in bad:
+        with pytest.raises(EpicRebindError, match="cannot read its journal of applied rebinds"):
+            epic_rebind.parse_journal(raw)
 
 
 # -- the command, on runs the engine left --------------------------------------------------
@@ -442,6 +572,11 @@ def test_the_dry_run_explains_the_rebind_and_changes_no_byte(tmp_path, capsys, f
     assert f"  recorded EPIC: {EPIC} (matches --from)" in out
     assert f"  --to:          #255 {NEW_EPIC} (open on GitHub)" in out
     assert f"  native parent: #255 {NEW_EPIC}" in out
+    assert (
+        "  old progress:  none (progress comments for #2 on the recorded EPIC, 0 comment(s) read)"
+        in out
+    )
+    assert "note:          a preview reads without the controller lock; the applied command" in out
     assert f"  decision:      would rebind from {EPIC} to {NEW_EPIC}" in out
     assert (
         f"  apply with:    autoforge {' '.join(flags)} rebind-epic --issue {ISSUE} --from {EPIC} "
@@ -449,10 +584,12 @@ def test_the_dry_run_explains_the_rebind_and_changes_no_byte(tmp_path, capsys, f
     ) in out
     assert "worktree:" in out and "autoforge/worktrees/2" in out
     assert state_tree(sd) == before
+    assert not (sd / epic_rebind.JOURNAL_NAME).exists()
     assert fakes["gh"].calls == [
         ("get_issue_node", ISSUE),
         ("get_issue_node", NEW_EPIC),
         ("get_issue_node", ISSUE),
+        ("get_issue_comments", EPIC),
     ]
     assert fakes["provider"].calls[-1].phase == "REVIEW"  # no agent since the run stopped
 
@@ -481,9 +618,23 @@ def test_an_applied_rebind_changes_the_binding_alone_and_a_repeat_is_already_bou
     assert meta["run_id"] == run_id and meta["issue_url"] == ISSUE
     assert meta["pr_url"] == fakes["pr"]
     assert meta["prior_updated_at"] == prior["updated_at"] and meta["problems"] == []
+    assert (
+        meta["recorded_epic_progress_comments"] == [] and meta["recorded_epic_comments_read"] == 0
+    )
     # No GitHub write, no agent, no merge.
-    assert [c[0] for c in fakes["gh"].calls] == ["get_issue_node"] * 3
+    assert [c[0] for c in fakes["gh"].calls] == ["get_issue_node"] * 3 + ["get_issue_comments"]
     assert fakes["gh"].merges == []
+    # The journal holds the transition, bound to the run, the issue and the prior state.
+    journal = json.loads((sd / epic_rebind.JOURNAL_NAME).read_text(encoding="utf-8"))
+    [entry] = journal["transitions"]
+    assert journal["schema"] == 1 and entry["run_id"] == run_id
+    assert (entry["issue_url"], entry["from_epic_url"], entry["to_epic_url"]) == (
+        ISSUE,
+        EPIC,
+        NEW_EPIC,
+    )
+    assert entry["prior_updated_at"] == prior["updated_at"]
+    assert os.stat(sd / epic_rebind.JOURNAL_NAME).st_mode & 0o777 == 0o600
 
     snapshot = state_tree(sd)
     fakes["gh"].calls.clear()
@@ -502,6 +653,21 @@ def test_a_conflicting_repeat_is_refused_with_nothing_changed(tmp_path, capsys, 
     assert cli.main([*flags, *_rebind()]) == 0
     capsys.readouterr()
     before = (sd / "state.json").read_bytes()
+    journal = (sd / epic_rebind.JOURNAL_NAME).read_bytes()
+    # Another --from with the same --to (R1-F3): it names the recorded EPIC, but repeats no
+    # rebind that happened, so it is refused, never reported as already applied.
+    words = ["rebind-epic", "--issue", ISSUE, "--from", OTHER, "--to", NEW_EPIC, "--reason", "x"]
+    snapshot = state_tree(sd)
+    assert cli.main([*flags, *words, "--dry-run"]) == 2
+    out = capsys.readouterr().out
+    assert "already bound" not in out and "would refuse" in out
+    assert f"since its rebind from {EPIC} for issue {ISSUE}" in out
+    assert state_tree(sd) == snapshot
+    assert cli.main([*flags, *words]) == 2
+    err = capsys.readouterr().err
+    assert f"names --from {OTHER} for --issue {ISSUE}: it is not a repeat of that rebind" in err
+    assert (sd / "state.json").read_bytes() == before
+    assert (sd / epic_rebind.JOURNAL_NAME).read_bytes() == journal
     # --from is stale now: the run records NEW_EPIC.
     words = ["rebind-epic", "--issue", ISSUE, "--from", EPIC, "--to", OTHER, "--reason", "x"]
     assert cli.main([*flags, *words]) == 2
@@ -515,9 +681,49 @@ def test_a_conflicting_repeat_is_refused_with_nothing_changed(tmp_path, capsys, 
     assert "as the issue's native parent, not --to #300" in capsys.readouterr().err
     assert (sd / "state.json").read_bytes() == before
     refusals = [r for r in _rebind_records(sd) if r["metadata"]["decision"] == "refused"]
-    assert len(refusals) == 2 and all(
+    assert len(refusals) == 3 and all(
         r["error"].startswith("rebind-epic refused") for r in refusals
     )
+    assert (sd / epic_rebind.JOURNAL_NAME).read_bytes() == journal
+
+
+def test_a_run_bound_to_to_since_it_was_created_is_refused_not_already_bound(
+    tmp_path, capsys, fakes
+):
+    """R1-F3: a run that records --to from the start has no rebind to repeat."""
+    fakes["gh"].parents[ISSUE] = NEW_EPIC  # run binds to the native parent (#293)
+    flags = _flags(tmp_path)
+    assert cli.main([*flags, "run", "--issue", ISSUE]) == 0
+    capsys.readouterr()
+    sd = tmp_path / ".autoforge"
+    assert load_state(sd / "state.json").epic_url == NEW_EPIC
+    before = (sd / "state.json").read_bytes()
+    fakes["gh"].calls.clear()
+    assert cli.main([*flags, *_rebind(), "--dry-run"]) == 2
+    out = capsys.readouterr().out
+    assert "already bound" not in out
+    assert "no rebind of run" in out and "to it is in its journal" in out
+    assert cli.main([*flags, *_rebind()]) == 2
+    err = capsys.readouterr().err
+    assert "repeats no rebind that happened" in err and "Nothing was changed" in err
+    assert (sd / "state.json").read_bytes() == before
+    assert not (sd / epic_rebind.JOURNAL_NAME).exists()
+    [refusal] = _rebind_records(sd)
+    assert refusal["metadata"]["decision"] == "refused"
+    assert not any(c[0].startswith(("create_", "edit_")) for c in fakes["gh"].calls)
+
+
+def test_a_journal_that_does_not_parse_refuses_every_rebind(tmp_path, capsys, fakes):
+    flags = _at_ready_for_merge(tmp_path, capsys, fakes)
+    sd = tmp_path / ".autoforge"
+    (sd / epic_rebind.JOURNAL_NAME).write_text("{", encoding="utf-8")
+    before = (sd / "state.json").read_bytes()
+    assert cli.main([*flags, *_rebind(), "--dry-run"]) == 2
+    assert "cannot read its journal of applied rebinds" in capsys.readouterr().out
+    assert cli.main([*flags, *_rebind()]) == 2
+    assert "Moving it aside is safe" in capsys.readouterr().err
+    assert (sd / "state.json").read_bytes() == before
+    assert (sd / epic_rebind.JOURNAL_NAME).read_text(encoding="utf-8") == "{"
 
 
 @pytest.mark.parametrize("dry", [False, True])
@@ -555,7 +761,9 @@ class Crash(BaseException):
     """A kill at an exact point: not an Exception, so nothing catches it on the way out."""
 
 
-@pytest.mark.parametrize("boundary", ["before the log", "after the log", "at the replace"])
+@pytest.mark.parametrize(
+    "boundary", ["before the log", "at the journal", "after the journal", "at the replace"]
+)
 def test_an_interrupted_rebind_leaves_the_old_binding_and_the_same_command_applies_it(
     tmp_path, capsys, fakes, monkeypatch, boundary
 ):
@@ -569,7 +777,7 @@ def test_an_interrupted_rebind_leaves_the_old_binding_and_the_same_command_appli
                 raise Crash()
 
             patch.setattr(ControllerEngine, "_log_rebind", crash_log)
-        elif boundary == "after the log":
+        elif boundary == "after the journal":
 
             def crash_save(self):
                 raise Crash()
@@ -579,10 +787,11 @@ def test_an_interrupted_rebind_leaves_the_old_binding_and_the_same_command_appli
             import autoforge.safefs as safefs
 
             real_replace = os.replace
+            name = "state.json" if boundary == "at the replace" else epic_rebind.JOURNAL_NAME
 
             def crash_replace(src, dst, *a, **k):
-                # The state's atomic rename alone; the run log's writes go through.
-                if dst == "state.json":
+                # One atomic rename alone; the run log's writes go through.
+                if dst == name:
                     raise Crash()
                 return real_replace(src, dst, *a, **k)
 
@@ -594,11 +803,23 @@ def test_an_interrupted_rebind_leaves_the_old_binding_and_the_same_command_appli
     assert load_state(sd / "state.json").epic_url == EPIC
     logged = len(_rebind_records(sd))
     assert logged == (0 if boundary == "before the log" else 1)
+    journaled = boundary in ("after the journal", "at the replace")
+    journal = sd / epic_rebind.JOURNAL_NAME
+    assert journal.exists() is journaled
     assert cli.main([*flags, *_rebind()]) == 0
     capsys.readouterr()
     assert load_state(sd / "state.json").epic_url == NEW_EPIC
     decisions = [r["metadata"]["decision"] for r in _rebind_records(sd)]
     assert decisions == ["rebound"] * (logged + 1)
+    # The entry of an interrupted attempt stays; the one in effect is the latest.
+    entries = epic_rebind.parse_journal(journal.read_bytes())
+    assert len(entries) == (2 if journaled else 1)
+    assert {(e.old.canonical, e.new.canonical) for e in entries} == {(EPIC, NEW_EPIC)}
+    # A repeat now is the very transition in effect.
+    snapshot = state_tree(sd)
+    assert cli.main([*flags, *_rebind()]) == 0
+    assert "already bound" in capsys.readouterr().out
+    assert state_tree(sd) == snapshot
 
 
 def test_an_interruption_after_the_save_leaves_the_new_binding_and_a_repeat_is_already_bound(
@@ -636,6 +857,147 @@ def test_a_rebind_is_refused_while_another_controller_holds_the_lock(tmp_path, c
     assert "lock" in capsys.readouterr().err.lower()
     assert state_tree(sd) == before
     assert fakes["gh"].calls == []
+
+
+def test_the_preview_reports_a_held_controller_lock_and_writes_no_lock_file(
+    tmp_path, capsys, fakes
+):
+    """R1-F4: the dry run probes L0 without taking it or creating anything, and says the
+    applied command decides again under the lock."""
+    flags = _at_ready_for_merge(tmp_path, capsys, fakes)
+    sd = tmp_path / ".autoforge"
+    lock_dir = tmp_path / ".git" / "autoforge"
+    with ControllerLock(repository_lock_path(tmp_path)):
+        before, lock_before = state_tree(sd), state_tree(lock_dir)
+        assert cli.main([*flags, *_rebind(), "--dry-run"]) == 2
+        out = capsys.readouterr().out
+        assert "would refuse" in out and "would rebind" not in out
+        assert "holds the controller lock" in out and "checks everything again under" in out
+        assert state_tree(sd) == before and state_tree(lock_dir) == lock_before
+    # Free again, with no lock file at all: the same preview would rebind, and the probe
+    # created no lock file and wrote no PID.
+    (lock_dir / "controller.lock").unlink()
+    lock_before = state_tree(lock_dir)
+    assert cli.main([*flags, *_rebind(), "--dry-run"]) == 0
+    assert "would rebind" in capsys.readouterr().out
+    assert state_tree(lock_dir) == lock_before and state_tree(sd) == before
+    assert not (lock_dir / "controller.lock").exists()
+
+
+def test_an_already_bound_scheduler_owned_run_is_refused_not_already_bound(tmp_path, capsys, fakes):
+    """R1-F4: scheduler refusals come before the already-bound shortcut, in the preview
+    as in the applied command, for an owned issue and for a namespace's own state."""
+    flags = _at_ready_for_merge(tmp_path, capsys, fakes)
+    sd = tmp_path / ".autoforge"
+    assert cli.main([*flags, *_rebind()]) == 0  # the standalone run is bound to NEW_EPIC
+    capsys.readouterr()
+    common = Path(os.path.realpath(tmp_path / ".git"))
+    namespace = issue_namespace(common, 2)
+    namespace.state_dir.mkdir(parents=True)
+    save_state(load_state(sd / "state.json"), namespace.state_file)
+    (namespace.state_dir / epic_rebind.JOURNAL_NAME).write_bytes(
+        (sd / epic_rebind.JOURNAL_NAME).read_bytes()
+    )
+    before, ns_before = state_tree(sd), state_tree(namespace.directory)
+    ns_flags = ["--config", flags[1], "--state-dir", str(namespace.state_dir)]
+    for where, words in ((flags, "is owned by the parallel EPIC scheduler"), (ns_flags, "")):
+        assert cli.main([*where, *_rebind(), "--dry-run"]) == 2
+        out = capsys.readouterr().out
+        assert "already bound" not in out and "would refuse" in out
+        assert (words or "inside the parallel EPIC scheduler's root") in out
+        assert cli.main([*where, *_rebind()]) == 2
+        err = capsys.readouterr().err
+        assert "already bound" not in err and "refuses" in err
+    assert state_tree(sd) == before and state_tree(namespace.directory) == ns_before
+
+
+def _second_clone(tmp_path_factory) -> Path:
+    """Another local clone of the same GitHub repository (owner/repo): another git common dir."""
+    return github_origin(git_repo(tmp_path_factory.mktemp("clone-b")))
+
+
+def test_a_state_directory_of_another_clone_is_refused_while_its_controller_runs(
+    tmp_path, capsys, fakes, monkeypatch, tmp_path_factory
+):
+    """R1-F1: from clone B, ``--state-dir`` naming clone A's run takes B's lock, which does
+    not guard A's state, while A's own controller holds A's: refused before any lock or
+    write, in the preview too, and also when A's lock is free."""
+    flags = _at_ready_for_merge(tmp_path, capsys, fakes)
+    sd = tmp_path / ".autoforge"
+    clone = _second_clone(tmp_path_factory)
+    monkeypatch.chdir(clone)
+    own = os.path.realpath(tmp_path / ".git")
+    theirs = os.path.realpath(clone / ".git")
+    for held in (True, False):
+        with contextlib.ExitStack() as stack:
+            if held:
+                stack.enter_context(ControllerLock(repository_lock_path(tmp_path)))
+            before = state_tree(sd)
+            assert cli.main([*flags, *_rebind(), "--dry-run"]) == 2
+            out = capsys.readouterr().out
+            assert "would refuse" in out and f"git common dir is {own}" in out
+            assert f"this command runs in the one whose git common dir is {theirs}" in out
+            assert cli.main([*flags, *_rebind()]) == 2
+            err = capsys.readouterr().err
+            assert f"belongs to the repository whose git common dir is {own}" in err
+            assert "no lock taken" in err
+            assert state_tree(sd) == before
+            assert not (clone / ".git" / "autoforge").exists()  # B's lock was never taken
+    assert load_state(sd / "state.json").epic_url == EPIC
+    assert _rebind_records(sd) == []
+
+
+def test_a_scheduler_namespace_of_another_clone_is_refused(
+    tmp_path, capsys, fakes, monkeypatch, tmp_path_factory
+):
+    """R1-F1: A's namespace named from clone B passes B's scheduler-root and ownership
+    checks, so the repository binding is what refuses it."""
+    flags = _at_ready_for_merge(tmp_path, capsys, fakes)
+    sd = tmp_path / ".autoforge"
+    namespace = issue_namespace(Path(os.path.realpath(tmp_path / ".git")), 2)
+    namespace.state_dir.mkdir(parents=True)
+    save_state(load_state(sd / "state.json"), namespace.state_file)
+    clone = _second_clone(tmp_path_factory)
+    monkeypatch.chdir(clone)
+    ns_flags = ["--config", flags[1], "--state-dir", str(namespace.state_dir)]
+    before = state_tree(namespace.directory)
+    assert cli.main([*ns_flags, *_rebind(), "--dry-run"]) == 2
+    out = capsys.readouterr().out
+    assert "would refuse" in out and "belongs to the repository whose git common dir" in out
+    assert cli.main([*ns_flags, *_rebind()]) == 2
+    assert "belongs to the repository whose git common dir" in capsys.readouterr().err
+    assert state_tree(namespace.directory) == before
+    assert not (clone / ".git" / "autoforge").exists()
+
+
+def test_a_state_directory_in_no_repository_is_refused(tmp_path, capsys, fakes, tmp_path_factory):
+    flags = _at_ready_for_merge(tmp_path, capsys, fakes)
+    outside = tmp_path_factory.mktemp("no-repository") / "state"
+    outside.mkdir()
+    save_state(load_state(tmp_path / ".autoforge" / "state.json"), outside / "state.json")
+    out_flags = ["--config", flags[1], "--state-dir", str(outside)]
+    before = state_tree(outside)
+    assert cli.main([*out_flags, *_rebind(), "--dry-run"]) == 2
+    assert "cannot be established" in capsys.readouterr().out
+    assert cli.main([*out_flags, *_rebind()]) == 2
+    assert "cannot be established" in capsys.readouterr().err
+    assert state_tree(outside) == before
+
+
+def test_the_engine_refuses_a_foreign_state_directory_under_its_own_lock(
+    tmp_path, capsys, fakes, tmp_path_factory
+):
+    """The engine's own check, for a caller that took this checkout's lock anyway: nothing
+    is written to the other repository's state directory, its run log included."""
+    _at_ready_for_merge(tmp_path, capsys, fakes)
+    sd = tmp_path / ".autoforge"
+    clone = _second_clone(tmp_path_factory)
+    eng = ControllerEngine(config=default_config(), state_dir=sd, workdir=clone)
+    eng.load()
+    before = state_tree(sd)
+    with eng.locked(), pytest.raises(EpicRebindError, match="belongs to the repository"):
+        eng.rebind_epic(_request())
+    assert state_tree(sd) == before
 
 
 def test_a_resume_while_the_rebind_holds_the_lock_is_refused(tmp_path, capsys, fakes):
@@ -774,6 +1136,71 @@ def test_a_run_blocked_with_a_k8_record_on_the_recorded_epic_is_refused(tmp_stat
     assert [r["kind"] for r in state.effect_records] == ["progress_comment"]
     _parented(gh)
     _assert_refused_unchanged(eng, f"on {EPIC} (the recorded EPIC), of UPDATE_EPIC")
+
+
+@pytest.mark.parametrize("found", ["an unjournaled progress comment", "an unreadable listing"])
+def test_a_run_blocked_by_update_epic_before_any_journal_is_refused(tmp_state_dir, found):
+    """R1-F2: UPDATE_EPIC blocks on what it found on the recorded EPIC before it records an
+    entry observation or an effect, so the BLOCKED run keeps nothing EPIC-scoped; its own
+    counted merge is what refuses, so no progress comment is ever posted on --to beside the
+    one on the recorded EPIC."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, [], github=gh)
+    gh.add_pr(state="MERGED")
+    eng.state.phase = Phase.UPDATE_EPIC
+    eng.state.current_pr_url = PR
+    eng.state.last_review_result = "clean"
+    eng.state.record_merge(PR)
+    eng.save()
+    if found == "an unjournaled progress comment":
+        post_progress_comment(gh)  # a legacy agent's, or anyone's
+    else:
+        gh.comments_error = GitHubError("HTTP 403: Resource not accessible")
+    assert eng.step().next_phase == "BLOCKED"
+    gh.comments_error = None
+    state = load_state(eng.paths.state_file)
+    assert state.effect_records == [] and state.entry_observation == {}
+    assert state.completion_context == {} and eng.provider.calls == []
+    _parented(gh)
+    _assert_refused_unchanged(eng, f"the run's PR {PR} is merged and counted")
+    assert not any(c[0].startswith(("create_", "edit_")) for c in gh.calls)
+
+
+def test_a_progress_comment_of_the_issue_on_the_recorded_epic_is_refused(tmp_path, capsys, fakes):
+    """R1-F2: a run whose PR is not merged yet, with a progress comment for its issue on the
+    recorded EPIC (an agent of the previous contract posted it, or a human): refused."""
+    flags = _at_ready_for_merge(tmp_path, capsys, fakes)
+    sd = tmp_path / ".autoforge"
+    fakes["gh"].add_comment(EPIC, 310, progress_comment_body(ISSUE, fakes["pr"]))
+    before = state_tree(sd)
+    assert cli.main([*flags, *_rebind(), "--dry-run"]) == 2
+    out = capsys.readouterr().out
+    assert f"old progress:  {comment_url(EPIC, 310)}" in out
+    assert "already carries 1 progress comment(s) for issue #2" in out
+    assert state_tree(sd) == before
+    assert cli.main([*flags, *_rebind()]) == 2
+    assert "let UPDATE_EPIC post another on --to" in capsys.readouterr().err
+    assert load_state(sd / "state.json").epic_url == EPIC
+    assert not (sd / epic_rebind.JOURNAL_NAME).exists()
+
+
+@pytest.mark.parametrize("dry", [False, True])
+@pytest.mark.parametrize(
+    "error", [GitHubUnavailableError("HTTP 502"), GitHubError("HTTP 403")], ids=["502", "403"]
+)
+def test_an_incomplete_comment_listing_of_the_recorded_epic_changes_nothing(
+    tmp_path, capsys, fakes, dry, error
+):
+    """Incomplete GitHub evidence: the listing read to its end or the rebind is undecided."""
+    flags = _at_ready_for_merge(tmp_path, capsys, fakes)
+    sd = tmp_path / ".autoforge"
+    before = (sd / "state.json").read_bytes()
+    fakes["gh"].comments_error = error
+    assert cli.main([*flags, *_rebind(), *(["--dry-run"] if dry else [])]) == 1
+    captured = capsys.readouterr()
+    assert "reading the comments of the recorded EPIC" in (captured.out if dry else captured.err)
+    assert (sd / "state.json").read_bytes() == before
+    assert not (sd / epic_rebind.JOURNAL_NAME).exists()
 
 
 def test_a_run_blocked_on_an_operator_action_for_the_recorded_epic_is_refused(tmp_state_dir):

@@ -24,9 +24,10 @@ Commands:
           operator actions (#243)
   rebind-epic  the operator's explicit move of a standalone run to its issue's native
           parent (#435): --issue, --from (the recorded EPIC), --to, --reason; only in
-          READY_FOR_MERGE or a BLOCKED run with nothing persisted tied to its EPIC; the
-          decision goes to the run log before the one-field state save; --dry-run writes
-          nothing
+          READY_FOR_MERGE or a BLOCKED run with nothing persisted tied to its EPIC, its own
+          PR not yet counted, its state directory in this checkout's repository; the
+          decision goes to the run log and the transition to epic-rebinds.json before the
+          one-field state save; --dry-run writes nothing
   status  show the persisted run summary (--json for machine output; --action
           prints an acceptance or operator action's exact payload); reads the issue's
           native parent and warns, changing nothing, when it is not the recorded EPIC
@@ -101,6 +102,7 @@ from .epic_rebind import (
 from .errors import (
     AutoForgeError,
     ConfigurationError,
+    EpicRebindError,
     InteractionDataError,
     LockError,
     StateError,
@@ -129,7 +131,7 @@ from .interaction import (
     Unavailable,
     UnavailableReason,
 )
-from .locking import ControllerLock, repository_lock_path
+from .locking import ControllerLock, controller_lock_live, repository_lock_path
 from .ownership import (
     refuse_scheduler_owned_issue,
     scheduler_ownership,
@@ -336,12 +338,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Replace the EPIC an existing standalone run records with the issue's native "
             "parent on GitHub, and nothing else of the run (#435). Only in READY_FOR_MERGE, "
             "or BLOCKED with no effect record, entry observation, completion context, replan "
-            "journal, rejected selection or other issue's merge pending for the recorded EPIC; "
-            "never for a scheduler's issue. The issue, --to and the issue again are read from "
-            "GitHub; --to must be the issue's open native parent. The decision is written to "
-            "the run log, then the state is saved atomically. A repeat that finds --to already "
-            "recorded changes nothing. No agent runs, nothing is written to GitHub, and the "
-            "merge gate is not touched."
+            "journal, rejected selection or other issue's merge pending for the recorded EPIC, "
+            "and before the run's own PR is merged and counted; never for a scheduler's issue, "
+            "and only for a state directory inside the repository the command runs in, whose "
+            "controller lock it takes. The issue, --to and the issue again are read from "
+            "GitHub; --to must be the issue's open native parent; then the recorded EPIC's "
+            "comments, which must hold no progress comment for the issue. The decision is "
+            "written to the run log and the transition to epic-rebinds.json in the state "
+            "directory, then the state is saved atomically. A repeat of that very rebind "
+            "changes nothing; a request that only names the recorded EPIC as --to is refused. "
+            "No agent runs, nothing is written to GitHub, and the merge gate is not touched."
         ),
     )
     rb.add_argument("--issue", required=True, metavar="ISSUE_URL", help="the run's current issue")
@@ -375,8 +381,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help=(
-            "read the state and GitHub and print the decision, every refusal and the command "
-            "that applies it; write nothing (no state, no run log, no lock)"
+            "read the state, the scheduler's files, whether the controller lock is held, and "
+            "GitHub, and print the decision, every refusal and the command that applies it; "
+            "write nothing (no state, no run log, no journal, no lock file)"
         ),
     )
 
@@ -1785,14 +1792,18 @@ def cmd_rebind_epic(args) -> int:
     """``autoforge rebind-epic``: the operator's explicit move of a run to its issue's parent.
 
     The request is checked before anything is read (exit 2). A dry run
-    loads the state without the lock, reads the scheduler's files and
-    GitHub, and prints the decision with every reason (exit 0, 2 when it
-    would refuse, 1 when a read failed); it writes nothing. Otherwise, as
+    loads the state without the lock, checks that the state directory is
+    this checkout's repository's, reads the scheduler's files, probes the
+    controller lock without taking it or writing a lock file, reads GitHub,
+    and prints the decision with every reason (exit 0, 2 when it would
+    refuse, 1 when a read failed); it writes nothing. Otherwise, as
     ``unblock``: the scheduler's state-directory refusal and an unloadable
-    state before the lock, then under it the state read again, the forward
-    ownership guard, and the engine's decision (:meth:`ControllerEngine.rebind_epic`),
-    which refuses with exit 2 and a failed read with exit 1, the state
-    unchanged either way. A rebind is not resumed here.
+    state before the lock, then a state directory of another repository
+    (whose lock this checkout cannot take) before the lock too, then under
+    it the state read again, the forward ownership guard, and the engine's
+    decision (:meth:`ControllerEngine.rebind_epic`), which refuses with
+    exit 2 and a failed read with exit 1, the state unchanged either way. A
+    rebind is not resumed here.
     """
     request = parse_rebind_request(
         issue_url=args.issue,
@@ -1803,16 +1814,24 @@ def cmd_rebind_epic(args) -> int:
     )
     engine = _engine_for(args)
     if args.dry_run:
-        # Reads the state, the scheduler's files and GitHub; writes nothing
-        # (no state, no run log, no lock).
+        # Reads the state, the scheduler's files, the lock's state and
+        # GitHub; writes nothing (no state, no run log, no journal, no lock).
         state = engine.load()
         report = engine.rebind_epic(
-            request, dry_run=True, scheduler_problems=_rebind_scheduler_problems(engine, state)
+            request, dry_run=True, preflight_problems=_rebind_preflight_problems(engine, state)
         )
         _print_rebind(report)
         return report.exit_code
     engine.refuse_scheduler_state_dir(REBIND_COMMAND)
     _refuse_unloadable_state_before_the_lock(engine)
+    # Before the lock, which is this checkout's: a state directory of another
+    # repository is guarded by that repository's lock, never by this one.
+    foreign = engine.state_dir_repository_problem()
+    if foreign:
+        raise EpicRebindError(
+            f"{REBIND_COMMAND} refused: {foreign}. Nothing was changed: no lock taken, no "
+            "state write, and nothing written to GitHub."
+        )
     # Load, decide and write under one lock, like `unblock`: a state loaded
     # before the lock could already have been replaced by another controller.
     with engine.locked():
@@ -1825,17 +1844,26 @@ def cmd_rebind_epic(args) -> int:
     return 0
 
 
-def _rebind_scheduler_problems(engine: ControllerEngine, state: AutoForgeState) -> list[str]:
-    """ADR 0008's refusals of a standalone command, as ``rebind-epic --dry-run`` reports them.
+def _rebind_preflight_problems(engine: ControllerEngine, state: AutoForgeState) -> list[str]:
+    """What the applied ``rebind-epic`` refuses before its decision, as its dry run reports it.
 
-    The state directory inside the scheduler's root (D17.3) and the issue a
-    scheduler namespace owns (D17.2), each read without a lock and without
-    a write, as the applied command refuses them with exit 2.
+    Each read without a lock and without a write. A state directory of
+    another repository is the engine's own refusal
+    (:meth:`ControllerEngine.state_dir_repository_problem`), and nothing
+    below is judged for it: this checkout's scheduler root and lock are not
+    the ones that guard it. Otherwise ADR 0008's refusals of a standalone
+    command: the state directory inside the scheduler's root (D17.3) and the
+    issue a scheduler namespace owns (D17.2); and a controller lock some
+    process holds now (:func:`~autoforge.locking.controller_lock_live`),
+    which the applied command would fail to take. Whatever this finds, the
+    applied command decides again under the lock.
     """
     try:
         root = engine.coordination_root()
     except LockError as exc:
         return [f"this directory has no controller lock to take: {exc}"]
+    if engine.state_dir_repository_problem():
+        return []  # reported by the engine
     problems: list[str] = []
     if inside_scheduler_root(engine.paths.state_dir, root):
         problems.append(
@@ -1844,16 +1872,29 @@ def _rebind_scheduler_problems(engine: ControllerEngine, state: AutoForgeState) 
             f"{REBIND_COMMAND} acts on standalone runs only"
         )
     try:
-        number = parse_issue_url(state.current_issue_url).number
+        number: int | None = parse_issue_url(state.current_issue_url).number
     except ConfigurationError:
-        return problems
-    owner = scheduler_ownership(root, number)
-    if owner:
-        problems.append(
-            f"issue #{number} is owned by the parallel EPIC scheduler: {owner}; only the "
-            "scheduler continues it, and 'autoforge epic archive' releases it to a standalone "
-            "run"
-        )
+        number = None
+    if number is not None:
+        owner = scheduler_ownership(root, number)
+        if owner:
+            problems.append(
+                f"issue #{number} is owned by the parallel EPIC scheduler: {owner}; only the "
+                "scheduler continues it, and 'autoforge epic archive' releases it to a "
+                "standalone run"
+            )
+    try:
+        held = controller_lock_live(root)
+    except LockError as exc:
+        problems.append(f"whether a controller holds the lock now cannot be told: {exc}")
+    else:
+        if held:
+            problems.append(
+                f"another AutoForge controller, scheduler or worker holds the controller lock "
+                f"of {root} now, so the applied command would refuse to take it; run it when "
+                "nothing else runs on the repository (it checks everything again under the "
+                "lock)"
+            )
     return problems
 
 

@@ -10,16 +10,20 @@ the issue's current native parent, and nothing else.
 
 This module is the operation's decision, apart from its I/O: the request
 and its local checks (:func:`parse_rebind_request`), what the run's state
-allows (:func:`state_problems`), what GitHub says (:func:`observe_parent`
-and :func:`parent_problems`), the report a dry run and an applied rebind
-print (:class:`RebindReport`) and the run-log record of the decision
-(:meth:`RebindReport.record`). The engine holds the lock, loads and saves;
-the CLI guards scheduler ownership. Nothing here writes, locks or reads a
-file.
+allows (:func:`state_problems`), what GitHub says (:func:`observe_parent`,
+:func:`parent_problems` and :func:`recorded_epic_problems`), whether a
+request is the repeat of an applied rebind (:func:`repeat_problem`, on the
+transitions :func:`parse_journal` reads), the report a dry run and an
+applied rebind print (:class:`RebindReport`) and the run-log record of the
+decision (:meth:`RebindReport.record`). The engine holds the lock, checks
+that the state directory is its repository's, loads and saves, and reads
+and writes the journal; the CLI guards scheduler ownership and probes the
+lock for a dry run. Nothing here writes, locks or reads a file.
 
 **What may be rebound.** A standalone run (never a scheduler namespace's,
-whose EPIC is the one whose graph admitted the issue, ADR 0008 D3.1) in
-one of :data:`REBIND_PHASES`:
+whose EPIC is the one whose graph admitted the issue, ADR 0008 D3.1) whose
+state directory lies in the repository the command runs in (so the lock
+it takes is the run's own), in one of :data:`REBIND_PHASES`:
 
 * ``READY_FOR_MERGE``: the review is done, nothing of the EPIC has been
   read or written for this issue, and with the merge gate closed the run
@@ -32,33 +36,63 @@ are kept while a run is ``BLOCKED`` for ``unblock`` to re-enter, and
 ``UPDATE_EPIC``'s name the EPIC and its body; a rebind never migrates or
 drops one), no ``REPLAN_REEXECUTE`` journal, no rejected ``UPDATE_EPIC``
 selection (``next_issue_rejections``: choices among the recorded EPIC's
-sub-issues, rendered into the next ``UPDATE_EPIC`` prompt), and no merge
+sub-issues, rendered into the next ``UPDATE_EPIC`` prompt), no merge
 counted for a roadmap update other than this issue's own PR (a batch of
-earlier issues' merges belongs to the EPIC they were made under). Every
-other phase, and every such record, refuses; there is no migration rule.
+earlier issues' merges belongs to the EPIC they were made under), and the
+run's own PR not counted as merged (:func:`own_merge_problem`). That PR is
+counted in the save that enters ``UPDATE_EPIC``, so a counted one means
+``UPDATE_EPIC`` runs next on the recorded EPIC or already ran there. An
+entry that blocked before it journaled anything keeps nothing that says
+what it found or did: an unjournaled progress comment it refused to adopt,
+a comment listing it could not read, what an agent of the previous
+(agent-publishing) contract wrote there. None of that can be ruled out
+from the state, so it refuses. Every other phase, and every such record,
+refuses; there is no migration rule.
 
 **What GitHub must say.** ``--to`` is the issue's direct native parent now,
-in the run's repository, and open. The reads are
+in the run's repository, and open; and the recorded EPIC carries no
+progress comment for the issue (:data:`~autoforge.claims.PROGRESS`, any
+PR) and no progress marker that cannot be read, on its complete comment
+listing. The reads are
 :meth:`~autoforge.github.GitHubClient.get_issue_node` of the issue, of
-``--to`` and of the issue again (:data:`REBIND_READS`); an issue whose id,
-state or parent changed between its two reads refuses, and a read that
-fails is the client's :class:`~autoforge.errors.GitHubError`, never a
-fallback. A parent named in an issue's text is never read.
+``--to`` and of the issue again, then
+:meth:`~autoforge.github.GitHubClient.get_issue_comments` of the recorded
+EPIC (:data:`REBIND_READS`); an issue whose id, state or parent changed
+between its two reads refuses, and a read that fails is the client's
+:class:`~autoforge.errors.GitHubError`, never a fallback. A parent named in
+an issue's text is never read.
 
-**What changes.** ``epic_url`` alone (and the save's ``updated_at``). The
-run id, issue, PR, branch, reviewed and current revisions, findings,
-rounds, counters, budgets, evidence, configuration and sandbox pin,
-operator history and the worktree are untouched: the prior state is the
-new one with the recorded EPIC and ``updated_at`` of the run-log record.
+**What a repeat is.** Every applied rebind appends one
+:class:`RebindTransition` (run, issue, from, to, the prior state's
+``updated_at``, when) to the journal ``epic-rebinds.json`` in the state
+directory (:data:`JOURNAL_NAME`) before the state is saved, at most
+:data:`MAX_JOURNAL_TRANSITIONS`, oldest dropped first. A request whose
+``--to`` the run records already is ``already-bound`` only when the
+latest transition of this run to that EPIC is this issue's from ``--from``:
+that one is the transition in effect, since a binding changes only in a
+save that follows its own entry. Any other such request (another
+``--from``, a run that has recorded ``--to`` since it was created, an entry
+past the bound) refuses as conflicting, and so does a journal that does
+not parse.
+
+**What changes.** ``epic_url`` alone (and the save's ``updated_at``) in
+the state, and one entry more in the journal. The run id, issue, PR,
+branch, reviewed and current revisions, findings, rounds, counters,
+budgets, evidence, configuration and sandbox pin, operator history and the
+worktree are untouched: the prior state is the new one with the recorded
+EPIC and ``updated_at`` of the run-log record.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
+from .claims import PROGRESS, collect
 from .errors import (
+    ClaimConflictError,
     ConfigurationError,
     EpicRebindError,
     ExecutionError,
@@ -66,23 +100,25 @@ from .errors import (
     GitHubNotFoundError,
     GitHubUnavailableError,
 )
-from .github import IssueNode
+from .github import CommentInfo, IssueNode
 from .runlog import RUN_ID_RE
 from .transitions import Phase
-from .validation import GitHubIssueRef, parse_issue_url
+from .validation import GitHubIssueRef, parse_issue_url, parse_pr_url
 
 if TYPE_CHECKING:
     from .state import AutoForgeState
 
 
 class ParentReader(Protocol):
-    """The one kind of GitHub read a rebind makes."""
+    """The two kinds of GitHub read a rebind makes."""
 
     def get_issue_node(self, url: str) -> IssueNode: ...
 
+    def get_issue_comments(self, url: str) -> list[CommentInfo]: ...
+
 
 # Every client method this module may call (a structural test holds it to this).
-REBIND_READS = frozenset({"get_issue_node"})
+REBIND_READS = frozenset({"get_issue_node", "get_issue_comments"})
 
 # The phases a run may be rebound in (see the module docstring).
 REBIND_PHASES = frozenset({Phase.READY_FOR_MERGE, Phase.BLOCKED})
@@ -94,6 +130,16 @@ MAX_REBIND_REASON_CHARS = 1000
 _MAX_SHOWN_ERROR_CHARS = 300
 
 COMMAND = "rebind-epic"
+
+# The journal of applied rebinds, in the state directory beside state.json.
+JOURNAL_NAME = "epic-rebinds.json"
+JOURNAL_SCHEMA = 1
+# Transitions the journal keeps, the oldest dropped first; and the bytes a
+# read accepts (each entry is six bounded strings, well under 1 KiB).
+MAX_JOURNAL_TRANSITIONS = 32
+MAX_JOURNAL_BYTES = 64 * 1024
+_TRANSITION_KEYS = ("run_id", "issue_url", "from_epic_url", "to_epic_url", "prior_updated_at", "at")
+_MAX_TIMESTAMP_CHARS = 64
 
 
 # -- the request ---------------------------------------------------------------------------
@@ -169,10 +215,166 @@ def _ref(url: str) -> GitHubIssueRef | None:
         return None
 
 
-def is_already_bound(state: AutoForgeState, request: RebindRequest) -> bool:
-    """The run already records ``--to``: a repeat of an applied rebind, nothing to do."""
+# -- the journal of applied rebinds ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RebindTransition:
+    """One applied (or, interrupted before its save, attempted) rebind of a run.
+
+    Appended to the journal before the state is saved: an entry whose save
+    never happened is possible, a binding changed without an entry is not.
+    """
+
+    run_id: str
+    issue: GitHubIssueRef
+    old: GitHubIssueRef
+    new: GitHubIssueRef
+    prior_updated_at: str
+    at: str
+
+    def document(self) -> dict[str, str]:
+        return {
+            "run_id": self.run_id,
+            "issue_url": self.issue.canonical,
+            "from_epic_url": self.old.canonical,
+            "to_epic_url": self.new.canonical,
+            "prior_updated_at": self.prior_updated_at,
+            "at": self.at,
+        }
+
+
+def _journal_refusal(why: str) -> EpicRebindError:
+    return EpicRebindError(
+        f"{COMMAND} cannot read its journal of applied rebinds ({JOURNAL_NAME} in the state "
+        f"directory): {why}. Nothing was changed; it is the controller's own record, so "
+        "inspect it. Moving it aside is safe: a repeat of a rebind applied before then is "
+        "refused instead of reported as already applied, and nothing else reads it"
+    )
+
+
+def _transition(raw: object, index: int) -> RebindTransition:
+    where = f"transition {index}"
+    if not isinstance(raw, dict) or sorted(raw) != sorted(_TRANSITION_KEYS):
+        raise _journal_refusal(f"{where} is not an object of exactly {list(_TRANSITION_KEYS)}")
+    values = {key: raw[key] for key in _TRANSITION_KEYS}
+    if not all(isinstance(v, str) for v in values.values()):
+        raise _journal_refusal(f"{where} holds a value that is not a string")
+    if not RUN_ID_RE.fullmatch(values["run_id"]):
+        raise _journal_refusal(f"{where} names no run id")
+    for key in ("prior_updated_at", "at"):
+        if len(values[key]) > _MAX_TIMESTAMP_CHARS:
+            raise _journal_refusal(f"{where}: {key} is longer than {_MAX_TIMESTAMP_CHARS}")
+    refs = {}
+    for key in ("issue_url", "from_epic_url", "to_epic_url"):
+        ref = _ref(values[key])
+        if ref is None:
+            raise _journal_refusal(f"{where}: {key} is not an issue URL")
+        refs[key] = ref
+    return RebindTransition(
+        run_id=values["run_id"],
+        issue=refs["issue_url"],
+        old=refs["from_epic_url"],
+        new=refs["to_epic_url"],
+        prior_updated_at=values["prior_updated_at"],
+        at=values["at"],
+    )
+
+
+def parse_journal(data: bytes | None) -> list[RebindTransition]:
+    """The journal's transitions, oldest first; ``[]`` when there is none (``None``).
+
+    Strict: a file that is not UTF-8 JSON of exactly ``{"schema": 1,
+    "transitions": [...]}``, with at most :data:`MAX_JOURNAL_TRANSITIONS`
+    entries of exactly the six string keys, is :class:`EpicRebindError`,
+    never a journal read as empty.
+    """
+    if data is None:
+        return []
+    try:
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise _journal_refusal(f"it is not UTF-8 JSON ({exc})") from None
+    if not isinstance(document, dict) or sorted(document) != ["schema", "transitions"]:
+        raise _journal_refusal("it is not an object of exactly 'schema' and 'transitions'")
+    if document["schema"] != JOURNAL_SCHEMA or isinstance(document["schema"], bool):
+        raise _journal_refusal(f"its schema is {document['schema']!r:.40}, not {JOURNAL_SCHEMA}")
+    entries = document["transitions"]
+    if not isinstance(entries, list) or len(entries) > MAX_JOURNAL_TRANSITIONS:
+        raise _journal_refusal(
+            f"'transitions' is not a list of at most {MAX_JOURNAL_TRANSITIONS} entries"
+        )
+    return [_transition(raw, i) for i, raw in enumerate(entries)]
+
+
+def render_journal(transitions: Sequence[RebindTransition]) -> bytes:
+    """The journal holding ``transitions``, the newest :data:`MAX_JOURNAL_TRANSITIONS`."""
+    kept = list(transitions)[-MAX_JOURNAL_TRANSITIONS:]
+    document = {"schema": JOURNAL_SCHEMA, "transitions": [t.document() for t in kept]}
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def applied_transition(
+    transitions: Sequence[RebindTransition], state: AutoForgeState
+) -> RebindTransition | None:
+    """The transition that bound the run to the EPIC it records, when the journal has it.
+
+    The latest of this run's entries to the recorded EPIC. It is the one in
+    effect: an entry is written before its save, so a later entry to the
+    same EPIC whose save never happened would have found the run recording
+    another EPIC, and the run could only have come back to this one through
+    a save after an entry later still.
+    """
+    recorded = _ref(state.epic_url)
+    if recorded is None:
+        return None
+    for transition in reversed(transitions):
+        if transition.run_id == state.run_id and transition.new.same_target(recorded):
+            return transition
+    return None
+
+
+def repeat_problem(
+    state: AutoForgeState, request: RebindRequest, transitions: Sequence[RebindTransition]
+) -> str:
+    """Why a request whose ``--to`` the run records is not a repeat ("" when it is one).
+
+    A repeat names the issue and ``--from`` of :func:`applied_transition`.
+    A run that records ``--to`` without one (bound so when it was created, or
+    the entry dropped past the bound) and a request with another issue or
+    ``--from`` are no repeat of anything that happened, and refuse.
+    """
+    applied = applied_transition(transitions, state)
+    new = request.new.canonical
+    if applied is None:
+        return (
+            f"the run records --to {new} already, and no rebind of run {state.run_id} to it "
+            f"is in its journal ({JOURNAL_NAME}): it has recorded it since it was created, "
+            "or the entry is gone, so this request repeats no rebind that happened; nothing "
+            "needs rebinding, and nothing was changed"
+        )
+    if not applied.old.same_target(request.old) or not applied.issue.same_target(request.issue):
+        return (
+            f"the run records --to {new} since its rebind from {applied.old.canonical} for "
+            f"issue {applied.issue.canonical} at {applied.at}, and this request names --from "
+            f"{request.old.canonical} for --issue {request.issue.canonical}: it is not a "
+            "repeat of that rebind, so it is refused rather than reported as already applied; "
+            "nothing needs rebinding, and nothing was changed"
+        )
+    return ""
+
+
+def records_target(state: AutoForgeState, request: RebindRequest) -> bool:
+    """Whether the run records ``--to`` already: a repeat, or a conflicting request."""
     recorded = _ref(state.epic_url)
     return recorded is not None and recorded.same_target(request.new)
+
+
+def is_already_bound(
+    state: AutoForgeState, request: RebindRequest, transitions: Sequence[RebindTransition]
+) -> bool:
+    """The run records ``--to`` by the very rebind ``request`` names: nothing to do."""
+    return records_target(state, request) and not repeat_problem(state, request, transitions)
 
 
 def identity_problems(state: AutoForgeState, request: RebindRequest) -> list[str]:
@@ -202,11 +404,19 @@ def identity_problems(state: AutoForgeState, request: RebindRequest) -> list[str
     return problems
 
 
-def stale_problem(state: AutoForgeState, request: RebindRequest) -> str:
-    """Why ``--from`` is not the EPIC the run records ("" when it is)."""
+def stale_problem(
+    state: AutoForgeState, request: RebindRequest, transitions: Sequence[RebindTransition] = ()
+) -> str:
+    """Why ``--from`` is not the EPIC the run records ("" when it is).
+
+    A run that records ``--to`` instead is judged by :func:`repeat_problem`
+    on the journal's ``transitions``.
+    """
     recorded = _ref(state.epic_url)
     if recorded is not None and recorded.same_target(request.old):
         return ""
+    if records_target(state, request):
+        return repeat_problem(state, request, transitions)
     return (
         f"the run records EPIC {state.epic_url or '(none)'}, not --from "
         f"{request.old.canonical}: the expected EPIC is stale, so nothing is changed; read "
@@ -301,16 +511,51 @@ def pending_batch(state: AutoForgeState) -> list[str]:
     return list(state.counted_merged_prs[-n:]) if n > 0 else []
 
 
-def state_problems(state: AutoForgeState, request: RebindRequest) -> list[str]:
+def _same_pr(first: str, second: str) -> bool:
+    try:
+        return parse_pr_url(first).same_target(parse_pr_url(second))
+    except ConfigurationError:
+        return False
+
+
+def own_merge_problem(state: AutoForgeState) -> str:
+    """Why the run's own counted merge refuses ("" when its PR is not counted).
+
+    MERGE counts the PR in the save that enters ``UPDATE_EPIC``, so a
+    counted one is an ``UPDATE_EPIC`` of this issue and PR on the recorded
+    EPIC: next, or already entered and stopped. An entry that blocked before
+    its first journal keeps nothing of what it found there (see the module
+    docstring), so whether the recorded EPIC already holds this issue's
+    progress comment or roadmap line cannot be ruled out from the state.
+    """
+    own = state.current_pr_url
+    if not own or not any(_same_pr(own, url) for url in state.counted_merged_prs):
+        return ""
+    return (
+        f"the run's PR {own} is merged and counted (counted_merged_prs), so UPDATE_EPIC of "
+        f"this issue runs next on the recorded EPIC {state.epic_url} or already ran there and "
+        "stopped; a BLOCKED run keeps no record of what such an entry found or wrote (a "
+        "progress comment it refused to adopt, a listing it could not read, what an agent of "
+        "the previous contract published), so a write to the recorded EPIC cannot be ruled "
+        "out and a rebind would let UPDATE_EPIC write to --to as well: use the manual "
+        "fallback in docs/usage.md"
+    )
+
+
+def state_problems(
+    state: AutoForgeState, request: RebindRequest, transitions: Sequence[RebindTransition] = ()
+) -> list[str]:
     """Every reason the loaded run may not be rebound by ``request``, each with what to do.
 
     Identity first (another run, issue or repository), then a stale
-    ``--from``, then what the run holds (see the module docstring). Empty
-    when the state allows the rebind; GitHub's answer is
-    :func:`parent_problems`'.
+    ``--from`` (or, for a run that records ``--to``, a request that repeats
+    no transition of the journal's ``transitions``), then what the run
+    holds (see the module docstring). Empty when the state allows the
+    rebind; GitHub's answer is :func:`parent_problems`' and
+    :func:`recorded_epic_problems`'.
     """
     problems = identity_problems(state, request)
-    stale = stale_problem(state, request)
+    stale = stale_problem(state, request, transitions)
     if stale:
         problems.append(stale)
     recorded = _ref(state.epic_url)
@@ -354,10 +599,12 @@ def state_problems(state: AutoForgeState, request: RebindRequest) -> list[str]:
             "sub-issues, rendered into the next UPDATE_EPIC prompt, and a rebind would hand "
             "them to another EPIC's selection; see the manual fallback in docs/usage.md"
         )
-    batch = pending_batch(state)
+    own_merge = own_merge_problem(state)
+    if own_merge:
+        problems.append(own_merge)
     own = state.current_pr_url
-    if batch and batch != [own]:
-        others = [url for url in batch if url != own]
+    others = [url for url in pending_batch(state) if not (own and _same_pr(own, url))]
+    if others:
         problems.append(
             f"{state.merged_since_epic_update} merge(s) are counted for the next roadmap "
             f"update of the recorded EPIC, {len(others)} of them another issue's PR ("
@@ -398,17 +645,22 @@ def _read(reader: ParentReader, ref: GitHubIssueRef, role: str) -> IssueNode:
     try:
         return reader.get_issue_node(ref.canonical)
     except (GitHubError, ExecutionError) as exc:
-        kind: type[GitHubError]
-        if isinstance(exc, GitHubUnavailableError):
-            kind = GitHubUnavailableError
-        elif isinstance(exc, GitHubNotFoundError):
-            kind = GitHubNotFoundError
-        else:
-            kind = GitHubError
-        raise kind(
-            f"{COMMAND}: reading {role} {ref.canonical} failed ({exc}). Nothing was changed; "
-            "a rebind is decided only on GitHub's complete answer"
-        ) from exc
+        raise _read_failure(exc, ref, role) from exc
+
+
+def _read_failure(exc: Exception, ref: GitHubIssueRef, role: str) -> GitHubError:
+    """A failed read as the rebind reports it: the client's class kept, context added."""
+    kind: type[GitHubError]
+    if isinstance(exc, GitHubUnavailableError):
+        kind = GitHubUnavailableError
+    elif isinstance(exc, GitHubNotFoundError):
+        kind = GitHubNotFoundError
+    else:
+        kind = GitHubError
+    return kind(
+        f"{COMMAND}: reading {role} {ref.canonical} failed ({exc}). Nothing was changed; "
+        "a rebind is decided only on GitHub's complete answer"
+    )
 
 
 def _parent_shown(parent: GitHubIssueRef | None) -> str:
@@ -486,6 +738,77 @@ def parent_problems(request: RebindRequest, observation: ParentObservation) -> l
     return problems
 
 
+@dataclass(frozen=True)
+class RecordedEpicObservation:
+    """What the recorded EPIC's complete comment listing says of the issue's progress.
+
+    ``comments`` is how many comments were read, ``progress_urls`` the ones
+    whose progress marker names the run's issue (any PR), and ``defect``
+    why a progress marker on it could not be read ("" when none).
+    """
+
+    epic: GitHubIssueRef
+    issue: GitHubIssueRef
+    comments: int
+    progress_urls: tuple[str, ...]
+    defect: str
+
+
+def observe_recorded_epic(
+    reader: ParentReader, state: AutoForgeState
+) -> RecordedEpicObservation | None:
+    """Read the recorded EPIC's comments for a progress comment of the run's issue.
+
+    ``UPDATE_EPIC`` posts one comment carrying the progress marker of
+    (issue, PR) on the EPIC it records, and before posting it asks the
+    complete listing whether one exists. A rebind asks the same listing of
+    the EPIC it leaves, for any PR of the issue: one there (posted by an
+    earlier entry, an agent of the previous contract, or a human) would stay
+    while the rebound run posts its own on ``--to``. The listing is read to
+    its end or not at all (:meth:`~autoforge.github.GitHubClient.get_issue_comments`);
+    a failed read raises the client's error. None when the state names no
+    readable EPIC or issue (its refusal is :func:`state_problems`').
+    """
+    epic, issue = _ref(state.epic_url), _ref(state.current_issue_url)
+    if epic is None or issue is None:
+        return None
+    try:
+        comments = reader.get_issue_comments(epic.canonical)
+    except (GitHubError, ExecutionError) as exc:
+        raise _read_failure(exc, epic, "the comments of the recorded EPIC") from exc
+    collection = collect(PROGRESS, comments, "comment")
+    try:
+        grouped = collection.grouped(
+            lambda claim: claim.issue.same_target(issue),
+            f"issue {issue.canonical} on EPIC {epic.canonical}",
+        )
+    except ClaimConflictError as exc:
+        return RecordedEpicObservation(epic, issue, len(comments), (), _shown_error(exc))
+    urls = sorted({holder.obj.url for holders in grouped.values() for holder in holders})
+    return RecordedEpicObservation(epic, issue, len(comments), tuple(urls), "")
+
+
+def recorded_epic_problems(observation: RecordedEpicObservation) -> list[str]:
+    """Why the recorded EPIC's comments refuse the rebind: one for the issue, or unreadable."""
+    epic, number = observation.epic.canonical, observation.issue.number
+    if observation.defect:
+        return [
+            f"whether the recorded EPIC {epic} already carries a progress comment for issue "
+            f"#{number} cannot be established: {observation.defect}. A rebind is made only "
+            "when it does not; repair or remove the unreadable marker, or use the manual "
+            "fallback in docs/usage.md"
+        ]
+    if observation.progress_urls:
+        return [
+            f"the recorded EPIC {epic} already carries {len(observation.progress_urls)} "
+            f"progress comment(s) for issue #{number} ("
+            + ", ".join(observation.progress_urls)
+            + "): a rebind would leave it there and let UPDATE_EPIC post another on --to; "
+            "use the manual fallback in docs/usage.md"
+        ]
+    return []
+
+
 # -- the report -------------------------------------------------------------------------
 
 
@@ -495,7 +818,8 @@ class RebindReport:
 
     ``decision`` is ``would-rebind`` / ``rebound`` / ``already-bound`` /
     ``refused`` (``would-refuse`` for a dry run). ``observation`` is GitHub's
-    answer when it was read, ``read_error`` the failed read otherwise
+    answer about the parent when it was read, ``recorded_epic`` what the
+    recorded EPIC's comments said, ``read_error`` the failed read otherwise
     (``""`` when no read was made).
     """
 
@@ -513,6 +837,7 @@ class RebindReport:
     decision: str = ""
     problems: list[str] = field(default_factory=list)
     observation: ParentObservation | None = None
+    recorded_epic: RecordedEpicObservation | None = None
     read_error: str = ""
     notes: list[str] = field(default_factory=list)
     apply_command: str = ""
@@ -572,8 +897,23 @@ class RebindReport:
             f"  recorded EPIC: {self.recorded_epic_url or '(none)'} ({expected})",
             f"  --to:          #{req.new.number} {req.new.canonical}" + to_state,
             f"  native parent: {parent}",
-            f"  reason:        {req.reason}",
         ]
+        old_epic = self.recorded_epic
+        if old_epic is not None:
+            if old_epic.defect:
+                found = f"unreadable ({old_epic.defect})"
+            elif old_epic.progress_urls:
+                found = ", ".join(old_epic.progress_urls)
+            else:
+                found = "none"
+            out.append(
+                f"  old progress:  {found} (progress comments for #{req.issue.number} on the "
+                f"recorded EPIC, {old_epic.comments} comment(s) read)"
+            )
+        elif observed is not None and self.read_error:
+            # The parent was read; the recorded EPIC's comments were not.
+            out.append(f"  old progress:  not read: {self.read_error}")
+        out.append(f"  reason:        {req.reason}")
         for note in self.notes:
             out.append(f"  note:          {note}")
         out.append(f"  decision:      {self._decision_text()}")
@@ -602,6 +942,7 @@ class RebindReport:
     def record(self) -> dict[str, object]:
         """The run log's record of the decision: identities, URLs, reason, outcome."""
         observed = self.observation
+        old_epic = self.recorded_epic
         return {
             "decision": self.decision,
             "operator_reason": self.request.reason,
@@ -618,6 +959,10 @@ class RebindReport:
             ),
             "issue_state": observed.issue_state if observed else None,
             "to_epic_state": observed.new_epic_state if observed else None,
+            "recorded_epic_progress_comments": (
+                list(old_epic.progress_urls) if old_epic is not None else None
+            ),
+            "recorded_epic_comments_read": old_epic.comments if old_epic is not None else None,
             "read_error": self.read_error,
             "problems": list(self.problems),
             "prior_updated_at": self.prior_updated_at,
@@ -682,12 +1027,6 @@ def informational_notes(state: AutoForgeState, request: RebindRequest) -> list[s
         notes.append(
             f"{len(on_epic)} operator action outcome(s) name comments on the recorded EPIC; "
             "they are evidence of what was verified there and stay as they are"
-        )
-    batch = pending_batch(state)
-    if batch and batch == [state.current_pr_url]:
-        notes.append(
-            "this issue's merged PR is counted for the next roadmap update; after the rebind "
-            "UPDATE_EPIC reports it on --to"
         )
     return notes
 

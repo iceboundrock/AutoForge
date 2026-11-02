@@ -26,18 +26,29 @@ which discards the run, or editing `state.json`. Now:
   the merge gate. `--dry-run` reads and prints the decision and writes
   nothing;
 - it is deliberately narrow, and refuses (exit 2, nothing changed) rather
-  than migrate anything: only a standalone run, only in `READY_FOR_MERGE`
-  or `BLOCKED`, only with no effect record, entry observation, completion
+  than migrate anything: only a standalone run whose state directory is in
+  the repository the command runs in (so the controller lock it takes is
+  the run's own; another clone's state, a namespace in another repository's
+  git directory, or a state directory in no repository is refused), only in
+  `READY_FOR_MERGE` or `BLOCKED`, only before the run's own PR is merged
+  and counted, only with no effect record, entry observation, completion
   context, replan journal, rejected `UPDATE_EPIC` selection or another
   issue's counted merge, only to the issue's open native parent on GitHub,
-  and only when `--from` is the EPIC the run records now. A failed GitHub
+  only when the old EPIC carries no progress comment for the issue, and
+  only when `--from` is the EPIC the run records now. A failed GitHub
   read exits 1;
-- the decision goes to the run log before the state's atomic save, so an
-  interruption leaves the old or the new binding; a repeat of an applied
-  rebind reports `already bound`.
+- the preview reports a held controller lock and a scheduler's issue as
+  the applied command would refuse them, without taking the lock or
+  writing a lock file;
+- the decision goes to the run log and the transition to
+  `<state dir>/epic-rebinds.json` before the state's atomic save, so an
+  interruption leaves the old or the new binding. A repeat of that very
+  rebind reports `already bound`; a request that only names the recorded
+  EPIC as `--to` (another `--from`, or a run bound so since it was
+  created) is refused.
 
-Runs blocked or stopped in `UPDATE_EPIC` with writes on the old EPIC still
-need the manual fallback the guide describes. See
+Runs that reached `UPDATE_EPIC` (their PR counted), or with writes on the
+old EPIC, still need the manual fallback the guide describes. See
 [Rebinding a run to its issue's parent](docs/usage.md#rebinding-a-run-to-its-issues-parent).
 
 ### A new run records the issue's native parent as its EPIC, and `--epic` is the fallback (#293)

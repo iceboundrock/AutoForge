@@ -61,6 +61,8 @@ a *close-only* release before its descriptor is handed out, and
 record. The last ``close`` anywhere releases the lock, so surviving workers
 keep the repository closed after their scheduler died. Only an inherited
 descriptor proves a worker: no environment variable, PID file or claim.
+:func:`controller_lock_live` asks, lock-free and writing nothing, whether
+anything holds L0 now (a read-only preview's question, #435).
 
 **L2, per-issue run** (:class:`IssueRunLock`):
 ``<common>/autoforge/scheduler/issues/<n>/run.lock``, opened with the same
@@ -555,6 +557,41 @@ def _open_fresh_root(root: Path) -> int:
         raise LockProofError(
             f"the coordination root {root} cannot be opened afresh to prove its lock: {exc}"
         ) from exc
+
+
+def controller_lock_live(coordination_root: str | Path) -> bool:
+    """Whether some process holds L0 of ``coordination_root`` now; lock-free, writes nothing.
+
+    The read-only preview's question (``rebind-epic --dry-run``, #435): the
+    coordination root is opened afresh ``O_RDONLY | O_DIRECTORY |
+    O_NOFOLLOW | O_CLOEXEC``, as :func:`prove_held` opens it, ``LOCK_SH |
+    LOCK_NB`` is tried and the descriptor is closed at once. ``EWOULDBLOCK``
+    is a holder (a standalone controller, a scheduler or its surviving
+    workers). Nothing is created, truncated or written: no ``autoforge``
+    directory, no ``controller.lock``, no PID. A probe that collides with an
+    :meth:`ControllerLock.acquire` makes only that acquisition fail with
+    LockError, nothing written, as D8.3 accepts for L2's probe. The answer
+    is a snapshot: a command that acts on it takes L0 itself and decides
+    again under it. A root that cannot be opened or probed is a LockError:
+    the caller cannot tell, and reports it as such.
+    """
+    root = Path(coordination_root)
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise LockError(f"cannot probe the controller lock of {root}: {exc}") from exc
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError as exc:
+            raise LockError(
+                f"cannot probe the controller lock of {root}: flock failed: {exc}"
+            ) from exc
+        return False
+    finally:
+        os.close(fd)  # also drops the shared probe lock
 
 
 def _open_lock_file(root: Path, relpath: str, *, create: bool, what: str) -> int:
