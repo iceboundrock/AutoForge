@@ -1217,7 +1217,15 @@ a stated reason it has none. The coverage that must keep working:
   a conflict, two comments are a conflict without an exact read, a failed
   exact read verifies nothing, a comment `gh` prints as it is takes no
   exact read, and REVIEW's operator evidence reports such a comment
-  unchanged and a failed exact read as unreadable
+  unchanged and a failed exact read as unreadable; one version on both
+  reads (PR #445, also `tests/test_github.py`, `tests/test_read_context.py`):
+  `gh_prints_as` takes every upstream vector's print and refuses an edit
+  before, between, inside or after a rewrite; a roadmap a human rewrites
+  between `gh`'s read and the exact read is read again and the agent is
+  shown the section of the body it binds, and one rewritten between every
+  pair blocks with nothing launched or written; an operator comment edited
+  between the listing and its exact read, either way, is reported as
+  changed while read, with no body quoted and no digest compared
 - the empty rollup and the plan limit (#289, `tests/test_engine.py`,
   `tests/test_github.py`, `tests/test_doctor.py`): in `READY_FOR_MERGE`
   and `MERGE` a rollup read and empty is `BLOCKED` with defaults, with

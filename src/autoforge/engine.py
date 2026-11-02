@@ -207,6 +207,7 @@ from .effect_ops import (
     append_problem,
     drive,
     gh_may_rewrite,
+    gh_prints_as,
     held_issue,
     held_pr,
     operation_for,
@@ -699,6 +700,10 @@ MERGE_GATE_MESSAGE = (
 MAX_NEXT_ISSUE_SELECTIONS = 2
 # How many of the issues that remain a refused `null` names (#287).
 _MAX_REMAINING_SHOWN = 10
+# How many times the UPDATE_EPIC entry reads the EPIC body through `gh` and
+# exactly to find the two reads of one version (#328): an edit between the
+# two reads is read again once, a second one blocks.
+EPIC_BODY_READ_ATTEMPTS = 2
 
 # `mergeStateStatus` values under which the controller is willing to call
 # `gh pr merge`. Everything else is a conclusive "not now" (BLOCKED) except
@@ -1637,7 +1642,9 @@ class ControllerEngine:
         self._epic_roadmap_at_entry: RoadmapSplit | None = None
         # The current section as `gh` printed it, handed to the agent as
         # ``CURRENT_ROADMAP_SECTION``: an agent is shown `gh`'s sanitized
-        # read, never the exact read's text (#327, #328).
+        # read, never the exact read's text (#327, #328). It is the print of
+        # the body ``_epic_roadmap_at_entry`` holds, never of another version
+        # (``_read_epic_bodies``).
         self._epic_section_shown: str | None = None
         # The follow-up issues already open for this PR from earlier rounds,
         # as (finding id, issue URL): found by the REVIEW and FIX entries and
@@ -3816,6 +3823,10 @@ class ControllerEngine:
         evidence's digest is of GitHub's text, so where that print holds a
         ``^`` the digest compared is the exact read's (#328), and a
         ``bound`` digest, taken from a print, is compared with the print.
+        The quote and the digest are of one version of the comment: an exact
+        read that is not the listing's print (:func:`gh_prints_as`, the
+        comment was edited between the two reads) is reported as a comment
+        that changed while it was read, with neither quoted nor compared.
         """
         s = self._require_state()
         listings: dict[str, list[CommentInfo] | str] = {}
@@ -3824,6 +3835,7 @@ class ControllerEngine:
             current: str | None = None
             digest = ""
             failed = ""
+            changed_while_read = False
             if o["outcome"] == "verified":
                 target = o["target"]
                 if target not in listings:
@@ -3844,11 +3856,14 @@ class ControllerEngine:
                         and gh_may_rewrite(current)
                     ):
                         try:
-                            digest = sha256_text(
-                                self.github.get_comment_exact(o["comment_url"]).body
-                            )
+                            held = self.github.get_comment_exact(o["comment_url"]).body
                         except GitHubError as exc:
-                            current, failed = None, type(exc).__name__
+                            current, digest, failed = None, "", type(exc).__name__
+                        else:
+                            if gh_prints_as(held, current):
+                                digest = sha256_text(held)
+                            else:
+                                current, digest, changed_while_read = None, "", True
             entries.append(
                 OperatorEvidence(
                     action_id=o["action_id"],
@@ -3864,6 +3879,7 @@ class ControllerEngine:
                     current=current,
                     current_sha256=digest,
                     unreadable=failed,
+                    changed_while_read=changed_while_read,
                 )
             )
         return render_operator_evidence(entries)
@@ -11042,7 +11058,20 @@ class ControllerEngine:
         """Read the EPIC body before a launch; block on a conclusive failure."""
         state = self._require_state()
         try:
-            printed, held = self._read_epic_bodies()
+            bodies = self._read_epic_bodies()
+            if bodies is None:
+                return self._block(
+                    Phase.UPDATE_EPIC,
+                    plan,
+                    f"the body of EPIC {state.epic_url} changed between `gh`'s read and its "
+                    f"exact read, {EPIC_BODY_READ_ATTEMPTS} times in a row: the controller "
+                    "will not show the agent the roadmap section of one version and splice "
+                    "its answer into another, so no agent was launched and nothing was "
+                    "written. Let the edits of the EPIC settle, then 'unblock' (it reads the "
+                    "body again)",
+                    code=StopReasonCode.GITHUB_READ_FAILED,
+                )
+            printed, held = bodies
             self._epic_roadmap_at_entry = split_roadmap(held)
             self._epic_section_shown = (
                 self._epic_roadmap_at_entry.section
@@ -11096,26 +11125,43 @@ class ControllerEngine:
             "launched)",
         )
 
-    def _read_epic_bodies(self) -> tuple[str, str]:
-        """The EPIC body as `gh` printed it, and as GitHub holds it (#328).
+    def _read_epic_bodies(self) -> tuple[str, str] | None:
+        """The EPIC body as `gh` printed it, and as GitHub holds it, of one version (#328).
 
         The controller writes the whole body back around its section, so the
         digests and the splice need GitHub's text: `gh` prints the text of an
         escape, or a control character, in an operator's EPIC as caret
-        notation, which a write would put in their place. A print without a
-        ``^`` is GitHub's text (the same string twice, no extra request);
-        one with a ``^`` is read again exactly (``get_issue_exact``), and a
-        failure of that read is classified as the first one's.
+        notation, which a write would put in their place. The agent is shown
+        the section of the print, so the two must be one version of the body:
+        the entry binds the agent's answer to the exact text, and a section
+        shown from an older print would be spliced over a newer one. A print
+        without a ``^`` is GitHub's text (the same string twice, no extra
+        request). One with a ``^`` is read again exactly
+        (``get_issue_exact``), and the pair is kept only when the print is
+        the exact text's (:func:`gh_prints_as`); an edit between the two
+        reads is read again, both reads, up to
+        :data:`EPIC_BODY_READ_ATTEMPTS` times, and ``None`` after that (the
+        caller blocks). A failure of either read is classified as any read's.
         """
         state = self._require_state()
-        printed = self.github.get_issue(state.epic_url).body
-        if not gh_may_rewrite(printed):
-            return printed, printed
-        return printed, self.github.get_issue_exact(state.epic_url).body
+        for _ in range(EPIC_BODY_READ_ATTEMPTS):
+            printed = self.github.get_issue(state.epic_url).body
+            if not gh_may_rewrite(printed):
+                return printed, printed
+            held = self.github.get_issue_exact(state.epic_url).body
+            if gh_prints_as(held, printed):
+                return printed, held
+        return None
 
     def _read_epic_roadmap(self) -> RoadmapSplit:
-        """The EPIC body as GitHub holds it now, split around its managed section."""
-        return split_roadmap(self._read_epic_bodies()[1])
+        """The EPIC body as GitHub holds it now, split around its managed section.
+
+        The splice's reads use GitHub's text alone, never a print, so they
+        need no pair: `gh`'s read, or its exact read where it printed a
+        ``^`` (:func:`held_issue`).
+        """
+        state = self._require_state()
+        return split_roadmap(held_issue(self.github, state.epic_url).body)
 
     # ======================================================================
     # REPLAN_REEXECUTE

@@ -401,6 +401,56 @@ def gh_may_rewrite(printed: str) -> bool:
     return "^" in printed
 
 
+def _gh_caret(code: int) -> str | None:
+    """The caret notation `gh`'s sanitizer prints for the character ``code``, or ``None``.
+
+    go-gh's asciisanitizer rewrites every C0 and C1 control character but
+    tab, line feed, vertical tab and carriage return: ``^`` and the
+    character 0x40 above it (C1 as C0), with 0x1C as ``^\\``.
+    """
+    if code in (0x09, 0x0A, 0x0B, 0x0D) or not (code < 0x20 or 0x80 <= code < 0xA0):
+        return None
+    low = code % 0x80
+    return "^" + ("\\" if low == 0x1C else chr(0x40 + low))
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def gh_prints_as(text: str, printed: str) -> bool:
+    """Whether ``printed``, a text `gh` printed, can be its print of GitHub's ``text`` (#328).
+
+    The sanitizer changes nothing but a control character (``\\x1b`` as
+    ``^[``) and the text of its JSON escape after a backslash (``\\u001b``
+    as ``\\^[``), each into caret notation; every other character is printed
+    as it is. ``printed`` is that print when it is ``text`` with some of
+    those rewritten. Which ones does not matter (GitHub may send a
+    backspace or form feed as a short escape, which the sanitizer leaves),
+    but any other difference does: the two reads saw different texts. Caret
+    notation is lossy, so a text that differs from ``text`` only where the
+    sanitizer rewrites (the literal ``^[`` for ``\\x1b``) also passes; it
+    prints the same, so whatever was shown from ``printed`` is what GitHub
+    holds. Every rewrite starts with a ``^`` and no rewritten character is
+    one, so where the two texts agree a character is never a rewrite: the
+    comparison is one pass.
+    """
+    i = j = 0
+    while i < len(text):
+        char = text[i]
+        if j < len(printed) and printed[j] == char:
+            i, j = i + 1, j + 1
+            continue
+        caret, width = _gh_caret(ord(char)), 1
+        if caret is None and char in "uU" and i > 0 and text[i - 1] == "\\":
+            digits = text[i + 1 : i + 5]
+            if len(digits) == 4 and _HEX_DIGITS.issuperset(digits):
+                caret, width = _gh_caret(int(digits, 16)), 5
+        if caret is None or not printed.startswith(caret, j):
+            return False
+        i, j = i + width, j + len(caret)
+    return j == len(printed)
+
+
 def held_pr(github: GitHubClient, url: str) -> PRInfo:
     """The PR with its body as GitHub holds it, to compose or judge a write on (#328).
 
@@ -1329,6 +1379,7 @@ __all__ = [
     "ReviewCommentOp",
     "drive",
     "gh_may_rewrite",
+    "gh_prints_as",
     "held_issue",
     "held_pr",
     "operation_for",

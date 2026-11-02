@@ -1367,12 +1367,43 @@ a print when the operator binds a comment and compared with later prints
 of that comment, so it is consistent, and moving it to the exact text
 would invalidate bindings already saved.
 
+**One version on both reads (#328, PR #445).** Two of these paths show a
+print of the object and judge or bind its exact text, so the print and the
+exact text must be one version of it: an edit between the two reads would
+otherwise pair the text shown with another text's digests.
+`effect_ops.gh_prints_as` tells. The sanitizer changes nothing but a
+control character and the text of its escape after a backslash, each into
+caret notation, so a print is the exact text's when every difference
+between them is one of those rewrites; any other difference is an edit
+between the reads. Caret notation is lossy, so a text that differs only
+where the sanitizer rewrites (the literal `^[` where an ESC was) passes
+too, and prints the same.
+
+- The `UPDATE_EPIC` entry shows the agent the section of the print and
+  binds its answer to the digests of the exact text
+  (`engine._read_epic_bodies`). A pair that is two versions is read again,
+  both reads, `EPIC_BODY_READ_ATTEMPTS` (2) times in all; a second such
+  pair blocks (`github-read-failed`) before anyone is launched, with
+  nothing written, and `unblock` reads again. A section shown from an older
+  print is never spliced over a newer body, even when the bytes outside
+  the markers are unchanged (which the splice alone would accept). The
+  splice's own reads use the exact text alone and need no pair.
+- REVIEW's `operator-evidence.md` quotes the listing's print and compares
+  the exact read's digest. An exact read that is not the listing's print is
+  reported as a comment that changed while it was read: neither body is
+  quoted and no digest is compared, so an edited quote is never shown "with
+  the observed digest", nor the observed body beside another version's.
+
+K10's own verification (`OperatorCommentOp._held`), K3 and K6 judge the
+exact text alone and show no print, so they need no pair.
+
 **Terminal protection is not turned off.** Everything `gh` prints still
 goes through its sanitizer. The exact read's text is compared and then
 dropped: it is never printed, logged, put in a conflict reason or an
 error, or handed to an agent. The read context an agent gets is still
 `gh`'s sanitized read, and so are the roadmap section an `UPDATE_EPIC`
-prompt quotes and the comment body `operator-evidence.md` quotes. A body
+prompt quotes and the comment body `operator-evidence.md` quotes, each
+the print of the exact text the controller judges (above). A body
 the controller writes back is the one exception by design: it goes to
 GitHub as GitHub held it.
 

@@ -26,6 +26,14 @@ so.
   composed against the print is asked for again on `resume`, and an
   operator comment it would not verify is verified by `unblock`
   ([GitHub safety](docs/agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)).
+- What the controller shows and what it judges are one version. The
+  `UPDATE_EPIC` prompt quotes `gh`'s print of the roadmap section while the
+  splice is bound to the exact text, and REVIEW's operator evidence quotes
+  `gh`'s print of a comment while it compares the exact text's digest. A
+  print that is not the exact text's (an edit between the two reads) is
+  never paired with it: the EPIC is read again, and blocks before any
+  launch when it changes again; the operator comment is reported as having
+  changed while it was read, with no body quoted and no digest compared.
 
 ### `rebind-epic` moves an existing standalone run to its issue's native parent, and `status` warns when they differ (#435)
 

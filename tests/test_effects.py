@@ -54,6 +54,7 @@ from autoforge.effect_ops import (
     ReplacementPrOp,
     ReviewCommentOp,
     drive,
+    gh_prints_as,
     operation_for,
     raise_conflict,
     verify,
@@ -2844,6 +2845,59 @@ def test_a_hostile_remote_text_is_compared_and_never_quoted(case):
         assert url in text
         for fragment in ("\x1b", "\x9b", "\x07", "attacker.example", SECRET, "^[", "quoted"):
             assert fragment not in text
+
+
+# -- one version on both reads: `gh`'s print and the exact text (#328) -------------------
+
+# Texts `gh` prints otherwise: escape text after one and two backslashes, C0 and C1
+# control characters (0x1C as ``^\\``), a backspace and form feed, and caret text.
+PRINTED_OTHERWISE = [
+    "the log shows `\\u001b[0m`; `\\\\U001B` too",
+    "a real \x1b[1mESC\x1b[0m, \x9b31m, \x1c and \x00",
+    "a backspace \x08 and a form feed \x0c",
+    "stop the watcher with ^C, or \x03",
+]
+
+
+@pytest.mark.parametrize("text", PRINTED_OTHERWISE)
+def test_gh_prints_as_accepts_gh_s_print_of_the_text(text):
+    """A print of ``text``, and ``text`` itself, are one version: every difference is
+    one of the sanitizer's rewrites. So is a print that rewrote only some of them, as
+    `gh` does a backspace GitHub sends as a short escape."""
+    printed = gh_sanitized(text)
+    assert gh_prints_as(text, printed)
+    assert gh_prints_as(text, text)
+    assert gh_prints_as(text, printed.replace("^H", "\x08").replace("^L", "\x0c"))
+
+
+@pytest.mark.parametrize("text", PRINTED_OTHERWISE)
+def test_gh_prints_as_refuses_the_print_of_another_version(text):
+    """A print of an edited text is not ``text``'s, wherever the edit is: before,
+    between or inside rewrites, or a character added or dropped at the end."""
+    middle = len(text) // 2
+    edits = [
+        "edited: " + text,
+        text[:middle] + "#" + text[middle + 1 :],
+        text + ".",
+        text[:-1],
+        text.replace("^", "~").replace("\x1b", "\x1d").replace("u001", "u002"),
+    ]
+    for edited in (e for e in edits if e != text):
+        assert not gh_prints_as(text, gh_sanitized(edited)), edited
+    assert not gh_prints_as(text, "")
+    assert not gh_prints_as("", gh_sanitized(text))
+
+
+def test_gh_prints_as_reads_a_rewrite_only_where_the_sanitizer_makes_one():
+    """A caret stands for a control character or the text of its escape after a
+    backslash, never for plain text: ``u001b`` without a backslash, a tab, an escape of
+    a printable character and DEL print as they are."""
+    assert gh_prints_as("\\u001b", "\\^[")
+    assert not gh_prints_as("u001b", "^[")
+    assert not gh_prints_as("\\u0041", "\\^A")
+    assert not gh_prints_as("\\u001", "\\^[")
+    assert not gh_prints_as("\t", "^I") and not gh_prints_as("\x7f", "^?")
+    assert not gh_prints_as("\x1b", "^\\") and not gh_prints_as("\x1c", "^[")
 
 
 # -- `gh`'s sanitizer and an append's base (#328) --------------------------------------

@@ -77,6 +77,7 @@ from autoforge.result_parser import (
     published_markdown_problem,
 )
 from autoforge.state import MAX_ACCEPTANCE_OUTCOMES, MAX_DECLINES_PER_ROUND, load_state
+from autoforge.stop_classification import StopReasonCode
 from autoforge.transitions import Phase
 from autoforge.validation import parse_pr_url
 from tests.conftest import (
@@ -9114,6 +9115,96 @@ def test_update_epic_on_a_body_gh_prints_as_it_is_takes_no_exact_read(tmp_state_
     written = f"{OPERATOR_BODY}\n{ROADMAP_START}\n{ROADMAP}\n{ROADMAP_END}\n"
     assert fake_github.issues[EPIC].body == written
     assert [c for c in fake_github.calls if c[0].endswith("_exact")] == []
+
+
+# R1-F1 of PR #445: a roadmap a human rewrites while the entry reads the EPIC. Both
+# versions hold an ESC, so `gh` prints each with a ``^`` and the entry reads it exactly.
+STALE_SECTION = "old roadmap \x1b[2m(dim)\x1b[0m"
+
+
+def _edited_between_reads(gh, monkeypatch, edits: list[str]) -> list[str]:
+    """Each exact read of the EPIC first lands the next of ``edits`` (a human's edit
+    between `gh`'s read and the exact read); returns the edits not landed yet."""
+    exact = gh.get_issue_exact
+
+    def edited_then_read(url):
+        if url == EPIC and edits:
+            gh.issues[EPIC].body = edits.pop(0)
+        return exact(url)
+
+    monkeypatch.setattr(gh, "get_issue_exact", edited_then_read)
+    return edits
+
+
+def test_update_epic_shows_the_section_of_the_body_it_binds_when_the_roadmap_changes_between_reads(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """R1-F1 of PR #445: `gh` printed the old roadmap, and a human rewrote it before the
+    exact read. The pair is two versions, so the entry reads both again: the agent is
+    shown the section of the body whose digests bind its answer, never the stale one,
+    and the write replaces the section it was shown."""
+    fake_github.gh_sanitizes = True
+    fake_github.add_issue(ISSUE3, "Next")
+    before = _epic_body(STALE_SECTION, trailing="\nOperator note.\n")
+    newer = "roadmap a human rewrote \x1b[1m(now)\x1b[0m"
+    edited = before.replace(STALE_SECTION, newer)
+    seen = []
+
+    def agent(req):
+        seen.append(req.prompt)
+        return _epic_result(ISSUE3)
+
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, before)
+    _edited_between_reads(fake_github, monkeypatch, [edited])
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE" and "replaced the managed" in out.message
+    (prompt,) = seen
+    assert "roadmap a human rewrote ^[[1m(now)^[[0m" in prompt
+    assert "old roadmap" not in prompt
+    reads = [c for c in fake_github.calls if c in (("get_issue", EPIC), ("get_issue_exact", EPIC))]
+    pair = [("get_issue", EPIC), ("get_issue_exact", EPIC)]
+    assert reads[:4] == pair * 2  # the first pair was two versions: read again
+    assert fake_github.edited_issues == [(EPIC, edited.replace(newer, ROADMAP))]
+    assert load_state(eng.paths.state_file).merged_since_epic_update == 0
+
+
+def test_update_epic_blocks_when_the_roadmap_keeps_changing_between_reads(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """R1-F1 of PR #445: when every pair of reads is two versions, the stale section is
+    never shown and never written over: the entry blocks with no agent launched and
+    nothing written, even though the bytes outside the markers never changed (which
+    the splice alone would accept). 'unblock' reads again once the edits settle."""
+    fake_github.gh_sanitizes = True
+    before = _epic_body(STALE_SECTION)
+    edits = [before.replace(STALE_SECTION, f"edit {n} \x1b[1m!\x1b[0m") for n in range(3)]
+    seen = []
+
+    def agent(req):
+        seen.append(req.prompt)
+        return _epic_result(None)
+
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, before)
+    left = _edited_between_reads(fake_github, monkeypatch, list(edits))
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and eng.provider.calls == []
+    assert out.stop is not None and out.stop.code is StopReasonCode.GITHUB_READ_FAILED
+    s = load_state(eng.paths.state_file)
+    assert f"the body of EPIC {EPIC} changed between `gh`'s read and its exact read" in (
+        s.block_reason
+    )
+    assert "2 times in a row" in s.block_reason and "nothing was written" in s.block_reason
+    assert [c for c in fake_github.calls if c == ("get_issue_exact", EPIC)] == [
+        ("get_issue_exact", EPIC)
+    ] * 2
+    assert fake_github.edited_issues == [] and s.merged_since_epic_update == 1
+    assert fake_github.issues[EPIC].body == edits[1] and left == [edits[2]]
+    left.clear()  # the edits settle
+    assert eng.unblock("the EPIC's edits settled").unblocked
+    assert eng.step().next_phase == "DONE"
+    (prompt,) = seen
+    assert "edit 1 ^[[1m!^[[0m" in prompt and "old roadmap" not in prompt
+    assert fake_github.issues[EPIC].body == _epic_body(ROADMAP)
 
 
 def test_update_epic_roadmap_not_due_keeps_the_counter_and_writes_nothing(

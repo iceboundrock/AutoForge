@@ -246,7 +246,9 @@ class OperatorEvidence:
     The outcome fields are the controller's record; ``current`` is the
     comment's body as read for this launch (``None`` when the target's
     listing no longer holds it) and ``unreadable`` the error type when the
-    listing could not be read.
+    listing could not be read. ``changed_while_read`` says the comment was
+    edited between the listing and its exact read (#328): no body is quoted
+    and no digest compared, since the two are not one version.
     """
 
     action_id: str
@@ -262,6 +264,7 @@ class OperatorEvidence:
     current: str | None = None
     current_sha256: str = ""
     unreadable: str = ""
+    changed_while_read: bool = False
 
 
 _EVIDENCE_LABELS = {
@@ -314,6 +317,14 @@ def render_operator_evidence(entries: Iterable[OperatorEvidence]) -> str:
             lines += [
                 f"- Now: the target's comments could not be read for this launch "
                 f"({escape_inline(item.unreadable)})",
+                "",
+            ]
+            continue
+        if item.changed_while_read:
+            lines += [
+                "- Now: the comment changed while it was read for this launch (the target's "
+                "listing and its exact read are two versions of it), so its current body is "
+                "neither quoted nor compared with the observed digest",
                 "",
             ]
             continue
