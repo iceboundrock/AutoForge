@@ -1,0 +1,439 @@
+# ADR 0012. Recovery and escalation: who may act on a stop, and the advisor's two gates
+
+- **Status:** proposed with #370's pull request. Planning only. Written at
+  `main` `0ba238e` (2026-11-02), where every reference below was read.
+  #370's first acceptance criterion asks for a *signed-off* record. That
+  sign-off is a maintainer's acceptance on #370 or on this record's pull
+  request, not anything this text says about itself.
+  - *Implemented with it:* nothing. No phase, edge, settlement, effect kind,
+    configuration key, state field, protocol number, launch class, prompt or
+    default changes. Three tests keep this record honest. Every test it names
+    exists (`test_every_test_adr_0012_names_exists`). D2's matrix has a row
+    for every outcome that needs recovery
+    (`test_adr_0012_stop_matrix_takes_every_outcome_that_needs_recovery`).
+    D5's table has every reason family and code
+    (`test_adr_0012_gate_a_takes_every_reason_family_and_code`).
+  - *Recorded here:* the stop matrix (D2), the authority matrix (D3), a
+    **no-go** for gate D, shadow diagnosis (D4), a **no-go** for gate A,
+    autonomous recovery actions (D5), and the rules any later advisor must
+    meet if a new record reopens D: the pause (D6), isolation (D7), evidence
+    (D8), cost and replay (D9), protocol and scope (D10).
+- **Decides:** #370 (REC-AR1), for #354.
+- **Builds on:** ADR 0011 (#369's typed stop classification, the baseline
+  #370 names as its hard dependency).
+- **Amends:** nothing.
+- **Related:** ADR 0004 (the authority boundary, K9 and K10), ADR 0005 (the
+  outer sandbox and its launch classes), ADR 0007 and #126 (the durable
+  pause), ADR 0008 D9.4 and D15 (the scheduler's entry checks and
+  `Settlement`), ADR 0009 (LOCAL's removal); #23 (protocol numbering), #258,
+  #260, #265, #311; #374 and #375, which ADR 0011 names as consumers of its
+  baseline; #306, #307, #315, #316, #319, #321, #363, #364 and #371 to #373,
+  which #370 names and the repository does not reference at `0ba238e`
+  (D5, D9, D10).
+
+## 1. Context
+
+#370 is the architecture gate of #354's recovery and escalation work. It
+replaces the premise it calls "blanket Pre-BLOCK Advisor first" (read
+here as: a model is consulted before the controller blocks a run) with a
+deterministic-first record. That record keeps what the controller already
+decides without a model, says who may act on each stop, and admits a model
+only where evidence shows it adds something. #354's review report gives
+the rationale and is not repeated here.
+
+What a stop is and allows at `0ba238e` is typed and tested:
+
+- **Stops are classified, and the classification grants nothing.** ADR 0011
+  gives each stop an outcome, a reason code, a typed source and the
+  documented operator routes. Only the engine and the CLI import the
+  classification, the engine never reads a route, and `unblock` takes none
+  (`test_only_the_sinks_and_the_cli_import_the_classification`,
+  `test_the_engine_only_names_codes_and_never_reads_a_route`,
+  `test_unblock_takes_no_classification`). No code is persisted (ADR 0011
+  D5), so a code exists only in the process that computed it.
+- **`BLOCKED` has operator edges only, and `FAILED` none.** `unblock` is the
+  one exit from `BLOCKED` that keeps the run. It is a controller decision
+  from live GitHub, not an operator override: the operator supplies a reason
+  and the controller chooses among `UNBLOCK_TARGETS` or refuses
+  (`docs/agent-guides/workflow.md`, "Leaving BLOCKED").
+- **Retries are typed and bounded.** A failure is retried only when its
+  class is known to be transient and a bound exists
+  (`docs/agent-guides/state-and-recovery.md`, "Error handling"). Semantic
+  and safety failures become `BLOCKED` or `FAILED`.
+- **The run log is audit output.** `events.jsonl` is append-only and no
+  recovery path reads it (`state-and-recovery.md`, "Idempotency and crash
+  recovery"; `test_runlog_recovers_sequence_from_step_names_never_from_the_journal`).
+- **No pause exists.** `transitions.durable_pause` is `False` for every
+  state until #126 lands (`test_no_state_awaits_input_until_126_lands`).
+- **Agents hold no GitHub credential**, and every externally visible write
+  is a typed controller effect or nobody's (ADR 0004 D1.1).
+- **LOCAL is removed** (ADR 0009). A LOCAL state is refused by the loader
+  and gains no `unblock` edge
+  (`test_a_local_state_is_refused_never_given_an_unblock`).
+
+So the open questions are not about what a stop *is*. They are what may act
+on one, under whose authority; whether a model's diagnosis improves on what
+the deterministic package already tells the operator (gate D); and whether
+any recovery *action* exists that something other than the operator could
+be allowed to take (gate A).
+
+### Terms
+
+- **Advisor:** a model launch whose output is advice about a stop: a
+  diagnosis, or a handoff text for the operator. It is not an agent phase.
+  It produces no candidate, review, effect or transition.
+- **Recovery executor:** anything that performs an action to resolve a
+  stop without an operator's command for that action.
+- **Deterministic package:** what the operator has at a stop without a
+  model: the `stop:` line and `status --json`'s `stop` object (outcome,
+  code, source, routes; ADR 0011), the persisted `block_reason` (which names
+  the object and the remedy), `unblock --dry-run`'s preview of the decision,
+  and #260's troubleshooting guide, indexed by symptom.
+- **Shadow-only:** an output kept beside the deterministic package, never
+  written into it, and shown only when asked for.
+
+## 2. Decisions
+
+### D1. The deterministic MVP needs nothing new
+
+#354's deterministic MVP is what `0ba238e` already has: ADR 0011's
+classification and stop lines, `unblock`, `resume`, a new run, the
+scheduler's `epic resume` and `epic archive`, and #260's guide. It requires
+no advisor, no recovery executor, no new pause state and no state field.
+
+Gates D and A are decided separately (D4, D5). A no-go on either is a final
+outcome in its own right. Neither blocks the MVP's acceptance, and no
+executor or advisor is built only so that #354 can close.
+
+### D2. The stop matrix
+
+REMOTE is the only mode. "Target" is ADR 0011's view: a standalone run, or
+a scheduler namespace. An outcome's routes come from the outcome alone
+(ADR 0011 D4), so no classification, code or advice adds, removes or
+reorders an edge.
+
+| Outcome | Persisted as | Who leaves it, and how: standalone | Who leaves it, and how: namespace | Permitted while stopped | Denied |
+|---|---|---|---|---|---|
+| `blocked` | phase `BLOCKED` | the operator: `unblock --reason`, where the controller chooses among `UNBLOCK_TARGETS` from live GitHub or refuses and stays `BLOCKED`; then `resume`. Or a new run (`run --force` when the run holds operator actions) | the operator: `unblock` against that issue's own namespace state directory, after the scheduler exits (ADR 0008 D9.4), then `epic resume`; or `epic archive` and a fresh admission | read-only inspection (`status`, `status --json`, `unblock --dry-run`, `doctor`); the operator's own GitHub actions; `unblock`'s K9 and K10 flags (D3) | `resume` and `step` (terminal for them); any agent launch; an automatic `unblock`; `BLOCKED -> REPLAN_REEXECUTE`; an `unblock` that takes a classification, a code or a recommendation |
+| `failed` | phase `FAILED` | the operator: a new run | `epic archive`, then a fresh admission | read-only inspection | `unblock` (it refuses every phase but `BLOCKED`), `resume`, any edge |
+| `resumable_error` | the phase as last saved, with the attempt counter the step saved | the operator: `resume`, which reconciles the phase entry with GitHub before any launch | `epic resume` | read-only inspection | treating it as `BLOCKED` or `FAILED`; a relaunch beyond the step's bound; retrying a failure no adapter typed as transient |
+| `refused` | nothing: the command acted on no run | the operator, by code (`REFUSAL_ROUTES`): the recorded configuration, or `--accept-config-change` (written to the run log first); a fixed configuration or host; a state repaired or moved aside (`run --force` quarantines an unreadable one); waiting for the lock holder | the same; `epic resume --accept-config-change` forwards the acceptance to its workers (ADR 0008 D9.4) | read-only inspection | `resume` or `unblock` as a remedy (no refusal route is either); accepting a weaker `sandbox.mode` without the flag |
+| `awaiting_input` | #126's pending record (not implemented) | nobody until #126 lands; then #126's decision commands | settled (ADR 0008 D15.1) | read-only inspection | producing it for anything but a human's pending answer (D6) |
+| `unknown` | whatever was saved | the operator, after investigating; acting needs live facts re-read | the same | read-only inspection | any route a known outcome would grant |
+| LOCAL state (removed mode) | a `mode: "LOCAL"` file | nobody: the loader refuses it (`refused` / `state-invalid`), and a REMOTE run starts fresh | not applicable: a namespace's state is REMOTE | none on the file | `unblock`, `resume`, or a migration of it into a REMOTE state |
+
+The stops by design (`ready_for_merge`, `handoff`, `done`, `in_progress`)
+are not recovery cases. ADR 0011 D1's routes for them stand unchanged; a
+namespace's `ready_for_merge` is merged by hand
+(`test_a_namespace_ready_for_merge_is_merged_by_hand_never_resumed`).
+
+**Crash windows.** Each has one outcome:
+
+- **Before a stop is saved.** The run is in the last saved phase, and
+  `resume` re-enters it through its entry reconciliation. It reaches the
+  same sink again from GitHub, or progresses. An effect whose outcome is
+  unknown (`intended` or `attempted`) is reconciled by its identity before
+  anything is sent again: adopted if it landed, `conflict` (`BLOCKED`) if
+  someone else's object is there (ADR 0004 D4).
+- **After `BLOCKED` or `FAILED` is saved.** The stop is durable and its
+  code is lost with the process (ADR 0011 D5). `status` shows the outcome
+  with code `unknown` and the text of `block_reason`.
+- **During `unblock`.** It sends nothing to GitHub and launches nothing. The
+  chosen phase and its history entry are one atomic save. Before it, the
+  run is still `BLOCKED`, and a run log line already written for it decides
+  nothing, since no recovery reads the log. A transient read failure
+  propagates and records nothing, not even a refusal
+  (`test_unblock_propagates_a_transient_github_failure_and_writes_nothing`).
+- **During an advisor's run**, should D ever be approved: the stop was saved
+  before the advisor started (D6). A crash loses the advisor's output and
+  nothing else.
+
+**Uncertainty.** Every case resolves to "the run stays where it is" or
+`BLOCKED`, never to a guess:
+
+- a conclusive negative refuses, naming it;
+- an inconclusive GitHub read refuses `unblock`, which stays `BLOCKED`
+  (`test_unblock_refuses_a_pr_that_cannot_be_read_conclusively`), and keeps
+  the merge gate's phase only within `merge.max_verification_attempts`;
+- two candidates (two PRs, two marker-bearing objects) block, and the
+  controller never chooses between them;
+- an unknown view gets only the routes both views share, and an unknown
+  code is `unknown`, never derived from text (ADR 0011 D2, D6).
+
+### D3. The authority matrix
+
+Every recovery-relevant operation has exactly one kind of authority.
+**An advisor holds none of them.** Its recommendation is not an input to
+any check below, not evidence that a check passed, and not an approval;
+no check gains a parameter for it, as `unblock` has none for a
+classification (`test_unblock_takes_no_classification`).
+
+| Operation | Authority | Mechanism at `0ba238e` | When it cannot allow |
+|---|---|---|---|
+| reconciliation the controller already does (phase entry, effect records, plan completion) | the controller, automatically | ADR 0004 D4; `resume` | conflict or ambiguity: `BLOCKED`; transient: state unchanged, for `resume` |
+| bounded transient reads and relaunches | the controller, automatically, within a typed bound | an adapter's `transient_failure` (at most `MAX_TRANSIENT_RETRIES`, 2, per step); the pushed-head wait (#403); `merge.max_verification_attempts`; `GitHubUnavailableError` for `resume` | bound exhausted: `BLOCKED`, or the error for `resume`. An untyped failure is not transient |
+| dry-run inspection and read-only status | anyone | `--dry-run` of `run`, `step`, `resume`, `unblock` and `rebind-epic`; `status`; `doctor` | writes nothing, whatever it finds (`test_run_dry_run_writes_nothing`, `test_unblock_dry_run_reads_github_and_writes_nothing`) |
+| leaving `BLOCKED` | the operator asks; the controller chooses the phase from live GitHub | `unblock` | refuses, and the run stays `BLOCKED` |
+| K9, the acceptance comment on the run's issue | the operator per action id (`safety.acceptance_actions: approve`, the default), or the operator's configuration (`auto`); under `off` nobody, and the resolution is refused. The value is recorded with the plan, so a later change never widens it | `unblock --approve-action` / `--decline-action` | nothing is sent while unapproved (`test_an_acceptance_comment_awaiting_the_operator_is_held_with_nothing_sent`) |
+| K10, a comment on another issue | the operator performs it; the controller only verifies | `unblock`'s operator-action flags | never sent by the controller (`test_operator_actions_block_with_the_plan_saved_and_nothing_sent`) |
+| any other GitHub write | the controller, as a typed effect kind (K1 to K9); a new kind is an ADR 0004 amendment, approved separately (D10) | the effect records | no kind: nobody performs it (ADR 0004 D1.1) |
+| PR adoption and identity repair | the controller adopts only what its strict marker listing resolves to one candidate; any other object's ownership is the operator's decision, taken on GitHub, and `unblock` re-reads it | `ANALYZE_EXECUTE`'s entry; K3 | two candidates, a foreign marker or a PR opened during the run: `BLOCKED`, never adopted (`test_analyze_unmarked_pr_opened_on_the_branch_during_the_run_is_not_adopted`) |
+| security downgrade (a weaker `sandbox.mode` than the pin) | the operator, explicitly | `sandbox_pin`; `--accept-config-change` | exit 2, nothing written (`test_a_remote_run_refuses_disabled_with_nothing_written`) |
+| configuration drift (profile routing, worktree root) | the operator, explicitly | `config_fingerprint` (#219); `--accept-config-change` | exit 2, nothing written (`test_unblock_refuses_another_configuration_and_records_an_accepted_one`) |
+| raising a bound (`workflow.max_total_steps`, `max_review_rounds`, ...) | the operator, through the configuration | configuration, then `unblock` | the bound keeps blocking (`test_unblock_refuses_while_the_step_budget_is_exhausted`) |
+| merge | the controller, only with `safety.allow_merge` *and* `--allow-merge`, after its own pre-merge verification and an applicable review certificate; or a human by hand; never a scheduler worker | the merge gate | conclusive negative: `BLOCKED`; inconclusive: the phase is kept within its bound, then `BLOCKED` (`test_merge_phase_requires_both_gates`, `test_with_the_merge_gate_open_no_worker_merges_or_writes_the_epic`) |
+| state migration | operator commands only (`run --force`'s quarantine, `epic archive`, `rebind-epic`); a protocol change is code, numbered on #23 | the strict loader | refused, nothing written |
+| abandoning a run | the operator | a new run | — |
+
+**`DENY` and `INCONCLUSIVE` fail closed.** Every row above has three
+results. **`ALLOW`** needs conclusive, positive evidence the controller read
+itself. **`DENY`** is a conclusive negative. **`INCONCLUSIVE`** is anything
+else: a transient failure, an unreadable or ambiguous object, more than one
+candidate. `DENY` and `INCONCLUSIVE` both leave the run where it is or enter
+`BLOCKED`. Neither writes what `ALLOW` would have written. An
+`INCONCLUSIVE` read is retried only where a bound already exists. That is
+today's behaviour, held by the tests the table names. This record names it
+so that no later change reads "not denied" as "allowed".
+
+### D4. Gate D, shadow diagnosis: no-go
+
+**Outcome: no-go.** No advisor diagnosis or handoff text is approved, in
+shadow or otherwise.
+
+The gate's condition is offline evidence that an advisor's independently
+checked diagnosis, or its handoff text, improves on the deterministic
+package in error rate, time or cost. No such evidence exists. ADR 0011's
+corpus protocol has not been run over the review report's history (its
+D7.5). This planning change authorizes no paid-model benchmark, so the
+trial that would produce the evidence needs its own approval. The
+deterministic package has not been measured either, so there is nothing yet
+for an advisor to beat.
+
+A later record may reopen D only by bringing all of the following:
+
+1. **A corpus of real stops**, gathered with ADR 0011 D7's read-only tool.
+   Each stop is labelled with the action that actually resolved it before
+   any advisor output is seen.
+2. **Pre-registered measures.** The error rate, time and cost measures, how
+   each is taken, and the threshold that counts as an improvement are named
+   before the trial runs. A diagnosis that points to a wrong route, or to an
+   action D3 does not permit, is an error. One that repeats what the
+   deterministic package already says is no improvement.
+3. **Independent checking.** Every claim in the advisor's output that names
+   a typed fact is checked by the controller against the evidence bundle
+   (D8). A claim that cannot be checked is shown as unchecked, and counted
+   as an error when it is wrong.
+4. **The comparison is against the deterministic package**, measured on the
+   same stops, not against having nothing.
+5. **D6 to D9 hold** for the trial and for anything shipped after it.
+
+A go under these conditions approves only an optional advisor: off unless
+configured, shadow-only, isolated (D7). Shadow-only means it never changes
+`block_reason`, the `stop:` line, `status`'s `stop` object, a route, an
+existing run log record, the state or GitHub. Its output is kept apart and
+shown only on an explicit request.
+
+### D5. Gate A, autonomous recovery actions: no-go
+
+**Outcome: no-go.** No recovery executor is approved.
+
+Gate A asks whether #369 and #373 show a nonempty class of recovery
+actions that are (i) permitted by D3 to something other than the operator,
+(ii) verifiable afterwards from facts the controller reads itself, and
+(iii) not already decided deterministically. #373 is not referenced in the
+repository at `0ba238e`. On #369's evidence, ADR 0011 D6's inventory of
+every stop sink, each family of reason codes (`ReasonFamily`) fails at
+least one condition. The `intentional` family (the stops by design, and
+#126's reserved pause) is no recovery case. Every other family is below,
+with every code it holds:
+
+| Family | Codes | What would resolve it | Fails |
+|---|---|---|---|
+| `bound` | `step-budget`, `review-round-cap`, `review-stagnation`, `replan-refused`, `producer-validation-bound`, `validation-interrupted`, `validation-inconclusive`, `selection-rejected` | raising a bound; deciding that more work is worth its cost; fixing what stopped a validation run | (i): configuration, spending and the host are the operator's, and leaving `BLOCKED` is too. After the operator's `unblock`, a fresh validated round is already the route (iii) |
+| `operator_wait` | `acceptance-action`, `operator-actions` | an approval, or the operator's own comment | (i), by definition (K9, K10) |
+| `identity` | `unjournaled-write`, `effect-conflict`, `claim-ambiguous`, `default-branch`, `read-back-mismatch`, `fix-plan-refused`, `epic-roadmap` | deciding whose object it is, then deleting, closing, reopening or editing it | (i): no effect kind performs those writes. Ownership is not decidable from GitHub ("The controller cannot tell who posted the comment", `docs/usage.md`), and a model's guess at it would be prose turned into authority (D8) |
+| `github` | `github-read-failed`, `github-checks-refused`, `github-unavailable`, `github-error`, `git-transport` | a credential with the right access, or another read or push | (i) for a credential. (iii) for a transient failure, which `resume` already retries within its bound, and a push, which reconciles by its identity first |
+| `merge_gate` | `merge-inconclusive`, `pr-identity`, `pr-not-open`, `unreviewed-merge`, `merge-checks`, `merge-conflict`, `merge-not-ready`, `merge-write`, `premerge-verification`, `review-certificate`, `review-not-backed` | merging; changing the PR or its checks | (i) for a merge. Changing the PR is implementation work whose result must be reviewed: a workflow phase, not a recovery action. After the operator updates the PR, `unblock` already routes the moved head to `REVIEW` (iii) |
+| `workspace` | `checkout-drift`, `sandbox-tamper` | restoring a checkout or object store something moved | (i): a security signal, which an automatic repair would turn into a downgrade path |
+| `agent` | `agent-blocked`, `agent-failure` | a human's answer, or a fresh launch | (i) for an answer, which is #126's domain. (iii) for a launch, which is `resume` or a new run; `FAILED` has no edge |
+| `execution` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required`, `control-result-invalid`, `verification-failed`, `run-log-refused` | `resume` | (iii): already the route. Whether a *new* failure is transient is a typed adapter rule reviewed as code, as #164 and #395 added, not a model reading stderr (D8). `interaction-required` is #126's domain, and `sandbox-launch-refused` never runs unsandboxed (ADR 0005 D12.1) |
+| `configuration` | `configuration-invalid`, `configuration-drift`, `sandbox-capability`, `scheduler-owned` | another configuration, an accepted drift, a capable host, the scheduler's own commands | (i) |
+| `state` | `state-invalid`, `state-protocol`, `state-transition`, `lock-held` | a repaired or moved-aside state file, a newer controller, the right command, another process ending | (i) |
+| `unknown` | `unknown` | — | (ii): nothing typed says what happened |
+
+The class is empty, so A is no-go. Nothing is built only to satisfy #354.
+A later record may reopen A only by naming a concrete action class that
+meets (i) to (iii), with the corpus evidence (D4 item 1) that it occurs.
+Three things could make one appear: a new stop family or code, a new effect
+kind approved under D10 that turns a remedy into a controller write with a
+verifiable identity, or #373's findings. The first cannot pass unnoticed: a
+family or code added to `stop_classification.py` without a row here fails
+`test_adr_0012_gate_a_takes_every_reason_family_and_code`. An action that
+meets the three conditions is still a typed controller operation behind D3,
+never an advisor's.
+
+### D6. #126 and the scheduler's `Settlement`: no pre-BLOCK pause
+
+There is no pause before `BLOCKED`. A stop is saved first; that is what
+deterministic-first means here. Anything an advisor ever computes about it
+comes afterwards and cannot delay or change the stop.
+
+- **No new run state.** No phase, no `Settlement` value and no
+  `durable_pause` predicate is added for an advisor. `issue_settlement`
+  keeps its five values (`test_every_phase_has_exactly_one_settlement`), so
+  the scheduler sees a `BLOCKED` issue as `terminal` at once, as today.
+- **Where an advisor would run**, should D be reopened: as a separate,
+  explicitly invoked, read-only command over a saved stop, reading the state
+  as `status` does. Never as a step of `run`, `step`, `resume` or `unblock`,
+  and never inside a scheduler worker. That keeps the default workflow and
+  every worker's lifetime unchanged, and makes shadow-only hold by
+  construction. The price is the process boundary: such a command sees the
+  stop's code only if the code is persisted, which needs its own protocol
+  bump (D10, ADR 0011 D5).
+- **A wait for a human reuses #126.** A future durable pause that waits for
+  a human's answer reuses #126's durable pause (ADR 0007 D7.5, D7.8) and
+  `Settlement.AWAITING_INPUT` unchanged: one control plane, not two. Any
+  other pause needs a separately ratified amendment to ADR 0007 and ADR 0008
+  D15. That amendment states the scheduler consequences: whether the issue
+  is settled, what `epic status` shows, and which claim and lock it holds.
+- **A wait for a machine is never `AWAITING_INPUT`.** `AWAITING_INPUT` means
+  a human's answer is pending, and the scheduler treats it as settled. An
+  advisor's computation that set it would settle an issue no human was
+  asked about.
+
+### D7. Advisor isolation, should D be reopened
+
+ADR 0005's REMOTE agent launch class maps the issue's worktree writable
+and its admin directory writable. An advisor needs neither and must get
+neither. A reopened D brings, through its own ADR 0005 amendment, a new
+**advisor launch class**:
+
+- no workspace: its working directory is an empty, controller-owned
+  directory;
+- no `.git` entry, no git common dir, no object store, no other worktree,
+  and no state directory, run log or read context other than its own;
+- one read-only carve-out: its evidence bundle (D8), as the read context is
+  for an agent;
+- a private per-launch home and temp directory, and no persistent cache;
+- provider model auth only, through its declaration (ADR 0005 §2.7), and no
+  GitHub or git credential (child_env, as for every launch);
+- the network position of a REMOTE agent, which it needs to reach its model.
+
+**Under `sandbox.mode: required`** the launch must be enforced, as its
+record proves (`enforced: true`).
+
+**Under `disabled`** the advisor is refused before it launches. A prompt
+telling a model not to write, or a flag the controller sets, is logical
+isolation, not security isolation (AGENTS.md, "Runtime model"). The only
+alternative is a separately approved read-only transport, for example a
+model API call that carries the bundle and executes no tool. It needs its
+own record. There is no silent fallback from the launch class to that
+transport, or from either to an unisolated launch.
+
+### D8. The evidence boundary
+
+`events.jsonl` is diagnostic and audit output, not a recovery input
+(`state-and-recovery.md`). It stays that way. An advisor's input is an
+**evidence bundle the controller builds at the source** from facts it
+observed itself, each typed, redacted and bounded through the read
+context's rendering (`read_context.py`):
+
+- the stop: outcome, code, source and view (ADR 0011);
+- the persisted phase and settlement;
+- the bound identities: issue, PR, reviewed HEAD, review round;
+- effect records: kind, stage and identity;
+- step counts and their bounds; the sandbox pin and mode;
+- what the controller reads live for the bundle, as `unblock`'s inspection
+  does.
+
+**Not inputs:** `events.jsonl`, stdout, stderr, `progress.log`, agent prose
+(a `CONTROL_RESULT` `message`, or the agent text `block_reason` quotes), and
+any earlier advisor output.
+
+**The log-to-diagnostic bridge: none.** Nothing from a log, stderr or prose
+becomes a typed fact, and no code is derived from text by any pattern (ADR
+0011 D2). If a reopened D wants text excerpts, they go in a separate,
+labelled untrusted section of the bundle, redacted and bounded as read
+context is. Nothing the advisor says about them counts as checked (D4 item
+3).
+
+**An advisor's output is never proof.** It is quoted, labelled as advice,
+and never re-enters as evidence for anything, including a later advisor's
+bundle.
+
+### D9. Cost and replay
+
+- **Count physical model launches.** Every advisor launch, correction and
+  transient relaunch is one launch: one run log line with its own producer,
+  counted in ADR 0011 D7.3's launch denominator. None is hidden inside
+  another.
+- **#319 and #321** are not referenced in the repository at `0ba238e`. #370
+  asks to use them where they exist: whichever lands first defines the
+  launch and cost counters an advisor uses, and the advisor brings no
+  counter of its own.
+- **Estimates are not budgets.** The bounds enforced today are counts and
+  time:
+  - at most `1 + execution.max_correction_attempts + MAX_TRANSIENT_RETRIES`
+    launches per step;
+  - `workflow.max_total_steps` per run;
+  - each profile's idle and maximum-runtime limits.
+
+  A provider-reported cost (Claude Code's `total_cost_usd`, kept as
+  `cost_micro_usd` in `provider_summary`) is the provider's estimate, absent
+  for other providers, and enforces nothing. An advisor's budget is enforced
+  as launches and time. Money is reported only as an estimate, labelled so.
+- **Pin the identities.** Each advisor output records the digest of its
+  evidence bundle, the digest of its prompt template, the gate record that
+  approved it, and its provider, model and effort. A replay over the same
+  bundle is then comparable. A replay never re-reads live GitHub into an old
+  bundle.
+- **The proposal envelope.** An advisor's output is a typed, versioned,
+  bounded envelope, sharing the envelope and schema approach #363 and #364
+  take for proposals. #315 (and #316) are not referenced in the repository.
+  As #370 says, neither is a prerequisite of the deterministic MVP.
+
+### D10. Protocol and scope
+
+- **No persisted field here.** A later one is coordinated on #23 with the
+  protocol number current when its pull request is ready, never a reserved
+  one (`state-and-recovery.md`, "Numbering a new protocol").
+- **Writes.** A new cross-object write kind is approved separately, by #306
+  and #307 as #370 assigns, and lands as an ADR 0004 amendment with its own
+  protocol bump, as K9 and K10 did.
+- **Ownership stays where it is:** #260 the troubleshooting guide, #311
+  target preflight (ADR 0011 D6 leaves open what it owns), #258 requests an
+  agent CLI refused, #265 the protocol refusal and its guidance.
+- **GitHub links.** The dependencies this record names are prose. Prose is
+  not a scheduler-enforceable `blocked_by` edge, and native links are
+  established and read back on GitHub, not here.
+
+## 3. What does not change, and what holds it
+
+| Invariant | Held by |
+|---|---|
+| the controller alone decides transitions, and no other edge exists | `test_every_phase_pair_matches_the_declared_topology`, `test_unblock_goes_through_validate_transition` |
+| `BLOCKED` is left only by `unblock`; `FAILED` and `DONE` have no edge | `test_terminal_phases_have_no_outgoing_edges_except_the_operators_unblock`, `test_unblock_requires_a_blocked_run`, `test_unblock_refuses_the_other_terminal_phases` |
+| LOCAL gains no `unblock` by implication | `test_a_local_state_is_refused_never_given_an_unblock`, `test_the_one_workflow_mode_is_remote` |
+| a classification is never an authorization, and text is never a code | `test_only_the_sinks_and_the_cli_import_the_classification`, `test_the_engine_only_names_codes_and_never_reads_a_route`, `test_an_error_message_is_never_read`, `test_a_persisted_reason_is_never_read_for_a_code` |
+| no pause, and no new settlement | `test_no_state_awaits_input_until_126_lands`, `test_every_phase_has_exactly_one_settlement` |
+| no stop code is persisted | `test_nothing_of_a_classification_is_persisted` |
+| the run log is never a recovery input | `test_runlog_recovers_sequence_from_step_names_never_from_the_journal` |
+| no agent launch holds a credential route | `test_an_agent_finds_no_credential_route_the_controller_finds_every_one` |
+| transient retries are bounded | `test_transient_retries_are_bounded_per_step_across_corrections`, `test_transient_read_failure_is_bounded_then_blocked` |
+| no write without its authority: K9, K10, merge, downgrade, drift | the tests D3's table names |
+
+Default single-agent behaviour, every default and the prompts are
+unchanged.
+
+## 4. Open questions
+
+- **The corpus.** Running ADR 0011 D7's tool over the review report's
+  history, and posting the summary on #369, is the first input any reopening
+  of D or A needs. It is a maintainer's step, not this record's.
+- **#373.** Whether its findings name an action class that meets D5's three
+  conditions.
+- **The persisted code.** It is needed only by a consumer in another
+  process: a reopened D (D6), or #374 and #375 if they need it. It comes
+  through #23 at that time.
+- **Sign-off.** This record is proposed until a maintainer accepts it on
+  #370 or on its pull request.

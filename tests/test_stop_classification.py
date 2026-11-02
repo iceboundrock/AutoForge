@@ -7,6 +7,11 @@ pause, the scheduler's settlement), the boundary that keeps it advice
 fixtures ADR 0011 names: each a real engine run that stops, with its
 outcome, its typed code, the source that code came from and the operator's
 routes. The CLI's stop lines are tested in ``test_cli.py``.
+
+ADR 0012 (#370) decides who may act on a stop. Its stop matrix takes every
+outcome and its gate A table every reason family and code, so a new one has
+no row until someone decides what it permits; both records name only tests
+that exist.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import ast
 import inspect
 import json
 import os
+import re
 from dataclasses import fields
 from pathlib import Path
 
@@ -38,6 +44,7 @@ from autoforge.stop_classification import (
     SCHEDULER_ROUTES,
     CodedReason,
     OperatorRoute,
+    ReasonFamily,
     ReasonSource,
     StopClassification,
     StopOutcome,
@@ -813,16 +820,14 @@ def test_every_code_is_produced_by_some_sink():
     assert named == set(StopReasonCode)
 
 
-def test_every_test_adr_0011_names_exists():
-    import re
+ADR = SRC.parent.parent / "docs" / "adr"
+ADR_0011 = ADR / "0011-typed-stop-classification-and-recovery-baseline.md"
+ADR_0012 = ADR / "0012-recovery-and-escalation-stop-authority-and-advisor-gates.md"
 
-    adr = (
-        SRC.parent.parent
-        / "docs"
-        / "adr"
-        / "0011-typed-stop-classification-and-recovery-baseline.md"
-    ).read_text()
-    named = set(re.findall(r"`(test_[a-z0-9_]+)`", adr))
+
+def _undefined_tests_named_in(adr: Path) -> list[str]:
+    """The tests ``adr`` names in backticks that no ``tests/test_*.py`` defines."""
+    named = set(re.findall(r"`(test_[a-z0-9_]+)`", adr.read_text()))
     assert named
     defined = {
         node.name
@@ -830,4 +835,49 @@ def test_every_test_adr_0011_names_exists():
         for node in ast.walk(ast.parse(path.read_text()))
         if isinstance(node, ast.FunctionDef)
     }
-    assert named <= defined, sorted(named - defined)
+    return sorted(named - defined)
+
+
+def test_every_test_adr_0011_names_exists():
+    assert _undefined_tests_named_in(ADR_0011) == []
+
+
+def test_every_test_adr_0012_names_exists():
+    assert _undefined_tests_named_in(ADR_0012) == []
+
+
+def _adr_0012_table(decision: str) -> dict[str, list[str]]:
+    """The rows of ADR 0012's ``### <decision>.`` section whose first cell is
+    one code span, keyed by it, each row as its stripped cells."""
+    text = ADR_0012.read_text()
+    start = text.index(f"\n### {decision}. ")
+    section = text[start : text.index("\n### ", start + 1)]
+    rows = {}
+    for line in section.splitlines():
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if line.startswith("| `") and re.fullmatch(r"`[a-z_]+`", cells[0]):
+            rows[cells[0].strip("`")] = cells
+    return rows
+
+
+def test_adr_0012_stop_matrix_takes_every_outcome_that_needs_recovery():
+    """ADR 0012 D2 says who leaves each stop and how. An outcome added to
+    ``StopOutcome`` has no row there until someone decides it; the stops by
+    design keep ADR 0011's routes and are named instead."""
+    by_design = {Out.READY_FOR_MERGE, Out.HANDOFF, Out.DONE, Out.IN_PROGRESS}
+    assert set(_adr_0012_table("D2")) == {o.value for o in set(Out) - by_design}
+    text = ADR_0012.read_text()
+    paragraph = text[text.index("The stops by design") :].split("\n\n")[0]
+    assert {f"`{o.value}`" for o in by_design} <= set(re.findall(r"`[a-z_]+`", paragraph))
+
+
+def test_adr_0012_gate_a_takes_every_reason_family_and_code():
+    """ADR 0012 D5's no-go for autonomous recovery rests on every family of
+    stop codes failing one of its three conditions. A family or a code added
+    later has no row there until someone decides whether it reopens gate A."""
+    rows = _adr_0012_table("D5")
+    recoverable = set(ReasonFamily) - {ReasonFamily.INTENTIONAL}
+    assert set(rows) == {family.value for family in recoverable}
+    for family in recoverable:
+        codes = {code.value for code, of in REASON_FAMILY.items() if of is family}
+        assert set(re.findall(r"`([a-z0-9-]+)`", rows[family.value][1])) == codes, family
