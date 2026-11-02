@@ -510,11 +510,16 @@ def test_the_digests_become_the_steps_outputs_and_sha256sums(tmp_path: Path, mon
 
 
 # What the installed command does on a REMOTE dry run, as far as the dist check
-# looks: the EPIC binding's two reads through `gh` (#293) and its line, then the
-# plan; the stand-ins below do it and then misbehave in one way each.
+# looks: the reads through `gh` a run makes before its first save (#293: the
+# checkout's repository, the issue, its EPIC, the issue again) and the binding's
+# line, then the plan; the stand-ins below do it and then misbehave in one way
+# each.
+_REPOSITORY_READ = "gh repo view example/dist-check --json nameWithOwner,defaultBranchRef"
 _BINDING_READS = (
+    f"{_REPOSITORY_READ} > /dev/null; "
     "gh api repos/example/dist-check/issues/2 > /dev/null; "
     "gh api repos/example/dist-check/issues/1 > /dev/null; "
+    "gh api repos/example/dist-check/issues/2 > /dev/null; "
 )
 _REMOTE_PLAN = (
     'echo "  used:          #1 https://github.com/example/dist-check/issues/1 '
@@ -530,9 +535,11 @@ _REMOTE_PLAN = (
         ("", None),
         (
             "gh api user || true",
-            r"called gh for \['api repos/example/dist-check/issues/2', "
-            r"'api repos/example/dist-check/issues/1', 'api user'\], not for the EPIC "
-            r"binding's two reads",
+            r"called gh for \['repo view example/dist-check --json "
+            r"nameWithOwner,defaultBranchRef', 'api repos/example/dist-check/issues/2', "
+            r"'api repos/example/dist-check/issues/1', "
+            r"'api repos/example/dist-check/issues/2', 'api user'\], not for the repository "
+            r"and EPIC binding reads",
         ),
         ("mkdir .autoforge", r"changed the scratch repository: \[.*'\.autoforge \(created\)'\]"),
         (": > .git/index.lock", r"repository: \[.*'\.git/index\.lock \(created\)'\]"),
@@ -555,8 +562,8 @@ def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
     tmp_path: Path, then: str, refusal: str | None
 ):
     """``remote_dry_run`` on a stand-in for the installed command (real git, fake gh):
-    a ``gh`` call beyond the EPIC binding's two reads shows, and so does any write,
-    the bytes a file already held written over it again included."""
+    a ``gh`` call beyond the repository and EPIC binding reads shows, and so does any
+    write, the bytes a file already held written over it again included."""
     command = tmp_path / "autoforge"
     command.write_text(f"#!/bin/sh\n{_BINDING_READS}{_REMOTE_PLAN}\n{then}\n", encoding="utf-8")
     command.chmod(0o755)
@@ -572,20 +579,39 @@ def test_the_remote_dry_run_check_refuses_a_gh_call_and_any_write(
 @pytest.mark.parametrize(
     "reads, refusal",
     [
-        ("", r"called gh for \[\], not for the EPIC binding's two reads"),
+        ("", r"called gh for \[\], not for the repository and EPIC binding reads"),
         (
+            f"{_REPOSITORY_READ} > /dev/null; "
             "gh api repos/example/dist-check/issues/1 > /dev/null; "
             "gh api repos/example/dist-check/issues/2 > /dev/null; ",
-            r"called gh for \['api repos/example/dist-check/issues/1', "
+            r"called gh for \['repo view example/dist-check --json "
+            r"nameWithOwner,defaultBranchRef', 'api repos/example/dist-check/issues/1', "
             r"'api repos/example/dist-check/issues/2'\]",
         ),
+        (
+            "gh api repos/example/dist-check/issues/2 > /dev/null; "
+            "gh api repos/example/dist-check/issues/1 > /dev/null; "
+            "gh api repos/example/dist-check/issues/2 > /dev/null; ",
+            r"called gh for \['api repos/example/dist-check/issues/2', "
+            r"'api repos/example/dist-check/issues/1', "
+            r"'api repos/example/dist-check/issues/2'\]",
+        ),
+        (
+            f"{_REPOSITORY_READ} > /dev/null; "
+            "gh api repos/example/dist-check/issues/2 > /dev/null; "
+            "gh api repos/example/dist-check/issues/1 > /dev/null; ",
+            r"called gh for \['repo view example/dist-check --json "
+            r"nameWithOwner,defaultBranchRef', 'api repos/example/dist-check/issues/2', "
+            r"'api repos/example/dist-check/issues/1'\]",
+        ),
     ],
-    ids=["no-binding-read", "reads-out-of-order"],
+    ids=["no-binding-read", "reads-out-of-order", "no-repository-read", "no-second-issue-read"],
 )
 def test_the_remote_dry_run_check_requires_the_binding_reads(
     tmp_path: Path, reads: str, refusal: str
 ):
-    """A dry run binds the run's EPIC as the run does (#293): the issue, then its EPIC."""
+    """A dry run reads what the run reads before its first save (#293): the checkout's
+    repository, then the issue, its EPIC and the issue again (PR #437 R1-F1, R1-F2)."""
     command = tmp_path / "autoforge"
     command.write_text(f"#!/bin/sh\n{reads}{_REMOTE_PLAN}\n", encoding="utf-8")
     command.chmod(0o755)

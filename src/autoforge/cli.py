@@ -1499,8 +1499,9 @@ def cmd_run(args) -> int:
     engine.validate_config()
 
     if args.dry_run:
-        # Side-effect-free: the binding's GitHub reads (#293), in-memory state,
-        # plan printed, nothing written.
+        # Side-effect-free: the checks and reads the run makes before its
+        # first save (#293: the checkout's repository, the EPIC binding),
+        # in-memory state, plan printed, nothing written.
         binding = engine.bind_new_run(args.epic, args.issue)
         _print_binding(binding)
         engine.new_run(binding.epic_url, binding.issue_url)
@@ -1535,9 +1536,12 @@ def cmd_run(args) -> int:
         # run log.
         _guard_scheduler_ownership(engine, args.issue, "run")
         _refuse_an_unusable_state_directory(engine)
-        # The EPIC the run records (#293): the issue's native parent, else
-        # --epic, read under the lock immediately before the first save, so
-        # the state holds what GitHub answered then and no earlier answer.
+        # This checkout must be the issue's repository, and the EPIC the run
+        # records (#293) is the issue's native parent, else --epic: both are
+        # read under the lock, before the state there is replaced or moved
+        # aside and immediately before the first save, the issue last of
+        # all, so the state holds what GitHub answered then and no earlier
+        # answer (PR #437 R1-F1, R1-F2). A refusal writes nothing.
         binding = engine.bind_new_run(args.epic, args.issue)
         _print_binding(binding)
         engine.new_run(binding.epic_url, binding.issue_url)

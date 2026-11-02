@@ -16,9 +16,9 @@ which issue that is, from GitHub's native parent link alone:
   never counts: none of them is read.
 
 **Fail closed.** The only reads are
-:meth:`~autoforge.github.GitHubClient.get_issue_node` of the issue and of
-the EPIC it binds to (:data:`BINDING_READS`). A read that fails, times out,
-is truncated, is refused or answers with another object stays a
+:meth:`~autoforge.github.GitHubClient.get_issue_node` of the issue, of the
+EPIC it binds to and of the issue again (:data:`BINDING_READS`). A read that
+fails, times out, is truncated, is refused or answers with another object stays a
 :class:`~autoforge.errors.GitHubError` (transient ones a
 :class:`~autoforge.errors.GitHubUnavailableError`), with this binding's
 context, and never falls back to ``--epic``. Only an issue object GitHub
@@ -32,12 +32,24 @@ an :class:`~autoforge.errors.EpicBindingError`: no parent and no
 repository), ``--epic`` naming the issue itself or another repository, an
 issue or EPIC that is not open.
 
+**Read again last.** The EPIC's read is a second GitHub request, and a
+person can re-parent, detach, attach or close the issue while it is in
+flight: the controller lock holds nothing on GitHub. So once the EPIC's
+answer is in, the issue is read again, and its binding facts (its id, its
+state and its native parent) are compared with the first answer. Any
+difference refuses the run (:class:`~autoforge.errors.EpicBindingError`)
+rather than recording the parent the first answer named: the operator runs
+the command again, and it binds what GitHub says then. That narrows the
+window to the local work between the last read and the save; no read can
+make a remote change atomic with a local one.
+
 Nothing here writes, locks or reads a file. ``run`` binds once, under the
 controller lock, after its existing-run and scheduler-ownership guards and
-immediately before the run's first save: the state records what GitHub
-answered then, with no earlier answer that could have gone stale, and a
-refusal leaves no state, quarantine or run log. Its dry run binds through
-the same function, without the lock, and persists nothing. A recorded run
+the check of the checkout's repository, and immediately before the run's
+first save: the state records what GitHub answered then, with no earlier
+answer that could have gone stale, and a refusal leaves no state,
+quarantine or run log. Its dry run binds through the same function,
+without the lock, and persists nothing. A recorded run
 is never bound again: ``resume``, ``step``, ``unblock`` and ``status`` read
 ``epic_url`` from the state, never the issue's current parent (rebinding an
 existing run is #435), and a scheduler worker records the EPIC whose
@@ -62,7 +74,7 @@ from .validation import GitHubIssueRef, parse_issue_url, validate_epic_and_issue
 
 
 class BindingReader(Protocol):
-    """The one GitHub read a binding makes."""
+    """The one kind of GitHub read a binding makes."""
 
     def get_issue_node(self, url: str) -> IssueNode: ...
 
@@ -177,15 +189,16 @@ def _read(reader: BindingReader, ref: GitHubIssueRef, role: str) -> IssueNode:
         ) from exc
 
 
-def bind_run_epic(reader: BindingReader, issue_url: str, epic_url: str | None) -> EpicBinding:
-    """The EPIC a new run of ``issue_url`` records (see the module docstring).
+def check_run_urls(
+    issue_url: str, epic_url: str | None
+) -> tuple[GitHubIssueRef, GitHubIssueRef | None]:
+    """``--issue`` and ``--epic`` (None when not given), checked locally; nothing is read.
 
-    ``epic_url`` is ``--epic`` (None when not given). The local checks come
-    first, and a URL they refuse is never read: ``--issue`` and ``--epic``
-    must be issue URLs of one repository, and ``--epic`` must not name the
-    issue itself. Then the issue's node is read; it must be open. Its
-    native parent, else ``--epic``, is the EPIC, whose node is read too: it
-    must be open, and in the issue's repository.
+    Both must be issue URLs of one repository, and ``--epic`` must not name
+    the issue itself (:class:`~autoforge.errors.ConfigurationError` or
+    :class:`~autoforge.errors.EpicBindingError` otherwise). ``run`` makes
+    these checks before it reads anything, the checkout's repository
+    included: a URL refused here is never read.
     """
     issue = parse_issue_url(issue_url)
     supplied: GitHubIssueRef | None = None
@@ -195,6 +208,20 @@ def bind_run_epic(reader: BindingReader, issue_url: str, epic_url: str | None) -
             raise EpicBindingError(
                 f"--epic {supplied.canonical} is the issue itself; a run's EPIC is another issue"
             )
+    return issue, supplied
+
+
+def bind_run_epic(reader: BindingReader, issue_url: str, epic_url: str | None) -> EpicBinding:
+    """The EPIC a new run of ``issue_url`` records (see the module docstring).
+
+    ``epic_url`` is ``--epic`` (None when not given). The local checks come
+    first (:func:`check_run_urls`), and a URL they refuse is never read.
+    Then the issue's node is read; it must be open. Its native parent, else
+    ``--epic``, is the EPIC, whose node is read too: it must be open, and in
+    the issue's repository. Last, the issue is read again: a change of its
+    id, state or native parent since its first read refuses the run.
+    """
+    issue, supplied = check_run_urls(issue_url, epic_url)
     node = _read(reader, issue, "the issue")
     if not node.is_open:
         raise EpicBindingError(
@@ -238,6 +265,9 @@ def bind_run_epic(reader: BindingReader, issue_url: str, epic_url: str | None) -
                 else "name an open EPIC with --epic)"
             )
         )
+    # The issue could change on GitHub while the EPIC was read (PR #437
+    # R1-F1): only what it still says after that read is recorded.
+    _refuse_a_changed_issue(issue, node, _read(reader, issue, "the issue again"))
     return EpicBinding(
         issue=issue,
         epic=epic,
@@ -245,3 +275,41 @@ def bind_run_epic(reader: BindingReader, issue_url: str, epic_url: str | None) -
         supplied=supplied,
         native_parent=parent,
     )
+
+
+def _refuse_a_changed_issue(issue: GitHubIssueRef, first: IssueNode, again: IssueNode) -> None:
+    """Refuse the binding when the issue's binding facts differ between its two reads.
+
+    The facts are the ones the binding was decided from: the issue's id
+    (the same issue), its state (only an open issue starts a run) and its
+    native parent (the EPIC, or the absence that lets ``--epic`` be used).
+    GitHub answered both reads and the answers disagree, so neither is
+    recorded: an :class:`EpicBindingError`.
+    """
+    changed: list[str] = []
+    if again.id != first.id:
+        changed.append(f"GitHub's id for it was {first.id} and is now {again.id}")
+    if again.state != first.state:
+        changed.append(f"it was {first.state} and is now {again.state}")
+    if not _same_parent(first.parent, again.parent):
+        changed.append(
+            f"its native parent was {_parent_shown(first.parent)} and is now "
+            f"{_parent_shown(again.parent)}"
+        )
+    if changed:
+        raise EpicBindingError(
+            f"issue {issue.canonical} changed on GitHub while the run's EPIC was being bound: "
+            + "; ".join(changed)
+            + ". Nothing was written and no EPIC was recorded; run the command again to bind "
+            "what GitHub says then"
+        )
+
+
+def _same_parent(first: GitHubIssueRef | None, again: GitHubIssueRef | None) -> bool:
+    if first is None or again is None:
+        return first is None and again is None
+    return first.same_target(again)
+
+
+def _parent_shown(parent: GitHubIssueRef | None) -> str:
+    return "none" if parent is None else parent.canonical

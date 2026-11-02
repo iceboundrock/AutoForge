@@ -40,12 +40,14 @@ imports the ``autoforge`` of the source tree:
    every prompt template loaded and rendered from the installed package
    (this file again, with ``--installed``, on the environment's own
    interpreter); and a REMOTE ``autoforge run --dry-run --full-prompt`` in
-   a scratch git repository, with a ``gh`` on ``PATH`` that records any
-   call, answers the EPIC binding's two issue reads (#293) and fails every
-   other call, which must print the binding and render the ANALYZE_EXECUTE
-   prompt through the installed engine, call ``gh`` for those two reads
-   alone and leave the repository unchanged (:func:`_tree`: every path's
-   bytes, identity and metadata). Then LOCAL
+   a scratch git repository whose ``origin`` is the issue's repository,
+   with a ``gh`` on ``PATH`` that records any call, answers the reads a
+   run makes before its first save (#293: the repository, then the issue,
+   its EPIC and the issue again) and fails every other call, which must
+   print the binding and render the ANALYZE_EXECUTE prompt through the
+   installed engine, call ``gh`` for those reads alone and leave the
+   repository unchanged (:func:`_tree`: every path's bytes, identity and
+   metadata). Then LOCAL
    mode's ways in, each met by a generic refusal of the installed command
    (ADR 0009 D3 to D5, #389): ``--help`` names no ``local``; ``autoforge
    local`` is argparse's invalid choice; a configuration with a ``local:``
@@ -125,10 +127,12 @@ DEVELOPMENT_VERSION = re.compile(RELEASE_VERSION.pattern + r"(\.dev(0|[1-9]\d*))
 BUILD_CONSTRAINTS = "build-constraints.txt"
 _PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][0-9A-Za-z.!+-]*)")
 _HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
-# The URLs of the REMOTE dry run. A dry run binds the run's EPIC (#293): it
-# reads the issue and the EPIC that binding names through `gh api`, and calls
-# `gh` for nothing else. The fake `gh` answers those two reads as GitHub does:
-# issue #2 is a native sub-issue of #1, the EPIC --epic names too.
+# The URLs of the REMOTE dry run. A dry run makes the reads a run makes before
+# its first save (#293): the checkout's repository (`gh repo view` of the one
+# its `origin` names), then the issue, the EPIC its binding names and the issue
+# again (`gh api`), and calls `gh` for nothing else. The fake `gh` answers
+# those reads as GitHub does: issue #2 is a native sub-issue of #1, the EPIC
+# --epic names too.
 REMOTE_EPIC = "https://github.com/example/dist-check/issues/1"
 REMOTE_ISSUE = "https://github.com/example/dist-check/issues/2"
 _REMOTE_REPOSITORY = "example/dist-check"
@@ -158,12 +162,22 @@ def _issue_row(number: int, parent: int | None) -> str:
     return json.dumps(row)
 
 
-# The `gh` arguments of the binding's reads, in the order a dry run makes them,
-# and the answer the fake `gh` gives each.
+# The `gh` arguments of each read and the answer the fake `gh` gives it.
+_REPOSITORY_READ = f"repo view {_REMOTE_REPOSITORY} --json nameWithOwner,defaultBranchRef"
 _BINDING_ANSWERS = {
+    _REPOSITORY_READ: json.dumps(
+        {"nameWithOwner": _REMOTE_REPOSITORY, "defaultBranchRef": {"name": "main"}}
+    ),
     f"api repos/{_REMOTE_REPOSITORY}/issues/2": _issue_row(2, parent=1),
     f"api repos/{_REMOTE_REPOSITORY}/issues/1": _issue_row(1, parent=None),
 }
+# The reads in the order a dry run makes them (PR #437 R1-F1, R1-F2).
+_BINDING_CALLS = (
+    _REPOSITORY_READ,
+    f"api repos/{_REMOTE_REPOSITORY}/issues/2",
+    f"api repos/{_REMOTE_REPOSITORY}/issues/1",
+    f"api repos/{_REMOTE_REPOSITORY}/issues/2",
+)
 _PLACEHOLDER = re.compile(r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}")
 # LOCAL mode's packaged files, deleted with it (ADR 0009 D12 S3, #388): its four
 # prompt templates and its two modules of its own. No artifact and no installed
@@ -694,8 +708,9 @@ def _changes(before: dict[str, _Entry], after: dict[str, _Entry]) -> list[str]:
 def _fake_gh(fake_bin: Path, calls: Path) -> None:
     """A ``gh`` in ``fake_bin`` that records its arguments in ``calls``.
 
-    It answers the EPIC binding's two reads (:data:`_BINDING_ANSWERS`, matched
-    on the whole argument list) and fails every other call.
+    It answers the reads of the checkout's repository and of the EPIC binding
+    (:data:`_BINDING_ANSWERS`, matched on the whole argument list) and fails
+    every other call.
     """
     fake_bin.mkdir()
     fake = fake_bin / "gh"
@@ -720,8 +735,9 @@ def _gh_calls(calls: Path) -> str:
 def remote_dry_run(autoforge: str, git: str, work: Path, env: dict[str, str]) -> None:
     """A REMOTE ``run --dry-run`` binds, renders a prompt, reads only the binding, writes nothing.
 
-    The repository has no ``origin`` and the issue URLs name no real
-    repository: past the EPIC binding's two reads (#293), which the ``gh``
+    The repository's ``origin`` names the issue URLs' repository, which is
+    no real one: past the reads a run makes before its first save (#293:
+    the repository, the issue, its EPIC, the issue again), which the ``gh``
     first on ``PATH`` answers, a dry run plans from in-memory state alone.
     That ``gh`` records its arguments and fails any other call, so any other
     call shows.
@@ -730,10 +746,11 @@ def remote_dry_run(autoforge: str, git: str, work: Path, env: dict[str, str]) ->
     _fake_gh(work / "fake-gh-bin", calls)
     remote_env = dict(env, PATH=f"{work / 'fake-gh-bin'}{os.pathsep}{env.get('PATH', '')}")
     repo = _scratch_repository(git, work / "remote-repo", remote_env)
+    _run([git, "remote", "add", "origin", FIRST_RUN_ORIGIN], cwd=repo, env=remote_env)
     _dry_run(autoforge, repo, remote_env, calls)
     _say(
         "ok: autoforge run --dry-run --full-prompt bound the EPIC and rendered the "
-        "ANALYZE_EXECUTE prompt; gh read the issue and the EPIC, nothing else"
+        "ANALYZE_EXECUTE prompt; gh read the repository, the issue and the EPIC, nothing else"
     )
 
 
@@ -878,7 +895,8 @@ def _dry_run(
 ) -> None:
     """``run --dry-run --full-prompt`` in ``repo``: the binding, the prompt, no write.
 
-    ``gh`` is called for the EPIC binding's two reads and nothing else (#293).
+    ``gh`` is called for the reads of :data:`_BINDING_CALLS`, in that order,
+    and nothing else (#293).
     """
     before, called = _tree(repo), _gh_calls(calls)
     argv = [autoforge, *options, "run", "--epic", REMOTE_EPIC, "--issue", REMOTE_ISSUE]
@@ -892,10 +910,10 @@ def _dry_run(
         _check(needle in plan, f"the REMOTE dry run printed no {needle!r}")
     _check(not _PLACEHOLDER.search(plan), "the REMOTE dry run's prompt has an unrendered variable")
     made = _gh_calls(calls)[len(called) :].splitlines()
-    if made != list(_BINDING_ANSWERS):
+    if made != list(_BINDING_CALLS):
         raise CheckFailed(
-            f"the REMOTE dry run called gh for {made!r}, not for the EPIC binding's two reads "
-            f"{list(_BINDING_ANSWERS)!r} alone"
+            f"the REMOTE dry run called gh for {made!r}, not for the repository and EPIC "
+            f"binding reads {list(_BINDING_CALLS)!r} alone"
         )
     changed = _changes(before, _tree(repo))
     _check(not changed, f"the REMOTE dry run changed the scratch repository: {changed}")

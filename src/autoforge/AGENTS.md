@@ -86,7 +86,8 @@ git_transport.py    controller git push: sanitized config, explicit URL, lease, 
 claims.py           durable GitHub claims: marker schemas, renderers, scan, cardinality
 validation.py       typed GitHub URL parsing and run-argument validation
 run_binding.py      the EPIC a new standalone run records: the issue's native parent, else
-                    `run --epic`; get_issue_node reads only, fails closed, no write (#293)
+                    `run --epic`; get_issue_node reads only (the issue again last), fails
+                    closed, no write (#293)
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
 materialize.py      byte-exact export of a candidate commit from the shared object store
                     and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171)

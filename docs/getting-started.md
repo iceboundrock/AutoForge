@@ -359,8 +359,9 @@ what you ran. `doctor` prints the versions it checks (`git available`,
 
 **Preview.** A dry run prints which EPIC the run would record, the plan of
 the first phases, the agent command and its limits, and the prompt. It
-reads the issue and the EPIC through `gh` (so `gh` must be signed in),
-starts no agent, runs no `git`, and writes no state:
+checks that the checkout's `origin` is the issues' repository and reads the
+issue and the EPIC through `gh` (so run it in the checkout, with `gh`
+signed in), starts no agent, writes nothing to git, and writes no state:
 
 ```bash
 autoforge --config autoforge.yaml run --epic "$epic" --issue "$issue" --dry-run
@@ -495,6 +496,7 @@ has a phase, see [Troubleshooting and recovery](troubleshooting.md).
 | `autoforge: error: expected a GitHub issue URL, got pr: '<url>'` | `--epic` and `--issue` take issues, not pull requests |
 | `autoforge: error: issue <url> has no native parent on GitHub and no --epic was given: ...` | pass `--epic "$epic"`, or make the issue a sub-issue of its EPIC on GitHub |
 | `autoforge: error: the EPIC --epic names <url> is closed on GitHub; a run records only an open EPIC ...` | reopen the EPIC, or name an open one |
+| `autoforge: error: issue <url> changed on GitHub while the run's EPIC was being bound: ...` | the issue was moved, attached, detached or closed while `run` read it; nothing was written: run the command again |
 | ``autoforge: error: cannot bind the run's EPIC: reading the issue <url> failed (`gh api repos/<repo>/issues/<n>` failed (exit 1): ...). Nothing was written, ...`` | `gh` cannot read the issue: sign in (`gh auth login`), check the URL, and that your token may read the repository |
 
 **`gh` and the agent CLIs.**

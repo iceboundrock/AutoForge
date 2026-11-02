@@ -16,8 +16,8 @@ development clone of AutoForge. With the command installed
 uv run autoforge doctor                 # environment checks (writes nothing but a state-dir probe)
 uv run autoforge doctor --json
 
-# preview: reads the issue and its EPIC through gh, writes nothing (no agent,
-# no git, no state file)
+# preview: reads the checkout's origin, the repository, the issue and its EPIC,
+# writes nothing (no agent, no git write, no state file)
 uv run autoforge run --epic https://github.com/owner/repo/issues/1 \
                --issue https://github.com/owner/repo/issues/2 --dry-run
 
@@ -94,8 +94,10 @@ repository as the current working directory (cross-repo runs are rejected).
 Which EPIC a new run records is decided from GitHub, not only from `--epic`:
 see [Which EPIC a run records](#which-epic-a-run-records).
 `run`, `step` and `resume` must be run inside a git checkout of that
-repository, because the repository lock lives in its git directory (dry-run
-does not need one).
+repository, because the repository lock lives in its git directory, and
+`run` refuses a checkout whose `origin` is another repository before it
+writes anything. `run --dry-run` makes the same check of the checkout's
+`origin`; `step --dry-run` and `resume --dry-run` need no checkout.
 
 ## Which EPIC a run records
 
@@ -133,10 +135,14 @@ the record whose `phase` is `INITIALIZING-epic-binding`, with
 `epic_source` `native-parent` or `epic-option`, `--epic` as given and the
 parent GitHub named).
 
-**What is checked, and when it refuses.** `run` reads the issue and the
-EPIC it would record through `gh` (`GET /repos/<owner>/<repo>/issues/<n>`
-each; nothing else). The issue and that EPIC must both be open, and the
-EPIC in the issue's repository: a native parent in another repository is
+**What is checked, and when it refuses.** `run` first checks that the
+checkout is the issue's repository: its `origin`, as GitHub names it
+(`gh repo view`, which follows a rename). Another repository, or an
+`origin` or repository that cannot be read, exits 1 and writes nothing.
+Then it reads the issue, the EPIC it would record and the issue again
+through `gh` (`GET /repos/<owner>/<repo>/issues/<n>` each; nothing else).
+The issue and that EPIC must both be open, and the EPIC in the issue's
+repository: a native parent in another repository is
 refused, and `--epic` does not override it. Each of these refusals exits 2
 and says what to change on GitHub or in the command. A read that fails
 (GitHub unavailable, a token that may not read the issue or its parent,
@@ -146,10 +152,15 @@ parent", so it never falls back to `--epic`: only an issue GitHub returned
 whole, without a parent, does.
 
 `run` reads the binding under the controller lock, after the
-existing-run and scheduler-ownership checks and immediately before it
-saves the new state, so the state records what GitHub answered at that
-moment. The dry run reads and prints it the same way, without the lock,
-and saves nothing.
+existing-run and scheduler-ownership checks, before `--force` replaces a
+run or moves an unreadable state aside, and immediately before it saves
+the new state, so the state records what GitHub answered at that moment.
+The issue is read last, after its EPIC: if its parent or its state changed
+on GitHub between its two reads (someone moved it while `run` read the
+EPIC), `run` refuses (exit 2, `issue <url> changed on GitHub while the
+run's EPIC was being bound`) and records nothing; run it again to bind what
+the issue says then. The dry run reads and prints it the same way, without
+the lock, and saves nothing.
 
 **Three different things.** GitHub's *native parent* of an issue is a fact
 on GitHub that anyone with access can change. A run's *recorded EPIC*
@@ -1073,10 +1084,12 @@ model/effort, agent limits, loop detection, round, template, variables,
 command, expected transition),
 redacted. What it reads depends on the command:
 
-- `run --dry-run` previews a new run. It reads the issue and the EPIC it
-  would record through `gh`, the same reads `run` makes ([Which EPIC a run
-  records](#which-epic-a-run-records)), and refuses as `run` would; it runs
-  no `git` and makes no other `gh` call.
+- `run --dry-run` previews a new run. It reads the checkout's `origin`
+  (one read-only `git remote get-url`) and the repository it names, then
+  the issue, the EPIC it would record and the issue again through `gh`:
+  the same reads `run` makes before its first save ([Which EPIC a run
+  records](#which-epic-a-run-records)). It refuses as `run` would, runs no
+  other `git` and makes no other `gh` call.
 - `step --dry-run` and `resume --dry-run` preview the existing run and make
   no `gh` call.
 - `unblock --dry-run` reads GitHub to report the decision it would make

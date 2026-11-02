@@ -531,7 +531,7 @@ phase or a person, which the agent needs to know just as much. The hint is
 information only: it changes no state, a clean worktree renders nothing, a
 status read that fails renders nothing and the run log's `request.json`
 says why (`metadata.worktree_state`), and the verification after the phase
-is unchanged. A plan or a dry run runs no git and shows a placeholder.
+is unchanged. A plan or a dry run reads no worktree status and shows a placeholder.
 
 Every probe below and the read-back after the agent consume one identity
 model, `src/autoforge/claims.py`: one exact-schema decoder per marker kind,

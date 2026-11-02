@@ -40,10 +40,25 @@ never from the operator's memory or the issue's text
   other than the issue refuses the run with the read's error, and never
   falls back to `--epic`. A parent in another repository, or an issue or
   EPIC that is not open, refuses too.
-- `run` binds once, under the controller lock, after its existing-run and
-  scheduler-ownership guards and immediately before the run's first save,
-  so the state records what GitHub answered then. A refusal writes nothing.
-  The run log records the binding and its source.
+- Before any of those reads, the checkout must be the issue's repository:
+  its `origin`, read through the hardened local request, as GitHub names it
+  (`gh repo view`, which follows a rename). A checkout of another
+  repository, or one whose `origin` or repository cannot be read, refuses
+  the run (PR #437 R1-F2). INITIALIZING checks it again on every entry.
+- The issue is read again after its EPIC: the EPIC's read is a second
+  request, and a person can re-parent, detach, attach or close the issue
+  meanwhile, which the controller lock does not stop. A change of the
+  issue's id, state or native parent between its two reads refuses the run
+  rather than record the first answer's parent (PR #437 R1-F1). The window
+  left is the local work between the last read and the save: no read makes
+  a remote change atomic with a local one.
+- `run` checks the checkout and binds once, under the controller lock,
+  after its existing-run and scheduler-ownership guards, before it
+  replaces a run or moves an unreadable state aside, and immediately
+  before the run's first save, so the state records what GitHub answered
+  then. A refusal writes nothing. The run log records the binding and its
+  source. `run --dry-run` makes the same checks and reads, without the
+  lock, so it refuses what the run would refuse.
 - A recorded EPIC is never re-read: `resume`, `step`, `unblock` and `status`
   act on `epic_url`, and a parent changed on GitHub after the run started
   changes nothing (rebinding an existing run is #435). A scheduler worker
@@ -1062,9 +1077,11 @@ When dry-run is active, AutoForge may:
 - render prompts
 - show intended commands
 - show expected transitions
-- read the issue and the EPIC it binds to through `gh`, read-only, for
-  `run --dry-run`'s EPIC binding (#293): the same binding `run` makes, so
-  a dry run refuses what the run would refuse
+- read the checkout's `origin` (the hardened local git request, which
+  writes nothing) and the repository it names through `gh`, and the issue,
+  the EPIC it binds to and the issue again through `gh`, read-only, for
+  `run --dry-run`'s checks before a new run's first save (#293): the same
+  checks `run` makes, so a dry run refuses what the run would refuse
 
 It must not:
 

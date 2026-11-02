@@ -4,13 +4,15 @@ Offline: the binding reads through ``FakeGitHub`` (its ``parents``) or a real
 ``GitHubClient`` whose ``gh`` is a scripted runner serving REST rows of the
 shape ``tests/fixtures/github_graph/`` recorded. The regression is the live
 incident: issue #257, whose native parent is #255, started with ``--epic
-#158`` and recorded #158.
+#158`` and recorded #158. The issue is read again after its EPIC, and an
+issue that changed on GitHub in between is refused (PR #437 R1-F1).
 """
 
 from __future__ import annotations
 
 import ast
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -82,13 +84,24 @@ def _result(stdout: str = "", exit_code: int = 0, stderr: str = "", **flags) -> 
     )
 
 
-def _client(answers: dict[int, ExecutionResult], calls: list[list[str]]) -> GitHubClient:
-    """A real client whose ``gh api repos/<repo>/issues/<n>`` answers from ``answers``."""
+def _client(
+    answers: dict[int, ExecutionResult],
+    calls: list[list[str]],
+    during: dict[int, Callable[[], None]] | None = None,
+) -> GitHubClient:
+    """A real client whose ``gh api repos/<repo>/issues/<n>`` answers from ``answers``.
+
+    ``during`` runs a change on GitHub while issue ``n`` is being read, before
+    it is answered: what a person does in the meantime, which the controller
+    lock does not stop.
+    """
 
     def runner(request):
         calls.append(request.command)
         assert request.command[:2] == ["gh", "api"], request.command  # reads only
         number = int(request.command[2].rsplit("/", 1)[1])
+        if during and number in during:
+            during.pop(number)()
         return answers[number]
 
     return GitHubClient(runner=runner, transient_retries=0, retry_delay_seconds=0)
@@ -116,8 +129,9 @@ def test_the_257_regression_binds_the_native_parent_and_names_all_three():
     assert binding.supplied is not None and binding.supplied.number == 158
     assert binding.native_parent is not None and binding.native_parent.number == 255
     assert binding.supplied_differs
-    # The issue and the EPIC it binds to are read; the unused --epic is not.
-    assert calls == [_api(257), _api(255)]
+    # The issue, the EPIC it binds to and the issue again are read; the
+    # unused --epic is not.
+    assert calls == [_api(257), _api(255), _api(257)]
     assert binding.lines() == [
         "EPIC binding for issue #257:",
         f"  --epic:        #158 {_issue_url(158)}",
@@ -150,7 +164,7 @@ def test_no_parent_is_only_an_answer_that_carries_the_sub_issue_summaries():
     binding = bind_run_epic(parentless, _issue_url(257), _issue_url(158))
     assert binding.source is EpicSource.EPIC_OPTION and binding.epic_url == _issue_url(158)
     assert binding.native_parent is None
-    assert calls == [_api(257), _api(158)]
+    assert calls == [_api(257), _api(158), _api(257)]
 
     no_summaries = _row(257)
     del no_summaries["sub_issues_summary"]
@@ -211,17 +225,22 @@ def test_no_parent_is_only_an_answer_that_carries_the_sub_issue_summaries():
         ),
     ],
 )
-@pytest.mark.parametrize("which", ["issue", "parent"])
+@pytest.mark.parametrize("which", ["issue", "parent", "issue-again"])
 def test_a_read_that_fails_refuses_and_never_falls_back_to_the_epic_option(
     answer, expected, match, which
 ):
-    """Unavailable, 401/403/404, malformed or truncated evidence: no binding, no --epic."""
+    """Unavailable, 401/403/404, malformed or truncated evidence: no binding, no --epic.
+
+    The issue's second read, after its EPIC's (PR #437 R1-F1), is held to the
+    same rules as its first.
+    """
     calls: list[list[str]] = []
     answers = {
         257: answer if which == "issue" else _result(json.dumps(_row(257, parent=255))),
         255: answer if which == "parent" else _result(json.dumps(_row(255))),
         158: _result(json.dumps(_row(158))),
     }
+    during = {255: lambda: answers.update({257: answer})} if which == "issue-again" else None
     if which == "parent" and "answered with" in match:
         answers[255] = _result(
             json.dumps(
@@ -236,17 +255,145 @@ def test_a_read_that_fails_refuses_and_never_falls_back_to_the_epic_option(
         answers[255] = _result(
             json.dumps(_row(255, html_url=f"https://github.com/{_REPO}/pull/255"))
         )
-    gh = _client(answers, calls)
+    gh = _client(answers, calls, during)
     with pytest.raises(expected, match=match) as raised:
         bind_run_epic(gh, _issue_url(257), _issue_url(158))
     message = str(raised.value)
-    assert message.startswith("cannot bind the run's EPIC: reading ")
+    assert message.startswith(
+        "cannot bind the run's EPIC: reading "
+        + ("the issue again " if which == "issue-again" else "")
+    )
     assert "a failed read never falls back to --epic" in message
     if expected is GitHubError:
         assert not isinstance(raised.value, (GitHubUnavailableError, GitHubNotFoundError))
     # #158 is never read: a failed read decides nothing.
     assert _api(158) not in calls
-    assert calls == ([_api(257)] if which == "issue" else [_api(257), _api(255)])
+    made = {
+        "issue": [_api(257)],
+        "parent": [_api(257), _api(255)],
+        "issue-again": [_api(257), _api(255), _api(257)],
+    }
+    assert calls == made[which]
+
+
+# -- the issue read again after its EPIC (PR #437 R1-F1) -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "first, then, epic_option, epic_read, change",
+    [
+        # Re-parented under another issue while its parent was read.
+        (
+            {"parent": 255},
+            {"parent": 300},
+            None,
+            255,
+            f"its native parent was {_issue_url(255)} and is now {_issue_url(300)}",
+        ),
+        # The same, with an --epic naming the issue it is moved under.
+        (
+            {"parent": 255},
+            {"parent": 158},
+            158,
+            255,
+            f"its native parent was {_issue_url(255)} and is now {_issue_url(158)}",
+        ),
+        # No parent to a parent: attached while --epic was read, so --epic
+        # would have been recorded although the issue now has a native parent.
+        (
+            {},
+            {"parent": 255},
+            158,
+            158,
+            f"its native parent was none and is now {_issue_url(255)}",
+        ),
+        # A parent to none: detached while its parent was read.
+        (
+            {"parent": 255},
+            {},
+            158,
+            255,
+            f"its native parent was {_issue_url(255)} and is now none",
+        ),
+        # Closed while its parent was read.
+        (
+            {"parent": 255},
+            {"parent": 255, "state": "closed"},
+            None,
+            255,
+            "it was open and is now closed",
+        ),
+        # Another issue answering for the number (GitHub's id is not the same).
+        (
+            {"parent": 255},
+            {"parent": 255, "id": 7},
+            None,
+            255,
+            f"GitHub's id for it was {4_000_257} and is now 7",
+        ),
+    ],
+    ids=["re-parented", "re-parented-to-epic", "attached", "detached", "closed", "other-id"],
+)
+def test_an_issue_that_changes_while_its_epic_is_read_binds_nothing(
+    first, then, epic_option, epic_read, change
+):
+    """The EPIC's read is a second request; the issue can change on GitHub meanwhile.
+
+    The issue is read again once the EPIC has answered, and any change of
+    its id, state or native parent refuses the binding: the parent of the
+    first answer, or --epic chosen for an absence that no longer holds, is
+    never returned for the state to record.
+    """
+    calls: list[list[str]] = []
+    answers = {
+        257: _result(json.dumps(_row(257, **first))),
+        255: _result(json.dumps(_row(255))),
+        158: _result(json.dumps(_row(158))),
+    }
+
+    def change_on_github():
+        answers[257] = _result(json.dumps(_row(257, **then)))
+
+    gh = _client(answers, calls, {epic_read: change_on_github})
+    supplied = _issue_url(epic_option) if epic_option is not None else None
+    with pytest.raises(EpicBindingError) as raised:
+        bind_run_epic(gh, _issue_url(257), supplied)
+    message = str(raised.value)
+    assert message.startswith(
+        f"issue {_issue_url(257)} changed on GitHub while the run's EPIC was being bound: "
+    )
+    assert change in message
+    assert "Nothing was written and no EPIC was recorded; run the command again" in message
+    assert calls == [_api(257), _api(epic_read), _api(257)]
+
+
+def test_an_issue_unchanged_on_its_second_read_binds_through_fake_github():
+    """FakeGitHub's graph: the second read answers as the first, and the binding stands."""
+    gh = FakeGitHub()
+    binding = bind_run_epic(gh, ISSUE, None)
+    assert binding.epic_url == EPIC
+    assert gh.calls == [
+        ("get_issue_node", ISSUE),
+        ("get_issue_node", EPIC),
+        ("get_issue_node", ISSUE),
+    ]
+
+
+def test_an_issue_attached_to_a_parent_while_the_epic_option_is_read_is_refused():
+    """No parent to a parent, through FakeGitHub: --epic is not recorded for it."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE3, "orphan", parent=None)
+    gh.add_issue(_PARENT, "its EPIC", parent=None)
+    read = gh.get_issue_node
+
+    def get_issue_node(url):
+        if url == EPIC:  # --epic is being read: someone attaches #3 under #10
+            gh.parents[ISSUE3] = _PARENT
+        return read(url)
+
+    gh.get_issue_node = get_issue_node  # type: ignore[method-assign]
+    with pytest.raises(EpicBindingError, match=f"was none and is now {_PARENT}"):
+        bind_run_epic(gh, ISSUE3, EPIC)
 
 
 # -- the binding rules, through FakeGitHub ----------------------------------------------------
@@ -281,7 +428,11 @@ def test_an_issue_without_a_native_parent_binds_the_epic_option():
         f"  used:          #1 {EPIC} (--epic, since the issue has no native parent)",
     ]
     assert binding.record()["native_parent_url"] is None
-    assert gh.calls == [("get_issue_node", ISSUE3), ("get_issue_node", EPIC)]
+    assert gh.calls == [
+        ("get_issue_node", ISSUE3),
+        ("get_issue_node", EPIC),
+        ("get_issue_node", ISSUE3),
+    ]
 
 
 def test_without_a_native_parent_or_the_epic_option_the_run_is_refused():

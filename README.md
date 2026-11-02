@@ -304,7 +304,8 @@ with no parent ([Which EPIC a run records](https://github.com/iceboundrock/AutoF
 # 1. check the environment (writes nothing but a state-dir probe)
 autoforge doctor
 
-# 2. preview: reads the issue and its EPIC through gh, writes nothing
+# 2. preview, in the checkout: reads its repository, the issue and its EPIC
+#    through gh, writes nothing
 autoforge run --epic https://github.com/owner/repo/issues/1 \
               --issue https://github.com/owner/repo/issues/2 --dry-run
 

@@ -52,6 +52,7 @@ from tests.conftest import (
     dotdot_config_paths,
     fixed,
     fixer,
+    git_out,
     git_repo,
     github_origin,
     implement,
@@ -135,8 +136,14 @@ def test_run_dry_run_writes_nothing(tmp_path, capsys, monkeypatch, fakes):
     assert "Expected next" in out and "Command" in out
     assert f"  used:          #1 {EPIC} (the issue's native parent, which --epic names too)" in out
     assert not sd.exists()
-    # The binding's two reads (#293), and nothing else: no write, no agent.
-    assert fakes["gh"].calls == [("get_issue_node", ISSUE), ("get_issue_node", EPIC)]
+    # The checkout's repository and the binding's reads (#293), as the run
+    # makes them, and nothing else: no write, no agent.
+    assert fakes["gh"].calls == [
+        ("get_repo", "owner/repo"),
+        ("get_issue_node", ISSUE),
+        ("get_issue_node", EPIC),
+        ("get_issue_node", ISSUE),
+    ]
     assert fakes["provider"].calls == []
 
 
@@ -246,7 +253,7 @@ def test_an_issue_with_neither_a_parent_nor_epic_is_refused_before_anything_is_w
     assert "has no native parent on GitHub and no --epic was given" in captured.err
     assert "Traceback" not in captured.err and "EPIC binding" not in captured.out
     assert not sd.exists()
-    assert fakes["gh"].calls == [("get_issue_node", ISSUE)]
+    assert fakes["gh"].calls == [("get_repo", "owner/repo"), ("get_issue_node", ISSUE)]
     assert fakes["provider"].calls == []
     ControllerLock(repository_lock_path(tmp_path)).acquire().release()  # released
 
@@ -274,7 +281,11 @@ def test_a_failed_parent_read_refuses_the_run_and_never_falls_back_to_epic(
     assert f"reading the issue's native parent {EPIC} failed" in err
     assert "a failed read never falls back to --epic" in err
     assert not sd.exists()
-    assert gh.calls == [("get_issue_node", ISSUE), ("get_issue_node", EPIC)]
+    assert gh.calls == [
+        ("get_repo", "owner/repo"),
+        ("get_issue_node", ISSUE),
+        ("get_issue_node", EPIC),
+    ]
     assert gh.effect_writes == [] and fakes["provider"].calls == []
 
 
@@ -316,11 +327,196 @@ def test_the_binding_is_read_under_the_lock_immediately_before_the_first_save(
     sd = tmp_path / ".autoforge"
     argv = ["--state-dir", str(sd), "run", "--issue", _ISSUE_257, "--max-steps", "1"]
     assert cli.main(argv) == 0
-    assert held_during_reads == [True, True]
+    assert held_during_reads == [True, True, True]  # the issue, its parent, the issue again
     assert load_state(sd / "state.json").epic_url == _EPIC_158
     assert f"  used:          #158 {_EPIC_158} (the issue's native parent)" in (
         capsys.readouterr().out
     )
+
+
+_ISSUE_300 = "https://github.com/owner/repo/issues/300"
+
+
+def _change_the_parent_while_the_epic_is_read(gh, monkeypatch, epic: str, parent: str) -> None:
+    """While ``epic`` is read, someone puts #257 under ``parent`` on GitHub (PR #437 R1-F1)."""
+    gh.add_issue(_ISSUE_300, "another EPIC", parent=None)
+    real_read = gh.get_issue_node
+
+    def read(url):
+        if url == epic:
+            gh.parents[_ISSUE_257] = parent
+        return real_read(url)
+
+    monkeypatch.setattr(gh, "get_issue_node", read)
+
+
+@pytest.mark.parametrize(
+    "start, epic_option, read, then",
+    [
+        # Re-parented from #255 to #300 while #255 was read.
+        ("parented", None, _PARENT_255, _ISSUE_300),
+        # No parent to a parent: attached under #300 while --epic #255 was read.
+        ("orphan", _PARENT_255, _PARENT_255, _ISSUE_300),
+    ],
+    ids=["re-parented", "attached"],
+)
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_a_parent_changed_while_the_epic_is_read_records_nothing(
+    tmp_path, capsys, monkeypatch, fakes, start, epic_option, read, then, dry_run
+):
+    """PR #437 R1-F1: the issue is read again after its EPIC, under the lock.
+
+    A parent changed on GitHub while the EPIC was read refuses the run, and
+    its dry run alike: the parent of the first answer (or --epic, chosen for
+    an absence that no longer holds) is never saved, and nothing is written.
+    """
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    _the_257_graph(gh)
+    if start == "orphan":
+        gh.parents[_ISSUE_257] = None
+    _change_the_parent_while_the_epic_is_read(gh, monkeypatch, read, then)
+    sd = tmp_path / ".autoforge"
+    argv = ["--state-dir", str(sd), "run", "--issue", _ISSUE_257, "--max-steps", "2"]
+    if epic_option is not None:
+        argv += ["--epic", epic_option]
+    assert cli.main([*argv, *(["--dry-run"] if dry_run else [])]) == 2
+    captured = capsys.readouterr()
+    assert (
+        f"issue {_ISSUE_257} changed on GitHub while the run's EPIC was being bound: its native "
+        f"parent was {'none' if start == 'orphan' else _PARENT_255} and is now {_ISSUE_300}"
+    ) in captured.err
+    assert "Traceback" not in captured.err and "EPIC binding" not in captured.out
+    assert not sd.exists()
+    assert gh.calls == [
+        ("get_repo", "owner/repo"),
+        ("get_issue_node", _ISSUE_257),
+        ("get_issue_node", read),
+        ("get_issue_node", _ISSUE_257),
+    ]
+    assert gh.effect_writes == [] and fakes["provider"].calls == []
+    ControllerLock(repository_lock_path(tmp_path)).acquire().release()  # released
+
+
+@pytest.mark.parametrize("existing", ["valid", "unreadable"])
+def test_a_parent_changed_while_the_epic_is_read_keeps_the_run_force_would_replace(
+    tmp_path, capsys, monkeypatch, fakes, existing
+):
+    """PR #437 R1-F1: ``run --force`` refused by the re-read leaves the state there as it was.
+
+    A run of another issue is in the state directory (or a state file that
+    does not load); the refused ``--force`` replaces nothing, moves nothing
+    aside and writes no run log.
+    """
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    sd = tmp_path / ".autoforge"
+    assert cli.main(["--state-dir", str(sd), "run", "--issue", ISSUE, "--max-steps", "1"]) == 0
+    if existing == "unreadable":
+        (sd / "state.json").write_text("{not json")
+    before = _files(sd)
+    capsys.readouterr()
+    _the_257_graph(gh)
+    _change_the_parent_while_the_epic_is_read(gh, monkeypatch, _PARENT_255, _ISSUE_300)
+    argv = ["--state-dir", str(sd), "run", "--issue", _ISSUE_257, "--force", "--max-steps", "2"]
+    assert cli.main(argv) == 2
+    assert "changed on GitHub while the run's EPIC was being bound" in capsys.readouterr().err
+    assert _files(sd) == before  # nothing replaced, quarantined or logged
+    assert fakes["provider"].calls == []
+
+
+def _checkout_of_another_repository(tmp_path, gh) -> str:
+    github_origin(tmp_path, "someone/else")
+    return "repository mismatch: this checkout's 'origin' is 'someone/else'"
+
+
+def _checkout_without_an_origin(tmp_path, gh) -> str:
+    git_out("-C", str(tmp_path), "remote", "remove", "origin")
+    return "a run starts in a checkout of the issue's repository, and this checkout's 'origin' "
+
+
+def _repository_read_unavailable(tmp_path, gh) -> str:
+    gh.get_repo_error = GitHubUnavailableError("gh repo view owner/repo: HTTP 502: Bad Gateway")
+    return "HTTP 502: Bad Gateway"
+
+
+def _repository_read_denied(tmp_path, gh) -> str:
+    gh.get_repo_error = GitHubError("gh repo view owner/repo: HTTP 403: Resource not accessible")
+    return "HTTP 403: Resource not accessible"
+
+
+_REPOSITORY_REFUSALS = {
+    "another-repository": _checkout_of_another_repository,
+    "no-origin": _checkout_without_an_origin,
+    "read-unavailable": _repository_read_unavailable,
+    "read-denied": _repository_read_denied,
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(_REPOSITORY_REFUSALS))
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_the_checkout_repository_is_verified_before_the_binding_and_the_first_save(
+    tmp_path, capsys, monkeypatch, fakes, refusal, dry_run
+):
+    """PR #437 R1-F2: a checkout of another repository, or one whose repository cannot be
+    read, refuses ``run`` and its dry run alike before the binding reads anything, with
+    no state, no run log and no agent."""
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    expected = _REPOSITORY_REFUSALS[refusal](tmp_path, gh)
+    sd = tmp_path / ".autoforge"
+    argv = ["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "2"]
+    assert cli.main([*argv, *(["--dry-run"] if dry_run else [])]) == 1
+    captured = capsys.readouterr()
+    assert expected in captured.err
+    assert "Traceback" not in captured.err and "EPIC binding" not in captured.out
+    assert not sd.exists()
+    assert not [call for call in gh.calls if call[0] != "get_repo"]  # no binding read
+    assert gh.effect_writes == [] and fakes["provider"].calls == []
+
+
+@pytest.mark.parametrize("refusal", ["another-repository", "read-unavailable"])
+@pytest.mark.parametrize("existing", ["nonterminal", "unreadable"])
+def test_run_force_from_the_wrong_checkout_keeps_the_existing_state(
+    tmp_path, capsys, monkeypatch, fakes, refusal, existing
+):
+    """PR #437 R1-F2: ``run --force`` checks the checkout's repository before it replaces a
+    run or moves an unreadable state aside, so a refusal leaves both exactly as they were."""
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    sd = tmp_path / ".autoforge"
+    assert cli.main(["--state-dir", str(sd), "run", "--issue", ISSUE, "--max-steps", "1"]) == 0
+    assert load_state(sd / "state.json").phase is Phase.ANALYZE_EXECUTE
+    if existing == "unreadable":
+        (sd / "state.json").write_text("{not json")
+    before = _files(sd)
+    capsys.readouterr()
+    gh.calls.clear()
+    expected = _REPOSITORY_REFUSALS[refusal](tmp_path, gh)
+    argv = ["--state-dir", str(sd), "run", "--issue", ISSUE, "--force", "--max-steps", "2"]
+    assert cli.main(argv) == 1
+    assert expected in capsys.readouterr().err
+    assert _files(sd) == before  # nothing replaced, quarantined or logged
+    assert not [call for call in gh.calls if call[0] != "get_repo"]
+    assert fakes["provider"].calls == []
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_a_checkout_of_a_renamed_repository_starts_the_run(
+    tmp_path, capsys, monkeypatch, fakes, dry_run
+):
+    """GitHub's name for the checkout's ``origin`` is what is compared (#283): an origin
+    still naming a renamed repository is the issue's repository."""
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    github_origin(tmp_path, "owner/old-name")
+    gh.repo_names["owner/old-name"] = "owner/repo"
+    sd = tmp_path / ".autoforge"
+    argv = ["--state-dir", str(sd), "run", "--issue", ISSUE, "--max-steps", "1"]
+    assert cli.main([*argv, *(["--dry-run"] if dry_run else [])]) == 0
+    assert f"  used:          #1 {EPIC} (the issue's native parent)" in capsys.readouterr().out
+    assert gh.calls[0] == ("get_repo", "owner/old-name")
+    assert sd.exists() is not dry_run
 
 
 def test_status_shows_the_recorded_epic_and_never_the_current_parent(
@@ -3164,23 +3360,36 @@ def test_commands_refuse_to_run_outside_a_git_repository(
         assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
 
 
-def test_dry_run_needs_no_repository_and_spawns_no_git(
-    tmp_path_factory, capsys, monkeypatch, fakes
+def test_dry_run_takes_no_lock_and_only_run_needs_a_checkout(
+    tmp_path, tmp_path_factory, capsys, monkeypatch, fakes
 ):
-    """Dry-run takes no lock, so it neither resolves the repository nor runs git."""
-    import autoforge.engine as engine_mod
+    """Dry-run takes no lock, so it never resolves the repository lock.
 
-    outside = tmp_path_factory.mktemp("not-a-repo")
-    monkeypatch.chdir(outside)
+    ``run --dry-run`` checks the checkout's repository as ``run`` does (PR #437
+    R1-F2), so outside a checkout it is refused before the binding reads
+    anything, writing nothing; in the issue's checkout it previews. ``step``
+    and ``resume`` dry runs read the state alone and need no repository.
+    """
+    import autoforge.engine as engine_mod
 
     def never(*a, **k):
         raise AssertionError("dry-run must not resolve the repository lock")
 
     monkeypatch.setattr(engine_mod, "repository_lock_path", never)
+    outside = tmp_path_factory.mktemp("not-a-repo")
+    monkeypatch.chdir(outside)
     sd = outside / ".autoforge"
-    assert cli.main(_run_argv(sd, "--dry-run")) == 0
+    assert cli.main(_run_argv(sd, "--dry-run")) == 1
+    err = capsys.readouterr().err
+    assert "a run starts in a checkout of the issue's repository, and this checkout's " in err
+    assert not sd.exists() and fakes["gh"].calls == []
+
+    monkeypatch.chdir(tmp_path)  # a checkout whose origin is the issue's repository
+    assert cli.main(_run_argv(tmp_path / ".autoforge", "--dry-run")) == 0
     assert "analyze_execute.md" in capsys.readouterr().out
-    assert not sd.exists()
+    assert not (tmp_path / ".autoforge").exists()
+
+    monkeypatch.chdir(outside)
     sd.mkdir()
     save_state(_other_controller_state("af-live"), sd / "state.json")
     assert cli.main(["--state-dir", str(sd), "step", "--dry-run"]) == 0
@@ -3306,8 +3515,9 @@ def test_status_reads_and_unblock_acts_on_a_namespace_state_dir(
 
 
 def test_a_dry_run_is_not_refused_and_writes_nothing(tmp_path, capsys, monkeypatch, fakes):
-    """A dry run takes no lock and runs no git, so it has no coordination root
-    to compare with; it writes nothing either way."""
+    """A dry run takes no lock and derives no coordination root to compare with
+    (``run --dry-run`` reads only the checkout's ``origin``); it writes nothing
+    either way."""
     monkeypatch.chdir(tmp_path)
     sd = _namespace_state_dir(tmp_path)
     assert cli.main(["--state-dir", str(sd), *_run_argv(None, "--dry-run")]) == 0
