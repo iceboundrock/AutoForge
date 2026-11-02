@@ -55,9 +55,11 @@ scheduler namespace's state is classified in the scheduler's view (a
 scheduler's), and a state directory whose view nothing establishes leaves
 such a phase `undecidable`. A path given that is missing, a link or no
 directory, and a directory on the way down that cannot be listed, is
-reported with the stage that failed, and the summary
-(`autoforge.stop-corpus/3`) says its input is incomplete instead of
-counting fewer runs.
+reported with the stage that failed, and the summary says its input is
+incomplete instead of counting fewer runs. A line the controller writes of
+itself that records no invocation, such as the EPIC a new run binds, is
+counted as bookkeeping (`autoforge.stop-corpus/4`), never as a launch, so
+it inflates no launch total and dilutes no failure rate.
 
 ### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
 

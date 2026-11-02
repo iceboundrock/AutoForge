@@ -3,9 +3,9 @@
 No test: the corpus protocol of ADR 0011 (D7), which a maintainer runs by
 hand over the state directories of past runs. It finds every run a state
 directory still holds evidence of, classifies each one once with
-:mod:`autoforge.stop_classification`, counts its run log's launches and
-operator actions from typed fields only, and prints a summary (``--json``:
-the ``autoforge.stop-corpus/3`` document)::
+:mod:`autoforge.stop_classification`, counts its run log's launches,
+operator actions and bookkeeping lines from typed fields only, and prints a
+summary (``--json``: the ``autoforge.stop-corpus/4`` document)::
 
     uv run python -m tests.stop_corpus ~/code/AutoForge/.autoforge
     uv run python -m tests.stop_corpus --json RUN_DIR [RUN_DIR ...] > corpus.json
@@ -50,7 +50,11 @@ descriptor-relative, links unfollowed, within its size bound
 - an *operator action* is one run log line of an operator's ``unblock``
   (applied or refused) or accepted configuration change. It is no launch.
   Each applied ``unblock`` ended one BLOCKED episode, which needed a human
-  by the exit rule, whatever its reason.
+  by the exit rule, whatever its reason;
+- a *bookkeeping line* is one run log line the controller wrote of itself,
+  recording no invocation: a ``(...; no agent)`` profile no operator action
+  has, with no provider and no command (the EPIC a new run binds, #293). It
+  is no launch, so it is in no launch total and no failure rate.
 
 **What it cannot say** (printed with every summary, :data:`LIMITATIONS`):
 no reason code is persisted (ADR 0011 D5), so a saved BLOCKED or FAILED
@@ -105,7 +109,7 @@ from autoforge.stop_classification import (
     classify_state,
 )
 
-SCHEMA = "autoforge.stop-corpus/3"
+SCHEMA = "autoforge.stop-corpus/4"
 # How deep below a given path a state directory is looked for.
 MAX_DEPTH = 4
 JOURNAL_NAME = "events.jsonl"
@@ -143,6 +147,9 @@ LIMITATIONS = (
     "agent's provider and profile, a '(controller ...)' profile), never by a limit, which "
     "agent lines also carried before #193; a line that names neither, or both, is kind "
     "'unknown'",
+    "a line is bookkeeping, no launch, only when its profile says '(...; no agent)', it is "
+    "no operator's, and it names no provider and no command; one that says no agent and "
+    "names either contradicts itself and is a launch of kind 'unknown'",
     "a run is a run id: one whose state is gone (a new standalone run replaced it) or does "
     "not load counts as 'undecidable', and its run log is still counted",
     "a state file that does not load and names no readable run id is counted apart, never "
@@ -361,6 +368,8 @@ class JournalCounts:
     launches: Counter[str] = field(default_factory=Counter)
     failed_launches: Counter[str] = field(default_factory=Counter)
     operator_actions: Counter[str] = field(default_factory=Counter)
+    #: Lines the controller wrote of itself, recording no invocation.
+    bookkeeping: Counter[str] = field(default_factory=Counter)
     torn_lines: int = 0
     foreign_lines: int = 0
     malformed_lines: int = 0
@@ -462,6 +471,7 @@ _FIELD_TYPES: dict[str, tuple[type, ...]] = {
     "timed_out": (bool,),
     "exit_code": (int, type(None)),
     "metadata": (dict,),
+    "command": (list,),
 }
 
 
@@ -496,6 +506,31 @@ def operator_kind(record: dict) -> str | None:
 # The profile every controller-run command's record names: a validation or
 # pre-merge verification command, in every engine that wrote a run log.
 CONTROLLER_PROFILE_PREFIX = "(controller "
+# How every engine ends the profile of a run log line that records no agent:
+# an operator's action, or the controller's own bookkeeping.
+NO_AGENT_SUFFIX = "; no agent)"
+
+
+def bookkeeping_kind(record: dict) -> str:
+    """A bookkeeping line's kind, ``""`` for none; read after :func:`operator_kind`.
+
+    The controller writes a line of itself that records no invocation under
+    a ``(...; no agent)`` profile, with no provider and no command: the EPIC
+    a new run binds (``<phase>-epic-binding``, #293) is ``epic-binding``,
+    another such line ``other``. It is no launch. A line that says no agent
+    but names a provider or a command, and a ``(controller ...)`` profile,
+    is none: what it records is not established, so it stays a launch for
+    :func:`launch_kind` to type.
+    """
+    profile = record.get("profile", "")
+    if (
+        not (profile.startswith("(") and profile.endswith(NO_AGENT_SUFFIX))
+        or profile.startswith(CONTROLLER_PROFILE_PREFIX)
+        or record.get("provider", "")
+        or record.get("command", [])
+    ):
+        return ""
+    return "epic-binding" if record.get("phase", "").endswith("-epic-binding") else "other"
 
 
 def launch_kind(record: dict) -> str:
@@ -506,13 +541,14 @@ def launch_kind(record: dict) -> str:
     and named a controller-run command by a ``(controller ...)`` profile
     and no provider. ``timeout_seconds`` says neither: an agent's record
     carried its wall-clock limit there until #193. A record that names both,
-    or neither (one of another producer, such as a record with a ``(...;
-    no agent)`` profile no operator action has), is ``unknown``, never
-    guessed.
+    or neither (a provider with a profile that says no agent, a ``(...; no
+    agent)`` profile with a command, no producer at all), is ``unknown``,
+    never guessed. A bookkeeping line (:func:`bookkeeping_kind`) is no
+    launch and never reaches here.
     """
     profile, provider = record.get("profile", ""), record.get("provider", "")
     controller = profile.startswith(CONTROLLER_PROFILE_PREFIX)
-    if provider and profile and not controller:
+    if provider and profile and not controller and not profile.endswith(NO_AGENT_SUFFIX):
         return "agent"
     if controller and not provider:
         return "command"
@@ -538,7 +574,11 @@ def launch_code(record: dict) -> StopReasonCode:
 
 
 def count_journal(counts: JournalCounts, data: bytes) -> None:
-    """Count each line of a run log once: a launch, an operator action or a bad line."""
+    """Count each run log line once: a launch, an operator action, bookkeeping or a bad line.
+
+    An operator's line and a bookkeeping line are each told apart before a
+    launch is counted, so neither is in a launch total or a failure rate.
+    """
     for line in data.splitlines():
         if not line.strip():
             continue
@@ -561,6 +601,8 @@ def count_journal(counts: JournalCounts, data: bytes) -> None:
             counts.malformed_lines += 1
         elif operator:
             counts.operator_actions[operator] += 1
+        elif bookkeeping := bookkeeping_kind(record):
+            counts.bookkeeping[bookkeeping] += 1
         else:
             kind = launch_kind(record)
             counts.launches[kind] += 1
@@ -652,6 +694,7 @@ class RunReport:
             "launches": dict(sorted(j.launches.items())),
             "failed_launches": dict(sorted(j.failed_launches.items())),
             "operator_actions": dict(sorted(j.operator_actions.items())),
+            "bookkeeping": dict(sorted(j.bookkeeping.items())),
             "unblock_history": self.unblock_history,
             "journal": self.journal_status,
             "journal_copies": self.journal_copies,
@@ -748,6 +791,7 @@ def summarize(corpus: Corpus) -> dict[str, object]:
     launches: Counter[str] = Counter()
     failures: Counter[str] = Counter()
     operator: Counter[str] = Counter()
+    bookkeeping: Counter[str] = Counter()
     lines: Counter[str] = Counter()
     for r in runs:
         if r.journal is None:
@@ -755,6 +799,7 @@ def summarize(corpus: Corpus) -> dict[str, object]:
         launches.update(r.journal.launches)
         failures.update(r.journal.failed_launches)
         operator.update(r.journal.operator_actions)
+        bookkeeping.update(r.journal.bookkeeping)
         lines.update(
             torn=r.journal.torn_lines,
             foreign=r.journal.foreign_lines,
@@ -793,6 +838,11 @@ def summarize(corpus: Corpus) -> dict[str, object]:
             "by_kind": dict(sorted(operator.items())),
             "unblocks_in_state_histories": sum(r.unblock_history or 0 for r in runs),
         },
+        # Never launches: the controller's own lines, recording no invocation.
+        "bookkeeping": {
+            "total": sum(bookkeeping.values()),
+            "by_kind": dict(sorted(bookkeeping.items())),
+        },
         # Every BLOCKED episode needed a human (the exit rule): those an
         # applied unblock ended, and those still BLOCKED.
         "blocked_episodes": {
@@ -815,6 +865,7 @@ def summarize(corpus: Corpus) -> dict[str, object]:
 def render(summary: dict) -> str:
     runs, launches = summary["runs"], summary["launches"]
     operator, unidentified = summary["operator_actions"], summary["unidentified_states"]
+    bookkeeping = summary["bookkeeping"]
     lines = [
         f"runs: {runs['total']} (each run id counted once, by one state file)",
         f"  by state: {runs['by_state']}",
@@ -831,6 +882,7 @@ def render(summary: dict) -> str:
         *(f"    {key}: {count}" for key, count in launches["failed_by_kind_and_code"].items()),
         f"operator actions (no launch): {operator['total']} {operator['by_kind']} "
         f"({operator['unblocks_in_state_histories']} unblocks in the states' histories)",
+        f"bookkeeping lines (no launch): {bookkeeping['total']} {bookkeeping['by_kind']}",
         f"BLOCKED episodes (each needed a human): {summary['blocked_episodes']}",
         f"bad journal lines: {summary['journal_lines']}",
         f"paths that could not be read: {len(summary['unreadable_directories'])}"

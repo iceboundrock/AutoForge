@@ -227,8 +227,10 @@ read it before adding tests for a listed area.
   (`uv run python -m tests.stop_corpus [--json] PATH...`) over the state
   directories of past runs: each run id counted once, whether its evidence
   is the current state, one moved aside or only its run log, classified by
-  one state file; each launch and each operator action counted once, in its
-  own denominator, from the run log's typed fields; the limitations printed
+  one state file; each launch, each operator action and each bookkeeping
+  line (one the controller writes of itself, recording no invocation)
+  counted once, in its own denominator, from the run log's typed fields;
+  the limitations printed
   with every summary. `tests/test_stop_corpus.py` runs it on synthetic runs
   and proves it writes nothing and opens no FIFO or link.
 - `watched_fifo(path)` makes a FIFO and yields the list of times

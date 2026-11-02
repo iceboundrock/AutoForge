@@ -3,8 +3,9 @@
 Synthetic runs, each a state directory as the controller leaves one: a
 current state, a state moved aside, the run log of a run a new run replaced,
 a state the loader refuses beside a run log that reads. The tool counts each
-run id once, classified by one state file, counts each launch and each
-operator action once in its own denominator, reads no reason text, opens
+run id once, classified by one state file, counts each launch, each
+operator action and each bookkeeping line once in its own denominator, reads
+no reason text, opens
 nothing that is not a regular file, flags what it cannot read whole, and
 writes nothing.
 """
@@ -187,6 +188,18 @@ def _config_change(run_id: str) -> ExecutionRecord:
     )
 
 
+def _epic_binding(run_id: str, **kw) -> ExecutionRecord:
+    """The controller's record of the EPIC a new run binds, as #293's engine writes it."""
+    return ExecutionRecord(
+        run_id=run_id,
+        seq=0,
+        phase="INITIALIZING-epic-binding",
+        profile="(EPIC binding at run creation; no agent)",
+        metadata={"epic_source": "native-parent", "epic_url": EPIC, "issue_url": ISSUE},
+        **kw,
+    )
+
+
 def _corpus(root: Path) -> dict[str, Path]:
     dirs: dict[str, Path] = {}
     # BLOCKED twice before, unblocked twice, blocked again; its reason names a
@@ -206,6 +219,7 @@ def _corpus(root: Path) -> dict[str, Path]:
         blocked,
         run_id,
         [
+            _epic_binding(run_id),
             _agent(run_id, 1, timed_out=True, exit_code=-1, error="killed", ended_by="idle"),
             _agent(run_id, 2, exit_code=1, error="exited 1"),
             _agent(run_id, 3, error="no CONTROL_RESULT"),  # exit 0: no typed cause
@@ -316,13 +330,14 @@ def test_the_corpus_counts_each_unit_once_and_reads_nothing_it_should_not(tmp_pa
         "agent:unknown": 1,
         "command:unknown": 1,
     }
-    # An operator's line is no launch, and each is counted once.
+    # An operator's line and a bookkeeping line are no launch, each counted once.
     assert blocked["launches"] == {"agent": 4, "command": 1}
     assert blocked["operator_actions"] == {
         "configuration-change": 1,
         "unblock-applied": 2,
         "unblock-refused": 1,
     }
+    assert blocked["bookkeeping"] == {"epic-binding": 1}
     assert blocked["unblock_history"] == 2 and not blocked["incomplete"]
 
     # The LOCAL run's state is refused, and its launches and unblock still count.
@@ -356,6 +371,7 @@ def test_the_corpus_counts_each_unit_once_and_reads_nothing_it_should_not(tmp_pa
         "by_kind": {"configuration-change": 1, "unblock-applied": 3, "unblock-refused": 1},
         "unblocks_in_state_histories": 2,
     }
+    assert summary["bookkeeping"] == {"total": 1, "by_kind": {"epic-binding": 1}}
     assert summary["blocked_episodes"] == {"ended_by_unblock": 3, "still_blocked": 2}
     assert summary["journal_lines"] == {"torn": 1, "foreign": 1, "malformed": 1}
     assert summary["unreadable_directories"] == [] and summary["input_incomplete"] is False
@@ -590,7 +606,9 @@ def test_a_legacy_agent_launch_is_an_agent_whatever_its_timeout_seconds(tmp_path
     the producer the record names (an agent's provider and profile, a
     ``(controller ...)`` profile), so a legacy agent timeout is still
     ``agent:execution-timeout``; a record whose producer cannot be
-    established is ``unknown``, never an agent or a command by default."""
+    established is ``unknown``, never an agent or a command by default.
+    R3-F1: the controller's own ``(...; no agent)`` record of the EPIC a new
+    run binds records no invocation, so it is bookkeeping and no launch."""
     state_dir, state = _run(tmp_path, "legacy", Phase.REVIEW)
     run_id = state.run_id
     _journal(
@@ -616,7 +634,7 @@ def test_a_legacy_agent_launch_is_an_agent_whatever_its_timeout_seconds(tmp_path
                 timed_out=True,
                 error="timed out after 600s",
             ),
-            # Another producer: a record no operator action has, with no agent.
+            # The controller's own bookkeeping: no operator's, no agent, no command.
             _legacy(
                 run_id,
                 0,
@@ -629,7 +647,8 @@ def test_a_legacy_agent_launch_is_an_agent_whatever_its_timeout_seconds(tmp_path
         ],
     )
     report = _report(_summary(tmp_path), "legacy")
-    assert report["launches"] == {"agent": 3, "command": 2, "unknown": 3}
+    assert report["launches"] == {"agent": 3, "command": 2, "unknown": 2}
+    assert report["bookkeeping"] == {"epic-binding": 1}
     assert report["failed_launches"] == {
         "agent:execution-timeout": 1,
         "agent:execution-failed": 1,
@@ -641,6 +660,52 @@ def test_a_legacy_agent_launch_is_an_agent_whatever_its_timeout_seconds(tmp_path
         assert stop_corpus.launch_kind(record) == "agent"
     assert stop_corpus.launch_kind({"profile": "(controller validation command)"}) == "command"
     assert stop_corpus.launch_kind({"timeout_seconds": 60, "provider": "claude"}) == "unknown"
+
+
+def test_a_bookkeeping_line_is_no_launch_and_dilutes_no_failure_rate(tmp_path):
+    """R3-F1: a line the controller wrote of itself, recording no invocation (a
+    ``(...; no agent)`` profile no operator action has, no provider, no
+    command), is counted as bookkeeping, never as a launch: one EPIC binding
+    and one failed agent launch are one launch, and it failed. A line that
+    says no agent and names a provider or a command contradicts itself, so
+    it stays a launch, of kind ``unknown``."""
+    state_dir, state = _run(tmp_path, "bound", Phase.REVIEW)
+    run_id = state.run_id
+    _journal(
+        state_dir,
+        run_id,
+        [_epic_binding(run_id), _agent(run_id, 1, exit_code=1, error="exited 1")],
+    )
+    summary = _summary(tmp_path)
+    report = _report(summary, "bound")
+    assert report["launches"] == {"agent": 1}
+    assert report["failed_launches"] == {"agent:execution-failed": 1}
+    assert report["bookkeeping"] == {"epic-binding": 1}
+    assert (report["malformed_lines"], report["incomplete"]) == (0, False)
+    launches = summary["launches"]
+    assert (launches["total"], launches["failed"]) == (1, 1)
+    assert summary["bookkeeping"] == {"total": 1, "by_kind": {"epic-binding": 1}}
+    assert summary["operator_actions"]["total"] == 0
+    assert "bookkeeping lines (no launch): 1 {'epic-binding': 1}" in stop_corpus.render(summary)
+
+    # Bookkeeping is no launch whether or not it carries an error, and one of
+    # a kind this tool does not name is still bookkeeping.
+    errored = asdict(_epic_binding(run_id, error="x"))
+    assert stop_corpus.bookkeeping_kind(errored) == "epic-binding"
+    other = {"profile": "(something the controller records; no agent)", "phase": "REVIEW-x"}
+    assert stop_corpus.bookkeeping_kind(other) == "other"
+    # None of these is bookkeeping: an agent, a command, a contradiction.
+    binding = asdict(_epic_binding(run_id))
+    for record in (
+        asdict(_agent(run_id)),
+        asdict(_command(run_id)),
+        {"profile": "(controller validation command; no agent)"},
+        {**binding, "provider": "claude"},
+        {**binding, "command": ["make", "check"]},
+    ):
+        assert stop_corpus.bookkeeping_kind(record) == ""
+    assert stop_corpus.launch_kind({**binding, "provider": "claude"}) == "unknown"
+    assert stop_corpus.launch_kind({**binding, "command": ["make", "check"]}) == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -657,6 +722,7 @@ def test_a_legacy_agent_launch_is_an_agent_whatever_its_timeout_seconds(tmp_path
         ("phase", 0),
         ("metadata", ["applied"]),
         ("run_id", 7),
+        ("command", "make check"),
     ],
 )
 def test_a_field_of_another_type_is_malformed_never_converted(tmp_path, field, value):

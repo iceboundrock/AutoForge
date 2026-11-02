@@ -280,13 +280,22 @@ uv run python -m tests.stop_corpus [--json] PATH [PATH ...]
    A failed agent launch's code comes from `timed_out`, `ended_by` and
    `exit_code`. An *operator action* is one run log line of an `unblock`
    (applied or refused) or of an accepted configuration change, and is no
-   launch. Each unit is counted in its own denominator and never summed with
+   launch. A *bookkeeping line* is one the controller wrote of itself and
+   that records no invocation: a `(...; no agent)` profile no operator
+   action has, with no provider and no command, such as the EPIC a new run
+   binds (#293). It is no launch, so it is in no launch total and no
+   failure rate; a line that says no agent and names a provider or a
+   command contradicts itself and is a launch of kind `unknown`
+   (`test_a_bookkeeping_line_is_no_launch_and_dilutes_no_failure_rate`).
+   Each unit is counted in its own denominator and never summed with
    another; a line whose fields have unexpected types is counted as
    malformed, never converted.
 4. **What it cannot say**, printed with every summary: no persisted code
    (D5), so a saved `BLOCKED` or `FAILED` is `unknown`; a failed launch that
    exited 0 (a malformed result, a failed verification) has no typed cause;
    a launch whose line names no producer it recognizes is kind `unknown`;
+   a line is bookkeeping only by its profile's `(...; no agent)`, no
+   provider and no command;
    a state directory's view is read from its path, so a namespace copied
    out of its layout is `unknown` and one renamed with nothing of its
    namespace beside it reads as a standalone run's; a path that cannot be
