@@ -507,6 +507,14 @@ from .state import (
     save_state,
     utcnow_iso,
 )
+from .stop_classification import (
+    CodedReason,
+    StopClassification,
+    StopReasonCode,
+    agent_status,
+    blocked_by_controller,
+    reason_code,
+)
 from .transitions import (
     STOP_PHASES,
     TERMINAL_PHASES,
@@ -1098,6 +1106,20 @@ class StepOutcome:
     plan: StepPlan | None = None
     result: dict | None = None
     message: str = ""
+    # The typed classification of a step that entered BLOCKED or FAILED
+    # (#369, ADR 0011): what the stop is, from the sink that entered it;
+    # ``None`` for every other step. It is reported, never persisted, and
+    # nothing decides on it.
+    stop: StopClassification | None = None
+
+
+def _blocked(code: StopReasonCode, reason: str) -> tuple[Phase, str]:
+    """A verify or apply step's ``(Phase.BLOCKED, reason)``, the reason carrying ``code``.
+
+    The step's caller hands the pair to ``ControllerEngine._block``, which
+    reads the code back (:func:`~autoforge.stop_classification.reason_code`).
+    """
+    return Phase.BLOCKED, CodedReason(code, reason)
 
 
 # Bound on the operator's ``unblock --reason`` text: it is persisted in
@@ -4215,6 +4237,7 @@ class ControllerEngine:
         plan: StepPlan | None = None,
         result: dict | None = None,
         message: str = "",
+        stop: StopClassification | None = None,
     ) -> StepOutcome:
         state = self._require_state()
         return StepOutcome(
@@ -4225,6 +4248,7 @@ class ControllerEngine:
             plan=plan,
             result=result,
             message=message,
+            stop=stop,
         )
 
     def _step_once(self, dry_run: bool, allow_merge: bool) -> StepOutcome:
@@ -4265,20 +4289,29 @@ class ControllerEngine:
         # that a replan journal past the write is finished first (#71).
         budget = step_budget_reason(state.step_count, self.config.workflow.max_total_steps)
         if budget and self._budget_may_stop(previous):
-            return self._block(previous, plan, self._budget_block_reason(budget))
+            return self._block(
+                previous, plan, self._budget_block_reason(budget), code=StopReasonCode.STEP_BUDGET
+            )
         if previous == Phase.REVIEW:
             # Review-round cap, whatever path led here (FIX, stale re-review,
             # HEAD drift from READY_FOR_MERGE/MERGE, resume): round cap+1 never
             # starts, no HEAD is bound and no reviewer is invoked.
             cap = next_round_cap_reason(state.review_round, self.config.workflow.max_review_rounds)
             if cap:
-                return self._block(previous, plan, self._loop_block_reason(cap))
+                return self._block(
+                    previous,
+                    plan,
+                    self._loop_block_reason(cap),
+                    code=StopReasonCode.REVIEW_ROUND_CAP,
+                )
         if previous in (Phase.ANALYZE_EXECUTE, Phase.FIX):
             # ADR 0006 D5.2: a crash after the save that reached the failure
             # bound, before its BLOCKED write, relaunches no agent.
             spent = self._spent_producer_failures(previous)
             if spent:
-                return self._block(previous, plan, spent)
+                return self._block(
+                    previous, plan, spent, code=StopReasonCode.PRODUCER_VALIDATION_BOUND
+                )
 
         # In memory until the step's first save: the launch checkpoint of an
         # agent step (`_invoke_phase`), or the resolution of a step that needs
@@ -4304,12 +4337,12 @@ class ControllerEngine:
         except CheckoutDriftError as exc:
             # The operator's checkout moved under the agent (the prompts
             # forbid it; this is the controller enforcing it).
-            return self._block(previous, plan, str(exc))
+            return self._block(previous, plan, str(exc), code=StopReasonCode.CHECKOUT_DRIFT)
         except SandboxTamperError as exc:
             # The issue's private object directory names another object
             # store or holds what no store does (ADR 0005 D6.5): nothing was
             # read from it, and a human decides.
-            return self._block(previous, plan, str(exc))
+            return self._block(previous, plan, str(exc), code=StopReasonCode.SANDBOX_TAMPER)
         except (ExecutionError, ControlResultValidationError) as exc:
             # The agent failed, timed out, could not be run or returned no
             # usable result, and the phase is as it was: the error says where
@@ -4341,6 +4374,7 @@ class ControllerEngine:
                 plan=plan,
                 result=payload,
                 message=f"agent reported {status}: {message}",
+                stop=agent_status(str(status), previous),
             )
 
         try:
@@ -4886,7 +4920,7 @@ class ControllerEngine:
         except ValidationInterruptedError as exc:
             state.validation_records = exc.records
             state.validation_attempt = {}
-            return self._block(previous, None, str(exc))
+            return self._block(previous, None, str(exc), code=StopReasonCode.VALIDATION_INTERRUPTED)
         state.validation_records = records
         state.validation_attempt = {}
         self._save()
@@ -4957,16 +4991,20 @@ class ControllerEngine:
                 phase, commit, base_revision, partial(self._count_producer_failure, phase)
             )
         except ValidationInconclusiveError as exc:
-            return (
+            return CodedReason(
+                StopReasonCode.VALIDATION_INCONCLUSIVE,
                 f"the controller could not validate the candidate {commit[:12]} before "
                 f"publishing it: {exc}. Nothing was pushed or published. Fix the cause, then "
-                "'unblock'"
+                "'unblock'",
             )
         if failure is None:
             return ""
         count = self._require_state().producer_validation_failure["count"]
         if count >= MAX_FAILURE_COUNT:
-            return self._producer_bound_text(phase, failure, count)
+            return CodedReason(
+                StopReasonCode.PRODUCER_VALIDATION_BOUND,
+                self._producer_bound_text(phase, failure, count),
+            )
         raise _ProducerValidationFailed(
             f"{phase.value}: the controller's validation of the candidate did not pass: "
             f"{_validation_failure_text(failure)}. Nothing was pushed or published, and no "
@@ -5048,6 +5086,7 @@ class ControllerEngine:
                 f"the controller could not validate PR head {head[:12]} before launching the "
                 f"reviewer of round {upcoming}: {exc}. Nothing was launched or posted. Fix the "
                 "cause, then 'unblock'",
+                code=StopReasonCode.VALIDATION_INCONCLUSIVE,
             )
         self._evidence_bound = True
         return None
@@ -5499,7 +5538,9 @@ class ControllerEngine:
             return self._finish_analyze_entry(plan)
         pr, problem = self._implementation_pr_candidate()
         if problem:
-            return self._block(Phase.ANALYZE_EXECUTE, plan, problem)
+            return self._block(
+                Phase.ANALYZE_EXECUTE, plan, problem, code=StopReasonCode.CLAIM_AMBIGUOUS
+            )
         observation = effects.observation
         honored = (
             observation
@@ -5510,7 +5551,12 @@ class ControllerEngine:
         )
         if pr is not None:
             if honored is not None:
-                return self._block(Phase.ANALYZE_EXECUTE, plan, self._unjournaled_pr_text(pr.url))
+                return self._block(
+                    Phase.ANALYZE_EXECUTE,
+                    plan,
+                    self._unjournaled_pr_text(pr.url),
+                    code=StopReasonCode.UNJOURNALED_WRITE,
+                )
             return self._recover_pr(pr, plan)
         branch = self.branch_name_for(state.current_issue_url)
         ref = f"refs/heads/{branch}"
@@ -5523,6 +5569,7 @@ class ControllerEngine:
                     f"GitHub names {default_branch!r} as the default branch of "
                     f"{state.repository}; the controller publishes issue work to {branch!r} "
                     "and never to the default branch. Nothing was launched",
+                    code=StopReasonCode.DEFAULT_BRANCH,
                 )
             if honored is not None:
                 recorded_base = [r for r in honored.refs if r != ref]
@@ -5543,6 +5590,7 @@ class ControllerEngine:
                         )
                         + ". Nothing was launched, pushed or created. 'unblock' starts a fresh "
                         "entry that reads the default branch again",
+                        code=StopReasonCode.DEFAULT_BRANCH,
                     )
                 base_sha = honored.base_sha
             else:
@@ -5559,15 +5607,19 @@ class ControllerEngine:
                 f"read: {exc}. This is not a transient GitHub failure (authentication, "
                 "permissions, or malformed data), so the controller will not launch an agent "
                 "whose work it could not publish; nothing was launched. Fix the cause, then "
-                "'resume'",
+                "'unblock'",
+                code=StopReasonCode.GITHUB_READ_FAILED,
             )
         if problem:
-            return self._block(Phase.ANALYZE_EXECUTE, plan, problem)
+            return self._block(
+                Phase.ANALYZE_EXECUTE, plan, problem, code=StopReasonCode.UNJOURNALED_WRITE
+            )
         if honored is not None and (ref not in honored.refs or honored.refs[ref] != remote_head):
             return self._block(
                 Phase.ANALYZE_EXECUTE,
                 plan,
                 self._unjournaled_branch_text(branch, honored.refs.get(ref), remote_head),
+                code=StopReasonCode.UNJOURNALED_WRITE,
             )
         adopt_url = parse_pr_url(adopt.url).canonical if adopt is not None else ""
         if honored is not None:
@@ -5582,6 +5634,7 @@ class ControllerEngine:
                     Phase.ANALYZE_EXECUTE,
                     plan,
                     self._unobserved_branch_pr_text(branch, recorded, adopt_url),
+                    code=StopReasonCode.UNJOURNALED_WRITE,
                 )
         wanted = [base_sha] + ([remote_head] if remote_head and remote_head != base_sha else [])
         try:
@@ -7826,8 +7879,21 @@ class ControllerEngine:
         if not self.merge_gate_open(allow_merge):
             raise VerificationError(MERGE_GATE_MESSAGE)
 
-    def _block(self, previous: Phase, plan: StepPlan | None, reason: str) -> StepOutcome:
+    def _block(
+        self,
+        previous: Phase,
+        plan: StepPlan | None,
+        reason: str,
+        *,
+        code: StopReasonCode | None = None,
+    ) -> StepOutcome:
         """Enter BLOCKED with a human-readable reason (never guess).
+
+        ``code`` is the typed reason the sink names (#369, ADR 0011); a
+        caller that hands on a verify or apply step's reason passes none, and
+        the reason's own code is used (:func:`_blocked`), ``UNKNOWN`` for
+        plain text. It goes on the outcome only: nothing is persisted and
+        nothing decides on it, and the text is never parsed for one.
 
         The reason is redacted here, once, not at the call sites: many of
         them quote a `GitHubError` (`gh` stderr, which can echo an
@@ -7841,11 +7907,12 @@ class ControllerEngine:
         reason is persisted on every save and printed by ``status``.
         """
         state = self._require_state()
+        stop = blocked_by_controller(code if code is not None else reason_code(reason), previous)
         reason = bound_block_reason(redact(reason))
         state.phase = Phase.BLOCKED
         state.block_reason = reason
         self._save()
-        return self._outcome(previous, plan=plan, message=reason)
+        return self._outcome(previous, plan=plan, message=reason, stop=stop)
 
     def _loop_block_reason(self, reason: str) -> str:
         """BLOCKED text for a REVIEW/FIX loop bound (cap or stagnation)."""
@@ -8064,6 +8131,7 @@ class ControllerEngine:
                 f"{reason}. GitHub data stayed inconclusive for {state.attempt} verification "
                 f"attempt(s) (merge.max_verification_attempts={limit}); giving up. "
                 f"{self._merge_so_far()}; inspect the PR on GitHub manually.",
+                code=StopReasonCode.MERGE_INCONCLUSIVE,
             )
         self._save()
         raise VerificationError(
@@ -8108,6 +8176,7 @@ class ControllerEngine:
             f"{what}: {exc}. This is not a transient GitHub failure (authentication, "
             "permissions, or the PR itself), so re-checking would not help. "
             f"{self._merge_so_far()}. Fix the cause and inspect the PR on GitHub manually.",
+            code=StopReasonCode.GITHUB_READ_FAILED,
         )
 
     def _merge_already_counted(self) -> bool:
@@ -8269,6 +8338,7 @@ class ControllerEngine:
                 f"({state.reviewed_pr_url}); the review is bound to that PR at HEAD "
                 f"{reviewed[:12]} on base {reviewed_base!r} and is not re-bound. Nothing "
                 "was merged or counted; inspect the state file and the PR manually.",
+                code=StopReasonCode.PR_IDENTITY,
             )
         # The gate judges the checks, so it reads the PR with them, in one
         # answer (#291): the checks are those of the HEAD it compares. A
@@ -8277,7 +8347,12 @@ class ControllerEngine:
         try:
             pr = self.github.get_pr_with_checks(url)
         except GitHubChecksAccessError as exc:
-            return self._block(phase, plan, self._checks_refused_reason(url, reviewed_ref, exc))
+            return self._block(
+                phase,
+                plan,
+                self._checks_refused_reason(url, reviewed_ref, exc),
+                code=StopReasonCode.GITHUB_CHECKS_REFUSED,
+            )
         except GitHubError as exc:
             return self._github_read_failed(phase, plan, f"PR {url} could not be read", exc)
         if parse_pr_url(pr.url or url).repository.lower() != state.repository.lower():
@@ -8289,6 +8364,7 @@ class ControllerEngine:
                 f"GitHub answered {url} with PR {pr.url}, which is not the reviewed PR "
                 f"{state.reviewed_pr_url}; refusing to merge a PR no review decided on. "
                 f"{self._merge_so_far()}.",
+                code=StopReasonCode.PR_IDENTITY,
             )
         if pr.state == "MERGED":
             if phase == Phase.READY_FOR_MERGE:
@@ -8315,11 +8391,15 @@ class ControllerEngine:
                     plan,
                     f"PR {url} is already MERGED {unreviewed}; the controller never "
                     "reviewed the merged change. Inspect manually.",
+                    code=StopReasonCode.UNREVIEWED_MERGE,
                 )
             return self._complete_merge(pr, plan, recovered=True)
         if not pr.is_open:
             return self._block(
-                phase, plan, f"PR {url} is {pr.state}; only an OPEN PR can be merged"
+                phase,
+                plan,
+                f"PR {url} is {pr.state}; only an OPEN PR can be merged",
+                code=StopReasonCode.PR_NOT_OPEN,
             )
         if not pr.head_sha:
             raise VerificationError(f"PR {url} has no readable head SHA")
@@ -8330,6 +8410,7 @@ class ControllerEngine:
                 f"PR {url} reports no base branch, so the reviewed change against "
                 f"{reviewed_base!r} cannot be confirmed as this PR's diff. Nothing was "
                 "merged or counted.",
+                code=StopReasonCode.PR_IDENTITY,
             )
         if pr.head_sha != reviewed or pr.base_ref != reviewed_base:
             return self._revision_drift_to_review(phase, plan, pr)
@@ -8355,7 +8436,7 @@ class ControllerEngine:
         # own, and a PR with no applicable certificate never has its code run.
         uncertified = self._merge_certificate_problem(phase, pr, merge_base)
         if uncertified:
-            return self._block(phase, plan, uncertified)
+            return self._block(phase, plan, uncertified, code=StopReasonCode.REVIEW_CERTIFICATE)
         # The PR is at the reviewed revision; now the review itself. Every
         # other fact the gate relies on was just read from GitHub, and the
         # clean review must be too (#94): the comment the state names is
@@ -8376,6 +8457,7 @@ class ControllerEngine:
                 f"{unbacked}. The clean review recorded in state is not backed by GitHub, "
                 "so re-checking would not help; nothing was merged or counted. Inspect the "
                 "state file and the PR's review comments manually.",
+                code=StopReasonCode.REVIEW_NOT_BACKED,
             )
         try:
             not_ready = self._merge_readiness_problem(pr)
@@ -8386,7 +8468,12 @@ class ControllerEngine:
                 phase, plan, f"a pre-merge GitHub read for PR {url} failed", exc
             )
         if not_ready:
-            return self._block(phase, plan, f"{not_ready}. Nothing was merged or counted.")
+            return self._block(
+                phase,
+                plan,
+                f"{not_ready}. Nothing was merged or counted.",
+                code=reason_code(not_ready, StopReasonCode.MERGE_NOT_READY),
+            )
         # Last, because it executes the PR's own code: only a PR that every
         # GitHub-side fact already accepts gets run on the operator's machine.
         try:
@@ -8394,7 +8481,12 @@ class ControllerEngine:
         except VerificationError as exc:
             return self._inconclusive(phase, plan, str(exc), cause=exc)
         if unverified:
-            return self._block(phase, plan, f"{unverified}. Nothing was merged or counted.")
+            return self._block(
+                phase,
+                plan,
+                f"{unverified}. Nothing was merged or counted.",
+                code=StopReasonCode.PREMERGE_VERIFICATION,
+            )
         return pr
 
     def _merge_certificate_problem(self, phase: Phase, pr: PRInfo, merge_base: str) -> str:
@@ -8936,6 +9028,7 @@ class ControllerEngine:
                 f"an earlier step of this run verified and counted the merge of PR "
                 f"{state.current_pr_url}, but GitHub now reports it {verified.state}; "
                 "refusing to merge it again. Inspect the PR on GitHub manually.",
+                code=StopReasonCode.MERGE_WRITE,
             )
         url = state.current_pr_url
         reviewed = (state.reviewed_head_sha or "").lower()
@@ -9007,6 +9100,7 @@ class ControllerEngine:
                 Phase.MERGE,
                 plan,
                 f"{reason}{note}. Nothing was counted; resolve on GitHub manually.",
+                code=StopReasonCode.MERGE_WRITE,
             )
         unreviewed = self._merged_revision_problem(after, reviewed, reviewed_base)
         if unreviewed:
@@ -9015,6 +9109,7 @@ class ControllerEngine:
                 plan,
                 f"PR {url} is MERGED {unreviewed}; refusing to count an unreviewed merge. "
                 "Inspect manually.",
+                code=StopReasonCode.UNREVIEWED_MERGE,
             )
         return self._complete_merge(after, plan, recovered=False)
 
@@ -9034,18 +9129,22 @@ class ControllerEngine:
         # nothing about them: it is never judged, and never as "no checks".
         checks = pr.checks
         if checks is None:
-            return f"the check results of PR {url} were not read, so they cannot be judged"
+            return CodedReason(
+                StopReasonCode.MERGE_CHECKS,
+                f"the check results of PR {url} were not read, so they cannot be judged",
+            )
         # An empty rollup was read and is empty: GitHub reports no check run
         # and no commit status for the head. "Every check succeeded" over no
         # check is vacuous, so it is never a pass, whatever
         # safety.required_checks and safety.verify_check_definition say (#289).
         if not checks:
-            return (
+            return CodedReason(
+                StopReasonCode.MERGE_CHECKS,
                 f"PR {url} has no check in its status rollup: GitHub reports no check run "
                 "or commit status for its head, and an empty rollup is not a set of passed "
                 "checks, so the controller never merges it, whatever safety.required_checks "
                 "and safety.verify_check_definition say. Make CI report on the PR's head, then "
-                "'unblock'; or merge it by hand"
+                "'unblock'; or merge it by hand",
             )
         if pr.is_draft:
             return f"PR {url} is a draft"
@@ -9060,7 +9159,10 @@ class ControllerEngine:
         failed = [c.name or "?" for c in checks if c.outcome in ("failure", "unknown")]
         pending = [c.name or "?" for c in checks if c.outcome == "pending"]
         if failed:
-            return f"PR {url} has failing or inconclusive checks: {', '.join(failed)}"
+            return CodedReason(
+                StopReasonCode.MERGE_CHECKS,
+                f"PR {url} has failing or inconclusive checks: {', '.join(failed)}",
+            )
         if pending:
             raise VerificationError(f"PR {url} has checks still running: {', '.join(pending)}")
         #    ... and at least one of them actually succeeded: a NEUTRAL or
@@ -9070,22 +9172,26 @@ class ControllerEngine:
         #    safety.required_checks and safety.verify_check_definition say (#289).
         if not any(check.succeeded for check in checks):
             results = sorted({(c.conclusion or c.state or "?").upper() for c in checks})
-            return (
+            return CodedReason(
+                StopReasonCode.MERGE_CHECKS,
                 f"PR {url} has no successful check in its status rollup: every check it holds "
                 f"ended {', '.join(results)}, and a rollup in which nothing succeeded is not a "
                 "set of passed checks, so the controller never merges it, whatever "
                 "safety.required_checks and safety.verify_check_definition say. Make CI report "
-                "a success on the PR's head, then 'unblock'; or merge it by hand"
+                "a success on the PR's head, then 'unblock'; or merge it by hand",
             )
         #    ... and the required ones came from the definition the base
         #    branch has, not merely from a run that reported the same name.
         redefined = self._check_definition_problem(pr)
         if redefined:
-            return redefined
+            return CodedReason(StopReasonCode.MERGE_CHECKS, redefined)
 
         # 3. mergeability as computed by GitHub
         if pr.mergeable == "CONFLICTING":
-            return f"PR {url} has merge conflicts (mergeable=CONFLICTING)"
+            return CodedReason(
+                StopReasonCode.MERGE_CONFLICT,
+                f"PR {url} has merge conflicts (mergeable=CONFLICTING)",
+            )
         if pr.mergeable != "MERGEABLE":
             raise VerificationError(
                 f"GitHub has not determined mergeability of PR {url} "
@@ -9834,6 +9940,7 @@ class ControllerEngine:
                 f"HEAD {head[:12]} on base {base!r} from merge base {merge_base[:12]} of PR "
                 f"{pr_ref.canonical}: {exc}. The controller will not review a round whose "
                 "comment it could not tell apart from one it would post",
+                code=StopReasonCode.GITHUB_READ_FAILED,
             )
         except ClaimConflictError as exc:
             return self._block(
@@ -9842,6 +9949,7 @@ class ControllerEngine:
                 self._unjournaled_review_text(
                     conflict=str(exc), after_reviewer=False, relaunch=relaunch
                 ),
+                code=StopReasonCode.CLAIM_AMBIGUOUS,
             )
         if holder is not None:
             return self._block(
@@ -9850,6 +9958,7 @@ class ControllerEngine:
                 self._unjournaled_review_text(
                     url=holder.obj.url, after_reviewer=False, relaunch=relaunch
                 ),
+                code=StopReasonCode.UNJOURNALED_WRITE,
             )
         try:
             deferred = self._follow_up_issues(pr_ref).grouped(
@@ -9864,6 +9973,7 @@ class ControllerEngine:
                 f"cannot establish which follow-up issues already exist for PR "
                 f"{pr_ref.canonical}: {exc}. The controller will not launch a reviewer that "
                 "could re-raise a problem an earlier round already deferred",
+                code=StopReasonCode.GITHUB_READ_FAILED,
             )
         self._existing_pr_follow_ups = _follow_up_pairs(deferred)
         wanted = [head] + ([merge_base] if merge_base and merge_base != head else [])
@@ -10134,7 +10244,9 @@ class ControllerEngine:
                 )
         problem = self._fix_branch_problem(pr)
         if problem:
-            return self._block(Phase.FIX, plan, problem + ". Nothing was launched")
+            return self._block(
+                Phase.FIX, plan, problem + ". Nothing was launched", code=StopReasonCode.PR_IDENTITY
+            )
         pr_ref = parse_pr_url(state.current_pr_url)
         open_ids = [str(f["id"]) for f in state.open_findings]
         try:
@@ -10152,6 +10264,7 @@ class ControllerEngine:
                 f"cannot establish which follow-up issues already exist for the open "
                 f"findings of PR {pr_ref.canonical}: {exc}. The controller will not launch a "
                 "fixer whose deferrals could create a second one",
+                code=StopReasonCode.GITHUB_READ_FAILED,
             )
         except ClaimConflictError as exc:
             return self._block(
@@ -10159,6 +10272,7 @@ class ControllerEngine:
                 plan,
                 f"{exc}. The controller never chooses between them: close or repair the "
                 "extra or unreadable issue(s) so exactly one remains, then start a new run",
+                code=StopReasonCode.CLAIM_AMBIGUOUS,
             )
         problem = self._fix_self_follow_up_problem(own)
         if problem:
@@ -10168,6 +10282,7 @@ class ControllerEngine:
                 f"{problem}. Remove that marker from the current issue (the finding is then "
                 "resolved in this PR or deferred to another issue), then 'unblock'. Nothing was "
                 "launched",
+                code=StopReasonCode.FIX_PLAN_REFUSED,
             )
         ref = f"refs/heads/{pr.head_ref}"
         observed = self._fix_observed_objects(pr_ref, open_ids, own)
@@ -10183,7 +10298,10 @@ class ControllerEngine:
             dict(honored.objects) != observed or dict(honored.refs) != {ref: reviewed}
         ):
             return self._block(
-                Phase.FIX, plan, self._unjournaled_fix_text(honored, observed, ref, reviewed)
+                Phase.FIX,
+                plan,
+                self._unjournaled_fix_text(honored, observed, ref, reviewed),
+                code=StopReasonCode.UNJOURNALED_WRITE,
             )
         try:
             self._git_transport().fetch([reviewed])
@@ -10510,7 +10628,12 @@ class ControllerEngine:
                 return self._finish_update_epic_entry(plan)
             reason = self._drive_progress_records()
             if reason:
-                return self._block(Phase.UPDATE_EPIC, plan, reason)
+                return self._block(
+                    Phase.UPDATE_EPIC,
+                    plan,
+                    reason,
+                    code=reason_code(reason, StopReasonCode.EFFECT_CONFLICT),
+                )
             return self._read_entry_roadmap(plan)
         marker = self._progress_marker()
         try:
@@ -10524,6 +10647,7 @@ class ControllerEngine:
                 f"cannot establish which comment on EPIC {state.epic_url} is the progress "
                 f"comment for issue {state.current_issue_url}: {exc}. The controller will "
                 "not launch an agent before it knows whether the comment exists",
+                code=StopReasonCode.GITHUB_READ_FAILED,
             )
         except ClaimConflictError as exc:
             return self._block(
@@ -10532,6 +10656,7 @@ class ControllerEngine:
                 f"{exc}. The controller never chooses between them: remove or repair the "
                 "extra or unreadable comment(s) so that at most one remains, then start a new "
                 "run",
+                code=StopReasonCode.CLAIM_AMBIGUOUS,
             )
         observation = state.phase_effects().observation
         observed = observation.objects.get(marker) if observation is not None else None
@@ -10542,7 +10667,10 @@ class ControllerEngine:
             )
             if not (journaled or legacy):
                 return self._block(
-                    Phase.UPDATE_EPIC, plan, self._unjournaled_progress_text(holder.obj.url)
+                    Phase.UPDATE_EPIC,
+                    plan,
+                    self._unjournaled_progress_text(holder.obj.url),
+                    code=StopReasonCode.UNJOURNALED_WRITE,
                 )
             self._adopted_progress_comment_url = holder.obj.url
         elif observed is not None:
@@ -10553,6 +10681,7 @@ class ControllerEngine:
                 f"{state.epic_url}. The controller does not post a replacement for a comment it "
                 "did not write; restore it or post the progress report by hand, then start a "
                 "new run",
+                code=StopReasonCode.READ_BACK_MISMATCH,
             )
         blocked = self._read_entry_roadmap(plan)
         if blocked is not None:
@@ -10598,7 +10727,8 @@ class ControllerEngine:
                 "transient GitHub failure (authentication, permissions, or malformed data), "
                 "so the controller will not launch an agent whose roadmap section it could "
                 "not splice into a body it has not read; nothing was written. Fix the cause, "
-                "then 'resume'",
+                "then 'unblock'",
+                code=StopReasonCode.GITHUB_READ_FAILED,
             )
         except RoadmapError as exc:
             return self._block(
@@ -10606,7 +10736,8 @@ class ControllerEngine:
                 plan,
                 f"EPIC {state.epic_url}: {exc}. The controller edits only the text between "
                 "the markers and will not guess which text that is: repair the EPIC body so "
-                "it carries one section (or none), then 'resume'",
+                "it carries one section (or none), then 'unblock'",
+                code=StopReasonCode.EPIC_ROADMAP,
             )
         return None
 
@@ -10735,7 +10866,7 @@ class ControllerEngine:
         if pr_url:
             txn.rejected_pr_url = pr_url
         self._require_state().replan_transaction = txn.to_dict()
-        return self._block(Phase.REPLAN_REEXECUTE, None, text)
+        return self._block(Phase.REPLAN_REEXECUTE, None, text, code=StopReasonCode.REPLAN_REFUSED)
 
     def _drive_replan(self) -> StepOutcome | None:
         """Advance the replan transaction as far as it goes without an agent.
@@ -10756,7 +10887,10 @@ class ControllerEngine:
             txn = ReplanTransaction.from_dict(state.replan_transaction)
         except ValueError as exc:
             return self._block(
-                Phase.REPLAN_REEXECUTE, None, f"persisted replan transaction is unusable: {exc}"
+                Phase.REPLAN_REEXECUTE,
+                None,
+                f"persisted replan transaction is unusable: {exc}",
+                code=StopReasonCode.REPLAN_REFUSED,
             )
         if txn.stage is ReplanStage.REJECTED:
             # Replay, never launder: the decision was already made and saved.
@@ -10764,6 +10898,7 @@ class ControllerEngine:
                 Phase.REPLAN_REEXECUTE,
                 None,
                 self._replan_block_text(txn, txn.rejection_reason or "refused by verification"),
+                code=StopReasonCode.REPLAN_REFUSED,
             )
         # Before any stage reads or writes the source -- the compensation and
         # the activation included -- the journal's source must be the PR this
@@ -12394,21 +12529,25 @@ class ControllerEngine:
         # read for, planned or sent to its publication.
         problem = self._gate_producer(Phase.ANALYZE_EXECUTE, res.head_sha, entry.base_sha)
         if problem:
-            return Phase.BLOCKED, problem
+            return _blocked(reason_code(problem, StopReasonCode.PRODUCER_VALIDATION_BOUND), problem)
         branch = self.branch_name_for(state.current_issue_url)
         ref = f"refs/heads/{branch}"
         pr, problem = self._implementation_pr_candidate()
         if problem:
-            return Phase.BLOCKED, problem
+            return _blocked(StopReasonCode.CLAIM_AMBIGUOUS, problem)
         if pr is not None:
-            return Phase.BLOCKED, self._unjournaled_pr_text(parse_pr_url(pr.url).canonical)
+            return _blocked(
+                StopReasonCode.UNJOURNALED_WRITE,
+                self._unjournaled_pr_text(parse_pr_url(pr.url).canonical),
+            )
         try:
             default_branch = self.github.get_repo(state.repository).default_branch
             if default_branch != entry.default_branch:
-                return Phase.BLOCKED, (
+                return _blocked(
+                    StopReasonCode.DEFAULT_BRANCH,
                     self._default_branch_changed_text(entry.default_branch, default_branch)
                     + ". Nothing was planned, pushed or created. 'unblock' starts a fresh entry "
-                    "that reads the default branch again"
+                    "that reads the default branch again",
                 )
             head = self._branch_head(branch)
             adopt, problem = self._analyze_branch_pr(branch, entry.default_branch)
@@ -12416,19 +12555,24 @@ class ControllerEngine:
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
                 f"the default branch, branch {branch!r} or the PRs headed at it could not be "
                 f"read before publishing: {exc}. This is not a transient GitHub failure, so "
-                "nothing was pushed or created. Fix the cause, then 'unblock'"
+                "nothing was pushed or created. Fix the cause, then 'unblock'",
             )
         if problem:
-            return Phase.BLOCKED, problem
+            return _blocked(StopReasonCode.UNJOURNALED_WRITE, problem)
         if head != entry.remote_head:
-            return Phase.BLOCKED, self._unjournaled_branch_text(branch, entry.remote_head, head)
+            return _blocked(
+                StopReasonCode.UNJOURNALED_WRITE,
+                self._unjournaled_branch_text(branch, entry.remote_head, head),
+            )
         adopt_url = parse_pr_url(adopt.url).canonical if adopt is not None else ""
         if not _same_pr(adopt_url, entry.adopt_url):
-            return Phase.BLOCKED, self._unobserved_branch_pr_text(
-                branch, entry.adopt_url, adopt_url
+            return _blocked(
+                StopReasonCode.UNJOURNALED_WRITE,
+                self._unobserved_branch_pr_text(branch, entry.adopt_url, adopt_url),
             )
         owner = EffectOwner(
             run_id=state.run_id,
@@ -12467,9 +12611,10 @@ class ControllerEngine:
             body = compose_append(adopt_body, block)
             problem = append_problem(f"PR {url}", IMPLEMENTATION, body)
             if problem:
-                return Phase.BLOCKED, (
+                return _blocked(
+                    StopReasonCode.UNJOURNALED_WRITE,
                     f"open PR {url} on {branch!r} cannot be adopted: {problem}. Nothing was "
-                    "pushed or written. Fix its body, then 'unblock'"
+                    "pushed or written. Fix its body, then 'unblock'",
                 )
             second = EffectRecord.plan(
                 1,
@@ -12521,10 +12666,11 @@ class ControllerEngine:
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
                 f"the default branch of {state.repository} could not be read: {exc}. This is "
                 "not a transient GitHub failure; nothing was sent again. Fix the cause, then "
-                "'unblock'"
+                "'unblock'",
             )
         planned_base = (
             str(records[1].target["base"])
@@ -12535,17 +12681,18 @@ class ControllerEngine:
             # K2's base is checked before anything of the plan is sent, the
             # push included: a create is never issued onto a branch that is
             # no longer the default (ADR 0004 K2).
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.DEFAULT_BRANCH,
                 self._default_branch_changed_text(planned_base, default_branch)
                 + f". The journaled plan opens the PR onto {planned_base!r}, so the controller "
                 "sends nothing more for it: no push and no PR create (an attempt sent before "
                 f"the change may already show on GitHub). Make {planned_base!r} the default "
                 "branch again, then 'unblock'; otherwise this plan cannot complete, and the "
-                "issue's PR is opened by hand"
+                "issue's PR is opened by hand",
             )
         for index, record in enumerate(records):
             if record.stage == Stage.CONFLICT:
-                return Phase.BLOCKED, self._analyze_conflict_text(record)
+                return _blocked(StopReasonCode.EFFECT_CONFLICT, self._analyze_conflict_text(record))
             if not record.pending:
                 continue
             try:
@@ -12554,7 +12701,7 @@ class ControllerEngine:
                         str(record.target["pr_url"]), candidate, expected_old, default_branch
                     )
                     if drift:
-                        return Phase.BLOCKED, drift
+                        return _blocked(StopReasonCode.READ_BACK_MISMATCH, drift)
                 op = operation_for(
                     record,
                     self.github,
@@ -12565,14 +12712,17 @@ class ControllerEngine:
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
-                return Phase.BLOCKED, (
+                return _blocked(
+                    StopReasonCode.GITHUB_READ_FAILED,
                     f"{record.describe()} could not be reconciled with GitHub: {exc}. This is "
                     "not a transient failure (authentication, permissions, or malformed "
-                    "data); nothing was sent again. Fix the cause, then 'unblock'"
+                    "data); nothing was sent again. Fix the cause, then 'unblock'",
                 )
             records[index] = driven.record
             if driven.record.stage == Stage.CONFLICT:
-                return Phase.BLOCKED, self._analyze_conflict_text(driven.record)
+                return _blocked(
+                    StopReasonCode.EFFECT_CONFLICT, self._analyze_conflict_text(driven.record)
+                )
         observed = records[1].observed
         if observed is None:
             raise StateError(f"{records[1].describe()} completed without an observed PR")
@@ -12757,10 +12907,11 @@ class ControllerEngine:
         except GitHubUnavailableError:
             raise
         except (GitHubError, ClaimConflictError) as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.READ_BACK_MISMATCH,
                 f"PR {url} was published for issue #{issue.number}, but the open PRs could not "
                 f"be read back as its one implementation: {exc}. Inspect the PRs carrying the "
-                "issue's marker, then 'unblock'"
+                "issue's marker, then 'unblock'",
             )
         pr = holder.obj
         problems = problems_of(pr)
@@ -12782,10 +12933,11 @@ class ControllerEngine:
                 )
             problems.append(f"it is headed at {pr.head_sha or 'nothing readable'}")
         if problems:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.READ_BACK_MISMATCH,
                 f"PR {url} does not read back as the implementation the controller published "
                 f"({candidate} on {branch!r} onto {default_branch!r}): {'; '.join(problems)}. "
-                "The controller binds only a PR it verified; inspect it, then 'unblock'"
+                "The controller binds only a PR it verified; inspect it, then 'unblock'",
             )
         state.current_pr_url = url
         state.current_head_sha = candidate
@@ -12984,18 +13136,21 @@ class ControllerEngine:
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
                 f"the comments of PR {pr_ref.canonical} could not be read before the comment "
                 f"of review round {res.round} was posted: {exc}. This is not a transient "
-                "GitHub failure; nothing was posted. Fix the cause, then 'unblock'"
+                "GitHub failure; nothing was posted. Fix the cause, then 'unblock'",
             )
         except ClaimConflictError as exc:
-            return Phase.BLOCKED, self._unjournaled_review_text(
-                conflict=str(exc), after_reviewer=True
+            return _blocked(
+                StopReasonCode.CLAIM_AMBIGUOUS,
+                self._unjournaled_review_text(conflict=str(exc), after_reviewer=True),
             )
         if holder is not None:
-            return Phase.BLOCKED, self._unjournaled_review_text(
-                url=holder.obj.url, after_reviewer=True
+            return _blocked(
+                StopReasonCode.UNJOURNALED_WRITE,
+                self._unjournaled_review_text(url=holder.obj.url, after_reviewer=True),
             )
         canonical = pr_ref.canonical
         marker = render_review_marker(
@@ -13088,20 +13243,21 @@ class ControllerEngine:
             raise StateError("REVIEW has no persisted review comment plan to complete")
         record = effects.records[0]
         if record.stage == Stage.CONFLICT:
-            return Phase.BLOCKED, self._review_conflict_text(record)
+            return _blocked(StopReasonCode.EFFECT_CONFLICT, self._review_conflict_text(record))
         if record.pending:
             try:
                 record = drive(record, ReviewCommentOp(self.github), self._persist_effect).record
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
-                return Phase.BLOCKED, (
+                return _blocked(
+                    StopReasonCode.GITHUB_READ_FAILED,
                     f"{record.describe()} could not be reconciled with GitHub: {exc}. This is "
                     "not a transient failure (authentication, permissions, or malformed "
-                    "data); nothing was sent again. Fix the cause, then 'unblock'"
+                    "data); nothing was sent again. Fix the cause, then 'unblock'",
                 )
             if record.stage == Stage.CONFLICT:
-                return Phase.BLOCKED, self._review_conflict_text(record)
+                return _blocked(StopReasonCode.EFFECT_CONFLICT, self._review_conflict_text(record))
         if record.observed is None:  # pragma: no cover - terminal and not a conflict
             raise StateError(f"{record.describe()} is settled without an observed comment")
         comment_url = parse_comment_url(record.observed["url"]).canonical
@@ -13213,8 +13369,11 @@ class ControllerEngine:
                 workflow_stagnation_reason=workflow_stagnation,
             )
             if decision.action == "block_for_human":
-                return Phase.BLOCKED, self._loop_block_reason(
-                    self._replan_refusal(decision) + ". Human intervention is required"
+                return _blocked(
+                    StopReasonCode.REPLAN_REFUSED,
+                    self._loop_block_reason(
+                        self._replan_refusal(decision) + ". Human intervention is required"
+                    ),
                 )
             replan = decision.action == "replan"
             nxt = self._next_phase(Phase.REVIEW, {"needs_fix_round": True, "replan": replan})
@@ -13235,11 +13394,14 @@ class ControllerEngine:
                 except ConfigurationError as exc:  # pragma: no cover - parsed by the prompt
                     unbound = f"the reviewed issue URL is unusable ({exc})"
                 if unbound:
-                    return Phase.BLOCKED, self._loop_block_reason(
-                        f"review round {round_}: {len(findings)} finding(s); controller "
-                        f"policy triggered REPLAN_REEXECUTE ({decision.reason}), but {unbound}, "
-                        "so the replan decision cannot bind the revision it was made on. Human "
-                        "intervention is required"
+                    return _blocked(
+                        StopReasonCode.REPLAN_REFUSED,
+                        self._loop_block_reason(
+                            f"review round {round_}: {len(findings)} finding(s); controller "
+                            f"policy triggered REPLAN_REEXECUTE ({decision.reason}), but "
+                            f"{unbound}, so the replan decision cannot bind the revision it was "
+                            "made on. Human intervention is required"
+                        ),
                     )
                 # Only the decision is recorded here, together with the issue,
                 # the PR, the revision it was made on, the base that revision
@@ -13265,8 +13427,11 @@ class ControllerEngine:
             stop = self._review_loop_stop_reason(round_)
             if stop:
                 # Findings stay persisted for the human; no FIX is started.
-                return Phase.BLOCKED, self._loop_block_reason(
-                    f"review round {round_}: {len(findings)} finding(s), but {stop}"
+                return _blocked(
+                    reason_code(stop, StopReasonCode.REVIEW_STAGNATION),
+                    self._loop_block_reason(
+                        f"review round {round_}: {len(findings)} finding(s), but {stop}"
+                    ),
                 )
             return nxt, (
                 f"review round {round_}: {len(findings)} finding(s); REVIEW -> {nxt.value}"
@@ -13309,9 +13474,10 @@ class ControllerEngine:
                 "applicable certificate it decides REVIEW, a fresh round that validates and "
                 "reviews the PR again"
             )
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.REVIEW_CERTIFICATE,
                 f"review round {round_} was clean for HEAD {expected_head[:12]}, but "
-                f"{uncertified}, so READY_FOR_MERGE was not entered. {remedy}"
+                f"{uncertified}, so READY_FOR_MERGE was not entered. {remedy}",
             )
         return nxt, (
             f"review round {round_} clean for HEAD {expected_head[:12]}; review certificate "
@@ -13361,12 +13527,13 @@ class ControllerEngine:
         state = self._require_state()
         reason = round_cap_reason(completed_round, wf.max_review_rounds, has_findings=True)
         if reason:
-            return reason
-        return stagnation_reason(
+            return CodedReason(StopReasonCode.REVIEW_ROUND_CAP, reason)
+        stagnation = stagnation_reason(
             state.review_history,
             wf.stagnation_identical_rounds,
             wf.stagnation_unchanged_count_rounds,
         )
+        return CodedReason(StopReasonCode.REVIEW_STAGNATION, stagnation) if stagnation else ""
 
     def _apply_fix(self, res: FixResult) -> tuple[Phase, str]:
         """Plan the FIX writes from the accepted result, save them, then complete (#163).
@@ -13405,16 +13572,17 @@ class ControllerEngine:
             # #243 (7.2): an operator action's target could not be read
             # conclusively at the check; nothing of the result is saved.
             block, self._fix_block, self._fix_candidate = self._fix_block, "", ""
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
                 f"{block}. This is not a transient GitHub failure; nothing was created, "
                 "appended or pushed and no operator action was planned. Fix the cause, then "
-                "'unblock' to launch the fixer afresh"
+                "'unblock' to launch the fixer afresh",
             )
         # ADR 0006 D5.1: the exact candidate, the reviewed HEAD itself when
         # nothing was committed, is validated before anything is planned.
         problem = self._gate_producer(Phase.FIX, candidate, reviewed)
         if problem:
-            return Phase.BLOCKED, problem
+            return _blocked(reason_code(problem, StopReasonCode.PRODUCER_VALIDATION_BOUND), problem)
         pr = self._require_open_pr()
         if pr.head_sha.lower() != reviewed:
             return self._fix_drift(
@@ -13425,9 +13593,10 @@ class ControllerEngine:
             )
         problem = self._fix_branch_problem(pr)
         if problem:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.PR_IDENTITY,
                 f"{problem}. Nothing was created, appended or pushed. Inspect the PR, then "
-                "'unblock'"
+                "'unblock'",
             )
         pr_ref = parse_pr_url(state.current_pr_url)
         pr_url = pr_ref.canonical
@@ -13438,20 +13607,25 @@ class ControllerEngine:
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
                 f"the follow-up issues of PR {pr_url} could not be read before the FIX plan "
                 f"was saved: {exc}. This is not a transient GitHub failure; nothing was "
-                "created, appended or pushed. Fix the cause, then 'unblock'"
+                "created, appended or pushed. Fix the cause, then 'unblock'",
             )
         except ClaimConflictError as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.CLAIM_AMBIGUOUS,
                 f"{exc}. The controller never chooses between follow-up issues; nothing was "
                 "created, appended or pushed. Close or repair the extra or unreadable "
-                "issue(s) so at most one remains per finding, then 'unblock'"
+                "issue(s) so at most one remains per finding, then 'unblock'",
             )
         observed = self._fix_observed_objects(pr_ref, open_ids, own)
         if observed != dict(observation.objects) or dict(observation.refs) != {ref: reviewed}:
-            return Phase.BLOCKED, self._unjournaled_fix_text(observation, observed, ref, reviewed)
+            return _blocked(
+                StopReasonCode.UNJOURNALED_WRITE,
+                self._unjournaled_fix_text(observation, observed, ref, reviewed),
+            )
         new: list[FindingResolution] = []
         # One append per handed-over issue, whichever spelling each deferral
         # used, written to the URL the entry read (PR #205 R4-F1).
@@ -13479,28 +13653,31 @@ class ControllerEngine:
                 if not issue.is_open or not parse_issue_url(issue.url or url).same_repository(
                     state.repository
                 ):
-                    return Phase.BLOCKED, (
+                    return _blocked(
+                        StopReasonCode.FIX_PLAN_REFUSED,
                         f"follow-up issue {url}, which {deferred} is deferred to, is "
                         f"{issue.state} or not in {state.repository}: the controller appends "
                         "a finding's marker to an open issue of this repository only. Nothing "
                         "was created, appended or pushed. Reopen it, or 'unblock' to launch "
-                        "the fixer afresh"
+                        "the fixer afresh",
                     )
                 block = "\n".join(render_follow_up_marker(pr_url, fid) for fid in fids)
                 problem = append_problem(url, FOLLOW_UP, compose_append(issue.body, block))
                 if problem:
-                    return Phase.BLOCKED, (
+                    return _blocked(
+                        StopReasonCode.FIX_PLAN_REFUSED,
                         f"the markers of {deferred} cannot be appended to {url}: {problem}. "
-                        "Nothing was created, appended or pushed"
+                        "Nothing was created, appended or pushed",
                     )
                 bases[url] = issue.body
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
                 f"the issues the FIX plan writes to could not be read before it was saved: "
                 f"{exc}. This is not a transient GitHub failure; nothing was created, "
-                "appended or pushed. Fix the cause, then 'unblock'"
+                "appended or pushed. Fix the cause, then 'unblock'",
             )
         owner = self._fix_owner()
         records: list[EffectRecord] = []
@@ -13608,9 +13785,10 @@ class ControllerEngine:
         )
         problem = plan_size_problem(records, context)
         if problem:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.FIX_PLAN_REFUSED,
                 f"the FIX plan cannot be saved: {problem}. Nothing was created, appended or "
-                "pushed. Shorten the issue bodies it appends to, then 'unblock'"
+                "pushed. Shorten the issue bodies it appends to, then 'unblock'",
             )
         state.effect_records = [record.to_dict() for record in records]
         state.completion_context = context.to_dict()
@@ -13805,10 +13983,11 @@ class ControllerEngine:
             return outcome
         problem = self._fix_target_problem(pr, push, observation)
         if problem:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.READ_BACK_MISMATCH,
                 f"{problem}. The controller pushes the fix only to the head branch the review "
                 f"bound and the FIX plan names; {sent} and the fix of review round "
-                f"{state.review_round} is not recorded. Inspect the PR, then 'unblock'"
+                f"{state.review_round} is not recorded. Inspect the PR, then 'unblock'",
             )
         return None
 
@@ -13852,11 +14031,12 @@ class ControllerEngine:
                 "be appended to, or unmark the issue(s) named above that the controller did not "
                 "write"
             )
-        return Phase.BLOCKED, (
+        return _blocked(
+            StopReasonCode.EFFECT_CONFLICT,
             f"{record.reason}. The controller never force-pushes, duplicates or chooses between "
             f"such objects; the fix of review round {state.review_round} is not recorded. "
             f"Inspect GitHub, {repair}, then 'unblock': the record is reconciled again within "
-            "its attempt bound"
+            "its attempt bound",
         )
 
     def _fix_source_url(
@@ -13952,12 +14132,13 @@ class ControllerEngine:
         return "; ".join(problems)
 
     def _fix_disposition_block(self, problem: str, sent: str) -> tuple[Phase, str]:
-        return Phase.BLOCKED, (
+        return _blocked(
+            StopReasonCode.FIX_PLAN_REFUSED,
             f"{problem}. The open issues contradict the FIX plan, in which each deferred "
             "finding has exactly one open issue carrying its marker (the one it reused, created "
             "or appended to) and no other finding has any; the controller never adopts, "
             f"chooses between or recreates follow-up issues, and {sent}. Close or unmark the "
-            "issue(s) it did not write, or reopen the one it did, then 'unblock'"
+            "issue(s) it did not write, or reopen the one it did, then 'unblock'",
         )
 
     def _fix_self_deferral_problem(
@@ -13995,12 +14176,13 @@ class ControllerEngine:
 
     def _fix_self_deferral_block(self, problem: str, sent: str) -> tuple[Phase, str]:
         state = self._require_state()
-        return Phase.BLOCKED, (
+        return _blocked(
+            StopReasonCode.FIX_PLAN_REFUSED,
             f"{problem}. The persisted FIX plan was saved without that check and cannot be "
             f"completed as saved: {sent}, the fix of review round {state.review_round} is not "
             "recorded and the findings stay open. This run cannot continue automatically: "
             "inspect the plan ('autoforge status') and the current issue, remove the marker "
-            "from the current issue, and start a new run"
+            "from the current issue, and start a new run",
         )
 
     def _complete_fix(self) -> tuple[Phase, str]:
@@ -14092,17 +14274,20 @@ class ControllerEngine:
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
-                return Phase.BLOCKED, (
+                return _blocked(
+                    StopReasonCode.GITHUB_READ_FAILED,
                     f"{record.describe()} could not be reconciled with GitHub: {exc}. This is "
                     "not a transient failure (authentication, permissions, or malformed "
-                    "data); nothing was sent again. Fix the cause, then 'unblock'"
+                    "data); nothing was sent again. Fix the cause, then 'unblock'",
                 )
             if driven.held:
                 # K9 (#211): the acceptance comment is due but may not be
                 # sent (no approval yet, or the issue no longer qualifies),
                 # or the issue stopped qualifying after it was sent (PR #221
                 # R2-F1). It is first in the plan, so nothing else was sent.
-                return Phase.BLOCKED, self._acceptance_hold_reason(driven, records)
+                return _blocked(
+                    StopReasonCode.ACCEPTANCE_ACTION, self._acceptance_hold_reason(driven, records)
+                )
             records[index] = driven.record
             checked = checked and record.kind is EffectKind.PUSH
             if driven.record.stage == Stage.CONFLICT:
@@ -14156,12 +14341,13 @@ class ControllerEngine:
             # or still at the reviewed HEAD GitHub has not moved off yet, so
             # this is not drift: the plan stays saved and is completed from
             # the journal once the PR is headed at its branch again (R3-F2).
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.READ_BACK_MISMATCH,
                 f"{problem}, read back after the FIX plan was sent. The controller records a "
                 "fix only for the head branch the review bound and the FIX plan names; the fix "
                 f"of review round {state.review_round} is not recorded and the findings stay "
                 "open. Inspect the PR, then 'unblock': FIX completes from the persisted plan, "
-                "which sends nothing GitHub already holds"
+                "which sends nothing GitHub already holds",
             )
         if behind:
             raise GitHubUnavailableError(
@@ -14275,7 +14461,7 @@ class ControllerEngine:
                 open_.append((driven.record, driven.record.reason))
         if not open_:
             return None
-        return Phase.BLOCKED, self._operator_hold_reason(open_, records)
+        return _blocked(StopReasonCode.OPERATOR_ACTIONS, self._operator_hold_reason(open_, records))
 
     def _operator_hold_reason(
         self, open_: Sequence[tuple[EffectRecord, str]], records: Sequence[EffectRecord]
@@ -14854,7 +15040,7 @@ class ControllerEngine:
         self._save()
         outcome = self._complete_replan(txn)
         if state.phase == Phase.BLOCKED:
-            return Phase.BLOCKED, outcome.message
+            return _blocked(StopReasonCode.REPLAN_REFUSED, outcome.message)
         # ``_supersede_source`` activated the replacement and already applied
         # REPLAN_REEXECUTE's one edge; the same decision is returned here.
         return self._next_phase(Phase.REPLAN_REEXECUTE, {}), outcome.message
@@ -14955,7 +15141,7 @@ class ControllerEngine:
     @staticmethod
     def _blocked_replan(outcome: StepOutcome) -> tuple[Phase, str]:
         """Adapt a persisted replan refusal to the verify/apply return type."""
-        return Phase.BLOCKED, outcome.message
+        return _blocked(StopReasonCode.REPLAN_REFUSED, outcome.message)
 
     def _reject_next_issue(self, reason: str, *, cause: BaseException) -> tuple[Phase, str]:
         """Bounded re-selection: persist the rejection, re-ask once, then BLOCKED.
@@ -14971,11 +15157,12 @@ class ControllerEngine:
         state.next_issue_rejections.append(reason)
         n = len(state.next_issue_rejections)
         if n >= MAX_NEXT_ISSUE_SELECTIONS:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.SELECTION_REJECTED,
                 f"UPDATE_EPIC selected an unusable next issue {n} time(s) "
                 f"(limit {MAX_NEXT_ISSUE_SELECTIONS}); last rejection: {reason}. The run "
                 f"stays on issue {state.current_issue_url}; nothing was switched. Pick "
-                "the next issue manually (a new run) or fix the EPIC."
+                "the next issue manually (a new run) or fix the EPIC.",
             )
         raise VerificationError(
             f"{reason}. Not switching issues; the run stays in UPDATE_EPIC (selection "
@@ -15148,9 +15335,9 @@ class ControllerEngine:
         assert res.progress is not None
         url, problem = self._precondition_holder()
         if problem:
-            return Phase.BLOCKED, problem
+            return _blocked(StopReasonCode.GITHUB_READ_FAILED, problem)
         if url is not None:
-            return Phase.BLOCKED, self._unjournaled_progress_text(url)
+            return _blocked(StopReasonCode.UNJOURNALED_WRITE, self._unjournaled_progress_text(url))
         section = (
             res.roadmap_section if self._roadmap_section_required(res.next_issue_url) else None
         )
@@ -15220,13 +15407,14 @@ class ControllerEngine:
         adopted = self._adopted_progress_comment_url
         url, problem = self._precondition_holder()
         if problem:
-            return Phase.BLOCKED, problem
+            return _blocked(StopReasonCode.GITHUB_READ_FAILED, problem)
         if url != adopted:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.READ_BACK_MISMATCH,
                 f"the progress comment {adopted} adopted for issue {state.current_issue_url} "
                 f"is no longer the one comment carrying its marker on EPIC {state.epic_url} "
                 f"(found: {url or 'none'}). Nothing was posted; inspect the EPIC's comments, "
-                "then 'unblock'"
+                "then 'unblock'",
             )
         section = (
             res.roadmap_section if self._roadmap_section_required(res.next_issue_url) else None
@@ -15260,7 +15448,9 @@ class ControllerEngine:
         state = self._require_state()
         for record in state.phase_effects().records:
             if record.stage == Stage.CONFLICT:
-                return self._effect_conflict_text(record)
+                return CodedReason(
+                    StopReasonCode.EFFECT_CONFLICT, self._effect_conflict_text(record)
+                )
             if not record.pending:
                 continue
             try:
@@ -15268,13 +15458,16 @@ class ControllerEngine:
             except GitHubUnavailableError:
                 raise
             except GitHubError as exc:
-                return (
+                return CodedReason(
+                    StopReasonCode.GITHUB_READ_FAILED,
                     f"{record.describe()} could not be reconciled with GitHub: {exc}. This is "
                     "not a transient failure (authentication, permissions, or malformed data); "
-                    "nothing was sent again. Fix the cause, then 'unblock'"
+                    "nothing was sent again. Fix the cause, then 'unblock'",
                 )
             if driven.record.stage == Stage.CONFLICT:
-                return self._effect_conflict_text(driven.record)
+                return CodedReason(
+                    StopReasonCode.EFFECT_CONFLICT, self._effect_conflict_text(driven.record)
+                )
         return ""
 
     def _effect_conflict_text(self, record: EffectRecord) -> str:
@@ -15304,7 +15497,7 @@ class ControllerEngine:
         state = self._require_state()
         reason = self._drive_progress_records()
         if reason:
-            return Phase.BLOCKED, reason
+            return _blocked(reason_code(reason, StopReasonCode.EFFECT_CONFLICT), reason)
         context = self._update_epic_context()
         if context is None or context.void:
             raise StateError("UPDATE_EPIC completion reached without a complete context")
@@ -15328,12 +15521,13 @@ class ControllerEngine:
         except GitHubUnavailableError:
             raise
         except (GitHubError, RoadmapError) as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.EPIC_ROADMAP,
                 f"the roadmap section of EPIC {state.epic_url} could not be written and read "
                 f"back: {exc}. This is not a transient GitHub failure, so asking the agent "
                 "again would not help; the merge counter was not reset and the run stays on "
                 f"issue {state.current_issue_url}. Inspect the EPIC body, fix the cause, "
-                "then 'resume'."
+                "then 'unblock'.",
             )
         done = f"progress comment {published} on the EPIC; {roadmap_note}"
         if selection is None:
@@ -15352,12 +15546,13 @@ class ControllerEngine:
                 cause=exc,
             )
         except GitHubError as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
                 f"next issue {selection} could not be verified on GitHub: {exc}. This is not "
                 "a transient GitHub failure (authentication, permissions, or malformed data), "
                 "so asking the agent to select again would not help; the run stays on issue "
                 f"{state.current_issue_url}, nothing was switched. Fix the cause, then "
-                "'resume'."
+                "'resume'.",
             )
         state.reset_for_new_issue(parse_issue_url(selection).canonical)
         nxt = self._next_phase(Phase.UPDATE_EPIC, {"next_issue_url": selection})
@@ -15392,14 +15587,15 @@ class ControllerEngine:
                     f"complete (GitHub unavailable: {exc})",
                     cause=exc,
                 )
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
                 f"next_issue_url null reports the EPIC {state.epic_url} complete, but its "
                 f"native sub-issues could not be read completely: {exc}. GitHub leaves a "
                 "sub-issue the token may not read out of the listing, so the controller "
                 "does not end the run on one that may miss an open issue. The progress "
                 f"comment stays published; the run stays on issue {state.current_issue_url}, "
                 "nothing was switched. Make every sub-issue of the EPIC readable to the "
-                "token, or remove the ones it may not read from the EPIC, then 'unblock'"
+                "token, or remove the ones it may not read from the EPIC, then 'unblock'",
             )
         except GitHubUnavailableError as exc:
             self._void_selection(context)
@@ -15409,13 +15605,14 @@ class ControllerEngine:
                 cause=exc,
             )
         except GitHubError as exc:
-            return Phase.BLOCKED, (
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
                 f"next_issue_url null reports the EPIC {state.epic_url} complete, but the "
                 f"EPIC could not be read on GitHub to confirm it: {exc}. This is not a "
                 "transient GitHub failure (authentication, permissions, or malformed data), "
                 "so asking the agent again would not help. The progress comment stays "
                 f"published; the run stays on issue {state.current_issue_url}, nothing was "
-                "switched. Fix the cause, then 'unblock'"
+                "switched. Fix the cause, then 'unblock'",
             )
         return None
 

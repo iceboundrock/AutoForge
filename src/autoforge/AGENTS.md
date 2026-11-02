@@ -154,6 +154,10 @@ epic_commands.py    the `epic` commands' logic (ADR 0008 D9.8, D14.4, D16.4, D17
 redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy
+stop_classification.py  typed stop classification (ADR 0011, #369): outcomes, reason
+                    codes, their source and the operator's routes, from a sink's code,
+                    a CONTROL_RESULT status, an error's class or a loaded state; advice
+                    that nothing deciding imports; pure, persists nothing
 prompts/            file-based templates ({{VAR}}): common.md (trust boundary), phase
                     templates, update_epic_rerequest.md, correction.md,
                     worktree_state.md (#187); renderer in prompts/__init__.py
@@ -260,6 +264,10 @@ agent_worktree.py, git_workspace.py, engine.py
                                                      and state-and-recovery.md + ADR 0005
                                                      D6
 result_parser.py, prompts/*.md                    -> docs/agent-guides/control-result-protocol.md
+stop_classification.py, engine.py (_block and
+_blocked codes, the agent-status sink),
+cli.py (stop lines), errors.py (a new class)      -> docs/adr/0011-typed-stop-classification-
+                                                     and-recovery-baseline.md
 redaction.py, runlog.py, doctor.py (env rows),
 error messages                                    -> docs/agent-guides/secrets-and-logging.md
 ```

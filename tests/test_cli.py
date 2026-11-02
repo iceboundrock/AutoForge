@@ -4506,3 +4506,90 @@ def test_the_scheduler_worker_entry_point_is_hidden_and_routed(monkeypatch, caps
     with pytest.raises(SystemExit):
         cli.main(["--help"])
     assert "_worker" not in capsys.readouterr().out
+
+
+# -- typed stop lines (#369, ADR 0011) ---------------------------------------------------
+
+
+def _stopping(status: str, message: str) -> str:
+    return block({"phase": "ANALYZE_EXECUTE", "status": status, "message": message})
+
+
+def test_a_blocked_run_names_its_typed_stop_and_never_advises_resume(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """The step that entered BLOCKED says why (its sink's code and source); a
+    later 'resume' or 'status' classifies the persisted phase alone, with an
+    UNKNOWN code, since none is persisted. Every route is unblock's or a new
+    run's: 'resume' refuses a BLOCKED run, so it is never the advice."""
+    monkeypatch.chdir(tmp_path)
+    fakes["handler"] = lambda req: _stopping("blocked", "need a decision")
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    out = capsys.readouterr().out
+    assert "is BLOCKED: need a decision" in out
+    line = next(x for x in out.splitlines() if x.startswith("stop: "))
+    assert line.startswith(
+        "stop: blocked (reason agent-blocked, from agent: "
+        "the ANALYZE_EXECUTE agent's status 'blocked'); next: fix the cause, then 'unblock"
+    )
+    assert "need a decision" not in line and "next: 'resume'" not in line
+
+    assert cli.main(["--state-dir", sd, "resume"]) == 1
+    out = capsys.readouterr().out
+    assert "stop: blocked (reason unknown, from state: phase BLOCKED, settlement terminal)" in out
+    assert "next: 'resume'" not in out and "'unblock --reason" in out
+
+    assert cli.main(["--state-dir", sd, "status"]) == 0
+    assert "Stop:       blocked (reason unknown, from state" in capsys.readouterr().out
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    stop = json.loads(capsys.readouterr().out)["stop"]
+    assert stop == {
+        "outcome": "blocked",
+        "code": "unknown",
+        "family": "unknown",
+        "source": "state",
+        "evidence": "phase BLOCKED, settlement terminal",
+        "routes": ["unblock", "new_run"],
+        "live_facts_required": True,
+    }
+
+
+def test_a_failed_run_routes_to_a_new_run_only(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    fakes["handler"] = lambda req: _stopping("failure", "tests red")
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    out = capsys.readouterr().out
+    line = next(x for x in out.splitlines() if x.startswith("stop: "))
+    assert line.startswith("stop: failed (reason agent-failure, from agent: ")
+    assert "'resume'" not in line and "'unblock" not in line and "a new run" in line
+
+
+def test_a_lifecycle_error_names_its_typed_stop_on_stderr(tmp_path, capsys, monkeypatch, fakes):
+    """An error that leaves the phase unchanged routes to 'resume'; a refusal
+    (exit 2) to the same command once fixed, with stdout left empty; and an
+    error of 'unblock', after which the run is still BLOCKED, gets no line."""
+    monkeypatch.chdir(tmp_path)
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "resume"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        "autoforge: stop: refused (reason state-invalid, from exception: StateError raised)"
+        in captured.err
+    )
+
+    fakes["handler"] = lambda req: "no result block at all"
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 1
+    err = capsys.readouterr().err
+    assert "State unchanged." in err
+    assert (
+        "autoforge: stop: resumable_error (reason control-result-invalid, from exception: "
+        "ControlResultValidationError raised); next: 'resume'"
+    ) in err
+    assert load_state(Path(sd) / "state.json").phase == Phase.ANALYZE_EXECUTE
+
+    assert cli.main(["--state-dir", sd, "unblock", "--reason", "x"]) == 2
+    captured = capsys.readouterr()
+    assert "autoforge: error:" in captured.err and "stop:" not in captured.err

@@ -222,6 +222,13 @@ read it before adding tests for a listed area.
   `live` needs a `LIVE_ONLY` entry naming its offline tests, so a change
   to it alone still runs something. `tests/test_fast_targets.py` fails
   without either. A FAST run is never evidence and never a gate.
+- `tests/stop_corpus.py` is no test either: ADR 0011's read-only corpus
+  protocol (#369), which a maintainer runs by hand
+  (`uv run python -m tests.stop_corpus [--json] PATH...`) over the state
+  directories of past runs: each run classified once by its saved state,
+  each launch and unblock counted once from the run log's typed fields, the
+  limitations printed with every summary. `tests/test_stop_corpus.py` runs
+  it on synthetic runs and proves it writes nothing.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
@@ -449,6 +456,12 @@ launch environment, no credential     test_child_env.py (engine and doctor: test
                                       test_doctor.py)
 agent read context                    test_read_context.py (collection: test_engine.py,
                                       test_integration.py)
+typed stop classification (#369,      test_stop_classification.py (every table total, every error
+ADR 0011)                             class mapped, routes from the outcome alone, a loaded state
+                                      and #126's pause, the scheduler's settlement, no deciding
+                                      importer and nothing persisted; the fixtures: real stops with
+                                      their outcome, code, source and routes), test_cli.py (the
+                                      stop lines), test_stop_corpus.py (the corpus tool)
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)

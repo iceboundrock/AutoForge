@@ -5,6 +5,28 @@ so.
 
 ## Unreleased
 
+### A stopped run says how it stopped and what applies next, from typed facts (#369)
+
+After its last line, `run`, `step` and `resume` print one `stop:` line
+naming the outcome (`blocked`, `failed`, `resumable_error`, or `refused`
+for an exit-2 refusal), a reason code, its source (the controller sink
+that blocked, the agent's own status, the error's class, or the saved
+state) and the routes that apply: `unblock` then `resume` for `BLOCKED`,
+a new run for `FAILED`, `resume` when the phase is unchanged, the same
+command once fixed for a refusal. `status` shows a `Stop:` line for a
+`BLOCKED` or `FAILED` run, and `status --json` a derived `stop` object.
+
+The code is advice: no decision reads it, and `unblock` re-reads GitHub
+whatever it says. It is not saved in the state file, which is unchanged, so
+`resume` and `status` on a stopped run show `reason unknown, from state`;
+`Reason:` keeps the text. An error of `unblock` prints no `stop:` line.
+
+Four `BLOCKED` reasons told you to `resume`, which refuses a `BLOCKED`
+run: a conclusive read failure of the default branch or of the branch's PRs
+before `ANALYZE_EXECUTE` launched, of the EPIC body before `UPDATE_EPIC`
+launched, an EPIC body with more than one roadmap section, and a roadmap
+section that could not be written and read back. They now say `unblock`.
+
 ### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
 
 `REVIEW` still blocks on a comment carrying the round's review marker that
