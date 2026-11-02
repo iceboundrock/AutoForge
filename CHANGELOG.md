@@ -5,6 +5,41 @@ so.
 
 ## Unreleased
 
+### `rebind-epic` moves an existing standalone run to its issue's native parent, and `status` warns when they differ (#435)
+
+A run records its EPIC once, and #293 only fixed how a new run chooses it.
+A run created earlier, or whose issue moved under another EPIC after it
+started, would still post its `UPDATE_EPIC` progress comment and roadmap
+section on the EPIC it recorded. The only ways out were `run --force`,
+which discards the run, or editing `state.json`. Now:
+
+- `status` reads the issue's native parent (one `GET` of the issue) and,
+  when it is not the recorded EPIC, prints a `WARNING:` line with the
+  read-only preview command, and `status --json` carries
+  `epic_parent_check`. It changes nothing, and a failed read only says
+  so (`status` still exits 0). `status` now needs GitHub access for this
+  line, as `run` does;
+- `rebind-epic --issue ... --from <recorded EPIC> --to <native parent>
+  --reason "..."` replaces the recorded EPIC and nothing else: not the
+  run id, issue, PR, branch, reviews, counters, evidence, approvals or
+  worktree. It writes nothing to GitHub, runs no agent and does not touch
+  the merge gate. `--dry-run` reads and prints the decision and writes
+  nothing;
+- it is deliberately narrow, and refuses (exit 2, nothing changed) rather
+  than migrate anything: only a standalone run, only in `READY_FOR_MERGE`
+  or `BLOCKED`, only with no effect record, entry observation, completion
+  context, replan journal, rejected `UPDATE_EPIC` selection or another
+  issue's counted merge, only to the issue's open native parent on GitHub,
+  and only when `--from` is the EPIC the run records now. A failed GitHub
+  read exits 1;
+- the decision goes to the run log before the state's atomic save, so an
+  interruption leaves the old or the new binding; a repeat of an applied
+  rebind reports `already bound`.
+
+Runs blocked or stopped in `UPDATE_EPIC` with writes on the old EPIC still
+need the manual fallback the guide describes. See
+[Rebinding a run to its issue's parent](docs/usage.md#rebinding-a-run-to-its-issues-parent).
+
 ### A new run records the issue's native parent as its EPIC, and `--epic` is the fallback (#293)
 
 `run` used to record whatever `--epic` named, so a run of #257 started with
@@ -39,7 +74,8 @@ its `UPDATE_EPIC` would have written to the wrong issue. Now:
   the issue again;
 - `status` labels the EPIC as the one recorded when the run was created.
   An existing run keeps its EPIC whatever happens to the issue's parent
-  on GitHub; rebinding a run is #435.
+  on GitHub; `rebind-epic` (#435, above) is the operator's explicit way to
+  change it.
 
 See [Which EPIC a run records](docs/usage.md#which-epic-a-run-records).
 

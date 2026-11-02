@@ -20,7 +20,11 @@ Expected state includes data such as:
 - prompt version
 - run ID
 - repository
-- EPIC URL
+- EPIC URL (`epic_url`): recorded by `run` (#293) and replaced only by the
+  operator's `rebind-epic` (#435), which changes it and `updated_at` alone,
+  writes its decision to the run log first (`<PHASE>-epic-rebind`, with the
+  old URL and `prior_updated_at`), and refuses outside `READY_FOR_MERGE` and
+  `BLOCKED` or while any persisted record depends on the recorded EPIC
 - current issue URL
 - current PR URL and its branch
 - phase
@@ -589,8 +593,8 @@ As implemented (`flock(2)`, `src/autoforge/locking.py`):
   and no second controller can take over the repository mid-command. A
   refusal needs no lock, and taking the lock writes its PID record, which
   lies in the state directory when that directory is the lock's own
-  (`--state-dir <git common dir>/autoforge`). So `step`, `resume` and
-  `unblock` first load the state once without the lock, and `run` first
+  (`--state-dir <git common dir>/autoforge`). So `step`, `resume`,
+  `unblock` and `rebind-epic` first load the state once without the lock, and `run` first
   asks once whether it may replace the state there. That read can only
   refuse: a missing state, one that does not load (a LOCAL one among
   them) or, for `run`, a run it does not replace. Whatever lets a command
@@ -695,7 +699,7 @@ takes L1:
   and nothing ever removes a lock file.
 - **Ownership (D17.2).** L0 excludes a standalone command and a scheduler
   in time; the guards exclude them in ownership. **Forward:** `run`,
-  `step`, `resume` and `unblock` refuse (exit 2, `SchedulerOwnedIssueError`
+  `step`, `resume`, `unblock` and `rebind-epic` refuse (exit 2, `SchedulerOwnedIssueError`
   naming `autoforge epic archive`) an issue a scheduler namespace owns,
   checked under L0 before anything is written: the namespace holds any
   `state/state.json` (loaded or not), its `claim.json` holds an open claim

@@ -250,6 +250,18 @@ from .effects import (
     sha256_text,
 )
 from .epic_graph import read_children
+from .epic_rebind import (
+    RebindReport,
+    RebindRequest,
+    apply_words,
+    identity_problems,
+    informational_notes,
+    is_already_bound,
+    observe_parent,
+    parent_problems,
+    refusal_message,
+    state_problems,
+)
 from .errors import (
     AutoForgeError,
     CandidateNotMaterializableError,
@@ -259,6 +271,7 @@ from .errors import (
     ConfigurationError,
     ControlResultError,
     ControlResultValidationError,
+    EpicRebindError,
     ExecutionError,
     ExecutionTimeoutError,
     GitHubChecksAccessError,
@@ -2901,6 +2914,129 @@ class ControllerEngine:
             finished_at=now,
             metadata=binding.record(),
         )
+        self._logger().log_execution(record)
+
+    def rebind_epic(
+        self,
+        request: RebindRequest,
+        *,
+        dry_run: bool = False,
+        scheduler_problems: Sequence[str] = (),
+    ) -> RebindReport:
+        """Bind the loaded run to the issue's native parent ``request.new`` (#435).
+
+        The operator's explicit, audited replacement of ``epic_url`` and of
+        nothing else (:mod:`autoforge.epic_rebind`). In order: the request
+        must name this run's issue (and run, with ``--run-id``); a run that
+        already records ``--to`` is reported ``already-bound`` and nothing is
+        read or written (a repeat of an applied rebind). Then the state must
+        allow it (``--from`` is the recorded EPIC, the phase is one of
+        :data:`~autoforge.epic_rebind.REBIND_PHASES`, no effect state,
+        replan journal, rejected selection or foreign merge batch) and
+        ``scheduler_problems`` (the CLI's ownership findings for a dry run)
+        must be empty; only then is GitHub read: the issue, ``--to`` and the
+        issue again, and ``--to`` must be its open native parent.
+
+        Applied (``dry_run`` False, under the controller lock the caller
+        holds): the decision is written to the run log *before* the state
+        save, as an applied unblock is, so a rebind is never on disk without
+        its record; a crash between the two leaves the old binding, and the
+        same command applies it again. The save is the state's atomic
+        replace: a reader sees the old binding or the new one. A refusal is
+        recorded in the run log and raised as :class:`EpicRebindError`
+        (exit 2), a failed read is recorded and re-raised (exit 1); the
+        state is untouched either way. ``dry_run`` makes the same checks and
+        reads, writes nothing (no state, no run log) and reports every
+        reason at once.
+        """
+        state = self._require_state()
+        if not dry_run and not self.lock_held:
+            raise LockError("rebind-epic changes a run only under the controller lock")
+        try:
+            worktree = self.agent_worktree_description()
+        except ConfigurationError:
+            worktree = "(none: the run names no issue)"
+        report = RebindReport(
+            request=request,
+            run_id=state.run_id,
+            phase=state.phase.value,
+            recorded_epic_url=state.epic_url,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            branch=state.current_branch,
+            worktree=worktree,
+            state_file=str(self.paths.state_file),
+            prior_updated_at=state.updated_at,
+            dry_run=dry_run,
+        )
+        if not identity_problems(state, request) and is_already_bound(state, request):
+            report.decision = "already-bound"
+            return report
+        report.problems = [*scheduler_problems, *state_problems(state, request)]
+        report.notes = informational_notes(state, request)
+        if report.problems and not dry_run:
+            return self._refuse_rebind(report)
+        try:
+            report.observation = observe_parent(self.github, request)
+        except EpicRebindError as exc:
+            report.problems.append(str(exc))
+        except GitHubError as exc:
+            report.read_error = " ".join(str(exc).split())
+            if not dry_run:
+                report.decision = "refused"
+                self._log_rebind(report)
+                raise
+        if report.observation is not None:
+            report.problems += parent_problems(request, report.observation)
+        if dry_run:
+            if report.problems:
+                report.decision = "would-refuse"
+            elif report.read_error:
+                report.decision = "undecided"
+            else:
+                report.decision = "would-rebind"
+                report.apply_command = self.cli_command(*apply_words(request, state.run_id))
+            return report
+        if report.problems:
+            return self._refuse_rebind(report)
+        report.decision = "rebound"
+        # Recorded before the state write, like an applied unblock: a log
+        # write that fails leaves the binding as it was, and an applied
+        # rebind is never on disk without its record.
+        self._log_rebind(report)
+        recorded = parse_issue_url(state.epic_url)
+        # The run's own spelling of its repository, as every URL it records.
+        state.epic_url = GitHubIssueRef(
+            owner=recorded.owner, repo=recorded.repo, number=request.new.number
+        ).canonical
+        self.save()
+        return report
+
+    def _refuse_rebind(self, report: RebindReport) -> NoReturn:
+        report.decision = "refused"
+        self._log_rebind(report)
+        raise EpicRebindError(refusal_message(report))
+
+    def _log_rebind(self, report: RebindReport) -> None:
+        """One controller-only run-log record per applied or refused rebind (#435)."""
+        state = self._require_state()
+        now = utcnow_iso()
+        record = ExecutionRecord(
+            run_id=state.run_id,
+            seq=0,
+            phase=f"{state.phase.value}-epic-rebind",
+            attempt=1,
+            issue_url=state.current_issue_url,
+            pr_url=state.current_pr_url,
+            review_round=state.review_round,
+            profile="(operator EPIC rebind; no agent)",
+            prompt_version=state.prompt_version,
+            started_at=now,
+            finished_at=now,
+            metadata=report.record(),
+        )
+        if report.decision == "refused":
+            record.error = f"rebind-epic refused: {'; '.join(report.problems) or report.read_error}"
         self._logger().log_execution(record)
 
     def load(self) -> AutoForgeState:

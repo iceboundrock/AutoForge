@@ -333,7 +333,11 @@ waits for you to approve or decline that exact comment
 comment on another issue (one the run's issue references, or the EPIC),
 you post it yourself, bind an existing comment or withdraw it
 (`unblock --bind-evidence` / `--decline-action`); the controller never posts
-there, and verifies the comment on GitHub. Every command,
+there, and verifies the comment on GitHub. When `status` warns that GitHub
+now names another parent for the issue than the EPIC the run recorded,
+`autoforge rebind-epic ... --dry-run` previews moving a run stopped at
+`READY_FOR_MERGE` or `BLOCKED` to that parent, before its `UPDATE_EPIC`
+writes to the old one. Every command,
 where a run stops, and how to recover are in
 [Running the remote workflow](docs/usage.md).
 

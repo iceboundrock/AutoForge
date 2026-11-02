@@ -78,6 +78,15 @@ uv run autoforge unblock --bind-evidence X-0123456789abcdef \
   https://github.com/owner/repo/issues/16#issuecomment-123 --reason "the note is there"
 uv run autoforge unblock --decline-action X-0123456789abcdef \
   --decline-action X-fedcba9876543210 --reason "not this issue's job"
+
+# a standalone run stopped at READY_FOR_MERGE or BLOCKED records an EPIC that
+# is not its issue's native parent (`status` warns): preview the rebind, then
+# apply it with the command the preview prints; it changes the recorded EPIC
+# and nothing else, and writes nothing to GitHub
+uv run autoforge rebind-epic --issue https://github.com/owner/repo/issues/257 \
+  --from https://github.com/owner/repo/issues/158 \
+  --to https://github.com/owner/repo/issues/255 \
+  --reason "#257 moved under #255" --dry-run
 ```
 
 Pass a config file with the global option, before the subcommand:
@@ -166,15 +175,202 @@ the lock, and saves nothing.
 
 **Three different things.** GitHub's *native parent* of an issue is a fact
 on GitHub that anyone with access can change. A run's *recorded EPIC*
-(`epic_url`, `EPIC:` in `status`) is what the run was created with and
-never changes. *Scheduler ownership* is whether an `autoforge epic`
+(`epic_url`, `EPIC:` in `status`) is what the run was created with; only
+an operator's [`rebind-epic`](#rebinding-a-run-to-its-issues-parent)
+changes it. *Scheduler ownership* is whether an `autoforge epic`
 namespace holds the issue ([Running an EPIC in parallel](#running-an-epic-in-parallel));
 a standalone `run` refuses an issue a scheduler owns before it reads
 anything from GitHub. Changing an issue's parent on GitHub after its run
-started changes nothing in that run: `resume`, `step`, `unblock` and
-`status` read the recorded EPIC, never the issue's current parent.
-Rebinding an existing run is not supported yet (#435); `run --force`
-discards a run, it does not migrate one.
+started changes nothing in that run: `resume`, `step` and `unblock` act
+on the recorded EPIC, never the issue's current parent. `status` reads
+the current parent and warns when it is another issue, and changes
+nothing. `run --force` discards a run; it does not migrate one.
+
+## Rebinding a run to its issue's parent
+
+A run created before `run` read native parents (#293), or one whose issue
+was moved under another EPIC after it started, records an EPIC that GitHub
+no longer names as the issue's parent. Left alone, its `UPDATE_EPIC` would
+post the progress comment, splice the roadmap section and choose the next
+issue on that old EPIC. `rebind-epic` replaces the recorded EPIC of such a
+run with the issue's current native parent (#435). It is deliberately
+narrow: a standalone run, in a phase where nothing persisted depends on the
+EPIC, moved only to the parent GitHub names. When any of that does not
+hold it refuses and changes nothing, and the [manual fallback](#when-a-rebind-is-refused-the-manual-fallback)
+below applies.
+
+**`status` tells you.** For a run that is not finished, `status` reads the
+issue once (`GET /repos/<owner>/<repo>/issues/<n>`) and compares its
+native parent with the recorded EPIC. When they differ it prints a warning
+under the `EPIC:` line with the read-only preview to run; it never repairs
+anything itself:
+
+```text
+EPIC:       #158 https://github.com/owner/repo/issues/158 (the run's recorded EPIC; status never changes it)
+WARNING:    GitHub names #255 https://github.com/owner/repo/issues/255 as the native parent of #257, not the recorded EPIC; UPDATE_EPIC would write to the recorded one. Nothing was changed. Preview a rebind (read-only): autoforge rebind-epic --issue https://github.com/owner/repo/issues/257 --from https://github.com/owner/repo/issues/158 --to https://github.com/owner/repo/issues/255 --reason '<why>' --dry-run
+```
+
+An issue with no parent gets a `Parent:` line instead (the recorded EPIC
+came from `run --epic`, or the issue was detached), and a failed read gets
+`Parent:     not read (...)`; `status` still exits 0. `status --json`
+carries the same as `epic_parent_check` (`recorded_epic_url`,
+`issue_url`, `native_parent_url`, `differs`, `problem`), `null` for a
+finished run. A scheduler namespace's `status` warns too, but its hint
+says that `rebind-epic` acts on standalone runs only.
+
+### Preview, apply, continue
+
+1. **Stop the run where a rebind is allowed.** Keep the merge gate closed
+   (no `--allow-merge`) so `resume` stops at `READY_FOR_MERGE`, or leave a
+   `BLOCKED` run as it is. Nothing else may run on the repository: the
+   applied rebind takes the controller lock as `unblock` does.
+2. **Preview it.** `rebind-epic ... --dry-run` loads the state without the
+   lock, reads GitHub, and prints the decision with every reason it would
+   refuse. It writes nothing: no state, no run log, no lock file, nothing
+   on GitHub. Exit 0 when it would rebind, 2 when it would refuse, 1 when a
+   GitHub read failed.
+
+   ```text
+   EPIC rebind of run af-20261022T070620Z-8542c2 (dry run: nothing written)
+     state file:    /home/me/code/repo/.autoforge/state.json
+     phase:         READY_FOR_MERGE
+     issue:         #257 https://github.com/owner/repo/issues/257 (open on GitHub)
+     PR:            https://github.com/owner/repo/pull/263 (branch autoforge/257)
+     worktree:      <git common dir>/autoforge/worktrees/257
+     recorded EPIC: https://github.com/owner/repo/issues/158 (matches --from)
+     --to:          #255 https://github.com/owner/repo/issues/255 (open on GitHub)
+     native parent: #255 https://github.com/owner/repo/issues/255
+     reason:        #257 moved under #255
+     decision:      would rebind from https://github.com/owner/repo/issues/158 to https://github.com/owner/repo/issues/255
+     apply with:    autoforge rebind-epic --issue https://github.com/owner/repo/issues/257 --from https://github.com/owner/repo/issues/158 --to https://github.com/owner/repo/issues/255 --run-id af-20261022T070620Z-8542c2 --reason '#257 moved under #255'
+   ```
+
+   A refusal lists each reason as a `- refused:` line, with what to do.
+3. **Apply it** with the printed command. It adds `--run-id`, so it acts
+   only on the run you previewed. It checks everything again under the
+   lock, re-reads GitHub, writes its record to the run log, then saves the
+   state, and prints `continue with: ... resume`.
+4. **Continue** with `resume` as usual. The merge gate is exactly as it
+   was: a rebind never sets `safety.allow_merge`, never implies
+   `--allow-merge`, and never enters `MERGE`.
+
+**What you must name, and why.** `--issue` must be the run's current
+issue, and `--from` the EPIC the run records now; a run recording another
+EPIC refuses with `the expected EPIC is stale`, so a rebind acts only on
+the binding you saw. `--to` must be the issue's direct native parent on
+GitHub, open, in the same repository: a parent named in issue text, a
+roadmap or a title never counts, as for `run`. `--reason` is required (at
+most 1000 characters) and goes to the run log. `--run-id` (optional,
+added by the printed apply command) refuses a state directory that holds
+another run. The state directory is the one `--state-dir` or the
+configuration names, as for every standalone command.
+
+**Where a rebind is allowed.**
+
+| Phase | Rebind? | Why |
+|---|---|---|
+| `READY_FOR_MERGE` | yes, unless a refusal below applies | the review is done and nothing of the EPIC has been read or written for this issue yet |
+| `BLOCKED` | yes, unless a refusal below applies | the run waits for you; `unblock` then re-enters a phase on the new EPIC |
+| `INITIALIZING`, `ANALYZE_EXECUTE`, `REVIEW`, `FIX`, `REPLAN_REEXECUTE` | no | a working phase whose entry may hold a journal, a launch or an unpushed candidate: `resume` (gate closed) until it stops at `READY_FOR_MERGE` or `BLOCKED`, then rebind |
+| `MERGE`, `UPDATE_EPIC` | no | the merge may be sent, and `UPDATE_EPIC` writes the recorded EPIC: see the manual fallback |
+| `DONE`, `FAILED` | no | nothing of the run uses its EPIC again; a new `run` binds to the native parent |
+
+Even in those two phases, a rebind refuses (exit 2) when the run holds
+anything persisted that names or depends on the recorded EPIC, because it
+never migrates, drops or relabels a journaled write:
+
+- an effect record, an entry observation or a completion context kept for
+  `unblock` to re-enter (a `BLOCKED` run keeps them; the message lists
+  each effect by kind, stage and target, and says which one targets the
+  recorded EPIC: a progress comment, an acceptance comment, an operator
+  action on the EPIC);
+- a `REPLAN_REEXECUTE` journal;
+- rejected `UPDATE_EPIC` selections (`next_issue_rejections`), which are
+  choices among the recorded EPIC's sub-issues;
+- merges counted for the next roadmap update that are another issue's PR
+  (a run that already moved on from an earlier issue); this issue's own PR
+  is fine, and is reported on the new EPIC.
+
+It also refuses (exit 2) for: a scheduler's issue or a state directory
+inside the scheduler's root; a held controller lock (`another AutoForge
+controller holds ...`); `--from`, `--to` or `--issue` in another
+repository, `--from` equal to `--to`, or either naming the issue itself;
+an issue with no native parent, a parent other than `--to`, a parent in
+another repository, or a closed `--to`; and an issue whose parent or state
+changed between its two reads (run the command again). A GitHub read that
+fails exits 1 and changes nothing; it is never taken for "no parent". A
+closed issue is not a refusal: a run whose PR is already merged by hand
+can still be rebound before its `UPDATE_EPIC`.
+
+**What changes, and what does not.** The state's `epic_url` and its
+`updated_at`, nothing else: the run id, issue, PR, branch, reviewed and
+current revisions, findings, review and fix rounds, replan count, step
+budget, validation evidence, configuration and sandbox pin, operator
+approvals and the agent worktree (with any unpushed candidate) are the
+same bytes (a state file an older controller wrote is also relabelled to
+this controller's protocol, as by any save). No agent runs and nothing is
+written to GitHub. The run log
+(`<state dir>/logs/<run id>/events.jsonl`) gets one record whose `phase`
+is `<PHASE>-epic-rebind` (for example `READY_FOR_MERGE-epic-rebind`) with
+`decision` (`rebound`, `refused`), `operator_reason`, the run and issue
+identity, `recorded_epic_url` (the old one), `from_epic_url`,
+`to_epic_url`, the native parent and states GitHub returned, every
+refusal, and `prior_updated_at`; that record and the old `epic_url` it
+names are the audit trail and the undo information. A refusal under the
+lock is recorded the same way; a dry run, an already-bound repeat, and a
+refusal of the request itself, of a held lock or of a scheduler's issue
+record nothing. From then on `UPDATE_EPIC`
+reads the new EPIC (its read context, `epic.md` and the sub-issue lists,
+is rendered fresh at each launch) and writes its progress comment and
+roadmap section there; nothing is written to the old one.
+
+**Repeats and interruptions.** Running the applied command again once it
+succeeded prints `already bound to <url>: nothing to do, nothing written`
+(exit 0) without reading GitHub. A repeat with another `--from` or `--to`
+refuses as stale. The record is written before the state, and the state
+file is replaced atomically, so an interruption leaves exactly one of the
+two bindings in `state.json`:
+
+- interrupted before the record: nothing changed;
+- after the record, before the save: the run log says `rebound`, the
+  state still records the old EPIC (`status` shows which). Run the same
+  command again; it rebinds and records a second time;
+- after the save: the repeat says `already bound`.
+
+**Undoing a rebind.** A rebind always follows GitHub, so to go back, move
+the issue back under the old EPIC on GitHub, then rebind with `--from`
+and `--to` swapped. The old URL is in the run-log record.
+
+**Scheduler namespaces.** An issue the parallel EPIC scheduler owns keeps
+the EPIC whose graph admitted it (ADR 0008), and `rebind-epic` refuses it
+in every form (its dry run included), as it refuses a state directory
+inside the scheduler's root; it never takes a scheduler's locks or touches
+its claims. There is no transfer of a namespace between EPICs. To continue
+such an issue under its new EPIC, stop the old EPIC's scheduler
+(`epic stop`), release the issue with [`epic archive`](#epic-archive)
+(which moves its state aside and closes its claim), then start a
+standalone `run` for it, which binds to its native parent, or let the new
+EPIC's scheduler admit it fresh.
+
+### When a rebind is refused: the manual fallback
+
+When a run cannot reach a phase where a rebind is allowed, or holds
+records tied to the old EPIC, finish the issue by hand rather than edit
+`state.json`, which would bypass the phase, effect and recovery
+protocols:
+
+1. Keep the merge gate closed so the run stops at `READY_FOR_MERGE` and
+   never enters `MERGE` or `UPDATE_EPIC`. Do not `unblock` a run blocked
+   in `UPDATE_EPIC` on the old EPIC.
+2. Merge the PR yourself.
+3. Post the progress note and update the roadmap on the right EPIC
+   yourself, and check what the old EPIC already received (its comments
+   carry the controller's markers); never edit or delete a comment the
+   controller wrote without reading the [GitHub safety](agent-guides/github-safety.md)
+   rules first.
+4. Start the next issue with `run --issue <next>`, which binds to that
+   issue's native parent (`run --force` when the old run is still
+   non-terminal; it discards that state, and its run logs stay).
 
 ## What a run does
 

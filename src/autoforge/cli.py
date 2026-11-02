@@ -22,8 +22,14 @@ Commands:
           a FIX plan awaits (#211); --bind-evidence binds an existing comment
           to an operator action and --decline-action (repeatable) declines
           operator actions (#243)
+  rebind-epic  the operator's explicit move of a standalone run to its issue's native
+          parent (#435): --issue, --from (the recorded EPIC), --to, --reason; only in
+          READY_FOR_MERGE or a BLOCKED run with nothing persisted tied to its EPIC; the
+          decision goes to the run log before the one-field state save; --dry-run writes
+          nothing
   status  show the persisted run summary (--json for machine output; --action
-          prints an acceptance or operator action's exact payload)
+          prints an acceptance or operator action's exact payload); reads the issue's
+          native parent and warns, changing nothing, when it is not the recorded EPIC
   epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
           --dry-run and --force), resume, status (lock-free, --json), stop
           (lock-free, --now) and archive; every 'epic' command refuses
@@ -45,6 +51,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TextIO
 
 from . import __version__
@@ -83,6 +90,14 @@ from .epic_commands import (
     stop_scheduler,
 )
 from .epic_graph import GraphReader
+from .epic_rebind import COMMAND as REBIND_COMMAND
+from .epic_rebind import (
+    RebindReport,
+    parent_drift,
+    parse_rebind_request,
+    preview_words,
+    status_lines,
+)
 from .errors import (
     AutoForgeError,
     ConfigurationError,
@@ -115,12 +130,16 @@ from .interaction import (
     UnavailableReason,
 )
 from .locking import ControllerLock, repository_lock_path
-from .ownership import refuse_scheduler_owned_issue, standalone_ownership_predicate
+from .ownership import (
+    refuse_scheduler_owned_issue,
+    scheduler_ownership,
+    standalone_ownership_predicate,
+)
 from .provenance import ControllerIdentity, mismatch_lines, protocol_ranges, refusal_headline
 from .redaction import redact, redact_argv, redact_dict, redact_obj
 from .replan_txn import ReplanTransaction
 from .run_binding import EpicBinding
-from .run_namespace import namespace_issue_of_state_dir
+from .run_namespace import inside_scheduler_root, namespace_issue_of_state_dir
 from .sandbox_pin import SandboxPin
 from .sandbox_policy import absolute_spelling
 from .scheduler import EpicScheduler, SchedulerInputs
@@ -128,7 +147,7 @@ from .scheduler_stop import StopMode
 from .sdk_policy import MAX_ANSWER_CHARS
 from .state import SUPPORTED_PROTOCOLS, AutoForgeState
 from .transitions import TERMINAL_PHASES, Phase
-from .validation import parse_issue_url
+from .validation import GitHubIssueRef, parse_issue_url
 
 
 def _positive_int(text: str) -> int:
@@ -307,6 +326,57 @@ def build_parser() -> argparse.ArgumentParser:
             "bind an existing comment on an operator action's target issue as its evidence "
             "(repeatable): 'resume' verifies the comment is there and unchanged; the "
             "controller never judges whether it is adequate"
+        ),
+    )
+
+    rb = sub.add_parser(
+        "rebind-epic",
+        help="bind a standalone run to its issue's native parent (READY_FOR_MERGE or BLOCKED)",
+        description=(
+            "Replace the EPIC an existing standalone run records with the issue's native "
+            "parent on GitHub, and nothing else of the run (#435). Only in READY_FOR_MERGE, "
+            "or BLOCKED with no effect record, entry observation, completion context, replan "
+            "journal, rejected selection or other issue's merge pending for the recorded EPIC; "
+            "never for a scheduler's issue. The issue, --to and the issue again are read from "
+            "GitHub; --to must be the issue's open native parent. The decision is written to "
+            "the run log, then the state is saved atomically. A repeat that finds --to already "
+            "recorded changes nothing. No agent runs, nothing is written to GitHub, and the "
+            "merge gate is not touched."
+        ),
+    )
+    rb.add_argument("--issue", required=True, metavar="ISSUE_URL", help="the run's current issue")
+    rb.add_argument(
+        "--from",
+        required=True,
+        dest="from_epic",
+        metavar="EPIC_URL",
+        help="the EPIC the run records now; a run recording another is refused",
+    )
+    rb.add_argument(
+        "--to",
+        required=True,
+        dest="to_epic",
+        metavar="EPIC_URL",
+        help="the EPIC to record: the issue's native parent on GitHub",
+    )
+    rb.add_argument(
+        "--reason",
+        required=True,
+        help="why the operator rebinds the run (recorded in the run log)",
+    )
+    rb.add_argument(
+        "--run-id",
+        default="",
+        metavar="RUN_ID",
+        help="the run the operator previewed ('status' and the dry run print it); refused if "
+        "the state directory holds another",
+    )
+    rb.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "read the state and GitHub and print the decision, every refusal and the command "
+            "that applies it; write nothing (no state, no run log, no lock)"
         ),
     )
 
@@ -512,6 +582,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_resume(args)
         if args.command == "unblock":
             return cmd_unblock(args)
+        if args.command == "rebind-epic":
+            return cmd_rebind_epic(args)
         if args.command == "status":
             return cmd_status(args)
         if args.command == "epic":
@@ -1709,6 +1781,88 @@ def print_unblock_outcome(o: UnblockOutcome) -> None:
     print(redact(f"[{o.run_id}] {o.message}"))
 
 
+def cmd_rebind_epic(args) -> int:
+    """``autoforge rebind-epic``: the operator's explicit move of a run to its issue's parent.
+
+    The request is checked before anything is read (exit 2). A dry run
+    loads the state without the lock, reads the scheduler's files and
+    GitHub, and prints the decision with every reason (exit 0, 2 when it
+    would refuse, 1 when a read failed); it writes nothing. Otherwise, as
+    ``unblock``: the scheduler's state-directory refusal and an unloadable
+    state before the lock, then under it the state read again, the forward
+    ownership guard, and the engine's decision (:meth:`ControllerEngine.rebind_epic`),
+    which refuses with exit 2 and a failed read with exit 1, the state
+    unchanged either way. A rebind is not resumed here.
+    """
+    request = parse_rebind_request(
+        issue_url=args.issue,
+        from_url=args.from_epic,
+        to_url=args.to_epic,
+        reason=args.reason,
+        run_id=args.run_id,
+    )
+    engine = _engine_for(args)
+    if args.dry_run:
+        # Reads the state, the scheduler's files and GitHub; writes nothing
+        # (no state, no run log, no lock).
+        state = engine.load()
+        report = engine.rebind_epic(
+            request, dry_run=True, scheduler_problems=_rebind_scheduler_problems(engine, state)
+        )
+        _print_rebind(report)
+        return report.exit_code
+    engine.refuse_scheduler_state_dir(REBIND_COMMAND)
+    _refuse_unloadable_state_before_the_lock(engine)
+    # Load, decide and write under one lock, like `unblock`: a state loaded
+    # before the lock could already have been replaced by another controller.
+    with engine.locked():
+        state = engine.load()
+        _guard_scheduler_ownership(engine, state.current_issue_url, REBIND_COMMAND)
+        report = engine.rebind_epic(request)
+    _print_rebind(report)
+    if report.decision == "rebound":
+        print(redact(f"continue with: {engine.resume_command()}"))
+    return 0
+
+
+def _rebind_scheduler_problems(engine: ControllerEngine, state: AutoForgeState) -> list[str]:
+    """ADR 0008's refusals of a standalone command, as ``rebind-epic --dry-run`` reports them.
+
+    The state directory inside the scheduler's root (D17.3) and the issue a
+    scheduler namespace owns (D17.2), each read without a lock and without
+    a write, as the applied command refuses them with exit 2.
+    """
+    try:
+        root = engine.coordination_root()
+    except LockError as exc:
+        return [f"this directory has no controller lock to take: {exc}"]
+    problems: list[str] = []
+    if inside_scheduler_root(engine.paths.state_dir, root):
+        problems.append(
+            f"the state directory {engine.paths.state_dir} is inside the parallel EPIC "
+            "scheduler's root: a scheduler's issue keeps the EPIC whose graph admitted it, and "
+            f"{REBIND_COMMAND} acts on standalone runs only"
+        )
+    try:
+        number = parse_issue_url(state.current_issue_url).number
+    except ConfigurationError:
+        return problems
+    owner = scheduler_ownership(root, number)
+    if owner:
+        problems.append(
+            f"issue #{number} is owned by the parallel EPIC scheduler: {owner}; only the "
+            "scheduler continues it, and 'autoforge epic archive' releases it to a standalone "
+            "run"
+        )
+    return problems
+
+
+def _print_rebind(report: RebindReport) -> None:
+    # State-derived and operator-supplied text; redacted line by line.
+    for line in report.lines():
+        print(redact(line))
+
+
 def _resume_holding_state(
     engine: ControllerEngine, state: AutoForgeState, allow_merge: bool
 ) -> int | None:
@@ -1954,6 +2108,7 @@ def cmd_status(args) -> int:
     # agents controlled (`block_reason`, findings, a hand-edited journal), so
     # both output modes cross the same redaction boundary as the run log.
     certificate = _review_certificate_check(engine, state)
+    parent = _epic_parent_check(engine, state)
     if args.as_json:
         # to_dict() carries "mode" and every persisted field; protocol 13
         # removed LOCAL's twelve fields from it (#388, ADR 0009 D8, D10).
@@ -1965,6 +2120,7 @@ def cmd_status(args) -> int:
             "acceptance_actions": _acceptance_actions(state),
             "operator_actions": _operator_actions(state),
             "review_certificate_status": _review_certificate_status(state, certificate),
+            "epic_parent_check": parent.document() if parent is not None else None,
             "outer_sandbox": {
                 "mode": engine.config.sandbox.mode,
                 "summary": sandbox_mode_summary(engine.config.sandbox),
@@ -1981,8 +2137,67 @@ def cmd_status(args) -> int:
         config = ("--config", args.config) if args.config else ()
         engine.continue_command = (*config, "epic", "resume", state.epic_url)
     actions = _render_acceptance_actions(state, engine) + _render_operator_actions(state, engine)
-    print(redact(_render_status(state, txn, actions, evidence)))
+    lines = parent.lines(engine) if parent is not None else []
+    print(redact(_render_status(state, txn, actions, evidence, lines)))
     return 0
+
+
+@dataclass(frozen=True)
+class _ParentCheck:
+    """``status``'s read of the issue's native parent beside the recorded EPIC (#435)."""
+
+    state: AutoForgeState
+    parent: GitHubIssueRef | None
+    problem: str
+
+    def document(self) -> dict:
+        """``epic_parent_check`` of ``status --json``: derived, never merged into the state."""
+        return {
+            "recorded_epic_url": self.state.epic_url,
+            "issue_url": self.state.current_issue_url,
+            "native_parent_url": self.parent.canonical if self.parent is not None else None,
+            "differs": None if self.problem else parent_drift(self.state.epic_url, self.parent),
+            "problem": self.problem,
+        }
+
+    def lines(self, engine: ControllerEngine) -> list[str]:
+        state = self.state
+        if engine.state_dir_in_scheduler_root():
+            hint = (
+                "A scheduler namespace's run keeps the EPIC whose graph admitted it; "
+                "rebind-epic acts on standalone runs only."
+            )
+        elif self.parent is not None:
+            hint = "Preview a rebind (read-only): " + engine.cli_command(
+                *preview_words(state.current_issue_url, state.epic_url, self.parent.canonical)
+            )
+        else:
+            hint = ""
+        return status_lines(
+            recorded_epic_url=state.epic_url,
+            issue_url=state.current_issue_url,
+            parent=self.parent,
+            read_error=self.problem,
+            rebind_hint=hint,
+        )
+
+
+def _epic_parent_check(engine: ControllerEngine, state: AutoForgeState) -> _ParentCheck | None:
+    """The issue's native parent on GitHub now, for ``status`` to compare (#435).
+
+    One read (``get_issue_node`` of the run's current issue); a finished run
+    (``DONE``, ``FAILED``) or one with no issue is not checked (None). A read
+    that fails is reported, never raised: ``status`` prints what the state
+    holds whatever GitHub answers. Nothing is written or repaired.
+    """
+    if state.phase in (Phase.DONE, Phase.FAILED) or not state.current_issue_url:
+        return None
+    try:
+        node = engine.github.get_issue_node(state.current_issue_url)
+    except AutoForgeError as exc:
+        text = " ".join(str(exc).split())
+        return _ParentCheck(state, None, text[:300] or type(exc).__name__)
+    return _ParentCheck(state, node.parent, "")
 
 
 # How many records of the current candidate ``status`` lists, newest last.
@@ -2539,8 +2754,13 @@ def _render_status(
     txn: ReplanTransaction | None,
     acceptance: list[str] | None = None,
     evidence: list[str] | None = None,
+    parent_check: list[str] | None = None,
 ) -> str:
-    """Human status for a GitHub run (unredacted; the caller redacts)."""
+    """Human status for a GitHub run (unredacted; the caller redacts).
+
+    ``parent_check`` is the read-only comparison of the recorded EPIC with
+    the issue's native parent (#435), printed under the EPIC line.
+    """
 
     def _num(url: str) -> str:
         return url.rstrip("/").rsplit("/", 1)[-1] if url else "-"
@@ -2550,9 +2770,11 @@ def _render_status(
         "",
         f"Run:        {state.run_id}",
         f"Repository: {state.repository}",
-        # The persisted EPIC, never the issue's current parent on GitHub (#293, #435).
+        # The persisted EPIC, never the issue's current parent on GitHub (#293);
+        # the parent is compared below it and never written (#435).
         f"EPIC:       #{_num(state.epic_url)} {state.epic_url} "
-        "(recorded when the run was created; not re-read from the issue's parent)",
+        "(the run's recorded EPIC; status never changes it)",
+        *(parent_check or []),
         f"Issue:      #{_num(state.current_issue_url)} {state.current_issue_url or '-'}",
         f"PR:         #{_num(state.current_pr_url)} {state.current_pr_url or '-'}",
         f"Branch:     {state.current_branch or '-'}",
