@@ -1880,6 +1880,18 @@ step outputs it hands on. `tests/test_publish_workflow.py` reads
   a changed file, an extra file, another version, a different
   `SHA256SUMS` or no recorded digests
 
+`tests/test_workflow_pins.py` reads every workflow under
+`.github/workflows/` (#288) and fails when a `uses:`, a step's or a
+reusable workflow's, is not `owner/repo[/path]@<full SHA> # vX.Y.Z`: a tag
+(`actions/checkout@v7` in the real `ci.yml` included), a branch, a short or
+uppercase SHA, a missing or partial release comment, a Docker image or a
+local action. Each workflow is read with PyYAML and line by line, and the
+two must find the same references, so a flow-style or quoted `uses:` fails
+rather than going unread; a commented-out step or a `run` script that
+names an action is no reference. One action repository must have one
+commit and one release in every workflow
+([Development](../development.md#pinned-actions)).
+
 ### SDK policy (#149, docs/sdk-policy.md)
 
 The SDK providers cannot launch yet, so their policy is held at its own

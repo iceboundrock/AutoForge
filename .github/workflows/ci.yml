@@ -19,6 +19,12 @@
 # `.github/workflows/`) makes any PR that touches these files BLOCK in
 # READY_FOR_MERGE / MERGE for a human to review and merge. See
 # docs/development.md, "What a green `ci` does and does not prove".
+#
+# Every action is pinned to a full commit SHA; the comment names its release.
+# A tag can be moved to other code, which would then run under the `ci`
+# check name the merge gate reads (#288). tests/test_workflow_pins.py keeps
+# every workflow so; docs/development.md, "Pinned actions", says how to
+# update a pin.
 name: CI
 
 on:
@@ -44,11 +50,9 @@ jobs:
         # release. tests/test_ci_workflow.py asserts the floor stays covered.
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v7
-      # Pinned to a full version on purpose: setup-uv stopped publishing
-      # floating major tags after v7, so `@v10` does not resolve.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           # Sets UV_PYTHON, which takes precedence over the repo's
           # .python-version pin.
@@ -117,10 +121,8 @@ jobs:
     name: lint + format + types
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      # Pinned to a full version on purpose: setup-uv stopped publishing
-      # floating major tags after v7, so `@v10` does not resolve.
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.11"
           enable-cache: true
@@ -145,10 +147,8 @@ jobs:
     name: sandbox (real backend)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      # Pinned to a full version on purpose: setup-uv stopped publishing
-      # floating major tags after v7, so `@v10` does not resolve.
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.11"
           enable-cache: true
@@ -183,13 +183,11 @@ jobs:
         # The same list as `test`; tests/test_ci_workflow.py keeps them equal.
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The build backend is third-party code; it gets no token.
           persist-credentials: false
-      # Pinned to a full version on purpose: setup-uv stopped publishing
-      # floating major tags after v7, so `@v10` does not resolve.
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           # The uv the release build of pypi-publish.yml uses, pinned to the
           # same version and archive SHA-256 there (test_publish_workflow.py).
