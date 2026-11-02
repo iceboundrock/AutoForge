@@ -212,7 +212,9 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        EPIC #383's exit audit in Appendix D):
                                        no compatibility, strict refusal, the protocol, sequencing;
                                        fast feedback and full validation: FAST is never evidence,
-                                       the controller selects FULL, the coverage mapping)
+                                       the controller selects FULL, the coverage mapping;
+                                       typed stop classification: outcomes, reason codes and
+                                       routes, never an authorization, no persisted code)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/getting-started.md                operator guide: a first run from nothing, step by step, and the
@@ -291,6 +293,11 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   result, read `docs/agent-guides/control-result-protocol.md`.
 - If changing logging, redaction, or any error text that can embed command
   output or configuration, read `docs/agent-guides/secrets-and-logging.md`.
+- If adding or changing a stop sink (a `_block` call or a `BLOCKED` an
+  engine step returns, the agent-status sink, an error class in
+  `src/autoforge/errors.py`), the CLI's `stop:` lines or
+  `src/autoforge/stop_classification.py`, read
+  `docs/adr/0011-typed-stop-classification-and-recovery-baseline.md`.
 - If adding or changing tests, or changing behaviour in a high-priority
   coverage area, read `tests/AGENTS.md` and `docs/agent-guides/testing.md`.
 

@@ -51,6 +51,62 @@ Runs that reached `UPDATE_EPIC` (their PR counted), or with writes on the
 old EPIC, still need the manual fallback the guide describes. See
 [Rebinding a run to its issue's parent](docs/usage.md#rebinding-a-run-to-its-issues-parent).
 
+### A stopped run says how it stopped and what applies next, from typed facts (#369)
+
+After its last line, `run`, `step` and `resume` print one `stop:` line
+naming the outcome (`blocked`, `failed`, `resumable_error`, or `refused`
+for an exit-2 refusal), a reason code, its source (the controller sink
+that blocked, the agent's own status, the error's class, or the saved
+state) and the routes that apply: `unblock` then `resume` for `BLOCKED`,
+a new run for `FAILED`, `resume` when the phase is unchanged, the same
+command once fixed for a refusal. `status` shows a `Stop:` line for a
+`BLOCKED` or `FAILED` run, and `status --json` a derived `stop` object.
+
+The code is advice: no decision reads it, and `unblock` re-reads GitHub
+whatever it says. It is not saved in the state file, which is unchanged, so
+`resume` and `status` on a stopped run show `reason unknown, from state`;
+`Reason:` keeps the text. An error of `unblock` prints no `stop:` line.
+A run log refused after a launch's attempt was saved still exits 2 and
+still says to repair the log directory and `resume`; its `stop:` line is
+`resumable_error`, reason `run-log-refused`, never a refusal that points to
+a new run.
+
+Seven `BLOCKED` reasons told you to `resume`, which refuses a `BLOCKED`
+run: a conclusive read failure of the default branch or of the branch's PRs
+before `ANALYZE_EXECUTE` launched, of the EPIC body before `UPDATE_EPIC`
+launched, and of the next issue `UPDATE_EPIC` selected; an EPIC body with
+more than one roadmap section; a roadmap section that could not be written
+and read back; and more than one open PR, or an unreadable marker, claiming
+the issue. They now say `unblock`.
+
+A scheduler namespace's `READY_FOR_MERGE` is routed to a merge by hand
+only: its worker never merges, whatever the merge gate says. Where nothing
+says whether a state directory is a namespace's (`status` outside a git
+repository, `resume --dry-run`, which runs no git), the `stop:` line gives
+only the routes both views share, and `status --json` and
+`resume --dry-run` work outside a git repository as they did before; the
+`stop` object names the view it took.
+
+`tests/stop_corpus.py` counts every run a state directory holds evidence
+of, by run id: the current state, an archived or quarantined one, and the
+run log of a run a new run replaced. A run whose state does not load or is
+gone is `undecidable` with its run log still counted, and operator actions
+are counted apart from launches. It never opens a FIFO, a link or an
+oversized run log, and counts a line with a field of an unexpected type as
+malformed instead of failing. A launch is an agent's or a controller
+command's by the producer its line names, so an agent's line from before
+#193, which carried its limit in `timeout_seconds`, is still an agent's. A
+scheduler namespace's state is classified in the scheduler's view (a
+`MERGE` or `UPDATE_EPIC` there is a hand-off, and its routes are the
+scheduler's), and a state directory whose view nothing establishes leaves
+such a phase `undecidable`. A path given that is missing, a link or no
+directory, and a directory on the way down that cannot be listed, is
+reported with the stage that failed, and the summary says its input is
+incomplete instead of counting fewer runs. A line the controller writes of
+itself that records no invocation, such as the EPIC a new run binds, is
+counted as bookkeeping (`autoforge.stop-corpus/4`), never as a launch, so
+it inflates no launch total and dilutes no failure rate.
+
 ### A new run records the issue's native parent as its EPIC, and `--epic` is the fallback (#293)
 
 `run` used to record whatever `--epic` named, so a run of #257 started with
