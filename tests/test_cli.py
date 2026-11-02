@@ -4550,6 +4550,7 @@ def test_a_blocked_run_names_its_typed_stop_and_never_advises_resume(
         "family": "unknown",
         "source": "state",
         "evidence": "phase BLOCKED, settlement terminal",
+        "view": "standalone",
         "routes": ["unblock", "new_run"],
         "live_facts_required": True,
     }
@@ -4593,3 +4594,68 @@ def test_a_lifecycle_error_names_its_typed_stop_on_stderr(tmp_path, capsys, monk
     assert cli.main(["--state-dir", sd, "unblock", "--reason", "x"]) == 2
     captured = capsys.readouterr()
     assert "autoforge: error:" in captured.err and "stop:" not in captured.err
+
+
+@pytest.mark.parametrize("phase", [Phase.BLOCKED, Phase.FAILED])
+def test_read_only_stop_lines_need_no_repository(
+    tmp_path_factory, capsys, monkeypatch, fakes, phase
+):
+    """Outside a git repository 'status --json' and 'resume --dry-run' work as
+    they did before the stop line, and a dry run still runs no git: whether
+    the state dir is a scheduler namespace's is unknown there, so only the
+    routes both views share are given."""
+    import autoforge.engine as engine_mod
+
+    outside = tmp_path_factory.mktemp("not-a-repo")
+    monkeypatch.chdir(outside)
+    sd = outside / ".autoforge"
+    sd.mkdir()
+    save_state(_other_controller_state("af-stopped", phase, "a reason"), sd / "state.json")
+    outcome = phase.value.lower()
+    routes = ["unblock"] if phase is Phase.BLOCKED else ["investigate"]
+
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    stop = json.loads(captured.out)["stop"]
+    assert (stop["outcome"], stop["view"], stop["routes"]) == (outcome, "unknown", routes)
+
+    def never(*a, **k):
+        raise AssertionError("dry-run must not resolve the repository lock")
+
+    monkeypatch.setattr(engine_mod, "repository_lock_path", never)
+    assert cli.main(["--state-dir", str(sd), "resume", "--dry-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert f"is in terminal phase {phase.value}: a reason" in captured.out
+    line = next(x for x in captured.out.splitlines() if x.startswith("stop: "))
+    assert line.startswith(f"stop: {outcome} (reason unknown, from state: phase {phase.value}")
+    assert "a new run" not in line and "epic archive" not in line
+    assert sorted(p.name for p in sd.iterdir()) == ["state.json"]
+
+
+def test_status_of_a_namespace_at_ready_for_merge_advises_a_merge_by_hand(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """A scheduler worker never merges and keeps the merge gate closed whatever
+    the configuration (ADR 0008 D15.3), and a standalone 'resume' refuses its
+    state dir: status names a merge by hand, never the gate and 'resume'."""
+    monkeypatch.chdir(tmp_path)
+    ready = _other_controller_state("af-ready", Phase.READY_FOR_MERGE)
+    sd = _namespace_state_dir(tmp_path, 2)
+    sd.mkdir(parents=True)
+    save_state(ready, sd / "state.json")
+    standalone = tmp_path / ".autoforge"
+    standalone.mkdir()
+    save_state(ready, standalone / "state.json")
+
+    assert cli.main(["--state-dir", str(sd), "status", "--json"]) == 0
+    stop = json.loads(capsys.readouterr().out)["stop"]
+    assert (stop["outcome"], stop["view"], stop["routes"]) == (
+        "ready_for_merge",
+        "scheduler",
+        ["merge"],
+    )
+    assert cli.main(["--state-dir", str(standalone), "status", "--json"]) == 0
+    stop = json.loads(capsys.readouterr().out)["stop"]
+    assert (stop["view"], stop["routes"]) == ("standalone", ["merge", "merge_gate"])

@@ -34,6 +34,7 @@ from autoforge.stop_classification import (
     REASON_FAMILY,
     REFUSAL_ROUTES,
     ROUTE_TEXT,
+    SCHEDULER_ROUTES,
     CodedReason,
     OperatorRoute,
     ReasonSource,
@@ -48,6 +49,8 @@ from autoforge.stop_classification import (
 )
 from autoforge.transitions import Phase, Settlement, issue_settlement
 from tests.conftest import (
+    ISSUE,
+    ISSUE3,
     SHA_A,
     UNLOADABLE_STATES,
     FakeGitHub,
@@ -62,9 +65,11 @@ from tests.conftest import (
 from tests.test_engine import (
     ESCAPE_BODY,
     _analyzed,
+    _epic_result,
     _in_merge,
     _in_ready,
     _in_review,
+    _in_update_epic,
     _loop_agent,
     _no_stagnation,
     _one_finding_per_round,
@@ -87,6 +92,7 @@ def test_every_table_is_total():
     assert set(OUTCOME_ROUTES) == set(StopOutcome)
     assert set(LIVE_FACTS_REQUIRED) == set(StopOutcome)
     assert set(ROUTE_TEXT) == set(OperatorRoute)
+    assert set(SCHEDULER_ROUTES) <= set(OperatorRoute)
     # Every refusal an error can be has routes of its own.
     refused = {code for outcome, code in EXCEPTION_CLASSES.values() if outcome is Out.REFUSED}
     assert refused <= set(REFUSAL_ROUTES)
@@ -284,10 +290,52 @@ def test_a_loaded_state_classifies_by_its_phase_and_settlement(phase):
         assert standalone.outcome is scheduler.outcome
     if phase in (Phase.BLOCKED, Phase.FAILED):
         assert standalone.code is C.UNKNOWN  # no code is persisted
-    # 'resume' and 'run' refuse a namespace's state directory (ADR 0008 D17.3).
+    # 'resume' and 'run' refuse a namespace's state directory (ADR 0008 D17.3),
+    # and no merge gate moves a worker past READY_FOR_MERGE (D15.3).
     assert R.RESUME not in scheduler.routes and R.NEW_RUN not in scheduler.routes
+    assert R.MERGE_GATE not in scheduler.routes
+    assert (standalone.view, scheduler.view) == ("standalone", "scheduler")
     if phase is Phase.BLOCKED:
         assert scheduler.routes == (R.UNBLOCK, R.SCHEDULER)
+
+
+def test_a_namespace_ready_for_merge_is_merged_by_hand_never_resumed():
+    """A scheduler worker stops at READY_FOR_MERGE whatever the merge gate
+    says (ADR 0008 D15.3), and a standalone 'resume' refuses its state
+    directory (D17.3): its one route is a merge by hand, in the line and in
+    the document status prints."""
+    state = _state(Phase.READY_FOR_MERGE)
+    standalone, scheduler = classify_state(state), classify_state(state, scheduler=True)
+    assert standalone.routes == (R.MERGE, R.MERGE_GATE)
+    assert scheduler.routes == (R.MERGE,)
+    line = scheduler.line()
+    assert line.endswith("; next: " + ROUTE_TEXT[R.MERGE])
+    for text in ("'resume'", "merge gate", "allow-merge"):
+        assert text not in line and text in standalone.line()
+    document = scheduler.as_dict()
+    assert (document["view"], document["routes"]) == ("scheduler", ["merge"])
+
+
+@pytest.mark.parametrize("phase", list(Phase), ids=lambda p: p.value)
+def test_an_unknown_view_gives_only_the_routes_both_views_share(phase):
+    """Where nothing says whether a state dir is a scheduler namespace's (no
+    git repository, a dry run), no route either view would refuse is given:
+    a BLOCKED run is still unblocked, everything else is investigated."""
+    state = _state(phase)
+    unknown = classify_state(state, scheduler=None)
+    standalone, scheduler = classify_state(state), classify_state(state, scheduler=True)
+    assert unknown.view == "unknown" and unknown.as_dict()["view"] == "unknown"
+    assert unknown.outcome is standalone.outcome
+    for route in unknown.routes:
+        assert route is R.INVESTIGATE or (route in standalone.routes and route in scheduler.routes)
+    assert not {R.RESUME, R.NEW_RUN, R.MERGE_GATE, R.SCHEDULER} & set(unknown.routes)
+    expected = {
+        Phase.BLOCKED: (R.UNBLOCK,),
+        Phase.FAILED: (R.INVESTIGATE,),
+        Phase.READY_FOR_MERGE: (R.MERGE,),
+        Phase.DONE: (),
+    }
+    assert unknown.routes == expected.get(phase, (R.INVESTIGATE,))
 
 
 @pytest.mark.parametrize(
@@ -602,7 +650,47 @@ def test_fixture_a_plain_reason_at_a_funnel_is_unknown_and_still_blocked(tmp_sta
     assert eng.state.block_reason == "coded"
 
 
+def test_fixture_a_conclusive_next_issue_read_failure_routes_to_unblock(tmp_state_dir, fake_github):
+    """UPDATE_EPIC's conclusive read failure of the next issue blocks, and the
+    reason it saves says 'unblock', as its stop line does: 'resume' refuses a
+    BLOCKED run."""
+    fake_github.get_issue_errors[ISSUE3] = errors.GitHubError("HTTP 403: not accessible")
+    eng = _in_update_epic(tmp_state_dir, fake_github, [_epic_result(ISSUE3)])
+    stop = _expect(eng.step(), Out.BLOCKED, C.GITHUB_READ_FAILED, ReasonSource.CONTROLLER)
+    assert stop.routes[0] is R.UNBLOCK and R.RESUME not in stop.routes
+    saved = load_state(eng.paths.state_file)
+    assert saved.phase is Phase.BLOCKED and saved.current_issue_url == ISSUE
+    assert saved.block_reason.startswith(f"next issue {ISSUE3} could not be verified")
+    assert saved.block_reason.endswith("Fix the cause, then 'unblock'.")
+    assert "resume" not in saved.block_reason
+
+
 # -- drift guards --------------------------------------------------------------------------
+
+
+def _literal_text(node: ast.AST) -> str:
+    return "".join(
+        n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    )
+
+
+def test_no_blocked_reason_advises_resume_without_unblock():
+    """'resume' refuses a BLOCKED run, so a reason the engine blocks with that
+    names 'resume' names 'unblock' too; so do the reasons
+    ``_implementation_pr_candidate`` returns for its callers to block with."""
+    tree = ast.parse((SRC / "engine.py").read_text())
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+            text = _literal_text(node)
+            if name in ("_blocked", "_block") and "resume" in text and "unblock" not in text:
+                offenders.append(node.lineno)
+        if isinstance(node, ast.FunctionDef) and node.name == "_implementation_pr_candidate":
+            body = node.body[1:]  # its docstring is no reason
+            text = "".join(_literal_text(stmt) for stmt in body)
+            assert text and "resume" not in text
+    assert offenders == []
 
 
 def test_every_code_is_produced_by_some_sink():

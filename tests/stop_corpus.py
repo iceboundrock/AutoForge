@@ -1,48 +1,66 @@
-"""How a set of AutoForge runs stopped, from their state and run logs, read only (#369).
+"""How a set of AutoForge runs stopped, from their state files and run logs, read only (#369).
 
 No test: the corpus protocol of ADR 0011 (D7), which a maintainer runs by
-hand over the state directories of past runs. It classifies each run's
-saved state with :mod:`autoforge.stop_classification` and counts its run
-log's launches and operator actions, from typed fields only, and prints a
-summary (``--json``: the ``autoforge.stop-corpus/1`` document)::
+hand over the state directories of past runs. It finds every run a state
+directory still holds evidence of, classifies each one once with
+:mod:`autoforge.stop_classification`, counts its run log's launches and
+operator actions from typed fields only, and prints a summary (``--json``:
+the ``autoforge.stop-corpus/2`` document)::
 
     uv run python -m tests.stop_corpus ~/code/AutoForge/.autoforge
     uv run python -m tests.stop_corpus --json RUN_DIR [RUN_DIR ...] > corpus.json
 
-A path is a state directory (it holds ``state.json``) or a directory whose
-subdirectories, two levels down at most, are; each state directory is one
-run. Nothing is written, locked, launched or sent: a state file is read by
-the controller's own strict loader (:func:`autoforge.state.load_state`),
-which writes nothing, and ``logs/<run id>/events.jsonl`` by a bounded read.
+A path is a state directory or a directory whose subdirectories, four
+levels down at most (so ``<git common dir>/autoforge`` reaches every
+scheduler namespace's ``scheduler/issues/<n>/state``), are. A state
+directory holds a ``state.json``, a state moved aside (``state.json.archived-*``
+by ``epic archive``, ``state.json.corrupt-*`` by ``run --force``) or a run
+log (``logs/<run id>/``). Nothing is written, locked, launched or sent, and
+no state file or run log that is not a regular file is opened: a state is
+read by the controller's own strict loader
+(:func:`autoforge.state.load_state`), which writes nothing, and a run log
+descriptor-relative, links unfollowed, within its size bound
+(:class:`autoforge.safefs.SafeRoot`).
 
 **Units, each counted once in its own denominator, never summed across:**
 
-- a *run* is one state directory, classified by its saved state alone into
-  one eligibility (:data:`ELIGIBILITY`): ``intentional`` (DONE,
-  READY_FOR_MERGE, a scheduler's hand-off), ``deterministic`` (a phase
-  ``resume`` re-enters), ``needs_human`` (BLOCKED, FAILED, a pause) or
-  ``undecidable`` (a state that does not load, or an UNKNOWN outcome);
-- a *launch* is one journal line of an agent or a controller-run command,
+- a *run* is one run id, wherever its evidence is: the current state, a
+  state moved aside, a run log (a run a new standalone run replaced keeps
+  only its log). Found twice (a directory given twice, a copied one), it is
+  still one run, classified by one state file and counted from one run log;
+  the copies are counted, not added. It has one eligibility
+  (:data:`ELIGIBILITY`): ``intentional`` (DONE, READY_FOR_MERGE, a
+  scheduler's hand-off), ``deterministic`` (a phase ``resume`` re-enters),
+  ``needs_human`` (BLOCKED, FAILED, a pause) or ``undecidable`` (no state of
+  it loads, or its outcome is UNKNOWN);
+- a state file that does not load and names no run id that can be read (a
+  torn file) is counted apart, never as a run: it may be one of the runs, or
+  another;
+- a *launch* is one run log line of an agent or a controller-run command,
   failed when it timed out, exited non-zero or recorded an error; a failed
   agent launch's code comes from ``timed_out``, ``ended_by`` and
   ``exit_code``, and is ``unknown`` when only the error text says more;
-- an *unblock* is one journal line of an operator's ``unblock``, applied or
-  refused; each applied one ended one BLOCKED episode, which needed a human
+- an *operator action* is one run log line of an operator's ``unblock``
+  (applied or refused) or accepted configuration change. It is no launch.
+  Each applied ``unblock`` ended one BLOCKED episode, which needed a human
   by the exit rule, whatever its reason.
 
 **What it cannot say** (printed with every summary, :data:`LIMITATIONS`):
 no reason code is persisted (ADR 0011 D5), so a saved BLOCKED or FAILED
 classifies ``unknown`` and the free text of ``block_reason`` and of a
-launch's ``error`` is never read; a run log that was moved, deleted or torn
-leaves its run's history incomplete (each such run is flagged, and a torn or
-foreign line is counted, not parsed around); and the corpus is the
-directories given, nothing else: whatever selected them is its bias.
+launch's ``error`` is never read; a run whose state is gone or does not
+load, and a run log that was moved, deleted, torn or holds a line of an
+unexpected type, leave that run's history incomplete (each such run is
+flagged, and each bad line counted, never parsed around); and the corpus is
+the directories given, nothing else: whatever selected them is its bias.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -50,9 +68,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from autoforge.errors import StateError
-from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
-from autoforge.state import STATE_FILENAME, load_state
+from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES, RUN_ID_RE
+from autoforge.safefs import ReadLimitExceeded, SafeRoot, UnsafePathError, entry_kind
+from autoforge.state import (
+    ARCHIVED_SUFFIX,
+    CORRUPT_SUFFIX,
+    LOGS_DIRNAME,
+    MAX_STATE_FILE_BYTES,
+    STATE_FILENAME,
+    AutoForgeState,
+    load_state,
+)
 from autoforge.stop_classification import (
+    ReasonSource,
     StopClassification,
     StopOutcome,
     StopReasonCode,
@@ -60,9 +88,10 @@ from autoforge.stop_classification import (
     classify_state,
 )
 
-SCHEMA = "autoforge.stop-corpus/1"
+SCHEMA = "autoforge.stop-corpus/2"
 # How deep below a given path a state directory is looked for.
-MAX_DEPTH = 2
+MAX_DEPTH = 4
+JOURNAL_NAME = "events.jsonl"
 
 # The eligibility of each final outcome; total over StopOutcome (tested).
 ELIGIBILITY: dict[StopOutcome, str] = {
@@ -79,60 +108,73 @@ ELIGIBILITY: dict[StopOutcome, str] = {
 }
 ELIGIBILITIES = ("intentional", "deterministic", "needs_human", "undecidable")
 
+# A run whose run log survives and none of whose state files does: nothing
+# typed says how it stopped.
+NO_STATE = StopClassification(
+    StopOutcome.UNKNOWN,
+    StopReasonCode.UNKNOWN,
+    ReasonSource.STATE,
+    "no state file of this run was found",
+)
+
 LIMITATIONS = (
     "no reason code is persisted: a saved BLOCKED or FAILED classifies 'unknown', and no "
     "block_reason or error text is read",
     "a failed agent launch that exited 0 (a malformed result, a failed verification, a "
     "refused run log) has no typed cause in the journal: 'unknown'",
-    "a run log that was moved, deleted or torn leaves its run's history incomplete; "
-    "such runs are flagged and torn or foreign lines counted, never parsed around",
+    "a run is a run id: one whose state is gone (a new standalone run replaced it) or does "
+    "not load counts as 'undecidable', and its run log is still counted",
+    "a state file that does not load and names no readable run id is counted apart, never "
+    "as a run: it may be one of the runs counted, or another",
+    "a run log that was moved, deleted, torn, too large or not a regular file, or that holds "
+    "a line of another run or of an unexpected type, leaves its run's history incomplete; "
+    "such runs are flagged and each bad line counted, never parsed around",
     "the corpus is the directories given and nothing else: what selected them is its "
     "selection bias, and no denominator reaches past them",
 )
 
+# A state file's name: the current one, or one the controller moved aside.
+_STATE_KIND_RANK = {"current": 0, "archived": 1, "quarantined": 2}
 
-@dataclass
-class RunReport:
-    """One state directory: its final stop and its run log's counts."""
 
-    state_dir: str
-    run_id: str = ""
-    final: StopClassification | None = None
-    eligibility: str = "undecidable"
-    launches: Counter[str] = field(default_factory=Counter)
-    failed_launches: Counter[str] = field(default_factory=Counter)
-    unblocks_applied: int = 0
-    unblocks_refused: int = 0
-    unblock_history: int = 0
-    torn_lines: int = 0
-    journal: str = "absent"  # absent | read | too-large | unreadable
+def state_file_kind(name: str) -> str | None:
+    """``current``, ``archived`` or ``quarantined`` for a state file's name, else ``None``."""
+    if name == STATE_FILENAME:
+        return "current"
+    for suffix, kind in ((ARCHIVED_SUFFIX, "archived"), (CORRUPT_SUFFIX, "quarantined")):
+        prefix = STATE_FILENAME + suffix
+        if name.startswith(prefix) and len(name) > len(prefix):
+            return kind
+    return None
 
-    @property
-    def incomplete(self) -> bool:
-        """Whether the run's history cannot be read whole."""
-        if self.final is None or self.final.outcome is StopOutcome.REFUSED:
-            return True
-        return (
-            self.journal != "read"
-            or self.torn_lines > 0
-            or self.unblock_history != self.unblocks_applied
+
+def _run_id_name(name: str) -> bool:
+    return bool(RUN_ID_RE.match(name)) and name not in (".", "..")
+
+
+# -- discovery ------------------------------------------------------------------------------
+
+
+def _is_state_dir(directory: Path) -> bool:
+    """Whether ``directory`` holds a state file or a run log; nothing in it is opened."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return False
+    if any(state_file_kind(name) for name in names):
+        return True
+    if LOGS_DIRNAME not in names:
+        return False
+    logs = directory / LOGS_DIRNAME
+    try:
+        if not stat.S_ISDIR(os.lstat(logs).st_mode):
+            return False
+        return any(
+            _run_id_name(name) and os.path.lexists(logs / name / JOURNAL_NAME)
+            for name in os.listdir(logs)
         )
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "state_dir": self.state_dir,
-            "run_id": self.run_id,
-            "final": self.final.as_dict() if self.final else None,
-            "eligibility": self.eligibility,
-            "launches": dict(sorted(self.launches.items())),
-            "failed_launches": dict(sorted(self.failed_launches.items())),
-            "unblocks_applied": self.unblocks_applied,
-            "unblocks_refused": self.unblocks_refused,
-            "unblock_history": self.unblock_history,
-            "journal": self.journal,
-            "torn_lines": self.torn_lines,
-            "incomplete": self.incomplete,
-        }
+    except OSError:
+        return False
 
 
 def find_state_dirs(paths: Iterable[Path], max_depth: int = MAX_DEPTH) -> list[Path]:
@@ -145,8 +187,7 @@ def find_state_dirs(paths: Iterable[Path], max_depth: int = MAX_DEPTH) -> list[P
             for directory in level:
                 if directory.is_symlink() or not directory.is_dir():
                     continue
-                state = directory / STATE_FILENAME
-                if state.is_file() and not state.is_symlink():
+                if _is_state_dir(directory):
                     found.add(directory.resolve())
                     continue
                 try:
@@ -157,117 +198,411 @@ def find_state_dirs(paths: Iterable[Path], max_depth: int = MAX_DEPTH) -> list[P
     return sorted(found)
 
 
+# -- one state directory, read only ----------------------------------------------------------
+
+
+@dataclass
+class StateSource:
+    """One state file: the run it names and how it stopped, or why it could not say."""
+
+    state_dir: str
+    name: str
+    kind: str
+    run_id: str = ""
+    state: AutoForgeState | None = None
+    final: StopClassification = NO_STATE
+
+    def rank(self) -> tuple[int, int]:
+        return (0 if self.state is not None else 1, _STATE_KIND_RANK[self.kind])
+
+
+@dataclass
+class JournalCounts:
+    """One run log, counted from its lines' typed fields alone."""
+
+    state_dir: str
+    run_id: str
+    status: str = "absent"  # read | absent | too-large | not-regular | unreadable
+    launches: Counter[str] = field(default_factory=Counter)
+    failed_launches: Counter[str] = field(default_factory=Counter)
+    operator_actions: Counter[str] = field(default_factory=Counter)
+    torn_lines: int = 0
+    foreign_lines: int = 0
+    malformed_lines: int = 0
+
+
+@dataclass
+class DirScan:
+    state_dir: str
+    states: list[StateSource] = field(default_factory=list)
+    journals: list[JournalCounts] = field(default_factory=list)
+    error: str = ""
+
+
+def _open_dir(directory: Path) -> SafeRoot:
+    """A root on ``directory`` whose last component is opened without following a link."""
+    with SafeRoot.open(directory.parent) as parent:
+        return parent.subroot(directory.name)
+
+
+def _identity_of(root: SafeRoot, name: str) -> str:
+    """The run id a state file the loader refused names, or ``""``.
+
+    Only for deduplicating runs: the file is read only when it is a
+    regular file within the loader's bound, and nothing but a well-formed
+    ``run_id`` is taken from it; the classification stays the refusal.
+    """
+    try:
+        st = root.lstat(name)
+        if st is None or entry_kind(st.st_mode) is not None or st.st_size > MAX_STATE_FILE_BYTES:
+            return ""
+        raw = root.read_bytes(name, limit=MAX_STATE_FILE_BYTES)
+        data = json.loads(raw) if raw is not None else None
+    except (StateError, OSError, ValueError, RecursionError):
+        return ""
+    run_id = data.get("run_id") if isinstance(data, dict) else None
+    return run_id if isinstance(run_id, str) and _run_id_name(run_id) else ""
+
+
+def _read_state(root: SafeRoot, state_dir: Path, name: str, kind: str) -> StateSource:
+    source = StateSource(state_dir=str(state_dir), name=name, kind=kind)
+    try:
+        state = load_state(state_dir / name, root=root)
+    except Exception as exc:  # noqa: BLE001 - every refusal is a classification
+        # StateError for every refusal; anything else classifies 'unknown'.
+        source.final = classify_exception(exc)
+        source.run_id = _identity_of(root, name)
+        return source
+    source.state, source.run_id = state, state.run_id
+    source.final = classify_state(state)
+    return source
+
+
+def _journal_bytes(root: SafeRoot, relpath: str) -> tuple[str, bytes]:
+    """A run log's bytes, or why there are none: never opens what is not a regular file."""
+    try:
+        st = root.lstat(relpath)
+    except UnsafePathError:
+        return "not-regular", b""  # a link or a non-directory on the way
+    except (StateError, OSError):
+        return "unreadable", b""
+    if st is None:
+        return "absent", b""
+    if entry_kind(st.st_mode) is not None:
+        return "not-regular", b""
+    if st.st_size > MAX_EVENT_JOURNAL_BYTES:
+        return "too-large", b""
+    try:
+        # Opened O_NOFOLLOW | O_NONBLOCK and checked on the descriptor, so a
+        # file replaced since the lstat is refused, and read one byte past
+        # the bound at most, whatever it has grown to.
+        data = root.read_bytes(relpath, limit=MAX_EVENT_JOURNAL_BYTES)
+    except ReadLimitExceeded:
+        return "too-large", b""
+    except UnsafePathError:
+        return "not-regular", b""
+    except (StateError, OSError):
+        return "unreadable", b""
+    if data is None:
+        return "absent", b""
+    return "read", data
+
+
+# The typed fields a count reads, and what each may hold. A line with one of
+# another type is malformed: counted, never converted or guessed at.
+_FIELD_TYPES: dict[str, tuple[type, ...]] = {
+    "run_id": (str,),
+    "phase": (str,),
+    "profile": (str,),
+    "error": (str,),
+    "ended_by": (str,),
+    "timed_out": (bool,),
+    "timeout_seconds": (int,),
+    "exit_code": (int, type(None)),
+    "metadata": (dict,),
+}
+
+
+def well_typed(record: dict) -> bool:
+    """Whether every field a count reads has its type (a bool is no integer here)."""
+    for name, kinds in _FIELD_TYPES.items():
+        if name not in record:
+            continue
+        value = record[name]
+        if isinstance(value, bool) and bool not in kinds:
+            return False
+        if not isinstance(value, kinds):
+            return False
+    return record.get("timeout_seconds", 0) >= 0
+
+
+def operator_kind(record: dict) -> str | None:
+    """An operator action's kind, ``""`` for none, ``None`` when its typed fields do not say."""
+    if not record.get("profile", "").startswith("(operator"):
+        return ""
+    phase = record.get("phase", "")
+    if phase.endswith("-unblock"):
+        applied = (record.get("metadata") or {}).get("applied")
+        if not isinstance(applied, bool):
+            return None
+        return "unblock-applied" if applied else "unblock-refused"
+    if phase.endswith("-config-change"):
+        return "configuration-change"
+    return "other"
+
+
 def launch_kind(record: dict) -> str:
-    """``agent``, ``command`` or ``operator``: from the record's typed fields."""
-    profile = str(record.get("profile", ""))
-    if profile.startswith("(operator"):
-        return "operator"
-    if profile.startswith("(controller") or int(record.get("timeout_seconds") or 0) > 0:
+    """``agent`` or ``command``: from a well-typed record's typed fields."""
+    if record.get("profile", "").startswith("(controller") or record.get("timeout_seconds", 0) > 0:
         return "command"
     return "agent"
 
 
 def failed(record: dict) -> bool:
     return (
-        bool(record.get("timed_out"))
+        record.get("timed_out", False)
         or record.get("exit_code") not in (0, None)
-        or bool(record.get("error"))
+        or bool(record.get("error", ""))
     )
 
 
 def launch_code(record: dict) -> StopReasonCode:
     """A failed launch's code from ``timed_out``, ``ended_by`` and ``exit_code`` alone."""
-    ended_by = str(record.get("ended_by") or "")
-    if record.get("timed_out") or ended_by in ("idle", "max_runtime"):
+    ended_by = record.get("ended_by", "")
+    if record.get("timed_out", False) or ended_by in ("idle", "max_runtime"):
         return StopReasonCode.EXECUTION_TIMEOUT
     if ended_by in ("loop", "provider_failure") or record.get("exit_code") not in (0, None):
         return StopReasonCode.EXECUTION_FAILED
     return StopReasonCode.UNKNOWN
 
 
-def _journal_lines(path: Path) -> tuple[str, list[bytes]]:
-    try:
-        size = path.stat().st_size
-    except FileNotFoundError:
-        return "absent", []
-    except OSError:
-        return "unreadable", []
-    if size > MAX_EVENT_JOURNAL_BYTES:
-        return "too-large", []
-    try:
-        with path.open("rb") as handle:
-            data = handle.read(MAX_EVENT_JOURNAL_BYTES + 1)
-    except OSError:
-        return "unreadable", []
-    return "read", data.splitlines()
-
-
-def read_run(state_dir: Path) -> RunReport:
-    """One run, read only."""
-    report = RunReport(state_dir=str(state_dir))
-    try:
-        state = load_state(state_dir / STATE_FILENAME)
-    except StateError as exc:
-        report.final = classify_exception(exc)
-        report.eligibility = ELIGIBILITY[report.final.outcome]
-        return report
-    report.run_id = state.run_id
-    report.final = classify_state(state)
-    report.eligibility = ELIGIBILITY[report.final.outcome]
-    report.unblock_history = len(state.unblock_history)
-    report.journal, lines = _journal_lines(state_dir / "logs" / state.run_id / "events.jsonl")
-    for line in lines:
+def count_journal(counts: JournalCounts, data: bytes) -> None:
+    """Count each line of a run log once: a launch, an operator action or a bad line."""
+    for line in data.splitlines():
         if not line.strip():
             continue
         try:
             record = json.loads(line)
         except (ValueError, RecursionError):
-            report.torn_lines += 1
+            counts.torn_lines += 1
             continue
-        if not isinstance(record, dict) or record.get("run_id") != state.run_id:
-            report.torn_lines += 1
+        if not isinstance(record, dict):
+            counts.torn_lines += 1
             continue
-        kind = launch_kind(record)
-        if kind == "operator":
-            if str(record.get("phase", "")).endswith("-unblock"):
-                metadata = record.get("metadata") or {}
-                if isinstance(metadata, dict) and metadata.get("applied") is True:
-                    report.unblocks_applied += 1
-                else:
-                    report.unblocks_refused += 1
-            report.launches["operator"] += 1
+        if not well_typed(record):
+            counts.malformed_lines += 1
             continue
-        report.launches[kind] += 1
-        if failed(record):
-            code = launch_code(record) if kind == "agent" else StopReasonCode.UNKNOWN
-            report.failed_launches[f"{kind}:{code.value}"] += 1
-    return report
+        if record.get("run_id") != counts.run_id:
+            counts.foreign_lines += 1
+            continue
+        operator = operator_kind(record)
+        if operator is None:
+            counts.malformed_lines += 1
+        elif operator:
+            counts.operator_actions[operator] += 1
+        else:
+            kind = launch_kind(record)
+            counts.launches[kind] += 1
+            if failed(record):
+                code = launch_code(record) if kind == "agent" else StopReasonCode.UNKNOWN
+                counts.failed_launches[f"{kind}:{code.value}"] += 1
 
 
-def summarize(reports: Sequence[RunReport]) -> dict[str, object]:
+def _read_journal(root: SafeRoot, state_dir: Path, run_id: str) -> JournalCounts:
+    counts = JournalCounts(state_dir=str(state_dir), run_id=run_id)
+    counts.status, data = _journal_bytes(root, f"{LOGS_DIRNAME}/{run_id}/{JOURNAL_NAME}")
+    count_journal(counts, data)
+    return counts
+
+
+def _logged_run_ids(root: SafeRoot) -> list[str]:
+    """The run ids ``logs/`` has an entry for, whatever the entry is."""
+    st = root.lstat(LOGS_DIRNAME)
+    if st is None or not stat.S_ISDIR(st.st_mode):
+        return []
+    with root.subroot(LOGS_DIRNAME) as logs:
+        return sorted(name for name in os.listdir(logs.fd) if _run_id_name(name))
+
+
+def scan_state_dir(state_dir: Path) -> DirScan:
+    """Every state file and run log of one state directory, read only.
+
+    One that cannot be read is classified or flagged, never fatal: the
+    directory's other runs, and every other directory, are still counted.
+    """
+    scan = DirScan(state_dir=str(state_dir))
+    try:
+        with _open_dir(state_dir) as root:
+            for name in sorted(os.listdir(root.fd)):
+                kind = state_file_kind(name)
+                if kind is not None:
+                    scan.states.append(_read_state(root, state_dir, name, kind))
+            logged = set(_logged_run_ids(root))
+            named = {s.run_id for s in scan.states if s.run_id}
+            for run_id in sorted(logged | named):
+                scan.journals.append(_read_journal(root, state_dir, run_id))
+    except Exception as exc:  # noqa: BLE001 - one directory never stops the corpus
+        scan.error = type(exc).__name__
+    return scan
+
+
+# -- the corpus ---------------------------------------------------------------------------
+
+
+@dataclass
+class RunReport:
+    """One run id: its final stop and its run log's counts, each source chosen once."""
+
+    run_id: str
+    state_dirs: list[str] = field(default_factory=list)
+    state: str = "absent"  # loaded | refused | absent
+    state_file: str = ""
+    state_copies: int = 0
+    final: StopClassification = NO_STATE
+    eligibility: str = "undecidable"
+    unblock_history: int | None = None
+    journal: JournalCounts | None = None
+    journal_copies: int = 0
+
+    @property
+    def journal_status(self) -> str:
+        return self.journal.status if self.journal is not None else "absent"
+
+    @property
+    def incomplete(self) -> bool:
+        """Whether the run's history cannot be read whole."""
+        if self.state != "loaded" or self.journal is None or self.journal.status != "read":
+            return True
+        j = self.journal
+        if j.torn_lines or j.foreign_lines or j.malformed_lines:
+            return True
+        return self.unblock_history != j.operator_actions["unblock-applied"]
+
+    def as_dict(self) -> dict[str, object]:
+        j = self.journal or JournalCounts(state_dir="", run_id=self.run_id)
+        return {
+            "run_id": self.run_id,
+            "state_dirs": self.state_dirs,
+            "state": self.state,
+            "state_file": self.state_file,
+            "state_copies": self.state_copies,
+            "final": self.final.as_dict(),
+            "eligibility": self.eligibility,
+            "launches": dict(sorted(j.launches.items())),
+            "failed_launches": dict(sorted(j.failed_launches.items())),
+            "operator_actions": dict(sorted(j.operator_actions.items())),
+            "unblock_history": self.unblock_history,
+            "journal": self.journal_status,
+            "journal_copies": self.journal_copies,
+            "torn_lines": j.torn_lines,
+            "foreign_lines": j.foreign_lines,
+            "malformed_lines": j.malformed_lines,
+            "incomplete": self.incomplete,
+        }
+
+
+@dataclass
+class Corpus:
+    runs: list[RunReport]
+    unidentified_states: list[StateSource]
+    unreadable_dirs: list[tuple[str, str]]
+
+
+def _pick_state(sources: list[StateSource]) -> StateSource:
+    """The state file a run is classified by: one that loads before one that does not,
+    the current one before one moved aside, the newest of those moved aside first."""
+    newest_first = sorted(sources, key=lambda s: (s.state_dir, s.name), reverse=True)
+    return min(newest_first, key=StateSource.rank)
+
+
+def build_corpus(scans: Sequence[DirScan]) -> Corpus:
+    """Each run id once, however many directories hold its evidence."""
+    states: dict[str, list[StateSource]] = {}
+    journals: dict[str, list[JournalCounts]] = {}
+    dirs: dict[str, list[str]] = {}
+    unidentified: list[StateSource] = []
+    for scan in scans:
+        for source in scan.states:
+            if not source.run_id:
+                unidentified.append(source)
+                continue
+            states.setdefault(source.run_id, []).append(source)
+            dirs.setdefault(source.run_id, []).append(scan.state_dir)
+        for counts in scan.journals:
+            journals.setdefault(counts.run_id, []).append(counts)
+            dirs.setdefault(counts.run_id, []).append(scan.state_dir)
+    runs: list[RunReport] = []
+    for run_id in sorted(dirs):
+        report = RunReport(run_id=run_id, state_dirs=sorted(set(dirs[run_id])))
+        sources = states.get(run_id, [])
+        home = ""
+        if sources:
+            chosen = _pick_state(sources)
+            home = chosen.state_dir
+            report.state = "loaded" if chosen.state is not None else "refused"
+            report.state_file = str(Path(chosen.state_dir) / chosen.name)
+            report.state_copies = len(sources) - 1
+            report.final = chosen.final
+            if chosen.state is not None:
+                report.unblock_history = len(chosen.state.unblock_history)
+        report.eligibility = ELIGIBILITY[report.final.outcome]
+        logs = [j for j in journals.get(run_id, []) if j.status != "absent"]
+        if logs:
+            # The run log beside the state that classified it, else the first.
+            beside = [j for j in logs if j.state_dir == home]
+            report.journal = (beside or logs)[0]
+            report.journal_copies = len(logs) - 1
+        runs.append(report)
+    unreadable = [(s.state_dir, s.error) for s in scans if s.error]
+    return Corpus(runs=runs, unidentified_states=unidentified, unreadable_dirs=unreadable)
+
+
+def read_corpus(paths: Iterable[Path]) -> Corpus:
+    return build_corpus([scan_state_dir(d) for d in find_state_dirs(paths)])
+
+
+def summarize(corpus: Corpus) -> dict[str, object]:
     """The corpus summary: each unit counted once in its own denominator."""
-    eligibility = Counter(r.eligibility for r in reports)
-    outcomes = Counter(r.final.outcome.value for r in reports if r.final is not None)
-    codes = Counter(
-        f"{r.final.outcome.value}:{r.final.code.value}" for r in reports if r.final is not None
-    )
+    runs = corpus.runs
+    eligibility = Counter(r.eligibility for r in runs)
+    outcomes = Counter(r.final.outcome.value for r in runs)
+    codes = Counter(f"{r.final.outcome.value}:{r.final.code.value}" for r in runs)
+    by_state = Counter(r.state for r in runs)
     launches: Counter[str] = Counter()
     failures: Counter[str] = Counter()
-    for r in reports:
-        launches.update(r.launches)
-        failures.update(r.failed_launches)
-    blocked_now = sum(
-        1 for r in reports if r.final is not None and r.final.outcome is StopOutcome.BLOCKED
+    operator: Counter[str] = Counter()
+    lines: Counter[str] = Counter()
+    for r in runs:
+        if r.journal is None:
+            continue
+        launches.update(r.journal.launches)
+        failures.update(r.journal.failed_launches)
+        operator.update(r.journal.operator_actions)
+        lines.update(
+            torn=r.journal.torn_lines,
+            foreign=r.journal.foreign_lines,
+            malformed=r.journal.malformed_lines,
+        )
+    blocked_now = sum(1 for r in runs if r.final.outcome is StopOutcome.BLOCKED)
+    unidentified = Counter(
+        f"{s.final.outcome.value}:{s.final.code.value}" for s in corpus.unidentified_states
     )
-    applied = sum(r.unblocks_applied for r in reports)
     return {
         "schema": SCHEMA,
         "runs": {
-            "total": len(reports),
+            "total": len(runs),
+            "by_state": {name: by_state.get(name, 0) for name in ("loaded", "refused", "absent")},
             "by_eligibility": {name: eligibility.get(name, 0) for name in ELIGIBILITIES},
             "by_outcome": dict(sorted(outcomes.items())),
             "by_outcome_and_code": dict(sorted(codes.items())),
-            "incomplete_history": sum(1 for r in reports if r.incomplete),
+            "incomplete_history": sum(1 for r in runs if r.incomplete),
+            "with_copies": sum(1 for r in runs if r.state_copies or r.journal_copies),
+        },
+        # Never runs: each may be one of the runs above, or another.
+        "unidentified_states": {
+            "total": len(corpus.unidentified_states),
+            "by_outcome_and_code": dict(sorted(unidentified.items())),
+            "files": sorted(str(Path(s.state_dir) / s.name) for s in corpus.unidentified_states),
         },
         "launches": {
             "total": sum(launches.values()),
@@ -275,35 +610,49 @@ def summarize(reports: Sequence[RunReport]) -> dict[str, object]:
             "failed": sum(failures.values()),
             "failed_by_kind_and_code": dict(sorted(failures.items())),
         },
-        "unblocks": {
-            "applied": applied,
-            "refused": sum(r.unblocks_refused for r in reports),
-            "in_state_histories": sum(r.unblock_history for r in reports),
+        "operator_actions": {
+            "total": sum(operator.values()),
+            "by_kind": dict(sorted(operator.items())),
+            "unblocks_in_state_histories": sum(r.unblock_history or 0 for r in runs),
         },
         # Every BLOCKED episode needed a human (the exit rule): those an
         # applied unblock ended, and those still BLOCKED.
-        "blocked_episodes": {"ended_by_unblock": applied, "still_blocked": blocked_now},
-        "torn_lines": sum(r.torn_lines for r in reports),
+        "blocked_episodes": {
+            "ended_by_unblock": operator["unblock-applied"],
+            "still_blocked": blocked_now,
+        },
+        "journal_lines": {name: lines.get(name, 0) for name in ("torn", "foreign", "malformed")},
+        "unreadable_directories": [{"state_dir": d, "error": e} for d, e in corpus.unreadable_dirs],
         "limitations": list(LIMITATIONS),
-        "run_reports": [r.as_dict() for r in reports],
+        "run_reports": [r.as_dict() for r in runs],
     }
 
 
 def render(summary: dict) -> str:
-    runs, launches, unblocks = summary["runs"], summary["launches"], summary["unblocks"]
+    runs, launches = summary["runs"], summary["launches"]
+    operator, unidentified = summary["operator_actions"], summary["unidentified_states"]
     lines = [
-        f"runs: {runs['total']} (each counted once, by its saved state)",
+        f"runs: {runs['total']} (each run id counted once, by one state file)",
+        f"  by state: {runs['by_state']}",
         *(f"  {name}: {count}" for name, count in runs["by_eligibility"].items()),
         "  by outcome and code:",
         *(f"    {key}: {count}" for key, count in runs["by_outcome_and_code"].items()),
         f"  with an incomplete history: {runs['incomplete_history']}",
+        f"  found more than once (copies counted once): {runs['with_copies']}",
+        f"state files that name no run (counted apart, never as runs): {unidentified['total']}",
+        *(f"  {key}: {count}" for key, count in unidentified["by_outcome_and_code"].items()),
         f"launches: {launches['total']} {launches['by_kind']}",
         f"  failed: {launches['failed']}",
         *(f"    {key}: {count}" for key, count in launches["failed_by_kind_and_code"].items()),
-        f"unblocks: {unblocks['applied']} applied, {unblocks['refused']} refused "
-        f"({unblocks['in_state_histories']} in the states' histories)",
+        f"operator actions (no launch): {operator['total']} {operator['by_kind']} "
+        f"({operator['unblocks_in_state_histories']} unblocks in the states' histories)",
         f"BLOCKED episodes (each needed a human): {summary['blocked_episodes']}",
-        f"torn or foreign journal lines: {summary['torn_lines']}",
+        f"bad journal lines: {summary['journal_lines']}",
+        f"directories that could not be read: {len(summary['unreadable_directories'])}",
+        *(
+            f"  {entry['state_dir']}: {entry['error']}"
+            for entry in summary["unreadable_directories"]
+        ),
         "limitations:",
         *(f"  - {text}" for text in summary["limitations"]),
     ]
@@ -315,8 +664,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("paths", nargs="+", type=Path, help="state directories, or their parents")
     parser.add_argument("--json", action="store_true", help=f"print the {SCHEMA} document")
     args = parser.parse_args(argv)
-    reports = [read_run(d) for d in find_state_dirs(args.paths)]
-    summary = summarize(reports)
+    summary = summarize(read_corpus(args.paths))
     print(json.dumps(summary, indent=2, sort_keys=True) if args.json else render(summary))
     return 0
 

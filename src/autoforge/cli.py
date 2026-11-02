@@ -1427,7 +1427,25 @@ def _final_stop(engine: ControllerEngine, outcomes: list[StepOutcome]) -> StopCl
     expected = {Phase.BLOCKED: StopOutcome.BLOCKED, Phase.FAILED: StopOutcome.FAILED}
     if last is not None and last.outcome is expected.get(state.phase):
         return last
-    return classify_state(state, scheduler=engine.state_dir_in_scheduler_root())
+    return classify_state(state, scheduler=_scheduler_view(engine))
+
+
+def _scheduler_view(engine: ControllerEngine, *, dry_run: bool = False) -> bool | None:
+    """Whether a stop line takes the scheduler's view of the run's state dir (#369).
+
+    ``None`` when that cannot be known, and the line then gives only the
+    routes both views share (ADR 0011 D6): a dry run runs no git, so it has
+    no coordination root (as :func:`_refuse_scheduler_state_dir` says), and
+    outside a git repository there is none to find. Read-only commands that
+    worked there before the stop line keep working; the commands that need
+    the repository still refuse without it, where they always did.
+    """
+    if dry_run:
+        return None
+    try:
+        return engine.state_dir_in_scheduler_root()
+    except LockError:
+        return None
 
 
 def _existing_run_guard(
@@ -1602,7 +1620,7 @@ def cmd_resume(args) -> int:
     if args.dry_run:
         # Read-only: no lock, nothing written.
         state = engine.load()
-        rc = _resume_holding_state(engine, state, args.allow_merge)
+        rc = _resume_holding_state(engine, state, args.allow_merge, dry_run=True)
         if rc is not None:
             return rc
         _check_configuration(engine, args, "resume", dry_run=True)
@@ -1695,9 +1713,13 @@ def print_unblock_outcome(o: UnblockOutcome) -> None:
 
 
 def _resume_holding_state(
-    engine: ControllerEngine, state: AutoForgeState, allow_merge: bool
+    engine: ControllerEngine, state: AutoForgeState, allow_merge: bool, *, dry_run: bool = False
 ) -> int | None:
-    """Exit code when ``resume`` has nothing to execute; None when it does."""
+    """Exit code when ``resume`` has nothing to execute; None when it does.
+
+    ``dry_run`` runs no git: the stop line of a terminal phase then cannot
+    tell a scheduler namespace's state dir from a standalone one.
+    """
     if state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(allow_merge):
         # Holding state: nothing runs unless the merge gate is open. With the
         # gate open, engine.run() performs the controller-side pre-merge
@@ -1723,7 +1745,8 @@ def _resume_holding_state(
                 f"{state.block_reason or '-'} — inspect {engine.paths.logs_dir}/ {how}"
             )
         )
-        print(redact(classify_state(state, scheduler=engine.state_dir_in_scheduler_root()).line()))
+        stop = classify_state(state, scheduler=_scheduler_view(engine, dry_run=dry_run))
+        print(redact(stop.line()))
         return 1
     return None
 
@@ -1942,7 +1965,8 @@ def cmd_status(args) -> int:
     certificate = _review_certificate_check(engine, state)
     # From the persisted phase alone (#369, ADR 0011): no reason code is
     # persisted, so a BLOCKED or FAILED run's is UNKNOWN; `Reason:` is the text.
-    stop = classify_state(state, scheduler=engine.state_dir_in_scheduler_root())
+    # Outside a git repository the view is unknown, and `--json` still works.
+    stop = classify_state(state, scheduler=_scheduler_view(engine))
     if args.as_json:
         # to_dict() carries "mode" and every persisted field; protocol 13
         # removed LOCAL's twelve fields from it (#388, ADR 0009 D8, D10).

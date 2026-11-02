@@ -225,10 +225,12 @@ read it before adding tests for a listed area.
 - `tests/stop_corpus.py` is no test either: ADR 0011's read-only corpus
   protocol (#369), which a maintainer runs by hand
   (`uv run python -m tests.stop_corpus [--json] PATH...`) over the state
-  directories of past runs: each run classified once by its saved state,
-  each launch and unblock counted once from the run log's typed fields, the
-  limitations printed with every summary. `tests/test_stop_corpus.py` runs
-  it on synthetic runs and proves it writes nothing.
+  directories of past runs: each run id counted once, whether its evidence
+  is the current state, one moved aside or only its run log, classified by
+  one state file; each launch and each operator action counted once, in its
+  own denominator, from the run log's typed fields; the limitations printed
+  with every summary. `tests/test_stop_corpus.py` runs it on synthetic runs
+  and proves it writes nothing and opens no FIFO or link.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the

@@ -95,6 +95,7 @@ class OperatorRoute(Enum):
     REPEAT = "repeat"
     NEW_RUN = "new_run"
     MERGE = "merge"
+    MERGE_GATE = "merge_gate"
     SCHEDULER = "scheduler"
     INVESTIGATE = "investigate"
 
@@ -110,7 +111,10 @@ ROUTE_TEXT: dict[OperatorRoute, str] = {
     OperatorRoute.REPEAT: "the same command once the cause is fixed",
     OperatorRoute.NEW_RUN: "a new run ('run --force' replaces this one)",
     OperatorRoute.MERGE: (
-        "merge by hand, or open the merge gate (safety.allow_merge and --allow-merge) and 'resume'"
+        "merge the PR by hand on GitHub (and close its issue if the merge does not)"
+    ),
+    OperatorRoute.MERGE_GATE: (
+        "open the merge gate (safety.allow_merge and --allow-merge) and 'resume'"
     ),
     OperatorRoute.SCHEDULER: "'epic resume', or 'epic archive' to release the issue",
     OperatorRoute.INVESTIGATE: "inspect 'status', the run's logs and GitHub; no route is implied",
@@ -286,12 +290,29 @@ OUTCOME_ROUTES: dict[StopOutcome, tuple[OperatorRoute, ...]] = {
     _O.REFUSED: (),
     # #126 has not landed: no route answers a pause, and none is invented.
     _O.AWAITING_INPUT: (),
-    _O.READY_FOR_MERGE: (_R.MERGE,),
+    _O.READY_FOR_MERGE: (_R.MERGE, _R.MERGE_GATE),
     _O.HANDOFF: (_R.SCHEDULER,),
     _O.DONE: (),
     _O.IN_PROGRESS: (_R.RESUME,),
     _O.UNKNOWN: (_R.INVESTIGATE,),
 }
+
+# What a standalone route is for a scheduler namespace's state (ADR 0008):
+# 'resume' and 'run' refuse its state directory (D17.3), so the scheduler's
+# commands continue or release it; and its workers stop at READY_FOR_MERGE
+# whatever the configuration says (D15.3), so no merge gate a namespace's
+# operator opens moves it on (``None``: the route is dropped).
+SCHEDULER_ROUTES: dict[OperatorRoute, OperatorRoute | None] = {
+    _R.RESUME: _R.SCHEDULER,
+    _R.NEW_RUN: _R.SCHEDULER,
+    _R.MERGE_GATE: None,
+}
+
+
+def _as_scheduler_routes(routes: tuple[OperatorRoute, ...]) -> tuple[OperatorRoute, ...]:
+    scheduled = (SCHEDULER_ROUTES.get(r, r) for r in routes)
+    return tuple(dict.fromkeys(r for r in scheduled if r is not None))
+
 
 REFUSAL_ROUTES: dict[StopReasonCode, tuple[OperatorRoute, ...]] = {
     _C.CONFIGURATION_INVALID: (_R.REPEAT,),
@@ -339,23 +360,38 @@ class StopClassification:
     evidence: str
     #: The parallel EPIC scheduler's view of a namespace's state (ADR 0008):
     #: the scheduler's commands continue or release it, never 'resume' or
-    #: 'run', which refuse a namespace's state directory (D17.3).
-    scheduler: bool = False
+    #: 'run', which refuse a namespace's state directory (D17.3), and no merge
+    #: gate moves its worker on (D15.3). ``None`` when which view applies is
+    #: not known (no git repository to find the scheduler root in, a dry run
+    #: that runs no git): only the routes both views share are given.
+    scheduler: bool | None = False
 
     @property
     def family(self) -> ReasonFamily:
         return REASON_FAMILY[self.code]
 
     @property
+    def view(self) -> str:
+        """``standalone``, ``scheduler`` or ``unknown``: whose routes these are."""
+        if self.scheduler is None:
+            return "unknown"
+        return "scheduler" if self.scheduler else "standalone"
+
+    @property
     def routes(self) -> tuple[OperatorRoute, ...]:
         if self.outcome is StopOutcome.REFUSED:
             return REFUSAL_ROUTES.get(self.code, (OperatorRoute.INVESTIGATE,))
-        routes = OUTCOME_ROUTES[self.outcome]
+        standalone = OUTCOME_ROUTES[self.outcome]
+        if self.scheduler is False:
+            return standalone
+        scheduled = _as_scheduler_routes(standalone)
         if self.scheduler:
-            standalone = (OperatorRoute.RESUME, OperatorRoute.NEW_RUN)
-            scheduled = (OperatorRoute.SCHEDULER if r in standalone else r for r in routes)
-            routes = tuple(dict.fromkeys(scheduled))
-        return routes
+            return scheduled
+        # Unknown view: a route of one view only could be refused or useless.
+        shared = tuple(r for r in standalone if r in scheduled)
+        if shared or not standalone:
+            return shared
+        return (OperatorRoute.INVESTIGATE,)
 
     @property
     def live_facts_required(self) -> bool:
@@ -381,6 +417,7 @@ class StopClassification:
             "family": self.family.value,
             "source": self.source.value,
             "evidence": self.evidence,
+            "view": self.view,
             "routes": [r.value for r in self.routes],
             "live_facts_required": self.live_facts_required,
         }
@@ -527,7 +564,7 @@ _SETTLED_PHASE: dict[Phase, tuple[StopOutcome, StopReasonCode]] = {
 def classify_state(
     state: AutoForgeState,
     *,
-    scheduler: bool = False,
+    scheduler: bool | None = False,
     paused: Callable[[AutoForgeState], bool] = durable_pause,
 ) -> StopClassification:
     """The stop a strictly loaded state is, from its phase and settlement alone.
@@ -537,7 +574,9 @@ def classify_state(
     which changes no route. ``scheduler`` takes the parallel EPIC
     scheduler's view (ADR 0008 D15.1): a hand-off phase is the scheduler's
     to settle and an unsettled one is continued by ``epic resume``; a
-    standalone run continues both with ``resume``. ``paused`` is #126's
+    standalone run continues both with ``resume``. ``None`` is a view not
+    known: the outcome is the standalone one, and the routes only those
+    both views share (:attr:`StopClassification.routes`). ``paused`` is #126's
     durable pause predicate, checked first, as
     :func:`~autoforge.transitions.issue_settlement` does.
     """

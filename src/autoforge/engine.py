@@ -5470,7 +5470,7 @@ class ControllerEngine:
             return None, (
                 f"{exc}. The controller will not launch an agent that could create a second "
                 "implementation and never guesses which PR is the issue's: close the stale "
-                "PR(s) or repair the unreadable marker, then resume"
+                "PR(s) or repair the unreadable marker, then 'unblock'"
             )
         if holder is not None:
             candidates.setdefault(parse_pr_url(holder.obj.url).canonical, holder.obj)
@@ -5479,7 +5479,7 @@ class ControllerEngine:
         if len(candidates) > 1:
             return None, (
                 f"{len(candidates)} open PRs claim to implement issue #{issue.number}: "
-                f"{', '.join(sorted(candidates))}. Close the stale ones and resume; the "
+                f"{', '.join(sorted(candidates))}. Close the stale ones, then 'unblock'; the "
                 "controller never guesses."
             )
         url, pr = next(iter(candidates.items()))
@@ -15552,7 +15552,7 @@ class ControllerEngine:
                 "a transient GitHub failure (authentication, permissions, or malformed data), "
                 "so asking the agent to select again would not help; the run stays on issue "
                 f"{state.current_issue_url}, nothing was switched. Fix the cause, then "
-                "'resume'.",
+                "'unblock'.",
             )
         state.reset_for_new_issue(parse_issue_url(selection).canonical)
         nxt = self._next_phase(Phase.UPDATE_EPIC, {"next_issue_url": selection})

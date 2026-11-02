@@ -21,11 +21,29 @@ whatever it says. It is not saved in the state file, which is unchanged, so
 `resume` and `status` on a stopped run show `reason unknown, from state`;
 `Reason:` keeps the text. An error of `unblock` prints no `stop:` line.
 
-Four `BLOCKED` reasons told you to `resume`, which refuses a `BLOCKED`
+Seven `BLOCKED` reasons told you to `resume`, which refuses a `BLOCKED`
 run: a conclusive read failure of the default branch or of the branch's PRs
 before `ANALYZE_EXECUTE` launched, of the EPIC body before `UPDATE_EPIC`
-launched, an EPIC body with more than one roadmap section, and a roadmap
-section that could not be written and read back. They now say `unblock`.
+launched, and of the next issue `UPDATE_EPIC` selected; an EPIC body with
+more than one roadmap section; a roadmap section that could not be written
+and read back; and more than one open PR, or an unreadable marker, claiming
+the issue. They now say `unblock`.
+
+A scheduler namespace's `READY_FOR_MERGE` is routed to a merge by hand
+only: its worker never merges, whatever the merge gate says. Where nothing
+says whether a state directory is a namespace's (`status` outside a git
+repository, `resume --dry-run`, which runs no git), the `stop:` line gives
+only the routes both views share, and `status --json` and
+`resume --dry-run` work outside a git repository as they did before; the
+`stop` object names the view it took.
+
+`tests/stop_corpus.py` counts every run a state directory holds evidence
+of, by run id: the current state, an archived or quarantined one, and the
+run log of a run a new run replaced. A run whose state does not load or is
+gone is `undecidable` with its run log still counted, and operator actions
+are counted apart from launches. It never opens a FIFO, a link or an
+oversized run log, and counts a line with a field of an unexpected type as
+malformed instead of failing.
 
 ### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
 

@@ -8,10 +8,10 @@
     `stop:` lines (D1 to D6); the read-only corpus tool
     `tests/stop_corpus.py` (D7); the fixtures of D8.
   - *Not done here:* running the corpus protocol over the review report's
-    history (D7.4), and any persisted code (D5).
+    history (D7.5), and any persisted code (D5).
 - **Decides:** #369 (REC-AR0), for #354, under EPIC #184.
 - **Amends:** nothing. Every phase, edge, exit rule, budget, retry, effect
-  and the state file are unchanged; four `BLOCKED` reasons that told the
+  and the state file are unchanged; seven `BLOCKED` reasons that told the
   operator to `resume`, which refuses a `BLOCKED` run, now say `unblock`.
 - **Related:** ADR 0004 (the authority boundary), ADR 0007 and #126 (the
   durable pause), ADR 0008 D15 (the scheduler's `Settlement`), ADR 0009
@@ -23,8 +23,10 @@ A command of a run stops in one of a few ways, and each allows something
 different next. Before this change the only typed facts about a stop were
 the persisted phase and the exit status; *why* it stopped was free text
 (`block_reason`, an error message), and so was the advice. That text was
-not always right: four `BLOCKED` reasons ended "fix the cause, then
-'resume'", and `resume` refuses a `BLOCKED` run. #354's review found
+not always right: seven `BLOCKED` reasons told the operator to `resume`
+once the cause was fixed, and `resume` refuses a `BLOCKED` run
+(`test_no_blocked_reason_advises_resume_without_unblock` now holds every
+reason a sink blocks with to `unblock`). #354's review found
 recovery advice that a reader could take for an authorization, and #370,
 #374 and #375 need a typed baseline before any recovery work can be
 measured.
@@ -47,7 +49,7 @@ be persisted.
 | `resumable_error` | the command failed and the persisted phase is unchanged | 1 | `resume` |
 | `refused` | the command refused before it acted on the run | 2 | by its code (D4) |
 | `awaiting_input` | #126's durable pause | — | none until #126 lands |
-| `ready_for_merge` | the merge gate is closed at a certified clean review | 0 | merge by hand, or open the gate and `resume` |
+| `ready_for_merge` | the merge gate is closed at a certified clean review | 0 | merge by hand, or (a standalone run only) open the gate and `resume` |
 | `handoff` | a scheduler worker's stop at `MERGE` or `UPDATE_EPIC` | 0 | `epic resume` / `epic archive` |
 | `done` | the workflow completed | 0 | none |
 | `in_progress` | the command stopped at its own limit (`step`, `--max-steps`) | 0 | `resume` (`epic resume` for a namespace) |
@@ -190,7 +192,21 @@ scheduler's view: its outcome agrees with `issue_settlement` for every
 phase, and where a standalone run's route would be `resume` or a new run, a
 namespace's is the scheduler's (`epic resume`, `epic archive`), since both
 refuse a namespace's state directory (ADR 0008 D17.3;
-`test_a_loaded_state_classifies_by_its_phase_and_settlement`).
+`test_a_loaded_state_classifies_by_its_phase_and_settlement`). A
+namespace's `ready_for_merge` has no merge-gate route: its worker stops
+there whatever the configuration says (ADR 0008 D15.3), so a human merges
+(`test_a_namespace_ready_for_merge_is_merged_by_hand_never_resumed`).
+
+Which view applies is decided on the state directory's resolved path
+against the scheduler root, which needs the git common dir. Where there is
+none to read (`status` outside a git repository) or none is read (a dry
+run, which runs no git), the view is `unknown` and a stop gets only the
+routes both views share: `unblock` for `blocked`, a merge by hand for
+`ready_for_merge`, "investigate" for every other outcome with a route
+(`test_an_unknown_view_gives_only_the_routes_both_views_share`). The
+read-only commands work there as they did before the stop line
+(`test_read_only_stop_lines_need_no_repository`); `status --json` names the
+view in `stop.view`.
 
 ### D7. The corpus protocol
 
@@ -202,30 +218,53 @@ uv run python -m tests.stop_corpus [--json] PATH [PATH ...]
 ```
 
 1. **Read only.** A state file is read by the controller's strict loader,
-   which writes nothing; the run log by a bounded read. Nothing is locked,
+   which writes nothing; a run log descriptor-relative, links unfollowed,
+   and only once its entry is a regular file within its size bound, which
+   the read enforces again on the opened file. A FIFO, a socket, a device or
+   a link at a state file or a run log is never opened. Nothing is locked,
    launched, sent or written (`tests/test_stop_corpus.py` snapshots the
-   tree). No model is called.
-2. **Units and denominators.** A *run* is one state directory (a path given
-   twice is one run), classified once by its saved state into one
-   eligibility: `intentional`, `deterministic` (a phase `resume`
-   re-enters), `needs_human` (`blocked`, `failed`, a pause) or
-   `undecidable` (a state that does not load, or `unknown`). A *launch* is
-   one journal line of an agent or a controller-run command; a failed agent
-   launch's code comes from `timed_out`, `ended_by` and `exit_code`. An
-   *unblock* is one operator journal line, applied or refused. Each unit is
-   counted in its own denominator and never summed with another.
-3. **What it cannot say**, printed with every summary: no persisted code
+   tree). No model is called. A state directory that cannot be read, a
+   state file the loader refuses and a run log that cannot be read are each
+   reported, and every other run is still counted.
+2. **Which runs.** A state directory keeps evidence of more runs than its
+   current `state.json`: a state `epic archive` moved aside
+   (`state.json.archived-*`), one `run --force` quarantined
+   (`state.json.corrupt-*`), and the run log `logs/<run id>/` of every run
+   it held, a run a new standalone run replaced included. Each is found, and
+   a run is one **run id**, wherever its evidence lies: a directory given
+   twice or copied elsewhere is still one run, classified by one state file
+   (one that loads before one that does not, the current one before one
+   moved aside, the newest of those first) and counted from one run log; the
+   copies are reported, never added.
+3. **Units and denominators.** Each *run* has one eligibility:
+   `intentional`, `deterministic` (a phase `resume` re-enters),
+   `needs_human` (`blocked`, `failed`, a pause) or `undecidable`: a run
+   whose state the loader refuses (classified by the refusal) or whose
+   state is gone, which classifies `unknown`, its run log still counted. A
+   state file that does not load and names no run id that can be read is
+   counted apart, never as a run, since it may be one of the runs counted.
+   A *launch* is one run log line of an agent or a controller-run command;
+   a failed agent launch's code comes from `timed_out`, `ended_by` and
+   `exit_code`. An *operator action* is one run log line of an `unblock`
+   (applied or refused) or of an accepted configuration change, and is no
+   launch. Each unit is counted in its own denominator and never summed with
+   another; a line whose fields have unexpected types is counted as
+   malformed, never converted.
+4. **What it cannot say**, printed with every summary: no persisted code
    (D5), so a saved `BLOCKED` or `FAILED` is `unknown`; a failed launch that
    exited 0 (a malformed result, a failed verification) has no typed cause;
-   a moved, deleted or torn run log leaves its run flagged incomplete; and
-   the corpus is the directories given, so whatever chose them is its
-   selection bias.
-4. **The review report's corpus** (51 local dogfooding runs, 15 applied
+   a run with no state that loads is `undecidable`; a state that names no
+   run is counted apart; a moved, deleted, torn, oversized or irregular run
+   log, or one with a foreign or malformed line, leaves its run flagged
+   incomplete; and the corpus is the directories given, so whatever chose
+   them is its selection bias.
+5. **The review report's corpus** (51 local dogfooding runs, 15 applied
    unblocks, about 36 failed launches) is *reported* by #354's review and
    not validated here: this change did not read the operator's run history,
    so it publishes no summary of it. A maintainer runs the tool over those
    state directories and posts the summary on #369; LOCAL runs, if any are
-   still on disk, are counted `undecidable` (their state does not load).
+   still on disk, are counted `undecidable` (their state does not load),
+   with their launches and unblocks counted from their run logs.
    No non-AutoForge cases were accessible.
 
 ### D8. The fixtures
@@ -247,6 +286,7 @@ named):
 | #327 / PR #330, regression negative: a body `gh` sanitizes | no stop: `ANALYZE_EXECUTE -> REVIEW` |
 | an agent's `blocked` / `failure` | `blocked` / `agent-blocked`, `failed` / `agent-failure` / agent |
 | a resumable timeout | `resumable_error` / `execution-timeout` / exception, phase unchanged |
+| a conclusive read failure of the next issue in `UPDATE_EPIC` | `blocked` / `github-read-failed` / controller; its saved reason says `unblock` |
 | a plain reason at a funnel | `blocked` / `unknown` / controller |
 | `run`, `resume`, `status`, an exit-2 refusal, `unblock` (`test_cli.py`) | the printed `stop:` line, or none for `unblock` |
 
