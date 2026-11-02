@@ -597,11 +597,15 @@ class FakeGitHub:
         # adds is a sub-issue of EPIC unless ``parent`` says otherwise; the EPIC
         # and an issue the controller creates (a follow-up) have none.
         # ``graph_error`` makes get_issue_node and both sub-issue listings
-        # raise; ``sub_issues_error`` the listings alone. ``hidden_sub_issues``
+        # raise; ``issue_node_errors`` makes get_issue_node of those issues
+        # (by canonical URL) raise, others answer (#293: a parent read that
+        # fails after the issue's own read answered); ``sub_issues_error``
+        # the listings alone. ``hidden_sub_issues``
         # are sub-issues GitHub counts for an issue (by canonical URL) but
         # leaves out of its listing, as it does one the token may not read.
         self.parents: dict[str, str | None] = {}
         self.graph_error: GitHubError | None = None
+        self.issue_node_errors: dict[str, GitHubError] = {}
         self.sub_issues_error: GitHubError | None = None
         self.hidden_sub_issues: dict[str, int] = {}
         # Controller-owned EPIC body write (edit_issue_body): every write is
@@ -824,6 +828,8 @@ class FakeGitHub:
         if self.graph_error is not None:
             raise self.graph_error
         ref = parse_issue_url(url)
+        if ref.canonical in self.issue_node_errors:
+            raise self.issue_node_errors[ref.canonical]
         for known in self.issues:
             if parse_issue_url(known).same_target(ref):
                 return self._issue_node(known)

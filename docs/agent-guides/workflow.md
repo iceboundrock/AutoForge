@@ -187,7 +187,10 @@ transition:
   not changed." and changes nothing. A run also stops at the worker's step
   limit (50, as a standalone `run`), its claim then classified `resumable`.
 - **The same run as a standalone one.** A fresh issue starts exactly as
-  `autoforge run` starts it (INITIALIZING); a namespace holding a state
+  `autoforge run` starts it (INITIALIZING), with one difference: the worker
+  records the EPIC whose snapshot admitted the issue as its direct child,
+  and makes none of the standalone `run`'s EPIC binding reads (#293); a
+  namespace holding a state
   passes #219's recorded-configuration gate first, as `resume` does, and a
   changed configuration is refused unless the scheduler forwards
   `--accept-config-change`. Every validation and certificate gate of #158
@@ -528,7 +531,7 @@ phase or a person, which the agent needs to know just as much. The hint is
 information only: it changes no state, a clean worktree renders nothing, a
 status read that fails renders nothing and the run log's `request.json`
 says why (`metadata.worktree_state`), and the verification after the phase
-is unchanged. A plan or a dry run runs no git and shows a placeholder.
+is unchanged. A plan or a dry run reads no worktree status and shows a placeholder.
 
 Every probe below and the read-back after the agent consume one identity
 model, `src/autoforge/claims.py`: one exact-schema decoder per marker kind,

@@ -5,6 +5,44 @@ so.
 
 ## Unreleased
 
+### A new run records the issue's native parent as its EPIC, and `--epic` is the fallback (#293)
+
+`run` used to record whatever `--epic` named, so a run of #257 started with
+`--epic` #158 recorded #158 although #257's parent on GitHub is #255, and
+its `UPDATE_EPIC` would have written to the wrong issue. Now:
+
+- a new run's EPIC is the issue's GitHub-native parent (its direct one, for
+  a nested issue). A `--epic` naming another issue is shown and not used;
+- `--epic` is optional, and is the EPIC only for an issue GitHub reports
+  with no native parent. With neither, `run` refuses (exit 2). A parent
+  named in the issue's body, a task list, a roadmap or a title never
+  counts;
+- `run` refuses (exit 2) a parent in another repository, a closed issue
+  and a closed EPIC, and refuses (exit 1) when reading the issue or its
+  EPIC fails, is denied or is cut off. A failed read never falls back to
+  `--epic`, and a refusal writes nothing;
+- the issue is read again after its EPIC, and `run` refuses (exit 2) an
+  issue whose parent or state changed on GitHub between the two reads,
+  instead of recording the parent it read first;
+- `run` checks that the checkout's `origin` is the issue's repository (as
+  GitHub names it) before it writes anything, replaces a run with
+  `--force` or moves an unreadable state aside, instead of only at
+  INITIALIZING after the first save; another repository, or an `origin` or
+  repository that cannot be read, refuses with exit 1. So does a `gh repo
+  view` answer that does not name the repository, which AutoForge used to
+  read as the repository it had asked for;
+- `run` and `run --dry-run` print `--epic`, the native parent and the EPIC
+  used, and the run log records which source was used. The dry run now
+  makes the same checks and read-only reads: the checkout's `origin`
+  (`git remote get-url`, so it runs in a checkout of the issue's
+  repository) and, through `gh`, the repository, the issue, its EPIC and
+  the issue again;
+- `status` labels the EPIC as the one recorded when the run was created.
+  An existing run keeps its EPIC whatever happens to the issue's parent
+  on GitHub; rebinding a run is #435.
+
+See [Which EPIC a run records](docs/usage.md#which-epic-a-run-records).
+
 ### REVIEW's block on a review comment it did not post says what happened and who may own it (#415)
 
 `REVIEW` still blocks on a comment carrying the round's review marker that

@@ -186,6 +186,19 @@ class SchedulerStateDirError(ConfigurationError):
     """
 
 
+class EpicBindingError(ConfigurationError):
+    """A new run's EPIC cannot be bound from the issue's native parent or ``--epic`` (#293).
+
+    Raised by :mod:`autoforge.run_binding` before ``run`` (its dry run
+    included) creates a state, when GitHub's answer decides against the
+    binding: the issue has no native parent and no ``--epic`` was given,
+    its parent is in another repository, the issue or the EPIC it would
+    bind to is not open, or ``--epic`` names the issue itself. Nothing was
+    written. A read that failed is never this error: it stays the client's
+    :class:`GitHubError`, and never falls back to ``--epic``.
+    """
+
+
 class StateTransitionError(AutoForgeError):
     """Illegal phase transition or step on a terminal phase."""
 

@@ -158,6 +158,7 @@ COVERAGE: Mapping[str, Entry] = {
     ),
     "src/autoforge/replan_txn.py": ("test_cli",),
     "src/autoforge/roadmap.py": ("test_engine",),
+    "src/autoforge/run_binding.py": ("test_cli", "test_state_root"),  # run's EPIC (#293)
     "src/autoforge/run_namespace.py": ("test_engine",),
     "src/autoforge/sandbox.py": ("test_sandbox_gate", "test_engine"),
     "src/autoforge/sandbox_bwrap.py": ("test_engine_sandbox",),
