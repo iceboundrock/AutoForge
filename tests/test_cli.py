@@ -20,6 +20,7 @@ from autoforge.errors import (
     LockError,
 )
 from autoforge.executor import ExecutionResult, execute
+from autoforge.github import GitHubClient
 from autoforge.locking import ControllerLock, IssueRunLock, repository_lock_path
 from autoforge.provenance import MAX_PATH_CHARS
 from autoforge.providers import ProviderRegistry, ScriptedProvider
@@ -445,11 +446,51 @@ def _repository_read_denied(tmp_path, gh) -> str:
     return "HTTP 403: Resource not accessible"
 
 
+def _repository_reply(gh, reply: object) -> None:
+    """``gh repo view`` answers ``reply``, decoded by the real client (PR #437 R2-F1)."""
+
+    def runner(req):
+        assert req.command[1:] == [
+            "repo",
+            "view",
+            "owner/repo",
+            "--json",
+            "nameWithOwner,defaultBranchRef",
+        ]
+        return ExecutionResult(req.command, req.cwd, 0, json.dumps(reply), "", "t", "t")
+
+    client = GitHubClient(runner=runner, retry_delay_seconds=0)
+
+    def get_repo(repo: str):
+        gh.calls.append(("get_repo", repo))
+        return client.get_repo(repo)
+
+    gh.get_repo = get_repo
+
+
+def _repository_reply_without_a_name(tmp_path, gh) -> str:
+    _repository_reply(gh, {})
+    return "gh repo view owner/repo: the reply names no repository: its nameWithOwner is missing"
+
+
+def _repository_reply_with_a_null_name(tmp_path, gh) -> str:
+    _repository_reply(gh, {"nameWithOwner": None, "defaultBranchRef": {"name": "main"}})
+    return "the reply names no repository: its nameWithOwner is None, not an owner/repo name"
+
+
+def _repository_reply_with_a_name_of_another_type(tmp_path, gh) -> str:
+    _repository_reply(gh, {"nameWithOwner": ["owner/repo"], "defaultBranchRef": None})
+    return "the reply names no repository: its nameWithOwner is ['owner/repo']"
+
+
 _REPOSITORY_REFUSALS = {
     "another-repository": _checkout_of_another_repository,
     "no-origin": _checkout_without_an_origin,
     "read-unavailable": _repository_read_unavailable,
     "read-denied": _repository_read_denied,
+    "reply-without-a-name": _repository_reply_without_a_name,
+    "reply-with-a-null-name": _repository_reply_with_a_null_name,
+    "reply-with-a-name-of-another-type": _repository_reply_with_a_name_of_another_type,
 }
 
 
@@ -475,13 +516,18 @@ def test_the_checkout_repository_is_verified_before_the_binding_and_the_first_sa
     assert gh.effect_writes == [] and fakes["provider"].calls == []
 
 
-@pytest.mark.parametrize("refusal", ["another-repository", "read-unavailable"])
+@pytest.mark.parametrize(
+    "refusal",
+    ["another-repository", "read-unavailable", "reply-without-a-name", "reply-with-a-null-name"],
+)
 @pytest.mark.parametrize("existing", ["nonterminal", "unreadable"])
 def test_run_force_from_the_wrong_checkout_keeps_the_existing_state(
     tmp_path, capsys, monkeypatch, fakes, refusal, existing
 ):
     """PR #437 R1-F2: ``run --force`` checks the checkout's repository before it replaces a
-    run or moves an unreadable state aside, so a refusal leaves both exactly as they were."""
+    run or moves an unreadable state aside, so a refusal leaves both exactly as they were.
+    A reply that names no repository is such a refusal, never the repository asked for
+    (R2-F1)."""
     monkeypatch.chdir(tmp_path)
     gh = fakes["gh"]
     sd = tmp_path / ".autoforge"

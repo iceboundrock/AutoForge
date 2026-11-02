@@ -139,6 +139,8 @@ parent GitHub named).
 checkout is the issue's repository: its `origin`, as GitHub names it
 (`gh repo view`, which follows a rename). Another repository, or an
 `origin` or repository that cannot be read, exits 1 and writes nothing.
+So does an answer that does not name the repository: AutoForge never
+assumes the name it asked for.
 Then it reads the issue, the EPIC it would record and the issue again
 through `gh` (`GET /repos/<owner>/<repo>/issues/<n>` each; nothing else).
 The issue and that EPIC must both be open, and the EPIC in the issue's

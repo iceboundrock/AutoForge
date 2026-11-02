@@ -28,7 +28,9 @@ its `UPDATE_EPIC` would have written to the wrong issue. Now:
   GitHub names it) before it writes anything, replaces a run with
   `--force` or moves an unreadable state aside, instead of only at
   INITIALIZING after the first save; another repository, or an `origin` or
-  repository that cannot be read, refuses with exit 1;
+  repository that cannot be read, refuses with exit 1. So does a `gh repo
+  view` answer that does not name the repository, which AutoForge used to
+  read as the repository it had asked for;
 - `run` and `run --dry-run` print `--epic`, the native parent and the EPIC
   used, and the run log records which source was used. The dry run now
   makes the same checks and read-only reads: the checkout's `origin`

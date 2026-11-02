@@ -2071,12 +2071,41 @@ class GitHubClient:
 
     # -- repository -------------------------------------------------------
     def get_repo(self, repo: str) -> RepoInfo:
-        """``repo`` as 'owner/name'."""
+        """``repo`` (as 'owner/name') as GitHub names it, with its default branch.
+
+        The name is the reply's own ``nameWithOwner``, an ``owner/name``
+        string, and never ``repo``: a renamed repository answers with its new
+        name, and a caller compares that name with the run's repository
+        (``verify_checkout_repository``). A reply whose ``nameWithOwner`` is
+        missing, null, of another type or not an ``owner/name`` name is a
+        GitHubError, not the repository asked for (PR #437 R2-F1). The
+        default branch is ``""`` when ``defaultBranchRef`` is null (a
+        repository with no commit), and every caller refuses an empty one; a
+        ``defaultBranchRef`` that is missing, not an object or names no
+        string branch is a GitHubError too.
+        """
+        what = f"gh repo view {repo}"
         data = self._api_json(["repo", "view", repo, "--json", "nameWithOwner,defaultBranchRef"])
-        return RepoInfo(
-            name_with_owner=data.get("nameWithOwner", repo),
-            default_branch=(data.get("defaultBranchRef") or {}).get("name", ""),
-        )
+        name = data.get("nameWithOwner")
+        try:
+            name_with_owner = _repository_path(name) if isinstance(name, str) else None
+        except GitHubError:
+            name_with_owner = None
+        if name_with_owner is None:
+            shown = "missing" if "nameWithOwner" not in data else f"{name!r:.120}"
+            raise GitHubError(
+                f"{what}: the reply names no repository: its nameWithOwner is {shown}, "
+                "not an owner/repo name"
+            )
+        if "defaultBranchRef" not in data:
+            raise GitHubError(f"{what}: the reply has no defaultBranchRef")
+        ref = data["defaultBranchRef"]
+        branch = "" if ref is None else ref.get("name") if isinstance(ref, dict) else None
+        if not isinstance(branch, str):
+            raise GitHubError(
+                f"{what}: the reply's defaultBranchRef {ref!r:.120} names no default branch"
+            )
+        return RepoInfo(name_with_owner=name_with_owner, default_branch=branch)
 
     # -- branch rules (read-only; `doctor`) ---------------------------------
     def get_required_status_check_rules(

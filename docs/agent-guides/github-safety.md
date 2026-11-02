@@ -45,6 +45,9 @@ never from the operator's memory or the issue's text
   (`gh repo view`, which follows a rename). A checkout of another
   repository, or one whose `origin` or repository cannot be read, refuses
   the run (PR #437 R1-F2). INITIALIZING checks it again on every entry.
+  The name compared is the one GitHub's reply returns: a reply whose
+  `nameWithOwner` is missing, null, of another type or not `owner/repo`
+  is a failed read, never the repository asked for (PR #437 R2-F1).
 - The issue is read again after its EPIC: the EPIC's read is a second
   request, and a person can re-parent, detach, attach or close the issue
   meanwhile, which the controller lock does not stop. A change of the
