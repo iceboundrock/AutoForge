@@ -660,10 +660,20 @@ refused, with nothing written, when the `FIX` plan is already saved (unblock
 without it), and when the agent worktree's `HEAD` is anything but the
 reviewed HEAD, for example a commit the fixer made before it blocked: that
 commit was never pushed or reviewed, and a fresh round would leave it
-behind. Unblock without the flag to let `FIX` continue from it, or move the
-work out of the worktree yourself. Where a plain `unblock` would not re-enter
-`FIX` with open findings, the flag is refused and the message says what the
-plain decision is.
+behind. It is refused too while the agent worktree holds uncommitted
+changes (`git -C <worktree> status` lists them; the message names the
+worktree): the new round's reviewer works there, and would read and test
+them instead of the reviewed commit. Unblock without the flag to let `FIX`
+continue from the work (its prompt lists uncommitted changes), or move the
+work out of the worktree yourself and unblock again; AutoForge never
+discards it. The flag also checks that the base branch was not rewritten
+under the PR since the review (its merge base moved): if it was, unblock
+without the flag, and `FIX` sends the PR to a fresh review of the actual
+revision without launching the fixer. Where a plain `unblock` would not
+re-enter `FIX` with open findings, the flag is refused and the message says
+what the plain decision is. If someone pushes to the PR after the unblock,
+the new round reviews the new HEAD, and its prompt says the PR moved after
+your request.
 
 ### BLOCKED on an acceptance action
 

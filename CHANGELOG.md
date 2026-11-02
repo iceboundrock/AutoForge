@@ -65,18 +65,26 @@ as it now stands. The round's findings are not marked resolved: they are
 handed to the new round to re-check, as when the PR moves, and it may raise
 them again. The new round counts against `workflow.max_review_rounds`.
 The flag is refused, with nothing written, when the round's `FIX` plan is
-saved, when the agent worktree's `HEAD` is anything but the reviewed HEAD
-(an unpushed commit of the fixer's, say), and wherever a plain `unblock`
-would not re-enter `FIX` with open findings. It excludes
-`--approve-action`, `--decline-action` and `--bind-evidence`.
+saved; when the merge base moved since the review (the base was rewritten
+under its name: unblock without the flag, and `FIX` sends the PR to a fresh
+review without launching the fixer) or cannot be proven unchanged; when the
+agent worktree's `HEAD` is anything but the reviewed HEAD (an unpushed
+commit of the fixer's, say); when the agent worktree holds uncommitted
+changes, which the new round's reviewer would read and test instead of the
+reviewed commit (move them out, or unblock without the flag to let `FIX`
+continue from them); and wherever a plain `unblock` would not re-enter
+`FIX` with open findings. It excludes `--approve-action`,
+`--decline-action` and `--bind-evidence`.
 
 The history entry records the abandoned finding ids (`action`), the run
 log adds `metadata.abandoned_findings`, and `status` shows both. A `FIX`
 agent that reports `blocked` now names the flag in the step's message; the
 saved block reason is still the agent's own text. The state protocol is
 unchanged. The `REVIEW` prompt says when its prior findings come from a
-re-review; the prompt version is `v15`, and a REMOTE run resumed by this
-version renders the new template and keeps its recorded label.
+re-review, and whether the PR moved after the request (a push before the
+round bound its revision); the prompt version is `v15`, and a REMOTE run
+resumed by this version renders the new template and keeps its recorded
+label.
 
 ### A stopped run says how it stopped and what applies next, from typed facts (#369)
 

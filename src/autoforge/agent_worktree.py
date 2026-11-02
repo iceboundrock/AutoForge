@@ -25,6 +25,12 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   ``gitdir``, or ``git -C <worktree>``. An attached ``HEAD`` is told by
   ``symbolic-ref --no-recurse``, which never opens the reference it names
   (#223).
+- **Uncommitted changes (#428).** :func:`uncommitted_entries` is ``git
+  status`` of the bound worktree with its admin dir, the common dir and
+  the working tree named explicitly (``--git-dir``, ``GIT_COMMON_DIR``,
+  ``--work-tree``): never through the worktree's ``.git`` file or the
+  admin dir's ``commondir``. ``unblock --rereview`` refuses a worktree it
+  lists anything in, since the next round's reviewer works there.
 - **Strict import (D6.5).** :func:`import_private_objects` copies the
   objects reachable from that ``HEAD`` which the shared store lacks out of
   the issue's private object directory (an enforced launch's overlay upper
@@ -65,6 +71,7 @@ from pathlib import Path
 from .errors import GitLockTimeout, LockError, SandboxTamperError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .git_transport import NO_AUTO_MAINTENANCE, local_git_request
+from .git_workspace import STATUS_ARGS, StatusEntry, parse_status
 from .locking import SharedGitLock
 from .redaction import redact
 
@@ -374,6 +381,41 @@ def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | No
     if found != 0 or not _SHA_RE.fullmatch(head):
         head = ""
     return Candidate(False, head)
+
+
+def uncommitted_entries(
+    common: Path, admin: Path, worktree: str, runner: Runner | None
+) -> list[StatusEntry]:
+    """What ``git status`` lists as uncommitted in the bound ``worktree`` (#428).
+
+    The records :meth:`~autoforge.git_workspace.GitWorkspace.status_entries`
+    reads (:data:`~autoforge.git_workspace.STATUS_ARGS`), but with the
+    admin dir the registry binds (D6.4) as ``--git-dir``, ``common`` as
+    ``GIT_COMMON_DIR`` and ``worktree`` as ``--work-tree``: never the
+    worktree's agent-writable ``.git`` file, and never the admin dir's
+    ``commondir``, which the variable overrides. With no optional lock, so
+    the index is not refreshed, and with rename detection off, so no blob
+    is read (the index may name one only the issue's private object
+    directory holds). Ignored files are not listed. It is the operator's
+    notion of uncommitted work, never an identity: the caller holds that
+    the candidate read (:func:`read_candidate`) found ``HEAD``. An
+    inconclusive read is a :class:`VerificationError`, never a guess.
+    """
+    args = ["status", *STATUS_ARGS, "--no-renames"]
+    res = _run(
+        runner,
+        local_git_request(
+            ["--no-optional-locks", "--git-dir", str(admin), "--work-tree", worktree, *args],
+            env={"GIT_COMMON_DIR": str(common)},
+            timeout_seconds=GIT_TIMEOUT_SECONDS,
+        ),
+    )
+    if res.timed_out or res.truncated or res.exit_code != 0:
+        raise VerificationError(
+            f"cannot read the uncommitted changes of the agent worktree {worktree} "
+            f"(`git {' '.join(args)}` {_ended(res)}{_detail(res)})"
+        )
+    return parse_status(res.stdout or "")
 
 
 def _root_problem(common: Path, directory: Path) -> str | None:

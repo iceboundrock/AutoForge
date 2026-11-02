@@ -472,7 +472,11 @@ BLOCKED**) is not a round and leaves it as it is. The one carry made at an
 unchanged revision is the operator's: `unblock --rereview` (#428) gives up
 a round's FIX and hands its open findings to the next round the same way,
 and the `PRIOR_FINDINGS` line then says the operator asked for that review
-instead of a FIX, since no push explains why none ran. Like `open_findings` they
+instead of a FIX, since no push explains why none ran. That line compares
+the round's own binding with the HEAD the FIX was given up at, and names
+the HEAD, base or merge base that moved after the request (a push before
+`REVIEW` bound its revision, PR #444 R1-F3); it says the HEAD is the same
+only when it is. Like `open_findings` they
 are per PR: a replacement PR and a new issue start with none. The
 alternative, not consuming a stale round, was rejected: it would relaunch
 the same round profile against a PR that may move again, and it would let
@@ -819,15 +823,28 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   that `unblock --rereview` abandoned them. It is refused, with nothing
   written, past `workflow.max_review_rounds` (the new round counts like
   any other); with a saved `FIX` plan (its writes are the controller's to
-  complete: unblock without the flag); and unless the agent worktree is
-  absent or its `HEAD` is detached at the reviewed HEAD, read as a
-  candidate is (ADR 0005 D6.3): any other `HEAD` (a fixer's unpushed
-  commit, a local branch, a commit the shared store lacks) may hold work
-  a fresh round would leave behind. Uncommitted files do not refuse it: a
-  review round neither discards nor publishes them. Anywhere else (a moved
-  PR, a clean review, no PR, no open findings) the flag refuses, quoting
-  the plain decision; it excludes the action flags. A `FIX` agent that
-  reports `blocked` names the flag in the step's message.
+  complete: unblock without the flag); unless the merge base, read now
+  against the reviewed HEAD as the `FIX` entry reads it, is the reviewed
+  one (PR #444 R1-F2): a base rewritten under its name moved the diff, and
+  the plain unblock is that drift's recovery (its `FIX` entry re-enters
+  `REVIEW` with the findings carried, no fixer launched), while a round
+  that recorded no merge base or a read that fails conclusively proves
+  nothing (an unavailable GitHub propagates, nothing decided); and unless
+  the agent worktree, where the next round's reviewer works, holds nothing
+  the reviewed HEAD does not. It may be absent; otherwise its `HEAD` must
+  be detached at the reviewed HEAD, read as a candidate is (ADR 0005
+  D6.3): any other `HEAD` (a fixer's unpushed commit, a local branch, a
+  commit the shared store lacks) may hold work a fresh round would leave
+  behind. And `git status`, read through the bound admin dir and never the
+  worktree's `.git` file, must list nothing (PR #444 R1-F1): an
+  uncommitted change (a blocked fixer's half-made edit, an untracked
+  file) is what that reviewer would read and test in place of the
+  reviewed commit, and the controller neither discards nor moves it; a
+  status that cannot be read refuses too. Ignored files are not listed.
+  Anywhere else (a moved PR, a clean review, no PR, no open findings) the
+  flag refuses, quoting the plain decision; it excludes the action flags.
+  A `FIX` agent that reports `blocked` names the flag in the step's
+  message.
 - **Operator actions awaiting the operator** (#243, ADR 0004 K10). A
   `FIX` plan's operator comments (first in the plan, at most four) ask the
   operator to post a comment on another issue of the repository; the

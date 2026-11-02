@@ -138,6 +138,7 @@ from .agent_worktree import (
     import_private_objects,
     read_candidate,
     registered_worktree_roots,
+    uncommitted_entries,
 )
 from .certificate import (
     CertificateIssuanceError,
@@ -3374,10 +3375,12 @@ class ControllerEngine:
         if not s.prior_findings:
             return "(none)"
         # #428: findings an operator's `unblock --rereview` abandoned are
-        # carried at the same HEAD, so the line says why no FIX ran.
+        # carried from an unchanged revision, so the line says why no FIX
+        # ran, and whether the PR moved after that request after all.
         why = (
-            "; the operator gave up that round's FIX at this HEAD and asked for this review "
-            "(`unblock --rereview`), so no FIX round resolved them"
+            "; the operator gave up that round's FIX at that HEAD and asked for a fresh review "
+            "(`unblock --rereview`), so no FIX round resolved them. "
+            + self._rereview_revision_note()
             if rereview_carry(s) is not None
             else ", and no FIX round resolved them"
         )
@@ -3386,6 +3389,38 @@ class ControllerEngine:
             f"({s.last_review_comment_url or 'comment URL not recorded'}) reported these "
             f"findings{why}:\n" + self._format_findings(s.prior_findings)
         )
+
+    def _rereview_revision_note(self) -> str:
+        """Whether a re-review's round is bound to the revision its FIX was given up at (#428).
+
+        ``unblock --rereview`` is applied only with the PR at the reviewed
+        HEAD, base and merge base, but the PR may move before REVIEW binds
+        its own revision (:meth:`_bind_review_head`, PR #444 R1-F3). The
+        HEAD at that unblock is the abandoned round's; the HEAD, base and
+        merge base this round is bound to are the ``current_*`` fields, and
+        each one bound that differs is named. A merge base not yet bound (a
+        plan or a dry run, before the entry reads it) is not compared.
+        """
+        s = self._require_state()
+        moved: list[str] = []
+        if s.current_head_sha and s.current_head_sha.lower() != s.reviewed_head_sha.lower():
+            moved.append(f"HEAD `{s.current_head_sha}`, not `{s.reviewed_head_sha}`")
+        if s.current_base_ref and s.current_base_ref != s.reviewed_base_ref:
+            moved.append(
+                f"base `{escape_inline(s.current_base_ref)}`, not "
+                f"`{escape_inline(s.reviewed_base_ref or '(none)')}`"
+            )
+        if s.current_merge_base_sha and s.current_merge_base_sha != s.reviewed_merge_base_sha:
+            moved.append(
+                f"merge base `{s.current_merge_base_sha}`, not "
+                f"`{s.reviewed_merge_base_sha or '(none)'}`"
+            )
+        if moved:
+            return (
+                "The PR moved after that request, so this round does not review the revision "
+                f"the operator asked to have re-reviewed: it is bound to {'; '.join(moved)}"
+            )
+        return "This round is bound to that same HEAD: no commit moved after the operator's request"
 
     def _format_previous_fix_resolutions(self) -> str:
         """The last FIX round's resolutions, for the next REVIEW prompt (#163, D5.3).
@@ -7410,20 +7445,19 @@ class ControllerEngine:
         carried to it to re-check, exactly as a stale round's are, and the
         last result is marked stale. Nothing is marked resolved; the
         operator's reason stays uninterpreted. The caller has checked the
-        PR binding, the absence of a saved FIX plan and the round cap.
-        Refused while the agent worktree may hold work the PR does not
-        (:meth:`_rereview_worktree_problem`).
+        PR's HEAD and base against the review binding, the absence of a
+        saved FIX plan and the round cap. Refused, with the remedy, unless
+        the merge base is proven the reviewed one too
+        (:meth:`_rereview_binding_problem`), and while the agent worktree,
+        where the next round's reviewer works, holds anything the reviewed
+        HEAD does not (:meth:`_rereview_worktree_problem`).
         """
         state = self._require_state()
-        problem = self._rereview_worktree_problem(reviewed)
+        problem = self._rereview_binding_problem(pr, reviewed) or self._rereview_worktree_problem(
+            reviewed
+        )
         if problem:
-            return UnblockDecision(
-                None,
-                f"unblock --rereview is refused: {problem}; a fresh review round would leave "
-                "such work behind unreviewed. Unblock without --rereview to let FIX continue "
-                "from it, or move the work out of the worktree yourself and unblock again",
-                pr=pr,
-            )
+            return UnblockDecision(None, f"unblock --rereview is refused: {problem}", pr=pr)
         ids = tuple(str(f.get("id", "")) for f in state.open_findings)
         return UnblockDecision(
             Phase.REVIEW,
@@ -7437,44 +7471,121 @@ class ControllerEngine:
             abandoned=ids,
         )
 
-    def _rereview_worktree_problem(self, reviewed: str) -> str:
-        """Why the agent worktree may hold work the PR does not, or "" (#428).
+    def _rereview_binding_problem(self, pr: PRInfo, reviewed: str) -> str:
+        """Why the PR's diff is not proven the reviewed one, with the remedy, or "" (#428).
 
-        Nothing is left behind only when the worktree does not exist or its
-        HEAD is detached at the reviewed HEAD: any other HEAD (a fixer's
-        unpushed commit, a local branch, a commit the shared store does not
-        hold) may be work. ``HEAD`` is read as a candidate is (ADR 0005
-        D6.3), never through the worktree's ``.git`` file, and nothing is
-        imported or written. Uncommitted changes are not looked at: a
-        review round neither discards nor publishes them.
+        The caller found the PR at the reviewed HEAD on the reviewed base,
+        but a base rewritten under its name moves the diff without moving
+        either (#96), and a re-review gives up a FIX only at an unchanged
+        revision (PR #444 R1-F2). So the merge base is read now, against the
+        reviewed HEAD as the FIX entry reads it (:meth:`_fix_unbound`), and
+        compared with the one the round recorded. A moved one is drift, whose
+        recovery is the plain unblock's: its FIX entry finds the same drift
+        and re-enters REVIEW of the actual revision with the findings
+        carried, no fixer launched. A round that recorded none (an older
+        state file) and a read that fails conclusively prove nothing, so
+        they refuse too. An unavailable GitHub propagates: nothing is
+        decided on a read that may succeed next time.
+        """
+        state = self._require_state()
+        recorded = state.reviewed_merge_base_sha
+        round_ = state.review_round
+        if not recorded:
+            return (
+                f"review round {round_} recorded no merge base, so the PR's diff cannot be "
+                "proven the one it reviewed, and a re-review gives up a FIX only at an "
+                "unchanged revision. Unblock without --rereview"
+            )
+        try:
+            with self._reading(
+                f"merge base of {pr.base_ref!r} and the reviewed HEAD {reviewed[:12]}"
+            ):
+                live = self.github.get_merge_base_sha(state.repository, pr.base_ref, reviewed)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return (
+                f"{exc}. This is not a transient GitHub failure, so the PR's diff cannot be "
+                f"proven the one review round {round_} reviewed; fix the cause, then unblock "
+                "again"
+            )
+        if live != recorded:
+            return (
+                f"PR merge base moved to {live[:12]} from the reviewed merge base "
+                f"{recorded[:12]} that the open findings of round {round_} are bound to (base "
+                f"{pr.base_ref!r} was rewritten under its name), so the PR's diff is not the "
+                "one reviewed and there is no FIX at an unchanged revision to give up. Unblock "
+                "without --rereview: FIX re-reads the merge base and, as it moved, re-enters "
+                "REVIEW of the actual revision with the findings carried, no fixer launched"
+            )
+        return ""
+
+    def _rereview_worktree_problem(self, reviewed: str) -> str:
+        """Why the agent worktree refuses a re-review, with the remedy, or "" (#428).
+
+        The next round's reviewer works in this worktree, so it may hold
+        nothing the reviewed HEAD does not: it does not exist, or its HEAD
+        is detached at the reviewed HEAD and ``git status`` lists nothing.
+        Any other HEAD (a fixer's unpushed commit, a local branch, a commit
+        the shared store does not hold) may be work a fresh round would
+        leave behind. An uncommitted change (a blocked fixer's half-made
+        edit, an untracked file) is what that reviewer would read and test
+        in place of the reviewed commit, and could clear code the PR does
+        not hold (PR #444 R1-F1); the controller neither discards nor moves
+        it. ``HEAD`` is read as a candidate is (ADR 0005 D6.3) and the
+        status through the bound admin dir (:func:`uncommitted_entries`),
+        never through the worktree's ``.git`` file; nothing is imported or
+        written.
         """
         path = self.agent_worktree_path()
         if not os.path.lexists(path):
             return ""
+        left_behind = (
+            "; a fresh review round would leave such work behind unreviewed. Unblock without "
+            "--rereview to let FIX continue from it, or move the work out of the worktree "
+            "yourself and unblock again"
+        )
         if path.is_symlink():
-            return f"the agent worktree path {path} is a symbolic link"
+            return f"the agent worktree path {path} is a symbolic link{left_behind}"
+        common = self.workspace().git_dirs()[-1]
         try:
-            candidate = read_candidate(
-                self.workspace().git_dirs()[-1],
-                self._agent_admin_dir(path),
-                str(path),
-                self._runner,
-            )
+            admin = self._agent_admin_dir(path)
+            candidate = read_candidate(common, admin, str(path), self._runner)
         except VerificationError as exc:
-            return f"the agent worktree {path} cannot be read ({exc})"
+            return f"the agent worktree {path} cannot be read ({exc}){left_behind}"
         if candidate.problem:
-            return f"the agent worktree {path} has no readable HEAD ({candidate.problem})"
+            return (
+                f"the agent worktree {path} has no readable HEAD ({candidate.problem}){left_behind}"
+            )
         if candidate.attached:
-            return f"the agent worktree {path} has its HEAD attached to a local branch"
+            return f"the agent worktree {path} has its HEAD attached to a local branch{left_behind}"
         if not candidate.head:
             return (
                 f"the HEAD of the agent worktree {path} names no commit the shared object "
-                "store holds"
+                f"store holds{left_behind}"
             )
         if candidate.head.lower() != reviewed.lower():
             return (
                 f"the agent worktree {path} is at {candidate.head[:12]}, not at the reviewed "
-                f"HEAD {reviewed[:12]}, so it may hold commits the PR does not"
+                f"HEAD {reviewed[:12]}, so it may hold commits the PR does not{left_behind}"
+            )
+        try:
+            entries = uncommitted_entries(common, admin, str(path), self._runner)
+        except VerificationError as exc:
+            return (
+                f"{exc}, so whether the next round's reviewer would judge changes the reviewed "
+                f"HEAD {reviewed[:12]} does not hold is not knowable. Fix the cause, then "
+                "unblock again, or unblock without --rereview"
+            )
+        if entries:
+            return (
+                f"the agent worktree {path} holds {len(entries)} uncommitted change(s) on the "
+                f"reviewed HEAD {reviewed[:12]} (`git -C {path} status` lists them), and the "
+                "next round's reviewer works in that worktree: what it reads and tests there "
+                "would be those changes, not the reviewed commit. The controller neither "
+                "discards nor moves them. Unblock without --rereview to let FIX continue from "
+                "them (its prompt lists them), or move them out of the worktree yourself and "
+                "unblock again"
             )
         return ""
 

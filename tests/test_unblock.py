@@ -7,6 +7,8 @@ action in state and in the run log. No agent runs and no step is charged.
 """
 
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -17,13 +19,16 @@ from autoforge.errors import (
     GitHubUnavailableError,
     StateTransitionError,
 )
+from autoforge.git_transport import NO_AUTO_MAINTENANCE
 from autoforge.state import load_state
 from autoforge.transitions import UNBLOCK_TARGETS, Phase
 from tests.conftest import (
     BRANCH,
     EPIC,
+    GIT_IDENT,
     ISSUE,
     MERGE_BASE,
+    MERGE_BASE_B,
     PR,
     SHA_A,
     SHA_B,
@@ -801,9 +806,20 @@ def test_the_review_prompt_says_the_operator_asked_for_the_rereview(tmp_state_di
     eng.state = load_state(eng.paths.state_file)
     text = eng._format_prior_findings()
     assert text.startswith(f"Review round 2 at HEAD `{SHA_A}`")
-    assert "the operator gave up that round's FIX at this HEAD" in text
+    assert "the operator gave up that round's FIX at that HEAD" in text
     assert "`unblock --rereview`" in text and "R2-F1" in text
+    assert "This round is bound to that same HEAD: no commit moved" in text
     assert RESOLVED_OUTSIDE not in text
+    # PR #444 R1-F3: the round's own binding is compared with the HEAD the
+    # FIX was given up at; whatever moved since is named, the provenance kept.
+    eng.state.current_head_sha = SHA_B
+    eng.state.current_merge_base_sha = MERGE_BASE_B
+    moved = eng._format_prior_findings()
+    assert moved.startswith(f"Review round 2 at HEAD `{SHA_A}`")
+    assert "the operator gave up that round's FIX at that HEAD" in moved
+    assert "The PR moved after that request" in moved
+    assert f"bound to HEAD `{SHA_B}`, not `{SHA_A}`; merge base `{MERGE_BASE_B}`" in moved
+    assert "same HEAD" not in moved
     # A stale round's carry keeps its own wording.
     eng.state.unblock_history = []
     assert "unblock --rereview" not in eng._format_prior_findings()
@@ -853,6 +869,81 @@ def test_unblock_rereview_after_the_review_round_blocks_again_keeps_the_carry(
     out = eng.unblock(REASON, rereview=True)
     assert not out.unblocked and "no such FIX to give up" in out.message
     assert eng.paths.state_file.read_text() == raw
+
+
+def test_unblock_rereview_is_refused_when_the_merge_base_moved(tmp_state_dir, fake_github):
+    """PR #444 R1-F2: the same HEAD on the same base name, but the base was
+    rewritten under it, so the diff round 2 reviewed is not the PR's. There
+    is no FIX at an unchanged revision to give up: refused, nothing written.
+    The plain unblock is the drift's recovery: its FIX entry finds the same
+    drift and re-enters REVIEW of the actual revision with the findings
+    carried, no fixer launched."""
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    fake_github.merge_base = MERGE_BASE_B
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert not out.unblocked
+    assert (
+        f"PR merge base moved to {MERGE_BASE_B[:12]} from the reviewed merge base "
+        f"{MERGE_BASE[:12]} that the open findings of round 2 are bound to" in out.message
+    )
+    assert "Unblock without --rereview: FIX re-reads the merge base" in out.message
+    # Read against the reviewed HEAD, as the FIX entry reads it.
+    assert ("get_merge_base_sha", "owner/repo", "main", SHA_A) in fake_github.calls
+    _assert_untouched(eng, raw)
+    (record,) = _unblock_records(eng)
+    assert record["metadata"]["applied"] is False
+    assert record["metadata"]["abandoned_findings"] == []
+
+    assert eng.unblock(REASON).phase == "FIX"
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "PR merge base moved to" in out.message
+    s = load_state(eng.paths.state_file)
+    assert [f["id"] for f in s.prior_findings] == ["R2-F1"] and s.open_findings == []
+    assert s.last_review_result == "stale" and engine_module.rereview_carry(s) is None
+    assert eng.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("extra", "error", "says"),
+    [
+        (
+            {"reviewed_merge_base_sha": ""},
+            None,
+            "review round 2 recorded no merge base, so the PR's diff cannot be proven",
+        ),
+        (
+            {},
+            GitHubError("HTTP 422: No common ancestor"),
+            "This is not a transient GitHub failure, so the PR's diff cannot be proven",
+        ),
+    ],
+    ids=["none-recorded", "unreadable"],
+)
+def test_unblock_rereview_is_refused_on_a_merge_base_it_cannot_prove(
+    tmp_state_dir, fake_github, extra, error, says
+):
+    """PR #444 R1-F2: a binding that cannot be proven unchanged is not taken
+    as unchanged. Refused, nothing written."""
+    eng = _needs_fix(tmp_state_dir, fake_github, **extra)
+    fake_github.merge_base_error = error
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert not out.unblocked and says in out.message, out.message
+    _assert_untouched(eng, raw)
+
+
+def test_unblock_rereview_propagates_an_unavailable_merge_base_read(tmp_state_dir, fake_github):
+    """Nothing is decided on a read that may succeed next time: no state
+    write and no run-log record."""
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    fake_github.merge_base_error = GitHubUnavailableError("HTTP 502")
+    raw = eng.paths.state_file.read_text()
+    with pytest.raises(GitHubUnavailableError, match="merge base of 'main'"):
+        eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert eng.paths.state_file.read_text() == raw
+    assert _unblock_records(eng) == []
 
 
 def test_unblock_rereview_is_refused_past_the_round_cap(tmp_state_dir, fake_github):
@@ -931,10 +1022,21 @@ def test_unblock_rereview_dry_run_writes_nothing(tmp_state_dir, fake_github):
     assert not eng.paths.logs_dir.exists()
 
 
-def _worktree_at_reviewed_head(tmp_state_dir, gh):
-    """The issue's agent worktree, created as a launch does, and a run reviewed at its HEAD."""
+def _worktree_at_reviewed_head(tmp_state_dir, gh, tracked=None):
+    """The issue's agent worktree, created as a launch does, and a run reviewed at its HEAD.
+
+    ``tracked`` (path: text) is committed in the worktree first, so the
+    reviewed HEAD holds those files.
+    """
     eng = make_engine(tmp_state_dir, [], github=gh)
     worktree = eng._ensure_agent_worktree()
+    if tracked:
+        for name, text in tracked.items():
+            (worktree / name).write_text(text, "utf-8")
+        git_out("-C", str(worktree), "add", *tracked)
+        git_out(
+            "-C", str(worktree), *NO_AUTO_MAINTENANCE, *GIT_IDENT, "commit", "-q", "-m", "Feature"
+        )
     head = git_out("-C", str(worktree), "rev-parse", "HEAD")
     gh.add_pr(head_sha=head)
     fields = _reviewed(head=head, result="needs_fix", findings=[FINDING_R2])
@@ -947,14 +1049,86 @@ def _worktree_at_reviewed_head(tmp_state_dir, gh):
     return eng, worktree, head
 
 
-def test_unblock_rereview_with_the_worktree_at_the_reviewed_head(tmp_state_dir, fake_github):
-    """The fixer blocked without a commit: the worktree holds nothing the PR
-    does not, so nothing is left behind; uncommitted files do not refuse it."""
-    eng, worktree, _ = _worktree_at_reviewed_head(tmp_state_dir, fake_github)
-    (worktree / "draft.txt").write_text("an uncommitted draft\n", "utf-8")
+BUGGY = "TTL_SECONDS = 0  # entries never expire\n"
+FIXED = "TTL_SECONDS = 300\n"
+
+
+def test_unblock_rereview_with_the_worktree_clean_at_the_reviewed_head(tmp_state_dir, fake_github):
+    """The fixer blocked without a commit and left nothing uncommitted: the
+    worktree holds nothing the reviewed HEAD does not. An ignored file is
+    not a change: `git status` does not list it."""
+    eng, worktree, _ = _worktree_at_reviewed_head(
+        tmp_state_dir, fake_github, tracked={"cache.py": BUGGY}
+    )
+    common = Path(
+        git_out("-C", str(eng.workdir), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    )
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "exclude").write_text("*.log\n", "utf-8")
+    (worktree / "pytest.log").write_text("an ignored log\n", "utf-8")
     out = eng.unblock(REASON, rereview=True)
     assert out.unblocked and out.phase == "REVIEW", out.message
-    assert (worktree / "draft.txt").exists()
+    assert (worktree / "pytest.log").exists()
+
+
+def _change(worktree, change):
+    """One uncommitted change of kind ``change`` in ``worktree``; the path it is at."""
+    if change == "untracked":
+        (worktree / "draft.txt").write_text("an uncommitted draft\n", "utf-8")
+        return worktree / "draft.txt"
+    (worktree / "cache.py").write_text(FIXED, "utf-8")
+    if change == "staged":
+        git_out("-C", str(worktree), "add", "cache.py")
+    return worktree / "cache.py"
+
+
+@pytest.mark.parametrize("change", ["untracked", "modified", "staged"])
+def test_unblock_rereview_refuses_uncommitted_changes_in_the_worktree(
+    tmp_state_dir, fake_github, change
+):
+    """PR #444 R1-F1: the next round's reviewer works in the agent worktree,
+    so an uncommitted change there (a blocked fixer's half-made edit, a
+    draft) is what it would read and test in place of the reviewed commit.
+    Refused, nothing written and the change left exactly as it was; the
+    plain unblock still re-enters FIX, whose prompt lists it."""
+    eng, worktree, head = _worktree_at_reviewed_head(
+        tmp_state_dir, fake_github, tracked={"cache.py": BUGGY}
+    )
+    path = _change(worktree, change)
+    before = path.read_text("utf-8")
+    status = git_out("-C", str(worktree), "status", "--porcelain")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked
+    assert (
+        f"the agent worktree {worktree} holds 1 uncommitted change(s) on the reviewed HEAD "
+        f"{head[:12]}" in out.message
+    )
+    assert "what it reads and tests there would be those changes" in out.message
+    assert "Unblock without --rereview to let FIX continue from them" in out.message
+    _assert_untouched(eng, raw)
+    (record,) = _unblock_records(eng)
+    assert record["metadata"]["applied"] is False
+    assert record["metadata"]["abandoned_findings"] == []
+    assert path.read_text("utf-8") == before
+    assert git_out("-C", str(worktree), "status", "--porcelain") == status
+    assert git_out("-C", str(worktree), "rev-parse", "HEAD") == head
+    assert eng.unblock(REASON).phase == "FIX"
+
+
+def test_unblock_rereview_refuses_a_worktree_whose_status_cannot_be_read(
+    tmp_state_dir, fake_github
+):
+    """A `git status` that fails proves nothing about what the reviewer
+    would read: refused, never taken as clean."""
+    eng, worktree, _ = _worktree_at_reviewed_head(tmp_state_dir, fake_github)
+    (eng._agent_admin_dir(worktree) / "index").write_bytes(b"not an index")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked
+    assert f"cannot read the uncommitted changes of the agent worktree {worktree}" in out.message
+    assert "is not knowable" in out.message
+    _assert_untouched(eng, raw)
 
 
 def test_unblock_rereview_refuses_a_worktree_holding_a_commit_the_pr_does_not(
@@ -998,30 +1172,39 @@ def test_unblock_rereview_refuses_a_worktree_path_it_cannot_bind(tmp_state_dir, 
     _assert_untouched(eng, raw)
 
 
-def test_a_finding_resolved_outside_the_repository_is_rereviewed_not_refixed(tmp_state_dir):
-    """The incident of #428 end to end. Round 2 asks for a PR description
-    rewrite; the fixer cannot edit a PR body, so it blocks without a commit,
-    and the step says which unblock asks for a fresh round instead. The
-    operator rewrites the body by hand and runs `unblock --rereview`: no
-    fixer launches again, round 3 reviews the same HEAD with R2-F1 to
-    re-check and the current body in its read context, and its clean
-    verdict clears the carry and goes on to READY_FOR_MERGE."""
+def _publish_with(eng, path: str, text: str) -> str:
+    """A PR head on the checkout's HEAD whose tree holds ``path`` with ``text``; its SHA.
+
+    Written with plumbing into the checkout's object store, so the
+    checkout's HEAD, index and working tree are not moved, and published
+    to the PR branch on the engine's origin.
+    """
+    workdir = str(eng.workdir)
+
+    def plumbing(*args: str, data: str) -> str:
+        res = subprocess.run(
+            ["git", "-C", workdir, *args], input=data, capture_output=True, text=True, check=True
+        )
+        return res.stdout.strip()
+
+    blob = plumbing("hash-object", "-w", "--stdin", data=text)
+    tree = plumbing("mktree", data=f"100644 blob {blob}\t{path}\n")
+    sha = git_out(
+        "-C", workdir, *GIT_IDENT, "commit-tree", tree, "-p", "HEAD", "-m", "Add the cache (#2)"
+    )
+    eng.origin.publish(eng.workdir, sha, BRANCH)
+    return sha
+
+
+def _in_fix_of_round_two(tmp_state_dir, *handlers, files=None):
+    """A REMOTE run entering FIX for round 2's R2-F1 on an origin-backed PR; ``(eng, gh, head)``.
+
+    The PR head holds ``files`` (one path: text) when given.
+    """
     gh = FakeGitHub()
     gh.add_issue(ISSUE, "Ship the feature")
-    prompts: list[str] = []
-    bodies: list[str] = []
-
-    def blocked_fixer(req):
-        git_out("-C", str(req.cwd), "checkout", "-q", "--detach", reviewed_head_in(req.prompt))
-        return block({"phase": "FIX", "status": "blocked", "message": "cannot edit a PR body"})
-
-    def reviewer(req):
-        prompts.append(req.prompt)
-        bodies.append((read_context_of(req.prompt) / "pull-request.md").read_text())
-        return block(review_result(3, head, []))
-
-    eng = make_engine(tmp_state_dir, scripted(blocked_fixer, reviewer), github=gh, origin=True)
-    head = publish_pr_head(eng)
+    eng = make_engine(tmp_state_dir, scripted(*handlers), github=gh, origin=True)
+    head = _publish_with(eng, *next(iter(files.items()))) if files else publish_pr_head(eng)
     gh.add_pr(head_sha=head, body="Adds the feature with the old cache design.")
     merge_base = git_out("-C", str(eng.workdir), "rev-parse", "HEAD")
     for name, value in (
@@ -1031,6 +1214,38 @@ def test_a_finding_resolved_outside_the_repository_is_rereviewed_not_refixed(tmp
         setattr(eng.state, name, value)
     gh.add_comment(PR, REVIEW_CID, review_comment_body(2, head, True))
     eng._save()
+    return eng, gh, head
+
+
+def _blocked_fixer(edit=None):
+    """A fixer that checks out the reviewed HEAD, makes ``edit`` uncommitted, and blocks."""
+
+    def fixer(req):
+        git_out("-C", str(req.cwd), "checkout", "-q", "--detach", reviewed_head_in(req.prompt))
+        if edit is not None:
+            edit(Path(req.cwd))
+        return block({"phase": "FIX", "status": "blocked", "message": "cannot edit a PR body"})
+
+    return fixer
+
+
+def test_a_finding_resolved_outside_the_repository_is_rereviewed_not_refixed(tmp_state_dir):
+    """The incident of #428 end to end. Round 2 asks for a PR description
+    rewrite; the fixer cannot edit a PR body, so it blocks without a commit,
+    and the step says which unblock asks for a fresh round instead. The
+    operator rewrites the body by hand and runs `unblock --rereview`: no
+    fixer launches again, round 3 reviews the same HEAD with R2-F1 to
+    re-check and the current body in its read context, and its clean
+    verdict clears the carry and goes on to READY_FOR_MERGE."""
+    prompts: list[str] = []
+    bodies: list[str] = []
+
+    def reviewer(req):
+        prompts.append(req.prompt)
+        bodies.append((read_context_of(req.prompt) / "pull-request.md").read_text())
+        return block(review_result(3, head, []))
+
+    eng, gh, head = _in_fix_of_round_two(tmp_state_dir, _blocked_fixer(), reviewer)
 
     out = eng.step()
     assert out.next_phase == "BLOCKED", out.message
@@ -1046,9 +1261,99 @@ def test_a_finding_resolved_outside_the_repository_is_rereviewed_not_refixed(tmp
     assert out.next_phase == "READY_FOR_MERGE", out.message
     assert len(eng.provider.calls) == 2  # the blocked fixer and round 3's reviewer
     [prompt] = prompts
-    assert "the operator gave up that round's FIX at this HEAD" in prompt
+    assert "the operator gave up that round's FIX at that HEAD" in prompt
+    assert "This round is bound to that same HEAD: no commit moved" in prompt
     assert "R2-F1" in prompt and RESOLVED_OUTSIDE not in prompt
     assert "new cache design" in bodies[0]
     s = load_state(eng.paths.state_file)
     assert s.review_round == 3 and s.reviewed_head_sha == head
     assert s.prior_findings == [] and s.open_findings == [] and s.last_review_result == "clean"
+
+
+CARRIED = {
+    "id": "R3-F1",
+    "classification": "blocked",
+    "title": "cache entries never expire",
+    "location": "cache.py:1",
+    "required_resolution": "carried from R2-F1: give TTL_SECONDS a positive value",
+}
+
+
+def test_a_rereview_judges_the_bound_commit_not_a_blocked_fixers_uncommitted_edit(
+    tmp_state_dir,
+):
+    """PR #444 R1-F1 end to end. The PR head's cache.py holds the bug; the
+    fixer fixes it in the worktree, does not commit, and blocks. A re-review
+    then would have its reviewer, which reads and tests the worktree, clear
+    code the PR does not hold: `unblock --rereview` is refused, nothing
+    written and no reviewer launched, and the edit is left as it was. Once
+    the operator has moved the edit out, the re-review's reviewer reads the
+    reviewed commit's cache.py and raises the bug again."""
+    seen: list[str] = []
+
+    def reviewer(req):
+        text = (Path(req.cwd) / "cache.py").read_text("utf-8")
+        seen.append(text)
+        return block(review_result(3, head, [] if text == FIXED else [CARRIED]))
+
+    def half_fix(worktree):
+        (worktree / "cache.py").write_text(FIXED, "utf-8")
+
+    eng, gh, head = _in_fix_of_round_two(
+        tmp_state_dir, _blocked_fixer(half_fix), reviewer, files={"cache.py": BUGGY}
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    worktree = eng.agent_worktree_path()
+    assert git_out("-C", str(worktree), "status", "--porcelain") == "M cache.py"
+
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert not out.unblocked
+    assert "holds 1 uncommitted change(s) on the reviewed HEAD" in out.message
+    _assert_untouched(eng, raw)
+    assert len(eng.provider.calls) == 1  # the blocked fixer only
+    assert (worktree / "cache.py").read_text("utf-8") == FIXED
+
+    # The operator moves the edit out of the worktree (here: drops it).
+    git_out("-C", str(worktree), "checkout", "-q", "--", "cache.py")
+    out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    out = eng.step()
+    assert out.next_phase == "FIX", out.message
+    assert seen == [BUGGY]
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 3 and s.reviewed_head_sha == head
+    assert [f["id"] for f in s.open_findings] == ["R3-F1"] and s.prior_findings == []
+
+
+def test_a_push_after_unblock_rereview_is_named_in_the_review_prompt(tmp_state_dir):
+    """PR #444 R1-F3: someone pushes after `unblock --rereview` succeeded and
+    before REVIEW binds its revision. The round reviews the new HEAD, and its
+    prompt keeps the provenance (round 2's HEAD, where the operator gave up
+    the FIX) while saying the PR moved since and naming the HEAD it is bound
+    to: it never claims the HEAD did not move."""
+    prompts: list[str] = []
+
+    def reviewer(req):
+        prompts.append(req.prompt)
+        return block(review_result(3, pushed, []))
+
+    eng, gh, head = _in_fix_of_round_two(tmp_state_dir, _blocked_fixer(), reviewer)
+    assert eng.step().next_phase == "BLOCKED"
+    out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+
+    pushed = publish_pr_head(eng, parent=head, message="Tidy the cache (#2)")
+    gh.set_head(pushed)
+    out = eng.step()
+    assert out.next_phase == "READY_FOR_MERGE", out.message
+    [prompt] = prompts
+    assert f"Reviewed HEAD (bound by the controller): `{pushed}`" in prompt
+    assert f"Review round 2 at HEAD `{head}`" in prompt
+    assert "the operator gave up that round's FIX at that HEAD" in prompt
+    assert "The PR moved after that request" in prompt
+    assert f"it is bound to HEAD `{pushed}`, not `{head}`" in prompt
+    assert "This round is bound to that same HEAD: no commit moved" not in prompt
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 3 and s.reviewed_head_sha == pushed

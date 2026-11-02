@@ -230,29 +230,44 @@ class GitWorkspace:
         each path is uncommitted (#187). It is the operator's notion of
         uncommitted work, never an identity.
         """
-        res = self._git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-        out = res.stdout or ""
-        fields = out.split("\0")
-        entries: list[StatusEntry] = []
-        index = 0
-        while index < len(fields):
-            record = fields[index]
-            index += 1
-            if not record:
-                continue
-            if len(record) < 4:
-                raise VerificationError(f"cannot parse `git status` record {record!r}")
-            code, path, old = record[:2], record[3:], ""
-            if code[0] in "RC" or code[1] in "RC":
-                # A rename or a copy (`status.renames=copies`) is two
-                # NUL-separated fields: "<code> <new>\0<old>". Read as a
-                # record of its own, the source path would be cut into a
-                # made-up code and path.
-                if index < len(fields):
-                    old = fields[index]
-                    index += 1
-            entries.append(StatusEntry(code=code, path=path, orig_path=old))
-        return entries
+        res = self._git(["status", *STATUS_ARGS])
+        return parse_status(res.stdout or "")
+
+
+# The `git status` arguments behind every StatusEntry: NUL-separated v1
+# records, every untracked file listed (not only its directory).
+STATUS_ARGS: tuple[str, ...] = ("--porcelain=v1", "-z", "--untracked-files=all")
+
+
+def parse_status(out: str) -> list[StatusEntry]:
+    """The records of ``git status`` run with :data:`STATUS_ARGS`, in git's order.
+
+    Shared by :meth:`GitWorkspace.status_entries` and the agent worktree's
+    read through its admin dir (:func:`~autoforge.agent_worktree.uncommitted_entries`).
+    A record too short to hold a code and a path raises
+    :class:`~autoforge.errors.VerificationError`.
+    """
+    fields = out.split("\0")
+    entries: list[StatusEntry] = []
+    index = 0
+    while index < len(fields):
+        record = fields[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4:
+            raise VerificationError(f"cannot parse `git status` record {record!r}")
+        code, path, old = record[:2], record[3:], ""
+        if code[0] in "RC" or code[1] in "RC":
+            # A rename or a copy (`status.renames=copies`) is two
+            # NUL-separated fields: "<code> <new>\0<old>". Read as a
+            # record of its own, the source path would be cut into a
+            # made-up code and path.
+            if index < len(fields):
+                old = fields[index]
+                index += 1
+        entries.append(StatusEntry(code=code, path=path, orig_path=old))
+    return entries
 
 
 def uncommitted_paths(

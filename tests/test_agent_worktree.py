@@ -28,9 +28,11 @@ from autoforge.agent_worktree import (
     private_objects_problem,
     read_candidate,
     registered_worktree_roots,
+    uncommitted_entries,
 )
 from autoforge.errors import SandboxTamperError, VerificationError
 from autoforge.executor import ExecutionRequest, execute
+from autoforge.git_workspace import StatusEntry
 
 from .conftest import GIT_IDENT, watched_fifo
 
@@ -406,6 +408,69 @@ def test_a_head_naming_no_commit_reads_as_none(repo):
     (repo["admin"] / "HEAD").write_text("0" * 40 + "\n")
     candidate = read_candidate(repo["common"], repo["admin"], str(repo["worktree"]), None)
     assert candidate.head == "" and candidate.attached is False
+
+
+# ----------------------------------------------------- uncommitted changes (#428)
+
+
+def _uncommitted(repo, runner=None) -> list[StatusEntry]:
+    return uncommitted_entries(repo["common"], repo["admin"], str(repo["worktree"]), runner)
+
+
+def test_a_clean_worktree_lists_no_uncommitted_change(repo):
+    assert _uncommitted(repo) == []
+
+
+def test_each_uncommitted_change_is_listed_with_its_code(repo):
+    worktree = repo["worktree"]
+    (worktree / "a.txt").write_text("changed\n")
+    (worktree / "staged.txt").write_text("staged\n")
+    _git("-C", str(worktree), "add", "staged.txt")
+    (worktree / "sub").mkdir()
+    (worktree / "sub" / "draft.txt").write_text("draft\n")
+    assert _uncommitted(repo) == [
+        StatusEntry(" M", "a.txt"),
+        StatusEntry("A ", "staged.txt"),
+        StatusEntry("??", "sub/draft.txt"),
+    ]
+
+
+def test_the_uncommitted_read_follows_no_pointer_the_agent_can_write(repo):
+    """The status is the bound admin dir's and the common dir's: a `.git`
+    file or a `commondir` pointed at a clean decoy hides nothing (#428)."""
+    (repo["worktree"] / "a.txt").write_text("changed\n")
+    decoy = repo["base"] / "decoy"
+    _git("init", "-q", "-b", "main", str(decoy))
+    (repo["worktree"] / ".git").write_text(f"gitdir: {decoy / '.git'}\n")
+    (repo["admin"] / "commondir").write_text(f"{decoy / '.git'}\n")
+    seen: list[ExecutionRequest] = []
+    assert _uncommitted(repo, _recording(seen)) == [StatusEntry(" M", "a.txt")]
+    (request,) = seen
+    argv = request.command
+    assert argv[argv.index("--git-dir") + 1] == str(repo["admin"])
+    assert argv[argv.index("--work-tree") + 1] == str(repo["worktree"])
+    assert "--no-optional-locks" in argv and "--no-renames" in argv
+    assert request.env["GIT_COMMON_DIR"] == str(repo["common"])
+
+
+def test_a_change_staged_into_the_private_directory_is_listed_without_reading_it(repo):
+    """An enforced agent's `git add` writes its blob into the private object
+    directory only; with rename detection off, the read needs no blob."""
+    worktree = str(repo["worktree"])
+    shared = str(repo["common"] / "objects")
+    env = {
+        "GIT_OBJECT_DIRECTORY": str(repo["private"]),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": f'"{shared}"',
+    }
+    (repo["worktree"] / "b.txt").write_text("b\n")
+    _git("-C", worktree, "add", "b.txt", env=env)
+    assert _uncommitted(repo) == [StatusEntry("A ", "b.txt")]
+
+
+def test_an_unreadable_status_is_refused_never_taken_as_clean(repo):
+    (repo["admin"] / "index").write_bytes(b"not an index")
+    with pytest.raises(VerificationError, match="cannot read the uncommitted changes"):
+        _uncommitted(repo)
 
 
 # ------------------------------------------------------------ strict import
