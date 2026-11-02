@@ -602,9 +602,13 @@ release build; a commit SHA names one tree (#288).
 `tests/test_workflow_pins.py` fails when a `uses:` names a tag, a branch, a
 short SHA, a Docker image or a local action, when its comment is not a full
 release `vX.Y.Z`, when it is spelled in a form the check's line scan cannot
-read (flow style, a quoted key or value), and when two references to one
+read (flow style, a quoted key or value, the value on the next line, an
+anchor, a reference merged in by `<<`), and when two references to one
 action repository, in any of the workflows, name different commits or
-releases. A workflow whose steps are all `run` has nothing to pin and
+releases. YAML's own parse locates each job's and step's `uses` key, and
+only those lines are scanned, so a line of a multi-line `run: |` script
+that reads like a `uses:` (one writing a composite action, say) is no
+reference. A workflow whose steps are all `run` has nothing to pin and
 passes. No test can tell offline whether a SHA really is the release its
 comment names; that is what the update procedure is for.
 
