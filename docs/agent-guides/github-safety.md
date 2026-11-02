@@ -1181,7 +1181,9 @@ path, so no setting makes the controller post one (ADR 0004 D2.1a).
   identity, in place, whose title or body `gh` printed otherwise, or whose
   payload holds a `^` (which another text can print as), reads that object
   once more past `gh` (the exact read, below) and judges it there.
-  Equality stays byte for byte.
+  Equality stays byte for byte. An append's base (K3, K6), the EPIC body
+  the roadmap splice writes back and K10's `exact` evidence are judged on
+  GitHub's text the same way (#328).
 - **Records before writes.** A record (`src/autoforge/effects.py`) holds
   the kind, the identity, the exact target, the precondition, the payload,
   the attempt count, the stage and the observed result. It moves from
@@ -1311,7 +1313,7 @@ token is a conclusive `GitHubError`, and the phase blocks with nothing
 sent again. No message quotes the reply; an error reply is read only to
 tell a rate limit from a refusal.
 
-**When it runs, and what stays strict.** Only in a create's completion
+**When it runs, and what stays strict.** In a create's completion
 read-back (K2 implementation PR, K4 review comment, K5 follow-up issue,
 K7 replacement PR, K8 progress comment, K9 acceptance comment), and only
 when exactly one object carries the identity, every condition other than
@@ -1332,20 +1334,51 @@ conditions fail, which no sanitizer explains. A payload without a `^`
 whose object `gh` prints as it is takes no exact read and no extra request.
 The persisted payload is never changed to fit a read-back.
 
+**Text the controller writes back or verifies (#328).** Three more paths
+compose a write from a body, or judge an operator's comment by its body,
+and each would carry `gh`'s rewrite into GitHub or into a verdict:
+
+- K3 adoption and the K6 follow-up append write the whole body, the base
+  and a block. The engine composes the payload and its `base_sha256` from
+  the base, and `AdoptPrOp` and `FollowUpAppendOp` judge the precondition,
+  a rebase and the completion on the body (`effect_ops.held_pr`,
+  `held_issue`).
+- `UPDATE_EPIC` writes the whole EPIC body back around its roadmap
+  section. The entry's digests of the bytes outside the markers, the
+  splice and its read-back use the body (`engine._read_epic_bodies`).
+- K10's `exact` evidence is a comment equal to the payload byte for byte.
+  The one comment carrying the action's marker is judged on its body
+  (`OperatorCommentOp._held`), and so is the digest REVIEW's
+  `operator-evidence.md` compares with an `exact` observation.
+
+Each reads the object through `gh` first. The sanitizer never removes a
+`^`, so a print without one is GitHub's text and costs nothing more. A
+print with one is replaced by the object's exact read, whose every field
+then stands for the object (its state, repository and head too). A base
+holding `\u001b` text or a control character is therefore written back
+byte for byte. An operator comment holding a payload with escape text is
+`exact`, and one holding `\x03` where the payload says `^C` is a
+conflict. Two comments with one marker, a misplaced payload and an
+unreadable marker are conflicts without the read. A failed exact read is
+classified as above: unavailable propagates with nothing persisted or
+sent, and conclusive blocks (K10 keeps it on the record as a failed
+verification). The `bound` digest stays on `gh`'s print. It is taken from
+a print when the operator binds a comment and compared with later prints
+of that comment, so it is consistent, and moving it to the exact text
+would invalidate bindings already saved.
+
 **Terminal protection is not turned off.** Everything `gh` prints still
 goes through its sanitizer. The exact read's text is compared and then
 dropped: it is never printed, logged, put in a conflict reason or an
 error, or handed to an agent. The read context an agent gets is still
-`gh`'s sanitized read.
+`gh`'s sanitized read, and so are the roadmap section an `UPDATE_EPIC`
+prompt quotes and the comment body `operator-evidence.md` quotes. A body
+the controller writes back is the one exception by design: it goes to
+GitHub as GitHub held it.
 
-**Not covered yet.** The base an append is composed on (K3 adoption, K6
-follow-up append) and the EPIC roadmap edit read the body through `gh`, so
-a base holding escape text or a control character would be rewritten by
-the controller's own write; K10 evidence compares a comment `gh` printed.
-These are follow-up work (#328), not part of #327. So are the open
-points of the exact read itself (#329): how a 404 or a credential failure
-of the exact read is classified in K7, where any conclusive failure ends
-the replan, and a `doctor` row for it.
+**Not covered yet.** The open points of the exact read itself (#329): how
+a 404 or a credential failure of the exact read is classified in K7, where
+any conclusive failure ends the replan, and a `doctor` row for it.
 
 **Troubleshooting.** A create that blocks with *"… carries its identity
 but is not the object the controller intended (another body, title, head
@@ -1360,6 +1393,16 @@ nothing is written again. An exact read that keeps failing names its cause
 in the reason: `gh auth status` and `gh auth token --hostname github.com`
 must work for the user running AutoForge, and `api.github.com` must be
 reachable (the proxy variables apply, as they do to `gh`).
+
+Work an earlier version left part done on such a body (#328) finishes
+without writing `gh`'s rewrite. An append it planned on `gh`'s print is
+rebased onto GitHub's text before its first write, because the base's
+digest no longer matches. An append it had already sent, whose write
+never landed, is a conflict, never a second write of the rewritten body.
+An `UPDATE_EPIC` context whose digests it took from the print finds the
+bytes outside the markers changed: the section is voided and `resume` asks
+the agent for it again, with nothing written over the EPIC. An operator
+comment it could not verify is verified by `unblock`.
 
 ### Published content
 

@@ -1201,6 +1201,23 @@ a stated reason it has none. The coverage that must keep working:
   the #314 recovery (a conflict an earlier
   version recorded, `unblock`, `REVIEW`) launches no agent and writes and
   pushes nothing
+- text the controller writes back or verifies (#328, `tests/test_effects.py`,
+  `tests/test_engine.py`, `tests/test_operator_actions.py`): for K3 and K6
+  a base holding escape text, control characters or caret text is written
+  back byte for byte and observed on the exact read, a record planned on
+  `gh`'s print is rebased onto GitHub's text before its first write and is
+  a conflict once attempted, a crash after the write resumes without a
+  second one, a body holding the payload's caret notation is a conflict, an
+  exact read that fails saves and sends nothing, and a base `gh` prints as
+  it is makes the same requests as without the sanitizer; the engine plans
+  K3 and K6 on GitHub's text, and `UPDATE_EPIC` splices into it, leaving
+  the operator's text outside the markers byte for byte while the prompt
+  quotes `gh`'s print of the section; a K10 comment holding a payload with
+  escape text is `exact`, one holding control characters for caret text is
+  a conflict, two comments are a conflict without an exact read, a failed
+  exact read verifies nothing, a comment `gh` prints as it is takes no
+  exact read, and REVIEW's operator evidence reports such a comment
+  unchanged and a failed exact read as unreadable
 - the empty rollup and the plan limit (#289, `tests/test_engine.py`,
   `tests/test_github.py`, `tests/test_doctor.py`): in `READY_FOR_MERGE`
   and `MERGE` a rollup read and empty is `BLOCKED` with defaults, with

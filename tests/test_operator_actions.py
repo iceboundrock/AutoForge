@@ -228,6 +228,42 @@ def test_operator_actions_complete_from_exact_payloads_without_relaunching(tmp_s
     assert "verified, exact" in evidence and "has the observed digest" in evidence
 
 
+def test_an_exact_payload_gh_prints_otherwise_is_verified_and_reported_unchanged(tmp_state_dir):
+    """#328: a note holding the text of an escape, posted byte for byte, prints through
+    `gh` as caret notation. FIX verifies it as ``exact`` on its exact read, and REVIEW's
+    operator evidence reports it unchanged: the observed digest is GitHub's text's, and
+    so is the one compared with it. The body quoted to the reviewer is `gh`'s print."""
+    note = "Coordination note for #16: the log shows `\\u001b[0m` after each line."
+    gh = FakeGitHub()
+    gh.gh_sanitizes = True
+    seen: list[str] = []
+    ref: list = []
+    eng = _operating(
+        tmp_state_dir, gh, scripted(fixer(operator("R1-F1", (16, note))), _reviewer(seen, ref))
+    )
+    ref.append(eng)
+    assert eng.step().next_phase == "BLOCKED"
+    x16 = _k10(eng, T16).action_id
+    c16 = _post(gh, T16, 9016, payload(T16, note))
+    out = eng.unblock(REASON)
+    assert out.unblocked and out.phase == "FIX", out.message
+    assert f"{x16} is on {c16.url} (exact)" in out.message
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.effect_writes == []
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    [evidence] = seen
+    assert c16.url in evidence and "verified, exact" in evidence
+    assert "has the observed digest" in evidence and "changed since" not in evidence
+    assert "`\\^[[0m`" in evidence and "\\u001b" not in evidence
+    assert ("get_comment_exact", c16.url) in gh.calls
+    # An exact read that fails is reported as such, never as an unchanged comment.
+    gh.exact_read_error = GitHubError("exact read: GitHub answered HTTP 401")
+    failed = eng._read_operator_evidence()
+    assert "could not be read for this launch (GitHubError)" in failed
+    assert "has the observed digest" not in failed
+
+
 def test_a_plain_unblock_on_an_assertion_is_refused_byte_identical(tmp_state_dir):
     """A reason, a comment on the run's issue saying "done" and an unmarked
     comment on a target are never evidence: the unblock is refused, the

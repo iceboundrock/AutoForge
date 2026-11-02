@@ -5,8 +5,8 @@
   `UPDATE_EPIC` progress comment and the one protocol bump), #161
   (`ANALYZE_EXECUTE`), #162 (`REVIEW`), #163 (`FIX`), #164
   (`REPLAN_REEXECUTE`) and #165 (credential removal and the agent read
-  path). The amendments below, and D4.5a (#327), were each made by the
-  change that implements them.
+  path). The amendments below, and D4.5a (#327, extended by #328), were
+  each made by the change that implements them.
 - **Amended by #211:** effect kind K9 (the acceptance comment on the run's
   own issue), its authorization precondition (D5.6), the decline of an
   unsent acceptance action (D5.7), its D1.2 row and its own protocol bump
@@ -584,6 +584,12 @@ redirected) and judges the whole completion predicate on it, byte for
 byte. Two holders, or one whose other conditions fail, are decided as
 before, without it. An exact read that fails raises as an identity read
 does: nothing is persisted or sent, and a conclusive failure blocks.
+#328 applies the same read to text the controller writes back or verifies:
+an append's base (K3, K6), the EPIC body around the roadmap section, and
+the comment K10 judges as `exact` evidence. Each is read through `gh`
+first; where that print holds a `^`, the object's exact read replaces it,
+so a human's text outside the controller's block is written back byte for
+byte and an operator's comment is compared as GitHub holds it.
 [GitHub safety](../agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)
 has the boundary and its limits.
 

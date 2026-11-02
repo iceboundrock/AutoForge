@@ -206,6 +206,9 @@ from .effect_ops import (
     ReviewCommentOp,
     append_problem,
     drive,
+    gh_may_rewrite,
+    held_issue,
+    held_pr,
     operation_for,
     verify,
 )
@@ -215,6 +218,7 @@ from .effects import (
     ALLOWED_BY_ISSUE_BODY,
     AUTHORIZATION_OPERATOR,
     AUTHORIZATION_POLICY,
+    EVIDENCE_EXACT,
     FOLLOW_UP_SOURCE_ENTRY,
     MAX_BODY_CHARS,
     MAX_EFFECT_STATE_CHARS,
@@ -1624,14 +1628,17 @@ class ControllerEngine:
         # Set only by :meth:`_reconcile_update_epic_entry`; it makes the launch
         # a selection re-request, which never carries progress text.
         self._adopted_progress_comment_url = ""
-        # The EPIC body the UPDATE_EPIC entry read, split around its managed
-        # roadmap section (``None`` until the entry has read it: a plan or dry
-        # run renders a placeholder). The current section is handed to the
-        # agent as ``CURRENT_ROADMAP_SECTION``, and the completion context
-        # stores the digests of its outside bytes (D4.6), which the splice
-        # requires before it writes. Re-derived from GitHub before every
-        # launch, never persisted itself.
+        # The EPIC body the UPDATE_EPIC entry read, as GitHub holds it, split
+        # around its managed roadmap section (``None`` until the entry has
+        # read it: a plan or dry run renders a placeholder). The completion
+        # context stores the digests of its outside bytes (D4.6), which the
+        # splice requires before it writes. Re-derived from GitHub before
+        # every launch, never persisted itself.
         self._epic_roadmap_at_entry: RoadmapSplit | None = None
+        # The current section as `gh` printed it, handed to the agent as
+        # ``CURRENT_ROADMAP_SECTION``: an agent is shown `gh`'s sanitized
+        # read, never the exact read's text (#327, #328).
+        self._epic_section_shown: str | None = None
         # The follow-up issues already open for this PR from earlier rounds,
         # as (finding id, issue URL): found by the REVIEW and FIX entries and
         # rendered into ``EXISTING_FOLLOW_UP_ISSUES``, so a problem a fixer
@@ -3805,13 +3812,17 @@ class ControllerEngine:
         with the comment's current body, read fresh from its target's
         complete listing (each target read once), and whether its digest
         still equals the observed one. A comment that changed or is gone is
-        reported, never acted on.
+        reported, never acted on. The body quoted is `gh`'s print; ``exact``
+        evidence's digest is of GitHub's text, so where that print holds a
+        ``^`` the digest compared is the exact read's (#328), and a
+        ``bound`` digest, taken from a print, is compared with the print.
         """
         s = self._require_state()
         listings: dict[str, list[CommentInfo] | str] = {}
         entries: list[OperatorEvidence] = []
         for o in s.operator_comment_outcomes:
             current: str | None = None
+            digest = ""
             failed = ""
             if o["outcome"] == "verified":
                 target = o["target"]
@@ -3826,6 +3837,18 @@ class ControllerEngine:
                 else:
                     wanted = parse_comment_url(o["comment_url"]).comment_id
                     current = next((c.body for c in listing if c.id == wanted), None)
+                    digest = sha256_text(current) if current is not None else ""
+                    if (
+                        current is not None
+                        and o["evidence"] == EVIDENCE_EXACT
+                        and gh_may_rewrite(current)
+                    ):
+                        try:
+                            digest = sha256_text(
+                                self.github.get_comment_exact(o["comment_url"]).body
+                            )
+                        except GitHubError as exc:
+                            current, failed = None, type(exc).__name__
             entries.append(
                 OperatorEvidence(
                     action_id=o["action_id"],
@@ -3839,7 +3862,7 @@ class ControllerEngine:
                     body_sha256=o["body_sha256"],
                     reason=o["reason"],
                     current=current,
-                    current_sha256=sha256_text(current) if current is not None else "",
+                    current_sha256=digest,
                     unreadable=failed,
                 )
             )
@@ -4059,9 +4082,9 @@ class ControllerEngine:
         split = self._epic_roadmap_at_entry
         if split is None:
             return "(read from the EPIC body immediately before the agent runs)"
-        if split.section is None:
+        if split.section is None or self._epic_section_shown is None:
             return "(none: the EPIC has no managed section yet; the controller appends one)"
-        return fenced_untrusted_block(split.section, "markdown")
+        return fenced_untrusted_block(self._epic_section_shown, "markdown")
 
     def template_for(self, phase: Phase) -> str | None:
         """The prompt template of ``phase``."""
@@ -10924,6 +10947,7 @@ class ControllerEngine:
         state = self._require_state()
         self._adopted_progress_comment_url = ""
         self._epic_roadmap_at_entry = None
+        self._epic_section_shown = None
         context = self._update_epic_context()
         if context is not None:
             if not context.void:
@@ -11018,7 +11042,13 @@ class ControllerEngine:
         """Read the EPIC body before a launch; block on a conclusive failure."""
         state = self._require_state()
         try:
-            self._epic_roadmap_at_entry = self._read_epic_roadmap()
+            printed, held = self._read_epic_bodies()
+            self._epic_roadmap_at_entry = split_roadmap(held)
+            self._epic_section_shown = (
+                self._epic_roadmap_at_entry.section
+                if printed == held
+                else split_roadmap(printed).section
+            )
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -11066,10 +11096,26 @@ class ControllerEngine:
             "launched)",
         )
 
+    def _read_epic_bodies(self) -> tuple[str, str]:
+        """The EPIC body as `gh` printed it, and as GitHub holds it (#328).
+
+        The controller writes the whole body back around its section, so the
+        digests and the splice need GitHub's text: `gh` prints the text of an
+        escape, or a control character, in an operator's EPIC as caret
+        notation, which a write would put in their place. A print without a
+        ``^`` is GitHub's text (the same string twice, no extra request);
+        one with a ``^`` is read again exactly (``get_issue_exact``), and a
+        failure of that read is classified as the first one's.
+        """
+        state = self._require_state()
+        printed = self.github.get_issue(state.epic_url).body
+        if not gh_may_rewrite(printed):
+            return printed, printed
+        return printed, self.github.get_issue_exact(state.epic_url).body
+
     def _read_epic_roadmap(self) -> RoadmapSplit:
         """The EPIC body as GitHub holds it now, split around its managed section."""
-        state = self._require_state()
-        return split_roadmap(self.github.get_issue(state.epic_url).body)
+        return split_roadmap(self._read_epic_bodies()[1])
 
     # ======================================================================
     # REPLAN_REEXECUTE
@@ -12859,7 +12905,9 @@ class ControllerEngine:
                 )
             head = self._branch_head(branch)
             adopt, problem = self._analyze_branch_pr(branch, entry.default_branch)
-            adopt_body = self.github.get_pr(adopt.url).body if adopt is not None else ""
+            # The base the append keeps byte for byte: GitHub's text, never
+            # `gh`'s rewrite of it (#328).
+            adopt_body = held_pr(self.github, adopt.url).body if adopt is not None else ""
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -13956,7 +14004,8 @@ class ControllerEngine:
         try:
             watermark = self.github.latest_issue_number(state.repository) if new else 0
             for url, fids in appends.items():
-                issue = self.github.get_issue(url)
+                # The base the append keeps byte for byte (#328).
+                issue = held_issue(self.github, url)
                 deferred = ", ".join(fids)
                 if not issue.is_open or not parse_issue_url(issue.url or url).same_repository(
                     state.repository

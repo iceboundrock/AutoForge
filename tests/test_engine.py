@@ -1539,6 +1539,34 @@ def test_analyze_a_conflict_from_gh_s_rewritten_body_unblocks_into_review_withou
     assert data["phase"] == "REVIEW"
 
 
+# A body a human wrote on the branch's PR, holding the text of an escape and the control
+# characters themselves: `gh` prints both as caret notation (#328).
+HUMAN_ESCAPED_BODY = "Started by hand. The log shows `\\u001b[0m`; \x1b[1mbold\x1b[0m here."
+
+
+@pytest.mark.parametrize(
+    "body", ["Started by hand.", HUMAN_ESCAPED_BODY], ids=["plain", "gh-prints-otherwise"]
+)
+def test_analyze_adoption_keeps_the_prs_body_byte_for_byte_whatever_gh_prints(
+    tmp_state_dir, fake_github, body
+):
+    """#328: K3's base is the PR body GitHub holds, never `gh`'s rewrite of it, so the
+    one body write appends ``Closes #n`` and the marker after the human's text byte for
+    byte. A body `gh` prints with a ``^`` is read again exactly; one without costs no
+    exact read."""
+    fake_github.gh_sanitizes = True
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body=body)
+    out = _analyzed(eng)
+    assert out.next_phase == "REVIEW", out.message
+    expected = f"{body}\n\n{CLOSING}"
+    assert fake_github.prs[PR41].body == expected
+    assert fake_github.effect_writes == [("write_pr_body", PR41, expected)]
+    exact = [c for c in fake_github.calls if c[0].endswith("_exact")]
+    assert exact == ([] if body == "Started by hand." else [("get_pr_exact", PR41)] * 3)
+
+
 def test_analyze_branch_moved_after_the_plan_conflicts_and_unblock_completes_the_plan(
     tmp_state_dir, fake_github, monkeypatch
 ):
@@ -3626,6 +3654,36 @@ def test_fix_entry_hands_earlier_rounds_follow_ups_and_appends_the_marker(tmp_st
     assert gh.issues[ISSUE3].body == appended
     assert len(gh.issues) == 3  # EPIC, ISSUE, ISSUE3: no second follow-up issue
     assert eng.state.last_fix_resolutions[0]["follow_up_issue_url"] == ISSUE3
+
+
+@pytest.mark.parametrize(
+    "notes",
+    ["", "Seen in CI: `\\u001b[0m` after each line; \x1b[31mred\x1b[0m.\n\n"],
+    ids=["plain", "gh-prints-otherwise"],
+)
+def test_fix_append_keeps_the_handed_over_issues_body_byte_for_byte(tmp_state_dir, notes):
+    """#328: K6's base is the issue body GitHub holds, never `gh`'s rewrite of it, so
+    the marker is appended after the human's text byte for byte. A body `gh` prints with
+    a ``^`` is read again exactly; one without costs no exact read."""
+    gh = FakeGitHub()
+    gh.gh_sanitizes = True
+    earlier = notes + follow_up_issue_body("R1-F2")
+    gh.add_issue(ISSUE3, "deferred in round 1", body=earlier)
+    eng = _in_fix(
+        tmp_state_dir,
+        gh,
+        fixer(deferred_to("R2-F1", ISSUE3), commit=False),
+        findings=[_finding(2)],
+        origin=True,
+    )
+    eng.state.review_round = 2
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    appended = compose_append(earlier, render_follow_up_marker(PR, "R2-F1"))
+    assert gh.effect_writes == [("write_issue_body", ISSUE3, appended)]
+    assert gh.issues[ISSUE3].body == appended
+    exact = [c for c in gh.calls if c[0].endswith("_exact")]
+    assert exact == ([("get_issue_exact", ISSUE3)] * 3 if notes else [])
 
 
 def test_fix_two_findings_deferred_to_one_issue_append_once(tmp_state_dir):
@@ -9014,6 +9072,48 @@ def test_update_epic_prompt_says_when_the_epic_has_no_section_yet(tmp_state_dir,
     eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, _epic_body())
     assert eng.step().next_phase == "DONE"
     assert "(none: the EPIC has no managed section yet" in seen[0]
+
+
+def test_update_epic_keeps_operator_text_gh_prints_otherwise_byte_for_byte(
+    tmp_state_dir, fake_github
+):
+    """#328: the controller writes the whole EPIC body back around its section, so it
+    splices into the body GitHub holds: the operator's escape text and control
+    characters outside the markers are left byte for byte, never replaced by `gh`'s
+    caret notation. The agent is still shown the section as `gh` printed it."""
+    fake_github.gh_sanitizes = True
+    fake_github.add_issue(ISSUE3, "Next")
+    old = "old roadmap \x1b[2m(dim)\x1b[0m"
+    note = "\nOperator note: the log shows `\\u001b[0m`; \x1b[1mbold\x1b[0m.\n"
+    before = _epic_body(old, trailing=note)
+    seen = []
+
+    def agent(req):
+        seen.append(req.prompt)
+        return _epic_result(ISSUE3)
+
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, agent, before)
+    out = eng.step()
+    assert out.next_phase == "ANALYZE_EXECUTE" and "replaced the managed" in out.message
+    after = fake_github.issues[EPIC].body
+    assert after == before.replace(old, ROADMAP)
+    assert after.startswith(OPERATOR_BODY) and after.endswith(note)
+    assert fake_github.edited_issues == [(EPIC, after)]
+    assert ("get_issue_exact", EPIC) in fake_github.calls
+    (prompt,) = seen
+    assert "old roadmap ^[[2m(dim)^[[0m" in prompt and "\x1b" not in prompt
+    assert load_state(eng.paths.state_file).merged_since_epic_update == 0
+
+
+def test_update_epic_on_a_body_gh_prints_as_it_is_takes_no_exact_read(tmp_state_dir, fake_github):
+    """A body whose print holds no ``^`` is GitHub's text: no exact read, and the same
+    body written as without the sanitizer."""
+    fake_github.gh_sanitizes = True
+    eng = _in_update_epic_with_body(tmp_state_dir, fake_github, [_epic_result(None)], _epic_body())
+    assert eng.step().next_phase == "DONE"
+    written = f"{OPERATOR_BODY}\n{ROADMAP_START}\n{ROADMAP}\n{ROADMAP_END}\n"
+    assert fake_github.issues[EPIC].body == written
+    assert [c for c in fake_github.calls if c[0].endswith("_exact")] == []
 
 
 def test_update_epic_roadmap_not_due_keeps_the_counter_and_writes_nothing(
