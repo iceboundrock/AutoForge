@@ -37,9 +37,12 @@ descriptor-relative, links unfollowed, within its size bound
   torn file) is counted apart, never as a run: it may be one of the runs, or
   another;
 - a *launch* is one run log line of an agent or a controller-run command,
-  failed when it timed out, exited non-zero or recorded an error; a failed
-  agent launch's code comes from ``timed_out``, ``ended_by`` and
-  ``exit_code``, and is ``unknown`` when only the error text says more;
+  told apart by the producer it names (an agent's provider and profile, a
+  controller command's ``(controller ...)`` profile), never by a limit, and
+  of kind ``unknown`` when its producer cannot be established; it failed
+  when it timed out, exited non-zero or recorded an error; a failed agent
+  launch's code comes from ``timed_out``, ``ended_by`` and ``exit_code``,
+  and is ``unknown`` when only the error text says more;
 - an *operator action* is one run log line of an operator's ``unblock``
   (applied or refused) or accepted configuration change. It is no launch.
   Each applied ``unblock`` ended one BLOCKED episode, which needed a human
@@ -122,6 +125,10 @@ LIMITATIONS = (
     "block_reason or error text is read",
     "a failed agent launch that exited 0 (a malformed result, a failed verification, a "
     "refused run log) has no typed cause in the journal: 'unknown'",
+    "a launch is an agent's or a controller command's by the producer its line names (an "
+    "agent's provider and profile, a '(controller ...)' profile), never by a limit, which "
+    "agent lines also carried before #193; a line that names neither, or both, is kind "
+    "'unknown'",
     "a run is a run id: one whose state is gone (a new standalone run replaced it) or does "
     "not load counts as 'undecidable', and its run log is still counted",
     "a state file that does not load and names no readable run id is counted apart, never "
@@ -314,10 +321,10 @@ _FIELD_TYPES: dict[str, tuple[type, ...]] = {
     "run_id": (str,),
     "phase": (str,),
     "profile": (str,),
+    "provider": (str,),
     "error": (str,),
     "ended_by": (str,),
     "timed_out": (bool,),
-    "timeout_seconds": (int,),
     "exit_code": (int, type(None)),
     "metadata": (dict,),
 }
@@ -333,7 +340,7 @@ def well_typed(record: dict) -> bool:
             return False
         if not isinstance(value, kinds):
             return False
-    return record.get("timeout_seconds", 0) >= 0
+    return True
 
 
 def operator_kind(record: dict) -> str | None:
@@ -351,11 +358,30 @@ def operator_kind(record: dict) -> str | None:
     return "other"
 
 
+# The profile every controller-run command's record names: a validation or
+# pre-merge verification command, in every engine that wrote a run log.
+CONTROLLER_PROFILE_PREFIX = "(controller "
+
+
 def launch_kind(record: dict) -> str:
-    """``agent`` or ``command``: from a well-typed record's typed fields."""
-    if record.get("profile", "").startswith("(controller") or record.get("timeout_seconds", 0) > 0:
+    """``agent``, ``command`` or ``unknown``: from the record's producer identity.
+
+    Every engine that wrote a run log named an agent launch's provider (the
+    profile's, which the configuration requires) and its profile's name,
+    and named a controller-run command by a ``(controller ...)`` profile
+    and no provider. ``timeout_seconds`` says neither: an agent's record
+    carried its wall-clock limit there until #193. A record that names both,
+    or neither (one of another producer, such as a record with a ``(...;
+    no agent)`` profile no operator action has), is ``unknown``, never
+    guessed.
+    """
+    profile, provider = record.get("profile", ""), record.get("provider", "")
+    controller = profile.startswith(CONTROLLER_PROFILE_PREFIX)
+    if provider and profile and not controller:
+        return "agent"
+    if controller and not provider:
         return "command"
-    return "agent"
+    return "unknown"
 
 
 def failed(record: dict) -> bool:

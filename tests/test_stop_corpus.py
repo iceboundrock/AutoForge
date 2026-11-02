@@ -71,7 +71,98 @@ def _journal(state_dir: Path, run_id: str, records: list, extra: bytes = b"") ->
 
 
 def _agent(run_id: str, seq: int = 1, **kw) -> ExecutionRecord:
-    return ExecutionRecord(run_id=run_id, seq=seq, phase="ANALYZE_EXECUTE", profile="p", **kw)
+    """An agent launch's record as the engine writes it: its profile and provider."""
+    return ExecutionRecord(
+        run_id=run_id, seq=seq, phase="ANALYZE_EXECUTE", profile="p", provider="claude", **kw
+    )
+
+
+def _command(run_id: str, **kw) -> ExecutionRecord:
+    """A controller-run command's record as the engine writes it: no provider."""
+    return ExecutionRecord(
+        run_id=run_id,
+        seq=0,
+        phase="REVIEW-candidate-validation",
+        profile="(controller candidate validation command)",
+        timeout_seconds=60,
+        **kw,
+    )
+
+
+# Every field of a run log line before #193 (``ExecutionRecord`` at d709618^,
+# serialized whole with ``json.dumps(asdict(record), sort_keys=True)``): an
+# agent's record carried its wall-clock limit in ``timeout_seconds`` then, as
+# a controller command's did, and named no ``ended_by``.
+_LEGACY_RECORD: dict[str, object] = {
+    "attempt": 1,
+    "capture_abandoned": False,
+    "command": [],
+    "correction": False,
+    "cwd": "",
+    "descendants_killed": False,
+    "dry_run": False,
+    "effort": "",
+    "error": "",
+    "exit_code": 0,
+    "finished_at": "2026-07-01T00:30:00+00:00",
+    "group_survived_kill": False,
+    "issue_url": ISSUE,
+    "log_dir": "",
+    "metadata": {},
+    "model": "",
+    "orphan_survived_kill": False,
+    "orphans_killed": False,
+    "orphans_unchecked": False,
+    "parsed_result": None,
+    "phase": "",
+    "pr_url": "",
+    "profile": "",
+    "prompt_version": "v1",
+    "provider": "",
+    "provider_summary": {},
+    "review_round": 0,
+    "run_id": "",
+    "seq": 0,
+    "started_at": "2026-07-01T00:00:00+00:00",
+    "stderr_truncated": False,
+    "stdout_truncated": False,
+    "timed_out": False,
+    "timeout_seconds": 0,
+}
+
+
+def _legacy(run_id: str, seq: int, **kw) -> dict[str, object]:
+    record = {**_LEGACY_RECORD, "run_id": run_id, "seq": seq, **kw}
+    assert set(record) == set(_LEGACY_RECORD), "a legacy line has the legacy fields only"
+    return record
+
+
+def _legacy_agent(run_id: str, seq: int, **kw) -> dict[str, object]:
+    """A pre-#193 agent launch: its profile and provider, and its limit in timeout_seconds."""
+    return _legacy(
+        run_id,
+        seq,
+        phase="REVIEW",
+        profile="reviewer",
+        provider="claude",
+        model="opus",
+        command=["claude", "-p", "<prompt>"],
+        timeout_seconds=1800,
+        **kw,
+    )
+
+
+def _legacy_command(run_id: str, seq: int, profile: str, phase: str, **kw) -> dict[str, object]:
+    """A pre-#193 controller-run command: a ``(controller ...)`` profile and no provider."""
+    return _legacy(
+        run_id,
+        seq,
+        phase=phase,
+        profile=profile,
+        command=["make", "check"],
+        timeout_seconds=600,
+        **kw,
+    )
 
 
 def _unblock(run_id: str, applied: bool) -> ExecutionRecord:
@@ -118,15 +209,7 @@ def _corpus(root: Path) -> dict[str, Path]:
             _agent(run_id, 2, exit_code=1, error="exited 1"),
             _agent(run_id, 3, error="no CONTROL_RESULT"),  # exit 0: no typed cause
             _agent(run_id, 4),
-            ExecutionRecord(
-                run_id=run_id,
-                seq=0,
-                phase="REVIEW",
-                timeout_seconds=60,
-                exit_code=2,
-                error="exit 2",
-                profile="validation",
-            ),
+            _command(run_id, exit_code=2, error="exit 2"),
             _config_change(run_id),
             _unblock(run_id, applied=True),
             _unblock(run_id, applied=False),
@@ -138,10 +221,10 @@ def _corpus(root: Path) -> dict[str, Path]:
     _journal(ready, state.run_id, [_agent(state.run_id)])
     dirs["ready"] = ready
     # Mid-workflow, its journal torn by a crash, holding another run's line and
-    # one whose timeout is no number.
+    # one whose exit code is no number.
     running, state = _run(root, "running", Phase.REVIEW)
     bad = asdict(_agent(state.run_id, 2))
-    bad["timeout_seconds"] = "60"
+    bad["exit_code"] = "1"
     _journal(
         running,
         state.run_id,
@@ -387,12 +470,70 @@ def test_a_run_log_past_its_bound_is_never_held(tmp_path, monkeypatch):
     assert _report(_summary(tmp_path), "big")["journal"] == "too-large"
 
 
+def test_a_legacy_agent_launch_is_an_agent_whatever_its_timeout_seconds(tmp_path):
+    """R2-F2: before #193 an agent's record carried its wall-clock limit in
+    ``timeout_seconds``, as a controller command's did. The kind comes from
+    the producer the record names (an agent's provider and profile, a
+    ``(controller ...)`` profile), so a legacy agent timeout is still
+    ``agent:execution-timeout``; a record whose producer cannot be
+    established is ``unknown``, never an agent or a command by default."""
+    state_dir, state = _run(tmp_path, "legacy", Phase.REVIEW)
+    run_id = state.run_id
+    _journal(
+        state_dir,
+        run_id,
+        [
+            _legacy_agent(run_id, 1, timed_out=True, exit_code=-9, error="timed out after 1800s"),
+            _legacy_agent(run_id, 2, exit_code=1, error="exit 1"),
+            _legacy_agent(run_id, 3),
+            _legacy_command(
+                run_id,
+                0,
+                "(controller validation command)",
+                "REVIEW-validation",
+                exit_code=1,
+                error="exit 1",
+            ),
+            _legacy_command(
+                run_id,
+                0,
+                "(controller pre-merge verification command)",
+                "MERGE-premerge-verification",
+                timed_out=True,
+                error="timed out after 600s",
+            ),
+            # Another producer: a record no operator action has, with no agent.
+            _legacy(
+                run_id,
+                0,
+                phase="INITIALIZING-epic-binding",
+                profile="(EPIC binding at run creation; no agent)",
+            ),
+            # Producer identities that contradict each other, or are missing.
+            _legacy(run_id, 4, phase="REVIEW", profile="(controller x)", provider="claude"),
+            _legacy(run_id, 5, phase="REVIEW", timeout_seconds=1800, exit_code=1, error="x"),
+        ],
+    )
+    report = _report(_summary(tmp_path), "legacy")
+    assert report["launches"] == {"agent": 3, "command": 2, "unknown": 3}
+    assert report["failed_launches"] == {
+        "agent:execution-timeout": 1,
+        "agent:execution-failed": 1,
+        "command:unknown": 2,
+        "unknown:unknown": 1,
+    }
+    assert report["malformed_lines"] == 0 and report["operator_actions"] == {}
+    for record in ({"provider": "claude", "profile": "p"}, {"provider": "pi", "profile": "x"}):
+        assert stop_corpus.launch_kind(record) == "agent"
+    assert stop_corpus.launch_kind({"profile": "(controller validation command)"}) == "command"
+    assert stop_corpus.launch_kind({"timeout_seconds": 60, "provider": "claude"}) == "unknown"
+
+
 @pytest.mark.parametrize(
     "field, value",
     [
-        ("timeout_seconds", "60"),
-        ("timeout_seconds", -1),
-        ("timeout_seconds", True),
+        ("provider", 1),
+        ("provider", None),
         ("exit_code", "1"),
         ("exit_code", 1.5),
         ("timed_out", "yes"),

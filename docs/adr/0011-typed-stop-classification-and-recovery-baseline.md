@@ -253,8 +253,14 @@ uv run python -m tests.stop_corpus [--json] PATH [PATH ...]
    state is gone, which classifies `unknown`, its run log still counted. A
    state file that does not load and names no run id that can be read is
    counted apart, never as a run, since it may be one of the runs counted.
-   A *launch* is one run log line of an agent or a controller-run command;
-   a failed agent launch's code comes from `timed_out`, `ended_by` and
+   A *launch* is one run log line of an agent or a controller-run command,
+   told apart by the producer the line names: an agent's provider and
+   profile, a controller command's `(controller ...)` profile and no
+   provider. A limit says neither (an agent's line carried its wall-clock
+   limit in `timeout_seconds` until #193), and a line that names neither
+   producer, or both, is a launch of kind `unknown`
+   (`test_a_legacy_agent_launch_is_an_agent_whatever_its_timeout_seconds`).
+   A failed agent launch's code comes from `timed_out`, `ended_by` and
    `exit_code`. An *operator action* is one run log line of an `unblock`
    (applied or refused) or of an accepted configuration change, and is no
    launch. Each unit is counted in its own denominator and never summed with
@@ -263,6 +269,7 @@ uv run python -m tests.stop_corpus [--json] PATH [PATH ...]
 4. **What it cannot say**, printed with every summary: no persisted code
    (D5), so a saved `BLOCKED` or `FAILED` is `unknown`; a failed launch that
    exited 0 (a malformed result, a failed verification) has no typed cause;
+   a launch whose line names no producer it recognizes is kind `unknown`;
    a run with no state that loads is `undecidable`; a state that names no
    run is counted apart; a moved, deleted, torn, oversized or irregular run
    log, or one with a foreign or malformed line, leaves its run flagged
