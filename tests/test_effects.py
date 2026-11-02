@@ -54,6 +54,7 @@ from autoforge.effect_ops import (
     ReplacementPrOp,
     ReviewCommentOp,
     drive,
+    gh_prints_as,
     operation_for,
     raise_conflict,
     verify,
@@ -2846,6 +2847,222 @@ def test_a_hostile_remote_text_is_compared_and_never_quoted(case):
             assert fragment not in text
 
 
+# -- one version on both reads: `gh`'s print and the exact text (#328) -------------------
+
+# Texts `gh` prints otherwise: escape text after one and two backslashes, C0 and C1
+# control characters (0x1C as ``^\\``), a backspace and form feed, and caret text.
+PRINTED_OTHERWISE = [
+    "the log shows `\\u001b[0m`; `\\\\U001B` too",
+    "a real \x1b[1mESC\x1b[0m, \x9b31m, \x1c and \x00",
+    "a backspace \x08 and a form feed \x0c",
+    "stop the watcher with ^C, or \x03",
+]
+
+
+@pytest.mark.parametrize("text", PRINTED_OTHERWISE)
+def test_gh_prints_as_accepts_gh_s_print_of_the_text(text):
+    """A print of ``text``, and ``text`` itself, are one version: every difference is
+    one of the sanitizer's rewrites. So is a print that rewrote only some of them, as
+    `gh` does a backspace GitHub sends as a short escape."""
+    printed = gh_sanitized(text)
+    assert gh_prints_as(text, printed)
+    assert gh_prints_as(text, text)
+    assert gh_prints_as(text, printed.replace("^H", "\x08").replace("^L", "\x0c"))
+
+
+@pytest.mark.parametrize("text", PRINTED_OTHERWISE)
+def test_gh_prints_as_refuses_the_print_of_another_version(text):
+    """A print of an edited text is not ``text``'s, wherever the edit is: before,
+    between or inside rewrites, or a character added or dropped at the end."""
+    middle = len(text) // 2
+    edits = [
+        "edited: " + text,
+        text[:middle] + "#" + text[middle + 1 :],
+        text + ".",
+        text[:-1],
+        text.replace("^", "~").replace("\x1b", "\x1d").replace("u001", "u002"),
+    ]
+    for edited in (e for e in edits if e != text):
+        assert not gh_prints_as(text, gh_sanitized(edited)), edited
+    assert not gh_prints_as(text, "")
+    assert not gh_prints_as("", gh_sanitized(text))
+
+
+def test_gh_prints_as_reads_a_rewrite_only_where_the_sanitizer_makes_one():
+    """A caret stands for a control character or the text of its escape after a
+    backslash, never for plain text: ``u001b`` without a backslash, a tab, an escape of
+    a printable character and DEL print as they are."""
+    assert gh_prints_as("\\u001b", "\\^[")
+    assert not gh_prints_as("u001b", "^[")
+    assert not gh_prints_as("\\u0041", "\\^A")
+    assert not gh_prints_as("\\u001", "\\^[")
+    assert not gh_prints_as("\t", "^I") and not gh_prints_as("\x7f", "^?")
+    assert not gh_prints_as("\x1b", "^\\") and not gh_prints_as("\x1c", "^[")
+
+
+# -- `gh`'s sanitizer and an append's base (#328) --------------------------------------
+
+# Bases a human wrote that `gh` prints otherwise or alike another text: the text of an
+# escape (printed `\^[`), the control characters themselves (printed `^[`), and caret
+# text, which `gh` prints as it is and which the control character also prints as.
+ESCAPED_BASES = [
+    pytest.param("A human's notes: the log shows `\\u001b[0m` after each line.", id="escape"),
+    pytest.param("A human pasted a log line: \x1b[31mFAIL\x1b[0m (\x03 to stop).", id="control"),
+    pytest.param("A human's notes: stop the watcher with ^C.", id="caret"),
+]
+# The bases `gh` prints otherwise: an earlier version planned on that print.
+REWRITTEN_BASES = ESCAPED_BASES[:2]
+by_append_case = pytest.mark.parametrize("case", APPEND_CASES, ids=repr)
+
+
+def append_target(record: EffectRecord) -> str:
+    return str(record.target.get("pr_url") or record.target["issue_url"])
+
+
+def planned_on(case: Case, base: str) -> EffectRecord:
+    """``case``'s record planned on ``base``, as the engine plans it."""
+    return adopt_record(base) if case is K3 else append_record(base=base)
+
+
+def base_world(case: Case, base: str) -> tuple[FakeGitHub, EffectRecord]:
+    """``case``'s target holding ``base`` on GitHub, `gh` sanitizing, the record planned on
+    GitHub's text."""
+    fake, _ = world_of(case)
+    fake.gh_sanitizes = True
+    case.edit_target(fake, base)
+    return fake, planned_on(case, base)
+
+
+@pytest.mark.parametrize("base", ESCAPED_BASES)
+@by_append_case
+def test_an_append_leaves_a_base_gh_prints_otherwise_byte_for_byte(case, base):
+    """#328: the base is read past `gh`'s sanitizer, so the precondition holds on
+    GitHub's text, the one write carries the human's base byte for byte, and its
+    read-back is judged on the exact read too: observed, no caret notation written."""
+    fake, record = base_world(case, base)
+    url = append_target(record)
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.ATTEMPTED, 1, 0), (Stage.OBSERVED, 1, 1)]
+    assert [w[2] for w in fake.effect_writes] == [compose_append(base, record.payload["block"])]
+    assert fake_body(fake, url) == record.body and fake_body(fake, url).startswith(base)
+    assert driven.record.payload == record.payload
+    assert exact_reads(fake) == [url, url]  # the reconciliation and the read-back
+
+
+@pytest.mark.parametrize("base", REWRITTEN_BASES)
+@by_append_case
+def test_an_intended_append_planned_on_gh_s_print_is_rebased_onto_github_s_text(case, base):
+    """A record an earlier version planned on `gh`'s print of the base: its digest is
+    not GitHub's text, so before its first issue it is rebased (D5.5) onto the base as
+    GitHub holds it, saved with that base's digest, and the human's text is kept."""
+    fake, _ = base_world(case, base)
+    record = planned_on(case, gh_sanitized(base))
+    assert record.body != compose_append(base, record.payload["block"])
+    saves = saves_for(fake)
+    driven = drive(record, operation_for(record, fake), saves)
+
+    assert saves.stages == [(Stage.ATTEMPTED, 1, 0), (Stage.OBSERVED, 1, 1)]
+    rebased = saves.log[0][0]
+    assert rebased.precondition["base_sha256"] == sha256_text(base)
+    assert rebased.body == compose_append(base, record.payload["block"])
+    assert fake_body(fake, append_target(record)) == rebased.body
+    assert driven.record.body == rebased.body
+
+
+@pytest.mark.parametrize("base", REWRITTEN_BASES)
+@by_append_case
+def test_an_attempted_append_planned_on_gh_s_print_is_never_sent_again(case, base):
+    """An earlier version planned on `gh`'s print and sent the write, which never
+    landed: GitHub still holds the human's base. That body is neither the payload nor
+    the recorded base on the exact read, so the record is a conflict, never a second
+    write of the rewritten body."""
+    fake, _ = base_world(case, base)
+    attempted = planned_on(case, gh_sanitized(base)).attempting()
+    saves = saves_for(fake)
+    driven = drive(attempted, operation_for(attempted, fake), saves)
+
+    assert saves.stages == [(Stage.CONFLICT, 1, 0)]
+    assert "equals neither the payload nor its base" in driven.record.reason
+    assert fake.effect_writes == [] and fake_body(fake, append_target(attempted)) == base
+
+
+@pytest.mark.parametrize("base", ESCAPED_BASES)
+@by_append_case
+def test_a_crash_after_an_append_on_an_escaped_base_resumes_without_a_second_write(case, base):
+    """The write lands and the process dies before the observed save. The next entry
+    reads the attempted record's target exactly and observes it: one write in all."""
+    fake, record = base_world(case, base)
+    op = operation_for(record, fake)
+    crashing = saves_for(fake, crash_on=Stage.OBSERVED)
+    with pytest.raises(Crash):
+        drive(record, op, crashing)
+    persisted = crashing.last
+    assert (persisted.stage, persisted.attempts) == (Stage.ATTEMPTED, 1)
+
+    saves = saves_for(fake)
+    driven = drive(persisted, op, saves)
+    assert saves.stages == [(Stage.OBSERVED, 1, 1)]
+    assert not driven.issued and len(fake.effect_writes) == 1
+    assert fake_body(fake, append_target(record)) == record.body
+
+
+@by_append_case
+def test_an_append_target_holding_its_payload_in_caret_notation_is_a_conflict(case):
+    """Equality stays byte for byte: after an issue, a body holding `\\^[` where the
+    payload holds the text of the escape is what `gh` prints for the payload, yet it is
+    neither the payload nor its base on the exact read. A conflict, never a second
+    write."""
+    base = "A human's notes: the log shows `\\u001b[0m` after each line."
+    fake, record = base_world(case, base)
+    url = append_target(record)
+    case.edit_target(fake, gh_sanitized(record.body))
+    attempted = record.attempting()
+    saves = saves_for(fake)
+    driven = drive(attempted, operation_for(attempted, fake), saves)
+
+    assert saves.stages == [(Stage.CONFLICT, 1, 0)]
+    assert "equals neither the payload nor its base" in driven.record.reason
+    assert fake.effect_writes == [] and exact_reads(fake) == [url]
+
+
+@pytest.mark.parametrize("error", EXACT_READ_FAILURES)
+@pytest.mark.parametrize("attempted", [False, True], ids=["intended", "attempted"])
+@by_append_case
+def test_an_append_whose_exact_read_fails_decides_nothing_and_sends_nothing(case, attempted, error):
+    """A base that could not be read exactly is never written over: the failure raises
+    as an identity read's own does (unavailable: 'resume' reads again; conclusive: the
+    caller blocks), nothing is saved or sent, and an attempted record keeps its
+    attempt."""
+    fake, record = base_world(case, ESCAPED_BASES[0].values[0])
+    fake.exact_read_error = error
+    start = record.attempting() if attempted else record
+    saves = saves_for(fake)
+    with pytest.raises(GitHubError) as info:
+        drive(start, operation_for(start, fake), saves)
+
+    assert info.value is error
+    assert saves.log == [] and fake.effect_writes == []
+    assert exact_reads(fake) == [append_target(record)]
+
+
+@by_append_case
+def test_an_append_on_a_base_gh_prints_as_it_is_takes_no_exact_read(case):
+    """The common case is unchanged: a base without a ``^`` in `gh`'s print is GitHub's
+    text, so the append makes the same requests with the sanitizer as without it, and
+    no exact read."""
+    calls = []
+    for sanitizes in (False, True):
+        fake, record = world_of(case)
+        fake.gh_sanitizes = sanitizes
+        driven = drive(record, operation_for(record, fake), saves_for(fake))
+        assert driven.record.stage is Stage.OBSERVED and driven.issued
+        assert exact_reads(fake) == []
+        calls.append(fake.calls)
+    assert calls[0] == calls[1]
+
+
 # -- complete comment listings behind the real client (K4, K8) -------------------------
 
 
@@ -5522,6 +5739,97 @@ def test_a_target_or_listing_that_cannot_be_read_now_raises_with_nothing_saved(f
     assert saves.log == [] and fake.effect_writes == []
 
 
+# -- K10: exact evidence on GitHub's text (#328) --------------------------------------------
+
+
+def k10_world(text: str) -> tuple[FakeGitHub, EffectRecord]:
+    """One K10 on ISSUE3 whose payload holds ``text``, `gh` sanitizing."""
+    fake = FakeGitHub()
+    fake.add_issue(ISSUE3, "A related issue")
+    fake.gh_sanitizes = True
+    return fake, operator_record(text=f"{OPERATOR_TEXT} {text}")
+
+
+def test_an_operator_comment_holding_a_payload_with_escape_text_is_exact_evidence():
+    """#328: the operator posts the payload byte for byte and `gh` prints its escape
+    text as caret notation. The one comment with the marker is read again exactly and
+    observed as ``exact``, its digest the payload's: no false conflict."""
+    fake, record = k10_world(ESCAPE_TEXT)
+    url = fake.add_comment(ISSUE3, 300, record.body).url
+    assert gh_sanitized(record.body) != record.body
+    saves = saves_for(fake)
+    driven = verify(record, OperatorCommentOp(fake, plan=[record]), saves)
+
+    assert driven.record.observed == exact_evidence(record)
+    assert saves.stages == [(Stage.OBSERVED, 0, 0)]
+    assert exact_reads(fake) == [url] and fake.effect_writes == []
+
+
+def test_an_operator_comment_holding_control_characters_for_caret_text_is_not_exact():
+    """A payload holding caret text (``^C``) prints exactly as a comment holding the
+    control character (``\\x03``) does. The exact read tells them apart: a conflict
+    naming the comment, never ``exact`` evidence."""
+    fake, record = k10_world(CARET_TEXT)
+    held = record.body.replace("^C", "\x03").replace("^[", "\x1b")
+    url = fake.add_comment(ISSUE3, 300, held).url
+    assert gh_sanitized(held) == record.body  # `gh` cannot tell them apart
+    saves = saves_for(fake)
+    driven = verify(record, OperatorCommentOp(fake, plan=[record]), saves)
+
+    assert saves.stages == [(Stage.CONFLICT, 0, 0)]
+    assert f"{url} carries its marker but its body is not the prepared" in driven.record.reason
+    assert exact_reads(fake) == [url]
+
+
+def test_an_operator_comment_holding_its_caret_payload_byte_for_byte_is_exact_evidence():
+    fake, record = k10_world(CARET_TEXT)
+    url = fake.add_comment(ISSUE3, 300, record.body).url
+    driven = verify(record, OperatorCommentOp(fake, plan=[record]), saves_for(fake))
+    assert driven.record.observed == exact_evidence(record)
+    assert exact_reads(fake) == [url]
+
+
+def test_an_operator_comment_gh_prints_as_it_is_takes_no_exact_read():
+    """A comment whose print holds no ``^`` is GitHub's text: the verification makes
+    the same requests with the sanitizer as without it, and no exact read."""
+    calls = []
+    for sanitizes in (False, True):
+        fake, plan = operator_world()
+        fake.gh_sanitizes = sanitizes
+        record = plan[0]
+        fake.add_comment(ISSUE3, 300, record.body)
+        driven = verify(record, OperatorCommentOp(fake, plan=plan), saves_for(fake))
+        assert driven.record.observed == exact_evidence(record)
+        assert exact_reads(fake) == []
+        calls.append(fake.calls)
+    assert calls[0] == calls[1]
+
+
+def test_two_operator_comments_with_one_marker_are_a_conflict_without_an_exact_read():
+    fake, record = k10_world(ESCAPE_TEXT)
+    fake.add_comment(ISSUE3, 300, record.body)
+    fake.add_comment(ISSUE3, 301, record.body)
+    driven = verify(record, OperatorCommentOp(fake, plan=[record]), saves_for(fake))
+    assert driven.record.stage is Stage.CONFLICT and "2 comments carry its marker" in (
+        driven.record.reason
+    )
+    assert exact_reads(fake) == []
+
+
+@pytest.mark.parametrize("error", EXACT_READ_FAILURES)
+def test_an_operator_comment_whose_exact_read_fails_is_never_verified(error):
+    """A comment that could not be read exactly is neither evidence nor a conflict: the
+    failure raises as the listing's own does, and nothing is saved."""
+    fake, record = k10_world(ESCAPE_TEXT)
+    url = fake.add_comment(ISSUE3, 300, record.body).url
+    fake.exact_read_error = error
+    saves = saves_for(fake)
+    with pytest.raises(GitHubError) as info:
+        verify(record, OperatorCommentOp(fake, plan=[record]), saves)
+    assert info.value is error and saves.log == []
+    assert exact_reads(fake) == [url]
+
+
 # -- K10: the operation behind the real client ---------------------------------------------
 
 
@@ -5590,3 +5898,20 @@ def test_a_target_github_answers_with_another_object_is_held_through_the_real_cl
     assert driven.record == record.diagnosed(driven.held) and saves == [driven.record]
     assert f"issue {ISSUE3} {says}" in driven.held
     assert (conversation.views, conversation.pages_read) == (1, 0)
+
+
+def test_an_operator_comment_gh_prints_otherwise_is_verified_through_the_real_client():
+    """#328 behind the real client: `gh` prints the target's page with the payload's
+    escape text as caret notation; the one exact GET of that comment returns it byte for
+    byte, and the record is observed as ``exact``."""
+    record = operator_record(text=f"{OPERATOR_TEXT} {ESCAPE_TEXT}")
+    conversation = IssueConversation(ISSUE3, FILLER)
+    conversation.sanitize = True
+    landed = conversation.add(record.body)
+    github = GitHubClient(runner=conversation, retry_delay_seconds=0, https=conversation.exact)
+    saves: list[EffectRecord] = []
+    driven = verify(record, OperatorCommentOp(github, plan=[record]), count_saves(saves))
+    assert driven.record.observed == {**exact_evidence(record, 5150), "url": landed}
+    assert [r.stage for r in saves] == [Stage.OBSERVED]
+    (request,) = conversation.exact_requests
+    assert request.url == "https://api.github.com/repos/owner/repo/issues/comments/5150"

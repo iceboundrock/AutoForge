@@ -321,6 +321,16 @@ def test_an_unreadable_target_names_the_error_type_only():
     assert "is gone" not in text and "untrusted\n" not in text
 
 
+def test_a_comment_that_changed_while_it_was_read_is_reported_without_a_body_or_digest():
+    """R1-F2 of PR #445: the listing and the exact read saw two versions, so the entry
+    quotes neither and compares no digest: never "has the observed digest"."""
+    text = render_operator_evidence([_verified("exact", current=None, changed_while_read=True)])
+    assert "- Now: the comment changed while it was read for this launch" in text
+    assert "neither quoted nor compared with the observed digest" in text
+    assert "has the observed digest" not in text and "changed since it was observed" not in text
+    assert "is gone" not in text and "untrusted\n" not in text and NOTE not in text
+
+
 @pytest.mark.parametrize("outcome", ["declined", "withdrawn", "stale"])
 def test_an_entry_that_was_not_verified_shows_its_outcome_and_reason_only(outcome):
     """No evidence, comment or current body: there is no observed comment."""

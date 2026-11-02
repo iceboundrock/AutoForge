@@ -43,7 +43,10 @@ create's completion is judged byte for byte on GitHub's text: `gh` prints
 control characters and the text of their escapes as caret notation, so the
 one object whose text differs on `gh`'s read, or matches a payload holding
 a ``^``, is judged again on the client's exact read (D4.5a,
-:func:`_exactly`, #327). Each
+:func:`_exactly`, #327). An append's base (K3, K6) and K10's ``exact``
+evidence are GitHub's text too: a body `gh` printed with a ``^`` is read
+again exactly before anything is composed, compared or written
+(:func:`held_pr`, :func:`held_issue`, #328). Each
 ``issue`` is exactly one write. What an operation checks is the record's own
 identity, target and payload; a consumer's further completion predicates
 (K2's and K7's head SHA against K1's observed candidate, K7's
@@ -386,6 +389,91 @@ def _exactly(
     return [replace(found[0], in_end_state=completes_exactly(objects[0]))]
 
 
+def gh_may_rewrite(printed: str) -> bool:
+    """Whether ``printed``, a text `gh` printed, may not be GitHub's text (#328).
+
+    Every rewrite of `gh`'s sanitizer leaves caret notation, a ``^``, where a
+    control character or the text of its escape was, and the sanitizer
+    removes no ``^``. A print without one is therefore GitHub's text byte for
+    byte; one with a ``^`` may be another text's print, and only the exact
+    read can tell.
+    """
+    return "^" in printed
+
+
+def _gh_caret(code: int) -> str | None:
+    """The caret notation `gh`'s sanitizer prints for the character ``code``, or ``None``.
+
+    go-gh's asciisanitizer rewrites every C0 and C1 control character but
+    tab, line feed, vertical tab and carriage return: ``^`` and the
+    character 0x40 above it (C1 as C0), with 0x1C as ``^\\``.
+    """
+    if code in (0x09, 0x0A, 0x0B, 0x0D) or not (code < 0x20 or 0x80 <= code < 0xA0):
+        return None
+    low = code % 0x80
+    return "^" + ("\\" if low == 0x1C else chr(0x40 + low))
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def gh_prints_as(text: str, printed: str) -> bool:
+    """Whether ``printed``, a text `gh` printed, can be its print of GitHub's ``text`` (#328).
+
+    The sanitizer changes nothing but a control character (``\\x1b`` as
+    ``^[``) and the text of its JSON escape after a backslash (``\\u001b``
+    as ``\\^[``), each into caret notation; every other character is printed
+    as it is. ``printed`` is that print when it is ``text`` with some of
+    those rewritten. Which ones does not matter (GitHub may send a
+    backspace or form feed as a short escape, which the sanitizer leaves),
+    but any other difference does: the two reads saw different texts. Caret
+    notation is lossy, so a text that differs from ``text`` only where the
+    sanitizer rewrites (the literal ``^[`` for ``\\x1b``) also passes; it
+    prints the same, so whatever was shown from ``printed`` is what GitHub
+    holds. Every rewrite starts with a ``^`` and no rewritten character is
+    one, so where the two texts agree a character is never a rewrite: the
+    comparison is one pass.
+    """
+    i = j = 0
+    while i < len(text):
+        char = text[i]
+        if j < len(printed) and printed[j] == char:
+            i, j = i + 1, j + 1
+            continue
+        caret, width = _gh_caret(ord(char)), 1
+        if caret is None and char in "uU" and i > 0 and text[i - 1] == "\\":
+            digits = text[i + 1 : i + 5]
+            if len(digits) == 4 and _HEX_DIGITS.issuperset(digits):
+                caret, width = _gh_caret(int(digits, 16)), 5
+        if caret is None or not printed.startswith(caret, j):
+            return False
+        i, j = i + width, j + len(caret)
+    return j == len(printed)
+
+
+def held_pr(github: GitHubClient, url: str) -> PRInfo:
+    """The PR with its body as GitHub holds it, to compose or judge a write on (#328).
+
+    `gh`'s identity read (:meth:`GitHubClient.get_pr`), or, when the body it
+    printed holds a ``^`` (:func:`gh_may_rewrite`), the one exact read of the
+    PR, whose every field then stands for the PR: the exact read is the
+    later answer, so its state and head are judged with its body. A body
+    `gh` prints without a ``^`` costs no extra request. A failed exact read
+    raises as every read does (GitHubUnavailableError: nothing persisted or
+    sent; GitHubError: the caller blocks), so a body that could not be read
+    exactly is never written over. The exact text is for comparison and the
+    write only: it is never printed, logged or handed to an agent.
+    """
+    pr = github.get_pr(url)
+    return github.get_pr_exact(url) if gh_may_rewrite(pr.body) else pr
+
+
+def held_issue(github: GitHubClient, url: str) -> IssueInfo:
+    """:func:`held_pr` for an issue: `gh`'s read, or its exact read where `gh` printed a ``^``."""
+    issue = github.get_issue(url)
+    return github.get_issue_exact(url) if gh_may_rewrite(issue.body) else issue
+
+
 def _comment_found(
     github: GitHubClient, record: EffectRecord, holders: Iterable[Holder[CommentInfo, Any]]
 ) -> list[Found]:
@@ -647,7 +735,9 @@ class AdoptPrOp:
     (``Closes #n`` and the marker). Completion: the body equals the payload
     byte for byte, and among the open PRs (the complete listing, D4.5) the
     marker resolves to this one only. A rebase (D5.5) is judged by size, the
-    credential check and the marker scan of the composed body.
+    credential check and the marker scan of the composed body. The body is
+    the one GitHub holds (:func:`held_pr`, #328): the precondition, the
+    rebase and the completion are judged on it, never on `gh`'s rewrite.
     """
 
     def __init__(self, github: GitHubClient) -> None:
@@ -660,7 +750,7 @@ class AdoptPrOp:
         pr_url = record.target["pr_url"]
         repo = parse_issue_url(record.owner.issue_url).repository
         claim = scan(IMPLEMENTATION, record.marker).claims[0]
-        pr = self.github.get_pr(pr_url)
+        pr = held_pr(self.github, pr_url)
         claimants = collect(IMPLEMENTATION, self.github.list_open_prs(repo), "open PR").claimants(
             claim.key, f"issue {claim.issue.canonical}"
         )
@@ -834,7 +924,8 @@ class FollowUpAppendOp:
     the payload byte for byte, and no other open issue carries a marker of
     the block (one open follow-up per finding; D4.5: the complete open
     listing). A rebase (D5.5) is judged by size, the credential check and
-    the marker scan of the composed body.
+    the marker scan of the composed body. The body is the one GitHub holds
+    (:func:`held_issue`, #328), as for K3.
     """
 
     def __init__(self, github: GitHubClient) -> None:
@@ -848,7 +939,7 @@ class FollowUpAppendOp:
         repo = parse_issue_url(record.owner.issue_url).repository
         markers: list[str] = list(record.identity["markers"])
         keys = _marker_keys(FOLLOW_UP, markers)
-        issue = self.github.get_issue(issue_url)
+        issue = held_issue(self.github, issue_url)
         listing = collect(FOLLOW_UP, self.github.list_open_issues(repo, strict=True), "open issue")
         if listing.defects:
             return _unreadable(record, f"open issues of {repo}", listing.defects)
@@ -1145,6 +1236,8 @@ class OperatorCommentOp:
             for h in collection.holders
             if h.claim.key in others
         ]
+        if len(own) == 1 and not collection.defects and not misplaced:
+            own = [self._held(own[0])]
         taken = dict(self.reserved)
         for r in siblings:
             if r.stage is Stage.OBSERVED:
@@ -1160,6 +1253,25 @@ class OperatorCommentOp:
             defects=collection.defects,
             taken={cid: a for cid, a in taken.items() if a != record.action_id},
         )
+
+    def _held(self, comment: Listed) -> Listed:
+        """The one comment carrying the marker, its body as GitHub holds it (#328).
+
+        ``exact`` evidence is the payload byte for byte, so the comparison
+        needs GitHub's text: `gh` prints the text of an escape in the
+        operator's comment as caret notation (a false conflict), and a
+        control character as the caret text a payload may hold (a false
+        match). A body `gh` printed with a ``^`` (:func:`gh_may_rewrite`) is
+        read again exactly, which also proves the comment is on the target;
+        one without a ``^`` is GitHub's text and costs no request. Two
+        comments with the key, a defect and a misplaced payload are
+        conflicts whatever the text, so none of them is read again. The
+        ``bound`` digest stays on `gh`'s print, as it was taken at bind time
+        and is compared with later prints of the same comment.
+        """
+        if not gh_may_rewrite(comment.body):
+            return comment
+        return replace(comment, body=self.github.get_comment_exact(comment.url).body)
 
     def target_problem(self, target_url: str, issue_url: str) -> str:
         """Why the target no longer qualifies (transferred, deleted, a PR), or "".
@@ -1266,6 +1378,10 @@ __all__ = [
     "ReplacementPrOp",
     "ReviewCommentOp",
     "drive",
+    "gh_may_rewrite",
+    "gh_prints_as",
+    "held_issue",
+    "held_pr",
     "operation_for",
     "raise_conflict",
     "verify",

@@ -228,6 +228,88 @@ def test_operator_actions_complete_from_exact_payloads_without_relaunching(tmp_s
     assert "verified, exact" in evidence and "has the observed digest" in evidence
 
 
+def test_an_exact_payload_gh_prints_otherwise_is_verified_and_reported_unchanged(tmp_state_dir):
+    """#328: a note holding the text of an escape, posted byte for byte, prints through
+    `gh` as caret notation. FIX verifies it as ``exact`` on its exact read, and REVIEW's
+    operator evidence reports it unchanged: the observed digest is GitHub's text's, and
+    so is the one compared with it. The body quoted to the reviewer is `gh`'s print."""
+    note = "Coordination note for #16: the log shows `\\u001b[0m` after each line."
+    gh = FakeGitHub()
+    gh.gh_sanitizes = True
+    seen: list[str] = []
+    ref: list = []
+    eng = _operating(
+        tmp_state_dir, gh, scripted(fixer(operator("R1-F1", (16, note))), _reviewer(seen, ref))
+    )
+    ref.append(eng)
+    assert eng.step().next_phase == "BLOCKED"
+    x16 = _k10(eng, T16).action_id
+    c16 = _post(gh, T16, 9016, payload(T16, note))
+    out = eng.unblock(REASON)
+    assert out.unblocked and out.phase == "FIX", out.message
+    assert f"{x16} is on {c16.url} (exact)" in out.message
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.effect_writes == []
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    [evidence] = seen
+    assert c16.url in evidence and "verified, exact" in evidence
+    assert "has the observed digest" in evidence and "changed since" not in evidence
+    assert "`\\^[[0m`" in evidence and "\\u001b" not in evidence
+    assert ("get_comment_exact", c16.url) in gh.calls
+    # An exact read that fails is reported as such, never as an unchanged comment.
+    gh.exact_read_error = GitHubError("exact read: GitHub answered HTTP 401")
+    failed = eng._read_operator_evidence()
+    assert "could not be read for this launch (GitHubError)" in failed
+    assert "has the observed digest" not in failed
+
+
+@pytest.mark.parametrize(
+    "listing_saw_the_edit", [True, False], ids=["listing-edited", "exact-read-edited"]
+)
+def test_operator_evidence_never_pairs_a_quoted_body_with_another_versions_digest(
+    tmp_state_dir, monkeypatch, listing_saw_the_edit
+):
+    """R1-F2 of PR #445: the body quoted is the listing's print and the digest compared
+    the exact read's, so both must be one version of the comment. The operator edits it
+    between the two reads: the listing sees an edit the exact read no longer does (it
+    was reverted), or the exact read sees an edit the listing did not. Either way the
+    entry reports a comment that changed while it was read, quoting no body and
+    comparing no digest: never an edited quote "with the observed digest", nor the
+    observed body quoted beside another version's digest."""
+    note = "Coordination note for #16: the log shows `\\u001b[0m` after each line."
+    gh = FakeGitHub()
+    gh.gh_sanitizes = True
+    eng = _operating(tmp_state_dir, gh, scripted(fixer(operator("R1-F1", (16, note)))))
+    assert eng.step().next_phase == "BLOCKED"
+    observed = payload(T16, note)
+    c16 = _post(gh, T16, 9016, observed)
+    assert eng.unblock(REASON).unblocked
+    assert eng.step().next_phase == "REVIEW"
+    edited = observed.replace("after each line", "after every line, `\\u001b[1m` too")
+    exact = gh.get_comment_exact
+
+    def edited_between_reads(url):
+        c16.body = observed if listing_saw_the_edit else edited
+        return exact(url)
+
+    c16.body = edited if listing_saw_the_edit else observed
+    monkeypatch.setattr(gh, "get_comment_exact", edited_between_reads)
+    text = eng._read_operator_evidence()
+    assert ("get_comment_exact", c16.url) in gh.calls
+    assert "- Now: the comment changed while it was read for this launch" in text
+    assert "has the observed digest" not in text and "changed since it was observed" not in text
+    assert "Coordination note" not in text and sha256_text(observed) in text
+    # Once the edits settle, one version on both reads is quoted and compared as before.
+    monkeypatch.setattr(gh, "get_comment_exact", exact)
+    settled = eng._read_operator_evidence()
+    assert "changed while it was read" not in settled
+    if listing_saw_the_edit:  # reverted: the observed body again
+        assert "has the observed digest" in settled and "Coordination note" in settled
+    else:
+        assert f"changed since it was observed (sha256 now {sha256_text(edited)})" in settled
+
+
 def test_a_plain_unblock_on_an_assertion_is_refused_byte_identical(tmp_state_dir):
     """A reason, a comment on the run's issue saying "done" and an unmarked
     comment on a target are never evidence: the unblock is refused, the

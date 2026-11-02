@@ -895,9 +895,11 @@ an effect's completion read-back cannot prove a body from `gh`'s print. An
 exact read is one bounded, read-only HTTPS `GET` of one object under
 `https://api.github.com/`, with the token `gh auth token` prints, through an
 injectable transport (`https=`, default `github.https_get`). It is still the
-client's credential and the client's classification; the effect operations
-call it only to judge one object whose text `gh` printed otherwise, or
-whose payload holds a `^` another text can print as
+client's credential and the client's classification. The effect operations
+and the engine call it for one object at a time: a create's read-back whose
+text `gh` printed otherwise, or whose payload holds a `^` another text can
+print as (#327), and a body the controller appends to or splices into, or
+an operator comment it verifies, whose print holds a `^` (#328)
 ([GitHub safety](github-safety.md#ghs-sanitizer-and-the-exact-read-327)).
 
 ### Controller effects and git transport
