@@ -27,11 +27,20 @@ from tests.conftest import (
     PR,
     SHA_A,
     SHA_B,
+    FakeGitHub,
+    block,
     certify_review,
     comment_url,
+    commit_in,
+    git_out,
     implementation_pr_body,
     make_engine,
+    publish_pr_head,
+    read_context_of,
     review_comment_body,
+    review_result,
+    reviewed_head_in,
+    scripted,
 )
 
 PR_B = "https://github.com/owner/repo/pull/43"
@@ -721,3 +730,325 @@ def test_unblock_survives_an_issue_switch(tmp_state_dir, fake_github):
     eng.state.reset_for_new_issue("https://github.com/owner/repo/issues/3")
     assert len(eng.state.unblock_history) == 1
     assert eng.state.epic_url == EPIC
+
+
+# -- unblock --rereview: a fresh round instead of FIX (#428) ---------------------------
+FINDING_R2 = {
+    "id": "R2-F1",
+    "classification": "spec",
+    "title": "stale PR description",
+    "required_resolution": "rewrite the PR description to match the code",
+}
+RESOLVED_OUTSIDE = "replaced the PR description by hand; the fixer cannot edit it"
+
+
+def _needs_fix(tmp_state_dir, gh, head=SHA_A, findings=(FINDING_R2,), **extra):
+    """BLOCKED in FIX with the round-2 findings open, PR open at the reviewed ``head``."""
+    gh.add_pr(head_sha=head)
+    fields = _reviewed(head=head, result="needs_fix", findings=list(findings)) | extra
+    return _blocked(tmp_state_dir, gh, pr_url=PR, reason="agent reported blocked", **fields)
+
+
+def test_unblock_rereview_reenters_review_and_carries_the_findings_unresolved(
+    tmp_state_dir, fake_github
+):
+    """The plain decision is FIX; --rereview gives that FIX up. The round's
+    findings are not dropped and not marked resolved: they move to the
+    carry the next round re-checks, the last result is stale, and the round
+    counter is untouched (the new round is counted when it completes). The
+    history entry, the run log and the message name what was abandoned."""
+    eng = _needs_fix(
+        tmp_state_dir, fake_github, findings=(FINDING_R2, dict(FINDING_R2, id="R2-F2"))
+    )
+    out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    assert out.message.startswith("BLOCKED -> REVIEW: ")
+    assert "R2-F1, R2-F2 are abandoned, not resolved" in out.message
+    assert "REVIEW round 3 reviews the PR as it now stands" in out.message
+    assert "the 2 open finding(s) of round 2 are carried to that review" in out.message
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.block_reason == "" and s.step_count == 3
+    assert s.open_findings == [] and [f["id"] for f in s.prior_findings] == ["R2-F1", "R2-F2"]
+    assert s.last_review_result == "stale" and s.review_round == 2
+    # The review binding is the operator path's to read, never to rewrite.
+    assert s.reviewed_head_sha == SHA_A and s.reviewed_pr_url == PR
+    (entry,) = s.unblock_history
+    assert entry["action"] == (
+        f"rereview: abandoned R2-F1, R2-F2 (round 2 of {PR} at {SHA_A[:12]})"
+    )
+    assert entry["phase"] == "REVIEW" and entry["reason"] == RESOLVED_OUTSIDE
+    assert engine_module.rereview_carry(s) == entry
+    (record,) = _unblock_records(eng)
+    assert record["metadata"]["applied"] is True
+    assert record["metadata"]["action"] == entry["action"]
+    assert record["metadata"]["abandoned_findings"] == ["R2-F1", "R2-F2"]
+    assert eng.provider.calls == []
+
+
+def test_a_plain_unblock_records_no_abandoned_findings(tmp_state_dir, fake_github):
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    assert eng.unblock(REASON).phase == "FIX"
+    (record,) = _unblock_records(eng)
+    assert record["metadata"]["abandoned_findings"] == [] and record["metadata"]["action"] == ""
+
+
+def test_the_review_prompt_says_the_operator_asked_for_the_rereview(tmp_state_dir, fake_github):
+    """The next round's PRIOR_FINDINGS line tells a re-review's carry from a
+    stale round's: same HEAD, FIX given up by the operator. The operator's
+    reason is not in it: it stays uninterpreted."""
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    assert eng.unblock(RESOLVED_OUTSIDE, rereview=True).unblocked
+    eng.state = load_state(eng.paths.state_file)
+    text = eng._format_prior_findings()
+    assert text.startswith(f"Review round 2 at HEAD `{SHA_A}`")
+    assert "the operator gave up that round's FIX at this HEAD" in text
+    assert "`unblock --rereview`" in text and "R2-F1" in text
+    assert RESOLVED_OUTSIDE not in text
+    # A stale round's carry keeps its own wording.
+    eng.state.unblock_history = []
+    assert "unblock --rereview" not in eng._format_prior_findings()
+    assert "and no FIX round resolved them" in eng._format_prior_findings()
+
+
+def test_rereview_carry_matches_only_its_own_findings_round_and_pr(tmp_state_dir, fake_github):
+    """The history outlives a carry and an issue switch: an entry is the
+    carry's source only for the same findings, round, PR and HEAD."""
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    assert eng.unblock(RESOLVED_OUTSIDE, rereview=True).unblocked
+    s = load_state(eng.paths.state_file)
+    assert engine_module.rereview_carry(s) is not None
+    # A later stale round replaces the carry under its own round.
+    s.review_round, s.prior_findings = 3, [dict(FINDING_R2, id="R3-F1")]
+    assert engine_module.rereview_carry(s) is None
+    # A completed round clears it.
+    s.prior_findings = []
+    assert engine_module.rereview_carry(s) is None
+    # Another PR with the same round and ids is not this entry's.
+    s.review_round, s.prior_findings, s.reviewed_pr_url = 2, [FINDING_R2], PR_B
+    assert engine_module.rereview_carry(s) is None
+
+
+def test_unblock_rereview_after_the_review_round_blocks_again_keeps_the_carry(
+    tmp_state_dir, fake_github
+):
+    """The new round did not complete (it blocked before its comment): a plain
+    unblock re-enters REVIEW with the carry, and the prompt still says why."""
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    assert eng.unblock(RESOLVED_OUTSIDE, rereview=True).unblocked
+    eng.state = load_state(eng.paths.state_file)
+    eng.state.phase = Phase.BLOCKED
+    eng.state.block_reason = "validation failed three times"
+    eng._save()
+    out = eng.unblock(REASON)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    s = load_state(eng.paths.state_file)
+    assert [f["id"] for f in s.prior_findings] == ["R2-F1"] and s.open_findings == []
+    assert engine_module.rereview_carry(s) == s.unblock_history[0]
+    # And a second --rereview has no FIX left to give up.
+    eng.state = s
+    eng.state.phase = Phase.BLOCKED
+    eng.state.block_reason = "blocked again"
+    eng._save()
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked and "no such FIX to give up" in out.message
+    assert eng.paths.state_file.read_text() == raw
+
+
+def test_unblock_rereview_is_refused_past_the_round_cap(tmp_state_dir, fake_github):
+    """The new round counts against workflow.max_review_rounds like any other."""
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    eng.config.workflow.max_review_rounds = 2
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked and "workflow.max_review_rounds=2 is reached" in out.message
+    assert "review round 3 is not started" in out.message
+    assert "could never be reviewed" not in out.message
+    _assert_untouched(eng, raw)
+    (record,) = _unblock_records(eng)
+    assert record["metadata"]["applied"] is False
+    assert record["metadata"]["abandoned_findings"] == []
+
+
+@pytest.mark.parametrize(
+    ("live_head", "fields", "plain"),
+    [
+        (SHA_B, _reviewed(head=SHA_A, result="needs_fix", findings=[FINDING_R2]), "REVIEW"),
+        (SHA_A, _reviewed(head=SHA_A, result="clean"), "REVIEW"),
+        (SHA_A, _reviewed(head=SHA_A, result="needs_fix", findings=[]), "REVIEW"),
+    ],
+    ids=["head-moved", "clean", "no-open-findings"],
+)
+def test_unblock_rereview_applies_only_where_unblock_would_reenter_fix(
+    tmp_state_dir, fake_github, live_head, fields, plain
+):
+    """Without a FIX to give up the flag is refused, quoting the plain
+    decision, and nothing is written: a moved PR already gets a fresh round
+    (with the carry), and a clean review has no findings to abandon."""
+    fake_github.add_pr(head_sha=live_head)
+    eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **fields)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked and "unblock --rereview applies only" in out.message
+    assert f"Without the flag: PR {PR} is OPEN" in out.message and plain in out.message
+    _assert_untouched(eng, raw)
+
+
+def test_unblock_rereview_without_a_pr_is_refused(tmp_state_dir, fake_github):
+    eng = _blocked(tmp_state_dir, fake_github)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked and "unblock --rereview applies only" in out.message
+    assert "ANALYZE_EXECUTE" in out.message
+    _assert_untouched(eng, raw)
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        {"approve_action": "A-0123456789abcdef"},
+        {"decline_action": "A-0123456789abcdef"},
+        {"bind_evidence": [("X-0123456789abcdef", comment_url(PR, 5))]},
+    ],
+)
+def test_unblock_rereview_excludes_the_action_flags(tmp_state_dir, fake_github, other):
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    raw = eng.paths.state_file.read_text()
+    with pytest.raises(ConfigurationError, match="--bind-evidence and --rereview"):
+        eng.unblock(REASON, rereview=True, **other)
+    _assert_untouched(eng, raw)
+    assert fake_github.calls == []
+
+
+def test_unblock_rereview_dry_run_writes_nothing(tmp_state_dir, fake_github):
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True, dry_run=True)
+    assert out.dry_run and not out.unblocked
+    assert out.message.startswith("[dry-run] would re-enter REVIEW: ")
+    assert "R2-F1 are abandoned, not resolved" in out.message
+    _assert_untouched(eng, raw)
+    assert not eng.paths.logs_dir.exists()
+
+
+def _worktree_at_reviewed_head(tmp_state_dir, gh):
+    """The issue's agent worktree, created as a launch does, and a run reviewed at its HEAD."""
+    eng = make_engine(tmp_state_dir, [], github=gh)
+    worktree = eng._ensure_agent_worktree()
+    head = git_out("-C", str(worktree), "rev-parse", "HEAD")
+    gh.add_pr(head_sha=head)
+    fields = _reviewed(head=head, result="needs_fix", findings=[FINDING_R2])
+    eng.state.phase = Phase.BLOCKED
+    eng.state.block_reason = "agent reported blocked"
+    eng.state.current_pr_url = PR
+    for name, value in fields.items():
+        setattr(eng.state, name, value)
+    eng._save()
+    return eng, worktree, head
+
+
+def test_unblock_rereview_with_the_worktree_at_the_reviewed_head(tmp_state_dir, fake_github):
+    """The fixer blocked without a commit: the worktree holds nothing the PR
+    does not, so nothing is left behind; uncommitted files do not refuse it."""
+    eng, worktree, _ = _worktree_at_reviewed_head(tmp_state_dir, fake_github)
+    (worktree / "draft.txt").write_text("an uncommitted draft\n", "utf-8")
+    out = eng.unblock(REASON, rereview=True)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    assert (worktree / "draft.txt").exists()
+
+
+def test_unblock_rereview_refuses_a_worktree_holding_a_commit_the_pr_does_not(
+    tmp_state_dir, fake_github
+):
+    """The fixer committed, then blocked: that commit was never pushed or
+    reviewed, so a fresh round would leave it behind. Refused, state
+    untouched, the worktree as it was; the plain unblock still re-enters FIX."""
+    eng, worktree, head = _worktree_at_reviewed_head(tmp_state_dir, fake_github)
+    fixed = commit_in(worktree, "Half a fix (#2)")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked
+    assert f"is at {fixed[:12]}, not at the reviewed HEAD {head[:12]}" in out.message
+    assert "Unblock without --rereview to let FIX continue" in out.message
+    _assert_untouched(eng, raw)
+    assert git_out("-C", str(worktree), "rev-parse", "HEAD") == fixed
+    assert eng.unblock(REASON).phase == "FIX"
+
+
+def test_unblock_rereview_refuses_a_worktree_on_a_local_branch(tmp_state_dir, fake_github):
+    """An attached HEAD is never resolved by the controller, so whether it
+    holds work is not knowable: refused."""
+    eng, worktree, _ = _worktree_at_reviewed_head(tmp_state_dir, fake_github)
+    git_out("-C", str(worktree), "checkout", "-q", "-b", "side")
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked and "attached to a local branch" in out.message
+    _assert_untouched(eng, raw)
+
+
+def test_unblock_rereview_refuses_a_worktree_path_it_cannot_bind(tmp_state_dir, fake_github):
+    """A directory at the worktree path that the registry does not bind is
+    not a worktree the controller can read: refused, not taken as empty."""
+    eng = _needs_fix(tmp_state_dir, fake_github)
+    path = eng.agent_worktree_path()
+    path.mkdir(parents=True)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked and f"the agent worktree {path} cannot be read" in out.message
+    _assert_untouched(eng, raw)
+
+
+def test_a_finding_resolved_outside_the_repository_is_rereviewed_not_refixed(tmp_state_dir):
+    """The incident of #428 end to end. Round 2 asks for a PR description
+    rewrite; the fixer cannot edit a PR body, so it blocks without a commit,
+    and the step says which unblock asks for a fresh round instead. The
+    operator rewrites the body by hand and runs `unblock --rereview`: no
+    fixer launches again, round 3 reviews the same HEAD with R2-F1 to
+    re-check and the current body in its read context, and its clean
+    verdict clears the carry and goes on to READY_FOR_MERGE."""
+    gh = FakeGitHub()
+    gh.add_issue(ISSUE, "Ship the feature")
+    prompts: list[str] = []
+    bodies: list[str] = []
+
+    def blocked_fixer(req):
+        git_out("-C", str(req.cwd), "checkout", "-q", "--detach", reviewed_head_in(req.prompt))
+        return block({"phase": "FIX", "status": "blocked", "message": "cannot edit a PR body"})
+
+    def reviewer(req):
+        prompts.append(req.prompt)
+        bodies.append((read_context_of(req.prompt) / "pull-request.md").read_text())
+        return block(review_result(3, head, []))
+
+    eng = make_engine(tmp_state_dir, scripted(blocked_fixer, reviewer), github=gh, origin=True)
+    head = publish_pr_head(eng)
+    gh.add_pr(head_sha=head, body="Adds the feature with the old cache design.")
+    merge_base = git_out("-C", str(eng.workdir), "rev-parse", "HEAD")
+    for name, value in (
+        _reviewed(head=head, result="needs_fix", findings=[FINDING_R2])
+        | {"reviewed_merge_base_sha": merge_base, "phase": Phase.FIX, "current_pr_url": PR}
+    ).items():
+        setattr(eng.state, name, value)
+    gh.add_comment(PR, REVIEW_CID, review_comment_body(2, head, True))
+    eng._save()
+
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.message.startswith("agent reported blocked: cannot edit a PR body (")
+    assert "unblock --rereview --reason" in out.message
+    assert load_state(eng.paths.state_file).block_reason == "cannot edit a PR body"
+
+    gh.prs[PR].body = "Adds the feature with the new cache design."
+    out = eng.unblock(RESOLVED_OUTSIDE, rereview=True)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+
+    out = eng.step()
+    assert out.next_phase == "READY_FOR_MERGE", out.message
+    assert len(eng.provider.calls) == 2  # the blocked fixer and round 3's reviewer
+    [prompt] = prompts
+    assert "the operator gave up that round's FIX at this HEAD" in prompt
+    assert "R2-F1" in prompt and RESOLVED_OUTSIDE not in prompt
+    assert "new cache design" in bodies[0]
+    s = load_state(eng.paths.state_file)
+    assert s.review_round == 3 and s.reviewed_head_sha == head
+    assert s.prior_findings == [] and s.open_findings == [] and s.last_review_result == "clean"

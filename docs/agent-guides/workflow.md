@@ -468,7 +468,11 @@ ones that still applied; a stale clean round therefore leaves none), and
 the next completed round of the actual revision, clean or with findings,
 clears them. Only a completed round replaces or clears the carry: an
 operator `unblock` into `REVIEW` after a stale round (see **Leaving
-BLOCKED**) is not a round and leaves it as it is. Like `open_findings` they
+BLOCKED**) is not a round and leaves it as it is. The one carry made at an
+unchanged revision is the operator's: `unblock --rereview` (#428) gives up
+a round's FIX and hands its open findings to the next round the same way,
+and the `PRIOR_FINDINGS` line then says the operator asked for that review
+instead of a FIX, since no push explains why none ran. Like `open_findings` they
 are per PR: a replacement PR and a new issue start with none. The
 alternative, not consuming a stale round, was rejected: it would relaunch
 the same round profile against a PR that may move again, and it would let
@@ -799,6 +803,31 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   A flag on a run with no waiting action refuses, quoting the decision a
   plain unblock would make. After an approval the record is authorized, so
   a later block (a closed issue, say) is left with a plain unblock.
+- **A fresh review instead of FIX** (`--rereview`, #428). Where the plain
+  decision is `FIX` with the round's open findings (`OPEN` at the reviewed
+  HEAD and base, no saved plan), a fixer relaunched by a plain unblock
+  cannot get past a finding the operator resolved outside the repository:
+  a PR description rewritten by hand is in neither its read context nor
+  its prompt, and the reason never reaches it. `--rereview` gives that FIX
+  up: `REVIEW`, the last result marked `stale` and the open findings
+  carried to the new round as prior findings, exactly as a moved revision
+  carries them; none is marked resolved, and that round's reviewer, who
+  reads the PR body as it now stands, may raise any of them again. The
+  history entry's `action` is `rereview: abandoned <ids> (round <n> of <PR>
+  at <HEAD>)` and the run log's `metadata.abandoned_findings` lists the
+  ids; `status` shows both the entry and, beside the carried findings,
+  that `unblock --rereview` abandoned them. It is refused, with nothing
+  written, past `workflow.max_review_rounds` (the new round counts like
+  any other); with a saved `FIX` plan (its writes are the controller's to
+  complete: unblock without the flag); and unless the agent worktree is
+  absent or its `HEAD` is detached at the reviewed HEAD, read as a
+  candidate is (ADR 0005 D6.3): any other `HEAD` (a fixer's unpushed
+  commit, a local branch, a commit the shared store lacks) may hold work
+  a fresh round would leave behind. Uncommitted files do not refuse it: a
+  review round neither discards nor publishes them. Anywhere else (a moved
+  PR, a clean review, no PR, no open findings) the flag refuses, quoting
+  the plain decision; it excludes the action flags. A `FIX` agent that
+  reports `blocked` names the flag in the step's message.
 - **Operator actions awaiting the operator** (#243, ADR 0004 K10). A
   `FIX` plan's operator comments (first in the plan, at most four) ask the
   operator to post a comment on another issue of the repository; the
@@ -862,7 +891,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   `current_merge_base_sha` is cleared for the next `REVIEW` entry to read;
   the review binding (`reviewed_*`) is never rewritten by this path. The action is
   appended to `unblock_history` (timestamp, reason, cleared block reason,
-  phase, detail, and `action` for an approval, a decline or a binding) and to the run log, `block_reason` is cleared and `attempt`
+  phase, detail, and `action` for an approval, a decline, a binding or a
+  re-review) and to the run log, `block_reason` is cleared and `attempt`
   reset. No agent runs and no step is charged: the operator reviews the
   outcome and runs `resume`, whose entry probe for that phase runs again.
 - **The validation override watermark** (ADR 0006 D14.2, #173). An applied

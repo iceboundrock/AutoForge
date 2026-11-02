@@ -87,6 +87,11 @@ uv run autoforge rebind-epic --issue https://github.com/owner/repo/issues/257 \
   --from https://github.com/owner/repo/issues/158 \
   --to https://github.com/owner/repo/issues/255 \
   --reason "#257 moved under #255" --dry-run
+
+# you resolved a review finding outside the repository (a PR description
+# rewritten by hand): give up the round's FIX and have a fresh REVIEW round
+# judge the PR as it now stands; then `resume`
+uv run autoforge unblock --rereview --reason "rewrote the PR description"
 ```
 
 Pass a config file with the global option, before the subcommand:
@@ -634,6 +639,31 @@ or after the fixer ran, is not a block: the PR goes back to `REVIEW` of the
 pushed HEAD; so does a PR retargeted to another base, or a base rewritten
 under its name, at any point of the phase. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
+
+### A finding the fixer cannot resolve
+
+Some findings ask for something no commit can carry, such as a PR
+description rewritten to match the code. The fixer cannot edit the PR, so it
+reports `blocked`, and the step's message names `unblock --rereview`. A
+plain `unblock` after you made the change yourself does not help: it
+re-enters `FIX`, and the fixer sees neither your change nor your reason, so
+it blocks again. Run
+`autoforge unblock --rereview --reason "..."` instead, then `resume`. The
+round's `FIX` is given up and a fresh `REVIEW` round reviews the same HEAD,
+reading the PR as it now stands. The round's findings are handed to it to
+re-check, not marked resolved, so it may raise them again. `status` shows the
+abandoned finding ids in the `Unblocked:` line and, while the new round has
+not completed, beside `Prior findings to re-check`.
+
+The new round counts against `workflow.max_review_rounds`. `--rereview` is
+refused, with nothing written, when the `FIX` plan is already saved (unblock
+without it), and when the agent worktree's `HEAD` is anything but the
+reviewed HEAD, for example a commit the fixer made before it blocked: that
+commit was never pushed or reviewed, and a fresh round would leave it
+behind. Unblock without the flag to let `FIX` continue from it, or move the
+work out of the worktree yourself. Where a plain `unblock` would not re-enter
+`FIX` with open findings, the flag is refused and the message says what the
+plain decision is.
 
 ### BLOCKED on an acceptance action
 

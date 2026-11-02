@@ -1566,6 +1566,22 @@ a stated reason it has none. The coverage that must keep working:
   default branch renamed during either wait blocks with nothing adopted or
   bound (PR #404). No test sleeps: `make_engine` records each pause in
   `eng.sleeps`
+- `unblock --rereview` (#428, `tests/test_unblock.py`, the saved-plan
+  refusals in `tests/test_operator_actions.py` and `tests/test_cli.py`):
+  where the plain decision is `FIX` with open findings it re-enters
+  `REVIEW` with them carried, the result `stale`, the round counter and the
+  review binding untouched, the abandoned ids in the history entry's
+  `action` and the run log's `abandoned_findings`; the next `REVIEW` prompt
+  says the operator asked for the round and quotes no reason, and only an
+  entry for the same findings, round, PR and HEAD marks a carry as a
+  re-review's; a fixer that blocks names the flag, and after the operator
+  edits the PR body the flag leads to a round that reads the new body,
+  clears the carry and reaches `READY_FOR_MERGE` with no second fixer
+  launch; it is refused, byte-identical, past the round cap, with a saved
+  `FIX` plan, with the agent worktree at another commit, on a branch or
+  unbindable, and wherever the plain decision is not `FIX` (quoting it);
+  uncommitted files do not refuse it; it excludes the action flags; a dry
+  run writes nothing
 
 ### Integration
 

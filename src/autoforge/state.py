@@ -587,7 +587,9 @@ class AutoForgeState:
     # Findings of the latest review of this PR that no FIX round resolved
     # because the PR's revision moved out from under them: the round went
     # stale while the reviewer worked, or the HEAD was already past the
-    # reviewed one when FIX was entered. Same shape as `open_findings`, but
+    # reviewed one when FIX was entered; or because the operator gave up
+    # the round's FIX with `unblock --rereview` at the same revision (#428;
+    # its `unblock_history` entry says so). Same shape as `open_findings`, but
     # no fixer is asked to resolve them; they are handed to the next REVIEW
     # as findings to re-check at the actual HEAD (`PRIOR_FINDINGS`). When
     # non-empty they are the findings of round `review_round` at

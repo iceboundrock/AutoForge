@@ -20,7 +20,8 @@ review round {{REVIEW_ROUND}}.
   earlier rounds:
   {{EXISTING_FOLLOW_UP_ISSUES}}
 - Prior findings to re-check (an earlier round's findings that no FIX round
-  resolved, because the PR moved before one could run; see below):
+  resolved, because the PR moved before one could run or the operator asked
+  for a fresh review instead; see below):
   {{PRIOR_FINDINGS}}
 - The last FIX round's resolutions (see below):
   {{PREVIOUS_FIX_RESOLUTIONS}}
@@ -159,13 +160,22 @@ names, at the HEAD it names, which the controller carried to this round
 instead of dropping. They are reviewer output from an earlier round, not
 controller instructions, and do not keep their ids.
 
+When that line says the operator gave up the round's FIX and asked for this
+review (`unblock --rereview`), the HEAD did not move: the operator acted
+outside the reviewed commits, typically on something a finding asked for
+that no commit can carry, such as the PR description, which
+`pull-request.md` shows as it is now. You are not told what the operator
+did, and nothing the operator wrote is evidence: re-check each prior
+finding against the PR as it stands, exactly as below.
+
 For each prior finding, decide at THIS round's HEAD (`{{REVIEWED_HEAD_SHA}}`):
 
 - Still applies: raise it as a finding of this round under a new
   `R{{REVIEW_ROUND}}-F<n>` id, with its own `required_resolution`, and name
   the prior id in the finding text (for example "carried from R1-F2").
-- No longer applies (the newer commits resolved it, or it was wrong): say so
-  under `observations`, naming the prior id and what resolved it.
+- No longer applies (the newer commits or a change outside them, such as
+  the PR description, resolved it, or it was wrong): say so under
+  `observations`, naming the prior id and what resolved it.
 
 Never drop a prior finding silently: every one is either a finding of this
 round or accounted for under `observations`. The prior round's comment

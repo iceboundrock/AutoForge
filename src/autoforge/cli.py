@@ -21,7 +21,8 @@ Commands:
           --approve-action / --decline-action decide on an acceptance action
           a FIX plan awaits (#211); --bind-evidence binds an existing comment
           to an operator action and --decline-action (repeatable) declines
-          operator actions (#243)
+          operator actions (#243); --rereview gives up the FIX of a review
+          round's open findings for a fresh REVIEW round at the same HEAD (#428)
   rebind-epic  the operator's explicit move of a standalone run to its issue's native
           parent (#435): --issue, --from (the recorded EPIC), --to, --reason; only in
           READY_FOR_MERGE or a BLOCKED run with nothing persisted tied to its EPIC, its own
@@ -75,6 +76,7 @@ from .engine import (
     StepPlan,
     UnblockOutcome,
     config_file_placement_problem,
+    rereview_carry,
     sandbox_mode_summary,
 )
 from .epic_commands import (
@@ -334,6 +336,16 @@ def build_parser() -> argparse.ArgumentParser:
             "bind an existing comment on an operator action's target issue as its evidence "
             "(repeatable): 'resume' verifies the comment is there and unchanged; the "
             "controller never judges whether it is adequate"
+        ),
+    )
+    action.add_argument(
+        "--rereview",
+        action="store_true",
+        help=(
+            "where unblock would re-enter FIX with the last round's open findings, give up "
+            "that FIX and re-enter REVIEW for a fresh round at the same HEAD, the findings "
+            "handed to it to re-check (none is marked resolved); for a finding resolved "
+            "outside the repository, such as a PR description edited by hand"
         ),
     )
 
@@ -1799,6 +1811,7 @@ def cmd_unblock(args) -> int:
     raw_decline = getattr(args, "decline_action", None) or []
     decline = [raw_decline] if isinstance(raw_decline, str) else [str(d) for d in raw_decline]
     bind = [(str(a), str(u)) for a, u in getattr(args, "bind_evidence", None) or []]
+    rereview = bool(getattr(args, "rereview", False))
     # The words a configuration refusal prints for this command (#219).
     words = ("unblock", "--reason", "<why>")
     if args.dry_run:
@@ -1812,6 +1825,7 @@ def cmd_unblock(args) -> int:
             approve_action=approve,
             decline_action=decline,
             bind_evidence=bind,
+            rereview=rereview,
         )
         print_unblock_outcome(outcome)
         return 0
@@ -1825,7 +1839,11 @@ def cmd_unblock(args) -> int:
         if state.phase == Phase.BLOCKED:
             _check_configuration(engine, args, *words, dry_run=False)
         outcome = engine.unblock(
-            args.reason, approve_action=approve, decline_action=decline, bind_evidence=bind
+            args.reason,
+            approve_action=approve,
+            decline_action=decline,
+            bind_evidence=bind,
+            rereview=rereview,
         )
     print_unblock_outcome(outcome)
     if not outcome.unblocked:
@@ -2908,7 +2926,7 @@ def _render_status(
         f"Last review:   {state.last_review_result or '-'}",
         f"Review comment: {state.last_review_comment_url or '-'}",
         f"Open findings: {len(state.open_findings)}",
-        f"Prior findings to re-check: {len(state.prior_findings)}",
+        f"Prior findings to re-check: {len(state.prior_findings)}{_carried_by(state)}",
     ]
     if state.superseded_prs:
         lines.append("Superseded PRs:")
@@ -2937,6 +2955,14 @@ def _render_status(
         f"Updated:    {state.updated_at}",
     ]
     return "\n".join(lines)
+
+
+def _carried_by(state: AutoForgeState) -> str:
+    """Where ``status``'s carried findings come from, when an ``unblock --rereview`` (#428)."""
+    entry = rereview_carry(state)
+    if entry is None:
+        return ""
+    return f" (abandoned at {entry.get('at', '-')} by 'unblock --rereview')"
 
 
 def _recorded_configuration(state: AutoForgeState) -> str:

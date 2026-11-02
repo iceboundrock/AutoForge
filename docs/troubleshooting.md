@@ -148,6 +148,7 @@ and usually what to do. The common causes:
 | the checkout the controller runs from moved | [When someone changed something on GitHub](#when-someone-changed-something-on-github) |
 | `validation.commands` failed three times for the phase | fix the cause; when it was the environment (a missing tool, a full disk), `unblock` makes the next gate run the same commit again ([Candidate validation evidence](usage.md#candidate-validation-evidence)) |
 | no applicable review certificate | `unblock`: it decides a fresh `REVIEW` round, or `READY_FOR_MERGE` once the certificate applies again ([Candidate validation evidence](usage.md#candidate-validation-evidence)) |
+| the fixer's own words: it cannot do what a finding asks (edit the PR description, say) | do it yourself, then `unblock --rereview` for a fresh `REVIEW` round instead of another fixer launch ([A finding the fixer cannot resolve](usage.md#a-finding-the-fixer-cannot-resolve)) |
 | an acceptance action or operator actions | [The run waits for you](#the-run-waits-for-you-acceptance-and-operator-actions) |
 | a replan transaction | [A replan](#a-replan) |
 

@@ -228,6 +228,22 @@ def test_operator_actions_complete_from_exact_payloads_without_relaunching(tmp_s
     assert "verified, exact" in evidence and "has the observed digest" in evidence
 
 
+def test_unblock_rereview_never_abandons_a_saved_plan(tmp_state_dir):
+    """#428: --rereview gives up a FIX only where nothing of it was planned.
+    Here the plan holds the fixer's commit and its K10 records, so it is
+    refused byte-identical, naming the plan, and no fixer or reviewer runs."""
+    gh = FakeGitHub()
+    eng = _operating(tmp_state_dir, gh, fixer(BOTH))
+    assert eng.step().next_phase == "BLOCKED"
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, rereview=True)
+    assert not out.unblocked
+    assert "unblock --rereview is refused: the FIX plan of review round 1 is saved" in out.message
+    assert "FIX completes the plan from the journal" in out.message
+    assert eng.paths.state_file.read_text() == raw
+    assert len(eng.provider.calls) == 1 and gh.effect_writes == []
+
+
 def test_a_plain_unblock_on_an_assertion_is_refused_byte_identical(tmp_state_dir):
     """A reason, a comment on the run's issue saying "done" and an unmarked
     comment on a target are never evidence: the unblock is refused, the

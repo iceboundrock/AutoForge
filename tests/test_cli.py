@@ -4186,6 +4186,71 @@ def test_unblock_takes_one_acceptance_flag(tmp_path, capsys, monkeypatch, fakes)
     assert "not allowed with argument" in capsys.readouterr().err
 
 
+def test_unblock_rereview_is_refused_with_a_saved_fix_plan(tmp_path, capsys, monkeypatch, fakes):
+    """#428: the plan holds writes the controller owes; a fresh review would
+    abandon them, so --rereview exits 1 with nothing written."""
+    sd, _, _ = _blocked_on_acceptance(tmp_path, monkeypatch, fakes)
+    raw = (tmp_path / ".autoforge" / "state.json").read_text()
+    capsys.readouterr()
+    assert cli.main(["--state-dir", sd, "unblock", "--rereview", "--reason", "x"]) == 1
+    out = capsys.readouterr().out
+    assert "unblock --rereview is refused: the FIX plan of review round 1 is saved" in out
+    assert (tmp_path / ".autoforge" / "state.json").read_text() == raw
+
+
+def test_unblock_rereview_reenters_review_and_status_shows_the_abandoned_findings(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#428: `unblock --rereview` where a plain unblock would relaunch the
+    fixer: REVIEW, the findings carried, and `status` says who abandoned them."""
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+    gh = fakes["gh"]
+    gh.add_pr(head_sha=SHA_A)
+    eng = make_engine(sd, [], github=gh)
+    finding = {"id": "R2-F1", "classification": "spec", "required_resolution": "rewrite it"}
+    for name, value in {
+        "phase": Phase.BLOCKED,
+        "block_reason": "cannot edit a PR body",
+        "current_pr_url": PR,
+        "current_head_sha": SHA_A,
+        "current_base_ref": "main",
+        "reviewed_pr_url": PR,
+        "reviewed_head_sha": SHA_A,
+        "reviewed_base_ref": "main",
+        "last_review_result": "needs_fix",
+        "last_review_comment_url": comment_url(PR, 100),
+        "open_findings": [finding],
+        "review_round": 2,
+    }.items():
+        setattr(eng.state, name, value)
+    eng._save()
+    eng.close()
+    argv = ["--state-dir", str(sd), "unblock", "--rereview", "--reason", "edited the PR body"]
+    assert cli.main(argv) == 0
+    out = capsys.readouterr().out
+    assert "BLOCKED -> REVIEW" in out and "R2-F1 are abandoned, not resolved" in out
+    assert "continue with: " in out
+    assert cli.main(["--state-dir", str(sd), "status"]) == 0
+    status = capsys.readouterr().out
+    at = load_state(sd / "state.json").unblock_history[-1]["at"]
+    assert f"Prior findings to re-check: 1 (abandoned at {at} by 'unblock --rereview')" in status
+    assert (
+        f"-> REVIEW [rereview: abandoned R2-F1 (round 2 of {PR} at {SHA_A[:12]})]: edited the PR "
+        "body" in status
+    )
+    assert "Open findings: 0" in status and "Last review:   stale" in status
+
+
+def test_unblock_rereview_excludes_the_action_flags(tmp_path, capsys, monkeypatch, fakes):
+    monkeypatch.chdir(tmp_path)
+    flags = ["--rereview", "--approve-action", "A-" + "0" * 16]
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--state-dir", str(tmp_path / ".autoforge"), "unblock", *flags, "--reason", "x"])
+    assert e.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
 # -- operator actions (#243) ------------------------------------------------------------
 T16 = "https://github.com/owner/repo/issues/16"
 T158 = "https://github.com/owner/repo/issues/158"
