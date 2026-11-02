@@ -330,10 +330,6 @@ def state_dir_view(state_dir: Path) -> bool | None:
     return False
 
 
-def view_name(scheduler: bool | None) -> str:
-    return "unknown" if scheduler is None else ("scheduler" if scheduler else "standalone")
-
-
 # -- one state directory, read only ----------------------------------------------------------
 
 

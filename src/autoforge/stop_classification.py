@@ -23,8 +23,9 @@ deciding module imports this one).
 Every classification comes from a typed source and never from the text of a
 reason: a controller sink that named its code (``ControllerEngine._block``),
 the validated ``status`` of a ``CONTROL_RESULT``, the class of a raised
-:class:`~autoforge.errors.AutoForgeError`, or a loaded state's phase and
-settlement. No code is persisted (ADR 0011 D5): a state loaded later
+:class:`~autoforge.errors.AutoForgeError` (and the one typed attribute the
+engine sets on a run log's refusal after a launch's attempt was saved), or
+a loaded state's phase and settlement. No code is persisted (ADR 0011 D5): a state loaded later
 classifies its ``BLOCKED`` or ``FAILED`` with :attr:`StopReasonCode.UNKNOWN`,
 and ``block_reason`` stays text for a human. Where nothing typed says why,
 the code is ``UNKNOWN``, and an ``UNKNOWN`` never adds a route.
