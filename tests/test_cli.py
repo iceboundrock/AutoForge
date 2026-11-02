@@ -4596,6 +4596,66 @@ def test_a_lifecycle_error_names_its_typed_stop_on_stderr(tmp_path, capsys, monk
     assert "autoforge: error:" in captured.err and "stop:" not in captured.err
 
 
+@pytest.mark.parametrize("outcome", ["accepted", "timeout", "exit", "malformed"])
+def test_a_post_agent_run_log_refusal_is_a_resumable_stop_not_a_refusal(
+    tmp_path, capsys, monkeypatch, fakes, outcome
+):
+    """R2-F1, through the CLI: the post-agent journal refusals of
+    ``test_post_agent_journal_refusal_names_the_outcome_and_keeps_the_attempt``
+    and ``test_review_post_agent_journal_refusal_keeps_the_phase_for_resume``
+    (the agent returned with an accepted result, timed out, exited non-zero or
+    returned none, then the journal append was refused). The command still
+    exits 2 with the error that says to repair the log directory and
+    'resume'; its stop line agrees with it, a resumable error with the phase
+    and the persisted attempt kept, never a refusal routed to a new run. A
+    state file that cannot be read is still a refusal."""
+    import dataclasses
+
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    monkeypatch.chdir(tmp_path)
+    sd = tmp_path / ".autoforge"
+
+    def enlarges_the_journal() -> None:
+        (journal,) = (sd / "logs").glob("*/events.jsonl")
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+
+    def handler(req):
+        out = implement(req) if outcome in ("accepted", "timeout", "exit") else "no result"
+        enlarges_the_journal()
+        return out
+
+    fakes["handler"] = handler
+    provider = fakes["provider"]
+    if outcome == "exit":
+        provider.exit_code = 3
+    if outcome == "timeout":
+        execute = provider.execute
+
+        def times_out(req):
+            return dataclasses.replace(execute(req), exit_code=-1, timed_out=True)
+
+        monkeypatch.setattr(provider, "execute", times_out)
+    assert cli.main(["--state-dir", str(sd), "run", "--epic", EPIC, "--issue", ISSUE]) == 2
+    captured = capsys.readouterr()
+    assert "after the agent had returned with:" in captured.err
+    assert "Repair the log directory, then 'resume'" in captured.err
+    line = next(x for x in captured.err.splitlines() if x.startswith("autoforge: stop: "))
+    assert line.startswith(
+        "autoforge: stop: resumable_error (reason run-log-refused, from exception: "
+    )
+    assert "raised by the run log after the launch's attempt was saved); next: 'resume'" in line
+    assert "refused" not in line.split("(")[0] and "a new run" not in line
+    saved = load_state(sd / "state.json")
+    assert (saved.phase, saved.attempt) == (Phase.ANALYZE_EXECUTE, 1)
+    assert len(provider.calls) == 1
+
+    # The unreadable state file is still the refusal it always was.
+    (sd / "state.json").write_bytes(b"{torn")
+    assert cli.main(["--state-dir", str(sd), "resume"]) == 2
+    assert "stop: refused (reason state-invalid" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("phase", [Phase.BLOCKED, Phase.FAILED])
 def test_read_only_stop_lines_need_no_repository(
     tmp_path_factory, capsys, monkeypatch, fakes, phase

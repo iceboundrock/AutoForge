@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import os
 from dataclasses import fields
 from pathlib import Path
 
@@ -113,7 +114,10 @@ def test_every_error_class_is_mapped_explicitly():
 
 def test_refused_is_exactly_what_the_cli_exits_2_for():
     """``cli.main`` exits 2 for these four bases and 1 for every other
-    AutoForgeError: a refusal acted on nothing, an exit 1 left the phase."""
+    AutoForgeError: a refusal acted on nothing, an exit 1 left the phase. The
+    one exception is no class but a typed mark on an instance (a run log's
+    refusal after a launch's attempt was saved, still exit 2):
+    ``test_a_run_log_refusal_after_the_attempt_is_resumable_never_refused``."""
     exit_2 = (
         errors.ConfigurationError,
         errors.StateError,
@@ -221,6 +225,32 @@ def test_an_error_is_classified_by_its_class(exc, outcome, code):
     found = classify_exception(exc)
     assert (found.outcome, found.code, found.source) == (outcome, code, ReasonSource.EXCEPTION)
     assert found.evidence == f"{type(exc).__name__} raised"
+
+
+@pytest.mark.parametrize(
+    "exc", [errors.StateError("s"), UnsafePathError("u")], ids=lambda e: type(e).__name__
+)
+def test_a_run_log_refusal_after_the_attempt_is_resumable_never_refused(exc):
+    """R2-F1: a StateError's class says it exits 2, not that nothing ran. The
+    engine marks the run log's refusal it re-raises after it persisted a
+    launch's attempt, and that typed mark, never the message, makes it a
+    resumable error: the phase is unchanged, and the error says to repair the
+    log directory and 'resume'. Unmarked, the same class is still a refusal."""
+    unmarked = classify_exception(exc)
+    assert (unmarked.outcome, unmarked.code) == (Out.REFUSED, C.STATE_INVALID)
+    exc.interrupted_attempt = True
+    found = classify_exception(exc)
+    assert (found.outcome, found.code, found.source) == (
+        Out.RESUMABLE_ERROR,
+        C.RUN_LOG_REFUSED,
+        ReasonSource.EXCEPTION,
+    )
+    assert found.routes == (R.RESUME,) and found.live_facts_required
+    assert R.NEW_RUN not in found.routes and R.INVESTIGATE not in found.routes
+    assert found.evidence.startswith(f"{type(exc).__name__} raised by the run log")
+    # The mark is the instance's: the class, and every other instance, is untouched.
+    assert type(exc).interrupted_attempt is False
+    assert classify_exception(type(exc)("other")).outcome is Out.REFUSED
 
 
 def test_an_error_message_is_never_read():
@@ -638,6 +668,57 @@ def test_fixture_resumable_timeout_keeps_the_phase(tmp_state_dir, fake_github):
     assert found.routes == (R.RESUME,) and found.live_facts_required
 
 
+def test_fixture_a_post_agent_run_log_refusal_keeps_the_phase_for_resume(tmp_state_dir):
+    """R2-F1, the post-agent journal refusal of
+    ``test_review_post_agent_journal_refusal_keeps_the_phase_for_resume``: the
+    reviewer returned, the journal append was refused, the phase and the
+    persisted attempt are kept for repair-then-resume. The error is a
+    StateError (exit 2), and classifies as the resumable error it is, never as
+    a refusal routed to a new run."""
+    from autoforge.runlog import MAX_EVENT_JOURNAL_BYTES
+
+    gh = FakeGitHub()
+    eng = _in_review(tmp_state_dir, gh, None)
+    journal = Path(eng.paths.logs_dir) / eng.state.run_id / "events.jsonl"
+
+    def reviews_then_enlarges_the_journal(req):
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.touch()
+        os.truncate(journal, 2 * MAX_EVENT_JOURNAL_BYTES)
+        return block(review_payload(1, SHA_A, []))
+
+    eng.provider._handler = reviews_then_enlarges_the_journal
+    with pytest.raises(errors.StateError, match="after the agent had returned") as caught:
+        eng.step()
+    saved = load_state(eng.paths.state_file)
+    assert (saved.phase, saved.attempt) == (Phase.REVIEW, 1)
+    found = classify_exception(caught.value)
+    assert (found.outcome, found.code) == (Out.RESUMABLE_ERROR, C.RUN_LOG_REFUSED)
+    assert found.routes == (R.RESUME,) and found.live_facts_required
+    eng.close()
+
+
+def test_fixture_a_refused_step_directory_after_the_attempt_is_resumable(
+    tmp_state_dir, monkeypatch
+):
+    """R2-F1: the run log's refusal of the step directory, after the attempt
+    was saved and before the launch, is marked the same way."""
+    from autoforge.runlog import RunLogger
+
+    def refuses(self, phase, attempt):
+        raise errors.StateError("corrupted run log directory")
+
+    monkeypatch.setattr(RunLogger, "begin_step", refuses)
+    eng = _in_review(tmp_state_dir, FakeGitHub(), [block(review_payload(1, SHA_A, []))])
+    with pytest.raises(errors.StateError, match="before the agent was launched") as caught:
+        eng.step()
+    assert eng.provider.calls == []
+    saved = load_state(eng.paths.state_file)
+    assert (saved.phase, saved.attempt) == (Phase.REVIEW, 1)
+    found = classify_exception(caught.value)
+    assert (found.outcome, found.code) == (Out.RESUMABLE_ERROR, C.RUN_LOG_REFUSED)
+
+
 def test_fixture_a_plain_reason_at_a_funnel_is_unknown_and_still_blocked(tmp_state_dir):
     """The safe fallback: a BLOCKED reason no sink coded is UNKNOWN, and the
     outcome and its routes are what BLOCKED always allows."""
@@ -699,6 +780,11 @@ def test_every_code_is_produced_by_some_sink():
     engine = (SRC / "engine.py").read_text()
     named = {code for code in StopReasonCode if f"StopReasonCode.{code.name}" in engine}
     named |= {code for _, code in EXCEPTION_CLASSES.values()}
+    # The run log's refusals the engine marks after it saved a launch's attempt.
+    assert engine.count("exc.interrupted_attempt = True") == 2
+    marked = errors.StateError("s")
+    marked.interrupted_attempt = True
+    named.add(classify_exception(marked).code)
     named |= {agent_status(s, Phase.FIX).code for s in ("blocked", "failure")}
     for phase in Phase:
         for scheduler in (False, True):

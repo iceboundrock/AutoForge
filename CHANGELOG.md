@@ -20,6 +20,10 @@ The code is advice: no decision reads it, and `unblock` re-reads GitHub
 whatever it says. It is not saved in the state file, which is unchanged, so
 `resume` and `status` on a stopped run show `reason unknown, from state`;
 `Reason:` keeps the text. An error of `unblock` prints no `stop:` line.
+A run log refused after a launch's attempt was saved still exits 2 and
+still says to repair the log directory and `resume`; its `stop:` line is
+`resumable_error`, reason `run-log-refused`, never a refusal that points to
+a new run.
 
 Seven `BLOCKED` reasons told you to `resume`, which refuses a `BLOCKED`
 run: a conclusive read failure of the default branch or of the branch's PRs

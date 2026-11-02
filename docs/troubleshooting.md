@@ -114,7 +114,10 @@ different next:
 Each of the three also ends with a `stop:` line: the outcome (`blocked`,
 `failed`, `resumable_error`, or `refused` for an exit-2 refusal of `run`,
 `step` or `resume`), a reason code, where the code came from and the
-routes that apply, for example
+routes that apply. One exit 2 is no refusal: a run log refused after a
+launch's attempt was saved (`... after the agent had returned with: ...
+Repair the log directory, then 'resume'`) is `resumable_error`, reason
+`run-log-refused`, since the phase was kept for that `resume`. For example
 
 ```text
 stop: blocked (reason review-round-cap, from controller: the controller entered BLOCKED from REVIEW); next: fix the cause, then 'unblock --reason "..."' (it re-reads GitHub and may refuse), then 'resume' ('epic resume' for a scheduler's issue); or a new run ('run --force' replaces this one)

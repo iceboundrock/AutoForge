@@ -192,6 +192,8 @@ class StopReasonCode(Enum):
     INTERACTION_REQUIRED = "interaction-required"
     CONTROL_RESULT_INVALID = "control-result-invalid"
     VERIFICATION_FAILED = "verification-failed"
+    # The run log refused a launch's step directory or record, its attempt persisted.
+    RUN_LOG_REFUSED = "run-log-refused"
     # Refusals before the command acted (exit 2).
     CONFIGURATION_INVALID = "configuration-invalid"
     CONFIGURATION_DRIFT = "configuration-drift"
@@ -260,6 +262,7 @@ REASON_FAMILY: dict[StopReasonCode, ReasonFamily] = {
     _C.INTERACTION_REQUIRED: _F.EXECUTION,
     _C.CONTROL_RESULT_INVALID: _F.EXECUTION,
     _C.VERIFICATION_FAILED: _F.EXECUTION,
+    _C.RUN_LOG_REFUSED: _F.EXECUTION,
     _C.CONFIGURATION_INVALID: _F.CONFIGURATION,
     _C.CONFIGURATION_DRIFT: _F.CONFIGURATION,
     _C.SANDBOX_CAPABILITY: _F.CONFIGURATION,
@@ -474,6 +477,10 @@ def agent_status(status: str, phase: Phase) -> StopClassification:
 # (``test_stop_classification``), so a parent's entry decides only for a
 # class defined elsewhere. REFUSED is exactly the classes ``cli.main``
 # exits 2 for; every other class exits 1 with the persisted phase unchanged.
+# One typed fact overrides the class (:func:`classify_exception`): a run log's
+# refusal the engine re-raised after it persisted a launch's attempt
+# (``StateError.interrupted_attempt``) still exits 2, but the command acted on
+# the run and left its phase for ``resume``, so it is no refusal.
 EXCEPTION_CLASSES: dict[type[errors.AutoForgeError], tuple[StopOutcome, StopReasonCode]] = {
     errors.AutoForgeError: (_O.UNKNOWN, _C.UNKNOWN),
     # Refusals: the command did not act on the run.
@@ -533,12 +540,24 @@ EXCEPTION_CLASSES: dict[type[errors.AutoForgeError], tuple[StopOutcome, StopReas
 def classify_exception(exc: BaseException) -> StopClassification:
     """The stop a typed error that ended ``run``, ``step`` or ``resume`` is.
 
-    Decided by the error's class alone, nearest mapped class first; its
-    message is never read. An exception that is no
+    Decided by the error's class, nearest mapped class first, and by one
+    typed attribute; its message is never read. A class says that a
+    ``StateError`` exits 2, not that nothing ran: one whose
+    ``interrupted_attempt`` the engine set is a run log's refusal after the
+    launch's attempt was persisted (the agent may have run, its side effects
+    may be on GitHub), the phase is unchanged, and the error itself says to
+    repair the log directory and ``resume``. An exception that is no
     :class:`~autoforge.errors.AutoForgeError` is ``UNKNOWN``. Only for the
     lifecycle commands: an error of ``unblock`` leaves the run ``BLOCKED``,
     which ``resume`` refuses, so its routes would be wrong there.
     """
+    if isinstance(exc, errors.StateError) and exc.interrupted_attempt is True:
+        return StopClassification(
+            StopOutcome.RESUMABLE_ERROR,
+            StopReasonCode.RUN_LOG_REFUSED,
+            ReasonSource.EXCEPTION,
+            f"{type(exc).__name__} raised by the run log after the launch's attempt was saved",
+        )
     for cls in type(exc).__mro__:
         entry = EXCEPTION_CLASSES.get(cls)
         if entry is not None:

@@ -46,7 +46,7 @@ be persisted.
 |---|---|---|---|
 | `blocked` | persisted; left only by the operator's `unblock` | 1 | `unblock` (then `resume`), or a new run |
 | `failed` | persisted; no outgoing edge | 1 | investigate, or a new run |
-| `resumable_error` | the command failed and the persisted phase is unchanged | 1 | `resume` |
+| `resumable_error` | the command failed and the persisted phase is unchanged | 1 (2 for `run-log-refused`) | `resume` |
 | `refused` | the command refused before it acted on the run | 2 | by its code (D4) |
 | `awaiting_input` | #126's durable pause | — | none until #126 lands |
 | `ready_for_merge` | the merge gate is closed at a certified clean review | 0 | merge by hand, or (a standalone run only) open the gate and `resume` |
@@ -85,9 +85,19 @@ so. There are four sources, and the text of a reason is never one of them:
   `step` or `resume`, nearest mapped class first along its MRO
   (`EXCEPTION_CLASSES`). Its message is never read. `refused` is exactly
   the four bases `cli.main` exits 2 for (`ConfigurationError`,
-  `StateError`, `StateTransitionError`, `LockError`). An error of
-  `unblock` is not classified: the run is still `BLOCKED` after it, and a
-  `resume` route would be wrong.
+  `StateError`, `StateTransitionError`, `LockError`), with one exception
+  that a class cannot carry: a class says an error exits 2, not that
+  nothing ran. A run log's refusal the engine re-raises after it saved a
+  launch's attempt (`_begin_step` before the launch, `_record_invocation`
+  after the agent returned) keeps its class, the filesystem cause, and its
+  exit 2, and the engine sets the typed `StateError.interrupted_attempt` on
+  it. The command acted on the run (the agent may have run, its effects may
+  be on GitHub) and left the phase for repair-then-`resume`, so it is
+  `resumable_error` / `run-log-refused`, never `refused` / `state-invalid`
+  with a new run among its routes
+  (`test_a_post_agent_run_log_refusal_is_a_resumable_stop_not_a_refusal`).
+  An error of `unblock` is not classified: the run is still `BLOCKED`
+  after it, and a `resume` route would be wrong.
 - **`state`**: a loaded state's phase and settlement, through
   `transitions.issue_settlement` (so the scheduler's view and #126's
   predicate are the same ones ADR 0008 D15.1 uses).
@@ -167,7 +177,7 @@ exhaustive by `test_every_error_class_is_mapped_explicitly`.
 | merge gate | `READY_FOR_MERGE`, `MERGE` | `blocked` | `merge-inconclusive`, `pr-identity`, `pr-not-open`, `unreviewed-merge`, `merge-checks`, `merge-conflict`, `merge-not-ready`, `merge-write`, `premerge-verification`, `review-certificate`, `review-not-backed` |
 | workspace | around an agent launch | `blocked` | `checkout-drift`, `sandbox-tamper` |
 | agent | the agent-status sink | `blocked`, `failed` | `agent-blocked`, `agent-failure` |
-| execution | an error ending `run` / `step` / `resume` | `resumable_error` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required` (SDK questions and permissions, #134), `control-result-invalid`, `verification-failed`, `github-unavailable`, `github-error`, `github-checks-refused`, `git-transport`, `effect-conflict`, `claim-ambiguous`, `checkout-drift`, `sandbox-tamper`, `validation-*` |
+| execution | an error ending `run` / `step` / `resume` | `resumable_error` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required` (SDK questions and permissions, #134), `control-result-invalid`, `verification-failed`, `github-unavailable`, `github-error`, `github-checks-refused`, `git-transport`, `effect-conflict`, `claim-ambiguous`, `checkout-drift`, `sandbox-tamper`, `validation-*`, `run-log-refused` (a run log refused after a launch's attempt was saved; exit 2) |
 | refusals | an error before the command acted | `refused` | `configuration-invalid`, `configuration-drift` (#219), `sandbox-capability` (ADR 0005 D12.2), `scheduler-owned`, `state-invalid` (LOCAL's state among them), `state-protocol` (#265), `state-transition`, `lock-held` |
 | intentional | the saved state | `ready_for_merge`, `handoff`, `done`, `in_progress` | the outcome's own code |
 | unknown | an unmapped error, an uncoded reason, a persisted stop | `unknown` or the sink's | `unknown` |
@@ -286,6 +296,7 @@ named):
 | #327 / PR #330, regression negative: a body `gh` sanitizes | no stop: `ANALYZE_EXECUTE -> REVIEW` |
 | an agent's `blocked` / `failure` | `blocked` / `agent-blocked`, `failed` / `agent-failure` / agent |
 | a resumable timeout | `resumable_error` / `execution-timeout` / exception, phase unchanged |
+| a post-agent journal refusal (#55), and a refused step directory after the attempt was saved | `resumable_error` / `run-log-refused` / exception, phase and attempt kept |
 | a conclusive read failure of the next issue in `UPDATE_EPIC` | `blocked` / `github-read-failed` / controller; its saved reason says `unblock` |
 | a plain reason at a funnel | `blocked` / `unknown` / controller |
 | `run`, `resume`, `status`, an exit-2 refusal, `unblock` (`test_cli.py`) | the printed `stop:` line, or none for `unblock` |

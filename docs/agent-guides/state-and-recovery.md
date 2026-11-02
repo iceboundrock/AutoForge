@@ -1389,9 +1389,14 @@ bases `cli.main` exits 2 for are `refused`, every other class that ends
 `run`, `step` or `resume` leaves the phase unchanged and is
 `resumable_error`, and a class with no rule of its own is `unknown`. The
 CLI prints that classification as a `stop:` line; it is decided by the
-class alone, never by the message, and nothing that retries, blocks or
-transitions reads it. A new class gets its entry in the same change
-(`test_every_error_class_is_mapped_explicitly`).
+class and one typed attribute, never by the message, and nothing that
+retries, blocks or transitions reads it. The attribute is
+`StateError.interrupted_attempt`, which the engine sets on a run log's
+refusal it re-raises after it saved a launch's attempt (`_begin_step`,
+`_record_invocation`): that error still exits 2, but the command acted on
+the run and kept its phase for repair-then-`resume`, so it is
+`resumable_error` / `run-log-refused`, not a refusal. A new class gets its
+entry in the same change (`test_every_error_class_is_mapped_explicitly`).
 
 The per-issue scheduler namespaces (#178, above) add three, none of them
 retried. `NamespaceError` is a `StateError`: a `binding.json` that is not a

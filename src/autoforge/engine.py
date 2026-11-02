@@ -12378,6 +12378,8 @@ class ControllerEngine:
                 "the agent was launched, so nothing was launched; repair the log directory, "
                 "then 'resume'",
             )
+            # The attempt was persisted (#369): typed as in _record_invocation.
+            exc.interrupted_attempt = True
             raise
 
     def _progress_label(self, phase: Phase) -> str:
@@ -12484,6 +12486,10 @@ class ControllerEngine:
                 f"{exc}. This refusal interrupted attempt {record.attempt} of {phase.value} "
                 f"after the agent had returned with: {outcome}. {follow_up}.",
             )
+            # Typed, for the stop classification (#369): the attempt was
+            # persisted and the agent ran, so this is no refusal before the
+            # command acted, whatever the class says.
+            exc.interrupted_attempt = True
             raise
 
     # -- verification + state application -------------------------------------------
