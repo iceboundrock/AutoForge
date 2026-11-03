@@ -1043,7 +1043,14 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   the state records the PR as owned (`owned_pr_url`: it published the PR,
   took it over, or read a marker naming a run on it), either one, or a body
   that reads empty, blocks (`pr-owner`), since the owner was removed
-  (PR #459 R1-F1);
+  (PR #459 R1-F1). Before the PR is bound, the journal says it: K2 and K3's
+  read back, and the replan's binding of its replacement, the reads before
+  and after the close and the activation, hold a PR whose record published
+  this run's marker to that owner, so a marker changed or removed after a
+  crash in that window blocks (K2, K3) or rejects the transaction (K7)
+  before the PR is bound, the source closed or the replacement activated
+  (PR #459 R2-F1). A refused `unblock` whose read of the bound PR found a
+  marker naming a run saves that it did (PR #459 R2-F2);
 - a takeover is the operator's: stop the owning run, replace the marker in
   the PR body with the one the refusal names, then `unblock --take-over
   <PR>` binds it and enters `REVIEW`. The controller writes no marker of its

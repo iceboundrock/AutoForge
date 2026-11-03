@@ -7549,6 +7549,150 @@ def test_a_takeover_between_the_push_and_the_replacement_pr_creates_no_pr(tmp_st
     assert _creates(gh) == [] and gh.prs[PR].state == "OPEN" and gh.closed_prs == []
 
 
+# -- the replacement's owner, from the journaled K7 record (#414, PR #459 R2-F1) ------
+def _crash_once_k7_is_observed(eng) -> None:
+    """The process dies right after the K7 record's ``observed`` stage is saved."""
+    persist = eng._persist_effect
+
+    def dying(record):
+        persist(record)
+        if record.kind.value == "replacement_pr" and record.stage.value == "observed":
+            raise RuntimeError("power loss")
+
+    eng._persist_effect = dying
+
+
+def _crash_before(name: str):
+    """The process dies when the step reaches ``name``, after the checkpoint saved before it."""
+
+    def crash(eng) -> None:
+        def dying(*args, **kwargs):
+            raise RuntimeError("power loss")
+
+        setattr(eng, name, dying)
+
+    return crash
+
+
+# Each recovery checkpoint after the K7 create, with the stage it saved and
+# whether the source was closed before the crash.
+_K7_CRASH_WINDOWS = [
+    pytest.param(_crash_once_k7_is_observed, ReplanStage.PREPARED, False, id="k7-observed"),
+    pytest.param(_crash_before("_supersede_source"), ReplanStage.VERIFIED, False, id="verified"),
+    pytest.param(
+        _crash_before("_activate_if_verified"), ReplanStage.SUPERSEDED, True, id="superseded"
+    ),
+]
+
+
+@pytest.mark.parametrize(("crash", "stage", "closed"), _K7_CRASH_WINDOWS)
+@pytest.mark.parametrize(
+    ("owner", "found"),
+    [
+        pytest.param(None, "naming no run, but this run published its marker", id="removed"),
+        pytest.param(OTHER_RUN, f"names run {OTHER_RUN} as its owner", id="another-run"),
+    ],
+)
+def test_a_replacement_whose_owner_changed_after_k7_is_never_activated(
+    tmp_state_dir, crash, stage, closed, owner, found
+):
+    """PR #459 R2-F1: K7 published the replacement's marker naming this run,
+    and the process died at a recovery checkpoint after the create. Before
+    the resume someone rewrote the marker to name no run, or another run.
+    Before R2-F1 the binding and the activation read the owner from the
+    replacement alone, so a removed owner closed the source and activated
+    the replacement as a legacy PR. The journaled K7 record says it was
+    published with this run's owner: the resume rejects the transaction
+    before it binds the replacement, closes the source or activates the
+    replacement, whichever is still ahead, and launches nothing."""
+    gh = FakeGitHub()
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh))
+    crash(eng)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    persisted = load_state(eng.paths.state_file).replan_transaction
+    assert ReplanTransaction.from_dict(persisted).stage is stage
+    assert _plan_stages(eng) == [("push", "observed"), ("replacement_pr", "observed")]
+    assert (gh.prs[PR].state == "CLOSED") is closed
+    published = render_implementation_marker(ISSUE, eng.state.run_id)
+    replacement = gh.prs[REPLACEMENT_PR]
+    assert published in replacement.body
+    replacement.body = replacement.body.replace(
+        published, render_implementation_marker(ISSUE, owner)
+    )
+
+    eng2 = _restart(eng, gh, save=False)
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.REPLAN_REFUSED
+    assert _txn(eng2).stage is ReplanStage.REJECTED
+    reason = eng2.state.block_reason
+    assert f"PR {REPLACEMENT_PR} " in reason and found in reason
+    assert "the replacement is not this run's to bind or activate" in reason
+    s = load_state(eng2.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url, s.superseded_prs) == (PR, "", [])
+    assert len(gh.closed_prs) == (1 if closed else 0) and gh.reopened_prs == []
+    assert eng2.provider.calls == [] and len(_creates(gh)) == 1
+
+
+def test_a_replacement_whose_owner_is_removed_inside_the_close_window_is_undone(tmp_state_dir):
+    """PR #459 R2-F1: the owner is removed between the last read before the
+    close and the close itself. The read after the close holds the
+    replacement to the journaled K7 record's owner as every other
+    checkpoint does: the close is undone (the source reopened) and the
+    transaction rejected, with the replacement never activated."""
+    gh = FakeGitHub()
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh))
+    close = gh.close_pr
+
+    def owner_removed_in_the_window(*args, **kwargs):
+        replacement = gh.prs[REPLACEMENT_PR]
+        replacement.body = replacement.body.replace(
+            render_implementation_marker(ISSUE, eng.state.run_id),
+            render_implementation_marker(ISSUE),
+        )
+        return close(*args, **kwargs)
+
+    gh.close_pr = owner_removed_in_the_window
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    reason = eng.state.block_reason
+    assert "naming no run, but this run published its marker naming this run" in reason
+    assert gh.prs[PR].state == "OPEN" and len(gh.reopened_prs) == 1
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url, s.superseded_prs) == (PR, "", [])
+
+
+def test_a_legacy_k7_record_still_activates_its_ownerless_replacement(tmp_state_dir):
+    """PR #459 R2-F1 keeps a genuinely ownerless publication recovering: a
+    K7 record saved before #414 (protocol 13) published the ownerless
+    marker, and the process died once it was observed. The upgraded resume
+    binds, closes over and activates its replacement as a legacy PR."""
+    gh = FakeGitHub()
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh))
+    _crash_once_k7_is_observed(eng)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    published = render_implementation_marker(ISSUE, eng.state.run_id)
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    create = data["effect_records"][1]
+    create["payload"]["body"] = create["payload"]["body"].replace(published, IMPLEMENTATION_MARKER)
+    data["protocol_version"] = "13"
+    del data["owned_pr_url"]
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    replacement = gh.prs[REPLACEMENT_PR]
+    replacement.body = replacement.body.replace(published, IMPLEMENTATION_MARKER)
+
+    eng2 = _restart(eng, gh, save=False)
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    s = load_state(eng2.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url) == (REPLACEMENT_PR, "")
+    assert gh.prs[PR].state == "CLOSED" and len(gh.closed_prs) == 1
+    assert eng2.provider.calls == [] and len(_creates(gh)) == 1
+
+
 def test_a_create_lost_in_flight_is_reconciled_and_issued_once_more_on_resume(tmp_state_dir):
     """Window: the push landed, the PR create was attempted and did not land.
     The resume reads, finds no PR and creates it exactly once more; the push

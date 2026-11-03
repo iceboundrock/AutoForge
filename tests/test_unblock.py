@@ -116,6 +116,22 @@ def _assert_untouched(eng, raw_before: str, gh_calls_before=None):
     assert load_state(eng.paths.state_file).unblock_history == []
 
 
+def _assert_only_the_owner_recorded(eng, raw_before: str, owned: str = PR) -> None:
+    """A refusal whose read found a marker naming a run saves ``owned_pr_url`` and nothing else.
+
+    PR #459 R2-F2: the run stays BLOCKED exactly as it was (its phase,
+    reason, history and validation watermark), and only the owned PR and
+    the save's own timestamp differ from the file before.
+    """
+    before = json.loads(raw_before)
+    after = json.loads(eng.paths.state_file.read_text())
+    assert (before["owned_pr_url"], after["owned_pr_url"]) == ("", owned)
+    changed = {key for key in before.keys() | after.keys() if before.get(key) != after.get(key)}
+    assert changed <= {"owned_pr_url", "updated_at"}
+    assert load_state(eng.paths.state_file).phase == Phase.BLOCKED
+    assert load_state(eng.paths.state_file).unblock_history == []
+
+
 # -- preconditions ---------------------------------------------------------------
 def test_unblock_requires_a_blocked_run(tmp_state_dir, fake_github):
     eng = make_engine(tmp_state_dir, [], github=fake_github)
@@ -276,7 +292,67 @@ def test_unblock_take_over_is_refused_for_a_run_bound_to_a_pr(tmp_state_dir, fak
     out = eng.unblock(REASON, take_over=PR)
     assert not out.unblocked
     assert "unblock --take-over binds a PR to a run that has none" in out.message
+    # The decision read the bound PR's marker naming this run: the refusal
+    # records the PR as owned, and nothing else (PR #459 R2-F2).
+    _assert_only_the_owner_recorded(eng, raw)
+
+
+@pytest.mark.parametrize(
+    ("remove", "found"),
+    [
+        pytest.param(
+            lambda gh: setattr(gh.prs[PR], "body", implementation_pr_body()),
+            "carries an implementation marker for issue #2 naming no run",
+            id="owner-removed",
+        ),
+        pytest.param(
+            lambda gh: setattr(gh.prs[PR], "body", "Started by hand."),
+            "carries no implementation marker for issue #2",
+            id="marker-removed",
+        ),
+    ],
+)
+def test_a_refused_unblock_keeps_the_owner_it_read_across_a_restart(
+    tmp_state_dir, fake_github, remove, found
+):
+    """PR #459 R2-F2: a legacy binding (its record names no owned PR, as
+    protocol 13 left it) is BLOCKED for another reason when the operator
+    hands its PR to another run. The run's next read of the PR is the
+    unblock's: it refuses, naming the owner, and that refusal is what
+    records the PR as owned. Before R2-F2 it saved nothing, so once the
+    owner was removed a new process read a legacy binding again and a plain
+    unblock re-entered REVIEW. A dry run still writes nothing, and the
+    refusal moves no phase, reason, history or validation watermark."""
+    fake_github.add_pr(head_sha=SHA_A, body=implementation_pr_body())
+    eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **_reviewed())
+    assert eng.state.owned_pr_url == ""
+    fake_github.prs[PR].body = implementation_pr_body(owner_run_id=OTHER_RUN)
+    raw = eng.paths.state_file.read_text()
+
+    preview = eng.unblock(REASON, dry_run=True)
+    assert preview.dry_run and not preview.unblocked
+    assert f"names run {OTHER_RUN} as its owner, not this run" in preview.message
     _assert_untouched(eng, raw)
+
+    refused = eng.unblock(REASON)
+    assert not refused.unblocked and refused.phase == "BLOCKED"
+    assert f"names run {OTHER_RUN} as its owner, not this run" in refused.message
+    _assert_only_the_owner_recorded(eng, raw)
+    s = load_state(eng.paths.state_file)
+    assert (s.block_reason, s.validation_override_seq, s.attempt) == ("stuck", None, 0)
+
+    remove(fake_github)
+    eng.close()
+    eng2 = make_engine(tmp_state_dir, [], github=fake_github)
+    eng2.load()
+    assert eng2.state.owned_pr_url == PR
+    raw = eng2.paths.state_file.read_text()
+    again = eng2.unblock("the other run let go of it")
+    assert not again.unblocked and again.phase == "BLOCKED"
+    assert found in again.message and "the owner was removed since" in again.message
+    _assert_untouched(eng2, raw)
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert fake_github.effect_writes == []
 
 
 @pytest.mark.parametrize("value", ["not a url", ISSUE, "https://github.com/owner/repo/pull/x"])

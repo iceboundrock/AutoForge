@@ -919,11 +919,14 @@ with `BLOCKED` and `pr-owner`, before anything is launched or written.
   long as the marker names the other run.
 - **A run whose PR's owner was removed.** Once a run has seen its PR's
   marker name an owner (it opened the PR, took it over, or read a marker
-  naming any run on it), `state.json` records that (`owned_pr_url`). If
-  someone then removes the owner from the marker, removes the marker, or
-  GitHub returns the PR body empty, the run stops: which run owns the PR is
-  no longer knowable. Write the run that is to drive it into the marker
-  (step 2 below), then a plain `unblock` on that run.
+  naming any run on it, a refused `unblock`'s read included),
+  `state.json` records that (`owned_pr_url`). If someone then removes the
+  owner from the marker, removes the marker, or GitHub returns the PR body
+  empty, the run stops: which run owns the PR is no longer knowable. The
+  same holds after a crash between opening the PR (or its replan
+  replacement) and binding it: the run's journal of what it published
+  says the marker named it. Write the run that is to drive it into the
+  marker (step 2 below), then a plain `unblock` on that run.
 
 To take the PR over:
 

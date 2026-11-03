@@ -511,7 +511,19 @@ High-priority coverage includes:
   driving its PR; a legacy re-entry blocks on an ownerless marked PR it
   has no record of; and a takeover after `FIX`'s first send, before a
   `PREPARED` replan's relaunch, before a saved replan plan is replayed or
-  between its push and its replacement PR sends nothing more
+  between its push and its replacement PR sends nothing more. The journal
+  decides before the binding (PR #459 R2-F1): a crash once K2 or K3 is
+  observed, then a marker naming no run or another run, blocks the resume
+  (`pr-owner`) with nothing bound or launched and the plan kept, until the
+  marker names the run again; a crash once K7 is observed, at `VERIFIED`
+  or at `SUPERSEDED`, then the same edit to the replacement, rejects the
+  transaction before it binds the replacement, closes the source or
+  activates the replacement, and the same edit inside the close window
+  undoes the close; a K2 or K7 record saved before #414 (protocol 13)
+  still binds its ownerless PR as legacy. A refused `unblock` whose read
+  found another run's marker saves `owned_pr_url` and nothing else, a dry
+  run saves nothing, and after the owner is removed a new process still
+  refuses (PR #459 R2-F2; `tests/test_unblock.py`)
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

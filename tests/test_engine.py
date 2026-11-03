@@ -2283,6 +2283,130 @@ def test_a_run_that_published_its_pr_blocks_once_its_owner_is_removed(
     assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
 
 
+# -- an owner changed between the publication and the binding (PR #459 R2-F1) ---------
+def _rewrite_owner(gh: FakeGitHub, url: str, run_id: str, owner: str | None) -> None:
+    """Someone rewrites the marker ``run_id`` published on ``url`` to name ``owner``."""
+    published = render_implementation_marker(ISSUE, run_id)
+    assert published in gh.prs[url].body
+    gh.prs[url].body = gh.prs[url].body.replace(
+        published, render_implementation_marker(ISSUE, owner)
+    )
+
+
+_PUBLISHED_OWNER_CHANGES = [
+    pytest.param(
+        None,
+        "carries an implementation marker for issue #2 naming no run, but this run published "
+        "its marker naming this run ({record}): the owner was removed since",
+        id="owner-removed",
+    ),
+    pytest.param(
+        OTHER_RUN,
+        f"names run {OTHER_RUN} as its owner, not this run",
+        id="another-run",
+    ),
+]
+
+
+def _assert_not_bound_for_the_owner(eng, out, url: str, found: str, record: str) -> None:
+    """The read back refused ``url`` for its owner: nothing bound, the plan kept."""
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert f"PR {url} " in reason and found.format(record=record) in reason
+    assert f"the PR was not bound and nothing was launched ({record} stays journaled" in reason
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.owned_pr_url) == (Phase.BLOCKED, "", "")
+    assert [(r["kind"], r["stage"]) for r in s.effect_records][1][1] == "observed"
+
+
+@pytest.mark.parametrize(("owner", "found"), _PUBLISHED_OWNER_CHANGES)
+def test_a_k2_crash_before_the_binding_refuses_an_owner_changed_since(
+    tmp_state_dir, fake_github, owner, found
+):
+    """PR #459 R2-F1: K2 opened the PR with the marker naming this run, and
+    the process died once the create was observed, before the PR was bound.
+    Someone then rewrote the marker. Before R2-F1 the read back took the
+    owner from the PR alone and bound a removed owner as a legacy PR, whose
+    REVIEW then launched a reviewer. The journal says K2 published this
+    run's owner: the resume blocks before binding, launching nothing, and
+    keeps the plan, so a plain unblock reads the PR again on re-entry, and
+    binds it as owned only once the marker names this run again."""
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    _power_loss_at(eng, EffectKind.IMPLEMENTATION_PR, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    run_id = eng.state.run_id
+    _rewrite_owner(fake_github, PR, run_id, owner)
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    record = f"implementation_pr effect 1 on {eng2.state.repository}"
+    _assert_not_bound_for_the_owner(eng2, eng2.step(), PR, found, record)
+    done = eng2.unblock("the owner is checked")
+    assert done.unblocked and done.phase == "ANALYZE_EXECUTE", done.message
+    _assert_not_bound_for_the_owner(eng2, eng2.step(), PR, found, record)
+
+    _owned_by(fake_github, run_id)
+    assert eng2.unblock("the marker names this run again").phase == "ANALYZE_EXECUTE"
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    s = load_state(eng2.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url, s.effect_records) == (PR, PR, [])
+    assert len(eng.provider.calls) == 1 and eng2.provider.calls == []
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+
+
+@pytest.mark.parametrize(("owner", "found"), _PUBLISHED_OWNER_CHANGES)
+def test_a_k3_crash_before_the_binding_refuses_an_owner_changed_since(
+    tmp_state_dir, fake_github, owner, found
+):
+    """PR #459 R2-F1, K3's equivalent: the adoption appended the marker
+    naming this run to the unmarked PR on the branch, and the process died
+    once it was observed. A marker rewritten before the resume refuses the
+    PR before it is bound, as K2's does."""
+    eng, _ = _adopting(tmp_state_dir, fake_github)
+    _power_loss_at(eng, EffectKind.ADOPT_PR, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    _rewrite_owner(fake_github, PR41, eng.state.run_id, owner)
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    record = f"adopt_pr effect 1 on {PR41}"
+    _assert_not_bound_for_the_owner(eng2, eng2.step(), PR41, found, record)
+    assert eng2.provider.calls == []
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
+
+
+def test_a_legacy_k2_record_still_binds_its_ownerless_pr(tmp_state_dir, fake_github):
+    """PR #459 R2-F1 keeps a genuinely ownerless publication recovering: a
+    K2 record saved before #414 (protocol 13) published the ownerless
+    marker, and the process died once the create was observed. The upgraded
+    resume binds that PR as a legacy one, as before."""
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    _power_loss_at(eng, EffectKind.IMPLEMENTATION_PR, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    published = render_implementation_marker(ISSUE, eng.state.run_id)
+    ownerless = render_implementation_marker(ISSUE)
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    create = data["effect_records"][1]
+    create["identity"]["marker"] = ownerless
+    create["payload"]["body"] = create["payload"]["body"].replace(published, ownerless)
+    data["protocol_version"] = "13"
+    del data["owned_pr_url"]
+    eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
+    _rewrite_owner(fake_github, PR, eng.state.run_id, None)
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    s = load_state(eng2.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url, s.protocol_version) == (PR, "", "14")
+    assert eng2.provider.calls == []
+
+
 @pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
 def test_a_displaced_run_stays_refused_once_the_new_owner_is_removed(
     tmp_state_dir, fake_github, remove, found

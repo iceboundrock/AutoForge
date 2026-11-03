@@ -2269,8 +2269,9 @@ its author. Only the effect records and the entry observation prove origin.
     prints it exactly), and run `unblock --take-over <PR URL>` on that
     run. The edit is the takeover every other run reads. The flag is the
     taking state's record of it, since a marker naming a run proves
-    nothing by itself. The unblock is refused, with nothing written,
-    unless all of these hold:
+    nothing by itself. The unblock is refused, with nothing written but
+    an owner its read of a bound PR found (R2-F2, below), unless all of
+    these hold:
     - no PR is bound;
     - no `ANALYZE_EXECUTE` plan or record is saved (the journal is
       completed first);
@@ -2301,11 +2302,13 @@ its author. Only the effect records and the entry observation prove origin.
     the run's own record does. `owned_pr_url` is the canonical URL of the
     bound PR when its marker is known to have named an owner, and `""`
     otherwise. The state sets it at each of these points:
-    - K2 or K3's read back of a marker naming the record's run;
-    - K7's activation of a replacement whose marker names this run;
+    - K2 or K3's binding of the PR its journaled record published under a
+      marker naming the record's run;
+    - K7's activation of a replacement its journaled record published
+      under a marker naming this run;
     - a takeover;
     - any read of the bound PR whose marker names a run, this one or
-      another.
+      another, a refused `unblock`'s included.
 
     It is cleared only when another PR is bound. While it names the bound
     PR, a marker naming no run, no marker and an empty body refuse
@@ -2314,6 +2317,29 @@ its author. Only the effect records and the entry observation prove origin.
     drive it into the marker, then `unblock`. A displaced run has recorded
     the owner on the read that refused it, so removing the new owner later
     does not hand the PR back to it either.
+  - **Before the binding, the journal (PR #459 R2-F1).** Between K2, K3 or
+    K7's `observed` save and the binding, `owned_pr_url` cannot name the
+    PR yet, and a crash leaves the PR's marker as the only live source. The
+    marker is public text anyone with the login can edit. So the journaled
+    record decides whether the PR was published with an owner: K2 and K3's
+    identity marker, or the closing block of K7's body. It stays with the
+    phase's effect state until the save that binds the PR, a `BLOCKED` save
+    included. When it names this run, a read finding another run or none is
+    refused before the PR is bound: K2 and K3 block (`pr-owner`) with the
+    plan kept, so a plain `unblock` re-enters the phase and reads the PR
+    again. The replan holds its replacement to the same rule at the
+    binding, before the close, after it (a refusal then undoes the close,
+    as any drift there does) and before the activation; a refusal rejects
+    the transaction. A record saved before #414 published no owner and
+    binds its PR as legacy, as before.
+  - **A refused `unblock` keeps what it read (PR #459 R2-F2).** An
+    `unblock` reads the bound PR before it decides. When that read finds a
+    marker naming a run and the state did not yet record the PR as owned,
+    the refusal saves `owned_pr_url` and nothing else. The phase, reason,
+    history and validation watermark stay as they were, and the run log
+    records the refusal as before. Without the save, removing the owner
+    afterwards would let a new process read a legacy binding again and
+    re-enter the PR. A dry run still writes nothing.
   - **Legacy PRs.** A run whose record does not name its PR as owned (a
     binding made by protocol 13 or older, or one whose marker never named
     a run) keeps driving it under a legacy marker or none, and a fresh run

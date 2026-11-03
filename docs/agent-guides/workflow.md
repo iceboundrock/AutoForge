@@ -583,7 +583,10 @@ next entry could not find again.
 - `ANALYZE_EXECUTE` publishes nothing through its agent (#161): the
   controller pushes the agent's commit and opens or adopts the PR from one
   persisted plan. Its entry reads that journal first: a persisted plan is
-  completed from its records without launching the agent. Otherwise, at a
+  completed from its records without launching the agent, and its read back
+  binds the PR only while its marker names no other run and, when the
+  record published this run's marker, still names this run (PR #459
+  R2-F1). Otherwise, at a
   fresh entry, it recovers the PR this state persisted, while that PR's
   `ai-implementation` marker names this run or no owner, without launching
   the agent (a marker naming no owner only while the state does not record
@@ -852,7 +855,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   names this run, recording it as owned (`owned_pr_url`): a later read
   finding the owner removed blocks. The history entry's `action` is
   `take-over <PR>`. It is
-  refused, with nothing written, for a run with a PR bound, with a saved
+  refused, with nothing written but an owner read on a bound PR (see
+  **Refusal** below), for a run with a PR bound, with a saved
   `ANALYZE_EXECUTE` plan or journaled records (the run's own plan is
   completed first: unblock without the flag), with no marked PR, another PR
   named, or a marker naming another run or none. REVIEW reviews the PR
@@ -980,7 +984,13 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
 - **Refusal.** A refusal leaves the state file byte-identical: the run stays
   `BLOCKED` with its reason, and only the run log records the attempt
   (`<run_id>/NNN-blocked-unblock-1/`, with the operator's reason, the block
-  reason and the detail, redacted).
+  reason and the detail, redacted). The one exception is the owned PR (#414,
+  PR #459 R2-F2): when the decision's read of the bound PR found a marker
+  naming a run and the state did not yet record the PR as owned, the
+  refusal saves `owned_pr_url` and nothing else (no phase, reason, history
+  or validation watermark moves), because removing that owner later must
+  not let a new process read a legacy binding again. A dry run writes
+  nothing, this included.
 - **Re-entry.** The chosen phase goes through `validate_transition(BLOCKED,
   target)` like any other step; the operator edges are declared in
   `LEGAL_EDGES` (`UNBLOCK_TARGETS`), never coerced, and checked before the

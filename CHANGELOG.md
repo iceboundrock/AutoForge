@@ -39,10 +39,14 @@ that its own agent opened it.
 
 A run records in `state.json` when its PR's marker has named an owner
 (`owned_pr_url`): it published the PR, took it over, or read a marker
-naming a run on it. From then on a marker that names no run, a missing
-marker and a PR body that reads empty block it (`pr-owner`), because the
-owner was removed and which run owns the PR is not knowable. Write the run
-that is to drive it into the marker, then `unblock`.
+naming a run on it, including on an `unblock` that refuses. From then on a
+marker that names no run, a missing marker and a PR body that reads empty
+block it (`pr-owner`), because the owner was removed and which run owns
+the PR is not knowable. A run that crashed after opening its PR or a replan
+replacement, before binding it, reads the owner it published from its own
+journal, so an owner removed in that window blocks it too, before the
+replacement replaces anything. Write the run that is to drive it into the
+marker, then `unblock`.
 
 `state.json` moves to protocol 14 for `owned_pr_url`. A protocol-13 file
 loads unchanged, with its PR treated as one opened before this change. Its
