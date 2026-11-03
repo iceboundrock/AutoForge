@@ -43,6 +43,53 @@ so.
   one that leaves the run `BLOCKED` exits 1 and prints the run's reason and
   its `stop:` line, as `step` and `resume` do, with the scheduler's routes.
 
+### `status` shows where an unjournaled review comment may have come from (#416)
+
+When `REVIEW` blocks on a round comment the controller did not journal
+(ADR 0004 D9.6), its reason names only the comment, and working out
+whether it was a stray comment or another controller's own review meant
+reading state files, run logs and GitHub by hand. Now `status` of such a
+`BLOCKED` run reads the PR's comments again and, under the reason,
+prints what GitHub and this checkout hold about each comment the round
+blocks on; `status --json` carries the same as `unjournaled_review`
+(`null` when there is none):
+
+- when GitHub says the comment was created, and how long after the run's
+  creation and after the run's last reviewer launches in its run log; the
+  login GitHub names, the comment's marker (at most 20 of its finding ids
+  and 10 of its markers' defects, each with their count), length, SHA-256 and a short excerpt. The length and
+  SHA-256 are of GitHub's text: a body `gh` printed with a `^` is read
+  again exactly, since `gh` rewrites control characters and the text of
+  their escapes. When that read fails, the report gives the print's
+  instead and says so. The excerpt is always `gh`'s print;
+- every state directory on this checkout that journaled it (a review
+  comment effect record observed at it, or `last_review_comment_url`
+  naming it); one that holds only a plan for its round (an effect record
+  for its marker not observed at it), or whose review history records its
+  round at its HEAD, is listed as that, not as the comment's journal, with
+  how the plan's payload compares with GitHub's text. A plan names no
+  comment, and a foreign comment posted after it was saved carries the
+  same marker. Then the state directories bound to the PR. The
+  directories read are the one `status` reads, those in it and under the
+  configured `state_dir`, those beside it when it lies elsewhere, and the
+  scheduler namespaces; an unreadable one is listed, and so is a directory
+  that could not be opened or listed, with the search then reported
+  incomplete;
+- the PR's other `ai-review-result` markers, the commits GitHub lists for
+  the PR committed after the comment (author, committer, time after it;
+  GitHub records when a commit was made, not when it was pushed), and the
+  PR's `ai-implementation` marker (at most 10 of the issues it names and of
+  its defects, with their count) and HEAD.
+
+It is evidence only: it names no author, adopts, deletes and writes
+nothing, and takes no lock. Bodies, commit messages, names and e-mail
+addresses are redacted, put on one line and bounded. A failed read is
+reported and `status` still exits 0. The cost is one more GitHub read
+(the PR's comments) for a `BLOCKED` run with a bound PR, HEAD, base and
+merge base, and two more (the PR and its commits) when such a comment is
+found, plus the exact read of each such comment `gh` printed with a `^`
+(at most 10). The block reason now names the `status` command to run.
+
 ### A body the controller writes back keeps text `gh` rewrites, and an operator's exact comment verifies (#328)
 
 - The controller writes an adopted PR's body (K3), a follow-up issue's
@@ -118,6 +165,53 @@ which discards the run, or editing `state.json`. Now:
 Runs that reached `UPDATE_EPIC` (their PR counted), or with writes on the
 old EPIC, still need the manual fallback the guide describes. See
 [Rebinding a run to its issue's parent](docs/usage.md#rebinding-a-run-to-its-issues-parent).
+
+### `unblock --rereview`: a fresh review round instead of another fixer launch (#428)
+
+A run `BLOCKED` with the PR at the reviewed HEAD and the round's findings
+open could only be unblocked into `FIX`. When you had resolved a finding
+outside the repository (a PR description rewritten by hand), the relaunched
+fixer saw neither your change nor your `--reason` and blocked again, and
+leaving `BLOCKED` meant editing `state.json`.
+
+`autoforge unblock --rereview --reason "..."` gives up that round's `FIX`
+and re-enters `REVIEW`: a new round reviews the same HEAD and reads the PR
+as it now stands. The round's findings are not marked resolved: they are
+handed to the new round to re-check, as when the PR moves, and it may raise
+them again. The new round counts against `workflow.max_review_rounds`.
+The flag is refused, with nothing written, when the round's `FIX` plan is
+saved; when the merge base moved since the review (the base was rewritten
+under its name: unblock without the flag, and `FIX` sends the PR to a fresh
+review without launching the fixer) or cannot be proven unchanged; when the
+agent worktree's `HEAD` is anything but the reviewed HEAD (an unpushed
+commit of the fixer's, say); when the agent worktree holds uncommitted
+changes, which the new round's reviewer would read and test instead of the
+reviewed commit (move them out, or unblock without the flag to let `FIX`
+continue from them), including an edit to a file the worktree's index
+marks assume-unchanged or skip-worktree, or one that a clean filter or
+another conversion its attributes name maps back to the committed content,
+which `git status` does not list: AutoForge compares every tracked file's
+bytes with the reviewed commit itself, with no git process reading the
+worktree, so a worktree whose checkout converts content (Git LFS,
+`eol=crlf`) is refused too; when a submodule's path in the agent worktree
+holds anything but the empty directory a checkout leaves an unpopulated
+submodule (a populated submodule, or files put there), whose content
+AutoForge cannot prove the reviewed commit's and which `git status` lists
+only as far as the submodule's `ignore` setting lets it, or not at all
+(`git submodule deinit` empties a submodule that holds no change and
+refuses one that does); and wherever a plain `unblock` would not re-enter
+`FIX` with open findings. It excludes `--approve-action`,
+`--decline-action` and `--bind-evidence`.
+
+The history entry records the abandoned finding ids (`action`), the run
+log adds `metadata.abandoned_findings`, and `status` shows both. A `FIX`
+agent that reports `blocked` now names the flag in the step's message; the
+saved block reason is still the agent's own text. The state protocol is
+unchanged. The `REVIEW` prompt says when its prior findings come from a
+re-review, and whether the PR moved after the request (a push before the
+round bound its revision); the prompt version is `v15`, and a REMOTE run
+resumed by this version renders the new template and keeps its recorded
+label.
 
 ### A stopped run says how it stopped and what applies next, from typed facts (#369)
 

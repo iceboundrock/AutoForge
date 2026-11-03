@@ -9,28 +9,35 @@ into the shared store.
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from autoforge import agent_worktree
+from autoforge import agent_worktree, materialize
 from autoforge.agent_worktree import (
+    ByteChanges,
     Candidate,
     ObjectImportError,
     alternate_entry,
     bound_admin_dir,
+    byte_changes_from_revision,
+    changes_from_revision,
     holds_objects,
     import_private_objects,
     private_objects_problem,
     read_candidate,
     registered_worktree_roots,
+    uncommitted_entries,
 )
 from autoforge.errors import SandboxTamperError, VerificationError
 from autoforge.executor import ExecutionRequest, execute
+from autoforge.git_workspace import StatusEntry
 
 from .conftest import GIT_IDENT, watched_fifo
 
@@ -406,6 +413,468 @@ def test_a_head_naming_no_commit_reads_as_none(repo):
     (repo["admin"] / "HEAD").write_text("0" * 40 + "\n")
     candidate = read_candidate(repo["common"], repo["admin"], str(repo["worktree"]), None)
     assert candidate.head == "" and candidate.attached is False
+
+
+# ----------------------------------------------------- uncommitted changes (#428)
+
+
+def _uncommitted(repo, runner=None) -> list[StatusEntry]:
+    return uncommitted_entries(repo["common"], repo["admin"], str(repo["worktree"]), runner)
+
+
+def test_a_clean_worktree_lists_no_uncommitted_change(repo):
+    assert _uncommitted(repo) == []
+
+
+def test_each_uncommitted_change_is_listed_with_its_code(repo):
+    worktree = repo["worktree"]
+    (worktree / "a.txt").write_text("changed\n")
+    (worktree / "staged.txt").write_text("staged\n")
+    _git("-C", str(worktree), "add", "staged.txt")
+    (worktree / "sub").mkdir()
+    (worktree / "sub" / "draft.txt").write_text("draft\n")
+    assert _uncommitted(repo) == [
+        StatusEntry(" M", "a.txt"),
+        StatusEntry("A ", "staged.txt"),
+        StatusEntry("??", "sub/draft.txt"),
+    ]
+
+
+def test_the_uncommitted_read_follows_no_pointer_the_agent_can_write(repo):
+    """The status is the bound admin dir's and the common dir's: a `.git`
+    file or a `commondir` pointed at a clean decoy hides nothing (#428)."""
+    (repo["worktree"] / "a.txt").write_text("changed\n")
+    decoy = repo["base"] / "decoy"
+    _git("init", "-q", "-b", "main", str(decoy))
+    (repo["worktree"] / ".git").write_text(f"gitdir: {decoy / '.git'}\n")
+    (repo["admin"] / "commondir").write_text(f"{decoy / '.git'}\n")
+    seen: list[ExecutionRequest] = []
+    assert _uncommitted(repo, _recording(seen)) == [StatusEntry(" M", "a.txt")]
+    (request,) = seen
+    argv = request.command
+    assert argv[argv.index("--git-dir") + 1] == str(repo["admin"])
+    assert argv[argv.index("--work-tree") + 1] == str(repo["worktree"])
+    assert "--no-optional-locks" in argv and "--no-renames" in argv
+    assert request.env["GIT_COMMON_DIR"] == str(repo["common"])
+
+
+def test_a_change_staged_into_the_private_directory_is_listed_without_reading_it(repo):
+    """An enforced agent's `git add` writes its blob into the private object
+    directory only; with rename detection off, the read needs no blob."""
+    worktree = str(repo["worktree"])
+    shared = str(repo["common"] / "objects")
+    env = {
+        "GIT_OBJECT_DIRECTORY": str(repo["private"]),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": f'"{shared}"',
+    }
+    (repo["worktree"] / "b.txt").write_text("b\n")
+    _git("-C", worktree, "add", "b.txt", env=env)
+    assert _uncommitted(repo) == [StatusEntry("A ", "b.txt")]
+
+
+def test_an_unreadable_status_is_refused_never_taken_as_clean(repo):
+    (repo["admin"] / "index").write_bytes(b"not an index")
+    with pytest.raises(VerificationError, match="cannot read the uncommitted changes"):
+        _uncommitted(repo)
+
+
+# ------------------------------------- changes from the revision (PR #444 R2-F1)
+
+
+def _against(repo, runner=None, revision=None) -> list[StatusEntry]:
+    worktree = str(repo["worktree"])
+    revision = revision or _git("-C", worktree, "rev-parse", "HEAD")
+    return changes_from_revision(repo["common"], repo["admin"], worktree, revision, runner)
+
+
+def _commit_in_worktree(repo, files: dict[str, str]) -> None:
+    worktree = str(repo["worktree"])
+    for name, text in files.items():
+        (repo["worktree"] / name).write_text(text)
+    _git("-C", worktree, "add", *files)
+    _git("-C", worktree, *GIT_IDENT, "commit", "-q", "-m", "more")
+
+
+@pytest.mark.parametrize("mark", ["--assume-unchanged", "--skip-worktree"])
+def test_an_edit_the_index_marks_unchanged_is_listed_against_the_revision(repo, mark):
+    """The worktree's index is the agent's to write: with the mark, its own
+    status lists nothing, but against a fresh index of the revision the
+    file is read and compared, and listed."""
+    worktree = repo["worktree"]
+    (worktree / "a.txt").write_text("changed\n")
+    _git("-C", str(worktree), "update-index", mark, "a.txt")
+    assert _git("-C", str(worktree), "status", "--porcelain") == ""
+    assert _uncommitted(repo) == []
+    assert _against(repo) == [StatusEntry(" M", "a.txt")]
+
+
+def test_a_file_deleted_or_retyped_under_a_mark_is_listed_against_the_revision(repo):
+    _commit_in_worktree(repo, {"b.txt": "b\n", "c.txt": "c\n"})
+    worktree = repo["worktree"]
+    (worktree / "b.txt").unlink()
+    _git("-C", str(worktree), "update-index", "--skip-worktree", "b.txt")
+    (worktree / "c.txt").unlink()
+    os.symlink("a.txt", worktree / "c.txt")
+    _git("-C", str(worktree), "update-index", "--assume-unchanged", "c.txt")
+    assert _uncommitted(repo) == []
+    assert _against(repo) == [StatusEntry(" D", "b.txt"), StatusEntry(" T", "c.txt")]
+
+
+def test_the_comparison_reads_content_and_writes_nothing_of_the_repository(repo):
+    """A file rewritten with the revision's content, a new mtime and a mark
+    is no change, and an ignored file is not listed. The fresh index lives
+    in a temporary directory of the controller's, removed after the read;
+    the worktree's index and admin dir are left exactly as they were, and
+    neither the `.git` file nor `commondir`, pointed at a decoy, is read."""
+    worktree, admin, common = repo["worktree"], repo["admin"], repo["common"]
+    head = _git("-C", str(worktree), "rev-parse", "HEAD")
+    (worktree / "a.txt").write_text("a\n")
+    os.utime(worktree / "a.txt", (1, 1))
+    _git("-C", str(worktree), "update-index", "--assume-unchanged", "a.txt")
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "exclude").write_text("*.log\n")
+    (worktree / "run.log").write_text("ignored\n")
+    decoy = repo["base"] / "decoy"
+    _git("init", "-q", "-b", "main", str(decoy))
+    (worktree / ".git").write_text(f"gitdir: {decoy / '.git'}\n")
+    (admin / "commondir").write_text(f"{decoy / '.git'}\n")
+    index = (admin / "index").read_bytes()
+    entries = sorted(p.name for p in admin.iterdir())
+    seen: list[ExecutionRequest] = []
+    assert _against(repo, _recording(seen), head) == []
+    (worktree / "b.txt").write_text("new\n")
+    assert _against(repo, revision=head) == [StatusEntry("??", "b.txt")]
+    assert (admin / "index").read_bytes() == index
+    assert sorted(p.name for p in admin.iterdir()) == entries
+    read_tree, status = seen
+    fresh = Path(read_tree.env["GIT_INDEX_FILE"])
+    assert status.env["GIT_INDEX_FILE"] == str(fresh) and not fresh.parent.exists()
+    assert common not in fresh.parents and worktree not in fresh.parents
+    for request, git_dir in ((read_tree, common), (status, admin)):
+        argv = request.command
+        assert argv[argv.index("--git-dir") + 1] == str(git_dir)
+        assert argv[argv.index("--work-tree") + 1] == str(worktree)
+        assert request.env["GIT_COMMON_DIR"] == str(common)
+        for switch in ("core.sparseCheckout=false", "core.ignoreStat=false"):
+            assert switch in argv
+    assert "read-tree" in read_tree.command and "--no-renames" in status.command
+
+
+def test_sparse_patterns_and_ignore_stat_mark_nothing_in_the_fresh_index(repo):
+    """Configuration that marks index entries (sparse patterns, which the
+    admin dir holds, and core.ignoreStat) is off for the fresh index."""
+    _git("-C", str(repo["root"]), "config", "core.sparseCheckout", "true")
+    _git("-C", str(repo["root"]), "config", "core.ignoreStat", "true")
+    (repo["admin"] / "info").mkdir(exist_ok=True)
+    (repo["admin"] / "info" / "sparse-checkout").write_text("/nothing\n")
+    (repo["worktree"] / "a.txt").write_text("changed\n")
+    assert _against(repo) == [StatusEntry(" M", "a.txt")]
+
+
+def test_a_change_staged_into_the_private_directory_reads_as_untracked(repo):
+    """The fresh index holds the revision's tree alone, so an enforced
+    agent's staged new file is untracked there; no blob is read."""
+    env = {
+        "GIT_OBJECT_DIRECTORY": str(repo["private"]),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": f'"{repo["common"] / "objects"}"',
+    }
+    (repo["worktree"] / "b.txt").write_text("b\n")
+    _git("-C", str(repo["worktree"]), "add", "b.txt", env=env)
+    assert _against(repo) == [StatusEntry("??", "b.txt")]
+
+
+def test_a_revision_the_shared_store_cannot_read_is_refused_never_taken_as_clean(repo):
+    with pytest.raises(VerificationError, match="cannot compare the agent worktree") as exc:
+        _against(repo, revision="0" * 40)
+    assert "`git read-tree 000000000000" in str(exc.value)
+
+
+def test_a_temporary_index_that_cannot_be_made_is_refused_never_taken_as_clean(repo, monkeypatch):
+    def no_space(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(agent_worktree.tempfile, "TemporaryDirectory", no_space)
+    with pytest.raises(VerificationError, match="temporary index directory: No space left"):
+        _against(repo, revision="0" * 40)
+
+
+# ---------------------------------------------- the worktree's bytes (PR #444 R3-F1)
+
+
+def _byte_changes(repo, runner=None, revision=None) -> ByteChanges:
+    worktree = str(repo["worktree"])
+    revision = revision or _git("-C", worktree, "rev-parse", "HEAD")
+    return byte_changes_from_revision(repo["common"], worktree, revision, runner)
+
+
+def _bytes_against(repo, runner=None, revision=None) -> list[StatusEntry]:
+    """The tracked files and the submodule paths the byte comparison lists, in that order."""
+    changes = _byte_changes(repo, runner, revision)
+    return [*changes.files, *changes.submodules]
+
+
+def _converting(repo, conversion: str) -> None:
+    """``a.txt`` (committed ``a``) edited in the worktree, and a conversion git applies to it
+    before it compares, which maps the edit back to the committed bytes. The repository's
+    configuration and ``info/attributes`` hold it, as the reviewer's reproduction had it."""
+    worktree, common = repo["worktree"], repo["common"]
+    (common / "info").mkdir(exist_ok=True)
+    if conversion == "clean filter":
+        committed = repo["base"] / "committed-a.txt"
+        committed.write_text("a\n")
+        clean = f"cat >/dev/null; cat {shlex.quote(str(committed))}"
+        _git("-C", str(repo["root"]), "config", "filter.revert.clean", clean)
+        (common / "info" / "attributes").write_text("a.txt filter=revert\n")
+        (worktree / "a.txt").write_text("TTL_SECONDS = 300\n")
+    else:  # an end-of-line conversion: CRLF in the file, LF in the blob
+        (common / "info" / "attributes").write_text("a.txt text eol=crlf\n")
+        (worktree / "a.txt").write_bytes(b"a\r\n")
+
+
+@pytest.mark.parametrize("conversion", ["clean filter", "eol"])
+def test_a_conversion_hides_an_edit_from_both_statuses_never_from_the_bytes(repo, conversion):
+    """Git converts a file as its attributes say before it compares it, so a
+    clean filter maps an edit back to the reviewed blob: neither status
+    lists it, with or without a mark in the worktree's index. The bytes do
+    not match the blob's, and the byte comparison lists it."""
+    _converting(repo, conversion)
+    _git("-C", str(repo["worktree"]), "update-index", "--assume-unchanged", "a.txt")
+    assert _uncommitted(repo) == []
+    assert _against(repo) == []
+    assert _bytes_against(repo) == [StatusEntry(" M", "a.txt")]
+
+
+def test_the_byte_comparison_runs_no_git_in_the_worktree_and_reads_only_tracked_files(repo):
+    """The tree is listed from the shared store, with git run in the common
+    dir: no git process names the worktree, so no attribute, filter or
+    index of the worktree takes part. A rewrite with the committed bytes
+    and a new mtime is no change; an untracked or ignored file, and the
+    `.git` file pointed at a decoy, are not looked at."""
+    worktree, common = repo["worktree"], repo["common"]
+    (worktree / "a.txt").write_text("a\n")
+    os.utime(worktree / "a.txt", (1, 1))
+    (common / "info").mkdir(exist_ok=True)
+    (common / "info" / "exclude").write_text("*.log\n")
+    (worktree / "run.log").write_text("ignored\n")
+    (worktree / "draft.txt").write_text("untracked\n")
+    head = _git("-C", str(worktree), "rev-parse", "HEAD")
+    decoy = repo["base"] / "decoy"
+    _git("init", "-q", "-b", "main", str(decoy))
+    (worktree / ".git").write_text(f"gitdir: {decoy / '.git'}\n")
+    (repo["admin"] / "commondir").write_text(f"{decoy / '.git'}\n")
+    seen: list[ExecutionRequest] = []
+    assert _bytes_against(repo, _recording(seen), head) == []
+    assert seen
+    for request in seen:
+        argv = request.command
+        assert argv[argv.index("-C") + 1] == str(common)
+        assert not any(str(worktree) in arg for arg in argv) and request.cwd is None
+    assert any("ls-tree" in request.command for request in seen)
+
+
+def test_each_tracked_file_the_worktree_does_not_hold_as_committed_is_listed(repo):
+    """A deletion, a file replaced by a link, a retargeted link and a flipped
+    execute bit, the last with core.fileMode off, which hides it from both
+    statuses."""
+    worktree = repo["worktree"]
+    os.symlink("a.txt", worktree / "link")
+    _commit_in_worktree(repo, {"b.txt": "b\n", "c.txt": "c\n"})
+    _git("-C", str(worktree), "add", "link")
+    _git("-C", str(worktree), *GIT_IDENT, "commit", "-q", "-m", "link")
+    _git("-C", str(repo["root"]), "config", "core.fileMode", "false")
+    (worktree / "a.txt").chmod(0o755)
+    (worktree / "b.txt").unlink()
+    (worktree / "c.txt").unlink()
+    os.symlink("b.txt", worktree / "c.txt")
+    (worktree / "link").unlink()
+    os.symlink("c.txt", worktree / "link")
+    assert _bytes_against(repo) == [
+        StatusEntry(" M", "a.txt"),
+        StatusEntry(" D", "b.txt"),
+        StatusEntry(" T", "c.txt"),
+        StatusEntry(" M", "link"),
+    ]
+    assert StatusEntry(" M", "a.txt") not in _against(repo)
+
+
+def test_a_directory_replaced_by_a_link_is_not_followed(repo):
+    """A tracked directory replaced by a link to a copy holding the same
+    bytes: nothing is read through the link, and the files below it read as
+    deleted, as `git status` lists them."""
+    worktree = repo["worktree"]
+    (worktree / "sub").mkdir()
+    _commit_in_worktree(repo, {"sub/x.txt": "x\n"})
+    copy = repo["base"] / "copy"
+    shutil.copytree(worktree / "sub", copy)
+    shutil.rmtree(worktree / "sub")
+    os.symlink(copy, worktree / "sub")
+    assert _bytes_against(repo) == [StatusEntry(" D", "sub/x.txt")]
+
+
+def test_a_fifo_at_a_tracked_path_is_retyped_never_opened(repo):
+    (repo["worktree"] / "a.txt").unlink()
+    with watched_fifo(repo["worktree"] / "a.txt") as opened:
+        assert _bytes_against(repo) == [StatusEntry(" T", "a.txt")]
+    assert opened == []
+
+
+def test_a_file_of_another_size_is_listed_without_reading_it(repo, monkeypatch):
+    """The listing holds each blob's size, so a file of another size (a
+    planted sparse file, say) is modified before any of its bytes is read;
+    a file of the same size is read and hashed."""
+    read: list[bytes] = []
+    file_id = materialize._file_id
+
+    def recording(algorithm, dir_fd, name, seen):
+        read.append(name)
+        return file_id(algorithm, dir_fd, name, seen)
+
+    monkeypatch.setattr(materialize, "_file_id", recording)
+    with open(repo["worktree"] / "a.txt", "wb") as handle:
+        handle.truncate(1 << 32)
+    assert _bytes_against(repo) == [StatusEntry(" M", "a.txt")] and read == []
+    (repo["worktree"] / "a.txt").write_text("b\n")
+    assert _bytes_against(repo) == [StatusEntry(" M", "a.txt")] and read == [b"a.txt"]
+
+
+def test_files_at_an_unpopulated_gitlink_are_listed_by_the_bytes_alone(repo):
+    """Files put at a submodule's path without a repository there are listed
+    by no `git status`, whatever its submodule settings: only the byte
+    comparison sees them, as a submodule path that is not the empty
+    directory a checkout leaves (PR #444 R4-F1)."""
+    worktree = repo["worktree"]
+    head = _git("-C", str(worktree), "rev-parse", "HEAD")
+    _git("-C", str(worktree), "update-index", "--add", "--cacheinfo", f"160000,{head},mod")
+    _git("-C", str(worktree), *GIT_IDENT, "commit", "-q", "-m", "a submodule")
+    (worktree / "mod").mkdir(exist_ok=True)
+    assert _bytes_against(repo) == []
+    (worktree / "mod" / "anything.txt").write_text("not the tree's\n")
+    plain = ["-C", str(worktree), "status", "--porcelain", "--untracked-files=all"]
+    assert _git(*plain, "--ignore-submodules=none") == ""
+    assert _uncommitted(repo) == [] and _against(repo) == []
+    changes = _byte_changes(repo)
+    assert changes.files == () and changes.submodules == (StatusEntry(" M", "mod"),)
+
+
+# ----------------------------------------- submodules and their ignore settings (R4-F1)
+
+
+def _with_submodule(repo) -> Path:
+    """``vendor``, a submodule holding ``cache.py``, committed in the worktree with
+    ``ignore = all`` in ``.gitmodules`` as the reviewer's reproduction had it, and
+    populated, as a fixer's `git submodule update --init` leaves it; its path."""
+    sub = repo["base"] / "sub"
+    _git("init", "-q", "-b", "main", str(sub))
+    (sub / "cache.py").write_text("TTL_SECONDS = 0\n")
+    _git("-C", str(sub), "add", "cache.py")
+    _git("-C", str(sub), *GIT_IDENT, "commit", "-q", "-m", "the cache")
+    worktree = str(repo["worktree"])
+    _git(
+        "-C",
+        worktree,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(sub),
+        "vendor",
+    )
+    _git("-C", worktree, "config", "-f", ".gitmodules", "submodule.vendor.ignore", "all")
+    _git("-C", worktree, "add", ".gitmodules")
+    _git("-C", worktree, *GIT_IDENT, "commit", "-q", "-m", "vendor the cache")
+    return repo["worktree"] / "vendor"
+
+
+def test_a_populated_submodule_is_listed_whatever_its_ignore_setting_hides(repo):
+    """PR #444 R4-F1: with `ignore = all`, `git status` lists nothing of an
+    edit in the submodule. Both statuses compare it by its gitlink alone,
+    and its commit is the reviewed one; the byte comparison lists its path,
+    since what a populated submodule holds is never proven the commit's.
+    Once the operator deinitializes it, the empty directory is no change."""
+    vendor = _with_submodule(repo)
+    worktree = repo["worktree"]
+    assert _bytes_against(repo) == [StatusEntry(" M", "vendor")]
+    (vendor / "cache.py").write_text("TTL_SECONDS = 300\n")
+    assert _git("-C", str(worktree), "status", "--porcelain") == ""
+    assert _uncommitted(repo) == [] and _against(repo) == []
+    changes = _byte_changes(repo)
+    assert changes.files == () and changes.submodules == (StatusEntry(" M", "vendor"),)
+    _git("-C", str(vendor), "checkout", "-q", "--", "cache.py")
+    _git("-C", str(worktree), "submodule", "deinit", "-q", "--", "vendor")
+    assert vendor.is_dir() and not any(vendor.iterdir())
+    assert _uncommitted(repo) == [] and _against(repo) == [] and _bytes_against(repo) == []
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [".gitmodules", "submodule.vendor.ignore", "diff.ignoreSubmodules", "worktree config"],
+)
+def test_both_statuses_list_a_moved_submodule_whatever_its_ignore_setting(repo, setting):
+    """A commit in the submodule moves its HEAD off the gitlink: both
+    statuses list it, with every place an ignore setting can come from set
+    to `all` (the worktree's own configuration among them), which hides it
+    from a plain `git status`."""
+    vendor = _with_submodule(repo)
+    worktree, root = str(repo["worktree"]), str(repo["root"])
+    if setting != ".gitmodules":
+        _git("-C", worktree, "config", "-f", ".gitmodules", "--unset", "submodule.vendor.ignore")
+        _git("-C", worktree, "update-index", "--assume-unchanged", ".gitmodules")
+    if setting == "worktree config":
+        _git("-C", root, "config", "extensions.worktreeConfig", "true")
+        _git("-C", worktree, "config", "--worktree", "diff.ignoreSubmodules", "all")
+    elif setting != ".gitmodules":
+        _git("-C", root, "config", setting, "all")
+    (vendor / "cache.py").write_text("TTL_SECONDS = 300\n")
+    _git("-C", str(vendor), *GIT_IDENT, "commit", "-q", "-am", "a fix, committed in the submodule")
+    assert _git("-C", worktree, "status", "--porcelain", "--", "vendor") == ""
+    assert _uncommitted(repo) == [StatusEntry(" M", "vendor")]
+    assert StatusEntry(" M", "vendor") in _against(repo)
+
+
+def test_no_git_runs_in_a_submodule(repo):
+    """The submodule's repository and configuration are the agent's: a clean
+    filter defined there runs when `git status` looks into the submodule
+    (`--ignore-submodules=none`, the default without a setting), as the
+    controller. None of the three reads does: both statuses run with
+    `--ignore-submodules=dirty`, and the byte comparison runs no git in the
+    worktree at all."""
+    vendor = _with_submodule(repo)
+    worktree = repo["worktree"]
+    _git("-C", str(worktree), "config", "-f", ".gitmodules", "--unset", "submodule.vendor.ignore")
+    _git("-C", str(worktree), *GIT_IDENT, "commit", "-q", "-am", "no ignore setting")
+    marker = repo["base"] / "ran"
+    module = Path(_git("-C", str(vendor), "rev-parse", "--path-format=absolute", "--git-dir"))
+    assert module == repo["admin"] / "modules" / "vendor"  # in the agent's admin dir
+    _git("-C", str(vendor), "config", "filter.spy.clean", f"touch {shlex.quote(str(marker))}; cat")
+    (module / "info").mkdir(exist_ok=True)
+    (module / "info" / "attributes").write_text("* filter=spy\n")
+    (vendor / "cache.py").write_text("TTL_SECONDS = 9\n")  # the committed size: content is read
+    seen: list[ExecutionRequest] = []
+    assert _uncommitted(repo, _recording(seen)) == []
+    assert _against(repo, _recording(seen)) == []
+    assert _bytes_against(repo, _recording(seen)) == [StatusEntry(" M", "vendor")]
+    assert not marker.exists()
+    statuses = [request.command for request in seen if "status" in request.command]
+    assert len(statuses) == 2
+    assert all("--ignore-submodules=dirty" in argv for argv in statuses)
+    _git("-C", str(worktree), "status", "--porcelain", "--ignore-submodules=none")
+    assert marker.exists()
+
+
+def test_an_unreadable_byte_comparison_is_refused_never_taken_as_clean(repo):
+    with pytest.raises(VerificationError, match="cannot compare the bytes of the agent worktree"):
+        _bytes_against(repo, revision="0" * 40)
+    if os.geteuid() == 0:
+        return  # root reads a directory whatever its mode
+    (repo["worktree"] / "sub").mkdir()
+    _commit_in_worktree(repo, {"sub/x.txt": "x\n"})
+    (repo["worktree"] / "sub").chmod(0)
+    try:
+        with pytest.raises(VerificationError, match="could not be compared with its tree"):
+            _bytes_against(repo)
+    finally:
+        (repo["worktree"] / "sub").chmod(0o755)
 
 
 # ------------------------------------------------------------ strict import

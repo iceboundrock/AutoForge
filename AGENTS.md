@@ -214,7 +214,10 @@ docs/adr/                              accepted design records (LOCAL mode works
                                        fast feedback and full validation: FAST is never evidence,
                                        the controller selects FULL, the coverage mapping;
                                        typed stop classification: outcomes, reason codes and
-                                       routes, never an authorization, no persisted code)
+                                       routes, never an authorization, no persisted code;
+                                       recovery and escalation: the stop and authority
+                                       matrices, no-go for an advisor's shadow diagnosis
+                                       and for autonomous recovery, no pre-BLOCK pause)
 docs/README.md                         human-oriented documentation index, by intent
 docs/non-code-rules.md                 writing and publishing rules for every non-code artifact
 docs/getting-started.md                operator guide: a first run from nothing, step by step, and the
@@ -298,6 +301,11 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   `src/autoforge/errors.py`), the CLI's `stop:` lines or
   `src/autoforge/stop_classification.py`, read
   `docs/adr/0011-typed-stop-classification-and-recovery-baseline.md`.
+- If adding anything that acts on a stop beyond reporting it (an advisor or
+  any model launch about a stop, an automatic recovery action, a pause
+  before `BLOCKED`, a new route out of `BLOCKED` or `FAILED`), read
+  `docs/adr/0012-recovery-and-escalation-stop-authority-and-advisor-gates.md`
+  in addition to ADR 0011.
 - If adding or changing tests, or changing behaviour in a high-priority
   coverage area, read `tests/AGENTS.md` and `docs/agent-guides/testing.md`.
 

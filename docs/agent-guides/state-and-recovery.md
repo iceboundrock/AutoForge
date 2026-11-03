@@ -64,7 +64,9 @@ Expected state includes data such as:
   acceptance action (#211), and `bound X-… <comment URL>` (one per pair,
   `; `-separated) or `declined X-…` (followed by `(withdrawn: X-…)` when
   the decline withdrew other pending actions) when it bound evidence to,
-  or declined, operator actions (#243); refused unblocks are only in
+  or declined, operator actions (#243), and `rereview: abandoned <ids>
+  (round <n> of <PR> at <HEAD>)` when `--rereview` gave up a round's FIX
+  (#428); refused unblocks are only in
   the run log; the list is kept across issue switches, redacted before it is
   written, and validated on load like every other list field)
 - the recorded configuration of a REMOTE run (`config_fingerprint`, #219).
@@ -106,7 +108,8 @@ Expected state includes data such as:
 
 Besides these, the state records the review loop: `review_round`,
 `last_review_needs_fix`, `open_findings`, `prior_findings` (a stale round's
-findings, carried to the next review to re-check), `last_fix_resolutions`,
+findings, or the findings of a round whose FIX `unblock --rereview` gave up,
+carried to the next review to re-check), `last_fix_resolutions`,
 `review_history` (one entry per completed review round of the current PR:
 round, reviewed SHA, result, finding count, fingerprint of the requested
 resolutions) and `step_count` (cumulative for the run, never reset). A

@@ -57,6 +57,7 @@ from autoforge.github import (  # noqa: E402
     IssueInfo,
     IssueNode,
     MergeQueueStatus,
+    PRCommitInfo,
     PRInfo,
     RepoInfo,
     WorkflowJob,
@@ -625,6 +626,11 @@ class FakeGitHub:
         self.issue_listing_truncated: bool = False  # a strict issue listing cannot be completed
         # every get_pr_comments / get_issue_comments call raises this
         self.comments_error: GitHubError | None = None
+        # The commits GitHub lists for each PR (#416), by canonical PR URL, oldest
+        # first; ``get_pr_commits`` answers [] for a PR without an entry and
+        # raises ``pr_commits_error`` when it is set.
+        self.pr_commits: dict[str, list[PRCommitInfo]] = {}
+        self.pr_commits_error: GitHubError | None = None
         self.get_comment_error: GitHubError | None = None  # every get_comment call raises this
         # Every read through `gh` returns titles and bodies as `gh` prints them,
         # through its JSON sanitizer (:func:`gh_sanitized`); the exact reads
@@ -787,8 +793,17 @@ class FakeGitHub:
         self.prs[ref.canonical] = info
         return info
 
-    def add_comment(self, pr_url: str, cid: int, body: str) -> CommentInfo:
-        c = CommentInfo(id=cid, url=comment_url(pr_url, cid), body=body, parent_url=pr_url)
+    def add_comment(
+        self, pr_url: str, cid: int, body: str, *, author: str = "", created_at: str = ""
+    ) -> CommentInfo:
+        c = CommentInfo(
+            id=cid,
+            url=comment_url(pr_url, cid),
+            body=body,
+            author=author,
+            created_at=created_at,
+            parent_url=pr_url,
+        )
         self.comments.setdefault(pr_url, []).append(c)
         return c
 
@@ -1154,6 +1169,16 @@ class FakeGitHub:
 
         self.get_pr(url)
         return self._comments_of(parse_pr_url(url))
+
+    def get_pr_commits(self, url: str) -> list[PRCommitInfo]:
+        from autoforge.validation import parse_pr_url
+
+        self.calls.append(("get_pr_commits", url))
+        if self.pr_commits_error is not None:
+            raise self.pr_commits_error
+        canonical = parse_pr_url(url).canonical
+        self._stored(canonical)  # fails closed on an unknown PR, like GitHub
+        return list(self.pr_commits.get(canonical, []))
 
     def get_issue_comments(self, url: str) -> list[CommentInfo]:
         self.calls.append(("get_issue_comments", url))

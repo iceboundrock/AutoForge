@@ -137,10 +137,13 @@ from .agent_worktree import (
     Candidate,
     ObjectImportError,
     bound_admin_dir,
+    byte_changes_from_revision,
+    changes_from_revision,
     holds_objects,
     import_private_objects,
     read_candidate,
     registered_worktree_roots,
+    uncommitted_entries,
 )
 from .certificate import (
     CertificateIssuanceError,
@@ -1193,6 +1196,9 @@ class UnblockDecision:
     # the plan's pending K10 records are withdrawn with them.
     bind: tuple[EffectRecord, ...] = ()
     operator_decline: tuple[EffectRecord, ...] = ()
+    # The open findings an ``unblock --rereview`` gives up the FIX of (#428),
+    # by id; the run log records them. Empty for every other decision.
+    abandoned: tuple[str, ...] = ()
 
     @property
     def refused(self) -> bool:
@@ -1230,6 +1236,55 @@ class OperatorRequest:
                 f"--bind-evidence {a} {u}" for a, u in zip(self.action_ids, self.urls, strict=True)
             )
         return " ".join(f"--decline-action {a}" for a in self.action_ids)
+
+
+@dataclass(frozen=True)
+class RereviewRequest:
+    """``unblock --rereview``: a fresh REVIEW round at the reviewed HEAD instead of FIX (#428)."""
+
+    @property
+    def flag(self) -> str:
+        return "--rereview"
+
+
+# What an ``unblock`` flag asks for; ``None`` for a plain unblock.
+UnblockRequest = AcceptanceRequest | OperatorRequest | RereviewRequest | None
+
+
+def rereview_action(state: AutoForgeState) -> str:
+    """The ``unblock_history`` action of an ``unblock --rereview`` of ``state`` (#428).
+
+    Names the open findings it abandons and the review they belong to: the
+    round, the PR and the HEAD it reviewed. Finding ids are held to the
+    ``R<round>-F<n>`` form on load, so the text needs no escaping. The state
+    has no field of its own for a re-review, so this text is also how the
+    carried findings are told apart from a stale round's afterwards
+    (:func:`rereview_carry`).
+    """
+    findings = state.open_findings or state.prior_findings
+    ids = ", ".join(str(f.get("id", "")) for f in findings)
+    return (
+        f"rereview: abandoned {ids} (round {state.review_round} of {state.reviewed_pr_url} at "
+        f"{state.reviewed_head_sha[:12]})"
+    )
+
+
+def rereview_carry(state: AutoForgeState) -> dict | None:
+    """The ``unblock --rereview`` entry the carried findings come from, or ``None`` (#428).
+
+    ``prior_findings`` are a re-review's when an ``unblock_history`` entry
+    abandoned exactly them, in the round, PR and HEAD they belong to. A
+    later stale round replaces them under another round, a completed round
+    clears them and a new issue starts with none, so an older entry never
+    matches another carry: the history outlives an issue switch.
+    """
+    if not state.prior_findings or state.open_findings:
+        return None
+    expected = rereview_action(state)
+    for entry in reversed(state.unblock_history):
+        if entry.get("action") == expected:
+            return entry
+    return None
 
 
 @dataclass(frozen=True)
@@ -3346,7 +3401,7 @@ class ControllerEngine:
         return fenced_untrusted_block("\n".join(lines), "text")
 
     def _format_prior_findings(self) -> str:
-        """The findings carried from a stale review, for the next REVIEW prompt.
+        """The findings carried from a stale or abandoned review, for the next REVIEW prompt.
 
         The provenance line is controller data (the round, the HEAD it was
         bound to and the comment the round was verified to have posted); the
@@ -3356,11 +3411,53 @@ class ControllerEngine:
         s = self._require_state()
         if not s.prior_findings:
             return "(none)"
+        # #428: findings an operator's `unblock --rereview` abandoned are
+        # carried from an unchanged revision, so the line says why no FIX
+        # ran, and whether the PR moved after that request after all.
+        why = (
+            "; the operator gave up that round's FIX at that HEAD and asked for a fresh review "
+            "(`unblock --rereview`), so no FIX round resolved them. "
+            + self._rereview_revision_note()
+            if rereview_carry(s) is not None
+            else ", and no FIX round resolved them"
+        )
         return (
             f"Review round {s.review_round} at HEAD `{s.reviewed_head_sha}` "
             f"({s.last_review_comment_url or 'comment URL not recorded'}) reported these "
-            "findings, and no FIX round resolved them:\n" + self._format_findings(s.prior_findings)
+            f"findings{why}:\n" + self._format_findings(s.prior_findings)
         )
+
+    def _rereview_revision_note(self) -> str:
+        """Whether a re-review's round is bound to the revision its FIX was given up at (#428).
+
+        ``unblock --rereview`` is applied only with the PR at the reviewed
+        HEAD, base and merge base, but the PR may move before REVIEW binds
+        its own revision (:meth:`_bind_review_head`, PR #444 R1-F3). The
+        HEAD at that unblock is the abandoned round's; the HEAD, base and
+        merge base this round is bound to are the ``current_*`` fields, and
+        each one bound that differs is named. A merge base not yet bound (a
+        plan or a dry run, before the entry reads it) is not compared.
+        """
+        s = self._require_state()
+        moved: list[str] = []
+        if s.current_head_sha and s.current_head_sha.lower() != s.reviewed_head_sha.lower():
+            moved.append(f"HEAD `{s.current_head_sha}`, not `{s.reviewed_head_sha}`")
+        if s.current_base_ref and s.current_base_ref != s.reviewed_base_ref:
+            moved.append(
+                f"base `{escape_inline(s.current_base_ref)}`, not "
+                f"`{escape_inline(s.reviewed_base_ref or '(none)')}`"
+            )
+        if s.current_merge_base_sha and s.current_merge_base_sha != s.reviewed_merge_base_sha:
+            moved.append(
+                f"merge base `{s.current_merge_base_sha}`, not "
+                f"`{s.reviewed_merge_base_sha or '(none)'}`"
+            )
+        if moved:
+            return (
+                "The PR moved after that request, so this round does not review the revision "
+                f"the operator asked to have re-reviewed: it is bound to {'; '.join(moved)}"
+            )
+        return "This round is bound to that same HEAD: no commit moved after the operator's request"
 
     def _format_previous_fix_resolutions(self) -> str:
         """The last FIX round's resolutions, for the next REVIEW prompt (#163, D5.3).
@@ -4744,11 +4841,21 @@ class ControllerEngine:
             state.phase = nxt
             state.block_reason = message
             self._save()
+            hint = ""
+            if previous == Phase.FIX and nxt == Phase.BLOCKED:
+                # #428: a plain unblock relaunches the fixer, which cannot see
+                # a finding resolved outside the repository; name the other way
+                # out. Controller text, so the reason stays the agent's own.
+                rereview = self.cli_command("unblock", "--rereview", "--reason", "<what you did>")
+                hint = (
+                    f" (if you resolved the findings outside the repository, '{rereview}' asks "
+                    "for a fresh review round instead of another fixer launch)"
+                )
             return self._outcome(
                 previous,
                 plan=plan,
                 result=payload,
-                message=f"agent reported {status}: {message}",
+                message=f"agent reported {status}: {message}{hint}",
                 stop=agent_status(str(status), previous),
             )
 
@@ -6747,6 +6854,7 @@ class ControllerEngine:
         approve_action: str = "",
         decline_action: str | Sequence[str] = "",
         bind_evidence: Sequence[tuple[str, str]] = (),
+        rereview: bool = False,
     ) -> UnblockOutcome:
         """The operator's explicit exit from BLOCKED.
 
@@ -6784,6 +6892,11 @@ class ControllerEngine:
         evidence, and ``decline_action`` may name one or more ``X-...`` ids
         to decline (withdrawing the plan's other pending ones). Both are
         decided by :meth:`_operator_unblock` from fresh reads.
+
+        ``rereview`` (#428) asks for a fresh REVIEW round where the plain
+        decision is FIX with the round's open findings: the operator gives
+        up that FIX, and the findings are carried to the new round to
+        re-check, none marked resolved (:meth:`_rereview_unblock`).
         """
         reason = reason.strip()
         if not reason:
@@ -6795,11 +6908,12 @@ class ControllerEngine:
             )
         declines = [decline_action] if isinstance(decline_action, str) else list(decline_action)
         declines = [d.strip() for d in declines if d.strip()]
-        if sum(bool(x) for x in (approve_action, declines, bind_evidence)) > 1:
+        if sum(bool(x) for x in (approve_action, declines, bind_evidence, rereview)) > 1:
             raise ConfigurationError(
-                "unblock takes one of --approve-action, --decline-action and --bind-evidence"
+                "unblock takes one of --approve-action, --decline-action, --bind-evidence and "
+                "--rereview"
             )
-        request: AcceptanceRequest | OperatorRequest | None = None
+        request: UnblockRequest = RereviewRequest() if rereview else None
         if approve_action.strip().startswith("X-"):
             raise ConfigurationError(
                 f"unblock --approve-action {approve_action.strip()} is refused: "
@@ -6844,7 +6958,7 @@ class ControllerEngine:
         reason: str,
         *,
         dry_run: bool,
-        request: AcceptanceRequest | OperatorRequest | None = None,
+        request: UnblockRequest = None,
     ) -> UnblockOutcome:
         state = self._require_state()
         if state.phase != Phase.BLOCKED:
@@ -7054,6 +7168,9 @@ class ControllerEngine:
                 "live_pr_state": decision.pr.state if decision.pr else "",
                 "live_head_sha": decision.pr.head_sha if decision.pr else "",
                 "action": decision.action,
+                # #428: the open findings an applied `--rereview` gave up the
+                # FIX of, by id; empty for every other unblock and a refusal.
+                "abandoned_findings": [] if decision.refused else list(decision.abandoned),
                 "validation_override_seq": None if decision.refused else watermark,
             },
         )
@@ -7061,9 +7178,7 @@ class ControllerEngine:
             record.error = f"unblock refused: {decision.detail}"
         self._logger().log_execution(record)
 
-    def _unblock_decision(
-        self, request: AcceptanceRequest | OperatorRequest | None = None
-    ) -> UnblockDecision:
+    def _unblock_decision(self, request: UnblockRequest = None) -> UnblockDecision:
         """Re-run the recovery inspection against live GitHub and choose the phase.
 
         Refuses (``target=None``) whenever the safe phase is not knowable
@@ -7072,12 +7187,22 @@ class ControllerEngine:
         next step would block again), then per the PR. A transient GitHub
         failure propagates unchanged: nothing is decided on a read that may
         succeed next time. An approval or a decline (``request``, #211) is
-        decided only by the saved FIX plan's row; any other decision is a
-        refusal of it.
+        decided only by the saved FIX plan's row, and ``--rereview`` (#428)
+        only by the row that would re-enter FIX with open findings; any
+        other decision is a refusal of it.
         """
         decision = self._unblock_decision_for(request)
         if request is None or decision.refused or decision.action:
             return decision
+        if isinstance(request, RereviewRequest):
+            return UnblockDecision(
+                None,
+                "unblock --rereview applies only to a run whose PR is OPEN at the reviewed "
+                "HEAD with open findings of the last review round and no saved FIX plan, "
+                "where it gives up that round's FIX; this run has no such FIX to give up. "
+                f"Without the flag: {decision.detail}",
+                pr=decision.pr,
+            )
         what = (
             "operator actions await the operator"
             if isinstance(request, OperatorRequest)
@@ -7090,9 +7215,7 @@ class ControllerEngine:
             pr=decision.pr,
         )
 
-    def _unblock_decision_for(
-        self, request: AcceptanceRequest | OperatorRequest | None
-    ) -> UnblockDecision:
+    def _unblock_decision_for(self, request: UnblockRequest) -> UnblockDecision:
         state = self._require_state()
         if state.replan_transaction:
             stage = state.replan_transaction.get("stage", "(unknown)")
@@ -7159,9 +7282,7 @@ class ControllerEngine:
             )
         return UnblockDecision(Phase.ANALYZE_EXECUTE, detail)
 
-    def _unblock_with_pr(
-        self, request: AcceptanceRequest | OperatorRequest | None = None
-    ) -> UnblockDecision:
+    def _unblock_with_pr(self, request: UnblockRequest = None) -> UnblockDecision:
         """A PR is bound: decide from its live state and the review bound to it."""
         state = self._require_state()
         url = state.current_pr_url
@@ -7275,6 +7396,19 @@ class ControllerEngine:
             # operator decides first (#211), and so do operator actions not
             # yet verified (#243); once every one is observed, the plan's
             # ordinary row below decides.
+            if isinstance(request, RereviewRequest):
+                # #428: a saved plan holds writes the controller accepted and
+                # owes, some perhaps already sent; a fresh review would orphan
+                # them, and the fixer's commit with them.
+                records = ", ".join(r.describe() for r in effects.records) or "nothing to send"
+                return UnblockDecision(
+                    None,
+                    f"unblock --rereview is refused: the FIX plan of review round "
+                    f"{effects.context.round} is saved ({records}), and a fresh review round "
+                    "would abandon what it has sent or still owes. Unblock without --rereview: "
+                    "FIX completes the plan from the journal",
+                    pr=pr,
+                )
             unverified = [
                 r
                 for r in effects.records
@@ -7329,12 +7463,21 @@ class ControllerEngine:
             and (state.open_findings)
         ):
             if cap:
+                # A re-review is the next round itself, so the cap refuses it
+                # in its own words.
+                consequence = (
+                    ""
+                    if isinstance(request, RereviewRequest)
+                    else ", so a FIX round now could never be reviewed"
+                )
                 return UnblockDecision(
                     None,
-                    f"{cap}, so a FIX round now could never be reviewed. Raise "
-                    "'workflow.max_review_rounds' in the config, then unblock again",
+                    f"{cap}{consequence}. Raise 'workflow.max_review_rounds' in the config, then "
+                    "unblock again",
                     pr=pr,
                 )
+            if isinstance(request, RereviewRequest):
+                return self._rereview_unblock(pr, canonical, reviewed)
             return UnblockDecision(
                 Phase.FIX,
                 f"PR {canonical} is OPEN at the reviewed HEAD {reviewed[:12]} with "
@@ -7378,6 +7521,230 @@ class ControllerEngine:
             "binds the actual revision",
             pr=pr,
             carry_findings=not at_reviewed_revision,
+        )
+
+    def _rereview_unblock(self, pr: PRInfo, canonical: str, reviewed: str) -> UnblockDecision:
+        """``unblock --rereview`` where the plain decision is FIX with open findings (#428).
+
+        The operator gives up the round's FIX, typically after resolving a
+        finding outside the repository (a PR description edited by hand),
+        which neither the fixer nor the controller can see or prove. The
+        next REVIEW round judges the PR as it stands: the open findings are
+        carried to it to re-check, exactly as a stale round's are, and the
+        last result is marked stale. Nothing is marked resolved; the
+        operator's reason stays uninterpreted. The caller has checked the
+        PR's HEAD and base against the review binding, the absence of a
+        saved FIX plan and the round cap. Refused, with the remedy, unless
+        the merge base is proven the reviewed one too
+        (:meth:`_rereview_binding_problem`), and while the agent worktree,
+        where the next round's reviewer works, holds anything the reviewed
+        HEAD does not (:meth:`_rereview_worktree_problem`).
+        """
+        state = self._require_state()
+        problem = self._rereview_binding_problem(pr, reviewed) or self._rereview_worktree_problem(
+            reviewed
+        )
+        if problem:
+            return UnblockDecision(None, f"unblock --rereview is refused: {problem}", pr=pr)
+        ids = tuple(str(f.get("id", "")) for f in state.open_findings)
+        return UnblockDecision(
+            Phase.REVIEW,
+            f"PR {canonical} is OPEN at the reviewed HEAD {reviewed[:12]} with "
+            f"{len(ids)} open finding(s) from round {state.review_round}, and --rereview gives "
+            f"up that round's FIX: {', '.join(ids)} are abandoned, not resolved, and REVIEW "
+            f"round {state.review_round + 1} reviews the PR as it now stands",
+            pr=pr,
+            carry_findings=True,
+            action=rereview_action(state),
+            abandoned=ids,
+        )
+
+    def _rereview_binding_problem(self, pr: PRInfo, reviewed: str) -> str:
+        """Why the PR's diff is not proven the reviewed one, with the remedy, or "" (#428).
+
+        The caller found the PR at the reviewed HEAD on the reviewed base,
+        but a base rewritten under its name moves the diff without moving
+        either (#96), and a re-review gives up a FIX only at an unchanged
+        revision (PR #444 R1-F2). So the merge base is read now, against the
+        reviewed HEAD as the FIX entry reads it (:meth:`_fix_unbound`), and
+        compared with the one the round recorded. A moved one is drift, whose
+        recovery is the plain unblock's: its FIX entry finds the same drift
+        and re-enters REVIEW of the actual revision with the findings
+        carried, no fixer launched. A round that recorded none (an older
+        state file) and a read that fails conclusively prove nothing, so
+        they refuse too. An unavailable GitHub propagates: nothing is
+        decided on a read that may succeed next time.
+        """
+        state = self._require_state()
+        recorded = state.reviewed_merge_base_sha
+        round_ = state.review_round
+        if not recorded:
+            return (
+                f"review round {round_} recorded no merge base, so the PR's diff cannot be "
+                "proven the one it reviewed, and a re-review gives up a FIX only at an "
+                "unchanged revision. Unblock without --rereview"
+            )
+        try:
+            with self._reading(
+                f"merge base of {pr.base_ref!r} and the reviewed HEAD {reviewed[:12]}"
+            ):
+                live = self.github.get_merge_base_sha(state.repository, pr.base_ref, reviewed)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return (
+                f"{exc}. This is not a transient GitHub failure, so the PR's diff cannot be "
+                f"proven the one review round {round_} reviewed; fix the cause, then unblock "
+                "again"
+            )
+        if live != recorded:
+            return (
+                f"PR merge base moved to {live[:12]} from the reviewed merge base "
+                f"{recorded[:12]} that the open findings of round {round_} are bound to (base "
+                f"{pr.base_ref!r} was rewritten under its name), so the PR's diff is not the "
+                "one reviewed and there is no FIX at an unchanged revision to give up. Unblock "
+                "without --rereview: FIX re-reads the merge base and, as it moved, re-enters "
+                "REVIEW of the actual revision with the findings carried, no fixer launched"
+            )
+        return ""
+
+    def _rereview_worktree_problem(self, reviewed: str) -> str:
+        """Why the agent worktree refuses a re-review, with the remedy, or "" (#428).
+
+        The next round's reviewer works in this worktree, so it may hold
+        nothing the reviewed HEAD does not: it does not exist, or its HEAD
+        is detached at the reviewed HEAD and ``git status`` lists nothing,
+        neither against the worktree's own index nor against a fresh index
+        of the reviewed tree, and every file of that tree holds its bytes.
+        Any other HEAD (a fixer's unpushed commit, a
+        local branch, a commit the shared store does not hold) may be work
+        a fresh round would leave behind. An uncommitted change (a blocked
+        fixer's half-made edit, an untracked file) is what that reviewer
+        would read and test in place of the reviewed commit, and could
+        clear code the PR does not hold (PR #444 R1-F1); the controller
+        neither discards nor moves it. The worktree's own index is the
+        agent's to write, and an assume-unchanged or skip-worktree mark
+        there hides an edit from its status (R2-F1), so the files are also
+        compared with the reviewed tree through a fresh index
+        (:func:`changes_from_revision`); the first read still lists what
+        only that index holds (a staged change since reverted in the file).
+        Both statuses compare a file after the conversions its attributes
+        name, and a clean filter can map an edit back to the reviewed blob
+        (R3-F1), so every blob of the reviewed tree is also compared with
+        the worktree's bytes, with no git process reading the worktree
+        (:func:`byte_changes_from_revision`). A submodule's ignore
+        setting hides what its checkout holds from a status, and files put
+        at a submodule's path without a repository are listed by none
+        (R4-F1): both statuses compare a submodule by its gitlink alone,
+        whatever that setting says, and run no git in it, and the byte
+        comparison refuses every submodule path that is not the empty
+        directory a checkout leaves an unpopulated one, since what a
+        populated submodule holds is never proven the reviewed commit's.
+        ``HEAD`` is read as a candidate is (ADR 0005 D6.3) and both
+        statuses through the bound admin dir (:func:`uncommitted_entries`),
+        never through the worktree's ``.git`` file; nothing is imported or
+        written.
+        """
+        path = self.agent_worktree_path()
+        if not os.path.lexists(path):
+            return ""
+        left_behind = (
+            "; a fresh review round would leave such work behind unreviewed. Unblock without "
+            "--rereview to let FIX continue from it, or move the work out of the worktree "
+            "yourself and unblock again"
+        )
+        if path.is_symlink():
+            return f"the agent worktree path {path} is a symbolic link{left_behind}"
+        common = self.workspace().git_dirs()[-1]
+        try:
+            admin = self._agent_admin_dir(path)
+            candidate = read_candidate(common, admin, str(path), self._runner)
+        except VerificationError as exc:
+            return f"the agent worktree {path} cannot be read ({exc}){left_behind}"
+        if candidate.problem:
+            return (
+                f"the agent worktree {path} has no readable HEAD ({candidate.problem}){left_behind}"
+            )
+        if candidate.attached:
+            return f"the agent worktree {path} has its HEAD attached to a local branch{left_behind}"
+        if not candidate.head:
+            return (
+                f"the HEAD of the agent worktree {path} names no commit the shared object "
+                f"store holds{left_behind}"
+            )
+        if candidate.head.lower() != reviewed.lower():
+            return (
+                f"the agent worktree {path} is at {candidate.head[:12]}, not at the reviewed "
+                f"HEAD {reviewed[:12]}, so it may hold commits the PR does not{left_behind}"
+            )
+        try:
+            entries = uncommitted_entries(common, admin, str(path), self._runner)
+            fresh = changes_from_revision(common, admin, str(path), reviewed, self._runner)
+            raw = byte_changes_from_revision(common, str(path), reviewed, self._runner)
+        except VerificationError as exc:
+            return (
+                f"{exc}, so whether the next round's reviewer would judge changes the reviewed "
+                f"HEAD {reviewed[:12]} does not hold is not knowable. Fix the cause, then "
+                "unblock again, or unblock without --rereview"
+            )
+        # A submodule's path is told as such, whichever read lists it: a
+        # plain `git status` lists it only as its ignore setting lets it.
+        populated = list(raw.submodules)
+        submodules = {entry.path for entry in populated}
+        entries = [entry for entry in entries if entry.path not in submodules]
+        listed = {entry.path for entry in entries} | submodules
+        marked = [entry for entry in fresh if entry.path not in listed]
+        known = listed | {entry.path for entry in marked}
+        converted = [entry for entry in raw.files if entry.path not in known]
+        if not entries and not marked and not converted and not populated:
+            return ""
+        listing, prompt = f"`git -C {path} status` lists them", "its prompt lists them"
+        notes: list[str] = []
+        if marked or converted:
+            causes = []
+            if marked:
+                causes.append(
+                    f"{len(marked)} the worktree's index records as unchanged although they "
+                    "differ from the reviewed commit, as an assume-unchanged or skip-worktree "
+                    f"mark does, which `git -C {path} ls-files -v` shows as a lower-case letter "
+                    "or an S"
+                )
+            if converted:
+                causes.append(
+                    f"{len(converted)} whose bytes or execute bit differ from the reviewed "
+                    "commit's although git reads them as its content, as a filter driver (a "
+                    "clean filter, Git LFS), an end-of-line, ident or working-tree-encoding "
+                    "conversion or core.fileMode=false does; "
+                    f"`git -C {path} check-attr -a -- <file>` names a file's conversions"
+                )
+            notes.append(
+                f"`git -C {path} status` does not list {len(marked) + len(converted)} of "
+                f"them: {'; '.join(causes)}"
+            )
+        if populated:
+            shown = ", ".join(entry.path for entry in populated[:3])
+            shown += ", ..." if len(populated) > 3 else ""
+            notes.append(
+                f"{len(populated)} at the path of a submodule ({shown}) that is not the empty "
+                "directory the reviewed commit's checkout leaves there: a populated submodule "
+                "is a repository of its own, whose content the controller cannot prove the "
+                "reviewed commit's and `git status` lists only as far as the submodule's "
+                "ignore setting (in `.gitmodules` or the configuration) lets it, and files put "
+                "there without a repository are listed by no `git status`; "
+                f"`git -C {path} submodule deinit -- <path>` empties a submodule that holds no "
+                "change, keeping its repository, and refuses one that does"
+            )
+        if notes:
+            listing, prompt = "; ".join(notes), "its prompt lists only what `git status` lists"
+        total = len(entries) + len(marked) + len(converted) + len(populated)
+        return (
+            f"the agent worktree {path} holds {total} "
+            f"uncommitted change(s) on the reviewed HEAD {reviewed[:12]} ({listing}), and the "
+            "next round's reviewer works in that worktree: what it reads and tests there would "
+            "be those changes, not the reviewed commit. The controller neither discards nor "
+            "moves them. "
+            f"Unblock without --rereview to let FIX continue from them ({prompt}), or move "
+            "them out of the worktree yourself and unblock again"
         )
 
     @staticmethod
@@ -10581,6 +10948,17 @@ class ControllerEngine:
             happened = "Nothing was launched or posted."
             rerun = "the reviewer is launched for this round"
         legacy = is_legacy_reentry(Phase.REVIEW, attempt, state.launch_label)
+        status = self.cli_command("status")
+
+        def report(what: str) -> str:
+            # Read-only evidence of where the comment came from (#416): the state
+            # directories of this checkout that journaled it, the PR's other
+            # review markers, the commits made after it.
+            return (
+                f"Run {status} for what GitHub and this checkout's state directories hold "
+                f"about where {what} came from; it changes nothing."
+            )
+
         remedy = (
             f"If {'it' if url else 'one'} belongs to another controller's run, do not delete it "
             "and do not 'unblock': it is that run's review record, its FIX may already be "
@@ -10605,8 +10983,9 @@ class ControllerEngine:
                 "journaled review it then is. The controller posts this round's comment itself "
                 "and journals it before it is sent; it never adopts or duplicates one it did not "
                 "journal (ADR 0004 D9.6), and 'unblock' does not change that. "
-                f"{happened} Check who posted the comment. If it is a stray or foreign comment, "
-                f"delete it or its marker, then 'unblock': {rerun}. {remedy}"
+                f"{happened} Check who posted the comment. {report('it')} If it is a "
+                f"stray or foreign comment, delete it or its marker, then 'unblock': {rerun}. "
+                f"{remedy}"
             )
         return (
             f"{conflict}."
@@ -10623,8 +11002,8 @@ class ControllerEngine:
             "comment itself and journals it before it is sent; it never chooses between comments "
             "it did not post and never adopts or duplicates one it did not journal (ADR 0004 "
             f"D9.6), and 'unblock' does not change that. {happened} Check who posted each "
-            "comment named. If each is a stray or foreign comment, delete it or its marker, then "
-            f"'unblock': {rerun}. {remedy}"
+            f"comment named. {report('they')} If each is a stray or foreign comment, "
+            f"delete it or its marker, then 'unblock': {rerun}. {remedy}"
         )
 
     def _prepare_fix(self, plan: StepPlan) -> StepOutcome | None:

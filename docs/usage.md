@@ -87,6 +87,11 @@ uv run autoforge rebind-epic --issue https://github.com/owner/repo/issues/257 \
   --from https://github.com/owner/repo/issues/158 \
   --to https://github.com/owner/repo/issues/255 \
   --reason "#257 moved under #255" --dry-run
+
+# you resolved a review finding outside the repository (a PR description
+# rewritten by hand): give up the round's FIX and have a fresh REVIEW round
+# judge the PR as it now stands; then `resume`
+uv run autoforge unblock --rereview --reason "rewrote the PR description"
 ```
 
 Pass a config file with the global option, before the subcommand:
@@ -606,7 +611,35 @@ before the block:
   was planned or posted, so that file is the only record of the result.
 
 The controller cannot tell who posted the comment, and the remedy depends
-on it, so check first:
+on it, so check first. `status` shows what it can read about that (#416),
+under the reason of a blocked run, and `status --json` carries the same as
+`unjournaled_review`. For each comment the round blocks on: when GitHub
+says it was created and how long after the run's creation and after the
+run's last reviewer launches; its marker (at most 20 of its finding ids
+and 10 of its markers' defects, each with their count); the length and SHA-256 of its body as GitHub holds it
+(read exactly when `gh` may have rewritten it; when that read fails, of
+`gh`'s print, and the report says so) and a short excerpt of `gh`'s print;
+and every state directory on this checkout that journaled it (a review
+comment effect record observed at it, or `last_review_comment_url` naming
+it). A state directory that holds only a plan for its round (an effect
+record for its marker that was not observed at it), or whose review
+history records the round at its HEAD, is listed as `recorded:`, never as
+the comment's journal: a plan names no comment, and a foreign comment
+posted after it was saved carries the same marker, with the planned body
+or another. Then which state directories are bound to the PR, the
+PR's other review markers, the commits GitHub lists for the PR committed
+after the comment, with author, committer and the time after it (GitHub
+records when a commit was made, not when it was pushed), and the PR's
+implementation marker (at most 10 of its issues and of its defects, with
+their count). The state directories read are the one `status`
+reads, the ones in it and under the configured `state_dir`, the ones beside
+it when it lies elsewhere, and the scheduler namespaces; a directory that
+could not be opened or listed is named as not searched, and the report then
+says its search was incomplete. It names no
+author and changes nothing. A comment another directory here journaled is
+that run's review; one none of them accounts for may still be the review
+of a controller on another machine or in another clone, which this
+checkout cannot see.
 
 - **A stray or foreign comment** (a human's, an agent's that still held a
   credential, or one a reviewer of an earlier AutoForge version posted):
@@ -653,6 +686,60 @@ or after the fixer ran, is not a block: the PR goes back to `REVIEW` of the
 pushed HEAD; so does a PR retargeted to another base, or a base rewritten
 under its name, at any point of the phase. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
+
+### A finding the fixer cannot resolve
+
+Some findings ask for something no commit can carry, such as a PR
+description rewritten to match the code. The fixer cannot edit the PR, so it
+reports `blocked`, and the step's message names `unblock --rereview`. A
+plain `unblock` after you made the change yourself does not help: it
+re-enters `FIX`, and the fixer sees neither your change nor your reason, so
+it blocks again. Run
+`autoforge unblock --rereview --reason "..."` instead, then `resume`. The
+round's `FIX` is given up and a fresh `REVIEW` round reviews the same HEAD,
+reading the PR as it now stands. The round's findings are handed to it to
+re-check, not marked resolved, so it may raise them again. `status` shows the
+abandoned finding ids in the `Unblocked:` line and, while the new round has
+not completed, beside `Prior findings to re-check`.
+
+The new round counts against `workflow.max_review_rounds`. `--rereview` is
+refused, with nothing written, when the `FIX` plan is already saved (unblock
+without it), and when the agent worktree's `HEAD` is anything but the
+reviewed HEAD, for example a commit the fixer made before it blocked: that
+commit was never pushed or reviewed, and a fresh round would leave it
+behind. It is refused too while the agent worktree holds uncommitted
+changes (the message names the worktree): the new round's reviewer works
+there, and would read and test them instead of the reviewed commit.
+AutoForge compares every tracked file's bytes with the reviewed commit
+itself, with no git process reading the worktree, so an edit is found
+even when `git -C <worktree> status` does not list it: when the
+worktree's index marks the file
+assume-unchanged or skip-worktree (`git -C <worktree> ls-files -v` shows
+the mark as a lower-case letter or an `S`), or when a conversion the
+file's attributes name, a clean filter say, maps it back to the committed
+content (`git -C <worktree> check-attr -a -- <file>` names it). The
+message says how many such files there are. A repository whose checkout
+itself writes other bytes than the committed ones (Git LFS, `eol=crlf`,
+`ident`, `working-tree-encoding`) is refused for the same reason. So is a
+submodule's path that holds anything but the empty directory a checkout
+leaves an unpopulated submodule: a populated submodule is a repository of
+its own whose content AutoForge cannot prove the reviewed commit's, and
+`git status` lists a change there only as far as the submodule's `ignore`
+setting (in `.gitmodules` or the configuration) lets it, and files put
+there without a repository not at all.
+`git -C <worktree> submodule deinit -- <path>` empties a submodule that
+holds no change and keeps its repository, and refuses one that does.
+Unblock without the flag to let `FIX` continue from the work (its prompt lists
+what `git status` lists), or move the work out of the worktree yourself
+and unblock again; AutoForge never discards it. The flag also checks that
+the base branch was not rewritten
+under the PR since the review (its merge base moved): if it was, unblock
+without the flag, and `FIX` sends the PR to a fresh review of the actual
+revision without launching the fixer. Where a plain `unblock` would not
+re-enter `FIX` with open findings, the flag is refused and the message says
+what the plain decision is. If someone pushes to the PR after the unblock,
+the new round reviews the new HEAD, and its prompt says the PR moved after
+your request.
 
 ### BLOCKED on an acceptance action
 

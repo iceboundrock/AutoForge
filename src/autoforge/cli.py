@@ -23,7 +23,8 @@ Commands:
           --approve-action / --decline-action decide on an acceptance action
           a FIX plan awaits (#211); --bind-evidence binds an existing comment
           to an operator action and --decline-action (repeatable) declines
-          operator actions (#243)
+          operator actions (#243); --rereview gives up the FIX of a review
+          round's open findings for a fresh REVIEW round at the same HEAD (#428)
   rebind-epic  the operator's explicit move of a standalone run to its issue's native
           parent (#435): --issue, --from (the recorded EPIC), --to, --reason; only in
           READY_FOR_MERGE or a BLOCKED run with nothing persisted tied to its EPIC, its own
@@ -58,6 +59,7 @@ import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TextIO
 
 from . import __version__
@@ -80,6 +82,7 @@ from .engine import (
     StepPlan,
     UnblockOutcome,
     config_file_placement_problem,
+    rereview_carry,
     sandbox_mode_summary,
 )
 from .epic_commands import (
@@ -148,6 +151,8 @@ from .ownership import (
 from .provenance import ControllerIdentity, mismatch_lines, protocol_ranges, refusal_headline
 from .redaction import redact, redact_argv, redact_dict, redact_obj
 from .replan_txn import ReplanTransaction
+from .review_provenance import ProvenanceReport, unjournaled_review_report
+from .review_provenance import applies as unjournaled_review_applies
 from .run_binding import EpicBinding
 from .run_namespace import inside_scheduler_root, namespace_issue_of_state_dir
 from .sandbox_pin import SandboxPin
@@ -342,6 +347,16 @@ def build_parser() -> argparse.ArgumentParser:
             "bind an existing comment on an operator action's target issue as its evidence "
             "(repeatable): 'resume' verifies the comment is there and unchanged; the "
             "controller never judges whether it is adequate"
+        ),
+    )
+    action.add_argument(
+        "--rereview",
+        action="store_true",
+        help=(
+            "where unblock would re-enter FIX with the last round's open findings, give up "
+            "that FIX and re-enter REVIEW for a fresh round at the same HEAD, the findings "
+            "handed to it to re-check (none is marked resolved); for a finding resolved "
+            "outside the repository, such as a PR description edited by hand"
         ),
     )
 
@@ -1836,6 +1851,7 @@ def cmd_unblock(args) -> int:
     raw_decline = getattr(args, "decline_action", None) or []
     decline = [raw_decline] if isinstance(raw_decline, str) else [str(d) for d in raw_decline]
     bind = [(str(a), str(u)) for a, u in getattr(args, "bind_evidence", None) or []]
+    rereview = bool(getattr(args, "rereview", False))
     # The words a configuration refusal prints for this command (#219).
     words = ("unblock", "--reason", "<why>")
     if args.dry_run:
@@ -1849,6 +1865,7 @@ def cmd_unblock(args) -> int:
             approve_action=approve,
             decline_action=decline,
             bind_evidence=bind,
+            rereview=rereview,
         )
         print_unblock_outcome(outcome)
         return 0
@@ -1862,7 +1879,11 @@ def cmd_unblock(args) -> int:
         if state.phase == Phase.BLOCKED:
             _check_configuration(engine, args, *words, dry_run=False)
         outcome = engine.unblock(
-            args.reason, approve_action=approve, decline_action=decline, bind_evidence=bind
+            args.reason,
+            approve_action=approve,
+            decline_action=decline,
+            bind_evidence=bind,
+            rereview=rereview,
         )
     print_unblock_outcome(outcome)
     if not outcome.unblocked:
@@ -2322,6 +2343,7 @@ def cmd_status(args) -> int:
     # both output modes cross the same redaction boundary as the run log.
     certificate = _review_certificate_check(engine, state)
     parent = _epic_parent_check(engine, state)
+    review = _unjournaled_review(engine, state)
     # From the persisted phase alone (#369, ADR 0011): no reason code is
     # persisted, so a BLOCKED or FAILED run's is UNKNOWN; `Reason:` is the text.
     # Outside a git repository the view is unknown, and `--json` still works.
@@ -2338,6 +2360,7 @@ def cmd_status(args) -> int:
             "operator_actions": _operator_actions(state),
             "review_certificate_status": _review_certificate_status(state, certificate),
             "epic_parent_check": parent.document() if parent is not None else None,
+            "unjournaled_review": review.document() if review is not None else None,
             "stop": stop.as_dict(),
             "outer_sandbox": {
                 "mode": engine.config.sandbox.mode,
@@ -2356,8 +2379,48 @@ def cmd_status(args) -> int:
         engine.continue_command = (*config, "epic", "resume", state.epic_url)
     actions = _render_acceptance_actions(state, engine) + _render_operator_actions(state, engine)
     lines = parent.lines(engine) if parent is not None else []
-    print(redact(_render_status(state, txn, actions, evidence, parent_check=lines, stop=stop)))
+    shown = review.lines() if review is not None else []
+    print(
+        redact(
+            _render_status(
+                state, txn, actions, evidence, parent_check=lines, stop=stop, review=shown
+            )
+        )
+    )
     return 0
+
+
+def _unjournaled_review(engine: ControllerEngine, state: AutoForgeState) -> ProvenanceReport | None:
+    """``status``'s read-only report of an unjournaled review comment (#416).
+
+    Only for a ``BLOCKED`` run bound to a round; ``None`` when the PR holds
+    no round comment the run does not account for. The state directories
+    searched are the one ``status`` reads, the configured ``state_dir`` and,
+    when they differ, the directory the one read lies in; and the scheduler
+    namespaces of this checkout. Reads only, takes no lock and writes
+    nothing; a failed read is in the report.
+    """
+    if not unjournaled_review_applies(state):
+        return None
+    coordination: Path | None
+    try:
+        coordination, problem = engine.coordination_root(), ""
+    except LockError as exc:
+        coordination, problem = None, str(exc)
+    state_dir = Path(os.path.abspath(engine.paths.state_dir))
+    configured = Path(os.path.abspath(engine.config.state_dir))
+    roots = [state_dir, configured]
+    if state_dir != configured:
+        roots.insert(1, state_dir.parent)
+    return unjournaled_review_report(
+        state,
+        github=engine.github,
+        state_dir=state_dir,
+        logs_dir=engine.paths.logs_dir,
+        standalone_roots=roots,
+        coordination_root=coordination,
+        coordination_problem=problem,
+    )
 
 
 @dataclass(frozen=True)
@@ -2974,11 +3037,14 @@ def _render_status(
     evidence: list[str] | None = None,
     parent_check: list[str] | None = None,
     stop: StopClassification | None = None,
+    review: list[str] | None = None,
 ) -> str:
     """Human status for a GitHub run (unredacted; the caller redacts).
 
     ``parent_check`` is the read-only comparison of the recorded EPIC with
-    the issue's native parent (#435), printed under the EPIC line.
+    the issue's native parent (#435), printed under the EPIC line;
+    ``review`` the report of an unjournaled review comment (#416), printed
+    under the stop.
     """
 
     def _num(url: str) -> str:
@@ -3013,7 +3079,7 @@ def _render_status(
         f"Last review:   {state.last_review_result or '-'}",
         f"Review comment: {state.last_review_comment_url or '-'}",
         f"Open findings: {len(state.open_findings)}",
-        f"Prior findings to re-check: {len(state.prior_findings)}",
+        f"Prior findings to re-check: {len(state.prior_findings)}{_carried_by(state)}",
     ]
     if state.superseded_prs:
         lines.append("Superseded PRs:")
@@ -3024,6 +3090,7 @@ def _render_status(
         lines.append(f"Reason:     {state.block_reason}")
     if stop is not None and stop.outcome in (StopOutcome.BLOCKED, StopOutcome.FAILED):
         lines.append(f"Stop:       {stop.line().removeprefix('stop: ')}")
+    lines += review or []
     lines += acceptance or []
     if state.unblock_history:
         last = state.unblock_history[-1]
@@ -3042,6 +3109,14 @@ def _render_status(
         f"Updated:    {state.updated_at}",
     ]
     return "\n".join(lines)
+
+
+def _carried_by(state: AutoForgeState) -> str:
+    """Where ``status``'s carried findings come from, when an ``unblock --rereview`` (#428)."""
+    entry = rereview_carry(state)
+    if entry is None:
+        return ""
+    return f" (abandoned at {entry.get('at', '-')} by 'unblock --rereview')"
 
 
 def _recorded_configuration(state: AutoForgeState) -> str:

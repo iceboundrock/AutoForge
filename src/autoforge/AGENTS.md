@@ -63,7 +63,8 @@ sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005
                     what a provider's declaration makes writable (declared_writable)
 agent_worktree.py   the agent worktree's git surface in every sandbox.mode: registry
                     binding and listing (D6.4, #223), candidate read through the
-                    common dir (D6.3),
+                    common dir (D6.3), the uncommitted-change reads through the bound
+                    admin dir and against the reviewed tree's bytes (#428),
                     strict import of private objects (D6.5); git only through the
                     executor's hardened local request (#168)
 github.py           GitHubClient over `gh`, the only holder of a GitHub credential:
@@ -95,9 +96,16 @@ epic_rebind.py      rebind-epic's decision for an existing standalone run: reque
                     parent reads and the recorded EPIC's progress comments, the journal
                     of applied rebinds and what a repeat is, the report and its run-log
                     record, status's parent warning; no I/O of its own (#435)
+review_provenance.py  status's read-only report of an unjournaled review comment (ADR 0004
+                    D9.6, #416): the state directories of the checkout that journaled it,
+                    the PR's other review markers, the commits made after it, the PR's
+                    implementation marker; GitHub reads and strict local loads only, names
+                    no author, nothing that decides imports it
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
 materialize.py      byte-exact export of a candidate commit from the shared object store
-                    and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171)
+                    and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171);
+                    a working tree's blob-by-blob comparison with a commit, a gitlink
+                    matching only as an empty directory (tree_differences)
 evidence.py         candidate validation evidence: definitions, policy P, ValidationRecords,
                     the attempt marker, their bounds and integrity checks; pure (ADR 0006, #172)
 certificate.py      review certificates: issuance from the review binding, applicability
@@ -228,7 +236,8 @@ engine.py (phase sequencing, resume)             -> docs/agent-guides/workflow.m
 replan_txn.py, engine.py (REPLAN_REEXECUTE),
 prompts/replan_reexecute.md                       -> docs/agent-guides/replan-transaction.md (+ workflow.md)
 github.py, claims.py, validation.py, run_binding.py,
-epic_rebind.py, premerge.py, materialize.py, effect_ops.py,
+epic_rebind.py, review_provenance.py, premerge.py,
+materialize.py, effect_ops.py,
 git_transport.py, child_env.py, read_context.py, engine.py (post-phase
 verification, merge gate, dry-run, read context),
 prompts/update_epic*.md                           -> docs/agent-guides/github-safety.md

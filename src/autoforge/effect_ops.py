@@ -97,7 +97,14 @@ from .errors import (
     StateError,
 )
 from .git_transport import GitTransport, PushOutcome
-from .github import CommentInfo, GitHubClient, IssueInfo, PRInfo
+from .github import (
+    CommentInfo,
+    GitHubClient,
+    IssueInfo,
+    PRInfo,
+    gh_may_rewrite,
+    gh_prints_as,
+)
 from .redaction import credential_classes, redact
 from .replan_txn import scan_replan_markers
 from .validation import parse_issue_url, parse_pr_url, same_issue_url
@@ -387,68 +394,6 @@ def _exactly(
     if found[0].in_end_state and not _printed_alike(record):
         return found
     return [replace(found[0], in_end_state=completes_exactly(objects[0]))]
-
-
-def gh_may_rewrite(printed: str) -> bool:
-    """Whether ``printed``, a text `gh` printed, may not be GitHub's text (#328).
-
-    Every rewrite of `gh`'s sanitizer leaves caret notation, a ``^``, where a
-    control character or the text of its escape was, and the sanitizer
-    removes no ``^``. A print without one is therefore GitHub's text byte for
-    byte; one with a ``^`` may be another text's print, and only the exact
-    read can tell.
-    """
-    return "^" in printed
-
-
-def _gh_caret(code: int) -> str | None:
-    """The caret notation `gh`'s sanitizer prints for the character ``code``, or ``None``.
-
-    go-gh's asciisanitizer rewrites every C0 and C1 control character but
-    tab, line feed, vertical tab and carriage return: ``^`` and the
-    character 0x40 above it (C1 as C0), with 0x1C as ``^\\``.
-    """
-    if code in (0x09, 0x0A, 0x0B, 0x0D) or not (code < 0x20 or 0x80 <= code < 0xA0):
-        return None
-    low = code % 0x80
-    return "^" + ("\\" if low == 0x1C else chr(0x40 + low))
-
-
-_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
-
-
-def gh_prints_as(text: str, printed: str) -> bool:
-    """Whether ``printed``, a text `gh` printed, can be its print of GitHub's ``text`` (#328).
-
-    The sanitizer changes nothing but a control character (``\\x1b`` as
-    ``^[``) and the text of its JSON escape after a backslash (``\\u001b``
-    as ``\\^[``), each into caret notation; every other character is printed
-    as it is. ``printed`` is that print when it is ``text`` with some of
-    those rewritten. Which ones does not matter (GitHub may send a
-    backspace or form feed as a short escape, which the sanitizer leaves),
-    but any other difference does: the two reads saw different texts. Caret
-    notation is lossy, so a text that differs from ``text`` only where the
-    sanitizer rewrites (the literal ``^[`` for ``\\x1b``) also passes; it
-    prints the same, so whatever was shown from ``printed`` is what GitHub
-    holds. Every rewrite starts with a ``^`` and no rewritten character is
-    one, so where the two texts agree a character is never a rewrite: the
-    comparison is one pass.
-    """
-    i = j = 0
-    while i < len(text):
-        char = text[i]
-        if j < len(printed) and printed[j] == char:
-            i, j = i + 1, j + 1
-            continue
-        caret, width = _gh_caret(ord(char)), 1
-        if caret is None and char in "uU" and i > 0 and text[i - 1] == "\\":
-            digits = text[i + 1 : i + 5]
-            if len(digits) == 4 and _HEX_DIGITS.issuperset(digits):
-                caret, width = _gh_caret(int(digits, 16)), 5
-        if caret is None or not printed.startswith(caret, j):
-            return False
-        i, j = i + width, j + len(caret)
-    return j == len(printed)
 
 
 def held_pr(github: GitHubClient, url: str) -> PRInfo:

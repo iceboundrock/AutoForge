@@ -2155,6 +2155,11 @@ def _assert_unjournaled_review_remedies(reason: str, *, many: bool = False) -> N
     )
     assert "never adopts or duplicates one it did not journal (ADR 0004 D9.6)" in reason
     assert f"{stray} 'unblock'" in reason
+    # #416: where to read the evidence, without changing anything.
+    assert (
+        "Run autoforge status for what GitHub and this checkout's state directories hold about "
+        f"where {'they' if many else 'it'} came from; it changes nothing. {stray}"
+    ) in reason
     assert (
         f"{owner} to another controller's run, do not delete it and do not 'unblock': "
         "it is that run's review record, its FIX may already be working from it, and after "

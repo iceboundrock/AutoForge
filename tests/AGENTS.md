@@ -58,8 +58,12 @@ read it before adding tests for a listed area.
   `controller_review_comment(eng, round)` returns the one comment carrying
   that round's marker. `review_comment_body(...)` builds a comment someone
   else posted: an earlier round's evidence for a test that starts past
-  `REVIEW`, or an unjournaled comment that blocks the round. Reuse these
-  rather than hand-rolling fakes.
+  `REVIEW`, or an unjournaled comment that blocks the round
+  (`add_comment(..., author=, created_at=)` gives it GitHub's login and
+  time). `FakeGitHub.pr_commits` holds the commits GitHub lists for a PR,
+  which `status`'s report of such a comment reads (#416), and
+  `pr_commits_error` makes that read raise. Reuse these rather than
+  hand-rolling fakes.
 - `REVIEW` and `FIX` fetch the bound HEAD (and `REVIEW` the merge base)
   before launching the agent. An engine without an origin records that
   fetch in the `offline_fetches` fixture and fetches nothing; with
@@ -474,6 +478,9 @@ ADR 0011)                             class mapped, routes from the outcome alon
                                       importer and nothing persisted; the fixtures: real stops with
                                       their outcome, code, source and routes), test_cli.py (the
                                       stop lines), test_stop_corpus.py (the corpus tool)
+recovery and escalation (#370,        test_stop_classification.py (ADR 0012's stop matrix takes
+ADR 0012)                             every outcome that needs recovery, its gate A table every
+                                      reason family and code, and every test it names exists)
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)
