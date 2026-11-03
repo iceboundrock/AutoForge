@@ -592,7 +592,35 @@ before the block:
   was planned or posted, so that file is the only record of the result.
 
 The controller cannot tell who posted the comment, and the remedy depends
-on it, so check first:
+on it, so check first. `status` shows what it can read about that (#416),
+under the reason of a blocked run, and `status --json` carries the same as
+`unjournaled_review`. For each comment the round blocks on: when GitHub
+says it was created and how long after the run's creation and after the
+run's last reviewer launches; its marker (at most 20 of its finding ids
+and 10 of its markers' defects, each with their count); the length and SHA-256 of its body as GitHub holds it
+(read exactly when `gh` may have rewritten it; when that read fails, of
+`gh`'s print, and the report says so) and a short excerpt of `gh`'s print;
+and every state directory on this checkout that journaled it (a review
+comment effect record observed at it, or `last_review_comment_url` naming
+it). A state directory that holds only a plan for its round (an effect
+record for its marker that was not observed at it), or whose review
+history records the round at its HEAD, is listed as `recorded:`, never as
+the comment's journal: a plan names no comment, and a foreign comment
+posted after it was saved carries the same marker, with the planned body
+or another. Then which state directories are bound to the PR, the
+PR's other review markers, the commits GitHub lists for the PR committed
+after the comment, with author, committer and the time after it (GitHub
+records when a commit was made, not when it was pushed), and the PR's
+implementation marker (at most 10 of its issues and of its defects, with
+their count). The state directories read are the one `status`
+reads, the ones in it and under the configured `state_dir`, the ones beside
+it when it lies elsewhere, and the scheduler namespaces; a directory that
+could not be opened or listed is named as not searched, and the report then
+says its search was incomplete. It names no
+author and changes nothing. A comment another directory here journaled is
+that run's review; one none of them accounts for may still be the review
+of a controller on another machine or in another clone, which this
+checkout cannot see.
 
 - **A stray or foreign comment** (a human's, an agent's that still held a
   credential, or one a reviewer of an earlier AutoForge version posted):

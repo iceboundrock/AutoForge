@@ -473,6 +473,37 @@ class CommentInfo:
     parent_url: str = ""  # canonical issue/PR URL this comment belongs to
 
 
+@dataclass(frozen=True)
+class CommitPerson:
+    """A commit's author or committer as git recorded it, and the account GitHub links.
+
+    ``name`` and ``email`` are what the commit says, which whoever made it
+    chose; ``login`` is the GitHub account GitHub matched to that email, ""
+    when it matched none. Each is "" when GitHub reports none.
+    """
+
+    name: str = ""
+    email: str = ""
+    login: str = ""
+
+
+@dataclass(frozen=True)
+class PRCommitInfo:
+    """One commit of a PR, as GitHub lists the PR's commits (#416).
+
+    GitHub records when a commit was authored and committed, both as the
+    commit says, and never when it was pushed. ``headline`` is the first
+    line of its message: untrusted text.
+    """
+
+    oid: str
+    authored_at: str
+    committed_at: str
+    author: CommitPerson
+    committer: CommitPerson
+    headline: str = ""
+
+
 @dataclass
 class PRInfo:
     url: str
@@ -756,6 +787,74 @@ _JSON_CONTENT_TYPE_RE = re.compile(r"^application/json\s*(?:;|$)", re.IGNORECASE
 # What `gh auth token` may print: visible ASCII, so it can never end the
 # Authorization header and start another.
 _API_TOKEN_RE = re.compile(r"[\x21-\x7e]{1,4096}")
+
+
+# What `gh` prints of a text, without reading it again: the sanitizer's rewrites are
+# known (#328), so a print can be told GitHub's text, or the print of a given text.
+# Pure functions: the effect read-backs judge with them (``effect_ops``), and so does
+# ``status``'s report of an unjournaled review comment (#416).
+
+
+def gh_may_rewrite(printed: str) -> bool:
+    """Whether ``printed``, a text `gh` printed, may not be GitHub's text (#328).
+
+    Every rewrite of `gh`'s sanitizer leaves caret notation, a ``^``, where a
+    control character or the text of its escape was, and the sanitizer
+    removes no ``^``. A print without one is therefore GitHub's text byte for
+    byte; one with a ``^`` may be another text's print, and only the exact
+    read can tell.
+    """
+    return "^" in printed
+
+
+def _gh_caret(code: int) -> str | None:
+    """The caret notation `gh`'s sanitizer prints for the character ``code``, or ``None``.
+
+    go-gh's asciisanitizer rewrites every C0 and C1 control character but
+    tab, line feed, vertical tab and carriage return: ``^`` and the
+    character 0x40 above it (C1 as C0), with 0x1C as ``^\\``.
+    """
+    if code in (0x09, 0x0A, 0x0B, 0x0D) or not (code < 0x20 or 0x80 <= code < 0xA0):
+        return None
+    low = code % 0x80
+    return "^" + ("\\" if low == 0x1C else chr(0x40 + low))
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def gh_prints_as(text: str, printed: str) -> bool:
+    """Whether ``printed``, a text `gh` printed, can be its print of GitHub's ``text`` (#328).
+
+    The sanitizer changes nothing but a control character (``\\x1b`` as
+    ``^[``) and the text of its JSON escape after a backslash (``\\u001b``
+    as ``\\^[``), each into caret notation; every other character is printed
+    as it is. ``printed`` is that print when it is ``text`` with some of
+    those rewritten. Which ones does not matter (GitHub may send a
+    backspace or form feed as a short escape, which the sanitizer leaves),
+    but any other difference does: the two reads saw different texts. Caret
+    notation is lossy, so a text that differs from ``text`` only where the
+    sanitizer rewrites (the literal ``^[`` for ``\\x1b``) also passes; it
+    prints the same, so whatever was shown from ``printed`` is what GitHub
+    holds. Every rewrite starts with a ``^`` and no rewritten character is
+    one, so where the two texts agree a character is never a rewrite: the
+    comparison is one pass.
+    """
+    i = j = 0
+    while i < len(text):
+        char = text[i]
+        if j < len(printed) and printed[j] == char:
+            i, j = i + 1, j + 1
+            continue
+        caret, width = _gh_caret(ord(char)), 1
+        if caret is None and char in "uU" and i > 0 and text[i - 1] == "\\":
+            digits = text[i + 1 : i + 5]
+            if len(digits) == 4 and _HEX_DIGITS.issuperset(digits):
+                caret, width = _gh_caret(int(digits, 16)), 5
+        if caret is None or not printed.startswith(caret, j):
+            return False
+        i, j = i + width, j + len(caret)
+    return j == len(printed)
 
 
 @dataclass(frozen=True)
@@ -1044,6 +1143,20 @@ def _comment_page_query(parent: str) -> str:
 _ISSUE_COMMENT_PAGE_QUERY = _comment_page_query("issue")
 _PR_COMMENT_PAGE_QUERY = _comment_page_query("pullRequest")
 
+# One page of a PR's commits, read by cursor to the end like the comments
+# (#416). GitHub lists at most 250 commits of a PR; that is the listing.
+_COMMIT_PAGE_SIZE = 100
+_GIT_ACTOR_FIELDS = "name email user { login }"
+_PR_COMMIT_PAGE_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!, $after: String) {"
+    " repository(owner: $owner, name: $name) {"
+    " pullRequest(number: $number) {"
+    f" commits(first: {_COMMIT_PAGE_SIZE}, after: $after) {{"
+    " pageInfo { hasNextPage endCursor }"
+    " nodes { commit { oid authoredDate committedDate messageHeadline"
+    f" author {{ {_GIT_ACTOR_FIELDS} }} committer {{ {_GIT_ACTOR_FIELDS} }} }} }} }} }} }} }}"
+)
+
 
 # -- strict row decoding ----------------------------------------------------------
 #
@@ -1207,6 +1320,38 @@ def _decode_comment(row: object, parent_url: str) -> CommentInfo:
         author=login,
         created_at=_text_field(data, "createdAt", what),
         parent_url=parent_url,
+    )
+
+
+def _decode_commit_person(row: object, role: str, what: str) -> CommitPerson:
+    """A commit's ``author`` or ``committer``: ``null`` is no one, another type malformed."""
+    if row is None:
+        return CommitPerson()
+    data = _row_object(row, f"{what}: {role}")
+    user = data.get("user")
+    if user is not None and not isinstance(user, dict):
+        raise GitHubError(f"{what}: {role}.user is {type(user).__name__}, expected an object")
+    return CommitPerson(
+        name=_text_field(data, "name", f"{what}: {role}"),
+        email=_text_field(data, "email", f"{what}: {role}"),
+        login=_text_field(user, "login", f"{what}: {role}.user") if user else "",
+    )
+
+
+def _decode_pr_commit(row: object, pr_url: str) -> PRCommitInfo:
+    """One node of a PR's commit listing; a node without a full object id is malformed."""
+    what = f"commit of {pr_url}"
+    commit = _row_object(_row_object(row, what).get("commit"), what)
+    oid = _text_field(commit, "oid", what).lower()
+    if not _FULL_SHA_RE.match(oid):
+        raise GitHubError(f"{what}: oid {oid!r:.80} is not a full object id")
+    return PRCommitInfo(
+        oid=oid,
+        authored_at=_text_field(commit, "authoredDate", what),
+        committed_at=_text_field(commit, "committedDate", what),
+        author=_decode_commit_person(commit.get("author"), "author", what),
+        committer=_decode_commit_person(commit.get("committer"), "committer", what),
+        headline=_text_field(commit, "messageHeadline", what),
     )
 
 
@@ -3357,6 +3502,41 @@ class GitHubClient:
         ref = parse_issue_url(url)
         return self._comments(_ISSUE_COMMENT_PAGE_QUERY, "issue", ref)
 
+    def get_pr_commits(self, url: str) -> list[PRCommitInfo]:
+        """The commits GitHub lists for a PR, oldest first, read to the end (#416).
+
+        Read only by ``status``'s report of an unjournaled review comment, as
+        evidence: no decision rests on it. A page that cannot be read or
+        walked past is a GitHubError, never a shorter listing, as for the
+        comments (:meth:`_walk_connection`); a commit listed twice is kept once.
+        """
+        ref = parse_pr_url(url)
+        what = f"commits of {ref.canonical}"
+        owner, _, name = ref.repository.partition("/")
+
+        def commits(data: dict, page_what: str) -> dict:
+            repository = data.get("repository")
+            if not isinstance(repository, dict):
+                raise GitHubError(f"{page_what}: repository is not readable: {repository!r:.200}")
+            pull = repository.get("pullRequest")
+            if not isinstance(pull, dict):
+                raise GitHubError(f"{page_what}: pullRequest is not readable: {pull!r:.200}")
+            connection = pull.get("commits")
+            if not isinstance(connection, dict):
+                raise GitHubError(f"{page_what} is not a commit connection: {connection!r:.200}")
+            return connection
+
+        variables = ["-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={ref.number}"]
+        found: list[PRCommitInfo] = []
+        seen: set[str] = set()
+        for node in self._walk_connection(_PR_COMMIT_PAGE_QUERY, variables, commits, what):
+            commit = _decode_pr_commit(node, ref.canonical)
+            if commit.oid in seen:
+                continue
+            seen.add(commit.oid)
+            found.append(commit)
+        return found
+
     def _comments(self, query: str, parent: str, ref: GitHubRef) -> list[CommentInfo]:
         """The complete comment listing of ``ref`` (ADR 0004 D4.5), or a GitHubError.
 
@@ -3438,6 +3618,7 @@ __all__ = [
     "MERGE_METHODS",
     "CheckInfo",
     "CommentInfo",
+    "CommitPerson",
     "CreatedObject",
     "GitHubClient",
     "GitHubIssueRef",
@@ -3446,10 +3627,13 @@ __all__ = [
     "HttpsRequest",
     "IssueInfo",
     "MergeQueueStatus",
+    "PRCommitInfo",
     "PRInfo",
     "RepoInfo",
     "build_disable_auto_merge_argv",
     "build_edit_issue_body_argv",
     "build_merge_argv",
+    "gh_may_rewrite",
+    "gh_prints_as",
     "https_get",
 ]

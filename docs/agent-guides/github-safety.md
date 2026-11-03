@@ -332,7 +332,23 @@ the upcoming round at the bound HEAD, base and merge base:
   (before anything is planned) blocks the same way, on one comment or
   several; its reason says a reviewer ran and names the run-log
   `control-result.json` that alone holds its result, never that nothing
-  was launched.
+  was launched. The reason also names `status`, which, for a `BLOCKED`
+  run bound to a round, reads the PR's comments again and reports what
+  GitHub and this checkout's state directories hold about each such
+  comment (#416): which state directory journaled it (a K4 record
+  observed at it, or `last_review_comment_url`; a K4 plan for its marker
+  not observed at it names no comment and is listed as a plan, never as
+  its journal), the PR's other review markers, the commits committed after
+  it and the PR's implementation marker. It reads only: the comments, then
+  the PR and its commits (`pullRequest.commits`, GraphQL) and the exact
+  read of each such comment `gh` printed with a `^` (at most 10), local
+  files through the strict loaders, and takes no lock. The comment's
+  digest and its comparison with a plan's payload are of GitHub's text;
+  when the exact read fails or finds another version, the digest is the
+  print's, labelled so, and no payload is judged equal to it. Only `gh`'s
+  print is quoted. A directory that could not be opened or listed is named
+  as not searched. It names no author and nothing that decides reads it;
+  a failed read is in the report, never a reason to refuse `status`.
 - a comment for the same round at another HEAD, against another base, or
   from another merge base is not this round's: the round's identity is the
   diff it decided on, and a review posted before the PR was retargeted, or
@@ -1371,7 +1387,7 @@ would invalidate bindings already saved.
 print of the object and judge or bind its exact text, so the print and the
 exact text must be one version of it: an edit between the two reads would
 otherwise pair the text shown with another text's digests.
-`effect_ops.gh_prints_as` tells. The sanitizer changes nothing but a
+`github.gh_prints_as` tells. The sanitizer changes nothing but a
 control character and the text of its escape after a backslash, each into
 caret notation, so a print is the exact text's when every difference
 between them is one of those rewrites; any other difference is an edit

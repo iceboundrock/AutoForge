@@ -5,6 +5,53 @@ so.
 
 ## Unreleased
 
+### `status` shows where an unjournaled review comment may have come from (#416)
+
+When `REVIEW` blocks on a round comment the controller did not journal
+(ADR 0004 D9.6), its reason names only the comment, and working out
+whether it was a stray comment or another controller's own review meant
+reading state files, run logs and GitHub by hand. Now `status` of such a
+`BLOCKED` run reads the PR's comments again and, under the reason,
+prints what GitHub and this checkout hold about each comment the round
+blocks on; `status --json` carries the same as `unjournaled_review`
+(`null` when there is none):
+
+- when GitHub says the comment was created, and how long after the run's
+  creation and after the run's last reviewer launches in its run log; the
+  login GitHub names, the comment's marker (at most 20 of its finding ids
+  and 10 of its markers' defects, each with their count), length, SHA-256 and a short excerpt. The length and
+  SHA-256 are of GitHub's text: a body `gh` printed with a `^` is read
+  again exactly, since `gh` rewrites control characters and the text of
+  their escapes. When that read fails, the report gives the print's
+  instead and says so. The excerpt is always `gh`'s print;
+- every state directory on this checkout that journaled it (a review
+  comment effect record observed at it, or `last_review_comment_url`
+  naming it); one that holds only a plan for its round (an effect record
+  for its marker not observed at it), or whose review history records its
+  round at its HEAD, is listed as that, not as the comment's journal, with
+  how the plan's payload compares with GitHub's text. A plan names no
+  comment, and a foreign comment posted after it was saved carries the
+  same marker. Then the state directories bound to the PR. The
+  directories read are the one `status` reads, those in it and under the
+  configured `state_dir`, those beside it when it lies elsewhere, and the
+  scheduler namespaces; an unreadable one is listed, and so is a directory
+  that could not be opened or listed, with the search then reported
+  incomplete;
+- the PR's other `ai-review-result` markers, the commits GitHub lists for
+  the PR committed after the comment (author, committer, time after it;
+  GitHub records when a commit was made, not when it was pushed), and the
+  PR's `ai-implementation` marker (at most 10 of the issues it names and of
+  its defects, with their count) and HEAD.
+
+It is evidence only: it names no author, adopts, deletes and writes
+nothing, and takes no lock. Bodies, commit messages, names and e-mail
+addresses are redacted, put on one line and bounded. A failed read is
+reported and `status` still exits 0. The cost is one more GitHub read
+(the PR's comments) for a `BLOCKED` run with a bound PR, HEAD, base and
+merge base, and two more (the PR and its commits) when such a comment is
+found, plus the exact read of each such comment `gh` printed with a `^`
+(at most 10). The block reason now names the `status` command to run.
+
 ### A body the controller writes back keeps text `gh` rewrites, and an operator's exact comment verifies (#328)
 
 - The controller writes an adopted PR's body (K3), a follow-up issue's
