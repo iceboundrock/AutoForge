@@ -2246,6 +2246,12 @@ its author. Only the effect records and the entry observation prove origin.
     one. Judged after them, it raised a verification error first, which
     leaves the phase as it was, so the displaced run re-entered the PR once
     it was reopened and its owner removed. These reads are:
+    - `ANALYZE_EXECUTE`'s probe of the PR its state persisted, judged
+      before the PR's state and before the open-PR listing or the branch is
+      read (PR #459 R5-F1). Judged after the state, a closed persisted PR
+      another run owns was dropped as no candidate and the implementation
+      agent launched; judged after the listing, a listing that failed left
+      the owner the read had found unrecorded;
     - `REVIEW`'s binding;
     - a read right before K4 is sent, on every entry that sends it (the one
       read this adds: a reviewer runs for minutes, and a takeover in
@@ -2256,7 +2262,11 @@ its author. Only the effect records and the entry observation prove origin.
       sends (a follow-up issue, a marker append, an acceptance comment):
       each send before it took a round trip or more (PR #459 R1-F4);
     - the merge gate's checks read, before a `MERGED` PR is reconciled or
-      counted;
+      counted, and the identity read behind a checks read GitHub refuses,
+      before the PR's state is judged, so the gate blocks on the owner
+      rather than on the refusal alone (PR #459 R5-F1);
+    - the step budget's read of the PR at the merge gate, which words its
+      `BLOCKED` reason (PR #459 R5-F1);
     - the closed merge gate's read of a run held at `READY_FOR_MERGE`, by
       `step`, `resume` and `epic recheck`, before its revision is judged:
       moved or not, a refusal blocks rather than routing the PR to `REVIEW`
@@ -2267,7 +2277,10 @@ its author. Only the effect records and the entry observation prove origin.
       the saved `ANALYZE_EXECUTE` plan still pending (K1, K2, K3), on the
       step that saved it and on every resume (PR #459 R3-F1). K1's lease
       holds the branch, not a PR's body, so an owner written into the
-      adopted PR since the plan was saved passes it;
+      adopted PR since the plan was saved passes it. Every implementation
+      marker on those PRs is judged, not the issue's alone: a marker of
+      another issue, whatever run it names or none, says the PR implements
+      that issue and refuses too (PR #459 R5-F2);
     - the replan checkpoint and the read before the source is closed;
     - a read of the source before a transaction `PREPARED` on an earlier
       entry launches its agent again, and before each record of its saved
@@ -2313,9 +2326,11 @@ its author. Only the effect records and the entry observation prove origin.
     marker) is displaced at its next boundary rather than left driving
     beside it. A marker written into that PR after the plan was saved
     refuses the push and the write before either is sent, with the plan
-    kept (PR #459 R3-F1); once it is removed, a plain `unblock` completes
-    the plan from the journal. A marker naming this run is never refused
-    there, so the record that published it reconciles as before.
+    kept (PR #459 R3-F1), and so does a marker of another issue written
+    there, whatever run it names (PR #459 R5-F2); once it is removed, a
+    plain `unblock` completes the plan from the journal. A marker of the
+    issue naming this run is never refused there, so the record that
+    published it reconciles as before.
   - **The owned PR (PR #459 R1-F1).** A marker naming no run, and no
     marker at all, look the same whether the PR was opened before #414 or
     someone removed its owner since. A body GitHub does not return reads
@@ -2330,7 +2345,9 @@ its author. Only the effect records and the entry observation prove origin.
     - a takeover;
     - any read of the bound PR whose marker names a run, this one or
       another, a refused `unblock`'s included, and the closed merge gate's
-      read of a run it holds (PR #459 R3-F2).
+      read of a run it holds (PR #459 R3-F2), `ANALYZE_EXECUTE`'s probe of
+      its persisted PR, the identity read behind a refused checks read and
+      the step budget's read at the merge gate (PR #459 R5-F1).
 
     A read writes it into the state file as soon as it finds it, and
     nothing else: no phase, no step charged (PR #459 R4-F2). The state

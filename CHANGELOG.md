@@ -24,11 +24,12 @@ comment, `FIX` before each follow-up issue, marker append and acceptance
 comment after its first, and a replan before it launches its agent again
 and before each push and replacement PR of its saved plan. A run resuming
 its saved `ANALYZE_EXECUTE` push and PR plan reads the PRs on its branch
-first, so it pushes nothing into a PR someone gave another run's marker
-after the plan was saved. A run held at `READY_FOR_MERGE` with the merge
-gate closed checks the owner on the same read `step`, `resume` and `epic
-recheck` make of the PR's revision: a PR another run owns blocks it, even
-when the PR moved, instead of sending it back to `REVIEW`.
+first, so it pushes nothing into a PR someone gave another run's marker,
+or the marker of another issue, after the plan was saved. A run held at
+`READY_FOR_MERGE` with the merge gate closed checks the owner on the same
+read `step`, `resume` and `epic recheck` make of the PR's revision: a PR
+another run owns blocks it, even when the PR moved, instead of sending it
+back to `REVIEW`.
 
 To hand a PR to a new run: stop the run that owns it, replace the marker in
 the PR body with the one the refusal names, then run `autoforge unblock
@@ -50,8 +51,12 @@ closed merge gate's read of a held run. That read writes it at once, so a
 read or check that fails after it, or a stopped process, keeps it too. A
 run whose PR is closed, or has no readable HEAD, and whose marker names
 another run stops (`pr-owner`) rather than waiting to re-enter the PR
-once it is reopened. From then on a
-marker that names no run, a missing marker and a PR body that reads empty
+once it is reopened, and so does an `ANALYZE_EXECUTE` entry whose own
+PR, closed or open, another run owns, before it reads anything else or
+launches the agent. A merge gate that GitHub refuses the PR's checks, or
+that the step budget stops, records the owner its read of the PR finds,
+and a PR another run owns stops it on that owner (`pr-owner`). From then
+on a marker that names no run, a missing marker and a PR body that reads empty
 block it (`pr-owner`), because the owner was removed and which run owns
 the PR is not knowable. A run that crashed after opening its PR or a replan
 replacement, before binding it, reads the owner it published from its own

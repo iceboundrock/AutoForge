@@ -557,7 +557,24 @@ High-priority coverage includes:
   (and, held, the PR moved) a restarted run blocks with nothing launched;
   a binding the state file does not hold yet gets no write, and a dry
   `unblock` that raises writes nothing and restores the state in memory
-  (PR #459 R4-F2; `tests/test_engine.py`, `tests/test_unblock.py`)
+  (PR #459 R4-F2; `tests/test_engine.py`, `tests/test_unblock.py`). A
+  legacy `ANALYZE_EXECUTE` binding whose PR, `CLOSED` or `OPEN` on a
+  custom branch, another run owns blocks (`pr-owner`) after the one PR
+  read, launching nothing and recording the owner; one whose marker names
+  this run keeps the owner on disk through an open-PR listing that is
+  unavailable (no step charged, the phase kept) or cannot be read to its
+  end; a refused checks read at `READY_FOR_MERGE` or `MERGE` whose
+  identity read finds another run's owner blocks on it (`pr-owner`), and
+  one naming this run blocks on the refusal with the owner recorded; the
+  step budget's read at the merge gate records the owner it finds; after
+  the owner is removed (and the PR moved) a restarted run's `unblock`
+  refuses and `run` launches nothing, and a dry run reads and writes
+  nothing (PR #459 R5-F1). The saved `ANALYZE_EXECUTE` plan's fence
+  refuses a marker of another issue, naming another run or none, written
+  into the PR on the branch after a crash: the resume and a plain
+  `unblock`'s re-entry push, adopt and open nothing with the branch where
+  it was, and once the marker is removed the plan completes from the
+  journal (PR #459 R5-F2; `tests/test_engine.py`)
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

@@ -6111,7 +6111,9 @@ class ControllerEngine:
             f"is, leave the issue to that run. {how}"
         )
 
-    def _implementation_pr_candidate(self) -> tuple[PRInfo | None, str]:
+    def _implementation_pr_candidate(
+        self, sent: str = "nothing was launched"
+    ) -> tuple[PRInfo | None, str]:
         """The one open PR that implements the current issue, if it is knowable.
 
         The probe behind :meth:`_reconcile_analyze_entry` (and behind
@@ -6125,6 +6127,18 @@ class ControllerEngine:
         D9.4) or one without a readable HEAD. ``reason`` is the
         text the caller blocks (or refuses) with; the controller never
         guesses. A transient GitHub failure propagates unchanged.
+
+        Who owns the persisted PR is judged as soon as the answer is known to
+        be that PR, in the run's repository, before its state is or anything
+        else is read (#414, PR #459 R5-F1), as :meth:`_require_open_pr` does
+        for every other phase: a PR another run owns, or whose marker cannot
+        be read or lost the owner this run knew, raises :class:`PROwnerError`
+        (``sent`` says what the step left unsent), which blocks the step,
+        closed as the PR may be. Judged after the state, a closed PR another
+        run owns was dropped as no candidate, and a legacy binding launched
+        the implementation agent beside it. An owner the read finds is
+        written into the state file at once (:meth:`_note_pr_owner`), so a
+        listing that then fails, or a process killed, keeps it.
         """
         state = self._require_state()
         issue = parse_issue_url(state.current_issue_url)
@@ -6138,6 +6152,8 @@ class ControllerEngine:
                 return None, (
                     f"state references PR {state.current_pr_url} but it cannot be read: {exc}"
                 )
+            if self._is_bound_answer(pr):
+                self._require_pr_owner(pr, sent)
             if pr.is_open:
                 candidates[parse_pr_url(pr.url).canonical] = pr
         try:
@@ -9252,6 +9268,14 @@ class ControllerEngine:
         PR moments before and found it OPEN, so the reason words that read
         instead of asking GitHub the same question again. It is judged as a
         fresh read would be.
+
+        Who owns the PR is judged on that read as soon as it is known to be
+        the bound PR, before its state is (#414, PR #459 R5-F1): a PR another
+        run owns, or whose marker cannot be read or lost the owner this run
+        knew, is that run's to merge and count, and the reason says so; an
+        owner the read finds is written into the state file at once
+        (:meth:`_note_pr_owner`), so once it is removed an 'unblock' after
+        the budget is raised still refuses the PR.
         """
         state = self._require_state()
         url = state.current_pr_url
@@ -9261,10 +9285,18 @@ class ControllerEngine:
             pr = read if read is not None else self.github.get_pr(url)
             if pr.url and not parse_pr_url(pr.url).same_target(parse_pr_url(url)):
                 unknown = f"GitHub answered with PR {pr.url}"
-            elif pr.state != "MERGED" and pr.state not in UNMERGED_PR_STATES:
-                unknown = f"its state {pr.state!r:.40} is none of OPEN, CLOSED or MERGED"
         except (GitHubError, ConfigurationError) as exc:
             unknown = str(exc) or type(exc).__name__
+        if pr is not None and not unknown:
+            owner = self._pr_owner_problem(pr)
+            if owner:
+                return self._pr_owner_text(
+                    owner,
+                    "this run counted no merge of it, and 'workflow.max_total_steps' is to be "
+                    "raised in the config before any 'unblock'",
+                )
+            if pr.state != "MERGED" and pr.state not in UNMERGED_PR_STATES:
+                unknown = f"its state {pr.state!r:.40} is none of OPEN, CLOSED or MERGED"
         unblock = (
             "Raise 'workflow.max_total_steps' in the config, then 'unblock': "
             f"{UNBLOCK_RECONCILES_MERGE}."
@@ -9618,8 +9650,8 @@ class ControllerEngine:
 
     def _checks_refused_reason(
         self, url: str, reviewed_ref: GitHubPullRequestRef, exc: GitHubChecksAccessError
-    ) -> str:
-        """The BLOCKED reason for a refused checks read at the merge gate (#291).
+    ) -> tuple[str, StopReasonCode]:
+        """The BLOCKED reason and code for a refused checks read at the merge gate (#291).
 
         A PR that is already merged (a MERGE crash recovery, or a human's
         merge that ``unblock`` sent to READY_FOR_MERGE to reconcile) is not
@@ -9635,7 +9667,19 @@ class ControllerEngine:
         re-read failed), and ``unblock`` sends such a merge here to be
         reconciled, so neither merge-gate phase may say from state that
         nothing was merged.
+
+        Who owns the PR is judged on the identity read as soon as it is known
+        to be the reviewed PR, before its state is (#414, PR #459 R5-F1), as
+        the gate judges it on a checks read: a PR another run owns, or whose
+        marker cannot be read or lost the owner this run knew, blocks with
+        :attr:`StopReasonCode.PR_OWNER` instead, and an owner the read finds
+        is written into the state file at once (:meth:`_note_pr_owner`).
+        Unjudged, a displaced legacy binding blocked on the checks alone and
+        forgot the owner, and once the owner was removed an 'unblock' drove
+        the PR again. Every other reason is
+        :attr:`StopReasonCode.GITHUB_CHECKS_REFUSED`.
         """
+        refused = StopReasonCode.GITHUB_CHECKS_REFUSED
         pr: PRInfo | None = None
         try:
             pr = self.github.get_pr(url)
@@ -9644,8 +9688,14 @@ class ControllerEngine:
         else:
             if pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref):
                 unread = f"GitHub answered the PR's identity read with PR {pr.url}"
+            elif owner := self._pr_owner_problem(pr):
+                sent = (
+                    "nothing was merged or counted (GitHub also refused this credential, "
+                    f"{exc.credential or 'the token'}, the PR's check runs)"
+                )
+                return self._pr_owner_text(owner, sent), StopReasonCode.PR_OWNER
             elif pr.state in UNMERGED_PR_STATES:
-                return self._checks_refused_text(url, exc)
+                return self._checks_refused_text(url, exc), refused
             elif pr.state != "MERGED":
                 unread = (
                     f"The PR's identity read reported its state as {pr.state!r:.40}, none of "
@@ -9654,8 +9704,11 @@ class ControllerEngine:
             else:
                 unread = ""
         if pr is None or unread:
-            return self._checks_refused_text(
-                url, exc, f"{unread}. {self._merge_so_far(pr_read=False)}"
+            return (
+                self._checks_refused_text(
+                    url, exc, f"{unread}. {self._merge_so_far(pr_read=False)}"
+                ),
+                refused,
             )
         if self._merge_already_counted():
             return (
@@ -9664,7 +9717,7 @@ class ControllerEngine:
                 f"it: GitHub refused this credential ({exc.credential or 'the token'}) the "
                 f"PR's check runs: {exc}. 'unblock' takes the run on to UPDATE_EPIC, which "
                 "reads no check"
-            )
+            ), refused
         remedy = checks_access_remedy(exc.credential)
         return (
             f"PR {url} is already MERGED on GitHub (head {pr.head_sha[:12] or '?'}), but this "
@@ -9673,7 +9726,7 @@ class ControllerEngine:
             "records a merge only after a successful checks read, never on the PR's state "
             "alone, so the merge was not counted and the run cannot go on to UPDATE_EPIC. "
             f"{remedy[:1].upper()}{remedy[1:]}, then 'unblock'"
-        )
+        ), refused
 
     def _verify_pr_for_merge(
         self, phase: Phase, plan: StepPlan, allow_merge: bool
@@ -9773,12 +9826,8 @@ class ControllerEngine:
         try:
             pr = self.github.get_pr_with_checks(url)
         except GitHubChecksAccessError as exc:
-            return self._block(
-                phase,
-                plan,
-                self._checks_refused_reason(url, reviewed_ref, exc),
-                code=StopReasonCode.GITHUB_CHECKS_REFUSED,
-            )
+            reason, code = self._checks_refused_reason(url, reviewed_ref, exc)
+            return self._block(phase, plan, reason, code=code)
         except GitHubError as exc:
             return self._github_read_failed(
                 phase, plan, f"PR {url} could not be read", exc, pr_read=False
@@ -11414,6 +11463,18 @@ class ControllerEngine:
         return bool(state.current_pr_url) and parse_pr_url(state.current_pr_url).same_target(
             parse_pr_url(url)
         )
+
+    def _is_bound_answer(self, pr: PRInfo) -> bool:
+        """Whether ``pr``, the answer for ``current_pr_url``, is that PR, in the run's repository.
+
+        The identity a read of the bound PR is validated by before its owner
+        is judged (#414, PR #459 R5-F1): an answer naming another PR, or a PR
+        of another repository, says nothing of the bound PR's owner, and the
+        caller refuses it on its own terms.
+        """
+        state = self._require_state()
+        ref = parse_pr_url(pr.url or state.current_pr_url)
+        return ref.same_repository(state.repository) and self._is_bound_pr(ref.canonical)
 
     def _is_owned_binding(self) -> bool:
         """Whether ``owned_pr_url`` names the bound PR: its marker is known to have named a run."""
@@ -14355,7 +14416,7 @@ class ControllerEngine:
             return _blocked(reason_code(problem, StopReasonCode.PRODUCER_VALIDATION_BOUND), problem)
         branch = self.branch_name_for(state.current_issue_url)
         ref = f"refs/heads/{branch}"
-        pr, problem = self._implementation_pr_candidate()
+        pr, problem = self._implementation_pr_candidate("nothing was planned, pushed or created")
         if problem:
             return _blocked(StopReasonCode.CLAIM_AMBIGUOUS, problem)
         if pr is not None:
@@ -14586,12 +14647,21 @@ class ControllerEngine:
         written since, by an edit anyone with the login can make: the lease
         on the push holds the branch, not the PR's body, and passes over it.
 
-        Journal reconciliation keeps working: a marker naming this run is
-        never refused here, and the one K2 or K3 published names it. Which
-        run a PR the plan published names is the read back's to judge
-        against the journal (:meth:`_bind_published_pr`). A conclusive read
-        failure blocks with nothing sent; an unavailable GitHub propagates
-        for 'resume'. ``None`` when ``record`` may go on.
+        Every implementation marker on those PRs is judged, not the issue's
+        alone (PR #459 R5-F2): a marker of another issue, whatever run it
+        names, says the PR implements that issue and is that issue's run's
+        to drive, and ``record`` is refused over it too
+        (:meth:`_other_issue_marker_problem`). The plan never adopts or
+        opens such a PR (:meth:`_analyze_branch_pr` refuses one), so one
+        found now was written since, and the push would move its head under
+        that run before K3 refused it.
+
+        Journal reconciliation keeps working: a marker of the issue naming
+        this run is never refused here, and the one K2 or K3 published is
+        exactly that. Which run a PR the plan published names is the read
+        back's to judge against the journal (:meth:`_bind_published_pr`). A
+        conclusive read failure blocks with nothing sent; an unavailable
+        GitHub propagates for 'resume'. ``None`` when ``record`` may go on.
         """
         state = self._require_state()
         try:
@@ -14608,7 +14678,7 @@ class ControllerEngine:
             )
         again = " again" if record.stage == Stage.ATTEMPTED else ""
         for pr in prs:
-            problem = self._pr_owner_problem(pr)
+            problem = self._pr_owner_problem(pr) or self._other_issue_marker_problem(pr)
             if not problem:
                 continue
             return _blocked(
@@ -14623,6 +14693,36 @@ class ControllerEngine:
                 "sent",
             )
         return None
+
+    def _other_issue_marker_problem(self, pr: PRInfo) -> str:
+        """Why ``pr`` carries an implementation marker of another issue, or ``""`` (#414).
+
+        PR #459 R5-F2: the publication fence (:meth:`_analyze_owner_fence`)
+        judges every implementation marker on the PRs headed at the branch it
+        publishes to. :meth:`_pr_owner_problem` judges the current issue's
+        (and an unreadable one); a marker of any other issue, in this
+        repository or another, says the PR implements that issue, whichever
+        run it names or none, so which run drives the PR is that issue's
+        record, never this run's.
+        """
+        state = self._require_state()
+        issue = parse_issue_url(state.current_issue_url)
+        for claim in scan(IMPLEMENTATION, pr.body or "").claims:
+            if claim.key == issue.identity:
+                continue
+            owner = claim.owner_run_id
+            whose = (
+                "naming no run"
+                if owner is None
+                else ("naming this run" if owner == state.run_id else f"naming run {owner}")
+            )
+            return (
+                f"PR {parse_pr_url(pr.url).canonical} carries the implementation marker of "
+                f"issue {claim.issue.canonical}, {whose}, not of issue #{issue.number}: it "
+                f"implements another issue, whose run drives it, and this run "
+                f"({state.run_id}) publishes nothing into it"
+            )
+        return ""
 
     def _await_pushed_head(
         self, read: Callable[[], _Read], lagging: Callable[[_Read], bool], what: str

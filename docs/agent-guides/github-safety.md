@@ -1034,7 +1034,15 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   launched, posted, pushed or merged, and `_require_open_pr` judges it as
   soon as the answer is the run's PR, before a `CLOSED` state or an
   unreadable HEAD is rejected (PR #459 R4-F1), which would leave the
-  phase as it was rather than block. `REVIEW` reads the PR once more right
+  phase as it was rather than block. So do `ANALYZE_EXECUTE`'s probe of
+  the PR its state persisted (`_implementation_pr_candidate`), before the
+  PR's state is judged or the open-PR listing read, the merge gate's
+  identity read behind a refused checks read, and the step budget's read
+  of the PR at the merge gate, before the PR's state is judged (PR #459
+  R5-F1): a closed persisted PR another run owns no longer lets the
+  implementation agent launch beside it, and a listing outage or a
+  refused checks read no longer leaves an owner the read found
+  unrecorded. `REVIEW` reads the PR once more right
   before its round comment is sent (K4), so a PR taken over while the
   reviewer ran gets no comment from the displaced run. `FIX` reads the
   owner again before each record of its plan after the first (follow-up
@@ -1045,7 +1053,10 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   record of its saved push and PR plan still pending, on the step that
   saved it and on every resume, so an owner written into the PR it adopts
   (or a marked PR opened on the branch) after the plan was saved refuses
-  the push, which K1's lease alone lets through (PR #459 R3-F1). The closed
+  the push, which K1's lease alone lets through (PR #459 R3-F1). It judges
+  every implementation marker on those PRs: a marker of another issue,
+  whatever run it names or none, refuses too, since the PR implements
+  that issue (PR #459 R5-F2). The closed
   merge gate's read of a run held at `READY_FOR_MERGE` (`step`, `resume`,
   `epic recheck`) checks the owner before the revision: a refusal blocks,
   moved or not, and never routes the PR to `REVIEW` (PR #459 R3-F2);

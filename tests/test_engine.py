@@ -2421,6 +2421,19 @@ _OWNERS_WRITTEN_SINCE = [
         "carries an implementation marker that cannot be read",
         id="unreadable",
     ),
+    # PR #459 R5-F2: a marker of another issue, whatever run it names, is not
+    # this run's to publish under either.
+    pytest.param(
+        f"Started by hand.\n\n{implementation_pr_body(ISSUE3, owner_run_id=OTHER_RUN)}",
+        f"carries the implementation marker of issue {ISSUE3}, naming run {OTHER_RUN}, not "
+        "of issue #2: it implements another issue, whose run drives it",
+        id="another-issue-another-run",
+    ),
+    pytest.param(
+        f"Started by hand.\n\n{implementation_pr_body(ISSUE3)}",
+        f"carries the implementation marker of issue {ISSUE3}, naming no run, not of issue #2",
+        id="another-issue-no-owner",
+    ),
 ]
 
 
@@ -2456,9 +2469,11 @@ def test_a_saved_adoption_plan_pushes_nothing_into_a_pr_another_run_took_since(
 ):
     """PR #459 R3-F1: the K1 + K3 plan adopting the unmarked PR on the branch
     is saved, and the process dies before anything is sent. Someone then
-    writes another run's marker into that PR (or one that cannot be read),
-    leaving its HEAD alone, so the push's lease still holds. Before R3-F1 the
-    resume pushed the candidate into the PR and only K3 blocked. The PRs on
+    writes another run's marker into that PR (or one that cannot be read, or,
+    R5-F2, one of another issue, naming another run or none), leaving its
+    HEAD alone, so the push's lease still holds. Before R3-F1 (R5-F2 for
+    another issue's marker) the resume pushed the candidate into the PR and
+    only K3 blocked. The PRs on
     the branch are read for their owner before the push: the resume and a
     plain unblock's re-entry block with the branch where it was, nothing
     written and nothing launched, keeping the plan; once the marker is gone,
@@ -2540,25 +2555,27 @@ def test_an_attempted_push_is_not_sent_again_into_a_pr_another_run_took_since(
     assert fake_github.effect_writes == [] and eng2.provider.calls == []
 
 
+@pytest.mark.parametrize(("body", "found"), _OWNERS_WRITTEN_SINCE)
 def test_a_pushed_adoption_plan_writes_nothing_into_a_pr_another_run_took_since(
-    tmp_state_dir, fake_github
+    tmp_state_dir, fake_github, body, found
 ):
     """PR #459 R3-F1, the boundary after the push: K1 landed and was observed,
     and the process died before K3 wrote the PR's body. Another run's marker
-    written into the PR since is read before K3: its body is not written,
-    and the run blocks with K3 still journaled."""
+    (or one that cannot be read, or another issue's: R5-F2) written into the
+    PR since is read before K3: its body is not written, and the run blocks
+    with K3 still journaled."""
     eng, _ = _adopting(tmp_state_dir, fake_github)
     _power_loss_at(eng, EffectKind.PUSH, Stage.OBSERVED, saved=True)
     with pytest.raises(KeyboardInterrupt):
         eng.step()
     candidate = _worktree_head(eng.provider.calls[0])
-    body = f"Started by hand.\n\n{implementation_pr_body(owner_run_id=OTHER_RUN)}"
     fake_github.prs[PR41].body = body
 
     eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
     out = eng2.step()
     assert out.next_phase == "BLOCKED", out.message
     assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert found in eng2.state.block_reason
     assert f"adopt_pr effect 1 on {PR41} was not sent" in eng2.state.block_reason
     s = load_state(eng2.paths.state_file)
     assert [(r["kind"], r["stage"]) for r in s.effect_records] == [
@@ -9047,6 +9064,216 @@ def test_an_owner_is_not_written_for_a_binding_the_state_file_does_not_hold(
         eng.step()
     assert eng.state.owned_pr_url == PR
     assert eng.paths.state_file.read_bytes() == before
+
+
+# -- the bound PR's owner on ANALYZE_EXECUTE's probe and the gate's identity reads -------
+# (PR #459 R5-F1)
+def _legacy_analyze(tmp_state_dir, gh: FakeGitHub, owner: str | None, **pr):
+    """A legacy ANALYZE_EXECUTE binding: the state persisted ``PR``, on a custom branch,
+    as protocol 13 left it (no owned PR recorded); the PR's marker names ``owner``."""
+    gh.add_pr(head_sha=SHA_A, branch="feature/x", **pr)
+    eng = make_engine(tmp_state_dir, ["never"], github=gh)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.state.current_pr_url = PR
+    eng._save()
+    _owned_by(gh, eng.state.run_id if owner == "self" else owner)
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+    return eng
+
+
+def _refused_after_removal(eng, tmp_state_dir, gh: FakeGitHub, remove, found) -> None:
+    """The owner removed and the process restarted: 'unblock' refuses, 'run' launches nothing."""
+    remove(gh)
+    eng2 = _reloaded(eng, tmp_state_dir, gh)
+    assert eng2.state.owned_pr_url == PR
+    raw = eng2.paths.state_file.read_text()
+    refused = eng2.unblock("the other run let go of it")
+    assert not refused.unblocked and refused.phase == "BLOCKED", refused.message
+    assert found in refused.message and "the owner was removed since" in refused.message
+    assert eng2.run(allow_merge=True) == []
+    assert eng2.paths.state_file.read_text() == raw
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert gh.effect_writes == [] and gh.merges == []
+
+
+@pytest.mark.parametrize("pr_state", ["CLOSED", "OPEN"])
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_legacy_analyze_binding_whose_pr_another_run_owns_blocks_before_anything_else_is_read(
+    tmp_state_dir, fake_github, pr_state, remove, found
+):
+    """PR #459 R5-F1, the reported sequence: a legacy ANALYZE_EXECUTE binding
+    whose PR, on a custom branch, another run owns. Before R5-F1 the entry
+    probe judged the persisted PR's state first: a CLOSED one was dropped as
+    no candidate, and the implementation agent launched beside it. The
+    owner is judged as soon as the answer is the run's PR, before the
+    listing or the branch is read: the entry blocks with nothing launched,
+    the owner recorded, and after the owner is removed (the PR reopened) a
+    restarted run's 'unblock' refuses and 'run' launches nothing."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, OTHER_RUN, state=pr_state)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert (
+        f"the implementation marker of PR {PR} names run {OTHER_RUN} as its owner, not this "
+        f"run ({eng.state.run_id})"
+    ) in reason
+    assert "nothing was launched" in reason
+    assert [call[0] for call in fake_github.calls] == ["get_pr"], "judged before any other read"
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.owned_pr_url) == (Phase.BLOCKED, PR, PR)
+    assert s.effect_records == [] and eng.provider.calls == []
+
+    fake_github.prs[PR].state = "OPEN"
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+def _listing_unavailable(gh: FakeGitHub, monkeypatch) -> None:
+    def unavailable(repo: str):
+        gh.calls.append(("list_open_prs", repo))
+        raise GitHubUnavailableError("`gh pr list` failed (exit 1): HTTP 502")
+
+    monkeypatch.setattr(gh, "list_open_prs", unavailable)
+
+
+def _listing_incomplete(gh: FakeGitHub, monkeypatch) -> None:
+    monkeypatch.setattr(gh, "open_pr_listing_incomplete", True)
+
+
+@pytest.mark.parametrize("outage", [_listing_unavailable, _listing_incomplete])
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_legacy_analyze_binding_keeps_the_owner_its_read_found_through_a_listing_outage(
+    tmp_state_dir, fake_github, monkeypatch, outage, remove, found
+):
+    """PR #459 R5-F1: a legacy ANALYZE_EXECUTE binding reads its OPEN PR, whose
+    marker names this run, and then the open-PR listing fails (GitHub
+    unavailable, or a listing that cannot be read to its end). Before R5-F1
+    the owner was judged only after the listing, so the failure left no
+    record of it; once it was removed a restarted run recovered the PR as a
+    legacy binding and launched a reviewer. The owner is on disk from the
+    read on, and nothing else is: an unavailable listing charges no step and
+    keeps the phase. After the removal, a restarted run blocks."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, "self")
+    before = eng.paths.state_file.read_text(encoding="utf-8")
+    with monkeypatch.context() as patched:
+        outage(fake_github, patched)
+        if outage is _listing_unavailable:
+            with pytest.raises(GitHubUnavailableError, match="HTTP 502"):
+                eng.step()
+            assert _changed_on_disk(before, eng) <= {"owned_pr_url", "updated_at"}
+            assert load_state(eng.paths.state_file).phase == Phase.ANALYZE_EXECUTE
+        else:
+            out = eng.step()
+            assert out.stop is not None and out.stop.code is StopReasonCode.CLAIM_AMBIGUOUS
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    assert [call[0] for call in fake_github.calls] == ["get_pr", "list_open_prs"]
+
+    if outage is _listing_incomplete:
+        _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+        return
+    remove(fake_github)
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    out = eng2.step()
+    _assert_owner_removed(eng2, out, found)
+    assert "nothing was launched" in eng2.state.block_reason
+    assert eng.provider.calls == eng2.provider.calls == [] and fake_github.effect_writes == []
+
+
+def test_a_dry_run_of_a_legacy_analyze_binding_reads_and_writes_nothing(tmp_state_dir, fake_github):
+    """PR #459 R5-F1 keeps the dry run write-free: it makes no entry read, so it
+    neither blocks a PR another run owns nor records its owner; the real
+    step after it does."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, OTHER_RUN, state="CLOSED")
+    before = eng.paths.state_file.read_bytes()
+    out = eng.step(dry_run=True)
+    assert out.dry_run and fake_github.calls == []
+    assert eng.paths.state_file.read_bytes() == before and eng.state.owned_pr_url == ""
+    assert eng.step().next_phase == "BLOCKED"
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+
+
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize("moved", [False, True], ids=["unchanged", "moved"])
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_refused_checks_read_blocks_on_the_owner_its_identity_read_finds(
+    tmp_state_dir, fake_github, phase, moved, remove, found
+):
+    """PR #459 R5-F1, the reported sequence: a legacy binding at the merge
+    gate whose checks GitHub refuses this credential, and whose PR another
+    run owns. Before R5-F1 the identity read behind the refusal judged only
+    the PR's state: the run blocked on the checks with no owner recorded,
+    and once the owner was removed (and the PR moved) an 'unblock' of a
+    restarted run sent it to REVIEW, where a reviewer launched. The owner is
+    judged on that read first: the run blocks on it (pr-owner), merging and
+    counting nothing, the owner recorded, and after the removal 'unblock'
+    refuses, moved or not."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    eng._save()
+    _owned_by(fake_github, OTHER_RUN)
+    fake_github.checks_error = checks_refused()
+    before = len(fake_github.calls)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert f"names run {OTHER_RUN} as its owner, not this run" in reason
+    assert (
+        "nothing was merged or counted (GitHub also refused this credential, personal access "
+        "token, the PR's check runs)"
+    ) in reason
+    assert fake_github.calls[before:] == [("get_pr_with_checks", PR), ("get_pr", PR)]
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.owned_pr_url, s.counted_merged_prs) == (Phase.BLOCKED, PR, [])
+
+    fake_github.checks_error = None
+    if moved:
+        fake_github.prs[PR].head_sha = SHA_B
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_refused_checks_read_keeps_the_owner_naming_this_run_across_a_restart(
+    tmp_state_dir, fake_github, remove, found
+):
+    """PR #459 R5-F1: the identity read behind a refused checks read finds a
+    marker naming this run on a legacy binding. The block is the refusal, as
+    before, and the owner is recorded with it: once the owner is removed, a
+    restarted run's 'unblock' refuses the PR rather than drive it."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_ready(tmp_state_dir, fake_github)
+    eng._save()
+    _owned_by(fake_github, eng.state.run_id)
+    fake_github.checks_error = checks_refused()
+    out = eng.step(allow_merge=True)
+    assert out.stop is not None and out.stop.code is StopReasonCode.GITHUB_CHECKS_REFUSED
+    assert f"the check results of PR {PR} could not be read" in eng.state.block_reason
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    fake_github.checks_error = None
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_an_exhausted_budget_at_the_merge_gate_keeps_the_owner_its_read_finds(
+    tmp_state_dir, fake_github, remove, found
+):
+    """PR #459 R5-F1, the step budget's read of the PR at the merge gate: on a
+    legacy binding whose PR another run owns, the reason says the PR is that
+    run's and the owner is recorded, so once the budget is raised and the
+    owner removed, a restarted run's 'unblock' still refuses."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_ready(tmp_state_dir, fake_github)
+    eng.config.workflow.max_total_steps = eng.state.step_count = 3
+    eng._save()
+    _owned_by(fake_github, OTHER_RUN)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.STEP_BUDGET
+    reason = eng.state.block_reason
+    assert f"names run {OTHER_RUN} as its owner, not this run" in reason
+    assert "'workflow.max_total_steps' is to be raised in the config before any" in reason
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
 
 
 def test_ready_for_merge_requires_clean_review_in_state(tmp_state_dir, fake_github):
