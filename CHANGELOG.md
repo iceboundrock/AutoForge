@@ -46,7 +46,11 @@ that its own agent opened it.
 A run records in `state.json` when its PR's marker has named an owner
 (`owned_pr_url`): it published the PR, took it over, or read a marker
 naming a run on it, including on an `unblock` that refuses and on the
-closed merge gate's read of a held run. From then on a
+closed merge gate's read of a held run. That read writes it at once, so a
+read or check that fails after it, or a stopped process, keeps it too. A
+run whose PR is closed, or has no readable HEAD, and whose marker names
+another run stops (`pr-owner`) rather than waiting to re-enter the PR
+once it is reopened. From then on a
 marker that names no run, a missing marker and a PR body that reads empty
 block it (`pr-owner`), because the owner was removed and which run owns
 the PR is not knowable. A run that crashed after opening its PR or a replan

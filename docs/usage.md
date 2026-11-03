@@ -928,7 +928,9 @@ with `BLOCKED` and `pr-owner`, before anything is launched or written.
   marker name an owner (it opened the PR, took it over, or read a marker
   naming any run on it, a refused `unblock`'s read and a held
   `READY_FOR_MERGE` run's read included),
-  `state.json` records that (`owned_pr_url`). If someone then removes the
+  `state.json` records that (`owned_pr_url`), at the read itself: a read
+  that fails after it, or a stopped process, does not lose it. If someone
+  then removes the
   owner from the marker, removes the marker, or GitHub returns the PR body
   empty, the run stops: which run owns the PR is no longer knowable. The
   same holds after a crash between opening the PR (or its replan

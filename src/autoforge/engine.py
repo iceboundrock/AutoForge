@@ -1783,6 +1783,11 @@ class ControllerEngine:
         # True while self.state is a snapshot of state.json taken by load();
         # such a snapshot is re-read under a self-acquired execution lock.
         self._state_from_disk = False
+        # True inside :meth:`_execution_lock`: a non-dry-run step, run or
+        # unblock, the only code that may write the state file. A dry run
+        # never enters it, so what it reads stays in memory (#414, PR #459
+        # R4-F2, :meth:`_keep_owner`).
+        self._executing = False
         # Where an agent launch's live progress lines go besides the step's
         # ``progress.log`` (#192): the CLI sets it to a stderr writer for a
         # real run. ``None`` (a library caller, a test, a dry run) prints
@@ -4655,14 +4660,31 @@ class ControllerEngine:
         discarded and ``state.json`` is re-read under the lock: a snapshot
         loaded before the lock may already have been replaced by another
         controller and must never be executed.
+
+        While it is held :attr:`_executing` is true: an owner a read of the
+        bound PR learns is written to the state file at once
+        (:meth:`_keep_owner`), which a dry run, never entering here, does
+        not.
         """
         if self._lock is not None:
-            yield
+            with self._executing_scope():
+                yield
             return
         with ControllerLock(self.lock_path()):
             if self._state_from_disk:
                 self.load()
+            with self._executing_scope():
+                yield
+
+    @contextmanager
+    def _executing_scope(self) -> Iterator[None]:
+        """Mark the body as a non-dry-run execution (:attr:`_executing`)."""
+        outer = self._executing
+        self._executing = True
+        try:
             yield
+        finally:
+            self._executing = outer
 
     def step(self, dry_run: bool = False, allow_merge: bool = False) -> StepOutcome:
         if dry_run:
@@ -4846,9 +4868,9 @@ class ControllerEngine:
         ):
             # The closed gate's read (#447), made here when :meth:`run` did
             # not make it, and like it before the step is charged: a hold
-            # takes no step, and saves at most the owner its read learned
-            # (PR #459 R3-F2); a moved revision or an owner refusal is the
-            # step, below.
+            # takes no step, and writes at most the owner its read learned
+            # (PR #459 R3-F2, R4-F2); a moved revision or an owner refusal is
+            # the step, below.
             held = self._held_revision_moved()
             if held is None:
                 raise VerificationError(MERGE_GATE_MESSAGE)
@@ -4857,8 +4879,10 @@ class ControllerEngine:
         # agent step (`_invoke_phase`), or the resolution of a step that needs
         # none. An entry read that fails transiently before either persists
         # nothing, so it is not a step and is not charged: `resume` re-reads
-        # with the same budget. The replan exemption above inherits this rule
-        # rather than adding one.
+        # with the same budget. (An owner an earlier read of the PR found is
+        # written alone, the count untouched: :meth:`_keep_owner`, PR #459
+        # R4-F2.) The replan exemption above inherits this rule rather than
+        # adding one.
         state.step_count += 1
         try:
             return self._step_phase(previous, plan, allow_merge, held)
@@ -7076,11 +7100,13 @@ class ControllerEngine:
         operator must change.
 
         Every applied unblock is recorded in ``state.unblock_history`` and in
-        the run log; a refusal only in the run log. A refusal whose read of
-        the bound PR found a marker naming a run, where the state did not
-        yet record the PR as owned, saves ``owned_pr_url`` and nothing else
-        (PR #459 R2-F2): that knowledge is what refuses the PR once its
-        owner is removed, in a later process too. The step budget is not
+        the run log; a refusal only in the run log. A read of the bound PR
+        that found a marker naming a run, where the state did not yet record
+        the PR as owned, writes ``owned_pr_url`` into the state file and
+        nothing else (PR #459 R2-F2, R4-F2, :meth:`_note_pr_owner`), whether
+        the unblock is then refused, applied or raises: that knowledge is
+        what refuses the PR once its owner is removed, in a later process
+        too. The step budget is not
         charged: no agent runs here. ``dry_run`` performs the same GitHub
         reads and reports the decision without writing state or the log.
 
@@ -7189,11 +7215,20 @@ class ControllerEngine:
                 "applies only to BLOCKED runs"
             )
         owned_before = state.owned_pr_url
-        decision = self._unblock_decision(request)
+        try:
+            # A real unblock's read of the bound PR writes an owner its marker
+            # names into the state file at once, and nothing else (#414, PR
+            # #459 R2-F2, R4-F2, :meth:`_note_pr_owner`): a refusal keeps it,
+            # and so does a decision that raises. That knowledge is what
+            # refuses the PR once the owner is removed.
+            decision = self._unblock_decision(request)
+        finally:
+            if dry_run:
+                # A preview changes nothing, in memory either, and writes
+                # nothing (it holds no execution lock): the owner its read
+                # recorded is the real unblock's to keep.
+                state.owned_pr_url = owned_before
         if dry_run:
-            # A preview changes nothing, in memory either: the owner its read
-            # recorded (:meth:`_note_pr_owner`) is the real unblock's to save.
-            state.owned_pr_url = owned_before
             if decision.target is None:
                 message = f"[dry-run] would stay BLOCKED: {decision.detail}"
             else:
@@ -7225,15 +7260,9 @@ class ControllerEngine:
         # both `state.json` and the log, so both cross the redaction boundary.
         self._log_unblock(reason, decision, watermark)
         if decision.refused:
-            if state.owned_pr_url != owned_before:
-                # #414 (PR #459 R2-F2): the decision's read of the bound PR
-                # found a marker naming a run, and recorded the PR as owned
-                # (:meth:`_note_pr_owner`). That knowledge is what refuses the
-                # PR once the owner is removed, so it is the one thing a
-                # refusal saves: no phase, reason, history or validation
-                # override moves, and the run stays BLOCKED as it was. A dry
-                # run returned above, writing nothing.
-                self._save()
+            # Nothing is saved: no phase, reason, history or validation
+            # override moves, and the run stays BLOCKED as it was. An owner
+            # the decision's read found is already in the state file.
             return UnblockOutcome(
                 run_id=state.run_id,
                 unblocked=False,
@@ -9036,7 +9065,8 @@ class ControllerEngine:
         as ``""``) -- is no evidence that the reviewed revision is still
         the PR's, so it raises :class:`VerificationError` rather than hold
         (R1-F2). That, and a read that fails (its GitHubError, named), leave
-        the phase and the state file unchanged.
+        the phase unchanged, and the state file but for an owner the PR's
+        read learned, below.
 
         Who owns the PR is read on the same answer, before its state or
         revision is judged (#414, PR #459 R3-F2), as every phase entry reads
@@ -9044,29 +9074,23 @@ class ControllerEngine:
         cannot be read, or the removal of an owner this run knew returns the
         PR with ``owner`` set, and the step blocks on it, moved or not, with
         no transition to REVIEW. The read records an owner its marker names
-        (:meth:`_note_pr_owner`): the step's own save keeps it, and a hold,
-        which takes no step, saves the state for it and changes nothing
-        else, so a legacy binding stops being one at its first such read,
-        and an owner removed after it refuses in a later process too. The
-        callers read before any step is charged, under the execution lock;
-        a dry run never reads here.
+        (:meth:`_note_pr_owner`) and writes it into the state file at once,
+        and nothing else (PR #459 R4-F2): a hold, which takes no step, a
+        merge base that cannot be read and an answer that raises keep it as
+        well as the step's own save does, so a legacy binding stops being
+        one at its first such read, and an owner removed after it refuses in
+        a later process too. The callers read before any step is charged,
+        under the execution lock; a dry run never reads here.
 
         Each hold sets :attr:`held_reason` to why it held.
         """
         state = self._require_state()
         url = state.current_pr_url
         reviewed = (state.reviewed_head_sha or "").lower()
-        owned_before = state.owned_pr_url
         self.held_reason = ""
 
         def hold(reason: str) -> _HeldRevisionMoved | None:
             self.held_reason = reason
-            if state.owned_pr_url != owned_before:
-                # PR #459 R3-F2: the read found a marker naming a run on a
-                # binding the state did not record as owned. That knowledge
-                # is what refuses the PR once its owner is removed, so it is
-                # saved, and nothing else moves: no phase, no step.
-                self._save()
             return None
 
         if (
@@ -9090,13 +9114,24 @@ class ControllerEngine:
             )
         with self._reading(f"PR {url}"):
             pr = self.github.get_pr(url)
-        unchanged = (
-            "whether the PR is still at the reviewed HEAD "
-            f"{reviewed[:12]} on {state.reviewed_base_ref!r} cannot be told; the run stays "
-            "READY_FOR_MERGE and nothing was written"
-        )
+        owned_before = state.owned_pr_url
+
+        def unchanged() -> str:
+            # PR #459 R4-F2: the owner check below writes an owner the
+            # marker names at once, whatever is raised after it.
+            written = (
+                "nothing was written but the owned PR its marker names (owned_pr_url)"
+                if state.owned_pr_url != owned_before
+                else "nothing was written"
+            )
+            return (
+                "whether the PR is still at the reviewed HEAD "
+                f"{reviewed[:12]} on {state.reviewed_base_ref!r} cannot be told; the run stays "
+                f"READY_FOR_MERGE and {written}"
+            )
+
         if pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref):
-            raise VerificationError(f"GitHub answered {url} with PR {pr.url}: {unchanged}")
+            raise VerificationError(f"GitHub answered {url} with PR {pr.url}: {unchanged()}")
         # #414 (PR #459 R3-F2): the owner before the revision. A PR another run
         # owns is that run's to review and merge, so its drift is not this
         # run's to route; the step blocks instead, launching nothing.
@@ -9108,14 +9143,14 @@ class ControllerEngine:
         if pr.state != "OPEN":
             shown = repr(pr.state) if pr.state else "no state"
             raise VerificationError(
-                f"PR {url} reports {shown}, not OPEN, CLOSED or MERGED: {unchanged}"
+                f"PR {url} reports {shown}, not OPEN, CLOSED or MERGED: {unchanged()}"
             )
         missing = [
             name for name, value in (("HEAD", pr.head_sha), ("base", pr.base_ref)) if not value
         ]
         if missing:
             raise VerificationError(
-                f"PR {url} is OPEN and reports no {' and no '.join(missing)}: {unchanged}"
+                f"PR {url} is OPEN and reports no {' and no '.join(missing)}: {unchanged()}"
             )
         if pr.head_sha != reviewed or pr.base_ref != state.reviewed_base_ref:
             return _HeldRevisionMoved(pr)
@@ -11230,6 +11265,19 @@ class ControllerEngine:
 
     # -- pre-invocation preparation --------------------------------------------
     def _require_open_pr(self) -> PRInfo:
+        """The bound PR, read now: in the run's repository, this run's, OPEN, with a HEAD.
+
+        Who owns the PR is judged as soon as the answer is known to be a PR
+        of the run's repository, before its state or HEAD is (#414, PR #459
+        R4-F1): a PR another run owns, or whose marker cannot be read or
+        lost the owner this run knew, raises :class:`PROwnerError`, which
+        blocks the step, closed or headless as it may be. Judged after them,
+        a CLOSED PR or one with no readable HEAD raised
+        :class:`VerificationError` first, which leaves the phase as it was,
+        so a run displaced while its PR was closed re-entered it once the
+        PR was reopened and its owner removed. An owner the read finds is
+        recorded and kept (:meth:`_note_pr_owner`) whatever is raised next.
+        """
         state = self._require_state()
         if not state.current_pr_url:
             raise StateError(f"phase {state.phase.value} requires current_pr_url in state")
@@ -11238,13 +11286,13 @@ class ControllerEngine:
             state.repository.lower()
         ):
             raise VerificationError(f"PR {state.current_pr_url} is not in {state.repository}")
+        self._require_pr_owner(pr)
         if not pr.is_open:
             raise VerificationError(
                 f"PR {state.current_pr_url} is {pr.state}; the workflow only operates on OPEN PRs"
             )
         if not pr.head_sha:
             raise VerificationError(f"PR {state.current_pr_url} has no readable head SHA")
-        self._require_pr_owner(pr)
         return pr
 
     def _pr_owner_problem(self, pr: PRInfo, *, published: str = "") -> str:
@@ -11379,13 +11427,54 @@ class ControllerEngine:
         current issue name, as just read or published. Any run, this one or
         another, proves the PR has an owner, so a later read finding the
         owner gone refuses (:meth:`_pr_owner_problem`). It is written into
-        the state in memory and persisted by the save that follows the read,
-        a block's included, and a refused unblock's (PR #459 R2-F2); a dry
-        run puts it back. It is never cleared while the PR stays bound.
+        the state in memory and, when the binding it is about is the one the
+        state file holds, into the state file at once (:meth:`_keep_owner`,
+        PR #459 R4-F2): a read, a validation or a write that raises after it
+        leaves the knowledge on disk, where a later process finds it, and so
+        does a hold or a refused unblock, which save nothing else. A binding
+        made in memory and not saved yet (a recovery, a read back, an
+        activation) keeps it in the save that persists the binding. A dry
+        run writes nothing and puts it back. It is never cleared while the
+        PR stays bound.
         """
         state = self._require_state()
         if state.current_pr_url and any(owner is not None for owner in owners):
             state.owned_pr_url = parse_pr_url(state.current_pr_url).canonical
+            self._keep_owner()
+
+    def _keep_owner(self) -> None:
+        """Write ``owned_pr_url`` into the state file, and nothing else (#414, PR #459 R4-F2).
+
+        An owner a read learned is what refuses the PR once its owner is
+        removed, in a later process too, so it must not depend on the step
+        reaching a save: a later read failing (the merge base, the PR again,
+        the checks), a verification refusing, an interrupt, or a process
+        killed would otherwise leave it in memory alone, and a restart would
+        drive the PR as a legacy binding. So the state file is read as last
+        saved, given the owned PR, and written back: the step's other
+        changes stay in memory for its own save, and an uncharged step stays
+        uncharged on disk. Written only when the state file holds this run
+        bound to the same PR without that owner: a binding not saved yet
+        carries the owner in its own save. Only inside a non-dry-run
+        execution (:attr:`_executing`); a dry run writes nothing.
+        """
+        state = self._require_state()
+        if not self._executing or not state.owned_pr_url:
+            return
+        persisted = self.existing_run()
+        if (
+            persisted is None
+            or persisted.run_id != state.run_id
+            or persisted.owned_pr_url == state.owned_pr_url
+            or not persisted.current_pr_url
+            or not parse_pr_url(persisted.current_pr_url).same_target(
+                parse_pr_url(state.owned_pr_url)
+            )
+        ):
+            return
+        persisted.owned_pr_url = state.owned_pr_url
+        assert_shared_git_lock_free("save the state")
+        save_state(persisted, self.paths.state_file, root=self.state_root())
 
     def _pr_owner_text(self, problem: str, sent: str) -> str:
         """A ``BLOCKED`` reason for ``problem``, what was ``sent``, and the way back (#414)."""

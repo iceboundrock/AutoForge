@@ -355,6 +355,68 @@ def test_a_refused_unblock_keeps_the_owner_it_read_across_a_restart(
     assert fake_github.effect_writes == []
 
 
+def _raises_after_the_read(eng, monkeypatch, where: str) -> None:
+    """Make the unblock raise after its read of the bound PR found the owner.
+
+    ``decision``: a check the decision makes after the read raises (an
+    unavailable GitHub); ``log``: the run log refuses the unblock's record.
+    """
+    if where == "decision":
+
+        def unavailable(*_args, **_kwargs):
+            raise GitHubUnavailableError("HTTP 502")
+
+        monkeypatch.setattr(eng, "review_certificate_problem", unavailable)
+    else:
+
+        def refused(*_args, **_kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(eng, "_log_unblock", refused)
+
+
+@pytest.mark.parametrize("where", ["decision", "log"])
+def test_an_unblock_that_raises_keeps_the_owner_its_read_found(
+    tmp_state_dir, fake_github, monkeypatch, where
+):
+    """PR #459 R4-F2, the unblock's equivalent: a legacy binding's unblock
+    reads its PR, whose marker names this run, and then raises (a later
+    check of the decision, or the run log refusing its record). Before R4-F2
+    only a refusal saved the owner, after its log record: a raise left it in
+    memory alone. It is in the state file with nothing else changed, so once
+    the owner is removed a new process's unblock refuses. A dry run that
+    raises writes nothing and leaves the state in memory as it was."""
+    fake_github.add_pr(head_sha=SHA_A, body=implementation_pr_body())
+    eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **_reviewed())
+    certify_review(eng)
+    raw = eng.paths.state_file.read_text()
+    fake_github.prs[PR].body = implementation_pr_body(owner_run_id=eng.state.run_id)
+    _raises_after_the_read(eng, monkeypatch, where)
+    if where == "decision":
+        with pytest.raises(GitHubUnavailableError, match="HTTP 502"):
+            eng.unblock(REASON, dry_run=True)
+        assert eng.state.owned_pr_url == ""
+        _assert_untouched(eng, raw)
+    with pytest.raises(GitHubUnavailableError if where == "decision" else OSError):
+        eng.unblock(REASON)
+    _assert_only_the_owner_recorded(eng, raw)
+    assert _unblock_records(eng) == []
+    monkeypatch.undo()
+
+    fake_github.prs[PR].body = implementation_pr_body()
+    eng.close()
+    eng2 = make_engine(tmp_state_dir, [], github=fake_github)
+    eng2.load()
+    assert eng2.state.owned_pr_url == PR
+    raw = eng2.paths.state_file.read_text()
+    again = eng2.unblock("the run is to go on")
+    assert not again.unblocked and again.phase == "BLOCKED"
+    assert "the owner was removed since" in again.message
+    _assert_untouched(eng2, raw)
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert fake_github.effect_writes == []
+
+
 @pytest.mark.parametrize("value", ["not a url", ISSUE, "https://github.com/owner/repo/pull/x"])
 def test_unblock_take_over_takes_a_pr_url(tmp_state_dir, fake_github, value):
     eng = _blocked(tmp_state_dir, fake_github)

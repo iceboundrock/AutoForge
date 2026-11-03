@@ -1031,7 +1031,10 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   `REVIEW`, `FIX` and the merge gate (`_require_open_pr`, the merge gate's
   identity check), the replan transaction, and `unblock`. A marker that
   names another run, or one it cannot read, blocks the run with nothing
-  launched, posted, pushed or merged. `REVIEW` reads the PR once more right
+  launched, posted, pushed or merged, and `_require_open_pr` judges it as
+  soon as the answer is the run's PR, before a `CLOSED` state or an
+  unreadable HEAD is rejected (PR #459 R4-F1), which would leave the
+  phase as it was rather than block. `REVIEW` reads the PR once more right
   before its round comment is sent (K4), so a PR taken over while the
   reviewer ran gets no comment from the displaced run. `FIX` reads the
   owner again before each record of its plan after the first (follow-up
@@ -1057,9 +1060,12 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   this run's marker to that owner, so a marker changed or removed after a
   crash in that window blocks (K2, K3) or rejects the transaction (K7)
   before the PR is bound, the source closed or the replacement activated
-  (PR #459 R2-F1). A refused `unblock` whose read of the bound PR found a
-  marker naming a run saves that it did (PR #459 R2-F2), and so does the
-  closed merge gate's hold, which takes no step (PR #459 R3-F2);
+  (PR #459 R2-F1). A read of the bound PR that finds a marker naming a
+  run, where the state did not record the PR as owned, writes
+  `owned_pr_url` into the state file at once and nothing else, a refused
+  `unblock`'s (PR #459 R2-F2) and the closed merge gate's hold (PR #459
+  R3-F2) included, so a read, check or write that raises after it, or a
+  killed process, keeps it too (PR #459 R4-F2); a dry run writes nothing;
 - a takeover is the operator's: stop the owning run, replace the marker in
   the PR body with the one the refusal names, then `unblock --take-over
   <PR>` binds it and enters `REVIEW`. The controller writes no marker of its

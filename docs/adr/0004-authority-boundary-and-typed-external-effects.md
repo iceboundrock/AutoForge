@@ -2239,7 +2239,13 @@ its author. Only the effect records and the entry observation prove origin.
     blocks as a fresh entry does, and the operator, who can tell, takes
     the PR over.
   - **Fencing at every boundary.** The owner is checked on the body of
-    every read of the bound PR before a launch or a send. These are:
+    every read of the bound PR before a launch or a send. It is checked as
+    soon as the answer is known to be the run's PR, before the PR's state
+    or HEAD is judged (PR #459 R4-F1): a closed PR, or one with no readable
+    HEAD, whose marker names another run blocks (`pr-owner`) like an open
+    one. Judged after them, it raised a verification error first, which
+    leaves the phase as it was, so the displaced run re-entered the PR once
+    it was reopened and its owner removed. These reads are:
     - `REVIEW`'s binding;
     - a read right before K4 is sent, on every entry that sends it (the one
       read this adds: a reviewer runs for minutes, and a takeover in
@@ -2281,7 +2287,7 @@ its author. Only the effect records and the entry observation prove origin.
     run. The edit is the takeover every other run reads. The flag is the
     taking state's record of it, since a marker naming a run proves
     nothing by itself. The unblock is refused, with nothing written but
-    an owner its read of a bound PR found (R2-F2, below), unless all of
+    an owner its read of a bound PR found (R2-F2, R4-F2, below), unless all of
     these hold:
     - no PR is bound;
     - no `ANALYZE_EXECUTE` plan or record is saved (the journal is
@@ -2324,8 +2330,22 @@ its author. Only the effect records and the entry observation prove origin.
     - a takeover;
     - any read of the bound PR whose marker names a run, this one or
       another, a refused `unblock`'s included, and the closed merge gate's
-      read of a run it holds, which saves that field and nothing else (no
-      phase, no step charged; PR #459 R3-F2).
+      read of a run it holds (PR #459 R3-F2).
+
+    A read writes it into the state file as soon as it finds it, and
+    nothing else: no phase, no step charged (PR #459 R4-F2). The state
+    file is read as last saved, given the field and written back, while
+    the step's other changes wait in memory for its own save. A read,
+    check or write that raises afterwards (a merge base that cannot be
+    read, a PR closed or with no base, a run log that refuses its record)
+    keeps it, and so does an interrupted or killed process. Before R4-F2
+    only the saves after the read kept it, so a raise left the field in
+    memory alone, and once the owner was removed a restarted run read a
+    legacy binding again and launched a reviewer. It is written only
+    inside a non-dry-run execution, and only while the state file holds
+    the run bound to that PR. A binding made in memory and not saved yet
+    (a recovery, a read back, an activation) carries the field in the save
+    that binds the PR. A dry run writes nothing.
 
     It is cleared only when another PR is bound. While it names the bound
     PR, a marker naming no run, no marker and an empty body refuse
@@ -2352,11 +2372,13 @@ its author. Only the effect records and the entry observation prove origin.
   - **A refused `unblock` keeps what it read (PR #459 R2-F2).** An
     `unblock` reads the bound PR before it decides. When that read finds a
     marker naming a run and the state did not yet record the PR as owned,
-    the refusal saves `owned_pr_url` and nothing else. The phase, reason,
-    history and validation watermark stay as they were, and the run log
-    records the refusal as before. Without the save, removing the owner
-    afterwards would let a new process read a legacy binding again and
-    re-enter the PR. A dry run still writes nothing.
+    `owned_pr_url` is written and nothing else, whether the unblock is then
+    refused, applied or raises (PR #459 R4-F2). On a refusal the phase,
+    reason, history and validation watermark stay as they were, and the
+    run log records the refusal as before. Without the write, removing the
+    owner afterwards would let a new process read a legacy binding again
+    and re-enter the PR. A dry run still writes nothing, and leaves the
+    state in memory as it was even when it raises.
   - **Legacy PRs.** A run whose record does not name its PR as owned (a
     binding made by protocol 13 or older, or one whose marker never named
     a run) keeps driving it under a legacy marker or none, and a fresh run

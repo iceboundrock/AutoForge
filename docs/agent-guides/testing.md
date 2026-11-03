@@ -541,7 +541,23 @@ High-priority coverage includes:
   marker saves `owned_pr_url` and nothing else (no step charged), and a
   later removal then blocks; a dry run reads and writes nothing; and
   `epic recheck` of a moved PR another run took over exits 1 with a
-  `pr-owner` stop (`tests/test_epic_commands.py`)
+  `pr-owner` stop (`tests/test_epic_commands.py`). A legacy binding in
+  `REVIEW` or `FIX` whose PR is `CLOSED`, or has no readable HEAD, and
+  whose marker names another run blocks (`pr-owner`) and records the
+  owner, so after the PR is reopened, the owner removed and the state
+  reloaded `unblock` refuses and `resume` launches nothing; one whose
+  marker cannot be read blocks too, and one this run drives is refused as
+  before, its phase kept (PR #459 R4-F1). An owner a read learned is
+  written at once and kept when the step then raises: a merge base that
+  cannot be read (unavailable or refused), a PR with no base, closed or
+  headless in `REVIEW` and `FIX`, the closed merge gate's merge-base read
+  through `step` and `run(recheck_held=True)`, and an `unblock` whose
+  decision or run-log record raises each leave `owned_pr_url` on disk and
+  nothing else changed (no step charged), and after the owner is removed
+  (and, held, the PR moved) a restarted run blocks with nothing launched;
+  a binding the state file does not hold yet gets no write, and a dry
+  `unblock` that raises writes nothing and restores the state in memory
+  (PR #459 R4-F2; `tests/test_engine.py`, `tests/test_unblock.py`)
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

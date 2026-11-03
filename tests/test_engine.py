@@ -8788,6 +8788,267 @@ def test_a_dry_run_of_a_held_run_reads_and_writes_nothing(tmp_state_dir, fake_gi
     assert _held_step(eng, recheck=True).next_phase == "BLOCKED"
 
 
+# -- a closed or headless PR another run owns (PR #459 R4-F1) ---------------------------
+def _legacy_in(tmp_state_dir, gh: FakeGitHub, phase: Phase):
+    """``_bound_in`` as saved: a legacy binding, its record naming no owned PR (protocol 13)."""
+    eng = _bound_in(tmp_state_dir, gh, phase)
+    eng._save()
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+    return eng
+
+
+def _repaired(gh: FakeGitHub) -> None:
+    """The PR open again at ``SHA_A`` on ``main``, and its merge base readable."""
+    pr = gh.prs[PR]
+    pr.state, pr.head_sha, pr.base_ref = "OPEN", SHA_A, "main"
+    gh.merge_base_error = None
+
+
+def _changed_on_disk(before: str, eng) -> set[str]:
+    """The state file's top-level fields that differ from ``before``'s."""
+    old = json.loads(before)
+    new = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    return {key for key in old.keys() | new.keys() if old.get(key) != new.get(key)}
+
+
+_INELIGIBLE = [
+    pytest.param({"state": "CLOSED"}, id="closed"),
+    pytest.param({"head_sha": ""}, id="unreadable-head"),
+]
+
+
+@pytest.mark.parametrize("phase", [Phase.REVIEW, Phase.FIX])
+@pytest.mark.parametrize("ineligible", _INELIGIBLE)
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_closed_or_headless_pr_another_run_owns_blocks_and_stays_refused_after_a_restart(
+    tmp_state_dir, fake_github, phase, ineligible, remove, found
+):
+    """PR #459 R4-F1, the reported sequence: a legacy binding in REVIEW (or
+    FIX) reads its PR closed, or with no readable HEAD, while its marker
+    names another run. Before R4-F1 the entry rejected the PR's state first
+    (a VerificationError, which leaves the phase), never reading the owner:
+    once the PR was reopened, its owner removed and the state reloaded, a
+    reviewer launched and the run reached READY_FOR_MERGE. The owner is read
+    as soon as the answer is the run's PR: the displaced run blocks, its
+    record keeps the owner, and after the reopening, the removal and a
+    restart 'unblock' refuses and 'resume' launches nothing."""
+    eng = _legacy_in(tmp_state_dir, fake_github, phase)
+    _owned_by(fake_github, OTHER_RUN)
+    for name, value in ineligible.items():
+        setattr(fake_github.prs[PR], name, value)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert f"names run {OTHER_RUN} as its owner, not this run" in eng.state.block_reason
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.owned_pr_url) == (Phase.BLOCKED, PR, PR)
+
+    _repaired(fake_github)
+    remove(fake_github)
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    raw = eng2.paths.state_file.read_text()
+    refused = eng2.unblock("the other run let go of it")
+    assert not refused.unblocked and refused.phase == "BLOCKED"
+    assert found in refused.message and "the owner was removed since" in refused.message
+    assert eng2.run() == []
+    assert eng2.paths.state_file.read_text() == raw
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert fake_github.effect_writes == [] and fake_github.merges == []
+
+
+@pytest.mark.parametrize("ineligible", _INELIGIBLE)
+def test_a_closed_or_headless_pr_whose_marker_cannot_be_read_blocks(
+    tmp_state_dir, fake_github, ineligible
+):
+    """PR #459 R4-F1: an unreadable marker refuses before the PR's state or
+    HEAD is judged, as it does on an open PR: the run blocks, launching
+    nothing, and records no owner (the marker names none)."""
+    eng = _legacy_in(tmp_state_dir, fake_github, Phase.REVIEW)
+    fake_github.prs[PR].body = '<!-- ai-implementation: {"issue": 2} -->'
+    for name, value in ineligible.items():
+        setattr(fake_github.prs[PR], name, value)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert "carries an implementation marker that cannot be read" in eng.state.block_reason
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+
+
+@pytest.mark.parametrize("ineligible", _INELIGIBLE)
+def test_a_closed_or_headless_pr_this_run_drives_is_still_refused_as_before(
+    tmp_state_dir, fake_github, ineligible
+):
+    """PR #459 R4-F1 changes only the order: a PR this run may drive that is
+    closed or has no readable HEAD is refused as it was, the phase kept."""
+    eng = _legacy_in(tmp_state_dir, fake_github, Phase.REVIEW)
+    for name, value in ineligible.items():
+        setattr(fake_github.prs[PR], name, value)
+    expected = (
+        "is CLOSED; the workflow only operates on OPEN PRs"
+        if "state" in ineligible
+        else ("has no readable head SHA")
+    )
+    with pytest.raises(VerificationError, match=re.escape(expected)):
+        eng.step()
+    assert load_state(eng.paths.state_file).phase == Phase.REVIEW
+    assert eng.provider.calls == []
+
+
+# -- an owner a read learned, when the step then raises (PR #459 R4-F2) ----------------
+def _merge_base_fails(error: GitHubError):
+    def fail(gh: FakeGitHub) -> None:
+        gh.merge_base_error = error
+
+    return fail
+
+
+def _pr_field(name: str, value: str):
+    def fail(gh: FakeGitHub) -> None:
+        setattr(gh.prs[PR], name, value)
+
+    return fail
+
+
+# Phase, what fails after the read of the PR found its owner, and what the step raises.
+_LATER_FAILURES = [
+    pytest.param(
+        Phase.REVIEW,
+        _merge_base_fails(GitHubUnavailableError("HTTP 502")),
+        GitHubUnavailableError,
+        id="review-merge-base-unavailable",
+    ),
+    pytest.param(
+        Phase.REVIEW,
+        _merge_base_fails(GitHubError("HTTP 404")),
+        GitHubError,
+        id="review-merge-base-refused",
+    ),
+    pytest.param(Phase.REVIEW, _pr_field("base_ref", ""), VerificationError, id="review-no-base"),
+    pytest.param(Phase.REVIEW, _pr_field("state", "CLOSED"), VerificationError, id="review-closed"),
+    pytest.param(Phase.FIX, _pr_field("state", "CLOSED"), VerificationError, id="fix-closed"),
+    pytest.param(Phase.FIX, _pr_field("head_sha", ""), VerificationError, id="fix-no-head"),
+]
+
+
+@pytest.mark.parametrize(("phase", "fail", "error"), _LATER_FAILURES)
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_an_owner_learned_before_the_step_raises_is_kept_across_a_restart(
+    tmp_state_dir, fake_github, phase, fail, error, remove, found
+):
+    """PR #459 R4-F2, the reported sequence: a legacy binding's entry reads
+    the PR, whose marker names this run, and then a read or a check after it
+    raises (the merge base unreadable, the PR closed or headless). Before
+    R4-F2 the owner was recorded in memory alone: the step never saved, so
+    once the owner was removed a restarted run read a legacy binding again
+    and launched a reviewer. The owner is written into the state file as
+    soon as it is read, and nothing else is: the phase is kept and no step
+    is charged. After the repair, the removal and a restart the run blocks,
+    launching nothing."""
+    eng = _legacy_in(tmp_state_dir, fake_github, phase)
+    _owned_by(fake_github, eng.state.run_id)
+    fail(fake_github)
+    before = eng.paths.state_file.read_text(encoding="utf-8")
+    with pytest.raises(error):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.owned_pr_url) == (phase, PR)
+    assert _changed_on_disk(before, eng) <= {"owned_pr_url", "updated_at"}
+
+    _repaired(fake_github)
+    remove(fake_github)
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    assert eng2.state.owned_pr_url == PR
+    out = eng2.step()
+    _assert_owner_removed(eng2, out, found)
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert fake_github.effect_writes == []
+
+
+@pytest.mark.parametrize("recheck", [False, True], ids=["step", "run(recheck_held)"])
+@pytest.mark.parametrize("moved", [False, True], ids=["unchanged", "moved"])
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_the_closed_gates_read_keeps_its_owner_when_the_merge_base_read_fails(
+    tmp_state_dir, fake_github, recheck, moved, remove, found
+):
+    """PR #459 R4-F2 at the closed gate's recheck: a legacy binding held at
+    READY_FOR_MERGE reads its unmoved PR, whose marker names this run, and
+    then fails to read the merge base. Before R4-F2 only a completed hold
+    saved the owner: the raise left the file without it, and after the
+    owner was removed (and the PR moved) a restarted run routed to REVIEW,
+    launched a reviewer and reached READY_FOR_MERGE again. The owner is on
+    disk, with nothing else changed, and the restarted run blocks."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng, before_bytes = _held(tmp_state_dir, fake_github, config_allows=False)
+    _owned_by(fake_github, eng.state.run_id)
+    fake_github.merge_base_error = GitHubUnavailableError("HTTP 502")
+    with pytest.raises(GitHubUnavailableError, match="merge base of 'main' and HEAD"):
+        if recheck:
+            eng.run(allow_merge=False, recheck_held=True)
+        else:
+            eng.step(allow_merge=False)
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    assert _changed_on_disk(before_bytes.decode(), eng) <= {"owned_pr_url", "updated_at"}
+
+    fake_github.merge_base_error = None
+    remove(fake_github)
+    if moved:
+        fake_github.prs[PR].head_sha = SHA_B
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    out = _held_step(eng2, recheck)
+    _assert_owner_removed(eng2, out, found)
+    s = load_state(eng2.paths.state_file)
+    assert (s.current_head_sha, s.last_review_result) == (SHA_A, "clean")
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert fake_github.effect_writes == [] and fake_github.merges == []
+
+
+@pytest.mark.parametrize("recheck", [False, True], ids=["step", "run(recheck_held)"])
+def test_an_incomplete_answer_at_the_closed_gate_says_the_owner_was_written(
+    tmp_state_dir, fake_github, recheck
+):
+    """PR #459 R4-F2: an OPEN PR with no base raises at the closed gate, as
+    before, after its marker named this run on a legacy binding. The owner
+    was written at the read, so the error says so rather than claim that
+    nothing was, and the file holds it with nothing else changed."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng, before_bytes = _held(tmp_state_dir, fake_github, config_allows=False)
+    _owned_by(fake_github, eng.state.run_id)
+    fake_github.prs[PR].base_ref = ""
+    with pytest.raises(VerificationError) as raised:
+        if recheck:
+            eng.run(allow_merge=False, recheck_held=True)
+        else:
+            eng.step(allow_merge=False)
+    assert str(raised.value).endswith(
+        "the run stays READY_FOR_MERGE and nothing was written but the owned PR its marker "
+        "names (owned_pr_url)"
+    )
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    assert _changed_on_disk(before_bytes.decode(), eng) <= {"owned_pr_url", "updated_at"}
+
+
+def test_an_owner_is_not_written_for_a_binding_the_state_file_does_not_hold(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R4-F2 writes the owner of the binding the state file holds,
+    and only it: a run whose saved state is bound to no PR (the binding made
+    in memory, not saved yet) leaves the file as it was when the step
+    raises, and the binding's own save would carry the owner."""
+    eng = _bound_in(tmp_state_dir, fake_github, Phase.REVIEW)
+    eng.state.phase, eng.state.current_pr_url = Phase.ANALYZE_EXECUTE, ""
+    eng._save()
+    eng.state.phase, eng.state.current_pr_url = Phase.REVIEW, PR
+    before = eng.paths.state_file.read_bytes()
+    assert load_state(eng.paths.state_file).current_pr_url == ""
+    _owned_by(fake_github, eng.state.run_id)
+    fake_github.merge_base_error = GitHubUnavailableError("HTTP 502")
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    assert eng.state.owned_pr_url == PR
+    assert eng.paths.state_file.read_bytes() == before
+
+
 def test_ready_for_merge_requires_clean_review_in_state(tmp_state_dir, fake_github):
     fake_github.add_pr(head_sha=SHA_A)
     eng = _in_ready(tmp_state_dir, fake_github, clean=False)
