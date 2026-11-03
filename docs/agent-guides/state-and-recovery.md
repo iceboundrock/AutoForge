@@ -1318,8 +1318,17 @@ code, is [Running an EPIC in parallel](../usage.md#running-an-epic-in-parallel).
   refused. It writes no `scheduler.json` (ADR 0008 D6.1, amended by #183).
   A re-run after a crash completes the archive, and one with nothing left
   says so.
+- **`epic recheck`** (#447) holds L0, then the issue's L2 (a live owner
+  refuses it), checks the binding as `epic archive` does, reads the
+  namespace strictly under L2 and goes on only for a run settled at
+  `READY_FOR_MERGE` with no open claim. The engine, bound to the namespace
+  under the held L0 with the merge gate closed, then reads the PR
+  (`run(max_steps=1, recheck_held=True)`): an unmoved PR leaves every file
+  as it was, a moved one takes `READY_FOR_MERGE -> REVIEW` in the same
+  state (one atomic save, the run log's record), which reconciliation
+  then classifies `resumable`. It writes no claim and no `scheduler.json`.
 - **A recorded repository** (`scheduler.json` for `epic stop`, the binding
-  for `epic archive`) is compared by its numeric id (D5.1), never by its
+  for `epic archive` and `epic recheck`) is compared by its numeric id (D5.1), never by its
   `owner/name`: a rename (which a binding keeps for good) changes the name
   and keeps the id, and a repository transferred or deleted leaves its
   name to another one. So the EPIC's repository id is read from GitHub

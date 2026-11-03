@@ -2057,7 +2057,12 @@ review comment or anything the gate judges past drift. A PR that moved off
 the clean-reviewed revision goes back to `REVIEW`, nothing merged; one at
 that revision holds, with nothing written: `resume` re-prints the banner
 and runs nothing, `step` refuses with an error naming both halves of the
-gate. `step` refuses to advance `MERGE` with the gate closed before
+gate. Only a PR GitHub reports `CLOSED` or `MERGED` holds without being
+compared; an answer that establishes no revision (no state or an unknown
+one, an `OPEN` PR with no HEAD or no base, an answer naming another PR)
+raises a `VerificationError` with nothing written. For a scheduler's issue
+settled at `READY_FOR_MERGE`, `epic recheck` makes the same read, the gate
+closed. `step` refuses to advance `MERGE` with the gate closed before
 anything is read from GitHub. `safety.allow_merge` is the *only* config key that opens the gate:
 the historical `execution.allow_merge` is rejected on load rather than read,
 and an unknown key under `safety` (a typo such as `allow_merges`) is a

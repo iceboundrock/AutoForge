@@ -29,8 +29,16 @@ so.
   answer naming another PR makes `resume` and `step` exit 1 with the
   phase and the state unchanged. Only a PR GitHub reports `CLOSED` or
   `MERGED` holds without being compared.
-- The scheduler's workers are unchanged: an issue `epic run` settled at
-  `READY_FOR_MERGE` is not read again.
+- `autoforge epic recheck <EPIC URL> <ISSUE>` is the same read for an
+  issue the parallel EPIC scheduler settled at `READY_FOR_MERGE`, which the
+  scheduler never relaunches and a standalone `resume` refuses. While no
+  scheduler runs (it takes the repository lock, then the issue's run lock)
+  and with no open claim, it reads the PR; one that moved goes back to
+  `REVIEW` in the same run, its review history and claims kept, and the
+  next `epic resume` admits the issue and reviews the new head. No agent
+  runs and nothing is written to GitHub. `epic status` names it, with
+  `epic resume`, as the next steps of a `ready-for-merge` issue. The
+  scheduler and its workers still never read a settled issue themselves.
 
 ### A body the controller writes back keeps text `gh` rewrites, and an operator's exact comment verifies (#328)
 

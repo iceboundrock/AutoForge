@@ -497,9 +497,13 @@ and force push, a retarget, a base rewritten under its name) goes back to
 review it; the earlier review certificate no longer applies, and the new
 round certifies the new head alone (#447). Since `resume` may start a
 review from here, it checks the run's recorded configuration first, as
-`step` does. `resume --dry-run` reads nothing and prints the banner. The
-parallel EPIC scheduler's workers do not make this read: an issue they
-settled at `READY_FOR_MERGE` stays there.
+`step` does. `resume --dry-run` reads nothing and prints the banner. A PR
+that GitHub answers with no state or an unknown one, or as `OPEN` with no
+HEAD or no base, is no hold: both commands exit 1 with the state
+unchanged, since such an answer does not show the reviewed revision is
+still the PR's. The parallel EPIC scheduler's workers do not make this
+read: for an issue they settled at `READY_FOR_MERGE`, the operator runs
+[`epic recheck`](#epic-recheck), then `epic resume`.
 
 The banner's `Review certificate:` line says whether the round's certificate
 applies, checked against the state and the configuration in force (not
@@ -852,6 +856,11 @@ uv run autoforge epic resume https://github.com/owner/repo/issues/1
 
 # release one settled or uncertain issue for a fresh run (never automatic)
 uv run autoforge epic archive https://github.com/owner/repo/issues/1 7
+
+# after a push to the PR of an issue settled at READY_FOR_MERGE: read the PR
+# and send it back to REVIEW if it moved, then let epic resume review it
+uv run autoforge epic recheck https://github.com/owner/repo/issues/1 7
+uv run autoforge epic resume https://github.com/owner/repo/issues/1
 ```
 
 ### The lifecycle
@@ -917,7 +926,7 @@ state and the run-lock probe, with the next command where there is one:
 | `ready` | open, supported, every blocker completed; no namespace state | nothing: the next admission takes it |
 | `claimed` | an open claim and no live run lock: its scheduler ended without closing it | `epic resume` |
 | `running` | a live process holds its run lock | wait; the claim's worker PID and process start time are shown as diagnostics and never signalled (a PID may be reused) |
-| `ready-for-merge` | its PR is at `READY_FOR_MERGE` | merge it; dependents become ready once the issue is closed as completed |
+| `ready-for-merge` | its PR is at `READY_FOR_MERGE` | merge it; dependents become ready once the issue is closed as completed. After a push to the PR branch, [`epic recheck`](#epic-recheck) the issue (while no scheduler runs), then `epic resume` |
 | `blocked` | the run is `BLOCKED`; the reason is shown | fix the cause, then the printed `autoforge --state-dir <namespace>/state unblock --reason "<why>"` (while no scheduler runs: it takes the repository lock), then `epic resume` |
 | `resumable` | a run stopped mid-workflow (a crash, a stop, a killed worker) | `epic resume` |
 | `uncertain` | a claim, a state or a run lock that cannot be read or does not agree | repair the files by hand, or `epic archive` the issue, then `epic resume` |
@@ -1026,6 +1035,44 @@ and adopts its marked PR. Re-running it completes an interrupted archive;
 on an issue with nothing left it says "nothing left to archive". It reads
 nothing from GitHub but the repository's id, which the binding's must be
 (see `epic stop` above), and does not touch `scheduler.json`.
+
+### `epic recheck`
+
+`epic recheck <EPIC_URL> <ISSUE>` is for an issue a worker settled at
+`READY_FOR_MERGE` whose PR moved afterwards: a push, a rebase and force
+push, a retarget, or a base rewritten under its name (#447). The scheduler
+launches nothing more for a settled issue and its workers never read a held
+run's PR, so neither `epic resume` nor a worker notices the move; a
+standalone `resume` refuses the namespace's state directory. `epic recheck`
+is the namespace's counterpart of what a standalone `resume` does at
+`READY_FOR_MERGE`:
+
+- It takes the repository lock and the issue's run lock, so it is refused
+  (exit 2) while a scheduler, a surviving worker or a standalone command
+  runs. The namespace must be bound under that EPIC, in this repository by
+  its numeric id (as for `epic archive`), hold no open claim (run
+  `epic resume` first, which closes a settled one) and hold a run settled at
+  `READY_FOR_MERGE`; anything else is refused before GitHub is read.
+- With the merge gate closed, as a worker's always is, it reads the PR from
+  GitHub: its HEAD and base, then the merge base when those are the reviewed
+  ones; never its checks or the review comment. A PR still at the reviewed
+  revision, or one GitHub reports closed or merged, changes nothing (exit 0;
+  the output says which). One that moved goes back to `REVIEW` of
+  the new revision in the same run, the review marked stale and its findings
+  carried, nothing merged (exit 0, and the command prints the `epic resume`
+  to run). A read that fails, or an answer that does not establish the
+  PR's revision, exits 1 with the state unchanged.
+- No agent runs and nothing is written to GitHub, to the claim or to
+  `scheduler.json`. The run keeps its id, review rounds, loop bounds,
+  validation records and claim history; unlike `epic archive`, nothing is
+  discarded.
+
+The issue is then `resumable`: the next `epic resume` (or `epic run`)
+admits it and its worker reviews the new head as the next round, which
+certifies that head alone and settles at `READY_FOR_MERGE` again when it
+is clean. A worker checks the run's recorded configuration before that
+review, as for any resume (`epic resume --accept-config-change` accepts a
+change).
 
 ### Recovery and exit codes
 

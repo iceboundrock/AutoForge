@@ -35,7 +35,9 @@ Commands:
           native parent and warns, changing nothing, when it is not the recorded EPIC
   epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
           --dry-run and --force), resume, status (lock-free, --json), stop
-          (lock-free, --now) and archive; every 'epic' command refuses
+          (lock-free, --now), archive, and recheck, which reads the PR of an
+          issue a worker settled at READY_FOR_MERGE and sends one that moved
+          back to REVIEW for 'epic resume' (#447); every 'epic' command refuses
           --state-dir, since each issue's state lives in its scheduler namespace,
           and an EPIC of another repository than the checkout's 'origin'.
           'epic _worker' is the scheduler's hidden worker entry point
@@ -82,6 +84,7 @@ from .engine import (
 from .epic_commands import (
     DRAIN_HELP,
     EXIT_OPEN_CLAIMS,
+    RecheckReport,
     archive_issue,
     checkout_epic,
     claims_left_open,
@@ -90,8 +93,10 @@ from .epic_commands import (
     dry_run_plan,
     epic_run_guard,
     left_open_lines,
+    recheck_issue,
     stop_scheduler,
 )
+from .epic_commands import command as epic_command_line
 from .epic_graph import GraphReader
 from .epic_rebind import COMMAND as REBIND_COMMAND
 from .epic_rebind import (
@@ -434,7 +439,7 @@ def _add_epic_parser(sub) -> None:
     """
     ep = sub.add_parser(
         "epic",
-        help="parallel EPIC scheduler: run, resume, status, stop, archive (REMOTE only)",
+        help="parallel EPIC scheduler: run, resume, status, stop, archive, recheck (REMOTE only)",
         description=(
             "Run up to --max-parallel issues of one EPIC at once, each in its own scheduler "
             "namespace and worktree, admitted in dependency order from GitHub's native "
@@ -539,6 +544,25 @@ def _add_epic_parser(sub) -> None:
     )
     ea.add_argument("epic", metavar="EPIC_URL", help="the EPIC issue URL")
     ea.add_argument("issue", type=_positive_int, metavar="ISSUE", help="the issue number")
+
+    erc = esub.add_parser(
+        "recheck",
+        help="read the PR of an issue settled at READY_FOR_MERGE; back to REVIEW if it moved",
+        description=(
+            "For an issue a worker settled at READY_FOR_MERGE, which the scheduler never "
+            "relaunches (#447). Under the controller lock (so while no scheduler or worker "
+            "runs) and the issue's run lock, with no open claim: read the PR from GitHub "
+            "(its HEAD and base, then the merge base; not its checks or the review comment). "
+            "A PR that moved since the clean review (a push, a rebase and force push, a "
+            "retarget, a base rewritten under its name) goes back to REVIEW of the new "
+            "revision, nothing merged, and 'epic resume' then admits the issue and reviews "
+            "it; a PR still at the reviewed revision changes nothing. No agent runs, nothing "
+            "is written to GitHub, and the run, its review history and the claim history "
+            "are kept."
+        ),
+    )
+    erc.add_argument("epic", metavar="EPIC_URL", help="the EPIC issue URL")
+    erc.add_argument("issue", type=_positive_int, metavar="ISSUE", help="the issue number")
 
 
 def _add_max_parallel(parser: argparse.ArgumentParser) -> None:
@@ -2093,6 +2117,8 @@ def cmd_epic(args) -> int:
         return cmd_epic_stop(args)
     if args.epic_command == "archive":
         return cmd_epic_archive(args)
+    if args.epic_command == "recheck":
+        return cmd_epic_recheck(args)
     raise ConfigurationError(f"unknown epic command {args.epic_command}")
 
 
@@ -2210,6 +2236,49 @@ def cmd_epic_archive(args) -> int:
             epic.canonical,
             args.issue,
             lambda repository: _epic_graph(cfg).get_repository_id(repository),
+        )
+    for line in report.lines():
+        print(line)
+    return 0
+
+
+def cmd_epic_recheck(args) -> int:
+    """``epic recheck``: one issue held at READY_FOR_MERGE read against its PR (#447).
+
+    Exit 0 whether the PR moved (the run is back in REVIEW, and the command
+    to continue is printed) or not (nothing changed); 2 for a refusal (L0 or
+    the issue's run lock held, a namespace that is not one settled at
+    READY_FOR_MERGE, or of another EPIC or repository); 1 for a GitHub read
+    that failed or did not establish the PR's revision, the state unchanged.
+    The configuration is loaded before L0 is taken, as ``epic archive``'s.
+    """
+    cfg = _load_cfg(args)
+    flags = _epic_flags(args)
+    epic_url = parse_issue_url(args.epic).canonical
+    repository = os.getcwd()
+    resume = epic_command_line(flags, "epic", "resume", epic_url)
+
+    def engine_for(namespace) -> ControllerEngine:
+        # As a worker's engine (worker._engine): the namespace's state, its
+        # hints naming the namespace and 'epic resume', never a standalone resume.
+        engine = ControllerEngine(config=cfg, workdir=repository)
+        engine.bind_issue_namespace(namespace)
+        engine.cli_global_flags = (*flags, "--state-dir", str(namespace.state_dir))
+        engine.continue_command = (*flags, "epic", "resume", epic_url)
+        engine.config_file = absolute_spelling(args.config) if args.config else ""
+        return engine
+
+    lock_path = repository_lock_path(repository)
+    with ControllerLock(lock_path) as l0:
+        report: RecheckReport = recheck_issue(
+            lock_path.parent.parent,
+            epic_url,
+            args.issue,
+            lambda name: _epic_graph(cfg).get_repository_id(name),
+            engine_for,
+            l0,
+            resume=resume,
+            on_outcome=_print_outcome_now,
         )
     for line in report.lines():
         print(line)

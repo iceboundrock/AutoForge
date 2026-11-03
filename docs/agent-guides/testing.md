@@ -1676,6 +1676,21 @@ the in-memory GitHub and scripted agents. It must keep covering:
   `epic archive` closing then moving aside, idempotent, refused while the
   issue has a live owner or another EPIC, an unusable claim file moved
   aside;
+- `epic recheck` (#447, `tests/test_epic_commands.py`): an issue a worker
+  settled at `READY_FOR_MERGE`, its PR branch then rewritten and
+  force-pushed, is held by `epic resume` (nothing admitted); `epic recheck`
+  reads only the PR's identity and merge base, changes nothing while the PR
+  is unmoved, and once it moved takes `READY_FOR_MERGE -> REVIEW` in the
+  same run (no new claim, the run id and round kept); the next `epic
+  resume` admits it and its worker certifies the pushed head as round 2,
+  one PR throughout and nothing merged; L0 or the issue's L2 held, no
+  namespace, another EPIC's binding, an open claim and a namespace not
+  settled at `READY_FOR_MERGE` are refused before an engine is built or
+  the PR is read, a state the engine loads in another phase is refused
+  before any read, a PR merged by hand is reported as merged, and an
+  answer with an unknown state exits 1 with the state unchanged; `epic
+  status` names `epic recheck` and `epic resume` as a `ready-for-merge`
+  issue's next steps;
 - GitHub changing between ticks: a blocker closed and another reopened, a
   child completed or given a dependency between snapshot and claim, a
   child removed or re-parented, the EPIC closed, a human push to an active

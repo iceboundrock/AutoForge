@@ -1735,6 +1735,10 @@ class ControllerEngine:
         # by the scheduler, which a standalone ``resume`` refuses. Words
         # after ``autoforge``, paths only; empty for every other caller.
         self.continue_command: tuple[str, ...] = ()
+        # Why the last closed-gate read of a held READY_FOR_MERGE run held
+        # (#447), set by :meth:`_held_revision_moved` whenever it returns
+        # None, "" otherwise: what ``epic recheck`` reports. Never persisted.
+        self.held_reason = ""
 
     # -- the state directory as a held capability --------------------------
     @property
@@ -8307,10 +8311,18 @@ class ControllerEngine:
         the PR's, so it raises :class:`VerificationError` rather than hold
         (R1-F2). That, and a read that fails (its GitHubError, named), leave
         the phase and the state file unchanged.
+
+        Each hold sets :attr:`held_reason` to why it held.
         """
         state = self._require_state()
         url = state.current_pr_url
         reviewed = (state.reviewed_head_sha or "").lower()
+        self.held_reason = ""
+
+        def hold(reason: str) -> _HeldRevisionMoved | None:
+            self.held_reason = reason
+            return None
+
         if (
             not url
             or state.last_review_result != "clean"
@@ -8319,10 +8331,17 @@ class ControllerEngine:
             or not state.reviewed_base_ref
             or not state.reviewed_merge_base_sha
         ):
-            return None
+            return hold(
+                "the state holds no complete clean review bound to a PR, a HEAD, a base and "
+                "a merge base, so there is no revision to compare (the open merge gate "
+                "refuses such a state too)"
+            )
         reviewed_ref = parse_pr_url(state.reviewed_pr_url)
         if not parse_pr_url(url).same_target(reviewed_ref):
-            return None
+            return hold(
+                f"current_pr_url {url} is not the reviewed PR {state.reviewed_pr_url}, so it "
+                "is not compared (the open merge gate blocks on it)"
+            )
         with self._reading(f"PR {url}"):
             pr = self.github.get_pr(url)
         unchanged = (
@@ -8333,7 +8352,7 @@ class ControllerEngine:
         if pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref):
             raise VerificationError(f"GitHub answered {url} with PR {pr.url}: {unchanged}")
         if pr.state in ("CLOSED", "MERGED"):
-            return None
+            return hold(f"GitHub reports PR {url} {pr.state}, so it is not compared")
         if pr.state != "OPEN":
             shown = repr(pr.state) if pr.state else "no state"
             raise VerificationError(
@@ -8351,7 +8370,10 @@ class ControllerEngine:
         merge_base = self._merge_base_of(pr)
         if merge_base != state.reviewed_merge_base_sha:
             return _HeldRevisionMoved(pr, merge_base)
-        return None
+        return hold(
+            f"PR {url} is still at the reviewed HEAD {reviewed[:12]}, its base "
+            f"{pr.base_ref!r} and merge base {merge_base[:12]}"
+        )
 
     def merge_gate_open(self, allow_merge: bool) -> bool:
         """The merge safety gate: config ``safety.allow_merge`` AND the CLI flag."""

@@ -7519,6 +7519,10 @@ def test_ready_for_merge_gate_closed_at_the_reviewed_revision_holds(
     with pytest.raises(VerificationError, match="merge is disabled"):
         eng.step(allow_merge=flag)
     assert _reads_since(fake_github, before) == ["get_pr", "get_merge_base_sha"]
+    assert eng.held_reason == (
+        f"PR {PR} is still at the reviewed HEAD {SHA_A[:12]}, its base 'main' and merge base "
+        f"{MERGE_BASE[:12]}"
+    )
     assert eng.paths.state_file.read_bytes() == before_bytes
     assert eng.state.phase == Phase.READY_FOR_MERGE and fake_github.merges == []
 
@@ -7576,16 +7580,20 @@ def test_ready_for_merge_gate_closed_revision_moved_goes_back_to_review(
 
 def _closed(gh, eng):
     gh.add_pr(head_sha=SHA_B, state="CLOSED")
+    return f"GitHub reports PR {PR} CLOSED, so it is not compared"
 
 
 def _merged_by_hand(gh, eng):
     gh.add_pr(head_sha=SHA_B, state="MERGED")
+    return f"GitHub reports PR {PR} MERGED, so it is not compared"
 
 
 def _another_pr(gh, eng):
     gh.add_pr(head_sha=SHA_B)
-    eng.state.current_pr_url = PR.replace("/pull/42", "/pull/43")
+    other = PR.replace("/pull/42", "/pull/43")
+    eng.state.current_pr_url = other
     eng._save()
+    return f"current_pr_url {other} is not the reviewed PR {PR}, so it is not compared"
 
 
 @pytest.mark.parametrize(
@@ -7597,12 +7605,14 @@ def test_ready_for_merge_gate_closed_holds_what_only_the_open_gate_decides(
     """#447 routes an OPEN reviewed PR's drift only. A closed PR, a merge by
     hand and a PR that is not the reviewed one hold READY_FOR_MERGE with the
     gate closed, as before: the open gate blocks or reconciles each itself.
-    Nothing is written and no merge is counted."""
+    Nothing is written and no merge is counted; ``held_reason`` says which
+    (``epic recheck`` reports it)."""
     eng, _ = _held(tmp_state_dir, fake_github)
-    case(fake_github, eng)
+    reason = case(fake_github, eng)
     before_bytes = eng.paths.state_file.read_bytes()
     with pytest.raises(VerificationError, match="merge is disabled"):
         eng.step(allow_merge=False)
+    assert eng.held_reason.startswith(reason)
     assert eng.paths.state_file.read_bytes() == before_bytes
     assert eng.state.phase == Phase.READY_FOR_MERGE and eng.state.counted_merged_prs == []
 

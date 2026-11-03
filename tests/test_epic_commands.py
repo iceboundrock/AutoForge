@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import cli, epic_commands, scheduler_stop
+from autoforge.engine import ControllerEngine
 from autoforge.epic_commands import DRAIN_HELP, EXIT_OPEN_CLAIMS, STATUS_SCHEMA
 from autoforge.errors import ExecutionError
 from autoforge.executor_supervised import spawn_supervised
@@ -551,7 +552,9 @@ def test_status_gives_every_child_exactly_one_category(epic, tmp_path):
         assert words in blocked["detail"]
     unblock = e.command("--state-dir", str(b.ns(3).state_dir), "unblock", "--reason", "<why>")
     assert blocked["next"] == [unblock, resume]
-    assert rows[2]["pr_url"] and rows[2]["next"] == []
+    # READY_FOR_MERGE: a human merges; after a push, epic recheck then epic resume (#447).
+    assert rows[2]["pr_url"] and "'epic recheck'" in rows[2]["detail"]
+    assert rows[2]["next"] == [e.command("epic", "recheck", EPIC, "2"), resume]
     assert rows[5]["blockers"] == ["#2 (open)"]
     assert rows[9]["classification"] == "uncertain(state-corrupt)"
     assert rows[9]["next"] == [e.command("epic", "archive", EPIC, "9"), resume]
@@ -1178,6 +1181,178 @@ def test_archive_is_refused_while_the_issue_has_a_live_owner_or_another_epic(epi
     assert code == 2 and "bound under EPIC #99" in err
     code, out, _ = e.cli("epic", "archive", EPIC, "6")
     assert code == 0 and "nothing left to archive" in out and not b.ns(6).directory.exists()
+
+
+# -- epic recheck (#447) ------------------------------------------------------------------
+
+
+class _WorldEngines:
+    """Every engine built while installed reads the issue's GitHub from its world file.
+
+    ``epic recheck`` runs its engine in this process; the issue's GitHub is
+    the FakeGitHub its workers pickled (``tests/scheduler_worker.py``), so
+    the recheck reads the PR the last worker left, at the head the origin
+    branch has now. ``built`` counts the engines: a refusal builds none.
+    """
+
+    def __init__(self, b: Bench, n: int, pr_state: str = "") -> None:
+        self.built = 0
+        self.calls: list[tuple] = []
+        real = ControllerEngine.__init__
+        engines = self
+
+        def init(engine, *args, **kwargs):
+            with open(world(b, n), "rb") as f:
+                gh = pickle.load(f)
+            for pr in gh.prs.values():  # a state GitHub reports for this read only
+                pr.state = pr_state or pr.state
+            gh.calls = []  # this engine's reads alone
+            engines.built += 1
+            engines.calls = gh.calls
+            kwargs.setdefault("github", gh)
+            real(engine, *args, **kwargs)
+
+        self.init = init
+        self._patch = pytest.MonkeyPatch.context()
+
+    def __enter__(self) -> _WorldEngines:
+        self._patch.__enter__().setattr(ControllerEngine, "__init__", self.init)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._patch.__exit__(*exc)
+
+
+def _rebase_and_force_push(b: Bench, n: int) -> str:
+    """The reported case: the PR branch rewritten (no file changed) and force-pushed."""
+    state = b.state(n)
+    first = state.reviewed_head_sha
+    pushed = git_out(
+        "-C", str(b.repo), *GIT_IDENT, "commit-tree", f"{first}^{{tree}}", "-p", f"{first}^",
+        "-m", "Rebased",
+    )  # fmt: skip
+    b.origin.publish(b.repo, pushed, state.current_branch)
+    return pushed
+
+
+def test_a_push_to_an_issue_settled_at_ready_for_merge_is_rechecked_and_reviewed(epic):
+    """R1-F1: a scheduler's issue whose PR moved after READY_FOR_MERGE is reviewed again.
+
+    The scheduler holds the settled namespace (``epic resume`` admits nothing),
+    so the operator runs ``epic recheck``: under L0 and the issue's run lock it
+    reads the PR (its identity, then the merge base when unmoved), changes
+    nothing while the PR is at the reviewed revision, and once it moved takes
+    READY_FOR_MERGE -> REVIEW in the same run: no agent, no claim, nothing on
+    GitHub. ``epic resume`` then admits the issue as resumable and its worker
+    reviews and certifies the pushed head as round 2. Nothing is merged, the
+    run and its history are kept, and one PR exists throughout.
+    """
+    e = epic()
+    b = e.b
+    b.issue(2, world=str(world(b, 2)))
+    assert e.run()[0] == 0
+    held = b.state(2)
+    first, run_id = held.reviewed_head_sha, held.run_id
+    assert held.phase is Phase.READY_FOR_MERGE and settled(b, 2) is ClaimClassification.SETTLED
+    recheck = e.command("epic", "recheck", EPIC, "2")
+    row = e.rows()[2]
+    assert row["category"] == "ready-for-merge" and "'epic recheck'" in row["detail"]
+    assert row["next"] == [recheck, e.command("epic", "resume", EPIC)]
+
+    # At the reviewed revision: the identity read and the merge base, nothing written.
+    before = b.ns(2).state_file.read_bytes()
+    with _WorldEngines(b, 2) as engines:
+        code, out, _ = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 0 and f"still at the reviewed HEAD {first[:12]}" in out
+    assert "the run stays READY_FOR_MERGE and nothing was written" in out
+    assert [call[0] for call in engines.calls] == ["get_pr", "get_merge_base_sha"]
+    assert b.ns(2).state_file.read_bytes() == before
+    # A PR merged by hand (the usual end) is said to be one, never "unmoved".
+    with _WorldEngines(b, 2, pr_state="MERGED"):
+        code, out, _ = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 0 and f"GitHub reports PR {held.current_pr_url} MERGED" in out
+    assert "still at the reviewed HEAD" not in out
+    assert b.ns(2).state_file.read_bytes() == before
+    # An answer that establishes no revision is an error, never a hold (R1-F2).
+    with _WorldEngines(b, 2, pr_state="LOCKED") as engines:
+        code, out, err = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 1 and "reports 'LOCKED', not OPEN, CLOSED or MERGED" in err
+    assert "nothing was written" in err and "stays READY_FOR_MERGE and" not in out
+    assert [call[0] for call in engines.calls] == ["get_pr"]
+    assert b.ns(2).state_file.read_bytes() == before
+
+    pushed = _rebase_and_force_push(b, 2)
+    # The scheduler holds a settled namespace: it reads and admits nothing for it.
+    assert e.resume()[0] == 0 and b.admitted() == []
+    assert b.ns(2).state_file.read_bytes() == before
+    # While a scheduler (L0) or a live owner (L2) holds its lock, the recheck refuses.
+    with _WorldEngines(b, 2) as engines:
+        with ControllerLock(repository_lock_path(b.repo)):
+            assert e.cli("epic", "recheck", EPIC, "2")[0] == 2
+        lock = IssueRunLock(b.ns(2)).acquire()
+        try:
+            code, _, err = e.cli("epic", "recheck", EPIC, "2")
+        finally:
+            lock.release()
+    assert code == 2 and "'epic recheck' refuses while it runs" in err
+    assert engines.built == 0 and b.ns(2).state_file.read_bytes() == before
+
+    with _WorldEngines(b, 2) as engines:
+        code, out, _ = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 0, out
+    assert "PR HEAD moved after the clean review" in out
+    assert "READY_FOR_MERGE -> REVIEW (not merged)" in out
+    assert f"continue with: {e.command('epic', 'resume', EPIC)}" in out
+    assert [call[0] for call in engines.calls] == ["get_pr"]
+    moved = b.state(2)
+    assert moved.phase is Phase.REVIEW and moved.last_review_result == "stale"
+    assert (moved.current_head_sha, moved.reviewed_head_sha) == (pushed, first)
+    assert moved.run_id == run_id and moved.review_round == 1
+    assert len(b.claims(2).history) == 1 and b.claims(2).current is None
+    assert e.rows()[2]["category"] == "resumable"
+    # Not held at READY_FOR_MERGE any more: refused, nothing read.
+    with _WorldEngines(b, 2) as engines:
+        code, _, err = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 2 and "resumable(in-progress)" in err and "not held at READY_FOR_MERGE" in err
+    assert engines.built == 0
+    # Should the classification ever pass a state that is not READY_FOR_MERGE,
+    # the engine's load refuses it: no step (which could launch the review), no read.
+    after = b.ns(2).state_file.read_bytes()
+    with _WorldEngines(b, 2) as engines, pytest.MonkeyPatch.context() as mp:
+        mp.setattr(epic_commands, "_recheck_refusal", lambda issue, classification: "")
+        code, _, err = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 2 and "in phase REVIEW, not READY_FOR_MERGE" in err
+    assert engines.built == 1 and engines.calls == []
+    assert b.ns(2).state_file.read_bytes() == after
+
+    # The next admission resumes the same run: its worker reviews the pushed head.
+    b.issue(2, ({**REVIEW, "round": 2},), world=str(world(b, 2)))
+    assert e.resume()[0] == 0 and b.admitted() == [2]
+    again = b.state(2)
+    assert again.phase is Phase.READY_FOR_MERGE and again.run_id == run_id
+    assert (again.reviewed_head_sha, again.review_round) == (pushed, 2)
+    assert [c.claim.generation for c in b.claims(2).history] == [1, 2]
+    assert settled(b, 2) is ClaimClassification.SETTLED and len(prs(b, 2)) == 1
+    with open(world(b, 2), "rb") as f:
+        assert pickle.load(f).merges == []
+
+
+def test_recheck_refuses_an_issue_it_does_not_hold_at_ready_for_merge(epic):
+    """No namespace, one bound under another EPIC, and an open claim are refused
+    (exit 2) before any engine is built or GitHub is read."""
+    e = epic()
+    b = e.b
+    b.graph.child(2)
+    with _WorldEngines(b, 2) as engines:
+        code, _, err = e.cli("epic", "recheck", EPIC, "2")
+        assert code == 2 and "issue #2 has no scheduler namespace bound under EPIC #1" in err
+        _bind_other_epic(b, 3)
+        code, _, err = e.cli("epic", "recheck", EPIC, "3")
+        assert code == 2 and "bound under EPIC #99, not #1" in err
+        _admitted_but_never_spawned(b, 2, b.graph.issue(2, R).id)
+        code, _, err = e.cli("epic", "recheck", EPIC, "2")
+        assert code == 2 and "is still open" in err and "'epic resume' classifies it" in err
+    assert engines.built == 0 and not b.ns(2).state_file.exists()
 
 
 # -- standalone runs and LOCAL ----------------------------------------------------------

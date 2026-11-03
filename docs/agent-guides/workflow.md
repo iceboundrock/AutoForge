@@ -90,7 +90,10 @@ nothing merged). `resume` then goes on to review the new revision; a PR
 still at the reviewed one holds, with nothing written. Only the first step
 of a `resume` reads a held run: one that reaches `READY_FOR_MERGE` again in
 the same invocation stops there, and a scheduler's worker, which does not
-ask for the recheck, never reads it. The recheck of an unmoved PR
+ask for the recheck, never reads it: for an issue a worker settled there,
+the operator's `epic recheck` makes the same read under L0 and the issue's
+L2 and takes the same edge, and the next `epic resume` admits the issue,
+now `resumable`, and reviews it (ADR 0008, amended by #447). The recheck of an unmoved PR
 is no step and is not charged; the step to `REVIEW` is, so an exhausted
 step budget blocks it like any other. A PR GitHub reports `CLOSED` or
 `MERGED` (a merge by hand) and a `current_pr_url` that is not the reviewed
