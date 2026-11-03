@@ -916,8 +916,12 @@ with `BLOCKED` and `pr-owner`, before anything is launched or written.
   entry, before the review comment is posted, before each thing `FIX`
   sends, before a replan launches its agent or sends its push or
   replacement PR, and at the merge gate, the closed gate's read by `step`,
-  `resume` and `epic recheck` included, even when the PR moved. A plain
-  `unblock` refuses for as long as the marker names the other run.
+  `resume` and `epic recheck` included, even when the PR moved. It stops
+  too when the read right after its `gh pr merge` finds the takeover. That
+  merge was already sent, so read the reason: it says what GitHub reports
+  (a merge that stands and was not counted, or a PR that has not merged)
+  and warns of any auto-merge or merge-queue entry it could not clear. A
+  plain `unblock` refuses for as long as the marker names the other run.
 - **A run resuming its own saved publication.** A run that stopped after
   saving its `ANALYZE_EXECUTE` push and PR plan, before sending all of it,
   reads the PRs on `autoforge/<n>` first. One whose marker names another
@@ -926,8 +930,8 @@ with `BLOCKED` and `pr-owner`, before anything is launched or written.
   then a plain `unblock` completes the plan from where it stopped.
 - **A run whose PR's owner was removed.** Once a run has seen its PR's
   marker name an owner (it opened the PR, took it over, or read a marker
-  naming any run on it, a refused `unblock`'s read and a held
-  `READY_FOR_MERGE` run's read included),
+  naming any run on it, a refused `unblock`'s read, a held
+  `READY_FOR_MERGE` run's read and the read after its `gh pr merge` included),
   `state.json` records that (`owned_pr_url`), at the read itself: a read
   that fails after it, a stopped process, or a second marker or one that
   cannot be read beside it, does not lose it. If someone then removes the

@@ -592,7 +592,21 @@ High-priority coverage includes:
   changed, and a body repaired to name this run is driven again. A defect
   beside no owner records none and the repaired binding stays legacy, and
   the publication fence records none for a PR the run is not bound to (PR
-  #459 R6-F1; `tests/test_engine.py`, `tests/test_unblock.py`)
+  #459 R6-F1; `tests/test_engine.py`, `tests/test_unblock.py`). The read after
+  `MERGE`'s `gh pr merge` that finds another run's owner, on a PR `OPEN` and
+  moved, `OPEN` and unmoved, `CLOSED` or `MERGED`, blocks (`pr-owner`) with
+  the owner recorded and nothing routed, counted or deleted, and after the
+  owner is removed a restarted run's `unblock` refuses, `run` launches nothing
+  and no second merge is sent; so does an owned binding whose known owner that
+  read finds removed. The reason says what GitHub reports of the write, a merge
+  that stands included, and an auto-merge the call armed is still disabled, or
+  what stays pending reaches the reason. A marker naming this run keeps
+  driving with the owner recorded, an ownerless one records none, a defect or
+  a marker of another issue blocks there too, a process killed after the read
+  keeps the owner alone, an answer naming another PR leaves the outcome
+  unknown with nothing recorded or counted, and a PR handed back is reconciled
+  once when merged and reviewed again when moved (PR #459 R7-F1;
+  `tests/test_engine.py`)
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

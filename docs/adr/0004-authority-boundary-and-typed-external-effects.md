@@ -2269,6 +2269,18 @@ its author. Only the effect records and the entry observation prove origin.
       counted, and the identity read behind a checks read GitHub refuses,
       before the PR's state is judged, so the gate blocks on the owner
       rather than on the refusal alone (PR #459 R5-F1);
+    - the read after `MERGE`'s `gh pr merge`, before the PR's revision is
+      routed or its merge counted (PR #459 R7-F1). That read already shows a
+      takeover that landed since the gate's, so this is not the check-to-write
+      race. Ignored, a displaced legacy binding sent a moved PR to `REVIEW` and
+      counted a merged one, both with no owner recorded, and once the owner
+      was removed a restarted run reviewed the PR again. The write was sent, so
+      the refusal undoes nothing: an auto-merge that call armed is still
+      disabled, whatever is left pending reaches the reason, and the reason
+      says what GitHub reports of the write, a merge that stands included. It
+      says the PR has not merged only of a read finding it `OPEN` or `CLOSED`.
+      An answer naming another PR says nothing of this one, so it is a re-read
+      that failed: the outcome is unknown and the run stays in `MERGE`;
     - the step budget's read of the PR at the merge gate, which words its
       `BLOCKED` reason (PR #459 R5-F1);
     - the closed merge gate's read of a run held at `READY_FOR_MERGE`, by
@@ -2352,7 +2364,8 @@ its author. Only the effect records and the entry observation prove origin.
       (PR #459 R5-F2), a refused `unblock`'s included, and the closed merge gate's
       read of a run it holds (PR #459 R3-F2), `ANALYZE_EXECUTE`'s probe of
       its persisted PR, the identity read behind a refused checks read and
-      the step budget's read at the merge gate (PR #459 R5-F1).
+      the step budget's read at the merge gate (PR #459 R5-F1), and the read
+      after `MERGE`'s write (PR #459 R7-F1).
 
     A defect in the body changes nothing of what its readable markers record
     (PR #459 R6-F1). A marker that cannot be read, or a second marker, refuses

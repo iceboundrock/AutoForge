@@ -1043,7 +1043,9 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   R5-F1): a closed persisted PR another run owns no longer lets the
   implementation agent launch beside it, and a listing outage or a
   refused checks read no longer leaves an owner the read found
-  unrecorded. `REVIEW` reads the PR once more right
+  unrecorded. The read after `MERGE`'s `gh pr merge` judges it too, before
+  the PR's revision is routed or its merge counted (PR #459 R7-F1; see
+  "Post-merge reconciliation"). `REVIEW` reads the PR once more right
   before its round comment is sent (K4), so a PR taken over while the
   reviewer ran gets no comment from the displaced run. `FIX` reads the
   owner again before each record of its plan after the first (follow-up
@@ -2387,7 +2389,22 @@ to `REVIEW`. If the post-merge re-read fails, the outcome is treated as
 unknown: the run stays in `MERGE` and `resume --allow-merge` re-inspects
 GitHub (an already-merged PR is recovered and counted once; an open one is
 re-verified), bounded by the same `merge.max_verification_attempts`, then
-`BLOCKED`.
+`BLOCKED`. An answer naming another PR says nothing of this one and is
+treated the same way, so it is never counted (PR #459 R7-F1).
+
+The post-merge re-read judges the PR's owner before anything else it shows
+(#414, PR #459 R7-F1). A marker naming a run is written into `owned_pr_url`
+at that read. A PR another run owns, a marker that cannot be read, or the
+owner this run knew removed blocks (`pr-owner`), whatever the PR's state or
+HEAD: a moved PR is not routed to `REVIEW` and a merged one is not counted,
+sent on to `UPDATE_EPIC` or its branch deleted. The write was already sent,
+so the refusal undoes nothing. An auto-merge that call armed is still
+disabled, and a merge that may still land reaches the reason. The reason
+says what GitHub reports of the write: `MERGED` stands and is not counted,
+`OPEN` or `CLOSED` has not merged as of that read, and any other state
+leaves it unknown. Once the operator hands the PR back, a plain `unblock`
+judges it from live GitHub: a merged PR is reconciled and counted once, and
+a moved one goes to `REVIEW`.
 
 No state field records that a `MERGE` step sent `gh pr merge`, so a
 `BLOCKED` reason says "nothing was merged" only where that is known (#376):
@@ -2404,8 +2421,10 @@ uncounted `READY_FOR_MERGE` or `MERGE` before it re-inspects GitHub reads
 the PR once (the stop is `BLOCKED` whatever it finds) and says what GitHub
 holds: `OPEN` or `CLOSED`, so nothing was merged; `MERGED`, not counted; or
 unknown, for a read that fails, answers with another PR, or reports any
-other state. The PR decoder reads an absent or null state as empty and
-passes any other string through, so only those three states are evidence.
+other state. A refusal on the owner the post-merge re-read found is worded
+from that read too, never from the owner. The PR decoder reads an absent or
+null state as empty and passes any other string through, so only those three
+states are evidence.
 Each of these names the way out: raise the bound where one stopped the run,
 then `unblock`, which reads the PR and sends a merge at the clean-reviewed
 HEAD to `READY_FOR_MERGE`, whose `MERGE` reconciles and counts it once

@@ -113,6 +113,13 @@ no step; a read that found a marker naming a run writes `owned_pr_url`
 into the state file and nothing else, whether the step then holds, blocks
 or raises (a merge base that cannot be read, PR #459 R4-F2).
 
+Both `MERGE` edges out of the read after `gh pr merge` are taken only once
+that read's owner is judged (#414, PR #459 R7-F1): a marker naming another run,
+one that cannot be read, or the removal of an owner the run knew takes
+`MERGE -> BLOCKED` (`pr-owner`), moved or merged, never `REVIEW` or
+`UPDATE_EPIC`. The merge was already sent, so the reason says what GitHub
+reports of it ([github-safety.md](github-safety.md#post-merge-reconciliation)).
+
 `MERGE -> ANALYZE_EXECUTE` and `MERGE -> DONE` are declared in `LEGAL_EDGES`
 but reserved: `decide_next_phase` never chooses them, because EPIC batching
 is decided inside `UPDATE_EPIC`, which every merge passes through.

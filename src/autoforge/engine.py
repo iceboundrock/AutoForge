@@ -10485,7 +10485,20 @@ class ControllerEngine:
         Then ``gh pr merge --<method> --match-head-commit <reviewed>``; the PR
         is re-read and the merge is counted only when GitHub says MERGED at
         the reviewed HEAD into the reviewed base.
-        If the re-read itself fails the outcome is *uncertain*: the run stays
+        Who owns the PR is judged on that re-read first (#414, PR #459 R7-F1):
+        a marker naming a run is written into the state file at once
+        (:meth:`_note_pr_owner`), and a PR another run owns, or whose marker
+        cannot be read or lost the owner this run knew, blocks (``pr-owner``)
+        before its revision is routed or its merge counted, once any
+        asynchronous merge that call armed is dealt with. Skipped, a displaced
+        legacy binding routed a moved PR to REVIEW and counted a merged one
+        with no owner recorded, and once the owner was removed a restarted
+        run reviewed the PR again. The refusal stops the run; it undoes
+        nothing, so its reason says what GitHub reports the write left
+        (:meth:`_merge_attempt_outcome`), a merge that stands included.
+        If the re-read itself fails, or answers with another PR (which says
+        nothing of this one, its merge or its owner), the outcome is
+        *uncertain*: the run stays
         in MERGE (not BLOCKED, until the same bound is reached) and ``resume``
         reconciles from real GitHub state (already MERGED -> recovered and
         counted once; still OPEN -> re-verified and re-attempted). The
@@ -10533,7 +10546,9 @@ class ControllerEngine:
         # GitHub is the source of truth: `gh` exit status is only a hint.
         try:
             after = self.github.get_pr(url)
-        except GitHubError as exc:
+            if not self._is_bound_answer(after):
+                raise GitHubError(f"GitHub answered with PR {after.url}")
+        except (GitHubError, ConfigurationError) as exc:
             # Uncertain outcome (the merge may or may not have happened).
             # Stay in MERGE so `resume` reconciles from real GitHub state
             # instead of terminalising a possibly-successful merge (bounded).
@@ -10546,7 +10561,22 @@ class ControllerEngine:
                 cause=exc,
                 merge_sent=True,
             )
-        if after.state != "MERGED":
+        # #414 (PR #459 R7-F1): the read that says what the write did also says
+        # who owns the PR now. The owner is recorded here, before anything else
+        # can raise, and judged before the revision or the merge is. What this
+        # call may have left pending is dealt with first: a refusal stops the
+        # run, and nothing would disarm it after that.
+        owner = self._pr_owner_problem(after)
+        merged = after.state == "MERGED"
+        note, pending = ("", False) if merged else self._disarm_async_merge(url, after)
+        if owner:
+            return self._block(
+                Phase.MERGE,
+                plan,
+                self._pr_owner_text(owner, self._merge_attempt_outcome(after, merge_error, note)),
+                code=StopReasonCode.PR_OWNER,
+            )
+        if not merged:
             if merge_error:
                 reason = f"gh pr merge failed: {merge_error}"
             else:
@@ -10554,7 +10584,6 @@ class ControllerEngine:
                     f"gh pr merge exited 0 but GitHub reports PR {url} as {after.state} "
                     "(auto-merge armed or merge queue?)"
                 )
-            note, pending = self._disarm_async_merge(url, after)
             drifted = after.is_open and (
                 (after.head_sha and after.head_sha != reviewed)
                 or (after.base_ref and after.base_ref != reviewed_base)
@@ -10957,6 +10986,38 @@ class ControllerEngine:
             pending = True
             note += "; WARNING: the PR is in the merge queue — remove it on GitHub immediately"
         return note, pending
+
+    @staticmethod
+    def _merge_attempt_outcome(after: PRInfo, merge_error: str, note: str) -> str:
+        """What this step's ``gh pr merge`` left, as the read after it shows, without a full stop.
+
+        For a refusal on the owner that read found (#414, PR #459 R7-F1). Who
+        owns the PR says nothing of what the write did, and the write was sent
+        before the owner was seen, so the reason never says "nothing was
+        merged" on the owner's account: a merge GitHub reports stands, whoever
+        made it, and only a state in :data:`UNMERGED_PR_STATES` says the PR has
+        not merged (#376). ``note`` is what :meth:`_disarm_async_merge` found,
+        a merge that may still land included.
+        """
+        sent = "this step had run `gh pr merge`, which " + (
+            f"failed ({merge_error})" if merge_error else "exited 0"
+        )
+        where = f"at HEAD {after.head_sha[:12] or '?'} on {after.base_ref!r}"
+        if after.state == "MERGED":
+            return (
+                f"{sent}, and GitHub reports the PR MERGED {where}, by that call or by another "
+                "hand: that merge stands, and this run did not count it"
+            )
+        if after.state in UNMERGED_PR_STATES:
+            return (
+                f"{sent}, and GitHub reports the PR {after.state} {where}, so it has not merged "
+                f"as of that read and this run counted no merge of it{note}"
+            )
+        return (
+            f"{sent}, and GitHub reports the PR's state as {after.state!r:.40}, none of OPEN, "
+            f"CLOSED or MERGED, so whether it merged is unknown and this run counted no merge of "
+            f"it{note}"
+        )
 
     def _complete_merge(self, pr: PRInfo, plan: StepPlan, recovered: bool) -> StepOutcome:
         state = self._require_state()

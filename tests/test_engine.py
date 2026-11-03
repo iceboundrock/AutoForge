@@ -9089,8 +9089,10 @@ def _legacy_analyze(tmp_state_dir, gh: FakeGitHub, owner: str | None, **pr):
     return eng
 
 
-def _refused_after_removal(eng, tmp_state_dir, gh: FakeGitHub, remove, found) -> None:
-    """The owner removed and the process restarted: 'unblock' refuses, 'run' launches nothing."""
+def _refused_after_removal(eng, tmp_state_dir, gh: FakeGitHub, remove, found, merges=()) -> None:
+    """The owner removed and the process restarted: 'unblock' refuses, 'run' launches nothing.
+
+    ``merges`` are the `gh pr merge` calls the run had already sent; none is sent after them."""
     remove(gh)
     eng2 = _reloaded(eng, tmp_state_dir, gh)
     assert eng2.state.owned_pr_url == PR
@@ -9101,7 +9103,7 @@ def _refused_after_removal(eng, tmp_state_dir, gh: FakeGitHub, remove, found) ->
     assert eng2.run(allow_merge=True) == []
     assert eng2.paths.state_file.read_text() == raw
     assert eng.provider.calls == eng2.provider.calls == []
-    assert gh.effect_writes == [] and gh.merges == []
+    assert gh.effect_writes == [] and gh.merges == list(merges)
 
 
 @pytest.mark.parametrize("pr_state", ["CLOSED", "OPEN"])
@@ -9602,6 +9604,408 @@ def test_a_defect_beside_no_owner_blocks_and_leaves_the_binding_legacy(
     assert eng.unblock("the marker is repaired").unblocked
     assert eng.step().next_phase == "READY_FOR_MERGE"
     assert load_state(eng.paths.state_file).owned_pr_url == ""
+
+
+# -- the owner on MERGE's read after its write (PR #459 R7-F1) ---------------------------
+def _legacy_merge(tmp_state_dir, gh: FakeGitHub):
+    """A legacy MERGE binding: its PR's marker names no run and its record no owned PR, so
+    the gate's read before the write lets it through."""
+    gh.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, gh)
+    _owned_by(gh, None)
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+    return eng
+
+
+def _merge_meets(gh: FakeGitHub, before=None, after=None) -> None:
+    """Between the gate's read and the read after the write: ``before`` lands right before
+    `gh pr merge` is sent, and ``after`` right after it returned or failed."""
+    real = gh.merge_pr
+
+    def merge(*args, **kwargs):
+        if before is not None:
+            before(gh)
+        try:
+            real(*args, **kwargs)
+        finally:
+            if after is not None:
+                after(gh)
+
+    gh.merge_pr = merge
+
+
+def _reopened(gh: FakeGitHub) -> None:
+    gh.prs[PR].state = "OPEN"
+
+
+def _left_open(gh: FakeGitHub) -> None:
+    gh.merge_leaves_open = True
+
+
+def _closed_first(gh: FakeGitHub) -> None:
+    gh.prs[PR].state = "CLOSED"
+
+
+# What the write meets, the PR's state and HEAD the read after it finds, and what the
+# reason says of the write.
+_WRITE_MEETS = [
+    pytest.param(
+        lambda gh: gh.set_head(SHA_B), "OPEN", SHA_B, "head commit does not match", id="open-moved"
+    ),
+    pytest.param(_left_open, "OPEN", SHA_A, "which exited 0", id="open-unmoved"),
+    pytest.param(_closed_first, "CLOSED", SHA_A, "PR is CLOSED", id="closed"),
+    pytest.param(lambda gh: None, "MERGED", SHA_A, "which exited 0", id="merged"),
+]
+
+
+def _assert_outcome_reported(reason: str, state: str, head: str, sent: str) -> None:
+    """The refusal says what GitHub reports the write left, never more than it knows."""
+    assert "this step had run `gh pr merge`, which " in reason and sent in reason
+    assert f"GitHub reports the PR {state} at HEAD {head[:12]} on 'main'" in reason
+    assert not _says_nothing_was_merged(reason), reason
+    if state == "MERGED":
+        assert "that merge stands, and this run did not count it" in reason
+    else:
+        assert "so it has not merged as of that read" in reason
+
+
+@pytest.mark.parametrize(("meets", "state", "head", "sent"), _WRITE_MEETS)
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_legacy_merge_blocks_on_the_owner_the_read_after_its_write_finds(
+    tmp_state_dir, fake_github, meets, state, head, sent, remove, found
+):
+    """PR #459 R7-F1, the reported sequences: the gate's read let a legacy binding through,
+    and the read after `gh pr merge` finds another run's owner. Before R7-F1 that read's
+    body was ignored: a moved PR went to REVIEW and a merged one was counted and went on to
+    UPDATE_EPIC, both with owned_pr_url empty, and once the marker was removed a restarted
+    run launched a reviewer and reached READY_FOR_MERGE. The read now blocks (pr-owner) in
+    every state, nothing routed, counted or deleted, the owner recorded, and the reason
+    says what the write left. After the removal 'unblock' refuses and 'run' launches
+    nothing, and no second merge is sent."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    eng.config.merge.delete_branch = True
+    _merge_meets(fake_github, before=lambda gh: (meets(gh), _owned_by(gh, OTHER_RUN)))
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert (
+        f"the implementation marker of PR {PR} names run {OTHER_RUN} as its owner, not this "
+        f"run ({eng.state.run_id})"
+    ) in reason
+    _assert_outcome_reported(reason, state, head, sent)
+    assert fake_github.prs[PR].state == state and fake_github.prs[PR].head_sha == head
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.owned_pr_url) == (Phase.BLOCKED, PR, PR)
+    assert s.counted_merged_prs == [] and s.merged_since_epic_update == 0
+    # Nothing was routed: the clean review stands as the record of what was reviewed.
+    assert (s.last_review_result, s.current_head_sha) == ("clean", SHA_A)
+    assert fake_github.deleted_branches == [] and len(fake_github.merges) == 1
+
+    if state == "CLOSED":
+        _reopened(fake_github)
+    sent_merges = list(fake_github.merges)
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found, merges=sent_merges)
+
+
+@pytest.mark.parametrize(("meets", "state", "head", "sent"), _WRITE_MEETS)
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_merge_blocks_when_the_read_after_its_write_finds_the_owner_it_knew_removed(
+    tmp_state_dir, fake_github, meets, state, head, sent, remove, found
+):
+    """PR #459 R7-F1 on an owned binding: the owner this run knew is gone on the read after
+    the write, so which run owns the PR is not knowable. It blocks in every state, counts
+    nothing, and says what the write left."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, fake_github)
+    _owned_by(fake_github, eng.state.run_id)
+    eng.state.owned_pr_url = PR
+    eng._save()
+    _merge_meets(fake_github, before=lambda gh: (meets(gh), remove(gh)))
+    out = eng.step(allow_merge=True)
+    _assert_owner_removed(eng, out, found)
+    _assert_outcome_reported(eng.state.block_reason, state, head, sent)
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.counted_merged_prs == []
+    assert s.last_review_result == "clean" and len(fake_github.merges) == 1
+
+
+@pytest.mark.parametrize(
+    ("arrange", "note"),
+    [
+        pytest.param(lambda gh: None, "auto-merge was armed on the PR and has been", id="disarmed"),
+        pytest.param(
+            lambda gh: setattr(gh, "disable_auto_error", "403"),
+            "WARNING: auto-merge is armed on the PR and could not be disabled",
+            id="stuck",
+        ),
+        pytest.param(
+            lambda gh: gh.merge_queue.update({PR: MergeQueueStatus(enabled=True, in_queue=True)}),
+            "WARNING: the PR is in the merge queue",
+            id="queued",
+        ),
+        pytest.param(
+            lambda gh: setattr(gh, "merge_queue_error", "boom"),
+            "merge-queue status could not be read",
+            id="queue-unread",
+        ),
+    ],
+)
+def test_the_owner_refusal_after_the_write_still_deals_with_an_asynchronous_merge(
+    tmp_state_dir, fake_github, arrange, note
+):
+    """PR #459 R7-F1 keeps the rule of the write that left the PR open: the auto-merge it
+    armed is disabled again on a PR another run now owns too, since nothing would disarm it
+    after the refusal, and what is still pending reaches the reason."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    fake_github.merge_leaves_open = fake_github.merge_arms_auto = True
+
+    def taken(gh):
+        arrange(gh)
+        gh.set_head(SHA_B)
+        _owned_by(gh, OTHER_RUN)
+
+    _merge_meets(fake_github, after=taken)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert note in reason and "so it has not merged as of that read" in reason
+    assert fake_github.disabled_auto == [PR]
+    s = load_state(eng.paths.state_file)
+    assert (s.owned_pr_url, s.counted_merged_prs, s.last_review_result) == (PR, [], "clean")
+
+
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_legacy_merge_routed_to_review_keeps_this_runs_owner_the_read_after_its_write_finds(
+    tmp_state_dir, fake_github, remove, found
+):
+    """PR #459 R7-F1, the other half of the read: a marker naming this run refuses nothing,
+    so a PR moved past the write goes to REVIEW as before, with the owner recorded. Once it
+    is removed, a restarted run blocks at REVIEW's binding and launches no reviewer."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    run_id = eng.state.run_id
+    _merge_meets(fake_github, before=lambda gh: (gh.set_head(SHA_B), _owned_by(gh, run_id)))
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "REVIEW" and "not merged" in out.message, out.message
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.owned_pr_url, s.current_head_sha) == (Phase.REVIEW, PR, SHA_B)
+
+    remove(fake_github)
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    _assert_owner_removed(eng2, eng2.step(), found)
+    assert eng.provider.calls == eng2.provider.calls == []
+
+
+def test_a_legacy_merge_counts_a_merge_whose_marker_names_this_run_and_records_the_owner(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R7-F1 refuses only what it should: the read after the write finds this run's
+    marker, so the merge is counted once and the owner goes with it."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    run_id = eng.state.run_id
+    _merge_meets(fake_github, before=lambda gh: _owned_by(gh, run_id))
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC", out.message
+    s = load_state(eng.paths.state_file)
+    assert (s.owned_pr_url, s.counted_merged_prs, s.merged_since_epic_update) == (PR, [PR], 1)
+
+
+def test_a_legacy_merge_under_an_ownerless_marker_is_counted_with_no_owner_recorded(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R7-F1 leaves a legacy binding as it was while no marker names a run."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC", out.message
+    s = load_state(eng.paths.state_file)
+    assert (s.owned_pr_url, s.counted_merged_prs) == ("", [PR])
+
+
+@pytest.mark.parametrize("body", [*_OWNER_BESIDE_A_DEFECT[:2], _OWNER_BESIDE_A_DEFECT[5]])
+@pytest.mark.parametrize(
+    ("meets", "state", "head", "sent"), [_WRITE_MEETS[0], _WRITE_MEETS[3]], ids=["open", "merged"]
+)
+def test_a_defect_on_the_read_after_the_write_blocks_and_keeps_the_owner_beside_it(
+    tmp_state_dir, fake_github, body, meets, state, head, sent
+):
+    """PR #459 R7-F1 with R6-F1's rule: a body the read after the write cannot read blocks,
+    and a readable marker naming a run beside the defect is recorded, so a restarted run
+    stays refused once the markers are removed."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    text = body(eng.state.run_id)
+
+    def edited(gh):
+        meets(gh)
+        gh.prs[PR].body = text
+
+    _merge_meets(fake_github, before=edited)
+    _assert_refused_on_the_defect(eng, eng.step(allow_merge=True))
+    _assert_outcome_reported(eng.state.block_reason, state, head, sent)
+    assert load_state(eng.paths.state_file).counted_merged_prs == []
+    remove, found = _OWNER_REMOVALS[1].values
+    sent_merges = list(fake_github.merges)
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found, merges=sent_merges)
+
+
+@pytest.mark.parametrize(
+    ("meets", "state", "head", "sent"), [_WRITE_MEETS[0], _WRITE_MEETS[3]], ids=["open", "merged"]
+)
+def test_a_marker_of_another_issue_on_the_read_after_the_write_blocks(
+    tmp_state_dir, fake_github, meets, state, head, sent
+):
+    """PR #459 R7-F1 with R5-F2's rule: a marker of another issue naming another run says
+    that run drives the PR, on this read as on the gate's."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+
+    def edited(gh):
+        meets(gh)
+        gh.prs[PR].body = _FOREIGN_ISSUE_BODY
+
+    _merge_meets(fake_github, before=edited)
+    out = eng.step(allow_merge=True)
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    _assert_outcome_reported(eng.state.block_reason, state, head, sent)
+    assert OTHER_RUN in eng.state.block_reason
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.owned_pr_url, s.counted_merged_prs) == (Phase.BLOCKED, PR, [])
+
+
+def test_the_refusal_says_the_outcome_is_unknown_for_a_state_github_does_not_use(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R7-F1 with #376's rule: only OPEN and CLOSED say the PR has not merged, so a
+    state GitHub does not use leaves the write's outcome unknown, refused or not."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+
+    def strange(gh):
+        gh.prs[PR].state = "QUEUED"
+        _owned_by(gh, OTHER_RUN)
+
+    _merge_meets(fake_github, after=strange)
+    fake_github.merge_leaves_open = True
+    out = eng.step(allow_merge=True)
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert "none of OPEN, CLOSED or MERGED, so whether it merged is unknown" in reason
+    assert not _says_nothing_was_merged(reason), reason
+    assert "has not merged" not in reason
+
+
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_the_owner_the_read_after_the_write_finds_is_written_alone_before_anything_else(
+    tmp_state_dir, fake_github, monkeypatch, remove, found
+):
+    """PR #459 R7-F1 keeps R4-F2's write: the owner reaches the state file at the read, with
+    nothing else, so a process killed right after it keeps it and stays in MERGE. A restarted
+    run blocks at the gate once the owner is removed, and sends no second merge."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    seen: list[str] = []
+
+    def taken(gh):
+        seen.append(eng.paths.state_file.read_text(encoding="utf-8"))
+        gh.set_head(SHA_B)
+        _owned_by(gh, OTHER_RUN)
+
+    def killed(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    _merge_meets(fake_github, before=taken)
+    monkeypatch.setattr(eng, "_disarm_async_merge", killed)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step(allow_merge=True)
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.owned_pr_url) == (Phase.MERGE, PR)
+    assert _changed_on_disk(seen[0], eng) <= {"owned_pr_url", "updated_at"}
+
+    remove(fake_github)
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    eng2.config.safety.allow_merge = True
+    _assert_owner_removed(eng2, eng2.step(allow_merge=True), found)
+    assert len(fake_github.merges) == 1 and eng2.provider.calls == []
+
+
+def test_an_answer_naming_another_pr_after_the_write_is_a_read_that_failed(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R7-F1: the owner is judged on an answer known to be the run's PR (R5-F1's
+    rule), and an answer naming another PR says nothing of this one. Taken at its word, it
+    could be counted as this PR's merge, so it leaves the outcome unknown like a read that
+    failed: its marker records and refuses nothing, the run stays in MERGE, and the re-check
+    recovers the merge once with the answer corrected."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    _add_same_head_pr_against_another_base(fake_github)
+    other = fake_github.prs[PR_B]
+    other.state = "MERGED"
+    other.base_ref = "main"
+    _owned_by(fake_github, OTHER_RUN, url=PR_B)
+
+    def answers_another(gh):
+        gh.get_pr = lambda url: replace(other)
+
+    _merge_meets(fake_github, after=answers_another)
+    with pytest.raises(VerificationError, match=f"GitHub answered with PR {PR_B}.*outcome unknown"):
+        eng.step(allow_merge=True)
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.attempt, s.owned_pr_url) == (Phase.MERGE, 1, "")
+    assert s.counted_merged_prs == [] and len(fake_github.merges) == 1
+
+    del fake_github.get_pr
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC" and "recovered" in out.message, out.message
+    assert len(fake_github.merges) == 1 and eng.state.counted_merged_prs == [PR]
+
+
+def test_an_answer_naming_another_pr_at_the_bound_says_the_outcome_is_unknown(
+    tmp_state_dir, fake_github
+):
+    """The same at ``merge.max_verification_attempts``: BLOCKED, and never "nothing was
+    merged", since the write was sent and nothing said what became of it."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    eng.config.merge.max_verification_attempts = 1
+    _add_same_head_pr_against_another_base(fake_github)
+    other = fake_github.prs[PR_B]
+
+    def answers_another(gh):
+        gh.get_pr = lambda url: replace(other)
+
+    _merge_meets(fake_github, after=answers_another)
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.MERGE_INCONCLUSIVE
+    reason = eng.state.block_reason
+    assert "whether GitHub merged the PR is still unknown" in reason
+    assert not _says_nothing_was_merged(reason), reason
+
+
+def test_a_merged_pr_handed_back_is_reconciled_and_counted_once(tmp_state_dir, fake_github):
+    """PR #459 R7-F1 refuses only until the operator acts: the marker the refusal prints,
+    written into the body of the PR that merged, lets a plain 'unblock' send the uncounted
+    merge to be reconciled, which counts it once and sends no second merge."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    _merge_meets(fake_github, after=lambda gh: _owned_by(gh, OTHER_RUN))
+    assert eng.step(allow_merge=True).next_phase == "BLOCKED"
+    assert render_implementation_marker(ISSUE, eng.state.run_id) in eng.state.block_reason
+    assert not eng.unblock("not yet handed back").unblocked
+    assert eng.state.counted_merged_prs == []
+
+    _owned_by(fake_github, eng.state.run_id)
+    _reconciled_after_unblock(eng, fake_github)
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+
+
+def test_a_moved_pr_handed_back_goes_to_review_of_its_new_head(tmp_state_dir, fake_github):
+    """PR #459 R7-F1: the refusal left the review's record as it was, so a PR handed back
+    after it moved is judged by 'unblock' from live GitHub: REVIEW, on the new HEAD."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    _merge_meets(fake_github, before=lambda gh: (gh.set_head(SHA_B), _owned_by(gh, OTHER_RUN)))
+    assert eng.step(allow_merge=True).next_phase == "BLOCKED"
+
+    _owned_by(fake_github, eng.state.run_id)
+    out = eng.unblock("the other run let go of it")
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    assert eng.state.current_head_sha == SHA_B
+    assert len(fake_github.merges) == 1 and eng.state.counted_merged_prs == []
 
 
 def test_ready_for_merge_requires_clean_review_in_state(tmp_state_dir, fake_github):

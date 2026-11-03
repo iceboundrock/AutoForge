@@ -58,7 +58,11 @@ once it is reopened, and so does an `ANALYZE_EXECUTE` entry whose own
 PR, closed or open, another run owns, before it reads anything else or
 launches the agent. A merge gate that GitHub refuses the PR's checks, or
 that the step budget stops, records the owner its read of the PR finds,
-and a PR another run owns stops it on that owner (`pr-owner`). From then
+and a PR another run owns stops it on that owner (`pr-owner`). The read
+right after `gh pr merge` does the same: a PR it finds another run owns
+stops the run rather than going back to `REVIEW` or being counted, and the
+reason says what GitHub reports of that merge, which it may report as made.
+From then
 on a marker that names no run, a missing marker and a PR body that reads empty
 block it (`pr-owner`), because the owner was removed and which run owns
 the PR is not knowable. A run that crashed after opening its PR or a replan
