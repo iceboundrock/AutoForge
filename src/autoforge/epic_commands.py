@@ -1610,6 +1610,13 @@ class RecheckReport:
                 "the new revision, its review history kept and nothing merged",
                 f"continue with: {self.resume} (it admits the issue and reviews the new head)",
             ]
+        elif self.phase in (Phase.BLOCKED, Phase.FAILED):
+            # Only a moved PR is stepped; the CLI prints the reason and the
+            # typed stop after this line and exits 1 (R2-F1).
+            out = [
+                f"issue #{n}: {pr} moved since its clean review, but the step left the run "
+                f"{self.phase.value}, not back in REVIEW; nothing was merged"
+            ]
         else:
             out = [
                 f"issue #{n}: the run is now {self.phase.value}; 'epic status' names its next step"
@@ -1677,8 +1684,10 @@ def recheck_issue(
        state as it was; one that moved takes READY_FOR_MERGE -> REVIEW, the
        review stale and its findings carried, nothing merged, which makes
        the namespace ``resumable`` for the next ``epic resume`` to admit and
-       review. A read that fails, or an answer that establishes no
-       revision, raises with the state unchanged.
+       review. That step is held to the run's bounds like any other: one the
+       exhausted step budget blocks leaves the run BLOCKED (``phase``), and
+       the CLI exits 1 with its typed stop. A read that fails, or an answer
+       that establishes no revision, raises with the state unchanged.
 
     No agent runs and nothing is written to GitHub, to a claim or to
     ``scheduler.json``: the run, its review rounds and loop bounds, its

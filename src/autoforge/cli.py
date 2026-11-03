@@ -46,6 +46,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import io
 import json
 import os
@@ -1529,13 +1530,20 @@ def _finish(
         )
         return 0
     if state.phase in (Phase.BLOCKED, Phase.FAILED):
-        # The whole line is state-derived (`run_id` is a validated path
-        # component, not a checked-for-secrets value), so the line crosses
-        # the redaction boundary assembled, not field by field.
-        print(redact(f"\nrun {state.run_id} is {state.phase.value}: {state.block_reason or '-'}"))
-        print(redact(_final_stop(engine, outcomes).line()))
+        _print_stopped_run(engine, _final_stop(engine, outcomes))
         return 1
     return 0
+
+
+def _print_stopped_run(engine: ControllerEngine, stop: StopClassification) -> None:
+    """The end of a command that left the run BLOCKED or FAILED: its reason, then its stop."""
+    state = engine.state
+    assert state is not None
+    # The whole line is state-derived (`run_id` is a validated path
+    # component, not a checked-for-secrets value), so the line crosses
+    # the redaction boundary assembled, not field by field.
+    print(redact(f"\nrun {state.run_id} is {state.phase.value}: {state.block_reason or '-'}"))
+    print(redact(stop.line()))
 
 
 def _final_stop(engine: ControllerEngine, outcomes: list[StepOutcome]) -> StopClassification:
@@ -2246,7 +2254,10 @@ def cmd_epic_recheck(args) -> int:
     """``epic recheck``: one issue held at READY_FOR_MERGE read against its PR (#447).
 
     Exit 0 whether the PR moved (the run is back in REVIEW, and the command
-    to continue is printed) or not (nothing changed); 2 for a refusal (L0 or
+    to continue is printed) or not (nothing changed); 1 when the step for a
+    PR that moved left the run BLOCKED or FAILED instead (the run's step
+    budget spent, say), with the run's reason and its typed stop line, as
+    ``step`` and ``resume`` end such a run (R2-F1); 2 for a refusal (L0 or
     the issue's run lock held, a namespace that is not one settled at
     READY_FOR_MERGE, or of another EPIC or repository); 1 for a GitHub read
     that failed or did not establish the PR's revision, the state unchanged.
@@ -2257,6 +2268,7 @@ def cmd_epic_recheck(args) -> int:
     epic_url = parse_issue_url(args.epic).canonical
     repository = os.getcwd()
     resume = epic_command_line(flags, "epic", "resume", epic_url)
+    built: list[ControllerEngine] = []
 
     def engine_for(namespace) -> ControllerEngine:
         # As a worker's engine (worker._engine): the namespace's state, its
@@ -2266,6 +2278,7 @@ def cmd_epic_recheck(args) -> int:
         engine.cli_global_flags = (*flags, "--state-dir", str(namespace.state_dir))
         engine.continue_command = (*flags, "epic", "resume", epic_url)
         engine.config_file = absolute_spelling(args.config) if args.config else ""
+        built.append(engine)
         return engine
 
     lock_path = repository_lock_path(repository)
@@ -2282,6 +2295,17 @@ def cmd_epic_recheck(args) -> int:
         )
     for line in report.lines():
         print(line)
+    if report.phase in (Phase.BLOCKED, Phase.FAILED):
+        # Only the step for a moved PR leaves READY_FOR_MERGE, so an engine
+        # was built and its state is the one the report read. The run is a
+        # namespace's: its stop gives the scheduler's routes ('epic resume',
+        # never a standalone 'resume' or 'run --force'), as 'epic status'.
+        engine = built[-1]
+        stop = dataclasses.replace(
+            _final_stop(engine, list(report.outcomes)), scheduler=_scheduler_view(engine)
+        )
+        _print_stopped_run(engine, stop)
+        return 1
     return 0
 
 

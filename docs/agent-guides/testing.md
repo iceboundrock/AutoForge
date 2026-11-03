@@ -1688,9 +1688,12 @@ the in-memory GitHub and scripted agents. It must keep covering:
   settled at `READY_FOR_MERGE` are refused before an engine is built or
   the PR is read, a state the engine loads in another phase is refused
   before any read, a PR merged by hand is reported as merged, and an
-  answer with an unknown state exits 1 with the state unchanged; `epic
-  status` names `epic recheck` and `epic resume` as a `ready-for-merge`
-  issue's next steps;
+  answer with an unknown state exits 1 with the state unchanged; a moved
+  PR whose step the spent step budget (`workflow.max_total_steps`) blocks
+  persists `BLOCKED` and exits 1 with the run's reason and a `stop:` line
+  of the scheduler's routes, never exit 0, while an unmoved PR of that run
+  still holds with exit 0; `epic status` names `epic recheck` and `epic
+  resume` as a `ready-for-merge` issue's next steps;
 - GitHub changing between ticks: a blocker closed and another reopened, a
   child completed or given a dependency between snapshot and claim, a
   child removed or re-parented, the EPIC closed, a human push to an active

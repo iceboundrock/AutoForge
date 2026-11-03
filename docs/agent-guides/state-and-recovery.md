@@ -1326,7 +1326,9 @@ code, is [Running an EPIC in parallel](../usage.md#running-an-epic-in-parallel).
   (`run(max_steps=1, recheck_held=True)`): an unmoved PR leaves every file
   as it was, a moved one takes `READY_FOR_MERGE -> REVIEW` in the same
   state (one atomic save, the run log's record), which reconciliation
-  then classifies `resumable`. It writes no claim and no `scheduler.json`.
+  then classifies `resumable`. That step is held to the run's step budget:
+  a spent one persists `BLOCKED` instead, and the command exits 1 with its
+  typed stop. It writes no claim and no `scheduler.json`.
 - **A recorded repository** (`scheduler.json` for `epic stop`, the binding
   for `epic archive` and `epic recheck`) is compared by its numeric id (D5.1), never by its
   `owner/name`: a rename (which a binding keeps for good) changes the name

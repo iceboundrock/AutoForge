@@ -39,6 +39,9 @@ so.
   runs and nothing is written to GitHub. `epic status` names it, with
   `epic resume`, as the next steps of a `ready-for-merge` issue. The
   scheduler and its workers still never read a settled issue themselves.
+  Its step for a moved PR is held to the run's step budget like any other:
+  one that leaves the run `BLOCKED` exits 1 and prints the run's reason and
+  its `stop:` line, as `step` and `resume` do, with the scheduler's routes.
 
 ### A body the controller writes back keeps text `gh` rewrites, and an operator's exact comment verifies (#328)
 

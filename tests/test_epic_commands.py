@@ -1337,6 +1337,53 @@ def test_a_push_to_an_issue_settled_at_ready_for_merge_is_rechecked_and_reviewed
         assert pickle.load(f).merges == []
 
 
+def test_a_recheck_whose_step_blocks_the_run_exits_1_with_its_typed_stop(epic):
+    """R2-F1: the step for a moved PR is held to the run's step budget, and a
+    recheck that leaves the run BLOCKED is no success.
+
+    With ``workflow.max_total_steps: 3`` the worker settles the issue at
+    READY_FOR_MERGE on its third step. An unmoved PR still holds (exit 0,
+    nothing written: the budget is never consulted for a hold). After a force
+    push, the recheck's step finds the budget spent and persists BLOCKED: the
+    command exits 1 and prints the run's reason and its typed stop, as
+    ``step`` and ``resume`` end a run they blocked, with the scheduler's
+    routes ('epic resume', never a standalone 'resume' or 'run --force').
+    Nothing is read past the PR, and nothing merged.
+    """
+    e = epic({"workflow": {"max_total_steps": 3}})
+    b = e.b
+    b.issue(2, world=str(world(b, 2)))
+    assert e.run()[0] == 0
+    held = b.state(2)
+    assert held.phase is Phase.READY_FOR_MERGE and held.step_count == 3
+    before = b.ns(2).state_file.read_bytes()
+    with _WorldEngines(b, 2):
+        code, out, _ = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 0 and "the run stays READY_FOR_MERGE and nothing was written" in out
+    assert b.ns(2).state_file.read_bytes() == before
+
+    _rebase_and_force_push(b, 2)
+    with _WorldEngines(b, 2) as engines:
+        code, out, err = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 1, out
+    blocked = b.state(2)
+    assert blocked.phase is Phase.BLOCKED and blocked.run_id == held.run_id
+    assert "workflow.max_total_steps=3 is reached" in blocked.block_reason
+    assert "but the step left the run BLOCKED, not back in REVIEW" in out
+    assert f"run {held.run_id} is BLOCKED: " in out and "max_total_steps=3" in out
+    stop = next(line for line in out.splitlines() if line.startswith("stop: "))
+    assert stop.startswith(
+        "stop: blocked (reason step-budget, from controller: the controller entered "
+        "BLOCKED from READY_FOR_MERGE); next: "
+    )
+    assert "'epic resume', or 'epic archive' to release the issue" in stop
+    assert "run --force" not in stop
+    assert "continue with:" not in out and err == ""
+    assert [call[0] for call in engines.calls] == ["get_pr"]
+    with open(world(b, 2), "rb") as f:
+        assert pickle.load(f).merges == []
+
+
 def test_recheck_refuses_an_issue_it_does_not_hold_at_ready_for_merge(epic):
     """No namespace, one bound under another EPIC, and an open claim are refused
     (exit 2) before any engine is built or GitHub is read."""

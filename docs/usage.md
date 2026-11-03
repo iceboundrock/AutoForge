@@ -1060,8 +1060,13 @@ is the namespace's counterpart of what a standalone `resume` does at
   the output says which). One that moved goes back to `REVIEW` of
   the new revision in the same run, the review marked stale and its findings
   carried, nothing merged (exit 0, and the command prints the `epic resume`
-  to run). A read that fails, or an answer that does not establish the
-  PR's revision, exits 1 with the state unchanged.
+  to run). That step is held to the run's bounds like any other: when the
+  run's step budget (`workflow.max_total_steps`) is already spent, it
+  enters `BLOCKED` instead and the command exits 1, printing the run's
+  reason and its `stop:` line as `step` and `resume` do, with the
+  scheduler's routes (`epic status` names the `unblock` to run, then
+  `epic resume`). A read that fails, or an answer that does not establish
+  the PR's revision, exits 1 with the state unchanged.
 - No agent runs and nothing is written to GitHub, to the claim or to
   `scheduler.json`. The run keeps its id, review rounds, loop bounds,
   validation records and claim history; unlike `epic archive`, nothing is
