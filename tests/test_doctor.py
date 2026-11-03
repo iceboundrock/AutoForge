@@ -256,7 +256,7 @@ def test_the_controller_row_names_the_imported_package_and_reads_no_state(tmp_pa
 
     sd = tmp_path / ".autoforge"
     sd.mkdir()
-    (sd / "state.json").write_text('{"protocol_version": "14"}', encoding="utf-8")
+    (sd / "state.json").write_text('{"protocol_version": "15"}', encoding="utf-8")
     before = (sd / "state.json").read_bytes(), (sd / "state.json").stat().st_mtime_ns
     d = Doctor(cwd=str(tmp_path), state_dir=str(sd), runner=_runner_factory())
     results = d.run_all()
@@ -264,9 +264,9 @@ def test_the_controller_row_names_the_imported_package_and_reads_no_state(tmp_pa
     row = results[0]
     assert row.ok and not row.required and not row.skipped
     assert row.detail == (
-        f"autoforge {autoforge.__version__} (protocol 13) imported from "
+        f"autoforge {autoforge.__version__} (protocol 14) imported from "
         f"{os.path.abspath(autoforge.__file__)}, python {sys.executable}; "
-        "reads state protocols 1-5 and 7-13"
+        "reads state protocols 1-5 and 7-14"
     )
     assert ((sd / "state.json").read_bytes(), (sd / "state.json").stat().st_mtime_ns) == before
 

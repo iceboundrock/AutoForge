@@ -57,6 +57,7 @@ from autoforge.result_parser import (
     parse_control_result,
 )
 from autoforge.state import load_state
+from autoforge.stop_classification import StopReasonCode
 from autoforge.transitions import Phase, edges_for
 from tests.conftest import (
     BRANCH,
@@ -620,6 +621,9 @@ def test_hard_threshold_replaces_pr_and_starts_fresh_review(tmp_state_dir, sandb
     creates = [w for w in gh.effect_writes if w[0] == "create_pull_request"]
     assert len(creates) == 1 and creates[0][2] == replacement.body
     assert state.current_pr_url == REPLACEMENT_PR
+    # K7 published the marker naming this run: the replacement is bound as
+    # owned, so a removal of its owner refuses it (#414, PR #459 R1-F1).
+    assert state.owned_pr_url == REPLACEMENT_PR
     assert state.current_branch == branch
     assert state.current_head_sha == head
     assert gh.merges == []  # a replan closes; it never merges anything
@@ -5901,6 +5905,7 @@ def _protocol_1_state_file(
         data.pop(key, None)
     data.pop("operator_comment_outcomes", None)  # protocol 11's own field (#243)
     data.pop("sandbox_pin", None)  # protocol 12's own field (#280)
+    data.pop("owned_pr_url", None)  # protocol 14's own field (#414)
     data["phase"] = Phase.REPLAN_REEXECUTE.value
     data["current_issue_url"] = ISSUE
     data["current_pr_url"] = PR
@@ -6129,12 +6134,12 @@ def test_a_protocol_4_journal_before_the_write_loads_and_relabels(tmp_state_dir,
     eng.save()
     _protocol_1_state_file(eng, _protocol_4_journal(stage), protocol="4")
     loaded = eng.load()
-    assert loaded.protocol_version == "13"
+    assert loaded.protocol_version == "14"
     txn = _txn(eng)
     assert txn.stage is stage and not txn.journal_defects
     assert txn.source_closed_event_count == 0 and txn.close_attempts == 0
     eng.save()
-    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "13"
+    assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "14"
     if stage is ReplanStage.VERIFIED:
         # The write proceeds from the relabelled journal and records the
         # watermark the protocol-4 controller never did.
@@ -6177,7 +6182,7 @@ def test_the_legacy_journal_refusal_knows_only_the_legacy_protocols():
 
     assert LEGACY_JOURNAL_PROTOCOLS == frozenset({"1", "2", "3", "4"})
     journal = _seed_dict(ReplanStage.PREPARED)
-    for protocol in ("5", "7", "8", "9", "10", "11", "12", "13", "0", ""):
+    for protocol in ("5", "7", "8", "9", "10", "11", "12", "13", "14", "0", ""):
         with pytest.raises(ValueError, match="not a legacy journal protocol"):
             legacy_journal_refusal(journal, protocol=protocol, written_by="0.1.0")
     for protocol in ("1", "2", "3"):
@@ -6208,10 +6213,10 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
         data["phase"] = "REVIEW" if not journal else "BLOCKED"
         eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
         loaded = eng.load()
-        assert loaded.protocol_version == "13"
+        assert loaded.protocol_version == "14"
         assert loaded.replan_transaction == journal
         eng.save()
-        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "13"
+        assert json.loads(eng.paths.state_file.read_text())["protocol_version"] == "14"
     # A legacy file that predates the journal field altogether is the same
     # case: no replan in flight.
     data = json.loads(eng.paths.state_file.read_text())
@@ -6219,7 +6224,7 @@ def test_r7f1_a_legacy_state_without_a_replan_in_flight_loads_as_current(tmp_sta
     del data["replan_transaction"], data["acceptance_outcomes"], data["config_fingerprint"]
     for key in _VALIDATION_FIELDS:
         del data[key]
-    del data["operator_comment_outcomes"], data["sandbox_pin"]
+    del data["operator_comment_outcomes"], data["sandbox_pin"], data["owned_pr_url"]
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
     assert eng.load().replan_transaction == {}
 
@@ -6261,11 +6266,12 @@ def test_r7f1_the_version_label_decides_not_the_journal_shape(tmp_state_dir):
     # this controller wrote the journal, so a missing field is a missing
     # field, whichever protocol step introduced it.
     data = json.loads(eng.paths.state_file.read_text())
-    data["protocol_version"] = "13"
+    data["protocol_version"] = "14"
     data["acceptance_outcomes"] = []
     data["config_fingerprint"] = {}
     data["operator_comment_outcomes"] = []
     data["sandbox_pin"] = {}
+    data["owned_pr_url"] = ""
     data.update(
         validation_records=[],
         validation_attempt={},
@@ -6376,7 +6382,7 @@ def test_f4_activation_counts_the_replan_budget_once_per_transaction(tmp_state_d
     assert [item["transaction_id"] for item in eng.state.superseded_prs] == [TXN_ID]
 
     eng.state.phase = Phase.REPLAN_REEXECUTE
-    assert eng._activate_replacement(txn).next_phase == "REVIEW"
+    assert eng._activate_replacement(txn, gh.get_pr(REPLACEMENT_PR)).next_phase == "REVIEW"
     assert eng.state.execution_attempt == 2 and eng.state.escalation_count == 1
     assert [item["transaction_id"] for item in eng.state.superseded_prs] == [TXN_ID]
     assert eng.state.current_pr_url == REPLACEMENT_PR and eng.state.review_round == 0
@@ -7457,6 +7463,90 @@ def test_a_crash_after_the_plan_is_saved_publishes_on_resume_without_the_agent(t
     assert eng2.provider.calls == []
     _assert_replacement_active(eng, gh, txn_id)
     assert len(_creates(gh)) == 1
+
+
+# -- the source's owner, before each launch and each write (#414, PR #459 R1-F2) -----
+# The run the operator hands the source PR to.
+OTHER_RUN = "af-20261103T000000Z-0a1b2c"
+
+
+def _hand_the_source_over(gh) -> None:
+    """The operator writes another run into the source PR's implementation marker."""
+    gh.prs[PR].body = f"Started by hand.\n\n{render_implementation_marker(ISSUE, OTHER_RUN)}"
+
+
+def _assert_rejected_for_the_owner(eng, out, sent: str) -> str:
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.REPLAN_REFUSED
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    reason = eng.state.block_reason
+    assert f"the implementation marker of PR {PR} names run {OTHER_RUN} as its owner" in reason
+    assert sent in reason
+    s = load_state(eng.paths.state_file)
+    assert s.current_pr_url == PR and s.superseded_prs == []  # the source stays bound
+    return reason
+
+
+def test_a_takeover_before_a_prepared_relaunch_rejects_and_launches_nothing(tmp_state_dir):
+    """PREPARED checked the source's owner, and the process stopped before
+    the agent ran. The operator hands the source to another run meanwhile:
+    the resume reads it again before it launches the agent and rejects, with
+    nothing launched, pushed or created."""
+    gh = FakeGitHub()
+    eng = make_engine(tmp_state_dir, ["crashed here"], github=gh, origin=True)
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    _seed(eng, ReplanStage.PREPARED)
+    eng2 = _restart(eng, gh)
+    _hand_the_source_over(gh)
+    out = eng2.step()
+    _assert_rejected_for_the_owner(eng2, out, "nothing was launched")
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert eng2.origin.head(_derived_branch(TXN_ID)) is None and _creates(gh) == []
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+
+
+def test_a_takeover_before_a_saved_plan_is_replayed_rejects_and_sends_nothing(tmp_state_dir):
+    """The push and PR plan was saved and nothing sent when the process
+    died. The source is handed to another run before the resume: the plan
+    is not replayed, and the agent is not launched again."""
+    gh = FakeGitHub()
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh))
+    eng._persist_effect = _power_loss_on_first_call(eng._persist_effect)
+    with pytest.raises(RuntimeError, match="power loss"):
+        eng.step()
+    assert _plan_stages(eng) == [("push", "intended"), ("replacement_pr", "intended")]
+    txn_id = _persisted_txn_id(eng)
+    _hand_the_source_over(gh)
+    eng2 = _restart(eng, gh, save=False)
+    out = eng2.step()
+    reason = _assert_rejected_for_the_owner(eng2, out, "was not sent")
+    assert "is on GitHub" not in reason
+    assert eng2.provider.calls == []
+    assert eng.origin.head(_derived_branch(txn_id)) is None and _creates(gh) == []
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+
+
+def test_a_takeover_between_the_push_and_the_replacement_pr_creates_no_pr(tmp_state_dir):
+    """The source is handed to another run right after the controller's
+    push landed: the read before the replacement PR finds the new owner, so
+    no replacement is created and the source is neither closed nor
+    superseded; the reason says the push is on GitHub."""
+    gh = FakeGitHub()
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh))
+    persist = eng._persist_effect
+
+    def hands_over_after_the_push(record):
+        persist(record)
+        if record.kind.value == "push" and record.stage.value == "observed":
+            _hand_the_source_over(gh)
+
+    eng._persist_effect = hands_over_after_the_push
+    out = eng.step()
+    reason = _assert_rejected_for_the_owner(eng, out, "was not sent; ")
+    assert "is on GitHub" in reason
+    assert len([c for c in eng.provider.calls if c.phase == "REPLAN_REEXECUTE"]) == 1
+    assert eng.origin.head(_derived_branch(_persisted_txn_id(eng))) is not None
+    assert _creates(gh) == [] and gh.prs[PR].state == "OPEN" and gh.closed_prs == []
 
 
 def test_a_create_lost_in_flight_is_reconciled_and_issued_once_more_on_resume(tmp_state_dir):

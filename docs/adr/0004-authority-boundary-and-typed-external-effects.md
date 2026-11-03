@@ -24,12 +24,15 @@
 - **Amended by #414:** D9.4a. The `ai-implementation` marker names the run
   that owns the PR (`owner_run_id`, metadata outside the claim's key), K2,
   K3 and K7 write it, and a run drives only the PR its own state bound
-  while the marker names it or no run. A marked PR a state has no record
-  of is never recovered at `ANALYZE_EXECUTE`'s entry; every read of the
-  bound PR before a launch or a send refuses one another run owns; and a
-  takeover is the operator's edit of the marker, confirmed by `unblock
-  --take-over`. No effect kind, state field or protocol number is added.
-  Coordinated with ADR 0008 D17.2 and D17.4, and with ADR 0012 D3.
+  while the marker names it, or names no run on a binding its state does
+  not record as owned (`owned_pr_url`). A marked PR a state has no record
+  of is never recovered at `ANALYZE_EXECUTE`'s entry, on a legacy re-entry
+  too; every read of the bound PR before a launch or a send refuses one
+  another run owns, or whose known owner was removed, and `FIX` and the
+  replan read it again before each later send; and a takeover is the
+  operator's edit of the marker, confirmed by `unblock --take-over`. No
+  effect kind is added; the state gains `owned_pr_url`, so the protocol is
+  14. Coordinated with ADR 0008 D17.2 and D17.4, and with ADR 0012 D3.
 - **Note:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) removed LOCAL mode (#388): §2.1's LOCAL
   prompts and K10's LOCAL refusal no longer apply, and §2.13's refusal of a
   LOCAL state carrying effect state is replaced by ADR 0009 D4's refusal of
@@ -2220,17 +2223,21 @@ its author. Only the effect records and the entry observation prove origin.
   - **Authority stays with the state (D9.3).** The shared login can write
     any owner, so the field can only make a run refuse. A run drives a PR
     only when its own state bound it, and the marker it re-reads names
-    this run, names no run (legacy), or is absent. The state binds it
-    through K2, K3 or K7's completion, the pre-#414 recovery, or a
-    takeover.
+    this run, or names no run or is absent on a legacy binding (see *The
+    owned PR*). The state binds it through K2, K3 or K7's completion, the
+    recovery of its own persisted PR, or a takeover.
   - **The fresh entry.** An open marked PR that the state did not persist
     is never recovered, whatever run its marker names, this one included.
     The entry blocks before any launch (`pr-owner`). The reason names the
     PR, its owner (or that it names none), the marker that would name this
     run, and `unblock --take-over`. The state's own persisted PR is
     recovered as before, unless its marker now names another run. The
-    one-shot legacy re-entry of D13.4 still recovers an ownerless marked
-    PR, since its own agent copied that marker from the prompt.
+    one-shot legacy re-entry of D13.4 is no exception (PR #459 R1-F3). Its
+    launch label proves an agent of the previous contract was launched,
+    not that it opened the PR found. Every PR opened before #414 carries
+    the same ownerless marker, another controller's included. So it
+    blocks as a fresh entry does, and the operator, who can tell, takes
+    the PR over.
   - **Fencing at every boundary.** The owner is checked on the body of
     every read of the bound PR before a launch or a send. These are:
     - `REVIEW`'s binding;
@@ -2239,9 +2246,16 @@ its author. Only the effect records and the entry observation prove origin.
       between must not get its comment posted);
     - `FIX`'s entry and its plan's reads before the first send and before
       the push;
+    - a read of the owner alone before each later record the `FIX` plan
+      sends (a follow-up issue, a marker append, an acceptance comment):
+      each send before it took a round trip or more (PR #459 R1-F4);
     - the merge gate's checks read, before a `MERGED` PR is reconciled or
       counted;
     - the replan checkpoint and the read before the source is closed;
+    - a read of the source before a transaction `PREPARED` on an earlier
+      entry launches its agent again, and before each record of its saved
+      push and PR plan is driven, on the step that saved it and on every
+      resume (PR #459 R1-F2);
     - `unblock` with a PR bound.
 
     Another run's owner, or a defect, blocks (`pr-owner`) with nothing
@@ -2280,15 +2294,41 @@ its author. Only the effect records and the entry observation prove origin.
     names this run, so a run still bound to that PR (legacy, or a removed
     marker) is displaced at its next boundary rather than left driving
     beside it.
-  - **Legacy PRs.** A run bound to a PR with a legacy marker keeps driving
-    it, and a fresh run refuses it. Two runs already bound to one legacy
-    PR, as #387 left them, are separated by writing the one to keep into
-    the marker.
-  - **No protocol change.** No state field is added and no record schema
-    changes. A K2, K3 or K7 record saved before #414 holds the ownerless
-    marker; it loads and completes, and publishes a legacy PR. One saved
-    now holds the owner, which an older controller's loader refuses as a
-    malformed record rather than as a newer protocol.
+  - **The owned PR (PR #459 R1-F1).** A marker naming no run, and no
+    marker at all, look the same whether the PR was opened before #414 or
+    someone removed its owner since. A body GitHub does not return reads
+    as empty, which is no marker too. The PR cannot tell these apart, so
+    the run's own record does. `owned_pr_url` is the canonical URL of the
+    bound PR when its marker is known to have named an owner, and `""`
+    otherwise. The state sets it at each of these points:
+    - K2 or K3's read back of a marker naming the record's run;
+    - K7's activation of a replacement whose marker names this run;
+    - a takeover;
+    - any read of the bound PR whose marker names a run, this one or
+      another.
+
+    It is cleared only when another PR is bound. While it names the bound
+    PR, a marker naming no run, no marker and an empty body refuse
+    (`pr-owner`): the owner was removed, so which run owns the PR is not
+    knowable. The reason gives the way back: write the run that is to
+    drive it into the marker, then `unblock`. A displaced run has recorded
+    the owner on the read that refused it, so removing the new owner later
+    does not hand the PR back to it either.
+  - **Legacy PRs.** A run whose record does not name its PR as owned (a
+    binding made by protocol 13 or older, or one whose marker never named
+    a run) keeps driving it under a legacy marker or none, and a fresh run
+    refuses it. Its first read finding a marker that names a run ends
+    that. Two runs already bound to one legacy PR, as #387 left them, are
+    separated by writing the one to keep into the marker.
+  - **Protocol 14 (PR #459 R1-F1).** `owned_pr_url` is a new state field,
+    so the state protocol is 14. A protocol-13 file loads with `""`,
+    which is a legacy binding, and the load writes nothing. The next save
+    writes 14. An older label carrying the field is refused, as is a
+    protocol-14 file without it. No record schema changes. A K2, K3 or
+    K7 record saved before #414 holds the ownerless marker; it loads,
+    completes, publishes a legacy PR and binds it as legacy. One saved now
+    holds the owner, which an older controller's loader refuses as a
+    malformed record. The protocol number refuses its state first.
 
   *Rejected.*
   - **A controller-written takeover (a new effect kind).** ADR 0012 D3
@@ -2308,6 +2348,10 @@ its author. Only the effect records and the entry observation prove origin.
     nothing.
   - **Adopting a marker that names this run.** Anyone with the login can
     write it.
+  - **Refusing every bound PR whose marker names no run** (PR #459 R1-F1).
+    That would stop every run bound before #414, whose PRs all carry the
+    legacy marker, until an operator edits each one. The run's own record
+    tells the two cases apart at no cost to them.
 
   *Residual.* GitHub offers no conditional body update and no
   compare-and-swap between the owner read and the next write. A takeover

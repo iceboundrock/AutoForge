@@ -2025,6 +2025,8 @@ def test_recovery_binds_the_persisted_pr_while_its_marker_names_this_run_or_none
     out = eng.step()
     assert out.next_phase == "REVIEW" and "recovered" in out.message
     assert eng.provider.calls == []
+    owned = load_state(eng.paths.state_file).owned_pr_url
+    assert owned == (PR if owner == "self" else ""), "a marker naming a run makes it owned"
 
 
 def test_recovery_of_the_persisted_pr_blocks_once_its_marker_names_another_run(
@@ -2112,17 +2114,26 @@ def test_a_displaced_run_blocks_at_its_next_entry_and_launches_nothing(
     assert load_state(eng.paths.state_file).current_pr_url == PR
 
 
-@pytest.mark.parametrize("owner", [pytest.param(None, id="ownerless"), "self"])
+@pytest.mark.parametrize(
+    "owner", [pytest.param(None, id="ownerless"), "self", pytest.param("", id="no-marker")]
+)
 def test_a_bound_run_drives_its_pr_while_the_marker_names_it_or_none(
     tmp_state_dir, fake_github, owner
 ):
-    """A PR opened before #414 carries the ownerless marker, and the run
-    bound to it keeps driving it; so does the run its marker names."""
+    """A PR opened before #414 carries the ownerless marker (or, edited by
+    hand, none), and a run whose record does not name it as owned (a legacy
+    binding: protocol 13 bound it) keeps driving it; so does the run its
+    marker names, whose read records the PR as owned from then on (PR #459
+    R1-F1)."""
     eng = _in_ready(tmp_state_dir, fake_github)
     fake_github.add_pr(head_sha=SHA_A)
-    _owned_by(fake_github, eng.state.run_id if owner == "self" else None)
+    if owner == "":
+        fake_github.prs[PR].body = "Started by hand."
+    else:
+        _owned_by(fake_github, eng.state.run_id if owner == "self" else None)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "MERGE", out.message
+    assert load_state(eng.paths.state_file).owned_pr_url == (PR if owner == "self" else "")
 
 
 def test_a_marker_that_cannot_be_read_stops_the_bound_run(tmp_state_dir, fake_github):
@@ -2178,6 +2189,199 @@ def test_a_displaced_run_is_unblocked_only_once_the_marker_names_it_again(
     _owned_by(fake_github, eng.state.run_id)
     assert eng.unblock("the PR is handed back to this run").unblocked
     assert eng.state.phase == Phase.REVIEW and eng.state.current_pr_url == PR
+
+
+# -- an owner removed once it was known (PR #459 R1-F1) -------------------------------
+# What is left of the PR's marker once its owner is removed: the marker without
+# the owner, no marker at all, or a body that reads empty (GitHub returned none).
+_OWNER_REMOVALS = [
+    pytest.param(
+        lambda gh: _owned_by(gh, None),
+        "carries an implementation marker for issue #2 naming no run",
+        id="owner-removed",
+    ),
+    pytest.param(
+        lambda gh: setattr(gh.prs[PR], "body", "Started by hand."),
+        "carries no implementation marker for issue #2",
+        id="marker-removed",
+    ),
+    pytest.param(
+        lambda gh: setattr(gh.prs[PR], "body", ""),
+        "reads with an empty body, so no implementation marker for issue #2",
+        id="body-unreadable",
+    ),
+]
+
+
+def _taken_over(tmp_state_dir, gh: FakeGitHub):
+    """A run with no PR that 'unblock --take-over' bound to ``PR``, the operator's handover."""
+    gh.add_pr(head_sha=SHA_A, body=implementation_pr_body())
+    eng = make_engine(tmp_state_dir, ["never"], github=gh)
+    eng.state.phase = Phase.BLOCKED
+    eng.state.block_reason = "an open PR carries the implementation marker for issue #2"
+    eng._save()
+    gh.prs[PR].body = implementation_pr_body(owner_run_id=eng.state.run_id)
+    out = eng.unblock("the operator handed the PR to this run", take_over=PR)
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url) == (PR, PR)
+    return eng
+
+
+def _assert_owner_removed(eng, out, found: str) -> None:
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert (
+        f"PR {PR} {found}, but its marker named an owner when this run published, took over "
+        "or last read it (owned_pr_url): the owner was removed since, so which run owns the "
+        f"PR is not knowable and this run ({eng.state.run_id}) does not assume it still does"
+    ) in reason
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url) == (PR, PR)
+
+
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_run_that_took_the_pr_over_blocks_once_its_owner_is_removed(
+    tmp_state_dir, fake_github, remove, found
+):
+    """The operator handed the PR to this run (B) by writing it into the
+    marker; then someone removed the owner again. Before PR #459 R1-F1 B
+    read that as a PR opened before #414 and drove it, and so did the run
+    it was taken from (A): two runs on one PR. B's record says the marker
+    named an owner, so which run owns the PR is not knowable: B blocks with
+    nothing launched or sent, and 'unblock' refuses until the operator
+    names this run again."""
+    eng = _taken_over(tmp_state_dir, fake_github)
+    remove(fake_github)
+    out = eng.step()
+    _assert_owner_removed(eng, out, found)
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+    raw = eng.paths.state_file.read_text()
+    refused = eng.unblock("the owner is gone")
+    assert not refused.unblocked and "the owner was removed since" in refused.message
+    assert eng.paths.state_file.read_text() == raw
+    _owned_by(fake_github, eng.state.run_id)
+    assert eng.unblock("the PR is handed back to this run").unblocked
+    assert eng.state.phase == Phase.REVIEW
+
+
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_run_that_published_its_pr_blocks_once_its_owner_is_removed(
+    tmp_state_dir, fake_github, remove, found
+):
+    """K2 publishes the marker naming this run, and the read back binds the
+    PR as owned. A later read finding the owner removed is not a PR opened
+    before #414: the run blocks, launching no reviewer and posting nothing."""
+    eng = make_engine(tmp_state_dir, implement, github=fake_github, origin=True)
+    assert _analyzed(eng).next_phase == "REVIEW"
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    remove(fake_github)
+    out = eng.step()
+    _assert_owner_removed(eng, out, found)
+    assert len(eng.provider.calls) == 1
+    assert [w[0] for w in fake_github.effect_writes] == ["create_pull_request"]
+
+
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_displaced_run_stays_refused_once_the_new_owner_is_removed(
+    tmp_state_dir, fake_github, remove, found
+):
+    """A legacy binding (its record names no owned PR, as protocol 13 left
+    it) is displaced: its next read finds another run's marker, records the
+    PR as owned and blocks. Removing that owner afterwards does not hand the
+    PR back to it: 'unblock' still refuses, in a new process too."""
+    eng = _in_review(tmp_state_dir, fake_github, "never", origin=True)
+    assert eng.state.owned_pr_url == ""
+    _owned_by(fake_github, OTHER_RUN)
+    assert eng.step().next_phase == "BLOCKED"
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    remove(fake_github)
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    raw = eng2.paths.state_file.read_text()
+    refused = eng2.unblock("the other run let go of it")
+    assert not refused.unblocked
+    assert found in refused.message and "the owner was removed since" in refused.message
+    assert eng2.paths.state_file.read_text() == raw
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert fake_github.effect_writes == []
+
+
+def test_a_legacy_reentry_blocks_on_an_ownerless_pr_it_has_no_record_of(tmp_state_dir, fake_github):
+    """PR #459 R1-F3: a run upgraded while an agent of the previous contract
+    was publishing (protocol 5, attempt 1: D13.4) finds an open PR carrying
+    the issue's ownerless marker. Every PR opened before #414 carries that
+    marker, another controller's too, so the launch label does not make the
+    PR this run's: the entry blocks as a fresh one does, adopting nothing,
+    and the operator, who can tell, takes it over."""
+    eng = make_engine(tmp_state_dir, ["never"], github=fake_github)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng._save()
+    _as_protocol_5(eng, attempt=1)
+    fake_github.add_pr(head_sha=SHA_B, branch="feature/x", body=implementation_pr_body())
+    eng.load()
+    assert (eng.state.attempt, eng.state.launch_label) == (1, "agent_publishes")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert "which names no owner (it was opened before the owner was recorded)" in reason
+    assert f"but this run ({eng.state.run_id}) has no record of the PR" in reason
+    assert f"unblock --take-over {PR}" in reason
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url) == ("", "")
+    fake_github.prs[PR].body = implementation_pr_body(owner_run_id=eng.state.run_id)
+    done = eng.unblock("the operator checked the PR is this run's agent's", take_over=PR)
+    assert done.unblocked and done.phase == "REVIEW", done.message
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url) == (PR, PR)
+
+
+@pytest.mark.parametrize("first", [EffectKind.FOLLOW_UP_ISSUE, EffectKind.ACCEPTANCE_COMMENT])
+def test_fix_sends_nothing_more_once_the_pr_is_handed_to_another_run_mid_plan(tmp_state_dir, first):
+    """PR #459 R1-F4: the PR is read for its owner before each record of the
+    FIX plan after the first. The operator hands it to another run right
+    after the first write (a follow-up issue, or the acceptance comment the
+    plan sends first) landed: no later follow-up, append or push is sent,
+    and the run blocks naming the owner and what is on GitHub."""
+    gh = FakeGitHub()
+    if first is EffectKind.FOLLOW_UP_ISSUE:
+        gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F5"))
+        eng = _in_fix(
+            tmp_state_dir,
+            gh,
+            fixer(fixed("R1-F1"), new_follow_up("R1-F2"), deferred_to("R1-F3", ISSUE3)),
+            [_finding(1, 1), _finding(1, 2), _finding(1, 3)],
+            origin=True,
+        )
+        _bound_to_main(eng)
+        sent, kinds = "create_issue", ["follow_up_issue", "follow_up_append", "push"]
+    else:
+        eng = _accepting(
+            tmp_state_dir,
+            gh,
+            fixer(acceptance("R1-F1"), new_follow_up("R1-F2")),
+            policy="auto",
+            findings=[_finding(1), _finding(1, 2)],
+        )
+        sent, kinds = "create_issue_comment", ["acceptance_comment", "follow_up_issue", "push"]
+    reviewed = eng.state.reviewed_head_sha
+    _after_persisting(eng, first, Stage.OBSERVED, lambda record: _owned_by(gh, OTHER_RUN))
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert [w[0] for w in gh.effect_writes] == [sent]
+    assert eng.origin.head(BRANCH) == reviewed == gh.prs[PR].head_sha
+    s = load_state(eng.paths.state_file)
+    assert [(r["kind"], r["stage"]) for r in s.effect_records] == list(
+        zip(kinds, ["observed", "intended", "intended"], strict=True)
+    )
+    reason = s.block_reason
+    assert f"names run {OTHER_RUN} as its owner, not this run ({s.run_id})" in reason
+    assert "stays on GitHub, and it was not sent" in reason
+    assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
+    assert len(eng.provider.calls) == 1
 
 
 # -- REVIEW ---------------------------------------------------------------------------
@@ -10879,6 +11083,7 @@ def _as_protocol_5(eng, *, attempt: int) -> None:
         "validation_override_seq",
         "operator_comment_outcomes",
         "sandbox_pin",
+        "owned_pr_url",
     ):
         data.pop(key, None)
     eng.paths.state_file.write_text(json.dumps(data), encoding="utf-8")
@@ -10907,7 +11112,7 @@ def test_update_epic_legacy_reentry_adopts_the_agents_comment_and_asks_for_the_s
     assert "posted by an agent under the previous contract" in call.prompt
     assert _progress_posts(fake_github) == [] and len(fake_github.comments[EPIC]) == 1
     s = load_state(eng.paths.state_file)
-    assert s.current_issue_url == ISSUE3 and s.protocol_version == "13"
+    assert s.current_issue_url == ISSUE3 and s.protocol_version == "14"
     assert s.effect_records == []  # adopted with no record (D13.7)
 
 

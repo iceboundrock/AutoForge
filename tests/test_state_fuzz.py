@@ -154,6 +154,7 @@ def good_remote() -> dict:
         epic_url=EPIC,
         current_issue_url=ISSUE,
         current_pr_url=PR,
+        owned_pr_url=PR,
         current_branch="autoforge/2",
         phase=Phase.FIX,
         review_round=1,
@@ -282,6 +283,14 @@ def holds_every_remote_invariant(s: AutoForgeState) -> None:
         except ConfigurationError as exc:  # pragma: no cover - the assertion's message
             raise AssertionError(f"reviewed_pr_url does not parse: {exc}") from None
         assert reviewed.same_repository(s.repository)
+    # The owned PR the owner check compares by identity (#414): empty, or the
+    # canonical URL of a PR of the run's repository.
+    if s.owned_pr_url:
+        try:
+            owned = parse_pr_url(s.owned_pr_url)
+        except ConfigurationError as exc:  # pragma: no cover - the assertion's message
+            raise AssertionError(f"owned_pr_url does not parse: {exc}") from None
+        assert owned.canonical == s.owned_pr_url and owned.same_repository(s.repository)
     # A REMOTE run carries no LOCAL checkpoint and no LOCAL contract: protocol
     # 13 has no such field at all (#388, ADR 0009 D8).
     for name in (
@@ -402,10 +411,15 @@ WELL_FORMED_CHECKPOINTS = (
 
 
 _CHECKPOINT_REFUSALS = {
-    # Protocol 13 has no such field: each is unknown (ADR 0009 D8 step 4).
+    # Protocols 13 and 14 have no such field: each is unknown (ADR 0009 D8
+    # step 4).
+    "14": (
+        "state file has unknown field(s) 'local_pending_attempts', "
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '14'"
+    ),
     "13": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '13'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '14'"
     ),
     # An older label's LOCAL fields are dropped only when empty (D8 step 3).
     "12": (
@@ -427,7 +441,7 @@ def test_a_remote_state_carrying_a_well_formed_local_checkpoint_is_refused(
 
     The file is :func:`good_remote` in ``phase``, which loads under either
     label, with a checkpoint that is complete and consistent with that phase:
-    under protocol 13 its three fields are unknown, and under protocol 12
+    under protocols 13 and 14 its three fields are unknown, and under protocol 12
     they hold what only LOCAL code wrote (ADR 0009 D8, #388). The refusal
     names them; ``load_state``, an engine's ``load`` and ``existing_run``
     all refuse it, and none of them writes the file. The random mutations
@@ -438,6 +452,8 @@ def test_a_remote_state_carrying_a_well_formed_local_checkpoint_is_refused(
     tests/test_local.py::test_a_state_file_with_a_malformed_pending_checkpoint_is_refused
     """
     payload = dict(good_remote(), phase=phase.value, protocol_version=label)
+    if label in ("12", "13"):
+        del payload["owned_pr_url"]  # protocol 14's own field (#414)
     if phase is Phase.BLOCKED or phase is Phase.FAILED:
         payload["block_reason"] = "the run stopped on an unverified launch"
     state_dir = tmp_path / ".autoforge"

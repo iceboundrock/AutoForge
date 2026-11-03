@@ -19,8 +19,10 @@ A run recovers only the PR its own state recorded. A fresh run that finds
 the issue's marked PR blocks before it launches anything (stop code
 `pr-owner`), whatever run the marker names, and the reason names the owner.
 A run whose PR was handed to another run blocks at its next `REVIEW`, `FIX`
-or merge-gate entry, and `REVIEW` checks again right before it posts its
-round comment.
+or merge-gate entry. `REVIEW` checks again right before it posts its round
+comment, `FIX` before each follow-up issue, marker append and acceptance
+comment after its first, and a replan before it launches its agent again
+and before each push and replacement PR of its saved plan.
 
 To hand a PR to a new run: stop the run that owns it, replace the marker in
 the PR body with the one the refusal names, then run `autoforge unblock
@@ -31,7 +33,21 @@ another run owns" in `docs/usage.md`.
 
 PRs opened before this change carry the ownerless marker. The run bound to
 one keeps driving it. A fresh run blocks on it like on any other marked PR,
-and is handed it the same way. `state.json` is unchanged (protocol 13).
+and is handed it the same way. So does a run resumed from a launch made
+before the controller published PRs itself: an ownerless PR is not proof
+that its own agent opened it.
+
+A run records in `state.json` when its PR's marker has named an owner
+(`owned_pr_url`): it published the PR, took it over, or read a marker
+naming a run on it. From then on a marker that names no run, a missing
+marker and a PR body that reads empty block it (`pr-owner`), because the
+owner was removed and which run owns the PR is not knowable. Write the run
+that is to drive it into the marker, then `unblock`.
+
+`state.json` moves to protocol 14 for `owned_pr_url`. A protocol-13 file
+loads unchanged, with its PR treated as one opened before this change. Its
+next save writes protocol 14. An older controller refuses a protocol-14
+file as written by a newer AutoForge.
 
 ### A merge whose outcome is unknown is no longer reported as "nothing was merged" (#376)
 

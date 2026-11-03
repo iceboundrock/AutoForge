@@ -5975,6 +5975,9 @@ class ControllerEngine:
         state = self._require_state()
         url = parse_pr_url(pr.url).canonical
         state.current_pr_url = url
+        # The PR this state persisted, read just now: a marker naming this
+        # run makes the binding owned, as any read of the bound PR does.
+        self._note_pr_owner([self._marker_owner(pr)])
         state.current_head_sha = pr.head_sha
         state.current_base_ref = pr.base_ref
         state.current_merge_base_sha = ""  # bound at REVIEW entry
@@ -6005,24 +6008,21 @@ class ControllerEngine:
         marker names, this one included, it is not recovered. The marker is
         public text the shared login can write (D9.3), so it can make a run
         refuse, never adopt; the operator's ``unblock --take-over`` is the
-        one way such a PR is bound. The exception is the one-shot legacy
-        re-entry of a run persisted while an agent of the previous contract
-        was publishing (D13.4): that agent copied the ownerless marker its
-        prompt rendered, so an ownerless marked PR is the one it opened.
+        one way such a PR is bound.
+
+        That holds for the one-shot legacy re-entry of a run persisted while
+        an agent of the previous contract was publishing (D13.4) as well
+        (PR #459 R1-F3). Its launch label proves an agent was launched, not
+        that the agent opened the PR now found: every PR opened before #414
+        carries the same ownerless marker, another controller's included, so
+        an ownerless marked PR is not evidence of this run's work. The
+        operator, who can tell, takes it over.
         """
-        state = self._require_state()
         url = parse_pr_url(pr.url).canonical
-        if state.current_pr_url and parse_pr_url(state.current_pr_url).same_target(
-            parse_pr_url(url)
-        ):
+        if self._is_bound_pr(url):
             problem = self._pr_owner_problem(pr)
             return self._pr_owner_text(problem, "nothing was launched") if problem else ""
-        owner = self._marker_owner(pr)
-        if owner is None and is_legacy_reentry(
-            Phase.ANALYZE_EXECUTE, state.attempt, state.launch_label
-        ):
-            return ""
-        return self._unowned_pr_text(url, owner)
+        return self._unowned_pr_text(url, self._marker_owner(pr))
 
     def _marker_owner(self, pr: PRInfo) -> str | None:
         """The run ``pr``'s implementation marker of the current issue names, or ``None``.
@@ -6154,10 +6154,11 @@ class ControllerEngine:
           binds it (#414, ADR 0004 D9.4a). After a launch of this entry no
           marked PR is recovered: the entry observation recorded none, so
           the controller did not open it, and it blocks rather than being
-          adopted. The one exception is the legacy re-entry of a run
-          upgraded while an agent of the previous contract was publishing
-          (D13.4): it has no observation, and recovers an ownerless marked
-          PR as before.
+          adopted. The legacy re-entry of a run upgraded while an agent of
+          the previous contract was publishing (D13.4) has no observation,
+          and blocks on a marked PR the state has no record of like a fresh
+          entry: an ownerless marker does not say whose agent opened it
+          (PR #459 R1-F3).
         - The run's own closing block must be publishable before the agent
           is launched: its marker carries the run id, which ``state.json``
           may hold in a credential shape (#6), and published text is refused,
@@ -7211,6 +7212,9 @@ class ControllerEngine:
             # (D2.4), before the PR is bound.
             state.drop_phase_effects()
             state.current_pr_url = decision.take_over
+            # The decision read the PR's marker naming this run: the binding
+            # is owned from the start (PR #459 R1-F1).
+            state.owned_pr_url = decision.take_over
         if pr is not None and pr.head_sha:
             state.current_head_sha = pr.head_sha
             if pr.base_ref:
@@ -11168,15 +11172,29 @@ class ControllerEngine:
         marker of the current issue that names another run means that run
         drives the PR now (the operator handed it over), and a marker that
         cannot be read leaves who does unknowable: both refuse. A marker that
-        names this run, the ownerless marker of a PR opened before the owner
-        was recorded, and no marker of this issue at all leave a run to drive
-        the PR it is bound to, as before #414. The marker is checked on a
-        read the caller already made, so it costs no read of its own; and it
-        can only make a run refuse a PR, never let it adopt one (D9.3).
+        names this run lets it drive the PR it is bound to.
+
+        A marker naming no run, and no marker of this issue at all, are told
+        apart by the run's own record, never by the PR (PR #459 R1-F1). When
+        ``owned_pr_url`` names the bound PR, this run published it or took it
+        over under a marker naming it, or read one naming a run on it: its
+        owner was removed since, by an edit anyone with the login can make,
+        so which run owns it is not knowable, and it refuses. An empty body
+        reads as no marker, so a body GitHub did not return refuses too.
+        Only a binding the record does not name is legacy (made by a
+        controller of protocol 13 or older, or from a record one saved), and
+        it keeps driving its PR under an ownerless marker or none, as before
+        #414. A read of the bound PR finding a marker that names a run
+        records it there (:meth:`_note_pr_owner`), so a legacy binding stops
+        being one at its first such read, and a displaced run whose PR's
+        owner is then removed stays refused. The marker is checked on a read
+        the caller already made, so it costs no read of its own; and it can
+        only make a run refuse a PR, never let it adopt one (D9.3).
         """
         state = self._require_state()
         url = parse_pr_url(pr.url or state.current_pr_url).canonical
-        found = scan(IMPLEMENTATION, pr.body or "")
+        body = pr.body or ""
+        found = scan(IMPLEMENTATION, body)
         if found.defects:
             return (
                 f"PR {url} carries an implementation marker that cannot be read "
@@ -11184,13 +11202,58 @@ class ControllerEngine:
                 f"run ({state.run_id}) does not assume it still does"
             )
         issue = parse_issue_url(state.current_issue_url)
-        for claim in found.claims:
-            if claim.key == issue.identity and claim.owner_run_id not in (None, state.run_id):
+        owners = [claim.owner_run_id for claim in found.claims if claim.key == issue.identity]
+        bound = self._is_bound_pr(url)
+        if bound:
+            self._note_pr_owner(owners)
+        for owner in owners:
+            if owner not in (None, state.run_id):
                 return (
-                    f"the implementation marker of PR {url} names run {claim.owner_run_id} as "
-                    f"its owner, not this run ({state.run_id})"
+                    f"the implementation marker of PR {url} names run {owner} as its owner, not "
+                    f"this run ({state.run_id})"
                 )
-        return ""
+        if not bound or not self._is_owned_binding() or state.run_id in owners:
+            return ""
+        if owners:
+            found_text = f"carries an implementation marker for issue #{issue.number} naming no run"
+        elif not body.strip():
+            found_text = (
+                f"reads with an empty body, so no implementation marker for issue #{issue.number}"
+            )
+        else:
+            found_text = f"carries no implementation marker for issue #{issue.number}"
+        return (
+            f"PR {url} {found_text}, but its marker named an owner when this run published, "
+            "took over or last read it (owned_pr_url): the owner was removed since, so which "
+            f"run owns the PR is not knowable and this run ({state.run_id}) does not assume it "
+            "still does"
+        )
+
+    def _is_bound_pr(self, url: str) -> bool:
+        """Whether ``url`` is the PR this run is bound to (``current_pr_url``), by identity."""
+        state = self._require_state()
+        return bool(state.current_pr_url) and parse_pr_url(state.current_pr_url).same_target(
+            parse_pr_url(url)
+        )
+
+    def _is_owned_binding(self) -> bool:
+        """Whether ``owned_pr_url`` names the bound PR: its marker is known to have named a run."""
+        state = self._require_state()
+        return bool(state.owned_pr_url) and self._is_bound_pr(state.owned_pr_url)
+
+    def _note_pr_owner(self, owners: Sequence[str | None]) -> None:
+        """Record the bound PR as owned when a marker of it names a run (#414, PR #459 R1-F1).
+
+        ``owners`` are the runs the bound PR's implementation markers of the
+        current issue name, as just read or published. Any run, this one or
+        another, proves the PR has an owner, so a later read finding the
+        owner gone refuses (:meth:`_pr_owner_problem`). It is written into
+        the state in memory and persisted by the save that follows the read,
+        a block's included; it is never cleared while the PR stays bound.
+        """
+        state = self._require_state()
+        if state.current_pr_url and any(owner is not None for owner in owners):
+            state.owned_pr_url = parse_pr_url(state.current_pr_url).canonical
 
     def _pr_owner_text(self, problem: str, sent: str) -> str:
         """A ``BLOCKED`` reason for ``problem``, what was ``sent``, and the way back (#414)."""
@@ -12304,6 +12367,36 @@ class ControllerEngine:
         self._require_state().replan_transaction = txn.to_dict()
         return self._block(Phase.REPLAN_REEXECUTE, None, text, code=StopReasonCode.REPLAN_REFUSED)
 
+    def _replan_owner_refusal(self, txn: ReplanTransaction, sent: str) -> StepOutcome | None:
+        """Reject ``txn`` when its source PR is no longer this run's (#414, PR #459 R1-F2).
+
+        Reads the source, the run's bound PR (:meth:`_replan_unbound` holds
+        them to be one), and applies :meth:`_pr_owner_problem` to it. Called
+        before a PREPARED transaction launches its agent again and before
+        each record of its saved plan is driven: a takeover after the
+        checkpoint hands the source to another run, and this run then
+        launches, pushes and creates nothing more for it. A refusal is a
+        rejection like every other checkpoint's (``sent`` says what is on
+        GitHub). An unavailable GitHub propagates; a conclusive read failure
+        rejects, as the checkpoint's own read does. ``None`` when the source
+        is still this run's.
+        """
+        state = self._require_state()
+        url = txn.source_pr_url or state.current_pr_url
+        try:
+            source = self.github.get_pr(url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return self._reject_replan(
+                txn,
+                f"the source PR {url} could not be read to check which run owns it: {exc}; {sent}",
+            )
+        problem = self._pr_owner_problem(source)
+        if problem:
+            return self._reject_replan(txn, self._pr_owner_text(problem, sent))
+        return None
+
     def _drive_replan(self) -> StepOutcome | None:
         """Advance the replan transaction as far as it goes without an agent.
 
@@ -12347,6 +12440,9 @@ class ControllerEngine:
             # The undo was decided and persisted before the reopen was
             # attempted. Replay it; never fall through to the supersede step.
             return self._run_compensation(txn)
+        # The prepare step reads the source and checks its owner itself; a
+        # transaction already PREPARED by an earlier entry is checked below.
+        prepared_now = txn.stage is ReplanStage.PENDING
         if txn.stage is ReplanStage.PENDING:
             prepared = self._prepare_replan(txn)
             if prepared is not None:
@@ -12354,7 +12450,8 @@ class ControllerEngine:
         if txn.stage is ReplanStage.PREPARED:
             # Journal first (#164): a saved push and PR plan means the
             # agent's commit was accepted; the plan is completed and bound,
-            # and the agent is never launched for it again.
+            # and the agent is never launched for it again. The completion
+            # reads the source's owner before each record it sends.
             if isinstance(state.phase_effects().context, ReplanContext):
                 return self._complete_replan(txn)
             # Without a plan the controller has created nothing, so a PR
@@ -12369,6 +12466,15 @@ class ControllerEngine:
             if refused is not None:
                 return refused
             if not txn.is_bound:
+                # #414 (PR #459 R1-F2): a transaction PREPARED by an earlier
+                # entry was checked for its source's owner then, and the
+                # operator may have handed the PR to another run since. The
+                # source is read again before the agent is launched (or
+                # relaunched) for it.
+                if not prepared_now:
+                    refused = self._replan_owner_refusal(txn, "nothing was launched")
+                    if refused is not None:
+                        return refused
                 # Nothing exists yet: read the base, derive the branch, then
                 # invoke the replan agent.
                 return self._replan_launch_entry(txn, legacy)
@@ -13243,9 +13349,9 @@ class ControllerEngine:
                 f"{drift}",
                 txn.replacement_pr_url,
             )
-        return self._activate_replacement(txn)
+        return self._activate_replacement(txn, target)
 
-    def _activate_replacement(self, txn: ReplanTransaction) -> StepOutcome:
+    def _activate_replacement(self, txn: ReplanTransaction, target: PRInfo) -> StepOutcome:
         """Make the verified replacement the current implementation (idempotent).
 
         The supersede is recorded once per transaction id, and the replan
@@ -13281,6 +13387,13 @@ class ControllerEngine:
                 }
             )
         state.current_pr_url = txn.replacement_pr_url
+        # #414 (PR #459 R1-F1): ``target`` is the replacement as the last
+        # read before this write found it, and K7 published its marker
+        # naming this run; from now on its removal refuses the PR. A legacy
+        # replacement (an agent's, D13.8, or a record saved before #414)
+        # names no run and binds a legacy PR.
+        state.owned_pr_url = ""
+        self._note_pr_owner([self._marker_owner(target)])
         state.current_branch = txn.replacement_branch
         state.current_head_sha = txn.replacement_head_sha
         # The activation predicate verified the replacement's base is the
@@ -14398,6 +14511,12 @@ class ControllerEngine:
                 "The controller binds only a PR it verified; inspect it, then 'unblock'",
             )
         state.current_pr_url = url
+        # #414 (PR #459 R1-F1): the marker read back is the one K2 or K3
+        # published, naming this run; from now on its removal refuses the
+        # PR. A record saved before #414 published a marker naming no run,
+        # and binds a legacy PR.
+        state.owned_pr_url = ""
+        self._note_pr_owner([holder.claim.owner_run_id])
         state.current_head_sha = candidate
         state.current_base_ref = pr.base_ref
         state.current_merge_base_sha = ""  # bound at REVIEW entry
@@ -15469,6 +15588,40 @@ class ControllerEngine:
             )
         return None
 
+    def _fix_owner_read(self, record: EffectRecord) -> tuple[Phase, str] | None:
+        """Read the bound PR's owner right before ``record`` of the FIX plan is sent (#414).
+
+        Called for each record after the first one this entry drives (PR
+        #459 R1-F4): every record before it took a round trip or more, and
+        a takeover in between hands the PR to another run, whose follow-ups
+        and comments this run must not write. The entry's own read
+        (:meth:`_fix_pr_outcome`) covers the first record and the push's
+        covers the push, so this read checks the owner alone: a PR that is
+        closed or moved meanwhile is still routed before the push, as
+        before. Another run's owner raises :class:`PROwnerError`; a
+        conclusive read failure blocks with ``record`` unsent; an
+        unavailable GitHub propagates for 'resume'. ``None`` when the PR is
+        still this run's.
+        """
+        state = self._require_state()
+        sent = (
+            f"what the FIX plan sent before {record.describe()} stays on GitHub, and it was "
+            "not sent"
+        )
+        try:
+            pr = self.github.get_pr(state.current_pr_url)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
+                f"PR {state.current_pr_url} could not be read before {record.describe()} was "
+                f"sent: {exc}. This is not a transient failure (authentication, permissions, or "
+                f"malformed data); {sent}. Fix the cause, then 'unblock'",
+            )
+        self._require_pr_owner(pr, sent)
+        return None
+
     def _fix_conflict(self, record: EffectRecord) -> tuple[Phase, str]:
         """A conflicting FIX record: drift when the PR moved, otherwise BLOCKED.
 
@@ -15725,6 +15878,9 @@ class ControllerEngine:
         # follow-up write: the push is never issued over a PR or a deferral
         # not read back as planned (PR #205 R2-F2, R2-F3, R3-F2).
         checked = True
+        # True while the last PR read postdates every record driven: the
+        # owner is read again before each later one (#414, PR #459 R1-F4).
+        fresh = True
         default_branch = ""
         for index, record in enumerate(records):
             if record.stage == Stage.CONFLICT:
@@ -15739,6 +15895,10 @@ class ControllerEngine:
                 problem = self._fix_disposition_problem(context, records, observation)
                 if problem:
                     return self._fix_disposition_block(problem, unpushed)
+            elif not fresh:
+                outcome = self._fix_owner_read(record)
+                if outcome is not None:
+                    return outcome
             try:
                 if record.kind is EffectKind.PUSH:
                     default_branch = self.github.get_repo(state.repository).default_branch
@@ -15768,6 +15928,7 @@ class ControllerEngine:
                 )
             records[index] = driven.record
             checked = checked and record.kind is EffectKind.PUSH
+            fresh = False
             if driven.record.stage == Stage.CONFLICT:
                 return self._fix_conflict(driven.record)
         problem = self._fix_self_deferral_problem(context, records, observation)
@@ -16566,6 +16727,18 @@ class ControllerEngine:
                 return self._reject_replan(txn, self._replan_conflict_text(record))
             if not record.pending:
                 continue
+            # #414 (PR #459 R1-F2): the source is read for its owner right
+            # before each record is driven, on the step that saved the plan
+            # (the agent ran for minutes) and on every later entry alike: a
+            # run the PR was handed to after the checkpoint pushes and
+            # creates nothing more for this transaction.
+            refused = self._replan_owner_refusal(
+                txn,
+                f"{record.describe()} was not sent"
+                + (f"; {records[0].describe()} is on GitHub" if index else ""),
+            )
+            if refused is not None:
+                return refused
             try:
                 if record.kind is EffectKind.REPLACEMENT_PR:
                     head = self._branch_head(branch)

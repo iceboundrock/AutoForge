@@ -122,10 +122,11 @@ controller writes:
   `unblock --take-over <PR>`, which binds the PR once the operator has
   written that marker into its body. After a launch of this entry the run is
   `BLOCKED` naming such a PR as well: the entry observation recorded none,
-  so the controller did not open it (D9.4). The one exception is the
-  one-shot re-entry of a run persisted while an agent of the previous
-  contract was publishing the PR (D13.4), which recovers an ownerless
-  marked PR as before.
+  so the controller did not open it (D9.4). The one-shot re-entry of a run
+  persisted while an agent of the previous contract was publishing the PR
+  (D13.4) blocks the same way on an ownerless marked PR: every PR opened
+  before #414 carries that marker, so it does not show whose agent opened
+  it (PR #459 R1-F3).
 - the PR this state persisted, whose marker now names another run: the
   operator handed it over, so the run is `BLOCKED` (`pr-owner`).
 - two or more, one whose marker cannot be read, or one headed in a fork:
@@ -1032,9 +1033,17 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   names another run, or one it cannot read, blocks the run with nothing
   launched, posted, pushed or merged. `REVIEW` reads the PR once more right
   before its round comment is sent (K4), so a PR taken over while the
-  reviewer ran gets no comment from the displaced run;
+  reviewer ran gets no comment from the displaced run. `FIX` reads the
+  owner again before each record of its plan after the first (follow-up
+  issues, marker appends, acceptance comments), and the replan before a
+  `PREPARED` transaction launches its agent on a later entry and before
+  each record of its saved push and PR plan (PR #459 R1-F2, R1-F4);
 - an ownerless marker (a PR opened before #414) and no marker leave the
-  bound run driving its own PR, as before;
+  bound run driving its own PR, as before, only on a legacy binding: once
+  the state records the PR as owned (`owned_pr_url`: it published the PR,
+  took it over, or read a marker naming a run on it), either one, or a body
+  that reads empty, blocks (`pr-owner`), since the owner was removed
+  (PR #459 R1-F1);
 - a takeover is the operator's: stop the owning run, replace the marker in
   the PR body with the one the refusal names, then `unblock --take-over
   <PR>` binds it and enters `REVIEW`. The controller writes no marker of its

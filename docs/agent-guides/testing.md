@@ -495,6 +495,23 @@ High-priority coverage includes:
   unknown kinds; and, structurally, `LOCAL_LEGAL_EDGES`, a LOCAL launch
   class and `WorkflowMode.LOCAL` do not exist, no module imports a
   deleted one, and the wheel carries no `local_*.md` template
+- protocol 14, which added the owned PR (`owned_pr_url`; #414, ADR 0004
+  D9.4a, PR #459 R1-F1; `tests/test_state.py`): it round-trips; a
+  protocol-13 file loads in every phase with `""` (a legacy binding),
+  without a write, and its next save writes label 14 with the field; a
+  file under each older label carrying it, even `""`, is refused and left
+  byte for byte; a protocol-14 or unlabelled file missing it is refused;
+  a value that is not a canonical PR URL of the run's repository is
+  refused; and a new issue clears it. In `tests/test_engine.py` and
+  `tests/test_replan.py`: K2's read back, a takeover, K7's activation and
+  a read finding a marker naming a run record it; while it names the
+  bound PR, a marker naming no run, no marker and an empty body block
+  (`pr-owner`) with nothing launched or sent, a displaced run stays
+  refused after the new owner is removed, and a legacy binding keeps
+  driving its PR; a legacy re-entry blocks on an ownerless marked PR it
+  has no record of; and a takeover after `FIX`'s first send, before a
+  `PREPARED` replan's relaunch, before a saved replan plan is replayed or
+  between its push and its replacement PR sends nothing more
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

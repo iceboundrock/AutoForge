@@ -902,8 +902,8 @@ Each implementation PR the controller opens or adopts names its run in its
 `ai-implementation` marker: `<!-- ai-implementation: {"issue": "...",
 "owner_run_id": "af-..."} -->` (#414). A run drives only a PR it recorded
 itself while that marker names it (or names no run: a PR opened before
-#414). Two cases stop a run with `BLOCKED` and `pr-owner`, before anything
-is launched or written.
+#414, bound by a run that never saw an owner on it). Three cases stop a run
+with `BLOCKED` and `pr-owner`, before anything is launched or written.
 
 - **A run that has no record of the issue's PR.** It may be a new
   `--state-dir`, another machine or container under the same GitHub login,
@@ -913,9 +913,17 @@ is launched or written.
   owning it, and the controller cannot tell a PR its own crashed run left
   behind from one another controller is still reviewing (#387).
 - **A run whose PR another run took over.** It stops at its next phase
-  entry, before the review comment is posted, before `FIX` sends anything,
-  and at the merge gate. A plain `unblock` refuses for as long as the marker
-  names the other run.
+  entry, before the review comment is posted, before each thing `FIX`
+  sends, before a replan launches its agent or sends its push or
+  replacement PR, and at the merge gate. A plain `unblock` refuses for as
+  long as the marker names the other run.
+- **A run whose PR's owner was removed.** Once a run has seen its PR's
+  marker name an owner (it opened the PR, took it over, or read a marker
+  naming any run on it), `state.json` records that (`owned_pr_url`). If
+  someone then removes the owner from the marker, removes the marker, or
+  GitHub returns the PR body empty, the run stops: which run owns the PR is
+  no longer knowable. Write the run that is to drive it into the marker
+  (step 2 below), then a plain `unblock` on that run.
 
 To take the PR over:
 

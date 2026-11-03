@@ -469,13 +469,18 @@ def _with_certificate(data: dict) -> dict:
 
 
 def _relabelled(data: dict, label: str) -> dict:
-    """``data`` under ``label``: a protocol-12 file carries LOCAL's twelve fields empty."""
+    """``data`` under ``label``: a protocol-12 file carries LOCAL's twelve fields empty.
+
+    No label before 14 wrote the owned PR (#414).
+    """
+    if label in ("12", "13"):
+        data = {k: v for k, v in data.items() if k != "owned_pr_url"}
     if label == "12":
         return {**data, **LOCAL_STATE_FIELDS, "protocol_version": "12"}
     return {**data, "protocol_version": label}
 
 
-@pytest.mark.parametrize("label", ["13", "12"])
+@pytest.mark.parametrize("label", ["14", "13", "12"])
 @pytest.mark.parametrize(
     ("plant", "needle"),
     [(_with_record, "end_fingerprint"), (_with_certificate, "review_certificate'.kind")],
@@ -486,7 +491,7 @@ def test_a_remote_state_carrying_a_local_record_or_certificate_is_refused_unchan
 ):
     """A workspace-variant record, or a ``local`` certificate beside its record, in
     the state a certified REMOTE run saved: refused at load, under the current
-    label and under 12, whose file loads without them. Nothing is written: no
+    label and under 13 and 12, whose files load without them. Nothing is written: no
     relabel, no ``.corrupt-*`` file."""
     gh = FakeGitHub()
     eng, _ = certified(tmp_state_dir, gh, PASSES)

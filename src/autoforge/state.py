@@ -209,10 +209,15 @@ _PRE_OPERATOR_PROTOCOL = "10"
 # phase with none, which is "not checked", and relabelled.
 _PRE_PIN_PROTOCOL = "11"
 # The label before LOCAL mode's removal (#388, ADR 0009 D8). A protocol-12
-# file is this protocol's shape with the twelve fields of
+# file is protocol 13's shape with the twelve fields of
 # :data:`_LOCAL_FIELDS` beside it, each at its empty value in every REMOTE
 # save: it is loaded in every phase with them dropped, and relabelled.
-_PREVIOUS_PROTOCOL = "12"
+_PRE_LOCAL_REMOVAL_PROTOCOL = "12"
+# The label before a run recorded the PR it knows to be owned (#414, ADR
+# 0004 D9.4a). A protocol-13 file is this protocol's shape without
+# ``owned_pr_url``: it is loaded in every phase with none, which is a
+# legacy binding (its controller never recorded an owner), and relabelled.
+_PREVIOUS_PROTOCOL = "13"
 # Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
 # one and each older one it migrates or refuses by its own rule. Any other
 # label is refused by :func:`protocol_support`'s classification before the
@@ -225,6 +230,7 @@ SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
         _PRE_VALIDATION_PROTOCOL,
         _PRE_OPERATOR_PROTOCOL,
         _PRE_PIN_PROTOCOL,
+        _PRE_LOCAL_REMOVAL_PROTOCOL,
         _PREVIOUS_PROTOCOL,
         __protocol_version__,
     }
@@ -272,6 +278,9 @@ _OPERATOR_FIELDS = ("operator_comment_outcomes",)
 # The field protocol 12 added (#280): the sandbox mode the run is pinned to
 # (:mod:`autoforge.sandbox_pin`), ``{}`` when none is.
 _PIN_FIELDS = ("sandbox_pin",)
+# The field protocol 14 added (#414, ADR 0004 D9.4a): the bound PR whose
+# implementation marker is known to have named an owner, ``""`` when none is.
+_OWNER_FIELDS = ("owned_pr_url",)
 # The twelve fields LOCAL mode wrote into every state file (ADR 0009 C2),
 # each with the value every REMOTE save wrote. Protocol 13 removed them with
 # LOCAL (#388, ADR 0009 D8): a file labelled 12 or older loads with each one
@@ -546,6 +555,17 @@ class AutoForgeState:
     current_issue_url: str = ""
     current_pr_url: str = ""
     current_branch: str = ""
+    # The bound PR whose implementation marker is known to have named an
+    # owner (#414, ADR 0004 D9.4a): its canonical URL, ``""`` when none is.
+    # Written when this run publishes or takes over its PR under a marker
+    # naming it (K2, K3, K7, ``unblock --take-over``) and when a read of the
+    # bound PR finds a marker naming any run. While it names
+    # ``current_pr_url``, the run drives that PR only while its marker names
+    # this run: a marker naming no run, no marker and an empty body are
+    # refused, never read as a PR opened before the owner was recorded. A
+    # binding it does not name is legacy: made by a controller of protocol
+    # 13 or older, or from a record saved by one. Cleared with the PR.
+    owned_pr_url: str = ""
 
     phase: Phase = Phase.INITIALIZING
 
@@ -906,8 +926,19 @@ class AutoForgeState:
         #   After every rule above, a file labelled 12 or older is loaded with
         #   each one dropped when it is absent or at its empty value, and is
         #   refused, unchanged, when one holds anything else
-        #   (:func:`_drop_local_fields`). A protocol-13 or unlabelled file
-        #   carrying one, even empty, is refused by the unknown-field check.
+        #   (:func:`_drop_local_fields`). A protocol-13 or later, or
+        #   unlabelled, file carrying one, even empty, is refused by the
+        #   unknown-field check.
+        # - 13 -> 14: a run records the bound PR whose implementation marker
+        #   is known to have named an owner (``owned_pr_url``, #414, ADR 0004
+        #   D9.4a), which makes a marker naming no run, or no marker, refuse
+        #   that PR. An older file has none and is loaded in every phase with
+        #   none: its binding, if any, is legacy, exactly what its controller
+        #   meant (it never recorded an owner), and the next read of the
+        #   bound PR that finds a marker naming a run records it. It is never
+        #   filled at load from GitHub: a load reads none, and a marker is
+        #   the public text the record exists not to trust. An older file
+        #   that carries the field, even empty, is refused, never merged.
         written_by = str(data.get("controller_version", ""))
         legacy = isinstance(raw_protocol, str) and raw_protocol in _LEGACY_PROTOCOLS
         if legacy:
@@ -944,6 +975,7 @@ class AutoForgeState:
             _refuse_validation_fields(data, str(raw_protocol))
             _refuse_operator_state(data, str(raw_protocol))
             _refuse_sandbox_pin(data, str(raw_protocol))
+            _refuse_owned_pr(data, str(raw_protocol))
         elif raw_protocol == _PRE_ACCEPTANCE_PROTOCOL:
             # 7 -> 8 (#211): the same shape without the acceptance-action
             # state. Every protocol-7 save wrote the effect fields, exactly
@@ -955,6 +987,7 @@ class AutoForgeState:
             _refuse_validation_fields(data, raw_protocol)
             _refuse_operator_state(data, raw_protocol)
             _refuse_sandbox_pin(data, raw_protocol)
+            _refuse_owned_pr(data, raw_protocol)
         elif raw_protocol == _PRE_CONFIG_PROTOCOL:
             # 8 -> 9 (#219): the same shape without the recorded
             # configuration, which it never wrote and which is refused.
@@ -963,6 +996,7 @@ class AutoForgeState:
             _refuse_validation_fields(data, raw_protocol)
             _refuse_operator_state(data, raw_protocol)
             _refuse_sandbox_pin(data, raw_protocol)
+            _refuse_owned_pr(data, raw_protocol)
         elif raw_protocol == _PRE_VALIDATION_PROTOCOL:
             # 9 -> 10 (#172): the same shape without the validation
             # evidence, which it never wrote and which is refused.
@@ -977,6 +1011,7 @@ class AutoForgeState:
             _refuse_validation_fields(data, raw_protocol)
             _refuse_operator_state(data, raw_protocol)
             _refuse_sandbox_pin(data, raw_protocol)
+            _refuse_owned_pr(data, raw_protocol)
         elif raw_protocol == _PRE_OPERATOR_PROTOCOL:
             # 10 -> 11 (#243): the same shape without the operator-action
             # state, which it never wrote and which is refused.
@@ -997,6 +1032,7 @@ class AutoForgeState:
             )
             _refuse_operator_state(data, raw_protocol)
             _refuse_sandbox_pin(data, raw_protocol)
+            _refuse_owned_pr(data, raw_protocol)
         elif raw_protocol == _PRE_PIN_PROTOCOL:
             # 11 -> 12 (#280): the same shape without the sandbox pin, which
             # it never wrote and which is refused.
@@ -1023,7 +1059,12 @@ class AutoForgeState:
                 "not a PR with none",
             )
             _refuse_sandbox_pin(data, raw_protocol)
-        elif raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+            _refuse_owned_pr(data, raw_protocol)
+        elif raw_protocol not in (
+            _PRE_LOCAL_REMOVAL_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Unreachable while SUPPORTED_PROTOCOLS names exactly the labels
             # of the branches above (pinned in tests/test_protocol_compat.py); kept so
             # a label added to the set and to no branch is still refused
@@ -1033,8 +1074,10 @@ class AutoForgeState:
                 f"(controller speaks {__protocol_version__!r})"
             )
         else:
-            # Protocol 12 and 13 write the same fields but LOCAL's twelve,
-            # which step 3 below handles. Only a legacy label loads with no
+            # Protocol 12, 13 and 14 write the same fields but LOCAL's
+            # twelve, which step 3 below handles, and protocol 14's
+            # ``owned_pr_url``, which the end of this branch does. Only a
+            # legacy label loads with no
             # effect state (D13.2). Every
             # protocol-7 save writes all four fields, so one that is absent
             # is a truncation or a hand edit, never "nothing planned": a
@@ -1085,6 +1128,20 @@ class AutoForgeState:
                 "sandbox pin",
                 "not a run with none pinned",
             )
+            if raw_protocol == __protocol_version__:
+                # Every protocol-14 save writes it, ``""`` included, so an
+                # absent one is a truncation or a hand edit: read as the
+                # empty default it would turn an owned binding back into a
+                # legacy one, which a marker naming no run then passes.
+                _require_fields(
+                    data,
+                    raw_protocol,
+                    _OWNER_FIELDS,
+                    "owned PR",
+                    "not a legacy binding",
+                )
+            else:
+                _refuse_owned_pr(data, raw_protocol)
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
@@ -1094,13 +1151,19 @@ class AutoForgeState:
             _PRE_VALIDATION_PROTOCOL,
             _PRE_OPERATOR_PROTOCOL,
             _PRE_PIN_PROTOCOL,
+            _PRE_LOCAL_REMOVAL_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 8 only: a protocol-8 file carries its own
             # acceptance state, which the migration would overwrite.
             kwargs.update(_acceptance_migration(data))
-        if raw_protocol not in (_PRE_PIN_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (
+            _PRE_PIN_PROTOCOL,
+            _PRE_LOCAL_REMOVAL_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Before protocol 11 (#243): over the acceptance migration, so a
             # pre-8 file gains both.
             kwargs.update(_operator_migration(kwargs))
@@ -1112,9 +1175,9 @@ class AutoForgeState:
                 )
         # ADR 0009 D8's step 3, after every per-protocol rule above: LOCAL's
         # twelve fields leave a file labelled 12 or older, or refuse it. A
-        # protocol-13 file is not asked: one that carries any of them is
-        # refused by the unknown-field check below.
-        if raw_protocol != __protocol_version__:
+        # protocol-13 or protocol-14 file is not asked: one that carries any
+        # of them is refused by the unknown-field check below.
+        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
             _drop_local_fields(kwargs, str(raw_protocol))
         # Unknown fields are corruption, not forward compatibility: at this
         # protocol version the controller knows every field it writes, so an
@@ -1229,6 +1292,26 @@ class AutoForgeState:
                 raise StateError(
                     f"state field 'reviewed_pr_url' names PR {state.reviewed_pr_url}, which "
                     f"is not in repository {state.repository!r}"
+                )
+        # The owned PR is compared by GitHub identity with the bound one, so
+        # it is the canonical URL of a PR of the run's repository when set
+        # (#414). Empty is "no binding known to be owned", which keeps a
+        # marker naming no run passing; anything else is refused rather than
+        # read as that.
+        if state.owned_pr_url:
+            try:
+                owned = parse_pr_url(state.owned_pr_url)
+            except ConfigurationError as exc:
+                raise StateError(f"state field 'owned_pr_url': {exc}") from None
+            if owned.canonical != state.owned_pr_url:
+                raise StateError(
+                    f"state field 'owned_pr_url' must be a canonical PR URL, got "
+                    f"{state.owned_pr_url!r:.120}"
+                )
+            if state.repository and not owned.same_repository(state.repository):
+                raise StateError(
+                    f"state field 'owned_pr_url' names PR {state.owned_pr_url}, which is not "
+                    f"in repository {state.repository!r}"
                 )
         # The merge bases are compared for equality with the one GitHub
         # reports (a lower-case full SHA), so a value of any other shape
@@ -1433,6 +1516,7 @@ class AutoForgeState:
         """
         self.current_issue_url = issue_url
         self.current_pr_url = ""
+        self.owned_pr_url = ""
         self.current_branch = ""
         self.current_head_sha = ""
         self.current_base_ref = ""
@@ -1525,6 +1609,21 @@ def _refuse_sandbox_pin(data: dict, protocol: str) -> None:
         raise StateError(
             f"state file is labelled protocol_version {protocol!r}, which never wrote "
             "'sandbox_pin'; refusing to load a file that carries a protocol-12 sandbox pin "
+            "-- it is a hand edit or a foreign file, not an older controller's state"
+        )
+
+
+def _refuse_owned_pr(data: dict, protocol: str) -> None:
+    """A file labelled before protocol 14 never recorded an owned PR (#414).
+
+    The label decides, not the value: ``owned_pr_url`` is protocol 14's own
+    field, so an older file that carries it at all, even ``""``, was not
+    written by the controller its label names.
+    """
+    if "owned_pr_url" in data:
+        raise StateError(
+            f"state file is labelled protocol_version {protocol!r}, which never wrote "
+            "'owned_pr_url'; refusing to load a file that carries a protocol-14 owned PR "
             "-- it is a hand edit or a foreign file, not an older controller's state"
         )
 

@@ -42,7 +42,7 @@ what no test covers.
 | `existing run <id> in phase <P> — use 'resume' to continue or 'run --force' to discard it` (exit 2) | [Starting over](#starting-over) |
 | `another AutoForge controller holds <path> — refusing to run concurrently on the same repository (...)` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
 | `'<command>' refuses issue <issue>: ... Only the parallel EPIC scheduler continues an issue its namespace owns ...` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
-| `unsupported protocol_version '<n>' (controller speaks '13'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
+| `unsupported protocol_version '<n>' (controller speaks '14'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
 | `refusing to start a new run over an unreadable state file`, `corrupted state file ...` (exit 2) | [The state file](#the-state-file) |
 | `issue <url> has no native parent on GitHub and no --epic was given`, `... has its native parent ... in another repository`, `... is closed on GitHub; a run records only an open EPIC`, `--epic <url> is the issue itself` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records) |
 | `issue <url> changed on GitHub while the run's EPIC was being bound: ...` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records): the issue's parent or state changed while `run` read its EPIC; nothing was written: run the command again |
@@ -424,8 +424,11 @@ first. Its run logs and worktree stay.
 The new run's `ANALYZE_EXECUTE` does not adopt the open PR carrying the
 issue's `ai-implementation` marker: the PR names the run that owned it, and
 the new run has no record of it (#414). It blocks, without running the
-implementer, and names the marker that would hand the PR to it. Close the
-old PR first if you want a fresh implementation. To continue it, take it
+implementer, and names the marker that would hand the PR to it. A run
+resumed from a launch made by an older AutoForge, whose agent opened PRs
+itself, blocks the same way on a PR whose marker names no run: that marker
+does not show whose agent opened it. Close the old PR first if you want a
+fresh implementation. To continue it, take it
 over ([Taking over a PR another run owns](usage.md#taking-over-a-pr-another-run-owns)).
 Two such PRs block either way.
 
@@ -672,7 +675,7 @@ The messages below are AutoForge's own refusals, grouped by subject.
   see [State and recovery](agent-guides/state-and-recovery.md#persistent-state).
   A file refused for its protocol label alone is not this entry's: see
   the next one.
-- **"unsupported protocol_version '14' (controller speaks '13'): a newer
+- **"unsupported protocol_version '15' (controller speaks '14'): a newer
   AutoForge wrote it"** or **"... no AutoForge protocol has that label"**
   (exit 2), followed by an `AutoForge controller/state protocol mismatch`
   block: the command imported a controller older than the one that wrote

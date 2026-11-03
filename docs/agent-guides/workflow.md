@@ -586,10 +586,12 @@ next entry could not find again.
   completed from its records without launching the agent. Otherwise, at a
   fresh entry, it recovers the PR this state persisted, while that PR's
   `ai-implementation` marker names this run or no owner, without launching
-  the agent; an open PR carrying the issue's marker that a complete listing
+  the agent (a marker naming no owner only while the state does not record
+  the PR as owned, `owned_pr_url`, PR #459 R1-F1); an open PR carrying the issue's marker that a complete listing
   of the repository's open PRs (read to the end) finds, and that this state
   has no record of, blocks (`pr-owner`) whatever run its marker names, and
-  only `unblock --take-over` binds it (#414, ADR 0004 D9.4a). Two candidates
+  only `unblock --take-over` binds it (#414, ADR 0004 D9.4a), on the legacy
+  re-entry of D13.4 too (PR #459 R1-F3). Two candidates
   block, and so does a listing that cannot be read to its end, since "none
   exists" is then not knowable. After a launch of the entry, a marker PR the entry observation
   did not record was not opened by the controller and blocks, as do a
@@ -758,8 +760,9 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   (one marked PR this run has no record of is refused, naming `unblock
   --take-over`, #414), and a conclusive GitHub failure of either read
   refuses exactly as it does with a PR bound; with a PR bound, the PR is
-  re-read, its implementation marker must name this run or no owner (ADR
-  0004 D9.4a), and its state, HEAD and base are compared with the persisted
+  re-read, its implementation marker must name this run, or no owner on a
+  binding the state does not record as owned (ADR 0004 D9.4a; PR #459
+  R1-F1), and its state, HEAD and base are compared with the persisted
   review binding.
 - **Identity first.** A review binding (`reviewed_pr_url`) that names a PR
   other than `current_pr_url` refuses before the live PR state is even
@@ -846,7 +849,9 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   --take-over <PR> --reason ...`. The controller re-reads the issue and the
   strict listing; it binds the PR (HEAD, base, branch) and enters `REVIEW`
   only when the listing's one marked PR is the PR named and its marker
-  names this run. The history entry's `action` is `take-over <PR>`. It is
+  names this run, recording it as owned (`owned_pr_url`): a later read
+  finding the owner removed blocks. The history entry's `action` is
+  `take-over <PR>`. It is
   refused, with nothing written, for a run with a PR bound, with a saved
   `ANALYZE_EXECUTE` plan or journaled records (the run's own plan is
   completed first: unblock without the flag), with no marked PR, another PR
@@ -854,8 +859,9 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   from this run's round 1; nothing of the run it was taken from (findings,
   verdict, certificate) is carried, and D9.6 still refuses a round comment
   already on the PR at the bound revision. A displaced run, whose bound
-  PR's marker names another run, blocks at its next entry; a plain unblock
-  refuses it until the marker names it again.
+  PR's marker names another run, blocks at its next entry and records the
+  PR as owned; a plain unblock refuses it until the marker names it again,
+  and removing the other run's owner does not hand the PR back to it.
 - **A fresh review instead of FIX** (`--rereview`, #428). Where the plain
   decision is `FIX` with the round's open findings (`OPEN` at the reviewed
   HEAD and base, no saved plan), a fixer relaunched by a plain unblock
