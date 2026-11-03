@@ -7,14 +7,16 @@ Commands:
           the run records the issue's native parent as its EPIC, --epic only when the
           issue has none (#293), and its dry run reads and prints the same binding
   step    execute exactly one phase step from persisted state
-  resume  continue a persisted run until a stop phase / max-steps; step, resume and
-          unblock refuse a REMOTE run whose recorded configuration (profile
-          routing, agent worktree root) this invocation's differs from, and any
-          run whose pinned sandbox.mode this invocation's is weaker than, unless
-          --accept-config-change (#219, #280). Under sandbox.mode required or
-          preferred every command refuses a --config file inside a tree the
-          repository's sandboxed launches write, or a directory a provider's
-          launches are given read-write (#280)
+  resume  continue a persisted run until a stop phase / max-steps; a run held at
+          READY_FOR_MERGE by the closed merge gate is read from GitHub first, and
+          goes back to REVIEW when its PR moved off the reviewed revision (#447);
+          step, resume and unblock refuse a REMOTE run whose recorded
+          configuration (profile routing, agent worktree root) this invocation's
+          differs from, and any run whose pinned sandbox.mode this invocation's
+          is weaker than, unless --accept-config-change (#219, #280). Under
+          sandbox.mode required or preferred every command refuses a --config
+          file inside a tree the repository's sandboxed launches write, or a
+          directory a provider's launches are given read-write (#280)
   unblock the operator's explicit exit from BLOCKED: the controller re-inspects
           live GitHub state, re-enters a phase through validate_transition or
           refuses and stays BLOCKED; the reason is recorded in state and the log.
@@ -34,7 +36,9 @@ Commands:
           native parent and warns, changing nothing, when it is not the recorded EPIC
   epic    the parallel EPIC scheduler (ADR 0008, #183), REMOTE only: run (with
           --dry-run and --force), resume, status (lock-free, --json), stop
-          (lock-free, --now) and archive; every 'epic' command refuses
+          (lock-free, --now), archive, and recheck, which reads the PR of an
+          issue a worker settled at READY_FOR_MERGE and sends one that moved
+          back to REVIEW for 'epic resume' (#447); every 'epic' command refuses
           --state-dir, since each issue's state lives in its scheduler namespace,
           and an EPIC of another repository than the checkout's 'origin'.
           'epic _worker' is the scheduler's hidden worker entry point
@@ -43,6 +47,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import io
 import json
 import os
@@ -83,6 +88,7 @@ from .engine import (
 from .epic_commands import (
     DRAIN_HELP,
     EXIT_OPEN_CLAIMS,
+    RecheckReport,
     archive_issue,
     checkout_epic,
     claims_left_open,
@@ -91,8 +97,10 @@ from .epic_commands import (
     dry_run_plan,
     epic_run_guard,
     left_open_lines,
+    recheck_issue,
     stop_scheduler,
 )
+from .epic_commands import command as epic_command_line
 from .epic_graph import GraphReader
 from .epic_rebind import COMMAND as REBIND_COMMAND
 from .epic_rebind import (
@@ -447,7 +455,7 @@ def _add_epic_parser(sub) -> None:
     """
     ep = sub.add_parser(
         "epic",
-        help="parallel EPIC scheduler: run, resume, status, stop, archive (REMOTE only)",
+        help="parallel EPIC scheduler: run, resume, status, stop, archive, recheck (REMOTE only)",
         description=(
             "Run up to --max-parallel issues of one EPIC at once, each in its own scheduler "
             "namespace and worktree, admitted in dependency order from GitHub's native "
@@ -552,6 +560,25 @@ def _add_epic_parser(sub) -> None:
     )
     ea.add_argument("epic", metavar="EPIC_URL", help="the EPIC issue URL")
     ea.add_argument("issue", type=_positive_int, metavar="ISSUE", help="the issue number")
+
+    erc = esub.add_parser(
+        "recheck",
+        help="read the PR of an issue settled at READY_FOR_MERGE; back to REVIEW if it moved",
+        description=(
+            "For an issue a worker settled at READY_FOR_MERGE, which the scheduler never "
+            "relaunches (#447). Under the controller lock (so while no scheduler or worker "
+            "runs) and the issue's run lock, with no open claim: read the PR from GitHub "
+            "(its HEAD and base, then the merge base; not its checks or the review comment). "
+            "A PR that moved since the clean review (a push, a rebase and force push, a "
+            "retarget, a base rewritten under its name) goes back to REVIEW of the new "
+            "revision, nothing merged, and 'epic resume' then admits the issue and reviews "
+            "it; a PR still at the reviewed revision changes nothing. No agent runs, nothing "
+            "is written to GitHub, and the run, its review history and the claim history "
+            "are kept."
+        ),
+    )
+    erc.add_argument("epic", metavar="EPIC_URL", help="the EPIC issue URL")
+    erc.add_argument("issue", type=_positive_int, metavar="ISSUE", help="the issue number")
 
 
 def _add_max_parallel(parser: argparse.ArgumentParser) -> None:
@@ -1518,13 +1545,20 @@ def _finish(
         )
         return 0
     if state.phase in (Phase.BLOCKED, Phase.FAILED):
-        # The whole line is state-derived (`run_id` is a validated path
-        # component, not a checked-for-secrets value), so the line crosses
-        # the redaction boundary assembled, not field by field.
-        print(redact(f"\nrun {state.run_id} is {state.phase.value}: {state.block_reason or '-'}"))
-        print(redact(_final_stop(engine, outcomes).line()))
+        _print_stopped_run(engine, _final_stop(engine, outcomes))
         return 1
     return 0
+
+
+def _print_stopped_run(engine: ControllerEngine, stop: StopClassification) -> None:
+    """The end of a command that left the run BLOCKED or FAILED: its reason, then its stop."""
+    state = engine.state
+    assert state is not None
+    # The whole line is state-derived (`run_id` is a validated path
+    # component, not a checked-for-secrets value), so the line crosses
+    # the redaction boundary assembled, not field by field.
+    print(redact(f"\nrun {state.run_id} is {state.phase.value}: {state.block_reason or '-'}"))
+    print(redact(stop.line()))
 
 
 def _final_stop(engine: ControllerEngine, outcomes: list[StepOutcome]) -> StopClassification:
@@ -1792,11 +1826,14 @@ def cmd_resume(args) -> int:
             return rc
         _check_configuration(engine, args, "resume", dry_run=False)
         _attach_terminal(engine)
+        # A run held at READY_FOR_MERGE by the closed gate is read from
+        # GitHub before the loop stops there (#447): REVIEW when its PR moved.
         outcomes = engine.run(
             max_steps=args.max_steps,
             dry_run=False,
             allow_merge=args.allow_merge,
             on_outcome=_print_outcome_now,
+            recheck_held=True,
         )
     return _finish(engine, outcomes, args.allow_merge, printed=True)
 
@@ -1993,14 +2030,21 @@ def _resume_holding_state(
 
     ``dry_run`` runs no git: the stop line of a terminal phase then cannot
     tell a scheduler namespace's state dir from a standalone one.
+
+    READY_FOR_MERGE with the merge gate closed is decided here only for a
+    dry run, which reads nothing from GitHub and prints the banner. A real
+    ``resume`` reads the PR first (``engine.run(recheck_held=True)``, #447),
+    so it passes the configuration check like ``step``: a PR that moved off
+    the reviewed revision goes back to REVIEW and the run continues, one
+    still at it ends with the same banner and exit 0.
     """
-    if state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(allow_merge):
-        # Holding state: nothing runs unless the merge gate is open. With the
-        # gate open, engine.run() performs the controller-side pre-merge
-        # verification instead (bounded re-checks of inconclusive GitHub data
-        # happen there, one attempt per resume), the review certificate's
-        # live check included (#175); the banner says only whether it
-        # applies against state and the configuration in force.
+    if dry_run and state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(allow_merge):
+        # Holding state: nothing runs unless the merge gate is open or the PR
+        # moved. With the gate open, engine.run() performs the controller-side
+        # pre-merge verification instead (bounded re-checks of inconclusive
+        # GitHub data happen there, one attempt per resume), the review
+        # certificate's live check included (#175); the banner says only
+        # whether it applies against state and the configuration in force.
         print_ready_banner(state, certificate=_review_certificate_check(engine, state))
         return 0
     if state.phase in TERMINAL_PHASES:
@@ -2102,6 +2146,8 @@ def cmd_epic(args) -> int:
         return cmd_epic_stop(args)
     if args.epic_command == "archive":
         return cmd_epic_archive(args)
+    if args.epic_command == "recheck":
+        return cmd_epic_recheck(args)
     raise ConfigurationError(f"unknown epic command {args.epic_command}")
 
 
@@ -2222,6 +2268,65 @@ def cmd_epic_archive(args) -> int:
         )
     for line in report.lines():
         print(line)
+    return 0
+
+
+def cmd_epic_recheck(args) -> int:
+    """``epic recheck``: one issue held at READY_FOR_MERGE read against its PR (#447).
+
+    Exit 0 whether the PR moved (the run is back in REVIEW, and the command
+    to continue is printed) or not (nothing changed); 1 when the step for a
+    PR that moved left the run BLOCKED or FAILED instead (the run's step
+    budget spent, say), with the run's reason and its typed stop line, as
+    ``step`` and ``resume`` end such a run (R2-F1); 2 for a refusal (L0 or
+    the issue's run lock held, a namespace that is not one settled at
+    READY_FOR_MERGE, or of another EPIC or repository); 1 for a GitHub read
+    that failed or did not establish the PR's revision, the state unchanged.
+    The configuration is loaded before L0 is taken, as ``epic archive``'s.
+    """
+    cfg = _load_cfg(args)
+    flags = _epic_flags(args)
+    epic_url = parse_issue_url(args.epic).canonical
+    repository = os.getcwd()
+    resume = epic_command_line(flags, "epic", "resume", epic_url)
+    built: list[ControllerEngine] = []
+
+    def engine_for(namespace) -> ControllerEngine:
+        # As a worker's engine (worker._engine): the namespace's state, its
+        # hints naming the namespace and 'epic resume', never a standalone resume.
+        engine = ControllerEngine(config=cfg, workdir=repository)
+        engine.bind_issue_namespace(namespace)
+        engine.cli_global_flags = (*flags, "--state-dir", str(namespace.state_dir))
+        engine.continue_command = (*flags, "epic", "resume", epic_url)
+        engine.config_file = absolute_spelling(args.config) if args.config else ""
+        built.append(engine)
+        return engine
+
+    lock_path = repository_lock_path(repository)
+    with ControllerLock(lock_path) as l0:
+        report: RecheckReport = recheck_issue(
+            lock_path.parent.parent,
+            epic_url,
+            args.issue,
+            lambda name: _epic_graph(cfg).get_repository_id(name),
+            engine_for,
+            l0,
+            resume=resume,
+            on_outcome=_print_outcome_now,
+        )
+    for line in report.lines():
+        print(line)
+    if report.phase in (Phase.BLOCKED, Phase.FAILED):
+        # Only the step for a moved PR leaves READY_FOR_MERGE, so an engine
+        # was built and its state is the one the report read. The run is a
+        # namespace's: its stop gives the scheduler's routes ('epic resume',
+        # never a standalone 'resume' or 'run --force'), as 'epic status'.
+        engine = built[-1]
+        stop = dataclasses.replace(
+            _final_stop(engine, list(report.outcomes)), scheduler=_scheduler_view(engine)
+        )
+        _print_stopped_run(engine, stop)
+        return 1
     return 0
 
 
@@ -3068,6 +3173,8 @@ def print_ready_banner(
             "The merge gate is closed: a human must review and merge the PR.",
             "(AutoForge merges only with 'safety.allow_merge: true' in the config and "
             "--allow-merge.)",
+            "A push to the PR branch makes this review stale: 'resume' reads the PR from "
+            "GitHub and reviews the new head.",
         ]
     lines.append("=" * 72)
     # State-derived like the status output: the same redaction boundary.

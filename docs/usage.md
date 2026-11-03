@@ -449,7 +449,7 @@ never advances the state machine. In brief:
 | `REVIEW` | OpenCode (`review_round_1`, `review_round_2_5`, `review_round_6_plus`), which makes no GitHub write | the round is bound to the PR, HEAD, base and merge base read from GitHub, and a comment already carrying that round's marker blocks (the controller never adopts one it did not post); the reviewer's round and HEAD must match the binding and `needs_fix_round == (len(findings) > 0)`; the controller renders the review comment from the result, journals it, posts it and reads it back, so a crash or `resume` never posts a second one; then controller policy picks `FIX`, `READY_FOR_MERGE`, `REPLAN_REEXECUTE` or `BLOCKED` |
 | `FIX` | Claude Code (`fix`), which makes no GitHub write | the PR is still at the reviewed revision (else back to `REVIEW` without running the fixer); the open issues already marked as a finding's follow-up are handed to the fixer to reuse, and one the controller did not hand over or create blocks; the fixer commits on its worktree's detached HEAD and resolves every open finding exactly once, and the controller checks that HEAD itself (the reported SHA, descent from the reviewed HEAD, every commit message, a commit for each `fixed` finding); it creates the follow-up issues the fixer asks for, appends the finding markers to the handed-over issues it defers to, then pushes the commit last, journalling each write before it is sent, and reads the follow-ups and the PR head back, so a crash or `resume` never creates or pushes twice; a push it did not make sends the PR back to `REVIEW` |
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`), which makes no GitHub write | one durable transaction; the agent commits on its worktree's detached HEAD at the default branch head the controller recorded, and the controller checks that HEAD itself (the reported SHA, descent from that base, every commit message), pushes it to `autoforge/<n>-replan-<transaction id>`, creates the replacement PR with the agent's title and body followed by the controller's markers, journalling each write before it is sent, and binds the PR only at exactly the pushed HEAD, so a crash or `resume` never pushes or creates twice; a replacement branch or a marker PR it did not write rejects the transaction; the old PR is closed by the controller only while both PRs still match their checkpoints |
-| `READY_FOR_MERGE` | nobody | holding state; with the merge gate open, the full pre-merge verification runs before `MERGE` is entered |
+| `READY_FOR_MERGE` | nobody | holding state at the clean-reviewed revision: with the merge gate closed, `step` and `resume` read the PR and send one that moved back to `REVIEW` (#447); with the gate open, the full pre-merge verification runs before `MERGE` is entered |
 | `MERGE` (gated) | controller, never an agent | `gh pr merge --match-head-commit <reviewed HEAD>`, counted only once GitHub reports `MERGED` at that HEAD into the reviewed base |
 | `UPDATE_EPIC` | OpenCode (`update_epic`), which makes no GitHub write | the controller (not the agent) posts the progress comment and writes the roadmap section, journals each write before performing it and reads it back, so a crash or `resume` never posts a second comment; a marker comment it did not post blocks; the next issue gets the `INITIALIZING` checks and must be a native sub-issue of the EPIC with no sub-issues of its own, as `epic run` admits (#287); `null` -> `DONE` only when GitHub's complete listing of the EPIC's sub-issues holds none the run could still select (a listing short of the EPIC's count is `BLOCKED`) |
 
@@ -490,10 +490,29 @@ exact triggers are in [Workflow: loop bounds](agent-guides/workflow.md#loop-boun
 When the loop reaches `READY_FOR_MERGE` with the merge gate closed (the
 default) the CLI prints a banner with the issue, PR, review round and reviewed
 HEAD, and states that the merge gate is closed: a human merges the PR.
-`resume` without the gate open re-prints the banner and runs nothing. The
-banner's `Review certificate:` line says whether the round's certificate
-applies, checked against the state and the configuration in force (GitHub
-is not read): `applies (round N, ...)`, `does not apply (<reason>)` or
+
+The run holds the revision its clean review covered, and no other.
+Without the gate open, `resume` and `step` read the PR from GitHub first:
+its HEAD and base, then the merge base (not its checks or the review
+comment). A PR still at the reviewed revision holds and nothing is
+written: `resume` re-prints the banner and exits 0, `step` exits 1 with
+the merge-gate message. A PR that moved since the review (a push, a rebase
+and force push, a retarget, a base rewritten under its name) goes back to
+`REVIEW` of the new revision with nothing merged, and `resume` goes on to
+review it; the earlier review certificate no longer applies, and the new
+round certifies the new head alone (#447). Since `resume` may start a
+review from here, it checks the run's recorded configuration first, as
+`step` does. `resume --dry-run` reads nothing and prints the banner. A PR
+that GitHub answers with no state or an unknown one, or as `OPEN` with no
+HEAD or no base, is no hold: both commands exit 1 with the state
+unchanged, since such an answer does not show the reviewed revision is
+still the PR's. The parallel EPIC scheduler's workers do not make this
+read: for an issue they settled at `READY_FOR_MERGE`, the operator runs
+[`epic recheck`](#epic-recheck), then `epic resume`.
+
+The banner's `Review certificate:` line says whether the round's certificate
+applies, checked against the state and the configuration in force (not
+against GitHub): `applies (round N, ...)`, `does not apply (<reason>)` or
 `none held`; in the last two cases the merge gate would refuse to merge.
 With the gate open (`resume --allow-merge` / `step --allow-merge`) the
 controller continues through its own pre-merge verification, `MERGE` and
@@ -924,6 +943,11 @@ uv run autoforge epic resume https://github.com/owner/repo/issues/1
 
 # release one settled or uncertain issue for a fresh run (never automatic)
 uv run autoforge epic archive https://github.com/owner/repo/issues/1 7
+
+# after a push to the PR of an issue settled at READY_FOR_MERGE: read the PR
+# and send it back to REVIEW if it moved, then let epic resume review it
+uv run autoforge epic recheck https://github.com/owner/repo/issues/1 7
+uv run autoforge epic resume https://github.com/owner/repo/issues/1
 ```
 
 ### The lifecycle
@@ -989,7 +1013,7 @@ state and the run-lock probe, with the next command where there is one:
 | `ready` | open, supported, every blocker completed; no namespace state | nothing: the next admission takes it |
 | `claimed` | an open claim and no live run lock: its scheduler ended without closing it | `epic resume` |
 | `running` | a live process holds its run lock | wait; the claim's worker PID and process start time are shown as diagnostics and never signalled (a PID may be reused) |
-| `ready-for-merge` | its PR is at `READY_FOR_MERGE` | merge it; dependents become ready once the issue is closed as completed |
+| `ready-for-merge` | its PR is at `READY_FOR_MERGE` | merge it; dependents become ready once the issue is closed as completed. After a push to the PR branch, [`epic recheck`](#epic-recheck) the issue (while no scheduler runs), then `epic resume` |
 | `blocked` | the run is `BLOCKED`; the reason is shown | fix the cause, then the printed `autoforge --state-dir <namespace>/state unblock --reason "<why>"` (while no scheduler runs: it takes the repository lock), then `epic resume` |
 | `resumable` | a run stopped mid-workflow (a crash, a stop, a killed worker) | `epic resume` |
 | `uncertain` | a claim, a state or a run lock that cannot be read or does not agree | repair the files by hand, or `epic archive` the issue, then `epic resume` |
@@ -1098,6 +1122,49 @@ and adopts its marked PR. Re-running it completes an interrupted archive;
 on an issue with nothing left it says "nothing left to archive". It reads
 nothing from GitHub but the repository's id, which the binding's must be
 (see `epic stop` above), and does not touch `scheduler.json`.
+
+### `epic recheck`
+
+`epic recheck <EPIC_URL> <ISSUE>` is for an issue a worker settled at
+`READY_FOR_MERGE` whose PR moved afterwards: a push, a rebase and force
+push, a retarget, or a base rewritten under its name (#447). The scheduler
+launches nothing more for a settled issue and its workers never read a held
+run's PR, so neither `epic resume` nor a worker notices the move; a
+standalone `resume` refuses the namespace's state directory. `epic recheck`
+is the namespace's counterpart of what a standalone `resume` does at
+`READY_FOR_MERGE`:
+
+- It takes the repository lock and the issue's run lock, so it is refused
+  (exit 2) while a scheduler, a surviving worker or a standalone command
+  runs. The namespace must be bound under that EPIC, in this repository by
+  its numeric id (as for `epic archive`), hold no open claim (run
+  `epic resume` first, which closes a settled one) and hold a run settled at
+  `READY_FOR_MERGE`; anything else is refused before GitHub is read.
+- With the merge gate closed, as a worker's always is, it reads the PR from
+  GitHub: its HEAD and base, then the merge base when those are the reviewed
+  ones; never its checks or the review comment. A PR still at the reviewed
+  revision, or one GitHub reports closed or merged, changes nothing (exit 0;
+  the output says which). One that moved goes back to `REVIEW` of
+  the new revision in the same run, the review marked stale and its findings
+  carried, nothing merged (exit 0, and the command prints the `epic resume`
+  to run). That step is held to the run's bounds like any other: when the
+  run's step budget (`workflow.max_total_steps`) is already spent, it
+  enters `BLOCKED` instead and the command exits 1, printing the run's
+  reason and its `stop:` line as `step` and `resume` do, with the
+  scheduler's routes (`epic status` names the `unblock` to run, then
+  `epic resume`). A read that fails, or an answer that does not establish
+  the PR's revision, exits 1 with the state unchanged.
+- No agent runs and nothing is written to GitHub, to the claim or to
+  `scheduler.json`. The run keeps its id, review rounds, loop bounds,
+  validation records and claim history; unlike `epic archive`, nothing is
+  discarded.
+
+The issue is then `resumable`: the next `epic resume` (or `epic run`)
+admits it and its worker reviews the new head as the next round, which
+certifies that head alone and settles at `READY_FOR_MERGE` again when it
+is clean. A worker checks the run's recorded configuration before that
+review, as for any resume (`epic resume --accept-config-change` accepts a
+change).
 
 ### Recovery and exit codes
 

@@ -35,6 +35,7 @@ from tests.conftest import (
     EPIC,
     FOLLOW_UP_TEXT,
     FOLLOW_UP_TITLE,
+    GIT_IDENT,
     GOOGLE_API_KEY,
     GOOGLE_KEY_BODY,
     ISSUE,
@@ -1402,6 +1403,107 @@ def test_full_run_prints_ready_banner(tmp_path, capsys, monkeypatch, fakes):
     assert f"Reviewed merge base: {merge_base}" in out
 
 
+@pytest.mark.parametrize("command", ["step", "resume"])
+def test_a_push_to_a_pr_held_at_ready_for_merge_is_reviewed_with_the_gate_closed(
+    tmp_path, capsys, monkeypatch, fakes, command
+):
+    """#447 as reported: a clean run held at READY_FOR_MERGE, its PR branch then
+    rewritten and force-pushed (a rebase that changed no file).
+
+    ``resume --dry-run`` still shows the banner and reads nothing. ``step`` or
+    ``resume`` reads the moved head from GitHub and goes back to REVIEW, the
+    next round reviews and certifies the pushed head, and nothing is merged.
+    """
+    monkeypatch.chdir(tmp_path)
+    gh, origin = fakes["gh"], fakes["origin"]
+    reviewed: list[str] = []
+
+    def agent(req):
+        if req.phase == "ANALYZE_EXECUTE":
+            return implement(req)
+        head = origin.head("autoforge/2")
+        reviewed.append(head)
+        return block(review_result(len(reviewed), head))
+
+    fakes["handler"] = agent
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
+    out = capsys.readouterr().out
+    assert "A push to the PR branch makes this review stale: 'resume' reads the PR" in out
+    first = origin.head("autoforge/2")
+    assert first is not None and reviewed == [first]
+
+    pushed = git_out(
+        "-C",
+        str(tmp_path),
+        *GIT_IDENT,
+        "commit-tree",
+        f"{first}^{{tree}}",
+        "-p",
+        f"{first}^",
+        "-m",
+        "Rebased",
+    )
+    origin.publish(tmp_path, pushed, "autoforge/2")
+
+    calls = len(gh.calls)
+    assert cli.main(["--state-dir", sd, "resume", "--dry-run"]) == 0
+    assert f"Reviewed HEAD: {first}" in capsys.readouterr().out
+    assert len(gh.calls) == calls, "a dry run reads nothing"
+
+    assert cli.main(["--state-dir", sd, command]) == 0
+    out = capsys.readouterr().out
+    assert "PR HEAD moved after the clean review" in out
+    assert "READY_FOR_MERGE -> REVIEW (not merged)" in out
+    if command == "step":
+        assert reviewed == [first], "step executes the one transition"
+        assert cli.main(["--state-dir", sd, "resume"]) == 0
+        out = capsys.readouterr().out
+    assert reviewed == [first, pushed]
+    assert "AutoForge workflow reached READY_FOR_MERGE." in out
+    assert f"Reviewed HEAD: {pushed}" in out and "Review round:  2" in out
+    assert gh.merges == []
+    assert cli.main(["--state-dir", sd, "status", "--json"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["phase"] == "READY_FOR_MERGE" and status["reviewed_head_sha"] == pushed
+    assert status["review_certificate_status"]["applicable"] is True
+
+
+@pytest.mark.parametrize("command", ["step", "resume"])
+@pytest.mark.parametrize(
+    ("field", "said"),
+    [("state", "reports no state, not OPEN, CLOSED or MERGED"), ("head_sha", "reports no HEAD")],
+    ids=["no state", "no HEAD"],
+)
+def test_an_incomplete_pr_answer_at_ready_for_merge_is_an_error_not_the_banner(
+    tmp_path, capsys, monkeypatch, fakes, command, field, said
+):
+    """R1-F2 through the CLI: a held run whose PR GitHub answers without a state,
+    or OPEN without a HEAD, is not shown as held at the reviewed revision.
+
+    ``resume`` does not print the READY_FOR_MERGE banner and exit 0, nor
+    ``step`` refuse with the merge-gate message: both exit 1 with the read's
+    own error and its stop line, the state file unchanged byte for byte.
+    """
+    monkeypatch.chdir(tmp_path)
+    _drive_to_ready(fakes)
+    gh = fakes["gh"]
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    assert json.loads(state_file.read_text())["phase"] == "READY_FOR_MERGE"
+    before = state_file.read_bytes()
+    setattr(gh.prs[PR], field, "")
+    assert cli.main(["--state-dir", sd, command]) == 1
+    captured = capsys.readouterr()
+    assert said in captured.err and "the run stays READY_FOR_MERGE" in captured.err
+    assert "stop: resumable_error (reason verification-failed, from exception: " in captured.err
+    assert "merge is disabled" not in captured.err
+    assert "AutoForge workflow reached READY_FOR_MERGE." not in captured.out
+    assert state_file.read_bytes() == before and gh.merges == []
+
+
 def _drive_to_ready(fakes):
     """Agent script: ANALYZE_EXECUTE commits (the controller opens the PR), REVIEW is
     clean, UPDATE_EPIC ends."""
@@ -1454,14 +1556,16 @@ def test_resume_with_gate_open_rechecks_inconclusive_ready_for_merge_then_blocks
     assert "The merge gate is closed" in capsys.readouterr().out  # no --allow-merge: holds
     gh.prs[PR].mergeable = "UNKNOWN"
 
-    # gate closed (flag missing): resume is a no-op banner, GitHub is not read
+    # gate closed (flag missing): resume reads the PR's revision alone (#447),
+    # finds it unmoved and prints the banner; the gate's checks read is not made
     def pr_reads():  # the identity read and the gate's checks read (#291)
         return gh.calls.count(("get_pr", PR)) + gh.calls.count(("get_pr_with_checks", PR))
 
-    n_reads = pr_reads()
+    n_checks = gh.calls.count(("get_pr_with_checks", PR))
     assert cli.main(["--config", cfg, "--state-dir", sd, "resume"]) == 0
     assert "a human must review and merge the PR." in capsys.readouterr().out
-    assert pr_reads() == n_reads
+    assert gh.calls.count(("get_pr_with_checks", PR)) == n_checks
+    n_reads = pr_reads()
 
     # gate open: each resume performs one verification attempt and keeps the phase
     for n in (1, 2):

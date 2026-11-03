@@ -112,6 +112,16 @@ def comment_reads(gh) -> int:
     return sum(1 for call in gh.calls if call[0] == "get_comment")
 
 
+def revision_reads(gh, since: int) -> bool:
+    """Whether GitHub was read since call ``since``, and only for the PR's revision (#447).
+
+    What the closed gate reads of a held run: the PR's identity read and the
+    merge base; never its checks, the review comment or anything else.
+    """
+    reads = {call[0] for call in gh.calls[since:]}
+    return bool(reads) and reads <= {"get_pr", "get_merge_base_sha"}
+
+
 def ready(tmp_state_dir, gh, *commands, premerge=()):
     """A certified run in READY_FOR_MERGE with the merge gate open in its configuration."""
     eng, head = certified(tmp_state_dir, gh, *commands)
@@ -494,10 +504,11 @@ def test_the_gate_stays_closed_with_a_certificate_held(tmp_state_dir):
 
     gh = FakeGitHub()
     eng, head = certified(tmp_state_dir, gh, PASSES)
-    calls = list(gh.calls)
+    calls = len(gh.calls)
     with pytest.raises(VerificationError, match="merge is disabled"):
         eng.step(allow_merge=True)
-    assert gh.calls == calls and gh.merges == []
+    # #447: the closed gate reads the PR's revision only, never its checks or the comment.
+    assert revision_reads(gh, calls) and gh.merges == []
 
 
 def test_a_refused_certificate_is_one_blocked_write(tmp_state_dir, monkeypatch):
@@ -1064,11 +1075,15 @@ def test_a_legacy_state_in_each_phase_reaches_a_validated_certified_merge(tmp_st
 def test_resume_with_the_gate_closed_says_whether_the_certificate_applies(
     tmp_state_dir, monkeypatch, capsys
 ):
-    """From state and the configuration in force: GitHub is not read."""
+    """The certificate line is from state and the configuration in force.
+
+    GitHub is read for the PR's revision alone (#447), which has not moved:
+    never for its checks or the review comment.
+    """
     gh = FakeGitHub()
     eng, head = certified(tmp_state_dir, gh, PASSES)
     monkeypatch.setattr(cli, "_engine_for", lambda args, cfg=None: eng)
-    calls = list(gh.calls)
+    calls = len(gh.calls)
 
     def banner() -> str:
         assert cli.main(["--state-dir", str(tmp_state_dir), "resume"]) == 0
@@ -1091,7 +1106,7 @@ def test_resume_with_the_gate_closed_says_whether_the_certificate_applies(
     eng.state = s
     eng._save()
     assert banner() == "Review certificate: none held; the merge gate would refuse to merge"
-    assert gh.calls == calls and gh.merges == []
+    assert revision_reads(gh, calls) and gh.merges == []
 
 
 def test_resume_with_the_gate_open_runs_the_full_gate_certificate_included(tmp_state_dir):
@@ -1104,6 +1119,103 @@ def test_resume_with_the_gate_open_runs_the_full_gate_certificate_included(tmp_s
     assert [o.next_phase for o in outcomes] == ["BLOCKED"]
     assert saved(eng).block_reason.startswith(f"{NO_CERTIFICATE} {head}")
     assert gh.merges == []
+
+
+# -- the closed gate holds the reviewed revision only (#447) -----------------------------
+
+
+@pytest.mark.parametrize("command", ["step", "resume"])
+@pytest.mark.parametrize(
+    "push",
+    [
+        lambda eng, head: a_human_push(eng, head),
+        lambda eng, head: a_human_push(eng, head, same_tree=True),
+        lambda eng, head: a_human_push(eng, f"{head}^"),
+    ],
+    ids=["new commit", "same tree, another commit", "force push"],
+)
+def test_a_push_with_the_gate_closed_goes_back_to_review_and_certifies_the_new_head(
+    tmp_state_dir, command, push
+):
+    """#447: a run held at READY_FOR_MERGE by the closed gate is not stuck on a
+    review of a head its PR no longer has.
+
+    ``step``, and ``resume`` (``run(recheck_held=True)``), read the PR's
+    revision (never its checks or the review comment) and go back to REVIEW
+    of the pushed head; the old certificate stays as history and does not apply;
+    the new round validates and certifies the pushed head alone, and once the
+    gate opens it is what merges. Nothing merges while the gate is closed.
+    """
+    gh = FakeGitHub()
+    eng, head = certified(tmp_state_dir, gh, PASSES)
+    assert not eng.merge_gate_open(allow_merge=True), "the configuration keeps the gate closed"
+    old = saved(eng).review_certificate
+    new = push(eng, head)
+    eng.provider._handler = scripted(clean_reviewer(eng, 2))
+    calls = len(gh.calls)
+    if command == "step":
+        out = eng.step()
+        assert revision_reads(gh, calls), "the PR's revision only: no gate pass ran"
+        assert out.next_phase == "REVIEW" and out.message.startswith("PR HEAD moved")
+        assert f"the PR is now at {new[:12]}" in out.message
+        s = saved(eng)
+        assert s.review_certificate == old and s.current_head_sha == new
+        assert status_applicable(eng).startswith("Applicable: no: the state's last review result")
+        assert eng.step().next_phase == "READY_FOR_MERGE"
+    else:
+        outcomes = eng.run(recheck_held=True)
+        assert [o.next_phase for o in outcomes] == ["REVIEW", "READY_FOR_MERGE"]
+        assert outcomes[0].message.startswith("PR HEAD moved")
+    assert gh.merges == []
+    s = saved(eng)
+    (validated,) = records_for(s, new)
+    cert = s.review_certificate
+    assert cert["review_round"] == 2 and cert["reviewed_head_sha"] == new
+    assert cert["records"] == [{"seq": validated["seq"], "digest": validated["digest"]}]
+    assert status_applicable(eng) == "Applicable: yes"
+
+    eng.config.safety.allow_merge = True
+    assert merges_through(eng) == ["MERGE", "UPDATE_EPIC"]
+    assert gh.merges == [(PR, "squash", new)]
+
+
+@pytest.mark.parametrize("move", [_rewritten_base, _retarget], ids=["rewritten base", "retarget"])
+def test_a_moved_base_with_the_gate_closed_goes_back_to_review(tmp_state_dir, move):
+    """#447 for the base: a retarget or a base rewritten under its name is the
+    same drift with the gate closed; the new round certifies the new base."""
+    gh = FakeGitHub()
+    eng, head = certified_on_history(tmp_state_dir, gh, PASSES)
+    eng.config.safety.allow_merge = False
+    base, merge_base, what = move(eng, gh, head)
+    out = eng.step()
+    assert out.next_phase == "REVIEW" and out.message.startswith(what)
+    eng.provider._handler = scripted(clean_reviewer(eng, 2))
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    cert = saved(eng).review_certificate
+    assert cert["review_round"] == 2
+    assert (
+        cert["reviewed_head_sha"],
+        cert["reviewed_base_ref"],
+        cert["reviewed_merge_base_sha"],
+    ) == (head, base, merge_base)
+    assert gh.merges == []
+
+
+def test_the_closed_gate_at_the_reviewed_revision_changes_nothing(tmp_state_dir):
+    """#447 changes nothing for an unmoved PR: ``step`` refuses with the gate's
+    message and ``resume`` stops, with the state file byte for byte as it was."""
+    from autoforge.errors import VerificationError
+
+    gh = FakeGitHub()
+    eng, head = certified(tmp_state_dir, gh, PASSES)
+    before = eng.paths.state_file.read_bytes()
+    calls = len(gh.calls)
+    with pytest.raises(VerificationError, match="merge is disabled"):
+        eng.step()
+    assert eng.run(recheck_held=True) == []
+    assert eng.paths.state_file.read_bytes() == before
+    assert revision_reads(gh, calls) and gh.merges == []
+    assert status_applicable(eng) == "Applicable: yes"
 
 
 # -- provider parity (D17.2) ------------------------------------------------------------

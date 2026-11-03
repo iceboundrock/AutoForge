@@ -5,6 +5,44 @@ so.
 
 ## Unreleased
 
+### A push to a PR held at `READY_FOR_MERGE` goes back to `REVIEW` with the merge gate closed (#447)
+
+- A run held at `READY_FOR_MERGE` by the closed merge gate (the default)
+  kept a clean review of a head its PR no longer had: after a push, a
+  rebase or a force push to the PR branch, `resume` re-printed the old
+  banner, `step` stopped at the merge gate, and only editing `state.json`
+  or `run --force` moved the run on. Now `resume` and `step` read the PR
+  from GitHub first (its HEAD and base, then the merge base; not its
+  checks or the review comment). A PR that moved since the review, a
+  retarget or a base rewritten under its name included, goes back to
+  `REVIEW` of the new revision, nothing merged, and `resume` goes on to
+  review it; the new round certifies the new head alone. A PR still at
+  the reviewed revision holds as before, and nothing is written.
+- `resume` of a `READY_FOR_MERGE` run now reads GitHub, so a failed read
+  exits 1 with the phase unchanged, where it printed the banner. It also
+  checks the run's recorded configuration first, as `step` always did: a
+  changed configuration refuses (exit 2) unless `--accept-config-change`.
+  `resume --dry-run` reads nothing and prints the banner.
+- An answer from GitHub that does not establish the PR's revision is an
+  error, never a hold: a PR with no state or one other than `OPEN`,
+  `CLOSED` and `MERGED`, an `OPEN` PR with no HEAD or no base, or an
+  answer naming another PR makes `resume` and `step` exit 1 with the
+  phase and the state unchanged. Only a PR GitHub reports `CLOSED` or
+  `MERGED` holds without being compared.
+- `autoforge epic recheck <EPIC URL> <ISSUE>` is the same read for an
+  issue the parallel EPIC scheduler settled at `READY_FOR_MERGE`, which the
+  scheduler never relaunches and a standalone `resume` refuses. While no
+  scheduler runs (it takes the repository lock, then the issue's run lock)
+  and with no open claim, it reads the PR; one that moved goes back to
+  `REVIEW` in the same run, its review history and claims kept, and the
+  next `epic resume` admits the issue and reviews the new head. No agent
+  runs and nothing is written to GitHub. `epic status` names it, with
+  `epic resume`, as the next steps of a `ready-for-merge` issue. The
+  scheduler and its workers still never read a settled issue themselves.
+  Its step for a moved PR is held to the run's step budget like any other:
+  one that leaves the run `BLOCKED` exits 1 and prints the run's reason and
+  its `stop:` line, as `step` and `resume` do, with the scheduler's routes.
+
 ### `status` shows where an unjournaled review comment may have come from (#416)
 
 When `REVIEW` blocks on a round comment the controller did not journal

@@ -91,6 +91,9 @@ Safety rules:
   state/log writes, no lock.
 - READY_FOR_MERGE is a holding state. MERGE requires BOTH
   ``safety.allow_merge=true`` in config AND ``--allow-merge`` on the CLI.
+  It holds the clean-reviewed revision only: with the gate closed, ``step``
+  and ``resume`` still read the PR and take a moved HEAD, base or merge
+  base back to REVIEW (#447).
 - Business failures (agent reports failure/blocked, verification mismatch,
   ambiguous recovery) never trigger blind retries. A failed launch the
   adapter recognised as a known transient failure of its provider
@@ -1324,6 +1327,20 @@ class _ReplanEntry:
     base_sha: str
 
 
+@dataclass(frozen=True)
+class _HeldRevisionMoved:
+    """What READY_FOR_MERGE read with the merge gate closed: the PR moved (#447).
+
+    ``pr`` is the OPEN reviewed PR as GitHub returned it, and
+    ``merge_base_sha`` the merge base read for it when its HEAD and base
+    were the reviewed ones (``""`` otherwise: the REVIEW entry reads it).
+    In memory only, handed from the read to the step that records it.
+    """
+
+    pr: PRInfo
+    merge_base_sha: str = ""
+
+
 @dataclass
 class UnblockOutcome:
     """Result of :meth:`ControllerEngine.unblock` for the CLI."""
@@ -1773,6 +1790,10 @@ class ControllerEngine:
         # by the scheduler, which a standalone ``resume`` refuses. Words
         # after ``autoforge``, paths only; empty for every other caller.
         self.continue_command: tuple[str, ...] = ()
+        # Why the last closed-gate read of a held READY_FOR_MERGE run held
+        # (#447), set by :meth:`_held_revision_moved` whenever it returns
+        # None, "" otherwise: what ``epic recheck`` reports. Never persisted.
+        self.held_reason = ""
 
     # -- the state directory as a held capability --------------------------
     @property
@@ -4282,6 +4303,10 @@ class ControllerEngine:
                 "(holds unless merge gate is opened) | MERGE | REVIEW",
                 notes=[
                     MERGE_GATE_MESSAGE,
+                    "with the gate closed, would read the PR via gh (its HEAD and base, then "
+                    "the merge base) and enter REVIEW of the new revision, the review's "
+                    "findings carried, if it moved since the clean review; at the reviewed "
+                    "revision it holds and writes nothing",
                     "with the gate open, would verify via gh before entering MERGE: last "
                     "review clean and bound to this PR, PR open at the reviewed HEAD and "
                     "base, the recorded review comment re-read and still this round's "
@@ -4603,6 +4628,7 @@ class ControllerEngine:
         on_outcome: Callable[[StepOutcome], None] | None = None,
         extra_stop_phases: Iterable[Phase] = (),
         should_continue: Callable[[], bool] | None = None,
+        recheck_held: bool = False,
     ) -> list[StepOutcome]:
         """Loop ``step()`` until a stop phase or ``max_steps``.
 
@@ -4611,6 +4637,15 @@ class ControllerEngine:
         through the controller-side pre-merge verification, MERGE and
         UPDATE_EPIC, so ``resume --allow-merge`` re-checks inconclusive
         GitHub data (bounded by ``merge.max_verification_attempts``).
+
+        ``recheck_held`` (``resume``, #447): a run that starts in
+        READY_FOR_MERGE held by the closed gate alone is checked against
+        GitHub before the loop stops there. A PR still at the clean-reviewed
+        HEAD, base and merge base ends the loop with nothing executed or
+        written, as before; a PR that moved off it is a step to REVIEW of the
+        new revision (:meth:`_held_revision_moved`), and the loop goes on
+        from there. Only the first step is checked: a run that reaches
+        READY_FOR_MERGE again in the same loop stops there.
 
         ``on_outcome`` is called with each step's outcome as soon as the
         step finished, before the next one starts (the CLI prints it, #192);
@@ -4622,13 +4657,16 @@ class ControllerEngine:
         stop phases besides the mode's, and ``should_continue`` a predicate
         that ends the loop when it returns false; both are checked before
         every step, the first included, so a run whose state already is in
-        one of the phases executes nothing. A dry run plans as before: it
-        executes nothing either way. The defaults are the loop above.
+        one of the phases executes nothing (READY_FOR_MERGE among them is
+        never rechecked). A dry run plans as before: it executes nothing
+        either way. The defaults are the loop above.
         """
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
-        stop_phases = TERMINAL_PHASES if self.merge_gate_open(allow_merge) else STOP_PHASES
-        stop_phases = frozenset(stop_phases) | frozenset(extra_stop_phases)
+        gate_open = self.merge_gate_open(allow_merge)
+        extra = frozenset(extra_stop_phases)
+        stop_phases = frozenset(TERMINAL_PHASES if gate_open else STOP_PHASES) | extra
+        recheck = recheck_held and not gate_open and Phase.READY_FOR_MERGE not in extra
         if dry_run:
             outcomes = [self._step_once(dry_run=True, allow_merge=allow_merge)]
             assert self.state is not None
@@ -4642,13 +4680,19 @@ class ControllerEngine:
             return outcomes
         all_outcomes: list[StepOutcome] = []
         with self._execution_lock():
-            for _ in range(max_steps):
+            for index in range(max_steps):
                 assert self.state is not None
-                if self.state.phase in stop_phases:
+                held_check = recheck and index == 0 and self.state.phase == Phase.READY_FOR_MERGE
+                if self.state.phase in stop_phases and not held_check:
                     break
                 if should_continue is not None and not should_continue():
                     break
-                outcome = self._step_once(dry_run=False, allow_merge=allow_merge)
+                held: _HeldRevisionMoved | None = None
+                if held_check:
+                    held = self._held_revision_moved()
+                    if held is None:
+                        break
+                outcome = self._step_once(dry_run=False, allow_merge=allow_merge, held=held)
                 all_outcomes.append(outcome)
                 if on_outcome is not None:
                     on_outcome(outcome)
@@ -4676,7 +4720,10 @@ class ControllerEngine:
             stop=stop,
         )
 
-    def _step_once(self, dry_run: bool, allow_merge: bool) -> StepOutcome:
+    def _step_once(
+        self, dry_run: bool, allow_merge: bool, held: _HeldRevisionMoved | None = None
+    ) -> StepOutcome:
+        """One phase execution; ``held`` is what :meth:`run` already read for READY_FOR_MERGE."""
         state = self._require_state()
         previous = state.phase
         # Set again only by this step's REVIEW entry (ADR 0006 D5.5, D5.7).
@@ -4748,7 +4795,7 @@ class ControllerEngine:
         if previous == Phase.INITIALIZING:
             return self._initialize(plan)
         if previous == Phase.READY_FOR_MERGE:
-            return self._ready_for_merge_step(plan, allow_merge)
+            return self._ready_for_merge_step(plan, allow_merge, held)
         if previous == Phase.MERGE:
             return self._merge_step(plan, allow_merge)
         resolved = self._remote_entry(previous, plan)
@@ -8550,15 +8597,39 @@ class ControllerEngine:
             )
         return notes
 
-    def _ready_for_merge_step(self, plan: StepPlan, allow_merge: bool) -> StepOutcome:
+    def _ready_for_merge_step(
+        self, plan: StepPlan, allow_merge: bool, held: _HeldRevisionMoved | None = None
+    ) -> StepOutcome:
         """READY_FOR_MERGE -> MERGE only after the full pre-merge verification.
 
         The same GitHub checks MERGE performs run here first, so a PR that
         GitHub reports as closed, conflicting, failing checks, draft, or
         drifted never enters MERGE at all (MERGE re-verifies anyway: the
         data may change between the two steps).
+
+        With the merge gate closed the step can only leave for REVIEW: a PR
+        that moved off the clean-reviewed revision (``held``, when
+        :meth:`run` already read it, else read here) goes back to REVIEW of
+        the new revision with the review's findings carried, as it does with
+        the gate open (#447). A PR still at that revision refuses with the
+        merge-gate message and changes nothing, as before.
         """
         state = self._require_state()
+        if not self.merge_gate_open(allow_merge):
+            moved = held or self._held_revision_moved()
+            if moved is None:
+                raise VerificationError(MERGE_GATE_MESSAGE)
+            pr = moved.pr
+            return self._revision_drift_to_review(
+                Phase.READY_FOR_MERGE,
+                plan,
+                pr,
+                detail=(
+                    f" of HEAD {state.reviewed_head_sha[:12]} (the PR is now at "
+                    f"{pr.head_sha[:12]} on {pr.base_ref!r}; the merge gate is closed)"
+                ),
+                merge_base_sha=moved.merge_base_sha,
+            )
         verified = self._verify_pr_for_merge(Phase.READY_FOR_MERGE, plan, allow_merge)
         if isinstance(verified, StepOutcome):
             return verified
@@ -8577,6 +8648,98 @@ class ControllerEngine:
                 f"review certificate of round {state.review_round} applies; "
                 f"READY_FOR_MERGE -> {nxt.value}"
             ),
+        )
+
+    def _held_revision_moved(self) -> _HeldRevisionMoved | None:
+        """READY_FOR_MERGE, merge gate closed: did the PR leave the reviewed revision? (#447)
+
+        The closed gate holds a run at the revision its clean review and
+        review certificate name, and at nothing else. A push to the PR (a
+        new commit, a force push, a rebase), a retarget or a base rewritten
+        under its name makes that review stale exactly as with the gate
+        open, so this reads what the open gate's drift check reads -- the
+        PR's identity read, then the merge base when HEAD and base are the
+        reviewed ones -- and returns the moved revision for the step to
+        record. It reads no checks and no review comment, runs nothing and
+        writes nothing; the certificate is not consulted, because the next
+        round certifies the new revision alone.
+
+        ``None`` (hold, as before) when the PR is at the reviewed HEAD, base
+        and merge base, and when this read has nothing it may decide: no
+        complete clean-review binding in state, a ``current_pr_url`` that
+        is not the reviewed PR, or a PR GitHub reports CLOSED or MERGED (a
+        merge by hand leaves the run READY_FOR_MERGE while the gate is
+        closed). The open gate judges each of those itself.
+
+        An answer that establishes neither -- GitHub naming another PR, a
+        state missing or none of OPEN, CLOSED and MERGED, or an OPEN PR with
+        no HEAD or no base (the decoder lets an absent or null field through
+        as ``""``) -- is no evidence that the reviewed revision is still
+        the PR's, so it raises :class:`VerificationError` rather than hold
+        (R1-F2). That, and a read that fails (its GitHubError, named), leave
+        the phase and the state file unchanged.
+
+        Each hold sets :attr:`held_reason` to why it held.
+        """
+        state = self._require_state()
+        url = state.current_pr_url
+        reviewed = (state.reviewed_head_sha or "").lower()
+        self.held_reason = ""
+
+        def hold(reason: str) -> _HeldRevisionMoved | None:
+            self.held_reason = reason
+            return None
+
+        if (
+            not url
+            or state.last_review_result != "clean"
+            or not reviewed
+            or not state.reviewed_pr_url
+            or not state.reviewed_base_ref
+            or not state.reviewed_merge_base_sha
+        ):
+            return hold(
+                "the state holds no complete clean review bound to a PR, a HEAD, a base and "
+                "a merge base, so there is no revision to compare (the open merge gate "
+                "refuses such a state too)"
+            )
+        reviewed_ref = parse_pr_url(state.reviewed_pr_url)
+        if not parse_pr_url(url).same_target(reviewed_ref):
+            return hold(
+                f"current_pr_url {url} is not the reviewed PR {state.reviewed_pr_url}, so it "
+                "is not compared (the open merge gate blocks on it)"
+            )
+        with self._reading(f"PR {url}"):
+            pr = self.github.get_pr(url)
+        unchanged = (
+            "whether the PR is still at the reviewed HEAD "
+            f"{reviewed[:12]} on {state.reviewed_base_ref!r} cannot be told; the run stays "
+            "READY_FOR_MERGE and nothing was written"
+        )
+        if pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref):
+            raise VerificationError(f"GitHub answered {url} with PR {pr.url}: {unchanged}")
+        if pr.state in ("CLOSED", "MERGED"):
+            return hold(f"GitHub reports PR {url} {pr.state}, so it is not compared")
+        if pr.state != "OPEN":
+            shown = repr(pr.state) if pr.state else "no state"
+            raise VerificationError(
+                f"PR {url} reports {shown}, not OPEN, CLOSED or MERGED: {unchanged}"
+            )
+        missing = [
+            name for name, value in (("HEAD", pr.head_sha), ("base", pr.base_ref)) if not value
+        ]
+        if missing:
+            raise VerificationError(
+                f"PR {url} is OPEN and reports no {' and no '.join(missing)}: {unchanged}"
+            )
+        if pr.head_sha != reviewed or pr.base_ref != state.reviewed_base_ref:
+            return _HeldRevisionMoved(pr)
+        merge_base = self._merge_base_of(pr)
+        if merge_base != state.reviewed_merge_base_sha:
+            return _HeldRevisionMoved(pr, merge_base)
+        return hold(
+            f"PR {url} is still at the reviewed HEAD {reviewed[:12]}, its base "
+            f"{pr.base_ref!r} and merge base {merge_base[:12]}"
         )
 
     def merge_gate_open(self, allow_merge: bool) -> bool:

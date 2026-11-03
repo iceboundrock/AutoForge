@@ -443,11 +443,15 @@ AutoForge workflow reached READY_FOR_MERGE.
   ...
 The merge gate is closed: a human must review and merge the PR.
 (AutoForge merges only with 'safety.allow_merge: true' in the config and --allow-merge.)
+A push to the PR branch makes this review stale: 'resume' reads the PR from GitHub and reviews the new head.
 ========================================================================
 ```
 
 Read the pull request and the review comment, and merge it on GitHub if you
-agree, or close it. The run stays at `READY_FOR_MERGE`; for the next issue,
+agree, or close it. If you push to the PR branch first (a rebase onto a
+newer default branch, say), `autoforge resume` sees the new head on GitHub
+and reviews it before the run stops here again. The run stays at
+`READY_FOR_MERGE`; for the next issue,
 `autoforge run --force --epic ... --issue ...` replaces it. Each issue keeps
 its agent worktree under `.git/autoforge/worktrees/<number>`; `git worktree
 list` shows them. Deleting the clone of a repository made for the first run

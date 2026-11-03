@@ -320,7 +320,9 @@ autoforge resume
 
 With the merge gate closed (the default) the run stops at
 `READY_FOR_MERGE` with a banner naming the issue, PR, review round and
-reviewed HEAD, and a human merges the PR. Only with `safety.allow_merge:
+reviewed HEAD, and a human merges the PR. A push to the PR branch after
+that review sends the run back to `REVIEW` of the new head on the next
+`resume`. Only with `safety.allow_merge:
 true` in config does `autoforge resume --allow-merge` let the
 controller verify the PR on GitHub and merge it itself.
 
@@ -348,8 +350,9 @@ from GitHub's native sub-issues and "blocked by" links, each in its own
 worker, namespace and worktree. Every worker stops at its settlement
 boundary (`READY_FOR_MERGE`, `BLOCKED`, `DONE`, `FAILED`), so nothing is
 merged without a human. `epic status` shows each child's category and next
-step without taking a lock, `epic stop` drains it, and `epic resume`
-recovers after a crash, a kill or a reboot
+step without taking a lock, `epic stop` drains it, `epic resume`
+recovers after a crash, a kill or a reboot, and `epic recheck` sends an
+issue settled at `READY_FOR_MERGE` whose PR was pushed to back to review
 ([Running an EPIC in parallel](docs/usage.md#running-an-epic-in-parallel)).
 It is experimental: it is verified offline only and has not yet driven a
 real EPIC ([Current maturity](#current-maturity)).
@@ -447,7 +450,7 @@ gate refuses it while its PR is open (`BLOCKED`, nothing merged), and
 `unblock` sends it to a new validated `REVIEW` round.
 
 **Experimental: implemented and verified offline:** the parallel EPIC
-scheduler (`autoforge epic run|resume|status|stop|archive`, ADR 0008). Its
+scheduler (`autoforge epic run|resume|status|stop|archive|recheck`, ADR 0008). Its
 crash windows are tested by killing real scheduler and worker processes at
 each one, but against the in-memory GitHub and scripted agents only, and it
 has not yet driven a real EPIC: run it on an EPIC you watch, with

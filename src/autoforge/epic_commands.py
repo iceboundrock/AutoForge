@@ -21,6 +21,11 @@ wires them. This module holds the rest, so the CLI only parses and prints:
 * **``epic archive``** (:func:`archive_issue`, D17.4): under the caller's L0
   and its own L2, the claim closed first and the state moved aside second;
   the logs, the worktree, the binding and the claim history are kept.
+* **``epic recheck``** (:func:`recheck_issue`, #447): under the caller's L0
+  and its own L2, an issue a worker settled at ``READY_FOR_MERGE`` read
+  against its PR by the engine, the merge gate closed: one that moved goes
+  back to ``REVIEW`` (``resumable`` for the next ``epic resume``), one at
+  the reviewed revision is left as it was.
 * **``epic run``'s refusal and ``--force``** (:func:`epic_run_guard`), run by
   the scheduler holding L0 before it writes anything, and the end-of-run
   check that no claim was left open (:func:`claims_left_open`).
@@ -34,7 +39,7 @@ wires them. This module holds the rest, so the CLI only parses and prints:
   problem.
 
 Nothing here names a provider, writes GitHub, records an effect or parses an
-agent's result.
+agent's result; ``epic recheck``'s one engine step launches nothing.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from .engine import ControllerEngine, StepOutcome
 from .epic_graph import (
     ChildVerdict,
     EpicSnapshot,
@@ -67,10 +73,11 @@ from .errors import (
     SchedulerStateError,
     SnapshotRefused,
     StateError,
+    StateTransitionError,
 )
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .git_transport import local_git_request
-from .locking import IssueRunLock, issue_run_lock_live, repository_lock_path
+from .locking import ControllerLock, IssueRunLock, issue_run_lock_live, repository_lock_path
 from .ownership import (
     StandaloneHold,
     admission_refusal,
@@ -107,6 +114,7 @@ from .scheduler_state import (
     SchedulerState,
     UncertainReason,
     archive_claim,
+    classify,
     classify_for_epic,
     load_scheduler_state,
     open_claims_for_epic,
@@ -574,10 +582,15 @@ def categorize(
         return row(Category.UNSUPPORTED, verdict.explain())
     if state is not None and state.phase is Phase.READY_FOR_MERGE:
         pr = state.current_pr_url or "its PR"
+        recheck = command(flags, "epic", "recheck", epic_url, str(facts.number))
         return row(
             Category.READY_FOR_MERGE,
             f"{pr} is at READY_FOR_MERGE: a human merges it (scheduler workers never "
-            "merge); its dependents become ready once the issue is closed as completed",
+            "merge); its dependents become ready once the issue is closed as completed. "
+            "After a push to the PR branch, 'epic recheck' on the issue, while no scheduler "
+            "runs (it takes the controller lock), reads the PR and sends one that moved back "
+            "to REVIEW; 'epic resume' then reviews the new head (#447)",
+            steps=(recheck, resume),
         )
     if state is not None and state.phase is Phase.BLOCKED and namespace is not None:
         reason = _bounded(state.block_reason or "no reason recorded", MAX_BLOCK_REASON_CHARS)
@@ -1561,3 +1574,187 @@ def archive_issue(
     finally:
         lock.release()
     return ArchiveReport(namespace, claim, moved, binding, problem)
+
+
+# -- epic recheck (#447) -----------------------------------------------------------------
+
+RECHECK_COMMAND = "epic recheck"
+
+
+@dataclass(frozen=True)
+class RecheckReport:
+    """What ``epic recheck`` read for one issue a worker settled at ``READY_FOR_MERGE``.
+
+    ``outcomes`` is the engine's one step, or none when the run held;
+    ``held`` is then the engine's reason (:attr:`ControllerEngine.held_reason`),
+    and ``phase`` is the state's phase afterwards.
+    """
+
+    issue: int
+    pr_url: str
+    phase: Phase
+    outcomes: tuple[StepOutcome, ...]
+    held: str
+    resume: str
+
+    def lines(self) -> list[str]:
+        n, pr = self.issue, self.pr_url or "its PR"
+        if not self.outcomes:
+            out = [
+                f"issue #{n}: {self.held or 'the run held'}; the run stays READY_FOR_MERGE "
+                "and nothing was written"
+            ]
+        elif self.phase is Phase.REVIEW:
+            out = [
+                f"issue #{n}: {pr} moved since its clean review; the run is back in REVIEW of "
+                "the new revision, its review history kept and nothing merged",
+                f"continue with: {self.resume} (it admits the issue and reviews the new head)",
+            ]
+        elif self.phase in (Phase.BLOCKED, Phase.FAILED):
+            # Only a moved PR is stepped; the CLI prints the reason and the
+            # typed stop after this line and exits 1 (R2-F1).
+            out = [
+                f"issue #{n}: {pr} moved since its clean review, but the step left the run "
+                f"{self.phase.value}, not back in REVIEW; nothing was merged"
+            ]
+        else:
+            out = [
+                f"issue #{n}: the run is now {self.phase.value}; 'epic status' names its next step"
+            ]
+        return [redact(line) for line in out]
+
+
+def _recheck_refusal(issue: int, classification: Classification) -> str:
+    """Why ``epic recheck`` does not read this namespace ("" when it does)."""
+    if classification.kind is ClassificationKind.UNCERTAIN:
+        return (
+            f"issue #{issue}'s namespace is {classification}: {classification.detail}; "
+            "'epic status' names what to do"
+        )
+    claim = classification.open_claim
+    if claim is not None:
+        return (
+            f"issue #{issue}'s {_claim_line(claim)} is still open: its scheduler ended "
+            "without closing it, and 'epic resume' classifies it first"
+        )
+    if classification.settlement is not Settlement.READY_FOR_MERGE:
+        return (
+            f"issue #{issue}'s namespace is {classification} ({classification.detail}), not "
+            f"held at READY_FOR_MERGE: '{RECHECK_COMMAND}' reads only an issue a worker "
+            "settled there; 'epic status' names its next step"
+        )
+    return ""
+
+
+def recheck_issue(
+    root: Path,
+    epic_url: str,
+    issue: int,
+    repository_id: Callable[[str], int],
+    engine_for: Callable[[IssueNamespace], ControllerEngine],
+    l0: ControllerLock,
+    *,
+    resume: str,
+    on_outcome: Callable[[StepOutcome], None] | None = None,
+) -> RecheckReport:
+    """``epic recheck``: read the PR of an issue a worker settled at READY_FOR_MERGE (#447).
+
+    The scheduler launches nothing more for a settled namespace (D15.1) and
+    its workers stop at READY_FOR_MERGE without reading the PR, so a push to
+    the PR branch after the clean review would leave the issue holding a
+    review of a head the PR no longer has. This is the operator's recheck,
+    the namespace's counterpart of a standalone ``resume``'s:
+
+    1. The caller holds L0 (``l0``), so no scheduler or worker of this
+       repository runs. The namespace must exist, be bound under
+       ``epic_url``'s EPIC and in this repository, by its numeric id as
+       ``epic archive`` checks it; otherwise nothing is read further.
+    2. L2 is taken non-blocking (a live owner refuses,
+       :class:`~autoforge.errors.IssueBusy`), and under it the namespace is
+       read strictly and classified (:func:`classify`): only a settled
+       ``ready_for_merge`` with no open claim goes on, every other class is
+       refused (StateTransitionError) with nothing read from GitHub.
+    3. ``engine_for`` builds the engine on the namespace's state, which must
+       load in READY_FOR_MERGE (else StateTransitionError, nothing read: a
+       step of another phase could launch an agent), run under
+       ``l0`` with the merge gate forced closed, as a worker's
+       (:meth:`ControllerEngine.run` with ``recheck_held=True``, one step):
+       the PR's identity read, then its merge base when HEAD and base are
+       the reviewed ones. A PR still at the reviewed revision leaves the
+       state as it was; one that moved takes READY_FOR_MERGE -> REVIEW, the
+       review stale and its findings carried, nothing merged, which makes
+       the namespace ``resumable`` for the next ``epic resume`` to admit and
+       review. That step is held to the run's bounds like any other: one the
+       exhausted step budget blocks leaves the run BLOCKED (``phase``), and
+       the CLI exits 1 with its typed stop. A read that fails, or an answer
+       that establishes no revision, raises with the state unchanged.
+
+    No agent runs and nothing is written to GitHub, to a claim or to
+    ``scheduler.json``: the run, its review rounds and loop bounds, its
+    records and the claim history are kept.
+    """
+    epic = parse_issue_url(epic_url)
+    namespace = issue_namespace(root, issue)
+    lookup = load_issue_namespace(root, issue)
+    binding = lookup.binding
+    if binding is None:
+        raise SchedulerStateError(
+            f"issue #{issue} has no scheduler namespace bound under EPIC #{epic.number} "
+            f"({namespace.directory}): '{RECHECK_COMMAND}' reads only an issue a worker "
+            "settled at READY_FOR_MERGE; a standalone run is read by 'resume'"
+        )
+    check_recorded_repository(
+        f"issue #{issue}'s namespace is bound under",
+        binding.repository,
+        binding.run_key.repository_id,
+        epic,
+        repository_id,
+        refused="nothing was read or written",
+    )
+    if binding.epic.number != epic.number:
+        other = f"https://github.com/{epic.repository}/issues/{binding.epic.number}"
+        raise SchedulerStateError(
+            f"issue #{issue}'s namespace is bound under EPIC #{binding.epic.number}, not "
+            f"#{epic.number}: 'autoforge {RECHECK_COMMAND} {other} {issue}' reads it"
+        )
+    lock = IssueRunLock(namespace)
+    try:
+        lock.acquire()
+    except IssueBusy as exc:
+        raise IssueBusy(
+            f"issue #{issue} has a live owner ({exc}); '{RECHECK_COMMAND}' refuses while it runs"
+        ) from exc
+    try:
+        read = read_namespace(namespace)
+        expected = ExpectedIdentity(binding.run_key.repository_id, repository=epic.repository)
+        refusal = _recheck_refusal(issue, classify(read.lookup, read.claim, expected=expected))
+        if refusal:
+            raise StateTransitionError(f"{refusal}. The PR was not read and nothing was written.")
+        engine = engine_for(namespace)
+        with engine.locked(held=l0):
+            loaded = engine.load()
+            if loaded.phase is not Phase.READY_FOR_MERGE:
+                # The classification above read the same file under the same
+                # locks; a state that no longer says READY_FOR_MERGE was not
+                # written by a controller, and its step could launch an agent.
+                raise StateTransitionError(
+                    f"issue #{issue}'s state is in phase {loaded.phase.value}, not "
+                    f"READY_FOR_MERGE, though its namespace was classified settled there: "
+                    f"'{RECHECK_COMMAND}' runs no step of it. The PR was not read and "
+                    "nothing was written."
+                )
+            outcomes = engine.run(
+                max_steps=1, allow_merge=False, on_outcome=on_outcome, recheck_held=True
+            )
+        final = engine.state
+        assert final is not None
+    finally:
+        lock.release()
+    return RecheckReport(
+        issue,
+        final.current_pr_url,
+        final.phase,
+        tuple(outcomes),
+        "" if outcomes else engine.held_reason,
+        resume,
+    )
