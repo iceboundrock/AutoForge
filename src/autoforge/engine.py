@@ -703,6 +703,18 @@ UNBLOCK_RECONCILES_MERGE = (
     "which reconciles and counts it once with the merge gate open"
 )
 
+# The phases that may follow a merge this run sent and has not counted
+# (#376): MERGE, whose re-read after `gh pr merge` can fail, and
+# READY_FOR_MERGE, which `unblock` enters to reconcile such a merge. Neither
+# can say "nothing was merged" from state alone.
+MERGE_GATE_PHASES = (Phase.READY_FOR_MERGE, Phase.MERGE)
+
+# The PR states that prove GitHub holds no merge of the PR (#376). The PR
+# decoder reads an absent or null state as "" and passes any other string
+# through, so only these two are evidence; anything but them and MERGED
+# leaves the outcome unknown.
+UNMERGED_PR_STATES = frozenset({"OPEN", "CLOSED"})
+
 # How many times UPDATE_EPIC may select a next issue the controller rejects
 # (does not exist, CLOSED, other repository, the EPIC or the current issue)
 # before the run is BLOCKED: the first rejection is retried once with the
@@ -4289,6 +4301,7 @@ class ControllerEngine:
                 "READY_FOR_MERGE (holding state; automatic merge disabled)",
                 "(holds unless merge gate is opened) | MERGE | REVIEW",
                 notes=[
+                    *self._merge_budget_plan_notes(s),
                     MERGE_GATE_MESSAGE,
                     "with the gate open, would verify via gh before entering MERGE: last "
                     "review clean and bound to this PR, PR open at the reviewed HEAD and "
@@ -4407,11 +4420,16 @@ class ControllerEngine:
         ]
 
     def _merge_budget_plan_notes(self, s: AutoForgeState) -> list[str]:
-        """Dry-run: what an exhausted step budget does to MERGE (:meth:`_budget_may_stop`)."""
+        """Dry-run: what an exhausted step budget does at the merge gate (:meth:`_budget_may_stop`).
+
+        READY_FOR_MERGE and MERGE alike: the stop's reason reads the PR once
+        (:meth:`_budget_merge_outcome`), since either may follow a merge this
+        run sent and has not counted (#376).
+        """
         budget = step_budget_reason(s.step_count, self.config.workflow.max_total_steps)
         if not budget:
             return []
-        if self._budget_may_stop(Phase.MERGE):
+        if self._budget_may_stop(s.phase):
             return [
                 f"would enter BLOCKED without executing: {budget}; the reason would read the "
                 "PR once to say whether GitHub holds a merge this run has not counted"
@@ -8646,9 +8664,9 @@ class ControllerEngine:
         )
 
     def _budget_block_reason(self, phase: Phase, reason: str) -> str:
-        """BLOCKED text for the exhausted step budget; in MERGE, what GitHub holds (#376)."""
+        """BLOCKED text for the exhausted step budget; at the merge gate, what GitHub holds."""
         head = f"{reason}. This budget is cumulative for the run and is not reset by 'resume'"
-        if phase is Phase.MERGE and self._require_state().current_pr_url:
+        if phase in MERGE_GATE_PHASES and self._require_state().current_pr_url:
             return f"{head}; {self._budget_merge_outcome()}"
         return (
             f"{head}; nothing was merged. Raise 'workflow.max_total_steps' in the config or "
@@ -8656,19 +8674,23 @@ class ControllerEngine:
         )
 
     def _budget_merge_outcome(self) -> str:
-        """What the budget's BLOCKED reason says of an uncounted MERGE's PR (#376).
+        """What the budget's BLOCKED reason says of an uncounted merge-gate PR (#376).
 
         The budget stops MERGE only while this run has counted no merge of
         the PR (:meth:`_budget_may_stop`), but an earlier MERGE step may
         still have sent ``gh pr merge``: one whose re-read failed charged
         the step and left the outcome unknown, and nothing in state records
-        that it sent the merge. So "nothing was merged" is not the
-        controller's to say from state. One identity read tells the cases
-        apart, as for a refused checks read (:meth:`_checks_refused_reason`);
-        it only words the reason, which is a BLOCKED whatever it finds: a
-        merge is reconciled and counted only by MERGE itself, after
-        ``unblock``. A read that fails, or answers with another PR, says the
-        outcome is unknown.
+        that it sent the merge. READY_FOR_MERGE is no proof either:
+        ``unblock`` sends such a merge, read as MERGED and uncounted, there
+        to be reconciled (:meth:`_unblock_with_pr`). So "nothing was merged"
+        is not the controller's to say from state in either phase. One
+        identity read tells the cases apart, as for a refused checks read
+        (:meth:`_checks_refused_reason`); it only words the reason, which is
+        a BLOCKED whatever it finds: a merge is reconciled and counted only
+        by MERGE itself, after ``unblock``. Only a state in
+        :data:`UNMERGED_PR_STATES` says nothing was merged; a read that
+        fails, answers with another PR, or reports any other state but
+        MERGED (an absent one included) says the outcome is unknown.
         """
         state = self._require_state()
         url = state.current_pr_url
@@ -8678,6 +8700,8 @@ class ControllerEngine:
             pr = self.github.get_pr(url)
             if pr.url and not parse_pr_url(pr.url).same_target(parse_pr_url(url)):
                 unknown = f"GitHub answered with PR {pr.url}"
+            elif pr.state != "MERGED" and pr.state not in UNMERGED_PR_STATES:
+                unknown = f"its state {pr.state!r:.40} is none of OPEN, CLOSED or MERGED"
         except (GitHubError, ConfigurationError) as exc:
             unknown = str(exc) or type(exc).__name__
         unblock = (
@@ -8696,7 +8720,7 @@ class ControllerEngine:
                 f"has not counted that merge. {unblock}"
             )
         return (
-            f"GitHub reports PR {url} as {pr.state or '(no state)'}, so nothing was merged. "
+            f"GitHub reports PR {url} as {pr.state}, so nothing was merged. "
             "Raise 'workflow.max_total_steps' in the config or start a new run."
         )
 
@@ -8985,14 +9009,17 @@ class ControllerEngine:
 
         "Nothing was merged" is said only where it is known (#376). It is
         not when this step ran ``gh pr merge`` and could not read the PR
-        back (``merge_sent``). Nor, in MERGE, when this step could not read
-        the PR at all (``pr_read`` false: the read failed, or GitHub
-        answered with another PR): an earlier MERGE step of this run may
-        have sent the merge and charged its step before its own re-read
-        failed, or a crash may have ended it after the write, and nothing
-        in state records either. A read that found the PR open is what
-        makes "nothing was merged" true; every caller past that read keeps
-        the default. READY_FOR_MERGE sends no merge, so it keeps it too.
+        back (``merge_sent``). Nor, at the merge gate, when this step could
+        not read the PR at all (``pr_read`` false: the read failed, GitHub
+        answered with another PR, or its state was none GitHub uses): an
+        earlier MERGE step of this run may have sent the merge and charged
+        its step before its own re-read failed, or a crash may have ended
+        it after the write, and nothing in state records either. That holds
+        in READY_FOR_MERGE too, which sends no merge itself but follows one:
+        ``unblock`` sends a PR it read as MERGED and uncounted there to be
+        reconciled (:meth:`_unblock_with_pr`). A read that found the PR open
+        is what makes "nothing was merged" true; every caller past that read
+        keeps the default.
         """
         if self._merge_already_counted():
             return "An earlier step of this run merged and counted the PR; nothing more was merged"
@@ -9002,7 +9029,7 @@ class ControllerEngine:
                 "unknown; this run counted no merge of it ('unblock': "
                 f"{UNBLOCK_RECONCILES_MERGE})"
             )
-        if not pr_read and self._require_state().phase == Phase.MERGE:
+        if not pr_read and self._require_state().phase in MERGE_GATE_PHASES:
             return (
                 "This step merged nothing and counted nothing, but it could not read the PR, "
                 "so whether an earlier MERGE step of this run merged it is unknown ('unblock': "
@@ -9011,15 +9038,21 @@ class ControllerEngine:
         return "Nothing was merged or counted"
 
     @staticmethod
-    def _checks_refused_text(url: str, exc: GitHubChecksAccessError) -> str:
-        """Why the merge gate blocks on a refused checks read (#291): the credential, the fix."""
+    def _checks_refused_text(url: str, exc: GitHubChecksAccessError, outcome: str = "") -> str:
+        """Why the merge gate blocks on a refused checks read (#291): the credential, the fix.
+
+        ``outcome`` replaces "so nothing was merged or counted" where the
+        identity read did not show that (#376): what the step leaves behind,
+        as sentences without the last full stop. The remedy stays either way.
+        """
         remedy = checks_access_remedy(exc.credential)
+        left = f". {outcome}." if outcome else ", so nothing was merged or counted."
         return (
             f"the check results of PR {url} could not be read: GitHub refused this "
             f"credential ({exc.credential or 'the token'}) the PR's check runs: {exc}. "
             "The merge gate needs a successful checks read; a refused one is never taken "
-            "as 'no checks' or as passed, and re-checking reads the same refusal, so "
-            f"nothing was merged or counted. {remedy[:1].upper()}{remedy[1:]}, then 'unblock'"
+            "as 'no checks' or as passed, and re-checking reads the same refusal"
+            f"{left} {remedy[:1].upper()}{remedy[1:]}, then 'unblock'"
         )
 
     def _checks_refused_reason(
@@ -9032,16 +9065,37 @@ class ControllerEngine:
         "nothing was merged": one identity read tells the two apart, so the
         reason says what GitHub holds. It stays a BLOCKED either way: the
         controller reconciles and counts a merge only after a successful
-        checks read, never on the identity read. An identity read that
-        fails, or answers with another PR, keeps the general reason.
+        checks read, never on the identity read. Only an identity read that
+        finds the PR in :data:`UNMERGED_PR_STATES` keeps the general reason,
+        "nothing was merged or counted" (#376). One that fails, answers with
+        another PR, or reports a state GitHub does not use keeps the checks
+        remedy but says what :meth:`_merge_so_far` says of a PR this step
+        could not read: an earlier MERGE step may have sent the merge (its
+        re-read failed), and ``unblock`` sends such a merge here to be
+        reconciled, so neither merge-gate phase may say from state that
+        nothing was merged.
         """
-        general = self._checks_refused_text(url, exc)
+        pr: PRInfo | None = None
         try:
             pr = self.github.get_pr(url)
-        except GitHubError:
-            return general
-        if pr.state != "MERGED" or (pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref)):
-            return general
+        except GitHubError as read_exc:
+            unread = f"The PR's identity read failed too: {read_exc}"
+        else:
+            if pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref):
+                unread = f"GitHub answered the PR's identity read with PR {pr.url}"
+            elif pr.state in UNMERGED_PR_STATES:
+                return self._checks_refused_text(url, exc)
+            elif pr.state != "MERGED":
+                unread = (
+                    f"The PR's identity read reported its state as {pr.state!r:.40}, none of "
+                    "OPEN, CLOSED or MERGED"
+                )
+            else:
+                unread = ""
+        if pr is None or unread:
+            return self._checks_refused_text(
+                url, exc, f"{unread}. {self._merge_so_far(pr_read=False)}"
+            )
         if self._merge_already_counted():
             return (
                 f"PR {url} is already MERGED on GitHub (head {pr.head_sha[:12] or '?'}), and "
@@ -9105,7 +9159,8 @@ class ControllerEngine:
           anything else is judged: the gate needs a successful checks read.
           One identity read only tells an already MERGED PR apart, so the
           reason says it merged and was not counted; it is never reconciled
-          or counted without the checks read
+          or counted without the checks read. An identity read that shows
+          neither MERGED nor OPEN or CLOSED leaves the outcome unknown (#376)
         """
         state = self._require_state()
         self._check_merge_gate(allow_merge)

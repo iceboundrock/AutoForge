@@ -7309,20 +7309,105 @@ def test_a_refused_checks_read_of_a_merged_pr_says_it_merged_and_was_not_counted
     assert fake_github.calls[before:] == [("get_pr_with_checks", PR), ("get_pr", PR)]
 
 
-def test_a_refused_checks_read_keeps_the_general_reason_when_the_pr_cannot_be_read(
-    tmp_state_dir, fake_github
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize(
+    ("unread", "detail"),
+    [
+        pytest.param(
+            lambda gh: setattr(
+                gh, "get_pr_error", GitHubUnavailableError("`gh pr view` failed: connection reset")
+            ),
+            "The PR's identity read failed too: `gh pr view` failed: connection reset. ",
+            id="read-fails",
+        ),
+        pytest.param(
+            lambda gh: setattr(gh, "get_pr_error", _UNAUTHORIZED),
+            "The PR's identity read failed too: `gh pr view` failed (exit 1): HTTP 401: Bad ",
+            id="read-refused",
+        ),
+        pytest.param(
+            lambda gh: _answers_with_another_pr(gh),
+            "GitHub answered the PR's identity read with PR https://github.com/owner/repo/pull/43",
+            id="another-pr",
+        ),
+        pytest.param(
+            lambda gh: setattr(gh.prs[PR], "state", ""),
+            "The PR's identity read reported its state as '', none of OPEN, CLOSED or MERGED. ",
+            id="no-state",
+        ),
+        pytest.param(
+            lambda gh: setattr(gh.prs[PR], "state", "QUEUED"),
+            "The PR's identity read reported its state as 'QUEUED', none of OPEN, CLOSED or ",
+            id="unknown-state",
+        ),
+    ],
+)
+def test_a_refused_checks_read_says_the_outcome_is_unknown_when_the_pr_cannot_be_read(
+    tmp_state_dir, fake_github, phase, unread, detail
 ):
-    """#291 (review R2): an identity read that fails too says nothing about a merge."""
+    """#291 (review R2), #376 (review R1-F1): GitHub holds a merge this run has not
+    counted, and the identity read that would tell it apart fails, answers with another
+    PR, or reports a state GitHub does not use. Either merge-gate phase may follow a merge
+    an earlier MERGE step sent and could not read back (READY_FOR_MERGE after 'unblock'),
+    so the reason keeps the checks remedy and says the outcome is unknown, never that
+    nothing was merged. Nothing is reconciled or counted on it."""
     fake_github.add_pr(head_sha=SHA_A, state="MERGED")
     fake_github.checks_error = checks_refused()
-    fake_github.get_pr_error = GitHubUnavailableError("`gh pr view` failed: connection reset")
-    eng = _in_merge(tmp_state_dir, fake_github)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
+    unread(fake_github)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED"
+    assert out.stop is not None and out.stop.code is StopReasonCode.GITHUB_CHECKS_REFUSED
     s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.attempt == 0
     assert f"the check results of PR {PR} could not be read" in s.block_reason
+    assert f"re-checking reads the same refusal. {detail}" in s.block_reason
+    assert (
+        "This step merged nothing and counted nothing, but it could not read the PR, so "
+        "whether an earlier MERGE step of this run merged it is unknown ('unblock': "
+    ) in s.block_reason
+    assert "`gh auth login`" in s.block_reason and s.block_reason.endswith(", then 'unblock'")
+    assert "nothing was merged" not in s.block_reason.lower()
     assert "already MERGED" not in s.block_reason
     assert s.counted_merged_prs == [] and fake_github.merges == []
+
+
+@pytest.mark.parametrize("pr_state", ["OPEN", "CLOSED"])
+def test_a_refused_checks_read_says_nothing_was_merged_when_github_shows_the_pr_unmerged(
+    tmp_state_dir, fake_github, pr_state
+):
+    """#376 (review R1-F2): OPEN and CLOSED are the states that show GitHub holds no merge,
+    so after the refused checks read the identity read keeps the general reason."""
+    fake_github.add_pr(head_sha=SHA_A, state=pr_state)
+    fake_github.checks_error = checks_refused()
+    eng = _in_merge(tmp_state_dir, fake_github)
+    assert eng.step(allow_merge=True).next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert "re-checking reads the same refusal, so nothing was merged or counted. " in reason
+    assert "is unknown" not in reason and "already MERGED" not in reason
+
+
+def test_a_refused_checks_read_of_a_counted_merge_never_says_nothing_was_merged(
+    tmp_state_dir, fake_github
+):
+    """#376: an earlier step of this run counted the merge (the save before the branch
+    deletion, #283), and the identity read after the refused checks read fails too. The
+    reason says the merge was counted, not that nothing was merged."""
+    fake_github.add_pr(head_sha=SHA_A, state="MERGED")
+    fake_github.checks_error = checks_refused()
+    eng = _in_merge(tmp_state_dir, fake_github)
+    eng.state.counted_merged_prs = [PR]
+    eng.state.merged_since_epic_update = 1
+    eng._save()
+    fake_github.get_pr_error = _UNAVAILABLE
+    assert eng.step(allow_merge=True).next_phase == "BLOCKED"
+    reason = eng.state.block_reason
+    assert "The PR's identity read failed too: " in reason
+    assert "An earlier step of this run merged and counted the PR; nothing more was merged." in (
+        reason
+    )
+    assert "nothing was merged" not in reason.lower() and "`gh auth login`" in reason
+    assert eng.state.counted_merged_prs == [PR] and fake_github.merges == []
 
 
 @pytest.mark.parametrize("pr_state", ["OPEN", "MERGED"])
@@ -7901,45 +7986,92 @@ def test_the_attempt_bound_after_gh_pr_merge_says_the_outcome_is_unknown(
         _reconciled_after_unblock(eng, fake_github)
 
 
+def _after_an_uncertain_merge(tmp_state_dir, gh, phase):
+    """`gh pr merge` landed and the re-read right after it failed; the run is back at the
+    merge gate in ``phase`` with the merge uncounted, at the last verification attempt
+    ``merge.max_verification_attempts`` allows. MERGE: that step left the run there for
+    ``resume``. READY_FOR_MERGE (#376 review R1-F3): the step was the bound's last attempt
+    and blocked, and 'unblock' read the PR as MERGED at the clean-reviewed HEAD and sent
+    the uncounted merge there to be reconciled."""
+    gh.add_pr(head_sha=SHA_A)
+    eng = _in_merge(tmp_state_dir, gh)
+    reentry = phase is Phase.READY_FOR_MERGE
+    eng.config.merge.max_verification_attempts = 1 if reentry else 2
+    restore = _merge_lands_then_reread_fails(gh)
+    if reentry:
+        assert eng.step(allow_merge=True).next_phase == "BLOCKED"
+        restore()
+        out = eng.unblock("inspected the PR on GitHub")
+        assert out.unblocked and out.phase == "READY_FOR_MERGE", out.message
+        assert "is MERGED at the clean-reviewed HEAD" in out.message
+    else:
+        with pytest.raises(VerificationError, match="Merge outcome unknown.*attempt 1/2"):
+            eng.step(allow_merge=True)
+        restore()
+    assert eng.state.phase == phase and gh.prs[PR].state == "MERGED"
+    assert eng.state.counted_merged_prs == [] and len(gh.merges) == 1
+    return eng
+
+
+_UNCERTAIN_MERGE_PHASES = pytest.mark.parametrize(
+    "phase", [Phase.MERGE, Phase.READY_FOR_MERGE], ids=["merge", "ready-for-merge-after-unblock"]
+)
+
+
+@_UNCERTAIN_MERGE_PHASES
 @pytest.mark.parametrize("error", [_UNAVAILABLE, _UNAUTHORIZED], ids=["transient", "conclusive"])
-def test_a_merge_step_that_cannot_read_the_pr_never_says_nothing_was_merged(
-    tmp_state_dir, fake_github, error
+def test_a_merge_gate_step_that_cannot_read_the_pr_never_says_nothing_was_merged(
+    tmp_state_dir, fake_github, phase, error
 ):
-    """An earlier MERGE step ran `gh pr merge` and its re-read failed; the next one cannot
-    read the PR at all (an outage that outlasts the merge, a credential that broke).
-    Whether that merge landed is unknown, at the bound and at once alike."""
-    fake_github.add_pr(head_sha=SHA_A)
-    eng = _in_merge(tmp_state_dir, fake_github)
-    eng.config.merge.max_verification_attempts = 2
-    restore = _merge_lands_then_reread_fails(fake_github)
-    with pytest.raises(VerificationError, match="Merge outcome unknown.*attempt 1/2"):
-        eng.step(allow_merge=True)
-    restore()
+    """An earlier MERGE step ran `gh pr merge` and its re-read failed; the next merge-gate
+    step cannot read the PR at all (an outage that outlasts the merge, a credential that
+    broke). Whether that merge landed is unknown, at the bound and at once alike, in MERGE
+    and in the READY_FOR_MERGE 'unblock' sends the merge to (#376 review R1-F3)."""
+    eng = _after_an_uncertain_merge(tmp_state_dir, fake_github, phase)
     fake_github.get_pr_error = error
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED", out.message
     reason = eng.state.block_reason
+    assert f"PR {PR} could not be read" in reason
     assert "This step merged nothing and counted nothing, but it could not read the PR, so " in (
         reason
     )
-    assert "whether an earlier MERGE step of this run merged it is unknown" in reason
+    assert "whether an earlier MERGE step of this run merged it is unknown ('unblock': " in reason
     assert not _says_nothing_was_merged(reason), reason
     assert fake_github.prs[PR].state == "MERGED" and eng.state.counted_merged_prs == []
     assert len(fake_github.merges) == 1
+    fake_github.get_pr_error = None
+    _reconciled_after_unblock(eng, fake_github)
+
+
+@_UNCERTAIN_MERGE_PHASES
+def test_a_merge_gate_step_answered_with_another_pr_never_says_nothing_was_merged(
+    tmp_state_dir, fake_github, phase
+):
+    """The same, when GitHub answers the PR read with another PR: this step learned nothing
+    of the reviewed PR, so it cannot say an earlier step did not merge it."""
+    eng = _after_an_uncertain_merge(tmp_state_dir, fake_github, phase)
+    _add_same_head_pr_against_another_base(fake_github)
+    other = fake_github.prs["https://github.com/owner/repo/pull/43"]
+    fake_github.get_pr_with_checks = lambda url: replace(other, checks=[])
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_IDENTITY
+    reason = eng.state.block_reason
+    assert "with PR https://github.com/owner/repo/pull/43, which is not the reviewed PR" in reason
+    assert "whether an earlier MERGE step of this run merged it is unknown ('unblock': " in reason
+    assert not _says_nothing_was_merged(reason), reason
+    assert len(fake_github.merges) == 1 and eng.state.counted_merged_prs == []
 
 
 @pytest.mark.parametrize(
-    ("phase", "breaker"),
-    [(Phase.READY_FOR_MERGE, _break_pr_read), (Phase.MERGE, _break_files_read)],
-    ids=["ready-for-merge-pr-read", "merge-read-after-the-pr"],
+    "phase", [Phase.READY_FOR_MERGE, Phase.MERGE], ids=["ready-for-merge", "merge"]
 )
-def test_nothing_was_merged_is_still_said_where_it_is_known(
-    tmp_state_dir, fake_github, phase, breaker
-):
-    """READY_FOR_MERGE sends no merge, and a MERGE step whose PR read found the PR open
-    knows GitHub has not merged it: both keep "Nothing was merged or counted"."""
+def test_nothing_was_merged_is_still_said_where_it_is_known(tmp_state_dir, fake_github, phase):
+    """A merge-gate step whose PR read found the PR open knows GitHub has not merged it:
+    a read that fails after it keeps "Nothing was merged or counted"."""
     fake_github.add_pr(head_sha=SHA_A)
-    breaker(fake_github, _UNAUTHORIZED)
+    _break_files_read(fake_github, _UNAUTHORIZED)
     eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED", out.message
@@ -7964,13 +8096,35 @@ def _budget_spent_by_a_merge_whose_reread_failed(tmp_state_dir, gh):
     return eng
 
 
+def _budget_stops_the_merge_gate_after_an_uncertain_merge(tmp_state_dir, gh, phase):
+    """The budget is spent and the next step is ``phase`` with the merge uncounted. MERGE:
+    the merge's own step spent it. READY_FOR_MERGE (#376 review R1-F3): the budget then
+    blocked MERGE; the operator raised it by one step and 'unblock' read the PR as MERGED
+    and sent the uncounted merge to READY_FOR_MERGE, whose PR read failed transiently.
+    That step was charged and stays in READY_FOR_MERGE, so the budget stops the next one."""
+    eng = _budget_spent_by_a_merge_whose_reread_failed(tmp_state_dir, gh)
+    if phase is Phase.READY_FOR_MERGE:
+        assert eng.step(allow_merge=True).next_phase == "BLOCKED"
+        eng.config.workflow.max_total_steps += 1
+        out = eng.unblock("inspected the PR on GitHub")
+        assert out.unblocked and out.phase == "READY_FOR_MERGE", out.message
+        assert "is MERGED at the clean-reviewed HEAD" in out.message
+        gh.get_pr_failures = 1
+        with pytest.raises(VerificationError, match=r"could not be read.*attempt 1/5"):
+            eng.step(allow_merge=True)
+    assert eng.state.phase == phase
+    assert eng.state.step_count == eng.config.workflow.max_total_steps
+    return eng
+
+
+@_UNCERTAIN_MERGE_PHASES
 def test_the_step_budget_says_github_holds_a_merge_the_run_has_not_counted(
-    tmp_state_dir, fake_github
+    tmp_state_dir, fake_github, phase
 ):
-    """The budget stops that MERGE before it re-inspects GitHub. One identity read words
-    the reason: the PR is MERGED and uncounted, the way out is 'unblock' once the budget
-    is raised, never a new run. The read writes nothing and counts nothing."""
-    eng = _budget_spent_by_a_merge_whose_reread_failed(tmp_state_dir, fake_github)
+    """The budget stops that merge-gate step before it re-inspects GitHub. One identity read
+    words the reason: the PR is MERGED and uncounted, the way out is 'unblock' once the
+    budget is raised, never a new run. The read writes nothing and counts nothing."""
+    eng = _budget_stops_the_merge_gate_after_an_uncertain_merge(tmp_state_dir, fake_github, phase)
     before = len(fake_github.calls)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED", out.message
@@ -7990,26 +8144,40 @@ def test_the_step_budget_says_github_holds_a_merge_the_run_has_not_counted(
 
 def _answers_with_another_pr(gh):
     _add_same_head_pr_against_another_base(gh)
-    other = gh.prs[PR_B]
+    other = gh.prs["https://github.com/owner/repo/pull/43"]
     gh.get_pr = lambda url: replace(other)
 
 
+@_UNCERTAIN_MERGE_PHASES
 @pytest.mark.parametrize(
     ("unreadable", "detail"),
     [
         (lambda gh: setattr(gh, "get_pr_error", _UNAVAILABLE), "503 Service Unavailable"),
         (lambda gh: setattr(gh, "get_pr_error", _UNAUTHORIZED), "401: Bad credentials"),
         (_answers_with_another_pr, "GitHub answered with PR https://github.com/owner/repo/pull/43"),
+        (
+            lambda gh: setattr(gh.prs[PR], "state", ""),
+            "its state '' is none of OPEN, CLOSED or MERGED",
+        ),
+        (
+            lambda gh: setattr(gh.prs[PR], "state", "QUEUED"),
+            "its state 'QUEUED' is none of OPEN, CLOSED or MERGED",
+        ),
     ],
-    ids=["transient", "conclusive", "another-pr"],
+    ids=["transient", "conclusive", "another-pr", "no-state", "unknown-state"],
 )
 def test_the_step_budget_says_the_outcome_is_unknown_when_the_pr_cannot_be_read(
-    tmp_state_dir, fake_github, unreadable, detail
+    tmp_state_dir, fake_github, phase, unreadable, detail
 ):
-    eng = _budget_spent_by_a_merge_whose_reread_failed(tmp_state_dir, fake_github)
+    """A read that fails, answers with another PR, or reports no state GitHub uses
+    (the decoder reads an absent or null state as "" and passes any other string
+    through) does not show what GitHub holds (#376 review R1-F2): the outcome is
+    unknown, never "nothing was merged"."""
+    eng = _budget_stops_the_merge_gate_after_an_uncertain_merge(tmp_state_dir, fake_github, phase)
     unreadable(fake_github)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.STEP_BUDGET
     reason = eng.state.block_reason
     assert f"PR {PR} could not be read (" in reason and detail in reason
     assert "so whether an earlier MERGE step of this run merged it is unknown, and this run " in (
@@ -8021,41 +8189,50 @@ def test_the_step_budget_says_the_outcome_is_unknown_when_the_pr_cannot_be_read(
     assert len(fake_github.merges) == 1 and eng.state.counted_merged_prs == []
 
 
-def test_the_step_budget_says_nothing_was_merged_when_github_shows_the_pr_open(
-    tmp_state_dir, fake_github
+@pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
+@pytest.mark.parametrize("pr_state", ["OPEN", "CLOSED"])
+def test_the_step_budget_says_nothing_was_merged_when_github_shows_the_pr_unmerged(
+    tmp_state_dir, fake_github, phase, pr_state
 ):
-    """The common case, READY_FOR_MERGE -> MERGE as the last step: the read finds the PR
-    open, so "nothing was merged" is true, and a new run stays a remedy."""
-    fake_github.add_pr(head_sha=SHA_A)
-    eng = _in_merge(tmp_state_dir, fake_github)
+    """The common case, the step after a clean REVIEW or READY_FOR_MERGE -> MERGE as the
+    last step: the read finds the PR in a state that shows no merge (OPEN, or CLOSED), so
+    "nothing was merged" is true, and a new run stays a remedy. The dry-run plan says
+    the stop reads the PR."""
+    fake_github.add_pr(head_sha=SHA_A, state=pr_state)
+    eng = _in_merge(tmp_state_dir, fake_github, phase=phase)
     eng.config.workflow.max_total_steps = eng.state.step_count = 3
     (note,) = [n for n in eng.plan_step().notes if "max_total_steps" in n]
     assert note.startswith("would enter BLOCKED without executing:")
     assert note.endswith(
         "would read the PR once to say whether GitHub holds a merge this run has not counted"
     )
+    before = len(fake_github.calls)
     out = eng.step(allow_merge=True)
     assert out.next_phase == "BLOCKED", out.message
     assert eng.state.block_reason.endswith(
-        f"is not reset by 'resume'; GitHub reports PR {PR} as OPEN, so nothing was merged. "
-        "Raise 'workflow.max_total_steps' in the config or start a new run."
+        f"is not reset by 'resume'; GitHub reports PR {PR} as {pr_state}, so nothing was "
+        "merged. Raise 'workflow.max_total_steps' in the config or start a new run."
     )
+    assert [call[0] for call in fake_github.calls[before:]] == ["get_pr"]
     assert fake_github.merges == []
 
 
-def test_the_step_budget_outside_merge_reads_no_pr(tmp_state_dir, fake_github):
-    """No merge is ever sent outside MERGE: the reason keeps its text and reads nothing."""
-    fake_github.add_pr(head_sha=SHA_A)
-    eng = _in_merge(tmp_state_dir, fake_github, phase=Phase.READY_FOR_MERGE)
+def test_the_step_budget_outside_the_merge_gate_reads_no_pr(tmp_state_dir, fake_github):
+    """No step outside READY_FOR_MERGE and MERGE follows a merge this run has not counted
+    ('unblock' sends such a merge to READY_FOR_MERGE): the reason keeps its text and the
+    budget reads nothing for it."""
+    eng = _in_review(tmp_state_dir, fake_github, [], round_done=1)
     eng.config.workflow.max_total_steps = eng.state.step_count = 3
+    eng.plan_step()
     before = len(fake_github.calls)
-    out = eng.step(allow_merge=True)
+    out = eng.step()
     assert out.next_phase == "BLOCKED", out.message
     assert eng.state.block_reason.endswith(
         "is not reset by 'resume'; nothing was merged. Raise 'workflow.max_total_steps' in "
         "the config or start a new run."
     )
-    assert fake_github.calls[before:] == []
+    assert ("get_pr", PR) not in fake_github.calls[before:]
+    assert eng.provider.calls == []
 
 
 _LEAKY_SECRET = "ghp_FakeSecretForBlockReasonTest0123456789"

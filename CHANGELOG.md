@@ -15,13 +15,18 @@ a later `MERGE` step gave when it could not read the PR at all, and the
 operator could take that route for an issue whose PR had already merged.
 
 Now the first two say the outcome is unknown. In `MERGE`, the budget's
-reason reads the PR once and says what GitHub holds: open, so nothing was
-merged; `MERGED` and not counted; or unreadable. Each reason where a
-merge may have landed names the way out instead of a new run: raise the
-bound if one stopped the run, then `unblock`, which sends a PR merged at
-the clean-reviewed HEAD to `READY_FOR_MERGE`, where `resume --allow-merge`
-counts it once. The run stops in the same phases as before, and nothing
-is counted or merged differently; the one new GitHub call is that read.
+reason reads the PR once and says what GitHub holds: `OPEN` or `CLOSED`,
+so nothing was merged; `MERGED` and not counted; or unknown, for a read
+that fails, answers with another PR, or reports no state GitHub uses. The
+same holds in `READY_FOR_MERGE`, which `unblock` enters to reconcile such a
+merge, and for a refused checks read whose identity read does not show the
+PR's state: it keeps the credential's remedy and says the outcome is
+unknown. Each reason where a merge may have landed names the way out
+instead of a new run: fix what stopped the run, then `unblock`, which
+sends a PR merged at the clean-reviewed HEAD to `READY_FOR_MERGE`, where
+`resume --allow-merge` counts it once. The run stops in the same phases as
+before, and nothing is counted or merged differently; the one new GitHub
+call is that read, made only when the budget stops the run.
 
 ### `status` shows where an unjournaled review comment may have come from (#416)
 
