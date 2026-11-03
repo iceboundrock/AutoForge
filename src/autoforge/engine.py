@@ -11353,6 +11353,15 @@ class ControllerEngine:
         cannot be read leaves who does unknowable: both refuse. A marker that
         names this run lets it drive the PR it is bound to.
 
+        A marker of another issue that names another run refuses too (PR #459
+        R5-F2): that run drives the PR, for that issue. Filtered out as no
+        marker at all, a legacy binding kept driving the PR and FIX pushed
+        into it. Its owner is recorded like any other, so the PR stays refused
+        once it is removed. (A marker of another issue naming no run, or this
+        one, names no other owner: a legacy binding keeps driving under it,
+        and the publication fence refuses it,
+        :meth:`_other_issue_marker_problem`.)
+
         A marker naming no run, and no marker of this issue at all, are told
         apart by the run's own record, never by the PR (PR #459 R1-F1). When
         ``owned_pr_url`` names the bound PR, this run published it or took it
@@ -11391,6 +11400,11 @@ class ControllerEngine:
         bound = self._is_bound_pr(url)
         if bound:
             self._note_pr_owner(owners)
+        for claim in found.claims:
+            if claim.key != issue.identity and claim.owner_run_id not in (None, state.run_id):
+                if bound:
+                    self._note_pr_owner([claim.owner_run_id])
+                return self._other_issue_marker_text(url, claim)
         for owner in owners:
             if owner not in (None, state.run_id):
                 return (
@@ -11485,7 +11499,8 @@ class ControllerEngine:
         """Record the bound PR as owned when a marker of it names a run (#414, PR #459 R1-F1).
 
         ``owners`` are the runs the bound PR's implementation markers of the
-        current issue name, as just read or published. Any run, this one or
+        current issue name, as just read or published, or another run a marker
+        of another issue names (PR #459 R5-F2). Any run, this one or
         another, proves the PR has an owner, so a later read finding the
         owner gone refuses (:meth:`_pr_owner_problem`). It is written into
         the state in memory and, when the binding it is about is the one the
@@ -14699,30 +14714,34 @@ class ControllerEngine:
 
         PR #459 R5-F2: the publication fence (:meth:`_analyze_owner_fence`)
         judges every implementation marker on the PRs headed at the branch it
-        publishes to. :meth:`_pr_owner_problem` judges the current issue's
-        (and an unreadable one); a marker of any other issue, in this
-        repository or another, says the PR implements that issue, whichever
-        run it names or none, so which run drives the PR is that issue's
-        record, never this run's.
+        publishes to. :meth:`_pr_owner_problem` judges the current issue's, an
+        unreadable one and another issue's naming another run; a marker of
+        any other issue, in this repository or another, naming no run or this
+        one, still says the PR implements that issue, so it is no PR this
+        issue's plan publishes to.
         """
         state = self._require_state()
         issue = parse_issue_url(state.current_issue_url)
         for claim in scan(IMPLEMENTATION, pr.body or "").claims:
-            if claim.key == issue.identity:
-                continue
-            owner = claim.owner_run_id
-            whose = (
-                "naming no run"
-                if owner is None
-                else ("naming this run" if owner == state.run_id else f"naming run {owner}")
-            )
-            return (
-                f"PR {parse_pr_url(pr.url).canonical} carries the implementation marker of "
-                f"issue {claim.issue.canonical}, {whose}, not of issue #{issue.number}: it "
-                f"implements another issue, whose run drives it, and this run "
-                f"({state.run_id}) publishes nothing into it"
-            )
+            if claim.key != issue.identity:
+                return self._other_issue_marker_text(parse_pr_url(pr.url).canonical, claim)
         return ""
+
+    def _other_issue_marker_text(self, url: str, claim: ImplementationClaim) -> str:
+        """``claim``, a marker of another issue on PR ``url``, as an owner problem (#414)."""
+        state = self._require_state()
+        owner = claim.owner_run_id
+        whose = (
+            "naming no run"
+            if owner is None
+            else ("naming this run" if owner == state.run_id else f"naming run {owner}")
+        )
+        return (
+            f"PR {url} carries the implementation marker of issue {claim.issue.canonical}, "
+            f"{whose}, not of issue #{parse_issue_url(state.current_issue_url).number}: it "
+            f"implements another issue, whose run drives it, and this run ({state.run_id}) "
+            "publishes nothing into it"
+        )
 
     def _await_pushed_head(
         self, read: Callable[[], _Read], lagging: Callable[[_Read], bool], what: str

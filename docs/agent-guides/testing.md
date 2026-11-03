@@ -574,7 +574,14 @@ High-priority coverage includes:
   into the PR on the branch after a crash: the resume and a plain
   `unblock`'s re-entry push, adopt and open nothing with the branch where
   it was, and once the marker is removed the plan completes from the
-  journal (PR #459 R5-F2; `tests/test_engine.py`)
+  journal; one naming this run refuses too. A legacy binding in `REVIEW`,
+  `FIX` or at the merge gate whose PR carries a marker of another issue
+  naming another run blocks (`pr-owner`) with the owner recorded, launching
+  and pushing nothing, and after the marker is removed a restarted run's
+  `unblock` refuses and `run` launches nothing; naming no run or this one,
+  it keeps driving and records no owner. The probe after the agent's launch
+  blocks on a PR taken while the agent ran, with nothing planned, pushed or
+  created (PR #459 R5-F1, R5-F2; `tests/test_engine.py`)
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

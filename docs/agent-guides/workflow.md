@@ -873,7 +873,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   from this run's round 1; nothing of the run it was taken from (findings,
   verdict, certificate) is carried, and D9.6 still refuses a round comment
   already on the PR at the bound revision. A displaced run, whose bound
-  PR's marker names another run, blocks at its next entry and records the
+  PR's marker names another run, of this issue or another (PR #459 R5-F2),
+  blocks at its next entry and records the
   PR as owned; a plain unblock refuses it until the marker names it again,
   and removing the other run's owner does not hand the PR back to it.
 - **A fresh review instead of FIX** (`--rereview`, #428). Where the plain

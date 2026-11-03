@@ -19,7 +19,8 @@ A run recovers only the PR its own state recorded. A fresh run that finds
 the issue's marked PR blocks before it launches anything (stop code
 `pr-owner`), whatever run the marker names, and the reason names the owner.
 A run whose PR was handed to another run blocks at its next `REVIEW`, `FIX`
-or merge-gate entry. `REVIEW` checks again right before it posts its round
+or merge-gate entry, and so does a run whose PR carries the marker of another
+issue naming another run. `REVIEW` checks again right before it posts its round
 comment, `FIX` before each follow-up issue, marker append and acceptance
 comment after its first, and a replan before it launches its agent again
 and before each push and replacement PR of its saved plan. A run resuming

@@ -2245,7 +2245,11 @@ its author. Only the effect records and the entry observation prove origin.
     HEAD, whose marker names another run blocks (`pr-owner`) like an open
     one. Judged after them, it raised a verification error first, which
     leaves the phase as it was, so the displaced run re-entered the PR once
-    it was reopened and its owner removed. These reads are:
+    it was reopened and its owner removed. A marker of another issue that
+    names another run refuses on each of them too, since that run drives
+    the PR, and its owner is recorded (PR #459 R5-F2): read as no marker, a
+    legacy binding kept driving the PR and `FIX` pushed into it. These
+    reads are:
     - `ANALYZE_EXECUTE`'s probe of the PR its state persisted, judged
       before the PR's state and before the open-PR listing or the branch is
       read (PR #459 R5-F1). Judged after the state, a closed persisted PR
@@ -2279,8 +2283,8 @@ its author. Only the effect records and the entry observation prove origin.
       holds the branch, not a PR's body, so an owner written into the
       adopted PR since the plan was saved passes it. Every implementation
       marker on those PRs is judged, not the issue's alone: a marker of
-      another issue, whatever run it names or none, says the PR implements
-      that issue and refuses too (PR #459 R5-F2);
+      another issue, whatever run it names or none, this one included, says
+      the PR implements that issue and refuses too (PR #459 R5-F2);
     - the replan checkpoint and the read before the source is closed;
     - a read of the source before a transaction `PREPARED` on an earlier
       entry launches its agent again, and before each record of its saved
@@ -2343,8 +2347,9 @@ its author. Only the effect records and the entry observation prove origin.
     - K7's activation of a replacement its journaled record published
       under a marker naming this run;
     - a takeover;
-    - any read of the bound PR whose marker names a run, this one or
-      another, a refused `unblock`'s included, and the closed merge gate's
+    - any read of the bound PR whose marker of the issue names a run, this
+      one or another, or whose marker of another issue names another run
+      (PR #459 R5-F2), a refused `unblock`'s included, and the closed merge gate's
       read of a run it holds (PR #459 R3-F2), `ANALYZE_EXECUTE`'s probe of
       its persisted PR, the identity read behind a refused checks read and
       the step budget's read at the merge gate (PR #459 R5-F1).
@@ -2399,8 +2404,10 @@ its author. Only the effect records and the entry observation prove origin.
   - **Legacy PRs.** A run whose record does not name its PR as owned (a
     binding made by protocol 13 or older, or one whose marker never named
     a run) keeps driving it under a legacy marker or none, and a fresh run
-    refuses it. Its first read finding a marker that names a run ends
-    that. Two runs already bound to one legacy PR, as #387 left them, are
+    refuses it. A marker of another issue naming no run, or this one, names
+    no other owner, so it keeps driving under that too, though its saved
+    plan's fence publishes nothing into the PR. Its first read finding a
+    marker that names a run ends that. Two runs already bound to one legacy PR, as #387 left them, are
     separated by writing the one to keep into the marker.
   - **Protocol 14 (PR #459 R1-F1).** `owned_pr_url` is a new state field,
     so the state protocol is 14. A protocol-13 file loads with `""`,

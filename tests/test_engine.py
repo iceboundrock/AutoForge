@@ -9276,6 +9276,131 @@ def test_an_exhausted_budget_at_the_merge_gate_keeps_the_owner_its_read_finds(
     _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
 
 
+# -- another issue's marker on the PR a run drives (PR #459 R5-F2) ---------------------
+_FOREIGN_ISSUE_BODY = (
+    f"Started by hand.\n\n{implementation_pr_body(ISSUE3, owner_run_id=OTHER_RUN)}"
+)
+
+
+def _legacy_review(tmp_state_dir, gh: FakeGitHub):
+    return _in_review(tmp_state_dir, gh, ["never"])
+
+
+def _legacy_fix(tmp_state_dir, gh: FakeGitHub):
+    return _in_fix(tmp_state_dir, gh, ["never"], origin=True)
+
+
+def _legacy_ready(tmp_state_dir, gh: FakeGitHub):
+    gh.add_pr(head_sha=SHA_A)
+    return _in_ready(tmp_state_dir, gh)
+
+
+@pytest.mark.parametrize("entered", [_legacy_review, _legacy_fix, _legacy_ready])
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_legacy_binding_blocks_on_a_marker_of_another_issue_naming_another_run(
+    tmp_state_dir, fake_github, entered, remove, found
+):
+    """PR #459 R5-F2 on the reads of the bound PR: a legacy binding read a marker
+    of another issue naming another run as no marker at all, so it kept driving
+    the PR, and FIX pushed into it. That run owns the PR: the entry blocks with
+    nothing launched, pushed or posted, the owner recorded, and once the marker
+    is removed a restarted run's 'unblock' refuses and 'run' launches nothing."""
+    eng = entered(tmp_state_dir, fake_github)
+    eng._save()
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+    head = fake_github.prs[PR].head_sha
+    fake_github.prs[PR].body = _FOREIGN_ISSUE_BODY
+    out = eng.step(allow_merge=True)
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert (
+        f"carries the implementation marker of issue {ISSUE3}, naming run {OTHER_RUN}, not of "
+        "issue #2"
+    ) in eng.state.block_reason
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    assert fake_github.prs[PR].head_sha == head
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+@pytest.mark.parametrize("owner", [None, "self"], ids=["no-run", "this-run"])
+def test_a_legacy_binding_keeps_driving_under_another_issues_marker_naming_no_other_run(
+    tmp_state_dir, fake_github, owner
+):
+    """PR #459 R5-F2 refuses a marker of another issue on the bound PR only when it
+    names another run: naming none or this one it says of no other owner, so a
+    legacy binding keeps driving, as before #414, and records no owner."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_payload(1, SHA_A, []))])
+    eng._save()
+    run_id = eng.state.run_id if owner == "self" else None
+    fake_github.prs[PR].body = implementation_pr_body(ISSUE3, owner_run_id=run_id)
+    out = eng.step()
+    assert out.next_phase == "READY_FOR_MERGE", out.message
+    assert len(eng.provider.calls) == 1
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+
+
+def test_a_saved_plan_pushes_nothing_into_a_pr_marked_for_another_issue_naming_this_run(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """PR #459 R5-F2, the marker that names this run but another issue: what the
+    plan published names this issue, so this is no record to reconcile, and the
+    PR implements that issue. The saved K1 + K3 plan sends nothing after the crash,
+    with the branch where it was."""
+    eng, earlier = _adopting(tmp_state_dir, fake_github)
+    pushes = _logs_pushes(eng.origin)
+    _plan_saved_then_crashed(eng, monkeypatch)
+    body = f"Started by hand.\n\n{implementation_pr_body(ISSUE3, owner_run_id=eng.state.run_id)}"
+    fake_github.prs[PR41].body = body
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    _refused_for_the_branch_pr_owner(
+        eng2,
+        eng2.step(),
+        PR41,
+        f"carries the implementation marker of issue {ISSUE3}, naming this run, not of issue #2",
+        "push effect 0 on refs/heads/autoforge/2",
+    )
+    assert eng.origin.head("autoforge/2") == earlier and _pushes(pushes) == []
+    assert fake_github.effect_writes == [] and fake_github.prs[PR41].body == body
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(implementation_pr_body(owner_run_id=OTHER_RUN), id="this-issue"),
+        pytest.param(_FOREIGN_ISSUE_BODY, id="another-issue"),
+    ],
+)
+def test_a_legacy_analyze_binding_plans_nothing_for_a_pr_taken_while_the_agent_ran(
+    tmp_state_dir, fake_github, body
+):
+    """PR #459 R5-F1, the probe after the launch: a legacy binding's CLOSED PR named
+    no owner at the entry, so the agent launched, and another run took the PR while
+    it ran. The second probe, before the plan is saved, judges the owner: the step
+    blocks (pr-owner) saying nothing was planned, pushed or created, with the owner
+    recorded."""
+    fake_github.add_pr(head_sha=SHA_A, branch="feature/x", state="CLOSED", body="Started by hand.")
+
+    def agent(req):
+        fake_github.prs[PR].body = body
+        return _from_start(req)
+
+    eng = make_engine(tmp_state_dir, agent, github=fake_github, origin=True)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.state.current_pr_url = PR
+    eng._save()
+    pushes = _logs_pushes(eng.origin)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert "nothing was planned, pushed or created" in eng.state.block_reason
+    assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url, s.effect_records) == (PR, PR, [])
+    assert _pushes(pushes) == [] and fake_github.effect_writes == []
+
+
 def test_ready_for_merge_requires_clean_review_in_state(tmp_state_dir, fake_github):
     fake_github.add_pr(head_sha=SHA_A)
     eng = _in_ready(tmp_state_dir, fake_github, clean=False)

@@ -1030,7 +1030,8 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
 - a bound run checks the marker on the PR read each entry already makes:
   `REVIEW`, `FIX` and the merge gate (`_require_open_pr`, the merge gate's
   identity check), the replan transaction, and `unblock`. A marker that
-  names another run, or one it cannot read, blocks the run with nothing
+  names another run, of this issue or another (PR #459 R5-F2), or one it
+  cannot read, blocks the run with nothing
   launched, posted, pushed or merged, and `_require_open_pr` judges it as
   soon as the answer is the run's PR, before a `CLOSED` state or an
   unreadable HEAD is rejected (PR #459 R4-F1), which would leave the
