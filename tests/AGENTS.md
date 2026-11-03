@@ -474,6 +474,9 @@ ADR 0011)                             class mapped, routes from the outcome alon
                                       importer and nothing persisted; the fixtures: real stops with
                                       their outcome, code, source and routes), test_cli.py (the
                                       stop lines), test_stop_corpus.py (the corpus tool)
+recovery and escalation (#370,        test_stop_classification.py (ADR 0012's stop matrix takes
+ADR 0012)                             every outcome that needs recovery, its gate A table every
+                                      reason family and code, and every test it names exists)
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)
