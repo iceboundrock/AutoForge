@@ -5,8 +5,13 @@
   [maintainer acceptance on #370](https://github.com/iceboundrock/AutoForge/issues/370#issuecomment-6591923375),
   as proposed in PR #446 at `0aa7987`. That comment is the sign-off #370's
   first acceptance criterion asks for; this line only records it. The
-  commit that records it changes no decision. Planning only. Written at
-  `main` `0ba238e` (2026-11-02), where every reference below was read.
+  commit that records it changes no decision. One addition followed the
+  acceptance, at PR #446's review (R2-F1): D5 now names the threat-model,
+  cost and security reviews #370's decision 4 requires before any go for
+  gate A. It makes reopening A stricter, keeps A's no-go and changes no
+  other decision; the acceptance itself is of the text at `0aa7987`.
+  Planning only. Written at `main` `0ba238e` (2026-11-02), where every
+  reference below was read.
   - *Implemented with it:* nothing. No phase, edge, settlement, effect kind,
     configuration key, state field, protocol number, launch class, prompt or
     default changes. Three tests keep this record honest. Every test it names
@@ -17,9 +22,10 @@
     (`test_adr_0012_gate_a_takes_every_reason_family_and_code`).
   - *Recorded here:* the stop matrix (D2), the authority matrix (D3), a
     **no-go** for gate D, shadow diagnosis (D4), a **no-go** for gate A,
-    autonomous recovery actions (D5), and the rules any later advisor must
-    meet if a new record reopens D: the pause (D6), isolation (D7), evidence
-    (D8), cost and replay (D9), protocol and scope (D10).
+    autonomous recovery actions, with the class and the threat-model, cost
+    and security reviews a go needs (D5), and the rules any later advisor
+    must meet if a new record reopens D: the pause (D6), isolation (D7),
+    evidence (D8), cost and replay (D9), protocol and scope (D10).
 - **Decides:** #370 (REC-AR1), for #354.
 - **Builds on:** ADR 0011 (#369's typed stop classification, the baseline
   #370 names as its hard dependency).
@@ -252,16 +258,20 @@ shown only on an explicit request.
 
 **Outcome: no-go.** No recovery executor is approved.
 
-Gate A asks whether #369 and #373 show a nonempty class of recovery
-actions that are (i) permitted by D3 to something other than the operator,
-(ii) verifiable afterwards from facts the controller reads itself, and
-(iii) not already decided deterministically. #373 is not referenced in the
-repository at `0ba238e`. On #369's evidence, ADR 0011 D6's inventory of
-every stop sink, each family of reason codes (`ReasonFamily`) but
-`intentional` fails at least one condition. Every family is below, with
-every code it holds. The `intentional` family (the stops by design, and
-#126's reserved pause) is no recovery case; its row is there so that a code
-added to it is decided like any other:
+Gate A asks two things, in order. First, whether #369 and #373 show a
+nonempty class of recovery actions that are (i) permitted by D3 to
+something other than the operator, (ii) verifiable afterwards from facts
+the controller reads itself, and (iii) not already decided
+deterministically. Second, whether that class passes a threat-model, cost
+and security review (#370's decision 4). With no class there is nothing to
+review, so the no-go below rests on the first question alone; what a go
+needs is after the table. #373 is not referenced in the repository at
+`0ba238e`. On #369's evidence, ADR 0011 D6's inventory of every stop sink,
+each family of reason codes (`ReasonFamily`) but `intentional` fails at
+least one condition. Every family is below, with every code it holds. The
+`intentional` family (the stops by design, and #126's reserved pause) is no
+recovery case; its row is there so that a code added to it is decided like
+any other:
 
 | Family | Codes | What would resolve it | Fails |
 |---|---|---|---|
@@ -279,16 +289,42 @@ added to it is decided like any other:
 | `intentional` | `ready-for-merge`, `handoff`, `done`, `in-progress`, `awaiting-input` | nothing: a stop by design keeps ADR 0011 D1's routes (D2), and a pause is answered by its human through #126 (D6) | none applies: not a recovery case |
 
 The class is empty, so A is no-go. Nothing is built only to satisfy #354.
-A later record may reopen A only by naming a concrete action class that
-meets (i) to (iii), with the corpus evidence (D4 item 1) that it occurs.
-Three things could make one appear: a new stop family or code, a new effect
-kind approved under D10 that turns a remedy into a controller write with a
-verifiable identity, or #373's findings. The first cannot pass unnoticed: a
-family or code added to `stop_classification.py`, in any family,
-`intentional` included, without its row here fails
-`test_adr_0012_gate_a_takes_every_reason_family_and_code`. An action that
-meets the three conditions is still a typed controller operation behind D3,
-never an advisor's.
+
+A later record may reopen A, and give it a go, only by bringing all of the
+following. A qualifying class is necessary, not sufficient: the three
+reviews are approvals in their own right, and no evidence that the class
+exists stands in for them.
+
+1. **A concrete action class** that meets (i) to (iii), named action by
+   action.
+2. **The corpus evidence** (D4 item 1) that it occurs.
+3. **A passed threat-model review.** It places the executor and every
+   input it reads among the actors of the supported threat models (ADR
+   0004 §2.11, ADR 0005 §2.2), and shows that nothing untrusted (project
+   data, an agent's output, a stop's text) can choose an action or its
+   target. A review that leaves the executor outside those models, or finds
+   a path from untrusted text to an action, fails.
+4. **A passed cost review.** It states what each action spends in model
+   launches, time and GitHub writes, against the operator route it
+   replaces, under bounds enforced as counts and time (D9). An action whose
+   cost is only a provider's estimate, or has no enforced bound, fails.
+5. **A passed security review** of the executor's authority. It names the
+   D3 row that grants each action and shows that the executor holds no
+   credential an agent can reach and that `DENY` and `INCONCLUSIVE` still
+   fail closed for every action.
+
+Each review and its outcome is recorded in the record that reopens A,
+before any go and before any executor is built. This record performs none
+of them: with no class, there is nothing to review.
+
+Three things could make a class appear: a new stop family or code, a new
+effect kind approved under D10 that turns a remedy into a controller write
+with a verifiable identity, or #373's findings. The first cannot pass
+unnoticed: a family or code added to `stop_classification.py`, in any
+family, `intentional` included, without its row here fails
+`test_adr_0012_gate_a_takes_every_reason_family_and_code`. An action
+approved this way is still a typed controller operation behind D3, never an
+advisor's.
 
 ### D6. #126 and the scheduler's `Settlement`: no pre-BLOCK pause
 
@@ -448,8 +484,9 @@ unchanged.
 - **The corpus.** Running ADR 0011 D7's tool over the review report's
   history, and posting the summary on #369, is the first input any reopening
   of D or A needs. It is a maintainer's step, not this record's.
-- **#373.** Whether its findings name an action class that meets D5's three
-  conditions.
+- **#373.** Whether its findings name an action class that meets D5's
+  conditions (i) to (iii). Such a class still needs D5's three reviews
+  before a go.
 - **The persisted code.** It is needed only by a consumer in another
   process: a reopened D (D6), or #374 and #375 if they need it. It comes
   through #23 at that time.
