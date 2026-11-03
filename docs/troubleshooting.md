@@ -643,6 +643,18 @@ The messages below are AutoForge's own refusals, grouped by subject.
   mergeability unknown or a transient GitHub failure; re-run
   `autoforge resume --allow-merge`. After `merge.max_verification_attempts`
   attempts the run is `BLOCKED`.
+- **"whether GitHub merged the PR is still unknown"**, **"whether an
+  earlier MERGE step of this run merged it is unknown"** or, at
+  `workflow.max_total_steps`, **"is MERGED on GitHub ... and this run has
+  not counted that merge"**: `gh pr merge` may have landed although the
+  run counted nothing. `MERGE` says it, and so does the `READY_FOR_MERGE`
+  that `unblock` sends such a merge to, which can stop the same ways.
+  Check the PR on GitHub before starting a new run for the issue. To go
+  on, fix what stopped the run (raise the bound that did, or give the
+  credential the check access a refused checks read names), then
+  `unblock`: a PR merged at the clean-reviewed HEAD goes to
+  `READY_FOR_MERGE`, and `resume --allow-merge` reconciles and counts the
+  merge once, without merging again.
 - **A conclusive refusal** (a failing or missing check, merge conflicts, a
   PR that changes `safety.protected_merge_paths`, a review certificate that
   does not apply, check results the credential cannot read) is `BLOCKED`

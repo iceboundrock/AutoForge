@@ -1369,6 +1369,8 @@ def test_a_recheck_whose_step_blocks_the_run_exits_1_with_its_typed_stop(epic):
     blocked = b.state(2)
     assert blocked.phase is Phase.BLOCKED and blocked.run_id == held.run_id
     assert "workflow.max_total_steps=3 is reached" in blocked.block_reason
+    # #376: the reason words the recheck's own read of the OPEN PR, not a second one.
+    assert " as OPEN, so nothing was merged" in blocked.block_reason
     assert "but the step left the run BLOCKED, not back in REVIEW" in out
     assert f"run {held.run_id} is BLOCKED: " in out and "max_total_steps=3" in out
     stop = next(line for line in out.splitlines() if line.startswith("stop: "))

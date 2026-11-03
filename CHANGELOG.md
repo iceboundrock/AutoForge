@@ -5,6 +5,29 @@ so.
 
 ## Unreleased
 
+### A merge whose outcome is unknown is no longer reported as "nothing was merged" (#376)
+
+When the controller's re-read of a PR failed right after `gh pr merge`,
+the merge outcome was unknown, yet three `BLOCKED` reasons could still say
+nothing was merged: the one at `merge.max_verification_attempts`, the one
+a later `MERGE` step gave when it could not read the PR at all, and the
+`workflow.max_total_steps` one, which also offered "start a new run". An
+operator could take that route for an issue whose PR had already merged.
+
+Now the first two say the outcome is unknown. In `MERGE`, the budget's
+reason reads the PR once and says what GitHub holds: `OPEN` or `CLOSED`,
+so nothing was merged; `MERGED` and not counted; or unknown, for a read
+that fails, answers with another PR, or reports no state GitHub uses. The
+same holds in `READY_FOR_MERGE`, which `unblock` enters to reconcile such a
+merge, and for a refused checks read whose identity read does not show the
+PR's state: it keeps the credential's remedy and says the outcome is
+unknown. Each reason where a merge may have landed names the way out
+instead of a new run: fix what stopped the run, then `unblock`, which
+sends a PR merged at the clean-reviewed HEAD to `READY_FOR_MERGE`, where
+`resume --allow-merge` counts it once. The run stops in the same phases as
+before, and nothing is counted or merged differently; the one new GitHub
+call is that read, made only when the budget stops the run.
+
 ### A push to a PR held at `READY_FOR_MERGE` goes back to `REVIEW` with the merge gate closed (#447)
 
 - A run held at `READY_FOR_MERGE` by the closed merge gate (the default)

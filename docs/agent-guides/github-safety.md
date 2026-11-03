@@ -2307,6 +2307,31 @@ GitHub (an already-merged PR is recovered and counted once; an open one is
 re-verified), bounded by the same `merge.max_verification_attempts`, then
 `BLOCKED`.
 
+No state field records that a `MERGE` step sent `gh pr merge`, so a
+`BLOCKED` reason says "nothing was merged" only where that is known (#376):
+after a read of the PR found it `OPEN` or `CLOSED`, or outside the merge
+gate. `READY_FOR_MERGE` sends no merge, but it is no proof either: `unblock`
+sends a merge it read as `MERGED` and uncounted there to be reconciled. The
+step that ran `gh pr merge` and could not read the PR back says the outcome
+is unknown. So does a later `READY_FOR_MERGE` or `MERGE` step that cannot
+read the PR at all (the read fails, GitHub answers with another PR), since
+an earlier step may have sent the merge; a refused checks read keeps its
+credential remedy and says the same when the identity read after it does
+not show the PR `OPEN`, `CLOSED` or `MERGED`. A step budget that stops an
+uncounted `READY_FOR_MERGE` or `MERGE` before it re-inspects GitHub reads
+the PR once (the stop is `BLOCKED` whatever it finds) and says what GitHub
+holds: `OPEN` or `CLOSED`, so nothing was merged; `MERGED`, not counted; or
+unknown, for a read that fails, answers with another PR, or reports any
+other state. The PR decoder reads an absent or null state as empty and
+passes any other string through, so only those three states are evidence.
+Each of these names the way out: raise the bound where one stopped the run,
+then `unblock`, which reads the PR and sends a merge at the clean-reviewed
+HEAD to `READY_FOR_MERGE`, whose `MERGE` reconciles and counts it once
+(`_merge_so_far`, `_checks_refused_reason` and `_budget_merge_outcome` in
+`src/autoforge/engine.py`). The budget does not let such a `MERGE` run:
+unlike the counted one below, an uncounted PR still open would be merged by
+it.
+
 ### Deleting the merged head branch
 
 With `merge.delete_branch: true` (default `false`) the controller deletes
