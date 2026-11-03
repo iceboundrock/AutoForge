@@ -187,7 +187,8 @@ High-priority coverage includes:
   to a fresh validated `REVIEW`; HEAD drift, failing CI, a failing
   verification command, a deleted comment and `BEHIND` still refuse with a
   certificate held; the dry-run plan and the closed-gate `resume` banner say
-  whether it applies, from state, with no GitHub read; the invalidation
+  whether it applies, from state, while GitHub is read for the PR's
+  revision alone; the invalidation
   matrix: a push (a new commit, the same tree, a force push) certifies the
   new head alone, a base that only advanced keeps the certificate, a
   rewritten base or a retarget reuses the records and certifies the new
@@ -202,6 +203,22 @@ High-priority coverage includes:
   merges, and a legacy state in `REVIEW`,
   `READY_FOR_MERGE`, `MERGE` or `BLOCKED` reaches a validated, certified
   merge; Claude Code, OpenCode and Pi route the gate alike
+- a run held at `READY_FOR_MERGE` by the closed merge gate (#447,
+  `tests/test_engine.py`, `tests/test_merge_certificate.py`,
+  `tests/test_cli.py`): with the gate closed by the configuration, the
+  flag or both, `step` reads only the PR's identity and merge base; a push
+  (a new commit, the same tree, a force push), a retarget or a rewritten
+  base goes back to `REVIEW` with the review stale and its revision
+  persisted, through `step` and through `resume` (`run(recheck_held=True)`,
+  whose step reuses its one read), and the new round certifies the new
+  head alone, which is what merges once the gate opens; an unmoved PR, a
+  closed PR, a merge by hand and a PR that is not the reviewed one hold
+  with the state file unchanged, and a failed PR or merge-base read raises
+  with it unchanged; a plain `run` and a worker's `READY_FOR_MERGE` stop
+  phase read nothing; an exhausted step budget leaves an unmoved PR alone
+  and blocks the step to `REVIEW`; through the CLI, the reported case (a
+  clean run, its branch rewritten and force-pushed) is reviewed again by
+  `step` or `resume`, and `resume --dry-run` reads nothing
 - per-issue scheduler namespaces (#178, ADR 0008 D5, D17.3,
   `tests/test_run_namespace.py`, `tests/test_cli.py`): the RunKey and the
   layout are pure and independent of `--state-dir`, `config.state_dir` and

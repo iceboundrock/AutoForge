@@ -320,7 +320,9 @@ autoforge resume
 
 With the merge gate closed (the default) the run stops at
 `READY_FOR_MERGE` with a banner naming the issue, PR, review round and
-reviewed HEAD, and a human merges the PR. Only with `safety.allow_merge:
+reviewed HEAD, and a human merges the PR. A push to the PR branch after
+that review sends the run back to `REVIEW` of the new head on the next
+`resume`. Only with `safety.allow_merge:
 true` in config does `autoforge resume --allow-merge` let the
 controller verify the PR on GitHub and merge it itself.
 

@@ -80,6 +80,24 @@ UPDATE_EPIC -> ANALYZE_EXECUTE  next issue verified, a sub-issue of the EPIC
 UPDATE_EPIC -> DONE           agent reports no next issue (null), and none remains on GitHub
 ```
 
+`READY_FOR_MERGE -> REVIEW` is taken with the gate closed too (#447). The
+closed gate holds the clean-reviewed revision and nothing else, so `step`
+and `resume` read the PR first, the same drift check the open gate makes
+(its HEAD and base, then the merge base; never its checks, the review
+comment or the certificate), and take the edge when the revision moved,
+recording it as the open gate does (the review stale, its findings carried,
+nothing merged). `resume` then goes on to review the new revision; a PR
+still at the reviewed one holds, with nothing written. Only the first step
+of a `resume` reads a held run: one that reaches `READY_FOR_MERGE` again in
+the same invocation stops there, and a scheduler's worker, which does not
+ask for the recheck, never reads it. The recheck of an unmoved PR
+is no step and is not charged; the step to `REVIEW` is, so an exhausted
+step budget blocks it like any other. A closed PR, a merge by hand or a
+`current_pr_url` that is not the reviewed PR hold as before: those are the
+open gate's to decide. Because `resume` may launch the reviewer from here,
+it passes the recorded-configuration check of **Re-entering a phase**
+first, as `step` always did.
+
 `MERGE -> ANALYZE_EXECUTE` and `MERGE -> DONE` are declared in `LEGAL_EDGES`
 but reserved: `decide_next_phase` never chooses them, because EPIC batching
 is decided inside `UPDATE_EPIC`, which every merge passes through.
@@ -322,7 +340,8 @@ stops at its first non-`PASS`.
 - **Drift and evidence** (D14.1). Nothing marks a record or a certificate
   stale; applicability is derived where it is used, and old ones stay as
   history. A push to the PR (a new commit, a force push, or another commit
-  with the same tree) routes to `REVIEW` as before; the REVIEW entry
+  with the same tree) routes to `REVIEW` as before, from `READY_FOR_MERGE`
+  with the merge gate closed too (#447); the REVIEW entry
   validates the new commit and the new round's clean result certifies it
   alone. A retarget or a rewritten base routes to `REVIEW` too; the
   candidate-tree records still apply and are reused, and the new round's

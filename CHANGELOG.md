@@ -5,6 +5,27 @@ so.
 
 ## Unreleased
 
+### A push to a PR held at `READY_FOR_MERGE` goes back to `REVIEW` with the merge gate closed (#447)
+
+- A run held at `READY_FOR_MERGE` by the closed merge gate (the default)
+  kept a clean review of a head its PR no longer had: after a push, a
+  rebase or a force push to the PR branch, `resume` re-printed the old
+  banner, `step` stopped at the merge gate, and only editing `state.json`
+  or `run --force` moved the run on. Now `resume` and `step` read the PR
+  from GitHub first (its HEAD and base, then the merge base; not its
+  checks or the review comment). A PR that moved since the review, a
+  retarget or a base rewritten under its name included, goes back to
+  `REVIEW` of the new revision, nothing merged, and `resume` goes on to
+  review it; the new round certifies the new head alone. A PR still at
+  the reviewed revision holds as before, and nothing is written.
+- `resume` of a `READY_FOR_MERGE` run now reads GitHub, so a failed read
+  exits 1 with the phase unchanged, where it printed the banner. It also
+  checks the run's recorded configuration first, as `step` always did: a
+  changed configuration refuses (exit 2) unless `--accept-config-change`.
+  `resume --dry-run` reads nothing and prints the banner.
+- The scheduler's workers are unchanged: an issue `epic run` settled at
+  `READY_FOR_MERGE` is not read again.
+
 ### A body the controller writes back keeps text `gh` rewrites, and an operator's exact comment verifies (#328)
 
 - The controller writes an adopted PR's body (K3), a follow-up issue's

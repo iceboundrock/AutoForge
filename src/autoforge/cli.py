@@ -7,14 +7,16 @@ Commands:
           the run records the issue's native parent as its EPIC, --epic only when the
           issue has none (#293), and its dry run reads and prints the same binding
   step    execute exactly one phase step from persisted state
-  resume  continue a persisted run until a stop phase / max-steps; step, resume and
-          unblock refuse a REMOTE run whose recorded configuration (profile
-          routing, agent worktree root) this invocation's differs from, and any
-          run whose pinned sandbox.mode this invocation's is weaker than, unless
-          --accept-config-change (#219, #280). Under sandbox.mode required or
-          preferred every command refuses a --config file inside a tree the
-          repository's sandboxed launches write, or a directory a provider's
-          launches are given read-write (#280)
+  resume  continue a persisted run until a stop phase / max-steps; a run held at
+          READY_FOR_MERGE by the closed merge gate is read from GitHub first, and
+          goes back to REVIEW when its PR moved off the reviewed revision (#447);
+          step, resume and unblock refuse a REMOTE run whose recorded
+          configuration (profile routing, agent worktree root) this invocation's
+          differs from, and any run whose pinned sandbox.mode this invocation's
+          is weaker than, unless --accept-config-change (#219, #280). Under
+          sandbox.mode required or preferred every command refuses a --config
+          file inside a tree the repository's sandboxed launches write, or a
+          directory a provider's launches are given read-write (#280)
   unblock the operator's explicit exit from BLOCKED: the controller re-inspects
           live GitHub state, re-enters a phase through validate_transition or
           refuses and stays BLOCKED; the reason is recorded in state and the log.
@@ -1777,11 +1779,14 @@ def cmd_resume(args) -> int:
             return rc
         _check_configuration(engine, args, "resume", dry_run=False)
         _attach_terminal(engine)
+        # A run held at READY_FOR_MERGE by the closed gate is read from
+        # GitHub before the loop stops there (#447): REVIEW when its PR moved.
         outcomes = engine.run(
             max_steps=args.max_steps,
             dry_run=False,
             allow_merge=args.allow_merge,
             on_outcome=_print_outcome_now,
+            recheck_held=True,
         )
     return _finish(engine, outcomes, args.allow_merge, printed=True)
 
@@ -1972,14 +1977,21 @@ def _resume_holding_state(
 
     ``dry_run`` runs no git: the stop line of a terminal phase then cannot
     tell a scheduler namespace's state dir from a standalone one.
+
+    READY_FOR_MERGE with the merge gate closed is decided here only for a
+    dry run, which reads nothing from GitHub and prints the banner. A real
+    ``resume`` reads the PR first (``engine.run(recheck_held=True)``, #447),
+    so it passes the configuration check like ``step``: a PR that moved off
+    the reviewed revision goes back to REVIEW and the run continues, one
+    still at it ends with the same banner and exit 0.
     """
-    if state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(allow_merge):
-        # Holding state: nothing runs unless the merge gate is open. With the
-        # gate open, engine.run() performs the controller-side pre-merge
-        # verification instead (bounded re-checks of inconclusive GitHub data
-        # happen there, one attempt per resume), the review certificate's
-        # live check included (#175); the banner says only whether it
-        # applies against state and the configuration in force.
+    if dry_run and state.phase == Phase.READY_FOR_MERGE and not engine.merge_gate_open(allow_merge):
+        # Holding state: nothing runs unless the merge gate is open or the PR
+        # moved. With the gate open, engine.run() performs the controller-side
+        # pre-merge verification instead (bounded re-checks of inconclusive
+        # GitHub data happen there, one attempt per resume), the review
+        # certificate's live check included (#175); the banner says only
+        # whether it applies against state and the configuration in force.
         print_ready_banner(state, certificate=_review_certificate_check(engine, state))
         return 0
     if state.phase in TERMINAL_PHASES:
@@ -2993,6 +3005,8 @@ def print_ready_banner(
             "The merge gate is closed: a human must review and merge the PR.",
             "(AutoForge merges only with 'safety.allow_merge: true' in the config and "
             "--allow-merge.)",
+            "A push to the PR branch makes this review stale: 'resume' reads the PR from "
+            "GitHub and reviews the new head.",
         ]
     lines.append("=" * 72)
     # State-derived like the status output: the same redaction boundary.

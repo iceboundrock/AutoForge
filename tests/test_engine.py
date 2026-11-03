@@ -7485,13 +7485,191 @@ def test_a_refused_checks_read_is_not_an_empty_one_at_the_gate(tmp_state_dir, fa
     assert problem is not None and "were not read" in problem
 
 
-def test_ready_for_merge_gate_closed_reads_nothing(tmp_state_dir, fake_github):
+# The merge gate closed by each of its two halves, or by both (#447).
+CLOSED_GATES = pytest.mark.parametrize(
+    ("config_allows", "flag"),
+    [(True, False), (False, True), (False, False)],
+    ids=["no --allow-merge", "config off", "both off"],
+)
+
+
+def _held(tmp_state_dir, gh, config_allows=True, **kwargs):
+    """``_in_ready`` with ``safety.allow_merge`` as given; the state file's bytes."""
+    eng = _in_ready(tmp_state_dir, gh, **kwargs)
+    eng.config.safety.allow_merge = config_allows
+    return eng, eng.paths.state_file.read_bytes()
+
+
+def _reads_since(gh, before: int) -> list[str]:
+    return [call[0] for call in gh.calls[before:]]
+
+
+@CLOSED_GATES
+def test_ready_for_merge_gate_closed_at_the_reviewed_revision_holds(
+    tmp_state_dir, fake_github, config_allows, flag
+):
+    """#447: the closed gate reads the PR's revision and, unmoved, refuses as before.
+
+    Only what the open gate's drift check reads -- the identity read and the
+    merge base -- never the checks or the review comment; nothing is written.
+    """
     fake_github.add_pr(head_sha=SHA_A)
-    eng = _in_ready(tmp_state_dir, fake_github)
-    before = list(fake_github.calls)
+    eng, before_bytes = _held(tmp_state_dir, fake_github, config_allows)
+    before = len(fake_github.calls)
+    with pytest.raises(VerificationError, match="merge is disabled"):
+        eng.step(allow_merge=flag)
+    assert _reads_since(fake_github, before) == ["get_pr", "get_merge_base_sha"]
+    assert eng.paths.state_file.read_bytes() == before_bytes
+    assert eng.state.phase == Phase.READY_FOR_MERGE and fake_github.merges == []
+
+
+# Each move: what the outcome names, the PR's HEAD, base and merge base as
+# persisted (the merge base only when it was read), and the reads it took.
+def _head_pushed(gh):
+    gh.add_pr(head_sha=SHA_B)
+    return "PR HEAD moved", (SHA_B, "main", ""), ["get_pr"]
+
+
+def _retargeted(gh):
+    gh.add_pr(head_sha=SHA_A, base_ref="release")
+    return "PR base changed to 'release'", (SHA_A, "release", ""), ["get_pr"]
+
+
+def _base_rewritten(gh):
+    gh.add_pr(head_sha=SHA_A)
+    gh.merge_base = MERGE_BASE_B
+    what = f"PR merge base moved to {MERGE_BASE_B[:12]} from the reviewed {MERGE_BASE[:12]}"
+    return what, (SHA_A, "main", MERGE_BASE_B), ["get_pr", "get_merge_base_sha"]
+
+
+@CLOSED_GATES
+@pytest.mark.parametrize(
+    "move", [_head_pushed, _retargeted, _base_rewritten], ids=["push", "retarget", "rewritten base"]
+)
+def test_ready_for_merge_gate_closed_revision_moved_goes_back_to_review(
+    tmp_state_dir, fake_github, config_allows, flag, move
+):
+    """#447: a PR that left the clean-reviewed revision is drift with the gate closed too.
+
+    The same record as the open gate's drift (REVIEW, the review stale, the
+    PR's revision persisted, the review still bound to what it reviewed),
+    from one read: no checks, no review comment, nothing merged.
+    """
+    what, revision, reads = move(fake_github)
+    head, base, _ = revision
+    eng, _ = _held(tmp_state_dir, fake_github, config_allows)
+    before = len(fake_github.calls)
+    out = eng.step(allow_merge=flag)
+    assert out.next_phase == "REVIEW" and out.message.startswith(what)
+    assert out.message.endswith(
+        f" after the clean review of HEAD {SHA_A[:12]} (the PR is now at {head[:12]} on "
+        f"{base!r}; the merge gate is closed); READY_FOR_MERGE -> REVIEW (not merged)"
+    )
+    assert _reads_since(fake_github, before) == reads
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.REVIEW and s.last_review_result == "stale" and s.attempt == 0
+    assert (s.current_head_sha, s.current_base_ref, s.current_merge_base_sha) == revision
+    assert (s.reviewed_head_sha, s.reviewed_base_ref) == (SHA_A, "main")
+    assert s.open_findings == [] and s.prior_findings == []
+    assert fake_github.merges == [] and s.counted_merged_prs == []
+
+
+def _closed(gh, eng):
+    gh.add_pr(head_sha=SHA_B, state="CLOSED")
+
+
+def _merged_by_hand(gh, eng):
+    gh.add_pr(head_sha=SHA_B, state="MERGED")
+
+
+def _another_pr(gh, eng):
+    gh.add_pr(head_sha=SHA_B)
+    eng.state.current_pr_url = PR.replace("/pull/42", "/pull/43")
+    eng._save()
+
+
+@pytest.mark.parametrize(
+    "case", [_closed, _merged_by_hand, _another_pr], ids=["closed", "merged by hand", "another PR"]
+)
+def test_ready_for_merge_gate_closed_holds_what_only_the_open_gate_decides(
+    tmp_state_dir, fake_github, case
+):
+    """#447 routes an OPEN reviewed PR's drift only. A closed PR, a merge by
+    hand and a PR that is not the reviewed one hold READY_FOR_MERGE with the
+    gate closed, as before: the open gate blocks or reconciles each itself.
+    Nothing is written and no merge is counted."""
+    eng, _ = _held(tmp_state_dir, fake_github)
+    case(fake_github, eng)
+    before_bytes = eng.paths.state_file.read_bytes()
     with pytest.raises(VerificationError, match="merge is disabled"):
         eng.step(allow_merge=False)
-    assert fake_github.calls == before and eng.state.phase == Phase.READY_FOR_MERGE
+    assert eng.paths.state_file.read_bytes() == before_bytes
+    assert eng.state.phase == Phase.READY_FOR_MERGE and eng.state.counted_merged_prs == []
+
+
+@pytest.mark.parametrize("recheck", [False, True], ids=["step", "run(recheck_held)"])
+@pytest.mark.parametrize(
+    ("attr", "error", "read"),
+    [
+        ("get_pr_error", GitHubUnavailableError("HTTP 502"), f"PR {PR} could not be read"),
+        ("merge_base_error", GitHubError("HTTP 404"), "merge base of 'main' and HEAD"),
+    ],
+    ids=["PR read", "merge-base read"],
+)
+def test_ready_for_merge_gate_closed_failed_read_changes_nothing(
+    tmp_state_dir, fake_github, recheck, attr, error, read
+):
+    """A read the closed gate cannot make raises, named and of its own class; the
+    run stays READY_FOR_MERGE byte for byte (never BLOCKED: the hold is sound)."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng, before_bytes = _held(tmp_state_dir, fake_github)
+    setattr(fake_github, attr, error)
+    with pytest.raises(type(error), match=re.escape(read)):
+        if recheck:
+            eng.run(allow_merge=False, recheck_held=True)
+        else:
+            eng.step(allow_merge=False)
+    assert eng.paths.state_file.read_bytes() == before_bytes
+
+
+def test_run_rechecks_a_held_ready_for_merge_only_when_asked(tmp_state_dir, fake_github):
+    """``run(recheck_held=True)`` (``resume``, #447) reads a held run once before it stops.
+
+    Unmoved: no step, no write. Moved: the step to REVIEW, from that one read.
+    A plain ``run`` and a READY_FOR_MERGE a caller names as its own stop
+    phase (a scheduler's worker) read nothing.
+    """
+    fake_github.add_pr(head_sha=SHA_A)
+    eng, before_bytes = _held(tmp_state_dir, fake_github, config_allows=False)
+    assert eng.run(max_steps=5) == [] and fake_github.calls == []
+    worker = eng.run(max_steps=5, recheck_held=True, extra_stop_phases=[Phase.READY_FOR_MERGE])
+    assert worker == [] and fake_github.calls == []
+    assert eng.run(max_steps=5, recheck_held=True) == []
+    assert _reads_since(fake_github, 0) == ["get_pr", "get_merge_base_sha"]
+    assert eng.paths.state_file.read_bytes() == before_bytes
+
+    fake_github.prs[PR].head_sha = SHA_B
+    before = len(fake_github.calls)
+    outcomes = eng.run(max_steps=1, recheck_held=True)
+    assert [o.next_phase for o in outcomes] == ["REVIEW"]
+    assert "PR HEAD moved" in outcomes[0].message
+    assert _reads_since(fake_github, before) == ["get_pr"], "the step reuses the run's read"
+    assert load_state(eng.paths.state_file).current_head_sha == SHA_B
+
+
+def test_a_held_run_that_moved_meets_the_step_budget_like_any_step(tmp_state_dir, fake_github):
+    """The recheck of an unmoved PR is no step, so an exhausted budget leaves it
+    alone; the step to REVIEW of a moved one is a step and is refused by it."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng, before_bytes = _held(tmp_state_dir, fake_github, config_allows=False)
+    eng.config.workflow.max_total_steps = eng.state.step_count
+    assert eng.run(recheck_held=True) == []
+    assert eng.paths.state_file.read_bytes() == before_bytes
+    fake_github.prs[PR].head_sha = SHA_B
+    outcomes = eng.run(recheck_held=True)
+    assert [o.next_phase for o in outcomes] == ["BLOCKED"]
+    s = load_state(eng.paths.state_file)
+    assert "workflow.max_total_steps" in s.block_reason and s.current_head_sha == SHA_A
 
 
 def test_ready_for_merge_requires_clean_review_in_state(tmp_state_dir, fake_github):

@@ -444,7 +444,7 @@ never advances the state machine. In brief:
 | `REVIEW` | OpenCode (`review_round_1`, `review_round_2_5`, `review_round_6_plus`), which makes no GitHub write | the round is bound to the PR, HEAD, base and merge base read from GitHub, and a comment already carrying that round's marker blocks (the controller never adopts one it did not post); the reviewer's round and HEAD must match the binding and `needs_fix_round == (len(findings) > 0)`; the controller renders the review comment from the result, journals it, posts it and reads it back, so a crash or `resume` never posts a second one; then controller policy picks `FIX`, `READY_FOR_MERGE`, `REPLAN_REEXECUTE` or `BLOCKED` |
 | `FIX` | Claude Code (`fix`), which makes no GitHub write | the PR is still at the reviewed revision (else back to `REVIEW` without running the fixer); the open issues already marked as a finding's follow-up are handed to the fixer to reuse, and one the controller did not hand over or create blocks; the fixer commits on its worktree's detached HEAD and resolves every open finding exactly once, and the controller checks that HEAD itself (the reported SHA, descent from the reviewed HEAD, every commit message, a commit for each `fixed` finding); it creates the follow-up issues the fixer asks for, appends the finding markers to the handed-over issues it defers to, then pushes the commit last, journalling each write before it is sent, and reads the follow-ups and the PR head back, so a crash or `resume` never creates or pushes twice; a push it did not make sends the PR back to `REVIEW` |
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`), which makes no GitHub write | one durable transaction; the agent commits on its worktree's detached HEAD at the default branch head the controller recorded, and the controller checks that HEAD itself (the reported SHA, descent from that base, every commit message), pushes it to `autoforge/<n>-replan-<transaction id>`, creates the replacement PR with the agent's title and body followed by the controller's markers, journalling each write before it is sent, and binds the PR only at exactly the pushed HEAD, so a crash or `resume` never pushes or creates twice; a replacement branch or a marker PR it did not write rejects the transaction; the old PR is closed by the controller only while both PRs still match their checkpoints |
-| `READY_FOR_MERGE` | nobody | holding state; with the merge gate open, the full pre-merge verification runs before `MERGE` is entered |
+| `READY_FOR_MERGE` | nobody | holding state at the clean-reviewed revision: with the merge gate closed, `step` and `resume` read the PR and send one that moved back to `REVIEW` (#447); with the gate open, the full pre-merge verification runs before `MERGE` is entered |
 | `MERGE` (gated) | controller, never an agent | `gh pr merge --match-head-commit <reviewed HEAD>`, counted only once GitHub reports `MERGED` at that HEAD into the reviewed base |
 | `UPDATE_EPIC` | OpenCode (`update_epic`), which makes no GitHub write | the controller (not the agent) posts the progress comment and writes the roadmap section, journals each write before performing it and reads it back, so a crash or `resume` never posts a second comment; a marker comment it did not post blocks; the next issue gets the `INITIALIZING` checks and must be a native sub-issue of the EPIC with no sub-issues of its own, as `epic run` admits (#287); `null` -> `DONE` only when GitHub's complete listing of the EPIC's sub-issues holds none the run could still select (a listing short of the EPIC's count is `BLOCKED`) |
 
@@ -485,10 +485,25 @@ exact triggers are in [Workflow: loop bounds](agent-guides/workflow.md#loop-boun
 When the loop reaches `READY_FOR_MERGE` with the merge gate closed (the
 default) the CLI prints a banner with the issue, PR, review round and reviewed
 HEAD, and states that the merge gate is closed: a human merges the PR.
-`resume` without the gate open re-prints the banner and runs nothing. The
-banner's `Review certificate:` line says whether the round's certificate
-applies, checked against the state and the configuration in force (GitHub
-is not read): `applies (round N, ...)`, `does not apply (<reason>)` or
+
+The run holds the revision its clean review covered, and no other.
+Without the gate open, `resume` and `step` read the PR from GitHub first:
+its HEAD and base, then the merge base (not its checks or the review
+comment). A PR still at the reviewed revision holds and nothing is
+written: `resume` re-prints the banner and exits 0, `step` exits 1 with
+the merge-gate message. A PR that moved since the review (a push, a rebase
+and force push, a retarget, a base rewritten under its name) goes back to
+`REVIEW` of the new revision with nothing merged, and `resume` goes on to
+review it; the earlier review certificate no longer applies, and the new
+round certifies the new head alone (#447). Since `resume` may start a
+review from here, it checks the run's recorded configuration first, as
+`step` does. `resume --dry-run` reads nothing and prints the banner. The
+parallel EPIC scheduler's workers do not make this read: an issue they
+settled at `READY_FOR_MERGE` stays there.
+
+The banner's `Review certificate:` line says whether the round's certificate
+applies, checked against the state and the configuration in force (not
+against GitHub): `applies (round N, ...)`, `does not apply (<reason>)` or
 `none held`; in the last two cases the merge gate would refuse to merge.
 With the gate open (`resume --allow-merge` / `step --allow-merge`) the
 controller continues through its own pre-merge verification, `MERGE` and
