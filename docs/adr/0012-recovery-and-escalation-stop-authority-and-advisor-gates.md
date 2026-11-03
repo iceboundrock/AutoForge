@@ -1,10 +1,12 @@
 # ADR 0012. Recovery and escalation: who may act on a stop, and the advisor's two gates
 
-- **Status:** proposed with #370's pull request. Planning only. Written at
+- **Status:** accepted. A maintainer accepted this record on 2026-11-03 in
+  the
+  [maintainer acceptance on #370](https://github.com/iceboundrock/AutoForge/issues/370#issuecomment-6591923375),
+  as proposed in PR #446 at `0aa7987`. That comment is the sign-off #370's
+  first acceptance criterion asks for; this line only records it. The
+  commit that records it changes no decision. Planning only. Written at
   `main` `0ba238e` (2026-11-02), where every reference below was read.
-  #370's first acceptance criterion asks for a *signed-off* record. That
-  sign-off is a maintainer's acceptance on #370 or on this record's pull
-  request, not anything this text says about itself.
   - *Implemented with it:* nothing. No phase, edge, settlement, effect kind,
     configuration key, state field, protocol number, launch class, prompt or
     default changes. Three tests keep this record honest. Every test it names
@@ -451,5 +453,3 @@ unchanged.
 - **The persisted code.** It is needed only by a consumer in another
   process: a reopened D (D6), or #374 and #375 if they need it. It comes
   through #23 at that time.
-- **Sign-off.** This record is proposed until a maintainer accepts it on
-  #370 or on its pull request.
