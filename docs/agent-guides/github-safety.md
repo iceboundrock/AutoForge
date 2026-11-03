@@ -1045,7 +1045,11 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   refused checks read no longer leaves an owner the read found
   unrecorded. The read after `MERGE`'s `gh pr merge` judges it too, before
   the PR's revision is routed or its merge counted (PR #459 R7-F1; see
-  "Post-merge reconciliation"). `REVIEW` reads the PR once more right
+  "Post-merge reconciliation"). The read of the PR for `REVIEW`'s or a
+  replan's read context judges it before the launch, on the typed answer
+  and never on the file rendered from it: `REVIEW` blocks, a replan rejects
+  its transaction, and an answer naming another PR is an item that could
+  not be read (PR #459 R8-F1). `REVIEW` reads the PR once more right
   before its round comment is sent (K4), so a PR taken over while the
   reviewer ran gets no comment from the displaced run. `FIX` reads the
   owner again before each record of its plan after the first (follow-up
@@ -2405,6 +2409,16 @@ says what GitHub reports of the write: `MERGED` stands and is not counted,
 leaves it unknown. Once the operator hands the PR back, a plain `unblock`
 judges it from live GitHub: a merged PR is reconciled and counted once, and
 a moved one goes to `REVIEW`.
+
+Judging that owner can itself raise, its write into `owned_pr_url` above all (a
+full disk). The cleanup of an open PR still runs before the failure goes on up
+(PR #459 R8-F2), since nothing after it would disarm what that call left
+pending. The failure stays the step's error and nothing is routed or counted,
+so the phase is as last saved and `resume` reads the PR again. No `BLOCKED`
+reason is saved, so what the cleanup found stays on the failure: in the text of
+an `AutoForgeError`, which the CLI and the worker print, and as a note on
+anything else, which a traceback prints. The same holds when the owner needs no
+write and the step's own save fails on that full disk.
 
 No state field records that a `MERGE` step sent `gh pr merge`, so a
 `BLOCKED` reason says "nothing was merged" only where that is known (#376):

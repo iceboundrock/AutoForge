@@ -119,6 +119,8 @@ one that cannot be read, or the removal of an owner the run knew takes
 `MERGE -> BLOCKED` (`pr-owner`), moved or merged, never `REVIEW` or
 `UPDATE_EPIC`. The merge was already sent, so the reason says what GitHub
 reports of it ([github-safety.md](github-safety.md#post-merge-reconciliation)).
+A failure of that judgement, its write into the state file above all, takes no
+edge: the step raises once the asynchronous merge is dealt with (PR #459 R8-F2).
 
 `MERGE -> ANALYZE_EXECUTE` and `MERGE -> DONE` are declared in `LEGAL_EDGES`
 but reserved: `decide_next_phase` never chooses them, because EPIC batching

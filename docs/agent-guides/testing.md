@@ -607,6 +607,24 @@ High-priority coverage includes:
   unknown with nothing recorded or counted, and a PR handed back is reconciled
   once when merged and reviewed again when moved (PR #459 R7-F1;
   `tests/test_engine.py`)
+- the owner on the read for an agent's context (PR #459 R8-F1;
+  `tests/test_engine.py`, `tests/test_replan.py`): a legacy `REVIEW` binding
+  whose checks read, or the identity read behind refused checks, finds another
+  run's owner blocks (`pr-owner`) with no launch and the owner on disk, a relaunch
+  and a read whose comments then fail included, and after the owner is removed a
+  restarted run's `unblock` refuses and `run` launches nothing. A defect, a marker
+  of another issue and an owner this run knew removed refuse there too, a marker
+  naming this run launches with the owner already on disk, and an answer naming
+  another PR records and refuses nothing and renders as unreadable. The replan's
+  read rejects its transaction, on a fresh entry and on a resumed `PREPARED` one
+- the cleanup after `gh pr merge` when judging the owner raises (PR #459 R8-F2;
+  `tests/test_engine.py`): a failed write of another run's or this run's owner,
+  raised as a `StateError`, a raw `OSError` or an interrupt, still disables the
+  auto-merge that call armed, and the failure stays the step's error, says what
+  the cleanup found, redacted, and leaves nothing routed, counted or saved. A
+  cleanup that cannot finish does not replace it, a merged PR has nothing to
+  disarm and is recovered once, a restart refuses the owner with no second merge,
+  and a failed save of the step's own result keeps the cleanup's warning too
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

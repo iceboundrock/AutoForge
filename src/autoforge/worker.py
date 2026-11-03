@@ -554,8 +554,13 @@ def run_worker(
                 _say(f"refused to start, nothing was read or written: {exc}")
                 return EXIT_REFUSED
             return _run(started, github_factory, provider_factory)
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as exc:
             _say("interrupted; the state is as the last step saved it")
+            # What the cleanup after `gh pr merge` found, when the interrupt
+            # landed in the owner's write (#414, PR #459 R8-F2). No traceback
+            # prints it here, since this ends the process with a status.
+            for note in getattr(exc, "__notes__", ()):
+                _say(note)
             return EXIT_INTERRUPTED
         except WorkerStartupError as exc:
             _say(f"refused to run, nothing was written: {exc}")

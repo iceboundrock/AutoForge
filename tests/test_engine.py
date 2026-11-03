@@ -1,5 +1,6 @@
 """Engine: verification of agent claims, SHA binding, routing, recovery, gate."""
 
+import errno
 import json
 import os
 import re
@@ -76,7 +77,12 @@ from autoforge.result_parser import (
     ReviewResult,
     published_markdown_problem,
 )
-from autoforge.state import MAX_ACCEPTANCE_OUTCOMES, MAX_DECLINES_PER_ROUND, load_state
+from autoforge.state import (
+    MAX_ACCEPTANCE_OUTCOMES,
+    MAX_DECLINES_PER_ROUND,
+    load_state,
+    save_state,
+)
 from autoforge.stop_classification import StopReasonCode
 from autoforge.transitions import Phase
 from autoforge.validation import parse_pr_url
@@ -9730,27 +9736,28 @@ def test_a_merge_blocks_when_the_read_after_its_write_finds_the_owner_it_knew_re
     assert s.last_review_result == "clean" and len(fake_github.merges) == 1
 
 
-@pytest.mark.parametrize(
-    ("arrange", "note"),
-    [
-        pytest.param(lambda gh: None, "auto-merge was armed on the PR and has been", id="disarmed"),
-        pytest.param(
-            lambda gh: setattr(gh, "disable_auto_error", "403"),
-            "WARNING: auto-merge is armed on the PR and could not be disabled",
-            id="stuck",
-        ),
-        pytest.param(
-            lambda gh: gh.merge_queue.update({PR: MergeQueueStatus(enabled=True, in_queue=True)}),
-            "WARNING: the PR is in the merge queue",
-            id="queued",
-        ),
-        pytest.param(
-            lambda gh: setattr(gh, "merge_queue_error", "boom"),
-            "merge-queue status could not be read",
-            id="queue-unread",
-        ),
-    ],
-)
+# What the write left for the cleanup to find, and what the cleanup says of it.
+_ASYNC_MERGE_FINDINGS = [
+    pytest.param(lambda gh: None, "auto-merge was armed on the PR and has been", id="disarmed"),
+    pytest.param(
+        lambda gh: setattr(gh, "disable_auto_error", "403"),
+        "WARNING: auto-merge is armed on the PR and could not be disabled",
+        id="stuck",
+    ),
+    pytest.param(
+        lambda gh: gh.merge_queue.update({PR: MergeQueueStatus(enabled=True, in_queue=True)}),
+        "WARNING: the PR is in the merge queue",
+        id="queued",
+    ),
+    pytest.param(
+        lambda gh: setattr(gh, "merge_queue_error", "boom"),
+        "merge-queue status could not be read",
+        id="queue-unread",
+    ),
+]
+
+
+@pytest.mark.parametrize(("arrange", "note"), _ASYNC_MERGE_FINDINGS)
 def test_the_owner_refusal_after_the_write_still_deals_with_an_asynchronous_merge(
     tmp_state_dir, fake_github, arrange, note
 ):
@@ -10006,6 +10013,461 @@ def test_a_moved_pr_handed_back_goes_to_review_of_its_new_head(tmp_state_dir, fa
     assert out.unblocked and out.phase == "REVIEW", out.message
     assert eng.state.current_head_sha == SHA_B
     assert len(fake_github.merges) == 1 and eng.state.counted_merged_prs == []
+
+
+# -- a state file that cannot be written (PR #459 R8-F1, R8-F2) -------------------------
+_NO_SPACE = os.strerror(errno.ENOSPC)
+# What the state file's write raises: the controller's own error on a full disk, a raw
+# error, and an interrupt landing in it.
+_WRITE_FAULTS = [
+    pytest.param(lambda: StateError(f"cannot write state.json: {_NO_SPACE}"), id="state-error"),
+    pytest.param(lambda: OSError(errno.ENOSPC, _NO_SPACE), id="raw-oserror"),
+    pytest.param(KeyboardInterrupt, id="interrupt"),
+]
+
+
+def _a_full_disk(monkeypatch, fault) -> list[bool]:
+    """``save_state`` raises ``fault()`` while the list returned holds True."""
+    real = save_state
+    full = [False]
+
+    def write(*args, **kwargs):
+        if full[0]:
+            raise fault()
+        real(*args, **kwargs)
+
+    monkeypatch.setattr("autoforge.engine.save_state", write)
+    return full
+
+
+# -- the owner on the read for the agent's context (PR #459 R8-F1) ----------------------
+def _context_read_meets(gh: FakeGitHub, change, *, refused: bool = False, on_call: int = 1) -> None:
+    """Between REVIEW's entry read and the read for its agent's context: ``change`` lands
+    right before the checks read of launch ``on_call``, the read of the PR the entry does not
+    make. With ``refused`` GitHub refuses those checks, so the identity read behind them is
+    the one that finds it."""
+    real = gh.get_pr_with_checks
+    calls = 0
+
+    def read(url):
+        nonlocal calls
+        calls += 1
+        if calls == on_call:
+            change(gh)
+            if refused:
+                gh.checks_error = checks_refused()
+        return real(url)
+
+    gh.get_pr_with_checks = read
+
+
+def _assert_no_launch_on_the_other_runs_owner(eng, out) -> None:
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert f"the implementation marker of PR {PR} names run {OTHER_RUN} as its owner" in reason
+    assert "this launch of the agent was not made" in reason
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.owned_pr_url) == (Phase.BLOCKED, PR, PR)
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["checks-read", "identity-read"])
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_legacy_review_launches_nothing_on_the_owner_its_context_read_finds(
+    tmp_state_dir, fake_github, refused, remove, found
+):
+    """PR #459 R8-F1, the reported sequence: a legacy REVIEW binding's entry read passes,
+    and the read for the agent's context finds another run's owner. Before R8-F1 that answer
+    was only rendered: the reviewer launched, and once the marker was removed while it ran
+    the step reached READY_FOR_MERGE with owned_pr_url empty. It now blocks (pr-owner) with
+    nothing launched and no context written, the owner on disk, so after the removal a
+    restarted run's 'unblock' refuses and 'run' launches nothing."""
+    eng = _legacy_review(tmp_state_dir, fake_github)
+    eng._save()
+    _context_read_meets(fake_github, lambda gh: _owned_by(gh, OTHER_RUN), refused=refused)
+    out = eng.step()
+    _assert_no_launch_on_the_other_runs_owner(eng, out)
+    assert eng.provider.calls == []
+    assert not (eng.paths.state_dir / "read-context").exists()
+    fake_github.checks_error = None
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+def test_the_context_read_judges_the_owner_before_it_reads_the_comments(tmp_state_dir, fake_github):
+    """PR #459 R8-F1: a comment listing that fails makes the file unreadable and lets the
+    launch proceed, so judged after it, the owner the PR's read found would be ignored."""
+    eng = _legacy_review(tmp_state_dir, fake_github)
+    eng._save()
+
+    def unavailable(url):
+        raise GitHubUnavailableError("HTTP 502")
+
+    def taken(gh):
+        _owned_by(gh, OTHER_RUN)
+        gh.get_pr_comments = unavailable
+
+    _context_read_meets(fake_github, taken)
+    _assert_no_launch_on_the_other_runs_owner(eng, eng.step())
+    assert eng.provider.calls == []
+
+
+def test_a_relaunch_is_not_made_on_the_owner_its_context_read_finds(tmp_state_dir, fake_github):
+    """PR #459 R8-F1: every launch collects its own context, so a correction whose read
+    finds another run's owner is not made either."""
+    eng = _in_review(tmp_state_dir, fake_github, ["no result at all"])
+    eng._save()
+    _context_read_meets(fake_github, lambda gh: _owned_by(gh, OTHER_RUN), on_call=2)
+    _assert_no_launch_on_the_other_runs_owner(eng, eng.step())
+    assert len(eng.provider.calls) == 1
+
+
+@pytest.mark.parametrize("body", [*_OWNER_BESIDE_A_DEFECT[:2], _OWNER_BESIDE_A_DEFECT[5]])
+def test_a_defect_on_the_context_read_blocks_and_keeps_the_owner_beside_it(
+    tmp_state_dir, fake_github, body
+):
+    """PR #459 R8-F1 with R6-F1's rule: a body the context read cannot read launches nothing,
+    and a readable marker naming a run beside the defect is recorded."""
+    eng = _legacy_review(tmp_state_dir, fake_github)
+    eng._save()
+    text = body(eng.state.run_id)
+    _context_read_meets(fake_github, lambda gh: setattr(gh.prs[PR], "body", text))
+    _assert_refused_on_the_defect(eng, eng.step())
+    assert eng.provider.calls == []
+    remove, found = _OWNER_REMOVALS[1].values
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+def test_a_marker_of_another_issue_on_the_context_read_blocks(tmp_state_dir, fake_github):
+    """PR #459 R8-F1 with R5-F2's rule: that marker's run drives the PR, on this read too."""
+    eng = _legacy_review(tmp_state_dir, fake_github)
+    eng._save()
+    _context_read_meets(fake_github, lambda gh: setattr(gh.prs[PR], "body", _FOREIGN_ISSUE_BODY))
+    out = eng.step()
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert OTHER_RUN in eng.state.block_reason and eng.provider.calls == []
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+
+
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_review_launches_nothing_when_its_context_read_finds_the_owner_it_knew_removed(
+    tmp_state_dir, fake_github, remove, found
+):
+    """PR #459 R8-F1 on an owned binding: the owner this run knew is gone by the read for
+    the agent's context, so which run owns the PR is not knowable."""
+    eng = _legacy_review(tmp_state_dir, fake_github)
+    _owned_by(fake_github, eng.state.run_id)
+    eng.state.owned_pr_url = PR
+    eng._save()
+    _context_read_meets(fake_github, remove)
+    _assert_owner_removed(eng, eng.step(), found)
+    assert eng.provider.calls == []
+
+
+def test_a_context_read_naming_this_run_launches_with_the_owner_already_on_disk(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R8-F1, the other half of the read: a marker naming this run refuses nothing,
+    and it is recorded before the launch. Its removal while the reviewer runs blocks at the
+    read after it, where before it reached READY_FOR_MERGE as a legacy binding."""
+
+    def reviewer(req):
+        assert load_state(eng.paths.state_file).owned_pr_url == PR
+        _owned_by(fake_github, None)
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, fake_github, reviewer)
+    eng._save()
+    run_id = eng.state.run_id
+    _context_read_meets(fake_github, lambda gh: _owned_by(gh, run_id))
+    out = eng.step()
+    _assert_owner_removed(eng, out, _OWNER_REMOVALS[0].values[1])
+    assert len(eng.provider.calls) == 1
+
+
+@pytest.mark.parametrize("named", ["another-run", "this-run"])
+def test_an_owner_the_context_read_cannot_write_launches_nothing(
+    tmp_state_dir, fake_github, monkeypatch, named
+):
+    """PR #459 R8-F1: the launch is fenced by an owner on disk, so a failed write of it is
+    no item that could not be read. The failure ends the step before the launch, for either
+    owner, and the file is as it was."""
+    eng = _legacy_review(tmp_state_dir, fake_github)
+    eng._save()
+    owner = OTHER_RUN if named == "another-run" else eng.state.run_id
+    full = _a_full_disk(monkeypatch, _WRITE_FAULTS[0].values[0])
+    on_disk: list[str] = []
+
+    def taken(gh):
+        _owned_by(gh, owner)
+        on_disk.append(eng.paths.state_file.read_text(encoding="utf-8"))
+        full[0] = True
+
+    _context_read_meets(fake_github, taken)
+    with pytest.raises(StateError, match=_NO_SPACE):
+        eng.step()
+    assert eng.provider.calls == []
+    assert eng.paths.state_file.read_text(encoding="utf-8") == on_disk[0]
+
+
+def test_a_pr_handed_back_after_the_context_read_refused_is_reviewed_from_the_same_round(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R8-F1 refuses only until the operator acts: nothing of the launch was charged,
+    so with the marker the refusal prints in the PR body a plain 'unblock' reviews the round
+    the refusal stopped, and the run goes on to READY_FOR_MERGE."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_payload(1, SHA_A, []))])
+    eng._save()
+    _context_read_meets(fake_github, lambda gh: _owned_by(gh, OTHER_RUN))
+    _assert_no_launch_on_the_other_runs_owner(eng, eng.step())
+    assert render_implementation_marker(ISSUE, eng.state.run_id) in eng.state.block_reason
+    s = load_state(eng.paths.state_file)
+    assert (s.review_round, s.attempt) == (0, 0)
+
+    _owned_by(fake_github, eng.state.run_id)
+    out = eng.unblock("the other run let go of it")
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    out = eng.step()
+    assert out.next_phase == "READY_FOR_MERGE", out.message
+    assert len(eng.provider.calls) == 1
+    s = load_state(eng.paths.state_file)
+    assert (s.review_round, s.owned_pr_url) == (1, PR)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(lambda other: other, id="another-pr"),
+        pytest.param(
+            lambda other: replace(other, url="https://github.com/other/repo/pull/42"),
+            id="another-repository",
+        ),
+        pytest.param(lambda other: replace(other, url="not a pull request"), id="unparsable"),
+    ],
+)
+def test_a_context_read_answering_with_another_pr_is_an_item_that_could_not_be_read(
+    tmp_state_dir, fake_github, answer
+):
+    """PR #459 R8-F1, the identity the owner is judged on (R5-F1's rule): an answer naming
+    another PR says nothing of this one. Its marker records and refuses nothing and its text
+    is not handed to the agent as this PR's: the file says it could not be read, and the
+    launch proceeds as for any other unreadable item."""
+    files: dict[str, str] = {}
+
+    def reviewer(req):
+        files.update({p.name: p.read_text() for p in read_context_of(req.prompt).iterdir()})
+        return block(review_payload(1, SHA_A, []))
+
+    eng = _in_review(tmp_state_dir, fake_github, reviewer)
+    eng._save()
+    _add_same_head_pr_against_another_base(fake_github)
+    _owned_by(fake_github, OTHER_RUN, url=PR_B)
+    other = fake_github.prs[PR_B]
+    fake_github.get_pr_with_checks = lambda url: answer(replace(other, checks=[]))
+    out = eng.step()
+    assert out.next_phase == "READY_FOR_MERGE", out.message
+    assert "could not read" in files["pull-request.md"]
+    assert OTHER_RUN not in files["pull-request.md"] and "checks.md" not in files
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+
+
+# -- the cleanup after `gh pr merge` when judging the owner raises (PR #459 R8-F2) ------
+def _said_by(exc: BaseException) -> str:
+    """What the operator is shown of ``exc``: the text the CLI prints, and a traceback's notes."""
+    return "\n".join([str(exc), *getattr(exc, "__notes__", [])])
+
+
+@pytest.mark.parametrize("fault", _WRITE_FAULTS)
+@pytest.mark.parametrize("named", ["another-run", "this-run"])
+@pytest.mark.parametrize(("arrange", "note"), _ASYNC_MERGE_FINDINGS)
+def test_a_failed_owner_write_after_the_merge_call_still_deals_with_an_asynchronous_merge(
+    tmp_state_dir, fake_github, monkeypatch, fault, named, arrange, note
+):
+    """PR #459 R8-F2, the reported sequence: `gh pr merge` leaves auto-merge armed, the read
+    after it finds a marker naming a run on a legacy binding, and writing that owner fails.
+    Before R8-F2 the step raised without calling disable_auto_merge, leaving auto-merge armed
+    for an unreviewed HEAD. The cleanup now runs, for either owner: the failure stays the
+    step's error and says what was found, and nothing is routed, counted or saved."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    fake_github.merge_leaves_open = fake_github.merge_arms_auto = True
+    owner = OTHER_RUN if named == "another-run" else eng.state.run_id
+    full = _a_full_disk(monkeypatch, fault)
+    on_disk: list[str] = []
+
+    def taken(gh):
+        arrange(gh)
+        _owned_by(gh, owner)
+        on_disk.append(eng.paths.state_file.read_text(encoding="utf-8"))
+        full[0] = True
+
+    _merge_meets(fake_github, after=taken)
+    with pytest.raises(type(fault())) as caught:
+        eng.step(allow_merge=True)
+    said = _said_by(caught.value)
+    assert str(fault()) in said and note in said and f"on PR {PR}" in said
+    assert fake_github.disabled_auto == [PR]
+    assert eng.paths.state_file.read_text(encoding="utf-8") == on_disk[0]
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.owned_pr_url, s.counted_merged_prs) == (Phase.MERGE, "", [])
+    assert s.last_review_result == "clean" and s.current_head_sha == SHA_A
+    assert len(fake_github.merges) == 1 and fake_github.deleted_branches == []
+
+
+def test_a_restart_after_a_failed_owner_write_refuses_the_pr_and_sends_no_second_merge(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """PR #459 R8-F2: the failed write left the phase as it was, so the restart reads the PR
+    again, finds the owner and blocks at the gate, with the owner on disk this time."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    fake_github.merge_leaves_open = fake_github.merge_arms_auto = True
+    full = _a_full_disk(monkeypatch, _WRITE_FAULTS[0].values[0])
+
+    def taken(gh):
+        _owned_by(gh, OTHER_RUN)
+        full[0] = True
+
+    _merge_meets(fake_github, after=taken)
+    with pytest.raises(StateError, match="auto-merge was armed on the PR and has been disabled"):
+        eng.step(allow_merge=True)
+    assert fake_github.prs[PR].auto_merge_enabled is False
+
+    full[0] = False
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    eng2.config.safety.allow_merge = True
+    out = eng2.step(allow_merge=True)
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert load_state(eng2.paths.state_file).owned_pr_url == PR
+    assert len(fake_github.merges) == 1 and eng2.provider.calls == []
+
+
+@pytest.mark.parametrize("fault", _WRITE_FAULTS[:2])
+def test_a_failed_owner_write_on_a_merged_pr_counts_nothing_and_is_recovered_once(
+    tmp_state_dir, fake_github, monkeypatch, fault
+):
+    """PR #459 R8-F2: a merged PR has nothing pending to disarm, as without the failure. The
+    failure counts nothing, and the restart reconciles the merge and counts it once."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    run_id = eng.state.run_id
+    full = _a_full_disk(monkeypatch, fault)
+
+    def taken(gh):
+        _owned_by(gh, run_id)
+        full[0] = True
+
+    _merge_meets(fake_github, after=taken)
+    with pytest.raises(type(fault())):
+        eng.step(allow_merge=True)
+    assert fake_github.disabled_auto == []
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.owned_pr_url, s.counted_merged_prs) == (Phase.MERGE, "", [])
+
+    full[0] = False
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    eng2.config.safety.allow_merge = True
+    out = eng2.step(allow_merge=True)
+    assert out.next_phase == "UPDATE_EPIC" and "recovered" in out.message, out.message
+    s = load_state(eng2.paths.state_file)
+    assert (s.owned_pr_url, s.counted_merged_prs) == (PR, [PR])
+    assert len(fake_github.merges) == 1
+
+
+def test_a_cleanup_that_cannot_finish_under_a_failed_owner_write_keeps_both(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """PR #459 R8-F2: the cleanup is best effort. Its own failure neither replaces the failed
+    write nor goes unsaid, redacted as everything else the controller prints of `gh`."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    fake_github.merge_leaves_open = fake_github.merge_arms_auto = True
+    full = _a_full_disk(monkeypatch, _WRITE_FAULTS[0].values[0])
+    secret = "ghp_" + "Q" * 36
+
+    def gone(url):
+        raise RuntimeError(f"gh went away holding {secret}")
+
+    def taken(gh):
+        _owned_by(gh, OTHER_RUN)
+        gh.disable_auto_merge = gone
+        full[0] = True
+
+    _merge_meets(fake_github, after=taken)
+    with pytest.raises(StateError) as caught:
+        eng.step(allow_merge=True)
+    said = str(caught.value)
+    assert f"cannot write state.json: {_NO_SPACE}" in said
+    assert "could not finish (RuntimeError: gh went away" in said
+    assert "check both on GitHub immediately" in said
+    assert secret not in said
+
+
+def test_a_stuck_auto_merge_under_a_failed_owner_write_is_redacted_on_the_failure(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """PR #459 R8-F2: `gh`'s refusal to disable auto-merge can echo a credential, and no
+    sink's redaction stands between a traceback's note and the terminal."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    fake_github.merge_leaves_open = fake_github.merge_arms_auto = True
+    full = _a_full_disk(monkeypatch, _WRITE_FAULTS[1].values[0])
+    secret = "ghp_" + "Q" * 36
+
+    def taken(gh):
+        _owned_by(gh, OTHER_RUN)
+        gh.disable_auto_error = f"403 for {secret}"
+        full[0] = True
+
+    _merge_meets(fake_github, after=taken)
+    with pytest.raises(OSError) as caught:
+        eng.step(allow_merge=True)
+    said = _said_by(caught.value)
+    assert "could not be disabled" in said and "disable it on GitHub immediately" in said
+    assert secret not in said
+
+
+@pytest.mark.parametrize(
+    ("owned", "arrange", "found"),
+    [
+        pytest.param(
+            True,
+            lambda gh: (_owned_by(gh, OTHER_RUN), setattr(gh, "disable_auto_error", "403")),
+            "WARNING: auto-merge is armed on the PR and could not be disabled",
+            id="owner-refusal",
+        ),
+        pytest.param(
+            False,
+            lambda gh: setattr(gh, "disable_auto_error", "403"),
+            "WARNING: auto-merge is armed on the PR and could not be disabled",
+            id="merge-write",
+        ),
+        pytest.param(
+            False,
+            lambda gh: gh.set_head(SHA_B),
+            "auto-merge was armed on the PR and has been disabled again",
+            id="drift-to-review",
+        ),
+    ],
+)
+def test_a_failed_save_of_the_step_keeps_what_the_cleanup_found(
+    tmp_state_dir, fake_github, monkeypatch, owned, arrange, found
+):
+    """PR #459 R8-F2: with no owner to write, the save that fails on the same full disk is the
+    step's own, which would have carried the warning in its reason. It stays on the failure."""
+    eng = _legacy_merge(tmp_state_dir, fake_github)
+    if owned:
+        _owned_by(fake_github, eng.state.run_id)
+        eng.state.owned_pr_url = PR
+        eng._save()
+    fake_github.merge_leaves_open = fake_github.merge_arms_auto = True
+    full = _a_full_disk(monkeypatch, _WRITE_FAULTS[0].values[0])
+
+    def taken(gh):
+        arrange(gh)
+        full[0] = True
+
+    _merge_meets(fake_github, after=taken)
+    with pytest.raises(StateError) as caught:
+        eng.step(allow_merge=True)
+    said = str(caught.value)
+    assert f"cannot write state.json: {_NO_SPACE}" in said and found in said
+    assert fake_github.disabled_auto == [PR]
+    assert load_state(eng.paths.state_file).phase == Phase.MERGE
 
 
 def test_ready_for_merge_requires_clean_review_in_state(tmp_state_dir, fake_github):

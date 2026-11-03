@@ -913,15 +913,19 @@ with `BLOCKED` and `pr-owner`, before anything is launched or written.
   owning it, and the controller cannot tell a PR its own crashed run left
   behind from one another controller is still reviewing (#387).
 - **A run whose PR another run took over.** It stops at its next phase
-  entry, before the review comment is posted, before each thing `FIX`
+  entry, at the read for a reviewer's or a replan agent's context, before
+  the review comment is posted, before each thing `FIX`
   sends, before a replan launches its agent or sends its push or
   replacement PR, and at the merge gate, the closed gate's read by `step`,
   `resume` and `epic recheck` included, even when the PR moved. It stops
   too when the read right after its `gh pr merge` finds the takeover. That
   merge was already sent, so read the reason: it says what GitHub reports
   (a merge that stands and was not counted, or a PR that has not merged)
-  and warns of any auto-merge or merge-queue entry it could not clear. A
-  plain `unblock` refuses for as long as the marker names the other run.
+  and warns of any auto-merge or merge-queue entry it could not clear. If
+  the state file cannot be written at that point (a full disk), the run
+  stops with that error instead, still in `MERGE`, and the error carries the
+  same warnings: read it, and act on them, before you `resume`. A plain
+  `unblock` refuses for as long as the marker names the other run.
 - **A run resuming its own saved publication.** A run that stopped after
   saving its `ANALYZE_EXECUTE` push and PR plan, before sending all of it,
   reads the PRs on `autoforge/<n>` first. One whose marker names another

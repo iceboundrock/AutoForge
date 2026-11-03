@@ -3888,7 +3888,8 @@ class ControllerEngine:
         Under the state directory, through its capability, in a directory of
         its own per launch (``read-context/<run>/<phase>-<attempt>-<token>``),
         outside the agent's worktree and the state file. Nothing is saved and
-        nothing launched yet, so a refusal to write leaves state as it was.
+        nothing launched yet, so a refusal to write leaves state as it was,
+        but for an owner the PR's read found, written alone (PR #459 R8-F1).
         The controller never reads it back.
         """
         state = self._require_state()
@@ -3908,7 +3909,8 @@ class ControllerEngine:
         Additive and never authority: an item that cannot be read becomes a
         file saying so (by error type), and the launch proceeds; every
         decision the phase makes is still taken on the controller's own
-        reads, never on these files.
+        reads, never on these files. The typed answer for the bound PR is one
+        of those reads: its owner can refuse the launch (:meth:`_read_pr_files`).
         """
         s = self._require_state()
         context = ReadContext()
@@ -4063,18 +4065,38 @@ class ControllerEngine:
         the checks. A credential GitHub refuses them (#291) still gets the
         PR from an identity read, and the summary says the checks were
         refused, never that there are none.
+
+        Each is a read of the bound PR like any other (#414, PR #459 R8-F1),
+        judged on the typed answer, before the rendering and the comments'
+        read and never on a file written from it. An answer naming another PR
+        says nothing of this one, so it is an item that cannot be read: it
+        records and refuses nothing, and its text is not handed to the agent
+        as this PR's. An answer that is this PR records the owner it finds at
+        once (:meth:`_note_pr_owner`), and a PR this run may not drive raises
+        :class:`PROwnerError`, so the launch is not made. Ignored, a takeover
+        landing after the entry's read launched a reviewer on another run's
+        PR, and once the marker was removed the step reached READY_FOR_MERGE
+        with no owner recorded.
         """
-        summary: str | None = None
+        refused = False
         try:
             if checks:
                 try:
                     pr = self.github.get_pr_with_checks(url)
-                    summary = render_checks(pr)
                 except GitHubChecksAccessError:
+                    refused = True
                     pr = self.github.get_pr(url)
-                    summary = render_checks_refused(pr)
             else:
                 pr = self.github.get_pr(url)
+            if not self._is_bound_answer(pr):
+                raise GitHubError(f"GitHub answered with PR {pr.url}")
+        except (GitHubError, ConfigurationError) as exc:
+            return unreadable(title, url, exc), None
+        self._require_pr_owner(pr, "this launch of the agent was not made")
+        summary: str | None = None
+        if checks:
+            summary = render_checks_refused(pr) if refused else render_checks(pr)
+        try:
             thread = self.github.get_pr_comments(url)
         except GitHubError as exc:
             return unreadable(title, url, exc), None
@@ -10495,7 +10517,11 @@ class ControllerEngine:
         with no owner recorded, and once the owner was removed a restarted
         run reviewed the PR again. The refusal stops the run; it undoes
         nothing, so its reason says what GitHub reports the write left
-        (:meth:`_merge_attempt_outcome`), a merge that stands included.
+        (:meth:`_merge_attempt_outcome`), a merge that stands included. When
+        that check itself raises, its write into the state file above all,
+        the asynchronous merge is dealt with all the same and the failure
+        goes on up carrying what was found, with nothing routed or counted
+        (PR #459 R8-F2).
         If the re-read itself fails, or answers with another PR (which says
         nothing of this one, its merge or its owner), the outcome is
         *uncertain*: the run stays
@@ -10565,62 +10591,75 @@ class ControllerEngine:
         # who owns the PR now. The owner is recorded here, before anything else
         # can raise, and judged before the revision or the merge is. What this
         # call may have left pending is dealt with first: a refusal stops the
-        # run, and nothing would disarm it after that.
-        owner = self._pr_owner_problem(after)
+        # run, and nothing would disarm it after that. So does a failure of the
+        # check itself, the owner's write into the state file above all (PR
+        # #459 R8-F2): the same cleanup runs before that failure goes on up, and
+        # nothing is routed or counted.
         merged = after.state == "MERGED"
+        try:
+            owner = self._pr_owner_problem(after)
+        except BaseException as failure:
+            if not merged:
+                self._disarm_under_failure(url, after, failure)
+            raise
         note, pending = ("", False) if merged else self._disarm_async_merge(url, after)
-        if owner:
-            return self._block(
-                Phase.MERGE,
-                plan,
-                self._pr_owner_text(owner, self._merge_attempt_outcome(after, merge_error, note)),
-                code=StopReasonCode.PR_OWNER,
-            )
-        if not merged:
-            if merge_error:
-                reason = f"gh pr merge failed: {merge_error}"
-            else:
-                reason = (
-                    f"gh pr merge exited 0 but GitHub reports PR {url} as {after.state} "
-                    "(auto-merge armed or merge queue?)"
-                )
-            drifted = after.is_open and (
-                (after.head_sha and after.head_sha != reviewed)
-                or (after.base_ref and after.base_ref != reviewed_base)
-            )
-            merge_base = ""
-            if after.is_open and not drifted and after.head_sha and after.base_ref:
-                # Same HEAD and base name: the base may still have been
-                # rewritten under its name in the window (#96).
-                try:
-                    merge_base = self._merge_base_of(after)
-                except GitHubError as exc:
-                    note += f"; {exc}"
-                else:
-                    drifted = merge_base != reviewed_merge_base
-            if drifted and not pending:
-                # Post-verification race: the revision moved between the
-                # controller's verification and the write (a push, which
-                # `--match-head-commit <reviewed>` refused, a retarget, or a
-                # rewritten base). Nothing unreviewed merged; the clean
-                # review is stale -> REVIEW (same rule as pre-write drift).
-                return self._revision_drift_to_review(
+        # The saves below can fail on the same full disk, and the reason they
+        # would have saved is where the cleanup's warning goes.
+        with self._cleanup_note_kept(url, note):
+            if owner:
+                return self._block(
                     Phase.MERGE,
                     plan,
-                    after,
-                    detail=(
-                        f" (HEAD {after.head_sha[:12]} on {after.base_ref!r} from merge base "
-                        f"{merge_base[:12] or '(unread)'} != reviewed {reviewed[:12]} on "
-                        f"{reviewed_base!r} from {reviewed_merge_base[:12]}; {reason}{note})"
+                    self._pr_owner_text(
+                        owner, self._merge_attempt_outcome(after, merge_error, note)
                     ),
-                    merge_base_sha=merge_base,
+                    code=StopReasonCode.PR_OWNER,
                 )
-            return self._block(
-                Phase.MERGE,
-                plan,
-                f"{reason}{note}. Nothing was counted; resolve on GitHub manually.",
-                code=StopReasonCode.MERGE_WRITE,
-            )
+            if not merged:
+                if merge_error:
+                    reason = f"gh pr merge failed: {merge_error}"
+                else:
+                    reason = (
+                        f"gh pr merge exited 0 but GitHub reports PR {url} as {after.state} "
+                        "(auto-merge armed or merge queue?)"
+                    )
+                drifted = after.is_open and (
+                    (after.head_sha and after.head_sha != reviewed)
+                    or (after.base_ref and after.base_ref != reviewed_base)
+                )
+                merge_base = ""
+                if after.is_open and not drifted and after.head_sha and after.base_ref:
+                    # Same HEAD and base name: the base may still have been
+                    # rewritten under its name in the window (#96).
+                    try:
+                        merge_base = self._merge_base_of(after)
+                    except GitHubError as exc:
+                        note += f"; {exc}"
+                    else:
+                        drifted = merge_base != reviewed_merge_base
+                if drifted and not pending:
+                    # Post-verification race: the revision moved between the
+                    # controller's verification and the write (a push, which
+                    # `--match-head-commit <reviewed>` refused, a retarget, or a
+                    # rewritten base). Nothing unreviewed merged; the clean
+                    # review is stale -> REVIEW (same rule as pre-write drift).
+                    return self._revision_drift_to_review(
+                        Phase.MERGE,
+                        plan,
+                        after,
+                        detail=(
+                            f" (HEAD {after.head_sha[:12]} on {after.base_ref!r} from merge base "
+                            f"{merge_base[:12] or '(unread)'} != reviewed {reviewed[:12]} on "
+                            f"{reviewed_base!r} from {reviewed_merge_base[:12]}; {reason}{note})"
+                        ),
+                        merge_base_sha=merge_base,
+                    )
+                return self._block(
+                    Phase.MERGE,
+                    plan,
+                    f"{reason}{note}. Nothing was counted; resolve on GitHub manually.",
+                    code=StopReasonCode.MERGE_WRITE,
+                )
         unreviewed = self._merged_revision_problem(after, reviewed, reviewed_base)
         if unreviewed:
             return self._block(
@@ -10986,6 +11025,51 @@ class ControllerEngine:
             pending = True
             note += "; WARNING: the PR is in the merge queue — remove it on GitHub immediately"
         return note, pending
+
+    def _disarm_under_failure(self, url: str, after: PRInfo, failure: BaseException) -> None:
+        """:meth:`_disarm_async_merge` on a step ``failure`` is ending (#414, PR #459 R8-F2).
+
+        Judging the owner on the read after `gh pr merge` raised, most likely
+        because the owner's write into the state file failed. Nothing else
+        would disarm what that call left pending, so this runs before
+        ``failure`` goes on up. It is best effort and ``failure`` stays the
+        step's error: a cleanup that cannot finish is one more warning on it.
+        """
+        try:
+            note, _ = self._disarm_async_merge(url, after)
+        except Exception as exc:
+            note = (
+                f"; WARNING: the cleanup of auto-merge and the merge queue could not finish "
+                f"({type(exc).__name__}: {exc}) — check both on GitHub immediately"
+            )
+        self._keep_cleanup_note(failure, url, note)
+
+    @contextmanager
+    def _cleanup_note_kept(self, url: str, note: str) -> Iterator[None]:
+        """What the cleanup found stays on a failure raised inside (#414, PR #459 R8-F2)."""
+        try:
+            yield
+        except BaseException as failure:
+            self._keep_cleanup_note(failure, url, note)
+            raise
+
+    @staticmethod
+    def _keep_cleanup_note(failure: BaseException, url: str, note: str) -> None:
+        """Put what the cleanup after `gh pr merge` found on ``failure`` (#414, PR #459 R8-F2).
+
+        The BLOCKED reason would have said it, and ``failure`` means no reason
+        is saved. An :class:`AutoForgeError`'s text is what the CLI and the
+        worker print, so it joins that text; anything else (a raw ``OSError``,
+        an interrupt) reaches the operator as a traceback, which prints an
+        exception's notes. Redacted here, since it can quote `gh`.
+        """
+        if not note:
+            return
+        text = redact(f"after `gh pr merge` on PR {url}: {note.removeprefix('; ')}")
+        if isinstance(failure, AutoForgeError):
+            failure.args = (f"{failure}; {text}",)
+        else:
+            failure.add_note(text)
 
     @staticmethod
     def _merge_attempt_outcome(after: PRInfo, merge_error: str, note: str) -> str:
@@ -13941,9 +14025,18 @@ class ControllerEngine:
             provider.integration_preflight(env_allowlist)
             # What the agent reads from GitHub, read by the controller (it
             # holds no credential to read it itself) and written before the
-            # prompt that names it is rendered; nothing is saved yet.
+            # prompt that names it is rendered; nothing is saved yet but an
+            # owner the PR's read found. That read can refuse the launch (PR
+            # #459 R8-F1): the step blocks, and a replan rejects its
+            # transaction like every other checkpoint on its source.
             read_context = ""
-            read_context = self._write_read_context(phase, state.attempt + 1)
+            try:
+                read_context = self._write_read_context(phase, state.attempt + 1)
+            except PROwnerError as exc:
+                if phase != Phase.REPLAN_REEXECUTE:
+                    raise
+                txn = ReplanTransaction.from_dict(state.replan_transaction)
+                return self._reject_replan(txn, str(exc))
             self._read_context_dir = read_context
             # What an earlier launch left uncommitted in the worktree, read
             # for every launch of a write phase, a relaunch included (#187).

@@ -20,7 +20,9 @@ the issue's marked PR blocks before it launches anything (stop code
 `pr-owner`), whatever run the marker names, and the reason names the owner.
 A run whose PR was handed to another run blocks at its next `REVIEW`, `FIX`
 or merge-gate entry, and so does a run whose PR carries the marker of another
-issue naming another run. `REVIEW` checks again right before it posts its round
+issue naming another run. The read of the PR for a reviewer's or a replan
+agent's context counts too: a takeover that read finds launches nothing.
+`REVIEW` checks again right before it posts its round
 comment, `FIX` before each follow-up issue, marker append and acceptance
 comment after its first, and a replan before it launches its agent again
 and before each push and replacement PR of its saved plan. A run resuming
@@ -61,7 +63,10 @@ that the step budget stops, records the owner its read of the PR finds,
 and a PR another run owns stops it on that owner (`pr-owner`). The read
 right after `gh pr merge` does the same: a PR it finds another run owns
 stops the run rather than going back to `REVIEW` or being counted, and the
-reason says what GitHub reports of that merge, which it may report as made.
+reason says what GitHub reports of that merge, which it may report as made. If
+the state file cannot be written right then (a full disk), the run still
+disables an auto-merge that call armed, and the error it stops with carries any
+warning about what it could not clear.
 From then
 on a marker that names no run, a missing marker and a PR body that reads empty
 block it (`pr-owner`), because the owner was removed and which run owns

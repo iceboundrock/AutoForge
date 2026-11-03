@@ -2257,6 +2257,15 @@ its author. Only the effect records and the entry observation prove origin.
       agent launched; judged after the listing, a listing that failed left
       the owner the read had found unrecorded;
     - `REVIEW`'s binding;
+    - the read of the bound PR for `REVIEW`'s or a replan's read context, right
+      before the launch (PR #459 R8-F1). Its typed answer already shows a
+      takeover that landed since the entry's read, so this is not the
+      check-to-write race. Ignored, the agent launched on another run's PR, and
+      once the marker was removed while it ran the step reached
+      `READY_FOR_MERGE` with no owner recorded. The refusal is the phase's own:
+      `REVIEW` blocks and a replan rejects its transaction. The owner is judged
+      on the typed answer, never on the file rendered from it, and an answer
+      naming another PR is an item that could not be read;
     - a read right before K4 is sent, on every entry that sends it (the one
       read this adds: a reviewer runs for minutes, and a takeover in
       between must not get its comment posted);
@@ -2279,6 +2288,9 @@ its author. Only the effect records and the entry observation prove origin.
       disabled, whatever is left pending reaches the reason, and the reason
       says what GitHub reports of the write, a merge that stands included. It
       says the PR has not merged only of a read finding it `OPEN` or `CLOSED`.
+      When judging the owner raises, its write into the state file above all,
+      the same cleanup runs first, and the failure goes on up carrying what the
+      cleanup found, with nothing routed or counted (PR #459 R8-F2).
       An answer naming another PR says nothing of this one, so it is a re-read
       that failed: the outcome is unknown and the run stays in `MERGE`;
     - the step budget's read of the PR at the merge gate, which words its
@@ -2364,8 +2376,9 @@ its author. Only the effect records and the entry observation prove origin.
       (PR #459 R5-F2), a refused `unblock`'s included, and the closed merge gate's
       read of a run it holds (PR #459 R3-F2), `ANALYZE_EXECUTE`'s probe of
       its persisted PR, the identity read behind a refused checks read and
-      the step budget's read at the merge gate (PR #459 R5-F1), and the read
-      after `MERGE`'s write (PR #459 R7-F1).
+      the step budget's read at the merge gate (PR #459 R5-F1), the read
+      after `MERGE`'s write (PR #459 R7-F1), and the read for `REVIEW`'s or a
+      replan's read context (PR #459 R8-F1).
 
     A defect in the body changes nothing of what its readable markers record
     (PR #459 R6-F1). A marker that cannot be read, or a second marker, refuses

@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -7547,6 +7548,115 @@ def test_a_takeover_between_the_push_and_the_replacement_pr_creates_no_pr(tmp_st
     assert len([c for c in eng.provider.calls if c.phase == "REPLAN_REEXECUTE"]) == 1
     assert eng.origin.head(_derived_branch(_persisted_txn_id(eng))) is not None
     assert _creates(gh) == [] and gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+
+
+# -- the source's owner on the read for the agent's context (#414, PR #459 R8-F1) ------
+def _context_read_meets(eng, gh, change, after=None) -> None:
+    """``change`` lands between the replan's last checkpoint and the read for its agent's
+    context, the read of the source PR that launch makes; ``after`` gets what was written."""
+    write = eng._write_read_context
+
+    def read(*args, **kwargs):
+        change(gh)
+        written = write(*args, **kwargs)
+        if after is not None:
+            after(written)
+        return written
+
+    eng._write_read_context = read
+
+
+def _resumed_prepared(tmp_state_dir, gh):
+    """A legacy binding's transaction PREPARED by an earlier entry, resumed in a new process."""
+    eng = make_engine(tmp_state_dir, ["crashed here"], github=gh, origin=True)
+    gh.add_pr(head_sha=SHA_A, branch=BRANCH, linked=[2])
+    _seed(eng, ReplanStage.PREPARED)
+    return _restart(eng, gh)
+
+
+def _freshly_decided(tmp_state_dir, gh):
+    """A transaction about to be prepared, on the step that launches its agent."""
+    return _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh))
+
+
+@pytest.mark.parametrize("entered", [_resumed_prepared, _freshly_decided])
+def test_a_takeover_at_the_replan_context_read_rejects_and_launches_nothing(tmp_state_dir, entered):
+    """PR #459 R8-F1, the replan's equivalent of REVIEW's: the checkpoints before the launch
+    pass, and the read of the source for the agent's context finds another run's owner. Before
+    R8-F1 it was only rendered, and the replan agent launched. It is a rejection like every
+    other checkpoint's on the source, with nothing launched, pushed, created or closed and the
+    owner on disk. Once the marker is removed a restarted run stays refused and launches
+    nothing."""
+    gh = FakeGitHub()
+    eng = entered(tmp_state_dir, gh)
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+    launched = list(eng.provider.calls)
+    _context_read_meets(eng, gh, _hand_the_source_over)
+    out = eng.step()
+    _assert_rejected_for_the_owner(eng, out, "this launch of the agent was not made")
+    assert eng.provider.calls == launched
+    assert eng.origin.head(_derived_branch(_txn(eng).transaction_id)) is None and _creates(gh) == []
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+
+    gh.prs[PR].body = "Started by hand."
+    eng.close()
+    eng2 = make_engine(eng.paths.state_dir, ["the replan agent must not run"], github=gh)
+    eng2.load()
+    assert eng2.state.owned_pr_url == PR
+    refused = eng2.unblock("the other run let go of it")
+    assert not refused.unblocked and refused.phase == "BLOCKED", refused.message
+    assert eng2.run() == []
+    assert eng2.provider.calls == [] and _creates(gh) == [] and gh.closed_prs == []
+
+
+def test_a_replan_context_read_naming_this_run_launches_with_the_owner_on_disk(tmp_state_dir):
+    """PR #459 R8-F1: a marker naming this run refuses nothing, and it is recorded before the
+    launch like on every other read of the bound PR."""
+    gh = FakeGitHub()
+    seen: list[str] = []
+
+    def during(_req):
+        seen.append(load_state(eng.paths.state_file).owned_pr_url)
+
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh, during=during))
+    run_id = eng.state.run_id
+
+    def named(gh):
+        gh.prs[PR].body = f"Started by hand.\n\n{render_implementation_marker(ISSUE, run_id)}"
+
+    _context_read_meets(eng, gh, named)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert seen == [PR]
+
+
+def test_a_replan_context_read_answering_with_another_pr_is_an_item_that_could_not_be_read(
+    tmp_state_dir,
+):
+    """PR #459 R8-F1: an answer naming another PR says nothing of the source. Its marker
+    records and refuses nothing and its text is not handed to the agent as the source's: the
+    file says it could not be read, and the launch proceeds."""
+    gh = FakeGitHub()
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh))
+    # Closed, so it is the answer alone: no listing the replan judges holds it.
+    gh.add_pr(url=EARLIER_PR, head_sha=SHA_B, branch="other", state="CLOSED")
+    gh.prs[EARLIER_PR].body = render_implementation_marker(ISSUE, OTHER_RUN)
+    real = gh.get_pr
+    written: list[str] = []
+
+    def answers_another(gh):
+        gh.get_pr = lambda url: real(EARLIER_PR if url == PR else url)
+
+    def corrected(path):
+        written.append((Path(path) / "pull-request.md").read_text())
+        del gh.get_pr
+
+    _context_read_meets(eng, gh, answers_another, after=corrected)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert "could not read" in written[0] and OTHER_RUN not in written[0]
+    assert len([c for c in eng.provider.calls if c.phase == "REPLAN_REEXECUTE"]) == 1
 
 
 # -- the replacement's owner, from the journaled K7 record (#414, PR #459 R2-F1) ------

@@ -648,6 +648,25 @@ def test_a_failed_proof_of_l2_stops_before_the_next_step(world, capsys, monkeypa
 # -- signals ------------------------------------------------------------------------------
 
 
+def test_an_interrupt_keeps_what_the_cleanup_after_the_merge_call_found(world, capsys, monkeypatch):
+    """#414, PR #459 R8-F2: an interrupt landing in the owner's write after `gh pr merge`
+    carries what the cleanup found as a note. The worker ends with a status and no traceback,
+    so it says the note itself: an auto-merge it could not disable is not left unsaid."""
+    w = world()
+    warning = "after `gh pr merge` on PR x: WARNING: auto-merge is armed on the PR"
+
+    def interrupted(*_args, **_kwargs):
+        exc = KeyboardInterrupt()
+        exc.add_note(warning)
+        raise exc
+
+    monkeypatch.setattr("autoforge.worker._run", interrupted)
+    assert w.run(w.admit()) == 130
+    err = capsys.readouterr().err
+    assert "interrupted; the state is as the last step saved it" in err
+    assert warning in err
+
+
 @pytest.mark.parametrize("how", ["SIGTERM", "SIGINT", "SIGINT-ignored-before"])
 def test_an_interrupt_ends_the_worker_with_130_and_the_state_in_progress(world, capsys, how):
     """A real signal, delivered while the agent runs; restored handlers after.
