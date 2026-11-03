@@ -1077,7 +1077,9 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   `owned_pr_url` into the state file at once and nothing else, a refused
   `unblock`'s (PR #459 R2-F2) and the closed merge gate's hold (PR #459
   R3-F2) included, so a read, check or write that raises after it, or a
-  killed process, keeps it too (PR #459 R4-F2); a dry run writes nothing;
+  killed process, keeps it too (PR #459 R4-F2). A body refused for a marker
+  it cannot read, or for a second marker, still records the run a readable
+  marker in it names (PR #459 R6-F1). A dry run writes nothing;
 - a takeover is the operator's: stop the owning run, replace the marker in
   the PR body with the one the refusal names, then `unblock --take-over
   <PR>` binds it and enters `REVIEW`. The controller writes no marker of its

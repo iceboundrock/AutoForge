@@ -1002,8 +1002,10 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   validation watermark moves), because removing that owner later must not
   let a new process read a legacy binding again. It is written at the read,
   so an unblock that raises after it (a later check, a run log refusing
-  its record) keeps it too (PR #459 R4-F2). A dry run writes nothing, this
-  included, and leaves the state in memory as it was even when it raises.
+  its record) keeps it too (PR #459 R4-F2), and so does an unblock refused
+  for a marker beside it that cannot be read, or a second marker (PR #459
+  R6-F1). A dry run writes nothing, this included, and leaves the state in
+  memory as it was even when it raises.
 - **Re-entry.** The chosen phase goes through `validate_transition(BLOCKED,
   target)` like any other step; the operator edges are declared in
   `LEGAL_EDGES` (`UNBLOCK_TARGETS`), never coerced, and checked before the

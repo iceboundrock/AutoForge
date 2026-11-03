@@ -50,6 +50,8 @@ A run records in `state.json` when its PR's marker has named an owner
 naming a run on it, including on an `unblock` that refuses and on the
 closed merge gate's read of a held run. That read writes it at once, so a
 read or check that fails after it, or a stopped process, keeps it too. A
+body with a marker that cannot be read, or with two markers, stops the run,
+and a readable marker in it that names a run is recorded all the same. A
 run whose PR is closed, or has no readable HEAD, and whose marker names
 another run stops (`pr-owner`) rather than waiting to re-enter the PR
 once it is reopened, and so does an `ANALYZE_EXECUTE` entry whose own

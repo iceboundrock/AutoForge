@@ -2354,6 +2354,16 @@ its author. Only the effect records and the entry observation prove origin.
       its persisted PR, the identity read behind a refused checks read and
       the step budget's read at the merge gate (PR #459 R5-F1).
 
+    A defect in the body changes nothing of what its readable markers record
+    (PR #459 R6-F1). A marker that cannot be read, or a second marker, refuses
+    the body (`pr-owner`), and a readable marker beside it records the owner
+    it would record on a clean body, on the same read, before the refusal.
+    Refused first, the read forgot the owner: a legacy binding blocked with
+    the field empty, and once the markers were removed a restarted run's plain
+    `unblock` launched a reviewer and reached `READY_FOR_MERGE`. A marker that
+    cannot be read names nobody, so it records nothing: once it is repaired, a
+    legacy binding keeps driving as it did before.
+
     A read writes it into the state file as soon as it finds it, and
     nothing else: no phase, no step charged (PR #459 R4-F2). The state
     file is read as last saved, given the field and written back, while

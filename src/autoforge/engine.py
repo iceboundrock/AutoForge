@@ -11379,6 +11379,14 @@ class ControllerEngine:
         the caller already made, so it costs no read of its own; and it can
         only make a run refuse a PR, never let it adopt one (D9.3).
 
+        A defect refuses the body, but says nothing of the markers beside it
+        (PR #459 R6-F1): on the bound PR the readable ones record the owner
+        they would record on a clean body, before the refusal. Refused first,
+        a readable marker beside a malformed or duplicate one was forgotten,
+        and once the markers were removed a restarted legacy binding reviewed
+        the PR again. A marker that cannot be read names nobody, so it
+        records nothing.
+
         ``published`` describes this run's journaled K2, K3 or K7 record
         whose published marker named this run (PR #459 R2-F1): the PR is
         not bound yet, or not as the replacement, so ``owned_pr_url`` cannot
@@ -11389,22 +11397,24 @@ class ControllerEngine:
         url = parse_pr_url(pr.url or state.current_pr_url).canonical
         body = pr.body or ""
         found = scan(IMPLEMENTATION, body)
+        issue = parse_issue_url(state.current_issue_url)
+        owners = [claim.owner_run_id for claim in found.claims if claim.key == issue.identity]
+        other_issues = [
+            claim
+            for claim in found.claims
+            if claim.key != issue.identity and claim.owner_run_id not in (None, state.run_id)
+        ]
+        bound = self._is_bound_pr(url)
+        if bound:
+            self._note_pr_owner([*owners, *(claim.owner_run_id for claim in other_issues)])
         if found.defects:
             return (
                 f"PR {url} carries an implementation marker that cannot be read "
                 f"({'; '.join(found.defects)}), so which run owns it is not knowable and this "
                 f"run ({state.run_id}) does not assume it still does"
             )
-        issue = parse_issue_url(state.current_issue_url)
-        owners = [claim.owner_run_id for claim in found.claims if claim.key == issue.identity]
-        bound = self._is_bound_pr(url)
-        if bound:
-            self._note_pr_owner(owners)
-        for claim in found.claims:
-            if claim.key != issue.identity and claim.owner_run_id not in (None, state.run_id):
-                if bound:
-                    self._note_pr_owner([claim.owner_run_id])
-                return self._other_issue_marker_text(url, claim)
+        if other_issues:
+            return self._other_issue_marker_text(url, other_issues[0])
         for owner in owners:
             if owner not in (None, state.run_id):
                 return (
@@ -11500,7 +11510,8 @@ class ControllerEngine:
 
         ``owners`` are the runs the bound PR's implementation markers of the
         current issue name, as just read or published, or another run a marker
-        of another issue names (PR #459 R5-F2). Any run, this one or
+        of another issue names (PR #459 R5-F2), the body's defects aside (PR
+        #459 R6-F1). Any run, this one or
         another, proves the PR has an owner, so a later read finding the
         owner gone refuses (:meth:`_pr_owner_problem`). It is written into
         the state in memory and, when the binding it is about is the one the

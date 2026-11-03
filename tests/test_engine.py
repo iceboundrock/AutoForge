@@ -2410,6 +2410,7 @@ def test_a_legacy_k2_record_still_binds_its_ownerless_pr(tmp_state_dir, fake_git
 # -- an owner written over a saved plan before it was sent (PR #459 R3-F1) -------------
 # The body of a PR on ``autoforge/2`` once someone wrote an owner into it, and
 # what the refusal says of it.
+_UNREADABLE_MARKER = '<!-- ai-implementation: {"issue": 2} -->'
 _OWNERS_WRITTEN_SINCE = [
     pytest.param(
         f"Started by hand.\n\n{implementation_pr_body(owner_run_id=OTHER_RUN)}",
@@ -2417,9 +2418,16 @@ _OWNERS_WRITTEN_SINCE = [
         id="another-run",
     ),
     pytest.param(
-        'Started by hand.\n\n<!-- ai-implementation: {"issue": 2} -->',
+        f"Started by hand.\n\n{_UNREADABLE_MARKER}",
         "carries an implementation marker that cannot be read",
         id="unreadable",
+    ),
+    # PR #459 R6-F1: an owner readable beside the defect is recorded only for the
+    # PR the run is bound to; this PR is not, so the fence refuses and records none.
+    pytest.param(
+        f"{implementation_pr_body(owner_run_id=OTHER_RUN)}\n{_UNREADABLE_MARKER}",
+        "carries an implementation marker that cannot be read",
+        id="another-run-beside-unreadable",
     ),
     # PR #459 R5-F2: a marker of another issue, whatever run it names, is not
     # this run's to publish under either.
@@ -9399,6 +9407,201 @@ def test_a_legacy_analyze_binding_plans_nothing_for_a_pr_taken_while_the_agent_r
     s = load_state(eng.paths.state_file)
     assert (s.current_pr_url, s.owned_pr_url, s.effect_records) == (PR, PR, [])
     assert _pushes(pushes) == [] and fake_github.effect_writes == []
+
+
+# -- an owner readable beside a defect in the PR's markers (PR #459 R6-F1) --------------
+# Each takes this run's id: a body the scan reports defects in, with a readable
+# marker that names an owner beside them.
+_OWNER_BESIDE_A_DEFECT = [
+    pytest.param(
+        lambda run: f"{implementation_pr_body(owner_run_id=OTHER_RUN)}\n{_UNREADABLE_MARKER}",
+        id="another-run-beside-malformed",
+    ),
+    pytest.param(
+        lambda run: f"{_UNREADABLE_MARKER}\n{implementation_pr_body(owner_run_id=run)}",
+        id="this-run-beside-malformed",
+    ),
+    pytest.param(
+        lambda run: implementation_pr_body(owner_run_id=OTHER_RUN) * 2,
+        id="another-run-twice",
+    ),
+    pytest.param(
+        lambda run: implementation_pr_body(owner_run_id=run) * 2,
+        id="this-run-twice",
+    ),
+    pytest.param(
+        lambda run: implementation_pr_body() + implementation_pr_body(owner_run_id=run),
+        id="this-run-beside-no-run",
+    ),
+    pytest.param(
+        lambda run: (
+            f"{implementation_pr_body(ISSUE3, owner_run_id=OTHER_RUN)}\n{_UNREADABLE_MARKER}"
+        ),
+        id="another-issue-beside-malformed",
+    ),
+    pytest.param(
+        lambda run: (
+            implementation_pr_body() + implementation_pr_body(ISSUE3, owner_run_id=OTHER_RUN)
+        ),
+        id="another-issue-beside-this-issue",
+    ),
+]
+_MARKER_DEFECT = "carries an implementation marker that cannot be read"
+
+
+def _assert_refused_on_the_defect(eng, out) -> None:
+    """The step blocked on the defective body, and the owner beside it is on disk."""
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert _MARKER_DEFECT in eng.state.block_reason
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.owned_pr_url) == (Phase.BLOCKED, PR, PR)
+
+
+@pytest.mark.parametrize("entered", [_legacy_review, _legacy_fix, _legacy_ready])
+@pytest.mark.parametrize("body", _OWNER_BESIDE_A_DEFECT)
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_legacy_binding_keeps_an_owner_readable_beside_a_defect_across_a_restart(
+    tmp_state_dir, fake_github, entered, body, remove, found
+):
+    """PR #459 R6-F1, the reported sequence: a legacy binding reads a body with a
+    readable marker naming a run beside a malformed or duplicate one. Before R6-F1
+    the defect returned before anything was recorded: the step blocked with
+    owned_pr_url empty, and once the markers were removed a restarted run's plain
+    'unblock' launched a reviewer and reached READY_FOR_MERGE. The defective body
+    is still refused, launching, pushing and posting nothing, and the owner is
+    recorded, so after the removal 'unblock' refuses and 'run' launches nothing."""
+    eng = entered(tmp_state_dir, fake_github)
+    eng._save()
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+    head = fake_github.prs[PR].head_sha
+    fake_github.prs[PR].body = body(eng.state.run_id)
+    _assert_refused_on_the_defect(eng, eng.step(allow_merge=True))
+    assert fake_github.prs[PR].head_sha == head
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+@pytest.mark.parametrize("pr_state", ["CLOSED", "OPEN"])
+@pytest.mark.parametrize("body", _OWNER_BESIDE_A_DEFECT[:2])
+def test_a_legacy_analyze_binding_keeps_an_owner_readable_beside_a_defect(
+    tmp_state_dir, fake_github, pr_state, body
+):
+    """PR #459 R6-F1 on ANALYZE_EXECUTE's probe of the PR its state persisted: the
+    one PR read blocks on the defect, closed or open, launching nothing, with the
+    owner recorded, and after its removal a restarted run stays refused."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, None, state=pr_state)
+    fake_github.prs[PR].body = body(eng.state.run_id)
+    _assert_refused_on_the_defect(eng, eng.step())
+    assert [call[0] for call in fake_github.calls] == ["get_pr"]
+    fake_github.prs[PR].state = "OPEN"
+    remove, found = _OWNER_REMOVALS[1].values
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+@pytest.mark.parametrize("recheck", [False, True], ids=["step", "run(recheck_held)"])
+@pytest.mark.parametrize("body", _OWNER_BESIDE_A_DEFECT[:2])
+def test_the_closed_gates_read_keeps_an_owner_readable_beside_a_defect(
+    tmp_state_dir, fake_github, recheck, body
+):
+    """PR #459 R6-F1 at the closed gate: the read of a held legacy binding blocks on
+    the defect and records the owner, so a PR moved after the owner's removal is
+    refused by a restarted run rather than routed to REVIEW."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng, _ = _held(tmp_state_dir, fake_github, config_allows=False)
+    fake_github.prs[PR].body = body(eng.state.run_id)
+    _assert_refused_on_the_defect(eng, _held_step(eng, recheck))
+    fake_github.prs[PR].head_sha = SHA_B
+    remove, found = _OWNER_REMOVALS[1].values
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+@pytest.mark.parametrize("body", _OWNER_BESIDE_A_DEFECT[:3])
+def test_an_owner_readable_beside_a_defect_is_written_alone_at_the_read(
+    tmp_state_dir, fake_github, monkeypatch, body
+):
+    """PR #459 R6-F1 keeps R4-F2's write: the owner reaches the state file at the
+    read, with nothing else, so a process killed before the block's own save keeps
+    it, with the phase as it was and no step charged."""
+    eng = _legacy_in(tmp_state_dir, fake_github, Phase.REVIEW)
+    fake_github.prs[PR].body = body(eng.state.run_id)
+    before = eng.paths.state_file.read_text(encoding="utf-8")
+
+    def killed(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(eng, "_block", killed)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.owned_pr_url) == (Phase.REVIEW, PR)
+    assert _changed_on_disk(before, eng) <= {"owned_pr_url", "updated_at"}
+    assert eng.provider.calls == []
+
+
+@pytest.mark.parametrize("body", _OWNER_BESIDE_A_DEFECT[:2])
+def test_a_body_repaired_to_name_this_run_is_driven_again_after_a_defect(
+    tmp_state_dir, fake_github, body
+):
+    """PR #459 R6-F1 refuses only until the operator acts: the marker the refusal
+    prints, written alone into the body, lets a plain 'unblock' of a restarted run
+    re-enter REVIEW, whose reviewer runs."""
+    eng = _in_review(tmp_state_dir, fake_github, ["never"])
+    eng._save()
+    fake_github.prs[PR].body = body(eng.state.run_id)
+    _assert_refused_on_the_defect(eng, eng.step())
+    assert render_implementation_marker(ISSUE, eng.state.run_id) in eng.state.block_reason
+
+    fake_github.prs[PR].body = implementation_pr_body(owner_run_id=eng.state.run_id)
+    eng.close()
+    eng2 = make_engine(tmp_state_dir, [block(review_payload(1, SHA_A, []))], github=fake_github)
+    eng2.load()
+    out = eng2.unblock("the marker names this run again")
+    assert out.unblocked and out.phase == "REVIEW", out.message
+    assert eng2.step().next_phase == "READY_FOR_MERGE"
+    assert len(eng2.provider.calls) == 1
+    assert load_state(eng2.paths.state_file).owned_pr_url == PR
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(lambda run: f"Started by hand.\n\n{_UNREADABLE_MARKER}", id="malformed-alone"),
+        pytest.param(
+            lambda run: f"{implementation_pr_body()}\n{_UNREADABLE_MARKER}",
+            id="no-run-beside-malformed",
+        ),
+        pytest.param(lambda run: implementation_pr_body() * 2, id="no-run-twice"),
+        pytest.param(
+            lambda run: f"{implementation_pr_body(ISSUE3)}\n{_UNREADABLE_MARKER}",
+            id="another-issue-no-run-beside-malformed",
+        ),
+        pytest.param(
+            lambda run: f"{implementation_pr_body(ISSUE3, owner_run_id=run)}\n{_UNREADABLE_MARKER}",
+            id="another-issue-this-run-beside-malformed",
+        ),
+    ],
+)
+def test_a_defect_beside_no_owner_blocks_and_leaves_the_binding_legacy(
+    tmp_state_dir, fake_github, body
+):
+    """PR #459 R6-F1 records what the same marker would on a clean body, and only
+    that: nothing here names an owner of the PR (R5-F2's rule for a marker of another
+    issue naming no run or this one). The body is refused, no owner is recorded, and
+    once it is repaired the legacy binding drives its PR under an ownerless marker."""
+    eng = _in_review(tmp_state_dir, fake_github, [block(review_payload(1, SHA_A, []))])
+    eng._save()
+    fake_github.prs[PR].body = body(eng.state.run_id)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert _MARKER_DEFECT in eng.state.block_reason
+    assert eng.provider.calls == []
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+
+    fake_github.prs[PR].body = implementation_pr_body()
+    assert eng.unblock("the marker is repaired").unblocked
+    assert eng.step().next_phase == "READY_FOR_MERGE"
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
 
 
 def test_ready_for_merge_requires_clean_review_in_state(tmp_state_dir, fake_github):

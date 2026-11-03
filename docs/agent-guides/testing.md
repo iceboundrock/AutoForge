@@ -581,7 +581,18 @@ High-priority coverage includes:
   `unblock` refuses and `run` launches nothing; naming no run or this one,
   it keeps driving and records no owner. The probe after the agent's launch
   blocks on a PR taken while the agent ran, with nothing planned, pushed or
-  created (PR #459 R5-F1, R5-F2; `tests/test_engine.py`)
+  created (PR #459 R5-F1, R5-F2; `tests/test_engine.py`). A readable marker
+  naming a run beside a malformed or duplicate one blocks (`pr-owner`) with
+  the owner recorded when a legacy binding reads its PR in `REVIEW`, in
+  `FIX`, at the merge gate, on `ANALYZE_EXECUTE`'s probe and at the closed
+  gate, and a plain `unblock` refuses and records it the same way, with a
+  dry run writing nothing. After the markers are removed a restarted run's
+  `unblock` refuses and `run` launches nothing. A
+  process killed before the block's save keeps the owner with nothing else
+  changed, and a body repaired to name this run is driven again. A defect
+  beside no owner records none and the repaired binding stays legacy, and
+  the publication fence records none for a PR the run is not bound to (PR
+  #459 R6-F1; `tests/test_engine.py`, `tests/test_unblock.py`)
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

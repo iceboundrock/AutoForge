@@ -355,6 +355,70 @@ def test_a_refused_unblock_keeps_the_owner_it_read_across_a_restart(
     assert fake_github.effect_writes == []
 
 
+_UNREADABLE_MARKER = '<!-- ai-implementation: {"issue": 2} -->'
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            lambda run: f"{implementation_pr_body(owner_run_id=OTHER_RUN)}\n{_UNREADABLE_MARKER}",
+            id="another-run-beside-malformed",
+        ),
+        pytest.param(
+            lambda run: f"{_UNREADABLE_MARKER}\n{implementation_pr_body(owner_run_id=run)}",
+            id="this-run-beside-malformed",
+        ),
+        pytest.param(
+            lambda run: implementation_pr_body(owner_run_id=OTHER_RUN) * 2,
+            id="another-run-twice",
+        ),
+        pytest.param(
+            lambda run: implementation_pr_body(owner_run_id=run) * 2,
+            id="this-run-twice",
+        ),
+    ],
+)
+def test_a_refused_unblock_keeps_an_owner_readable_beside_a_defect_across_a_restart(
+    tmp_state_dir, fake_github, body
+):
+    """PR #459 R6-F1 on the unblock's read: a legacy binding, BLOCKED for another
+    reason, reads a readable marker naming a run beside a malformed or duplicate
+    one. The unblock refuses on the defect. A dry run writes nothing and leaves the
+    state in memory as it was; the real one writes the owner and nothing else, and
+    once the markers are removed a new process's unblock refuses too."""
+    fake_github.add_pr(head_sha=SHA_A, body=implementation_pr_body())
+    eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **_reviewed())
+    fake_github.prs[PR].body = body(eng.state.run_id)
+    raw = eng.paths.state_file.read_text()
+    defect = "carries an implementation marker that cannot be read"
+
+    preview = eng.unblock(REASON, dry_run=True)
+    assert preview.dry_run and not preview.unblocked
+    assert defect in preview.message
+    assert eng.state.owned_pr_url == ""
+    _assert_untouched(eng, raw)
+
+    refused = eng.unblock(REASON)
+    assert not refused.unblocked and refused.phase == "BLOCKED"
+    assert defect in refused.message
+    _assert_only_the_owner_recorded(eng, raw)
+
+    fake_github.prs[PR].body = "Started by hand."
+    eng.close()
+    eng2 = make_engine(tmp_state_dir, [], github=fake_github)
+    eng2.load()
+    assert eng2.state.owned_pr_url == PR
+    raw = eng2.paths.state_file.read_text()
+    again = eng2.unblock("the other run let go of it")
+    assert not again.unblocked and again.phase == "BLOCKED"
+    assert "carries no implementation marker for issue #2" in again.message
+    assert "the owner was removed since" in again.message
+    _assert_untouched(eng2, raw)
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert fake_github.effect_writes == []
+
+
 def _raises_after_the_read(eng, monkeypatch, where: str) -> None:
     """Make the unblock raise after its read of the bound PR found the owner.
 
