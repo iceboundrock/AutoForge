@@ -4793,7 +4793,7 @@ class ControllerEngine:
             return self._block(
                 previous,
                 plan,
-                self._budget_block_reason(previous, budget),
+                self._budget_block_reason(previous, budget, held.pr if held else None),
                 code=StopReasonCode.STEP_BUDGET,
             )
         if previous == Phase.REVIEW:
@@ -8826,17 +8826,21 @@ class ControllerEngine:
             "open findings and the PR (or raise the 'workflow:' bounds in the config)."
         )
 
-    def _budget_block_reason(self, phase: Phase, reason: str) -> str:
-        """BLOCKED text for the exhausted step budget; at the merge gate, what GitHub holds."""
+    def _budget_block_reason(self, phase: Phase, reason: str, read: PRInfo | None = None) -> str:
+        """BLOCKED text for the exhausted step budget; at the merge gate, what GitHub holds.
+
+        ``read`` is a PR read this step already made (the held READY_FOR_MERGE
+        recheck's, #447), handed to :meth:`_budget_merge_outcome`.
+        """
         head = f"{reason}. This budget is cumulative for the run and is not reset by 'resume'"
         if phase in MERGE_GATE_PHASES and self._require_state().current_pr_url:
-            return f"{head}; {self._budget_merge_outcome()}"
+            return f"{head}; {self._budget_merge_outcome(read)}"
         return (
             f"{head}; nothing was merged. Raise 'workflow.max_total_steps' in the config or "
             "start a new run."
         )
 
-    def _budget_merge_outcome(self) -> str:
+    def _budget_merge_outcome(self, read: PRInfo | None = None) -> str:
         """What the budget's BLOCKED reason says of an uncounted merge-gate PR (#376).
 
         The budget stops MERGE only while this run has counted no merge of
@@ -8854,13 +8858,19 @@ class ControllerEngine:
         :data:`UNMERGED_PR_STATES` says nothing was merged; a read that
         fails, answers with another PR, or reports any other state but
         MERGED (an absent one included) says the outcome is unknown.
+
+        ``read`` is a read of the PR this step already made: the held
+        READY_FOR_MERGE recheck (:meth:`_held_revision_moved`, #447) read the
+        PR moments before and found it OPEN, so the reason words that read
+        instead of asking GitHub the same question again. It is judged as a
+        fresh read would be.
         """
         state = self._require_state()
         url = state.current_pr_url
         pr: PRInfo | None = None
         unknown = ""
         try:
-            pr = self.github.get_pr(url)
+            pr = read if read is not None else self.github.get_pr(url)
             if pr.url and not parse_pr_url(pr.url).same_target(parse_pr_url(url)):
                 unknown = f"GitHub answered with PR {pr.url}"
             elif pr.state != "MERGED" and pr.state not in UNMERGED_PR_STATES:
