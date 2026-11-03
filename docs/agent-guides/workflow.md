@@ -468,7 +468,15 @@ ones that still applied; a stale clean round therefore leaves none), and
 the next completed round of the actual revision, clean or with findings,
 clears them. Only a completed round replaces or clears the carry: an
 operator `unblock` into `REVIEW` after a stale round (see **Leaving
-BLOCKED**) is not a round and leaves it as it is. Like `open_findings` they
+BLOCKED**) is not a round and leaves it as it is. The one carry made at an
+unchanged revision is the operator's: `unblock --rereview` (#428) gives up
+a round's FIX and hands its open findings to the next round the same way,
+and the `PRIOR_FINDINGS` line then says the operator asked for that review
+instead of a FIX, since no push explains why none ran. That line compares
+the round's own binding with the HEAD the FIX was given up at, and names
+the HEAD, base or merge base that moved after the request (a push before
+`REVIEW` bound its revision, PR #444 R1-F3); it says the HEAD is the same
+only when it is. Like `open_findings` they
 are per PR: a replacement PR and a new issue start with none. The
 alternative, not consuming a stale round, was rejected: it would relaunch
 the same round profile against a PR that may move again, and it would let
@@ -799,6 +807,71 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   A flag on a run with no waiting action refuses, quoting the decision a
   plain unblock would make. After an approval the record is authorized, so
   a later block (a closed issue, say) is left with a plain unblock.
+- **A fresh review instead of FIX** (`--rereview`, #428). Where the plain
+  decision is `FIX` with the round's open findings (`OPEN` at the reviewed
+  HEAD and base, no saved plan), a fixer relaunched by a plain unblock
+  cannot get past a finding the operator resolved outside the repository:
+  a PR description rewritten by hand is in neither its read context nor
+  its prompt, and the reason never reaches it. `--rereview` gives that FIX
+  up: `REVIEW`, the last result marked `stale` and the open findings
+  carried to the new round as prior findings, exactly as a moved revision
+  carries them; none is marked resolved, and that round's reviewer, who
+  reads the PR body as it now stands, may raise any of them again. The
+  history entry's `action` is `rereview: abandoned <ids> (round <n> of <PR>
+  at <HEAD>)` and the run log's `metadata.abandoned_findings` lists the
+  ids; `status` shows both the entry and, beside the carried findings,
+  that `unblock --rereview` abandoned them. It is refused, with nothing
+  written, past `workflow.max_review_rounds` (the new round counts like
+  any other); with a saved `FIX` plan (its writes are the controller's to
+  complete: unblock without the flag); unless the merge base, read now
+  against the reviewed HEAD as the `FIX` entry reads it, is the reviewed
+  one (PR #444 R1-F2): a base rewritten under its name moved the diff, and
+  the plain unblock is that drift's recovery (its `FIX` entry re-enters
+  `REVIEW` with the findings carried, no fixer launched), while a round
+  that recorded no merge base or a read that fails conclusively proves
+  nothing (an unavailable GitHub propagates, nothing decided); and unless
+  the agent worktree, where the next round's reviewer works, holds nothing
+  the reviewed HEAD does not. It may be absent; otherwise its `HEAD` must
+  be detached at the reviewed HEAD, read as a candidate is (ADR 0005
+  D6.3): any other `HEAD` (a fixer's unpushed commit, a local branch, a
+  commit the shared store lacks) may hold work a fresh round would leave
+  behind. And `git status`, read through the bound admin dir and never the
+  worktree's `.git` file, must list nothing (PR #444 R1-F1): an
+  uncommitted change (a blocked fixer's half-made edit, an untracked
+  file) is what that reviewer would read and test in place of the
+  reviewed commit, and the controller neither discards nor moves it; a
+  status that cannot be read refuses too. That status compares the files
+  with the worktree's own index, which the agent writes, and an
+  assume-unchanged or skip-worktree mark there hides an edit from it, so
+  the same status is read a second time against a fresh index of the
+  reviewed tree, written into a temporary directory of the controller's
+  own: every tracked file is read and compared with the reviewed commit,
+  whatever the worktree's index records (R2-F1). Both statuses compare
+  what git makes of a file, after the conversions the attributes and the
+  configuration name, and a clean filter can map an edit back to the
+  reviewed blob, so every blob of the reviewed tree is also compared with
+  the worktree's bytes, mode and file type by the controller itself, with
+  no git process reading the worktree and no link followed
+  (`materialize.tree_differences`, R3-F1): a worktree whose checkout
+  converts content (Git LFS, `eol=crlf`) refuses the flag too, since no
+  conversion is trusted to say which bytes are the commit's. A submodule's
+  ignore setting (`.gitmodules`, `submodule.<name>.ignore`,
+  `diff.ignoreSubmodules`) hides what its checkout holds from a status,
+  and files put at a submodule's path without a repository are listed by
+  no status at all (R4-F1). So both statuses run with
+  `--ignore-submodules=dirty`, which overrides every setting, lists a
+  gitlink whose commit moved, and runs no git in a submodule (its
+  repository and configuration, a filter driver say, are the agent's),
+  and the byte comparison refuses every submodule path that is not the
+  empty directory a checkout leaves an unpopulated submodule: what a
+  populated one holds is never proven the reviewed commit's.
+  `git submodule deinit` empties a submodule that holds no change, keeping
+  its repository, and refuses one that does. Ignored files are not listed
+  by any of the three.
+  Anywhere else (a moved PR, a clean review, no PR, no open findings) the
+  flag refuses, quoting the plain decision; it excludes the action flags.
+  A `FIX` agent that reports `blocked` names the flag in the step's
+  message.
 - **Operator actions awaiting the operator** (#243, ADR 0004 K10). A
   `FIX` plan's operator comments (first in the plan, at most four) ask the
   operator to post a comment on another issue of the repository; the
@@ -862,7 +935,8 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   `current_merge_base_sha` is cleared for the next `REVIEW` entry to read;
   the review binding (`reviewed_*`) is never rewritten by this path. The action is
   appended to `unblock_history` (timestamp, reason, cleared block reason,
-  phase, detail, and `action` for an approval, a decline or a binding) and to the run log, `block_reason` is cleared and `attempt`
+  phase, detail, and `action` for an approval, a decline, a binding or a
+  re-review) and to the run log, `block_reason` is cleared and `attempt`
   reset. No agent runs and no step is charged: the operator reviews the
   outcome and runs `resume`, whose entry probe for that phase runs again.
 - **The validation override watermark** (ADR 0006 D14.2, #173). An applied

@@ -62,7 +62,8 @@ sandbox_policy.py   which host resources a launch gets by launch class (ADR 0005
                     what a provider's declaration makes writable (declared_writable)
 agent_worktree.py   the agent worktree's git surface in every sandbox.mode: registry
                     binding and listing (D6.4, #223), candidate read through the
-                    common dir (D6.3),
+                    common dir (D6.3), the uncommitted-change reads through the bound
+                    admin dir and against the reviewed tree's bytes (#428),
                     strict import of private objects (D6.5); git only through the
                     executor's hardened local request (#168)
 github.py           GitHubClient over `gh`, the only holder of a GitHub credential:
@@ -96,7 +97,9 @@ epic_rebind.py      rebind-epic's decision for an existing standalone run: reque
                     record, status's parent warning; no I/O of its own (#435)
 premerge.py         controller-produced pre-merge evidence (check definitions, tree export)
 materialize.py      byte-exact export of a candidate commit from the shared object store
-                    and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171)
+                    and its hash-back proof; the pre-merge export's writer (ADR 0006 D6, #171);
+                    a working tree's blob-by-blob comparison with a commit, a gitlink
+                    matching only as an empty directory (tree_differences)
 evidence.py         candidate validation evidence: definitions, policy P, ValidationRecords,
                     the attempt marker, their bounds and integrity checks; pure (ADR 0006, #172)
 certificate.py      review certificates: issuance from the review binding, applicability

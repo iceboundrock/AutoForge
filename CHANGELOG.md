@@ -81,6 +81,53 @@ Runs that reached `UPDATE_EPIC` (their PR counted), or with writes on the
 old EPIC, still need the manual fallback the guide describes. See
 [Rebinding a run to its issue's parent](docs/usage.md#rebinding-a-run-to-its-issues-parent).
 
+### `unblock --rereview`: a fresh review round instead of another fixer launch (#428)
+
+A run `BLOCKED` with the PR at the reviewed HEAD and the round's findings
+open could only be unblocked into `FIX`. When you had resolved a finding
+outside the repository (a PR description rewritten by hand), the relaunched
+fixer saw neither your change nor your `--reason` and blocked again, and
+leaving `BLOCKED` meant editing `state.json`.
+
+`autoforge unblock --rereview --reason "..."` gives up that round's `FIX`
+and re-enters `REVIEW`: a new round reviews the same HEAD and reads the PR
+as it now stands. The round's findings are not marked resolved: they are
+handed to the new round to re-check, as when the PR moves, and it may raise
+them again. The new round counts against `workflow.max_review_rounds`.
+The flag is refused, with nothing written, when the round's `FIX` plan is
+saved; when the merge base moved since the review (the base was rewritten
+under its name: unblock without the flag, and `FIX` sends the PR to a fresh
+review without launching the fixer) or cannot be proven unchanged; when the
+agent worktree's `HEAD` is anything but the reviewed HEAD (an unpushed
+commit of the fixer's, say); when the agent worktree holds uncommitted
+changes, which the new round's reviewer would read and test instead of the
+reviewed commit (move them out, or unblock without the flag to let `FIX`
+continue from them), including an edit to a file the worktree's index
+marks assume-unchanged or skip-worktree, or one that a clean filter or
+another conversion its attributes name maps back to the committed content,
+which `git status` does not list: AutoForge compares every tracked file's
+bytes with the reviewed commit itself, with no git process reading the
+worktree, so a worktree whose checkout converts content (Git LFS,
+`eol=crlf`) is refused too; when a submodule's path in the agent worktree
+holds anything but the empty directory a checkout leaves an unpopulated
+submodule (a populated submodule, or files put there), whose content
+AutoForge cannot prove the reviewed commit's and which `git status` lists
+only as far as the submodule's `ignore` setting lets it, or not at all
+(`git submodule deinit` empties a submodule that holds no change and
+refuses one that does); and wherever a plain `unblock` would not re-enter
+`FIX` with open findings. It excludes `--approve-action`,
+`--decline-action` and `--bind-evidence`.
+
+The history entry records the abandoned finding ids (`action`), the run
+log adds `metadata.abandoned_findings`, and `status` shows both. A `FIX`
+agent that reports `blocked` now names the flag in the step's message; the
+saved block reason is still the agent's own text. The state protocol is
+unchanged. The `REVIEW` prompt says when its prior findings come from a
+re-review, and whether the PR moved after the request (a push before the
+round bound its revision); the prompt version is `v15`, and a REMOTE run
+resumed by this version renders the new template and keeps its recorded
+label.
+
 ### A stopped run says how it stopped and what applies next, from typed facts (#369)
 
 After its last line, `run`, `step` and `resume` print one `stop:` line

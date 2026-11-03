@@ -87,6 +87,11 @@ uv run autoforge rebind-epic --issue https://github.com/owner/repo/issues/257 \
   --from https://github.com/owner/repo/issues/158 \
   --to https://github.com/owner/repo/issues/255 \
   --reason "#257 moved under #255" --dry-run
+
+# you resolved a review finding outside the repository (a PR description
+# rewritten by hand): give up the round's FIX and have a fresh REVIEW round
+# judge the PR as it now stands; then `resume`
+uv run autoforge unblock --rereview --reason "rewrote the PR description"
 ```
 
 Pass a config file with the global option, before the subcommand:
@@ -634,6 +639,60 @@ or after the fixer ran, is not a block: the PR goes back to `REVIEW` of the
 pushed HEAD; so does a PR retargeted to another base, or a base rewritten
 under its name, at any point of the phase. The decision table is in
 [Workflow: leaving BLOCKED](agent-guides/workflow.md#leaving-blocked-the-operators-unblock).
+
+### A finding the fixer cannot resolve
+
+Some findings ask for something no commit can carry, such as a PR
+description rewritten to match the code. The fixer cannot edit the PR, so it
+reports `blocked`, and the step's message names `unblock --rereview`. A
+plain `unblock` after you made the change yourself does not help: it
+re-enters `FIX`, and the fixer sees neither your change nor your reason, so
+it blocks again. Run
+`autoforge unblock --rereview --reason "..."` instead, then `resume`. The
+round's `FIX` is given up and a fresh `REVIEW` round reviews the same HEAD,
+reading the PR as it now stands. The round's findings are handed to it to
+re-check, not marked resolved, so it may raise them again. `status` shows the
+abandoned finding ids in the `Unblocked:` line and, while the new round has
+not completed, beside `Prior findings to re-check`.
+
+The new round counts against `workflow.max_review_rounds`. `--rereview` is
+refused, with nothing written, when the `FIX` plan is already saved (unblock
+without it), and when the agent worktree's `HEAD` is anything but the
+reviewed HEAD, for example a commit the fixer made before it blocked: that
+commit was never pushed or reviewed, and a fresh round would leave it
+behind. It is refused too while the agent worktree holds uncommitted
+changes (the message names the worktree): the new round's reviewer works
+there, and would read and test them instead of the reviewed commit.
+AutoForge compares every tracked file's bytes with the reviewed commit
+itself, with no git process reading the worktree, so an edit is found
+even when `git -C <worktree> status` does not list it: when the
+worktree's index marks the file
+assume-unchanged or skip-worktree (`git -C <worktree> ls-files -v` shows
+the mark as a lower-case letter or an `S`), or when a conversion the
+file's attributes name, a clean filter say, maps it back to the committed
+content (`git -C <worktree> check-attr -a -- <file>` names it). The
+message says how many such files there are. A repository whose checkout
+itself writes other bytes than the committed ones (Git LFS, `eol=crlf`,
+`ident`, `working-tree-encoding`) is refused for the same reason. So is a
+submodule's path that holds anything but the empty directory a checkout
+leaves an unpopulated submodule: a populated submodule is a repository of
+its own whose content AutoForge cannot prove the reviewed commit's, and
+`git status` lists a change there only as far as the submodule's `ignore`
+setting (in `.gitmodules` or the configuration) lets it, and files put
+there without a repository not at all.
+`git -C <worktree> submodule deinit -- <path>` empties a submodule that
+holds no change and keeps its repository, and refuses one that does.
+Unblock without the flag to let `FIX` continue from the work (its prompt lists
+what `git status` lists), or move the work out of the worktree yourself
+and unblock again; AutoForge never discards it. The flag also checks that
+the base branch was not rewritten
+under the PR since the review (its merge base moved): if it was, unblock
+without the flag, and `FIX` sends the PR to a fresh review of the actual
+revision without launching the fixer. Where a plain `unblock` would not
+re-enter `FIX` with open findings, the flag is refused and the message says
+what the plain decision is. If someone pushes to the PR after the unblock,
+the new round reviews the new HEAD, and its prompt says the PR moved after
+your request.
 
 ### BLOCKED on an acceptance action
 

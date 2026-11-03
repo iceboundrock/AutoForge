@@ -25,6 +25,30 @@ REMOTE run's issue worktree, whatever ``sandbox.mode`` says (#168).
   ``gitdir``, or ``git -C <worktree>``. An attached ``HEAD`` is told by
   ``symbolic-ref --no-recurse``, which never opens the reference it names
   (#223).
+- **Uncommitted changes (#428).** :func:`uncommitted_entries` is ``git
+  status`` of the bound worktree with its admin dir, the common dir and
+  the working tree named explicitly (``--git-dir``, ``GIT_COMMON_DIR``,
+  ``--work-tree``): never through the worktree's ``.git`` file or the
+  admin dir's ``commondir``. That status trusts the worktree's own index,
+  which the agent writes, so :func:`changes_from_revision` reads the same
+  status against a fresh index of the reviewed revision that the
+  controller writes into a temporary directory of its own: an
+  assume-unchanged or skip-worktree mark hides no edit there (PR #444
+  R2-F1). Both statuses compare what git makes of a file, after the
+  conversions its attributes and configuration name (a clean filter, an
+  end-of-line, ``ident`` or ``working-tree-encoding`` conversion), so
+  :func:`byte_changes_from_revision` also compares every blob of the
+  reviewed tree with the worktree's bytes with no git process reading the
+  worktree (:func:`~autoforge.materialize.tree_differences`, R3-F1).
+  A submodule's ignore setting (``.gitmodules``, ``submodule.<name>.ignore``,
+  ``diff.ignoreSubmodules``) would hide what its checkout holds from both
+  statuses, so they override it with ``--ignore-submodules=dirty``: a
+  gitlink's commit is compared, but no git process runs in a submodule,
+  whose repository and configuration are the agent's. What a submodule's
+  path holds is the byte comparison's: only the empty directory a
+  checkout leaves there matches (R4-F1). ``unblock --rereview`` refuses a
+  worktree any of the three lists anything in, since the next round's
+  reviewer works there.
 - **Strict import (D6.5).** :func:`import_private_objects` copies the
   objects reachable from that ``HEAD`` which the shared store lacks out of
   the issue's private object directory (an enforced launch's overlay upper
@@ -65,7 +89,9 @@ from pathlib import Path
 from .errors import GitLockTimeout, LockError, SandboxTamperError, VerificationError
 from .executor import ExecutionRequest, ExecutionResult, execute
 from .git_transport import NO_AUTO_MAINTENANCE, local_git_request
+from .git_workspace import STATUS_ARGS, StatusEntry, parse_status
 from .locking import SharedGitLock
+from .materialize import read_object_format, tree_differences
 from .redaction import redact
 
 Runner = Callable[[ExecutionRequest], ExecutionResult]
@@ -374,6 +400,202 @@ def read_candidate(common: Path, admin: Path, worktree: str, runner: Runner | No
     if found != 0 or not _SHA_RE.fullmatch(head):
         head = ""
     return Candidate(False, head)
+
+
+# The status both reads below run (#428): rename detection off, so no blob is
+# read, and every submodule ignore setting overridden (PR #444 R4-F1):
+# ``ignore = all`` in ``.gitmodules`` or the configuration
+# (``submodule.<name>.ignore``, ``diff.ignoreSubmodules``) would hide a
+# submodule from the status entirely. ``--ignore-submodules=dirty`` lists a
+# gitlink whose commit differs (the submodule's ``HEAD``, read as a
+# reference, or the index entry) and runs nothing in a submodule, where
+# ``none`` would run ``git status`` in each populated one, a repository whose
+# configuration (a filter driver, say) the agent writes. What a submodule's
+# checkout holds is :func:`byte_changes_from_revision`'s to compare.
+_STATUS: tuple[str, ...] = ("status", *STATUS_ARGS, "--no-renames", "--ignore-submodules=dirty")
+
+
+def uncommitted_entries(
+    common: Path, admin: Path, worktree: str, runner: Runner | None
+) -> list[StatusEntry]:
+    """What ``git status`` lists as uncommitted in the bound ``worktree`` (#428).
+
+    The records :meth:`~autoforge.git_workspace.GitWorkspace.status_entries`
+    reads (:data:`~autoforge.git_workspace.STATUS_ARGS`), but with the
+    admin dir the registry binds (D6.4) as ``--git-dir``, ``common`` as
+    ``GIT_COMMON_DIR`` and ``worktree`` as ``--work-tree``: never the
+    worktree's agent-writable ``.git`` file, and never the admin dir's
+    ``commondir``, which the variable overrides. With no optional lock, so
+    the index is not refreshed, and with rename detection off, so no blob
+    is read (the index may name one only the issue's private object
+    directory holds). Ignored files are not listed. A submodule is listed
+    by its gitlink alone, whatever its ignore setting (:data:`_STATUS`):
+    what its checkout holds is not read here. It is the operator's notion
+    of uncommitted work, never an identity: the caller holds that the
+    candidate read (:func:`read_candidate`) found ``HEAD``. An inconclusive
+    read is a :class:`VerificationError`, never a guess.
+    """
+    args = list(_STATUS)
+    res = _run(
+        runner,
+        local_git_request(
+            ["--no-optional-locks", "--git-dir", str(admin), "--work-tree", worktree, *args],
+            env={"GIT_COMMON_DIR": str(common)},
+            timeout_seconds=GIT_TIMEOUT_SECONDS,
+        ),
+    )
+    if res.timed_out or res.truncated or res.exit_code != 0:
+        raise VerificationError(
+            f"cannot read the uncommitted changes of the agent worktree {worktree} "
+            f"(`git {' '.join(args)}` {_ended(res)}{_detail(res)})"
+        )
+    return parse_status(res.stdout or "")
+
+
+# What a fresh index takes from no configuration (PR #444 R2-F1): no sparse
+# patterns, which would mark its entries skip-worktree; no entry marked
+# assume-unchanged; no shared split index, which git would write into the
+# git dir rather than beside the index.
+_FRESH_INDEX_SWITCHES: tuple[str, ...] = (
+    "-c",
+    "core.sparseCheckout=false",
+    "-c",
+    "core.ignoreStat=false",
+    "-c",
+    "core.splitIndex=false",
+)
+
+
+def changes_from_revision(
+    common: Path, admin: Path, worktree: str, revision: str, runner: Runner | None
+) -> list[StatusEntry]:
+    """What the bound ``worktree`` holds that ``revision`` does not, whatever its index says.
+
+    :func:`uncommitted_entries` compares the files with the worktree's own
+    index, which the agent writes: git takes an entry marked
+    assume-unchanged or skip-worktree, or one whose recorded stat data
+    matches an edited file, as unchanged without reading the file, so such
+    an edit is listed nowhere (PR #444 R2-F1). Here ``git read-tree``,
+    with the common dir as its git dir, writes a fresh index of
+    ``revision``'s tree into a temporary directory of the controller's
+    own, and ``git status`` reads the worktree against it, with the admin
+    dir, the common dir and the working tree named as
+    :func:`uncommitted_entries` names them. The fresh index records no
+    flag and no stat data, so every tracked file is read and compared with
+    ``revision``'s blob. ``revision`` is the candidate's ``HEAD``
+    (:func:`read_candidate`), so nothing reads as staged: a change is a
+    modified, deleted or retyped file, or an untracked one. Rename
+    detection stays off, so only trees of ``revision`` are read from the
+    shared store. Ignored files are not listed, and a submodule is
+    compared by its gitlink alone, as :func:`uncommitted_entries` compares
+    it. Nothing of the worktree,
+    its admin dir or the shared store is written. An inconclusive read is
+    a :class:`VerificationError`, never a guess.
+    """
+    failed = f"cannot compare the agent worktree {worktree} with the revision {revision[:12]}"
+    read_tree = ["read-tree", revision]
+    status = list(_STATUS)
+    try:
+        with tempfile.TemporaryDirectory(prefix="autoforge-index-") as scratch:
+            env = {"GIT_COMMON_DIR": str(common), "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+            for git_dir, args in ((common, read_tree), (admin, status)):
+                res = _run(
+                    runner,
+                    local_git_request(
+                        [
+                            *_FRESH_INDEX_SWITCHES,
+                            "--no-optional-locks",
+                            "--git-dir",
+                            str(git_dir),
+                            "--work-tree",
+                            worktree,
+                            *args,
+                        ],
+                        env=env,
+                        timeout_seconds=GIT_TIMEOUT_SECONDS,
+                    ),
+                )
+                if res.timed_out or res.truncated or res.exit_code != 0:
+                    raise VerificationError(
+                        f"{failed} (`git {' '.join(args)}` on a fresh index {_ended(res)}"
+                        f"{_detail(res)})"
+                    )
+    except OSError as exc:
+        raise VerificationError(
+            f"{failed} (its temporary index directory: {exc.strerror or exc})"
+        ) from exc
+    return parse_status(res.stdout or "")
+
+
+# How a byte comparison's difference reads as a ``git status`` code: a
+# populated submodule as ``git status --ignore-submodules=none`` lists one.
+_DIFFERENCE_CODES = {"modified": " M", "deleted": " D", "retyped": " T", "populated": " M"}
+
+
+@dataclass(frozen=True)
+class ByteChanges:
+    """What :func:`byte_changes_from_revision` finds, each as a ``git status`` record.
+
+    ``files``: the tracked files whose bytes, mode or type differ.
+    ``submodules``: the gitlink paths that are not the empty directory an
+    unpopulated submodule leaves (PR #444 R4-F1).
+    """
+
+    files: tuple[StatusEntry, ...]
+    submodules: tuple[StatusEntry, ...]
+
+
+def byte_changes_from_revision(
+    common: Path, worktree: str, revision: str, runner: Runner | None
+) -> ByteChanges:
+    """The tracked paths of ``revision`` that the bound ``worktree`` does not hold as committed.
+
+    Both :func:`uncommitted_entries` and :func:`changes_from_revision`
+    compare what git makes of a file: before it compares, git converts the
+    file as the attributes name (the worktree's ``.gitattributes`` files,
+    ``info/attributes``, ``core.attributesFile``) with what the
+    configuration defines (a filter driver's clean program, an end-of-line,
+    ``ident`` or ``working-tree-encoding`` conversion). A clean filter can
+    map an edited file back to the reviewed blob, so neither lists an edit
+    the next round's reviewer would read and test (PR #444 R3-F1). Here no
+    git process reads the worktree: ``revision``'s tree is listed from the
+    shared store (git runs in ``common``) and each of its blobs is
+    compared with the worktree's bytes, its mode and its file type
+    (:func:`~autoforge.materialize.tree_differences`). A modified, deleted
+    or retyped file reads as ``" M"``, ``" D"`` or ``" T"``; a file that is
+    not in ``revision`` is not looked at (:func:`changes_from_revision`
+    lists it). A worktree whose checkout converts content itself (Git LFS,
+    ``eol=crlf``) reads as changed: no conversion is trusted to say which
+    bytes are the commit's.
+
+    A gitlink's path (a submodule's) holds the checkout of a repository of
+    its own, which both statuses compare by its commit alone and which an
+    ignore setting hides from them entirely; files placed there without a
+    repository are listed by no ``git status`` at all. Its store and
+    configuration are the agent's to write, so nothing it holds is proven
+    the gitlink's commit: only the empty directory a checkout leaves an
+    unpopulated submodule matches, and anything else there is in
+    ``submodules`` (``" M"`` when it is populated, ``" D"`` or ``" T"`` as
+    for a file), never read (PR #444 R4-F1). An inconclusive read is a
+    :class:`VerificationError`, never a guess.
+    """
+    run = runner or execute
+    try:
+        object_format = read_object_format(run, str(common))
+        differences = tree_differences(run, str(common), revision, object_format, Path(worktree))
+    except VerificationError as exc:
+        raise VerificationError(
+            f"cannot compare the bytes of the agent worktree {worktree} with the revision "
+            f"{revision[:12]} ({exc})"
+        ) from exc
+    entries = [
+        (d.submodule, StatusEntry(_DIFFERENCE_CODES[d.kind], d.path.decode("utf-8", "replace")))
+        for d in differences
+    ]
+    return ByteChanges(
+        files=tuple(entry for submodule, entry in entries if not submodule),
+        submodules=tuple(entry for submodule, entry in entries if submodule),
+    )
 
 
 def _root_problem(common: Path, directory: Path) -> str | None:

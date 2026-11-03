@@ -1297,7 +1297,13 @@ a stated reason it has none. The coverage that must keep working:
   directory before the strict import (it exports after it), and anything
   but a full commit id are not materializable; a replacement object changes
   nothing; the directory is removed after a pass, a failure and an
-  exception. The merge gate's commands see the committed bytes, and an
+  exception. Its comparison of a working tree with a commit
+  (`tree_differences`, PR #444 R3-F1) lists a changed byte, a flipped
+  execute bit, a retargeted link, a deletion and a retyped file by raw
+  path, and takes a gitlink as the commit's only as an empty real
+  directory: a repository, a file or a subdirectory in it, a link to it or
+  above it, a regular file, a FIFO (never opened) or nothing at its path
+  is a difference (R4-F1). The merge gate's commands see the committed bytes, and an
   unexportable reviewed HEAD stays inconclusive (`tests/test_engine.py`)
 - `ANALYZE_EXECUTE`'s publication (#161, `tests/test_engine.py`, engine
   built with `origin=True`): the controller pushes the agent's commit and
@@ -1591,6 +1597,67 @@ a stated reason it has none. The coverage that must keep working:
   default branch renamed during either wait blocks with nothing adopted or
   bound (PR #404). No test sleeps: `make_engine` records each pause in
   `eng.sleeps`
+- `unblock --rereview` (#428, `tests/test_unblock.py`, the saved-plan
+  refusals in `tests/test_operator_actions.py` and `tests/test_cli.py`):
+  where the plain decision is `FIX` with open findings it re-enters
+  `REVIEW` with them carried, the result `stale`, the round counter and the
+  review binding untouched, the abandoned ids in the history entry's
+  `action` and the run log's `abandoned_findings`; the next `REVIEW` prompt
+  says the operator asked for the round and quotes no reason, and only an
+  entry for the same findings, round, PR and HEAD marks a carry as a
+  re-review's; a fixer that blocks names the flag, and after the operator
+  edits the PR body the flag leads to a round that reads the new body,
+  clears the carry and reaches `READY_FOR_MERGE` with no second fixer
+  launch; it is refused, byte-identical, past the round cap, with a saved
+  `FIX` plan, with the agent worktree at another commit, on a branch or
+  unbindable, and wherever the plain decision is not `FIX` (quoting it);
+  with the merge base moved under an unchanged HEAD and base name, after
+  which the plain unblock's `FIX` re-enters `REVIEW` with no fixer
+  launched, with no merge base recorded or a conclusive read failure, and
+  an unavailable read propagates with no record (PR #444 R1-F2); with an
+  untracked, modified or staged change in the agent worktree, or a status
+  that cannot be read, the change left as it was, and end to end a blocked
+  fixer's uncommitted edit that would have cleared the bug refuses the
+  flag until the operator moves it out, after which the round's reviewer
+  reads the reviewed commit and raises it again (R1-F1); the same with
+  the edit marked assume-unchanged or skip-worktree in the worktree's
+  index, which `git status` does not list, the edit and its mark left as
+  they were (R2-F1); the same with the marked edit also mapped back to the
+  committed content by a clean filter in the repository's configuration
+  and `info/attributes`, which no `git status` lists, the edit, its mark
+  and the filter left as they were (R3-F1); the same with the fix made in
+  a submodule whose `.gitmodules` entry says `ignore = all`, left
+  uncommitted, committed in the submodule only, or written into the
+  unpopulated submodule's directory without a repository, which no plain
+  `git status` lists, the fix left as it was, until the operator empties
+  the submodule, after which the reviewer finds it unpopulated (R4-F1); an
+  ignored file does not refuse it; the uncommitted read follows neither the `.git` file nor
+  `commondir` and reads no blob,
+  and the read against a fresh index of the revision lists a marked
+  edit, deletion or type change, takes a rewrite with the revision's
+  content as no change, writes nothing of the worktree, its admin dir or
+  the shared store, keeps sparse patterns and `core.ignoreStat` from
+  marking its entries, and refuses a revision the shared store cannot read;
+  the byte comparison lists an edit a clean filter or an end-of-line
+  conversion hides from both statuses, a deletion, a file replaced by a
+  link, a retargeted link and an execute bit flipped under
+  `core.fileMode=false`, reads files below a directory replaced by a link
+  as deleted without following it, a FIFO as retyped without opening it,
+  and a file of another size without reading it; it runs no git process
+  naming the worktree, ignores untracked and ignored files, takes a
+  rewrite with the committed bytes as no change, and refuses a revision
+  the store cannot read or a directory it cannot read; it lists a
+  populated submodule's path whose edit `ignore = all` hides from both
+  statuses, and files put into an unpopulated one, which no status lists,
+  and takes a deinitialized submodule's empty directory as no change; both
+  statuses list a submodule whose commit moved with `ignore = all` set in
+  `.gitmodules`, `submodule.<name>.ignore`, `diff.ignoreSubmodules` or the
+  worktree's own configuration, and none of the three reads runs a clean
+  filter the submodule's configuration defines, which
+  `--ignore-submodules=none` runs (`tests/test_agent_worktree.py`); a
+  push between the unblock and the `REVIEW` entry is named in the prompt,
+  which keeps the provenance and never says the HEAD is the same (R1-F3);
+  it excludes the action flags; a dry run writes nothing
 
 ### Integration
 
