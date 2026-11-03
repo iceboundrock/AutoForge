@@ -92,9 +92,14 @@ of a `resume` reads a held run: one that reaches `READY_FOR_MERGE` again in
 the same invocation stops there, and a scheduler's worker, which does not
 ask for the recheck, never reads it. The recheck of an unmoved PR
 is no step and is not charged; the step to `REVIEW` is, so an exhausted
-step budget blocks it like any other. A closed PR, a merge by hand or a
-`current_pr_url` that is not the reviewed PR hold as before: those are the
-open gate's to decide. Because `resume` may launch the reviewer from here,
+step budget blocks it like any other. A PR GitHub reports `CLOSED` or
+`MERGED` (a merge by hand) and a `current_pr_url` that is not the reviewed
+PR hold as before: those are the open gate's to decide. An answer that
+establishes no revision is no hold: a state missing or none of `OPEN`,
+`CLOSED` and `MERGED`, an `OPEN` PR with no HEAD or no base, or GitHub
+naming another PR raises a `VerificationError` with the phase and the
+state file unchanged, as a failed read does, so `resume` exits 1 instead of
+printing the banner. Because `resume` may launch the reviewer from here,
 it passes the recorded-configuration check of **Re-entering a phase**
 first, as `step` always did.
 

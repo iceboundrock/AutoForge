@@ -1468,6 +1468,41 @@ def test_a_push_to_a_pr_held_at_ready_for_merge_is_reviewed_with_the_gate_closed
     assert status["review_certificate_status"]["applicable"] is True
 
 
+@pytest.mark.parametrize("command", ["step", "resume"])
+@pytest.mark.parametrize(
+    ("field", "said"),
+    [("state", "reports no state, not OPEN, CLOSED or MERGED"), ("head_sha", "reports no HEAD")],
+    ids=["no state", "no HEAD"],
+)
+def test_an_incomplete_pr_answer_at_ready_for_merge_is_an_error_not_the_banner(
+    tmp_path, capsys, monkeypatch, fakes, command, field, said
+):
+    """R1-F2 through the CLI: a held run whose PR GitHub answers without a state,
+    or OPEN without a HEAD, is not shown as held at the reviewed revision.
+
+    ``resume`` does not print the READY_FOR_MERGE banner and exit 0, nor
+    ``step`` refuse with the merge-gate message: both exit 1 with the read's
+    own error and its stop line, the state file unchanged byte for byte.
+    """
+    monkeypatch.chdir(tmp_path)
+    _drive_to_ready(fakes)
+    gh = fakes["gh"]
+    sd = str(tmp_path / ".autoforge")
+    assert cli.main(["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE]) == 0
+    capsys.readouterr()
+    state_file = tmp_path / ".autoforge" / "state.json"
+    assert json.loads(state_file.read_text())["phase"] == "READY_FOR_MERGE"
+    before = state_file.read_bytes()
+    setattr(gh.prs[PR], field, "")
+    assert cli.main(["--state-dir", sd, command]) == 1
+    captured = capsys.readouterr()
+    assert said in captured.err and "the run stays READY_FOR_MERGE" in captured.err
+    assert "stop: resumable_error (reason verification-failed, from exception: " in captured.err
+    assert "merge is disabled" not in captured.err
+    assert "AutoForge workflow reached READY_FOR_MERGE." not in captured.out
+    assert state_file.read_bytes() == before and gh.merges == []
+
+
 def _drive_to_ready(fakes):
     """Agent script: ANALYZE_EXECUTE commits (the controller opens the PR), REVIEW is
     clean, UPDATE_EPIC ends."""

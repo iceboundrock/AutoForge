@@ -8296,11 +8296,17 @@ class ControllerEngine:
         ``None`` (hold, as before) when the PR is at the reviewed HEAD, base
         and merge base, and when this read has nothing it may decide: no
         complete clean-review binding in state, a ``current_pr_url`` that
-        is not the reviewed PR or a PR GitHub answers as another one, or a
-        PR that is not OPEN (a merge by hand leaves the run READY_FOR_MERGE
-        while the gate is closed) or reports no HEAD or base. The open gate
-        judges each of those itself. A read that fails raises its
-        GitHubError, named, with the phase unchanged.
+        is not the reviewed PR, or a PR GitHub reports CLOSED or MERGED (a
+        merge by hand leaves the run READY_FOR_MERGE while the gate is
+        closed). The open gate judges each of those itself.
+
+        An answer that establishes neither -- GitHub naming another PR, a
+        state missing or none of OPEN, CLOSED and MERGED, or an OPEN PR with
+        no HEAD or no base (the decoder lets an absent or null field through
+        as ``""``) -- is no evidence that the reviewed revision is still
+        the PR's, so it raises :class:`VerificationError` rather than hold
+        (R1-F2). That, and a read that fails (its GitHubError, named), leave
+        the phase and the state file unchanged.
         """
         state = self._require_state()
         url = state.current_pr_url
@@ -8319,10 +8325,27 @@ class ControllerEngine:
             return None
         with self._reading(f"PR {url}"):
             pr = self.github.get_pr(url)
+        unchanged = (
+            "whether the PR is still at the reviewed HEAD "
+            f"{reviewed[:12]} on {state.reviewed_base_ref!r} cannot be told; the run stays "
+            "READY_FOR_MERGE and nothing was written"
+        )
         if pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref):
+            raise VerificationError(f"GitHub answered {url} with PR {pr.url}: {unchanged}")
+        if pr.state in ("CLOSED", "MERGED"):
             return None
-        if not pr.is_open or not pr.head_sha or not pr.base_ref:
-            return None
+        if pr.state != "OPEN":
+            shown = repr(pr.state) if pr.state else "no state"
+            raise VerificationError(
+                f"PR {url} reports {shown}, not OPEN, CLOSED or MERGED: {unchanged}"
+            )
+        missing = [
+            name for name, value in (("HEAD", pr.head_sha), ("base", pr.base_ref)) if not value
+        ]
+        if missing:
+            raise VerificationError(
+                f"PR {url} is OPEN and reports no {' and no '.join(missing)}: {unchanged}"
+            )
         if pr.head_sha != reviewed or pr.base_ref != state.reviewed_base_ref:
             return _HeldRevisionMoved(pr)
         merge_base = self._merge_base_of(pr)

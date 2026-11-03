@@ -212,9 +212,12 @@ High-priority coverage includes:
   persisted, through `step` and through `resume` (`run(recheck_held=True)`,
   whose step reuses its one read), and the new round certifies the new
   head alone, which is what merges once the gate opens; an unmoved PR, a
-  closed PR, a merge by hand and a PR that is not the reviewed one hold
-  with the state file unchanged, and a failed PR or merge-base read raises
-  with it unchanged; a plain `run` and a worker's `READY_FOR_MERGE` stop
+  closed PR, a merge by hand and a `current_pr_url` that is not the
+  reviewed PR hold with the state file unchanged, and a failed PR or
+  merge-base read raises with it unchanged; so does an answer that
+  establishes no revision (no state or an unknown one, an `OPEN` PR with no
+  HEAD or no base, an answer naming another PR), through `step` and
+  `resume` alike, never the banner or the merge-gate refusal; a plain `run` and a worker's `READY_FOR_MERGE` stop
   phase read nothing; an exhausted step budget leaves an unmoved PR alone
   and blocks the step to `REVIEW`; through the CLI, the reported case (a
   clean run, its branch rewritten and force-pushed) is reviewed again by

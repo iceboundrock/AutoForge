@@ -23,6 +23,12 @@ so.
   checks the run's recorded configuration first, as `step` always did: a
   changed configuration refuses (exit 2) unless `--accept-config-change`.
   `resume --dry-run` reads nothing and prints the banner.
+- An answer from GitHub that does not establish the PR's revision is an
+  error, never a hold: a PR with no state or one other than `OPEN`,
+  `CLOSED` and `MERGED`, an `OPEN` PR with no HEAD or no base, or an
+  answer naming another PR makes `resume` and `step` exit 1 with the
+  phase and the state unchanged. Only a PR GitHub reports `CLOSED` or
+  `MERGED` holds without being compared.
 - The scheduler's workers are unchanged: an issue `epic run` settled at
   `READY_FOR_MERGE` is not read again.
 

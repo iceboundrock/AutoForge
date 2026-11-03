@@ -7607,6 +7607,75 @@ def test_ready_for_merge_gate_closed_holds_what_only_the_open_gate_decides(
     assert eng.state.phase == Phase.READY_FOR_MERGE and eng.state.counted_merged_prs == []
 
 
+def _answers_no_state(pr):
+    pr.state = ""
+
+
+def _answers_another_state(pr):
+    pr.state = "LOCKED"
+
+
+def _answers_no_head(pr):
+    pr.head_sha = ""
+
+
+def _answers_no_base(pr):
+    pr.base_ref = ""
+
+
+def _answers_neither(pr):
+    pr.head_sha = pr.base_ref = ""
+
+
+def _answers_another_pr(pr):
+    pr.url = PR.replace("/pull/42", "/pull/43")
+
+
+@pytest.mark.parametrize("recheck", [False, True], ids=["step", "run(recheck_held)"])
+@pytest.mark.parametrize(
+    ("answer", "said"),
+    [
+        (_answers_no_state, f"PR {PR} reports no state, not OPEN, CLOSED or MERGED"),
+        (_answers_another_state, f"PR {PR} reports 'LOCKED', not OPEN, CLOSED or MERGED"),
+        (_answers_no_head, f"PR {PR} is OPEN and reports no HEAD:"),
+        (_answers_no_base, f"PR {PR} is OPEN and reports no base:"),
+        (_answers_neither, f"PR {PR} is OPEN and reports no HEAD and no base:"),
+        (_answers_another_pr, f"GitHub answered {PR} with PR {PR.replace('/42', '/43')}:"),
+    ],
+    ids=["no state", "unknown state", "no HEAD", "no base", "neither", "another PR"],
+)
+def test_ready_for_merge_gate_closed_incomplete_pr_answer_is_an_error_not_a_hold(
+    tmp_state_dir, fake_github, recheck, answer, said
+):
+    """R1-F2: an identity answer that does not establish the PR's revision is no hold.
+
+    Only a PR GitHub reports CLOSED or MERGED holds without a revision; a
+    missing or unknown state, an OPEN PR without a HEAD or a base (the
+    decoder lets an absent or null field through as ``""``) and an answer
+    naming another PR raise a VerificationError of their own, never the
+    merge-gate refusal ``step`` gives an unmoved PR or the hold that lets
+    ``resume`` print the banner. The merge base is not read and the state
+    file is unchanged byte for byte.
+    """
+    fake_github.add_pr(head_sha=SHA_A)
+    eng, before_bytes = _held(tmp_state_dir, fake_github)
+    answer(fake_github.prs[PR])
+    before = len(fake_github.calls)
+    with pytest.raises(VerificationError, match=re.escape(said)) as raised:
+        if recheck:
+            eng.run(allow_merge=False, recheck_held=True)
+        else:
+            eng.step(allow_merge=False)
+    assert str(raised.value).endswith(
+        f"whether the PR is still at the reviewed HEAD {SHA_A[:12]} on 'main' cannot be told; "
+        "the run stays READY_FOR_MERGE and nothing was written"
+    )
+    assert "merge is disabled" not in str(raised.value)
+    assert _reads_since(fake_github, before) == ["get_pr"]
+    assert eng.paths.state_file.read_bytes() == before_bytes
+    assert eng.state.phase == Phase.READY_FOR_MERGE and fake_github.merges == []
+
+
 @pytest.mark.parametrize("recheck", [False, True], ids=["step", "run(recheck_held)"])
 @pytest.mark.parametrize(
     ("attr", "error", "read"),
