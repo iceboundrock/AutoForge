@@ -5,6 +5,36 @@ so.
 
 ## Unreleased
 
+### A body the controller writes back keeps text `gh` rewrites, and an operator's exact comment verifies (#328)
+
+- The controller writes an adopted PR's body (K3), a follow-up issue's
+  body (K6) and the EPIC body around its roadmap section back whole. It
+  read them through `gh`, which prints control characters and the text of
+  their escapes (`\u001b` in a body) as caret notation, so its own write
+  replaced a human's `\u001b` with `\^[`. Where `gh`'s print of such a body
+  holds a `^`, the body is now read exactly from `https://api.github.com/`
+  (#327's read), and the payload, its digest and the read-back use that
+  text, so the human's text is written back byte for byte. A body whose
+  print holds no `^` costs no extra request.
+- An operator comment (K10) holding its payload byte for byte is verified
+  as `exact` when the payload holds escape text, where it was a conflict;
+  one holding a control character where the payload holds caret text
+  (`^C`) is a conflict, where it was `exact`. A bound comment is still
+  compared by the digest of `gh`'s print, as when it was bound.
+- Work an earlier version left part done never writes the rewrite: a
+  planned append is rebased onto GitHub's text, an `UPDATE_EPIC` section
+  composed against the print is asked for again on `resume`, and an
+  operator comment it would not verify is verified by `unblock`
+  ([GitHub safety](docs/agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)).
+- What the controller shows and what it judges are one version. The
+  `UPDATE_EPIC` prompt quotes `gh`'s print of the roadmap section while the
+  splice is bound to the exact text, and REVIEW's operator evidence quotes
+  `gh`'s print of a comment while it compares the exact text's digest. A
+  print that is not the exact text's (an edit between the two reads) is
+  never paired with it: the EPIC is read again, and blocks before any
+  launch when it changes again; the operator comment is reported as having
+  changed while it was read, with no body quoted and no digest compared.
+
 ### `rebind-epic` moves an existing standalone run to its issue's native parent, and `status` warns when they differ (#435)
 
 A run records its EPIC once, and #293 only fixed how a new run chooses it.

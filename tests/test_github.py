@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 import autoforge.github as github_module
+from autoforge.effect_ops import gh_prints_as
 from autoforge.errors import (
     ConfigurationError,
     GitHubChecksAccessError,
@@ -3941,6 +3942,17 @@ def test_the_fakes_sanitizer_is_gh_s_on_upstream_s_own_vectors(wire, printed):
     """The fakes' model of `gh`'s sanitizer (``gh_sanitized_json``) is go-gh's: every
     vector of upstream's own test, so what a fake prints is what `gh` prints."""
     assert gh_sanitized_json(wire) == printed
+
+
+@pytest.mark.parametrize(("wire", "printed"), _UPSTREAM_SANITIZER_VECTORS)
+def test_gh_prints_as_accepts_every_upstream_vector(wire, printed):
+    """#328: ``effect_ops.gh_prints_as``, which keeps the UPDATE_EPIC entry and REVIEW's
+    operator evidence on one version of a text, takes each upstream print for the
+    print of its text: the vectors as JSON strings, decoded."""
+    text = json.loads(f'"{wire}"', strict=False)
+    shown = json.loads(f'"{printed}"', strict=False)
+    assert gh_prints_as(text, shown)
+    assert not gh_prints_as(text, shown + "!") and not gh_prints_as(text + "!", shown)
 
 
 def test_gh_prints_the_text_of_an_escape_as_caret_notation_and_loses_which_it_was():

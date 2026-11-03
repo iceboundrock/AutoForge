@@ -340,9 +340,11 @@ AutoForge uses the `gh` login of the user who runs it (or the `GH_TOKEN`
 of the shell you start it from) for every GitHub call, and hands it to git
 through `gh auth git-credential` for every fetch and push; agents never see
 it. One kind of read goes around `gh`: to check that a PR, issue or comment
-it created holds exactly the text it sent, AutoForge reads that one object
-from `https://api.github.com/` itself, with the token `gh auth token`
-prints, because `gh` rewrites control characters in what it prints (#327).
+it created holds exactly the text it sent, to read the body it is about to
+append to or splice into (an adopted PR, a follow-up issue, the EPIC), or
+to check an operator's comment, AutoForge reads that one object from
+`https://api.github.com/` itself, with the token `gh auth token` prints,
+because `gh` rewrites control characters in what it prints (#327, #328).
 That read is a `GET`, follows no redirect, verifies GitHub's certificate,
 ignores `SSLKEYLOGFILE` (so no TLS key log of that connection is written),
 and keeps the token in memory for the one request; it needs no permission

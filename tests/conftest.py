@@ -884,9 +884,11 @@ class FakeGitHub:
             raise self.edit_issue_error
         if self.edit_issue_error:
             raise GitHubError(self.edit_issue_error)
-        issue = self.get_issue(canonical)  # fails closed on an unknown issue, like `gh`
+        self.get_issue(canonical)  # fails closed on an unknown issue, like `gh`
         if not self.edit_issue_leaves_body:
-            issue.body = body
+            # The stored issue: `get_issue` hands out `gh`'s print of it, a
+            # copy while ``gh_sanitizes`` (#328).
+            self._stored_issue(canonical).body = body
 
     def list_open_issues(self, repo: str, *, strict: bool = False) -> list[IssueInfo]:
         self.calls.append(("list_open_issues", repo, strict))
