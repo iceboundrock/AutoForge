@@ -18,8 +18,8 @@ blocks on; `status --json` carries the same as `unjournaled_review`
 
 - when GitHub says the comment was created, and how long after the run's
   creation and after the run's last reviewer launches in its run log; the
-  login GitHub names, the comment's marker (at most 20 of its finding ids,
-  with their count), length, SHA-256 and a short excerpt. The length and
+  login GitHub names, the comment's marker (at most 20 of its finding ids
+  and 10 of its markers' defects, each with their count), length, SHA-256 and a short excerpt. The length and
   SHA-256 are of GitHub's text: a body `gh` printed with a `^` is read
   again exactly, since `gh` rewrites control characters and the text of
   their escapes. When that read fails, the report gives the print's
@@ -40,7 +40,8 @@ blocks on; `status --json` carries the same as `unjournaled_review`
 - the PR's other `ai-review-result` markers, the commits GitHub lists for
   the PR committed after the comment (author, committer, time after it;
   GitHub records when a commit was made, not when it was pushed), and the
-  PR's `ai-implementation` marker and HEAD.
+  PR's `ai-implementation` marker (at most 10 of the issues it names and of
+  its defects, with their count) and HEAD.
 
 It is evidence only: it names no author, adopts, deletes and writes
 nothing, and takes no lock. Bodies, commit messages, names and e-mail

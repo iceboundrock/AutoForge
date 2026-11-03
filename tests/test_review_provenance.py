@@ -209,7 +209,12 @@ def test_the_report_names_the_state_directory_that_journaled_the_comment(tmp_pat
     assert [e["kind"] for e in match["evidence"]] == ["last_review_comment_url", "review_history"]
     assert document["state_directories"]["read"] == 2
     assert document["state_directories"]["namespaces_read"] is True
-    assert document["implementation_marker"] == {"issues": [ISSUE], "defects": []}
+    assert document["implementation_marker"] == {
+        "issues": [ISSUE],
+        "issues_total": 1,
+        "defects": [],
+        "defects_total": 0,
+    }
     # Only reads: the comments, then (a comment was found) the PR and its commits.
     assert {call[0] for call in gh.calls} <= {
         "get_issue_node",
@@ -739,6 +744,47 @@ def test_a_markers_finding_ids_are_bounded_in_both_output_modes(tmp_path, status
     )
     assert out.count(f"findings {shown}") == 2
     assert hidden not in out
+
+
+def test_marker_defects_and_implementation_issues_are_bounded_in_both_output_modes(
+    tmp_path, status
+):
+    """A body may carry any number of broken markers, and a PR body any number of
+    implementation markers: the report shows a bounded few of each and says how many."""
+    from dataclasses import replace
+
+    from autoforge.engine import render_implementation_marker
+
+    gh = FakeGitHub()
+    broken = "".join(f"<!-- ai-review-result: broken-{n} -->\n" for n in range(50))
+    gh.add_comment(PR, 100, broken, created_at="2026-01-01T00:00:00Z")
+    blocked = _blocked(tmp_path, "mine", gh)
+    issues = [f"https://github.com/o/r/issues/{n}" for n in range(1, 31)]
+    gh.prs[PR] = replace(
+        gh.prs[PR], body="".join(render_implementation_marker(i) + "\n" for i in issues)
+    )
+
+    document = _report(status(gh, blocked, "--json"))
+    [comment] = document["comments"]
+    assert comment["defects_total"] == 50
+    assert len(comment["defects"]) == provenance.MAX_LISTED_DEFECTS
+    marker = document["implementation_marker"]
+    assert marker["issues"] == issues[: provenance.MAX_LISTED_ISSUES]
+    assert marker["issues_total"] == 30
+    assert len(marker["defects"]) == marker["defects_total"] == 1  # it carries 30 markers
+    assert issues[provenance.MAX_LISTED_ISSUES] not in json.dumps(document)
+
+    lines = status(gh, blocked).splitlines()
+    defects = [line for line in lines if line.startswith("    defect:    ")]
+    assert len(defects) == provenance.MAX_LISTED_DEFECTS
+    assert f"    defects:   the first {provenance.MAX_LISTED_DEFECTS} of 50 shown" in lines
+    [pr_marker] = [line for line in lines if line.startswith("  PR marker: ")]
+    assert pr_marker.startswith(
+        "  PR marker: ai-implementation names "
+        + ", ".join(issues[: provenance.MAX_LISTED_ISSUES])
+        + f" (the first {provenance.MAX_LISTED_ISSUES} of 30); "
+    )
+    assert issues[provenance.MAX_LISTED_ISSUES] not in "\n".join(lines)
 
 
 # -- the pieces --------------------------------------------------------------------------------

@@ -13,9 +13,10 @@ module gathers them for ``status``:
 - each such comment: when GitHub says it was created, set against this
   run's creation and its most recent reviewer launches (from the run log's
   ``execution.json``), the login GitHub names, its marker (its finding ids
-  bounded), the digest and length of its body and a bounded excerpt of
-  `gh`'s print of it. The digest is of GitHub's text, read exactly where
-  `gh` may have rewritten it, and says so when that text is not known;
+  and defects bounded and counted), the digest and length of its body and
+  a bounded excerpt of `gh`'s print of it. The digest is of GitHub's text,
+  read exactly where `gh` may have rewritten it, and says so when that
+  text is not known;
 - which state directories on this checkout account for it: every state
   directory found in or directly under the directories the caller names
   (``status`` names the state directory it reads, the configured
@@ -33,7 +34,8 @@ module gathers them for ``status``:
 - the commits GitHub lists for the PR committed after the earliest such
   comment, with author and committer identity and the time after it.
   GitHub records when a commit was made, never when it was pushed;
-- the PR's ``ai-implementation`` marker, and its HEAD now. No owner of a
+- the PR's ``ai-implementation`` marker (the issues it names and its
+  defects bounded and counted), and its HEAD now. No owner of a
   PR is recorded on GitHub yet (#414 proposes one): the states bound to the
   PR are what this checkout knows of it.
 
@@ -89,11 +91,14 @@ MAX_IDENTITY_CHARS = 120
 # A read that failed, as the report quotes it.
 MAX_PROBLEM_CHARS = 300
 # How many of the PR's other review markers, of the commits after the
-# comment and of the finding ids one marker names, are shown; the report says
-# how many there are.
+# comment, of the finding ids one marker names, of the defects one comment's
+# markers have and of the issues the PR's implementation markers name, are
+# shown; the report says how many there are.
 MAX_LISTED_MARKERS = 40
 MAX_LISTED_COMMITS = 40
 MAX_LISTED_FINDING_IDS = 20
+MAX_LISTED_DEFECTS = 10
+MAX_LISTED_ISSUES = 10
 # At most this many of the comments the round blocks on are read again
 # exactly, when `gh` printed them with a ``^``.
 MAX_EXACT_READS = 10
@@ -695,12 +700,37 @@ def _claim_document(claim: ReviewClaim | None) -> dict | None:
     }
 
 
+def _listed_text(items: Sequence[str], limit: int, sep: str, max_chars: int) -> str:
+    """At most ``limit`` of ``items``, joined and cut at ``max_chars``, then how many there are.
+
+    The count follows the cut, so a long list never hides its total.
+    """
+    shown = one_line(sep.join(items[:limit]), max_chars)
+    if len(items) > limit:
+        shown += f" (the first {limit} of {len(items)})"
+    return shown
+
+
 def _findings_text(ids: tuple[str, ...] | None) -> str:
     if not ids:
         return "none"
-    shown = ", ".join(ids[:MAX_LISTED_FINDING_IDS])
-    if len(ids) > MAX_LISTED_FINDING_IDS:
-        shown += f" (the first {MAX_LISTED_FINDING_IDS} of {len(ids)})"
+    return _listed_text(ids, MAX_LISTED_FINDING_IDS, ", ", MAX_EXCERPT_CHARS)
+
+
+def _defects_document(defects: Sequence[str]) -> list[str]:
+    """At most :data:`MAX_LISTED_DEFECTS` of an object's marker defects, each one line.
+
+    A body may carry any number of broken markers, and each is a defect: the
+    report repeats a bounded few of them and gives their total beside them.
+    """
+    return [one_line(d, MAX_PROBLEM_CHARS) for d in defects[:MAX_LISTED_DEFECTS]]
+
+
+def _defects_text(defects: Sequence[str]) -> str:
+    """:func:`_defects_document` on one line, with their total when some are not shown."""
+    shown = "; ".join(_defects_document(defects))
+    if len(defects) > MAX_LISTED_DEFECTS:
+        shown += f" (the first {MAX_LISTED_DEFECTS} of {len(defects)} defects)"
     return shown
 
 
@@ -713,7 +743,7 @@ def _claim_text(claim: ReviewClaim | None) -> str:
     return (
         f"round {claim.round} at HEAD {claim.reviewed_head_sha[:12]} on base {base} from merge "
         f"base {merge_base}, needs_fix_round {str(claim.needs_fix_round).lower()}, findings "
-        f"{one_line(findings, MAX_EXCERPT_CHARS)}"
+        f"{findings}"
     )
 
 
@@ -731,7 +761,8 @@ class MarkedComment:
             "created_at": one_line(self.comment.created_at, 64),
             "login": one_line(self.comment.author, MAX_IDENTITY_CHARS),
             "marker": _claim_document(self.claim),
-            "defects": [one_line(d, MAX_PROBLEM_CHARS) for d in self.defects],
+            "defects": _defects_document(self.defects),
+            "defects_total": len(self.defects),
         }
 
 
@@ -845,10 +876,10 @@ class ProvenanceReport:
             },
             "implementation_marker": (
                 {
-                    "issues": list(self.implementation_issues),
-                    "defects": [
-                        one_line(d, MAX_PROBLEM_CHARS) for d in self.implementation_defects
-                    ],
+                    "issues": list(self.implementation_issues[:MAX_LISTED_ISSUES]),
+                    "issues_total": len(self.implementation_issues),
+                    "defects": _defects_document(self.implementation_defects),
+                    "defects_total": len(self.implementation_defects),
                 }
                 if self.implementation_read
                 else None
@@ -901,8 +932,11 @@ class ProvenanceReport:
         else:
             lines.append("    launches:  no reviewer launch of this run is in its run log")
         lines.append(f"    marker:    {_claim_text(item.marked.claim)}")
-        for defect in item.marked.defects:
-            lines.append(f"    defect:    {one_line(defect, MAX_PROBLEM_CHARS)}")
+        defects = item.marked.defects
+        for defect in _defects_document(defects):
+            lines.append(f"    defect:    {defect}")
+        if len(defects) > MAX_LISTED_DEFECTS:
+            lines.append(f"    defects:   the first {MAX_LISTED_DEFECTS} of {len(defects)} shown")
         lines.append(
             f"    body:      {item.body.text()}; begins (as gh printed it): "
             f"{one_line(item.body.printed, MAX_EXCERPT_CHARS)!r}"
@@ -968,7 +1002,7 @@ class ProvenanceReport:
             created = one_line(marked.comment.created_at, 64) or "(unknown)"
             text = _claim_text(marked.claim)
             if marked.defects:
-                text += "; " + "; ".join(one_line(d, MAX_PROBLEM_CHARS) for d in marked.defects)
+                text += "; " + _defects_text(marked.defects)
             lines.append(f"    {marked.comment.url} ({created}): {text}")
         return lines
 
@@ -997,14 +1031,16 @@ class ProvenanceReport:
     def _pr_lines(self) -> list[str]:
         lines = []
         if self.implementation_read:
-            if self.implementation_issues:
-                text = "names " + ", ".join(self.implementation_issues)
+            issues = self.implementation_issues
+            if issues:
+                shown = ", ".join(issues[:MAX_LISTED_ISSUES])
+                if len(issues) > MAX_LISTED_ISSUES:
+                    shown += f" (the first {MAX_LISTED_ISSUES} of {len(issues)})"
+                text = "names " + shown
             else:
                 text = "none"
             if self.implementation_defects:
-                text += "; " + "; ".join(
-                    one_line(d, MAX_PROBLEM_CHARS) for d in self.implementation_defects
-                )
+                text += "; " + _defects_text(self.implementation_defects)
             lines.append(f"  PR marker: ai-implementation {text}")
         if self.pr_head_sha:
             lines.append(f"  PR HEAD:   {self.pr_head_sha} now (the round is bound to {self.head})")
@@ -1261,7 +1297,9 @@ __all__ = [
     "MAX_IDENTITY_CHARS",
     "MAX_EXACT_READS",
     "MAX_LISTED_COMMITS",
+    "MAX_LISTED_DEFECTS",
     "MAX_LISTED_FINDING_IDS",
+    "MAX_LISTED_ISSUES",
     "MAX_LISTED_MARKERS",
     "MAX_REVIEW_LAUNCHES",
     "NOTE",
