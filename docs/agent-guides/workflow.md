@@ -609,7 +609,11 @@ next entry could not find again.
   the PR as owned, `owned_pr_url`, PR #459 R1-F1). That PR's owner is
   judged as soon as it is read, before its state and before the listing
   below: one another run owns blocks (`pr-owner`), closed as it may be,
-  rather than letting the agent launch beside it (PR #459 R5-F1); an open PR carrying the issue's marker that a complete listing
+  rather than letting the agent launch beside it (PR #459 R5-F1). Its row in
+  that listing, and in the listing of the branch, is judged the same way as soon
+  as the listing is read, and the row, as the later read, replaces the earlier
+  answer as the candidate, so recovery records the owner the listing showed (PR
+  #459 R9-F1); an open PR carrying the issue's marker that a complete listing
   of the repository's open PRs (read to the end) finds, and that this state
   has no record of, blocks (`pr-owner`) whatever run its marker names, and
   only `unblock --take-over` binds it (#414, ADR 0004 D9.4a), on the legacy

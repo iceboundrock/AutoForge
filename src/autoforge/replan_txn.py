@@ -1235,6 +1235,27 @@ def _bind_to_run(what: str, url: str, repository: str, held: GitHubPullRequestRe
     return ""
 
 
+def verify_decision_pr(pr: PRInfo, txn: ReplanTransaction) -> str:
+    """The PR read must be the PR whose review decided the replan, or why it is not.
+
+    The identity half of :func:`verify_decision_point`, on its own because it
+    needs only the read itself: the prepare step asks it before it judges who
+    owns the source or reads anything else (PR #459 R9-F2).
+    """
+    if not txn.decision_pr_url:
+        return (
+            "the replan transaction does not record the PR whose review decided it, so the "
+            "source cannot be proven to be the PR the findings belong to"
+        )
+    if not same_pr_url(pr.url, txn.decision_pr_url):
+        return (
+            f"source PR read back as {pr.url or '(none)'}, but the review that decided this "
+            f"replan ran on {txn.decision_pr_url}; the current work was never reviewed "
+            "against this decision"
+        )
+    return ""
+
+
 def verify_decision_point(pr: PRInfo, txn: ReplanTransaction, merge_base_sha: str) -> str:
     """The source must still be the revision whose review decided the replan.
 
@@ -1264,17 +1285,9 @@ def verify_decision_point(pr: PRInfo, txn: ReplanTransaction, merge_base_sha: st
     journal at every stage; this is the same rule at the point of use, never
     vacuous.
     """
-    if not txn.decision_pr_url:
-        return (
-            "the replan transaction does not record the PR whose review decided it, so the "
-            "source cannot be proven to be the PR the findings belong to"
-        )
-    if not same_pr_url(pr.url, txn.decision_pr_url):
-        return (
-            f"source PR read back as {pr.url or '(none)'}, but the review that decided this "
-            f"replan ran on {txn.decision_pr_url}; the current work was never reviewed "
-            "against this decision"
-        )
+    identity = verify_decision_pr(pr, txn)
+    if identity:
+        return identity
     if not txn.decision_head_sha:
         return (
             "the replan transaction does not record the reviewed HEAD that decided it, so the "

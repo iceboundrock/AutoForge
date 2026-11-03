@@ -1049,7 +1049,15 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   replan's read context judges it before the launch, on the typed answer
   and never on the file rendered from it: `REVIEW` blocks, a replan rejects
   its transaction, and an answer naming another PR is an item that could
-  not be read (PR #459 R8-F1). `REVIEW` reads the PR once more right
+  not be read (PR #459 R8-F1). The bound PR's row in a typed PR listing
+  (`list_open_prs`, `list_all_prs`, `list_prs_for_head`) judges it as soon
+  as the listing is read, before anything filters the listing or a question
+  about it raises, and the row, as the later read, replaces an earlier
+  snapshot of the PR (PR #459 R9-F1). K2, K3 and K7 pass what they read,
+  before and after their write, through the same rule, and a refusal keeps
+  the record journaled. A replan's prepare step judges the source on the
+  answer to its own read, before it reads the repository, the open PRs or
+  the watermark (PR #459 R9-F2). `REVIEW` reads the PR once more right
   before its round comment is sent (K4), so a PR taken over while the
   reviewer ran gets no comment from the displaced run. `FIX` reads the
   owner again before each record of its plan after the first (follow-up

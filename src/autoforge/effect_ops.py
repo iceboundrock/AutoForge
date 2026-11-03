@@ -110,6 +110,15 @@ from .replan_txn import scan_replan_markers
 from .validation import parse_issue_url, parse_pr_url, same_issue_url
 
 Persist = Callable[[EffectRecord], None]
+# Shown every PR an operation reads, as read, before the operation filters them
+# (#414, PR #459 R9-F1). The operations know nothing of who owns a PR: the engine
+# judges the PR its run is bound to, which a listing can hold beside the ones the
+# operation asks about, and it may raise to stop the operation there.
+PRsRead = Callable[[Sequence[PRInfo]], None]
+
+
+def _no_witness(_prs: Sequence[PRInfo]) -> None:
+    """The witness of an operation whose caller asks to be shown nothing."""
 
 
 class EffectOperation(Protocol):
@@ -607,8 +616,9 @@ class ImplementationPrOp:
     merged PR on the branch is a conflict, never a reason for a second PR).
     """
 
-    def __init__(self, github: GitHubClient) -> None:
+    def __init__(self, github: GitHubClient, witness: PRsRead = _no_witness) -> None:
         self.github = github
+        self.witness = witness
 
     def reconcile(self, record: EffectRecord) -> Decision:
         settled = _settled(record)
@@ -619,6 +629,7 @@ class ImplementationPrOp:
         claim = scan(IMPLEMENTATION, record.marker).claims[0]
         on_head = self.github.list_prs_for_head(repo, head)
         open_prs = self.github.list_open_prs(repo)
+        self.witness([*on_head, *open_prs])
         claimants = collect(IMPLEMENTATION, open_prs, "open PR").claimants(
             claim.key, f"issue {claim.issue.canonical}"
         )
@@ -685,8 +696,9 @@ class AdoptPrOp:
     rebase and the completion are judged on it, never on `gh`'s rewrite.
     """
 
-    def __init__(self, github: GitHubClient) -> None:
+    def __init__(self, github: GitHubClient, witness: PRsRead = _no_witness) -> None:
         self.github = github
+        self.witness = witness
 
     def reconcile(self, record: EffectRecord) -> Decision:
         settled = _settled(record)
@@ -696,7 +708,9 @@ class AdoptPrOp:
         repo = parse_issue_url(record.owner.issue_url).repository
         claim = scan(IMPLEMENTATION, record.marker).claims[0]
         pr = held_pr(self.github, pr_url)
-        claimants = collect(IMPLEMENTATION, self.github.list_open_prs(repo), "open PR").claimants(
+        open_prs = self.github.list_open_prs(repo)
+        self.witness([pr, *open_prs])
+        claimants = collect(IMPLEMENTATION, open_prs, "open PR").claimants(
             claim.key, f"issue {claim.issue.canonical}"
         )
         if claimants.defects:
@@ -941,8 +955,9 @@ class ReplacementPrOp:
     implementation claimant, attestation) remain the consumer's (#164).
     """
 
-    def __init__(self, github: GitHubClient) -> None:
+    def __init__(self, github: GitHubClient, witness: PRsRead = _no_witness) -> None:
         self.github = github
+        self.witness = witness
 
     def reconcile(self, record: EffectRecord) -> Decision:
         settled = _settled(record)
@@ -953,7 +968,9 @@ class ReplacementPrOp:
         watermark = record.precondition["watermark"]
         txn = record.owner.transaction_id
         on_head = self.github.list_prs_for_head(repo, head)
-        above = [p for p in self.github.list_all_prs(repo, strict=True) if p.number > watermark]
+        all_prs = self.github.list_all_prs(repo, strict=True)
+        self.witness([*on_head, *all_prs])
+        above = [p for p in all_prs if p.number > watermark]
         malformed: list[str] = []
         holders: list[PRInfo] = []
         for pr in above:
@@ -1268,13 +1285,15 @@ class OperatorCommentOp:
         )
 
 
-_GITHUB_OPS: dict[EffectKind, Callable[[GitHubClient], EffectOperation]] = {
+_PR_READING_OPS: dict[EffectKind, Callable[[GitHubClient, PRsRead], EffectOperation]] = {
     EffectKind.IMPLEMENTATION_PR: ImplementationPrOp,
     EffectKind.ADOPT_PR: AdoptPrOp,
+    EffectKind.REPLACEMENT_PR: ReplacementPrOp,
+}
+_GITHUB_OPS: dict[EffectKind, Callable[[GitHubClient], EffectOperation]] = {
     EffectKind.REVIEW_COMMENT: ReviewCommentOp,
     EffectKind.FOLLOW_UP_ISSUE: FollowUpIssueOp,
     EffectKind.FOLLOW_UP_APPEND: FollowUpAppendOp,
-    EffectKind.REPLACEMENT_PR: ReplacementPrOp,
     EffectKind.PROGRESS_COMMENT: ProgressCommentOp,
     EffectKind.ACCEPTANCE_COMMENT: AcceptanceCommentOp,
     # Read-only: its ``issue`` raises (#243).
@@ -1288,13 +1307,15 @@ def operation_for(
     *,
     transport: GitTransport | None = None,
     default_branch: str = "",
+    witness: PRsRead = _no_witness,
 ) -> EffectOperation:
     """The operation of ``record``'s kind.
 
     A push (K1) also needs the controller's git transport and the default
     branch it must never push to; without them it has no operation, which
     is a conflict naming the record rather than a push through anything
-    else. Every other kind needs the GitHub client only.
+    else. Every other kind needs the GitHub client only. The kinds that read
+    PR listings (K2, K3, K7) show ``witness`` what they read (:data:`PRsRead`).
     """
     if record.kind is EffectKind.PUSH:
         if transport is None or not default_branch:
@@ -1303,6 +1324,9 @@ def operation_for(
                 "default branch, and neither may be left out"
             )
         return PushOp(github, transport, default_branch)
+    reading = _PR_READING_OPS.get(record.kind)
+    if reading is not None:
+        return reading(github, witness)
     return _GITHUB_OPS[record.kind](github)
 
 

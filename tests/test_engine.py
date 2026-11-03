@@ -44,6 +44,7 @@ from autoforge.errors import (
     GitHubUnavailableError,
     GitTransportError,
     InteractionRequiredError,
+    PROwnerError,
     StateError,
     StateTransitionError,
     VerificationError,
@@ -10013,6 +10014,226 @@ def test_a_moved_pr_handed_back_goes_to_review_of_its_new_head(tmp_state_dir, fa
     assert out.unblocked and out.phase == "REVIEW", out.message
     assert eng.state.current_head_sha == SHA_B
     assert len(fake_github.merges) == 1 and eng.state.counted_merged_prs == []
+
+
+# -- the owner on a PR listing's row of the bound PR (PR #459 R9-F1) --------------------
+def _listing_meets(gh: FakeGitHub, listing: str, change, *, on_call: int = 1) -> None:
+    """``change`` lands right before call ``on_call`` of the typed ``listing``: the reads of
+    the PR before it saw none of it, and the listing is the first to."""
+    real = getattr(gh, listing)
+    calls = 0
+
+    def read(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == on_call:
+            change(gh)
+        return real(*args, **kwargs)
+
+    setattr(gh, listing, read)
+
+
+def _assert_refused_on_the_listed_owner(eng, out, sent: str) -> None:
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert sent in eng.state.block_reason
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.owned_pr_url) == (Phase.BLOCKED, PR, PR)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(implementation_pr_body(owner_run_id=OTHER_RUN), id="this-issue"),
+        pytest.param(_FOREIGN_ISSUE_BODY, id="another-issue"),
+    ],
+)
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_legacy_analyze_binding_blocks_on_the_owner_its_listing_finds(
+    tmp_state_dir, fake_github, body, remove, found
+):
+    """PR #459 R9-F1, the reported sequence: ANALYZE_EXECUTE reads a legacy PR naming no owner,
+    then its open-PR listing shows another run's. Before R9-F1 the earlier snapshot was kept,
+    recovery saved REVIEW with owned_pr_url empty, and once the owner was removed a restarted
+    run launched a reviewer and reached READY_FOR_MERGE. A marker of another issue was filtered
+    out of the listing's claimants as well. The entry now blocks with the owner on disk, and
+    after the removal 'unblock' refuses and 'run' launches nothing."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, None)
+    _listing_meets(fake_github, "list_open_prs", lambda gh: setattr(gh.prs[PR], "body", body))
+    out = eng.step()
+    _assert_refused_on_the_listed_owner(eng, out, "nothing was launched")
+    assert OTHER_RUN in eng.state.block_reason
+    _refused_after_removal(eng, tmp_state_dir, fake_github, remove, found)
+
+
+@pytest.mark.parametrize("body", _OWNER_BESIDE_A_DEFECT)
+def test_a_legacy_analyze_listing_keeps_an_owner_readable_beside_a_defect(
+    tmp_state_dir, fake_github, body
+):
+    """PR #459 R9-F1 with R6-F1's rule: asking the listing for the issue's claimant raises on
+    a defect, so judged after that question a readable owner beside the defect was forgotten
+    (a claim-ambiguous block with owned_pr_url empty). It is recorded, and stays refused once
+    the markers are removed."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, None)
+    run_id = eng.state.run_id
+    _listing_meets(
+        fake_github, "list_open_prs", lambda gh: setattr(gh.prs[PR], "body", body(run_id))
+    )
+    _assert_refused_on_the_defect(eng, eng.step())
+    assert eng.provider.calls == []
+    _refused_after_removal(
+        eng,
+        tmp_state_dir,
+        fake_github,
+        lambda gh: setattr(gh.prs[PR], "body", "Started by hand."),
+        "carries no implementation marker for issue #2",
+    )
+
+
+def test_a_legacy_analyze_recovery_keeps_the_owner_its_listing_finds_naming_this_run(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R9-F1: a marker naming this run on the listing refuses nothing and recovers
+    the PR, judged on the listing's row rather than on the older snapshot, which named no
+    owner and would have read as that owner removed. The binding is saved owned, so once the
+    owner is removed a restarted run launches nothing."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, None)
+    run_id = eng.state.run_id
+    _listing_meets(fake_github, "list_open_prs", lambda gh: _owned_by(gh, run_id))
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert eng.provider.calls == []
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.owned_pr_url) == (Phase.REVIEW, PR, PR)
+
+    _owned_by(fake_github, None)
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED" and out.stop.code is StopReasonCode.PR_OWNER, out.message
+    assert "the owner was removed since" in eng2.state.block_reason
+    assert eng2.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("https://github.com/owner/repo/pull/43", id="another-pr"),
+        pytest.param("https://github.com/other/repo/pull/42", id="another-repository"),
+        pytest.param("", id="no-url"),
+        pytest.param("https://example.com/not/a/pull", id="malformed-url"),
+    ],
+)
+def test_a_listing_row_that_is_not_the_bound_pr_records_and_refuses_nothing(
+    tmp_state_dir, fake_github, url
+):
+    """PR #459 R9-F1: a row is judged only once its identity says it is the bound PR. Another
+    run's marker on any other row says nothing of the bound PR's owner, and the callers ask of
+    that row what they ask."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, None)
+    row = replace(fake_github.prs[PR], url=url, body=implementation_pr_body(owner_run_id=OTHER_RUN))
+    assert eng._listed_owner_problem([row]) == ""
+    eng._require_listed_owner([row], "nothing was launched")
+    assert eng.state.owned_pr_url == "" and load_state(eng.paths.state_file).owned_pr_url == ""
+
+
+def test_another_open_prs_owner_is_ambiguity_not_the_bound_prs_owner(tmp_state_dir, fake_github):
+    """PR #459 R9-F1: a legacy binding beside a second open PR marked for the issue by another
+    run stays the choice the controller never makes. It blocks as it did, recording nothing of
+    the other PR's owner on the bound PR."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, None)
+    fake_github.add_pr(
+        PR41, head_sha=SHA_A, branch="other", body=implementation_pr_body(owner_run_id=OTHER_RUN)
+    )
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.CLAIM_AMBIGUOUS
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+
+
+def _legacy_closed_on_the_branch(tmp_state_dir, gh: FakeGitHub):
+    """A legacy binding whose PR, closed and naming no owner, is on the controller's branch."""
+    gh.add_pr(head_sha=SHA_A, branch="autoforge/2", state="CLOSED", body="Started by hand.")
+    eng = make_engine(tmp_state_dir, ["never"], github=gh, origin=True)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.state.current_pr_url = PR
+    eng._save()
+    return eng
+
+
+def test_a_closed_legacy_pr_blocks_on_the_owner_the_listing_of_its_branch_finds(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R9-F1: a closed persisted PR is no candidate, so the listing of the branch is
+    the one that holds it. Read only as a closed PR on the branch, its new owner was reported
+    as an unjournaled write and forgotten."""
+    eng = _legacy_closed_on_the_branch(tmp_state_dir, fake_github)
+    _listing_meets(fake_github, "list_prs_for_head", lambda gh: _owned_by(gh, OTHER_RUN))
+    _assert_refused_on_the_listed_owner(eng, eng.step(), "nothing was launched")
+    assert OTHER_RUN in eng.state.block_reason
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+
+
+def _reopened_for(run_id: str):
+    def change(gh: FakeGitHub) -> None:
+        gh.prs[PR].state = "OPEN"
+        _owned_by(gh, run_id)
+
+    return change
+
+
+@pytest.mark.parametrize(
+    ("kind", "stage", "sent", "created"),
+    [
+        pytest.param(
+            "push",
+            "observed",
+            "nothing more was sent for implementation_pr effect",
+            0,
+            id="the-listing-before-the-create",
+        ),
+        pytest.param(
+            "implementation_pr", "observed", "nothing was bound", 1, id="the-read-back-listing"
+        ),
+    ],
+)
+def test_the_published_prs_listings_judge_the_bound_pr_they_hold(
+    tmp_state_dir, fake_github, kind, stage, sent, created
+):
+    """PR #459 R9-F1: K2 and the read back of what it published list the open PRs to find the
+    issue's claimant, and a legacy binding's closed PR reopened under another run's owner is on
+    that listing. Read as a second claimant it was a conflict, and its owner was forgotten. The
+    step stops on the owner, recorded, with the plan as journaled."""
+    fake_github.add_pr(head_sha=SHA_A, branch="feature/x", state="CLOSED", body="Started by hand.")
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    eng.state.phase = Phase.ANALYZE_EXECUTE
+    eng.state.current_pr_url = PR
+    eng._save()
+    persist = eng._persist_effect
+
+    def persisted(record):
+        persist(record)
+        if (record.kind.value, record.stage.value) == (kind, stage):
+            _reopened_for(OTHER_RUN)(fake_github)
+
+    eng._persist_effect = persisted
+    _assert_refused_on_the_listed_owner(eng, eng.step(), sent)
+    writes = [w for w in fake_github.effect_writes if w[0] == "create_pull_request"]
+    assert len(writes) == created
+    assert len(load_state(eng.paths.state_file).effect_records) == 2
+
+
+def test_a_dry_run_writes_no_owner_a_listing_shows(tmp_state_dir, fake_github):
+    """PR #459 R9-F1: a dry run stays free of writes. Its plan reads no listing, and the
+    judgement itself, outside an execution, raises without touching the state file."""
+    eng = _legacy_analyze(tmp_state_dir, fake_github, None)
+    _owned_by(fake_github, OTHER_RUN)
+    raw = eng.paths.state_file.read_text()
+    assert eng.step(dry_run=True).dry_run
+    assert eng.paths.state_file.read_text() == raw
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+    with pytest.raises(PROwnerError):
+        eng._require_listed_owner(fake_github.list_open_prs("owner/repo"), "nothing was launched")
+    assert eng.paths.state_file.read_text() == raw
 
 
 # -- a state file that cannot be written (PR #459 R8-F1, R8-F2) -------------------------

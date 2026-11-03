@@ -7659,6 +7659,426 @@ def test_a_replan_context_read_answering_with_another_pr_is_an_item_that_could_n
     assert len([c for c in eng.provider.calls if c.phase == "REPLAN_REEXECUTE"]) == 1
 
 
+# -- the source's owner on the replan's own reads and listings (#414, PR #459 R9-F1, R9-F2) --
+_UNREADABLE_IMPLEMENTATION = '<!-- ai-implementation: {"issue": 2} -->'
+_FOREIGN_IMPLEMENTATION = render_implementation_marker(ISSUE, OTHER_RUN)
+# What a defect leaves readable beside it: another run's marker.
+_OWNER_BESIDE_A_DEFECT = [
+    pytest.param(
+        f"{_FOREIGN_IMPLEMENTATION}\n{_UNREADABLE_IMPLEMENTATION}", id="beside-a-malformed-marker"
+    ),
+    pytest.param(f"{_FOREIGN_IMPLEMENTATION}\n{_FOREIGN_IMPLEMENTATION}", id="twice"),
+]
+_READS_AFTER_THE_SOURCE = ["get_repo", "list_open_prs", "latest_pr_number"]
+
+
+def _goes_down(gh, read: str) -> None:
+    """GitHub is unavailable for the typed read ``read``."""
+
+    def unavailable(*_args, **_kwargs):
+        raise GitHubUnavailableError("gh: 502 Bad Gateway")
+
+    setattr(gh, read, unavailable)
+
+
+def _meets(gh, read: str, change, *, on_call: int = 1) -> None:
+    """``change`` lands right before call ``on_call`` of the typed ``read``."""
+    real = getattr(gh, read)
+    calls = 0
+
+    def reads(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == on_call:
+            change(gh)
+        return real(*args, **kwargs)
+
+    setattr(gh, read, reads)
+
+
+def _pending_saved(tmp_state_dir, gh):
+    """A legacy binding's PENDING transaction, as the REVIEW that decided it saved it."""
+    eng = _pending_at_the_source(tmp_state_dir, gh)
+    eng.save()
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+    return eng
+
+
+def _verified_saved(tmp_state_dir, gh, stage=ReplanStage.VERIFIED):
+    """A legacy binding's transaction at ``stage``, its replacement beside the source."""
+    eng, _ = _seeded_engine(tmp_state_dir, gh, stage)
+    eng.save()
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+    return eng
+
+
+def _refused_after_the_owner_is_removed(eng, gh) -> None:
+    """The owner removed and the process restarted: nothing is launched, created or closed."""
+    closed = list(gh.closed_prs)
+    creates = _creates(gh)
+    gh.prs[PR].body = "Started by hand."
+    eng.close()
+    eng2 = make_engine(eng.paths.state_dir, ["the replan agent must not run"], github=gh)
+    eng2.load()
+    assert eng2.state.owned_pr_url == PR
+    refused = eng2.unblock("the other run let go of it")
+    assert not refused.unblocked and refused.phase == "BLOCKED", refused.message
+    assert eng2.run() == []
+    assert eng2.provider.calls == [] and _creates(gh) == creates and gh.closed_prs == closed
+
+
+def _assert_rejected_on_the_defect(eng, out) -> None:
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.REPLAN_REFUSED
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert "carries an implementation marker that cannot be read" in eng.state.block_reason
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url, s.superseded_prs) == (PR, PR, [])
+
+
+@pytest.mark.parametrize("read", _READS_AFTER_THE_SOURCE)
+def test_a_source_another_run_owns_is_rejected_before_anything_else_is_read(tmp_state_dir, read):
+    """PR #459 R9-F2, the reported sequence: a legacy binding's source names another run, and
+    the next read of the prepare step fails transiently. Judged after those reads, the outage
+    left owned_pr_url empty, and once the owner was removed a restarted run launched the agent,
+    published a replacement and closed the source. The refusal now reads nothing more, so the
+    outage is never met, and the removal changes nothing."""
+    gh = FakeGitHub()
+    eng = _pending_saved(tmp_state_dir, gh)
+    _hand_the_source_over(gh)
+    _goes_down(gh, read)
+    out = eng.step()
+    _assert_rejected_for_the_owner(eng, out, "no replacement was started")
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    assert eng.provider.calls == [] and gh.closed_prs == []
+    delattr(gh, read)
+    _refused_after_the_owner_is_removed(eng, gh)
+
+
+@pytest.mark.parametrize("read", _READS_AFTER_THE_SOURCE)
+def test_a_source_naming_this_run_keeps_its_owner_when_a_later_read_fails(tmp_state_dir, read):
+    """PR #459 R9-F2, the exceptional exit: a marker naming this run refuses nothing, and the
+    read after it raises. The owner is on disk and nothing else is: no step charged, the
+    transaction not moved. Once the owner is removed a restarted run rejects the source rather
+    than reading a legacy binding, launching, publishing and closing it."""
+    gh = FakeGitHub()
+    eng = _pending_saved(tmp_state_dir, gh)
+    before = load_state(eng.paths.state_file)
+    gh.prs[PR].body = render_implementation_marker(ISSUE, eng.state.run_id)
+    _goes_down(gh, read)
+    with pytest.raises(GitHubUnavailableError):
+        eng.step()
+    s = load_state(eng.paths.state_file)
+    assert s.owned_pr_url == PR
+    assert (s.phase, s.step_count, s.attempt) == (before.phase, before.step_count, before.attempt)
+    assert s.replan_transaction == before.replan_transaction and s.block_reason == ""
+    assert eng.provider.calls == []
+
+    delattr(gh, read)
+    gh.prs[PR].body = "Started by hand."
+    eng2 = _restart(eng, gh, save=False)
+    assert eng2.state.owned_pr_url == PR
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.REPLAN_REFUSED
+    assert "the owner was removed since" in eng2.state.block_reason
+    assert eng2.provider.calls == [] and _creates(gh) == [] and gh.closed_prs == []
+
+
+@pytest.mark.parametrize("body", _OWNER_BESIDE_A_DEFECT)
+def test_a_source_with_a_defect_is_rejected_on_its_own_read_keeping_the_owner(tmp_state_dir, body):
+    """PR #459 R9-F2 with R6-F1's rule, the outage again in the way of the old order."""
+    gh = FakeGitHub()
+    eng = _pending_saved(tmp_state_dir, gh)
+    gh.prs[PR].body = body
+    _goes_down(gh, "get_repo")
+    _assert_rejected_on_the_defect(eng, eng.step())
+    delattr(gh, "get_repo")
+    _refused_after_the_owner_is_removed(eng, gh)
+
+
+def test_an_answer_naming_another_pr_is_refused_before_it_is_judged_or_anything_else_is_read(
+    tmp_state_dir,
+):
+    """PR #459 R9-F2: the source's identity comes first. An answer naming another PR says
+    nothing of the source's owner: it records nothing, and refuses as the decision's PR."""
+    gh = FakeGitHub()
+    eng = _pending_saved(tmp_state_dir, gh)
+    gh.add_pr(url=EARLIER_PR, head_sha=SHA_B, branch="other", state="CLOSED")
+    gh.prs[EARLIER_PR].body = render_implementation_marker(ISSUE, OTHER_RUN)
+    real = gh.get_pr
+    gh.get_pr = lambda url: real(EARLIER_PR if url == PR else url)
+    _goes_down(gh, "get_repo")
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert f"source PR read back as {EARLIER_PR}" in eng.state.block_reason
+    assert load_state(eng.paths.state_file).owned_pr_url == ""
+
+
+def test_a_dry_run_of_the_prepare_step_writes_no_owner(tmp_state_dir):
+    """PR #459 R9-F2: a dry run plans the step from the journal, reads no owner and writes
+    nothing, whatever the source now says."""
+    gh = FakeGitHub()
+    eng = _pending_saved(tmp_state_dir, gh)
+    _hand_the_source_over(gh)
+    raw = eng.paths.state_file.read_text()
+    assert eng.step(dry_run=True).dry_run
+    assert eng.paths.state_file.read_text() == raw
+    assert gh.closed_prs == [] and _creates(gh) == [] and eng.provider.calls == []
+
+
+def test_a_takeover_the_prepare_listing_shows_is_rejected_before_the_watermark_is_read(
+    tmp_state_dir,
+):
+    """PR #459 R9-F1: the listing the prepare step checkpoints holds the source, and is read
+    after it. Its owner is judged before the watermark is, so that read's outage cannot lose
+    it."""
+    gh = FakeGitHub()
+    eng = _pending_saved(tmp_state_dir, gh)
+    _meets(gh, "list_open_prs", _hand_the_source_over)
+    _goes_down(gh, "latest_pr_number")
+    out = eng.step()
+    _assert_rejected_for_the_owner(eng, out, "no replacement was started")
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    delattr(gh, "latest_pr_number")
+    _refused_after_the_owner_is_removed(eng, gh)
+
+
+@pytest.mark.parametrize("listing", ["list_open_prs", "list_all_prs"])
+def test_a_takeover_the_binding_listings_show_launches_nothing(tmp_state_dir, listing):
+    """PR #459 R9-F1: the candidate listings read the source for this transaction's marker
+    alone, open or across all states. A takeover only that listing shows, gone by the read of
+    the source before the launch, rejects with nothing launched."""
+    gh = FakeGitHub()
+    eng = _resumed_prepared(tmp_state_dir, gh)
+    real = getattr(gh, listing)
+
+    def shown_once(*args, **kwargs):
+        setattr(gh, listing, real)
+        body = gh.prs[PR].body
+        _hand_the_source_over(gh)
+        try:
+            return real(*args, **kwargs)
+        finally:
+            gh.prs[PR].body = body
+
+    setattr(gh, listing, shown_once)
+    out = eng.step()
+    _assert_rejected_for_the_owner(eng, out, "nothing was launched")
+    assert eng.provider.calls == [] and _creates(gh) == []
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    _refused_after_the_owner_is_removed(eng, gh)
+
+
+def test_a_takeover_the_replacement_prs_listing_shows_creates_no_pr(tmp_state_dir):
+    """PR #459 R9-F1: K7 keeps the PRs above its watermark, so the source's row was dropped
+    unread. It lands after the read of the source before the record: the record stops on the
+    listing, nothing is created, and the owner is on disk."""
+    gh = FakeGitHub()
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh))
+    persist = eng._persist_effect
+
+    def after_the_push(record):
+        persist(record)
+        if record.kind.value == "push" and record.stage.value == "observed":
+            _meets(gh, "list_prs_for_head", _hand_the_source_over)
+
+    eng._persist_effect = after_the_push
+    out = eng.step()
+    reason = _assert_rejected_for_the_owner(
+        eng, out, "nothing more was sent for replacement_pr effect"
+    )
+    assert "which stays journaled" in reason
+    assert _creates(gh) == [] and gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+
+
+def test_a_takeover_the_listing_after_the_replacement_pr_shows_closes_nothing(tmp_state_dir):
+    """PR #459 R9-F1: K7's read back of its own create holds the source too. The create was
+    sent, so nothing more is, and the source stays open."""
+    gh = FakeGitHub()
+    eng = _parked_and_decided(tmp_state_dir, gh, _replan_agent(gh))
+    _meets(gh, "create_pull_request", _hand_the_source_over)
+    out = eng.step()
+    reason = _assert_rejected_for_the_owner(
+        eng, out, "nothing more was sent for replacement_pr effect"
+    )
+    assert "was not closed" not in reason and len(_creates(gh)) == 1
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+
+
+@pytest.mark.parametrize("stage", [ReplanStage.VERIFIED, ReplanStage.SUPERSEDE_INTENT])
+def test_a_takeover_the_pre_close_listing_shows_keeps_the_source_open(tmp_state_dir, stage):
+    """PR #459 R9-F1, the reported sequence: the read of the source passes, and the listing
+    read right before the close shows another run's owner. The question it was read for leaves
+    the source out, so the engine closed it and activated the replacement. It now rejects on
+    the first attempt and on the retry alike, naming no replacement as the one refused, and the
+    owner stays recorded once it is removed."""
+    gh = FakeGitHub()
+    eng = _verified_saved(tmp_state_dir, gh, stage)
+    _meets(gh, "list_open_prs", _hand_the_source_over)
+    out = eng.step()
+    _assert_rejected_for_the_owner(eng, out, "the source PR was not closed")
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == [] and gh.reopened_prs == []
+    assert _txn(eng).rejected_pr_url == ""
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    _refused_after_the_owner_is_removed(eng, gh)
+
+
+@pytest.mark.parametrize("body", _OWNER_BESIDE_A_DEFECT)
+def test_the_pre_close_listing_keeps_an_owner_readable_beside_a_defect(tmp_state_dir, body):
+    """PR #459 R9-F1 with R6-F1's rule: the sole-claimant question leaves the source out,
+    claims and defects alike, so a defect on its row was no refusal at all."""
+    gh = FakeGitHub()
+    eng = _verified_saved(tmp_state_dir, gh)
+    _meets(gh, "list_open_prs", lambda gh: setattr(gh.prs[PR], "body", body))
+    _assert_rejected_on_the_defect(eng, eng.step())
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+    _refused_after_the_owner_is_removed(eng, gh)
+
+
+def test_a_replacement_the_pre_close_listing_shows_another_run_owns_is_not_closed_over(
+    tmp_state_dir,
+):
+    """PR #459 R9-F1: the listing is read after the replacement's own read, so its row is the
+    later word on the replacement's owner. The source stays open and the replacement is the PR
+    rejected."""
+    gh = FakeGitHub()
+    eng = _verified_saved(tmp_state_dir, gh)
+
+    def replacement_taken(gh):
+        gh.prs[
+            REPLACEMENT_PR
+        ].body = f"{render_implementation_marker(ISSUE, OTHER_RUN)}\n{_ours_marker()}"
+
+    _meets(gh, "list_open_prs", replacement_taken)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert f"PR {REPLACEMENT_PR} names run {OTHER_RUN}" in eng.state.block_reason
+    assert _txn(eng).rejected_pr_url == REPLACEMENT_PR
+    assert gh.prs[PR].state == "OPEN" and gh.closed_prs == []
+
+
+def test_a_takeover_landing_in_the_close_window_undoes_the_close(tmp_state_dir):
+    """PR #459 R9-F1: the source's read after the receipt judges its owner like the rest of
+    its facts. Another run's PR does not stay closed by this one: the close is compensated, and
+    no replacement is activated."""
+    gh = FakeGitHub()
+    eng = _verified_saved(tmp_state_dir, gh)
+    _meets(gh, "comment_pr", _hand_the_source_over)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert f"names run {OTHER_RUN} as its owner" in eng.state.block_reason
+    assert "the close was undone" in eng.state.block_reason
+    assert [url for url, _ in gh.reopened_prs] == [PR] and gh.prs[PR].state == "OPEN"
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url, s.superseded_prs) == (PR, PR, [])
+
+
+def test_the_read_seeing_the_close_keeps_an_owner_gone_by_the_confirmation(tmp_state_dir):
+    """PR #459 R9-F1: the read proving the close landed records an owner it finds. Gone by the
+    confirmation's own read, that owner has been removed, and the close is undone rather than
+    confirmed against a legacy binding."""
+    gh = FakeGitHub()
+    eng = _verified_saved(tmp_state_dir, gh)
+    close = gh.close_pr
+
+    def closed_and_named(url, comment):
+        close(url, comment)
+        _hand_the_source_over(gh)
+
+    gh.close_pr = closed_and_named
+    _meets(gh, "comment_pr", lambda gh: setattr(gh.prs[PR], "body", "Started by hand."))
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert "the owner was removed since" in eng.state.block_reason
+    assert [url for url, _ in gh.reopened_prs] == [PR]
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+
+
+def test_a_source_reopened_under_another_run_in_the_confirming_listing_is_not_kept_closed(
+    tmp_state_dir,
+):
+    """PR #459 R9-F1: after the close the listing holds the source only if it was reopened, so
+    its row is a fact of the swap. It is drift, and the close stands undone, the PR open."""
+    gh = FakeGitHub()
+    eng = _verified_saved(tmp_state_dir, gh)
+
+    def reopened_and_taken(gh):
+        gh.prs[PR].state = "OPEN"
+        _hand_the_source_over(gh)
+
+    # The first listing is the one before the close, and the second the confirmation's.
+    _meets(gh, "list_open_prs", reopened_and_taken, on_call=2)
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert f"names run {OTHER_RUN} as its owner" in eng.state.block_reason
+    assert "the close was undone" in eng.state.block_reason
+    assert gh.reopened_prs == [] and gh.prs[PR].state == "OPEN"
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+
+
+def _superseded_saved(tmp_state_dir, gh):
+    eng = _verified_saved(tmp_state_dir, gh, ReplanStage.SUPERSEDED)
+    _closed_by_controller(gh)
+    return eng
+
+
+def _assert_not_activated_for_the_owner(eng, gh, out) -> None:
+    assert out.next_phase == "BLOCKED", out.message
+    reason = eng.state.block_reason
+    assert "the replacement can no longer be activated" in reason
+    assert f"names run {OTHER_RUN} as its owner" in reason
+    assert "the replacement was not activated" in reason
+    assert _txn(eng).stage is ReplanStage.REJECTED
+    assert gh.reopened_prs == []
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url, s.superseded_prs) == (PR, PR, [])
+
+
+def test_a_takeover_of_the_closed_source_stops_the_activation(tmp_state_dir):
+    """PR #459 R9-F1: who closed the source is settled, who owns it now is not. The run does not
+    go on to a replacement of a PR another run was handed, and the close stays as it was."""
+    gh = FakeGitHub()
+    eng = _superseded_saved(tmp_state_dir, gh)
+    _hand_the_source_over(gh)
+    _assert_not_activated_for_the_owner(eng, gh, eng.step())
+
+
+def test_a_takeover_the_activation_listing_shows_stops_the_activation(tmp_state_dir):
+    """PR #459 R9-F1: the last read before the activation is the listing."""
+    gh = FakeGitHub()
+    eng = _superseded_saved(tmp_state_dir, gh)
+
+    def reopened_and_taken(gh):
+        gh.prs[PR].state = "OPEN"
+        _hand_the_source_over(gh)
+
+    _meets(gh, "list_open_prs", reopened_and_taken)
+    _assert_not_activated_for_the_owner(eng, gh, eng.step())
+
+
+def test_the_activation_records_an_owner_only_its_listing_shows(tmp_state_dir):
+    """PR #459 R9-F1: a replacement with no record of an owner binds as legacy, unless the
+    reads at the activation name a run. The listing is the later of them, and an owner on it
+    binds the replacement as owned."""
+    gh = FakeGitHub()
+    eng = _superseded_saved(tmp_state_dir, gh)
+    run_id = eng.state.run_id
+
+    def named(gh):
+        gh.prs[
+            REPLACEMENT_PR
+        ].body = f"{render_implementation_marker(ISSUE, run_id)}\n{_ours_marker()}"
+
+    _meets(gh, "list_open_prs", named)
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    s = load_state(eng.paths.state_file)
+    assert (s.current_pr_url, s.owned_pr_url) == (REPLACEMENT_PR, REPLACEMENT_PR)
+
+
 # -- the replacement's owner, from the journaled K7 record (#414, PR #459 R2-F1) ------
 def _crash_once_k7_is_observed(eng) -> None:
     """The process dies right after the K7 record's ``observed`` stage is saved."""

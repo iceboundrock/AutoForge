@@ -625,6 +625,27 @@ High-priority coverage includes:
   cleanup that cannot finish does not replace it, a merged PR has nothing to
   disarm and is recovered once, a restart refuses the owner with no second merge,
   and a failed save of the step's own result keeps the cleanup's warning too
+- the owner on a PR listing's row of the bound PR (PR #459 R9-F1;
+  `tests/test_engine.py`, `tests/test_replan.py`, `tests/test_effects.py`): a
+  legacy `ANALYZE_EXECUTE` binding whose open-PR listing, or the listing of its
+  branch once the PR closed, shows another run's owner blocks (`pr-owner`) with
+  the owner on disk, beside a defect too, and after the owner is removed a
+  restarted run reviews nothing. A marker naming this run recovers with the owner
+  recorded, a row that is not the bound PR records and refuses nothing, and a dry
+  run writes nothing. Each replan listing refuses a takeover only it shows: the
+  prepare step's before the watermark is read, both binding listings with nothing
+  launched, K7's with no PR created, the one after K7's write with nothing closed,
+  and the pre-close listing with the source left open. Inside the close window
+  the takeover undoes the close, after it the activation stops, and an owner only
+  the activation's listing shows is recorded. K2, K3 and K7 show every PR they read
+  to the witness, and one that raises stops the operation before it decides
+- the replan checkpoint's owner before its later reads (PR #459 R9-F2;
+  `tests/test_replan.py`): a source another run owns is rejected with the
+  repository, the open PRs and the watermark unread. A marker naming this run
+  stays on disk, alone and uncharged, when any of those reads is unavailable, and a
+  restart after the owner is removed refuses with no launch. A defect is rejected
+  on the source's own read with the owner kept, an answer naming another PR is
+  refused before it is judged, and a dry run writes nothing
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

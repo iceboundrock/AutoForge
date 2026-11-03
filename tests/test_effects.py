@@ -109,6 +109,7 @@ from autoforge.errors import (
     GitHubUnavailableError,
     GitHubWrongTargetError,
     GitTransportError,
+    PROwnerError,
     StateError,
 )
 from autoforge.executor import ExecutionRequest, ExecutionResult, execute
@@ -5955,3 +5956,51 @@ def test_an_operator_comment_gh_prints_otherwise_is_verified_through_the_real_cl
     assert [r.stage for r in saves] == [Stage.OBSERVED]
     (request,) = conversation.exact_requests
     assert request.url == "https://api.github.com/repos/owner/repo/issues/comments/5150"
+
+
+# -- the PRs an operation reads, shown before it filters them (#414, PR #459 R9-F1) --------
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param(impl_record, id="K2"),
+        pytest.param(adopt_record, id="K3"),
+        pytest.param(lambda: replacement_record(watermark=42), id="K7"),
+    ],
+)
+def test_a_listing_operation_shows_every_pr_it_reads_to_its_witness(record):
+    """K7's listing is filtered by its watermark, and K2's and K3's by the issue's marker, so
+    a PR the run is bound to, read and dropped, would otherwise never be seen by the engine.
+    The witness gets the rows as read, the dropped ones included, before anything is decided."""
+    fake = FakeGitHub()
+    fake.add_pr(PR, body=ADOPT_BASE)
+    seen: list[str] = []
+
+    def witness(prs):
+        seen.extend(pr.url for pr in prs)
+
+    planned = record()
+    operation_for(planned, fake, witness=witness).reconcile(planned)
+    assert PR in seen
+
+
+def test_a_witness_that_raises_stops_the_operation_before_it_decides_anything():
+    """The engine stops a record by raising from the witness: nothing is issued or persisted."""
+    fake = FakeGitHub()
+    fake.add_pr(PR)
+    planned = replacement_record(watermark=42)
+    persisted: list[EffectRecord] = []
+
+    def witness(_prs):
+        raise PROwnerError("another run owns it")
+
+    with pytest.raises(PROwnerError, match="another run owns it"):
+        drive(planned, operation_for(planned, fake, witness=witness), persisted.append)
+    assert persisted == [] and fake.effect_writes == []
+
+
+def test_an_operation_with_no_witness_reads_as_it_did():
+    """The default shows nothing to anyone."""
+    fake = FakeGitHub()
+    fake.add_pr(PR)
+    planned = replacement_record(watermark=42)
+    assert operation_for(planned, fake).reconcile(planned).action is Action.ISSUE

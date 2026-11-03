@@ -22,6 +22,10 @@ A run whose PR was handed to another run blocks at its next `REVIEW`, `FIX`
 or merge-gate entry, and so does a run whose PR carries the marker of another
 issue naming another run. The read of the PR for a reviewer's or a replan
 agent's context counts too: a takeover that read finds launches nothing.
+So does the PR's row in any PR listing a run reads, as soon as it is read: a
+replan closes no source its listing shows another run owning, and a run
+recovering its PR does not keep an older read of it over the listing's.
+A replan checks its source's owner before any other read it prepares with.
 `REVIEW` checks again right before it posts its round
 comment, `FIX` before each follow-up issue, marker append and acceptance
 comment after its first, and a replan before it launches its agent again
@@ -49,8 +53,9 @@ that its own agent opened it.
 
 A run records in `state.json` when its PR's marker has named an owner
 (`owned_pr_url`): it published the PR, took it over, or read a marker
-naming a run on it, including on an `unblock` that refuses and on the
-closed merge gate's read of a held run. That read writes it at once, so a
+naming a run on it, including on an `unblock` that refuses, on the
+closed merge gate's read of a held run and on a PR listing's row of it.
+That read writes it at once, so a
 read or check that fails after it, or a stopped process, keeps it too. A
 body with a marker that cannot be read, or with two markers, stops the run,
 and a readable marker in it that names a run is recorded all the same. A

@@ -453,6 +453,7 @@ from .replan_txn import (
     verify_close_never_ran,
     verify_closed_source,
     verify_decision_point,
+    verify_decision_pr,
     verify_run_binding,
     verify_sole_implementation_claimant,
     verify_source_checkpoint,
@@ -6161,6 +6162,12 @@ class ControllerEngine:
         the implementation agent beside it. An owner the read finds is
         written into the state file at once (:meth:`_note_pr_owner`), so a
         listing that then fails, or a process killed, keeps it.
+
+        The listing's row of that PR is judged the same way, as soon as the
+        listing is read (:meth:`_implementation_prs`, PR #459 R9-F1), and the
+        row, being the later read, replaces the snapshot as the candidate:
+        kept, the snapshot was what recovery judged and recorded, so a binding
+        recovered with no owner beside the owner the listing had just shown.
         """
         state = self._require_state()
         issue = parse_issue_url(state.current_issue_url)
@@ -6179,7 +6186,7 @@ class ControllerEngine:
             if pr.is_open:
                 candidates[parse_pr_url(pr.url).canonical] = pr
         try:
-            holder = self._implementation_prs(issue).at_most_one()
+            holder = self._implementation_prs(issue, sent).at_most_one()
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -6195,7 +6202,7 @@ class ControllerEngine:
                 "PR(s) or repair the unreadable marker, then 'unblock'"
             )
         if holder is not None:
-            candidates.setdefault(parse_pr_url(holder.obj.url).canonical, holder.obj)
+            candidates[parse_pr_url(holder.obj.url).canonical] = holder.obj
         if not candidates:
             return None, ""
         if len(candidates) > 1:
@@ -6347,7 +6354,7 @@ class ControllerEngine:
             else:
                 base_sha = self.github.get_branch_head_sha(state.repository, default_branch)
             remote_head = self._branch_head(branch)
-            adopt, problem = self._analyze_branch_pr(branch, default_branch)
+            adopt, problem = self._analyze_branch_pr(branch, default_branch, "nothing was launched")
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -6428,7 +6435,9 @@ class ControllerEngine:
         except GitHubNotFoundError:
             return None
 
-    def _analyze_branch_pr(self, branch: str, default_branch: str) -> tuple[PRInfo | None, str]:
+    def _analyze_branch_pr(
+        self, branch: str, default_branch: str, sent: str
+    ) -> tuple[PRInfo | None, str]:
         """The open PR on the controller's branch that ANALYZE_EXECUTE adopts (D9.4).
 
         ``(None, "")`` when no PR of this repository is headed at ``branch``;
@@ -6439,9 +6448,15 @@ class ControllerEngine:
         one, and two PRs, another base or another issue's marker are never
         guessed around. A fork's PR is never listed (the listing holds
         same-repository heads only), so it is never adopted.
+
+        The bound PR's row is judged before any of that (PR #459 R9-F1): a
+        persisted PR closed since is a row here and no candidate, so another
+        run's owner on it raises :class:`PROwnerError` (``sent`` says what the
+        step left unsent) rather than being read as a closed PR on the branch.
         """
         state = self._require_state()
         prs = self.github.list_prs_for_head(state.repository, branch)
+        self._require_listed_owner(prs, sent)
         if not prs:
             return None, ""
         closed = sorted(
@@ -11727,6 +11742,60 @@ class ControllerEngine:
         if problem:
             raise PROwnerError(self._pr_owner_text(problem, sent))
 
+    def _is_bound_row(self, pr: PRInfo) -> bool:
+        """Whether ``pr``, read from a listing, is the bound PR, in the run's repository.
+
+        :meth:`_is_bound_answer` for a read that is not of the bound PR: a row
+        with no readable URL is no row of the bound PR, where an answer with no
+        URL is taken as the answer to the URL asked for.
+        """
+        try:
+            return bool(pr.url) and self._is_bound_answer(pr)
+        except ConfigurationError:
+            return False
+
+    def _listed_owner_problem(self, prs: Iterable[PRInfo]) -> str:
+        """Why the bound PR's rows among ``prs`` refuse this run (#414, PR #459 R9-F1), or ``""``.
+
+        A typed listing holds the bound PR's body like a read of it does, and
+        is often the later read. So it is judged by the one rule
+        (:meth:`_pr_owner_problem`) as soon as it is read, before anything
+        filters the listing or a question about it can raise: a claim for
+        another issue, a defect anywhere (``ClaimConflictError``), the source a
+        replan leaves out of its questions, a number under a watermark. A row
+        identified as the bound PR writes the owner it finds into the state file
+        at once, and an owner found on a row stays recorded when another row
+        refuses. Rows of other PRs say nothing of the bound PR and are not
+        judged; the caller asks of them what it asks.
+
+        It costs no read, and a dry run writes nothing (:meth:`_keep_owner`).
+        """
+        problems = [self._pr_owner_problem(pr) for pr in prs if self._is_bound_row(pr)]
+        return next(filter(None, problems), "")
+
+    def _listed_owner_refusal(self, prs: Iterable[PRInfo], sent: str) -> str:
+        """:meth:`_listed_owner_problem` as a ``BLOCKED`` reason, or ``""``."""
+        problem = self._listed_owner_problem(prs)
+        return self._pr_owner_text(problem, sent) if problem else ""
+
+    def _require_listed_owner(self, prs: Iterable[PRInfo], sent: str) -> None:
+        """Raise :class:`PROwnerError` when the bound PR's rows among ``prs`` refuse this run."""
+        refusal = self._listed_owner_refusal(prs, sent)
+        if refusal:
+            raise PROwnerError(refusal)
+
+    def _bound_pr_witness(self, record: EffectRecord) -> Callable[[Sequence[PRInfo]], None]:
+        """What ``record``'s operation shows the PRs it reads to (PR #459 R9-F1).
+
+        K7 keeps the PRs above its watermark, so the source is dropped unread,
+        and K2 and K3 keep the issue's claimants and the branch's PRs. Each of
+        their reads, before and after the write, passes the bound PR's rows
+        through :meth:`_require_listed_owner`, so its owner is recorded and
+        another run's stops the record there, as journaled.
+        """
+        sent = f"nothing more was sent for {record.describe()}, which stays journaled"
+        return lambda prs: self._require_listed_owner(prs, sent)
+
     def _merge_base_of(self, pr: PRInfo) -> str:
         """The merge base of the PR's base branch and its HEAD, as GitHub reports it now.
 
@@ -12439,10 +12508,19 @@ class ControllerEngine:
         mine = tuple(h for h in whole.holders if h.claim.pr.identity == pr_ref.identity)
         return Collection(whole.kind, whole.noun, mine, whole.defects)
 
-    def _implementation_prs(self, issue: GitHubIssueRef) -> Claimants[PRInfo, ImplementationClaim]:
-        """The open PRs claiming to implement ``issue``, from one complete listing."""
+    def _implementation_prs(
+        self, issue: GitHubIssueRef, sent: str
+    ) -> Claimants[PRInfo, ImplementationClaim]:
+        """The open PRs claiming to implement ``issue``, from one complete listing.
+
+        The bound PR's row is judged first (:meth:`_listed_owner_problem`, PR
+        #459 R9-F1), and :class:`PROwnerError` says what was ``sent``: the
+        claim for the issue, or the defect that makes asking for one raise,
+        would otherwise be all that is left of it.
+        """
         state = self._require_state()
         prs = self.github.list_open_prs(state.repository)
+        self._require_listed_owner(prs, sent)
         return collect(IMPLEMENTATION, prs, "open PR").claimants(
             issue.identity, f"issue {issue.canonical}"
         )
@@ -13074,6 +13152,15 @@ class ControllerEngine:
         review evidence the replacement must answer for, the set of PRs that
         already exist (which therefore can never *be* the replacement), and the
         random transaction id that is the only accepted proof of causality.
+
+        The source's identity and owner are settled on the answer to its own
+        read, before the repository, the listing or the watermark is read (PR
+        #459 R9-F2): a refusal reads nothing more, and an owner it finds is in
+        the state file, alone, whichever of those reads then fails. Judged after
+        them, an unavailable GitHub left a legacy binding with no owner, and once
+        the marker was removed a restarted run launched the agent and closed the
+        source. The listing's row of the source is judged before the watermark
+        is read, for the same reason (PR #459 R9-F1).
         """
         state = self._require_state()
         truncated = truncated_evidence_rounds(state.review_history)
@@ -13093,16 +13180,9 @@ class ControllerEngine:
         # REVIEW recorded it with the decision and ``_replan_unbound`` has
         # already bound it to the run, so the prepare step re-derives nothing
         # a substituted state could redirect.
+        not_started = "no replacement was started"
         try:
             source = self.github.get_pr(state.current_pr_url)
-            repo = self.github.get_repo(state.repository)
-            # Repository-wide and complete, for the same reason the candidate
-            # lookup is: an issue-shaped filter cannot see a PR that is not
-            # (yet) linked to the issue.
-            preexisting = self.github.list_open_prs(state.repository)
-            # Read *before* the transaction id is generated below, so every PR
-            # that could already be carrying a copied marker is under it.
-            watermark = self.github.latest_pr_number(state.repository)
         except GitHubUnavailableError:
             raise  # unknown, not refused: `resume` re-reads
         except GitHubError as exc:
@@ -13111,22 +13191,42 @@ class ControllerEngine:
             # URLs read back from GitHub are data, not proof of shape: a
             # malformed one is a conclusive refusal, not a crash.
             source_ref = parse_pr_url(source.url or state.current_pr_url)
-            preexisting_urls = sorted(
-                {parse_pr_url(pr.url).canonical for pr in preexisting if pr.url}
-            )
         except ConfigurationError as exc:
             return self._reject_replan(txn, f"cannot checkpoint the replan source: {exc}")
         if source_ref.repository.lower() != state.repository.lower():
             return self._reject_replan(
                 txn, f"PR {source_ref.canonical} is not in {state.repository}"
             )
+        identity = verify_decision_pr(source, txn)
+        if identity:
+            return self._reject_replan(txn, identity)
         owner = self._pr_owner_problem(source)
         if owner:
             # #414 (ADR 0004 D9.4a): superseding a PR is closing it, and a PR
             # another run owns is never this run's to close or replace.
-            return self._reject_replan(
-                txn, self._pr_owner_text(owner, "no replacement was started")
+            return self._reject_replan(txn, self._pr_owner_text(owner, not_started))
+        try:
+            repo = self.github.get_repo(state.repository)
+            # Repository-wide and complete, for the same reason the candidate
+            # lookup is: an issue-shaped filter cannot see a PR that is not
+            # (yet) linked to the issue.
+            preexisting = self.github.list_open_prs(state.repository)
+            listed_owner = self._listed_owner_refusal(preexisting, not_started)
+            if listed_owner:
+                return self._reject_replan(txn, listed_owner)
+            # Read *before* the transaction id is generated below, so every PR
+            # that could already be carrying a copied marker is under it.
+            watermark = self.github.latest_pr_number(state.repository)
+        except GitHubUnavailableError:
+            raise  # unknown, not refused: `resume` re-reads
+        except GitHubError as exc:
+            return self._reject_replan(txn, f"cannot checkpoint the replan source: {exc}")
+        try:
+            preexisting_urls = sorted(
+                {parse_pr_url(pr.url).canonical for pr in preexisting if pr.url}
             )
+        except ConfigurationError as exc:
+            return self._reject_replan(txn, f"cannot checkpoint the replan source: {exc}")
         if not source.is_open or not source.head_sha or not source.head_ref or not source.base_ref:
             # The branch and the base are checkpointed alongside the HEAD and
             # enforced by every later source comparison; an empty one would
@@ -13236,8 +13336,19 @@ class ControllerEngine:
         else's code, never the replacement. With ``unjournaled`` no plan was
         journaled, so any PR carrying the transaction's marker is not the
         controller's and is refused rather than bound (ADR 0004 D9.8).
+
+        The source's rows are judged as soon as each listing is read
+        (:meth:`_listed_owner_problem`, PR #459 R9-F1): the candidate selection
+        reads the source for this transaction's marker alone, and a takeover it
+        shows rejects the transaction here.
         """
         state = self._require_state()
+        # Without a candidate no plan was driven: this step reads before any launch.
+        not_bound = (
+            "the replacement was not bound and the source PR was not closed"
+            if candidate
+            else "nothing was launched"
+        )
         try:
             # Every open PR in the repository, to the end: "no candidate exists"
             # decides whether the agent runs again, so it must be neither a
@@ -13250,6 +13361,9 @@ class ControllerEngine:
             raise  # the candidate set is unknown, not ambiguous: stay resumable
         except GitHubError as exc:
             return self._reject_replan(txn, f"cannot list replacement PR candidates: {exc}")
+        listed_owner = self._listed_owner_refusal(open_prs, not_bound)
+        if listed_owner:
+            return self._reject_replan(txn, listed_owner)
         selection = select_bound_candidate(open_prs, txn)
         if selection.disposition is Disposition.NONE:
             # Open listing says "none" -- but a replacement the first agent
@@ -13264,6 +13378,9 @@ class ControllerEngine:
                 raise  # unknown, not absent: stay resumable
             except GitHubError as exc:
                 return self._reject_replan(txn, f"cannot list replacement PR candidates: {exc}")
+            listed_owner = self._listed_owner_refusal(all_prs, not_bound)
+            if listed_owner:
+                return self._reject_replan(txn, listed_owner)
             closed = find_non_open_claimant(all_prs, txn)
             if closed.disposition is not Disposition.NONE:
                 return self._reject_replan(txn, closed.reason)
@@ -13338,6 +13455,11 @@ class ControllerEngine:
         (:func:`verify_sole_implementation_claimant`). Binding applies the
         same three rules on its own snapshot, with the HEAD becoming the
         checkpoint rather than being compared to it.
+
+        The listing was read after ``target``, so the replacement's owner is
+        judged on its row there as well as on ``target`` (PR #459 R9-F1). The
+        source's row in the listing is its callers' to judge: they word what
+        its refusal leaves unsent.
         """
         repository = self._require_state().repository
         return (
@@ -13347,7 +13469,20 @@ class ControllerEngine:
                 open_prs, txn.replacement_pr_url, txn, repository
             )
             or self._replacement_owner_problem(target, txn)
+            or next(
+                (
+                    problem
+                    for pr in self._replacement_rows(open_prs, txn)
+                    if (problem := self._replacement_owner_problem(pr, txn))
+                ),
+                "",
+            )
         )
+
+    @staticmethod
+    def _replacement_rows(prs: Iterable[PRInfo], txn: ReplanTransaction) -> list[PRInfo]:
+        """The rows of ``txn``'s replacement among ``prs``, read from a listing."""
+        return [pr for pr in prs if same_pr_url(pr.url, txn.replacement_pr_url)]
 
     def _replacement_owner_problem(self, target: PRInfo, txn: ReplanTransaction) -> str:
         """Why ``txn``'s replacement may not be bound, closed over or activated (#414), or ``""``.
@@ -13513,6 +13648,12 @@ class ControllerEngine:
                 f"replacement PR {txn.replacement_pr_url} could not be re-read: {exc}",
                 txn.replacement_pr_url,
             )
+        # #414 (PR #459 R9-F1): the listing is the last read of the source
+        # before the close, so a takeover it shows is not this run's to close
+        # over, even though every question below leaves the source out of it.
+        listed_owner = self._listed_owner_refusal(open_prs, "the source PR was not closed")
+        if listed_owner:
+            return self._reject_replan(txn, listed_owner)
         drift = self._target_drift(target, open_prs, txn)
         if drift:
             return self._reject_replan(txn, drift, txn.replacement_pr_url)
@@ -13582,6 +13723,11 @@ class ControllerEngine:
                 f"source PR {txn.source_pr_url} is {source.state or '(unknown)'} after the close "
                 "attempt; expected CLOSED",
             )
+        # #414 (PR #459 R9-F1): recorded, not judged. The receipt is what lets
+        # the close be undone, so it is published first; the confirmation
+        # judges the source on its own read, where an owner this read found and
+        # someone then removed refuses too.
+        self._listed_owner_problem([source])
         # The close landed under this transaction: publish the ownership
         # receipt now, so a resume can tell this close from a human's. Posted
         # only by the attempt that observed its own close.
@@ -13630,23 +13776,32 @@ class ControllerEngine:
         A *transient* GitHub failure propagates untouched: the transaction
         stays at ``SUPERSEDE_INTENT``, and a resume runs exactly this method
         again on the same source PR.
+
+        Who owns the source counts as one of its facts (PR #459 R9-F1), on the
+        read of the source, before its merge base is read, and on its row in
+        the listing should it be open again: a takeover the window hides from
+        the read before the close is drift the compensation undoes, so another
+        run's PR does not stay closed by this one.
         """
         state = self._require_state()
         unowned = self._close_not_ours(txn)
         if unowned:
             return self._reject_replan(txn, unowned)
+        undone = "the close of it is undone"
+        owner = ""
         try:
             source = self.github.get_pr(txn.source_pr_url)
+            owner = self._listed_owner_refusal([source], undone)
             merge_base, unread = self._source_merge_base(source)
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            drift = (
+            drift = owner or (
                 f"source PR {txn.source_pr_url} could not be re-read after the close "
                 f"({exc}), so the close cannot be confirmed against its checkpoint"
             )
         else:
-            drift = (
+            drift = owner or (
                 f"the merge base of source PR {txn.source_pr_url} could not be re-read after "
                 f"the close ({unread}), so the close cannot be confirmed against its checkpoint"
                 if unread
@@ -13664,7 +13819,9 @@ class ControllerEngine:
                     f"close ({exc}), so the replacement cannot be confirmed"
                 )
             else:
-                drift = self._target_drift(target, open_prs, txn)
+                drift = self._listed_owner_refusal(open_prs, undone) or self._target_drift(
+                    target, open_prs, txn
+                )
         if not drift:
             return self._record_supersede(txn)
         return self._compensate_close(txn, drift)
@@ -13800,10 +13957,18 @@ class ControllerEngine:
         was right when it was made would be its own kind of laundering, so the
         run blocks and says so, naming both PRs. Ownership of that close is
         already durable in ``SUPERSEDED`` and is not re-litigated.
+
+        Who owns the source now is not that question: another run's owner, on
+        the read of the source or its row in the listing, leaves the replacement
+        unactivated too, recorded before the next read (PR #459 R9-F1).
         """
         state = self._require_state()
+        not_activated = "the replacement was not activated"
+        refused = "the source PR was closed, but the replacement can no longer be activated"
+        owner = ""
         try:
             source = self.github.get_pr(txn.source_pr_url)
+            owner = self._listed_owner_refusal([source], not_activated)
             merge_base, unread = self._source_merge_base(source)
             target = self.github.get_pr(txn.replacement_pr_url)
             open_prs = self.github.list_open_prs(state.repository)
@@ -13811,6 +13976,8 @@ class ControllerEngine:
             raise  # unknown, not refused: `resume` re-reads and re-verifies
         except GitHubError as exc:
             unread = str(exc)
+        if owner:
+            return self._reject_replan(txn, f"{refused}: {owner}", txn.replacement_pr_url)
         if unread:
             # The merge base is read beside the PRs and a conclusive failure
             # of that read is the same refusal as one of theirs: a checkpoint
@@ -13821,19 +13988,18 @@ class ControllerEngine:
                 f"before activating the replacement ({unread})",
                 txn.replacement_pr_url,
             )
-        drift = verify_closed_source(source, txn, merge_base) or self._target_drift(
-            target, open_prs, txn
+        drift = (
+            self._listed_owner_refusal(open_prs, not_activated)
+            or verify_closed_source(source, txn, merge_base)
+            or self._target_drift(target, open_prs, txn)
         )
         if drift:
-            return self._reject_replan(
-                txn,
-                f"the source PR was closed, but the replacement can no longer be activated: "
-                f"{drift}",
-                txn.replacement_pr_url,
-            )
-        return self._activate_replacement(txn, target)
+            return self._reject_replan(txn, f"{refused}: {drift}", txn.replacement_pr_url)
+        return self._activate_replacement(txn, target, self._replacement_rows(open_prs, txn))
 
-    def _activate_replacement(self, txn: ReplanTransaction, target: PRInfo) -> StepOutcome:
+    def _activate_replacement(
+        self, txn: ReplanTransaction, target: PRInfo, listed: Sequence[PRInfo] = ()
+    ) -> StepOutcome:
         """Make the verified replacement the current implementation (idempotent).
 
         The supersede is recorded once per transaction id, and the replan
@@ -13848,8 +14014,9 @@ class ControllerEngine:
         state = self._require_state()
         # #414 (PR #459 R1-F1, R2-F1): read before anything below moves the
         # state the journaled K7 record is validated against. ``target`` is
-        # the replacement as the last read before this write found it, which
-        # :meth:`_target_drift` held to the record's owner.
+        # the replacement as read before this write, and ``listed`` its rows in
+        # the listing read after that, which :meth:`_target_drift` held to the
+        # record's owner.
         published = self._replacement_publication(txn)
         already_counted = any(
             item.get("transaction_id") == txn.transaction_id for item in state.superseded_prs
@@ -13879,7 +14046,7 @@ class ControllerEngine:
         # removal refuses the PR. A legacy replacement (an agent's, D13.8, or
         # a record saved before #414) names no run and binds a legacy PR.
         state.owned_pr_url = txn.replacement_pr_url if published else ""
-        self._note_pr_owner([self._marker_owner(target)])
+        self._note_pr_owner([self._marker_owner(pr) for pr in (target, *listed)])
         state.current_branch = txn.replacement_branch
         state.current_head_sha = txn.replacement_head_sha
         # The activation predicate verified the replacement's base is the
@@ -14614,10 +14781,15 @@ class ControllerEngine:
                     "that reads the default branch again",
                 )
             head = self._branch_head(branch)
-            adopt, problem = self._analyze_branch_pr(branch, entry.default_branch)
+            sent = "nothing was planned, pushed or created"
+            adopt, problem = self._analyze_branch_pr(branch, entry.default_branch, sent)
             # The base the append keeps byte for byte: GitHub's text, never
             # `gh`'s rewrite of it (#328).
-            adopt_body = held_pr(self.github, adopt.url).body if adopt is not None else ""
+            adopt_body = ""
+            if adopt is not None:
+                held = held_pr(self.github, adopt.url)
+                self._require_listed_owner([held], sent)
+                adopt_body = held.body
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
@@ -14785,6 +14957,7 @@ class ControllerEngine:
                     self.github,
                     transport=self._git_transport() if record.kind is EffectKind.PUSH else None,
                     default_branch=default_branch,
+                    witness=self._bound_pr_witness(record),
                 )
                 driven = drive(record, op, self._persist_effect)
             except GitHubUnavailableError:
@@ -14857,8 +15030,11 @@ class ControllerEngine:
                 "the cause, then 'unblock'",
             )
         again = " again" if record.stage == Stage.ATTEMPTED else ""
-        for pr in prs:
-            problem = self._pr_owner_problem(pr) or self._other_issue_marker_problem(pr)
+        # Every row before the first refusal: a refused row must not leave the
+        # bound PR's owner, further down the listing, unread (PR #459 R9-F1).
+        judged = [(pr, self._pr_owner_problem(pr)) for pr in prs]
+        for pr, owner_problem in judged:
+            problem = owner_problem or self._other_issue_marker_problem(pr)
             if not problem:
                 continue
             return _blocked(
@@ -14981,10 +15157,17 @@ class ControllerEngine:
         head that is still there is :class:`GitHubUnavailableError`, for
         'resume'; any other head is something else pushed to the branch, and
         blocks, as does another base, or a default branch that changed
-        while the controller waited (PR #404 R1-F3).
+        while the controller waited (PR #404 R1-F3). A PR the run is still bound
+        to has its owner judged on each read, the wait's included (PR #459 R9-F1).
         """
+
+        def read() -> PRInfo:
+            pr = self.github.get_pr(url)
+            self._require_listed_owner([pr], "nothing was written to the PR")
+            return pr
+
         pr, waited = self._await_pushed_head(
-            lambda: self.github.get_pr(url),
+            read,
             lambda pr: (
                 pr.base_ref == default_branch
                 and expected_old is not None
@@ -15084,7 +15267,9 @@ class ControllerEngine:
 
         try:
             holder, waited = self._await_pushed_head(
-                lambda: self._implementation_prs(issue).exactly_one(),
+                lambda: self._implementation_prs(
+                    issue, f"nothing was bound, and {record.describe()} stays journaled"
+                ).exactly_one(),
                 lagging,
                 f"PR {url} is still headed at {expected_old} after the push of {candidate}",
             )
@@ -17382,6 +17567,7 @@ class ControllerEngine:
                     self.github,
                     transport=self._git_transport() if record.kind is EffectKind.PUSH else None,
                     default_branch=default_branch,
+                    witness=self._bound_pr_witness(record),
                 )
                 driven = drive(record, op, self._persist_effect)
             except GitHubUnavailableError:
@@ -17390,6 +17576,8 @@ class ControllerEngine:
                 return self._reject_replan(
                     txn, f"{record.describe()} could not be reconciled with GitHub: {exc}"
                 )
+            except PROwnerError as exc:
+                return self._reject_replan(txn, str(exc))
             records[index] = driven.record
             if driven.record.stage == Stage.CONFLICT:
                 return self._reject_replan(txn, self._replan_conflict_text(driven.record))

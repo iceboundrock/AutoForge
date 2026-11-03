@@ -2266,6 +2266,21 @@ its author. Only the effect records and the entry observation prove origin.
       `REVIEW` blocks and a replan rejects its transaction. The owner is judged
       on the typed answer, never on the file rendered from it, and an answer
       naming another PR is an item that could not be read;
+    - the bound PR's row in every typed PR listing the run reads, as soon as the
+      listing is read (`list_open_prs`, `list_all_prs`, `list_prs_for_head`; PR
+      #459 R9-F1). A row holds the PR's body as a read of it does, and is often
+      the later read, so it is judged before anything can filter it or raise: a
+      claim for another issue, a defect elsewhere in the listing, a replan's
+      questions that leave the source out, K7's watermark. Ignored,
+      `ANALYZE_EXECUTE` kept its earlier snapshot of a legacy PR, so recovery
+      saved `REVIEW` with no owner beside the one the listing had just shown,
+      and a replan closed a source its pre-close listing showed another run
+      owning. A row counts only once its URL identifies it as the bound PR in the
+      run's repository; other rows say nothing of the bound PR's owner. K2, K3 and
+      K7 show what they read, before and after their write, to the same rule,
+      and a refusal stops the record as journaled. A replan's refusal rejects its
+      transaction before the close, is drift the compensation undoes inside the
+      close window, and stops the activation after it;
     - a read right before K4 is sent, on every entry that sends it (the one
       read this adds: a reviewer runs for minutes, and a takeover in
       between must not get its comment posted);
@@ -2309,7 +2324,13 @@ its author. Only the effect records and the entry observation prove origin.
       marker on those PRs is judged, not the issue's alone: a marker of
       another issue, whatever run it names or none, this one included, says
       the PR implements that issue and refuses too (PR #459 R5-F2);
-    - the replan checkpoint and the read before the source is closed;
+    - the replan checkpoint, on the answer to its read of the source, once that
+      answer is known to be the PR the review decided on, and before the
+      repository, the open PRs or the watermark is read (PR #459 R9-F2). Judged
+      after them, an unavailable GitHub left a legacy binding's owner unrecorded,
+      and once it was removed a restarted run launched the agent and closed the
+      source;
+    - the read before the source is closed;
     - a read of the source before a transaction `PREPARED` on an earlier
       entry launches its agent again, and before each record of its saved
       push and PR plan is driven, on the step that saved it and on every
@@ -2377,8 +2398,10 @@ its author. Only the effect records and the entry observation prove origin.
       read of a run it holds (PR #459 R3-F2), `ANALYZE_EXECUTE`'s probe of
       its persisted PR, the identity read behind a refused checks read and
       the step budget's read at the merge gate (PR #459 R5-F1), the read
-      after `MERGE`'s write (PR #459 R7-F1), and the read for `REVIEW`'s or a
-      replan's read context (PR #459 R8-F1).
+      after `MERGE`'s write (PR #459 R7-F1), the read for `REVIEW`'s or a
+      replan's read context (PR #459 R8-F1), the bound PR's row in a typed PR
+      listing (PR #459 R9-F1), and the replan checkpoint's read of the source,
+      before its other reads (PR #459 R9-F2).
 
     A defect in the body changes nothing of what its readable markers record
     (PR #459 R6-F1). A marker that cannot be read, or a second marker, refuses
