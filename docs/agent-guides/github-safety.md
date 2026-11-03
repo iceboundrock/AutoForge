@@ -2066,10 +2066,20 @@ both `safety.allow_merge: true` is set in config and `--allow-merge` is
 passed on the CLI. With the gate closed `run`/`resume` stop at
 `READY_FOR_MERGE` and a human merges: the CLI prints a banner with the
 issue, PR, review round and reviewed HEAD and states that automatic merge is
-disabled, and `resume` without the gate open re-prints the banner and runs
-nothing. `step` without the gate open refuses to advance `READY_FOR_MERGE`
-or `MERGE` with an error naming both halves of the gate, before anything is
-read from GitHub. `safety.allow_merge` is the *only* config key that opens the gate:
+disabled. Without the gate open, `resume` and `step` read the PR of a run
+held at `READY_FOR_MERGE` first (#447): its identity read, then the merge
+base when its HEAD and base are the reviewed ones; never its checks, the
+review comment or anything the gate judges past drift. A PR that moved off
+the clean-reviewed revision goes back to `REVIEW`, nothing merged; one at
+that revision holds, with nothing written: `resume` re-prints the banner
+and runs nothing, `step` refuses with an error naming both halves of the
+gate. Only a PR GitHub reports `CLOSED` or `MERGED` holds without being
+compared; an answer that establishes no revision (no state or an unknown
+one, an `OPEN` PR with no HEAD or no base, an answer naming another PR)
+raises a `VerificationError` with nothing written. For a scheduler's issue
+settled at `READY_FOR_MERGE`, `epic recheck` makes the same read, the gate
+closed. `step` refuses to advance `MERGE` with the gate closed before
+anything is read from GitHub. `safety.allow_merge` is the *only* config key that opens the gate:
 the historical `execution.allow_merge` is rejected on load rather than read,
 and an unknown key under `safety` (a typo such as `allow_merges`) is a
 configuration error, so the gate can never be "disabled" in one place while

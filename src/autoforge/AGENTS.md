@@ -11,7 +11,8 @@ a concern lives so the routing rules can be applied.
 
 ```text
 cli.py              subcommands run / step / resume / unblock / status / doctor, dry-run flags;
-                    the `epic` group (run / resume / status / stop / archive, #183) and the
+                    the `epic` group (run / resume / status / stop / archive, #183;
+                    recheck, #447) and the
                     hidden `epic _worker` entry point of a scheduler's worker (#182)
 config.py           configuration loading and validation; owns config defaults and keys
 doctor.py           read-only environment checks; the scheduler rows (settings, and with
@@ -167,8 +168,10 @@ scheduler_stop.py   `epics/<n>/stop-request` (ADR 0008 D16.4, #182): published b
 epic_commands.py    the `epic` commands' logic (ADR 0008 D9.8, D14.4, D16.4, D17.4, #183):
                     the lock-free `epic status` (one category per child, the
                     autoforge.epic-status/1 document), the dry-run plan, `epic run`'s
-                    open-claim refusal and --force, `epic stop`'s outcomes and `epic
-                    archive` under L0 and L2; graph reads only, no signal, no GitHub write
+                    open-claim refusal and --force, `epic stop`'s outcomes, `epic
+                    archive` under L0 and L2, and `epic recheck` (#447): under L0 and L2,
+                    one closed-gate engine step on an issue settled at READY_FOR_MERGE,
+                    which reads its PR and launches nothing; no signal, no GitHub write
 redaction.py        secret redaction for anything that reaches logs
 runlog.py           per-invocation run logs, redacted
 errors.py           typed error taxonomy

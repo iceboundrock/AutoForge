@@ -21,6 +21,16 @@
   entry and in `epic status`).
 - **Amended by #265:** D17.2's reverse guard (a standalone state of a
   protocol the controller does not read admits nothing at all).
+- **Amended by #447:** D15.1's `ready_for_merge` stays settled, and the
+  scheduler still never relaunches it, but the operator may recheck it:
+  `epic recheck <epic> <issue>` holds L0, then the issue's L2, and for a
+  namespace settled at `READY_FOR_MERGE` with no open claim runs the
+  engine's closed-gate read of the PR (a standalone `resume`'s). A PR that
+  moved off the clean-reviewed revision takes `READY_FOR_MERGE -> REVIEW`
+  in the same run, which makes the namespace `resumable` for the next
+  admission; no agent runs and no claim, `scheduler.json` or GitHub object
+  is written. Like `unblock` (D17.3) it may edit a namespace's state, only
+  while no orchestrator is live; like `epic archive` it is never automatic.
 - **Where:** placement is decided per decision and collected in §5.
   Existing code this record builds on: `src/autoforge/locking.py`,
   `engine.py`, `state.py`, `transitions.py`, `cli.py`, `executor.py`,
@@ -1345,7 +1355,7 @@ predicate first and only then maps the phase:
 |---|---|---|
 | `awaiting_input` | #126's durable pause predicate holds, once #126 has landed. Checked before the phase mapping. | Settled. |
 | `terminal` | phase `DONE`, `BLOCKED` or `FAILED` | Settled. `BLOCKED` needs `unblock` (a standalone command, run after the scheduler exits, D9.4), then `epic resume`. |
-| `ready_for_merge` | phase `READY_FOR_MERGE` | Settled. The stop phase was reached with the merge gate closed. |
+| `ready_for_merge` | phase `READY_FOR_MERGE` | Settled. The stop phase was reached with the merge gate closed. A push to its PR afterwards is read by the operator's `epic recheck` (amended by #447), which may make it `in_progress`, then `epic resume`. |
 | `handoff` | phase `MERGE` or `UPDATE_EPIC` | Settled. Never executed by a worker. |
 | `in_progress` | any other phase | Resumable. |
 
