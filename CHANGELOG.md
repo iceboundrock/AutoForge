@@ -5,6 +5,24 @@ so.
 
 ## Unreleased
 
+### A merge whose outcome is unknown is no longer reported as "nothing was merged" (#376)
+
+When the controller's re-read of a PR failed right after `gh pr merge`,
+the merge outcome was unknown, yet three `BLOCKED` reasons could still say
+nothing was merged: the one at `merge.max_verification_attempts`, the one
+a later `MERGE` step gave when it could not read the PR at all, and the
+`workflow.max_total_steps` one, which also offered "start a new run". An
+operator could take that route for an issue whose PR had already merged.
+
+Now the first two say the outcome is unknown. In `MERGE`, the budget's
+reason reads the PR once and says what GitHub holds: open, so nothing was
+merged; `MERGED` and not counted; or unreadable. Each reason where a
+merge may have landed names the way out instead of a new run: raise the
+bound if one stopped the run, then `unblock`, which sends a PR merged at
+the clean-reviewed HEAD to `READY_FOR_MERGE`, where `resume --allow-merge`
+counts it once. The run stops in the same phases as before, and nothing
+is counted or merged differently; the one new GitHub call is that read.
+
 ### `status` shows where an unjournaled review comment may have come from (#416)
 
 When `REVIEW` blocks on a round comment the controller did not journal

@@ -2297,6 +2297,22 @@ GitHub (an already-merged PR is recovered and counted once; an open one is
 re-verified), bounded by the same `merge.max_verification_attempts`, then
 `BLOCKED`.
 
+No state field records that a `MERGE` step sent `gh pr merge`, so a
+`BLOCKED` reason says "nothing was merged" only where that is known (#376):
+after a read of the PR found it unmerged, or outside `MERGE`, which sends no
+merge. The step that ran `gh pr merge` and could not read the PR back says
+the outcome is unknown. So does a later `MERGE` step that cannot read the PR
+at all, since an earlier step may have sent the merge. A step budget that
+stops an uncounted `MERGE` before it re-inspects GitHub reads the PR once
+(the stop is `BLOCKED` whatever it finds) and says what GitHub holds: open,
+so nothing was merged; `MERGED`, not counted; or unreadable, so unknown.
+Each of these names the way out: raise the bound where one stopped the run,
+then `unblock`, which reads the PR and sends a merge at the clean-reviewed
+HEAD to `READY_FOR_MERGE`, whose `MERGE` reconciles and counts it once
+(`_merge_so_far` and `_budget_merge_outcome` in `src/autoforge/engine.py`).
+The budget does not let such a `MERGE` run: unlike the counted one below,
+an uncounted PR still open would be merged by it.
+
 ### Deleting the merged head branch
 
 With `merge.delete_branch: true` (default `false`) the controller deletes
