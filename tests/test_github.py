@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 import autoforge.github as github_module
-from autoforge.effect_ops import gh_prints_as
 from autoforge.errors import (
     ConfigurationError,
     GitHubChecksAccessError,
@@ -44,6 +43,7 @@ from autoforge.github import (
     HttpsRequest,
     WorkflowJob,
     checks_access_denial,
+    gh_prints_as,
     https_get,
     is_access_denied_gh_failure,
     is_checks_access_denied_gh_failure,
@@ -4060,7 +4060,7 @@ def test_the_fakes_sanitizer_is_gh_s_on_upstream_s_own_vectors(wire, printed):
 
 @pytest.mark.parametrize(("wire", "printed"), _UPSTREAM_SANITIZER_VECTORS)
 def test_gh_prints_as_accepts_every_upstream_vector(wire, printed):
-    """#328: ``effect_ops.gh_prints_as``, which keeps the UPDATE_EPIC entry and REVIEW's
+    """#328: ``github.gh_prints_as``, which keeps the UPDATE_EPIC entry and REVIEW's
     operator evidence on one version of a text, takes each upstream print for the
     print of its text: the vectors as JSON strings, decoded."""
     text = json.loads(f'"{wire}"', strict=False)

@@ -10,7 +10,9 @@ implementation marker. It names no author and writes nothing.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -23,6 +25,8 @@ from autoforge.errors import GitHubUnavailableError
 from autoforge.github import CommentInfo, CommitPerson, PRCommitInfo
 from autoforge.review_provenance import (
     MAX_LISTED_COMMITS,
+    MAX_LISTED_FINDING_IDS,
+    BodyRead,
     journal_evidence,
     offset_text,
     one_line,
@@ -42,6 +46,7 @@ from tests.conftest import (
     FakeGitHub,
     block,
     comment_url,
+    gh_sanitized,
     git_repo,
     implementation_pr_body,
     make_engine,
@@ -130,6 +135,23 @@ def status(monkeypatch, tmp_path):
 
 def _report(text: str) -> dict:
     return json.loads(text)["unjournaled_review"]
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _planned_then_died(tmp_path: Path, name: str, gh: FakeGitHub, result: dict) -> str:
+    """A run in ``.autoforge/<name>`` that saved its K4 plan for round 1 and died before the
+    comment landed; returns the planned body. GitHub holds no comment of it."""
+    eng = _in_review(tmp_path, name, gh, [block(result)])
+    gh.write_failures.append(("create_pr_comment", KeyboardInterrupt(), False))
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    eng.close()
+    [record] = load_state(tmp_path / ".autoforge" / name / "state.json").effect_records
+    assert record["kind"] == "review_comment" and record["stage"] == "attempted"
+    return record["payload"]["body"]
 
 
 # -- the acceptance criteria -----------------------------------------------------------------
@@ -255,7 +277,16 @@ def test_a_foreign_comment_has_no_journal_match_and_the_later_commits_are_listed
         "login": "alice",
     }
     assert comment["marker"]["finding_ids"] == ["R1-F1"]
-    assert comment["body_sha256"] and comment["body_chars"] == len(gh.comments[PR][0].body)
+    assert comment["marker"]["finding_ids_total"] == 1
+    held = gh.comments[PR][0].body
+    assert comment["body"] == {
+        "exact": True,
+        "read": "listing",
+        "sha256": hashlib.sha256(held.encode()).hexdigest(),
+        "chars": len(held),
+        "problem": "",
+    }
+    assert ("get_comment_exact", comment["url"]) not in gh.calls  # gh printed it unchanged
 
 
 # -- what else the report holds ------------------------------------------------------------------
@@ -421,7 +452,303 @@ def test_at_most_the_bound_number_of_later_commits_is_shown(tmp_path, status):
     assert f"; the first {MAX_LISTED_COMMITS} shown" in status(gh, blocked)
 
 
+# -- a plan is not a journal (R1-F1) ----------------------------------------------------------
+
+
+def test_a_foreign_comment_after_the_runs_own_plan_is_reported_with_the_plan(tmp_path, status):
+    """The run saved its K4 plan for round 1 and died before the comment landed; someone
+    then posted a comment carrying the round's marker with another body, and the plan's
+    read-back blocks on it as a conflict. The plan names no comment, so it does not account
+    for this one: the comment is reported, and the run's own plan is listed under it as a
+    plan."""
+    gh = FakeGitHub()
+    _planned_then_died(tmp_path, "mine", gh, review_result(1, SHA_A, [FINDING]))
+    assert gh.comments.get(PR, []) == []
+    foreign = gh.add_comment(
+        PR,
+        101,
+        review_comment_body(1, SHA_A, True, ["R1-F1"]),
+        author="operator",
+        created_at="2026-01-01T00:00:41Z",
+    )
+    mine = tmp_path / ".autoforge" / "mine"
+    resumed = make_engine(mine, ["the reviewer must not run again"], github=gh, workdir=tmp_path)
+    resumed.load()
+    assert resumed.step().next_phase == "BLOCKED"
+    assert resumed.provider.calls == []
+    resumed.close()
+    [record] = load_state(mine / "state.json").effect_records
+    assert record["stage"] == "conflict" and foreign.url in record["reason"]
+
+    out = status(gh, mine)
+    lines = out.splitlines()
+    assert f"  Comment:   {foreign.url}" in lines
+    assert "    journal:   none of the 1 state directories read accounts for it" in lines
+    [recorded] = [line for line in lines if line.startswith("    recorded:")]
+    assert recorded.startswith(f"    recorded:  {mine} (the state status reads; run ")
+    assert recorded.endswith(
+        "a review_comment effect record (K4) for this comment's marker, conflict: a plan for "
+        "this comment's round, which names no comment; its payload differs from this "
+        "comment's text"
+    )
+    document = _report(status(gh, mine, "--json"))
+    [comment] = document["comments"]
+    [match] = comment["journals"]
+    assert match["current"] is True and match["journaled"] is False
+    assert [(e["kind"], e["payload"]) for e in match["evidence"]] == [("effect_plan", "differs")]
+
+
+@pytest.mark.parametrize("same_body", [False, True], ids=["another body", "the planned body"])
+def test_another_runs_plan_for_the_round_does_not_account_for_a_foreign_comment(
+    tmp_path, status, same_body
+):
+    """Another run on this checkout saved its K4 plan for the same round and its comment
+    never landed; a comment carrying the same marker then appears and this run blocks on
+    it. The other run's plan is listed as a plan for the round, never as the journal of
+    the comment, whether the comment holds the planned body or another."""
+    gh = FakeGitHub()
+    planned = _planned_then_died(tmp_path, "other", gh, review_result(1, SHA_A, [FINDING]))
+    body = planned if same_body else review_comment_body(1, SHA_A, True, ["R1-F1"])
+    gh.add_comment(PR, 101, body, author="operator", created_at="2026-01-01T00:00:41Z")
+    blocked = _blocked(tmp_path, "mine", gh)
+    other = tmp_path / ".autoforge" / "other"
+
+    out = status(gh, blocked)
+    lines = out.splitlines()
+    assert "    journal:   none of the 2 state directories read accounts for it" in lines
+    assert not [line for line in lines if line.startswith("    journal:   /")]
+    [recorded] = [line for line in lines if line.startswith("    recorded:")]
+    assert recorded.startswith(f"    recorded:  {other} (standalone; run ")
+    verdict = (
+        "is this comment's text byte for byte" if same_body else "differs from this comment's text"
+    )
+    assert recorded.endswith(
+        "a review_comment effect record (K4) for this comment's marker, attempted: a plan for "
+        f"this comment's round, which names no comment; its payload {verdict}"
+    )
+    document = _report(status(gh, blocked, "--json"))
+    [match] = document["comments"][0]["journals"]
+    assert match["state_dir"] == str(other) and match["journaled"] is False
+    assert [(e["kind"], e["payload"]) for e in match["evidence"]] == [
+        ("effect_plan", "same" if same_body else "differs")
+    ]
+
+
+# -- GitHub's text, not gh's print (R1-F2) ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("title", "on_github", "verdict"),
+    [
+        # The planned body holds the six characters \u001b, and GitHub holds it byte for
+        # byte; gh prints them as \^[, so its print is not the payload.
+        ("reset with \\u001b[0m", lambda planned: planned, "same"),
+        # The planned body holds the text ^[, and GitHub holds an ESC there, which gh
+        # prints as ^[: its print is the payload, and GitHub's text is not.
+        ("press ^[ to leave", lambda planned: planned.replace("^[", "\x1b"), "differs"),
+    ],
+    ids=["literal escape text", "control character"],
+)
+def test_a_body_gh_rewrites_is_digested_and_compared_on_githubs_text(
+    tmp_path, status, title, on_github, verdict
+):
+    """gh rewrites a control character, and the text of its JSON escape, into caret
+    notation, which cannot be undone: the print's digest is not GitHub's, and a payload
+    equal to the print is not GitHub's text. The comment is read again exactly; its digest
+    and the plan's comparison are of GitHub's text, and only the print is quoted."""
+    gh = FakeGitHub()
+    finding = {**FINDING, "title": title}
+    planned = _planned_then_died(tmp_path, "other", gh, review_result(1, SHA_A, [finding]))
+    held = on_github(planned)
+    gh.gh_sanitizes = True
+    foreign = gh.add_comment(PR, 101, held, created_at="2026-01-01T00:00:41Z")
+    blocked = _blocked(tmp_path, "mine", gh)
+    printed = gh_sanitized(held)
+    assert printed != held and (printed == planned) is (verdict == "differs")
+
+    gh.calls.clear()
+    document = _report(status(gh, blocked, "--json"))
+    assert ("get_comment_exact", foreign.url) in gh.calls
+    [comment] = document["comments"]
+    assert comment["body"] == {
+        "exact": True,
+        "read": "exact_read",
+        "sha256": _sha256(held),
+        "chars": len(held),
+        "problem": "",
+    }
+    [match] = comment["journals"]
+    assert [(e["kind"], e["payload"]) for e in match["evidence"]] == [("effect_plan", verdict)]
+    out = status(gh, blocked)
+    assert (
+        f"    body:      {len(held)} characters, sha256 {_sha256(held)} (GitHub's text, read "
+        "exactly); begins (as gh printed it): "
+    ) in out
+    # Only gh's print is quoted: the exact text is digested and compared, never shown.
+    shown = one_line(printed, provenance.MAX_EXCERPT_CHARS)
+    assert comment["excerpt"] == shown and "^[" in shown
+    for text in (out, json.dumps(document)):
+        assert "u001b" not in text and "\x1b" not in text
+
+
+def test_a_body_not_read_exactly_is_reported_as_gh_printed_it(tmp_path, status, monkeypatch):
+    """A failed exact read, or one that finds another version of the comment, leaves
+    GitHub's text unknown: the digest is the print's and says so, and status succeeds."""
+    gh = FakeGitHub()
+    gh.gh_sanitizes = True
+    held = "Press \x1b and \\u001b to leave\n" + review_comment_body(1, SHA_A, False)
+    gh.add_comment(PR, 100, held, created_at="2026-01-01T00:00:00Z")
+    blocked = _blocked(tmp_path, "mine", gh)
+    printed = gh_sanitized(held)
+    assert printed.startswith("Press ^[ and \\^[ to leave")
+
+    gh.exact_read_error = GitHubUnavailableError("api.github.com: timed out")
+    problem = "its exact read failed: api.github.com: timed out"
+    document = _report(status(gh, blocked, "--json"))
+    assert document["comments"][0]["body"] == {
+        "exact": False,
+        "read": "listing",
+        "sha256": _sha256(printed),
+        "chars": len(printed),
+        "problem": problem,
+    }
+    assert (
+        f"    body:      {len(printed)} characters, sha256 {_sha256(printed)} of gh's print of "
+        f"it, which may not be GitHub's text ({problem}); begins (as gh printed it): "
+    ) in status(gh, blocked)
+
+    gh.exact_read_error = None
+    edited = CommentInfo(id=100, url=comment_url(PR, 100), body=held + "edited")
+    monkeypatch.setattr(gh, "get_comment_exact", lambda url: edited)
+    body = _report(status(gh, blocked, "--json"))["comments"][0]["body"]
+    assert body["exact"] is False and body["sha256"] == _sha256(printed)
+    assert body["problem"] == "it changed between gh's listing and its exact read"
+
+
+def test_a_payload_is_compared_with_githubs_text_and_only_with_it():
+    held = "Press \x1b to leave"
+    printed = gh_sanitized(held)
+    assert printed == "Press ^[ to leave"
+    exact = BodyRead(printed, held, exact_read=True)
+    assert exact.compare(held) == "same"
+    assert exact.compare(printed) == "differs"  # printed alike, another text
+    unknown = BodyRead.of_print(printed, "its exact read failed: x")
+    assert not unknown.exact and unknown.sha256 == _sha256(printed)
+    assert unknown.compare(held) == "unknown" and unknown.compare(printed) == "unknown"
+    assert unknown.compare("Press q to leave") == "differs"  # gh never prints it so
+    changed = BodyRead(printed, None, changed=True, problem="changed")
+    assert changed.compare("Press q to leave") == "unknown"
+    plain = BodyRead.of_print("no caret")
+    assert plain.exact and plain.held == "no caret" and plain.compare("no caret") == "same"
+
+    body = review_comment_body(1, SHA_A, False)
+    state = _state("af-other", Phase.REVIEW, current_pr_url=PR)
+    state.effect_records = [_k4_record("attempted", body, None, body)]
+    comment = CommentInfo(id=100, url=comment_url(PR, 100), body=body + "^[")
+    [evidence] = journal_evidence(state, parse_pr_url(PR), comment, _claim(body))
+    assert evidence.payload == "differs"
+    [evidence] = journal_evidence(
+        state, parse_pr_url(PR), comment, _claim(body), BodyRead(comment.body, None, changed=True)
+    )
+    assert evidence.payload == "unknown"
+    assert evidence.detail.endswith(
+        "whether its payload is this comment's text is not known, since GitHub's text of the "
+        "comment is not (see its body line)"
+    )
+
+
+# -- an incomplete search is said (R1-F3) -------------------------------------------------------
+
+
+def test_a_directory_that_cannot_be_opened_is_reported_as_not_searched(tmp_path, status):
+    """A directory listed beside the state directory that cannot be opened may hold the
+    journal: it is named as not searched, the report says its search was incomplete, and
+    status still succeeds."""
+    gh = FakeGitHub()
+    gh.add_comment(PR, 100, review_comment_body(1, SHA_A, False), created_at="2026-01-01T00:00:00Z")
+    blocked = _blocked(tmp_path, "mine", gh)
+    locked = tmp_path / ".autoforge" / "locked"
+    locked.mkdir()
+    held = _state(
+        "af-hidden",
+        Phase.FIX,
+        current_pr_url=PR,
+        review_round=1,
+        last_review_comment_url=comment_url(PR, 100),
+    )
+    save_state(held, locked / "state.json")
+    locked.chmod(0)
+    try:
+        try:
+            os.close(os.open(locked, os.O_RDONLY | os.O_DIRECTORY))
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("this user opens a directory whatever its mode")
+        out = status(gh, blocked)
+        document = _report(status(gh, blocked, "--json"))
+    finally:
+        locked.chmod(0o700)
+    lines = out.splitlines()
+    [line] = [line for line in lines if line.startswith(f"    not searched: {locked}: ")]
+    assert "Permission denied" in line
+    assert (
+        "    journal:   none of the 1 state directories read accounts for it; the search was "
+        "incomplete (see 'unreadable' and 'not searched' below), so a state directory that "
+        "does may not have been read"
+    ) in lines
+    directories = document["state_directories"]
+    assert directories["complete"] is False
+    [unsearched] = directories["unsearched"]
+    assert unsearched["path"] == str(locked) and "Permission denied" in unsearched["problem"]
+    assert document["comments"][0]["journals"] == []
+
+    # Readable again, the same directory is the one that accounts for it.
+    document = _report(status(gh, blocked, "--json"))
+    assert document["state_directories"]["complete"] is True
+    assert document["state_directories"]["unsearched"] == []
+    [match] = document["comments"][0]["journals"]
+    assert match["state_dir"] == str(locked) and match["journaled"] is True
+
+
+# -- untrusted marker data is bounded (R1-F4) -----------------------------------------------------
+
+
+def test_a_markers_finding_ids_are_bounded_in_both_output_modes(tmp_path, status):
+    """The marker decoder bounds each finding id, never how many one marker names."""
+    gh = FakeGitHub()
+    ids = [f"R1-F{n}" for n in range(1, 1001)]
+    gh.add_comment(PR, 90, review_comment_body(1, "b" * 40, True, ids))
+    gh.add_comment(
+        PR, 100, review_comment_body(1, SHA_A, True, ids), created_at="2026-01-01T00:00:00Z"
+    )
+    blocked = _blocked(tmp_path, "mine", gh)
+    hidden = f"R1-F{MAX_LISTED_FINDING_IDS + 1}"
+
+    document = _report(status(gh, blocked, "--json"))
+    [comment] = document["comments"]
+    [other] = document["review_markers"]["shown"]
+    for marker in (comment["marker"], other["marker"]):
+        assert marker["finding_ids"] == ids[:MAX_LISTED_FINDING_IDS]
+        assert marker["finding_ids_total"] == 1000
+    assert hidden not in json.dumps(document)
+
+    out = status(gh, blocked)
+    shown = (
+        ", ".join(ids[:MAX_LISTED_FINDING_IDS]) + f" (the first {MAX_LISTED_FINDING_IDS} of 1000)"
+    )
+    assert out.count(f"findings {shown}") == 2
+    assert hidden not in out
+
+
 # -- the pieces --------------------------------------------------------------------------------
+
+
+def _claim(body: str):
+    from autoforge.claims import REVIEW, scan
+
+    [claim] = scan(REVIEW, body).claims
+    return claim
 
 
 def _k4_record(stage: str, marker_body: str, observed_url: str | None, body: str) -> dict:
@@ -436,45 +763,83 @@ def _k4_record(stage: str, marker_body: str, observed_url: str | None, body: str
     }
 
 
+def test_an_effect_record_observed_at_the_comment_accounts_for_it():
+    """The controller's read-back found exactly this comment carrying its marker with the
+    planned body: a record of the comment itself."""
+    body = review_comment_body(1, SHA_A, False)
+    comment = CommentInfo(id=100, url=comment_url(PR, 100), body=body)
+    state = _state("af-other", Phase.REVIEW, current_pr_url=PR)
+    state.effect_records = [_k4_record("observed", body, comment_url(PR, 100), body)]
+    [evidence] = journal_evidence(state, parse_pr_url(PR), comment, _claim(body))
+    assert evidence.kind == "effect_record" and evidence.journals
+    assert evidence.payload == "same"
+    assert evidence.detail == (
+        "a review_comment effect record (K4) for this comment's marker, observed at this "
+        "comment: that run read it back as the comment it posted; its payload is this "
+        "comment's text byte for byte"
+    )
+
+
 @pytest.mark.parametrize(
     ("stage", "observed", "same_body", "expected"),
     [
         (
+            "intended",
+            None,
+            True,
+            "a review_comment effect record (K4) for this comment's marker, intended: a plan for "
+            "this comment's round, which names no comment; its payload is this comment's text "
+            "byte for byte",
+        ),
+        (
             "attempted",
             None,
             True,
-            "a review_comment effect record (K4), attempted, for this comment's marker; its "
-            "payload is this comment's body byte for byte",
+            "a review_comment effect record (K4) for this comment's marker, attempted: a plan "
+            "for this comment's round, which names no comment; its payload is this comment's "
+            "text byte for byte",
+        ),
+        (
+            "attempted",
+            None,
+            False,
+            "a review_comment effect record (K4) for this comment's marker, attempted: a plan "
+            "for this comment's round, which names no comment; its payload differs from this "
+            "comment's text",
+        ),
+        (
+            "conflict",
+            None,
+            False,
+            "a review_comment effect record (K4) for this comment's marker, conflict: a plan for "
+            "this comment's round, which names no comment; its payload differs from this "
+            "comment's text",
         ),
         (
             "observed",
-            comment_url(PR, 100),
+            comment_url(PR, 99),
             True,
-            "a review_comment effect record (K4), observed, for this comment's marker, observed "
-            "at this comment; its payload is this comment's body byte for byte",
-        ),
-        (
-            "intended",
-            None,
-            False,
-            "a review_comment effect record (K4), intended, for this comment's marker; its "
-            "payload differs from this comment's body",
+            "a review_comment effect record (K4) for this comment's marker, observed: a plan for "
+            f"this comment's round, which names no comment; observed at {comment_url(PR, 99)}; "
+            "its payload is this comment's text byte for byte",
         ),
     ],
 )
-def test_an_effect_record_for_the_comments_marker_accounts_for_it(
+def test_a_plan_for_the_comments_marker_does_not_account_for_it(
     stage, observed, same_body, expected
 ):
+    """R1-F1: a K4 record for the comment's marker that was not observed at it names no
+    comment. A foreign comment posted after the plan was saved carries the same marker,
+    with the planned body or another, so the plan is listed as what it is and never as
+    accounting for the comment, whatever its payload."""
     body = review_comment_body(1, SHA_A, False)
     comment = CommentInfo(id=100, url=comment_url(PR, 100), body=body)
     record = _k4_record(stage, body, observed, body if same_body else body + "x")
     state = _state("af-other", Phase.REVIEW, current_pr_url=PR)
     state.effect_records = [record]
-    from autoforge.claims import REVIEW, scan
-
-    [claim] = scan(REVIEW, body).claims
-    [evidence] = journal_evidence(state, parse_pr_url(PR), comment, claim)
-    assert evidence.kind == "effect_record" and evidence.journals
+    [evidence] = journal_evidence(state, parse_pr_url(PR), comment, _claim(body))
+    assert evidence.kind == "effect_plan" and not evidence.journals
+    assert evidence.payload == ("same" if same_body else "differs")
     assert evidence.detail == expected
 
 
@@ -493,10 +858,7 @@ def test_nothing_else_accounts_for_a_comment():
         _k4_record("observed", other_round, comment_url(PR, 99), other_round),
         {**_k4_record("attempted", body, None, body), "kind": "follow_up_issue"},
     ]
-    from autoforge.claims import REVIEW, scan
-
-    [claim] = scan(REVIEW, body).claims
-    assert journal_evidence(state, parse_pr_url(PR), comment, claim) == ()
+    assert journal_evidence(state, parse_pr_url(PR), comment, _claim(body)) == ()
 
 
 @pytest.mark.parametrize(
@@ -528,7 +890,7 @@ def test_one_line_redacts_flattens_and_bounds():
 
 
 def test_the_module_reads_github_and_never_writes():
-    """Structural: the report calls only the three reads, imports no engine, and the engine
+    """Structural: the report calls only its four reads, imports no engine, and the engine
     does not import it (nothing that decides reads the report)."""
     tree = ast.parse(Path(provenance.__file__).read_text(encoding="utf-8"))
     on_github = {
@@ -538,7 +900,7 @@ def test_the_module_reads_github_and_never_writes():
         and isinstance(node.value, ast.Name)
         and node.value.id == "github"
     }
-    assert on_github == {"get_pr_comments", "get_pr", "get_pr_commits"}
+    assert on_github == {"get_pr_comments", "get_pr", "get_pr_commits", "get_comment_exact"}
     declared = {name for name in vars(provenance.ProvenanceReads) if not name.startswith("_")}
     assert declared == on_github
     imported = {

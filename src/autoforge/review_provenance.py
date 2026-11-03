@@ -12,18 +12,23 @@ module gathers them for ``status``:
 
 - each such comment: when GitHub says it was created, set against this
   run's creation and its most recent reviewer launches (from the run log's
-  ``execution.json``), the login GitHub names, its marker, the digest and
-  length of its body and a bounded excerpt;
+  ``execution.json``), the login GitHub names, its marker (its finding ids
+  bounded), the digest and length of its body and a bounded excerpt of
+  `gh`'s print of it. The digest is of GitHub's text, read exactly where
+  `gh` may have rewritten it, and says so when that text is not known;
 - which state directories on this checkout account for it: every state
   directory found in or directly under the directories the caller names
   (``status`` names the state directory it reads, the configured
   ``state_dir`` and, when the two differ, the directory the first lies in),
-  and every scheduler namespace under the git common dir. A state accounts
-  for the comment with a ``review_comment`` effect record (K4) for the
-  comment's marker or observed at it, or with ``last_review_comment_url``
-  naming it; its ``review_history`` recording the comment's round at the
-  comment's HEAD is listed too, as weaker evidence (a round, not the
-  comment). The states bound to the PR are listed whatever they hold;
+  and every scheduler namespace under the git common dir; a directory that
+  could not be searched is named, and the search is then incomplete. Only
+  a record of the comment itself accounts for it: a ``review_comment``
+  effect record (K4) observed at it, or ``last_review_comment_url`` naming
+  it. A K4 record for the comment's marker that is not observed at it is a
+  plan for its round, which names no comment, and its ``review_history``
+  recording the round at the comment's HEAD is a round too: both are
+  listed as qualified evidence, never as accounting for the comment. The
+  states bound to the PR are listed whatever they hold;
 - the PR's other ``ai-review-result`` markers, with their rounds and HEADs;
 - the commits GitHub lists for the PR committed after the earliest such
   comment, with author and committer identity and the time after it.
@@ -37,7 +42,8 @@ anything that decides: the engine never imports it. It is not a remedy
 either: the block's own reason says what to do.
 
 **Read-only.** GitHub is read through the client handed in (the PR's
-comments; when a comment is found, the PR and its commits), and the local
+comments; when a comment is found, the PR and its commits, and the exact
+read of a comment `gh` printed with a ``^``), and the local
 files through :class:`~autoforge.safefs.SafeRoot` and the strict loaders
 (:func:`~autoforge.state.load_state`, #178's namespace lookup), which
 create, quarantine, lock and write nothing. A read that fails is reported in
@@ -59,7 +65,14 @@ from typing import Protocol
 
 from .claims import IMPLEMENTATION, REVIEW, ReviewClaim, scan
 from .errors import AutoForgeError, ConfigurationError, StateError
-from .github import CommentInfo, CommitPerson, PRCommitInfo, PRInfo
+from .github import (
+    CommentInfo,
+    CommitPerson,
+    PRCommitInfo,
+    PRInfo,
+    gh_may_rewrite,
+    gh_prints_as,
+)
 from .redaction import redact
 from .run_namespace import StateStatus, list_issue_namespaces, load_issue_namespace
 from .runlog import MAX_RUN_LOG_ENTRIES
@@ -75,10 +88,15 @@ MAX_HEADLINE_CHARS = 160
 MAX_IDENTITY_CHARS = 120
 # A read that failed, as the report quotes it.
 MAX_PROBLEM_CHARS = 300
-# How many of the PR's other review markers, and of the commits after the
-# comment, are shown; the report says how many there are.
+# How many of the PR's other review markers, of the commits after the
+# comment and of the finding ids one marker names, are shown; the report says
+# how many there are.
 MAX_LISTED_MARKERS = 40
 MAX_LISTED_COMMITS = 40
+MAX_LISTED_FINDING_IDS = 20
+# At most this many of the comments the round blocks on are read again
+# exactly, when `gh` printed them with a ``^``.
+MAX_EXACT_READS = 10
 # The run's most recent reviewer launches shown.
 MAX_REVIEW_LAUNCHES = 5
 # Entries listed in one directory searched for state directories.
@@ -104,6 +122,8 @@ class ProvenanceReads(Protocol):
     def get_pr(self, url: str) -> PRInfo: ...
 
     def get_pr_commits(self, url: str) -> list[PRCommitInfo]: ...
+
+    def get_comment_exact(self, comment_url: str) -> CommentInfo: ...
 
 
 # -- untrusted text -----------------------------------------------------------------------
@@ -195,12 +215,20 @@ class ScannedState:
 
 @dataclass(frozen=True)
 class StateScan:
-    """Every state directory found on this checkout, and what could not be searched."""
+    """Every state directory found on this checkout, and what could not be searched.
+
+    ``unsearched`` is each directory that should have been searched and was
+    not, with why: a root that could not be opened or listed, or a
+    directory listed under one that could not be opened (no permission, or
+    no longer a directory). A state directory may be in it, so a search with
+    one, an unreadable state or a problem is not :attr:`complete`.
+    """
 
     states: tuple[ScannedState, ...]
     roots: tuple[str, ...]  # the directories searched for standalone state directories
     namespaces_read: bool
     problems: tuple[str, ...]
+    unsearched: tuple[tuple[str, str], ...] = ()
 
     @property
     def loaded(self) -> tuple[ScannedState, ...]:
@@ -209,6 +237,11 @@ class StateScan:
     @property
     def unreadable(self) -> tuple[ScannedState, ...]:
         return tuple(s for s in self.states if s.state is None)
+
+    @property
+    def complete(self) -> bool:
+        """Whether every state directory that could hold a journal was read."""
+        return not (self.unreadable or self.unsearched or self.problems)
 
 
 def _load_in(root: SafeRoot) -> tuple[AutoForgeState | None, str]:
@@ -233,8 +266,10 @@ def scan_state_dirs(
 
     The standalone ones are each of ``roots`` that holds a ``state.json``,
     and every directory directly under one of them that does; links are
-    never followed, and a directory holding more than
-    :data:`MAX_DIR_ENTRIES` entries is reported, not searched. The scheduler
+    never followed. A root that cannot be opened or listed, one holding
+    more than :data:`MAX_DIR_ENTRIES` entries, and a directory listed under
+    one that cannot be opened are reported as not searched, never skipped
+    in silence: a state directory may be there. The scheduler
     namespaces are every issue namespace under ``coordination_root``
     (``None`` outside a git repository, ``coordination_problem`` saying
     why). ``current`` is the state already loaded from ``current_dir``: it is
@@ -243,6 +278,7 @@ def scan_state_dirs(
     """
     states: list[ScannedState] = []
     problems: list[str] = []
+    unsearched: list[tuple[str, str]] = []
     seen: set[tuple[int, int]] = set()
     seen_paths: set[str] = set()
     try:
@@ -259,7 +295,7 @@ def scan_state_dirs(
         seen.add(root.identity)
         try:
             state, problem = _load_in(root)
-        except StateError as exc:
+        except (StateError, OSError) as exc:
             state, problem = None, _problem(exc)
         if state is not None or problem:
             seen_paths.add(str(Path(root.path).resolve()))
@@ -276,7 +312,7 @@ def scan_state_dirs(
         except FileNotFoundError:
             continue
         except (StateError, OSError) as exc:
-            problems.append(f"{path}: {_problem(exc)}")
+            unsearched.append((str(path), _problem(exc)))
             continue
         with root:
             consider(root)
@@ -287,21 +323,25 @@ def scan_state_dirs(
                     if entry.is_dir:
                         names.append(entry.name)
             except WalkBudgetExceeded:
-                problems.append(
-                    f"{path} holds more than {MAX_DIR_ENTRIES} entries; the directories under "
-                    "it were not searched"
+                unsearched.append(
+                    (
+                        str(path),
+                        f"it holds more than {MAX_DIR_ENTRIES} entries, so the directories in "
+                        "it were not searched",
+                    )
                 )
-            except StateError as exc:
-                problems.append(f"{path}: {_problem(exc)}")
+            except (StateError, OSError) as exc:
+                unsearched.append((str(path), f"it could not be listed: {_problem(exc)}"))
             for name in sorted(names):
                 try:
                     with root.subroot(name) as sub:
                         consider(sub)
                 except FileNotFoundError:
-                    continue
-                except (StateError, OSError):
-                    # Not a directory status could open: no state directory it can name.
-                    continue
+                    continue  # removed since it was listed: nothing is there to search
+                except (StateError, OSError) as exc:
+                    # Listed as a directory and not opened: no permission, or no
+                    # longer a directory. A state directory may be there.
+                    unsearched.append((str(root.path / name), _problem(exc)))
 
     namespaces_read = False
     if coordination_root is None:
@@ -333,27 +373,162 @@ def scan_state_dirs(
                 elif lookup.state.status is StateStatus.CORRUPT:
                     reason = one_line(lookup.state.reason, MAX_PROBLEM_CHARS)
                     states.append(ScannedState(where, namespace.issue_number, None, reason))
-    return StateScan(tuple(states), tuple(searched), namespaces_read, tuple(problems))
+    return StateScan(
+        tuple(states), tuple(searched), namespaces_read, tuple(problems), tuple(unsearched)
+    )
 
 
 # -- what one state holds about a comment -------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class Evidence:
-    """One thing a state holds about a comment."""
-
-    kind: str  # "effect_record" | "last_review_comment_url" | "review_history"
-    detail: str
-
-    @property
-    def journals(self) -> bool:
-        """Whether this accounts for the comment itself, not only for its round."""
-        return self.kind != "review_history"
+# How an effect record's payload compares with a comment's text (:meth:`BodyRead.compare`).
+SAME = "same"
+DIFFERS = "differs"
+UNKNOWN = "unknown"
 
 
 def _sha256(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class BodyRead:
+    """A comment's body: `gh`'s print of it, and GitHub's text when that is known.
+
+    `gh` prints every body through its sanitizer, which rewrites a control
+    character, and the literal text of its JSON escape, into caret notation
+    and cannot be undone (#327, #328), so a digest or a comparison of the
+    print is not one of GitHub's text. ``held`` is GitHub's text byte for
+    byte: the print itself when it holds no ``^`` (:func:`gh_may_rewrite`),
+    else the comment's exact read (``exact_read``) when the print is that
+    text's (:func:`gh_prints_as`). It is ``None`` when the exact read was not
+    made, failed, or found another version of the comment (``changed``),
+    ``problem`` saying which: the digest shown is then the print's, and no
+    text is judged equal to the comment's. Only the print is ever quoted;
+    the exact text is digested and compared, never shown.
+    """
+
+    printed: str
+    held: str | None
+    exact_read: bool = False
+    changed: bool = False
+    problem: str = ""
+
+    @classmethod
+    def of_print(cls, printed: str, problem: str = "") -> BodyRead:
+        """The body from `gh`'s print alone: GitHub's text when it holds no ``^``."""
+        printed = printed or ""
+        if not gh_may_rewrite(printed):
+            return cls(printed, printed)
+        return cls(printed, None, problem=problem or "it was not read exactly")
+
+    @property
+    def exact(self) -> bool:
+        return self.held is not None
+
+    @property
+    def sha256(self) -> str:
+        """The digest of GitHub's text, or of the print when that is not known."""
+        return _sha256(self.held if self.held is not None else self.printed)
+
+    @property
+    def chars(self) -> int:
+        return len(self.held if self.held is not None else self.printed)
+
+    def compare(self, payload: str) -> str:
+        """``payload`` against GitHub's text: :data:`SAME`, :data:`DIFFERS` or :data:`UNKNOWN`.
+
+        Byte for byte when GitHub's text is known. Otherwise a payload that
+        `gh` would not print as it printed the comment differs from it,
+        and any other is not known to be the comment's text or not; so is
+        every payload when the comment changed between the two reads.
+        """
+        if self.held is not None:
+            return SAME if payload == self.held else DIFFERS
+        if self.changed or gh_prints_as(payload, self.printed):
+            return UNKNOWN
+        return DIFFERS
+
+    def document(self) -> dict:
+        return {
+            "exact": self.exact,
+            "read": "exact_read" if self.exact_read else "listing",
+            "sha256": self.sha256,
+            "chars": self.chars,
+            "problem": self.problem,
+        }
+
+    def text(self) -> str:
+        """The body line's digest and what it is a digest of."""
+        if self.held is None:
+            return (
+                f"{self.chars} characters, sha256 {self.sha256} of gh's print of it, which may "
+                f"not be GitHub's text ({self.problem})"
+            )
+        how = "read exactly" if self.exact_read else "gh printed it unchanged"
+        return f"{self.chars} characters, sha256 {self.sha256} (GitHub's text, {how})"
+
+
+def read_body(github: ProvenanceReads, comment: CommentInfo, *, may_read: bool) -> BodyRead:
+    """``comment``'s body, read again exactly when `gh` printed it with a ``^``.
+
+    ``may_read`` False reads nothing more (the bound of
+    :data:`MAX_EXACT_READS` is reached). A failed exact read is inconclusive,
+    never raised: the report says so.
+    """
+    printed = comment.body or ""
+    if not gh_may_rewrite(printed):
+        return BodyRead(printed, printed)
+    if not may_read:
+        return BodyRead.of_print(
+            printed,
+            f"it was not read exactly: at most {MAX_EXACT_READS} comments are",
+        )
+    try:
+        held = github.get_comment_exact(comment.url).body
+    except AutoForgeError as exc:
+        return BodyRead.of_print(printed, f"its exact read failed: {_problem(exc)}")
+    if not gh_prints_as(held, printed):
+        return BodyRead(
+            printed,
+            None,
+            changed=True,
+            problem="it changed between gh's listing and its exact read",
+        )
+    return BodyRead(printed, held, exact_read=True)
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """One thing a state holds about a comment.
+
+    ``effect_record`` and ``last_review_comment_url`` name the comment
+    itself and account for it (:attr:`journals`). ``effect_plan`` (a K4
+    record for the comment's marker not observed at it) and
+    ``review_history`` are about its round: another comment carrying the
+    marker is just as consistent with them. ``payload`` is an effect
+    record's payload against the comment's text (:meth:`BodyRead.compare`).
+    """
+
+    kind: str  # "effect_record" | "last_review_comment_url" | "effect_plan" | "review_history"
+    detail: str
+    payload: str = ""
+
+    @property
+    def journals(self) -> bool:
+        """Whether this accounts for the comment itself, not only for its round."""
+        return self.kind in ("effect_record", "last_review_comment_url")
+
+    def document(self) -> dict:
+        return {"kind": self.kind, "detail": self.detail, "payload": self.payload or None}
+
+
+_PAYLOAD_TEXT = {
+    SAME: "its payload is this comment's text byte for byte",
+    DIFFERS: "its payload differs from this comment's text",
+    UNKNOWN: "whether its payload is this comment's text is not known, since GitHub's text of "
+    "the comment is not (see its body line)",
+}
 
 
 def _same_comment(url: str, other: str) -> bool:
@@ -377,10 +552,25 @@ def journal_evidence(
     pr: GitHubPullRequestRef,
     comment: CommentInfo,
     claim: ReviewClaim | None,
+    body: BodyRead | None = None,
 ) -> tuple[Evidence, ...]:
-    """What ``state`` holds that accounts for ``comment`` (``claim`` its marker, if readable)."""
+    """What ``state`` holds about ``comment`` (``claim`` its marker, if readable).
+
+    Only a record of the comment itself accounts for it: a K4 record the
+    controller observed at it (its read-back found exactly this comment
+    carrying the marker, with the planned body), or ``last_review_comment_url``
+    naming it. A K4 record for the comment's marker that is not observed at
+    it (``intended``, ``attempted``, a ``conflict``, or observed at another
+    comment) is a plan for the comment's round and names no comment: a
+    foreign comment posted after it was saved carries the same marker, with
+    the planned body or another. It is listed as qualified evidence
+    (``effect_plan``), as is ``review_history`` recording the round at the
+    comment's HEAD, and neither accounts for the comment. A payload is
+    compared with GitHub's text when ``body`` knows it (``None``: the
+    comment's print alone, read no further).
+    """
+    body = body if body is not None else BodyRead.of_print(comment.body)
     found: list[Evidence] = []
-    digest = _sha256(comment.body)
     for raw in state.effect_records if isinstance(state.effect_records, list) else ():
         if not isinstance(raw, dict) or raw.get("kind") != _K4_KIND:
             continue
@@ -389,29 +579,40 @@ def journal_evidence(
             continue
         observed = raw.get("observed")
         observed_url = observed.get("url", "") if isinstance(observed, dict) else ""
-        at_comment = isinstance(observed_url, str) and _same_comment(observed_url, comment.url)
+        if not isinstance(observed_url, str):
+            observed_url = ""
+        at_comment = bool(observed_url) and _same_comment(observed_url, comment.url)
         marker = identity.get("marker")
         keys = {c.key for c in scan(REVIEW, marker).claims} if isinstance(marker, str) else set()
         same_key = claim is not None and claim.key in keys
         if not (at_comment or same_key):
             continue
-        stage = one_line(str(raw.get("stage", "?")), 40)
-        detail = f"a review_comment effect record (K4), {stage}, for "
-        detail += "this comment's marker" if same_key else "another marker"
-        if at_comment:
-            detail += ", observed at this comment"
-        elif isinstance(observed_url, str) and observed_url:
-            detail += f", observed at {one_line(observed_url, MAX_PROBLEM_CHARS)}"
-        payload = raw.get("payload")
-        body = payload.get("body") if isinstance(payload, dict) else None
-        if isinstance(body, str):
-            same = _sha256(body) == digest
-            detail += "; its payload " + (
-                "is this comment's body byte for byte"
-                if same
-                else "differs from this comment's body"
+        stage = raw.get("stage")
+        marker_text = "this comment's marker" if same_key else "another marker"
+        if at_comment and stage == "observed":
+            kind = "effect_record"
+            detail = (
+                f"a review_comment effect record (K4) for {marker_text}, observed at this "
+                "comment: that run read it back as the comment it posted"
             )
-        found.append(Evidence("effect_record", detail))
+        else:
+            kind = "effect_plan"
+            round_text = "this comment's round" if same_key else "another round"
+            detail = (
+                f"a review_comment effect record (K4) for {marker_text}, "
+                f"{one_line(str(stage or '?'), 40)}: a plan for {round_text}, which names no "
+                "comment"
+            )
+            if observed_url:
+                where = "this comment" if at_comment else one_line(observed_url, MAX_PROBLEM_CHARS)
+                detail += f"; observed at {where}"
+        payload = raw.get("payload")
+        planned = payload.get("body") if isinstance(payload, dict) else None
+        verdict = ""
+        if isinstance(planned, str):
+            verdict = body.compare(planned)
+            detail += "; " + _PAYLOAD_TEXT[verdict]
+        found.append(Evidence(kind, detail, verdict))
     if state.last_review_comment_url and _same_comment(state.last_review_comment_url, comment.url):
         found.append(
             Evidence(
@@ -459,7 +660,7 @@ class JournalMatch:
             "run_id": state.run_id,
             "phase": state.phase.value,
             "journaled": self.journaled,
-            "evidence": [{"kind": e.kind, "detail": e.detail} for e in self.evidence],
+            "evidence": [e.document() for e in self.evidence],
         }
 
 
@@ -475,16 +676,32 @@ class Launch:
 
 
 def _claim_document(claim: ReviewClaim | None) -> dict | None:
+    """A marker's fields, its finding ids bounded (:data:`MAX_LISTED_FINDING_IDS`) and counted.
+
+    The decoder bounds each id and the base ref, never how many ids a marker
+    names: an untrusted comment's whole list is not the report's to repeat.
+    """
     if claim is None:
         return None
+    ids = claim.finding_ids
     return {
         "round": claim.round,
         "reviewed_head_sha": claim.reviewed_head_sha,
         "reviewed_base_ref": claim.reviewed_base_ref,
         "reviewed_merge_base_sha": claim.reviewed_merge_base_sha,
         "needs_fix_round": claim.needs_fix_round,
-        "finding_ids": list(claim.finding_ids) if claim.finding_ids is not None else None,
+        "finding_ids": list(ids[:MAX_LISTED_FINDING_IDS]) if ids is not None else None,
+        "finding_ids_total": len(ids) if ids is not None else None,
     }
+
+
+def _findings_text(ids: tuple[str, ...] | None) -> str:
+    if not ids:
+        return "none"
+    shown = ", ".join(ids[:MAX_LISTED_FINDING_IDS])
+    if len(ids) > MAX_LISTED_FINDING_IDS:
+        shown += f" (the first {MAX_LISTED_FINDING_IDS} of {len(ids)})"
+    return shown
 
 
 def _claim_text(claim: ReviewClaim | None) -> str:
@@ -492,7 +709,7 @@ def _claim_text(claim: ReviewClaim | None) -> str:
         return "no readable marker"
     base = repr(claim.reviewed_base_ref) if claim.reviewed_base_ref is not None else "(none)"
     merge_base = (claim.reviewed_merge_base_sha or "")[:12] or "(none)"
-    findings = ", ".join(claim.finding_ids or ()) or "none"
+    findings = _findings_text(claim.finding_ids)
     return (
         f"round {claim.round} at HEAD {claim.reviewed_head_sha[:12]} on base {base} from merge "
         f"base {merge_base}, needs_fix_round {str(claim.needs_fix_round).lower()}, findings "
@@ -526,14 +743,13 @@ class RoundComment:
     journals: tuple[JournalMatch, ...]
     seconds_after_run_created: int | None
     seconds_after_launches: tuple[tuple[str, int | None], ...]
+    body: BodyRead
 
     def document(self) -> dict:
-        comment = self.marked.comment
         return {
             **self.marked.document(),
-            "body_sha256": _sha256(comment.body),
-            "body_chars": len(comment.body or ""),
-            "excerpt": one_line(comment.body, MAX_EXCERPT_CHARS),
+            "body": self.body.document(),
+            "excerpt": one_line(self.body.printed, MAX_EXCERPT_CHARS),
             "seconds_after_run_created": self.seconds_after_run_created,
             "seconds_after_launches": [
                 {"step": step, "seconds": seconds} for step, seconds in self.seconds_after_launches
@@ -595,9 +811,14 @@ class ProvenanceReport:
                 "read": len(scan_.loaded) if scan_ else 0,
                 "searched": list(scan_.roots) if scan_ else [],
                 "namespaces_read": scan_.namespaces_read if scan_ else False,
+                "complete": scan_.complete if scan_ else False,
                 "unreadable": [
                     {"state_dir": s.state_dir, "problem": s.problem}
                     for s in (scan_.unreadable if scan_ else ())
+                ],
+                "unsearched": [
+                    {"path": where, "problem": why}
+                    for where, why in (scan_.unsearched if scan_ else ())
                 ],
                 "problems": list(scan_.problems) if scan_ else [],
                 "bound_to_pr": [_state_on_pr(s) for s in self.states_on_pr],
@@ -683,15 +904,19 @@ class ProvenanceReport:
         for defect in item.marked.defects:
             lines.append(f"    defect:    {one_line(defect, MAX_PROBLEM_CHARS)}")
         lines.append(
-            f"    body:      {len(comment.body or '')} characters, sha256 "
-            f"{_sha256(comment.body)}; begins: {one_line(comment.body, MAX_EXCERPT_CHARS)!r}"
+            f"    body:      {item.body.text()}; begins (as gh printed it): "
+            f"{one_line(item.body.printed, MAX_EXCERPT_CHARS)!r}"
         )
         journaled = [m for m in item.journals if m.journaled]
         if not journaled:
             read = len(self.scan.loaded) if self.scan else 0
-            lines.append(
-                f"    journal:   none of the {read} state directories read accounts for it"
-            )
+            text = f"    journal:   none of the {read} state directories read accounts for it"
+            if self.scan is not None and not self.scan.complete:
+                text += (
+                    "; the search was incomplete (see 'unreadable' and 'not searched' below), so "
+                    "a state directory that does may not have been read"
+                )
+            lines.append(text)
         for match in item.journals:
             state = match.scanned.state
             assert state is not None
@@ -716,6 +941,8 @@ class ProvenanceReport:
         ]
         for scanned in scan_.unreadable:
             lines.append(f"    unreadable: {scanned.state_dir}: {scanned.problem}")
+        for where, why in scan_.unsearched:
+            lines.append(f"    not searched: {where}: {why}")
         for problem in scan_.problems:
             lines.append(f"    not searched: {problem}")
         for scanned in self.states_on_pr:
@@ -889,9 +1116,13 @@ def unjournaled_review_report(
     Nothing to report: the run is not :func:`applies`, or no comment of the
     PR carries this round's marker at the bound HEAD, base and merge base,
     or an unreadable ``ai-review-result`` marker, that ``state`` itself does
-    not account for. Those are the comments the REVIEW entry and its
-    post-review read block on (ADR 0004 D9.6). A failed comment read is a
-    report that says so.
+    not account for (:func:`journal_evidence`). Those are the comments the
+    REVIEW entry and its post-review read block on (ADR 0004 D9.6), and one
+    the run's own saved plan for the round reads back as a conflict: a plan
+    names no comment, so it accounts for none, and the report lists it as a
+    plan. A body `gh` printed with a ``^`` is read again exactly (at most
+    :data:`MAX_EXACT_READS` of them). A failed comment read is a report that
+    says so.
     """
     if not applies(state):
         return None
@@ -926,11 +1157,16 @@ def unjournaled_review_report(
         coordination_problem=coordination_problem,
     )
     round_comments = []
+    exact_reads = 0
     for m in blocking:
+        may_read = exact_reads < MAX_EXACT_READS
+        if may_read and gh_may_rewrite(m.comment.body or ""):
+            exact_reads += 1  # read_body makes it, whether it succeeds or not
+        body = read_body(github, m.comment, may_read=may_read)
         matches = []
         for scanned in scan_.loaded:
             assert scanned.state is not None
-            evidence = journal_evidence(scanned.state, pr, m.comment, m.claim)
+            evidence = journal_evidence(scanned.state, pr, m.comment, m.claim, body)
             if evidence:
                 matches.append(JournalMatch(scanned, evidence))
         round_comments.append(
@@ -942,6 +1178,7 @@ def unjournaled_review_report(
                     (launch.step, seconds_between(launch.started_at, m.comment.created_at))
                     for launch in launches
                 ),
+                body,
             )
         )
     on_pr = tuple(
@@ -1022,10 +1259,13 @@ __all__ = [
     "MAX_EXCERPT_CHARS",
     "MAX_HEADLINE_CHARS",
     "MAX_IDENTITY_CHARS",
+    "MAX_EXACT_READS",
     "MAX_LISTED_COMMITS",
+    "MAX_LISTED_FINDING_IDS",
     "MAX_LISTED_MARKERS",
     "MAX_REVIEW_LAUNCHES",
     "NOTE",
+    "BodyRead",
     "Evidence",
     "JournalMatch",
     "Launch",
@@ -1039,6 +1279,7 @@ __all__ = [
     "journal_evidence",
     "offset_text",
     "one_line",
+    "read_body",
     "reviewer_launches",
     "scan_state_dirs",
     "seconds_between",
