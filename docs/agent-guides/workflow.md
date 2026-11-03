@@ -104,7 +104,13 @@ naming another PR raises a `VerificationError` with the phase and the
 state file unchanged, as a failed read does, so `resume` exits 1 instead of
 printing the banner. Because `resume` may launch the reviewer from here,
 it passes the recorded-configuration check of **Re-entering a phase**
-first, as `step` always did.
+first, as `step` always did. The same read checks the PR's owner before
+its revision (#414, PR #459 R3-F2): a marker naming another run, one that
+cannot be read, or the removal of an owner the run knew takes
+`READY_FOR_MERGE -> BLOCKED` (`pr-owner`), moved or not, never `REVIEW`.
+`step` and `resume` both read before the step is charged, so a hold takes
+no step; a hold whose read found a marker naming a run saves
+`owned_pr_url` and nothing else.
 
 `MERGE -> ANALYZE_EXECUTE` and `MERGE -> DONE` are declared in `LEGAL_EDGES`
 but reserved: `decide_next_phase` never chooses them, because EPIC batching

@@ -1037,7 +1037,15 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   owner again before each record of its plan after the first (follow-up
   issues, marker appends, acceptance comments), and the replan before a
   `PREPARED` transaction launches its agent on a later entry and before
-  each record of its saved push and PR plan (PR #459 R1-F2, R1-F4);
+  each record of its saved push and PR plan (PR #459 R1-F2, R1-F4).
+  `ANALYZE_EXECUTE` reads every PR headed at `autoforge/<n>` before each
+  record of its saved push and PR plan still pending, on the step that
+  saved it and on every resume, so an owner written into the PR it adopts
+  (or a marked PR opened on the branch) after the plan was saved refuses
+  the push, which K1's lease alone lets through (PR #459 R3-F1). The closed
+  merge gate's read of a run held at `READY_FOR_MERGE` (`step`, `resume`,
+  `epic recheck`) checks the owner before the revision: a refusal blocks,
+  moved or not, and never routes the PR to `REVIEW` (PR #459 R3-F2);
 - an ownerless marker (a PR opened before #414) and no marker leave the
   bound run driving its own PR, as before, only on a legacy binding: once
   the state records the PR as owned (`owned_pr_url`: it published the PR,
@@ -1050,7 +1058,8 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a):
   crash in that window blocks (K2, K3) or rejects the transaction (K7)
   before the PR is bound, the source closed or the replacement activated
   (PR #459 R2-F1). A refused `unblock` whose read of the bound PR found a
-  marker naming a run saves that it did (PR #459 R2-F2);
+  marker naming a run saves that it did (PR #459 R2-F2), and so does the
+  closed merge gate's hold, which takes no step (PR #459 R3-F2);
 - a takeover is the operator's: stop the owning run, replace the marker in
   the PR body with the one the refusal names, then `unblock --take-over
   <PR>` binds it and enters `REVIEW`. The controller writes no marker of its

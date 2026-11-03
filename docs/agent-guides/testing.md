@@ -523,7 +523,25 @@ High-priority coverage includes:
   still binds its ownerless PR as legacy. A refused `unblock` whose read
   found another run's marker saves `owned_pr_url` and nothing else, a dry
   run saves nothing, and after the owner is removed a new process still
-  refuses (PR #459 R2-F2; `tests/test_unblock.py`)
+  refuses (PR #459 R2-F2; `tests/test_unblock.py`). A saved
+  `ANALYZE_EXECUTE` plan reads the PRs on its branch before each pending
+  record (PR #459 R3-F1): a crash after the K1 + K3 plan's save, then
+  another run's marker or an unreadable one written into the PR to adopt
+  at an unchanged HEAD, blocks the resume and a plain unblock's re-entry
+  (`pr-owner`) with the branch unmoved, nothing written or launched and
+  the plan kept, which completes once the marker is removed; the same
+  over a K1 + K2 plan, with such a PR opened on the branch at its head,
+  pushes and creates nothing; and a crash after K1 was observed writes
+  nothing into a PR taken since. The closed merge gate's read (PR #459
+  R3-F2), through `step` and `run(recheck_held=True)`, blocks a legacy
+  binding whose PR another run owns or whose marker cannot be read,
+  unmoved or moved, routing nothing and recording the owner it read; a
+  run so displaced stays refused by `unblock` and `resume` in a new
+  process after the owner is removed; a hold whose read found this run's
+  marker saves `owned_pr_url` and nothing else (no step charged), and a
+  later removal then blocks; a dry run reads and writes nothing; and
+  `epic recheck` of a moved PR another run took over exits 1 with a
+  `pr-owner` stop (`tests/test_epic_commands.py`)
 - the removal's closure (ADR 0009 D12 S4; #389;
   `tests/test_removal_attestation.py`, `tests/test_packaging.py`):
   Appendix C.6 attests every invariant of A.2.4 in its words, each with

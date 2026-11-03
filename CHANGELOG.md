@@ -22,7 +22,13 @@ A run whose PR was handed to another run blocks at its next `REVIEW`, `FIX`
 or merge-gate entry. `REVIEW` checks again right before it posts its round
 comment, `FIX` before each follow-up issue, marker append and acceptance
 comment after its first, and a replan before it launches its agent again
-and before each push and replacement PR of its saved plan.
+and before each push and replacement PR of its saved plan. A run resuming
+its saved `ANALYZE_EXECUTE` push and PR plan reads the PRs on its branch
+first, so it pushes nothing into a PR someone gave another run's marker
+after the plan was saved. A run held at `READY_FOR_MERGE` with the merge
+gate closed checks the owner on the same read `step`, `resume` and `epic
+recheck` make of the PR's revision: a PR another run owns blocks it, even
+when the PR moved, instead of sending it back to `REVIEW`.
 
 To hand a PR to a new run: stop the run that owns it, replace the marker in
 the PR body with the one the refusal names, then run `autoforge unblock
@@ -39,7 +45,8 @@ that its own agent opened it.
 
 A run records in `state.json` when its PR's marker has named an owner
 (`owned_pr_url`): it published the PR, took it over, or read a marker
-naming a run on it, including on an `unblock` that refuses. From then on a
+naming a run on it, including on an `unblock` that refuses and on the
+closed merge gate's read of a held run. From then on a
 marker that names no run, a missing marker and a PR body that reads empty
 block it (`pr-owner`), because the owner was removed and which run owns
 the PR is not knowable. A run that crashed after opening its PR or a replan

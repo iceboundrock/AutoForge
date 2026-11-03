@@ -902,7 +902,7 @@ Each implementation PR the controller opens or adopts names its run in its
 `ai-implementation` marker: `<!-- ai-implementation: {"issue": "...",
 "owner_run_id": "af-..."} -->` (#414). A run drives only a PR it recorded
 itself while that marker names it (or names no run: a PR opened before
-#414, bound by a run that never saw an owner on it). Three cases stop a run
+#414, bound by a run that never saw an owner on it). Four cases stop a run
 with `BLOCKED` and `pr-owner`, before anything is launched or written.
 
 - **A run that has no record of the issue's PR.** It may be a new
@@ -915,11 +915,19 @@ with `BLOCKED` and `pr-owner`, before anything is launched or written.
 - **A run whose PR another run took over.** It stops at its next phase
   entry, before the review comment is posted, before each thing `FIX`
   sends, before a replan launches its agent or sends its push or
-  replacement PR, and at the merge gate. A plain `unblock` refuses for as
-  long as the marker names the other run.
+  replacement PR, and at the merge gate, the closed gate's read by `step`,
+  `resume` and `epic recheck` included, even when the PR moved. A plain
+  `unblock` refuses for as long as the marker names the other run.
+- **A run resuming its own saved publication.** A run that stopped after
+  saving its `ANALYZE_EXECUTE` push and PR plan, before sending all of it,
+  reads the PRs on `autoforge/<n>` first. One whose marker names another
+  run, or cannot be read, stops it before the push or the PR body write.
+  If no other run is to drive it, remove that marker from the PR body,
+  then a plain `unblock` completes the plan from where it stopped.
 - **A run whose PR's owner was removed.** Once a run has seen its PR's
   marker name an owner (it opened the PR, took it over, or read a marker
-  naming any run on it, a refused `unblock`'s read included),
+  naming any run on it, a refused `unblock`'s read and a held
+  `READY_FOR_MERGE` run's read included),
   `state.json` records that (`owned_pr_url`). If someone then removes the
   owner from the marker, removes the marker, or GitHub returns the PR body
   empty, the run stops: which run owns the PR is no longer knowable. The

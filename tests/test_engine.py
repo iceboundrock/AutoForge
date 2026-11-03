@@ -2407,6 +2407,168 @@ def test_a_legacy_k2_record_still_binds_its_ownerless_pr(tmp_state_dir, fake_git
     assert eng2.provider.calls == []
 
 
+# -- an owner written over a saved plan before it was sent (PR #459 R3-F1) -------------
+# The body of a PR on ``autoforge/2`` once someone wrote an owner into it, and
+# what the refusal says of it.
+_OWNERS_WRITTEN_SINCE = [
+    pytest.param(
+        f"Started by hand.\n\n{implementation_pr_body(owner_run_id=OTHER_RUN)}",
+        f"names run {OTHER_RUN} as its owner, not this run",
+        id="another-run",
+    ),
+    pytest.param(
+        'Started by hand.\n\n<!-- ai-implementation: {"issue": 2} -->',
+        "carries an implementation marker that cannot be read",
+        id="unreadable",
+    ),
+]
+
+
+def _plan_saved_then_crashed(eng, monkeypatch) -> None:
+    """The ANALYZE_EXECUTE step saves its push and PR plan, and the process dies."""
+    from autoforge.engine import ControllerEngine
+
+    with monkeypatch.context() as patched:
+        patched.setattr(ControllerEngine, "_complete_analyze", _crash)
+        with pytest.raises(KeyboardInterrupt):
+            eng.step()
+
+
+def _refused_for_the_branch_pr_owner(eng, out, url: str, found: str, record: str) -> None:
+    """The plan's ``record`` was refused over ``url``'s owner: nothing sent, the plan kept."""
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert found in reason
+    assert (
+        f"PR {url} is headed at 'autoforge/2', where this run's journaled plan publishes: "
+        f"{record} was not sent, and the plan stays journaled"
+    ) in reason
+    assert "remove that marker from the PR body, then 'unblock'" in reason
+    s = load_state(eng.paths.state_file)
+    assert (s.phase, s.current_pr_url, s.owned_pr_url) == (Phase.BLOCKED, "", "")
+    assert [r["stage"] for r in s.effect_records] == ["intended", "intended"]
+
+
+@pytest.mark.parametrize(("body", "found"), _OWNERS_WRITTEN_SINCE)
+def test_a_saved_adoption_plan_pushes_nothing_into_a_pr_another_run_took_since(
+    tmp_state_dir, fake_github, monkeypatch, body, found
+):
+    """PR #459 R3-F1: the K1 + K3 plan adopting the unmarked PR on the branch
+    is saved, and the process dies before anything is sent. Someone then
+    writes another run's marker into that PR (or one that cannot be read),
+    leaving its HEAD alone, so the push's lease still holds. Before R3-F1 the
+    resume pushed the candidate into the PR and only K3 blocked. The PRs on
+    the branch are read for their owner before the push: the resume and a
+    plain unblock's re-entry block with the branch where it was, nothing
+    written and nothing launched, keeping the plan; once the marker is gone,
+    the plan completes from the journal."""
+    eng, earlier = _adopting(tmp_state_dir, fake_github)
+    pushes = _logs_pushes(eng.origin)
+    _plan_saved_then_crashed(eng, monkeypatch)
+    candidate = _worktree_head(eng.provider.calls[0])
+    fake_github.prs[PR41].body = body
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    record = "push effect 0 on refs/heads/autoforge/2"
+    _refused_for_the_branch_pr_owner(eng2, eng2.step(), PR41, found, record)
+    assert eng2.unblock("the owner is checked").phase == "ANALYZE_EXECUTE"
+    _refused_for_the_branch_pr_owner(eng2, eng2.step(), PR41, found, record)
+    assert eng.origin.head("autoforge/2") == earlier == fake_github.prs[PR41].head_sha
+    assert _pushes(pushes) == [] and fake_github.effect_writes == []
+    assert fake_github.prs[PR41].body == body and eng2.provider.calls == []
+
+    fake_github.prs[PR41].body = "Started by hand."
+    assert eng2.unblock("the marker is removed").phase == "ANALYZE_EXECUTE"
+    _adopted_once(eng2, eng2.step(), fake_github, candidate)
+    assert _pushes(pushes) == [f"refs/heads/autoforge/2 {candidate}"]
+
+
+@pytest.mark.parametrize(("body", "found"), _OWNERS_WRITTEN_SINCE)
+def test_a_saved_pr_plan_pushes_nothing_under_a_pr_another_run_opened_on_the_branch(
+    tmp_state_dir, fake_github, monkeypatch, body, found
+):
+    """PR #459 R3-F1, K2's equivalent: the K1 + K2 plan over the branch's
+    earlier work is saved, and the process dies before anything is sent. A
+    PR carrying another run's marker (or one that cannot be read) is then
+    opened on the branch at that very head, so the push's lease holds. The
+    resume pushes nothing under that PR and opens none beside it."""
+    eng = make_engine(tmp_state_dir, _from_start, github=fake_github, origin=True)
+    earlier = _earlier_work(eng)
+    assert eng.step().next_phase == "ANALYZE_EXECUTE"
+    pushes = _logs_pushes(eng.origin)
+    _plan_saved_then_crashed(eng, monkeypatch)
+    data = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    assert [r["kind"] for r in data["effect_records"]] == ["push", "implementation_pr"]
+    fake_github.add_pr(PR41, head_sha=earlier, branch="autoforge/2", body=body)
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    record = "push effect 0 on refs/heads/autoforge/2"
+    _refused_for_the_branch_pr_owner(eng2, eng2.step(), PR41, found, record)
+    assert eng.origin.head("autoforge/2") == earlier and _pushes(pushes) == []
+    assert fake_github.effect_writes == [] and PR not in fake_github.prs
+    assert eng2.provider.calls == []
+
+
+def test_an_attempted_push_is_not_sent_again_into_a_pr_another_run_took_since(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R3-F1 at K1's ``attempted`` window: the process died once the
+    push's attempt was saved, before git ran. The owner written into the PR
+    since is read before the push is reconciled, so it is not sent again,
+    and the reason says so."""
+    eng, earlier = _adopting(tmp_state_dir, fake_github)
+    pushes = _logs_pushes(eng.origin)
+    _power_loss_at(eng, EffectKind.PUSH, Stage.ATTEMPTED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    _owned_by(fake_github, OTHER_RUN, PR41)
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert (
+        "push effect 0 on refs/heads/autoforge/2 was not sent again, and the plan stays journaled"
+    ) in eng2.state.block_reason
+    s = load_state(eng2.paths.state_file)
+    assert [(r["kind"], r["stage"]) for r in s.effect_records] == [
+        ("push", "attempted"),
+        ("adopt_pr", "intended"),
+    ]
+    assert eng.origin.head("autoforge/2") == earlier and _pushes(pushes) == []
+    assert fake_github.effect_writes == [] and eng2.provider.calls == []
+
+
+def test_a_pushed_adoption_plan_writes_nothing_into_a_pr_another_run_took_since(
+    tmp_state_dir, fake_github
+):
+    """PR #459 R3-F1, the boundary after the push: K1 landed and was observed,
+    and the process died before K3 wrote the PR's body. Another run's marker
+    written into the PR since is read before K3: its body is not written,
+    and the run blocks with K3 still journaled."""
+    eng, _ = _adopting(tmp_state_dir, fake_github)
+    _power_loss_at(eng, EffectKind.PUSH, Stage.OBSERVED, saved=True)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    candidate = _worktree_head(eng.provider.calls[0])
+    body = f"Started by hand.\n\n{implementation_pr_body(owner_run_id=OTHER_RUN)}"
+    fake_github.prs[PR41].body = body
+
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    out = eng2.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert f"adopt_pr effect 1 on {PR41} was not sent" in eng2.state.block_reason
+    s = load_state(eng2.paths.state_file)
+    assert [(r["kind"], r["stage"]) for r in s.effect_records] == [
+        ("push", "observed"),
+        ("adopt_pr", "intended"),
+    ]
+    assert fake_github.prs[PR41].body == body and fake_github.effect_writes == []
+    assert eng.origin.head("autoforge/2") == candidate and eng2.provider.calls == []
+
+
 @pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
 def test_a_displaced_run_stays_refused_once_the_new_owner_is_removed(
     tmp_state_dir, fake_github, remove, found
@@ -8481,6 +8643,149 @@ def test_a_held_run_that_moved_meets_the_step_budget_like_any_step(tmp_state_dir
     assert [o.next_phase for o in outcomes] == ["BLOCKED"]
     s = load_state(eng.paths.state_file)
     assert "workflow.max_total_steps" in s.block_reason and s.current_head_sha == SHA_A
+
+
+# -- the closed gate's read and the PR's owner (PR #459 R3-F2) --------------------------
+def _held_step(eng, recheck: bool):
+    """The closed gate's one step: ``step``, or ``resume``'s ``run(recheck_held=True)``."""
+    if not recheck:
+        return eng.step(allow_merge=False)
+    outcomes = eng.run(allow_merge=False, recheck_held=True)
+    assert len(outcomes) == 1, [o.next_phase for o in outcomes]
+    return outcomes[0]
+
+
+def _reloaded(eng, tmp_state_dir, gh):
+    """A new controller process on the same state and GitHub, launching nothing."""
+    eng.close()
+    eng2 = make_engine(tmp_state_dir, ["never"], github=gh)
+    eng2.load()
+    return eng2
+
+
+@pytest.mark.parametrize("recheck", [False, True], ids=["step", "run(recheck_held)"])
+@pytest.mark.parametrize("moved", [False, True], ids=["unchanged", "moved"])
+@pytest.mark.parametrize(
+    ("body", "found"),
+    [
+        pytest.param(
+            implementation_pr_body(owner_run_id=OTHER_RUN),
+            f"names run {OTHER_RUN} as its owner, not this run",
+            id="another-run",
+        ),
+        pytest.param(
+            '<!-- ai-implementation: {"issue": 2} -->',
+            "carries an implementation marker that cannot be read",
+            id="unreadable",
+        ),
+    ],
+)
+def test_the_closed_gate_blocks_a_pr_it_no_longer_owns_moved_or_not(
+    tmp_state_dir, fake_github, recheck, moved, body, found
+):
+    """PR #459 R3-F2: a run held at READY_FOR_MERGE by the closed gate, on a
+    legacy binding (its record names no owned PR, as protocol 13 left it).
+    The PR is handed to another run, or its marker made unreadable. Before
+    R3-F2 the closed gate's read routed a moved PR to REVIEW, where this run
+    would review it again, and held an unmoved one silently. The owner is
+    read first: the step blocks either way, routing nothing, merging and
+    launching nothing, and an owner the read found is saved."""
+    fake_github.add_pr(head_sha=SHA_B if moved else SHA_A, body=body)
+    eng, _ = _held(tmp_state_dir, fake_github, config_allows=False)
+    assert eng.state.owned_pr_url == ""
+    before = len(fake_github.calls)
+    out = _held_step(eng, recheck)
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    reason = eng.state.block_reason
+    assert found in reason
+    assert "nothing was merged and no review round was started" in reason
+    assert _reads_since(fake_github, before) == ["get_pr"]
+    s = load_state(eng.paths.state_file)
+    assert s.phase == Phase.BLOCKED and s.last_review_result == "clean"
+    assert (s.current_head_sha, s.reviewed_head_sha) == (SHA_A, SHA_A)
+    # A marker naming a run makes the PR owned; one that cannot be read names none.
+    assert s.owned_pr_url == (PR if "names run" in found else "")
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+    assert fake_github.merges == [] and s.counted_merged_prs == []
+
+
+@pytest.mark.parametrize("moved", [False, True], ids=["unchanged", "moved"])
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_held_run_displaced_by_the_closed_gates_read_stays_refused_across_a_restart(
+    tmp_state_dir, fake_github, moved, remove, found
+):
+    """PR #459 R3-F2, the reported sequence: a legacy binding held at
+    READY_FOR_MERGE, whose PR another run took over. Before R3-F2 the
+    recheck of the moved PR saved REVIEW with no owner recorded; once the
+    owner was removed and the state reloaded, a reviewer launched. The
+    recheck blocks and records the owner it read, so after the removal a new
+    process's 'unblock' still refuses, and 'resume' launches nothing."""
+    fake_github.add_pr(head_sha=SHA_B if moved else SHA_A)
+    eng, _ = _held(tmp_state_dir, fake_github, config_allows=False)
+    _owned_by(fake_github, OTHER_RUN)
+    assert _held_step(eng, recheck=True).next_phase == "BLOCKED"
+    assert load_state(eng.paths.state_file).owned_pr_url == PR
+    remove(fake_github)
+
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    raw = eng2.paths.state_file.read_text()
+    refused = eng2.unblock("the other run let go of it")
+    assert not refused.unblocked
+    assert found in refused.message and "the owner was removed since" in refused.message
+    assert eng2.paths.state_file.read_text() == raw
+    assert eng2.run(allow_merge=False, recheck_held=True) == []
+    assert eng2.paths.state_file.read_text() == raw
+    assert eng.provider.calls == eng2.provider.calls == []
+    assert fake_github.effect_writes == [] and fake_github.merges == []
+
+
+@pytest.mark.parametrize("recheck", [False, True], ids=["step", "run(recheck_held)"])
+@pytest.mark.parametrize(("remove", "found"), _OWNER_REMOVALS)
+def test_a_hold_saves_the_owner_its_read_found_and_nothing_else(
+    tmp_state_dir, fake_github, recheck, remove, found
+):
+    """PR #459 R3-F2: the closed gate's read of an unmoved PR whose marker
+    names this run, on a legacy binding. The hold takes no step, but the
+    owner it read is saved, and nothing else is: no phase, no step charged.
+    Once that owner is removed, the next process's recheck blocks on the PR
+    rather than holding, or routing a later move to REVIEW."""
+    fake_github.add_pr(head_sha=SHA_A)
+    eng, before_bytes = _held(tmp_state_dir, fake_github, config_allows=False)
+    _owned_by(fake_github, eng.state.run_id)
+    if recheck:
+        assert eng.run(allow_merge=False, recheck_held=True) == []
+    else:
+        with pytest.raises(VerificationError, match="merge is disabled"):
+            eng.step(allow_merge=False)
+    assert eng.held_reason.startswith(f"PR {PR} is still at the reviewed HEAD")
+    saved = json.loads(eng.paths.state_file.read_text(encoding="utf-8"))
+    held = json.loads(before_bytes)
+    assert (held["owned_pr_url"], saved["owned_pr_url"]) == ("", PR)
+    changed = {key for key in saved if saved[key] != held.get(key)}
+    assert changed <= {"owned_pr_url", "updated_at"}, changed
+
+    remove(fake_github)
+    fake_github.prs[PR].head_sha = SHA_B
+    eng2 = _reloaded(eng, tmp_state_dir, fake_github)
+    out = _held_step(eng2, recheck)
+    _assert_owner_removed(eng2, out, found)
+    s = load_state(eng2.paths.state_file)
+    assert (s.current_head_sha, s.last_review_result) == (SHA_A, "clean")
+    assert eng.provider.calls == eng2.provider.calls == []
+
+
+def test_a_dry_run_of_a_held_run_reads_and_writes_nothing(tmp_state_dir, fake_github):
+    """PR #459 R3-F2 keeps the dry run write-free: it never makes the closed
+    gate's read, so it neither blocks a PR another run owns nor records its
+    owner; the real recheck after it does."""
+    fake_github.add_pr(head_sha=SHA_B, body=implementation_pr_body(owner_run_id=OTHER_RUN))
+    eng, before_bytes = _held(tmp_state_dir, fake_github, config_allows=False)
+    outcomes = eng.run(dry_run=True, allow_merge=False, recheck_held=True)
+    assert [o.dry_run for o in outcomes] == [True]
+    assert fake_github.calls == [] and eng.paths.state_file.read_bytes() == before_bytes
+    assert eng.state.phase == Phase.READY_FOR_MERGE and eng.state.owned_pr_url == ""
+    assert _held_step(eng, recheck=True).next_phase == "BLOCKED"
 
 
 def test_ready_for_merge_requires_clean_review_in_state(tmp_state_dir, fake_github):

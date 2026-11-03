@@ -1364,16 +1364,22 @@ class _ReplanEntry:
 
 @dataclass(frozen=True)
 class _HeldRevisionMoved:
-    """What READY_FOR_MERGE read with the merge gate closed: the PR moved (#447).
+    """What READY_FOR_MERGE read with the merge gate closed: a step to take (#447).
 
-    ``pr`` is the OPEN reviewed PR as GitHub returned it, and
-    ``merge_base_sha`` the merge base read for it when its HEAD and base
-    were the reviewed ones (``""`` otherwise: the REVIEW entry reads it).
-    In memory only, handed from the read to the step that records it.
+    ``pr`` is the reviewed PR as GitHub returned it. Without ``owner`` it
+    is OPEN and moved off the reviewed revision, and ``merge_base_sha`` is
+    the merge base read for it when its HEAD and base were the reviewed
+    ones (``""`` otherwise: the REVIEW entry reads it). ``owner`` is why
+    this run may not drive the PR any more (#414, PR #459 R3-F2): its
+    marker names another run, cannot be read, or lost the owner this run
+    knew. The step then blocks, whether or not the revision moved, and
+    routes nothing. In memory only, handed from the read to the step that
+    records it.
     """
 
     pr: PRInfo
     merge_base_sha: str = ""
+    owner: str = ""
 
 
 @dataclass
@@ -4685,10 +4691,12 @@ class ControllerEngine:
         ``recheck_held`` (``resume``, #447): a run that starts in
         READY_FOR_MERGE held by the closed gate alone is checked against
         GitHub before the loop stops there. A PR still at the clean-reviewed
-        HEAD, base and merge base ends the loop with nothing executed or
-        written, as before; a PR that moved off it is a step to REVIEW of the
-        new revision (:meth:`_held_revision_moved`), and the loop goes on
-        from there. Only the first step is checked: a run that reaches
+        HEAD, base and merge base ends the loop with nothing executed, and
+        nothing written but an owner the read learned (#414); a PR that
+        moved off it is a step to REVIEW of the new revision
+        (:meth:`_held_revision_moved`), and the loop goes on from there; a
+        PR this run may no longer drive is a step to BLOCKED, moved or not
+        (PR #459 R3-F2). Only the first step is checked: a run that reaches
         READY_FOR_MERGE again in the same loop stops there.
 
         ``on_outcome`` is called with each step's outcome as soon as the
@@ -4831,6 +4839,19 @@ class ControllerEngine:
                 return self._block(
                     previous, plan, spent, code=StopReasonCode.PRODUCER_VALIDATION_BOUND
                 )
+        if (
+            previous == Phase.READY_FOR_MERGE
+            and held is None
+            and not self.merge_gate_open(allow_merge)
+        ):
+            # The closed gate's read (#447), made here when :meth:`run` did
+            # not make it, and like it before the step is charged: a hold
+            # takes no step, and saves at most the owner its read learned
+            # (PR #459 R3-F2); a moved revision or an owner refusal is the
+            # step, below.
+            held = self._held_revision_moved()
+            if held is None:
+                raise VerificationError(MERGE_GATE_MESSAGE)
 
         # In memory until the step's first save: the launch checkpoint of an
         # agent step (`_invoke_phase`), or the resolution of a step that needs
@@ -8929,17 +8950,34 @@ class ControllerEngine:
         data may change between the two steps).
 
         With the merge gate closed the step can only leave for REVIEW: a PR
-        that moved off the clean-reviewed revision (``held``, when
-        :meth:`run` already read it, else read here) goes back to REVIEW of
-        the new revision with the review's findings carried, as it does with
-        the gate open (#447). A PR still at that revision refuses with the
-        merge-gate message and changes nothing, as before.
+        that moved off the clean-reviewed revision (``held``, which
+        :meth:`run` or :meth:`_step_once` read) goes back to REVIEW of the
+        new revision with the review's findings carried, as it does with the
+        gate open (#447). A PR still at that revision refuses with the
+        merge-gate message and changes nothing, as before, but for an owner
+        its read learned (:meth:`_held_revision_moved`). A PR this run may
+        no longer drive blocks, moved or not (#414, PR #459 R3-F2).
         """
         state = self._require_state()
         if not self.merge_gate_open(allow_merge):
-            moved = held or self._held_revision_moved()
+            # Read before the step was charged, by :meth:`run` or by
+            # :meth:`_step_once`, which raises the merge-gate message on a
+            # hold: a hold may save the owner its read learned, never a step.
+            moved = held
             if moved is None:
                 raise VerificationError(MERGE_GATE_MESSAGE)
+            if moved.owner:
+                # #414 (PR #459 R3-F2): a PR another run owns, or whose owner
+                # is not knowable, is not this run's to review again or merge,
+                # whatever its revision; the revision is not routed.
+                return self._block(
+                    Phase.READY_FOR_MERGE,
+                    plan,
+                    self._pr_owner_text(
+                        moved.owner, "nothing was merged and no review round was started"
+                    ),
+                    code=StopReasonCode.PR_OWNER,
+                )
             pr = moved.pr
             return self._revision_drift_to_review(
                 Phase.READY_FOR_MERGE,
@@ -9000,15 +9038,35 @@ class ControllerEngine:
         (R1-F2). That, and a read that fails (its GitHubError, named), leave
         the phase and the state file unchanged.
 
+        Who owns the PR is read on the same answer, before its state or
+        revision is judged (#414, PR #459 R3-F2), as every phase entry reads
+        it (:meth:`_pr_owner_problem`): a marker naming another run, one that
+        cannot be read, or the removal of an owner this run knew returns the
+        PR with ``owner`` set, and the step blocks on it, moved or not, with
+        no transition to REVIEW. The read records an owner its marker names
+        (:meth:`_note_pr_owner`): the step's own save keeps it, and a hold,
+        which takes no step, saves the state for it and changes nothing
+        else, so a legacy binding stops being one at its first such read,
+        and an owner removed after it refuses in a later process too. The
+        callers read before any step is charged, under the execution lock;
+        a dry run never reads here.
+
         Each hold sets :attr:`held_reason` to why it held.
         """
         state = self._require_state()
         url = state.current_pr_url
         reviewed = (state.reviewed_head_sha or "").lower()
+        owned_before = state.owned_pr_url
         self.held_reason = ""
 
         def hold(reason: str) -> _HeldRevisionMoved | None:
             self.held_reason = reason
+            if state.owned_pr_url != owned_before:
+                # PR #459 R3-F2: the read found a marker naming a run on a
+                # binding the state did not record as owned. That knowledge
+                # is what refuses the PR once its owner is removed, so it is
+                # saved, and nothing else moves: no phase, no step.
+                self._save()
             return None
 
         if (
@@ -9039,6 +9097,12 @@ class ControllerEngine:
         )
         if pr.url and not parse_pr_url(pr.url).same_target(reviewed_ref):
             raise VerificationError(f"GitHub answered {url} with PR {pr.url}: {unchanged}")
+        # #414 (PR #459 R3-F2): the owner before the revision. A PR another run
+        # owns is that run's to review and merge, so its drift is not this
+        # run's to route; the step blocks instead, launching nothing.
+        owner = self._pr_owner_problem(pr)
+        if owner:
+            return _HeldRevisionMoved(pr, owner=owner)
         if pr.state in ("CLOSED", "MERGED"):
             return hold(f"GitHub reports PR {url} {pr.state}, so it is not compared")
         if pr.state != "OPEN":
@@ -14315,7 +14379,11 @@ class ControllerEngine:
         record is reconciled against GitHub and issued at most once, in plan
         order, so the PR is never opened or adopted before the branch holds
         the candidate, and a PR to adopt is written to only once GitHub shows
-        it at the candidate, onto the default branch. Then the PR is
+        it at the candidate, onto the default branch. Before each record
+        still pending, the PRs on the branch are read for their owner, and
+        one another run owns, or whose marker cannot be read, blocks with
+        that record unsent (#414, PR #459 R3-F1,
+        :meth:`_analyze_owner_fence`). Then the PR is
         read back as the one open PR carrying the issue's marker, the one the
         record observed, headed at exactly the pushed HEAD on the
         controller's branch of this repository and based on the default
@@ -14367,6 +14435,14 @@ class ControllerEngine:
                 return _blocked(StopReasonCode.EFFECT_CONFLICT, self._analyze_conflict_text(record))
             if not record.pending:
                 continue
+            # #414 (PR #459 R3-F1): who owns the PRs on the branch is read
+            # right before each record is reconciled or sent, on the step that
+            # saved the plan and on every later entry alike. The push's lease
+            # holds the branch, not the PR's body, so an owner written there
+            # since the plan was saved is seen only by this read.
+            fenced = self._analyze_owner_fence(record, branch)
+            if fenced is not None:
+                return fenced
             try:
                 if record.kind is EffectKind.ADOPT_PR:
                     drift = self._adopted_head_problem(
@@ -14406,6 +14482,58 @@ class ControllerEngine:
             default_branch=default_branch,
             record=records[1],
         )
+
+    def _analyze_owner_fence(self, record: EffectRecord, branch: str) -> tuple[Phase, str] | None:
+        """Refuse ``record`` of the ANALYZE_EXECUTE plan over a PR another run owns (#414).
+
+        Every PR headed at ``branch`` is read (the K2 identity listing, any
+        state): the push moves the head of each, K3 writes into the one the
+        plan adopts, and K2 opens the issue's PR beside them. A PR whose
+        implementation marker of the issue names another run, or whose
+        marker cannot be read, is not this run's to publish to (ADR 0004
+        D9.4a, :meth:`_pr_owner_problem`), and ``record`` is refused with
+        nothing sent, the plan kept journaled (PR #459 R3-F1). The plan was
+        saved over a branch with no marked PR, so a marker found now was
+        written since, by an edit anyone with the login can make: the lease
+        on the push holds the branch, not the PR's body, and passes over it.
+
+        Journal reconciliation keeps working: a marker naming this run is
+        never refused here, and the one K2 or K3 published names it. Which
+        run a PR the plan published names is the read back's to judge
+        against the journal (:meth:`_bind_published_pr`). A conclusive read
+        failure blocks with nothing sent; an unavailable GitHub propagates
+        for 'resume'. ``None`` when ``record`` may go on.
+        """
+        state = self._require_state()
+        try:
+            prs = self.github.list_prs_for_head(state.repository, branch)
+        except GitHubUnavailableError:
+            raise
+        except GitHubError as exc:
+            return _blocked(
+                StopReasonCode.GITHUB_READ_FAILED,
+                f"the PRs headed at {branch!r} could not be read for their owner before "
+                f"{record.describe()} was sent: {exc}. This is not a transient failure "
+                "(authentication, permissions, or malformed data); nothing was sent again. Fix "
+                "the cause, then 'unblock'",
+            )
+        again = " again" if record.stage == Stage.ATTEMPTED else ""
+        for pr in prs:
+            problem = self._pr_owner_problem(pr)
+            if not problem:
+                continue
+            return _blocked(
+                StopReasonCode.PR_OWNER,
+                f"{problem}. A PR is driven only by the run its implementation marker names "
+                f"(ADR 0004 D9.4a), and PR {parse_pr_url(pr.url).canonical} is headed at "
+                f"{branch!r}, where this run's journaled plan publishes: {record.describe()} "
+                f"was not sent{again}, and the plan stays journaled. Leave the issue to the run "
+                "that owns the PR. If that run is stopped for good and this one is to publish "
+                "the issue's PR, remove that marker from the PR body, then 'unblock': the plan "
+                "is completed from the journal, which reads the owner again before anything is "
+                "sent",
+            )
+        return None
 
     def _await_pushed_head(
         self, read: Callable[[], _Read], lagging: Callable[[_Read], bool], what: str

@@ -2251,6 +2251,17 @@ its author. Only the effect records and the entry observation prove origin.
       each send before it took a round trip or more (PR #459 R1-F4);
     - the merge gate's checks read, before a `MERGED` PR is reconciled or
       counted;
+    - the closed merge gate's read of a run held at `READY_FOR_MERGE`, by
+      `step`, `resume` and `epic recheck`, before its revision is judged:
+      moved or not, a refusal blocks rather than routing the PR to `REVIEW`
+      (PR #459 R3-F2). That read is made before any step is charged, outside
+      the step's error handling in `resume` and `epic recheck`, so the
+      refusal is the step itself, never an error;
+    - a read of every PR headed at `autoforge/<n>` before each record of
+      the saved `ANALYZE_EXECUTE` plan still pending (K1, K2, K3), on the
+      step that saved it and on every resume (PR #459 R3-F1). K1's lease
+      holds the branch, not a PR's body, so an owner written into the
+      adopted PR since the plan was saved passes it;
     - the replan checkpoint and the read before the source is closed;
     - a read of the source before a transaction `PREPARED` on an earlier
       entry launches its agent again, and before each record of its saved
@@ -2294,7 +2305,11 @@ its author. Only the effect records and the entry observation prove origin.
   - **K3.** K3 adopts only an unmarked PR, which no run owns. Its block
     names this run, so a run still bound to that PR (legacy, or a removed
     marker) is displaced at its next boundary rather than left driving
-    beside it.
+    beside it. A marker written into that PR after the plan was saved
+    refuses the push and the write before either is sent, with the plan
+    kept (PR #459 R3-F1); once it is removed, a plain `unblock` completes
+    the plan from the journal. A marker naming this run is never refused
+    there, so the record that published it reconciles as before.
   - **The owned PR (PR #459 R1-F1).** A marker naming no run, and no
     marker at all, look the same whether the PR was opened before #414 or
     someone removed its owner since. A body GitHub does not return reads
@@ -2308,7 +2323,9 @@ its author. Only the effect records and the entry observation prove origin.
       under a marker naming this run;
     - a takeover;
     - any read of the bound PR whose marker names a run, this one or
-      another, a refused `unblock`'s included.
+      another, a refused `unblock`'s included, and the closed merge gate's
+      read of a run it holds, which saves that field and nothing else (no
+      phase, no step charged; PR #459 R3-F2).
 
     It is cleared only when another PR is bound. While it names the bound
     PR, a marker naming no run, no marker and an empty body refuse
