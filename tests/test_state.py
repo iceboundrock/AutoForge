@@ -2060,7 +2060,9 @@ def _replan_state(**kw):
         precondition={"absent": True, "watermark": 42},
         payload={
             "title": "Reimplement issue #2",
-            "body": replacement_pr_body("A fresh reimplementation.", EFFECT_ISSUE, marker),
+            "body": replacement_pr_body(
+                "A fresh reimplementation.", EFFECT_ISSUE, marker, "af-test-1"
+            ),
         },
     )
     context = ReplanContext(

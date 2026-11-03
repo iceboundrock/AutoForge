@@ -584,12 +584,14 @@ next entry could not find again.
   controller pushes the agent's commit and opens or adopts the PR from one
   persisted plan. Its entry reads that journal first: a persisted plan is
   completed from its records without launching the agent. Otherwise, at a
-  fresh entry, it adopts the open PR carrying the issue's
-  `ai-implementation` marker (the persisted PR, or the one found by a
-  complete listing of the repository's open PRs, read to the end), if one
-  exists, without launching the agent; two candidates block, and so does a
-  listing that cannot be read to its end, since "none exists" is then not
-  knowable. After a launch of the entry, a marker PR the entry observation
+  fresh entry, it recovers the PR this state persisted, while that PR's
+  `ai-implementation` marker names this run or no owner, without launching
+  the agent; an open PR carrying the issue's marker that a complete listing
+  of the repository's open PRs (read to the end) finds, and that this state
+  has no record of, blocks (`pr-owner`) whatever run its marker names, and
+  only `unblock --take-over` binds it (#414, ADR 0004 D9.4a). Two candidates
+  block, and so does a listing that cannot be read to its end, since "none
+  exists" is then not knowable. After a launch of the entry, a marker PR the entry observation
   did not record was not opened by the controller and blocks, as do a
   branch head, an open PR on the branch or a default branch other than the
   recorded one. A PR is identified by that
@@ -752,11 +754,13 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   GitHub: with no PR bound, the issue must be selectable and either a
   persisted `ANALYZE_EXECUTE` plan exists (the re-entry completes its push
   and PR from the records, without launching the agent) or the strict
-  marker listing of `ANALYZE_EXECUTE`'s entry must resolve (one adoptable PR
-  or none, adopted at the fresh entry the unblock starts), and a conclusive
-  GitHub failure of either read refuses exactly as it does with a PR bound;
-  with a PR bound, the PR is re-read and its state, HEAD and base are
-  compared with the persisted review binding.
+  marker listing of `ANALYZE_EXECUTE`'s entry must resolve to no marked PR
+  (one marked PR this run has no record of is refused, naming `unblock
+  --take-over`, #414), and a conclusive GitHub failure of either read
+  refuses exactly as it does with a PR bound; with a PR bound, the PR is
+  re-read, its implementation marker must name this run or no owner (ADR
+  0004 D9.4a), and its state, HEAD and base are compared with the persisted
+  review binding.
 - **Identity first.** A review binding (`reviewed_pr_url`) that names a PR
   other than `current_pr_url` refuses before the live PR state is even
   considered, as the merge gate does from state alone: review evidence is
@@ -834,6 +838,24 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   A flag on a run with no waiting action refuses, quoting the decision a
   plain unblock would make. After an approval the record is authorized, so
   a later block (a closed issue, say) is left with a plain unblock.
+- **Taking over a marked PR** (`--take-over <PR>`, #414). A run with no PR
+  bound whose `ANALYZE_EXECUTE` entry found the issue's marked PR without a
+  record of it is refused by a plain unblock. The operator stops the run
+  that owns the PR, replaces the marker in its body with the one the
+  refusal names (this run's id as `owner_run_id`), and runs `unblock
+  --take-over <PR> --reason ...`. The controller re-reads the issue and the
+  strict listing; it binds the PR (HEAD, base, branch) and enters `REVIEW`
+  only when the listing's one marked PR is the PR named and its marker
+  names this run. The history entry's `action` is `take-over <PR>`. It is
+  refused, with nothing written, for a run with a PR bound, with a saved
+  `ANALYZE_EXECUTE` plan or journaled records (the run's own plan is
+  completed first: unblock without the flag), with no marked PR, another PR
+  named, or a marker naming another run or none. REVIEW reviews the PR
+  from this run's round 1; nothing of the run it was taken from (findings,
+  verdict, certificate) is carried, and D9.6 still refuses a round comment
+  already on the PR at the bound revision. A displaced run, whose bound
+  PR's marker names another run, blocks at its next entry; a plain unblock
+  refuses it until the marker names it again.
 - **A fresh review instead of FIX** (`--rereview`, #428). Where the plain
   decision is `FIX` with the round's open findings (`OPEN` at the reviewed
   HEAD and base, no saved plan), a fixer relaunched by a plain unblock

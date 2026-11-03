@@ -1059,11 +1059,15 @@ def test_state_derived_run_id_is_redacted_on_every_terminal_line(
     assert FAKE_SECRET not in captured.out + captured.err
     assert "existing run ***REDACTED*** in phase" in captured.err
 
-    # `step` prints the outcome line under the run id.
-    assert cli.main(["--state-dir", sd, "step"]) == 0
+    # `step` prints the outcome line under the run id. The run cannot publish
+    # its marker, which names it as the PR's owner (#414): it blocks before
+    # the agent is launched, and the reason does not quote the id either.
+    assert cli.main(["--state-dir", sd, "step"]) == 1
     captured = capsys.readouterr()
     assert FAKE_SECRET not in captured.out + captured.err
-    assert captured.out.startswith("[***REDACTED***] ") and " -> " in captured.out
+    assert captured.out.startswith("[***REDACTED***] ") and " -> BLOCKED" in captured.out
+    assert "this run's id has a credential shape (pattern class: github-token)" in captured.out
+    assert fakes["provider"].calls == []
 
     data = json.loads(state_file.read_text())
     data["phase"] = "BLOCKED"
@@ -4355,6 +4359,49 @@ def test_unblock_rereview_excludes_the_action_flags(tmp_path, capsys, monkeypatc
         cli.main(["--state-dir", str(tmp_path / ".autoforge"), "unblock", *flags, "--reason", "x"])
     assert e.value.code == 2
     assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_unblock_take_over_binds_the_marked_pr_the_operator_handed_the_run(
+    tmp_path, capsys, monkeypatch, fakes
+):
+    """#414: a fresh run blocks on the issue's marked PR, which it has no
+    record of and whose marker names another run. The operator writes the
+    run into the marker; `unblock --take-over PR_URL` binds the PR and
+    enters REVIEW. The flag takes a PR URL and excludes the other actions."""
+    from tests.conftest import implementation_pr_body
+
+    monkeypatch.chdir(tmp_path)
+    gh = fakes["gh"]
+    gh.add_pr(PR, head_sha=SHA_A, branch="autoforge/2")
+    gh.prs[PR].body = implementation_pr_body(owner_run_id="af-20261103T000000Z-0a1b2c")
+    sd = str(tmp_path / ".autoforge")
+    argv = ["--state-dir", sd, "run", "--epic", EPIC, "--issue", ISSUE, "--max-steps", "2"]
+    assert cli.main(argv) == 1
+    out = capsys.readouterr().out
+    assert "names run af-20261103T000000Z-0a1b2c as its owner" in out
+    assert f"unblock --take-over {PR}" in out
+    assert fakes["provider"].calls == []
+    state_file = tmp_path / ".autoforge" / "state.json"
+    run_id = load_state(state_file).run_id
+
+    raw = state_file.read_text()
+    unblock = ["--state-dir", sd, "unblock", "--reason", "handed over"]
+    assert cli.main([*unblock, "--take-over", PR]) == 1  # the marker still names the other run
+    assert "unblock --take-over" in capsys.readouterr().out
+    assert state_file.read_text() == raw
+    gh.prs[PR].body = implementation_pr_body(owner_run_id=run_id)
+    assert cli.main([*unblock, "--take-over", PR]) == 0
+    assert "BLOCKED -> REVIEW" in capsys.readouterr().out
+    s = load_state(state_file)
+    assert (s.phase, s.current_pr_url, s.current_head_sha) == (Phase.REVIEW, PR, SHA_A)
+    assert s.unblock_history[-1]["action"] == f"take-over {PR}"
+    assert fakes["provider"].calls == [] and gh.effect_writes == []
+
+    for other in (["--rereview"], ["--approve-action", "A-" + "0" * 16]):
+        with pytest.raises(SystemExit) as e:
+            cli.main([*unblock, "--take-over", PR, *other])
+        assert e.value.code == 2
+        assert "not allowed with argument" in capsys.readouterr().err
 
 
 # -- operator actions (#243) ------------------------------------------------------------

@@ -107,18 +107,27 @@ PR the controller persisted is read first; then the repository's open PRs
 are listed, to the end (the client walks GitHub's pages by cursor until it
 reports no next page, so the listing has no ceiling to fall past, #20; a
 listing the client cannot read to its end blocks, because "none exists" is
-then not knowable) for the `ai-implementation` marker of `{"issue"}`, which
-only the controller writes:
+then not knowable) for the `ai-implementation` marker of `{"issue"}` (since
+#414 also `"owner_run_id"`, the run that owns the PR), which only the
+controller writes:
 
-- exactly one, at a fresh entry: it is adopted (recorded as the issue's PR,
-  `REVIEW` next) without launching the agent, whatever its branch name and
-  whether or not GitHub links it to the issue. After a launch of this entry
-  it is not: the entry observation recorded none, so the controller did not
-  open it, and the run is `BLOCKED` naming it (D9.4); `unblock` then binds
-  it at a fresh entry if the operator decides it is the implementation. The
-  one exception is the one-shot re-entry of a run persisted while an agent
-  of the previous contract was publishing the PR (D13.4), which recovers as
-  before.
+- exactly one, and it is the PR this state persisted, whose marker names
+  this run or no owner: it is recovered (bound, `REVIEW` next) without
+  launching the agent, whatever its branch name and whether or not GitHub
+  links it to the issue.
+- exactly one this state has no record of: `BLOCKED` (`pr-owner`) without
+  launching, whatever run its marker names, this one included. Finding a PR
+  is not owning it, and another controller may still be driving it (ADR 0004
+  D9.4a). The reason names the owner, the marker naming this run, and
+  `unblock --take-over <PR>`, which binds the PR once the operator has
+  written that marker into its body. After a launch of this entry the run is
+  `BLOCKED` naming such a PR as well: the entry observation recorded none,
+  so the controller did not open it (D9.4). The one exception is the
+  one-shot re-entry of a run persisted while an agent of the previous
+  contract was publishing the PR (D13.4), which recovers an ownerless
+  marked PR as before.
+- the PR this state persisted, whose marker now names another run: the
+  operator handed it over, so the run is `BLOCKED` (`pr-owner`).
 - two or more, one whose marker cannot be read, or one headed in a fork:
   `BLOCKED` without launching the agent. The controller never chooses
   which PR is the issue's, and it cannot publish to a fork's branch.
@@ -1006,6 +1015,34 @@ decided on: `BLOCKED`, not counted.
 Never advance the workflow solely because an LLM said an operation succeeded.
 
 ---
+
+## The PR's owner (#414)
+
+Every PR the controller opens (K2), adopts (K3) or creates as a replacement
+(K7) carries the `ai-implementation` marker with `"owner_run_id"`: the run
+that owns the PR. The state stays the authority (D9.3: anyone with the
+shared login can write the marker), so the marker can only make a run
+refuse a PR, never let it adopt one (ADR 0004 D9.4a):
+
+- a fresh entry never binds a marked PR its state has no record of; it
+  blocks (`pr-owner`) and names `unblock --take-over`;
+- a bound run checks the marker on the PR read each entry already makes:
+  `REVIEW`, `FIX` and the merge gate (`_require_open_pr`, the merge gate's
+  identity check), the replan transaction, and `unblock`. A marker that
+  names another run, or one it cannot read, blocks the run with nothing
+  launched, posted, pushed or merged. `REVIEW` reads the PR once more right
+  before its round comment is sent (K4), so a PR taken over while the
+  reviewer ran gets no comment from the displaced run;
+- an ownerless marker (a PR opened before #414) and no marker leave the
+  bound run driving its own PR, as before;
+- a takeover is the operator's: stop the owning run, replace the marker in
+  the PR body with the one the refusal names, then `unblock --take-over
+  <PR>` binds it and enters `REVIEW`. The controller writes no marker of its
+  own for it (no new effect kind, ADR 0012 D10).
+
+The check and the next write are not atomic: a takeover that lands between
+a run's read and its write is seen at the next read. The PR's owner is
+public text in the PR body, never a credential or a lock.
 
 ## The PR identity read and the checks read
 

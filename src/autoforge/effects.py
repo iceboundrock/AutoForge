@@ -259,21 +259,30 @@ def review_comment_problem(
     ) or published_markdown_problem("review comment", text)
 
 
-def implementation_closing_block(issue_url: str) -> str:
-    """What K2's body ends with and K3 appends: ``Closes #n``, a blank line, the marker (#161)."""
+def implementation_closing_block(issue_url: str, owner_run_id: str | None) -> str:
+    """What K2's body ends with and K3 appends: ``Closes #n``, a blank line, the marker (#161).
+
+    The marker names ``owner_run_id``, the run that publishes it (#414);
+    ``None`` is the ownerless block a record saved before #414 holds.
+    """
     number = parse_issue_url(issue_url).number
-    return f"Closes #{number}{APPEND_SEPARATOR}{render_implementation_marker(issue_url)}"
+    marker = render_implementation_marker(issue_url, owner_run_id)
+    return f"Closes #{number}{APPEND_SEPARATOR}{marker}"
 
 
-def replacement_pr_body(text: str, issue_url: str, transaction_marker: str) -> str:
+def replacement_pr_body(
+    text: str, issue_url: str, transaction_marker: str, owner_run_id: str | None
+) -> str:
     """K7's body: the agent's text, ``Closes #n`` and the marker, then the transaction marker.
 
     The controller renders everything after the agent's text (#164): the
-    closing block of the issue (:func:`implementation_closing_block`) and
-    the transaction's marker with the validated counts.
+    closing block of the issue (:func:`implementation_closing_block`), owned
+    by ``owner_run_id`` (#414), and the transaction's marker with the
+    validated counts.
     """
     return compose_append(
-        compose_append(text, implementation_closing_block(issue_url)), transaction_marker
+        compose_append(text, implementation_closing_block(issue_url, owner_run_id)),
+        transaction_marker,
     )
 
 
@@ -1289,6 +1298,11 @@ def _check_owner_issue_marker(record: EffectRecord, kind: MarkerKind, what: str)
         issue.canonical, record.owner.issue_url, parse_issue_url
     ):
         _fail(what, "carries a marker for another issue than its owner's")
+    # #414: an implementation marker names the run that publishes it, which
+    # is the record's own run; one saved before #414 names none.
+    owner_run_id = getattr(claim, "owner_run_id", None)
+    if owner_run_id is not None and owner_run_id != record.owner.run_id:
+        _fail(what, "carries a marker owned by another run than its owner's")
     pr = getattr(claim, "pr", None)
     if pr is not None and not _same_url(pr.canonical, record.owner.pr_url, parse_pr_url):
         _fail(what, "carries a marker for another PR than its owner's")
@@ -1327,15 +1341,26 @@ def _cross_push(record: EffectRecord, what: str) -> None:
         _fail(what, "is observed at another SHA than its candidate")
 
 
-def _owner_closing_block(record: EffectRecord, repository: str, what: str) -> str:
-    """The closing block of the owner's issue, for a PR in ``repository``.
+def _owner_closing_blocks(record: EffectRecord, repository: str, what: str) -> tuple[str, ...]:
+    """The closing blocks of the owner's issue a record may carry, for a PR in ``repository``.
 
     ``Closes #n`` names issue ``n`` of the PR's own repository, so it is the
-    owner's issue only when the PR is in that issue's repository.
+    owner's issue only when the PR is in that issue's repository. Its marker
+    names the record's own run (#414) or, in a record saved before #414, no
+    run at all: such a record still completes, and its PR is a legacy one.
+    A record whose identity holds the implementation marker (K2, K3) may
+    carry only the block of that marker, so the body and the identity agree
+    on the owner.
     """
     if not parse_issue_url(record.owner.issue_url).same_repository(repository):
         _fail(what, "is in another repository than its owner's issue, which 'Closes #n' names")
-    return implementation_closing_block(record.owner.issue_url)
+    if "marker" in record.identity:
+        owners: tuple[str | None, ...] = (
+            _marker_claim(IMPLEMENTATION, record.identity["marker"]).owner_run_id,
+        )
+    else:
+        owners = (record.owner.run_id, None)
+    return tuple(implementation_closing_block(record.owner.issue_url, o) for o in owners)
 
 
 def _cross_implementation_pr(record: EffectRecord, what: str) -> None:
@@ -1352,8 +1377,12 @@ def _cross_implementation_pr(record: EffectRecord, what: str) -> None:
     # get the parser's rules again, because a resumed create publishes them
     # with no agent result in between. The credential rule over the whole
     # body is the record's redaction invariance.
-    tail = APPEND_SEPARATOR + _owner_closing_block(record, record.target["repository"], what)
-    if not record.body.endswith(tail):
+    tails = [
+        APPEND_SEPARATOR + block
+        for block in _owner_closing_blocks(record, record.target["repository"], what)
+    ]
+    tail = next((t for t in tails if record.body.endswith(t)), None)
+    if tail is None:
         _fail(
             what,
             "has a payload body that is not its text, a blank line and the closing block "
@@ -1380,7 +1409,7 @@ def _cross_adopt_pr(record: EffectRecord, what: str) -> None:
     # keeps as it is; only the block is the controller's, and it is exactly
     # the closing block of the owner's issue.
     repository = parse_pr_url(record.target["pr_url"]).repository
-    if record.payload["block"] != _owner_closing_block(record, repository, what):
+    if record.payload["block"] not in _owner_closing_blocks(record, repository, what):
         _fail(what, "has a block that is not the closing block of its owner's issue")
     if record.observed is not None and record.observed["url"] != record.target["pr_url"]:
         _fail(what, "is observed on another PR than its target")
@@ -1471,13 +1500,12 @@ def _cross_replacement_pr(record: EffectRecord, what: str) -> None:
     # followed by the controller's closing block and transaction marker
     # (#164); both texts get the parser's rules again, because a resumed
     # create publishes them with no agent result in between.
-    tail = (
-        APPEND_SEPARATOR
-        + _owner_closing_block(record, record.target["repository"], what)
-        + APPEND_SEPARATOR
-        + record.identity["transaction_marker"]
-    )
-    if not record.body.endswith(tail):
+    tails = [
+        APPEND_SEPARATOR + block + APPEND_SEPARATOR + record.identity["transaction_marker"]
+        for block in _owner_closing_blocks(record, record.target["repository"], what)
+    ]
+    tail = next((t for t in tails if record.body.endswith(t)), None)
+    if tail is None:
         _fail(
             what,
             "has a payload body that is not its text, the closing block of its owner's issue "

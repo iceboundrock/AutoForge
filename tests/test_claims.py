@@ -776,6 +776,42 @@ def test_a_raw_json_base_with_a_delimiter_is_the_defect_marker_json_prevents():
     assert result.claims == () and len(result.defects) == 1
 
 
+RUN = "af-20261103T162253Z-684a99"
+
+
+def test_the_implementation_marker_names_its_owner_and_keys_on_the_issue_alone():
+    """#414: the marker may name the run that owns the PR. The key stays the
+    issue's identity, so a PR is still found by its issue whatever run its
+    marker names, and an ownerless marker (a PR opened before #414) is the
+    same issue's claim with no owner."""
+    owned = render_implementation_marker(ISSUE, RUN)
+    assert owned == (f'<!-- ai-implementation: {{"issue": "{ISSUE}", "owner_run_id": "{RUN}"}} -->')
+    (claim,) = scan(IMPLEMENTATION, owned).claims
+    assert claim.owner_run_id == RUN and claim.key == _issue_key(ISSUE)
+    (legacy,) = scan(IMPLEMENTATION, render_implementation_marker(ISSUE)).claims
+    assert legacy.owner_run_id is None and legacy.key == claim.key
+    (other,) = scan(IMPLEMENTATION, render_implementation_marker(ISSUE, "run-2")).claims
+    assert other.key == claim.key and other != claim
+    assert render_implementation_marker(ISSUE, "r" * 128).count("r" * 128) == 1
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [7, None, True, "", "../x", "-x", ".x", "a b", "a\n", "r" * 129, ["af-1"]],
+    ids=repr,
+)
+def test_an_owner_outside_the_run_id_shape_is_a_defect(owner):
+    raw = f"<!-- ai-implementation: {json.dumps({'issue': ISSUE, 'owner_run_id': owner})} -->"
+    result = scan(IMPLEMENTATION, raw)
+    assert result.claims == () and len(result.defects) == 1
+    assert "owner_run_id" in result.defects[0]
+    if owner == "r" * 129:
+        assert "r" * 129 not in result.defects[0]  # an oversized value is never quoted
+    if isinstance(owner, str):
+        with pytest.raises(ValueError, match="owner_run_id"):
+            render_implementation_marker(ISSUE, owner)
+
+
 def test_a_renderer_refuses_to_emit_a_marker_the_decoder_would_reject():
     with pytest.raises(ValueError, match="not a finding id"):
         render_follow_up_marker(PR, "F1")

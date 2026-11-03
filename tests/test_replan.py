@@ -249,9 +249,12 @@ def _derived_branch(txn_id: str) -> str:
     return replacement_branch_for(2, txn_id)
 
 
-def _controller_body(marker: str, text: str = REPLAN_TEXT) -> str:
-    """The replacement PR body the controller renders around the agent's text."""
-    return replacement_pr_body(text, ISSUE, marker)
+def _controller_body(eng, marker: str, text: str = REPLAN_TEXT) -> str:
+    """The replacement PR body ``eng``'s run renders around the agent's text.
+
+    Its implementation marker names the run as the PR's owner (#414).
+    """
+    return replacement_pr_body(text, ISSUE, marker, eng.state.run_id)
 
 
 def _published_marker(eng, txn_id: str, unique: int = 2, *, calls=None) -> str:
@@ -612,7 +615,7 @@ def test_hard_threshold_replaces_pr_and_starts_fresh_review(tmp_state_dir, sandb
         "main",
     )
     assert replacement.title == REPLAN_TITLE
-    assert replacement.body == _controller_body(_published_marker(eng, txn_id))
+    assert replacement.body == _controller_body(eng, _published_marker(eng, txn_id))
     assert replacement.linked_issue_numbers == [2]
     creates = [w for w in gh.effect_writes if w[0] == "create_pull_request"]
     assert len(creates) == 1 and creates[0][2] == replacement.body
@@ -971,7 +974,7 @@ def test_a_marker_the_agent_writes_is_corrected_and_only_the_controllers_is_publ
     assert [c.phase for c in eng.provider.calls][-2:] == ["REPLAN_REEXECUTE"] * 2
     txn_id = eng.state.superseded_prs[0]["transaction_id"]
     replacement = gh.prs[REPLACEMENT_PR]
-    assert replacement.body == _controller_body(_published_marker(eng, txn_id))
+    assert replacement.body == _controller_body(eng, _published_marker(eng, txn_id))
     assert replacement.body.count("<!-- autoforge-replan-transaction:") == 1
     creates = [w for w in gh.effect_writes if w[0] == "create_pull_request"]
     assert [w[2] for w in creates] == [replacement.body]
@@ -1629,7 +1632,7 @@ def test_a_pr_carrying_the_transaction_marker_the_controller_did_not_create_is_r
             head_sha=git_out("-C", str(req.cwd), "rev-parse", "HEAD"),
             branch=_derived_branch(txn_id),
             linked=[2],
-            body=_controller_body(_ours_marker(txn_id=txn_id)),
+            body=_controller_body(eng, _ours_marker(txn_id=txn_id)),
         )
 
     eng = _park_at_hard_threshold(
@@ -1696,9 +1699,11 @@ def test_a_replacement_with_an_unreadable_implementation_marker_is_refused(tmp_s
 
 def test_an_activated_replacement_is_what_a_fresh_analyze_entry_finds(tmp_state_dir):
     """The read-back never accepts what the next entry could not find again:
-    with the state file gone, ANALYZE_EXECUTE for the same issue adopts the
-    activated replacement (the superseded PR is closed) instead of launching
-    a second implementation."""
+    with the state file gone, ANALYZE_EXECUTE for the same issue finds the
+    activated replacement (the superseded PR is closed) and launches no
+    second implementation. The replacement's marker names the run that
+    opened it (#414), so the fresh run does not adopt it either: it blocks,
+    naming that run, and binds nothing."""
     gh = FakeGitHub()
     eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh))
     assert eng.step().next_phase == "REPLAN_REEXECUTE"
@@ -1707,10 +1712,11 @@ def test_an_activated_replacement_is_what_a_fresh_analyze_entry_finds(tmp_state_
     fresh = make_engine(tmp_state_dir / "fresh", ["never"], github=gh)
     fresh.state.phase = Phase.ANALYZE_EXECUTE
     out = fresh.step()
-    assert out.next_phase == "REVIEW" and fresh.provider.calls == []
-    assert fresh.state.current_pr_url == REPLACEMENT_PR
-    assert fresh.state.current_head_sha == gh.prs[REPLACEMENT_PR].head_sha
-    assert fresh.state.current_head_sha == eng.state.current_head_sha
+    assert out.next_phase == "BLOCKED" and fresh.provider.calls == []
+    reason = fresh.state.block_reason
+    assert f"open PR {REPLACEMENT_PR} carries the implementation marker for issue #2" in reason
+    assert f"names run {eng.state.run_id} as its owner" in reason
+    assert fresh.state.current_pr_url == "" and fresh.state.run_id != eng.state.run_id
 
 
 def test_n1_agent_claimed_pr_urls_are_compared_by_identity(tmp_state_dir):
@@ -2222,7 +2228,7 @@ def test_a_marked_pr_in_another_repository_is_never_a_candidate(tmp_state_dir):
 
     def opens_elsewhere(req):
         txn_id = _from_prompt(req.prompt, r"`([0-9a-f]{32})`")
-        body = _controller_body(_ours_marker(txn_id=txn_id))
+        body = _controller_body(eng, _ours_marker(txn_id=txn_id))
         gh.add_pr(url=foreign, head_sha=SHA_C, branch="autoforge/2", linked=[2], body=body)
 
     eng = _park_at_hard_threshold(tmp_state_dir, gh, _replan_agent(gh, during=opens_elsewhere))
@@ -2279,7 +2285,7 @@ def test_the_published_marker_attests_exactly_the_results_counts(tmp_state_dir, 
         marker = _ours_marker(99, 2, txn_id)
     else:
         marker = _published_marker(eng, txn_id, unique=0)
-    assert gh.prs[REPLACEMENT_PR].body == _controller_body(marker)
+    assert gh.prs[REPLACEMENT_PR].body == _controller_body(eng, marker)
 
 
 @pytest.mark.parametrize(
@@ -2433,7 +2439,7 @@ def test_t1_prepared_survives_a_restart_and_invokes_the_agent_once(tmp_state_dir
     assert eng.provider.calls == []  # the crashed process never ran it
     assert eng2.state.current_pr_url == REPLACEMENT_PR
     assert eng2.state.current_branch == _derived_branch(TXN_ID)
-    assert gh.prs[REPLACEMENT_PR].body == _controller_body(_ours_marker(3, 2))
+    assert gh.prs[REPLACEMENT_PR].body == _controller_body(eng2, _ours_marker(3, 2))
     assert len(eng2.state.superseded_prs) == 1
     assert len(gh.closed_prs) == 1
 
@@ -7261,7 +7267,7 @@ def test_a_pi_replan_runs_the_same_transaction(tmp_state_dir, tmp_path_factory):
     head = eng.origin.head(branch)
     assert gh.prs[REPLACEMENT_PR].head_sha == head and head != eng.merge_base
     assert gh.prs[REPLACEMENT_PR].body == _controller_body(
-        _published_marker(eng, txn_id, calls=eng.pi.calls)
+        eng, _published_marker(eng, txn_id, calls=eng.pi.calls)
     )
     assert state.current_pr_url == REPLACEMENT_PR
     assert state.current_branch == branch and state.current_head_sha == head
@@ -7417,7 +7423,7 @@ def _assert_replacement_active(eng, gh, txn_id: str) -> str:
     assert eng.origin.is_ancestor(eng.merge_base, head)
     replacement = gh.prs[REPLACEMENT_PR]
     assert (replacement.head_ref, replacement.head_sha) == (branch, head)
-    assert replacement.body == _controller_body(_published_marker(eng, txn_id))
+    assert replacement.body == _controller_body(eng, _published_marker(eng, txn_id))
     state = load_state(eng.paths.state_file)
     assert state.phase is Phase.REVIEW and state.current_pr_url == REPLACEMENT_PR
     assert (state.current_branch, state.current_head_sha) == (branch, head)

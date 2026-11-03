@@ -421,10 +421,13 @@ replaces `state.json`: its review history, its loop-bound counts, its
 replan count and its validation records go with it, so read `status`
 first. Its run logs and worktree stay.
 
-The new run's `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
-`ai-implementation` marker without running the implementer, and blocks on
-two. Close the old PR first if you want a fresh implementation; leave it
-open to continue it.
+The new run's `ANALYZE_EXECUTE` does not adopt the open PR carrying the
+issue's `ai-implementation` marker: the PR names the run that owned it, and
+the new run has no record of it (#414). It blocks, without running the
+implementer, and names the marker that would hand the PR to it. Close the
+old PR first if you want a fresh implementation. To continue it, take it
+over ([Taking over a PR another run owns](usage.md#taking-over-a-pr-another-run-owns)).
+Two such PRs block either way.
 
 ## Stopping a run safely
 
@@ -695,9 +698,11 @@ The messages below are AutoForge's own refusals, grouped by subject.
   did to the source PR. Inspect those PRs on GitHub and decide by hand
   which one, if either, carries the issue forward. To continue, start a new
   run; it replaces `state.json`, journal included, so read `status` first.
-  Its `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
-  `ai-implementation` marker and blocks on two, so close the PR you do not
-  keep. See [Replan transaction](agent-guides/replan-transaction.md).
+  Its `ANALYZE_EXECUTE` blocks on two open PRs carrying the issue's
+  `ai-implementation` marker, so close the PR you do not keep, and on the
+  one it then finds, which names the old run: take that one over
+  ([Taking over a PR another run owns](usage.md#taking-over-a-pr-another-run-owns)).
+  See [Replan transaction](agent-guides/replan-transaction.md).
 
 ## Exit codes
 

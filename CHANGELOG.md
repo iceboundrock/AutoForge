@@ -5,6 +5,34 @@ so.
 
 ## Unreleased
 
+### A fresh run no longer adopts a PR another run is driving (#414)
+
+A new state for an issue (a copied checkout, another `--state-dir`, an
+EPIC namespace re-admitted after `epic archive`) used to find the issue's
+PR by its `ai-implementation` marker and adopt it, even while the run that
+opened it was still driving it elsewhere: two controllers then reviewed,
+fixed and could merge the same PR.
+
+Now the marker names the run that owns the PR (`"owner_run_id"`). Every PR
+the controller opens, adopts or creates as a replan replacement carries it.
+A run recovers only the PR its own state recorded. A fresh run that finds
+the issue's marked PR blocks before it launches anything (stop code
+`pr-owner`), whatever run the marker names, and the reason names the owner.
+A run whose PR was handed to another run blocks at its next `REVIEW`, `FIX`
+or merge-gate entry, and `REVIEW` checks again right before it posts its
+round comment.
+
+To hand a PR to a new run: stop the run that owns it, replace the marker in
+the PR body with the one the refusal names, then run `autoforge unblock
+--take-over <PR> --reason ...` on the new run's state (for an EPIC
+namespace, its `--state-dir`, then `epic resume`). The new run enters
+`REVIEW` and reviews the PR from its own round 1. See "Taking over a PR
+another run owns" in `docs/usage.md`.
+
+PRs opened before this change carry the ownerless marker. The run bound to
+one keeps driving it. A fresh run blocks on it like on any other marked PR,
+and is handed it the same way. `state.json` is unchanged (protocol 13).
+
 ### A merge whose outcome is unknown is no longer reported as "nothing was merged" (#376)
 
 When the controller's re-read of a PR failed right after `gh pr merge`,

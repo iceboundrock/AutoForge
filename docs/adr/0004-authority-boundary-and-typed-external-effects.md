@@ -21,6 +21,15 @@
 - **Amended by #283:** the merge's mechanism (D5.4) deletes the merged
   head branch itself, on GitHub only, and every `gh` the controller starts
   runs where no git it starts finds a repository.
+- **Amended by #414:** D9.4a. The `ai-implementation` marker names the run
+  that owns the PR (`owner_run_id`, metadata outside the claim's key), K2,
+  K3 and K7 write it, and a run drives only the PR its own state bound
+  while the marker names it or no run. A marked PR a state has no record
+  of is never recovered at `ANALYZE_EXECUTE`'s entry; every read of the
+  bound PR before a launch or a send refuses one another run owns; and a
+  takeover is the operator's edit of the marker, confirmed by `unblock
+  --take-over`. No effect kind, state field or protocol number is added.
+  Coordinated with ADR 0008 D17.2 and D17.4, and with ADR 0012 D3.
 - **Note:** [ADR 0009](0009-removing-local-mode-strict-refusal-protocol-and-sequencing.md) removed LOCAL mode (#388): §2.1's LOCAL
   prompts and K10's LOCAL refusal no longer apply, and §2.13's refusal of a
   LOCAL state carrying effect state is replaced by ADR 0009 D4's refusal of
@@ -974,7 +983,7 @@ target URL, the identity and the marker are the controller's.
   - K1 is `observed`.
 - **Payload:** a title and body. The body is the agent's validated text
   followed by a controller-rendered `Closes #n` line and the implementation
-  marker.
+  marker, which names the record's run as the PR's owner (D9.4a).
 - **Completion read-back:** the all-states listing filtered by head branch
   shows exactly one PR, and it is:
   - open;
@@ -1009,7 +1018,8 @@ target URL, the identity and the marker are the controller's.
   - its body equals the recorded base and carries no implementation marker
     for the issue (D5.5).
 - **Payload:** a body append (D5.5). The block is `Closes #n` and the
-  implementation marker, and the base is the PR body. D5.5's credential
+  implementation marker naming the record's run as the owner (D9.4a), and
+  the base is the PR body. D5.5's credential
   check judges the whole payload, base included.
 - **Completion read-back:**
   - the body equals the payload, byte for byte;
@@ -1116,9 +1126,9 @@ target URL, the identity and the marker are the controller's.
   - no PR in any state is headed at the replacement branch;
   - K1 to that branch is `observed`.
 - **Payload:** a title and body. The body is the agent's validated text,
-  followed by controller-rendered `Closes #n`, the implementation marker and
-  the transaction marker. The marker's counts come from the validated
-  result.
+  followed by controller-rendered `Closes #n`, the implementation marker
+  (naming the record's run as the owner, D9.4a) and the transaction marker.
+  The transaction marker's counts come from the validated result.
 - **Completion read-back:** the existing `_bind_replacement` predicates:
   - above the watermark;
   - exactly one valid attestation;
@@ -2175,6 +2185,139 @@ its author. Only the effect records and the entry observation prove origin.
   - A closed or merged PR on the branch is `BLOCKED`.
   - A remote branch with no PR is prior work: its head becomes K1's expected
     old value, and it is fetched so that the agent continues from it.
+
+  **Amended by D9.4a (#414):** the first rule above recovers only the PR
+  the run's own state persisted. A marked PR the state has no record of is
+  refused.
+- **D9.4a (#414) Discovery is not ownership.** The first rule of D9.4
+  recovered the one open marked PR of the issue at any fresh entry. A fresh
+  state could not tell a PR its own crashed run left behind from one
+  another controller was still driving, and nothing else could: L0 does
+  not coordinate independent clones, and the ownership guards of ADR 0008
+  read local files only. In #387 a second environment, under the same
+  GitHub login, adopted a PR a live controller was reviewing and launched
+  a second reviewer. Only D9.6's read before the post stopped it, and only
+  because both runs had bound the same revision. GitHub is the one place
+  two environments meet, so the owner is recorded there, and authority
+  stays with the state.
+  - **The owner on the marker.** The `ai-implementation` payload gains
+    `owner_run_id`, the `run_id` of the state that publishes the PR. K2's
+    body, K3's block and K7's body carry it, rendered from the record's own
+    run, and a record whose marker names another run is refused on load.
+    It is metadata, not identity. `ImplementationClaim.key` stays the
+    issue, so an issue still has one implementation PR, and K2, K3 and K7's
+    preconditions, listings and read-backs are unchanged. The value is held
+    to the run-id rule (`RUN_ID_RE`, at most 128 characters). Any other
+    value is a defect of the PR that carries it, and a defect is
+    inconclusive, never "no owner". A marker without the field is a
+    *legacy* marker, on a PR opened before #414. The review marker's
+    identity gains no run id: two runs' round-1 comments must stay one
+    key, so that D9.6 refuses the second. The run id becomes published
+    text. A run whose id has a credential shape (it is read from
+    `state.json`, #6) cannot publish its marker, so its entry blocks
+    (`pr-owner`) before the launch, rather than have the agent's result
+    refused for text the agent did not write.
+  - **Authority stays with the state (D9.3).** The shared login can write
+    any owner, so the field can only make a run refuse. A run drives a PR
+    only when its own state bound it, and the marker it re-reads names
+    this run, names no run (legacy), or is absent. The state binds it
+    through K2, K3 or K7's completion, the pre-#414 recovery, or a
+    takeover.
+  - **The fresh entry.** An open marked PR that the state did not persist
+    is never recovered, whatever run its marker names, this one included.
+    The entry blocks before any launch (`pr-owner`). The reason names the
+    PR, its owner (or that it names none), the marker that would name this
+    run, and `unblock --take-over`. The state's own persisted PR is
+    recovered as before, unless its marker now names another run. The
+    one-shot legacy re-entry of D13.4 still recovers an ownerless marked
+    PR, since its own agent copied that marker from the prompt.
+  - **Fencing at every boundary.** The owner is checked on the body of
+    every read of the bound PR before a launch or a send. These are:
+    - `REVIEW`'s binding;
+    - a read right before K4 is sent, on every entry that sends it (the one
+      read this adds: a reviewer runs for minutes, and a takeover in
+      between must not get its comment posted);
+    - `FIX`'s entry and its plan's reads before the first send and before
+      the push;
+    - the merge gate's checks read, before a `MERGED` PR is reconciled or
+      counted;
+    - the replan checkpoint and the read before the source is closed;
+    - `unblock` with a PR bound.
+
+    Another run's owner, or a defect, blocks (`pr-owner`) with nothing
+    more sent, records keeping their stage. `unblock` refuses while it
+    holds, whatever the PR's revision, so a run whose PR another controller
+    pushed past the bound HEAD re-enters nothing and launches nothing. A
+    replan refused this way is rejected as any other checkpoint is.
+  - **Takeover is the operator's, on GitHub (ADR 0012 D3).** First the
+    operator stops the run that owns the PR. Then they replace the marker
+    in the PR body with the one naming the taking run (its `BLOCKED` reason
+    prints it exactly), and run `unblock --take-over <PR URL>` on that
+    run. The edit is the takeover every other run reads. The flag is the
+    taking state's record of it, since a marker naming a run proves
+    nothing by itself. The unblock is refused, with nothing written,
+    unless all of these hold:
+    - no PR is bound;
+    - no `ANALYZE_EXECUTE` plan or record is saved (the journal is
+      completed first);
+    - the issue is selectable;
+    - the strict marker listing resolves exactly the PR named, by D9.4's
+      candidate rules (one, in the repository, not headed in a fork, a
+      readable head and base);
+    - its marker names this run.
+
+    Applied, it binds the PR (`current_pr_url`, HEAD, base and branch, the
+    merge base cleared for `REVIEW`) and enters `REVIEW`
+    (`BLOCKED -> REVIEW`), recording `take-over <url>` as the
+    `unblock_history` action. A displaced run whose PR is handed back
+    needs no flag: once the marker names it again, a plain `unblock`
+    decides from its review binding as before.
+  - **What a takeover carries.** The taking run reviews from its own
+    round 1. It inherits no finding, verdict, round count or certificate,
+    exactly as the pre-#414 recovery did. D9.6 still refuses a round
+    comment already on the PR at the bound revision.
+  - **K3.** K3 adopts only an unmarked PR, which no run owns. Its block
+    names this run, so a run still bound to that PR (legacy, or a removed
+    marker) is displaced at its next boundary rather than left driving
+    beside it.
+  - **Legacy PRs.** A run bound to a PR with a legacy marker keeps driving
+    it, and a fresh run refuses it. Two runs already bound to one legacy
+    PR, as #387 left them, are separated by writing the one to keep into
+    the marker.
+  - **No protocol change.** No state field is added and no record schema
+    changes. A K2, K3 or K7 record saved before #414 holds the ownerless
+    marker; it loads and completes, and publishes a legacy PR. One saved
+    now holds the owner, which an older controller's loader refuses as a
+    malformed record rather than as a newer protocol.
+
+  *Rejected.*
+  - **A controller-written takeover (a new effect kind).** ADR 0012 D3
+    leaves another object's ownership to the operator, on GitHub, and D10
+    there approves a new write kind separately. The operator's edit is the
+    one write a takeover needs, and the controller verifies it on reads it
+    already makes.
+  - **An owner generation (a fencing epoch).** A run id belongs to one
+    state and is never reused, and a takeover always names the taking
+    run. A → B → A therefore happens only through a takeover from A's own
+    state, which A then drives legitimately. Two copies of one state
+    directory share an id, and would defeat an epoch the same way.
+  - **Refusing only a PR that carries markers the state never recorded**
+    (the issue's option 2). It is blind before the first review comment,
+    which is exactly when #387's second run started.
+  - **Documenting one controller per issue** (option 3). It prevents
+    nothing.
+  - **Adopting a marker that names this run.** Anyone with the login can
+    write it.
+
+  *Residual.* GitHub offers no conditional body update and no
+  compare-and-swap between the owner read and the next write. A takeover
+  that lands between the read before a send and the send is seen at the
+  next boundary. This is cooperative fencing, not a mutex: the operator
+  stops the old controller before the edit, and K1's lease, D9.6 and the
+  merge gate still bound what slips through. Two copies of one state
+  directory are one run to GitHub, as they are to L0. A replan
+  transaction already past its close, and an `UPDATE_EPIC` after the
+  merge, run as journaled.
 - **D9.5 (#163) `FIX`.** Marker-bearing follow-ups found at entry are handed
   over and are never republished, as with #90's `EXISTING_FOLLOW_UP_ISSUES`
   today. An open finding's own follow-up is that finding's follow-up: it is

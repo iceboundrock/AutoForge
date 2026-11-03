@@ -445,7 +445,7 @@ never advances the state machine. In brief:
 | Phase | Who | What the controller checks |
 |---|---|---|
 | `INITIALIZING` | controller | the checkout's `origin` (read locally, named as GitHub names it) is the issue's repo, the issue is in this repo, is not the EPIC, exists and is OPEN |
-| `ANALYZE_EXECUTE` | Claude Code (`analyze_execute`), which makes no GitHub write | an open PR already carrying the issue's `ai-implementation` marker is adopted without running the agent (two block); the agent commits on its worktree's detached HEAD, and the controller checks that HEAD itself (the reported SHA, descent from the default branch head and from the branch head, every commit message), pushes it to `autoforge/<n>`, opens the PR with the agent's title and body (or adopts the open unmarked PR on that branch), journalling each write before it is sent, and reads the PR back at exactly the pushed HEAD; a marker PR or a branch head it did not write blocks |
+| `ANALYZE_EXECUTE` | Claude Code (`analyze_execute`), which makes no GitHub write | an open PR already carrying the issue's `ai-implementation` marker blocks without running the agent unless this run recorded it ([taking over a PR](#taking-over-a-pr-another-run-owns); two block); the agent commits on its worktree's detached HEAD, and the controller checks that HEAD itself (the reported SHA, descent from the default branch head and from the branch head, every commit message), pushes it to `autoforge/<n>`, opens the PR with the agent's title and body (or adopts the open unmarked PR on that branch), journalling each write before it is sent, and reads the PR back at exactly the pushed HEAD; a marker PR or a branch head it did not write blocks |
 | `REVIEW` | OpenCode (`review_round_1`, `review_round_2_5`, `review_round_6_plus`), which makes no GitHub write | the round is bound to the PR, HEAD, base and merge base read from GitHub, and a comment already carrying that round's marker blocks (the controller never adopts one it did not post); the reviewer's round and HEAD must match the binding and `needs_fix_round == (len(findings) > 0)`; the controller renders the review comment from the result, journals it, posts it and reads it back, so a crash or `resume` never posts a second one; then controller policy picks `FIX`, `READY_FOR_MERGE`, `REPLAN_REEXECUTE` or `BLOCKED` |
 | `FIX` | Claude Code (`fix`), which makes no GitHub write | the PR is still at the reviewed revision (else back to `REVIEW` without running the fixer); the open issues already marked as a finding's follow-up are handed to the fixer to reuse, and one the controller did not hand over or create blocks; the fixer commits on its worktree's detached HEAD and resolves every open finding exactly once, and the controller checks that HEAD itself (the reported SHA, descent from the reviewed HEAD, every commit message, a commit for each `fixed` finding); it creates the follow-up issues the fixer asks for, appends the finding markers to the handed-over issues it defers to, then pushes the commit last, journalling each write before it is sent, and reads the follow-ups and the PR head back, so a crash or `resume` never creates or pushes twice; a push it did not make sends the PR back to `REVIEW` |
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`), which makes no GitHub write | one durable transaction; the agent commits on its worktree's detached HEAD at the default branch head the controller recorded, and the controller checks that HEAD itself (the reported SHA, descent from that base, every commit message), pushes it to `autoforge/<n>-replan-<transaction id>`, creates the replacement PR with the agent's title and body followed by the controller's markers, journalling each write before it is sent, and binds the PR only at exactly the pushed HEAD, so a crash or `resume` never pushes or creates twice; a replacement branch or a marker PR it did not write rejects the transaction; the old PR is closed by the controller only while both PRs still match their checkpoints |
@@ -568,8 +568,8 @@ names the effect in the reason: perform the write by hand or remove the
 conflicting object, then `unblock`; the controller reconciles the write
 against GitHub again before it issues anything. `ANALYZE_EXECUTE` blocks the
 same way on anything it did not write: a PR carrying the issue's marker
-that appeared while the agent ran (if it is the implementation, `unblock`
-binds it), a push to, creation or deletion of `autoforge/<n>` it did not
+that appeared while the agent ran (if it is the implementation, take it
+over: see [Taking over a PR another run owns](#taking-over-a-pr-another-run-owns)), a push to, creation or deletion of `autoforge/<n>` it did not
 record (inspect the branch; `unblock` reads it again and the agent continues
 from its head), a closed or merged PR on that branch (reopen it to have it
 adopted, or finish the issue by hand), an open PR on that branch the entry
@@ -896,6 +896,55 @@ and still judges whether they resolve the finding. `run` refuses to replace a
 `BLOCKED` or `FAILED` run that holds operator actions without `--force`; the
 comments stay on GitHub either way.
 
+### Taking over a PR another run owns
+
+Each implementation PR the controller opens or adopts names its run in its
+`ai-implementation` marker: `<!-- ai-implementation: {"issue": "...",
+"owner_run_id": "af-..."} -->` (#414). A run drives only a PR it recorded
+itself while that marker names it (or names no run: a PR opened before
+#414). Two cases stop a run with `BLOCKED` and `pr-owner`, before anything
+is launched or written.
+
+- **A run that has no record of the issue's PR.** It may be a new
+  `--state-dir`, another machine or container under the same GitHub login,
+  a scheduler namespace after `epic archive`, or a run whose state was
+  lost. Its `ANALYZE_EXECUTE` entry finds the issue's open marked PR and
+  does not bind it, whatever run the marker names. Finding a PR is not
+  owning it, and the controller cannot tell a PR its own crashed run left
+  behind from one another controller is still reviewing (#387).
+- **A run whose PR another run took over.** It stops at its next phase
+  entry, before the review comment is posted, before `FIX` sends anything,
+  and at the merge gate. A plain `unblock` refuses for as long as the marker
+  names the other run.
+
+To take the PR over:
+
+1. Make sure no controller still drives it. Stop the run its marker names,
+   on whichever machine runs it. The controller cannot do this for you:
+   nothing but the marker connects two environments.
+2. Edit the PR body on GitHub and replace the whole `ai-implementation`
+   marker with the one the `BLOCKED` reason prints, which names the taking
+   run. Other runs read this edit: from then on, the old run blocks at its
+   next phase entry.
+3. Run `autoforge unblock --take-over <PR URL> --reason "..."` on the
+   taking run, with the `--state-dir` (or `--config`) it uses. It refuses,
+   writing nothing, unless the run has no PR bound and no `ANALYZE_EXECUTE`
+   plan or record saved, the issue can be worked on, the PR named is the issue's one
+   open marked PR (in the repository, not from a fork), and its marker
+   names this run. A marker naming the run without the flag binds nothing.
+   Anyone with the login could have written it.
+4. `autoforge resume`, or `epic resume` for a scheduler's issue. The run
+   reviews the PR from its own round 1. It carries over no finding,
+   verdict or certificate of the run that owned the PR, and a review
+   comment already on the PR for that round at the same revision still
+   blocks, as any comment the run did not post does.
+
+To hand a PR back to a displaced run, do the same with that run's marker,
+then run a plain `unblock` on it. It is bound to the PR already. This is
+cooperative fencing, not a lock: GitHub has no conditional body update, so
+a takeover that lands while the old run is between its last read and a
+write is seen at its next phase entry. Stop the old run first.
+
 ### DONE and FAILED
 
 `DONE` is reached when `UPDATE_EPIC` reports no next issue. `DONE` and
@@ -1117,8 +1166,12 @@ archived (an unusable claim file is moved aside), then moves
 order. It keeps the run logs, the worker logs, the worktree, the binding
 and the claim history, and says so; the run's loop-bound evidence (review
 rounds, fix attempts, the replan count) and its validation records then
-live only in the archived state: the next admission starts the issue fresh
-and adopts its marked PR. Re-running it completes an interrupted archive;
+live only in the archived state: the next admission starts the issue fresh.
+An open PR of the issue is kept, and stays the archived run's: archiving
+moves a local file, while the PR's owner is recorded on GitHub, in its
+implementation marker (#414). The fresh state's entry therefore blocks on
+the PR, and [taking it over](#taking-over-a-pr-another-run-owns) hands it to
+the new state. Re-running it completes an interrupted archive;
 on an issue with nothing left it says "nothing left to archive". It reads
 nothing from GitHub but the repository's id, which the binding's must be
 (see `epic stop` above), and does not touch `scheduler.json`.

@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import cli, epic_commands, scheduler_stop
+from autoforge.claims import render_implementation_marker
 from autoforge.engine import ControllerEngine
 from autoforge.epic_commands import DRAIN_HELP, EXIT_OPEN_CLAIMS, STATUS_SCHEMA
 from autoforge.errors import ExecutionError
@@ -1124,7 +1125,14 @@ def test_a_drain_and_a_now_stop_of_a_running_scheduler(epic, signals):
 # -- epic archive ------------------------------------------------------------------------
 
 
-def test_a_blocked_issue_archived_is_admitted_fresh_and_adopts_its_pr(epic):
+def test_a_blocked_issue_archived_is_admitted_fresh_and_takes_its_pr_over_only_when_handed_it(
+    epic, monkeypatch
+):
+    """ADR 0008 D17.4, amended by #414: the fresh run 'epic archive' admits
+    finds the issue's PR and launches no implementer, but the PR's marker
+    names the archived run, so it binds nothing and blocks (ADR 0004 D9.4a).
+    The operator writes the new run into the marker and runs 'unblock
+    --take-over' on the namespace; 'epic resume' then reviews the PR."""
     e = epic()
     b = e.b
     b.issue(2, (IMPLEMENT, {"do": "blocked"}), world=str(world(b, 2)))
@@ -1138,14 +1146,49 @@ def test_a_blocked_issue_archived_is_admitted_fresh_and_adopts_its_pr(epic):
     assert f"the state was moved aside to {archived}" in out
     assert "kept: the run logs" in out and "the claim history" in out
     assert "loop-bound evidence" in out and "now live only in" in out
+    assert "until 'unblock --take-over'" in out
     assert load_state(archived).phase is Phase.BLOCKED
     assert e.rows()[2]["category"] == "ready"
-    b.issue(2, (REVIEW,), world=str(world(b, 2)))  # the PR is adopted: no implementer runs
+    b.issue(2, (REVIEW,), world=str(world(b, 2)))  # no implementer runs
     assert e.run()[0] == 0
+    fresh = b.state(2)
+    assert fresh.phase is Phase.BLOCKED and fresh.current_pr_url == ""
+    assert fresh.run_id != first.run_id
+    assert f"names run {first.run_id} as its owner" in fresh.block_reason
+    assert f"unblock --take-over {first.current_pr_url}" in fresh.block_reason
+    (pr,) = prs(b, 2)
+    issue = url(2)
+    assert render_implementation_marker(issue, first.run_id) in pr.body
+
+    # The operator hands the PR to the fresh run on GitHub, then unblocks the
+    # namespace with --take-over (in this process, on the issue's GitHub).
+    with open(world(b, 2), "rb") as f:
+        gh = pickle.load(f)
+    gh.prs[pr.url].body = pr.body.replace(
+        render_implementation_marker(issue, first.run_id),
+        render_implementation_marker(issue, fresh.run_id),
+    )
+    with open(world(b, 2), "wb") as f:
+        pickle.dump(gh, f)
+    engine_for = cli._engine_for
+
+    def on_the_issues_github(args, cfg=None):
+        engine = engine_for(args, cfg)
+        engine._github = gh
+        return engine
+
+    monkeypatch.setattr(cli, "_engine_for", on_the_issues_github)
+    words = ("unblock", "--take-over", pr.url, "--reason", "the archived run is gone")
+    code, out, err = e.cli("--state-dir", str(b.ns(2).state_dir), *words)
+    assert code == 0, err
+    assert "BLOCKED -> REVIEW" in out
+    taken = b.state(2)
+    assert taken.phase is Phase.REVIEW and taken.current_pr_url == first.current_pr_url
+
+    assert e.resume()[0] == 0
     again = b.state(2)
     assert again.phase is Phase.READY_FOR_MERGE and again.current_pr_url == first.current_pr_url
-    assert again.run_id != first.run_id and len(prs(b, 2)) == 1
-    assert [c.claim.generation for c in b.claims(2).history] == [1, 2]
+    assert again.run_id == fresh.run_id and len(prs(b, 2)) == 1
     assert e.cli("epic", "archive", EPIC, "2")[0] == 0
     assert "nothing left to archive" in e.cli("epic", "archive", EPIC, "2")[1]
 

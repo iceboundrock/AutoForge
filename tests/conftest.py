@@ -318,11 +318,15 @@ def post_progress_comment(gh: FakeGitHub, cid: int = 300) -> None:
     gh.add_comment(EPIC, cid, progress_comment_body())
 
 
-def implementation_pr_body(issue_url: str = ISSUE) -> str:
-    """A PR body carrying the issue's implementation marker (an existing implementation PR)."""
+def implementation_pr_body(issue_url: str = ISSUE, owner_run_id: str | None = None) -> str:
+    """A PR body carrying the issue's implementation marker (an existing implementation PR).
+
+    The marker names ``owner_run_id`` as the PR's owner, or no owner, as a PR
+    opened before #414 does.
+    """
     from autoforge.engine import render_implementation_marker
 
-    return f"Closes {issue_url}\n\n{render_implementation_marker(issue_url)}\n"
+    return f"Closes {issue_url}\n\n{render_implementation_marker(issue_url, owner_run_id)}\n"
 
 
 def follow_up_issue_body(finding_id: str, pr_url: str = PR) -> str:

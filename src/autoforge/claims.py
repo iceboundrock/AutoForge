@@ -62,12 +62,15 @@ from .result_parser import (
     MAX_FINDING_ID_CHARS,
     MAX_URL_CHARS,
 )
+from .runlog import RUN_ID_RE
 from .validation import GitHubIssueRef, GitHubPullRequestRef, parse_issue_url, parse_pr_url
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # A git refname component is at most 255 bytes and a branch name a few of
 # them; the bound only keeps an oversized marker value out of a block reason.
 MAX_BASE_REF_CHARS = 512
+# The bound of ``runlog.RUN_ID_RE`` (one leading character and 127 more).
+MAX_RUN_ID_CHARS = 128
 _BASE_REF_FORBIDDEN_RE = re.compile(r"[\s\x00-\x1f\x7f]")
 
 
@@ -95,9 +98,20 @@ class Claim(Protocol):
 
 @dataclass(frozen=True)
 class ImplementationClaim:
-    """``ai-implementation``: the PR body names the issue it implements."""
+    """``ai-implementation``: the PR body names the issue it implements, and the run that owns it.
+
+    ``owner_run_id`` (#414, ADR 0004 D9.4a) is the run that drives the PR:
+    the run whose K2 opened it, whose K3 adopted it, whose K7 replaced it,
+    or that the operator handed it to by rewriting it. It is metadata, not
+    identity: two markers for one issue are the same claim whatever runs
+    they name, so a PR is found by its issue alone and an issue still has
+    one implementation PR. ``None`` is a marker written before the owner
+    was part of the schema. The value is an untrusted claim like the rest
+    of the marker: it can make a run refuse a PR, never adopt one.
+    """
 
     issue: GitHubIssueRef
+    owner_run_id: str | None = None
 
     @property
     def key(self) -> Hashable:
@@ -306,9 +320,28 @@ def _finding_id(value: object, what: str, round_: int | None = None) -> str:
     return value
 
 
+def _owner_run_id(value: object) -> str:
+    """The run a marker names as its owner, held to the run-id rule of ``runlog``.
+
+    Length is checked before shape, so an oversized value is refused by its
+    length and never quoted; the shape is the one every run id the
+    controller generates or loads has (:data:`RUN_ID_RE`).
+    """
+    if not isinstance(value, str):
+        raise ValueError("owner_run_id must be a run id string")
+    if len(value) > MAX_RUN_ID_CHARS:
+        raise ValueError(
+            f"owner_run_id is {len(value)} characters; a run id is at most {MAX_RUN_ID_CHARS}"
+        )
+    if not RUN_ID_RE.fullmatch(value):  # `$` alone admits a trailing newline
+        raise ValueError(f"owner_run_id {value!r} is not a run id")
+    return value
+
+
 def _decode_implementation(payload: dict) -> ImplementationClaim:
-    _exact_keys(payload, ("issue",))
-    return ImplementationClaim(issue=_issue_ref(payload, "issue"))
+    _exact_keys(payload, ("issue",), ("owner_run_id",))
+    owner = _owner_run_id(payload["owner_run_id"]) if "owner_run_id" in payload else None
+    return ImplementationClaim(issue=_issue_ref(payload, "issue"), owner_run_id=owner)
 
 
 def _decode_review(payload: dict) -> ReviewClaim:
@@ -483,9 +516,17 @@ OPERATOR_COMMENT: MarkerKind[OperatorCommentClaim] = MarkerKind(
 )
 
 
-def render_implementation_marker(issue_url: str) -> str:
-    """The exact ``ai-implementation`` marker the issue's implementation PR carries."""
-    return IMPLEMENTATION.render({"issue": parse_issue_url(issue_url).canonical})
+def render_implementation_marker(issue_url: str, owner_run_id: str | None = None) -> str:
+    """The exact ``ai-implementation`` marker the issue's implementation PR carries.
+
+    ``owner_run_id`` names the run that owns the PR (#414). Every PR the
+    controller opens, adopts or replaces carries it; ``None`` renders the
+    ownerless marker of a PR opened before the owner was recorded.
+    """
+    payload: dict = {"issue": parse_issue_url(issue_url).canonical}
+    if owner_run_id is not None:
+        payload["owner_run_id"] = owner_run_id
+    return IMPLEMENTATION.render(payload)
 
 
 def render_progress_marker(issue_url: str, pr_url: str) -> str:

@@ -31,6 +31,11 @@
   admission; no agent runs and no claim, `scheduler.json` or GitHub object
   is written. Like `unblock` (D17.3) it may edit a namespace's state, only
   while no orchestrator is live; like `epic archive` it is never automatic.
+- **Amended by #414:** D17.2's residual and D17.4. A fresh state no longer
+  adopts a marked PR it has no record of (ADR 0004 D9.4a), so archiving a
+  namespace transfers no ownership on GitHub: the next admission blocks on
+  the PR the archived state's run owns, and the operator hands it to the
+  new state with `unblock --take-over` (D17.3).
 - **Where:** placement is decided per decision and collected in §5.
   Existing code this record builds on: `src/autoforge/locking.py`,
   `engine.py`, `state.py`, `transitions.py`, `cli.py`, `executor.py`,
@@ -1518,8 +1523,11 @@ migrated. **Exclusion in time** is L0 (D10).
   - Other `--state-dir` locations are unknowable, so the scheduler may admit
     an issue such a state names. The forward guard then refuses to continue
     that state. That residual is today's (two sequential runs with
-    different state dirs on one issue), and the engine's PR adoption by
-    marker keeps it from creating a second PR.
+    different state dirs on one issue). **Amended by #414:** the second
+    state's entry neither creates a second PR nor drives the first. The
+    issue's marked PR is one the second state has no record of, so its
+    entry blocks naming the run that owns it (ADR 0004 D9.4a), and the
+    state that owns it is fenced off it after a takeover.
 
 **D17.3 (#178).** **Namespace paths.** Standalone `run`, `step` and
 `resume` refuse a state dir inside `<common>/autoforge/scheduler/`,
@@ -1543,12 +1551,19 @@ after a crash completes the archive (D14.5 lists both windows). A crash
 between the link and the unlink leaves both names; the re-run moves
 `state.json` aside again.
 
-The next admission starts fresh (`fresh`), and the engine adopts any
-existing marked PR, so archiving discards no GitHub work. It does
-deliberately discard the per-issue loop-bound evidence (review rounds, fix
-attempts, replan count) and the issue's validation records and
-certificate, which live in the archived state. That is the point of an
-explicit retry, and the reason it is never automatic. Archiving is also the
+The next admission starts fresh (`fresh`), and archiving discards no
+GitHub work: an open PR of the issue stays as it is. **Amended by #414:**
+the engine no longer adopts it. Archiving moves a local state aside, and a
+PR's owner is recorded on GitHub, in its implementation marker, so the
+fresh state's `ANALYZE_EXECUTE` entry blocks on the PR, which names the
+archived state's run (ADR 0004 D9.4a). The operator replaces that marker
+with the one the block reason names and hands the PR to the new state with
+`unblock --take-over` in the namespace's state directory (D17.3), then
+continues with `epic resume`. Archiving also deliberately discards the
+per-issue loop-bound evidence (review rounds, fix attempts, replan count)
+and the issue's validation records and certificate, which live in the
+archived state. That is the point of an explicit retry, and the reason it
+is never automatic. Archiving is also the
 operator's only way to hand a scheduler-owned issue to a standalone run,
 for example to merge it through the standalone merge gate.
 

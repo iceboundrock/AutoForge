@@ -151,8 +151,13 @@ REPLACEMENT_BRANCH = "autoforge/2-replan-1"
 SECRET = "supersecretvalue123"
 CREDENTIAL_TEXT = f"GH_TOKEN={SECRET}"
 
-IMPL_MARKER = render_implementation_marker(ISSUE)
+IMPL_MARKER = render_implementation_marker(ISSUE, RUN_ID)
 CLOSING = f"Closes #2\n\n{IMPL_MARKER}"
+# The ownerless marker of a record saved before #414, and its closing block.
+LEGACY_IMPL_MARKER = render_implementation_marker(ISSUE)
+LEGACY_CLOSING = f"Closes #2\n\n{LEGACY_IMPL_MARKER}"
+# The marker of a PR another run owns (#414).
+FOREIGN_IMPL_MARKER = render_implementation_marker(ISSUE, "run-161")
 FOLLOW_UP_MARKER = render_follow_up_marker(PR, "R1-F1")
 PROGRESS_MARKER = render_progress_marker(ISSUE, PR)
 REVIEW_PAYLOAD: dict[str, object] = {
@@ -218,28 +223,30 @@ def impl_record(
     head: str = BRANCH,
     base: str = "main",
     by: EffectOwner = ANALYZE_OWNER,
+    marker: str = IMPL_MARKER,
 ) -> EffectRecord:
+    closing = f"Closes #2\n\n{marker}"
     return EffectRecord.plan(
         1,
         EffectKind.IMPLEMENTATION_PR,
         by,
-        identity={"repository": REPO, "marker": IMPL_MARKER, "head_branch": head},
+        identity={"repository": REPO, "marker": marker, "head_branch": head},
         target={"repository": REPO, "base": base, "head": head},
         precondition={"absent": True},
         payload={
             "title": title,
-            "body": f"Implements {ISSUE}.\n\n{CLOSING}" if body is None else body,
+            "body": f"Implements {ISSUE}.\n\n{closing}" if body is None else body,
         },
     )
 
 
-def adopt_record(base: str = ADOPT_BASE) -> EffectRecord:
-    block = CLOSING
+def adopt_record(base: str = ADOPT_BASE, marker: str = IMPL_MARKER) -> EffectRecord:
+    block = f"Closes #2\n\n{marker}"
     return EffectRecord.plan(
         1,
         EffectKind.ADOPT_PR,
         ANALYZE_OWNER,
-        identity={"pr_url": PR, "marker": IMPL_MARKER},
+        identity={"pr_url": PR, "marker": marker},
         target={"pr_url": PR},
         precondition={"base_sha256": sha256_text(base)},
         payload={"body": compose_append(base, block), "block": block},
@@ -298,6 +305,7 @@ def replacement_record(
     head: str = REPLACEMENT_BRANCH,
     position: int = 1,
     summary: str = f"Replaces {PR} for {ISSUE}.",
+    marker_owner: str | None = RUN_ID,
 ) -> EffectRecord:
     return EffectRecord.plan(
         position,
@@ -308,7 +316,7 @@ def replacement_record(
         precondition={"absent": True, "watermark": watermark},
         payload={
             "title": "Replace PR #42 for #2",
-            "body": replacement_pr_body(summary, ISSUE, REPLAN_MARKER),
+            "body": replacement_pr_body(summary, ISSUE, REPLAN_MARKER, marker_owner),
         },
     )
 
@@ -1305,14 +1313,17 @@ CORRUPTIONS = [
         REPLACE,
         both(
             at("identity.transaction_marker", FAILED_REPLAN_MARKER),
-            at("payload.body", replacement_pr_body("Replacement.", ISSUE, FAILED_REPLAN_MARKER)),
+            at(
+                "payload.body",
+                replacement_pr_body("Replacement.", ISSUE, FAILED_REPLAN_MARKER, RUN_ID),
+            ),
         ),
         "attesting failed tests",
     ),
     _p(
         "k7-text-closes-an-issue",
         REPLACE,
-        at("payload.body", replacement_pr_body("Fixes #9 too.", ISSUE, REPLAN_MARKER)),
+        at("payload.body", replacement_pr_body("Fixes #9 too.", ISSUE, REPLAN_MARKER, RUN_ID)),
         "has an invalid PR body",
     ),
     _p(
@@ -1320,7 +1331,9 @@ CORRUPTIONS = [
         REPLACE,
         at(
             "payload.body",
-            replacement_pr_body(f"Replacement.\n\n{OTHER_IMPL_MARKER}", ISSUE, REPLAN_MARKER),
+            replacement_pr_body(
+                f"Replacement.\n\n{OTHER_IMPL_MARKER}", ISSUE, REPLAN_MARKER, RUN_ID
+            ),
         ),
         "has an invalid PR body",
     ),
@@ -1530,7 +1543,12 @@ def test_field_bounds_are_inclusive():
     assert impl_record(body=f"{text}\n\n{CLOSING}").body.startswith(text)
     with pytest.raises(StateError, match=f"is {MAX_PR_BODY_CHARS + 1} characters"):
         impl_record(body=f"{text}x\n\n{CLOSING}")
-    assert impl_record(by=owner(Phase.ANALYZE_EXECUTE, run_id="r" * 128)).owner.run_id
+    longest = "r" * 128  # a run id at its bound, which the marker carries (#414)
+    record = impl_record(
+        by=owner(Phase.ANALYZE_EXECUTE, run_id=longest),
+        marker=render_implementation_marker(ISSUE, longest),
+    )
+    assert record.owner.run_id == longest
     raw = impl_record().to_dict() | {"stage": "conflict", "reason": "r" * MAX_CONFLICT_REASON_CHARS}
     assert len(EffectRecord.from_dict(raw).reason) == MAX_CONFLICT_REASON_CHARS
     ids = tuple(f"R1-F{i}" for i in range(1, MAX_FINDINGS_PER_REVIEW + 1))
@@ -2051,7 +2069,8 @@ def test_an_adoption_keeps_the_adopted_prs_own_body_as_it_is():
     human's text the controller does not rewrite, so the agent-text policy is
     not applied to it; only the block is the controller's, and it is exactly
     the closing block of the owner's issue."""
-    assert implementation_closing_block(ISSUE) == CLOSING
+    assert implementation_closing_block(ISSUE, RUN_ID) == CLOSING
+    assert implementation_closing_block(ISSUE, None) == LEGACY_CLOSING
     base = "Started by hand, thanks @octocat.\n\nFixes #3"
     effects = load_phase_effects(
         [analyze_push().to_dict(), adopt_record(base).to_dict()],
@@ -2060,6 +2079,27 @@ def test_an_adoption_keeps_the_adopted_prs_own_body_as_it_is():
         ANALYZE_BINDING,
     )
     assert effects.records[1].body == compose_append(base, CLOSING)
+
+
+def test_a_record_publishes_the_marker_of_its_own_run_or_a_legacy_ownerless_one():
+    """#414 (ADR 0004 D9.4a): K2's and K3's marker names the run that owns the
+    record, and K7's closing block names it too. A record saved before #414
+    carries the ownerless marker and still loads, so a run persisted then
+    completes its plan; a record whose marker names another run is corrupt,
+    since the controller never journals a PR another run owns."""
+    for marker in (IMPL_MARKER, LEGACY_IMPL_MARKER):
+        closing = f"Closes #2\n\n{marker}"
+        assert impl_record(marker=marker).body.endswith(closing)
+        assert adopt_record(marker=marker).payload["block"] == closing
+    with pytest.raises(StateError, match="marker owned by another run than its owner's"):
+        impl_record(marker=FOREIGN_IMPL_MARKER)
+    with pytest.raises(StateError, match="marker owned by another run than its owner's"):
+        adopt_record(marker=FOREIGN_IMPL_MARKER)
+    for marker_owner in (RUN_ID, None):
+        record = replacement_record(marker_owner=marker_owner)
+        assert implementation_closing_block(ISSUE, marker_owner) in record.body
+    with pytest.raises(StateError, match="the closing block of its owner's issue"):
+        replacement_record(marker_owner="run-161")
 
 
 # -- operations: success and adoption (all GitHub kinds) --------------------------------

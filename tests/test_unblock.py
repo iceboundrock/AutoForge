@@ -156,36 +156,137 @@ def test_unblock_bounds_the_reason_length(tmp_state_dir, fake_github):
 
 
 # -- no PR bound: ANALYZE_EXECUTE once its entry probe is known to succeed ---------
-def test_unblock_without_a_pr_reenters_analyze_execute(tmp_state_dir, fake_github):
+def test_unblock_without_a_pr_takes_over_the_marked_pr_the_operator_hands_it(
+    tmp_state_dir, fake_github
+):
     """Two candidate PRs blocked ANALYZE_EXECUTE; the operator closed the stale
-    one. The controller verifies the issue and the listing itself, records the
-    action, clears the reason and re-enters the phase; `resume` then adopts."""
+    one. The one left carries the issue's marker and this run has no record
+    of it, so a plain unblock binds nothing and names the takeover (#414,
+    ADR 0004 D9.4a). The operator writes this run into the marker; 'unblock
+    --take-over' verifies the issue and the listing itself, records the
+    action, clears the reason and binds the PR into REVIEW, with no agent."""
     fake_github.add_pr(head_sha=SHA_A, body=implementation_pr_body())
     fake_github.add_pr(PR_B, head_sha=SHA_B, branch="other", state="CLOSED")
     eng = _blocked(tmp_state_dir, fake_github, reason="2 open PRs claim to implement issue #2")
-    out = eng.unblock(REASON)
-    assert out.unblocked and out.phase == "ANALYZE_EXECUTE" and not out.dry_run
-    assert "BLOCKED -> ANALYZE_EXECUTE" in out.message and "pull/42" in out.message
+    raw = eng.paths.state_file.read_text()
+    refused = eng.unblock(REASON)
+    assert not refused.unblocked and refused.phase == "BLOCKED"
+    assert f"open PR {PR} carries the implementation marker for issue #2" in refused.message
+    assert "which names no owner" in refused.message
+    assert f"unblock --take-over {PR}" in refused.message
+    _assert_untouched(eng, raw)
+
+    fake_github.prs[PR].body = implementation_pr_body(owner_run_id=eng.state.run_id)
+    out = eng.unblock(REASON, take_over=PR)
+    assert out.unblocked and out.phase == "REVIEW" and not out.dry_run
+    assert "BLOCKED -> REVIEW" in out.message and "pull/42" in out.message
     s = load_state(eng.paths.state_file)
-    assert s.phase == Phase.ANALYZE_EXECUTE and s.block_reason == ""
+    assert s.phase == Phase.REVIEW and s.block_reason == ""
+    assert (s.current_pr_url, s.current_head_sha, s.current_branch) == (PR, SHA_A, BRANCH)
+    assert s.current_merge_base_sha == ""  # REVIEW binds it
     assert s.step_count == 3  # not a step: no agent ran
     assert s.attempt == 0
     (entry,) = s.unblock_history
-    assert entry["reason"] == REASON and entry["phase"] == "ANALYZE_EXECUTE"
+    assert entry["reason"] == REASON and entry["phase"] == "REVIEW"
     assert entry["block_reason"] == "2 open PRs claim to implement issue #2"
+    assert entry["action"] == f"take-over {PR}"
     assert entry["at"].endswith("+00:00") and "pull/42" in entry["detail"]
-    (record,) = _unblock_records(eng)
+    refusal, record = _unblock_records(eng)
+    assert refusal["metadata"]["applied"] is False
     assert record["phase"] == "BLOCKED-unblock" and record["profile"].startswith("(operator")
     assert record["metadata"]["applied"] is True
-    assert record["metadata"]["target_phase"] == "ANALYZE_EXECUTE"
+    assert record["metadata"]["target_phase"] == "REVIEW"
     assert record["metadata"]["operator_reason"] == REASON
     # The live inspection is the ANALYZE_EXECUTE probe: issue + strict listing.
     assert ("get_issue", ISSUE) in fake_github.calls
     assert ("list_open_prs", "owner/repo") in fake_github.calls
-    # And the entry adopts the PR the unblock saw, without an agent.
-    nxt = eng.step()
-    assert nxt.next_phase == "REVIEW" and "recovered existing open PR" in nxt.message
-    assert eng.provider.calls == []
+    assert eng.provider.calls == [] and fake_github.effect_writes == []
+
+
+OTHER_RUN = "af-20261103T000000Z-0a1b2c"
+
+
+def test_unblock_take_over_dry_run_writes_nothing(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A, body=implementation_pr_body())
+    eng = _blocked(tmp_state_dir, fake_github)
+    fake_github.prs[PR].body = implementation_pr_body(owner_run_id=eng.state.run_id)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, take_over=PR, dry_run=True)
+    assert out.dry_run and not out.unblocked
+    assert out.message.startswith("[dry-run] would re-enter REVIEW: ")
+    assert "the operator handed the PR to this run" in out.message
+    _assert_untouched(eng, raw)
+    assert _unblock_records(eng) == []
+
+
+@pytest.mark.parametrize(
+    ("setup", "refusal"),
+    [
+        pytest.param(
+            lambda gh, eng: None,
+            "no open PR carries the implementation marker for issue #2, so there is nothing "
+            "to take over",
+            id="no-marked-pr",
+        ),
+        pytest.param(
+            lambda gh, eng: gh.add_pr(
+                head_sha=SHA_A, body=implementation_pr_body(owner_run_id=OTHER_RUN)
+            ),
+            f"the PR's implementation marker names run {OTHER_RUN}, not this run",
+            id="marker-names-another-run",
+        ),
+        pytest.param(
+            lambda gh, eng: gh.add_pr(head_sha=SHA_A, body=implementation_pr_body()),
+            "the PR's implementation marker names no owner, not this run",
+            id="ownerless-marker",
+        ),
+    ],
+)
+def test_unblock_take_over_is_refused_unless_the_marker_names_this_run(
+    tmp_state_dir, fake_github, setup, refusal
+):
+    """A takeover is written on GitHub, where every other run reads it: the
+    flag binds only the marked PR whose marker the operator rewrote to name
+    this run. Anything else stays BLOCKED with nothing written."""
+    eng = _blocked(tmp_state_dir, fake_github)
+    setup(fake_github, eng)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, take_over=PR)
+    assert not out.unblocked and out.phase == "BLOCKED"
+    assert refusal in out.message
+    _assert_untouched(eng, raw)
+
+
+def test_unblock_take_over_names_only_the_pr_the_marker_identifies(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A, body=implementation_pr_body())
+    eng = _blocked(tmp_state_dir, fake_github)
+    fake_github.prs[PR].body = implementation_pr_body(owner_run_id=eng.state.run_id)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, take_over=PR_B)
+    assert not out.unblocked
+    assert f"unblock --take-over names {PR_B}, but the open PR carrying" in out.message
+    _assert_untouched(eng, raw)
+
+
+def test_unblock_take_over_is_refused_for_a_run_bound_to_a_pr(tmp_state_dir, fake_github):
+    fake_github.add_pr(head_sha=SHA_A)
+    eng = _blocked(tmp_state_dir, fake_github, pr_url=PR, **_reviewed())
+    fake_github.prs[PR].body = implementation_pr_body(owner_run_id=eng.state.run_id)
+    raw = eng.paths.state_file.read_text()
+    out = eng.unblock(REASON, take_over=PR)
+    assert not out.unblocked
+    assert "unblock --take-over binds a PR to a run that has none" in out.message
+    _assert_untouched(eng, raw)
+
+
+@pytest.mark.parametrize("value", ["not a url", ISSUE, "https://github.com/owner/repo/pull/x"])
+def test_unblock_take_over_takes_a_pr_url(tmp_state_dir, fake_github, value):
+    eng = _blocked(tmp_state_dir, fake_github)
+    raw = eng.paths.state_file.read_text()
+    with pytest.raises(ConfigurationError, match="--take-over"):
+        eng.unblock(REASON, take_over=value)
+    _assert_untouched(eng, raw)
+    assert fake_github.calls == []
 
 
 def test_unblock_without_any_pr_lets_analyze_execute_launch(tmp_state_dir, fake_github):
@@ -1006,7 +1107,7 @@ def test_unblock_rereview_without_a_pr_is_refused(tmp_state_dir, fake_github):
 def test_unblock_rereview_excludes_the_action_flags(tmp_state_dir, fake_github, other):
     eng = _needs_fix(tmp_state_dir, fake_github)
     raw = eng.paths.state_file.read_text()
-    with pytest.raises(ConfigurationError, match="--bind-evidence and --rereview"):
+    with pytest.raises(ConfigurationError, match="--bind-evidence, --rereview and --take-over"):
         eng.unblock(REASON, rereview=True, **other)
     _assert_untouched(eng, raw)
     assert fake_github.calls == []
