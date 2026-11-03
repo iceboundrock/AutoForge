@@ -158,6 +158,7 @@ COVERAGE: Mapping[str, Entry] = {
         "test_doctor",
     ),
     "src/autoforge/replan_txn.py": ("test_cli",),
+    "src/autoforge/review_provenance.py": ("test_cli",),  # status's D9.6 report (#416)
     "src/autoforge/roadmap.py": ("test_engine",),
     "src/autoforge/run_binding.py": ("test_cli", "test_state_root"),  # run's EPIC (#293)
     "src/autoforge/run_namespace.py": ("test_engine",),

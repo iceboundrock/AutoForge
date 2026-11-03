@@ -473,6 +473,37 @@ class CommentInfo:
     parent_url: str = ""  # canonical issue/PR URL this comment belongs to
 
 
+@dataclass(frozen=True)
+class CommitPerson:
+    """A commit's author or committer as git recorded it, and the account GitHub links.
+
+    ``name`` and ``email`` are what the commit says, which whoever made it
+    chose; ``login`` is the GitHub account GitHub matched to that email, ""
+    when it matched none. Each is "" when GitHub reports none.
+    """
+
+    name: str = ""
+    email: str = ""
+    login: str = ""
+
+
+@dataclass(frozen=True)
+class PRCommitInfo:
+    """One commit of a PR, as GitHub lists the PR's commits (#416).
+
+    GitHub records when a commit was authored and committed, both as the
+    commit says, and never when it was pushed. ``headline`` is the first
+    line of its message: untrusted text.
+    """
+
+    oid: str
+    authored_at: str
+    committed_at: str
+    author: CommitPerson
+    committer: CommitPerson
+    headline: str = ""
+
+
 @dataclass
 class PRInfo:
     url: str
@@ -1044,6 +1075,20 @@ def _comment_page_query(parent: str) -> str:
 _ISSUE_COMMENT_PAGE_QUERY = _comment_page_query("issue")
 _PR_COMMENT_PAGE_QUERY = _comment_page_query("pullRequest")
 
+# One page of a PR's commits, read by cursor to the end like the comments
+# (#416). GitHub lists at most 250 commits of a PR; that is the listing.
+_COMMIT_PAGE_SIZE = 100
+_GIT_ACTOR_FIELDS = "name email user { login }"
+_PR_COMMIT_PAGE_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!, $after: String) {"
+    " repository(owner: $owner, name: $name) {"
+    " pullRequest(number: $number) {"
+    f" commits(first: {_COMMIT_PAGE_SIZE}, after: $after) {{"
+    " pageInfo { hasNextPage endCursor }"
+    " nodes { commit { oid authoredDate committedDate messageHeadline"
+    f" author {{ {_GIT_ACTOR_FIELDS} }} committer {{ {_GIT_ACTOR_FIELDS} }} }} }} }} }} }} }}"
+)
+
 
 # -- strict row decoding ----------------------------------------------------------
 #
@@ -1207,6 +1252,38 @@ def _decode_comment(row: object, parent_url: str) -> CommentInfo:
         author=login,
         created_at=_text_field(data, "createdAt", what),
         parent_url=parent_url,
+    )
+
+
+def _decode_commit_person(row: object, role: str, what: str) -> CommitPerson:
+    """A commit's ``author`` or ``committer``: ``null`` is no one, another type malformed."""
+    if row is None:
+        return CommitPerson()
+    data = _row_object(row, f"{what}: {role}")
+    user = data.get("user")
+    if user is not None and not isinstance(user, dict):
+        raise GitHubError(f"{what}: {role}.user is {type(user).__name__}, expected an object")
+    return CommitPerson(
+        name=_text_field(data, "name", f"{what}: {role}"),
+        email=_text_field(data, "email", f"{what}: {role}"),
+        login=_text_field(user, "login", f"{what}: {role}.user") if user else "",
+    )
+
+
+def _decode_pr_commit(row: object, pr_url: str) -> PRCommitInfo:
+    """One node of a PR's commit listing; a node without a full object id is malformed."""
+    what = f"commit of {pr_url}"
+    commit = _row_object(_row_object(row, what).get("commit"), what)
+    oid = _text_field(commit, "oid", what).lower()
+    if not _FULL_SHA_RE.match(oid):
+        raise GitHubError(f"{what}: oid {oid!r:.80} is not a full object id")
+    return PRCommitInfo(
+        oid=oid,
+        authored_at=_text_field(commit, "authoredDate", what),
+        committed_at=_text_field(commit, "committedDate", what),
+        author=_decode_commit_person(commit.get("author"), "author", what),
+        committer=_decode_commit_person(commit.get("committer"), "committer", what),
+        headline=_text_field(commit, "messageHeadline", what),
     )
 
 
@@ -3357,6 +3434,41 @@ class GitHubClient:
         ref = parse_issue_url(url)
         return self._comments(_ISSUE_COMMENT_PAGE_QUERY, "issue", ref)
 
+    def get_pr_commits(self, url: str) -> list[PRCommitInfo]:
+        """The commits GitHub lists for a PR, oldest first, read to the end (#416).
+
+        Read only by ``status``'s report of an unjournaled review comment, as
+        evidence: no decision rests on it. A page that cannot be read or
+        walked past is a GitHubError, never a shorter listing, as for the
+        comments (:meth:`_walk_connection`); a commit listed twice is kept once.
+        """
+        ref = parse_pr_url(url)
+        what = f"commits of {ref.canonical}"
+        owner, _, name = ref.repository.partition("/")
+
+        def commits(data: dict, page_what: str) -> dict:
+            repository = data.get("repository")
+            if not isinstance(repository, dict):
+                raise GitHubError(f"{page_what}: repository is not readable: {repository!r:.200}")
+            pull = repository.get("pullRequest")
+            if not isinstance(pull, dict):
+                raise GitHubError(f"{page_what}: pullRequest is not readable: {pull!r:.200}")
+            connection = pull.get("commits")
+            if not isinstance(connection, dict):
+                raise GitHubError(f"{page_what} is not a commit connection: {connection!r:.200}")
+            return connection
+
+        variables = ["-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={ref.number}"]
+        found: list[PRCommitInfo] = []
+        seen: set[str] = set()
+        for node in self._walk_connection(_PR_COMMIT_PAGE_QUERY, variables, commits, what):
+            commit = _decode_pr_commit(node, ref.canonical)
+            if commit.oid in seen:
+                continue
+            seen.add(commit.oid)
+            found.append(commit)
+        return found
+
     def _comments(self, query: str, parent: str, ref: GitHubRef) -> list[CommentInfo]:
         """The complete comment listing of ``ref`` (ADR 0004 D4.5), or a GitHubError.
 
@@ -3438,6 +3550,7 @@ __all__ = [
     "MERGE_METHODS",
     "CheckInfo",
     "CommentInfo",
+    "CommitPerson",
     "CreatedObject",
     "GitHubClient",
     "GitHubIssueRef",
@@ -3446,6 +3559,7 @@ __all__ = [
     "HttpsRequest",
     "IssueInfo",
     "MergeQueueStatus",
+    "PRCommitInfo",
     "PRInfo",
     "RepoInfo",
     "build_disable_auto_merge_argv",

@@ -10418,6 +10418,17 @@ class ControllerEngine:
             happened = "Nothing was launched or posted."
             rerun = "the reviewer is launched for this round"
         legacy = is_legacy_reentry(Phase.REVIEW, attempt, state.launch_label)
+        status = self.cli_command("status")
+
+        def report(what: str) -> str:
+            # Read-only evidence of where the comment came from (#416): the state
+            # directories of this checkout that journaled it, the PR's other
+            # review markers, the commits made after it.
+            return (
+                f"Run {status} for what GitHub and this checkout's state directories hold "
+                f"about where {what} came from; it changes nothing."
+            )
+
         remedy = (
             f"If {'it' if url else 'one'} belongs to another controller's run, do not delete it "
             "and do not 'unblock': it is that run's review record, its FIX may already be "
@@ -10442,8 +10453,9 @@ class ControllerEngine:
                 "journaled review it then is. The controller posts this round's comment itself "
                 "and journals it before it is sent; it never adopts or duplicates one it did not "
                 "journal (ADR 0004 D9.6), and 'unblock' does not change that. "
-                f"{happened} Check who posted the comment. If it is a stray or foreign comment, "
-                f"delete it or its marker, then 'unblock': {rerun}. {remedy}"
+                f"{happened} Check who posted the comment. {report('it')} If it is a "
+                f"stray or foreign comment, delete it or its marker, then 'unblock': {rerun}. "
+                f"{remedy}"
             )
         return (
             f"{conflict}."
@@ -10460,8 +10472,8 @@ class ControllerEngine:
             "comment itself and journals it before it is sent; it never chooses between comments "
             "it did not post and never adopts or duplicates one it did not journal (ADR 0004 "
             f"D9.6), and 'unblock' does not change that. {happened} Check who posted each "
-            "comment named. If each is a stray or foreign comment, delete it or its marker, then "
-            f"'unblock': {rerun}. {remedy}"
+            f"comment named. {report('they')} If each is a stray or foreign comment, "
+            f"delete it or its marker, then 'unblock': {rerun}. {remedy}"
         )
 
     def _prepare_fix(self, plan: StepPlan) -> StepOutcome | None:

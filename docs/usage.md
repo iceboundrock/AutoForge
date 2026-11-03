@@ -587,7 +587,25 @@ before the block:
   was planned or posted, so that file is the only record of the result.
 
 The controller cannot tell who posted the comment, and the remedy depends
-on it, so check first:
+on it, so check first. `status` shows what it can read about that (#416),
+under the reason of a blocked run, and `status --json` carries the same as
+`unjournaled_review`. For each comment the round blocks on: when GitHub
+says it was created and how long after the run's creation and after the
+run's last reviewer launches; its marker, its length, the SHA-256 of its
+body and a short excerpt; and every state directory on this checkout that
+journaled it (a review comment effect record for its marker, or
+`last_review_comment_url` naming it) or whose review history records its
+round at its HEAD. Then which state directories are bound to the PR, the
+PR's other review markers, the commits GitHub lists for the PR committed
+after the comment, with author, committer and the time after it (GitHub
+records when a commit was made, not when it was pushed), and the PR's
+implementation marker. The state directories read are the one `status`
+reads, the ones in it and under the configured `state_dir`, the ones beside
+it when it lies elsewhere, and the scheduler namespaces. It names no
+author and changes nothing. A comment another directory here journaled is
+that run's review; one none of them accounts for may still be the review
+of a controller on another machine or in another clone, which this
+checkout cannot see.
 
 - **A stray or foreign comment** (a human's, an agent's that still held a
   credential, or one a reviewer of an earlier AutoForge version posted):

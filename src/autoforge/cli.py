@@ -53,6 +53,7 @@ import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TextIO
 
 from . import __version__
@@ -140,6 +141,8 @@ from .ownership import (
 from .provenance import ControllerIdentity, mismatch_lines, protocol_ranges, refusal_headline
 from .redaction import redact, redact_argv, redact_dict, redact_obj
 from .replan_txn import ReplanTransaction
+from .review_provenance import ProvenanceReport, unjournaled_review_report
+from .review_provenance import applies as unjournaled_review_applies
 from .run_binding import EpicBinding
 from .run_namespace import inside_scheduler_root, namespace_issue_of_state_dir
 from .sandbox_pin import SandboxPin
@@ -2217,6 +2220,7 @@ def cmd_status(args) -> int:
     # both output modes cross the same redaction boundary as the run log.
     certificate = _review_certificate_check(engine, state)
     parent = _epic_parent_check(engine, state)
+    review = _unjournaled_review(engine, state)
     # From the persisted phase alone (#369, ADR 0011): no reason code is
     # persisted, so a BLOCKED or FAILED run's is UNKNOWN; `Reason:` is the text.
     # Outside a git repository the view is unknown, and `--json` still works.
@@ -2233,6 +2237,7 @@ def cmd_status(args) -> int:
             "operator_actions": _operator_actions(state),
             "review_certificate_status": _review_certificate_status(state, certificate),
             "epic_parent_check": parent.document() if parent is not None else None,
+            "unjournaled_review": review.document() if review is not None else None,
             "stop": stop.as_dict(),
             "outer_sandbox": {
                 "mode": engine.config.sandbox.mode,
@@ -2251,8 +2256,48 @@ def cmd_status(args) -> int:
         engine.continue_command = (*config, "epic", "resume", state.epic_url)
     actions = _render_acceptance_actions(state, engine) + _render_operator_actions(state, engine)
     lines = parent.lines(engine) if parent is not None else []
-    print(redact(_render_status(state, txn, actions, evidence, parent_check=lines, stop=stop)))
+    shown = review.lines() if review is not None else []
+    print(
+        redact(
+            _render_status(
+                state, txn, actions, evidence, parent_check=lines, stop=stop, review=shown
+            )
+        )
+    )
     return 0
+
+
+def _unjournaled_review(engine: ControllerEngine, state: AutoForgeState) -> ProvenanceReport | None:
+    """``status``'s read-only report of an unjournaled review comment (#416).
+
+    Only for a ``BLOCKED`` run bound to a round; ``None`` when the PR holds
+    no round comment the run does not account for. The state directories
+    searched are the one ``status`` reads, the configured ``state_dir`` and,
+    when they differ, the directory the one read lies in; and the scheduler
+    namespaces of this checkout. Reads only, takes no lock and writes
+    nothing; a failed read is in the report.
+    """
+    if not unjournaled_review_applies(state):
+        return None
+    coordination: Path | None
+    try:
+        coordination, problem = engine.coordination_root(), ""
+    except LockError as exc:
+        coordination, problem = None, str(exc)
+    state_dir = Path(os.path.abspath(engine.paths.state_dir))
+    configured = Path(os.path.abspath(engine.config.state_dir))
+    roots = [state_dir, configured]
+    if state_dir != configured:
+        roots.insert(1, state_dir.parent)
+    return unjournaled_review_report(
+        state,
+        github=engine.github,
+        state_dir=state_dir,
+        logs_dir=engine.paths.logs_dir,
+        standalone_roots=roots,
+        coordination_root=coordination,
+        coordination_problem=problem,
+    )
 
 
 @dataclass(frozen=True)
@@ -2869,11 +2914,14 @@ def _render_status(
     evidence: list[str] | None = None,
     parent_check: list[str] | None = None,
     stop: StopClassification | None = None,
+    review: list[str] | None = None,
 ) -> str:
     """Human status for a GitHub run (unredacted; the caller redacts).
 
     ``parent_check`` is the read-only comparison of the recorded EPIC with
-    the issue's native parent (#435), printed under the EPIC line.
+    the issue's native parent (#435), printed under the EPIC line;
+    ``review`` the report of an unjournaled review comment (#416), printed
+    under the stop.
     """
 
     def _num(url: str) -> str:
@@ -2919,6 +2967,7 @@ def _render_status(
         lines.append(f"Reason:     {state.block_reason}")
     if stop is not None and stop.outcome in (StopOutcome.BLOCKED, StopOutcome.FAILED):
         lines.append(f"Stop:       {stop.line().removeprefix('stop: ')}")
+    lines += review or []
     lines += acceptance or []
     if state.unblock_history:
         last = state.unblock_history[-1]

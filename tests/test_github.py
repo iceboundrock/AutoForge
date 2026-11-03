@@ -4,6 +4,7 @@ import http.client
 import http.server
 import json
 import os
+import re
 import ssl
 import tempfile
 import threading
@@ -2905,6 +2906,119 @@ def test_a_comment_listing_failure_is_classified_as_usual():
     )
     with pytest.raises(GitHubNotFoundError):
         _client(lambda req: missing).get_issue_comments(url)
+
+
+# -- the PR's commits, for status's report of an unjournaled review comment (#416) ------------
+
+
+def _commit_node(n: int, **commit) -> dict:
+    """One node of a PR's commit listing, as GraphQL returns it."""
+    row = {
+        "oid": f"{n:040x}",
+        "authoredDate": "2026-11-02T10:00:00Z",
+        "committedDate": f"2026-11-02T10:{n % 60:02d}:00Z",
+        "messageHeadline": f"commit {n}",
+        "author": {"name": "Alice", "email": "alice@example.com", "user": {"login": "alice"}},
+        "committer": {"name": "GitHub", "email": "noreply@github.com", "user": None},
+    }
+    row.update(commit)
+    return {"commit": row}
+
+
+def _commit_page(nodes: list, *, has_next: bool = False, cursor: str | None = None) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "commits": {
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                        "nodes": nodes,
+                    }
+                }
+            }
+        }
+    }
+
+
+def test_the_pr_commit_listing_walks_every_page_and_decodes_each_identity():
+    """#416: the commits of a PR are read by cursor to the end, oldest first, each with
+    the identity git recorded and the account GitHub links (none for a ``null`` user)."""
+    rows = [_commit_node(n) for n in range(1, 151)]
+    handler, seen = _open_pr_pages(rows, 100, page=_commit_page)
+
+    commits = _client(handler).get_pr_commits("https://github.com/o/r/pull/42")
+
+    assert [c.oid for c in commits] == [f"{n:040x}" for n in range(1, 151)]
+    first = commits[0]
+    assert (first.authored_at, first.committed_at) == (
+        "2026-11-02T10:00:00Z",
+        "2026-11-02T10:01:00Z",
+    )
+    assert (first.author.name, first.author.email, first.author.login) == (
+        "Alice",
+        "alice@example.com",
+        "alice",
+    )
+    assert (first.committer.name, first.committer.login, first.headline) == (
+        "GitHub",
+        "",
+        "commit 1",
+    )
+    assert len(seen) == 2
+    for command in seen:
+        assert command[:3] == ["gh", "api", "graphql"]
+        assert "pullRequest(number: $number)" in command[4]
+        assert "commits(first: 100, after: $after)" in command[4]
+        assert command[5:11] == ["-f", "owner=o", "-f", "name=r", "-F", "number=42"]
+    assert seen[1][-2:] == ["-f", "after=cursor-1"]
+
+
+def test_the_pr_commit_listing_reads_a_missing_person_as_no_one_and_keeps_a_commit_once():
+    pages = iter(
+        [
+            _commit_page([_commit_node(1, author=None)], has_next=True, cursor="c1"),
+            _commit_page([_commit_node(1), _commit_node(2, committer={"name": None})]),
+        ]
+    )
+    commits = _client(lambda req: _res(next(pages))).get_pr_commits(
+        "https://github.com/o/r/pull/42"
+    )
+    assert [c.oid for c in commits] == [f"{1:040x}", f"{2:040x}"]
+    assert commits[0].author.name == "" and commits[0].author.login == ""
+    assert commits[1].committer.name == "" and commits[1].committer.email == ""
+
+
+@pytest.mark.parametrize(
+    ("page", "needle"),
+    [
+        (_commit_page([{"commit": None}]), "commit of https://github.com/o/r/pull/42"),
+        (_commit_page([_commit_node(1, oid="abc")]), "is not a full object id"),
+        (_commit_page([_commit_node(1, author="Alice")]), "author"),
+        (_commit_page([_commit_node(1, author={"name": "A", "user": "a"})]), "author.user"),
+        ({"data": {"repository": {"pullRequest": None}}}, "pullRequest is not readable"),
+        (
+            {"data": {"repository": {"pullRequest": {"commits": []}}}},
+            "is not a commit connection",
+        ),
+        (_commit_page([], has_next=True, cursor=None), "announces a next page but no cursor"),
+    ],
+    ids=[
+        "null-commit",
+        "short-oid",
+        "string-author",
+        "string-user",
+        "no-pr",
+        "no-connection",
+        "no-cursor",
+    ],
+)
+def test_a_pr_commit_listing_that_cannot_be_read_is_an_error(page, needle):
+    """Never a shorter listing, and never a commit with a made-up identity."""
+    with pytest.raises(GitHubError, match=re.escape(needle)) as exc:
+        _client(lambda req: _res(page)).get_pr_commits("https://github.com/o/r/pull/42")
+    assert "commits of https://github.com/o/r/pull/42" in str(exc.value) or "commit of" in str(
+        exc.value
+    )
 
 
 # -- typed effect writes (ADR 0004 D12.2) ----------------------------------------

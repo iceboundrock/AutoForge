@@ -332,7 +332,17 @@ the upcoming round at the bound HEAD, base and merge base:
   (before anything is planned) blocks the same way, on one comment or
   several; its reason says a reviewer ran and names the run-log
   `control-result.json` that alone holds its result, never that nothing
-  was launched.
+  was launched. The reason also names `status`, which, for a `BLOCKED`
+  run bound to a round, reads the PR's comments again and reports what
+  GitHub and this checkout's state directories hold about each such
+  comment (#416): which state directory journaled it (a K4 record for its
+  marker or observed at it, or `last_review_comment_url`), the PR's other
+  review markers, the commits committed after it and the PR's
+  implementation marker. It reads only: the comments, then the PR and its
+  commits (`pullRequest.commits`, GraphQL), local files through the
+  strict loaders, and takes no lock. It names no author and nothing that
+  decides reads it; a failed read is in the report, never a reason to
+  refuse `status`.
 - a comment for the same round at another HEAD, against another base, or
   from another merge base is not this round's: the round's identity is the
   diff it decided on, and a review posted before the PR was retargeted, or
