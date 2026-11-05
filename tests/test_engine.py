@@ -1324,6 +1324,40 @@ def test_analyze_adoption_crash_after_the_plan_save_completes_from_the_journal(
     assert _pushes(pushes) == [f"refs/heads/autoforge/2 {candidate}"]
 
 
+def test_analyze_adoption_rebases_onto_an_edit_its_own_claimant_listing_saw(
+    tmp_state_dir, fake_github, monkeypatch
+):
+    """PR #460 R1-F4, which K11 shares with K3: the reconcile lists the open
+    PRs, bodies included, before the write. An edit landing before that
+    listing is judged on a read of the body made after it, so the block is
+    appended to the edited body (D5.5's rebase), never to the earlier one
+    with the edit dropped."""
+    from autoforge.engine import ControllerEngine
+
+    eng, _ = _adopting(tmp_state_dir, fake_github)
+    monkeypatch.setattr(ControllerEngine, "_complete_analyze", _crash)
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    monkeypatch.undo()
+    candidate = _worktree_head(eng.provider.calls[0])
+    eng2 = _resumed(eng, tmp_state_dir, fake_github, "never")
+    edited = "Started by hand, and edited since."
+    listed = fake_github.list_open_prs
+
+    def edited_then_listed(*args, **kwargs):
+        if fake_github.prs[PR41].head_sha == candidate and fake_github.prs[PR41].body == (
+            "Started by hand."
+        ):
+            fake_github.prs[PR41].body = edited
+        return listed(*args, **kwargs)
+
+    fake_github.list_open_prs = edited_then_listed  # type: ignore[method-assign]
+    out = eng2.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert fake_github.prs[PR41].body == f"{edited}\n\n{closing(eng2.state.run_id)}"
+    assert [w[0] for w in fake_github.effect_writes] == ["write_pr_body"]
+
+
 def test_analyze_adoption_crash_after_the_write_before_its_save_is_reconciled_without_a_second_edit(
     tmp_state_dir, fake_github
 ):

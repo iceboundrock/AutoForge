@@ -696,10 +696,12 @@ class AdoptPrOp:
         pr_url = record.target["pr_url"]
         repo = parse_issue_url(record.owner.issue_url).repository
         claim = scan(IMPLEMENTATION, record.marker).claims[0]
-        pr = held_pr(self.github, pr_url)
         claimants = collect(IMPLEMENTATION, self.github.list_open_prs(repo), "open PR").claimants(
             claim.key, f"issue {claim.issue.canonical}"
         )
+        # Read after the listing, as K11's is: the precondition and a rebase
+        # are judged on the last read before the write (PR #460 R1-F4).
+        pr = held_pr(self.github, pr_url)
         if claimants.defects:
             return _unreadable(record, f"open PRs of {repo}", claimants.defects)
         others = sorted({h.obj.url for h in claimants.holders if not _same_pr(h.obj.url, pr_url)})
@@ -755,7 +757,8 @@ class OwnerTakeoverOp:
     Payload: that body with only the marker's owner replaced. Completion:
     the body equals the payload. A body changed since the read is a
     conflict, never rebased or written over (:func:`decide_replace`). The
-    body is the one GitHub holds (:func:`held_pr`, #328).
+    body is the one GitHub holds (:func:`held_pr`, #328), read after the
+    listing, so the last read before the write is the one judged.
     """
 
     def __init__(self, github: GitHubClient) -> None:
@@ -768,10 +771,14 @@ class OwnerTakeoverOp:
         pr_url = record.target["pr_url"]
         repo = parse_issue_url(record.owner.issue_url).repository
         claim = scan(IMPLEMENTATION, record.marker).claims[0]
-        pr = held_pr(self.github, pr_url)
         claimants = collect(IMPLEMENTATION, self.github.list_open_prs(repo), "open PR").claimants(
             claim.key, f"issue {claim.issue.canonical}"
         )
+        # The exact body is read after the listing, which carries bodies too:
+        # the precondition is judged on the controller's last read before the
+        # write, so an edit the listing could have shown is a conflict, never
+        # written over by an earlier read of the body (PR #460 R1-F4).
+        pr = held_pr(self.github, pr_url)
         if claimants.defects:
             return _unreadable(record, f"open PRs of {repo}", claimants.defects)
         others = sorted({h.obj.url for h in claimants.holders if not _same_pr(h.obj.url, pr_url)})

@@ -426,6 +426,32 @@ def test_k11_never_writes_over_a_body_edited_after_the_takeover_read_it(tmp_stat
     )
 
 
+def test_k11_never_writes_over_an_edit_its_own_claimant_listing_saw(tmp_state_dir, fake_github):
+    """PR #460 R1-F4: the takeover's reconcile lists the open PRs, bodies
+    included, to find another claimant. An edit that keeps the marker and
+    lands before that listing is already the controller's to see, so the
+    byte-exact precondition is judged on a read made after the listing, and
+    the edit is a conflict, never written over by the stale body."""
+    fake_github.add_pr(head_sha=SHA_A, body=implementation_pr_body(owner_run_id=OTHER_RUN))
+    eng = _blocked(tmp_state_dir, fake_github)
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    edited = implementation_pr_body(owner_run_id=OTHER_RUN) + "\n\nA paragraph a human added."
+    listed = fake_github.list_open_prs
+    editing = [True]
+
+    def edited_then_listed(*args, **kwargs):
+        if editing:
+            fake_github.prs[PR].body = edited
+            editing.clear()
+        return listed(*args, **kwargs)
+
+    fake_github.list_open_prs = edited_then_listed  # type: ignore[method-assign]
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and out.stop.code is StopReasonCode.EFFECT_CONFLICT
+    assert "the PR body changed since the takeover read it" in eng.state.block_reason
+    assert fake_github.effect_writes == [] and fake_github.prs[PR].body == edited
+
+
 def test_a_k11_record_is_refused_under_a_protocol_before_14(tmp_state_dir, fake_github):
     """Protocol 14 is K11's (#414): no older controller plans a takeover, so a
     file labelled 13 that carries one is a hand edit or a foreign file, and is
