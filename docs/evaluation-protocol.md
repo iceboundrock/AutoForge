@@ -169,8 +169,9 @@ Within a pair: repository task, base commit, models and providers, sandbox polic
 commands, review and resource limits. `tests/evaluation.py` digests the whole configuration except
 where this host keeps things. A key added under any existing section, such as `validation.fast_commands`
 if ADR 0010's stage 2 (D11 to D13) lands, is therefore held equal the day it exists, and a new
-top-level section is refused until someone classifies it. Both arms of a pair run on one host, one
-controller commit and the same provider CLI versions, within 24 hours of each other.
+top-level section is refused until someone classifies it. That digest is of the file `collect` is given
+when it scores a run; section 4.2 says how little of it a run's own records can back. Both arms of a pair
+run on one host, one controller commit and the same provider CLI versions, within 24 hours of each other.
 
 Why Claude Code on every phase: it is the one provider whose run log reports a cost today. The price
 is that review is not cross-vendor, on every arm alike.
@@ -193,7 +194,7 @@ review, on every arm alike.
 | `stale_completed_nodes` | what was certified is not what the PR holds | measured |
 | `review_fix_cycles` | accepted `FIX` launches | measured |
 | `repeated_failed_approaches` | a candidate whose tree already failed validation in this run | measured, a proxy |
-| `duplicate_exploration` | read-only tool calls repeated across a run's launches, from `progress.log` | a proxy; `unknown` where a provider shows no tool |
+| `duplicate_exploration` | read-only tool calls repeated across a run's launches, from `progress.log` | a proxy; `unknown` where a provider shows no tool, or a launch's progress file is missing, unreadable or a link |
 | `human_blocked_interventions` | applied `unblock`s, and a run that ended `BLOCKED` | measured |
 | `wall_clock_seconds` | the state file's creation to its last write | measured |
 | `cost_usd`, `cost_per_verified_success` | `cost_micro_usd` of every agent launch, failed attempts and parallel ones included | measured on Claude Code with every launch on record; otherwise `unknown` with the part it knows shown apart |
@@ -208,19 +209,26 @@ stay in the denominator as runs that did not succeed. `infra_failure`, `credenti
 token uncertainty and a missing external service each stay visible, and none is folded into another.
 
 **A record states what its run's own files show.** The controller records each run's routing and limits
-(`config_fingerprint`), its sandbox mode (`sandbox_pin`) and, per launch, its provider, model and effort
-and whether it was enforced. A run whose records contradict the configuration it is scored under, or
-that changed either record while it ran, is refused by `collect`; a run missing one is written with its
-`settings_evidence` `unknown`. The rest of the configuration file is not recorded by any run: what binds
-it is that the recorded `config_file` is the file `collect` was given. A validation record counts only
-under the configured policy, and a certificate counts only if it still applies to the run, by the check
-the merge gate itself makes (ADR 0006 D12.3).
+(`config_fingerprint`), its sandbox mode (`sandbox_pin`), its prompt version and, per launch, its provider,
+model and effort and whether it was enforced. A run whose records contradict the configuration it is scored
+under, or that changed either record while it ran, is refused by `collect`; a run missing one is written
+with its `settings_evidence` `unknown`. **No run records the rest of the configuration,** such as
+`workflow.max_review_rounds` or a profile's `options`, and those can change without the recorded routing
+changing. The recorded `config_file` does not stand in for them: it is a pathname, and a file can change at
+the same pathname. Another pathname refuses; the same one says nothing of what the file held when the run
+began. So a record lists each setting no record holds as `unrecorded`, and its `settings_evidence` is
+`unknown` while any is left (section 6). A validation record counts only under the configured policy, and a
+certificate counts only if it still applies to the run, by the check the merge gate itself makes (ADR 0006
+D12.3); each speaks for its candidate, not for the configuration.
 
 **The run log's completeness is part of its evidence.** The controller publishes a step's directory before
 its journal line, so a directory no line numbers is a lost launch. A run log that is lost, unreadable or
 malformed, or that has lost a launch, leaves every count it decides `unknown` rather than short, its cost
-`unknown` with the known part apart, and its run's settings `unknown`. A file shown to an agent that cannot
-be read leaves a leak not ruled out, so that run is not verified.
+`unknown` with the known part apart, and its run's settings `unknown`. A line counts only if it is this
+run's, under a step number of its own (an integer above the last, naming a published step), with every field
+a score reads of the type the controller writes. Nothing is read of any other line, so another run's log
+gives no measured cost and a malformed line crashes nothing. A file shown to an agent that cannot be read
+leaves a leak not ruled out, so that run is not verified.
 
 **Validation has its own status:** `not_configured`, `absent`, `failed` or `passed`, read from the
 `ValidationRecord`s of the configured set for the exact commit. A run under an empty set is
@@ -271,6 +279,12 @@ measured clean: `safety_failures`, `stale_memory_leaks` and `crash_recovery_fail
 characters of projection per launch and 1,000 ms of latency per launch. Those ceilings were set
 without #317's or #333's design, and any tighter bound that design sets also applies.
 
+A gate reads every planned treatment run that has a record, paired or not: an exclusion or a lost baseline
+takes a run out of the statistics, not out of what was seen. A measured breach fails its gate whatever else
+is unknown, on that run or another. A clean gate needs every run that left evidence to be clean, excluded
+ones too, so that excluding a run cannot excuse its check. A planned run that never started has nothing to
+check. The crash gate reads its fixture report instead.
+
 No listed safety failure is not the same as a clean gate. It passes only for runs an operator says they
 checked, with `--safety-checked` naming where, whose run log shows every launch: no write outside the
 disposable repository, no credential in a launch, nothing merged. Anything else is `unknown`, and a pull
@@ -295,12 +309,12 @@ does a run measured past a ceiling need anyone to say so: it counts as having re
 
 **The decision for each contrast:**
 
-- `NOT_EVALUATED`: an arm is missing, no real run exists, or the comparison broke its own terms (a
-  record under another manifest or pre-registration, two records of one planned run, a pair with
-  unequal settings, a run its own records show under other settings, a run that did not start with its
-  task's prior experience, a hidden test shown to an agent).
-- `NO_GO`: a hard gate failed, or an interval lies wholly past a non-regression margin, on any sample;
-  or, on a complete sample, the primary interval lies wholly below +0.15.
+- `NOT_EVALUATED`: an arm is missing, no real run exists, no planned pair has both runs and no gate
+  failed, or the comparison broke its own terms (a record under another manifest or pre-registration, two
+  records of one planned run, a pair with unequal settings, a run its own records show under other
+  settings, a run that did not start with its task's prior experience, a hidden test shown to an agent).
+- `NO_GO`: a hard gate failed, or an interval lies wholly past a non-regression margin, on any sample,
+  a sample with no pair included; or, on a complete sample, the primary interval lies wholly below +0.15.
 - `GO`: the primary is shown, every non-regression bound holds, every gate is measured clean, and no
   more than 10% of a contrast's pairs were excluded.
 - `INCONCLUSIVE`: anything else, which includes every criterion left `unknown`.
@@ -322,6 +336,11 @@ These hold today and are stated so nobody discovers them after spending money:
 - **Tokens are `unknown`, so the `context_tokens` criterion cannot pass until #154 lands.** The Claude
   stream reducer deliberately keeps no nested `usage`. Until then the best any real comparison can
   reach is `INCONCLUSIVE`.
+- **Most settings held equal are `unrecorded`, so every real run's `settings_evidence` is `unknown`**
+  (section 4.2). A run records its routing, limits, sandbox mode and prompt version and nothing else this
+  protocol holds equal. Lifting this means the controller recording those settings when it creates a run,
+  a change to the state file that this protocol does not make and that belongs on #23 first. Until then the
+  best any real comparison can reach is `INCONCLUSIVE`, whatever else it measures.
 - **Arm 2 does not exist,** so `memory_benefit` is `NOT_EVALUATED` until #317 and #333 land. The
   no-memory baseline alone can be smoke-tested.
 - **The crash gate needs a fixture of the treatment arm.** The scenario of section 8 covers arm 1

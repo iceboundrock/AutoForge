@@ -1963,7 +1963,8 @@ model. They cover:
   interval; only `measured` values can pass, so unknown tokens or an estimated
   cost rule out `GO`; a fixture never reaches a decision; a missing arm is
   `NOT_EVALUATED` and raises nothing; harm is `NO_GO` however large the benefit,
-  and on an incomplete sample too; a failed run stays in the denominator, a pair
+  on an incomplete sample, on a run an exclusion or a lost baseline took out of its
+  pair, and whatever else is unknown; a failed run stays in the denominator, a pair
   with no record, a ceiling or too many exclusions is `INCONCLUSIVE` before any
   primary effect is read, exclusions are listed and bounded, and another digest,
   unequal settings, two records of one run or a leaked test leave no result;
@@ -1974,9 +1975,12 @@ model. They cover:
   repeats nothing;
 - what a score reads: a narrower run than the configured set is no evidence, nor
   is a record under another policy or a certificate that no longer applies; prose
-  in a run log changes nothing, and `not_configured` is no pass; a lost launch line
-  or an unreadable run log leaves what it decides `unknown`, an unassessed safety
-  gate rules out `GO`, and a stopped run keeps what it did and spent;
+  in a run log changes nothing, and `not_configured` is no pass; a lost launch line,
+  an unreadable run log, another run's line, a malformed field or a step number that
+  is not its own leaves what it decides `unknown` and crashes nothing, a missing or
+  linked progress file leaves exploration `unknown`, a file changed at the same
+  pathname establishes no setting, an unassessed safety gate rules out `GO`, and a
+  stopped run keeps what it did and spent;
 - the oracle: the candidate's code gets the launch isolation of
   `validation.commands`, and the export-command sandbox under `required`; only
   exit 0 is a pass, and what could not run is `not_run`;

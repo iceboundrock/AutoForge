@@ -469,6 +469,38 @@ def test_each_setting_the_issue_names_changes_the_digest(change):
     assert ev.settings_digest(plain) != ev.settings_digest(changed)
 
 
+def test_what_no_run_records_is_each_setting_but_its_routing_and_sandbox_mode():
+    """Listed by what a run's files hold, not by what is left out: a key that lands tomorrow is
+    unrecorded until something records it, and a profile's options are never recorded."""
+    cfg = load_config_file(str(ev.REAL_RUN_CONFIG))
+    unrecorded = set(ev.unrecorded_settings(cfg))
+    assert {
+        "workflow.max_review_rounds",
+        "review.replan.enabled",
+        "validation.commands",
+        "safety.allow_merge",
+        "execution.max_correction_attempts",
+        "profiles.fix.options.permission_mode",
+        "profiles.fix.extra_args",
+        "profiles.fix.command",
+        "profiles.review_round_1.options.permission_mode",
+    } <= unrecorded
+    assert not unrecorded & {
+        "sandbox.mode",
+        "prompt_version",
+        "profiles.fix.provider",
+        "profiles.fix.model",
+        "profiles.fix.effort",
+        "profiles.fix.idle_timeout_seconds",
+        "profiles.fix.max_runtime_seconds",
+        "execution.default_idle_timeout_seconds",
+        "execution.default_max_runtime_seconds",
+    }
+    assert not unrecorded & set(ev.EXEMPT_SETTINGS)
+    # A profile with no options still holds the setting, for a run to have set otherwise.
+    assert ev._setting_paths({"profiles": {"fix": {"options": {}}}}) == ["profiles.fix.options"]
+
+
 def test_where_a_host_keeps_things_does_not_change_the_digest():
     plain, moved = default_config(), default_config()
     moved.state_dir = "/elsewhere/state"
@@ -851,6 +883,160 @@ def test_a_found_safety_failure_is_no_go_whether_or_not_the_rest_was_assessed():
     assert _decide(manifest, prereg, records)["decision"] == ev.NO_GO
 
 
+def _treated(records: list[dict]) -> dict:
+    return next(r for r in records if r["arm"] == TREATMENT)
+
+
+def _baseline_of(records: list[dict], treated: dict) -> dict:
+    return next(
+        r
+        for r in records
+        if r["arm"] == BASELINE and (r["task"], r["seed"]) == (treated["task"], treated["seed"])
+    )
+
+
+def _exclude(records: list[dict]) -> list[dict]:
+    treated = _treated(records)
+    treated["outcome"], treated["stopped_reason"] = "service_unavailable", "the API was down"
+    return records
+
+
+def _exclude_its_baseline(records: list[dict]) -> list[dict]:
+    baseline = _baseline_of(records, _treated(records))
+    baseline["outcome"], baseline["stopped_reason"] = "infra_failure", "the host went away"
+    return records
+
+
+def _lose_its_baseline(records: list[dict]) -> list[dict]:
+    baseline = _baseline_of(records, _treated(records))
+    return [record for record in records if record is not baseline]
+
+
+_LEAVE_THE_PAIR = {
+    "excluded": _exclude,
+    "excluded-baseline": _exclude_its_baseline,
+    "unpaired": _lose_its_baseline,
+}
+
+
+@pytest.mark.parametrize("leave", _LEAVE_THE_PAIR.values(), ids=_LEAVE_THE_PAIR)
+@pytest.mark.parametrize(
+    "harm, gate",
+    [
+        (lambda r: r.update(safety_failures=["an agent merged"]), "safety_failures"),
+        (lambda r: r["memory"]["stale_leaks"].update(value=1), "stale_memory_leaks"),
+        (lambda r: r["memory"]["storage_bytes"].update(value=2**40), "memory_overhead"),
+    ],
+    ids=["safety", "stale", "overhead"],
+)
+def test_harm_seen_on_a_run_no_pair_holds_is_still_no_go(leave, harm, gate):
+    """Leaving a pair takes a run out of the statistics, not out of what was seen. An excluded
+    outcome or a lost baseline cannot turn what went wrong into a clean gate."""
+    manifest, prereg, records = _world()
+    harm(_treated(records))
+    result = _decide(manifest, prereg, leave(records))
+    assert result["pairs"] == 35
+    verdicts = {g["gate"]: g["verdict"] for g in result["hard_gates"]}
+    assert verdicts[gate] == "fail"
+    assert result["decision"] == ev.NO_GO and gate in result["why"]
+
+
+def test_harm_is_no_go_with_no_pair_at_all():
+    """There is no primary to read, and what happened still happened."""
+    manifest, prereg, records = _world()
+    treated = _treated(records)
+    treated["safety_failures"] = ["an agent merged"]
+    result = _decide(manifest, prereg, [treated])
+    assert result["pairs"] == 0 and result["primary"] is None
+    assert result["decision"] == ev.NO_GO and "safety_failures" in result["why"]
+
+    treated["safety_failures"] = []
+    clean = _decide(manifest, prereg, [treated])
+    assert clean["decision"] == ev.NOT_EVALUATED and "no pair" in clean["why"]
+
+
+def test_an_excluded_run_that_left_evidence_still_owes_its_safety_check():
+    """An exclusion cannot be what makes a run's check unnecessary. A planned run that never
+    started has nothing to check, which test_exclusions_are_listed holds."""
+    manifest, prereg, records = _world()
+    _treated(records)["safety_assessed"] = False
+    result = _decide(manifest, prereg, _exclude(records))
+    gate = next(g for g in result["hard_gates"] if g["gate"] == "safety_failures")
+    assert gate["verdict"] == "unknown" and "1 run(s)" in gate["why"]
+    assert result["decision"] == ev.INCONCLUSIVE and "safety_failures" in result["why"]
+
+
+def test_a_smoke_runs_harm_stays_outside_every_decision():
+    """A gate reads the plan's runs. The smoke run's record says what happened, on its own."""
+    manifest, prereg, records = _world()
+    smoke = copy.deepcopy(_treated(records))
+    smoke["seed"], smoke["safety_failures"] = ev.SMOKE_SEED, ["an agent merged"]
+    assert _decide(manifest, prereg, [*records, smoke])["decision"] == ev.GO
+
+
+_UNKNOWN_MEASURE = {"value": None, "provenance": ev.UNKNOWN}
+
+
+@pytest.mark.parametrize(
+    "known, unknown, other_run, gate",
+    [
+        ("stale_leaks", "stale_leaks", 1, "stale_memory_leaks"),
+        ("projection_chars", "storage_bytes", 1, "memory_overhead"),
+        ("projection_chars", "storage_bytes", 0, "memory_overhead"),
+        ("latency_ms", "latency_ms", 1, "memory_overhead"),
+    ],
+    ids=["stale-elsewhere", "projection-elsewhere", "projection-same-run", "latency-elsewhere"],
+)
+def test_a_measured_breach_fails_its_gate_whatever_else_is_unknown(known, unknown, other_run, gate):
+    """What is not known of another value leaves this one past its ceiling."""
+    manifest, prereg, records = _world()
+    treated = [record for record in records if record["arm"] == TREATMENT]
+    treated[0]["memory"][known]["value"] = 10**9
+    treated[other_run]["memory"][unknown] = dict(_UNKNOWN_MEASURE)
+    result = _decide(manifest, prereg, records)
+    verdicts = {g["gate"]: g["verdict"] for g in result["hard_gates"]}
+    assert verdicts[gate] == "fail"
+    assert result["decision"] == ev.NO_GO and gate in result["why"]
+
+
+@pytest.mark.parametrize(
+    "key, gate",
+    [("stale_leaks", "stale_memory_leaks"), ("storage_bytes", "memory_overhead")],
+)
+def test_an_unknown_measure_with_no_breach_stays_unknown(key, gate):
+    """No breach is established, and neither is a clean gate."""
+    manifest, prereg, records = _world()
+    _treated(records)["memory"][key] = dict(_UNKNOWN_MEASURE)
+    result = _decide(manifest, prereg, records)
+    verdicts = {g["gate"]: g["verdict"] for g in result["hard_gates"]}
+    assert verdicts[gate] == "unknown"
+    assert result["decision"] == ev.INCONCLUSIVE and gate in result["why"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "1", True, -1, float("nan"), float("inf")],
+    ids=["null", "text", "bool", "negative", "nan", "infinity"],
+)
+@pytest.mark.parametrize(
+    "key, gate",
+    [("stale_leaks", "stale_memory_leaks"), ("projection_chars", "memory_overhead")],
+)
+def test_a_measured_value_that_is_no_amount_is_no_measurement(key, gate, value):
+    """Said to be measured and not a possible amount: it neither crashes a gate nor clears it,
+    and a negative one offsets nothing."""
+    manifest, prereg, records = _world()
+    treated = [record for record in records if record["arm"] == TREATMENT]
+    treated[0]["memory"][key]["value"] = value
+    result = _decide(manifest, prereg, records)
+    verdicts = {g["gate"]: g["verdict"] for g in result["hard_gates"]}
+    assert verdicts[gate] == "unknown"
+    assert result["decision"] == ev.INCONCLUSIVE
+
+    treated[1]["memory"][key]["value"] = 10**9
+    assert _decide(manifest, prereg, records)["decision"] == ev.NO_GO
+
+
 @pytest.mark.parametrize(
     "metric", ["review_fix_cycles", "repeated_failed_approaches", "human_blocked_interventions"]
 )
@@ -1034,6 +1220,16 @@ def test_a_malformed_record_is_refused(field, value, problem):
     record = _record(manifest, prereg, manifest["tasks"][0], 1, BASELINE)
     record[field] = value
     assert problem in ev.record_problems(record)
+
+
+@pytest.mark.parametrize("measure", [None, "a string", {"value": 0}, {"provenance": "guess"}])
+def test_a_memory_measure_of_no_known_provenance_is_refused(measure):
+    """A gate reads every planned treatment run's, excluded ones too."""
+    manifest, prereg = _manifest_with_memory(), ev.load_preregistration()
+    record = _record(manifest, prereg, manifest["tasks"][0], 1, TREATMENT)
+    assert ev.record_problems(record) == []
+    record["memory"]["stale_leaks"] = measure
+    assert ev.record_problems(record) == ["memory.stale_leaks has no known provenance"]
 
 
 def test_a_run_that_did_not_finish_says_why():

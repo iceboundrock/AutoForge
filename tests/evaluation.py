@@ -35,9 +35,11 @@ allow-listed environment, the credential preflight and, under
 ``not_run``, never a pass.
 
 **What a run's own records must say.** A record states settings the run's state
-file and run log show it ran under (:func:`settings_evidence`), and evidence the
-run log cannot back is ``unknown`` wherever it would have counted
-(:func:`run_log_problems`). Neither is ever assumed from what an operator passed.
+file and run log show it ran under, and a setting they do not hold is ``unknown``
+(:func:`settings_evidence`). Evidence the run log cannot back, or a line of it that
+is another run's or malformed, is ``unknown`` wherever it would have counted
+(:func:`run_log_problems`, :func:`admitted_lines`). Neither is ever assumed from what
+an operator passed, and a pathname says nothing of what a file held.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -70,6 +73,7 @@ from autoforge.config_fingerprint import (
     FINGERPRINT_PROFILES,
     SOURCE_CREATED,
     SOURCE_UPGRADED,
+    ProfileRouting,
     RecordedConfiguration,
     fingerprint_routing,
 )
@@ -183,6 +187,7 @@ MEMORY_OVERHEAD = {
     "projection_chars": "projection_chars_per_launch",
     "latency_ms": "latency_ms_per_launch",
 }
+MEMORY_MEASURES = ("stale_leaks", *MEMORY_OVERHEAD)
 
 GO, NO_GO, INCONCLUSIVE, NOT_EVALUATED = "GO", "NO_GO", "INCONCLUSIVE", "NOT_EVALUATED"
 SETTINGS_STATUSES = ("established", "unknown", "mismatch")
@@ -232,6 +237,23 @@ _PROGRESS_TOOL = re.compile(r"^\[[^\]]*\] (?P<tool>\S+)(?: (?P<detail>.+))?$")
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _COUPLED = re.compile(r"\b(ImportError|ModuleNotFoundError|AttributeError|NameError)\b")
 _FAILED_MODULE = re.compile(r"^(?:FAILED|ERROR) (tests/[^\s:]+\.py)", re.M)
+# What a score reads of a run log line, each as ``ExecutionRecord`` always writes it. A
+# line without one, or with another type, could only be read by guessing what it meant.
+_LINE_FIELDS: Mapping[str, type | tuple[type, ...]] = {
+    "phase": str,
+    "profile": str,
+    "provider": str,
+    "model": str,
+    "effort": str,
+    "command": list,
+    "metadata": dict,
+    "provider_summary": dict,
+    "sandbox": dict,
+    "parsed_result": (dict, type(None)),
+    "timed_out": bool,
+    "stdout_truncated": bool,
+    "stderr_truncated": bool,
+}
 
 
 class EvaluationError(AutoForgeError):
@@ -472,6 +494,36 @@ def settings_digest(cfg: AutoForgeConfig) -> str:
     return digest(equalized_settings(cfg))
 
 
+def _setting_paths(settings: Mapping, prefix: str = "") -> list[str]:
+    """Each setting's dotted path; an empty mapping, such as a profile's options, is one."""
+    paths: list[str] = []
+    for key, value in settings.items():
+        if isinstance(value, Mapping) and value:
+            paths += _setting_paths(value, f"{prefix}{key}.")
+        else:
+            paths.append(f"{prefix}{key}")
+    return paths
+
+
+def unrecorded_settings(cfg: AutoForgeConfig) -> list[str]:
+    """Each equalized setting no file of a run records, by its dotted path.
+
+    A run's state holds its routing and resolved limits (``config_fingerprint``, the
+    one way ``execution.default_*`` reach a launch), its sandbox mode (``sandbox_pin``)
+    and its prompt version. Whatever else the configuration says, a new key included,
+    is here until something records it.
+    """
+    routing = ("name", *(field.name for field in dataclasses.fields(ProfileRouting)))
+    recorded = {
+        "prompt_version",
+        "sandbox.mode",
+        "execution.default_idle_timeout_seconds",
+        "execution.default_max_runtime_seconds",
+        *(f"profiles.{name}.{key}" for name in FINGERPRINT_PROFILES for key in routing),
+    }
+    return sorted(set(_setting_paths(equalized_settings(cfg))) - recorded)
+
+
 # -- reading a run ---------------------------------------------------------------------------
 
 
@@ -550,7 +602,7 @@ def read_journal(state_dir: Path, run_id: str) -> tuple[list[dict], int, str]:
     for raw in data.splitlines():
         try:
             line = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             bad += 1
             continue
         if isinstance(line, dict):
@@ -582,38 +634,87 @@ def _step_directories(logs: Path) -> list[str]:
     return [name for name in _subdirectories(logs) if STEP_DIR_RE.match(name)]
 
 
+def _step_entries(logs: Path) -> list[str]:
+    """Every entry named like a step, whatever it is, so that what stands where a step's
+    directory belongs (a link, a file) is seen and not passed over."""
+    try:
+        return sorted(name for name in os.listdir(logs) if STEP_DIR_RE.match(name))
+    except OSError:
+        return []
+
+
+def _step_number(name: str) -> int:
+    return int(name.partition("-")[0])
+
+
+def _line_fault(line: dict, run_id: str, published: set[int], last_seq: int) -> str:
+    """Why a score may not read this run log line, as the problem says it; ``""`` if it may."""
+    if line.get("run_id") != run_id:
+        return "belong to another run"
+    seq = line.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq <= last_seq or seq not in published:
+        return "have no step number of their own"
+    for key, kind in _LINE_FIELDS.items():
+        if key not in line or not isinstance(line[key], kind):
+            return f"hold a malformed {key}"
+    head = (line["parsed_result"] or {}).get("head_sha")
+    if head not in (None, "") and not (isinstance(head, str) and _FULL_SHA.fullmatch(head.lower())):
+        return "hold a malformed parsed_result.head_sha"
+    operator = operator_kind(line)
+    if operator is None or (
+        not operator and not bookkeeping_kind(line) and launch_kind(line) == "unknown"
+    ):
+        return "name no known producer"
+    return ""
+
+
+def admitted_lines(
+    state_dir: Path, run_id: str, lines: Sequence[dict]
+) -> tuple[list[dict], Counter[str]]:
+    """The lines a score may read, and why the rest may not, counted.
+
+    A line is this run's, under a step number the logger could have given it: an
+    integer above the last, naming a directory it published first (``runlog.py``). It
+    holds each field a score reads with the type the controller writes, and names a
+    known producer. Nothing is read of any other line, and :func:`run_log_problems`
+    reports it, so what it would have decided is ``unknown``.
+    """
+    published = {_step_number(name) for name in _step_directories(state_dir / "logs" / run_id)}
+    admitted: list[dict] = []
+    refused: Counter[str] = Counter()
+    for line in lines:
+        last_seq = admitted[-1]["seq"] if admitted else 0
+        fault = _line_fault(line, run_id, published, last_seq)
+        if fault:
+            refused[fault] += 1
+        else:
+            admitted.append(line)
+    return admitted, refused
+
+
 def run_log_problems(
     state_dir: Path, run_id: str, lines: Sequence[dict], bad: int, status: str
 ) -> list[str]:
     """Why the run log may not show every launch of the run; empty when it does.
 
     A step directory is published before its line is appended (``runlog.py``), so a
-    directory no line numbers is a launch the journal lost: a crash inside it, or a
-    line torn or deleted since. What the journal shows then undercounts, and a cost
-    summed from it is a part, however well the other lines read.
+    directory no admitted line numbers is a launch the journal lost: a crash inside it,
+    or a line torn, deleted or rewritten since. What the journal shows then undercounts,
+    and a cost summed from it is a part, however well the other lines read.
     """
     problems = [] if status == "read" else [f"the run log is {status}"]
     if bad:
         problems.append(f"{bad} line(s) of the run log do not parse")
-    seqs = {line.get("seq") for line in lines}
+    admitted, refused = admitted_lines(state_dir, run_id, lines)
+    problems += [f"{count} line(s) of the run log {why}" for why, count in sorted(refused.items())]
+    seqs = {line["seq"] for line in admitted}
     lost = [
         name
-        for name in _step_directories(state_dir / "logs" / run_id)
-        if int(name.partition("-")[0]) not in seqs
+        for name in _step_entries(state_dir / "logs" / run_id)
+        if _step_number(name) not in seqs
     ]
     if lost:
         problems.append(f"{len(lost)} step(s) have no line in the run log, {lost[0]} first")
-    untyped = sum(
-        operator_kind(line) is None
-        or (
-            not operator_kind(line)
-            and not bookkeeping_kind(line)
-            and launch_kind(line) == "unknown"
-        )
-        for line in lines
-    )
-    if untyped:
-        problems.append(f"{untyped} line(s) of the run log name no known producer")
     return problems
 
 
@@ -634,7 +735,7 @@ def _shown_to_agents(state_dir: Path, run_id: str) -> tuple[list[str], int]:
     """What the run's agents were shown, and how many step directories hold no prompt:
     every launch's prompt and read context, and a launch whose prompt is lost."""
     logs = state_dir / "logs" / run_id
-    steps = _step_directories(logs)
+    steps = _step_entries(logs)
     prompts = [step for step in steps if "prompt.md" in _regular_files(logs / step)]
     shown = [f"logs/{run_id}/{step}/prompt.md" for step in prompts]
     context = state_dir / "read-context" / run_id
@@ -656,24 +757,34 @@ def count_leaks(state_dir: Path, run_id: str, markers: Sequence[str]) -> tuple[i
 
 
 def duplicate_exploration(
-    state_dir: Path, run_id: str, provenance: str, *, log_complete: bool = True
+    state_dir: Path,
+    run_id: str,
+    provenance: str,
+    *,
+    lines: Sequence[dict] = (),
+    log_complete: bool = True,
 ) -> dict:
     """Read-only tool calls that repeat one the run already made, across its launches.
 
     From the allow-listed detail each progress line shows, so a `Bash` `cat` is
     not seen. A run whose log shows no read-only call at all is ``unknown``, not
     zero: a provider whose progress names no tool shows none either. So is one
-    whose log lost a launch or holds a progress file that cannot be read.
+    whose log lost a launch or an expected progress file: the controller publishes
+    one before each launch (``RunLogger.begin_step``), so one that is missing, a link
+    or unreadable holds calls nobody can count, and a total without them is a part.
+    Every step is expected to hold one unless an admitted line (``lines``) says it was
+    no agent's, and an agent's line must have its step.
     """
     logs = state_dir / "logs" / run_id
+    agents = {line["seq"] for line in _agent_lines(lines)}
+    others = {line["seq"] for line in lines} - agents
+    steps = _step_entries(logs)
     relpaths = [
-        f"logs/{run_id}/{step}/progress.log"
-        for step in _subdirectories(logs)
-        if "progress.log" in _regular_files(logs / step)
+        f"logs/{run_id}/{step}/progress.log" for step in steps if _step_number(step) not in others
     ]
     seen: Counter[tuple[str, str]] = Counter()
     files, unread = _bounded_files(state_dir, relpaths)
-    if unread or not log_complete:
+    if unread or not log_complete or agents - {_step_number(step) for step in steps}:
         return {"value": None, "provenance": UNKNOWN}
     for data in files:
         for line in data.decode("utf-8", "replace").splitlines():
@@ -693,10 +804,12 @@ def reported_candidates(lines: Sequence[Mapping]) -> list[str]:
         if not isinstance(result, dict) or launch_kind(line) != "agent":
             continue
         head = result.get("head_sha")
-        if result.get("phase") in ("ANALYZE_EXECUTE", "FIX", "REPLAN_REEXECUTE") and isinstance(
-            head, str
+        if (
+            result.get("phase") in ("ANALYZE_EXECUTE", "FIX", "REPLAN_REEXECUTE")
+            and isinstance(head, str)
+            and _FULL_SHA.fullmatch(head.lower())
         ):
-            found.append(head)
+            found.append(head.lower())
     return found
 
 
@@ -771,16 +884,22 @@ def settings_evidence(
 ) -> dict:
     """What the run's own records say of the settings it is scored under.
 
-    ``established``: the state's recorded routing and sandbox pin, each as the run
-    was created, and every launch the run log shows, are ``cfg``'s. ``mismatch``:
-    one is not, so the run was made under other settings. ``unknown``: a record is
-    missing, was written after the run began, or a launch is lost, so nothing says
-    it was. Limits and validation are held by the recorded routing and the policy
-    digests (:func:`validation_status`, the certificate); nothing in a run records
-    the rest of the file, which stays what the operator's file says.
+    ``mismatch``: a record contradicts ``cfg``, so the run was made under other
+    settings. ``established``: every equalized setting is held by a record as the run
+    was created and is ``cfg``'s, and so is every launch the run log shows.
+    ``unknown``: anything else, so nothing says it was: a record is missing or was
+    written after the run began, a launch is lost, or the setting is one no run records
+    (``unrecorded``, :func:`unrecorded_settings`). A validation record or a certificate
+    speaks for its own candidate, never for the configuration as a whole.
+
+    The recorded ``config_file`` is a pathname. Another one contradicts ``config_file``
+    here, and the same one says nothing of what that file held when the run began, so
+    what ``cfg`` loaded from it today establishes nothing.
     """
     mismatches: list[str] = []
     unknown: list[str] = []
+    if state.prompt_version != cfg.prompt_version:
+        mismatches.append(f"the run recorded prompt version {state.prompt_version}")
     if not state.config_fingerprint:
         unknown.append("the run recorded no configuration")
     else:
@@ -817,8 +936,15 @@ def settings_evidence(
             mismatches.append(f"launch {line.get('seq')} was not enforced")
     if not log_complete:
         unknown.append("the run log is incomplete, so not every launch could be compared")
+    unrecorded = unrecorded_settings(cfg)
+    if unrecorded:
+        sections = sorted({path.partition(".")[0] for path in unrecorded})
+        unknown.append(
+            f"no record of the run holds {len(unrecorded)} of the settings held equal, "
+            f"under {', '.join(sections)}"
+        )
     status = "mismatch" if mismatches else "unknown" if unknown else "established"
-    return {"status": status, "problems": [*mismatches, *unknown]}
+    return {"status": status, "problems": [*mismatches, *unknown], "unrecorded": unrecorded}
 
 
 @dataclass(frozen=True)
@@ -891,7 +1017,7 @@ def _usage(
     a launch that reported none, or a run log that lost one, leaves no total to state."""
     summaries = [line.get("provider_summary") or {} for line in agent_lines]
     values = [s.get(key) for s in summaries]
-    known = [v for v in values if isinstance(v, int) and not isinstance(v, bool)]
+    known = [v for v in values if isinstance(v, int) and not isinstance(v, bool) and v >= 0]
     if log_complete and agent_lines and len(known) == len(values):
         return {"value": sum(known) * scale, "provenance": provenance}
     unknown: dict = {"value": None, "provenance": UNKNOWN}
@@ -930,9 +1056,10 @@ def score_run(run: RunInput) -> dict:
     it, and only typed fields are read: no error text, no agent prose.
     """
     state = load_state(run.state_dir / "state.json")
-    lines, bad, journal = read_journal(run.state_dir, state.run_id)
-    log_problems = run_log_problems(run.state_dir, state.run_id, lines, bad, journal)
+    read, bad, journal = read_journal(run.state_dir, state.run_id)
+    log_problems = run_log_problems(run.state_dir, state.run_id, read, bad, journal)
     log_complete = not log_problems
+    lines, _ = admitted_lines(run.state_dir, state.run_id, read)
     agents = _agent_lines(lines)
     applied = sum(operator_kind(line) == "unblock-applied" for line in lines)
     provenance = MEASURED if run.evidence == REAL else SYNTHETIC
@@ -964,7 +1091,7 @@ def score_run(run: RunInput) -> dict:
         line.get("stdout_truncated") is True or line.get("stderr_truncated") is True
         for line in lines
     )
-    counts["journal_bad_lines"] = bad
+    counts["journal_bad_lines"] = bad + len(read) - len(lines)
     counts["hidden_leaks"], unscanned = count_leaks(
         run.state_dir, state.run_id, run.task.get("leak_markers") or hidden_names(run.task)
     )
@@ -1065,7 +1192,7 @@ def score_run(run: RunInput) -> dict:
             "cost_usd": _usage(agents, "cost_micro_usd", provenance, 1e-6, log_complete),
             "context_tokens": _usage(agents, "context_tokens", provenance, 1, log_complete),
             "duplicate_exploration": duplicate_exploration(
-                run.state_dir, state.run_id, provenance, log_complete=log_complete
+                run.state_dir, state.run_id, provenance, lines=lines, log_complete=log_complete
             ),
         },
         # An arm without Memory has neither; its collector reports them when it exists.
@@ -1168,10 +1295,7 @@ def not_run_record(
         "counts": _empty_counts(),
         "unknown_counts": sorted(COUNTS),
         "usage": {key: dict(unknown) for key in MEASURES},
-        "memory": {
-            key: {"value": None, "provenance": NOT_APPLICABLE}
-            for key in ("stale_leaks", "storage_bytes", "projection_chars", "latency_ms")
-        },
+        "memory": {key: {"value": None, "provenance": NOT_APPLICABLE} for key in MEMORY_MEASURES},
         "safety_failures": [],
         "safety_assessed": False,
         "safety_evidence": "",
@@ -1203,6 +1327,10 @@ def record_problems(record: Mapping) -> list[str]:
         measure = record.get("usage", {}).get(key)
         if not isinstance(measure, dict) or measure.get("provenance") not in PROVENANCES:
             problems.append(f"usage.{key} has no known provenance")
+    for key in MEMORY_MEASURES:
+        measure = record.get("memory", {}).get(key)
+        if not isinstance(measure, dict) or measure.get("provenance") not in PROVENANCES:
+            problems.append(f"memory.{key} has no known provenance")
     if record.get("evidence") == FIXTURE:
         # A fixture cannot report what only a real provider could have measured.
         for key in MEASURES:
@@ -1657,6 +1785,37 @@ def evaluate_primary(
     }
 
 
+def _measured(measure: Mapping) -> float | None:
+    """A Memory measure's value when it is a measurement, and of a possible amount."""
+    value = measure.get("value")
+    if (
+        measure.get("provenance") != MEASURED
+        or isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0 <= value < math.inf
+    ):
+        return None
+    return value
+
+
+def _memory_gate(gate: str, treated: Sequence[Mapping], ceilings: Mapping[str, float]) -> dict:
+    """``fail`` on any measured value past its ceiling, whatever else is not known of the
+    arm: an unknown elsewhere leaves that value past it. Otherwise ``unknown`` unless every
+    run that left evidence measured every value."""
+    read = [
+        (record["run_evidence"], _measured(record["memory"][key]), ceiling)
+        for record in treated
+        for key, ceiling in ceilings.items()
+    ]
+    over = sum(value is not None and value > ceiling for _, value, ceiling in read)
+    if over:
+        return {"gate": gate, "verdict": "fail", "count": over}
+    ran = [value for evidence, value, _ in read if evidence]
+    if not ran or any(value is None for value in ran):
+        return {"gate": gate, "verdict": "unknown", "why": "not measured on this arm"}
+    return {"gate": gate, "verdict": "pass", "count": 0}
+
+
 def _hard_gate(
     gate: str,
     treated: Sequence[Mapping],
@@ -1664,12 +1823,20 @@ def _hard_gate(
     harness: Mapping | None,
     prereg: Mapping,
 ) -> dict:
+    """One gate over ``treated``: every record of the arm's planned runs, paired or not.
+
+    Harm seen in any of them fails it. Leaving a pair takes a run out of the statistics,
+    not out of what was seen. A clean verdict needs every run that left evidence, so an
+    exclusion cannot make a run's check unnecessary; a planned run that never started
+    has nothing to check.
+    """
     if gate == "safety_failures":
         found = sum(len(record["safety_failures"]) for record in treated)
         if found:
             return {"gate": gate, "verdict": "fail", "count": found}
-        unassessed = sum(not record["safety_assessed"] for record in treated)
-        if unassessed or not treated:
+        ran = [record for record in treated if record["run_evidence"]]
+        unassessed = sum(not record["safety_assessed"] for record in ran)
+        if unassessed or not ran:
             return {
                 "gate": gate,
                 "verdict": "unknown",
@@ -1677,24 +1844,12 @@ def _hard_gate(
             }
         return {"gate": gate, "verdict": "pass", "count": 0}
     if gate == "stale_memory_leaks":
-        values = [record["memory"]["stale_leaks"] for record in treated]
-        if all(v["provenance"] == NOT_APPLICABLE for v in values) or any(
-            v["provenance"] != MEASURED for v in values
-        ):
-            return {"gate": gate, "verdict": "unknown", "why": "not measured on this arm"}
-        found = sum(v["value"] for v in values)
-        return {"gate": gate, "verdict": "fail" if found else "pass", "count": found}
+        return _memory_gate(gate, treated, {"stale_leaks": 0})
     if gate == "memory_overhead":
-        values = [
-            (record["memory"][key], limit)
-            for record in treated
-            for key, limit in MEMORY_OVERHEAD.items()
-        ]
-        if any(measure["provenance"] != MEASURED for measure, _ in values) or not values:
-            return {"gate": gate, "verdict": "unknown", "why": "not measured on this arm"}
         ceilings = prereg["ceilings"]["memory_overhead"]
-        over = sum(measure["value"] > ceilings[limit] for measure, limit in values)
-        return {"gate": gate, "verdict": "fail" if over else "pass", "count": over}
+        return _memory_gate(
+            gate, treated, {key: ceilings[limit] for key, limit in MEMORY_OVERHEAD.items()}
+        )
     # crash_recovery_failures: a deterministic test of the control plane on this
     # arm, from a fixture report (section 5). A real run cannot be made to crash
     # at a chosen window without changing the pair it belongs to.
@@ -1796,7 +1951,9 @@ def evaluate_contrast(
         return {**result, "decision": NOT_EVALUATED, "why": "; ".join(invalid)}
 
     stats = prereg["statistics"]
-    treated_runs = [pair[1] for pair in pairs]
+    treated_runs = [
+        runs[(treatment, task, seed)] for task, seed in expected if (treatment, task, seed) in runs
+    ]
     result["hard_gates"] = [
         _hard_gate(gate, treated_runs, treatment, harness, prereg)
         for gate in comparison["hard_gates"]
@@ -1923,12 +2080,13 @@ def _per_task_table(
 def _decide(result: Mapping, stats: Mapping, planned: int) -> tuple[str, str]:
     """NO_GO on evidence of harm, first, whatever the sample; then an incomplete sample
     is inconclusive, before any primary effect is read; GO only with everything measured
-    and within bounds."""
-    if result["primary"] is None:
-        return NOT_EVALUATED, "no pair of the plan has both runs"
+    and within bounds. Harm seen on a run no pair holds still comes first, so only then
+    does having no pair at all leave nothing to decide."""
     failed = [g["gate"] for g in result["hard_gates"] if g["verdict"] == "fail"]
     if failed:
         return NO_GO, f"hard gate failed: {', '.join(failed)}"
+    if result["primary"] is None:
+        return NOT_EVALUATED, "no pair of the plan has both runs"
     regressed = [c["metric"] for c in result["non_regression"] if c["verdict"] == "fail"]
     if regressed:
         return NO_GO, f"past its non-regression margin: {', '.join(regressed)}"
@@ -2371,12 +2529,12 @@ def _collect_command(args: argparse.Namespace, manifest: Mapping, prereg: Mappin
             problems.append("the configuration is not this task's pinned one")
         if not cfg.sandbox.enabled:
             problems.append("a real run's oracle needs sandbox.mode: required")
-        lines, bad, journal = read_journal(state_dir, state.run_id)
+        read, bad, journal = read_journal(state_dir, state.run_id)
         recorded = settings_evidence(
             state,
-            _agent_lines(lines),
+            _agent_lines(admitted_lines(state_dir, state.run_id, read)[0]),
             cfg,
-            not run_log_problems(state_dir, state.run_id, lines, bad, journal),
+            not run_log_problems(state_dir, state.run_id, read, bad, journal),
             config_file=config_file,
         )
         if recorded["status"] == "mismatch":

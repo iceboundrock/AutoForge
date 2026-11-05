@@ -385,6 +385,19 @@ def _edit_journal(state_dir: Path, edit) -> None:
     path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
 
 
+def _edit_agent_lines(state_dir: Path, edit) -> None:
+    _edit_journal(state_dir, lambda line: edit(line) if line.get("provider") else None)
+
+
+def _agent_steps(state_dir: Path) -> list[Path]:
+    """The step directories the run log says were an agent's, in order."""
+    run_id = load_state(state_dir / "state.json").run_id
+    lines, _, _ = ev.read_journal(state_dir, run_id)
+    seqs = {line["seq"] for line in ev._agent_lines(lines)}
+    steps = [path for path in sorted(_log_dir(state_dir).iterdir()) if path.is_dir()]
+    return [path for path in steps if int(path.name.partition("-")[0]) in seqs]
+
+
 def test_a_narrower_run_is_no_evidence_for_the_configured_set(world):
     """ADR 0010 D1: a run of something other than the configured FULL set makes no
     `passed`. The records are of the fixture's command, and this configuration's set is
@@ -468,7 +481,7 @@ def test_a_lost_launch_line_leaves_everything_it_decides_unknown(world, tmp_path
     assert whole["journal_problems"] == [] and whole["unknown_counts"] == []
     assert whole["safety_assessed"] is True
     assert whole["usage"]["cost_usd"]["provenance"] == ev.SYNTHETIC
-    assert whole["settings_evidence"]["status"] == "established"
+    assert not any("incomplete" in problem for problem in whole["settings_evidence"]["problems"])
 
     record = _score(world, "fx-slugify", state_dir=state_dir, safety_evidence="checked by hand")
     (problem,) = record["journal_problems"]
@@ -481,6 +494,7 @@ def test_a_lost_launch_line_leaves_everything_it_decides_unknown(world, tmp_path
     }
     assert record["usage"]["duplicate_exploration"]["provenance"] == ev.UNKNOWN
     assert record["settings_evidence"]["status"] == "unknown"
+    assert any("incomplete" in problem for problem in record["settings_evidence"]["problems"])
     assert record["safety_assessed"] is False
     assert ev.measure_of(record, "review_fix_cycles") == (None, ev.UNKNOWN)
     assert ev.measure_of(record, "cost_usd") == (None, ev.UNKNOWN)
@@ -495,9 +509,8 @@ def test_a_lost_launch_line_leaves_everything_it_decides_unknown(world, tmp_path
             "1 line(s) of the run log do not parse",
         ),
         (
-            lambda journal: journal.write_text(
-                journal.read_text(encoding="utf-8") + json.dumps({"seq": 99, "phase": "?"}) + "\n",
-                encoding="utf-8",
+            lambda journal: _edit_journal(
+                journal.parent.parent.parent, lambda line: line.update(profile="", provider="")
             ),
             "name no known producer",
         ),
@@ -512,6 +525,164 @@ def test_a_run_log_that_cannot_be_read_whole_decides_nothing(world, tmp_path, sp
     assert set(ev.JOURNAL_COUNTS) <= set(record["unknown_counts"])
     assert record["usage"]["cost_usd"]["value"] is None
     assert record["safety_assessed"] is False
+
+
+def _assert_decides_nothing(record: dict, needle: str) -> None:
+    """What a refused line would have decided is `unknown`, reported, and nothing was read of it."""
+    assert any(needle in problem for problem in record["journal_problems"]), record[
+        "journal_problems"
+    ]
+    assert set(ev.JOURNAL_COUNTS) <= set(record["unknown_counts"])
+    assert record["usage"]["cost_usd"]["value"] is None
+    assert record["usage"]["cost_usd"]["provenance"] == ev.UNKNOWN
+    assert record["usage"]["duplicate_exploration"]["provenance"] == ev.UNKNOWN
+    assert record["settings_evidence"]["status"] == "unknown"
+    assert record["safety_assessed"] is False
+
+
+def test_another_runs_log_is_no_evidence_of_this_one(world, tmp_path):
+    """Every line of it reads well, and none of it happened here: no measured cost, and no
+    launch counted."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _edit_journal(state_dir, lambda line: line.update(run_id="af-another-run"))
+    record = _score(world, "fx-slugify", state_dir=state_dir, safety_evidence="checked by hand")
+    _assert_decides_nothing(record, "belong to another run")
+    assert record["usage"]["cost_usd"] == {"value": None, "provenance": ev.UNKNOWN}
+    assert record["counts"]["agent_launches"] == 0
+    assert record["counts"]["journal_bad_lines"] > 0
+
+
+def test_one_foreign_line_leaves_only_the_known_part_of_a_cost(world, tmp_path):
+    """The lines that are this run's still say what they spent, as a part apart."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    (first, *_) = _agent_steps(state_dir)
+    seq = int(first.name.partition("-")[0])
+    _edit_journal(state_dir, lambda line: line["seq"] == seq and line.update(run_id="af-other"))
+    whole = _score(world, "fx-slugify")["usage"]["cost_usd"]["value"]
+    record = _score(world, "fx-slugify", state_dir=state_dir, safety_evidence="checked by hand")
+    _assert_decides_nothing(record, "1 line(s) of the run log belong to another run")
+    assert 0 < record["usage"]["cost_usd"]["known_part"] < whole
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("provider_summary", "a string"),
+        ("provider_summary", None),
+        ("metadata", "a string"),
+        ("sandbox", "a string"),
+        ("profile", 1),
+        ("profile", ["analyze_execute"]),
+        ("provider", {"name": "claude"}),
+        ("phase", None),
+        ("model", 1),
+        ("effort", 1),
+        ("command", "python3"),
+        ("timed_out", "false"),
+        ("stdout_truncated", 0),
+        ("stderr_truncated", None),
+        ("parsed_result", "a string"),
+    ],
+)
+def test_a_malformed_field_is_refused_and_never_crashes_a_score(world, tmp_path, field, value):
+    """A string where a summary goes used to reach `.get`; a list where a profile goes, a
+    `dict` lookup. Each now leaves what the line would have decided `unknown`."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _edit_agent_lines(state_dir, lambda line: line.update({field: value}))
+    record = _score(world, "fx-slugify", state_dir=state_dir, safety_evidence="checked by hand")
+    _assert_decides_nothing(record, f"hold a malformed {field}")
+    assert record["usage"]["cost_usd"] == {"value": None, "provenance": ev.UNKNOWN}
+
+
+def test_a_field_a_line_leaves_out_is_refused_never_read_as_its_default(world, tmp_path):
+    """`ExecutionRecord` writes every field, so a line without `timed_out` is no line that says
+    the launch did not time out."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _edit_agent_lines(state_dir, lambda line: line.pop("timed_out"))
+    record = _score(world, "fx-slugify", state_dir=state_dir, safety_evidence="checked by hand")
+    _assert_decides_nothing(record, "hold a malformed timed_out")
+
+
+@pytest.mark.parametrize(
+    "seq",
+    ["1", 1.0, True, 0, -1, None, [1], {"seq": 1}, 999],
+    ids=["text", "float", "bool", "zero", "negative", "null", "list", "mapping", "no-such-step"],
+)
+def test_a_line_without_a_step_number_of_its_own_is_refused(world, tmp_path, seq):
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    (first, *_) = _agent_steps(state_dir)
+    number = int(first.name.partition("-")[0])
+    _edit_journal(state_dir, lambda line: line["seq"] == number and line.update(seq=seq))
+    record = _score(world, "fx-slugify", state_dir=state_dir, safety_evidence="checked by hand")
+    _assert_decides_nothing(record, "have no step number of their own")
+
+
+def _rewrite_lines(state_dir: Path, edit) -> None:
+    path = _log_dir(state_dir) / "events.jsonl"
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    edit(lines)
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda lines: lines[-1].update(seq=lines[0]["seq"]),
+        lambda lines: lines.append(dict(lines[-1])),
+        lambda lines: lines.reverse(),
+    ],
+    ids=["reused", "repeated", "out-of-order"],
+)
+def test_a_step_number_only_ever_rises(world, tmp_path, edit):
+    """The logger gives each line the next number, so a repeat counted twice is a launch and
+    its cost that happened once."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _rewrite_lines(state_dir, edit)
+    record = _score(world, "fx-slugify", state_dir=state_dir, safety_evidence="checked by hand")
+    _assert_decides_nothing(record, "have no step number of their own")
+
+
+def test_a_result_naming_no_commit_reaches_neither_git_nor_the_oracle(world, tmp_path):
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+
+    def spoil(line: dict) -> None:
+        if (line.get("parsed_result") or {}).get("head_sha"):
+            line["parsed_result"]["head_sha"] = "--output=/tmp/owned"
+
+    _edit_journal(state_dir, spoil)
+    asked: list[str] = []
+    record = _score(
+        world,
+        "fx-slugify",
+        state_dir=state_dir,
+        oracle=lambda commit: asked.append(commit) or "pass",
+    )
+    assert any("parsed_result.head_sha" in problem for problem in record["journal_problems"])
+    assert "--output=/tmp/owned" not in asked
+    assert "--output=/tmp/owned" not in record["candidates"]
+
+
+def test_a_full_sha_in_capitals_is_the_same_commit(world, tmp_path):
+    """The controller's parser takes one and lower-cases its own copy, and the run log holds
+    the payload as it came."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+
+    def shout(line: dict) -> None:
+        if (line.get("parsed_result") or {}).get("head_sha"):
+            line["parsed_result"]["head_sha"] = line["parsed_result"]["head_sha"].upper()
+
+    _edit_journal(state_dir, shout)
+    record = _score(world, "fx-slugify", state_dir=state_dir)
+    assert record["journal_problems"] == []
+    assert record["candidates"] == _score(world, "fx-slugify")["candidates"]
+
+
+def test_a_negative_cost_is_no_cost(world, tmp_path):
+    """It would make the measured total smaller than what was spent."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _edit_agent_lines(state_dir, lambda line: line["provider_summary"].update(cost_micro_usd=-1))
+    record = _score(world, "fx-slugify", state_dir=state_dir)
+    assert record["usage"]["cost_usd"] == {"value": None, "provenance": ev.UNKNOWN}
 
 
 def test_a_journal_read_as_a_link_is_not_read(world, tmp_path):
@@ -532,6 +703,19 @@ def test_a_prompt_that_cannot_be_read_leaves_a_leak_not_ruled_out(world, tmp_pat
     record = _score(world, "fx-slugify", state_dir=state_dir)
     assert "hidden_leaks" in record["unknown_counts"]
     assert record["unverified_reasons"] == ["leak_scan_incomplete"]
+    assert record["outcome"] == ev.UNVERIFIED
+
+
+def test_a_step_directory_replaced_by_a_link_leaves_a_leak_not_ruled_out(world, tmp_path):
+    """What the link reaches is no prompt the run showed, and the one it did show is gone."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    (first, *_) = sorted(p for p in _log_dir(state_dir).iterdir() if p.is_dir())
+    aside = tmp_path / "aside"
+    shutil.move(first, aside)
+    first.symlink_to(aside)
+    record = _score(world, "fx-slugify", state_dir=state_dir)
+    assert "hidden_leaks" in record["unknown_counts"]
+    assert "leak_scan_incomplete" in record["unverified_reasons"]
     assert record["outcome"] == ev.UNVERIFIED
 
 
@@ -676,12 +860,14 @@ def test_a_journal_line_that_does_not_parse_is_counted(tmp_path):
     lines, bad, status = ev.read_journal(state_dir, "run")
     assert (lines, bad, status) == ([{"phase": "REVIEW"}], 2, "read")
     assert ev.read_journal(state_dir, "other") == ([], 0, "absent")
+    (logs / "events.jsonl").write_bytes(b'{"phase": "REVIEW"}\n' + b"[" * 1_000_000 + b"\n")
+    assert ev.read_journal(state_dir, "run") == ([{"phase": "REVIEW"}], 1, "read")
 
 
 def test_duplicate_exploration_counts_read_only_calls_repeated_across_launches(tmp_path):
     state_dir = tmp_path / "state"
     logs = state_dir / "logs" / "run"
-    first, second = logs / "001-ANALYZE_EXECUTE-1", logs / "002-REVIEW-1"
+    first, second = logs / "001-analyze-execute-1", logs / "002-review-1"
     first.mkdir(parents=True)
     second.mkdir()
     (first / "progress.log").write_text(
@@ -706,6 +892,107 @@ def test_duplicate_exploration_counts_read_only_calls_repeated_across_launches(t
         "value": None,
         "provenance": ev.UNKNOWN,
     }
+
+
+_NOT_COUNTED = {"value": None, "provenance": ev.UNKNOWN}
+
+
+def _two_agent_steps(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A state directory with two agent steps; only the first holds its progress file."""
+    state_dir = tmp_path / "state"
+    logs = state_dir / "logs" / "run"
+    first, second = logs / "001-analyze-execute-1", logs / "002-review-1"
+    first.mkdir(parents=True)
+    second.mkdir()
+    (first / "progress.log").write_text("[00:00:01 X #1] Read src/a.py\n", encoding="utf-8")
+    return state_dir, first, second
+
+
+def test_a_missing_progress_file_is_no_measured_part(tmp_path):
+    """The second launch's calls are not counted, so the first's zero repeats say nothing of
+    the run: the one measured value this could give is one nobody saw."""
+    state_dir, _, second = _two_agent_steps(tmp_path)
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == _NOT_COUNTED
+    (second / "progress.log").write_text("[00:00:01 Y #1] Read src/a.py\n", encoding="utf-8")
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == {
+        "value": 1,
+        "provenance": ev.MEASURED,
+    }
+
+
+def test_a_progress_file_replaced_by_a_link_is_no_measured_part(tmp_path):
+    state_dir, _, second = _two_agent_steps(tmp_path)
+    aside = tmp_path / "aside.log"
+    aside.write_text("[00:00:01 Y #1] Read src/b.py\n", encoding="utf-8")
+    (second / "progress.log").symlink_to(aside)
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == _NOT_COUNTED
+
+
+@pytest.mark.parametrize(
+    "plant",
+    [lambda path: path.mkdir(), os.mkfifo],
+    ids=["directory", "fifo"],
+)
+def test_a_progress_file_that_is_no_file_is_no_measured_part(tmp_path, plant):
+    state_dir, _, second = _two_agent_steps(tmp_path)
+    plant(second / "progress.log")
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == _NOT_COUNTED
+
+
+def test_a_progress_file_nobody_may_read_is_no_measured_part(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root reads whatever a file's mode says")
+    state_dir, _, second = _two_agent_steps(tmp_path)
+    progress = second / "progress.log"
+    progress.write_text("[00:00:01 Y #1] Read src/b.py\n", encoding="utf-8")
+    progress.chmod(0)
+    try:
+        assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == _NOT_COUNTED
+    finally:
+        progress.chmod(0o600)
+
+
+def test_a_step_directory_replaced_by_a_link_is_no_measured_part(tmp_path):
+    state_dir, _, second = _two_agent_steps(tmp_path)
+    second.rmdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "progress.log").write_text("[00:00:01 Y #1] Read src/b.py\n", encoding="utf-8")
+    second.symlink_to(elsewhere)
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == _NOT_COUNTED
+
+
+def test_only_an_agents_step_owes_a_progress_file(tmp_path):
+    """A bookkeeping line's step holds none, and is no gap. An agent's line whose step is gone
+    is one, however the steps that remain read."""
+    state_dir, _, second = _two_agent_steps(tmp_path)
+    agent = {"seq": 1, "profile": "analyze_execute", "provider": "claude"}
+    bookkeeping = {"seq": 2, "profile": "(EPIC binding at run creation; no agent)", "provider": ""}
+    assert second.is_dir() and not (second / "progress.log").exists()
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED, lines=[agent, bookkeeping]) == {
+        "value": 0,
+        "provenance": ev.MEASURED,
+    }
+    lost = {"seq": 3, "profile": "fix", "provider": "claude"}
+    assert (
+        ev.duplicate_exploration(state_dir, "run", ev.MEASURED, lines=[agent, bookkeeping, lost])
+        == _NOT_COUNTED
+    )
+
+
+def test_a_lost_progress_file_leaves_a_scored_run_with_no_exploration_count(world, tmp_path):
+    """Through `score_run`, so the agent steps are the ones its own run log names."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    steps = _agent_steps(state_dir)
+    assert len(steps) > 1
+    for step in steps:
+        (step / "progress.log").write_text("[00:00:01 X #1] Read src/a.py\n", encoding="utf-8")
+    whole = _score(world, "fx-slugify", state_dir=state_dir)["usage"]["duplicate_exploration"]
+    assert whole == {"value": len(steps) - 1, "provenance": ev.SYNTHETIC}
+
+    (steps[-1] / "progress.log").unlink()
+    lost = _score(world, "fx-slugify", state_dir=state_dir)["usage"]["duplicate_exploration"]
+    assert lost == _NOT_COUNTED
 
 
 # -- the oracle ------------------------------------------------------------------------------
@@ -949,7 +1236,10 @@ def test_collect_scores_a_real_run_as_measured_and_records_the_approval(
     assert record["approval"] == "the approval's URL"
     assert record["usage"]["cost_usd"]["provenance"] == ev.MEASURED
     assert record["settings_digest"] == manifest["equalized_settings"]["digest"]
-    assert record["settings_evidence"] == {"status": "established", "problems": []}
+    evidence = record["settings_evidence"]
+    assert evidence["status"] == "unknown"
+    (problem,) = evidence["problems"]
+    assert "no record of the run holds" in problem and "workflow" in problem
     assert record["run_evidence"] is True and record["safety_assessed"] is False
     assert record["validation"] == "absent"
     assert record["outcome"] == ev.UNVERIFIED
@@ -1015,8 +1305,20 @@ def _recorded_routing(state_dir: Path, profile: str, **routing) -> None:
             ),
             "was not enforced",
         ),
+        (
+            lambda d: _edit_state(d, prompt_version="another"),
+            "the run recorded prompt version another",
+        ),
     ],
-    ids=["model", "limit", "disabled-sandbox", "pin-moved", "launched-model", "unenforced"],
+    ids=[
+        "model",
+        "limit",
+        "disabled-sandbox",
+        "pin-moved",
+        "launched-model",
+        "unenforced",
+        "prompt-version",
+    ],
 )
 def test_collect_refuses_a_run_its_own_records_show_under_other_settings(
     world, tmp_path, monkeypatch, capsys, spoil, said
@@ -1041,6 +1343,101 @@ def test_collect_refuses_a_run_recorded_from_another_file(world, tmp_path, monke
     assert "the run was recorded from /o.yaml" in capsys.readouterr().out
 
 
+def _recorded_from(state_dir: Path, cfg, config_file: str) -> None:
+    _edit_state(
+        state_dir,
+        config_fingerprint=RecordedConfiguration(
+            fingerprint=ConfigFingerprint.from_config(cfg, "/worktrees"),
+            config_file=config_file,
+            source="created",
+            recorded_at="2026-01-01T00:00:00+00:00",
+        ).to_dict(),
+    )
+
+
+@pytest.mark.parametrize(
+    "setting, change",
+    [
+        (
+            "workflow.max_review_rounds",
+            lambda text: text + "\nworkflow:\n  max_review_rounds: 99\n",
+        ),
+        (
+            "execution.max_correction_attempts",
+            lambda text: text.replace("max_correction_attempts: 1", "max_correction_attempts: 3"),
+        ),
+        (
+            "profiles.review_round_1.options.permission_mode",
+            lambda text: text.replace(
+                "permission_mode: bypassPermissions", "permission_mode: acceptEdits", 1
+            ),
+        ),
+        (
+            "safety.required_checks",
+            lambda text: text.replace('- "ci"', '- "ci"\n    - "other"'),
+        ),
+    ],
+    ids=["loop-bound", "correction-attempts", "profile-option", "required-checks"],
+)
+def test_a_file_changed_at_the_same_pathname_establishes_nothing(world, tmp_path, setting, change):
+    """The run recorded this pathname from one configuration, and the pathname holds another
+    today. Its routing is the same and so is the pathname, so nothing in the run can tell. That
+    is `unknown`, naming the setting: never `established` because the path matched."""
+    pinned = ev.REAL_RUN_CONFIG.read_text(encoding="utf-8")
+    config = tmp_path / "run.yaml"
+    config.write_text(change(pinned), encoding="utf-8")
+    at_the_run = load_config_file(str(config))
+    state_dir = _pinned_state(world, tmp_path)
+    _recorded_from(state_dir, at_the_run, str(config))
+
+    config.write_text(pinned, encoding="utf-8")
+    today = load_config_file(str(config))
+    assert ev.settings_digest(at_the_run) != ev.settings_digest(today)
+    state = load_state(state_dir / "state.json")
+    assert state.config_fingerprint["config_file"] == str(config)
+    assert state.config_fingerprint["profiles"] == {
+        name: routing.to_dict() for name, routing in ev.fingerprint_routing(today).items()
+    }
+
+    lines, _, _ = ev.read_journal(state_dir, state.run_id)
+    evidence = ev.settings_evidence(
+        state, ev._agent_lines(lines), today, True, config_file=str(config)
+    )
+    assert evidence["status"] == "unknown"
+    assert setting in evidence["unrecorded"]
+    assert any("no record of the run holds" in problem for problem in evidence["problems"])
+
+
+def test_settings_are_established_only_when_a_record_holds_every_one(world, tmp_path, monkeypatch):
+    """What stands between a run and `established` is the settings no record holds: the day
+    something records them, nothing else here has to change."""
+    state_dir = _pinned_state(world, tmp_path)
+    cfg = load_config_file(str(ev.REAL_RUN_CONFIG))
+    state = load_state(state_dir / "state.json")
+    lines, _, _ = ev.read_journal(state_dir, state.run_id)
+    agents = ev._agent_lines(lines)
+    assert ev.settings_evidence(state, agents, cfg, True)["status"] == "unknown"
+    monkeypatch.setattr(ev, "unrecorded_settings", lambda _cfg: [])
+    assert ev.settings_evidence(state, agents, cfg, True) == {
+        "status": "established",
+        "problems": [],
+        "unrecorded": [],
+    }
+
+
+def test_a_malformed_line_refuses_no_collect_and_establishes_nothing(world, tmp_path, monkeypatch):
+    """A list where a profile goes used to raise out of `settings_evidence`: `collect` writes
+    the record, with what that line decided `unknown`."""
+    args, manifest = _collect_inputs(world, tmp_path, monkeypatch)
+    state_dir = Path(args[args.index("--state-dir") + 1])
+    _edit_agent_lines(state_dir, lambda line: line.update(profile=["fix"]))
+    assert _run_collect(args, manifest, monkeypatch) == 0
+    record = ev.read_json(tmp_path / "record.json")
+    assert any("hold a malformed profile" in problem for problem in record["journal_problems"])
+    assert record["usage"]["cost_usd"] == {"value": None, "provenance": ev.UNKNOWN}
+    assert record["settings_evidence"]["status"] == "unknown"
+
+
 def test_collect_marks_settings_a_run_did_not_record_as_unknown(world, tmp_path, monkeypatch):
     """Nothing contradicts the file, and nothing backs it: written, and marked, so that a
     comparison over it cannot read `GO`."""
@@ -1049,10 +1446,11 @@ def test_collect_marks_settings_a_run_did_not_record_as_unknown(world, tmp_path,
     _edit_state(state_dir, config_fingerprint={}, sandbox_pin={})
     assert _run_collect(args, manifest, monkeypatch) == 0
     evidence = ev.read_json(tmp_path / "record.json")["settings_evidence"]
-    assert evidence == {
-        "status": "unknown",
-        "problems": ["the run recorded no configuration", "the run recorded no sandbox pin"],
-    }
+    assert evidence["status"] == "unknown"
+    assert evidence["problems"][:2] == [
+        "the run recorded no configuration",
+        "the run recorded no sandbox pin",
+    ]
 
 
 @pytest.mark.parametrize("ceiling", ev.CEILING_OUTCOMES)
