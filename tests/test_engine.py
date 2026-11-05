@@ -5119,10 +5119,12 @@ def test_fix_pr_changed_after_a_follow_up_write_is_read_before_the_push(
     """PR #205 R3-F2: the PR the plan was checked against before it sent
     anything may change while the follow-ups are written, so it is read
     again, under the same rules, before the push (the commit point). A PR
-    closed meanwhile is refused (VerificationError, for 'resume'); one no
-    longer headed at a branch of the run's repository blocks; one
-    retargeted is drift (the findings carried to REVIEW). In each case the
-    follow-ups stay on GitHub and the candidate is never pushed."""
+    closed meanwhile is refused (VerificationError, for 'resume'), and since
+    PR #460 R1-F3 by the owner check before the next effect, a follow-up
+    included; one no longer headed at a branch of the run's repository
+    blocks; one retargeted is drift (the findings carried to REVIEW). In
+    each case the follow-ups sent before the change stay on GitHub and the
+    candidate is never pushed."""
     gh = FakeGitHub()
     gh.add_issue(ISSUE3, "deferred in round 1", body=_marked("R1-F5"))
     eng = _in_fix(
@@ -5150,13 +5152,19 @@ def test_fix_pr_changed_after_a_follow_up_write_is_read_before_the_push(
             eng.step()
     else:
         out = eng.step()
-    assert [w[0] for w in gh.effect_writes] == ["create_issue", "write_issue_body"]
+    # A PR closed after the follow-up issue gets no append either (PR #460
+    # R1-F3): the owner check before each FIX effect passes only an open PR.
+    sent = 1 if (change, kind) == ("closed", EffectKind.FOLLOW_UP_ISSUE) else 2
+    assert [w[0] for w in gh.effect_writes] == ["create_issue", "write_issue_body"][:sent]
     assert eng.origin.head(BRANCH) == reviewed and gh.prs[PR].head_sha == reviewed
     s = load_state(eng.paths.state_file)
     assert s.last_review_result != "fixed" and s.last_fix_resolutions == []
     if change == "closed":
         assert s.phase == Phase.FIX
-        assert [r["stage"] for r in s.effect_records] == ["observed", "observed", "intended"]
+        stages = ["observed", "observed", "intended"]
+        if sent == 1:
+            stages[1] = "intended"
+        assert [r["stage"] for r in s.effect_records] == stages
         assert [f["id"] for f in s.open_findings] == ["R1-F1", "R1-F2", "R1-F3"]
     elif change == "no-head-repository":
         assert out.next_phase == "BLOCKED", out.message

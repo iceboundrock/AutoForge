@@ -1039,7 +1039,11 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a).
   the PR it adopts; in `unblock` (a PR no longer open is refused, as at the
   merge gate, only for another run's marker or a defect, and is never taken
   over); and in a replan at preparation, before each write of its plan,
-  and before the source is closed. A replan
+  and before the source is closed. Where no read of the phase follows the
+  check before a launch or a write (the launch, a `FIX` effect after the
+  first, a write of the replan's plan), it passes only an open PR, read as
+  itself, whose marker names this run: a conclusive read failure refuses,
+  and so does a PR no longer open. A replan
   refused this way is rejected for good, and its reason says to start a
   fresh run for the issue and take the PR over there.
 - **A fresh state never adopts a marked PR.** It blocks and names

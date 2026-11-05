@@ -1532,12 +1532,15 @@ def test_an_unusable_marker_on_the_pre_existing_source_is_ignored_by_the_all_sta
     listing = find_non_open_claimant(list(gh.prs.values()), txn)
     assert listing.disposition is Disposition.NONE, listing.reason
     # And through the engine: no claimant found, so the phase falls through
-    # to the agent (the stub returns nothing usable) instead of blocking on
-    # the source's broken marker.
+    # to the launch instead of blocking on the source's broken marker. The
+    # owner check right before the launch then refuses the closed source, so
+    # nothing is launched (PR #460 R1-F3).
     calls_before = len(eng.provider.calls)
-    with pytest.raises(ControlResultValidationError):
-        eng.step()
-    assert len(eng.provider.calls) > calls_before
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert "unusable replan marker" not in out.message
+    assert "nothing was launched" in out.message and "the PR is CLOSED" in out.message
+    assert len(eng.provider.calls) == calls_before
     assert eng.state.superseded_prs == []
 
 

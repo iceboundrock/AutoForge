@@ -2334,8 +2334,7 @@ its author. Only the effect records and the entry observation prove origin.
       `REPLAN_REEXECUTE` (for a replan whose transaction is journaled the
       replan's own checks below apply instead);
     - as the last read before every agent launch, after the read context
-      is gathered; no read of the phase follows it, so there a read that
-      fails conclusively refuses the launch too (`pr-owner`);
+      is gathered;
     - after an agent returns, before its result is applied;
     - right before K4 is sent, and before each `FIX` effect after the
       plan's first;
@@ -2353,6 +2352,18 @@ its author. Only the effect records and the entry observation prove origin.
       before each write of its push and replacement-PR plan; and before
       the source is closed, on both the source read and the open-PR
       listing the replacement check uses.
+
+    Before a launch, before a `FIX` effect after the first and before a
+    write of the replan's plan, no read of the phase follows the check
+    before the launch or the write, so there it passes only an open PR,
+    read as itself, whose marker names this run. A read that fails
+    conclusively, or is answered with another PR, leaves the owner not
+    knowable and refuses with `pr-owner`, as does a PR no longer open
+    whose marker names another run. A PR no longer open whose marker
+    still names this run is not driven either: the launch or the `FIX`
+    effect is not sent and the phase's entry routes the PR on `resume`,
+    and the replan is rejected, since its source has nothing left to
+    replace (PR #460 R1-F2, R1-F3).
 
     `UPDATE_EPIC`, after the merge, and a replan past its close run as
     journaled.

@@ -20,7 +20,7 @@ import pytest
 
 from autoforge import engine as engine_module
 from autoforge.engine import ControllerEngine
-from autoforge.errors import GitHubError
+from autoforge.errors import AutoForgeError, GitHubError
 from autoforge.state import AutoForgeState, load_state
 from autoforge.stop_classification import StopReasonCode
 from autoforge.transitions import Phase
@@ -124,6 +124,7 @@ class OwnerFlip:
     gh: FakeGitHub
     at: int | None
     monkeypatch: pytest.MonkeyPatch
+    close: bool = False  # the new owner also closes the PR at that read
     reads: int = 0
     before: Effects | None = None
     eng: ControllerEngine | None = None
@@ -156,6 +157,8 @@ class OwnerFlip:
                 self.gh.prs[PR].body = body
                 self.gh.unbodied.discard(PR)
                 seen.body = body
+                if self.close:
+                    self.gh.prs[PR].state = seen.state = "CLOSED"
             return seen
 
         self.gh._owned = reading  # type: ignore[method-assign]
@@ -271,6 +274,52 @@ def test_an_owner_change_at_any_read_of_the_bound_pr_stops_the_run(tmp_path, mon
         assert again.provider.calls == [], where
 
 
+def _run_through_errors(lifecycle: Lifecycle, flip: OwnerFlip, *, extra: int = 2) -> list:
+    """As :func:`_run`, but a step that raises is followed by the next, as ``resume`` is."""
+    eng = lifecycle.eng
+    eng._save()
+    flip.install(eng)
+    seen: list = []
+    target = parse_pr_url(PR)
+    for taken in range(lifecycle.steps + extra):
+        if eng.state.phase in (Phase.BLOCKED, Phase.UPDATE_EPIC):
+            break
+        if taken >= lifecycle.steps and not parse_pr_url(eng.state.current_pr_url).same_target(
+            target
+        ):
+            break
+        try:
+            seen.append(eng.step(allow_merge=lifecycle.allow_merge))
+        except AutoForgeError as exc:
+            seen.append(exc)
+    return seen
+
+
+@pytest.mark.parametrize("name", sorted(LIFECYCLES))
+def test_a_pr_taken_over_and_closed_at_any_read_gets_nothing_more(tmp_path, monkeypatch, name):
+    """PR #460 R1-F3: a PR another run takes over and closes is no longer this
+    run's either, at whichever read the change is first seen. A check right
+    before a launch or a write is the last word there, so it refuses a PR
+    that is no longer open rather than leave it to a read that never comes:
+    nothing is launched, posted, pushed, closed or merged after the change,
+    the replan's replacement included."""
+    make = LIFECYCLES[name]
+    total = _reads_in(make, tmp_path, monkeypatch)
+    for at in range(1, total + 1):
+        gh = FakeGitHub()
+        flip = OwnerFlip(gh, at=at, monkeypatch=monkeypatch, close=True)
+        lifecycle = make(tmp_path / f"close-{at}", gh)
+        eng = lifecycle.eng
+        seen = _run_through_errors(lifecycle, flip)
+        where = f"{name}: taken over and closed at read {at} of {total}: " + "; ".join(
+            str(getattr(o, "message", o))[:300] for o in seen
+        )
+        assert flip.before is not None, where
+        if flip.before.merges or flip.before.closes:
+            continue  # the PR was done with before the change
+        assert Effects.of(eng, gh) == flip.before, where
+
+
 @pytest.mark.parametrize("removed", ["before-the-read", "after-the-read"])
 def test_a_process_killed_right_after_a_read_of_its_pr_blocks_on_restart_once_unowned(
     tmp_path, removed
@@ -338,3 +387,48 @@ def test_a_launch_whose_owner_check_cannot_read_the_pr_is_refused(tmp_path):
     assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
     assert "could not be read right before the launch" in out.message
     assert eng.provider.calls == [] and gh.effect_writes == []
+
+
+def test_a_fix_effect_whose_owner_check_cannot_read_the_pr_is_not_sent(tmp_path):
+    """PR #460 R1-F2: between two FIX effects the owner check is the last read
+    of the PR before the second write (a follow-up's reconcile reads issues,
+    not the PR), so a read that fails conclusively there refuses the write
+    rather than assume the PR is still this run's."""
+    gh = FakeGitHub()
+    script = fixer(new_follow_up("R1-F1"), new_follow_up("R2-F1"), commit=False)
+    eng = _in_fix(tmp_path / "state", gh, script, findings=[_finding(1), _finding(2)], origin=True)
+    get_pr = gh.get_pr
+
+    def read(url):
+        if gh.effect_writes:
+            raise GitHubError("HTTP 403: forbidden")
+        return get_pr(url)
+
+    gh.get_pr = read  # type: ignore[method-assign]
+    out = eng.step()
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.PR_OWNER
+    assert "could not be read right before" in out.message
+    assert [w[0] for w in gh.effect_writes] == ["create_issue"], gh.effect_writes
+
+
+def test_a_replan_whose_source_closed_since_its_checks_publishes_nothing(tmp_path):
+    """PR #460 R1-F3: a source closed after the replan's agent was launched has
+    nothing left to replace, even when its marker still names this run: the
+    read right before the push refuses it, and neither the replacement branch
+    nor its PR is published."""
+    gh = FakeGitHub()
+
+    def close_source(req):
+        gh.prs[PR].state = "CLOSED"
+
+    eng = _park_at_hard_threshold(tmp_path / "state", gh, _replan_agent(gh, during=close_source))
+    eng._save()
+    refs = _origin_refs(eng)
+    assert eng.step().next_phase == "REPLAN_REEXECUTE"
+    out = eng.step()
+    assert not [w for w in gh.effect_writes if w[0] == "create_pull_request"], out.message
+    assert _origin_refs(eng) == refs, out.message
+    assert out.next_phase == "BLOCKED", out.message
+    assert out.stop is not None and out.stop.code is StopReasonCode.REPLAN_REFUSED, out.stop
+    assert "is CLOSED, so there is nothing left to replace" in out.message

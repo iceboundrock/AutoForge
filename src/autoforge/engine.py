@@ -11394,7 +11394,7 @@ class ControllerEngine:
         return pr
 
     def _check_bound_owner(
-        self, phase: Phase, sent: str, *, entry: bool = False, launch: bool = False
+        self, phase: Phase, sent: str, *, entry: bool = False, before: str = ""
     ) -> None:
         """Raise :class:`PROwnerError` unless this run still owns its bound open PR (#414).
 
@@ -11404,39 +11404,66 @@ class ControllerEngine:
         the ordinary ``BLOCKED`` save and a read lost to a crash loses
         nothing. ANALYZE_EXECUTE decides for itself (its entry's recovery,
         or a K11 takeover that binds the PR), as does a replan whose
-        transaction is journaled (it checks its source before closing it);
-        READY_FOR_MERGE and MERGE check on the merge gate's read, the first
-        of their step. A PR that is not open, a read answered with another
-        PR and a read that fails conclusively are the phase's to handle, on
-        its own read; an unavailable GitHub propagates with nothing saved.
-        Right before a ``launch`` no read of the phase follows, so there a
-        read that fails conclusively refuses the launch: whether the marker
-        still names this run is not knowable.
+        transaction is journaled (it checks its source before each write and
+        before closing it); READY_FOR_MERGE and MERGE check on the merge
+        gate's read, the first of their step. There, a PR that is not open,
+        a read answered with another PR and a read that fails conclusively
+        are the phase's to handle, on its own read; an unavailable GitHub
+        propagates with nothing saved.
+
+        ``before`` names what the check fences when no read of the phase
+        follows it before that is done: the launch, or a FIX effect after
+        the first. There the check is the last word, so it passes only an
+        open PR, read as itself, whose marker names this run (PR #460
+        R1-F2, R1-F3). A read that fails conclusively or is answered with
+        another PR leaves the owner not knowable, and refuses with
+        ``pr-owner``; so does a PR that is no longer open and whose marker
+        names another run. One that is no longer open and still names this
+        run raises :class:`VerificationError`, as every phase's own read of
+        a PR that is not open does, for its entry to route on ``resume``.
         """
         state = self._require_state()
         if not state.current_pr_url or phase not in _OWNER_CHECKED_PHASES:
             return
         if entry and phase == Phase.REPLAN_REEXECUTE and state.replan_transaction:
             return
+        url = state.current_pr_url
         try:
-            pr = self.github.get_pr(state.current_pr_url)
+            pr = self.github.get_pr(url)
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            if launch:
+            if before:
                 raise PROwnerError(
                     self._pr_owner_text(
-                        f"PR {state.current_pr_url} could not be read right before the launch "
-                        f"({exc}), so whether its implementation marker still names this run "
-                        "is not knowable",
+                        f"PR {url} could not be read right before {before} ({exc}), so whether "
+                        "its implementation marker still names this run is not knowable",
                         sent,
                     )
                 ) from exc
             return
-        if pr.url and not parse_pr_url(pr.url).same_target(parse_pr_url(state.current_pr_url)):
+        if pr.url and not parse_pr_url(pr.url).same_target(parse_pr_url(url)):
+            if before:
+                raise PROwnerError(
+                    self._pr_owner_text(
+                        f"GitHub answered PR {url} with {pr.url} right before {before}, so "
+                        "whether its implementation marker still names this run is not knowable",
+                        sent,
+                    )
+                )
             return
         if pr.is_open:
             self._require_pr_owner(pr, sent)
+            return
+        if not before:
+            return
+        problem = self._pr_owner_problem(pr)
+        if problem:
+            raise PROwnerError(self._pr_owner_text(problem, sent, pr_state=pr.state or "CLOSED"))
+        raise VerificationError(
+            f"PR {url} is {pr.state or 'not open'}; the workflow only operates on OPEN PRs, "
+            f"so {sent}"
+        )
 
     def _pr_owner_problem(self, pr: PRInfo) -> str:
         """Why this run may not drive its bound PR ``pr`` (#414, ADR 0004 D9.4a), or ``""``.
@@ -13808,7 +13835,7 @@ class ControllerEngine:
             # ADR 0004 D9.4a: the last read of the bound PR before the launch
             # is an owner check, so a change any earlier read of this step
             # saw (the entry's, the read context's) launches nothing.
-            self._check_bound_owner(phase, "nothing was launched", launch=True)
+            self._check_bound_owner(phase, "nothing was launched", before="the launch")
             try:
                 prompt = self.render_prompt_for(phase, correction_error, previous_reply)
             finally:
@@ -16260,7 +16287,9 @@ class ControllerEngine:
                 # #414 (ADR 0004 D9.4a; PR #459 R1-F4): each write of the plan
                 # is this run's only while the PR is; the read before the plan
                 # covers its first write, and this one each write after it.
-                self._check_bound_owner(Phase.FIX, f"{record.describe()} was not sent")
+                self._check_bound_owner(
+                    Phase.FIX, f"{record.describe()} was not sent", before=record.describe()
+                )
             sent = True
             if record.kind is EffectKind.PUSH and not checked:
                 unpushed = "the follow-ups are on GitHub but the candidate was not pushed"
@@ -17100,11 +17129,13 @@ class ControllerEngine:
             # #414 (ADR 0004 D9.4a): the replacement is published only for a
             # source this run still owns, read right before each write of
             # the plan, so a takeover an earlier read saw sends nothing more.
-            owner, refused = self._replan_source_owner(txn)
+            owner, source_state, refused = self._replan_source_owner(txn)
             if refused is not None:
                 return refused
-            if owner:
-                return self._reject_replan_for_owner(txn, record, owner, default_branch)
+            if owner or source_state != "OPEN":
+                return self._reject_replan_for_owner(
+                    txn, record, owner, default_branch, source_state=source_state
+                )
             try:
                 if record.kind is EffectKind.REPLACEMENT_PR:
                     head = self._branch_head(branch)
@@ -17155,13 +17186,18 @@ class ControllerEngine:
             "this transaction"
         )
 
-    def _replan_source_owner(self, txn: ReplanTransaction) -> tuple[str, StepOutcome | None]:
-        """Why this run may no longer publish its replacement (#414), or ``""``.
+    def _replan_source_owner(self, txn: ReplanTransaction) -> tuple[str, str, StepOutcome | None]:
+        """Why this run may no longer publish its replacement (#414), and the source's state.
 
         Reads the run's bound PR, the source until the replacement is
         activated (a journal naming another source is
-        :meth:`_replan_unbound`'s to refuse, on its own read). A conclusive
-        read failure rejects the replan, returned as the outcome.
+        :meth:`_replan_unbound`'s to refuse, on its own read), and returns
+        why its marker does not name this run (``""`` when it does) with the
+        state it was read in. Only an open source this run owns is replaced:
+        a source closed or merged since the replan's earlier checks has
+        nothing left to replace, whoever closed it, and no read of the
+        replan follows this one before the write (PR #460 R1-F3). A
+        conclusive read failure rejects the replan, returned as the outcome.
         """
         url = self._require_state().current_pr_url
         try:
@@ -17169,18 +17205,26 @@ class ControllerEngine:
         except GitHubUnavailableError:
             raise
         except GitHubError as exc:
-            return "", self._reject_replan(txn, f"cannot read source PR {url}: {exc}")
-        return (self._pr_owner_problem(source) if source.is_open else ""), None
+            return "", "", self._reject_replan(txn, f"cannot read source PR {url}: {exc}")
+        return self._pr_owner_problem(source), source.state or "OPEN", None
 
     def _reject_replan_for_owner(
-        self, txn: ReplanTransaction, record: EffectRecord, owner: str, default_branch: str
+        self,
+        txn: ReplanTransaction,
+        record: EffectRecord,
+        owner: str,
+        default_branch: str,
+        *,
+        source_state: str = "OPEN",
     ) -> StepOutcome:
-        """Reject the replan for ``owner`` before ``record`` is sent (again) (#414).
+        """Reject the replan before ``record`` is sent (again) (#414).
 
-        A record attempted before may have landed: it is reconciled read-only
-        first, so the refusal says what it left and names a replacement PR it
-        created (``rejected_pr_url``) rather than strand it unnamed. Nothing is
-        sent either way.
+        For ``owner``, why the source's marker does not name this run, or
+        for a source read in ``source_state`` other than open. A record
+        attempted before may have landed: it is reconciled read-only first,
+        so the refusal says what it left and names a replacement PR it
+        created (``rejected_pr_url``) rather than strand it unnamed. Nothing
+        is sent either way.
         """
         sent = f"{record.describe()} was not sent"
         found = ""
@@ -17213,8 +17257,19 @@ class ControllerEngine:
                     sent = f"{record.describe()} had already landed; nothing more was sent"
             elif decision is not None:
                 sent = f"{record.describe()} had not landed and was not sent again"
+        if owner:
+            return self._reject_replan(
+                txn,
+                self._pr_owner_text(owner, sent, pr_state=source_state),
+                found,
+                code=StopReasonCode.PR_OWNER,
+            )
+        url = self._require_state().current_pr_url
         return self._reject_replan(
-            txn, self._pr_owner_text(owner, sent), found, code=StopReasonCode.PR_OWNER
+            txn,
+            f"source PR {url} is {source_state}, so there is nothing left to replace and no "
+            f"replacement is published for it; {sent}",
+            found,
         )
 
     @staticmethod
