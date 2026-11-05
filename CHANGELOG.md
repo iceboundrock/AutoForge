@@ -5,6 +5,42 @@ so.
 
 ## Unreleased
 
+### A run drives only a PR whose marker names it; `unblock --take-over` hands one over (#414)
+
+A new state for an issue (a copied checkout, another `--state-dir`, an
+EPIC namespace re-admitted after `epic archive`) used to find the issue's
+PR by its `ai-implementation` marker and adopt it, even while the run that
+opened it was still driving it elsewhere: two controllers then reviewed,
+fixed and could merge the same PR.
+
+Now the marker names the run that owns the PR (`"owner_run_id"`), and a
+run bound to a PR drives it only while the marker names that run. Any
+other body (a marker naming another run or none, no marker, a malformed
+one) blocks with stop code `pr-owner` before anything more is launched,
+posted, pushed or merged. A fresh run never adopts a marked PR, and `epic
+archive` no longer lets the next admission adopt the issue's PR.
+
+**Runs in flight at the upgrade stop once.** A PR opened before this
+change carries a marker that names no run, so each run bound to one blocks
+at its next step and needs one `--take-over`.
+
+To take a PR over: stop the other controller, run `autoforge unblock
+--take-over <PR URL> --reason "..."`, then `autoforge resume`. The
+takeover is a new controller write, effect K11 (`owner_takeover`): the
+unblock journals it, and the resume replaces only the marker's owner in
+the PR body, reads it back, binds the PR and continues in `REVIEW`. The
+write goes only over the exact body the unblock read; a body edited since
+is a conflict (`effect-conflict`), nothing is written over it, and a
+second `--take-over` plans the write over the body as it is then. A write
+the read-back does not show is sent again by the next `resume`, at most
+twice in all. Plain `unblock`, `resume`, `run --force` and `epic archive`
+never take a PR over. See "Taking over a PR another run owns" in
+`docs/usage.md`.
+
+`state.json` is protocol 14. No field changed: a protocol-13 file loads
+and is relabelled 14 on its next save, and one carrying a K11 record is
+refused. An older AutoForge refuses a protocol-14 file.
+
 ### A merge whose outcome is unknown is no longer reported as "nothing was merged" (#376)
 
 When the controller's re-read of a PR failed right after `gh pr merge`,

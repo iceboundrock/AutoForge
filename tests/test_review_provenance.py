@@ -72,7 +72,10 @@ def _in_review(tmp_path: Path, name: str, gh: FakeGitHub, script) -> ControllerE
     workdir = git_repo(tmp_path)
     eng = make_engine(tmp_path / ".autoforge" / name, script, github=gh, workdir=workdir)
     if PR not in gh.prs:
-        gh.add_pr(head_sha=SHA_A, body=implementation_pr_body())
+        gh.add_pr(head_sha=SHA_A)
+    # The PR is handed to this run (#414): its marker names the run that
+    # drives it now, as a takeover leaves it.
+    gh.prs[PR].body = implementation_pr_body(owner_run_id=eng.state.run_id)
     state = eng.state
     state.phase = Phase.REVIEW
     state.current_pr_url = PR

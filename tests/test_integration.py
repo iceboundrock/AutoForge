@@ -568,7 +568,7 @@ def test_an_all_pi_run_routes_every_launch_through_its_profile(tmp_state_dir, tm
     # round's review comment (#162) and posted the progress on the EPIC with
     # the marker, once each.
     pr_body = analyze_payload("")["pr_body"]
-    closing = f"Closes #2\n\n{render_implementation_marker(ISSUE)}"
+    closing = f"Closes #2\n\n{render_implementation_marker(ISSUE, eng.state.run_id)}"
     marker = render_progress_marker(ISSUE, PR)
     reviews = [controller_review_comment(eng, n).body for n in range(1, 7)]
     assert gh.effect_writes == [

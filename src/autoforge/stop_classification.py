@@ -158,6 +158,7 @@ class StopReasonCode(Enum):
     UNJOURNALED_WRITE = "unjournaled-write"
     EFFECT_CONFLICT = "effect-conflict"
     CLAIM_AMBIGUOUS = "claim-ambiguous"
+    PR_OWNER = "pr-owner"
     DEFAULT_BRANCH = "default-branch"
     READ_BACK_MISMATCH = "read-back-mismatch"
     FIX_PLAN_REFUSED = "fix-plan-refused"
@@ -233,6 +234,7 @@ REASON_FAMILY: dict[StopReasonCode, ReasonFamily] = {
     _C.UNJOURNALED_WRITE: _F.IDENTITY,
     _C.EFFECT_CONFLICT: _F.IDENTITY,
     _C.CLAIM_AMBIGUOUS: _F.IDENTITY,
+    _C.PR_OWNER: _F.IDENTITY,
     _C.DEFAULT_BRANCH: _F.IDENTITY,
     _C.READ_BACK_MISMATCH: _F.IDENTITY,
     _C.FIX_PLAN_REFUSED: _F.IDENTITY,
@@ -525,6 +527,9 @@ EXCEPTION_CLASSES: dict[type[errors.AutoForgeError], tuple[StopOutcome, StopReas
     errors.GitTransportError: (_O.RESUMABLE_ERROR, _C.GIT_TRANSPORT),
     errors.EffectConflictError: (_O.RESUMABLE_ERROR, _C.EFFECT_CONFLICT),
     errors.ClaimConflictError: (_O.RESUMABLE_ERROR, _C.CLAIM_AMBIGUOUS),
+    # The step that meets it blocks (#414); one that escapes a command left
+    # the phase as it was.
+    errors.PROwnerError: (_O.RESUMABLE_ERROR, _C.PR_OWNER),
     errors.VerificationError: (_O.RESUMABLE_ERROR, _C.VERIFICATION_FAILED),
     errors.CheckoutDriftError: (_O.RESUMABLE_ERROR, _C.CHECKOUT_DRIFT),
     errors.SandboxTamperError: (_O.RESUMABLE_ERROR, _C.SANDBOX_TAMPER),

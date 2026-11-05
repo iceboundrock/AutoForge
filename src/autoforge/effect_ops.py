@@ -86,6 +86,7 @@ from .effects import (
     decide_create,
     decide_operator_comment,
     decide_push,
+    decide_replace,
 )
 from .errors import (
     EffectConflictError,
@@ -741,6 +742,62 @@ class AdoptPrOp:
         self.github.write_pr_body(record.target["pr_url"], record.body)
 
 
+# -- K11: the operator's takeover of the issue's PR (#414) -------------------------------
+
+
+class OwnerTakeoverOp:
+    """K11 (#414, ADR 0004 D9.4a): name the taking run in the PR's implementation marker.
+
+    Target: the PR, open, in the owner issue's repository and not headed in
+    a fork, and the one open PR carrying the issue's implementation marker
+    (the complete listing, D4.5). Precondition: its body equals, byte for
+    byte, the body 'unblock --take-over' read when it planned the write.
+    Payload: that body with only the marker's owner replaced. Completion:
+    the body equals the payload. A body changed since the read is a
+    conflict, never rebased or written over (:func:`decide_replace`). The
+    body is the one GitHub holds (:func:`held_pr`, #328).
+    """
+
+    def __init__(self, github: GitHubClient) -> None:
+        self.github = github
+
+    def reconcile(self, record: EffectRecord) -> Decision:
+        settled = _settled(record)
+        if settled is not None:
+            return settled
+        pr_url = record.target["pr_url"]
+        repo = parse_issue_url(record.owner.issue_url).repository
+        claim = scan(IMPLEMENTATION, record.marker).claims[0]
+        pr = held_pr(self.github, pr_url)
+        claimants = collect(IMPLEMENTATION, self.github.list_open_prs(repo), "open PR").claimants(
+            claim.key, f"issue {claim.issue.canonical}"
+        )
+        if claimants.defects:
+            return _unreadable(record, f"open PRs of {repo}", claimants.defects)
+        others = sorted({h.obj.url for h in claimants.holders if not _same_pr(h.obj.url, pr_url)})
+        if others:
+            return Decision(
+                Action.CONFLICT,
+                reason=(
+                    f"{record.describe()}: {', '.join(others)} also carries the implementation "
+                    f"marker for issue {claim.issue.canonical}; an issue has one implementation PR"
+                ),
+            )
+        return decide_replace(
+            record,
+            pr.body,
+            target_ok=(
+                pr.is_open
+                and _same_repository(pr.repository, repo)
+                and _same_pr(pr.url, pr_url)
+                and _same_repo_head(pr)
+            ),
+        )
+
+    def issue(self, record: EffectRecord) -> None:
+        self.github.write_pr_body(record.target["pr_url"], record.body)
+
+
 # -- K4: the review round comment -----------------------------------------------------
 
 
@@ -1271,6 +1328,7 @@ class OperatorCommentOp:
 _GITHUB_OPS: dict[EffectKind, Callable[[GitHubClient], EffectOperation]] = {
     EffectKind.IMPLEMENTATION_PR: ImplementationPrOp,
     EffectKind.ADOPT_PR: AdoptPrOp,
+    EffectKind.OWNER_TAKEOVER: OwnerTakeoverOp,
     EffectKind.REVIEW_COMMENT: ReviewCommentOp,
     EffectKind.FOLLOW_UP_ISSUE: FollowUpIssueOp,
     EffectKind.FOLLOW_UP_APPEND: FollowUpAppendOp,
@@ -1309,6 +1367,7 @@ def operation_for(
 __all__ = [
     "AcceptanceCommentOp",
     "AdoptPrOp",
+    "OwnerTakeoverOp",
     "Driven",
     "EffectOperation",
     "EffectPending",

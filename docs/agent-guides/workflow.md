@@ -584,19 +584,28 @@ next entry could not find again.
   controller pushes the agent's commit and opens or adopts the PR from one
   persisted plan. Its entry reads that journal first: a persisted plan is
   completed from its records without launching the agent. Otherwise, at a
-  fresh entry, it adopts the open PR carrying the issue's
-  `ai-implementation` marker (the persisted PR, or the one found by a
-  complete listing of the repository's open PRs, read to the end), if one
-  exists, without launching the agent; two candidates block, and so does a
-  listing that cannot be read to its end, since "none exists" is then not
-  knowable. After a launch of the entry, a marker PR the entry observation
-  did not record was not opened by the controller and blocks, as do a
+  fresh entry, it recovers the PR this state persisted, while that PR's
+  `ai-implementation` marker names this run, without launching the agent;
+  an open PR carrying the issue's marker that a complete listing of the
+  repository's open PRs (read to the end) finds, and that this state has
+  no record of, blocks (`pr-owner`) whatever run its marker names, and only
+  the operator's `unblock --take-over` binds it, through K11 (#414, ADR
+  0004 D9.4a). Two candidates block, and so does a listing that cannot be
+  read to its end, since "none exists" is then not knowable. After a
+  launch of the entry, a marker PR the entry observation did not record was not opened by the controller and blocks, as do a
   branch head, an open PR on the branch or a default branch other than the
   recorded one. A PR is identified by that
   marker alone, never by its branch name or a linked issue; the read-back
   after the controller's own write holds the PR to the same rule
   (github-safety.md, "Before ANALYZE_EXECUTE"), and so does the replan
   transaction for its replacement PR (replan-transaction.md).
+- A run drives its bound PR only while the PR's implementation marker
+  names it (#414, ADR 0004 D9.4a). `REVIEW`, `FIX` and `REPLAN_REEXECUTE`
+  check it at the start of each step, before each launch, after the agent
+  returns and before each write; `READY_FOR_MERGE` and `MERGE` on the
+  merge gate's read. Any other marker, or none, blocks (`pr-owner`) with
+  nothing more sent, and the reason names `unblock --take-over`
+  (github-safety.md, "The PR's owner").
 - `REVIEW` publishes nothing through its agent (#162): the controller
   renders the round's comment from the validated result and posts it from
   one persisted plan. Its entry reads that journal first: a persisted plan
@@ -752,11 +761,18 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   GitHub: with no PR bound, the issue must be selectable and either a
   persisted `ANALYZE_EXECUTE` plan exists (the re-entry completes its push
   and PR from the records, without launching the agent) or the strict
-  marker listing of `ANALYZE_EXECUTE`'s entry must resolve (one adoptable PR
-  or none, adopted at the fresh entry the unblock starts), and a conclusive
-  GitHub failure of either read refuses exactly as it does with a PR bound;
-  with a PR bound, the PR is re-read and its state, HEAD and base are
-  compared with the persisted review binding.
+  marker listing of `ANALYZE_EXECUTE`'s entry must resolve to no marked PR
+  (one marked PR this run has no record of is refused, naming `unblock
+  --take-over`, #414), and a conclusive GitHub failure of either read
+  refuses exactly as it does with a PR bound; with a PR bound, the PR is
+  re-read, its implementation marker must name this run (ADR 0004 D9.4a;
+  otherwise the refusal names `unblock --take-over`; a PR no longer open is
+  refused, as at the merge gate, only for another run's marker or a
+  defect), and its state, HEAD
+  and base are compared with the persisted review binding. A journaled K11
+  takeover is decided first: pending, a plain unblock re-enters
+  `ANALYZE_EXECUTE` to finish it; in `conflict`, a plain unblock refuses
+  and names `unblock --take-over`.
 - **Identity first.** A review binding (`reviewed_pr_url`) that names a PR
   other than `current_pr_url` refuses before the live PR state is even
   considered, as the merge gate does from state alone: review evidence is
@@ -834,6 +850,41 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   A flag on a run with no waiting action refuses, quoting the decision a
   plain unblock would make. After an approval the record is authorized, so
   a later block (a closed issue, say) is left with a plain unblock.
+- **Taking over a PR** (`--take-over <PR URL>`, #414). A run drives its
+  bound PR only while the PR's implementation marker names it, and a fresh
+  entry never binds a marked PR it has no record of (ADR 0004 D9.4a). Both
+  stop with `pr-owner`, and a plain unblock refuses both. After stopping
+  the run that owns the PR, the operator runs `unblock --take-over <PR URL>
+  --reason ...`. The controller reads the PR (open, in this repository,
+  not headed in a fork, a readable head and base, exactly one readable
+  marker of the issue, naming another run or none) and, for an unbound
+  run, checks it is the one marked PR the strict listing finds. It then
+  journals a K11 `owner_takeover` record, whose payload is the body read
+  with only the marker's owner replaced by this run, and enters
+  `ANALYZE_EXECUTE` (`BLOCKED -> ANALYZE_EXECUTE`). It writes nothing to
+  GitHub. The history entry's `action` is `take-over <PR URL>`. The next
+  step (`resume`) completes the record without launching the agent: a body
+  equal to the payload is observed, a body equal to the one read is
+  written and read back, and anything else is a conflict that blocks
+  (`effect-conflict`) with nothing written over. Once observed, the PR is
+  re-read and bound (HEAD, base, branch; `REVIEW` reads the merge base),
+  and the run enters `REVIEW` (`ANALYZE_EXECUTE -> REVIEW`). A run rebound
+  to its own PR keeps its open findings as prior findings to re-check,
+  its last result stale; any other binding starts the review state fresh,
+  and D9.6 still refuses a round comment already on the PR at the bound
+  revision. A write the read-back does not show leaves the run in
+  `ANALYZE_EXECUTE`, and the next `resume` sends it again within the
+  attempt bound. It is refused, with nothing written, for another PR than
+  the bound one or the listing's one, a K11 already journaled and pending
+  (a plain unblock finishes it), the run's own `ANALYZE_EXECUTE` plan or
+  records of another phase journaled, a marker that already names this run
+  (bound: unblock without the flag; unbound: start a fresh run, since a
+  marker this run did not write hands it nothing), and no marked PR. A
+  takeover in `conflict` is planned again on the body as it is then by a
+  second `--take-over` of the same PR. A run with a replan journal is never
+  unblocked, so a replan refused for its owner names a fresh run and
+  `--take-over` there. Plain `unblock`, `resume`, `run --force` and `epic
+  archive` never take a PR over.
 - **A fresh review instead of FIX** (`--rereview`, #428). Where the plain
   decision is `FIX` with the round's open findings (`OPEN` at the reviewed
   HEAD and base, no saved plan), a fixer relaunched by a plain unblock

@@ -335,7 +335,10 @@ waits for you to approve or decline that exact comment
 comment on another issue (one the run's issue references, or the EPIC),
 you post it yourself, bind an existing comment or withdraw it
 (`unblock --bind-evidence` / `--decline-action`); the controller never posts
-there, and verifies the comment on GitHub. When `status` warns that GitHub
+there, and verifies the comment on GitHub. When a run stops because the
+PR's implementation marker names another run, or none (`pr-owner`), stop
+the other controller, then `autoforge unblock --take-over <PR URL>` and
+`resume` hand the PR to this run. When `status` warns that GitHub
 now names another parent for the issue than the EPIC the run recorded,
 `autoforge rebind-epic ... --dry-run` previews moving a run stopped at
 `READY_FOR_MERGE` or `BLOCKED` to that parent, before its `UPDATE_EPIC`

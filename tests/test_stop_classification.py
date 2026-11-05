@@ -106,6 +106,12 @@ def test_every_table_is_total():
     assert refused <= set(REFUSAL_ROUTES)
 
 
+def test_a_pr_another_run_owns_is_an_identity_stop():
+    """#414: the PR's owner is part of its identity, as its marker is (ADR 0011)."""
+    assert REASON_FAMILY[C.PR_OWNER] is ReasonFamily.IDENTITY
+    assert C.PR_OWNER.value == "pr-owner"
+
+
 def test_every_error_class_is_mapped_explicitly():
     """No class of errors.py falls through to a parent's entry by omission: a
     new one fails here until someone decides what stop it is."""
@@ -208,6 +214,8 @@ def test_an_agent_status_is_the_controller_applied_outcome(status, outcome, code
         (errors.GitHubChecksAccessError("403"), Out.RESUMABLE_ERROR, C.GITHUB_CHECKS_REFUSED),
         (errors.GitHubNotFoundError("404"), Out.RESUMABLE_ERROR, C.GITHUB_ERROR),
         (errors.CheckoutDriftError("d"), Out.RESUMABLE_ERROR, C.CHECKOUT_DRIFT),
+        # #414: a step blocks on it; it ends a command only from outside a step.
+        (errors.PROwnerError("o"), Out.RESUMABLE_ERROR, C.PR_OWNER),
         (errors.ConfigurationDriftError("d"), Out.REFUSED, C.CONFIGURATION_DRIFT),
         (errors.SandboxCapabilityError("s"), Out.REFUSED, C.SANDBOX_CAPABILITY),
         (errors.SchedulerOwnedIssueError("o"), Out.REFUSED, C.SCHEDULER_OWNED),

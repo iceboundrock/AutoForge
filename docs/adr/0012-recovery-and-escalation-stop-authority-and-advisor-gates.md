@@ -30,6 +30,9 @@
 - **Builds on:** ADR 0011 (#369's typed stop classification, the baseline
   #370 names as its hard dependency).
 - **Amends:** nothing.
+- **Amended by #414:** D3's adoption row (taking over a marked PR is the
+  operator's decision by command, and the controller's write) and D10,
+  which records K11's approval.
 - **Related:** ADR 0004 (the authority boundary, K9 and K10), ADR 0005 (the
   outer sandbox and its launch classes), ADR 0007 and #126 (the durable
   pause), ADR 0008 D9.4 and D15 (the scheduler's entry checks and
@@ -197,8 +200,8 @@ classification (`test_unblock_takes_no_classification`).
 | leaving `BLOCKED` | the operator asks; the controller chooses the phase from live GitHub | `unblock` | refuses, and the run stays `BLOCKED` |
 | K9, the acceptance comment on the run's issue | the operator per action id (`safety.acceptance_actions: approve`, the default), or the operator's configuration (`auto`); under `off` nobody, and the resolution is refused. The value is recorded with the plan, so a later change never widens it | `unblock --approve-action` / `--decline-action` | nothing is sent while unapproved (`test_an_acceptance_comment_awaiting_the_operator_is_held_with_nothing_sent`) |
 | K10, a comment on another issue | the operator performs it; the controller only verifies | `unblock`'s operator-action flags | never sent by the controller (`test_operator_actions_block_with_the_plan_saved_and_nothing_sent`) |
-| any other GitHub write | the controller, as a typed effect kind (K1 to K9); a new kind is an ADR 0004 amendment, approved separately (D10) | the effect records | no kind: nobody performs it (ADR 0004 D1.1) |
-| PR adoption and identity repair | the controller adopts only what its strict marker listing resolves to one candidate; any other object's ownership is the operator's decision, taken on GitHub, and `unblock` re-reads it | `ANALYZE_EXECUTE`'s entry; K3 | two candidates, a foreign marker or a PR opened during the run: `BLOCKED`, never adopted (`test_analyze_unmarked_pr_opened_on_the_branch_during_the_run_is_not_adopted`) |
+| any other GitHub write | the controller, as a typed effect kind (K1 to K9, and K11 since #414); a new kind is an ADR 0004 amendment, approved separately (D10) | the effect records | no kind: nobody performs it (ADR 0004 D1.1) |
+| PR adoption and identity repair | the controller recovers only the PR its own state recorded, while that PR's marker names this run, and adopts through K3 only an unmarked PR. Taking over a marked PR is decided by the operator, by command, and written by the controller (K11, #414). Any other object's ownership is the operator's decision, taken on GitHub, and `unblock` re-reads it | `ANALYZE_EXECUTE`'s entry; K3; `unblock --take-over` and K11 (ADR 0004 D9.4a) | two candidates, a foreign marker or a PR opened during the run: `BLOCKED`, never adopted (`test_analyze_unmarked_pr_opened_on_the_branch_during_the_run_is_not_adopted`); a marked PR the run has no record of, or a bound PR whose marker does not name this run: `BLOCKED` before any launch or send (`test_a_fresh_run_blocks_on_a_pr_another_run_owns_and_names_the_owner`, `test_a_displaced_run_blocks_at_its_next_entry_and_launches_nothing`); a body changed since the takeover read it: `BLOCKED`, nothing written over (`test_k11_never_writes_over_a_body_edited_after_the_takeover_read_it`) |
 | security downgrade (a weaker `sandbox.mode` than the pin) | the operator, explicitly | `sandbox_pin`; `--accept-config-change` | exit 2, nothing written (`test_a_remote_run_refuses_disabled_with_nothing_written`) |
 | configuration drift (profile routing, worktree root) | the operator, explicitly | `config_fingerprint` (#219); `--accept-config-change` | exit 2, nothing written (`test_unblock_refuses_another_configuration_and_records_an_accepted_one`) |
 | raising a bound (`workflow.max_total_steps`, `max_review_rounds`, ...) | the operator, through the configuration | configuration, then `unblock` | the bound keeps blocking (`test_unblock_refuses_while_the_step_budget_is_exhausted`) |
@@ -277,7 +280,7 @@ any other:
 |---|---|---|---|
 | `bound` | `step-budget`, `review-round-cap`, `review-stagnation`, `replan-refused`, `producer-validation-bound`, `validation-interrupted`, `validation-inconclusive`, `selection-rejected` | raising a bound; deciding that more work is worth its cost; fixing what stopped a validation run | (i): configuration, spending and the host are the operator's, and leaving `BLOCKED` is too. After the operator's `unblock`, a fresh validated round is already the route (iii) |
 | `operator_wait` | `acceptance-action`, `operator-actions` | an approval, or the operator's own comment | (i), by definition (K9, K10) |
-| `identity` | `unjournaled-write`, `effect-conflict`, `claim-ambiguous`, `default-branch`, `read-back-mismatch`, `fix-plan-refused`, `epic-roadmap` | deciding whose object it is, then deleting, closing, reopening or editing it | (i): no effect kind performs those writes. Ownership is not decidable from GitHub ("The controller cannot tell who posted the comment", `docs/usage.md`), and a model's guess at it would be prose turned into authority (D8) |
+| `identity` | `unjournaled-write`, `effect-conflict`, `claim-ambiguous`, `pr-owner`, `default-branch`, `read-back-mismatch`, `fix-plan-refused`, `epic-roadmap` | deciding whose object it is, then deleting, closing, reopening or editing it | (i): no effect kind performs those writes. Ownership is not decidable from GitHub ("The controller cannot tell who posted the comment", `docs/usage.md`), and a model's guess at it would be prose turned into authority (D8) |
 | `github` | `github-read-failed`, `github-checks-refused`, `github-unavailable`, `github-error`, `git-transport` | a credential with the right access, or another read or push | (i) for a credential. (iii) for a transient failure, which `resume` already retries within its bound, and a push, which reconciles by its identity first |
 | `merge_gate` | `merge-inconclusive`, `pr-identity`, `pr-not-open`, `unreviewed-merge`, `merge-checks`, `merge-conflict`, `merge-not-ready`, `merge-write`, `premerge-verification`, `review-certificate`, `review-not-backed` | merging; changing the PR or its checks | (i) for a merge. Changing the PR is implementation work whose result must be reviewed: a workflow phase, not a recovery action. After the operator updates the PR, `unblock` already routes the moved head to `REVIEW` (iii) |
 | `workspace` | `checkout-drift`, `sandbox-tamper` | restoring a checkout or object store something moved | (i): a security signal, which an automatic repair would turn into a downgrade path |
@@ -453,7 +456,12 @@ bundle.
   one (`state-and-recovery.md`, "Numbering a new protocol").
 - **Writes.** A new cross-object write kind is approved separately, by #306
   and #307 as #370 assigns, and lands as an ADR 0004 amendment with its own
-  protocol bump, as K9 and K10 did.
+  protocol bump, as K9 and K10 did. **Amended by #414:** #414's decision
+  record approves K11 (`owner_takeover`) as a new controller write under
+  this rule: the takeover of the issue's implementation PR, which the
+  operator decides with `unblock --take-over` and the controller writes.
+  It lands as ADR 0004's D9.4a and K11, with protocol 14 (ADR 0004
+  D13.11).
 - **Ownership stays where it is:** #260 the troubleshooting guide, #311
   target preflight (ADR 0011 D6 leaves open what it owns), #258 requests an
   agent CLI refused, #265 the protocol refusal and its guidance.

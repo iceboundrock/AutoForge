@@ -209,10 +209,16 @@ _PRE_OPERATOR_PROTOCOL = "10"
 # phase with none, which is "not checked", and relabelled.
 _PRE_PIN_PROTOCOL = "11"
 # The label before LOCAL mode's removal (#388, ADR 0009 D8). A protocol-12
-# file is this protocol's shape with the twelve fields of
+# file is protocol 13's shape with the twelve fields of
 # :data:`_LOCAL_FIELDS` beside it, each at its empty value in every REMOTE
 # save: it is loaded in every phase with them dropped, and relabelled.
-_PREVIOUS_PROTOCOL = "12"
+_PRE_LOCAL_REMOVAL_PROTOCOL = "12"
+# The label before the operator's takeover effect (K11, #414, ADR 0004
+# D9.4a). A protocol-13 file is this protocol's shape: no field changed, and
+# its effect records hold no K11, which its controller could not plan. It is
+# loaded in every phase as it is, and relabelled; one that holds a K11
+# record is refused (:func:`_refuse_takeover_records`).
+_PREVIOUS_PROTOCOL = "13"
 # Every label :meth:`AutoForgeState.from_dict` has a rule for: the current
 # one and each older one it migrates or refuses by its own rule. Any other
 # label is refused by :func:`protocol_support`'s classification before the
@@ -225,6 +231,7 @@ SUPPORTED_PROTOCOLS: frozenset[str] = frozenset(
         _PRE_VALIDATION_PROTOCOL,
         _PRE_OPERATOR_PROTOCOL,
         _PRE_PIN_PROTOCOL,
+        _PRE_LOCAL_REMOVAL_PROTOCOL,
         _PREVIOUS_PROTOCOL,
         __protocol_version__,
     }
@@ -1023,7 +1030,11 @@ class AutoForgeState:
                 "not a PR with none",
             )
             _refuse_sandbox_pin(data, raw_protocol)
-        elif raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
+        elif raw_protocol not in (
+            _PRE_LOCAL_REMOVAL_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Unreachable while SUPPORTED_PROTOCOLS names exactly the labels
             # of the branches above (pinned in tests/test_protocol_compat.py); kept so
             # a label added to the set and to no branch is still refused
@@ -1033,8 +1044,10 @@ class AutoForgeState:
                 f"(controller speaks {__protocol_version__!r})"
             )
         else:
-            # Protocol 12 and 13 write the same fields but LOCAL's twelve,
-            # which step 3 below handles. Only a legacy label loads with no
+            # Protocol 12, 13 and 14 write the same fields but LOCAL's
+            # twelve, which step 3 below handles; protocol 14 adds an effect
+            # kind (K11), which an older file is refused for carrying
+            # (:func:`_refuse_takeover_records`). Only a legacy label loads with no
             # effect state (D13.2). Every
             # protocol-7 save writes all four fields, so one that is absent
             # is a truncation or a hand edit, never "nothing planned": a
@@ -1085,6 +1098,9 @@ class AutoForgeState:
                 "sandbox pin",
                 "not a run with none pinned",
             )
+        if raw_protocol != __protocol_version__:
+            # 13 -> 14 (#414): K11 is planned by this protocol only.
+            _refuse_takeover_records(data, str(raw_protocol))
         kwargs = dict(data)
         kwargs["phase"] = phase
         kwargs["mode"] = mode
@@ -1094,13 +1110,19 @@ class AutoForgeState:
             _PRE_VALIDATION_PROTOCOL,
             _PRE_OPERATOR_PROTOCOL,
             _PRE_PIN_PROTOCOL,
+            _PRE_LOCAL_REMOVAL_PROTOCOL,
             _PREVIOUS_PROTOCOL,
             __protocol_version__,
         ):
             # Before protocol 8 only: a protocol-8 file carries its own
             # acceptance state, which the migration would overwrite.
             kwargs.update(_acceptance_migration(data))
-        if raw_protocol not in (_PRE_PIN_PROTOCOL, _PREVIOUS_PROTOCOL, __protocol_version__):
+        if raw_protocol not in (
+            _PRE_PIN_PROTOCOL,
+            _PRE_LOCAL_REMOVAL_PROTOCOL,
+            _PREVIOUS_PROTOCOL,
+            __protocol_version__,
+        ):
             # Before protocol 11 (#243): over the acceptance migration, so a
             # pre-8 file gains both.
             kwargs.update(_operator_migration(kwargs))
@@ -1112,9 +1134,9 @@ class AutoForgeState:
                 )
         # ADR 0009 D8's step 3, after every per-protocol rule above: LOCAL's
         # twelve fields leave a file labelled 12 or older, or refuse it. A
-        # protocol-13 file is not asked: one that carries any of them is
-        # refused by the unknown-field check below.
-        if raw_protocol != __protocol_version__:
+        # protocol-13 or protocol-14 file is not asked: one that carries any
+        # of them is refused by the unknown-field check below.
+        if raw_protocol not in (_PREVIOUS_PROTOCOL, __protocol_version__):
             _drop_local_fields(kwargs, str(raw_protocol))
         # Unknown fields are corruption, not forward compatibility: at this
         # protocol version the controller knows every field it writes, so an
@@ -1512,6 +1534,26 @@ def _refuse_config_fingerprint(data: dict, protocol: str) -> None:
             "recorded configuration -- it is a hand edit or a foreign file, not an older "
             "controller's state"
         )
+
+
+def _refuse_takeover_records(data: dict, protocol: str) -> None:
+    """Refuse a K11 record in a file labelled before protocol 14 (#414, ADR 0004 D9.4a).
+
+    No controller of an older protocol plans the operator's takeover, so a
+    record of that kind under an older label is a hand edit or a foreign
+    file, and is refused rather than relabelled.
+    """
+    records = data.get("effect_records")
+    if not isinstance(records, list):
+        return
+    for raw in records:
+        if isinstance(raw, dict) and raw.get("kind") == EffectKind.OWNER_TAKEOVER.value:
+            raise StateError(
+                f"protocol_version {protocol!r} cannot carry an "
+                f"{EffectKind.OWNER_TAKEOVER.value!r} effect record, which protocol "
+                f"{__protocol_version__} introduced; the file is a hand edit or not this "
+                "controller's"
+            )
 
 
 def _refuse_sandbox_pin(data: dict, protocol: str) -> None:

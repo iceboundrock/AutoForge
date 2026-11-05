@@ -1511,7 +1511,9 @@ class ArchiveReport:
             out.append(
                 "the run's loop-bound evidence (review rounds, fix attempts, the replan count) "
                 f"and its validation records now live only in {self.state_moved_to}: the next "
-                "admission starts the issue fresh and adopts its marked PR"
+                "admission starts the issue fresh, and an open PR of the issue stays its old "
+                "run's (#414): that admission blocks on it until 'unblock --take-over' hands "
+                "it to the new state"
             )
         out.append("nothing is archived automatically; this was the operator's explicit retry")
         return [redact(line) for line in out]

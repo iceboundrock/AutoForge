@@ -31,6 +31,12 @@
   admission; no agent runs and no claim, `scheduler.json` or GitHub object
   is written. Like `unblock` (D17.3) it may edit a namespace's state, only
   while no orchestrator is live; like `epic archive` it is never automatic.
+- **Amended by #414:** D9.5, D17.2's residual and D17.4. A fresh state no
+  longer adopts a marked PR (ADR 0004 D9.4a), so archiving a namespace
+  hands no PR over: the next admission blocks on the PR the archived
+  state's run owns, and the operator takes it over with `unblock
+  --take-over` in the namespace's state directory (D17.3), which the
+  controller performs as ADR 0004's K11.
 - **Where:** placement is decided per decision and collected in §5.
   Existing code this record builds on: `src/autoforge/locking.py`,
   `engine.py`, `state.py`, `transitions.py`, `cli.py`, `executor.py`,
@@ -926,7 +932,10 @@ then `ANALYZE_EXECUTE`, whose entry reconciliation
 (`_reconcile_analyze_entry`, `engine.py` :5962) recovers an existing PR
 (`_recover_pr` :5856) before anything is launched, and whose first launch
 creates the worktree. An existing implementation PR is adopted by marker
-exactly as in a standalone run, and ambiguity blocks.
+exactly as in a standalone run, and ambiguity blocks. **Amended by #414:**
+as in a standalone run, only the PR the namespace's own state persisted is
+recovered, while its marker names that state's run; any other marked PR
+blocks the entry (`pr-owner`, ADR 0004 D9.4a).
 
 **D9.6 (#182).** **Process relationship.**
 
@@ -1518,8 +1527,12 @@ migrated. **Exclusion in time** is L0 (D10).
   - Other `--state-dir` locations are unknowable, so the scheduler may admit
     an issue such a state names. The forward guard then refuses to continue
     that state. That residual is today's (two sequential runs with
-    different state dirs on one issue), and the engine's PR adoption by
-    marker keeps it from creating a second PR.
+    different state dirs on one issue). **Amended by #414:** the second
+    state's entry neither creates a second PR nor drives the first. The
+    issue's marked PR is one the second state has no record of, so its
+    entry blocks naming the run that owns it (ADR 0004 D9.4a). If the
+    operator takes the PR over there, the first state blocks at its next
+    check.
 
 **D17.3 (#178).** **Namespace paths.** Standalone `run`, `step` and
 `resume` refuse a state dir inside `<common>/autoforge/scheduler/`,
@@ -1543,14 +1556,25 @@ after a crash completes the archive (D14.5 lists both windows). A crash
 between the link and the unlink leaves both names; the re-run moves
 `state.json` aside again.
 
-The next admission starts fresh (`fresh`), and the engine adopts any
-existing marked PR, so archiving discards no GitHub work. It does
-deliberately discard the per-issue loop-bound evidence (review rounds, fix
-attempts, replan count) and the issue's validation records and
-certificate, which live in the archived state. That is the point of an
-explicit retry, and the reason it is never automatic. Archiving is also the
+The next admission starts fresh (`fresh`), and archiving discards no
+GitHub work: an open PR of the issue stays as it is. **Amended by #414:**
+archiving no longer lets the next fresh run adopt it. Archiving moves a
+local state aside, while a PR's owner is recorded on GitHub, in its
+implementation marker, which still names the archived state's run (or no
+run, for a PR opened before #414). The
+fresh state's `ANALYZE_EXECUTE` entry therefore blocks on the PR (ADR 0004
+D9.4a). To continue the PR, the operator runs `unblock --take-over <PR URL>`
+in the namespace's state directory (D17.3), then `epic resume`; the
+controller writes the new run into the marker (ADR 0004 K11), reads it
+back and enters `REVIEW`. Archiving also deliberately discards the
+per-issue loop-bound evidence (review rounds, fix attempts, replan count)
+and the issue's validation records and certificate, which live in the
+archived state. That is the point of an explicit retry, and the reason it
+is never automatic. Archiving is also the
 operator's only way to hand a scheduler-owned issue to a standalone run,
-for example to merge it through the standalone merge gate.
+for example to merge it through the standalone merge gate. Since #414
+that standalone run takes the PR over the same way, with `unblock
+--take-over` on its own state.
 
 **D17.5 (documentation only).** **LOCAL** is unchanged and is excluded from
 scheduler runs by L0. `epic` commands are REMOTE-only.

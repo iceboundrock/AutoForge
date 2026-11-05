@@ -56,6 +56,7 @@ from .claims import (
     ACCEPTANCE,
     FOLLOW_UP,
     IMPLEMENTATION,
+    MAX_RUN_ID_CHARS,
     OPERATOR_COMMENT,
     PROGRESS,
     REVIEW,
@@ -102,6 +103,7 @@ from .result_parser import (
     validate_review_section,
     validate_roadmap_section,
 )
+from .runlog import RUN_ID_RE
 from .transitions import Phase
 from .validation import parse_comment_url, parse_issue_url, parse_pr_url
 
@@ -259,21 +261,52 @@ def review_comment_problem(
     ) or published_markdown_problem("review comment", text)
 
 
-def implementation_closing_block(issue_url: str) -> str:
-    """What K2's body ends with and K3 appends: ``Closes #n``, a blank line, the marker (#161)."""
+def implementation_closing_block(issue_url: str, owner_run_id: str | None) -> str:
+    """What K2's body ends with and K3 appends: ``Closes #n``, a blank line, the marker (#161).
+
+    The marker names ``owner_run_id``, the run that publishes it (#414);
+    ``None`` is the ownerless block a record saved before #414 holds.
+    """
     number = parse_issue_url(issue_url).number
-    return f"Closes #{number}{APPEND_SEPARATOR}{render_implementation_marker(issue_url)}"
+    marker = render_implementation_marker(issue_url, owner_run_id)
+    return f"Closes #{number}{APPEND_SEPARATOR}{marker}"
 
 
-def replacement_pr_body(text: str, issue_url: str, transaction_marker: str) -> str:
+def take_over_body(body: str, issue_url: str, run_id: str) -> tuple[str, str | None] | None:
+    """K11 (#414): ``body`` with the marker naming ``run_id``, and the owner it replaced.
+
+    ``None`` unless ``body`` carries exactly one implementation marker, a
+    readable one for ``issue_url``: a takeover replaces the owner of the
+    issue's PR and nothing else, so a body with no marker, a malformed or a
+    second one, or another issue's, is not taken over. The returned owner is
+    the run the marker named before (``None``: none). Everything but the
+    marker is kept byte for byte.
+    """
+    found = scan(IMPLEMENTATION, body)
+    matches = list(IMPLEMENTATION.pattern.finditer(body))
+    issue = parse_issue_url(issue_url)
+    if found.defects or len(found.claims) != 1 or len(matches) != 1:
+        return None
+    if found.claims[0].key != issue.identity:
+        return None
+    match = matches[0]
+    marker = render_implementation_marker(issue.canonical, run_id)
+    return body[: match.start()] + marker + body[match.end() :], found.claims[0].owner_run_id
+
+
+def replacement_pr_body(
+    text: str, issue_url: str, transaction_marker: str, owner_run_id: str | None
+) -> str:
     """K7's body: the agent's text, ``Closes #n`` and the marker, then the transaction marker.
 
     The controller renders everything after the agent's text (#164): the
-    closing block of the issue (:func:`implementation_closing_block`) and
-    the transaction's marker with the validated counts.
+    closing block of the issue (:func:`implementation_closing_block`), owned
+    by ``owner_run_id`` (#414), and the transaction's marker with the
+    validated counts.
     """
     return compose_append(
-        compose_append(text, implementation_closing_block(issue_url)), transaction_marker
+        compose_append(text, implementation_closing_block(issue_url, owner_run_id)),
+        transaction_marker,
     )
 
 
@@ -416,6 +449,7 @@ class EffectKind(StrEnum):
     PROGRESS_COMMENT = "progress_comment"  # K8
     ACCEPTANCE_COMMENT = "acceptance_comment"  # K9 (#211)
     OPERATOR_COMMENT = "operator_comment"  # K10 (#243): operator-performed, never issued
+    OWNER_TAKEOVER = "owner_takeover"  # K11 (#414): the operator's takeover of a PR
 
 
 class Stage(StrEnum):
@@ -448,6 +482,7 @@ KIND_PHASES: Mapping[EffectKind, frozenset[Phase]] = {
     EffectKind.PROGRESS_COMMENT: frozenset({Phase.UPDATE_EPIC}),
     EffectKind.ACCEPTANCE_COMMENT: frozenset({Phase.FIX}),
     EffectKind.OPERATOR_COMMENT: frozenset({Phase.FIX}),
+    EffectKind.OWNER_TAKEOVER: frozenset({Phase.ANALYZE_EXECUTE}),
 }
 
 # D13.3: the contract a launch ran under, recorded in every pre-launch save of
@@ -657,6 +692,13 @@ def _marker_list(value: object, what: str) -> None:
         _fail(what, "repeats a marker")
 
 
+def _replaced_owner(value: object, what: str) -> None:
+    """K11 (#414): the run a takeover replaces as the PR's owner, or ``""`` for none."""
+    text = _str(value, what, MAX_RUN_ID_CHARS)
+    if text and not RUN_ID_RE.fullmatch(text):
+        _fail(what, "must be a run id or empty")
+
+
 def _absent(value: object, what: str) -> None:
     if value is not True:
         _fail(what, "must be true: a create's precondition is that no object has the identity")
@@ -784,6 +826,17 @@ KIND_SPECS: Mapping[EffectKind, _KindSpec] = {
         payload={"body": _BODY, "block": _BODY},
         observed={"url": _pr_url},
         completion="body_equals_payload_marker_exactly_one",
+    ),
+    # K11 (#414, ADR 0004 D9.4a): the operator's takeover of the issue's
+    # implementation PR. The payload is the PR's body as read, with only the
+    # implementation marker's owner replaced by the taking run.
+    EffectKind.OWNER_TAKEOVER: _KindSpec(
+        identity={"pr_url": _pr_url, "marker": _marker_of(IMPLEMENTATION)},
+        target={"pr_url": _pr_url},
+        precondition={"base_sha256": _digest, "replaced_owner": _replaced_owner},
+        payload={"body": _BODY},
+        observed={"url": _pr_url},
+        completion="body_equals_payload_marker_names_run",
     ),
     EffectKind.REVIEW_COMMENT: _KindSpec(
         identity={"pr_url": _pr_url, "marker": _marker_of(REVIEW)},
@@ -1289,6 +1342,11 @@ def _check_owner_issue_marker(record: EffectRecord, kind: MarkerKind, what: str)
         issue.canonical, record.owner.issue_url, parse_issue_url
     ):
         _fail(what, "carries a marker for another issue than its owner's")
+    # #414: an implementation marker names the run that publishes it, which
+    # is the record's own run; one saved before #414 names none.
+    owner_run_id = getattr(claim, "owner_run_id", None)
+    if owner_run_id is not None and owner_run_id != record.owner.run_id:
+        _fail(what, "carries a marker owned by another run than its owner's")
     pr = getattr(claim, "pr", None)
     if pr is not None and not _same_url(pr.canonical, record.owner.pr_url, parse_pr_url):
         _fail(what, "carries a marker for another PR than its owner's")
@@ -1327,15 +1385,26 @@ def _cross_push(record: EffectRecord, what: str) -> None:
         _fail(what, "is observed at another SHA than its candidate")
 
 
-def _owner_closing_block(record: EffectRecord, repository: str, what: str) -> str:
-    """The closing block of the owner's issue, for a PR in ``repository``.
+def _owner_closing_blocks(record: EffectRecord, repository: str, what: str) -> tuple[str, ...]:
+    """The closing blocks of the owner's issue a record may carry, for a PR in ``repository``.
 
     ``Closes #n`` names issue ``n`` of the PR's own repository, so it is the
-    owner's issue only when the PR is in that issue's repository.
+    owner's issue only when the PR is in that issue's repository. Its marker
+    names the record's own run (#414) or, in a record saved before #414, no
+    run at all: such a record still completes, and its PR is a legacy one.
+    A record whose identity holds the implementation marker (K2, K3) may
+    carry only the block of that marker, so the body and the identity agree
+    on the owner.
     """
     if not parse_issue_url(record.owner.issue_url).same_repository(repository):
         _fail(what, "is in another repository than its owner's issue, which 'Closes #n' names")
-    return implementation_closing_block(record.owner.issue_url)
+    if "marker" in record.identity:
+        owners: tuple[str | None, ...] = (
+            _marker_claim(IMPLEMENTATION, record.identity["marker"]).owner_run_id,
+        )
+    else:
+        owners = (record.owner.run_id, None)
+    return tuple(implementation_closing_block(record.owner.issue_url, o) for o in owners)
 
 
 def _cross_implementation_pr(record: EffectRecord, what: str) -> None:
@@ -1352,8 +1421,12 @@ def _cross_implementation_pr(record: EffectRecord, what: str) -> None:
     # get the parser's rules again, because a resumed create publishes them
     # with no agent result in between. The credential rule over the whole
     # body is the record's redaction invariance.
-    tail = APPEND_SEPARATOR + _owner_closing_block(record, record.target["repository"], what)
-    if not record.body.endswith(tail):
+    tails = [
+        APPEND_SEPARATOR + block
+        for block in _owner_closing_blocks(record, record.target["repository"], what)
+    ]
+    tail = next((t for t in tails if record.body.endswith(t)), None)
+    if tail is None:
         _fail(
             what,
             "has a payload body that is not its text, a blank line and the closing block "
@@ -1380,8 +1453,32 @@ def _cross_adopt_pr(record: EffectRecord, what: str) -> None:
     # keeps as it is; only the block is the controller's, and it is exactly
     # the closing block of the owner's issue.
     repository = parse_pr_url(record.target["pr_url"]).repository
-    if record.payload["block"] != _owner_closing_block(record, repository, what):
+    if record.payload["block"] not in _owner_closing_blocks(record, repository, what):
         _fail(what, "has a block that is not the closing block of its owner's issue")
+    if record.observed is not None and record.observed["url"] != record.target["pr_url"]:
+        _fail(what, "is observed on another PR than its target")
+
+
+def _cross_owner_takeover(record: EffectRecord, what: str) -> None:
+    _same(record, what, (record.identity["pr_url"], record.target["pr_url"], "PR"))
+    claim = _marker_claim(IMPLEMENTATION, record.identity["marker"])
+    if not _same_url(claim.issue.canonical, record.owner.issue_url, parse_issue_url):
+        _fail(what, "carries a marker for another issue than its owner's")
+    if claim.owner_run_id != record.owner.run_id:
+        _fail(what, "carries a marker that does not name its owner's run")
+    if record.owner.pr_url and not _same_url(
+        record.target["pr_url"], record.owner.pr_url, parse_pr_url
+    ):
+        _fail(what, "takes over another PR than the one its owner is bound to")
+    found = scan(IMPLEMENTATION, record.body)
+    if found.defects or found.claims != (claim,) or record.identity["marker"] not in record.body:
+        _fail(what, "has a payload that does not carry exactly its identity's marker")
+    if record.precondition["replaced_owner"] == record.owner.run_id:
+        _fail(what, "replaces its own run as the owner, which is no takeover")
+    if not parse_issue_url(record.owner.issue_url).same_repository(
+        parse_pr_url(record.target["pr_url"]).repository
+    ):
+        _fail(what, "takes over a PR in another repository than its owner's issue")
     if record.observed is not None and record.observed["url"] != record.target["pr_url"]:
         _fail(what, "is observed on another PR than its target")
 
@@ -1471,13 +1568,12 @@ def _cross_replacement_pr(record: EffectRecord, what: str) -> None:
     # followed by the controller's closing block and transaction marker
     # (#164); both texts get the parser's rules again, because a resumed
     # create publishes them with no agent result in between.
-    tail = (
-        APPEND_SEPARATOR
-        + _owner_closing_block(record, record.target["repository"], what)
-        + APPEND_SEPARATOR
-        + record.identity["transaction_marker"]
-    )
-    if not record.body.endswith(tail):
+    tails = [
+        APPEND_SEPARATOR + block + APPEND_SEPARATOR + record.identity["transaction_marker"]
+        for block in _owner_closing_blocks(record, record.target["repository"], what)
+    ]
+    tail = next((t for t in tails if record.body.endswith(t)), None)
+    if tail is None:
         _fail(
             what,
             "has a payload body that is not its text, the closing block of its owner's issue "
@@ -1685,6 +1781,7 @@ _CROSS_CHECKS: Mapping[EffectKind, Callable[[EffectRecord, str], None]] = {
     EffectKind.PUSH: _cross_push,
     EffectKind.IMPLEMENTATION_PR: _cross_implementation_pr,
     EffectKind.ADOPT_PR: _cross_adopt_pr,
+    EffectKind.OWNER_TAKEOVER: _cross_owner_takeover,
     EffectKind.REVIEW_COMMENT: _cross_review_comment,
     EffectKind.FOLLOW_UP_ISSUE: _cross_follow_up_issue,
     EffectKind.FOLLOW_UP_APPEND: _cross_follow_up_append,
@@ -1959,7 +2056,8 @@ def _context_header(raw: object, keys: Sequence[str], binding: Binding, phase: P
 class AnalyzeContext:
     """``ANALYZE_EXECUTE``: no result data; completion persists K1's and K2's/K3's results.
 
-    The plan saved with it is the push (K1) at position 0, then either the
+    The plan saved with it is the operator's takeover (K11) alone, or the
+    push (K1) at position 0, then either the
     implementation PR (K2) on the pushed branch or the adoption (K3), and the
     push is the one the entry observation explains: its base is the
     observed default-branch head and its expected old value the observed
@@ -1990,6 +2088,13 @@ class AnalyzeContext:
         _issue_url(data["issue_url"], f"{what}.issue_url")
         binding.check_issue(data["issue_url"], what)
         kinds = [r.kind for r in records]
+        if kinds == [EffectKind.OWNER_TAKEOVER]:
+            # K11 (#414): the operator's takeover is planned by 'unblock
+            # --take-over' from its own read of the PR, not from an entry
+            # observation; completing it binds the PR (ADR 0004 D9.4a).
+            if observation is not None:
+                _fail(what, "is a takeover saved with an entry observation")
+            return cls(data["issue_url"])
         if kinds not in (
             [EffectKind.PUSH, EffectKind.IMPLEMENTATION_PR],
             [EffectKind.PUSH, EffectKind.ADOPT_PR],
@@ -3182,6 +3287,43 @@ def decide_append(
             "landed and was edited cannot be told from one that never landed"
         )
     return Decision(Action.CONFLICT, reason=f"{record.describe()}: {why}")
+
+
+def decide_replace(record: EffectRecord, body_now: str, *, target_ok: bool) -> Decision:
+    """K11 (#414): a body replaced only over the exact body it was planned on.
+
+    The body already equal to the payload is the write (whoever made it,
+    D9.3), observed while the target qualifies. The body still equal to the
+    one read when the takeover was planned is the precondition: the write is
+    issued within the bound. Anything else is a conflict and nothing is
+    sent: the body changed since it was read (a concurrent edit is never
+    overwritten, and there is no rebase), or, after an issue, a write that
+    landed and was edited cannot be told from one that never landed.
+    """
+    terminal = _terminal(record)
+    if terminal is not None:
+        return terminal
+    if body_now == record.body:
+        if target_ok:
+            return Decision(Action.OBSERVE, observed={"url": record.target["pr_url"]})
+        return Decision(
+            Action.CONFLICT,
+            reason=f"{record.describe()}: the body is written but the PR no longer qualifies",
+        )
+    if not target_ok:
+        return Decision(
+            Action.CONFLICT,
+            reason=f"{record.describe()}: the PR no longer meets the takeover's conditions",
+        )
+    if sha256_text(body_now) == record.precondition["base_sha256"]:
+        return Decision(Action.ISSUE) if record.bound_left else _exhausted(record)
+    return Decision(
+        Action.CONFLICT,
+        reason=(
+            f"{record.describe()}: the PR body changed since the takeover read it, so it is not "
+            "written over; read the PR and run 'unblock --take-over' again"
+        ),
+    )
 
 
 def _append_target(record: EffectRecord) -> str:
