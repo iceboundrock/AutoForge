@@ -106,9 +106,10 @@ hidden test files and functions, the paths a candidate must not change, and its 
 
 - **No hidden-test leakage.** The hidden tests live in the reference commit. A run happens in a
   disposable repository whose history starts at the base's tree, so the fix and its tests are not
-  there to find. The manifest check refuses a statement naming a hidden test or the reference
-  commit, and a record counts each prompt or read-context file that names one. Any such file
-  invalidates the comparison.
+  there to find. The manifest check refuses a statement naming a hidden test or a pinned commit (the
+  base too, because the reference is its child on a public history), and a record counts each prompt
+  or read-context file that names one. Any such file invalidates the comparison, whichever planned run
+  holds it: excluding that run takes it out of the statistics, and an agent was still shown the answer.
 - **No benchmark contamination.** `collect` refuses a run on this repository and one whose base
   commit has another tree than the task pins.
 - **No cherry-picking.** The rule ran before any outcome existed. A run that failed stays in the
@@ -194,7 +195,7 @@ review, on every arm alike.
 | `stale_completed_nodes` | what was certified is not what the PR holds | measured |
 | `review_fix_cycles` | accepted `FIX` launches | measured |
 | `repeated_failed_approaches` | a candidate whose tree already failed validation in this run | measured, a proxy |
-| `duplicate_exploration` | read-only tool calls repeated across a run's launches, from `progress.log` | a proxy; `unknown` where a provider shows no tool, or a launch's progress file is missing, unreadable or a link |
+| `duplicate_exploration` | read-only tool calls repeated across a run's launches, from `progress.log` | a proxy; `unknown` where a provider shows no tool, or a launch's progress file is missing, unreadable, a link or cut at its bound |
 | `human_blocked_interventions` | applied `unblock`s, and a run that ended `BLOCKED` | measured |
 | `wall_clock_seconds` | the state file's creation to its last write | measured |
 | `cost_usd`, `cost_per_verified_success` | `cost_micro_usd` of every agent launch, failed attempts and parallel ones included | measured on Claude Code with every launch on record; otherwise `unknown` with the part it knows shown apart |
@@ -227,8 +228,14 @@ malformed, or that has lost a launch, leaves every count it decides `unknown` ra
 `unknown` with the known part apart, and its run's settings `unknown`. A line counts only if it is this
 run's, under a step number of its own (an integer above the last, naming a published step), with every field
 a score reads of the type the controller writes. Nothing is read of any other line, so another run's log
-gives no measured cost and a malformed line crashes nothing. A file shown to an agent that cannot be read
-leaves a leak not ruled out, so that run is not verified.
+gives no measured cost and a malformed line crashes nothing.
+
+**What an agent was shown comes from what its run recorded, not from what survived.** Each launch's prompt
+names its read-context directory, and that directory's `README.md` lists its files. A prompt that names none,
+or a directory, index or listed file that is missing, unreadable or a link, leaves a leak not ruled out, so
+that run is not verified. Whatever else such a directory holds is scanned too. This finds what is gone, not
+a prompt and an index rewritten to agree. An agent cannot do that under `sandbox.mode: required`, which
+`collect` needs: it sees the read context read-only and the rest of the state directory not at all.
 
 **Validation has its own status:** `not_configured`, `absent`, `failed` or `passed`, read from the
 `ValidationRecord`s of the configured set for the exact commit. A run under an empty set is
@@ -305,14 +312,17 @@ per run. AutoForge enforces neither during a run: its only limits are per launch
 run past 8 hours, and records it with `--stopped-by cost_ceiling` or `--stopped-by wall_clock_ceiling`,
 with its state directory when it has one: what the run did and spent stays in the record. A planned run
 never started for a ceiling has no state directory, so nothing is known of its settings or its usage. Nor
-does a run measured past a ceiling need anyone to say so: it counts as having reached it.
+does a run measured past a ceiling need anyone to say so: it counts as having reached it. A ceiling reads
+every planned run of the contrast that has a record, on either arm, paired or not: an exclusion or a lost
+counterpart takes a run out of the statistics, not out of what it spent.
 
 **The decision for each contrast:**
 
 - `NOT_EVALUATED`: an arm is missing, no real run exists, no planned pair has both runs and no gate
-  failed, or the comparison broke its own terms (a record under another manifest or pre-registration, two
-  records of one planned run, a pair with unequal settings, a run its own records show under other
-  settings, a run that did not start with its task's prior experience, a hidden test shown to an agent).
+  failed or ceiling was reached, or the comparison broke its own terms (a record under another manifest or
+  pre-registration, two records of one planned run, a pair with unequal settings, a run its own records
+  show under other settings, a run that did not start with its task's prior experience, a hidden test or
+  pinned commit shown to an agent).
 - `NO_GO`: a hard gate failed, or an interval lies wholly past a non-regression margin, on any sample,
   a sample with no pair included; or, on a complete sample, the primary interval lies wholly below +0.15.
 - `GO`: the primary is shown, every non-regression bound holds, every gate is measured clean, and no

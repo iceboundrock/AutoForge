@@ -25,12 +25,16 @@ import pytest
 from autoforge.config import default_config, load_config_file
 from autoforge.config_fingerprint import ConfigFingerprint, RecordedConfiguration
 from autoforge.executor import execute
+from autoforge.read_context import ReadContext
+from autoforge.runlog import MAX_PROGRESS_LOG_BYTES, RunLogger
 from autoforge.sandbox_pin import SandboxPin
 from autoforge.sandbox_policy import LaunchClass
 from autoforge.state import load_state
 from tests import evaluation as ev
 from tests import evaluation_fixture as fx
 from tests.conftest import make_engine
+
+from .test_evaluation import _decide, _treated, _world
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -719,6 +723,253 @@ def test_a_step_directory_replaced_by_a_link_leaves_a_leak_not_ruled_out(world, 
     assert record["outcome"] == ev.UNVERIFIED
 
 
+def _launch_contexts(state_dir: Path) -> list[Path]:
+    """Each launch's read context, as the run left it."""
+    run_id = load_state(state_dir / "state.json").run_id
+    return sorted((state_dir / "read-context" / run_id).iterdir())
+
+
+def _moved_aside_behind_a_link(path: Path, tmp_path: Path) -> None:
+    """``path`` replaced by a link to what it held: the bytes are still there, one hop away."""
+    aside = Path(tempfile.mkdtemp(prefix="aside-", dir=tmp_path)) / path.name
+    shutil.move(path, aside)
+    path.symlink_to(aside)
+
+
+def _scored_with_its_marker(world, state_dir: Path, **inputs) -> dict:
+    """The hidden-leak fixture scored for what it leaked, not for a marker nobody wrote."""
+    held_to = {
+        "id": "hidden_test_leak",
+        "memory_class": world["records"]["hidden_test_leak seed 1"]["memory_class"],
+        "protected_paths": [],
+        "hidden_files": [],
+        "leak_markers": fx.load_fixture_tasks()["bases"]["slug"]["leak_markers"],
+    }
+    return _score(world, "hidden_test_leak", state_dir=state_dir, held_to=held_to, **inputs)
+
+
+def _assert_leak_not_ruled_out(record: dict) -> None:
+    assert record["counts"]["hidden_leaks"] == 0
+    assert "hidden_leaks" in record["unknown_counts"]
+    assert ev.measure_of(record, "hidden_leaks") == (None, ev.UNKNOWN)
+    assert record["unverified_reasons"] == ["leak_scan_incomplete"]
+    assert record["outcome"] == ev.UNVERIFIED
+
+
+_LOSE_THE_ISSUE = {
+    "file-missing": lambda launch, tmp_path: (launch / "issue.md").unlink(),
+    "file-linked": lambda launch, tmp_path: _moved_aside_behind_a_link(
+        launch / "issue.md", tmp_path
+    ),
+    "directory-missing": lambda launch, tmp_path: shutil.rmtree(launch),
+    "directory-linked": lambda launch, tmp_path: _moved_aside_behind_a_link(launch, tmp_path),
+}
+
+
+@pytest.mark.parametrize("lose", _LOSE_THE_ISSUE.values(), ids=_LOSE_THE_ISSUE)
+def test_the_file_that_held_a_leak_gone_leaves_it_not_ruled_out(world, tmp_path, lose):
+    """Each is the same run as the one that leaked. Enumerating only what survived read each
+    of these as a clean scan of everything, and so as a verified success."""
+    state_dir = _copied_state(world, "hidden_test_leak", tmp_path)
+    leaked = _scored_with_its_marker(world, state_dir)
+    assert leaked["counts"]["hidden_leaks"] == 2 and leaked["unknown_counts"] == []
+    assert leaked["unverified_reasons"] == ["hidden_test_leak"]
+
+    for launch in _launch_contexts(state_dir):
+        lose(launch, tmp_path)
+    _assert_leak_not_ruled_out(_scored_with_its_marker(world, state_dir))
+
+
+def _read_context_of_run(state_dir: Path) -> Path:
+    return state_dir / "read-context" / load_state(state_dir / "state.json").run_id
+
+
+_LOSE_EVERY_CONTEXT = {
+    "run-missing": lambda state_dir, tmp_path: shutil.rmtree(_read_context_of_run(state_dir)),
+    "run-linked": lambda state_dir, tmp_path: _moved_aside_behind_a_link(
+        _read_context_of_run(state_dir), tmp_path
+    ),
+    "root-missing": lambda state_dir, tmp_path: shutil.rmtree(state_dir / "read-context"),
+    "root-linked": lambda state_dir, tmp_path: _moved_aside_behind_a_link(
+        state_dir / "read-context", tmp_path
+    ),
+}
+
+
+@pytest.mark.parametrize("lose", _LOSE_EVERY_CONTEXT.values(), ids=_LOSE_EVERY_CONTEXT)
+def test_a_read_context_gone_whole_leaves_a_leak_not_ruled_out(world, tmp_path, lose):
+    """Nothing is left to enumerate, and each prompt still names what it was given."""
+    state_dir = _copied_state(world, "hidden_test_leak", tmp_path)
+    lose(state_dir, tmp_path)
+    _assert_leak_not_ruled_out(_scored_with_its_marker(world, state_dir))
+
+
+def _empty_the_index(state_dir: Path, tmp_path: Path) -> None:
+    (_launch_contexts(state_dir)[0] / "README.md").write_text("Nothing here.\n", encoding="utf-8")
+
+
+def _index_of_first(spoil):
+    return lambda state_dir, tmp_path: spoil(_launch_contexts(state_dir)[0] / "README.md", tmp_path)
+
+
+def _prompt_of_first(state_dir: Path) -> Path:
+    return _agent_steps(state_dir)[0] / "prompt.md"
+
+
+_LOSE_THE_RECORD = {
+    "index-missing": _index_of_first(lambda index, tmp_path: index.unlink()),
+    "index-linked": _index_of_first(_moved_aside_behind_a_link),
+    "index-without-a-listing": _empty_the_index,
+    "prompt-empty": lambda state_dir, tmp_path: _prompt_of_first(state_dir).write_text(""),
+    "prompt-names-no-context": lambda state_dir, tmp_path: _prompt_of_first(state_dir).write_text(
+        "The read context is elsewhere.\n"
+    ),
+    "prompt-names-another-runs": lambda state_dir, tmp_path: _prompt_of_first(state_dir).write_text(
+        "read-context/af-another-run/review-1-0123456789ab\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("lose", _LOSE_THE_RECORD.values(), ids=_LOSE_THE_RECORD)
+def test_a_record_of_what_was_shown_that_is_gone_is_no_clean_scan(world, tmp_path, lose):
+    """A clean run, whose only fault is that nobody can now say what one launch was shown."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    assert _score(world, "fx-slugify", state_dir=state_dir)["outcome"] == ev.VERIFIED
+    lose(state_dir, tmp_path)
+    _assert_leak_not_ruled_out(_score(world, "fx-slugify", state_dir=state_dir))
+
+
+@pytest.mark.parametrize(
+    "plant",
+    [lambda path: path.mkdir(), os.mkfifo],
+    ids=["directory", "fifo"],
+)
+def test_a_listed_file_that_is_no_file_is_no_clean_scan(world, tmp_path, plant):
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    issue = _launch_contexts(state_dir)[0] / "issue.md"
+    issue.unlink()
+    plant(issue)
+    _assert_leak_not_ruled_out(_score(world, "fx-slugify", state_dir=state_dir))
+
+
+@pytest.mark.parametrize("target", ["issue.md", "."], ids=["file", "directory"])
+def test_a_read_context_nobody_may_read_is_no_clean_scan(world, tmp_path, target):
+    if os.geteuid() == 0:
+        pytest.skip("root reads whatever a file's mode says")
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    path = _launch_contexts(state_dir)[0] / target
+    mode = path.stat().st_mode
+    path.chmod(0)
+    try:
+        _assert_leak_not_ruled_out(_score(world, "fx-slugify", state_dir=state_dir))
+    finally:
+        path.chmod(mode)
+
+
+def test_what_the_index_does_not_list_is_still_scanned(world, tmp_path):
+    """A file put beside the listed ones was as readable to the launch. Scanned, it counts;
+    a link there is no more a clean scan than a link in the listing."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    marker = "HiddenCheckMarkerSlug"
+    launch = _launch_contexts(state_dir)[0]
+    (launch / "notes.md").write_text(f"See {marker}.\n", encoding="utf-8")
+    record = _scored_with_its_marker(world, state_dir)
+    assert record["counts"]["hidden_leaks"] == 1 and "hidden_leaks" not in record["unknown_counts"]
+
+    (launch / "notes.md").unlink()
+    (launch / "notes.md").symlink_to(launch / "issue.md")
+    record = _scored_with_its_marker(world, state_dir)
+    assert record["counts"]["hidden_leaks"] == 0 and "hidden_leaks" in record["unknown_counts"]
+
+
+def _hand_made_run(tmp_path: Path) -> Path:
+    """An agent's step with its read context, then a step with an empty prompt."""
+    state_dir = tmp_path / "state"
+    logs = state_dir / "logs" / "run"
+    first, second = logs / "001-analyze_execute-1", logs / "002-analyze_execute-epic-binding-1"
+    first.mkdir(parents=True)
+    second.mkdir()
+    (first / "prompt.md").write_text("read-context/run/analyze_execute-1-0123456789ab\n")
+    (second / "prompt.md").write_text("")
+    context = state_dir / "read-context" / "run" / "analyze_execute-1-0123456789ab"
+    context.mkdir(parents=True)
+    written = ReadContext()
+    written.add("issue.md", "the issue", "The issue.\n")
+    for name, text in written.rendered().items():
+        (context / name).write_text(text, encoding="utf-8")
+    return state_dir
+
+
+def test_only_a_launchs_prompt_owes_a_read_context(tmp_path):
+    """A bookkeeping line's or a command's step holds an empty prompt, which is no gap. A step
+    no admitted line speaks for could be any launch, so it owes one."""
+    state_dir = _hand_made_run(tmp_path)
+    agent = {"seq": 1, "profile": "analyze_execute", "provider": "claude"}
+    bookkeeping = {"seq": 2, "profile": "(EPIC binding at run creation; no agent)", "provider": ""}
+    markers = ["no-such-marker"]
+    assert ev.count_leaks(state_dir, "run", markers, lines=[agent, bookkeeping]) == (0, 0)
+    assert ev.count_leaks(state_dir, "run", markers, lines=[agent]) == (0, 1)
+    assert ev.count_leaks(state_dir, "run", markers) == (0, 1)
+    assert ev.count_leaks(state_dir, "run", ["The issue."], lines=[agent, bookkeeping]) == (1, 0)
+
+
+def test_a_commit_named_in_capitals_is_a_leak_of_it(tmp_path):
+    state_dir = _hand_made_run(tmp_path)
+    context = state_dir / "read-context" / "run" / "analyze_execute-1-0123456789ab"
+    (context / "issue.md").write_text("See ABCDEF0123.\n")
+    assert ev.count_leaks(state_dir, "run", ["abcdef0"], lines=[{"seq": 2}])[0] == 1
+
+
+_REFERENCE_NAMED_AS = {
+    "full": lambda task: task["reference_sha"],
+    "abbreviated": lambda task: task["reference_sha"][:10],
+    "seven-characters": lambda task: task["reference_sha"][:7],
+    "capitals": lambda task: task["reference_sha"].upper(),
+}
+_REFERENCE_NAMED_IN = {
+    "prompt": lambda state_dir: _agent_steps(state_dir)[-1] / "prompt.md",
+    "read-context": lambda state_dir: _launch_contexts(state_dir)[-1] / "issue.md",
+}
+
+
+@pytest.mark.parametrize("named_as", _REFERENCE_NAMED_AS.values(), ids=_REFERENCE_NAMED_AS)
+@pytest.mark.parametrize("named_in", _REFERENCE_NAMED_IN.values(), ids=_REFERENCE_NAMED_IN)
+def test_the_reference_commit_shown_to_an_agent_invalidates_the_comparison(
+    world, tmp_path, named_as, named_in
+):
+    """The statement check refuses it, so the scan must see it: a run can name the fix to its
+    agent in a prompt or a read-context file as well as a statement can. Held to a real task,
+    whose markers are its own hidden tests and pinned commits."""
+    real = ev.load_manifest()["tasks"][0]
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    clean = _score(world, "fx-slugify", state_dir=state_dir, held_to=real)
+    assert clean["counts"]["hidden_leaks"] == 0
+
+    with named_in(state_dir).open("a", encoding="utf-8") as stream:
+        stream.write(f"\nThe fix is {named_as(real)}.\n")
+    record = _score(world, "fx-slugify", state_dir=state_dir, held_to=real)
+    assert record["counts"]["hidden_leaks"] == 1
+    assert "hidden_leaks" not in record["unknown_counts"]
+    assert "hidden_test_leak" in record["unverified_reasons"]
+    assert record["outcome"] == ev.UNVERIFIED
+
+    manifest, prereg, records = _world()
+    assert _decide(manifest, prereg, records)["decision"] == ev.GO
+    _treated(records)["counts"]["hidden_leaks"] = record["counts"]["hidden_leaks"]
+    result = _decide(manifest, prereg, records)
+    assert result["decision"] == ev.NOT_EVALUATED and "pinned commit" in result["why"]
+
+
+def test_the_pinned_base_shown_to_an_agent_is_a_leak_too(world, tmp_path):
+    """The statement check refuses it as well, and the reference is its child."""
+    real = ev.load_manifest()["tasks"][0]
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    with (_agent_steps(state_dir)[0] / "prompt.md").open("a", encoding="utf-8") as stream:
+        stream.write(f"\nStart from {real['base_sha']}.\n")
+    record = _score(world, "fx-slugify", state_dir=state_dir, held_to=real)
+    assert record["counts"]["hidden_leaks"] == 1
+
+
 def test_nobody_saying_the_run_was_checked_leaves_safety_unassessed(world):
     assert _score(world, "fx-slugify")["safety_assessed"] is False
     assert _score(world, "fx-slugify", safety_evidence="  ")["safety_assessed"] is False
@@ -978,6 +1229,84 @@ def test_only_an_agents_step_owes_a_progress_file(tmp_path):
         ev.duplicate_exploration(state_dir, "run", ev.MEASURED, lines=[agent, bookkeeping, lost])
         == _NOT_COUNTED
     )
+
+
+_OMITTED = "[3 progress line(s) omitted past the 1048576-byte bound]\n"
+
+
+def test_a_progress_file_cut_at_its_bound_is_no_measured_count(tmp_path):
+    """One `Read` and three lines nobody can see, any of them a repeat: a measured zero here
+    could pass a criterion the run failed."""
+    state_dir, first, second = _two_agent_steps(tmp_path)
+    (second / "progress.log").write_text("[00:00:01 Y #1] Read src/b.py\n", encoding="utf-8")
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == {
+        "value": 0,
+        "provenance": ev.MEASURED,
+    }
+    with (second / "progress.log").open("a", encoding="utf-8") as stream:
+        stream.write(_OMITTED)
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == _NOT_COUNTED
+
+
+def test_the_controllers_own_omission_line_is_what_is_recognised(tmp_path):
+    """Written by the logger, so that the two cannot drift apart: a bound or a wording the
+    harness no longer knows would read as a whole file again."""
+    state_dir = tmp_path / "state"
+    logger = RunLogger(state_dir / "logs", "run")
+    step = logger.begin_step("REVIEW", 1)
+    step.append("[00:00:01 REVIEW #1] Read src/a.py")
+    line = "[00:00:02 REVIEW #1] Bash " + "x" * 65536
+    for _ in range(MAX_PROGRESS_LOG_BYTES // len(line) + 2):
+        step.append(line)
+    step.close()
+    logger.close()
+    held = (step.path / "progress.log").read_text(encoding="utf-8")
+    assert f"omitted past the {MAX_PROGRESS_LOG_BYTES}-byte bound]\n" in held
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == _NOT_COUNTED
+
+
+def test_a_tool_call_that_mentions_the_omission_is_not_one(tmp_path):
+    """A read of this very harness, say: only the logger's whole line says lines were lost."""
+    state_dir, _, second = _two_agent_steps(tmp_path)
+    (second / "progress.log").write_text(
+        f"[00:00:01 Y #1] Read {_OMITTED}"
+        "[00:00:02 Y #1] Grep progress line(s) omitted past the 1048576-byte bound\n",
+        encoding="utf-8",
+    )
+    assert ev.duplicate_exploration(state_dir, "run", ev.MEASURED) == {
+        "value": 0,
+        "provenance": ev.MEASURED,
+    }
+
+
+def test_a_truncated_progress_file_cannot_satisfy_a_non_regression_criterion(world, tmp_path):
+    """Through `score_run` and the decision. The whole run passes the registered margin on its
+    measured count, and with one launch's progress cut the criterion has nothing to read."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    steps = _agent_steps(state_dir)
+    assert len(steps) > 1
+    for step in steps:
+        (step / "progress.log").write_text("[00:00:01 X #1] Read src/a.py\n", encoding="utf-8")
+    whole = _score(world, "fx-slugify", state_dir=state_dir, evidence=ev.REAL)
+    assert whole["usage"]["duplicate_exploration"] == {
+        "value": len(steps) - 1,
+        "provenance": ev.MEASURED,
+    }
+    with (steps[-1] / "progress.log").open("a", encoding="utf-8") as stream:
+        stream.write(_OMITTED)
+    cut = _score(world, "fx-slugify", state_dir=state_dir, evidence=ev.REAL)
+    assert cut["usage"]["duplicate_exploration"] == _NOT_COUNTED
+
+    prereg = ev.load_preregistration()
+    criterion = next(
+        c
+        for c in prereg["comparisons"]["memory_benefit"]["non_regression"]
+        if c["metric"] == "duplicate_exploration"
+    )
+    stats = prereg["statistics"]
+    assert ev.evaluate_non_regression([(whole, whole)], criterion, stats)["verdict"] == "pass"
+    held = ev.evaluate_non_regression([(whole, cut)], criterion, stats)
+    assert held["verdict"] == "unknown" and held["provenance"][ev.UNKNOWN] == 1
 
 
 def test_a_lost_progress_file_leaves_a_scored_run_with_no_exploration_count(world, tmp_path):

@@ -90,6 +90,7 @@ from autoforge.executor import ExecutionRequest, execute, select_environment
 from autoforge.git_transport import local_git_request
 from autoforge.materialize import METHOD as MATERIALIZATION_METHOD
 from autoforge.premerge import export_commit_tree
+from autoforge.read_context import INDEX_FILE
 from autoforge.runlog import STEP_DIR_RE
 from autoforge.safefs import SafeRoot
 from autoforge.sandbox_pin import SandboxPin
@@ -234,6 +235,12 @@ LESSON_LENGTH_RATIO = 2
 # The tools whose repeated call is exploring the same thing again.
 READ_ONLY_TOOLS = frozenset({"read", "grep", "glob", "find", "ls"})
 _PROGRESS_TOOL = re.compile(r"^\[[^\]]*\] (?P<tool>\S+)(?: (?P<detail>.+))?$")
+# The line ``StepLog.close`` ends a progress file with when its bound left calls out.
+_PROGRESS_OMITTED = re.compile(r"^\[\d+ progress line\(s\) omitted past the \d+-byte bound\]$")
+# How a launch's read context is named (``_write_read_context``): phase, attempt, token.
+_READ_CONTEXT_DIR = r"[a-z0-9_]+-\d+-[0-9a-f]{12}"
+# One file of a read context's index (``ReadContext.rendered``).
+_INDEXED_FILE = re.compile(rb"^- `([^`\n]+)`: ", re.M)
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _COUPLED = re.compile(r"\b(ImportError|ModuleNotFoundError|AttributeError|NameError)\b")
 _FAILED_MODULE = re.compile(r"^(?:FAILED|ERROR) (tests/[^\s:]+\.py)", re.M)
@@ -292,16 +299,22 @@ def arms_by_id(manifest: Mapping) -> dict[str, dict]:
 
 
 def hidden_names(task: Mapping) -> list[str]:
-    """What must never reach the agent: each hidden test's name."""
+    """Each hidden test's name."""
     return [node.partition("::")[2] for node in task["hidden_tests"]]
+
+
+def forbidden_markers(task: Mapping) -> list[str]:
+    """What must never reach an agent: each hidden test's name and each pinned commit.
+
+    A commit by its first seven characters, which every longer spelling of it holds. The
+    base counts because the reference is its child, on a history anyone can read.
+    """
+    return [*hidden_names(task), task["reference_sha"][:7], task["base_sha"][:7]]
 
 
 def statement_leaks(task: Mapping) -> list[str]:
     """What of the answer a task's statement gives away, which the agent would read."""
-    statement = task["statement"]
-    found = [name for name in hidden_names(task) if name in statement]
-    found += [sha[:7] for sha in (task["reference_sha"], task["base_sha"]) if sha[:7] in statement]
-    return found
+    return [marker for marker in forbidden_markers(task) if marker in task["statement"]]
 
 
 def manifest_problems(manifest: Mapping) -> list[str]:
@@ -367,7 +380,7 @@ def _lesson_problems(task: Mapping, match: Mapping) -> list[str]:
     lesson, other = prior["lesson"], match["prior_experience"]["lesson"]
     if not lesson.strip():
         problems.append(f"{name}: the lesson is empty")
-    leaks = [item for item in (*hidden_names(task), task["reference_sha"][:7]) if item in lesson]
+    leaks = [marker for marker in forbidden_markers(task) if marker in lesson]
     if leaks:
         problems.append(f"{name}: the lesson gives away {leaks}")
     if len(lesson) > LESSON_LENGTH_RATIO * len(other):
@@ -612,11 +625,10 @@ def read_journal(state_dir: Path, run_id: str) -> tuple[list[dict], int, str]:
     return lines, bad, status
 
 
-def _regular_files(directory: Path) -> list[str]:
-    """Names of the regular files directly in ``directory``, links unfollowed, sorted."""
+def _entries(directory: Path) -> list[str]:
+    """Every name directly in ``directory``, whatever each is; none when it cannot be listed."""
     try:
-        with os.scandir(directory) as entries:
-            return sorted(e.name for e in entries if e.is_file(follow_symlinks=False))
+        return sorted(os.listdir(directory))
     except OSError:
         return []
 
@@ -637,10 +649,7 @@ def _step_directories(logs: Path) -> list[str]:
 def _step_entries(logs: Path) -> list[str]:
     """Every entry named like a step, whatever it is, so that what stands where a step's
     directory belongs (a link, a file) is seen and not passed over."""
-    try:
-        return sorted(name for name in os.listdir(logs) if STEP_DIR_RE.match(name))
-    except OSError:
-        return []
+    return [name for name in _entries(logs) if STEP_DIR_RE.match(name)]
 
 
 def _step_number(name: str) -> int:
@@ -731,29 +740,79 @@ def _bounded_files(state_dir: Path, relpaths: Sequence[str]) -> tuple[list[bytes
     )
 
 
-def _shown_to_agents(state_dir: Path, run_id: str) -> tuple[list[str], int]:
-    """What the run's agents were shown, and how many step directories hold no prompt:
-    every launch's prompt and read context, and a launch whose prompt is lost."""
-    logs = state_dir / "logs" / run_id
-    steps = _step_entries(logs)
-    prompts = [step for step in steps if "prompt.md" in _regular_files(logs / step)]
-    shown = [f"logs/{run_id}/{step}/prompt.md" for step in prompts]
-    context = state_dir / "read-context" / run_id
-    for launch in _subdirectories(context):
-        shown += [
-            f"read-context/{run_id}/{launch}/{name}" for name in _regular_files(context / launch)
-        ]
-    return shown, len(steps) - len(prompts)
+def _readable(root: SafeRoot, relpath: str) -> bytes | None:
+    """A file's bytes, read as a run log is; ``None`` for a link, a gap or an oversized file."""
+    status, data = _journal_bytes(root, relpath)
+    return data if status == "read" else None
 
 
-def count_leaks(state_dir: Path, run_id: str, markers: Sequence[str]) -> tuple[int, int]:
-    """How many files shown to an agent name something it must not know, and how many
-    could not be scanned: a leak there is not ruled out."""
-    needles = [marker.encode() for marker in markers]
-    shown, promptless = _shown_to_agents(state_dir, run_id)
-    files, unread = _bounded_files(state_dir, shown)
-    found = sum(any(needle in data for needle in needles) for data in files)
-    return found, promptless + unread
+def _read_context(root: SafeRoot, state_dir: Path, directory: str) -> tuple[list[bytes], int]:
+    """One launch's read context, and how many of its inputs could not be read.
+
+    Its index says what the controller wrote, so a file it lists is expected whether or
+    not it is still there, and anything else in the directory, of any kind, is an input
+    too. An index that is gone, or holds no listing, leaves nothing to say what was shown.
+    """
+    index = _readable(root, f"{directory}/{INDEX_FILE}")
+    listed = {name.decode("utf-8", "replace") for name in _INDEXED_FILE.findall(index or b"")}
+    shown = [] if index is None else [index]
+    lost = int(index is None or b"\nFiles:\n" not in index)
+    for name in sorted((listed | set(_entries(state_dir / directory))) - {INDEX_FILE}):
+        data = _readable(root, f"{directory}/{name}")
+        if data is None:
+            lost += 1
+        else:
+            shown.append(data)
+    return shown, lost
+
+
+def _shown_to_agents(
+    state_dir: Path, run_id: str, lines: Sequence[dict]
+) -> tuple[list[bytes], int]:
+    """What the run's agents were shown, and how many of those inputs could not be read.
+
+    What is expected comes from what the run recorded, not from what survived it, so an
+    input that is gone is counted rather than passed over. Every step holds a prompt. Every
+    prompt but one an admitted line (``lines``) says was no agent's names the read context
+    written for its launch, which a directory of that run must hold (:func:`_read_context`).
+    A directory no prompt names is read too: a launch that crashed left it behind.
+    """
+    others = {line["seq"] for line in lines} - {line["seq"] for line in _agent_lines(lines)}
+    context = f"read-context/{run_id}"
+    named = re.compile(rf"{re.escape(context)}/({_READ_CONTEXT_DIR})".encode())
+    launches = set(_entries(state_dir / context))
+    shown: list[bytes] = []
+    lost = 0
+    root = _open_dir(state_dir)
+    try:
+        for step in _step_entries(state_dir / "logs" / run_id):
+            prompt = _readable(root, f"logs/{run_id}/{step}/prompt.md")
+            if prompt is None:
+                lost += 1
+                continue
+            shown.append(prompt)
+            contexts = {match.decode() for match in named.findall(prompt)}
+            lost += not contexts and _step_number(step) not in others
+            launches |= contexts
+        for launch in sorted(launches):
+            files, unread = _read_context(root, state_dir, f"{context}/{launch}")
+            shown += files
+            lost += unread
+    finally:
+        root.close()
+    return shown, lost
+
+
+def count_leaks(
+    state_dir: Path, run_id: str, markers: Sequence[str], *, lines: Sequence[dict] = ()
+) -> tuple[int, int]:
+    """How many inputs shown to an agent name something it must not know, and how many
+    could not be scanned: a leak there is not ruled out. A commit's SHA is the same commit
+    in capitals, so case does not hide a marker."""
+    needles = [marker.lower().encode() for marker in markers]
+    shown, lost = _shown_to_agents(state_dir, run_id, lines)
+    found = sum(any(needle in data.lower() for needle in needles) for data in shown)
+    return found, lost
 
 
 def duplicate_exploration(
@@ -772,8 +831,10 @@ def duplicate_exploration(
     whose log lost a launch or an expected progress file: the controller publishes
     one before each launch (``RunLogger.begin_step``), so one that is missing, a link
     or unreadable holds calls nobody can count, and a total without them is a part.
-    Every step is expected to hold one unless an admitted line (``lines``) says it was
-    no agent's, and an agent's line must have its step.
+    So is one cut at its bound, which says so in its last line (``StepLog.close``):
+    any call it left out could be a repeat. Every step is expected to hold one unless
+    an admitted line (``lines``) says it was no agent's, and an agent's line must have
+    its step.
     """
     logs = state_dir / "logs" / run_id
     agents = {line["seq"] for line in _agent_lines(lines)}
@@ -788,6 +849,8 @@ def duplicate_exploration(
         return {"value": None, "provenance": UNKNOWN}
     for data in files:
         for line in data.decode("utf-8", "replace").splitlines():
+            if _PROGRESS_OMITTED.match(line):
+                return {"value": None, "provenance": UNKNOWN}
             match = _PROGRESS_TOOL.match(line)
             if match and match.group("tool").lower() in READ_ONLY_TOOLS:
                 seen[(match.group("tool").lower(), match.group("detail") or "")] += 1
@@ -1093,7 +1156,10 @@ def score_run(run: RunInput) -> dict:
     )
     counts["journal_bad_lines"] = bad + len(read) - len(lines)
     counts["hidden_leaks"], unscanned = count_leaks(
-        run.state_dir, state.run_id, run.task.get("leak_markers") or hidden_names(run.task)
+        run.state_dir,
+        state.run_id,
+        run.task.get("leak_markers") or forbidden_markers(run.task),
+        lines=lines,
     )
     counts["lost_success"] = int(
         final_oracle != "pass" and any(oracle[c] == "pass" for c in candidates if c != final)
@@ -1915,7 +1981,15 @@ def evaluate_contrast(
     result |= {"pairs": len(pairs), "planned_pairs": len(expected), "excluded": excluded}
     result["missing"] = missing
     paired = [record for pair in pairs for record in pair]
-    result["ceiling_stopped"] = _ceiling_stopped(paired, prereg)
+    # Every planned run with a record. Leaving a pair takes a run out of the statistics, not
+    # out of what it spent or was shown.
+    observed = [
+        runs[(arm, task, seed)]
+        for task, seed in expected
+        for arm in (baseline, treatment)
+        if (arm, task, seed) in runs
+    ]
+    result["ceiling_stopped"] = _ceiling_stopped(observed, prereg)
     result["settings_unknown"] = [
         _run_key(r) for r in paired if r["settings_evidence"]["status"] == "unknown"
     ]
@@ -1945,15 +2019,13 @@ def evaluate_contrast(
         for r in paired
     ):
         invalid.append("a run did not start with its task's prior experience")
-    if any(r["counts"]["hidden_leaks"] for pair in pairs for r in pair):
-        invalid.append("a hidden test reached an agent")
+    if any(r["counts"]["hidden_leaks"] for r in observed):
+        invalid.append("a hidden test or a pinned commit reached an agent")
     if invalid:
         return {**result, "decision": NOT_EVALUATED, "why": "; ".join(invalid)}
 
     stats = prereg["statistics"]
-    treated_runs = [
-        runs[(treatment, task, seed)] for task, seed in expected if (treatment, task, seed) in runs
-    ]
+    treated_runs = [record for record in observed if record["arm"] == treatment]
     result["hard_gates"] = [
         _hard_gate(gate, treated_runs, treatment, harness, prereg)
         for gate in comparison["hard_gates"]
@@ -1985,11 +2057,12 @@ def _repeated_runs(real: Sequence[Mapping], arms: Sequence[str]) -> list[dict]:
     ]
 
 
-def _ceiling_stopped(paired: Sequence[Mapping], prereg: Mapping) -> list[dict]:
-    """Each run at a registered ceiling: stopped there, or measured past it unsaid."""
+def _ceiling_stopped(observed: Sequence[Mapping], prereg: Mapping) -> list[dict]:
+    """Each run at a registered ceiling: stopped there, or measured past it unsaid. An
+    exclusion or a lost counterpart does not take back what a run spent."""
     ceilings = prereg["ceilings"]
     found = []
-    for record in paired:
+    for record in observed:
         cost, wall = record["usage"]["cost_usd"], record["volatile"]["wall_clock_seconds"]
         known_cost = cost.get("known_part") if cost["value"] is None else cost["value"]
         if record["outcome"] in CEILING_OUTCOMES:
@@ -2081,11 +2154,13 @@ def _decide(result: Mapping, stats: Mapping, planned: int) -> tuple[str, str]:
     """NO_GO on evidence of harm, first, whatever the sample; then an incomplete sample
     is inconclusive, before any primary effect is read; GO only with everything measured
     and within bounds. Harm seen on a run no pair holds still comes first, so only then
-    does having no pair at all leave nothing to decide."""
+    does having no pair at all leave nothing to decide, unless a ceiling stopped the plan."""
     failed = [g["gate"] for g in result["hard_gates"] if g["verdict"] == "fail"]
     if failed:
         return NO_GO, f"hard gate failed: {', '.join(failed)}"
     if result["primary"] is None:
+        if result["ceiling_stopped"]:
+            return INCONCLUSIVE, f"{len(result['ceiling_stopped'])} run(s) reached a ceiling"
         return NOT_EVALUATED, "no pair of the plan has both runs"
     regressed = [c["metric"] for c in result["non_regression"] if c["verdict"] == "fail"]
     if regressed:

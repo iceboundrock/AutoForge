@@ -1943,7 +1943,7 @@ checkout, the issue worktree and its HEAD:
 model. They cover:
 
 - the pinned files: the manifest and pre-registration validate against each
-  other; a statement naming a hidden test or the reference commit is refused;
+  other; a statement naming a hidden test or a pinned commit is refused;
   each pin is what the history holds, skipped with its reason where no history
   exists; every task was verified fair, at its base and its reference; the
   protocol's digests, task table, thresholds, ceilings, control-plane list and
@@ -1965,9 +1965,10 @@ model. They cover:
   `NOT_EVALUATED` and raises nothing; harm is `NO_GO` however large the benefit,
   on an incomplete sample, on a run an exclusion or a lost baseline took out of its
   pair, and whatever else is unknown; a failed run stays in the denominator, a pair
-  with no record, a ceiling or too many exclusions is `INCONCLUSIVE` before any
-  primary effect is read, exclusions are listed and bounded, and another digest,
-  unequal settings, two records of one run or a leaked test leave no result;
+  with no record, a ceiling reached on any planned run, paired or not, or too many
+  exclusions is `INCONCLUSIVE` before any primary effect is read, exclusions are
+  listed and bounded, and another digest, unequal settings, two records of one run
+  or a hidden test or pinned commit shown on any planned run leave no result;
 - the fixture baseline: byte-identical across two runs and in a process outside
   pytest; the single-agent path, controller-owned effects, exact candidate
   records, the certificate, a closed gate and no credential in a launch on every
@@ -1977,10 +1978,11 @@ model. They cover:
   is a record under another policy or a certificate that no longer applies; prose
   in a run log changes nothing, and `not_configured` is no pass; a lost launch line,
   an unreadable run log, another run's line, a malformed field or a step number that
-  is not its own leaves what it decides `unknown` and crashes nothing, a missing or
-  linked progress file leaves exploration `unknown`, a file changed at the same
-  pathname establishes no setting, an unassessed safety gate rules out `GO`, and a
-  stopped run keeps what it did and spent;
+  is not its own leaves what it decides `unknown` and crashes nothing, a missing,
+  linked or truncated progress file leaves exploration `unknown`, a prompt, read
+  context, index or listed file that is gone or linked leaves a leak not ruled out,
+  a file changed at the same pathname establishes no setting, an unassessed safety
+  gate rules out `GO`, and a stopped run keeps what it did and spent;
 - the oracle: the candidate's code gets the launch isolation of
   `validation.commands`, and the export-command sandbox under `required`; only
   exit 0 is a pass, and what could not run is `not_run`;

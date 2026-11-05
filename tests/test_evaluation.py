@@ -184,6 +184,18 @@ def test_a_statement_that_gives_the_answer_away_is_refused(leak):
     assert any("gives away" in problem for problem in ev.manifest_problems(manifest))
 
 
+def test_what_a_scan_looks_for_is_what_a_statement_may_not_name():
+    """One list, so a run cannot show an agent what the manifest check would have refused to
+    let its statement say."""
+    manifest = ev.load_manifest()
+    task = manifest["tasks"][0]
+    markers = ev.forbidden_markers(task)
+    assert {task["reference_sha"][:7], task["base_sha"][:7], *ev.hidden_names(task)} == set(markers)
+    assert ev.statement_leaks(task) == []
+    for marker in markers:
+        assert ev.statement_leaks({**task, "statement": f"See {marker}."}) == [marker]
+
+
 def test_a_task_needs_its_match_to_be_of_the_other_memory_class():
     manifest = ev.load_manifest()
     first = manifest["tasks"][0]
@@ -955,6 +967,144 @@ def test_harm_is_no_go_with_no_pair_at_all():
     assert clean["decision"] == ev.NOT_EVALUATED and "no pair" in clean["why"]
 
 
+def _says_it_is_incomplete(result: dict) -> str:
+    """What the decision names first: a planned pair with no record, or else the ceiling."""
+    return "have no record" if result["missing"] else "reached a ceiling"
+
+
+_PAST_A_CEILING = {
+    "cost": (lambda r: r["usage"]["cost_usd"].update(value=26.0), "cost_ceiling"),
+    "known-part-of-a-cost": (
+        lambda r: r["usage"]["cost_usd"].update(value=None, provenance=ev.UNKNOWN, known_part=26.0),
+        "cost_ceiling",
+    ),
+    "wall-clock": (
+        lambda r: r["volatile"]["wall_clock_seconds"].update(value=8 * 3600 + 1),
+        "wall_clock_ceiling",
+    ),
+}
+
+
+@pytest.mark.parametrize("leave", _LEAVE_THE_PAIR.values(), ids=_LEAVE_THE_PAIR)
+@pytest.mark.parametrize("past, ceiling", _PAST_A_CEILING.values(), ids=_PAST_A_CEILING)
+def test_a_ceiling_passed_on_a_run_no_pair_holds_leaves_the_comparison_incomplete(
+    leave, past, ceiling
+):
+    """The stopping rule is about what was spent, which an exclusion does not take back. Read
+    over pairs alone, $26 on a run whose baseline went away was a `GO` with no ceiling listed."""
+    manifest, prereg, records = _world()
+    treated = _treated(records)
+    past(treated)
+    result = _decide(manifest, prereg, leave(records))
+    assert result["pairs"] == 35
+    assert [(c["arm"], c["task"], c["ceiling"]) for c in result["ceiling_stopped"]] == [
+        (TREATMENT, treated["task"], ceiling)
+    ]
+    assert result["decision"] == ev.INCONCLUSIVE
+    assert _says_it_is_incomplete(result) in result["why"]
+
+
+@pytest.mark.parametrize(
+    "leave", [_exclude_its_baseline, _lose_its_baseline], ids=["excluded-baseline", "unpaired"]
+)
+@pytest.mark.parametrize("ceiling", ev.CEILING_OUTCOMES)
+def test_a_run_stopped_at_a_ceiling_counts_though_its_counterpart_left_the_pair(leave, ceiling):
+    """Said by the operator, with what it spent on record."""
+    manifest, prereg, records = _world()
+    stopped = _treated(records)
+    stopped["outcome"], stopped["stopped_reason"] = ceiling, "the operator stopped it"
+    result = _decide(manifest, prereg, leave(records))
+    assert [c["ceiling"] for c in result["ceiling_stopped"]] == [ceiling]
+    assert result["ceiling_stopped"][0]["reason"] == "the operator stopped it"
+    assert result["decision"] == ev.INCONCLUSIVE
+    assert _says_it_is_incomplete(result) in result["why"]
+
+
+@pytest.mark.parametrize("ceiling", ev.CEILING_OUTCOMES)
+def test_a_run_never_started_for_a_ceiling_counts_though_its_baseline_was_excluded(ceiling):
+    manifest, prereg, records = _world()
+    planned = _treated(records)
+    _exclude_its_baseline(records)
+    records[records.index(planned)] = ev.not_run_record(
+        ev.tasks_by_id(manifest)[planned["task"]],
+        TREATMENT,
+        planned["seed"],
+        ceiling,
+        "the comparison's ceiling was reached",
+        ev.digest(manifest),
+        ev.digest(prereg),
+    )
+    result = _decide(manifest, prereg, records)
+    assert [c["ceiling"] for c in result["ceiling_stopped"]] == [ceiling]
+    assert result["decision"] == ev.INCONCLUSIVE and "reached a ceiling" in result["why"]
+
+
+def test_a_baselines_ceiling_counts_though_its_treatment_was_excluded():
+    """Either arm's: a registered ceiling is per planned run."""
+    manifest, prereg, records = _world()
+    baseline = _baseline_of(records, _treated(records))
+    baseline["usage"]["cost_usd"]["value"] = prereg["ceilings"]["per_run_usd"][BASELINE] + 1
+    result = _decide(manifest, prereg, _exclude(records))
+    assert [c["arm"] for c in result["ceiling_stopped"]] == [BASELINE]
+    assert result["decision"] == ev.INCONCLUSIVE and "reached a ceiling" in result["why"]
+
+
+def test_harm_outweighs_a_ceiling_on_a_run_no_pair_holds():
+    manifest, prereg, records = _world()
+    treated = _treated(records)
+    treated["usage"]["cost_usd"]["value"] = 26.0
+    treated["safety_failures"] = ["an agent merged"]
+    result = _decide(manifest, prereg, _exclude_its_baseline(records))
+    assert result["decision"] == ev.NO_GO and result["ceiling_stopped"]
+
+
+def test_a_ceiling_reached_with_no_pair_at_all_is_inconclusive():
+    """A plan stopped at its ceiling is incomplete, which nothing to read yet does not undo."""
+    manifest, prereg, records = _world()
+    treated = _treated(records)
+    treated["outcome"], treated["stopped_reason"] = "cost_ceiling", "the bill passed the ceiling"
+    result = _decide(manifest, prereg, [treated])
+    assert result["pairs"] == 0 and result["primary"] is None
+    assert result["decision"] == ev.INCONCLUSIVE and "reached a ceiling" in result["why"]
+
+
+def test_a_smoke_runs_ceiling_stays_outside_every_decision():
+    """It is no planned run, and the stopping rule is the plan's."""
+    manifest, prereg, records = _world()
+    smoke = copy.deepcopy(_treated(records))
+    smoke["seed"] = ev.SMOKE_SEED
+    smoke["usage"]["cost_usd"]["value"] = 26.0
+    result = _decide(manifest, prereg, [*records, smoke])
+    assert result["decision"] == ev.GO and result["ceiling_stopped"] == []
+
+
+def test_another_contrasts_arm_past_its_ceiling_does_not_touch_this_one():
+    manifest, prereg, records = _world()
+    other = copy.deepcopy(_treated(records))
+    other["arm"] = "fixed_role_multi_agent_issue_memory"
+    other["usage"]["cost_usd"]["value"] = prereg["ceilings"]["per_run_usd"][other["arm"]] + 1
+    result = _decide(manifest, prereg, [*records, other])
+    assert result["decision"] == ev.GO and result["ceiling_stopped"] == []
+
+
+@pytest.mark.parametrize("leave", _LEAVE_THE_PAIR.values(), ids=_LEAVE_THE_PAIR)
+def test_a_leak_on_a_run_no_pair_holds_still_invalidates_the_comparison(leave):
+    """What an agent was shown says the protocol's isolation failed, on that run and perhaps
+    on others. Excluding the run does not make it not have happened."""
+    manifest, prereg, records = _world()
+    _treated(records)["counts"]["hidden_leaks"] = 1
+    result = _decide(manifest, prereg, leave(records))
+    assert result["decision"] == ev.NOT_EVALUATED and "reached an agent" in result["why"]
+
+
+def test_a_smoke_runs_leak_stays_outside_every_decision():
+    manifest, prereg, records = _world()
+    smoke = copy.deepcopy(_treated(records))
+    smoke["seed"] = ev.SMOKE_SEED
+    smoke["counts"]["hidden_leaks"] = 1
+    assert _decide(manifest, prereg, [*records, smoke])["decision"] == ev.GO
+
+
 def test_an_excluded_run_that_left_evidence_still_owes_its_safety_check():
     """An exclusion cannot be what makes a run's check unnecessary. A planned run that never
     started has nothing to check, which test_exclusions_are_listed holds."""
@@ -1159,7 +1309,7 @@ def test_a_pair_with_no_record_is_inconclusive_never_a_smaller_sample():
         (lambda r: r.update(preregistration_digest="0" * 64), "another pre-registration"),
         (lambda r: r.update(manifest_digest="0" * 64), "another manifest"),
         (lambda r: r.update(settings_digest="0" * 64), "settings are not equal"),
-        (lambda r: r["counts"].update(hidden_leaks=1), "hidden test reached an agent"),
+        (lambda r: r["counts"].update(hidden_leaks=1), "pinned commit reached an agent"),
     ],
     ids=["preregistration", "manifest", "settings", "leak"],
 )
