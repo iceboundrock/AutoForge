@@ -319,6 +319,9 @@ def run_scenario(
         return built
 
     eng = engine(origin=True)
+    # As `autoforge run` does before its first save: what collect holds a run to.
+    eng.record_run_configuration()
+    eng.save()
     crashed = False
     try:
         eng.run(max_steps=MAX_STEPS)
@@ -350,6 +353,7 @@ def run_scenario(
         "id": scenario["task"],
         "memory_class": scenario["memory_class"],
         "protected_paths": base["protected_paths"],
+        "hidden_files": list(base["hidden_files"]),
         "leak_markers": base["leak_markers"],
     }
     overlay = {path: text.encode("utf-8") for path, text in base["hidden_files"].items()}
@@ -371,6 +375,14 @@ def run_scenario(
             ),
             manifest_digest=manifest_digest,
             preregistration_digest=preregistration_digest,
+            pristine_checkers=lambda commit: evaluation.run_oracle(
+                str(checkout),
+                commit,
+                {},
+                fixtures["validation_command"],
+                cfg,
+                pristine=(str(checkout), base_sha),
+            ),
         )
     )
     pinned = base_sha == base["base_sha"]

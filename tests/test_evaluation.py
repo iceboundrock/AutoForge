@@ -83,15 +83,21 @@ def _record(
         "manifest_digest": ev.digest(manifest),
         "preregistration_digest": ev.digest(prereg),
         "settings_digest": "s" * 64,
+        "settings_evidence": {"status": "established", "problems": []},
+        "run_evidence": True,
+        "prior_experience": ev.seeded_digest(manifest, arm, task),
         "phase": "READY_FOR_MERGE",
         "outcome": outcome or (ev.VERIFIED if verified else ev.UNVERIFIED),
         "unverified_reasons": [],
         "validation": "passed",
-        "certificate": {"held": True, "candidate": "c" * 40},
+        "certificate": {"held": True, "candidate": "c" * 40, "problem": ""},
         "final_candidate": "c" * 40,
         "candidates": ["c" * 40],
         "oracle": {"c" * 40: "pass" if verified else "fail"},
+        "pristine_checkers": {"status": "pass", "failing_modules": []},
+        "altered_checkers": [],
         "counts": {**ev._empty_counts(), **counts},
+        "unknown_counts": [],
         "usage": {key: dict(measured) for key in ev.MEASURES},
         "memory": {
             "stale_leaks": dict(memory),
@@ -100,8 +106,11 @@ def _record(
             "latency_ms": dict(memory),
         },
         "safety_failures": [],
+        "safety_assessed": True,
+        "safety_evidence": "the operator's check",
         "stopped_reason": "",
         "journal": "read",
+        "journal_problems": [],
         "volatile": {"run_id": "r", "wall_clock_seconds": dict(measured)},
     }
 
@@ -191,6 +200,7 @@ def test_an_arm_that_is_not_evaluated_names_what_it_needs():
         "status": "available",
         "requires": [],
         "comparison_role": "",
+        "seeded_experience": False,
     }
     assert arms[TREATMENT]["requires"] == [317, 333]
     assert all(arm["status"] == "not_evaluated" for arm in arms.values() if arm["id"] != BASELINE)
@@ -201,14 +211,7 @@ def test_an_arm_that_is_not_evaluated_names_what_it_needs():
 def test_the_pins_are_what_this_repositorys_history_holds():
     """Each base is its reference's parent, each hidden test exists there. An export has
     no history to read: the suite also runs where validation.commands run it."""
-    if not (REPO_ROOT / ".git").exists():
-        pytest.skip("no git history: run `python -m tests.evaluation verify-pins --git .`")
-    known = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "cat-file", "-e", ev.load_manifest()["tasks"][0]["base_sha"]],
-        capture_output=True,
-    )
-    if known.returncode != 0:
-        pytest.skip("a shallow clone holds no pinned commit")
+    _history_or_skip()
     problems = [
         problem
         for task in ev.load_manifest()["tasks"]
@@ -224,7 +227,12 @@ def test_every_pinned_task_was_verified_fair():
     tasks = {task["id"] for task in ev.load_manifest()["tasks"]}
     assert set(recorded["results"]) == tasks
     for result in recorded["results"].values():
-        assert result == {"base": "fail", "reference": "pass", "coupled_to_new_names": False}
+        assert result == {
+            "base": "fail",
+            "reference": "pass",
+            "coupled_to_new_names": False,
+            "lesson": "pass",
+        }
     selection = recorded["selection"]
     assert selection["eligible_commits"] == (
         len(tasks)
@@ -240,6 +248,16 @@ def test_each_task_verified_its_validation_passes_at_its_base():
     recorded = ev.read_json(ev.PIN_VERIFICATION)["base_suite"]
     manifest = ev.load_manifest()
     assert set(recorded["results"]) == set(ev.tasks_by_id(manifest))
+    assert set(recorded["results"].values()) == {"pass"}
+    assert "sandbox.mode" in recorded["limits"]
+
+
+def test_each_task_verified_its_pristine_checkers_pass_at_its_reference():
+    """The pristine suite is a candidate's source under the reference's `tests/`. Should the
+    reference itself not pass it, no candidate of any arm could. The recorded measurement
+    takes every task once, and says a run host must measure it again."""
+    recorded = ev.read_json(ev.PIN_VERIFICATION)["reference_suite"]
+    assert set(recorded["results"]) == set(ev.tasks_by_id(ev.load_manifest()))
     assert set(recorded["results"].values()) == {"pass"}
     assert "sandbox.mode" in recorded["limits"]
 
@@ -275,6 +293,127 @@ def test_a_summary_names_the_modules_that_failed():
         "tests/test_c.py passed\n1 failed in 1s\n"
     )
     assert ev.failing_modules(stdout) == ["tests/sub/test_b.py", "tests/test_a.py"]
+
+
+# -- what a Memory arm starts with -----------------------------------------------------------
+
+
+def test_every_task_holds_a_lesson_and_only_a_memory_arm_starts_with_it():
+    """A memory-dependent task means nothing to a Memory that starts empty, and a control
+    with an empty Memory would be no control. The plan prints what each run starts with, so
+    the seed is fixed before any run: the task's own lesson, or nothing."""
+    manifest, prereg = _manifest_with_memory(), ev.load_preregistration()
+    arms = ev.arms_by_id(manifest)
+    assert [arm for arm, held in arms.items() if not held["seeded_experience"]] == [BASELINE]
+    runs = ev.plan_runs("memory_benefit", manifest, prereg)["runs"]
+    tasks = ev.tasks_by_id(manifest)
+    assert len({run["task"] for run in runs}) == len(tasks) == 12
+    for run in runs:
+        lesson = tasks[run["task"]]["prior_experience"]["lesson"]
+        assert run["prior_experience"] == (lesson if run["arm"] == TREATMENT else None)
+        assert lesson not in tasks[run["task"]]["statement"]
+
+
+@pytest.mark.parametrize(
+    "spoil, problem",
+    [
+        (lambda task: task["prior_experience"].update(lesson=" "), "the lesson is empty"),
+        (
+            lambda task: task["prior_experience"].update(
+                lesson=f"See {ev.hidden_names(task)[0]}, which decides this."
+            ),
+            "the lesson gives away",
+        ),
+        (
+            lambda task: task["prior_experience"].update(
+                lesson=f"The fix was {task['reference_sha'][:12]}."
+            ),
+            "the lesson gives away",
+        ),
+        (
+            lambda task: task["prior_experience"].update(evidence_sha=task["reference_sha"]),
+            "evidence is the reference commit",
+        ),
+        (
+            lambda task: task["prior_experience"].update(evidence_sha="abc"),
+            "evidence_sha is no full SHA",
+        ),
+        (
+            lambda task: task["prior_experience"].update(evidence_test="tests/test_engine.py"),
+            "evidence_test names no test",
+        ),
+        (
+            lambda task: task["prior_experience"].update(lesson="x" * 2000),
+            "more than twice its match's length",
+        ),
+    ],
+    ids=["empty", "hidden-test", "reference-sha", "the-reference", "short-sha", "no-test", "long"],
+)
+def test_a_lesson_that_could_not_seed_a_memory_is_refused(spoil, problem):
+    manifest = ev.load_manifest()
+    spoil(manifest["tasks"][0])
+    assert any(problem in found for found in ev.manifest_problems(manifest))
+
+
+def test_an_arm_seeded_otherwise_than_its_memory_says_is_refused():
+    manifest = ev.load_manifest()
+    ev.arms_by_id(manifest)[BASELINE]["seeded_experience"] = True
+    assert any("only an arm with Issue Memory" in p for p in ev.manifest_problems(manifest))
+
+
+def _history_or_skip() -> None:
+    if not (REPO_ROOT / ".git").exists():
+        pytest.skip("no git history: run `python -m tests.evaluation verify-pins --git .`")
+    known = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "cat-file", "-e", ev.load_manifest()["tasks"][0]["base_sha"]],
+        capture_output=True,
+    )
+    if known.returncode != 0:
+        pytest.skip("a shallow clone holds no pinned commit")
+
+
+def test_a_lesson_must_be_earlier_than_its_base_and_must_not_copy_the_fix():
+    """Earlier: evidence past the base would be what this very run could teach. Not the
+    answer: a line the reference commit added is the fix, whichever words surround it."""
+    _history_or_skip()
+    task = ev.tasks_by_id(ev.load_manifest())["fix-entry-retarget"]
+    assert ev.verify_pin_lesson(str(REPO_ROOT), task) == []
+
+    later = copy.deepcopy(task)
+    later["prior_experience"]["evidence_sha"] = task["reference_sha"]
+    assert any("not at or before" in p for p in ev.verify_pin_lesson(str(REPO_ROOT), later))
+
+    absent = copy.deepcopy(task)
+    absent["prior_experience"]["evidence_test"] = "tests/test_engine.py::test_no_such_test"
+    assert any("defines no" in p for p in ev.verify_pin_lesson(str(REPO_ROOT), absent))
+
+    diff = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "diff", "-U0", task["base_sha"], task["reference_sha"]]
+        + ["--", "src/"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    line = next(
+        added[1:].strip()
+        for added in diff.splitlines()
+        if added.startswith("+") and not added.startswith("+++") and len(added.strip()) > 30
+    )
+    copying = copy.deepcopy(task)
+    copying["prior_experience"]["lesson"] += f" Write: {line}"
+    assert any("copies the fix" in p for p in ev.verify_pin_lesson(str(REPO_ROOT), copying))
+
+
+def test_a_run_that_did_not_start_with_its_tasks_lesson_leaves_no_result():
+    """Memory that held something else, or an unseeded arm that held anything, is another
+    intervention than the one registered: no result, in either direction."""
+    manifest, prereg, records = _world()
+    next(r for r in records if r["arm"] == TREATMENT)["prior_experience"] = "0" * 64
+    other = _decide(manifest, prereg, records)
+    assert other["decision"] == ev.NOT_EVALUATED and "prior experience" in other["why"]
+
+    manifest, prereg, records = _world()
+    next(r for r in records if r["arm"] == BASELINE)["prior_experience"] = "0" * 64
+    assert _decide(manifest, prereg, records)["decision"] == ev.NOT_EVALUATED
 
 
 # -- what the arms hold equal ----------------------------------------------------------------
@@ -527,9 +666,239 @@ def test_no_effect_is_no_go_and_a_doubtful_one_is_inconclusive():
     assert doubtful["decision"] == ev.INCONCLUSIVE
 
 
+def _one_pair(manifest: dict, prereg: dict, *, treated_verified: bool, **treated_counts) -> list:
+    """The first memory-dependent task's first seed, on both arms, and nothing else."""
+    task = next(t for t in manifest["tasks"] if t["memory_class"] == "memory_dependent")
+    return [
+        _record(manifest, prereg, task, 1, BASELINE, verified=False),
+        _record(manifest, prereg, task, 1, TREATMENT, verified=treated_verified, **treated_counts),
+    ]
+
+
+def test_an_incomplete_sample_reaches_no_primary_conclusion():
+    """One pair without an effect and 35 with no record say nothing of the effect: the
+    registered rule is that a planned pair with no record leaves the comparison inconclusive,
+    and it comes before the primary is read, or stopping early could decide it."""
+    manifest, prereg = _manifest_with_memory(), ev.load_preregistration()
+    result = _decide(manifest, prereg, _one_pair(manifest, prereg, treated_verified=False))
+    assert result["primary"]["verdict"] == "fail"
+    assert len(result["missing"]) == 35
+    assert result["decision"] == ev.INCONCLUSIVE
+    assert "35 planned pair(s) have no record" in result["why"]
+
+
+def test_too_many_exclusions_reach_no_primary_conclusion():
+    manifest, prereg, records = _world(treated_verified=lambda task, seed: False)
+    tasks = ev.tasks_by_id(manifest)
+    swept = [
+        ev.not_run_record(
+            tasks[record["task"]],
+            TREATMENT,
+            record["seed"],
+            "infra_failure",
+            "the host went away",
+            ev.digest(manifest),
+            ev.digest(prereg),
+        )
+        if record["arm"] == TREATMENT and record["memory_class"] == "memory_independent"
+        else record
+        for record in records
+    ]
+    result = _decide(manifest, prereg, swept)
+    assert result["primary"]["verdict"] == "fail"
+    assert result["decision"] == ev.INCONCLUSIVE and "over the bound" in result["why"]
+
+
+def test_observed_harm_still_decides_an_incomplete_sample():
+    """What was seen to go wrong does not wait for the rest of the plan: a safety failure
+    or a value wholly past its margin is NO_GO however few pairs there are."""
+    manifest, prereg = _manifest_with_memory(), ev.load_preregistration()
+    unsafe = _one_pair(manifest, prereg, treated_verified=True)
+    unsafe[1]["safety_failures"] = ["an agent merged"]
+    result = _decide(manifest, prereg, unsafe)
+    assert result["decision"] == ev.NO_GO and "safety_failures" in result["why"]
+    harmed = _decide(
+        manifest, prereg, _one_pair(manifest, prereg, treated_verified=True, lost_success=1)
+    )
+    assert harmed["decision"] == ev.NO_GO and "lost_success" in harmed["why"]
+
+
+def test_two_records_of_one_planned_run_leave_no_result_whichever_comes_first():
+    """Keeping the last record would let the order of the arguments choose an arm's score,
+    and let a failed attempt and its cost vanish. Nobody may choose between them afterwards,
+    and neither disappears from the report."""
+    manifest, prereg, records = _world()
+    planned = next(r for r in records if r["arm"] == TREATMENT and r["outcome"] == ev.VERIFIED)
+    failed = copy.deepcopy(planned)
+    failed["outcome"] = "failed"
+    first = _decide(manifest, prereg, [failed, *records])
+    second = _decide(manifest, prereg, [*records, failed])
+    for result in (first, second):
+        assert result["decision"] == ev.NOT_EVALUATED
+        assert "1 planned run(s) have more than one record" in result["why"]
+        assert result["repeated_runs"] == [
+            {
+                "arm": TREATMENT,
+                "task": planned["task"],
+                "seed": planned["seed"],
+                "outcomes": ["failed", ev.VERIFIED],
+            }
+        ]
+    report = ev.build_report([failed, *records], manifest, prereg, harness_report=_COVERED)
+    assert failed in report["model_quality"]["runs"] and planned in report["model_quality"]["runs"]
+    assert f"repeated {TREATMENT} on {planned['task']}" in ev.render(report)
+
+
+def test_a_repeat_of_another_contrasts_arm_does_not_touch_this_one():
+    manifest, prereg, records = _world()
+    other = copy.deepcopy(records[0])
+    other["arm"] = "fixed_role_multi_agent_issue_memory"
+    result = _decide(manifest, prereg, [*records, other, other])
+    assert result["decision"] == ev.GO
+
+
+@pytest.mark.parametrize("ceiling", ev.CEILING_OUTCOMES)
+def test_a_run_stopped_at_a_ceiling_is_inconclusive_and_keeps_what_it_spent(ceiling):
+    """As registered: a ceiling reached leaves the comparison incomplete. The pair stays, as
+    a run that did not succeed, with its settings and what it cost."""
+    manifest, prereg, records = _world()
+    stopped = next(r for r in records if r["arm"] == TREATMENT)
+    stopped["outcome"] = ceiling
+    stopped["stopped_reason"] = "the bill passed the ceiling"
+    stopped["usage"]["cost_usd"]["value"] = 12.5
+    result = _decide(manifest, prereg, records)
+    assert result["decision"] == ev.INCONCLUSIVE and "reached a ceiling" in result["why"]
+    assert result["pairs"] == 36 and result["excluded"] == []
+    assert result["ceiling_stopped"] == [
+        {
+            "arm": TREATMENT,
+            "task": stopped["task"],
+            "seed": stopped["seed"],
+            "ceiling": ceiling,
+            "cost_usd": 12.5,
+            "wall_clock_seconds": 1.0,
+            "reason": "the bill passed the ceiling",
+        }
+    ]
+    report = ev.build_report(records, manifest, prereg, harness_report=_COVERED)
+    rendered = ev.render(report)
+    assert f"{stopped['task']} seed {stopped['seed']} {TREATMENT}: {ceiling}" in rendered
+    assert "cost 12.5 (measured)" in rendered and "the bill passed the ceiling" in rendered
+
+
+@pytest.mark.parametrize("ceiling", ev.CEILING_OUTCOMES)
+def test_a_run_never_started_for_a_ceiling_is_inconclusive_never_unequal_settings(ceiling):
+    """No state directory, so nothing is known of its settings. That is no inequality: it
+    must not turn an incomplete comparison into one that broke its own terms."""
+    manifest, prereg, records = _world()
+    planned = next(r for r in records if r["arm"] == TREATMENT)
+    task = ev.tasks_by_id(manifest)[planned["task"]]
+    replaced = ev.not_run_record(
+        task,
+        TREATMENT,
+        planned["seed"],
+        ceiling,
+        "the comparison's ceiling was reached",
+        ev.digest(manifest),
+        ev.digest(prereg),
+    )
+    records[records.index(planned)] = replaced
+    result = _decide(manifest, prereg, records)
+    assert result["decision"] == ev.INCONCLUSIVE
+    assert "reached a ceiling" in result["why"]
+    assert result["ceiling_stopped"][0]["cost_usd"] is None
+
+
+@pytest.mark.parametrize(
+    "spoil",
+    [
+        lambda r: r["usage"]["cost_usd"].update(value=26.0),
+        lambda r: r["usage"]["cost_usd"].update(value=None, provenance=ev.UNKNOWN, known_part=26.0),
+        lambda r: r["volatile"]["wall_clock_seconds"].update(value=8 * 3600 + 1),
+    ],
+    ids=["cost", "known-part-of-a-cost", "wall-clock"],
+)
+def test_a_run_measured_past_a_ceiling_is_inconclusive_though_nobody_said_so(spoil):
+    manifest, prereg, records = _world()
+    spoil(next(r for r in records if r["arm"] == TREATMENT))
+    result = _decide(manifest, prereg, records)
+    assert result["decision"] == ev.INCONCLUSIVE and "reached a ceiling" in result["why"]
+
+
+def test_harm_outweighs_a_ceiling():
+    manifest, prereg, records = _world()
+    stopped = next(r for r in records if r["arm"] == TREATMENT)
+    stopped["outcome"] = "cost_ceiling"
+    stopped["safety_failures"] = ["an agent merged"]
+    assert _decide(manifest, prereg, records)["decision"] == ev.NO_GO
+
+
+def test_an_unassessed_safety_gate_is_unknown_and_rules_out_go():
+    """An empty list of safety failures may only mean nobody looked: the gate needs someone
+    to say they looked."""
+    manifest, prereg, records = _world()
+    next(r for r in records if r["arm"] == TREATMENT)["safety_assessed"] = False
+    result = _decide(manifest, prereg, records)
+    gate = next(g for g in result["hard_gates"] if g["gate"] == "safety_failures")
+    assert gate["verdict"] == "unknown" and "1 run(s)" in gate["why"]
+    assert result["decision"] == ev.INCONCLUSIVE and "safety_failures" in result["why"]
+
+
+def test_a_found_safety_failure_is_no_go_whether_or_not_the_rest_was_assessed():
+    manifest, prereg, records = _world()
+    record = next(r for r in records if r["arm"] == TREATMENT)
+    record["safety_assessed"], record["safety_failures"] = False, ["an agent merged"]
+    assert _decide(manifest, prereg, records)["decision"] == ev.NO_GO
+
+
+@pytest.mark.parametrize(
+    "metric", ["review_fix_cycles", "repeated_failed_approaches", "human_blocked_interventions"]
+)
+def test_a_lost_launch_line_leaves_its_counts_unknown_and_rules_out_go(metric):
+    """A count from a log that lost a launch may be short. It reads as unknown, never as the
+    zero it would be, and the run's log is named in the decision."""
+    manifest, prereg, records = _world()
+    lost = next(r for r in records if r["arm"] == TREATMENT)
+    lost["journal_problems"] = ["1 step(s) have no line in the run log, 003-review-1 first"]
+    lost["unknown_counts"] = sorted(ev.JOURNAL_COUNTS)
+    result = _decide(manifest, prereg, records)
+    verdicts = {c["metric"]: c for c in result["non_regression"]}
+    assert verdicts[metric]["verdict"] == "unknown"
+    assert verdicts[metric]["provenance"][ev.UNKNOWN] == 1
+    assert result["decision"] == ev.INCONCLUSIVE and "run(s) is incomplete" in result["why"]
+    report = ev.build_report(records, manifest, prereg, harness_report=_COVERED)
+    uncertainty = report["model_quality"]["uncertainty"]
+    assert uncertainty["incomplete_run_logs"] == 1
+    assert uncertainty["unknown_counts"][metric] == 1
+
+
+@pytest.mark.parametrize(
+    "status, decision, why",
+    [
+        ("unknown", ev.INCONCLUSIVE, "settings of 1 run(s) are unknown"),
+        ("mismatch", ev.NOT_EVALUATED, "other settings than its record states"),
+    ],
+)
+def test_settings_a_run_cannot_show_rule_out_go(status, decision, why):
+    manifest, prereg, records = _world()
+    next(r for r in records if r["arm"] == TREATMENT)["settings_evidence"] = {
+        "status": status,
+        "problems": ["the run recorded no configuration"],
+    }
+    result = _decide(manifest, prereg, records)
+    assert result["decision"] == decision and why in result["why"]
+
+
+def test_a_leak_nobody_could_rule_out_rules_out_go():
+    manifest, prereg, records = _world()
+    next(r for r in records if r["arm"] == BASELINE)["unknown_counts"] = ["hidden_leaks"]
+    result = _decide(manifest, prereg, records)
+    assert result["decision"] == ev.INCONCLUSIVE and "run(s) is incomplete" in result["why"]
+
+
 def test_a_run_that_failed_stays_in_the_denominator():
-    """No cherry-picking: a BLOCKED, timed-out or cost-capped run counts as what it is,
-    a run that did not succeed. Only who stopped it from outside leaves the denominator."""
+    """No cherry-picking: a BLOCKED or timed-out run counts as what it is, a run that did
+    not succeed. Only who stopped it from outside leaves the denominator."""
     manifest, prereg, records = _world()
     for record in records:
         if record["arm"] == TREATMENT:
@@ -641,6 +1010,17 @@ def test_a_fixture_record_may_not_say_it_measured_anything():
         ev.build_report([record], manifest, prereg)
 
 
+def test_a_record_that_leaves_something_unsaid_is_refused_never_read_as_clean():
+    manifest, prereg = _manifest_with_memory(), ev.load_preregistration()
+    record = _record(manifest, prereg, manifest["tasks"][0], 1, BASELINE)
+    del record["safety_assessed"], record["unknown_counts"]
+    problems = ev.record_problems(record)
+    assert "safety_assessed is not stated" in problems
+    assert "unknown_counts is not stated" in problems
+    with pytest.raises(ev.EvaluationError, match="safety_assessed is not stated"):
+        ev.build_report([record], manifest, prereg)
+
+
 @pytest.mark.parametrize(
     "field, value, problem",
     [
@@ -663,9 +1043,13 @@ def test_a_run_that_did_not_finish_says_why():
         ev.not_run_record(task, BASELINE, 1, "skipped", " ", "m", "p")
     with pytest.raises(ev.EvaluationError, match="--stopped-by"):
         ev.not_run_record(task, BASELINE, 1, "because", "x", "m", "p")
-    assert ev.not_run_record(task, BASELINE, 1, "cost_ceiling", "spent", "m", "p")["usage"][
-        "cost_usd"
-    ] == {"value": None, "provenance": ev.UNKNOWN}
+    never_run = ev.not_run_record(task, BASELINE, 1, "cost_ceiling", "spent", "m", "p")
+    assert never_run["usage"]["cost_usd"] == {"value": None, "provenance": ev.UNKNOWN}
+    assert never_run["run_evidence"] is False and never_run["settings_digest"] == ""
+    assert never_run["settings_evidence"]["status"] == "unknown"
+    assert set(never_run["unknown_counts"]) == set(ev.COUNTS)
+    assert never_run["safety_assessed"] is False
+    assert ev.record_problems(never_run) == []
 
 
 def _collect_args(out: Path, **overrides) -> list[str]:
@@ -790,6 +1174,65 @@ def test_the_plan_launches_nothing_and_is_fixed_before_any_run(capsys, monkeypat
 
 
 @pytest.mark.parametrize(
+    "path, removed, new, altered",
+    [
+        ("tests/conftest.py", 0, False, True),
+        ("tests/fixtures/state_protocol_12/a.json", 0, False, True),
+        ("tests/fixtures/new.json", 0, True, True),
+        ("conftest.py", 0, True, True),
+        ("pytest.ini", 0, True, True),
+        ("setup.cfg", 0, True, True),
+        ("pyproject.toml", 1, False, True),
+        ("Makefile", 0, False, True),
+        (".github/workflows/ci.yml", 1, False, True),
+        ("tests/test_never_hidden.py", 1, False, True),
+        ("tests/test_never_hidden.py", None, False, True),
+        ("tests/claude_fake.py", 0, False, True),
+        ("tests/sub/conftest.py", 0, True, True),
+        ("tests/test_never_hidden.py", 0, False, False),
+        ("tests/test_a_new_module.py", 0, True, False),
+        ("tests/AGENTS.md", 2, False, False),
+        ("src/autoforge/engine.py", 40, False, False),
+        ("docs/usage.md", 3, False, False),
+    ],
+)
+def test_every_real_task_holds_its_checkers(path, removed, new, altered):
+    """Against the real manifest: what decides validation may not change, whichever task it
+    is. A new test or a line added to a test module is what a good candidate does, so those
+    fall to the pristine suite, which sees what an added line can do."""
+    for task in ev.load_manifest()["tasks"]:
+        change = ev.FileChange(path, removed, new)
+        assert ev.checker_alterations([change], task) == ([path] if altered else []), task["id"]
+
+
+def test_an_edit_to_a_file_the_reference_edited_is_left_to_the_pristine_suite():
+    """A correct candidate may have to change an existing assertion the reference changed
+    too, so a text rule cannot refuse it. Conftest stays protected even for the one task whose
+    reference edited it: the overlay lays that copy over what the hidden tests see."""
+    task = ev.tasks_by_id(ev.load_manifest())["google-api-key-redaction"]
+    edit = ev.FileChange("tests/test_redaction.py", 3, False)
+    assert ev.checker_alterations([edit], task) == []
+    conftest = ev.FileChange("tests/conftest.py", 0, False)
+    assert ev.checker_alterations([conftest], task) == ["tests/conftest.py"]
+
+
+def test_a_task_that_leaves_a_checker_unprotected_is_refused():
+    manifest = ev.load_manifest()
+    manifest["tasks"][0]["protected_paths"].remove("tests/fixtures/")
+    assert any("protected_paths leaves out" in p for p in ev.manifest_problems(manifest))
+
+
+def test_the_fixtures_protect_what_the_real_tasks_protect():
+    """The negative fixtures exercise the rule a real task is held to, not one of their own."""
+    fixtures = ev.read_json(ev.FIXTURES / "fixture_tasks.json")
+    for name, base in fixtures["bases"].items():
+        assert base["protected_paths"] == list(ev.PROTECTED_PATHS), name
+    assert {tuple(t["protected_paths"]) for t in ev.load_manifest()["tasks"]} == {
+        ev.PROTECTED_PATHS
+    }
+
+
+@pytest.mark.parametrize(
     "changed, protected, expected",
     [
         (["src/a.py"], ["tests/conftest.py"], False),
@@ -800,6 +1243,68 @@ def test_the_plan_launches_nothing_and_is_fixed_before_any_run(capsys, monkeypat
 )
 def test_a_protected_path_is_an_exact_path_or_a_directory(changed, protected, expected):
     assert ev.touches_protected(changed, protected) is expected
+
+
+def test_the_documented_report_publishes_every_real_run_and_every_tasks_uncertainty(
+    capsys, tmp_path, monkeypatch
+):
+    """The command the protocol says to post in full: each run's outcome, reasons and usage
+    provenance, each criterion's interval, what left the sample, and every task, including one
+    with no pair at all. Failures are in it, not only the summary counts."""
+    manifest, prereg, records = _world()
+    tasks = ev.tasks_by_id(manifest)
+    failed = next(r for r in records if r["arm"] == TREATMENT and r["seed"] == 1)
+    failed["outcome"], failed["unverified_reasons"] = ev.UNVERIFIED, ["oracle_failed"]
+    failed["usage"]["context_tokens"] = {"value": None, "provenance": ev.UNKNOWN}
+    failed["usage"]["cost_usd"] = {"value": None, "provenance": ev.UNKNOWN, "known_part": 3.5}
+    victim = next(r for r in records if r["arm"] == TREATMENT and r["seed"] == 2)
+    excluded = ev.not_run_record(
+        tasks[victim["task"]],
+        TREATMENT,
+        2,
+        "service_unavailable",
+        "the API was down",
+        ev.digest(manifest),
+        ev.digest(prereg),
+    )
+    records[records.index(victim)] = excluded
+    gone = next(
+        t for t in manifest["tasks"] if t["id"] != failed["task"] and t["id"] != victim["task"]
+    )
+    records = [r for r in records if not (r["task"] == gone["id"] and r["arm"] == BASELINE)]
+
+    report = ev.build_report(records, manifest, prereg, harness_report=_COVERED)
+    runs = report["model_quality"]["runs"]
+    assert failed in runs and excluded in runs and len(runs) == len(records)
+    (contrast,) = report["model_quality"]["comparisons"]["memory_benefit"]
+    rows = {row["task"]: row for row in contrast["per_task"]}
+    assert set(rows) == set(tasks)
+    assert rows[gone["id"]]["seeds"] == 0 and rows[gone["id"]]["missing_seeds"] == 3
+    assert rows[gone["id"]]["effect"] is None
+    assert rows[victim["task"]]["excluded_seeds"] == 1
+    row = rows[failed["task"]]
+    assert row["treatment_outcomes"][ev.UNVERIFIED] == 1
+    assert row["unknown_usage"]["context_tokens"] == 1
+    assert row["seed_range"][0] <= row["effect"] <= row["seed_range"][1]
+
+    paths = []
+    for index, record in enumerate(records):
+        paths.append(tmp_path / f"{index}.json")
+        paths[-1].write_text(json.dumps(record), encoding="utf-8")
+    harness = tmp_path / "harness.json"
+    harness.write_text(json.dumps(_COVERED), encoding="utf-8")
+    monkeypatch.setattr(ev, "load_manifest", lambda: manifest)
+    assert ev.main(["report", *map(str, paths), "--harness-report", str(harness)]) == 0
+    out = capsys.readouterr().out
+    assert f"{failed['task']} seed 1 {TREATMENT}: {ev.UNVERIFIED} (oracle_failed)" in out
+    assert "cost None (unknown, at least 3.5)" in out
+    assert f"excluded {victim['task']} seed 2" in out and "the API was down" in out
+    assert f"no record {gone['id']} seed 1" in out
+    assert "primary verified_success on memory_dependent:" in out and "interval [" in out
+    assert "non-regression context_tokens on all: unknown" in out
+    assert "gate safety_failures:" in out
+    assert f"task {gone['id']} (" in out and "0 of 3 seeds" in out
+    assert "known part of unknown costs 3.5" in out
 
 
 # -- never a benchmark in CI, in planning or by accident -------------------------------------

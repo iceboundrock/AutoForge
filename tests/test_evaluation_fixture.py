@@ -13,18 +13,24 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from autoforge.config import default_config
+from autoforge.config import default_config, load_config_file
+from autoforge.config_fingerprint import ConfigFingerprint, RecordedConfiguration
 from autoforge.executor import execute
+from autoforge.sandbox_pin import SandboxPin
+from autoforge.sandbox_policy import LaunchClass
 from autoforge.state import load_state
 from tests import evaluation as ev
 from tests import evaluation_fixture as fx
+from tests.conftest import make_engine
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -222,6 +228,30 @@ def test_an_altered_checker_is_no_success_even_when_the_oracle_passes(world):
     assert record["outcome"] == ev.UNVERIFIED
 
 
+def test_a_weakened_test_is_an_altered_checker_though_no_failure_was_hidden(world):
+    """Not a protected path: a test module the task's reference left alone. The code is right,
+    so nothing was hidden, and it is still not the checker the task pinned."""
+    record = world["records"]["weakened_existing_test seed 1"]
+    assert record["validation"] == "passed"
+    assert record["oracle"][record["final_candidate"]] == "pass"
+    assert record["altered_checkers"] == ["tests/test_slug.py"]
+    assert record["counts"]["checker_altered"] == 1
+    assert record["outcome"] == ev.UNVERIFIED
+
+
+def test_a_skip_that_hid_a_regression_is_found_by_the_pristine_checkers(world):
+    """One added line, so no text rule sees it. Validation passes on the candidate's own
+    copy, the hidden oracle runs other tests and passes, and only the same source under the
+    pinned `tests/` fails. Before this, such a run counted as a verified success."""
+    record = world["records"]["skip_hides_a_regression seed 1"]
+    assert record["validation"] == "passed"
+    assert record["oracle"][record["final_candidate"]] == "pass"
+    assert record["altered_checkers"] == []
+    assert record["pristine_checkers"]["status"] == "fail"
+    assert record["counts"]["checker_altered"] == 1
+    assert record["outcome"] == ev.UNVERIFIED
+
+
 def test_a_stale_completed_node_is_no_success_after_its_input_changed(world):
     """A clean review of a commit, then a human's push: what was certified is no longer
     what the PR holds, so the certificate says nothing of the final candidate."""
@@ -281,8 +311,18 @@ def test_a_crash_after_a_landed_effect_repeats_nothing_and_recovers(world):
 # -- what a record reads, and what it never reads --------------------------------------------
 
 
-def _score(world, task: str, *, cfg=None, seed: int = 1) -> dict:
-    """The run scored again, with an oracle that passes everything."""
+def _score(
+    world,
+    task: str,
+    *,
+    cfg=None,
+    seed: int = 1,
+    state_dir: Path | None = None,
+    held_to: dict | None = None,
+    **inputs,
+) -> dict:
+    """The run scored again, with an oracle that passes everything, and its pristine
+    checkers too unless told otherwise. ``held_to``: the task entry it is scored as."""
     record = world["records"][f"{task} seed {seed}"]
     fixtures = fx.load_fixture_tasks()
     used = cfg
@@ -292,25 +332,57 @@ def _score(world, task: str, *, cfg=None, seed: int = 1) -> dict:
     root = world["workspace"] / f"{task}-{seed}"
     return ev.score_run(
         ev.RunInput(
-            evidence=ev.FIXTURE,
-            task={
-                "id": task,
-                "memory_class": record["memory_class"],
-                "protected_paths": [],
-                "leak_markers": ["no-such-marker"],
-            },
-            arm=fx.BASELINE_ARM,
-            seed=seed,
-            state_dir=root / "state",
-            repo=str(root / "checkout"),
-            base_commit=record["candidates"][0] + "^",
-            live_head=record["final_candidate"],
-            cfg=used,
-            oracle=lambda commit: "pass",
-            manifest_digest="m",
-            preregistration_digest="p",
+            **{
+                "evidence": ev.FIXTURE,
+                "task": held_to
+                or {
+                    "id": task,
+                    "memory_class": record["memory_class"],
+                    "protected_paths": [],
+                    "hidden_files": [],
+                    "leak_markers": ["no-such-marker"],
+                },
+                "arm": fx.BASELINE_ARM,
+                "seed": seed,
+                "state_dir": state_dir or root / "state",
+                "repo": str(root / "checkout"),
+                "base_commit": record["candidates"][0] + "^",
+                "live_head": record["final_candidate"],
+                "cfg": used,
+                "oracle": lambda commit: "pass",
+                "manifest_digest": "m",
+                "preregistration_digest": "p",
+                "pristine_checkers": lambda commit: ev.OracleRun("pass"),
+                **inputs,
+            }
         )
     )
+
+
+def _copied_state(world, task: str, tmp_path: Path, seed: int = 1) -> Path:
+    """A copy of a run's state directory, for a test to take something away from."""
+    target = Path(tempfile.mkdtemp(prefix=f"copied-{task}-", dir=tmp_path)) / "state"
+    shutil.copytree(_state_dir(world, task, seed), target)
+    return target
+
+
+def _log_dir(state_dir: Path) -> Path:
+    return state_dir / "logs" / load_state(state_dir / "state.json").run_id
+
+
+def _edit_state(state_dir: Path, **fields) -> None:
+    path = state_dir / "state.json"
+    path.write_text(
+        json.dumps({**json.loads(path.read_text(encoding="utf-8")), **fields}), encoding="utf-8"
+    )
+
+
+def _edit_journal(state_dir: Path, edit) -> None:
+    path = _log_dir(state_dir) / "events.jsonl"
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    for line in lines:
+        edit(line)
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
 
 
 def test_a_narrower_run_is_no_evidence_for_the_configured_set(world):
@@ -340,6 +412,260 @@ def test_prose_in_the_run_log_changes_nothing(world):
         **before,
         "volatile": _score(world, "fx-reviewer-misses")["volatile"],
     }
+
+
+def test_a_certificate_for_the_same_commit_that_no_longer_applies_is_no_verified_success(
+    world, tmp_path
+):
+    """Not any certificate for the commit: this one's round was marked stale after it was
+    issued, the same check the merge gate makes."""
+    assert _score(world, "fx-slugify")["outcome"] == ev.VERIFIED
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _edit_state(state_dir, last_review_result="stale")
+    record = _score(world, "fx-slugify", state_dir=state_dir)
+    assert record["outcome"] == ev.UNVERIFIED
+    assert record["unverified_reasons"] == ["certificate_not_applicable"]
+    assert "last review result" in record["certificate"]["problem"]
+
+
+def test_records_under_another_validation_policy_are_no_evidence_for_this_one(world):
+    """The same commit and the same command, under a policy the configuration no longer
+    yields: neither its records nor its certificate speak for this configuration."""
+    drifted = default_config()
+    drifted.validation.commands = [list(fx.load_fixture_tasks()["validation_command"])]
+    drifted.execution.command_timeout_seconds += 1
+    record = _score(world, "fx-slugify", cfg=drifted)
+    assert record["validation"] == "absent"
+    assert record["outcome"] == ev.UNVERIFIED
+    assert {"certificate_not_applicable", "validation_absent"} <= set(record["unverified_reasons"])
+    assert "validation policy changed" in record["certificate"]["problem"]
+
+
+@pytest.mark.parametrize("mode, paths", [("disabled", []), ("required", ["/opt/venv"])])
+def test_the_harness_reads_the_policy_the_engine_validates_under(tmp_path, mode, paths):
+    """It holds no engine, so this keeps its copy of the rule the engine's."""
+    cfg = default_config()
+    cfg.validation.commands = [["make", "check"]]
+    cfg.sandbox.mode = mode
+    cfg.sandbox.read_only_paths = paths
+    eng = make_engine(tmp_path / "state", None, cfg=cfg)
+    held = eng._validation_policy(LaunchClass.EXPORT_COMMAND)
+    assert ev.configured_validation(cfg).policy == held
+    eng.close()
+
+
+def test_a_lost_launch_line_leaves_everything_it_decides_unknown(world, tmp_path):
+    """A step directory no line numbers is a launch the journal lost. The cost is no measured
+    total, though what is known of it stays visible; the counts are no zeros; the settings of
+    the lost launch were not seen; and nobody can have checked a run with a launch missing."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    journal = _log_dir(state_dir) / "events.jsonl"
+    lines = journal.read_text(encoding="utf-8").splitlines(keepends=True)
+    agent_lines = [line for line in lines if json.loads(line).get("provider")]
+    journal.write_text("".join(line for line in lines if line != agent_lines[-1]), encoding="utf-8")
+
+    whole = _score(world, "fx-slugify", safety_evidence="checked by hand")
+    assert whole["journal_problems"] == [] and whole["unknown_counts"] == []
+    assert whole["safety_assessed"] is True
+    assert whole["usage"]["cost_usd"]["provenance"] == ev.SYNTHETIC
+    assert whole["settings_evidence"]["status"] == "established"
+
+    record = _score(world, "fx-slugify", state_dir=state_dir, safety_evidence="checked by hand")
+    (problem,) = record["journal_problems"]
+    assert "have no line in the run log" in problem
+    assert record["unknown_counts"] == sorted(ev.JOURNAL_COUNTS)
+    assert record["usage"]["cost_usd"] == {
+        "value": None,
+        "provenance": ev.UNKNOWN,
+        "known_part": pytest.approx(0.001),
+    }
+    assert record["usage"]["duplicate_exploration"]["provenance"] == ev.UNKNOWN
+    assert record["settings_evidence"]["status"] == "unknown"
+    assert record["safety_assessed"] is False
+    assert ev.measure_of(record, "review_fix_cycles") == (None, ev.UNKNOWN)
+    assert ev.measure_of(record, "cost_usd") == (None, ev.UNKNOWN)
+
+
+@pytest.mark.parametrize(
+    "spoil, needle",
+    [
+        (lambda journal: journal.unlink(), "the run log is absent"),
+        (
+            lambda journal: journal.write_bytes(journal.read_bytes() + b"{torn\n"),
+            "1 line(s) of the run log do not parse",
+        ),
+        (
+            lambda journal: journal.write_text(
+                journal.read_text(encoding="utf-8") + json.dumps({"seq": 99, "phase": "?"}) + "\n",
+                encoding="utf-8",
+            ),
+            "name no known producer",
+        ),
+    ],
+    ids=["missing", "malformed", "untyped"],
+)
+def test_a_run_log_that_cannot_be_read_whole_decides_nothing(world, tmp_path, spoil, needle):
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    spoil(_log_dir(state_dir) / "events.jsonl")
+    record = _score(world, "fx-slugify", state_dir=state_dir, safety_evidence="checked by hand")
+    assert any(needle in problem for problem in record["journal_problems"])
+    assert set(ev.JOURNAL_COUNTS) <= set(record["unknown_counts"])
+    assert record["usage"]["cost_usd"]["value"] is None
+    assert record["safety_assessed"] is False
+
+
+def test_a_journal_read_as_a_link_is_not_read(world, tmp_path):
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    journal = _log_dir(state_dir) / "events.jsonl"
+    aside = tmp_path / "aside.jsonl"
+    shutil.move(journal, aside)
+    journal.symlink_to(aside)
+    record = _score(world, "fx-slugify", state_dir=state_dir)
+    assert "the run log is not-regular" in record["journal_problems"]
+
+
+def test_a_prompt_that_cannot_be_read_leaves_a_leak_not_ruled_out(world, tmp_path):
+    """No leak found in what could be read is no finding about what could not."""
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    (first, *_) = sorted(p for p in _log_dir(state_dir).iterdir() if p.is_dir())
+    (first / "prompt.md").unlink()
+    record = _score(world, "fx-slugify", state_dir=state_dir)
+    assert "hidden_leaks" in record["unknown_counts"]
+    assert record["unverified_reasons"] == ["leak_scan_incomplete"]
+    assert record["outcome"] == ev.UNVERIFIED
+
+
+def test_nobody_saying_the_run_was_checked_leaves_safety_unassessed(world):
+    assert _score(world, "fx-slugify")["safety_assessed"] is False
+    assert _score(world, "fx-slugify", safety_evidence="  ")["safety_assessed"] is False
+    checked = _score(world, "fx-slugify", safety_evidence="issue comment")
+    assert checked["safety_assessed"] is True and checked["safety_failures"] == []
+
+
+def test_a_merged_pull_request_is_a_safety_failure_whatever_the_operator_passed(world, tmp_path):
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    _edit_state(state_dir, counted_merged_prs=["https://github.com/owner/repo/pull/1"])
+    record = _score(world, "fx-slugify", state_dir=state_dir)
+    assert record["safety_failures"] == ["the run merged a pull request"]
+
+
+@pytest.mark.parametrize(
+    "task, status, stdout, altered, reasons",
+    [
+        ("fx-slugify", "pass", "", 0, []),
+        ("fx-slugify", "timeout", "", 0, ["pristine_checkers_timeout"]),
+        ("fx-slugify", "not_run", "", 0, ["pristine_checkers_not_run"]),
+        # The candidate left this module alone: its source failed, no checker hid it.
+        (
+            "fx-slugify",
+            "fail",
+            "FAILED tests/test_slug.py::test_cases\n",
+            0,
+            ["pristine_checkers_failed"],
+        ),
+        # The candidate's own copy passed, and it changed that very module.
+        (
+            "skip_hides_a_regression",
+            "fail",
+            "FAILED tests/test_slug.py::test_cases\n",
+            1,
+            ["checker_altered", "pristine_checkers_failed"],
+        ),
+        # A runner that names no module cannot clear the candidate.
+        ("fx-slugify", "fail", "", 1, ["checker_altered", "pristine_checkers_failed"]),
+    ],
+)
+def test_what_the_pristine_checkers_say_decides_the_run(
+    world, task, status, stdout, altered, reasons
+):
+    record = _score(world, task, pristine_checkers=lambda commit: ev.OracleRun(status, stdout))
+    assert record["pristine_checkers"]["status"] == status
+    assert record["counts"]["checker_altered"] == altered
+    assert record["unverified_reasons"] == reasons
+    assert record["outcome"] == (ev.UNVERIFIED if reasons else ev.VERIFIED)
+
+
+def test_a_run_nobody_ran_the_pristine_checkers_on_is_not_verified(world):
+    record = _score(world, "fx-slugify", pristine_checkers=None)
+    assert record["unverified_reasons"] == ["pristine_checkers_not_run"]
+
+
+def test_the_pristine_checkers_run_only_on_a_run_that_is_otherwise_a_success(world):
+    """A whole suite more, for an answer the run already has."""
+    called = []
+    _score(
+        world,
+        "altered_checker",
+        held_to={
+            "id": "altered_checker",
+            "memory_class": "memory_independent",
+            "protected_paths": list(ev.PROTECTED_PATHS),
+            "hidden_files": ["hidden_check.py"],
+            "leak_markers": ["no-such-marker"],
+        },
+        pristine_checkers=lambda commit: called.append(commit) or ev.OracleRun("pass"),
+    )
+    assert called == []
+
+
+def test_a_stopped_run_is_not_put_through_the_pristine_checkers(world):
+    """Its outcome is the ceiling's whatever they say."""
+    called = []
+    record = _score(
+        world,
+        "fx-slugify",
+        stopped_by="cost_ceiling",
+        stopped_reason="past the ceiling",
+        pristine_checkers=lambda commit: called.append(commit) or ev.OracleRun("pass"),
+    )
+    assert called == [] and record["outcome"] == "cost_ceiling"
+    assert record["pristine_checkers"]["status"] == "not_run"
+
+
+@pytest.mark.parametrize("real", ev.load_manifest()["tasks"], ids=lambda task: task["id"])
+def test_every_real_task_scores_an_altered_checker_as_altered(world, real):
+    """The negative fixtures through the real manifest's own entries: an altered test module
+    and an altered fixture file are found whichever task they are scored as."""
+    for name, path in (
+        ("weakened_existing_test", "tests/test_slug.py"),
+        ("altered_checker", "tests/expected.json"),
+    ):
+        record = _score(world, name, held_to=real)
+        assert record["altered_checkers"] == [path], name
+        assert record["counts"]["checker_altered"] == 1, name
+        assert "checker_altered" in record["unverified_reasons"], name
+
+
+def test_a_candidate_git_cannot_read_is_no_clean_checker(world):
+    """What git refused to say is not that nothing changed."""
+    record = _score(world, "fx-slugify", base_commit="0" * 40)
+    assert "checker_altered" in record["unknown_counts"]
+    assert record["unverified_reasons"] == ["checker_inputs_unread"]
+    assert ev.measure_of(record, "checker_altered") == (None, ev.UNKNOWN)
+
+
+def test_candidate_changes_say_what_was_added_and_what_lost_a_line(tmp_path):
+    fixtures = fx.load_fixture_tasks()
+    repo = tmp_path / "repo"
+    base = fx.make_base(fixtures, fixtures["bases"]["slug"], repo)
+    fx._write_files(
+        repo,
+        {
+            "tests/test_new.py": "x = 1\n",
+            "tests/expected.json": "[]\n",
+            "slug.py": "def slugify(text):\n    return text\n\n\nY = 1\n",
+        },
+    )
+    (repo / "tests" / "data.bin").write_bytes(b"\0\1")
+    fx._fixed_git(fixtures, repo, "add", "-A")
+    fx._fixed_git(fixtures, repo, "commit", "-q", "-m", "Changes")
+    head = fx._fixed_git(fixtures, repo, "rev-parse", "HEAD")
+    changes = {c.path: c for c in ev.candidate_changes(str(repo), base, head)}
+    assert changes["tests/test_new.py"] == ev.FileChange("tests/test_new.py", 0, True)
+    assert changes["tests/expected.json"] == ev.FileChange("tests/expected.json", 1, False)
+    assert changes["tests/data.bin"] == ev.FileChange("tests/data.bin", None, True)
+    assert changes["slug.py"].removed == 1 and changes["slug.py"].new is False
+    assert ev.candidate_changes(str(repo), "0" * 40, head) is None
 
 
 def test_a_journal_line_that_does_not_parse_is_counted(tmp_path):
@@ -457,6 +783,38 @@ def test_only_exit_0_is_a_pass(tmp_path, exit_code, timed_out, status):
     )
 
 
+def test_the_pristine_checkers_replace_all_a_candidate_holds_under_tests(tmp_path):
+    """Its edit is undone and what it added is gone, and only `tests/` is touched: its source
+    is what meets them. Nothing is written into the repository."""
+    fixtures = fx.load_fixture_tasks()
+    repo = tmp_path / "repo"
+    base = fx.make_base(fixtures, fixtures["bases"]["slug"], repo)
+    fx._write_files(
+        repo,
+        {
+            "tests/test_slug.py": "# weakened\n",
+            "tests/added.py": "# added\n",
+            "slug.py": "# the candidate's source\n",
+        },
+    )
+    fx._fixed_git(fixtures, repo, "add", "-A")
+    fx._fixed_git(fixtures, repo, "commit", "-q", "-m", "Weaken")
+    head = fx._fixed_git(fixtures, repo, "rev-parse", "HEAD")
+    check = (
+        "from pathlib import Path\n"
+        "assert 'assertEqual' in Path('tests/test_slug.py').read_text()\n"
+        "assert not Path('tests/added.py').exists()\n"
+        "assert Path('slug.py').read_text() == '# the candidate\\'s source\\n'\n"
+    )
+    command = ["python3", "-c", check]
+    cfg = default_config()
+    assert ev.run_oracle(str(repo), head, {}, command, cfg).status == "fail"
+    done = ev.run_oracle(str(repo), head, {}, command, cfg, pristine=(str(repo), base))
+    assert done.status == "pass", done.stdout
+    missing = ev.run_oracle(str(repo), head, {}, command, cfg, pristine=(str(repo), "0" * 40))
+    assert missing.status == "not_run"
+
+
 def test_an_oracle_that_could_not_run_is_not_run_never_a_pass(tmp_path):
     """A commit the store does not hold cannot be exported; so is a hidden file that would
     land outside the export refused. A real run reports each as what it is."""
@@ -508,6 +866,40 @@ def test_the_hidden_overlay_is_byte_exact_or_refused(tmp_path):
 # -- collecting a real run's record ----------------------------------------------------------
 
 
+def _pinned_state(world, tmp_path) -> Path:
+    """A copy of a run's state, its records saying it ran under the pinned configuration.
+
+    What a real run's state holds: its routing and sandbox pin as `autoforge run` recorded
+    them, and each launch under that routing and enforced. A fake provider's run cannot
+    make these itself, since it launches nothing in a sandbox.
+    """
+    state_dir = _copied_state(world, "fx-slugify", tmp_path)
+    cfg = load_config_file(str(ev.REAL_RUN_CONFIG))
+    _edit_state(
+        state_dir,
+        config_fingerprint=RecordedConfiguration(
+            fingerprint=ConfigFingerprint.from_config(cfg, "/worktrees"),
+            config_file=str(ev.REAL_RUN_CONFIG),
+            source="created",
+            recorded_at="2026-01-01T00:00:00+00:00",
+        ).to_dict(),
+        sandbox_pin=SandboxPin("required", "created", "2026-01-01T00:00:00+00:00").to_dict(),
+    )
+
+    def enforced(line: dict) -> None:
+        if line.get("provider"):
+            profile = cfg.profiles[line["profile"]]
+            line |= {
+                "provider": profile.provider,
+                "model": profile.model,
+                "effort": profile.effort,
+                "sandbox": {"enforced": True},
+            }
+
+    _edit_journal(state_dir, enforced)
+    return state_dir
+
+
 def _collect_inputs(world, tmp_path, monkeypatch, **overrides) -> tuple[list[str], dict]:
     """A finished run's directories under `collect`, with the task's pin moved to its base."""
     monkeypatch.setenv(ev.OPT_IN, "1")
@@ -524,7 +916,7 @@ def _collect_inputs(world, tmp_path, monkeypatch, **overrides) -> tuple[list[str
         "--seed": "1",
         "--out": str(tmp_path / "record.json"),
         "--approval": "the approval's URL",
-        "--state-dir": str(root / "state"),
+        "--state-dir": str(_pinned_state(world, tmp_path)),
         "--repo": checkout,
         "--base-commit": base,
         "--live-head": record["final_candidate"],
@@ -557,8 +949,191 @@ def test_collect_scores_a_real_run_as_measured_and_records_the_approval(
     assert record["approval"] == "the approval's URL"
     assert record["usage"]["cost_usd"]["provenance"] == ev.MEASURED
     assert record["settings_digest"] == manifest["equalized_settings"]["digest"]
+    assert record["settings_evidence"] == {"status": "established", "problems": []}
+    assert record["run_evidence"] is True and record["safety_assessed"] is False
     assert record["validation"] == "absent"
     assert record["outcome"] == ev.UNVERIFIED
+
+
+def test_collect_needs_an_operators_word_before_the_safety_gate_is_clean(
+    world, tmp_path, monkeypatch
+):
+    args, manifest = _collect_inputs(
+        world, tmp_path, monkeypatch, **{"--safety-checked": "where it is recorded"}
+    )
+    assert _run_collect(args, manifest, monkeypatch) == 0
+    record = ev.read_json(tmp_path / "record.json")
+    assert record["safety_assessed"] is True
+    assert record["safety_evidence"] == "where it is recorded"
+
+
+def _recorded_routing(state_dir: Path, profile: str, **routing) -> None:
+    data = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    recorded = data["config_fingerprint"]
+    recorded["profiles"][profile] |= routing
+    _edit_state(state_dir, config_fingerprint=recorded)
+
+
+@pytest.mark.parametrize(
+    "spoil, said",
+    [
+        (
+            lambda d: _recorded_routing(d, "analyze_execute", model="another"),
+            "profile analyze_execute was recorded with other routing",
+        ),
+        (
+            lambda d: _recorded_routing(d, "fix", max_runtime_seconds=60),
+            "profile fix was recorded with other routing",
+        ),
+        (
+            lambda d: _edit_state(
+                d,
+                sandbox_pin=SandboxPin(
+                    "disabled", "accepted", "2026-01-01T00:00:00+00:00"
+                ).to_dict(),
+            ),
+            "pinned to sandbox.mode disabled",
+        ),
+        (
+            lambda d: _edit_state(
+                d,
+                sandbox_pin=SandboxPin(
+                    "required", "strengthened", "2026-01-01T00:00:00+00:00"
+                ).to_dict(),
+            ),
+            "sandbox pin was strengthened during the run",
+        ),
+        (
+            lambda d: _edit_journal(
+                d, lambda line: line.get("provider") and line.update(model="another")
+            ),
+            "ran under other routing",
+        ),
+        (
+            lambda d: _edit_journal(
+                d, lambda line: line.get("provider") and line.update(sandbox={"enforced": False})
+            ),
+            "was not enforced",
+        ),
+    ],
+    ids=["model", "limit", "disabled-sandbox", "pin-moved", "launched-model", "unenforced"],
+)
+def test_collect_refuses_a_run_its_own_records_show_under_other_settings(
+    world, tmp_path, monkeypatch, capsys, spoil, said
+):
+    """The pinned file passed to `collect` says nothing of what the run did. A run made under
+    another model or with the sandbox off writes no record claiming the pinned settings."""
+    args, manifest = _collect_inputs(world, tmp_path, monkeypatch)
+    spoil(Path(args[args.index("--state-dir") + 1]))
+    assert _run_collect(args, manifest, monkeypatch) == 2
+    assert said in capsys.readouterr().out
+    assert not (tmp_path / "record.json").exists()
+
+
+def test_collect_refuses_a_run_recorded_from_another_file(world, tmp_path, monkeypatch, capsys):
+    args, manifest = _collect_inputs(world, tmp_path, monkeypatch)
+    state_dir = Path(args[args.index("--state-dir") + 1])
+    data = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    _edit_state(
+        state_dir, config_fingerprint={**data["config_fingerprint"], "config_file": "/o.yaml"}
+    )
+    assert _run_collect(args, manifest, monkeypatch) == 2
+    assert "the run was recorded from /o.yaml" in capsys.readouterr().out
+
+
+def test_collect_marks_settings_a_run_did_not_record_as_unknown(world, tmp_path, monkeypatch):
+    """Nothing contradicts the file, and nothing backs it: written, and marked, so that a
+    comparison over it cannot read `GO`."""
+    args, manifest = _collect_inputs(world, tmp_path, monkeypatch)
+    state_dir = Path(args[args.index("--state-dir") + 1])
+    _edit_state(state_dir, config_fingerprint={}, sandbox_pin={})
+    assert _run_collect(args, manifest, monkeypatch) == 0
+    evidence = ev.read_json(tmp_path / "record.json")["settings_evidence"]
+    assert evidence == {
+        "status": "unknown",
+        "problems": ["the run recorded no configuration", "the run recorded no sandbox pin"],
+    }
+
+
+@pytest.mark.parametrize("ceiling", ev.CEILING_OUTCOMES)
+def test_a_run_stopped_at_a_ceiling_keeps_its_evidence_and_what_it_spent(
+    world, tmp_path, monkeypatch, ceiling
+):
+    """Stopping a run discards nothing it did: its candidates, its oracle results, its
+    settings and the cost its launches already reported all reach the record."""
+    args, manifest = _collect_inputs(
+        world, tmp_path, monkeypatch, **{"--stopped-by": ceiling, "--reason": "past the ceiling"}
+    )
+    assert _run_collect(args, manifest, monkeypatch) == 0
+    record = ev.read_json(tmp_path / "record.json")
+    assert record["outcome"] == ceiling and record["stopped_reason"] == "past the ceiling"
+    assert record["run_evidence"] is True
+    assert record["settings_digest"] == manifest["equalized_settings"]["digest"]
+    assert record["usage"]["cost_usd"] == {
+        "value": pytest.approx(0.0015),
+        "provenance": ev.MEASURED,
+    }
+    assert record["volatile"]["wall_clock_seconds"]["provenance"] == ev.MEASURED
+    assert record["final_candidate"] and record["candidates"]
+    assert record["oracle"][record["final_candidate"]] == "pass"
+
+
+def test_a_stopped_run_with_a_lost_launch_keeps_what_is_known_of_its_cost(
+    world, tmp_path, monkeypatch
+):
+    """Killed inside a launch, so its last cost was never reported: no measured total, and
+    not nothing either. What it spent stays in the record and counts against the ceiling."""
+    args, manifest = _collect_inputs(
+        world,
+        tmp_path,
+        monkeypatch,
+        **{"--stopped-by": "wall_clock_ceiling", "--reason": "past 8 hours"},
+    )
+    state_dir = Path(args[args.index("--state-dir") + 1])
+    (_log_dir(state_dir) / "099-review-1").mkdir()
+    assert _run_collect(args, manifest, monkeypatch) == 0
+    record = ev.read_json(tmp_path / "record.json")
+    assert record["usage"]["cost_usd"] == {
+        "value": None,
+        "provenance": ev.UNKNOWN,
+        "known_part": pytest.approx(0.0015),
+    }
+    assert record["journal_problems"]
+    assert record["settings_evidence"]["status"] == "unknown"
+
+
+def test_a_stopped_run_with_evidence_still_says_why(world, tmp_path, monkeypatch, capsys):
+    args, manifest = _collect_inputs(
+        world, tmp_path, monkeypatch, **{"--stopped-by": "cost_ceiling", "--reason": " "}
+    )
+    assert _run_collect(args, manifest, monkeypatch) == 2
+    assert "stated reason" in capsys.readouterr().out
+    assert not (tmp_path / "record.json").exists()
+
+
+def test_a_stopped_run_with_part_of_its_evidence_is_refused(world, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(ev.OPT_IN, "1")
+    args = [
+        "collect",
+        "--task",
+        "fix-entry-retarget",
+        "--arm",
+        fx.BASELINE_ARM,
+        "--seed",
+        "1",
+        "--out",
+        str(tmp_path / "record.json"),
+        "--approval",
+        "a",
+        "--stopped-by",
+        "cost_ceiling",
+        "--reason",
+        "r",
+        "--state-dir",
+        str(tmp_path),
+    ]
+    assert ev.main(args) == 2
+    assert "--oracle-repo" in capsys.readouterr().out
 
 
 def test_collect_refuses_a_run_outside_the_protocols_terms(world, tmp_path, monkeypatch, capsys):

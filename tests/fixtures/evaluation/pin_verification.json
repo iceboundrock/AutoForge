@@ -1,5 +1,5 @@
 {
-  "what": "python -m tests.evaluation verify-pins --git . --run-oracle, on the commit that added this file",
+  "what": "python -m tests.evaluation verify-pins --git . --run-oracle, on the commit that added each task's prior experience: each lesson's test at its evidence commit as well as each hidden test at its base and reference",
   "date": "2026-11-05",
   "host": {
     "python": "3.14.10",
@@ -12,61 +12,73 @@
     "c6-refusal-names-the-cache": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "claude-held-back-results": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "dry-run-prompt-placeholder": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "fix-entry-retarget": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "google-api-key-redaction": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "no-correction-with-a-survivor": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "opencode-recovered-errors": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "paginate-changed-files": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "prompt-version-refusal": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "redact-the-parsed-result": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "review-round-refused-by-reread": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     },
     "yaml-subset-errors-name-the-path": {
       "base": "fail",
       "coupled_to_new_names": false,
+      "lesson": "pass",
       "reference": "pass"
     }
   },
@@ -91,6 +103,24 @@
   "base_suite": {
     "what": "python -m tests.evaluation verify-pins --git . --base-suite --workers 6, twice: the first run's failing modules became each task's validation_ignore, and the second ran with them",
     "limits": "measured under sandbox.mode: disabled on 6 pytest-xdist workers on one host; a real run is serial under sandbox.mode: required, so its host must measure this again (docs/evaluation-protocol.md, section 9)",
+    "results": {
+      "c6-refusal-names-the-cache": "pass",
+      "claude-held-back-results": "pass",
+      "dry-run-prompt-placeholder": "pass",
+      "fix-entry-retarget": "pass",
+      "google-api-key-redaction": "pass",
+      "no-correction-with-a-survivor": "pass",
+      "opencode-recovered-errors": "pass",
+      "paginate-changed-files": "pass",
+      "prompt-version-refusal": "pass",
+      "redact-the-parsed-result": "pass",
+      "review-round-refused-by-reread": "pass",
+      "yaml-subset-errors-name-the-path": "pass"
+    }
+  },
+  "reference_suite": {
+    "what": "python -m tests.evaluation verify-pins --git . --reference-suite --workers 6: each task's validation at its reference commit, the one source the pristine checkers were pinned against",
+    "limits": "measured under sandbox.mode: disabled on 6 pytest-xdist workers on one host; a real run is serial under sandbox.mode: required, so its host must measure this again (docs/evaluation-protocol.md, section 9). In the first pass, with other test runs on the host, c6-refusal-names-the-cache failed tests/test_interaction.py; repeated with nothing else running, that module passed three times of three at both its commits and the whole validation passed, which is the result below, so this suite can fail on a loaded host",
     "results": {
       "c6-refusal-names-the-cache": "pass",
       "claude-held-back-results": "pass",

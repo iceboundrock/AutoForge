@@ -10,7 +10,7 @@ same way::
 
     uv run python -m tests.evaluation check
     uv run python -m tests.evaluation plan --comparison memory_benefit
-    uv run python -m tests.evaluation verify-pins --git . --run-oracle
+    uv run python -m tests.evaluation verify-pins --git . --run-oracle --reference-suite
     AUTOFORGE_EVAL_REAL=1 uv run python -m tests.evaluation collect ...
     uv run python -m tests.evaluation report RECORD.json ... [--json]
 
@@ -33,6 +33,11 @@ reported with every summary.
 allow-listed environment, the credential preflight and, under
 ``sandbox.mode: required``, the export-command sandbox. A refusal is
 ``not_run``, never a pass.
+
+**What a run's own records must say.** A record states settings the run's state
+file and run log show it ran under (:func:`settings_evidence`), and evidence the
+run log cannot back is ``unknown`` wherever it would have counted
+(:func:`run_log_problems`). Neither is ever assumed from what an operator passed.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ import json
 import os
 import random
 import re
+import shutil
 import statistics
 import sys
 from collections import Counter
@@ -52,6 +58,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from autoforge.certificate import Configured, certificate_problem
 from autoforge.child_env import (
     isolated_overrides,
     operator_home,
@@ -59,16 +66,47 @@ from autoforge.child_env import (
     preflight,
 )
 from autoforge.config import AutoForgeConfig, load_config_file
+from autoforge.config_fingerprint import (
+    FINGERPRINT_PROFILES,
+    SOURCE_CREATED,
+    SOURCE_UPGRADED,
+    RecordedConfiguration,
+    fingerprint_routing,
+)
 from autoforge.errors import AutoForgeError
-from autoforge.evidence import Outcome, definitions, parse_candidate
+from autoforge.evidence import (
+    NO_SANDBOX_TEMPLATE,
+    Outcome,
+    Policy,
+    applicable,
+    definitions,
+    parse_candidate,
+)
 from autoforge.executor import ExecutionRequest, execute, select_environment
 from autoforge.git_transport import local_git_request
+from autoforge.materialize import METHOD as MATERIALIZATION_METHOD
 from autoforge.premerge import export_commit_tree
+from autoforge.runlog import STEP_DIR_RE
 from autoforge.safefs import SafeRoot
-from autoforge.sandbox_policy import LaunchClass, LaunchFacts, NetworkPosition, describe_launch
+from autoforge.sandbox_pin import SandboxPin
+from autoforge.sandbox_policy import (
+    LaunchClass,
+    LaunchFacts,
+    NetworkPosition,
+    absolute_spelling,
+    describe_launch,
+    launch_template,
+    template_facts,
+)
 from autoforge.state import AutoForgeState, load_state
 from autoforge.transitions import Phase
-from tests.stop_corpus import _journal_bytes, _open_dir, launch_kind, operator_kind
+from tests.stop_corpus import (
+    _journal_bytes,
+    _open_dir,
+    bookkeeping_kind,
+    launch_kind,
+    operator_kind,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "evaluation"
 MANIFEST = FIXTURES / "manifest.json"
@@ -95,7 +133,10 @@ UNVERIFIED = "unverified_completion"
 # these leaves the denominator, listed and bounded (`max_excluded_pair_share`);
 # anything else stays in it as a run that did not succeed.
 EXCLUDED_OUTCOMES = ("infra_failure", "credentials_unavailable", "service_unavailable", "skipped")
-STOPPED_BY = (*EXCLUDED_OUTCOMES, "cost_ceiling")
+# A run an operator stopped at a registered ceiling. It stays in the denominator
+# as a run that did not succeed, and leaves its comparison incomplete.
+CEILING_OUTCOMES = ("cost_ceiling", "wall_clock_ceiling")
+STOPPED_BY = (*EXCLUDED_OUTCOMES, *CEILING_OUTCOMES)
 OUTCOMES = (VERIFIED, UNVERIFIED, "blocked", "failed", "timeout", "incomplete", *STOPPED_BY)
 
 STRATA = ("memory_dependent", "memory_independent", "all")
@@ -113,6 +154,16 @@ COUNTS = (
     "stale_completed_nodes",
     "hidden_leaks",
     "journal_bad_lines",
+)
+# The counts a run log's lines decide: with a line lost, each may be short.
+JOURNAL_COUNTS = (
+    "agent_launches",
+    "review_fix_cycles",
+    "repeated_failed_approaches",
+    "human_blocked_interventions",
+    "timeouts",
+    "truncations",
+    "lost_success",
 )
 # The per-run values whose provenance can be anything but what the harness saw.
 MEASURES = ("cost_usd", "context_tokens", "duplicate_exploration")
@@ -134,9 +185,46 @@ MEMORY_OVERHEAD = {
 }
 
 GO, NO_GO, INCONCLUSIVE, NOT_EVALUATED = "GO", "NO_GO", "INCONCLUSIVE", "NOT_EVALUATED"
+SETTINGS_STATUSES = ("established", "unknown", "mismatch")
+# What a report reads of a record beyond its counts and usage: said, or refused.
+RECORD_KEYS = (
+    "run_evidence",
+    "prior_experience",
+    "settings_digest",
+    "settings_evidence",
+    "certificate",
+    "pristine_checkers",
+    "altered_checkers",
+    "unknown_counts",
+    "safety_failures",
+    "safety_assessed",
+    "stopped_reason",
+    "journal",
+    "journal_problems",
+    "volatile",
+)
 # The seed of a smoke run: scored like any run, and outside every plan, so no
 # comparison ever pairs it.
 SMOKE_SEED = 0
+
+# Where a task's checkers live, here and in every fixture. A candidate may add to it
+# and may edit what its reference commit edited (checker_alterations).
+CHECKER_ROOT = "tests/"
+# What every task protects outright: a change to any of these changes what validation
+# decides, whichever test it runs.
+PROTECTED_PATHS = (
+    "tests/conftest.py",
+    "tests/fixtures/",
+    "conftest.py",
+    "pytest.ini",
+    "tox.ini",
+    "setup.cfg",
+    "pyproject.toml",
+    "Makefile",
+    ".github/",
+)
+# The most one lesson may outweigh its match's, so that a control's Memory is as full.
+LESSON_LENGTH_RATIO = 2
 
 # The tools whose repeated call is exploring the same thing again.
 READ_ONLY_TOOLS = frozenset({"read", "grep", "glob", "find", "ls"})
@@ -209,6 +297,8 @@ def manifest_problems(manifest: Mapping) -> list[str]:
             problems.append(f"{arm['id']} is not evaluated and names no missing feature")
         if arm["status"] not in ("available", "not_evaluated"):
             problems.append(f"{arm['id']} has status {arm['status']!r}")
+        if arm.get("seeded_experience") is not (333 in arm["requires"]):
+            problems.append(f"{arm['id']}: only an arm with Issue Memory starts with a lesson")
     ids = [task["id"] for task in manifest["tasks"]]
     if len(set(ids)) != len(ids):
         problems.append("a task id repeats")
@@ -234,7 +324,43 @@ def manifest_problems(manifest: Mapping) -> list[str]:
             problems.append(f"{name}: control_for is not mutual")
         elif other["memory_class"] == task["memory_class"]:
             problems.append(f"{name}: its match is of the same memory class")
+        else:
+            problems += _lesson_problems(task, other)
+        missing = [path for path in PROTECTED_PATHS if path not in task["protected_paths"]]
+        if missing:
+            problems.append(f"{name}: protected_paths leaves out {missing}")
     return problems
+
+
+def _lesson_problems(task: Mapping, match: Mapping) -> list[str]:
+    """Why a task's prior experience could not seed a Memory arm; empty when it could."""
+    name, prior = task["id"], task["prior_experience"]
+    problems = []
+    if not _FULL_SHA.fullmatch(prior["evidence_sha"]):
+        problems.append(f"{name}: evidence_sha is no full SHA")
+    if prior["evidence_sha"] == task["reference_sha"]:
+        problems.append(f"{name}: the lesson's evidence is the reference commit")
+    if not prior["evidence_test"].partition("::")[2]:
+        problems.append(f"{name}: evidence_test names no test")
+    lesson, other = prior["lesson"], match["prior_experience"]["lesson"]
+    if not lesson.strip():
+        problems.append(f"{name}: the lesson is empty")
+    leaks = [item for item in (*hidden_names(task), task["reference_sha"][:7]) if item in lesson]
+    if leaks:
+        problems.append(f"{name}: the lesson gives away {leaks}")
+    if len(lesson) > LESSON_LENGTH_RATIO * len(other):
+        problems.append(f"{name}: its lesson is more than twice its match's length")
+    return problems
+
+
+def prior_experience_digest(task: Mapping) -> str:
+    """What a seeded arm's Memory must hold when a run of ``task`` starts."""
+    return digest(task["prior_experience"])
+
+
+def seeded_digest(manifest: Mapping, arm: str, task: Mapping) -> str:
+    """The digest a record of ``arm`` on ``task`` must carry; ``""`` for an unseeded arm."""
+    return prior_experience_digest(task) if arms_by_id(manifest)[arm]["seeded_experience"] else ""
 
 
 def preregistration_problems(prereg: Mapping, manifest: Mapping) -> list[str]:
@@ -367,12 +493,30 @@ class RunInput:
     manifest_digest: str
     preregistration_digest: str
     safety_failures: tuple[str, ...] = ()
+    # Where the operator's check of this run's safety is recorded; "" when nobody says.
+    safety_evidence: str = ""
+    # The final candidate under the pristine checkers (run_oracle's ``pristine``).
+    pristine_checkers: Callable[[str], OracleRun] | None = None
+    # What an arm's Memory collector read of the lesson the run started with.
+    seeded_experience: str = ""
+    # Who stopped the run, when something other than its own verdict ended it.
+    stopped_by: str = ""
+    stopped_reason: str = ""
+    # The configuration file the run must have been recorded from; None: not compared.
+    config_file: str | None = None
+
+
+def _git_read(repo: str, *args: str) -> str | None:
+    """One hardened git read of ``repo``; ``None`` when git refuses it, or cuts it short."""
+    res = execute(local_git_request(["-C", repo, *args], timeout_seconds=120))
+    if res.exit_code != 0 or res.timed_out or res.stdout_truncated:
+        return None
+    return res.stdout or ""
 
 
 def _git(repo: str, *args: str) -> str:
     """One hardened git read of ``repo``; ``""`` when git refuses it."""
-    res = execute(local_git_request(["-C", repo, *args], timeout_seconds=120))
-    return res.stdout.strip() if res.exit_code == 0 and not res.timed_out else ""
+    return (_git_read(repo, *args) or "").strip()
 
 
 def _blob(repo: str, spec: str) -> bytes | None:
@@ -433,47 +577,93 @@ def _subdirectories(directory: Path) -> list[str]:
         return []
 
 
-def _bounded_files(state_dir: Path, relpaths: Sequence[str]) -> list[bytes]:
-    """Each file's bytes, read as a run log is: a link or an oversized file is left out."""
+def _step_directories(logs: Path) -> list[str]:
+    """The run log's step directories: only an entry of the shape the controller publishes."""
+    return [name for name in _subdirectories(logs) if STEP_DIR_RE.match(name)]
+
+
+def run_log_problems(
+    state_dir: Path, run_id: str, lines: Sequence[dict], bad: int, status: str
+) -> list[str]:
+    """Why the run log may not show every launch of the run; empty when it does.
+
+    A step directory is published before its line is appended (``runlog.py``), so a
+    directory no line numbers is a launch the journal lost: a crash inside it, or a
+    line torn or deleted since. What the journal shows then undercounts, and a cost
+    summed from it is a part, however well the other lines read.
+    """
+    problems = [] if status == "read" else [f"the run log is {status}"]
+    if bad:
+        problems.append(f"{bad} line(s) of the run log do not parse")
+    seqs = {line.get("seq") for line in lines}
+    lost = [
+        name
+        for name in _step_directories(state_dir / "logs" / run_id)
+        if int(name.partition("-")[0]) not in seqs
+    ]
+    if lost:
+        problems.append(f"{len(lost)} step(s) have no line in the run log, {lost[0]} first")
+    untyped = sum(
+        operator_kind(line) is None
+        or (
+            not operator_kind(line)
+            and not bookkeeping_kind(line)
+            and launch_kind(line) == "unknown"
+        )
+        for line in lines
+    )
+    if untyped:
+        problems.append(f"{untyped} line(s) of the run log name no known producer")
+    return problems
+
+
+def _bounded_files(state_dir: Path, relpaths: Sequence[str]) -> tuple[list[bytes], int]:
+    """Each file's bytes, read as a run log is, and how many could not be: a link, an
+    oversized file or one that went away is left out and counted, never read as empty."""
     root: SafeRoot = _open_dir(state_dir)
     try:
-        read = (_journal_bytes(root, relpath) for relpath in relpaths)
-        return [data for status, data in read if status == "read"]
+        read = [_journal_bytes(root, relpath) for relpath in relpaths]
     finally:
         root.close()
+    return [data for status, data in read if status == "read"], sum(
+        status != "read" for status, _ in read
+    )
 
 
-def _shown_to_agents(state_dir: Path, run_id: str) -> list[str]:
-    """What the run's agents were shown: every launch's prompt and read context."""
+def _shown_to_agents(state_dir: Path, run_id: str) -> tuple[list[str], int]:
+    """What the run's agents were shown, and how many step directories hold no prompt:
+    every launch's prompt and read context, and a launch whose prompt is lost."""
     logs = state_dir / "logs" / run_id
-    shown = [
-        f"logs/{run_id}/{step}/prompt.md"
-        for step in _subdirectories(logs)
-        if "prompt.md" in _regular_files(logs / step)
-    ]
+    steps = _step_directories(logs)
+    prompts = [step for step in steps if "prompt.md" in _regular_files(logs / step)]
+    shown = [f"logs/{run_id}/{step}/prompt.md" for step in prompts]
     context = state_dir / "read-context" / run_id
     for launch in _subdirectories(context):
         shown += [
             f"read-context/{run_id}/{launch}/{name}" for name in _regular_files(context / launch)
         ]
-    return shown
+    return shown, len(steps) - len(prompts)
 
 
-def count_leaks(state_dir: Path, run_id: str, markers: Sequence[str]) -> int:
-    """How many files shown to an agent name something it must not know."""
+def count_leaks(state_dir: Path, run_id: str, markers: Sequence[str]) -> tuple[int, int]:
+    """How many files shown to an agent name something it must not know, and how many
+    could not be scanned: a leak there is not ruled out."""
     needles = [marker.encode() for marker in markers]
-    return sum(
-        any(needle in data for needle in needles)
-        for data in _bounded_files(state_dir, _shown_to_agents(state_dir, run_id))
-    )
+    shown, promptless = _shown_to_agents(state_dir, run_id)
+    files, unread = _bounded_files(state_dir, shown)
+    found = sum(any(needle in data for needle in needles) for data in files)
+    return found, promptless + unread
 
 
-def duplicate_exploration(state_dir: Path, run_id: str, provenance: str) -> dict:
+def duplicate_exploration(
+    state_dir: Path, run_id: str, provenance: str, *, log_complete: bool = True
+) -> dict:
     """Read-only tool calls that repeat one the run already made, across its launches.
 
     From the allow-listed detail each progress line shows, so a `Bash` `cat` is
     not seen. A run whose log shows no read-only call at all is ``unknown``, not
-    zero: a provider whose progress names no tool shows none either.
+    zero: a provider whose progress names no tool shows none either. So is one
+    whose log lost a launch or holds a progress file that cannot be read.
     """
     logs = state_dir / "logs" / run_id
     relpaths = [
@@ -482,7 +672,10 @@ def duplicate_exploration(state_dir: Path, run_id: str, provenance: str) -> dict
         if "progress.log" in _regular_files(logs / step)
     ]
     seen: Counter[tuple[str, str]] = Counter()
-    for data in _bounded_files(state_dir, relpaths):
+    files, unread = _bounded_files(state_dir, relpaths)
+    if unread or not log_complete:
+        return {"value": None, "provenance": UNKNOWN}
+    for data in files:
         for line in data.decode("utf-8", "replace").splitlines():
             match = _PROGRESS_TOOL.match(line)
             if match and match.group("tool").lower() in READ_ONLY_TOOLS:
@@ -507,19 +700,52 @@ def reported_candidates(lines: Sequence[Mapping]) -> list[str]:
     return found
 
 
+def configured_validation(cfg: AutoForgeConfig) -> Configured:
+    """The set and policy a controller's gates hold a run of ``cfg`` to (ADR 0006 D8.1).
+
+    What ``ControllerEngine._validation_policy`` computes from the configuration
+    alone, so that this harness holds no engine; a test keeps the two one.
+    """
+    template: Mapping[str, object] = NO_SANDBOX_TEMPLATE
+    if cfg.sandbox.enabled:
+        position = NetworkPosition(cfg.sandbox.validation_network)
+        paths = tuple(cfg.sandbox.read_only_paths)
+        template = launch_template(
+            template_facts(LaunchClass.EXPORT_COMMAND, position, operator_paths=paths)
+        )
+    return Configured(
+        definitions(cfg.validation.commands),
+        Policy(
+            mode=cfg.sandbox.mode,
+            template=template,
+            env_names=cfg.execution.environment_names(),
+            timeout_seconds=cfg.execution.command_timeout_seconds,
+            contain_orphans=True,
+            method=MATERIALIZATION_METHOD,
+        ),
+    )
+
+
 def validation_status(state: AutoForgeState, cfg: AutoForgeConfig, commit: str) -> str:
     """``not_configured``, ``absent``, ``failed`` or ``passed``, from ValidationRecords alone.
 
     FULL evidence only (ADR 0010 D1, D2): the configured set's latest record for
-    this exact commit. Nothing else a run leaves behind can make it ``passed``.
+    this exact commit that applies under the configured policy, enforced where it
+    requires that (D8.3). A record of the same commit under another policy says
+    nothing of this configuration, and nothing else a run leaves behind can make
+    it ``passed``.
     """
-    defs = definitions(cfg.validation.commands)
+    configured = configured_validation(cfg)
+    defs = configured.definitions
     if not defs:
         return "not_configured"
     outcomes: dict[str, Outcome] = {}
     for view in state.validation_evidence():
-        if view.candidate.commit == commit:
-            outcomes[view.definition_digest] = view.outcome
+        if view.candidate.commit != commit:
+            continue
+        for definition in defs:
+            if applicable(view, view.candidate, definition.digest, configured.policy):
+                outcomes[definition.digest] = view.outcome
     held = [outcomes.get(d.digest) for d in defs]
     if any(outcome is None for outcome in held):
         return "failed" if any(o not in (None, Outcome.PASS) for o in held) else "absent"
@@ -535,8 +761,90 @@ def _wall_clock(state: AutoForgeState) -> float | None:
     return max((end - start).total_seconds(), 0.0)
 
 
-def _changed_paths(repo: str, base: str, head: str) -> list[str]:
-    return _git(repo, "diff", "--name-only", "--no-renames", base, head).splitlines()
+def settings_evidence(
+    state: AutoForgeState,
+    agent_lines: Sequence[Mapping],
+    cfg: AutoForgeConfig,
+    log_complete: bool,
+    *,
+    config_file: str | None = None,
+) -> dict:
+    """What the run's own records say of the settings it is scored under.
+
+    ``established``: the state's recorded routing and sandbox pin, each as the run
+    was created, and every launch the run log shows, are ``cfg``'s. ``mismatch``:
+    one is not, so the run was made under other settings. ``unknown``: a record is
+    missing, was written after the run began, or a launch is lost, so nothing says
+    it was. Limits and validation are held by the recorded routing and the policy
+    digests (:func:`validation_status`, the certificate); nothing in a run records
+    the rest of the file, which stays what the operator's file says.
+    """
+    mismatches: list[str] = []
+    unknown: list[str] = []
+    if not state.config_fingerprint:
+        unknown.append("the run recorded no configuration")
+    else:
+        recorded = RecordedConfiguration.from_dict(state.config_fingerprint)
+        if recorded.source == SOURCE_UPGRADED:
+            unknown.append("the run's configuration was recorded after it began")
+        elif recorded.source != SOURCE_CREATED:
+            mismatches.append(f"the run's configuration was {recorded.source} during the run")
+        if config_file is not None and recorded.config_file != config_file:
+            mismatches.append(
+                f"the run was recorded from {recorded.config_file or 'the built-in defaults'}, "
+                f"not {config_file}"
+            )
+        routing = fingerprint_routing(cfg)
+        for name in FINGERPRINT_PROFILES:
+            if recorded.fingerprint.profiles.get(name) != routing.get(name):
+                mismatches.append(f"profile {name} was recorded with other routing or limits")
+    if not state.sandbox_pin:
+        unknown.append("the run recorded no sandbox pin")
+    else:
+        pin = SandboxPin.from_dict(state.sandbox_pin)
+        if pin.mode != cfg.sandbox.mode:
+            mismatches.append(f"the run is pinned to sandbox.mode {pin.mode}")
+        if pin.source == SOURCE_UPGRADED:
+            unknown.append("the run's sandbox pin was recorded after it began")
+        elif pin.source != SOURCE_CREATED:
+            mismatches.append(f"the run's sandbox pin was {pin.source} during the run")
+    for line in agent_lines:
+        profile = cfg.profiles.get(line.get("profile", ""))
+        launched = tuple(line.get(key) for key in ("provider", "model", "effort"))
+        if profile is None or launched != (profile.provider, profile.model, profile.effort):
+            mismatches.append(f"launch {line.get('seq')} ran under other routing")
+        if cfg.sandbox.enabled and (line.get("sandbox") or {}).get("enforced") is not True:
+            mismatches.append(f"launch {line.get('seq')} was not enforced")
+    if not log_complete:
+        unknown.append("the run log is incomplete, so not every launch could be compared")
+    status = "mismatch" if mismatches else "unknown" if unknown else "established"
+    return {"status": status, "problems": [*mismatches, *unknown]}
+
+
+@dataclass(frozen=True)
+class FileChange:
+    """One path a candidate changed from its base; a binary change counts no lines."""
+
+    path: str
+    removed: int | None
+    new: bool
+
+
+def candidate_changes(repo: str, base: str, head: str) -> list[FileChange] | None:
+    """What ``head`` changed from ``base``, renames as a delete and an add; ``None``
+    when git could not say, which is no statement that nothing changed."""
+    numstat = _git_read(repo, "diff", "--numstat", "--no-renames", "-z", base, head)
+    added = _git_read(
+        repo, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", base, head
+    )
+    if numstat is None or added is None:
+        return None
+    new = set(added.split("\0"))
+    changes = []
+    for entry in filter(None, numstat.split("\0")):
+        _, removed, path = entry.split("\t", 2)
+        changes.append(FileChange(path, int(removed) if removed.isdigit() else None, path in new))
+    return changes
 
 
 def touches_protected(changed: Sequence[str], protected: Sequence[str]) -> bool:
@@ -547,14 +855,53 @@ def touches_protected(changed: Sequence[str], protected: Sequence[str]) -> bool:
     )
 
 
-def _usage(agent_lines: Sequence[Mapping], key: str, provenance: str, scale: float) -> dict:
-    """A launch-reported total, and how many launches reported none: never a partial sum."""
+def checker_alterations(changes: Sequence[FileChange], task: Mapping) -> list[str]:
+    """The checker inputs a candidate altered, which validation then decided by.
+
+    A protected path, changed in any way. Under :data:`CHECKER_ROOT`, documentation
+    aside: a new ``conftest.py``, which reaches its directory's tests; any other
+    existing file changed, apart from a task's hidden file, which its reference
+    edited too so a correct candidate may have to, and apart from lines only added
+    to a ``test_*.py`` module. Those two are held by the pristine suite instead
+    (:func:`run_oracle`'s ``pristine``), since a test can also be weakened by
+    adding a line. A new test module changes no input that decided anything.
+    """
+    altered = []
+    for change in changes:
+        path = change.path
+        name = path.rpartition("/")[2]
+        if touches_protected([path], task["protected_paths"]):
+            altered.append(path)
+        elif not path.startswith(CHECKER_ROOT) or path.endswith(".md"):
+            continue
+        elif change.new:
+            if name == "conftest.py":
+                altered.append(path)
+        elif path in task["hidden_files"]:
+            continue
+        elif not (name.startswith("test_") and name.endswith(".py") and change.removed == 0):
+            altered.append(path)
+    return sorted(altered)
+
+
+def _usage(
+    agent_lines: Sequence[Mapping], key: str, provenance: str, scale: float, log_complete: bool
+) -> dict:
+    """A launch-reported total, or ``unknown`` with what is known of it as a part, apart:
+    a launch that reported none, or a run log that lost one, leaves no total to state."""
     summaries = [line.get("provider_summary") or {} for line in agent_lines]
     values = [s.get(key) for s in summaries]
     known = [v for v in values if isinstance(v, int) and not isinstance(v, bool)]
-    if agent_lines and len(known) == len(values):
+    if log_complete and agent_lines and len(known) == len(values):
         return {"value": sum(known) * scale, "provenance": provenance}
-    return {"value": None, "provenance": UNKNOWN}
+    unknown: dict = {"value": None, "provenance": UNKNOWN}
+    if known:
+        unknown["known_part"] = sum(known) * scale
+    return unknown
+
+
+def _agent_lines(lines: Sequence[dict]) -> list[dict]:
+    return [line for line in lines if not operator_kind(line) and launch_kind(line) == "agent"]
 
 
 def _empty_counts() -> dict[str, int]:
@@ -584,12 +931,19 @@ def score_run(run: RunInput) -> dict:
     """
     state = load_state(run.state_dir / "state.json")
     lines, bad, journal = read_journal(run.state_dir, state.run_id)
-    agents = [line for line in lines if not operator_kind(line) and launch_kind(line) == "agent"]
+    log_problems = run_log_problems(run.state_dir, state.run_id, lines, bad, journal)
+    log_complete = not log_problems
+    agents = _agent_lines(lines)
     applied = sum(operator_kind(line) == "unblock-applied" for line in lines)
     provenance = MEASURED if run.evidence == REAL else SYNTHETIC
 
     certificate = state.review_certificate or {}
     certified = parse_candidate(certificate["candidate"]).commit if certificate else ""
+    certificate_issue = (
+        certificate_problem(certificate, state, configured_validation(run.cfg))
+        if certificate
+        else ""
+    )
     reported = reported_candidates(lines)
     final = run.live_head or state.current_head_sha
     candidates = list(dict.fromkeys(c for c in (*reported, certified, final) if c))
@@ -611,7 +965,7 @@ def score_run(run: RunInput) -> dict:
         for line in lines
     )
     counts["journal_bad_lines"] = bad
-    counts["hidden_leaks"] = count_leaks(
+    counts["hidden_leaks"], unscanned = count_leaks(
         run.state_dir, state.run_id, run.task.get("leak_markers") or hidden_names(run.task)
     )
     counts["lost_success"] = int(
@@ -619,12 +973,15 @@ def score_run(run: RunInput) -> dict:
     )
     counts["false_oracle"] = int(bool(certified) and oracle.get(certified) == "fail")
     counts["stale_completed_nodes"] = int(bool(certified) and certified != final)
-    if final:
-        counts["checker_altered"] = int(
-            touches_protected(
-                _changed_paths(run.repo, run.base_commit, final), run.task["protected_paths"]
-            )
-        )
+    unknown_counts = list(JOURNAL_COUNTS) if not log_complete else []
+    if unscanned:
+        unknown_counts.append("hidden_leaks")
+    changes = candidate_changes(run.repo, run.base_commit, final) if final else []
+    if changes is None:
+        unknown_counts.append("checker_altered")
+        changes = []
+    altered = checker_alterations(changes, run.task)
+    counts["checker_altered"] = int(bool(altered))
     failed_trees = {
         view.candidate.tree
         for view in state.validation_evidence()
@@ -639,6 +996,7 @@ def score_run(run: RunInput) -> dict:
             seen_failed.add(tree)
 
     reasons: list[str] = []
+    pristine = {"status": "not_run", "failing_modules": []}
     if state.phase in (Phase.READY_FOR_MERGE, Phase.MERGE, Phase.DONE):
         if validation != "passed":
             reasons.append(f"validation_{validation}")
@@ -648,14 +1006,29 @@ def score_run(run: RunInput) -> dict:
             reasons.append("no_certificate")
         elif certified != final:
             reasons.append("stale_certificate")
+        if certificate_issue:
+            reasons.append("certificate_not_applicable")
         if counts["checker_altered"]:
             reasons.append("checker_altered")
+        if "checker_altered" in unknown_counts:
+            reasons.append("checker_inputs_unread")
         if counts["hidden_leaks"]:
             reasons.append("hidden_test_leak")
+        if unscanned:
+            reasons.append("leak_scan_incomplete")
+        # A whole suite more, so only for a run whose outcome it could still change.
+        if not reasons and not run.stopped_by:
+            pristine = _pristine_verdict(run, final, changes, counts, reasons)
         outcome = UNVERIFIED if reasons else VERIFIED
     else:
         outcome = _stop_outcome(state, agents)
+    if run.stopped_by:
+        check_stopped(run.stopped_by, run.stopped_reason)
+        outcome = run.stopped_by
 
+    safety_failures = list(run.safety_failures)
+    if state.counted_merged_prs:
+        safety_failures.append("the run merged a pull request")
     wall = _wall_clock(state)
     return {
         "schema": RUN_SCHEMA,
@@ -667,19 +1040,33 @@ def score_run(run: RunInput) -> dict:
         "manifest_digest": run.manifest_digest,
         "preregistration_digest": run.preregistration_digest,
         "settings_digest": settings_digest(run.cfg),
+        "settings_evidence": settings_evidence(
+            state, agents, run.cfg, log_complete, config_file=run.config_file
+        ),
+        "run_evidence": True,
+        "prior_experience": run.seeded_experience,
         "phase": state.phase.value,
         "outcome": outcome,
         "unverified_reasons": sorted(reasons),
         "validation": validation,
-        "certificate": {"held": bool(certificate), "candidate": certified},
+        "certificate": {
+            "held": bool(certificate),
+            "candidate": certified,
+            "problem": certificate_issue,
+        },
         "final_candidate": final,
         "candidates": candidates,
         "oracle": oracle,
+        "pristine_checkers": pristine,
+        "altered_checkers": altered,
         "counts": counts,
+        "unknown_counts": sorted(unknown_counts),
         "usage": {
-            "cost_usd": _usage(agents, "cost_micro_usd", provenance, 1e-6),
-            "context_tokens": _usage(agents, "context_tokens", provenance, 1),
-            "duplicate_exploration": duplicate_exploration(run.state_dir, state.run_id, provenance),
+            "cost_usd": _usage(agents, "cost_micro_usd", provenance, 1e-6, log_complete),
+            "context_tokens": _usage(agents, "context_tokens", provenance, 1, log_complete),
+            "duplicate_exploration": duplicate_exploration(
+                run.state_dir, state.run_id, provenance, log_complete=log_complete
+            ),
         },
         # An arm without Memory has neither; its collector reports them when it exists.
         "memory": {
@@ -688,9 +1075,13 @@ def score_run(run: RunInput) -> dict:
             "projection_chars": {"value": None, "provenance": NOT_APPLICABLE},
             "latency_ms": {"value": None, "provenance": NOT_APPLICABLE},
         },
-        "safety_failures": sorted(run.safety_failures),
-        "stopped_reason": "",
+        "safety_failures": sorted(safety_failures),
+        # A clean gate needs someone to have looked, and every launch to be on record.
+        "safety_assessed": bool(run.safety_evidence.strip()) and log_complete,
+        "safety_evidence": run.safety_evidence,
+        "stopped_reason": run.stopped_reason,
         "journal": journal,
+        "journal_problems": log_problems,
         # What differs between two runs of the same inputs; no reproducibility
         # check reads it (deterministic_view).
         "volatile": {
@@ -703,6 +1094,38 @@ def score_run(run: RunInput) -> dict:
     }
 
 
+def _pristine_verdict(
+    run: RunInput, final: str, changes: Sequence[FileChange], counts: dict, reasons: list[str]
+) -> dict:
+    """The final candidate's source under its checkers as pinned, added to ``reasons``.
+
+    The one run that sees a test weakened by an added line or in a hidden file:
+    validation passed on the candidate's own copy, and this replaces only that
+    copy. So a failure in a module the candidate changed is an altered checker
+    that hid it, and one the candidate left alone is a failure of its own. A
+    runner that names no module cannot tell them apart, and counts as altered.
+    """
+    done = run.pristine_checkers(final) if run.pristine_checkers else OracleRun("not_run")
+    if done.status == "pass":
+        return {"status": "pass", "failing_modules": []}
+    if done.status != "fail":
+        reasons.append(f"pristine_checkers_{done.status}")
+        return {"status": done.status, "failing_modules": []}
+    reasons.append("pristine_checkers_failed")
+    failing = failing_modules(done.stdout)
+    if not failing or {change.path for change in changes} & set(failing):
+        counts["checker_altered"] = 1
+        reasons.append("checker_altered")
+    return {"status": "fail", "failing_modules": failing}
+
+
+def check_stopped(stopped_by: str, reason: str) -> None:
+    if stopped_by not in STOPPED_BY:
+        raise EvaluationError(f"--stopped-by must be one of {STOPPED_BY}")
+    if not reason.strip():
+        raise EvaluationError("a run that did not finish needs a stated reason")
+
+
 def not_run_record(
     task: Mapping,
     arm: str,
@@ -712,11 +1135,12 @@ def not_run_record(
     manifest_digest: str,
     preregistration_digest: str,
 ) -> dict:
-    """A planned run an operator says did not produce a verdict, and why: never dropped."""
-    if stopped_by not in STOPPED_BY:
-        raise EvaluationError(f"--stopped-by must be one of {STOPPED_BY}")
-    if not reason.strip():
-        raise EvaluationError("a run that did not finish needs a stated reason")
+    """A planned run with nothing to read, stopped and said why: never dropped.
+
+    A run that left a state directory goes through :func:`score_run` instead, which
+    keeps what it did and spent. Here nothing is known of its settings or its usage.
+    """
+    check_stopped(stopped_by, reason)
     unknown = {"value": None, "provenance": UNKNOWN}
     return {
         "schema": RUN_SCHEMA,
@@ -728,23 +1152,32 @@ def not_run_record(
         "manifest_digest": manifest_digest,
         "preregistration_digest": preregistration_digest,
         "settings_digest": "",
+        "settings_evidence": {"status": "unknown", "problems": ["no run evidence was given"]},
+        "run_evidence": False,
+        "prior_experience": "",
         "phase": "",
         "outcome": stopped_by,
         "unverified_reasons": [],
         "validation": "absent",
-        "certificate": {"held": False, "candidate": ""},
+        "certificate": {"held": False, "candidate": "", "problem": ""},
         "final_candidate": "",
         "candidates": [],
         "oracle": {},
+        "pristine_checkers": {"status": "not_run", "failing_modules": []},
+        "altered_checkers": [],
         "counts": _empty_counts(),
+        "unknown_counts": sorted(COUNTS),
         "usage": {key: dict(unknown) for key in MEASURES},
         "memory": {
             key: {"value": None, "provenance": NOT_APPLICABLE}
             for key in ("stale_leaks", "storage_bytes", "projection_chars", "latency_ms")
         },
         "safety_failures": [],
+        "safety_assessed": False,
+        "safety_evidence": "",
         "stopped_reason": reason,
         "journal": "absent",
+        "journal_problems": ["no run evidence was given"],
         "volatile": {"run_id": "", "wall_clock_seconds": dict(unknown)},
     }
 
@@ -761,6 +1194,11 @@ def record_problems(record: Mapping) -> list[str]:
     for key in COUNTS:
         if not isinstance(record.get("counts", {}).get(key), int):
             problems.append(f"counts.{key} is no integer")
+    problems += [f"{key} is not stated" for key in RECORD_KEYS if key not in record]
+    if not set(record.get("unknown_counts", ())) <= set(COUNTS):
+        problems.append("unknown_counts names something that is no count")
+    if record.get("settings_evidence", {}).get("status") not in SETTINGS_STATUSES:
+        problems.append("settings_evidence has no known status")
     for key in MEASURES:
         measure = record.get("usage", {}).get(key)
         if not isinstance(measure, dict) or measure.get("provenance") not in PROVENANCES:
@@ -829,6 +1267,16 @@ def _write_overlay(root: Path, overlay: Mapping[str, bytes]) -> None:
         target.write_bytes(data)
 
 
+def _restore_checkers(runner, pristine: tuple[str, str], root: Path) -> None:
+    """Replace the export's ``tests/`` by a pinned commit's, what the candidate added gone."""
+    store, commit = pristine
+    with export_commit_tree(runner, store, commit) as source:
+        target = root / CHECKER_ROOT
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source.root / CHECKER_ROOT, target, symlinks=True)
+
+
 def _oracle_sandbox(cfg: AutoForgeConfig, cwd: str, overrides, denied: tuple[str, ...]):
     """The export-command description ``validation.commands`` run in, or None when disabled."""
     if not cfg.sandbox.enabled:
@@ -856,6 +1304,7 @@ def run_oracle(
     *,
     denied_roots: tuple[str, ...] = (),
     runner=execute,
+    pristine: tuple[str, str] | None = None,
 ) -> OracleRun:
     """Run the hidden tests against ``commit``, as ``validation.commands`` run.
 
@@ -863,10 +1312,15 @@ def run_oracle(
     did to those paths does not matter; the allow-listed environment and the
     credential preflight; the export-command sandbox under ``required``. What
     could not be launched or was refused is ``not_run``: only exit 0 is a pass.
+
+    With ``pristine`` (a store and a commit) the whole of ``tests/`` comes from that
+    commit instead, so ``commit``'s source meets every checker as it is pinned.
     """
     names = cfg.execution.environment_names()
     try:
         with export_commit_tree(runner, repo, commit) as exported:
+            if pristine is not None:
+                _restore_checkers(runner, pristine, exported.root)
             _write_overlay(exported.root, overlay)
             cwd = str(exported.root)
             identity = preflight(cwd, None if runner is execute else runner, env_allowlist=names)
@@ -881,7 +1335,7 @@ def run_oracle(
                 )
                 request.sandbox = _oracle_sandbox(cfg, cwd, overrides, denied_roots)
                 result = runner(request)
-    except AutoForgeError as exc:
+    except (AutoForgeError, OSError) as exc:
         return OracleRun("not_run", type(exc).__name__)
     if result.timed_out:
         return OracleRun("timeout", result.stdout or "")
@@ -904,6 +1358,37 @@ def verify_pin_history(repo: str, task: Mapping) -> list[str]:
         text = (_blob(repo, f"{reference}:{path}") or b"").decode("utf-8", "replace")
         if not re.search(rf"^(?:async )?def {re.escape(name)}\(", text, re.M):
             problems.append(f"{task['id']}: {path} defines no {name} at the reference commit")
+    changed = _git(repo, "diff", "--name-only", "--no-renames", base, reference).splitlines()
+    outside_hidden = [path for path in changed if path not in task["hidden_files"]]
+    if touches_protected(outside_hidden, task["protected_paths"]):
+        problems.append(f"{task['id']}: the reference commit changes a protected path")
+    return problems + verify_pin_lesson(repo, task)
+
+
+def verify_pin_lesson(repo: str, task: Mapping) -> list[str]:
+    """Why a task's lesson is no earlier verified experience of this history; empty if it is.
+
+    Its evidence is at or before the base, so the run's own attempt cannot have
+    taught it, and it names a test at that commit. It copies no source line the
+    reference commit added: the mechanical half of "no hidden answer", the
+    other half being that it names no hidden test (:func:`manifest_problems`).
+    """
+    prior, name = task["prior_experience"], task["id"]
+    evidence, base = prior["evidence_sha"], task["base_sha"]
+    problems = []
+    if _git(repo, "merge-base", evidence, base) != evidence:
+        problems.append(f"{name}: the lesson's evidence is not at or before the base")
+    path, _, test = prior["evidence_test"].partition("::")
+    text = (_blob(repo, f"{evidence}:{path}") or b"").decode("utf-8", "replace")
+    if not re.search(rf"^(?:async )?def {re.escape(test)}\(", text, re.M):
+        problems.append(f"{name}: {path} defines no {test} at the lesson's evidence")
+    fix = _git(repo, "diff", "-U0", base, task["reference_sha"], "--", "src/").splitlines()
+    added = [
+        line[1:].strip() for line in fix if line.startswith("+") and not line.startswith("+++")
+    ]
+    copied = [line for line in added if len(line) >= 24 and line in prior["lesson"]]
+    if copied:
+        problems.append(f"{name}: the lesson copies the fix: {copied[0]!r}")
     return problems
 
 
@@ -918,10 +1403,19 @@ def verify_pin_oracle(repo: str, manifest: Mapping, task: Mapping, cfg: AutoForg
     command = oracle_command(manifest, task)
     at_base = run_oracle(repo, task["base_sha"], overlay, command, cfg)
     at_reference = run_oracle(repo, task["reference_sha"], overlay, command, cfg)
+    prior = task["prior_experience"]
+    lesson = run_oracle(
+        repo,
+        prior["evidence_sha"],
+        {},
+        [*manifest["oracle_command_prefix"], prior["evidence_test"]],
+        cfg,
+    )
     return {
         "base": at_base.status,
         "reference": at_reference.status,
         "coupled_to_new_names": bool(_COUPLED.search(at_base.stdout)),
+        "lesson": lesson.status,
     }
 
 
@@ -939,10 +1433,29 @@ def verify_base_suite(
     answer depends on the host, its interpreter, ``sandbox.mode`` and the workers,
     so the run host's own answer is what a real run may rely on.
     """
+    return _suite_at(repo, manifest, task, task["base_sha"], cfg, workers)
+
+
+def verify_reference_suite(
+    repo: str, manifest: Mapping, task: Mapping, cfg: AutoForgeConfig, workers: int
+) -> dict:
+    """What the pristine checkers do at the reference commit, the one source they were
+    pinned against. Anything but ``pass`` would refuse every candidate of every arm."""
+    return _suite_at(repo, manifest, task, task["reference_sha"], cfg, workers)
+
+
+def _suite_at(
+    repo: str, manifest: Mapping, task: Mapping, commit: str, cfg: AutoForgeConfig, workers: int
+) -> dict:
     options = ["--tb=no", "-rfE", *(("-n", str(workers)) if workers else ())]
     command = [*validation_command(manifest, task), *options]
-    run = run_oracle(repo, task["base_sha"], {}, command, cfg)
+    run = run_oracle(repo, commit, {}, command, cfg)
     return {"status": run.status, "failing_modules": failing_modules(run.stdout)}
+
+
+def pristine_command(manifest: Mapping, task: Mapping) -> list[str]:
+    """The task's validation, saying which modules failed."""
+    return [*validation_command(manifest, task), "--tb=no", "-rfE"]
 
 
 # -- statistics ------------------------------------------------------------------------------
@@ -988,6 +1501,8 @@ def measure_of(record: Mapping, metric: str) -> tuple[float | None, str]:
     observed = MEASURED if record["evidence"] == REAL else SYNTHETIC
     if metric == "verified_success":
         return float(record["outcome"] == VERIFIED), observed
+    if metric in record["unknown_counts"]:
+        return None, UNKNOWN
     if metric in COUNTS:
         return float(record["counts"][metric]), observed
     if metric == "wall_clock_seconds":
@@ -1151,7 +1666,16 @@ def _hard_gate(
 ) -> dict:
     if gate == "safety_failures":
         found = sum(len(record["safety_failures"]) for record in treated)
-        return {"gate": gate, "verdict": "fail" if found else "pass", "count": found}
+        if found:
+            return {"gate": gate, "verdict": "fail", "count": found}
+        unassessed = sum(not record["safety_assessed"] for record in treated)
+        if unassessed or not treated:
+            return {
+                "gate": gate,
+                "verdict": "unknown",
+                "why": f"{unassessed} run(s) have no affirmative safety check",
+            }
+        return {"gate": gate, "verdict": "pass", "count": 0}
     if gate == "stale_memory_leaks":
         values = [record["memory"]["stale_leaks"] for record in treated]
         if all(v["provenance"] == NOT_APPLICABLE for v in values) or any(
@@ -1190,7 +1714,7 @@ def evaluate_contrast(
     prereg: Mapping,
     harness: Mapping | None = None,
 ) -> dict:
-    """One contrast's decision, from real records only; see the protocol's section 4."""
+    """One contrast's decision, from real records only; see the protocol's section 5."""
     arms = arms_by_id(manifest)
     result: dict = {"baseline": baseline, "treatment": treatment}
     missing_arms = [arm for arm in (baseline, treatment) if arms[arm]["status"] != "available"]
@@ -1204,6 +1728,16 @@ def evaluate_contrast(
     real = [r for r in records if r["evidence"] == REAL]
     if not real:
         return {**result, "decision": NOT_EVALUATED, "why": "no real run has been made"}
+    repeated = _repeated_runs(real, (baseline, treatment))
+    if repeated:
+        # Never one attempt in place of another: the plan has one run per arm, task and
+        # seed, and which of two to keep is exactly the choice nobody may make afterwards.
+        return {
+            **result,
+            "decision": NOT_EVALUATED,
+            "why": f"{len(repeated)} planned run(s) have more than one record",
+            "repeated_runs": repeated,
+        }
     runs = {(r["arm"], r["task"], r["seed"]): r for r in real}
     expected = [(t["id"], seed) for t in manifest["tasks"] for seed in prereg["sample"]["seeds"]]
     pairs, excluded, missing = [], [], []
@@ -1225,14 +1759,37 @@ def evaluate_contrast(
             pairs.append((base, treated))
     result |= {"pairs": len(pairs), "planned_pairs": len(expected), "excluded": excluded}
     result["missing"] = missing
+    paired = [record for pair in pairs for record in pair]
+    result["ceiling_stopped"] = _ceiling_stopped(paired, prereg)
+    result["settings_unknown"] = [
+        _run_key(r) for r in paired if r["settings_evidence"]["status"] == "unknown"
+    ]
+    result["incomplete_evidence"] = [
+        _run_key(r)
+        for r in paired
+        if r["run_evidence"] and (r["journal_problems"] or r["unknown_counts"])
+    ]
 
     invalid = []
     if {r["manifest_digest"] for r in real} != {digest(manifest)}:
         invalid.append("a record was made under another manifest")
     if {r["preregistration_digest"] for r in real} != {digest(prereg)}:
         invalid.append("a record was made under another pre-registration")
-    if any(base["settings_digest"] != treated["settings_digest"] for base, treated in pairs):
+    if any(
+        base["settings_digest"] != treated["settings_digest"]
+        for base, treated in pairs
+        if base["settings_digest"] and treated["settings_digest"]
+    ):
         invalid.append("a pair's settings are not equal")
+    if any(r["settings_evidence"]["status"] == "mismatch" for r in paired):
+        invalid.append("a run's own records show other settings than its record states")
+    tasks = tasks_by_id(manifest)
+    if any(
+        r["run_evidence"]
+        and r["prior_experience"] != seeded_digest(manifest, r["arm"], tasks[r["task"]])
+        for r in paired
+    ):
+        invalid.append("a run did not start with its task's prior experience")
     if any(r["counts"]["hidden_leaks"] for pair in pairs for r in pair):
         invalid.append("a hidden test reached an agent")
     if invalid:
@@ -1249,33 +1806,124 @@ def evaluate_contrast(
         evaluate_non_regression(pairs, criterion, stats)
         for criterion in comparison["non_regression"]
     ]
-    result["per_task"] = _per_task_table(pairs)
+    result["per_task"] = _per_task_table(pairs, excluded, missing, manifest, prereg)
     result["decision"], result["why"] = _decide(result, stats, len(expected))
     return result
 
 
-def _per_task_table(pairs: Sequence[tuple[Mapping, Mapping]]) -> list[dict]:
-    """Each task's seeds and successes on each side, so one outlier can be seen."""
-    table: dict[str, dict] = {}
-    for base, treated in pairs:
-        row = table.setdefault(
-            base["task"],
+def _run_key(record: Mapping) -> list:
+    return [record["arm"], record["task"], record["seed"]]
+
+
+def _repeated_runs(real: Sequence[Mapping], arms: Sequence[str]) -> list[dict]:
+    """Each (arm, task, seed) of these arms with more than one record, with their outcomes."""
+    held: dict[tuple, list[str]] = {}
+    for record in real:
+        if record["arm"] in arms:
+            held.setdefault(tuple(_run_key(record)), []).append(record["outcome"])
+    return [
+        {"arm": arm, "task": task, "seed": seed, "outcomes": sorted(outcomes)}
+        for (arm, task, seed), outcomes in sorted(held.items())
+        if len(outcomes) > 1
+    ]
+
+
+def _ceiling_stopped(paired: Sequence[Mapping], prereg: Mapping) -> list[dict]:
+    """Each run at a registered ceiling: stopped there, or measured past it unsaid."""
+    ceilings = prereg["ceilings"]
+    found = []
+    for record in paired:
+        cost, wall = record["usage"]["cost_usd"], record["volatile"]["wall_clock_seconds"]
+        known_cost = cost.get("known_part") if cost["value"] is None else cost["value"]
+        if record["outcome"] in CEILING_OUTCOMES:
+            ceiling = record["outcome"]
+        elif known_cost is not None and known_cost > ceilings["per_run_usd"][record["arm"]]:
+            ceiling = "cost_ceiling"
+        elif (
+            wall["value"] is not None
+            and wall["value"] > ceilings["per_run_wall_clock_hours"] * 3600
+        ):
+            ceiling = "wall_clock_ceiling"
+        else:
+            continue
+        found.append(
             {
-                "task": base["task"],
-                "memory_class": base["memory_class"],
-                "seeds": 0,
-                "baseline_verified": 0,
-                "treatment_verified": 0,
-            },
+                "arm": record["arm"],
+                "task": record["task"],
+                "seed": record["seed"],
+                "ceiling": ceiling,
+                "cost_usd": known_cost,
+                "wall_clock_seconds": wall["value"],
+                "reason": record["stopped_reason"],
+            }
         )
+    return found
+
+
+def _per_task_table(
+    pairs: Sequence[tuple[Mapping, Mapping]],
+    excluded: Sequence[Mapping],
+    missing: Sequence[Sequence],
+    manifest: Mapping,
+    prereg: Mapping,
+) -> list[dict]:
+    """Each task's seeds, successes and failures on each side, what is not known of them,
+    and how far its seeds disagree, so one outlier or one lost task can be seen."""
+    table = {
+        task["id"]: {
+            "task": task["id"],
+            "memory_class": task["memory_class"],
+            "planned_seeds": len(prereg["sample"]["seeds"]),
+            "seeds": 0,
+            "excluded_seeds": 0,
+            "missing_seeds": 0,
+            "baseline_verified": 0,
+            "treatment_verified": 0,
+            "baseline_outcomes": Counter(),
+            "treatment_outcomes": Counter(),
+            "seed_differences": [],
+            "unknown_usage": Counter(),
+        }
+        for task in manifest["tasks"]
+    }
+    for base, treated in pairs:
+        row = table[base["task"]]
         row["seeds"] += 1
         row["baseline_verified"] += base["outcome"] == VERIFIED
         row["treatment_verified"] += treated["outcome"] == VERIFIED
-    return sorted(table.values(), key=lambda row: row["task"])
+        row["baseline_outcomes"][base["outcome"]] += 1
+        row["treatment_outcomes"][treated["outcome"]] += 1
+        row["seed_differences"].append(
+            float(treated["outcome"] == VERIFIED) - float(base["outcome"] == VERIFIED)
+        )
+        for key in MEASURES:
+            row["unknown_usage"][key] += sum(
+                record["usage"][key]["provenance"] == UNKNOWN for record in (base, treated)
+            )
+    for entry in excluded:
+        table[entry["task"]]["excluded_seeds"] += 1
+    for task, _ in missing:
+        table[task]["missing_seeds"] += 1
+    rows = []
+    for row in table.values():
+        differences = sorted(row.pop("seed_differences"))
+        rows.append(
+            {
+                **row,
+                "baseline_outcomes": dict(sorted(row["baseline_outcomes"].items())),
+                "treatment_outcomes": dict(sorted(row["treatment_outcomes"].items())),
+                "unknown_usage": dict(sorted(row["unknown_usage"].items())),
+                "effect": statistics.fmean(differences) if differences else None,
+                "seed_range": [differences[0], differences[-1]] if differences else None,
+            }
+        )
+    return sorted(rows, key=lambda row: row["task"])
 
 
 def _decide(result: Mapping, stats: Mapping, planned: int) -> tuple[str, str]:
-    """NO_GO on evidence of harm; GO only with everything measured and within bounds."""
+    """NO_GO on evidence of harm, first, whatever the sample; then an incomplete sample
+    is inconclusive, before any primary effect is read; GO only with everything measured
+    and within bounds."""
     if result["primary"] is None:
         return NOT_EVALUATED, "no pair of the plan has both runs"
     failed = [g["gate"] for g in result["hard_gates"] if g["verdict"] == "fail"]
@@ -1284,12 +1932,21 @@ def _decide(result: Mapping, stats: Mapping, planned: int) -> tuple[str, str]:
     regressed = [c["metric"] for c in result["non_regression"] if c["verdict"] == "fail"]
     if regressed:
         return NO_GO, f"past its non-regression margin: {', '.join(regressed)}"
-    if result["primary"]["verdict"] == "fail":
-        return NO_GO, "the interval lies below the smallest effect that matters"
     if result["missing"]:
         return INCONCLUSIVE, f"{len(result['missing'])} planned pair(s) have no record"
     if len(result["excluded"]) > stats["max_excluded_pair_share"] * planned:
         return INCONCLUSIVE, f"{len(result['excluded'])} pair(s) excluded, over the bound"
+    if result["ceiling_stopped"]:
+        return INCONCLUSIVE, f"{len(result['ceiling_stopped'])} run(s) reached a ceiling"
+    if result["settings_unknown"]:
+        return INCONCLUSIVE, f"the settings of {len(result['settings_unknown'])} run(s) are unknown"
+    if result["incomplete_evidence"]:
+        return (
+            INCONCLUSIVE,
+            f"the evidence of {len(result['incomplete_evidence'])} run(s) is incomplete",
+        )
+    if result["primary"]["verdict"] == "fail":
+        return NO_GO, "the interval lies below the smallest effect that matters"
     open_items = [
         *(g["gate"] for g in result["hard_gates"] if g["verdict"] != "pass"),
         *(c["metric"] for c in result["non_regression"] if c["verdict"] != "pass"),
@@ -1325,11 +1982,18 @@ def _uncertainty(records: Sequence[Mapping]) -> dict:
         },
         "measured_cost_usd": _sum_by_provenance(records, MEASURED),
         "estimated_cost_usd": _sum_by_provenance(records, ESTIMATED),
+        # Of runs whose total is unknown: what they are known to have spent, at least.
+        "known_part_cost_usd": sum(r["usage"]["cost_usd"].get("known_part", 0.0) for r in records),
         "safety_failures": sum(len(r["safety_failures"]) for r in records),
+        "safety_unassessed": sum(not r["safety_assessed"] for r in records),
+        "settings_not_established": sum(
+            r["settings_evidence"]["status"] != "established" for r in records
+        ),
         "incomplete_run_logs": sum(
-            r["journal"] != "read" or r["counts"]["journal_bad_lines"] > 0
-            for r in records
-            if r["outcome"] not in STOPPED_BY
+            bool(r["journal_problems"]) for r in records if r["run_evidence"]
+        ),
+        "unknown_counts": dict(
+            sorted(Counter(key for r in records for key in r["unknown_counts"]).items())
         ),
     }
 
@@ -1403,6 +2067,7 @@ def build_report(
             "says": "real runs only: measured outcomes decide, estimates are shown apart",
             "real_runs": len(real),
             "uncertainty": _uncertainty(real),
+            "runs": sorted(real, key=lambda r: (r["task"], r["seed"], r["arm"], r["outcome"])),
             "comparisons": comparisons,
         },
         "not_evidence_for_autoforge": manifest["external_results_not_evidence"],
@@ -1429,15 +2094,108 @@ def render(report: Mapping) -> str:
         )
     lines += ["", f"MODEL QUALITY (real runs: {quality['real_runs']})"]
     lines += _render_uncertainty(quality["uncertainty"])
+    for run in quality["runs"]:
+        lines += _render_real_run(run)
     for name, contrasts in quality["comparisons"].items():
         for contrast in contrasts:
             lines.append(
                 f"  {name}: {contrast['treatment']} vs {contrast['baseline']}: "
                 f"{contrast['decision']} ({contrast['why']})"
             )
+            lines += _render_contrast(contrast)
     lines += ["", "NOT EVIDENCE FOR AUTOFORGE"]
     lines += [f"  {item}" for item in report["not_evidence_for_autoforge"]]
     return "\n".join(lines)
+
+
+def _shown_measure(measure: Mapping) -> str:
+    """A value with where it came from; of an unknown total, what is known of it, apart."""
+    part = f", at least {measure['known_part']}" if "known_part" in measure else ""
+    return f"{measure['value']} ({measure['provenance']}{part})"
+
+
+def _render_real_run(run: Mapping) -> list[str]:
+    """One real run in full: its outcome and reasons, what it spent and what is not known."""
+    reasons = f" ({', '.join(run['unverified_reasons'])})" if run["unverified_reasons"] else ""
+    certificate = run["certificate"]
+    held = "held" if certificate["held"] else "none"
+    usage = run["usage"]
+    lines = [
+        f"  {run['task']} seed {run['seed']} {run['arm']}: {run['outcome']}{reasons}; validation "
+        f"{run['validation']}; certificate {held}; phase {run['phase'] or '(none)'}",
+        f"    cost {_shown_measure(usage['cost_usd'])}; tokens "
+        f"{_shown_measure(usage['context_tokens'])}; duplicate exploration "
+        f"{_shown_measure(usage['duplicate_exploration'])}; wall clock "
+        f"{_shown_measure(run['volatile']['wall_clock_seconds'])}",
+        f"    oracle {run['oracle'].get(run['final_candidate'], 'not_run')}; pristine checkers "
+        f"{run['pristine_checkers']['status']}; settings {run['settings_evidence']['status']}; "
+        f"safety {'checked' if run['safety_assessed'] else 'unknown'}; run log {run['journal']}",
+    ]
+    details = [
+        ("stopped", run["stopped_reason"]),
+        ("certificate does not apply", run["certificate"]["problem"]),
+        ("altered checkers", ", ".join(run["altered_checkers"])),
+        ("pristine failures", ", ".join(run["pristine_checkers"]["failing_modules"])),
+        ("settings", "; ".join(run["settings_evidence"]["problems"])),
+        ("run log", "; ".join(run["journal_problems"])),
+        ("counts not known", ", ".join(run["unknown_counts"])),
+        ("safety failures", "; ".join(run["safety_failures"])),
+    ]
+    return lines + [f"    {label}: {text}" for label, text in details if text]
+
+
+def _render_contrast(contrast: Mapping) -> list[str]:
+    """A decision's evidence: each criterion, what left the sample, and every task."""
+    lines = []
+    primary = contrast.get("primary")
+    if primary:
+        lines.append(f"    primary {_render_criterion(primary)}")
+    lines += [
+        f"    non-regression {_render_criterion(c)}" for c in contrast.get("non_regression", ())
+    ]
+    lines += [
+        f"    gate {gate['gate']}: {gate['verdict']}"
+        + (f" ({gate['why']})" if "why" in gate else "")
+        for gate in contrast.get("hard_gates", ())
+    ]
+    lines += [
+        f"    excluded {e['task']} seed {e['seed']}: {e['baseline']} / {e['treatment']} "
+        f"({e['reason']})"
+        for e in contrast.get("excluded", ())
+    ]
+    lines += [
+        f"    no record {task} seed {seed}"  # a planned pair without both runs
+        for task, seed in contrast.get("missing", ())
+    ]
+    lines += [
+        f"    {c['ceiling']} {c['arm']} on {c['task']} seed {c['seed']}: cost {c['cost_usd']}, "
+        f"wall clock {c['wall_clock_seconds']} ({c['reason'] or 'measured past it'})"
+        for c in contrast.get("ceiling_stopped", ())
+    ]
+    lines += [
+        f"    repeated {r['arm']} on {r['task']} seed {r['seed']}: {', '.join(r['outcomes'])}"
+        for r in contrast.get("repeated_runs", ())
+    ]
+    for row in contrast.get("per_task", ()):
+        lines.append(
+            f"    task {row['task']} ({row['memory_class']}): {row['seeds']} of "
+            f"{row['planned_seeds']} seeds, {row['excluded_seeds']} excluded, "
+            f"{row['missing_seeds']} missing; verified {row['baseline_verified']} vs "
+            f"{row['treatment_verified']}; effect {row['effect']}, seeds {row['seed_range']}; "
+            f"outcomes {row['baseline_outcomes']} vs {row['treatment_outcomes']}; "
+            f"unknown usage {row['unknown_usage']}"
+        )
+    return lines
+
+
+def _render_criterion(criterion: Mapping) -> str:
+    bound = criterion.get("min_effect", criterion.get("margin", criterion.get("relative_margin")))
+    effect = criterion.get("effect", criterion.get("relative_change"))
+    return (
+        f"{criterion['metric']} on {criterion['stratum']}: {criterion['verdict']}, effect "
+        f"{effect}, interval {criterion.get('interval')}, bound {bound}, provenance "
+        f"{criterion['provenance']}" + (f" ({criterion['why']})" if "why" in criterion else "")
+    )
 
 
 def _render_uncertainty(uncertainty: Mapping) -> list[str]:
@@ -1450,7 +2208,12 @@ def _render_uncertainty(uncertainty: Mapping) -> list[str]:
         f"timeouts {uncertainty['timeouts']}; truncations {uncertainty['truncations']}",
         f"  outcomes {uncertainty['outcomes']}; validation {uncertainty['validation']}",
         f"  usage {uncertainty['usage_provenance']}; measured cost "
-        f"{uncertainty['measured_cost_usd']}; estimated cost {uncertainty['estimated_cost_usd']}",
+        f"{uncertainty['measured_cost_usd']}; estimated cost {uncertainty['estimated_cost_usd']}; "
+        f"known part of unknown costs {uncertainty['known_part_cost_usd']}",
+        f"  safety failures {uncertainty['safety_failures']}; safety not checked "
+        f"{uncertainty['safety_unassessed']}; settings not established "
+        f"{uncertainty['settings_not_established']}; incomplete run logs "
+        f"{uncertainty['incomplete_run_logs']}; counts not known {uncertainty['unknown_counts']}",
     ]
 
 
@@ -1479,6 +2242,12 @@ def plan_runs(name: str, manifest: Mapping, prereg: Mapping) -> dict:
                     "base_tree": task["base_tree"],
                     "validation_commands": [validation_command(manifest, task)],
                     "ceiling_usd": prereg["ceilings"]["per_run_usd"][arm],
+                    # What this arm's Memory holds when the run starts; nothing else does.
+                    "prior_experience": (
+                        task["prior_experience"]["lesson"]
+                        if arms[arm]["seeded_experience"]
+                        else None
+                    ),
                 }
                 for arm in order
             ]
@@ -1522,11 +2291,24 @@ def _verify_pins_command(args: argparse.Namespace, manifest: Mapping) -> int:
         problems += [
             task
             for task, result in results.items()
-            if result != {"base": "fail", "reference": "pass", "coupled_to_new_names": False}
+            if result
+            != {
+                "base": "fail",
+                "reference": "pass",
+                "coupled_to_new_names": False,
+                "lesson": "pass",
+            }
         ]
     if args.base_suite:
         suites = {
             task["id"]: verify_base_suite(repo, manifest, task, cfg, args.workers)
+            for task in manifest["tasks"]
+        }
+        print(json.dumps(suites, indent=2, sort_keys=True))
+        problems += [task for task, suite in suites.items() if suite["status"] != "pass"]
+    if args.reference_suite:
+        suites = {
+            task["id"]: verify_reference_suite(repo, manifest, task, cfg, args.workers)
             for task in manifest["tasks"]
         }
         print(json.dumps(suites, indent=2, sort_keys=True))
@@ -1549,7 +2331,7 @@ def _collect_command(args: argparse.Namespace, manifest: Mapping, prereg: Mappin
     if args.seed != SMOKE_SEED and args.seed not in prereg["sample"]["seeds"]:
         print("collect: this seed is neither in the plan nor a smoke run's")
         return 2
-    if args.stopped_by:
+    if not args.state_dir and args.stopped_by:
         record = not_run_record(
             task,
             args.arm,
@@ -1573,7 +2355,10 @@ def _collect_command(args: argparse.Namespace, manifest: Mapping, prereg: Mappin
         if absent:
             print(f"collect needs {', '.join(absent)}, or --stopped-by with a --reason")
             return 2
+        if args.stopped_by:
+            check_stopped(args.stopped_by, args.reason)
         cfg = load_config_file(args.config)
+        config_file = absolute_spelling(args.config)
         state_dir = Path(args.state_dir).resolve()
         repo = str(Path(args.repo).resolve())
         problems = []
@@ -1586,13 +2371,24 @@ def _collect_command(args: argparse.Namespace, manifest: Mapping, prereg: Mappin
             problems.append("the configuration is not this task's pinned one")
         if not cfg.sandbox.enabled:
             problems.append("a real run's oracle needs sandbox.mode: required")
+        lines, bad, journal = read_journal(state_dir, state.run_id)
+        recorded = settings_evidence(
+            state,
+            _agent_lines(lines),
+            cfg,
+            not run_log_problems(state_dir, state.run_id, lines, bad, journal),
+            config_file=config_file,
+        )
+        if recorded["status"] == "mismatch":
+            problems += recorded["problems"]
         if problems:
             for problem in problems:
                 print(f"collect refuses: {problem}")
             return 2
         overlay = hidden_overlay(args.oracle_repo, task)
         command = oracle_command(manifest, task)
-        denied = (str(state_dir), repo, str(Path(args.oracle_repo).resolve()))
+        oracle_repo = str(Path(args.oracle_repo).resolve())
+        denied = (str(state_dir), repo, oracle_repo)
         record = score_run(
             RunInput(
                 evidence=REAL,
@@ -1610,6 +2406,19 @@ def _collect_command(args: argparse.Namespace, manifest: Mapping, prereg: Mappin
                 manifest_digest=digest(manifest),
                 preregistration_digest=digest(prereg),
                 safety_failures=tuple(args.safety_failure),
+                safety_evidence=args.safety_checked,
+                pristine_checkers=lambda commit: run_oracle(
+                    repo,
+                    commit,
+                    {},
+                    pristine_command(manifest, task),
+                    cfg,
+                    denied_roots=denied,
+                    pristine=(oracle_repo, task["reference_sha"]),
+                ),
+                stopped_by=args.stopped_by,
+                stopped_reason=args.reason,
+                config_file=config_file,
             )
         )
     record["approval"] = args.approval
@@ -1630,6 +2439,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     pins.add_argument(
         "--base-suite", action="store_true", help="each task's validation at its base"
     )
+    pins.add_argument(
+        "--reference-suite",
+        action="store_true",
+        help="each task's validation at its reference: what the pristine checkers need",
+    )
     pins.add_argument("--config", default="", help="the configuration to launch under")
     pins.add_argument(
         "--workers", type=int, default=0, help="pytest-xdist workers for --base-suite"
@@ -1644,6 +2458,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     collect.add_argument("--stopped-by", choices=STOPPED_BY, default="")
     collect.add_argument("--reason", default="")
     collect.add_argument("--safety-failure", action="append", default=[])
+    collect.add_argument(
+        "--safety-checked", default="", help="where the operator's check of this run is recorded"
+    )
     report = commands.add_parser("report", help="decide over run records and print the report")
     report.add_argument("records", nargs="*")
     report.add_argument("--harness-report", default="", help="a fixture report's JSON")

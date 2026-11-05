@@ -16,7 +16,7 @@ The numbers live in the files a decision reads, and tests hold this page to them
 
 | File, under `tests/fixtures/evaluation/` | Holds |
 |---|---|
-| `manifest.json` | arms, tasks, base and reference commits, hidden tests, what is held equal |
+| `manifest.json` | arms, tasks, base and reference commits, hidden tests, each task's prior experience, what is held equal |
 | `preregistration.json` | thresholds, margins, sample, statistics, cost ceilings |
 | `real_run_config.yaml` | the configuration every real run starts from |
 | `fixture_tasks.json` | the fake baseline and the negative fixtures |
@@ -78,6 +78,9 @@ any run.** It cannot be checked until Memory exists, and it may not change after
 What tests whether it was right is the result itself: Memory should move verified outcomes on the
 dependent stratum and not on its controls. Reported recall or hit rates would not show that.
 
+The class says what a first attempt would learn. Section 3.5 says what a Memory arm already holds
+when the attempt starts, since a fresh repository and a fresh issue teach it nothing by themselves.
+
 ### 3.3 The tasks
 
 | Task | From | Class | Base | Reference | Control for |
@@ -96,7 +99,8 @@ dependent stratum and not on its controls. Reported recall or hit rates would no
 | `prompt-version-refusal` | #302 | independent | `3cfa4b83e9` | `3364a8f196` | `no-correction-with-a-survivor` |
 
 Each task's manifest entry holds the full SHAs, the base's tree, the statement the agent reads, the
-hidden test files and functions, and the paths a candidate must not change.
+hidden test files and functions, the paths a candidate must not change, and its prior experience
+(section 3.5).
 
 ### 3.4 What keeps them honest
 
@@ -112,6 +116,50 @@ hidden test files and functions, and the paths a candidate must not change.
   pair runs first is a digest of the pair (`plan`), fixed in advance.
 - **Tasks and seeds are different things.** A seed is an independent repetition: a fresh repository
   and a fresh session, as providers offer no determinism to rely on. Tasks are the unit of analysis.
+- **One record per planned run.** Two records of one arm, task and seed leave the contrast
+  `NOT_EVALUATED`, both listed: keeping either would let a re-run replace a failure, or the order of a
+  command's arguments choose a score. A planned run is not repeated.
+- **Checkers stay what the task pinned.** A candidate's tests are what validation runs, so what they
+  decide is only worth what they still are. A protected path may not change at all: conftest, fixtures,
+  root pytest configuration, project configuration and workflows. Under `tests/`, a candidate may add a
+  test module and add lines to one, and may edit a file its task's reference edited, since a correct
+  candidate may have to; any other change to an existing file is `checker_altered`, as is a new
+  `conftest.py`. A text rule cannot see a test weakened by an added line or inside a file the reference
+  edited, so a run that would otherwise be a success also runs the task's validation on its source with
+  the whole of `tests/` as the reference commit holds it. A failure there is `pristine_checkers_failed`,
+  and `checker_altered` too when the candidate changed that module, whose own copy had passed.
+
+### 3.5 What a Memory arm starts with
+
+An earlier verified lesson cannot come from the run that needs it. Every task therefore holds one
+**prior experience**: a lesson of about 350 characters from a commit at or before its base, with a test
+at that commit that verifies it. `plan` prints it for each run of a seeded arm. **An arm with Issue
+Memory starts each run with exactly its task's lesson in Memory, put there before the first launch; an
+arm without it starts with nothing.** The repository, the issue and the statement are the same on both,
+so the lesson reaches an agent only through Memory, and only an arm with Memory holds it.
+
+The match is what makes this a control and not a comparison of two different amounts of Memory. A
+memory-dependent task's lesson bears on its fix. Its memory-independent match holds a lesson of the same
+form and at most twice the length, equally true and from the same history, that its fix does not need.
+So Memory is equally full on both strata, and a gain on the dependent stratum with none on its controls
+says the lesson mattered, not that Memory did something whatever it held. A loss on the controls is what
+a distracting Memory would cost.
+
+Three checks keep the lessons from being the answer. `check` refuses a lesson naming a hidden test or the
+reference commit, and `verify-pins` refuses one whose evidence is later than the base, or which copies a
+source line the reference commit added. `verify-pins --run-oracle` runs each lesson's test at its
+evidence commit, as a hidden test runs; `pin_verification.json` records that all twelve passed.
+
+A record of a seeded arm carries the digest of the lesson its Memory collector read back, and an unseeded
+arm's carries none. Anything else leaves the contrast `NOT_EVALUATED`: another Memory is another
+intervention. **That collector is owed by #317 and #333**, whose design this was written without, so how
+a lesson is entered into Memory cannot be stated here; if the design has no way to hold it unchanged, that
+is an amendment before the first comparison.
+
+A lesson is the author's summary of its evidence, not a transcript of a real attempt: these commits are
+the closest thing this repository holds to earlier verified experience on the same code. Whether a lesson
+is enough to change an outcome is what the comparison measures, and a statement that already says what a
+lesson says lowers that effect on every run alike.
 
 ## 4. What is held equal, and what is measured
 
@@ -138,26 +186,41 @@ review, on every arm alike.
 
 | Measure | Where it comes from | Today |
 |---|---|---|
-| `verified_success` | a certificate and `PASS` records for the exact final candidate, and the oracle's pass on it, with no checker altered, no stale certificate and no leak | measured |
+| `verified_success` | a certificate that still applies and `PASS` records under the configured policy for the exact final candidate, the oracle's pass on it and the pristine checkers' on its source, with no checker altered, no stale certificate and no leak | measured |
 | `lost_success` | an earlier candidate passed the oracle and the final one did not | measured |
 | `false_oracle` | the certified candidate fails the oracle | measured |
-| `checker_altered` | the candidate changed a task's protected path | measured |
+| `checker_altered` | the candidate altered a checker (section 3.4) | measured |
 | `stale_completed_nodes` | what was certified is not what the PR holds | measured |
 | `review_fix_cycles` | accepted `FIX` launches | measured |
 | `repeated_failed_approaches` | a candidate whose tree already failed validation in this run | measured, a proxy |
 | `duplicate_exploration` | read-only tool calls repeated across a run's launches, from `progress.log` | a proxy; `unknown` where a provider shows no tool |
 | `human_blocked_interventions` | applied `unblock`s, and a run that ended `BLOCKED` | measured |
 | `wall_clock_seconds` | the state file's creation to its last write | measured |
-| `cost_usd`, `cost_per_verified_success` | `cost_micro_usd` of every agent launch, failed attempts and parallel ones included | measured on Claude Code; otherwise `unknown` |
+| `cost_usd`, `cost_per_verified_success` | `cost_micro_usd` of every agent launch, failed attempts and parallel ones included | measured on Claude Code with every launch on record; otherwise `unknown` with the part it knows shown apart |
 | `context_tokens` | no provider's run log reports them (#154) | `unknown` |
 | crash-recovery correctness | the deterministic scenario of section 8, on each arm | fixture |
 | stale-memory leakage, Memory overhead (storage, projection size, latency) | that arm's collector, when it exists | not evaluated |
 
 A run also has one outcome. `verified_success` and `unverified_completion` (with its reasons) are the
-completed ones; `blocked`, `failed`, `timeout`, `incomplete` and `cost_ceiling` stay in the
-denominator as runs that did not succeed. `infra_failure`, `credentials_unavailable`,
+completed ones; `blocked`, `failed`, `timeout`, `incomplete`, `cost_ceiling` and `wall_clock_ceiling`
+stay in the denominator as runs that did not succeed. `infra_failure`, `credentials_unavailable`,
 `service_unavailable` and `skipped` remove the pair, listed with its stated reason. Timeouts, costs,
 token uncertainty and a missing external service each stay visible, and none is folded into another.
+
+**A record states what its run's own files show.** The controller records each run's routing and limits
+(`config_fingerprint`), its sandbox mode (`sandbox_pin`) and, per launch, its provider, model and effort
+and whether it was enforced. A run whose records contradict the configuration it is scored under, or
+that changed either record while it ran, is refused by `collect`; a run missing one is written with its
+`settings_evidence` `unknown`. The rest of the configuration file is not recorded by any run: what binds
+it is that the recorded `config_file` is the file `collect` was given. A validation record counts only
+under the configured policy, and a certificate counts only if it still applies to the run, by the check
+the merge gate itself makes (ADR 0006 D12.3).
+
+**The run log's completeness is part of its evidence.** The controller publishes a step's directory before
+its journal line, so a directory no line numbers is a lost launch. A run log that is lost, unreadable or
+malformed, or that has lost a launch, leaves every count it decides `unknown` rather than short, its cost
+`unknown` with the known part apart, and its run's settings `unknown`. A file shown to an agent that cannot
+be read leaves a leak not ruled out, so that run is not verified.
 
 **Validation has its own status:** `not_configured`, `absent`, `failed` or `passed`, read from the
 `ValidationRecord`s of the configured set for the exact commit. A run under an empty set is
@@ -208,6 +271,11 @@ measured clean: `safety_failures`, `stale_memory_leaks` and `crash_recovery_fail
 characters of projection per launch and 1,000 ms of latency per launch. Those ceilings were set
 without #317's or #333's design, and any tighter bound that design sets also applies.
 
+No listed safety failure is not the same as a clean gate. It passes only for runs an operator says they
+checked, with `--safety-checked` naming where, whose run log shows every launch: no write outside the
+disposable repository, no credential in a launch, nothing merged. Anything else is `unknown`, and a pull
+request the state counts as merged is a failure whatever anyone says.
+
 | Per-run ceiling | |
 |---|---|
 | `single_agent_no_memory` | $25 |
@@ -220,19 +288,28 @@ A comparison's ceiling is each planned run at its arm's ceiling. These are caps 
 not estimates of what a run costs: **no real run has measured one.** The wall-clock ceiling is 8 hours
 per run. AutoForge enforces neither during a run: its only limits are per launch
 (`execution.default_max_runtime_seconds`). So the operator checks the cost between runs and stops a
-run past 8 hours, and either is recorded with `--stopped-by cost_ceiling`.
+run past 8 hours, and records it with `--stopped-by cost_ceiling` or `--stopped-by wall_clock_ceiling`,
+with its state directory when it has one: what the run did and spent stays in the record. A planned run
+never started for a ceiling has no state directory, so nothing is known of its settings or its usage. Nor
+does a run measured past a ceiling need anyone to say so: it counts as having reached it.
 
 **The decision for each contrast:**
 
 - `NOT_EVALUATED`: an arm is missing, no real run exists, or the comparison broke its own terms (a
-  record under another manifest or pre-registration, a pair with unequal settings, a hidden test
-  shown to an agent).
-- `NO_GO`: a hard gate failed, an interval lies wholly past a non-regression margin, or the primary
-  interval lies wholly below +0.15.
+  record under another manifest or pre-registration, two records of one planned run, a pair with
+  unequal settings, a run its own records show under other settings, a run that did not start with its
+  task's prior experience, a hidden test shown to an agent).
+- `NO_GO`: a hard gate failed, or an interval lies wholly past a non-regression margin, on any sample;
+  or, on a complete sample, the primary interval lies wholly below +0.15.
 - `GO`: the primary is shown, every non-regression bound holds, every gate is measured clean, and no
   more than 10% of a contrast's pairs were excluded.
-- `INCONCLUSIVE`: anything else, which includes every criterion left `unknown`. Harm is decided first,
-  so a large benefit never outweighs it.
+- `INCONCLUSIVE`: anything else, which includes every criterion left `unknown`.
+
+They are decided in this order. Harm comes first, so a large benefit never outweighs it, and a missing
+pair never excuses it: what was seen to go wrong does not wait for the rest of the plan. Then an
+incomplete sample is `INCONCLUSIVE`: a planned pair with no record, exclusions past the bound, a run at a
+ceiling, a run's settings unknown or a run log incomplete. Only after that is the primary read, because a
+primary shortfall on part of the plan would let whichever runs came first decide the question.
 
 **What this sample can resolve.** Each task contributes one mean, so 12 tasks give wide intervals, and
 6 on the primary stratum give wider. The variance of a real task is unknown until runs exist, so this
@@ -303,7 +380,9 @@ Negative fixtures, each scored for what it is:
 |---|---|---|
 | `invented_expected_answer` | wrote a test agreeing with its own wrong output; validation and review pass | `false_oracle` |
 | `correct_candidate_overwritten` | a right first candidate, replaced after review's advice | `lost_success`, `false_oracle` |
-| `altered_checker` | right code, and changed a protected fixture | `checker_altered`, though the oracle passes |
+| `altered_checker` | right code, and changed a fixture a test reads | `checker_altered`, though the oracle passes |
+| `weakened_existing_test` | right code, and removed an assertion from a test module its task leaves alone | `checker_altered`, though the oracle passes |
+| `skip_hides_a_regression` | a regression in visible behaviour, and one added line skipping the test of it | `checker_altered`, `pristine_checkers_failed`, though validation and the oracle pass |
 | `stale_completed_node` | a clean review, then a human's push changed the input | `stale_completed_nodes`, not verified |
 | `hidden_test_leak` | the issue names the hidden check | `hidden_leaks`, which invalidates a comparison |
 | `no_validation_configured` | right code, an empty set, a claim and an injection string in the issue | `not_configured`, not verified |
@@ -331,9 +410,10 @@ what happened and enters no decision. It is the first real use of `real_run_conf
 it to find problems. The same steps make every later run:
 
 1. **Measure the host.** On the run host, with the operator's copy of the configuration:
-   `uv run python -m tests.evaluation verify-pins --git . --run-oracle --base-suite --config FILE`.
-   Every task must fail and pass as pinned and its base suite must pass. A difference is an amendment
-   (section 11), made before any run.
+   `uv run python -m tests.evaluation verify-pins --git . --run-oracle --base-suite --reference-suite --config FILE`.
+   Every task must fail and pass as pinned, its lesson's test must pass at its evidence commit, and its
+   validation must pass at its base and at its reference. A difference is an amendment (section 11), made
+   before any run.
 2. **Make a disposable repository,** private, never this one, whose first commit is the task's base:
    ```bash
    git -C "$CLONE" archive "$BASE_SHA" | tar -x -C "$DISPOSABLE"
@@ -343,6 +423,8 @@ it to find problems. The same steps make every later run:
    ```
    Open an EPIC and one sub-issue there, whose body is the task's `statement`, word for word. Keep the
    clone holding the reference commit (the oracle store) outside every path the configuration shows.
+   A seeded arm's Memory takes the `prior_experience` that `plan` prints for the run, and nothing else,
+   before the first launch (section 3.5).
 3. **Configure** from `real_run_config.yaml`, adding only what is the host's (`state_dir`,
    `execution.worktree_dir`, `github.command`, `sandbox.read_only_paths`), and setting
    `validation.commands` to what `uv run python -m tests.evaluation plan --comparison memory_benefit`
@@ -355,19 +437,25 @@ it to find problems. The same steps make every later run:
    AUTOFORGE_EVAL_REAL=1 uv run python -m tests.evaluation collect \
      --task TASK --arm single_agent_no_memory --seed 0 --approval APPROVAL_URL \
      --state-dir STATE_DIR --repo DISPOSABLE --base-commit BASE_COMMIT --live-head PR_HEAD \
-     --config FILE --oracle-repo CLONE --out RECORD.json
+     --config FILE --oracle-repo CLONE --safety-checked WHERE --out RECORD.json
    ```
-   `collect` refuses a run on this repository, a base of another tree, another configuration, or no
-   sandbox: the hidden tests run the candidate's code, and only as `validation.commands` would.
-   A run that never reached a verdict is scored with `--stopped-by` and `--reason`. A skipped or
-   refused run is a record, never a pass.
+   `collect` refuses a run on this repository, a base of another tree, another configuration, a run its
+   own records show under other settings, or no sandbox: the hidden tests run the candidate's code, and
+   only as `validation.commands` would. `--safety-checked` names where the operator recorded section 5's
+   check, and `--safety-failure` says what it found. A run that never reached a verdict is scored the
+   same way with `--stopped-by` and `--reason`, without the run's flags only if it left nothing to read.
+   A skipped or refused run is a record, never a pass.
 6. **Report,** over every record of the plan:
    `uv run python -m tests.evaluation report RECORD.json ... --harness-report FIXTURE_REPORT.json`.
-   Post it on #318 in full, failures included.
+   It prints every run with its outcome, reasons and where each usage value came from; each criterion
+   with its interval; what was excluded, missing or stopped; and every task with its seeds' spread and
+   outcomes. Add `--json` for the same as data. Post it on #318 in full, failures included.
 
 The cost is the provider's bill for one agent run per candidate plus review rounds, and each
 candidate's validation takes as long as the suite does (ADR 0010 records about eight to sixteen
-minutes serially on the hosts it measured). No run of this procedure has been timed or priced.
+minutes serially on the hosts it measured). The pristine suite adds one such run to `collect`, on the
+final candidate of a run that would otherwise be a success. No run of this procedure has been timed or
+priced.
 
 ## 10. What these results may not be used for
 
@@ -386,9 +474,22 @@ fixes; that affects every arm alike but may raise every arm's rate.
   fair rule catches only a missing name. Each statement gives the wording its tests assert, as read when
   writing it, and the smoke run and the first results should be read for a task nobody can pass. Such a
   task lowers every arm's rate, and an amendment before the first comparison may replace it.
+- The pristine suite holds a candidate to every test the reference commit has, and the fair rule checked
+  only the functions it added. One it changed may assert how the reference did it, so a correct
+  candidate can read `pristine_checkers_failed`, on every arm alike. Its failing modules are in the
+  record to read for that.
+- An edit that weakens a test in a file the reference edited, and hides no failure, is not flagged: only
+  what it hid is. Nothing is decided on that test, since the pristine suite runs its own copy.
+- The pristine suite is one more run of the whole suite, so a flaky test costs a verified success, on
+  every arm alike. On the one measured pass, a loaded host failed one module that passed alone
+  (`pin_verification.json`). No retry was registered, since a retry is a choice made after an outcome;
+  a run host that does not hold its load steady will see this more.
 - `repeated_failed_approaches` compares trees, so the same idea rewritten counts as new, and
   `duplicate_exploration` does not see a `Bash` `cat`. Both undercount.
 - The pins were verified on one interpreter, Python 3.14.10, which is not the CI matrix's.
+- A lesson is the author's reading of an earlier commit, written before any run (section 3.5). A bad
+  lesson lowers the Memory arm's rate on its stratum, and only an amendment before the first comparison
+  may change it.
 - Validation runs only what `validation_ignore` leaves (section 4.1), and the oracle runs only the
   functions the reference commit added, so a regression elsewhere is left to review.
 
@@ -398,7 +499,7 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 **and states whether any real run had been made.** A record carries the digests it was made under, and a
 report refuses to decide over records of another, so criteria cannot move under results.
 
-- `manifest.json`: `5f2dc544394a665c45098f62fa83cedae22b6a8650436b99031a1edad04640c9`
+- `manifest.json`: `5ef8a4228a0bb56327427f2635ea0a469bdd4d0ddfd4e372258dc216486a5924`
 - `preregistration.json`: `5f1dfe4ec7c39b9df2c0b8b7a5d5b996708190b1b4a399926cbc8136a08cfb5b`
 - `real_run_config.yaml`: `6270e03cd6760c28136151af502ef88824c9c37c96f1cf81a14882a7d884b4a0`
 

@@ -1945,8 +1945,16 @@ model. They cover:
 - the pinned files: the manifest and pre-registration validate against each
   other; a statement naming a hidden test or the reference commit is refused;
   each pin is what the history holds, skipped with its reason where no history
-  exists; every task was verified fair; the protocol's digests, task table,
-  thresholds, ceilings, control-plane list and negative fixtures are the files';
+  exists; every task was verified fair, at its base and its reference; the
+  protocol's digests, task table, thresholds, ceilings, control-plane list and
+  negative fixtures are the files';
+- what a Memory arm starts with: every task holds a lesson from at or before its
+  base, of about the size of its match's, naming no hidden test and copying no
+  line of the fix; only an arm with Memory is seeded, and a run that did not start
+  with its task's lesson leaves no result;
+- checkers: against the real manifest, each kind of change to a protected path or
+  an existing test file is `checker_altered`, what a good candidate does is not,
+  and the pristine suite finds what a text rule cannot;
 - what is held equal: every configuration section is classified, a new
   top-level one is refused, a new key under an existing one reaches the digest
   (ADR 0010's `validation.fast_commands` among them), and where a host keeps
@@ -1954,23 +1962,30 @@ model. They cover:
 - the decision: tasks are the resampling unit, so more seeds never narrow an
   interval; only `measured` values can pass, so unknown tokens or an estimated
   cost rule out `GO`; a fixture never reaches a decision; a missing arm is
-  `NOT_EVALUATED` and raises nothing; harm is `NO_GO` however large the benefit;
-  a failed run stays in the denominator, a pair with no record is
-  `INCONCLUSIVE`, exclusions are listed and bounded, and another digest, unequal
-  settings or a leaked test leave no result;
+  `NOT_EVALUATED` and raises nothing; harm is `NO_GO` however large the benefit,
+  and on an incomplete sample too; a failed run stays in the denominator, a pair
+  with no record, a ceiling or too many exclusions is `INCONCLUSIVE` before any
+  primary effect is read, exclusions are listed and bounded, and another digest,
+  unequal settings, two records of one run or a leaked test leave no result;
 - the fixture baseline: byte-identical across two runs and in a process outside
   pytest; the single-agent path, controller-owned effects, exact candidate
   records, the certificate, a closed gate and no credential in a launch on every
   run; each negative fixture scored for what it is; a crash after a landed effect
   repeats nothing;
-- what a score reads: a narrower run than the configured set is no evidence,
-  prose in a run log changes nothing, and `not_configured` is no pass;
+- what a score reads: a narrower run than the configured set is no evidence, nor
+  is a record under another policy or a certificate that no longer applies; prose
+  in a run log changes nothing, and `not_configured` is no pass; a lost launch line
+  or an unreadable run log leaves what it decides `unknown`, an unassessed safety
+  gate rules out `GO`, and a stopped run keeps what it did and spent;
 - the oracle: the candidate's code gets the launch isolation of
   `validation.commands`, and the export-command sandbox under `required`; only
   exit 0 is a pass, and what could not run is `not_run`;
+- what is published: the report the protocol says to post holds every real run,
+  every criterion's interval, what left the sample and every task;
 - what never happens: `collect` needs its opt-in and a recorded approval and
-  refuses a run outside the protocol's terms, no workflow or `make` gate runs the
-  harness, and it names no real provider and no GitHub client.
+  refuses a run outside the protocol's terms or one its own records show under
+  other settings, no workflow or `make` gate runs the harness, and it names no real
+  provider and no GitHub client.
 
 ### Packaging and the installed artifact (#256)
 

@@ -240,7 +240,9 @@ read it before adding tests for a listed area.
 - `tests/evaluation.py` is no test either: the harness of
   `docs/evaluation-protocol.md` (#318), which scores a run's state file and run
   log read only, runs its hidden tests as `validation.commands` run, and decides
-  over records, launching no agent and holding no credential. `tests/evaluation_fixture.py`
+  over records, launching no agent and holding no credential. It keeps its own copy
+  of the validation policy rule so as to hold no engine, and a test keeps the two
+  one. `tests/evaluation_fixture.py`
   (`make eval-fixture`) plays `tests/fixtures/evaluation/fixture_tasks.json` through
   the real engine on `FakeGitHub`, a bare origin and a scripted provider, at fixed
   commit dates, doing in its own process what the autouse fixtures do. A hidden
