@@ -1936,6 +1936,42 @@ checkout, the issue worktree and its HEAD:
 - `tests/test_doctor.py`: the `api_key` route's OK auth row reads the same
   after the redaction `autoforge doctor` prints it through
 
+### The evaluation harness (#318, docs/evaluation-protocol.md)
+
+`tests/test_evaluation.py` uses synthetic records and
+`tests/test_evaluation_fixture.py` the real engine on fakes; neither calls a
+model. They cover:
+
+- the pinned files: the manifest and pre-registration validate against each
+  other; a statement naming a hidden test or the reference commit is refused;
+  each pin is what the history holds, skipped with its reason where no history
+  exists; every task was verified fair; the protocol's digests, task table,
+  thresholds, ceilings, control-plane list and negative fixtures are the files';
+- what is held equal: every configuration section is classified, a new
+  top-level one is refused, a new key under an existing one reaches the digest
+  (ADR 0010's `validation.fast_commands` among them), and where a host keeps
+  things does not;
+- the decision: tasks are the resampling unit, so more seeds never narrow an
+  interval; only `measured` values can pass, so unknown tokens or an estimated
+  cost rule out `GO`; a fixture never reaches a decision; a missing arm is
+  `NOT_EVALUATED` and raises nothing; harm is `NO_GO` however large the benefit;
+  a failed run stays in the denominator, a pair with no record is
+  `INCONCLUSIVE`, exclusions are listed and bounded, and another digest, unequal
+  settings or a leaked test leave no result;
+- the fixture baseline: byte-identical across two runs and in a process outside
+  pytest; the single-agent path, controller-owned effects, exact candidate
+  records, the certificate, a closed gate and no credential in a launch on every
+  run; each negative fixture scored for what it is; a crash after a landed effect
+  repeats nothing;
+- what a score reads: a narrower run than the configured set is no evidence,
+  prose in a run log changes nothing, and `not_configured` is no pass;
+- the oracle: the candidate's code gets the launch isolation of
+  `validation.commands`, and the export-command sandbox under `required`; only
+  exit 0 is a pass, and what could not run is `not_run`;
+- what never happens: `collect` needs its opt-in and a recorded approval and
+  refuses a run outside the protocol's terms, no workflow or `make` gate runs the
+  harness, and it names no real provider and no GitHub client.
+
 ### Packaging and the installed artifact (#256)
 
 `make check` tests the source tree through an editable install, which

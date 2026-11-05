@@ -237,6 +237,17 @@ read it before adding tests for a listed area.
   the limitations printed
   with every summary. `tests/test_stop_corpus.py` runs it on synthetic runs
   and proves it writes nothing and opens no FIFO or link.
+- `tests/evaluation.py` is no test either: the harness of
+  `docs/evaluation-protocol.md` (#318), which scores a run's state file and run
+  log read only, runs its hidden tests as `validation.commands` run, and decides
+  over records, launching no agent and holding no credential. `tests/evaluation_fixture.py`
+  (`make eval-fixture`) plays `tests/fixtures/evaluation/fixture_tasks.json` through
+  the real engine on `FakeGitHub`, a bare origin and a scripted provider, at fixed
+  commit dates, doing in its own process what the autouse fixtures do. A hidden
+  file is held in JSON, so that pytest never collects one and no agent's worktree
+  holds one. `tests/test_evaluation.py` uses synthetic records and
+  `tests/test_evaluation_fixture.py` the fixtures. A change to a pinned file moves
+  a digest the protocol registers; see its section 11.
 - `watched_fifo(path)` makes a FIFO and yields the list of times
   something opened it to read (a watchdog releases the reader, so a read
   that follows a planted link records itself instead of hanging the
@@ -481,6 +492,11 @@ ADR 0011)                             class mapped, routes from the outcome alon
 recovery and escalation (#370,        test_stop_classification.py (ADR 0012's stop matrix takes
 ADR 0012)                             every outcome that needs recovery, its gate A table every
                                       reason family and code, and every test it names exists)
+the evaluation protocol (#318)        test_evaluation.py (the pins, what arms hold equal, the
+                                      statistics and decision on synthetic records, what never
+                                      runs in CI; the protocol held to its files),
+                                      test_evaluation_fixture.py (the baseline on the real engine,
+                                      its reproducibility, the negative fixtures, the oracle)
 troubleshooting guide (#260)          test_troubleshooting_guide.py (every scenario row names
                                       a test that exists; the guide's links and the links
                                       into it resolve)

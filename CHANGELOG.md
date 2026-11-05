@@ -5,6 +5,19 @@ so.
 
 ## Unreleased
 
+### An evaluation protocol for Issue Memory and multi-agent execution, registered before any real run (#318)
+
+[`docs/evaluation-protocol.md`](docs/evaluation-protocol.md) fixes, before
+anyone has seen an outcome, what would count as Issue Memory and multi-agent
+execution earning their cost: the arms, twelve pinned tasks from this
+repository's history with hidden tests, what is held equal, what is measured,
+and the go/no-go thresholds, margins, sample and cost ceilings. `make
+eval-fixture` runs the no-memory baseline on fakes through the unchanged
+engine and reports reproducibly on the harness, and says it is no evidence of
+model quality. No real run has been made, and nothing here starts one: a real
+run is the ordinary `autoforge` command on a disposable repository, separately
+approved. Nothing about a run of AutoForge changes.
+
 ### A merge whose outcome is unknown is no longer reported as "nothing was merged" (#376)
 
 When the controller's re-read of a PR failed right after `gh pr merge`,

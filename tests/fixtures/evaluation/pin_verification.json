@@ -1,0 +1,109 @@
+{
+  "what": "python -m tests.evaluation verify-pins --git . --run-oracle, on the commit that added this file",
+  "date": "2026-11-05",
+  "host": {
+    "python": "3.14.10",
+    "pytest": "9.1.1",
+    "git": "2.47.3",
+    "sandbox_mode": "disabled"
+  },
+  "limits": "Python 3.14.10 only, not the CI matrix's 3.11 or 3.12; the hidden tests' verdict at each commit, not the whole suite at the base",
+  "results": {
+    "c6-refusal-names-the-cache": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "claude-held-back-results": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "dry-run-prompt-placeholder": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "fix-entry-retarget": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "google-api-key-redaction": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "no-correction-with-a-survivor": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "opencode-recovered-errors": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "paginate-changed-files": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "prompt-version-refusal": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "redact-the-parsed-result": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "review-round-refused-by-reread": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    },
+    "yaml-subset-errors-name-the-path": {
+      "base": "fail",
+      "coupled_to_new_names": false,
+      "reference": "pass"
+    }
+  },
+  "selection": {
+    "eligible_commits": 23,
+    "refused_by_the_fair_rule": {
+      "99980c2b49": "hidden tests import a name the fix added",
+      "9b96fcfefb": "hidden tests import a name the fix added",
+      "d4faddbda6": "the hidden module does not collect at the base",
+      "acebe52aea": "the hidden tests do not collect at either commit",
+      "a86b729825": "a hidden test fails at the base on an attribute the fix added",
+      "0763d6e10a": "a hidden test fails at the base on a name the fix added",
+      "45a21022fa": "adds no test function"
+    },
+    "fair_but_not_taken": {
+      "87eb5d7ba9": "memory-independent, older than the six taken",
+      "48b0c3dadc": "memory-independent, older than the six taken",
+      "8cb9b62c88": "memory-independent, older than the six taken",
+      "0c3bdb14cd": "memory-independent, older than the six taken"
+    }
+  },
+  "base_suite": {
+    "what": "python -m tests.evaluation verify-pins --git . --base-suite --workers 6, twice: the first run's failing modules became each task's validation_ignore, and the second ran with them",
+    "limits": "measured under sandbox.mode: disabled on 6 pytest-xdist workers on one host; a real run is serial under sandbox.mode: required, so its host must measure this again (docs/evaluation-protocol.md, section 9)",
+    "results": {
+      "c6-refusal-names-the-cache": "pass",
+      "claude-held-back-results": "pass",
+      "dry-run-prompt-placeholder": "pass",
+      "fix-entry-retarget": "pass",
+      "google-api-key-redaction": "pass",
+      "no-correction-with-a-survivor": "pass",
+      "opencode-recovered-errors": "pass",
+      "paginate-changed-files": "pass",
+      "prompt-version-refusal": "pass",
+      "redact-the-parsed-result": "pass",
+      "review-round-refused-by-reread": "pass",
+      "yaml-subset-errors-name-the-path": "pass"
+    }
+  }
+}
