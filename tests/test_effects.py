@@ -6029,8 +6029,11 @@ def test_a_takeover_record_round_trips_and_a_corrupt_one_fails_loudly():
         takeover_record(replaced=RUN_ID)
     with pytest.raises(StateError, match="takes over another PR than the one its owner"):
         takeover_record(by=owner(Phase.ANALYZE_EXECUTE, pr_url=PR43))
-    with pytest.raises(StateError):
-        takeover_record(by=owner(Phase.FIX, pr_url=PR))  # K11 is ANALYZE_EXECUTE's only
+    # K11 is ANALYZE_EXECUTE's, and REVIEW's and FIX's to append to their
+    # plan (PR #460 R1-F1); no other phase plans one.
+    with pytest.raises(StateError, match="which UPDATE_EPIC never plans"):
+        takeover_record(by=owner(Phase.UPDATE_EPIC, pr_url=PR))
+    assert takeover_record(by=owner(Phase.FIX, pr_url=PR)).owner.phase is Phase.FIX
     raw = record.to_dict()
     raw["payload"]["body"] = TAKEOVER_BASE  # still names the other run
     with pytest.raises(StateError, match="does not carry exactly its identity's marker"):

@@ -124,6 +124,10 @@ MAX_TITLE_CHARS = 256
 # for one more finding, so 49 K5/K6, 4 K10 and one K1 (54). A K9 plan (one
 # acceptance comment for one finding) is smaller.
 MAX_EFFECTS_PER_PLAN = (MAX_FINDINGS_PER_REVIEW - 1) + MAX_OPERATOR_ACTIONS_PER_FIX + 1
+# The records a journal may hold: a REVIEW or FIX plan, and the operator's
+# takeover (K11, #414) appended to it as its last record (PR #460 R1-F1),
+# the one record that may sit past the plan's bound.
+MAX_EFFECT_RECORDS = MAX_EFFECTS_PER_PLAN + 1
 
 # D2.4's total bound, over every payload string of the plan and the
 # completion context counted at its stored bound. ``json.dumps`` writes the
@@ -482,7 +486,9 @@ KIND_PHASES: Mapping[EffectKind, frozenset[Phase]] = {
     EffectKind.PROGRESS_COMMENT: frozenset({Phase.UPDATE_EPIC}),
     EffectKind.ACCEPTANCE_COMMENT: frozenset({Phase.FIX}),
     EffectKind.OPERATOR_COMMENT: frozenset({Phase.FIX}),
-    EffectKind.OWNER_TAKEOVER: frozenset({Phase.ANALYZE_EXECUTE}),
+    # ANALYZE_EXECUTE binds the PR it takes over; REVIEW and FIX take back the
+    # PR they are bound to before their journaled plan completes (PR #460 R1-F1).
+    EffectKind.OWNER_TAKEOVER: frozenset({Phase.ANALYZE_EXECUTE, Phase.REVIEW, Phase.FIX}),
 }
 
 # D13.3: the contract a launch ran under, recorded in every pre-launch save of
@@ -1090,7 +1096,8 @@ class EffectRecord:
     @classmethod
     def from_dict(cls, raw: object, what: str = "effect record") -> EffectRecord:
         data = _exact(raw, cls._KEYS, what)
-        position = _int(data["position"], f"{what}.position", 0, MAX_EFFECTS_PER_PLAN - 1)
+        bound = MAX_EFFECT_RECORDS if _is_takeover(data) else MAX_EFFECTS_PER_PLAN
+        position = _int(data["position"], f"{what}.position", 0, bound - 1)
         what = f"effect record {position}"
         kind_text = _str(data["kind"], f"{what}.kind", 64)
         try:
@@ -1797,15 +1804,33 @@ def payload_chars(records: Sequence[EffectRecord]) -> int:
     return sum(len(v) for r in records for v in r.payload.values() if isinstance(v, str))
 
 
+def _is_takeover(raw: object) -> bool:
+    """Whether a raw record says it is K11, before it is parsed (PR #460 R1-F1)."""
+    return isinstance(raw, dict) and raw.get("kind") == EffectKind.OWNER_TAKEOVER.value
+
+
 def load_records(raw: object, binding: Binding) -> tuple[EffectRecord, ...]:
     """The persisted plan, validated: positions in order, one owner, D2.4's bounds."""
     if not isinstance(raw, list):
         _fail("effect_records", f"must be a list, got {type(raw).__name__}")
-    if len(raw) > MAX_EFFECTS_PER_PLAN:
-        _fail("effect_records", f"holds {len(raw)} records, over {MAX_EFFECTS_PER_PLAN}")
+    bound = MAX_EFFECTS_PER_PLAN + (1 if raw and _is_takeover(raw[-1]) else 0)
+    if len(raw) > bound:
+        _fail("effect_records", f"holds {len(raw)} records, over {bound}")
     records = tuple(
         EffectRecord.from_dict(item, f"effect_records[{i}]") for i, item in enumerate(raw)
     )
+    takeovers = [r.position for r in records if r.kind == EffectKind.OWNER_TAKEOVER]
+    if len(takeovers) > 1:
+        _fail("effect_records", "plans more than one takeover")
+    if takeovers and takeovers[0] != len(records) - 1:
+        # K11 (#414): the takeover precedes nothing of a plan; one appended to
+        # a REVIEW or FIX plan is completed before it (PR #460 R1-F1).
+        _fail("effect_records", "plans a takeover before another effect")
+    if len(records) - len(takeovers) > MAX_EFFECTS_PER_PLAN:
+        _fail(
+            "effect_records",
+            f"plans {len(records) - len(takeovers)} effects, over {MAX_EFFECTS_PER_PLAN}",
+        )
     for i, record in enumerate(records):
         if record.position != i:
             _fail(f"effect_records[{i}]", f"is at position {record.position}, not {i}")
@@ -2896,6 +2921,24 @@ class PhaseEffects:
         return not self.records and self.observation is None and self.context is None
 
     @property
+    def appended_takeover(self) -> EffectRecord | None:
+        """The K11 record appended to this REVIEW or FIX plan, or ``None`` (PR #460 R1-F1).
+
+        The operator's takeover of the PR a run is bound to, journaled while
+        the run's plan for the phase was still incomplete: it is sent, read
+        back and dropped before anything of the plan is, so the plan itself
+        never holds it. A takeover journaled alone, in ANALYZE_EXECUTE, is
+        no appended one.
+        """
+        if (
+            len(self.records) > 1
+            and self.records[-1].kind is EffectKind.OWNER_TAKEOVER
+            and self.records[0].owner.phase in (Phase.REVIEW, Phase.FIX)
+        ):
+            return self.records[-1]
+        return None
+
+    @property
     def published(self) -> bool:
         """D4.7: every record of the plan is observed (an empty plan is published)."""
         return all(r.stage == Stage.OBSERVED for r in self.records)
@@ -2906,6 +2949,15 @@ def load_phase_effects(
 ) -> PhaseEffects:
     """Validate the three persisted pieces against the state and against each other."""
     records = load_records(records_raw, binding)
+    # A takeover appended to a REVIEW or FIX plan (PR #460 R1-F1) is no part
+    # of that plan: the context is checked against the plan alone, and the
+    # plan's size bound counts the plan alone (K11's body is bounded as any
+    # body is). Only those phases append one; ANALYZE_EXECUTE's is the plan.
+    plan = records
+    if records and records[-1].kind is EffectKind.OWNER_TAKEOVER and len(records) > 1:
+        if records[0].owner.phase not in (Phase.REVIEW, Phase.FIX):
+            _fail("effect_records", "append a takeover to a plan of a phase that takes none over")
+        plan = records[:-1]
     observation = None
     if not isinstance(observation_raw, dict):
         _fail("entry_observation", f"must be an object, got {type(observation_raw).__name__}")
@@ -2929,11 +2981,17 @@ def load_phase_effects(
         _fail("effect state", "names more than one phase across records, observation and context")
     context = None
     if context_raw:
-        context = load_context(context_raw, binding, records=records, observation=observation)
+        context = load_context(context_raw, binding, records=plan, observation=observation)
     effects = PhaseEffects(records, observation, context)
     if records and context is None:
         _fail("effect_records", "are persisted without the completion context saved with them")
-    problem = plan_size_problem(records, context)
+    if (
+        records
+        and records[0].owner.phase in (Phase.REVIEW, Phase.FIX)
+        and records[0].kind is EffectKind.OWNER_TAKEOVER
+    ):
+        _fail("effect_records", "hold a takeover with no plan of the phase to append it to")
+    problem = plan_size_problem(plan, context)
     if problem:
         _fail("effect state", problem)
     return effects

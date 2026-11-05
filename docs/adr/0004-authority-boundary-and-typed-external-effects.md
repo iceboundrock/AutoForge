@@ -1388,15 +1388,35 @@ replaced, and its precondition is that exact body.
   - `--take-over` naming a PR other than the bound one, or than the one
     the listing finds;
   - a K11 already journaled and pending (a plain `unblock` re-enters
-    `ANALYZE_EXECUTE` to finish it);
-  - the run's own `ANALYZE_EXECUTE` plan, or records of another phase,
-    journaled: those are finished first, never discarded by a takeover;
+    `ANALYZE_EXECUTE`, or the phase of the plan it is appended to, to
+    finish it);
+  - the run's own `ANALYZE_EXECUTE` plan, or records of a phase other than
+    `REVIEW` and `FIX`, journaled: those are finished first, never
+    discarded by a takeover;
   - a marker that already names this run: a bound run is told to unblock
     without the flag; an unbound one to start a fresh run, since a marker
     the run did not write hands it nothing (D9.3);
   - no marked PR, or a body without exactly one readable marker of the
     issue;
   - a run with a replan journal, which `unblock` never re-enters (D9.4a).
+- **Appended to a `REVIEW` or `FIX` plan** (PR #460 R1-F1). A bound run
+  that journaled its `REVIEW` or `FIX` plan and stopped before it was
+  sent, as a run in flight when #414 was installed may have, keeps the
+  plan: `--take-over` of its own PR appends the K11 record to it as its
+  last record, with the plan's owner, and re-enters the plan's phase
+  rather than `ANALYZE_EXECUTE`. The phase's next step sends the takeover
+  before anything else, with the windows above, and drops the record once
+  it reads back; the step's owner check then reads the PR, and the plan
+  completes as journaled, each record reconciled with GitHub first. The
+  takeover rebinds nothing and marks nothing stale: the plan's own reads
+  of the PR decide whether it is still current, as on any entry after a
+  stop. A conflicted takeover sends nothing of the plan; a plain
+  `unblock` refuses, and a second `--take-over` of the same PR replaces
+  the record. The unblock reopens none of the plan's records: a conflict
+  of the plan is reported by its phase once the takeover is through, and
+  a plain `unblock` decides it then. A plan holds at most one K11, last;
+  it does not count toward the plan's record or size bounds, and its
+  phase's completion context is validated against the plan alone.
 - **Residual:** as for K3, GitHub has no conditional body update. An edit
   that lands between the reconciliation's read and the write is
   overwritten. D9.4a's operator procedure stops the old controller first.
@@ -2327,7 +2347,10 @@ its author. Only the effect records and the entry observation prove origin.
     ownerless PR blocks at its next step, with the takeover command in its
     reason; it does not keep driving. A K2, K3 or K7 record saved before
     the change holds the ownerless marker. It loads and completes, and the
-    binding it makes then blocks the same way.
+    binding it makes then blocks the same way. A run stopped mid-`REVIEW`
+    or mid-`FIX` with its plan journaled blocks the same way, and its one
+    `--take-over` is appended to that plan, which then completes (K11
+    below; PR #460 R1-F1).
   - **Where the check runs.** On a read the step already makes wherever
     one exists, and on one more read where it does not:
     - at the start of each step in `REVIEW`, `FIX` and
@@ -2436,7 +2459,9 @@ its author. Only the effect records and the entry observation prove origin.
     "Round 1". The numbering rule is left to a follow-up; merge still
     requires the taking run's own review certificate.
   - **Upgrade cost.** Every run in flight at the upgrade stops once and
-    needs one `--take-over`.
+    needs one `--take-over`. A run stopped mid-`REVIEW` or mid-`FIX` with
+    its plan journaled keeps the plan: the takeover is appended to it and
+    the plan completes after it (PR #460 R1-F1).
 - **D9.5 (#163) `FIX`.** Marker-bearing follow-ups found at entry are handed
   over and are never republished, as with #90's `EXISTING_FOLLOW_UP_ISSUES`
   today. An open finding's own follow-up is that finding's follow-up: it is

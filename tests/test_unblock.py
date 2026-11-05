@@ -15,6 +15,7 @@ import pytest
 
 from autoforge import engine as engine_module
 from autoforge.claims import render_implementation_marker
+from autoforge.effects import EffectKind, Stage
 from autoforge.errors import (
     ConfigurationError,
     GitHubError,
@@ -450,6 +451,184 @@ def test_k11_never_writes_over_an_edit_its_own_claimant_listing_saw(tmp_state_di
     assert out.next_phase == "BLOCKED" and out.stop.code is StopReasonCode.EFFECT_CONFLICT
     assert "the PR body changed since the takeover read it" in eng.state.block_reason
     assert fake_github.effect_writes == [] and fake_github.prs[PR].body == edited
+
+
+def _stopped_mid_plan(tmp_path, phase: Phase, owner: str | None):
+    """A run that stopped with its REVIEW or FIX plan half sent, then lost its PR.
+
+    FIX: the follow-up issue is created and the push still intended. REVIEW:
+    the round comment is still intended. Then the PR's marker names ``owner``
+    (``None``: a PR opened before #414 recorded owners). Returns the engine
+    of the next controller process, its GitHub and what was sent so far.
+    """
+    from tests.test_engine import (
+        _finding,
+        _in_fix,
+        _in_review,
+        _power_loss_at,
+        fixed,
+        fixer,
+        new_follow_up,
+    )
+
+    gh = FakeGitHub()
+    state_dir = tmp_path / "state"
+    if phase is Phase.FIX:
+        script = fixer(fixed("R1-F1"), new_follow_up("R1-F2"))
+        eng = _in_fix(state_dir, gh, script, findings=[_finding(1), _finding(1, 2)], origin=True)
+        _power_loss_at(eng, EffectKind.PUSH, Stage.ATTEMPTED, saved=False)
+    else:
+        eng = _in_review(state_dir, gh, [block(review_result(1, SHA_A))])
+        _power_loss_at(eng, EffectKind.REVIEW_COMMENT, Stage.ATTEMPTED, saved=False)
+    eng._save()
+    with pytest.raises(KeyboardInterrupt):
+        eng.step()
+    sent = list(gh.effect_writes)
+    gh.prs[PR].body = implementation_pr_body(owner_run_id=owner)
+    return _next_process(eng, gh), gh, sent
+
+
+def _next_process(eng, gh):
+    """A new controller process on the same state, GitHub and (if any) git remote."""
+    from tests.test_engine import _resumed as resumed
+
+    if getattr(eng, "origin", None) is not None:
+        return resumed(eng, eng.paths.state_dir, gh, "never")
+    eng.close()
+    again = make_engine(eng.paths.state_dir, "never", github=gh)
+    again.load()
+    return again
+
+
+@pytest.mark.parametrize("phase", [Phase.FIX, Phase.REVIEW])
+@pytest.mark.parametrize("owner", [None, OTHER_RUN], ids=["legacy-ownerless", "displaced"])
+def test_a_run_stopped_mid_plan_takes_its_pr_back_and_completes_the_plan(tmp_path, phase, owner):
+    """PR #460 R1-F1: a run stopped with a REVIEW or FIX plan half sent (one
+    stopped this way when #414 was installed, or one displaced since) is not
+    stranded. 'unblock --take-over' of its own PR appends K11 to the plan;
+    the next step writes this run into the marker first, then completes the
+    plan as journaled: nothing of it is sent twice, nothing is dropped, and
+    no agent is launched again."""
+    eng, gh, sent = _stopped_mid_plan(tmp_path, phase, owner)
+    planned = [(r.kind, r.stage) for r in eng.state.phase_effects().records]
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and out.stop.code is StopReasonCode.PR_OWNER
+    assert gh.effect_writes == sent
+    assert not eng.unblock(REASON).unblocked
+
+    taken = eng.unblock(REASON, take_over=PR)
+    assert taken.unblocked, taken.message
+    assert eng.state.phase is phase and gh.effect_writes == sent
+    effects = eng.state.phase_effects()
+    assert [(r.kind, r.stage) for r in effects.records] == [
+        *planned,
+        (EffectKind.OWNER_TAKEOVER, Stage.INTENDED),
+    ]
+    out = eng.step()
+    run_id = eng.state.run_id
+    marker = implementation_pr_body(owner_run_id=run_id)
+    assert gh.prs[PR].body == marker
+    rest = [w[0] for w in gh.effect_writes[len(sent) :]]
+    if phase is Phase.FIX:
+        assert out.next_phase == "REVIEW", out.message
+        assert rest == ["write_pr_body"]  # the push is git's, not a GitHub write
+        assert gh.prs[PR].head_sha == eng.state.current_head_sha != eng.state.reviewed_head_sha
+        assert [w[0] for w in sent] == ["create_issue"]
+    else:
+        # The round this run reviewed, at the revision the PR is still at: its
+        # comment is posted and its clean verdict applied, as on any entry.
+        assert rest == ["write_pr_body", "create_pr_comment"], out.message
+        assert out.next_phase == "READY_FOR_MERGE", out.message
+    assert eng.state.phase_effects().appended_takeover is None
+    assert eng.provider.calls == []
+
+
+def test_an_appended_takeover_never_writes_over_an_edit_and_is_planned_again(tmp_path):
+    """A body edited after the takeover read it is a conflict: nothing of the
+    takeover or of the plan is sent, a plain unblock is refused, and a second
+    'unblock --take-over' replaces the record, on the body as it is now."""
+    eng, gh, sent = _stopped_mid_plan(tmp_path, Phase.FIX, None)
+    eng.step()
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    edited = "A human edit.\n\n" + implementation_pr_body(owner_run_id=None)
+    gh.prs[PR].body = edited
+    out = eng.step()
+    assert out.next_phase == "BLOCKED" and out.stop.code is StopReasonCode.EFFECT_CONFLICT
+    assert "nothing of the FIX plan it precedes was sent" in out.message
+    assert gh.effect_writes == sent and gh.prs[PR].body == edited
+    assert not eng.unblock(REASON).unblocked
+
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    records = eng.state.phase_effects().records
+    assert [r.kind for r in records] == [
+        EffectKind.FOLLOW_UP_ISSUE,
+        EffectKind.PUSH,
+        EffectKind.OWNER_TAKEOVER,
+    ]
+    assert records[-1].stage is Stage.INTENDED
+    assert eng.step().next_phase == "REVIEW"
+    assert gh.prs[PR].body == edited.replace(
+        render_implementation_marker(ISSUE, None),
+        render_implementation_marker(ISSUE, eng.state.run_id),
+    )
+
+
+@pytest.mark.parametrize("landed", [True, False], ids=["landed", "lost"])
+def test_an_appended_takeover_after_a_crash_mid_write_reads_back_first(tmp_path, landed):
+    """The crash windows of an appended K11, as of one journaled alone: a write
+    that landed is observed and never sent again, one that did not is sent
+    once more; the plan completes after it either way."""
+    eng, gh, sent = _stopped_mid_plan(tmp_path, Phase.FIX, OTHER_RUN)
+    eng.step()
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    record = eng.state.phase_effects().appended_takeover
+    eng.state.effect_records[record.position] = record.attempting().to_dict()
+    eng._save()
+    taken = implementation_pr_body(owner_run_id=eng.state.run_id)
+    if landed:
+        gh.prs[PR].body = taken
+    again = _next_process(eng, gh)
+    assert again.step().next_phase == "REVIEW"
+    assert gh.prs[PR].body == taken
+    rest = gh.effect_writes[len(sent) :]
+    assert rest == ([] if landed else [("write_pr_body", PR, taken)])
+
+
+def test_a_plan_taken_back_after_its_pr_moved_is_routed_by_its_own_checks(tmp_path):
+    """The takeover hands the PR back, not the plan's premises: the run that
+    drove the PR meanwhile pushed past the reviewed HEAD, so the FIX plan's
+    own read of the PR finds a revision it did not plan for, sends no push,
+    and carries the findings to REVIEW, as on any entry after a stop."""
+    eng, gh, sent = _stopped_mid_plan(tmp_path, Phase.FIX, OTHER_RUN)
+    eng.step()
+    reviewed = eng.state.reviewed_head_sha
+    gh.prs[PR].head_sha = SHA_B
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    out = eng.step()
+    assert out.next_phase == "REVIEW", out.message
+    assert gh.prs[PR].body == implementation_pr_body(owner_run_id=eng.state.run_id)
+    assert [w[0] for w in gh.effect_writes[len(sent) :]] == ["write_pr_body"]
+    assert eng.origin.head(BRANCH) == reviewed  # the candidate was never pushed
+    assert eng.state.prior_findings and eng.provider.calls == []
+
+
+def test_a_journaled_appended_takeover_is_completed_by_a_plain_unblock_only(tmp_path):
+    """A run stopped again before its appended takeover was sent: a plain
+    unblock re-enters the plan's phase to complete it, and a second
+    '--take-over' is refused, as for one journaled alone."""
+    eng, _, _ = _stopped_mid_plan(tmp_path, Phase.FIX, OTHER_RUN)
+    eng.step()
+    assert eng.unblock(REASON, take_over=PR).unblocked
+    eng.state.phase = Phase.BLOCKED
+    eng.state.block_reason = "stopped before the step"
+    eng._save()
+    refused = eng.unblock(REASON, take_over=PR)
+    assert not refused.unblocked
+    assert "the takeover of" in refused.message and "is already journaled" in refused.message
+    resumed = eng.unblock(REASON)
+    assert resumed.unblocked and eng.state.phase is Phase.FIX, resumed.message
+    assert eng.state.phase_effects().appended_takeover.stage is Stage.INTENDED
+    assert eng.step().next_phase == "REVIEW"
 
 
 def test_a_k11_record_is_refused_under_a_protocol_before_14(tmp_state_dir, fake_github):

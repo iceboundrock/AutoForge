@@ -936,7 +936,9 @@ command. To take the PR over:
    repository or headed in a fork, is not the issue's one marked PR (or,
    for a bound run, not the PR it is bound to), or its body does not carry
    exactly one readable marker of the issue; when the run journaled other
-   writes it has to finish first; and when the marker already names this
+   writes it has to finish first (other than a `REVIEW` or `FIX` plan,
+   which the takeover is added to; see below); and when the marker already
+   names this
    run (unblock without the flag if the run is bound to the PR; otherwise
    start a fresh run, since a marker this run did not write hands it
    nothing).
@@ -958,6 +960,15 @@ written re-enters `ANALYZE_EXECUTE` to finish it, and a second
 `--take-over` is refused. A plain `unblock`, `resume`, `run --force` and
 `epic archive` never take a PR over, and `unblock --take-over --dry-run`
 writes nothing.
+
+A run that stopped partway through a `REVIEW` or `FIX` step, with its
+round comment, follow-ups or push recorded but not all sent, keeps that
+work. This is also what a run in flight when you upgraded to #414 looks
+like. `--take-over` adds the takeover to that recorded work, and `resume`
+continues in the same phase: it writes this run into the marker first,
+then finishes what was recorded, checking each write against GitHub so
+that nothing is sent twice. If the PR moved while another run drove it,
+that phase's own checks send the run back to `REVIEW` instead.
 
 A run with a replan journal is never unblocked. When its replan is refused
 for the PR's owner, start a fresh run for the issue and take the PR over

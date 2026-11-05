@@ -4866,6 +4866,10 @@ class ControllerEngine:
     ) -> StepOutcome:
         """The charged part of :meth:`_step_once`: the phase's entry, launch and result."""
         state = self._require_state()
+        taken = self._complete_appended_takeover(previous)
+        if taken is not None:
+            code, reason = taken
+            return self._block(previous, plan, reason, code=code)
         self._check_bound_owner(previous, "nothing was launched or sent in this step", entry=True)
         if previous == Phase.INITIALIZING:
             return self._initialize(plan)
@@ -7205,7 +7209,16 @@ class ControllerEngine:
             )
         assert target is not None
         pr = decision.pr
-        if decision.takeover is not None:
+        if decision.takeover is not None and decision.takeover.owner.phase in (
+            Phase.REVIEW,
+            Phase.FIX,
+        ):
+            # PR #460 R1-F1: appended to the run's REVIEW or FIX plan, in place
+            # of one appended before; the plan is kept as it stood, and its
+            # phase sends the takeover before anything of it.
+            plan = state.effect_records[: decision.takeover.position]
+            state.effect_records = [*plan, decision.takeover.to_dict()]
+        elif decision.takeover is not None:
             # #414 (K11): the operator's takeover is journaled with the
             # unblock, before anything is written to the PR; ANALYZE_EXECUTE
             # sends it, reads it back and only then binds the PR. The entry it
@@ -7316,11 +7329,14 @@ class ControllerEngine:
                     )
             state.bound_operator_comment_outcomes()
         effects = state.phase_effects()
-        if effects.phase == target:
+        if effects.phase == target and effects.appended_takeover is None:
             # D2.4: the records belong to the phase entry the block
             # interrupted, and the unblock resumes it. A conflict the operator
             # resolved is reconciled again, its attempt count kept; any other
-            # target drops them with the save below.
+            # target drops them with the save below. A plan with a takeover
+            # appended is resumed as it stood (PR #460 R1-F1): the operator
+            # decided on the PR's owner, not on the plan's conflicts, which
+            # its phase reports once the takeover is through.
             state.effect_records = [r.reopened().to_dict() for r in effects.records]
         state.validation_override_seq = watermark
         state.block_reason = ""
@@ -7555,7 +7571,7 @@ class ControllerEngine:
             )
         return self._plan_takeover(url)
 
-    def _plan_takeover(self, url: str) -> UnblockDecision:
+    def _plan_takeover(self, url: str, append_to: PhaseEffects | None = None) -> UnblockDecision:
         """Plan K11 on PR ``url`` from a fresh read of its body (#414, ADR 0004 D9.4a).
 
         The PR must be open, in the run's repository and headed there, with
@@ -7570,6 +7586,13 @@ class ControllerEngine:
         journal), and public marker text hands nothing over (D9.3). The
         record is validated exactly as a later load validates it; nothing is
         written here.
+
+        With ``append_to``, the bound run's incomplete REVIEW or FIX plan, the
+        record is appended to that plan instead of starting an
+        ANALYZE_EXECUTE entry (PR #460 R1-F1): the phase's next step sends
+        it and reads it back before anything of the plan, and the plan then
+        completes as journaled. A takeover appended before and conflicted or
+        written is replaced.
         """
         state = self._require_state()
         refused = f"unblock --take-over {url} is refused"
@@ -7624,15 +7647,20 @@ class ControllerEngine:
             return UnblockDecision(
                 None, f"{refused}: the body the takeover would write is refused: {problem}", pr=pr
             )
-        owner = EffectOwner(
-            run_id=state.run_id,
-            phase=Phase.ANALYZE_EXECUTE,
-            issue_url=state.current_issue_url,
-            pr_url=state.current_pr_url,
-            transaction_id="",
-        )
+        plan: tuple[EffectRecord, ...] = ()
+        if append_to is None:
+            owner = EffectOwner(
+                run_id=state.run_id,
+                phase=Phase.ANALYZE_EXECUTE,
+                issue_url=state.current_issue_url,
+                pr_url=state.current_pr_url,
+                transaction_id="",
+            )
+        else:
+            plan = append_to.records[:-1] if append_to.appended_takeover else append_to.records
+            owner = plan[0].owner
         record = EffectRecord.plan(
-            0,
+            len(plan),
             EffectKind.OWNER_TAKEOVER,
             owner,
             identity={
@@ -7648,13 +7676,34 @@ class ControllerEngine:
         )
         # Strictly validated exactly as the load after the unblock's save
         # will validate it: a plan that fails is never written.
+        whose = f"run {previous}" if previous else "no run"
+        if append_to is not None:
+            load_phase_effects(
+                [*(r.to_dict() for r in plan), record.to_dict()],
+                state.entry_observation,
+                state.completion_context,
+                state.effect_binding(),
+            )
+            phase = owner.phase
+            return UnblockDecision(
+                phase,
+                f"open PR {ref.canonical} (HEAD {pr.head_sha[:12]}) carries the implementation "
+                f"marker for issue #{issue.number}, which names {whose}; the operator hands it "
+                f"back to this run ({state.run_id}), whose {phase.value} plan is journaled "
+                f"({', '.join(r.describe() for r in plan)}). {phase.value} first writes this "
+                "run into the marker (K11) and reads the body back, sending nothing of the "
+                "plan before, then completes the plan as journaled, reconciling each record "
+                "with GitHub first (ADR 0004 D9.4a)",
+                pr=pr,
+                action=f"take-over {ref.canonical}",
+                takeover=record,
+            )
         load_phase_effects(
             [record.to_dict()],
             {},
             AnalyzeContext(state.current_issue_url).to_dict(),
             state.effect_binding(),
         )
-        whose = f"run {previous}" if previous else "no run"
         return UnblockDecision(
             Phase.ANALYZE_EXECUTE,
             f"open PR {ref.canonical} (HEAD {pr.head_sha[:12]}) carries the implementation "
@@ -7695,6 +7744,8 @@ class ControllerEngine:
         same PR plans it again, on the body as it is now (``None`` here,
         and the caller plans it).
         """
+        if effects.appended_takeover is not None:
+            return self._appended_takeover_decision(effects, take_over)
         if not (
             isinstance(effects.context, AnalyzeContext)
             and [r.kind for r in effects.records] == [EffectKind.OWNER_TAKEOVER]
@@ -7739,6 +7790,51 @@ class ControllerEngine:
             "back and binds the PR, launching no agent",
         )
 
+    def _appended_takeover_decision(
+        self, effects: PhaseEffects, take_over: TakeOverRequest | None
+    ) -> UnblockDecision | None:
+        """The unblock of a run with K11 appended to its REVIEW or FIX plan (PR #460 R1-F1).
+
+        As :meth:`_saved_takeover_decision` for one journaled alone, but the
+        phase re-entered is the plan's: a pending takeover is completed by a
+        plain unblock and refused a second ``--take-over``; one written is
+        dropped by the phase, whose owner check reads the PR first; one that
+        conflicted sends nothing more, and only a ``--take-over`` of the same
+        PR plans it again (``None`` here, and the caller plans it). Nothing
+        of the plan is reopened: it is completed as it stood.
+        """
+        record = effects.appended_takeover
+        assert record is not None and effects.phase is not None
+        phase = effects.phase
+        url = str(record.target["pr_url"])
+        same = take_over is not None and parse_pr_url(take_over.pr_url).same_target(
+            parse_pr_url(url)
+        )
+        if record.stage is Stage.CONFLICT:
+            if same:
+                return None
+            return UnblockDecision(None, self._takeover_conflict_text(record, bound=True))
+        if record.stage is Stage.OBSERVED:
+            if same:
+                return None  # written, but overtaken since: planned again on the body as it is
+            return UnblockDecision(
+                phase,
+                f"the takeover of {url} was written ({record.describe()}); {phase.value} "
+                "drops it, checks the PR's owner and completes its journaled plan",
+            )
+        if take_over is not None:
+            return UnblockDecision(
+                None,
+                f"unblock --take-over is refused: the takeover of {url} is already journaled "
+                f"({record.describe()}); unblock without the flag completes it",
+            )
+        return UnblockDecision(
+            phase,
+            f"the takeover of {url} is journaled ({record.describe()}); {phase.value} "
+            "reconciles it with GitHub, sends it at most once more within its bound and reads "
+            "it back before anything of its journaled plan is sent",
+        )
+
     def _bound_take_over_decision(
         self, pr: PRInfo, take_over: TakeOverRequest, effects: PhaseEffects
     ) -> UnblockDecision:
@@ -7751,6 +7847,13 @@ class ControllerEngine:
         never dropped by a takeover). REVIEW then reviews the PR at its
         revision, with the run's open findings carried to re-check and its
         last verdict stale, as after any revision this run did not review.
+
+        A run that journaled a REVIEW or FIX plan, a run stopped mid-phase
+        when #414 was installed among them, keeps it: the takeover is
+        appended to the plan, and the phase sends it first and then
+        completes the plan as journaled (PR #460 R1-F1). That plan's own
+        reconciliation and re-reads of the PR are what decide whether it is
+        still current, as on any entry after a stop.
         """
         state = self._require_state()
         url = parse_pr_url(state.current_pr_url).canonical
@@ -7762,7 +7865,8 @@ class ControllerEngine:
                 "fresh run for its issue",
                 pr=pr,
             )
-        if effects.records and not self._takeover_replaceable(effects):
+        append = effects.phase in (Phase.REVIEW, Phase.FIX) and bool(effects.records)
+        if effects.records and not append and not self._takeover_replaceable(effects):
             return UnblockDecision(
                 None,
                 f"unblock --take-over is refused: this run journaled "
@@ -7779,7 +7883,7 @@ class ControllerEngine:
                 "names this run, which drives it; unblock without the flag",
                 pr=pr,
             )
-        return self._plan_takeover(url)
+        return self._plan_takeover(url, append_to=effects if append else None)
 
     def _unblock_with_pr(self, request: UnblockRequest = None) -> UnblockDecision:
         """A PR is bound: decide from its live state and the review bound to it."""
@@ -14733,16 +14837,66 @@ class ControllerEngine:
             f"this run ({state.run_id}){carried}; ANALYZE_EXECUTE -> {nxt.value}"
         )
 
-    def _takeover_conflict_text(self, record: EffectRecord) -> str:
+    def _takeover_conflict_text(self, record: EffectRecord, *, bound: bool = False) -> str:
         url = str(record.target["pr_url"])
         again = self.cli_command(
             "unblock", "--take-over", url, "--reason", "<why this run drives the PR>"
         )
+        left = (
+            f"nothing of the {record.owner.phase.value} plan it precedes was sent"
+            if bound
+            else "the PR is not bound"
+        )
         return (
             f"{record.reason}. The controller never writes over a PR body it did not read, so "
-            f"the takeover sent nothing more and the PR is not bound. Inspect PR {url}; to "
-            f"take it over as it is now, run '{again}'"
+            f"the takeover sent nothing more and {left}. Inspect PR {url}; to take it over as "
+            f"it is now, run '{again}'"
         )
+
+    def _complete_appended_takeover(self, phase: Phase) -> tuple[StopReasonCode, str] | None:
+        """Send the takeover appended to this phase's plan, before the plan (PR #460 R1-F1).
+
+        The K11 record is reconciled with GitHub and issued at most once
+        more within its bound, as ANALYZE_EXECUTE's is (an ambiguous write is
+        read back, never resent blind; a body changed since the takeover
+        read it is a conflict, never written over). Once it reads back, the
+        record is dropped and the plan is the phase's journal again, exactly
+        as it stood; the step's owner check, which follows, reads the PR
+        again before anything of the plan is sent. Returns the stop when the
+        takeover cannot complete, ``None`` otherwise. An unavailable GitHub
+        propagates with the record as persisted.
+        """
+        state = self._require_state()
+        if phase not in (Phase.REVIEW, Phase.FIX):
+            return None
+        record = state.phase_effects().appended_takeover
+        if record is None:
+            return None
+        if record.stage is Stage.CONFLICT:
+            return StopReasonCode.EFFECT_CONFLICT, self._takeover_conflict_text(record, bound=True)
+        if record.pending:
+            try:
+                record = drive(
+                    record, operation_for(record, self.github), self._persist_effect
+                ).record
+            except GitHubUnavailableError:
+                raise
+            except GitHubError as exc:
+                return (
+                    StopReasonCode.GITHUB_READ_FAILED,
+                    f"{record.describe()} could not be reconciled with GitHub: {exc}. This is "
+                    "not a transient failure (authentication, permissions, or malformed data); "
+                    "nothing was sent again, nor anything of the plan it precedes. Fix the "
+                    "cause, then 'unblock'",
+                )
+            if record.stage is Stage.CONFLICT:
+                return (
+                    StopReasonCode.EFFECT_CONFLICT,
+                    self._takeover_conflict_text(record, bound=True),
+                )
+        state.effect_records = state.effect_records[: record.position]
+        self._save()
+        return None
 
     def _await_pushed_head(
         self, read: Callable[[], _Read], lagging: Callable[[_Read], bool], what: str

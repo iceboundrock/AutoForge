@@ -877,11 +877,20 @@ chooses from live GitHub, never from the operator's claim of what was fixed.
   attempt bound. It is refused, with nothing written, for another PR than
   the bound one or the listing's one, a K11 already journaled and pending
   (a plain unblock finishes it), the run's own `ANALYZE_EXECUTE` plan or
-  records of another phase journaled, a marker that already names this run
+  records of a phase other than `REVIEW` and `FIX` journaled, a marker that
+  already names this run
   (bound: unblock without the flag; unbound: start a fresh run, since a
   marker this run did not write hands it nothing), and no marked PR. A
   takeover in `conflict` is planned again on the body as it is then by a
-  second `--take-over` of the same PR. A run with a replan journal is never
+  second `--take-over` of the same PR. A bound run with a journaled
+  `REVIEW` or `FIX` plan (one stopped mid-phase, as a run in flight when
+  #414 was installed may be) keeps it: the K11 record is appended to the
+  plan and the plan's phase is re-entered (`BLOCKED -> REVIEW` or `FIX`).
+  Its next step sends the takeover first and reads it back, then the
+  step's owner check reads the PR and the plan completes as journaled,
+  its own reads deciding whether it is still current; nothing is rebound
+  or marked stale, and none of the plan's records is reopened by the
+  unblock (PR #460 R1-F1). A run with a replan journal is never
   unblocked, so a replan refused for its owner names a fresh run and
   `--take-over` there. Plain `unblock`, `resume`, `run --force` and `epic
   archive` never take a PR over.

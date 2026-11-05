@@ -272,7 +272,11 @@ an `implementation_pr` follows an observation of no open PR there and is
 onto the default branch the observation records at the base; an
 `adopt_pr` targets the very PR the observation recorded there. The one
 other `ANALYZE_EXECUTE` plan is a single `owner_takeover` record with no
-entry observation, which `unblock --take-over` saves (#414). Anything
+entry observation, which `unblock --take-over` saves (#414). A `REVIEW` or
+`FIX` plan may carry one `owner_takeover` record appended as its last
+record, with the plan's owner (PR #460 R1-F1): it sits outside the plan's
+record and size bounds, the phase's completion context is validated
+against the plan without it, and the phase drops it once it reads back. Anything
 else is refused, so a plan whose push or PR no entry read explains is
 never completed. A `REPLAN_REEXECUTE` completion context is held to the
 same rule: it loads only for the state's transaction, with its plan of

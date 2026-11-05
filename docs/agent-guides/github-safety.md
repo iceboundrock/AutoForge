@@ -1061,7 +1061,10 @@ refuse a PR, never let it adopt one (ADR 0004 D9.4a).
   bound, against the same base body; a body changed since the command read
   it is a conflict (`effect-conflict`) and is never written over. A plain
   `unblock`, `resume`, `run --force` and `epic archive` never take a PR
-  over. A dry run writes nothing.
+  over. A dry run writes nothing. A bound run whose `REVIEW` or `FIX` plan
+  is journaled keeps it: the record is appended to the plan, the plan's
+  phase sends it first and then completes the plan as journaled (PR #460
+  R1-F1).
 
 The check and the next write are not atomic: GitHub has no conditional
 body update, so a takeover that lands between a run's last check and its
