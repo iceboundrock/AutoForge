@@ -5,6 +5,36 @@ so.
 
 ## Unreleased
 
+### A Claude reply already in hand is no longer discarded when a background task keeps the CLI alive (#439)
+
+`claude -p` emits a turn's `result` at once but stays alive while a background
+task the agent started is pending. If that task never fired, the stream went
+silent, the idle limit ran out and the timeout threw away a finished reply:
+one 92-minute `ANALYZE_EXECUTE` was lost this way, with `resume` set to rerun
+all of it.
+
+Now a stream-json run whose last `result` is a success holding a
+`CONTROL_RESULT` block, with no turn or tool call left open, is decided. A CLI
+still running 10 s later is stopped with everything it started, a limit that
+falls due in those 10 s no longer discards the reply, and the step goes on
+with the reply, validated as any other. `execution.json` says `ended_by:
+reply`, exit code -1 and no error, and the step's end line says `agent replied
+and was stopped while still running`.
+
+A background task that fires after those 10 s no longer gets a turn, so it
+cannot revise the reply. One that fires within them does, and that turn's
+reply is the run's. A reply with no block is still waited for, so an agent that
+ends its turn to wait for its test suite keeps working under the idle limit, as
+before. `output_format: text` is unchanged. Nothing changes a default.
+
+Lines the controller received before the stop count first, however far behind
+it was in reading them. A later turn or failure among them overtakes the reply,
+and a reply among them is kept as one already read would be, so a limit that
+falls due before the controller has read it does not discard it. A reply does
+not stand once the stream outran the controller's queue and lost lines, because
+what was lost could have been that turn: the step fails, or times out if a limit
+fell due. What the CLI writes while it is being stopped counts for nothing.
+
 ### An evaluation protocol for Issue Memory and multi-agent execution, registered before any real run (#318)
 
 [`docs/evaluation-protocol.md`](docs/evaluation-protocol.md) fixes, before

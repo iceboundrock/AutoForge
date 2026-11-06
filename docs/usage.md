@@ -1266,6 +1266,18 @@ profile; see [Configuration: Agent limits](configuration.md#agent-limits).
 - **Only the agent's own output counts.** Nothing the controller does
   resets the timer, and neither will a wait for a human answer once agents
   can ask one (#126).
+- **A reply in hand is not lost to a limit.** A stream-json Claude run whose
+  reply holds a `CONTROL_RESULT` block, with no turn or tool call left open,
+  has decided the step. A CLI still running 10 s later is stopped with
+  everything it started (`execution.json`: `ended_by: reply`, exit code -1,
+  no error, and the end line says `agent replied and was stopped while still
+  running`), and a limit that falls due in those 10 s does not discard the
+  reply. Work the agent left pending is not waited for, and a later turn can
+  revise the reply only if it opens within them. Lines already received are
+  read first, so a later turn or failure among them overtakes the reply, a reply
+  among them is kept even if a limit falls due before it has been read, and a
+  run that lost lines to the queue's bound before the stop fails as any such
+  run does (`stdout lines arrived faster than they were read`).
 
 When a limit fires, the error names it, the agent's last output and the
 configuration key that set it, for example `agent 'analyze_execute' made no
@@ -1291,10 +1303,10 @@ only part of it is kept:
   text a Claude run received (an earlier turn's, or none, when it was
   killed inside a later one) or a Pi run's final reply, which a killed Pi
   run never has. The Claude adapter stops reading the stream once the run
-  is to end (a limit, a loop stop), so the records written while the CLI
-  is killed are not reduced either, and its summary is the stream as it
-  stood at that moment. Pi's answer to the abort is read only to see the
-  abort settle.
+  is to end (a limit, a loop stop, a stop after a reply), so the records
+  written while the CLI is killed are not reduced either, and its summary
+  is the stream as it stood at that moment. Pi's answer to the abort is read
+  only to see the abort settle.
 
 Both logs are bounded; `stdout_truncated` and `stderr_truncated` say when
 one was cut. A record written before #343 counted the shutdown, so its
@@ -1357,8 +1369,10 @@ each:
   it takes on your machine, or make it finish sooner
   (`make test-parallel`). In the other two the reply was already final,
   with its `CONTROL_RESULT` block, and whatever was still pending kept the
-  CLI alive anyway. The kill discards that reply and `resume` runs the
-  phase again; a higher limit only waits longer for what is pending.
+  CLI alive anyway. Since #439 such a run is no idle kill: the CLI is stopped
+  10 s after the reply and the step goes on with it
+  ([Agent limits](#agent-limits)). So an idle kill between turns now means a
+  reply with no readable block.
 - **Claude inside a tool call** (`results` below `turns`,
   `open_tool_calls` above 0, unless a caveat after this list applies).
   The stream carries nothing while a tool runs. None of the nine was this:

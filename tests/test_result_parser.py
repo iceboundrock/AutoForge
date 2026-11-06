@@ -52,6 +52,7 @@ from autoforge.result_parser import (
     UpdateEpicResult,
     _mention_problem,
     commit_message_problem,
+    holds_control_result,
     operator_comment_link_problem,
     operator_markup_problem,
     parse_control_result,
@@ -95,6 +96,45 @@ GOOD_REVIEW = {
 def test_valid_block():
     stdout = "some logs...\n" + BEGIN + "\n" + json.dumps(GOOD_REVIEW) + "\n" + END + "\n"
     assert parse_control_result(stdout, Phase.REVIEW) == GOOD_REVIEW
+
+
+@pytest.mark.parametrize(
+    ("text", "holds"),
+    [
+        (f"done\n{BEGIN}\n{{}}\n{END}\n", True),
+        # What it says is the engine's to refuse and correct, not a question here.
+        (f'{BEGIN}{{"phase": "REVIEW"}}{END}', True),
+        (f"{BEGIN}\n[1]\n{END}\n{BEGIN}\n{{}}\n{END}", True),
+        ("", False),
+        ("The suite is running; I'll report when it finishes.", False),
+        (f"{BEGIN}\n{{}}\n", False),
+        (f"{BEGIN}\n{{not json\n{END}", False),
+        (f"{BEGIN}\n[1]\n{END}", False),
+        (f"{BEGIN}\n{{}}\n{END}\n{BEGIN}\n[1]\n{END}", False),
+        (f'{BEGIN}{{"pad": "{"x" * MAX_CONTROL_RESULT_CHARS}"}}{END}', False),
+        # The decoder's own limits, which are not JSONDecodeError.
+        (f'{BEGIN}{{"n": {"1" * 5000}}}{END}', False),
+        (f"{BEGIN}{'[' * 200_000}{END}", False),
+    ],
+    ids=[
+        "prose_and_a_block",
+        "a_wrong_phase_and_no_status",
+        "only_the_last_block_counts",
+        "empty",
+        "prose_only",
+        "no_end_marker",
+        "not_json",
+        "not_an_object",
+        "a_last_block_that_is_no_object",
+        "past_the_bound",
+        "an_integer_past_the_decoder",
+        "nesting_past_the_decoder",
+    ],
+)
+def test_holds_control_result_is_whether_the_agent_wrote_a_result(text, holds):
+    """#439: what makes a reply one the agent meant as its last, read the way
+    :func:`parse_control_result` reads a block up to the point its fields count."""
+    assert holds_control_result(text) is holds
 
 
 def test_multiple_blocks_last_wins():

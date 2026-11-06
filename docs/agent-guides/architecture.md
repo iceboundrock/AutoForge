@@ -165,6 +165,26 @@ redacted `provider_summary` (scalars only) goes to `execution.json`. The engine 
 check. The adapter returns the text the parser reads as `stdout`, which for
 Pi is the final assistant message, never raw protocol records.
 
+A success does not always end the process either: a Claude turn's `result`
+comes at once, and a background task still pending keeps the CLI alive and
+silent for a turn that may never come (#439). Once every turn has its result,
+no tool call is open and the last text holds a block
+(`result_parser.holds_control_result`), the adapter stops a CLI still running
+a short grace later (`CLAUDE_REPLIED_EXIT_GRACE_SECONDS`) and reports the run
+as completed on that reply: `stopped_on_reply`, which the engine records as
+`ended_by: reply`. It asks only whether the agent wrote a result; the engine
+validates that result as it does any other, so a refused one is corrected.
+`exit_code` stays the real -1, and `AgentExecutionResult.failed_exit`, which
+the engine's check reads, does not count it. A turn that opens within the
+grace is waited for, and a limit falling due within it does not outrank the
+reply ([ADR 0002 §4d](../adr/0002-executor-nothing-outlives-the-invocation.md)).
+Neither takes the reply past lines already received: the stop waits until the
+queue has been read (`DuplexChild.stop(once_read=True)`), a limit reads what it
+left whatever the stream held before it (`DuplexChild.unread_at_deadline()`),
+and a reply among them decides as one already read does, while a later turn, a
+failure or an overflow among them decides instead. The queue is sealed as the
+group is signalled, so what the CLI writes while it dies counts for nothing.
+
 An adapter may also report a failed run as a known transient failure of its
 provider (`transient_failure`, a short fixed reason). It is a fact,
 recognised from the CLI's own output by the one layer that knows that
@@ -327,9 +347,9 @@ end the invocation early (ADR 0002 §4d, #194): it sets
 `ExecutionRequest.stop` (or calls `DuplexChild.stop()`), and the group is
 killed through the same path; the result says `stopped`, never why.
 `ExecutionRequest.on_chunk` hands the caller every chunk read, after it is
-captured. The reasons to stop, a loop (`loop_detect.py`, below) and a
-Claude stream that has already failed the run (#394), are the provider
-layer's. Once the child has
+captured. The reasons to stop, a loop (`loop_detect.py`, below), a
+Claude stream that has already failed the run (#394) and one a reply has
+already decided (#439), are the provider layer's. Once the child has
 exited on its own, the other two conditions
 are given a short exit grace (`_EXIT_GRACE_SECONDS`): a child that left
 nothing behind clears them at once, a helper it is shutting down as it

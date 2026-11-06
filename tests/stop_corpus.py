@@ -555,12 +555,13 @@ def launch_kind(record: dict) -> str:
     return "unknown"
 
 
+def _failed_exit(record: dict) -> bool:
+    """Any exit status but 0, except the -1 of a CLI stopped after its reply (#439)."""
+    return record.get("ended_by") != "reply" and record.get("exit_code") not in (0, None)
+
+
 def failed(record: dict) -> bool:
-    return (
-        record.get("timed_out", False)
-        or record.get("exit_code") not in (0, None)
-        or bool(record.get("error", ""))
-    )
+    return record.get("timed_out", False) or _failed_exit(record) or bool(record.get("error", ""))
 
 
 def launch_code(record: dict) -> StopReasonCode:
@@ -568,7 +569,7 @@ def launch_code(record: dict) -> StopReasonCode:
     ended_by = record.get("ended_by", "")
     if record.get("timed_out", False) or ended_by in ("idle", "max_runtime"):
         return StopReasonCode.EXECUTION_TIMEOUT
-    if ended_by in ("loop", "provider_failure") or record.get("exit_code") not in (0, None):
+    if ended_by in ("loop", "provider_failure") or _failed_exit(record):
         return StopReasonCode.EXECUTION_FAILED
     return StopReasonCode.UNKNOWN
 
