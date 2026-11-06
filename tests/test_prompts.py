@@ -939,14 +939,16 @@ def test_the_claude_section_says_what_happens_and_what_to_do():
 def test_the_claude_section_tells_silent_work_from_a_background_agent():
     """#440 R1-F1: a pending task meets the limits according to its kind. A
     background command, a `Monitor` and a wakeup write nothing until they fire,
-    so nothing restarts the idle limit. A background agent's own records reach
-    the stream as it works (`claude_stream.py`), and every chunk restarts the
-    limit (`executor.py`), until a long call of its own stops them. It also
-    keeps `ClaudeStream.replied` false, so a reply written meanwhile is not one
-    to stop on."""
+    so nothing restarts the idle limit. Under `stream-json`, a background
+    agent's own records reach the stream as it works (`claude_stream.py`), and
+    every chunk restarts the limit (`executor.py`), until a long call of its own
+    stops them. It also keeps `ClaudeStream.replied` false, so a reply written
+    meanwhile is not one to stop on."""
     flat = " ".join(prompts.load_template("claude_background_work.md").split())
     _, _, waiting = flat.partition("Ending a turn without the block")
-    silent, _, agent = waiting.partition("- A background agent is not silent while it works.")
+    silent, _, agent = waiting.partition(
+        "- Under `stream-json` output, a background agent is not silent while it works."
+    )
     assert agent, "the section has no entry of its own for a background agent"
     for phrase in (
         "A background command, a `Monitor` and a scheduled wakeup are silent.",
@@ -966,7 +968,7 @@ def test_the_claude_section_tells_silent_work_from_a_background_agent():
     ):
         assert phrase in agent, phrase
     assert (
-        "A reply written while a background agent runs cannot be read yet: the CLI holds it "
+        "a reply written while a background agent runs cannot be read yet: the CLI holds it "
         "back until no background agent is left, and any later turn's reply replaces it."
     ) in flat
     # The claim that covered a background agent too, in the words it used.
@@ -975,6 +977,84 @@ def test_the_claude_section_tells_silent_work_from_a_background_agent():
     # Output is no reason to leave one running: the instruction names it still.
     assert "every background task, `Monitor` and background agent" in flat
     assert "Give each wait of yours a bound" in flat
+
+
+def test_the_claude_section_says_which_output_format_each_claim_holds_under():
+    """#440 R2-F1: a template takes no variable, so one text reaches both of
+    Claude's output formats. Records that restart the idle limit are
+    `stream-json`'s: `text` writes nothing until the CLI exits, whatever a
+    background agent does, and runs under its ceiling alone. Nothing in the
+    section may assure a `text` agent that its worker's messages count, and the
+    claims are held to the code that makes them true."""
+    from dataclasses import replace
+
+    from autoforge.config import AgentLimits, default_config
+    from autoforge.providers import ClaudeCodeProvider
+
+    flat = " ".join(prompts.load_template("claude_background_work.md").split())
+    _, _, waiting = flat.partition("Ending a turn without the block")
+    _, _, stream_json = waiting.partition("- Under `stream-json` output, a background agent")
+    stream_json, _, text = stream_json.partition("- Under `text` output, a background agent")
+    assert text, "the section has no entry of its own for a background agent under `text`"
+
+    # What a worker's messages do is said of `stream-json` alone.
+    assert "each counts as activity" in stream_json
+    for claim in ("reach the CLI's output", "each counts as activity", "idle limit can"):
+        assert claim not in text, claim
+    # The sentences that claimed it of every launch, in the words they used.
+    for unqualified in (
+        "- A background agent is not silent",
+        "your reply is not used. A reply written while a background agent runs",
+    ):
+        assert unqualified not in flat, unqualified
+
+    # `text` is silent until exit, with a worker running, under one limit.
+    for phrase in (
+        "is silent like the rest",
+        "The CLI writes nothing until it exits, even while the agent works",
+        "none of its messages counts as activity",
+        "Such a run has no idle limit, only the limit on its total length",
+    ):
+        assert phrase in text, phrase
+    assert (
+        "Under `text` output, the CLI prints nothing until it exits, so no reply can be read "
+        "before that and the CLI is never stopped on one."
+    ) in flat
+    # The prompt does not name the launch's format, so the agent counts on neither.
+    assert "This prompt does not tell you which, so rely on neither." in flat
+
+    cfg = default_config()
+    provider = ClaudeCodeProvider()
+    streaming = replace(cfg.profile("fix"), idle_timeout_seconds=600, max_runtime_seconds=3600)
+    one_shot = replace(streaming, options={**streaming.options, "output_format": "text"})
+    assert provider.reports_activity(streaming)
+    assert cfg.agent_limits(streaming) == AgentLimits(600, 3600)
+    assert not provider.reports_activity(one_shot)
+    assert cfg.agent_limits(one_shot) == AgentLimits(None, 3600)
+
+
+@pytest.mark.parametrize("output_format", ["stream-json", "text"])
+def test_a_claude_launch_gets_the_whole_section_under_either_output_format(
+    tmp_state_dir, fake_github, output_format
+):
+    """#440 R2-F1: the format changes what a background agent's messages do, not
+    what the agent must do, so the clean-up and the bound on each wait reach a
+    launch under either one, in a correction too, with both formats explained."""
+    eng = _routed(tmp_state_dir, fake_github, fix="claude")
+    eng.config.profile("fix").options["output_format"] = output_format
+    eng.state.phase = Phase.FIX
+    for rendered in (
+        eng.render_prompt_for(Phase.FIX),
+        eng.render_prompt_for(Phase.FIX, "boom", ReplyExcerpt.of("the reply\n")),
+    ):
+        flat = " ".join(rendered.split())
+        for phrase in (
+            "Stop, with `TaskStop`, every background task, `Monitor` and background agent",
+            "Give each wait of yours a bound when you start it",
+            "Under `stream-json` output, a background agent is not silent while it works.",
+            "Under `text` output, a background agent is silent like the rest.",
+        ):
+            assert flat.count(phrase) == 1, phrase
 
 
 def test_only_claude_code_names_a_provider_section():

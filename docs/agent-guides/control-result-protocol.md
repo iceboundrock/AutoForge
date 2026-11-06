@@ -97,10 +97,15 @@ What only one CLI does goes in a section its adapter names
 end the CLI while a task is pending, so stop every task, `Monitor` and background
 agent (`TaskStop`) and bound every wait. It tells the silent kinds from a
 background agent, which meet the limits differently: a background command, a
-`Monitor` or a wakeup writes nothing until it fires, while a background agent's
-own records reach the stream and restart the idle limit until a long call of its
-own stops them, and the CLI holds the reply of a turn that ends while one runs
-(`claude_stream.py`). The instruction does not depend on the
+`Monitor` or a wakeup writes nothing until it fires, while under `stream-json` a
+background agent's own records reach the stream and restart the idle limit until
+a long call of its own stops them, and the CLI holds the reply of a turn that ends
+while one runs (`claude_stream.py`). Under `text` a background agent is silent
+too: the CLI prints nothing until it exits, so the profile runs under its
+wall-clock ceiling alone (`AutoForgeConfig.agent_limits`) and has no reply to stop
+on. A section takes no variable, so both formats get the same text, which says
+which claim belongs to which and tells the agent to rely on neither. The
+instruction does not depend on the
 stop for a reply: with it the leftovers are lost, and without it (`text` output,
 a reply it cannot read) the run hangs until a limit. The stop stays the safety
 net. The controller still neither tracks a task nor reads a reply for whether

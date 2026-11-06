@@ -596,8 +596,11 @@ High-priority coverage includes:
   Claude launch, in every phase and in a correction, also gets the section its
   adapter names, inside the trusted header, saying what a pending task does,
   telling a silent one from a background agent, whose records count as activity
-  and whose running holds the reply back, and to stop it with `TaskStop` and
-  bound each wait; OpenCode, Pi and the SDK
+  and whose running holds the reply back under `stream-json`, while under `text`
+  nothing is written until the CLI exits and only the wall-clock limit applies,
+  and to stop it with `TaskStop` and bound each wait; a launch under either
+  output format gets all of it, and those claims are held to the limits each
+  format really runs under; OpenCode, Pi and the SDK
   providers get no trace of it; the section follows the profile of each launch,
   review rounds included, and a dry run shows it
 - an agent failure that leaves the state unchanged (a timeout, a failed
