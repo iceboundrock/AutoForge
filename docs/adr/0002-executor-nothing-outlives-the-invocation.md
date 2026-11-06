@@ -429,9 +429,14 @@ reader, so when the grace ends or a limit falls due the queue can already hold
 a later turn or a failure, and past its bound such lines are gone. So the stop
 waits until every line queued has been read (`DuplexChild.stop(once_read=True)`)
 and a limit, which does not wait, reads what it left after the kill
-(`unread_at_deadline`). An overflow from before either costs the reply, which
-may be stale with nothing to say otherwise: the run fails on the overflow, or
-times out on the limit. The other side of the line is the
+(`unread_at_deadline`). The limit reads it whatever the stream held before it,
+because the same delay can hold back the reply itself: with a later turn's
+`init` read and its `result` queued no reply is in hand, and the timeout would
+discard one that had arrived in time. Only a reply that decides the run on all
+of those lines stands; a turn they leave unfinished keeps its timeout. An
+overflow from before either costs the reply, which may be stale with nothing to
+say otherwise: the run fails on the overflow, or times out on the limit. The
+other side of the line is the
 stop itself, because the CLI flushes records on SIGTERM, possibly past the
 queue's bound, and those must neither revise the reply nor read as lost lines.
 The queue is sealed before the signal goes out, so `records_overflowed` then

@@ -1825,7 +1825,10 @@ Progress is observability, never part of an outcome. Keep covered:
   ends a later reply, turn or failure already queued overtakes the reply, every
   notice queued is read before the stop, and an overflow before the stop fails
   the run, and a limit reads what it left, the reply standing only if it still
-  decides the run; the duplex handle's `stop(once_read=True)` goes ahead only
+  decides the run; with no reply in hand when a limit falls due, one found in
+  what it left stands under either limit, first or revised, while a turn left
+  unfinished, a failure or an overflow there keeps the timeout; the duplex
+  handle's `stop(once_read=True)` goes ahead only
   with nothing unread and never after an overflow, a queue sealed by it or by a
   limit takes nothing more and cannot overflow, and a plain `stop()` does not
   wait; through the engine the phase advances, `execution.json` says

@@ -1274,7 +1274,8 @@ profile; see [Configuration: Agent limits](configuration.md#agent-limits).
   running`), and a limit that falls due in those 10 s does not discard the
   reply. Work the agent left pending is not waited for, and a later turn can
   revise the reply only if it opens within them. Lines already received are
-  read first, so a later turn or failure among them overtakes the reply, and a
+  read first, so a later turn or failure among them overtakes the reply, a reply
+  among them is kept even if a limit falls due before it has been read, and a
   run that lost lines to the queue's bound before the stop fails as any such
   run does (`stdout lines arrived faster than they were read`).
 

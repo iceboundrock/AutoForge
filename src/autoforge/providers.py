@@ -1436,9 +1436,10 @@ class ClaudeCodeProvider(AgentProvider):
         holds a reply that decides the run (:attr:`ClaudeStream.replied`), a
         CLI still running :data:`CLAUDE_REPLIED_EXIT_GRACE_SECONDS` later is
         stopped too and the reply stands (#439), as it does when a limit falls
-        due within that grace: the timeout would otherwise discard it. Neither
-        happens on a reply that lines already received overtake, or after
-        lines were lost to the queue's bound (:func:`_read_claude_stream`).
+        due within that grace or with the reply received but not yet read: the
+        timeout would otherwise discard it. Neither happens on a reply that
+        lines already received overtake, or after lines were lost to the
+        queue's bound (:func:`_read_claude_stream`).
         ``exit_code`` is always the real process status, -1 when the CLI was
         killed. A failure that is a turn ended by a transient model API error
         is also a ``transient_failure`` (#395); ``text`` output carries no
@@ -1588,10 +1589,12 @@ def _read_claude_stream(
     the stop waits until every line queued has been read, each going through
     the rules above, and an overflow among them fails the run as any overflow
     does: the lines it dropped could have been a later turn or a failure. A
-    limit does not wait: what it left unread is read after the kill, and the
-    reply stands only if it still decides the run. Either way the queue is
-    sealed at that moment, so lines written while the CLI dies neither revise
-    the reply nor count as an overflow.
+    limit does not wait: what it left unread is read after the kill, whatever
+    the stream held before it, since the reply can be among those lines as well
+    as what overtakes one. The run completes only on a reply that decides it
+    on all of them, and otherwise the limit is the outcome. Either way the
+    queue is sealed at that moment, so lines written while the CLI dies neither
+    revise the reply nor count as an overflow.
     """
     failed_at: float | None = None
     replied_at: float | None = None
@@ -1606,9 +1609,8 @@ def _read_claude_stream(
                 return None
         elif isinstance(item, Timeout):
             if item.deadline_exceeded:
-                if stream.replied:
-                    for unread in child.unread_at_deadline():
-                        _reduce(stream, unread)
+                for unread in child.unread_at_deadline():
+                    _reduce(stream, unread)
                 return _Cut.REPLIED if stream.replied else _Cut.DEADLINE
         else:
             _reduce(stream, item)
