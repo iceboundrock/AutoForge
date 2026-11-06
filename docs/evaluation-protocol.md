@@ -127,8 +127,13 @@ hidden test files and functions, the paths a candidate must not change, and its 
   candidate may have to; any other change to an existing file is `checker_altered`, as is a new
   `conftest.py`. A text rule cannot see a test weakened by an added line or inside a file the reference
   edited, so a run that would otherwise be a success also runs the task's validation on its source with
-  the whole of `tests/` as the reference commit holds it. A failure there is `pristine_checkers_failed`,
-  and `checker_altered` too when the candidate changed that module, whose own copy had passed.
+  the whole of `tests/` as the reference commit holds it, and so does any other run whose final candidate
+  changed something under `tests/`, documentation aside: another reason may settle that it was no success,
+  but not whether its checkers are what the task pinned. A failure there is `pristine_checkers_failed`.
+  A hidden test's says nothing of the checkers, since the candidate never held that test to alter. Any other
+  failure in a module the candidate changed is `checker_altered` when its own copy passed validation and its
+  source passed the oracle. Without both, the same failure may be the source's own, or what the hidden tests
+  need of the pinned copy, so `checker_altered` is `unknown`.
 
 ### 3.5 What a Memory arm starts with
 
@@ -191,7 +196,7 @@ review, on every arm alike.
 | `verified_success` | a certificate that still applies and `PASS` records under the configured policy for the exact final candidate, the oracle's pass on it and the pristine checkers' on its source, with no checker altered, no stale certificate and no leak | measured; `unknown` where a check with no result is all that stands before it |
 | `lost_success` | an earlier candidate passed the oracle and the final one failed it, or the run ended on no candidate | measured; `unknown` where an oracle with no result leaves it open |
 | `false_oracle` | the certified candidate fails the oracle | measured; `unknown` where the oracle gave no result on that candidate |
-| `checker_altered` | the candidate altered a checker (section 3.4) | measured; `unknown` where the pristine checkers gave no result |
+| `checker_altered` | the candidate altered a checker (section 3.4) | measured; `unknown` where it turns on the pristine checkers and they gave no result, were not run, or failed where nothing tells an alteration from the source's own failure |
 | `stale_completed_nodes` | what was certified is not what the PR holds | measured |
 | `review_fix_cycles` | accepted `FIX` launches | measured |
 | `repeated_failed_approaches` | a candidate whose tree already failed validation in this run | measured, a proxy |
@@ -218,9 +223,13 @@ results at hand decide it anyway. `lost_success` is a measured 0 with a final pa
 candidate failed, and a measured 1 with a final failure after an earlier pass; `false_oracle` is a measured 0
 with no certificate. `verified_success` stays a measured 0 while any other reason says the run was no success,
 and is `unknown` when such a status, of the oracle or of the pristine checkers, is all that stands before one;
-`checker_altered` is `unknown` when the pristine checkers gave no result. This is no exclusion: the pair stays
+`checker_altered` is `unknown` when the pristine checkers gave no result, and when a candidate that changed
+something under `tests/` never met them, as a stopped run's does; a candidate that changed only its source altered
+no checker, so whatever else kept it from a success leaves that a measured 0. This is no exclusion: the pair stays
 in the sample, a criterion that reads the run is `unknown` and the run's evidence is incomplete, so the contrast
-is `INCONCLUSIVE` unless measured harm makes it `NO_GO`.
+is `INCONCLUSIVE` unless measured harm makes it `NO_GO`. A task's row in the report reads a success the same way:
+a seed with an `unknown` one is counted apart on its side, and the task has no effect and no spread, neither a
+loss nor a mean of its other seeds.
 
 **How long a run took comes from what it recorded last.** The engine saves before a launch and not after one
 that timed out or failed, so the state's last write can lie hours before the end of the launch that ended the
@@ -499,14 +508,15 @@ it to find problems. The same steps make every later run:
 6. **Report,** over every record of the plan:
    `uv run python -m tests.evaluation report RECORD.json ... --harness-report FIXTURE_REPORT.json`.
    It prints every run with its outcome, reasons and where each usage value came from; each criterion
-   with its interval; what was excluded, missing or stopped; and every task with its seeds' spread and
-   outcomes. Add `--json` for the same as data. Post it on #318 in full, failures included.
+   with its interval; what was excluded, missing or stopped; and every task with its seeds' spread,
+   outcomes and successes not known. Add `--json` for the same as data. Post it on #318 in full, failures
+   included.
 
 The cost is the provider's bill for one agent run per candidate plus review rounds, and each
 candidate's validation takes as long as the suite does (ADR 0010 records about eight to sixteen
 minutes serially on the hosts it measured). The pristine suite adds one such run to `collect`, on the
-final candidate of a run that would otherwise be a success. No run of this procedure has been timed or
-priced.
+final candidate of a run that would otherwise be a success or that changed something under `tests/` and
+was not stopped. No run of this procedure has been timed or priced.
 
 ## 10. What these results may not be used for
 
@@ -531,6 +541,11 @@ fixes; that affects every arm alike but may raise every arm's rate.
   record to read for that.
 - An edit that weakens a test in a file the reference edited, and hides no failure, is not flagged: only
   what it hid is. Nothing is decided on that test, since the pristine suite runs its own copy.
+- A run that fails the oracle and also fails, under the pristine suite, a test other than a hidden one in a
+  module it changed has `checker_altered` `unknown`, since a broken source and a hidden failure look the same
+  there. One such run leaves its contrast `INCONCLUSIVE`, on any arm. That is the price of never reading an
+  honest failure as an altered checker, whose margin is 0.00; how often it happens is not known before a real
+  run, and the records say which runs it was.
 - The pristine suite is one more run of the whole suite, so a flaky test costs a verified success, on
   every arm alike. On the one measured pass, a loaded host failed one module that passed alone
   (`pin_verification.json`). No retry was registered, since a retry is a choice made after an outcome;

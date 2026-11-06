@@ -1954,7 +1954,9 @@ model. They cover:
   with its task's lesson leaves no result;
 - checkers: against the real manifest, each kind of change to a protected path or
   an existing test file is `checker_altered`, what a good candidate does is not,
-  and the pristine suite finds what a text rule cannot;
+  and the pristine suite finds what a text rule cannot, on any run that edited a
+  test: a skipped check or a failure nothing attributes leaves the count `unknown`
+  and the contrast `INCONCLUSIVE`, and a hidden test's own failure is no alteration;
 - what is held equal: every configuration section is classified, a new
   top-level one is refused, a new key under an existing one reaches the digest
   (ADR 0010's `validation.fast_commands` among them), and where a host keeps
@@ -1968,7 +1970,9 @@ model. They cover:
   with no record, a ceiling reached on any planned run, paired or not, or too many
   exclusions is `INCONCLUSIVE` before any primary effect is read, exclusions are
   listed and bounded, and another digest, unequal settings, two records of one run
-  or a hidden test or pinned commit shown on any planned run leave no result;
+  or a hidden test or pinned commit shown on any planned run leave no result; a
+  task's row reads a success as the criterion does, so an `unknown` one is stated
+  and gives no effect or spread;
 - the fixture baseline: byte-identical across two runs and in a process outside
   pytest; the single-agent path, controller-owned effects, exact candidate
   records, the certificate, a closed gate and no credential in a launch on every

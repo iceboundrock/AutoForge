@@ -1700,6 +1700,83 @@ def test_the_documented_report_publishes_every_real_run_and_every_tasks_uncertai
     assert "known part of unknown costs 3.5" in out
 
 
+def _one_seed_of_a_task(records: list[dict], arm: str, reason: str) -> dict:
+    """The last seed of the first memory-dependent task on ``arm``, now not verified."""
+    held = [r for r in records if r["arm"] == arm and r["memory_class"] == "memory_dependent"]
+    record = next(r for r in reversed(held) if r["task"] == held[0]["task"])
+    record["outcome"], record["unverified_reasons"] = ev.UNVERIFIED, [reason]
+    return record
+
+
+def _row_of(report: dict, task: str) -> dict:
+    (contrast,) = report["model_quality"]["comparisons"]["memory_benefit"]
+    return next(row for row in contrast["per_task"] if row["task"] == task)
+
+
+@pytest.mark.parametrize(
+    "arm, baseline_unknown, treatment_unknown, baseline_verified, treatment_verified",
+    [(TREATMENT, 0, 1, 3, 2), (BASELINE, 1, 0, 2, 3)],
+)
+def test_a_success_nobody_established_is_no_loss_and_no_gain_in_its_tasks_row(
+    arm, baseline_unknown, treatment_unknown, baseline_verified, treatment_verified
+):
+    """Round 5's finding: the criterion read this seed as unknown and the task's row as a
+    measured -1/3, with a seed at -1.0. It now says the same as the criterion, and how many."""
+    manifest, prereg, records = _world(baseline_verified=lambda task, seed: True)
+    held = _one_seed_of_a_task(records, arm, "oracle_not_run")
+    report = ev.build_report(records, manifest, prereg, harness_report=_COVERED)
+    row = _row_of(report, held["task"])
+    assert row["seeds"] == row["planned_seeds"] == 3
+    assert row["baseline_verified"] == baseline_verified
+    assert row["treatment_verified"] == treatment_verified
+    assert row["baseline_unknown_success"] == baseline_unknown
+    assert row["treatment_unknown_success"] == treatment_unknown
+    assert row["effect"] is None and row["seed_range"] is None
+    (contrast,) = report["model_quality"]["comparisons"]["memory_benefit"]
+    assert contrast["primary"]["verdict"] == "unknown"
+    other = next(r for r in contrast["per_task"] if r["task"] != held["task"])
+    assert other["effect"] == 0.0 and other["treatment_unknown_success"] == 0
+
+
+def test_a_measured_failure_in_a_task_row_stays_a_measured_loss():
+    """The other side of the same read: any other reason says the run was no success."""
+    manifest, prereg, records = _world(baseline_verified=lambda task, seed: True)
+    held = _one_seed_of_a_task(records, TREATMENT, "oracle_failed")
+    report = ev.build_report(records, manifest, prereg, harness_report=_COVERED)
+    row = _row_of(report, held["task"])
+    assert row["effect"] == pytest.approx(-1 / 3) and row["seed_range"] == [-1.0, 0.0]
+    assert row["treatment_verified"] == 2 and row["treatment_unknown_success"] == 0
+
+
+def test_the_published_report_keeps_a_tasks_unknown_success_in_both_its_forms(
+    capsys, tmp_path, monkeypatch
+):
+    """The command the protocol says to post, and its JSON: what is not known of a seed is
+    stated there, and no effect or spread is shown for its task."""
+    manifest, _, records = _world(baseline_verified=lambda task, seed: True)
+    held = _one_seed_of_a_task(records, TREATMENT, "oracle_not_run")
+    paths = []
+    for index, record in enumerate(records):
+        paths.append(tmp_path / f"{index}.json")
+        paths[-1].write_text(json.dumps(record), encoding="utf-8")
+    harness = tmp_path / "harness.json"
+    harness.write_text(json.dumps(_COVERED), encoding="utf-8")
+    monkeypatch.setattr(ev, "load_manifest", lambda: manifest)
+    command = ["report", *map(str, paths), "--harness-report", str(harness)]
+
+    assert ev.main([*command, "--json"]) == 0
+    row = _row_of(json.loads(capsys.readouterr().out), held["task"])
+    assert row["treatment_verified"] == 2 and row["treatment_unknown_success"] == 1
+    assert row["effect"] is None and row["seed_range"] is None
+
+    assert ev.main(command) == 0
+    line = next(
+        line for line in capsys.readouterr().out.splitlines() if f"task {held['task']} (" in line
+    )
+    assert "3 of 3 seeds" in line and "verified 3 vs 2" in line
+    assert "success unknown 0 vs 1" in line and "effect None, seeds None" in line
+
+
 # -- never a benchmark in CI, in planning or by accident -------------------------------------
 
 

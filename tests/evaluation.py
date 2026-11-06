@@ -256,7 +256,8 @@ _READ_CONTEXT_DIR = r"[a-z0-9_]+-\d+-[0-9a-f]{12}"
 _INDEXED_FILE = re.compile(rb"^- `([^`\n]+)`: ", re.M)
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _COUPLED = re.compile(r"\b(ImportError|ModuleNotFoundError|AttributeError|NameError)\b")
-_FAILED_MODULE = re.compile(r"^(?:FAILED|ERROR) (tests/[^\s:]+\.py)", re.M)
+# A pytest summary's line: the module, and the test when the line names one.
+_FAILED_TEST = re.compile(r"^(?:FAILED|ERROR) (tests/[^\s:]+\.py)(::\S+)?", re.M)
 # What a score reads of a run log line, each as ``ExecutionRecord`` always writes it. A
 # line without one, or with another type, could only be read by guessing what it meant.
 _LINE_FIELDS: Mapping[str, type | tuple[type, ...]] = {
@@ -1122,6 +1123,16 @@ def checker_alterations(changes: Sequence[FileChange], task: Mapping) -> list[st
     return sorted(altered)
 
 
+def left_to_pristine(changes: Sequence[FileChange]) -> bool:
+    """Whether a candidate changed what only the pristine suite can judge: anything under
+    :data:`CHECKER_ROOT`, documentation aside. With nothing changed there, no checker can
+    have been altered, and it takes no run to say so."""
+    return any(
+        change.path.startswith(CHECKER_ROOT) and not change.path.endswith(".md")
+        for change in changes
+    )
+
+
 def _usage(
     agent_lines: Sequence[Mapping], key: str, provenance: str, scale: float, log_complete: bool
 ) -> dict:
@@ -1260,7 +1271,8 @@ def score_run(run: RunInput) -> dict:
 
     reasons: list[str] = []
     pristine = {"status": "not_run", "failing_modules": []}
-    if state.phase in (Phase.READY_FOR_MERGE, Phase.MERGE, Phase.DONE):
+    completed = state.phase in (Phase.READY_FOR_MERGE, Phase.MERGE, Phase.DONE)
+    if completed:
         if validation != "passed":
             reasons.append(f"validation_{validation}")
         if final_oracle != "pass":
@@ -1279,11 +1291,21 @@ def score_run(run: RunInput) -> dict:
             reasons.append("hidden_test_leak")
         if unscanned:
             reasons.append("leak_scan_incomplete")
-        # A whole suite more, so only for a run whose outcome it could still change.
-        if not reasons and not run.stopped_by:
-            pristine = _pristine_verdict(run, final, changes, counts, reasons)
-            if pristine["status"] not in ORACLE_RESULTS:
-                unknown_counts.append("checker_altered")
+    # A whole suite more, so only for what it can still answer: whether this run succeeded,
+    # and whether its count is clean, whatever else already says it did not succeed. A
+    # stopped run is spared it: its outcome is the operator's, a ceiling leaves the comparison
+    # incomplete and an exclusion takes the pair away, so its count just stays unknown.
+    count_open = (
+        not altered and "checker_altered" not in unknown_counts and left_to_pristine(changes)
+    )
+    if run.stopped_by:
+        if count_open:
+            unknown_counts.append("checker_altered")
+    elif count_open or (completed and not reasons):
+        vouched = validation == "passed" and final_oracle == "pass"
+        said = reasons if completed else []  # only a completed run has reasons
+        pristine = _pristine_verdict(run, final, changes, vouched, counts, said, unknown_counts)
+    if completed:
         outcome = UNVERIFIED if reasons else VERIFIED
     else:
         outcome = _stop_outcome(state, agents)
@@ -1356,27 +1378,42 @@ def score_run(run: RunInput) -> dict:
 
 
 def _pristine_verdict(
-    run: RunInput, final: str, changes: Sequence[FileChange], counts: dict, reasons: list[str]
+    run: RunInput,
+    final: str,
+    changes: Sequence[FileChange],
+    vouched: bool,
+    counts: dict,
+    reasons: list[str],
+    unknown_counts: list[str],
 ) -> dict:
     """The final candidate's source under its checkers as pinned, added to ``reasons``.
 
-    The one run that sees a test weakened by an added line or in a hidden file:
-    validation passed on the candidate's own copy, and this replaces only that
-    copy. So a failure in a module the candidate changed is an altered checker
-    that hid it, and one the candidate left alone is a failure of its own. A
-    runner that names no module cannot tell them apart, and counts as altered.
+    The one run that sees a test weakened by an added line or in a hidden file. It
+    replaces only the candidate's copy of ``tests/``, so a failure in a module the
+    candidate left alone is a failure of its own. So is a hidden test's: the candidate
+    never held that test, so no edit of its own can have hidden it. Any other failure in
+    a module it changed is an altered checker that hid it, when ``vouched``: validation
+    passed on its own copy and the oracle on its source. Without that, the same failure
+    may be a broken source meeting the reference's copy, so the count is unknown. A
+    runner that names no module cannot tell any of these apart: altered when vouched,
+    and otherwise unknown.
     """
     done = run.pristine_checkers(final) if run.pristine_checkers else OracleRun("not_run")
     if done.status == "pass":
         return {"status": "pass", "failing_modules": []}
     if done.status != "fail":
         reasons.append(f"pristine_checkers_{done.status}")
+        unknown_counts.append("checker_altered")
         return {"status": done.status, "failing_modules": []}
     reasons.append("pristine_checkers_failed")
     failing = failing_modules(done.stdout)
-    if not failing or {change.path for change in changes} & set(failing):
-        counts["checker_altered"] = 1
-        reasons.append("checker_altered")
+    changed = {change.path for change in changes}
+    if not failing or changed & _modules_past_hidden_tests(done.stdout, run.task):
+        if vouched:
+            counts["checker_altered"] = 1
+            reasons.append("checker_altered")
+        else:
+            unknown_counts.append("checker_altered")
     return {"status": "fail", "failing_modules": failing}
 
 
@@ -1683,7 +1720,14 @@ def verify_pin_oracle(repo: str, manifest: Mapping, task: Mapping, cfg: AutoForg
 
 def failing_modules(stdout: str) -> list[str]:
     """The test modules a pytest summary (``-rfE``) names as failed or in error."""
-    return sorted(set(_FAILED_MODULE.findall(stdout)))
+    return sorted({module for module, _ in _FAILED_TEST.findall(stdout)})
+
+
+def _modules_past_hidden_tests(stdout: str, task: Mapping) -> set[str]:
+    """The modules that summary names for anything but one of the task's hidden tests. A
+    node it cannot match, such as a parametrized one, stays: that is the cautious side."""
+    hidden = set(task.get("hidden_tests", ()))
+    return {module for module, test in _FAILED_TEST.findall(stdout) if module + test not in hidden}
 
 
 def verify_base_suite(
@@ -2169,7 +2213,13 @@ def _per_task_table(
     prereg: Mapping,
 ) -> list[dict]:
     """Each task's seeds, successes and failures on each side, what is not known of them,
-    and how far its seeds disagree, so one outlier or one lost task can be seen."""
+    and how far its seeds disagree, so one outlier or one lost task can be seen.
+
+    Success is read as :func:`measure_of` reads it. A seed whose success nobody could
+    establish has no difference, so a task with one has no effect and no spread, as it has no
+    row in the statistics, and says how many on each side: neither a failure, nor a mean
+    over fewer seeds than it has.
+    """
     table = {
         task["id"]: {
             "task": task["id"],
@@ -2180,6 +2230,8 @@ def _per_task_table(
             "missing_seeds": 0,
             "baseline_verified": 0,
             "treatment_verified": 0,
+            "baseline_unknown_success": 0,
+            "treatment_unknown_success": 0,
             "baseline_outcomes": Counter(),
             "treatment_outcomes": Counter(),
             "seed_differences": [],
@@ -2190,13 +2242,16 @@ def _per_task_table(
     for base, treated in pairs:
         row = table[base["task"]]
         row["seeds"] += 1
-        row["baseline_verified"] += base["outcome"] == VERIFIED
-        row["treatment_verified"] += treated["outcome"] == VERIFIED
+        base_success, _ = measure_of(base, "verified_success")
+        treated_success, _ = measure_of(treated, "verified_success")
+        row["baseline_verified"] += base_success == 1
+        row["treatment_verified"] += treated_success == 1
+        row["baseline_unknown_success"] += base_success is None
+        row["treatment_unknown_success"] += treated_success is None
         row["baseline_outcomes"][base["outcome"]] += 1
         row["treatment_outcomes"][treated["outcome"]] += 1
-        row["seed_differences"].append(
-            float(treated["outcome"] == VERIFIED) - float(base["outcome"] == VERIFIED)
-        )
+        if base_success is not None and treated_success is not None:
+            row["seed_differences"].append(treated_success - base_success)
         for key in MEASURES:
             row["unknown_usage"][key] += sum(
                 record["usage"][key]["provenance"] == UNKNOWN for record in (base, treated)
@@ -2208,14 +2263,15 @@ def _per_task_table(
     rows = []
     for row in table.values():
         differences = sorted(row.pop("seed_differences"))
+        whole = bool(differences) and len(differences) == row["seeds"]
         rows.append(
             {
                 **row,
                 "baseline_outcomes": dict(sorted(row["baseline_outcomes"].items())),
                 "treatment_outcomes": dict(sorted(row["treatment_outcomes"].items())),
                 "unknown_usage": dict(sorted(row["unknown_usage"].items())),
-                "effect": statistics.fmean(differences) if differences else None,
-                "seed_range": [differences[0], differences[-1]] if differences else None,
+                "effect": statistics.fmean(differences) if whole else None,
+                "seed_range": [differences[0], differences[-1]] if whole else None,
             }
         )
     return sorted(rows, key=lambda row: row["task"])
@@ -2485,7 +2541,9 @@ def _render_contrast(contrast: Mapping) -> list[str]:
             f"    task {row['task']} ({row['memory_class']}): {row['seeds']} of "
             f"{row['planned_seeds']} seeds, {row['excluded_seeds']} excluded, "
             f"{row['missing_seeds']} missing; verified {row['baseline_verified']} vs "
-            f"{row['treatment_verified']}; effect {row['effect']}, seeds {row['seed_range']}; "
+            f"{row['treatment_verified']}; success unknown {row['baseline_unknown_success']} vs "
+            f"{row['treatment_unknown_success']}; effect {row['effect']}, seeds "
+            f"{row['seed_range']}; "
             f"outcomes {row['baseline_outcomes']} vs {row['treatment_outcomes']}; "
             f"unknown usage {row['unknown_usage']}"
         )
