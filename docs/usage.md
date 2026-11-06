@@ -1477,7 +1477,9 @@ each:
   CLI alive anyway. Since #439 such a run is no idle kill: the CLI is stopped
   10 s after the reply and the step goes on with it
   ([Agent limits](#agent-limits)). So an idle kill between turns now means a
-  reply with no readable block.
+  reply with no readable block. Since #440 the prompt tells a Claude agent to
+  stop what it started before that reply, so `ended_by: reply` usually means
+  it left something pending anyway.
 - **Claude inside a tool call** (`results` below `turns`,
   `open_tool_calls` above 0, unless a caveat after this list applies).
   The stream carries nothing while a tool runs. None of the nine was this:

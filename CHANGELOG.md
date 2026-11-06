@@ -48,6 +48,26 @@ never start a takeover. See "Taking over a PR another run owns" in
 and is relabelled 14 on its next save, and one carrying a K11 record is
 refused. An older AutoForge refuses a protocol-14 file.
 
+### Agents are told to stop what they started before their final reply (#440)
+
+The shared prompt said the controller "does not wait for the work" and that it
+terminates whatever is left, so an agent could reasonably end its turn with a
+background task still pending. On Claude Code that task keeps the CLI alive: in
+one run a task never stopped held it for 30 minutes after the reply. #439 made
+such a run complete on its reply, but the task's result is still lost, and a
+reply the controller cannot read, or any reply under `output_format: text`, still
+waits for a limit.
+
+Every agent is now told to let what it started finish or stop it before the
+final reply, and that the kill is a last resort. A Claude agent also gets a
+section of its own: a pending background task or `Monitor` does not let the CLI
+exit, so stop each with `TaskStop` and put a bound on every wait. OpenCode and
+Pi agents do not get that section, since their CLIs have no such turn. Nothing
+checks that an agent obeys it, and no controller behaviour or default changes;
+the prompt version is `v16`, and a REMOTE run resumed by this version renders the
+new templates and keeps its recorded label. The label is one of the settings the
+evaluation protocol pins, so its section 11 records the move as an amendment.
+
 ### A Claude reply already in hand is no longer discarded when a background task keeps the CLI alive (#439)
 
 `claude -p` emits a turn's `result` at once but stays alive while a background

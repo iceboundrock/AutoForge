@@ -50,6 +50,10 @@ TEMPLATE_FILES = (
     # and fix.md's {{VALIDATION_FAILURE}} on the relaunch after one.
     "validation_evidence.md",
     "validation_failure.md",
+    # What an agent is told of its own CLI alone (#440), rendered into
+    # common.md's {{PROVIDER_SECTION}} for the provider that names it
+    # (``AgentProvider.prompt_section``).
+    "claude_background_work.md",
 )
 
 # The trusted header prepended to every phase template.

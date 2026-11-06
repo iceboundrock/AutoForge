@@ -565,9 +565,10 @@ An amendment changes the files of section 1 and these digests in one reviewed ch
 **and states whether any real run had been made.** A record carries the digests it was made under, and a
 report refuses to decide over records of another, so criteria cannot move under results.
 
-- `manifest.json`: `5ef8a4228a0bb56327427f2635ea0a469bdd4d0ddfd4e372258dc216486a5924`
-- `preregistration.json`: `5f1dfe4ec7c39b9df2c0b8b7a5d5b996708190b1b4a399926cbc8136a08cfb5b`
-- `real_run_config.yaml`: `6270e03cd6760c28136151af502ef88824c9c37c96f1cf81a14882a7d884b4a0`
+- `manifest.json`: `c48935bdb7b4a6c4c88434b09ff4157eef4d39a2e5311c4a3aa9d146d5f5425a`
+- `preregistration.json`: `0c28918468a7aa37f3f787ea5c45881a36e440ea500617dc1c21ca93a65834d9`
+- `real_run_config.yaml`: `0d6b81feb25854df1ac6640770c56ebb04f8ed8637cb7d801faa7327516a1c5a`
 
 | Date | Change | Why | Real runs before it |
 |---|---|---|---|
+| 2026-11-06 | The prompt label moves from `v15` to `v16`, which moves the settings digest and the digests that hold it. | #440 changed the prompt: every agent is told to stop what it started before its final reply, and a Claude Code launch gets a section on what a pending background task does. Every arm runs Claude Code on one label, so what is compared does not move, and no threshold, task or other setting changes. | None recorded: the protocol was registered on 2026-11-05 with none, and no record has been added since. |

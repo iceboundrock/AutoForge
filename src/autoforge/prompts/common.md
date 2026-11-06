@@ -73,8 +73,9 @@ Concretely:
   still in your process group (a dev server, a watcher, anything started
   with `&`) is terminated by the controller, at once or after a short
   grace, whether or not it still holds your stdout/stderr, and the run log
-  records that it had to be. Stop what you start before you exit, and
-  never rely on a background process for a later phase.
+  records that it had to be. That is a last resort, not a clean-up to leave
+  to the controller: stop what you start before you write your final reply,
+  and never rely on a background process for a later phase.
 - Do not modify AutoForge controller state (`.autoforge/`), and do not commit it.
 - Every GitHub write of this phase (a push, a pull request, a comment, an
   issue) is the controller's, made after you exit from what you report.
@@ -126,11 +127,14 @@ machine-readable block:
   not inside it.
 - If the phase could not be completed, still emit the block with
   `"status": "failure"` (or `"status": "blocked"` when a human decision is
-  required) and a human-readable `"message"`; never omit it. That covers a
-  reply you write while work you started (a test run, a build, any
-  background task) is still running, too: the controller may take that
-  reply as your final one and does not wait for the work, so let the work
-  finish before you write it.
+  required) and a human-readable `"message"`; never omit it.
+- Write your final reply only once nothing you started (a test run, a build,
+  any background task) is still running: let it finish, or stop it, first.
+  The controller may take any reply as your final one and give you no later
+  turn, so what the work would have shown you is lost, and a reply that says
+  you are still waiting for it is a reply without its block.
+
+{{PROVIDER_SECTION}}
 
 ## Context variables
 

@@ -33,6 +33,8 @@ Claude Code (``claude 2.1.x``; the stream run against 2.1.291 to 2.1.293)::
     is one still running :data:`CLAUDE_REPLIED_EXIT_GRACE_SECONDS` after a
     reply holding a CONTROL_RESULT block with no turn or tool call left open,
     and that reply stands (:attr:`AgentExecutionResult.stopped_on_reply`, #439).
+    The agent is told to leave nothing pending (#440,
+    ``prompts/claude_background_work.md``).
   * ``options.output_format: text`` is the opt-out: the final text is
     printed once, at exit, and the run reports no progress and no activity
     while it runs.
@@ -696,6 +698,9 @@ class AgentProvider:
     # The variables this CLI reads that name a path (ADR 0005 D8.2): a
     # sandboxed launch keeps one only when what it names is visible inside.
     path_names: tuple[str, ...] = ()
+    # The prompt template holding what an agent must be told of this CLI alone,
+    # rendered into common.md's {{PROVIDER_SECTION}}; "" for none (#440).
+    prompt_section: str = ""
 
     def __init__(self, runner: Runner | None = None) -> None:
         self._runner: Runner = runner or execute
@@ -980,7 +985,7 @@ CLAUDE_FAILED_EXIT_GRACE_SECONDS = 10.0
 # exit on its own before the driver stops it (#439). ``claude -p`` emits a
 # turn's ``result`` at once, but a background task still pending keeps it alive
 # for a turn that may never come, silently, until the idle limit. The agent is
-# told the controller does not wait for such work (``prompts/common.md``). The
+# told to leave nothing pending (``prompts/claude_background_work.md``). The
 # value is #394's, not a measurement of how long a CLI takes to exit after its
 # last ``result``: one that takes longer loses its own status, not its reply.
 CLAUDE_REPLIED_EXIT_GRACE_SECONDS = 10.0
@@ -1224,6 +1229,9 @@ class ClaudeCodeProvider(AgentProvider):
     option_keys = ("permission_mode", "output_format", "session_persistence")
     isolation_names = tuple(sorted(claude_isolation_env("", "")))
     path_names = ("CLAUDE_ENV_FILE", "CLAUDE_CODE_SHELL", "CLAUDE_CONFIG_DIR")
+    # The end of a turn does not end this CLI while a background task is
+    # pending, which is true of no other adapter's (#440).
+    prompt_section = "claude_background_work.md"
 
     def sandbox_requirements(
         self, profile: ProfileConfig, command: list[str], env: Mapping[str, str], home: str
