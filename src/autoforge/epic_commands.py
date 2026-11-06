@@ -1511,7 +1511,9 @@ class ArchiveReport:
             out.append(
                 "the run's loop-bound evidence (review rounds, fix attempts, the replan count) "
                 f"and its validation records now live only in {self.state_moved_to}: the next "
-                "admission starts the issue fresh and adopts its marked PR"
+                "admission starts the issue fresh, and an open PR of the issue stays its old "
+                "run's (#414): that admission blocks on it until 'unblock --take-over' hands "
+                "it to the new state"
             )
         out.append("nothing is archived automatically; this was the operator's explicit retry")
         return [redact(line) for line in out]
@@ -1686,8 +1688,10 @@ def recheck_issue(
        the namespace ``resumable`` for the next ``epic resume`` to admit and
        review. That step is held to the run's bounds like any other: one the
        exhausted step budget blocks leaves the run BLOCKED (``phase``), and
-       the CLI exits 1 with its typed stop. A read that fails, or an answer
-       that establishes no revision, raises with the state unchanged.
+       the CLI exits 1 with its typed stop. So does a PR whose marker does
+       not name the run, whether it moved or not (``pr-owner``, #414). A read
+       that fails, or an answer that establishes no revision, raises with the
+       state unchanged.
 
     No agent runs and nothing is written to GitHub, to a claim or to
     ``scheduler.json``: the run, its review rounds and loop bounds, its

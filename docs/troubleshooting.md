@@ -32,6 +32,7 @@ what no test covers.
 | `... made no progress for <N>s ... and was killed`, `... reached its <N>s maximum runtime and was killed`, `... was killed: the same ... repeated ...` | [An agent was killed: idle timeout, maximum runtime, loop](#an-agent-was-killed-idle-timeout-maximum-runtime-loop) |
 | `failed: claude: the run ended in an error (...)`, `failed: pi: the auth preflight refused the launch: ...`, an `exited 1. stderr tail:` holding the CLI's own error, `(transient: ...)`, `not relaunched: ...` | [Provider authentication, model and API errors](#provider-authentication-model-and-api-errors) |
 | `the agent asked for permission (...)`, `an answer to a question` | [An agent asked for permission or input](usage.md#an-agent-asked-for-permission-or-input) |
+| `stop: blocked (reason pr-owner, ...)`, a reason naming `unblock --take-over` (`... names run <id> as its owner, not this run`, `... has no record of the PR`, `... names no run as its owner`) | [Taking over a PR another run owns](usage.md#taking-over-a-pr-another-run-owns) |
 | `status` shows an `Acceptance action A-…` or an `Operator actions (FIX, ...)` block | [The run waits for you: acceptance and operator actions](#the-run-waits-for-you-acceptance-and-operator-actions) |
 | a traceback ending in `KeyboardInterrupt`; a killed process, a closed terminal, a reboot | [The process was interrupted](#the-process-was-interrupted) |
 | `run <id> is in terminal phase BLOCKED: ...` (from `resume`, exit 1), `cannot step from terminal phase BLOCKED` (from `step`, exit 2) | [resume, unblock or a new run](#resume-unblock-or-a-new-run) |
@@ -42,7 +43,7 @@ what no test covers.
 | `existing run <id> in phase <P> — use 'resume' to continue or 'run --force' to discard it` (exit 2) | [Starting over](#starting-over) |
 | `another AutoForge controller holds <path> — refusing to run concurrently on the same repository (...)` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
 | `'<command>' refuses issue <issue>: ... Only the parallel EPIC scheduler continues an issue its namespace owns ...` (exit 2) | [Another controller holds the lock](#another-controller-holds-the-lock) |
-| `unsupported protocol_version '<n>' (controller speaks '13'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
+| `unsupported protocol_version '<n>' (controller speaks '14'): a newer AutoForge wrote it` (exit 2) | [A run a newer controller wrote](usage.md#a-run-a-newer-controller-wrote) |
 | `refusing to start a new run over an unreadable state file`, `corrupted state file ...` (exit 2) | [The state file](#the-state-file) |
 | `issue <url> has no native parent on GitHub and no --epic was given`, `... has its native parent ... in another repository`, `... is closed on GitHub; a run records only an open EPIC`, `--epic <url> is the issue itself` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records) |
 | `issue <url> changed on GitHub while the run's EPIC was being bound: ...` (from `run`, exit 2) | [Which EPIC a run records](usage.md#which-epic-a-run-records): the issue's parent or state changed while `run` read its EPIC; nothing was written: run the command again |
@@ -421,10 +422,14 @@ replaces `state.json`: its review history, its loop-bound counts, its
 replan count and its validation records go with it, so read `status`
 first. Its run logs and worktree stay.
 
-The new run's `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
-`ai-implementation` marker without running the implementer, and blocks on
-two. Close the old PR first if you want a fresh implementation; leave it
-open to continue it.
+The new run's `ANALYZE_EXECUTE` does not adopt the open PR carrying the
+issue's `ai-implementation` marker: the PR names the run that owned it, and
+the new run has no record of it (#414). It blocks (`pr-owner`), without
+running the implementer, and names `unblock --take-over`. Close the old PR
+first if you want a fresh implementation. To continue it, stop the run
+that drove it, then take it over
+([Taking over a PR another run owns](usage.md#taking-over-a-pr-another-run-owns)).
+Two such PRs block either way.
 
 ## Stopping a run safely
 
@@ -512,6 +517,7 @@ something under a run:
 | the PR was merged by hand | with the gate closed, the run stays `READY_FOR_MERGE`. With the gate open, `resume --allow-merge` counts a merge at the reviewed revision once, and blocks on one at another revision (`the controller never reviewed the merged change`) | with the gate closed, start the next issue with `run --force`; a block on an unreviewed merge is yours to inspect |
 | the PR has merge conflicts | with the gate open: `BLOCKED`, `PR <url> has merge conflicts (mergeable=CONFLICTING)` | resolve them on the PR branch; `unblock` then decides `REVIEW` of the new head |
 | a comment carrying a controller marker, or a second PR carrying the issue's marker, appeared | `BLOCKED`, naming it: the controller never adopts, edits or duplicates an object it did not write | delete the comment or its marker, or close the PR that is not the issue's, then `unblock`. For a review comment, first read what `status` reports under the reason (#416): a state directory of this checkout that journaled it, and the commits made after it. Another controller's review is not deleted ([`REVIEW` blocks](usage.md#blocked-fix-the-cause-then-unblock)) |
+| the PR's `ai-implementation` marker names another run, names none (a PR opened before #414, or a run you upgraded mid-flight), or is gone or unreadable | `BLOCKED` (`pr-owner`) at the run's next step, before the agent's result is applied, before a review comment is posted, between `FIX`'s writes or at the merge gate, or, for a run waiting at `READY_FOR_MERGE` with the gate closed, at the next `resume` or `epic recheck`, with nothing more sent; a plain `unblock` refuses. A fresh run blocks the same way on any marked PR it has no record of | stop the other controller, then `unblock --take-over <PR URL> --reason "..."` and `resume`, which writes this run into the marker, reads it back and continues in `REVIEW`, or, for a run stopped partway through a `REVIEW` or `FIX` step, finishes that step's recorded writes. On `effect-conflict` (the body changed after `--take-over` read it, or the PR stopped qualifying), inspect the PR: run `--take-over` again if the marker names another run or no run, or a plain `unblock` if it already names this run or the PR was merged or closed. A push stopped by a PR another run owns on its branch, or a PR this run has no record of whose marker names this run, takes a fresh run instead, whose `--take-over` takes the PR ([Taking over a PR another run owns](usage.md#taking-over-a-pr-another-run-owns)) |
 | an earlier version blocked on the controller's own PR, issue or comment whose text held a character like `\u001b` (#327) | the read-back now reads the exact text from GitHub | `unblock`; nothing is written again |
 | an earlier version would not verify an operator comment that held its payload byte for byte, because the payload held text like `\u001b` (#328) | the comment is now judged on its exact text from GitHub | `unblock` |
 | the EPIC body, whose text holds a character like `\u001b`, was edited while `UPDATE_EPIC` read it, twice in a row | `BLOCKED`, ``the body of EPIC <url> changed between `gh`'s read and its exact read, 2 times in a row``: no agent launched, nothing written ([`gh`'s sanitizer and the exact read](agent-guides/github-safety.md#ghs-sanitizer-and-the-exact-read-327)) | let the edits settle, then `unblock` |
@@ -669,7 +675,7 @@ The messages below are AutoForge's own refusals, grouped by subject.
   see [State and recovery](agent-guides/state-and-recovery.md#persistent-state).
   A file refused for its protocol label alone is not this entry's: see
   the next one.
-- **"unsupported protocol_version '14' (controller speaks '13'): a newer
+- **"unsupported protocol_version '15' (controller speaks '14'): a newer
   AutoForge wrote it"** or **"... no AutoForge protocol has that label"**
   (exit 2), followed by an `AutoForge controller/state protocol mismatch`
   block: the command imported a controller older than the one that wrote
@@ -695,9 +701,11 @@ The messages below are AutoForge's own refusals, grouped by subject.
   did to the source PR. Inspect those PRs on GitHub and decide by hand
   which one, if either, carries the issue forward. To continue, start a new
   run; it replaces `state.json`, journal included, so read `status` first.
-  Its `ANALYZE_EXECUTE` adopts the one open PR carrying the issue's
-  `ai-implementation` marker and blocks on two, so close the PR you do not
-  keep. See [Replan transaction](agent-guides/replan-transaction.md).
+  Its `ANALYZE_EXECUTE` blocks on two open PRs carrying the issue's
+  `ai-implementation` marker, so close the PR you do not keep, and on the
+  one it then finds, which names the old run: take that one over
+  ([Taking over a PR another run owns](usage.md#taking-over-a-pr-another-run-owns)).
+  See [Replan transaction](agent-guides/replan-transaction.md).
 
 ## Exit codes
 

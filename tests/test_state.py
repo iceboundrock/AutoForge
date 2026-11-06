@@ -480,7 +480,7 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path, local_
     """
     path = tmp_path / "state.json"
     base = make_state().to_dict()
-    assert base["protocol_version"] == "13"
+    assert base["protocol_version"] == "14"
     local_fields(base)  # protocol 1 wrote none, some or all of LOCAL's (ADR 0009 D8)
     del base["acceptance_outcomes"]  # protocol 8's own field (#211)
     del base["config_fingerprint"]  # protocol 9's own field (#219)
@@ -490,9 +490,9 @@ def test_protocol_1_is_migrated_only_without_a_replan_in_flight(tmp_path, local_
         data = dict(base, protocol_version="1", replan_transaction=journal)
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "13" and loaded.replan_transaction == journal
+        assert loaded.protocol_version == "14" and loaded.replan_transaction == journal
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "13"
+        assert json.loads(path.read_text())["protocol_version"] == "14"
     in_flight = {
         "stage": "prepared",
         "transaction_id": "a" * 32,
@@ -643,7 +643,7 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
         del data[missing]
     path.write_text(json.dumps(data), encoding="utf-8")
     loaded = load_state(path)
-    assert loaded.protocol_version == "13" and loaded.phase == phase
+    assert loaded.protocol_version == "14" and loaded.phase == phase
     assert (loaded.reviewed_pr_url, loaded.reviewed_base_ref, loaded.current_base_ref) == (
         "",
         "",
@@ -652,7 +652,7 @@ def test_protocol_2_is_relabelled_outside_the_merge_phases(tmp_path, phase):
     assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
     assert loaded.reviewed_head_sha == "a" * 40  # what protocol 2 did record is kept
     save_state(loaded, path)
-    assert json.loads(path.read_text())["protocol_version"] == "13"
+    assert json.loads(path.read_text())["protocol_version"] == "14"
 
 
 @pytest.mark.parametrize("phase", [Phase.READY_FOR_MERGE, Phase.MERGE])
@@ -712,12 +712,12 @@ def test_protocol_3_is_relabelled_outside_the_merge_phases(tmp_path, phase):
             del data[missing]
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "13" and loaded.phase == phase
+        assert loaded.protocol_version == "14" and loaded.phase == phase
         assert (loaded.reviewed_merge_base_sha, loaded.current_merge_base_sha) == ("", "")
         assert loaded.reviewed_pr_url == PR42 and loaded.reviewed_base_ref == "main"
         assert loaded.replan_transaction == journal
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "13"
+        assert json.loads(path.read_text())["protocol_version"] == "14"
 
 
 @pytest.mark.parametrize("phase", list(Phase))
@@ -801,11 +801,11 @@ def test_protocol_4_is_relabelled_in_every_phase_without_a_replan_past_the_write
         _drop_operator(data)  # protocol 11's own field (#243)
         path.write_text(json.dumps(data), encoding="utf-8")
         loaded = load_state(path)
-        assert loaded.protocol_version == "13" and loaded.phase == phase
+        assert loaded.protocol_version == "14" and loaded.phase == phase
         assert loaded.replan_transaction == journal
         assert loaded.reviewed_merge_base_sha == "d" * 40  # the binding is kept whole
         save_state(loaded, path)
-        assert json.loads(path.read_text())["protocol_version"] == "13"
+        assert json.loads(path.read_text())["protocol_version"] == "14"
 
 
 @pytest.mark.parametrize("phase", list(Phase))
@@ -2060,7 +2060,9 @@ def _replan_state(**kw):
         precondition={"absent": True, "watermark": 42},
         payload={
             "title": "Reimplement issue #2",
-            "body": replacement_pr_body("A fresh reimplementation.", EFFECT_ISSUE, marker),
+            "body": replacement_pr_body(
+                "A fresh reimplementation.", EFFECT_ISSUE, marker, "af-test-1"
+            ),
         },
     )
     context = ReplanContext(
@@ -2157,7 +2159,7 @@ def test_the_controller_speaks_protocol_13():
     good."""
     from autoforge import __protocol_version__
 
-    assert __protocol_version__ == "13"
+    assert __protocol_version__ == "14"
 
 
 @pytest.mark.parametrize(
@@ -2182,7 +2184,7 @@ def test_effect_state_round_trips_in_every_record_stage_under_the_current_protoc
     save_state(s, p)
 
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13"
+    assert raw["protocol_version"] == "14"
     assert raw["effect_records"][0]["stage"] == stage.value
     loaded = load_state(p)
     assert loaded == s
@@ -3332,7 +3334,7 @@ def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_on_save(tmp_
         _legacy(protocol, phase=Phase.REVIEW, current_pr_url=PR42, review_round=1),
     )
     loaded = load_state(p)
-    assert loaded.protocol_version == "13"
+    assert loaded.protocol_version == "14"
     assert loaded.phase_effects().empty
     assert _effect_fields(loaded) == {
         "effect_records": [],
@@ -3342,7 +3344,7 @@ def test_a_legacy_file_loads_with_no_effect_state_and_is_relabelled_on_save(tmp_
     }
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13"
+    assert raw["protocol_version"] == "14"
     assert raw["acceptance_outcomes"] == [] and raw["config_fingerprint"] == {}
     assert raw["validation_records"] == [] and raw["validation_override_seq"] is None
     assert raw["operator_comment_outcomes"] == []
@@ -3443,7 +3445,7 @@ def test_a_protocol_7_or_8_file_missing_an_effect_field_is_refused_and_left_unch
     plan at all, and the phase would complete from its context without
     publishing it."""
     d = _update_epic_state(stage).to_dict()
-    assert d["protocol_version"] == "13"
+    assert d["protocol_version"] == "14"
     d["protocol_version"] = protocol
     del d["config_fingerprint"]  # protocol 9's own field (#219)
     _drop_validation(d)  # protocol 10's own fields (#172)
@@ -3477,12 +3479,12 @@ def test_a_legacy_file_with_effect_fields_at_their_empty_values_loads(tmp_path):
     d = _legacy("5", phase=Phase.UPDATE_EPIC, attempt=1, current_pr_url=PR42)
     d.update(effect_records=[], entry_observation={}, completion_context={}, launch_label="")
     loaded = load_state(_write(tmp_path / "state.json", d))
-    assert loaded.protocol_version == "13"
+    assert loaded.protocol_version == "14"
     assert loaded.phase_effects().empty
     assert loaded.launch_label == LABEL_AGENT_PUBLISHES
 
 
-@pytest.mark.parametrize("protocol", ["6", "14", 7, 8, 9, 10, 11, 12, 13])
+@pytest.mark.parametrize("protocol", ["6", "15", 7, 8, 9, 10, 11, 12, 13, 14])
 def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(
     tmp_path, protocol, local_fields
 ):
@@ -3497,7 +3499,7 @@ def test_protocol_6_and_other_unknown_labels_are_refused_and_left_unchanged(
     before = p.read_bytes()
     with pytest.raises(StateError) as exc:
         load_state(p)
-    assert f"unsupported protocol_version {protocol!r} (controller speaks '13')" in str(exc.value)
+    assert f"unsupported protocol_version {protocol!r} (controller speaks '14')" in str(exc.value)
     assert p.read_bytes() == before
 
 
@@ -3779,11 +3781,11 @@ def test_a_protocol_12_file_loads_in_every_phase_and_is_relabelled_without_the_l
     written = p.read_bytes()
     loaded = load_state(p)
     assert p.read_bytes() == written  # a load writes nothing
-    assert loaded.protocol_version == "13" and loaded.phase == phase
+    assert loaded.protocol_version == "14" and loaded.phase == phase
     assert loaded == state
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13"
+    assert raw["protocol_version"] == "14"
     assert not set(raw) & set(LOCAL_STATE_FIELDS)
     assert set(raw) == _PROTOCOL_12_KEYS - set(LOCAL_STATE_FIELDS)
 
@@ -3939,13 +3941,13 @@ def test_a_protocol_12_file_main_saved_loads_without_a_write_and_its_next_save_i
     assert [x.name for x in tmp_path.iterdir()] == ["state.json"]
 
     kept = {k: v for k, v in raw.items() if k not in LOCAL_STATE_FIELDS}
-    assert loaded.protocol_version == "13"
+    assert loaded.protocol_version == "14"
     assert loaded.phase == Phase(raw["phase"]) and loaded.mode == WorkflowMode.REMOTE
-    assert loaded.to_dict() == {**kept, "protocol_version": "13"}
+    assert loaded.to_dict() == {**kept, "protocol_version": "14"}
 
     save_state(loaded, p)
     saved = json.loads(p.read_text(encoding="utf-8"))
-    assert saved["protocol_version"] == "13"
+    assert saved["protocol_version"] == "14"
     assert set(saved) == set(kept) == _PROTOCOL_12_KEYS - set(LOCAL_STATE_FIELDS)
     for key, value in kept.items():
         if key not in ("protocol_version", "updated_at"):
@@ -3962,10 +3964,10 @@ def test_a_file_under_each_older_label_loads_and_is_relabelled_without_the_local
     d = local_fields(_as_label(make_state(phase=Phase.REVIEW, current_pr_url=PR42), label))
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
-    assert loaded.protocol_version == "13" and loaded.phase == Phase.REVIEW
+    assert loaded.protocol_version == "14" and loaded.phase == Phase.REVIEW
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13"
+    assert raw["protocol_version"] == "14"
     assert not set(raw) & set(LOCAL_STATE_FIELDS)
 
 
@@ -3989,10 +3991,10 @@ def test_a_protocol_1_file_with_none_or_some_of_the_local_fields_loads(tmp_path,
             del d[name]
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
-    assert loaded.protocol_version == "13"
+    assert loaded.protocol_version == "14"
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and not set(raw) & set(LOCAL_STATE_FIELDS)
+    assert raw["protocol_version"] == "14" and not set(raw) & set(LOCAL_STATE_FIELDS)
 
 
 @pytest.mark.parametrize("label", ["1", "8", "12"])
@@ -4041,15 +4043,16 @@ def test_a_local_field_is_empty_only_at_the_value_a_remote_save_wrote(tmp_path, 
 def test_a_protocol_13_or_unlabelled_file_carrying_a_local_field_is_refused(
     tmp_path, field, held, label
 ):
-    """ADR 0009 D8 step 3: protocol 13 never writes a LOCAL field, so a file
-    labelled 13 that carries one, even at its empty value, is refused as an
-    unknown field; so is an unlabelled file, read as the current protocol."""
+    """ADR 0009 D8 step 3: protocol 13 and later never write a LOCAL field,
+    so a file of the current label that carries one, even at its empty value,
+    is refused as an unknown field; so is an unlabelled file, read as the
+    current protocol."""
     d = make_state(phase=Phase.REVIEW).to_dict()
     d[field] = type(LOCAL_STATE_FIELDS[field])() if held == "empty" else _LOCAL_FIELD_VALUES[field]
     if label is None:
         del d["protocol_version"]
     p = _write(tmp_path / "state.json", d)
-    _refused_unchanged(p, f"unknown field(s) {field!r}", "for protocol_version '13'")
+    _refused_unchanged(p, f"unknown field(s) {field!r}", "for protocol_version '14'")
 
 
 # -- record lifetime: settle_phase_effects (D2.4) ------------------------------------------
@@ -4312,7 +4315,7 @@ def test_a_protocol_7_file_loads_migrated_and_is_relabelled_on_save(tmp_path):
     d["last_fix_resolutions"] = [dict(FIXED_ENTRY)]
     p = _write(tmp_path / "state.json", _as_protocol_7(d))
     loaded = load_state(p)
-    assert loaded.protocol_version == "13" and loaded.acceptance_outcomes == []
+    assert loaded.protocol_version == "14" and loaded.acceptance_outcomes == []
     assert loaded.operator_comment_outcomes == []
     assert loaded.last_fix_resolutions == [FIXED_ENTRY]
     context = loaded.phase_effects().context
@@ -4321,7 +4324,7 @@ def test_a_protocol_7_file_loads_migrated_and_is_relabelled_on_save(tmp_path):
     assert all(r["operator_sources"] is None for r in context.resolutions)
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and raw["acceptance_outcomes"] == []
+    assert raw["protocol_version"] == "14" and raw["acceptance_outcomes"] == []
     assert load_state(p) == loaded
 
 
@@ -4503,7 +4506,7 @@ def test_a_recorded_configuration_round_trips_under_the_current_protocol(tmp_pat
     s = make_state(phase=Phase.REVIEW, config_fingerprint=_recorded_config())
     save_state(s, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and raw["config_fingerprint"] == _recorded_config()
+    assert raw["protocol_version"] == "14" and raw["config_fingerprint"] == _recorded_config()
     assert load_state(p) == s
 
 
@@ -4518,12 +4521,12 @@ def test_a_protocol_8_file_loads_with_no_recorded_configuration_and_is_relabelle
     _drop_operator(d)
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
-    assert loaded.protocol_version == "13" and loaded.config_fingerprint == {}
+    assert loaded.protocol_version == "14" and loaded.config_fingerprint == {}
     assert loaded.last_fix_resolutions[0]["acceptance_comment_url"] == ACCEPTANCE_COMMENT_URL
     assert loaded.acceptance_outcomes == _after_fix().acceptance_outcomes
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and raw["config_fingerprint"] == {}
+    assert raw["protocol_version"] == "14" and raw["config_fingerprint"] == {}
     assert load_state(p) == loaded
 
 
@@ -4554,7 +4557,7 @@ def test_an_older_file_carrying_a_recorded_configuration_is_refused_and_left_unc
     assert p.read_bytes() == before
 
 
-@pytest.mark.parametrize("protocol", ["9", "10", "11", "12", "13"])
+@pytest.mark.parametrize("protocol", ["9", "10", "11", "12", "13", "14"])
 def test_a_protocol_9_file_missing_its_recorded_configuration_is_refused(
     tmp_path, protocol, local_fields
 ):
@@ -4569,7 +4572,7 @@ def test_a_protocol_9_file_missing_its_recorded_configuration_is_refused(
     if protocol == "11":
         d["protocol_version"] = protocol
         _drop_pin(d)
-    if protocol == "12":
+    if protocol in ("12", "13"):
         d["protocol_version"] = protocol
     if protocol == "9":
         _drop_validation(d)
@@ -4663,7 +4666,7 @@ def test_validation_evidence_round_trips_under_the_current_protocol(tmp_path):
     )
     save_state(s, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13"
+    assert raw["protocol_version"] == "14"
     assert [r["outcome"] for r in raw["validation_records"]] == ["PASS", "FAIL"]
     loaded = load_state(p)
     assert loaded == s
@@ -4698,7 +4701,7 @@ def test_an_older_file_loads_in_every_phase_with_no_validation_evidence(tmp_path
             del d["acceptance_outcomes"]
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
-    assert loaded.protocol_version == "13" and loaded.phase == phase
+    assert loaded.protocol_version == "14" and loaded.phase == phase
     assert {key: getattr(loaded, key) for key in _VALIDATION_KEYS} == {
         "validation_records": [],
         "validation_attempt": {},
@@ -4709,7 +4712,7 @@ def test_an_older_file_loads_in_every_phase_with_no_validation_evidence(tmp_path
     }
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and raw["validation_records"] == []
+    assert raw["protocol_version"] == "14" and raw["validation_records"] == []
 
 
 @pytest.mark.parametrize("protocol", ["5", "7", "8", "9"])
@@ -4737,7 +4740,7 @@ def test_an_older_file_carrying_validation_evidence_is_refused(
     assert p.read_bytes() == before
 
 
-@pytest.mark.parametrize("protocol", ["10", "11", "12", "13"])
+@pytest.mark.parametrize("protocol", ["10", "11", "12", "13", "14"])
 @pytest.mark.parametrize("key", _VALIDATION_KEYS)
 def test_a_protocol_10_file_missing_a_validation_field_is_refused(
     tmp_path, key, protocol, local_fields
@@ -4750,8 +4753,8 @@ def test_a_protocol_10_file_missing_a_validation_field_is_refused(
     if protocol == "11":
         d["protocol_version"] = "11"
         _drop_pin(d)
-    if protocol == "12":
-        d["protocol_version"] = "12"
+    if protocol in ("12", "13"):
+        d["protocol_version"] = protocol
     del d[key]
     p = _write(tmp_path / "state.json", local_fields(d))
     with pytest.raises(StateError) as exc:
@@ -4923,7 +4926,7 @@ def test_every_operator_outcome_round_trips_under_the_current_protocol(tmp_path)
     p = tmp_path / "state.json"
     save_state(_after_operator_fix(operator_comment_outcomes=outcomes), p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and raw["operator_comment_outcomes"] == outcomes
+    assert raw["protocol_version"] == "14" and raw["operator_comment_outcomes"] == outcomes
     loaded = load_state(p)
     assert loaded.operator_comment_outcomes == outcomes
     assert loaded.last_fix_resolutions[0]["operator_evidence"] == [_operator_evidence()]
@@ -4942,11 +4945,11 @@ def test_a_protocol_10_file_loads_in_every_phase_with_no_operator_state(tmp_path
     assert "operator_comment_outcomes" not in d
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
-    assert loaded.protocol_version == "13" and loaded.phase == phase
+    assert loaded.protocol_version == "14" and loaded.phase == phase
     assert loaded.operator_comment_outcomes == []
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and raw["operator_comment_outcomes"] == []
+    assert raw["protocol_version"] == "14" and raw["operator_comment_outcomes"] == []
     assert load_state(p) == loaded
 
 
@@ -4959,7 +4962,7 @@ def test_a_protocol_10_fix_plan_loads_migrated_and_is_relabelled_on_save(tmp_pat
     d["last_fix_resolutions"] = [dict(FIXED_ENTRY)]
     p = _write(tmp_path / "state.json", _as_protocol(d, "10"))
     loaded = load_state(p)
-    assert loaded.protocol_version == "13" and loaded.operator_comment_outcomes == []
+    assert loaded.protocol_version == "14" and loaded.operator_comment_outcomes == []
     assert loaded.last_fix_resolutions == [FIXED_ENTRY]
     effects = loaded.phase_effects()
     assert isinstance(effects.context, FixContext)
@@ -4967,7 +4970,7 @@ def test_a_protocol_10_fix_plan_loads_migrated_and_is_relabelled_on_save(tmp_pat
     assert effects.observation is not None and effects.observation.operator_targets is None
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and raw["operator_comment_outcomes"] == []
+    assert raw["protocol_version"] == "14" and raw["operator_comment_outcomes"] == []
     assert raw["last_fix_resolutions"][0]["operator_evidence"] == []
     assert load_state(p) == loaded
 
@@ -5061,7 +5064,8 @@ def test_a_protocol_11_file_missing_its_operator_outcomes_is_refused(tmp_path, l
     for value, label in (
         ("12", "labelled protocol_version '12'"),
         ("13", "labelled protocol_version '13'"),
-        (None, "no protocol_version label (read as '13')"),
+        ("14", "labelled protocol_version '14'"),
+        (None, "no protocol_version label (read as '14')"),
     ):
         if value is None:
             del d["protocol_version"]
@@ -5405,7 +5409,7 @@ def test_a_sandbox_pin_round_trips_under_the_current_protocol(tmp_path):
     p = tmp_path / "state.json"
     save_state(state, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and raw["sandbox_pin"] == PIN
+    assert raw["protocol_version"] == "14" and raw["sandbox_pin"] == PIN
     assert load_state(p).sandbox_pin == PIN
 
 
@@ -5418,10 +5422,10 @@ def test_a_protocol_11_file_loads_unpinned_and_is_relabelled(tmp_path):
     _drop_pin(d)
     p = _write(tmp_path / "state.json", d)
     loaded = load_state(p)
-    assert loaded.protocol_version == "13" and loaded.sandbox_pin == {}
+    assert loaded.protocol_version == "14" and loaded.sandbox_pin == {}
     save_state(loaded, p)
     raw = json.loads(p.read_text(encoding="utf-8"))
-    assert raw["protocol_version"] == "13" and raw["sandbox_pin"] == {}
+    assert raw["protocol_version"] == "14" and raw["sandbox_pin"] == {}
     assert load_state(p) == loaded
 
 
@@ -5459,7 +5463,8 @@ def test_a_protocol_12_file_missing_its_sandbox_pin_is_refused(tmp_path, local_f
     for value, label in (
         ("12", "labelled protocol_version '12'"),
         ("13", "labelled protocol_version '13'"),
-        (None, "no protocol_version label (read as '13')"),
+        ("14", "labelled protocol_version '14'"),
+        (None, "no protocol_version label (read as '14')"),
     ):
         if value is None:
             del d["protocol_version"]

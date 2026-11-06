@@ -24,7 +24,10 @@ Commands:
           a FIX plan awaits (#211); --bind-evidence binds an existing comment
           to an operator action and --decline-action (repeatable) declines
           operator actions (#243); --rereview gives up the FIX of a review
-          round's open findings for a fresh REVIEW round at the same HEAD (#428)
+          round's open findings for a fresh REVIEW round at the same HEAD (#428);
+          --take-over hands the issue's open PR to this run (#414): it journals
+          the controller's write of this run into the PR's implementation
+          marker, which 'resume' sends, reads back and binds before REVIEW
   rebind-epic  the operator's explicit move of a standalone run to its issue's native
           parent (#435): --issue, --from (the recorded EPIC), --to, --reason; only in
           READY_FOR_MERGE or a BLOCKED run with nothing persisted tied to its EPIC, its own
@@ -357,6 +360,18 @@ def build_parser() -> argparse.ArgumentParser:
             "that FIX and re-enter REVIEW for a fresh round at the same HEAD, the findings "
             "handed to it to re-check (none is marked resolved); for a finding resolved "
             "outside the repository, such as a PR description edited by hand"
+        ),
+    )
+    action.add_argument(
+        "--take-over",
+        default="",
+        metavar="PR_URL",
+        help=(
+            "hand the issue's open PR to this run (#414); stop the run that owns it first. "
+            "Journals the controller's write of this run into the PR's implementation marker "
+            "and re-enters ANALYZE_EXECUTE; 'resume' then sends it over the body read here "
+            "(a body changed since is a conflict, never overwritten), reads it back and binds "
+            "the PR before REVIEW. Plain unblock never takes a PR over"
         ),
     )
 
@@ -1852,6 +1867,7 @@ def cmd_unblock(args) -> int:
     decline = [raw_decline] if isinstance(raw_decline, str) else [str(d) for d in raw_decline]
     bind = [(str(a), str(u)) for a, u in getattr(args, "bind_evidence", None) or []]
     rereview = bool(getattr(args, "rereview", False))
+    take_over = str(getattr(args, "take_over", "") or "")
     # The words a configuration refusal prints for this command (#219).
     words = ("unblock", "--reason", "<why>")
     if args.dry_run:
@@ -1866,6 +1882,7 @@ def cmd_unblock(args) -> int:
             decline_action=decline,
             bind_evidence=bind,
             rereview=rereview,
+            take_over=take_over,
         )
         print_unblock_outcome(outcome)
         return 0
@@ -1884,6 +1901,7 @@ def cmd_unblock(args) -> int:
             decline_action=decline,
             bind_evidence=bind,
             rereview=rereview,
+            take_over=take_over,
         )
     print_unblock_outcome(outcome)
     if not outcome.unblocked:

@@ -107,18 +107,29 @@ PR the controller persisted is read first; then the repository's open PRs
 are listed, to the end (the client walks GitHub's pages by cursor until it
 reports no next page, so the listing has no ceiling to fall past, #20; a
 listing the client cannot read to its end blocks, because "none exists" is
-then not knowable) for the `ai-implementation` marker of `{"issue"}`, which
-only the controller writes:
+then not knowable) for the `ai-implementation` marker of `{"issue"}` (since
+#414 also `"owner_run_id"`, the run that owns the PR), which only the
+controller writes:
 
-- exactly one, at a fresh entry: it is adopted (recorded as the issue's PR,
-  `REVIEW` next) without launching the agent, whatever its branch name and
-  whether or not GitHub links it to the issue. After a launch of this entry
-  it is not: the entry observation recorded none, so the controller did not
-  open it, and the run is `BLOCKED` naming it (D9.4); `unblock` then binds
-  it at a fresh entry if the operator decides it is the implementation. The
-  one exception is the one-shot re-entry of a run persisted while an agent
-  of the previous contract was publishing the PR (D13.4), which recovers as
-  before.
+- exactly one, and it is the PR this state persisted, whose marker names
+  this run: it is recovered (bound, `REVIEW` next) without launching the
+  agent, whatever its branch name and whether or not GitHub links it to
+  the issue.
+- the PR this state persisted, whose marker names another run or no run,
+  or no longer carries a readable marker of the issue: `BLOCKED`
+  (`pr-owner`), naming `unblock --take-over`. A PR bound before #414 names
+  no run, so its run stops here, or at the check of whichever phase it is
+  in, once (ADR 0004 D9.4a).
+- exactly one this state has no record of: `BLOCKED` (`pr-owner`) without
+  launching, whatever run its marker names, this one included. Finding a
+  PR is not owning it, and another controller may still be driving it.
+  The reason names the PR, its owner and `unblock --take-over <PR>`, or,
+  when the marker names this run, which that command refuses, the same
+  command in a fresh run. After
+  a launch of this entry such a PR is `BLOCKED` as unjournaled: the entry
+  observation recorded none, so the controller did not open it (D9.4). The
+  one-shot re-entry of a run persisted while an agent of the previous
+  contract was publishing the PR (D13.4) adopts nothing either.
 - two or more, one whose marker cannot be read, or one headed in a fork:
   `BLOCKED` without launching the agent. The controller never chooses
   which PR is the issue's, and it cannot publish to a fork's branch.
@@ -1007,6 +1018,70 @@ Never advance the workflow solely because an LLM said an operation succeeded.
 
 ---
 
+## The PR's owner (#414)
+
+Every PR the controller opens (K2), adopts (K3) or creates as a replacement
+(K7) carries the `ai-implementation` marker with `"owner_run_id"`: the run
+that owns the PR. The state stays the authority (D9.3: anyone with the
+shared login can write the marker), so the marker can only make a run
+refuse a PR, never let it adopt one (ADR 0004 D9.4a).
+
+- **One rule.** A run bound to a PR drives it only while the PR's marker
+  is the issue's and names that run. A marker naming another run or no
+  run, no marker, another issue's marker, a malformed or duplicate marker
+  and an empty body each block with `pr-owner`, with nothing launched,
+  posted, pushed or merged. A transient read error propagates with nothing
+  saved. No check writes state, and no state field remembers an owner.
+- **Where it is checked.** At the start of each step in `REVIEW`, `FIX`
+  and `REPLAN_REEXECUTE`; as the last read before every agent launch; after
+  an agent returns, before its result is applied; right before K4 is sent
+  and between `FIX` effects; on the merge gate's read in `READY_FOR_MERGE`
+  and `MERGE` (a `MERGED` PR is refused only for another run's marker or a
+  defect); with the merge gate closed, on the held run's read of the PR, by
+  the same rule; at `ANALYZE_EXECUTE`'s discovery, in the K3 plan's read of
+  the PR it adopts, and before a saved K1+K2 plan's push, on the PRs headed
+  at its branch (K2 requires none, so any of them stops the plan before it
+  moves the branch: `pr-owner` for an open PR whose marker names another run
+  or cannot be read, `unjournaled-write` otherwise); in `unblock` (a PR no longer open is refused, as at the
+  merge gate, only for another run's marker or a defect, and is never taken
+  over); and in a replan at preparation, before each write of its plan,
+  and before the source is closed. Where no read of the phase follows the
+  check before a launch or a write (the launch, a `FIX` effect after the
+  first, a write of the replan's plan), it passes only an open PR, read as
+  itself, whose marker names this run: a conclusive read failure refuses,
+  and so does a PR no longer open. The read right before K4 also refuses
+  an answer that is another PR or carries no state. A replan
+  refused this way is rejected for good, and its reason says to start a
+  fresh run for the issue and take the PR over there.
+- **A fresh state never adopts a marked PR.** It blocks and names
+  `unblock --take-over`. So does a state bound to a PR before #414, once,
+  since that PR's marker names no run.
+- **Takeover is K11.** `unblock --take-over <PR URL> --reason ...` reads
+  the PR, journals an `owner_takeover` record (precondition: the digest of
+  the body read and the owner it replaces; payload: that body with only
+  the marker's owner replaced by this run) and moves the run to
+  `ANALYZE_EXECUTE`, writing nothing to GitHub. The next step writes the
+  body, reads it back, binds the PR and enters `REVIEW`. An ambiguous
+  reply is read back in the same step; a write that landed before a crash
+  is observed on `resume` with no second write; a write the read-back
+  does not show is sent again by the next `resume`, within the attempt
+  bound, against the same base body; a body changed since the command read
+  it is a conflict (`effect-conflict`) and is never written over. A settled
+  record is decided on a fresh read of its PR (ADR 0004 K11, "A settled
+  K11"); that decision writes nothing. A plain `unblock`, `resume`,
+  `run --force` and `epic archive` never start a takeover. A dry run writes
+  nothing. A bound run whose `REVIEW` or `FIX` plan
+  is journaled keeps it: the record is appended to the plan, the plan's
+  phase sends it first and then completes the plan as journaled (PR #460
+  R1-F1).
+
+The check and the next write are not atomic: GitHub has no conditional
+body update, so a takeover that lands between a run's last check and its
+write is seen at the next check. Stop the old controller before taking a
+PR over. Reads an effect makes inside its own reconciliation (K7 listing
+every PR, say) belong to that write and are not owner checks. The PR's
+owner is public text in the PR body, never a credential or a lock.
+
 ## The PR identity read and the checks read
 
 `GitHubClient` reads a pull request in one of two ways (#291):
@@ -1171,6 +1246,10 @@ repository that the operator posts and the controller only verifies. It
 adds no write: its operation is read-only (`OperatorCommentOp.issue`
 raises), `drive` refuses its record and `effect_ops.verify` is its one
 path, so no setting makes the controller post one (ADR 0004 D2.1a).
+#414 adds K11, the takeover of the issue's implementation PR: the operator
+decides it with `unblock --take-over`, and the controller writes this run
+into the PR's implementation marker over exactly the body the command
+read (`OwnerTakeoverOp`, `decide_replace`), with no rebase.
 
 - **Typed writes, never retried blind.** `GitHubClient` has one method per
   write the effects need (`create_issue_comment`, `create_pr_comment`,
@@ -1521,6 +1600,7 @@ operation the prompts used to name is in one class.
 | post the EPIC progress comment; splice the EPIC roadmap | controller-only | the controller, effect K8 and the roadmap write |
 | post the acceptance comment on the run's issue | controller-only | the controller, effect K9, once authorized (#211) |
 | post a comment on another issue of the run's repository as acceptance evidence | controller-only | the operator; the controller never posts it and verifies it as effect K10 (#243) |
+| replace the owner in the implementation PR's marker (a takeover) | controller-only | the controller, effect K11, on the operator's `unblock --take-over` (#414) |
 | close, reopen or comment on the source PR of a replan | controller-only | the controller's replan transaction |
 | merge; disable auto-merge | controller-only | the controller, behind `safety.allow_merge` |
 | delete the merged PR's head branch on GitHub | controller-only | the controller, after a verified merge, behind `merge.delete_branch` (#283) |

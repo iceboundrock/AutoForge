@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from autoforge import cli, epic_commands, scheduler_stop
+from autoforge.claims import render_implementation_marker
 from autoforge.engine import ControllerEngine
 from autoforge.epic_commands import DRAIN_HELP, EXIT_OPEN_CLAIMS, STATUS_SCHEMA
 from autoforge.errors import ExecutionError
@@ -1124,7 +1125,15 @@ def test_a_drain_and_a_now_stop_of_a_running_scheduler(epic, signals):
 # -- epic archive ------------------------------------------------------------------------
 
 
-def test_a_blocked_issue_archived_is_admitted_fresh_and_adopts_its_pr(epic):
+def test_a_blocked_issue_archived_is_admitted_fresh_and_takes_its_pr_over_only_when_handed_it(
+    epic, monkeypatch
+):
+    """ADR 0008 D17.4, amended by #414: the fresh run 'epic archive' admits
+    finds the issue's PR and launches no implementer, but the PR's marker
+    names the archived run, so it binds nothing and blocks (ADR 0004 D9.4a).
+    The operator runs 'unblock --take-over' on the namespace, which plans
+    K11 and writes nothing; 'epic resume' writes the new run into the
+    marker, binds the PR and reviews it."""
     e = epic()
     b = e.b
     b.issue(2, (IMPLEMENT, {"do": "blocked"}), world=str(world(b, 2)))
@@ -1138,14 +1147,49 @@ def test_a_blocked_issue_archived_is_admitted_fresh_and_adopts_its_pr(epic):
     assert f"the state was moved aside to {archived}" in out
     assert "kept: the run logs" in out and "the claim history" in out
     assert "loop-bound evidence" in out and "now live only in" in out
+    assert "until 'unblock --take-over'" in out
     assert load_state(archived).phase is Phase.BLOCKED
     assert e.rows()[2]["category"] == "ready"
-    b.issue(2, (REVIEW,), world=str(world(b, 2)))  # the PR is adopted: no implementer runs
+    b.issue(2, (REVIEW,), world=str(world(b, 2)))  # no implementer runs
     assert e.run()[0] == 0
+    fresh = b.state(2)
+    assert fresh.phase is Phase.BLOCKED and fresh.current_pr_url == ""
+    assert fresh.run_id != first.run_id
+    assert f"names run {first.run_id} as its owner" in fresh.block_reason
+    assert f"unblock --take-over {first.current_pr_url}" in fresh.block_reason
+    (pr,) = prs(b, 2)
+    issue = url(2)
+    assert render_implementation_marker(issue, first.run_id) in pr.body
+
+    # The operator hands the PR to the fresh run: 'unblock --take-over' on
+    # the namespace (in this process, on the issue's GitHub) plans K11.
+    with open(world(b, 2), "rb") as f:
+        gh = pickle.load(f)
+    written = list(gh.effect_writes)
+    engine_for = cli._engine_for
+
+    def on_the_issues_github(args, cfg=None):
+        engine = engine_for(args, cfg)
+        engine._github = gh
+        return engine
+
+    monkeypatch.setattr(cli, "_engine_for", on_the_issues_github)
+    words = ("unblock", "--take-over", pr.url, "--reason", "the archived run is gone")
+    code, out, err = e.cli("--state-dir", str(b.ns(2).state_dir), *words)
+    assert code == 0, err
+    assert "BLOCKED -> ANALYZE_EXECUTE" in out
+    taken = b.state(2)
+    assert taken.phase is Phase.ANALYZE_EXECUTE and taken.current_pr_url == ""
+    assert [r["kind"] for r in taken.effect_records] == ["owner_takeover"]
+    assert gh.effect_writes == written
+
+    assert e.resume()[0] == 0
     again = b.state(2)
     assert again.phase is Phase.READY_FOR_MERGE and again.current_pr_url == first.current_pr_url
-    assert again.run_id != first.run_id and len(prs(b, 2)) == 1
-    assert [c.claim.generation for c in b.claims(2).history] == [1, 2]
+    assert again.run_id == fresh.run_id and len(prs(b, 2)) == 1
+    (taken_pr,) = prs(b, 2)
+    assert render_implementation_marker(issue, fresh.run_id) in taken_pr.body
+    assert render_implementation_marker(issue, first.run_id) not in taken_pr.body
     assert e.cli("epic", "archive", EPIC, "2")[0] == 0
     assert "nothing left to archive" in e.cli("epic", "archive", EPIC, "2")[1]
 
@@ -1386,6 +1430,38 @@ def test_a_recheck_whose_step_blocks_the_run_exits_1_with_its_typed_stop(epic):
         assert pickle.load(f).merges == []
 
 
+def test_a_recheck_of_an_issue_whose_pr_another_run_owns_blocks_the_run(epic):
+    """#414: 'epic recheck' makes the held run's read, so it checks the owner on
+    it too. The run stops with its typed stop and the takeover command, whether
+    or not the PR moved; the command exits 1 and reads nothing past the PR."""
+    e = epic()
+    b = e.b
+    b.issue(2, world=str(world(b, 2)))
+    assert e.run()[0] == 0
+    held = b.state(2)
+    assert held.phase is Phase.READY_FOR_MERGE
+    other = "af-20261031T040500Z-0a0b0c"
+    with open(world(b, 2), "rb") as f:
+        gh = pickle.load(f)
+    (pr,) = gh.prs.values()
+    pr.body = pr.body.replace(held.run_id, other)
+    with open(world(b, 2), "wb") as f:
+        pickle.dump(gh, f)
+
+    with _WorldEngines(b, 2) as engines:
+        code, out, _ = e.cli("epic", "recheck", EPIC, "2")
+    assert code == 1, out
+    blocked = b.state(2)
+    assert blocked.phase is Phase.BLOCKED and blocked.run_id == held.run_id
+    assert other in blocked.block_reason and "--take-over" in blocked.block_reason
+    assert blocked.last_review_result == "clean"
+    stop = next(line for line in out.splitlines() if line.startswith("stop: "))
+    assert stop.startswith("stop: blocked (reason pr-owner, from controller")
+    assert [call[0] for call in engines.calls] == ["get_pr"]
+    with open(world(b, 2), "rb") as f:
+        assert pickle.load(f).merges == []
+
+
 def test_recheck_refuses_an_issue_it_does_not_hold_at_ready_for_merge(epic):
     """No namespace, one bound under another EPIC, and an open claim are refused
     (exit 2) before any engine is built or GitHub is read."""
@@ -1484,14 +1560,14 @@ def _a_standalone_state_labelled(standalone: Path, issue: int, label: object) ->
     standalone_state(standalone, issue, Phase.REVIEW)
     state_file = standalone / "state.json"
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    data.update(protocol_version=label, phase="A_PHASE_OF_PROTOCOL_14")
+    data.update(protocol_version=label, phase="A_PHASE_OF_PROTOCOL_15")
     state_file.write_text(json.dumps(data), encoding="utf-8")
     (standalone / "logs" / "standalone").mkdir(parents=True)
     (standalone / "logs" / "standalone" / "run.log").write_text("a run log\n", encoding="utf-8")
     return state_file
 
 
-@pytest.mark.parametrize("label", ["14", "99", "6", "14.0", 14], ids=repr)
+@pytest.mark.parametrize("label", ["15", "99", "6", "15.0", 15], ids=repr)
 def test_a_standalone_state_of_a_protocol_this_controller_does_not_read_admits_nothing(
     epic, tmp_path, label
 ):
@@ -1549,7 +1625,7 @@ def test_a_standalone_state_of_a_protocol_this_controller_does_not_read_admits_n
     assert state_tree(standalone) == before
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    data.update(protocol_version="13", phase="REVIEW")
+    data.update(protocol_version="14", phase="REVIEW")
     state_file.write_text(json.dumps(data), encoding="utf-8")
     code, _, _ = e.run()
     assert code == 0 and b.admitted() == [3], e.said
@@ -1632,7 +1708,7 @@ def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
     b = e.b
     b.issue(2)
     if content == "protocol-14":
-        state_file = _a_standalone_state_labelled(standalone, 2, "14")
+        state_file = _a_standalone_state_labelled(standalone, 2, "15")
     else:
         standalone_state(standalone, 2, Phase.REVIEW)
         state_file = standalone / "state.json"
@@ -1649,11 +1725,11 @@ def test_every_report_names_the_standalone_state_on_one_printable_bounded_line(
     held = f"the standalone state {shown} runs it (phase REVIEW)"
     # The refusal and the controller, right after the path the report names.
     refused = (
-        f"{unreadable}unsupported protocol_version '14' (controller speaks '13'): a newer "
+        f"{unreadable}unsupported protocol_version '15' (controller speaks '14'): a newer "
         "AutoForge wrote it, and this controller, autoforge "
     )
     provenance = (
-        f"(protocol 13) imported from {os.path.abspath(autoforge.__file__)}, "
+        f"(protocol 14) imported from {os.path.abspath(autoforge.__file__)}, "
         f"python {sys.executable}, reads protocols "
     )
 
@@ -1756,13 +1832,13 @@ def test_a_namespace_state_a_newer_controller_wrote_is_held_with_this_controller
     _bind(b, 2, issue_id=b.graph.issue(2, R).id)
     standalone_state(b.ns(2).state_dir, 2, Phase.REVIEW)
     data = json.loads(b.ns(2).state_file.read_text(encoding="utf-8"))
-    data.update(protocol_version="14", phase="A_PHASE_OF_PROTOCOL_14")
+    data.update(protocol_version="15", phase="A_PHASE_OF_PROTOCOL_15")
     b.ns(2).state_file.write_text(json.dumps(data), encoding="utf-8")
     before = (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes())
     code, _, _ = e.run()
     assert code == 0 and b.admitted() == [] and b.claims(2) is None, e.said
     headline = (
-        "unsupported protocol_version '14' (controller speaks '13'): a newer AutoForge wrote it"
+        "unsupported protocol_version '15' (controller speaks '14'): a newer AutoForge wrote it"
     )
     imported = os.path.abspath(autoforge.__file__)
     named = f"; state file {shown_path(str(b.ns(2).state_file))}"
@@ -1772,7 +1848,7 @@ def test_a_namespace_state_a_newer_controller_wrote_is_held_with_this_controller
     assert row["category"] == "uncertain"
     assert row["classification"] == "uncertain(state-corrupt)"
     assert headline in row["detail"] and f"imported from {imported}" in row["detail"]
-    assert "a controller that speaks protocol 14 reads and continues it" in row["detail"]
+    assert "a controller that speaks protocol 15 reads and continues it" in row["detail"]
     assert "epic archive" not in row["detail"] and "by hand" not in row["detail"]
     assert row["next"] == []
     assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
@@ -1796,13 +1872,13 @@ def test_a_namespace_state_of_a_label_no_protocol_has_offers_no_repair_or_archiv
     _bind(b, 2, issue_id=b.graph.issue(2, R).id)
     standalone_state(b.ns(2).state_dir, 2, Phase.REVIEW)
     data = json.loads(b.ns(2).state_file.read_text(encoding="utf-8"))
-    data.update(protocol_version=label, phase="A_PHASE_OF_PROTOCOL_14")
+    data.update(protocol_version=label, phase="A_PHASE_OF_PROTOCOL_15")
     b.ns(2).state_file.write_text(json.dumps(data), encoding="utf-8")
     before = (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes())
     code, _, _ = e.run()
     assert code == 0 and b.admitted() == [] and b.claims(2) is None, e.said
     headline = (
-        f"unsupported protocol_version {label!r} (controller speaks '13'): no AutoForge "
+        f"unsupported protocol_version {label!r} (controller speaks '14'): no AutoForge "
         "protocol has that label"
     )
     imported = f"imported from {os.path.abspath(autoforge.__file__)}"
@@ -1867,17 +1943,17 @@ def test_every_report_of_a_refused_namespace_state_keeps_the_controller_however_
     _bind(b, 2, issue_id=b.graph.issue(2, R).id)
     standalone_state(b.ns(2).state_dir, 2, Phase.REVIEW)
     data = json.loads(b.ns(2).state_file.read_text(encoding="utf-8"))
-    data.update(protocol_version="14", phase="A_PHASE_OF_PROTOCOL_14")
+    data.update(protocol_version="15", phase="A_PHASE_OF_PROTOCOL_15")
     b.ns(2).state_file.write_text(json.dumps(data), encoding="utf-8")
     before = (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes())
     shown = shown_path(str(b.ns(2).state_file))
     assert (shown == str(b.ns(2).state_file)) == (length <= MAX_PATH_CHARS)
     refused = (
-        "unsupported protocol_version '14' (controller speaks '13'): a newer AutoForge wrote "
+        "unsupported protocol_version '15' (controller speaks '14'): a newer AutoForge wrote "
         "it, and this controller, autoforge "
     )
     provenance = (
-        f"(protocol 13) imported from {os.path.abspath(autoforge.__file__)}, "
+        f"(protocol 14) imported from {os.path.abspath(autoforge.__file__)}, "
         f"python {sys.executable}, reads protocols "
     )
     named = f"; state file {shown}"
@@ -1902,14 +1978,14 @@ def test_every_report_of_a_refused_namespace_state_keeps_the_controller_however_
     code, out, _ = e.cli("epic", "status", EPIC)
     assert code == 1
     row = keeps_the_provenance(out, f"  #2 uncertain: {corrupt}")
-    assert "a controller that speaks protocol 14 reads and continues it" in row
+    assert "a controller that speaks protocol 15 reads and continues it" in row
     keeps_the_provenance(out, f"problem: issue #2: {corrupt}")
     code, doc = e.status()
     assert code == 1
     (child,) = [row for row in doc["children"] if row["number"] == 2]
     assert child["detail"].startswith(f"{corrupt}{refused}")
     keeps_the_provenance(child["detail"], corrupt)
-    assert "a controller that speaks protocol 14 reads and continues it" in child["detail"]
+    assert "a controller that speaks protocol 15 reads and continues it" in child["detail"]
     keeps_the_provenance("\n".join(doc["problems"]), f"issue #2: {corrupt}")
     assert (state_tree(b.ns(2).state_dir), b.ns(2).binding_file.read_bytes()) == before
 

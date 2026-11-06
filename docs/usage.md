@@ -445,13 +445,18 @@ never advances the state machine. In brief:
 | Phase | Who | What the controller checks |
 |---|---|---|
 | `INITIALIZING` | controller | the checkout's `origin` (read locally, named as GitHub names it) is the issue's repo, the issue is in this repo, is not the EPIC, exists and is OPEN |
-| `ANALYZE_EXECUTE` | Claude Code (`analyze_execute`), which makes no GitHub write | an open PR already carrying the issue's `ai-implementation` marker is adopted without running the agent (two block); the agent commits on its worktree's detached HEAD, and the controller checks that HEAD itself (the reported SHA, descent from the default branch head and from the branch head, every commit message), pushes it to `autoforge/<n>`, opens the PR with the agent's title and body (or adopts the open unmarked PR on that branch), journalling each write before it is sent, and reads the PR back at exactly the pushed HEAD; a marker PR or a branch head it did not write blocks |
+| `ANALYZE_EXECUTE` | Claude Code (`analyze_execute`), which makes no GitHub write | an open PR already carrying the issue's `ai-implementation` marker blocks without running the agent unless this run recorded it and the marker names this run ([taking over a PR](#taking-over-a-pr-another-run-owns); two block); the agent commits on its worktree's detached HEAD, and the controller checks that HEAD itself (the reported SHA, descent from the default branch head and from the branch head, every commit message), pushes it to `autoforge/<n>`, opens the PR with the agent's title and body (or adopts the open unmarked PR on that branch), journalling each write before it is sent, and reads the PR back at exactly the pushed HEAD; a marker PR or a branch head it did not write blocks |
 | `REVIEW` | OpenCode (`review_round_1`, `review_round_2_5`, `review_round_6_plus`), which makes no GitHub write | the round is bound to the PR, HEAD, base and merge base read from GitHub, and a comment already carrying that round's marker blocks (the controller never adopts one it did not post); the reviewer's round and HEAD must match the binding and `needs_fix_round == (len(findings) > 0)`; the controller renders the review comment from the result, journals it, posts it and reads it back, so a crash or `resume` never posts a second one; then controller policy picks `FIX`, `READY_FOR_MERGE`, `REPLAN_REEXECUTE` or `BLOCKED` |
 | `FIX` | Claude Code (`fix`), which makes no GitHub write | the PR is still at the reviewed revision (else back to `REVIEW` without running the fixer); the open issues already marked as a finding's follow-up are handed to the fixer to reuse, and one the controller did not hand over or create blocks; the fixer commits on its worktree's detached HEAD and resolves every open finding exactly once, and the controller checks that HEAD itself (the reported SHA, descent from the reviewed HEAD, every commit message, a commit for each `fixed` finding); it creates the follow-up issues the fixer asks for, appends the finding markers to the handed-over issues it defers to, then pushes the commit last, journalling each write before it is sent, and reads the follow-ups and the PR head back, so a crash or `resume` never creates or pushes twice; a push it did not make sends the PR back to `REVIEW` |
 | `REPLAN_REEXECUTE` | OpenCode (`replan_reexecute`), which makes no GitHub write | one durable transaction; the agent commits on its worktree's detached HEAD at the default branch head the controller recorded, and the controller checks that HEAD itself (the reported SHA, descent from that base, every commit message), pushes it to `autoforge/<n>-replan-<transaction id>`, creates the replacement PR with the agent's title and body followed by the controller's markers, journalling each write before it is sent, and binds the PR only at exactly the pushed HEAD, so a crash or `resume` never pushes or creates twice; a replacement branch or a marker PR it did not write rejects the transaction; the old PR is closed by the controller only while both PRs still match their checkpoints |
 | `READY_FOR_MERGE` | nobody | holding state at the clean-reviewed revision: with the merge gate closed, `step` and `resume` read the PR and send one that moved back to `REVIEW` (#447); with the gate open, the full pre-merge verification runs before `MERGE` is entered |
 | `MERGE` (gated) | controller, never an agent | `gh pr merge --match-head-commit <reviewed HEAD>`, counted only once GitHub reports `MERGED` at that HEAD into the reviewed base |
 | `UPDATE_EPIC` | OpenCode (`update_epic`), which makes no GitHub write | the controller (not the agent) posts the progress comment and writes the roadmap section, journals each write before performing it and reads it back, so a crash or `resume` never posts a second comment; a marker comment it did not post blocks; the next issue gets the `INITIALIZING` checks and must be a native sub-issue of the EPIC with no sub-issues of its own, as `epic run` admits (#287); `null` -> `DONE` only when GitHub's complete listing of the EPIC's sub-issues holds none the run could still select (a listing short of the EPIC's count is `BLOCKED`) |
+
+In `REVIEW`, `FIX` and `REPLAN_REEXECUTE`, and at the merge gate, the bound
+PR's `ai-implementation` marker must also name the run; otherwise the run
+blocks with `pr-owner` and nothing more is launched, posted, pushed or
+merged ([taking over a PR](#taking-over-a-pr-another-run-owns)).
 
 The complete per-phase verification, including what each phase reads
 *before* it launches an agent so a re-entry never duplicates work, is in
@@ -568,8 +573,8 @@ names the effect in the reason: perform the write by hand or remove the
 conflicting object, then `unblock`; the controller reconciles the write
 against GitHub again before it issues anything. `ANALYZE_EXECUTE` blocks the
 same way on anything it did not write: a PR carrying the issue's marker
-that appeared while the agent ran (if it is the implementation, `unblock`
-binds it), a push to, creation or deletion of `autoforge/<n>` it did not
+that appeared while the agent ran (if it is the implementation, take it
+over: see [Taking over a PR another run owns](#taking-over-a-pr-another-run-owns)), a push to, creation or deletion of `autoforge/<n>` it did not
 record (inspect the branch; `unblock` reads it again and the agent continues
 from its head), a closed or merged PR on that branch (reopen it to have it
 adopted, or finish the issue by hand), an open PR on that branch the entry
@@ -896,6 +901,100 @@ and still judges whether they resolve the finding. `run` refuses to replace a
 `BLOCKED` or `FAILED` run that holds operator actions without `--force`; the
 comments stay on GitHub either way.
 
+### Taking over a PR another run owns
+
+Each implementation PR the controller opens or adopts names its run in its
+`ai-implementation` marker: `<!-- ai-implementation: {"issue": "...",
+"owner_run_id": "af-..."} -->` (#414). A run drives a PR only while it is
+bound to it and that marker names it. Otherwise it stops with `BLOCKED`
+and `pr-owner`, before anything more is launched or written:
+
+- **A run with no record of the issue's PR.** It may be a new
+  `--state-dir`, another machine or container under the same GitHub login,
+  a scheduler namespace after `epic archive`, or a run whose state was
+  lost. Its `ANALYZE_EXECUTE` entry finds the issue's open marked PR and
+  does not bind it, whatever run the marker names, this one included. The
+  controller cannot tell a PR its own crashed run left behind from one
+  another controller is still reviewing (#387). When the marker names this
+  run, `--take-over` refuses it too, and the reason names a fresh run's
+  `--take-over` instead.
+- **A run whose PR's marker no longer names it.** Another run took it
+  over, the marker was removed or cannot be read, or the PR was opened
+  before #414 and its marker names no run. Every run bound to a PR when
+  you upgrade stops here once. It stops at its next step, before the agent's
+  result is applied, before the review comment is posted, between `FIX`'s
+  writes, and at the merge gate. A run waiting at `READY_FOR_MERGE` with the
+  merge gate closed stops at your next `resume` or `epic recheck`. A plain
+  `unblock` refuses it.
+
+The `BLOCKED` reason names the PR, the run its marker names, and the
+command. To take the PR over:
+
+1. Stop the other controller. Stop the run the marker names, on whichever
+   machine runs it. AutoForge cannot do this for you: nothing but the
+   marker connects two environments, and it is not a lock.
+2. Run `autoforge unblock --take-over <PR URL> --reason "..."` on the
+   taking run, with the `--state-dir` (or `--config`) it uses. It reads
+   the PR and records the takeover, and writes nothing to GitHub yet. It
+   refuses, writing nothing, when the PR is not open, is in another
+   repository or headed in a fork, is not the issue's one marked PR (or,
+   for a bound run, not the PR it is bound to), or its body does not carry
+   exactly one readable marker of the issue; when the run journaled other
+   writes it has to finish first (other than a `REVIEW` or `FIX` plan,
+   which the takeover is added to; see below); and when the marker already
+   names this
+   run (unblock without the flag if the run is bound to the PR; otherwise
+   start a fresh run, since a marker this run did not write hands it
+   nothing).
+3. Run `autoforge resume` (or `epic resume` for a scheduler's issue). It
+   writes this run into the marker, changing nothing else of the body,
+   reads it back, binds the PR and continues in `REVIEW`. A run that never
+   had the PR reviews it from its own round 1, with no finding, verdict or
+   certificate of the run it took the PR from. A run handed back its own
+   PR re-checks its open findings at the PR's current revision.
+4. If it reports a conflict (`effect-conflict`: the PR body changed since
+   step 2 read it, or the PR stopped qualifying), the controller wrote
+   nothing over it. Inspect the PR. What you do next depends on what you
+   find:
+   - The marker names another run or no run: run `--take-over` again. It
+     plans the write over the body as it is now.
+   - The marker is gone or unreadable: repair the body so it carries the
+     issue's one marker, then run `--take-over` again. A run not yet bound
+     can instead start a new run, which decides from the PR as it is.
+   - The marker already names this run, because the write landed and the
+     body was edited afterwards: run a plain `unblock`. Nothing more is
+     written, and the run continues.
+   - The PR was merged or closed: run a plain `unblock`. A run bound to the
+     PR goes wherever a merged or closed PR sends it. A run not yet bound
+     is refused, and the reason says to reopen the PR or start a new run.
+
+If the write does not show on GitHub when it is read back, the run stays
+in `ANALYZE_EXECUTE` and the next `resume` sends it again, at most twice
+in all. A plain `unblock` on a run whose takeover is recorded but not yet
+written re-enters `ANALYZE_EXECUTE` to finish it, and a second
+`--take-over` is refused. A plain `unblock`, `resume`, `run --force` and
+`epic archive` never start a takeover, and `unblock --take-over --dry-run`
+writes nothing.
+
+A run that stopped partway through a `REVIEW` or `FIX` step, with its
+round comment, follow-ups or push recorded but not all sent, keeps that
+work. This is also what a run in flight when you upgraded to #414 looks
+like. `--take-over` adds the takeover to that recorded work, and `resume`
+continues in the same phase: it writes this run into the marker first,
+then finishes what was recorded, checking each write against GitHub so
+that nothing is sent twice. If the PR moved while another run drove it,
+that phase's own checks send the run back to `REVIEW` instead.
+
+A run with a replan journal is never unblocked. When its replan is refused
+for the PR's owner, start a fresh run for the issue and take the PR over
+there.
+
+This is cooperative fencing, not a lock: GitHub has no conditional body
+update, so a takeover that lands while the old run is between its last
+check and a write is seen at its next check. Stop the old run first. If
+you take over at the same revision, a second round-1 review comment is
+still refused; at a new revision, the taking run posts its own "Round 1".
+
 ### DONE and FAILED
 
 `DONE` is reached when `UPDATE_EPIC` reports no next issue. `DONE` and
@@ -1117,8 +1216,13 @@ archived (an unusable claim file is moved aside), then moves
 order. It keeps the run logs, the worker logs, the worktree, the binding
 and the claim history, and says so; the run's loop-bound evidence (review
 rounds, fix attempts, the replan count) and its validation records then
-live only in the archived state: the next admission starts the issue fresh
-and adopts its marked PR. Re-running it completes an interrupted archive;
+live only in the archived state: the next admission starts the issue fresh.
+An open PR of the issue is kept, and stays the archived run's: archiving
+moves a local file, while the PR's owner is recorded on GitHub, in its
+implementation marker (#414). The fresh state's entry therefore blocks on
+the PR; to continue it, [take it over](#taking-over-a-pr-another-run-owns)
+with `unblock --take-over` in the namespace's state directory, then
+`epic resume`. Re-running `epic archive` completes an interrupted archive;
 on an issue with nothing left it says "nothing left to archive". It reads
 nothing from GitHub but the repository's id, which the binding's must be
 (see `epic stop` above), and does not touch `scheduler.json`.
@@ -1171,7 +1275,8 @@ change).
 Ctrl-C, a killed scheduler, a killed worker and a reboot all end the same
 way: run `epic status`, then `epic resume`. Each crash window between the
 scheduler's writes (ADR 0008 D14.5) is recovered by it, and no issue gets a
-second worker or a second PR: a PR an interrupted run opened is adopted
+second worker or a second PR: a PR an interrupted run opened is recovered
+by that run's own state
 ([State and recovery](agent-guides/state-and-recovery.md#per-issue-scheduler-namespaces)).
 `epic resume` never signals a process: a worker that survived its
 scheduler keeps the repository lock until it exits, so wait for it (or

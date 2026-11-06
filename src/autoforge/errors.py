@@ -527,6 +527,21 @@ class ClaimConflictError(AutoForgeError):
     """
 
 
+class PROwnerError(AutoForgeError):
+    """The bound PR's implementation marker names another run, or cannot be read (#414).
+
+    ADR 0004 D9.4a: the ``ai-implementation`` marker names the run that owns
+    the PR, and a run drives its bound PR only while the marker names it:
+    another run, no run (a PR opened before the owner was recorded), no
+    marker or an unreadable one all refuse. The controller's owner checks
+    of the bound PR raise this before anything is launched, posted, pushed
+    or merged on a PR this run does not own, and the step turns it into
+    ``BLOCKED`` with nothing more sent. It is no :class:`VerificationError`:
+    another run's PR is not a failed check to read again on ``resume``, but
+    the operator's decision.
+    """
+
+
 class VerificationError(AutoForgeError):
     """Post-execution verification failed (HEAD mismatch, PR state, guards).
 

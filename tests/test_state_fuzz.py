@@ -403,9 +403,13 @@ WELL_FORMED_CHECKPOINTS = (
 
 _CHECKPOINT_REFUSALS = {
     # Protocol 13 has no such field: each is unknown (ADR 0009 D8 step 4).
+    "14": (
+        "state file has unknown field(s) 'local_pending_attempts', "
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '14'"
+    ),
     "13": (
         "state file has unknown field(s) 'local_pending_attempts', "
-        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '13'"
+        "'local_pending_fingerprint', 'local_pending_phase' for protocol_version '14'"
     ),
     # An older label's LOCAL fields are dropped only when empty (D8 step 3).
     "12": (

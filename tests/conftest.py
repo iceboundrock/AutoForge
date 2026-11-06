@@ -29,6 +29,7 @@ from autoforge.certificate import Revision, remote_certificate  # noqa: E402
 from autoforge.config import default_config  # noqa: E402
 from autoforge.engine import ControllerEngine  # noqa: E402
 from autoforge.errors import (  # noqa: E402
+    ConfigurationError,
     ExecutionError,
     GitHubChecksAccessError,
     GitHubError,
@@ -318,11 +319,15 @@ def post_progress_comment(gh: FakeGitHub, cid: int = 300) -> None:
     gh.add_comment(EPIC, cid, progress_comment_body())
 
 
-def implementation_pr_body(issue_url: str = ISSUE) -> str:
-    """A PR body carrying the issue's implementation marker (an existing implementation PR)."""
+def implementation_pr_body(issue_url: str = ISSUE, owner_run_id: str | None = None) -> str:
+    """A PR body carrying the issue's implementation marker (an existing implementation PR).
+
+    The marker names ``owner_run_id`` as the PR's owner, or no owner, as a PR
+    opened before #414 does.
+    """
     from autoforge.engine import render_implementation_marker
 
-    return f"Closes {issue_url}\n\n{render_implementation_marker(issue_url)}\n"
+    return f"Closes {issue_url}\n\n{render_implementation_marker(issue_url, owner_run_id)}\n"
 
 
 def follow_up_issue_body(finding_id: str, pr_url: str = PR) -> str:
@@ -522,6 +527,14 @@ class FakeGitHub:
         self.repo = repo
         self.issues: dict[str, IssueInfo] = {}
         self.prs: dict[str, PRInfo] = {}
+        # PRs a test added without a body (#414): each reads, while a run of an
+        # engine made by `make_engine` is bound to it and its body is still
+        # empty, as that run's own implementation PR -- the body carrying the
+        # marker that names the run, as the K2, K3 or K7 that bound it would
+        # have written. A test that gives a body, or writes one, gets exactly
+        # that body.
+        self.unbodied: set[str] = set()
+        self.engines: list = []
         self.comments: dict[str, list[CommentInfo]] = {}
         self.calls: list[tuple] = []
         # Controller-owned merge simulation (see merge_pr).
@@ -761,7 +774,7 @@ class FakeGitHub:
         branch: str = BRANCH,
         state: str = "OPEN",
         linked: list[int] | None = None,
-        body: str = "",
+        body: str | None = None,
         base_ref: str = "main",
         checks: list[CheckInfo] | None = None,
     ) -> PRInfo:
@@ -787,10 +800,14 @@ class FakeGitHub:
             # sets another (a fork) or "" (a deleted head repository).
             head_repository=ref.repository,
             linked_issue_numbers=list(linked or []),
-            body=body,
+            body=body or "",
             checks=[ci_check()] if checks is None else list(checks),
         )
         self.prs[ref.canonical] = info
+        if body is None:
+            self.unbodied.add(ref.canonical)
+        else:
+            self.unbodied.discard(ref.canonical)
         return info
 
     def add_comment(
@@ -942,6 +959,29 @@ class FakeGitHub:
                 return info
         raise GitHubError(f"pr not found: {url}")
 
+    def _owned(self, pr: PRInfo) -> PRInfo:
+        """``pr`` as read: a PR added without a body is its bound run's (see ``unbodied``)."""
+        from autoforge.validation import parse_pr_url
+
+        if pr.body or not pr.url:
+            return pr
+        try:
+            ref = parse_pr_url(pr.url)
+        except ConfigurationError:
+            return pr  # a malformed URL a test planted is no run's PR
+        if not any(parse_pr_url(u).same_target(ref) for u in self.unbodied):
+            return pr
+        for eng in reversed(self.engines):  # the latest engine: a restart's
+            state = eng.state
+            if (
+                state is not None
+                and state.current_pr_url
+                and parse_pr_url(state.current_pr_url).same_target(ref)
+            ):
+                pr.body = implementation_pr_body(state.current_issue_url, state.run_id)
+                break
+        return pr
+
     def _same_repo(self, repository: str, repo: str) -> bool:
         return repository.lower() == repo.lower()
 
@@ -975,7 +1015,7 @@ class FakeGitHub:
         # the server cannot retroactively appear in it. Handing out the live
         # record instead would hide every staleness bug the controller must not
         # have -- a stale checkpoint comparison would silently self-heal.
-        return replace(self._stored(url))
+        return self._owned(replace(self._stored(url)))
 
     def get_pr(self, url: str) -> PRInfo:
         """The identity read: no ``statusCheckRollup``, so ``checks`` is None (#291)."""
@@ -1133,7 +1173,7 @@ class FakeGitHub:
                 "next page but no cursor that reaches it (None)"
             )
         return [
-            self._gh_prints(replace(p))
+            self._gh_prints(self._owned(replace(p)))
             for p in self.prs.values()
             if p.is_open and self._same_repo(p.repository, repo)
         ]
@@ -1147,7 +1187,7 @@ class FakeGitHub:
                 "truncated and the set of candidates cannot be established"
             )
         return [
-            self._gh_prints(replace(p))
+            self._gh_prints(self._owned(replace(p)))
             for p in self.prs.values()
             if self._same_repo(p.repository, repo)
         ]
@@ -1236,7 +1276,7 @@ class FakeGitHub:
 
     def get_pr_exact(self, url: str) -> PRInfo:
         self._exact_read("get_pr_exact", url)
-        return replace(self._stored(url), checks=None)
+        return self._owned(replace(self._stored(url), checks=None))
 
     def get_issue_exact(self, url: str) -> IssueInfo:
         self._exact_read("get_issue_exact", url)
@@ -1490,6 +1530,7 @@ class FakeGitHub:
 
         def perform() -> None:
             self._stored(canonical).body = body
+            self.unbodied.discard(canonical)
 
         self._effect_write("write_pr_body", canonical, body, perform)
 
@@ -1557,7 +1598,7 @@ class FakeGitHub:
         self._effect_read("list_prs_for_head", repository, branch)
         self._follow_origin()
         prs = [
-            self._gh_prints(replace(p))
+            self._gh_prints(self._owned(replace(p)))
             for p in self.prs.values()
             if self._same_repo(p.repository, repository)
             and p.head_ref == branch
@@ -2183,6 +2224,8 @@ def make_engine(
         sleep=sleeps.append,
     )
     eng.new_run(EPIC, ISSUE)
+    if isinstance(gh, FakeGitHub):
+        gh.engines.append(eng)
     eng.provider = provider  # type: ignore[attr-defined]
     eng.sleeps = sleeps  # type: ignore[attr-defined]
     if origin:

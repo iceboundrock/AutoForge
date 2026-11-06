@@ -10,6 +10,19 @@
   - *Not done here:* running the corpus protocol over the review report's
     history (D7.5), and any persisted code (D5).
 - **Decides:** #369 (REC-AR0), for #354, under EPIC #184.
+- **Amended by #414:** the `pr-owner` code, in the identity family (ADR
+  0004 D9.4a). It is the stop of a run whose bound PR's implementation
+  marker does not name it (another run, no run, no marker, another
+  issue's, a malformed or duplicate marker, an empty body), of a fresh
+  run that found the issue's marked PR without any record of it, of a K3
+  plan whose PR another run's marker claims, and of a run whose id cannot
+  be published in a marker. A replan refused for its owner keeps the code:
+  the transaction is rejected as any other replan refusal is, but the stop
+  is `pr-owner`, not `replan-refused`. `PROwnerError` carries it; the step
+  that meets the error blocks, and so does `run`'s read of a held
+  `READY_FOR_MERGE`, the one read made outside a step, so it ends a command
+  only if another path outside a step raises it. A K11 takeover that meets a changed body stops with
+  `effect-conflict`, like any other effect conflict.
 - **Amends:** nothing. Every phase, edge, exit rule, budget, retry, effect
   and the state file are unchanged; seven `BLOCKED` reasons that told the
   operator to `resume`, which refuses a `BLOCKED` run, now say `unblock`.
@@ -172,12 +185,12 @@ exhaustive by `test_every_error_class_is_mapped_explicitly`.
 | bounds | REPLAN_REEXECUTE's reducer | `blocked` | `replan-refused` |
 | bounds | UPDATE_EPIC's re-selection | `blocked` | `selection-rejected` |
 | K9 / K10 | FIX's prefix pass and drive | `blocked` | `acceptance-action`, `operator-actions` |
-| identity | entry reconciliations, plan completion, read-backs | `blocked` | `unjournaled-write`, `effect-conflict`, `claim-ambiguous`, `default-branch`, `read-back-mismatch`, `fix-plan-refused`, `epic-roadmap` |
+| identity | entry reconciliations, plan completion, read-backs | `blocked` | `unjournaled-write`, `effect-conflict`, `claim-ambiguous`, `pr-owner` (#414), `default-branch`, `read-back-mismatch`, `fix-plan-refused`, `epic-roadmap` |
 | GitHub | a conclusive read that failed | `blocked` | `github-read-failed`, `github-checks-refused` (#291) |
 | merge gate | `READY_FOR_MERGE`, `MERGE` | `blocked` | `merge-inconclusive`, `pr-identity`, `pr-not-open`, `unreviewed-merge`, `merge-checks`, `merge-conflict`, `merge-not-ready`, `merge-write`, `premerge-verification`, `review-certificate`, `review-not-backed` |
 | workspace | around an agent launch | `blocked` | `checkout-drift`, `sandbox-tamper` |
 | agent | the agent-status sink | `blocked`, `failed` | `agent-blocked`, `agent-failure` |
-| execution | an error ending `run` / `step` / `resume` | `resumable_error` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required` (SDK questions and permissions, #134), `control-result-invalid`, `verification-failed`, `github-unavailable`, `github-error`, `github-checks-refused`, `git-transport`, `effect-conflict`, `claim-ambiguous`, `checkout-drift`, `sandbox-tamper`, `validation-*`, `run-log-refused` (a run log refused after a launch's attempt was saved; exit 2) |
+| execution | an error ending `run` / `step` / `resume` | `resumable_error` | `execution-failed`, `execution-timeout`, `sandbox-launch-refused`, `interaction-required` (SDK questions and permissions, #134), `control-result-invalid`, `verification-failed`, `github-unavailable`, `github-error`, `github-checks-refused`, `git-transport`, `effect-conflict`, `claim-ambiguous`, `pr-owner`, `checkout-drift`, `sandbox-tamper`, `validation-*`, `run-log-refused` (a run log refused after a launch's attempt was saved; exit 2) |
 | refusals | an error before the command acted | `refused` | `configuration-invalid`, `configuration-drift` (#219), `sandbox-capability` (ADR 0005 D12.2), `scheduler-owned`, `state-invalid` (LOCAL's state among them), `state-protocol` (#265), `state-transition`, `lock-held` |
 | intentional | the saved state | `ready_for_merge`, `handoff`, `done`, `in_progress` | the outcome's own code |
 | unknown | an unmapped error, an uncoded reason, a persisted stop | `unknown` or the sink's | `unknown` |
