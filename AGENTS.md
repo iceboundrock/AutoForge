@@ -240,6 +240,10 @@ docs/development.md                    make targets, CI, its pinned actions and 
                                        the CI duration report and its regression policy, the
                                        built-distribution check, what a green `ci` does and does
                                        not prove
+docs/evaluation-protocol.md            the pre-registered evaluation of Issue Memory and multi-agent
+                                       execution (#318): arms, pinned tasks, what is held equal and
+                                       measured, the go/no-go decision, the control-plane test list,
+                                       fixture mode and the opt-in real-run procedure; no result yet
 docs/test-suite-performance-audit.md   EPIC #338's exit audit: the suite at the EPIC's baseline and on
                                        main, measured on one host; each exit criterion and invariant
                                        with its verdict and tests; what only GitHub holds
@@ -308,6 +312,11 @@ matches none of them needs only this file and the scoped `AGENTS.md`.
   in addition to ADR 0011.
 - If adding or changing tests, or changing behaviour in a high-priority
   coverage area, read `tests/AGENTS.md` and `docs/agent-guides/testing.md`.
+- If changing `tests/evaluation.py`, `tests/evaluation_fixture.py` or
+  `tests/fixtures/evaluation/`, adding an arm or a Memory or multi-agent feature
+  an arm needs, or adding a top-level configuration section, read
+  `docs/evaluation-protocol.md`. A threshold, task or setting changes only by
+  its section 11.
 
 ## Scope discipline
 
